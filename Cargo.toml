@@ -1,0 +1,26 @@
+[package]
+name = "datatools-vectordata-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Rust implementation of vectordata tools for dataset.yaml"
+license = "Apache-2.0"
+homepage = "github.com/nosqlbench/vectordata-rs"
+repository = "github.com/nosqlbench/vectordata-rs"
+readme = "README.md"
+keywords = ["vector", "dataset", "ann", "http", "mmap"]
+categories = ["filesystem", "network-programming", "science"]
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
+thiserror = "1.0"
+anyhow = "1.0"
+memmap2 = "0.9"
+byteorder = "1.5"
+reqwest = { version = "0.11", features = ["blocking", "json"] }
+url = "2.5"
+log = "0.4"
+env_logger = "0.10"
+
+[dev-dependencies]
+tempfile = "3.8"
