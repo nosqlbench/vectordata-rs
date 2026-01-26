@@ -11,7 +11,7 @@
 //! read only the required vector data.
 //!
 //! ```no_run
-//! use datatools_vectordata_rs::TestDataGroup;
+//! use vectordata::TestDataGroup;
 //!
 //! fn main() -> anyhow::Result<()> {
 //!     // Load a dataset from a remote URL

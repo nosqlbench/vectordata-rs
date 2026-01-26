@@ -24,6 +24,7 @@ pub enum DataSource {
 /// Represents a loaded vector dataset configuration.
 ///
 /// Use `TestDataGroup::load` to parse a `dataset.yaml` and prepare for data access.
+#[derive(Debug)]
 pub struct TestDataGroup {
     source: DataSource,
     config: DatasetConfig,
@@ -35,7 +36,7 @@ impl TestDataGroup {
     /// # Examples
     ///
     /// ```no_run
-    /// use datatools_vectordata_rs::TestDataGroup;
+    /// use vectordata::TestDataGroup;
     ///
     /// // Load from local path
     /// let local_group = TestDataGroup::load("./data")?;
@@ -123,5 +124,70 @@ impl TestDataGroup {
     /// Retrieves a top-level attribute from the dataset configuration.
     pub fn attribute(&self, name: &str) -> Option<&serde_yaml::Value> {
         self.config.attributes.get(name)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_load_from_path_success() {
+        let dir = tempdir().unwrap();
+        let yaml_path = dir.path().join("dataset.yaml");
+        let mut file = fs::File::create(&yaml_path).unwrap();
+        writeln!(file, r#"
+attributes:
+  dimension: 128
+profiles:
+  default:
+    base_vectors: base.fvec
+"#).unwrap();
+
+        let group = TestDataGroup::load(dir.path().to_str().unwrap()).unwrap();
+        assert!(group.profile("default").is_some());
+        assert!(group.profile("nonexistent").is_none());
+        
+        let dim = group.attribute("dimension").unwrap();
+        assert_eq!(dim.as_u64().unwrap(), 128);
+    }
+
+    #[test]
+    fn test_load_from_path_file_success() {
+        let dir = tempdir().unwrap();
+        let yaml_path = dir.path().join("dataset.yaml");
+        let mut file = fs::File::create(&yaml_path).unwrap();
+        writeln!(file, "profiles: {{}}").unwrap();
+
+        let group = TestDataGroup::load(yaml_path.to_str().unwrap()).unwrap();
+        assert!(group.config.profiles.is_empty());
+    }
+
+    #[test]
+    fn test_load_from_path_missing_file() {
+        let dir = tempdir().unwrap();
+        let result = TestDataGroup::load(dir.path().to_str().unwrap());
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            Error::ConfigIo(_) => (), // Expected
+            e => panic!("Expected ConfigIo error, got {:?}", e),
+        }
+    }
+    
+    #[test]
+    fn test_load_from_path_invalid_yaml() {
+        let dir = tempdir().unwrap();
+        let yaml_path = dir.path().join("dataset.yaml");
+        let mut file = fs::File::create(&yaml_path).unwrap();
+        writeln!(file, "invalid_yaml: [").unwrap();
+
+        let result = TestDataGroup::load(dir.path().to_str().unwrap());
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            Error::ConfigParse(_) => (), // Expected
+            e => panic!("Expected ConfigParse error, got {:?}", e),
+        }
     }
 }

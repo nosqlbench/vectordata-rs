@@ -1,6 +1,6 @@
 # Vector Data Tools
 
-`datatools-vectordata-rs` is a Rust library for efficiently accessing vector datasets described by a `dataset.yaml` configuration. It supports seamless access to both local file system datasets and remote datasets via HTTP/HTTPS, using efficient Range requests for on-demand data retrieval.
+`vectordata` is a Rust library for efficiently accessing vector datasets described by a `dataset.yaml` configuration. It supports seamless access to both local file system datasets and remote datasets via HTTP/HTTPS, using efficient Range requests for on-demand data retrieval.
 
 ## Features
 
@@ -16,7 +16,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-datatools-vectordata-rs = "0.1.0"
+vectordata = "0.1.0"
 ```
 
 ## Usage
@@ -24,7 +24,7 @@ datatools-vectordata-rs = "0.1.0"
 ### 1. Reading a Local Dataset
 
 ```rust
-use datatools_vectordata_rs::TestDataGroup;
+use vectordata::TestDataGroup;
 
 fn main() -> anyhow::Result<()> {
     // Load from a local directory containing dataset.yaml
@@ -52,7 +52,7 @@ fn main() -> anyhow::Result<()> {
 Accessing a remote dataset is just as simple. Provide the URL to the dataset directory or the `dataset.yaml` file itself.
 
 ```rust
-use datatools_vectordata_rs::TestDataGroup;
+use vectordata::TestDataGroup;
 
 fn main() -> anyhow::Result<()> {
     // URL to a remote dataset
