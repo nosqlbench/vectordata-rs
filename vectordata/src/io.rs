@@ -9,6 +9,9 @@
 //!   - Header: 4 bytes (int32) representing the dimension.
 //!   - Data: Sequence of vectors, each starting with the dimension (4 bytes) followed by `dim` floats.
 //! - **ivec**: Similar to fvec but for 32-bit integers (used for ground truth indices).
+//! - **hvec**: A binary format for half-precision (f16) vectors.
+//!   - Header: 4 bytes (int32) representing the dimension.
+//!   - Data: Sequence of vectors, each starting with the dimension (4 bytes) followed by `dim` f16 values (2 bytes each).
 
 use std::fs::File;
 use std::io::{self, Cursor};
@@ -198,6 +201,76 @@ impl VectorReader<i32> for MmapVectorReader<i32> {
         
         for _ in 0..self.dim {
             vector.push(cursor.read_i32::<LittleEndian>()?);
+        }
+
+        Ok(vector)
+    }
+}
+
+impl MmapVectorReader<half::f16> {
+    /// Opens a local `.hvec` file for reading half-precision (f16) vectors.
+    pub fn open_hvec(path: &Path) -> Result<Self, IoError> {
+        let file = File::open(path)?;
+        let mmap = unsafe { Mmap::map(&file)? };
+
+        if mmap.len() < 4 {
+            return Err(IoError::InvalidFormat("File too short".into()));
+        }
+
+        let mut cursor = Cursor::new(&mmap[..]);
+        let dim = cursor.read_i32::<LittleEndian>()? as usize;
+
+        if dim == 0 {
+            return Err(IoError::InvalidFormat("Dimension cannot be 0".into()));
+        }
+
+        let entry_size = 4 + dim * 2; // 4 bytes for dim header + dim * 2 bytes per f16
+
+        let count = mmap.len() / entry_size;
+
+        Ok(Self {
+            mmap,
+            dim,
+            count,
+            entry_size,
+            header_size: 4,
+            _phantom: PhantomData,
+        })
+    }
+}
+
+impl VectorReader<half::f16> for MmapVectorReader<half::f16> {
+    fn dim(&self) -> usize {
+        self.dim
+    }
+
+    fn count(&self) -> usize {
+        self.count
+    }
+
+    fn get(&self, index: usize) -> Result<Vec<half::f16>, IoError> {
+        if index >= self.count {
+            return Err(IoError::OutOfBounds(index));
+        }
+
+        let start = index * self.entry_size;
+        let mut cursor = Cursor::new(&self.mmap[start..start + 4]);
+        let dim = cursor.read_i32::<LittleEndian>()? as usize;
+        if dim != self.dim {
+            return Err(IoError::InvalidFormat(format!(
+                "Record at index {} has mismatched dimension {}",
+                index, dim
+            )));
+        }
+
+        let vector_start = start + 4;
+        let vector_end = vector_start + self.dim * 2;
+
+        let mut vector = Vec::with_capacity(self.dim);
+        let mut cursor = Cursor::new(&self.mmap[vector_start..vector_end]);
+
+        for _ in 0..self.dim {
+            vector.push(half::f16::from_bits(cursor.read_u16::<LittleEndian>()?));
         }
 
         Ok(vector)

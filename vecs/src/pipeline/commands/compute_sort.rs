@@ -1,0 +1,447 @@
+// Copyright (c) DataStax, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
+//! Pipeline command: sort vectors by a specified criterion.
+//!
+//! Reads an fvec file and writes a sorted copy. Sorting criteria include:
+//! - `norm`: L2 norm of each vector (ascending)
+//! - `dimension:N`: value of dimension N (ascending)
+//!
+//! For large files, uses an index-sort approach: compute sort keys, sort
+//! indices, then write output in sorted order via mmap random access.
+//!
+//! Equivalent to the Java `CMD_compute_sort` command.
+
+use std::path::{Path, PathBuf};
+use std::time::Instant;
+
+use vectordata::VectorReader;
+use vectordata::io::MmapVectorReader;
+
+use crate::pipeline::command::{
+    CommandOp, CommandResult, OptionDesc, Options, Status, StreamContext,
+};
+
+/// Pipeline command: sort vectors.
+pub struct ComputeSortOp;
+
+pub fn factory() -> Box<dyn CommandOp> {
+    Box::new(ComputeSortOp)
+}
+
+/// Sort criterion.
+#[derive(Debug, Clone)]
+enum SortCriterion {
+    /// Sort by L2 norm ascending.
+    Norm,
+    /// Sort by value of a specific dimension ascending.
+    Dimension(usize),
+}
+
+impl SortCriterion {
+    fn from_str(s: &str, max_dim: usize) -> Result<Self, String> {
+        match s.to_lowercase().as_str() {
+            "norm" | "l2norm" | "l2" => Ok(SortCriterion::Norm),
+            other => {
+                if let Some(dim_str) = other.strip_prefix("dimension:") {
+                    let dim: usize = dim_str
+                        .parse()
+                        .map_err(|_| format!("invalid dimension index: '{}'", dim_str))?;
+                    if dim >= max_dim {
+                        return Err(format!(
+                            "dimension index {} out of range (max {})",
+                            dim,
+                            max_dim - 1
+                        ));
+                    }
+                    Ok(SortCriterion::Dimension(dim))
+                } else if let Some(dim_str) = other.strip_prefix("dim:") {
+                    let dim: usize = dim_str
+                        .parse()
+                        .map_err(|_| format!("invalid dimension index: '{}'", dim_str))?;
+                    if dim >= max_dim {
+                        return Err(format!(
+                            "dimension index {} out of range (max {})",
+                            dim,
+                            max_dim - 1
+                        ));
+                    }
+                    Ok(SortCriterion::Dimension(dim))
+                } else {
+                    Err(format!(
+                        "unknown sort criterion: '{}'. Use 'norm' or 'dimension:N'",
+                        s
+                    ))
+                }
+            }
+        }
+    }
+
+    /// Compute the sort key for a vector.
+    fn key(&self, vec: &[f32]) -> f64 {
+        match self {
+            SortCriterion::Norm => {
+                let mut sum = 0.0f64;
+                for &v in vec {
+                    let vf = v as f64;
+                    sum += vf * vf;
+                }
+                sum.sqrt()
+            }
+            SortCriterion::Dimension(d) => vec[*d] as f64,
+        }
+    }
+}
+
+impl CommandOp for ComputeSortOp {
+    fn command_path(&self) -> &str {
+        "compute sort"
+    }
+
+    fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
+        let start = Instant::now();
+
+        let source_str = match options.require("source") {
+            Ok(s) => s,
+            Err(e) => return error_result(e, start),
+        };
+        let output_str = match options.require("output") {
+            Ok(s) => s,
+            Err(e) => return error_result(e, start),
+        };
+        let sort_by_str = options.get("sort-by").unwrap_or("norm");
+
+        let source_path = resolve_path(source_str, &ctx.workspace);
+        let output_path = resolve_path(output_str, &ctx.workspace);
+
+        // Open source
+        let reader = match MmapVectorReader::<f32>::open_fvec(&source_path) {
+            Ok(r) => r,
+            Err(e) => {
+                return error_result(
+                    format!("failed to open {}: {}", source_path.display(), e),
+                    start,
+                )
+            }
+        };
+
+        let count = <MmapVectorReader<f32> as VectorReader<f32>>::count(&reader);
+        let dim = <MmapVectorReader<f32> as VectorReader<f32>>::dim(&reader);
+
+        let criterion = match SortCriterion::from_str(sort_by_str, dim) {
+            Ok(c) => c,
+            Err(e) => return error_result(e, start),
+        };
+
+        eprintln!(
+            "Sort: {} vectors (dim={}) by {:?}",
+            count, dim, criterion
+        );
+
+        // Compute sort keys and build index
+        let mut indexed_keys: Vec<(usize, f64)> = Vec::with_capacity(count);
+        for i in 0..count {
+            let vec = match reader.get(i) {
+                Ok(v) => v,
+                Err(e) => {
+                    return error_result(
+                        format!("failed to read vector {}: {}", i, e),
+                        start,
+                    )
+                }
+            };
+            indexed_keys.push((i, criterion.key(&vec)));
+        }
+
+        // Sort by key (stable sort to preserve order for equal keys)
+        indexed_keys.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Create output directory
+        if let Some(parent) = output_path.parent() {
+            if !parent.exists() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    return error_result(format!("failed to create directory: {}", e), start);
+                }
+            }
+        }
+
+        // Write sorted vectors
+        if let Err(e) = write_sorted_fvec(&output_path, &reader, dim, &indexed_keys) {
+            return error_result(e, start);
+        }
+
+        CommandResult {
+            status: Status::Ok,
+            message: format!(
+                "sorted {} vectors (dim={}) by {:?} to {}",
+                count,
+                dim,
+                criterion,
+                output_path.display()
+            ),
+            produced: vec![output_path],
+            elapsed: start.elapsed(),
+        }
+    }
+
+    fn describe_options(&self) -> Vec<OptionDesc> {
+        vec![
+            OptionDesc {
+                name: "source".to_string(),
+                type_name: "Path".to_string(),
+                required: true,
+                default: None,
+                description: "Input fvec file".to_string(),
+            },
+            OptionDesc {
+                name: "output".to_string(),
+                type_name: "Path".to_string(),
+                required: true,
+                default: None,
+                description: "Output sorted fvec file".to_string(),
+            },
+            OptionDesc {
+                name: "sort-by".to_string(),
+                type_name: "String".to_string(),
+                required: false,
+                default: Some("norm".to_string()),
+                description: "Sort criterion: 'norm' or 'dimension:N'".to_string(),
+            },
+        ]
+    }
+}
+
+/// Write vectors in the order specified by sorted indices.
+fn write_sorted_fvec(
+    output: &Path,
+    reader: &MmapVectorReader<f32>,
+    dim: usize,
+    sorted_indices: &[(usize, f64)],
+) -> Result<(), String> {
+    use std::io::Write;
+
+    let file = std::fs::File::create(output)
+        .map_err(|e| format!("failed to create {}: {}", output.display(), e))?;
+    let mut writer = std::io::BufWriter::with_capacity(1 << 20, file);
+
+    let dim_i32 = dim as i32;
+    for &(idx, _) in sorted_indices {
+        let vec = reader
+            .get(idx)
+            .map_err(|e| format!("failed to read vector {}: {}", idx, e))?;
+
+        writer
+            .write_all(&dim_i32.to_le_bytes())
+            .map_err(|e| e.to_string())?;
+        for &val in &vec {
+            writer
+                .write_all(&val.to_le_bytes())
+                .map_err(|e| e.to_string())?;
+        }
+    }
+
+    writer.flush().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn resolve_path(path_str: &str, workspace: &Path) -> PathBuf {
+    let p = PathBuf::from(path_str);
+    if p.is_absolute() {
+        p
+    } else {
+        workspace.join(p)
+    }
+}
+
+fn error_result(message: String, start: Instant) -> CommandResult {
+    CommandResult {
+        status: Status::Error,
+        message,
+        produced: vec![],
+        elapsed: start.elapsed(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pipeline::command::StreamContext;
+    use crate::pipeline::progress::ProgressLog;
+    use indexmap::IndexMap;
+
+    fn test_ctx(dir: &Path) -> StreamContext {
+        StreamContext {
+            workspace: dir.to_path_buf(),
+            scratch: dir.join(".scratch"),
+            cache: dir.join(".cache"),
+            defaults: IndexMap::new(),
+            dry_run: false,
+            progress: ProgressLog::new(),
+            threads: 1,
+            step_id: String::new(),
+        }
+    }
+
+    /// Write a small fvec file with known vectors for testing.
+    fn write_test_fvec(path: &Path, vectors: &[Vec<f32>]) {
+        use std::io::Write;
+        let file = std::fs::File::create(path).unwrap();
+        let mut w = std::io::BufWriter::new(file);
+        for vec in vectors {
+            let dim = vec.len() as i32;
+            w.write_all(&dim.to_le_bytes()).unwrap();
+            for &v in vec {
+                w.write_all(&v.to_le_bytes()).unwrap();
+            }
+        }
+        w.flush().unwrap();
+    }
+
+    /// Read an fvec file back into vectors.
+    fn read_fvec(path: &Path) -> Vec<Vec<f32>> {
+        let data = std::fs::read(path).unwrap();
+        let mut result = Vec::new();
+        let mut offset = 0;
+        while offset < data.len() {
+            let dim = i32::from_le_bytes([
+                data[offset],
+                data[offset + 1],
+                data[offset + 2],
+                data[offset + 3],
+            ]) as usize;
+            offset += 4;
+            let mut vec = Vec::with_capacity(dim);
+            for _ in 0..dim {
+                let v = f32::from_le_bytes([
+                    data[offset],
+                    data[offset + 1],
+                    data[offset + 2],
+                    data[offset + 3],
+                ]);
+                vec.push(v);
+                offset += 4;
+            }
+            result.push(vec);
+        }
+        result
+    }
+
+    #[test]
+    fn test_sort_by_norm() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path();
+
+        // Vectors with known norms: [3,0]→3, [1,0]→1, [2,0]→2
+        let source = workspace.join("input.fvec");
+        write_test_fvec(
+            &source,
+            &[vec![3.0, 0.0], vec![1.0, 0.0], vec![2.0, 0.0]],
+        );
+
+        let output = workspace.join("sorted.fvec");
+        let mut opts = Options::new();
+        opts.set("source", source.to_string_lossy().to_string());
+        opts.set("output", output.to_string_lossy().to_string());
+        opts.set("sort-by", "norm");
+
+        let mut op = ComputeSortOp;
+        let mut ctx = test_ctx(workspace);
+        let result = op.execute(&opts, &mut ctx);
+        assert_eq!(result.status, Status::Ok);
+
+        let sorted = read_fvec(&output);
+        assert_eq!(sorted.len(), 3);
+        assert_eq!(sorted[0], vec![1.0, 0.0]); // norm 1
+        assert_eq!(sorted[1], vec![2.0, 0.0]); // norm 2
+        assert_eq!(sorted[2], vec![3.0, 0.0]); // norm 3
+    }
+
+    #[test]
+    fn test_sort_by_dimension() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path();
+
+        // Sort by dimension 1 (second component)
+        let source = workspace.join("input.fvec");
+        write_test_fvec(
+            &source,
+            &[
+                vec![0.0, 5.0, 0.0],
+                vec![0.0, 1.0, 0.0],
+                vec![0.0, 3.0, 0.0],
+            ],
+        );
+
+        let output = workspace.join("sorted.fvec");
+        let mut opts = Options::new();
+        opts.set("source", source.to_string_lossy().to_string());
+        opts.set("output", output.to_string_lossy().to_string());
+        opts.set("sort-by", "dimension:1");
+
+        let mut op = ComputeSortOp;
+        let mut ctx = test_ctx(workspace);
+        let result = op.execute(&opts, &mut ctx);
+        assert_eq!(result.status, Status::Ok);
+
+        let sorted = read_fvec(&output);
+        assert_eq!(sorted[0][1], 1.0);
+        assert_eq!(sorted[1][1], 3.0);
+        assert_eq!(sorted[2][1], 5.0);
+    }
+
+    #[test]
+    fn test_sort_preserves_size() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path();
+
+        let source = workspace.join("input.fvec");
+        write_test_fvec(
+            &source,
+            &[vec![1.0, 2.0], vec![3.0, 4.0], vec![5.0, 6.0]],
+        );
+
+        let output = workspace.join("sorted.fvec");
+        let mut opts = Options::new();
+        opts.set("source", source.to_string_lossy().to_string());
+        opts.set("output", output.to_string_lossy().to_string());
+
+        let mut op = ComputeSortOp;
+        let mut ctx = test_ctx(workspace);
+        op.execute(&opts, &mut ctx);
+
+        let src_size = std::fs::metadata(&source).unwrap().len();
+        let out_size = std::fs::metadata(&output).unwrap().len();
+        assert_eq!(src_size, out_size);
+    }
+
+    #[test]
+    fn test_sort_criterion_parsing() {
+        assert!(SortCriterion::from_str("norm", 10).is_ok());
+        assert!(SortCriterion::from_str("l2norm", 10).is_ok());
+        assert!(SortCriterion::from_str("dimension:0", 10).is_ok());
+        assert!(SortCriterion::from_str("dim:5", 10).is_ok());
+        assert!(SortCriterion::from_str("dimension:10", 10).is_err()); // out of range
+        assert!(SortCriterion::from_str("invalid", 10).is_err());
+    }
+
+    #[test]
+    fn test_sort_invalid_dimension() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path();
+
+        let source = workspace.join("input.fvec");
+        write_test_fvec(&source, &[vec![1.0, 2.0]]);
+
+        let output = workspace.join("sorted.fvec");
+        let mut opts = Options::new();
+        opts.set("source", source.to_string_lossy().to_string());
+        opts.set("output", output.to_string_lossy().to_string());
+        opts.set("sort-by", "dimension:5");
+
+        let mut op = ComputeSortOp;
+        let mut ctx = test_ctx(workspace);
+        let result = op.execute(&opts, &mut ctx);
+        assert_eq!(result.status, Status::Error);
+        assert!(result.message.contains("out of range"));
+    }
+}

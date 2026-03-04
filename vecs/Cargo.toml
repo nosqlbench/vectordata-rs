@@ -1,0 +1,45 @@
+[package]
+name = "vecs"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "vecs"
+path = "src/main.rs"
+
+[dependencies]
+arrow = "53"
+atty = "0.2"
+byteorder = "1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive", "string"] }
+clap_complete = { version = "4", features = ["unstable-dynamic"] }
+curl = "0.4"
+env_logger = "0.11"
+half = "2"
+indicatif = "0.17"
+indexmap = { version = "2", features = ["serde"] }
+log = "0.4"
+ndarray = "0.16"
+ndarray-npy = "0.9"
+parquet = "53"
+petgraph = "0.7"
+rand = "0.9"
+rand_distr = "0.5"
+rand_xoshiro = "0.7"
+libc = "0.2"
+jaq-core = "1.5"
+jaq-interpret = "1.5"
+jaq-parse = "1.0"
+jaq-std = "1.6"
+sha2 = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+simsimd = "6"
+slabtastic = "0.7"
+tokio = { version = "1", features = ["full"] }
+vectordata = { path = "../vectordata" }
+
+[dev-dependencies]
+tempfile = "3"

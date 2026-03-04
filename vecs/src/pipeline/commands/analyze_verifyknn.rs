@@ -1,0 +1,573 @@
+// Copyright (c) DataStax, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
+//! Pipeline command: verify KNN ground truth correctness.
+//!
+//! Loads base vectors, query vectors, and precomputed neighbor indices, then
+//! recomputes distances for a range of queries and verifies the provided
+//! neighborhoods match the true nearest neighbors.
+//!
+//! Supports distance metrics: L2, Cosine, DotProduct, L1.
+//!
+//! Equivalent to the Java `CMD_analyze_verifyknn` command.
+
+use std::cmp::Ordering;
+use std::collections::BinaryHeap;
+use std::path::{Path, PathBuf};
+use std::time::Instant;
+
+use vectordata::VectorReader;
+use vectordata::io::MmapVectorReader;
+
+use crate::pipeline::command::{
+    CommandOp, CommandResult, OptionDesc, Options, Status, StreamContext,
+};
+
+/// Pipeline command: verify KNN results.
+pub struct AnalyzeVerifyKnnOp;
+
+pub fn factory() -> Box<dyn CommandOp> {
+    Box::new(AnalyzeVerifyKnnOp)
+}
+
+/// Distance metric (shared with compute_knn but self-contained here).
+#[derive(Debug, Clone, Copy)]
+enum DistanceMetric {
+    L2,
+    Cosine,
+    DotProduct,
+    L1,
+}
+
+impl DistanceMetric {
+    fn from_str(s: &str) -> Option<Self> {
+        match s.to_uppercase().as_str() {
+            "L2" | "EUCLIDEAN" => Some(DistanceMetric::L2),
+            "COSINE" => Some(DistanceMetric::Cosine),
+            "DOT_PRODUCT" | "DOTPRODUCT" | "DOT" => Some(DistanceMetric::DotProduct),
+            "L1" | "MANHATTAN" => Some(DistanceMetric::L1),
+            _ => None,
+        }
+    }
+
+    fn distance(&self, a: &[f32], b: &[f32]) -> f32 {
+        match self {
+            DistanceMetric::L2 => {
+                let mut sum = 0.0f64;
+                for i in 0..a.len() {
+                    let d = (a[i] - b[i]) as f64;
+                    sum += d * d;
+                }
+                sum.sqrt() as f32
+            }
+            DistanceMetric::Cosine => {
+                let mut dot = 0.0f64;
+                let mut na = 0.0f64;
+                let mut nb = 0.0f64;
+                for i in 0..a.len() {
+                    let ai = a[i] as f64;
+                    let bi = b[i] as f64;
+                    dot += ai * bi;
+                    na += ai * ai;
+                    nb += bi * bi;
+                }
+                let denom = (na * nb).sqrt();
+                if denom == 0.0 {
+                    1.0
+                } else {
+                    (1.0 - dot / denom) as f32
+                }
+            }
+            DistanceMetric::DotProduct => {
+                let mut dot = 0.0f64;
+                for i in 0..a.len() {
+                    dot += (a[i] as f64) * (b[i] as f64);
+                }
+                -dot as f32
+            }
+            DistanceMetric::L1 => {
+                let mut sum = 0.0f64;
+                for i in 0..a.len() {
+                    sum += ((a[i] - b[i]) as f64).abs();
+                }
+                sum as f32
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct Neighbor {
+    index: u32,
+    distance: f32,
+}
+
+impl PartialEq for Neighbor {
+    fn eq(&self, other: &Self) -> bool {
+        self.distance == other.distance
+    }
+}
+impl Eq for Neighbor {}
+impl PartialOrd for Neighbor {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for Neighbor {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.distance
+            .partial_cmp(&other.distance)
+            .unwrap_or(Ordering::Equal)
+    }
+}
+
+/// Find true top-k nearest neighbors by brute force.
+fn find_true_top_k(
+    query: &[f32],
+    base_reader: &MmapVectorReader<f32>,
+    k: usize,
+    metric: DistanceMetric,
+) -> Vec<Neighbor> {
+    let base_count = <MmapVectorReader<f32> as VectorReader<f32>>::count(base_reader);
+    let mut heap = BinaryHeap::with_capacity(k + 1);
+
+    for i in 0..base_count {
+        let base_vec = match base_reader.get(i) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let dist = metric.distance(query, &base_vec);
+
+        if heap.len() < k {
+            heap.push(Neighbor {
+                index: i as u32,
+                distance: dist,
+            });
+        } else if let Some(worst) = heap.peek() {
+            if dist < worst.distance {
+                heap.pop();
+                heap.push(Neighbor {
+                    index: i as u32,
+                    distance: dist,
+                });
+            }
+        }
+    }
+
+    let mut result: Vec<Neighbor> = heap.into_vec();
+    result.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap_or(Ordering::Equal));
+    result
+}
+
+/// Read neighbor indices from an ivec file for a specific query.
+fn read_ivec_row(reader: &MmapVectorReader<i32>, row: usize) -> Result<Vec<i32>, String> {
+    reader
+        .get(row)
+        .map_err(|e| format!("failed to read indices row {}: {}", row, e))
+}
+
+impl CommandOp for AnalyzeVerifyKnnOp {
+    fn command_path(&self) -> &str {
+        "analyze verify-knn"
+    }
+
+    fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
+        let start = Instant::now();
+
+        let base_str = match options.require("base") {
+            Ok(s) => s,
+            Err(e) => return error_result(e, start),
+        };
+        let query_str = match options.require("query") {
+            Ok(s) => s,
+            Err(e) => return error_result(e, start),
+        };
+        let indices_str = match options.require("indices") {
+            Ok(s) => s,
+            Err(e) => return error_result(e, start),
+        };
+
+        let metric_str = options.get("metric").unwrap_or("L2");
+        let metric = match DistanceMetric::from_str(metric_str) {
+            Some(m) => m,
+            None => {
+                return error_result(
+                    format!("unknown metric: '{}'. Use L2, COSINE, DOT_PRODUCT, or L1", metric_str),
+                    start,
+                )
+            }
+        };
+
+        // Tolerance for floating-point comparison
+        let phi: f32 = options
+            .get("phi")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.001);
+
+        // Range of queries to verify (default: all)
+        let range_str = options.get("range");
+
+        let base_path = resolve_path(base_str, &ctx.workspace);
+        let query_path = resolve_path(query_str, &ctx.workspace);
+        let indices_path = resolve_path(indices_str, &ctx.workspace);
+
+        // Open readers
+        let base_reader = match MmapVectorReader::<f32>::open_fvec(&base_path) {
+            Ok(r) => r,
+            Err(e) => {
+                return error_result(
+                    format!("failed to open base {}: {}", base_path.display(), e),
+                    start,
+                )
+            }
+        };
+        let query_reader = match MmapVectorReader::<f32>::open_fvec(&query_path) {
+            Ok(r) => r,
+            Err(e) => {
+                return error_result(
+                    format!("failed to open query {}: {}", query_path.display(), e),
+                    start,
+                )
+            }
+        };
+        let indices_reader = match MmapVectorReader::<i32>::open_ivec(&indices_path) {
+            Ok(r) => r,
+            Err(e) => {
+                return error_result(
+                    format!("failed to open indices {}: {}", indices_path.display(), e),
+                    start,
+                )
+            }
+        };
+
+        let query_count = <MmapVectorReader<f32> as VectorReader<f32>>::count(&query_reader);
+        let indices_count = <MmapVectorReader<i32> as VectorReader<i32>>::count(&indices_reader);
+
+        if indices_count != query_count {
+            return error_result(
+                format!(
+                    "query count ({}) != indices count ({})",
+                    query_count, indices_count
+                ),
+                start,
+            );
+        }
+
+        // Auto-detect k from indices dimension
+        let k = <MmapVectorReader<i32> as VectorReader<i32>>::dim(&indices_reader);
+
+        // Parse range
+        let (range_start, range_end) = match range_str {
+            Some(s) => match parse_range(s, query_count) {
+                Ok(r) => r,
+                Err(e) => return error_result(e, start),
+            },
+            None => (0, query_count),
+        };
+
+        eprintln!(
+            "Verify KNN: queries [{}, {}), k={}, metric={:?}, phi={}",
+            range_start, range_end, k, metric, phi
+        );
+
+        let mut pass_count = 0usize;
+        let mut fail_count = 0usize;
+
+        for qi in range_start..range_end {
+            let query_vec = match query_reader.get(qi) {
+                Ok(v) => v,
+                Err(e) => {
+                    return error_result(format!("failed to read query {}: {}", qi, e), start)
+                }
+            };
+
+            // Read provided indices
+            let provided_indices = match read_ivec_row(&indices_reader, qi) {
+                Ok(v) => v,
+                Err(e) => return error_result(e, start),
+            };
+
+            // Compute true neighbors
+            let true_neighbors = find_true_top_k(&query_vec, &base_reader, k, metric);
+
+            // Compare: check overlap of index sets
+            let true_set: std::collections::HashSet<u32> =
+                true_neighbors.iter().map(|n| n.index).collect();
+            let _provided_set: std::collections::HashSet<i32> =
+                provided_indices.iter().copied().collect();
+
+            let matching = provided_indices
+                .iter()
+                .filter(|&&idx| idx >= 0 && true_set.contains(&(idx as u32)))
+                .count();
+
+            let is_pass = matching == k;
+
+            if is_pass {
+                pass_count += 1;
+            } else {
+                fail_count += 1;
+                // Check if it's a distance-tie situation
+                let worst_true_dist = true_neighbors.last().map(|n| n.distance).unwrap_or(0.0);
+                let mut tie_adjusted_matching = matching;
+                for &idx in &provided_indices {
+                    if idx >= 0 && !true_set.contains(&(idx as u32)) {
+                        // This index wasn't in true set — check if its distance
+                        // is within phi of the worst true neighbor
+                        let base_vec = base_reader.get(idx as usize).unwrap_or_default();
+                        let dist = metric.distance(&query_vec, &base_vec);
+                        if (dist - worst_true_dist).abs() <= phi {
+                            tie_adjusted_matching += 1;
+                        }
+                    }
+                }
+                if tie_adjusted_matching == k {
+                    // Ties explain the difference
+                    fail_count -= 1;
+                    pass_count += 1;
+                } else {
+                    eprintln!(
+                        "  FAIL query {}: {}/{} matching ({} with ties)",
+                        qi, matching, k, tie_adjusted_matching
+                    );
+                }
+            }
+
+            if (qi - range_start + 1) % 100 == 0 || qi + 1 == range_end {
+                eprint!(
+                    "\r  {}/{} verified ({} pass, {} fail)",
+                    qi - range_start + 1,
+                    range_end - range_start,
+                    pass_count,
+                    fail_count
+                );
+            }
+        }
+        eprintln!();
+
+        let total = pass_count + fail_count;
+        let status = if fail_count == 0 {
+            Status::Ok
+        } else {
+            Status::Error
+        };
+
+        CommandResult {
+            status,
+            message: format!(
+                "verified {}/{} queries: {} pass, {} fail (k={}, metric={:?})",
+                total,
+                range_end - range_start,
+                pass_count,
+                fail_count,
+                k,
+                metric
+            ),
+            produced: vec![],
+            elapsed: start.elapsed(),
+        }
+    }
+
+    fn describe_options(&self) -> Vec<OptionDesc> {
+        vec![
+            OptionDesc {
+                name: "base".to_string(),
+                type_name: "Path".to_string(),
+                required: true,
+                default: None,
+                description: "Base vectors file (fvec)".to_string(),
+            },
+            OptionDesc {
+                name: "query".to_string(),
+                type_name: "Path".to_string(),
+                required: true,
+                default: None,
+                description: "Query vectors file (fvec)".to_string(),
+            },
+            OptionDesc {
+                name: "indices".to_string(),
+                type_name: "Path".to_string(),
+                required: true,
+                default: None,
+                description: "Precomputed neighbor indices (ivec)".to_string(),
+            },
+            OptionDesc {
+                name: "metric".to_string(),
+                type_name: "enum".to_string(),
+                required: false,
+                default: Some("L2".to_string()),
+                description: "Distance metric: L2, COSINE, DOT_PRODUCT, L1".to_string(),
+            },
+            OptionDesc {
+                name: "phi".to_string(),
+                type_name: "float".to_string(),
+                required: false,
+                default: Some("0.001".to_string()),
+                description: "Floating-point tolerance for distance comparison".to_string(),
+            },
+            OptionDesc {
+                name: "range".to_string(),
+                type_name: "String".to_string(),
+                required: false,
+                default: None,
+                description: "Query range to verify (e.g. '0..100')".to_string(),
+            },
+        ]
+    }
+}
+
+/// Parse a range string like "0..100" or "[0,100)".
+fn parse_range(s: &str, max: usize) -> Result<(usize, usize), String> {
+    if let Some((a, b)) = s.split_once("..") {
+        let start: usize = a.trim().parse().map_err(|_| format!("invalid range start: '{}'", a))?;
+        let end: usize = if b.trim().is_empty() {
+            max
+        } else {
+            b.trim().parse().map_err(|_| format!("invalid range end: '{}'", b))?
+        };
+        if start >= end || end > max {
+            return Err(format!("range {}..{} out of bounds (max {})", start, end, max));
+        }
+        Ok((start, end))
+    } else {
+        Err(format!("invalid range format: '{}'. Use 'start..end'", s))
+    }
+}
+
+fn resolve_path(path_str: &str, workspace: &Path) -> PathBuf {
+    let p = PathBuf::from(path_str);
+    if p.is_absolute() {
+        p
+    } else {
+        workspace.join(p)
+    }
+}
+
+fn error_result(message: String, start: Instant) -> CommandResult {
+    CommandResult {
+        status: Status::Error,
+        message,
+        produced: vec![],
+        elapsed: start.elapsed(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pipeline::command::StreamContext;
+    use crate::pipeline::commands::compute_knn::ComputeKnnOp;
+    use crate::pipeline::commands::gen_vectors::GenerateVectorsOp;
+    use crate::pipeline::progress::ProgressLog;
+    use indexmap::IndexMap;
+
+    fn test_ctx(dir: &Path) -> StreamContext {
+        StreamContext {
+            workspace: dir.to_path_buf(),
+            scratch: dir.join(".scratch"),
+            cache: dir.join(".cache"),
+            defaults: IndexMap::new(),
+            dry_run: false,
+            progress: ProgressLog::new(),
+            threads: 1,
+            step_id: String::new(),
+        }
+    }
+
+    #[test]
+    fn test_verify_knn_pass() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        let mut ctx = test_ctx(ws);
+
+        // Generate base and query vectors
+        let base = ws.join("base.fvec");
+        let query = ws.join("query.fvec");
+        for (path, count) in [(&base, "30"), (&query, "5")] {
+            let mut opts = Options::new();
+            opts.set("output", path.to_string_lossy().to_string());
+            opts.set("dimension", "4");
+            opts.set("count", count);
+            opts.set("seed", "42");
+            let mut gen_op = GenerateVectorsOp;
+            gen_op.execute(&opts, &mut ctx);
+        }
+
+        // Compute KNN
+        let indices = ws.join("indices.ivec");
+        let mut opts = Options::new();
+        opts.set("base", base.to_string_lossy().to_string());
+        opts.set("query", query.to_string_lossy().to_string());
+        opts.set("indices", indices.to_string_lossy().to_string());
+        opts.set("neighbors", "3");
+        opts.set("metric", "L2");
+        let mut knn = ComputeKnnOp;
+        let r = knn.execute(&opts, &mut ctx);
+        assert_eq!(r.status, Status::Ok);
+
+        // Verify — should pass since we just computed the correct answer
+        let mut opts = Options::new();
+        opts.set("base", base.to_string_lossy().to_string());
+        opts.set("query", query.to_string_lossy().to_string());
+        opts.set("indices", indices.to_string_lossy().to_string());
+        opts.set("metric", "L2");
+
+        let mut verify = AnalyzeVerifyKnnOp;
+        let result = verify.execute(&opts, &mut ctx);
+        assert_eq!(result.status, Status::Ok, "verify failed: {}", result.message);
+    }
+
+    #[test]
+    fn test_verify_knn_with_range() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        let mut ctx = test_ctx(ws);
+
+        let base = ws.join("base.fvec");
+        let query = ws.join("query.fvec");
+        for (path, count) in [(&base, "20"), (&query, "10")] {
+            let mut opts = Options::new();
+            opts.set("output", path.to_string_lossy().to_string());
+            opts.set("dimension", "4");
+            opts.set("count", count);
+            opts.set("seed", "42");
+            let mut gen_op = GenerateVectorsOp;
+            gen_op.execute(&opts, &mut ctx);
+        }
+
+        let indices = ws.join("indices.ivec");
+        let mut opts = Options::new();
+        opts.set("base", base.to_string_lossy().to_string());
+        opts.set("query", query.to_string_lossy().to_string());
+        opts.set("indices", indices.to_string_lossy().to_string());
+        opts.set("neighbors", "3");
+        let mut knn = ComputeKnnOp;
+        knn.execute(&opts, &mut ctx);
+
+        // Verify only queries 2..5
+        let mut opts = Options::new();
+        opts.set("base", base.to_string_lossy().to_string());
+        opts.set("query", query.to_string_lossy().to_string());
+        opts.set("indices", indices.to_string_lossy().to_string());
+        opts.set("range", "2..5");
+
+        let mut verify = AnalyzeVerifyKnnOp;
+        let result = verify.execute(&opts, &mut ctx);
+        assert_eq!(result.status, Status::Ok);
+        assert!(result.message.contains("3/3"));
+    }
+
+    #[test]
+    fn test_parse_range_valid() {
+        assert_eq!(parse_range("0..10", 100).unwrap(), (0, 10));
+        assert_eq!(parse_range("5..50", 100).unwrap(), (5, 50));
+        assert_eq!(parse_range("0..", 100).unwrap(), (0, 100));
+    }
+
+    #[test]
+    fn test_parse_range_invalid() {
+        assert!(parse_range("50..10", 100).is_err());
+        assert!(parse_range("0..200", 100).is_err());
+        assert!(parse_range("abc", 100).is_err());
+    }
+}
