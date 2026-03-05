@@ -14,8 +14,13 @@ use url::Url;
 
 /// Interface for accessing the components of a dataset profile.
 ///
-/// Each method returns a thread-safe `VectorReader` for the corresponding component.
+/// This mirrors the Java `TestDataView` interface, which extends both
+/// `VectorTestDataView` and `PredicateTestDataView`. Vector and filtered-neighbor
+/// methods return `VectorReader`s; metadata accessors return the `FacetConfig`
+/// so callers can resolve the underlying resource.
 pub trait TestDataView: Send + Sync {
+    // -- Vector facets --
+
     /// Returns a reader for the base (database) vectors.
     fn base_vectors(&self) -> Result<Arc<dyn VectorReader<f32>>>;
     /// Returns a reader for the query vectors.
@@ -24,6 +29,24 @@ pub trait TestDataView: Send + Sync {
     fn neighbor_indices(&self) -> Result<Arc<dyn VectorReader<i32>>>;
     /// Returns a reader for the neighbor distances (ground truth).
     fn neighbor_distances(&self) -> Result<Arc<dyn VectorReader<f32>>>;
+
+    // -- Filtered neighbor facets --
+
+    /// Returns a reader for the filtered neighbor indices.
+    fn filtered_neighbor_indices(&self) -> Result<Arc<dyn VectorReader<i32>>>;
+    /// Returns a reader for the filtered neighbor distances.
+    fn filtered_neighbor_distances(&self) -> Result<Arc<dyn VectorReader<f32>>>;
+
+    // -- Metadata facets (config access) --
+
+    /// Returns the facet config for metadata content, if present.
+    fn metadata_content(&self) -> Option<&FacetConfig>;
+    /// Returns the facet config for metadata predicates, if present.
+    fn metadata_predicates(&self) -> Option<&FacetConfig>;
+    /// Returns the facet config for predicate result indices, if present.
+    fn predicate_results(&self) -> Option<&FacetConfig>;
+    /// Returns the facet config for metadata layout, if present.
+    fn metadata_layout(&self) -> Option<&FacetConfig>;
 }
 
 /// A generic implementation of `TestDataView`.
@@ -110,5 +133,29 @@ impl TestDataView for GenericTestDataView {
 
     fn neighbor_distances(&self) -> Result<Arc<dyn VectorReader<f32>>> {
         self.open_fvec(self.config.neighbor_distances.as_ref(), "neighbor_distances")
+    }
+
+    fn filtered_neighbor_indices(&self) -> Result<Arc<dyn VectorReader<i32>>> {
+        self.open_ivec(self.config.filtered_neighbor_indices.as_ref(), "filtered_neighbor_indices")
+    }
+
+    fn filtered_neighbor_distances(&self) -> Result<Arc<dyn VectorReader<f32>>> {
+        self.open_fvec(self.config.filtered_neighbor_distances.as_ref(), "filtered_neighbor_distances")
+    }
+
+    fn metadata_content(&self) -> Option<&FacetConfig> {
+        self.config.metadata_content.as_ref()
+    }
+
+    fn metadata_predicates(&self) -> Option<&FacetConfig> {
+        self.config.metadata_predicates.as_ref()
+    }
+
+    fn predicate_results(&self) -> Option<&FacetConfig> {
+        self.config.predicate_results.as_ref()
+    }
+
+    fn metadata_layout(&self) -> Option<&FacetConfig> {
+        self.config.metadata_layout.as_ref()
     }
 }

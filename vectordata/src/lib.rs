@@ -41,6 +41,7 @@ pub mod view;
 pub mod group;
 
 pub use group::TestDataGroup;
+pub use model::FacetConfig;
 pub use view::TestDataView;
 pub use io::VectorReader;
 

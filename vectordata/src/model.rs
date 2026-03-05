@@ -16,7 +16,13 @@
 //!     query_vectors: query.fvec
 //!     neighbor_indices: ground_truth.ivec
 //!     neighbor_distances: distances.fvec
-//!   
+//!     metadata_content: meta.slab
+//!     metadata_predicates: predicates.slab
+//!     predicate_results: results.slab
+//!     metadata_layout: layout.slab
+//!     filtered_neighbor_indices: filtered_gt.ivec
+//!     filtered_neighbor_distances: filtered_dist.fvec
+//!
 //!   small:
 //!     base_vectors:
 //!       source: base.fvec
@@ -38,17 +44,44 @@ pub struct DatasetConfig {
 
 /// Configuration for a specific profile within a dataset.
 ///
-/// A profile defines which files (facets) constitute the dataset view (e.g., base vectors, queries).
+/// A profile defines which files (facets) constitute the dataset view.
+/// Facet names match the canonical keys from the Java `TestDataKind` enum.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProfileConfig {
+    // -- Vector facets --
+
     /// Configuration for the base (database) vectors.
     pub base_vectors: Option<FacetConfig>,
+    /// Optional original content associated with base vectors.
+    pub base_content: Option<FacetConfig>,
     /// Configuration for the query vectors.
     pub query_vectors: Option<FacetConfig>,
+    /// Optional query terms dataset.
+    pub query_terms: Option<FacetConfig>,
+    /// Optional query filters dataset.
+    pub query_filters: Option<FacetConfig>,
     /// Configuration for the ground truth neighbor indices.
     pub neighbor_indices: Option<FacetConfig>,
     /// Configuration for the ground truth neighbor distances.
     pub neighbor_distances: Option<FacetConfig>,
+
+    // -- Filtered neighbor facets --
+
+    /// Filtered ground-truth neighbor indices (pre-conditioned on metadata predicates).
+    pub filtered_neighbor_indices: Option<FacetConfig>,
+    /// Filtered ground-truth neighbor distances (pre-conditioned on metadata predicates).
+    pub filtered_neighbor_distances: Option<FacetConfig>,
+
+    // -- Metadata facets --
+
+    /// Metadata content records (MNode-encoded slab).
+    pub metadata_content: Option<FacetConfig>,
+    /// Metadata predicate trees (PNode-encoded slab).
+    pub metadata_predicates: Option<FacetConfig>,
+    /// Predicate result indices — ordinals matching metadata records for each predicate.
+    pub predicate_results: Option<FacetConfig>,
+    /// Metadata layout describing the field schema.
+    pub metadata_layout: Option<FacetConfig>,
 }
 
 /// Configuration for a single facet (file resource) of a dataset.
