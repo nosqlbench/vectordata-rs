@@ -2,6 +2,13 @@
 name = "veks"
 version = "0.2.0"
 edition = "2024"
+description = "A vector bulk data processing tool"
+license = "Apache-2.0"
+homepage = "https://github.com/nosqlbench/vectordata-rs"
+repository = "https://github.com/nosqlbench/vectordata-rs"
+readme = "README.md"
+keywords = ["vector", "dataset", "ann", "testing", "automation"]
+categories = ["filesystem", "network-programming", "science"]
 
 [[bin]]
 name = "veks"
