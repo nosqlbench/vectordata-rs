@@ -1,7 +1,7 @@
 [workspace]
 members = [
     "vectordata",
-    "vecs",
+    "veks",
     "slabtastic",
 ]
 resolver = "2"

@@ -75,7 +75,7 @@ pub fn run(args: ImportArgs) {
 ///
 /// Iterates the default profile's views and imports each source file
 /// as the corresponding facet. Datasets with pipeline-based upstream
-/// (`upstream.steps`) should use `vecs run` instead.
+/// (`upstream.steps`) should use `veks run` instead.
 fn run_dataset_import(dataset_path: &Path, args: &ImportArgs) {
     let config = DatasetConfig::load(dataset_path).unwrap_or_else(|e| {
         eprintln!("{}", e);
@@ -99,7 +99,7 @@ fn run_dataset_import(dataset_path: &Path, args: &ImportArgs) {
         Some(p) => p,
         None => {
             eprintln!("No default profile defined — nothing to import.");
-            eprintln!("Use 'vecs run' for pipeline-based datasets.");
+            eprintln!("Use 'veks run' for pipeline-based datasets.");
             return;
         }
     };
@@ -127,7 +127,7 @@ fn run_dataset_import(dataset_path: &Path, args: &ImportArgs) {
 
     if importable.is_empty() {
         eprintln!("No view sources found on disk — nothing to import.");
-        eprintln!("Use 'vecs run' for pipeline-based datasets.");
+        eprintln!("Use 'veks run' for pipeline-based datasets.");
         return;
     }
 

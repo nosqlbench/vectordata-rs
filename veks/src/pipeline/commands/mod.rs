@@ -3,7 +3,7 @@
 
 //! Built-in pipeline command implementations.
 //!
-//! Each command wraps an existing vecs operation or provides a new Rust-native
+//! Each command wraps an existing veks operation or provides a new Rust-native
 //! implementation behind the `CommandOp` trait, extracting options from the
 //! pipeline `Options` map and delegating to the underlying logic.
 

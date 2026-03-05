@@ -1,7 +1,7 @@
 // Copyright (c) DataStax, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Implementation of `vecs analyze describe` — reports metadata and
+//! Implementation of `veks analyze describe` — reports metadata and
 //! normalization status for vector files and dataset facets.
 
 use std::fs;

@@ -24,7 +24,7 @@ use expand::expand_tokens;
 /// Entry point for the bulkdl subcommand
 pub async fn run(args: BulkDlArgs) {
     logging::init_logging();
-    info!("vecs bulkdl starting with config: {}", args.config.display());
+    info!("veks bulkdl starting with config: {}", args.config.display());
 
     let config_text = fs::read_to_string(&args.config).unwrap_or_else(|e| {
         eprintln!("Error reading config file {}: {}", args.config.display(), e);
@@ -170,5 +170,5 @@ pub async fn run(args: BulkDlArgs) {
         pb.finish_with_message(format!("{} (done)", dataset.name));
     }
 
-    info!("vecs bulkdl finished");
+    info!("veks bulkdl finished");
 }

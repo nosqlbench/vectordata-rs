@@ -8,8 +8,8 @@
 //! only through YAML pipeline files:
 //!
 //! ```text
-//! vecs pipeline analyze stats --source=test.fvec
-//! vecs pipeline generate predicated --input-dir=./dataset --selectivity=0.1
+//! veks pipeline analyze stats --source=test.fvec
+//! veks pipeline generate predicated --input-dir=./dataset --selectivity=0.1
 //! ```
 
 use std::collections::BTreeMap;
@@ -112,7 +112,7 @@ pub fn build_pipeline_command() -> Command {
 /// options, then creates a `StreamContext` and executes the command.
 pub fn run_direct(args: Vec<String>) {
     if args.len() < 2 {
-        eprintln!("Usage: vecs pipeline <group> <command> [--option=value ...]");
+        eprintln!("Usage: veks pipeline <group> <command> [--option=value ...]");
         std::process::exit(1);
     }
 

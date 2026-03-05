@@ -1,7 +1,7 @@
 // Copyright (c) DataStax, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Command stream pipeline framework for vecs.
+//! Command stream pipeline framework for veks.
 //!
 //! This module provides a declarative YAML-driven pipeline system that can
 //! describe multi-step transformation pipelines embedded in `dataset.yaml`.
@@ -15,12 +15,12 @@
 //!
 //! ## Usage
 //!
-//! The primary entry point is [`run_pipeline`], invoked by `vecs run`:
+//! The primary entry point is [`run_pipeline`], invoked by `veks run`:
 //!
 //! ```text
-//! vecs run dataset.yaml              # execute pipeline
-//! vecs run dataset.yaml --dry-run    # validate only
-//! vecs run dataset.yaml --clean      # delete progress + intermediates
+//! veks run dataset.yaml              # execute pipeline
+//! veks run dataset.yaml --dry-run    # validate only
+//! veks run dataset.yaml --clean      # delete progress + intermediates
 //! ```
 
 pub mod bound;
@@ -47,7 +47,7 @@ use command::StreamContext;
 use progress::ProgressLog;
 use registry::CommandRegistry;
 
-/// CLI arguments for `vecs run`.
+/// CLI arguments for `veks run`.
 #[derive(Args)]
 pub struct RunArgs {
     /// Path to dataset.yaml containing the pipeline definition.
@@ -79,7 +79,7 @@ pub struct RunArgs {
     pub emit_yaml: bool,
 }
 
-/// Entry point for `vecs run` — execute a command stream pipeline.
+/// Entry point for `veks run` — execute a command stream pipeline.
 pub fn run_pipeline(args: RunArgs) {
     let dataset_path = &args.dataset;
 

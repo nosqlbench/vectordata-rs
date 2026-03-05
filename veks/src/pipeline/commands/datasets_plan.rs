@@ -153,27 +153,27 @@ impl CommandOp for DatasetsPlanOp {
                 match (name.as_str(), ext) {
                     (n, "fvec") if n.contains("base") || n.contains("vector") => {
                         eprintln!(
-                            "  vecs run generate vectors output={} dimension={} count=<COUNT> seed=42",
+                            "  veks run generate vectors output={} dimension={} count=<COUNT> seed=42",
                             full.display(),
                             dim.unwrap_or(128)
                         );
                     }
                     (n, "fvec") if n.contains("query") => {
                         eprintln!(
-                            "  vecs run generate vectors output={} dimension={} count=<QUERY_COUNT> seed=43",
+                            "  veks run generate vectors output={} dimension={} count=<QUERY_COUNT> seed=43",
                             full.display(),
                             dim.unwrap_or(128)
                         );
                     }
                     (n, "ivec") if n.contains("neighbor") || n.contains("indic") => {
                         eprintln!(
-                            "  vecs run compute knn source=<BASE_VECTORS> queries=<QUERY_VECTORS> output-indices={} k=100 metric=EUCLIDEAN",
+                            "  veks run compute knn source=<BASE_VECTORS> queries=<QUERY_VECTORS> output-indices={} k=100 metric=EUCLIDEAN",
                             full.display()
                         );
                     }
                     (n, "fvec") if n.contains("dist") => {
                         eprintln!(
-                            "  vecs run compute knn source=<BASE_VECTORS> queries=<QUERY_VECTORS> output-distances={} k=100 metric=EUCLIDEAN",
+                            "  veks run compute knn source=<BASE_VECTORS> queries=<QUERY_VECTORS> output-distances={} k=100 metric=EUCLIDEAN",
                             full.display()
                         );
                     }

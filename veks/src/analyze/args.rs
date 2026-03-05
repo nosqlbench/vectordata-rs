@@ -24,7 +24,7 @@ pub enum AnalyzeCommand {
     Describe(DescribeArgs),
 }
 
-/// Arguments for `vecs analyze describe`
+/// Arguments for `veks analyze describe`
 #[derive(Args)]
 pub struct DescribeArgs {
     /// File path, directory, or dataset.yaml to describe

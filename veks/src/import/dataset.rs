@@ -34,7 +34,7 @@ pub struct DatasetConfig {
 
     /// Top-level pipeline configuration (shared defaults and steps).
     ///
-    /// When present, `vecs run` can execute a full multi-step pipeline.
+    /// When present, `veks run` can execute a full multi-step pipeline.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub upstream: Option<PipelineConfig>,
 
