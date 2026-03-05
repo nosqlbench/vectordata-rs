@@ -39,7 +39,7 @@ serde_yaml = "0.9"
 simsimd = "6"
 slabtastic = { path = "../slabtastic", version ="0.7.0" }
 tokio = { version = "1", features = ["full"] }
-vectordata = { path = "../vectordata", version="0.1.0" }
+vectordata = { path = "../vectordata", version="0.2.0" }
 
 [dev-dependencies]
 tempfile = "3"
