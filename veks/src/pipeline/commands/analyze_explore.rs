@@ -17,7 +17,8 @@ use vectordata::VectorReader;
 use vectordata::io::MmapVectorReader;
 
 use crate::pipeline::command::{
-    CommandOp, CommandResult, OptionDesc, Options, Status, StreamContext,
+    CommandDoc, CommandOp, CommandResult, OptionDesc, Options, ResourceDesc, Status, StreamContext,
+    render_options_table,
 };
 
 /// Pipeline command: interactive vector file explorer.
@@ -30,6 +31,24 @@ pub fn factory() -> Box<dyn CommandOp> {
 impl CommandOp for AnalyzeExploreOp {
     fn command_path(&self) -> &str {
         "analyze explore"
+    }
+
+    fn command_doc(&self) -> CommandDoc {
+        let options = self.describe_options();
+        CommandDoc {
+            summary: "Interactive exploration of vector file contents".into(),
+            body: format!(
+                "# analyze explore\n\nInteractive exploration of vector file contents.\n\n## Description\n\nOpens a vector file and provides an interactive REPL for querying vectors, computing distances, finding neighbors, and inspecting file contents. Supports scripted commands via the `commands` option.\n\n## Options\n\n{}",
+                render_options_table(&options)
+            ),
+        }
+    }
+
+    fn describe_resources(&self) -> Vec<ResourceDesc> {
+        vec![
+            ResourceDesc { name: "mem".into(), description: "Vector data buffers".into(), adjustable: false },
+            ResourceDesc { name: "readahead".into(), description: "Sequential read prefetch".into(), adjustable: false },
+        ]
     }
 
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
@@ -54,9 +73,9 @@ impl CommandOp for AnalyzeExploreOp {
         let count = <MmapVectorReader<f32> as VectorReader<f32>>::count(&reader);
         let dim = <MmapVectorReader<f32> as VectorReader<f32>>::dim(&reader);
 
-        eprintln!("Exploring: {} ({} vectors, {} dims)", source.display(), count, dim);
-        eprintln!("Type 'help' for available commands, 'quit' to exit.");
-        eprintln!();
+        ctx.display.log(&format!("Exploring: {} ({} vectors, {} dims)", source.display(), count, dim));
+        ctx.display.log("Type 'help' for available commands, 'quit' to exit.");
+        ctx.display.log("");
 
         // Check if stdin is a TTY for interactive mode
         let is_interactive = atty::is(atty::Stream::Stdin);
@@ -442,6 +461,8 @@ mod tests {
             progress: ProgressLog::new(),
             threads: 1,
             step_id: String::new(),
+            governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
+            display: crate::pipeline::display::ProgressDisplay::new(),
         }
     }
 

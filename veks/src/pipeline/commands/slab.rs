@@ -4,7 +4,8 @@
 //! Pipeline commands: slabtastic file operations.
 //!
 //! Provides import, export, append, rewrite, check, get, analyze, explain,
-//! and namespaces commands for `.slab` files using the `slabtastic` crate.
+//! namespaces, inspect, and survey commands for `.slab` files using the
+//! `slabtastic` crate.
 //!
 //! Equivalent to the Java `CMD_slab_*` commands.
 
@@ -12,11 +13,13 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use slabtastic::{SlabReader, SlabWriter, WriterConfig};
+use slabtastic::{OpenProgress, SlabReader, SlabWriter, WriterConfig};
 
 use crate::pipeline::command::{
-    CommandOp, CommandResult, OptionDesc, Options, Status, StreamContext,
+    CommandDoc, CommandOp, CommandResult, OptionDesc, Options, ResourceDesc, Status, StreamContext,
+    render_options_table,
 };
+use crate::pipeline::display::ProgressDisplay;
 
 // -- Slab Import --------------------------------------------------------------
 
@@ -30,6 +33,24 @@ pub fn import_factory() -> Box<dyn CommandOp> {
 impl CommandOp for SlabImportOp {
     fn command_path(&self) -> &str {
         "slab import"
+    }
+
+    fn command_doc(&self) -> CommandDoc {
+        let options = self.describe_options();
+        CommandDoc {
+            summary: "Import records into a slab file".into(),
+            body: format!(
+                "# slab import\n\nImport records into a slab file.\n\n## Description\n\nReads records from an input source and writes them into a slab file, creating or overwriting the target file.\n\n## Options\n\n{}",
+                render_options_table(&options)
+            ),
+        }
+    }
+
+    fn describe_resources(&self) -> Vec<ResourceDesc> {
+        vec![
+            ResourceDesc { name: "iothreads".into(), description: "Concurrent I/O for source reading".into(), adjustable: false },
+            ResourceDesc { name: "readahead".into(), description: "Read-ahead buffer size".into(), adjustable: false },
+        ]
     }
 
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
@@ -87,7 +108,7 @@ impl CommandOp for SlabImportOp {
         }
 
         let count = records.len();
-        eprintln!("Imported {} records from {} to {}", count, from_path.display(), to_path.display());
+        ctx.display.log(&format!("Imported {} records from {} to {}", count, from_path.display(), to_path.display()));
 
         CommandResult {
             status: Status::Ok,
@@ -122,7 +143,7 @@ fn read_source_records(path: &Path, format: &str) -> Result<Vec<Vec<u8>>, String
             Ok(data.split(|&b| b == 0).filter(|s| !s.is_empty()).map(|s| s.to_vec()).collect())
         }
         "slab" => {
-            let reader = SlabReader::open(path)
+            let reader = open_slab(path)
                 .map_err(|e| format!("failed to open slab: {}", e))?;
             let mut records = Vec::new();
             let mut iter = reader.batch_iter(4096);
@@ -160,6 +181,23 @@ impl CommandOp for SlabExportOp {
         "slab export"
     }
 
+    fn command_doc(&self) -> CommandDoc {
+        let options = self.describe_options();
+        CommandDoc {
+            summary: "Export slab records to text or binary".into(),
+            body: format!(
+                "# slab export\n\nExport slab records to text or binary.\n\n## Description\n\nReads records from a slab file and exports them in the specified output format.\n\n## Options\n\n{}",
+                render_options_table(&options)
+            ),
+        }
+    }
+
+    fn describe_resources(&self) -> Vec<ResourceDesc> {
+        vec![
+            ResourceDesc { name: "readahead".into(), description: "Sequential read prefetch".into(), adjustable: false },
+        ]
+    }
+
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
         let start = Instant::now();
 
@@ -170,7 +208,7 @@ impl CommandOp for SlabExportOp {
         let input_path = resolve_path(input_str, &ctx.workspace);
         let format = options.get("format").unwrap_or("text");
 
-        let reader = match SlabReader::open(&input_path) {
+        let reader = match open_slab_display(&input_path, &ctx.display) {
             Ok(r) => r,
             Err(e) => return error_result(format!("failed to open: {}", e), start),
         };
@@ -258,6 +296,23 @@ impl CommandOp for SlabAppendOp {
         "slab append"
     }
 
+    fn command_doc(&self) -> CommandDoc {
+        let options = self.describe_options();
+        CommandDoc {
+            summary: "Append records from one slab to another".into(),
+            body: format!(
+                "# slab append\n\nAppend records from one slab to another.\n\n## Description\n\nReads records from a source slab file and appends them to a destination slab file.\n\n## Options\n\n{}",
+                render_options_table(&options)
+            ),
+        }
+    }
+
+    fn describe_resources(&self) -> Vec<ResourceDesc> {
+        vec![
+            ResourceDesc { name: "readahead".into(), description: "Sequential read prefetch".into(), adjustable: false },
+        ]
+    }
+
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
         let start = Instant::now();
 
@@ -279,7 +334,7 @@ impl CommandOp for SlabAppendOp {
             .unwrap_or(65536);
 
         // Read source records
-        let source = match SlabReader::open(&from_path) {
+        let source = match open_slab_display(&from_path, &ctx.display) {
             Ok(r) => r,
             Err(e) => return error_result(format!("failed to open source: {}", e), start),
         };
@@ -315,7 +370,7 @@ impl CommandOp for SlabAppendOp {
             return error_result(format!("finish error: {}", e), start);
         }
 
-        eprintln!("Appended {} records from {} to {}", count, from_path.display(), target_path.display());
+        ctx.display.log(&format!("Appended {} records from {} to {}", count, from_path.display(), target_path.display()));
 
         CommandResult {
             status: Status::Ok,
@@ -348,6 +403,24 @@ impl CommandOp for SlabRewriteOp {
         "slab rewrite"
     }
 
+    fn command_doc(&self) -> CommandDoc {
+        let options = self.describe_options();
+        CommandDoc {
+            summary: "Rewrite a slab file with new page layout".into(),
+            body: format!(
+                "# slab rewrite\n\nRewrite a slab file with new page layout.\n\n## Description\n\nReads a slab file and rewrites it with a new page size or layout configuration.\n\n## Options\n\n{}",
+                render_options_table(&options)
+            ),
+        }
+    }
+
+    fn describe_resources(&self) -> Vec<ResourceDesc> {
+        vec![
+            ResourceDesc { name: "mem".into(), description: "Page buffers during rewrite".into(), adjustable: true },
+            ResourceDesc { name: "readahead".into(), description: "Sequential read prefetch".into(), adjustable: false },
+        ]
+    }
+
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
         let start = Instant::now();
 
@@ -375,7 +448,7 @@ impl CommandOp for SlabRewriteOp {
             );
         }
 
-        let reader = match SlabReader::open(&source_path) {
+        let reader = match open_slab_display(&source_path, &ctx.display) {
             Ok(r) => r,
             Err(e) => return error_result(format!("failed to open source: {}", e), start),
         };
@@ -411,7 +484,7 @@ impl CommandOp for SlabRewriteOp {
             return error_result(format!("finish error: {}", e), start);
         }
 
-        eprintln!("Rewrote {} records from {} to {}", count, source_path.display(), dest_path.display());
+        ctx.display.log(&format!("Rewrote {} records from {} to {}", count, source_path.display(), dest_path.display()));
 
         CommandResult {
             status: Status::Ok,
@@ -445,6 +518,17 @@ impl CommandOp for SlabCheckOp {
         "slab check"
     }
 
+    fn command_doc(&self) -> CommandDoc {
+        let options = self.describe_options();
+        CommandDoc {
+            summary: "Verify slab file structural integrity".into(),
+            body: format!(
+                "# slab check\n\nVerify slab file structural integrity.\n\n## Description\n\nValidates the internal structure of a slab file, checking page boundaries and record consistency.\n\n## Options\n\n{}",
+                render_options_table(&options)
+            ),
+        }
+    }
+
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
         let start = Instant::now();
 
@@ -455,7 +539,7 @@ impl CommandOp for SlabCheckOp {
         let input_path = resolve_path(input_str, &ctx.workspace);
         let verbose = options.get("verbose").map_or(false, |s| s == "true");
 
-        let reader = match SlabReader::open(&input_path) {
+        let reader = match open_slab_display(&input_path, &ctx.display) {
             Ok(r) => r,
             Err(e) => {
                 return CommandResult {
@@ -480,29 +564,29 @@ impl CommandOp for SlabCheckOp {
                     let recs = page.record_count() as u64;
                     record_count += recs;
                     if verbose {
-                        eprintln!(
+                        ctx.display.log(&format!(
                             "  Page {}: offset={}, ordinal={}, records={}",
                             i,
                             entry.file_offset,
                             entry.start_ordinal,
                             recs
-                        );
+                        ));
                     }
                 }
                 Err(e) => {
                     errors += 1;
-                    eprintln!("  Page {}: ERROR: {}", i, e);
+                    ctx.display.log(&format!("  Page {}: ERROR: {}", i, e));
                 }
             }
         }
 
         if errors == 0 {
-            eprintln!(
+            ctx.display.log(&format!(
                 "OK: {} pages, {} records in {}",
                 page_count,
                 record_count,
                 input_path.display()
-            );
+            ));
             CommandResult {
                 status: Status::Ok,
                 message: format!("{} pages, {} records, no errors", page_count, record_count),
@@ -541,6 +625,17 @@ impl CommandOp for SlabGetOp {
         "slab get"
     }
 
+    fn command_doc(&self) -> CommandDoc {
+        let options = self.describe_options();
+        CommandDoc {
+            summary: "Retrieve a single record by ordinal".into(),
+            body: format!(
+                "# slab get\n\nRetrieve a single record by ordinal.\n\n## Description\n\nLooks up and displays a single record from a slab file by its ordinal position.\n\n## Options\n\n{}",
+                render_options_table(&options)
+            ),
+        }
+    }
+
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
         let start = Instant::now();
 
@@ -561,7 +656,7 @@ impl CommandOp for SlabGetOp {
             Err(e) => return error_result(e, start),
         };
 
-        let reader = match SlabReader::open(&input_path) {
+        let reader = match open_slab_display(&input_path, &ctx.display) {
             Ok(r) => r,
             Err(e) => return error_result(format!("failed to open: {}", e), start),
         };
@@ -576,20 +671,20 @@ impl CommandOp for SlabGetOp {
                         "hex" => {
                             let hex: Vec<String> =
                                 data.iter().map(|b| format!("{:02x}", b)).collect();
-                            eprintln!("[{}]: {}", ordinal, hex.join(" "));
+                            ctx.display.log(&format!("[{}]: {}", ordinal, hex.join(" ")));
                         }
                         "raw" => {
                             std::io::stdout().write_all(&data).ok();
                         }
                         _ => {
                             let text = String::from_utf8_lossy(&data);
-                            eprintln!("[{}]: {}", ordinal, text);
+                            ctx.display.log(&format!("[{}]: {}", ordinal, text));
                         }
                     }
                     found += 1;
                 }
                 Err(e) => {
-                    eprintln!("[{}]: NOT FOUND ({})", ordinal, e);
+                    ctx.display.log(&format!("[{}]: NOT FOUND ({})", ordinal, e));
                     missing += 1;
                 }
             }
@@ -659,6 +754,17 @@ impl CommandOp for SlabAnalyzeOp {
         "slab analyze"
     }
 
+    fn command_doc(&self) -> CommandDoc {
+        let options = self.describe_options();
+        CommandDoc {
+            summary: "Analyze slab page utilization and statistics".into(),
+            body: format!(
+                "# slab analyze\n\nAnalyze slab page utilization and statistics.\n\n## Description\n\nScans a slab file and reports page-level utilization metrics and record statistics.\n\n## Options\n\n{}",
+                render_options_table(&options)
+            ),
+        }
+    }
+
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
         let start = Instant::now();
 
@@ -668,7 +774,7 @@ impl CommandOp for SlabAnalyzeOp {
         };
         let input_path = resolve_path(input_str, &ctx.workspace);
 
-        let reader = match SlabReader::open(&input_path) {
+        let reader = match open_slab_display(&input_path, &ctx.display) {
             Ok(r) => r,
             Err(e) => return error_result(format!("failed to open: {}", e), start),
         };
@@ -712,13 +818,13 @@ impl CommandOp for SlabAnalyzeOp {
             }
         }
 
-        eprintln!("Slab Analysis: {}", input_path.display());
-        eprintln!("  File size: {} bytes", file_size);
-        eprintln!("  Pages: {}", page_count);
-        eprintln!("  Records: {}", total_records);
+        ctx.display.log(&format!("Slab Analysis: {}", input_path.display()));
+        ctx.display.log(&format!("  File size: {} bytes", file_size));
+        ctx.display.log(&format!("  Pages: {}", page_count));
+        ctx.display.log(&format!("  Records: {}", total_records));
 
         if min_ordinal <= max_ordinal {
-            eprintln!("  Ordinal range: {} .. {}", min_ordinal, max_ordinal);
+            ctx.display.log(&format!("  Ordinal range: {} .. {}", min_ordinal, max_ordinal));
         }
 
         if !record_sizes.is_empty() {
@@ -727,7 +833,7 @@ impl CommandOp for SlabAnalyzeOp {
             let max_rs = record_sizes[record_sizes.len() - 1];
             let avg_rs: f64 = record_sizes.iter().sum::<usize>() as f64 / record_sizes.len() as f64;
             let median_rs = record_sizes[record_sizes.len() / 2];
-            eprintln!("  Record sizes: min={}, max={}, avg={:.1}, median={}", min_rs, max_rs, avg_rs, median_rs);
+            ctx.display.log(&format!("  Record sizes: min={}, max={}, avg={:.1}, median={}", min_rs, max_rs, avg_rs, median_rs));
 
             // Content type detection from first page
             if let Some(first_entry) = page_entries.first() {
@@ -748,7 +854,7 @@ impl CommandOp for SlabAnalyzeOp {
                     } else {
                         "binary"
                     };
-                    eprintln!("  Content type: {} (sampled {} records)", content_type, sample_count);
+                    ctx.display.log(&format!("  Content type: {} (sampled {} records)", content_type, sample_count));
                 }
             }
         }
@@ -757,13 +863,13 @@ impl CommandOp for SlabAnalyzeOp {
             let min_ps = page_sizes.iter().min().unwrap();
             let max_ps = page_sizes.iter().max().unwrap();
             let avg_ps: f64 = page_sizes.iter().sum::<u64>() as f64 / page_sizes.len() as f64;
-            eprintln!("  Page sizes: min={}, max={}, avg={:.0}", min_ps, max_ps, avg_ps);
+            ctx.display.log(&format!("  Page sizes: min={}, max={}, avg={:.0}", min_ps, max_ps, avg_ps));
 
             // Utilization
             let total_page_bytes: u64 = page_sizes.iter().sum();
             if file_size > 0 {
                 let utilization = total_page_bytes as f64 / file_size as f64 * 100.0;
-                eprintln!("  Page utilization: {:.1}%", utilization);
+                ctx.display.log(&format!("  Page utilization: {:.1}%", utilization));
             }
         }
 
@@ -796,6 +902,17 @@ impl CommandOp for SlabExplainOp {
         "slab explain"
     }
 
+    fn command_doc(&self) -> CommandDoc {
+        let options = self.describe_options();
+        CommandDoc {
+            summary: "Decode and display a record's wire format".into(),
+            body: format!(
+                "# slab explain\n\nDecode and display a record's wire format.\n\n## Description\n\nRetrieves a record by ordinal and displays its raw wire-format encoding with field annotations.\n\n## Options\n\n{}",
+                render_options_table(&options)
+            ),
+        }
+    }
+
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
         let start = Instant::now();
 
@@ -811,7 +928,7 @@ impl CommandOp for SlabExplainOp {
                 .collect()
         });
 
-        let reader = match SlabReader::open(&input_path) {
+        let reader = match open_slab_display(&input_path, &ctx.display) {
             Ok(r) => r,
             Err(e) => return error_result(format!("failed to open: {}", e), start),
         };
@@ -830,17 +947,17 @@ impl CommandOp for SlabExplainOp {
                     let recs = page.record_count();
                     let page_size = page.serialized_size();
 
-                    eprintln!("┌─── Page {} ───────────────────────────┐", i);
-                    eprintln!("│ Offset:    {:<28}│", entry.file_offset);
-                    eprintln!("│ Page size: {:<28}│", page_size);
-                    eprintln!("│ Ordinals:  {:<28}│",
-                        format!("{}..{}", entry.start_ordinal, entry.start_ordinal + recs as i64));
-                    eprintln!("│ Records:   {:<28}│", recs);
+                    ctx.display.log(&format!("┌─── Page {} ───────────────────────────┐", i));
+                    ctx.display.log(&format!("│ Offset:    {:<28}│", entry.file_offset));
+                    ctx.display.log(&format!("│ Page size: {:<28}│", page_size));
+                    ctx.display.log(&format!("│ Ordinals:  {:<28}│",
+                        format!("{}..{}", entry.start_ordinal, entry.start_ordinal + recs as i64)));
+                    ctx.display.log(&format!("│ Records:   {:<28}│", recs));
 
                     // Show first few record sizes
                     let preview_count = recs.min(5) as i64;
                     if preview_count > 0 {
-                        eprintln!("│ Record preview:                       │");
+                        ctx.display.log("│ Record preview:                       │");
                         for j in 0..preview_count {
                             let ord = entry.start_ordinal + j;
                             if let Ok(data) = reader.get(ord) {
@@ -849,29 +966,29 @@ impl CommandOp for SlabExplainOp {
                                     .collect::<Vec<_>>()
                                     .join(" ");
                                 let suffix = if data.len() > 16 { "..." } else { "" };
-                                eprintln!("│   [{}]: {} bytes  {}{:<2}│",
-                                    ord, data.len(), hex_preview, suffix);
+                                ctx.display.log(&format!("│   [{}]: {} bytes  {}{:<2}│",
+                                    ord, data.len(), hex_preview, suffix));
                             }
                         }
                     }
-                    eprintln!("└───────────────────────────────────────┘");
-                    eprintln!();
+                    ctx.display.log("└───────────────────────────────────────┘");
+                    ctx.display.log("");
                 }
                 Err(e) => {
-                    eprintln!("Page {}: ERROR reading: {}", i, e);
+                    ctx.display.log(&format!("Page {}: ERROR reading: {}", i, e));
                 }
             }
         }
 
         // Show pages page summary
-        eprintln!("Pages Page: {} entries", page_entries.len());
+        ctx.display.log(&format!("Pages Page: {} entries", page_entries.len()));
         for (i, entry) in page_entries.iter().enumerate() {
-            eprintln!(
+            ctx.display.log(&format!(
                 "  [{}] ordinal={}, offset={}",
                 i,
                 entry.start_ordinal,
                 entry.file_offset
-            );
+            ));
         }
 
         CommandResult {
@@ -904,6 +1021,17 @@ impl CommandOp for SlabNamespacesOp {
         "slab namespaces"
     }
 
+    fn command_doc(&self) -> CommandDoc {
+        let options = self.describe_options();
+        CommandDoc {
+            summary: "List namespace IDs present in a slab file".into(),
+            body: format!(
+                "# slab namespaces\n\nList namespace IDs present in a slab file.\n\n## Description\n\nScans a slab file and lists all distinct namespace identifiers found in its records.\n\n## Options\n\n{}",
+                render_options_table(&options)
+            ),
+        }
+    }
+
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
         let start = Instant::now();
 
@@ -918,20 +1046,20 @@ impl CommandOp for SlabNamespacesOp {
             Err(e) => return error_result(format!("failed to list namespaces: {}", e), start),
         };
 
-        eprintln!("{:<6} {:<30} {:>14}", "Index", "Name", "PagesOffset");
-        eprintln!("{}", "-".repeat(54));
+        ctx.display.log(&format!("{:<6} {:<30} {:>14}", "Index", "Name", "PagesOffset"));
+        ctx.display.log(&format!("{}", "-".repeat(54)));
 
         for ns in &namespaces {
-            eprintln!(
+            ctx.display.log(&format!(
                 "{:<6} {:<30} {:>14}",
                 ns.namespace_index,
                 ns.name,
                 ns.pages_page_offset,
-            );
+            ));
         }
 
-        eprintln!();
-        eprintln!("{} namespace(s)", namespaces.len());
+        ctx.display.log("");
+        ctx.display.log(&format!("{} namespace(s)", namespaces.len()));
 
         CommandResult {
             status: Status::Ok,
@@ -962,6 +1090,17 @@ impl CommandOp for SlabInspectOp {
         "slab inspect"
     }
 
+    fn command_doc(&self) -> CommandDoc {
+        let options = self.describe_options();
+        CommandDoc {
+            summary: "Inspect slab file header and page structure".into(),
+            body: format!(
+                "# slab inspect\n\nInspect slab file header and page structure.\n\n## Description\n\nDisplays the file header, page directory, and structural details of a slab file.\n\n## Options\n\n{}",
+                render_options_table(&options)
+            ),
+        }
+    }
+
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
         let start = Instant::now();
 
@@ -988,7 +1127,7 @@ impl CommandOp for SlabInspectOp {
             Err(e) => return error_result(e, start),
         };
 
-        let reader = match SlabReader::open(&input_path) {
+        let reader = match open_slab_display(&input_path, &ctx.display) {
             Ok(r) => r,
             Err(e) => return error_result(format!("failed to open: {}", e), start),
         };
@@ -1007,17 +1146,17 @@ impl CommandOp for SlabInspectOp {
                     match decode_result {
                         Ok(anode) => {
                             let rendered = crate::formats::anode_vernacular::render(&anode, vernacular);
-                            eprintln!("[{}]: {}", ordinal, rendered);
+                            ctx.display.log(&format!("[{}]: {}", ordinal, rendered));
                             found += 1;
                         }
                         Err(e) => {
-                            eprintln!("[{}]: DECODE ERROR: {}", ordinal, e);
+                            ctx.display.log(&format!("[{}]: DECODE ERROR: {}", ordinal, e));
                             errors += 1;
                         }
                     }
                 }
                 Err(e) => {
-                    eprintln!("[{}]: NOT FOUND ({})", ordinal, e);
+                    ctx.display.log(&format!("[{}]: NOT FOUND ({})", ordinal, e));
                     errors += 1;
                 }
             }
@@ -1043,7 +1182,645 @@ impl CommandOp for SlabInspectOp {
     }
 }
 
+// -- Slab Survey ---------------------------------------------------------------
+
+/// Pipeline command: sample slab records, decode as ANodes, and report per-field
+/// value distribution statistics.
+pub struct SlabSurveyOp;
+
+/// Create a boxed `SlabSurveyOp` command.
+pub fn survey_factory() -> Box<dyn CommandOp> {
+    Box::new(SlabSurveyOp)
+}
+
+impl CommandOp for SlabSurveyOp {
+    fn command_path(&self) -> &str {
+        "slab survey"
+    }
+
+    fn command_doc(&self) -> CommandDoc {
+        let options = self.describe_options();
+        CommandDoc {
+            summary: "Survey metadata field value distributions".into(),
+            body: format!(
+                "# slab survey\n\nSurvey metadata field value distributions.\n\n## Description\n\nScans slab records and reports the distribution of values for each metadata field.\n\n## Options\n\n{}",
+                render_options_table(&options)
+            ),
+        }
+    }
+
+    fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
+        let start = Instant::now();
+
+        let input_str = match options.require("input") {
+            Ok(s) => s,
+            Err(e) => return error_result(e, start),
+        };
+        let input_path = resolve_path(input_str, &ctx.workspace);
+
+        let max_samples: usize = options
+            .get("samples")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1000);
+        let max_distinct: usize = options
+            .get("max-distinct")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(20);
+
+        let output_path = options.get("output").map(|s| resolve_path(s, &ctx.workspace));
+
+        let survey = match survey_slab(&input_path, max_samples, max_distinct) {
+            Ok(s) => s,
+            Err(e) => return error_result(e, start),
+        };
+
+        // Print results
+        ctx.display.log(&format!(
+            "Slab Survey: {} ({} of {} records sampled)",
+            input_path.display(),
+            survey.sampled,
+            survey.total_records,
+        ));
+
+        for (name, fs) in &survey.field_stats {
+            ctx.display.log("");
+            ctx.display.log(&format!(
+                "  Field \"{}\" — {} values ({} null)",
+                name, fs.count, fs.null_count,
+            ));
+
+            // Type breakdown
+            let mut type_parts: Vec<String> = Vec::new();
+            for (tag, cnt) in &fs.type_counts {
+                type_parts.push(format!("{} ({})", tag, cnt));
+            }
+            if !type_parts.is_empty() {
+                ctx.display.log(&format!("    types: {}", type_parts.join(", ")));
+            }
+
+            // Numeric stats
+            if fs.numeric_count > 0 {
+                let mean = fs.numeric_sum / fs.numeric_count as f64;
+                ctx.display.log(&format!(
+                    "    range: {} .. {}   mean: {:.1}",
+                    fs.numeric_min, fs.numeric_max, mean,
+                ));
+            }
+
+            // String length stats
+            if fs.strlen_count > 0 {
+                let mean = fs.strlen_sum as f64 / fs.strlen_count as f64;
+                ctx.display.log(&format!(
+                    "    strlen: {} .. {}   mean: {:.1}",
+                    fs.strlen_min, fs.strlen_max, mean,
+                ));
+            }
+
+            // Bytes length stats
+            if fs.byteslen_count > 0 {
+                let mean = fs.byteslen_sum as f64 / fs.byteslen_count as f64;
+                ctx.display.log(&format!(
+                    "    byteslen: {} .. {}   mean: {:.1}",
+                    fs.byteslen_min, fs.byteslen_max, mean,
+                ));
+            }
+
+            // Distinct values
+            if !fs.distinct.is_empty() {
+                let overflow_msg = if fs.distinct_overflow {
+                    " (overflow — more exist)"
+                } else {
+                    ""
+                };
+                ctx.display.log(&format!(
+                    "    {} distinct values{}",
+                    fs.distinct.len(),
+                    overflow_msg,
+                ));
+            }
+        }
+
+        if survey.non_mnode_count > 0 || survey.decode_errors > 0 {
+            ctx.display.log("");
+            if survey.non_mnode_count > 0 {
+                ctx.display.log(&format!("  Non-MNode records: {}", survey.non_mnode_count));
+            }
+            if survey.decode_errors > 0 {
+                ctx.display.log(&format!("  Decode errors: {}", survey.decode_errors));
+            }
+        }
+
+        // Write JSON output if requested
+        let mut produced = vec![];
+        if let Some(ref out_path) = output_path {
+            match survey_to_json(&survey, out_path) {
+                Ok(()) => {
+                    produced.push(out_path.clone());
+                }
+                Err(e) => return error_result(format!("failed to write JSON: {}", e), start),
+            }
+        }
+
+        // Build field names list for message
+        let field_names: Vec<&str> = survey.field_stats.keys().map(|s| s.as_str()).collect();
+        let message = format!(
+            "{} records sampled, {} fields: {}",
+            survey.sampled,
+            field_names.len(),
+            field_names.join(", "),
+        );
+
+        CommandResult {
+            status: Status::Ok,
+            message,
+            produced,
+            elapsed: start.elapsed(),
+        }
+    }
+
+    fn describe_options(&self) -> Vec<OptionDesc> {
+        vec![
+            opt("input", "Path", true, None, "Slab file to survey"),
+            opt("output", "Path", false, None, "Optional JSON output file for survey results"),
+            opt("samples", "int", false, Some("1000"), "Max records to sample"),
+            opt("max-distinct", "int", false, Some("20"), "Max distinct values tracked per field"),
+        ]
+    }
+}
+
+/// Per-field distribution statistics accumulated during a slab survey.
+pub(crate) struct FieldStats {
+    pub(crate) count: usize,
+    pub(crate) null_count: usize,
+    pub(crate) type_counts: indexmap::IndexMap<String, usize>,
+    pub(crate) numeric_min: f64,
+    pub(crate) numeric_max: f64,
+    pub(crate) numeric_sum: f64,
+    pub(crate) numeric_count: usize,
+    pub(crate) strlen_min: usize,
+    pub(crate) strlen_max: usize,
+    pub(crate) strlen_sum: usize,
+    pub(crate) strlen_count: usize,
+    pub(crate) byteslen_min: usize,
+    pub(crate) byteslen_max: usize,
+    pub(crate) byteslen_sum: usize,
+    pub(crate) byteslen_count: usize,
+    pub(crate) distinct: indexmap::IndexMap<String, usize>,
+    pub(crate) distinct_overflow: bool,
+}
+
+impl FieldStats {
+    pub(crate) fn new() -> Self {
+        FieldStats {
+            count: 0,
+            null_count: 0,
+            type_counts: indexmap::IndexMap::new(),
+            numeric_min: f64::INFINITY,
+            numeric_max: f64::NEG_INFINITY,
+            numeric_sum: 0.0,
+            numeric_count: 0,
+            strlen_min: usize::MAX,
+            strlen_max: 0,
+            strlen_sum: 0,
+            strlen_count: 0,
+            byteslen_min: usize::MAX,
+            byteslen_max: 0,
+            byteslen_sum: 0,
+            byteslen_count: 0,
+            distinct: indexmap::IndexMap::new(),
+            distinct_overflow: false,
+        }
+    }
+
+    /// Observe a single field value, updating all tracked statistics.
+    pub(crate) fn observe(&mut self, value: &crate::formats::mnode::MValue, max_distinct: usize) {
+        use crate::formats::mnode::MValue;
+
+        self.count += 1;
+
+        if matches!(value, MValue::Null) {
+            self.null_count += 1;
+        }
+
+        let tag_name = value.tag().to_string();
+        *self.type_counts.entry(tag_name).or_insert(0) += 1;
+
+        // Numeric stats
+        let numeric_val: Option<f64> = match value {
+            MValue::Int(v) => Some(*v as f64),
+            MValue::Int32(v) => Some(*v as f64),
+            MValue::Short(v) => Some(*v as f64),
+            MValue::Float(v) => Some(*v),
+            MValue::Float32(v) => Some(*v as f64),
+            MValue::Half(v) => Some(half::f16::from_bits(*v).to_f64()),
+            MValue::Millis(v) => Some(*v as f64),
+            _ => None,
+        };
+        if let Some(v) = numeric_val {
+            if v < self.numeric_min { self.numeric_min = v; }
+            if v > self.numeric_max { self.numeric_max = v; }
+            self.numeric_sum += v;
+            self.numeric_count += 1;
+        }
+
+        // String length stats
+        let str_val: Option<&str> = match value {
+            MValue::Text(s) | MValue::Ascii(s) | MValue::EnumStr(s)
+            | MValue::Date(s) | MValue::Time(s) | MValue::DateTime(s) => Some(s.as_str()),
+            _ => None,
+        };
+        if let Some(s) = str_val {
+            let len = s.len();
+            if len < self.strlen_min { self.strlen_min = len; }
+            if len > self.strlen_max { self.strlen_max = len; }
+            self.strlen_sum += len;
+            self.strlen_count += 1;
+        }
+
+        // Bytes length stats
+        if let MValue::Bytes(b) = value {
+            let len = b.len();
+            if len < self.byteslen_min { self.byteslen_min = len; }
+            if len > self.byteslen_max { self.byteslen_max = len; }
+            self.byteslen_sum += len;
+            self.byteslen_count += 1;
+        }
+
+        // Distinct value tracking
+        if !self.distinct_overflow {
+            let repr = format!("{}", value);
+            if self.distinct.contains_key(&repr) {
+                *self.distinct.get_mut(&repr).unwrap() += 1;
+            } else if self.distinct.len() < max_distinct {
+                self.distinct.insert(repr, 1);
+            } else {
+                self.distinct_overflow = true;
+            }
+        }
+    }
+}
+
+/// Select `n` evenly-spaced page indices from `total` pages.
+pub(crate) fn sample_page_indices(total: usize, n: usize) -> Vec<usize> {
+    if n == 0 || total == 0 {
+        return vec![];
+    }
+    if n >= total {
+        return (0..total).collect();
+    }
+    let step = total as f64 / n as f64;
+    (0..n).map(|i| (i as f64 * step) as usize).collect()
+}
+
+/// Result of surveying a slab file's field distributions.
+pub(crate) struct SurveyResult {
+    /// Per-field distribution statistics, keyed by field name.
+    pub(crate) field_stats: indexmap::IndexMap<String, FieldStats>,
+    /// Total records sampled.
+    pub(crate) sampled: usize,
+    /// Total records in the slab.
+    pub(crate) total_records: usize,
+    /// Number of non-MNode records encountered.
+    pub(crate) non_mnode_count: usize,
+    /// Number of decode errors encountered.
+    pub(crate) decode_errors: usize,
+}
+
+/// Survey a slab file by sampling records and gathering per-field statistics.
+///
+/// Opens the slab, samples up to `max_samples` records across evenly-spaced
+/// pages, decodes each as an MNode, and accumulates field statistics.
+pub(crate) fn survey_slab(
+    path: &Path,
+    max_samples: usize,
+    max_distinct: usize,
+) -> Result<SurveyResult, String> {
+    let reader = open_slab(path)
+        .map_err(|e| format!("failed to open: {}", e))?;
+
+    let page_entries = reader.page_entries();
+    let total_pages = page_entries.len();
+
+    if total_pages == 0 {
+        return Ok(SurveyResult {
+            field_stats: indexmap::IndexMap::new(),
+            sampled: 0,
+            total_records: 0,
+            non_mnode_count: 0,
+            decode_errors: 0,
+        });
+    }
+
+    // Use the cached page index for total record count — no extra I/O
+    let total_records = reader.total_records() as usize;
+
+    let desired_pages = if total_records == 0 {
+        0
+    } else {
+        let avg_recs_per_page = total_records as f64 / total_pages as f64;
+        let needed = (max_samples as f64 / avg_recs_per_page).ceil() as usize;
+        needed.max(1).min(total_pages)
+    };
+    let sample_indices = sample_page_indices(total_pages, desired_pages);
+
+    eprintln!(
+        "    survey: sampling {} of {} pages ({} total records, target {} samples)",
+        sample_indices.len(), total_pages, total_records, max_samples,
+    );
+
+    use crate::formats::anode;
+    use crate::formats::anode::ANode;
+
+    let mut field_stats: indexmap::IndexMap<String, FieldStats> = indexmap::IndexMap::new();
+    let mut sampled = 0usize;
+    let mut non_mnode_count = 0usize;
+    let mut decode_errors = 0usize;
+    let sample_page_count = sample_indices.len();
+    let survey_start = std::time::Instant::now();
+    let mut last_report = std::time::Instant::now();
+
+    'outer: for (progress_idx, &page_idx) in sample_indices.iter().enumerate() {
+        if progress_idx > 0
+            && (last_report.elapsed().as_secs() >= 5 || progress_idx + 1 == sample_page_count)
+        {
+            last_report = std::time::Instant::now();
+            let elapsed = survey_start.elapsed().as_secs_f64();
+            let rate = if elapsed > 0.0 { sampled as f64 / elapsed } else { 0.0 };
+            let pct = (progress_idx + 1) as f64 / sample_page_count as f64 * 100.0;
+            let eta = if rate > 0.0 {
+                let remaining_pages = sample_page_count - progress_idx - 1;
+                let avg_recs_per_page = if progress_idx > 0 { sampled as f64 / progress_idx as f64 } else { 1.0 };
+                let remaining_secs = remaining_pages as f64 * avg_recs_per_page / rate;
+                if remaining_secs < 60.0 { format!(", ETA {:.0}s", remaining_secs) }
+                else if remaining_secs < 3600.0 { format!(", ETA {:.1}m", remaining_secs / 60.0) }
+                else { format!(", ETA {:.1}h", remaining_secs / 3600.0) }
+            } else {
+                String::new()
+            };
+            eprintln!(
+                "    survey: {:.1}% ({}/{} pages, {} records, {:.0} rec/s{})",
+                pct, progress_idx + 1, sample_page_count, sampled, rate, eta,
+            );
+        }
+
+        let entry = &page_entries[page_idx];
+        let page = match reader.read_data_page(entry) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        let rec_count = page.record_count();
+        for i in 0..rec_count {
+            if sampled >= max_samples {
+                break 'outer;
+            }
+            let data = match page.get_record(i) {
+                Some(d) => d,
+                None => continue,
+            };
+            match anode::decode(data) {
+                Ok(ANode::MNode(node)) => {
+                    for (name, value) in &node.fields {
+                        let fs = field_stats
+                            .entry(name.clone())
+                            .or_insert_with(FieldStats::new);
+                        fs.observe(value, max_distinct);
+                    }
+                }
+                Ok(ANode::PNode(_)) => {
+                    non_mnode_count += 1;
+                }
+                Err(_) => {
+                    decode_errors += 1;
+                }
+            }
+            sampled += 1;
+        }
+    }
+
+    eprintln!("    survey: complete, {} records sampled", sampled);
+
+    Ok(SurveyResult {
+        field_stats,
+        sampled,
+        total_records,
+        non_mnode_count,
+        decode_errors,
+    })
+}
+
+/// Write survey results to a JSON file.
+///
+/// Produces a JSON object with `sampled`, `total_records`, and a `fields`
+/// object containing per-field statistics (types, numeric range, string
+/// lengths, distinct values, etc.).
+fn survey_to_json(survey: &SurveyResult, path: &Path) -> Result<(), String> {
+    use serde_json::{Map, Number, Value};
+
+    let mut root = Map::new();
+    root.insert("sampled".into(), Value::Number(Number::from(survey.sampled)));
+    root.insert("total_records".into(), Value::Number(Number::from(survey.total_records)));
+    root.insert("non_mnode_count".into(), Value::Number(Number::from(survey.non_mnode_count)));
+    root.insert("decode_errors".into(), Value::Number(Number::from(survey.decode_errors)));
+
+    let mut fields = Map::new();
+    for (name, fs) in &survey.field_stats {
+        let mut field_obj = Map::new();
+        field_obj.insert("count".into(), Value::Number(Number::from(fs.count)));
+        field_obj.insert("null_count".into(), Value::Number(Number::from(fs.null_count)));
+
+        let mut types = Map::new();
+        for (tag, cnt) in &fs.type_counts {
+            types.insert(tag.clone(), Value::Number(Number::from(*cnt)));
+        }
+        field_obj.insert("types".into(), Value::Object(types));
+
+        if fs.numeric_count > 0 {
+            let mut numeric = Map::new();
+            if let Some(n) = Number::from_f64(fs.numeric_min) {
+                numeric.insert("min".into(), Value::Number(n));
+            }
+            if let Some(n) = Number::from_f64(fs.numeric_max) {
+                numeric.insert("max".into(), Value::Number(n));
+            }
+            let mean = fs.numeric_sum / fs.numeric_count as f64;
+            if let Some(n) = Number::from_f64(mean) {
+                numeric.insert("mean".into(), Value::Number(n));
+            }
+            numeric.insert("count".into(), Value::Number(Number::from(fs.numeric_count)));
+            field_obj.insert("numeric".into(), Value::Object(numeric));
+        }
+
+        if fs.strlen_count > 0 {
+            let mut strlen = Map::new();
+            strlen.insert("min".into(), Value::Number(Number::from(fs.strlen_min)));
+            strlen.insert("max".into(), Value::Number(Number::from(fs.strlen_max)));
+            let mean = fs.strlen_sum as f64 / fs.strlen_count as f64;
+            if let Some(n) = Number::from_f64(mean) {
+                strlen.insert("mean".into(), Value::Number(n));
+            }
+            strlen.insert("count".into(), Value::Number(Number::from(fs.strlen_count)));
+            field_obj.insert("strlen".into(), Value::Object(strlen));
+        }
+
+        if fs.byteslen_count > 0 {
+            let mut byteslen = Map::new();
+            byteslen.insert("min".into(), Value::Number(Number::from(fs.byteslen_min)));
+            byteslen.insert("max".into(), Value::Number(Number::from(fs.byteslen_max)));
+            let mean = fs.byteslen_sum as f64 / fs.byteslen_count as f64;
+            if let Some(n) = Number::from_f64(mean) {
+                byteslen.insert("mean".into(), Value::Number(n));
+            }
+            byteslen.insert("count".into(), Value::Number(Number::from(fs.byteslen_count)));
+            field_obj.insert("byteslen".into(), Value::Object(byteslen));
+        }
+
+        if !fs.distinct.is_empty() {
+            let mut distinct = Map::new();
+            for (val, cnt) in &fs.distinct {
+                distinct.insert(val.clone(), Value::Number(Number::from(*cnt)));
+            }
+            field_obj.insert("distinct".into(), Value::Object(distinct));
+            field_obj.insert("distinct_overflow".into(), Value::Bool(fs.distinct_overflow));
+        }
+
+        fields.insert(name.clone(), Value::Object(field_obj));
+    }
+    root.insert("fields".into(), Value::Object(fields));
+
+    let json = serde_json::to_string_pretty(&Value::Object(root))
+        .map_err(|e| format!("JSON serialization failed: {}", e))?;
+
+    if let Some(parent) = path.parent() {
+        if !parent.exists() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("failed to create directory: {}", e))?;
+        }
+    }
+    std::fs::write(path, json)
+        .map_err(|e| format!("failed to write {}: {}", path.display(), e))?;
+
+    eprintln!("  Survey JSON written to {}", path.display());
+
+    Ok(())
+}
+
+/// Load survey results from a JSON file previously written by [`survey_to_json`].
+///
+/// Reconstructs a [`SurveyResult`] with [`FieldStats`] populated from the JSON
+/// fields used by predicate generation: `count`, `null_count`, `types`,
+/// `numeric` (min/max), `distinct`, and `distinct_overflow`.
+pub(crate) fn survey_from_json(path: &Path) -> Result<SurveyResult, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("failed to read {}: {}", path.display(), e))?;
+    let root: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| format!("failed to parse JSON: {}", e))?;
+
+    let sampled = root.get("sampled").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    let total_records = root.get("total_records").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    let non_mnode_count = root.get("non_mnode_count").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    let decode_errors = root.get("decode_errors").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+
+    let mut field_stats = indexmap::IndexMap::new();
+
+    if let Some(fields) = root.get("fields").and_then(|v| v.as_object()) {
+        for (name, fobj) in fields {
+            let mut fs = FieldStats::new();
+
+            fs.count = fobj.get("count").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            fs.null_count = fobj.get("null_count").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+
+            if let Some(types) = fobj.get("types").and_then(|v| v.as_object()) {
+                for (tag, cnt) in types {
+                    fs.type_counts.insert(tag.clone(), cnt.as_u64().unwrap_or(0) as usize);
+                }
+            }
+
+            if let Some(numeric) = fobj.get("numeric").and_then(|v| v.as_object()) {
+                fs.numeric_min = numeric.get("min").and_then(|v| v.as_f64()).unwrap_or(f64::INFINITY);
+                fs.numeric_max = numeric.get("max").and_then(|v| v.as_f64()).unwrap_or(f64::NEG_INFINITY);
+                let mean = numeric.get("mean").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                fs.numeric_count = numeric.get("count").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                fs.numeric_sum = mean * fs.numeric_count as f64;
+            }
+
+            if let Some(strlen) = fobj.get("strlen").and_then(|v| v.as_object()) {
+                fs.strlen_min = strlen.get("min").and_then(|v| v.as_u64()).unwrap_or(usize::MAX as u64) as usize;
+                fs.strlen_max = strlen.get("max").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                fs.strlen_count = strlen.get("count").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let mean = strlen.get("mean").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                fs.strlen_sum = (mean * fs.strlen_count as f64) as usize;
+            }
+
+            if let Some(distinct) = fobj.get("distinct").and_then(|v| v.as_object()) {
+                for (val, cnt) in distinct {
+                    fs.distinct.insert(val.clone(), cnt.as_u64().unwrap_or(0) as usize);
+                }
+            }
+            fs.distinct_overflow = fobj.get("distinct_overflow").and_then(|v| v.as_bool()).unwrap_or(false);
+
+            field_stats.insert(name.clone(), fs);
+        }
+    }
+
+    Ok(SurveyResult {
+        field_stats,
+        sampled,
+        total_records,
+        non_mnode_count,
+        decode_errors,
+    })
+}
+
 // -- Helpers -------------------------------------------------------------------
+
+/// Open a slab file with progress feedback on stderr.
+///
+/// Wraps [`SlabReader::open_with_progress`] so that large files report
+/// page index scan progress during the open.
+fn open_slab(path: &Path) -> slabtastic::Result<SlabReader> {
+    open_slab_with_display(path, None)
+}
+
+fn open_slab_display(path: &Path, display: &ProgressDisplay) -> slabtastic::Result<SlabReader> {
+    open_slab_with_display(path, Some(display))
+}
+
+fn open_slab_with_display(path: &Path, display: Option<&ProgressDisplay>) -> slabtastic::Result<SlabReader> {
+    use indicatif::ProgressBar;
+
+    let pb: Option<ProgressBar> = None;
+    let pb = std::cell::RefCell::new(pb);
+
+    SlabReader::open_with_progress(path, |p| {
+        match p {
+            OpenProgress::PagesPageRead { page_count } => {
+                if let Some(d) = display {
+                    let bar = d.bar(*page_count as u64, "slab index");
+                    *pb.borrow_mut() = Some(bar);
+                } else {
+                    eprintln!("    slab index: {} pages to scan", page_count);
+                }
+            }
+            OpenProgress::IndexBuild { done, total } => {
+                if let Some(ref bar) = *pb.borrow() {
+                    bar.set_position(*done as u64);
+                } else {
+                    eprintln!("    slab index: {}/{} pages scanned", done, total);
+                }
+            }
+            OpenProgress::IndexComplete { total_records } => {
+                if let Some(bar) = pb.borrow_mut().take() {
+                    bar.finish_and_clear();
+                }
+                if let Some(d) = display {
+                    d.log(&format!("    slab index: complete, {} total records", total_records));
+                } else {
+                    eprintln!("    slab index: complete, {} total records", total_records);
+                }
+            }
+        }
+    })
+}
 
 fn resolve_path(path_str: &str, workspace: &Path) -> PathBuf {
     let p = PathBuf::from(path_str);
@@ -1092,6 +1869,8 @@ mod tests {
             progress: ProgressLog::new(),
             threads: 1,
             step_id: String::new(),
+            governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
+            display: crate::pipeline::display::ProgressDisplay::new(),
         }
     }
 
@@ -1270,6 +2049,65 @@ mod tests {
         assert_eq!(parse_ordinals("5").unwrap(), vec![5]);
         assert_eq!(parse_ordinals("0,5..8,10").unwrap(), vec![0, 5, 6, 7, 10]);
         assert!(parse_ordinals("abc").is_err());
+    }
+
+    #[test]
+    fn test_slab_survey() {
+        use crate::formats::mnode::MNode;
+        use crate::formats::mnode::MValue;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        let mut ctx = test_ctx(ws);
+
+        // Build MNode-encoded records
+        let mut node1 = MNode::new();
+        node1.insert("user_id".into(), MValue::Int(42));
+        node1.insert("name".into(), MValue::Text("alice".into()));
+
+        let mut node2 = MNode::new();
+        node2.insert("user_id".into(), MValue::Int(99));
+        node2.insert("name".into(), MValue::Text("bob".into()));
+
+        let mut node3 = MNode::new();
+        node3.insert("user_id".into(), MValue::Int(7));
+        node3.insert("name".into(), MValue::Null);
+
+        let rec1 = node1.to_bytes();
+        let rec2 = node2.to_bytes();
+        let rec3 = node3.to_bytes();
+
+        let slab_path = create_test_slab(
+            ws,
+            "survey.slab",
+            &[rec1.as_slice(), rec2.as_slice(), rec3.as_slice()],
+        );
+
+        let mut opts = Options::new();
+        opts.set("input", slab_path.to_string_lossy().to_string());
+        opts.set("samples", "100");
+        let mut op = SlabSurveyOp;
+        let result = op.execute(&opts, &mut ctx);
+        assert_eq!(result.status, Status::Ok, "survey failed: {}", result.message);
+        assert!(result.message.contains("user_id"), "message should mention user_id: {}", result.message);
+        assert!(result.message.contains("name"), "message should mention name: {}", result.message);
+        assert!(result.message.contains("3 records sampled"), "message: {}", result.message);
+    }
+
+    #[test]
+    fn test_slab_survey_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        let mut ctx = test_ctx(ws);
+
+        let slab_path = create_test_slab(ws, "empty.slab", &[]);
+
+        let mut opts = Options::new();
+        opts.set("input", slab_path.to_string_lossy().to_string());
+        let mut op = SlabSurveyOp;
+        let result = op.execute(&opts, &mut ctx);
+        assert_eq!(result.status, Status::Ok, "survey empty failed: {}", result.message);
+        assert!(result.message.contains("0 records sampled"), "message: {}", result.message);
     }
 
     #[test]

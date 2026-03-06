@@ -19,7 +19,8 @@ use crate::pipeline::command::{ArtifactState, Options};
 /// - If the file does not exist → `Absent`
 /// - If the file exists and is empty → `Partial`
 /// - If the file exists and has content → attempts format-specific checks
-/// - Falls back to `Complete` if format cannot be determined (conservative)
+/// - Returns `Unknown` if format cannot be determined (completeness
+///   cannot be verified without a recognized format)
 pub fn check_artifact_default(output: &Path, _options: &Options) -> ArtifactState {
     if !output.exists() {
         return ArtifactState::Absent;
@@ -38,8 +39,10 @@ pub fn check_artifact_default(output: &Path, _options: &Options) -> ArtifactStat
     if let Some(format) = VecFormat::detect(output) {
         check_format_specific(output, format, meta.len())
     } else {
-        // Cannot determine format — treat non-empty as complete (conservative)
-        ArtifactState::Complete
+        ArtifactState::Unknown(format!(
+            "unrecognized format for '{}' — cannot verify completeness",
+            output.display(),
+        ))
     }
 }
 
@@ -51,7 +54,11 @@ fn check_format_specific(output: &Path, format: VecFormat, file_size: u64) -> Ar
             check_xvec_completeness(file_size, format)
         }
         VecFormat::Slab => check_slab_completeness(output),
-        _ => ArtifactState::Complete,
+        _ => ArtifactState::Unknown(format!(
+            "format '{}' for '{}' has no completeness check",
+            format.name(),
+            output.display(),
+        )),
     }
 }
 
@@ -70,11 +77,14 @@ fn check_xvec_completeness(file_size: u64, format: VecFormat) -> ArtifactState {
     ArtifactState::Complete
 }
 
-/// Check slab file completeness by attempting to open and read the pages page.
+/// Check slab file completeness by probing the pages page.
+///
+/// Uses [`SlabReader::probe`] for a lightweight check that avoids
+/// building the full page index.
 fn check_slab_completeness(output: &Path) -> ArtifactState {
-    match slabtastic::SlabReader::open(output) {
-        Ok(reader) => {
-            if reader.page_entries().is_empty() {
+    match slabtastic::SlabReader::probe(output) {
+        Ok(stats) => {
+            if stats.page_count == 0 {
                 ArtifactState::Partial
             } else {
                 ArtifactState::Complete
@@ -109,7 +119,10 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(tmp.path(), b"some content").unwrap();
         let state = check_artifact_default(tmp.path(), &Options::new());
-        // Unknown format, non-empty → conservative Complete
-        assert_eq!(state, ArtifactState::Complete);
+        assert!(
+            matches!(state, ArtifactState::Unknown(_)),
+            "expected Unknown for unrecognized format, got {:?}",
+            state,
+        );
     }
 }

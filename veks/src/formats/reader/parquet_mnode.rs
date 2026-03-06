@@ -147,7 +147,7 @@ impl ParquetMnodeReader {
     /// backpressure. Results are reassembled in file-sorted order.
     ///
     /// `threads` controls the number of loader threads. Pass `0` to
-    /// auto-detect: the lesser of 3/4 of hardware threads or 32.
+    /// auto-detect: hardware thread count, capped at 64.
     pub fn open(path: &Path, threads: usize) -> Result<Box<dyn VecSource>, String> {
         let files = collect_parquet_files(path)?;
         let total_rows = count_total_rows(&files)?;
@@ -161,7 +161,7 @@ impl ParquetMnodeReader {
             let hw = std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(4);
-            (hw * 3 / 4).max(1).min(32)
+            hw.max(1).min(64)
         };
         let num_workers = if threads == 0 { default_threads } else { threads }
             .min(total_files);
@@ -439,12 +439,16 @@ fn collect_parquet_files(path: &Path) -> Result<Vec<PathBuf>, String> {
 
 /// Count total rows across all parquet files using file-level metadata.
 ///
-/// For directories with many files, prints periodic progress to stderr
-/// so the user can see that work is happening.
+/// For directories with more than 10 files, prints periodic progress to
+/// stderr so the user can see that work is happening.
 fn count_total_rows(files: &[PathBuf]) -> Result<u64, String> {
     let mut total = 0u64;
     let n = files.len();
-    let report_interval = if n > 100 { n / 10 } else { n + 1 };
+    // Report every ~10% but at least every 20 files, and always for >10 files
+    let report_interval = if n > 10 { (n / 10).max(1).min(20) } else { n + 1 };
+    if n > 10 {
+        eprintln!("    counting rows across {} parquet files...", n);
+    }
     for (i, f) in files.iter().enumerate() {
         let file = fs::File::open(f)
             .map_err(|e| format!("Failed to open {}: {}", f.display(), e))?;

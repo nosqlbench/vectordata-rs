@@ -12,6 +12,17 @@ use vectordata::io::MmapVectorReader;
 use super::VecSource;
 use crate::formats::VecFormat;
 
+/// Read buffer size for sequential xvec reads (4 MiB).
+///
+/// Large enough to amortize syscall overhead and encourage the kernel to
+/// do aggressive sequential read-ahead.
+const READ_BUF_SIZE: usize = 4 << 20;
+
+/// Interval (in bytes read) between `FADV_DONTNEED` calls that release
+/// already-consumed pages from the page cache. Prevents page cache
+/// accumulation that causes memory pressure and I/O throttling on large files.
+const READ_DONTNEED_INTERVAL: u64 = 64 << 20; // 64 MiB
+
 /// Opens an xvec source, dispatching to `MmapVectorReader` for
 /// fvec/ivec (the canonical implementation) and falling back to a manual
 /// stream reader for bvec/dvec/hvec/svec.
@@ -187,12 +198,20 @@ impl VecSource for IvecReader {
 /// Reads xvec formats not yet supported by `vectordata` (bvec, dvec, hvec, svec).
 ///
 /// Wire format per record: `[dimension: i32 LE][elements: dim * element_size bytes]`
+///
+/// Periodically advises the kernel to release already-read pages from the
+/// page cache via `FADV_DONTNEED`, preventing memory pressure on large files.
 struct RawXvecReader {
     readers: Vec<BufReader<File>>,
     current_reader_idx: usize,
     dimension: u32,
     element_size: usize,
     record_count: Option<u64>,
+    bytes_read: u64,
+    last_dontneed: u64,
+    /// Reusable read buffer — avoids per-record heap allocation and
+    /// the associated `clear_page_erms` zeroing cost.
+    read_buf: Vec<u8>,
 }
 
 impl RawXvecReader {
@@ -222,24 +241,28 @@ impl RawXvecReader {
             .map(|m| m.len() / record_size)
             .sum();
 
-        // Re-open all files (first one included, since we consumed part of it)
+        // Re-open all files with large buffers and sequential fadvise hints
         drop(first);
         let readers: Vec<BufReader<File>> = files
             .drain(..)
             .map(|f| {
-                BufReader::new(
-                    File::open(&f)
-                        .unwrap_or_else(|e| panic!("Failed to open {}: {}", f.display(), e)),
-                )
+                let file = File::open(&f)
+                    .unwrap_or_else(|e| panic!("Failed to open {}: {}", f.display(), e));
+                advise_sequential(&file);
+                BufReader::with_capacity(READ_BUF_SIZE, file)
             })
             .collect();
 
+        let data_len = dimension as usize * element_size;
         Ok(Box::new(RawXvecReader {
             readers,
             current_reader_idx: 0,
             dimension,
             element_size,
             record_count: Some(total_records),
+            bytes_read: 0,
+            last_dontneed: 0,
+            read_buf: vec![0u8; data_len],
         }))
     }
 }
@@ -272,13 +295,27 @@ impl VecSource for RawXvecReader {
                             self.dimension, dim
                         );
                     }
-                    let data_len = self.dimension as usize * self.element_size;
-                    let mut buf = vec![0u8; data_len];
-                    reader.read_exact(&mut buf).ok()?;
-                    return Some(buf);
+                    reader.read_exact(&mut self.read_buf).ok()?;
+                    let data_len = self.read_buf.len();
+                    self.bytes_read += 4 + data_len as u64;
+
+                    // Release already-read pages from the page cache
+                    if self.bytes_read - self.last_dontneed >= READ_DONTNEED_INTERVAL {
+                        advise_dontneed_reader(reader, self.last_dontneed, self.bytes_read);
+                        self.last_dontneed = self.bytes_read;
+                    }
+
+                    return Some(self.read_buf.clone());
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    // Release remaining pages before moving to next file
+                    if self.bytes_read > self.last_dontneed {
+                        let reader = &self.readers[self.current_reader_idx];
+                        advise_dontneed_reader(reader, self.last_dontneed, self.bytes_read);
+                    }
                     self.current_reader_idx += 1;
+                    self.bytes_read = 0;
+                    self.last_dontneed = 0;
                     continue;
                 }
                 Err(_) => return None,
@@ -288,6 +325,37 @@ impl VecSource for RawXvecReader {
 }
 
 // -- shared helpers ------------------------------------------------------------
+
+/// Tell the kernel it can release pages in the given byte range.
+///
+/// Prevents page cache accumulation that causes memory pressure and
+/// I/O throttling on large sequential reads.
+#[cfg(unix)]
+fn advise_dontneed_reader(reader: &BufReader<File>, offset: u64, end: u64) {
+    use std::os::unix::io::AsRawFd;
+    let fd = reader.get_ref().as_raw_fd();
+    unsafe {
+        libc::posix_fadvise(fd, offset as i64, (end - offset) as i64, libc::POSIX_FADV_DONTNEED);
+    }
+}
+
+#[cfg(not(unix))]
+fn advise_dontneed_reader(_reader: &BufReader<File>, _offset: u64, _end: u64) {}
+
+/// Hint the kernel that this file will be read sequentially.
+///
+/// Sets `FADV_SEQUENTIAL` which encourages aggressive read-ahead and
+/// reduces page cache pollution on large files.
+#[cfg(unix)]
+fn advise_sequential(file: &File) {
+    use std::os::unix::io::AsRawFd;
+    unsafe {
+        libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL);
+    }
+}
+
+#[cfg(not(unix))]
+fn advise_sequential(_file: &File) {}
 
 /// Collect xvec files from a path (single file or directory), sorted
 fn collect_xvec_files(path: &Path, ext: &str) -> Result<Vec<std::path::PathBuf>, String> {

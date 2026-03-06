@@ -20,7 +20,8 @@ use vectordata::VectorReader;
 use vectordata::io::MmapVectorReader;
 
 use crate::pipeline::command::{
-    CommandOp, CommandResult, OptionDesc, Options, Status, StreamContext,
+    CommandDoc, CommandOp, CommandResult, OptionDesc, Options, ResourceDesc, Status, StreamContext,
+    render_options_table,
 };
 
 /// Pipeline command: verify KNN results.
@@ -171,6 +172,25 @@ impl CommandOp for AnalyzeVerifyKnnOp {
         "analyze verify-knn"
     }
 
+    fn command_doc(&self) -> CommandDoc {
+        let options = self.describe_options();
+        CommandDoc {
+            summary: "Verify KNN results by recomputing distances".into(),
+            body: format!(
+                "# analyze verify-knn\n\nVerify KNN results by recomputing distances.\n\n## Description\n\nLoads base vectors, query vectors, and precomputed neighbor indices, then recomputes distances for a range of queries and verifies the provided neighborhoods match the true nearest neighbors. Supports L2, Cosine, DotProduct, and L1 distance metrics.\n\n## Options\n\n{}",
+                render_options_table(&options)
+            ),
+        }
+    }
+
+    fn describe_resources(&self) -> Vec<ResourceDesc> {
+        vec![
+            ResourceDesc { name: "mem".into(), description: "Base vector mmap and distance recomputation".into(), adjustable: false },
+            ResourceDesc { name: "threads".into(), description: "Parallel distance recomputation".into(), adjustable: true },
+            ResourceDesc { name: "readahead".into(), description: "Sequential read prefetch".into(), adjustable: false },
+        ]
+    }
+
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
         let start = Instant::now();
 
@@ -265,15 +285,22 @@ impl CommandOp for AnalyzeVerifyKnnOp {
             None => (0, query_count),
         };
 
-        eprintln!(
+        ctx.display.log(&format!(
             "Verify KNN: queries [{}, {}), k={}, metric={:?}, phi={}",
             range_start, range_end, k, metric, phi
-        );
+        ));
 
         let mut pass_count = 0usize;
         let mut fail_count = 0usize;
 
         for qi in range_start..range_end {
+            // Periodic governor checkpoint every 1000 queries
+            if (qi - range_start) % 1000 == 0 {
+                if ctx.governor.checkpoint() {
+                    ctx.display.log("  governor: throttle active");
+                }
+            }
+
             let query_vec = match query_reader.get(qi) {
                 Ok(v) => v,
                 Err(e) => {
@@ -326,24 +353,24 @@ impl CommandOp for AnalyzeVerifyKnnOp {
                     fail_count -= 1;
                     pass_count += 1;
                 } else {
-                    eprintln!(
+                    ctx.display.log(&format!(
                         "  FAIL query {}: {}/{} matching ({} with ties)",
                         qi, matching, k, tie_adjusted_matching
-                    );
+                    ));
                 }
             }
 
             if (qi - range_start + 1) % 100 == 0 || qi + 1 == range_end {
-                eprint!(
+                ctx.display.log(&format!(
                     "\r  {}/{} verified ({} pass, {} fail)",
                     qi - range_start + 1,
                     range_end - range_start,
                     pass_count,
                     fail_count
-                );
+                ));
             }
         }
-        eprintln!();
+        ctx.display.log("");
 
         let total = pass_count + fail_count;
         let status = if fail_count == 0 {
@@ -471,6 +498,8 @@ mod tests {
             progress: ProgressLog::new(),
             threads: 1,
             step_id: String::new(),
+            governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
+            display: crate::pipeline::display::ProgressDisplay::new(),
         }
     }
 

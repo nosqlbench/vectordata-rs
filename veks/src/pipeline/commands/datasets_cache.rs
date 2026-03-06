@@ -12,7 +12,8 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::pipeline::command::{
-    CommandOp, CommandResult, OptionDesc, Options, Status, StreamContext,
+    CommandDoc, CommandOp, CommandResult, OptionDesc, Options, Status, StreamContext,
+    render_options_table,
 };
 
 /// Pipeline command: list locally cached datasets.
@@ -27,6 +28,22 @@ impl CommandOp for DatasetsCacheOp {
         "datasets cache"
     }
 
+    fn command_doc(&self) -> CommandDoc {
+        let options = self.describe_options();
+        CommandDoc {
+            summary: "Manage the dataset download cache".into(),
+            body: format!(
+                "# datasets cache\n\n\
+                 Manage the dataset download cache.\n\n\
+                 ## Description\n\n\
+                 Scans the local cache directory for dataset directories that contain \
+                 `dataset.yaml` and reports their status, file counts, and sizes.\n\n\
+                 ## Options\n\n{}",
+                render_options_table(&options)
+            ),
+        }
+    }
+
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
         let start = Instant::now();
 
@@ -38,7 +55,7 @@ impl CommandOp for DatasetsCacheOp {
         let verbose = options.get("verbose").map_or(false, |s| s == "true");
 
         if !cache_dir.exists() {
-            eprintln!("Cache directory does not exist: {}", cache_dir.display());
+            ctx.display.log(&format!("Cache directory does not exist: {}", cache_dir.display()));
             return CommandResult {
                 status: Status::Ok,
                 message: "no cache directory".to_string(),
@@ -47,8 +64,8 @@ impl CommandOp for DatasetsCacheOp {
             };
         }
 
-        eprintln!("Cache directory: {}", cache_dir.display());
-        eprintln!();
+        ctx.display.log(&format!("Cache directory: {}", cache_dir.display()));
+        ctx.display.log("");
 
         let mut datasets = Vec::new();
 
@@ -67,13 +84,13 @@ impl CommandOp for DatasetsCacheOp {
         datasets.sort();
 
         if datasets.is_empty() {
-            eprintln!("No datasets found in cache.");
+            ctx.display.log("No datasets found in cache.");
         } else {
-            eprintln!(
+            ctx.display.log(&format!(
                 "{:<30} {:>6} {:>12}",
                 "Dataset", "Files", "Size"
-            );
-            eprintln!("{}", "-".repeat(52));
+            ));
+            ctx.display.log(&format!("{}", "-".repeat(52)));
 
             for ds_dir in &datasets {
                 let name = ds_dir
@@ -83,7 +100,7 @@ impl CommandOp for DatasetsCacheOp {
                 let (file_count, total_size) = scan_directory(ds_dir);
 
                 if verbose {
-                    eprintln!("{:<30} {:>6} {:>12}", name, file_count, format_size(total_size));
+                    ctx.display.log(&format!("{:<30} {:>6} {:>12}", name, file_count, format_size(total_size)));
                     // List facet files
                     if let Ok(files) = std::fs::read_dir(ds_dir) {
                         for f in files.flatten() {
@@ -91,18 +108,18 @@ impl CommandOp for DatasetsCacheOp {
                             if fp.is_file() && fp.file_name().and_then(|n| n.to_str()) != Some("dataset.yaml") {
                                 let fname = fp.file_name().and_then(|n| n.to_str()).unwrap_or("?");
                                 let fsize = std::fs::metadata(&fp).map(|m| m.len()).unwrap_or(0);
-                                eprintln!("  {:<28} {:>12}", fname, format_size(fsize));
+                                ctx.display.log(&format!("  {:<28} {:>12}", fname, format_size(fsize)));
                             }
                         }
                     }
                 } else {
-                    eprintln!("{:<30} {:>6} {:>12}", name, file_count, format_size(total_size));
+                    ctx.display.log(&format!("{:<30} {:>6} {:>12}", name, file_count, format_size(total_size)));
                 }
             }
         }
 
-        eprintln!();
-        eprintln!("{} dataset(s) cached", datasets.len());
+        ctx.display.log("");
+        ctx.display.log(&format!("{} dataset(s) cached", datasets.len()));
 
         CommandResult {
             status: Status::Ok,
@@ -196,6 +213,8 @@ mod tests {
             progress: ProgressLog::new(),
             threads: 1,
             step_id: String::new(),
+            governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
+            display: crate::pipeline::display::ProgressDisplay::new(),
         }
     }
 

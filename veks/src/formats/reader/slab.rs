@@ -3,7 +3,7 @@
 
 use std::path::Path;
 
-use slabtastic::{SlabBatchIter, SlabReader as SlabtasticReader};
+use slabtastic::{OpenProgress, SlabBatchIter, SlabReader as SlabtasticReader};
 
 use super::VecSource;
 
@@ -20,17 +20,28 @@ pub struct SlabReader {
 }
 
 impl SlabReader {
-    /// Open a slab file for reading
+    /// Open a slab file for reading, with progress output to stderr.
     pub fn open(path: &Path) -> Result<Box<dyn VecSource>, String> {
-        let reader = SlabtasticReader::open(path)
-            .map_err(|e| format!("Failed to open slab {}: {}", path.display(), e))?;
+        let reader = SlabtasticReader::open_with_progress(path, |p| {
+            match p {
+                OpenProgress::PagesPageRead { page_count } => {
+                    eprintln!("    slab index: {} pages to scan", page_count);
+                }
+                OpenProgress::IndexBuild { done, total } => {
+                    eprintln!("    slab index: {}/{} pages scanned", done, total);
+                }
+                OpenProgress::IndexComplete { total_records } => {
+                    eprintln!("    slab index: complete, {} total records", total_records);
+                }
+            }
+        }).map_err(|e| format!("Failed to open slab {}: {}", path.display(), e))?;
 
-        let entries = reader.page_entries();
-        if entries.is_empty() {
+        if reader.page_count() == 0 {
             return Err("Empty slab file".to_string());
         }
 
         // Determine dimension from the first record
+        let entries = reader.page_entries();
         let first_ordinal = entries
             .iter()
             .min_by_key(|e| e.start_ordinal)
@@ -42,14 +53,8 @@ impl SlabReader {
         // Assume f32 elements (4 bytes each) as default
         let dimension = (first_record.len() / 4) as u32;
 
-        // Get total record count by reading each page's metadata
-        let mut total_records: u64 = 0;
-        for entry in &entries {
-            let page = reader
-                .read_data_page(entry)
-                .map_err(|e| format!("Failed to read page: {}", e))?;
-            total_records += page.record_count() as u64;
-        }
+        // Total record count from cached page metadata (no extra I/O)
+        let total_records = reader.total_records();
 
         // Use batch_iter for streaming reads (page-at-a-time, not all-in-memory)
         let batch_iter = reader.batch_iter(4096);
@@ -96,5 +101,4 @@ impl VecSource for SlabReader {
             }
         }
     }
-
 }

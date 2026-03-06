@@ -24,7 +24,8 @@ use rand::Rng;
 use rand_distr::{Beta, Distribution, Normal, Uniform};
 
 use crate::pipeline::command::{
-    CommandOp, CommandResult, OptionDesc, Options, Status, StreamContext,
+    CommandDoc, CommandOp, CommandResult, OptionDesc, Options, Status, StreamContext,
+    render_options_table,
 };
 use crate::pipeline::rng;
 
@@ -89,6 +90,27 @@ impl DimSampler {
 impl CommandOp for GenerateSketchOp {
     fn command_path(&self) -> &str {
         "generate sketch"
+    }
+
+    fn command_doc(&self) -> CommandDoc {
+        let options = self.describe_options();
+        CommandDoc {
+            summary: "Generate a compact sketch of vector data".into(),
+            body: format!(r#"# generate sketch
+
+Generate a compact sketch of vector data.
+
+## Description
+
+Generates reference datasets with known, reproducible statistical properties
+by selecting from predefined distribution mix strategies. Each dimension of
+a vector is sampled from an independently configured distribution, producing
+datasets useful for testing profile analysis and similarity search.
+
+## Options
+
+{}"#, render_options_table(&options)),
+        }
     }
 
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
@@ -369,6 +391,8 @@ mod tests {
             progress: ProgressLog::new(),
             threads: 1,
             step_id: String::new(),
+            governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
+            display: crate::pipeline::display::ProgressDisplay::new(),
         }
     }
 

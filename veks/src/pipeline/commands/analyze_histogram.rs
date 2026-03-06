@@ -15,7 +15,8 @@ use vectordata::VectorReader;
 use vectordata::io::MmapVectorReader;
 
 use crate::pipeline::command::{
-    CommandOp, CommandResult, OptionDesc, Options, Status, StreamContext,
+    CommandDoc, CommandOp, CommandResult, OptionDesc, Options, ResourceDesc, Status, StreamContext,
+    render_options_table,
 };
 use super::analyze_stats::DimensionStats;
 
@@ -29,6 +30,24 @@ pub fn factory() -> Box<dyn CommandOp> {
 impl CommandOp for AnalyzeHistogramOp {
     fn command_path(&self) -> &str {
         "analyze histogram"
+    }
+
+    fn command_doc(&self) -> CommandDoc {
+        let options = self.describe_options();
+        CommandDoc {
+            summary: "Generate dimension-value histograms for vector files".into(),
+            body: format!(
+                "# analyze histogram\n\nGenerate dimension-value histograms for vector files.\n\n## Description\n\nReads an fvec file and produces an ASCII histogram of values for a specific dimension, showing the distribution shape. Configurable bin count and bar width.\n\n## Options\n\n{}",
+                render_options_table(&options)
+            ),
+        }
+    }
+
+    fn describe_resources(&self) -> Vec<ResourceDesc> {
+        vec![
+            ResourceDesc { name: "mem".into(), description: "Vector data buffers".into(), adjustable: false },
+            ResourceDesc { name: "readahead".into(), description: "Sequential read prefetch".into(), adjustable: false },
+        ]
     }
 
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
@@ -98,10 +117,10 @@ impl CommandOp for AnalyzeHistogramOp {
         let max = stats.max;
 
         if (max - min).abs() < f64::EPSILON {
-            eprintln!(
+            ctx.display.log(&format!(
                 "Dimension {}: all {} values = {:.6}",
                 dimension, effective_count, min
-            );
+            ));
             return CommandResult {
                 status: Status::Ok,
                 message: format!("histogram: all values identical ({:.6})", min),
@@ -122,16 +141,16 @@ impl CommandOp for AnalyzeHistogramOp {
         let max_count = *bin_counts.iter().max().unwrap_or(&1);
 
         // Print header
-        eprintln!(
+        ctx.display.log(&format!(
             "Histogram: dimension {} ({} vectors)",
             dimension, effective_count
-        );
-        eprintln!(
+        ));
+        ctx.display.log(&format!(
             "  Range: [{:.4}, {:.4}], Mean: {:.4}, StdDev: {:.4}",
             min, max, stats.mean, stats.std_dev
-        );
-        eprintln!("  {} bins, bin width: {:.6}", bins, bin_width);
-        eprintln!();
+        ));
+        ctx.display.log(&format!("  {} bins, bin width: {:.6}", bins, bin_width));
+        ctx.display.log("");
 
         // Print histogram
         for (i, &count) in bin_counts.iter().enumerate() {
@@ -143,10 +162,10 @@ impl CommandOp for AnalyzeHistogramOp {
                 0
             };
             let bar: String = "\u{2588}".repeat(bar_len);
-            eprintln!(
+            ctx.display.log(&format!(
                 "  [{:8.4}, {:8.4}) {:6} |{}",
                 lo, hi, count, bar
-            );
+            ));
         }
 
         CommandResult {
@@ -240,6 +259,8 @@ mod tests {
             progress: ProgressLog::new(),
             threads: 1,
             step_id: String::new(),
+            governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
+            display: crate::pipeline::display::ProgressDisplay::new(),
         }
     }
 

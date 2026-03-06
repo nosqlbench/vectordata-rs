@@ -199,6 +199,19 @@ fn mvalue_map_to_json(m: &MNode) -> JsonValue {
     )
 }
 
+fn comparand_to_json(c: &pnode::Comparand) -> JsonValue {
+    match c {
+        pnode::Comparand::Int(v) => JsonValue::Int(*v),
+        pnode::Comparand::Float(v) => JsonValue::Float(*v),
+        pnode::Comparand::Text(s) => JsonValue::Str(s.clone()),
+        pnode::Comparand::Bool(b) => JsonValue::Bool(*b),
+        pnode::Comparand::Bytes(b) => JsonValue::Str(
+            b.iter().map(|x| format!("{:02x}", x)).collect(),
+        ),
+        pnode::Comparand::Null => JsonValue::Null,
+    }
+}
+
 fn pnode_to_json(p: &pnode::PNode) -> JsonValue {
     match p {
         pnode::PNode::Predicate(pred) => {
@@ -212,10 +225,10 @@ fn pnode_to_json(p: &pnode::PNode) -> JsonValue {
                 ("op".into(), JsonValue::Str(pred.op.symbol().into())),
             ];
             if pred.comparands.len() == 1 {
-                obj.push(("value".into(), JsonValue::Int(pred.comparands[0])));
+                obj.push(("value".into(), comparand_to_json(&pred.comparands[0])));
             } else {
                 obj.push(("values".into(), JsonValue::Array(
-                    pred.comparands.iter().map(|v| JsonValue::Int(*v)).collect()
+                    pred.comparands.iter().map(comparand_to_json).collect()
                 )));
             }
             JsonValue::Object(obj)
@@ -367,6 +380,22 @@ fn yaml_scalar(v: &MValue) -> String {
     }
 }
 
+/// Format a PNode comparand for YAML output.
+fn yaml_comparand(c: &pnode::Comparand) -> String {
+    match c {
+        pnode::Comparand::Text(s) => {
+            if s.contains(':') || s.contains('#') || s.contains('\'')
+                || s.contains('"') || s.starts_with(' ') || s.is_empty()
+            {
+                format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+            } else {
+                s.clone()
+            }
+        }
+        _ => format!("{}", c),
+    }
+}
+
 fn render_pnode_yaml(p: &pnode::PNode, indent: usize) -> String {
     let pad = "  ".repeat(indent);
     match p {
@@ -377,9 +406,9 @@ fn render_pnode_yaml(p: &pnode::PNode, indent: usize) -> String {
             };
             if pred.comparands.len() == 1 {
                 format!("{}field: {}\n{}op: {}\n{}value: {}",
-                    pad, field, pad, pred.op.symbol(), pad, pred.comparands[0])
+                    pad, field, pad, pred.op.symbol(), pad, yaml_comparand(&pred.comparands[0]))
             } else {
-                let vals: Vec<String> = pred.comparands.iter().map(|v| format!("{}  - {}", pad, v)).collect();
+                let vals: Vec<String> = pred.comparands.iter().map(|v| format!("{}  - {}", pad, yaml_comparand(v))).collect();
                 format!("{}field: {}\n{}op: {}\n{}values:\n{}",
                     pad, field, pad, pred.op.symbol(), pad, vals.join("\n"))
             }
@@ -442,7 +471,7 @@ fn render_pnode_readout(p: &pnode::PNode, indent: usize) -> String {
             if pred.comparands.len() == 1 {
                 format!("{}{} {} {}", pad, field, pred.op.symbol(), pred.comparands[0])
             } else {
-                let vals: Vec<String> = pred.comparands.iter().map(|v| v.to_string()).collect();
+                let vals: Vec<String> = pred.comparands.iter().map(|v| format!("{}", v)).collect();
                 format!("{}{} {} ({})", pad, field, pred.op.symbol(), vals.join(", "))
             }
         }
@@ -767,7 +796,7 @@ fn parse_readout_value(s: &str) -> MValue {
 mod tests {
     use super::*;
     use crate::formats::mnode::{MNode, MValue};
-    use crate::formats::pnode::{ConjugateNode, ConjugateType, FieldRef, OpType, PNode, PredicateNode};
+    use crate::formats::pnode::{Comparand, ConjugateNode, ConjugateType, FieldRef, OpType, PNode, PredicateNode};
     use crate::formats::anode::ANode;
 
     fn sample_mnode() -> MNode {
@@ -787,12 +816,12 @@ mod tests {
                 PNode::Predicate(PredicateNode {
                     field: FieldRef::Named("age".into()),
                     op: OpType::Gt,
-                    comparands: vec![18],
+                    comparands: vec![Comparand::Int(18)],
                 }),
                 PNode::Predicate(PredicateNode {
                     field: FieldRef::Named("status".into()),
                     op: OpType::In,
-                    comparands: vec![1, 2, 3],
+                    comparands: vec![Comparand::Int(1), Comparand::Int(2), Comparand::Int(3)],
                 }),
             ],
         })

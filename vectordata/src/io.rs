@@ -67,6 +67,96 @@ pub struct MmapVectorReader<T> {
     _phantom: PhantomData<T>,
 }
 
+impl<T> MmapVectorReader<T> {
+    /// Returns the byte size of each vector entry (header + data).
+    pub fn entry_size(&self) -> usize {
+        self.entry_size
+    }
+
+    /// Advise the kernel to prefetch vector data for indices `[start, end)`.
+    ///
+    /// Issues `madvise(MADV_WILLNEED)` on the byte range covering the
+    /// requested vectors. This is non-blocking — the kernel begins
+    /// asynchronous readahead.
+    pub fn prefetch_range(&self, start: usize, end: usize) {
+        let byte_start = start * self.entry_size;
+        let byte_end = std::cmp::min(end * self.entry_size, self.mmap.len());
+        let byte_len = byte_end.saturating_sub(byte_start);
+        if byte_len > 0 {
+            let _ = self.mmap.advise_range(memmap2::Advice::WillNeed, byte_start, byte_len);
+        }
+    }
+
+    /// Advise the kernel that the entire mmap will be accessed sequentially.
+    ///
+    /// Issues `madvise(MADV_SEQUENTIAL)` on the full mapping. This enables
+    /// aggressive kernel readahead and allows the kernel to free pages
+    /// behind the access cursor.
+    pub fn advise_sequential(&self) {
+        let _ = self.mmap.advise(memmap2::Advice::Sequential);
+    }
+
+    /// Advise the kernel that vector data for indices `[start, end)` is
+    /// no longer needed.
+    ///
+    /// Issues `madvise(MADV_DONTNEED)` on the byte range, allowing the
+    /// kernel to evict those pages from the page cache. Use this after
+    /// completing a partition scan to reduce page cache pressure.
+    pub fn release_range(&self, start: usize, end: usize) {
+        let byte_start = start * self.entry_size;
+        let byte_end = std::cmp::min(end * self.entry_size, self.mmap.len());
+        let byte_len = byte_end.saturating_sub(byte_start);
+        if byte_len > 0 {
+            // memmap2's Advice enum doesn't expose DONTNEED; use libc directly.
+            #[cfg(unix)]
+            unsafe {
+                libc::madvise(
+                    self.mmap.as_ptr().add(byte_start) as *mut libc::c_void,
+                    byte_len,
+                    libc::MADV_DONTNEED,
+                );
+            }
+        }
+    }
+
+    /// Force vector data for indices `[start, end)` into the page cache.
+    ///
+    /// Issues `madvise(MADV_WILLNEED)` then sequentially touches every
+    /// page in the range via a volatile read. This **blocks** until all
+    /// pages are resident — call from a background thread to overlap
+    /// I/O with compute on a different partition.
+    ///
+    /// If `bytes_paged` is provided, the counter is incremented after each
+    /// page touch so callers can display progress from another thread.
+    pub fn prefetch_pages(
+        &self,
+        start: usize,
+        end: usize,
+        bytes_paged: Option<&std::sync::atomic::AtomicU64>,
+    ) {
+        let byte_start = start * self.entry_size;
+        let byte_end = std::cmp::min(end * self.entry_size, self.mmap.len());
+        let byte_len = byte_end.saturating_sub(byte_start);
+        if byte_len == 0 {
+            return;
+        }
+
+        // Hint the kernel for sequential readahead
+        let _ = self.mmap.advise_range(memmap2::Advice::WillNeed, byte_start, byte_len);
+
+        // Touch every page to force it into the page cache.
+        // Sequential access creates steady I/O instead of random page faults.
+        let data = &self.mmap[byte_start..byte_end];
+        let page_size = 4096;
+        for offset in (0..data.len()).step_by(page_size) {
+            unsafe { std::ptr::read_volatile(&data[offset]); }
+            if let Some(counter) = bytes_paged {
+                counter.fetch_add(page_size as u64, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+}
+
 impl MmapVectorReader<f32> {
     /// Opens a local `.fvec` file for reading floating-point vectors.
     pub fn open_fvec(path: &Path) -> Result<Self, IoError> {
@@ -102,6 +192,23 @@ impl MmapVectorReader<f32> {
             header_size: 4,
             _phantom: PhantomData,
         })
+    }
+}
+
+impl MmapVectorReader<f32> {
+    /// Returns a zero-copy slice into the mmap'd data for the vector at `index`.
+    ///
+    /// No allocation, no per-element parsing, no dimension validation.
+    /// The caller must ensure `index < self.count()`.
+    #[inline]
+    pub fn get_slice(&self, index: usize) -> &[f32] {
+        let data_start = index * self.entry_size + 4; // skip 4-byte dim header
+        unsafe {
+            std::slice::from_raw_parts(
+                self.mmap.as_ptr().add(data_start) as *const f32,
+                self.dim,
+            )
+        }
     }
 }
 
@@ -172,6 +279,20 @@ impl MmapVectorReader<i32> {
     }
 }
 
+impl MmapVectorReader<i32> {
+    /// Returns a zero-copy slice into the mmap'd data for the vector at `index`.
+    #[inline]
+    pub fn get_slice(&self, index: usize) -> &[i32] {
+        let data_start = index * self.entry_size + 4;
+        unsafe {
+            std::slice::from_raw_parts(
+                self.mmap.as_ptr().add(data_start) as *const i32,
+                self.dim,
+            )
+        }
+    }
+}
+
 impl VectorReader<i32> for MmapVectorReader<i32> {
     fn dim(&self) -> usize {
         self.dim
@@ -236,6 +357,27 @@ impl MmapVectorReader<half::f16> {
             header_size: 4,
             _phantom: PhantomData,
         })
+    }
+}
+
+impl MmapVectorReader<half::f16> {
+    /// Returns a zero-copy slice into the mmap'd data for the vector at `index`.
+    ///
+    /// No allocation, no per-element parsing, no dimension validation.
+    /// The caller must ensure `index < self.count()`.
+    ///
+    /// Safe on little-endian architectures (x86/ARM) where the mmap bytes
+    /// are already in the correct f16 bit pattern. `half::f16` is
+    /// `#[repr(transparent)]` around `u16`.
+    #[inline]
+    pub fn get_slice(&self, index: usize) -> &[half::f16] {
+        let data_start = index * self.entry_size + 4; // skip 4-byte dim header
+        unsafe {
+            std::slice::from_raw_parts(
+                self.mmap.as_ptr().add(data_start) as *const half::f16,
+                self.dim,
+            )
+        }
     }
 }
 

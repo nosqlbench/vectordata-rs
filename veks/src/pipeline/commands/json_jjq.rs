@@ -25,7 +25,8 @@ use std::time::Instant;
 use serde_json::Value;
 
 use crate::pipeline::command::{
-    CommandOp, CommandResult, OptionDesc, Options, Status, StreamContext,
+    CommandDoc, CommandOp, CommandResult, OptionDesc, Options, ResourceDesc, Status, StreamContext,
+    render_options_table,
 };
 
 /// Pipeline command: JSON/JSONL transformation.
@@ -211,6 +212,30 @@ impl CommandOp for JsonJjqOp {
         "json jjq"
     }
 
+    fn command_doc(&self) -> CommandDoc {
+        let options = self.describe_options();
+        CommandDoc {
+            summary: "Query JSON files with jq-like expressions".into(),
+            body: format!(
+                "# json jjq\n\n\
+                 Query JSON files with jq-like expressions.\n\n\
+                 ## Description\n\n\
+                 Applies simple JQ-like expressions to JSONL (JSON Lines) files. Supports \
+                 field extraction, nested access, multi-field selection, filtering with \
+                 `select()`, and `length` counting.\n\n\
+                 ## Options\n\n{}",
+                render_options_table(&options)
+            ),
+        }
+    }
+
+    fn describe_resources(&self) -> Vec<ResourceDesc> {
+        vec![
+            ResourceDesc { name: "mem".into(), description: "JSON parse buffers".into(), adjustable: false },
+            ResourceDesc { name: "readahead".into(), description: "Read-ahead buffer size".into(), adjustable: false },
+        ]
+    }
+
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
         let start = Instant::now();
 
@@ -303,7 +328,7 @@ impl CommandOp for JsonJjqOp {
             let value: Value = match serde_json::from_str(&line) {
                 Ok(v) => v,
                 Err(e) => {
-                    eprintln!("  Warning: line {}: parse error: {}", line_count, e);
+                    ctx.display.log(&format!("  Warning: line {}: parse error: {}", line_count, e));
                     continue;
                 }
             };
@@ -390,6 +415,8 @@ mod tests {
             progress: ProgressLog::new(),
             threads: 1,
             step_id: String::new(),
+            governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
+            display: crate::pipeline::display::ProgressDisplay::new(),
         }
     }
 

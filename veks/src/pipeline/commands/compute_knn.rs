@@ -29,11 +29,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
+use indicatif::{ProgressBar, ProgressState, ProgressStyle};
 use vectordata::VectorReader;
 use vectordata::io::MmapVectorReader;
 
 use crate::pipeline::command::{
-    CommandOp, CommandResult, OptionDesc, Options, Status, StreamContext,
+    CommandDoc, CommandOp, CommandResult, OptionDesc, Options, ResourceDesc, Status, StreamContext,
+    render_options_table,
 };
 use crate::pipeline::simd_distance::{self, Metric};
 
@@ -77,47 +79,139 @@ impl Ord for Neighbor {
     }
 }
 
-/// Find the k nearest neighbors for a query within base vectors `[start, end)`.
+/// Compute KNN for a batch of f32 queries against base vectors `[start, end)`.
 ///
-/// Indices in the returned `Neighbor` values are absolute (i.e. relative to the
-/// full base vector file, not the partition).
-fn find_top_k_range(
-    query: &[f32],
+/// Scans base vectors exactly once per batch, amortizing memory loads.
+/// Uses transposed SIMD kernels when available for the given metric.
+#[inline(never)]
+fn find_top_k_batch_f32(
+    queries: &[&[f32]],
     base_reader: &MmapVectorReader<f32>,
     start: usize,
     end: usize,
     k: usize,
     dist_fn: fn(&[f32], &[f32]) -> f32,
-) -> Vec<Neighbor> {
-    let mut heap = BinaryHeap::with_capacity(k + 1);
+    batched_fn: Option<simd_distance::BatchedDistFnF32>,
+    dim: usize,
+    results: &mut [Vec<Neighbor>],
+) {
+    if let Some(bfn) = batched_fn {
+        find_top_k_batch_transposed_f32(queries, base_reader, start, end, k, bfn, dim, results);
+    } else {
+        find_top_k_batch_pairwise_f32(queries, base_reader, start, end, k, dist_fn, results);
+    }
+}
+
+/// Per-pair fallback for f32 batch processing.
+#[inline(never)]
+fn find_top_k_batch_pairwise_f32(
+    queries: &[&[f32]],
+    base_reader: &MmapVectorReader<f32>,
+    start: usize,
+    end: usize,
+    k: usize,
+    dist_fn: fn(&[f32], &[f32]) -> f32,
+    results: &mut [Vec<Neighbor>],
+) {
+    let batch_size = queries.len();
+    let mut heaps: Vec<BinaryHeap<Neighbor>> = (0..batch_size)
+        .map(|_| BinaryHeap::with_capacity(k + 1))
+        .collect();
+    let mut thresholds = vec![f32::INFINITY; batch_size];
 
     for i in start..end {
-        let base_vec = match base_reader.get(i) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let dist = dist_fn(query, &base_vec);
+        let base_vec = base_reader.get_slice(i);
+        let idx = i as u32;
 
-        if heap.len() < k {
-            heap.push(Neighbor {
-                index: i as u32,
-                distance: dist,
-            });
-        } else if let Some(worst) = heap.peek() {
-            if dist < worst.distance {
-                heap.pop();
-                heap.push(Neighbor {
-                    index: i as u32,
-                    distance: dist,
-                });
+        for qi in 0..batch_size {
+            let dist = dist_fn(queries[qi], base_vec);
+
+            if dist < thresholds[qi] {
+                heaps[qi].push(Neighbor { index: idx, distance: dist });
+                if heaps[qi].len() > k {
+                    heaps[qi].pop();
+                }
+                if heaps[qi].len() == k {
+                    thresholds[qi] = heaps[qi].peek().unwrap().distance;
+                }
             }
         }
     }
 
-    // Sort by distance ascending (closest first)
-    let mut result: Vec<Neighbor> = heap.into_vec();
-    result.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap_or(Ordering::Equal));
-    result
+    for (qi, heap) in heaps.into_iter().enumerate() {
+        let mut v: Vec<Neighbor> = heap.into_vec();
+        v.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap_or(Ordering::Equal));
+        results[qi] = v;
+    }
+}
+
+/// Transposed SIMD batch processing for f32.
+///
+/// Splits queries into sub-batches of [`simd_distance::SIMD_BATCH_WIDTH`] (16),
+/// transposes each sub-batch into dimension-major layout, then scans base
+/// vectors once computing 16 distances per SIMD FMA instruction.
+#[inline(never)]
+fn find_top_k_batch_transposed_f32(
+    queries: &[&[f32]],
+    base_reader: &MmapVectorReader<f32>,
+    start: usize,
+    end: usize,
+    k: usize,
+    batched_fn: simd_distance::BatchedDistFnF32,
+    dim: usize,
+    results: &mut [Vec<Neighbor>],
+) {
+    use simd_distance::{SIMD_BATCH_WIDTH, TransposedBatch};
+
+    let batch_size = queries.len();
+    let mut heaps: Vec<BinaryHeap<Neighbor>> = (0..batch_size)
+        .map(|_| BinaryHeap::with_capacity(k + 1))
+        .collect();
+    let mut thresholds = vec![f32::INFINITY; batch_size];
+
+    // Pre-transpose queries into SIMD-width sub-batches
+    let mut sub_batches: Vec<TransposedBatch> = Vec::new();
+    let mut sub_offsets: Vec<usize> = Vec::new();
+    let mut offset = 0;
+    while offset < batch_size {
+        let sub_end = std::cmp::min(offset + SIMD_BATCH_WIDTH, batch_size);
+        sub_batches.push(TransposedBatch::from_f32(&queries[offset..sub_end], dim));
+        sub_offsets.push(offset);
+        offset = sub_end;
+    }
+
+    let mut dist_buf = [0.0f32; SIMD_BATCH_WIDTH];
+
+    for i in start..end {
+        let base_vec = base_reader.get_slice(i);
+        let idx = i as u32;
+
+        for (si, sub_batch) in sub_batches.iter().enumerate() {
+            batched_fn(sub_batch, base_vec, &mut dist_buf);
+            let sub_offset = sub_offsets[si];
+
+            for qi in 0..sub_batch.count() {
+                let global_qi = sub_offset + qi;
+                let dist = dist_buf[qi];
+
+                if dist < thresholds[global_qi] {
+                    heaps[global_qi].push(Neighbor { index: idx, distance: dist });
+                    if heaps[global_qi].len() > k {
+                        heaps[global_qi].pop();
+                    }
+                    if heaps[global_qi].len() == k {
+                        thresholds[global_qi] = heaps[global_qi].peek().unwrap().distance;
+                    }
+                }
+            }
+        }
+    }
+
+    for (qi, heap) in heaps.into_iter().enumerate() {
+        let mut v: Vec<Neighbor> = heap.into_vec();
+        v.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap_or(Ordering::Equal));
+        results[qi] = v;
+    }
 }
 
 // -- Partitioned computation --------------------------------------------------
@@ -128,6 +222,7 @@ struct PartitionMeta {
     end: usize,
     neighbors_path: PathBuf,
     distances_path: PathBuf,
+    cached: bool,
 }
 
 /// Build a cache file path for a partition segment.
@@ -163,76 +258,93 @@ fn validate_cache_file(path: &Path, query_count: usize, k: usize, elem_size: usi
 }
 
 /// Compute KNN for a single partition `[start, end)` across all queries.
+///
+/// Batched f32 partition computation. See [`compute_partition_f16`] for details.
 fn compute_partition(
-    queries: &[Vec<f32>],
+    query_reader: &MmapVectorReader<f32>,
+    query_count: usize,
     base_reader: &Arc<MmapVectorReader<f32>>,
     start: usize,
     end: usize,
     k: usize,
     dist_fn: fn(&[f32], &[f32]) -> f32,
+    metric: Metric,
+    dim: usize,
     threads: usize,
+    pb: &ProgressBar,
 ) -> Vec<Vec<Neighbor>> {
-    let query_count = queries.len();
+    let batched_fn = simd_distance::select_batched_fn_f32(metric);
+    let mut results: Vec<Vec<Neighbor>> = (0..query_count).map(|_| Vec::new()).collect();
 
     if threads > 1 && query_count > 1 {
-        use std::sync::Mutex;
-
         let effective_threads = std::cmp::min(threads, query_count);
-        let results = Arc::new(Mutex::new(vec![Vec::new(); query_count]));
-        let completed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let chunk_size = (query_count + effective_threads - 1) / effective_threads;
+
+        let result_chunks: Vec<&mut [Vec<Neighbor>]> =
+            results.chunks_mut(chunk_size).collect();
 
         std::thread::scope(|scope| {
-            let chunk_size = (query_count + effective_threads - 1) / effective_threads;
-            for chunk_start in (0..query_count).step_by(chunk_size) {
-                let chunk_end = std::cmp::min(chunk_start + chunk_size, query_count);
+            for (ci, chunk) in result_chunks.into_iter().enumerate() {
+                let chunk_start = ci * chunk_size;
+                let chunk_len = chunk.len();
                 let base_ref = Arc::clone(base_reader);
-                let results_ref = Arc::clone(&results);
-                let completed_ref = Arc::clone(&completed);
 
                 scope.spawn(move || {
-                    for qi in chunk_start..chunk_end {
-                        let neighbors =
-                            find_top_k_range(&queries[qi], &base_ref, start, end, k, dist_fn);
-                        {
-                            let mut lock = results_ref.lock().unwrap();
-                            lock[qi] = neighbors;
-                        }
-                        let done = completed_ref
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                            + 1;
-                        if done % 10 == 0 || done == query_count {
-                            eprint!(
-                                "\r  {}/{} queries ({:.0}%)",
-                                done,
-                                query_count,
-                                done as f64 / query_count as f64 * 100.0
-                            );
-                        }
+                    let mut offset = 0;
+                    while offset < chunk_len {
+                        let batch_end = std::cmp::min(offset + QUERY_BATCH_SIZE, chunk_len);
+                        let batch_size = batch_end - offset;
+
+                        let queries: Vec<&[f32]> = (0..batch_size)
+                            .map(|i| query_reader.get_slice(chunk_start + offset + i))
+                            .collect();
+
+                        find_top_k_batch_f32(
+                            &queries,
+                            &base_ref,
+                            start,
+                            end,
+                            k,
+                            dist_fn,
+                            batched_fn,
+                            dim,
+                            &mut chunk[offset..batch_end],
+                        );
+
+                        pb.inc(batch_size as u64);
+                        offset = batch_end;
                     }
                 });
             }
         });
-        eprintln!();
-
-        Arc::try_unwrap(results).unwrap().into_inner().unwrap()
     } else {
-        queries
-            .iter()
-            .enumerate()
-            .map(|(i, q)| {
-                let neighbors = find_top_k_range(q, base_reader, start, end, k, dist_fn);
-                if (i + 1) % 10 == 0 || i + 1 == query_count {
-                    eprint!(
-                        "\r  {}/{} queries ({:.0}%)",
-                        i + 1,
-                        query_count,
-                        (i + 1) as f64 / query_count as f64 * 100.0
-                    );
-                }
-                neighbors
-            })
-            .collect()
+        let mut offset = 0;
+        while offset < query_count {
+            let batch_end = std::cmp::min(offset + QUERY_BATCH_SIZE, query_count);
+            let batch_size = batch_end - offset;
+
+            let queries: Vec<&[f32]> = (0..batch_size)
+                .map(|i| query_reader.get_slice(offset + i))
+                .collect();
+
+            find_top_k_batch_f32(
+                &queries,
+                base_reader,
+                start,
+                end,
+                k,
+                dist_fn,
+                batched_fn,
+                dim,
+                &mut results[offset..batch_end],
+            );
+
+            pb.inc(batch_size as u64);
+            offset = batch_end;
+        }
     }
+
+    results
 }
 
 // -- Element type detection ---------------------------------------------------
@@ -253,116 +365,262 @@ fn detect_element_type(path: &Path) -> ElementType {
 
 // -- f16 KNN functions --------------------------------------------------------
 
-/// Find the k nearest neighbors for an f16 query within base vectors `[start, end)`.
-fn find_top_k_range_f16(
-    query: &[half::f16],
+/// Number of queries processed per base-vector scan in the batched KNN loop.
+///
+/// Each batch scans all base vectors ONCE and computes distances to all queries
+/// in the batch simultaneously. Larger batches reduce memory bandwidth (base
+/// vectors are loaded once per batch instead of once per query) at the cost of
+/// more working memory for heaps.
+///
+/// 256 queries × (heap ~1.6 KB + threshold 4B + query ptr 8B) ≈ 410 KB per
+/// batch — fits comfortably in per-core L2 cache.
+const QUERY_BATCH_SIZE: usize = 256;
+
+/// Compute KNN for a batch of f16 queries against base vectors `[start, end)`.
+///
+/// Scans base vectors exactly once. Uses transposed SIMD kernels when
+/// available for the given metric. The transposed path converts each base
+/// vector f16→f32 once (via SIMD bulk conversion) and uses the f32 kernel,
+/// since `TransposedBatch` already stores f32-converted query data.
+#[inline(never)]
+fn find_top_k_batch_f16(
+    queries: &[&[half::f16]],
     base_reader: &MmapVectorReader<half::f16>,
     start: usize,
     end: usize,
     k: usize,
     dist_fn: fn(&[half::f16], &[half::f16]) -> f32,
-) -> Vec<Neighbor> {
-    let mut heap = BinaryHeap::with_capacity(k + 1);
+    batched_fn: Option<simd_distance::BatchedDistFnF32>,
+    dim: usize,
+    results: &mut [Vec<Neighbor>],
+) {
+    if let Some(bfn) = batched_fn {
+        find_top_k_batch_transposed_f16(queries, base_reader, start, end, k, bfn, dim, results);
+    } else {
+        find_top_k_batch_pairwise_f16(queries, base_reader, start, end, k, dist_fn, results);
+    }
+}
+
+/// Per-pair fallback for f16 batch processing.
+#[inline(never)]
+fn find_top_k_batch_pairwise_f16(
+    queries: &[&[half::f16]],
+    base_reader: &MmapVectorReader<half::f16>,
+    start: usize,
+    end: usize,
+    k: usize,
+    dist_fn: fn(&[half::f16], &[half::f16]) -> f32,
+    results: &mut [Vec<Neighbor>],
+) {
+    let batch_size = queries.len();
+    let mut heaps: Vec<BinaryHeap<Neighbor>> = (0..batch_size)
+        .map(|_| BinaryHeap::with_capacity(k + 1))
+        .collect();
+    let mut thresholds = vec![f32::INFINITY; batch_size];
 
     for i in start..end {
-        let base_vec = match base_reader.get(i) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let dist = dist_fn(query, &base_vec);
+        let base_vec = base_reader.get_slice(i);
+        let idx = i as u32;
 
-        if heap.len() < k {
-            heap.push(Neighbor {
-                index: i as u32,
-                distance: dist,
-            });
-        } else if let Some(worst) = heap.peek() {
-            if dist < worst.distance {
-                heap.pop();
-                heap.push(Neighbor {
-                    index: i as u32,
-                    distance: dist,
-                });
+        for qi in 0..batch_size {
+            let dist = dist_fn(queries[qi], base_vec);
+
+            if dist < thresholds[qi] {
+                heaps[qi].push(Neighbor { index: idx, distance: dist });
+                if heaps[qi].len() > k {
+                    heaps[qi].pop();
+                }
+                if heaps[qi].len() == k {
+                    thresholds[qi] = heaps[qi].peek().unwrap().distance;
+                }
             }
         }
     }
 
-    let mut result: Vec<Neighbor> = heap.into_vec();
-    result.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap_or(Ordering::Equal));
-    result
+    for (qi, heap) in heaps.into_iter().enumerate() {
+        let mut v: Vec<Neighbor> = heap.into_vec();
+        v.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap_or(Ordering::Equal));
+        results[qi] = v;
+    }
+}
+
+/// Transposed SIMD batch processing for f16.
+///
+/// Splits queries into sub-batches of [`simd_distance::SIMD_BATCH_WIDTH`] (16),
+/// transposes each sub-batch into dimension-major f32 layout, then scans base
+/// vectors once computing 16 distances per SIMD FMA instruction.
+///
+/// Each f16 base vector is bulk-converted to f32 **once** via SIMD (32 AVX-512
+/// conversions for 512 dims), then the f32 kernel processes all sub-batches.
+/// This eliminates the 16× redundant per-sub-batch f16→f32 conversion that
+/// would otherwise dominate the inner loop.
+#[inline(never)]
+fn find_top_k_batch_transposed_f16(
+    queries: &[&[half::f16]],
+    base_reader: &MmapVectorReader<half::f16>,
+    start: usize,
+    end: usize,
+    k: usize,
+    batched_fn: simd_distance::BatchedDistFnF32,
+    dim: usize,
+    results: &mut [Vec<Neighbor>],
+) {
+    use simd_distance::{SIMD_BATCH_WIDTH, TransposedBatch};
+
+    let batch_size = queries.len();
+    let mut heaps: Vec<BinaryHeap<Neighbor>> = (0..batch_size)
+        .map(|_| BinaryHeap::with_capacity(k + 1))
+        .collect();
+    let mut thresholds = vec![f32::INFINITY; batch_size];
+
+    // Pre-transpose queries into SIMD-width sub-batches (already f32)
+    let mut sub_batches: Vec<TransposedBatch> = Vec::new();
+    let mut sub_offsets: Vec<usize> = Vec::new();
+    let mut offset = 0;
+    while offset < batch_size {
+        let sub_end = std::cmp::min(offset + SIMD_BATCH_WIDTH, batch_size);
+        sub_batches.push(TransposedBatch::from_f16(&queries[offset..sub_end], dim));
+        sub_offsets.push(offset);
+        offset = sub_end;
+    }
+
+    // Reusable f32 buffer for base vector conversion (avoids per-vector allocation)
+    let mut base_f32 = vec![0.0f32; dim];
+    let mut dist_buf = [0.0f32; SIMD_BATCH_WIDTH];
+
+    for i in start..end {
+        let base_f16 = base_reader.get_slice(i);
+        let idx = i as u32;
+
+        // Convert base vector f16→f32 ONCE via SIMD bulk conversion
+        simd_distance::convert_f16_to_f32_bulk(base_f16, &mut base_f32);
+
+        // Use f32 kernel for all sub-batches (no more f16→f32 in the hot loop)
+        for (si, sub_batch) in sub_batches.iter().enumerate() {
+            batched_fn(sub_batch, &base_f32, &mut dist_buf);
+            let sub_offset = sub_offsets[si];
+
+            for qi in 0..sub_batch.count() {
+                let global_qi = sub_offset + qi;
+                let dist = dist_buf[qi];
+
+                if dist < thresholds[global_qi] {
+                    heaps[global_qi].push(Neighbor { index: idx, distance: dist });
+                    if heaps[global_qi].len() > k {
+                        heaps[global_qi].pop();
+                    }
+                    if heaps[global_qi].len() == k {
+                        thresholds[global_qi] = heaps[global_qi].peek().unwrap().distance;
+                    }
+                }
+            }
+        }
+    }
+
+    for (qi, heap) in heaps.into_iter().enumerate() {
+        let mut v: Vec<Neighbor> = heap.into_vec();
+        v.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap_or(Ordering::Equal));
+        results[qi] = v;
+    }
 }
 
 /// Compute KNN for a single partition `[start, end)` across all f16 queries.
+///
+/// Uses batched processing: queries are grouped into batches of
+/// [`QUERY_BATCH_SIZE`]. Each batch scans base vectors once, computing
+/// distances to all queries in the batch simultaneously. This reduces memory
+/// bandwidth by `QUERY_BATCH_SIZE`× compared to per-query scanning.
+///
+/// When a transposed SIMD kernel is available for the metric, queries are
+/// further split into sub-batches of 16 (AVX-512 width) with dimension-major
+/// layout, computing 16 distances per FMA instruction.
 fn compute_partition_f16(
-    queries: &[Vec<half::f16>],
+    query_reader: &MmapVectorReader<half::f16>,
+    query_count: usize,
     base_reader: &Arc<MmapVectorReader<half::f16>>,
     start: usize,
     end: usize,
     k: usize,
     dist_fn: fn(&[half::f16], &[half::f16]) -> f32,
+    metric: Metric,
+    dim: usize,
     threads: usize,
+    pb: &ProgressBar,
 ) -> Vec<Vec<Neighbor>> {
-    let query_count = queries.len();
+    // Use f32 batched kernel: TransposedBatch stores f32, and base vectors are
+    // bulk-converted f16→f32 once per base vector in the inner loop.
+    let batched_fn = simd_distance::select_batched_fn_f32(metric);
+    let mut results: Vec<Vec<Neighbor>> = (0..query_count).map(|_| Vec::new()).collect();
 
     if threads > 1 && query_count > 1 {
-        use std::sync::Mutex;
-
         let effective_threads = std::cmp::min(threads, query_count);
-        let results = Arc::new(Mutex::new(vec![Vec::new(); query_count]));
-        let completed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let chunk_size = (query_count + effective_threads - 1) / effective_threads;
+
+        let result_chunks: Vec<&mut [Vec<Neighbor>]> =
+            results.chunks_mut(chunk_size).collect();
 
         std::thread::scope(|scope| {
-            let chunk_size = (query_count + effective_threads - 1) / effective_threads;
-            for chunk_start in (0..query_count).step_by(chunk_size) {
-                let chunk_end = std::cmp::min(chunk_start + chunk_size, query_count);
+            for (ci, chunk) in result_chunks.into_iter().enumerate() {
+                let chunk_start = ci * chunk_size;
+                let chunk_len = chunk.len();
                 let base_ref = Arc::clone(base_reader);
-                let results_ref = Arc::clone(&results);
-                let completed_ref = Arc::clone(&completed);
 
                 scope.spawn(move || {
-                    for qi in chunk_start..chunk_end {
-                        let neighbors =
-                            find_top_k_range_f16(&queries[qi], &base_ref, start, end, k, dist_fn);
-                        {
-                            let mut lock = results_ref.lock().unwrap();
-                            lock[qi] = neighbors;
-                        }
-                        let done = completed_ref
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                            + 1;
-                        if done % 10 == 0 || done == query_count {
-                            eprint!(
-                                "\r  {}/{} queries ({:.0}%)",
-                                done,
-                                query_count,
-                                done as f64 / query_count as f64 * 100.0
-                            );
-                        }
+                    let mut offset = 0;
+                    while offset < chunk_len {
+                        let batch_end = std::cmp::min(offset + QUERY_BATCH_SIZE, chunk_len);
+                        let batch_size = batch_end - offset;
+
+                        let queries: Vec<&[half::f16]> = (0..batch_size)
+                            .map(|i| query_reader.get_slice(chunk_start + offset + i))
+                            .collect();
+
+                        find_top_k_batch_f16(
+                            &queries,
+                            &base_ref,
+                            start,
+                            end,
+                            k,
+                            dist_fn,
+                            batched_fn,
+                            dim,
+                            &mut chunk[offset..batch_end],
+                        );
+
+                        pb.inc(batch_size as u64);
+                        offset = batch_end;
                     }
                 });
             }
         });
-        eprintln!();
-
-        Arc::try_unwrap(results).unwrap().into_inner().unwrap()
     } else {
-        queries
-            .iter()
-            .enumerate()
-            .map(|(i, q)| {
-                let neighbors = find_top_k_range_f16(q, base_reader, start, end, k, dist_fn);
-                if (i + 1) % 10 == 0 || i + 1 == query_count {
-                    eprint!(
-                        "\r  {}/{} queries ({:.0}%)",
-                        i + 1,
-                        query_count,
-                        (i + 1) as f64 / query_count as f64 * 100.0
-                    );
-                }
-                neighbors
-            })
-            .collect()
+        let mut offset = 0;
+        while offset < query_count {
+            let batch_end = std::cmp::min(offset + QUERY_BATCH_SIZE, query_count);
+            let batch_size = batch_end - offset;
+
+            let queries: Vec<&[half::f16]> = (0..batch_size)
+                .map(|i| query_reader.get_slice(offset + i))
+                .collect();
+
+            find_top_k_batch_f16(
+                &queries,
+                base_reader,
+                start,
+                end,
+                k,
+                dist_fn,
+                batched_fn,
+                dim,
+                &mut results[offset..batch_end],
+            );
+
+            pb.inc(batch_size as u64);
+            offset = batch_end;
+        }
     }
+
+    results
 }
 
 /// Write partition results to cache files (both ivec and fvec).
@@ -387,6 +645,7 @@ fn merge_partitions(
     distances_path: Option<&Path>,
     k: usize,
     query_count: usize,
+    display: &crate::pipeline::display::ProgressDisplay,
 ) -> Result<(), String> {
     // Open all partition files
     let mut ivec_readers: Vec<BufReader<std::fs::File>> = Vec::with_capacity(partitions.len());
@@ -420,6 +679,7 @@ fn merge_partitions(
     let mut ivec_row = vec![0u8; row_bytes];
     let mut fvec_row = vec![0u8; row_bytes];
 
+    let pb = make_query_progress_bar(query_count as u64, display);
     for _qi in 0..query_count {
         // Collect candidates from all partitions
         let mut candidates: Vec<Neighbor> = Vec::with_capacity(partitions.len() * k);
@@ -491,7 +751,10 @@ fn merge_partitions(
                     .map_err(|e| e.to_string())?;
             }
         }
+
+        pb.inc(1);
     }
+    pb.finish_and_clear();
 
     idx_writer.flush().map_err(|e| e.to_string())?;
     if let Some(ref mut dw) = dist_writer {
@@ -506,6 +769,56 @@ fn merge_partitions(
 impl CommandOp for ComputeKnnOp {
     fn command_path(&self) -> &str {
         "compute knn"
+    }
+
+    fn command_doc(&self) -> CommandDoc {
+        let options = self.describe_options();
+        CommandDoc {
+            summary: "Brute-force exact K-nearest-neighbor ground truth computation".into(),
+            body: format!(r#"# compute knn
+
+Brute-force exact K-nearest-neighbor ground truth computation.
+
+## Description
+
+Computes ground truth KNN for a set of query vectors against a base vector
+set. Outputs both neighbor indices (ivec) and distances (fvec).
+
+Supports both f32 (fvec) and f16 (hvec) input formats. The element type is
+detected from the file extension of the base vectors path. When hvec files
+are used, native f16 SIMD distance kernels operate directly on half-precision
+data without an explicit upcast to f32.
+
+Supports distance metrics: L2 (Euclidean), Cosine, DotProduct, L1 (Manhattan).
+
+Uses multi-threaded query processing with a max-heap for top-k selection.
+Base vectors are mmap'd for O(1) random access.
+
+For large base vector sets, supports partitioned computation: the base
+space is split into partitions, each partition's per-query top-K results are
+cached in `.cache/`, and a merge phase combines partition results into the
+final global top-K. Cached partitions are reusable across runs with different
+base-vector ranges.
+
+## Options
+
+{}
+
+## Notes
+
+- Element type (f32 vs f16) is auto-detected from the base file extension.
+- Partition caching allows incremental and resumable computation.
+- Thread count of 0 uses the system default (all available cores).
+"#, render_options_table(&options)),
+        }
+    }
+
+    fn describe_resources(&self) -> Vec<ResourceDesc> {
+        vec![
+            ResourceDesc { name: "mem".into(), description: "Partition results and top-K heaps".into(), adjustable: true },
+            ResourceDesc { name: "threads".into(), description: "Parallel query processing".into(), adjustable: true },
+            ResourceDesc { name: "readahead".into(), description: "Sequential prefetch for mmap'd base vectors".into(), adjustable: false },
+        ]
     }
 
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
@@ -548,11 +861,12 @@ impl CommandOp for ComputeKnnOp {
         let threads: usize = options
             .get("threads")
             .and_then(|s| s.parse().ok())
-            .unwrap_or(ctx.threads);
+            .unwrap_or_else(|| ctx.governor.current_or("threads", ctx.threads as u64) as usize);
 
         let partition_size: usize = options
             .get("partition_size")
             .and_then(|s| s.parse().ok())
+            .or_else(|| ctx.governor.current("segmentsize").map(|v| v as usize))
             .unwrap_or(1_000_000);
 
         let step_id = if ctx.step_id.is_empty() {
@@ -701,6 +1015,7 @@ fn execute_f32(
     ctx: &mut StreamContext,
     start: Instant,
 ) -> CommandResult {
+    ctx.display.log(&format!("  opening base vectors: {}", base_path.display()));
     let base_reader = match MmapVectorReader::<f32>::open_fvec(base_path) {
         Ok(r) => Arc::new(r),
         Err(e) => {
@@ -710,6 +1025,7 @@ fn execute_f32(
             )
         }
     };
+    ctx.display.log(&format!("  opening query vectors: {}", query_path.display()));
     let query_reader = match MmapVectorReader::<f32>::open_fvec(query_path) {
         Ok(r) => r,
         Err(e) => {
@@ -732,20 +1048,32 @@ fn execute_f32(
         );
     }
 
-    eprintln!(
-        "KNN: {} queries x {} base vectors (f32), k={}, metric={:?}, threads={}, simd={}",
-        query_count, base_count, k, metric, threads, simd_distance::simd_level()
-    );
-
-    let queries: Vec<Vec<f32>> = (0..query_count)
-        .map(|i| query_reader.get(i).unwrap())
-        .collect();
+    let base_bytes = base_count as u64 * base_dim as u64 * 4;
+    let query_bytes = query_count as u64 * query_dim as u64 * 4;
+    let batched_mode = if simd_distance::select_batched_fn_f32(metric).is_some() {
+        "transposed AVX-512 (16-wide)"
+    } else {
+        "per-pair SimSIMD"
+    };
+    ctx.display.log(&format!(
+        "KNN: {} queries x {} base vectors (f32, dim={}), k={}, metric={:?}, threads={}, simd={}, batch={}",
+        format_count(query_count), format_count(base_count), base_dim,
+        k, metric, threads, simd_distance::simd_level(), batched_mode
+    ));
+    ctx.display.log(&format!(
+        "  base: {} ({})  query: {} ({})",
+        base_path.file_name().unwrap_or_default().to_string_lossy(),
+        format_bytes(base_bytes),
+        query_path.file_name().unwrap_or_default().to_string_lossy(),
+        format_bytes(query_bytes),
+    ));
 
     execute_with_partitions(
-        &queries,
+        &query_reader,
         &base_reader,
         base_count,
         query_count,
+        base_dim,
         indices_path,
         distances_path,
         k,
@@ -776,6 +1104,7 @@ fn execute_f16(
     ctx: &mut StreamContext,
     start: Instant,
 ) -> CommandResult {
+    ctx.display.log(&format!("  opening base vectors: {}", base_path.display()));
     let base_reader = match MmapVectorReader::<half::f16>::open_hvec(base_path) {
         Ok(r) => Arc::new(r),
         Err(e) => {
@@ -785,6 +1114,7 @@ fn execute_f16(
             )
         }
     };
+    ctx.display.log(&format!("  opening query vectors: {}", query_path.display()));
     let query_reader = match MmapVectorReader::<half::f16>::open_hvec(query_path) {
         Ok(r) => r,
         Err(e) => {
@@ -807,20 +1137,32 @@ fn execute_f16(
         );
     }
 
-    eprintln!(
-        "KNN: {} queries x {} base vectors (f16), k={}, metric={:?}, threads={}, simd={}",
-        query_count, base_count, k, metric, threads, simd_distance::simd_level()
-    );
-
-    let queries: Vec<Vec<half::f16>> = (0..query_count)
-        .map(|i| query_reader.get(i).unwrap())
-        .collect();
+    let base_bytes = base_count as u64 * base_dim as u64 * 2;
+    let query_bytes = query_count as u64 * query_dim as u64 * 2;
+    let batched_mode = if simd_distance::select_batched_fn_f16(metric).is_some() {
+        "transposed AVX-512 (16-wide)"
+    } else {
+        "per-pair SimSIMD"
+    };
+    ctx.display.log(&format!(
+        "KNN: {} queries x {} base vectors (f16, dim={}), k={}, metric={:?}, threads={}, simd={}, batch={}",
+        format_count(query_count), format_count(base_count), base_dim,
+        k, metric, threads, simd_distance::simd_level(), batched_mode
+    ));
+    ctx.display.log(&format!(
+        "  base: {} ({})  query: {} ({})",
+        base_path.file_name().unwrap_or_default().to_string_lossy(),
+        format_bytes(base_bytes),
+        query_path.file_name().unwrap_or_default().to_string_lossy(),
+        format_bytes(query_bytes),
+    ));
 
     execute_with_partitions(
-        &queries,
+        &query_reader,
         &base_reader,
         base_count,
         query_count,
+        base_dim,
         indices_path,
         distances_path,
         k,
@@ -836,12 +1178,17 @@ fn execute_f16(
 }
 
 /// Shared partition/merge logic for both f32 and f16 paths.
+///
+/// Query vectors are accessed via mmap random access on demand — no bulk
+/// loading. Each base-vector partition's results are cached independently,
+/// then merged into the final output.
 #[allow(clippy::too_many_arguments)]
 fn execute_with_partitions<T>(
-    queries: &[Vec<T>],
+    query_reader: &MmapVectorReader<T>,
     base_reader: &Arc<MmapVectorReader<T>>,
     base_count: usize,
     query_count: usize,
+    dim: usize,
     indices_path: &Path,
     distances_path: Option<&Path>,
     k: usize,
@@ -852,15 +1199,18 @@ fn execute_with_partitions<T>(
     step_id: &str,
     ctx: &mut StreamContext,
     start: Instant,
-    compute_fn: fn(&[Vec<T>], &Arc<MmapVectorReader<T>>, usize, usize, usize, fn(&[T], &[T]) -> f32, usize) -> Vec<Vec<Neighbor>>,
+    compute_fn: fn(&MmapVectorReader<T>, usize, &Arc<MmapVectorReader<T>>, usize, usize, usize, fn(&[T], &[T]) -> f32, Metric, usize, usize, &ProgressBar) -> Vec<Vec<Neighbor>>,
 ) -> CommandResult
 where
-    T: Send + Sync,
+    T: Send + Sync + 'static,
 {
     // Single-partition fast path
     if base_count <= partition_size {
-        let results = compute_fn(queries, base_reader, 0, base_count, k, dist_fn, threads);
+        let pb = make_query_progress_bar(query_count as u64, &ctx.display);
+        let results = compute_fn(query_reader, query_count, base_reader, 0, base_count, k, dist_fn, metric, dim, threads, &pb);
+        pb.finish_and_clear();
 
+        ctx.display.log("  writing results...");
         if let Err(e) = write_indices(indices_path, &results, k) {
             return error_result(e, start);
         }
@@ -887,6 +1237,65 @@ where
 
     // Partitioned path
 
+    // Memory-aware partition sizing (REQ-RM-09).
+    //
+    // The main memory cost per partition is the result set:
+    //   query_count × k × 8 bytes (Neighbor = u32 index + f32 distance)
+    // Plus per-thread heaps and batch buffers (~small).
+    // If the result set for the configured partition_size exceeds the memory
+    // budget, we don't need to change partition_size — the result set size
+    // depends on query_count and k, not partition_size. But base vectors
+    // consume page cache proportional to partition_size × dim × sizeof(T),
+    // so we can reduce partition_size to limit page cache pressure.
+    let partition_size = if let Some(mem_ceiling) = ctx.governor.mem_ceiling() {
+        let snapshot = super::super::resource::SystemSnapshot::sample();
+        let target = (mem_ceiling as f64 * 0.85) as u64;
+        let available = if snapshot.rss_bytes < target {
+            target - snapshot.rss_bytes
+        } else {
+            (mem_ceiling as f64 * 0.10) as u64
+        };
+
+        // Result set memory (fixed regardless of partition_size)
+        let result_bytes = query_count as u64 * k as u64 * 8;
+        // Per-thread heap memory
+        let heap_bytes = threads as u64 * k as u64 * 8;
+        let fixed_overhead = result_bytes + heap_bytes;
+
+        if fixed_overhead > available {
+            ctx.display.log(&format!(
+                "  WARNING: KNN result set alone ({}) exceeds available memory ({})",
+                format_bytes(fixed_overhead), format_bytes(available),
+            ));
+            ctx.display.log(&format!(
+                "    result set: {} queries × k={} × 8B = {}",
+                format_count(query_count), k, format_bytes(result_bytes),
+            ));
+        }
+
+        // Remaining memory for base vector page cache
+        let remaining = available.saturating_sub(fixed_overhead);
+        let entry_size = base_reader.entry_size() as u64;
+        if entry_size > 0 {
+            let max_partition = (remaining / entry_size) as usize;
+            if max_partition < partition_size && max_partition >= 1000 {
+                ctx.display.log(&format!(
+                    "  memory-aware partition sizing: {} → {} (available: {}, RSS: {}, ceiling: {})",
+                    format_count(partition_size), format_count(max_partition),
+                    format_bytes(available), format_bytes(snapshot.rss_bytes),
+                    format_bytes(mem_ceiling),
+                ));
+                max_partition
+            } else {
+                partition_size
+            }
+        } else {
+            partition_size
+        }
+    } else {
+        partition_size
+    };
+
     if !ctx.cache.exists() {
         if let Err(e) = std::fs::create_dir_all(&ctx.cache) {
             return error_result(
@@ -896,7 +1305,21 @@ where
         }
     }
 
-    // Phase 1: Plan partitions
+    // Phase 1: Plan partitions and validate cache
+    let estimated_partitions = (base_count + partition_size - 1) / partition_size;
+    ctx.display.log(&format!(
+        "  planning ~{} partitions (partition_size={})...",
+        estimated_partitions, format_count(partition_size)
+    ));
+
+    let plan_pb = ctx.display.bar_with_style(
+        estimated_partitions as u64,
+        ProgressStyle::default_bar()
+            .template("  [{bar:40.green/dim}] {pos}/{len} partitions — validating cache")
+            .expect("invalid template")
+            .progress_chars("=>-"),
+    );
+
     let mut partitions: Vec<PartitionMeta> = Vec::new();
     let mut part_start = 0;
     while part_start < base_count {
@@ -907,65 +1330,223 @@ where
         let dist_cache_path = build_cache_path(
             &ctx.cache, step_id, part_start, part_end, k, metric, "distances", "fvec",
         );
+        let cached = validate_cache_file(&neighbors_path, query_count, k, 4)
+            && validate_cache_file(&dist_cache_path, query_count, k, 4);
         partitions.push(PartitionMeta {
             start: part_start,
             end: part_end,
             neighbors_path,
             distances_path: dist_cache_path,
+            cached,
         });
+        plan_pb.inc(1);
         part_start = part_end;
     }
+    plan_pb.finish_and_clear();
 
-    eprintln!(
-        "KNN: {} partitions of up to {} base vectors each",
-        partitions.len(),
-        partition_size
-    );
+    let num_partitions = partitions.len();
+    let cached_count = partitions.iter().filter(|p| p.cached).count();
+    let to_compute = num_partitions - cached_count;
+
+    ctx.display.log(&format!(
+        "  {} partitions of {} base vectors ({} cached, {} to compute)",
+        num_partitions, format_count(partition_size), cached_count, to_compute
+    ));
 
     // Phase 2: Compute missing partitions
-    for (pi, part) in partitions.iter().enumerate() {
-        let ivec_valid = validate_cache_file(&part.neighbors_path, query_count, k, 4);
-        let fvec_valid = validate_cache_file(&part.distances_path, query_count, k, 4);
+    //
+    // 3-stage pipeline so I/O and compute overlap continuously:
+    //   prefetch thread  — sequentially touches pages for upcoming partitions
+    //   main thread      — runs compute on the current partition
+    //   writer thread    — writes previous partition's results to cache files
+    //
+    // The prefetch thread walks *all* uncached partitions, forcing every page
+    // into the page cache via sequential volatile reads (not just madvise).
+    // It runs independently and stays ahead of compute, creating steady I/O
+    // instead of bursty page faults inside compute threads.
 
-        if ivec_valid && fvec_valid {
-            eprintln!(
-                "  partition {}/{} [{}, {}) — cached",
-                pi + 1, partitions.len(), part.start, part.end
-            );
+    // Hint sequential access pattern for base vectors (REQ-RM-10)
+    base_reader.advise_sequential();
+
+    // Collect uncached partition ranges for the prefetch thread
+    let uncached_ranges: Vec<(usize, usize)> = partitions.iter()
+        .filter(|p| !p.cached)
+        .map(|p| (p.start, p.end))
+        .collect();
+
+    let prefetch_reader = Arc::clone(base_reader);
+    let total_prefetch_bytes: u64 = uncached_ranges.iter()
+        .map(|(s, e)| ((e - s) as u64) * (base_reader.entry_size() as u64))
+        .sum();
+    ctx.display.log(&format!(
+        "  prefetch thread: {} uncached partition{} ({} to page in)",
+        uncached_ranges.len(),
+        if uncached_ranges.len() == 1 { "" } else { "s" },
+        format_bytes(total_prefetch_bytes),
+    ));
+
+    // Shared counter so we can show a progress bar for prefetch I/O
+    let prefetch_bytes_paged = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let prefetch_counter = Arc::clone(&prefetch_bytes_paged);
+    let prefetch_handle = std::thread::spawn(move || {
+        for (range_start, range_end) in &uncached_ranges {
+            prefetch_reader.prefetch_pages(*range_start, *range_end, Some(&prefetch_counter));
+        }
+    });
+
+    // Progress bar for prefetch — runs on a background tick thread so it
+    // updates even while the main thread is busy computing.
+    let prefetch_pb = ctx.display.bar_with_style(
+        total_prefetch_bytes,
+        ProgressStyle::default_bar()
+            .template("  [{bar:40.yellow/dim}] {bytes}/{total_bytes} paging in — {bytes_per_sec}")
+            .expect("invalid template")
+            .progress_chars("=>-"),
+    );
+    let prefetch_pb_clone = prefetch_pb.clone();
+    let prefetch_bytes_for_tick = Arc::clone(&prefetch_bytes_paged);
+    let prefetch_tick_handle = std::thread::spawn(move || {
+        loop {
+            let paged = prefetch_bytes_for_tick.load(std::sync::atomic::Ordering::Relaxed);
+            prefetch_pb_clone.set_position(paged);
+            if paged >= total_prefetch_bytes {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        prefetch_pb_clone.finish_and_clear();
+    });
+
+    let mut computed = 0usize;
+    let mut prev_writer: Option<std::thread::JoinHandle<Result<(), String>>> = None;
+    let mut prev_write_start: Option<Instant> = None;
+
+    for (pi, part) in partitions.iter().enumerate() {
+        if part.cached {
+            ctx.display.log(&format!(
+                "  partition {}/{} [{}, {}) — cached (skipping)",
+                pi + 1, num_partitions, part.start, part.end,
+            ));
             continue;
         }
 
-        eprintln!(
-            "  partition {}/{} [{}, {}) — computing...",
-            pi + 1, partitions.len(), part.start, part.end
-        );
-
-        let results = compute_fn(
-            queries, base_reader, part.start, part.end, k, dist_fn, threads,
-        );
-
-        if let Err(e) = write_partition_cache(part, &results, k) {
-            return error_result(
-                format!("failed to write partition cache: {}", e),
-                start,
-            );
+        // Governor checkpoint at partition boundary
+        if ctx.governor.checkpoint() {
+            ctx.display.log(&format!(
+                "  partition {}/{} — governor throttle active, continuing with current settings",
+                pi + 1, num_partitions,
+            ));
         }
 
-        if !validate_cache_file(&part.neighbors_path, query_count, k, 4)
-            || !validate_cache_file(&part.distances_path, query_count, k, 4)
-        {
-            return error_result(
-                format!(
+        computed += 1;
+        ctx.display.log(&format!(
+            "  partition {}/{} [{}, {}) — computing [{}/{}] {} queries x {} base vectors...",
+            pi + 1, num_partitions, part.start, part.end,
+            computed, to_compute,
+            format_count(query_count), format_count(part.end - part.start),
+        ));
+
+        let part_start_time = Instant::now();
+        let pb = make_query_progress_bar(query_count as u64, &ctx.display);
+        let results = compute_fn(
+            query_reader, query_count, base_reader, part.start, part.end, k, dist_fn, metric, dim, threads, &pb,
+        );
+        pb.finish_and_clear();
+        let compute_elapsed = part_start_time.elapsed();
+
+        // Wait for previous background writer before starting a new write
+        if let Some(handle) = prev_writer.take() {
+            let write_result = join_writer_with_spinner(handle, "previous", &ctx.display);
+            let write_elapsed = prev_write_start.take()
+                .map(|s| s.elapsed())
+                .unwrap_or_default();
+            match write_result {
+                Ok(()) => {
+                    ctx.display.log(&format!("    (previous write completed in {:.1}s)", write_elapsed.as_secs_f64()));
+                }
+                Err(msg) => {
+                    return error_result(msg, start);
+                }
+            }
+        }
+
+        // Spawn background writer for this partition's results
+        let neighbors_path = part.neighbors_path.clone();
+        let distances_path = part.distances_path.clone();
+        let part_start_idx = part.start;
+        let part_end_idx = part.end;
+        let part_query_count = query_count;
+        prev_write_start = Some(Instant::now());
+        let writer_display = ctx.display.clone();
+        prev_writer = Some(std::thread::spawn(move || {
+            write_indices(&neighbors_path, &results, k)?;
+            write_distances(&distances_path, &results, k)?;
+
+            if !validate_cache_file(&neighbors_path, part_query_count, k, 4)
+                || !validate_cache_file(&distances_path, part_query_count, k, 4)
+            {
+                return Err(format!(
                     "partition [{}, {}) cache files failed size validation after write",
-                    part.start, part.end
-                ),
-                start,
-            );
+                    part_start_idx, part_end_idx,
+                ));
+            }
+
+            let ivec_size = std::fs::metadata(&neighbors_path)
+                .map(|m| m.len()).unwrap_or(0);
+            let fvec_size = std::fs::metadata(&distances_path)
+                .map(|m| m.len()).unwrap_or(0);
+            writer_display.log(&format!(
+                "    → {}  ({})",
+                neighbors_path.file_name().unwrap_or_default().to_string_lossy(),
+                format_bytes(ivec_size),
+            ));
+            writer_display.log(&format!(
+                "    → {}  ({})",
+                distances_path.file_name().unwrap_or_default().to_string_lossy(),
+                format_bytes(fvec_size),
+            ));
+            Ok(())
+        }));
+
+        // Release completed partition's pages from page cache (REQ-RM-10)
+        base_reader.release_range(part.start, part.end);
+
+        ctx.display.log(&format!(
+            "  partition {}/{} — compute done in {:.1}s (write in background)",
+            pi + 1, num_partitions,
+            compute_elapsed.as_secs_f64(),
+        ));
+    }
+
+    // Wait for final background writer
+    if let Some(handle) = prev_writer.take() {
+        let write_result = join_writer_with_spinner(handle, "final", &ctx.display);
+        let write_elapsed = prev_write_start.take()
+            .map(|s| s.elapsed())
+            .unwrap_or_default();
+        match write_result {
+            Ok(()) => {
+                ctx.display.log(&format!("    (final write completed in {:.1}s)", write_elapsed.as_secs_f64()));
+            }
+            Err(msg) => {
+                return error_result(msg, start);
+            }
         }
     }
 
+    // Prefetch thread may still be running if compute was faster; let it finish
+    if !prefetch_handle.is_finished() {
+        let sp = ctx.display.spinner("waiting for prefetch to finish...");
+        let _ = prefetch_handle.join();
+        sp.finish_and_clear();
+    } else {
+        let _ = prefetch_handle.join();
+    }
+    // Stop the prefetch progress bar tick thread
+    let _ = prefetch_tick_handle.join();
+
     // Phase 3: Merge
-    eprintln!("  merging {} partitions...", partitions.len());
+    ctx.display.log(&format!("  merging {} partitions ({} queries)...", num_partitions, query_count));
 
     if let Err(e) = merge_partitions(
         &partitions,
@@ -973,6 +1554,7 @@ where
         distances_path,
         k,
         query_count,
+        &ctx.display,
     ) {
         return error_result(format!("merge failed: {}", e), start);
     }
@@ -986,7 +1568,7 @@ where
         status: Status::Ok,
         message: format!(
             "computed KNN: {} queries, k={}, metric={:?}, {} base vectors ({} partitions)",
-            query_count, k, metric, base_count, partitions.len()
+            query_count, k, metric, base_count, num_partitions
         ),
         produced,
         elapsed: start.elapsed(),
@@ -1045,12 +1627,99 @@ fn write_distances(path: &Path, results: &[Vec<Neighbor>], k: usize) -> Result<(
     Ok(())
 }
 
+/// Create a progress bar for query processing within a partition.
+fn make_query_progress_bar(total: u64, display: &crate::pipeline::display::ProgressDisplay) -> ProgressBar {
+    display.bar_with_style(
+        total,
+        ProgressStyle::default_bar()
+            .template("  [{bar:40.cyan/blue}] {pos}/{len} ({percent}%) queries — {rps} — ETA {eta}")
+            .expect("invalid template")
+            .with_key("rps", format_qps)
+            .progress_chars("=>-"),
+    )
+}
+
+/// Format queries/sec for the progress bar.
+fn format_qps(state: &ProgressState, w: &mut dyn std::fmt::Write) {
+    let qps = state.per_sec();
+    if qps < 100.0 {
+        write!(w, "{:.1} q/s", qps).unwrap();
+    } else {
+        let whole = qps as u64;
+        let s = whole.to_string();
+        let mut result = String::with_capacity(s.len() + s.len() / 3);
+        for (i, ch) in s.chars().rev().enumerate() {
+            if i > 0 && i % 3 == 0 {
+                result.push(',');
+            }
+            result.push(ch);
+        }
+        let formatted: String = result.chars().rev().collect();
+        write!(w, "{} q/s", formatted).unwrap();
+    }
+}
+
+/// Format a count with thousands separators.
+fn format_count(n: usize) -> String {
+    let s = n.to_string();
+    let mut result = String::with_capacity(s.len() + s.len() / 3);
+    for (i, ch) in s.chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            result.push(',');
+        }
+        result.push(ch);
+    }
+    result.chars().rev().collect()
+}
+
+/// Format byte count as human-readable size.
+fn format_bytes(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * 1024 * 1024;
+    const TIB: u64 = 1024 * 1024 * 1024 * 1024;
+    if bytes >= TIB {
+        format!("{:.1} TiB", bytes as f64 / TIB as f64)
+    } else if bytes >= GIB {
+        format!("{:.1} GiB", bytes as f64 / GIB as f64)
+    } else if bytes >= MIB {
+        format!("{:.1} MiB", bytes as f64 / MIB as f64)
+    } else if bytes >= KIB {
+        format!("{:.1} KiB", bytes as f64 / KIB as f64)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
 fn resolve_path(path_str: &str, workspace: &Path) -> PathBuf {
     let p = PathBuf::from(path_str);
     if p.is_absolute() {
         p
     } else {
         workspace.join(p)
+    }
+}
+
+/// Wait for a background cache-writer thread to finish, showing a spinner
+/// if the thread hasn't completed yet.
+fn join_writer_with_spinner(
+    handle: std::thread::JoinHandle<Result<(), String>>,
+    label: &str,
+    display: &crate::pipeline::display::ProgressDisplay,
+) -> Result<(), String> {
+    if !handle.is_finished() {
+        let sp = display.spinner(&format!("flushing {} cache write...", label));
+        let result = handle.join();
+        sp.finish_and_clear();
+        match result {
+            Ok(inner) => inner,
+            Err(_) => Err("partition cache writer thread panicked".to_string()),
+        }
+    } else {
+        match handle.join() {
+            Ok(inner) => inner,
+            Err(_) => Err("partition cache writer thread panicked".to_string()),
+        }
     }
 }
 
@@ -1081,6 +1750,8 @@ mod tests {
             progress: ProgressLog::new(),
             threads: 1,
             step_id: String::new(),
+            governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
+            display: crate::pipeline::display::ProgressDisplay::new(),
         }
     }
 

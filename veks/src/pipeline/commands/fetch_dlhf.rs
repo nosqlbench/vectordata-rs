@@ -14,7 +14,8 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::pipeline::command::{
-    CommandOp, CommandResult, OptionDesc, Options, Status, StreamContext,
+    CommandDoc, CommandOp, CommandResult, OptionDesc, Options, ResourceDesc, Status, StreamContext,
+    render_options_table,
 };
 
 /// Pipeline command: download from HuggingFace Hub.
@@ -27,6 +28,30 @@ pub fn factory() -> Box<dyn CommandOp> {
 impl CommandOp for FetchDlhfOp {
     fn command_path(&self) -> &str {
         "fetch dlhf"
+    }
+
+    fn command_doc(&self) -> CommandDoc {
+        let options = self.describe_options();
+        CommandDoc {
+            summary: "Download files from HuggingFace Hub".into(),
+            body: format!(
+                "# fetch dlhf\n\n\
+                 Download files from HuggingFace Hub.\n\n\
+                 ## Description\n\n\
+                 Given a HuggingFace repository identifier, lists and downloads matching \
+                 files into a local output directory using the HuggingFace HTTP API. \
+                 Supports glob filtering, revision selection, and resume.\n\n\
+                 ## Options\n\n{}",
+                render_options_table(&options)
+            ),
+        }
+    }
+
+    fn describe_resources(&self) -> Vec<ResourceDesc> {
+        vec![
+            ResourceDesc { name: "iothreads".into(), description: "Concurrent download connections".into(), adjustable: false },
+            ResourceDesc { name: "mem".into(), description: "Download buffers".into(), adjustable: false },
+        ]
     }
 
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
@@ -50,7 +75,7 @@ impl CommandOp for FetchDlhfOp {
             return error_result(format!("failed to create output dir: {}", e), start);
         }
 
-        eprintln!("Fetching file list from HuggingFace: {}", repo);
+        ctx.display.log(&format!("Fetching file list from HuggingFace: {}", repo));
 
         // List files via the HuggingFace API
         let api_url = format!(
@@ -69,12 +94,12 @@ impl CommandOp for FetchDlhfOp {
             .filter(|f| f.file_type == "file" && glob_match(pattern, &f.rfilename))
             .collect();
 
-        eprintln!(
+        ctx.display.log(&format!(
             "Found {} file(s) matching '{}' (of {} total)",
             matching.len(),
             pattern,
             file_list.len()
-        );
+        ));
 
         if matching.is_empty() {
             return CommandResult {
@@ -96,10 +121,10 @@ impl CommandOp for FetchDlhfOp {
             if dest.exists() {
                 if let Ok(meta) = std::fs::metadata(&dest) {
                     if meta.len() == entry.size {
-                        eprintln!(
+                        ctx.display.log(&format!(
                             "  {} — already downloaded ({} bytes)",
                             entry.rfilename, entry.size
-                        );
+                        ));
                         skipped += 1;
                         continue;
                     }
@@ -111,28 +136,28 @@ impl CommandOp for FetchDlhfOp {
                 repo_type, repo, revision, entry.rfilename
             );
 
-            eprintln!(
+            ctx.display.log(&format!(
                 "  {} — downloading ({} bytes)...",
                 entry.rfilename, entry.size
-            );
+            ));
 
             match download_file(&download_url, &dest) {
                 Ok(size) => {
-                    eprintln!("  {} — done ({} bytes)", entry.rfilename, size);
+                    ctx.display.log(&format!("  {} — done ({} bytes)", entry.rfilename, size));
                     downloaded += 1;
                 }
                 Err(e) => {
-                    eprintln!("  {} — FAILED: {}", entry.rfilename, e);
+                    ctx.display.log(&format!("  {} — FAILED: {}", entry.rfilename, e));
                     failed += 1;
                 }
             }
         }
 
-        eprintln!();
-        eprintln!(
+        ctx.display.log("");
+        ctx.display.log(&format!(
             "HuggingFace download: {} downloaded, {} skipped, {} failed",
             downloaded, skipped, failed
-        );
+        ));
 
         let status = if failed > 0 {
             Status::Error

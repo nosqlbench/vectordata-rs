@@ -19,7 +19,8 @@ use vectordata::VectorReader;
 use vectordata::io::MmapVectorReader;
 
 use crate::pipeline::command::{
-    CommandOp, CommandResult, OptionDesc, Options, Status, StreamContext,
+    CommandDoc, CommandOp, CommandResult, OptionDesc, Options, ResourceDesc, Status, StreamContext,
+    render_options_table,
 };
 
 /// Pipeline command: sort vectors.
@@ -98,6 +99,44 @@ impl CommandOp for ComputeSortOp {
         "compute sort"
     }
 
+    fn command_doc(&self) -> CommandDoc {
+        let options = self.describe_options();
+        CommandDoc {
+            summary: "Sort vectors by ordinal mapping".into(),
+            body: format!(r#"# compute sort
+
+Sort vectors by ordinal mapping.
+
+## Description
+
+Reads an fvec file and writes a sorted copy. Sorting criteria include:
+- `norm`: L2 norm of each vector (ascending)
+- `dimension:N`: value of dimension N (ascending)
+
+For large files, uses an index-sort approach: compute sort keys, sort
+indices, then write output in sorted order via mmap random access.
+
+## Options
+
+{}
+
+## Notes
+
+- Sort is stable: vectors with equal keys preserve their original order.
+- Accepts `norm`, `l2norm`, `l2`, `dimension:N`, or `dim:N` as sort criteria.
+- Output file size matches the input file size exactly.
+"#, render_options_table(&options)),
+        }
+    }
+
+    fn describe_resources(&self) -> Vec<ResourceDesc> {
+        vec![
+            ResourceDesc { name: "mem".into(), description: "Sort buffers for vector reordering".into(), adjustable: true },
+            ResourceDesc { name: "threads".into(), description: "Parallel sort/copy".into(), adjustable: true },
+            ResourceDesc { name: "readahead".into(), description: "Sequential read prefetch".into(), adjustable: false },
+        ]
+    }
+
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
         let start = Instant::now();
 
@@ -133,10 +172,15 @@ impl CommandOp for ComputeSortOp {
             Err(e) => return error_result(e, start),
         };
 
-        eprintln!(
+        ctx.display.log(&format!(
             "Sort: {} vectors (dim={}) by {:?}",
             count, dim, criterion
-        );
+        ));
+
+        // Governor checkpoint before sort processing
+        if ctx.governor.checkpoint() {
+            ctx.display.log("  governor: throttle active");
+        }
 
         // Compute sort keys and build index
         let mut indexed_keys: Vec<(usize, f64)> = Vec::with_capacity(count);
@@ -155,6 +199,11 @@ impl CommandOp for ComputeSortOp {
 
         // Sort by key (stable sort to preserve order for equal keys)
         indexed_keys.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Governor checkpoint after sort phase
+        if ctx.governor.checkpoint() {
+            ctx.display.log("  governor: throttle active");
+        }
 
         // Create output directory
         if let Some(parent) = output_path.parent() {
@@ -279,6 +328,8 @@ mod tests {
             progress: ProgressLog::new(),
             threads: 1,
             step_id: String::new(),
+            governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
+            display: crate::pipeline::display::ProgressDisplay::new(),
         }
     }
 

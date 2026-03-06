@@ -15,7 +15,8 @@ use vectordata::VectorReader;
 use vectordata::io::MmapVectorReader;
 
 use crate::pipeline::command::{
-    CommandOp, CommandResult, OptionDesc, Options, Status, StreamContext,
+    CommandDoc, CommandOp, CommandResult, OptionDesc, Options, ResourceDesc, Status, StreamContext,
+    render_options_table,
 };
 
 /// Pipeline command: find a specific vector in a target file.
@@ -28,6 +29,24 @@ pub fn factory() -> Box<dyn CommandOp> {
 impl CommandOp for AnalyzeFindOp {
     fn command_path(&self) -> &str {
         "analyze find"
+    }
+
+    fn command_doc(&self) -> CommandDoc {
+        let options = self.describe_options();
+        CommandDoc {
+            summary: "Search for vectors matching a value pattern".into(),
+            body: format!(
+                "# analyze find\n\nSearch for vectors matching a value pattern.\n\n## Description\n\nReads a vector at a given index from a source file, then searches for it in a target file using either binary search (if sorted) or exhaustive scan.\n\n## Options\n\n{}",
+                render_options_table(&options)
+            ),
+        }
+    }
+
+    fn describe_resources(&self) -> Vec<ResourceDesc> {
+        vec![
+            ResourceDesc { name: "mem".into(), description: "Vector data buffers".into(), adjustable: false },
+            ResourceDesc { name: "readahead".into(), description: "Sequential read prefetch".into(), adjustable: false },
+        ]
     }
 
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
@@ -80,12 +99,12 @@ impl CommandOp for AnalyzeFindOp {
         };
         let dim = needle.len();
 
-        eprintln!(
+        ctx.display.log(&format!(
             "Searching for source[{}] (dim={}) in {}",
             index,
             dim,
             target_path.display()
-        );
+        ));
 
         // Open target
         let target_reader = match MmapVectorReader::<f32>::open_fvec(&target_path) {
@@ -115,10 +134,10 @@ impl CommandOp for AnalyzeFindOp {
         let is_sorted = check_sorted(&target_reader, target_count);
 
         if is_sorted {
-            eprintln!("Target appears sorted — using binary search");
+            ctx.display.log("Target appears sorted — using binary search");
             match binary_search(&target_reader, &needle, target_count) {
                 Some(found_idx) => {
-                    eprintln!("FOUND at index {}", found_idx);
+                    ctx.display.log(&format!("FOUND at index {}", found_idx));
                     CommandResult {
                         status: Status::Ok,
                         message: format!("found at index {}", found_idx),
@@ -127,7 +146,7 @@ impl CommandOp for AnalyzeFindOp {
                     }
                 }
                 None => {
-                    eprintln!("NOT FOUND (binary search)");
+                    ctx.display.log("NOT FOUND (binary search)");
                     CommandResult {
                         status: Status::Warning,
                         message: "not found".to_string(),
@@ -137,15 +156,15 @@ impl CommandOp for AnalyzeFindOp {
                 }
             }
         } else {
-            eprintln!(
+            ctx.display.log(&format!(
                 "Target is unsorted — exhaustive scan ({} vectors)",
                 target_count
-            );
+            ));
             let result = exhaustive_scan(&target_reader, &needle, target_count);
             match result {
                 Some((found_idx, exact)) => {
                     if exact {
-                        eprintln!("FOUND exact match at index {}", found_idx);
+                        ctx.display.log(&format!("FOUND exact match at index {}", found_idx));
                         CommandResult {
                             status: Status::Ok,
                             message: format!("found exact match at index {}", found_idx),
@@ -153,7 +172,7 @@ impl CommandOp for AnalyzeFindOp {
                             elapsed: start.elapsed(),
                         }
                     } else {
-                        eprintln!("Closest match at index {} (not exact)", found_idx);
+                        ctx.display.log(&format!("Closest match at index {} (not exact)", found_idx));
                         CommandResult {
                             status: Status::Warning,
                             message: format!("closest match at index {} (not exact)", found_idx),
@@ -163,7 +182,7 @@ impl CommandOp for AnalyzeFindOp {
                     }
                 }
                 None => {
-                    eprintln!("NOT FOUND");
+                    ctx.display.log("NOT FOUND");
                     CommandResult {
                         status: Status::Warning,
                         message: "not found".to_string(),
@@ -354,6 +373,8 @@ mod tests {
             progress: ProgressLog::new(),
             threads: 1,
             step_id: String::new(),
+            governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
+            display: crate::pipeline::display::ProgressDisplay::new(),
         }
     }
 

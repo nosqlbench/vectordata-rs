@@ -19,6 +19,7 @@ pub mod pnode;
 pub mod anode;
 #[allow(dead_code)]
 pub mod anode_vernacular;
+pub mod convert;
 pub mod reader;
 pub mod writer;
 

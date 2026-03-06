@@ -16,7 +16,8 @@ use vectordata::io::MmapVectorReader;
 use vectordata::io::VectorReader;
 
 use crate::pipeline::command::{
-    CommandOp, CommandResult, OptionDesc, Options, Status, StreamContext,
+    CommandDoc, CommandOp, CommandResult, OptionDesc, Options, ResourceDesc, Status, StreamContext,
+    render_options_table,
 };
 
 /// Pipeline command: slice vector data.
@@ -81,6 +82,24 @@ fn parse_range(s: &str, max: usize) -> Result<(usize, usize), String> {
 impl CommandOp for AnalyzeSliceOp {
     fn command_path(&self) -> &str {
         "analyze slice"
+    }
+
+    fn command_doc(&self) -> CommandDoc {
+        let options = self.describe_options();
+        CommandDoc {
+            summary: "Extract a contiguous range of vectors to a new file".into(),
+            body: format!(
+                "# analyze slice\n\nExtract a contiguous range of vectors to a new file.\n\n## Description\n\nExtracts a subset of vectors by ordinal range and a subset of dimensions by component range from an xvec file. Supports text, CSV, TSV, and JSON output formats.\n\n## Options\n\n{}",
+                render_options_table(&options)
+            ),
+        }
+    }
+
+    fn describe_resources(&self) -> Vec<ResourceDesc> {
+        vec![
+            ResourceDesc { name: "mem".into(), description: "Vector data buffers".into(), adjustable: false },
+            ResourceDesc { name: "readahead".into(), description: "Sequential read prefetch".into(), adjustable: false },
+        ]
     }
 
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
@@ -410,6 +429,8 @@ mod tests {
             progress: ProgressLog::new(),
             threads: 1,
             step_id: String::new(),
+            governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
+            display: crate::pipeline::display::ProgressDisplay::new(),
         }
     }
 

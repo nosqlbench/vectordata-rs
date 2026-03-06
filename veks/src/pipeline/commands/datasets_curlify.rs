@@ -13,7 +13,8 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::pipeline::command::{
-    CommandOp, CommandResult, OptionDesc, Options, Status, StreamContext,
+    CommandDoc, CommandOp, CommandResult, OptionDesc, Options, Status, StreamContext,
+    render_options_table,
 };
 
 /// Pipeline command: generate curl commands for dataset download.
@@ -26,6 +27,22 @@ pub fn factory() -> Box<dyn CommandOp> {
 impl CommandOp for DatasetsCurlifyOp {
     fn command_path(&self) -> &str {
         "datasets curlify"
+    }
+
+    fn command_doc(&self) -> CommandDoc {
+        let options = self.describe_options();
+        CommandDoc {
+            summary: "Generate curl commands for dataset downloads".into(),
+            body: format!(
+                "# datasets curlify\n\n\
+                 Generate curl commands for dataset downloads.\n\n\
+                 ## Description\n\n\
+                 Reads a dataset.yaml and generates a bash script with curl commands to \
+                 download the dataset facets, using resume-capable transfers.\n\n\
+                 ## Options\n\n{}",
+                render_options_table(&options)
+            ),
+        }
     }
 
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
@@ -133,7 +150,7 @@ impl CommandOp for DatasetsCurlifyOp {
         }
 
         if file_count == 0 {
-            eprintln!("No downloadable views found (no URLs in sources)");
+            ctx.display.log("No downloadable views found (no URLs in sources)");
             return CommandResult {
                 status: Status::Warning,
                 message: "no downloadable views".to_string(),
@@ -150,9 +167,9 @@ impl CommandOp for DatasetsCurlifyOp {
             return error_result(format!("failed to write script: {}", e), start);
         }
 
-        eprintln!("Wrote download script: {}", script_path.display());
-        eprintln!("  {} curl command(s)", file_count);
-        eprintln!("  Run with: bash {}", script_path.display());
+        ctx.display.log(&format!("Wrote download script: {}", script_path.display()));
+        ctx.display.log(&format!("  {} curl command(s)", file_count));
+        ctx.display.log(&format!("  Run with: bash {}", script_path.display()));
 
         CommandResult {
             status: Status::Ok,
@@ -213,6 +230,8 @@ mod tests {
             progress: ProgressLog::new(),
             threads: 1,
             step_id: String::new(),
+            governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
+            display: crate::pipeline::display::ProgressDisplay::new(),
         }
     }
 

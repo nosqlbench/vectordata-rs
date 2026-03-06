@@ -13,7 +13,8 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::pipeline::command::{
-    CommandOp, CommandResult, OptionDesc, Options, Status, StreamContext,
+    CommandDoc, CommandOp, CommandResult, OptionDesc, Options, ResourceDesc, Status, StreamContext,
+    render_options_table,
 };
 
 /// Pipeline command: prebuffer (download) dataset facets.
@@ -26,6 +27,28 @@ pub fn factory() -> Box<dyn CommandOp> {
 impl CommandOp for DatasetsPrebufferOp {
     fn command_path(&self) -> &str {
         "datasets prebuffer"
+    }
+
+    fn command_doc(&self) -> CommandDoc {
+        let options = self.describe_options();
+        CommandDoc {
+            summary: "Pre-load dataset files into page cache".into(),
+            body: format!(
+                "# datasets prebuffer\n\n\
+                 Pre-load dataset files into page cache.\n\n\
+                 ## Description\n\n\
+                 Reads a dataset.yaml, downloads facets from their upstream URLs into \
+                 the local cache directory, and reports progress.\n\n\
+                 ## Options\n\n{}",
+                render_options_table(&options)
+            ),
+        }
+    }
+
+    fn describe_resources(&self) -> Vec<ResourceDesc> {
+        vec![
+            ResourceDesc { name: "readahead".into(), description: "Page cache prefetch window".into(), adjustable: false },
+        ]
     }
 
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
@@ -82,7 +105,7 @@ impl CommandOp for DatasetsPrebufferOp {
         // Copy dataset.yaml to cache
         let cached_yaml = ds_cache.join("dataset.yaml");
         if let Err(e) = std::fs::copy(&yaml_path, &cached_yaml) {
-            eprintln!("  warning: failed to copy dataset.yaml: {}", e);
+            ctx.display.log(&format!("  warning: failed to copy dataset.yaml: {}", e));
         }
 
         let mut downloaded = 0u32;
@@ -124,21 +147,21 @@ impl CommandOp for DatasetsPrebufferOp {
                     // Check if already cached
                     if target.exists() {
                         let size = std::fs::metadata(&target).map(|m| m.len()).unwrap_or(0);
-                        eprintln!("  {} — already cached ({} bytes)", view_name, size);
+                        ctx.display.log(&format!("  {} — already cached ({} bytes)", view_name, size));
                         skipped += 1;
                         continue;
                     }
 
                     // Check if source is a URL
                     if rel_path.starts_with("http://") || rel_path.starts_with("https://") {
-                        eprintln!("  {} — downloading from {}", view_name, rel_path);
+                        ctx.display.log(&format!("  {} — downloading from {}", view_name, rel_path));
                         match download_file(&rel_path, &target) {
                             Ok(size) => {
-                                eprintln!("  {} — downloaded {} bytes", view_name, size);
+                                ctx.display.log(&format!("  {} — downloaded {} bytes", view_name, size));
                                 downloaded += 1;
                             }
                             Err(e) => {
-                                eprintln!("  {} — FAILED: {}", view_name, e);
+                                ctx.display.log(&format!("  {} — FAILED: {}", view_name, e));
                                 failed += 1;
                             }
                         }
@@ -148,25 +171,25 @@ impl CommandOp for DatasetsPrebufferOp {
                         let local_src = dataset_dir.join(&rel_path);
                         if local_src.exists() && local_src != target {
                             if let Err(e) = std::fs::copy(&local_src, &target) {
-                                eprintln!("  {} — FAILED to copy: {}", view_name, e);
+                                ctx.display.log(&format!("  {} — FAILED to copy: {}", view_name, e));
                                 failed += 1;
                             } else {
-                                eprintln!("  {} — copied from local source", view_name);
+                                ctx.display.log(&format!("  {} — copied from local source", view_name));
                                 downloaded += 1;
                             }
                         } else {
-                            eprintln!("  {} — no source available", view_name);
+                            ctx.display.log(&format!("  {} — no source available", view_name));
                         }
                     }
                 }
             }
         }
 
-        eprintln!();
-        eprintln!(
+        ctx.display.log("");
+        ctx.display.log(&format!(
             "Prebuffer: {} downloaded, {} skipped, {} failed",
             downloaded, skipped, failed
-        );
+        ));
 
         let status = if failed > 0 {
             Status::Error
@@ -266,6 +289,8 @@ mod tests {
             progress: ProgressLog::new(),
             threads: 1,
             step_id: String::new(),
+            governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
+            display: crate::pipeline::display::ProgressDisplay::new(),
         }
     }
 

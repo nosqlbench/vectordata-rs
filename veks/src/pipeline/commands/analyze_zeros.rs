@@ -15,7 +15,8 @@ use vectordata::io::MmapVectorReader;
 use vectordata::io::VectorReader;
 
 use crate::pipeline::command::{
-    CommandOp, CommandResult, OptionDesc, Options, Status, StreamContext,
+    CommandDoc, CommandOp, CommandResult, OptionDesc, Options, ResourceDesc, Status, StreamContext,
+    render_options_table,
 };
 
 /// Pipeline command: count all-zero vectors.
@@ -28,6 +29,24 @@ pub fn factory() -> Box<dyn CommandOp> {
 impl CommandOp for AnalyzeZerosOp {
     fn command_path(&self) -> &str {
         "analyze zeros"
+    }
+
+    fn command_doc(&self) -> CommandDoc {
+        let options = self.describe_options();
+        CommandDoc {
+            summary: "Find and report zero vectors in a vector file".into(),
+            body: format!(
+                "# analyze zeros\n\nFind and report zero vectors in a vector file.\n\n## Description\n\nScans an fvec or ivec file and counts vectors where all components are zero. Reports the count and percentage of zero vectors found.\n\n## Options\n\n{}",
+                render_options_table(&options)
+            ),
+        }
+    }
+
+    fn describe_resources(&self) -> Vec<ResourceDesc> {
+        vec![
+            ResourceDesc { name: "mem".into(), description: "Vector data buffers".into(), adjustable: false },
+            ResourceDesc { name: "readahead".into(), description: "Sequential read prefetch".into(), adjustable: false },
+        ]
     }
 
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
@@ -202,6 +221,8 @@ mod tests {
             progress: ProgressLog::new(),
             threads: 1,
             step_id: String::new(),
+            governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
+            display: crate::pipeline::display::ProgressDisplay::new(),
         }
     }
 

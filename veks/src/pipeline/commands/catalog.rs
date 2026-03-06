@@ -14,7 +14,8 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 
 use crate::pipeline::command::{
-    CommandOp, CommandResult, OptionDesc, Options, Status, StreamContext,
+    CommandDoc, CommandOp, CommandResult, OptionDesc, Options, Status, StreamContext,
+    render_options_table,
 };
 
 /// Pipeline command: generate catalog from dataset directories.
@@ -38,6 +39,22 @@ impl CommandOp for CatalogGenerateOp {
         "catalog generate"
     }
 
+    fn command_doc(&self) -> CommandDoc {
+        let options = self.describe_options();
+        CommandDoc {
+            summary: "Generate a dataset catalog index".into(),
+            body: format!(
+                "# catalog generate\n\n\
+                 Generate a dataset catalog index.\n\n\
+                 ## Description\n\n\
+                 Recursively walks directory trees, locates `dataset.yaml` files, and \
+                 writes `catalog.json` and `catalog.yaml` index files.\n\n\
+                 ## Options\n\n{}",
+                render_options_table(&options)
+            ),
+        }
+    }
+
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
         let start = Instant::now();
 
@@ -52,7 +69,7 @@ impl CommandOp for CatalogGenerateOp {
             );
         }
 
-        eprintln!("Scanning {} for datasets...", input_path.display());
+        ctx.display.log(&format!("Scanning {} for datasets...", input_path.display()));
 
         // Walk directory tree and find dataset.yaml files
         let mut entries: Vec<CatalogEntry> = Vec::new();
@@ -60,7 +77,7 @@ impl CommandOp for CatalogGenerateOp {
 
         entries.sort_by(|a, b| a.path.cmp(&b.path));
 
-        eprintln!("Found {} dataset(s)", entries.len());
+        ctx.display.log(&format!("Found {} dataset(s)", entries.len()));
 
         if entries.is_empty() {
             return CommandResult {
@@ -72,12 +89,12 @@ impl CommandOp for CatalogGenerateOp {
         }
 
         for entry in &entries {
-            eprintln!(
+            ctx.display.log(&format!(
                 "  {} — {} view(s) [{}]",
                 entry.name,
                 entry.views.len(),
                 entry.path
-            );
+            ));
         }
 
         // Write catalog.json
@@ -100,12 +117,12 @@ impl CommandOp for CatalogGenerateOp {
             return error_result(format!("failed to write {}: {}", yaml_path.display(), e), start);
         }
 
-        eprintln!(
+        ctx.display.log(&format!(
             "Wrote {} entries to {} and {}",
             entries.len(),
             json_path.display(),
             yaml_path.display()
-        );
+        ));
 
         CommandResult {
             status: Status::Ok,
@@ -246,6 +263,8 @@ mod tests {
             progress: ProgressLog::new(),
             threads: 1,
             step_id: String::new(),
+            governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
+            display: crate::pipeline::display::ProgressDisplay::new(),
         }
     }
 

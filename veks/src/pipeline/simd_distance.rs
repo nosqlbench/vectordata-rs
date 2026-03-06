@@ -49,7 +49,9 @@ pub fn select_distance_fn(metric: Metric) -> fn(&[f32], &[f32]) -> f32 {
 // -- L2 (Euclidean) distance via SimSIMD --------------------------------------
 
 fn select_l2() -> fn(&[f32], &[f32]) -> f32 {
-    |a, b| (<f32 as SpatialSimilarity>::l2sq(a, b).unwrap_or(0.0) as f32).sqrt()
+    // Use squared L2 — sqrt is monotonic so ordering is preserved for KNN.
+    // Avoids ~15 cycles per distance in the inner loop.
+    |a, b| <f32 as SpatialSimilarity>::l2sq(a, b).unwrap_or(0.0) as f32
 }
 
 #[cfg(test)]
@@ -59,7 +61,7 @@ fn l2_scalar(a: &[f32], b: &[f32]) -> f32 {
         let d = a[i] - b[i];
         sum += d * d;
     }
-    sum.sqrt()
+    sum // squared L2 — matches select_distance_fn(Metric::L2)
 }
 
 // -- Cosine distance via SimSIMD ----------------------------------------------
@@ -250,9 +252,10 @@ unsafe fn as_simsimd_f16(s: &[half::f16]) -> &[simsimd::f16] {
 }
 
 fn select_l2_f16() -> fn(&[half::f16], &[half::f16]) -> f32 {
+    // Use squared L2 — sqrt is monotonic so ordering is preserved for KNN.
     |a, b| {
         let (sa, sb) = unsafe { (as_simsimd_f16(a), as_simsimd_f16(b)) };
-        (<simsimd::f16 as SpatialSimilarity>::l2sq(sa, sb).unwrap_or(0.0) as f32).sqrt()
+        <simsimd::f16 as SpatialSimilarity>::l2sq(sa, sb).unwrap_or(0.0) as f32
     }
 }
 
@@ -376,6 +379,449 @@ fn l1_f16_avx512(a: &[half::f16], b: &[half::f16]) -> f32 {
     unsafe { l1_f16_avx512_inner(a, b) }
 }
 
+// -- Batched multi-query distance (transposed SIMD) ---------------------------
+
+/// Width of the transposed SIMD batch — matches AVX-512 f32 lane count.
+///
+/// Each base vector dimension is broadcast to all 16 lanes, and 16 query
+/// distances are computed simultaneously with a single FMA instruction.
+pub const SIMD_BATCH_WIDTH: usize = 16;
+
+/// Transposed query batch for SIMD-optimized multi-query distance computation.
+///
+/// Stores up to [`SIMD_BATCH_WIDTH`] queries in dimension-major (columnar)
+/// layout, with all values pre-converted to f32. Layout:
+/// `data[d * SIMD_BATCH_WIDTH + qi]` = f32 value for dimension `d` of query `qi`.
+/// Unused lanes (fewer than 16 queries) are zero-padded.
+///
+/// This layout enables the inner distance loop to process all queries in
+/// parallel using a single SIMD instruction per dimension:
+/// 1. Broadcast `base[d]` to all 16 lanes
+/// 2. Load `transposed[d][0..16]` (contiguous f32 vector)
+/// 3. FMA: `acc += (base[d] - query[d])²` for all 16 queries
+///
+/// Pre-converting f16 to f32 during construction eliminates redundant
+/// per-base-vector conversion in the inner loop (512× fewer conversions
+/// for 512-dim vectors in a batch of 256 queries).
+pub struct TransposedBatch {
+    data: Vec<f32>,
+    dim: usize,
+    count: usize,
+}
+
+impl TransposedBatch {
+    /// Create a transposed batch from f16 query slices.
+    ///
+    /// Converts all values to f32 and transposes from query-major
+    /// `[queries][dims]` to dimension-major `[dims][SIMD_BATCH_WIDTH]`.
+    pub fn from_f16(queries: &[&[half::f16]], dim: usize) -> Self {
+        assert!(queries.len() <= SIMD_BATCH_WIDTH);
+        let count = queries.len();
+        let mut data = vec![0.0f32; dim * SIMD_BATCH_WIDTH];
+        for (qi, q) in queries.iter().enumerate() {
+            for d in 0..dim {
+                data[d * SIMD_BATCH_WIDTH + qi] = q[d].to_f32();
+            }
+        }
+        Self { data, dim, count }
+    }
+
+    /// Create a transposed batch from f32 query slices.
+    pub fn from_f32(queries: &[&[f32]], dim: usize) -> Self {
+        assert!(queries.len() <= SIMD_BATCH_WIDTH);
+        let count = queries.len();
+        let mut data = vec![0.0f32; dim * SIMD_BATCH_WIDTH];
+        for (qi, q) in queries.iter().enumerate() {
+            for d in 0..dim {
+                data[d * SIMD_BATCH_WIDTH + qi] = q[d];
+            }
+        }
+        Self { data, dim, count }
+    }
+
+    /// Number of actual queries in this batch (≤ SIMD_BATCH_WIDTH).
+    pub fn count(&self) -> usize {
+        self.count
+    }
+}
+
+/// Function type for batched distance computation on f16 base vectors.
+pub type BatchedDistFnF16 = fn(&TransposedBatch, &[half::f16], &mut [f32]);
+
+/// Function type for batched distance computation on f32 base vectors.
+pub type BatchedDistFnF32 = fn(&TransposedBatch, &[f32], &mut [f32]);
+
+/// Select a batched SIMD distance function for f16 vectors, if available.
+///
+/// Returns `Some(fn)` for metrics with batched SIMD implementations,
+/// `None` otherwise (caller should fall back to per-pair distance).
+pub fn select_batched_fn_f16(metric: Metric) -> Option<BatchedDistFnF16> {
+    match metric {
+        Metric::L2 => Some(batched_l2sq_f16),
+        Metric::DotProduct => Some(batched_neg_dot_f16),
+        Metric::L1 => Some(batched_l1_f16),
+        _ => None,
+    }
+}
+
+/// Select a batched SIMD distance function for f32 vectors, if available.
+pub fn select_batched_fn_f32(metric: Metric) -> Option<BatchedDistFnF32> {
+    match metric {
+        Metric::L2 => Some(batched_l2sq_f32),
+        Metric::DotProduct => Some(batched_neg_dot_f32),
+        Metric::L1 => Some(batched_l1_f32),
+        _ => None,
+    }
+}
+
+// -- Batched L2 squared -------------------------------------------------------
+
+/// Compute L2 squared distances from one f16 base vector to all queries
+/// in a transposed batch. Dispatches to AVX-512 when available.
+fn batched_l2sq_f16(batch: &TransposedBatch, base: &[half::f16], out: &mut [f32]) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx512f") {
+            unsafe { batched_l2sq_f16_avx512(batch, base, out); }
+            return;
+        }
+    }
+    batched_l2sq_scalar_from_f16(batch, base, out);
+}
+
+fn batched_l2sq_scalar_from_f16(batch: &TransposedBatch, base: &[half::f16], out: &mut [f32]) {
+    let dim = batch.dim;
+    for qi in 0..batch.count {
+        let mut sum = 0.0f32;
+        for d in 0..dim {
+            let diff = base[d].to_f32() - batch.data[d * SIMD_BATCH_WIDTH + qi];
+            sum += diff * diff;
+        }
+        out[qi] = sum;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn batched_l2sq_f16_avx512(batch: &TransposedBatch, base: &[half::f16], out: &mut [f32]) {
+    unsafe {
+        use std::arch::x86_64::*;
+
+        let dim = batch.dim;
+        let t_ptr = batch.data.as_ptr();
+
+        let mut acc = _mm512_setzero_ps();
+
+        for d in 0..dim {
+            let bval = base[d].to_f32();
+            let base_bc = _mm512_set1_ps(bval);
+            let q16 = _mm512_loadu_ps(t_ptr.add(d * SIMD_BATCH_WIDTH));
+            let diff = _mm512_sub_ps(base_bc, q16);
+            acc = _mm512_fmadd_ps(diff, diff, acc);
+        }
+
+        _mm512_storeu_ps(out.as_mut_ptr(), acc);
+    }
+}
+
+/// Compute L2 squared distances from one f32 base vector to all queries.
+fn batched_l2sq_f32(batch: &TransposedBatch, base: &[f32], out: &mut [f32]) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx512f") {
+            unsafe { batched_l2sq_f32_avx512(batch, base, out); }
+            return;
+        }
+    }
+    batched_l2sq_scalar_from_f32(batch, base, out);
+}
+
+fn batched_l2sq_scalar_from_f32(batch: &TransposedBatch, base: &[f32], out: &mut [f32]) {
+    let dim = batch.dim;
+    for qi in 0..batch.count {
+        let mut sum = 0.0f32;
+        for d in 0..dim {
+            let diff = base[d] - batch.data[d * SIMD_BATCH_WIDTH + qi];
+            sum += diff * diff;
+        }
+        out[qi] = sum;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn batched_l2sq_f32_avx512(batch: &TransposedBatch, base: &[f32], out: &mut [f32]) {
+    unsafe {
+        use std::arch::x86_64::*;
+
+        let dim = batch.dim;
+        let t_ptr = batch.data.as_ptr();
+        let b_ptr = base.as_ptr();
+
+        let mut acc = _mm512_setzero_ps();
+
+        for d in 0..dim {
+            let base_bc = _mm512_set1_ps(*b_ptr.add(d));
+            let q16 = _mm512_loadu_ps(t_ptr.add(d * SIMD_BATCH_WIDTH));
+            let diff = _mm512_sub_ps(base_bc, q16);
+            acc = _mm512_fmadd_ps(diff, diff, acc);
+        }
+
+        _mm512_storeu_ps(out.as_mut_ptr(), acc);
+    }
+}
+
+// -- Batched negative dot product ---------------------------------------------
+
+/// Compute negative dot product distances from one f16 base vector to all
+/// queries in a transposed batch.
+fn batched_neg_dot_f16(batch: &TransposedBatch, base: &[half::f16], out: &mut [f32]) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx512f") {
+            unsafe { batched_neg_dot_f16_avx512(batch, base, out); }
+            return;
+        }
+    }
+    let dim = batch.dim;
+    for qi in 0..batch.count {
+        let mut dot = 0.0f32;
+        for d in 0..dim {
+            dot += base[d].to_f32() * batch.data[d * SIMD_BATCH_WIDTH + qi];
+        }
+        out[qi] = -dot;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn batched_neg_dot_f16_avx512(batch: &TransposedBatch, base: &[half::f16], out: &mut [f32]) {
+    unsafe {
+        use std::arch::x86_64::*;
+
+        let dim = batch.dim;
+        let t_ptr = batch.data.as_ptr();
+        let mut acc = _mm512_setzero_ps();
+
+        for d in 0..dim {
+            let bval = base[d].to_f32();
+            let base_bc = _mm512_set1_ps(bval);
+            let q16 = _mm512_loadu_ps(t_ptr.add(d * SIMD_BATCH_WIDTH));
+            acc = _mm512_fmadd_ps(base_bc, q16, acc);
+        }
+
+        // Negate: distance = -dot (higher dot = more similar = lower distance)
+        let neg = _mm512_sub_ps(_mm512_setzero_ps(), acc);
+        _mm512_storeu_ps(out.as_mut_ptr(), neg);
+    }
+}
+
+/// Compute negative dot product distances from one f32 base vector.
+fn batched_neg_dot_f32(batch: &TransposedBatch, base: &[f32], out: &mut [f32]) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx512f") {
+            unsafe { batched_neg_dot_f32_avx512(batch, base, out); }
+            return;
+        }
+    }
+    let dim = batch.dim;
+    for qi in 0..batch.count {
+        let mut dot = 0.0f32;
+        for d in 0..dim {
+            dot += base[d] * batch.data[d * SIMD_BATCH_WIDTH + qi];
+        }
+        out[qi] = -dot;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn batched_neg_dot_f32_avx512(batch: &TransposedBatch, base: &[f32], out: &mut [f32]) {
+    unsafe {
+        use std::arch::x86_64::*;
+
+        let dim = batch.dim;
+        let t_ptr = batch.data.as_ptr();
+        let b_ptr = base.as_ptr();
+        let mut acc = _mm512_setzero_ps();
+
+        for d in 0..dim {
+            let base_bc = _mm512_set1_ps(*b_ptr.add(d));
+            let q16 = _mm512_loadu_ps(t_ptr.add(d * SIMD_BATCH_WIDTH));
+            acc = _mm512_fmadd_ps(base_bc, q16, acc);
+        }
+
+        let neg = _mm512_sub_ps(_mm512_setzero_ps(), acc);
+        _mm512_storeu_ps(out.as_mut_ptr(), neg);
+    }
+}
+
+// -- Batched L1 (Manhattan) ---------------------------------------------------
+
+/// Compute L1 distances from one f16 base vector to all queries.
+fn batched_l1_f16(batch: &TransposedBatch, base: &[half::f16], out: &mut [f32]) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx512f") {
+            unsafe { batched_l1_f16_avx512(batch, base, out); }
+            return;
+        }
+    }
+    let dim = batch.dim;
+    for qi in 0..batch.count {
+        let mut sum = 0.0f32;
+        for d in 0..dim {
+            sum += (base[d].to_f32() - batch.data[d * SIMD_BATCH_WIDTH + qi]).abs();
+        }
+        out[qi] = sum;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn batched_l1_f16_avx512(batch: &TransposedBatch, base: &[half::f16], out: &mut [f32]) {
+    unsafe {
+        use std::arch::x86_64::*;
+
+        let dim = batch.dim;
+        let t_ptr = batch.data.as_ptr();
+        let mut acc = _mm512_setzero_ps();
+
+        for d in 0..dim {
+            let bval = base[d].to_f32();
+            let base_bc = _mm512_set1_ps(bval);
+            let q16 = _mm512_loadu_ps(t_ptr.add(d * SIMD_BATCH_WIDTH));
+            let diff = _mm512_sub_ps(base_bc, q16);
+            let abs_diff = _mm512_abs_ps(diff);
+            acc = _mm512_add_ps(acc, abs_diff);
+        }
+
+        _mm512_storeu_ps(out.as_mut_ptr(), acc);
+    }
+}
+
+/// Compute L1 distances from one f32 base vector to all queries.
+fn batched_l1_f32(batch: &TransposedBatch, base: &[f32], out: &mut [f32]) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx512f") {
+            unsafe { batched_l1_f32_avx512(batch, base, out); }
+            return;
+        }
+    }
+    let dim = batch.dim;
+    for qi in 0..batch.count {
+        let mut sum = 0.0f32;
+        for d in 0..dim {
+            sum += (base[d] - batch.data[d * SIMD_BATCH_WIDTH + qi]).abs();
+        }
+        out[qi] = sum;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn batched_l1_f32_avx512(batch: &TransposedBatch, base: &[f32], out: &mut [f32]) {
+    unsafe {
+        use std::arch::x86_64::*;
+
+        let dim = batch.dim;
+        let t_ptr = batch.data.as_ptr();
+        let b_ptr = base.as_ptr();
+        let mut acc = _mm512_setzero_ps();
+
+        for d in 0..dim {
+            let base_bc = _mm512_set1_ps(*b_ptr.add(d));
+            let q16 = _mm512_loadu_ps(t_ptr.add(d * SIMD_BATCH_WIDTH));
+            let diff = _mm512_sub_ps(base_bc, q16);
+            let abs_diff = _mm512_abs_ps(diff);
+            acc = _mm512_add_ps(acc, abs_diff);
+        }
+
+        _mm512_storeu_ps(out.as_mut_ptr(), acc);
+    }
+}
+
+// -- Bulk f16 → f32 conversion ------------------------------------------------
+
+/// Bulk-convert f16 values to f32 using AVX-512 when available.
+///
+/// For 512 dimensions, uses 32 SIMD conversion instructions instead of
+/// 512 scalar conversions. This should be called once per base vector,
+/// not inside the per-sub-batch distance kernel.
+pub fn convert_f16_to_f32_bulk(src: &[half::f16], dst: &mut [f32]) {
+    debug_assert!(dst.len() >= src.len());
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("f16c") {
+            unsafe { convert_f16_to_f32_avx512(src, dst); }
+            return;
+        }
+        if is_x86_feature_detected!("f16c") {
+            unsafe { convert_f16_to_f32_avx2(src, dst); }
+            return;
+        }
+    }
+    for (i, h) in src.iter().enumerate() {
+        dst[i] = h.to_f32();
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f", enable = "f16c")]
+unsafe fn convert_f16_to_f32_avx512(src: &[half::f16], dst: &mut [f32]) {
+    unsafe {
+        use std::arch::x86_64::*;
+
+        let n = src.len();
+        let src_ptr = src.as_ptr() as *const u16;
+        let dst_ptr = dst.as_mut_ptr();
+        let chunks = n / 16;
+        let remainder = n % 16;
+
+        for i in 0..chunks {
+            let offset = i * 16;
+            let f16_vals = _mm256_loadu_si256(src_ptr.add(offset) as *const __m256i);
+            let f32_vals = _mm512_cvtph_ps(f16_vals);
+            _mm512_storeu_ps(dst_ptr.add(offset), f32_vals);
+        }
+
+        let tail_start = chunks * 16;
+        for i in 0..remainder {
+            *dst_ptr.add(tail_start + i) =
+                half::f16::from_bits(*src_ptr.add(tail_start + i)).to_f32();
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "f16c")]
+unsafe fn convert_f16_to_f32_avx2(src: &[half::f16], dst: &mut [f32]) {
+    unsafe {
+        use std::arch::x86_64::*;
+
+        let n = src.len();
+        let src_ptr = src.as_ptr() as *const u16;
+        let dst_ptr = dst.as_mut_ptr();
+        let chunks = n / 8;
+        let remainder = n % 8;
+
+        for i in 0..chunks {
+            let offset = i * 8;
+            let f16_vals = _mm_loadu_si128(src_ptr.add(offset) as *const __m128i);
+            let f32_vals = _mm256_cvtph_ps(f16_vals);
+            _mm256_storeu_ps(dst_ptr.add(offset), f32_vals);
+        }
+
+        let tail_start = chunks * 8;
+        for i in 0..remainder {
+            *dst_ptr.add(tail_start + i) =
+                half::f16::from_bits(*src_ptr.add(tail_start + i)).to_f32();
+        }
+    }
+}
+
 // -- Reporting ---------------------------------------------------------------
 
 /// Report which SIMD level is available on this system.
@@ -410,7 +856,7 @@ fn l2_f16_scalar(a: &[half::f16], b: &[half::f16]) -> f32 {
         let d = a[i].to_f32() - b[i].to_f32();
         sum += d * d;
     }
-    sum.sqrt()
+    sum // squared L2 — matches select_distance_fn_f16(Metric::L2)
 }
 
 #[cfg(test)]
@@ -455,8 +901,8 @@ mod tests {
         let b = vec![0.0, 1.0, 0.0];
         let d = l2_scalar(&a, &b);
         assert!(
-            (d - std::f32::consts::SQRT_2).abs() < 1e-5,
-            "expected sqrt(2), got {}",
+            (d - 2.0).abs() < 1e-5, // squared L2: (1-0)² + (0-1)² = 2
+            "expected 2.0 (l2sq), got {}",
             d
         );
     }
@@ -663,6 +1109,158 @@ mod tests {
                 let d = f(&a, &b);
                 assert!(d.is_finite(), "f16 metric {:?} len={} non-finite", metric, len);
             }
+        }
+    }
+
+    // -- Transposed batch tests -----------------------------------------------
+
+    #[test]
+    fn test_transposed_batch_l2sq_f16_matches_pairwise() {
+        let dim = 128;
+        let queries: Vec<Vec<half::f16>> = (0..16)
+            .map(|qi| {
+                (0..dim)
+                    .map(|d| half::f16::from_f32((qi * dim + d) as f32 * 0.01))
+                    .collect()
+            })
+            .collect();
+        let base: Vec<half::f16> = (0..dim)
+            .map(|d| half::f16::from_f32(d as f32 * 0.05 - 3.0))
+            .collect();
+
+        let query_refs: Vec<&[half::f16]> = queries.iter().map(|q| q.as_slice()).collect();
+        let batch = TransposedBatch::from_f16(&query_refs, dim);
+
+        let mut batched_out = vec![0.0f32; SIMD_BATCH_WIDTH];
+        batched_l2sq_f16(&batch, &base, &mut batched_out);
+
+        let pairwise_fn = select_distance_fn_f16(Metric::L2);
+        for qi in 0..16 {
+            let pairwise = pairwise_fn(&queries[qi], &base);
+            assert!(
+                (batched_out[qi] - pairwise).abs() < 0.5,
+                "L2sq f16 mismatch at qi={}: batched={}, pairwise={}",
+                qi, batched_out[qi], pairwise
+            );
+        }
+    }
+
+    #[test]
+    fn test_transposed_batch_l2sq_f32_matches_pairwise() {
+        let dim = 128;
+        let queries: Vec<Vec<f32>> = (0..16)
+            .map(|qi| {
+                (0..dim)
+                    .map(|d| (qi * dim + d) as f32 * 0.01)
+                    .collect()
+            })
+            .collect();
+        let base: Vec<f32> = (0..dim).map(|d| d as f32 * 0.05 - 3.0).collect();
+
+        let query_refs: Vec<&[f32]> = queries.iter().map(|q| q.as_slice()).collect();
+        let batch = TransposedBatch::from_f32(&query_refs, dim);
+
+        let mut batched_out = vec![0.0f32; SIMD_BATCH_WIDTH];
+        batched_l2sq_f32(&batch, &base, &mut batched_out);
+
+        let pairwise_fn = select_distance_fn(Metric::L2);
+        for qi in 0..16 {
+            let pairwise = pairwise_fn(&queries[qi], &base);
+            // Relative tolerance: SimSIMD uses different accumulation order
+            let tol = pairwise.abs() * 1e-4 + 0.1;
+            assert!(
+                (batched_out[qi] - pairwise).abs() < tol,
+                "L2sq f32 mismatch at qi={}: batched={}, pairwise={}",
+                qi, batched_out[qi], pairwise
+            );
+        }
+    }
+
+    #[test]
+    fn test_transposed_batch_partial_fill() {
+        let dim = 64;
+        let queries: Vec<Vec<f32>> = (0..5)
+            .map(|qi| (0..dim).map(|d| (qi * dim + d) as f32 * 0.1).collect())
+            .collect();
+        let base: Vec<f32> = (0..dim).map(|d| d as f32 * 0.2).collect();
+
+        let query_refs: Vec<&[f32]> = queries.iter().map(|q| q.as_slice()).collect();
+        let batch = TransposedBatch::from_f32(&query_refs, dim);
+        assert_eq!(batch.count(), 5);
+
+        let mut batched_out = vec![0.0f32; SIMD_BATCH_WIDTH];
+        batched_l2sq_f32(&batch, &base, &mut batched_out);
+
+        let pairwise_fn = select_distance_fn(Metric::L2);
+        for qi in 0..5 {
+            let pairwise = pairwise_fn(&queries[qi], &base);
+            assert!(
+                (batched_out[qi] - pairwise).abs() < 1e-2,
+                "partial L2sq f32 mismatch at qi={}: batched={}, pairwise={}",
+                qi, batched_out[qi], pairwise
+            );
+        }
+    }
+
+    #[test]
+    fn test_transposed_batch_neg_dot_f16() {
+        let dim = 64;
+        let queries: Vec<Vec<half::f16>> = (0..8)
+            .map(|qi| {
+                (0..dim)
+                    .map(|d| half::f16::from_f32((qi * dim + d) as f32 * 0.01))
+                    .collect()
+            })
+            .collect();
+        let base: Vec<half::f16> = (0..dim)
+            .map(|d| half::f16::from_f32(d as f32 * 0.05))
+            .collect();
+
+        let query_refs: Vec<&[half::f16]> = queries.iter().map(|q| q.as_slice()).collect();
+        let batch = TransposedBatch::from_f16(&query_refs, dim);
+
+        let mut batched_out = vec![0.0f32; SIMD_BATCH_WIDTH];
+        batched_neg_dot_f16(&batch, &base, &mut batched_out);
+
+        let pairwise_fn = select_distance_fn_f16(Metric::DotProduct);
+        for qi in 0..8 {
+            let pairwise = pairwise_fn(&queries[qi], &base);
+            assert!(
+                (batched_out[qi] - pairwise).abs() < 1.0,
+                "neg dot f16 mismatch at qi={}: batched={}, pairwise={}",
+                qi, batched_out[qi], pairwise
+            );
+        }
+    }
+
+    #[test]
+    fn test_transposed_batch_l1_f16() {
+        let dim = 64;
+        let queries: Vec<Vec<half::f16>> = (0..8)
+            .map(|qi| {
+                (0..dim)
+                    .map(|d| half::f16::from_f32((qi * dim + d) as f32 * 0.01))
+                    .collect()
+            })
+            .collect();
+        let base: Vec<half::f16> = (0..dim)
+            .map(|d| half::f16::from_f32(d as f32 * 0.05 - 1.0))
+            .collect();
+
+        let query_refs: Vec<&[half::f16]> = queries.iter().map(|q| q.as_slice()).collect();
+        let batch = TransposedBatch::from_f16(&query_refs, dim);
+
+        let mut batched_out = vec![0.0f32; SIMD_BATCH_WIDTH];
+        batched_l1_f16(&batch, &base, &mut batched_out);
+
+        let pairwise_fn = select_distance_fn_f16(Metric::L1);
+        for qi in 0..8 {
+            let pairwise = pairwise_fn(&queries[qi], &base);
+            assert!(
+                (batched_out[qi] - pairwise).abs() < 1.0,
+                "L1 f16 mismatch at qi={}: batched={}, pairwise={}",
+                qi, batched_out[qi], pairwise
+            );
         }
     }
 }

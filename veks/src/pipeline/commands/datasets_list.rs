@@ -16,7 +16,8 @@ use std::time::Instant;
 
 use crate::import::dataset::DatasetConfig;
 use crate::pipeline::command::{
-    CommandOp, CommandResult, OptionDesc, Options, Status, StreamContext,
+    CommandDoc, CommandOp, CommandResult, OptionDesc, Options, Status, StreamContext,
+    render_options_table,
 };
 
 /// Pipeline command: list datasets.
@@ -40,6 +41,23 @@ struct DatasetSummary {
 impl CommandOp for DatasetsListOp {
     fn command_path(&self) -> &str {
         "datasets list"
+    }
+
+    fn command_doc(&self) -> CommandDoc {
+        let options = self.describe_options();
+        CommandDoc {
+            summary: "List available datasets from configured sources".into(),
+            body: format!(
+                "# datasets list\n\n\
+                 List available datasets from configured sources.\n\n\
+                 ## Description\n\n\
+                 Scans a directory for `dataset.yaml` files and lists them with their \
+                 metadata (name, description, facets, profiles). Supports text, JSON, \
+                 and YAML output formats.\n\n\
+                 ## Options\n\n{}",
+                render_options_table(&options)
+            ),
+        }
     }
 
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
@@ -71,38 +89,38 @@ impl CommandOp for DatasetsListOp {
         match format {
             "json" => {
                 let json = serde_json::to_string_pretty(&datasets).unwrap_or_default();
-                eprintln!("{}", json);
+                ctx.display.log(&format!("{}", json));
             }
             "yaml" => {
                 let yaml = serde_yaml::to_string(&datasets).unwrap_or_default();
-                eprintln!("{}", yaml);
+                ctx.display.log(&format!("{}", yaml));
             }
             _ => {
                 // Text format
                 if datasets.is_empty() {
-                    eprintln!("No datasets found in {}", catalog_path.display());
+                    ctx.display.log(&format!("No datasets found in {}", catalog_path.display()));
                 } else {
-                    eprintln!("Datasets in {}:", catalog_path.display());
-                    eprintln!();
+                    ctx.display.log(&format!("Datasets in {}:", catalog_path.display()));
+                    ctx.display.log("");
                     for ds in &datasets {
-                        eprintln!("  {}", ds.name);
+                        ctx.display.log(&format!("  {}", ds.name));
                         if verbose {
-                            eprintln!("    Path: {}", ds.path);
+                            ctx.display.log(&format!("    Path: {}", ds.path));
                             if let Some(ref desc) = ds.description {
-                                eprintln!("    Description: {}", desc);
+                                ctx.display.log(&format!("    Description: {}", desc));
                             }
-                            eprintln!("    Views: {}", ds.views.join(", "));
-                            eprintln!("    Profiles: {}", ds.profile_count);
-                            eprintln!(
+                            ctx.display.log(&format!("    Views: {}", ds.views.join(", ")));
+                            ctx.display.log(&format!("    Profiles: {}", ds.profile_count));
+                            ctx.display.log(&format!(
                                 "    Pipeline: {}",
                                 if ds.has_pipeline { "yes" } else { "no" }
-                            );
-                            eprintln!();
+                            ));
+                            ctx.display.log("");
                         }
                     }
                     if !verbose {
-                        eprintln!();
-                        eprintln!("  {} datasets found. Use verbose=true for details.", datasets.len());
+                        ctx.display.log("");
+                        ctx.display.log(&format!("  {} datasets found. Use verbose=true for details.", datasets.len()));
                     }
                 }
             }
@@ -246,6 +264,8 @@ mod tests {
             progress: ProgressLog::new(),
             threads: 1,
             step_id: String::new(),
+            governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
+            display: crate::pipeline::display::ProgressDisplay::new(),
         }
     }
 

@@ -14,7 +14,8 @@ use std::time::Instant;
 use serde::Deserialize;
 
 use crate::pipeline::command::{
-    CommandOp, CommandResult, OptionDesc, Options, Status, StreamContext,
+    CommandDoc, CommandOp, CommandResult, OptionDesc, Options, ResourceDesc, Status, StreamContext,
+    render_options_table,
 };
 
 /// Pipeline command: diff two model.json files.
@@ -93,6 +94,24 @@ impl CommandOp for AnalyzeModelDiffOp {
         "analyze model-diff"
     }
 
+    fn command_doc(&self) -> CommandDoc {
+        let options = self.describe_options();
+        CommandDoc {
+            summary: "Compare vector distributions across two files".into(),
+            body: format!(
+                "# analyze model-diff\n\nCompare vector distributions across two files.\n\n## Description\n\nLoads two VectorSpaceModel JSON files and compares them dimension-by-dimension, computing parameter drift percentages and reporting PASS/FAIL based on configurable thresholds.\n\n## Options\n\n{}",
+                render_options_table(&options)
+            ),
+        }
+    }
+
+    fn describe_resources(&self) -> Vec<ResourceDesc> {
+        vec![
+            ResourceDesc { name: "mem".into(), description: "Vector data buffers".into(), adjustable: false },
+            ResourceDesc { name: "readahead".into(), description: "Sequential read prefetch".into(), adjustable: false },
+        ]
+    }
+
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
         let start = Instant::now();
 
@@ -143,11 +162,11 @@ impl CommandOp for AnalyzeModelDiffOp {
         let mut max_drift = 0.0f64;
         let mut problem_dims: Vec<usize> = Vec::new();
 
-        eprintln!(
+        ctx.display.log(&format!(
             "{:<6} {:<10} {:<10} {:>10}  {}",
             "Dim", "Original", "Compare", "Drift%", "Status"
-        );
-        eprintln!("{}", "-".repeat(52));
+        ));
+        ctx.display.log(&format!("{}", "-".repeat(52)));
 
         for i in 0..dim_count {
             let o = &orig.scalar_models[i];
@@ -175,38 +194,38 @@ impl CommandOp for AnalyzeModelDiffOp {
 
             let show = verbose || i < 10 || problem_dims.contains(&i) || i == dim_count - 1;
             if show {
-                eprintln!(
+                ctx.display.log(&format!(
                     "{:<6} {:<10} {:<10} {:>9.2}%  {}",
                     i,
                     o.type_name(),
                     c.type_name(),
                     drift,
                     status
-                );
+                ));
             } else if i == 10 {
-                eprintln!("  ...");
+                ctx.display.log("  ...");
             }
         }
 
         let avg_drift = total_drift / dim_count as f64;
         let type_match_pct = (type_matches as f64 / dim_count as f64) * 100.0;
 
-        eprintln!();
-        eprintln!("Summary:");
-        eprintln!("  Dimensions:    {}", dim_count);
-        eprintln!("  Type match:    {:.1}% ({}/{})", type_match_pct, type_matches, dim_count);
-        eprintln!("  Avg drift:     {:.2}%", avg_drift);
-        eprintln!("  Max drift:     {:.2}%", max_drift);
-        eprintln!("  Problem dims:  {}", problem_dims.len());
+        ctx.display.log("");
+        ctx.display.log("Summary:");
+        ctx.display.log(&format!("  Dimensions:    {}", dim_count));
+        ctx.display.log(&format!("  Type match:    {:.1}% ({}/{})", type_match_pct, type_matches, dim_count));
+        ctx.display.log(&format!("  Avg drift:     {:.2}%", avg_drift));
+        ctx.display.log(&format!("  Max drift:     {:.2}%", max_drift));
+        ctx.display.log(&format!("  Problem dims:  {}", problem_dims.len()));
 
         let pass = avg_drift <= drift_threshold
             && max_drift <= max_drift_threshold
             && type_match_pct >= 100.0;
 
         if pass {
-            eprintln!("  Result: PASS");
+            ctx.display.log("  Result: PASS");
         } else {
-            eprintln!("  Result: FAIL");
+            ctx.display.log("  Result: FAIL");
         }
 
         CommandResult {
@@ -299,6 +318,8 @@ mod tests {
             progress: ProgressLog::new(),
             threads: 1,
             step_id: String::new(),
+            governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
+            display: crate::pipeline::display::ProgressDisplay::new(),
         }
     }
 

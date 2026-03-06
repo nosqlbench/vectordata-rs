@@ -48,7 +48,7 @@ pub fn run(args: ConvertArgs) {
     }
 
     // Open source reader
-    let mut source = reader::open_source(&args.source, source_format, 0).unwrap_or_else(|e| {
+    let mut source = reader::open_source(&args.source, source_format, 0, None).unwrap_or_else(|e| {
         eprintln!("Failed to open source: {}", e);
         std::process::exit(1);
     });

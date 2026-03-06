@@ -23,7 +23,8 @@ use vectordata::VectorReader;
 use vectordata::io::MmapVectorReader;
 
 use crate::pipeline::command::{
-    CommandOp, CommandResult, OptionDesc, Options, Status, StreamContext,
+    CommandDoc, CommandOp, CommandResult, OptionDesc, Options, ResourceDesc, Status, StreamContext,
+    render_options_table,
 };
 use crate::pipeline::predicate::attribute::{AttributeColumn, FieldType};
 use crate::pipeline::predicate::codec;
@@ -43,6 +44,34 @@ pub fn factory() -> Box<dyn CommandOp> {
 impl CommandOp for GeneratePredicatedOp {
     fn command_path(&self) -> &str {
         "generate predicated"
+    }
+
+    fn command_doc(&self) -> CommandDoc {
+        let options = self.describe_options();
+        CommandDoc {
+            summary: "Generate predicated dataset with filtered ground truth".into(),
+            body: format!(r#"# generate predicated
+
+Generate predicated dataset with filtered ground truth.
+
+## Description
+
+Starting from an existing base dataset (base vectors, queries, ground truth),
+adds structured metadata attributes, query predicates, and recomputed
+predicated ground truth (KNN over predicate-filtered base vectors).
+
+## Options
+
+{}"#, render_options_table(&options)),
+        }
+    }
+
+    fn describe_resources(&self) -> Vec<ResourceDesc> {
+        vec![
+            ResourceDesc { name: "mem".into(), description: "Dataset buffers during predicated output".into(), adjustable: true },
+            ResourceDesc { name: "threads".into(), description: "Parallel processing".into(), adjustable: true },
+            ResourceDesc { name: "readahead".into(), description: "Sequential prefetch for input files".into(), adjustable: false },
+        ]
     }
 
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
@@ -125,18 +154,18 @@ impl CommandOp for GeneratePredicatedOp {
         let schema = generator::generate_schema(field_count, &type_strs, &cardinalities);
 
         // Generate attribute columns
-        eprintln!(
+        ctx.display.log(&format!(
             "  Generating {} attribute columns for {} base vectors...",
             field_count, base_count
-        );
+        ));
         let mut rng_inst = rng::seeded_rng(seed);
         let columns = generator::generate_columns(&schema, base_count, &mut rng_inst);
 
         // Generate predicates for each query
-        eprintln!(
+        ctx.display.log(&format!(
             "  Generating {} predicates (selectivity={}, complexity={})...",
             query_count, selectivity, complexity
-        );
+        ));
         let predicates: Vec<PNode> = (0..query_count)
             .map(|_| match complexity {
                 "compound" => {
@@ -214,10 +243,15 @@ impl CommandOp for GeneratePredicatedOp {
         let indices_path = output_dir.join("predicated_indices.ivec");
         let distances_path = output_dir.join("predicated_distances.fvec");
 
-        eprintln!(
+        ctx.display.log(&format!(
             "  Computing predicated {}-NN ({} queries × {} base)...",
             effective_k, query_count, base_count
-        );
+        ));
+
+        // Governor checkpoint before predicated KNN computation
+        if ctx.governor.checkpoint() {
+            ctx.display.log("  governor: throttle active");
+        }
 
         match compute_predicated_knn(
             &base,
@@ -260,15 +294,15 @@ impl CommandOp for GeneratePredicatedOp {
             .map(|p| generator::measure_selectivity(p, &columns, base_count))
             .sum::<f64>()
             / query_count as f64;
-        eprintln!(
+        ctx.display.log(&format!(
             "  Average selectivity: {:.4} (target: {:.4})",
             avg_sel, selectivity
-        );
+        ));
 
-        eprintln!(
+        ctx.display.log(&format!(
             "  Predicated dataset created: {}",
             output_dir.display()
-        );
+        ));
 
         CommandResult {
             status: Status::Ok,
@@ -579,6 +613,8 @@ mod tests {
             progress: ProgressLog::new(),
             threads: 1,
             step_id: String::new(),
+            governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
+            display: crate::pipeline::display::ProgressDisplay::new(),
         }
     }
 

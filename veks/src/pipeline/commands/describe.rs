@@ -12,7 +12,8 @@ use std::time::Instant;
 use crate::formats::VecFormat;
 use crate::formats::reader;
 use crate::pipeline::command::{
-    CommandOp, CommandResult, OptionDesc, Options, Status, StreamContext,
+    CommandDoc, CommandOp, CommandResult, OptionDesc, Options, ResourceDesc, Status, StreamContext,
+    render_options_table,
 };
 
 /// Pipeline command: describe/analyze a vector file.
@@ -25,6 +26,24 @@ pub fn factory() -> Box<dyn CommandOp> {
 impl CommandOp for AnalyzeDescribeOp {
     fn command_path(&self) -> &str {
         "analyze describe"
+    }
+
+    fn command_doc(&self) -> CommandDoc {
+        let options = self.describe_options();
+        CommandDoc {
+            summary: "Describe vector file format and dimensions".into(),
+            body: format!(
+                "# analyze describe\n\nDescribe vector file format and dimensions.\n\n## Description\n\nProbes a vector file and reports its format, dimensionality, element size, and record count. Useful for validation steps in pipelines.\n\n## Options\n\n{}",
+                render_options_table(&options)
+            ),
+        }
+    }
+
+    fn describe_resources(&self) -> Vec<ResourceDesc> {
+        vec![
+            ResourceDesc { name: "mem".into(), description: "Vector data buffers".into(), adjustable: false },
+            ResourceDesc { name: "readahead".into(), description: "Sequential read prefetch".into(), adjustable: false },
+        ]
     }
 
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {

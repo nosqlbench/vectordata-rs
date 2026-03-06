@@ -18,7 +18,8 @@ use vectordata::VectorReader;
 use vectordata::io::MmapVectorReader;
 
 use crate::pipeline::command::{
-    CommandOp, CommandResult, OptionDesc, Options, Status, StreamContext,
+    CommandDoc, CommandOp, CommandResult, OptionDesc, Options, ResourceDesc, Status, StreamContext,
+    render_options_table,
 };
 
 /// Pipeline command: derive a synthetic dataset from an existing one.
@@ -50,6 +51,35 @@ enum ScalarModelDef {
 impl CommandOp for GenerateDeriveOp {
     fn command_path(&self) -> &str {
         "generate derive"
+    }
+
+    fn command_doc(&self) -> CommandDoc {
+        let options = self.describe_options();
+        CommandDoc {
+            summary: "Derive new facets from existing dataset files".into(),
+            body: format!(r#"# generate derive
+
+Derive new facets from existing dataset files.
+
+## Description
+
+Extracts a statistical model (per-dimension distribution parameters) from
+a source dataset's base vectors, then creates a target directory with a
+model.json and dataset.yaml that can be used to generate unlimited
+synthetic vectors matching the source's statistical profile.
+
+## Options
+
+{}"#, render_options_table(&options)),
+        }
+    }
+
+    fn describe_resources(&self) -> Vec<ResourceDesc> {
+        vec![
+            ResourceDesc { name: "mem".into(), description: "Derivation buffers".into(), adjustable: true },
+            ResourceDesc { name: "threads".into(), description: "Parallel derivation".into(), adjustable: true },
+            ResourceDesc { name: "readahead".into(), description: "Sequential read prefetch".into(), adjustable: false },
+        ]
     }
 
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
@@ -108,13 +138,13 @@ impl CommandOp for GenerateDeriveOp {
         let effective_sample = sample.min(total_count);
         let output_count = if count == 0 { total_count as u64 } else { count };
 
-        eprintln!(
+        ctx.display.log(&format!(
             "Extracting model from {} ({} vectors, dim={}, sampling {})",
             base_path.display(),
             total_count,
             dim,
             effective_sample
-        );
+        ));
 
         // Extract per-dimension statistics
         let mut models: Vec<ScalarModelDef> = Vec::with_capacity(dim);
@@ -181,12 +211,12 @@ impl CommandOp for GenerateDeriveOp {
             return error_result(format!("failed to write dataset.yaml: {}", e), start);
         }
 
-        eprintln!(
+        ctx.display.log(&format!(
             "Derived dataset '{}' with {} dimensions, {} target vectors",
             name, dim, output_count
-        );
-        eprintln!("  model: {}", model_path.display());
-        eprintln!("  config: {}", yaml_path.display());
+        ));
+        ctx.display.log(&format!("  model: {}", model_path.display()));
+        ctx.display.log(&format!("  config: {}", yaml_path.display()));
 
         CommandResult {
             status: Status::Ok,
@@ -375,6 +405,8 @@ mod tests {
             progress: ProgressLog::new(),
             threads: 1,
             step_id: String::new(),
+            governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
+            display: crate::pipeline::display::ProgressDisplay::new(),
         }
     }
 

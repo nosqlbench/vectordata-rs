@@ -30,7 +30,8 @@ use rand_distr::{Beta, Distribution, Normal, Uniform};
 use serde::Deserialize;
 
 use crate::pipeline::command::{
-    CommandOp, CommandResult, OptionDesc, Options, Status, StreamContext,
+    CommandDoc, CommandOp, CommandResult, OptionDesc, Options, Status, StreamContext,
+    render_options_table,
 };
 use crate::pipeline::rng;
 
@@ -138,6 +139,26 @@ impl ModelSampler {
 impl CommandOp for GenerateFromModelOp {
     fn command_path(&self) -> &str {
         "generate from-model"
+    }
+
+    fn command_doc(&self) -> CommandDoc {
+        let options = self.describe_options();
+        CommandDoc {
+            summary: "Generate vectors using an embedding model".into(),
+            body: format!(r#"# generate from-model
+
+Generate vectors using an embedding model.
+
+## Description
+
+Loads a VectorSpaceModel JSON file (produced by profile analysis or
+`generate sketch --model-out`) and generates synthetic vectors by sampling
+each dimension from its fitted distribution via inverse CDF transform.
+
+## Options
+
+{}"#, render_options_table(&options)),
+        }
     }
 
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
@@ -337,6 +358,8 @@ mod tests {
             progress: ProgressLog::new(),
             threads: 1,
             step_id: String::new(),
+            governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
+            display: crate::pipeline::display::ProgressDisplay::new(),
         }
     }
 

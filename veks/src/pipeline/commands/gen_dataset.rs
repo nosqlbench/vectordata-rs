@@ -24,7 +24,8 @@ use vectordata::VectorReader;
 use vectordata::io::MmapVectorReader;
 
 use crate::pipeline::command::{
-    CommandOp, CommandResult, OptionDesc, Options, Status, StreamContext,
+    CommandDoc, CommandOp, CommandResult, OptionDesc, Options, Status, StreamContext,
+    render_options_table,
 };
 use crate::pipeline::rng;
 use crate::pipeline::simd_distance;
@@ -39,6 +40,27 @@ pub fn factory() -> Box<dyn CommandOp> {
 impl CommandOp for GenerateDatasetOp {
     fn command_path(&self) -> &str {
         "generate dataset"
+    }
+
+    fn command_doc(&self) -> CommandDoc {
+        let options = self.describe_options();
+        CommandDoc {
+            summary: "Generate a complete synthetic dataset".into(),
+            body: format!(r#"# generate dataset
+
+Generate a complete synthetic dataset.
+
+## Description
+
+Creates a full dataset directory containing base vectors, query vectors,
+ground truth nearest-neighbor indices, ground truth distances, and a
+dataset.yaml descriptor file. Uses SIMD-accelerated distance computation
+for ground truth KNN.
+
+## Options
+
+{}"#, render_options_table(&options)),
+        }
     }
 
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
@@ -107,20 +129,20 @@ impl CommandOp for GenerateDatasetOp {
 
         // Generate base vectors
         let base_path = output_dir.join("base.fvec");
-        eprintln!(
+        ctx.display.log(&format!(
             "  Generating {} base vectors (dim={})...",
             base_count, dimension
-        );
+        ));
         if let Err(e) = generate_fvec(&base_path, base_count, dimension, min_val, max_val, &mut rng_inst) {
             return error_result(format!("base generation failed: {}", e), start);
         }
 
         // Generate query vectors
         let query_path = output_dir.join("query.fvec");
-        eprintln!(
+        ctx.display.log(&format!(
             "  Generating {} query vectors (dim={})...",
             query_count, dimension
-        );
+        ));
         if let Err(e) = generate_fvec(&query_path, query_count, dimension, min_val, max_val, &mut rng_inst) {
             return error_result(format!("query generation failed: {}", e), start);
         }
@@ -128,10 +150,10 @@ impl CommandOp for GenerateDatasetOp {
         // Compute ground truth KNN
         let indices_path = output_dir.join("indices.ivec");
         let distances_path = output_dir.join("distances.fvec");
-        eprintln!(
+        ctx.display.log(&format!(
             "  Computing {}-NN ground truth ({} queries × {} base)...",
             k, query_count, base_count
-        );
+        ));
         let effective_k = k.min(base_count);
         if let Err(e) = compute_ground_truth(
             &base_path,
@@ -176,7 +198,7 @@ impl CommandOp for GenerateDatasetOp {
             return error_result(format!("failed to write dataset.yaml: {}", e), start);
         }
 
-        eprintln!("  Dataset created: {}", output_dir.display());
+        ctx.display.log(&format!("  Dataset created: {}", output_dir.display()));
 
         CommandResult {
             status: Status::Ok,
@@ -480,6 +502,8 @@ mod tests {
             progress: ProgressLog::new(),
             threads: 1,
             step_id: String::new(),
+            governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
+            display: crate::pipeline::display::ProgressDisplay::new(),
         }
     }
 

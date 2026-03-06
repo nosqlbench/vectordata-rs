@@ -23,6 +23,7 @@ pub mod analyze_stats;
 pub mod analyze_verifyknn;
 pub mod analyze_zeros;
 pub mod cleanup_cleanfvec;
+pub mod compute_filtered_knn;
 pub mod compute_knn;
 pub mod compute_sort;
 mod config;
@@ -40,6 +41,8 @@ pub mod gen_derive;
 pub mod gen_extract;
 pub mod gen_from_model;
 pub mod gen_predicated;
+pub mod gen_predicate_keys;
+pub mod gen_predicates;
 pub mod gen_shuffle;
 pub mod gen_sketch;
 pub mod gen_vectors;
@@ -65,11 +68,13 @@ pub fn register_all(registry: &mut CommandRegistry) {
     registry.register("generate ivec-shuffle", gen_shuffle::factory);
     registry.register("generate fvec-extract", gen_extract::fvec_factory);
     registry.register("generate ivec-extract", gen_extract::ivec_factory);
+    registry.register("generate hvec-extract", gen_extract::hvec_factory);
     registry.register("generate sketch", gen_sketch::factory);
     registry.register("generate from-model", gen_from_model::factory);
 
     // Phase 4: compute commands
     registry.register("compute knn", compute_knn::factory);
+    registry.register("compute filtered-knn", compute_filtered_knn::factory);
     registry.register("compute sort", compute_sort::factory);
 
     // Phase 5: analysis, info, and cleanup commands
@@ -133,9 +138,12 @@ pub fn register_all(registry: &mut CommandRegistry) {
     registry.register("slab explain", slab::explain_factory);
     registry.register("slab namespaces", slab::namespaces_factory);
     registry.register("slab inspect", slab::inspect_factory);
+    registry.register("slab survey", slab::survey_factory);
 
     // Phase 6: visualization and predicated datasets
     registry.register("analyze plot", analyze_plot::factory);
     registry.register("analyze flamegraph", analyze_flamegraph::factory);
     registry.register("generate predicated", gen_predicated::factory);
+    registry.register("generate predicates", gen_predicates::factory);
+    registry.register("generate predicate-keys", gen_predicate_keys::factory);
 }

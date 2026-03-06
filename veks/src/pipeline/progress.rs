@@ -30,6 +30,21 @@ pub struct ProgressLog {
     pub steps: HashMap<String, StepRecord>,
 }
 
+/// Resource consumption summary for a single step.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResourceSummary {
+    /// Peak RSS in bytes observed during step execution.
+    pub peak_rss_bytes: u64,
+    /// CPU user time in seconds consumed during step execution.
+    pub cpu_user_secs: f64,
+    /// CPU system time in seconds consumed during step execution.
+    pub cpu_system_secs: f64,
+    /// Total bytes read from disk during step execution.
+    pub io_read_bytes: u64,
+    /// Total bytes written to disk during step execution.
+    pub io_write_bytes: u64,
+}
+
 /// Record of a single step's execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StepRecord {
@@ -50,6 +65,9 @@ pub struct StepRecord {
     /// Error detail if the step failed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Resource consumption summary (peak RSS, CPU, I/O).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_summary: Option<ResourceSummary>,
 }
 
 /// Record of a single output artifact at completion time.
@@ -111,15 +129,28 @@ impl ProgressLog {
         self.steps.get(step_id)
     }
 
-    /// Check whether the recorded outputs for a step still match disk state.
+    /// Check whether the recorded outputs for a step still match disk state
+    /// and the resolved options haven't changed.
     ///
-    /// Returns `true` if the step was recorded as OK and all output files
-    /// exist with sizes matching the recorded values.
-    pub fn is_step_fresh(&self, step_id: &str) -> bool {
+    /// Returns `true` if the step was recorded as OK, all output files exist
+    /// with sizes matching the recorded values, and the resolved options
+    /// match the current step options.
+    pub fn is_step_fresh(
+        &self,
+        step_id: &str,
+        current_options: Option<&HashMap<String, String>>,
+    ) -> bool {
         let record = match self.get_step(step_id) {
             Some(r) if r.status == Status::Ok => r,
             _ => return false,
         };
+
+        // Check whether resolved options changed since the last run
+        if let Some(current) = current_options {
+            if !record.resolved_options.is_empty() && &record.resolved_options != current {
+                return false;
+            }
+        }
 
         for output in &record.outputs {
             let path = Path::new(&output.path);
@@ -182,6 +213,7 @@ mod tests {
                 outputs: vec![],
                 resolved_options: HashMap::new(),
                 error: None,
+                resource_summary: None,
             },
         );
 
@@ -206,6 +238,7 @@ mod tests {
                 }],
                 resolved_options: HashMap::new(),
                 error: None,
+                resource_summary: None,
             },
         );
 
@@ -237,6 +270,7 @@ mod tests {
                 outputs: vec![],
                 resolved_options: HashMap::new(),
                 error: None,
+                resource_summary: None,
             },
         );
         log.save().unwrap();

@@ -12,7 +12,8 @@
 use std::time::Instant;
 
 use crate::pipeline::command::{
-    CommandOp, CommandResult, OptionDesc, Options, Status, StreamContext,
+    CommandDoc, CommandOp, CommandResult, OptionDesc, Options, Status, StreamContext,
+    render_options_table,
 };
 
 /// Pipeline command: display compute environment info.
@@ -27,7 +28,23 @@ impl CommandOp for InfoComputeOp {
         "info compute"
     }
 
-    fn execute(&mut self, options: &Options, _ctx: &mut StreamContext) -> CommandResult {
+    fn command_doc(&self) -> CommandDoc {
+        let options = self.describe_options();
+        CommandDoc {
+            summary: "Display compute capability information".into(),
+            body: format!(
+                "# info compute\n\n\
+                 Display compute capability information.\n\n\
+                 ## Description\n\n\
+                 Reports system information relevant to vector computation: CPU features, \
+                 available memory, thread count, and SIMD capabilities.\n\n\
+                 ## Options\n\n{}",
+                render_options_table(&options)
+            ),
+        }
+    }
+
+    fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
         let start = Instant::now();
 
         let short = options.get("short").map_or(false, |s| s == "true");
@@ -43,7 +60,7 @@ impl CommandOp for InfoComputeOp {
         let simd_features = detect_simd_features();
 
         if short {
-            eprintln!(
+            ctx.display.log(&format!(
                 "{} {} | {} CPUs | SIMD: {}",
                 os,
                 arch,
@@ -53,23 +70,23 @@ impl CommandOp for InfoComputeOp {
                 } else {
                     simd_features.join(", ")
                 }
-            );
+            ));
         } else {
-            eprintln!("Compute Environment");
-            eprintln!("  OS:           {} {}", os, arch);
-            eprintln!("  CPUs:         {}", cpus);
-            eprintln!("  Rust version: {}", env!("CARGO_PKG_VERSION"));
-            eprintln!(
+            ctx.display.log("Compute Environment");
+            ctx.display.log(&format!("  OS:           {} {}", os, arch));
+            ctx.display.log(&format!("  CPUs:         {}", cpus));
+            ctx.display.log(&format!("  Rust version: {}", env!("CARGO_PKG_VERSION")));
+            ctx.display.log(&format!(
                 "  Target:       {}",
                 std::env::var("TARGET").unwrap_or_else(|_| "unknown".to_string())
-            );
+            ));
 
             if simd_features.is_empty() {
-                eprintln!("  SIMD:         none detected at compile time");
+                ctx.display.log("  SIMD:         none detected at compile time");
             } else {
-                eprintln!("  SIMD features:");
+                ctx.display.log("  SIMD features:");
                 for feat in &simd_features {
-                    eprintln!("    - {}", feat);
+                    ctx.display.log(&format!("    - {}", feat));
                 }
             }
 
@@ -78,15 +95,15 @@ impl CommandOp for InfoComputeOp {
             {
                 if let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") {
                     for line in meminfo.lines().take(3) {
-                        eprintln!("  {}", line.trim());
+                        ctx.display.log(&format!("  {}", line.trim()));
                     }
                 }
             }
 
-            eprintln!();
-            eprintln!("  Vectorized distance computation: Rust auto-vectorization");
-            eprintln!("  For best performance, compile with:");
-            eprintln!("    RUSTFLAGS=\"-C target-cpu=native\" cargo build --release");
+            ctx.display.log("");
+            ctx.display.log("  Vectorized distance computation: Rust auto-vectorization");
+            ctx.display.log("  For best performance, compile with:");
+            ctx.display.log("    RUSTFLAGS=\"-C target-cpu=native\" cargo build --release");
         }
 
         CommandResult {
@@ -164,6 +181,8 @@ mod tests {
             progress: ProgressLog::new(),
             threads: 1,
             step_id: String::new(),
+            governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
+            display: crate::pipeline::display::ProgressDisplay::new(),
         }
     }
 

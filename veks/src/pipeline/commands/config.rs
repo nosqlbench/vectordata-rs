@@ -14,7 +14,8 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::pipeline::command::{
-    CommandOp, CommandResult, OptionDesc, Options, Status, StreamContext,
+    CommandDoc, CommandOp, CommandResult, OptionDesc, Options, Status, StreamContext,
+    render_options_table,
 };
 
 const CONFIG_DIR: &str = ".config/vectordata";
@@ -92,13 +93,30 @@ impl CommandOp for ConfigShowOp {
         "config show"
     }
 
-    fn execute(&mut self, _options: &Options, _ctx: &mut StreamContext) -> CommandResult {
+    fn command_doc(&self) -> CommandDoc {
+        let options = self.describe_options();
+        CommandDoc {
+            summary: "Display current configuration".into(),
+            body: format!(
+                "# config show\n\n\
+                 Display current configuration.\n\n\
+                 ## Description\n\n\
+                 Reads and displays the vectordata configuration from \
+                 `~/.config/vectordata/settings.yaml`, including cache directory \
+                 status and used space.\n\n\
+                 ## Options\n\n{}",
+                render_options_table(&options)
+            ),
+        }
+    }
+
+    fn execute(&mut self, _options: &Options, ctx: &mut StreamContext) -> CommandResult {
         let start = Instant::now();
         let path = settings_path();
 
         if !path.exists() {
-            eprintln!("Configuration: {} (not found)", path.display());
-            eprintln!("Run 'config init' to set up vectordata configuration.");
+            ctx.display.log(&format!("Configuration: {} (not found)", path.display()));
+            ctx.display.log("Run 'config init' to set up vectordata configuration.");
             return CommandResult {
                 status: Status::Ok,
                 message: "no configuration found".to_string(),
@@ -112,29 +130,29 @@ impl CommandOp for ConfigShowOp {
             Err(e) => return error_result(e, start),
         };
 
-        eprintln!("Configuration: {}", path.display());
+        ctx.display.log(&format!("Configuration: {}", path.display()));
 
         if let Some(ref cache_dir) = settings.cache_dir {
             let cache_path = PathBuf::from(cache_dir);
-            eprintln!("  cache_dir: {}", cache_dir);
+            ctx.display.log(&format!("  cache_dir: {}", cache_dir));
 
             if cache_path.is_dir() {
-                eprintln!("  Status: Active");
+                ctx.display.log("  Status: Active");
 
                 // Compute used space
                 if let Ok(used) = dir_size(&cache_path) {
-                    eprintln!("  Used space: {}", format_bytes(used));
+                    ctx.display.log(&format!("  Used space: {}", format_bytes(used)));
                 }
             } else if cache_path.exists() {
-                eprintln!("  Status: Error — path exists but is not a directory");
+                ctx.display.log("  Status: Error — path exists but is not a directory");
             } else {
-                eprintln!("  Status: Not yet created");
+                ctx.display.log("  Status: Not yet created");
             }
         } else {
-            eprintln!("  cache_dir: (not set)");
+            ctx.display.log("  cache_dir: (not set)");
         }
 
-        eprintln!("  protect_settings: {}", settings.protect_settings);
+        ctx.display.log(&format!("  protect_settings: {}", settings.protect_settings));
 
         CommandResult {
             status: Status::Ok,
@@ -166,7 +184,23 @@ impl CommandOp for ConfigInitOp {
         "config init"
     }
 
-    fn execute(&mut self, options: &Options, _ctx: &mut StreamContext) -> CommandResult {
+    fn command_doc(&self) -> CommandDoc {
+        let options = self.describe_options();
+        CommandDoc {
+            summary: "Initialize a new dataset workspace".into(),
+            body: format!(
+                "# config init\n\n\
+                 Initialize a new dataset workspace.\n\n\
+                 ## Description\n\n\
+                 Creates or updates the vectordata cache directory and writes the \
+                 configuration to `~/.config/vectordata/settings.yaml`.\n\n\
+                 ## Options\n\n{}",
+                render_options_table(&options)
+            ),
+        }
+    }
+
+    fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
         let start = Instant::now();
         let path = settings_path();
 
@@ -212,9 +246,9 @@ impl CommandOp for ConfigInitOp {
             return error_result(e, start);
         }
 
-        eprintln!("Configuration initialized:");
-        eprintln!("  Settings: {}", path.display());
-        eprintln!("  cache_dir: {}", cache_dir);
+        ctx.display.log("Configuration initialized:");
+        ctx.display.log(&format!("  Settings: {}", path.display()));
+        ctx.display.log(&format!("  cache_dir: {}", cache_dir));
 
         CommandResult {
             status: Status::Ok,
@@ -318,7 +352,23 @@ impl CommandOp for ConfigListMountsOp {
         "config list-mounts"
     }
 
-    fn execute(&mut self, options: &Options, _ctx: &mut StreamContext) -> CommandResult {
+    fn command_doc(&self) -> CommandDoc {
+        let options = self.describe_options();
+        CommandDoc {
+            summary: "List configured dataset mount points".into(),
+            body: format!(
+                "# config list-mounts\n\n\
+                 List configured dataset mount points.\n\n\
+                 ## Description\n\n\
+                 Lists writable mount points on the system suitable for cache storage, \
+                 showing available and total space.\n\n\
+                 ## Options\n\n{}",
+                render_options_table(&options)
+            ),
+        }
+    }
+
+    fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
         let start = Instant::now();
 
         let show_all = options.get("all").map_or(false, |s| s == "true");
@@ -326,8 +376,8 @@ impl CommandOp for ConfigListMountsOp {
 
         let mounts = list_mount_points();
 
-        eprintln!("{:<40} {:>12} {:>12} {:>8}", "Mount Point", "Available", "Total", "Writable");
-        eprintln!("{}", "-".repeat(76));
+        ctx.display.log(&format!("{:<40} {:>12} {:>12} {:>8}", "Mount Point", "Available", "Total", "Writable"));
+        ctx.display.log(&format!("{}", "-".repeat(76)));
 
         let mut count = 0;
         for mount in &mounts {
@@ -339,24 +389,24 @@ impl CommandOp for ConfigListMountsOp {
             } else {
                 mount.path.clone()
             };
-            eprintln!(
+            ctx.display.log(&format!(
                 "{:<40} {:>12} {:>12} {:>8}",
                 display_path,
                 format_bytes(mount.available),
                 format_bytes(mount.total),
                 if mount.writable { "Yes" } else { "No" }
-            );
+            ));
             count += 1;
         }
 
         if count == 0 {
-            eprintln!("No suitable mount points found.");
+            ctx.display.log("No suitable mount points found.");
             if !show_all {
-                eprintln!("Use all=true to show all mount points (including those with < 100 MB).");
+                ctx.display.log("Use all=true to show all mount points (including those with < 100 MB).");
             }
         } else {
-            eprintln!();
-            eprintln!("To set a cache directory, run: config init cache-dir=<path>");
+            ctx.display.log("");
+            ctx.display.log("To set a cache directory, run: config init cache-dir=<path>");
         }
 
         CommandResult {
@@ -504,6 +554,8 @@ mod tests {
             progress: ProgressLog::new(),
             threads: 1,
             step_id: String::new(),
+            governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
+            display: crate::pipeline::display::ProgressDisplay::new(),
         }
     }
 

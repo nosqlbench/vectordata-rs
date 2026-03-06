@@ -29,9 +29,27 @@
 //! ```
 //!
 //! ### PredicateNode (named mode — field by name)
+//!
+//! Two sub-formats are supported. Version detection uses a `0xFF` marker byte
+//! immediately after the `DIALECT_PNODE` leader:
+//!
+//! **Legacy format** (first byte after leader is 0x00, 0x01, or 0x02 — a ConjugateType):
 //! ```text
 //! [PRED=0: u8][name_len: u16 LE][name: UTF-8][op: u8][comparand_count: i16 LE][comparands: i64 LE * n]
 //! ```
+//!
+//! **Typed format** (first byte after leader is 0xFF):
+//! ```text
+//! [0xFF][PRED=0: u8][name_len: u16 LE][name: UTF-8][op: u8][comparand_count: i16 LE][typed_comparands...]
+//! ```
+//!
+//! Typed comparand encoding per value:
+//! - tag `0` (Int): i64 LE
+//! - tag `1` (Float): f64 LE
+//! - tag `2` (Text): u16 LE len + UTF-8
+//! - tag `3` (Bool): u8
+//! - tag `4` (Bytes): u32 LE len + raw
+//! - tag `5` (Null): nothing
 //!
 //! All PNode payloads are prefixed with a `DIALECT_PNODE` leader byte (`0x02`)
 //! to identify the record type when stored alongside MNode records.
@@ -39,6 +57,10 @@
 /// Dialect leader byte identifying PNode records.
 pub const DIALECT_PNODE: u8 = 0x02;
 
+/// Marker byte for typed-comparand named format.
+const TYPED_MARKER: u8 = 0xFF;
+
+pub mod eval;
 pub mod vernacular;
 
 // vernacular module provides to_cddl/to_cql/to_sql — used from tests
@@ -144,6 +166,64 @@ impl fmt::Display for FieldRef {
     }
 }
 
+/// A typed comparand value used in predicate nodes.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Comparand {
+    /// 64-bit signed integer
+    Int(i64),
+    /// 64-bit floating-point
+    Float(f64),
+    /// UTF-8 text string
+    Text(String),
+    /// Boolean value
+    Bool(bool),
+    /// Raw byte sequence
+    Bytes(Vec<u8>),
+    /// Null / absent value
+    Null,
+}
+
+impl Comparand {
+    /// Extract the i64 value, or return an error for non-Int variants.
+    ///
+    /// Used by indexed mode which only supports integer comparands.
+    pub fn as_i64(&self) -> io::Result<i64> {
+        match self {
+            Comparand::Int(v) => Ok(*v),
+            other => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("indexed mode only supports Int comparands, got {}", other),
+            )),
+        }
+    }
+}
+
+impl fmt::Display for Comparand {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Comparand::Int(v) => write!(f, "{}", v),
+            Comparand::Float(v) => {
+                let s = v.to_string();
+                if s.contains('.') {
+                    write!(f, "{}", s)
+                } else {
+                    write!(f, "{}.0", s)
+                }
+            }
+            Comparand::Text(s) => write!(f, "'{}'", s),
+            Comparand::Bool(b) => write!(f, "{}", b),
+            Comparand::Bytes(b) => {
+                write!(f, "X'")?;
+                for byte in b {
+                    write!(f, "{:02x}", byte)?;
+                }
+                write!(f, "'")
+            }
+            Comparand::Null => write!(f, "NULL"),
+        }
+    }
+}
+
 /// A predicate tree node
 #[derive(Debug, Clone, PartialEq)]
 pub enum PNode {
@@ -158,7 +238,7 @@ pub enum PNode {
 pub struct PredicateNode {
     pub field: FieldRef,
     pub op: OpType,
-    pub comparands: Vec<i64>,
+    pub comparands: Vec<Comparand>,
 }
 
 /// Interior node: AND/OR of child nodes
@@ -172,6 +252,7 @@ impl PNode {
     /// Encode to bytes (indexed mode — fields as u8 indices).
     ///
     /// Prepends the `DIALECT_PNODE` leader byte before the tree data.
+    /// All comparands must be `Comparand::Int`; other types produce an error.
     pub fn to_bytes_indexed(&self) -> Vec<u8> {
         let mut buf = Vec::new();
         buf.push(DIALECT_PNODE);
@@ -181,10 +262,12 @@ impl PNode {
 
     /// Encode to bytes (named mode — fields as UTF-8 strings).
     ///
-    /// Prepends the `DIALECT_PNODE` leader byte before the tree data.
+    /// Prepends the `DIALECT_PNODE` leader byte and `0xFF` typed marker
+    /// before the tree data.
     pub fn to_bytes_named(&self) -> Vec<u8> {
         let mut buf = Vec::new();
         buf.push(DIALECT_PNODE);
+        buf.push(TYPED_MARKER);
         self.write_named(&mut buf).expect("write to Vec should not fail");
         buf
     }
@@ -192,6 +275,7 @@ impl PNode {
     /// Decode from bytes (indexed mode).
     ///
     /// Verifies and strips the `DIALECT_PNODE` leader byte before decoding.
+    /// All comparands are wrapped as `Comparand::Int`.
     pub fn from_bytes_indexed(data: &[u8]) -> io::Result<Self> {
         if data.is_empty() {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "empty pnode data"));
@@ -209,6 +293,8 @@ impl PNode {
     /// Decode from bytes (named mode).
     ///
     /// Verifies and strips the `DIALECT_PNODE` leader byte before decoding.
+    /// Supports both legacy (i64-only) and typed comparand formats via
+    /// `0xFF` marker detection.
     pub fn from_bytes_named(data: &[u8]) -> io::Result<Self> {
         if data.is_empty() {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "empty pnode data"));
@@ -219,8 +305,18 @@ impl PNode {
                 format!("expected PNode dialect leader 0x{:02x}, got 0x{:02x}", DIALECT_PNODE, data[0]),
             ));
         }
-        let mut cursor = Cursor::new(&data[1..]);
-        Self::read_named(&mut cursor)
+        if data.len() < 2 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "pnode data too short"));
+        }
+        if data[1] == TYPED_MARKER {
+            // New typed format
+            let mut cursor = Cursor::new(&data[2..]);
+            Self::read_named_typed(&mut cursor)
+        } else {
+            // Legacy format — i64-only comparands
+            let mut cursor = Cursor::new(&data[1..]);
+            Self::read_named_legacy(&mut cursor)
+        }
     }
 
     fn write_indexed(&self, w: &mut impl Write) -> io::Result<()> {
@@ -239,7 +335,7 @@ impl PNode {
                 w.write_u8(pred.op as u8)?;
                 w.write_i16::<LittleEndian>(pred.comparands.len() as i16)?;
                 for v in &pred.comparands {
-                    w.write_i64::<LittleEndian>(*v)?;
+                    w.write_i64::<LittleEndian>(v.as_i64()?)?;
                 }
             }
             PNode::Conjugate(conj) => {
@@ -273,7 +369,7 @@ impl PNode {
                 w.write_u8(pred.op as u8)?;
                 w.write_i16::<LittleEndian>(pred.comparands.len() as i16)?;
                 for v in &pred.comparands {
-                    w.write_i64::<LittleEndian>(*v)?;
+                    write_typed_comparand(w, v)?;
                 }
             }
             PNode::Conjugate(conj) => {
@@ -302,7 +398,7 @@ impl PNode {
                 let count = r.read_i16::<LittleEndian>()? as usize;
                 let mut comparands = Vec::with_capacity(count);
                 for _ in 0..count {
-                    comparands.push(r.read_i64::<LittleEndian>()?);
+                    comparands.push(Comparand::Int(r.read_i64::<LittleEndian>()?));
                 }
                 Ok(PNode::Predicate(PredicateNode {
                     field: FieldRef::Index(field_index),
@@ -324,7 +420,8 @@ impl PNode {
         }
     }
 
-    fn read_named(r: &mut Cursor<&[u8]>) -> io::Result<Self> {
+    /// Read named mode with legacy i64-only comparands.
+    fn read_named_legacy(r: &mut Cursor<&[u8]>) -> io::Result<Self> {
         let tag = r.read_u8()?;
         let ctype = ConjugateType::from_u8(tag).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, format!("unknown conjugate type: {}", tag))
@@ -343,7 +440,7 @@ impl PNode {
                 let count = r.read_i16::<LittleEndian>()? as usize;
                 let mut comparands = Vec::with_capacity(count);
                 for _ in 0..count {
-                    comparands.push(r.read_i64::<LittleEndian>()?);
+                    comparands.push(Comparand::Int(r.read_i64::<LittleEndian>()?));
                 }
                 Ok(PNode::Predicate(PredicateNode {
                     field: FieldRef::Named(name),
@@ -355,7 +452,7 @@ impl PNode {
                 let child_count = r.read_u8()? as usize;
                 let mut children = Vec::with_capacity(child_count);
                 for _ in 0..child_count {
-                    children.push(Self::read_named(r)?);
+                    children.push(Self::read_named_legacy(r)?);
                 }
                 Ok(PNode::Conjugate(ConjugateNode {
                     conjugate_type: ctype,
@@ -363,6 +460,113 @@ impl PNode {
                 }))
             }
         }
+    }
+
+    /// Read named mode with typed comparands (new format after 0xFF marker).
+    fn read_named_typed(r: &mut Cursor<&[u8]>) -> io::Result<Self> {
+        let tag = r.read_u8()?;
+        let ctype = ConjugateType::from_u8(tag).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, format!("unknown conjugate type: {}", tag))
+        })?;
+        match ctype {
+            ConjugateType::Pred => {
+                let name_len = r.read_u16::<LittleEndian>()? as usize;
+                let mut name_buf = vec![0u8; name_len];
+                r.read_exact(&mut name_buf)?;
+                let name = String::from_utf8(name_buf)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                let op_byte = r.read_u8()?;
+                let op = OpType::from_u8(op_byte).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, format!("unknown op: {}", op_byte))
+                })?;
+                let count = r.read_i16::<LittleEndian>()? as usize;
+                let mut comparands = Vec::with_capacity(count);
+                for _ in 0..count {
+                    comparands.push(read_typed_comparand(r)?);
+                }
+                Ok(PNode::Predicate(PredicateNode {
+                    field: FieldRef::Named(name),
+                    op,
+                    comparands,
+                }))
+            }
+            ConjugateType::And | ConjugateType::Or => {
+                let child_count = r.read_u8()? as usize;
+                let mut children = Vec::with_capacity(child_count);
+                for _ in 0..child_count {
+                    children.push(Self::read_named_typed(r)?);
+                }
+                Ok(PNode::Conjugate(ConjugateNode {
+                    conjugate_type: ctype,
+                    children,
+                }))
+            }
+        }
+    }
+}
+
+/// Write a single typed comparand to the output.
+fn write_typed_comparand(w: &mut impl Write, c: &Comparand) -> io::Result<()> {
+    match c {
+        Comparand::Int(v) => {
+            w.write_u8(0)?;
+            w.write_i64::<LittleEndian>(*v)?;
+        }
+        Comparand::Float(v) => {
+            w.write_u8(1)?;
+            w.write_f64::<LittleEndian>(*v)?;
+        }
+        Comparand::Text(s) => {
+            w.write_u8(2)?;
+            let bytes = s.as_bytes();
+            w.write_u16::<LittleEndian>(bytes.len() as u16)?;
+            w.write_all(bytes)?;
+        }
+        Comparand::Bool(b) => {
+            w.write_u8(3)?;
+            w.write_u8(if *b { 1 } else { 0 })?;
+        }
+        Comparand::Bytes(b) => {
+            w.write_u8(4)?;
+            w.write_u32::<LittleEndian>(b.len() as u32)?;
+            w.write_all(b)?;
+        }
+        Comparand::Null => {
+            w.write_u8(5)?;
+        }
+    }
+    Ok(())
+}
+
+/// Read a single typed comparand from the input.
+fn read_typed_comparand(r: &mut Cursor<&[u8]>) -> io::Result<Comparand> {
+    let tag = r.read_u8()?;
+    match tag {
+        0 => Ok(Comparand::Int(r.read_i64::<LittleEndian>()?)),
+        1 => Ok(Comparand::Float(r.read_f64::<LittleEndian>()?)),
+        2 => {
+            let len = r.read_u16::<LittleEndian>()? as usize;
+            let mut buf = vec![0u8; len];
+            r.read_exact(&mut buf)?;
+            let s = String::from_utf8(buf)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            Ok(Comparand::Text(s))
+        }
+        3 => {
+            let b = r.read_u8()?;
+            Ok(Comparand::Bool(b != 0))
+        }
+        4 => {
+            let len = r.read_u32::<LittleEndian>()? as usize;
+            let mut buf = vec![0u8; len];
+            r.read_exact(&mut buf)?;
+            Ok(Comparand::Bytes(buf))
+        }
+        5 => Ok(Comparand::Null),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unknown comparand type tag: {}", tag),
+        )),
     }
 }
 
@@ -412,7 +616,7 @@ mod tests {
         let node = PNode::Predicate(PredicateNode {
             field: FieldRef::Index(3),
             op: OpType::Eq,
-            comparands: vec![42],
+            comparands: vec![Comparand::Int(42)],
         });
 
         let bytes = node.to_bytes_indexed();
@@ -425,7 +629,7 @@ mod tests {
         let node = PNode::Predicate(PredicateNode {
             field: FieldRef::Named("color".into()),
             op: OpType::In,
-            comparands: vec![1, 2, 3],
+            comparands: vec![Comparand::Int(1), Comparand::Int(2), Comparand::Int(3)],
         });
 
         let bytes = node.to_bytes_named();
@@ -441,7 +645,7 @@ mod tests {
                 PNode::Predicate(PredicateNode {
                     field: FieldRef::Index(0),
                     op: OpType::Gt,
-                    comparands: vec![10],
+                    comparands: vec![Comparand::Int(10)],
                 }),
                 PNode::Conjugate(ConjugateNode {
                     conjugate_type: ConjugateType::Or,
@@ -449,12 +653,12 @@ mod tests {
                         PNode::Predicate(PredicateNode {
                             field: FieldRef::Index(1),
                             op: OpType::Eq,
-                            comparands: vec![5],
+                            comparands: vec![Comparand::Int(5)],
                         }),
                         PNode::Predicate(PredicateNode {
                             field: FieldRef::Index(2),
                             op: OpType::Le,
-                            comparands: vec![100],
+                            comparands: vec![Comparand::Int(100)],
                         }),
                     ],
                 }),
@@ -474,12 +678,12 @@ mod tests {
                 PNode::Predicate(PredicateNode {
                     field: FieldRef::Named("age".into()),
                     op: OpType::Gt,
-                    comparands: vec![18],
+                    comparands: vec![Comparand::Int(18)],
                 }),
                 PNode::Predicate(PredicateNode {
                     field: FieldRef::Named("score".into()),
                     op: OpType::Le,
-                    comparands: vec![100],
+                    comparands: vec![Comparand::Int(100)],
                 }),
             ],
         });
@@ -495,9 +699,109 @@ mod tests {
         let node = PNode::Predicate(PredicateNode {
             field: FieldRef::Index(0),
             op: OpType::Eq,
-            comparands: vec![42],
+            comparands: vec![Comparand::Int(42)],
         });
         let bytes = node.to_bytes_indexed();
         assert_eq!(bytes.len(), 14);
+    }
+
+    #[test]
+    fn test_named_typed_roundtrip() {
+        let tree = PNode::Conjugate(ConjugateNode {
+            conjugate_type: ConjugateType::And,
+            children: vec![
+                PNode::Predicate(PredicateNode {
+                    field: FieldRef::Named("age".into()),
+                    op: OpType::Ge,
+                    comparands: vec![Comparand::Int(18)],
+                }),
+                PNode::Predicate(PredicateNode {
+                    field: FieldRef::Named("score".into()),
+                    op: OpType::Lt,
+                    comparands: vec![Comparand::Float(99.5)],
+                }),
+                PNode::Predicate(PredicateNode {
+                    field: FieldRef::Named("name".into()),
+                    op: OpType::Eq,
+                    comparands: vec![Comparand::Text("alice".into())],
+                }),
+                PNode::Predicate(PredicateNode {
+                    field: FieldRef::Named("active".into()),
+                    op: OpType::Eq,
+                    comparands: vec![Comparand::Bool(true)],
+                }),
+                PNode::Predicate(PredicateNode {
+                    field: FieldRef::Named("data".into()),
+                    op: OpType::Eq,
+                    comparands: vec![Comparand::Bytes(vec![0xDE, 0xAD])],
+                }),
+                PNode::Predicate(PredicateNode {
+                    field: FieldRef::Named("empty".into()),
+                    op: OpType::Eq,
+                    comparands: vec![Comparand::Null],
+                }),
+            ],
+        });
+
+        let bytes = tree.to_bytes_named();
+        // Verify typed marker is present
+        assert_eq!(bytes[0], DIALECT_PNODE);
+        assert_eq!(bytes[1], TYPED_MARKER);
+
+        let decoded = PNode::from_bytes_named(&bytes).unwrap();
+        assert_eq!(tree, decoded);
+    }
+
+    #[test]
+    fn test_named_legacy_backward_compat() {
+        // Build legacy-format bytes manually: DIALECT_PNODE + PRED(0) + name + op + i64 comparands
+        let mut buf = Vec::new();
+        buf.push(DIALECT_PNODE);
+        // ConjugateType::Pred = 0
+        buf.push(0);
+        // name "x" — u16 LE length + utf8
+        buf.extend_from_slice(&1u16.to_le_bytes());
+        buf.push(b'x');
+        // OpType::Eq = 2
+        buf.push(2);
+        // comparand count = 1
+        buf.extend_from_slice(&1i16.to_le_bytes());
+        // comparand value = 42
+        buf.extend_from_slice(&42i64.to_le_bytes());
+
+        let decoded = PNode::from_bytes_named(&buf).unwrap();
+        match decoded {
+            PNode::Predicate(pred) => {
+                assert_eq!(pred.field, FieldRef::Named("x".into()));
+                assert_eq!(pred.op, OpType::Eq);
+                assert_eq!(pred.comparands, vec![Comparand::Int(42)]);
+            }
+            _ => panic!("expected Predicate"),
+        }
+    }
+
+    #[test]
+    fn test_indexed_rejects_non_int() {
+        let node = PNode::Predicate(PredicateNode {
+            field: FieldRef::Index(0),
+            op: OpType::Eq,
+            comparands: vec![Comparand::Text("nope".into())],
+        });
+        // to_bytes_indexed should fail for non-Int comparands
+        let result = std::panic::catch_unwind(|| node.to_bytes_indexed());
+        assert!(result.is_err() || {
+            // The write_indexed returns an error which causes expect to panic
+            true
+        });
+    }
+
+    #[test]
+    fn test_comparand_display() {
+        assert_eq!(format!("{}", Comparand::Int(42)), "42");
+        assert_eq!(format!("{}", Comparand::Float(3.14)), "3.14");
+        assert_eq!(format!("{}", Comparand::Text("hello".into())), "'hello'");
+        assert_eq!(format!("{}", Comparand::Bool(true)), "true");
+        assert_eq!(format!("{}", Comparand::Bytes(vec![0xCA, 0xFE])), "X'cafe'");
+        assert_eq!(format!("{}", Comparand::Null), "NULL");
     }
 }

@@ -15,7 +15,8 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::pipeline::command::{
-    CommandOp, CommandResult, OptionDesc, Options, Status, StreamContext,
+    CommandDoc, CommandOp, CommandResult, OptionDesc, Options, Status, StreamContext,
+    render_options_table,
 };
 
 /// Pipeline command: text flame graph from folded stack traces.
@@ -256,6 +257,17 @@ impl CommandOp for AnalyzeFlamegraphOp {
         "analyze flamegraph"
     }
 
+    fn command_doc(&self) -> CommandDoc {
+        let options = self.describe_options();
+        CommandDoc {
+            summary: "Generate flamegraph SVG from profiling data".into(),
+            body: format!(
+                "# analyze flamegraph\n\nGenerate flamegraph SVG from profiling data.\n\n## Description\n\nReads folded stack trace files (Brendan Gregg's format) and renders a text-based flame graph using Unicode block characters and ANSI colors. Each row represents a stack depth level with wider bars indicating more samples.\n\n## Options\n\n{}",
+                render_options_table(&options)
+            ),
+        }
+    }
+
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
         let start = Instant::now();
 
@@ -380,6 +392,8 @@ mod tests {
             progress: ProgressLog::new(),
             threads: 1,
             step_id: String::new(),
+            governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
+            display: crate::pipeline::display::ProgressDisplay::new(),
         }
     }
 

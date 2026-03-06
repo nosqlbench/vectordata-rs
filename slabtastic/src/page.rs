@@ -216,6 +216,71 @@ impl Page {
         self.footer.start_ordinal
     }
 
+    /// Read the record count from a serialized page buffer by inspecting
+    /// only the footer bytes. No heap allocation.
+    ///
+    /// The record count is stored as a 3-byte unsigned LE integer at
+    /// footer offset 5–7 (bytes `[len-11..len-8]` of the page buffer).
+    ///
+    /// ## Errors
+    ///
+    /// - [`SlabError::TruncatedPage`] if the buffer is too small for a
+    ///   header + footer.
+    pub fn record_count_from_buf(buf: &[u8]) -> Result<usize> {
+        if buf.len() < HEADER_SIZE + FOOTER_V1_SIZE {
+            return Err(SlabError::TruncatedPage {
+                expected: HEADER_SIZE + FOOTER_V1_SIZE,
+                actual: buf.len(),
+            });
+        }
+        let footer_start = buf.len() - FOOTER_V1_SIZE;
+        let mut rc_bytes = [0u8; 4];
+        rc_bytes[0..3].copy_from_slice(&buf[footer_start + 5..footer_start + 8]);
+        Ok(u32::from_le_bytes(rc_bytes) as usize)
+    }
+
+    /// Return a borrowed slice of a single record from a serialized page
+    /// buffer without deserializing the entire page.
+    ///
+    /// Like [`get_record_from_buf`](Self::get_record_from_buf) but returns
+    /// `&[u8]` instead of `Vec<u8>`, eliminating the per-record heap
+    /// allocation. The `record_count` parameter avoids re-parsing the
+    /// footer on every call when iterating all records in a page.
+    ///
+    /// Magic validation is intentionally skipped since callers are
+    /// expected to have obtained the buffer through a validated path.
+    ///
+    /// ## Errors
+    ///
+    /// - [`SlabError::TruncatedPage`] if the buffer is too small.
+    /// - [`SlabError::OrdinalNotFound`] if `local_index` is out of range.
+    pub fn get_record_ref_from_buf(
+        buf: &[u8], local_index: usize, record_count: usize,
+    ) -> Result<&[u8]> {
+        if buf.len() < HEADER_SIZE + FOOTER_V1_SIZE {
+            return Err(SlabError::TruncatedPage {
+                expected: HEADER_SIZE + FOOTER_V1_SIZE,
+                actual: buf.len(),
+            });
+        }
+
+        if local_index >= record_count {
+            return Err(SlabError::OrdinalNotFound(-1));
+        }
+
+        let footer_start = buf.len() - FOOTER_V1_SIZE;
+        let offset_count = record_count + 1;
+        let offsets_size = offset_count * 4;
+        let offsets_start = footer_start - offsets_size;
+
+        let pos_a = offsets_start + local_index * 4;
+        let pos_b = pos_a + 4;
+        let start = u32::from_le_bytes([buf[pos_a], buf[pos_a + 1], buf[pos_a + 2], buf[pos_a + 3]]) as usize;
+        let end = u32::from_le_bytes([buf[pos_b], buf[pos_b + 1], buf[pos_b + 2], buf[pos_b + 3]]) as usize;
+
+        Ok(&buf[start..end])
+    }
+
     /// Extract a single record from a serialized page buffer without
     /// deserializing the entire page.
     ///
@@ -384,5 +449,29 @@ mod tests {
         bytes[0] = b'X';
         // Should still extract the record — magic is not checked
         assert_eq!(Page::get_record_from_buf(&bytes, 0).unwrap(), b"test");
+    }
+
+    /// `get_record_ref_from_buf` returns borrowed slices without copying.
+    #[test]
+    fn test_get_record_ref_from_buf_multiple() {
+        let mut page = Page::new(0, PageType::Data);
+        page.add_record(b"alpha");
+        page.add_record(b"beta");
+        page.add_record(b"gamma");
+        let bytes = page.serialize();
+
+        assert_eq!(Page::get_record_ref_from_buf(&bytes, 0, 3).unwrap(), b"alpha");
+        assert_eq!(Page::get_record_ref_from_buf(&bytes, 1, 3).unwrap(), b"beta");
+        assert_eq!(Page::get_record_ref_from_buf(&bytes, 2, 3).unwrap(), b"gamma");
+    }
+
+    /// `get_record_ref_from_buf` with an out-of-bounds index returns an error.
+    #[test]
+    fn test_get_record_ref_from_buf_out_of_bounds() {
+        let mut page = Page::new(0, PageType::Data);
+        page.add_record(b"one");
+        let bytes = page.serialize();
+        assert!(Page::get_record_ref_from_buf(&bytes, 1, 1).is_err());
+        assert!(Page::get_record_ref_from_buf(&bytes, 100, 1).is_err());
     }
 }

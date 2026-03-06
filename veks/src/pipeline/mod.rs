@@ -28,8 +28,10 @@ pub mod cli;
 pub mod command;
 pub mod commands;
 pub mod dag;
+pub mod display;
 pub mod interpolate;
 pub mod predicate;
+pub mod resource;
 pub mod rng;
 pub mod simd_distance;
 pub mod progress;
@@ -40,10 +42,12 @@ pub mod schema;
 use std::path::{Path, PathBuf};
 
 use clap::Args;
+use clap_complete::engine::{ArgValueCandidates, ArgValueCompleter};
 use indexmap::IndexMap;
 
 use crate::import::dataset::DatasetConfig;
 use command::StreamContext;
+use display::ProgressDisplay;
 use progress::ProgressLog;
 use registry::CommandRegistry;
 
@@ -77,6 +81,22 @@ pub struct RunArgs {
     /// `PipelineConfig` to stdout.
     #[arg(long)]
     pub emit_yaml: bool,
+
+    /// Resource configuration for the governor (e.g., "mem:25%-50%,threads:4-8").
+    ///
+    /// Controls how much of the system's resources the pipeline may use.
+    /// Supports absolute values, percentages, and ranges that the governor
+    /// adjusts dynamically during execution.
+    #[arg(long, num_args = 1, add = ArgValueCompleter::new(cli::resource_completer))]
+    pub resources: Option<String>,
+
+    /// Governor strategy for resource adjustment.
+    ///
+    /// - `maximize` (default): aggressively use resources up to the configured ceiling
+    /// - `conservative`: start at floor values, only increase after sustained low utilization
+    /// - `fixed`: use midpoint values, never adjust (useful for benchmarking)
+    #[arg(long, default_value = "maximize", add = ArgValueCandidates::new(cli::governor_candidates))]
+    pub governor: String,
 }
 
 /// Entry point for `veks run` — execute a command stream pipeline.
@@ -178,7 +198,37 @@ pub fn run_pipeline(args: RunArgs) {
         args.threads
     };
 
+    // Parse --resources if provided
+    let resource_budget = if let Some(ref res_str) = args.resources {
+        resource::ResourceBudget::parse(res_str).unwrap_or_else(|e| {
+            eprintln!("Invalid --resources: {}", e);
+            std::process::exit(1);
+        })
+    } else {
+        resource::ResourceBudget::new()
+    };
+
+    let governor = resource::ResourceGovernor::new(resource_budget, Some(&workspace));
+
+    // Apply governor strategy from --governor flag
+    match args.governor.as_str() {
+        "maximize" => {} // default, already set
+        "conservative" => {
+            governor.set_strategy(Box::new(resource::ConservativeStrategy::default()));
+        }
+        "fixed" => {
+            governor.set_strategy(Box::new(resource::FixedStrategy));
+        }
+        other => {
+            eprintln!("Unknown governor strategy: '{}'. Use maximize, conservative, or fixed.", other);
+            std::process::exit(1);
+        }
+    }
+
+    governor.print_summary();
+
     // Build execution context
+    let display = ProgressDisplay::new();
     let mut ctx = StreamContext {
         workspace,
         scratch: scratch_dir.clone(),
@@ -188,6 +238,8 @@ pub fn run_pipeline(args: RunArgs) {
         progress,
         threads,
         step_id: String::new(),
+        governor,
+        display,
     };
 
     // Build command registry
@@ -264,6 +316,7 @@ fn resolve_pipeline_yaml(
         resolved_steps.push(schema::StepDef {
             id: step.def.id.clone(),
             run: step.def.run.clone(),
+            description: step.def.description.clone(),
             after: step.def.after.clone(),
             on_partial: step.def.on_partial.clone(),
             options,
@@ -397,6 +450,7 @@ mod tests {
         schema::StepDef {
             id: Some(id.to_string()),
             run: run.to_string(),
+            description: None,
             after: after.into_iter().map(String::from).collect(),
             on_partial: OnPartial::default(),
             options,

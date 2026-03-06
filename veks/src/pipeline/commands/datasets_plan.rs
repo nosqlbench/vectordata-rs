@@ -12,7 +12,8 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::pipeline::command::{
-    CommandOp, CommandResult, OptionDesc, Options, Status, StreamContext,
+    CommandDoc, CommandOp, CommandResult, OptionDesc, Options, Status, StreamContext,
+    render_options_table,
 };
 
 /// Pipeline command: plan missing facets for a dataset.
@@ -25,6 +26,22 @@ pub fn factory() -> Box<dyn CommandOp> {
 impl CommandOp for DatasetsPlanOp {
     fn command_path(&self) -> &str {
         "datasets plan"
+    }
+
+    fn command_doc(&self) -> CommandDoc {
+        let options = self.describe_options();
+        CommandDoc {
+            summary: "Show the execution plan for a dataset pipeline".into(),
+            body: format!(
+                "# datasets plan\n\n\
+                 Show the execution plan for a dataset pipeline.\n\n\
+                 ## Description\n\n\
+                 Analyzes a dataset.yaml, checks which referenced files exist, and \
+                 generates command suggestions to create the missing ones.\n\n\
+                 ## Options\n\n{}",
+                render_options_table(&options)
+            ),
+        }
     }
 
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
@@ -73,8 +90,8 @@ impl CommandOp for DatasetsPlanOp {
             .and_then(|v| v.as_str())
             .unwrap_or("unknown");
 
-        eprintln!("Dataset: {} ({})", dataset_name, yaml_path.display());
-        eprintln!();
+        ctx.display.log(&format!("Dataset: {} ({})", dataset_name, yaml_path.display()));
+        ctx.display.log("");
 
         let mut missing = Vec::new();
         let mut present = Vec::new();
@@ -122,28 +139,28 @@ impl CommandOp for DatasetsPlanOp {
 
         // Report present facets
         if !present.is_empty() {
-            eprintln!("Present views:");
+            ctx.display.log("Present views:");
             for (name, path, size) in &present {
-                eprintln!(
+                ctx.display.log(&format!(
                     "  {} — {} ({} bytes)",
                     name, path, size
-                );
+                ));
             }
-            eprintln!();
+            ctx.display.log("");
         }
 
         // Report missing facets with suggestions
         if !missing.is_empty() {
-            eprintln!("Missing views:");
+            ctx.display.log("Missing views:");
             for (name, path) in &missing {
-                eprintln!("  {} — {}", name, path);
+                ctx.display.log(&format!("  {} — {}", name, path));
             }
-            eprintln!();
+            ctx.display.log("");
 
             // Detect dimension from existing files
             let dim = detect_dimension(dataset_dir, &present);
 
-            eprintln!("Suggested commands:");
+            ctx.display.log("Suggested commands:");
             for (name, path) in &missing {
                 let ext = Path::new(path)
                     .extension()
@@ -152,38 +169,38 @@ impl CommandOp for DatasetsPlanOp {
                 let full = dataset_dir.join(path);
                 match (name.as_str(), ext) {
                     (n, "fvec") if n.contains("base") || n.contains("vector") => {
-                        eprintln!(
+                        ctx.display.log(&format!(
                             "  veks run generate vectors output={} dimension={} count=<COUNT> seed=42",
                             full.display(),
                             dim.unwrap_or(128)
-                        );
+                        ));
                     }
                     (n, "fvec") if n.contains("query") => {
-                        eprintln!(
+                        ctx.display.log(&format!(
                             "  veks run generate vectors output={} dimension={} count=<QUERY_COUNT> seed=43",
                             full.display(),
                             dim.unwrap_or(128)
-                        );
+                        ));
                     }
                     (n, "ivec") if n.contains("neighbor") || n.contains("indic") => {
-                        eprintln!(
+                        ctx.display.log(&format!(
                             "  veks run compute knn source=<BASE_VECTORS> queries=<QUERY_VECTORS> output-indices={} k=100 metric=EUCLIDEAN",
                             full.display()
-                        );
+                        ));
                     }
                     (n, "fvec") if n.contains("dist") => {
-                        eprintln!(
+                        ctx.display.log(&format!(
                             "  veks run compute knn source=<BASE_VECTORS> queries=<QUERY_VECTORS> output-distances={} k=100 metric=EUCLIDEAN",
                             full.display()
-                        );
+                        ));
                     }
                     _ => {
-                        eprintln!("  # {} — no automatic suggestion for '{}'", name, path);
+                        ctx.display.log(&format!("  # {} — no automatic suggestion for '{}'", name, path));
                     }
                 }
             }
         } else {
-            eprintln!("All facets are present.");
+            ctx.display.log("All facets are present.");
         }
 
         let msg = format!(
@@ -269,6 +286,8 @@ mod tests {
             progress: ProgressLog::new(),
             threads: 1,
             step_id: String::new(),
+            governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
+            display: crate::pipeline::display::ProgressDisplay::new(),
         }
     }
 

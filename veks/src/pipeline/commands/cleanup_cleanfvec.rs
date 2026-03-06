@@ -19,7 +19,8 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::pipeline::command::{
-    CommandOp, CommandResult, OptionDesc, Options, Status, StreamContext,
+    CommandDoc, CommandOp, CommandResult, OptionDesc, Options, ResourceDesc, Status, StreamContext,
+    render_options_table,
 };
 
 /// Pipeline command: clean/repair fvec files.
@@ -41,6 +42,29 @@ struct CleanResult {
 impl CommandOp for CleanupCleanfvecOp {
     fn command_path(&self) -> &str {
         "cleanup cleanfvec"
+    }
+
+    fn command_doc(&self) -> CommandDoc {
+        let options = self.describe_options();
+        CommandDoc {
+            summary: "Clean and repair a malformed fvec file".into(),
+            body: format!(
+                "# cleanup cleanfvec\n\n\
+                 Clean and repair a malformed fvec file.\n\n\
+                 ## Description\n\n\
+                 Detects and removes trailing bytes, zero vectors, and duplicate vectors. \
+                 Writes a cleaned output file and reports what was removed.\n\n\
+                 ## Options\n\n{}",
+                render_options_table(&options)
+            ),
+        }
+    }
+
+    fn describe_resources(&self) -> Vec<ResourceDesc> {
+        vec![
+            ResourceDesc { name: "mem".into(), description: "Read/write buffers for vector repair".into(), adjustable: false },
+            ResourceDesc { name: "readahead".into(), description: "Sequential read prefetch".into(), adjustable: false },
+        ]
     }
 
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
@@ -114,6 +138,11 @@ impl CommandOp for CleanupCleanfvecOp {
         let mut dupes_removed = 0usize;
         let mut seen_hashes: HashSet<u64> = HashSet::new();
 
+        // Governor checkpoint before processing loop
+        if ctx.governor.checkpoint() {
+            ctx.display.log("  governor: throttle active");
+        }
+
         for i in 0..complete_vectors {
             let offset = i * bytes_per_vector;
             let record = &data[offset..offset + bytes_per_vector];
@@ -152,18 +181,18 @@ impl CommandOp for CleanupCleanfvecOp {
         };
 
         let removed_total = result.original_count - result.written_count;
-        eprintln!(
+        ctx.display.log(&format!(
             "Clean: {} -> {} vectors ({} removed)",
             result.original_count, result.written_count, removed_total
-        );
+        ));
         if result.trailing_bytes_removed > 0 {
-            eprintln!("  Trailing bytes removed: {}", result.trailing_bytes_removed);
+            ctx.display.log(&format!("  Trailing bytes removed: {}", result.trailing_bytes_removed));
         }
         if result.zero_vectors_removed > 0 {
-            eprintln!("  Zero vectors removed: {}", result.zero_vectors_removed);
+            ctx.display.log(&format!("  Zero vectors removed: {}", result.zero_vectors_removed));
         }
         if result.duplicate_vectors_removed > 0 {
-            eprintln!("  Duplicate vectors removed: {}", result.duplicate_vectors_removed);
+            ctx.display.log(&format!("  Duplicate vectors removed: {}", result.duplicate_vectors_removed));
         }
 
         CommandResult {
@@ -261,6 +290,8 @@ mod tests {
             progress: ProgressLog::new(),
             threads: 1,
             step_id: String::new(),
+            governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
+            display: crate::pipeline::display::ProgressDisplay::new(),
         }
     }
 

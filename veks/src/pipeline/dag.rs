@@ -162,6 +162,7 @@ mod tests {
         StepDef {
             id: Some(id.to_string()),
             run: run.to_string(),
+            description: None,
             after: after.into_iter().map(String::from).collect(),
             on_partial: OnPartial::default(),
             options,
@@ -211,6 +212,7 @@ mod tests {
             StepDef {
                 id: Some("b".to_string()),
                 run: "generate fvec-extract".to_string(),
+                description: None,
                 after: vec![],
                 on_partial: OnPartial::default(),
                 options: b_opts,
@@ -267,6 +269,7 @@ mod tests {
         let steps = vec![StepDef {
             id: None,
             run: "generate ivec-shuffle".to_string(),
+            description: None,
             after: vec![],
             on_partial: OnPartial::default(),
             options: IndexMap::new(),

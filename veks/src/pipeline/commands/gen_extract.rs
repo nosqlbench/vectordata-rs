@@ -1,7 +1,7 @@
 // Copyright (c) DataStax, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Pipeline commands: fvec-extract and ivec-extract.
+//! Pipeline commands: fvec-extract, ivec-extract, and hvec-extract.
 //!
 //! `fvec-extract`: Extracts vectors from an fvec file using indices from an
 //! ivec file. Each index in the ivec is a 1-dimensional record whose value
@@ -9,8 +9,11 @@
 //!
 //! `ivec-extract`: Extracts a range of records from an ivec file.
 //!
-//! Both support range specifications in the format `[start,end)` or `start..end`
-//! to select a subset of the index/ivec file.
+//! `hvec-extract`: Extracts a range of records from an hvec (half-precision
+//! float16) file.
+//!
+//! All support range specifications in the format `[start,end)` or `start..end`
+//! to select a subset of the source file.
 //!
 //! Equivalent to Java `CMD_generate_fvecExtract` and `CMD_generate_ivecExtract`.
 
@@ -21,7 +24,8 @@ use vectordata::VectorReader;
 use vectordata::io::MmapVectorReader;
 
 use crate::pipeline::command::{
-    CommandOp, CommandResult, OptionDesc, Options, Status, StreamContext,
+    CommandDoc, CommandOp, CommandResult, OptionDesc, Options, ResourceDesc, Status, StreamContext,
+    render_options_table,
 };
 
 // ---- fvec-extract -----------------------------------------------------------
@@ -36,6 +40,32 @@ pub fn fvec_factory() -> Box<dyn CommandOp> {
 impl CommandOp for GenerateFvecExtractOp {
     fn command_path(&self) -> &str {
         "generate fvec-extract"
+    }
+
+    fn command_doc(&self) -> CommandDoc {
+        let options = self.describe_options();
+        CommandDoc {
+            summary: "Extract a subset of vectors from an fvec file".into(),
+            body: format!(r#"# generate fvec-extract
+
+Extract a subset of vectors from an fvec file.
+
+## Description
+
+Extracts vectors from an fvec file using indices from an ivec file. Each
+index in the ivec is a 1-dimensional record whose value selects a vector
+from the fvec source. Supports range specifications to select a subset.
+
+## Options
+
+{}"#, render_options_table(&options)),
+        }
+    }
+
+    fn describe_resources(&self) -> Vec<ResourceDesc> {
+        vec![
+            ResourceDesc { name: "readahead".into(), description: "Sequential read prefetch".into(), adjustable: false },
+        ]
     }
 
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
@@ -244,6 +274,31 @@ impl CommandOp for GenerateIvecExtractOp {
         "generate ivec-extract"
     }
 
+    fn command_doc(&self) -> CommandDoc {
+        let options = self.describe_options();
+        CommandDoc {
+            summary: "Extract a subset of vectors from an ivec file".into(),
+            body: format!(r#"# generate ivec-extract
+
+Extract a subset of vectors from an ivec file.
+
+## Description
+
+Extracts a range of records from an ivec file. Supports range specifications
+in the format `[start,end)` or `start..end` to select a subset of the source file.
+
+## Options
+
+{}"#, render_options_table(&options)),
+        }
+    }
+
+    fn describe_resources(&self) -> Vec<ResourceDesc> {
+        vec![
+            ResourceDesc { name: "readahead".into(), description: "Sequential read prefetch".into(), adjustable: false },
+        ]
+    }
+
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
         let start = Instant::now();
 
@@ -387,6 +442,191 @@ impl CommandOp for GenerateIvecExtractOp {
     }
 }
 
+// ---- hvec-extract -----------------------------------------------------------
+
+/// Pipeline command: extract a range of records from an hvec (f16) file.
+pub struct GenerateHvecExtractOp;
+
+pub fn hvec_factory() -> Box<dyn CommandOp> {
+    Box::new(GenerateHvecExtractOp)
+}
+
+impl CommandOp for GenerateHvecExtractOp {
+    fn command_path(&self) -> &str {
+        "generate hvec-extract"
+    }
+
+    fn command_doc(&self) -> CommandDoc {
+        let options = self.describe_options();
+        CommandDoc {
+            summary: "Extract a subset of vectors from an hvec file".into(),
+            body: format!(r#"# generate hvec-extract
+
+Extract a subset of vectors from an hvec file.
+
+## Description
+
+Extracts a range of records from an hvec (half-precision float16) file.
+Supports range specifications in the format `[start,end)` or `start..end`
+to select a subset of the source file.
+
+## Options
+
+{}"#, render_options_table(&options)),
+        }
+    }
+
+    fn describe_resources(&self) -> Vec<ResourceDesc> {
+        vec![
+            ResourceDesc { name: "readahead".into(), description: "Sequential read prefetch".into(), adjustable: false },
+        ]
+    }
+
+    fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
+        let start = Instant::now();
+
+        let hvec_str = match options.require("hvec-file") {
+            Ok(s) => s,
+            Err(e) => return error_result(e, start),
+        };
+        let output_str = match options.require("output") {
+            Ok(s) => s,
+            Err(e) => return error_result(e, start),
+        };
+
+        let hvec_path = resolve_path(hvec_str, &ctx.workspace);
+        let output_path = resolve_path(output_str, &ctx.workspace);
+
+        let range = match options.get("range") {
+            Some(r) => match parse_range(r) {
+                Ok(rng) => rng,
+                Err(e) => return error_result(format!("invalid range '{}': {}", r, e), start),
+            },
+            None => Range { start: 0, end: None },
+        };
+
+        // Open the hvec file
+        let hvec_reader = match MmapVectorReader::<half::f16>::open_hvec(&hvec_path) {
+            Ok(r) => r,
+            Err(e) => {
+                return error_result(
+                    format!("failed to open hvec file {}: {}", hvec_path.display(), e),
+                    start,
+                )
+            }
+        };
+
+        let hvec_count =
+            <MmapVectorReader<half::f16> as VectorReader<half::f16>>::count(&hvec_reader);
+        let dim =
+            <MmapVectorReader<half::f16> as VectorReader<half::f16>>::dim(&hvec_reader) as u32;
+        let range_start = range.start;
+        let range_end = range.end.unwrap_or(hvec_count);
+        let effective_end = std::cmp::min(range_end, hvec_count);
+
+        if range_start >= hvec_count {
+            return error_result(
+                format!(
+                    "range start {} exceeds hvec count {}",
+                    range_start, hvec_count
+                ),
+                start,
+            );
+        }
+
+        // Create output directory
+        if let Some(parent) = output_path.parent() {
+            if !parent.exists() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    return error_result(format!("failed to create directory: {}", e), start);
+                }
+            }
+        }
+
+        // Extract records
+        use std::io::Write;
+        let file = match std::fs::File::create(&output_path) {
+            Ok(f) => f,
+            Err(e) => {
+                return error_result(
+                    format!("failed to create {}: {}", output_path.display(), e),
+                    start,
+                )
+            }
+        };
+        let mut writer = std::io::BufWriter::with_capacity(1 << 20, file);
+
+        let mut count: u64 = 0;
+        for i in range_start..effective_end {
+            let vec = match hvec_reader.get(i) {
+                Ok(v) => v,
+                Err(e) => {
+                    return error_result(
+                        format!("failed to read hvec[{}]: {}", i, e),
+                        start,
+                    )
+                }
+            };
+
+            writer
+                .write_all(&(dim as i32).to_le_bytes())
+                .map_err(|e| e.to_string())
+                .unwrap();
+            let slice: &[half::f16] = vec.as_ref();
+            for &val in slice {
+                writer
+                    .write_all(&val.to_le_bytes())
+                    .map_err(|e| e.to_string())
+                    .unwrap();
+            }
+            count += 1;
+        }
+
+        if let Err(e) = writer.flush() {
+            return error_result(format!("failed to flush output: {}", e), start);
+        }
+
+        CommandResult {
+            status: Status::Ok,
+            message: format!(
+                "extracted {} hvec records (range [{}..{})) to {}",
+                count,
+                range_start,
+                effective_end,
+                output_path.display()
+            ),
+            produced: vec![output_path],
+            elapsed: start.elapsed(),
+        }
+    }
+
+    fn describe_options(&self) -> Vec<OptionDesc> {
+        vec![
+            OptionDesc {
+                name: "hvec-file".to_string(),
+                type_name: "Path".to_string(),
+                required: true,
+                default: None,
+                description: "Source hvec file".to_string(),
+            },
+            OptionDesc {
+                name: "output".to_string(),
+                type_name: "Path".to_string(),
+                required: true,
+                default: None,
+                description: "Output hvec file".to_string(),
+            },
+            OptionDesc {
+                name: "range".to_string(),
+                type_name: "String".to_string(),
+                required: false,
+                default: None,
+                description: "Record range: [start,end) or start..end".to_string(),
+            },
+        ]
+    }
+}
+
 // ---- Range parsing ----------------------------------------------------------
 
 /// Parsed range with inclusive start and exclusive end.
@@ -504,6 +744,71 @@ mod tests {
         assert!(parse_range("[100,)").is_err());
     }
 
+    #[test]
+    fn test_hvec_extract_range() {
+        use crate::pipeline::command::StreamContext;
+        use crate::pipeline::progress::ProgressLog;
+        use crate::pipeline::commands::gen_vectors::GenerateVectorsOp;
+        use indexmap::IndexMap;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path();
+
+        let mut ctx = StreamContext {
+            workspace: workspace.to_path_buf(),
+            scratch: workspace.join(".scratch"),
+            cache: workspace.join(".cache"),
+            defaults: IndexMap::new(),
+            dry_run: false,
+            progress: ProgressLog::new(),
+            threads: 1,
+            step_id: String::new(),
+            governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
+            display: crate::pipeline::display::ProgressDisplay::new(),
+        };
+
+        // Generate 50 f16 vectors of dimension 8
+        let hvec_path = workspace.join("source.hvec");
+        let mut opts = Options::new();
+        opts.set("output", hvec_path.to_string_lossy().to_string());
+        opts.set("dimension", "8");
+        opts.set("count", "50");
+        opts.set("seed", "42");
+        opts.set("type", "f16");
+        let mut gen_op = GenerateVectorsOp;
+        let r = gen_op.execute(&opts, &mut ctx);
+        assert_eq!(r.status, Status::Ok);
+
+        // Extract first 10 records
+        let out_path = workspace.join("extracted.hvec");
+        let mut opts = Options::new();
+        opts.set("hvec-file", hvec_path.to_string_lossy().to_string());
+        opts.set("output", out_path.to_string_lossy().to_string());
+        opts.set("range", "[0,10)");
+        let mut ext = GenerateHvecExtractOp;
+        let r = ext.execute(&opts, &mut ctx);
+        assert_eq!(r.status, Status::Ok);
+
+        // 10 records of dim 8 (f16=2 bytes): 10 * (4 + 8*2) = 200 bytes
+        let size = std::fs::metadata(&out_path).unwrap().len();
+        assert_eq!(size, 10 * (4 + 8 * 2));
+
+        // Verify extracted vectors match originals
+        let orig = MmapVectorReader::<half::f16>::open_hvec(&hvec_path).unwrap();
+        let extracted = MmapVectorReader::<half::f16>::open_hvec(&out_path).unwrap();
+        assert_eq!(
+            <MmapVectorReader<half::f16> as VectorReader<half::f16>>::count(&extracted),
+            10
+        );
+        for i in 0..10 {
+            let o = orig.get(i).unwrap();
+            let e = extracted.get(i).unwrap();
+            let o_slice: &[half::f16] = o.as_ref();
+            let e_slice: &[half::f16] = e.as_ref();
+            assert_eq!(o_slice, e_slice);
+        }
+    }
+
     // Integration tests for extract require actual fvec/ivec files on disk.
     // The generate commands produce these, so end-to-end testing is done
     // via pipeline integration tests.
@@ -528,6 +833,8 @@ mod tests {
             progress: ProgressLog::new(),
             threads: 1,
             step_id: String::new(),
+            governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
+            display: crate::pipeline::display::ProgressDisplay::new(),
         };
 
         // Generate 20 vectors of dimension 4

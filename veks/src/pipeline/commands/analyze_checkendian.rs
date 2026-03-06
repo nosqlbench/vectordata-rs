@@ -14,7 +14,8 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::pipeline::command::{
-    CommandOp, CommandResult, OptionDesc, Options, Status, StreamContext,
+    CommandDoc, CommandOp, CommandResult, OptionDesc, Options, Status, StreamContext,
+    render_options_table,
 };
 
 /// Pipeline command: check endianness of xvec files.
@@ -149,6 +150,17 @@ impl CommandOp for AnalyzeCheckEndianOp {
         "analyze check-endian"
     }
 
+    fn command_doc(&self) -> CommandDoc {
+        let options = self.describe_options();
+        CommandDoc {
+            summary: "Check byte order of a vector file".into(),
+            body: format!(
+                "# analyze check-endian\n\nCheck byte order of a vector file.\n\n## Description\n\nReads the dimension header under both little-endian and big-endian interpretations and validates which is correct by checking that the file size is a multiple of the expected record size.\n\n## Options\n\n{}",
+                render_options_table(&options)
+            ),
+        }
+    }
+
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
         let start = Instant::now();
 
@@ -228,6 +240,8 @@ mod tests {
             progress: ProgressLog::new(),
             threads: 1,
             step_id: String::new(),
+            governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
+            display: crate::pipeline::display::ProgressDisplay::new(),
         }
     }
 

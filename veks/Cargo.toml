@@ -10,6 +10,10 @@ readme = "README.md"
 keywords = ["vector", "dataset", "ann", "testing", "automation"]
 categories = ["filesystem", "network-programming", "science"]
 
+[lib]
+name = "veks"
+path = "src/lib.rs"
+
 [[bin]]
 name = "veks"
 path = "src/main.rs"

@@ -38,6 +38,7 @@ pub struct PipelineConfig {
 /// ```yaml
 /// - id: shuffle
 ///   run: generate ivec-shuffle
+///   description: Create a random permutation for base vector extraction
 ///   after:
 ///     - download
 ///   interval: 0..1000000
@@ -52,6 +53,10 @@ pub struct StepDef {
 
     /// Command to execute, e.g. `"generate ivec-shuffle"` or `"import facet"`.
     pub run: String,
+
+    /// Optional human-readable description of what this step does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 
     /// Steps that must complete before this one (explicit ordering).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -115,6 +120,7 @@ mod tests {
         let step = StepDef {
             id: Some("my-step".to_string()),
             run: "generate vectors".to_string(),
+            description: None,
             after: vec![],
             on_partial: OnPartial::default(),
             options: IndexMap::new(),
@@ -127,6 +133,7 @@ mod tests {
         let step = StepDef {
             id: None,
             run: "generate ivec-shuffle".to_string(),
+            description: None,
             after: vec![],
             on_partial: OnPartial::default(),
             options: IndexMap::new(),
@@ -178,6 +185,7 @@ steps:
         let step = StepDef {
             id: None,
             run: "convert file".to_string(),
+            description: None,
             after: vec![],
             on_partial: OnPartial::default(),
             options: opts,

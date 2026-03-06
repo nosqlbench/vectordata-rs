@@ -89,7 +89,7 @@ pub fn encode(node: &ANode) -> Vec<u8> {
 mod tests {
     use super::*;
     use crate::formats::mnode::{MNode, MValue};
-    use crate::formats::pnode::{ConjugateNode, ConjugateType, FieldRef, OpType, PNode, PredicateNode};
+    use crate::formats::pnode::{Comparand, ConjugateNode, ConjugateType, FieldRef, OpType, PNode, PredicateNode};
 
     #[test]
     fn test_dialect_constants() {
@@ -117,7 +117,7 @@ mod tests {
         let node = PNode::Predicate(PredicateNode {
             field: FieldRef::Named("age".into()),
             op: OpType::Gt,
-            comparands: vec![18],
+            comparands: vec![Comparand::Int(18)],
         });
         let bytes = node.to_bytes_named();
         assert_eq!(bytes[0], DIALECT_PNODE);
@@ -149,12 +149,12 @@ mod tests {
                 PNode::Predicate(PredicateNode {
                     field: FieldRef::Named("x".into()),
                     op: OpType::Eq,
-                    comparands: vec![1],
+                    comparands: vec![Comparand::Int(1)],
                 }),
                 PNode::Predicate(PredicateNode {
                     field: FieldRef::Named("y".into()),
                     op: OpType::Lt,
-                    comparands: vec![10],
+                    comparands: vec![Comparand::Int(10)],
                 }),
             ],
         });

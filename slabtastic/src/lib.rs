@@ -120,6 +120,6 @@ pub use footer::Footer;
 pub use namespaces_page::{NamespaceEntry, NamespacesPage};
 pub use page::Page;
 pub use pages_page::{PageEntry, PagesPage};
-pub use reader::{BatchReadResult, SlabBatchIter, SlabReader};
+pub use reader::{BatchReadResult, OpenProgress, SlabBatchIter, SlabReader, SlabStats};
 pub use task::{SlabProgress, SlabTask};
 pub use writer::SlabWriter;

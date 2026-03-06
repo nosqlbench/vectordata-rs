@@ -13,7 +13,46 @@ use std::time::Duration;
 use indexmap::IndexMap;
 
 use super::bound;
+use super::display::ProgressDisplay;
 use super::progress::ProgressLog;
+pub use super::resource::{ResourceDesc, ResourceType};
+use super::resource::ResourceGovernor;
+
+/// Built-in documentation for a pipeline command.
+///
+/// Every command provides a one-line summary (for completions and listings)
+/// and a full markdown body (for `--help` and `veks help`).
+#[derive(Debug, Clone)]
+pub struct CommandDoc {
+    /// One-line summary (plain text, no markdown).
+    /// Used in completion suggestions and command listings.
+    pub summary: String,
+
+    /// Full markdown documentation body.
+    /// Rendered when the user requests detailed help.
+    pub body: String,
+}
+
+/// Render an options table in markdown from `OptionDesc` entries.
+///
+/// Commands can call this from their `command_doc()` to keep the body
+/// consistent with `describe_options()`.
+pub fn render_options_table(options: &[OptionDesc]) -> String {
+    if options.is_empty() {
+        return String::from("_(none)_");
+    }
+    let mut s = String::from("| Option | Type | Required | Default | Description |\n");
+    s.push_str("|--------|------|----------|---------|-------------|\n");
+    for opt in options {
+        let req = if opt.required { "yes" } else { "no" };
+        let def = opt.default.as_deref().unwrap_or("—");
+        s.push_str(&format!(
+            "| `{}` | {} | {} | {} | {} |\n",
+            opt.name, opt.type_name, req, def, opt.description,
+        ));
+    }
+    s
+}
 
 /// A single executable operation in a command stream.
 ///
@@ -29,6 +68,28 @@ pub trait CommandOp: Send {
 
     /// Describe accepted options for dry-run validation.
     fn describe_options(&self) -> Vec<OptionDesc>;
+
+    /// Return built-in documentation for this command.
+    ///
+    /// The default generates a basic doc from the command path and options.
+    /// Commands SHOULD override this with a meaningful summary and body.
+    fn command_doc(&self) -> CommandDoc {
+        let path = self.command_path();
+        let options = self.describe_options();
+        let table = render_options_table(&options);
+        CommandDoc {
+            summary: path.to_string(),
+            body: format!("# {}\n\n## Options\n\n{}", path, table),
+        }
+    }
+
+    /// Declare which resource types this command consumes.
+    ///
+    /// Commands that process arbitrarily large data MUST override this
+    /// (see SRD §06 REQ-RM-11). The default returns an empty list.
+    fn describe_resources(&self) -> Vec<ResourceDesc> {
+        vec![]
+    }
 
     /// Check whether an existing output artifact is complete.
     ///
@@ -82,6 +143,9 @@ pub enum ArtifactState {
     Partial,
     /// Output does not exist.
     Absent,
+    /// Output exists but its format is unrecognized, so completeness
+    /// cannot be verified.
+    Unknown(String),
 }
 
 /// Resolved key-value options for a pipeline step.
@@ -137,6 +201,10 @@ pub struct StreamContext {
     pub threads: usize,
     /// Current step identifier, set by the runner before each step executes.
     pub step_id: String,
+    /// Resource governor for adaptive resource management.
+    pub governor: ResourceGovernor,
+    /// Shared progress display for the fixed status line (SRD §08).
+    pub display: ProgressDisplay,
 }
 
 /// Describes a single accepted option for a `CommandOp`.

@@ -22,7 +22,8 @@ use std::time::Instant;
 use jaq_interpret::{Ctx, FilterT, ParseCtx, RcIter, Val};
 
 use crate::pipeline::command::{
-    CommandOp, CommandResult, OptionDesc, Options, Status, StreamContext,
+    CommandDoc, CommandOp, CommandResult, OptionDesc, Options, ResourceDesc, Status, StreamContext,
+    render_options_table,
 };
 
 /// Pipeline command: JSON/JSONL transformation via jaq.
@@ -78,6 +79,30 @@ fn val_to_json(v: Val) -> serde_json::Value {
 impl CommandOp for JsonRjqOp {
     fn command_path(&self) -> &str {
         "json rjq"
+    }
+
+    fn command_doc(&self) -> CommandDoc {
+        let options = self.describe_options();
+        CommandDoc {
+            summary: "Query slab records with jq-like expressions".into(),
+            body: format!(
+                "# json rjq\n\n\
+                 Query slab records with jq-like expressions.\n\n\
+                 ## Description\n\n\
+                 Applies full jq expressions to JSONL files via the `jaq` crate — a pure \
+                 Rust implementation of the jq language. Supports pipes, array operations, \
+                 object construction, conditionals, `map`, `select`, `group_by`, and more.\n\n\
+                 ## Options\n\n{}",
+                render_options_table(&options)
+            ),
+        }
+    }
+
+    fn describe_resources(&self) -> Vec<ResourceDesc> {
+        vec![
+            ResourceDesc { name: "mem".into(), description: "Slab record iteration buffers".into(), adjustable: false },
+            ResourceDesc { name: "readahead".into(), description: "Read-ahead buffer size".into(), adjustable: false },
+        ]
     }
 
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
@@ -156,7 +181,7 @@ impl CommandOp for JsonRjqOp {
                 Err(e) => {
                     error_count += 1;
                     if error_count <= 5 {
-                        eprintln!("  Warning: line {}: parse error: {}", line_count, e);
+                        ctx.display.log(&format!("  Warning: line {}: parse error: {}", line_count, e));
                     }
                     continue;
                 }
@@ -177,7 +202,7 @@ impl CommandOp for JsonRjqOp {
                     Err(e) => {
                         error_count += 1;
                         if error_count <= 5 {
-                            eprintln!("  Warning: line {}: eval error: {:?}", line_count, e);
+                            ctx.display.log(&format!("  Warning: line {}: eval error: {:?}", line_count, e));
                         }
                     }
                 }
@@ -187,7 +212,7 @@ impl CommandOp for JsonRjqOp {
         let _ = writer.flush();
 
         if error_count > 5 {
-            eprintln!("  ... and {} more errors", error_count - 5);
+            ctx.display.log(&format!("  ... and {} more errors", error_count - 5));
         }
 
         let status = if error_count > 0 && output_count == 0 {
@@ -278,6 +303,8 @@ mod tests {
             progress: ProgressLog::new(),
             threads: 1,
             step_id: String::new(),
+            governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
+            display: crate::pipeline::display::ProgressDisplay::new(),
         }
     }
 

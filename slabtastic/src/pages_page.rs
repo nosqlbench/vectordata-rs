@@ -127,6 +127,12 @@ impl PagesPage {
         self.sorted_entries.clone()
     }
 
+    /// Return a borrowed slice of the cached entries (sorted by
+    /// `start_ordinal`), with zero allocation.
+    pub fn sorted_entries_ref(&self) -> &[PageEntry] {
+        &self.sorted_entries
+    }
+
     /// Binary search for the page entry containing the given ordinal.
     ///
     /// Returns the entry whose `start_ordinal` is the greatest value

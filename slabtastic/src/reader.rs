@@ -23,8 +23,8 @@
 //! ## Performance
 //!
 //! The file is memory-mapped at open time. Point gets use interpolation
-//! search over a pre-built page index with cached per-page metadata
-//! (page_size, record_count), so a `get()` call performs:
+//! search over the pages-page entries with record counts derived from
+//! consecutive `start_ordinal` values, so a `get()` call performs:
 //!
 //! 1. **Interpolation search** — O(1) expected for uniform ordinal
 //!    distributions (~1–2 probes vs ~12 for binary search).
@@ -96,22 +96,40 @@ impl BatchReadResult {
     }
 }
 
-/// Cached per-page metadata built at open time.
+/// Progress events emitted during [`SlabReader::open_with_progress`].
 ///
-/// Stores the page geometry (size, record count) alongside the
-/// pages-page entry so that [`SlabReader::get_into`] can locate a
-/// record's bytes without any per-call I/O parsing.
-#[derive(Debug, Clone, Copy)]
-struct PageIndexEntry {
-    /// Starting ordinal for this page.
-    start_ordinal: i64,
-    /// Byte offset of this page within the file.
-    file_offset: u64,
-    /// Total page size in bytes (from the page header).
-    page_size: u32,
-    /// Number of records in this page (from the page footer).
-    record_count: u32,
+/// Allows callers to display feedback during the page index build,
+/// which can involve millions of mmap page faults for large files.
+#[derive(Debug, Clone)]
+pub enum OpenProgress {
+    /// The file has been memory-mapped and the pages-page parsed.
+    /// `page_count` is the number of data pages whose footers will be read.
+    PagesPageRead { page_count: usize },
+    /// Progress during the page index build.
+    /// `done` pages out of `total` have been processed so far.
+    IndexBuild { done: usize, total: usize },
+    /// The page index build is complete. `total_records` is the sum of
+    /// all per-page record counts.
+    IndexComplete { total_records: u64 },
 }
+
+/// Lightweight metadata from probing a slab file without building the
+/// full page index.
+///
+/// Returned by [`SlabReader::probe`]. Only reads the pages-page and
+/// at most two data page footers, regardless of file size.
+#[derive(Debug, Clone)]
+pub struct SlabStats {
+    /// Number of data pages in the file.
+    pub page_count: usize,
+    /// Total record count across all pages.
+    pub total_records: u64,
+    /// Size of the first record in bytes (useful for inferring element size/dimension).
+    pub first_record_size: usize,
+    /// File size in bytes.
+    pub file_size: u64,
+}
+
 
 /// Reads slabtastic files, supporting random access by ordinal,
 /// batched iteration, streaming sink reads, and multi-batch concurrent
@@ -133,8 +151,10 @@ struct PageIndexEntry {
 /// ## Opening semantics
 ///
 /// [`SlabReader::open`] memory-maps the file and reads the trailing pages
-/// page to build the ordinal-to-offset index. Each data page's header and
-/// footer are scanned once to cache page_size and record_count. If the
+/// page to build the ordinal-to-offset index. Record counts are derived
+/// from consecutive pages-page entries; only the last page's footer is
+/// read (one page fault) to compute `total_records`. Page sizes are read
+/// on demand from the page header (4 bytes at a known offset). If the
 /// file is truncated or does not end with a pages page, an error is
 /// returned.
 ///
@@ -167,18 +187,22 @@ pub struct SlabReader {
     mmap: Mmap,
     /// The deserialized pages page (index of all data pages).
     pages_page: PagesPage,
-    /// Pre-built page index with cached per-page metadata, sorted by
-    /// `start_ordinal`. Used by [`get_into`](Self::get_into) for
-    /// zero-syscall, zero-parse record lookup.
-    page_index: Vec<PageIndexEntry>,
+    /// Total record count across all data pages, computed at open time.
+    total_records: u64,
 }
+
+// SAFETY: All `&self` methods on `SlabReader` access only the `mmap` (which is
+// `Sync`) and the read-only `pages_page`/`total_records` fields. The `File`
+// field is kept solely as a lifetime anchor for the mmap and is never read
+// through `SlabReader` methods (only moved out by the consuming `batch_iter()`).
+unsafe impl Sync for SlabReader {}
 
 impl SlabReader {
     /// Open a slabtastic file for reading using the default namespace.
     ///
-    /// Memory-maps the file, reads the trailing page to build the
-    /// ordinal-to-offset index, and pre-caches per-page metadata
-    /// (page_size, record_count) for zero-syscall point gets.
+    /// Memory-maps the file, reads the trailing pages page to build the
+    /// ordinal-to-offset index, and derives record counts from consecutive
+    /// entries. Only the last page's footer is read (one page fault).
     ///
     /// The last page must be either a pages page (type 1) for
     /// single-namespace files, or a namespaces page (type 3) for
@@ -186,6 +210,118 @@ impl SlabReader {
     /// pages page is located via the namespaces page.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         Self::open_namespace(path, None)
+    }
+
+    /// Open with a progress callback that receives [`OpenProgress`] events
+    /// during the page index build.
+    ///
+    /// Equivalent to [`open`](Self::open) but emits progress events so
+    /// callers can display feedback for large files.
+    pub fn open_with_progress<P, F>(path: P, progress: F) -> Result<Self>
+    where
+        P: AsRef<Path>,
+        F: Fn(&OpenProgress),
+    {
+        Self::open_namespace_with_progress(path, None, progress)
+    }
+
+    /// Probe a slab file for lightweight metadata without building the
+    /// full page index.
+    ///
+    /// Reads only the pages-page (or namespaces → pages-page) and at most
+    /// two data page footers. For files with millions of pages this is
+    /// orders of magnitude faster than [`open`](Self::open).
+    ///
+    /// Returns [`SlabStats`] with page count, total records, and the size
+    /// of the first record.
+    pub fn probe<P: AsRef<Path>>(path: P) -> Result<SlabStats> {
+        Self::probe_namespace(path, None)
+    }
+
+    /// Probe a specific namespace for lightweight metadata.
+    ///
+    /// See [`probe`](Self::probe) for details.
+    pub fn probe_namespace<P: AsRef<Path>>(path: P, namespace_name: Option<&str>) -> Result<SlabStats> {
+        let file = File::open(path.as_ref())?;
+        let file_size = file.metadata().map(|m| m.len()).unwrap_or(0);
+        let mmap = unsafe { Mmap::map(&file).map_err(SlabError::from)? };
+        let file_len = mmap.len();
+
+        if file_len < HEADER_SIZE + FOOTER_V1_SIZE {
+            return Err(SlabError::TruncatedPage {
+                expected: HEADER_SIZE + FOOTER_V1_SIZE,
+                actual: file_len,
+            });
+        }
+
+        let footer = Footer::read_from(&mmap[file_len - FOOTER_V1_SIZE..])?;
+
+        if footer.page_type != PageType::Pages && footer.page_type != PageType::Namespaces {
+            return Err(SlabError::InvalidPageType(footer.page_type as u8));
+        }
+
+        let pages_page = Self::resolve_pages_page(&mmap, file_len, &footer, namespace_name)?;
+        let entries = pages_page.entries();
+        let page_count = entries.len();
+
+        if page_count == 0 {
+            return Ok(SlabStats {
+                page_count: 0,
+                total_records: 0,
+                first_record_size: 0,
+                file_size,
+            });
+        }
+
+        // Compute total records from consecutive start_ordinals.
+        // For pages 0..n-1: records[i] = entries[i+1].start_ordinal - entries[i].start_ordinal
+        // For the last page: read its footer to get record_count.
+        let mut total_records: u64 = 0;
+        for i in 0..page_count - 1 {
+            total_records += (entries[i + 1].start_ordinal - entries[i].start_ordinal) as u64;
+        }
+
+        // Read last page footer for its record_count (one page fault)
+        let last_offset = entries[page_count - 1].file_offset as usize;
+        let last_page_size = u32::from_le_bytes(
+            mmap[last_offset + 4..last_offset + 8].try_into().unwrap(),
+        );
+        let last_footer_start = last_offset + last_page_size as usize - FOOTER_V1_SIZE;
+        let mut rc = [0u8; 4];
+        rc[..3].copy_from_slice(&mmap[last_footer_start + 5..last_footer_start + 8]);
+        let last_record_count = u32::from_le_bytes(rc);
+        total_records += last_record_count as u64;
+
+        // Read first record size from the first page
+        let first_offset = entries[0].file_offset as usize;
+        let first_page_size = u32::from_le_bytes(
+            mmap[first_offset + 4..first_offset + 8].try_into().unwrap(),
+        );
+        let first_footer_start = first_offset + first_page_size as usize - FOOTER_V1_SIZE;
+        let mut first_rc = [0u8; 4];
+        first_rc[..3].copy_from_slice(&mmap[first_footer_start + 5..first_footer_start + 8]);
+        let first_record_count = u32::from_le_bytes(first_rc);
+
+        let first_record_size = if first_record_count > 0 {
+            // Read offset table: (record_count+1) u32 entries before the footer
+            let offset_table_start = first_footer_start - (first_record_count as usize + 1) * 4;
+            let off0 = u32::from_le_bytes(
+                mmap[offset_table_start..offset_table_start + 4].try_into().unwrap(),
+            ) as usize;
+            let off1 = u32::from_le_bytes(
+                mmap[offset_table_start + 4..offset_table_start + 8].try_into().unwrap(),
+            ) as usize;
+            off1 - off0
+        } else {
+            0
+        };
+
+        Ok(SlabStats {
+            page_count,
+            total_records,
+            first_record_size,
+            file_size,
+        })
     }
 
     /// Open a slabtastic file for reading, targeting a specific namespace.
@@ -198,6 +334,24 @@ impl SlabReader {
     /// searched for a matching entry. If no match is found, an error is
     /// returned listing the available namespaces.
     pub fn open_namespace<P: AsRef<Path>>(path: P, namespace_name: Option<&str>) -> Result<Self> {
+        Self::open_namespace_with_progress(path, namespace_name, |_| {})
+    }
+
+    /// Open a slabtastic file targeting a specific namespace, with a
+    /// progress callback.
+    ///
+    /// See [`open_namespace`](Self::open_namespace) for namespace semantics.
+    /// The `progress` callback receives [`OpenProgress`] events during the
+    /// page index build.
+    pub fn open_namespace_with_progress<P, F>(
+        path: P,
+        namespace_name: Option<&str>,
+        progress: F,
+    ) -> Result<Self>
+    where
+        P: AsRef<Path>,
+        F: Fn(&OpenProgress),
+    {
         let file = File::open(path)?;
 
         // Safety: the file is opened read-only and we keep the File
@@ -225,9 +379,63 @@ impl SlabReader {
             return Err(SlabError::InvalidPageType(footer.page_type as u8));
         }
 
-        let pages_page = if footer.page_type == PageType::Pages {
-            // Single-namespace file — if user asked for a non-default
-            // namespace, that's an error.
+        let pages_page = Self::resolve_pages_page(&mmap, file_len, &footer, namespace_name)?;
+
+        let entries = pages_page.sorted_entries_ref();
+        let page_count = entries.len();
+        progress(&OpenProgress::PagesPageRead { page_count });
+
+        // Derive total_records from consecutive start_ordinal values.
+        // For pages 0..n-1: records[i] = entries[i+1].start_ordinal - entries[i].start_ordinal
+        // For the last page: read its footer once (1 page fault).
+        let total_records = if page_count == 0 {
+            0u64
+        } else {
+            let mut sum: u64 = 0;
+            for i in 0..page_count - 1 {
+                sum += (entries[i + 1].start_ordinal - entries[i].start_ordinal) as u64;
+            }
+            // Read last page's footer for its record_count
+            let last_offset = entries[page_count - 1].file_offset as usize;
+            let last_page_size = u32::from_le_bytes(
+                mmap[last_offset + 4..last_offset + 8].try_into().unwrap(),
+            );
+            if (last_page_size as usize) < HEADER_SIZE + FOOTER_V1_SIZE {
+                return Err(SlabError::TruncatedPage {
+                    expected: HEADER_SIZE + FOOTER_V1_SIZE,
+                    actual: last_page_size as usize,
+                }
+                .with_context(Some(last_offset as u64), None, None));
+            }
+            let last_footer_start = last_offset + last_page_size as usize - FOOTER_V1_SIZE;
+            let mut rc = [0u8; 4];
+            rc[..3].copy_from_slice(&mmap[last_footer_start + 5..last_footer_start + 8]);
+            let last_record_count = u32::from_le_bytes(rc);
+            sum += last_record_count as u64;
+            sum
+        };
+
+        progress(&OpenProgress::IndexComplete { total_records });
+
+        Ok(SlabReader {
+            file,
+            mmap,
+            pages_page,
+            total_records,
+        })
+    }
+
+    /// Resolve the pages-page for a given namespace from the terminal footer.
+    ///
+    /// Shared by [`open_namespace_with_progress`](Self::open_namespace_with_progress)
+    /// and [`probe_namespace`](Self::probe_namespace).
+    fn resolve_pages_page(
+        mmap: &Mmap,
+        file_len: usize,
+        footer: &Footer,
+        namespace_name: Option<&str>,
+    ) -> Result<PagesPage> {
+        if footer.page_type == PageType::Pages {
             if let Some(name) = namespace_name
                 && !name.is_empty() {
                     return Err(SlabError::InvalidFooter(format!(
@@ -236,19 +444,16 @@ impl SlabReader {
                     )));
                 }
             let pp_start = file_len - footer.page_size as usize;
-            PagesPage::deserialize(&mmap[pp_start..file_len])?
+            PagesPage::deserialize(&mmap[pp_start..file_len])
         } else {
-            // Namespaces page — locate the target namespace's pages page
             let ns_start = file_len - footer.page_size as usize;
             let ns_page = Page::deserialize(&mmap[ns_start..file_len])?;
             let ns_page_obj = NamespacesPage { page: ns_page };
             let ns_entries = ns_page_obj.entries()?;
 
             let target_entry = if let Some(name) = namespace_name {
-                // Find namespace by name
                 ns_entries.iter().find(|e| e.name == name)
             } else {
-                // Find default namespace (index DEFAULT_NAMESPACE_INDEX, name "")
                 ns_entries.iter().find(|e| {
                     e.namespace_index == DEFAULT_NAMESPACE_INDEX && e.name.is_empty()
                 })
@@ -280,53 +485,11 @@ impl SlabReader {
                 }
             };
 
-            // Read page_size from the pages page header
             let pp_size = u32::from_le_bytes(
                 mmap[pp_offset + 4..pp_offset + 8].try_into().unwrap(),
             ) as usize;
-            PagesPage::deserialize(&mmap[pp_offset..pp_offset + pp_size])?
-        };
-
-        // Build page index with cached per-page metadata.
-        // Each data page's header and footer are validated here so that
-        // get_into() can skip per-call validation entirely.
-        let entries = pages_page.entries();
-        let mut page_index = Vec::with_capacity(entries.len());
-        for entry in &entries {
-            let offset = entry.file_offset as usize;
-            let page_size = u32::from_le_bytes(
-                mmap[offset + 4..offset + 8].try_into().unwrap(),
-            );
-            if (page_size as usize) < HEADER_SIZE + FOOTER_V1_SIZE {
-                return Err(SlabError::TruncatedPage {
-                    expected: HEADER_SIZE + FOOTER_V1_SIZE,
-                    actual: page_size as usize,
-                }
-                .with_context(Some(offset as u64), None, None));
-            }
-            let footer_start = offset + page_size as usize - FOOTER_V1_SIZE;
-            let page_type = mmap[footer_start + 12];
-            if page_type != PageType::Data as u8 {
-                return Err(SlabError::InvalidPageType(page_type)
-                    .with_context(Some(offset as u64), None, None));
-            }
-            let mut rc = [0u8; 4];
-            rc[..3].copy_from_slice(&mmap[footer_start + 5..footer_start + 8]);
-            let record_count = u32::from_le_bytes(rc);
-            page_index.push(PageIndexEntry {
-                start_ordinal: entry.start_ordinal,
-                file_offset: entry.file_offset as u64,
-                page_size,
-                record_count,
-            });
+            PagesPage::deserialize(&mmap[pp_offset..pp_offset + pp_size])
         }
-
-        Ok(SlabReader {
-            file,
-            mmap,
-            pages_page,
-            page_index,
-        })
     }
 
     /// List all namespaces in a slabtastic file without fully opening
@@ -385,23 +548,27 @@ impl SlabReader {
     ///
     /// The returned slice is valid for the lifetime of the reader.
     pub fn get_ref(&self, ordinal: i64) -> Result<&[u8]> {
+        let entries = self.pages_page.sorted_entries_ref();
         let idx = self
             .find_page_interpolation(ordinal)
             .ok_or(SlabError::OrdinalNotFound(ordinal))?;
-        let entry = &self.page_index[idx];
+        let entry = &entries[idx];
 
+        let record_count = self.page_record_count(idx) as usize;
         let local_index = (ordinal - entry.start_ordinal) as usize;
-        if local_index >= entry.record_count as usize {
+        if local_index >= record_count {
             return Err(SlabError::OrdinalNotFound(ordinal).with_context(
-                Some(entry.file_offset),
+                Some(entry.file_offset as u64),
                 None,
                 Some(ordinal),
             ));
         }
 
         let page_start = entry.file_offset as usize;
-        let page_size = entry.page_size as usize;
-        let record_count = entry.record_count as usize;
+        // Read page_size from the page header (4 bytes at offset+4)
+        let page_size = u32::from_le_bytes(
+            self.mmap[page_start + 4..page_start + 8].try_into().unwrap(),
+        ) as usize;
 
         let offset_count = record_count + 1;
         let offsets_start = page_start + page_size - FOOTER_V1_SIZE - offset_count * 4;
@@ -491,7 +658,7 @@ impl SlabReader {
     /// Falls back to binary search if the interpolation guess is off by
     /// more than a bounded scan distance.
     fn find_page_interpolation(&self, ordinal: i64) -> Option<usize> {
-        let entries = &self.page_index;
+        let entries = self.pages_page.sorted_entries_ref();
         let len = entries.len();
         if len == 0 || ordinal < entries[0].start_ordinal {
             return None;
@@ -542,6 +709,32 @@ impl SlabReader {
         }
     }
 
+    /// Derive the record count for the page at `idx` from consecutive
+    /// pages-page entries.
+    ///
+    /// For pages `0..n-1`, the record count is
+    /// `entries[idx+1].start_ordinal - entries[idx].start_ordinal`.
+    /// For the last page, the count is derived from `total_records`
+    /// minus the sum of all preceding pages' counts.
+    fn page_record_count(&self, idx: usize) -> u32 {
+        let entries = self.pages_page.sorted_entries_ref();
+        if idx + 1 < entries.len() {
+            (entries[idx + 1].start_ordinal - entries[idx].start_ordinal) as u32
+        } else {
+            // Last page: total_records - start_ordinal_of_last_page + start_ordinal_of_first_page
+            // More precisely: total_records - sum_of_all_preceding_pages
+            // Since sum of preceding = entries[last].start_ordinal - entries[0].start_ordinal
+            // and total_records = sum_of_preceding + last_count,
+            // last_count = total_records - (entries[last].start_ordinal - entries[0].start_ordinal)
+            let preceding: u64 = if entries.len() > 1 {
+                (entries[idx].start_ordinal - entries[0].start_ordinal) as u64
+            } else {
+                0
+            };
+            (self.total_records - preceding) as u32
+        }
+    }
+
     /// Check whether the file contains a record for the given ordinal.
     pub fn contains(&self, ordinal: i64) -> bool {
         self.get(ordinal).is_ok()
@@ -550,6 +743,14 @@ impl SlabReader {
     /// Return the number of data pages in this file.
     pub fn page_count(&self) -> usize {
         self.pages_page.entry_count()
+    }
+
+    /// Return the total number of records across all data pages.
+    ///
+    /// This is computed at open time from consecutive pages-page entries
+    /// and requires no additional I/O.
+    pub fn total_records(&self) -> u64 {
+        self.total_records
     }
 
     /// Return the page entries (index) from the pages page.
@@ -583,25 +784,16 @@ impl SlabReader {
     /// entirely outside the range are skipped. Within qualifying pages,
     /// only records whose ordinal falls in `[start, end)` are returned.
     pub fn iter_range(&self, start: i64, end: i64) -> Result<Vec<(i64, Vec<u8>)>> {
-        let mut entries = self.pages_page.entries();
-        entries.sort_by_key(|e| e.start_ordinal);
+        let entries = self.pages_page.sorted_entries_ref();
 
         let mut result = Vec::new();
-        for entry in &entries {
-            // Find the cached page index entry to get the record count
-            // without deserializing the page.
-            let idx = match self.page_index.iter().position(|p| {
-                p.file_offset == entry.file_offset as u64
-            }) {
-                Some(i) => i,
-                None => continue,
-            };
-            let pi = &self.page_index[idx];
-            let page_start = pi.start_ordinal;
-            let page_end = page_start + pi.record_count as i64;
+        for (idx, entry) in entries.iter().enumerate() {
+            let record_count = self.page_record_count(idx);
+            let page_start_ord = entry.start_ordinal;
+            let page_end_ord = page_start_ord + record_count as i64;
 
             // Skip pages entirely outside the range
-            if page_end <= start || page_start >= end {
+            if page_end_ord <= start || page_start_ord >= end {
                 continue;
             }
 
@@ -746,6 +938,56 @@ impl SlabReader {
             e.with_context(Some(entry.file_offset as u64), None, None)
         })
     }
+
+    /// Return a zero-copy slice of the raw page bytes for `entry`.
+    ///
+    /// The returned slice points directly into the mmap with no heap
+    /// allocation. Use with [`Page::get_record_ref_from_buf`] to read
+    /// individual records without deserializing the entire page.
+    pub fn page_buf(&self, entry: &PageEntry) -> &[u8] {
+        let offset = entry.file_offset as usize;
+        let page_size = u32::from_le_bytes(
+            self.mmap[offset + 4..offset + 8].try_into().unwrap(),
+        ) as usize;
+        &self.mmap[offset..offset + page_size]
+    }
+
+    /// Advise the kernel that this file will be accessed sequentially.
+    ///
+    /// Calls `madvise(MADV_SEQUENTIAL)` on the underlying mmap, enabling
+    /// aggressive kernel readahead and page cache drop-behind. This is a
+    /// no-op on non-Unix platforms.
+    #[cfg(unix)]
+    pub fn advise_sequential(&self) {
+        let _ = self.mmap.advise(Advice::Sequential);
+    }
+
+    /// Advise the kernel that this file will be accessed sequentially.
+    ///
+    /// No-op on non-Unix platforms.
+    #[cfg(not(unix))]
+    pub fn advise_sequential(&self) {}
+
+    /// Asynchronously prefetch a byte range into the page cache.
+    ///
+    /// Calls `madvise(MADV_WILLNEED, start..end)` so the kernel begins
+    /// paging in the specified range in the background. This is a no-op
+    /// on non-Unix platforms or if the range is out of bounds.
+    #[cfg(unix)]
+    pub fn prefetch_range(&self, start_offset: usize, end_offset: usize) {
+        let len = self.mmap.len();
+        let start = start_offset.min(len);
+        let end = end_offset.min(len);
+        if start < end {
+            let _ = self.mmap.advise_range(Advice::WillNeed, start, end - start);
+        }
+    }
+
+    /// Asynchronously prefetch a byte range into the page cache.
+    ///
+    /// No-op on non-Unix platforms.
+    #[cfg(not(unix))]
+    pub fn prefetch_range(&self, _start_offset: usize, _end_offset: usize) {}
 }
 
 /// Batched iterator over all records in a slabtastic file.

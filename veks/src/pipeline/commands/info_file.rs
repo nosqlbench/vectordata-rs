@@ -14,7 +14,8 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::pipeline::command::{
-    CommandOp, CommandResult, OptionDesc, Options, Status, StreamContext,
+    CommandDoc, CommandOp, CommandResult, OptionDesc, Options, Status, StreamContext,
+    render_options_table,
 };
 
 /// Pipeline command: display vector file info.
@@ -181,6 +182,23 @@ impl CommandOp for InfoFileOp {
         "info file"
     }
 
+    fn command_doc(&self) -> CommandDoc {
+        let options = self.describe_options();
+        CommandDoc {
+            summary: "Display file format, dimensions, and record count".into(),
+            body: format!(
+                "# info file\n\n\
+                 Display file format, dimensions, and record count.\n\n\
+                 ## Description\n\n\
+                 Reads a vector file header and reports format, dimensions, vector count, \
+                 file size, element type, and optional sample vectors. Supports xvec formats: \
+                 fvec, ivec, bvec, dvec, hvec.\n\n\
+                 ## Options\n\n{}",
+                render_options_table(&options)
+            ),
+        }
+    }
+
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
         let start = Instant::now();
 
@@ -204,35 +222,35 @@ impl CommandOp for InfoFileOp {
         let header_overhead =
             (4 * info.vector_count) as f64 / info.file_size as f64 * 100.0;
 
-        eprintln!("File: {}", source_path.display());
-        eprintln!("  Size:       {} ({} bytes)", human_bytes(info.file_size), info.file_size);
-        eprintln!("  Format:     .{} ({})", info.format, info.data_type);
-        eprintln!(
+        ctx.display.log(&format!("File: {}", source_path.display()));
+        ctx.display.log(&format!("  Size:       {} ({} bytes)", human_bytes(info.file_size), info.file_size));
+        ctx.display.log(&format!("  Format:     .{} ({})", info.format, info.data_type));
+        ctx.display.log(&format!(
             "  Element:    {} bytes per value",
             info.bytes_per_element
-        );
-        eprintln!("  Dimensions: {}", info.dimensions);
-        eprintln!("  Vectors:    {}", info.vector_count);
-        eprintln!(
+        ));
+        ctx.display.log(&format!("  Dimensions: {}", info.dimensions));
+        ctx.display.log(&format!("  Vectors:    {}", info.vector_count));
+        ctx.display.log(&format!(
             "  Per-vector: {} bytes (4 header + {} data)",
             info.bytes_per_vector,
             info.dimensions * info.bytes_per_element
-        );
-        eprintln!("  Header overhead: {:.1}%", header_overhead);
+        ));
+        ctx.display.log(&format!("  Header overhead: {:.1}%", header_overhead));
 
         if info.trailing_bytes > 0 {
-            eprintln!(
+            ctx.display.log(&format!(
                 "  WARNING: {} trailing bytes (file may be truncated or corrupted)",
                 info.trailing_bytes
-            );
+            ));
         }
 
         if sample_count > 0 {
             let data = std::fs::read(&source_path).unwrap_or_default();
             let samples = read_samples(&data, &info, sample_count, 8);
-            eprintln!("  Sample vectors:");
+            ctx.display.log("  Sample vectors:");
             for s in &samples {
-                eprintln!("{}", s);
+                ctx.display.log(&format!("{}", s));
             }
         }
 
@@ -306,6 +324,8 @@ mod tests {
             progress: ProgressLog::new(),
             threads: 1,
             step_id: String::new(),
+            governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
+            display: crate::pipeline::display::ProgressDisplay::new(),
         }
     }
 

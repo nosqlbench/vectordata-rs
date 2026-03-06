@@ -177,16 +177,24 @@ fn import_single_facet(
 ) {
     let source_format = resolve_source_format(format_override, source_path, facet);
 
-    // Open source first to determine element size
-    let mut source = reader::open_source_for_facet(source_path, source_format, facet, args.threads).unwrap_or_else(|e| {
-        eprintln!("Failed to open source: {}", e);
+    // Probe source first to get metadata (lightweight — no data loading)
+    eprintln!("  probing {} ({})...", source_path.display(), source_format);
+    let probe = reader::probe_source_for_facet(source_path, source_format, facet).unwrap_or_else(|e| {
+        eprintln!("Failed to probe source: {}", e);
         std::process::exit(1);
     });
-
-    let dimension = source.dimension();
-    let element_size = source.element_size();
-    let record_count = source.record_count();
+    let dimension = probe.dimension;
+    let element_size = probe.element_size;
+    let record_count = probe.record_count;
     let target_format = facet.preferred_format(element_size);
+
+    eprintln!(
+        "  probed: dimension={}, element_size={}, records={}, target={}",
+        dimension,
+        element_size,
+        record_count.map_or("unknown".to_string(), |n| n.to_string()),
+        target_format,
+    );
 
     // Derive output path if not provided
     let derived_output;
@@ -284,6 +292,13 @@ fn import_single_facet(
             record_count.map_or("unknown".to_string(), |n| n.to_string())
         );
     }
+
+    // Open the full source reader (may spawn threads, load data)
+    eprintln!("  opening source reader...");
+    let mut source = reader::open_source_for_facet(source_path, source_format, facet, args.threads, None).unwrap_or_else(|e| {
+        eprintln!("Failed to open source: {}", e);
+        std::process::exit(1);
+    });
 
     // Create output directory if needed
     if let Some(parent) = output_path.parent() {
@@ -425,8 +440,11 @@ fn check_output_completeness(
 /// (e.g. no pages-page from an interrupted write), since a corrupt/unfinished
 /// slab is definitively incomplete.
 fn check_slab_completeness(output_path: &Path, expected_records: u64) -> OutputStatus {
-    let reader = match slabtastic::SlabReader::open(output_path) {
-        Ok(r) => r,
+    // Use lightweight probe to get total records from cached page metadata
+    // without reading every data page (which would be extremely slow for
+    // large slab files).
+    let stats = match slabtastic::SlabReader::probe(output_path) {
+        Ok(s) => s,
         Err(e) => {
             eprintln!(
                 "    (slab unreadable: {} — treating as incomplete)",
@@ -438,36 +456,7 @@ fn check_slab_completeness(output_path: &Path, expected_records: u64) -> OutputS
             };
         }
     };
-    let entries = reader.page_entries();
-    let n = entries.len();
-    if n > 100 {
-        eprintln!("    checking slab completeness ({} pages)...", n);
-    }
-    let report_interval = if n > 100 { n / 10 } else { n + 1 };
-    let mut actual_records: u64 = 0;
-    for (i, entry) in entries.iter().enumerate() {
-        match reader.read_data_page(entry) {
-            Ok(page) => actual_records += page.record_count() as u64,
-            Err(e) => {
-                eprintln!(
-                    "    (slab page read failed: {} — counting {} records so far)",
-                    e, actual_records
-                );
-                return OutputStatus::Incomplete {
-                    actual: actual_records,
-                    expected: expected_records,
-                };
-            }
-        }
-        if (i + 1) % report_interval == 0 {
-            eprintln!(
-                "    scanned {}/{} pages, {} records so far",
-                i + 1,
-                n,
-                actual_records
-            );
-        }
-    }
+    let actual_records = stats.total_records;
     if actual_records >= expected_records {
         OutputStatus::Complete
     } else {

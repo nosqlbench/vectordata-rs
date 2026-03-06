@@ -17,7 +17,8 @@ use vectordata::VectorReader;
 use vectordata::io::MmapVectorReader;
 
 use crate::pipeline::command::{
-    CommandOp, CommandResult, OptionDesc, Options, Status, StreamContext,
+    CommandDoc, CommandOp, CommandResult, OptionDesc, Options, ResourceDesc, Status, StreamContext,
+    render_options_table,
 };
 
 /// Pipeline command: verify vectors match a model profile.
@@ -45,6 +46,24 @@ enum ScalarModelDef {
 impl CommandOp for AnalyzeVerifyProfilesOp {
     fn command_path(&self) -> &str {
         "analyze verify-profiles"
+    }
+
+    fn command_doc(&self) -> CommandDoc {
+        let options = self.describe_options();
+        CommandDoc {
+            summary: "Verify dataset profile facet consistency".into(),
+            body: format!(
+                "# analyze verify-profiles\n\nVerify dataset profile facet consistency.\n\n## Description\n\nLoads a model.json and a generated fvec file, then performs per-dimension Kolmogorov-Smirnov tests to verify the vectors match the model's statistical profile within acceptable tolerances.\n\n## Options\n\n{}",
+                render_options_table(&options)
+            ),
+        }
+    }
+
+    fn describe_resources(&self) -> Vec<ResourceDesc> {
+        vec![
+            ResourceDesc { name: "mem".into(), description: "Vector data buffers".into(), adjustable: false },
+            ResourceDesc { name: "readahead".into(), description: "Sequential read prefetch".into(), adjustable: false },
+        ]
     }
 
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
@@ -102,10 +121,10 @@ impl CommandOp for AnalyzeVerifyProfilesOp {
         }
 
         let effective = sample.min(vec_count);
-        eprintln!(
+        ctx.display.log(&format!(
             "Verifying {} vectors (sampling {}) against model ({} dims)",
             vec_count, effective, model.dimensions
-        );
+        ));
 
         let mut pass_count = 0;
         let mut fail_count = 0;
@@ -132,22 +151,22 @@ impl CommandOp for AnalyzeVerifyProfilesOp {
 
             if verbose || !pass {
                 let status = if pass { "ok" } else { "FAIL" };
-                eprintln!(
+                ctx.display.log(&format!(
                     "  dim[{}]: KS D={:.4} (threshold={:.4}) — {}",
                     d, ks_d, threshold, status
-                );
+                ));
             }
         }
 
         let avg_ks = total_ks / vec_dim as f64;
-        eprintln!();
-        eprintln!(
+        ctx.display.log("");
+        ctx.display.log(&format!(
             "Results: {}/{} dimensions pass (avg KS D={:.4}, threshold={:.4})",
             pass_count, vec_dim, avg_ks, threshold
-        );
+        ));
 
         if fail_count == 0 {
-            eprintln!("PASS");
+            ctx.display.log("PASS");
             CommandResult {
                 status: Status::Ok,
                 message: format!(
@@ -158,7 +177,7 @@ impl CommandOp for AnalyzeVerifyProfilesOp {
                 elapsed: start.elapsed(),
             }
         } else {
-            eprintln!("FAIL ({} dimensions exceeded threshold)", fail_count);
+            ctx.display.log(&format!("FAIL ({} dimensions exceeded threshold)", fail_count));
             CommandResult {
                 status: Status::Error,
                 message: format!(
@@ -336,6 +355,8 @@ mod tests {
             progress: ProgressLog::new(),
             threads: 1,
             step_id: String::new(),
+            governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
+            display: crate::pipeline::display::ProgressDisplay::new(),
         }
     }
 

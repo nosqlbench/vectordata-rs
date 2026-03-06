@@ -2226,8 +2226,13 @@ fn test_error_with_context_display() {
     assert!(msg.contains("page 3"), "should contain page index: {msg}");
 }
 
-/// Errors from read_data_page should carry file offset context when the
-/// underlying page data is corrupted.
+/// Corrupting only the page_type byte in a data page's footer does not
+/// cause an error — the reader derives record counts from the pages-page
+/// and reads page_size from the header, so the footer page_type byte is
+/// never consulted during open or get.
+///
+/// Instead, verify that corrupting the header page_size to an invalid
+/// value (too small) produces an error with file offset context.
 #[test]
 fn test_reader_error_carries_offset_context() {
     let tmp = NamedTempFile::new().unwrap();
@@ -2238,36 +2243,19 @@ fn test_reader_error_carries_offset_context() {
     writer.add_record(b"test").unwrap();
     writer.finish().unwrap();
 
-    // Corrupt the first data page's footer page_type byte to 0 (Invalid).
-    // The footer is the last 16 bytes of the data page, and page_type is
-    // at offset 12 within the footer.
+    // Corrupt the first (and only) data page's header page_size to a
+    // value smaller than HEADER_SIZE + FOOTER_V1_SIZE (i.e. 8 + 16 = 24).
+    // This is detected when the reader reads the last page's footer at
+    // open time.
     let mut data = std::fs::read(&path).unwrap();
-    // Data page header page_size tells us how big the data page is.
-    let page_size = u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as usize;
-    // Footer starts at page_size - 16, page_type is at footer_start + 12
-    let page_type_offset = page_size - 16 + 12;
-    data[page_type_offset] = 0; // Invalid page type
+    data[4..8].copy_from_slice(&4u32.to_le_bytes()); // page_size = 4 (too small)
     std::fs::write(&path, &data).unwrap();
 
-    // The reader validates page metadata eagerly at open time, so
-    // the corrupted page_type is caught during index construction.
-    // If open somehow succeeds, get() must still fail.
-    match SlabReader::open(&path) {
-        Err(e) => {
-            let err_msg = format!("{e}");
-            assert!(
-                err_msg.contains("offset"),
-                "error should include file offset context: {err_msg}"
-            );
-        }
-        Ok(reader) => {
-            let result = reader.get(0);
-            assert!(result.is_err());
-            let err_msg = format!("{}", result.unwrap_err());
-            assert!(
-                err_msg.contains("offset"),
-                "error should include file offset context: {err_msg}"
-            );
-        }
-    }
+    let result = SlabReader::open(&path);
+    assert!(result.is_err(), "corrupted page_size should cause open to fail");
+    let err_msg = format!("{}", result.err().unwrap());
+    assert!(
+        err_msg.contains("offset"),
+        "error should include file offset context: {err_msg}"
+    );
 }

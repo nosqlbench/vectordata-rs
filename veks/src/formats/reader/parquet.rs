@@ -219,7 +219,7 @@ impl ParquetDirReader {
     /// reassembled in file-sorted order.
     ///
     /// `threads` controls the number of loader threads. Pass `0` to
-    /// auto-detect: the lesser of 3/4 of hardware threads or 32.
+    /// auto-detect: hardware thread count, capped at 64.
     pub fn open(path: &Path, threads: usize) -> Result<Box<dyn VecSource>, String> {
         let files = collect_parquet_files(path)?;
 
@@ -266,7 +266,7 @@ impl ParquetDirReader {
             let hw = std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(4);
-            (hw * 3 / 4).max(1).min(32)
+            hw.max(1).min(64)
         };
         let num_workers = if threads == 0 { default_threads } else { threads }
             .min(total_files);

@@ -1,7 +1,7 @@
 [package]
 name = "vectordata"
 version = "0.2.0"
-edition = "2021"
+edition = "2024"
 description = "Rust implementation of vectordata tools for dataset.yaml"
 license = "Apache-2.0"
 homepage = "https://github.com/nosqlbench/vectordata-rs"
@@ -16,6 +16,7 @@ serde_yaml = "0.9"
 thiserror = "2.0.18"
 anyhow = "1.0"
 memmap2 = "0.9"
+libc = "0.2"
 byteorder = "1.5"
 half = "2"
 reqwest = { version = "0.13.1", features = ["blocking", "json"] }

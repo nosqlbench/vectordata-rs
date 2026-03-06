@@ -16,7 +16,8 @@ use vectordata::io::MmapVectorReader;
 use vectordata::io::VectorReader;
 
 use crate::pipeline::command::{
-    CommandOp, CommandResult, OptionDesc, Options, Status, StreamContext,
+    CommandDoc, CommandOp, CommandResult, OptionDesc, Options, ResourceDesc, Status, StreamContext,
+    render_options_table,
 };
 
 /// Pipeline command: K-S distribution comparison.
@@ -97,6 +98,24 @@ fn ks_p_value(z: f64) -> f64 {
 impl CommandOp for AnalyzeCompareOp {
     fn command_path(&self) -> &str {
         "analyze compare"
+    }
+
+    fn command_doc(&self) -> CommandDoc {
+        let options = self.describe_options();
+        CommandDoc {
+            summary: "Compare two vector files element-by-element".into(),
+            body: format!(
+                "# analyze compare\n\nCompare two vector files element-by-element.\n\n## Description\n\nPerforms a two-sample Kolmogorov-Smirnov test per dimension between two fvec files to determine if their distributions match. Useful for comparing synthetic or generated data against the original dataset.\n\n## Options\n\n{}",
+                render_options_table(&options)
+            ),
+        }
+    }
+
+    fn describe_resources(&self) -> Vec<ResourceDesc> {
+        vec![
+            ResourceDesc { name: "mem".into(), description: "Buffers for two vector files".into(), adjustable: false },
+            ResourceDesc { name: "readahead".into(), description: "Sequential read prefetch".into(), adjustable: false },
+        ]
     }
 
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
@@ -207,42 +226,42 @@ impl CommandOp for AnalyzeCompareOp {
         }
 
         // Print results table
-        eprintln!(
+        ctx.display.log(&format!(
             "\nK-S Distribution Comparison (alpha={}, samples: orig={}, synth={})",
             alpha, orig_sample, synth_sample
-        );
-        eprintln!("{:>8}  {:>10}  {:>10}  {:>6}", "Dim", "D-stat", "P-value", "Result");
-        eprintln!("{}", "-".repeat(42));
+        ));
+        ctx.display.log(&format!("{:>8}  {:>10}  {:>10}  {:>6}", "Dim", "D-stat", "P-value", "Result"));
+        ctx.display.log(&format!("{}", "-".repeat(42)));
 
         let show_count = if verbose { results.len() } else { 10.min(results.len()) };
         let mut shown = 0;
 
         for r in &results {
             if verbose || shown < 10 || !r.passed {
-                eprintln!(
+                ctx.display.log(&format!(
                     "{:>8}  {:>10.6}  {:>10.6}  {:>6}",
                     r.dimension,
                     r.d_statistic,
                     r.p_value,
                     if r.passed { "PASS" } else { "FAIL" }
-                );
+                ));
                 shown += 1;
             }
         }
 
         if !verbose && results.len() > show_count {
-            eprintln!("  ... {} more dimensions (use verbose=true to see all)", results.len() - shown);
+            ctx.display.log(&format!("  ... {} more dimensions (use verbose=true to see all)", results.len() - shown));
         }
 
-        eprintln!();
+        ctx.display.log("");
         if fail_count == 0 {
-            eprintln!("DISTRIBUTIONS MATCH ({}/{} dimensions passed)", dims.len(), dims.len());
+            ctx.display.log(&format!("DISTRIBUTIONS MATCH ({}/{} dimensions passed)", dims.len(), dims.len()));
         } else {
-            eprintln!(
+            ctx.display.log(&format!(
                 "DISTRIBUTIONS DIFFER ({}/{} dimensions failed)",
                 fail_count,
                 dims.len()
-            );
+            ));
         }
 
         let status = if fail_count == 0 {
@@ -348,6 +367,8 @@ mod tests {
             progress: ProgressLog::new(),
             threads: 1,
             step_id: String::new(),
+            governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
+            display: crate::pipeline::display::ProgressDisplay::new(),
         }
     }
 

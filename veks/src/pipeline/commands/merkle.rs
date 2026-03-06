@@ -17,7 +17,8 @@ use std::time::Instant;
 use sha2::{Digest, Sha256};
 
 use crate::pipeline::command::{
-    CommandOp, CommandResult, OptionDesc, Options, Status, StreamContext,
+    CommandDoc, CommandOp, CommandResult, OptionDesc, Options, ResourceDesc, Status, StreamContext,
+    render_options_table,
 };
 
 const DEFAULT_CHUNK_SIZE: usize = 1 << 20; // 1 MiB
@@ -200,6 +201,29 @@ impl CommandOp for MerkleCreateOp {
         "merkle create"
     }
 
+    fn command_doc(&self) -> CommandDoc {
+        let options = self.describe_options();
+        CommandDoc {
+            summary: "Create a Merkle hash tree for a file".into(),
+            body: format!(
+                "# merkle create\n\n\
+                 Create a Merkle hash tree for a file.\n\n\
+                 ## Description\n\n\
+                 Creates a SHA-256 Merkle tree over file chunks and stores it as an \
+                 `.mref` file. Chunk size is configurable (default 1 MiB, must be \
+                 power of 2).\n\n\
+                 ## Options\n\n{}",
+                render_options_table(&options)
+            ),
+        }
+    }
+
+    fn describe_resources(&self) -> Vec<ResourceDesc> {
+        vec![
+            ResourceDesc { name: "readahead".into(), description: "Sequential read prefetch for hashing".into(), adjustable: false },
+        ]
+    }
+
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
         let start = Instant::now();
 
@@ -261,13 +285,13 @@ impl CommandOp for MerkleCreateOp {
 
         let tree = MerkleTree::from_data(&data, chunk_size);
 
-        eprintln!(
+        ctx.display.log(&format!(
             "Merkle create: {} ({} bytes, {} chunks, root={})",
             source_path.display(),
             data.len(),
             tree.leaf_count,
             hex::encode(tree.root_hash())
-        );
+        ));
 
         // Write mref
         let mref_bytes = tree.to_bytes();
@@ -332,6 +356,28 @@ impl CommandOp for MerkleVerifyOp {
         "merkle verify"
     }
 
+    fn command_doc(&self) -> CommandDoc {
+        let options = self.describe_options();
+        CommandDoc {
+            summary: "Verify file integrity against a Merkle tree".into(),
+            body: format!(
+                "# merkle verify\n\n\
+                 Verify file integrity against a Merkle tree.\n\n\
+                 ## Description\n\n\
+                 Rebuilds the Merkle tree from the file data and compares it against \
+                 the stored `.mref` reference to detect corruption.\n\n\
+                 ## Options\n\n{}",
+                render_options_table(&options)
+            ),
+        }
+    }
+
+    fn describe_resources(&self) -> Vec<ResourceDesc> {
+        vec![
+            ResourceDesc { name: "readahead".into(), description: "Sequential read prefetch for verification".into(), adjustable: false },
+        ]
+    }
+
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
         let start = Instant::now();
 
@@ -379,11 +425,11 @@ impl CommandOp for MerkleVerifyOp {
 
         // Compare
         if ref_tree == current_tree {
-            eprintln!(
+            ctx.display.log(&format!(
                 "Merkle verify: {} OK ({} chunks)",
                 source_path.display(),
                 current_tree.leaf_count
-            );
+            ));
             CommandResult {
                 status: Status::Ok,
                 message: format!(
@@ -416,13 +462,13 @@ impl CommandOp for MerkleVerifyOp {
                 String::new()
             };
 
-            eprintln!(
+            ctx.display.log(&format!(
                 "Merkle verify: {} FAILED ({} mismatched chunks)",
                 source_path.display(),
                 mismatches.len()
-            );
+            ));
             for d in &mismatch_detail {
-                eprintln!("  {}", d);
+                ctx.display.log(&format!("  {}", d));
             }
 
             CommandResult {
@@ -464,6 +510,28 @@ impl CommandOp for MerkleDiffOp {
         "merkle diff"
     }
 
+    fn command_doc(&self) -> CommandDoc {
+        let options = self.describe_options();
+        CommandDoc {
+            summary: "Diff two Merkle trees to find changed chunks".into(),
+            body: format!(
+                "# merkle diff\n\n\
+                 Diff two Merkle trees to find changed chunks.\n\n\
+                 ## Description\n\n\
+                 Compares two `.mref` files and reports which chunks differ between \
+                 them, useful for incremental synchronization.\n\n\
+                 ## Options\n\n{}",
+                render_options_table(&options)
+            ),
+        }
+    }
+
+    fn describe_resources(&self) -> Vec<ResourceDesc> {
+        vec![
+            ResourceDesc { name: "readahead".into(), description: "Read prefetch for file comparison".into(), adjustable: false },
+        ]
+    }
+
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
         let start = Instant::now();
 
@@ -488,37 +556,37 @@ impl CommandOp for MerkleDiffOp {
             Err(e) => return error_result(e, start),
         };
 
-        eprintln!("MERKLE REFERENCE DIFF SUMMARY");
-        eprintln!("============================");
-        eprintln!("File 1: {}", path1.display());
-        eprintln!("File 2: {}", path2.display());
-        eprintln!();
+        ctx.display.log("MERKLE REFERENCE DIFF SUMMARY");
+        ctx.display.log("============================");
+        ctx.display.log(&format!("File 1: {}", path1.display()));
+        ctx.display.log(&format!("File 2: {}", path2.display()));
+        ctx.display.log("");
 
         // Compare metadata
         let chunk_match = tree1.chunk_size == tree2.chunk_size;
         let size_match = tree1.file_size == tree2.file_size;
         let leaf_match = tree1.leaf_count == tree2.leaf_count;
 
-        eprintln!("Basic Information Comparison:");
-        eprintln!(
+        ctx.display.log("Basic Information Comparison:");
+        ctx.display.log(&format!(
             "  Chunk Size: {} vs {} ({})",
             tree1.chunk_size,
             tree2.chunk_size,
             if chunk_match { "MATCH" } else { "MISMATCH" }
-        );
-        eprintln!(
+        ));
+        ctx.display.log(&format!(
             "  Total Size: {} vs {} ({})",
             tree1.file_size,
             tree2.file_size,
             if size_match { "MATCH" } else { "MISMATCH" }
-        );
-        eprintln!(
+        ));
+        ctx.display.log(&format!(
             "  Leaf Count: {} vs {} ({})",
             tree1.leaf_count,
             tree2.leaf_count,
             if leaf_match { "MATCH" } else { "MISMATCH" }
-        );
-        eprintln!();
+        ));
+        ctx.display.log("");
 
         if !chunk_match {
             return CommandResult {
@@ -532,7 +600,7 @@ impl CommandOp for MerkleDiffOp {
         let mismatches = tree1.find_mismatches(&tree2);
 
         if mismatches.is_empty() {
-            eprintln!("No differences found — files are identical.");
+            ctx.display.log("No differences found — files are identical.");
             CommandResult {
                 status: Status::Ok,
                 message: "merkle diff: no differences".to_string(),
@@ -544,29 +612,29 @@ impl CommandOp for MerkleDiffOp {
                 / tree1.leaf_count.max(tree2.leaf_count) as f64)
                 * 100.0;
 
-            eprintln!("Leaf Node Differences:");
-            eprintln!("  Total Mismatched Chunks: {}", mismatches.len());
-            eprintln!("  Percentage: {:.2}%", pct);
+            ctx.display.log("Leaf Node Differences:");
+            ctx.display.log(&format!("  Total Mismatched Chunks: {}", mismatches.len()));
+            ctx.display.log(&format!("  Percentage: {:.2}%", pct));
 
             let show = mismatches.len().min(10);
             if show > 0 {
-                eprintln!("  First {} mismatches:", show);
+                ctx.display.log(&format!("  First {} mismatches:", show));
                 for &chunk_idx in mismatches.iter().take(show) {
                     let offset = chunk_idx * tree1.chunk_size;
                     let length = tree1.chunk_size;
-                    eprintln!("    Chunk {}: offset {}, length {}", chunk_idx, offset, length);
+                    ctx.display.log(&format!("    Chunk {}: offset {}, length {}", chunk_idx, offset, length));
                 }
                 if mismatches.len() > show {
-                    eprintln!("    ... and {} more", mismatches.len() - show);
+                    ctx.display.log(&format!("    ... and {} more", mismatches.len() - show));
                 }
             }
 
             // Braille visualization
             let max_leaves = tree1.leaf_count.max(tree2.leaf_count);
             let braille = render_braille_bitset(&mismatches, max_leaves);
-            eprintln!();
-            eprintln!("  Mismatch Map (braille):");
-            eprintln!("  {}", braille);
+            ctx.display.log("");
+            ctx.display.log("  Mismatch Map (braille):");
+            ctx.display.log(&format!("  {}", braille));
 
             CommandResult {
                 status: Status::Warning,
@@ -615,6 +683,22 @@ impl CommandOp for MerkleSummaryOp {
         "merkle summary"
     }
 
+    fn command_doc(&self) -> CommandDoc {
+        let options = self.describe_options();
+        CommandDoc {
+            summary: "Print Merkle tree summary statistics".into(),
+            body: format!(
+                "# merkle summary\n\n\
+                 Print Merkle tree summary statistics.\n\n\
+                 ## Description\n\n\
+                 Loads an `.mref` file and displays summary statistics including \
+                 file size, chunk size, leaf count, tree depth, and root hash.\n\n\
+                 ## Options\n\n{}",
+                render_options_table(&options)
+            ),
+        }
+    }
+
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
         let start = Instant::now();
 
@@ -638,29 +722,29 @@ impl CommandOp for MerkleSummaryOp {
         let internal_count = padded_leaves - 1;
         let total_nodes = internal_count + padded_leaves;
 
-        eprintln!("MERKLE REFERENCE FILE SUMMARY");
-        eprintln!("============================");
-        eprintln!("File: {}", mref_path.display());
-        eprintln!("File Size: {} bytes", mref_size);
-        eprintln!("Content File Size: {} bytes", tree.file_size);
-        eprintln!("Chunk Size: {} bytes", tree.chunk_size);
-        eprintln!("Number of Chunks: {}", tree.leaf_count);
-        eprintln!();
-        eprintln!("Tree Shape:");
-        eprintln!("  Leaf Nodes: {}", tree.leaf_count);
-        eprintln!("  Padded Leaves: {}", padded_leaves);
-        eprintln!("  Internal Nodes: {}", internal_count);
-        eprintln!("  Total Nodes: {}", total_nodes);
-        eprintln!("  Tree Depth: {}", (padded_leaves as f64).log2().ceil() as usize + 1);
-        eprintln!();
-        eprintln!("Root Hash: {}", hex::encode(tree.root_hash()));
+        ctx.display.log("MERKLE REFERENCE FILE SUMMARY");
+        ctx.display.log("============================");
+        ctx.display.log(&format!("File: {}", mref_path.display()));
+        ctx.display.log(&format!("File Size: {} bytes", mref_size));
+        ctx.display.log(&format!("Content File Size: {} bytes", tree.file_size));
+        ctx.display.log(&format!("Chunk Size: {} bytes", tree.chunk_size));
+        ctx.display.log(&format!("Number of Chunks: {}", tree.leaf_count));
+        ctx.display.log("");
+        ctx.display.log("Tree Shape:");
+        ctx.display.log(&format!("  Leaf Nodes: {}", tree.leaf_count));
+        ctx.display.log(&format!("  Padded Leaves: {}", padded_leaves));
+        ctx.display.log(&format!("  Internal Nodes: {}", internal_count));
+        ctx.display.log(&format!("  Total Nodes: {}", total_nodes));
+        ctx.display.log(&format!("  Tree Depth: {}", (padded_leaves as f64).log2().ceil() as usize + 1));
+        ctx.display.log("");
+        ctx.display.log(&format!("Root Hash: {}", hex::encode(tree.root_hash())));
 
         let ratio = if tree.file_size > 0 {
             (mref_size as f64 / tree.file_size as f64) * 100.0
         } else {
             0.0
         };
-        eprintln!("Size Ratio: {:.2}% of content file", ratio);
+        ctx.display.log(&format!("Size Ratio: {:.2}% of content file", ratio));
 
         CommandResult {
             status: Status::Ok,
@@ -698,6 +782,22 @@ pub fn treeview_factory() -> Box<dyn CommandOp> {
 impl CommandOp for MerkleTreeviewOp {
     fn command_path(&self) -> &str {
         "merkle treeview"
+    }
+
+    fn command_doc(&self) -> CommandDoc {
+        let options = self.describe_options();
+        CommandDoc {
+            summary: "Display Merkle tree structure visually".into(),
+            body: format!(
+                "# merkle treeview\n\n\
+                 Display Merkle tree structure visually.\n\n\
+                 ## Description\n\n\
+                 Loads an `.mref` file and renders the tree structure with indented \
+                 hash prefixes, showing internal nodes and leaves.\n\n\
+                 ## Options\n\n{}",
+                render_options_table(&options)
+            ),
+        }
     }
 
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
@@ -739,11 +839,11 @@ impl CommandOp for MerkleTreeviewOp {
             );
         }
 
-        eprintln!("Merkle Tree Visualization");
-        eprintln!("------------------------");
-        eprintln!("Base node: {}", base_node);
-        eprintln!("Levels: {}", levels);
-        eprintln!();
+        ctx.display.log("Merkle Tree Visualization");
+        ctx.display.log("------------------------");
+        ctx.display.log(&format!("Base node: {}", base_node));
+        ctx.display.log(&format!("Levels: {}", levels));
+        ctx.display.log("");
 
         render_tree_node(
             &tree.hashes,
@@ -904,6 +1004,22 @@ impl CommandOp for MerklePathOp {
         "merkle path"
     }
 
+    fn command_doc(&self) -> CommandDoc {
+        let options = self.describe_options();
+        CommandDoc {
+            summary: "Show the hash path for a specific chunk".into(),
+            body: format!(
+                "# merkle path\n\n\
+                 Show the hash path for a specific chunk.\n\n\
+                 ## Description\n\n\
+                 Displays the authentication path from a specific leaf chunk up to \
+                 the root of the Merkle tree, showing sibling hashes at each level.\n\n\
+                 ## Options\n\n{}",
+                render_options_table(&options)
+            ),
+        }
+    }
+
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
         let start = Instant::now();
 
@@ -956,9 +1072,9 @@ impl CommandOp for MerklePathOp {
             level += 1;
         }
 
-        eprintln!("Authentication path for chunk {} to root:", chunk_index);
+        ctx.display.log(&format!("Authentication path for chunk {} to root:", chunk_index));
         for (label, hash) in &path_hashes {
-            eprintln!("  {:>10}: {}", label, hex::encode(hash));
+            ctx.display.log(&format!("  {:>10}: {}", label, hex::encode(hash)));
         }
 
         CommandResult {
@@ -1098,6 +1214,22 @@ impl CommandOp for MerkleSpoilbitsOp {
         "merkle spoilbits"
     }
 
+    fn command_doc(&self) -> CommandDoc {
+        let options = self.describe_options();
+        CommandDoc {
+            summary: "Report bit-level differences between trees".into(),
+            body: format!(
+                "# merkle spoilbits\n\n\
+                 Report bit-level differences between trees.\n\n\
+                 ## Description\n\n\
+                 Deliberately corrupts random bits in a file and rebuilds the Merkle \
+                 tree to verify that corruption is detected at the correct granularity.\n\n\
+                 ## Options\n\n{}",
+                render_options_table(&options)
+            ),
+        }
+    }
+
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
         let start = Instant::now();
 
@@ -1140,11 +1272,11 @@ impl CommandOp for MerkleSpoilbitsOp {
         selected.sort();
 
         if dryrun {
-            eprintln!("Dry run: would spoil {} of {} leaf nodes ({:.1}%)", spoil_count, leaf_count, percentage);
+            ctx.display.log(&format!("Dry run: would spoil {} of {} leaf nodes ({:.1}%)", spoil_count, leaf_count, percentage));
             for &idx in &selected {
                 let abs_idx = internal_count + idx;
                 let hash = &tree.hashes[abs_idx];
-                eprintln!("  leaf {} (node {}): {}", idx, abs_idx, format_hash(hash, 8));
+                ctx.display.log(&format!("  leaf {} (node {}): {}", idx, abs_idx, format_hash(hash, 8)));
             }
             return CommandResult {
                 status: Status::Ok,
@@ -1168,7 +1300,7 @@ impl CommandOp for MerkleSpoilbitsOp {
             return error_result(e, start);
         }
 
-        eprintln!("Spoiled {} of {} leaf nodes in {}", spoil_count, leaf_count, mref_path.display());
+        ctx.display.log(&format!("Spoiled {} of {} leaf nodes in {}", spoil_count, leaf_count, mref_path.display()));
 
         CommandResult {
             status: Status::Ok,
@@ -1224,6 +1356,23 @@ pub fn spoilchunks_factory() -> Box<dyn CommandOp> {
 impl CommandOp for MerkleSpoilchunksOp {
     fn command_path(&self) -> &str {
         "merkle spoilchunks"
+    }
+
+    fn command_doc(&self) -> CommandDoc {
+        let options = self.describe_options();
+        CommandDoc {
+            summary: "Report chunk-level differences between trees".into(),
+            body: format!(
+                "# merkle spoilchunks\n\n\
+                 Report chunk-level differences between trees.\n\n\
+                 ## Description\n\n\
+                 Deliberately corrupts random chunks in a file and rebuilds the Merkle \
+                 tree to verify that corruption is detected and localized to the \
+                 correct chunks.\n\n\
+                 ## Options\n\n{}",
+                render_options_table(&options)
+            ),
+        }
     }
 
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
@@ -1284,10 +1433,10 @@ impl CommandOp for MerkleSpoilchunksOp {
         selected.sort();
 
         if dryrun {
-            eprintln!("Dry run: would spoil {} chunks ({} bytes each) in {}", spoil_count, bytes_to_corrupt, source_path.display());
+            ctx.display.log(&format!("Dry run: would spoil {} chunks ({} bytes each) in {}", spoil_count, bytes_to_corrupt, source_path.display()));
             for &idx in &selected {
                 let offset = idx * chunk_size;
-                eprintln!("  chunk {}: offset {} ({} bytes to corrupt)", idx, offset, bytes_to_corrupt);
+                ctx.display.log(&format!("  chunk {}: offset {} ({} bytes to corrupt)", idx, offset, bytes_to_corrupt));
             }
             return CommandResult {
                 status: Status::Ok,
@@ -1328,10 +1477,10 @@ impl CommandOp for MerkleSpoilchunksOp {
             return error_result(e, start);
         }
 
-        eprintln!(
+        ctx.display.log(&format!(
             "Corrupted {} chunks ({} bytes each) in {}",
             spoil_count, bytes_to_corrupt, source_path.display()
-        );
+        ));
 
         CommandResult {
             status: Status::Ok,
@@ -1439,6 +1588,8 @@ mod tests {
             progress: ProgressLog::new(),
             threads: 1,
             step_id: String::new(),
+            governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
+            display: crate::pipeline::display::ProgressDisplay::new(),
         }
     }
 

@@ -201,7 +201,7 @@ struct NpyScanResult {
 
 /// Scan a directory of npy files: collect sorted paths, validate headers,
 /// and compute total row count. Only reads headers (a few hundred bytes each).
-fn scan_npy_headers(path: &Path) -> Result<NpyScanResult, String> {
+fn scan_npy_headers(path: &Path, max_count: Option<u64>) -> Result<NpyScanResult, String> {
     let files: Vec<_> = if path.is_dir() {
         let mut entries: Vec<_> = fs::read_dir(path)
             .map_err(|e| format!("Failed to read directory: {}", e))?
@@ -228,26 +228,45 @@ fn scan_npy_headers(path: &Path) -> Result<NpyScanResult, String> {
     let dimension = first_header.cols as u32;
     let mut total_rows = first_header.rows as u64;
 
-    for f in &files[1..] {
-        let header = read_npy_header(f)?;
-        if header.dtype != dtype {
-            return Err(format!(
-                "Dtype mismatch in {}: expected {:?}, got {:?}",
-                f.display(),
-                dtype,
-                header.dtype
-            ));
+    // When max_count is set, only scan enough shards to cover the limit
+    let mut scanned_files = 1usize; // first file already scanned
+    let have_enough = max_count.map_or(false, |mc| total_rows >= mc);
+
+    if !have_enough {
+        for f in &files[1..] {
+            let header = read_npy_header(f)?;
+            if header.dtype != dtype {
+                return Err(format!(
+                    "Dtype mismatch in {}: expected {:?}, got {:?}",
+                    f.display(),
+                    dtype,
+                    header.dtype
+                ));
+            }
+            if header.cols as u32 != dimension {
+                return Err(format!(
+                    "Dimension mismatch in {}: expected {}, got {}",
+                    f.display(),
+                    dimension,
+                    header.cols
+                ));
+            }
+            total_rows += header.rows as u64;
+            scanned_files += 1;
+            if let Some(mc) = max_count {
+                if total_rows >= mc {
+                    break;
+                }
+            }
         }
-        if header.cols as u32 != dimension {
-            return Err(format!(
-                "Dimension mismatch in {}: expected {}, got {}",
-                f.display(),
-                dimension,
-                header.cols
-            ));
-        }
-        total_rows += header.rows as u64;
     }
+
+    // Only include the files we actually need
+    let files = if scanned_files < files.len() {
+        files[..scanned_files].to_vec()
+    } else {
+        files
+    };
 
     Ok(NpyScanResult { files, dtype, dimension, total_rows })
 }
@@ -290,7 +309,7 @@ impl NpyDirReader {
     /// Only reads file headers — no data is loaded, no background threads
     /// are spawned. Used for fail-fast validation in the import probe phase.
     pub fn probe(path: &Path) -> Result<super::SourceMeta, String> {
-        let scan = scan_npy_headers(path)?;
+        let scan = scan_npy_headers(path, None)?;
         eprintln!(
             "    {} npy file(s), dtype {:?}, {} bytes/element, dimension {}",
             scan.files.len(),
@@ -312,9 +331,9 @@ impl NpyDirReader {
     /// adaptive backpressure. Results are reassembled in file-sorted order.
     ///
     /// `threads` controls the number of loader threads. Pass `0` to
-    /// auto-detect: the lesser of 3/4 of hardware threads or 32.
-    pub fn open(path: &Path, threads: usize) -> Result<Box<dyn VecSource>, String> {
-        let scan = scan_npy_headers(path)?;
+    /// auto-detect: hardware thread count, capped at 64.
+    pub fn open(path: &Path, threads: usize, max_count: Option<u64>) -> Result<Box<dyn VecSource>, String> {
+        let scan = scan_npy_headers(path, max_count)?;
 
         eprintln!(
             "    {} npy file(s), dtype {:?}, {} bytes/element, dimension {}",
@@ -331,7 +350,7 @@ impl NpyDirReader {
             let hw = std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(4);
-            (hw * 3 / 4).max(1).min(32)
+            hw.max(1).min(64)
         };
         let num_workers = if threads == 0 { default_threads } else { threads }
             .min(total_files);

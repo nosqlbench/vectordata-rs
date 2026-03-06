@@ -15,7 +15,8 @@ use vectordata::VectorReader;
 use vectordata::io::MmapVectorReader;
 
 use crate::pipeline::command::{
-    CommandOp, CommandResult, OptionDesc, Options, Status, StreamContext,
+    CommandDoc, CommandOp, CommandResult, OptionDesc, Options, ResourceDesc, Status, StreamContext,
+    render_options_table,
 };
 
 /// Pipeline command: compute vector statistics.
@@ -135,6 +136,24 @@ impl CommandOp for AnalyzeStatsOp {
         "analyze stats"
     }
 
+    fn command_doc(&self) -> CommandDoc {
+        let options = self.describe_options();
+        CommandDoc {
+            summary: "Compute per-dimension statistics for vector files".into(),
+            body: format!(
+                "# analyze stats\n\nCompute per-dimension statistics for vector files.\n\n## Description\n\nComputes per-dimension statistics (min, max, mean, std_dev, skewness, kurtosis) and optional percentiles for fvec files. Can analyze a single dimension with detailed percentile breakdown, all dimensions in a summary table, or global statistics across all dimensions.\n\n## Options\n\n{}",
+                render_options_table(&options)
+            ),
+        }
+    }
+
+    fn describe_resources(&self) -> Vec<ResourceDesc> {
+        vec![
+            ResourceDesc { name: "mem".into(), description: "Vector data buffers".into(), adjustable: false },
+            ResourceDesc { name: "readahead".into(), description: "Sequential read prefetch".into(), adjustable: false },
+        ]
+    }
+
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
         let start = Instant::now();
 
@@ -200,33 +219,33 @@ impl CommandOp for AnalyzeStatsOp {
                 .filter(|&&v| v < lower_fence || v > upper_fence)
                 .count();
 
-            eprintln!("Dimension {} statistics ({} vectors):", d, stats.count);
-            eprintln!("  Mean:     {:.6}", stats.mean);
-            eprintln!("  Variance: {:.6}", stats.variance);
-            eprintln!("  StdDev:   {:.6}", stats.std_dev);
-            eprintln!("  Min:      {:.6}", stats.min);
-            eprintln!("  Max:      {:.6}", stats.max);
-            eprintln!("  Skewness: {:.4} ({})", stats.skewness, skewness_label(stats.skewness));
-            eprintln!("  Kurtosis: {:.4} ({})", stats.kurtosis, kurtosis_label(stats.kurtosis));
-            eprintln!("  Percentiles:");
-            eprintln!(
+            ctx.display.log(&format!("Dimension {} statistics ({} vectors):", d, stats.count));
+            ctx.display.log(&format!("  Mean:     {:.6}", stats.mean));
+            ctx.display.log(&format!("  Variance: {:.6}", stats.variance));
+            ctx.display.log(&format!("  StdDev:   {:.6}", stats.std_dev));
+            ctx.display.log(&format!("  Min:      {:.6}", stats.min));
+            ctx.display.log(&format!("  Max:      {:.6}", stats.max));
+            ctx.display.log(&format!("  Skewness: {:.4} ({})", stats.skewness, skewness_label(stats.skewness)));
+            ctx.display.log(&format!("  Kurtosis: {:.4} ({})", stats.kurtosis, kurtosis_label(stats.kurtosis)));
+            ctx.display.log("  Percentiles:");
+            ctx.display.log(&format!(
                 "    p1={:.4}  p5={:.4}  p25={:.4}  p50={:.4}  p75={:.4}  p95={:.4}  p99={:.4}",
                 p1, p5, p25, p50, p75, p95, p99
-            );
-            eprintln!(
+            ));
+            ctx.display.log(&format!(
                 "  Outliers: {} ({:.1}%), fences: [{:.4}, {:.4}]",
                 outliers,
                 outliers as f64 / effective_count as f64 * 100.0,
                 lower_fence,
                 upper_fence
-            );
+            ));
         } else if all_dimensions {
             // Summary table for all dimensions
-            eprintln!(
+            ctx.display.log(&format!(
                 "{:>5} {:>12} {:>12} {:>12} {:>12} {:>10} {:>10}",
                 "Dim", "Mean", "StdDev", "Min", "Max", "Skewness", "Kurtosis"
-            );
-            eprintln!("{}", "-".repeat(83));
+            ));
+            ctx.display.log(&format!("{}", "-".repeat(83)));
 
             for d in 0..dim {
                 let mut values: Vec<f32> = Vec::with_capacity(effective_count);
@@ -235,10 +254,10 @@ impl CommandOp for AnalyzeStatsOp {
                     values.push(vec[d]);
                 }
                 let stats = DimensionStats::compute(&values);
-                eprintln!(
+                ctx.display.log(&format!(
                     "{:5} {:12.6} {:12.6} {:12.6} {:12.6} {:10.4} {:10.4}",
                     d, stats.mean, stats.std_dev, stats.min, stats.max, stats.skewness, stats.kurtosis
-                );
+                ));
             }
         } else {
             // Global stats across all dimensions
@@ -249,16 +268,16 @@ impl CommandOp for AnalyzeStatsOp {
             }
             let stats = DimensionStats::compute(&all_values);
 
-            eprintln!(
+            ctx.display.log(&format!(
                 "Global statistics ({} vectors, {} dims, {} values):",
                 effective_count, dim, all_values.len()
-            );
-            eprintln!("  Mean:     {:.6}", stats.mean);
-            eprintln!("  StdDev:   {:.6}", stats.std_dev);
-            eprintln!("  Min:      {:.6}", stats.min);
-            eprintln!("  Max:      {:.6}", stats.max);
-            eprintln!("  Skewness: {:.4}", stats.skewness);
-            eprintln!("  Kurtosis: {:.4}", stats.kurtosis);
+            ));
+            ctx.display.log(&format!("  Mean:     {:.6}", stats.mean));
+            ctx.display.log(&format!("  StdDev:   {:.6}", stats.std_dev));
+            ctx.display.log(&format!("  Min:      {:.6}", stats.min));
+            ctx.display.log(&format!("  Max:      {:.6}", stats.max));
+            ctx.display.log(&format!("  Skewness: {:.4}", stats.skewness));
+            ctx.display.log(&format!("  Kurtosis: {:.4}", stats.kurtosis));
         }
 
         CommandResult {
@@ -364,6 +383,8 @@ mod tests {
             progress: ProgressLog::new(),
             threads: 1,
             step_id: String::new(),
+            governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
+            display: crate::pipeline::display::ProgressDisplay::new(),
         }
     }
 

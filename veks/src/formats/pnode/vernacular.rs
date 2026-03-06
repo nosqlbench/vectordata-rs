@@ -7,7 +7,7 @@
 //! These adapters convert predicate trees into native query language syntax for
 //! troubleshooting, visualization, and schema documentation.
 
-use super::{ConjugateType, FieldRef, OpType, PNode};
+use super::{Comparand, ConjugateType, FieldRef, OpType, PNode};
 
 // -- SQL vernacular -----------------------------------------------------------
 
@@ -16,28 +16,43 @@ pub fn to_sql(node: &PNode) -> String {
     sql_expr(node)
 }
 
+/// Format a comparand for SQL output.
+fn sql_comparand(c: &Comparand) -> String {
+    match c {
+        Comparand::Int(v) => v.to_string(),
+        Comparand::Float(v) => {
+            let s = v.to_string();
+            if s.contains('.') { s } else { format!("{}.0", s) }
+        }
+        Comparand::Text(s) => format!("'{}'", s.replace('\'', "''")),
+        Comparand::Bool(b) => if *b { "TRUE".into() } else { "FALSE".into() },
+        Comparand::Bytes(b) => format!("X'{}'", b.iter().map(|x| format!("{:02x}", x)).collect::<String>()),
+        Comparand::Null => "NULL".into(),
+    }
+}
+
 fn sql_expr(node: &PNode) -> String {
     match node {
         PNode::Predicate(pred) => {
             let field = sql_field(&pred.field);
             match pred.op {
                 OpType::In => {
-                    let vals: Vec<String> = pred.comparands.iter().map(|v| v.to_string()).collect();
+                    let vals: Vec<String> = pred.comparands.iter().map(sql_comparand).collect();
                     format!("{} IN ({})", field, vals.join(", "))
                 }
                 OpType::Matches => {
                     if let Some(v) = pred.comparands.first() {
-                        format!("{} ~ '{}'", field, v)
+                        format!("{} ~ {}", field, sql_comparand(v))
                     } else {
                         format!("{} ~ ''", field)
                     }
                 }
                 _ => {
                     if pred.comparands.len() == 1 {
-                        format!("{} {} {}", field, pred.op.symbol(), pred.comparands[0])
+                        format!("{} {} {}", field, pred.op.symbol(), sql_comparand(&pred.comparands[0]))
                     } else {
                         let vals: Vec<String> =
-                            pred.comparands.iter().map(|v| v.to_string()).collect();
+                            pred.comparands.iter().map(sql_comparand).collect();
                         format!("{} {} ({})", field, pred.op.symbol(), vals.join(", "))
                     }
                 }
@@ -73,40 +88,56 @@ pub fn to_cql(node: &PNode) -> String {
     cql_expr(node)
 }
 
+/// Format a comparand for CQL output.
+fn cql_comparand(c: &Comparand) -> String {
+    match c {
+        Comparand::Int(v) => v.to_string(),
+        Comparand::Float(v) => {
+            let s = v.to_string();
+            if s.contains('.') { s } else { format!("{}.0", s) }
+        }
+        Comparand::Text(s) => format!("'{}'", s.replace('\'', "''")),
+        Comparand::Bool(b) => if *b { "true".into() } else { "false".into() },
+        Comparand::Bytes(b) => format!("0x{}", b.iter().map(|x| format!("{:02x}", x)).collect::<String>()),
+        Comparand::Null => "null".into(),
+    }
+}
+
 fn cql_expr(node: &PNode) -> String {
     match node {
         PNode::Predicate(pred) => {
             let field = cql_field(&pred.field);
             match pred.op {
                 OpType::In => {
-                    let vals: Vec<String> = pred.comparands.iter().map(|v| v.to_string()).collect();
+                    let vals: Vec<String> = pred.comparands.iter().map(cql_comparand).collect();
                     format!("{} IN ({})", field, vals.join(", "))
                 }
                 OpType::Ne => {
                     // CQL doesn't have != directly; use < and > with OR
                     if pred.comparands.len() == 1 {
+                        let v = cql_comparand(&pred.comparands[0]);
                         format!(
                             "({} < {} OR {} > {})",
-                            field, pred.comparands[0], field, pred.comparands[0]
+                            field, v, field, v
                         )
                     } else {
-                        format!("{} != {}", field, pred.comparands[0])
+                        format!("{} != {}", field, cql_comparand(&pred.comparands[0]))
                     }
                 }
                 OpType::Matches => {
                     // CQL uses LIKE for pattern matching
                     if let Some(v) = pred.comparands.first() {
-                        format!("{} LIKE '{}'", field, v)
+                        format!("{} LIKE {}", field, cql_comparand(v))
                     } else {
                         format!("{} LIKE ''", field)
                     }
                 }
                 _ => {
                     if pred.comparands.len() == 1 {
-                        format!("{} {} {}", field, pred.op.symbol(), pred.comparands[0])
+                        format!("{} {} {}", field, pred.op.symbol(), cql_comparand(&pred.comparands[0]))
                     } else {
                         let vals: Vec<String> =
-                            pred.comparands.iter().map(|v| v.to_string()).collect();
+                            pred.comparands.iter().map(cql_comparand).collect();
                         format!("{} {} ({})", field, pred.op.symbol(), vals.join(", "))
                     }
                 }
@@ -145,6 +176,21 @@ pub fn to_cddl(node: &PNode) -> String {
     cddl_expr(node)
 }
 
+/// Format a comparand for CDDL output.
+fn cddl_comparand(c: &Comparand) -> String {
+    match c {
+        Comparand::Int(v) => v.to_string(),
+        Comparand::Float(v) => {
+            let s = v.to_string();
+            if s.contains('.') { s } else { format!("{}.0", s) }
+        }
+        Comparand::Text(s) => format!("\"{}\"", s),
+        Comparand::Bool(b) => if *b { "true".into() } else { "false".into() },
+        Comparand::Bytes(b) => format!("h'{}'", b.iter().map(|x| format!("{:02x}", x)).collect::<String>()),
+        Comparand::Null => "null".into(),
+    }
+}
+
 fn cddl_expr(node: &PNode) -> String {
     match node {
         PNode::Predicate(pred) => {
@@ -163,9 +209,9 @@ fn cddl_expr(node: &PNode) -> String {
                 OpType::Matches => "matches",
             };
             if pred.comparands.len() == 1 {
-                format!("{{ field: \"{}\", op: \"{}\", value: {} }}", field, op_name, pred.comparands[0])
+                format!("{{ field: \"{}\", op: \"{}\", value: {} }}", field, op_name, cddl_comparand(&pred.comparands[0]))
             } else {
-                let vals: Vec<String> = pred.comparands.iter().map(|v| v.to_string()).collect();
+                let vals: Vec<String> = pred.comparands.iter().map(cddl_comparand).collect();
                 format!(
                     "{{ field: \"{}\", op: \"{}\", values: [{}] }}",
                     field,
@@ -198,12 +244,12 @@ mod tests {
                 PNode::Predicate(PredicateNode {
                     field: FieldRef::Named("age".into()),
                     op: OpType::Gt,
-                    comparands: vec![18],
+                    comparands: vec![Comparand::Int(18)],
                 }),
                 PNode::Predicate(PredicateNode {
                     field: FieldRef::Named("status".into()),
                     op: OpType::In,
-                    comparands: vec![1, 2, 3],
+                    comparands: vec![Comparand::Int(1), Comparand::Int(2), Comparand::Int(3)],
                 }),
             ],
         })
@@ -231,5 +277,43 @@ mod tests {
         assert!(cddl.contains("and"));
         assert!(cddl.contains("\"age\""));
         assert!(cddl.contains("\"gt\""));
+    }
+
+    #[test]
+    fn test_sql_typed_comparands() {
+        let node = PNode::Predicate(PredicateNode {
+            field: FieldRef::Named("name".into()),
+            op: OpType::Eq,
+            comparands: vec![Comparand::Text("alice".into())],
+        });
+        let sql = to_sql(&node);
+        assert_eq!(sql, "name = 'alice'");
+
+        let node = PNode::Predicate(PredicateNode {
+            field: FieldRef::Named("active".into()),
+            op: OpType::Eq,
+            comparands: vec![Comparand::Bool(true)],
+        });
+        let sql = to_sql(&node);
+        assert_eq!(sql, "active = TRUE");
+    }
+
+    #[test]
+    fn test_cql_typed_comparands() {
+        let node = PNode::Predicate(PredicateNode {
+            field: FieldRef::Named("name".into()),
+            op: OpType::Eq,
+            comparands: vec![Comparand::Text("bob".into())],
+        });
+        let cql = to_cql(&node);
+        assert_eq!(cql, "name = 'bob'");
+
+        let node = PNode::Predicate(PredicateNode {
+            field: FieldRef::Named("active".into()),
+            op: OpType::Eq,
+            comparands: vec![Comparand::Bool(false)],
+        });
+        let cql = to_cql(&node);
+        assert_eq!(cql, "active = false");
     }
 }
