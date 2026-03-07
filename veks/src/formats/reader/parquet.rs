@@ -272,7 +272,7 @@ impl ParquetDirReader {
             .min(total_files);
 
         let initial_in_flight = MAX_IN_FLIGHT.min(total_files);
-        eprintln!(
+        log::info!(
             "parquet: {} file(s), {} total rows, dim {}, {} loader thread(s), {} max in-flight",
             total_files, total_rows, dimension, num_workers, initial_in_flight
         );
@@ -329,7 +329,7 @@ impl ParquetDirReader {
                             }
                         }
                         Err(e) => {
-                            eprintln!("Warning: failed to load {}: {}", path.display(), e);
+                            log::info!("Warning: failed to load {}: {}", path.display(), e);
                             let mut in_flight = gate.in_flight.lock().unwrap();
                             *in_flight -= 1;
                             gate.can_send.notify_one();
@@ -405,7 +405,7 @@ impl ParquetDirReader {
                 if old < MAX_PREFETCH {
                     self.gate.allowed.store(old + 1, Ordering::Relaxed);
                     self.gate.can_send.notify_all();
-                    eprintln!(
+                    log::info!(
                         "parquet: prefetch short — increased depth to {}",
                         old + 1
                     );

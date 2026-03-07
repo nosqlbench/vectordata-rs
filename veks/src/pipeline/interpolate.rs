@@ -4,9 +4,15 @@
 //! Variable interpolation engine for command stream pipelines.
 //!
 //! Supports the following substitution patterns:
-//! - `${name}` — lookup in defaults map
+//! - `${name}` — lookup in defaults map (includes variables.yaml)
 //! - `${name:-fallback}` — default value if not found
 //! - `${env:VAR}` — environment variable
+//! - `${variables:name}` — explicitly from variables.yaml only (short form)
+//! - `${variables.yaml:name}` — explicitly from variables.yaml only (long form)
+//!
+//! The qualified `variables:` / `variables.yaml:` prefixes are unambiguous even
+//! on the command line — shells will not expand `${variables:foo}` or
+//! `${variables.yaml:foo}` because they are not valid shell variable names.
 //!
 //! Implicit variables available in every context:
 //! - `${dataset_dir}` — directory containing the dataset.yaml
@@ -81,6 +87,25 @@ fn resolve_var(
             Err(_) => match fallback {
                 Some(fb) => Ok(fb.to_string()),
                 None => Err(format!("environment variable '{}' not set", env_var)),
+            },
+        };
+    }
+
+    // Check for variables: or variables.yaml: prefix — resolve exclusively
+    // from variables.yaml, bypassing defaults and implicit variables.
+    let var_name = name.strip_prefix("variables.yaml:")
+        .or_else(|| name.strip_prefix("variables:"));
+    if let Some(var_name) = var_name {
+        let vars = super::variables::load(workspace)
+            .map_err(|e| format!("failed to load variables.yaml: {}", e))?;
+        return match vars.get(var_name) {
+            Some(val) => Ok(val.clone()),
+            None => match fallback {
+                Some(fb) => Ok(fb.to_string()),
+                None => Err(format!(
+                    "variable '{}' not found in variables.yaml",
+                    var_name,
+                )),
             },
         };
     }
@@ -233,6 +258,55 @@ mod tests {
     fn test_empty_string() {
         let result = interpolate("", &defaults(), Path::new("/data")).unwrap();
         assert_eq!(result, "");
+    }
+
+    #[test]
+    fn test_variables_yaml_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        super::super::variables::set_and_save(tmp.path(), "vector_count", "407314954").unwrap();
+
+        let result = interpolate(
+            "${variables.yaml:vector_count}",
+            &defaults(),
+            tmp.path(),
+        ).unwrap();
+        assert_eq!(result, "407314954");
+    }
+
+    #[test]
+    fn test_variables_short_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        super::super::variables::set_and_save(tmp.path(), "dim", "512").unwrap();
+
+        let result = interpolate(
+            "${variables:dim}",
+            &defaults(),
+            tmp.path(),
+        ).unwrap();
+        assert_eq!(result, "512");
+    }
+
+    #[test]
+    fn test_variables_prefix_not_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let result = interpolate(
+            "${variables:nonexistent}",
+            &defaults(),
+            tmp.path(),
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("not found in variables.yaml"));
+    }
+
+    #[test]
+    fn test_variables_prefix_with_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let result = interpolate(
+            "${variables:missing:-default_val}",
+            &defaults(),
+            tmp.path(),
+        ).unwrap();
+        assert_eq!(result, "default_val");
     }
 
     #[test]

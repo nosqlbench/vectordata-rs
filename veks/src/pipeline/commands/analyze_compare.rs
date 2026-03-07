@@ -226,19 +226,19 @@ impl CommandOp for AnalyzeCompareOp {
         }
 
         // Print results table
-        ctx.display.log(&format!(
+        ctx.ui.log(&format!(
             "\nK-S Distribution Comparison (alpha={}, samples: orig={}, synth={})",
             alpha, orig_sample, synth_sample
         ));
-        ctx.display.log(&format!("{:>8}  {:>10}  {:>10}  {:>6}", "Dim", "D-stat", "P-value", "Result"));
-        ctx.display.log(&format!("{}", "-".repeat(42)));
+        ctx.ui.log(&format!("{:>8}  {:>10}  {:>10}  {:>6}", "Dim", "D-stat", "P-value", "Result"));
+        ctx.ui.log(&format!("{}", "-".repeat(42)));
 
         let show_count = if verbose { results.len() } else { 10.min(results.len()) };
         let mut shown = 0;
 
         for r in &results {
             if verbose || shown < 10 || !r.passed {
-                ctx.display.log(&format!(
+                ctx.ui.log(&format!(
                     "{:>8}  {:>10.6}  {:>10.6}  {:>6}",
                     r.dimension,
                     r.d_statistic,
@@ -250,14 +250,14 @@ impl CommandOp for AnalyzeCompareOp {
         }
 
         if !verbose && results.len() > show_count {
-            ctx.display.log(&format!("  ... {} more dimensions (use verbose=true to see all)", results.len() - shown));
+            ctx.ui.log(&format!("  ... {} more dimensions (use verbose=true to see all)", results.len() - shown));
         }
 
-        ctx.display.log("");
+        ctx.ui.log("");
         if fail_count == 0 {
-            ctx.display.log(&format!("DISTRIBUTIONS MATCH ({}/{} dimensions passed)", dims.len(), dims.len()));
+            ctx.ui.log(&format!("DISTRIBUTIONS MATCH ({}/{} dimensions passed)", dims.len(), dims.len()));
         } else {
-            ctx.display.log(&format!(
+            ctx.ui.log(&format!(
                 "DISTRIBUTIONS DIFFER ({}/{} dimensions failed)",
                 fail_count,
                 dims.len()
@@ -359,6 +359,9 @@ mod tests {
 
     fn test_ctx(dir: &Path) -> StreamContext {
         StreamContext {
+            dataset_name: String::new(),
+            profile: String::new(),
+            profile_names: vec![],
             workspace: dir.to_path_buf(),
             scratch: dir.join(".scratch"),
             cache: dir.join(".cache"),
@@ -368,7 +371,7 @@ mod tests {
             threads: 1,
             step_id: String::new(),
             governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
-            display: crate::pipeline::display::ProgressDisplay::new(),
+            ui: crate::ui::UiHandle::new(std::sync::Arc::new(crate::ui::TestSink::new())),
         }
     }
 

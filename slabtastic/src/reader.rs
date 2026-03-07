@@ -58,7 +58,7 @@ use std::path::{Path, PathBuf};
 
 use memmap2::Mmap;
 #[cfg(unix)]
-use memmap2::Advice;
+use memmap2::{Advice, UncheckedAdvice};
 
 use crate::constants::{DEFAULT_NAMESPACE_INDEX, FOOTER_V1_SIZE, HEADER_SIZE, PageType};
 use crate::error::{Result, SlabError};
@@ -988,6 +988,43 @@ impl SlabReader {
     /// No-op on non-Unix platforms.
     #[cfg(not(unix))]
     pub fn prefetch_range(&self, _start_offset: usize, _end_offset: usize) {}
+
+    /// Advise the kernel that a byte range is no longer needed.
+    ///
+    /// Calls `madvise(MADV_DONTNEED)` on the specified range, allowing the
+    /// kernel to reclaim those pages from the process RSS. This is essential
+    /// for sequential scans of large mmap'd files to prevent RSS from growing
+    /// to the full file size.
+    ///
+    /// # Safety
+    ///
+    /// This is safe to call as long as no references into the released range
+    /// are held. The scan loop drops all `page_buf` slices before the
+    /// prefetch thread releases their segment.
+    #[cfg(unix)]
+    pub fn release_range(&self, start_offset: usize, end_offset: usize) {
+        let len = self.mmap.len();
+        let start = start_offset.min(len);
+        let end = end_offset.min(len);
+        if start < end {
+            // SAFETY: The caller guarantees no live borrows into this range.
+            // The prefetch thread only releases ranges for segments that scan
+            // threads have already finished processing.
+            unsafe {
+                let _ = self.mmap.unchecked_advise_range(
+                    UncheckedAdvice::DontNeed,
+                    start,
+                    end - start,
+                );
+            }
+        }
+    }
+
+    /// Advise the kernel that a byte range is no longer needed.
+    ///
+    /// No-op on non-Unix platforms.
+    #[cfg(not(unix))]
+    pub fn release_range(&self, _start_offset: usize, _end_offset: usize) {}
 }
 
 /// Batched iterator over all records in a slabtastic file.

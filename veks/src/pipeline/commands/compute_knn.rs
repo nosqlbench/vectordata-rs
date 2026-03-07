@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
-use indicatif::{ProgressBar, ProgressState, ProgressStyle};
+use crate::ui::ProgressHandle;
 use vectordata::VectorReader;
 use vectordata::io::MmapVectorReader;
 
@@ -271,7 +271,7 @@ fn compute_partition(
     metric: Metric,
     dim: usize,
     threads: usize,
-    pb: &ProgressBar,
+    pb: &ProgressHandle,
 ) -> Vec<Vec<Neighbor>> {
     let batched_fn = simd_distance::select_batched_fn_f32(metric);
     let mut results: Vec<Vec<Neighbor>> = (0..query_count).map(|_| Vec::new()).collect();
@@ -545,7 +545,7 @@ fn compute_partition_f16(
     metric: Metric,
     dim: usize,
     threads: usize,
-    pb: &ProgressBar,
+    pb: &ProgressHandle,
 ) -> Vec<Vec<Neighbor>> {
     // Use f32 batched kernel: TransposedBatch stores f32, and base vectors are
     // bulk-converted f16→f32 once per base vector in the inner loop.
@@ -645,7 +645,7 @@ fn merge_partitions(
     distances_path: Option<&Path>,
     k: usize,
     query_count: usize,
-    display: &crate::pipeline::display::ProgressDisplay,
+    ui: &crate::ui::UiHandle,
 ) -> Result<(), String> {
     // Open all partition files
     let mut ivec_readers: Vec<BufReader<std::fs::File>> = Vec::with_capacity(partitions.len());
@@ -679,7 +679,7 @@ fn merge_partitions(
     let mut ivec_row = vec![0u8; row_bytes];
     let mut fvec_row = vec![0u8; row_bytes];
 
-    let pb = make_query_progress_bar(query_count as u64, display);
+    let pb = make_query_progress_bar(query_count as u64, ui);
     for _qi in 0..query_count {
         // Collect candidates from all partitions
         let mut candidates: Vec<Neighbor> = Vec::with_capacity(partitions.len() * k);
@@ -754,7 +754,7 @@ fn merge_partitions(
 
         pb.inc(1);
     }
-    pb.finish_and_clear();
+    pb.finish();
 
     idx_writer.flush().map_err(|e| e.to_string())?;
     if let Some(ref mut dw) = dist_writer {
@@ -1015,7 +1015,7 @@ fn execute_f32(
     ctx: &mut StreamContext,
     start: Instant,
 ) -> CommandResult {
-    ctx.display.log(&format!("  opening base vectors: {}", base_path.display()));
+    ctx.ui.log(&format!("  opening base vectors: {}", base_path.display()));
     let base_reader = match MmapVectorReader::<f32>::open_fvec(base_path) {
         Ok(r) => Arc::new(r),
         Err(e) => {
@@ -1025,7 +1025,7 @@ fn execute_f32(
             )
         }
     };
-    ctx.display.log(&format!("  opening query vectors: {}", query_path.display()));
+    ctx.ui.log(&format!("  opening query vectors: {}", query_path.display()));
     let query_reader = match MmapVectorReader::<f32>::open_fvec(query_path) {
         Ok(r) => r,
         Err(e) => {
@@ -1055,12 +1055,12 @@ fn execute_f32(
     } else {
         "per-pair SimSIMD"
     };
-    ctx.display.log(&format!(
+    ctx.ui.log(&format!(
         "KNN: {} queries x {} base vectors (f32, dim={}), k={}, metric={:?}, threads={}, simd={}, batch={}",
         format_count(query_count), format_count(base_count), base_dim,
         k, metric, threads, simd_distance::simd_level(), batched_mode
     ));
-    ctx.display.log(&format!(
+    ctx.ui.log(&format!(
         "  base: {} ({})  query: {} ({})",
         base_path.file_name().unwrap_or_default().to_string_lossy(),
         format_bytes(base_bytes),
@@ -1104,7 +1104,7 @@ fn execute_f16(
     ctx: &mut StreamContext,
     start: Instant,
 ) -> CommandResult {
-    ctx.display.log(&format!("  opening base vectors: {}", base_path.display()));
+    ctx.ui.log(&format!("  opening base vectors: {}", base_path.display()));
     let base_reader = match MmapVectorReader::<half::f16>::open_hvec(base_path) {
         Ok(r) => Arc::new(r),
         Err(e) => {
@@ -1114,7 +1114,7 @@ fn execute_f16(
             )
         }
     };
-    ctx.display.log(&format!("  opening query vectors: {}", query_path.display()));
+    ctx.ui.log(&format!("  opening query vectors: {}", query_path.display()));
     let query_reader = match MmapVectorReader::<half::f16>::open_hvec(query_path) {
         Ok(r) => r,
         Err(e) => {
@@ -1144,12 +1144,12 @@ fn execute_f16(
     } else {
         "per-pair SimSIMD"
     };
-    ctx.display.log(&format!(
+    ctx.ui.log(&format!(
         "KNN: {} queries x {} base vectors (f16, dim={}), k={}, metric={:?}, threads={}, simd={}, batch={}",
         format_count(query_count), format_count(base_count), base_dim,
         k, metric, threads, simd_distance::simd_level(), batched_mode
     ));
-    ctx.display.log(&format!(
+    ctx.ui.log(&format!(
         "  base: {} ({})  query: {} ({})",
         base_path.file_name().unwrap_or_default().to_string_lossy(),
         format_bytes(base_bytes),
@@ -1199,18 +1199,18 @@ fn execute_with_partitions<T>(
     step_id: &str,
     ctx: &mut StreamContext,
     start: Instant,
-    compute_fn: fn(&MmapVectorReader<T>, usize, &Arc<MmapVectorReader<T>>, usize, usize, usize, fn(&[T], &[T]) -> f32, Metric, usize, usize, &ProgressBar) -> Vec<Vec<Neighbor>>,
+    compute_fn: fn(&MmapVectorReader<T>, usize, &Arc<MmapVectorReader<T>>, usize, usize, usize, fn(&[T], &[T]) -> f32, Metric, usize, usize, &ProgressHandle) -> Vec<Vec<Neighbor>>,
 ) -> CommandResult
 where
     T: Send + Sync + 'static,
 {
     // Single-partition fast path
     if base_count <= partition_size {
-        let pb = make_query_progress_bar(query_count as u64, &ctx.display);
+        let pb = make_query_progress_bar(query_count as u64, &ctx.ui);
         let results = compute_fn(query_reader, query_count, base_reader, 0, base_count, k, dist_fn, metric, dim, threads, &pb);
-        pb.finish_and_clear();
+        pb.finish();
 
-        ctx.display.log("  writing results...");
+        ctx.ui.log("  writing results...");
         if let Err(e) = write_indices(indices_path, &results, k) {
             return error_result(e, start);
         }
@@ -1263,11 +1263,11 @@ where
         let fixed_overhead = result_bytes + heap_bytes;
 
         if fixed_overhead > available {
-            ctx.display.log(&format!(
+            ctx.ui.log(&format!(
                 "  WARNING: KNN result set alone ({}) exceeds available memory ({})",
                 format_bytes(fixed_overhead), format_bytes(available),
             ));
-            ctx.display.log(&format!(
+            ctx.ui.log(&format!(
                 "    result set: {} queries × k={} × 8B = {}",
                 format_count(query_count), k, format_bytes(result_bytes),
             ));
@@ -1279,7 +1279,7 @@ where
         if entry_size > 0 {
             let max_partition = (remaining / entry_size) as usize;
             if max_partition < partition_size && max_partition >= 1000 {
-                ctx.display.log(&format!(
+                ctx.ui.log(&format!(
                     "  memory-aware partition sizing: {} → {} (available: {}, RSS: {}, ceiling: {})",
                     format_count(partition_size), format_count(max_partition),
                     format_bytes(available), format_bytes(snapshot.rss_bytes),
@@ -1307,18 +1307,12 @@ where
 
     // Phase 1: Plan partitions and validate cache
     let estimated_partitions = (base_count + partition_size - 1) / partition_size;
-    ctx.display.log(&format!(
+    ctx.ui.log(&format!(
         "  planning ~{} partitions (partition_size={})...",
         estimated_partitions, format_count(partition_size)
     ));
 
-    let plan_pb = ctx.display.bar_with_style(
-        estimated_partitions as u64,
-        ProgressStyle::default_bar()
-            .template("  [{bar:40.green/dim}] {pos}/{len} partitions — validating cache")
-            .expect("invalid template")
-            .progress_chars("=>-"),
-    );
+    let plan_pb = ctx.ui.bar(estimated_partitions as u64, "validating cache");
 
     let mut partitions: Vec<PartitionMeta> = Vec::new();
     let mut part_start = 0;
@@ -1342,13 +1336,13 @@ where
         plan_pb.inc(1);
         part_start = part_end;
     }
-    plan_pb.finish_and_clear();
+    plan_pb.finish();
 
     let num_partitions = partitions.len();
     let cached_count = partitions.iter().filter(|p| p.cached).count();
     let to_compute = num_partitions - cached_count;
 
-    ctx.display.log(&format!(
+    ctx.ui.log(&format!(
         "  {} partitions of {} base vectors ({} cached, {} to compute)",
         num_partitions, format_count(partition_size), cached_count, to_compute
     ));
@@ -1378,7 +1372,7 @@ where
     let total_prefetch_bytes: u64 = uncached_ranges.iter()
         .map(|(s, e)| ((e - s) as u64) * (base_reader.entry_size() as u64))
         .sum();
-    ctx.display.log(&format!(
+    ctx.ui.log(&format!(
         "  prefetch thread: {} uncached partition{} ({} to page in)",
         uncached_ranges.len(),
         if uncached_ranges.len() == 1 { "" } else { "s" },
@@ -1396,25 +1390,18 @@ where
 
     // Progress bar for prefetch — runs on a background tick thread so it
     // updates even while the main thread is busy computing.
-    let prefetch_pb = ctx.display.bar_with_style(
-        total_prefetch_bytes,
-        ProgressStyle::default_bar()
-            .template("  [{bar:40.yellow/dim}] {bytes}/{total_bytes} paging in — {bytes_per_sec}")
-            .expect("invalid template")
-            .progress_chars("=>-"),
-    );
-    let prefetch_pb_clone = prefetch_pb.clone();
+    let prefetch_pb = ctx.ui.bar(total_prefetch_bytes, "paging in");
     let prefetch_bytes_for_tick = Arc::clone(&prefetch_bytes_paged);
     let prefetch_tick_handle = std::thread::spawn(move || {
         loop {
             let paged = prefetch_bytes_for_tick.load(std::sync::atomic::Ordering::Relaxed);
-            prefetch_pb_clone.set_position(paged);
+            prefetch_pb.set_position(paged);
             if paged >= total_prefetch_bytes {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
-        prefetch_pb_clone.finish_and_clear();
+        prefetch_pb.finish();
     });
 
     let mut computed = 0usize;
@@ -1423,46 +1410,46 @@ where
 
     for (pi, part) in partitions.iter().enumerate() {
         if part.cached {
-            ctx.display.log(&format!(
-                "  partition {}/{} [{}, {}) — cached (skipping)",
+            log::info!(
+                "partition {}/{} [{}, {}) — cached (skipping)",
                 pi + 1, num_partitions, part.start, part.end,
-            ));
+            );
             continue;
         }
 
         // Governor checkpoint at partition boundary
         if ctx.governor.checkpoint() {
-            ctx.display.log(&format!(
-                "  partition {}/{} — governor throttle active, continuing with current settings",
+            log::info!(
+                "partition {}/{} — governor throttle active, continuing with current settings",
                 pi + 1, num_partitions,
-            ));
+            );
         }
 
         computed += 1;
-        ctx.display.log(&format!(
-            "  partition {}/{} [{}, {}) — computing [{}/{}] {} queries x {} base vectors...",
+        log::info!(
+            "partition {}/{} [{}, {}) — computing [{}/{}] {} queries x {} base vectors...",
             pi + 1, num_partitions, part.start, part.end,
             computed, to_compute,
             format_count(query_count), format_count(part.end - part.start),
-        ));
+        );
 
         let part_start_time = Instant::now();
-        let pb = make_query_progress_bar(query_count as u64, &ctx.display);
+        let pb = make_query_progress_bar(query_count as u64, &ctx.ui);
         let results = compute_fn(
             query_reader, query_count, base_reader, part.start, part.end, k, dist_fn, metric, dim, threads, &pb,
         );
-        pb.finish_and_clear();
+        pb.finish();
         let compute_elapsed = part_start_time.elapsed();
 
         // Wait for previous background writer before starting a new write
         if let Some(handle) = prev_writer.take() {
-            let write_result = join_writer_with_spinner(handle, "previous", &ctx.display);
+            let write_result = join_writer_with_spinner(handle, "previous", &ctx.ui);
             let write_elapsed = prev_write_start.take()
                 .map(|s| s.elapsed())
                 .unwrap_or_default();
             match write_result {
                 Ok(()) => {
-                    ctx.display.log(&format!("    (previous write completed in {:.1}s)", write_elapsed.as_secs_f64()));
+                    log::info!("previous write completed in {:.1}s", write_elapsed.as_secs_f64());
                 }
                 Err(msg) => {
                     return error_result(msg, start);
@@ -1477,7 +1464,6 @@ where
         let part_end_idx = part.end;
         let part_query_count = query_count;
         prev_write_start = Some(Instant::now());
-        let writer_display = ctx.display.clone();
         prev_writer = Some(std::thread::spawn(move || {
             write_indices(&neighbors_path, &results, k)?;
             write_distances(&distances_path, &results, k)?;
@@ -1495,38 +1481,38 @@ where
                 .map(|m| m.len()).unwrap_or(0);
             let fvec_size = std::fs::metadata(&distances_path)
                 .map(|m| m.len()).unwrap_or(0);
-            writer_display.log(&format!(
-                "    → {}  ({})",
+            log::info!(
+                "→ {}  ({})",
                 neighbors_path.file_name().unwrap_or_default().to_string_lossy(),
                 format_bytes(ivec_size),
-            ));
-            writer_display.log(&format!(
-                "    → {}  ({})",
+            );
+            log::info!(
+                "→ {}  ({})",
                 distances_path.file_name().unwrap_or_default().to_string_lossy(),
                 format_bytes(fvec_size),
-            ));
+            );
             Ok(())
         }));
 
         // Release completed partition's pages from page cache (REQ-RM-10)
         base_reader.release_range(part.start, part.end);
 
-        ctx.display.log(&format!(
-            "  partition {}/{} — compute done in {:.1}s (write in background)",
+        log::info!(
+            "partition {}/{} — compute done in {:.1}s (write in background)",
             pi + 1, num_partitions,
             compute_elapsed.as_secs_f64(),
-        ));
+        );
     }
 
     // Wait for final background writer
     if let Some(handle) = prev_writer.take() {
-        let write_result = join_writer_with_spinner(handle, "final", &ctx.display);
+        let write_result = join_writer_with_spinner(handle, "final", &ctx.ui);
         let write_elapsed = prev_write_start.take()
             .map(|s| s.elapsed())
             .unwrap_or_default();
         match write_result {
             Ok(()) => {
-                ctx.display.log(&format!("    (final write completed in {:.1}s)", write_elapsed.as_secs_f64()));
+                log::info!("final write completed in {:.1}s", write_elapsed.as_secs_f64());
             }
             Err(msg) => {
                 return error_result(msg, start);
@@ -1536,9 +1522,9 @@ where
 
     // Prefetch thread may still be running if compute was faster; let it finish
     if !prefetch_handle.is_finished() {
-        let sp = ctx.display.spinner("waiting for prefetch to finish...");
+        let sp = ctx.ui.spinner("waiting for prefetch to finish...");
         let _ = prefetch_handle.join();
-        sp.finish_and_clear();
+        sp.finish();
     } else {
         let _ = prefetch_handle.join();
     }
@@ -1546,7 +1532,7 @@ where
     let _ = prefetch_tick_handle.join();
 
     // Phase 3: Merge
-    ctx.display.log(&format!("  merging {} partitions ({} queries)...", num_partitions, query_count));
+    ctx.ui.log(&format!("  merging {} partitions ({} queries)...", num_partitions, query_count));
 
     if let Err(e) = merge_partitions(
         &partitions,
@@ -1554,7 +1540,7 @@ where
         distances_path,
         k,
         query_count,
-        &ctx.display,
+        &ctx.ui,
     ) {
         return error_result(format!("merge failed: {}", e), start);
     }
@@ -1628,35 +1614,8 @@ fn write_distances(path: &Path, results: &[Vec<Neighbor>], k: usize) -> Result<(
 }
 
 /// Create a progress bar for query processing within a partition.
-fn make_query_progress_bar(total: u64, display: &crate::pipeline::display::ProgressDisplay) -> ProgressBar {
-    display.bar_with_style(
-        total,
-        ProgressStyle::default_bar()
-            .template("  [{bar:40.cyan/blue}] {pos}/{len} ({percent}%) queries — {rps} — ETA {eta}")
-            .expect("invalid template")
-            .with_key("rps", format_qps)
-            .progress_chars("=>-"),
-    )
-}
-
-/// Format queries/sec for the progress bar.
-fn format_qps(state: &ProgressState, w: &mut dyn std::fmt::Write) {
-    let qps = state.per_sec();
-    if qps < 100.0 {
-        write!(w, "{:.1} q/s", qps).unwrap();
-    } else {
-        let whole = qps as u64;
-        let s = whole.to_string();
-        let mut result = String::with_capacity(s.len() + s.len() / 3);
-        for (i, ch) in s.chars().rev().enumerate() {
-            if i > 0 && i % 3 == 0 {
-                result.push(',');
-            }
-            result.push(ch);
-        }
-        let formatted: String = result.chars().rev().collect();
-        write!(w, "{} q/s", formatted).unwrap();
-    }
+fn make_query_progress_bar(total: u64, ui: &crate::ui::UiHandle) -> ProgressHandle {
+    ui.bar(total, "queries")
 }
 
 /// Format a count with thousands separators.
@@ -1705,12 +1664,12 @@ fn resolve_path(path_str: &str, workspace: &Path) -> PathBuf {
 fn join_writer_with_spinner(
     handle: std::thread::JoinHandle<Result<(), String>>,
     label: &str,
-    display: &crate::pipeline::display::ProgressDisplay,
+    ui: &crate::ui::UiHandle,
 ) -> Result<(), String> {
     if !handle.is_finished() {
-        let sp = display.spinner(&format!("flushing {} cache write...", label));
+        let sp = ui.spinner(&format!("flushing {} cache write...", label));
         let result = handle.join();
-        sp.finish_and_clear();
+        sp.finish();
         match result {
             Ok(inner) => inner,
             Err(_) => Err("partition cache writer thread panicked".to_string()),
@@ -1742,6 +1701,9 @@ mod tests {
 
     fn test_ctx(dir: &Path) -> StreamContext {
         StreamContext {
+            dataset_name: String::new(),
+            profile: String::new(),
+            profile_names: vec![],
             workspace: dir.to_path_buf(),
             scratch: dir.join(".scratch"),
             cache: dir.join(".cache"),
@@ -1751,7 +1713,7 @@ mod tests {
             threads: 1,
             step_id: String::new(),
             governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
-            display: crate::pipeline::display::ProgressDisplay::new(),
+            ui: crate::ui::UiHandle::new(std::sync::Arc::new(crate::ui::TestSink::new())),
         }
     }
 

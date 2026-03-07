@@ -310,7 +310,7 @@ impl NpyDirReader {
     /// are spawned. Used for fail-fast validation in the import probe phase.
     pub fn probe(path: &Path) -> Result<super::SourceMeta, String> {
         let scan = scan_npy_headers(path, None)?;
-        eprintln!(
+        log::info!(
             "    {} npy file(s), dtype {:?}, {} bytes/element, dimension {}",
             scan.files.len(),
             scan.dtype,
@@ -335,7 +335,7 @@ impl NpyDirReader {
     pub fn open(path: &Path, threads: usize, max_count: Option<u64>) -> Result<Box<dyn VecSource>, String> {
         let scan = scan_npy_headers(path, max_count)?;
 
-        eprintln!(
+        log::info!(
             "    {} npy file(s), dtype {:?}, {} bytes/element, dimension {}",
             scan.files.len(),
             scan.dtype,
@@ -356,7 +356,7 @@ impl NpyDirReader {
             .min(total_files);
 
         let initial_in_flight = MAX_IN_FLIGHT.min(total_files);
-        eprintln!(
+        log::info!(
             "npy: {} file(s), {} total rows, {} loader thread(s), {} max in-flight",
             total_files, total_rows, num_workers, initial_in_flight
         );
@@ -413,7 +413,7 @@ impl NpyDirReader {
                             }
                         }
                         Err(e) => {
-                            eprintln!("Warning: failed to load {}: {}", path.display(), e);
+                            log::info!("Warning: failed to load {}: {}", path.display(), e);
                             let mut in_flight = gate.in_flight.lock().unwrap();
                             *in_flight -= 1;
                             gate.can_send.notify_one();
@@ -485,7 +485,7 @@ impl NpyDirReader {
                 if old < MAX_PREFETCH {
                     self.gate.allowed.store(old + 1, Ordering::Relaxed);
                     self.gate.can_send.notify_all();
-                    eprintln!(
+                    log::info!(
                         "npy: prefetch short — increased depth to {}",
                         old + 1
                     );

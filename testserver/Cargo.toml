@@ -1,0 +1,16 @@
+[package]
+name = "testserver"
+version = "0.1.0"
+edition = "2024"
+description = "Lightweight HTTP file server for integration tests — supports Range requests"
+license = "Apache-2.0"
+homepage = "https://github.com/nosqlbench/vectordata-rs"
+repository = "https://github.com/nosqlbench/vectordata-rs"
+keywords = ["test", "http", "server", "fixture"]
+
+[dependencies]
+tiny_http = "0.12"
+
+[dev-dependencies]
+reqwest = { version = "0.13.1", features = ["blocking"] }
+tempfile = "3"

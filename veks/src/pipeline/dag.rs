@@ -164,6 +164,8 @@ mod tests {
             run: run.to_string(),
             description: None,
             after: after.into_iter().map(String::from).collect(),
+            profiles: vec![],
+            per_profile: false,
             on_partial: OnPartial::default(),
             options,
         }
@@ -214,6 +216,8 @@ mod tests {
                 run: "generate fvec-extract".to_string(),
                 description: None,
                 after: vec![],
+                profiles: vec![],
+                per_profile: false,
                 on_partial: OnPartial::default(),
                 options: b_opts,
             },
@@ -271,6 +275,8 @@ mod tests {
             run: "generate ivec-shuffle".to_string(),
             description: None,
             after: vec![],
+            profiles: vec![],
+            per_profile: false,
             on_partial: OnPartial::default(),
             options: IndexMap::new(),
         }];

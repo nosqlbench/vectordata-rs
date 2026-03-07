@@ -129,7 +129,7 @@ for ground truth KNN.
 
         // Generate base vectors
         let base_path = output_dir.join("base.fvec");
-        ctx.display.log(&format!(
+        ctx.ui.log(&format!(
             "  Generating {} base vectors (dim={})...",
             base_count, dimension
         ));
@@ -139,7 +139,7 @@ for ground truth KNN.
 
         // Generate query vectors
         let query_path = output_dir.join("query.fvec");
-        ctx.display.log(&format!(
+        ctx.ui.log(&format!(
             "  Generating {} query vectors (dim={})...",
             query_count, dimension
         ));
@@ -150,7 +150,7 @@ for ground truth KNN.
         // Compute ground truth KNN
         let indices_path = output_dir.join("indices.ivec");
         let distances_path = output_dir.join("distances.fvec");
-        ctx.display.log(&format!(
+        ctx.ui.log(&format!(
             "  Computing {}-NN ground truth ({} queries × {} base)...",
             k, query_count, base_count
         ));
@@ -198,7 +198,7 @@ for ground truth KNN.
             return error_result(format!("failed to write dataset.yaml: {}", e), start);
         }
 
-        ctx.display.log(&format!("  Dataset created: {}", output_dir.display()));
+        ctx.ui.log(&format!("  Dataset created: {}", output_dir.display()));
 
         CommandResult {
             status: Status::Ok,
@@ -494,6 +494,9 @@ mod tests {
 
     fn test_ctx(dir: &Path) -> StreamContext {
         StreamContext {
+            dataset_name: String::new(),
+            profile: String::new(),
+            profile_names: vec![],
             workspace: dir.to_path_buf(),
             scratch: dir.join(".scratch"),
             cache: dir.join(".cache"),
@@ -503,7 +506,7 @@ mod tests {
             threads: 1,
             step_id: String::new(),
             governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
-            display: crate::pipeline::display::ProgressDisplay::new(),
+            ui: crate::ui::UiHandle::new(std::sync::Arc::new(crate::ui::TestSink::new())),
         }
     }
 

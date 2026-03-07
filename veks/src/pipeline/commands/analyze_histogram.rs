@@ -117,7 +117,7 @@ impl CommandOp for AnalyzeHistogramOp {
         let max = stats.max;
 
         if (max - min).abs() < f64::EPSILON {
-            ctx.display.log(&format!(
+            ctx.ui.log(&format!(
                 "Dimension {}: all {} values = {:.6}",
                 dimension, effective_count, min
             ));
@@ -141,16 +141,16 @@ impl CommandOp for AnalyzeHistogramOp {
         let max_count = *bin_counts.iter().max().unwrap_or(&1);
 
         // Print header
-        ctx.display.log(&format!(
+        ctx.ui.log(&format!(
             "Histogram: dimension {} ({} vectors)",
             dimension, effective_count
         ));
-        ctx.display.log(&format!(
+        ctx.ui.log(&format!(
             "  Range: [{:.4}, {:.4}], Mean: {:.4}, StdDev: {:.4}",
             min, max, stats.mean, stats.std_dev
         ));
-        ctx.display.log(&format!("  {} bins, bin width: {:.6}", bins, bin_width));
-        ctx.display.log("");
+        ctx.ui.log(&format!("  {} bins, bin width: {:.6}", bins, bin_width));
+        ctx.ui.log("");
 
         // Print histogram
         for (i, &count) in bin_counts.iter().enumerate() {
@@ -162,7 +162,7 @@ impl CommandOp for AnalyzeHistogramOp {
                 0
             };
             let bar: String = "\u{2588}".repeat(bar_len);
-            ctx.display.log(&format!(
+            ctx.ui.log(&format!(
                 "  [{:8.4}, {:8.4}) {:6} |{}",
                 lo, hi, count, bar
             ));
@@ -251,6 +251,9 @@ mod tests {
 
     fn test_ctx(dir: &Path) -> StreamContext {
         StreamContext {
+            dataset_name: String::new(),
+            profile: String::new(),
+            profile_names: vec![],
             workspace: dir.to_path_buf(),
             scratch: dir.join(".scratch"),
             cache: dir.join(".cache"),
@@ -260,7 +263,7 @@ mod tests {
             threads: 1,
             step_id: String::new(),
             governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
-            display: crate::pipeline::display::ProgressDisplay::new(),
+            ui: crate::ui::UiHandle::new(std::sync::Arc::new(crate::ui::TestSink::new())),
         }
     }
 

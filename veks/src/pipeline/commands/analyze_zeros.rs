@@ -112,7 +112,7 @@ fn count_zeros_fvec(path: &Path, start: Instant) -> CommandResult {
         0.0
     };
 
-    eprintln!(
+    log::info!(
         "{}: {} zero vectors out of {} total ({:.2}%)",
         path.display(),
         zero_count,
@@ -160,7 +160,7 @@ fn count_zeros_ivec(path: &Path, start: Instant) -> CommandResult {
         0.0
     };
 
-    eprintln!(
+    log::info!(
         "{}: {} zero vectors out of {} total ({:.2}%)",
         path.display(),
         zero_count,
@@ -213,6 +213,9 @@ mod tests {
 
     fn test_ctx(dir: &Path) -> StreamContext {
         StreamContext {
+            dataset_name: String::new(),
+            profile: String::new(),
+            profile_names: vec![],
             workspace: dir.to_path_buf(),
             scratch: dir.join(".scratch"),
             cache: dir.join(".cache"),
@@ -222,7 +225,7 @@ mod tests {
             threads: 1,
             step_id: String::new(),
             governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
-            display: crate::pipeline::display::ProgressDisplay::new(),
+            ui: crate::ui::UiHandle::new(std::sync::Arc::new(crate::ui::TestSink::new())),
         }
     }
 

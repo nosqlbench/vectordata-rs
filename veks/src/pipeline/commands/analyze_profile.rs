@@ -111,7 +111,7 @@ impl CommandOp for AnalyzeProfileOp {
         let dim = <MmapVectorReader<f32> as VectorReader<f32>>::dim(&reader);
         let effective = sample.min(total_count);
 
-        ctx.display.log(&format!(
+        ctx.ui.log(&format!(
             "Profiling {} ({} vectors, dim={}, sampling {})",
             source_path.display(),
             total_count,
@@ -132,12 +132,12 @@ impl CommandOp for AnalyzeProfileOp {
 
             let (model, model_type, ks_d) = fit_and_evaluate(&values);
             if verbose || d < 5 || d == dim - 1 {
-                ctx.display.log(&format!(
+                ctx.ui.log(&format!(
                     "  dim[{}]: {} (KS D={:.4})",
                     d, model_type, ks_d
                 ));
             } else if d == 5 {
-                ctx.display.log("  ...");
+                ctx.ui.log("  ...");
             }
 
             fit_results.push(DimFitResult {
@@ -157,10 +157,10 @@ impl CommandOp for AnalyzeProfileOp {
             .map(|r| r.ks_d)
             .fold(0.0, f64::max);
 
-        ctx.display.log("");
-        ctx.display.log("Model summary:");
-        ctx.display.log(&format!("  Normal: {}, Beta: {}, Uniform: {}", normal_count, beta_count, uniform_count));
-        ctx.display.log(&format!("  Avg KS D: {:.4}, Max KS D: {:.4}", avg_ks, max_ks));
+        ctx.ui.log("");
+        ctx.ui.log("Model summary:");
+        ctx.ui.log(&format!("  Normal: {}, Beta: {}, Uniform: {}", normal_count, beta_count, uniform_count));
+        ctx.ui.log(&format!("  Avg KS D: {:.4}, Max KS D: {:.4}", avg_ks, max_ks));
 
         // Write model
         let vsm = VectorSpaceModel {
@@ -176,7 +176,7 @@ impl CommandOp for AnalyzeProfileOp {
             return error_result(format!("failed to write {}: {}", output_path.display(), e), start);
         }
 
-        ctx.display.log(&format!("Wrote model to {}", output_path.display()));
+        ctx.ui.log(&format!("Wrote model to {}", output_path.display()));
 
         CommandResult {
             status: Status::Ok,
@@ -457,6 +457,9 @@ mod tests {
 
     fn test_ctx(dir: &Path) -> StreamContext {
         StreamContext {
+            dataset_name: String::new(),
+            profile: String::new(),
+            profile_names: vec![],
             workspace: dir.to_path_buf(),
             scratch: dir.join(".scratch"),
             cache: dir.join(".cache"),
@@ -466,7 +469,7 @@ mod tests {
             threads: 1,
             step_id: String::new(),
             governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
-            display: crate::pipeline::display::ProgressDisplay::new(),
+            ui: crate::ui::UiHandle::new(std::sync::Arc::new(crate::ui::TestSink::new())),
         }
     }
 

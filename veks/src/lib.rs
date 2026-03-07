@@ -9,6 +9,8 @@ pub mod analyze;
 pub mod bulkdl;
 pub mod cli;
 pub mod convert;
+pub mod datasets;
 pub mod formats;
 pub mod import;
 pub mod pipeline;
+pub mod ui;

@@ -1,7 +1,7 @@
 // Copyright (c) DataStax, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use veks::{analyze, bulkdl, cli, convert, import, pipeline};
+use veks::{analyze, bulkdl, cli, convert, datasets, import, pipeline};
 
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::CompleteEnv;
@@ -20,12 +20,16 @@ enum Commands {
     Analyze(analyze::AnalyzeArgs),
     /// Bulk file downloader driven by YAML config with token expansion
     Bulkdl(bulkdl::BulkDlArgs),
+    /// Browse, search, and manage datasets
+    Datasets(datasets::DatasetsArgs),
     /// Convert vector data between formats
     Convert(convert::ConvertArgs),
     /// Import data into preferred internal format by facet type
     Import(import::ImportArgs),
     /// Execute a command stream pipeline defined in dataset.yaml
     Run(pipeline::RunArgs),
+    /// Emit a dataset pipeline as an equivalent shell script
+    Script(pipeline::ScriptArgs),
     /// Execute a single pipeline command directly
     Pipeline {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -75,12 +79,30 @@ async fn main() {
         Commands::Analyze(args) => analyze::run(args),
         Commands::Bulkdl(args) => bulkdl::run(args).await,
         Commands::Convert(args) => convert::run(args),
+        Commands::Datasets(args) => datasets::run(args),
         Commands::Import(args) => import::run(args),
         Commands::Run(args) => pipeline::run_pipeline(args),
+        Commands::Script(args) => pipeline::run_script(args),
         Commands::Pipeline { args } => pipeline::cli::run_direct(args),
         Commands::Completions(args) => cli::completions(args),
         Commands::Help(args) => run_help(args),
     }
+}
+
+/// Root-level command descriptions for `veks help`.
+fn root_commands() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("analyze", "Analyze vector data files and datasets"),
+        ("bulkdl", "Bulk file downloader driven by YAML config with token expansion"),
+        ("datasets", "Browse, search, and manage datasets"),
+        ("convert", "Convert vector data between formats"),
+        ("import", "Import data into preferred internal format by facet type"),
+        ("run", "Execute a command stream pipeline defined in dataset.yaml"),
+        ("script", "Emit a dataset pipeline as an equivalent shell script"),
+        ("pipeline", "Execute a single pipeline command directly"),
+        ("completions", "Generate shell completions"),
+        ("help", "Show detailed help for a pipeline command or command group"),
+    ]
 }
 
 /// Execute `veks help` — display documentation for pipeline commands and groups.
@@ -91,7 +113,7 @@ fn run_help(args: HelpArgs) {
     let registry = CommandRegistry::with_builtins();
     let paths = registry.command_paths();
 
-    // Group command paths by first word.
+    // Group pipeline command paths by first word.
     let mut groups: BTreeMap<String, Vec<(&str, String)>> = BTreeMap::new();
     for path in &paths {
         let mut parts = path.splitn(2, ' ');
@@ -110,13 +132,23 @@ fn run_help(args: HelpArgs) {
 
     let query = args.command_path.join(" ");
 
-    // Check if query matches a group name (DOC-07)
+    // Check if query matches a root-level command
+    if let Some(help_text) = root_command_help(&query) {
+        if args.markdown {
+            println!("{}", help_text);
+        } else {
+            render_markdown_to_terminal(&help_text);
+        }
+        return;
+    }
+
+    // Check if query matches a pipeline group name (DOC-07)
     if groups.contains_key(&query) {
         print_group_help(&query, &groups, &registry, args.markdown);
         return;
     }
 
-    // Check if query matches a specific command
+    // Check if query matches a specific pipeline command
     if let Some(factory) = registry.get(&query) {
         let cmd = factory();
         let doc = cmd.command_doc();
@@ -128,9 +160,18 @@ fn run_help(args: HelpArgs) {
         return;
     }
 
-    eprintln!("Unknown command or group: '{}'", query);
-    eprintln!("Use 'veks help --list' to see all available commands.");
+    println!("Unknown command or group: '{}'", query);
+    println!("Use 'veks help --list' to see all available commands.");
     std::process::exit(1);
+}
+
+/// Generate help text for a root-level command by rendering its clap help.
+fn root_command_help(name: &str) -> Option<String> {
+    let cmd = build_augmented_cli();
+    let sub = cmd.get_subcommands().find(|c| c.get_name() == name)?;
+    let mut sub = sub.clone();
+    let help = sub.render_help();
+    Some(help.to_string())
 }
 
 /// Print all commands grouped by category (DOC-05 --list mode).
@@ -138,10 +179,20 @@ fn print_command_list(
     groups: &std::collections::BTreeMap<String, Vec<(&str, String)>>,
     markdown: bool,
 ) {
+    let root_cmds = root_commands();
+
     if markdown {
-        println!("# veks pipeline commands\n");
+        println!("# veks commands\n");
+        println!("## root\n");
+        println!("| Command | Summary |");
+        println!("|---------|---------|");
+        for (name, summary) in &root_cmds {
+            println!("| `{}` | {} |", name, summary);
+        }
+        println!();
+        println!("## pipeline commands\n");
         for (group, commands) in groups {
-            println!("## {}\n", group);
+            println!("### {}\n", group);
             println!("| Command | Summary |");
             println!("|---------|---------|");
             for (path, summary) in commands {
@@ -151,15 +202,22 @@ fn print_command_list(
             println!();
         }
     } else {
+        let max_root = root_cmds.iter().map(|(n, _)| n.len()).max().unwrap_or(0);
+        println!("root:");
+        for (name, summary) in &root_cmds {
+            println!("  {:<width$}  {}", name, summary, width = max_root);
+        }
+        println!();
+        println!("pipeline:");
         for (group, commands) in groups {
-            println!("{}:", group);
+            println!("  {}:", group);
             let max_len = commands.iter()
                 .map(|(p, _)| p.splitn(2, ' ').nth(1).unwrap_or(p).len())
                 .max()
                 .unwrap_or(0);
             for (path, summary) in commands {
                 let subname = path.splitn(2, ' ').nth(1).unwrap_or(path);
-                println!("  {:<width$}  {}", subname, summary, width = max_len);
+                println!("    {:<width$}  {}", subname, summary, width = max_len);
             }
             println!();
         }

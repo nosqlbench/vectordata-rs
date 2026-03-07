@@ -249,6 +249,43 @@ pub struct ConjugateNode {
 }
 
 impl PNode {
+    /// Create a structural fingerprint by replacing all comparand values with
+    /// type-default placeholders while preserving the tree shape, field names,
+    /// operators, and comparand count/types.
+    ///
+    /// Two PNodes with equal fingerprints are *structurally congruent* — they
+    /// differ only in the specific comparand values.
+    pub fn fingerprint(&self) -> PNode {
+        match self {
+            PNode::Predicate(pred) => PNode::Predicate(PredicateNode {
+                field: pred.field.clone(),
+                op: pred.op,
+                comparands: pred
+                    .comparands
+                    .iter()
+                    .map(|c| match c {
+                        Comparand::Int(_) => Comparand::Int(0),
+                        Comparand::Float(_) => Comparand::Float(0.0),
+                        Comparand::Text(_) => Comparand::Text(String::new()),
+                        Comparand::Bool(_) => Comparand::Bool(false),
+                        Comparand::Bytes(_) => Comparand::Bytes(Vec::new()),
+                        Comparand::Null => Comparand::Null,
+                    })
+                    .collect(),
+            }),
+            PNode::Conjugate(conj) => PNode::Conjugate(ConjugateNode {
+                conjugate_type: conj.conjugate_type,
+                children: conj.children.iter().map(|c| c.fingerprint()).collect(),
+            }),
+        }
+    }
+
+    /// Check whether two PNodes are structurally congruent — same tree shape,
+    /// field references, operators, and comparand types, differing only in values.
+    pub fn is_congruent(&self, other: &Self) -> bool {
+        self.fingerprint().to_string() == other.fingerprint().to_string()
+    }
+
     /// Encode to bytes (indexed mode — fields as u8 indices).
     ///
     /// Prepends the `DIALECT_PNODE` leader byte before the tree data.
@@ -793,6 +830,89 @@ mod tests {
             // The write_indexed returns an error which causes expect to panic
             true
         });
+    }
+
+    #[test]
+    fn test_fingerprint_strips_values() {
+        let node = PNode::Predicate(PredicateNode {
+            field: FieldRef::Named("age".into()),
+            op: OpType::Gt,
+            comparands: vec![Comparand::Int(42)],
+        });
+        let fp = node.fingerprint();
+        assert_eq!(
+            fp,
+            PNode::Predicate(PredicateNode {
+                field: FieldRef::Named("age".into()),
+                op: OpType::Gt,
+                comparands: vec![Comparand::Int(0)],
+            })
+        );
+    }
+
+    #[test]
+    fn test_fingerprint_congruence() {
+        let a = PNode::Conjugate(ConjugateNode {
+            conjugate_type: ConjugateType::And,
+            children: vec![
+                PNode::Predicate(PredicateNode {
+                    field: FieldRef::Named("x".into()),
+                    op: OpType::Eq,
+                    comparands: vec![Comparand::Text("hello".into())],
+                }),
+                PNode::Predicate(PredicateNode {
+                    field: FieldRef::Named("y".into()),
+                    op: OpType::Lt,
+                    comparands: vec![Comparand::Int(100)],
+                }),
+            ],
+        });
+        let b = PNode::Conjugate(ConjugateNode {
+            conjugate_type: ConjugateType::And,
+            children: vec![
+                PNode::Predicate(PredicateNode {
+                    field: FieldRef::Named("x".into()),
+                    op: OpType::Eq,
+                    comparands: vec![Comparand::Text("world".into())],
+                }),
+                PNode::Predicate(PredicateNode {
+                    field: FieldRef::Named("y".into()),
+                    op: OpType::Lt,
+                    comparands: vec![Comparand::Int(999)],
+                }),
+            ],
+        });
+        assert!(a.is_congruent(&b));
+
+        // Different structure — not congruent
+        let c = PNode::Predicate(PredicateNode {
+            field: FieldRef::Named("x".into()),
+            op: OpType::Eq,
+            comparands: vec![Comparand::Text("hello".into())],
+        });
+        assert!(!a.is_congruent(&c));
+    }
+
+    #[test]
+    fn test_fingerprint_preserves_comparand_types() {
+        let node = PNode::Predicate(PredicateNode {
+            field: FieldRef::Named("f".into()),
+            op: OpType::In,
+            comparands: vec![
+                Comparand::Text("a".into()),
+                Comparand::Text("b".into()),
+            ],
+        });
+        let fp = node.fingerprint();
+        let expected = PNode::Predicate(PredicateNode {
+            field: FieldRef::Named("f".into()),
+            op: OpType::In,
+            comparands: vec![
+                Comparand::Text(String::new()),
+                Comparand::Text(String::new()),
+            ],
+        });
+        assert_eq!(fp, expected);
     }
 
     #[test]

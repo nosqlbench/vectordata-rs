@@ -35,6 +35,9 @@
 //! }
 //! ```
 
+pub mod cache;
+pub mod merkle;
+pub mod transport;
 pub mod model;
 pub mod io;
 pub mod view;
@@ -42,7 +45,7 @@ pub mod group;
 
 pub use group::TestDataGroup;
 pub use model::FacetConfig;
-pub use view::TestDataView;
+pub use view::{FacetDescriptor, TestDataView};
 pub use io::VectorReader;
 
 use thiserror::Error;

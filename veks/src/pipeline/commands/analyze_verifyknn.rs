@@ -285,7 +285,7 @@ impl CommandOp for AnalyzeVerifyKnnOp {
             None => (0, query_count),
         };
 
-        ctx.display.log(&format!(
+        ctx.ui.log(&format!(
             "Verify KNN: queries [{}, {}), k={}, metric={:?}, phi={}",
             range_start, range_end, k, metric, phi
         ));
@@ -297,7 +297,7 @@ impl CommandOp for AnalyzeVerifyKnnOp {
             // Periodic governor checkpoint every 1000 queries
             if (qi - range_start) % 1000 == 0 {
                 if ctx.governor.checkpoint() {
-                    ctx.display.log("  governor: throttle active");
+                    ctx.ui.log("  governor: throttle active");
                 }
             }
 
@@ -353,7 +353,7 @@ impl CommandOp for AnalyzeVerifyKnnOp {
                     fail_count -= 1;
                     pass_count += 1;
                 } else {
-                    ctx.display.log(&format!(
+                    ctx.ui.log(&format!(
                         "  FAIL query {}: {}/{} matching ({} with ties)",
                         qi, matching, k, tie_adjusted_matching
                     ));
@@ -361,7 +361,7 @@ impl CommandOp for AnalyzeVerifyKnnOp {
             }
 
             if (qi - range_start + 1) % 100 == 0 || qi + 1 == range_end {
-                ctx.display.log(&format!(
+                ctx.ui.log(&format!(
                     "\r  {}/{} verified ({} pass, {} fail)",
                     qi - range_start + 1,
                     range_end - range_start,
@@ -370,7 +370,7 @@ impl CommandOp for AnalyzeVerifyKnnOp {
                 ));
             }
         }
-        ctx.display.log("");
+        ctx.ui.log("");
 
         let total = pass_count + fail_count;
         let status = if fail_count == 0 {
@@ -490,6 +490,9 @@ mod tests {
 
     fn test_ctx(dir: &Path) -> StreamContext {
         StreamContext {
+            dataset_name: String::new(),
+            profile: String::new(),
+            profile_names: vec![],
             workspace: dir.to_path_buf(),
             scratch: dir.join(".scratch"),
             cache: dir.join(".cache"),
@@ -499,7 +502,7 @@ mod tests {
             threads: 1,
             step_id: String::new(),
             governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
-            display: crate::pipeline::display::ProgressDisplay::new(),
+            ui: crate::ui::UiHandle::new(std::sync::Arc::new(crate::ui::TestSink::new())),
         }
     }
 

@@ -574,7 +574,7 @@ impl VectorReader<i32> for HttpVectorReader<i32> {
 
         let bytes = resp.bytes()?;
         let mut cursor = Cursor::new(bytes);
-        
+
         let dim = cursor.read_i32::<LittleEndian>()? as usize;
         if dim != self.dim {
              return Err(IoError::InvalidFormat(format!("Record at index {} has mismatched dimension {}", index, dim)));
@@ -583,6 +583,83 @@ impl VectorReader<i32> for HttpVectorReader<i32> {
         let mut vector = Vec::with_capacity(self.dim);
         for _ in 0..self.dim {
             vector.push(cursor.read_i32::<LittleEndian>()?);
+        }
+        Ok(vector)
+    }
+}
+
+impl HttpVectorReader<half::f16> {
+    /// Opens a half-precision vector file from a URL.
+    pub fn open_hvec(url: Url) -> Result<Self, IoError> {
+        let client = Client::new();
+
+        let resp = client.get(url.clone())
+            .header(RANGE, "bytes=0-3")
+            .send()?
+            .error_for_status()?;
+
+        let bytes = resp.bytes()?;
+        if bytes.len() < 4 {
+            return Err(IoError::InvalidFormat("File too short".into()));
+        }
+        let mut cursor = Cursor::new(bytes);
+        let dim = cursor.read_i32::<LittleEndian>()? as usize;
+        if dim == 0 {
+            return Err(IoError::InvalidFormat("Dimension cannot be 0".into()));
+        }
+
+        let resp = client.head(url.clone()).send()?.error_for_status()?;
+        let total_size = resp.headers()
+            .get(CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+            .ok_or_else(|| IoError::InvalidFormat("Missing Content-Length".into()))?;
+
+        let entry_size = 4 + dim * 2; // 4 bytes dim header + dim * 2 bytes per f16
+        let count = (total_size / entry_size as u64) as usize;
+
+        Ok(Self {
+            client,
+            url,
+            dim,
+            count,
+            entry_size,
+            total_size,
+            _phantom: PhantomData,
+        })
+    }
+}
+
+impl VectorReader<half::f16> for HttpVectorReader<half::f16> {
+    fn dim(&self) -> usize { self.dim }
+    fn count(&self) -> usize { self.count }
+
+    fn get(&self, index: usize) -> Result<Vec<half::f16>, IoError> {
+        if index >= self.count {
+            return Err(IoError::OutOfBounds(index));
+        }
+
+        let start = index * self.entry_size;
+        let end = start + self.entry_size - 1;
+
+        let resp = self.client.get(self.url.clone())
+            .header(RANGE, format!("bytes={}-{}", start, end))
+            .send()?
+            .error_for_status()?;
+
+        let bytes = resp.bytes()?;
+        let mut cursor = Cursor::new(bytes);
+
+        let dim = cursor.read_i32::<LittleEndian>()? as usize;
+        if dim != self.dim {
+            return Err(IoError::InvalidFormat(format!(
+                "Record at index {} has mismatched dimension {}", index, dim
+            )));
+        }
+
+        let mut vector = Vec::with_capacity(self.dim);
+        for _ in 0..self.dim {
+            vector.push(half::f16::from_bits(cursor.read_u16::<LittleEndian>()?));
         }
         Ok(vector)
     }

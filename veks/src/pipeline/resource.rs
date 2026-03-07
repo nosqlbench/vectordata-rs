@@ -356,8 +356,8 @@ impl ResourceBudget {
             };
 
             if resource_type.is_none() {
-                eprintln!(
-                    "Warning: unknown resource type '{}'. Known types: {}",
+                log::warn!(
+                    "Unknown resource type '{}'. Known types: {}",
                     name,
                     ResourceType::all().iter().map(|t| t.name()).collect::<Vec<_>>().join(", "),
                 );
@@ -872,7 +872,7 @@ impl GovernorLog {
     /// Create a new log file at the given path (overwrites existing).
     fn new(path: &Path) -> Self {
         let file = std::fs::File::create(path)
-            .map_err(|e| eprintln!("Warning: cannot create governor log: {}", e))
+            .map_err(|e| log::warn!("Cannot create governor log: {}", e))
             .ok();
         GovernorLog { file }
     }
@@ -1317,6 +1317,7 @@ impl ResourceGovernor {
             effective: Arc::clone(&self.effective),
             throttle: Arc::clone(&self.throttle),
             emergency: Arc::clone(&self.emergency),
+            prev_cpu: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -1328,14 +1329,14 @@ impl ResourceGovernor {
         self.status_source().status_line()
     }
 
-    /// Print a summary of the current effective resource values to stderr.
+    /// Print a summary of the current effective resource values to stdout.
     pub fn print_summary(&self) {
         let effective = self.effective.read().unwrap();
         if effective.is_empty() {
             return;
         }
         let strategy_name = self.strategy.lock().unwrap().name().to_string();
-        eprintln!("Resource governor: strategy={}", strategy_name);
+        println!("Resource governor: strategy={}", strategy_name);
         let mut entries: Vec<_> = effective.iter().collect();
         entries.sort_by_key(|(k, _)| (*k).clone());
         for (name, value) in entries {
@@ -1348,9 +1349,9 @@ impl ResourceGovernor {
             } else {
                 String::new()
             };
-            eprintln!("  {}: {}{}", name, format_value(name, *value), budget_info);
+            println!("  {}: {}{}", name, format_value(name, *value), budget_info);
         }
-        eprintln!();
+        println!();
     }
 }
 
@@ -1365,6 +1366,8 @@ pub struct ResourceStatusSource {
     effective: Arc<RwLock<HashMap<String, u64>>>,
     throttle: Arc<AtomicBool>,
     emergency: Arc<AtomicBool>,
+    /// Previous CPU tick count and sample time for instantaneous CPU % computation.
+    prev_cpu: Arc<Mutex<Option<(u64, Instant)>>>,
 }
 
 impl ResourceStatusSource {
@@ -1382,12 +1385,44 @@ impl ResourceStatusSource {
             parts.push(format!("rss: {}", format_value("mem", snapshot.rss_bytes)));
         }
 
-        // Always show thread count
+        // CPU usage — instantaneous % from tick deltas between samples
+        let num_cpus = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        let total_ticks = snapshot.cpu_user_ticks + snapshot.cpu_system_ticks;
+        let cpu_pct = {
+            let mut prev = self.prev_cpu.lock().unwrap();
+            let pct = if let Some((prev_ticks, prev_time)) = *prev {
+                let dt = prev_time.elapsed().as_secs_f64();
+                if dt > 0.0 && snapshot.ticks_per_sec > 0.0 {
+                    let delta_ticks = total_ticks.saturating_sub(prev_ticks) as f64;
+                    let delta_secs = delta_ticks / snapshot.ticks_per_sec;
+                    (delta_secs / dt) * 100.0 // percentage across all cores
+                } else {
+                    0.0
+                }
+            } else {
+                0.0
+            };
+            *prev = Some((total_ticks, Instant::now()));
+            pct
+        };
+        parts.push(format!("cpu: {:.0}%/{}", cpu_pct, num_cpus * 100));
+
+        // Show thread budget (effective/ceiling), not process thread count
         if let Some(thread_budget) = self.budget.get("threads") {
-            parts.push(format!("threads: {}/{}", snapshot.active_threads, thread_budget.ceiling()));
+            let eff = effective.get("threads").copied().unwrap_or(0);
+            parts.push(format!("threads: {}/{}", eff, thread_budget.ceiling()));
         } else {
             parts.push(format!("threads: {}", snapshot.active_threads));
         }
+
+        // I/O throughput (cumulative bytes — UI computes rates from deltas)
+        parts.push(format!("io_r: {}", format_value("mem", snapshot.io_read_bps)));
+        parts.push(format!("io_w: {}", format_value("mem", snapshot.io_write_bps)));
+
+        // Page faults (cumulative counts)
+        parts.push(format!("pgfault: {}/{}", snapshot.major_faults, snapshot.minor_faults));
 
         // Show remaining budgeted resources (skip mem/threads already shown)
         let mut names: Vec<&String> = self.budget.keys()
@@ -1409,6 +1444,30 @@ impl ResourceStatusSource {
         }
 
         parts.join(" | ")
+    }
+
+    /// Whether the governor is in emergency state.
+    pub fn is_emergency(&self) -> bool {
+        self.emergency.load(Ordering::Relaxed)
+    }
+
+    /// Return how many percentage points RSS exceeds the memory ceiling.
+    ///
+    /// Returns 0.0 if RSS is at or below the ceiling, or if no memory
+    /// budget is configured.
+    pub fn rss_overage_pct(&self) -> f64 {
+        if let Some(mem_budget) = self.budget.get("mem") {
+            let ceiling = mem_budget.ceiling();
+            if ceiling > 0 {
+                let snapshot = SystemSnapshot::sample();
+                let pct = (snapshot.rss_bytes as f64 / ceiling as f64) * 100.0;
+                (pct - 100.0).max(0.0)
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        }
     }
 }
 

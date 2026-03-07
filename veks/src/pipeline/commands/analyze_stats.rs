@@ -219,20 +219,20 @@ impl CommandOp for AnalyzeStatsOp {
                 .filter(|&&v| v < lower_fence || v > upper_fence)
                 .count();
 
-            ctx.display.log(&format!("Dimension {} statistics ({} vectors):", d, stats.count));
-            ctx.display.log(&format!("  Mean:     {:.6}", stats.mean));
-            ctx.display.log(&format!("  Variance: {:.6}", stats.variance));
-            ctx.display.log(&format!("  StdDev:   {:.6}", stats.std_dev));
-            ctx.display.log(&format!("  Min:      {:.6}", stats.min));
-            ctx.display.log(&format!("  Max:      {:.6}", stats.max));
-            ctx.display.log(&format!("  Skewness: {:.4} ({})", stats.skewness, skewness_label(stats.skewness)));
-            ctx.display.log(&format!("  Kurtosis: {:.4} ({})", stats.kurtosis, kurtosis_label(stats.kurtosis)));
-            ctx.display.log("  Percentiles:");
-            ctx.display.log(&format!(
+            ctx.ui.log(&format!("Dimension {} statistics ({} vectors):", d, stats.count));
+            ctx.ui.log(&format!("  Mean:     {:.6}", stats.mean));
+            ctx.ui.log(&format!("  Variance: {:.6}", stats.variance));
+            ctx.ui.log(&format!("  StdDev:   {:.6}", stats.std_dev));
+            ctx.ui.log(&format!("  Min:      {:.6}", stats.min));
+            ctx.ui.log(&format!("  Max:      {:.6}", stats.max));
+            ctx.ui.log(&format!("  Skewness: {:.4} ({})", stats.skewness, skewness_label(stats.skewness)));
+            ctx.ui.log(&format!("  Kurtosis: {:.4} ({})", stats.kurtosis, kurtosis_label(stats.kurtosis)));
+            ctx.ui.log("  Percentiles:");
+            ctx.ui.log(&format!(
                 "    p1={:.4}  p5={:.4}  p25={:.4}  p50={:.4}  p75={:.4}  p95={:.4}  p99={:.4}",
                 p1, p5, p25, p50, p75, p95, p99
             ));
-            ctx.display.log(&format!(
+            ctx.ui.log(&format!(
                 "  Outliers: {} ({:.1}%), fences: [{:.4}, {:.4}]",
                 outliers,
                 outliers as f64 / effective_count as f64 * 100.0,
@@ -241,11 +241,11 @@ impl CommandOp for AnalyzeStatsOp {
             ));
         } else if all_dimensions {
             // Summary table for all dimensions
-            ctx.display.log(&format!(
+            ctx.ui.log(&format!(
                 "{:>5} {:>12} {:>12} {:>12} {:>12} {:>10} {:>10}",
                 "Dim", "Mean", "StdDev", "Min", "Max", "Skewness", "Kurtosis"
             ));
-            ctx.display.log(&format!("{}", "-".repeat(83)));
+            ctx.ui.log(&format!("{}", "-".repeat(83)));
 
             for d in 0..dim {
                 let mut values: Vec<f32> = Vec::with_capacity(effective_count);
@@ -254,7 +254,7 @@ impl CommandOp for AnalyzeStatsOp {
                     values.push(vec[d]);
                 }
                 let stats = DimensionStats::compute(&values);
-                ctx.display.log(&format!(
+                ctx.ui.log(&format!(
                     "{:5} {:12.6} {:12.6} {:12.6} {:12.6} {:10.4} {:10.4}",
                     d, stats.mean, stats.std_dev, stats.min, stats.max, stats.skewness, stats.kurtosis
                 ));
@@ -268,16 +268,16 @@ impl CommandOp for AnalyzeStatsOp {
             }
             let stats = DimensionStats::compute(&all_values);
 
-            ctx.display.log(&format!(
+            ctx.ui.log(&format!(
                 "Global statistics ({} vectors, {} dims, {} values):",
                 effective_count, dim, all_values.len()
             ));
-            ctx.display.log(&format!("  Mean:     {:.6}", stats.mean));
-            ctx.display.log(&format!("  StdDev:   {:.6}", stats.std_dev));
-            ctx.display.log(&format!("  Min:      {:.6}", stats.min));
-            ctx.display.log(&format!("  Max:      {:.6}", stats.max));
-            ctx.display.log(&format!("  Skewness: {:.4}", stats.skewness));
-            ctx.display.log(&format!("  Kurtosis: {:.4}", stats.kurtosis));
+            ctx.ui.log(&format!("  Mean:     {:.6}", stats.mean));
+            ctx.ui.log(&format!("  StdDev:   {:.6}", stats.std_dev));
+            ctx.ui.log(&format!("  Min:      {:.6}", stats.min));
+            ctx.ui.log(&format!("  Max:      {:.6}", stats.max));
+            ctx.ui.log(&format!("  Skewness: {:.4}", stats.skewness));
+            ctx.ui.log(&format!("  Kurtosis: {:.4}", stats.kurtosis));
         }
 
         CommandResult {
@@ -375,6 +375,9 @@ mod tests {
 
     fn test_ctx(dir: &Path) -> StreamContext {
         StreamContext {
+            dataset_name: String::new(),
+            profile: String::new(),
+            profile_names: vec![],
             workspace: dir.to_path_buf(),
             scratch: dir.join(".scratch"),
             cache: dir.join(".cache"),
@@ -384,7 +387,7 @@ mod tests {
             threads: 1,
             step_id: String::new(),
             governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
-            display: crate::pipeline::display::ProgressDisplay::new(),
+            ui: crate::ui::UiHandle::new(std::sync::Arc::new(crate::ui::TestSink::new())),
         }
     }
 

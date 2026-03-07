@@ -121,7 +121,7 @@ impl CommandOp for AnalyzeVerifyProfilesOp {
         }
 
         let effective = sample.min(vec_count);
-        ctx.display.log(&format!(
+        ctx.ui.log(&format!(
             "Verifying {} vectors (sampling {}) against model ({} dims)",
             vec_count, effective, model.dimensions
         ));
@@ -151,7 +151,7 @@ impl CommandOp for AnalyzeVerifyProfilesOp {
 
             if verbose || !pass {
                 let status = if pass { "ok" } else { "FAIL" };
-                ctx.display.log(&format!(
+                ctx.ui.log(&format!(
                     "  dim[{}]: KS D={:.4} (threshold={:.4}) — {}",
                     d, ks_d, threshold, status
                 ));
@@ -159,14 +159,14 @@ impl CommandOp for AnalyzeVerifyProfilesOp {
         }
 
         let avg_ks = total_ks / vec_dim as f64;
-        ctx.display.log("");
-        ctx.display.log(&format!(
+        ctx.ui.log("");
+        ctx.ui.log(&format!(
             "Results: {}/{} dimensions pass (avg KS D={:.4}, threshold={:.4})",
             pass_count, vec_dim, avg_ks, threshold
         ));
 
         if fail_count == 0 {
-            ctx.display.log("PASS");
+            ctx.ui.log("PASS");
             CommandResult {
                 status: Status::Ok,
                 message: format!(
@@ -177,7 +177,7 @@ impl CommandOp for AnalyzeVerifyProfilesOp {
                 elapsed: start.elapsed(),
             }
         } else {
-            ctx.display.log(&format!("FAIL ({} dimensions exceeded threshold)", fail_count));
+            ctx.ui.log(&format!("FAIL ({} dimensions exceeded threshold)", fail_count));
             CommandResult {
                 status: Status::Error,
                 message: format!(
@@ -347,6 +347,9 @@ mod tests {
 
     fn test_ctx(dir: &Path) -> StreamContext {
         StreamContext {
+            dataset_name: String::new(),
+            profile: String::new(),
+            profile_names: vec![],
             workspace: dir.to_path_buf(),
             scratch: dir.join(".scratch"),
             cache: dir.join(".cache"),
@@ -356,7 +359,7 @@ mod tests {
             threads: 1,
             step_id: String::new(),
             governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
-            display: crate::pipeline::display::ProgressDisplay::new(),
+            ui: crate::ui::UiHandle::new(std::sync::Arc::new(crate::ui::TestSink::new())),
         }
     }
 

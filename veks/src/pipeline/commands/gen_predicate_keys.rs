@@ -30,7 +30,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
@@ -47,6 +47,7 @@ use crate::pipeline::command::{
     CommandDoc, CommandOp, CommandResult, OptionDesc, Options, ResourceDesc, Status, StreamContext,
     render_options_table,
 };
+use super::slab::survey_from_json;
 
 /// Pipeline command: generate predicate answer keys from metadata and predicate slabs.
 pub struct GenPredicateKeysOp;
@@ -221,12 +222,10 @@ fn eval_record_fallback(
 ) {
     let pred_len = memo.count;
 
-    // Reset pass counts
     for c in pass_counts.iter_mut() {
         *c = 0;
     }
 
-    // Evaluate conditions for fields present in the record
     for (field_name, field_value) in &mnode.fields {
         if let Some(conditions) = memo.field_conditions.get(field_name.as_str()) {
             for (pred_idx, op, comparands) in conditions {
@@ -237,7 +236,6 @@ fn eval_record_fallback(
         }
     }
 
-    // Missing fields: Eq Null / In Null / Ne <non-Null> pass
     for (field_name, conditions) in &memo.field_conditions {
         if !mnode.fields.contains_key(field_name.as_str()) {
             for (pred_idx, op, comparands) in conditions {
@@ -248,7 +246,6 @@ fn eval_record_fallback(
         }
     }
 
-    // Compiled predicates match when all conditions pass
     for i in 0..pred_len {
         let required = memo.condition_counts[i];
         if required > 0 && pass_counts[i] == required {
@@ -258,7 +255,6 @@ fn eval_record_fallback(
         }
     }
 
-    // Fallback predicates use full tree evaluation
     for (idx, pnode) in compiled_scan.fallback() {
         if evaluate(pnode, mnode) {
             if limit == 0 || local_matches[*idx].len() < limit {
@@ -287,64 +283,61 @@ struct SegmentInfo {
     cached: bool,
 }
 
-/// Plan segments from sorted page entries.
+/// Plan segments at exact `segment_size` ordinal boundaries.
+///
+/// Segments cover fixed ordinal ranges `[0, S), [S, 2S), …` where
+/// `S = segment_size`.  Pages that straddle a boundary are included in
+/// both adjacent segments; the scan loop filters records to the segment's
+/// ordinal range.
 fn plan_segments(
     page_entries: &[slabtastic::PageEntry],
-    total_records: u64,
+    end_ordinal: u64,
     segment_size: usize,
     cache_dir: Option<&Path>,
     step_id: &str,
     pred_count: usize,
+    first_ordinal: i64,
 ) -> Vec<SegmentInfo> {
-    if page_entries.is_empty() {
+    if page_entries.is_empty() || end_ordinal == 0 {
         return Vec::new();
     }
 
     let mut segments = Vec::new();
-    let mut seg_page_start = 0usize;
-    let mut seg_start_ordinal = page_entries[0].start_ordinal;
-    let mut current_count = 0usize;
+    let mut seg_start: i64 = first_ordinal;
 
-    for (i, entry) in page_entries.iter().enumerate() {
-        let page_records = if i + 1 < page_entries.len() {
-            (page_entries[i + 1].start_ordinal - entry.start_ordinal) as usize
-        } else {
-            (total_records as i64 - entry.start_ordinal) as usize
+    while (seg_start as u64) < end_ordinal {
+        let seg_end = ((seg_start as u64) + segment_size as u64)
+            .min(end_ordinal) as i64;
+
+        // First page: last page with start_ordinal <= seg_start (contains seg_start).
+        let ps = page_entries.partition_point(|e| e.start_ordinal <= seg_start);
+        let page_start_idx = if ps > 0 { ps - 1 } else { 0 };
+
+        // Last page (exclusive): first page with start_ordinal >= seg_end.
+        let page_end_idx = page_entries.partition_point(|e| e.start_ordinal < seg_end);
+
+        let (cache_path, cached) = match cache_dir {
+            Some(dir) => {
+                let path = dir.join(format!(
+                    "{}.seg_{:010}_{:010}.predkeys.slab",
+                    step_id, seg_start, seg_end,
+                ));
+                let valid = is_cache_valid(&path, pred_count);
+                (Some(path), valid)
+            }
+            None => (None, false),
         };
-        current_count += page_records;
 
-        if current_count >= segment_size || i + 1 == page_entries.len() {
-            let end_ordinal = if i + 1 < page_entries.len() {
-                page_entries[i + 1].start_ordinal
-            } else {
-                total_records as i64
-            };
+        segments.push(SegmentInfo {
+            page_start_idx,
+            page_end_idx,
+            start_ordinal: seg_start,
+            end_ordinal: seg_end,
+            cache_path,
+            cached,
+        });
 
-            let (cache_path, cached) = match cache_dir {
-                Some(dir) => {
-                    let path = dir.join(format!(
-                        "{}.seg_{:010}_{:010}.predkeys.slab",
-                        step_id, seg_start_ordinal, end_ordinal,
-                    ));
-                    let valid = is_cache_valid(&path, pred_count);
-                    (Some(path), valid)
-                }
-                None => (None, false),
-            };
-
-            segments.push(SegmentInfo {
-                page_start_idx: seg_page_start,
-                page_end_idx: i + 1,
-                start_ordinal: seg_start_ordinal,
-                end_ordinal,
-                cache_path,
-                cached,
-            });
-
-            seg_page_start = i + 1;
-            seg_start_ordinal = end_ordinal;
-            current_count = 0;
-        }
+        seg_start = seg_end;
     }
 
     segments
@@ -386,19 +379,6 @@ fn write_segment_cache(
     Ok(())
 }
 
-/// Read segment results from a cache slab.
-fn read_segment_cache(path: &Path, pred_count: usize) -> Result<Vec<Vec<i32>>, String> {
-    let reader =
-        SlabReader::open(path).map_err(|e| format!("cache read open: {}", e))?;
-    let mut results = Vec::with_capacity(pred_count);
-    for pi in 0..pred_count {
-        let data = reader
-            .get(pi as i64)
-            .map_err(|e| format!("cache read pred {}: {}", pi, e))?;
-        results.push(read_ordinals(&data));
-    }
-    Ok(results)
-}
 
 fn read_ordinals(data: &[u8]) -> Vec<i32> {
     let mut cursor = std::io::Cursor::new(data);
@@ -430,6 +410,89 @@ fn format_bytes(bytes: u64) -> String {
         format!("{:.1} GB", b / GB)
     } else {
         format!("{:.1} TB", b / TB)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Memory profiling
+// ---------------------------------------------------------------------------
+
+/// Detailed memory breakdown from /proc/self/status.
+#[derive(Clone, Debug)]
+struct MemProfile {
+    vm_rss: u64,       // VmRSS: total resident
+    rss_anon: u64,     // RssAnon: heap + stack (anonymous pages)
+    rss_file: u64,     // RssFile: mmap'd file pages (includes slab mmap)
+    rss_shmem: u64,    // RssShmem: shared memory
+    vm_data: u64,      // VmData: private data segments (heap capacity)
+    vm_swap: u64,      // VmSwap: swapped out
+}
+
+impl MemProfile {
+    fn sample() -> Self {
+        #[cfg(target_os = "linux")]
+        {
+            let mut p = MemProfile {
+                vm_rss: 0, rss_anon: 0, rss_file: 0, rss_shmem: 0,
+                vm_data: 0, vm_swap: 0,
+            };
+            if let Ok(content) = std::fs::read_to_string("/proc/self/status") {
+                for line in content.lines() {
+                    let mut parts = line.split_whitespace();
+                    if let (Some(key), Some(val)) = (parts.next(), parts.next()) {
+                        let kb: u64 = val.parse().unwrap_or(0);
+                        let bytes = kb * 1024;
+                        match key {
+                            "VmRSS:" => p.vm_rss = bytes,
+                            "RssAnon:" => p.rss_anon = bytes,
+                            "RssFile:" => p.rss_file = bytes,
+                            "RssShmem:" => p.rss_shmem = bytes,
+                            "VmData:" => p.vm_data = bytes,
+                            "VmSwap:" => p.vm_swap = bytes,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            p
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            MemProfile {
+                vm_rss: 0, rss_anon: 0, rss_file: 0, rss_shmem: 0,
+                vm_data: 0, vm_swap: 0,
+            }
+        }
+    }
+
+    fn summary(&self) -> String {
+        format!(
+            "VmRSS={} (anon={}, file={}, shmem={}) VmData={} VmSwap={}",
+            format_bytes(self.vm_rss),
+            format_bytes(self.rss_anon),
+            format_bytes(self.rss_file),
+            format_bytes(self.rss_shmem),
+            format_bytes(self.vm_data),
+            format_bytes(self.vm_swap),
+        )
+    }
+
+    fn delta_from(&self, baseline: &MemProfile) -> String {
+        let d = |cur: u64, base: u64| -> String {
+            if cur >= base {
+                format!("+{}", format_bytes(cur - base))
+            } else {
+                format!("-{}", format_bytes(base - cur))
+            }
+        };
+        format!(
+            "Δ VmRSS={} (anon={}, file={}, shmem={}) VmData={}",
+            d(self.vm_rss, baseline.vm_rss),
+            d(self.rss_anon, baseline.rss_anon),
+            d(self.rss_file, baseline.rss_file),
+            d(self.rss_shmem, baseline.rss_shmem),
+            d(self.vm_data, baseline.vm_data),
+        )
     }
 }
 
@@ -488,9 +551,27 @@ satisfy the corresponding predicate.
             Err(e) => return error_result(e, start),
         };
 
+        let survey_str = match options.require("survey") {
+            Ok(s) => s,
+            Err(e) => return error_result(e, start),
+        };
+
         let input_path = resolve_path(input_str, &ctx.workspace);
         let predicates_path = resolve_path(predicates_str, &ctx.workspace);
         let output_path = resolve_path(output_str, &ctx.workspace);
+        let survey_path = resolve_path(survey_str, &ctx.workspace);
+
+        // Load survey data
+        let survey = match survey_from_json(&survey_path) {
+            Ok(s) => s,
+            Err(e) => return error_result(format!("failed to load survey: {}", e), start),
+        };
+        ctx.ui.log(&format!(
+            "generate predicate-keys: survey loaded: {} fields, {} records sampled, {} total records",
+            survey.field_stats.len(),
+            survey.sampled,
+            survey.total_records,
+        ));
 
         let limit: usize = options
             .get("limit")
@@ -510,6 +591,22 @@ satisfy the corresponding predicate.
             .get("selectivity-max")
             .and_then(|s| s.parse().ok());
 
+        // Parse optional range to limit ordinal scanning to a profile subset.
+        let range_start: i64;
+        let range_end: Option<i64>;
+        if let Some(range_str) = options.get("range") {
+            match parse_ordinal_range(range_str) {
+                Ok((s, e)) => {
+                    range_start = s;
+                    range_end = e;
+                }
+                Err(e) => return error_result(format!("invalid range '{}': {}", range_str, e), start),
+            }
+        } else {
+            range_start = 0;
+            range_end = None;
+        }
+
         // ── Phase 1: Load predicates and memoize ─────────────────────────
 
         let pred_reader = match SlabReader::open(&predicates_path) {
@@ -528,14 +625,14 @@ satisfy the corresponding predicate.
                 Ok(data) => match PNode::from_bytes_named(&data) {
                     Ok(pnode) => predicates.push(pnode),
                     Err(e) => {
-                        ctx.display.log(&format!(
+                        ctx.ui.log(&format!(
                             "generate predicate-keys: skipping predicate {}: {}",
                             ord, e
                         ));
                     }
                 },
                 Err(e) => {
-                    ctx.display.log(&format!(
+                    ctx.ui.log(&format!(
                         "generate predicate-keys: error reading predicate {}: {}",
                         ord, e
                     ));
@@ -544,15 +641,59 @@ satisfy the corresponding predicate.
         }
 
         let pred_len = predicates.len();
-        ctx.display.log(&format!(
+        ctx.ui.log(&format!(
             "generate predicate-keys: loaded {} predicates from {}",
             pred_len,
             predicates_path.display(),
         ));
 
+        // ── Predicate structure analysis ─────────────────────────────────
+        if !predicates.is_empty() {
+            // Build histogram of structural fingerprints
+            let mut fingerprint_counts: indexmap::IndexMap<String, (usize, usize)> =
+                indexmap::IndexMap::new();
+            for (i, pred) in predicates.iter().enumerate() {
+                let fp_str = pred.fingerprint().to_string();
+                let entry = fingerprint_counts.entry(fp_str).or_insert((0, i));
+                entry.0 += 1;
+            }
+            // Sort by descending count
+            fingerprint_counts.sort_by(|_, a, _, b| b.0.cmp(&a.0));
+
+            let num_forms = fingerprint_counts.len();
+            if num_forms == 1 {
+                let (fp_str, (count, example_idx)) = fingerprint_counts.iter().next().unwrap();
+                ctx.ui.log(&format!(
+                    "generate predicate-keys: all {} predicates share one structural form:",
+                    count,
+                ));
+                ctx.ui.log(&format!("    form: {}", fp_str));
+                ctx.ui.log(&format!(
+                    "    example[{}]: {}",
+                    example_idx, predicates[*example_idx],
+                ));
+            } else {
+                ctx.ui.log(&format!(
+                    "generate predicate-keys: {} distinct predicate forms across {} predicates:",
+                    num_forms, pred_len,
+                ));
+                for (fp_str, (count, example_idx)) in &fingerprint_counts {
+                    let pct = *count as f64 / pred_len as f64 * 100.0;
+                    ctx.ui.log(&format!(
+                        "    {:>6} ({:5.1}%) — {}",
+                        count, pct, fp_str,
+                    ));
+                    ctx.ui.log(&format!(
+                        "             example[{}]: {}",
+                        example_idx, predicates[*example_idx],
+                    ));
+                }
+            }
+        }
+
         // Memoize: flatten into field-indexed conditions
         let memo = memoize_predicates(&predicates);
-        ctx.display.log(&format!(
+        ctx.ui.log(&format!(
             "generate predicate-keys: memoized {} field-indexed, {} fallback, {} fields",
             memo.count - memo.fallback.len(),
             memo.fallback.len(),
@@ -561,11 +702,11 @@ satisfy the corresponding predicate.
 
         // ── Phase 2: Open metadata slab ──────────────────────────────────
 
-        let index_pb: std::cell::RefCell<Option<indicatif::ProgressBar>> = std::cell::RefCell::new(None);
-        let display = &ctx.display;
+        let index_pb: std::cell::RefCell<Option<crate::ui::ProgressHandle>> = std::cell::RefCell::new(None);
+        let ui = &ctx.ui;
         let meta_reader = match SlabReader::open_with_progress(&input_path, |p| match p {
             OpenProgress::PagesPageRead { page_count } => {
-                *index_pb.borrow_mut() = Some(display.bar(*page_count as u64, "slab index"));
+                *index_pb.borrow_mut() = Some(ui.bar(*page_count as u64, "slab index"));
             }
             OpenProgress::IndexBuild { done, total: _ } => {
                 if let Some(ref bar) = *index_pb.borrow() {
@@ -574,9 +715,9 @@ satisfy the corresponding predicate.
             }
             OpenProgress::IndexComplete { total_records } => {
                 if let Some(bar) = index_pb.borrow_mut().take() {
-                    bar.finish_and_clear();
+                    bar.finish();
                 }
-                display.log(&format!("    slab index: complete, {} total records", total_records));
+                ui.log(&format!("    slab index: complete, {} total records", total_records));
             }
         }) {
             Ok(r) => r,
@@ -588,7 +729,22 @@ satisfy the corresponding predicate.
             }
         };
 
-        let total_records = meta_reader.total_records();
+        let slab_total_records = meta_reader.total_records();
+
+        // Apply range to limit scanning to a subset of ordinals.
+        let effective_start = range_start.max(0);
+        let effective_end = match range_end {
+            Some(e) => (e as u64).min(slab_total_records),
+            None => slab_total_records,
+        };
+        let total_records = effective_end.saturating_sub(effective_start as u64);
+
+        if range_end.is_some() || range_start > 0 {
+            ctx.ui.log(&format!(
+                "generate predicate-keys: range [{}, {}) — scanning {} of {} total records",
+                effective_start, effective_end, total_records, slab_total_records,
+            ));
+        }
 
         let mut page_entries = meta_reader.page_entries();
         page_entries.sort_by_key(|e| e.start_ordinal);
@@ -605,14 +761,14 @@ satisfy the corresponding predicate.
                         Ok(data) => {
                             match discover_schema(data) {
                                 Ok(s) => {
-                                    ctx.display.log(&format!(
+                                    ctx.ui.log(&format!(
                                         "generate predicate-keys: schema discovered: {} fields",
                                         s.field_count,
                                     ));
                                     Some(s)
                                 }
                                 Err(e) => {
-                                    ctx.display.log(&format!(
+                                    ctx.ui.log(&format!(
                                         "generate predicate-keys: schema discovery failed: {}, using fallback path",
                                         e,
                                     ));
@@ -662,7 +818,15 @@ satisfy the corresponding predicate.
         //   per_segment_bytes = pred_count × est_matches_per_pred × 4 × threads
         // where est_matches_per_pred = min(segment_size × selectivity, limit).
         let segment_size = {
-            let est_selectivity = selectivity.unwrap_or(0.10); // conservative 10% default
+            // Use explicit selectivity, or estimate from survey distinct counts
+            let est_selectivity = selectivity.unwrap_or_else(|| {
+                let est = estimate_selectivity_from_survey(&memo, &survey);
+                ctx.ui.log(&format!(
+                    "generate predicate-keys: selectivity estimated from survey: {:.4}%",
+                    est * 100.0,
+                ));
+                est
+            });
             let est_matches_per_pred = {
                 let raw = (segment_size as f64 * est_selectivity).ceil() as usize;
                 if limit > 0 { raw.min(limit) } else { raw }
@@ -691,20 +855,20 @@ satisfy the corresponding predicate.
                     let scale = available as f64 / bytes_per_segment as f64;
                     let adjusted = ((segment_size as f64) * scale).floor() as usize;
                     let adjusted = adjusted.max(1000); // floor at 1000
-                    ctx.display.log(
+                    ctx.ui.log(
                         "generate predicate-keys: memory-aware segment sizing");
-                    ctx.display.log(&format!(
+                    ctx.ui.log(&format!(
                         "    estimated {}/segment ({} preds × {} matches × 4B × {} threads)",
                         format_bytes(bytes_per_segment),
                         pred_len, est_matches_per_pred, num_threads,
                     ));
-                    ctx.display.log(&format!(
+                    ctx.ui.log(&format!(
                         "    available memory: {} (RSS: {}, ceiling: {})",
                         format_bytes(available),
                         format_bytes(snapshot.rss_bytes),
                         format_bytes(mem_ceiling),
                     ));
-                    ctx.display.log(&format!(
+                    ctx.ui.log(&format!(
                         "    reducing segment_size: {} → {}",
                         segment_size, adjusted,
                     ));
@@ -736,11 +900,12 @@ satisfy the corresponding predicate.
 
         let segments = plan_segments(
             &page_entries,
-            total_records,
+            effective_end,
             segment_size,
             Some(cache_dir.as_path()),
             &ctx.step_id,
             pred_len,
+            effective_start,
         );
 
         let cached_count = segments.iter().filter(|s| s.cached).count();
@@ -791,29 +956,29 @@ satisfy the corresponding predicate.
                 }
             };
 
-            ctx.display.log("generate predicate-keys: summary");
-            ctx.display.log(&format!("    predicates:             {}", pred_len));
-            ctx.display.log(&format!("    records:                {}", total_records));
-            ctx.display.log(&format!("    unique fields targeted: {}", memo.field_conditions.len()));
-            ctx.display.log(&format!("    total conditions:       {}", total_conditions));
-            ctx.display.log(&format!("    total comparands:       {}", total_comparands));
-            ctx.display.log(&format!("    comparisons/record:     {}", comparisons_per_record));
-            ctx.display.log(&format!("    total comparisons:      {}", total_comparisons));
-            ctx.display.log(&format!("    conditions/predicate:   min={} max={} mean={:.1}",
+            ctx.ui.log("generate predicate-keys: summary");
+            ctx.ui.log(&format!("    predicates:             {}", pred_len));
+            ctx.ui.log(&format!("    records:                {}", total_records));
+            ctx.ui.log(&format!("    unique fields targeted: {}", memo.field_conditions.len()));
+            ctx.ui.log(&format!("    total conditions:       {}", total_conditions));
+            ctx.ui.log(&format!("    total comparands:       {}", total_comparands));
+            ctx.ui.log(&format!("    comparisons/record:     {}", comparisons_per_record));
+            ctx.ui.log(&format!("    total comparisons:      {}", total_comparisons));
+            ctx.ui.log(&format!("    conditions/predicate:   min={} max={} mean={:.1}",
                 min_conds, max_conds, mean_conds));
-            ctx.display.log(&format!("    limit/predicate:        {}", limit_desc));
-            ctx.display.log(&format!("    segments:               {} ({} cached, {} to scan)",
+            ctx.ui.log(&format!("    limit/predicate:        {}", limit_desc));
+            ctx.ui.log(&format!("    segments:               {} ({} cached, {} to scan)",
                 segments.len(), cached_count, uncached_count));
-            ctx.display.log(&format!("    segment size:           {} records", segment_size));
-            ctx.display.log(&format!("    threads:                {}", num_threads));
-            ctx.display.log("");
+            ctx.ui.log(&format!("    segment size:           {} records", segment_size));
+            ctx.ui.log(&format!("    threads:                {}", num_threads));
+            ctx.ui.log("");
 
             // Output size math breakdown
             let gib = 1_073_741_824.0f64;
-            ctx.display.log(&format!("    max output size:        {:.1} GB", max_output_bytes as f64 / gib));
-            ctx.display.log(&format!("      = {} ordinals/pred × 4 bytes × {} preds",
+            ctx.ui.log(&format!("    max output size:        {:.1} GB", max_output_bytes as f64 / gib));
+            ctx.ui.log(&format!("      = {} ordinals/pred × 4 bytes × {} preds",
                 max_ordinals_per_pred, pred_len));
-            ctx.display.log("");
+            ctx.ui.log("");
 
             // Selectivity-based estimates: expected matches per predicate and
             // total output. When selectivity/selectivity-max are provided from
@@ -848,29 +1013,29 @@ satisfy the corresponding predicate.
                 let sel_min = selectivity.unwrap();
                 let sel_max = selectivity_max.unwrap_or(sel_min);
                 if (sel_min - sel_max).abs() < f64::EPSILON {
-                    ctx.display.log(&format!("    selectivity:            {:.4}%  (from predicate generation)",
+                    ctx.ui.log(&format!("    selectivity:            {:.4}%  (from predicate generation)",
                         sel_min * 100.0));
                 } else {
-                    ctx.display.log(&format!("    selectivity:            {:.4}% .. {:.4}%  (from predicate generation)",
+                    ctx.ui.log(&format!("    selectivity:            {:.4}% .. {:.4}%  (from predicate generation)",
                         sel_min * 100.0, sel_max * 100.0));
                 }
                 let (matches, indices, bytes) = estimate_fn(sel_min);
-                ctx.display.log(&format!("    est. matches/pred:      {}", matches));
-                ctx.display.log(&format!("    est. total indices:     {}", indices));
-                ctx.display.log(&format!("    est. output size:       {}", format_bytes(bytes)));
+                ctx.ui.log(&format!("    est. matches/pred:      {}", matches));
+                ctx.ui.log(&format!("    est. total indices:     {}", indices));
+                ctx.ui.log(&format!("    est. output size:       {}", format_bytes(bytes)));
                 if sel_min != sel_max {
                     let (matches_hi, indices_hi, bytes_hi) = estimate_fn(sel_max);
-                    ctx.display.log(&format!("    est. matches/pred (hi): {}", matches_hi));
-                    ctx.display.log(&format!("    est. total indices (hi):{}", indices_hi));
-                    ctx.display.log(&format!("    est. output size (hi):  {}", format_bytes(bytes_hi)));
+                    ctx.ui.log(&format!("    est. matches/pred (hi): {}", matches_hi));
+                    ctx.ui.log(&format!("    est. total indices (hi):{}", indices_hi));
+                    ctx.ui.log(&format!("    est. output size (hi):  {}", format_bytes(bytes_hi)));
                 }
             } else {
-                ctx.display.log("    estimated output by selectivity (pass selectivity= to narrow):");
-                ctx.display.log(&format!("    {:>12}  {:>14}  {:>14}  {:>10}",
+                ctx.ui.log("    estimated output by selectivity (pass selectivity= to narrow):");
+                ctx.ui.log(&format!("    {:>12}  {:>14}  {:>14}  {:>10}",
                     "selectivity", "matches/pred", "total indices", "data size"));
                 for &sel in &sel_targets {
                     let (matches_per_pred, total_indices, data_bytes) = estimate_fn(sel);
-                    ctx.display.log(&format!("    {:>11.1}%  {:>14}  {:>14}  {:>10}",
+                    ctx.ui.log(&format!("    {:>11.1}%  {:>14}  {:>14}  {:>10}",
                         sel * 100.0,
                         matches_per_pred,
                         total_indices,
@@ -880,154 +1045,215 @@ satisfy the corresponding predicate.
         }
 
         // ── Phase 5: Process segments ────────────────────────────────────
+        //
+        // Each segment covers ~1M metadata records (aligned with KNN partition
+        // boundaries for tandem use). Results are cached per-segment so
+        // interrupted runs resume and subsets can be recomposed later.
 
         // Governor checkpoint before segment processing
         ctx.governor.checkpoint();
 
         let records_done = AtomicU64::new(0);
         let errors_done = AtomicU64::new(0);
+        let total_matches_counter = AtomicU64::new(0);
         let scan_start = Instant::now();
-        let next_segment = AtomicUsize::new(0);
 
-        // Progress bar for the scan phase
-        let scan_pb = ctx.display.bar(total_records, "scanning records");
+        // Memory profile: baseline before scan (before bars, so log doesn't
+        // disrupt the multi-progress region).
+        let scan_baseline = MemProfile::sample();
 
-        // Scan uncached segments — results are written to cache files and
-        // dropped immediately, keeping memory proportional to one segment per
-        // thread rather than all segments combined.
+        // Progress bars — ghost-line artifacts from sequential bar creation
+        // will be resolved by the ratatui migration (ui module).
+        let scan_pb = ctx.ui.bar(total_records, "scanning records");
+        let seg_pb = ctx.ui.bar(segments.len() as u64, "segments");
+        let sel_bar = ctx.ui.ratio(10_000, "selectivity");
+
         if uncached_count > 0 {
-            // Hint sequential access to enable kernel readahead
             meta_reader.advise_sequential();
 
-            let seg_ref = &segments;
-            let display = &ctx.display;
-            std::thread::scope(|s| {
-                // Prefetch thread — walks uncached segments in order, issuing
-                // MADV_WILLNEED for each segment's byte range so the kernel
-                // pages data in ahead of the scan threads.
-                {
-                    let reader = &meta_reader;
-                    let pe = &page_entries;
-                    s.spawn(move || {
-                        for seg in seg_ref.iter() {
-                            if seg.cached {
-                                continue;
-                            }
-                            let start = pe[seg.page_start_idx].file_offset as usize;
-                            let end = if seg.page_end_idx < pe.len() {
-                                pe[seg.page_end_idx].file_offset as usize
-                            } else {
-                                reader.file_len().unwrap_or(0) as usize
-                            };
-                            reader.prefetch_range(start, end);
-                        }
-                    });
+            // Process segments sequentially; parallelise pages *within* each
+            // segment.  This gives sequential I/O, bounded memory (one
+            // segment's matches at a time), and ordered cache writes.
+
+            let seg_byte_range = |seg: &SegmentInfo| -> (usize, usize) {
+                let start = page_entries[seg.page_start_idx].file_offset as usize;
+                let end = if seg.page_end_idx < page_entries.len() {
+                    page_entries[seg.page_end_idx].file_offset as usize
+                } else {
+                    meta_reader.file_len().unwrap_or(0) as usize
+                };
+                (start, end)
+            };
+
+            for (seg_idx, seg) in segments.iter().enumerate() {
+                if seg.cached {
+                    // Count cached records toward progress.
+                    let seg_records = (seg.end_ordinal - seg.start_ordinal) as u64;
+                    records_done.fetch_add(seg_records, Ordering::Relaxed);
+                    scan_pb.set_position(records_done.load(Ordering::Relaxed));
+                    continue;
                 }
 
-                let handles: Vec<_> = (0..num_threads)
-                    .map(|_| {
+                // Prefetch this segment's byte range.
+                let (byte_start, byte_end) = seg_byte_range(seg);
+                meta_reader.prefetch_range(byte_start, byte_end);
+
+                // Divide pages among threads.
+                let seg_pages = seg.page_end_idx - seg.page_start_idx;
+                let effective_threads = num_threads.min(seg_pages).max(1);
+
+                // Each thread produces its own per-predicate match vectors.
+                let thread_results: Vec<Vec<Vec<i32>>> =
+                    std::thread::scope(|s| {
                         let reader = &meta_reader;
                         let compiled_scan = &compiled_scan;
                         let memo = &memo;
                         let records_done = &records_done;
                         let errors_done = &errors_done;
-                        let next_segment = &next_segment;
                         let scan_pb = &scan_pb;
                         let page_entries = &page_entries;
-                        let display = display;
 
-                        s.spawn(move || {
-                            let mut pass_counts = vec![0u32; pred_len];
+                        let handles: Vec<_> = (0..effective_threads)
+                            .map(|tid| {
+                                // Divide pages for this thread (contiguous slice).
+                                let pages_per = seg_pages / effective_threads;
+                                let extra = seg_pages % effective_threads;
+                                let t_start = seg.page_start_idx
+                                    + tid * pages_per
+                                    + tid.min(extra);
+                                let t_end = t_start
+                                    + pages_per
+                                    + if tid < extra { 1 } else { 0 };
 
-                            loop {
-                                let seg_idx =
-                                    next_segment.fetch_add(1, Ordering::Relaxed);
-                                if seg_idx >= seg_ref.len() {
-                                    break;
-                                }
-                                let seg = &seg_ref[seg_idx];
-                                if seg.cached {
-                                    continue;
-                                }
+                                s.spawn(move || {
+                                    let mut local_matches: Vec<Vec<i32>> =
+                                        vec![Vec::new(); pred_len];
+                                    let mut pass_counts = vec![0u32; pred_len];
+                                    let mut local_rec_count = 0u64;
 
-                                let mut local_matches: Vec<Vec<i32>> =
-                                    vec![Vec::new(); pred_len];
-                                let mut local_rec_count = 0u64;
+                                    for pi in t_start..t_end {
+                                        let entry = &page_entries[pi];
+                                        let page_buf = reader.page_buf(entry);
+                                        let rec_count =
+                                            match Page::record_count_from_buf(page_buf) {
+                                                Ok(rc) => rc,
+                                                Err(_) => continue,
+                                            };
 
-                                for pi in seg.page_start_idx..seg.page_end_idx {
-                                    let entry = &page_entries[pi];
-                                    let page_buf = reader.page_buf(entry);
-                                    let rec_count = match Page::record_count_from_buf(page_buf) {
-                                        Ok(rc) => rc,
-                                        Err(_) => continue,
-                                    };
+                                        let page_start = entry.start_ordinal;
 
-                                    let page_start = entry.start_ordinal;
-
-                                    for rec_idx in 0..rec_count {
-                                        let data = match Page::get_record_ref_from_buf(
-                                            page_buf, rec_idx, rec_count,
-                                        ) {
-                                            Ok(d) => d,
-                                            Err(_) => continue,
+                                        // Clip to segment ordinal range (pages
+                                        // straddling a boundary appear in both
+                                        // adjacent segments).
+                                        let first_rec =
+                                            if page_start < seg.start_ordinal {
+                                                (seg.start_ordinal - page_start) as usize
+                                            } else {
+                                                0
+                                            };
+                                        let last_rec = if page_start + rec_count as i64
+                                            > seg.end_ordinal
+                                        {
+                                            (seg.end_ordinal - page_start) as usize
+                                        } else {
+                                            rec_count
                                         };
 
-                                        let ordinal =
-                                            (page_start + rec_idx as i64) as i32;
+                                        for rec_idx in first_rec..last_rec {
+                                            let data =
+                                                match Page::get_record_ref_from_buf(
+                                                    page_buf, rec_idx, rec_count,
+                                                ) {
+                                                    Ok(d) => d,
+                                                    Err(_) => continue,
+                                                };
 
-                                        // Reset pass counts
-                                        for c in pass_counts.iter_mut() {
-                                            *c = 0;
-                                        }
+                                            let ordinal =
+                                                (page_start + rec_idx as i64) as i32;
 
-                                        // Try zero-alloc scan
-                                        let schema_matched = match scan_record(
-                                            data,
-                                            compiled_scan,
-                                            &mut pass_counts,
-                                        ) {
-                                            Ok(matched) => matched,
-                                            Err(_) => {
-                                                errors_done
-                                                    .fetch_add(1, Ordering::Relaxed);
-                                                continue;
+                                            for c in pass_counts.iter_mut() {
+                                                *c = 0;
                                             }
-                                        };
 
-                                        if schema_matched {
-                                            // Check compiled predicates
-                                            for i in 0..pred_len {
-                                                let required =
-                                                    compiled_scan.required_count(i);
-                                                if required != u32::MAX
-                                                    && pass_counts[i] == required
-                                                {
-                                                    if limit == 0
-                                                        || local_matches[i].len() < limit
+                                            let schema_matched = match scan_record(
+                                                data,
+                                                compiled_scan,
+                                                &mut pass_counts,
+                                            ) {
+                                                Ok(matched) => matched,
+                                                Err(_) => {
+                                                    errors_done.fetch_add(
+                                                        1,
+                                                        Ordering::Relaxed,
+                                                    );
+                                                    continue;
+                                                }
+                                            };
+
+                                            if schema_matched {
+                                                for i in 0..pred_len {
+                                                    let required =
+                                                        compiled_scan.required_count(i);
+                                                    if required != u32::MAX
+                                                        && pass_counts[i] == required
                                                     {
-                                                        local_matches[i].push(ordinal);
+                                                        if limit == 0
+                                                            || local_matches[i].len()
+                                                                < limit
+                                                        {
+                                                            local_matches[i]
+                                                                .push(ordinal);
+                                                        }
                                                     }
                                                 }
-                                            }
 
-                                            // Fallback predicates still need MNode
-                                            if !compiled_scan.fallback().is_empty() {
-                                                match MNode::from_bytes(data) {
-                                                    Ok(mnode) => {
-                                                        for (idx, pnode) in
-                                                            compiled_scan.fallback()
-                                                        {
-                                                            if evaluate(pnode, &mnode) {
-                                                                if limit == 0
-                                                                    || local_matches[*idx]
-                                                                        .len()
-                                                                        < limit
-                                                                {
-                                                                    local_matches[*idx]
-                                                                        .push(ordinal);
+                                                if !compiled_scan
+                                                    .fallback()
+                                                    .is_empty()
+                                                {
+                                                    match MNode::from_bytes(data) {
+                                                        Ok(mnode) => {
+                                                            for (idx, pnode) in
+                                                                compiled_scan.fallback()
+                                                            {
+                                                                if evaluate(
+                                                                    pnode, &mnode,
+                                                                ) {
+                                                                    if limit == 0
+                                                                        || local_matches
+                                                                            [*idx]
+                                                                            .len()
+                                                                            < limit
+                                                                    {
+                                                                        local_matches
+                                                                            [*idx]
+                                                                            .push(
+                                                                                ordinal,
+                                                                            );
+                                                                    }
                                                                 }
                                                             }
                                                         }
+                                                        Err(_) => {
+                                                            errors_done.fetch_add(
+                                                                1,
+                                                                Ordering::Relaxed,
+                                                            );
+                                                        }
+                                                    }
+                                                }
+                                            } else {
+                                                match MNode::from_bytes(data) {
+                                                    Ok(mnode) => {
+                                                        eval_record_fallback(
+                                                            &mnode,
+                                                            memo,
+                                                            &mut pass_counts,
+                                                            &mut local_matches,
+                                                            compiled_scan,
+                                                            ordinal,
+                                                            limit,
+                                                        );
                                                     }
                                                     Err(_) => {
                                                         errors_done.fetch_add(
@@ -1037,80 +1263,144 @@ satisfy the corresponding predicate.
                                                     }
                                                 }
                                             }
-                                        } else {
-                                            // Schema mismatch — full fallback
-                                            match MNode::from_bytes(data) {
-                                                Ok(mnode) => {
-                                                    eval_record_fallback(
-                                                        &mnode,
-                                                        memo,
-                                                        &mut pass_counts,
-                                                        &mut local_matches,
-                                                        compiled_scan,
-                                                        ordinal,
-                                                        limit,
-                                                    );
-                                                }
-                                                Err(_) => {
-                                                    errors_done
-                                                        .fetch_add(1, Ordering::Relaxed);
-                                                }
+
+                                            local_rec_count += 1;
+                                            if local_rec_count % 100 == 0 {
+                                                let total = records_done
+                                                    .fetch_add(100, Ordering::Relaxed)
+                                                    + 100;
+                                                scan_pb.set_position(total);
                                             }
                                         }
 
-                                        // Progress reporting
-                                        local_rec_count += 1;
-                                        if local_rec_count % 100 == 0 {
-                                            let total = records_done
-                                                .fetch_add(100, Ordering::Relaxed)
-                                                + 100;
-                                            scan_pb.set_position(total);
+                                        let leftover = local_rec_count % 100;
+                                        if leftover > 0 {
+                                            records_done.fetch_add(
+                                                leftover,
+                                                Ordering::Relaxed,
+                                            );
+                                            local_rec_count = 0;
                                         }
                                     }
 
-                                    // Flush remaining
-                                    let leftover = local_rec_count % 100;
-                                    if leftover > 0 {
-                                        records_done
-                                            .fetch_add(leftover, Ordering::Relaxed);
-                                        local_rec_count = 0;
-                                    }
-                                }
+                                    local_matches
+                                })
+                            })
+                            .collect();
 
-                                // Always write to cache — this is how we keep
-                                // memory bounded.  local_matches is dropped after
-                                // this block, freeing the ordinal vectors.
-                                if let Some(ref cache_path) = seg.cache_path {
-                                    if let Err(e) =
-                                        write_segment_cache(cache_path, &local_matches)
-                                    {
-                                        display.log(&format!(
-                                            "generate predicate-keys: cache write error for segment {}: {}",
-                                            seg_idx, e
-                                        ));
-                                    }
-                                }
-                                // local_matches dropped here — memory reclaimed
-                            }
-                        })
-                    })
-                    .collect();
+                        handles
+                            .into_iter()
+                            .map(|h| h.join().unwrap())
+                            .collect()
+                    });
 
-                // Wait for all threads to finish
-                for handle in handles {
-                    handle.join().unwrap();
+                // Merge thread-local matches into segment matches.
+                let mut seg_matches: Vec<Vec<i32>> = vec![Vec::new(); pred_len];
+                for thread_match in thread_results {
+                    for (pi, mut ords) in thread_match.into_iter().enumerate() {
+                        seg_matches[pi].append(&mut ords);
+                    }
                 }
-            });
+
+                // Sort ordinals within each predicate (threads processed
+                // contiguous page ranges so this is nearly sorted already).
+                for ords in &mut seg_matches {
+                    ords.sort_unstable();
+                    if limit > 0 {
+                        ords.truncate(limit);
+                    }
+                }
+
+                // Tally segment matches for running selectivity.
+                let seg_match_count: u64 =
+                    seg_matches.iter().map(|v| v.len() as u64).sum();
+                total_matches_counter.fetch_add(seg_match_count, Ordering::Relaxed);
+
+                // Update selectivity display (bar scaled to 0.0–1.0 via 0–10000).
+                let total_m = total_matches_counter.load(Ordering::Relaxed);
+                let total_r = records_done.load(Ordering::Relaxed);
+                if total_r > 0 && pred_len > 0 {
+                    let avg_matches_per_pred = total_m as f64 / pred_len as f64;
+                    let eff_sel = avg_matches_per_pred / total_r as f64;
+                    let sel_scaled = (eff_sel * 10_000.0).round().min(10_000.0) as u64;
+                    sel_bar.set_position(sel_scaled);
+                    sel_bar.set_message(format!(
+                        "{:.4}% ({:.0} avg/pred)",
+                        eff_sel * 100.0,
+                        avg_matches_per_pred,
+                    ));
+                }
+
+                // Write segment cache.
+                match &seg.cache_path {
+                    Some(cache_path) => {
+                        if let Err(e) = write_segment_cache(cache_path, &seg_matches) {
+                            log::warn!(
+                                "generate predicate-keys: cache write error for segment {}: {} (path: {})",
+                                seg_idx, e, cache_path.display(),
+                            );
+                        }
+                    }
+                    None => {
+                        log::warn!(
+                            "generate predicate-keys: BUG — segment {} has no cache_path",
+                            seg_idx,
+                        );
+                    }
+                }
+
+                seg_pb.set_position((seg_idx + 1) as u64);
+
+                // Release madvise for this segment's byte range.
+                meta_reader.release_range(byte_start, byte_end);
+
+                if ctx.governor.checkpoint() {
+                    log::info!(
+                        "generate predicate-keys: governor throttle at segment {}",
+                        seg_idx,
+                    );
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                }
+            }
         }
 
         // Governor checkpoint after segment processing
         if ctx.governor.checkpoint() {
-            ctx.display.log("generate predicate-keys: governor throttle signal received");
+            log::info!("generate predicate-keys: governor throttle signal received");
         }
 
-        scan_pb.finish_and_clear();
+        scan_pb.finish();
+        seg_pb.finish();
 
+        // Finalize selectivity display
+        let total_match_count = total_matches_counter.load(Ordering::Relaxed);
         let total_scanned = records_done.load(Ordering::Relaxed);
+        let effective_selectivity = if total_scanned > 0 && pred_len > 0 {
+            let avg = total_match_count as f64 / pred_len as f64;
+            avg / total_scanned as f64
+        } else {
+            0.0
+        };
+        sel_bar.finish();
+        ctx.ui.log(&format!(
+            "    effective selectivity: {:.4}% ({} total matches across {} predicates, {} records scanned)",
+            effective_selectivity * 100.0,
+            total_match_count,
+            pred_len,
+            total_scanned,
+        ));
+        if let Some(target) = selectivity {
+            let ratio = if target > 0.0 { effective_selectivity / target } else { 0.0 };
+            if ratio > 2.0 {
+                ctx.ui.log(&format!(
+                    "    WARNING: effective selectivity {:.4}% is {:.0}x higher than target {:.4}% — predicates may be too broad",
+                    effective_selectivity * 100.0,
+                    ratio,
+                    target * 100.0,
+                ));
+            }
+        }
+
         let total_errors = errors_done.load(Ordering::Relaxed);
         let scan_elapsed = scan_start.elapsed();
         let final_rate = if scan_elapsed.as_secs_f64() > 0.0 {
@@ -1118,7 +1408,7 @@ satisfy the corresponding predicate.
         } else {
             0.0
         };
-        ctx.display.log(&format!(
+        ctx.ui.log(&format!(
             "    scan complete: {} records in {:.1}s ({:.0} rec/s), {} decode errors",
             total_scanned,
             scan_elapsed.as_secs_f64(),
@@ -1126,37 +1416,35 @@ satisfy the corresponding predicate.
             total_errors,
         ));
 
-        // ── Phase 6: Merge segment results from cache ─────────────────────
-        //
-        // Stream one segment at a time from cache files to keep memory bounded.
-        // Only one segment's worth of data is in memory at any point.
-
-        let mut matches: Vec<Vec<i32>> = vec![Vec::new(); pred_len];
-        for (seg_idx, seg) in segments.iter().enumerate() {
-            if let Some(ref cache_path) = seg.cache_path {
-                match read_segment_cache(cache_path, pred_len) {
-                    Ok(seg_matches) => {
-                        for (pi, seg_vec) in seg_matches.into_iter().enumerate() {
-                            if limit > 0 && matches[pi].len() >= limit {
-                                continue;
-                            }
-                            matches[pi].extend(seg_vec);
-                            if limit > 0 {
-                                matches[pi].truncate(limit);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        ctx.display.log(&format!(
-                            "generate predicate-keys: error reading cache for segment {}: {}",
-                            seg_idx, e
-                        ));
-                    }
-                }
-            }
+        // Memory profile dump
+        {
+            let scan_end = MemProfile::sample();
+            log::info!("mem profile (scan end):   {}", scan_end.summary());
+            log::info!("mem profile (scan delta): {}", scan_end.delta_from(&scan_baseline));
         }
 
-        // ── Phase 7: Write output slab ───────────────────────────────────
+        // ── Phase 6: Open segment caches ──────────────────────────────────
+
+        let cache_readers: Vec<Option<SlabReader>> = segments
+            .iter()
+            .enumerate()
+            .map(|(seg_idx, seg)| {
+                seg.cache_path.as_ref().and_then(|cp| {
+                    match SlabReader::open(cp) {
+                        Ok(r) => Some(r),
+                        Err(e) => {
+                            ctx.ui.log(&format!(
+                                "generate predicate-keys: error opening cache for segment {}: {}",
+                                seg_idx, e
+                            ));
+                            None
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        // ── Phase 7: Stream merge + write output slab ────────────────────
 
         let config = match WriterConfig::new(512, 4096, u32::MAX, false) {
             Ok(c) => c,
@@ -1173,13 +1461,37 @@ satisfy the corresponding predicate.
         };
 
         let mut total_matches: u64 = 0;
-        for (pi, pred_matches) in matches.iter().enumerate() {
-            total_matches += pred_matches.len() as u64;
-
-            let mut buf = Vec::with_capacity(pred_matches.len() * 4);
-            for &ord in pred_matches {
-                buf.write_i32::<LittleEndian>(ord).unwrap();
+        for pi in 0..pred_len {
+            let mut buf: Vec<u8> = Vec::new();
+            let mut count = 0usize;
+            for reader_opt in &cache_readers {
+                if limit > 0 && count >= limit {
+                    break;
+                }
+                if let Some(reader) = reader_opt {
+                    match reader.get(pi as i64) {
+                        Ok(data) => {
+                            let ords = read_ordinals(&data);
+                            let take = if limit > 0 {
+                                ords.len().min(limit - count)
+                            } else {
+                                ords.len()
+                            };
+                            for &ord in &ords[..take] {
+                                buf.write_i32::<LittleEndian>(ord).unwrap();
+                            }
+                            count += take;
+                        }
+                        Err(e) => {
+                            ctx.ui.log(&format!(
+                                "generate predicate-keys: error reading cache pred {}: {}",
+                                pi, e
+                            ));
+                        }
+                    }
+                }
             }
+            total_matches += count as u64;
             if let Err(e) = writer.add_record(&buf) {
                 return error_result(
                     format!("write error at predicate {}: {}", pi, e),
@@ -1187,6 +1499,8 @@ satisfy the corresponding predicate.
                 );
             }
         }
+
+        drop(cache_readers);
 
         if let Err(e) = writer.finish() {
             return error_result(format!("finish error: {}", e), start);
@@ -1205,7 +1519,7 @@ satisfy the corresponding predicate.
             avg_matches,
             start.elapsed().as_secs_f64(),
         );
-        ctx.display.log(&format!("generate predicate-keys: {}", message));
+        ctx.ui.log(&format!("generate predicate-keys: {}", message));
 
         CommandResult {
             status: Status::Ok,
@@ -1239,6 +1553,13 @@ satisfy the corresponding predicate.
                 "Output slab for answer key records",
             ),
             opt(
+                "survey",
+                "Path",
+                true,
+                None,
+                "Survey JSON file (from 'slab survey') for field statistics and selectivity",
+            ),
+            opt(
                 "limit",
                 "int",
                 false,
@@ -1266,6 +1587,13 @@ satisfy the corresponding predicate.
                 None,
                 "Upper bound of selectivity range (if predicates used a range)",
             ),
+            opt(
+                "range",
+                "String",
+                false,
+                None,
+                "Ordinal range to scan, e.g. '[0,10000000)'. Limits metadata scanning to a profile subset.",
+            ),
         ]
     }
 }
@@ -1273,6 +1601,39 @@ satisfy the corresponding predicate.
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Estimate selectivity from survey field statistics and memoized predicates.
+///
+/// For each targeted field, computes `1 / distinct_count` as the probability
+/// that a random record matches an equality condition. The overall selectivity
+/// is the product across fields (assuming independence), clamped to a
+/// conservative range of 0.001–0.50.
+fn estimate_selectivity_from_survey(
+    memo: &MemoizedPredicates,
+    survey: &super::slab::SurveyResult,
+) -> f64 {
+    let mut selectivities: Vec<f64> = Vec::new();
+    for field_name in memo.field_conditions.keys() {
+        if let Some(fs) = survey.field_stats.get(field_name) {
+            let distinct = fs.distinct.len().max(1) as f64;
+            // If distinct values overflowed the sample, use the sample count
+            let effective_distinct = if fs.distinct_overflow {
+                fs.count.max(1) as f64
+            } else {
+                distinct
+            };
+            selectivities.push(1.0 / effective_distinct);
+        }
+    }
+
+    if selectivities.is_empty() {
+        return 0.10; // no field info available, conservative default
+    }
+
+    // Product of per-field selectivities (assumes independence)
+    let combined: f64 = selectivities.iter().product();
+    combined.clamp(0.001, 0.50)
+}
 
 fn resolve_path(path_str: &str, workspace: &Path) -> PathBuf {
     let p = PathBuf::from(path_str);
@@ -1308,6 +1669,52 @@ fn opt(
     }
 }
 
+/// Parse an ordinal range specification like `[0,10000000)` or `[0..10M)`.
+///
+/// Returns `(start, Option<end>)` where `end` is `None` for open-ended ranges.
+fn parse_ordinal_range(s: &str) -> Result<(i64, Option<i64>), String> {
+    let s = s.trim();
+
+    let left_exclusive = s.starts_with('(');
+    let right_inclusive = s.ends_with(']');
+    let has_left = s.starts_with('[') || s.starts_with('(');
+    let has_right = s.ends_with(')') || s.ends_with(']');
+
+    let inner = if has_left { &s[1..] } else { s };
+    let inner = if has_right { &inner[..inner.len() - 1] } else { inner };
+    let inner = inner.trim();
+
+    // "all" pattern: empty inner means full range
+    if inner == ".." || inner.is_empty() {
+        return Ok((0, None));
+    }
+
+    let sep = if inner.contains(',') { "," } else { ".." };
+    let parts: Vec<&str> = inner.splitn(2, sep).collect();
+    if parts.len() != 2 {
+        return Err(format!("expected 'start{}end' format", sep));
+    }
+
+    let left_str = parts[0].trim();
+    let right_str = parts[1].trim();
+
+    let start = if left_str.is_empty() {
+        0i64
+    } else {
+        let v = dataset::source::parse_number_with_suffix(left_str)? as i64;
+        if left_exclusive { v + 1 } else { v }
+    };
+
+    let end = if right_str.is_empty() {
+        None
+    } else {
+        let v = dataset::source::parse_number_with_suffix(right_str)? as i64;
+        Some(if right_inclusive { v + 1 } else { v })
+    };
+
+    Ok((start, end))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1321,6 +1728,9 @@ mod tests {
 
     fn test_ctx(dir: &std::path::Path) -> StreamContext {
         StreamContext {
+            dataset_name: String::new(),
+            profile: String::new(),
+            profile_names: vec![],
             workspace: dir.to_path_buf(),
             scratch: dir.join(".scratch"),
             cache: dir.join(".cache"),
@@ -1330,7 +1740,7 @@ mod tests {
             threads: 1,
             step_id: String::new(),
             governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
-            display: crate::pipeline::display::ProgressDisplay::new(),
+            ui: crate::ui::UiHandle::new(std::sync::Arc::new(crate::ui::TestSink::new())),
         }
     }
 
@@ -1381,6 +1791,51 @@ mod tests {
         read_ordinals(data)
     }
 
+    /// Create a minimal survey JSON for the test records produced by [`make_test_records`].
+    fn create_test_survey(dir: &std::path::Path, record_count: usize) -> std::path::PathBuf {
+        let path = dir.join("survey.json");
+        let json = serde_json::json!({
+            "sampled": record_count,
+            "total_records": record_count,
+            "non_mnode_count": 0,
+            "decode_errors": 0,
+            "fields": {
+                "user_id": {
+                    "count": record_count,
+                    "null_count": 0,
+                    "types": { "int": record_count },
+                    "numeric": { "min": 0, "max": record_count - 1, "mean": (record_count - 1) as f64 / 2.0, "count": record_count },
+                    "distinct": {},
+                    "distinct_overflow": true
+                },
+                "name": {
+                    "count": record_count,
+                    "null_count": 0,
+                    "types": { "text": record_count },
+                    "distinct": { "user_0": 4, "user_1": 4, "user_2": 4, "user_3": 4, "user_4": 4 },
+                    "distinct_overflow": false
+                },
+                "score": {
+                    "count": record_count,
+                    "null_count": 0,
+                    "types": { "float": record_count },
+                    "numeric": { "min": 0.0, "max": 28.5, "mean": 14.25, "count": record_count },
+                    "distinct": {},
+                    "distinct_overflow": true
+                },
+                "active": {
+                    "count": record_count,
+                    "null_count": 0,
+                    "types": { "bool": record_count },
+                    "distinct": { "true": record_count / 2, "false": record_count / 2 },
+                    "distinct_overflow": false
+                }
+            }
+        });
+        std::fs::write(&path, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+        path
+    }
+
     #[test]
     fn test_basic() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1416,6 +1871,8 @@ mod tests {
         opts.set("input", meta_path.to_string_lossy().to_string());
         opts.set("predicates", pred_path.to_string_lossy().to_string());
         opts.set("output", output_path.to_string_lossy().to_string());
+        let survey_path = create_test_survey(ws, 20);
+        opts.set("survey", survey_path.to_string_lossy().to_string());
 
         let mut op = GenPredicateKeysOp;
         let result = op.execute(&opts, &mut ctx);
@@ -1460,6 +1917,8 @@ mod tests {
         opts.set("predicates", pred_path.to_string_lossy().to_string());
         opts.set("output", output_path.to_string_lossy().to_string());
         opts.set("limit", "3".to_string());
+        let survey_path = create_test_survey(ws, 20);
+        opts.set("survey", survey_path.to_string_lossy().to_string());
 
         let mut op = GenPredicateKeysOp;
         let result = op.execute(&opts, &mut ctx);
@@ -1509,6 +1968,8 @@ mod tests {
         opts.set("input", meta_path.to_string_lossy().to_string());
         opts.set("predicates", pred_path.to_string_lossy().to_string());
         opts.set("output", output_path.to_string_lossy().to_string());
+        let survey_path = create_test_survey(ws, 20);
+        opts.set("survey", survey_path.to_string_lossy().to_string());
 
         let mut op = GenPredicateKeysOp;
         let result = op.execute(&opts, &mut ctx);
@@ -1544,6 +2005,8 @@ mod tests {
         opts.set("input", meta_path.to_string_lossy().to_string());
         opts.set("predicates", pred_path.to_string_lossy().to_string());
         opts.set("output", output_path.to_string_lossy().to_string());
+        let survey_path = create_test_survey(ws, 20);
+        opts.set("survey", survey_path.to_string_lossy().to_string());
 
         let mut op = GenPredicateKeysOp;
         let result = op.execute(&opts, &mut ctx);

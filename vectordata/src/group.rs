@@ -117,7 +117,11 @@ impl TestDataGroup {
     /// Returns `None` if the profile name does not exist in the configuration.
     pub fn profile(&self, name: &str) -> Option<Arc<dyn TestDataView>> {
         let profile_config = self.config.profiles.get(name)?;
-        let view = GenericTestDataView::new(self.source.clone(), profile_config.clone());
+        let view = GenericTestDataView::with_attributes(
+            self.source.clone(),
+            profile_config.clone(),
+            self.config.attributes.clone(),
+        );
         Some(Arc::new(view))
     }
 

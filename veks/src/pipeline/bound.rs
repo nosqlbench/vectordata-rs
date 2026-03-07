@@ -35,15 +35,36 @@ pub fn check_artifact_default(output: &Path, _options: &Options) -> ArtifactStat
         return ArtifactState::Partial;
     }
 
-    // Try to detect format and do a basic size sanity check
+    // Try to detect format and do a format-specific structural check
     if let Some(format) = VecFormat::detect(output) {
         check_format_specific(output, format, meta.len())
+    } else if is_opaque_format(output) {
+        // Opaque but recognized formats (json, yaml, csv, etc.) — no structural
+        // integrity check is possible, but exists + non-empty is sufficient.
+        ArtifactState::Complete
     } else {
         ArtifactState::Unknown(format!(
             "unrecognized format for '{}' — cannot verify completeness",
             output.display(),
         ))
     }
+}
+
+/// Extensions for opaque file formats where the only practical completeness
+/// check is "exists and non-empty." These are common output formats that have
+/// no cheap structural integrity probe, but catching zero-length files is
+/// still valuable.
+const OPAQUE_EXTENSIONS: &[&str] = &[
+    "json", "jsonl", "yaml", "yml", "csv", "tsv", "txt", "log", "xml",
+    "html", "svg", "png", "jpg", "jpeg", "pdf", "md", "toml",
+];
+
+/// Returns true if the file has an extension we recognize as an opaque format.
+fn is_opaque_format(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|ext| OPAQUE_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()))
+        .unwrap_or(false)
 }
 
 /// Check completeness using format-specific heuristics.
@@ -111,6 +132,24 @@ mod tests {
     fn test_empty_file() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let state = check_artifact_default(tmp.path(), &Options::new());
+        assert_eq!(state, ArtifactState::Partial);
+    }
+
+    #[test]
+    fn test_nonempty_opaque_format_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("output.json");
+        std::fs::write(&path, b"{\"count\": 42}").unwrap();
+        let state = check_artifact_default(&path, &Options::new());
+        assert_eq!(state, ArtifactState::Complete);
+    }
+
+    #[test]
+    fn test_empty_opaque_format_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("output.json");
+        std::fs::write(&path, b"").unwrap();
+        let state = check_artifact_default(&path, &Options::new());
         assert_eq!(state, ArtifactState::Partial);
     }
 

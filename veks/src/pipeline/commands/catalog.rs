@@ -69,7 +69,7 @@ impl CommandOp for CatalogGenerateOp {
             );
         }
 
-        ctx.display.log(&format!("Scanning {} for datasets...", input_path.display()));
+        ctx.ui.log(&format!("Scanning {} for datasets...", input_path.display()));
 
         // Walk directory tree and find dataset.yaml files
         let mut entries: Vec<CatalogEntry> = Vec::new();
@@ -77,7 +77,7 @@ impl CommandOp for CatalogGenerateOp {
 
         entries.sort_by(|a, b| a.path.cmp(&b.path));
 
-        ctx.display.log(&format!("Found {} dataset(s)", entries.len()));
+        ctx.ui.log(&format!("Found {} dataset(s)", entries.len()));
 
         if entries.is_empty() {
             return CommandResult {
@@ -89,7 +89,7 @@ impl CommandOp for CatalogGenerateOp {
         }
 
         for entry in &entries {
-            ctx.display.log(&format!(
+            ctx.ui.log(&format!(
                 "  {} — {} view(s) [{}]",
                 entry.name,
                 entry.views.len(),
@@ -117,7 +117,7 @@ impl CommandOp for CatalogGenerateOp {
             return error_result(format!("failed to write {}: {}", yaml_path.display(), e), start);
         }
 
-        ctx.display.log(&format!(
+        ctx.ui.log(&format!(
             "Wrote {} entries to {} and {}",
             entries.len(),
             json_path.display(),
@@ -255,6 +255,9 @@ mod tests {
 
     fn test_ctx(dir: &Path) -> StreamContext {
         StreamContext {
+            dataset_name: String::new(),
+            profile: String::new(),
+            profile_names: vec![],
             workspace: dir.to_path_buf(),
             scratch: dir.join(".scratch"),
             cache: dir.join(".cache"),
@@ -264,7 +267,7 @@ mod tests {
             threads: 1,
             step_id: String::new(),
             governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
-            display: crate::pipeline::display::ProgressDisplay::new(),
+            ui: crate::ui::UiHandle::new(std::sync::Arc::new(crate::ui::TestSink::new())),
         }
     }
 

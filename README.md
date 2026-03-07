@@ -1,53 +1,60 @@
-# vectordata-rs
+# ⚡️ vectordata-rs
 
-A Rust workspace for working with vector datasets — loading, converting, analyzing, and storing ANN benchmark data.
+**High-performance Rust toolkit for large-scale vector datasets.**
 
-## Crates
+`vectordata-rs` is an industrial-strength workspace for loading, converting, analyzing, and storing ANN (Approximate Nearest Neighbor) benchmark data at scale. Built for speed, resource efficiency, and transparent remote access.
 
-### vectordata
+---
 
-A library for efficiently accessing vector datasets described by `dataset.yaml` configurations. Provides a unified interface for reading vector data from local files (via memory mapping) or remote URLs (via HTTP Range requests).
+## 🛠 The Workspace
 
-- Parses `dataset.yaml` to understand dataset structure, profiles, and views
-- Supports `.fvec`, `.ivec`, and other standard ANN benchmark formats
-- Memory-mapped local access and on-demand remote retrieval
+### [**veks**](./veks/) — The Umbrella CLI
+The primary entry point for all vector operations.
+- 🔍 **analyze** — Inspect, profile, and visualize vector distributions.
+- 🔄 **convert** — Seamlessly transform between `.fvec`, `.ivec`, `.hvec`, and more.
+- 📥 **import** — Canonicalize data into optimized internal formats.
+- 🚀 **pipeline** — Execute complex DAG-ordered data processing streams.
+- 📦 **bulkdl** — Parallel, config-driven dataset downloader.
 
-```toml
-[dependencies]
-vectordata = { path = "vectordata" }
+### [**vectordata**](./vectordata/) — Transparent Access Layer
+A library for efficient dataset access via `dataset.yaml`.
+- **Zero-copy I/O**: Memory-mapped local access for maximum throughput.
+- **Smart Remote**: On-demand, Merkle-verified retrieval via HTTP Range requests.
+- **Unified API**: One interface for local files and remote URLs.
+
+### [**slabtastic**](./slabtastic/) — Random-Access Storage
+The storage engine for non-uniform data (metadata, predicates, etc.).
+- **Page-Aligned**: Optimized for efficient random and sequential I/O.
+- **High Scale**: Supports append-friendly files up to 2^63 bytes.
+- **Ordinal Addressing**: O(1) expected lookup for variable-length records.
+
+---
+
+## 📖 Documentation
+
+Everything you need to know, organized by the **Diátaxis** framework:
+
+- 🎓 **[Tutorials](./docs/tutorials/README.md)** — Step-by-step lessons to get you started.
+- 💡 **[How-to Guides](./docs/howto/README.md)** — Goal-oriented solutions for specific tasks.
+- 🧠 **[Explanation](./docs/explanation/README.md)** — Deep dives into architecture and design.
+- 📚 **[Reference](./docs/reference/README.md)** — Technical specs, APIs, and wire formats.
+- 🏗 **[SRD](./docs/design/README.md)** — Formal System Requirements and design documents.
+
+---
+
+## ⚡️ Quick Start
+
+```bash
+# Build the entire workspace
+cargo build --release
+
+# Run a sample analysis
+./target/release/veks analyze describe path/to/data.fvec
+
+# Run all tests
+cargo test
 ```
 
-### veks
-
-An umbrella CLI (`veks`) for vector data operations:
-
-- **analyze** — inspect, profile, compare, and visualize vector data files
-- **bulkdl** — bulk file downloader driven by YAML config with token expansion
-- **convert** — convert vector data between formats
-- **import** — import data into preferred internal format by facet type
-- **run / pipeline** — execute command-stream pipelines defined in `dataset.yaml`
-
-### slabtastic
-
-A library and CLI (`slab`) for the slabtastic file format — a streamable, random-accessible, appendable data layout for non-uniform data by ordinal. Used as the storage format for metadata facets in vector datasets.
-
-- Pages with forward and backward traversal
-- Supports files up to 2^63 bytes
-- Conventional `.slab` extension
-
-```toml
-[dependencies]
-slabtastic = { path = "slabtastic" }
-```
-
-## Building
-
-```sh
-cargo build            # build all crates
-cargo build -p veks    # build only the veks CLI
-cargo test             # run all tests
-```
-
-## License
+## ⚖️ License
 
 Apache-2.0

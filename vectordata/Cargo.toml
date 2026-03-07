@@ -11,6 +11,7 @@ keywords = ["vector", "dataset", "ann", "testing", "automation"]
 categories = ["filesystem", "network-programming", "science"]
 
 [dependencies]
+dataset = { path = "../dataset" }
 serde = { version = "1.0", features = ["derive"] }
 serde_yaml = "0.9"
 thiserror = "2.0.18"
@@ -18,9 +19,13 @@ anyhow = "1.0"
 memmap2 = "0.9"
 libc = "0.2"
 byteorder = "1.5"
+sha2 = "0.10"
 half = "2"
 reqwest = { version = "0.13.1", features = ["blocking", "json"] }
 url = "2.5"
 
 [dev-dependencies]
+hex = "0.4"
 tempfile = "3.8"
+testserver = { path = "../testserver" }
+url = "2.5"

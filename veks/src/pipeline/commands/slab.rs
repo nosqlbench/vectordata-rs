@@ -19,7 +19,6 @@ use crate::pipeline::command::{
     CommandDoc, CommandOp, CommandResult, OptionDesc, Options, ResourceDesc, Status, StreamContext,
     render_options_table,
 };
-use crate::pipeline::display::ProgressDisplay;
 
 // -- Slab Import --------------------------------------------------------------
 
@@ -108,7 +107,7 @@ impl CommandOp for SlabImportOp {
         }
 
         let count = records.len();
-        ctx.display.log(&format!("Imported {} records from {} to {}", count, from_path.display(), to_path.display()));
+        ctx.ui.log(&format!("Imported {} records from {} to {}", count, from_path.display(), to_path.display()));
 
         CommandResult {
             status: Status::Ok,
@@ -208,7 +207,7 @@ impl CommandOp for SlabExportOp {
         let input_path = resolve_path(input_str, &ctx.workspace);
         let format = options.get("format").unwrap_or("text");
 
-        let reader = match open_slab_display(&input_path, &ctx.display) {
+        let reader = match open_slab_display(&input_path, &ctx.ui) {
             Ok(r) => r,
             Err(e) => return error_result(format!("failed to open: {}", e), start),
         };
@@ -334,7 +333,7 @@ impl CommandOp for SlabAppendOp {
             .unwrap_or(65536);
 
         // Read source records
-        let source = match open_slab_display(&from_path, &ctx.display) {
+        let source = match open_slab_display(&from_path, &ctx.ui) {
             Ok(r) => r,
             Err(e) => return error_result(format!("failed to open source: {}", e), start),
         };
@@ -370,7 +369,7 @@ impl CommandOp for SlabAppendOp {
             return error_result(format!("finish error: {}", e), start);
         }
 
-        ctx.display.log(&format!("Appended {} records from {} to {}", count, from_path.display(), target_path.display()));
+        ctx.ui.log(&format!("Appended {} records from {} to {}", count, from_path.display(), target_path.display()));
 
         CommandResult {
             status: Status::Ok,
@@ -448,7 +447,7 @@ impl CommandOp for SlabRewriteOp {
             );
         }
 
-        let reader = match open_slab_display(&source_path, &ctx.display) {
+        let reader = match open_slab_display(&source_path, &ctx.ui) {
             Ok(r) => r,
             Err(e) => return error_result(format!("failed to open source: {}", e), start),
         };
@@ -484,7 +483,7 @@ impl CommandOp for SlabRewriteOp {
             return error_result(format!("finish error: {}", e), start);
         }
 
-        ctx.display.log(&format!("Rewrote {} records from {} to {}", count, source_path.display(), dest_path.display()));
+        ctx.ui.log(&format!("Rewrote {} records from {} to {}", count, source_path.display(), dest_path.display()));
 
         CommandResult {
             status: Status::Ok,
@@ -539,7 +538,7 @@ impl CommandOp for SlabCheckOp {
         let input_path = resolve_path(input_str, &ctx.workspace);
         let verbose = options.get("verbose").map_or(false, |s| s == "true");
 
-        let reader = match open_slab_display(&input_path, &ctx.display) {
+        let reader = match open_slab_display(&input_path, &ctx.ui) {
             Ok(r) => r,
             Err(e) => {
                 return CommandResult {
@@ -564,7 +563,7 @@ impl CommandOp for SlabCheckOp {
                     let recs = page.record_count() as u64;
                     record_count += recs;
                     if verbose {
-                        ctx.display.log(&format!(
+                        ctx.ui.log(&format!(
                             "  Page {}: offset={}, ordinal={}, records={}",
                             i,
                             entry.file_offset,
@@ -575,13 +574,13 @@ impl CommandOp for SlabCheckOp {
                 }
                 Err(e) => {
                     errors += 1;
-                    ctx.display.log(&format!("  Page {}: ERROR: {}", i, e));
+                    ctx.ui.log(&format!("  Page {}: ERROR: {}", i, e));
                 }
             }
         }
 
         if errors == 0 {
-            ctx.display.log(&format!(
+            ctx.ui.log(&format!(
                 "OK: {} pages, {} records in {}",
                 page_count,
                 record_count,
@@ -656,7 +655,7 @@ impl CommandOp for SlabGetOp {
             Err(e) => return error_result(e, start),
         };
 
-        let reader = match open_slab_display(&input_path, &ctx.display) {
+        let reader = match open_slab_display(&input_path, &ctx.ui) {
             Ok(r) => r,
             Err(e) => return error_result(format!("failed to open: {}", e), start),
         };
@@ -671,20 +670,20 @@ impl CommandOp for SlabGetOp {
                         "hex" => {
                             let hex: Vec<String> =
                                 data.iter().map(|b| format!("{:02x}", b)).collect();
-                            ctx.display.log(&format!("[{}]: {}", ordinal, hex.join(" ")));
+                            ctx.ui.log(&format!("[{}]: {}", ordinal, hex.join(" ")));
                         }
                         "raw" => {
                             std::io::stdout().write_all(&data).ok();
                         }
                         _ => {
                             let text = String::from_utf8_lossy(&data);
-                            ctx.display.log(&format!("[{}]: {}", ordinal, text));
+                            ctx.ui.log(&format!("[{}]: {}", ordinal, text));
                         }
                     }
                     found += 1;
                 }
                 Err(e) => {
-                    ctx.display.log(&format!("[{}]: NOT FOUND ({})", ordinal, e));
+                    ctx.ui.log(&format!("[{}]: NOT FOUND ({})", ordinal, e));
                     missing += 1;
                 }
             }
@@ -774,7 +773,7 @@ impl CommandOp for SlabAnalyzeOp {
         };
         let input_path = resolve_path(input_str, &ctx.workspace);
 
-        let reader = match open_slab_display(&input_path, &ctx.display) {
+        let reader = match open_slab_display(&input_path, &ctx.ui) {
             Ok(r) => r,
             Err(e) => return error_result(format!("failed to open: {}", e), start),
         };
@@ -818,13 +817,13 @@ impl CommandOp for SlabAnalyzeOp {
             }
         }
 
-        ctx.display.log(&format!("Slab Analysis: {}", input_path.display()));
-        ctx.display.log(&format!("  File size: {} bytes", file_size));
-        ctx.display.log(&format!("  Pages: {}", page_count));
-        ctx.display.log(&format!("  Records: {}", total_records));
+        ctx.ui.log(&format!("Slab Analysis: {}", input_path.display()));
+        ctx.ui.log(&format!("  File size: {} bytes", file_size));
+        ctx.ui.log(&format!("  Pages: {}", page_count));
+        ctx.ui.log(&format!("  Records: {}", total_records));
 
         if min_ordinal <= max_ordinal {
-            ctx.display.log(&format!("  Ordinal range: {} .. {}", min_ordinal, max_ordinal));
+            ctx.ui.log(&format!("  Ordinal range: {} .. {}", min_ordinal, max_ordinal));
         }
 
         if !record_sizes.is_empty() {
@@ -833,7 +832,7 @@ impl CommandOp for SlabAnalyzeOp {
             let max_rs = record_sizes[record_sizes.len() - 1];
             let avg_rs: f64 = record_sizes.iter().sum::<usize>() as f64 / record_sizes.len() as f64;
             let median_rs = record_sizes[record_sizes.len() / 2];
-            ctx.display.log(&format!("  Record sizes: min={}, max={}, avg={:.1}, median={}", min_rs, max_rs, avg_rs, median_rs));
+            ctx.ui.log(&format!("  Record sizes: min={}, max={}, avg={:.1}, median={}", min_rs, max_rs, avg_rs, median_rs));
 
             // Content type detection from first page
             if let Some(first_entry) = page_entries.first() {
@@ -854,7 +853,7 @@ impl CommandOp for SlabAnalyzeOp {
                     } else {
                         "binary"
                     };
-                    ctx.display.log(&format!("  Content type: {} (sampled {} records)", content_type, sample_count));
+                    ctx.ui.log(&format!("  Content type: {} (sampled {} records)", content_type, sample_count));
                 }
             }
         }
@@ -863,13 +862,13 @@ impl CommandOp for SlabAnalyzeOp {
             let min_ps = page_sizes.iter().min().unwrap();
             let max_ps = page_sizes.iter().max().unwrap();
             let avg_ps: f64 = page_sizes.iter().sum::<u64>() as f64 / page_sizes.len() as f64;
-            ctx.display.log(&format!("  Page sizes: min={}, max={}, avg={:.0}", min_ps, max_ps, avg_ps));
+            ctx.ui.log(&format!("  Page sizes: min={}, max={}, avg={:.0}", min_ps, max_ps, avg_ps));
 
             // Utilization
             let total_page_bytes: u64 = page_sizes.iter().sum();
             if file_size > 0 {
                 let utilization = total_page_bytes as f64 / file_size as f64 * 100.0;
-                ctx.display.log(&format!("  Page utilization: {:.1}%", utilization));
+                ctx.ui.log(&format!("  Page utilization: {:.1}%", utilization));
             }
         }
 
@@ -928,7 +927,7 @@ impl CommandOp for SlabExplainOp {
                 .collect()
         });
 
-        let reader = match open_slab_display(&input_path, &ctx.display) {
+        let reader = match open_slab_display(&input_path, &ctx.ui) {
             Ok(r) => r,
             Err(e) => return error_result(format!("failed to open: {}", e), start),
         };
@@ -947,17 +946,17 @@ impl CommandOp for SlabExplainOp {
                     let recs = page.record_count();
                     let page_size = page.serialized_size();
 
-                    ctx.display.log(&format!("┌─── Page {} ───────────────────────────┐", i));
-                    ctx.display.log(&format!("│ Offset:    {:<28}│", entry.file_offset));
-                    ctx.display.log(&format!("│ Page size: {:<28}│", page_size));
-                    ctx.display.log(&format!("│ Ordinals:  {:<28}│",
+                    ctx.ui.log(&format!("┌─── Page {} ───────────────────────────┐", i));
+                    ctx.ui.log(&format!("│ Offset:    {:<28}│", entry.file_offset));
+                    ctx.ui.log(&format!("│ Page size: {:<28}│", page_size));
+                    ctx.ui.log(&format!("│ Ordinals:  {:<28}│",
                         format!("{}..{}", entry.start_ordinal, entry.start_ordinal + recs as i64)));
-                    ctx.display.log(&format!("│ Records:   {:<28}│", recs));
+                    ctx.ui.log(&format!("│ Records:   {:<28}│", recs));
 
                     // Show first few record sizes
                     let preview_count = recs.min(5) as i64;
                     if preview_count > 0 {
-                        ctx.display.log("│ Record preview:                       │");
+                        ctx.ui.log("│ Record preview:                       │");
                         for j in 0..preview_count {
                             let ord = entry.start_ordinal + j;
                             if let Ok(data) = reader.get(ord) {
@@ -966,24 +965,24 @@ impl CommandOp for SlabExplainOp {
                                     .collect::<Vec<_>>()
                                     .join(" ");
                                 let suffix = if data.len() > 16 { "..." } else { "" };
-                                ctx.display.log(&format!("│   [{}]: {} bytes  {}{:<2}│",
+                                ctx.ui.log(&format!("│   [{}]: {} bytes  {}{:<2}│",
                                     ord, data.len(), hex_preview, suffix));
                             }
                         }
                     }
-                    ctx.display.log("└───────────────────────────────────────┘");
-                    ctx.display.log("");
+                    ctx.ui.log("└───────────────────────────────────────┘");
+                    ctx.ui.log("");
                 }
                 Err(e) => {
-                    ctx.display.log(&format!("Page {}: ERROR reading: {}", i, e));
+                    ctx.ui.log(&format!("Page {}: ERROR reading: {}", i, e));
                 }
             }
         }
 
         // Show pages page summary
-        ctx.display.log(&format!("Pages Page: {} entries", page_entries.len()));
+        ctx.ui.log(&format!("Pages Page: {} entries", page_entries.len()));
         for (i, entry) in page_entries.iter().enumerate() {
-            ctx.display.log(&format!(
+            ctx.ui.log(&format!(
                 "  [{}] ordinal={}, offset={}",
                 i,
                 entry.start_ordinal,
@@ -1046,11 +1045,11 @@ impl CommandOp for SlabNamespacesOp {
             Err(e) => return error_result(format!("failed to list namespaces: {}", e), start),
         };
 
-        ctx.display.log(&format!("{:<6} {:<30} {:>14}", "Index", "Name", "PagesOffset"));
-        ctx.display.log(&format!("{}", "-".repeat(54)));
+        ctx.ui.log(&format!("{:<6} {:<30} {:>14}", "Index", "Name", "PagesOffset"));
+        ctx.ui.log(&format!("{}", "-".repeat(54)));
 
         for ns in &namespaces {
-            ctx.display.log(&format!(
+            ctx.ui.log(&format!(
                 "{:<6} {:<30} {:>14}",
                 ns.namespace_index,
                 ns.name,
@@ -1058,8 +1057,8 @@ impl CommandOp for SlabNamespacesOp {
             ));
         }
 
-        ctx.display.log("");
-        ctx.display.log(&format!("{} namespace(s)", namespaces.len()));
+        ctx.ui.log("");
+        ctx.ui.log(&format!("{} namespace(s)", namespaces.len()));
 
         CommandResult {
             status: Status::Ok,
@@ -1127,7 +1126,7 @@ impl CommandOp for SlabInspectOp {
             Err(e) => return error_result(e, start),
         };
 
-        let reader = match open_slab_display(&input_path, &ctx.display) {
+        let reader = match open_slab_display(&input_path, &ctx.ui) {
             Ok(r) => r,
             Err(e) => return error_result(format!("failed to open: {}", e), start),
         };
@@ -1146,17 +1145,17 @@ impl CommandOp for SlabInspectOp {
                     match decode_result {
                         Ok(anode) => {
                             let rendered = crate::formats::anode_vernacular::render(&anode, vernacular);
-                            ctx.display.log(&format!("[{}]: {}", ordinal, rendered));
+                            ctx.ui.log(&format!("[{}]: {}", ordinal, rendered));
                             found += 1;
                         }
                         Err(e) => {
-                            ctx.display.log(&format!("[{}]: DECODE ERROR: {}", ordinal, e));
+                            ctx.ui.log(&format!("[{}]: DECODE ERROR: {}", ordinal, e));
                             errors += 1;
                         }
                     }
                 }
                 Err(e) => {
-                    ctx.display.log(&format!("[{}]: NOT FOUND ({})", ordinal, e));
+                    ctx.ui.log(&format!("[{}]: NOT FOUND ({})", ordinal, e));
                     errors += 1;
                 }
             }
@@ -1235,7 +1234,7 @@ impl CommandOp for SlabSurveyOp {
         };
 
         // Print results
-        ctx.display.log(&format!(
+        ctx.ui.log(&format!(
             "Slab Survey: {} ({} of {} records sampled)",
             input_path.display(),
             survey.sampled,
@@ -1243,8 +1242,8 @@ impl CommandOp for SlabSurveyOp {
         ));
 
         for (name, fs) in &survey.field_stats {
-            ctx.display.log("");
-            ctx.display.log(&format!(
+            ctx.ui.log("");
+            ctx.ui.log(&format!(
                 "  Field \"{}\" — {} values ({} null)",
                 name, fs.count, fs.null_count,
             ));
@@ -1255,13 +1254,13 @@ impl CommandOp for SlabSurveyOp {
                 type_parts.push(format!("{} ({})", tag, cnt));
             }
             if !type_parts.is_empty() {
-                ctx.display.log(&format!("    types: {}", type_parts.join(", ")));
+                ctx.ui.log(&format!("    types: {}", type_parts.join(", ")));
             }
 
             // Numeric stats
             if fs.numeric_count > 0 {
                 let mean = fs.numeric_sum / fs.numeric_count as f64;
-                ctx.display.log(&format!(
+                ctx.ui.log(&format!(
                     "    range: {} .. {}   mean: {:.1}",
                     fs.numeric_min, fs.numeric_max, mean,
                 ));
@@ -1270,7 +1269,7 @@ impl CommandOp for SlabSurveyOp {
             // String length stats
             if fs.strlen_count > 0 {
                 let mean = fs.strlen_sum as f64 / fs.strlen_count as f64;
-                ctx.display.log(&format!(
+                ctx.ui.log(&format!(
                     "    strlen: {} .. {}   mean: {:.1}",
                     fs.strlen_min, fs.strlen_max, mean,
                 ));
@@ -1279,7 +1278,7 @@ impl CommandOp for SlabSurveyOp {
             // Bytes length stats
             if fs.byteslen_count > 0 {
                 let mean = fs.byteslen_sum as f64 / fs.byteslen_count as f64;
-                ctx.display.log(&format!(
+                ctx.ui.log(&format!(
                     "    byteslen: {} .. {}   mean: {:.1}",
                     fs.byteslen_min, fs.byteslen_max, mean,
                 ));
@@ -1292,7 +1291,7 @@ impl CommandOp for SlabSurveyOp {
                 } else {
                     ""
                 };
-                ctx.display.log(&format!(
+                ctx.ui.log(&format!(
                     "    {} distinct values{}",
                     fs.distinct.len(),
                     overflow_msg,
@@ -1301,12 +1300,12 @@ impl CommandOp for SlabSurveyOp {
         }
 
         if survey.non_mnode_count > 0 || survey.decode_errors > 0 {
-            ctx.display.log("");
+            ctx.ui.log("");
             if survey.non_mnode_count > 0 {
-                ctx.display.log(&format!("  Non-MNode records: {}", survey.non_mnode_count));
+                ctx.ui.log(&format!("  Non-MNode records: {}", survey.non_mnode_count));
             }
             if survey.decode_errors > 0 {
-                ctx.display.log(&format!("  Decode errors: {}", survey.decode_errors));
+                ctx.ui.log(&format!("  Decode errors: {}", survey.decode_errors));
             }
         }
 
@@ -1523,8 +1522,8 @@ pub(crate) fn survey_slab(
     };
     let sample_indices = sample_page_indices(total_pages, desired_pages);
 
-    eprintln!(
-        "    survey: sampling {} of {} pages ({} total records, target {} samples)",
+    log::info!(
+        "survey: sampling {} of {} pages ({} total records, target {} samples)",
         sample_indices.len(), total_pages, total_records, max_samples,
     );
 
@@ -1557,8 +1556,8 @@ pub(crate) fn survey_slab(
             } else {
                 String::new()
             };
-            eprintln!(
-                "    survey: {:.1}% ({}/{} pages, {} records, {:.0} rec/s{})",
+            log::info!(
+                "survey: {:.1}% ({}/{} pages, {} records, {:.0} rec/s{})",
                 pct, progress_idx + 1, sample_page_count, sampled, rate, eta,
             );
         }
@@ -1597,7 +1596,7 @@ pub(crate) fn survey_slab(
         }
     }
 
-    eprintln!("    survey: complete, {} records sampled", sampled);
+    log::info!("survey: complete, {} records sampled", sampled);
 
     Ok(SurveyResult {
         field_stats,
@@ -1699,7 +1698,7 @@ fn survey_to_json(survey: &SurveyResult, path: &Path) -> Result<(), String> {
     std::fs::write(path, json)
         .map_err(|e| format!("failed to write {}: {}", path.display(), e))?;
 
-    eprintln!("  Survey JSON written to {}", path.display());
+    log::info!("Survey JSON written to {}", path.display());
 
     Ok(())
 }
@@ -1778,44 +1777,41 @@ pub(crate) fn survey_from_json(path: &Path) -> Result<SurveyResult, String> {
 /// Wraps [`SlabReader::open_with_progress`] so that large files report
 /// page index scan progress during the open.
 fn open_slab(path: &Path) -> slabtastic::Result<SlabReader> {
-    open_slab_with_display(path, None)
+    open_slab_with_ui(path, None)
 }
 
-fn open_slab_display(path: &Path, display: &ProgressDisplay) -> slabtastic::Result<SlabReader> {
-    open_slab_with_display(path, Some(display))
+fn open_slab_display(path: &Path, ui: &crate::ui::UiHandle) -> slabtastic::Result<SlabReader> {
+    open_slab_with_ui(path, Some(ui))
 }
 
-fn open_slab_with_display(path: &Path, display: Option<&ProgressDisplay>) -> slabtastic::Result<SlabReader> {
-    use indicatif::ProgressBar;
-
-    let pb: Option<ProgressBar> = None;
-    let pb = std::cell::RefCell::new(pb);
+fn open_slab_with_ui(path: &Path, ui: Option<&crate::ui::UiHandle>) -> slabtastic::Result<SlabReader> {
+    let pb: std::cell::RefCell<Option<crate::ui::ProgressHandle>> = std::cell::RefCell::new(None);
 
     SlabReader::open_with_progress(path, |p| {
         match p {
             OpenProgress::PagesPageRead { page_count } => {
-                if let Some(d) = display {
-                    let bar = d.bar(*page_count as u64, "slab index");
+                if let Some(u) = ui {
+                    let bar = u.bar(*page_count as u64, "slab index");
                     *pb.borrow_mut() = Some(bar);
                 } else {
-                    eprintln!("    slab index: {} pages to scan", page_count);
+                    log::info!("slab index: {} pages to scan", page_count);
                 }
             }
             OpenProgress::IndexBuild { done, total } => {
                 if let Some(ref bar) = *pb.borrow() {
                     bar.set_position(*done as u64);
                 } else {
-                    eprintln!("    slab index: {}/{} pages scanned", done, total);
+                    log::info!("slab index: {}/{} pages scanned", done, total);
                 }
             }
             OpenProgress::IndexComplete { total_records } => {
                 if let Some(bar) = pb.borrow_mut().take() {
-                    bar.finish_and_clear();
+                    bar.finish();
                 }
-                if let Some(d) = display {
-                    d.log(&format!("    slab index: complete, {} total records", total_records));
+                if let Some(u) = ui {
+                    u.log(&format!("    slab index: complete, {} total records", total_records));
                 } else {
-                    eprintln!("    slab index: complete, {} total records", total_records);
+                    log::info!("slab index: complete, {} total records", total_records);
                 }
             }
         }
@@ -1861,6 +1857,9 @@ mod tests {
 
     fn test_ctx(dir: &Path) -> StreamContext {
         StreamContext {
+            dataset_name: String::new(),
+            profile: String::new(),
+            profile_names: vec![],
             workspace: dir.to_path_buf(),
             scratch: dir.join(".scratch"),
             cache: dir.join(".cache"),
@@ -1870,7 +1869,7 @@ mod tests {
             threads: 1,
             step_id: String::new(),
             governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
-            display: crate::pipeline::display::ProgressDisplay::new(),
+            ui: crate::ui::UiHandle::new(std::sync::Arc::new(crate::ui::TestSink::new())),
         }
     }
 

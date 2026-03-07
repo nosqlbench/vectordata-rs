@@ -99,7 +99,7 @@ impl CommandOp for AnalyzeFindOp {
         };
         let dim = needle.len();
 
-        ctx.display.log(&format!(
+        ctx.ui.log(&format!(
             "Searching for source[{}] (dim={}) in {}",
             index,
             dim,
@@ -134,10 +134,10 @@ impl CommandOp for AnalyzeFindOp {
         let is_sorted = check_sorted(&target_reader, target_count);
 
         if is_sorted {
-            ctx.display.log("Target appears sorted — using binary search");
+            ctx.ui.log("Target appears sorted — using binary search");
             match binary_search(&target_reader, &needle, target_count) {
                 Some(found_idx) => {
-                    ctx.display.log(&format!("FOUND at index {}", found_idx));
+                    ctx.ui.log(&format!("FOUND at index {}", found_idx));
                     CommandResult {
                         status: Status::Ok,
                         message: format!("found at index {}", found_idx),
@@ -146,7 +146,7 @@ impl CommandOp for AnalyzeFindOp {
                     }
                 }
                 None => {
-                    ctx.display.log("NOT FOUND (binary search)");
+                    ctx.ui.log("NOT FOUND (binary search)");
                     CommandResult {
                         status: Status::Warning,
                         message: "not found".to_string(),
@@ -156,7 +156,7 @@ impl CommandOp for AnalyzeFindOp {
                 }
             }
         } else {
-            ctx.display.log(&format!(
+            ctx.ui.log(&format!(
                 "Target is unsorted — exhaustive scan ({} vectors)",
                 target_count
             ));
@@ -164,7 +164,7 @@ impl CommandOp for AnalyzeFindOp {
             match result {
                 Some((found_idx, exact)) => {
                     if exact {
-                        ctx.display.log(&format!("FOUND exact match at index {}", found_idx));
+                        ctx.ui.log(&format!("FOUND exact match at index {}", found_idx));
                         CommandResult {
                             status: Status::Ok,
                             message: format!("found exact match at index {}", found_idx),
@@ -172,7 +172,7 @@ impl CommandOp for AnalyzeFindOp {
                             elapsed: start.elapsed(),
                         }
                     } else {
-                        ctx.display.log(&format!("Closest match at index {} (not exact)", found_idx));
+                        ctx.ui.log(&format!("Closest match at index {} (not exact)", found_idx));
                         CommandResult {
                             status: Status::Warning,
                             message: format!("closest match at index {} (not exact)", found_idx),
@@ -182,7 +182,7 @@ impl CommandOp for AnalyzeFindOp {
                     }
                 }
                 None => {
-                    ctx.display.log("NOT FOUND");
+                    ctx.ui.log("NOT FOUND");
                     CommandResult {
                         status: Status::Warning,
                         message: "not found".to_string(),
@@ -365,6 +365,9 @@ mod tests {
 
     fn test_ctx(dir: &Path) -> StreamContext {
         StreamContext {
+            dataset_name: String::new(),
+            profile: String::new(),
+            profile_names: vec![],
             workspace: dir.to_path_buf(),
             scratch: dir.join(".scratch"),
             cache: dir.join(".cache"),
@@ -374,7 +377,7 @@ mod tests {
             threads: 1,
             step_id: String::new(),
             governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
-            display: crate::pipeline::display::ProgressDisplay::new(),
+            ui: crate::ui::UiHandle::new(std::sync::Arc::new(crate::ui::TestSink::new())),
         }
     }
 

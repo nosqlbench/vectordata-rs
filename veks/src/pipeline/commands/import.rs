@@ -9,7 +9,6 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use indicatif::{ProgressState, ProgressStyle};
 
 use crate::formats::VecFormat;
 use crate::formats::reader;
@@ -160,21 +159,14 @@ impl CommandOp for ImportFacetOp {
             (None, None) => None,
         };
         let pb = if let Some(total) = effective_total {
-            ctx.display.bar_with_style(
-                total,
-                ProgressStyle::default_bar()
-                    .template("  [{bar:40.cyan/blue}] {pos}/{len} ({percent}%) records — {rps} — ETA {eta}")
-                    .expect("invalid template")
-                    .with_key("rps", format_rps)
-                    .progress_chars("=>-"),
-            )
+            ctx.ui.bar(total, "importing records")
         } else {
-            ctx.display.spinner("importing records")
+            ctx.ui.spinner("importing records")
         };
 
         // Governor checkpoint before import processing
         if ctx.governor.checkpoint() {
-            ctx.display.log("  governor: throttle active");
+            log::info!("governor: throttle active");
         }
 
         // Import records
@@ -190,7 +182,7 @@ impl CommandOp for ImportFacetOp {
             pb.inc(1);
         }
 
-        pb.finish_and_clear();
+        pb.finish();
 
         if let Err(e) = sink.finish() {
             return error_result(format!("failed to finalize output: {}", e), start);
@@ -270,22 +262,3 @@ fn error_result(message: String, start: Instant) -> CommandResult {
     }
 }
 
-/// Format records/sec for the progress bar.
-fn format_rps(state: &ProgressState, w: &mut dyn std::fmt::Write) {
-    let rps = state.per_sec();
-    if rps < 100.0 {
-        write!(w, "{:.1}/s", rps).unwrap();
-    } else {
-        let whole = rps as u64;
-        let s = whole.to_string();
-        let mut result = String::with_capacity(s.len() + s.len() / 3);
-        for (i, ch) in s.chars().rev().enumerate() {
-            if i > 0 && i % 3 == 0 {
-                result.push(',');
-            }
-            result.push(ch);
-        }
-        let formatted: String = result.chars().rev().collect();
-        write!(w, "{}/s", formatted).unwrap();
-    }
-}

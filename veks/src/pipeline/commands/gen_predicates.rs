@@ -99,7 +99,7 @@ selectivity. The generated predicates are written to an output slab file.
         // Load survey data — from pre-computed JSON if available, otherwise survey the slab
         let survey = if let Some(survey_str) = options.get("survey") {
             let survey_path = resolve_path(survey_str, &ctx.workspace);
-            ctx.display.log(&format!("generate predicates: loading survey from {}", survey_path.display()));
+            ctx.ui.log(&format!("generate predicates: loading survey from {}", survey_path.display()));
             match survey_from_json(&survey_path) {
                 Ok(s) => s,
                 Err(e) => return error_result(e, start),
@@ -119,7 +119,7 @@ selectivity. The generated predicates are written to an output slab file.
             .collect();
 
         if eligible.is_empty() {
-            ctx.display.log("generate predicates: 0 eligible fields, producing 0 predicates");
+            ctx.ui.log("generate predicates: 0 eligible fields, producing 0 predicates");
             // Write empty slab
             let config = WriterConfig::new(512, 4096, u32::MAX, false)
                 .map_err(|e| format!("{}", e));
@@ -187,7 +187,7 @@ selectivity. The generated predicates are written to an output slab file.
             predicates.len(),
             eligible.len(),
         );
-        ctx.display.log(&format!("generate predicates: {}", message));
+        ctx.ui.log(&format!("generate predicates: {}", message));
 
         CommandResult {
             status: Status::Ok,
@@ -242,37 +242,68 @@ fn dominant_type(fs: &FieldStats) -> Option<&str> {
 /// Generate a simple Eq predicate on a single randomly chosen field.
 ///
 /// Picks one eligible field at random and generates a single `Eq` comparand
-/// from the field's observed distinct values. For numeric fields without
-/// distinct values, falls back to `Eq` on a random value in the observed range.
+/// from the field's observed distinct values. The target selectivity is used
+/// to prefer fields whose cardinality is close to `1/target_selectivity`, and
+/// within a field, to prefer lower-frequency values that approximate the
+/// target.
 fn generate_eq_predicate(
     eligible: &[(&String, &FieldStats)],
-    _target_selectivity: f64,
+    target_selectivity: f64,
     rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
 ) -> PNode {
-    let idx = rng.random_range(0..eligible.len());
+    // Prefer fields whose per-value selectivity is close to the target.
+    // For a field with N distinct values, per-value sel ≈ 1/N (uniform).
+    // Pick the field whose 1/N is closest to target_selectivity.
+    let target_distinct = (1.0 / target_selectivity.max(1e-12)).round() as usize;
+
+    // Filter to fields that have enough cardinality (non-overflow, distinct > 1)
+    let selective_fields: Vec<usize> = (0..eligible.len())
+        .filter(|&i| {
+            let fs = eligible[i].1;
+            fs.distinct.len() > 1 || fs.distinct_overflow
+        })
+        .collect();
+
+    let idx = if selective_fields.is_empty() {
+        rng.random_range(0..eligible.len())
+    } else {
+        // Weight by closeness of 1/distinct to target; overflow fields get
+        // high cardinality estimate
+        let mut best_idx = selective_fields[0];
+        let mut best_diff = f64::MAX;
+        for &i in &selective_fields {
+            let fs = eligible[i].1;
+            let est_distinct = if fs.distinct_overflow {
+                fs.count.max(1)
+            } else {
+                fs.distinct.len().max(1)
+            };
+            let diff = (est_distinct as f64 - target_distinct as f64).abs();
+            // Add jitter to avoid always picking the same field
+            let jittered = diff + rng.random_range(0.0..1.0);
+            if jittered < best_diff {
+                best_diff = jittered;
+                best_idx = i;
+            }
+        }
+        best_idx
+    };
+
     let (name, fs) = &eligible[idx];
     let field = FieldRef::Named(name.to_string());
-
     let dtype = dominant_type(fs);
 
     match dtype {
         Some("text" | "ascii" | "enum_str") => {
             if !fs.distinct.is_empty() {
-                let keys: Vec<&String> = fs.distinct.keys().collect();
-                let pick = rng.random_range(0..keys.len());
-                let raw = keys[pick].as_str();
-                let cleaned = if raw.starts_with('\'') && raw.ends_with('\'') && raw.len() >= 2 {
-                    &raw[1..raw.len() - 1]
-                } else {
-                    raw
-                };
+                // Pick a value weighted toward lower-frequency values
+                let value = pick_value_by_selectivity(fs, target_selectivity, rng);
                 PNode::Predicate(PredicateNode {
                     field,
                     op: OpType::Eq,
-                    comparands: vec![Comparand::Text(cleaned.to_string())],
+                    comparands: vec![Comparand::Text(value)],
                 })
             } else {
-                // No distinct values available — use Null check as fallback
                 PNode::Predicate(PredicateNode {
                     field,
                     op: OpType::Eq,
@@ -289,10 +320,9 @@ fn generate_eq_predicate(
             })
         }
         Some("int" | "int32" | "short" | "millis") => {
-            if !fs.distinct.is_empty() {
-                let keys: Vec<&String> = fs.distinct.keys().collect();
-                let pick = rng.random_range(0..keys.len());
-                if let Ok(v) = keys[pick].parse::<i64>() {
+            if !fs.distinct.is_empty() && !fs.distinct_overflow {
+                let value_str = pick_value_by_selectivity(fs, target_selectivity, rng);
+                if let Ok(v) = value_str.parse::<i64>() {
                     return PNode::Predicate(PredicateNode {
                         field,
                         op: OpType::Eq,
@@ -300,7 +330,6 @@ fn generate_eq_predicate(
                     });
                 }
             }
-            // Fallback: random value in observed range
             let min_val = fs.numeric_min as i64;
             let max_val = fs.numeric_max as i64;
             let val = if max_val > min_val {
@@ -329,7 +358,6 @@ fn generate_eq_predicate(
             })
         }
         _ => {
-            // Ultimate fallback
             PNode::Predicate(PredicateNode {
                 field,
                 op: OpType::Eq,
@@ -339,17 +367,102 @@ fn generate_eq_predicate(
     }
 }
 
-/// Generate a compound predicate AND-ing sub-predicates for each eligible field.
+/// Pick a value from a field's distinct values, preferring values whose
+/// observed frequency is closest to `target_selectivity`.
+fn pick_value_by_selectivity(
+    fs: &FieldStats,
+    target_selectivity: f64,
+    rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
+) -> String {
+    let total: usize = fs.distinct.values().sum();
+    if total == 0 || fs.distinct.is_empty() {
+        return String::new();
+    }
+
+    // Score each value: how close is its frequency to the target selectivity?
+    let target_count = (total as f64 * target_selectivity).max(1.0);
+    let scored: Vec<(&String, f64)> = fs.distinct
+        .iter()
+        .map(|(val, &cnt)| {
+            let diff = ((cnt as f64) - target_count).abs();
+            // Inverse distance weight — prefer closer matches
+            let weight = 1.0 / (diff + 1.0);
+            (val, weight)
+        })
+        .collect();
+
+    // Weighted random selection
+    let total_weight: f64 = scored.iter().map(|(_, w)| w).sum();
+    let mut pick = rng.random_range(0.0..total_weight);
+    for (val, weight) in &scored {
+        pick -= weight;
+        if pick <= 0.0 {
+            let raw = val.as_str();
+            let cleaned = if raw.starts_with('\'') && raw.ends_with('\'') && raw.len() >= 2 {
+                &raw[1..raw.len() - 1]
+            } else {
+                raw
+            };
+            return cleaned.to_string();
+        }
+    }
+
+    // Fallback: last value
+    let (val, _) = scored.last().unwrap();
+    let raw = val.as_str();
+    if raw.starts_with('\'') && raw.ends_with('\'') && raw.len() >= 2 {
+        raw[1..raw.len() - 1].to_string()
+    } else {
+        raw.to_string()
+    }
+}
+
+/// Generate a compound predicate AND-ing sub-predicates for a subset of fields.
+///
+/// Selects enough fields to achieve the target selectivity, rather than using
+/// all eligible fields. Fields are shuffled and added until the cumulative
+/// estimated selectivity reaches the target.
 fn generate_compound_predicate(
     eligible: &[(&String, &FieldStats)],
     target_selectivity: f64,
     rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
 ) -> PNode {
-    let n = eligible.len() as f64;
+    // Shuffle field indices
+    let mut indices: Vec<usize> = (0..eligible.len()).collect();
+    for i in (1..indices.len()).rev() {
+        let j = rng.random_range(0..=i);
+        indices.swap(i, j);
+    }
+
+    // Greedily add fields until cumulative selectivity is low enough.
+    // Each field's contribution is bounded: for N distinct values, the
+    // best per-field selectivity is roughly 1/N.
+    let mut selected: Vec<usize> = Vec::new();
+    let mut cumulative_sel = 1.0f64;
+
+    for &idx in &indices {
+        if cumulative_sel <= target_selectivity && !selected.is_empty() {
+            break;
+        }
+        let fs = eligible[idx].1;
+        let est_distinct = if fs.distinct_overflow {
+            fs.count.max(1) as f64
+        } else {
+            fs.distinct.len().max(1) as f64
+        };
+        // This field can contribute at most 1/est_distinct selectivity reduction
+        cumulative_sel *= 1.0 / est_distinct;
+        selected.push(idx);
+    }
+
+    // Compute per-field selectivity target: distribute the overall target
+    // evenly across selected fields.
+    let n = selected.len().max(1) as f64;
     let per_field_sel = target_selectivity.powf(1.0 / n);
 
     let mut children: Vec<PNode> = Vec::new();
-    for (name, fs) in eligible {
+    for &idx in &selected {
+        let (name, fs) = &eligible[idx];
         if let Some(sub) = generate_field_predicate(name, fs, per_field_sel, rng) {
             children.push(sub);
         }
@@ -402,6 +515,9 @@ fn generate_field_predicate(
 }
 
 /// Generate an integer predicate — Eq/In for few distinct values, range for many.
+///
+/// Uses observed value frequencies to pick values whose cumulative frequency
+/// is closest to `per_field_sel`.
 fn generate_int_predicate(
     field: FieldRef,
     fs: &FieldStats,
@@ -411,27 +527,41 @@ fn generate_int_predicate(
     let distinct_count = fs.distinct.len();
 
     if distinct_count > 0 && !fs.distinct_overflow {
-        // Few distinct values — use Eq or In
-        let num_pick = ((distinct_count as f64 * per_field_sel).ceil() as usize).max(1).min(distinct_count);
-        let distinct_vals: Vec<&String> = fs.distinct.keys().collect();
-        let mut indices: Vec<usize> = (0..distinct_count).collect();
-        // Partial shuffle
-        for i in 0..num_pick {
-            let j = rng.random_range(i..indices.len());
-            indices.swap(i, j);
+        let total: usize = fs.distinct.values().sum();
+        if total == 0 {
+            return generate_int_range_predicate(field, fs, per_field_sel, rng);
         }
-        let picked: Vec<Comparand> = indices[..num_pick]
+
+        // Sort by ascending frequency, shuffle within similar bands
+        let mut by_freq: Vec<(&String, usize)> = fs.distinct
             .iter()
-            .filter_map(|&i| {
-                distinct_vals[i]
-                    .parse::<i64>()
-                    .ok()
-                    .map(Comparand::Int)
-            })
+            .map(|(k, &v)| (k, v))
             .collect();
+        by_freq.sort_by_key(|(_, cnt)| *cnt);
+        for i in (1..by_freq.len()).rev() {
+            let j = rng.random_range(0..=i);
+            let f_i = by_freq[i].1.max(1);
+            let f_j = by_freq[j].1.max(1);
+            if f_i <= f_j * 2 && f_j <= f_i * 2 {
+                by_freq.swap(i, j);
+            }
+        }
+
+        let target_count = (total as f64 * per_field_sel).max(1.0);
+        let mut picked: Vec<Comparand> = Vec::new();
+        let mut cumulative = 0usize;
+
+        for (val, cnt) in &by_freq {
+            if cumulative as f64 >= target_count && !picked.is_empty() {
+                break;
+            }
+            if let Ok(v) = val.parse::<i64>() {
+                picked.push(Comparand::Int(v));
+                cumulative += cnt;
+            }
+        }
 
         if picked.is_empty() {
-            // Fallback to range
             return generate_int_range_predicate(field, fs, per_field_sel, rng);
         }
 
@@ -524,6 +654,9 @@ fn generate_float_predicate(
 }
 
 /// Generate a text predicate — Eq or In from distinct values.
+///
+/// Uses observed value frequencies to pick values whose cumulative frequency
+/// is closest to `per_field_sel`, rather than assuming uniform distribution.
 fn generate_text_predicate(
     field: FieldRef,
     fs: &FieldStats,
@@ -534,28 +667,53 @@ fn generate_text_predicate(
         return None;
     }
 
-    let distinct_count = fs.distinct.len();
-    let num_pick = ((distinct_count as f64 * per_field_sel).ceil() as usize).max(1).min(distinct_count);
-    let distinct_vals: Vec<&String> = fs.distinct.keys().collect();
-    let mut indices: Vec<usize> = (0..distinct_count).collect();
-    for i in 0..num_pick {
-        let j = rng.random_range(i..indices.len());
-        indices.swap(i, j);
+    let total: usize = fs.distinct.values().sum();
+    if total == 0 {
+        return None;
     }
 
-    let picked: Vec<Comparand> = indices[..num_pick]
+    // Sort values by ascending frequency so we can greedily pick low-frequency
+    // values until we reach the target selectivity.
+    let mut by_freq: Vec<(&String, usize)> = fs.distinct
         .iter()
-        .map(|&i| {
-            // Distinct values from MValue Display have surrounding quotes for text — strip them
-            let raw = distinct_vals[i].as_str();
-            let cleaned = if raw.starts_with('\'') && raw.ends_with('\'') && raw.len() >= 2 {
-                &raw[1..raw.len() - 1]
-            } else {
-                raw
-            };
-            Comparand::Text(cleaned.to_string())
-        })
+        .map(|(k, &v)| (k, v))
         .collect();
+    by_freq.sort_by_key(|(_, cnt)| *cnt);
+
+    // Shuffle values with similar frequency to add randomness
+    // (partial shuffle within frequency bands)
+    let mut shuffled = by_freq.clone();
+    for i in (1..shuffled.len()).rev() {
+        let j = rng.random_range(0..=i);
+        // Only swap if frequencies are within 2x of each other (similar band)
+        let f_i = shuffled[i].1.max(1);
+        let f_j = shuffled[j].1.max(1);
+        if f_i <= f_j * 2 && f_j <= f_i * 2 {
+            shuffled.swap(i, j);
+        }
+    }
+
+    let target_count = (total as f64 * per_field_sel).max(1.0);
+    let mut picked: Vec<Comparand> = Vec::new();
+    let mut cumulative = 0usize;
+
+    for (val, cnt) in &shuffled {
+        if cumulative as f64 >= target_count && !picked.is_empty() {
+            break;
+        }
+        let raw = val.as_str();
+        let cleaned = if raw.starts_with('\'') && raw.ends_with('\'') && raw.len() >= 2 {
+            &raw[1..raw.len() - 1]
+        } else {
+            raw
+        };
+        picked.push(Comparand::Text(cleaned.to_string()));
+        cumulative += cnt;
+    }
+
+    if picked.is_empty() {
+        return None;
+    }
 
     if picked.len() == 1 {
         Some(PNode::Predicate(PredicateNode { field, op: OpType::Eq, comparands: picked }))
@@ -604,6 +762,9 @@ mod tests {
 
     fn test_ctx(dir: &std::path::Path) -> StreamContext {
         StreamContext {
+            dataset_name: String::new(),
+            profile: String::new(),
+            profile_names: vec![],
             workspace: dir.to_path_buf(),
             scratch: dir.join(".scratch"),
             cache: dir.join(".cache"),
@@ -613,7 +774,7 @@ mod tests {
             threads: 1,
             step_id: String::new(),
             governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
-            display: crate::pipeline::display::ProgressDisplay::new(),
+            ui: crate::ui::UiHandle::new(std::sync::Arc::new(crate::ui::TestSink::new())),
         }
     }
 

@@ -222,24 +222,24 @@ impl CommandOp for InfoFileOp {
         let header_overhead =
             (4 * info.vector_count) as f64 / info.file_size as f64 * 100.0;
 
-        ctx.display.log(&format!("File: {}", source_path.display()));
-        ctx.display.log(&format!("  Size:       {} ({} bytes)", human_bytes(info.file_size), info.file_size));
-        ctx.display.log(&format!("  Format:     .{} ({})", info.format, info.data_type));
-        ctx.display.log(&format!(
+        ctx.ui.log(&format!("File: {}", source_path.display()));
+        ctx.ui.log(&format!("  Size:       {} ({} bytes)", human_bytes(info.file_size), info.file_size));
+        ctx.ui.log(&format!("  Format:     .{} ({})", info.format, info.data_type));
+        ctx.ui.log(&format!(
             "  Element:    {} bytes per value",
             info.bytes_per_element
         ));
-        ctx.display.log(&format!("  Dimensions: {}", info.dimensions));
-        ctx.display.log(&format!("  Vectors:    {}", info.vector_count));
-        ctx.display.log(&format!(
+        ctx.ui.log(&format!("  Dimensions: {}", info.dimensions));
+        ctx.ui.log(&format!("  Vectors:    {}", info.vector_count));
+        ctx.ui.log(&format!(
             "  Per-vector: {} bytes (4 header + {} data)",
             info.bytes_per_vector,
             info.dimensions * info.bytes_per_element
         ));
-        ctx.display.log(&format!("  Header overhead: {:.1}%", header_overhead));
+        ctx.ui.log(&format!("  Header overhead: {:.1}%", header_overhead));
 
         if info.trailing_bytes > 0 {
-            ctx.display.log(&format!(
+            ctx.ui.log(&format!(
                 "  WARNING: {} trailing bytes (file may be truncated or corrupted)",
                 info.trailing_bytes
             ));
@@ -248,9 +248,9 @@ impl CommandOp for InfoFileOp {
         if sample_count > 0 {
             let data = std::fs::read(&source_path).unwrap_or_default();
             let samples = read_samples(&data, &info, sample_count, 8);
-            ctx.display.log("  Sample vectors:");
+            ctx.ui.log("  Sample vectors:");
             for s in &samples {
-                ctx.display.log(&format!("{}", s));
+                ctx.ui.log(&format!("{}", s));
             }
         }
 
@@ -316,6 +316,9 @@ mod tests {
 
     fn test_ctx(dir: &Path) -> StreamContext {
         StreamContext {
+            dataset_name: String::new(),
+            profile: String::new(),
+            profile_names: vec![],
             workspace: dir.to_path_buf(),
             scratch: dir.join(".scratch"),
             cache: dir.join(".cache"),
@@ -325,7 +328,7 @@ mod tests {
             threads: 1,
             step_id: String::new(),
             governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
-            display: crate::pipeline::display::ProgressDisplay::new(),
+            ui: crate::ui::UiHandle::new(std::sync::Arc::new(crate::ui::TestSink::new())),
         }
     }
 

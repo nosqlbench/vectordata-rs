@@ -262,7 +262,14 @@ from the fvec source. Supports range specifications to select a subset.
 
 // ---- ivec-extract -----------------------------------------------------------
 
-/// Pipeline command: extract a range of records from an ivec file.
+/// Pipeline command: extract records from an ivec file.
+///
+/// Supports two modes:
+/// - **Index-based**: provide `index-file` (an ivec containing indices); each
+///   index selects a record from the source ivec. `range` selects which
+///   index-file entries to use.
+/// - **Range-based**: omit `index-file`; `range` selects a contiguous range
+///   of ivec records directly.
 pub struct GenerateIvecExtractOp;
 
 pub fn ivec_factory() -> Box<dyn CommandOp> {
@@ -284,8 +291,16 @@ Extract a subset of vectors from an ivec file.
 
 ## Description
 
-Extracts a range of records from an ivec file. Supports range specifications
-in the format `[start,end)` or `start..end` to select a subset of the source file.
+Extracts records from an ivec file. Two modes:
+
+**Index-based** (with `index-file`): Each index in the index ivec is a
+1-dimensional record whose value selects a record from the source ivec.
+The `range` parameter controls which entries of the index file to use.
+
+**Range-based** (without `index-file`): Extracts a contiguous range of records
+from the ivec file directly.
+
+Supports range specifications in the format `[start,end)` or `start..end`.
 
 ## Options
 
@@ -313,6 +328,7 @@ in the format `[start,end)` or `start..end` to select a subset of the source fil
 
         let ivec_path = resolve_path(ivec_str, &ctx.workspace);
         let output_path = resolve_path(output_str, &ctx.workspace);
+        let index_path = options.get("index-file").map(|s| resolve_path(s, &ctx.workspace));
 
         let range = match options.get("range") {
             Some(r) => match parse_range(r) {
@@ -322,7 +338,7 @@ in the format `[start,end)` or `start..end` to select a subset of the source fil
             None => Range { start: 0, end: None },
         };
 
-        // Open the ivec file
+        // Open the source ivec file
         let ivec_reader = match MmapVectorReader::<i32>::open_ivec(&ivec_path) {
             Ok(r) => r,
             Err(e) => {
@@ -335,19 +351,6 @@ in the format `[start,end)` or `start..end` to select a subset of the source fil
 
         let ivec_count = <MmapVectorReader<i32> as VectorReader<i32>>::count(&ivec_reader);
         let dim = <MmapVectorReader<i32> as VectorReader<i32>>::dim(&ivec_reader) as u32;
-        let range_start = range.start;
-        let range_end = range.end.unwrap_or(ivec_count);
-        let effective_end = std::cmp::min(range_end, ivec_count);
-
-        if range_start >= ivec_count {
-            return error_result(
-                format!(
-                    "range start {} exceeds ivec count {}",
-                    range_start, ivec_count
-                ),
-                start,
-            );
-        }
 
         // Create output directory
         if let Some(parent) = output_path.parent() {
@@ -358,7 +361,6 @@ in the format `[start,end)` or `start..end` to select a subset of the source fil
             }
         }
 
-        // Extract records
         use std::io::Write;
         let file = match std::fs::File::create(&output_path) {
             Ok(f) => f,
@@ -371,47 +373,133 @@ in the format `[start,end)` or `start..end` to select a subset of the source fil
         };
         let mut writer = std::io::BufWriter::with_capacity(1 << 20, file);
 
-        let mut count: u64 = 0;
-        for i in range_start..effective_end {
-            let vec = match ivec_reader.get(i) {
-                Ok(v) => v,
+        if let Some(ref idx_p) = index_path {
+            // Index-based extraction: read indices from index-file, look up records in source ivec
+            let idx_reader = match MmapVectorReader::<i32>::open_ivec(idx_p) {
+                Ok(r) => r,
                 Err(e) => {
                     return error_result(
-                        format!("failed to read ivec[{}]: {}", i, e),
+                        format!("failed to open index file {}: {}", idx_p.display(), e),
                         start,
                     )
                 }
             };
 
-            writer
-                .write_all(&(dim as i32).to_le_bytes())
-                .map_err(|e| e.to_string())
-                .unwrap();
-            let slice: &[i32] = vec.as_ref();
-            for &val in slice {
-                writer
-                    .write_all(&val.to_le_bytes())
-                    .map_err(|e| e.to_string())
-                    .unwrap();
+            let idx_count = <MmapVectorReader<i32> as VectorReader<i32>>::count(&idx_reader);
+            let range_start = range.start;
+            let range_end = range.end.unwrap_or(idx_count);
+
+            if range_start >= idx_count {
+                return error_result(
+                    format!("range start {} exceeds index-file count {}", range_start, idx_count),
+                    start,
+                );
             }
-            count += 1;
-        }
+            let effective_end = std::cmp::min(range_end, idx_count);
 
-        if let Err(e) = writer.flush() {
-            return error_result(format!("failed to flush output: {}", e), start);
-        }
+            let mut count: u64 = 0;
+            for i in range_start..effective_end {
+                let index_vec = match idx_reader.get(i) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return error_result(
+                            format!("failed to read index-file[{}]: {}", i, e),
+                            start,
+                        )
+                    }
+                };
+                let index = index_vec[0] as usize;
 
-        CommandResult {
-            status: Status::Ok,
-            message: format!(
-                "extracted {} ivec records (range [{}..{})) to {}",
-                count,
-                range_start,
-                effective_end,
-                output_path.display()
-            ),
-            produced: vec![output_path],
-            elapsed: start.elapsed(),
+                if index >= ivec_count {
+                    return error_result(
+                        format!(
+                            "index {} at index-file[{}] exceeds ivec count {}",
+                            index, i, ivec_count
+                        ),
+                        start,
+                    );
+                }
+
+                let vec = match ivec_reader.get(index) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return error_result(
+                            format!("failed to read ivec[{}]: {}", index, e),
+                            start,
+                        )
+                    }
+                };
+
+                writer.write_all(&(dim as i32).to_le_bytes()).map_err(|e| e.to_string()).unwrap();
+                let slice: &[i32] = vec.as_ref();
+                for &val in slice {
+                    writer.write_all(&val.to_le_bytes()).map_err(|e| e.to_string()).unwrap();
+                }
+                count += 1;
+            }
+
+            if let Err(e) = writer.flush() {
+                return error_result(format!("failed to flush output: {}", e), start);
+            }
+
+            CommandResult {
+                status: Status::Ok,
+                message: format!(
+                    "extracted {} ivec records by index (range [{}..{})) to {}",
+                    count, range_start, effective_end, output_path.display()
+                ),
+                produced: vec![output_path],
+                elapsed: start.elapsed(),
+            }
+        } else {
+            // Range-based extraction: contiguous range from ivec
+            let range_start = range.start;
+            let range_end = range.end.unwrap_or(ivec_count);
+            let effective_end = std::cmp::min(range_end, ivec_count);
+
+            if range_start >= ivec_count {
+                return error_result(
+                    format!(
+                        "range start {} exceeds ivec count {}",
+                        range_start, ivec_count
+                    ),
+                    start,
+                );
+            }
+
+            let mut count: u64 = 0;
+            for i in range_start..effective_end {
+                let vec = match ivec_reader.get(i) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return error_result(
+                            format!("failed to read ivec[{}]: {}", i, e),
+                            start,
+                        )
+                    }
+                };
+
+                writer.write_all(&(dim as i32).to_le_bytes()).map_err(|e| e.to_string()).unwrap();
+                let slice: &[i32] = vec.as_ref();
+                for &val in slice {
+                    writer.write_all(&val.to_le_bytes()).map_err(|e| e.to_string()).unwrap();
+                }
+                count += 1;
+            }
+
+            if let Err(e) = writer.flush() {
+                return error_result(format!("failed to flush output: {}", e), start);
+            }
+
+            CommandResult {
+                status: Status::Ok,
+                message: format!(
+                    "extracted {} ivec records (range [{}..{})) to {}",
+                    count, range_start, effective_end, output_path.display()
+                ),
+                produced: vec![output_path],
+                elapsed: start.elapsed(),
+            }
         }
     }
 
@@ -425,6 +513,13 @@ in the format `[start,end)` or `start..end` to select a subset of the source fil
                 description: "Source ivec file".to_string(),
             },
             OptionDesc {
+                name: "index-file".to_string(),
+                type_name: "Path".to_string(),
+                required: false,
+                default: None,
+                description: "Ivec file containing indices (enables index-based extraction)".to_string(),
+            },
+            OptionDesc {
                 name: "output".to_string(),
                 type_name: "Path".to_string(),
                 required: true,
@@ -436,7 +531,7 @@ in the format `[start,end)` or `start..end` to select a subset of the source fil
                 type_name: "String".to_string(),
                 required: false,
                 default: None,
-                description: "Record range: [start,end) or start..end".to_string(),
+                description: "Range: [start,end) or start..end. Applies to index-file entries (index mode) or ivec records (range mode)".to_string(),
             },
         ]
     }
@@ -444,7 +539,13 @@ in the format `[start,end)` or `start..end` to select a subset of the source fil
 
 // ---- hvec-extract -----------------------------------------------------------
 
-/// Pipeline command: extract a range of records from an hvec (f16) file.
+/// Pipeline command: extract records from an hvec (f16) file.
+///
+/// Supports two modes:
+/// - **Index-based**: provide `ivec-file` containing indices; each index selects
+///   a vector from the hvec source. `range` selects which ivec entries to use.
+/// - **Range-based**: omit `ivec-file`; `range` selects a contiguous range of
+///   hvec records directly.
 pub struct GenerateHvecExtractOp;
 
 pub fn hvec_factory() -> Box<dyn CommandOp> {
@@ -466,9 +567,16 @@ Extract a subset of vectors from an hvec file.
 
 ## Description
 
-Extracts a range of records from an hvec (half-precision float16) file.
-Supports range specifications in the format `[start,end)` or `start..end`
-to select a subset of the source file.
+Extracts vectors from an hvec (half-precision float16) file. Two modes:
+
+**Index-based** (with `ivec-file`): Each index in the ivec is a 1-dimensional
+record whose value selects a vector from the hvec source. The `range` parameter
+controls which entries of the ivec to use.
+
+**Range-based** (without `ivec-file`): Extracts a contiguous range of records
+from the hvec file directly.
+
+Supports range specifications in the format `[start,end)` or `start..end`.
 
 ## Options
 
@@ -496,6 +604,7 @@ to select a subset of the source file.
 
         let hvec_path = resolve_path(hvec_str, &ctx.workspace);
         let output_path = resolve_path(output_str, &ctx.workspace);
+        let ivec_path = options.get("ivec-file").map(|s| resolve_path(s, &ctx.workspace));
 
         let range = match options.get("range") {
             Some(r) => match parse_range(r) {
@@ -520,19 +629,6 @@ to select a subset of the source file.
             <MmapVectorReader<half::f16> as VectorReader<half::f16>>::count(&hvec_reader);
         let dim =
             <MmapVectorReader<half::f16> as VectorReader<half::f16>>::dim(&hvec_reader) as u32;
-        let range_start = range.start;
-        let range_end = range.end.unwrap_or(hvec_count);
-        let effective_end = std::cmp::min(range_end, hvec_count);
-
-        if range_start >= hvec_count {
-            return error_result(
-                format!(
-                    "range start {} exceeds hvec count {}",
-                    range_start, hvec_count
-                ),
-                start,
-            );
-        }
 
         // Create output directory
         if let Some(parent) = output_path.parent() {
@@ -543,7 +639,6 @@ to select a subset of the source file.
             }
         }
 
-        // Extract records
         use std::io::Write;
         let file = match std::fs::File::create(&output_path) {
             Ok(f) => f,
@@ -556,47 +651,133 @@ to select a subset of the source file.
         };
         let mut writer = std::io::BufWriter::with_capacity(1 << 20, file);
 
-        let mut count: u64 = 0;
-        for i in range_start..effective_end {
-            let vec = match hvec_reader.get(i) {
-                Ok(v) => v,
+        if let Some(ref ivec_p) = ivec_path {
+            // Index-based extraction: read indices from ivec, look up vectors in hvec
+            let ivec_reader = match MmapVectorReader::<i32>::open_ivec(ivec_p) {
+                Ok(r) => r,
                 Err(e) => {
                     return error_result(
-                        format!("failed to read hvec[{}]: {}", i, e),
+                        format!("failed to open ivec file {}: {}", ivec_p.display(), e),
                         start,
                     )
                 }
             };
 
-            writer
-                .write_all(&(dim as i32).to_le_bytes())
-                .map_err(|e| e.to_string())
-                .unwrap();
-            let slice: &[half::f16] = vec.as_ref();
-            for &val in slice {
-                writer
-                    .write_all(&val.to_le_bytes())
-                    .map_err(|e| e.to_string())
-                    .unwrap();
+            let ivec_count = <MmapVectorReader<i32> as VectorReader<i32>>::count(&ivec_reader);
+            let range_start = range.start;
+            let range_end = range.end.unwrap_or(ivec_count);
+
+            if range_start >= ivec_count {
+                return error_result(
+                    format!("range start {} exceeds ivec count {}", range_start, ivec_count),
+                    start,
+                );
             }
-            count += 1;
-        }
+            let effective_end = std::cmp::min(range_end, ivec_count);
 
-        if let Err(e) = writer.flush() {
-            return error_result(format!("failed to flush output: {}", e), start);
-        }
+            let mut count: u64 = 0;
+            for i in range_start..effective_end {
+                let index_vec = match ivec_reader.get(i) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return error_result(
+                            format!("failed to read ivec[{}]: {}", i, e),
+                            start,
+                        )
+                    }
+                };
+                let index = index_vec[0] as usize;
 
-        CommandResult {
-            status: Status::Ok,
-            message: format!(
-                "extracted {} hvec records (range [{}..{})) to {}",
-                count,
-                range_start,
-                effective_end,
-                output_path.display()
-            ),
-            produced: vec![output_path],
-            elapsed: start.elapsed(),
+                if index >= hvec_count {
+                    return error_result(
+                        format!(
+                            "index {} at ivec[{}] exceeds hvec count {}",
+                            index, i, hvec_count
+                        ),
+                        start,
+                    );
+                }
+
+                let vector = match hvec_reader.get(index) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return error_result(
+                            format!("failed to read hvec[{}]: {}", index, e),
+                            start,
+                        )
+                    }
+                };
+
+                writer.write_all(&(dim as i32).to_le_bytes()).map_err(|e| e.to_string()).unwrap();
+                let slice: &[half::f16] = vector.as_ref();
+                for &val in slice {
+                    writer.write_all(&val.to_le_bytes()).map_err(|e| e.to_string()).unwrap();
+                }
+                count += 1;
+            }
+
+            if let Err(e) = writer.flush() {
+                return error_result(format!("failed to flush output: {}", e), start);
+            }
+
+            CommandResult {
+                status: Status::Ok,
+                message: format!(
+                    "extracted {} hvec vectors by index (ivec range [{}..{})) to {}",
+                    count, range_start, effective_end, output_path.display()
+                ),
+                produced: vec![output_path],
+                elapsed: start.elapsed(),
+            }
+        } else {
+            // Range-based extraction: contiguous range from hvec
+            let range_start = range.start;
+            let range_end = range.end.unwrap_or(hvec_count);
+            let effective_end = std::cmp::min(range_end, hvec_count);
+
+            if range_start >= hvec_count {
+                return error_result(
+                    format!(
+                        "range start {} exceeds hvec count {}",
+                        range_start, hvec_count
+                    ),
+                    start,
+                );
+            }
+
+            let mut count: u64 = 0;
+            for i in range_start..effective_end {
+                let vec = match hvec_reader.get(i) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return error_result(
+                            format!("failed to read hvec[{}]: {}", i, e),
+                            start,
+                        )
+                    }
+                };
+
+                writer.write_all(&(dim as i32).to_le_bytes()).map_err(|e| e.to_string()).unwrap();
+                let slice: &[half::f16] = vec.as_ref();
+                for &val in slice {
+                    writer.write_all(&val.to_le_bytes()).map_err(|e| e.to_string()).unwrap();
+                }
+                count += 1;
+            }
+
+            if let Err(e) = writer.flush() {
+                return error_result(format!("failed to flush output: {}", e), start);
+            }
+
+            CommandResult {
+                status: Status::Ok,
+                message: format!(
+                    "extracted {} hvec records (range [{}..{})) to {}",
+                    count, range_start, effective_end, output_path.display()
+                ),
+                produced: vec![output_path],
+                elapsed: start.elapsed(),
+            }
         }
     }
 
@@ -610,6 +791,13 @@ to select a subset of the source file.
                 description: "Source hvec file".to_string(),
             },
             OptionDesc {
+                name: "ivec-file".to_string(),
+                type_name: "Path".to_string(),
+                required: false,
+                default: None,
+                description: "Ivec file containing indices (enables index-based extraction)".to_string(),
+            },
+            OptionDesc {
                 name: "output".to_string(),
                 type_name: "Path".to_string(),
                 required: true,
@@ -621,7 +809,7 @@ to select a subset of the source file.
                 type_name: "String".to_string(),
                 required: false,
                 default: None,
-                description: "Record range: [start,end) or start..end".to_string(),
+                description: "Range: [start,end) or start..end. Applies to ivec entries (index mode) or hvec records (range mode)".to_string(),
             },
         ]
     }
@@ -635,57 +823,83 @@ struct Range {
     end: Option<usize>,
 }
 
+/// Parse a number with optional unit suffix, returning usize.
+fn parse_range_number(s: &str) -> Result<usize, String> {
+    let v = dataset::source::parse_number_with_suffix(s)?;
+    usize::try_from(v).map_err(|_| format!("value too large for usize: {}", v))
+}
+
 /// Parse a range specification.
 ///
 /// Supported formats:
 /// - `[start,end)` — inclusive start, exclusive end (Java interval notation)
 /// - `start..end` — Rust-style exclusive end
 /// - `start` — from start to end of file
+///
+/// Symbolic open-ended ranges (unit suffixes supported in all positions):
+/// - `[10k..]` — from 10,000 to end of file
+/// - `[..10k)` — first 10k elements
+/// - `[..10k]` — first 10,001 elements (inclusive end)
+/// - `(10k..]` — from 10,001 to end of file (exclusive start)
 fn parse_range(s: &str) -> Result<Range, String> {
     let s = s.trim();
 
-    // Java interval notation: [start,end)
-    if s.starts_with('[') && s.ends_with(')') {
-        let inner = &s[1..s.len() - 1];
-        let parts: Vec<&str> = inner.split(',').collect();
-        if parts.len() != 2 {
-            return Err("expected [start,end)".to_string());
+    // Detect bracket types for inclusive/exclusive semantics
+    let left_exclusive = s.starts_with('(');
+    let right_inclusive = s.ends_with(']');
+    let has_left_bracket = s.starts_with('[') || s.starts_with('(');
+    let has_right_bracket = s.ends_with(')') || s.ends_with(']');
+
+    // Strip brackets
+    let inner = if has_left_bracket { &s[1..] } else { s };
+    let inner = if has_right_bracket {
+        &inner[..inner.len() - 1]
+    } else {
+        inner
+    };
+    let inner = inner.trim();
+
+    // Try comma separator first (Java interval notation), then '..'
+    let sep = if inner.contains(',') {
+        ","
+    } else if inner.contains("..") {
+        ".."
+    } else {
+        // Single value: start only (or shorthand for 0..N)
+        let val = parse_range_number(inner)?;
+        return Ok(Range {
+            start: val,
+            end: None,
+        });
+    };
+
+    let (left, right) = inner.split_once(sep).unwrap();
+    let left = left.trim();
+    let right = right.trim();
+
+    let mut start = if left.is_empty() {
+        0
+    } else {
+        parse_range_number(left)?
+    };
+    let mut end = if right.is_empty() {
+        None
+    } else {
+        Some(parse_range_number(right)?)
+    };
+
+    // Exclusive start '(' → skip one more element
+    if left_exclusive && !left.is_empty() {
+        start = start.checked_add(1).ok_or("start overflow")?;
+    }
+    // Inclusive end ']' → include the boundary element
+    if right_inclusive {
+        if let Some(e) = end {
+            end = Some(e.checked_add(1).ok_or("end overflow")?);
         }
-        let start: usize = parts[0]
-            .trim()
-            .parse()
-            .map_err(|_| format!("invalid start: '{}'", parts[0].trim()))?;
-        let end: usize = parts[1]
-            .trim()
-            .parse()
-            .map_err(|_| format!("invalid end: '{}'", parts[1].trim()))?;
-        return Ok(Range {
-            start,
-            end: Some(end),
-        });
     }
 
-    // Rust-style: start..end
-    if let Some((left, right)) = s.split_once("..") {
-        let start: usize = left
-            .trim()
-            .parse()
-            .map_err(|_| format!("invalid start: '{}'", left.trim()))?;
-        let end: usize = right
-            .trim()
-            .parse()
-            .map_err(|_| format!("invalid end: '{}'", right.trim()))?;
-        return Ok(Range {
-            start,
-            end: Some(end),
-        });
-    }
-
-    // Single value: start only
-    let start: usize = s
-        .parse()
-        .map_err(|_| format!("invalid range: '{}'", s))?;
-    Ok(Range { start, end: None })
+    Ok(Range { start, end })
 }
 
 fn resolve_path(path_str: &str, workspace: &Path) -> PathBuf {
@@ -741,7 +955,48 @@ mod tests {
     #[test]
     fn test_parse_range_invalid() {
         assert!(parse_range("[abc,100)").is_err());
-        assert!(parse_range("[100,)").is_err());
+    }
+
+    #[test]
+    fn test_parse_range_with_suffixes() {
+        let r = parse_range("[0,10K)").unwrap();
+        assert_eq!(r.start, 0);
+        assert_eq!(r.end, Some(10_000));
+    }
+
+    #[test]
+    fn test_parse_range_open_right() {
+        let r = parse_range("[10k..]").unwrap();
+        assert_eq!(r.start, 10_000);
+        assert_eq!(r.end, None);
+    }
+
+    #[test]
+    fn test_parse_range_open_left_exclusive() {
+        let r = parse_range("[..10k)").unwrap();
+        assert_eq!(r.start, 0);
+        assert_eq!(r.end, Some(10_000));
+    }
+
+    #[test]
+    fn test_parse_range_open_left_inclusive() {
+        let r = parse_range("[..10k]").unwrap();
+        assert_eq!(r.start, 0);
+        assert_eq!(r.end, Some(10_001));
+    }
+
+    #[test]
+    fn test_parse_range_exclusive_start() {
+        let r = parse_range("(10k..]").unwrap();
+        assert_eq!(r.start, 10_001);
+        assert_eq!(r.end, None);
+    }
+
+    #[test]
+    fn test_parse_range_all() {
+        let r = parse_range("[..]").unwrap();
+        assert_eq!(r.start, 0);
+        assert_eq!(r.end, None);
     }
 
     #[test]
@@ -755,6 +1010,9 @@ mod tests {
         let workspace = tmp.path();
 
         let mut ctx = StreamContext {
+            dataset_name: String::new(),
+            profile: String::new(),
+            profile_names: vec![],
             workspace: workspace.to_path_buf(),
             scratch: workspace.join(".scratch"),
             cache: workspace.join(".cache"),
@@ -764,7 +1022,7 @@ mod tests {
             threads: 1,
             step_id: String::new(),
             governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
-            display: crate::pipeline::display::ProgressDisplay::new(),
+            ui: crate::ui::UiHandle::new(std::sync::Arc::new(crate::ui::TestSink::new())),
         };
 
         // Generate 50 f16 vectors of dimension 8
@@ -809,9 +1067,87 @@ mod tests {
         }
     }
 
-    // Integration tests for extract require actual fvec/ivec files on disk.
-    // The generate commands produce these, so end-to-end testing is done
-    // via pipeline integration tests.
+    #[test]
+    fn test_hvec_extract_by_index() {
+        use crate::pipeline::command::StreamContext;
+        use crate::pipeline::progress::ProgressLog;
+        use crate::pipeline::commands::gen_vectors::GenerateVectorsOp;
+        use crate::pipeline::commands::gen_shuffle::GenerateIvecShuffleOp;
+        use indexmap::IndexMap;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path();
+
+        let mut ctx = StreamContext {
+            dataset_name: String::new(),
+            profile: String::new(),
+            profile_names: vec![],
+            workspace: workspace.to_path_buf(),
+            scratch: workspace.join(".scratch"),
+            cache: workspace.join(".cache"),
+            defaults: IndexMap::new(),
+            dry_run: false,
+            progress: ProgressLog::new(),
+            threads: 1,
+            step_id: String::new(),
+            governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
+            ui: crate::ui::UiHandle::new(std::sync::Arc::new(crate::ui::TestSink::new())),
+        };
+
+        // Generate 20 f16 vectors of dimension 8
+        let hvec_path = workspace.join("source.hvec");
+        let mut opts = Options::new();
+        opts.set("output", hvec_path.to_string_lossy().to_string());
+        opts.set("dimension", "8");
+        opts.set("count", "20");
+        opts.set("seed", "42");
+        opts.set("type", "f16");
+        let mut gen_op = GenerateVectorsOp;
+        let r = gen_op.execute(&opts, &mut ctx);
+        assert_eq!(r.status, Status::Ok);
+
+        // Generate shuffle of 20 elements
+        let ivec_path = workspace.join("shuffle.ivec");
+        let mut opts = Options::new();
+        opts.set("output", ivec_path.to_string_lossy().to_string());
+        opts.set("interval", "20");
+        opts.set("seed", "99");
+        let mut shuf_op = GenerateIvecShuffleOp;
+        let r = shuf_op.execute(&opts, &mut ctx);
+        assert_eq!(r.status, Status::Ok);
+
+        // Extract first 5 vectors using shuffle indices
+        let out_path = workspace.join("extracted.hvec");
+        let mut opts = Options::new();
+        opts.set("hvec-file", hvec_path.to_string_lossy().to_string());
+        opts.set("ivec-file", ivec_path.to_string_lossy().to_string());
+        opts.set("output", out_path.to_string_lossy().to_string());
+        opts.set("range", "[0,5)");
+        let mut ext = GenerateHvecExtractOp;
+        let r = ext.execute(&opts, &mut ctx);
+        assert_eq!(r.status, Status::Ok);
+
+        // 5 records of dim 8 (f16=2 bytes): 5 * (4 + 8*2) = 100 bytes
+        let size = std::fs::metadata(&out_path).unwrap().len();
+        assert_eq!(size, 5 * (4 + 8 * 2));
+
+        // Verify extracted vectors match shuffled originals
+        let orig = MmapVectorReader::<half::f16>::open_hvec(&hvec_path).unwrap();
+        let extracted = MmapVectorReader::<half::f16>::open_hvec(&out_path).unwrap();
+        let shuffle = MmapVectorReader::<i32>::open_ivec(&ivec_path).unwrap();
+        assert_eq!(
+            <MmapVectorReader<half::f16> as VectorReader<half::f16>>::count(&extracted),
+            5
+        );
+        for i in 0..5 {
+            let shuf_idx = shuffle.get(i).unwrap()[0] as usize;
+            let o = orig.get(shuf_idx).unwrap();
+            let e = extracted.get(i).unwrap();
+            let o_slice: &[half::f16] = o.as_ref();
+            let e_slice: &[half::f16] = e.as_ref();
+            assert_eq!(o_slice, e_slice, "mismatch at extracted[{}] (orig[{}])", i, shuf_idx);
+        }
+    }
 
     #[test]
     fn test_fvec_extract_roundtrip() {
@@ -825,6 +1161,9 @@ mod tests {
         let workspace = tmp.path();
 
         let mut ctx = StreamContext {
+            dataset_name: String::new(),
+            profile: String::new(),
+            profile_names: vec![],
             workspace: workspace.to_path_buf(),
             scratch: workspace.join(".scratch"),
             cache: workspace.join(".cache"),
@@ -834,7 +1173,7 @@ mod tests {
             threads: 1,
             step_id: String::new(),
             governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
-            display: crate::pipeline::display::ProgressDisplay::new(),
+            ui: crate::ui::UiHandle::new(std::sync::Arc::new(crate::ui::TestSink::new())),
         };
 
         // Generate 20 vectors of dimension 4

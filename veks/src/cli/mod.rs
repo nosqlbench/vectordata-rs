@@ -53,7 +53,7 @@ pub fn completions(args: CompletionsArgs) {
             r#"(& {{ $env:COMPLETE="powershell"; veks }}) | Invoke-Expression
 "#
         ),
-        _ => eprintln!("Unsupported shell: {:?}", args.shell),
+        _ => println!("Unsupported shell: {:?}", args.shell),
     }
 }
 

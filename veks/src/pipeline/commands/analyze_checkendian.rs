@@ -173,7 +173,7 @@ impl CommandOp for AnalyzeCheckEndianOp {
 
         match check_endianness(&source_path) {
             Ok(report) => {
-                eprint!("{}", report);
+                ctx.ui.emit(report);
                 CommandResult {
                     status: Status::Ok,
                     message: format!("endianness check passed: {}", source_path.display()),
@@ -182,7 +182,7 @@ impl CommandOp for AnalyzeCheckEndianOp {
                 }
             }
             Err(report) => {
-                eprint!("{}", report);
+                ctx.ui.emit(report);
                 CommandResult {
                     status: Status::Error,
                     message: format!("endianness check failed: {}", source_path.display()),
@@ -232,6 +232,9 @@ mod tests {
 
     fn test_ctx(dir: &Path) -> StreamContext {
         StreamContext {
+            dataset_name: String::new(),
+            profile: String::new(),
+            profile_names: vec![],
             workspace: dir.to_path_buf(),
             scratch: dir.join(".scratch"),
             cache: dir.join(".cache"),
@@ -241,7 +244,7 @@ mod tests {
             threads: 1,
             step_id: String::new(),
             governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
-            display: crate::pipeline::display::ProgressDisplay::new(),
+            ui: crate::ui::UiHandle::new(std::sync::Arc::new(crate::ui::TestSink::new())),
         }
     }
 

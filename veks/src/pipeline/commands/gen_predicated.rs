@@ -154,7 +154,7 @@ predicated ground truth (KNN over predicate-filtered base vectors).
         let schema = generator::generate_schema(field_count, &type_strs, &cardinalities);
 
         // Generate attribute columns
-        ctx.display.log(&format!(
+        ctx.ui.log(&format!(
             "  Generating {} attribute columns for {} base vectors...",
             field_count, base_count
         ));
@@ -162,7 +162,7 @@ predicated ground truth (KNN over predicate-filtered base vectors).
         let columns = generator::generate_columns(&schema, base_count, &mut rng_inst);
 
         // Generate predicates for each query
-        ctx.display.log(&format!(
+        ctx.ui.log(&format!(
             "  Generating {} predicates (selectivity={}, complexity={})...",
             query_count, selectivity, complexity
         ));
@@ -243,14 +243,14 @@ predicated ground truth (KNN over predicate-filtered base vectors).
         let indices_path = output_dir.join("predicated_indices.ivec");
         let distances_path = output_dir.join("predicated_distances.fvec");
 
-        ctx.display.log(&format!(
+        ctx.ui.log(&format!(
             "  Computing predicated {}-NN ({} queries × {} base)...",
             effective_k, query_count, base_count
         ));
 
         // Governor checkpoint before predicated KNN computation
         if ctx.governor.checkpoint() {
-            ctx.display.log("  governor: throttle active");
+            ctx.ui.log("  governor: throttle active");
         }
 
         match compute_predicated_knn(
@@ -294,12 +294,12 @@ predicated ground truth (KNN over predicate-filtered base vectors).
             .map(|p| generator::measure_selectivity(p, &columns, base_count))
             .sum::<f64>()
             / query_count as f64;
-        ctx.display.log(&format!(
+        ctx.ui.log(&format!(
             "  Average selectivity: {:.4} (target: {:.4})",
             avg_sel, selectivity
         ));
 
-        ctx.display.log(&format!(
+        ctx.ui.log(&format!(
             "  Predicated dataset created: {}",
             output_dir.display()
         ));
@@ -605,6 +605,9 @@ mod tests {
 
     fn test_ctx(dir: &Path) -> StreamContext {
         StreamContext {
+            dataset_name: String::new(),
+            profile: String::new(),
+            profile_names: vec![],
             workspace: dir.to_path_buf(),
             scratch: dir.join(".scratch"),
             cache: dir.join(".cache"),
@@ -614,7 +617,7 @@ mod tests {
             threads: 1,
             step_id: String::new(),
             governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
-            display: crate::pipeline::display::ProgressDisplay::new(),
+            ui: crate::ui::UiHandle::new(std::sync::Arc::new(crate::ui::TestSink::new())),
         }
     }
 

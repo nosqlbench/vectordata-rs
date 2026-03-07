@@ -25,13 +25,13 @@ impl SlabReader {
         let reader = SlabtasticReader::open_with_progress(path, |p| {
             match p {
                 OpenProgress::PagesPageRead { page_count } => {
-                    eprintln!("    slab index: {} pages to scan", page_count);
+                    log::info!("    slab index: {} pages to scan", page_count);
                 }
                 OpenProgress::IndexBuild { done, total } => {
-                    eprintln!("    slab index: {}/{} pages scanned", done, total);
+                    log::info!("    slab index: {}/{} pages scanned", done, total);
                 }
                 OpenProgress::IndexComplete { total_records } => {
-                    eprintln!("    slab index: complete, {} total records", total_records);
+                    log::info!("    slab index: complete, {} total records", total_records);
                 }
             }
         }).map_err(|e| format!("Failed to open slab {}: {}", path.display(), e))?;

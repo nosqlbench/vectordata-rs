@@ -13,10 +13,10 @@ use std::time::Duration;
 use indexmap::IndexMap;
 
 use super::bound;
-use super::display::ProgressDisplay;
 use super::progress::ProgressLog;
 pub use super::resource::{ResourceDesc, ResourceType};
 use super::resource::ResourceGovernor;
+use crate::ui::UiHandle;
 
 /// Built-in documentation for a pipeline command.
 ///
@@ -185,6 +185,12 @@ impl Options {
 
 /// Execution context shared across all pipeline steps.
 pub struct StreamContext {
+    /// Dataset name (from `name` field in dataset.yaml).
+    pub dataset_name: String,
+    /// Active profile name (`"all"` when running all profiles).
+    pub profile: String,
+    /// Ordered list of all profile names (for progress display).
+    pub profile_names: Vec<String>,
     /// Workspace directory (usually the directory containing `dataset.yaml`).
     pub workspace: PathBuf,
     /// Scratch directory for temporary files deleted after pipeline success.
@@ -203,8 +209,8 @@ pub struct StreamContext {
     pub step_id: String,
     /// Resource governor for adaptive resource management.
     pub governor: ResourceGovernor,
-    /// Shared progress display for the fixed status line (SRD §08).
-    pub display: ProgressDisplay,
+    /// UI-agnostic event handle for progress, logging, and output.
+    pub ui: UiHandle,
 }
 
 /// Describes a single accepted option for a `CommandOp`.

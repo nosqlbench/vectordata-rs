@@ -10,7 +10,6 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Instant;
 
-use indicatif::{ProgressState, ProgressStyle};
 
 use crate::formats::VecFormat;
 use crate::formats::convert::convert_elements_into;
@@ -116,14 +115,14 @@ impl CommandOp for ConvertFileOp {
             .unwrap_or(1);
 
         // Open source
-        ctx.display.log(&format!(
+        ctx.ui.log(&format!(
             "  converting {} ({}) -> {} ({})",
             source_path.display(),
             source_format.name(),
             output_path.display(),
             to_format.name(),
         ));
-        ctx.display.log("  opening source...");
+        ctx.ui.log("  opening source...");
         let threads = ctx.governor.current_or("threads", ctx.threads as u64) as usize;
         let mut source = match reader::open_source(&source_path, source_format, threads, None) {
             Ok(s) => s,
@@ -140,14 +139,14 @@ impl CommandOp for ConvertFileOp {
             && src_element_size > 0
             && src_element_size != dst_element_size;
 
-        ctx.display.log(&format!(
+        ctx.ui.log(&format!(
             "  source: dimension={}, element_size={}, records={}",
             dimension,
             src_element_size,
             record_count.map_or("unknown".to_string(), |n| n.to_string()),
         ));
         if needs_conversion {
-            ctx.display.log(&format!(
+            ctx.ui.log(&format!(
                 "  element conversion: {} ({} bytes) -> {} ({} bytes)",
                 source_format.data_type_name(),
                 src_element_size,
@@ -183,16 +182,9 @@ impl CommandOp for ConvertFileOp {
 
         // Progress bar
         let pb = if let Some(total) = record_count {
-            ctx.display.bar_with_style(
-                total,
-                ProgressStyle::default_bar()
-                    .template("  [{bar:40.cyan/blue}] {pos}/{len} ({percent}%) records — {rps} — ETA {eta}")
-                    .expect("invalid template")
-                    .with_key("rps", format_rps)
-                    .progress_chars("=>-"),
-            )
+            ctx.ui.bar(total, "converting records")
         } else {
-            ctx.display.spinner("converting records")
+            ctx.ui.spinner("converting records")
         };
 
         // Read-ahead pipeline: a background thread reads records into a
@@ -221,7 +213,7 @@ impl CommandOp for ConvertFileOp {
 
         // Governor checkpoint before conversion
         if ctx.governor.checkpoint() {
-            ctx.display.log("  governor: throttle active");
+            log::info!("governor: throttle active");
         }
 
         // Convert + write on the main thread
@@ -243,7 +235,7 @@ impl CommandOp for ConvertFileOp {
         }
 
         reader_handle.join().expect("reader thread panicked");
-        pb.finish_and_clear();
+        pb.finish();
 
         if let Err(e) = sink.finish() {
             return error_result(format!("failed to finalize output: {}", e), start);
@@ -315,22 +307,3 @@ fn error_result(message: String, start: Instant) -> CommandResult {
     }
 }
 
-/// Format records/sec for the progress bar.
-fn format_rps(state: &ProgressState, w: &mut dyn std::fmt::Write) {
-    let rps = state.per_sec();
-    if rps < 100.0 {
-        write!(w, "{:.1}/s", rps).unwrap();
-    } else {
-        let whole = rps as u64;
-        let s = whole.to_string();
-        let mut result = String::with_capacity(s.len() + s.len() / 3);
-        for (i, ch) in s.chars().rev().enumerate() {
-            if i > 0 && i % 3 == 0 {
-                result.push(',');
-            }
-            result.push(ch);
-        }
-        let formatted: String = result.chars().rev().collect();
-        write!(w, "{}/s", formatted).unwrap();
-    }
-}

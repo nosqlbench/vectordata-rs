@@ -1,0 +1,16 @@
+[package]
+name = "dataset"
+version = "0.1.0"
+edition = "2024"
+description = "Dataset YAML configuration model for vector datasets"
+license = "Apache-2.0"
+homepage = "https://github.com/nosqlbench/vectordata-rs"
+repository = "https://github.com/nosqlbench/vectordata-rs"
+readme = "../README.md"
+keywords = ["vector", "dataset", "yaml", "configuration"]
+categories = ["config", "data-structures"]
+
+[dependencies]
+indexmap = { version = "2", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"

@@ -75,7 +75,7 @@ impl CommandOp for FetchDlhfOp {
             return error_result(format!("failed to create output dir: {}", e), start);
         }
 
-        ctx.display.log(&format!("Fetching file list from HuggingFace: {}", repo));
+        ctx.ui.log(&format!("Fetching file list from HuggingFace: {}", repo));
 
         // List files via the HuggingFace API
         let api_url = format!(
@@ -94,7 +94,7 @@ impl CommandOp for FetchDlhfOp {
             .filter(|f| f.file_type == "file" && glob_match(pattern, &f.rfilename))
             .collect();
 
-        ctx.display.log(&format!(
+        ctx.ui.log(&format!(
             "Found {} file(s) matching '{}' (of {} total)",
             matching.len(),
             pattern,
@@ -121,7 +121,7 @@ impl CommandOp for FetchDlhfOp {
             if dest.exists() {
                 if let Ok(meta) = std::fs::metadata(&dest) {
                     if meta.len() == entry.size {
-                        ctx.display.log(&format!(
+                        ctx.ui.log(&format!(
                             "  {} — already downloaded ({} bytes)",
                             entry.rfilename, entry.size
                         ));
@@ -136,25 +136,25 @@ impl CommandOp for FetchDlhfOp {
                 repo_type, repo, revision, entry.rfilename
             );
 
-            ctx.display.log(&format!(
+            ctx.ui.log(&format!(
                 "  {} — downloading ({} bytes)...",
                 entry.rfilename, entry.size
             ));
 
             match download_file(&download_url, &dest) {
                 Ok(size) => {
-                    ctx.display.log(&format!("  {} — done ({} bytes)", entry.rfilename, size));
+                    ctx.ui.log(&format!("  {} — done ({} bytes)", entry.rfilename, size));
                     downloaded += 1;
                 }
                 Err(e) => {
-                    ctx.display.log(&format!("  {} — FAILED: {}", entry.rfilename, e));
+                    ctx.ui.log(&format!("  {} — FAILED: {}", entry.rfilename, e));
                     failed += 1;
                 }
             }
         }
 
-        ctx.display.log("");
-        ctx.display.log(&format!(
+        ctx.ui.log("");
+        ctx.ui.log(&format!(
             "HuggingFace download: {} downloaded, {} skipped, {} failed",
             downloaded, skipped, failed
         ));

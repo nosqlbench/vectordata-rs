@@ -285,7 +285,7 @@ impl CommandOp for MerkleCreateOp {
 
         let tree = MerkleTree::from_data(&data, chunk_size);
 
-        ctx.display.log(&format!(
+        ctx.ui.log(&format!(
             "Merkle create: {} ({} bytes, {} chunks, root={})",
             source_path.display(),
             data.len(),
@@ -425,7 +425,7 @@ impl CommandOp for MerkleVerifyOp {
 
         // Compare
         if ref_tree == current_tree {
-            ctx.display.log(&format!(
+            ctx.ui.log(&format!(
                 "Merkle verify: {} OK ({} chunks)",
                 source_path.display(),
                 current_tree.leaf_count
@@ -462,13 +462,13 @@ impl CommandOp for MerkleVerifyOp {
                 String::new()
             };
 
-            ctx.display.log(&format!(
+            ctx.ui.log(&format!(
                 "Merkle verify: {} FAILED ({} mismatched chunks)",
                 source_path.display(),
                 mismatches.len()
             ));
             for d in &mismatch_detail {
-                ctx.display.log(&format!("  {}", d));
+                ctx.ui.log(&format!("  {}", d));
             }
 
             CommandResult {
@@ -556,37 +556,37 @@ impl CommandOp for MerkleDiffOp {
             Err(e) => return error_result(e, start),
         };
 
-        ctx.display.log("MERKLE REFERENCE DIFF SUMMARY");
-        ctx.display.log("============================");
-        ctx.display.log(&format!("File 1: {}", path1.display()));
-        ctx.display.log(&format!("File 2: {}", path2.display()));
-        ctx.display.log("");
+        ctx.ui.log("MERKLE REFERENCE DIFF SUMMARY");
+        ctx.ui.log("============================");
+        ctx.ui.log(&format!("File 1: {}", path1.display()));
+        ctx.ui.log(&format!("File 2: {}", path2.display()));
+        ctx.ui.log("");
 
         // Compare metadata
         let chunk_match = tree1.chunk_size == tree2.chunk_size;
         let size_match = tree1.file_size == tree2.file_size;
         let leaf_match = tree1.leaf_count == tree2.leaf_count;
 
-        ctx.display.log("Basic Information Comparison:");
-        ctx.display.log(&format!(
+        ctx.ui.log("Basic Information Comparison:");
+        ctx.ui.log(&format!(
             "  Chunk Size: {} vs {} ({})",
             tree1.chunk_size,
             tree2.chunk_size,
             if chunk_match { "MATCH" } else { "MISMATCH" }
         ));
-        ctx.display.log(&format!(
+        ctx.ui.log(&format!(
             "  Total Size: {} vs {} ({})",
             tree1.file_size,
             tree2.file_size,
             if size_match { "MATCH" } else { "MISMATCH" }
         ));
-        ctx.display.log(&format!(
+        ctx.ui.log(&format!(
             "  Leaf Count: {} vs {} ({})",
             tree1.leaf_count,
             tree2.leaf_count,
             if leaf_match { "MATCH" } else { "MISMATCH" }
         ));
-        ctx.display.log("");
+        ctx.ui.log("");
 
         if !chunk_match {
             return CommandResult {
@@ -600,7 +600,7 @@ impl CommandOp for MerkleDiffOp {
         let mismatches = tree1.find_mismatches(&tree2);
 
         if mismatches.is_empty() {
-            ctx.display.log("No differences found — files are identical.");
+            ctx.ui.log("No differences found — files are identical.");
             CommandResult {
                 status: Status::Ok,
                 message: "merkle diff: no differences".to_string(),
@@ -612,29 +612,29 @@ impl CommandOp for MerkleDiffOp {
                 / tree1.leaf_count.max(tree2.leaf_count) as f64)
                 * 100.0;
 
-            ctx.display.log("Leaf Node Differences:");
-            ctx.display.log(&format!("  Total Mismatched Chunks: {}", mismatches.len()));
-            ctx.display.log(&format!("  Percentage: {:.2}%", pct));
+            ctx.ui.log("Leaf Node Differences:");
+            ctx.ui.log(&format!("  Total Mismatched Chunks: {}", mismatches.len()));
+            ctx.ui.log(&format!("  Percentage: {:.2}%", pct));
 
             let show = mismatches.len().min(10);
             if show > 0 {
-                ctx.display.log(&format!("  First {} mismatches:", show));
+                ctx.ui.log(&format!("  First {} mismatches:", show));
                 for &chunk_idx in mismatches.iter().take(show) {
                     let offset = chunk_idx * tree1.chunk_size;
                     let length = tree1.chunk_size;
-                    ctx.display.log(&format!("    Chunk {}: offset {}, length {}", chunk_idx, offset, length));
+                    ctx.ui.log(&format!("    Chunk {}: offset {}, length {}", chunk_idx, offset, length));
                 }
                 if mismatches.len() > show {
-                    ctx.display.log(&format!("    ... and {} more", mismatches.len() - show));
+                    ctx.ui.log(&format!("    ... and {} more", mismatches.len() - show));
                 }
             }
 
             // Braille visualization
             let max_leaves = tree1.leaf_count.max(tree2.leaf_count);
             let braille = render_braille_bitset(&mismatches, max_leaves);
-            ctx.display.log("");
-            ctx.display.log("  Mismatch Map (braille):");
-            ctx.display.log(&format!("  {}", braille));
+            ctx.ui.log("");
+            ctx.ui.log("  Mismatch Map (braille):");
+            ctx.ui.log(&format!("  {}", braille));
 
             CommandResult {
                 status: Status::Warning,
@@ -722,29 +722,29 @@ impl CommandOp for MerkleSummaryOp {
         let internal_count = padded_leaves - 1;
         let total_nodes = internal_count + padded_leaves;
 
-        ctx.display.log("MERKLE REFERENCE FILE SUMMARY");
-        ctx.display.log("============================");
-        ctx.display.log(&format!("File: {}", mref_path.display()));
-        ctx.display.log(&format!("File Size: {} bytes", mref_size));
-        ctx.display.log(&format!("Content File Size: {} bytes", tree.file_size));
-        ctx.display.log(&format!("Chunk Size: {} bytes", tree.chunk_size));
-        ctx.display.log(&format!("Number of Chunks: {}", tree.leaf_count));
-        ctx.display.log("");
-        ctx.display.log("Tree Shape:");
-        ctx.display.log(&format!("  Leaf Nodes: {}", tree.leaf_count));
-        ctx.display.log(&format!("  Padded Leaves: {}", padded_leaves));
-        ctx.display.log(&format!("  Internal Nodes: {}", internal_count));
-        ctx.display.log(&format!("  Total Nodes: {}", total_nodes));
-        ctx.display.log(&format!("  Tree Depth: {}", (padded_leaves as f64).log2().ceil() as usize + 1));
-        ctx.display.log("");
-        ctx.display.log(&format!("Root Hash: {}", hex::encode(tree.root_hash())));
+        ctx.ui.log("MERKLE REFERENCE FILE SUMMARY");
+        ctx.ui.log("============================");
+        ctx.ui.log(&format!("File: {}", mref_path.display()));
+        ctx.ui.log(&format!("File Size: {} bytes", mref_size));
+        ctx.ui.log(&format!("Content File Size: {} bytes", tree.file_size));
+        ctx.ui.log(&format!("Chunk Size: {} bytes", tree.chunk_size));
+        ctx.ui.log(&format!("Number of Chunks: {}", tree.leaf_count));
+        ctx.ui.log("");
+        ctx.ui.log("Tree Shape:");
+        ctx.ui.log(&format!("  Leaf Nodes: {}", tree.leaf_count));
+        ctx.ui.log(&format!("  Padded Leaves: {}", padded_leaves));
+        ctx.ui.log(&format!("  Internal Nodes: {}", internal_count));
+        ctx.ui.log(&format!("  Total Nodes: {}", total_nodes));
+        ctx.ui.log(&format!("  Tree Depth: {}", (padded_leaves as f64).log2().ceil() as usize + 1));
+        ctx.ui.log("");
+        ctx.ui.log(&format!("Root Hash: {}", hex::encode(tree.root_hash())));
 
         let ratio = if tree.file_size > 0 {
             (mref_size as f64 / tree.file_size as f64) * 100.0
         } else {
             0.0
         };
-        ctx.display.log(&format!("Size Ratio: {:.2}% of content file", ratio));
+        ctx.ui.log(&format!("Size Ratio: {:.2}% of content file", ratio));
 
         CommandResult {
             status: Status::Ok,
@@ -839,11 +839,11 @@ impl CommandOp for MerkleTreeviewOp {
             );
         }
 
-        ctx.display.log("Merkle Tree Visualization");
-        ctx.display.log("------------------------");
-        ctx.display.log(&format!("Base node: {}", base_node));
-        ctx.display.log(&format!("Levels: {}", levels));
-        ctx.display.log("");
+        ctx.ui.log("Merkle Tree Visualization");
+        ctx.ui.log("------------------------");
+        ctx.ui.log(&format!("Base node: {}", base_node));
+        ctx.ui.log(&format!("Levels: {}", levels));
+        ctx.ui.log("");
 
         render_tree_node(
             &tree.hashes,
@@ -929,11 +929,11 @@ fn render_tree_node(
         format!("Node {}: {}", node, hash_str)
     };
 
-    eprintln!("{}{}", prefix, label);
+    log::info!("{}{}", prefix, label);
 
     if is_leaf || depth + 1 >= max_levels {
         if !is_leaf {
-            eprintln!("{}    ... (deeper levels not shown)", child_prefix);
+            log::info!("{}    ... (deeper levels not shown)", child_prefix);
         }
         return;
     }
@@ -1072,9 +1072,9 @@ impl CommandOp for MerklePathOp {
             level += 1;
         }
 
-        ctx.display.log(&format!("Authentication path for chunk {} to root:", chunk_index));
+        ctx.ui.log(&format!("Authentication path for chunk {} to root:", chunk_index));
         for (label, hash) in &path_hashes {
-            ctx.display.log(&format!("  {:>10}: {}", label, hex::encode(hash)));
+            ctx.ui.log(&format!("  {:>10}: {}", label, hex::encode(hash)));
         }
 
         CommandResult {
@@ -1272,11 +1272,11 @@ impl CommandOp for MerkleSpoilbitsOp {
         selected.sort();
 
         if dryrun {
-            ctx.display.log(&format!("Dry run: would spoil {} of {} leaf nodes ({:.1}%)", spoil_count, leaf_count, percentage));
+            ctx.ui.log(&format!("Dry run: would spoil {} of {} leaf nodes ({:.1}%)", spoil_count, leaf_count, percentage));
             for &idx in &selected {
                 let abs_idx = internal_count + idx;
                 let hash = &tree.hashes[abs_idx];
-                ctx.display.log(&format!("  leaf {} (node {}): {}", idx, abs_idx, format_hash(hash, 8)));
+                ctx.ui.log(&format!("  leaf {} (node {}): {}", idx, abs_idx, format_hash(hash, 8)));
             }
             return CommandResult {
                 status: Status::Ok,
@@ -1300,7 +1300,7 @@ impl CommandOp for MerkleSpoilbitsOp {
             return error_result(e, start);
         }
 
-        ctx.display.log(&format!("Spoiled {} of {} leaf nodes in {}", spoil_count, leaf_count, mref_path.display()));
+        ctx.ui.log(&format!("Spoiled {} of {} leaf nodes in {}", spoil_count, leaf_count, mref_path.display()));
 
         CommandResult {
             status: Status::Ok,
@@ -1433,10 +1433,10 @@ impl CommandOp for MerkleSpoilchunksOp {
         selected.sort();
 
         if dryrun {
-            ctx.display.log(&format!("Dry run: would spoil {} chunks ({} bytes each) in {}", spoil_count, bytes_to_corrupt, source_path.display()));
+            ctx.ui.log(&format!("Dry run: would spoil {} chunks ({} bytes each) in {}", spoil_count, bytes_to_corrupt, source_path.display()));
             for &idx in &selected {
                 let offset = idx * chunk_size;
-                ctx.display.log(&format!("  chunk {}: offset {} ({} bytes to corrupt)", idx, offset, bytes_to_corrupt));
+                ctx.ui.log(&format!("  chunk {}: offset {} ({} bytes to corrupt)", idx, offset, bytes_to_corrupt));
             }
             return CommandResult {
                 status: Status::Ok,
@@ -1477,7 +1477,7 @@ impl CommandOp for MerkleSpoilchunksOp {
             return error_result(e, start);
         }
 
-        ctx.display.log(&format!(
+        ctx.ui.log(&format!(
             "Corrupted {} chunks ({} bytes each) in {}",
             spoil_count, bytes_to_corrupt, source_path.display()
         ));
@@ -1580,6 +1580,9 @@ mod tests {
 
     fn test_ctx(dir: &Path) -> StreamContext {
         StreamContext {
+            dataset_name: String::new(),
+            profile: String::new(),
+            profile_names: vec![],
             workspace: dir.to_path_buf(),
             scratch: dir.join(".scratch"),
             cache: dir.join(".cache"),
@@ -1589,7 +1592,7 @@ mod tests {
             threads: 1,
             step_id: String::new(),
             governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
-            display: crate::pipeline::display::ProgressDisplay::new(),
+            ui: crate::ui::UiHandle::new(std::sync::Arc::new(crate::ui::TestSink::new())),
         }
     }
 

@@ -60,7 +60,7 @@ impl CommandOp for InfoComputeOp {
         let simd_features = detect_simd_features();
 
         if short {
-            ctx.display.log(&format!(
+            ctx.ui.log(&format!(
                 "{} {} | {} CPUs | SIMD: {}",
                 os,
                 arch,
@@ -72,21 +72,21 @@ impl CommandOp for InfoComputeOp {
                 }
             ));
         } else {
-            ctx.display.log("Compute Environment");
-            ctx.display.log(&format!("  OS:           {} {}", os, arch));
-            ctx.display.log(&format!("  CPUs:         {}", cpus));
-            ctx.display.log(&format!("  Rust version: {}", env!("CARGO_PKG_VERSION")));
-            ctx.display.log(&format!(
+            ctx.ui.log("Compute Environment");
+            ctx.ui.log(&format!("  OS:           {} {}", os, arch));
+            ctx.ui.log(&format!("  CPUs:         {}", cpus));
+            ctx.ui.log(&format!("  Rust version: {}", env!("CARGO_PKG_VERSION")));
+            ctx.ui.log(&format!(
                 "  Target:       {}",
                 std::env::var("TARGET").unwrap_or_else(|_| "unknown".to_string())
             ));
 
             if simd_features.is_empty() {
-                ctx.display.log("  SIMD:         none detected at compile time");
+                ctx.ui.log("  SIMD:         none detected at compile time");
             } else {
-                ctx.display.log("  SIMD features:");
+                ctx.ui.log("  SIMD features:");
                 for feat in &simd_features {
-                    ctx.display.log(&format!("    - {}", feat));
+                    ctx.ui.log(&format!("    - {}", feat));
                 }
             }
 
@@ -95,15 +95,15 @@ impl CommandOp for InfoComputeOp {
             {
                 if let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") {
                     for line in meminfo.lines().take(3) {
-                        ctx.display.log(&format!("  {}", line.trim()));
+                        ctx.ui.log(&format!("  {}", line.trim()));
                     }
                 }
             }
 
-            ctx.display.log("");
-            ctx.display.log("  Vectorized distance computation: Rust auto-vectorization");
-            ctx.display.log("  For best performance, compile with:");
-            ctx.display.log("    RUSTFLAGS=\"-C target-cpu=native\" cargo build --release");
+            ctx.ui.log("");
+            ctx.ui.log("  Vectorized distance computation: Rust auto-vectorization");
+            ctx.ui.log("  For best performance, compile with:");
+            ctx.ui.log("    RUSTFLAGS=\"-C target-cpu=native\" cargo build --release");
         }
 
         CommandResult {
@@ -173,6 +173,9 @@ mod tests {
 
     fn test_ctx(dir: &Path) -> StreamContext {
         StreamContext {
+            dataset_name: String::new(),
+            profile: String::new(),
+            profile_names: vec![],
             workspace: dir.to_path_buf(),
             scratch: dir.join(".scratch"),
             cache: dir.join(".cache"),
@@ -182,7 +185,7 @@ mod tests {
             threads: 1,
             step_id: String::new(),
             governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
-            display: crate::pipeline::display::ProgressDisplay::new(),
+            ui: crate::ui::UiHandle::new(std::sync::Arc::new(crate::ui::TestSink::new())),
         }
     }
 

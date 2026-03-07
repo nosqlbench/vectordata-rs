@@ -125,7 +125,7 @@ impl ParquetMnodeReader {
     /// all files via parquet metadata.
     pub fn probe(path: &Path) -> Result<SourceMeta, String> {
         let files = collect_parquet_files(path)?;
-        eprintln!("    {} parquet file(s), reading metadata...", files.len());
+        log::info!("    {} parquet file(s), reading metadata...", files.len());
         let total_rows = count_total_rows(&files)?;
 
         // Validate schema by compiling a writer from the first file
@@ -167,7 +167,7 @@ impl ParquetMnodeReader {
             .min(total_files);
 
         let initial_in_flight = MAX_IN_FLIGHT.min(total_files);
-        eprintln!(
+        log::info!(
             "parquet-mnode: {} file(s), {} total rows, {} loader thread(s), {} max in-flight",
             total_files, total_rows, num_workers, initial_in_flight
         );
@@ -223,7 +223,7 @@ impl ParquetMnodeReader {
                             }
                         }
                         Err(e) => {
-                            eprintln!("Warning: failed to load {}: {}", path.display(), e);
+                            log::info!("Warning: failed to load {}: {}", path.display(), e);
                             let mut in_flight = gate.in_flight.lock().unwrap();
                             *in_flight -= 1;
                             gate.can_send.notify_one();
@@ -299,7 +299,7 @@ impl ParquetMnodeReader {
                 if old < MAX_PREFETCH {
                     self.gate.allowed.store(old + 1, Ordering::Relaxed);
                     self.gate.can_send.notify_all();
-                    eprintln!(
+                    log::info!(
                         "parquet-mnode: prefetch short — increased depth to {}",
                         old + 1
                     );
@@ -447,7 +447,7 @@ fn count_total_rows(files: &[PathBuf]) -> Result<u64, String> {
     // Report every ~10% but at least every 20 files, and always for >10 files
     let report_interval = if n > 10 { (n / 10).max(1).min(20) } else { n + 1 };
     if n > 10 {
-        eprintln!("    counting rows across {} parquet files...", n);
+        log::info!("    counting rows across {} parquet files...", n);
     }
     for (i, f) in files.iter().enumerate() {
         let file = fs::File::open(f)
@@ -457,7 +457,7 @@ fn count_total_rows(files: &[PathBuf]) -> Result<u64, String> {
         use parquet::file::reader::FileReader;
         total += pq_reader.metadata().file_metadata().num_rows() as u64;
         if (i + 1) % report_interval == 0 {
-            eprintln!("    scanned {}/{} files, {} rows so far", i + 1, n, total);
+            log::info!("    scanned {}/{} files, {} rows so far", i + 1, n, total);
         }
     }
     Ok(total)

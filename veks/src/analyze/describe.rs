@@ -15,7 +15,7 @@ use super::args::DescribeArgs;
 use crate::formats::VecFormat;
 use crate::formats::reader::{self, SourceMeta};
 use crate::formats::reader::parquet::ParquetDirReader;
-use crate::import::dataset::DatasetConfig;
+use dataset::DatasetConfig;
 use crate::import::facet::Facet;
 
 /// Run the describe command.
@@ -143,7 +143,7 @@ fn run_dataset_mode(args: &DescribeArgs) {
     let default_profile = match config.default_profile() {
         Some(p) => p,
         None => {
-            eprintln!("Error: no default profile in {}", source.display());
+            println!("Error: no default profile in {}", source.display());
             return;
         }
     };
@@ -159,7 +159,7 @@ fn run_dataset_mode(args: &DescribeArgs) {
         let facet = match Facet::from_key(key) {
             Some(f) => f,
             None => {
-                eprintln!("Warning: unknown view key '{}', skipping", key);
+                println!("Warning: unknown view key '{}', skipping", key);
                 continue;
             }
         };
@@ -170,7 +170,7 @@ fn run_dataset_mode(args: &DescribeArgs) {
             if view_path.exists() {
                 view_path
             } else {
-                eprintln!(
+                println!(
                     "Warning: view '{}': path '{}' does not exist, skipping",
                     key,
                     view_path.display()
@@ -225,7 +225,7 @@ fn run_dataset_mode(args: &DescribeArgs) {
                     }
                 }
                 Err(e) => {
-                    eprintln!("Warning: view '{}': failed to probe: {}", key, e);
+                    println!("Warning: view '{}': failed to probe: {}", key, e);
                     continue;
                 }
             }
@@ -233,7 +233,7 @@ fn run_dataset_mode(args: &DescribeArgs) {
             let meta = match reader::probe_source(&probe_path, format) {
                 Ok(m) => m,
                 Err(e) => {
-                    eprintln!("Warning: view '{}': failed to probe: {}", key, e);
+                    println!("Warning: view '{}': failed to probe: {}", key, e);
                     continue;
                 }
             };
@@ -266,9 +266,9 @@ fn run_dataset_mode(args: &DescribeArgs) {
 
     if !described {
         if let Some(ref filter) = facet_filter {
-            eprintln!("Error: view '{}' not found in {}", filter, source.display());
+            println!("Error: view '{}' not found in {}", filter, source.display());
         } else {
-            eprintln!("Error: no views found in {}", source.display());
+            println!("Error: no views found in {}", source.display());
         }
     }
 }

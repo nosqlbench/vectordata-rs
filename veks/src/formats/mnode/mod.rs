@@ -72,6 +72,42 @@ pub enum MValue {
 }
 
 impl MValue {
+    /// Create a structural fingerprint by replacing the value with a
+    /// type-default placeholder.  Preserves the type tag (and for
+    /// containers, the recursive structure) but strips all payload data.
+    pub fn fingerprint(&self) -> MValue {
+        match self {
+            MValue::Text(_) => MValue::Text(String::new()),
+            MValue::Int(_) => MValue::Int(0),
+            MValue::Float(_) => MValue::Float(0.0),
+            MValue::Bool(_) => MValue::Bool(false),
+            MValue::Bytes(_) => MValue::Bytes(Vec::new()),
+            MValue::Null => MValue::Null,
+            MValue::EnumStr(_) => MValue::EnumStr(String::new()),
+            MValue::EnumOrd(_) => MValue::EnumOrd(0),
+            MValue::List(items) => MValue::List(items.iter().map(|v| v.fingerprint()).collect()),
+            MValue::Map(node) => MValue::Map(node.fingerprint()),
+            MValue::Ascii(_) => MValue::Ascii(String::new()),
+            MValue::Int32(_) => MValue::Int32(0),
+            MValue::Short(_) => MValue::Short(0),
+            MValue::Float32(_) => MValue::Float32(0.0),
+            MValue::Half(_) => MValue::Half(0),
+            MValue::Millis(_) => MValue::Millis(0),
+            MValue::Nanos { .. } => MValue::Nanos { epoch_seconds: 0, nano_adjust: 0 },
+            MValue::Date(_) => MValue::Date(String::new()),
+            MValue::Time(_) => MValue::Time(String::new()),
+            MValue::DateTime(_) => MValue::DateTime(String::new()),
+            MValue::UuidV1(_) => MValue::UuidV1([0u8; 16]),
+            MValue::UuidV7(_) => MValue::UuidV7([0u8; 16]),
+            MValue::Ulid(_) => MValue::Ulid([0u8; 16]),
+            MValue::Array(tag, items) => MValue::Array(*tag, items.iter().map(|v| v.fingerprint()).collect()),
+            MValue::Set(items) => MValue::Set(items.iter().map(|v| v.fingerprint()).collect()),
+            MValue::TypedMap(entries) => MValue::TypedMap(
+                entries.iter().map(|(k, v)| (k.fingerprint(), v.fingerprint())).collect(),
+            ),
+        }
+    }
+
     /// Returns the type tag for this value
     pub fn tag(&self) -> TypeTag {
         match self {
@@ -195,6 +231,28 @@ impl MNode {
     /// Add a field
     pub fn insert(&mut self, name: String, value: MValue) {
         self.fields.insert(name, value);
+    }
+
+    /// Create a structural fingerprint by preserving field names and type
+    /// tags while replacing all values with type-default placeholders.
+    ///
+    /// Two MNodes with equal fingerprints are *structurally congruent* —
+    /// they have the same fields in the same order with the same types,
+    /// differing only in values.
+    pub fn fingerprint(&self) -> MNode {
+        MNode {
+            fields: self
+                .fields
+                .iter()
+                .map(|(name, value)| (name.clone(), value.fingerprint()))
+                .collect(),
+        }
+    }
+
+    /// Check whether two MNodes are structurally congruent — same field
+    /// names, same order, same value types, differing only in values.
+    pub fn is_congruent(&self, other: &Self) -> bool {
+        self.fingerprint().to_string() == other.fingerprint().to_string()
     }
 
     /// Encode to bytes (payload only, no length prefix).
@@ -559,5 +617,58 @@ mod tests {
         let s = format!("{}", node);
         assert!(s.contains("name: 'bob'"));
         assert!(s.contains("age: 25"));
+    }
+
+    #[test]
+    fn test_mvalue_fingerprint() {
+        assert_eq!(MValue::Text("hello".into()).fingerprint(), MValue::Text(String::new()));
+        assert_eq!(MValue::Int(42).fingerprint(), MValue::Int(0));
+        assert_eq!(MValue::Float(3.14).fingerprint(), MValue::Float(0.0));
+        assert_eq!(MValue::Bool(true).fingerprint(), MValue::Bool(false));
+        assert_eq!(MValue::Null.fingerprint(), MValue::Null);
+    }
+
+    #[test]
+    fn test_mnode_fingerprint() {
+        let mut a = MNode::new();
+        a.insert("name".into(), MValue::Text("alice".into()));
+        a.insert("age".into(), MValue::Int(30));
+
+        let mut b = MNode::new();
+        b.insert("name".into(), MValue::Text("bob".into()));
+        b.insert("age".into(), MValue::Int(25));
+
+        assert!(a.is_congruent(&b));
+        assert_eq!(a.fingerprint(), b.fingerprint());
+
+        // Different field set — not congruent
+        let mut c = MNode::new();
+        c.insert("name".into(), MValue::Text("carol".into()));
+        c.insert("score".into(), MValue::Float(99.0));
+        assert!(!a.is_congruent(&c));
+    }
+
+    #[test]
+    fn test_mnode_fingerprint_nested() {
+        let mut inner = MNode::new();
+        inner.insert("k".into(), MValue::Int(999));
+
+        let mut node = MNode::new();
+        node.insert("nested".into(), MValue::Map(inner));
+        node.insert("items".into(), MValue::List(vec![MValue::Text("x".into())]));
+
+        let fp = node.fingerprint();
+        match fp.fields.get("nested").unwrap() {
+            MValue::Map(m) => {
+                assert_eq!(*m.fields.get("k").unwrap(), MValue::Int(0));
+            }
+            _ => panic!("expected Map"),
+        }
+        match fp.fields.get("items").unwrap() {
+            MValue::List(items) => {
+                assert_eq!(items[0], MValue::Text(String::new()));
+            }
+            _ => panic!("expected List"),
+        }
     }
 }

@@ -1,0 +1,10 @@
+# Default to release builds via aliases.
+# `cargo t` = `cargo test --release`
+# `cargo b` = `cargo build --release`
+[alias]
+t = "test --release"
+b = "build --release"
+
+[profile.release]
+# Keep debug info for profiling while still optimizing.
+debug = 1

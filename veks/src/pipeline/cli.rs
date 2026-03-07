@@ -111,6 +111,10 @@ pub fn build_pipeline_command() -> Command {
                     arg = arg.value_hint(ValueHint::AnyPath);
                 }
 
+                // Add variable completion for non-path options so tab-completion
+                // suggests '${variables:name}' from variables.yaml.
+                arg = arg.add(ArgValueCompleter::new(variable_completer));
+
                 sub_cmd = sub_cmd.arg(arg);
             }
 
@@ -245,6 +249,43 @@ pub fn resource_completer(current: &OsStr) -> Vec<CompletionCandidate> {
         .collect()
 }
 
+/// Context-sensitive completer for option values that may reference pipeline
+/// variables. Suggests `'${variables:name}'` candidates from `variables.yaml`
+/// in the current working directory (or `--workspace` if set).
+///
+/// The suggestions are single-quoted so shells pass them through verbatim.
+pub fn variable_completer(current: &OsStr) -> Vec<CompletionCandidate> {
+    let partial = current.to_string_lossy();
+
+    // Only trigger when the user has started typing a variable reference
+    // or the value is empty (show all available variables as hints).
+    let workspace = std::env::current_dir().unwrap_or_default();
+    let vars = match super::variables::load(&workspace) {
+        Ok(v) => v,
+        Err(_) => return vec![],
+    };
+    if vars.is_empty() {
+        return vec![];
+    }
+
+    // Filter by partial match on the variable name portion.
+    let filter = if let Some(rest) = partial.strip_prefix("'${variables:") {
+        rest.trim_end_matches(['\'', '}'].as_ref())
+    } else if let Some(rest) = partial.strip_prefix("${variables:") {
+        rest.trim_end_matches('}')
+    } else {
+        ""
+    };
+
+    vars.iter()
+        .filter(|(name, _)| filter.is_empty() || name.starts_with(filter))
+        .map(|(name, value)| {
+            CompletionCandidate::new(format!("'${{variables:{}}}'", name))
+                .help(Some(format!("= {}", value).into()))
+        })
+        .collect()
+}
+
 /// Build the help string for an option arg (DOC-04a).
 ///
 /// Appends type and default info to the description so shells render it
@@ -264,7 +305,7 @@ fn build_option_help(description: &str, type_name: &str, default: Option<&str>) 
 /// options, then creates a `StreamContext` and executes the command.
 pub fn run_direct(args: Vec<String>) {
     if args.len() < 2 {
-        eprintln!("Usage: veks pipeline <group> <command> [--option=value ...]");
+        println!("Usage: veks pipeline <group> <command> [--option=value ...]");
         std::process::exit(1);
     }
 
@@ -277,10 +318,10 @@ pub fn run_direct(args: Vec<String>) {
     let factory = match registry.get(&command_path) {
         Some(f) => f,
         None => {
-            eprintln!("Unknown pipeline command: '{}'", command_path);
-            eprintln!("Available commands:");
+            println!("Unknown pipeline command: '{}'", command_path);
+            println!("Available commands:");
             for path in registry.command_paths() {
-                eprintln!("  {}", path);
+                println!("  {}", path);
             }
             std::process::exit(1);
         }
@@ -344,7 +385,7 @@ pub fn run_direct(args: Vec<String>) {
                 options.set(stripped, "true");
             }
         } else {
-            eprintln!("Unexpected argument: '{}'", arg);
+            println!("Unexpected argument: '{}'", arg);
             std::process::exit(1);
         }
         i += 1;
@@ -377,7 +418,7 @@ pub fn run_direct(args: Vec<String>) {
     // Parse resources and create governor
     let resource_budget = if let Some(ref res_str) = resources_str {
         super::resource::ResourceBudget::parse(res_str).unwrap_or_else(|e| {
-            eprintln!("Invalid --resources: {}", e);
+            println!("Invalid --resources: {}", e);
             std::process::exit(1);
         })
     } else {
@@ -394,15 +435,17 @@ pub fn run_direct(args: Vec<String>) {
             governor.set_strategy(Box::new(super::resource::FixedStrategy));
         }
         other => {
-            eprintln!("Unknown governor strategy: '{}'. Use maximize, conservative, or fixed.", other);
+            println!("Unknown governor strategy: '{}'. Use maximize, conservative, or fixed.", other);
             std::process::exit(1);
         }
     }
 
     let scratch = workspace.join(".scratch");
     let cache = workspace.join(".cache");
-    let display = super::display::ProgressDisplay::new();
     let mut ctx = StreamContext {
+        dataset_name: String::new(),
+        profile: String::new(),
+        profile_names: vec![],
         workspace,
         scratch,
         cache,
@@ -412,47 +455,67 @@ pub fn run_direct(args: Vec<String>) {
         threads,
         step_id: String::new(),
         governor,
-        display,
+        ui: crate::ui::auto_ui_handle(),
     };
 
     let mut cmd = factory();
 
-    // Start resource status bar
-    let resource_bar = ctx.display.resource_bar();
+    // Start resource status monitoring
     let resource_source = ctx.governor.status_source();
-    resource_bar.set_message(resource_source.status_line());
+    ctx.ui.resource_status(resource_source.status_line());
     let resource_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let resource_stop2 = resource_stop.clone();
+    let resource_ui = ctx.ui.clone();
     let resource_handle = std::thread::Builder::new()
         .name("resource-status".into())
         .spawn(move || {
+            let mut emergency_ticks = 0u32;
             while !resource_stop2.load(std::sync::atomic::Ordering::Relaxed) {
                 std::thread::sleep(std::time::Duration::from_millis(500));
                 if resource_stop2.load(std::sync::atomic::Ordering::Relaxed) {
                     break;
                 }
-                resource_bar.set_message(resource_source.status_line());
+                resource_ui.resource_status(resource_source.status_line());
+
+                if resource_source.is_emergency() {
+                    emergency_ticks += 1;
+                    let overage = resource_source.rss_overage_pct();
+                    let reduction = (overage.floor() as u32) * 2;
+                    let grace_ticks = 20u32.saturating_sub(reduction).max(2);
+                    if emergency_ticks >= grace_ticks {
+                        resource_ui.log(&format!(
+                            "FATAL: resource emergency for {:.1}s, RSS {:.0}% over ceiling — aborting to prevent system lockup",
+                            emergency_ticks as f64 * 0.5,
+                            overage,
+                        ));
+                        resource_ui.log(&format!(
+                            "  last status: {}", resource_source.status_line()
+                        ));
+                        std::process::exit(1);
+                    }
+                } else {
+                    emergency_ticks = 0;
+                }
             }
-            resource_bar.finish_and_clear();
         })
         .ok();
 
     let result = cmd.execute(&options, &mut ctx);
 
-    // Stop resource status bar
+    // Stop resource status monitoring
     resource_stop.store(true, std::sync::atomic::Ordering::Relaxed);
     if let Some(h) = resource_handle {
         let _ = h.join();
     }
 
-    eprintln!("[{}] {}", result.status, result.message);
+    println!("[{}] {}", result.status, result.message);
     if !result.produced.is_empty() {
-        eprintln!("Produced:");
+        println!("Produced:");
         for p in &result.produced {
-            eprintln!("  {}", p.display());
+            println!("  {}", p.display());
         }
     }
-    eprintln!("Elapsed: {:.2?}", result.elapsed);
+    println!("Elapsed: {:.2?}", result.elapsed);
 
     if result.status == super::command::Status::Error {
         std::process::exit(1);
@@ -483,12 +546,14 @@ fn emit_step_yaml(
         run: command_path.to_string(),
         description: None,
         after: after.to_vec(),
+        profiles: vec![],
+        per_profile: false,
         on_partial: Default::default(),
         options: step_options,
     };
 
     let yaml = serde_yaml::to_string(&[&step]).unwrap_or_else(|e| {
-        eprintln!("Failed to serialize step: {}", e);
+        println!("Failed to serialize step: {}", e);
         std::process::exit(1);
     });
     print!("{}", yaml);
@@ -575,6 +640,8 @@ mod tests {
             run: "analyze stats".to_string(),
             description: None,
             after: vec!["download".to_string()],
+            profiles: vec![],
+            per_profile: false,
             on_partial: Default::default(),
             options: step_options,
         };
@@ -612,6 +679,8 @@ mod tests {
             run: "analyze stats".to_string(),
             description: None,
             after: vec![],
+            profiles: vec![],
+            per_profile: false,
             on_partial: Default::default(),
             options: step_options,
         };

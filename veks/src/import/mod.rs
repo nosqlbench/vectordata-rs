@@ -14,7 +14,7 @@
 //! - `predicate_results`, `metadata_layout` -> slab
 
 pub mod args;
-pub mod dataset;
+pub mod dataset_ext;
 pub mod facet;
 pub mod profile;
 pub mod source;
@@ -24,7 +24,6 @@ pub use facet::Facet;
 
 use std::path::Path;
 
-use indicatif::{ProgressBar, ProgressState, ProgressStyle};
 use log::info;
 
 use crate::formats::VecFormat;
@@ -32,9 +31,12 @@ use crate::formats::reader;
 use crate::formats::writer::{self, SinkConfig};
 
 use dataset::DatasetConfig;
+use dataset_ext::DatasetConfigExt;
 
 /// Entry point for the import subcommand
 pub fn run(args: ImportArgs) {
+    let ui = crate::ui::auto_ui_handle();
+
     // Handle scaffold generation (no source needed)
     if let Some(name) = &args.scaffold {
         let config = DatasetConfig::scaffold(name);
@@ -44,31 +46,31 @@ pub fn run(args: ImportArgs) {
             .clone()
             .unwrap_or_else(|| std::path::PathBuf::from("dataset.yaml"));
         std::fs::write(&out_path, &yaml).unwrap_or_else(|e| {
-            eprintln!("Failed to write {}: {}", out_path.display(), e);
+            ui.emitln(format!("Failed to write {}: {}", out_path.display(), e));
             std::process::exit(1);
         });
-        eprintln!("Scaffold written to {}", out_path.display());
+        ui.log(&format!("Scaffold written to {}", out_path.display()));
         return;
     }
 
     // Dataset mode: upstream sources come from the YAML, not the CLI
     if let Some(dataset_path) = &args.dataset {
-        run_dataset_import(dataset_path, &args);
+        run_dataset_import(dataset_path, &args, &ui);
         return;
     }
 
     // Single facet mode: source is required
     let source = args.source.as_ref().unwrap_or_else(|| {
-        eprintln!("Source path is required for single-facet import. Use --dataset for multi-facet mode.");
+        ui.emitln(format!("Source path is required for single-facet import. Use --dataset for multi-facet mode."));
         std::process::exit(1);
     });
 
     let facet = args.facet.unwrap_or_else(|| {
-        eprintln!("--facet is required for single-facet import. Use --dataset for multi-facet mode.");
+        ui.emitln(format!("--facet is required for single-facet import. Use --dataset for multi-facet mode."));
         std::process::exit(1);
     });
 
-    import_single_facet(source, facet, args.output.as_deref(), args.from.as_deref(), &args);
+    import_single_facet(source, facet, args.output.as_deref(), args.from.as_deref(), &args, &ui);
 }
 
 /// Import views from a dataset.yaml using the default profile.
@@ -76,36 +78,36 @@ pub fn run(args: ImportArgs) {
 /// Iterates the default profile's views and imports each source file
 /// as the corresponding facet. Datasets with pipeline-based upstream
 /// (`upstream.steps`) should use `veks run` instead.
-fn run_dataset_import(dataset_path: &Path, args: &ImportArgs) {
+fn run_dataset_import(dataset_path: &Path, args: &ImportArgs, ui: &crate::ui::UiHandle) {
     let config = DatasetConfig::load(dataset_path).unwrap_or_else(|e| {
-        eprintln!("{}", e);
+        ui.emitln(format!("{}", e));
         std::process::exit(1);
     });
 
     let base_dir = dataset_path.parent().unwrap_or(Path::new("."));
 
     // Phase 1: Fail-fast validation
-    eprintln!("Validating dataset configuration...");
+    ui.log(&format!("Validating dataset configuration..."));
     let errors = config.validate(base_dir);
     if !errors.is_empty() {
         for err in &errors {
-            eprintln!("  ERROR: {}", err);
+            ui.emitln(format!("  ERROR: {}", err));
         }
-        eprintln!("Validation failed with {} error(s)", errors.len());
+        ui.emitln(format!("Validation failed with {} error(s)", errors.len()));
         std::process::exit(1);
     }
 
     let default_profile = match config.default_profile() {
         Some(p) => p,
         None => {
-            eprintln!("No default profile defined — nothing to import.");
-            eprintln!("Use 'veks run' for pipeline-based datasets.");
+            ui.log(&format!("No default profile defined — nothing to import."));
+            ui.log(&format!("Use 'veks run' for pipeline-based datasets."));
             return;
         }
     };
 
     if default_profile.views.is_empty() {
-        eprintln!("Default profile has no views — nothing to import");
+        ui.log(&format!("Default profile has no views — nothing to import"));
         return;
     }
 
@@ -126,18 +128,18 @@ fn run_dataset_import(dataset_path: &Path, args: &ImportArgs) {
         .collect();
 
     if importable.is_empty() {
-        eprintln!("No view sources found on disk — nothing to import.");
-        eprintln!("Use 'veks run' for pipeline-based datasets.");
+        ui.log(&format!("No view sources found on disk — nothing to import."));
+        ui.log(&format!("Use 'veks run' for pipeline-based datasets."));
         return;
     }
 
     // Phase 2: Import each view
-    eprintln!("\nImporting {} view(s)...", importable.len());
+    ui.log(&format!("\nImporting {} view(s)...", importable.len()));
     for (key, view) in &importable {
         let facet = match Facet::from_key(key) {
             Some(f) => f,
             None => {
-                eprintln!("  Warning: unknown view key '{}', skipping", key);
+                ui.log(&format!("  Warning: unknown view key '{}', skipping", key));
                 continue;
             }
         };
@@ -151,17 +153,18 @@ fn run_dataset_import(dataset_path: &Path, args: &ImportArgs) {
             }
         };
 
-        eprintln!("\n--- {} ---", key);
+        ui.emitln(format!("\n--- {} ---", key));
         import_single_facet(
             &source_path,
             facet,
             None,
             None,
             args,
+            ui,
         );
     }
 
-    eprintln!("\nAll views imported successfully.");
+    ui.log(&format!("\nAll views imported successfully."));
 }
 
 /// Import a single facet from source to output.
@@ -174,13 +177,14 @@ fn import_single_facet(
     output_path: Option<&Path>,
     format_override: Option<&str>,
     args: &ImportArgs,
+    ui: &crate::ui::UiHandle,
 ) {
-    let source_format = resolve_source_format(format_override, source_path, facet);
+    let source_format = resolve_source_format(format_override, source_path, facet, ui);
 
     // Probe source first to get metadata (lightweight — no data loading)
-    eprintln!("  probing {} ({})...", source_path.display(), source_format);
+    ui.log(&format!("  probing {} ({})...", source_path.display(), source_format));
     let probe = reader::probe_source_for_facet(source_path, source_format, facet).unwrap_or_else(|e| {
-        eprintln!("Failed to probe source: {}", e);
+        ui.emitln(format!("Failed to probe source: {}", e));
         std::process::exit(1);
     });
     let dimension = probe.dimension;
@@ -188,13 +192,13 @@ fn import_single_facet(
     let record_count = probe.record_count;
     let target_format = facet.preferred_format(element_size);
 
-    eprintln!(
+    ui.log(&format!(
         "  probed: dimension={}, element_size={}, records={}, target={}",
         dimension,
         element_size,
         record_count.map_or("unknown".to_string(), |n| n.to_string()),
         target_format,
-    );
+    ));
 
     // Derive output path if not provided
     let derived_output;
@@ -224,42 +228,42 @@ fn import_single_facet(
                 );
                 match status {
                     OutputStatus::Complete => {
-                        eprintln!(
+                        ui.log(&format!(
                             "  skipping {} — output complete ({} bytes). Use --force to re-import.",
                             facet.key(),
                             actual_size
-                        );
+                        ));
                         return;
                     }
                     OutputStatus::Incomplete { actual, expected } => {
                         let unit = if target_format == VecFormat::Slab { "records" } else { "bytes" };
                         if actual == 0 {
-                            eprintln!(
+                            ui.log(&format!(
                                 "  overwriting {} — output corrupt or unfinished ({} bytes). Expected {} {}.",
                                 facet.key(),
                                 actual_size,
                                 expected,
                                 unit,
-                            );
+                            ));
                         } else {
-                            eprintln!(
+                            ui.log(&format!(
                                 "  re-importing {} — output incomplete: {} of {} {} ({:.1}%).",
                                 facet.key(),
                                 actual,
                                 expected,
                                 unit,
                                 (actual as f64 / expected as f64) * 100.0
-                            );
+                            ));
                         }
                         // Fall through to re-import
                     }
                     OutputStatus::Unknown => {
                         // Cannot determine completeness — treat non-empty as complete (conservative)
-                        eprintln!(
+                        ui.log(&format!(
                             "  skipping {} — output exists ({} bytes, completeness unverifiable). Use --force to re-import.",
                             facet.key(),
                             actual_size
-                        );
+                        ));
                         return;
                     }
                 }
@@ -268,35 +272,35 @@ fn import_single_facet(
     }
 
     if facet.is_mnode() {
-        eprintln!(
+        ui.log(&format!(
             "Importing {} -> {} ({})",
             source_path.display(),
             output_path.display(),
             target_format,
-        );
-        eprintln!(
+        ));
+        ui.log(&format!(
             "  records: {} (MNode metadata)",
             record_count.map_or("unknown".to_string(), |n| n.to_string())
-        );
+        ));
     } else {
-        eprintln!(
+        ui.log(&format!(
             "Importing {} -> {} ({}, {} bytes/element)",
             source_path.display(),
             output_path.display(),
             target_format,
             element_size,
-        );
-        eprintln!(
+        ));
+        ui.log(&format!(
             "  dimension: {}, records: {}",
             dimension,
             record_count.map_or("unknown".to_string(), |n| n.to_string())
-        );
+        ));
     }
 
     // Open the full source reader (may spawn threads, load data)
-    eprintln!("  opening source reader...");
+    ui.log(&format!("  opening source reader..."));
     let mut source = reader::open_source_for_facet(source_path, source_format, facet, args.threads, None).unwrap_or_else(|e| {
-        eprintln!("Failed to open source: {}", e);
+        ui.emitln(format!("Failed to open source: {}", e));
         std::process::exit(1);
     });
 
@@ -304,7 +308,7 @@ fn import_single_facet(
     if let Some(parent) = output_path.parent() {
         if !parent.exists() {
             std::fs::create_dir_all(parent).unwrap_or_else(|e| {
-                eprintln!("Failed to create directory {}: {}", parent.display(), e);
+                ui.emitln(format!("Failed to create directory {}: {}", parent.display(), e));
                 std::process::exit(1);
             });
         }
@@ -317,15 +321,15 @@ fn import_single_facet(
         if let Ok(meta) = std::fs::metadata(output_path) {
             let size = meta.len();
             if size > 1 << 30 {
-                eprintln!(
+                ui.log(&format!(
                     "  removing existing output ({:.1} GB) — this may take a moment...",
                     size as f64 / (1u64 << 30) as f64
-                );
+                ));
             } else if size > 1 << 20 {
-                eprintln!(
+                ui.log(&format!(
                     "  removing existing output ({:.1} MB)...",
                     size as f64 / (1u64 << 20) as f64
-                );
+                ));
             }
         }
     }
@@ -339,30 +343,15 @@ fn import_single_facet(
     };
     let mut sink =
         writer::open_sink(output_path, target_format, &sink_config).unwrap_or_else(|e| {
-            eprintln!("Failed to open sink: {}", e);
+            ui.emitln(format!("Failed to open sink: {}", e));
             std::process::exit(1);
         });
 
-    // Progress bar
+    // Progress via UI handle
     let pb = if let Some(total) = record_count {
-        let pb = ProgressBar::new(total);
-        pb.set_style(
-            ProgressStyle::default_bar()
-                .template("[{bar:40.cyan/blue}] {pos}/{len} ({percent}%) records — {rps} — ETA {eta}")
-                .expect("invalid template")
-                .with_key("rps", format_rps)
-                .progress_chars("=>-"),
-        );
-        pb
+        ui.bar(total, "importing records")
     } else {
-        let pb = ProgressBar::new_spinner();
-        pb.set_style(
-            ProgressStyle::default_spinner()
-                .template("{spinner:.green} {pos} records — {rps}")
-                .expect("invalid template")
-                .with_key("rps", format_rps),
-        );
-        pb
+        ui.spinner("importing records")
     };
 
     // Import loop
@@ -373,15 +362,15 @@ fn import_single_facet(
         pb.inc(1);
     }
 
-    pb.finish_with_message("done");
+    pb.finish();
 
     sink.finish().unwrap_or_else(|e| {
-        eprintln!("Failed to finalize output: {}", e);
+        ui.emitln(format!("Failed to finalize output: {}", e));
         std::process::exit(1);
     });
 
     info!("Imported {} records for facet {}", ordinal, facet);
-    eprintln!("  wrote {} records to {}", ordinal, output_path.display());
+    ui.log(&format!("  wrote {} records to {}", ordinal, output_path.display()));
 }
 
 /// Result of comparing an existing output file against the upstream source bounds
@@ -446,10 +435,7 @@ fn check_slab_completeness(output_path: &Path, expected_records: u64) -> OutputS
     let stats = match slabtastic::SlabReader::probe(output_path) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!(
-                "    (slab unreadable: {} — treating as incomplete)",
-                e
-            );
+            log::warn!("    (slab unreadable: {} — treating as incomplete)", e);
             return OutputStatus::Incomplete {
                 actual: 0,
                 expected: expected_records,
@@ -469,28 +455,6 @@ fn check_slab_completeness(output_path: &Path, expected_records: u64) -> OutputS
 
 /// Format records/sec for the progress bar.
 ///
-/// Shows fractional digits only when the whole part is below 100
-/// (e.g. `12.3/s`, `545,828/s`).
-fn format_rps(state: &ProgressState, w: &mut dyn std::fmt::Write) {
-    let rps = state.per_sec();
-    if rps < 100.0 {
-        write!(w, "{:.1}/s", rps).unwrap();
-    } else {
-        // Format with thousands separators, no decimals
-        let whole = rps as u64;
-        let s = whole.to_string();
-        let mut result = String::with_capacity(s.len() + s.len() / 3);
-        for (i, ch) in s.chars().rev().enumerate() {
-            if i > 0 && i % 3 == 0 {
-                result.push(',');
-            }
-            result.push(ch);
-        }
-        let formatted: String = result.chars().rev().collect();
-        write!(w, "{}/s", formatted).unwrap();
-    }
-}
-
 /// Format a count with thousands separators.
 fn format_count(n: u64) -> String {
     let s = n.to_string();
@@ -509,18 +473,19 @@ fn resolve_source_format(
     format_override: Option<&str>,
     source_path: &Path,
     _facet: Facet,
+    ui: &crate::ui::UiHandle,
 ) -> VecFormat {
     if let Some(fmt_str) = format_override {
         VecFormat::from_extension(fmt_str).unwrap_or_else(|| {
-            eprintln!("Unknown source format: '{}'", fmt_str);
+            ui.emitln(format!("Unknown source format: '{}'", fmt_str));
             std::process::exit(1);
         })
     } else {
         VecFormat::detect(source_path).unwrap_or_else(|| {
-            eprintln!(
+            ui.emitln(format!(
                 "Could not auto-detect source format for '{}'. Use --from to specify.",
                 source_path.display()
-            );
+            ));
             std::process::exit(1);
         })
     }

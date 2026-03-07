@@ -140,7 +140,7 @@ impl CommandOp for CleanupCleanfvecOp {
 
         // Governor checkpoint before processing loop
         if ctx.governor.checkpoint() {
-            ctx.display.log("  governor: throttle active");
+            ctx.ui.log("  governor: throttle active");
         }
 
         for i in 0..complete_vectors {
@@ -181,18 +181,18 @@ impl CommandOp for CleanupCleanfvecOp {
         };
 
         let removed_total = result.original_count - result.written_count;
-        ctx.display.log(&format!(
+        ctx.ui.log(&format!(
             "Clean: {} -> {} vectors ({} removed)",
             result.original_count, result.written_count, removed_total
         ));
         if result.trailing_bytes_removed > 0 {
-            ctx.display.log(&format!("  Trailing bytes removed: {}", result.trailing_bytes_removed));
+            ctx.ui.log(&format!("  Trailing bytes removed: {}", result.trailing_bytes_removed));
         }
         if result.zero_vectors_removed > 0 {
-            ctx.display.log(&format!("  Zero vectors removed: {}", result.zero_vectors_removed));
+            ctx.ui.log(&format!("  Zero vectors removed: {}", result.zero_vectors_removed));
         }
         if result.duplicate_vectors_removed > 0 {
-            ctx.display.log(&format!("  Duplicate vectors removed: {}", result.duplicate_vectors_removed));
+            ctx.ui.log(&format!("  Duplicate vectors removed: {}", result.duplicate_vectors_removed));
         }
 
         CommandResult {
@@ -282,6 +282,9 @@ mod tests {
 
     fn test_ctx(dir: &Path) -> StreamContext {
         StreamContext {
+            dataset_name: String::new(),
+            profile: String::new(),
+            profile_names: vec![],
             workspace: dir.to_path_buf(),
             scratch: dir.join(".scratch"),
             cache: dir.join(".cache"),
@@ -291,7 +294,7 @@ mod tests {
             threads: 1,
             step_id: String::new(),
             governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
-            display: crate::pipeline::display::ProgressDisplay::new(),
+            ui: crate::ui::UiHandle::new(std::sync::Arc::new(crate::ui::TestSink::new())),
         }
     }
 

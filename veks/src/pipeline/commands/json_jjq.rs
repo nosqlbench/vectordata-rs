@@ -328,7 +328,7 @@ impl CommandOp for JsonJjqOp {
             let value: Value = match serde_json::from_str(&line) {
                 Ok(v) => v,
                 Err(e) => {
-                    ctx.display.log(&format!("  Warning: line {}: parse error: {}", line_count, e));
+                    ctx.ui.log(&format!("  Warning: line {}: parse error: {}", line_count, e));
                     continue;
                 }
             };
@@ -407,6 +407,9 @@ mod tests {
 
     fn test_ctx(dir: &Path) -> StreamContext {
         StreamContext {
+            dataset_name: String::new(),
+            profile: String::new(),
+            profile_names: vec![],
             workspace: dir.to_path_buf(),
             scratch: dir.join(".scratch"),
             cache: dir.join(".cache"),
@@ -416,7 +419,7 @@ mod tests {
             threads: 1,
             step_id: String::new(),
             governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
-            display: crate::pipeline::display::ProgressDisplay::new(),
+            ui: crate::ui::UiHandle::new(std::sync::Arc::new(crate::ui::TestSink::new())),
         }
     }
 

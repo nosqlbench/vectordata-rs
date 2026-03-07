@@ -115,8 +115,8 @@ impl CommandOp for ConfigShowOp {
         let path = settings_path();
 
         if !path.exists() {
-            ctx.display.log(&format!("Configuration: {} (not found)", path.display()));
-            ctx.display.log("Run 'config init' to set up vectordata configuration.");
+            ctx.ui.log(&format!("Configuration: {} (not found)", path.display()));
+            ctx.ui.log("Run 'config init' to set up vectordata configuration.");
             return CommandResult {
                 status: Status::Ok,
                 message: "no configuration found".to_string(),
@@ -130,29 +130,29 @@ impl CommandOp for ConfigShowOp {
             Err(e) => return error_result(e, start),
         };
 
-        ctx.display.log(&format!("Configuration: {}", path.display()));
+        ctx.ui.log(&format!("Configuration: {}", path.display()));
 
         if let Some(ref cache_dir) = settings.cache_dir {
             let cache_path = PathBuf::from(cache_dir);
-            ctx.display.log(&format!("  cache_dir: {}", cache_dir));
+            ctx.ui.log(&format!("  cache_dir: {}", cache_dir));
 
             if cache_path.is_dir() {
-                ctx.display.log("  Status: Active");
+                ctx.ui.log("  Status: Active");
 
                 // Compute used space
                 if let Ok(used) = dir_size(&cache_path) {
-                    ctx.display.log(&format!("  Used space: {}", format_bytes(used)));
+                    ctx.ui.log(&format!("  Used space: {}", format_bytes(used)));
                 }
             } else if cache_path.exists() {
-                ctx.display.log("  Status: Error — path exists but is not a directory");
+                ctx.ui.log("  Status: Error — path exists but is not a directory");
             } else {
-                ctx.display.log("  Status: Not yet created");
+                ctx.ui.log("  Status: Not yet created");
             }
         } else {
-            ctx.display.log("  cache_dir: (not set)");
+            ctx.ui.log("  cache_dir: (not set)");
         }
 
-        ctx.display.log(&format!("  protect_settings: {}", settings.protect_settings));
+        ctx.ui.log(&format!("  protect_settings: {}", settings.protect_settings));
 
         CommandResult {
             status: Status::Ok,
@@ -246,9 +246,9 @@ impl CommandOp for ConfigInitOp {
             return error_result(e, start);
         }
 
-        ctx.display.log("Configuration initialized:");
-        ctx.display.log(&format!("  Settings: {}", path.display()));
-        ctx.display.log(&format!("  cache_dir: {}", cache_dir));
+        ctx.ui.log("Configuration initialized:");
+        ctx.ui.log(&format!("  Settings: {}", path.display()));
+        ctx.ui.log(&format!("  cache_dir: {}", cache_dir));
 
         CommandResult {
             status: Status::Ok,
@@ -376,8 +376,8 @@ impl CommandOp for ConfigListMountsOp {
 
         let mounts = list_mount_points();
 
-        ctx.display.log(&format!("{:<40} {:>12} {:>12} {:>8}", "Mount Point", "Available", "Total", "Writable"));
-        ctx.display.log(&format!("{}", "-".repeat(76)));
+        ctx.ui.log(&format!("{:<40} {:>12} {:>12} {:>8}", "Mount Point", "Available", "Total", "Writable"));
+        ctx.ui.log(&format!("{}", "-".repeat(76)));
 
         let mut count = 0;
         for mount in &mounts {
@@ -389,7 +389,7 @@ impl CommandOp for ConfigListMountsOp {
             } else {
                 mount.path.clone()
             };
-            ctx.display.log(&format!(
+            ctx.ui.log(&format!(
                 "{:<40} {:>12} {:>12} {:>8}",
                 display_path,
                 format_bytes(mount.available),
@@ -400,13 +400,13 @@ impl CommandOp for ConfigListMountsOp {
         }
 
         if count == 0 {
-            ctx.display.log("No suitable mount points found.");
+            ctx.ui.log("No suitable mount points found.");
             if !show_all {
-                ctx.display.log("Use all=true to show all mount points (including those with < 100 MB).");
+                ctx.ui.log("Use all=true to show all mount points (including those with < 100 MB).");
             }
         } else {
-            ctx.display.log("");
-            ctx.display.log("To set a cache directory, run: config init cache-dir=<path>");
+            ctx.ui.log("");
+            ctx.ui.log("To set a cache directory, run: config init cache-dir=<path>");
         }
 
         CommandResult {
@@ -546,6 +546,9 @@ mod tests {
 
     fn test_ctx(dir: &Path) -> StreamContext {
         StreamContext {
+            dataset_name: String::new(),
+            profile: String::new(),
+            profile_names: vec![],
             workspace: dir.to_path_buf(),
             scratch: dir.join(".scratch"),
             cache: dir.join(".cache"),
@@ -555,7 +558,7 @@ mod tests {
             threads: 1,
             step_id: String::new(),
             governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
-            display: crate::pipeline::display::ProgressDisplay::new(),
+            ui: crate::ui::UiHandle::new(std::sync::Arc::new(crate::ui::TestSink::new())),
         }
     }
 

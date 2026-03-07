@@ -7,6 +7,7 @@
 //! implementation behind the `CommandOp` trait, extracting options from the
 //! pipeline `Options` map and delegating to the underlying logic.
 
+pub mod barrier;
 pub mod analyze_explore;
 pub mod analyze_checkendian;
 pub mod analyze_find;
@@ -29,11 +30,6 @@ pub mod compute_sort;
 mod config;
 mod convert;
 mod catalog;
-pub mod datasets_cache;
-pub mod datasets_curlify;
-pub mod datasets_list;
-pub mod datasets_plan;
-pub mod datasets_prebuffer;
 pub mod fetch_dlhf;
 mod describe;
 pub mod gen_dataset;
@@ -49,7 +45,9 @@ pub mod gen_vectors;
 pub mod info_compute;
 pub mod info_file;
 mod import;
+pub mod inspect_predicate;
 pub mod json_jjq;
+pub mod set_variable;
 pub mod json_rjq;
 pub mod merkle;
 pub mod slab;
@@ -85,13 +83,12 @@ pub fn register_all(registry: &mut CommandRegistry) {
     registry.register("info compute", info_compute::factory);
     registry.register("cleanup cleanfvec", cleanup_cleanfvec::factory);
 
-    // Phase 5 batch 2: merkle, datasets, json
+    // Phase 5 batch 2: merkle, json
     registry.register("merkle create", merkle::create_factory);
     registry.register("merkle verify", merkle::verify_factory);
     registry.register("merkle diff", merkle::diff_factory);
     registry.register("merkle summary", merkle::summary_factory);
     registry.register("merkle treeview", merkle::treeview_factory);
-    registry.register("datasets list", datasets_list::factory);
     registry.register("json jjq", json_jjq::factory);
     registry.register("json rjq", json_rjq::factory);
 
@@ -114,17 +111,13 @@ pub fn register_all(registry: &mut CommandRegistry) {
     registry.register("merkle spoilchunks", merkle::spoilchunks_factory);
     registry.register("config list-mounts", config::list_mounts_factory);
 
-    // Phase 5 batch 7: analyze find/profile/model-diff/verifyprofiles, datasets, catalog
+    // Phase 5 batch 7: analyze find/profile/model-diff/verifyprofiles, catalog
     registry.register("analyze explore", analyze_explore::factory);
     registry.register("analyze find", analyze_find::factory);
     registry.register("analyze profile", analyze_profile::factory);
     registry.register("analyze model-diff", analyze_modeldiff::factory);
     registry.register("analyze verify-profiles", analyze_verifyprofiles::factory);
-    registry.register("datasets plan", datasets_plan::factory);
-    registry.register("datasets cache", datasets_cache::factory);
     registry.register("catalog generate", catalog::factory);
-    registry.register("datasets curlify", datasets_curlify::factory);
-    registry.register("datasets prebuffer", datasets_prebuffer::factory);
     registry.register("fetch dlhf", fetch_dlhf::factory);
 
     // Phase 5 batch 6: slab commands
@@ -146,4 +139,14 @@ pub fn register_all(registry: &mut CommandRegistry) {
     registry.register("generate predicated", gen_predicated::factory);
     registry.register("generate predicates", gen_predicates::factory);
     registry.register("generate predicate-keys", gen_predicate_keys::factory);
+
+    // Phase 7: inspection
+    registry.register("inspect predicate", inspect_predicate::factory);
+
+    // Phase 8: pipeline utilities
+    registry.register("set variable", set_variable::factory);
+    registry.register("clear variables", set_variable::clear_factory);
+
+    // Phase 9: pipeline infrastructure
+    registry.register("barrier", barrier::factory);
 }

@@ -162,11 +162,11 @@ impl CommandOp for AnalyzeModelDiffOp {
         let mut max_drift = 0.0f64;
         let mut problem_dims: Vec<usize> = Vec::new();
 
-        ctx.display.log(&format!(
+        ctx.ui.log(&format!(
             "{:<6} {:<10} {:<10} {:>10}  {}",
             "Dim", "Original", "Compare", "Drift%", "Status"
         ));
-        ctx.display.log(&format!("{}", "-".repeat(52)));
+        ctx.ui.log(&format!("{}", "-".repeat(52)));
 
         for i in 0..dim_count {
             let o = &orig.scalar_models[i];
@@ -194,7 +194,7 @@ impl CommandOp for AnalyzeModelDiffOp {
 
             let show = verbose || i < 10 || problem_dims.contains(&i) || i == dim_count - 1;
             if show {
-                ctx.display.log(&format!(
+                ctx.ui.log(&format!(
                     "{:<6} {:<10} {:<10} {:>9.2}%  {}",
                     i,
                     o.type_name(),
@@ -203,29 +203,29 @@ impl CommandOp for AnalyzeModelDiffOp {
                     status
                 ));
             } else if i == 10 {
-                ctx.display.log("  ...");
+                ctx.ui.log("  ...");
             }
         }
 
         let avg_drift = total_drift / dim_count as f64;
         let type_match_pct = (type_matches as f64 / dim_count as f64) * 100.0;
 
-        ctx.display.log("");
-        ctx.display.log("Summary:");
-        ctx.display.log(&format!("  Dimensions:    {}", dim_count));
-        ctx.display.log(&format!("  Type match:    {:.1}% ({}/{})", type_match_pct, type_matches, dim_count));
-        ctx.display.log(&format!("  Avg drift:     {:.2}%", avg_drift));
-        ctx.display.log(&format!("  Max drift:     {:.2}%", max_drift));
-        ctx.display.log(&format!("  Problem dims:  {}", problem_dims.len()));
+        ctx.ui.log("");
+        ctx.ui.log("Summary:");
+        ctx.ui.log(&format!("  Dimensions:    {}", dim_count));
+        ctx.ui.log(&format!("  Type match:    {:.1}% ({}/{})", type_match_pct, type_matches, dim_count));
+        ctx.ui.log(&format!("  Avg drift:     {:.2}%", avg_drift));
+        ctx.ui.log(&format!("  Max drift:     {:.2}%", max_drift));
+        ctx.ui.log(&format!("  Problem dims:  {}", problem_dims.len()));
 
         let pass = avg_drift <= drift_threshold
             && max_drift <= max_drift_threshold
             && type_match_pct >= 100.0;
 
         if pass {
-            ctx.display.log("  Result: PASS");
+            ctx.ui.log("  Result: PASS");
         } else {
-            ctx.display.log("  Result: FAIL");
+            ctx.ui.log("  Result: FAIL");
         }
 
         CommandResult {
@@ -310,6 +310,9 @@ mod tests {
 
     fn test_ctx(dir: &Path) -> StreamContext {
         StreamContext {
+            dataset_name: String::new(),
+            profile: String::new(),
+            profile_names: vec![],
             workspace: dir.to_path_buf(),
             scratch: dir.join(".scratch"),
             cache: dir.join(".cache"),
@@ -319,7 +322,7 @@ mod tests {
             threads: 1,
             step_id: String::new(),
             governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
-            display: crate::pipeline::display::ProgressDisplay::new(),
+            ui: crate::ui::UiHandle::new(std::sync::Arc::new(crate::ui::TestSink::new())),
         }
     }
 

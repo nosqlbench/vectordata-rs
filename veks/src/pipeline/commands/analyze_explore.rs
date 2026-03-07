@@ -73,9 +73,9 @@ impl CommandOp for AnalyzeExploreOp {
         let count = <MmapVectorReader<f32> as VectorReader<f32>>::count(&reader);
         let dim = <MmapVectorReader<f32> as VectorReader<f32>>::dim(&reader);
 
-        ctx.display.log(&format!("Exploring: {} ({} vectors, {} dims)", source.display(), count, dim));
-        ctx.display.log("Type 'help' for available commands, 'quit' to exit.");
-        ctx.display.log("");
+        ctx.ui.log(&format!("Exploring: {} ({} vectors, {} dims)", source.display(), count, dim));
+        ctx.ui.log("Type 'help' for available commands, 'quit' to exit.");
+        ctx.ui.log("");
 
         // Check if stdin is a TTY for interactive mode
         let is_interactive = atty::is(atty::Stream::Stdin);
@@ -114,7 +114,7 @@ impl CommandOp for AnalyzeExploreOp {
         let mut stdout = io::stdout();
 
         loop {
-            print!("explore> ");
+            ctx.ui.emit("explore> ");
             let _ = stdout.flush();
 
             let mut line = String::new();
@@ -133,7 +133,7 @@ impl CommandOp for AnalyzeExploreOp {
             }
 
             let result = execute_repl_command(line, &reader, count, dim);
-            println!("{}", result);
+            ctx.ui.emitln(result);
         }
 
         CommandResult {
@@ -453,6 +453,9 @@ mod tests {
 
     fn test_ctx(dir: &Path) -> StreamContext {
         StreamContext {
+            dataset_name: String::new(),
+            profile: String::new(),
+            profile_names: vec![],
             workspace: dir.to_path_buf(),
             scratch: dir.join(".scratch"),
             cache: dir.join(".cache"),
@@ -462,7 +465,7 @@ mod tests {
             threads: 1,
             step_id: String::new(),
             governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
-            display: crate::pipeline::display::ProgressDisplay::new(),
+            ui: crate::ui::UiHandle::new(std::sync::Arc::new(crate::ui::TestSink::new())),
         }
     }
 

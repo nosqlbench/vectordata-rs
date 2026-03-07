@@ -129,7 +129,7 @@ fn select_fvec(path: &Path, ordinal: usize, format: &str, start: Instant) -> Com
     };
 
     let output = format_vector("float[]", &vec, format, ordinal);
-    eprintln!("{}", output);
+    log::info!("{}", output);
 
     CommandResult {
         status: Status::Ok,
@@ -159,7 +159,7 @@ fn select_ivec(path: &Path, ordinal: usize, format: &str, start: Instant) -> Com
     };
 
     let output = format_vector("int[]", &vec, format, ordinal);
-    eprintln!("{}", output);
+    log::info!("{}", output);
 
     CommandResult {
         status: Status::Ok,
@@ -227,6 +227,9 @@ mod tests {
 
     fn test_ctx(dir: &Path) -> StreamContext {
         StreamContext {
+            dataset_name: String::new(),
+            profile: String::new(),
+            profile_names: vec![],
             workspace: dir.to_path_buf(),
             scratch: dir.join(".scratch"),
             cache: dir.join(".cache"),
@@ -236,7 +239,7 @@ mod tests {
             threads: 1,
             step_id: String::new(),
             governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
-            display: crate::pipeline::display::ProgressDisplay::new(),
+            ui: crate::ui::UiHandle::new(std::sync::Arc::new(crate::ui::TestSink::new())),
         }
     }
 

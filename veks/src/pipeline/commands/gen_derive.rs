@@ -138,7 +138,7 @@ synthetic vectors matching the source's statistical profile.
         let effective_sample = sample.min(total_count);
         let output_count = if count == 0 { total_count as u64 } else { count };
 
-        ctx.display.log(&format!(
+        ctx.ui.log(&format!(
             "Extracting model from {} ({} vectors, dim={}, sampling {})",
             base_path.display(),
             total_count,
@@ -211,12 +211,12 @@ synthetic vectors matching the source's statistical profile.
             return error_result(format!("failed to write dataset.yaml: {}", e), start);
         }
 
-        ctx.display.log(&format!(
+        ctx.ui.log(&format!(
             "Derived dataset '{}' with {} dimensions, {} target vectors",
             name, dim, output_count
         ));
-        ctx.display.log(&format!("  model: {}", model_path.display()));
-        ctx.display.log(&format!("  config: {}", yaml_path.display()));
+        ctx.ui.log(&format!("  model: {}", model_path.display()));
+        ctx.ui.log(&format!("  config: {}", yaml_path.display()));
 
         CommandResult {
             status: Status::Ok,
@@ -397,6 +397,9 @@ mod tests {
 
     fn test_ctx(dir: &Path) -> StreamContext {
         StreamContext {
+            dataset_name: String::new(),
+            profile: String::new(),
+            profile_names: vec![],
             workspace: dir.to_path_buf(),
             scratch: dir.join(".scratch"),
             cache: dir.join(".cache"),
@@ -406,7 +409,7 @@ mod tests {
             threads: 1,
             step_id: String::new(),
             governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
-            display: crate::pipeline::display::ProgressDisplay::new(),
+            ui: crate::ui::UiHandle::new(std::sync::Arc::new(crate::ui::TestSink::new())),
         }
     }
 

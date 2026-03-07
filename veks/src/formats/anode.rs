@@ -38,6 +38,29 @@ pub enum ANode {
     PNode(PNode),
 }
 
+impl ANode {
+    /// Create a structural fingerprint by delegating to the inner type's
+    /// fingerprint method.  Values are replaced with type-default placeholders
+    /// while the overall structure (field names, operators, tree shape) is
+    /// preserved.
+    pub fn fingerprint(&self) -> ANode {
+        match self {
+            ANode::MNode(node) => ANode::MNode(node.fingerprint()),
+            ANode::PNode(node) => ANode::PNode(node.fingerprint()),
+        }
+    }
+
+    /// Check whether two ANodes are structurally congruent — same variant
+    /// with matching structure, differing only in values.
+    pub fn is_congruent(&self, other: &Self) -> bool {
+        match (self, other) {
+            (ANode::MNode(a), ANode::MNode(b)) => a.is_congruent(b),
+            (ANode::PNode(a), ANode::PNode(b)) => a.is_congruent(b),
+            _ => false,
+        }
+    }
+}
+
 impl fmt::Display for ANode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -183,5 +206,51 @@ mod tests {
         let anode = ANode::MNode(node);
         let s = format!("{}", anode);
         assert!(s.contains("k: 1"));
+    }
+
+    #[test]
+    fn test_anode_fingerprint_mnode() {
+        let mut a = MNode::new();
+        a.insert("name".into(), MValue::Text("alice".into()));
+        a.insert("age".into(), MValue::Int(30));
+
+        let mut b = MNode::new();
+        b.insert("name".into(), MValue::Text("bob".into()));
+        b.insert("age".into(), MValue::Int(25));
+
+        let aa = ANode::MNode(a);
+        let bb = ANode::MNode(b);
+        assert!(aa.is_congruent(&bb));
+        assert_eq!(aa.fingerprint().to_string(), bb.fingerprint().to_string());
+    }
+
+    #[test]
+    fn test_anode_fingerprint_pnode() {
+        let a = ANode::PNode(PNode::Predicate(PredicateNode {
+            field: FieldRef::Named("x".into()),
+            op: OpType::Eq,
+            comparands: vec![Comparand::Int(1)],
+        }));
+        let b = ANode::PNode(PNode::Predicate(PredicateNode {
+            field: FieldRef::Named("x".into()),
+            op: OpType::Eq,
+            comparands: vec![Comparand::Int(999)],
+        }));
+        assert!(a.is_congruent(&b));
+    }
+
+    #[test]
+    fn test_anode_cross_variant_not_congruent() {
+        let mut m = MNode::new();
+        m.insert("x".into(), MValue::Int(1));
+        let mnode = ANode::MNode(m);
+
+        let pnode = ANode::PNode(PNode::Predicate(PredicateNode {
+            field: FieldRef::Named("x".into()),
+            op: OpType::Eq,
+            comparands: vec![Comparand::Int(1)],
+        }));
+
+        assert!(!mnode.is_congruent(&pnode));
     }
 }

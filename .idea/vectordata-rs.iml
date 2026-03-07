@@ -9,6 +9,9 @@
       <sourceFolder url="file://$MODULE_DIR$/vecs/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/vectordata/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/veks/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/dataset/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/testserver/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/vectordata/tests" isTestSource="true" />
       <excludeFolder url="file://$MODULE_DIR$/target" />
     </content>
     <orderEntry type="inheritedJdk" />
