@@ -3,7 +3,7 @@
 
 use veks::{analyze, bulkdl, cli, convert, datasets, import, pipeline};
 
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{Arg, Command, CommandFactory, Parser, Subcommand};
 use clap_complete::CompleteEnv;
 
 /// Veks — umbrella CLI for vector data tools
@@ -31,6 +31,7 @@ enum Commands {
     /// Emit a dataset pipeline as an equivalent shell script
     Script(pipeline::ScriptArgs),
     /// Execute a single pipeline command directly
+    #[command(disable_help_flag = true)]
     Pipeline {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
@@ -66,7 +67,121 @@ fn build_augmented_cli() -> clap::Command {
     cmd = cmd.mut_subcommand("pipeline", |_| {
         pipeline::cli::build_pipeline_command()
     });
+    // Replace the derive-generated `help` stub with a tree that supports
+    // tab-completing pipeline group names and command names.
+    cmd = cmd.mut_subcommand("help", |_| {
+        build_help_completion_command()
+    });
     cmd
+}
+
+/// Build a `clap::Command` for `veks help` with nested subcommands
+/// matching all valid help targets.
+///
+/// This tree is only used for shell completion — runtime parsing still
+/// goes through the derive-generated `HelpArgs`. The structure mirrors
+/// what `run_help()` accepts:
+///
+/// ```text
+/// veks help                          # top-level overview
+/// veks help --list                   # full catalog
+/// veks help run                      # root command help
+/// veks help compute                  # pipeline group listing
+/// veks help compute knn              # pipeline command docs
+/// veks help pipeline compute knn     # same, with explicit prefix
+/// ```
+fn build_help_completion_command() -> clap::Command {
+    use pipeline::registry::CommandRegistry;
+    use std::collections::BTreeMap;
+
+    let registry = CommandRegistry::with_builtins();
+    let paths = registry.command_paths();
+
+    // Group pipeline command paths by first word.
+    let mut groups: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
+    for path in &paths {
+        let mut parts = path.splitn(2, ' ');
+        let group = parts.next().unwrap().to_string();
+        let subname = parts.next().unwrap_or("").to_string();
+        let factory = registry.get(path).unwrap();
+        let summary = factory().command_doc().summary;
+        groups.entry(group).or_default().push((subname, summary));
+    }
+
+    let mut help_cmd = Command::new("help")
+        .about("Show detailed help for a pipeline command or command group")
+        .arg(Arg::new("list").long("list").num_args(0)
+            .help("List all commands with summaries, grouped by category"))
+        .arg(Arg::new("markdown").long("markdown").num_args(0)
+            .help("Emit raw markdown to stdout instead of rendering for the terminal"));
+
+    // Add root-level commands as help subcommands.
+    // All subcommands in the help tree disable their own --help flag since
+    // they exist purely for tab-completion routing, not execution.
+    for (name, desc) in root_commands() {
+        if name == "help" || name == "pipeline" {
+            continue; // handled separately
+        }
+        help_cmd = help_cmd.subcommand(
+            Command::new(name).about(desc).disable_help_flag(true),
+        );
+    }
+
+    // Add pipeline groups as direct help subcommands (for `veks help compute knn`).
+    // If a root command and pipeline group share a name, replace the existing
+    // entry with one that includes the pipeline subcommands. Otherwise add a
+    // new subcommand for the group.
+    for (group, commands) in &groups {
+        let group_about = format!("{} pipeline commands", group);
+        let exists = help_cmd.get_subcommands().any(|c| c.get_name() == group.as_str());
+
+        let mut group_cmd = if exists {
+            help_cmd.get_subcommands()
+                .find(|c| c.get_name() == group.as_str())
+                .cloned()
+                .unwrap()
+        } else {
+            Command::new(group.clone()).about(group_about).disable_help_flag(true)
+        };
+
+        for (subname, summary) in commands {
+            if !subname.is_empty() {
+                group_cmd = group_cmd.subcommand(
+                    Command::new(subname.clone()).about(summary.clone())
+                        .disable_help_flag(true),
+                );
+            }
+        }
+
+        if exists {
+            help_cmd = help_cmd.mut_subcommand(group.as_str(), |_| group_cmd);
+        } else {
+            help_cmd = help_cmd.subcommand(group_cmd);
+        }
+    }
+
+    // Add "pipeline" as a help subcommand with the full group/command tree
+    // for `veks help pipeline analyze stats`.
+    let mut pipeline_sub = Command::new("pipeline")
+        .about("Execute a single pipeline command directly")
+        .disable_help_flag(true);
+    for (group, commands) in &groups {
+        let mut group_cmd = Command::new(group.clone())
+            .about(format!("{} pipeline commands", group))
+            .disable_help_flag(true);
+        for (subname, summary) in commands {
+            if !subname.is_empty() {
+                group_cmd = group_cmd.subcommand(
+                    Command::new(subname.clone()).about(summary.clone())
+                        .disable_help_flag(true),
+                );
+            }
+        }
+        pipeline_sub = pipeline_sub.subcommand(group_cmd);
+    }
+    help_cmd = help_cmd.subcommand(pipeline_sub);
+
+    help_cmd
 }
 
 #[tokio::main]
@@ -105,7 +220,14 @@ fn root_commands() -> Vec<(&'static str, &'static str)> {
     ]
 }
 
-/// Execute `veks help` — display documentation for pipeline commands and groups.
+/// Execute `veks help` — display documentation for commands and groups.
+///
+/// With no arguments, shows the same concise overview as `veks --help`.
+/// With `--list`, shows all commands including the full pipeline catalog.
+/// With a command path, shows detailed help for that command or group.
+///
+/// The `pipeline` prefix is optional: `veks help analyze stats` and
+/// `veks help pipeline analyze stats` are equivalent.
 fn run_help(args: HelpArgs) {
     use pipeline::registry::CommandRegistry;
     use std::collections::BTreeMap;
@@ -124,22 +246,56 @@ fn run_help(args: HelpArgs) {
         groups.entry(group).or_default().push((path, summary));
     }
 
-    // --list mode: show all commands grouped
-    if args.list || args.command_path.is_empty() {
+    // --list mode: show all commands grouped (full pipeline catalog)
+    if args.list {
         print_command_list(&groups, args.markdown);
         return;
     }
 
-    let query = args.command_path.join(" ");
+    // No arguments: show the same concise output as `veks --help`.
+    if args.command_path.is_empty() {
+        let mut cmd = build_augmented_cli();
+        let help = cmd.render_help();
+        println!("{}", help);
+        return;
+    }
 
-    // Check if query matches a root-level command
-    if let Some(help_text) = root_command_help(&query) {
-        if args.markdown {
-            println!("{}", help_text);
-        } else {
-            render_markdown_to_terminal(&help_text);
+    // Strip optional "pipeline" prefix so `veks help pipeline analyze stats`
+    // works the same as `veks help analyze stats`.
+    let had_pipeline_prefix = args.command_path.first().map(|s| s.as_str()) == Some("pipeline");
+    let command_path = if had_pipeline_prefix {
+        &args.command_path[1..]
+    } else {
+        &args.command_path[..]
+    };
+
+    // If stripping "pipeline" left nothing, show the pipeline subcommand help.
+    if command_path.is_empty() {
+        if let Some(help_text) = root_command_help("pipeline") {
+            if args.markdown {
+                println!("{}", help_text);
+            } else {
+                render_markdown_to_terminal(&help_text);
+            }
         }
         return;
+    }
+
+    let query = command_path.join(" ");
+
+    // When the user did NOT say "pipeline", check root-level commands first
+    // (e.g., `veks help run` shows the root `run` command).
+    // When they DID say "pipeline", skip root commands so
+    // `veks help pipeline analyze` shows the pipeline group, not root analyze.
+    if !had_pipeline_prefix {
+        if let Some(help_text) = root_command_help(&query) {
+            if args.markdown {
+                println!("{}", help_text);
+            } else {
+                render_markdown_to_terminal(&help_text);
+            }
+            return;
+        }
     }
 
     // Check if query matches a pipeline group name (DOC-07)
@@ -160,8 +316,21 @@ fn run_help(args: HelpArgs) {
         return;
     }
 
-    println!("Unknown command or group: '{}'", query);
-    println!("Use 'veks help --list' to see all available commands.");
+    // Fall through: when user didn't say "pipeline" and it's not a pipeline
+    // group/command either, try root commands as a last resort.
+    if had_pipeline_prefix {
+        if let Some(help_text) = root_command_help(&query) {
+            if args.markdown {
+                println!("{}", help_text);
+            } else {
+                render_markdown_to_terminal(&help_text);
+            }
+            return;
+        }
+    }
+
+    eprintln!("Unknown command or group: '{}'", query);
+    eprintln!("Use 'veks help --list' to see all available commands.");
     std::process::exit(1);
 }
 

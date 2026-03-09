@@ -364,15 +364,139 @@ This expands to profiles named `10m`, `20m`, `100m`, `200m`, `300m`, `400m`,
 each with `base_count` set and inheriting from `default`. Profiles are sorted
 smallest to largest.
 
-**Sized entry forms**:
+The `sized` key is reserved — it is not a profile name. It may appear
+alongside explicit profile definitions and the `default` profile.
 
-| Form | Example | Expansion |
-|------|---------|-----------|
-| Simple value | `10m` | One profile with `base_count: 10000000` |
-| Linear range (step) | `100m..400m/100m` | Profiles at each absolute step (100m, 200m, 300m, 400m) |
-| Linear range (count) | `0m..400m/10` | 10 equal divisions (bare number = count) |
-| Fibonacci | `fib:1m..400m` | Fibonacci multiples of start within range |
-| Geometric | `mul:1m..400m/2` | Compound by factor (doubling, tripling, etc.) |
+#### Sized entry forms
+
+Each entry in the `sized` list is a string parsed into one or more
+`(profile_name, base_count)` pairs. Five forms are supported:
+
+**1. Simple value** — a single count:
+```yaml
+sized: [10m, 20m, 50m]
+```
+Each value becomes one profile. `10m` → profile named `"10m"` with
+`base_count: 10000000`.
+
+**2. Linear range with step size** (`start..end/step`):
+```yaml
+sized: ["100m..400m/100m"]
+```
+The divisor has a **unit suffix** (like `m`, `k`), so it is interpreted as
+an absolute step size. Produces a profile at each step from start to end
+inclusive: `100m, 200m, 300m, 400m`. If end is not exactly reachable, the
+last value that does not exceed end is included.
+
+Another example: `"10m..25m/10m"` → `10m, 20m` (30m would exceed 25m).
+
+**3. Linear range with count** (`start..end/N`):
+```yaml
+sized: ["0m..400m/10"]
+```
+The divisor is a **bare integer** (no unit suffix), so it is interpreted as
+the number of equal divisions. The range `[start, end]` is divided into N
+equal parts, and profiles are created at each division boundary (excluding
+start if start is 0). Formula: `value[i] = start + (range × i) / N` for
+`i = 1..N`.
+
+Produces: `40m, 80m, 120m, 160m, 200m, 240m, 280m, 320m, 360m, 400m`.
+
+With nonzero start: `"100m..400m/3"` → `200m, 300m, 400m` (3 divisions
+of the 300m range).
+
+**The critical distinction**: `100m..400m/10m` (step of 10 million)
+produces 31 profiles (100m, 110m, 120m, ..., 400m), while
+`100m..400m/10` (10 divisions) produces 10 profiles (130m, 160m, ...,
+400m). The presence or absence of a unit suffix on the divisor determines
+which interpretation is used.
+
+**4. Fibonacci series** (`fib:start..end`):
+```yaml
+sized: ["fib:1m..400m"]
+```
+Uses `start` as the base unit. Generates profiles at fibonacci multiples
+of that unit within the range: `fib(n) × start` for each fibonacci
+number where the result falls within `[start, end]`.
+
+With base unit 1m, the fibonacci sequence 1, 1, 2, 3, 5, 8, 13, 21, 34,
+55, 89, 144, 233, 377 produces: `1m, 1m, 2m, 3m, 5m, 8m, 13m, 21m,
+34m, 55m, 89m, 144m, 233m, 377m`. Start must be > 0.
+
+**5. Geometric (multiply-by-factor) series** (`mul:start..end/factor`):
+```yaml
+sized: ["mul:1m..100m/2"]
+```
+Each successive value is `floor(prev × factor)`. The factor must be > 1.0
+and can be fractional. Produces: `1m, 2m, 4m, 8m, 16m, 32m, 64m`.
+
+With a fractional factor: `"mul:10m..100m/1.5"` → `10m, 15m, 22500k,
+33750k, 50625k, 75937500` (values are `floor(prev × 1.5)`, named with
+the largest clean suffix).
+
+#### Profile naming
+
+Profile names are derived from the `base_count` value using the largest
+clean suffix: values divisible by 1B get `b` suffix, by 1M get `m`, by
+1K get `k`, otherwise the raw number is used. Examples: `10000000` →
+`"10m"`, `1500000` → `"1500k"`, `100000` → `"100k"`, `1234` → `"1234"`.
+
+#### Structured sized form with facet templates
+
+Instead of a simple list, `sized` can be a map with explicit facet
+templates that control how views are constructed for each expanded
+profile:
+
+```yaml
+profiles:
+  default:
+    maxk: 100
+    query_vectors: query_vectors.hvec
+  sized:
+    ranges: ["10m", "20m"]
+    facets:
+      base_vectors: "base_vectors.hvec:${range}"
+      metadata_content: "metadata.slab:${range}"
+      neighbor_indices: "profiles/${profile}/neighbor_indices.ivec"
+```
+
+Template variables:
+- `${profile}` — the expanded profile name (e.g., `"10m"`)
+- `${range}` — a window spec `[0..base_count]` for that profile
+
+This form is useful when different facets require different access
+patterns — some windowed into a shared file, others stored per-profile.
+
+#### Expansion ordering and inheritance
+
+- All sized entries are expanded, then sorted by `base_count` ascending.
+- Each expanded profile inherits views and `maxk` from the `default`
+  profile (same rules as §5.3 Profile group behavior).
+- `base_count` is set from the expanded value and is never inherited.
+- Sized profiles coexist with explicitly declared profiles. Explicit
+  profiles are not affected by the sized expansion.
+
+#### Complete example
+
+```yaml
+profiles:
+  default:
+    maxk: 100
+    base_vectors: base_vectors.hvec
+    query_vectors: query_vectors.hvec
+    neighbor_indices: neighbor_indices.ivec
+
+  sized: [10m, 20m, 100m..300m/100m]
+
+  custom-queries:
+    query_vectors: alt_queries.hvec
+    neighbor_indices: alt_indices.ivec
+```
+
+Expands to 7 profiles: `default`, `10m`, `20m`, `100m`, `200m`, `300m`,
+`custom-queries`. The sized profiles inherit all views from default and
+have `base_count` set. The explicit `custom-queries` profile is
+unaffected by sized expansion.
 
 ## 5.4 Upstream Pipeline Patterns
 
@@ -618,11 +742,19 @@ function resolve_profile(profiles_map, requested_name) -> ResolvedProfile:
            Else:
              Preserve the key as-is (custom facet).
 
-    2. SIZED EXPANSION (if "sized" key exists)
-       Parse the sized specification list.
-       For each size spec, expand to one or more profile entries:
-         - Set profile.base_count = expanded count
-         - Name the profile using the count with suffix (e.g., "10m")
+    2. SIZED EXPANSION (if "sized" key exists in profiles_map)
+       Parse the sized value (list or structured map form, see §5.3).
+       For each entry string, determine the expansion form:
+         a. Prefix "fib:" → fibonacci series (§5.3 form 4)
+         b. Prefix "mul:" → geometric series (§5.3 form 5)
+         c. Contains "/" with suffixed divisor → linear step (§5.3 form 2)
+         d. Contains "/" with bare-integer divisor → linear count (§5.3 form 3)
+         e. Otherwise → simple value (§5.3 form 1)
+       Expand each entry to (name, base_count) pairs.
+       If structured form with "facets" templates: interpolate ${profile}
+       and ${range} into each template per expanded profile.
+       Sort all expanded pairs by base_count ascending.
+       For each pair, create a profile with base_count set.
        Add all expanded profiles to profiles_map.
        Remove the "sized" key.
 

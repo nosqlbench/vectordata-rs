@@ -176,6 +176,58 @@ pub fn build_pipeline_command() -> Command {
     pipeline_cmd
 }
 
+/// Print pipeline help — either all commands or a specific group.
+///
+/// When `group` is `None`, lists all pipeline commands grouped by category.
+/// When `group` is `Some(name)`, lists commands in that group with summaries,
+/// or reports that the group is unknown.
+fn print_pipeline_help(registry: &CommandRegistry, group: Option<&str>) {
+    let paths = registry.command_paths();
+
+    // Group command paths by first word.
+    let mut groups: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
+    for path in &paths {
+        let mut parts = path.splitn(2, ' ');
+        let g = parts.next().unwrap().to_string();
+        let subname = parts.next().unwrap_or("").to_string();
+        let factory = registry.get(path).unwrap();
+        let summary = factory().command_doc().summary;
+        groups.entry(g).or_default().push((subname, summary));
+    }
+
+    match group {
+        None => {
+            println!("Execute a single pipeline command directly.\n");
+            println!("Usage: veks pipeline <group> <command> [--option=value ...]\n");
+            for (g, commands) in &groups {
+                println!("  {}:", g);
+                let max_len = commands.iter().map(|(n, _)| n.len()).max().unwrap_or(0);
+                for (subname, summary) in commands {
+                    println!("    {:<width$}  {}", subname, summary, width = max_len);
+                }
+                println!();
+            }
+            println!("Use 'veks pipeline <group> <command> --help' for detailed command documentation.");
+        }
+        Some(g) => {
+            if let Some(commands) = groups.get(g) {
+                println!("{} — pipeline command group\n", g);
+                let max_len = commands.iter().map(|(n, _)| n.len()).max().unwrap_or(0);
+                for (subname, summary) in commands {
+                    println!("  {:<width$}  {}", subname, summary, width = max_len);
+                }
+                println!("\nUse 'veks pipeline {} <command> --help' for detailed documentation.", g);
+            } else {
+                eprintln!("Unknown pipeline group: '{}'\n", g);
+                eprintln!("Available groups:");
+                for g in groups.keys() {
+                    eprintln!("  {}", g);
+                }
+            }
+        }
+    }
+}
+
 /// Completion candidates for `--governor`: lists strategy names with descriptions.
 pub fn governor_candidates() -> Vec<CompletionCandidate> {
     vec![
@@ -308,26 +360,51 @@ fn build_option_help(description: &str, type_name: &str, default: Option<&str>) 
 ///
 /// Parses the trailing argument list to identify the command path and its
 /// options, then creates a `StreamContext` and executes the command.
+///
+/// Help is handled at three levels:
+/// - `veks pipeline --help` / `veks pipeline` — list all pipeline commands
+/// - `veks pipeline <group> --help` — list commands in that group
+/// - `veks pipeline <group> <command> --help` — show command documentation
 pub fn run_direct(args: Vec<String>) {
+    let registry = CommandRegistry::with_builtins();
+
+    // No args, or bare --help: show all pipeline commands grouped.
+    if args.is_empty()
+        || (args.len() == 1 && (args[0] == "--help" || args[0] == "-h" || args[0] == "help"))
+    {
+        print_pipeline_help(&registry, None);
+        std::process::exit(0);
+    }
+
+    let group = &args[0];
+
+    // Group-level help: `veks pipeline compute --help` or `veks pipeline compute`
+    // when the second arg is --help/-h/help, or only one arg that is a valid group.
+    let is_help_request = args.len() >= 2
+        && (args[1] == "--help" || args[1] == "-h" || args[1] == "help");
+    let is_bare_group = args.len() == 1
+        && !group.starts_with('-')
+        && registry.command_paths().iter().any(|p| p.starts_with(&format!("{} ", group)));
+
+    if is_help_request || is_bare_group {
+        print_pipeline_help(&registry, Some(group));
+        std::process::exit(0);
+    }
+
     if args.len() < 2 {
         println!("Usage: veks pipeline <group> <command> [--option=value ...]");
         std::process::exit(1);
     }
 
-    let group = &args[0];
     let subcommand = &args[1];
     let command_path = format!("{} {}", group, subcommand);
-
-    let registry = CommandRegistry::with_builtins();
 
     let factory = match registry.get(&command_path) {
         Some(f) => f,
         None => {
-            println!("Unknown pipeline command: '{}'", command_path);
-            println!("Available commands:");
-            for path in registry.command_paths() {
-                println!("  {}", path);
-            }
+            eprintln!("Unknown pipeline command: '{}'", command_path);
+            eprintln!();
+            print_pipeline_help(&registry, Some(group));
             std::process::exit(1);
         }
     };
