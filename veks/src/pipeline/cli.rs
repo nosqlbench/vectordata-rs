@@ -268,13 +268,18 @@ pub fn variable_completer(current: &OsStr) -> Vec<CompletionCandidate> {
         return vec![];
     }
 
-    // Filter by partial match on the variable name portion.
+    // Only suggest variables when the user has started typing a variable
+    // reference. Otherwise return empty so bash falls back to filesystem
+    // completion via -o bashdefault.
     let filter = if let Some(rest) = partial.strip_prefix("'${variables:") {
         rest.trim_end_matches(['\'', '}'].as_ref())
     } else if let Some(rest) = partial.strip_prefix("${variables:") {
         rest.trim_end_matches('}')
-    } else {
+    } else if partial.starts_with('$') || partial.starts_with("'$") {
+        // Starting a variable reference but hasn't typed the full prefix yet
         ""
+    } else {
+        return vec![];
     };
 
     vars.iter()
@@ -326,6 +331,15 @@ pub fn run_direct(args: Vec<String>) {
             std::process::exit(1);
         }
     };
+
+    // Check for --help anywhere in args before parsing. This ensures help
+    // is shown even when other options are invalid or incomplete.
+    if args[2..].iter().any(|a| a == "--help" || a == "-h") {
+        let cmd = factory();
+        let doc = cmd.command_doc();
+        println!("{}", doc.body);
+        std::process::exit(0);
+    }
 
     // Collect resource names declared by this command for alias recognition.
     let cmd_instance = factory();
@@ -517,6 +531,11 @@ pub fn run_direct(args: Vec<String>) {
     if let Some(h) = resource_handle {
         let _ = h.join();
     }
+
+    // Drop ctx (including the UI handle) to restore the terminal before
+    // printing any messages. Without this, output goes to the alternate
+    // screen and is lost when the ratatui sink is dropped.
+    drop(ctx);
 
     println!("[{}] {}", result.status, result.message);
     if !result.produced.is_empty() {

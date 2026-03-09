@@ -285,7 +285,7 @@ pub fn run_pipeline(args: RunArgs) {
         .into_iter()
         .filter(|s| s.per_profile)
         .collect();
-    derive_sized_profile_views(&template_steps, &mut config.profiles);
+    config.profiles.derive_views_from_templates(&template_steps);
 
     // Insert barriers between profile groups (runtime injection, not in YAML)
     insert_profile_barriers(&mut expanded_steps, &config.profiles);
@@ -757,88 +757,8 @@ fn insert_profile_barriers(
 /// options and creates profile view entries using the filename stem as the view
 /// key and `profiles/{name}/{filename}` as the path. Existing explicit views
 /// are not overridden.
-fn derive_sized_profile_views(
-    templates: &[schema::StepDef],
-    profiles: &mut dataset::DSProfileGroup,
-) {
-    use dataset::profile::{DSView};
-    use dataset::source::{DSSource, DSWindow, DSInterval};
-
-    // Collect bare output filenames from templates
-    let template_outputs: Vec<String> = templates
-        .iter()
-        .filter(|s| s.per_profile)
-        .filter_map(|s| s.output_path())
-        .map(|p| p.strip_prefix("${profile_dir}").unwrap_or(&p).to_string())
-        .collect();
-
-    if template_outputs.is_empty() {
-        return;
-    }
-
-    for (name, profile) in profiles.0.iter_mut() {
-        // Skip profiles without base_count (except default)
-        if name != "default" && profile.base_count.is_none() {
-            continue;
-        }
-
-        let profile_dir = format!("profiles/{}/", name);
-
-        for filename in &template_outputs {
-            // Derive the view key from the filename stem
-            let path = std::path::Path::new(filename);
-            let stem = match path.file_stem().and_then(|s| s.to_str()) {
-                Some(s) => s.to_string(),
-                None => continue,
-            };
-
-            // Don't override explicitly declared views
-            if profile.views.contains_key(&stem) {
-                continue;
-            }
-
-            // For non-default sized profiles, reference the default profile's
-            // file with a window [0, base_count) instead of creating a
-            // separate extracted file.
-            if name != "default" {
-                if let Some(bc) = profile.base_count {
-                    let default_path = format!("profiles/default/{}", filename);
-                    let window = DSWindow(vec![DSInterval {
-                        min_incl: 0,
-                        max_excl: bc,
-                    }]);
-                    profile.views.insert(
-                        stem,
-                        DSView {
-                            source: DSSource {
-                                path: default_path,
-                                namespace: None,
-                                window,
-                            },
-                            window: None,
-                        },
-                    );
-                    continue;
-                }
-            }
-
-            // Default profile or profiles without base_count: use direct path
-            let resolved_path = format!("{}{}", profile_dir, filename);
-
-            profile.views.insert(
-                stem,
-                DSView {
-                    source: DSSource {
-                        path: resolved_path,
-                        namespace: None,
-                        window: Default::default(),
-                    },
-                    window: None,
-                },
-            );
-        }
-    }
-}
+// `derive_sized_profile_views` logic is now in
+// `DSProfileGroup::derive_views_from_templates` in the dataset crate.
 
 /// Emit the pipeline as a sequence of `veks pipeline` CLI commands to stdout.
 ///
@@ -1734,7 +1654,7 @@ default:
                 ("output", "neighbor_indices.ivec"),
             ]),
         ];
-        derive_sized_profile_views(&templates, &mut profiles);
+        profiles.derive_views_from_templates(&templates);
 
         // Default gets auto-derived views (no explicit base_vectors view)
         let pdef = profiles.profile("default").unwrap();

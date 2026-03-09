@@ -125,8 +125,7 @@ fn print_bash_completions() {
     else
         local _CLAP_COMPLETE_SPACE=true
     fi
-    # Use fish format to get value\tdescription pairs, then convert
-    # to bash COMPREPLY with # comment description entries.
+    # Use fish format to get value\tdescription pairs.
     local raw
     raw=$( \
         _CLAP_IFS=$'\013' \
@@ -145,10 +144,6 @@ fn print_bash_completions() {
     while IFS=$'\t' read -r _val _desc; do
         [[ -z "$_val" ]] && continue
         COMPREPLY+=("$_val")
-        # Add description as # comment (skip entries already starting with #)
-        if [[ -n "$_desc" ]] && [[ "$_val" != \#* ]]; then
-            COMPREPLY+=("$(printf '# %s - %s' "$_val" "$_desc")")
-        fi
         if [[ "$_val" =~ [=/:]$ ]]; then
             _has_nospace=true
         fi

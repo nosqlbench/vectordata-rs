@@ -62,12 +62,38 @@ impl RatatuiSink {
 
     /// Create a new ratatui-based sink with a custom redraw interval.
     pub fn with_redraw_interval(inline_height: u16, redraw_interval: Duration) -> io::Result<Self> {
+        // Install a panic hook that restores the terminal before printing
+        // the panic message. Without this, a panic leaves the terminal in
+        // raw/alternate screen mode and the error message is invisible.
+        let default_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let _ = disable_raw_mode();
+            let mut stdout = io::stdout();
+            let _ = crossterm::execute!(
+                stdout,
+                crossterm::terminal::LeaveAlternateScreen,
+                cursor::Show,
+            );
+            let _ = io::Write::flush(&mut stdout);
+            default_hook(info);
+        }));
+
         let (tx, rx) = mpsc::channel::<RenderMsg>();
 
         let handle = thread::Builder::new()
             .name("ratatui-render".into())
             .spawn(move || {
                 if let Err(e) = render_loop(rx, inline_height, redraw_interval) {
+                    // Unconditionally restore terminal state — render_loop may
+                    // have entered raw/alternate screen before the error.
+                    let _ = disable_raw_mode();
+                    let mut stdout = io::stdout();
+                    let _ = crossterm::execute!(
+                        stdout,
+                        crossterm::terminal::LeaveAlternateScreen,
+                        cursor::Show,
+                    );
+                    let _ = io::Write::flush(&mut stdout);
                     eprintln!("ratatui render error: {}", e);
                 }
             })

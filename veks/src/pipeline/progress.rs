@@ -247,11 +247,27 @@ impl ProgressLog {
         // completion time, the step is stale.
         if let Some(current) = current_options {
             let completed = record.completed_at;
+            // Use sub-second precision to avoid false positives when files
+            // are written in the same second as step completion.
+            let completed_nanos = completed.timestamp_nanos_opt().unwrap_or(
+                completed.timestamp() as i64 * 1_000_000_000
+            );
             let completed_systime = std::time::SystemTime::UNIX_EPOCH
-                + std::time::Duration::from_secs(completed.timestamp() as u64);
+                + std::time::Duration::from_nanos(completed_nanos as u64);
+
+            // Collect recorded output paths so we can skip them in the mtime
+            // check.  Options like "indices" and "distances" are outputs even
+            // though they are not named "output".
+            let output_paths: std::collections::HashSet<&str> = record
+                .outputs
+                .iter()
+                .map(|o| o.path.as_str())
+                .collect();
+
             for (key, value) in current {
-                // Skip "output" — that's what we produce, not what we consume
-                if key == "output" {
+                // Skip options whose values match a recorded output path —
+                // those are produced by this step, not consumed.
+                if key == "output" || output_paths.contains(value.as_str()) {
                     continue;
                 }
                 let path = resolve_path(value, workspace);
@@ -513,6 +529,132 @@ mod tests {
         let reason = log.check_step_freshness("knn", Some(&opts), None);
         assert!(reason.is_some(), "expected stale due to input mtime");
         assert!(reason.unwrap().contains("input"), "reason should mention input");
+    }
+
+    #[test]
+    fn test_check_step_freshness_output_option_not_treated_as_input() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let input_path = tmp_dir.path().join("input.fvec");
+        let indices_path = tmp_dir.path().join("indices.ivec");
+        let distances_path = tmp_dir.path().join("distances.fvec");
+
+        // Create all files
+        std::fs::write(&input_path, "data").unwrap();
+        std::fs::write(&indices_path, "result").unwrap();
+        std::fs::write(&distances_path, "result").unwrap();
+
+        // Record step as completed in the past. The output files ("indices"
+        // and "distances") are recorded as produced outputs even though they
+        // are not named "output".
+        let mut log = ProgressLog::new();
+        let past = Utc::now() - chrono::Duration::seconds(60);
+        log.record_step(
+            "knn",
+            StepRecord {
+                status: Status::Ok,
+                message: "ok".to_string(),
+                completed_at: past,
+                elapsed_secs: 1.0,
+                outputs: vec![
+                    OutputRecord {
+                        path: indices_path.to_string_lossy().into_owned(),
+                        size: 6,
+                        mtime: None,
+                    },
+                    OutputRecord {
+                        path: distances_path.to_string_lossy().into_owned(),
+                        size: 6,
+                        mtime: None,
+                    },
+                ],
+                resolved_options: {
+                    let mut m = HashMap::new();
+                    m.insert("base".to_string(), input_path.to_string_lossy().into_owned());
+                    m.insert("indices".to_string(), indices_path.to_string_lossy().into_owned());
+                    m.insert("distances".to_string(), distances_path.to_string_lossy().into_owned());
+                    m
+                },
+                error: None,
+                resource_summary: None,
+            },
+        );
+
+        // The indices and distances files were just created (mtime = now),
+        // which is newer than completed_at (60s ago). Without the fix, these
+        // would falsely trigger "input is newer than last run".
+        let opts: HashMap<String, String> = [
+            ("base".to_string(), input_path.to_string_lossy().into_owned()),
+            ("indices".to_string(), indices_path.to_string_lossy().into_owned()),
+            ("distances".to_string(), distances_path.to_string_lossy().into_owned()),
+        ].into_iter().collect();
+
+        let reason = log.check_step_freshness("knn", Some(&opts), None);
+        // The input file (base) IS newer, so the step should be stale for
+        // that reason. But indices and distances should NOT trigger staleness.
+        assert!(reason.is_some(), "expected stale due to input mtime");
+        let reason_str = reason.unwrap();
+        assert!(reason_str.contains("base"), "reason should mention 'base', got: {}", reason_str);
+        assert!(!reason_str.contains("indices"), "indices should not be treated as input");
+        assert!(!reason_str.contains("distances"), "distances should not be treated as input");
+    }
+
+    #[test]
+    fn test_check_step_freshness_output_files_skipped_even_when_newer() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let indices_path = tmp_dir.path().join("indices.ivec");
+        let distances_path = tmp_dir.path().join("distances.fvec");
+
+        // Create output files (mtime = now)
+        std::fs::write(&indices_path, "result").unwrap();
+        std::fs::write(&distances_path, "result").unwrap();
+
+        // Record step as completed in the past with only output files
+        // (no true input files). The step should be FRESH because the
+        // output files should not be checked as inputs.
+        let mut log = ProgressLog::new();
+        let past = Utc::now() - chrono::Duration::seconds(60);
+        log.record_step(
+            "knn",
+            StepRecord {
+                status: Status::Ok,
+                message: "ok".to_string(),
+                completed_at: past,
+                elapsed_secs: 1.0,
+                outputs: vec![
+                    OutputRecord {
+                        path: indices_path.to_string_lossy().into_owned(),
+                        size: 6,
+                        mtime: None,
+                    },
+                    OutputRecord {
+                        path: distances_path.to_string_lossy().into_owned(),
+                        size: 6,
+                        mtime: None,
+                    },
+                ],
+                resolved_options: {
+                    let mut m = HashMap::new();
+                    m.insert("indices".to_string(), indices_path.to_string_lossy().into_owned());
+                    m.insert("distances".to_string(), distances_path.to_string_lossy().into_owned());
+                    m.insert("neighbors".to_string(), "100".to_string());
+                    m.insert("metric".to_string(), "L2".to_string());
+                    m
+                },
+                error: None,
+                resource_summary: None,
+            },
+        );
+
+        let opts: HashMap<String, String> = [
+            ("indices".to_string(), indices_path.to_string_lossy().into_owned()),
+            ("distances".to_string(), distances_path.to_string_lossy().into_owned()),
+            ("neighbors".to_string(), "100".to_string()),
+            ("metric".to_string(), "L2".to_string()),
+        ].into_iter().collect();
+
+        // Should be FRESH — output files are not treated as inputs
+        let reason = log.check_step_freshness("knn", Some(&opts), None);
+        assert!(reason.is_none(), "expected fresh but got: {:?}", reason);
     }
 
     #[test]

@@ -3,26 +3,43 @@
 
 # 05 — Dataset Specification
 
+This document is the normative reference for implementing dataset access in any
+language or system. It specifies the `dataset.yaml` manifest format, the profile
+resolution algorithm, the data file formats, and the protocol for local and
+remote dataset access. A conforming implementation must be able to load a
+`dataset.yaml`, resolve any named profile, and read the data files referenced by
+that profile's views — whether those files are on a local filesystem or served
+over HTTP.
+
+---
+
 ## 5.1 dataset.yaml Schema
 
-The dataset.yaml file is the canonical descriptor for a vector dataset.
+The `dataset.yaml` file is the canonical descriptor for a vector dataset.
 It defines provenance, upstream preparation steps, and output profiles.
 
 ### Top-level fields
 
 ```yaml
-name: <string>           # Dataset identifier
-description: <string>    # Human-readable description
+name: <string>           # Dataset identifier (required)
+description: <string>    # Human-readable description (optional)
 
 upstream:                 # Optional: data preparation pipeline
   steps: [...]
 
-profiles:                 # Named facet mappings
+profiles:                 # Named facet mappings (required for access)
   default:
     base_vectors: <path>
     query_vectors: <path>
     ...
 ```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `name` | string | Yes | Dataset identifier |
+| `description` | string | No | Human-readable description |
+| `upstream` | object | No | Pipeline configuration for producing data files |
+| `profiles` | map | Yes | Named profiles mapping facet keys to data views |
 
 ### Step definition
 
@@ -330,6 +347,33 @@ When `per_profile` steps are expanded, sized profiles automatically receive
 window-based views referencing the default profile's files rather than
 creating separate extracted copies.
 
+### Sized profile expansion (`sized` key)
+
+Instead of declaring each sized profile individually, use the `sized` key
+with a list of size specifications:
+
+```yaml
+profiles:
+  default:
+    maxk: 100
+    query_vectors: query_vectors.hvec
+  sized: [10m, 20m, 100m..400m/100m]
+```
+
+This expands to profiles named `10m`, `20m`, `100m`, `200m`, `300m`, `400m`,
+each with `base_count` set and inheriting from `default`. Profiles are sorted
+smallest to largest.
+
+**Sized entry forms**:
+
+| Form | Example | Expansion |
+|------|---------|-----------|
+| Simple value | `10m` | One profile with `base_count: 10000000` |
+| Linear range (step) | `100m..400m/100m` | Profiles at each absolute step (100m, 200m, 300m, 400m) |
+| Linear range (count) | `0m..400m/10` | 10 equal divisions (bare number = count) |
+| Fibonacci | `fib:1m..400m` | Fibonacci multiples of start within range |
+| Geometric | `mul:1m..400m/2` | Compound by factor (doubling, tripling, etc.) |
+
 ## 5.4 Upstream Pipeline Patterns
 
 ### Basic KNN dataset
@@ -494,3 +538,412 @@ re-executions (to fill in missing pieces or extend the dataset) can skip
 already-cached segments. Deleting cache forces full recomputation of all
 intermediate stages and should be treated as a significant operational
 decision, not routine cleanup.
+
+---
+
+## 5.8 Implementor's Guide: Dataset Discovery and Access
+
+This section specifies the exact algorithm that any client system must
+follow to load a dataset, resolve a profile, and access data files. It is
+the normative reference for implementing dataset access in any language.
+
+### 5.8.1 Dataset discovery
+
+A dataset is identified by a **root location** — either a local filesystem
+directory or an HTTP(S) base URL. The manifest is always named
+`dataset.yaml` within that root.
+
+**Local filesystem**:
+```
+root = /path/to/dataset-name/
+manifest = root + "dataset.yaml"
+```
+
+**Remote HTTP(S)**:
+```
+root = https://host/path/to/dataset-name/
+manifest = root + "dataset.yaml"
+```
+
+If the caller provides a path ending in `.yaml` or `.yml`, treat it as the
+manifest directly and derive the root as its parent directory/URL.
+
+If the caller provides a bare directory path or URL (no `.yaml` suffix),
+append `dataset.yaml` to locate the manifest. For URLs, ensure the path
+ends with `/` before appending.
+
+**Loading**:
+1. Read the manifest content (local `read_to_string`, or HTTP GET).
+2. Parse as YAML into the top-level schema (§5.1).
+3. Resolve the `profiles` section using the profile resolution algorithm
+   (§5.8.3).
+
+### 5.8.2 Resolved view model
+
+After parsing and profile resolution, each view resolves to this canonical
+form:
+
+```
+ResolvedView {
+    source_path: String,          // relative path to data file
+    namespace:   Option<String>,  // slab namespace (if applicable)
+    window:      List<Interval>,  // half-open record ranges; empty = all
+}
+
+Interval {
+    min_incl: u64,                // inclusive lower bound
+    max_excl: u64,                // exclusive upper bound
+}
+```
+
+The `source_path` is always relative to the dataset root. To access the
+file:
+- **Local**: join the root directory path with `source_path`.
+- **Remote**: resolve `source_path` against the root URL (standard URL
+  resolution).
+
+### 5.8.3 Profile resolution algorithm
+
+Given a requested profile name (default: `"default"`), resolve a complete
+set of views as follows:
+
+```
+function resolve_profile(profiles_map, requested_name) -> ResolvedProfile:
+
+    1. ALIAS NORMALIZATION
+       For every profile in profiles_map:
+         For every view key in the profile:
+           If the key matches a known alias (§5.3 Facet key aliases):
+             Replace the key with the canonical facet name.
+           Else:
+             Preserve the key as-is (custom facet).
+
+    2. SIZED EXPANSION (if "sized" key exists)
+       Parse the sized specification list.
+       For each size spec, expand to one or more profile entries:
+         - Set profile.base_count = expanded count
+         - Name the profile using the count with suffix (e.g., "10m")
+       Add all expanded profiles to profiles_map.
+       Remove the "sized" key.
+
+    3. SUGAR DESUGARING
+       For every view value in every profile:
+         If the value is a bare string:
+           Parse using the sugar grammar (§5.3 View sugar forms):
+             a. Check for bracket/paren window suffix → extract window
+             b. Check for colon-delimited namespace → extract namespace
+             c. Remaining text = source path
+           Convert to canonical form: { source, namespace?, window? }
+         If the value is a map:
+           Accept "source" or "path" for the file path.
+           Accept "namespace" or "ns" for the namespace.
+           Parse "window" if present (string, number, or list form).
+
+    4. INHERITANCE
+       Let default_profile = profiles_map["default"] (may not exist).
+       Let target = profiles_map[requested_name].
+       If target is not "default" AND default_profile exists:
+         For each view in default_profile:
+           If target does NOT have a view with the same key:
+             Copy the view into target (inherited).
+         If target.maxk is not set AND default_profile.maxk is set:
+           Copy default_profile.maxk into target.
+         NOTE: base_count is NEVER inherited.
+
+    5. WINDOW RESOLUTION
+       For each view in target:
+         If the view has a view-level window override:
+           Use the view-level window (takes precedence).
+         Else if the source has an inline window:
+           Use the source window.
+         Else:
+           Window is empty (meaning: all records).
+
+    6. Return the resolved profile with all views in canonical form.
+```
+
+**Ordering**: Steps 1-3 happen during YAML deserialization. Step 4 happens
+as a post-deserialization pass. Step 5 is evaluated at access time.
+
+### 5.8.4 Data file formats
+
+All data files use simple binary layouts designed for O(1) random access
+by record ordinal. The format is determined by file extension.
+
+#### xvec family (fixed-dimension vectors)
+
+Each record is:
+```
+[dimension: i32 LE][element_0 .. element_{dim-1}: T]
+```
+
+| Extension | Element type | Element size | Record size |
+|-----------|-------------|--------------|-------------|
+| `.fvec` | f32 (IEEE 754) | 4 bytes | `4 + dim × 4` |
+| `.ivec` | i32 (signed) | 4 bytes | `4 + dim × 4` |
+| `.bvec` | u8 | 1 byte | `4 + dim × 1` |
+| `.dvec` | f64 (IEEE 754) | 8 bytes | `4 + dim × 8` |
+| `.hvec` | f16 (IEEE 754) | 2 bytes | `4 + dim × 2` |
+| `.svec` | i16 (signed) | 2 bytes | `4 + dim × 2` |
+
+**Key properties**:
+- The dimension prefix is repeated before every record (not just once at
+  file start). Every record is self-describing.
+- All multi-byte values are little-endian.
+- Record count = `file_size / record_size`. If `file_size` is not evenly
+  divisible, the file is corrupt.
+- To read record at ordinal N: seek to `N × record_size`, read
+  `record_size` bytes, extract dimension from first 4 bytes, then read
+  `dim` elements.
+
+**Dimension detection**: Read the first 4 bytes of the file as `i32 LE`.
+This gives the dimension. Compute `record_size = 4 + dim × element_size`.
+Compute `count = file_size / record_size`.
+
+#### Slab format (.slab)
+
+Page-aligned record container for variable-length records (MNode, PNode,
+bitmaps, etc.). See document 02 for the full physical layout. Key points
+for implementors:
+
+- Records are addressed by sequential ordinal (0-based).
+- The PagesPage (last page in file) contains the page index.
+- Binary-search the page index to find which page holds ordinal N.
+- Each page has a directory of `(offset, length)` entries for its records.
+- Optional namespace support: a slab file may contain multiple independent
+  record streams, each addressed by a string namespace.
+
+#### MNode / PNode binary formats
+
+MNode (metadata) and PNode (predicate) are self-describing binary records
+stored inside slab files. See document 02 for wire format details.
+Implementations that only need vector and index access can treat slab
+facets as opaque and skip MNode/PNode decoding.
+
+### 5.8.5 Windowed access
+
+When a view specifies a window (list of half-open intervals), the
+implementation must restrict record access to only the specified ranges.
+
+**For xvec files**: Map the logical ordinal to the physical ordinal within
+the windowed ranges. For a single interval `[min, max)`:
+- Logical ordinal 0 maps to physical ordinal `min`.
+- Logical ordinal `N` maps to physical ordinal `min + N`.
+- Total logical count = `max - min`.
+- Seek to `(min + N) × record_size` in the file.
+
+**For multi-interval windows**: The logical ordinal space is the
+concatenation of all intervals in order. To resolve logical ordinal `N`:
+1. Walk intervals in order, accumulating counts.
+2. When the cumulative count exceeds `N`, the current interval contains
+   the target. Physical ordinal = `interval.min + (N - prior_count)`.
+3. Total logical count = sum of `(max - min)` across all intervals.
+
+**For slab files**: Windows restrict which ordinals are accessible.
+Apply the same logical-to-physical mapping when requesting records.
+
+### 5.8.6 Remote access protocol
+
+Remote datasets are served as static files over HTTP(S). No special server
+is required — any static file server or object store (S3, GCS, etc.)
+that supports Range requests is sufficient.
+
+#### Manifest retrieval
+
+```
+GET {root_url}/dataset.yaml
+```
+
+Returns the full YAML manifest. Parse identically to a local file.
+
+#### Data file access
+
+For each view's `source_path`, the data file URL is:
+```
+file_url = root_url + source_path
+```
+
+(Standard URL resolution. If `source_path` is relative, it resolves
+against `root_url`.)
+
+#### Dimension and count detection (xvec)
+
+To determine dimension and count without downloading the full file:
+
+1. **HEAD request** → get `Content-Length` header for total file size.
+2. **Range request for header**:
+   ```
+   GET {file_url}
+   Range: bytes=0-3
+   ```
+   Returns the first 4 bytes (dimension as `i32 LE`).
+3. Compute `record_size = 4 + dim × element_size`.
+4. Compute `count = content_length / record_size`.
+
+#### Single-record fetch (xvec)
+
+To read record at ordinal N:
+```
+byte_offset = N × record_size
+GET {file_url}
+Range: bytes={byte_offset}-{byte_offset + record_size - 1}
+```
+
+Implementations should batch nearby records into larger Range requests
+when sequential access patterns are detected.
+
+#### Connection pooling
+
+HTTP clients must reuse connections (HTTP/1.1 keep-alive or HTTP/2
+multiplexing). Creating a new TCP+TLS connection per record is not
+acceptable for performance.
+
+#### Integrity verification (Merkle)
+
+For each data file, a companion `.mref` file may exist at `{file_url}.mref`
+containing a Merkle tree of SHA-256 chunk hashes. See document 09 for the
+Merkle wire format. When `.mref` files are present, implementations should:
+
+1. Fetch `{file_url}.mref` and parse the Merkle reference tree.
+2. Download data in chunk-sized units matching the tree's `chunk_size`.
+3. Verify each chunk's SHA-256 hash against the corresponding leaf hash.
+4. Track verification state locally in a `.mrkl` file for crash recovery.
+
+This is optional for read-only clients that trust the transport layer
+but required for caching clients that persist data locally.
+
+### 5.8.7 Facet manifest and discovery
+
+A conforming implementation should expose a **facet manifest** that lists
+all facets in a resolved profile without materializing data. For each
+facet, the manifest reports:
+
+| Field | Description |
+|-------|-------------|
+| `name` | Canonical facet key (after alias resolution) |
+| `source_path` | File path from the view |
+| `source_type` | Inferred format (from file extension: `fvec`, `ivec`, `hvec`, `slab`, etc.) |
+| `is_standard` | Whether this matches one of the 10 standard facets |
+
+This enables "discover then load" patterns where a client enumerates
+available facets before deciding which to materialize.
+
+### 5.8.8 Implementation checklist
+
+A conforming dataset access implementation must support:
+
+| Capability | Required | Notes |
+|------------|----------|-------|
+| Parse `dataset.yaml` | Yes | Full schema per §5.1 |
+| Alias resolution | Yes | All aliases per §5.3 |
+| Sugar desugaring (bare string, inline window, inline namespace) | Yes | All forms per §5.3 |
+| Profile inheritance from `default` | Yes | Views + `maxk`, not `base_count` |
+| Window parsing (all range forms + suffixes) | Yes | All forms per §5.3 |
+| Windowed record access | Yes | Single and multi-interval |
+| xvec format reading (fvec, ivec at minimum) | Yes | hvec, bvec, dvec, svec recommended |
+| Custom facet preservation | Yes | Non-standard keys pass through |
+| Remote manifest fetch (HTTP GET) | Recommended | Required for remote datasets |
+| Remote data access (HTTP Range) | Recommended | Required for remote datasets |
+| Slab format reading | Optional | Required only for metadata facets |
+| MNode/PNode decoding | Optional | Required only for predicated datasets |
+| Merkle verification | Optional | Required for cached/offline access |
+| Sized profile expansion | Optional | Required for `sized` key support |
+| Facet manifest (discovery API) | Recommended | Enables generic tooling |
+
+### 5.8.9 Reference implementations
+
+| Language | Module | Scope |
+|----------|--------|-------|
+| Rust | `dataset` crate | YAML parsing, profiles, views, aliases, windows, sized expansion |
+| Rust | `vectordata` crate | VectorReader trait, mmap/HTTP backends, facet manifest, Merkle |
+| Java | `datatools-vectordata` | Full access layer with Merkle, caching, transport |
+
+### 5.8.10 Worked example: resolving a profile
+
+Given this `dataset.yaml`:
+
+```yaml
+name: example-768
+description: 768-dim float vectors with metadata
+
+profiles:
+  default:
+    maxk: 100
+    base: base_vectors.fvec
+    query: query_vectors.fvec
+    indices: gnd/idx.ivec
+    distances: gnd/dis.fvec
+    metadata_content: "metadata.slab:content"
+    model_config: model.json
+
+  1m:
+    base_count: 1M
+    base: "base_vectors.fvec[0..1M]"
+    indices: gnd/idx_1m.ivec
+    distances: gnd/dis_1m.fvec
+```
+
+**Resolving profile `"1m"`**:
+
+Step 1 — Alias normalization:
+```
+"base"      → "base_vectors"
+"query"     → "query_vectors"
+"indices"   → "neighbor_indices"
+"distances" → "neighbor_distances"
+"model_config" → preserved (custom facet)
+```
+
+Step 3 — Sugar desugaring:
+```
+default.base_vectors:      { source: "base_vectors.fvec" }
+default.query_vectors:     { source: "query_vectors.fvec" }
+default.neighbor_indices:  { source: "gnd/idx.ivec" }
+default.neighbor_distances: { source: "gnd/dis.fvec" }
+default.metadata_content:  { source: "metadata.slab", namespace: "content" }
+default.model_config:      { source: "model.json" }
+
+1m.base_vectors:           { source: "base_vectors.fvec", window: [0..1000000) }
+1m.neighbor_indices:       { source: "gnd/idx_1m.ivec" }
+1m.neighbor_distances:     { source: "gnd/dis_1m.fvec" }
+```
+
+Step 4 — Inheritance (1m inherits from default):
+```
+1m.base_vectors:            { source: "base_vectors.fvec", window: [0..1000000) }  — declared
+1m.query_vectors:           { source: "query_vectors.fvec" }                        — inherited
+1m.neighbor_indices:        { source: "gnd/idx_1m.ivec" }                           — declared (overrides)
+1m.neighbor_distances:      { source: "gnd/dis_1m.fvec" }                           — declared (overrides)
+1m.metadata_content:        { source: "metadata.slab", namespace: "content" }       — inherited
+1m.model_config:            { source: "model.json" }                                — inherited (custom)
+1m.maxk:                    100                                                     — inherited
+1m.base_count:              1000000                                                 — declared (never inherited)
+```
+
+**Reading `base_vectors` for profile `1m`** (local):
+```
+file = /path/to/example-768/base_vectors.fvec
+dim  = read_i32_le(file, offset=0)        → 768
+record_size = 4 + 768 × 4                 → 3076 bytes
+window = [0, 1000000)
+logical_count = 1000000
+To read logical ordinal 500:
+  physical ordinal = 0 + 500 = 500
+  seek to 500 × 3076 = 1538000
+  read 3076 bytes
+```
+
+**Reading `base_vectors` for profile `1m`** (remote):
+```
+url = https://host/example-768/base_vectors.fvec
+
+# Detect dimension
+HEAD url → Content-Length: 307600000076  (hypothetical)
+GET url, Range: bytes=0-3 → dim = 768
+record_size = 3076
+
+# Read logical ordinal 500 (window [0, 1000000))
+byte_offset = 500 × 3076 = 1538000
+GET url, Range: bytes=1538000-1540075
+→ parse: skip first 4 bytes (dim), read 768 × f32 LE
+```

@@ -216,6 +216,102 @@ impl DSProfileGroup {
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
+
+    /// Derive views for sized profiles from per-profile template step outputs.
+    ///
+    /// For each `per_profile` template step, collects the output filename and
+    /// creates views in every profile:
+    ///
+    /// - **default**: a direct view pointing to `profiles/default/{filename}`
+    /// - **sized profiles** (with `base_count`): a windowed view referencing
+    ///   `profiles/default/{filename}` with window `[0, base_count)`
+    ///
+    /// Explicitly declared views are never overridden. This mirrors the
+    /// expansion rules used by the upstream pipeline so that consumers of
+    /// the dataset crate see the same profile structure without needing the
+    /// pipeline runtime.
+    pub fn derive_views_from_templates(&mut self, templates: &[crate::pipeline::StepDef]) {
+        use crate::source::{DSInterval, DSSource, DSWindow};
+
+        // Collect bare output filenames from per_profile templates
+        let template_outputs: Vec<String> = templates
+            .iter()
+            .filter(|s| s.per_profile)
+            .filter_map(|s| s.output_path())
+            .map(|p| {
+                p.strip_prefix("${profile_dir}")
+                    .unwrap_or(&p)
+                    .to_string()
+            })
+            .collect();
+
+        if template_outputs.is_empty() {
+            return;
+        }
+
+        for (name, profile) in self.0.iter_mut() {
+            // Skip profiles without base_count (except default)
+            if name != "default" && profile.base_count.is_none() {
+                continue;
+            }
+
+            let profile_dir = format!("profiles/{}/", name);
+
+            for filename in &template_outputs {
+                // Derive the view key from the filename stem
+                let path = std::path::Path::new(filename);
+                let stem = match path.file_stem().and_then(|s| s.to_str()) {
+                    Some(s) => s.to_string(),
+                    None => continue,
+                };
+
+                // Don't override explicitly declared views
+                if profile.views.contains_key(&stem) {
+                    continue;
+                }
+
+                // For non-default sized profiles, reference the default profile's
+                // file with a window [0, base_count) instead of creating a
+                // separate extracted file.
+                if name != "default" {
+                    if let Some(bc) = profile.base_count {
+                        let default_path = format!("profiles/default/{}", filename);
+                        let window = DSWindow(vec![DSInterval {
+                            min_incl: 0,
+                            max_excl: bc,
+                        }]);
+                        profile.views.insert(
+                            stem,
+                            DSView {
+                                source: DSSource {
+                                    path: default_path,
+                                    namespace: None,
+                                    window,
+                                },
+                                window: None,
+                            },
+                        );
+                        continue;
+                    }
+                }
+
+                // Default profile or profiles without base_count: use direct path
+                let resolved_path = format!("{}{}", profile_dir, filename);
+
+                profile.views.insert(
+                    stem,
+                    DSView {
+                        source: DSSource {
+                            path: resolved_path,
+                            namespace: None,
+                            window: Default::default(),
+                        },
+                        window: None,
+                    },
+                );
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1132,5 +1228,86 @@ sized: ["mul:1m..16m/2"]
         let names = g.profile_names();
         // default + 1m, 2m, 4m, 8m, 16m
         assert_eq!(names, vec!["default", "1m", "2m", "4m", "8m", "16m"]);
+    }
+
+    #[test]
+    fn test_derive_views_from_templates() {
+        use crate::pipeline::StepDef;
+        use indexmap::IndexMap;
+
+        let yaml = r#"
+default:
+  query_vectors: query.hvec
+10m:
+  base_count: 10000000
+"#;
+        let mut profiles: DSProfileGroup = serde_yaml::from_str(yaml).unwrap();
+
+        // Build template steps with per_profile: true
+        let mut opts1 = IndexMap::new();
+        opts1.insert(
+            "output".to_string(),
+            serde_yaml::Value::String("base_vectors.hvec".to_string()),
+        );
+        let mut opts2 = IndexMap::new();
+        opts2.insert(
+            "output".to_string(),
+            serde_yaml::Value::String("neighbor_indices.ivec".to_string()),
+        );
+        let templates = vec![
+            StepDef {
+                id: Some("extract".to_string()),
+                run: "generate hvec-extract".to_string(),
+                description: None,
+                after: vec![],
+                profiles: vec![],
+                per_profile: true,
+                on_partial: crate::pipeline::OnPartial::default(),
+                options: opts1,
+            },
+            StepDef {
+                id: Some("knn".to_string()),
+                run: "compute knn".to_string(),
+                description: None,
+                after: vec![],
+                profiles: vec![],
+                per_profile: true,
+                on_partial: crate::pipeline::OnPartial::default(),
+                options: opts2,
+            },
+        ];
+        profiles.derive_views_from_templates(&templates);
+
+        // Default gets auto-derived views
+        let pdef = profiles.profile("default").unwrap();
+        assert_eq!(
+            pdef.view("base_vectors").unwrap().path(),
+            "profiles/default/base_vectors.hvec"
+        );
+        assert_eq!(
+            pdef.view("neighbor_indices").unwrap().path(),
+            "profiles/default/neighbor_indices.ivec"
+        );
+        // Explicit view preserved
+        assert_eq!(pdef.view("query_vectors").unwrap().path(), "query.hvec");
+
+        // Sized profile gets windowed views referencing default's files
+        let p10 = profiles.profile("10m").unwrap();
+        assert_eq!(
+            p10.view("base_vectors").unwrap().path(),
+            "profiles/default/base_vectors.hvec"
+        );
+        assert!(!p10.view("base_vectors").unwrap().source.window.is_empty());
+        assert_eq!(
+            p10.view("base_vectors").unwrap().source.window.0[0].max_excl,
+            10_000_000
+        );
+        assert_eq!(
+            p10.view("neighbor_indices").unwrap().path(),
+            "profiles/default/neighbor_indices.ivec"
+        );
+        assert!(!p10.view("neighbor_indices").unwrap().source.window.is_empty());
+        // Inherited shared view unchanged
+        assert_eq!(p10.view("query_vectors").unwrap().path(), "query.hvec");
     }
 }
