@@ -33,9 +33,11 @@ Each step in the pipeline goes through:
 1. **Option interpolation** — Variables like `${scratch}` are resolved from
    context defaults and workspace paths.
 
-2. **Freshness check** — The progress log is consulted. If the step was
-   previously recorded as OK, outputs exist with matching sizes, and resolved
-   options are unchanged, the step is **skipped**.
+2. **Freshness check** — The progress log is consulted. A step is skipped
+   only when all of: status is OK, outputs exist with matching sizes, resolved
+   options are unchanged, and no input file has a modification time newer than
+   the step's completion timestamp. If stale, the reason is logged (e.g.,
+   "stale: input 'source' (base_vectors.hvec) is newer than last run").
 
 3. **Command resolution** — The `run` field (e.g., `"compute knn"`) is looked
    up in the `CommandRegistry` to find the factory function.
@@ -50,16 +52,28 @@ Each step in the pipeline goes through:
    verified. Missing required options with no defaults cause an error (or a
    dry-run warning).
 
-6. **Execution** — `cmd.execute(&options, &mut ctx)` is called. The command
+6. **Buffer-write setup** — If the artifact is `Absent` (or `Partial` with
+   restart), the runner rewrites the `output` option to a `_buffer` path
+   (e.g., `data.slab` → `data_buffer.slab`). The command writes to the buffer
+   path without knowing it. This prevents partially-written files from being
+   mistaken for valid artifacts by other processes or a re-run after a crash.
+
+7. **Execution** — `cmd.execute(&options, &mut ctx)` is called. The command
    has full control during execution.
 
-7. **Result recording** — The `CommandResult` (status, message, produced
+8. **Buffer-write commit** — On success (status Ok or Warning), the runner
+   renames the buffer file to the final output path. This is an atomic
+   filesystem operation, so the final path either contains the complete
+   artifact or does not exist. On error, the buffer is left in place for
+   diagnostics and cleaned up on the next run.
+
+9. **Result recording** — The `CommandResult` (status, message, produced
    files, elapsed time) is recorded in the progress log.
 
-8. **Post-execution check** — If the step declares an output, its artifact
-   state is re-checked. A non-`Complete` state generates a warning.
+10. **Post-execution check** — The artifact state of the final output path
+    is re-checked. A non-`Complete` state is an error.
 
-9. **Progress save** — The progress log is atomically persisted to disk.
+11. **Progress save** — The progress log is atomically persisted to disk.
 
 ## 3.3 StreamContext
 
@@ -86,17 +100,37 @@ pub struct StreamContext {
 - **scratch**: `${workspace}/.scratch/` — temporary files that can be
   deleted after a successful pipeline run. Scratch data is truly disposable.
 - **cache**: `${workspace}/.cache/` — persistent intermediates that survive
-  across runs. Used by partitioned KNN and segmented predicate-key generation.
+  across runs. Used by partitioned KNN and segmented predicate evaluation.
 
   **Cache data is not disposable.** Cached artifacts may be expensive to
   acquire or compute (e.g., KNN partition results over hundreds of GB of
-  vectors, or predicate-key segment evaluations over hundreds of millions
+  vectors, or predicate evaluation segments over hundreds of millions
   of metadata records). While cache data is not carried forward into the
   hosted views of the dataset (it is not a dataset facet), it remains
   valuable in-situ because forward rendering stages may be re-executed in
   the future to fill in missing pieces — and cached segments allow those
   re-executions to skip already-completed work. Deleting cache data forces
   full recomputation of all intermediate stages.
+
+  **Cache keys are derived from input file stems, not step IDs.** This
+  enables cross-profile segment reuse: when profiles share overlapping
+  vector ranges, the smaller profile's cached segments are valid for the
+  larger profile. For example, `compute knn` for a 50M profile can reuse
+  partition caches originally computed for a 10M profile because both
+  process the same base/query vector files. Cache file naming by command:
+
+  | Command | Cache file pattern |
+  |---------|-------------------|
+  | `compute knn` | `{base_stem}.{query_stem}.range_{start}_{end}.k{k}.{metric}.{ext}` |
+  | `evaluate predicates` | `{input_stem}.{pred_stem}.seg_{start:010}_{end:010}.predkeys.slab` |
+
+  Profile ordering (smallest to largest, see §3.6.1) ensures that when
+  the 110M profile runs, segments `[0,10M)` through `[99M,100M)` are
+  already cached by profiles 10M through 100M.
+
+  **Cache invalidation by mtime**: when an input file's mtime is newer
+  than the step's `completed_at` timestamp, the step is considered stale
+  and will re-run, potentially recomputing cache segments.
 
 ## 3.4 CommandOp Trait
 
@@ -139,6 +173,7 @@ declarations; the remainder return an empty vector. See
 Stored as `.upstream.progress.yaml` adjacent to `dataset.yaml`:
 
 ```yaml
+schema_version: 2
 steps:
   import-base:
     status: ok
@@ -148,13 +183,29 @@ steps:
     outputs:
     - path: base_vectors.hvec
       size: 418719772712
-      mtime: null
+      mtime: '2026-03-05T06:00:01.123456789Z'
     resolved_options:
       from: npy
       output: base_vectors.hvec
       source: ../sourcedata/embeddings/text_emb
       facet: base_vectors
 ```
+
+### Schema version
+
+The progress log carries a `schema_version` field
+(`PROGRESS_SCHEMA_VERSION` constant in `progress.rs`). When the version
+in the file differs from the code's constant, **all step records are
+cleared** and the version is updated. This provides automatic
+invalidation when internal algorithms change in ways that affect cache
+naming, segment layout, or output content — without requiring the user
+to manually delete the progress file.
+
+The schema version is bumped whenever:
+- Cache key naming conventions change (e.g., step-ID-based →
+  file-stem-based).
+- Segment boundary calculation changes.
+- Output file formats change in incompatible ways.
 
 ### Freshness algorithm
 
@@ -164,6 +215,34 @@ A step is "fresh" when ALL of:
 3. All recorded output file sizes match the recorded values
 4. The resolved options match the recorded options (or the recorded
    options are empty, for backward compatibility)
+5. No input file (option value that resolves to an existing file, excluding
+   `output`) has a modification time newer than the step's `completed_at`
+   timestamp
+
+Additionally, two whole-log invalidation mechanisms exist:
+
+- **Schema version mismatch**: If `schema_version` in the file differs
+  from `PROGRESS_SCHEMA_VERSION`, all step records are cleared and the
+  user is informed (e.g., "Progress log schema version 1 differs from
+  current 2 — clearing all step records").
+
+- **Pipeline definition mtime**: If `dataset.yaml` has a newer mtime
+  than the progress log file itself, the entire progress log is
+  invalidated (all step records cleared) before any steps are evaluated.
+  This ensures that edits to the pipeline definition trigger full
+  re-evaluation.
+
+When a step is stale, `check_step_freshness()` returns a reason string
+(e.g., "options changed", "output 'foo.ivec' missing", "input 'source'
+(base_vectors.hvec) is newer than last run") that is displayed in the
+pipeline log.
+
+### Output mtime recording
+
+Step records store the modification time of each output file at
+completion as an RFC 3339 timestamp in the `mtime` field. This enables
+downstream freshness checks to detect when an input (which is another
+step's output) has been regenerated.
 
 ### Atomic persistence
 
@@ -186,6 +265,35 @@ Steps declare dependencies via `after: [step-id, ...]`. The DAG resolver
 
 Step ID auto-derivation: `run: "generate ivec-shuffle"` →
 `id: "generate-ivec-shuffle"` when no explicit `id` is provided.
+
+### 3.6.1 Profile Expansion and Barriers
+
+Steps marked `per_profile: true` in `dataset.yaml` are expanded into
+per-profile copies by `expand_per_profile_steps()`:
+
+1. **Sorted expansion**: Sized profiles are sorted ascending by
+   `base_count` (10M, 20M, 30M, …), then `default` (full dataset) last.
+
+2. **ID suffixing**: Template step `evaluate-predicates` becomes
+   `evaluate-predicates-10m`, `evaluate-predicates-20m`, etc.
+
+3. **Auto-prefixing**: `output` values are prefixed with
+   `profiles/{name}/`. Non-output values that match template output
+   filenames are also prefixed (cross-references between per-profile
+   steps). Shared inputs (e.g., `metadata_content.slab` produced by a
+   non-per-profile step) are NOT prefixed — all profiles read the same
+   shared file.
+
+4. **Range injection**: Sized profiles automatically receive a `range`
+   option `[0, query_count + base_count)` if one is not already present.
+
+5. **Barrier insertion**: `insert_profile_barriers()` adds synthetic
+   barrier steps between profile groups so that ALL steps for one profile
+   complete before any step of the next profile begins. This ensures
+   cache segments are available for reuse: the 20M profile's
+   `evaluate-predicates-20m` can reuse segments `[0,10M)` cached by
+   `evaluate-predicates-10m` because the 10M barrier guarantees all 10M
+   steps completed first.
 
 ## 3.7 Variable Interpolation
 
@@ -295,6 +403,7 @@ counts, but commands do not yet query them.
 calls from commands, not on a background thread. A background governor thread
 is planned (REQ-RM-12).
 
-**Incomplete telemetry**: `SystemSnapshot` samples RSS and page faults from
-`/proc/self/stat` on Linux, but CPU utilization, I/O throughput, and active
-thread count fields are not yet implemented.
+**Telemetry**: `SystemSnapshot` samples RSS, page faults, CPU utilization,
+I/O throughput, I/O queue depth, active thread count, per-core CPU
+percentages, and system page cache size from `/proc` on Linux. All metrics
+are charted in the TUI (see §8.6.3).

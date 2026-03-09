@@ -52,7 +52,7 @@ pub struct StepDef {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
 
-    /// Command to execute, e.g. `"generate ivec-shuffle"` or `"import facet"`.
+    /// Command to execute, e.g. `"generate ivec-shuffle"` or `"import"`.
     pub run: String,
 
     /// Optional human-readable description of what this step does.
@@ -106,6 +106,25 @@ impl StepDef {
             serde_yaml::Value::String(s) => Some(s.clone()),
             _ => Some(format!("{:?}", v)),
         })
+    }
+
+    /// Return all option values that look like output file paths.
+    ///
+    /// Checks `output`, `indices`, and `distances` keys — the known set of
+    /// option names that commands use for files they write. Used by
+    /// `expand_per_profile_steps()` to auto-prefix bare filenames with the
+    /// profile directory.
+    pub fn output_paths(&self) -> Vec<String> {
+        const OUTPUT_KEYS: &[&str] = &["output", "indices", "distances"];
+        OUTPUT_KEYS
+            .iter()
+            .filter_map(|key| {
+                self.options.get(*key).and_then(|v| match v {
+                    serde_yaml::Value::String(s) => Some(s.clone()),
+                    _ => None,
+                })
+            })
+            .collect()
     }
 }
 
@@ -222,7 +241,7 @@ steps:
     fn test_step_profiles_field_parsing() {
         let yaml = r#"
 steps:
-  - run: import facet
+  - run: import
     output: all.hvec
   - run: compute knn
     profiles: [default]
@@ -242,7 +261,7 @@ steps:
     fn test_step_profiles_not_serialized_when_empty() {
         let step = StepDef {
             id: Some("s1".to_string()),
-            run: "import facet".to_string(),
+            run: "import".to_string(),
             description: None,
             after: vec![],
             profiles: vec![],

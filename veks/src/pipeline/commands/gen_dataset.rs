@@ -358,9 +358,9 @@ fn compute_ground_truth(
     let dist_fn = simd_distance::select_distance_fn(metric);
 
     let base = MmapVectorReader::<f32>::open_fvec(base_path)
-        .map_err(|e| format!("failed to open base: {}", e))?;
+        .map_err(|e| format!("failed to open base {}: {}", base_path.display(), e))?;
     let query = MmapVectorReader::<f32>::open_fvec(query_path)
-        .map_err(|e| format!("failed to open query: {}", e))?;
+        .map_err(|e| format!("failed to open query {}: {}", query_path.display(), e))?;
 
     let base_count = <MmapVectorReader<f32> as VectorReader<f32>>::count(&base);
     let query_count = <MmapVectorReader<f32> as VectorReader<f32>>::count(&query);
@@ -507,6 +507,7 @@ mod tests {
             step_id: String::new(),
             governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
             ui: crate::ui::UiHandle::new(std::sync::Arc::new(crate::ui::TestSink::new())),
+            status_interval: std::time::Duration::from_secs(1),
         }
     }
 

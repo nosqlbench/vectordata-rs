@@ -26,7 +26,7 @@ pub mod sink;
 pub mod test_sink;
 
 // Re-export the handful of types that most callers need.
-pub use event::{ProgressId, ProgressKind, UiEvent};
+pub use event::{ProgressId, ProgressKind, ResourceMetrics, UiEvent};
 pub use handle::{ProgressHandle, UiHandle};
 pub use plain_sink::PlainSink;
 pub use ratatui_sink::RatatuiSink;
@@ -38,8 +38,13 @@ pub use test_sink::TestSink;
 /// Uses `RatatuiSink` when stdout is a TTY, `PlainSink` otherwise (pipes, CI).
 /// Falls back to `PlainSink` if the ratatui terminal cannot be initialized.
 pub fn auto_ui_handle() -> UiHandle {
+    auto_ui_handle_with_interval(std::time::Duration::from_secs(1))
+}
+
+/// Create a UI handle with a custom redraw interval.
+pub fn auto_ui_handle_with_interval(redraw_interval: std::time::Duration) -> UiHandle {
     let sink: std::sync::Arc<dyn UiSink> = if atty::is(atty::Stream::Stdout) {
-        match RatatuiSink::new(16) {
+        match RatatuiSink::with_redraw_interval(16, redraw_interval) {
             Ok(s) => std::sync::Arc::new(s),
             Err(_) => std::sync::Arc::new(PlainSink::new()),
         }

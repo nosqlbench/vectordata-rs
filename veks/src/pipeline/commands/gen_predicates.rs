@@ -24,7 +24,7 @@ use crate::pipeline::rng;
 
 use super::slab::{survey_from_json, survey_slab, FieldStats};
 
-/// Pipeline command: generate predicates from metadata slab field distributions.
+/// Pipeline command: synthesize predicates from metadata slab field distributions.
 pub struct GenPredicatesOp;
 
 /// Create a boxed `GenPredicatesOp` command.
@@ -34,14 +34,14 @@ pub fn factory() -> Box<dyn CommandOp> {
 
 impl CommandOp for GenPredicatesOp {
     fn command_path(&self) -> &str {
-        "generate predicates"
+        "synthesize predicates"
     }
 
     fn command_doc(&self) -> CommandDoc {
         let options = self.describe_options();
         CommandDoc {
             summary: "Generate random predicate trees from metadata survey".into(),
-            body: format!(r#"# generate predicates
+            body: format!(r#"# synthesize predicates
 
 Generate random predicate trees from metadata survey.
 
@@ -99,7 +99,7 @@ selectivity. The generated predicates are written to an output slab file.
         // Load survey data — from pre-computed JSON if available, otherwise survey the slab
         let survey = if let Some(survey_str) = options.get("survey") {
             let survey_path = resolve_path(survey_str, &ctx.workspace);
-            ctx.ui.log(&format!("generate predicates: loading survey from {}", survey_path.display()));
+            ctx.ui.log(&format!("synthesize predicates: loading survey from {}", survey_path.display()));
             match survey_from_json(&survey_path) {
                 Ok(s) => s,
                 Err(e) => return error_result(e, start),
@@ -119,7 +119,7 @@ selectivity. The generated predicates are written to an output slab file.
             .collect();
 
         if eligible.is_empty() {
-            ctx.ui.log("generate predicates: 0 eligible fields, producing 0 predicates");
+            ctx.ui.log("synthesize predicates: 0 eligible fields, producing 0 predicates");
             // Write empty slab
             let config = WriterConfig::new(512, 4096, u32::MAX, false)
                 .map_err(|e| format!("{}", e));
@@ -144,8 +144,9 @@ selectivity. The generated predicates are written to an output slab file.
         let mut rng_inst = rng::seeded_rng(seed);
 
         // Generate predicates
+        let pb = ctx.ui.bar(count as u64, "generating predicates");
         let mut predicates: Vec<Vec<u8>> = Vec::with_capacity(count);
-        for _ in 0..count {
+        for pred_i in 0..count {
             let target_sel = match selectivity_max {
                 Some(max) => rng_inst.random_range(selectivity..=max),
                 None => selectivity,
@@ -162,7 +163,9 @@ selectivity. The generated predicates are written to an output slab file.
                 }
             };
             predicates.push(pnode.to_bytes_named());
+            if (pred_i + 1) % 1_000 == 0 { pb.set_position((pred_i + 1) as u64); }
         }
+        pb.finish();
 
         // Write to output slab
         let config = match WriterConfig::new(512, 4096, u32::MAX, false) {
@@ -187,7 +190,7 @@ selectivity. The generated predicates are written to an output slab file.
             predicates.len(),
             eligible.len(),
         );
-        ctx.ui.log(&format!("generate predicates: {}", message));
+        ctx.ui.log(&format!("synthesize predicates: {}", message));
 
         CommandResult {
             status: Status::Ok,
@@ -201,7 +204,7 @@ selectivity. The generated predicates are written to an output slab file.
         vec![
             opt("input", "Path", true, None, "Metadata slab to survey"),
             opt("output", "Path", true, None, "Output slab for predicates"),
-            opt("survey", "Path", false, None, "Pre-computed survey JSON from 'slab survey --output' (skips re-surveying the slab)"),
+            opt("survey", "Path", false, None, "Pre-computed survey JSON from 'survey --output' (skips re-surveying the slab)"),
             opt("count", "int", false, Some("100"), "Number of predicates to generate"),
             opt("selectivity", "float", false, Some("0.1"), "Target selectivity (0.0–1.0)"),
             opt("selectivity-max", "float", false, None, "If set, selectivity is uniform in [selectivity, selectivity-max]"),
@@ -775,6 +778,7 @@ mod tests {
             step_id: String::new(),
             governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
             ui: crate::ui::UiHandle::new(std::sync::Arc::new(crate::ui::TestSink::new())),
+            status_interval: std::time::Duration::from_secs(1),
         }
     }
 

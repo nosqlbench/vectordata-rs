@@ -18,6 +18,7 @@ use crate::pipeline::command::{
     CommandDoc, CommandOp, CommandResult, OptionDesc, Options, ResourceDesc, Status, StreamContext,
     render_options_table,
 };
+use super::source_window::resolve_source;
 
 /// Pipeline command: compute vector statistics.
 pub struct AnalyzeStatsOp;
@@ -166,7 +167,11 @@ impl CommandOp for AnalyzeStatsOp {
         let all_dimensions = options.get("all-dimensions").map_or(false, |s| s == "true");
         let sample: Option<usize> = options.get("sample").and_then(|s| s.parse().ok());
 
-        let source_path = resolve_path(source_str, &ctx.workspace);
+        let source = match resolve_source(source_str, &ctx.workspace) {
+            Ok(s) => s,
+            Err(e) => return error_result(e, start),
+        };
+        let source_path = source.path.clone();
 
         let reader = match MmapVectorReader::<f32>::open_fvec(&source_path) {
             Ok(r) => r,
@@ -178,8 +183,16 @@ impl CommandOp for AnalyzeStatsOp {
             }
         };
 
-        let count = <MmapVectorReader<f32> as VectorReader<f32>>::count(&reader);
+        let file_count = <MmapVectorReader<f32> as VectorReader<f32>>::count(&reader);
         let dim = <MmapVectorReader<f32> as VectorReader<f32>>::dim(&reader);
+        let (base_offset, count) = match source.window {
+            Some((ws, we)) => {
+                let ws = ws.min(file_count);
+                let we = we.min(file_count);
+                (ws, we.saturating_sub(ws))
+            }
+            None => (0, file_count),
+        };
         let effective_count = sample.map(|s| s.min(count)).unwrap_or(count);
 
         if let Some(d) = dimension {
@@ -193,7 +206,7 @@ impl CommandOp for AnalyzeStatsOp {
             // Single dimension analysis with percentiles
             let mut values: Vec<f32> = Vec::with_capacity(effective_count);
             for i in 0..effective_count {
-                let vec = reader.get(i).unwrap_or_default();
+                let vec = reader.get(base_offset + i).unwrap_or_default();
                 values.push(vec[d]);
             }
 
@@ -263,7 +276,7 @@ impl CommandOp for AnalyzeStatsOp {
             // Global stats across all dimensions
             let mut all_values: Vec<f32> = Vec::with_capacity(effective_count * dim);
             for i in 0..effective_count {
-                let vec = reader.get(i).unwrap_or_default();
+                let vec = reader.get(base_offset + i).unwrap_or_default();
                 all_values.extend_from_slice(&vec);
             }
             let stats = DimensionStats::compute(&all_values);
@@ -388,6 +401,7 @@ mod tests {
             step_id: String::new(),
             governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
             ui: crate::ui::UiHandle::new(std::sync::Arc::new(crate::ui::TestSink::new())),
+            status_interval: std::time::Duration::from_secs(1),
         }
     }
 

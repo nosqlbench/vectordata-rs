@@ -109,25 +109,26 @@ element types. Output format is determined by the element type.
         }
 
         let mut rng_inst = rng::seeded_rng(seed);
+        let pb = ctx.ui.bar(count, "generating");
 
         let result = match elem_type {
             "float[]" | "f32" => {
-                generate_xvec_f32(&output_path, dimension, count, float_min as f32, float_max as f32, &mut rng_inst)
+                generate_xvec_f32(&output_path, dimension, count, float_min as f32, float_max as f32, &mut rng_inst, &pb)
             }
             "int[]" | "i32" => {
-                generate_xvec_i32(&output_path, dimension, count, int_min, int_max, &mut rng_inst)
+                generate_xvec_i32(&output_path, dimension, count, int_min, int_max, &mut rng_inst, &pb)
             }
             "double[]" | "f64" => {
-                generate_xvec_f64(&output_path, dimension, count, float_min, float_max, &mut rng_inst)
+                generate_xvec_f64(&output_path, dimension, count, float_min, float_max, &mut rng_inst, &pb)
             }
             "byte[]" | "u8" => {
-                generate_xvec_u8(&output_path, dimension, count, &mut rng_inst)
+                generate_xvec_u8(&output_path, dimension, count, &mut rng_inst, &pb)
             }
             "half" | "f16" => {
-                generate_xvec_f16(&output_path, dimension, count, float_min as f32, float_max as f32, &mut rng_inst)
+                generate_xvec_f16(&output_path, dimension, count, float_min as f32, float_max as f32, &mut rng_inst, &pb)
             }
             "short[]" | "i16" => {
-                generate_xvec_i16(&output_path, dimension, count, int_min as i16, int_max as i16, &mut rng_inst)
+                generate_xvec_i16(&output_path, dimension, count, int_min as i16, int_max as i16, &mut rng_inst, &pb)
             }
             _ => Err(format!("unsupported element type: '{}'. Use float[], int[], double[], byte[], half, or short[]", elem_type)),
         };
@@ -204,6 +205,9 @@ element types. Output format is determined by the element type.
     }
 }
 
+/// Batch size for progress updates in generate loops.
+const GEN_BATCH: u64 = 10_000;
+
 /// Generate f32 vectors in fvec format.
 fn generate_xvec_f32(
     output: &Path,
@@ -212,6 +216,7 @@ fn generate_xvec_f32(
     min: f32,
     max: f32,
     rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
+    pb: &crate::ui::ProgressHandle,
 ) -> Result<(), String> {
     use std::io::Write;
     let file = std::fs::File::create(output)
@@ -219,7 +224,7 @@ fn generate_xvec_f32(
     let mut writer = std::io::BufWriter::with_capacity(1 << 20, file);
     let range = max - min;
 
-    for _ in 0..count {
+    for i in 0..count {
         writer
             .write_all(&(dim as i32).to_le_bytes())
             .map_err(|e| e.to_string())?;
@@ -227,7 +232,9 @@ fn generate_xvec_f32(
             let val: f32 = min + rng.random::<f32>() * range;
             writer.write_all(&val.to_le_bytes()).map_err(|e| e.to_string())?;
         }
+        if (i + 1) % GEN_BATCH == 0 { pb.set_position(i + 1); }
     }
+    pb.set_position(count);
     writer.flush().map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -240,6 +247,7 @@ fn generate_xvec_i32(
     min: i32,
     max: i32,
     rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
+    pb: &crate::ui::ProgressHandle,
 ) -> Result<(), String> {
     use std::io::Write;
     let file = std::fs::File::create(output)
@@ -247,7 +255,7 @@ fn generate_xvec_i32(
     let mut writer = std::io::BufWriter::with_capacity(1 << 20, file);
     let range = (max - min + 1) as u32;
 
-    for _ in 0..count {
+    for i in 0..count {
         writer
             .write_all(&(dim as i32).to_le_bytes())
             .map_err(|e| e.to_string())?;
@@ -255,7 +263,9 @@ fn generate_xvec_i32(
             let val: i32 = min + (rng.random::<u32>() % range) as i32;
             writer.write_all(&val.to_le_bytes()).map_err(|e| e.to_string())?;
         }
+        if (i + 1) % GEN_BATCH == 0 { pb.set_position(i + 1); }
     }
+    pb.set_position(count);
     writer.flush().map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -268,6 +278,7 @@ fn generate_xvec_f64(
     min: f64,
     max: f64,
     rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
+    pb: &crate::ui::ProgressHandle,
 ) -> Result<(), String> {
     use std::io::Write;
     let file = std::fs::File::create(output)
@@ -275,7 +286,7 @@ fn generate_xvec_f64(
     let mut writer = std::io::BufWriter::with_capacity(1 << 20, file);
     let range = max - min;
 
-    for _ in 0..count {
+    for i in 0..count {
         writer
             .write_all(&(dim as i32).to_le_bytes())
             .map_err(|e| e.to_string())?;
@@ -283,7 +294,9 @@ fn generate_xvec_f64(
             let val: f64 = min + rng.random::<f64>() * range;
             writer.write_all(&val.to_le_bytes()).map_err(|e| e.to_string())?;
         }
+        if (i + 1) % GEN_BATCH == 0 { pb.set_position(i + 1); }
     }
+    pb.set_position(count);
     writer.flush().map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -294,13 +307,14 @@ fn generate_xvec_u8(
     dim: u32,
     count: u64,
     rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
+    pb: &crate::ui::ProgressHandle,
 ) -> Result<(), String> {
     use std::io::Write;
     let file = std::fs::File::create(output)
         .map_err(|e| format!("failed to create {}: {}", output.display(), e))?;
     let mut writer = std::io::BufWriter::with_capacity(1 << 20, file);
 
-    for _ in 0..count {
+    for i in 0..count {
         writer
             .write_all(&(dim as i32).to_le_bytes())
             .map_err(|e| e.to_string())?;
@@ -308,7 +322,9 @@ fn generate_xvec_u8(
             let val: u8 = rng.random();
             writer.write_all(&[val]).map_err(|e| e.to_string())?;
         }
+        if (i + 1) % GEN_BATCH == 0 { pb.set_position(i + 1); }
     }
+    pb.set_position(count);
     writer.flush().map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -321,6 +337,7 @@ fn generate_xvec_f16(
     min: f32,
     max: f32,
     rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
+    pb: &crate::ui::ProgressHandle,
 ) -> Result<(), String> {
     use std::io::Write;
     let file = std::fs::File::create(output)
@@ -328,7 +345,7 @@ fn generate_xvec_f16(
     let mut writer = std::io::BufWriter::with_capacity(1 << 20, file);
     let range = max - min;
 
-    for _ in 0..count {
+    for i in 0..count {
         writer
             .write_all(&(dim as i32).to_le_bytes())
             .map_err(|e| e.to_string())?;
@@ -339,7 +356,9 @@ fn generate_xvec_f16(
                 .write_all(&val_f16.to_le_bytes())
                 .map_err(|e| e.to_string())?;
         }
+        if (i + 1) % GEN_BATCH == 0 { pb.set_position(i + 1); }
     }
+    pb.set_position(count);
     writer.flush().map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -352,6 +371,7 @@ fn generate_xvec_i16(
     min: i16,
     max: i16,
     rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
+    pb: &crate::ui::ProgressHandle,
 ) -> Result<(), String> {
     use std::io::Write;
     let file = std::fs::File::create(output)
@@ -359,7 +379,7 @@ fn generate_xvec_i16(
     let mut writer = std::io::BufWriter::with_capacity(1 << 20, file);
     let range = (max as i32 - min as i32 + 1) as u32;
 
-    for _ in 0..count {
+    for i in 0..count {
         writer
             .write_all(&(dim as i32).to_le_bytes())
             .map_err(|e| e.to_string())?;
@@ -367,7 +387,9 @@ fn generate_xvec_i16(
             let val: i16 = min + (rng.random::<u32>() % range) as i16;
             writer.write_all(&val.to_le_bytes()).map_err(|e| e.to_string())?;
         }
+        if (i + 1) % GEN_BATCH == 0 { pb.set_position(i + 1); }
     }
+    pb.set_position(count);
     writer.flush().map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -412,6 +434,7 @@ mod tests {
             step_id: String::new(),
             governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
             ui: crate::ui::UiHandle::new(std::sync::Arc::new(crate::ui::TestSink::new())),
+            status_interval: std::time::Duration::from_secs(1),
         }
     }
 

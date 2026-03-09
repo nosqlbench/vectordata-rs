@@ -20,6 +20,8 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
+use crate::ui::event::ResourceMetrics;
+
 // ---------------------------------------------------------------------------
 // Resource types (centralized definitions)
 // ---------------------------------------------------------------------------
@@ -136,6 +138,300 @@ impl std::fmt::Display for ResourceType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.name())
     }
+}
+
+// ---------------------------------------------------------------------------
+// Storage detection
+// ---------------------------------------------------------------------------
+
+/// Classification of the backing storage for a path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StorageType {
+    /// Local NVMe (e.g., EC2 instance storage).
+    LocalNvme,
+    /// Network-attached block storage (e.g., EBS, Azure Managed Disk).
+    NetworkBlock,
+    /// SATA/AHCI SSD.
+    SataSsd,
+    /// Spinning disk (rotational).
+    Hdd,
+    /// Could not determine storage type.
+    Unknown,
+}
+
+impl StorageType {
+    /// Suggested I/O queue depth threshold at which this storage type
+    /// is considered partially saturated.
+    pub fn saturation_queue_depth(&self) -> u64 {
+        match self {
+            StorageType::LocalNvme => 128,
+            StorageType::NetworkBlock => 32,
+            StorageType::SataSsd => 32,
+            StorageType::Hdd => 4,
+            StorageType::Unknown => 32,
+        }
+    }
+
+    /// Human-readable label for display.
+    pub fn label(&self) -> &'static str {
+        match self {
+            StorageType::LocalNvme => "local NVMe",
+            StorageType::NetworkBlock => "network block",
+            StorageType::SataSsd => "SATA SSD",
+            StorageType::Hdd => "HDD",
+            StorageType::Unknown => "unknown",
+        }
+    }
+}
+
+impl std::fmt::Display for StorageType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+/// Detected storage information for a block device.
+#[derive(Debug, Clone, Serialize)]
+pub struct StorageInfo {
+    /// Block device name (e.g., "nvme0n1").
+    pub device: String,
+    /// Classified storage type.
+    pub storage_type: StorageType,
+    /// Device model string, if available.
+    pub model: Option<String>,
+    /// Whether the device is rotational (from sysfs).
+    pub rotational: bool,
+    /// Transport type (e.g., "nvme", "sata"), if available.
+    pub transport: Option<String>,
+    /// Hardware queue depth (nr_requests), if available.
+    pub nr_requests: Option<u64>,
+}
+
+/// Detect storage info for the block device backing the given path.
+///
+/// Resolves the mount point for `path`, then reads sysfs attributes to
+/// classify the storage type. Returns `None` on non-Linux platforms or
+/// if detection fails.
+pub fn detect_storage_info(path: &Path) -> Option<StorageInfo> {
+    #[cfg(target_os = "linux")]
+    {
+        detect_storage_info_linux(path)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn detect_storage_info_linux(path: &Path) -> Option<StorageInfo> {
+    // Step 1: Find the block device for the given path
+    let device_name = resolve_block_device(path)?;
+
+    // Step 2: Read sysfs attributes for the device
+    let sysfs_base = format!("/sys/block/{}", device_name);
+    let sysfs_path = std::path::Path::new(&sysfs_base);
+    if !sysfs_path.exists() {
+        return None;
+    }
+
+    // For device-mapper (LVM, RAID) devices, resolve through to underlying
+    // physical devices via /sys/block/dm-*/slaves/
+    let (phys_name, phys_sysfs) = resolve_dm_slaves(&device_name, sysfs_path);
+
+    let rotational = read_sysfs_u64(&sysfs_path.join("queue/rotational")).unwrap_or(0) == 1;
+    let nr_requests = read_sysfs_u64(&phys_sysfs.join("queue/nr_requests"));
+
+    // Read model from the physical device
+    let model = read_sysfs_string(&phys_sysfs.join("device/model"));
+
+    // Read transport from the physical device
+    let transport = detect_transport(&phys_name, &phys_sysfs);
+
+    // Step 3: Classify based on the physical device characteristics
+    let storage_type = classify_storage(&phys_name, rotational, model.as_deref(), transport.as_deref());
+
+    Some(StorageInfo {
+        device: device_name,
+        storage_type,
+        model,
+        rotational,
+        transport,
+        nr_requests,
+    })
+}
+
+/// For device-mapper devices (dm-*), resolve to the first underlying slave
+/// device to read physical attributes. Returns the physical device name and
+/// its sysfs path. For non-dm devices, returns the input unchanged.
+#[cfg(target_os = "linux")]
+fn resolve_dm_slaves(device_name: &str, sysfs_path: &Path) -> (String, std::path::PathBuf) {
+    if !device_name.starts_with("dm-") {
+        return (device_name.to_string(), sysfs_path.to_path_buf());
+    }
+    let slaves_dir = sysfs_path.join("slaves");
+    if let Ok(entries) = std::fs::read_dir(&slaves_dir) {
+        for entry in entries.flatten() {
+            let slave_name = entry.file_name().to_string_lossy().to_string();
+            let slave_sysfs = std::path::PathBuf::from(format!("/sys/block/{}", slave_name));
+            if slave_sysfs.exists() {
+                // Recurse in case of stacked dm devices
+                return resolve_dm_slaves(&slave_name, &slave_sysfs);
+            }
+        }
+    }
+    (device_name.to_string(), sysfs_path.to_path_buf())
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_block_device(path: &Path) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+
+    // Get the device number for the path
+    let meta = std::fs::metadata(path).ok()?;
+    let dev = meta.dev();
+    let target_major = libc::major(dev) as u64;
+    let target_minor = libc::minor(dev) as u64;
+
+    // Search /sys/block for matching major:minor
+    if let Ok(entries) = std::fs::read_dir("/sys/block") {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.starts_with("loop") || name_str.starts_with("ram") {
+                continue;
+            }
+            let dev_path = entry.path().join("dev");
+            if let Some(dev_str) = read_sysfs_string(&dev_path) {
+                if let Some((maj_s, min_s)) = dev_str.split_once(':') {
+                    if let (Ok(maj), Ok(min)) = (maj_s.parse::<u64>(), min_s.parse::<u64>()) {
+                        if maj == target_major && min == target_minor {
+                            return Some(name_str.to_string());
+                        }
+                    }
+                }
+            }
+            // Check partitions under this block device
+            if let Ok(sub_entries) = std::fs::read_dir(entry.path()) {
+                for sub in sub_entries.flatten() {
+                    let sub_name = sub.file_name();
+                    let sub_name_str = sub_name.to_string_lossy();
+                    let sub_dev = sub.path().join("dev");
+                    if let Some(dev_str) = read_sysfs_string(&sub_dev) {
+                        if let Some((maj_s, min_s)) = dev_str.split_once(':') {
+                            if let (Ok(maj), Ok(min)) = (maj_s.parse::<u64>(), min_s.parse::<u64>()) {
+                                if maj == target_major && min == target_minor {
+                                    // Return the parent block device, not the partition
+                                    let _ = sub_name_str;
+                                    return Some(name_str.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn detect_transport(device_name: &str, sysfs_path: &Path) -> Option<String> {
+    // NVMe devices are obvious from the name
+    if device_name.starts_with("nvme") {
+        return Some("nvme".to_string());
+    }
+
+    // Try reading transport from uevent
+    let uevent_path = sysfs_path.join("device/uevent");
+    if let Some(content) = read_sysfs_string(&uevent_path) {
+        for line in content.lines() {
+            if let Some(val) = line.strip_prefix("ID_BUS=") {
+                return Some(val.trim().to_string());
+            }
+        }
+    }
+
+    // Try /sys/block/<dev>/device symlink to infer from path
+    let device_link = sysfs_path.join("device");
+    if let Ok(resolved) = std::fs::read_link(&device_link) {
+        let resolved_str = resolved.to_string_lossy();
+        if resolved_str.contains("/ata") || resolved_str.contains("/sata") {
+            return Some("sata".to_string());
+        }
+        if resolved_str.contains("/usb") {
+            return Some("usb".to_string());
+        }
+        if resolved_str.contains("/virtio") {
+            return Some("virtio".to_string());
+        }
+    }
+
+    None
+}
+
+fn classify_storage(
+    device_name: &str,
+    rotational: bool,
+    model: Option<&str>,
+    transport: Option<&str>,
+) -> StorageType {
+    // Rotational → HDD
+    if rotational {
+        return StorageType::Hdd;
+    }
+
+    // Check for known cloud block storage models
+    if let Some(m) = model {
+        let m_lower = m.to_lowercase();
+        if m_lower.contains("elastic block store")
+            || m_lower.contains("google persistent disk")
+            || m_lower.contains("azure premium")
+            || m_lower.contains("managed disk")
+        {
+            return StorageType::NetworkBlock;
+        }
+        if m_lower.contains("instance storage") {
+            return StorageType::LocalNvme;
+        }
+    }
+
+    // Transport-based classification
+    match transport {
+        Some(t) if t == "nvme" || device_name.starts_with("nvme") => {
+            // NVMe without a recognized cloud block model → local NVMe
+            StorageType::LocalNvme
+        }
+        Some(t) if t == "sata" || t == "ata" => StorageType::SataSsd,
+        Some(t) if t == "virtio" => {
+            // virtio is typically network-backed (cloud VMs)
+            StorageType::NetworkBlock
+        }
+        _ => {
+            // Unknown transport, non-rotational
+            if device_name.starts_with("xvd") || device_name.starts_with("vd") {
+                StorageType::NetworkBlock
+            } else {
+                StorageType::Unknown
+            }
+        }
+    }
+}
+
+fn read_sysfs_u64(path: &Path) -> Option<u64> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+}
+
+fn read_sysfs_string(path: &Path) -> Option<String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 // ---------------------------------------------------------------------------
@@ -425,6 +721,16 @@ pub struct SystemSnapshot {
     pub minor_faults: u64,
     /// Current active thread count.
     pub active_threads: usize,
+    /// Read I/O requests currently in flight across all block devices.
+    pub io_inflight_read: u64,
+    /// Write I/O requests currently in flight across all block devices.
+    pub io_inflight_write: u64,
+    /// System page cache size in bytes (from /proc/meminfo Cached + Buffers).
+    pub page_cache_bytes: u64,
+    /// Cumulative minor faults for this process (page cache hits).
+    pub cumulative_minor_faults: u64,
+    /// Cumulative major faults for this process (page cache misses → disk).
+    pub cumulative_major_faults: u64,
     /// Raw cumulative CPU user time in clock ticks (for delta computation).
     #[serde(skip)]
     pub cpu_user_ticks: u64,
@@ -444,6 +750,8 @@ impl SystemSnapshot {
         let rss_pct = (rss_bytes as f64 / system_ram as f64) * 100.0;
         let (io_read, io_write) = read_proc_self_io();
         let active_threads = read_proc_self_threads();
+        let (io_inflight_read, io_inflight_write) = read_diskstats_inflight();
+        let page_cache_bytes = read_page_cache_bytes();
 
         // Convert utime/stime (in clock ticks) to percentage (rough estimate).
         // This is cumulative, not per-interval, so it's a running average.
@@ -472,9 +780,30 @@ impl SystemSnapshot {
             major_faults,
             minor_faults,
             active_threads,
+            io_inflight_read,
+            io_inflight_write,
+            page_cache_bytes,
+            cumulative_minor_faults: minor_faults,
+            cumulative_major_faults: major_faults,
             cpu_user_ticks: utime,
             cpu_system_ticks: stime,
             ticks_per_sec,
+        }
+    }
+
+    /// Compute the page cache hit ratio from two snapshots.
+    ///
+    /// Uses the delta in minor faults (cache hits) and major faults (cache misses)
+    /// between `prev` and `self`. Returns a ratio in `[0.0, 1.0]`, or `None` if
+    /// there were no faults in the interval.
+    pub fn page_cache_hit_ratio(&self, prev: &SystemSnapshot) -> Option<f64> {
+        let minor_delta = self.cumulative_minor_faults.saturating_sub(prev.cumulative_minor_faults);
+        let major_delta = self.cumulative_major_faults.saturating_sub(prev.cumulative_major_faults);
+        let total = minor_delta + major_delta;
+        if total == 0 {
+            None
+        } else {
+            Some(minor_delta as f64 / total as f64)
         }
     }
 }
@@ -534,6 +863,41 @@ fn read_proc_self_io() -> (u64, u64) {
     }
 }
 
+/// Read system page cache size from /proc/meminfo (Cached + Buffers).
+fn read_page_cache_bytes() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(content) = std::fs::read_to_string("/proc/meminfo") {
+            let mut cached_kb: u64 = 0;
+            let mut buffers_kb: u64 = 0;
+            for line in content.lines() {
+                if let Some(rest) = line.strip_prefix("Cached:") {
+                    cached_kb = parse_meminfo_kb(rest);
+                } else if let Some(rest) = line.strip_prefix("Buffers:") {
+                    buffers_kb = parse_meminfo_kb(rest);
+                }
+            }
+            return (cached_kb + buffers_kb) * 1024;
+        }
+        0
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        0
+    }
+}
+
+/// Parse a /proc/meminfo value like "  12345 kB" → 12345.
+fn parse_meminfo_kb(s: &str) -> u64 {
+    s.trim()
+        .strip_suffix("kB")
+        .or_else(|| s.trim().strip_suffix("KB"))
+        .unwrap_or(s.trim())
+        .trim()
+        .parse()
+        .unwrap_or(0)
+}
+
 /// Read active thread count from /proc/self/status.
 fn read_proc_self_threads() -> usize {
     #[cfg(target_os = "linux")]
@@ -550,6 +914,127 @@ fn read_proc_self_threads() -> usize {
     #[cfg(not(target_os = "linux"))]
     {
         1
+    }
+}
+
+/// Read per-core CPU ticks from `/proc/stat`.
+///
+/// Returns a vec of `(busy_ticks, total_ticks)` for each core, where
+/// `busy = user + nice + system + irq + softirq + steal` and
+/// `total = busy + idle + iowait`.
+fn read_per_core_cpu_ticks() -> Vec<(u64, u64)> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut cores = Vec::new();
+        if let Ok(content) = std::fs::read_to_string("/proc/stat") {
+            for line in content.lines() {
+                if !line.starts_with("cpu") {
+                    continue;
+                }
+                // Skip aggregate "cpu " line (has space after "cpu")
+                let after_cpu = &line[3..];
+                if after_cpu.starts_with(' ') {
+                    continue;
+                }
+                // "cpuN user nice system idle iowait irq softirq steal ..."
+                let fields: Vec<u64> = line
+                    .split_whitespace()
+                    .skip(1) // skip "cpuN"
+                    .filter_map(|f| f.parse().ok())
+                    .collect();
+                if fields.len() >= 7 {
+                    let user = fields[0];
+                    let nice = fields[1];
+                    let system = fields[2];
+                    let idle = fields[3];
+                    let iowait = fields[4];
+                    let irq = fields[5];
+                    let softirq = fields[6];
+                    let steal = if fields.len() > 7 { fields[7] } else { 0 };
+                    let busy = user + nice + system + irq + softirq + steal;
+                    let total = busy + idle + iowait;
+                    cores.push((busy, total));
+                }
+            }
+        }
+        cores
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Vec::new()
+    }
+}
+
+/// Read I/O requests in flight from `/sys/block/*/inflight` (read, write).
+///
+/// Each `/sys/block/<dev>/inflight` file contains two numbers: read and write
+/// inflight counts. Falls back to the combined count from `/proc/diskstats`
+/// if `/sys/block` is unavailable.
+fn read_diskstats_inflight() -> (u64, u64) {
+    #[cfg(target_os = "linux")]
+    {
+        // Try /sys/block/*/inflight first — gives separate read/write counts
+        if let Ok(entries) = std::fs::read_dir("/sys/block") {
+            let mut total_read: u64 = 0;
+            let mut total_write: u64 = 0;
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                // Skip loop devices
+                if name.starts_with("loop") || name.starts_with("ram") {
+                    continue;
+                }
+                let path = entry.path().join("inflight");
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    let parts: Vec<&str> = content.split_whitespace().collect();
+                    if parts.len() >= 2 {
+                        if let (Ok(r), Ok(w)) = (parts[0].parse::<u64>(), parts[1].parse::<u64>()) {
+                            total_read += r;
+                            total_write += w;
+                        }
+                    }
+                }
+            }
+            return (total_read, total_write);
+        }
+
+        // Fallback: /proc/diskstats (combined inflight only)
+        if let Ok(content) = std::fs::read_to_string("/proc/diskstats") {
+            let mut total: u64 = 0;
+            for line in content.lines() {
+                let fields: Vec<&str> = line.split_whitespace().collect();
+                if fields.len() < 14 {
+                    continue;
+                }
+                let name = fields[2];
+                if name.starts_with("loop") {
+                    continue;
+                }
+                let trimmed = name.trim_end_matches(|c: char| c.is_ascii_digit());
+                if trimmed.ends_with('p') && trimmed.len() > 1
+                    && trimmed[..trimmed.len()-1].ends_with(|c: char| c.is_ascii_digit())
+                {
+                    continue;
+                }
+                if (trimmed.starts_with("sd") || trimmed.starts_with("hd")
+                    || trimmed.starts_with("vd") || trimmed.starts_with("xvd"))
+                    && trimmed.len() > 2
+                    && trimmed != name
+                {
+                    continue;
+                }
+                if let Ok(inflight) = fields[11].parse::<u64>() {
+                    total += inflight;
+                }
+            }
+            // Can't distinguish read vs write — attribute all to read
+            return (total, 0);
+        }
+        (0, 0)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        (0, 0)
     }
 }
 
@@ -861,6 +1346,15 @@ enum GovernorLogEntry {
         resource: String,
         reason: String,
     },
+    Demand {
+        ts: String,
+        step_id: String,
+        resource: String,
+        current: u64,
+        desired: u64,
+        granted: u64,
+        reason: String,
+    },
 }
 
 /// Writer for the governor utilization log.
@@ -924,6 +1418,12 @@ pub struct ResourceGovernor {
     stop_flag: Arc<AtomicBool>,
     /// Background evaluation thread handle.
     bg_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// Detected storage info for the workspace path.
+    storage: Option<StorageInfo>,
+    /// Outstanding demand offers from commands, keyed by resource name.
+    /// Each entry is (current, desired) from the most recent offer.
+    /// Cleared after each governor evaluation cycle.
+    demands: Mutex<HashMap<String, (u64, u64)>>,
 }
 
 impl ResourceGovernor {
@@ -959,10 +1459,10 @@ impl ResourceGovernor {
             effective.insert(name.clone(), value.midpoint());
         }
 
-        let log = if let Some(ws) = workspace {
-            GovernorLog::new(&ws.join(".governor.log"))
+        let (log, storage) = if let Some(ws) = workspace {
+            (GovernorLog::new(&ws.join(".governor.log")), detect_storage_info(ws))
         } else {
-            GovernorLog::noop()
+            (GovernorLog::noop(), None)
         };
 
         let has_mem_budget = budget.get("mem").is_some();
@@ -978,6 +1478,8 @@ impl ResourceGovernor {
             eval_interval: Duration::from_millis(500),
             stop_flag: Arc::new(AtomicBool::new(false)),
             bg_thread: Mutex::new(None),
+            storage,
+            demands: Mutex::new(HashMap::new()),
         };
 
         // Start background evaluation thread if a memory budget is configured.
@@ -1105,6 +1607,8 @@ impl ResourceGovernor {
             eval_interval: Duration::from_millis(500),
             stop_flag: Arc::new(AtomicBool::new(false)),
             bg_thread: Mutex::new(None),
+            storage: None,
+            demands: Mutex::new(HashMap::new()),
         }
     }
 
@@ -1215,6 +1719,42 @@ impl ResourceGovernor {
         self.budget.get("mem").map(|v| v.ceiling())
     }
 
+    /// Return detected storage info for the workspace, if available.
+    pub fn storage_info(&self) -> Option<&StorageInfo> {
+        self.storage.as_ref()
+    }
+
+    /// Return the detected storage type, or `Unknown` if detection failed.
+    pub fn storage_type(&self) -> StorageType {
+        self.storage.as_ref()
+            .map(|s| s.storage_type)
+            .unwrap_or(StorageType::Unknown)
+    }
+
+    /// Return the I/O queue depth threshold for saturation of the workspace
+    /// storage. Commands can use this to decide whether to back off I/O.
+    pub fn io_saturation_depth(&self) -> u64 {
+        self.storage_type().saturation_queue_depth()
+    }
+
+    /// Offer a resource demand to the governor (demand-pull protocol).
+    ///
+    /// The command declares that it is currently using `current` units of
+    /// the named resource and could productively use up to `desired` units.
+    /// The governor evaluates this on its next cycle and may increase the
+    /// effective value. Returns the current effective value (which may not
+    /// yet reflect the demand — the command should re-read on its next
+    /// `checkpoint()`).
+    ///
+    /// Demands expire after one evaluation cycle. Commands must re-offer
+    /// on each checkpoint if they still want more resources.
+    pub fn offer_demand(&self, name: &str, current: u64, desired: u64) -> u64 {
+        if desired > current {
+            self.demands.lock().unwrap().insert(name.to_string(), (current, desired));
+        }
+        self.current_or(name, current)
+    }
+
     /// Run a governor evaluation cycle.
     ///
     /// Samples system state, runs the strategy, applies adjustments,
@@ -1302,6 +1842,43 @@ impl ResourceGovernor {
             self.emergency.store(false, Ordering::Relaxed);
         }
 
+        // Process demand offers (only when not throttling)
+        if !self.throttle.load(Ordering::Relaxed) {
+            let demands: HashMap<String, (u64, u64)> = {
+                let mut d = self.demands.lock().unwrap();
+                std::mem::take(&mut *d)
+            };
+
+            if !demands.is_empty() {
+                let mut effective = self.effective.write().unwrap();
+                let mut log = self.log.lock().unwrap();
+
+                for (name, (current, desired)) in &demands {
+                    let eff = effective.get(name).copied().unwrap_or(*current);
+                    let ceiling = self.budget.get(name)
+                        .map(|v| v.ceiling())
+                        .unwrap_or(*desired);
+                    let granted = (*desired).min(ceiling);
+
+                    if granted > eff {
+                        effective.insert(name.clone(), granted);
+                        log.write_entry(&GovernorLogEntry::Demand {
+                            ts: chrono::Utc::now().to_rfc3339(),
+                            step_id: step_id.clone(),
+                            resource: name.clone(),
+                            current: *current,
+                            desired: *desired,
+                            granted,
+                            reason: format!("demand granted; system not throttled"),
+                        });
+                    }
+                }
+            }
+        } else {
+            // Clear demands when throttling
+            self.demands.lock().unwrap().clear();
+        }
+
         *self.last_eval.lock().unwrap() = Instant::now();
     }
 
@@ -1318,6 +1895,8 @@ impl ResourceGovernor {
             throttle: Arc::clone(&self.throttle),
             emergency: Arc::clone(&self.emergency),
             prev_cpu: Arc::new(Mutex::new(None)),
+            prev_per_core: Arc::new(Mutex::new(Vec::new())),
+            prev_snapshot_faults: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -1337,6 +1916,16 @@ impl ResourceGovernor {
         }
         let strategy_name = self.strategy.lock().unwrap().name().to_string();
         println!("Resource governor: strategy={}", strategy_name);
+
+        if let Some(si) = &self.storage {
+            println!("  storage: {} ({}{})",
+                si.storage_type,
+                si.device,
+                si.model.as_deref().map(|m| format!(", {}", m)).unwrap_or_default(),
+            );
+            println!("  io-saturation-depth: {}", si.storage_type.saturation_queue_depth());
+        }
+
         let mut entries: Vec<_> = effective.iter().collect();
         entries.sort_by_key(|(k, _)| (*k).clone());
         for (name, value) in entries {
@@ -1368,18 +1957,34 @@ pub struct ResourceStatusSource {
     emergency: Arc<AtomicBool>,
     /// Previous CPU tick count and sample time for instantaneous CPU % computation.
     prev_cpu: Arc<Mutex<Option<(u64, Instant)>>>,
+    /// Previous per-core CPU ticks (busy, total) for delta-based utilization.
+    prev_per_core: Arc<Mutex<Vec<(u64, u64)>>>,
+    /// Previous snapshot for computing page cache hit ratio from fault deltas.
+    prev_snapshot_faults: Arc<Mutex<Option<(u64, u64)>>>,
 }
 
 impl ResourceStatusSource {
     /// Render a one-line status string showing current resource utilization.
     pub fn status_line(&self) -> String {
+        self.status_line_with_metrics().0
+    }
+
+    /// Sample system state and return both the formatted status line and
+    /// structured [`ResourceMetrics`] from a single snapshot.
+    ///
+    /// The status line is for text display; the metrics carry raw numeric
+    /// values for chart rendering without re-parsing.
+    pub fn status_line_with_metrics(&self) -> (String, ResourceMetrics) {
         let snapshot = SystemSnapshot::sample();
         let effective = self.effective.read().unwrap();
         let mut parts: Vec<String> = Vec::new();
+        let mut metrics = ResourceMetrics::default();
 
-        // Always show RSS
+        // RSS
+        metrics.rss_bytes = snapshot.rss_bytes;
         if let Some(mem_budget) = self.budget.get("mem") {
             let ceiling = mem_budget.ceiling();
+            metrics.rss_ceiling_bytes = ceiling;
             parts.push(format!("rss: {}/{}", format_value("mem", snapshot.rss_bytes), format_value("mem", ceiling)));
         } else {
             parts.push(format!("rss: {}", format_value("mem", snapshot.rss_bytes)));
@@ -1407,22 +2012,84 @@ impl ResourceStatusSource {
             *prev = Some((total_ticks, Instant::now()));
             pct
         };
+        metrics.cpu_pct = cpu_pct;
+        metrics.cpu_ceiling = (num_cpus * 100) as f64;
         parts.push(format!("cpu: {:.0}%/{}", cpu_pct, num_cpus * 100));
 
-        // Show thread budget (effective/ceiling), not process thread count
+        // Per-core CPU utilization (delta-based)
+        let current_cores = read_per_core_cpu_ticks();
+        if !current_cores.is_empty() {
+            let mut prev_cores = self.prev_per_core.lock().unwrap();
+            if prev_cores.len() == current_cores.len() {
+                let core_pcts: Vec<u64> = current_cores
+                    .iter()
+                    .zip(prev_cores.iter())
+                    .map(|(&(busy, total), &(prev_busy, prev_total))| {
+                        let d_busy = busy.saturating_sub(prev_busy);
+                        let d_total = total.saturating_sub(prev_total);
+                        if d_total > 0 {
+                            (d_busy as f64 / d_total as f64 * 100.0).round() as u64
+                        } else {
+                            0
+                        }
+                    })
+                    .map(|p| p.min(100))
+                    .collect();
+                let pct_strs: Vec<String> = core_pcts.iter().map(|p| p.to_string()).collect();
+                parts.push(format!("cpu_cores: {}", pct_strs.join(",")));
+                metrics.cpu_cores = core_pcts;
+            }
+            *prev_cores = current_cores;
+        }
+
+        // Threads
+        metrics.threads = snapshot.active_threads;
         if let Some(thread_budget) = self.budget.get("threads") {
-            let eff = effective.get("threads").copied().unwrap_or(0);
-            parts.push(format!("threads: {}/{}", eff, thread_budget.ceiling()));
+            metrics.thread_ceiling = thread_budget.ceiling();
+            parts.push(format!("threads: {}/{}", snapshot.active_threads, thread_budget.ceiling()));
         } else {
             parts.push(format!("threads: {}", snapshot.active_threads));
         }
 
         // I/O throughput (cumulative bytes — UI computes rates from deltas)
+        metrics.io_read_bytes = snapshot.io_read_bps;
+        metrics.io_write_bytes = snapshot.io_write_bps;
         parts.push(format!("io_r: {}", format_value("mem", snapshot.io_read_bps)));
         parts.push(format!("io_w: {}", format_value("mem", snapshot.io_write_bps)));
 
+        // I/O queue depth (inflight requests — read and write)
+        metrics.ioq_read = snapshot.io_inflight_read;
+        metrics.ioq_write = snapshot.io_inflight_write;
+        parts.push(format!("ioq_r: {}", snapshot.io_inflight_read));
+        parts.push(format!("ioq_w: {}", snapshot.io_inflight_write));
+
         // Page faults (cumulative counts)
+        metrics.major_faults = snapshot.cumulative_major_faults;
+        metrics.minor_faults = snapshot.cumulative_minor_faults;
         parts.push(format!("pgfault: {}/{}", snapshot.major_faults, snapshot.minor_faults));
+
+        // Page cache size and hit ratio
+        if snapshot.page_cache_bytes > 0 {
+            metrics.page_cache_bytes = snapshot.page_cache_bytes;
+            let hit_pct = {
+                let mut prev = self.prev_snapshot_faults.lock().unwrap();
+                let pct = if let Some((prev_minor, prev_major)) = *prev {
+                    let d_minor = snapshot.cumulative_minor_faults.saturating_sub(prev_minor);
+                    let d_major = snapshot.cumulative_major_faults.saturating_sub(prev_major);
+                    let total = d_minor + d_major;
+                    if total > 0 { Some((d_minor as f64 / total as f64) * 100.0) } else { None }
+                } else {
+                    None
+                };
+                *prev = Some((snapshot.cumulative_minor_faults, snapshot.cumulative_major_faults));
+                pct
+            };
+            metrics.page_cache_hit_pct = hit_pct;
+            match hit_pct {
+                Some(pct) => parts.push(format!("pcache: {} hit:{:.0}%", format_value("mem", snapshot.page_cache_bytes), pct)),
+                None => parts.push(format!("pcache: {}", format_value("mem", snapshot.page_cache_bytes))),
+            }
+        }
 
         // Show remaining budgeted resources (skip mem/threads already shown)
         let mut names: Vec<&String> = self.budget.keys()
@@ -1437,13 +2104,17 @@ impl ResourceStatusSource {
         }
 
         // Throttle/emergency indicator
-        if self.emergency.load(Ordering::Relaxed) {
+        let is_emergency = self.emergency.load(Ordering::Relaxed);
+        let is_throttle = self.throttle.load(Ordering::Relaxed);
+        metrics.emergency = is_emergency;
+        metrics.throttle = is_throttle;
+        if is_emergency {
             parts.push("⚠ EMERGENCY".to_string());
-        } else if self.throttle.load(Ordering::Relaxed) {
+        } else if is_throttle {
             parts.push("⏳ throttle".to_string());
         }
 
-        parts.join(" | ")
+        (parts.join(" | "), metrics)
     }
 
     /// Whether the governor is in emergency state.
@@ -1663,6 +2334,11 @@ mod tests {
             major_faults: 0,
             minor_faults: 0,
             active_threads: 6,
+            io_inflight_read: 0,
+            io_inflight_write: 0,
+            page_cache_bytes: 0,
+            cumulative_minor_faults: 0,
+            cumulative_major_faults: 0,
             cpu_user_ticks: 0,
             cpu_system_ticks: 0,
             ticks_per_sec: 100.0,
@@ -1691,6 +2367,11 @@ mod tests {
             major_faults: 0,
             minor_faults: 0,
             active_threads: 6,
+            io_inflight_read: 0,
+            io_inflight_write: 0,
+            page_cache_bytes: 0,
+            cumulative_minor_faults: 0,
+            cumulative_major_faults: 0,
             cpu_user_ticks: 0,
             cpu_system_ticks: 0,
             ticks_per_sec: 100.0,
@@ -1719,6 +2400,11 @@ mod tests {
             major_faults: 0,
             minor_faults: 0,
             active_threads: 0,
+            io_inflight_read: 0,
+            io_inflight_write: 0,
+            page_cache_bytes: 0,
+            cumulative_minor_faults: 0,
+            cumulative_major_faults: 0,
             cpu_user_ticks: 0,
             cpu_system_ticks: 0,
             ticks_per_sec: 100.0,
@@ -1787,5 +2473,133 @@ mod tests {
         assert_eq!(desc.name, "mem");
         assert_eq!(desc.description, "Test memory usage");
         assert!(desc.adjustable);
+    }
+
+    #[test]
+    fn test_storage_type_saturation_depths() {
+        assert_eq!(StorageType::LocalNvme.saturation_queue_depth(), 128);
+        assert_eq!(StorageType::NetworkBlock.saturation_queue_depth(), 32);
+        assert_eq!(StorageType::SataSsd.saturation_queue_depth(), 32);
+        assert_eq!(StorageType::Hdd.saturation_queue_depth(), 4);
+        assert_eq!(StorageType::Unknown.saturation_queue_depth(), 32);
+    }
+
+    #[test]
+    fn test_storage_type_labels() {
+        assert_eq!(StorageType::LocalNvme.label(), "local NVMe");
+        assert_eq!(StorageType::NetworkBlock.label(), "network block");
+        assert_eq!(StorageType::Hdd.label(), "HDD");
+    }
+
+    #[test]
+    fn test_classify_storage_rotational() {
+        assert_eq!(classify_storage("sda", true, None, None), StorageType::Hdd);
+    }
+
+    #[test]
+    fn test_classify_storage_ebs() {
+        assert_eq!(
+            classify_storage("nvme1n1", false, Some("Amazon Elastic Block Store"), Some("nvme")),
+            StorageType::NetworkBlock,
+        );
+    }
+
+    #[test]
+    fn test_classify_storage_instance() {
+        assert_eq!(
+            classify_storage("nvme0n1", false, Some("Amazon EC2 NVMe Instance Storage"), Some("nvme")),
+            StorageType::LocalNvme,
+        );
+    }
+
+    #[test]
+    fn test_classify_storage_bare_nvme() {
+        assert_eq!(
+            classify_storage("nvme0n1", false, None, Some("nvme")),
+            StorageType::LocalNvme,
+        );
+    }
+
+    #[test]
+    fn test_classify_storage_virtio() {
+        assert_eq!(
+            classify_storage("vda", false, None, Some("virtio")),
+            StorageType::NetworkBlock,
+        );
+    }
+
+    #[test]
+    fn test_classify_storage_xvd() {
+        assert_eq!(
+            classify_storage("xvda", false, None, None),
+            StorageType::NetworkBlock,
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_detect_storage_info_on_cwd() {
+        let info = detect_storage_info(std::path::Path::new("."));
+        // Should succeed on a real Linux system
+        assert!(info.is_some(), "detect_storage_info should work on real Linux");
+        let info = info.unwrap();
+        assert!(!info.device.is_empty());
+        // On this system we know it's NVMe-backed
+        assert!(
+            info.storage_type == StorageType::LocalNvme || info.storage_type == StorageType::NetworkBlock,
+            "expected NVMe or network block, got {:?}", info.storage_type,
+        );
+    }
+
+    #[test]
+    fn test_page_cache_hit_ratio() {
+        let prev = SystemSnapshot {
+            rss_bytes: 0, rss_pct: 0.0,
+            cpu_user_pct: 0.0, cpu_system_pct: 0.0,
+            io_read_bps: 0, io_write_bps: 0,
+            major_faults: 0, minor_faults: 0,
+            active_threads: 0,
+            io_inflight_read: 0, io_inflight_write: 0,
+            page_cache_bytes: 0,
+            cumulative_minor_faults: 1000,
+            cumulative_major_faults: 100,
+            cpu_user_ticks: 0, cpu_system_ticks: 0,
+            ticks_per_sec: 100.0,
+        };
+        let curr = SystemSnapshot {
+            cumulative_minor_faults: 1900,
+            cumulative_major_faults: 200,
+            ..prev.clone()
+        };
+        let ratio = curr.page_cache_hit_ratio(&prev).unwrap();
+        // 900 minor / (900 + 100) = 0.9
+        assert!((ratio - 0.9).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_page_cache_hit_ratio_no_faults() {
+        let s = SystemSnapshot {
+            rss_bytes: 0, rss_pct: 0.0,
+            cpu_user_pct: 0.0, cpu_system_pct: 0.0,
+            io_read_bps: 0, io_write_bps: 0,
+            major_faults: 0, minor_faults: 0,
+            active_threads: 0,
+            io_inflight_read: 0, io_inflight_write: 0,
+            page_cache_bytes: 0,
+            cumulative_minor_faults: 100,
+            cumulative_major_faults: 10,
+            cpu_user_ticks: 0, cpu_system_ticks: 0,
+            ticks_per_sec: 100.0,
+        };
+        assert!(s.page_cache_hit_ratio(&s).is_none());
+    }
+
+    #[test]
+    fn test_governor_storage_info() {
+        let gov = ResourceGovernor::default_governor();
+        // Default governor has no workspace, so no storage info
+        assert!(gov.storage_info().is_none());
+        assert_eq!(gov.storage_type(), StorageType::Unknown);
+        assert_eq!(gov.io_saturation_depth(), 32);
     }
 }

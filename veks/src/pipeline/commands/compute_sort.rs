@@ -183,6 +183,7 @@ indices, then write output in sorted order via mmap random access.
         }
 
         // Compute sort keys and build index
+        let pb = ctx.ui.bar(count as u64, "computing sort keys");
         let mut indexed_keys: Vec<(usize, f64)> = Vec::with_capacity(count);
         for i in 0..count {
             let vec = match reader.get(i) {
@@ -195,10 +196,14 @@ indices, then write output in sorted order via mmap random access.
                 }
             };
             indexed_keys.push((i, criterion.key(&vec)));
+            if (i + 1) % 10_000 == 0 { pb.set_position((i + 1) as u64); }
         }
+        pb.finish();
 
         // Sort by key (stable sort to preserve order for equal keys)
+        let sort_sp = ctx.ui.spinner("sorting");
         indexed_keys.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        sort_sp.finish();
 
         // Governor checkpoint after sort phase
         if ctx.governor.checkpoint() {
@@ -333,6 +338,7 @@ mod tests {
             step_id: String::new(),
             governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
             ui: crate::ui::UiHandle::new(std::sync::Arc::new(crate::ui::TestSink::new())),
+            status_interval: std::time::Duration::from_secs(1),
         }
     }
 

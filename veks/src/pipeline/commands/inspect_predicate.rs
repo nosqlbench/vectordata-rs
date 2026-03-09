@@ -4,9 +4,9 @@
 //! Pipeline command: inspect predicate ↔ metadata relationships.
 //!
 //! Given a predicate ordinal, renders the predicate from `predicates.slab`,
-//! looks up matching metadata ordinals from `predicate-keys.slab`, and
+//! looks up matching metadata ordinals from `metadata-indices.slab`, and
 //! renders each matching metadata record.  This illustrates the cross-
-//! reference computed by `generate predicate-keys`.
+//! reference computed by `evaluate predicates`.
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -38,19 +38,19 @@ impl CommandOp for InspectPredicateOp {
     fn command_doc(&self) -> CommandDoc {
         let options = self.describe_options();
         CommandDoc {
-            summary: "Inspect predicate ↔ metadata relationship via predicate-keys".into(),
+            summary: "Inspect predicate ↔ metadata relationship via metadata-indices".into(),
             body: format!(
                 r#"# inspect predicate
 
-Inspect predicate ↔ metadata relationship via predicate-keys.
+Inspect predicate ↔ metadata relationship via metadata-indices.
 
 ## Description
 
 For a given predicate ordinal, renders the predicate from the predicates slab,
-looks up matching metadata ordinals from the predicate-keys slab, and renders
+looks up matching metadata ordinals from the metadata-indices slab, and renders
 each matching metadata record in the specified vernacular.
 
-This illustrates the cross-reference computed by `generate predicate-keys`:
+This illustrates the cross-reference computed by `evaluate predicates`:
 which metadata records satisfy a given predicate.
 
 ## Options
@@ -60,7 +60,7 @@ which metadata records satisfy a given predicate.
 ## Notes
 
 - The ordinal indexes into the predicates slab (and the corresponding
-  predicate-keys record at the same ordinal).
+  metadata-indices record at the same ordinal).
 - Use `limit` to cap the number of matching metadata records shown.
 - Available vernaculars: json, yaml, sql, cql, cddl, readout, display.
 "#,
@@ -84,7 +84,7 @@ which metadata records satisfy a given predicate.
             Ok(s) => s,
             Err(e) => return error_result(e, start),
         };
-        let keys_str = match options.require("predicate-keys") {
+        let keys_str = match options.require("metadata-indices") {
             Ok(s) => s,
             Err(e) => return error_result(e, start),
         };
@@ -123,7 +123,7 @@ which metadata records satisfy a given predicate.
         };
         let keys_reader = match SlabReader::open(&keys_path) {
             Ok(r) => r,
-            Err(e) => return error_result(format!("open predicate-keys: {}", e), start),
+            Err(e) => return error_result(format!("open metadata-indices: {}", e), start),
         };
 
         // Read predicate at the given ordinal
@@ -142,11 +142,11 @@ which metadata records satisfy a given predicate.
             ),
         };
 
-        // Read predicate-keys record (matching metadata ordinals)
+        // Read metadata-indices record (matching metadata ordinals)
         let keys_bytes = match keys_reader.get(ordinal) {
             Ok(data) => data,
             Err(e) => return error_result(
-                format!("read predicate-keys at ordinal {}: {}", ordinal, e),
+                format!("read metadata-indices at ordinal {}: {}", ordinal, e),
                 start,
             ),
         };
@@ -217,7 +217,7 @@ which metadata records satisfy a given predicate.
         vec![
             opt("predicates", "Path", true, None, "Predicates slab file"),
             opt("metadata", "Path", true, None, "Metadata slab file"),
-            opt("predicate-keys", "Path", true, None, "Predicate-keys slab from generate predicate-keys"),
+            opt("metadata-indices", "Path", true, None, "Predicate-keys slab from evaluate predicates"),
             opt("ordinal", "int", true, None, "Predicate ordinal to inspect"),
             opt("vernacular", "enum", false, Some("readout"), "Rendering format: json, yaml, sql, cql, cddl, readout, display"),
             opt("limit", "int", false, Some("20"), "Max matching metadata records to display"),
@@ -225,7 +225,7 @@ which metadata records satisfy a given predicate.
     }
 }
 
-/// Read a predicate-keys slab record as a Vec of i32 base ordinals.
+/// Read a metadata-indices slab record as a Vec of i32 base ordinals.
 fn read_ordinals(data: &[u8]) -> Vec<i32> {
     let mut cursor = std::io::Cursor::new(data);
     let mut result = Vec::with_capacity(data.len() / 4);

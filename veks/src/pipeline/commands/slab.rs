@@ -143,7 +143,7 @@ fn read_source_records(path: &Path, format: &str) -> Result<Vec<Vec<u8>>, String
         }
         "slab" => {
             let reader = open_slab(path)
-                .map_err(|e| format!("failed to open slab: {}", e))?;
+                .map_err(|e| format!("failed to open slab {}: {}", path.display(), e))?;
             let mut records = Vec::new();
             let mut iter = reader.batch_iter(4096);
             loop {
@@ -209,7 +209,7 @@ impl CommandOp for SlabExportOp {
 
         let reader = match open_slab_display(&input_path, &ctx.ui) {
             Ok(r) => r,
-            Err(e) => return error_result(format!("failed to open: {}", e), start),
+            Err(e) => return error_result(format!("failed to open {}: {}", input_path.display(), e), start),
         };
 
         let output_path = options.get("to").map(|s| resolve_path(s, &ctx.workspace));
@@ -335,7 +335,7 @@ impl CommandOp for SlabAppendOp {
         // Read source records
         let source = match open_slab_display(&from_path, &ctx.ui) {
             Ok(r) => r,
-            Err(e) => return error_result(format!("failed to open source: {}", e), start),
+            Err(e) => return error_result(format!("failed to open source {}: {}", from_path.display(), e), start),
         };
 
         let config = match WriterConfig::new(512, page_size, u32::MAX, false) {
@@ -344,7 +344,7 @@ impl CommandOp for SlabAppendOp {
         };
         let mut writer = match SlabWriter::append(&target_path, config) {
             Ok(w) => w,
-            Err(e) => return error_result(format!("failed to open target for append: {}", e), start),
+            Err(e) => return error_result(format!("failed to open target for append {}: {}", target_path.display(), e), start),
         };
 
         let mut count = 0u64;
@@ -449,7 +449,7 @@ impl CommandOp for SlabRewriteOp {
 
         let reader = match open_slab_display(&source_path, &ctx.ui) {
             Ok(r) => r,
-            Err(e) => return error_result(format!("failed to open source: {}", e), start),
+            Err(e) => return error_result(format!("failed to open source {}: {}", source_path.display(), e), start),
         };
 
         let config = match WriterConfig::new(512, page_size, u32::MAX, false) {
@@ -657,7 +657,7 @@ impl CommandOp for SlabGetOp {
 
         let reader = match open_slab_display(&input_path, &ctx.ui) {
             Ok(r) => r,
-            Err(e) => return error_result(format!("failed to open: {}", e), start),
+            Err(e) => return error_result(format!("failed to open {}: {}", input_path.display(), e), start),
         };
 
         let mut found = 0;
@@ -775,7 +775,7 @@ impl CommandOp for SlabAnalyzeOp {
 
         let reader = match open_slab_display(&input_path, &ctx.ui) {
             Ok(r) => r,
-            Err(e) => return error_result(format!("failed to open: {}", e), start),
+            Err(e) => return error_result(format!("failed to open {}: {}", input_path.display(), e), start),
         };
 
         let page_entries = reader.page_entries();
@@ -929,7 +929,7 @@ impl CommandOp for SlabExplainOp {
 
         let reader = match open_slab_display(&input_path, &ctx.ui) {
             Ok(r) => r,
-            Err(e) => return error_result(format!("failed to open: {}", e), start),
+            Err(e) => return error_result(format!("failed to open {}: {}", input_path.display(), e), start),
         };
 
         let page_entries = reader.page_entries();
@@ -1128,7 +1128,7 @@ impl CommandOp for SlabInspectOp {
 
         let reader = match open_slab_display(&input_path, &ctx.ui) {
             Ok(r) => r,
-            Err(e) => return error_result(format!("failed to open: {}", e), start),
+            Err(e) => return error_result(format!("failed to open {}: {}", input_path.display(), e), start),
         };
 
         let mut found = 0;
@@ -1194,7 +1194,7 @@ pub fn survey_factory() -> Box<dyn CommandOp> {
 
 impl CommandOp for SlabSurveyOp {
     fn command_path(&self) -> &str {
-        "slab survey"
+        "survey"
     }
 
     fn command_doc(&self) -> CommandDoc {
@@ -1202,7 +1202,7 @@ impl CommandOp for SlabSurveyOp {
         CommandDoc {
             summary: "Survey metadata field value distributions".into(),
             body: format!(
-                "# slab survey\n\nSurvey metadata field value distributions.\n\n## Description\n\nScans slab records and reports the distribution of values for each metadata field.\n\n## Options\n\n{}",
+                "# survey\n\nSurvey metadata field value distributions.\n\n## Description\n\nScans slab records and reports the distribution of values for each metadata field.\n\n## Options\n\n{}",
                 render_options_table(&options)
             ),
         }
@@ -1495,7 +1495,7 @@ pub(crate) fn survey_slab(
     max_distinct: usize,
 ) -> Result<SurveyResult, String> {
     let reader = open_slab(path)
-        .map_err(|e| format!("failed to open: {}", e))?;
+        .map_err(|e| format!("failed to open {}: {}", path.display(), e))?;
 
     let page_entries = reader.page_entries();
     let total_pages = page_entries.len();
@@ -1870,6 +1870,7 @@ mod tests {
             step_id: String::new(),
             governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
             ui: crate::ui::UiHandle::new(std::sync::Arc::new(crate::ui::TestSink::new())),
+            status_interval: std::time::Duration::from_secs(1),
         }
     }
 

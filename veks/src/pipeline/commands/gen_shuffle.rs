@@ -83,12 +83,26 @@ be used as an index array for downstream extraction steps.
         // Build the identity sequence [0, 1, 2, ..., interval-1]
         let mut values: Vec<i32> = (0..interval as i32).collect();
 
-        // Fisher-Yates shuffle with the seeded PRNG
+        // Fisher-Yates shuffle with the seeded PRNG, with progress
+        let pb = ctx.ui.bar(interval as u64, "shuffle");
         let mut rng_inst = rng::seeded_rng(seed);
-        rng::fisher_yates_shuffle(&mut values, &mut rng_inst);
+        {
+            use rand::Rng;
+            let batch = 10_000.max(interval / 1000);
+            for i in (1..interval).rev() {
+                let j = rng_inst.random_range(0..=i);
+                values.swap(i, j);
+                if i % batch == 0 {
+                    pb.set_position((interval - i) as u64);
+                }
+            }
+            pb.set_position(interval as u64);
+        }
+        pb.finish();
 
         // Write as 1-dimensional ivec records
-        match write_ivec_1d(&output_path, &values) {
+        let write_pb = ctx.ui.bar(values.len() as u64, "write");
+        match write_ivec_1d(&output_path, &values, &write_pb) {
             Ok(()) => CommandResult {
                 status: Status::Ok,
                 message: format!(
@@ -133,21 +147,26 @@ be used as an index array for downstream extraction steps.
 /// Write a vector of i32 values as 1-dimensional ivec records.
 ///
 /// Each record: `[dim=1: i32 LE][value: i32 LE]` = 8 bytes.
-fn write_ivec_1d(output: &Path, values: &[i32]) -> Result<(), String> {
+fn write_ivec_1d(output: &Path, values: &[i32], pb: &crate::ui::ProgressHandle) -> Result<(), String> {
     use std::io::Write;
     let file = std::fs::File::create(output)
         .map_err(|e| format!("failed to create {}: {}", output.display(), e))?;
     let mut writer = std::io::BufWriter::with_capacity(1 << 20, file);
 
     let dim: i32 = 1;
-    for &value in values {
+    let batch = 10_000.max(values.len() / 1000);
+    for (i, &value) in values.iter().enumerate() {
         writer
             .write_all(&dim.to_le_bytes())
             .map_err(|e| e.to_string())?;
         writer
             .write_all(&value.to_le_bytes())
             .map_err(|e| e.to_string())?;
+        if (i + 1) % batch == 0 {
+            pb.inc(batch as u64);
+        }
     }
+    pb.set_position(values.len() as u64);
     writer.flush().map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -192,6 +211,7 @@ mod tests {
             step_id: String::new(),
             governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
             ui: crate::ui::UiHandle::new(std::sync::Arc::new(crate::ui::TestSink::new())),
+            status_interval: std::time::Duration::from_secs(1),
         }
     }
 

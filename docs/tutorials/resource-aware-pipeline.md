@@ -19,7 +19,7 @@ log to tune your configuration.
 ## Step 1: Start with a compute-heavy dataset.yaml
 
 Create or use a `dataset.yaml` that includes resource-intensive steps. This
-example imports metadata, generates predicates and predicate-keys, and
+example imports metadata, generates predicates and metadata-indices, and
 computes KNN ground truth:
 
 ```yaml
@@ -29,21 +29,21 @@ dimensions: 768
 
 upstream:
   steps:
-    - import facet:
+    - import:
         from: metadata.parquet
         to: metadata_content
         encoding: mnode
 
-    - generate predicates:
+    - synthesize predicates:
         survey: survey.json
         count: 1000
         to: predicates
 
-    - generate predicate-keys:
+    - evaluate predicates:
         metadata: metadata_content
         predicates: predicates
         survey: survey.json
-        to: predicate_keys
+        to: metadata_indices
 
     - compute knn:
         base: base_vectors.fvec
@@ -52,7 +52,7 @@ upstream:
         to: ground_truth
 ```
 
-The `generate predicate-keys` step scans the entire metadata slab once per
+The `evaluate predicates` step scans the entire metadata slab once per
 segment, evaluating every predicate against every record. The `compute knn`
 step memory-maps the full base vector file and runs brute-force distance
 computations. Both are resource-intensive.
@@ -109,9 +109,9 @@ Now the governor can dynamically adjust:
 - **Threads**: The governor starts at 6 threads and adjusts between 4 and 8
   based on CPU utilization and memory headroom.
 
-During the `import facet` step (I/O-bound, low memory), the governor will
+During the `import` step (I/O-bound, low memory), the governor will
 likely stay in the UNDERUSED band and scale toward the ceiling. During
-`generate predicate-keys` (memory-intensive), the governor will scale down
+`evaluate predicates` (memory-intensive), the governor will scale down
 if RSS climbs into the CAUTION or THROTTLE bands.
 
 ## Step 5: Examine the governor log
@@ -139,7 +139,7 @@ Each line is a JSON object. The key entry types are:
   "major_faults": 12,
   "minor_faults": 84200,
   "active_threads": 8,
-  "step_id": "generate-predicate-keys"
+  "step_id": "evaluate-predicates"
 }
 ```
 
@@ -149,7 +149,7 @@ Each line is a JSON object. The key entry types are:
 {
   "type": "decision",
   "ts": "2026-03-05T06:14:30.125Z",
-  "step_id": "generate-predicate-keys",
+  "step_id": "evaluate-predicates",
   "resource": "segmentsize",
   "old_value": 1000000,
   "new_value": 750000,
@@ -166,7 +166,7 @@ Each line is a JSON object. The key entry types are:
 {
   "type": "throttle",
   "ts": "2026-03-05T06:14:35.001Z",
-  "step_id": "generate-predicate-keys",
+  "step_id": "evaluate-predicates",
   "reason": "RSS exceeded 90% of ceiling; throttle requested",
   "resources_affected": ["segmentsize", "threads"]
 }
@@ -178,7 +178,7 @@ Each line is a JSON object. The key entry types are:
 {
   "type": "request",
   "ts": "2026-03-05T06:14:36.100Z",
-  "step_id": "generate-predicate-keys",
+  "step_id": "evaluate-predicates",
   "resource": "segmentsize",
   "requested": 1500000,
   "granted": 750000,

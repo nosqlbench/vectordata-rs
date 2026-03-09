@@ -11,7 +11,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use super::event::{ProgressId, ProgressKind, UiEvent};
+use super::event::{ProgressId, ProgressKind, ResourceMetrics, UiEvent};
 use super::sink::UiSink;
 
 /// Owned handle to a single progress indicator.
@@ -159,11 +159,22 @@ impl UiHandle {
         self.sink.send(UiEvent::EmitLn { text: text.into() });
     }
 
-    /// Update the resource status line.
+    /// Update the resource status line (text only, no structured metrics).
+    ///
+    /// Prefer [`resource_status_with_metrics`] when structured data is available.
     pub fn resource_status(&self, line: impl Into<String>) {
         self.sink.send(UiEvent::ResourceStatus {
             line: line.into(),
+            metrics: ResourceMetrics::default(),
         });
+    }
+
+    /// Update the resource status with both formatted text and structured metrics.
+    ///
+    /// The TUI uses `metrics` directly for chart rendering, avoiding
+    /// re-parsing the formatted text.
+    pub fn resource_status_with_metrics(&self, line: String, metrics: ResourceMetrics) {
+        self.sink.send(UiEvent::ResourceStatus { line, metrics });
     }
 
     /// Begin a batch — suppress intermediate redraws until [`suspend_end`].
@@ -201,6 +212,16 @@ impl UiHandle {
     pub fn set_context(&self, label: impl Into<String>) {
         self.sink.send(UiEvent::SetContext {
             label: label.into(),
+        });
+    }
+
+    /// Set the YAML snippet for the current pipeline step.
+    ///
+    /// Displayed as a scrollable panel alongside the throughput chart.
+    /// Pass an empty string to clear it.
+    pub fn set_step_yaml(&self, yaml: impl Into<String>) {
+        self.sink.send(UiEvent::SetStepYaml {
+            yaml: yaml.into(),
         });
     }
 

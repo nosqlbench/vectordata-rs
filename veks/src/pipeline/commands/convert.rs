@@ -126,7 +126,7 @@ impl CommandOp for ConvertFileOp {
         let threads = ctx.governor.current_or("threads", ctx.threads as u64) as usize;
         let mut source = match reader::open_source(&source_path, source_format, threads, None) {
             Ok(s) => s,
-            Err(e) => return error_result(format!("failed to open source: {}", e), start),
+            Err(e) => return error_result(format!("failed to open source {}: {}", source_path.display(), e), start),
         };
 
         let dimension = source.dimension();
@@ -177,7 +177,7 @@ impl CommandOp for ConvertFileOp {
         };
         let mut sink = match writer::open_sink(&output_path, to_format, &sink_config) {
             Ok(s) => s,
-            Err(e) => return error_result(format!("failed to open sink: {}", e), start),
+            Err(e) => return error_result(format!("failed to open sink {}: {}", output_path.display(), e), start),
         };
 
         // Progress bar

@@ -114,7 +114,7 @@ innocuous in shell completion (comment syntax):
 
 ```
 $ veks pipeline compute <TAB>
-filtered-knn    # Brute-force filtered KNN with predicate-key pre-filtering
+filtered-knn    # Brute-force filtered KNN with predicate pre-filtering
 knn             # Brute-force exact K-nearest-neighbor computation
 sort            # Sort vectors by ordinal mapping
 ```
@@ -125,7 +125,7 @@ derive              # Derive new facets from existing data
 fvec-extract        # Extract a subset of vectors from an fvec file
 hvec-extract        # Extract a subset of vectors from an hvec file
 ivec-extract        # Extract a subset of vectors from an ivec file
-predicate-keys      # Evaluate predicates against metadata to produce match ordinals
+metadata-indices      # Evaluate predicates against metadata to produce match ordinals
 predicates          # Generate random predicate trees from metadata survey
 vectors             # Generate synthetic random vectors
 ```
@@ -273,7 +273,7 @@ Commands for computing distance-based results over vector datasets.
 | Command | Summary |
 |---------|---------|
 | `knn` | Brute-force exact K-nearest-neighbor computation |
-| `filtered-knn` | Brute-force filtered KNN with predicate-key pre-filtering |
+| `filtered-knn` | Brute-force filtered KNN with predicate pre-filtering |
 | `sort` | Sort vectors by ordinal mapping |
 ```
 

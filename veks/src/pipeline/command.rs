@@ -60,7 +60,7 @@ pub fn render_options_table(options: &[OptionDesc]) -> String {
 /// generate, compute, etc.) behind a uniform interface so the pipeline runner
 /// can orchestrate them generically.
 pub trait CommandOp: Send {
-    /// Canonical command path, e.g. `"import facet"` or `"generate vectors"`.
+    /// Canonical command path, e.g. `"import"` or `"generate vectors"`.
     fn command_path(&self) -> &str;
 
     /// Execute with resolved options.
@@ -211,6 +211,8 @@ pub struct StreamContext {
     pub governor: ResourceGovernor,
     /// UI-agnostic event handle for progress, logging, and output.
     pub ui: UiHandle,
+    /// Interval between resource status polls and TUI redraws.
+    pub status_interval: std::time::Duration,
 }
 
 /// Describes a single accepted option for a `CommandOp`.

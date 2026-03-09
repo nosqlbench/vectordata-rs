@@ -76,7 +76,7 @@ impl CommandOp for AnalyzeFindOp {
             Ok(r) => r,
             Err(e) => {
                 return error_result(
-                    format!("failed to open source: {}", e),
+                    format!("failed to open source {}: {}", source_path.display(), e),
                     start,
                 )
             }
@@ -111,7 +111,7 @@ impl CommandOp for AnalyzeFindOp {
             Ok(r) => r,
             Err(e) => {
                 return error_result(
-                    format!("failed to open target: {}", e),
+                    format!("failed to open target {}: {}", target_path.display(), e),
                     start,
                 )
             }
@@ -378,6 +378,7 @@ mod tests {
             step_id: String::new(),
             governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
             ui: crate::ui::UiHandle::new(std::sync::Arc::new(crate::ui::TestSink::new())),
+            status_interval: std::time::Duration::from_secs(1),
         }
     }
 

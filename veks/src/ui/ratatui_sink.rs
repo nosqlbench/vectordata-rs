@@ -1,7 +1,7 @@
 // Copyright (c) DataStax, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Rich terminal [`UiSink`] using ratatui's `Viewport::Inline` mode.
+//! Rich terminal [`UiSink`] using ratatui's alternate screen mode.
 //!
 //! Renders progress bars and a resource status line in a fixed region at the
 //! bottom of the terminal. Log lines scroll above the fixed area via
@@ -27,7 +27,7 @@ use ratatui::{
     style::{Color, Modifier, Style},
     symbols,
     text::{Line, Span},
-    widgets::{Axis, Block, Borders, Chart, Dataset, Gauge, GraphType, Paragraph, Widget},
+    widgets::{Axis, Block, Borders, Chart, Dataset, Gauge, GraphType, Paragraph, Sparkline, Widget},
 };
 
 use super::event::{ProgressId, ProgressKind, UiEvent};
@@ -41,7 +41,7 @@ enum RenderMsg {
     Shutdown,
 }
 
-/// Rich terminal sink using ratatui `Viewport::Inline`.
+/// Rich terminal sink using ratatui alternate screen mode.
 ///
 /// Thread-safe: holds only a channel sender and an atomic id counter.
 /// The actual terminal rendering happens on a background thread.
@@ -57,12 +57,17 @@ impl RatatuiSink {
     /// `inline_height` is the number of terminal lines reserved for the
     /// fixed progress region (typically 4-8).
     pub fn new(inline_height: u16) -> io::Result<Self> {
+        Self::with_redraw_interval(inline_height, Duration::from_secs(1))
+    }
+
+    /// Create a new ratatui-based sink with a custom redraw interval.
+    pub fn with_redraw_interval(inline_height: u16, redraw_interval: Duration) -> io::Result<Self> {
         let (tx, rx) = mpsc::channel::<RenderMsg>();
 
         let handle = thread::Builder::new()
             .name("ratatui-render".into())
             .spawn(move || {
-                if let Err(e) = render_loop(rx, inline_height) {
+                if let Err(e) = render_loop(rx, inline_height, redraw_interval) {
                     eprintln!("ratatui render error: {}", e);
                 }
             })
@@ -161,6 +166,109 @@ impl MetricsHistory {
     }
 }
 
+/// Time-series buffer that keeps up to `capacity` data points and
+/// automatically downsamples when full.
+///
+/// When the buffer reaches capacity, consecutive pairs of samples are merged
+/// (averaged), halving the point count and doubling the effective sampling
+/// period. The x-coordinates are normalized to `0..N` so the chart always
+/// stretches from left to right regardless of the sampling period.
+struct DownsamplingHistory {
+    data: Vec<(f64, f64)>,
+    capacity: usize,
+    /// How many raw samples have been accumulated into the current pending slot.
+    pending_count: u64,
+    /// Accumulated value for the current pending slot (to be averaged).
+    pending_sum: f64,
+    /// Current downsampling factor: every `stride` raw samples become one point.
+    stride: u64,
+    /// Total raw samples received (for stride accounting).
+    raw_count: u64,
+    max_value: f64,
+}
+
+impl DownsamplingHistory {
+    fn new(capacity: usize) -> Self {
+        DownsamplingHistory {
+            data: Vec::with_capacity(capacity),
+            capacity,
+            pending_count: 0,
+            pending_sum: 0.0,
+            stride: 1,
+            raw_count: 0,
+            max_value: 1.0,
+        }
+    }
+
+    fn push(&mut self, value: f64) {
+        self.raw_count += 1;
+        self.pending_count += 1;
+        self.pending_sum += value;
+
+        if self.pending_count >= self.stride {
+            let avg = self.pending_sum / self.pending_count as f64;
+            self.pending_count = 0;
+            self.pending_sum = 0.0;
+
+            if self.data.len() >= self.capacity {
+                self.compact();
+            }
+            let x = self.data.len() as f64;
+            self.data.push((x, avg));
+            if avg > self.max_value {
+                self.max_value = avg;
+            }
+        }
+    }
+
+    /// Merge consecutive pairs, halving the data and doubling the stride.
+    fn compact(&mut self) {
+        let mut compacted = Vec::with_capacity(self.data.len() / 2 + 1);
+        let mut i = 0;
+        while i + 1 < self.data.len() {
+            let avg = (self.data[i].1 + self.data[i + 1].1) / 2.0;
+            compacted.push((compacted.len() as f64, avg));
+            i += 2;
+        }
+        // If odd number of points, keep the last one.
+        if i < self.data.len() {
+            compacted.push((compacted.len() as f64, self.data[i].1));
+        }
+        self.data = compacted;
+        self.stride *= 2;
+        // Recompute max after compaction (averages may be lower than peaks).
+        self.max_value = self.data.iter().map(|p| p.1).fold(1.0f64, f64::max);
+    }
+
+    fn as_slice(&self) -> &[(f64, f64)] {
+        &self.data
+    }
+
+    fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+
+    fn x_bounds(&self) -> [f64; 2] {
+        if self.data.is_empty() {
+            return [0.0, 1.0];
+        }
+        [0.0, (self.data.len() as f64).max(1.0)]
+    }
+
+    fn y_bounds(&self) -> [f64; 2] {
+        [0.0, self.max_value * 1.25]
+    }
+
+    fn clear(&mut self) {
+        self.data.clear();
+        self.pending_count = 0;
+        self.pending_sum = 0.0;
+        self.stride = 1;
+        self.raw_count = 0;
+        self.max_value = 1.0;
+    }
+}
+
 /// Mutable state owned by the render thread.
 struct RenderState {
     bars: HashMap<ProgressId, BarState>,
@@ -175,16 +283,26 @@ struct RenderState {
     thread_history: MetricsHistory,
     /// CPU usage history for chart (total percentage).
     cpu_history: MetricsHistory,
+    /// Per-core CPU utilization percentages (0–100 per core).
+    cpu_cores: Vec<u64>,
     /// I/O read rate history (MB/s).
     io_read_history: MetricsHistory,
     /// I/O write rate history (MB/s).
     io_write_history: MetricsHistory,
     /// Page fault rate history (major faults/s).
     pgfault_history: MetricsHistory,
+    /// System page cache size history (MB).
+    pcache_history: MetricsHistory,
+    /// I/O queue depth history — read inflight requests.
+    ioq_read_history: MetricsHistory,
+    /// I/O queue depth history — write inflight requests.
+    ioq_write_history: MetricsHistory,
     /// Previous cumulative I/O read bytes (for delta computation).
     prev_io_read: f64,
     /// Previous cumulative I/O write bytes.
     prev_io_write: f64,
+    /// Timestamp of last I/O sample (for rate computation).
+    last_io_time: Instant,
     /// Previous cumulative major fault count.
     prev_major_faults: f64,
     /// RSS ceiling in MB (from resource budget), for chart reference line.
@@ -195,6 +313,28 @@ struct RenderState {
     cpu_ceiling: f64,
     /// Whether to show the keystroke help overlay.
     show_help: bool,
+    /// RPS (records per second) history with auto-downsampling.
+    rps_history: DownsamplingHistory,
+    /// Previous bar positions for computing RPS deltas.
+    prev_positions: HashMap<ProgressId, u64>,
+    /// Timestamp of the last RPS sample.
+    last_rps_sample: Instant,
+    /// Extra budget items not covered by dedicated charts (e.g., "segmentsize: 1M/1M").
+    extra_budget: Vec<String>,
+    /// Alert indicator: "EMERGENCY", "throttle", or empty.
+    alert: String,
+    /// Current RSS readout string for chart title (e.g., "2.5G/806G").
+    rss_readout: String,
+    /// Current thread readout string for chart title (e.g., "128/128").
+    thread_readout: String,
+    /// Current pgfault readout string for chart title (e.g., "0/26M").
+    pgfault_readout: String,
+    /// Current page cache readout string for chart title (e.g., "120G hit:98%").
+    pcache_readout: String,
+    /// YAML snippet of the current pipeline step.
+    step_yaml: String,
+    /// Height of the step YAML panel (user-adjustable via up/down arrows).
+    step_yaml_height: u16,
     /// Whether rendering is paused (`p` key toggle).
     paused: bool,
     /// One-shot flag: redraw once to show/hide PAUSED indicator.
@@ -213,16 +353,32 @@ impl RenderState {
             rss_history: MetricsHistory::new(120),
             thread_history: MetricsHistory::new(120),
             cpu_history: MetricsHistory::new(120),
+            cpu_cores: Vec::new(),
             io_read_history: MetricsHistory::new(120),
             io_write_history: MetricsHistory::new(120),
             pgfault_history: MetricsHistory::new(120),
+            pcache_history: MetricsHistory::new(120),
+            ioq_read_history: MetricsHistory::new(120),
+            ioq_write_history: MetricsHistory::new(120),
+            rps_history: DownsamplingHistory::new(4096),
+            prev_positions: HashMap::new(),
+            last_rps_sample: Instant::now(),
             prev_io_read: 0.0,
             prev_io_write: 0.0,
+            last_io_time: Instant::now(),
             prev_major_faults: 0.0,
             rss_ceiling_mb: 0.0,
             thread_ceiling: 0.0,
             cpu_ceiling: 0.0,
+            extra_budget: Vec::new(),
+            alert: String::new(),
+            rss_readout: String::new(),
+            thread_readout: String::new(),
+            pgfault_readout: String::new(),
+            pcache_readout: String::new(),
             show_help: false,
+            step_yaml: String::new(),
+            step_yaml_height: 8,
             paused: false,
             pause_redraw_pending: false,
             suspended: false,
@@ -237,43 +393,55 @@ impl RenderState {
         }
         let context_line = if self.context_label.is_empty() { 0u16 } else { 1 };
         let bar_lines = self.bar_order.len() as u16;
-        let status_lines = if self.resource_status.is_empty() {
-            0
-        } else if self.rss_history.data.len() >= 2 {
-            11 // status text + 10-line chart (8 data + 2 border)
+        let has_rps = self.rps_history.data.len() >= 2;
+        let has_yaml = !self.step_yaml.is_empty();
+        // The top panel shows YAML + throughput side-by-side. Its height
+        // is the YAML panel height when YAML is present, otherwise just
+        // the RPS chart height (8 lines).
+        let top_panel_lines = if has_yaml {
+            self.step_yaml_height
+        } else if has_rps {
+            8u16
         } else {
-            1
+            0
         };
+        let has_extra = !self.alert.is_empty() || !self.extra_budget.is_empty();
+        let extra_line = if has_extra { 1u16 } else { 0 };
+        let chart_lines = if !self.resource_status.is_empty() && self.rss_history.data.len() >= 2 {
+            10u16 // min chart height
+        } else {
+            0
+        };
+        let status_lines = extra_line + chart_lines;
         let paused_line = if self.paused { 1 } else { 0 };
-        context_line + bar_lines + status_lines + paused_line
+        context_line + bar_lines + top_panel_lines + status_lines + paused_line
     }
 }
 
 /// Restore the terminal to a usable state: show cursor, disable raw mode,
 /// and flush stdout.
 fn restore_terminal<B: ratatui::backend::Backend + io::Write>(terminal: &mut Terminal<B>) {
-    let _ = terminal.clear();
-    let _ = crossterm::execute!(terminal.backend_mut(), cursor::Show);
+    let _ = crossterm::execute!(
+        terminal.backend_mut(),
+        crossterm::terminal::LeaveAlternateScreen,
+        cursor::Show,
+    );
     let _ = io::Write::flush(terminal.backend_mut());
     let _ = disable_raw_mode();
 }
 
 /// Main render loop running on the background thread.
-fn render_loop(rx: mpsc::Receiver<RenderMsg>, max_height: u16) -> io::Result<()> {
+fn render_loop(rx: mpsc::Receiver<RenderMsg>, max_height: u16, redraw_interval: Duration) -> io::Result<()> {
     enable_raw_mode()?;
-    let stdout = io::stdout();
+    let mut stdout = io::stdout();
+    crossterm::execute!(stdout, crossterm::terminal::EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::with_options(
-        backend,
-        ratatui::TerminalOptions {
-            viewport: ratatui::Viewport::Inline(max_height),
-        },
-    )?;
+    let mut terminal = Terminal::new(backend)?;
 
     let mut state = RenderState::new();
-    let min_redraw_interval = Duration::from_millis(50);
+    let min_redraw_interval = redraw_interval;
     let mut last_draw = Instant::now() - min_redraw_interval;
-    let poll_timeout = Duration::from_millis(50);
+    let poll_timeout = Duration::from_millis(100);
     let mut last_escape: Option<Instant> = None;
 
     loop {
@@ -335,6 +503,16 @@ fn render_loop(rx: mpsc::Receiver<RenderMsg>, max_height: u16) -> io::Result<()>
                     // Force immediate redraw to show/hide the PAUSED indicator.
                     state.pause_redraw_pending = true;
                     state.dirty = true;
+                } else if key.code == KeyCode::Up {
+                    if state.step_yaml_height > 4 {
+                        state.step_yaml_height -= 1;
+                        state.dirty = true;
+                    }
+                } else if key.code == KeyCode::Down {
+                    if state.step_yaml_height < 30 {
+                        state.step_yaml_height += 1;
+                        state.dirty = true;
+                    }
                 }
             }
         }
@@ -363,6 +541,25 @@ fn render_loop(rx: mpsc::Receiver<RenderMsg>, max_height: u16) -> io::Result<()>
         // Flush text output above the progress region.
         flush_logs(&mut terminal, &pending_logs)?;
         flush_emits(&mut terminal, &pending_emits)?;
+
+        // Sample RPS from bar position deltas.
+        let rps_dt = state.last_rps_sample.elapsed().as_secs_f64();
+        if rps_dt >= 0.25 && !state.bar_order.is_empty() {
+            let mut total_delta: u64 = 0;
+            for id in &state.bar_order {
+                if let Some(bar) = state.bars.get(id) {
+                    if bar.kind == ProgressKind::Bar {
+                        let prev = state.prev_positions.get(id).copied().unwrap_or(0);
+                        total_delta += bar.position.saturating_sub(prev);
+                        state.prev_positions.insert(*id, bar.position);
+                    }
+                }
+            }
+            let rps = total_delta as f64 / rps_dt;
+            state.rps_history.push(rps);
+            state.last_rps_sample = Instant::now();
+            state.dirty = true;
+        }
 
         // Rate-limited redraw. When paused, only redraw once (to show the
         // PAUSED indicator), then suppress until unpaused.
@@ -430,6 +627,7 @@ fn process_msg(
         UiEvent::ProgressFinish { id } => {
             state.bars.remove(id);
             state.bar_order.retain(|x| x != id);
+            state.prev_positions.remove(id);
             state.dirty = true;
         }
 
@@ -445,77 +643,115 @@ fn process_msg(
             emits.push((text.clone(), true));
         }
 
-        UiEvent::ResourceStatus { line } => {
+        UiEvent::ResourceStatus { line, metrics } => {
+            let now = Instant::now();
             state.resource_status = line.clone();
-            // Parse RSS and thread values for chart history.
-            // Format: "rss: 1.2G/4G | threads: 4/8 | ..."
-            for part in line.split(" | ") {
-                if let Some(rest) = part.strip_prefix("rss: ") {
-                    // "1.2 GiB/4.0 GiB" → current/ceiling
-                    let mut parts = rest.split('/');
-                    if let Some(current) = parts.next().and_then(|s| parse_size_to_mb(s.trim())) {
-                        state.rss_history.push(current);
-                    }
-                    if let Some(ceiling) = parts.next().and_then(|s| parse_size_to_mb(s.trim())) {
-                        state.rss_ceiling_mb = ceiling;
-                    }
-                } else if let Some(rest) = part.strip_prefix("cpu: ") {
-                    // "42%/800" → current pct / ceiling pct
-                    let mut parts = rest.split('/');
-                    if let Some(current) = parts.next().and_then(|s| s.trim().strip_suffix('%').and_then(|n| n.parse::<f64>().ok())) {
-                        state.cpu_history.push(current);
-                    }
-                    if let Some(ceiling) = parts.next().and_then(|s| s.trim().parse::<f64>().ok()) {
-                        state.cpu_ceiling = ceiling;
-                    }
-                } else if let Some(rest) = part.strip_prefix("threads: ") {
-                    let mut parts = rest.split('/');
-                    if let Some(current) = parts.next().and_then(|s| s.trim().parse::<f64>().ok()) {
-                        state.thread_history.push(current);
-                    }
-                    if let Some(ceiling) = parts.next().and_then(|s| s.trim().parse::<f64>().ok()) {
-                        state.thread_ceiling = ceiling;
-                    }
-                } else if let Some(rest) = part.strip_prefix("io_r: ") {
-                    // Cumulative read bytes — compute rate as delta/interval
-                    if let Some(current_mb) = parse_size_to_mb(rest.trim()) {
-                        let rate = if state.prev_io_read > 0.0 {
-                            (current_mb - state.prev_io_read) * 2.0 // ×2 because 500ms interval
-                        } else {
-                            0.0
-                        };
-                        state.prev_io_read = current_mb;
-                        state.io_read_history.push(rate.max(0.0));
-                    }
-                } else if let Some(rest) = part.strip_prefix("io_w: ") {
-                    if let Some(current_mb) = parse_size_to_mb(rest.trim()) {
-                        let rate = if state.prev_io_write > 0.0 {
-                            (current_mb - state.prev_io_write) * 2.0
-                        } else {
-                            0.0
-                        };
-                        state.prev_io_write = current_mb;
-                        state.io_write_history.push(rate.max(0.0));
-                    }
-                } else if let Some(rest) = part.strip_prefix("pgfault: ") {
-                    // "major/minor" — track major fault rate
-                    let mut parts = rest.split('/');
-                    if let Some(major) = parts.next().and_then(|s| s.trim().parse::<f64>().ok()) {
-                        let rate = if state.prev_major_faults > 0.0 {
-                            (major - state.prev_major_faults) * 2.0
-                        } else {
-                            0.0
-                        };
-                        state.prev_major_faults = major;
-                        state.pgfault_history.push(rate.max(0.0));
-                    }
-                }
+            state.extra_budget.clear();
+            state.alert.clear();
+
+            // Use structured metrics directly for chart data — no text parsing.
+            let m = &metrics;
+
+            // RSS
+            let rss_mb = bytes_to_mb(m.rss_bytes);
+            state.rss_history.push(rss_mb);
+            if m.rss_ceiling_bytes > 0 {
+                state.rss_ceiling_mb = bytes_to_mb(m.rss_ceiling_bytes);
+                state.rss_readout = format!("{}/{}", format_mb(rss_mb), format_mb(state.rss_ceiling_mb));
+            } else {
+                state.rss_readout = format_mb(rss_mb);
             }
+
+            // CPU
+            state.cpu_history.push(m.cpu_pct);
+            state.cpu_ceiling = m.cpu_ceiling;
+
+            // Per-core CPU
+            state.cpu_cores = m.cpu_cores.clone();
+
+            // Threads
+            state.thread_history.push(m.threads as f64);
+            state.thread_ceiling = m.thread_ceiling as f64;
+            if m.thread_ceiling > 0 {
+                state.thread_readout = format!("{}/{}", m.threads, m.thread_ceiling);
+            } else {
+                state.thread_readout = format!("{}", m.threads);
+            }
+
+            // I/O throughput — cumulative bytes, compute rate from deltas
+            let io_read_mb = bytes_to_mb(m.io_read_bytes);
+            let io_write_mb = bytes_to_mb(m.io_write_bytes);
+            let dt = now.duration_since(state.last_io_time).as_secs_f64();
+            if state.prev_io_read > 0.0 && dt > 0.0 {
+                state.io_read_history.push(((io_read_mb - state.prev_io_read) / dt).max(0.0));
+            } else {
+                state.io_read_history.push(0.0);
+            }
+            if state.prev_io_write > 0.0 && dt > 0.0 {
+                state.io_write_history.push(((io_write_mb - state.prev_io_write) / dt).max(0.0));
+            } else {
+                state.io_write_history.push(0.0);
+            }
+            state.prev_io_read = io_read_mb;
+            state.prev_io_write = io_write_mb;
+
+            // I/O queue depth
+            state.ioq_read_history.push(m.ioq_read as f64);
+            state.ioq_write_history.push(m.ioq_write as f64);
+
+            // Page cache
+            let pcache_mb = bytes_to_mb(m.page_cache_bytes);
+            state.pcache_history.push(pcache_mb);
+            state.pcache_readout = match m.page_cache_hit_pct {
+                Some(pct) => format!("{} hit:{:.0}%", format_mb(pcache_mb), pct),
+                None => format_mb(pcache_mb),
+            };
+
+            // Page faults — track major fault rate from cumulative deltas
+            let major = m.major_faults as f64;
+            if state.prev_major_faults > 0.0 && dt > 0.0 {
+                state.pgfault_history.push(((major - state.prev_major_faults) / dt).max(0.0));
+            } else {
+                state.pgfault_history.push(0.0);
+            }
+            state.prev_major_faults = major;
+            state.pgfault_readout = format!("{}/{}", m.major_faults, m.minor_faults);
+
+            // Alert state
+            if m.emergency {
+                state.alert = "⚠ EMERGENCY".to_string();
+            } else if m.throttle {
+                state.alert = "⏳ throttle".to_string();
+            }
+
+            // Collect extra budget items from the text line (non-standard resources)
+            for part in line.split(" | ") {
+                let trimmed = part.trim();
+                if trimmed.starts_with("rss:") || trimmed.starts_with("cpu:")
+                    || trimmed.starts_with("cpu_cores:") || trimmed.starts_with("threads:")
+                    || trimmed.starts_with("io_r:") || trimmed.starts_with("io_w:")
+                    || trimmed.starts_with("ioq_r:") || trimmed.starts_with("ioq_w:")
+                    || trimmed.starts_with("ioq:") || trimmed.starts_with("pcache:")
+                    || trimmed.starts_with("pgfault:")
+                    || trimmed.contains("EMERGENCY") || trimmed.contains("throttle")
+                    || trimmed.starts_with("segmentsize")
+                {
+                    continue;
+                }
+                state.extra_budget.push(trimmed.to_string());
+            }
+
+            state.last_io_time = now;
             state.dirty = true;
         }
 
         UiEvent::SetContext { label } => {
             state.context_label = label.clone();
+            state.dirty = true;
+        }
+
+        UiEvent::SetStepYaml { yaml } => {
+            state.step_yaml = yaml.clone();
             state.dirty = true;
         }
 
@@ -532,6 +768,9 @@ fn process_msg(
             state.bars.clear();
             state.bar_order.clear();
             state.resource_status.clear();
+            state.rps_history.clear();
+            state.prev_positions.clear();
+            state.step_yaml.clear();
             state.dirty = true;
         }
     }
@@ -669,8 +908,11 @@ fn draw_progress<B: ratatui::backend::Backend>(
             return;
         }
 
-        // Build constraints: context line + bars + status/chart + paused.
+        // Build constraints: context line + bars + top panel (YAML + RPS) + status/chart + paused.
         let has_chart = state.rss_history.data.len() >= 2;
+        let has_rps_chart = state.rps_history.data.len() >= 2;
+        let has_yaml = !state.step_yaml.is_empty();
+        let has_top_panel = has_yaml || has_rps_chart;
         let mut constraints: Vec<Constraint> = Vec::new();
 
         if !state.context_label.is_empty() {
@@ -679,17 +921,34 @@ fn draw_progress<B: ratatui::backend::Backend>(
         for _ in &state.bar_order {
             constraints.push(Constraint::Length(1)); // progress bar
         }
-        if !state.resource_status.is_empty() {
-            constraints.push(Constraint::Length(1)); // status text
-            if has_chart {
-                constraints.push(Constraint::Length(10)); // chart area (8 data + 2 border)
+        let has_extra = !state.alert.is_empty() || !state.extra_budget.is_empty();
+        let has_resource_chart = !state.resource_status.is_empty() && has_chart;
+        if has_top_panel && has_resource_chart {
+            // Both panels present — split remaining space 50/50
+            constraints.push(Constraint::Percentage(50)); // top: YAML + RPS
+            if has_extra {
+                constraints.push(Constraint::Length(1)); // alert/extra budget line
+            }
+            constraints.push(Constraint::Percentage(50)); // bottom: resource charts
+        } else {
+            if has_top_panel {
+                let top_height = if has_yaml { state.step_yaml_height } else { 8 };
+                constraints.push(Constraint::Length(top_height));
+            }
+            if has_extra {
+                constraints.push(Constraint::Length(1));
+            }
+            if has_resource_chart {
+                constraints.push(Constraint::Min(10));
             }
         }
         if state.paused {
             constraints.push(Constraint::Length(1)); // paused indicator
         }
-        // Fill remaining space.
-        constraints.push(Constraint::Min(0));
+        if !has_chart {
+            // Fill remaining space when no chart is shown.
+            constraints.push(Constraint::Min(0));
+        }
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -706,7 +965,7 @@ fn draw_progress<B: ratatui::backend::Backend>(
                     &state.context_label,
                     Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled("  (? help)", Style::default().fg(Color::DarkGray)),
+                Span::styled("  (? help  ↑↓ resize)", Style::default().fg(Color::DarkGray)),
             ]);
             frame.render_widget(Paragraph::new(ctx_line), chunks[idx]);
             idx += 1;
@@ -719,21 +978,78 @@ fn draw_progress<B: ratatui::backend::Backend>(
             idx += 1;
         }
 
-        if !state.resource_status.is_empty() {
+        // Top panel: YAML panel (left) + RPS chart (right), or just RPS
+        if has_top_panel {
             if idx < chunks.len() {
-                let spans = colorize_resource_status(&state.resource_status);
-                let status = Paragraph::new(Line::from(spans));
-                frame.render_widget(status, chunks[idx]);
+                let top_area = chunks[idx];
+                if has_yaml && has_rps_chart {
+                    // Side-by-side: YAML left, RPS right
+                    let halves = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints([
+                            Constraint::Percentage(45),
+                            Constraint::Percentage(55),
+                        ])
+                        .split(top_area);
+                    render_step_yaml(frame, halves[0], state);
+                    render_rps_chart(frame, halves[1], state);
+                } else if has_yaml {
+                    // YAML only (no RPS data yet)
+                    render_step_yaml(frame, top_area, state);
+                } else {
+                    // RPS only (no step YAML)
+                    render_rps_chart(frame, top_area, state);
+                }
             }
             idx += 1;
+        }
 
-            // Chart: RSS + threads over time
-            if has_chart {
-                if idx < chunks.len() {
-                    render_resource_chart(frame, chunks[idx], state);
+        // Alert / extra budget line
+        if has_extra {
+            if idx < chunks.len() {
+                let mut spans: Vec<Span> = Vec::new();
+                spans.push(Span::styled(
+                    " ▸ ",
+                    Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD),
+                ));
+                if !state.alert.is_empty() {
+                    let (alert_color, alert_mod) = if state.alert.contains("EMERGENCY") {
+                        (Color::Red, Modifier::BOLD)
+                    } else {
+                        (Color::Yellow, Modifier::empty())
+                    };
+                    spans.push(Span::styled(
+                        &state.alert,
+                        Style::default().fg(alert_color).add_modifier(alert_mod),
+                    ));
+                    if !state.extra_budget.is_empty() {
+                        spans.push(Span::styled(" │ ", Style::default().fg(Color::DarkGray)));
+                    }
                 }
-                idx += 1;
+                for (i, item) in state.extra_budget.iter().enumerate() {
+                    if i > 0 {
+                        spans.push(Span::styled(" │ ", Style::default().fg(Color::DarkGray)));
+                    }
+                    if let Some(colon_pos) = item.find(':') {
+                        let label = &item[..=colon_pos];
+                        let value = &item[colon_pos + 1..];
+                        spans.push(Span::styled(label, Style::default().fg(Color::DarkGray)));
+                        spans.push(Span::styled(value, Style::default().fg(Color::White)));
+                    } else {
+                        spans.push(Span::raw(item));
+                    }
+                }
+                frame.render_widget(Paragraph::new(Line::from(spans)), chunks[idx]);
             }
+            idx += 1;
+        }
+
+        // Resource charts
+        if !state.resource_status.is_empty() && has_chart {
+            if idx < chunks.len() {
+                render_resource_chart(frame, chunks[idx], state);
+            }
+            idx += 1;
         }
 
         if state.paused && idx < chunks.len() {
@@ -746,6 +1062,11 @@ fn draw_progress<B: ratatui::backend::Backend>(
     })?;
 
     Ok(())
+}
+
+/// Convert raw bytes to megabytes (MiB) for chart data.
+fn bytes_to_mb(bytes: u64) -> f64 {
+    bytes as f64 / (1024.0 * 1024.0)
 }
 
 /// Parse a human-readable size string to megabytes (as `f64`).
@@ -795,48 +1116,6 @@ fn parse_size_to_mb(s: &str) -> Option<f64> {
 
 /// Colorize the resource status line.
 ///
-/// Parses the `"rss: 1.2G/4G | threads: 4/8 | ⚠ EMERGENCY"` format
-/// produced by `ResourceStatusSource::status_line()` and applies color:
-/// - Label ("rss:", "threads:") in dim white
-/// - Values in default color
-/// - EMERGENCY in bold red
-/// - Throttle in yellow
-fn colorize_resource_status(status: &str) -> Vec<Span<'_>> {
-    let mut spans = Vec::new();
-    spans.push(Span::styled(
-        " ▸ ",
-        Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD),
-    ));
-
-    for (i, part) in status.split(" | ").enumerate() {
-        if i > 0 {
-            spans.push(Span::styled(" │ ", Style::default().fg(Color::DarkGray)));
-        }
-
-        if part.contains("EMERGENCY") {
-            spans.push(Span::styled(
-                part,
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-            ));
-        } else if part.contains("throttle") {
-            spans.push(Span::styled(
-                part,
-                Style::default().fg(Color::Yellow),
-            ));
-        } else if let Some(colon_pos) = part.find(':') {
-            // "label: value/ceiling"
-            let label = &part[..=colon_pos];
-            let value = &part[colon_pos + 1..];
-            spans.push(Span::styled(label, Style::default().fg(Color::DarkGray)));
-            spans.push(Span::styled(value, Style::default().fg(Color::White)));
-        } else {
-            spans.push(Span::raw(part));
-        }
-    }
-
-    spans
-}
-
 /// Format a megabyte value as a compact human-readable string.
 fn format_mb(mb: f64) -> String {
     if mb >= 1_048_576.0 {
@@ -878,6 +1157,10 @@ fn render_help(frame: &mut ratatui::Frame, area: Rect) {
             Span::styled("  Ctrl-Z  ", Style::default().fg(Color::Yellow)),
             Span::raw("Suspend process"),
         ]),
+        Line::from(vec![
+            Span::styled("  ↑ / ↓   ", Style::default().fg(Color::Yellow)),
+            Span::raw("Resize step YAML panel"),
+        ]),
     ];
     let block = Block::default()
         .borders(Borders::ALL)
@@ -890,7 +1173,7 @@ fn render_help(frame: &mut ratatui::Frame, area: Rect) {
 /// Build a single-dataset chart widget for a metric time series.
 fn metric_chart<'a>(
     history: &'a MetricsHistory,
-    title: &str,
+    title: &'a str,
     color: Color,
     y_label: String,
     dim: Style,
@@ -907,7 +1190,7 @@ fn metric_chart<'a>(
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(Span::styled(format!(" {} ", title), Style::default().fg(color)))
+                .title(Span::styled(title, Style::default().fg(color)))
                 .border_style(dim),
         )
         .x_axis(Axis::default().bounds(history.x_bounds()).style(dim))
@@ -922,113 +1205,285 @@ fn metric_chart<'a>(
         )
 }
 
+/// Render the current step's YAML snippet in a bordered panel.
+fn render_step_yaml(frame: &mut ratatui::Frame, area: Rect, state: &RenderState) {
+    let dim = Style::default().fg(Color::DarkGray);
+    let key_style = Style::default().fg(Color::Cyan);
+    let val_style = Style::default().fg(Color::White);
+
+    let lines: Vec<Line> = state.step_yaml.lines().map(|line| {
+        // Colorize YAML: keys in cyan, values in white
+        if let Some(colon_pos) = line.find(':') {
+            let indent_end = line.len() - line.trim_start().len();
+            let key_part = &line[..colon_pos + 1];
+            let val_part = &line[colon_pos + 1..];
+            if val_part.is_empty() || indent_end <= colon_pos {
+                Line::from(vec![
+                    Span::styled(key_part, key_style),
+                    Span::styled(val_part, val_style),
+                ])
+            } else {
+                Line::from(Span::styled(line, val_style))
+            }
+        } else if line.trim_start().starts_with('-') {
+            Line::from(Span::styled(line, val_style))
+        } else {
+            Line::from(Span::styled(line, dim))
+        }
+    }).collect();
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(" step ", Style::default().fg(Color::Cyan)))
+        .border_style(dim);
+    let paragraph = Paragraph::new(lines).block(block);
+    frame.render_widget(paragraph, area);
+}
+
+/// Render the RPS time-series chart.
+fn render_rps_chart(frame: &mut ratatui::Frame, area: Rect, state: &RenderState) {
+    let dim = Style::default().fg(Color::DarkGray);
+    let y_max = state.rps_history.y_bounds()[1];
+    let y_label = format_rate(y_max);
+    let title_label = {
+        // Show current RPS in the title
+        let current = state.rps_history.as_slice().last().map(|p| p.1).unwrap_or(0.0);
+        format!(" throughput: {} ", format_rate(current))
+    };
+
+    let datasets = vec![
+        Dataset::default()
+            .name("rps")
+            .marker(symbols::Marker::Braille)
+            .graph_type(GraphType::Line)
+            .style(Style::default().fg(Color::Yellow))
+            .data(state.rps_history.as_slice()),
+    ];
+
+    let chart = Chart::new(datasets)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(Span::styled(title_label, Style::default().fg(Color::Yellow)))
+                .border_style(dim),
+        )
+        .x_axis(Axis::default().bounds(state.rps_history.x_bounds()).style(dim))
+        .y_axis(
+            Axis::default()
+                .bounds(state.rps_history.y_bounds())
+                .labels(vec![
+                    Span::styled("0", dim),
+                    Span::styled(y_label, dim),
+                ])
+                .style(dim),
+        );
+
+    frame.render_widget(chart, area);
+}
+
+/// Render a dual-series (read/write) time-series chart.
+fn rw_chart<'a>(
+    read_history: &'a MetricsHistory,
+    write_history: &'a MetricsHistory,
+    title_spans: Vec<Span<'a>>,
+    dim: Style,
+    y_format: fn(f64) -> String,
+) -> Chart<'a> {
+    let mut datasets = Vec::new();
+    let mut y_max = 1.0f64;
+    if !read_history.is_empty() {
+        y_max = y_max.max(read_history.max_value * 1.25);
+        datasets.push(
+            Dataset::default()
+                .name("read")
+                .marker(symbols::Marker::Braille)
+                .graph_type(GraphType::Line)
+                .style(Style::default().fg(Color::Cyan))
+                .data(read_history.as_slice()),
+        );
+    }
+    if !write_history.is_empty() {
+        y_max = y_max.max(write_history.max_value * 1.25);
+        datasets.push(
+            Dataset::default()
+                .name("write")
+                .marker(symbols::Marker::Braille)
+                .graph_type(GraphType::Line)
+                .style(Style::default().fg(Color::Yellow))
+                .data(write_history.as_slice()),
+        );
+    }
+    let x_bounds = if !read_history.is_empty() {
+        read_history.x_bounds()
+    } else {
+        write_history.x_bounds()
+    };
+    let label = y_format(y_max);
+    Chart::new(datasets)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(Line::from(title_spans))
+                .border_style(dim),
+        )
+        .x_axis(Axis::default().bounds(x_bounds).style(dim))
+        .y_axis(
+            Axis::default()
+                .bounds([0.0, y_max])
+                .labels(vec![
+                    Span::styled("0", dim),
+                    Span::styled(label, dim),
+                ])
+                .style(dim),
+        )
+}
+
 /// Render the resource metrics charts: RSS, CPU, I/O, threads, page faults.
+///
+/// Each chart's title includes the current readout value so that the separate
+/// status text line is no longer needed.
 fn render_resource_chart(frame: &mut ratatui::Frame, area: Rect, state: &RenderState) {
     let panels = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage(25), // RSS
-            Constraint::Percentage(20), // CPU
-            Constraint::Percentage(20), // I/O
-            Constraint::Percentage(15), // threads
-            Constraint::Percentage(20), // faults
+            Constraint::Percentage(16), // RSS
+            Constraint::Percentage(14), // page cache (adjacent to RSS)
+            Constraint::Percentage(10), // faults (adjacent to page cache)
+            Constraint::Percentage(14), // CPU
+            Constraint::Percentage(18), // I/O throughput
+            Constraint::Percentage(14), // I/O queue
+            Constraint::Percentage(14), // threads
         ])
         .split(area);
 
     let dim = Style::default().fg(Color::DarkGray);
 
-    // RSS (magenta)
+    // RSS (magenta) — title shows current/ceiling
     if !state.rss_history.is_empty() {
+        let title = if state.rss_readout.is_empty() {
+            " rss ".to_string()
+        } else {
+            format!(" rss {} ", state.rss_readout)
+        };
         let label = format_mb(state.rss_history.y_bounds()[1]);
         frame.render_widget(
-            metric_chart(&state.rss_history, "rss", Color::Magenta, label, dim),
+            metric_chart(&state.rss_history, &title, Color::Magenta, label, dim),
             panels[0],
         );
     }
 
-    // CPU (green)
-    if !state.cpu_history.is_empty() {
-        let label = format!("{}%", state.cpu_history.y_bounds()[1] as u64);
+    // Page cache (yellow) — adjacent to RSS
+    if !state.pcache_history.is_empty() {
+        let title = if state.pcache_readout.is_empty() {
+            " pcache ".to_string()
+        } else {
+            format!(" pcache {} ", state.pcache_readout)
+        };
+        let label = format_mb(state.pcache_history.y_bounds()[1]);
         frame.render_widget(
-            metric_chart(&state.cpu_history, "cpu", Color::Green, label, dim),
+            metric_chart(&state.pcache_history, &title, Color::Yellow, label, dim),
             panels[1],
         );
     }
 
-    // I/O — read (cyan) and write (yellow) on the same chart
-    if !state.io_read_history.is_empty() || !state.io_write_history.is_empty() {
-        let mut datasets = Vec::new();
-        // Compute combined Y bounds from both read and write
-        let mut y_max = 1.0f64;
-        if !state.io_read_history.is_empty() {
-            y_max = y_max.max(state.io_read_history.max_value * 1.25);
-            datasets.push(
-                Dataset::default()
-                    .name("read")
-                    .marker(symbols::Marker::Braille)
-                    .graph_type(GraphType::Line)
-                    .style(Style::default().fg(Color::Cyan))
-                    .data(state.io_read_history.as_slice()),
-            );
-        }
-        if !state.io_write_history.is_empty() {
-            y_max = y_max.max(state.io_write_history.max_value * 1.25);
-            datasets.push(
-                Dataset::default()
-                    .name("write")
-                    .marker(symbols::Marker::Braille)
-                    .graph_type(GraphType::Line)
-                    .style(Style::default().fg(Color::Yellow))
-                    .data(state.io_write_history.as_slice()),
-            );
-        }
-        // Use the read history for X bounds (both are populated together)
-        let x_bounds = if !state.io_read_history.is_empty() {
-            state.io_read_history.x_bounds()
+    // Page faults (red) — adjacent to page cache for correlation
+    if !state.pgfault_history.is_empty() {
+        let title = if state.pgfault_readout.is_empty() {
+            " faults ".to_string()
         } else {
-            state.io_write_history.x_bounds()
+            format!(" faults {} ", state.pgfault_readout)
         };
-        let label = format!("{}/s", format_mb(y_max));
-        let chart = Chart::new(datasets)
+        let label = format!("{}/s", state.pgfault_history.y_bounds()[1] as u64);
+        frame.render_widget(
+            metric_chart(&state.pgfault_history, &title, Color::Red, label, dim),
+            panels[2],
+        );
+    }
+
+    // CPU — per-core sparkline when available, otherwise time-series chart
+    if !state.cpu_cores.is_empty() {
+        let active = state.cpu_cores.iter().filter(|&&v| v > 0).count();
+        let total = state.cpu_cores.len();
+        let avg = if total > 0 {
+            state.cpu_cores.iter().sum::<u64>() / total as u64
+        } else {
+            0
+        };
+        let title = format!(" cpu {}/{} avg {}% ", active, total, avg);
+        let sparkline = Sparkline::default()
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title(Line::from(vec![
-                        Span::styled(" io ", Style::default().fg(Color::Cyan)),
-                        Span::styled("r", Style::default().fg(Color::Cyan)),
-                        Span::styled("/", dim),
-                        Span::styled("w ", Style::default().fg(Color::Yellow)),
-                    ]))
+                    .title(Span::styled(title, Style::default().fg(Color::Green)))
                     .border_style(dim),
             )
-            .x_axis(Axis::default().bounds(x_bounds).style(dim))
-            .y_axis(
-                Axis::default()
-                    .bounds([0.0, y_max])
-                    .labels(vec![
-                        Span::styled("0", dim),
-                        Span::styled(label, dim),
-                    ])
-                    .style(dim),
-            );
-        frame.render_widget(chart, panels[2]);
-    }
-
-    // Threads (blue)
-    if !state.thread_history.is_empty() {
-        let label = format!("{}", state.thread_history.y_bounds()[1] as u64);
+            .data(&state.cpu_cores)
+            .max(100)
+            .style(Style::default().fg(Color::Green));
+        frame.render_widget(sparkline, panels[3]);
+    } else if !state.cpu_history.is_empty() {
+        let label = format!("{}%", state.cpu_history.y_bounds()[1] as u64);
         frame.render_widget(
-            metric_chart(&state.thread_history, "threads", Color::Blue, label, dim),
+            metric_chart(&state.cpu_history, " cpu ", Color::Green, label, dim),
             panels[3],
         );
     }
 
-    // Page faults (red)
-    if !state.pgfault_history.is_empty() {
-        let label = format!("{}/s", state.pgfault_history.y_bounds()[1] as u64);
+    // I/O throughput — read (cyan) and write (yellow)
+    if !state.io_read_history.is_empty() || !state.io_write_history.is_empty() {
+        let r_rate = state.io_read_history.as_slice().last().map(|p| p.1).unwrap_or(0.0);
+        let w_rate = state.io_write_history.as_slice().last().map(|p| p.1).unwrap_or(0.0);
+        let title_spans = vec![
+            Span::styled(" io ", Style::default().fg(Color::White)),
+            Span::styled(format!("r:{}/s", format_mb(r_rate)), Style::default().fg(Color::Cyan)),
+            Span::styled(" ", dim),
+            Span::styled(format!("w:{}/s ", format_mb(w_rate)), Style::default().fg(Color::Yellow)),
+        ];
         frame.render_widget(
-            metric_chart(&state.pgfault_history, "faults", Color::Red, label, dim),
+            rw_chart(
+                &state.io_read_history,
+                &state.io_write_history,
+                title_spans,
+                dim,
+                |y| format!("{}/s", format_mb(y)),
+            ),
             panels[4],
+        );
+    }
+
+    // I/O queue depth — read (cyan) and write (yellow)
+    if !state.ioq_read_history.is_empty() || !state.ioq_write_history.is_empty() {
+        let r_cur = state.ioq_read_history.as_slice().last().map(|p| p.1 as u64).unwrap_or(0);
+        let w_cur = state.ioq_write_history.as_slice().last().map(|p| p.1 as u64).unwrap_or(0);
+        let title_spans = vec![
+            Span::styled(" ioq ", Style::default().fg(Color::White)),
+            Span::styled(format!("r:{}", r_cur), Style::default().fg(Color::Cyan)),
+            Span::styled(" ", dim),
+            Span::styled(format!("w:{} ", w_cur), Style::default().fg(Color::Yellow)),
+        ];
+        frame.render_widget(
+            rw_chart(
+                &state.ioq_read_history,
+                &state.ioq_write_history,
+                title_spans,
+                dim,
+                |y| format!("{}", y as u64),
+            ),
+            panels[5],
+        );
+    }
+
+    // Threads (blue) — title shows current/ceiling
+    if !state.thread_history.is_empty() {
+        let title = if state.thread_readout.is_empty() {
+            " threads ".to_string()
+        } else {
+            format!(" threads {} ", state.thread_readout)
+        };
+        let label = format!("{}", state.thread_history.y_bounds()[1] as u64);
+        frame.render_widget(
+            metric_chart(&state.thread_history, &title, Color::Blue, label, dim),
+            panels[6],
         );
     }
 }
@@ -1044,17 +1499,23 @@ fn render_bar(frame: &mut ratatui::Frame, area: Rect, bar: &BarState) {
             };
             let pct = (ratio * 100.0) as u16;
             let elapsed = bar.created_at.elapsed().as_secs_f64();
-            let rps_str = if elapsed > 0.5 && bar.position > 0 {
+            let rate_eta = if elapsed > 0.5 && bar.position > 0 {
                 let rps = bar.position as f64 / elapsed;
                 let rate = format_rate(rps);
-                if rate.is_empty() { String::new() } else { format!(" {}", rate) }
+                let eta = if bar.total > bar.position && rps > 0.0 {
+                    let remaining = (bar.total - bar.position) as f64;
+                    format!(" eta {}", format_duration(remaining / rps))
+                } else {
+                    String::new()
+                };
+                if rate.is_empty() { eta } else { format!(" {}{}", rate, eta) }
             } else {
                 String::new()
             };
             let label_str = if bar.message.is_empty() {
-                format!("{} [{}/{}] {}%{}", bar.label, format_count(bar.position), format_count(bar.total), pct, rps_str)
+                format!("{} [{}/{}] {}%{}", bar.label, format_count(bar.position), format_count(bar.total), pct, rate_eta)
             } else {
-                format!("{} [{}/{}] {}%{} {}", bar.label, format_count(bar.position), format_count(bar.total), pct, rps_str, bar.message)
+                format!("{} [{}/{}] {}%{} {}", bar.label, format_count(bar.position), format_count(bar.total), pct, rate_eta, bar.message)
             };
 
             let gauge = Gauge::default()
@@ -1069,10 +1530,16 @@ fn render_bar(frame: &mut ratatui::Frame, area: Rect, bar: &BarState) {
             } else {
                 0.0
             };
-            let label_str = if bar.message.is_empty() {
-                bar.label.clone()
+            let elapsed = bar.created_at.elapsed().as_secs_f64();
+            let elapsed_str = if elapsed > 0.5 {
+                format!(" [{}]", format_duration(elapsed))
             } else {
-                format!("{} {}", bar.label, bar.message)
+                String::new()
+            };
+            let label_str = if bar.message.is_empty() {
+                format!("{}{}", bar.label, elapsed_str)
+            } else {
+                format!("{} {}{}", bar.label, bar.message, elapsed_str)
             };
             let gauge = Gauge::default()
                 .gauge_style(Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
@@ -1100,9 +1567,11 @@ fn render_bar(frame: &mut ratatui::Frame, area: Rect, bar: &BarState) {
 }
 
 /// Format a rate value as a compact human-readable string (e.g. "1.2M/s").
+///
+/// Uses K/M/G suffixes (not B for billion) to avoid confusion with bytes.
 fn format_rate(rps: f64) -> String {
     if rps >= 1_000_000_000.0 {
-        format!("{:.1}B/s", rps / 1_000_000_000.0)
+        format!("{:.1}G/s", rps / 1_000_000_000.0)
     } else if rps >= 1_000_000.0 {
         format!("{:.1}M/s", rps / 1_000_000.0)
     } else if rps >= 1_000.0 {
@@ -1111,6 +1580,20 @@ fn format_rate(rps: f64) -> String {
         format!("{:.0}/s", rps)
     } else {
         String::new()
+    }
+}
+
+/// Format a duration in seconds as a compact human-readable string.
+fn format_duration(secs: f64) -> String {
+    let s = secs as u64;
+    if s < 60 {
+        format!("{}s", s)
+    } else if s < 3600 {
+        format!("{}m{}s", s / 60, s % 60)
+    } else {
+        let h = s / 3600;
+        let m = (s % 3600) / 60;
+        format!("{}h{}m", h, m)
     }
 }
 
@@ -1130,6 +1613,7 @@ fn format_count(n: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::event::ResourceMetrics;
 
     #[test]
     fn format_count_thousands() {
@@ -1145,7 +1629,49 @@ mod tests {
         assert_eq!(format_rate(42.0), "42/s");
         assert_eq!(format_rate(1_500.0), "1.5K/s");
         assert_eq!(format_rate(2_300_000.0), "2.3M/s");
-        assert_eq!(format_rate(1_200_000_000.0), "1.2B/s");
+        assert_eq!(format_rate(1_200_000_000.0), "1.2G/s");
+    }
+
+    #[test]
+    fn downsampling_history_basic() {
+        let mut h = DownsamplingHistory::new(8);
+        for i in 0..8 {
+            h.push(i as f64);
+        }
+        assert_eq!(h.data.len(), 8);
+        assert_eq!(h.stride, 1);
+
+        // 9th push: stride is still 1 when pending check runs, so value is
+        // emitted immediately. But data.len()==8 triggers compact first
+        // (8→4, stride=2), then the point is appended → 5 total.
+        h.push(100.0);
+        assert_eq!(h.stride, 2);
+        assert_eq!(h.data.len(), 5);
+        assert!((h.data[4].1 - 100.0).abs() < 0.001);
+
+        // 10th push: stride=2, pending_count=1 < 2 → still pending
+        h.push(200.0);
+        assert_eq!(h.data.len(), 5);
+
+        // 11th push: pending_count=2 >= 2 → emit average of 200+300=250
+        h.push(300.0);
+        assert_eq!(h.data.len(), 6);
+        assert!((h.data[5].1 - 250.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn downsampling_history_x_stretches() {
+        let mut h = DownsamplingHistory::new(16);
+        for i in 0..10 {
+            h.push(i as f64);
+        }
+        let bounds = h.x_bounds();
+        assert_eq!(bounds[0], 0.0);
+        assert_eq!(bounds[1], 10.0);
+        // X coords are sequential 0..N
+        for (i, pt) in h.as_slice().iter().enumerate() {
+            assert_eq!(pt.0, i as f64);
+        }
     }
 
     #[test]
@@ -1164,8 +1690,20 @@ mod tests {
         });
         assert_eq!(state.visible_lines(), 1);
 
+        // Resource status without chart data — no extra lines (no status text line)
         state.resource_status = "mem: 1.2G / 4G".into();
+        assert_eq!(state.visible_lines(), 1);
+
+        // With alert, adds an extra line
+        state.alert = "⏳ throttle".into();
         assert_eq!(state.visible_lines(), 2);
+        state.alert.clear();
+
+        // With chart data, adds chart area
+        for i in 0..5 {
+            state.rss_history.push(i as f64 * 100.0);
+        }
+        assert_eq!(state.visible_lines(), 1 + 10); // bar + chart
     }
 
     #[test]
@@ -1462,6 +2000,7 @@ mod tests {
         process_msg(
             &RenderMsg::Event(UiEvent::ResourceStatus {
                 line: "status".into(),
+                metrics: ResourceMetrics::default(),
             }),
             &mut state, &mut logs, &mut emits,
         );
@@ -1561,13 +2100,9 @@ mod tests {
         let bar_row = row_text(&buf, 0);
         assert!(bar_row.contains("computing"), "Row 0 should contain the progress bar label, got: '{}'", bar_row);
 
-        // Row 1: resource status line
-        let status_row = row_text(&buf, 1);
-        assert!(status_row.contains("rss:"), "Row 1 should contain resource status, got: '{}'", status_row);
-
-        // Rows 2..12: chart area (10 lines: 8 data + 2 border)
-        // The chart should have content in multiple rows, not just the edges.
-        let chart_rows_with_content: Vec<u16> = (2..12)
+        // Row 1: chart area starts (no separate status line)
+        // Charts should have content in multiple rows
+        let chart_rows_with_content: Vec<u16> = (1..height)
             .filter(|&r| row_has_content(&buf, r))
             .collect();
         assert!(
@@ -1577,18 +2112,11 @@ mod tests {
             chart_rows_with_content,
         );
 
-        // The top chart row (row 2) should have Y-axis label content
-        let top_chart_row = row_text(&buf, 2);
+        // The first chart row should have the title/border
+        let top_chart_row = row_text(&buf, 1);
         assert!(
-            !top_chart_row.is_empty(),
-            "Top chart row should have Y-axis label, got empty"
-        );
-
-        // The Y-axis max label should NOT be a raw number like "907991M"
-        // It should be formatted compactly like "3.6G"
-        assert!(
-            !top_chart_row.contains("M") || top_chart_row.len() < 15 || top_chart_row.contains("G"),
-            "Y-axis label should be compact, got: '{}'", top_chart_row
+            top_chart_row.contains("rss"),
+            "First chart row should contain chart title, got: '{}'", top_chart_row
         );
     }
 
@@ -1646,24 +2174,23 @@ mod tests {
             "Progress bar row should not contain chart characters: '{}'", row0
         );
 
-        // Row 1 should be the status line
+        // Row 1 should be the start of chart area (box-drawing border with title)
         let row1 = row_text(&buf, 1);
-        assert!(row1.contains("rss:"), "Row 1 should be resource status, got: '{}'", row1);
+        assert!(row1.contains("rss"), "Row 1 should be chart border with rss title, got: '{}'", row1);
     }
 
     #[test]
-    fn layout_status_only_no_chart_when_insufficient_data() {
+    fn layout_no_chart_when_insufficient_data() {
         let mut state = RenderState::new();
         state.resource_status = "rss: 1.0 GiB | threads: 4".into();
         // Only 1 data point — not enough for chart
         state.rss_history.push(1024.0);
         state.dirty = true;
 
-        assert_eq!(state.visible_lines(), 1, "Should be 1 line (status only) with < 2 data points");
+        // No chart, no extra budget/alert — visible_lines is 0
+        assert_eq!(state.visible_lines(), 0, "Should be 0 lines with no bars, no chart, no extra");
 
         let buf = render_state_to_buffer(&state, 80, 4);
-        let row0 = row_text(&buf, 0);
-        assert!(row0.contains("rss:"), "Should show status text without chart");
 
         // No braille characters anywhere
         for r in 0..4 {

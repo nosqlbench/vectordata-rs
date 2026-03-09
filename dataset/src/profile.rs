@@ -8,6 +8,17 @@
 //! `"default"` profile exists, all other profiles automatically inherit its
 //! views and `maxk` unless explicitly overridden.
 //!
+//! ## Reserved profile names
+//!
+//! Two profile names are reserved:
+//!
+//! - **`default`** — The baseline profile. All other profiles inherit its
+//!   `maxk` and views unless explicitly overridden.
+//! - **`sized`** — Not a profile itself, but a list of size specifications
+//!   that expand into named profiles with `base_count` set. See below.
+//!
+//! All other profile names are available for custom profiles.
+//!
 //! ## Custom facets
 //!
 //! Profile view keys that do not match a recognized standard facet are
@@ -32,6 +43,31 @@
 //!     indices: gnd/idx_1M.ivecs
 //!     distances: gnd/dis_1M.fvecs
 //! ```
+//!
+//! ## Sized profile sugar
+//!
+//! Instead of declaring each sized profile individually, use the `sized` key
+//! with a list of size specifications:
+//!
+//! ```yaml
+//! profiles:
+//!   default:
+//!     maxk: 100
+//!     query_vectors: query_vectors.hvec
+//!   sized: [10m, 20m, 100m..400m/100m]
+//! ```
+//!
+//! This expands to profiles named `10m`, `20m`, `100m`, `200m`, `300m`, `400m`,
+//! each with `base_count` set and inheriting from `default`. Profiles are sorted
+//! smallest to largest.
+//!
+//! ### Sized entry forms
+//!
+//! - **Simple value**: `10m` — one profile with base_count 10,000,000
+//! - **Linear range (step)**: `100m..400m/100m` — profiles at each absolute step
+//! - **Linear range (count)**: `0m..400m/10` — 10 equal divisions (bare number = count)
+//! - **Fibonacci**: `fib:1m..400m` — fibonacci multiples of start within range
+//! - **Geometric**: `mul:1m..400m/2` — compound by factor (doubling, tripling, etc.)
 
 use std::fmt;
 
@@ -40,7 +76,7 @@ use serde::{Deserialize, Serialize};
 use serde::de::{self, Visitor};
 
 use crate::facet::resolve_standard_key;
-use crate::source::{DSSource, DSWindow, parse_source_string};
+use crate::source::{DSSource, DSWindow, format_count_with_suffix, parse_number_with_suffix, parse_source_string};
 
 /// A view of a data facet within a profile.
 ///
@@ -298,6 +334,162 @@ impl<'de> Deserialize<'de> for DSProfile {
 }
 
 // ---------------------------------------------------------------------------
+// Sized profile expansion
+// ---------------------------------------------------------------------------
+
+/// Parse a sized entry into `(name, base_count)` pairs.
+///
+/// Accepts these forms:
+/// - Simple value: `"10m"` → one pair `("10m", 10_000_000)`
+/// - Linear range (step): `"100m..400m/100m"` → profiles at each step from start to end
+/// - Linear range (count): `"0m..400m/10"` → 10 equal divisions (suffix-less divisor = count)
+/// - Fibonacci: `"fib:1m..400m"` → fibonacci-progression values within [start, end]
+/// - Geometric: `"mul:1m..400m/2"` → compound by factor: start, start×2, start×4, ... (factor can be fractional)
+///
+/// The profile name is generated from the count using `format_count_with_suffix`.
+fn parse_sized_entry(entry: &str) -> Result<Vec<(String, u64)>, String> {
+    let entry = entry.trim();
+
+    // Check for series generator prefixes
+    if let Some(rest) = entry.strip_prefix("fib:") {
+        return parse_fib_range(rest);
+    }
+    if let Some(rest) = entry.strip_prefix("mul:") {
+        return parse_mul_range(rest);
+    }
+
+    if let Some((range_part, step_str)) = entry.split_once('/') {
+        let (start_str, end_str) = range_part
+            .split_once("..")
+            .ok_or_else(|| format!("invalid sized range '{}': expected start..end/step", entry))?;
+        let start = parse_number_with_suffix(start_str.trim())?;
+        let end = parse_number_with_suffix(end_str.trim())?;
+        if start > end {
+            return Err(format!("sized range start > end in '{}'", entry));
+        }
+
+        let step_trimmed = step_str.trim();
+        let has_suffix = step_trimmed.bytes().any(|b| b.is_ascii_alphabetic());
+
+        if has_suffix {
+            // Step-size mode: start..end/step_size
+            let step = parse_number_with_suffix(step_trimmed)?;
+            if step == 0 {
+                return Err(format!("sized range step must be > 0 in '{}'", entry));
+            }
+            let mut result = Vec::new();
+            let mut v = start;
+            while v <= end {
+                if v > 0 {
+                    result.push((format_count_with_suffix(v), v));
+                }
+                v += step;
+            }
+            Ok(result)
+        } else {
+            // Count mode: start..end/N — divide into N equal parts
+            let count: u64 = step_trimmed.parse()
+                .map_err(|e| format!("invalid division count '{}': {}", step_trimmed, e))?;
+            if count == 0 {
+                return Err(format!("sized range division count must be > 0 in '{}'", entry));
+            }
+            let range = end - start;
+            let mut result = Vec::new();
+            for i in 1..=count {
+                let val = start + (range * i) / count;
+                if val > 0 {
+                    result.push((format_count_with_suffix(val), val));
+                }
+            }
+            // Deduplicate (possible with small ranges and large counts)
+            result.dedup_by(|a, b| a.1 == b.1);
+            Ok(result)
+        }
+    } else {
+        // Simple value
+        let count = parse_number_with_suffix(entry)?;
+        Ok(vec![(format_count_with_suffix(count), count)])
+    }
+}
+
+/// Generate fibonacci-progression values within [start, end].
+///
+/// `fib:1m..400m` produces all fibonacci multiples of the base unit that
+/// fall within the range. The base unit is the GCD-friendly smallest value;
+/// the series starts at 1×base and grows by fibonacci steps.
+fn parse_fib_range(range_str: &str) -> Result<Vec<(String, u64)>, String> {
+    let (start_str, end_str) = range_str
+        .split_once("..")
+        .ok_or_else(|| format!("invalid fib range '{}': expected fib:start..end", range_str))?;
+    let start = parse_number_with_suffix(start_str.trim())?;
+    let end = parse_number_with_suffix(end_str.trim())?;
+    if start == 0 || start > end {
+        return Err(format!("fib range requires 0 < start <= end, got {}..{}", start, end));
+    }
+
+    // Use start as the base unit; generate fib(n) * start within range
+    let mut result = Vec::new();
+    let (mut a, mut b): (u64, u64) = (1, 1);
+    loop {
+        let val = a.checked_mul(start).unwrap_or(u64::MAX);
+        if val > end {
+            break;
+        }
+        if val >= start {
+            result.push((format_count_with_suffix(val), val));
+        }
+        let next = a.saturating_add(b);
+        a = b;
+        b = next;
+    }
+    Ok(result)
+}
+
+/// Generate geometric (compound-by-factor) values within [start, end].
+///
+/// `mul:1m..400m/2` produces: 1m, 2m, 4m, 8m, 16m, 32m, 64m, 128m, 256m
+/// `mul:1m..100m/1.5` produces: 1m, 1500k (rounded), etc.
+///
+/// The factor must be > 1.0. Each successive value is `floor(prev × factor)`.
+fn parse_mul_range(spec: &str) -> Result<Vec<(String, u64)>, String> {
+    let (range_part, factor_str) = spec
+        .split_once('/')
+        .ok_or_else(|| format!("invalid mul spec '{}': expected mul:start..end/factor", spec))?;
+    let (start_str, end_str) = range_part
+        .split_once("..")
+        .ok_or_else(|| format!("invalid mul range '{}': expected start..end", range_part))?;
+    let start = parse_number_with_suffix(start_str.trim())?;
+    let end = parse_number_with_suffix(end_str.trim())?;
+    let factor: f64 = factor_str.trim().parse()
+        .map_err(|e| format!("invalid mul factor '{}': {}", factor_str, e))?;
+    if factor <= 1.0 {
+        return Err(format!("mul factor must be > 1.0, got {}", factor));
+    }
+    if start == 0 || start > end {
+        return Err(format!("mul range requires 0 < start <= end, got {}..{}", start, end));
+    }
+
+    let mut result = Vec::new();
+    let mut val_f = start as f64;
+    loop {
+        let val = val_f as u64;
+        if val > end {
+            break;
+        }
+        // Deduplicate: skip if same as previous
+        if result.last().map_or(true, |&(_, prev): &(String, u64)| prev != val) {
+            result.push((format_count_with_suffix(val), val));
+        }
+        val_f *= factor;
+        // Guard against stalling (factor near 1.0 with small values)
+        if val_f as u64 == val {
+            val_f = (val + 1) as f64;
+        }
+    }
+    Ok(result)
+}
+
+// ---------------------------------------------------------------------------
 // Serde: DSProfileGroup
 // ---------------------------------------------------------------------------
 
@@ -325,6 +517,99 @@ impl<'de> Deserialize<'de> for DSProfileGroup {
                 // Already parsed
                 if let Some(ref dp) = default_profile {
                     profiles.insert(name.clone(), dp.clone());
+                }
+                continue;
+            }
+
+            if name == "sized" {
+                // Sized profile sugar — two forms:
+                //
+                // 1. Simple list: `sized: [10m, 20m, 100m..400m/100m]`
+                // 2. Structured map with ranges + facets scaffold:
+                //    ```yaml
+                //    sized:
+                //      ranges: ["0m..400m/10m"]
+                //      facets:
+                //        base_vectors: "base_vectors.hvec:${range}"
+                //        query_vectors: query_vectors.hvec
+                //    ```
+                //
+                // In form 2, facet templates are interpolated per profile:
+                //   ${profile} → profile name (e.g., "10m")
+                //   ${range}   → window spec "[0..base_count]"
+                let (entries, facet_templates) = match value {
+                    serde_yaml::Value::Sequence(_) => {
+                        let entries: Vec<String> = serde_yaml::from_value(value.clone())
+                            .map_err(de::Error::custom)?;
+                        (entries, None)
+                    }
+                    serde_yaml::Value::Mapping(_) => {
+                        let map: IndexMap<String, serde_yaml::Value> =
+                            serde_yaml::from_value(value.clone()).map_err(de::Error::custom)?;
+                        let ranges_val = map.get("ranges").ok_or_else(|| {
+                            de::Error::custom("sized map must have 'ranges' key")
+                        })?;
+                        let entries: Vec<String> = serde_yaml::from_value(ranges_val.clone())
+                            .map_err(de::Error::custom)?;
+                        let facets: Option<IndexMap<String, String>> = map.get("facets")
+                            .map(|v| serde_yaml::from_value(v.clone()))
+                            .transpose()
+                            .map_err(de::Error::custom)?;
+                        (entries, facets)
+                    }
+                    _ => return Err(de::Error::custom(
+                        "sized must be a list of ranges or a map with 'ranges' + optional 'facets'"
+                    )),
+                };
+
+                let mut all_pairs: Vec<(String, u64)> = Vec::new();
+                for entry_str in &entries {
+                    let pairs = parse_sized_entry(entry_str)
+                        .map_err(de::Error::custom)?;
+                    all_pairs.extend(pairs);
+                }
+                all_pairs.sort_by_key(|(_, count)| *count);
+                for (prof_name, count) in all_pairs {
+                    // Build views from facet templates if provided
+                    let scaffold_views = if let Some(ref templates) = facet_templates {
+                        let range_spec = format!("[0..{}]", count);
+                        let mut views = IndexMap::new();
+                        for (facet_key, template) in templates {
+                            let interpolated = template
+                                .replace("${profile}", &prof_name)
+                                .replace("${range}", &range_spec);
+                            let canonical = resolve_standard_key(facet_key)
+                                .unwrap_or_else(|| facet_key.clone());
+                            let source = parse_source_string(&interpolated)
+                                .map_err(de::Error::custom)?;
+                            views.insert(canonical, DSView { source, window: None });
+                        }
+                        Some(views)
+                    } else {
+                        None
+                    };
+
+                    let base_views = scaffold_views.unwrap_or_default();
+
+                    // Inherit from default, then overlay scaffold views
+                    let merged = if let Some(ref dp) = default_profile {
+                        let mut merged_views = dp.views.clone();
+                        for (k, v) in base_views {
+                            merged_views.insert(k, v);
+                        }
+                        DSProfile {
+                            maxk: dp.maxk,
+                            base_count: Some(count),
+                            views: merged_views,
+                        }
+                    } else {
+                        DSProfile {
+                            maxk: None,
+                            base_count: Some(count),
+                            views: base_views,
+                        }
+                    };
+                    profiles.insert(prof_name, merged);
                 }
                 continue;
             }
@@ -576,5 +861,276 @@ indices:
         // indices has map-level window
         let idx = p.view("neighbor_indices").unwrap();
         assert!(idx.window.is_some());
+    }
+
+    #[test]
+    fn test_sized_simple_list() {
+        let yaml = r#"
+default:
+  maxk: 100
+  query_vectors: query.fvec
+sized: [10m, 20m, 50m]
+"#;
+        let g: DSProfileGroup = serde_yaml::from_str(yaml).unwrap();
+        // default + 3 sized profiles
+        assert_eq!(g.0.len(), 4);
+
+        let p10 = g.profile("10m").unwrap();
+        assert_eq!(p10.base_count, Some(10_000_000));
+        assert_eq!(p10.maxk, Some(100)); // inherited
+        assert!(p10.views.contains_key("query_vectors")); // inherited
+
+        let p50 = g.profile("50m").unwrap();
+        assert_eq!(p50.base_count, Some(50_000_000));
+    }
+
+    #[test]
+    fn test_sized_range_expansion() {
+        let yaml = r#"
+default:
+  maxk: 100
+sized: [100m..400m/100m]
+"#;
+        let g: DSProfileGroup = serde_yaml::from_str(yaml).unwrap();
+        // default + 4 expanded profiles (100m, 200m, 300m, 400m)
+        assert_eq!(g.0.len(), 5);
+        assert_eq!(g.profile("100m").unwrap().base_count, Some(100_000_000));
+        assert_eq!(g.profile("200m").unwrap().base_count, Some(200_000_000));
+        assert_eq!(g.profile("300m").unwrap().base_count, Some(300_000_000));
+        assert_eq!(g.profile("400m").unwrap().base_count, Some(400_000_000));
+    }
+
+    #[test]
+    fn test_sized_mixed_simple_and_range() {
+        let yaml = r#"
+default:
+  maxk: 100
+sized: [10m, 20m, 100m..300m/100m]
+"#;
+        let g: DSProfileGroup = serde_yaml::from_str(yaml).unwrap();
+        // default + 10m + 20m + 100m + 200m + 300m = 6
+        assert_eq!(g.0.len(), 6);
+        assert!(g.profile("10m").is_some());
+        assert!(g.profile("20m").is_some());
+        assert!(g.profile("100m").is_some());
+        assert!(g.profile("200m").is_some());
+        assert!(g.profile("300m").is_some());
+    }
+
+    #[test]
+    fn test_sized_with_k_suffix() {
+        let yaml = r#"
+sized: [100k, 500k, 1m]
+"#;
+        let g: DSProfileGroup = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(g.0.len(), 3);
+        assert_eq!(g.profile("100k").unwrap().base_count, Some(100_000));
+        assert_eq!(g.profile("500k").unwrap().base_count, Some(500_000));
+        assert_eq!(g.profile("1m").unwrap().base_count, Some(1_000_000));
+    }
+
+    #[test]
+    fn test_sized_no_default() {
+        let yaml = r#"
+sized: [10m, 20m]
+"#;
+        let g: DSProfileGroup = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(g.0.len(), 2);
+        let p = g.profile("10m").unwrap();
+        assert_eq!(p.base_count, Some(10_000_000));
+        assert!(p.maxk.is_none());
+        assert!(p.views.is_empty());
+    }
+
+    #[test]
+    fn test_sized_coexists_with_explicit_profiles() {
+        let yaml = r#"
+default:
+  maxk: 100
+  query_vectors: query.fvec
+sized: [10m, 20m]
+custom:
+  maxk: 50
+  base_vectors: custom_base.fvec
+"#;
+        let g: DSProfileGroup = serde_yaml::from_str(yaml).unwrap();
+        // default + 10m + 20m + custom = 4
+        assert_eq!(g.0.len(), 4);
+        assert!(g.profile("10m").is_some());
+        assert!(g.profile("custom").is_some());
+        assert_eq!(g.profile("custom").unwrap().maxk, Some(50));
+    }
+
+    #[test]
+    fn test_sized_sorted_by_count() {
+        let yaml = r#"
+default:
+  maxk: 100
+sized: [50m, 10m, 100m..300m/100m, 20m]
+"#;
+        let g: DSProfileGroup = serde_yaml::from_str(yaml).unwrap();
+        let names = g.profile_names();
+        // default first, then sized sorted: 10m, 20m, 50m, 100m, 200m, 300m
+        assert_eq!(names, vec!["default", "10m", "20m", "50m", "100m", "200m", "300m"]);
+    }
+
+    #[test]
+    fn test_parse_sized_entry_simple() {
+        let pairs = parse_sized_entry("10m").unwrap();
+        assert_eq!(pairs, vec![("10m".to_string(), 10_000_000)]);
+    }
+
+    #[test]
+    fn test_parse_sized_entry_range() {
+        let pairs = parse_sized_entry("1m..3m/1m").unwrap();
+        assert_eq!(pairs, vec![
+            ("1m".to_string(), 1_000_000),
+            ("2m".to_string(), 2_000_000),
+            ("3m".to_string(), 3_000_000),
+        ]);
+    }
+
+    #[test]
+    fn test_parse_sized_entry_count_mode() {
+        // 0m..400m/10 → 10 equal divisions: 40m, 80m, 120m, ..., 400m
+        let pairs = parse_sized_entry("0m..400m/10").unwrap();
+        assert_eq!(pairs.len(), 10);
+        assert_eq!(pairs[0], ("40m".to_string(), 40_000_000));
+        assert_eq!(pairs[9], ("400m".to_string(), 400_000_000));
+        // All evenly spaced
+        for i in 0..10 {
+            assert_eq!(pairs[i].1, (i as u64 + 1) * 40_000_000);
+        }
+    }
+
+    #[test]
+    fn test_parse_sized_entry_count_mode_nonzero_start() {
+        // 100m..400m/3 → 3 divisions: 200m, 300m, 400m
+        let pairs = parse_sized_entry("100m..400m/3").unwrap();
+        assert_eq!(pairs.len(), 3);
+        assert_eq!(pairs[0], ("200m".to_string(), 200_000_000));
+        assert_eq!(pairs[1], ("300m".to_string(), 300_000_000));
+        assert_eq!(pairs[2], ("400m".to_string(), 400_000_000));
+    }
+
+    #[test]
+    fn test_parse_sized_entry_range_not_aligned() {
+        // 10m..25m/10m → 10m, 20m (25m is not reached because 20+10=30 > 25)
+        let pairs = parse_sized_entry("10m..25m/10m").unwrap();
+        assert_eq!(pairs, vec![
+            ("10m".to_string(), 10_000_000),
+            ("20m".to_string(), 20_000_000),
+        ]);
+    }
+
+    #[test]
+    fn test_fib_range() {
+        let pairs = parse_sized_entry("fib:1m..400m").unwrap();
+        let counts: Vec<u64> = pairs.iter().map(|(_, c)| *c).collect();
+        // fib multiples of 1m: 1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233, 377
+        // deduplicated start: 1m, 2m, 3m, 5m, 8m, 13m, 21m, 34m, 55m, 89m, 144m, 233m, 377m
+        assert_eq!(counts[0], 1_000_000);
+        assert_eq!(counts[1], 1_000_000); // fib(2)=1 again, that's fine
+        assert_eq!(counts[2], 2_000_000);
+        assert_eq!(counts[3], 3_000_000);
+        assert_eq!(counts[4], 5_000_000);
+        assert!(*counts.last().unwrap() <= 400_000_000);
+    }
+
+    #[test]
+    fn test_mul_doubling() {
+        let pairs = parse_sized_entry("mul:1m..100m/2").unwrap();
+        let counts: Vec<u64> = pairs.iter().map(|(_, c)| *c).collect();
+        // 1m, 2m, 4m, 8m, 16m, 32m, 64m
+        assert_eq!(counts, vec![
+            1_000_000, 2_000_000, 4_000_000, 8_000_000,
+            16_000_000, 32_000_000, 64_000_000,
+        ]);
+    }
+
+    #[test]
+    fn test_mul_factor_1_5() {
+        let pairs = parse_sized_entry("mul:10m..100m/1.5").unwrap();
+        let counts: Vec<u64> = pairs.iter().map(|(_, c)| *c).collect();
+        // 10m, 15m, 22.5m→22500000, 33.75m→33750000, 50.625m→50625000, 75.9375m→75937500
+        assert_eq!(counts[0], 10_000_000);
+        assert_eq!(counts[1], 15_000_000);
+        assert!(counts.len() >= 4);
+        assert!(*counts.last().unwrap() <= 100_000_000);
+    }
+
+    #[test]
+    fn test_sized_structured_with_facets() {
+        let yaml = r#"
+default:
+  maxk: 100
+  query_vectors: query_vectors.hvec
+sized:
+  ranges: ["10m", "20m"]
+  facets:
+    base_vectors: "base_vectors.hvec:${range}"
+    metadata_content: "metadata.slab:${range}"
+    neighbor_indices: "profiles/${profile}/neighbor_indices.ivec"
+"#;
+        let g: DSProfileGroup = serde_yaml::from_str(yaml).unwrap();
+        // default + 2 sized profiles
+        assert_eq!(g.0.len(), 3);
+
+        let p10 = g.profile("10m").unwrap();
+        assert_eq!(p10.base_count, Some(10_000_000));
+        assert_eq!(p10.maxk, Some(100)); // inherited
+
+        // base_vectors should have path + window from ${range}
+        let bv = p10.view("base_vectors").unwrap();
+        assert_eq!(bv.source.path, "base_vectors.hvec");
+        assert_eq!(bv.source.window.0.len(), 1);
+        assert_eq!(bv.source.window.0[0].min_incl, 0);
+        assert_eq!(bv.source.window.0[0].max_excl, 10_000_000);
+
+        // metadata_content should have path + window
+        let mc = p10.view("metadata_content").unwrap();
+        assert_eq!(mc.source.path, "metadata.slab");
+        assert_eq!(mc.source.window.0[0].max_excl, 10_000_000);
+
+        // neighbor_indices should have ${profile} interpolated
+        let ni = p10.view("neighbor_indices").unwrap();
+        assert_eq!(ni.source.path, "profiles/10m/neighbor_indices.ivec");
+        assert!(ni.source.window.is_empty());
+
+        // query_vectors inherited from default
+        assert!(p10.views.contains_key("query_vectors"));
+
+        // Check 20m profile too
+        let p20 = g.profile("20m").unwrap();
+        let bv20 = p20.view("base_vectors").unwrap();
+        assert_eq!(bv20.source.window.0[0].max_excl, 20_000_000);
+        let ni20 = p20.view("neighbor_indices").unwrap();
+        assert_eq!(ni20.source.path, "profiles/20m/neighbor_indices.ivec");
+    }
+
+    #[test]
+    fn test_sized_structured_backward_compat() {
+        // Old list format should still work
+        let yaml = r#"
+default:
+  maxk: 100
+sized: [10m, 20m]
+"#;
+        let g: DSProfileGroup = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(g.0.len(), 3);
+        assert_eq!(g.profile("10m").unwrap().base_count, Some(10_000_000));
+    }
+
+    #[test]
+    fn test_mul_in_sized_yaml() {
+        let yaml = r#"
+default:
+  maxk: 100
+sized: ["mul:1m..16m/2"]
+"#;
+        let g: DSProfileGroup = serde_yaml::from_str(yaml).unwrap();
+        let names = g.profile_names();
+        // default + 1m, 2m, 4m, 8m, 16m
+        assert_eq!(names, vec!["default", "1m", "2m", "4m", "8m", "16m"]);
     }
 }

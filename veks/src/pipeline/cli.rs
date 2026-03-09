@@ -456,36 +456,46 @@ pub fn run_direct(args: Vec<String>) {
         step_id: String::new(),
         governor,
         ui: crate::ui::auto_ui_handle(),
+        status_interval: std::time::Duration::from_secs(1),
     };
 
     let mut cmd = factory();
 
     // Start resource status monitoring
     let resource_source = ctx.governor.status_source();
-    ctx.ui.resource_status(resource_source.status_line());
+    {
+        let (line, metrics) = resource_source.status_line_with_metrics();
+        ctx.ui.resource_status_with_metrics(line, metrics);
+    }
     let resource_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let resource_stop2 = resource_stop.clone();
     let resource_ui = ctx.ui.clone();
+    let poll_interval = ctx.status_interval;
     let resource_handle = std::thread::Builder::new()
         .name("resource-status".into())
         .spawn(move || {
             let mut emergency_ticks = 0u32;
+            let tick_secs = poll_interval.as_secs_f64();
             while !resource_stop2.load(std::sync::atomic::Ordering::Relaxed) {
-                std::thread::sleep(std::time::Duration::from_millis(500));
+                std::thread::sleep(poll_interval);
                 if resource_stop2.load(std::sync::atomic::Ordering::Relaxed) {
                     break;
                 }
-                resource_ui.resource_status(resource_source.status_line());
+                {
+                    let (line, metrics) = resource_source.status_line_with_metrics();
+                    resource_ui.resource_status_with_metrics(line, metrics);
+                }
 
                 if resource_source.is_emergency() {
                     emergency_ticks += 1;
                     let overage = resource_source.rss_overage_pct();
-                    let reduction = (overage.floor() as u32) * 2;
-                    let grace_ticks = 20u32.saturating_sub(reduction).max(2);
+                    let base_ticks = (10.0 / tick_secs).ceil() as u32;
+                    let reduction = overage.floor() as u32;
+                    let grace_ticks = base_ticks.saturating_sub(reduction).max(1);
                     if emergency_ticks >= grace_ticks {
                         resource_ui.log(&format!(
                             "FATAL: resource emergency for {:.1}s, RSS {:.0}% over ceiling — aborting to prevent system lockup",
-                            emergency_ticks as f64 * 0.5,
+                            emergency_ticks as f64 * tick_secs,
                             overage,
                         ));
                         resource_ui.log(&format!(

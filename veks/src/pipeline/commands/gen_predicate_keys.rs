@@ -289,12 +289,16 @@ struct SegmentInfo {
 /// `S = segment_size`.  Pages that straddle a boundary are included in
 /// both adjacent segments; the scan loop filters records to the segment's
 /// ordinal range.
+///
+/// The cache key uses `cache_prefix` (derived from input file stems) rather
+/// than the pipeline step ID, so that different profiles with overlapping
+/// ordinal ranges can share cached segments.
 fn plan_segments(
     page_entries: &[slabtastic::PageEntry],
     end_ordinal: u64,
     segment_size: usize,
     cache_dir: Option<&Path>,
-    step_id: &str,
+    cache_prefix: &str,
     pred_count: usize,
     first_ordinal: i64,
 ) -> Vec<SegmentInfo> {
@@ -320,7 +324,7 @@ fn plan_segments(
             Some(dir) => {
                 let path = dir.join(format!(
                     "{}.seg_{:010}_{:010}.predkeys.slab",
-                    step_id, seg_start, seg_end,
+                    cache_prefix, seg_start, seg_end,
                 ));
                 let valid = is_cache_valid(&path, pred_count);
                 (Some(path), valid)
@@ -502,14 +506,14 @@ impl MemProfile {
 
 impl CommandOp for GenPredicateKeysOp {
     fn command_path(&self) -> &str {
-        "generate predicate-keys"
+        "evaluate predicates"
     }
 
     fn command_doc(&self) -> CommandDoc {
         let options = self.describe_options();
         CommandDoc {
             summary: "Evaluate predicates against metadata to produce match ordinals".into(),
-            body: format!(r#"# generate predicate-keys
+            body: format!(r#"# evaluate predicates
 
 Evaluate predicates against metadata to produce match ordinals.
 
@@ -567,7 +571,7 @@ satisfy the corresponding predicate.
             Err(e) => return error_result(format!("failed to load survey: {}", e), start),
         };
         ctx.ui.log(&format!(
-            "generate predicate-keys: survey loaded: {} fields, {} records sampled, {} total records",
+            "evaluate predicates: survey loaded: {} fields, {} records sampled, {} total records",
             survey.field_stats.len(),
             survey.sampled,
             survey.total_records,
@@ -613,7 +617,7 @@ satisfy the corresponding predicate.
             Ok(r) => r,
             Err(e) => {
                 return error_result(
-                    format!("failed to open predicates slab: {}", e),
+                    format!("failed to open predicates slab {}: {}", predicates_path.display(), e),
                     start,
                 )
             }
@@ -626,14 +630,14 @@ satisfy the corresponding predicate.
                     Ok(pnode) => predicates.push(pnode),
                     Err(e) => {
                         ctx.ui.log(&format!(
-                            "generate predicate-keys: skipping predicate {}: {}",
+                            "evaluate predicates: skipping predicate {}: {}",
                             ord, e
                         ));
                     }
                 },
                 Err(e) => {
                     ctx.ui.log(&format!(
-                        "generate predicate-keys: error reading predicate {}: {}",
+                        "evaluate predicates: error reading predicate {}: {}",
                         ord, e
                     ));
                 }
@@ -642,7 +646,7 @@ satisfy the corresponding predicate.
 
         let pred_len = predicates.len();
         ctx.ui.log(&format!(
-            "generate predicate-keys: loaded {} predicates from {}",
+            "evaluate predicates: loaded {} predicates from {}",
             pred_len,
             predicates_path.display(),
         ));
@@ -664,7 +668,7 @@ satisfy the corresponding predicate.
             if num_forms == 1 {
                 let (fp_str, (count, example_idx)) = fingerprint_counts.iter().next().unwrap();
                 ctx.ui.log(&format!(
-                    "generate predicate-keys: all {} predicates share one structural form:",
+                    "evaluate predicates: all {} predicates share one structural form:",
                     count,
                 ));
                 ctx.ui.log(&format!("    form: {}", fp_str));
@@ -674,7 +678,7 @@ satisfy the corresponding predicate.
                 ));
             } else {
                 ctx.ui.log(&format!(
-                    "generate predicate-keys: {} distinct predicate forms across {} predicates:",
+                    "evaluate predicates: {} distinct predicate forms across {} predicates:",
                     num_forms, pred_len,
                 ));
                 for (fp_str, (count, example_idx)) in &fingerprint_counts {
@@ -694,7 +698,7 @@ satisfy the corresponding predicate.
         // Memoize: flatten into field-indexed conditions
         let memo = memoize_predicates(&predicates);
         ctx.ui.log(&format!(
-            "generate predicate-keys: memoized {} field-indexed, {} fallback, {} fields",
+            "evaluate predicates: memoized {} field-indexed, {} fallback, {} fields",
             memo.count - memo.fallback.len(),
             memo.fallback.len(),
             memo.field_conditions.len(),
@@ -723,7 +727,7 @@ satisfy the corresponding predicate.
             Ok(r) => r,
             Err(e) => {
                 return error_result(
-                    format!("failed to open metadata slab: {}", e),
+                    format!("failed to open metadata slab {}: {}", input_path.display(), e),
                     start,
                 )
             }
@@ -741,7 +745,7 @@ satisfy the corresponding predicate.
 
         if range_end.is_some() || range_start > 0 {
             ctx.ui.log(&format!(
-                "generate predicate-keys: range [{}, {}) — scanning {} of {} total records",
+                "evaluate predicates: range [{}, {}) — scanning {} of {} total records",
                 effective_start, effective_end, total_records, slab_total_records,
             ));
         }
@@ -762,14 +766,14 @@ satisfy the corresponding predicate.
                             match discover_schema(data) {
                                 Ok(s) => {
                                     ctx.ui.log(&format!(
-                                        "generate predicate-keys: schema discovered: {} fields",
+                                        "evaluate predicates: schema discovered: {} fields",
                                         s.field_count,
                                     ));
                                     Some(s)
                                 }
                                 Err(e) => {
                                     ctx.ui.log(&format!(
-                                        "generate predicate-keys: schema discovery failed: {}, using fallback path",
+                                        "evaluate predicates: schema discovery failed: {}, using fallback path",
                                         e,
                                     ));
                                     None
@@ -822,7 +826,7 @@ satisfy the corresponding predicate.
             let est_selectivity = selectivity.unwrap_or_else(|| {
                 let est = estimate_selectivity_from_survey(&memo, &survey);
                 ctx.ui.log(&format!(
-                    "generate predicate-keys: selectivity estimated from survey: {:.4}%",
+                    "evaluate predicates: selectivity estimated from survey: {:.4}%",
                     est * 100.0,
                 ));
                 est
@@ -856,7 +860,7 @@ satisfy the corresponding predicate.
                     let adjusted = ((segment_size as f64) * scale).floor() as usize;
                     let adjusted = adjusted.max(1000); // floor at 1000
                     ctx.ui.log(
-                        "generate predicate-keys: memory-aware segment sizing");
+                        "evaluate predicates: memory-aware segment sizing");
                     ctx.ui.log(&format!(
                         "    estimated {}/segment ({} preds × {} matches × 4B × {} threads)",
                         format_bytes(bytes_per_segment),
@@ -898,12 +902,26 @@ satisfy the corresponding predicate.
             );
         }
 
+        // Cache prefix from input file stems so overlapping profile ranges
+        // share cached segments (same fix as compute_knn).
+        let cache_prefix = {
+            let input_stem = input_path
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy();
+            let pred_stem = predicates_path
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy();
+            format!("{}.{}", input_stem, pred_stem)
+        };
+
         let segments = plan_segments(
             &page_entries,
             effective_end,
             segment_size,
             Some(cache_dir.as_path()),
-            &ctx.step_id,
+            &cache_prefix,
             pred_len,
             effective_start,
         );
@@ -956,7 +974,7 @@ satisfy the corresponding predicate.
                 }
             };
 
-            ctx.ui.log("generate predicate-keys: summary");
+            ctx.ui.log("evaluate predicates: summary");
             ctx.ui.log(&format!("    predicates:             {}", pred_len));
             ctx.ui.log(&format!("    records:                {}", total_records));
             ctx.ui.log(&format!("    unique fields targeted: {}", memo.field_conditions.len()));
@@ -1087,10 +1105,11 @@ satisfy the corresponding predicate.
 
             for (seg_idx, seg) in segments.iter().enumerate() {
                 if seg.cached {
-                    // Count cached records toward progress.
+                    // Count cached records and segments toward progress.
                     let seg_records = (seg.end_ordinal - seg.start_ordinal) as u64;
                     records_done.fetch_add(seg_records, Ordering::Relaxed);
                     scan_pb.set_position(records_done.load(Ordering::Relaxed));
+                    seg_pb.set_position((seg_idx + 1) as u64);
                     continue;
                 }
 
@@ -1336,14 +1355,14 @@ satisfy the corresponding predicate.
                     Some(cache_path) => {
                         if let Err(e) = write_segment_cache(cache_path, &seg_matches) {
                             log::warn!(
-                                "generate predicate-keys: cache write error for segment {}: {} (path: {})",
+                                "evaluate predicates: cache write error for segment {}: {} (path: {})",
                                 seg_idx, e, cache_path.display(),
                             );
                         }
                     }
                     None => {
                         log::warn!(
-                            "generate predicate-keys: BUG — segment {} has no cache_path",
+                            "evaluate predicates: BUG — segment {} has no cache_path",
                             seg_idx,
                         );
                     }
@@ -1356,7 +1375,7 @@ satisfy the corresponding predicate.
 
                 if ctx.governor.checkpoint() {
                     log::info!(
-                        "generate predicate-keys: governor throttle at segment {}",
+                        "evaluate predicates: governor throttle at segment {}",
                         seg_idx,
                     );
                     std::thread::sleep(std::time::Duration::from_secs(1));
@@ -1366,7 +1385,7 @@ satisfy the corresponding predicate.
 
         // Governor checkpoint after segment processing
         if ctx.governor.checkpoint() {
-            log::info!("generate predicate-keys: governor throttle signal received");
+            log::info!("evaluate predicates: governor throttle signal received");
         }
 
         scan_pb.finish();
@@ -1434,7 +1453,7 @@ satisfy the corresponding predicate.
                         Ok(r) => Some(r),
                         Err(e) => {
                             ctx.ui.log(&format!(
-                                "generate predicate-keys: error opening cache for segment {}: {}",
+                                "evaluate predicates: error opening cache for segment {}: {}",
                                 seg_idx, e
                             ));
                             None
@@ -1484,7 +1503,7 @@ satisfy the corresponding predicate.
                         }
                         Err(e) => {
                             ctx.ui.log(&format!(
-                                "generate predicate-keys: error reading cache pred {}: {}",
+                                "evaluate predicates: error reading cache pred {}: {}",
                                 pi, e
                             ));
                         }
@@ -1512,14 +1531,14 @@ satisfy the corresponding predicate.
             0
         };
         let message = format!(
-            "{} predicate keys generated from {} predicates × {} records ({} avg matches), {:.1}s",
+            "{} metadata indices generated from {} predicates × {} records ({} avg matches), {:.1}s",
             pred_len,
             pred_len,
             total_scanned,
             avg_matches,
             start.elapsed().as_secs_f64(),
         );
-        ctx.ui.log(&format!("generate predicate-keys: {}", message));
+        ctx.ui.log(&format!("evaluate predicates: {}", message));
 
         CommandResult {
             status: Status::Ok,
@@ -1557,7 +1576,7 @@ satisfy the corresponding predicate.
                 "Path",
                 true,
                 None,
-                "Survey JSON file (from 'slab survey') for field statistics and selectivity",
+                "Survey JSON file (from 'survey') for field statistics and selectivity",
             ),
             opt(
                 "limit",
@@ -1741,6 +1760,7 @@ mod tests {
             step_id: String::new(),
             governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
             ui: crate::ui::UiHandle::new(std::sync::Arc::new(crate::ui::TestSink::new())),
+            status_interval: std::time::Duration::from_secs(1),
         }
     }
 

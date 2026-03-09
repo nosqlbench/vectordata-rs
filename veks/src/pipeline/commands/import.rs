@@ -1,7 +1,7 @@
 // Copyright (c) DataStax, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Pipeline wrapper for the import facet operation.
+//! Pipeline wrapper for the import operation.
 //!
 //! Extracts options from the pipeline `Options` map, constructs the
 //! appropriate arguments, and delegates to the existing import logic.
@@ -28,7 +28,7 @@ pub fn factory() -> Box<dyn CommandOp> {
 
 impl CommandOp for ImportFacetOp {
     fn command_path(&self) -> &str {
-        "import facet"
+        "import"
     }
 
     fn command_doc(&self) -> CommandDoc {
@@ -36,7 +36,7 @@ impl CommandOp for ImportFacetOp {
         CommandDoc {
             summary: "Import a data facet from source format to output".into(),
             body: format!(
-                "# import facet\n\n\
+                "# import\n\n\
                  Import a data facet from source format to output.\n\n\
                  ## Description\n\n\
                  Extracts options from the pipeline options map, constructs the \
@@ -51,7 +51,7 @@ impl CommandOp for ImportFacetOp {
     fn describe_resources(&self) -> Vec<ResourceDesc> {
         vec![
             ResourceDesc { name: "threads".into(), description: "Parallel source reading".into(), adjustable: true },
-            ResourceDesc { name: "iothreads".into(), description: "Concurrent I/O operations".into(), adjustable: false },
+            ResourceDesc { name: "iothreads".into(), description: "Concurrent I/O operations".into(), adjustable: true },
             ResourceDesc { name: "readahead".into(), description: "Read-ahead buffer size".into(), adjustable: false },
         ]
     }
@@ -119,7 +119,7 @@ impl CommandOp for ImportFacetOp {
         // Open source
         let mut source = match reader::open_source_for_facet(&source_path, source_format, facet, threads, max_count) {
             Ok(s) => s,
-            Err(e) => return error_result(format!("failed to open source: {}", e), start),
+            Err(e) => return error_result(format!("failed to open source {}: {}", source_path.display(), e), start),
         };
 
         let dimension = source.dimension();
@@ -147,7 +147,7 @@ impl CommandOp for ImportFacetOp {
         };
         let mut sink = match writer::open_sink(&output_path, target_format, &sink_config) {
             Ok(s) => s,
-            Err(e) => return error_result(format!("failed to open sink: {}", e), start),
+            Err(e) => return error_result(format!("failed to open sink {}: {}", output_path.display(), e), start),
         };
 
         // Progress bar
@@ -169,17 +169,72 @@ impl CommandOp for ImportFacetOp {
             log::info!("governor: throttle active");
         }
 
-        // Import records
+        // Import records with time-based throughput tracking and demand signaling.
+        //
+        // Every checkpoint_secs, we measure sustained throughput and offer
+        // demand for more I/O bandwidth if the rate has been stable and
+        // suggests headroom. We require several consecutive low-throughput
+        // samples before signaling demand to avoid reacting to transient dips.
         let mut count: u64 = 0;
+        let mut interval_bytes: u64 = 0;
+        let mut interval_records: u64 = 0;
+        let mut checkpoint_time = Instant::now();
+        let checkpoint_secs = 5.0_f64;
+
+        // Demand hysteresis: require consecutive_low samples before offering
+        let mut consecutive_low: u32 = 0;
+        let demand_threshold: u32 = 3; // 3 × 5s = 15s sustained before demand
+
         while let Some(data) = source.next_record() {
             if let Some(mc) = max_count {
                 if count >= mc {
                     break;
                 }
             }
+            interval_bytes += data.len() as u64;
+            interval_records += 1;
             sink.write_record(count as i64, &data);
             count += 1;
             pb.inc(1);
+
+            let elapsed_secs = checkpoint_time.elapsed().as_secs_f64();
+            if elapsed_secs >= checkpoint_secs {
+                let throughput_mbps = (interval_bytes as f64 / (1024.0 * 1024.0)) / elapsed_secs;
+                let records_per_sec = interval_records as f64 / elapsed_secs;
+
+                // Heuristic: if throughput is under 500 MB/s and we have
+                // I/O headroom (queue depth below saturation), more source
+                // reader threads would likely help.
+                let saturation_depth = ctx.governor.io_saturation_depth();
+                let current_threads = threads as u64;
+
+                if throughput_mbps < 500.0 {
+                    consecutive_low += 1;
+                } else {
+                    consecutive_low = 0;
+                }
+
+                if consecutive_low >= demand_threshold {
+                    let could_use = (current_threads * 2).max(8).min(64);
+                    ctx.governor.offer_demand("threads", current_threads, could_use);
+                }
+
+                log::debug!(
+                    "import: {:.0} rec/s, {:.1} MB/s, {} threads, io_sat={}{}",
+                    records_per_sec, throughput_mbps, threads, saturation_depth,
+                    if consecutive_low >= demand_threshold { " [demand offered]" } else { "" },
+                );
+
+                // Reset for next interval
+                interval_bytes = 0;
+                interval_records = 0;
+                checkpoint_time = Instant::now();
+
+                // Governor throttle check
+                if ctx.governor.checkpoint() {
+                    log::info!("governor: throttle active at record {}", count);
+                }
+            }
         }
 
         pb.finish();

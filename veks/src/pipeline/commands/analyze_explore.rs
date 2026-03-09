@@ -67,7 +67,7 @@ impl CommandOp for AnalyzeExploreOp {
 
         let reader = match MmapVectorReader::<f32>::open_fvec(&source) {
             Ok(r) => r,
-            Err(e) => return error_result(format!("failed to open: {}", e), start),
+            Err(e) => return error_result(format!("failed to open {}: {}", source.display(), e), start),
         };
 
         let count = <MmapVectorReader<f32> as VectorReader<f32>>::count(&reader);
@@ -466,6 +466,7 @@ mod tests {
             step_id: String::new(),
             governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
             ui: crate::ui::UiHandle::new(std::sync::Arc::new(crate::ui::TestSink::new())),
+            status_interval: std::time::Duration::from_secs(1),
         }
     }
 

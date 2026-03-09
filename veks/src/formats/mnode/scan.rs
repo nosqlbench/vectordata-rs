@@ -296,7 +296,7 @@ fn raw_ord(data: &[u8], pos: usize, tag: u8, c: &Comparand) -> Option<Ordering> 
 /// Evaluate a single condition against a raw value.
 ///
 /// `pos` is the position of the value payload (after the type tag byte).
-/// Mirrors the behaviour of `check_condition` in `gen_predicate_keys` but
+/// Mirrors the behaviour of `check_condition` in `gen_metadata_indices` but
 /// operates on raw bytes.
 pub fn check_condition_raw(
     data: &[u8],

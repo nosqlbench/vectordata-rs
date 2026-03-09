@@ -263,7 +263,7 @@ name: minimal
 name: test-pipeline
 upstream:
   steps:
-    - run: import facet
+    - run: import
       facet: base_vectors
       source: data/base.npy
       output: base_vectors.fvec

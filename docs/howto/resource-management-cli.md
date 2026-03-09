@@ -23,9 +23,9 @@ veks run dataset.yaml --resources 'mem:25%-50%,threads:4-8'
 The governor starts at the midpoint (37.5% memory, 6 threads) and adjusts
 based on observed RSS and system pressure.
 
-## Predicate-key generation with bounded segments
+## Predicate evaluation with bounded segments
 
-For the resource-intensive `generate predicate-keys` command, limit segment
+For the resource-intensive `evaluate predicates` command, limit segment
 size to prevent memory spikes:
 
 ```sh

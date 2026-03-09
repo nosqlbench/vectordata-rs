@@ -42,6 +42,7 @@ impl UiSink for PlainSink {
             | UiEvent::ProgressFinish { .. }
             | UiEvent::ResourceStatus { .. }
             | UiEvent::SetContext { .. }
+            | UiEvent::SetStepYaml { .. }
             | UiEvent::SuspendBegin
             | UiEvent::SuspendEnd
             | UiEvent::Clear => {}

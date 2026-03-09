@@ -15,7 +15,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Instant;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use log::info;
 
 use super::command::{ArtifactState, CommandResult, Options, Status, StreamContext};
@@ -95,12 +95,21 @@ pub fn run_steps(
 
         // 3. Check progress log → skip if recorded OK, outputs match, options unchanged,
         //    AND no upstream dependency ran this session
-        if !upstream_ran && ctx.progress.is_step_fresh(&step.id, Some(&resolved_map)) {
-            ctx.ui.log(&format!("{} {} — SKIP (fresh)", prefix, step.id));
-            continue;
-        }
         if upstream_ran {
             ctx.ui.log(&format!("{} {} — invalidated (upstream dependency re-ran)", prefix, step.id));
+        } else {
+            match ctx.progress.check_step_freshness(&step.id, Some(&resolved_map), Some(&ctx.workspace)) {
+                None => {
+                    ctx.ui.log(&format!("{} {} — SKIP (fresh)", prefix, step.id));
+                    continue;
+                }
+                Some(reason) => {
+                    // Only log the reason for non-trivial cases (not "not recorded")
+                    if !reason.starts_with("not recorded") {
+                        ctx.ui.log(&format!("{} {} — stale: {}", prefix, step.id, reason));
+                    }
+                }
+            }
         }
 
         // 4. Resolve command from registry
@@ -120,19 +129,24 @@ pub fn run_steps(
             options.set(k, v);
         }
 
-        // 5. Check artifact state
-        if let Some(output_path) = step.def.output_path() {
-            let full_path = if std::path::Path::new(&output_path).is_absolute() {
-                PathBuf::from(&output_path)
+        // 5. Check artifact state (use interpolated output path, not raw)
+        let resolved_output = resolved_opts.get("output").cloned();
+        let mut use_buffer_write = false;
+        if let Some(ref output_path) = resolved_output {
+            let full_path = if std::path::Path::new(output_path.as_str()).is_absolute() {
+                PathBuf::from(output_path)
             } else {
-                ctx.workspace.join(&output_path)
+                ctx.workspace.join(output_path)
             };
+            let buffer_path = buffer_path_for(&full_path);
 
             let state = cmd.check_artifact(&full_path, &options);
             match state {
                 ArtifactState::Complete => {
                     // Not in progress log but artifact is complete — record and skip
                     ctx.ui.log(&format!("{} {} — SKIP (artifact complete)", prefix, step.id));
+                    // Clean up any stale buffer file
+                    let _ = std::fs::remove_file(&buffer_path);
                     ctx.progress.record_step(
                         &step.id,
                         StepRecord {
@@ -168,13 +182,17 @@ pub fn run_steps(
                             ));
                             if !ctx.dry_run {
                                 let _ = std::fs::remove_file(&full_path);
+                                let _ = std::fs::remove_file(&buffer_path);
                             }
+                            // Restart writes to buffer
+                            use_buffer_write = true;
                         }
                         OnPartial::Resume => {
                             ctx.ui.log(&format!(
                                 "{} {} — resuming from partial output '{}'",
                                 prefix, step.id, output_path
                             ));
+                            // Resume writes directly — command manages its own state
                         }
                     }
                 }
@@ -185,6 +203,10 @@ pub fn run_steps(
                             let _ = std::fs::create_dir_all(parent);
                         }
                     }
+                    // Clean up any stale buffer from a prior crash
+                    let _ = std::fs::remove_file(&buffer_path);
+                    // New writes go to buffer
+                    use_buffer_write = true;
                 }
                 ArtifactState::Unknown(ref reason) => {
                     let msg = format!(
@@ -199,6 +221,29 @@ pub fn run_steps(
                 }
             }
         }
+
+        // 5b. Buffer-write: redirect the output option to a _buffer path.
+        // The command writes to the buffer; on success, the runner renames
+        // it to the final path. This prevents partially-written files from
+        // being mistaken for valid artifacts.
+        let buffer_final_rename: Option<(PathBuf, PathBuf)> = if use_buffer_write {
+            if let Some(ref output_path) = resolved_output {
+                let full_path = if std::path::Path::new(output_path.as_str()).is_absolute() {
+                    PathBuf::from(output_path)
+                } else {
+                    ctx.workspace.join(output_path)
+                };
+                let buf_path = buffer_path_for(&full_path);
+                // Rewrite the output option to the buffer path
+                let buf_str = buf_path.to_string_lossy().to_string();
+                options.set("output", &buf_str);
+                Some((buf_path, full_path))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         // 6. Validate required options from describe_options
         let option_descs = cmd.describe_options();
@@ -294,6 +339,12 @@ pub fn run_steps(
             ctx.ui.set_context(format!("{} [{}/{}] {}{}", ctx_label, step_num, total, step.id, profile_tag));
         }
 
+        // Send the step definition as YAML for the TUI step panel.
+        match serde_yaml::to_string(&step.def) {
+            Ok(yaml) => ctx.ui.set_step_yaml(yaml),
+            Err(_) => ctx.ui.set_step_yaml(""),
+        }
+
         if let Some(ref desc) = step.def.description {
             ctx.ui.log(&format!("{} {} — {}", prefix, step.id, desc));
         }
@@ -307,34 +358,43 @@ pub fn run_steps(
         let resource_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let resource_stop2 = resource_stop.clone();
         let resource_ui = ctx.ui.clone();
+        let poll_interval = ctx.status_interval;
         let resource_handle = std::thread::Builder::new()
             .name("resource-status".into())
             .spawn(move || {
                 let mut emergency_ticks = 0u32;
+                let tick_secs = poll_interval.as_secs_f64();
                 // Immediate first sample so the status line appears right away.
-                resource_ui.resource_status(resource_source.status_line());
+                {
+                    let (line, metrics) = resource_source.status_line_with_metrics();
+                    resource_ui.resource_status_with_metrics(line, metrics);
+                }
                 while !resource_stop2.load(std::sync::atomic::Ordering::Relaxed) {
-                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    std::thread::sleep(poll_interval);
                     if resource_stop2.load(std::sync::atomic::Ordering::Relaxed) {
                         break;
                     }
 
                     // Push resource status to the UI for display and charting.
-                    resource_ui.resource_status(resource_source.status_line());
+                    {
+                        let (line, metrics) = resource_source.status_line_with_metrics();
+                        resource_ui.resource_status_with_metrics(line, metrics);
+                    }
 
                     // If EMERGENCY persists, abort the process to prevent system
-                    // lockup.  Base grace period is 10s (20 ticks at 500ms), but
-                    // shrinks by 1s (2 ticks) for every 1% RSS is over ceiling.
+                    // lockup.  Base grace period is ~10s worth of ticks, but
+                    // shrinks for every 1% RSS is over ceiling.
                     // Going back under ceiling resets the counter.
                     if resource_source.is_emergency() {
                         emergency_ticks += 1;
                         let overage = resource_source.rss_overage_pct();
-                        let reduction = (overage.floor() as u32) * 2; // 2 ticks = 1s per 1%
-                        let grace_ticks = 20u32.saturating_sub(reduction).max(2); // floor at 1s
+                        let base_ticks = (10.0 / tick_secs).ceil() as u32;
+                        let reduction = overage.floor() as u32;
+                        let grace_ticks = base_ticks.saturating_sub(reduction).max(1);
                         if emergency_ticks >= grace_ticks {
                             resource_ui.log(&format!(
                                 "FATAL: resource emergency for {:.1}s, RSS {:.0}% over ceiling — aborting to prevent system lockup",
-                                emergency_ticks as f64 * 0.5,
+                                emergency_ticks as f64 * tick_secs,
                                 overage,
                             ));
                             resource_ui.log(&format!(
@@ -382,27 +442,40 @@ pub fn run_steps(
         ctx.progress.record_step(&step.id, record);
 
         match result.status {
-            Status::Ok => {
+            Status::Ok | Status::Warning => {
+                // 8a. Buffer-write: rename buffer → final path
+                if let Some((ref buf_path, ref final_path)) = buffer_final_rename {
+                    if buf_path.exists() {
+                        if let Err(e) = std::fs::rename(buf_path, final_path) {
+                            let msg = format!(
+                                "step '{}': failed to rename buffer '{}' → '{}': {}",
+                                step.id,
+                                buf_path.display(),
+                                final_path.display(),
+                                e,
+                            );
+                            ctx.ui.log(&format!("{} {} — ERROR: {}", prefix, step.id, msg));
+                            if let Err(e) = ctx.progress.save() {
+                                ctx.ui.log(&format!("  warning: failed to save progress: {}", e));
+                            }
+                            return Err(msg);
+                        }
+                    }
+                }
+
                 executed_steps.insert(step.id.clone());
+                let level = if result.status == Status::Ok { "OK" } else { "WARNING" };
                 ctx.ui.log(&format!(
-                    "{} {} — OK ({:.1}s): {}",
+                    "{} {} — {} ({:.1}s): {}",
                     prefix,
                     step.id,
-                    elapsed.as_secs_f64(),
-                    result.message
-                ));
-            }
-            Status::Warning => {
-                executed_steps.insert(step.id.clone());
-                ctx.ui.log(&format!(
-                    "{} {} — WARNING ({:.1}s): {}",
-                    prefix,
-                    step.id,
+                    level,
                     elapsed.as_secs_f64(),
                     result.message
                 ));
             }
             Status::Error => {
+                // Leave buffer file in place for diagnostics; clean up on next run
                 ctx.ui.log(&format!(
                     "{} {} — ERROR ({:.1}s): {}",
                     prefix,
@@ -419,11 +492,12 @@ pub fn run_steps(
         }
 
         // 9. Post-execution bound check — non-Complete artifacts are errors
-        if let Some(output_path) = step.def.output_path() {
-            let full_path = if std::path::Path::new(&output_path).is_absolute() {
-                PathBuf::from(&output_path)
+        //    Check the final path (buffer has been renamed at this point).
+        if let Some(ref output_path) = resolved_output {
+            let full_path = if std::path::Path::new(output_path.as_str()).is_absolute() {
+                PathBuf::from(output_path)
             } else {
-                ctx.workspace.join(&output_path)
+                ctx.workspace.join(output_path)
             };
             let state = cmd.check_artifact(&full_path, &options);
             if state != ArtifactState::Complete {
@@ -510,6 +584,22 @@ pub fn run_steps(
     Ok(())
 }
 
+/// Compute the buffer path for a given output path.
+///
+/// Appends `_buffer` before the file extension (or at the end if no extension):
+/// - `foo.slab` → `foo_buffer.slab`
+/// - `data.hvec` → `data_buffer.hvec`
+/// - `noext` → `noext_buffer`
+fn buffer_path_for(path: &std::path::Path) -> PathBuf {
+    let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+    let ext = path.extension().map(|e| e.to_string_lossy());
+    let buffered_name = match ext {
+        Some(e) => format!("{}_buffer.{}", stem, e),
+        None => format!("{}_buffer", stem),
+    };
+    path.with_file_name(buffered_name)
+}
+
 /// Build a `StepRecord` from a `CommandResult`.
 fn step_record_from_result(
     result: &CommandResult,
@@ -520,11 +610,19 @@ fn step_record_from_result(
         .produced
         .iter()
         .map(|p| {
-            let size = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+            let meta = std::fs::metadata(p).ok();
+            let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+            let mtime = meta
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| {
+                    let duration = t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok()?;
+                    let dt = DateTime::<Utc>::from(std::time::UNIX_EPOCH + duration);
+                    Some(dt.to_rfc3339())
+                });
             OutputRecord {
                 path: p.to_string_lossy().into_owned(),
                 size,
-                mtime: None,
+                mtime,
             }
         })
         .collect();

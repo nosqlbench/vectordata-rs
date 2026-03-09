@@ -8,6 +8,7 @@
 //! pipeline `Options` map and delegating to the underlying logic.
 
 pub mod barrier;
+pub mod source_window;
 pub mod analyze_explore;
 pub mod analyze_checkendian;
 pub mod analyze_find;
@@ -57,16 +58,17 @@ use super::registry::CommandRegistry;
 /// Register all built-in commands with the given registry.
 pub fn register_all(registry: &mut CommandRegistry) {
     // Phase 2: wrappers for existing commands
-    registry.register("import facet", import::factory);
+    registry.register("import", import::factory);
     registry.register("convert file", convert::factory);
     registry.register("analyze describe", describe::factory);
 
     // Phase 3: generation commands
     registry.register("generate vectors", gen_vectors::factory);
     registry.register("generate ivec-shuffle", gen_shuffle::factory);
-    registry.register("generate fvec-extract", gen_extract::fvec_factory);
-    registry.register("generate ivec-extract", gen_extract::ivec_factory);
-    registry.register("generate hvec-extract", gen_extract::hvec_factory);
+    registry.register("transform fvec-extract", gen_extract::fvec_factory);
+    registry.register("transform ivec-extract", gen_extract::ivec_factory);
+    registry.register("transform hvec-extract", gen_extract::hvec_factory);
+    registry.register("transform slab-extract", gen_extract::slab_factory);
     registry.register("generate sketch", gen_sketch::factory);
     registry.register("generate from-model", gen_from_model::factory);
 
@@ -131,14 +133,14 @@ pub fn register_all(registry: &mut CommandRegistry) {
     registry.register("slab explain", slab::explain_factory);
     registry.register("slab namespaces", slab::namespaces_factory);
     registry.register("slab inspect", slab::inspect_factory);
-    registry.register("slab survey", slab::survey_factory);
+    registry.register("survey", slab::survey_factory);
 
     // Phase 6: visualization and predicated datasets
     registry.register("analyze plot", analyze_plot::factory);
     registry.register("analyze flamegraph", analyze_flamegraph::factory);
     registry.register("generate predicated", gen_predicated::factory);
-    registry.register("generate predicates", gen_predicates::factory);
-    registry.register("generate predicate-keys", gen_predicate_keys::factory);
+    registry.register("synthesize predicates", gen_predicates::factory);
+    registry.register("evaluate predicates", gen_predicate_keys::factory);
 
     // Phase 7: inspection
     registry.register("inspect predicate", inspect_predicate::factory);

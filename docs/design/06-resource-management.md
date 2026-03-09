@@ -6,13 +6,13 @@
 ## 6.1 The Problem
 
 On 2026-03-05, processing the LAION-400M img2text dataset's
-`generate predicate-keys` step caused a complete system lockup. The step
+`evaluate predicates` step caused a complete system lockup. The step
 was evaluating 10,000 predicates against 407 million metadata records
 (207 GB slab file). The system became unresponsive, requiring a hard reset.
 
 ### Root cause analysis
 
-The `generate predicate-keys` command accumulates per-predicate match
+The `evaluate predicates` command accumulates per-predicate match
 ordinal vectors (`Vec<Vec<i32>>`) across metadata records. With 10,000
 predicates and high-match-rate predicates on a 407M-record corpus:
 
@@ -51,7 +51,7 @@ codebase that demonstrate resource awareness:
   methods using `MADV_WILLNEED` for page cache warming.
 - **KNN partitioned computation**: Caches per-partition results to `.cache/`
   so only one partition's results are in memory at a time.
-- **Predicate-key segmentation**: Processes metadata in 1M-record segments
+- **Predicate evaluation segmentation**: Processes metadata in 1M-record segments
   with per-segment disk caching.
 
 These patterns are *local* to individual components. The gap is that there
@@ -66,7 +66,7 @@ is no *global* coordination or enforcement across the pipeline.
 | `MmapVectorReader` | Memory-mapped files. Kernel manages page cache. | Low direct risk — kernel evicts pages under pressure. But: competing mmap regions can thrash. |
 | `SlabReader` page index | Loaded into heap on open. Proportional to page count. | Medium — 407M records at ~6500 records/page ≈ 62K pages × ~16 bytes = ~1 MB. Manageable. |
 | KNN partition caches | Cached to disk. Only one partition's results in memory at a time. | Low — partitioned design is sound. |
-| Predicate-key match vectors | `Vec<Vec<i32>>` — one per predicate, growing during segment scan. | **Critical** — unbounded growth within a segment. |
+| Predicate match vectors | `Vec<Vec<i32>>` — one per predicate, growing during segment scan. | **Critical** — unbounded growth within a segment. |
 | Parquet→MNode import | Buffered row-group reads + MNode encoding. | Medium — row group size determines peak. |
 
 ### CPU
@@ -82,7 +82,7 @@ is no *global* coordination or enforcement across the pipeline.
 | Component | Pattern | Risk |
 |-----------|---------|------|
 | Vector mmap reads | Sequential scan for KNN, random for filtered KNN | Depends on page cache. Cold reads on 418 GB file = sustained I/O. |
-| Slab sequential scan | Sequential page reads during predicate-key generation | 207 GB sequential reads. Saturates disk bandwidth. |
+| Slab sequential scan | Sequential page reads during predicate evaluation | 207 GB sequential reads. Saturates disk bandwidth. |
 | Cache file writes | Per-segment slab writes to `.cache/` | Moderate — many small files can stress filesystem. |
 | Progress log writes | Small YAML file, atomic write+rename | Negligible. |
 
@@ -136,19 +136,32 @@ holds independent buffers.
 
 Long-running operations MUST checkpoint progress frequently enough that
 an OOM kill or system reset loses at most one segment's worth of work.
-The predicate-key generation already uses segment caching — this pattern
+The predicate evaluation already uses segment caching — this pattern
 should be formalized and required for all resource-intensive commands.
 
 ### REQ-RM-07: System health telemetry
 
 The pipeline engine SHOULD emit periodic telemetry during execution:
 - RSS and virtual memory size
-- CPU utilization (user + system)
-- I/O throughput (read/write bytes)
+- CPU utilization (user + system, per-core)
+- I/O throughput (cumulative read/write bytes)
+- I/O queue depth (inflight read/write from `/proc/diskstats`)
 - Active thread count
-- Active mmap regions
+- System page cache size and hit ratio
+- Major/minor page fault counts
 
 This telemetry supports both real-time monitoring and post-mortem analysis.
+
+Telemetry is published through two channels:
+
+1. **`ResourceStatusSource::status_line_with_metrics()`** — produces a
+   formatted text line for display AND a `ResourceMetrics` struct with
+   raw numeric values. The `UiEvent::ResourceStatus` event carries both,
+   so the TUI renders charts directly from structured data without
+   re-parsing the text representation.
+
+2. **Governor log** (`.governor.log`) — JSON-line entries with
+   observation, decision, throttle, request, and ignored records.
 
 ### REQ-RM-08: Configurable resource limits
 
@@ -291,7 +304,7 @@ operators can detect misconfiguration during post-mortem analysis:
   "ts": "2026-03-05T06:14:30.125Z",
   "step_id": "import-base",
   "resource": "segmentsize",
-  "reason": "command 'import facet' does not declare resource 'segmentsize'; limit ignored"
+  "reason": "command 'import' does not declare resource 'segmentsize'; limit ignored"
 }
 ```
 
@@ -308,11 +321,11 @@ application is skipped.
 | `compute knn` | `mem`, `threads`, `readahead` |
 | `compute filtered-knn` | `mem`, `threads`, `readahead` |
 | `compute sort` | `mem`, `threads`, `readahead` |
-| `generate predicate-keys` | `mem`, `threads`, `segments`, `segmentsize` |
+| `evaluate predicates` | `mem`, `threads`, `segments`, `segmentsize` |
 | `generate predicated` | `mem`, `threads`, `readahead` |
 | `generate derive` | `mem`, `threads`, `readahead` |
-| `generate fvec-extract` | `readahead` |
-| `import facet` | `threads`, `iothreads`, `readahead` |
+| `transform fvec-extract` | `readahead` |
+| `import` | `threads`, `iothreads`, `readahead` |
 | `convert file` | `iothreads`, `readahead` |
 | `slab import` | `iothreads`, `readahead` |
 | `slab export` | `readahead` |
@@ -335,7 +348,7 @@ application is skipped.
 | `merkle diff` | `readahead` |
 | `cleanup cleanfvec` | `mem`, `readahead` |
 | `datasets prebuffer` | `readahead` |
-| `generate predicates` | (none — lightweight) |
+| `synthesize predicates` | (none — lightweight) |
 | `slab inspect` | (none — lightweight) |
 
 #### 6.4.6 Autocomplete rewrite behavior
@@ -354,9 +367,9 @@ while providing a natural CLI experience. The long-form flags:
 - Only appear in completions for commands that declare them
 - Are never passed through to the command — always rewritten
 
-### REQ-RM-09: OOM prevention for predicate-key generation
+### REQ-RM-09: OOM prevention for predicate evaluation
 
-The `generate predicate-keys` command specifically MUST:
+The `evaluate predicates` command specifically MUST:
 1. Estimate total memory for match vectors before starting each segment
 2. If the estimate exceeds budget, split the predicates into batches
    (process predicate subsets sequentially to bound peak memory)
@@ -423,14 +436,14 @@ dataset-scale. Organized by category:
 | Command | Reason |
 |---------|--------|
 | `compute knn` | Mmaps full base vector file; multi-threaded distance computation |
-| `compute filtered-knn` | Mmaps full base vector file; reads predicate-key slab |
+| `compute filtered-knn` | Mmaps full base vector file; reads metadata indices slab |
 | `compute sort` | Reads and reorders arbitrarily large vector files |
 
 **Import / convert / export** — stream arbitrarily large files:
 
 | Command | Reason |
 |---------|--------|
-| `import facet` | Streams arbitrarily large source files (npy, parquet) to output |
+| `import` | Streams arbitrarily large source files (npy, parquet) to output |
 | `convert file` | Streams arbitrarily large source files to output |
 | `slab import` | Reads source records of arbitrary size into a slab |
 | `slab export` | Reads slab records of arbitrary count |
@@ -442,12 +455,12 @@ dataset-scale. Organized by category:
 
 | Command | Reason |
 |---------|--------|
-| `generate predicate-keys` | Scans entire metadata slab; accumulates match ordinals |
+| `evaluate predicates` | Scans entire metadata slab; accumulates match ordinals |
 | `generate predicated` | Processes full dataset to produce predicated output |
 | `generate derive` | Derives new facets from existing large files |
-| `generate fvec-extract` | Reads from arbitrarily large source vectors |
-| `generate ivec-extract` | Reads from arbitrarily large source vectors |
-| `generate hvec-extract` | Reads from arbitrarily large source vectors |
+| `transform fvec-extract` | Reads from arbitrarily large source vectors |
+| `transform ivec-extract` | Reads from arbitrarily large source vectors |
+| `transform hvec-extract` | Reads from arbitrarily large source vectors |
 
 **Analyze commands** — open and read dataset-scale files:
 
@@ -490,7 +503,7 @@ dataset-scale. Organized by category:
 Commands that operate on fixed-size inputs, inherently small files, or
 do not perform I/O on dataset-scale files:
 
-- `generate predicates` — reads a small survey JSON, writes a small slab
+- `synthesize predicates` — reads a small survey JSON, writes a small slab
 - `generate vectors` — output size is user-specified, not input-driven
 - `generate ivec-shuffle` — output size is user-specified
 - `generate sketch` — output size is user-specified
@@ -499,7 +512,7 @@ do not perform I/O on dataset-scale files:
 - `slab inspect`, `slab get`, `slab analyze`, `slab explain`,
   `slab namespaces`, `slab check` — point lookups or metadata-only
   operations that do not stream the full file
-- `slab survey` — samples a bounded number of records (not a full scan)
+- `survey` — samples a bounded number of records (not a full scan)
 - `config show`, `config init`, `config list-mounts` — configuration only
 - `info file` — reads file header metadata only
 - `info compute` — no file I/O
@@ -742,7 +755,7 @@ Each line is a self-contained JSON object.
   "major_faults": 12,
   "minor_faults": 84200,
   "active_threads": 8,
-  "step_id": "compute-predicate-keys"
+  "step_id": "evaluate-predicates"
 }
 ```
 
@@ -752,7 +765,7 @@ Each line is a self-contained JSON object.
 {
   "type": "decision",
   "ts": "2026-03-05T06:14:30.125Z",
-  "step_id": "compute-predicate-keys",
+  "step_id": "evaluate-predicates",
   "resource": "segmentsize",
   "old_value": 1000000,
   "new_value": 750000,
@@ -769,7 +782,7 @@ Each line is a self-contained JSON object.
 {
   "type": "throttle",
   "ts": "2026-03-05T06:14:35.001Z",
-  "step_id": "compute-predicate-keys",
+  "step_id": "evaluate-predicates",
   "reason": "RSS exceeded 95% of ceiling; emergency flush requested",
   "resources_affected": ["segmentsize", "threads"]
 }
@@ -781,7 +794,7 @@ Each line is a self-contained JSON object.
 {
   "type": "request",
   "ts": "2026-03-05T06:14:36.100Z",
-  "step_id": "compute-predicate-keys",
+  "step_id": "evaluate-predicates",
   "resource": "segmentsize",
   "requested": 1500000,
   "granted": 750000,
@@ -802,20 +815,212 @@ resource consumption (peak RSS, total I/O, CPU time). The governor log
 records the *detailed timeline* of observations and decisions within each
 step. Together they provide both the "what" and the "why" of resource usage.
 
+### REQ-RM-14: Resource affinity protocol (demand-pull)
+
+Commands (resource users) and the governor (resource manager) communicate
+via a **demand-pull** protocol. The knowledge of which resources can
+actually benefit a workload lives in the command; the knowledge of whether
+granting more resources is safe lives in the governor. Neither side should
+make the other's decision.
+
+#### Protocol
+
+1. **Command declares affinity**: At segment or checkpoint boundaries, a
+   command MAY signal to the governor that it could make productive use of
+   a specific resource type by calling `ctx.governor.offer_demand()`:
+
+   ```rust
+   ctx.governor.offer_demand("threads", current_threads, max_useful_threads);
+   ctx.governor.offer_demand("iothreads", current_io, max_useful_io);
+   ```
+
+   The call declares: "I am currently using `current`, and I could
+   productively use up to `desired`." This is purely informational —
+   the command does NOT change its own behavior yet.
+
+2. **Governor evaluates and publishes**: On the next evaluation cycle, the
+   governor considers all outstanding demand offers against system state
+   (CPU idle, I/O queue depth, memory headroom, storage saturation
+   thresholds). If the resource is not scarce, the governor increases the
+   effective value for that resource toward (but not exceeding) the
+   demanded ceiling:
+
+   ```rust
+   // Governor internal logic (simplified)
+   if snapshot.cpu_user_pct < cpu_underutilized && !throttle {
+       let demand = demands.get("threads");
+       let ceiling = budget.get("threads").ceiling();
+       let new_eff = current_eff.min(demand.desired).min(ceiling);
+       effective.insert("threads", new_eff);
+   }
+   ```
+
+3. **Command reads updated effective value**: On its next `checkpoint()`,
+   the command reads `ctx.governor.current("threads")` and adjusts its
+   thread pool, segment concurrency, or I/O parallelism accordingly. The
+   command MUST NOT exceed the granted effective value.
+
+4. **Governor may revoke**: If system pressure increases, the governor
+   reduces the effective value. Commands observe this on their next
+   checkpoint and MUST comply by reducing consumption.
+
+#### Design principles
+
+- **Commands know their workload**: An import command knows that adding
+  more I/O threads will help because it is I/O-bound. A compute command
+  knows that more CPU threads will help because it is compute-bound. Only
+  the command has this knowledge.
+
+- **Governor knows the system**: The governor knows the RSS headroom, CPU
+  utilization, I/O queue depth, storage type, and page cache hit ratio.
+  Only the governor can make safe decisions about whether granting more
+  resources will help or harm overall system health.
+
+- **Neither side overreaches**: Commands don't blindly grab resources.
+  The governor doesn't blindly assign resources without demand.
+
+#### Examples
+
+**Example 1: Import metadata (I/O bound)**
+
+The `import` command processes parquet shards. It detects that its I/O
+wait time exceeds compute time and offers demand for more I/O concurrency:
+
+```rust
+// In import command's processing loop, at checkpoint boundary:
+let io_threads = ctx.governor.current_or("iothreads", 4) as usize;
+let could_use = (io_threads * 2).min(32); // I'm I/O bound, I could use 2x
+ctx.governor.offer_demand("iothreads", io_threads as u64, could_use as u64);
+```
+
+The governor sees that I/O queue depth is low (under the storage's
+saturation threshold from auto-detected NVMe) and grants the increase.
+On the next checkpoint, the import command reads the new effective value
+and spawns additional I/O worker threads.
+
+**Example 2: KNN computation (CPU bound)**
+
+The `compute knn` command finds that SIMD distance computations leave
+some cores idle due to memory stalls:
+
+```rust
+let threads = ctx.governor.current_or("threads", 8) as usize;
+let could_use = (threads + 4).min(num_cpus); // Hyperthreading helps here
+ctx.governor.offer_demand("threads", threads as u64, could_use as u64);
+```
+
+The governor checks CPU utilization and memory headroom. If cores are
+idle and memory is in the NOMINAL band, it grants additional threads.
+
+**Example 3: Extract (I/O bound, sequential read)**
+
+The `transform hvec-extract` command uses sorted-index extraction. The
+sequential read pattern benefits from increased readahead:
+
+```rust
+let readahead = ctx.governor.current_or("readahead", 64 * 1024 * 1024);
+let could_use = 256 * 1024 * 1024; // 256 MiB readahead helps sequential
+ctx.governor.offer_demand("readahead", readahead, could_use);
+```
+
+The governor checks page cache pressure and memory headroom. If the
+system has ample free RAM and the page cache hit ratio is high, it
+grants the larger readahead window.
+
+**Example 4: Governor declines (memory pressure)**
+
+Same import command offers demand for more I/O threads, but this time
+RSS is in the CAUTION band (85% of ceiling). The governor keeps the
+effective value unchanged or reduces it. The command continues at its
+current concurrency level without any special handling — the protocol
+is entirely non-blocking from the command's perspective.
+
+#### Demand expiry
+
+Demand offers are transient — they expire after one governor evaluation
+cycle. Commands must re-offer demand on each checkpoint if they still
+want more resources. This prevents stale demands from keeping resources
+elevated after a command's workload characteristics change.
+
+#### Logging
+
+Demand offers and governor responses are logged in `.governor.log`:
+
+```json
+{
+  "type": "demand",
+  "ts": "2026-03-07T14:22:01.500Z",
+  "step_id": "import-metadata",
+  "resource": "iothreads",
+  "current": 4,
+  "desired": 8,
+  "granted": 6,
+  "reason": "io_queue_depth 12 < saturation_threshold 128 (local NVMe); scaling up"
+}
+```
+
+### REQ-RM-15: Storage type detection
+
+The resource governor MUST detect the backing storage type for the
+workspace directory at startup. This information informs I/O-related
+resource decisions (queue depth saturation thresholds, readahead sizing,
+I/O concurrency limits).
+
+#### Detection method (Linux)
+
+1. Resolve the workspace path to its backing block device via
+   `stat(2)` device number and `/sys/block/*/dev` matching.
+2. For device-mapper (LVM/RAID) devices, follow
+   `/sys/block/dm-*/slaves/` to the underlying physical device.
+3. Read sysfs attributes:
+   - `/sys/block/<dev>/queue/rotational` — 0=SSD/NVMe, 1=spinning
+   - `/sys/block/<dev>/device/model` — identifies cloud storage types
+   - `/sys/block/<dev>/queue/nr_requests` — hardware queue depth
+   - Transport (inferred from device name or uevent)
+4. Classify into storage tiers:
+
+| Tier | Detection | Saturation depth |
+|------|-----------|-----------------|
+| `LocalNvme` | NVMe transport + "Instance Storage" model or bare NVMe | 128 |
+| `NetworkBlock` | "Elastic Block Store", virtio, xvd/vd prefix | 32 |
+| `SataSsd` | SATA transport, non-rotational | 32 |
+| `Hdd` | rotational=1 | 4 |
+
+The storage type and saturation threshold are exposed via
+`governor.storage_type()` and `governor.io_saturation_depth()` for
+use by the demand-pull protocol and governor strategy heuristics.
+
+### REQ-RM-16: Page cache observability
+
+The system MUST provide page cache performance metrics for monitoring
+and governor decision-making:
+
+1. **System page cache size**: Read from `/proc/meminfo` (Cached + Buffers).
+   Displayed in the resource status line as `pcache: <size>`.
+
+2. **Page cache hit ratio**: Computed from process-level minor faults
+   (cache hits) and major faults (cache misses) between sampling
+   intervals. Displayed as `pcache: <size> hit:<pct>%` when available.
+
+These metrics help identify whether the workload is I/O-bound due to
+cache misses (low hit ratio → increase readahead, reduce working set)
+or compute-bound with good cache behavior (high hit ratio → scale up
+CPU resources).
+
 ## 6.5 Current State vs Requirements
 
 | Requirement | Current state | Gap |
 |-------------|--------------|-----|
-| REQ-RM-01 | `ResourceBudget` parsed from `--resources`; commands query `governor.current()` / `current_or()` for thread count and segment sizing; memory-aware segment/partition sizing via `mem_ceiling()` in compute knn and gen predicate-keys | **Done** |
+| REQ-RM-01 | `ResourceBudget` parsed from `--resources`; commands query `governor.current()` / `current_or()` for thread count and segment sizing; memory-aware segment/partition sizing via `mem_ceiling()` in compute knn and gen metadata-indices | **Done** |
 | REQ-RM-02 | `SystemSnapshot::sample()` reads RSS, page faults, CPU times (with raw ticks), I/O bytes, thread count from `/proc/self/stat`, `/proc/self/io`, `/proc/self/status` | **Done** |
-| REQ-RM-03 | Governor publishes throttle/emergency signals; `checkpoint()` called at boundaries in compute knn, filtered-knn, gen predicate-keys, compute sort, convert, import, gen predicated, cleanup cleanfvec, analyze verifyknn | **Done** |
+| REQ-RM-03 | Governor publishes throttle/emergency signals; `checkpoint()` called at boundaries in compute knn, filtered-knn, gen metadata-indices, compute sort, convert, import, gen predicated, cleanup cleanfvec, analyze verifyknn | **Done** |
 | REQ-RM-04 | 37 commands implement `describe_resources()` with resource declarations | **Done** |
-| REQ-RM-05 | Commands query `governor.current_or("threads", ...)` for thread count (compute knn, filtered-knn, gen predicate-keys, import, convert) | **Done** |
-| REQ-RM-06 | Segment caching formalized: gen predicate-keys uses `.cache/{step_id}.seg_{start}_{end}.predkeys.slab`; compute knn uses `.cache/{step_id}.part_{start}_{end}.{k}.{metric}.{type}.{ext}` with validation on resume | **Done** |
+| REQ-RM-05 | Commands query `governor.current_or("threads", ...)` for thread count (compute knn, filtered-knn, gen metadata-indices, import, convert) | **Done** |
+| REQ-RM-06 | Segment caching formalized with **file-stem-based keys** for cross-profile reuse: evaluate predicates uses `.cache/{input_stem}.{pred_stem}.seg_{start}_{end}.predkeys.slab`; compute knn uses `.cache/{base_stem}.{query_stem}.range_{start}_{end}.k{k}.{metric}.{ext}`. Cache keys are derived from input file stems (not step IDs) so that overlapping ordinal ranges across profiles share cached segments. Profile barriers ensure smallest-to-largest execution order so cached segments are available for reuse. | **Done** |
 | REQ-RM-07 | Per-step `ResourceSummary` (peak RSS, CPU user/system seconds, I/O read/write bytes) captured by runner and stored in `.upstream.progress.yaml`; governor log writes JSON-line observation/decision/throttle/request/ignored entries | **Done** |
 | REQ-RM-08 | `--resources` and `--governor` args on both `run_pipeline()` and per-command direct CLI; long-form resource aliases (e.g., `--mem`, `--readahead`) generated from `describe_resources()` with conflict avoidance; completion filtering shows only applicable resource types per command | **Done** |
-| REQ-RM-09 | Memory-aware segment/partition sizing: gen predicate-keys estimates per-segment memory from selectivity × predicates × 4B × threads and scales down if budget exceeded; compute knn estimates result set + page cache pressure and reduces partition_size accordingly | **Done** |
-| REQ-RM-10 | `MmapVectorReader` provides `advise_sequential()` (MADV_SEQUENTIAL), `prefetch_range()` / `prefetch_pages()` (MADV_WILLNEED), and `release_range()` (MADV_DONTNEED); compute knn uses sequential advice at start and releases completed partitions; gen predicate-keys has prefetch thread with MADV_WILLNEED per segment | **Done** |
+| REQ-RM-09 | Memory-aware segment/partition sizing: gen metadata-indices estimates per-segment memory from selectivity × predicates × 4B × threads and scales down if budget exceeded; compute knn estimates result set + page cache pressure and reduces partition_size accordingly | **Done** |
+| REQ-RM-10 | `MmapVectorReader` provides `advise_sequential()` (MADV_SEQUENTIAL), `prefetch_range()` / `prefetch_pages()` (MADV_WILLNEED), and `release_range()` (MADV_DONTNEED); compute knn uses sequential advice at start and releases completed partitions; gen metadata-indices has prefetch thread with MADV_WILLNEED per segment | **Done** |
 | REQ-RM-11 | Runner warns for >1 GiB files without resource declarations; 37 commands comply; runner logs ignored resources for budget items not declared by command | **Done** |
 | REQ-RM-12 | Background governor thread (`governor-bg`) monitors RSS vs mem ceiling, adjusts effective values, and sets throttle/emergency flags between checkpoint() calls; only started when explicit `--resources` with mem budget is provided; 3 built-in strategies (maximize, conservative, fixed) | **Done** |
 | REQ-RM-13 | `GovernorLog` writes to `.governor.log` with JSON-line entries including `Ignored` variant | **Done** |
@@ -880,7 +1085,7 @@ StreamContext
 For immediate relief, the minimum changes needed:
 
 1. Add `--resources 'mem:...'` CLI parsing with single-value support
-2. Add RSS check in `generate predicate-keys` between segments
+2. Add RSS check in `evaluate predicates` between segments
 3. If RSS exceeds the `mem` ceiling, reduce `segmentsize` by 50% for
    remaining segments
 4. Add `madvise(MADV_SEQUENTIAL)` to `MmapVectorReader` for scan access
@@ -892,7 +1097,7 @@ framework.
 
 ## 6.7 Failure Scenarios and Mitigations
 
-### Scenario: Predicate-key generation OOM
+### Scenario: Predicate evaluation OOM
 
 - **Trigger**: High-selectivity predicates on large metadata corpus
 - **Current behavior**: System lockup / OOM kill

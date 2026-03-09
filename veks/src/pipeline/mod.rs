@@ -104,6 +104,10 @@ pub struct RunArgs {
     /// - `fixed`: use midpoint values, never adjust (useful for benchmarking)
     #[arg(long, default_value = "maximize", add = ArgValueCandidates::new(cli::governor_candidates))]
     pub governor: String,
+
+    /// Interval in milliseconds between UI status updates and TUI redraws.
+    #[arg(long, default_value = "1000", value_name = "MS")]
+    pub status_interval: u64,
 }
 
 /// CLI arguments for `veks script`.
@@ -211,7 +215,7 @@ pub fn run_script(args: ScriptArgs) {
     // Optionally load progress log for --show-progress
     let progress = if args.show_progress {
         let progress_path = ProgressLog::path_for_dataset(dataset_path);
-        ProgressLog::load(&progress_path).ok()
+        ProgressLog::load(&progress_path).ok().map(|(log, _)| log)
     } else {
         None
     };
@@ -366,10 +370,18 @@ pub fn run_pipeline(args: RunArgs) {
 
     // Load or create progress log
     let progress_path = ProgressLog::path_for_dataset(dataset_path);
-    let progress = ProgressLog::load(&progress_path).unwrap_or_else(|e| {
+    let (mut progress, schema_msg) = ProgressLog::load(&progress_path).unwrap_or_else(|e| {
         println!("Warning: failed to load progress log: {}", e);
-        ProgressLog::new()
+        (ProgressLog::new(), None)
     });
+    if let Some(msg) = schema_msg {
+        println!("{}", msg);
+    }
+
+    // Invalidate progress log if dataset.yaml is newer
+    if let Some(msg) = progress.invalidate_if_stale(dataset_path) {
+        println!("{}", msg);
+    }
 
     let threads = if args.threads == 0 {
         std::thread::available_parallelism()
@@ -410,7 +422,20 @@ pub fn run_pipeline(args: RunArgs) {
 
     // Build execution context
     let dataset_name = config.name.clone();
-    let all_profile_names: Vec<String> = config.profile_names().into_iter().map(String::from).collect();
+    // Profile names ordered by size: sized ascending, then default last
+    let all_profile_names: Vec<String> = {
+        let profiles = &config.profiles;
+        let mut sized: Vec<(&str, u64)> = profiles.0.iter()
+            .filter(|(name, p)| name.as_str() != "default" && p.base_count.is_some())
+            .map(|(name, p)| (name.as_str(), p.base_count.unwrap()))
+            .collect();
+        sized.sort_by_key(|(_, bc)| *bc);
+        let mut names: Vec<String> = sized.into_iter().map(|(n, _)| n.to_string()).collect();
+        if profiles.0.contains_key("default") {
+            names.push("default".to_string());
+        }
+        names
+    };
     let mut ctx = StreamContext {
         dataset_name,
         profile: profile_name.clone(),
@@ -424,20 +449,28 @@ pub fn run_pipeline(args: RunArgs) {
         threads,
         step_id: String::new(),
         governor,
-        ui: crate::ui::auto_ui_handle(),
+        ui: crate::ui::auto_ui_handle_with_interval(std::time::Duration::from_millis(args.status_interval)),
+        status_interval: std::time::Duration::from_millis(args.status_interval),
     };
 
     // Build command registry
     let registry = CommandRegistry::with_builtins();
 
     // Run
-    if let Err(e) = runner::run_steps(&pipeline_dag.steps, &registry, &mut ctx) {
-        println!("\nPipeline failed: {}", e);
-        println!(
+    let result = runner::run_steps(&pipeline_dag.steps, &registry, &mut ctx);
+
+    // Drop ctx (including the UI handle) to restore the terminal before
+    // printing any messages. Without this, error output goes to the
+    // alternate screen and is lost when the ratatui sink is dropped.
+    drop(ctx);
+
+    if let Err(e) = result {
+        eprintln!("\nPipeline failed: {}", e);
+        eprintln!(
             "Scratch directory preserved for debugging: {}",
             scratch_dir.display()
         );
-        println!("Run with --clean to reset.");
+        eprintln!("Run with --clean to reset.");
         std::process::exit(1);
     }
 
@@ -507,9 +540,11 @@ fn expand_per_profile_steps(
     // Collect bare output filenames from templates for auto-prefix matching.
     // When a non-output option value matches one of these filenames, it is
     // treated as a cross-reference and auto-prefixed with the profile dir.
+    // Uses output_paths() to capture all output-like options (output,
+    // indices, distances) — not just the "output" key.
     let template_output_names: HashSet<String> = templates
         .iter()
-        .filter_map(|s| s.output_path())
+        .flat_map(|s| s.output_paths())
         .map(|p| p.strip_prefix("${profile_dir}").unwrap_or(&p).to_string())
         .collect();
 
@@ -521,17 +556,19 @@ fn expand_per_profile_steps(
 
     let mut result = regular;
 
-    // Collect all profiles to expand: default (when no explicit steps) + sized
-    let mut all_profiles: Vec<(&str, Option<u64>)> = Vec::new();
+    // Collect all profiles to expand: sized ascending by base_count, then
+    // default (full dataset) last.
+    let mut sized: Vec<(&str, u64)> = profiles.0.iter()
+        .filter(|(name, p)| name.as_str() != "default" && p.base_count.is_some())
+        .map(|(name, p)| (name.as_str(), p.base_count.unwrap()))
+        .collect();
+    sized.sort_by_key(|(_, bc)| *bc);
+
+    let mut all_profiles: Vec<(&str, Option<u64>)> = sized.into_iter()
+        .map(|(name, bc)| (name, Some(bc)))
+        .collect();
     if profiles.0.contains_key("default") && !has_explicit_default_steps {
         all_profiles.push(("default", None));
-    }
-    for (name, profile) in &profiles.0 {
-        if name != "default" {
-            if let Some(bc) = profile.base_count {
-                all_profiles.push((name.as_str(), Some(bc)));
-            }
-        }
     }
 
     for (profile_name, base_count_opt) in &all_profiles {
@@ -578,12 +615,17 @@ fn expand_per_profile_steps(
                         *s = s.replace("${profile_dir}", &profile_dir);
                     } else {
                         // Auto-prefix bare filenames:
-                        // - `output` values always get prefixed
-                        // - other values get prefixed if they match a template output
+                        // - output-like keys (output, indices, distances)
+                        //   always get prefixed
+                        // - other values get prefixed if they match a
+                        //   template output filename (cross-references)
                         let bare = s.as_str();
+                        let is_output_key = key == "output"
+                            || key == "indices"
+                            || key == "distances";
                         let should_prefix = !bare.contains('/')
                             && !bare.contains("${")
-                            && (key == "output" || template_output_names.contains(bare));
+                            && (is_output_key || template_output_names.contains(bare));
                         if should_prefix {
                             *s = format!("{}{}", profile_dir, s);
                         }
@@ -636,32 +678,34 @@ fn insert_profile_barriers(
     steps: &mut Vec<schema::StepDef>,
     profiles: &dataset::DSProfileGroup,
 ) {
-    // Determine the profile execution order: shared/default first, then sized
-    let mut profile_order: Vec<String> = vec!["default".to_string()];
-    for (name, profile) in &profiles.0 {
-        if name != "default" && profile.base_count.is_some() {
-            profile_order.push(name.clone());
-        }
+    // Barrier order: sized profiles ascending by base_count, then default last.
+    // Shared steps (no profiles) are not in the barrier chain — they run
+    // when their explicit deps are satisfied.
+    let mut sized_profiles: Vec<(String, u64)> = profiles.0.iter()
+        .filter(|(name, p)| name.as_str() != "default" && p.base_count.is_some())
+        .map(|(name, p)| (name.clone(), p.base_count.unwrap()))
+        .collect();
+    sized_profiles.sort_by_key(|(_, bc)| *bc);
+
+    let mut profile_order: Vec<String> = sized_profiles.into_iter().map(|(name, _)| name).collect();
+    if profiles.0.contains_key("default") {
+        profile_order.push("default".to_string());
     }
 
     if profile_order.len() <= 1 {
         return; // No barriers needed with only one profile
     }
 
-    // Collect step IDs per profile group
+    // Collect step IDs per profile group.
+    // Shared steps (empty profiles) are NOT included in the barrier chain.
+    // They run whenever their explicit `after` dependencies are satisfied.
+    // Profile steps that need shared outputs already declare those deps directly.
     let step_ids_per_profile: Vec<(String, Vec<String>)> = profile_order
         .iter()
         .map(|pname| {
             let ids: Vec<String> = steps
                 .iter()
-                .filter(|s| {
-                    if pname == "default" {
-                        // Default group: steps with profiles: [default] or shared (no profiles)
-                        s.profiles.is_empty() || s.profiles.iter().any(|p| p == "default")
-                    } else {
-                        s.profiles.iter().any(|p| p == pname)
-                    }
-                })
+                .filter(|s| s.profiles.iter().any(|p| p == pname))
                 .map(|s| s.effective_id())
                 .collect();
             (pname.clone(), ids)
@@ -718,7 +762,7 @@ fn derive_sized_profile_views(
     profiles: &mut dataset::DSProfileGroup,
 ) {
     use dataset::profile::{DSView};
-    use dataset::source::DSSource;
+    use dataset::source::{DSSource, DSWindow, DSInterval};
 
     // Collect bare output filenames from templates
     let template_outputs: Vec<String> = templates
@@ -753,7 +797,32 @@ fn derive_sized_profile_views(
                 continue;
             }
 
-            // Build the actual path for this profile
+            // For non-default sized profiles, reference the default profile's
+            // file with a window [0, base_count) instead of creating a
+            // separate extracted file.
+            if name != "default" {
+                if let Some(bc) = profile.base_count {
+                    let default_path = format!("profiles/default/{}", filename);
+                    let window = DSWindow(vec![DSInterval {
+                        min_incl: 0,
+                        max_excl: bc,
+                    }]);
+                    profile.views.insert(
+                        stem,
+                        DSView {
+                            source: DSSource {
+                                path: default_path,
+                                namespace: None,
+                                window,
+                            },
+                            window: None,
+                        },
+                    );
+                    continue;
+                }
+            }
+
+            // Default profile or profiles without base_count: use direct path
             let resolved_path = format!("{}{}", profile_dir, filename);
 
             profile.views.insert(
@@ -1289,7 +1358,7 @@ mod tests {
     #[test]
     fn test_filter_steps_shared_always_included() {
         let steps = vec![
-            make_step("shared", "import facet", vec![], vec![("source", "x")]),
+            make_step("shared", "import", vec![], vec![("source", "x")]),
             make_step_with_profiles("default-only", "compute knn", vec![], vec![], vec!["default"]),
             make_step_with_profiles("ten-m", "compute knn", vec![], vec![], vec!["10M"]),
         ];
@@ -1302,7 +1371,7 @@ mod tests {
     #[test]
     fn test_filter_steps_profile_10m() {
         let steps = vec![
-            make_step("shared", "import facet", vec![], vec![]),
+            make_step("shared", "import", vec![], vec![]),
             make_step_with_profiles("default-only", "compute knn", vec![], vec![], vec!["default"]),
             make_step_with_profiles("ten-m", "compute knn", vec![], vec![], vec!["10M"]),
         ];
@@ -1325,7 +1394,7 @@ mod tests {
     #[test]
     fn test_filter_steps_no_profiles_means_shared() {
         let steps = vec![
-            make_step("a", "import facet", vec![], vec![]),
+            make_step("a", "import", vec![], vec![]),
             make_step("b", "compute knn", vec![], vec![]),
         ];
         // All steps are shared — any profile gets all of them
@@ -1356,7 +1425,7 @@ default:
   base_count: 10000000
 "#);
         let steps = vec![
-            make_step("shared", "import facet", vec![], vec![("output", "all.hvec")]),
+            make_step("shared", "import", vec![], vec![("output", "all.hvec")]),
             make_per_profile_step(
                 "extract",
                 "generate hvec-extract",
@@ -1365,20 +1434,20 @@ default:
             ),
         ];
         let expanded = expand_per_profile_steps(steps, &profiles, 10_000);
-        // Should have: shared + extract (default) + extract-10M
+        // Should have: shared + extract-10M (sized first) + extract (default last)
         assert_eq!(expanded.len(), 3);
         assert_eq!(expanded[0].effective_id(), "shared");
-        assert_eq!(expanded[1].effective_id(), "extract");
-        assert_eq!(expanded[1].profiles, vec!["default"]);
-        assert_eq!(expanded[1].output_path().unwrap(), "profiles/default/base.hvec");
-        assert_eq!(expanded[2].effective_id(), "extract-10M");
+        assert_eq!(expanded[1].effective_id(), "extract-10M");
         // Check variable resolution in options
-        let output = expanded[2].output_path().unwrap();
+        let output = expanded[1].output_path().unwrap();
         assert_eq!(output, "profiles/10M/base.hvec");
-        let range_val = expanded[2].options.get("range").unwrap().as_str().unwrap();
+        let range_val = expanded[1].options.get("range").unwrap().as_str().unwrap();
         assert_eq!(range_val, "[10000,10010000)");
         // Should be gated to 10M
-        assert_eq!(expanded[2].profiles, vec!["10M"]);
+        assert_eq!(expanded[1].profiles, vec!["10M"]);
+        assert_eq!(expanded[2].effective_id(), "extract");
+        assert_eq!(expanded[2].profiles, vec!["default"]);
+        assert_eq!(expanded[2].output_path().unwrap(), "profiles/default/base.hvec");
     }
 
     #[test]
@@ -1429,21 +1498,15 @@ default:
             ]),
         ];
         let expanded = expand_per_profile_steps(steps, &profiles, 10_000);
-        // default + 10M + 20M = 3
+        // 10M + 20M + default = 3 (sized ascending, default last)
         assert_eq!(expanded.len(), 3);
-        assert_eq!(expanded[0].effective_id(), "knn");
-        assert_eq!(expanded[0].profiles, vec!["default"]);
-        assert_eq!(expanded[0].output_path().unwrap(), "profiles/default/gnd.ivec");
-        assert_eq!(expanded[1].effective_id(), "knn-10M");
-        assert_eq!(expanded[2].effective_id(), "knn-20M");
-        assert_eq!(
-            expanded[1].output_path().unwrap(),
-            "profiles/10M/gnd.ivec"
-        );
-        assert_eq!(
-            expanded[2].output_path().unwrap(),
-            "profiles/20M/gnd.ivec"
-        );
+        assert_eq!(expanded[0].effective_id(), "knn-10M");
+        assert_eq!(expanded[0].output_path().unwrap(), "profiles/10M/gnd.ivec");
+        assert_eq!(expanded[1].effective_id(), "knn-20M");
+        assert_eq!(expanded[1].output_path().unwrap(), "profiles/20M/gnd.ivec");
+        assert_eq!(expanded[2].effective_id(), "knn");
+        assert_eq!(expanded[2].profiles, vec!["default"]);
+        assert_eq!(expanded[2].output_path().unwrap(), "profiles/default/gnd.ivec");
     }
 
     #[test]
@@ -1488,7 +1551,7 @@ default:
   base_count: 10000000
 "#);
         let steps = vec![
-            make_step("a", "import facet", vec![], vec![]),
+            make_step("a", "import", vec![], vec![]),
             make_step("b", "compute knn", vec!["a"], vec![]),
         ];
         let expanded = expand_per_profile_steps(steps.clone(), &profiles, 10_000);
@@ -1543,6 +1606,39 @@ default:
     }
 
     #[test]
+    fn test_expand_per_profile_indices_distances_prefixed() {
+        // Verify that indices and distances keys (used by compute knn)
+        // are auto-prefixed with the profile directory, not just "output".
+        let profiles = test_profile_group(r#"
+default:
+  base_vectors: base.hvec
+10M:
+  base_count: 10000000
+"#);
+        let steps = vec![
+            make_per_profile_step("knn", "compute knn", vec![], vec![
+                ("base", "base_vectors.hvec"),
+                ("query", "query_vectors.hvec"),
+                ("indices", "neighbor_indices.ivec"),
+                ("distances", "neighbor_distances.fvec"),
+            ]),
+        ];
+        let expanded = expand_per_profile_steps(steps, &profiles, 10_000);
+
+        // 10M + default = 2
+        assert_eq!(expanded.len(), 2);
+
+        let knn_10m = expanded.iter().find(|s| s.effective_id() == "knn-10M").unwrap();
+        let indices = knn_10m.options.get("indices").unwrap().as_str().unwrap();
+        assert_eq!(indices, "profiles/10M/neighbor_indices.ivec");
+        let distances = knn_10m.options.get("distances").unwrap().as_str().unwrap();
+        assert_eq!(distances, "profiles/10M/neighbor_distances.fvec");
+        // Non-output options should NOT be prefixed
+        let query = knn_10m.options.get("query").unwrap().as_str().unwrap();
+        assert_eq!(query, "query_vectors.hvec");
+    }
+
+    #[test]
     fn test_insert_profile_barriers() {
         let profiles = test_profile_group(r#"
 default:
@@ -1553,26 +1649,73 @@ default:
   base_count: 20000000
 "#);
         let mut steps = vec![
-            make_step("shared", "import facet", vec![], vec![]),
+            make_step("shared", "import", vec![], vec![]),
             make_step_with_profiles("def-knn", "compute knn", vec![], vec![], vec!["default"]),
             make_step_with_profiles("knn-10M", "compute knn", vec![], vec![], vec!["10M"]),
             make_step_with_profiles("knn-20M", "compute knn", vec![], vec![], vec!["20M"]),
         ];
         insert_profile_barriers(&mut steps, &profiles);
 
-        // Should have 2 barrier steps added (10M and 20M)
+        // Order: 10M → 20M → default (sized ascending, default last).
+        // Shared steps are NOT in the barrier chain.
+        // Should have 2 barrier steps: barrier-20M, barrier-default.
         let barrier_steps: Vec<_> = steps.iter()
             .filter(|s| s.run == "barrier")
             .collect();
         assert_eq!(barrier_steps.len(), 2);
 
-        // barrier-10M should depend on default's steps
-        let b10 = barrier_steps.iter().find(|s| s.effective_id() == "barrier-10M").unwrap();
-        assert!(b10.after.contains(&"shared".to_string()) || b10.after.contains(&"def-knn".to_string()));
+        // barrier-20M should depend on 10M's steps
+        let b20 = barrier_steps.iter().find(|s| s.effective_id() == "barrier-20M").unwrap();
+        assert!(b20.after.contains(&"knn-10M".to_string()));
 
-        // knn-10M should depend on barrier-10M
-        let knn10 = steps.iter().find(|s| s.effective_id() == "knn-10M").unwrap();
-        assert!(knn10.after.contains(&"barrier-10M".to_string()));
+        // barrier-default should depend on 20M's steps
+        let bdef = barrier_steps.iter().find(|s| s.effective_id() == "barrier-default").unwrap();
+        assert!(bdef.after.contains(&"knn-20M".to_string()));
+
+        // def-knn should depend on barrier-default
+        let def_knn = steps.iter().find(|s| s.effective_id() == "def-knn").unwrap();
+        assert!(def_knn.after.contains(&"barrier-default".to_string()));
+
+        // shared step should NOT have any barrier dependency
+        let shared_step = steps.iter().find(|s| s.effective_id() == "shared").unwrap();
+        assert!(shared_step.after.is_empty());
+    }
+
+    #[test]
+    fn test_barriers_no_cycle_with_shared_deps_on_shared() {
+        // Regression: shared steps must depend on other shared steps, NOT on
+        // per-profile template outputs. This mirrors the real dataset.yaml
+        // pattern where survey/synthesize run against the full imported data.
+        // Pattern: import (shared) → survey (shared) → extract (per_profile) → evaluate (per_profile)
+        let profiles = test_profile_group(r#"
+default:
+  base_vectors: base.hvec
+10M:
+  base_count: 10000000
+"#);
+        let steps = vec![
+            // Shared import — no profiles, no per_profile
+            make_step("import-metadata", "import", vec![], vec![
+                ("output", "metadata_all.slab"),
+            ]),
+            // Shared survey depends on shared import (NOT per-profile extract)
+            make_step("survey-metadata", "analyze survey", vec!["import-metadata"], vec![]),
+            // Per-profile extract depends on shared import
+            make_per_profile_step("extract-metadata", "transform slab-extract", vec!["import-metadata"], vec![
+                ("output", "${profile_dir}meta.slab"),
+            ]),
+            // Per-profile evaluate depends on its own extract + shared survey
+            make_per_profile_step("evaluate", "transform evaluate", vec!["extract-metadata", "survey-metadata"], vec![
+                ("output", "${profile_dir}eval.slab"),
+            ]),
+        ];
+        let expanded = expand_per_profile_steps(steps, &profiles, 10_000);
+        let mut all_steps = expanded;
+        insert_profile_barriers(&mut all_steps, &profiles);
+
+        // Must not panic — if barriers created a cycle, build_dag would fail
+        let result = dag::build_dag(&all_steps);
+        assert!(result.is_ok(), "DAG cycle detected: {}", result.unwrap_err());
     }
 
     #[test]
@@ -1600,10 +1743,13 @@ default:
         // Explicit view preserved
         assert_eq!(pdef.view("query_vectors").unwrap().path(), "query.hvec");
 
-        // Sized profile also gets auto-derived views
+        // Sized profile gets window-based views referencing default's files
         let p10 = profiles.profile("10M").unwrap();
-        assert_eq!(p10.view("base_vectors").unwrap().path(), "profiles/10M/base_vectors.hvec");
-        assert_eq!(p10.view("neighbor_indices").unwrap().path(), "profiles/10M/neighbor_indices.ivec");
+        assert_eq!(p10.view("base_vectors").unwrap().path(), "profiles/default/base_vectors.hvec");
+        assert!(!p10.view("base_vectors").unwrap().source.window.is_empty());
+        assert_eq!(p10.view("base_vectors").unwrap().source.window.0[0].max_excl, 10000000);
+        assert_eq!(p10.view("neighbor_indices").unwrap().path(), "profiles/default/neighbor_indices.ivec");
+        assert!(!p10.view("neighbor_indices").unwrap().source.window.is_empty());
         // Inherited shared view unchanged
         assert_eq!(p10.view("query_vectors").unwrap().path(), "query.hvec");
     }

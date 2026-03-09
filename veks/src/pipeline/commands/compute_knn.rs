@@ -38,6 +38,7 @@ use crate::pipeline::command::{
     render_options_table,
 };
 use crate::pipeline::simd_distance::{self, Metric};
+use super::source_window::resolve_source;
 
 /// Pipeline command: compute exact KNN ground truth.
 pub struct ComputeKnnOp;
@@ -226,9 +227,14 @@ struct PartitionMeta {
 }
 
 /// Build a cache file path for a partition segment.
+///
+/// The cache key is derived from the base/query file stems, partition range,
+/// k, and metric — NOT from the pipeline step ID. This allows partition
+/// caches to be shared across profiles that use overlapping base-vector
+/// windows with the same query set, k, and metric.
 fn build_cache_path(
     cache_dir: &Path,
-    step_id: &str,
+    cache_prefix: &str,
     start: usize,
     end: usize,
     k: usize,
@@ -244,8 +250,24 @@ fn build_cache_path(
     };
     cache_dir.join(format!(
         "{}.range_{:06}_{:06}.k{}.{}.{}.{}",
-        step_id, start, end, k, metric_str, suffix, ext
+        cache_prefix, start, end, k, metric_str, suffix, ext
     ))
+}
+
+/// Derive a cache key prefix from the base and query file paths.
+///
+/// Uses file stems so that partitions computed for the same physical files
+/// are reusable regardless of which pipeline step or profile triggered them.
+fn cache_prefix_for(base_path: &Path, query_path: &Path) -> String {
+    let base_stem = base_path
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy();
+    let query_stem = query_path
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy();
+    format!("{}.{}", base_stem, query_stem)
 }
 
 /// Validate that a cache file exists and has the expected byte size.
@@ -629,7 +651,7 @@ fn write_partition_cache(
     results: &[Vec<Neighbor>],
     k: usize,
 ) -> Result<(), String> {
-    write_indices(&meta.neighbors_path, results, k)?;
+    write_indices(&meta.neighbors_path, results, k, 0)?;
     write_distances(&meta.distances_path, results, k)?;
     Ok(())
 }
@@ -645,6 +667,7 @@ fn merge_partitions(
     distances_path: Option<&Path>,
     k: usize,
     query_count: usize,
+    base_offset: usize,
     ui: &crate::ui::UiHandle,
 ) -> Result<(), String> {
     // Open all partition files
@@ -726,9 +749,10 @@ fn merge_partitions(
         idx_writer
             .write_all(&dim.to_le_bytes())
             .map_err(|e| e.to_string())?;
+        let offset32 = base_offset as u32;
         for j in 0..k {
             let idx: i32 = if j < candidates.len() {
-                candidates[j].index as i32
+                (candidates[j].index - offset32) as i32
             } else {
                 -1
             };
@@ -869,13 +893,11 @@ base-vector ranges.
             .or_else(|| ctx.governor.current("segmentsize").map(|v| v as usize))
             .unwrap_or(1_000_000);
 
-        let step_id = if ctx.step_id.is_empty() {
-            "compute-knn".to_string()
-        } else {
-            ctx.step_id.clone()
+        let base_source = match resolve_source(base_str, &ctx.workspace) {
+            Ok(s) => s,
+            Err(e) => return error_result(e, start),
         };
-
-        let base_path = resolve_path(base_str, &ctx.workspace);
+        let base_path = base_source.path.clone();
         let query_path = resolve_path(query_str, &ctx.workspace);
         let indices_path = resolve_path(indices_str, &ctx.workspace);
 
@@ -898,6 +920,8 @@ base-vector ranges.
             }
         }
 
+        let base_window = base_source.window;
+
         // Detect element type from base file extension and dispatch
         match detect_element_type(&base_path) {
             ElementType::F16 => {
@@ -912,7 +936,7 @@ base-vector ranges.
                     dist_fn,
                     threads,
                     partition_size,
-                    &step_id,
+                    base_window,
                     ctx,
                     start,
                 )
@@ -929,7 +953,7 @@ base-vector ranges.
                     dist_fn,
                     threads,
                     partition_size,
-                    &step_id,
+                    base_window,
                     ctx,
                     start,
                 )
@@ -1011,7 +1035,7 @@ fn execute_f32(
     dist_fn: fn(&[f32], &[f32]) -> f32,
     threads: usize,
     partition_size: usize,
-    step_id: &str,
+    base_window: Option<(usize, usize)>,
     ctx: &mut StreamContext,
     start: Instant,
 ) -> CommandResult {
@@ -1036,10 +1060,20 @@ fn execute_f32(
         }
     };
 
-    let base_count = <MmapVectorReader<f32> as VectorReader<f32>>::count(&*base_reader);
+    let file_count = <MmapVectorReader<f32> as VectorReader<f32>>::count(&*base_reader);
     let query_count = <MmapVectorReader<f32> as VectorReader<f32>>::count(&query_reader);
     let base_dim = <MmapVectorReader<f32> as VectorReader<f32>>::dim(&*base_reader);
     let query_dim = <MmapVectorReader<f32> as VectorReader<f32>>::dim(&query_reader);
+
+    // Apply window to base vectors
+    let (base_offset, base_count) = match base_window {
+        Some((ws, we)) => {
+            let ws = ws.min(file_count);
+            let we = we.min(file_count);
+            (ws, we.saturating_sub(ws))
+        }
+        None => (0, file_count),
+    };
 
     if base_dim != query_dim {
         return error_result(
@@ -1055,11 +1089,20 @@ fn execute_f32(
     } else {
         "per-pair SimSIMD"
     };
-    ctx.ui.log(&format!(
-        "KNN: {} queries x {} base vectors (f32, dim={}), k={}, metric={:?}, threads={}, simd={}, batch={}",
-        format_count(query_count), format_count(base_count), base_dim,
-        k, metric, threads, simd_distance::simd_level(), batched_mode
-    ));
+    if base_offset > 0 {
+        ctx.ui.log(&format!(
+            "KNN: {} queries x {} base vectors (f32, dim={}, window=[{}..{})), k={}, metric={:?}, threads={}, simd={}, batch={}",
+            format_count(query_count), format_count(base_count), base_dim,
+            format_count(base_offset), format_count(base_offset + base_count),
+            k, metric, threads, simd_distance::simd_level(), batched_mode
+        ));
+    } else {
+        ctx.ui.log(&format!(
+            "KNN: {} queries x {} base vectors (f32, dim={}), k={}, metric={:?}, threads={}, simd={}, batch={}",
+            format_count(query_count), format_count(base_count), base_dim,
+            k, metric, threads, simd_distance::simd_level(), batched_mode
+        ));
+    }
     ctx.ui.log(&format!(
         "  base: {} ({})  query: {} ({})",
         base_path.file_name().unwrap_or_default().to_string_lossy(),
@@ -1071,6 +1114,7 @@ fn execute_f32(
     execute_with_partitions(
         &query_reader,
         &base_reader,
+        base_offset,
         base_count,
         query_count,
         base_dim,
@@ -1081,7 +1125,8 @@ fn execute_f32(
         dist_fn,
         threads,
         partition_size,
-        step_id,
+        base_path,
+        query_path,
         ctx,
         start,
         compute_partition,
@@ -1100,7 +1145,7 @@ fn execute_f16(
     dist_fn: fn(&[half::f16], &[half::f16]) -> f32,
     threads: usize,
     partition_size: usize,
-    step_id: &str,
+    base_window: Option<(usize, usize)>,
     ctx: &mut StreamContext,
     start: Instant,
 ) -> CommandResult {
@@ -1125,10 +1170,20 @@ fn execute_f16(
         }
     };
 
-    let base_count = <MmapVectorReader<half::f16> as VectorReader<half::f16>>::count(&*base_reader);
+    let file_count = <MmapVectorReader<half::f16> as VectorReader<half::f16>>::count(&*base_reader);
     let query_count = <MmapVectorReader<half::f16> as VectorReader<half::f16>>::count(&query_reader);
     let base_dim = <MmapVectorReader<half::f16> as VectorReader<half::f16>>::dim(&*base_reader);
     let query_dim = <MmapVectorReader<half::f16> as VectorReader<half::f16>>::dim(&query_reader);
+
+    // Apply window to base vectors
+    let (base_offset, base_count) = match base_window {
+        Some((ws, we)) => {
+            let ws = ws.min(file_count);
+            let we = we.min(file_count);
+            (ws, we.saturating_sub(ws))
+        }
+        None => (0, file_count),
+    };
 
     if base_dim != query_dim {
         return error_result(
@@ -1144,11 +1199,20 @@ fn execute_f16(
     } else {
         "per-pair SimSIMD"
     };
-    ctx.ui.log(&format!(
-        "KNN: {} queries x {} base vectors (f16, dim={}), k={}, metric={:?}, threads={}, simd={}, batch={}",
-        format_count(query_count), format_count(base_count), base_dim,
-        k, metric, threads, simd_distance::simd_level(), batched_mode
-    ));
+    if base_offset > 0 {
+        ctx.ui.log(&format!(
+            "KNN: {} queries x {} base vectors (f16, dim={}, window=[{}..{})), k={}, metric={:?}, threads={}, simd={}, batch={}",
+            format_count(query_count), format_count(base_count), base_dim,
+            format_count(base_offset), format_count(base_offset + base_count),
+            k, metric, threads, simd_distance::simd_level(), batched_mode
+        ));
+    } else {
+        ctx.ui.log(&format!(
+            "KNN: {} queries x {} base vectors (f16, dim={}), k={}, metric={:?}, threads={}, simd={}, batch={}",
+            format_count(query_count), format_count(base_count), base_dim,
+            k, metric, threads, simd_distance::simd_level(), batched_mode
+        ));
+    }
     ctx.ui.log(&format!(
         "  base: {} ({})  query: {} ({})",
         base_path.file_name().unwrap_or_default().to_string_lossy(),
@@ -1160,6 +1224,7 @@ fn execute_f16(
     execute_with_partitions(
         &query_reader,
         &base_reader,
+        base_offset,
         base_count,
         query_count,
         base_dim,
@@ -1170,7 +1235,8 @@ fn execute_f16(
         dist_fn,
         threads,
         partition_size,
-        step_id,
+        base_path,
+        query_path,
         ctx,
         start,
         compute_partition_f16,
@@ -1186,6 +1252,7 @@ fn execute_f16(
 fn execute_with_partitions<T>(
     query_reader: &MmapVectorReader<T>,
     base_reader: &Arc<MmapVectorReader<T>>,
+    base_offset: usize,
     base_count: usize,
     query_count: usize,
     dim: usize,
@@ -1196,7 +1263,8 @@ fn execute_with_partitions<T>(
     dist_fn: fn(&[T], &[T]) -> f32,
     threads: usize,
     partition_size: usize,
-    step_id: &str,
+    base_path: &Path,
+    query_path: &Path,
     ctx: &mut StreamContext,
     start: Instant,
     compute_fn: fn(&MmapVectorReader<T>, usize, &Arc<MmapVectorReader<T>>, usize, usize, usize, fn(&[T], &[T]) -> f32, Metric, usize, usize, &ProgressHandle) -> Vec<Vec<Neighbor>>,
@@ -1207,11 +1275,11 @@ where
     // Single-partition fast path
     if base_count <= partition_size {
         let pb = make_query_progress_bar(query_count as u64, &ctx.ui);
-        let results = compute_fn(query_reader, query_count, base_reader, 0, base_count, k, dist_fn, metric, dim, threads, &pb);
+        let results = compute_fn(query_reader, query_count, base_reader, base_offset, base_offset + base_count, k, dist_fn, metric, dim, threads, &pb);
         pb.finish();
 
         ctx.ui.log("  writing results...");
-        if let Err(e) = write_indices(indices_path, &results, k) {
+        if let Err(e) = write_indices(indices_path, &results, k, base_offset) {
             return error_result(e, start);
         }
 
@@ -1314,15 +1382,17 @@ where
 
     let plan_pb = ctx.ui.bar(estimated_partitions as u64, "validating cache");
 
+    let cache_prefix = cache_prefix_for(base_path, query_path);
+    let base_end = base_offset + base_count;
     let mut partitions: Vec<PartitionMeta> = Vec::new();
-    let mut part_start = 0;
-    while part_start < base_count {
-        let part_end = std::cmp::min(part_start + partition_size, base_count);
+    let mut part_start = base_offset;
+    while part_start < base_end {
+        let part_end = std::cmp::min(part_start + partition_size, base_end);
         let neighbors_path = build_cache_path(
-            &ctx.cache, step_id, part_start, part_end, k, metric, "neighbors", "ivec",
+            &ctx.cache, &cache_prefix, part_start, part_end, k, metric, "neighbors", "ivec",
         );
         let dist_cache_path = build_cache_path(
-            &ctx.cache, step_id, part_start, part_end, k, metric, "distances", "fvec",
+            &ctx.cache, &cache_prefix, part_start, part_end, k, metric, "distances", "fvec",
         );
         let cached = validate_cache_file(&neighbors_path, query_count, k, 4)
             && validate_cache_file(&dist_cache_path, query_count, k, 4);
@@ -1349,47 +1419,52 @@ where
 
     // Phase 2: Compute missing partitions
     //
-    // 3-stage pipeline so I/O and compute overlap continuously:
-    //   prefetch thread  — sequentially touches pages for upcoming partitions
-    //   main thread      — runs compute on the current partition
-    //   writer thread    — writes previous partition's results to cache files
+    // 3-stage pipeline: load → compute → save
     //
-    // The prefetch thread walks *all* uncached partitions, forcing every page
-    // into the page cache via sequential volatile reads (not just madvise).
-    // It runs independently and stays ahead of compute, creating steady I/O
-    // instead of bursty page faults inside compute threads.
+    // The bottleneck is I/O (both load and save), while compute is fast
+    // (in-memory). The pipeline is designed to keep the I/O channel
+    // saturated at all times:
+    //
+    //   - Load uses 2-partition lookahead: load N+1 and N+2 are both
+    //     started before compute N begins, so by the time we need N+1
+    //     its pages are already warm.
+    //   - Save and load may overlap (read vs write I/O), keeping the
+    //     channel busy in both directions.
+    //   - If load and save DO contend for the same I/O resource, save
+    //     (drain) is waited on first to bias toward pipeline clearing
+    //     and steady-state throughput.
+    //
+    // Steady-state per partition:
+    //   1. Wait save N-1    (drain output first if pending)
+    //   2. Wait load N      (should be warm — started 2 iterations ago)
+    //   3. Compute N        (CPU-bound; load N+1, N+2 in flight)
+    //   4. Spawn save N     (background write)
+    //   5. Spawn load N+2   (refill lookahead queue)
 
     // Hint sequential access pattern for base vectors (REQ-RM-10)
     base_reader.advise_sequential();
 
-    // Collect uncached partition ranges for the prefetch thread
-    let uncached_ranges: Vec<(usize, usize)> = partitions.iter()
-        .filter(|p| !p.cached)
-        .map(|p| (p.start, p.end))
+    // Collect uncached partition indices for lookahead
+    let uncached_indices: Vec<usize> = partitions.iter()
+        .enumerate()
+        .filter(|(_, p)| !p.cached)
+        .map(|(i, _)| i)
         .collect();
 
-    let prefetch_reader = Arc::clone(base_reader);
-    let total_prefetch_bytes: u64 = uncached_ranges.iter()
-        .map(|(s, e)| ((e - s) as u64) * (base_reader.entry_size() as u64))
+    let total_prefetch_bytes: u64 = uncached_indices.iter()
+        .map(|&i| ((partitions[i].end - partitions[i].start) as u64) * (base_reader.entry_size() as u64))
         .sum();
     ctx.ui.log(&format!(
-        "  prefetch thread: {} uncached partition{} ({} to page in)",
-        uncached_ranges.len(),
-        if uncached_ranges.len() == 1 { "" } else { "s" },
+        "  pipeline: {} uncached partition{} ({} to page in)",
+        uncached_indices.len(),
+        if uncached_indices.len() == 1 { "" } else { "s" },
         format_bytes(total_prefetch_bytes),
     ));
 
-    // Shared counter so we can show a progress bar for prefetch I/O
+    // Shared counter for the prefetch progress bar
     let prefetch_bytes_paged = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let prefetch_counter = Arc::clone(&prefetch_bytes_paged);
-    let prefetch_handle = std::thread::spawn(move || {
-        for (range_start, range_end) in &uncached_ranges {
-            prefetch_reader.prefetch_pages(*range_start, *range_end, Some(&prefetch_counter));
-        }
-    });
 
-    // Progress bar for prefetch — runs on a background tick thread so it
-    // updates even while the main thread is busy computing.
+    // Prefetch progress bar — updated by a background tick thread
     let prefetch_pb = ctx.ui.bar(total_prefetch_bytes, "paging in");
     let prefetch_bytes_for_tick = Arc::clone(&prefetch_bytes_paged);
     let prefetch_tick_handle = std::thread::spawn(move || {
@@ -1408,14 +1483,39 @@ where
     let mut prev_writer: Option<std::thread::JoinHandle<Result<(), String>>> = None;
     let mut prev_write_start: Option<Instant> = None;
 
-    for (pi, part) in partitions.iter().enumerate() {
-        if part.cached {
-            log::info!(
-                "partition {}/{} [{}, {}) — cached (skipping)",
-                pi + 1, num_partitions, part.start, part.end,
-            );
-            continue;
-        }
+    // Lookahead queue for load (prefetch) handles.
+    // We maintain up to LOAD_DEPTH outstanding loads so the I/O channel
+    // is continuously fed. Each entry corresponds to a future uncached
+    // partition whose pages are being warmed.
+    const LOAD_DEPTH: usize = 2;
+    let mut load_queue: std::collections::VecDeque<std::thread::JoinHandle<()>> =
+        std::collections::VecDeque::with_capacity(LOAD_DEPTH);
+
+    // Overall partition progress bar — tracks how many partitions have been
+    // computed out of the total uncached count.
+    let overall_pb = if to_compute > 1 {
+        Some(ctx.ui.bar(to_compute as u64, "partitions"))
+    } else {
+        None
+    };
+
+    // Seed the load queue: kick off prefetch for the first LOAD_DEPTH
+    // uncached partitions so I/O is already running before compute begins.
+    let mut next_load_slot = 0usize; // index into uncached_indices for next load to enqueue
+    while next_load_slot < uncached_indices.len() && load_queue.len() < LOAD_DEPTH {
+        let idx = uncached_indices[next_load_slot];
+        let reader = Arc::clone(base_reader);
+        let counter = Arc::clone(&prefetch_bytes_paged);
+        let pstart = partitions[idx].start;
+        let pend = partitions[idx].end;
+        load_queue.push_back(std::thread::spawn(move || {
+            reader.prefetch_pages(pstart, pend, Some(&counter));
+        }));
+        next_load_slot += 1;
+    }
+
+    for (_ui_idx, &pi) in uncached_indices.iter().enumerate() {
+        let part = &partitions[pi];
 
         // Governor checkpoint at partition boundary
         if ctx.governor.checkpoint() {
@@ -1433,15 +1533,19 @@ where
             format_count(query_count), format_count(part.end - part.start),
         );
 
-        let part_start_time = Instant::now();
-        let pb = make_query_progress_bar(query_count as u64, &ctx.ui);
-        let results = compute_fn(
-            query_reader, query_count, base_reader, part.start, part.end, k, dist_fn, metric, dim, threads, &pb,
-        );
-        pb.finish();
-        let compute_elapsed = part_start_time.elapsed();
+        if let Some(ref opb) = overall_pb {
+            opb.set_message(format!(
+                "[{},{})",
+                format_count(part.start), format_count(part.end),
+            ));
+        }
 
-        // Wait for previous background writer before starting a new write
+        // ── Stage 1: Drain output (save N-1) ────────────────────────
+        // Wait for the previous save to finish first. This gives the
+        // write I/O priority if it's competing with load I/O, and frees
+        // the result buffer memory. When the I/O channel isn't saturated,
+        // this is typically already done (completed during the previous
+        // compute + load overlap).
         if let Some(handle) = prev_writer.take() {
             let write_result = join_writer_with_spinner(handle, "previous", &ctx.ui);
             let write_elapsed = prev_write_start.take()
@@ -1449,15 +1553,52 @@ where
                 .unwrap_or_default();
             match write_result {
                 Ok(()) => {
-                    log::info!("previous write completed in {:.1}s", write_elapsed.as_secs_f64());
+                    log::info!("previous save completed in {:.1}s", write_elapsed.as_secs_f64());
                 }
                 Err(msg) => {
+                    if let Some(opb) = overall_pb.as_ref() { opb.finish(); }
                     return error_result(msg, start);
                 }
             }
         }
 
-        // Spawn background writer for this partition's results
+        // ── Stage 2: Wait for this partition's load ──────────────────
+        // The front of the load queue is this partition (started
+        // LOAD_DEPTH iterations ago or during seeding). With 2-deep
+        // lookahead it should be warm by now.
+        if let Some(handle) = load_queue.pop_front() {
+            if !handle.is_finished() {
+                let sp = ctx.ui.spinner(&format!(
+                    "waiting for load [{},{})",
+                    format_count(part.start), format_count(part.end),
+                ));
+                let _ = handle.join();
+                sp.finish();
+            } else {
+                let _ = handle.join();
+            }
+        }
+
+        // ── Stage 3: Compute ─────────────────────────────────────────
+        // CPU-bound. Outstanding loads in the queue continue paging in
+        // the next partition(s) — I/O read runs in parallel with no
+        // contention (compute doesn't touch the I/O channel).
+        let part_start_time = Instant::now();
+        let pb = make_query_progress_bar(query_count as u64, &ctx.ui);
+        let results = compute_fn(
+            query_reader, query_count, base_reader, part.start, part.end, k, dist_fn, metric, dim, threads, &pb,
+        );
+        pb.finish();
+
+        if let Some(ref opb) = overall_pb {
+            opb.inc(1);
+        }
+        let compute_elapsed = part_start_time.elapsed();
+
+        // ── Stage 4: Spawn save for this partition ───────────────────
+        // Starts immediately after compute. The write runs in the
+        // background, overlapping with the next iteration's load wait
+        // and compute. Drained at Stage 1 of the next iteration.
         let neighbors_path = part.neighbors_path.clone();
         let distances_path = part.distances_path.clone();
         let part_start_idx = part.start;
@@ -1465,7 +1606,7 @@ where
         let part_query_count = query_count;
         prev_write_start = Some(Instant::now());
         prev_writer = Some(std::thread::spawn(move || {
-            write_indices(&neighbors_path, &results, k)?;
+            write_indices(&neighbors_path, &results, k, 0)?;
             write_distances(&distances_path, &results, k)?;
 
             if !validate_cache_file(&neighbors_path, part_query_count, k, 4)
@@ -1494,17 +1635,33 @@ where
             Ok(())
         }));
 
+        // ── Stage 5: Refill load queue ───────────────────────────────
+        // Push the next unqueued partition into the load pipeline so
+        // I/O stays saturated. With LOAD_DEPTH=2, at any point we have
+        // up to 2 outstanding loads warming future partitions.
+        if next_load_slot < uncached_indices.len() {
+            let idx = uncached_indices[next_load_slot];
+            let reader = Arc::clone(base_reader);
+            let counter = Arc::clone(&prefetch_bytes_paged);
+            let pstart = partitions[idx].start;
+            let pend = partitions[idx].end;
+            load_queue.push_back(std::thread::spawn(move || {
+                reader.prefetch_pages(pstart, pend, Some(&counter));
+            }));
+            next_load_slot += 1;
+        }
+
         // Release completed partition's pages from page cache (REQ-RM-10)
         base_reader.release_range(part.start, part.end);
 
         log::info!(
-            "partition {}/{} — compute done in {:.1}s (write in background)",
+            "partition {}/{} — compute done in {:.1}s (save in background)",
             pi + 1, num_partitions,
             compute_elapsed.as_secs_f64(),
         );
     }
 
-    // Wait for final background writer
+    // Drain final save
     if let Some(handle) = prev_writer.take() {
         let write_result = join_writer_with_spinner(handle, "final", &ctx.ui);
         let write_elapsed = prev_write_start.take()
@@ -1512,22 +1669,25 @@ where
             .unwrap_or_default();
         match write_result {
             Ok(()) => {
-                log::info!("final write completed in {:.1}s", write_elapsed.as_secs_f64());
+                log::info!("final save completed in {:.1}s", write_elapsed.as_secs_f64());
             }
             Err(msg) => {
+                if let Some(opb) = overall_pb.as_ref() { opb.finish(); }
                 return error_result(msg, start);
             }
         }
     }
 
-    // Prefetch thread may still be running if compute was faster; let it finish
-    if !prefetch_handle.is_finished() {
-        let sp = ctx.ui.spinner("waiting for prefetch to finish...");
-        let _ = prefetch_handle.join();
-        sp.finish();
-    } else {
-        let _ = prefetch_handle.join();
+    // Drain any remaining loads (shouldn't happen but be safe)
+    for handle in load_queue {
+        let _ = handle.join();
     }
+
+    // Finish the overall partition progress bar
+    if let Some(opb) = overall_pb {
+        opb.finish();
+    }
+
     // Stop the prefetch progress bar tick thread
     let _ = prefetch_tick_handle.join();
 
@@ -1540,6 +1700,7 @@ where
         distances_path,
         k,
         query_count,
+        base_offset,
         &ctx.ui,
     ) {
         return error_result(format!("merge failed: {}", e), start);
@@ -1562,19 +1723,23 @@ where
 }
 
 /// Write neighbor indices as ivec (each row: k i32 indices).
-fn write_indices(path: &Path, results: &[Vec<Neighbor>], k: usize) -> Result<(), String> {
+///
+/// `base_offset` is subtracted from each neighbor index so output indices are
+/// 0-based relative to the window start.
+fn write_indices(path: &Path, results: &[Vec<Neighbor>], k: usize, base_offset: usize) -> Result<(), String> {
     let file = std::fs::File::create(path)
         .map_err(|e| format!("failed to create {}: {}", path.display(), e))?;
     let mut writer = std::io::BufWriter::with_capacity(1 << 20, file);
 
     let dim = k as i32;
+    let offset32 = base_offset as u32;
     for row in results {
         writer
             .write_all(&dim.to_le_bytes())
             .map_err(|e| e.to_string())?;
         for i in 0..k {
             let idx: i32 = if i < row.len() {
-                row[i].index as i32
+                (row[i].index - offset32) as i32
             } else {
                 -1 // Padding if fewer than k neighbors
             };
@@ -1714,6 +1879,7 @@ mod tests {
             step_id: String::new(),
             governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
             ui: crate::ui::UiHandle::new(std::sync::Arc::new(crate::ui::TestSink::new())),
+            status_interval: std::time::Duration::from_secs(1),
         }
     }
 

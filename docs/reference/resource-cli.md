@@ -129,7 +129,7 @@ a self-contained JSON object with a `type` field.
   "major_faults": 12,
   "minor_faults": 84200,
   "active_threads": 8,
-  "step_id": "compute-predicate-keys"
+  "step_id": "evaluate-predicates"
 }
 ```
 
@@ -139,7 +139,7 @@ a self-contained JSON object with a `type` field.
 {
   "type": "decision",
   "ts": "2026-03-05T06:14:30.125Z",
-  "step_id": "compute-predicate-keys",
+  "step_id": "evaluate-predicates",
   "resource": "segmentsize",
   "old_value": 1000000,
   "new_value": 750000,
@@ -156,7 +156,7 @@ a self-contained JSON object with a `type` field.
 {
   "type": "throttle",
   "ts": "2026-03-05T06:14:35.001Z",
-  "step_id": "compute-predicate-keys",
+  "step_id": "evaluate-predicates",
   "reason": "RSS exceeded 95% of ceiling; emergency flush requested",
   "resources_affected": ["segmentsize", "threads"]
 }
@@ -169,7 +169,7 @@ granted (or denied) it:
 {
   "type": "request",
   "ts": "2026-03-05T06:14:36.100Z",
-  "step_id": "compute-predicate-keys",
+  "step_id": "evaluate-predicates",
   "resource": "segmentsize",
   "requested": 1500000,
   "granted": 750000,
@@ -199,11 +199,11 @@ resources declared by the current command.
 |---------|---------------------|
 | `compute knn` | `mem`, `threads`, `readahead` |
 | `compute filtered-knn` | `mem`, `threads`, `readahead` |
-| `generate predicate-keys` | `mem`, `threads`, `segments`, `segmentsize` |
+| `evaluate predicates` | `mem`, `threads`, `segments`, `segmentsize` |
 | `generate predicated` | `mem`, `threads`, `readahead` |
-| `import facet` | `threads`, `iothreads`, `readahead` |
+| `import` | `threads`, `iothreads`, `readahead` |
 | `convert file` | `iothreads`, `readahead` |
 | `slab import` | `iothreads`, `readahead` |
 | `analyze stats` | `mem`, `readahead` |
-| `generate predicates` | (none -- lightweight) |
+| `synthesize predicates` | (none -- lightweight) |
 | `slab inspect` | (none -- lightweight) |

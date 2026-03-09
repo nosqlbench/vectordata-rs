@@ -25,7 +25,7 @@ Each command implements:
 
 | Command | Description | Resource profile |
 |---------|-------------|------------------|
-| `import facet` | Import source data into preferred internal format by facet type | **I/O-heavy**: streaming read + write. Memory proportional to buffer sizes. For parquet→slab, uses compiled MNode writer. |
+| `import` | Import source data into preferred internal format by facet type | **I/O-heavy**: streaming read + write. Memory proportional to buffer sizes. For parquet→slab, uses compiled MNode writer. |
 
 ### Convert
 
@@ -38,7 +38,7 @@ Each command implements:
 | Command | Description | Resource profile |
 |---------|-------------|------------------|
 | `compute knn` | Brute-force exact K-nearest neighbors | **CPU + memory intensive**: mmaps base vectors (potentially hundreds of GB). Multi-threaded query processing. Partitioned mode caches per-partition results in `.cache/`. |
-| `compute filtered-knn` | Predicate-filtered exact KNN | **CPU + memory intensive**: mmaps base vectors. Reads predicate-key ordinals from slab. Multi-threaded. |
+| `compute filtered-knn` | Predicate-filtered exact KNN | **CPU + memory intensive**: mmaps base vectors. Reads matching metadata ordinals from slab. Multi-threaded. |
 | `compute sort` | Sort vectors by some criterion | I/O-bound |
 
 ### Generate
@@ -47,16 +47,16 @@ Each command implements:
 |---------|-------------|------------------|
 | `generate vectors` | Generate synthetic random vectors | CPU + I/O |
 | `generate ivec-shuffle` | Generate shuffled ordinal permutation | Memory: full ordinal array |
-| `generate fvec-extract` | Extract vector subset | I/O-bound |
-| `generate ivec-extract` | Extract index subset | I/O-bound |
-| `generate hvec-extract` | Extract half-precision subset | I/O-bound |
+| `transform fvec-extract` | Extract vector subset | I/O-bound |
+| `transform ivec-extract` | Extract index subset | I/O-bound |
+| `transform hvec-extract` | Extract half-precision subset | I/O-bound |
 | `generate sketch` | Generate vector sketches | CPU |
 | `generate from-model` | Generate vectors from an ML model | CPU + GPU |
 | `generate dataset` | Generate synthetic dataset | Mixed |
 | `generate derive` | Derive new facets from existing | Mixed |
 | `generate predicated` | Generate predicated dataset | Mixed |
-| `generate predicates` | Generate random filter predicates from metadata survey | **Light**: reads survey JSON, outputs small slab. Fast. |
-| `generate predicate-keys` | Evaluate predicates against all metadata records | **CRITICAL: highest resource risk**. Scans entire metadata slab (207 GB for LAION-400M). Segmented processing with cache. Per-segment: reads all pages, evaluates all predicates against every record. Memory: match ordinal vectors per predicate × segment. THIS IS THE COMMAND THAT CAUSED THE SYSTEM LOCKUP. |
+| `synthesize predicates` | Generate random filter predicates from metadata survey | **Light**: reads survey JSON, outputs small slab. Fast. |
+| `evaluate predicates` | Evaluate predicates against all metadata records | **CRITICAL: highest resource risk**. Scans entire metadata slab (207 GB for LAION-400M). Segmented processing with cache. Per-segment: reads all pages, evaluates all predicates against every record. Memory: match ordinal vectors per predicate × segment. THIS IS THE COMMAND THAT CAUSED THE SYSTEM LOCKUP. |
 
 ### Slab Operations
 
@@ -72,7 +72,7 @@ Each command implements:
 | `slab explain` | Display page layout | Light |
 | `slab namespaces` | List namespaces | Light |
 | `slab inspect` | Decode + render records via ANode | Light per record |
-| `slab survey` | Sample records and analyze field distributions | Memory: sample set |
+| `survey` | Sample records and analyze field distributions | Memory: sample set |
 
 ### Analysis
 
@@ -137,12 +137,12 @@ Each command implements:
 
 | Risk level | Commands | Primary concern |
 |-----------|----------|-----------------|
-| **Critical** | `generate predicate-keys` | Memory: accumulates match ordinals for all predicates across all records. At 407M records × 10K predicates, matching ordinal vectors can consume tens of GB. Segmented, but segment size and match density determine peak memory. |
+| **Critical** | `evaluate predicates` | Memory: accumulates match ordinals for all predicates across all records. At 407M records × 10K predicates, matching ordinal vectors can consume tens of GB. Segmented, but segment size and match density determine peak memory. |
 | **High** | `compute knn`, `compute filtered-knn` | Memory: mmaps full base vector file. CPU: brute-force distance for every query × every base vector. Thread count × working set can overwhelm system. |
-| **Medium** | `import facet` (parquet→slab), `datasets prebuffer` | I/O: sustained sequential reads and writes at multi-GB/s. Can saturate disk bandwidth and page cache. |
+| **Medium** | `import` (parquet→slab), `datasets prebuffer` | I/O: sustained sequential reads and writes at multi-GB/s. Can saturate disk bandwidth and page cache. |
 | **Low** | Most analysis, slab, merkle, config commands | Bounded resource usage. |
 
-## 4.4 generate predicate-keys — Deep Dive
+## 4.4 evaluate predicates — Deep Dive
 
 This is the command that caused the system lockup. Its execution model:
 

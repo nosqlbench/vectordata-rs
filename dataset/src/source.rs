@@ -14,6 +14,7 @@
 //! | Bare string | `"file.fvec"` |
 //! | String + bracket window | `"file.fvec[0..1M]"` |
 //! | String + paren window | `"file.fvec(0..1000)"` |
+//! | String + mixed delimiters | `"file.fvec[0..1M)"` |
 //! | String + namespace | `"file.slab:content"` |
 //! | String + namespace + window | `"file.slab:ns:[0..1K]"` |
 //! | Map with `source` | `{ source: "f.fvec" }` |
@@ -91,6 +92,22 @@ impl fmt::Display for DSSource {
 // ---------------------------------------------------------------------------
 // Interval parsing
 // ---------------------------------------------------------------------------
+
+/// Format a count value back to a compact suffix string.
+///
+/// Picks the largest clean suffix: `b` (billions), `m` (millions), `k` (thousands).
+/// Falls back to the raw number if no suffix divides evenly.
+pub fn format_count_with_suffix(n: u64) -> String {
+    if n > 0 && n % 1_000_000_000 == 0 {
+        format!("{}b", n / 1_000_000_000)
+    } else if n > 0 && n % 1_000_000 == 0 {
+        format!("{}m", n / 1_000_000)
+    } else if n > 0 && n % 1_000 == 0 {
+        format!("{}k", n / 1_000)
+    } else {
+        n.to_string()
+    }
+}
 
 /// Parse a unit suffix and return the multiplier.
 ///
@@ -246,38 +263,32 @@ fn parse_window(s: &str) -> Result<DSWindow, String> {
 /// - `"file.fvec"` -> path only
 /// - `"file.fvec[0..1M]"` -> path + bracket window
 /// - `"file.fvec(0..1000)"` -> path + paren window
+/// - `"file.fvec[0..1M)"` -> path + mixed-delimiter window
 /// - `"file.slab:content"` -> path + namespace
 /// - `"file.slab:ns:[0..1K]"` -> path + namespace + window
+///
+/// The outer delimiters (`[`, `(`, `]`, `)`) are structural — they mark
+/// the window region but do not affect interval bound semantics. The
+/// inner content is parsed by `parse_window`/`parse_interval`.
 pub fn parse_source_string(s: &str) -> Result<DSSource, String> {
     let s = s.trim();
 
-    // Check for bracket window: "file.fvec[0..1M]" or "file.slab:ns:[0..1K]"
-    if let Some(bracket_start) = s.find('[') {
-        if s.ends_with(']') {
-            let mut path_part = &s[..bracket_start];
-            let window_part = &s[bracket_start + 1..s.len() - 1];
+    // Check for window delimiters: brackets or parens, including mixed forms
+    // like "[0..1M)", "(0..1M]", etc. The opening delimiter can be '[' or '('
+    // and the closing delimiter can be ']' or ')'.
+    //
+    // The outer delimiters in source sugar are structural (they separate
+    // the path from the window spec) — they are stripped before the inner
+    // content is passed to `parse_window` / `parse_interval`.
+    let ends_with_close = s.ends_with(']') || s.ends_with(')');
+    if ends_with_close {
+        // Find the opening delimiter — first '[' or '(' that could start a window
+        let window_start = s.find('[').or_else(|| s.find('('));
+        if let Some(start_pos) = window_start {
+            let mut path_part = &s[..start_pos];
+            let window_part = &s[start_pos + 1..s.len() - 1];
 
-            // Strip trailing colon before bracket (ns separator in "path:ns:[window]")
-            if path_part.ends_with(':') {
-                path_part = &path_part[..path_part.len() - 1];
-            }
-
-            let (path, namespace) = split_namespace(path_part);
-            let window = parse_window(window_part)?;
-            return Ok(DSSource {
-                path: path.to_string(),
-                namespace,
-                window,
-            });
-        }
-    }
-
-    // Check for paren window: "file.fvec(0..1000)"
-    if let Some(paren_start) = s.find('(') {
-        if s.ends_with(')') {
-            let mut path_part = &s[..paren_start];
-            let window_part = &s[paren_start + 1..s.len() - 1];
-
+            // Strip trailing colon before delimiter (ns separator in "path:ns:[window]")
             if path_part.ends_with(':') {
                 path_part = &path_part[..path_part.len() - 1];
             }
@@ -762,5 +773,45 @@ window: "0..1000"
         let i: DSInterval = serde_yaml::from_str("\"0..1K\"").unwrap();
         assert_eq!(i.min_incl, 0);
         assert_eq!(i.max_excl, 1000);
+    }
+
+    // -- mixed bracket forms in source sugar --
+
+    #[test]
+    fn test_source_mixed_bracket_paren_window() {
+        // "[0..1M)" — half-open range in source sugar
+        let s = parse_source_string("file.fvec[0..1M)").unwrap();
+        assert_eq!(s.path, "file.fvec");
+        assert_eq!(s.window.0.len(), 1);
+        assert_eq!(s.window.0[0].min_incl, 0);
+        assert_eq!(s.window.0[0].max_excl, 1_000_000);
+    }
+
+    #[test]
+    fn test_source_mixed_paren_bracket_window() {
+        // "(0..1M]" — exclusive start, inclusive end
+        let s = parse_source_string("file.fvec(0..1M]").unwrap();
+        assert_eq!(s.path, "file.fvec");
+        assert_eq!(s.window.0.len(), 1);
+        // Outer delimiters are structural — inner "0..1M" parses as default half-open
+        assert_eq!(s.window.0[0].min_incl, 0);
+        assert_eq!(s.window.0[0].max_excl, 1_000_000);
+    }
+
+    #[test]
+    fn test_source_mixed_with_interpolated_number() {
+        // Simulates post-interpolation: "base.hvec[0..407000000)"
+        let s = parse_source_string("base.hvec[0..407000000)").unwrap();
+        assert_eq!(s.path, "base.hvec");
+        assert_eq!(s.window.0[0].min_incl, 0);
+        assert_eq!(s.window.0[0].max_excl, 407_000_000);
+    }
+
+    #[test]
+    fn test_source_mixed_with_namespace() {
+        let s = parse_source_string("file.slab:ns:[0..1K)").unwrap();
+        assert_eq!(s.path, "file.slab");
+        assert_eq!(s.namespace.as_deref(), Some("ns"));
+        assert_eq!(s.window.0[0].max_excl, 1000);
     }
 }

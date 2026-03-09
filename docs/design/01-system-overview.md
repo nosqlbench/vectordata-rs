@@ -172,7 +172,7 @@ Pipeline command groups:
 | `import` | Import source data into preferred internal format by facet type |
 | `convert` | Format-to-format conversion of vector data |
 | `compute` | Brute-force KNN, filtered KNN, sorting |
-| `generate` | Synthetic vectors, predicates, predicate keys, shuffles, extracts, sketches |
+| `generate` | Synthetic vectors, predicates, metadata indices, shuffles, extracts, sketches |
 | `slab` | Slab file operations (import, export, append, rewrite, check, get, inspect, survey) |
 | `analyze` | Stats, histograms, verify-knn, compare, select, slice, zeros, find, profiles, plots |
 | `merkle` | Merkle tree creation, verification, diff, summary, proof paths |

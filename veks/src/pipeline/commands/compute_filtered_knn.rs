@@ -5,12 +5,12 @@
 //!
 //! A variant of `compute knn` that restricts each query's candidate set to
 //! the base vectors matching a pre-computed predicate. The predicate answer
-//! keys are stored in a slab file produced by `generate predicate-keys`:
+//! indices are stored in a slab file produced by `evaluate predicates`:
 //! each slab record `i` is a packed `[i32 LE]*` array of base ordinals that
 //! satisfy predicate `i`.
 //!
 //! For query `i`, only the base vectors whose ordinals appear in the
-//! predicate-keys record `i` are considered. This models pre-filtered
+//! metadata-indices record `i` are considered. This models pre-filtered
 //! vector search where metadata predicates narrow the candidate set
 //! before distance computation.
 //!
@@ -20,7 +20,7 @@
 //!
 //! 1. The base vector space is split into contiguous partitions.
 //! 2. Each partition is processed sequentially: for every query, the
-//!    predicate-key ordinals that fall within the partition's range are
+//!    metadata-index ordinals that fall within the partition's range are
 //!    filtered and distance-computed against the mmap'd base vectors.
 //! 3. A prefetch thread pages in upcoming partitions for sequential I/O.
 //! 4. A background writer flushes completed partition results to cache
@@ -51,6 +51,7 @@ use crate::pipeline::command::{
     render_options_table,
 };
 use crate::pipeline::simd_distance::{self, Metric};
+use super::source_window::resolve_source;
 
 /// Pipeline command: compute predicate-filtered exact KNN.
 pub struct ComputeFilteredKnnOp;
@@ -90,7 +91,7 @@ impl Ord for Neighbor {
     }
 }
 
-/// Read a predicate-keys slab record as a Vec of i32 base ordinals.
+/// Read a metadata-indices slab record as a Vec of i32 base ordinals.
 fn read_ordinals(data: &[u8]) -> Vec<i32> {
     let mut cursor = std::io::Cursor::new(data);
     let mut result = Vec::with_capacity(data.len() / 4);
@@ -150,15 +151,16 @@ fn metric_label(metric: Metric) -> &'static str {
 // -- Write partition cache ----------------------------------------------------
 
 /// Write neighbor indices as ivec (each row: k i32 indices).
-fn write_indices(path: &Path, results: &[Vec<Neighbor>], k: usize) -> Result<(), String> {
+fn write_indices(path: &Path, results: &[Vec<Neighbor>], k: usize, base_offset: usize) -> Result<(), String> {
     let file = std::fs::File::create(path)
         .map_err(|e| format!("create {}: {}", path.display(), e))?;
     let mut w = std::io::BufWriter::with_capacity(1 << 20, file);
     let dim = k as i32;
+    let offset32 = base_offset as u32;
     for row in results {
         w.write_all(&dim.to_le_bytes()).map_err(|e| e.to_string())?;
         for i in 0..k {
-            let idx: i32 = if i < row.len() { row[i].index as i32 } else { -1 };
+            let idx: i32 = if i < row.len() { (row[i].index - offset32) as i32 } else { -1 };
             w.write_all(&idx.to_le_bytes()).map_err(|e| e.to_string())?;
         }
     }
@@ -190,7 +192,7 @@ fn write_partition_cache(
     k: usize,
     query_count: usize,
 ) -> Result<(), String> {
-    write_indices(&meta.neighbors_path, results, k)?;
+    write_indices(&meta.neighbors_path, results, k, 0)?;
     write_distances(&meta.distances_path, results, k)?;
 
     if !validate_cache_file(&meta.neighbors_path, query_count, k, 4)
@@ -216,6 +218,7 @@ fn merge_partitions(
     distances_path: Option<&Path>,
     k: usize,
     query_count: usize,
+    base_offset: usize,
     ui: &UiHandle,
 ) -> Result<(), String> {
     let mut ivec_readers: Vec<BufReader<std::fs::File>> = Vec::with_capacity(partitions.len());
@@ -278,9 +281,10 @@ fn merge_partitions(
         candidates.truncate(k);
 
         let dim = k as i32;
+        let offset32 = base_offset as u32;
         idx_writer.write_all(&dim.to_le_bytes()).map_err(|e| e.to_string())?;
         for j in 0..k {
-            let idx: i32 = if j < candidates.len() { candidates[j].index as i32 } else { -1 };
+            let idx: i32 = if j < candidates.len() { (candidates[j].index - offset32) as i32 } else { -1 };
             idx_writer.write_all(&idx.to_le_bytes()).map_err(|e| e.to_string())?;
         }
         if let Some(ref mut dw) = dist_writer {
@@ -365,7 +369,7 @@ fn find_top_k_filtered_f16(
 
 /// Compute filtered KNN for a single base-vector partition `[start, end)` (f32).
 ///
-/// For each query, reads predicate-key ordinals, filters to those within the
+/// For each query, reads metadata-index ordinals, filters to those within the
 /// partition range, and computes distances only to matching base vectors.
 fn compute_partition_filtered_f32(
     query_reader: &MmapVectorReader<f32>,
@@ -533,10 +537,10 @@ impl CommandOp for ComputeFilteredKnnOp {
     fn command_doc(&self) -> CommandDoc {
         let options = self.describe_options();
         CommandDoc {
-            summary: "Brute-force filtered KNN with predicate-key pre-filtering".into(),
+            summary: "Brute-force filtered KNN with metadata-index pre-filtering".into(),
             body: format!(r#"# compute filtered-knn
 
-Brute-force filtered KNN with predicate-key pre-filtering.
+Brute-force filtered KNN with metadata-index pre-filtering.
 
 ## Description
 
@@ -556,8 +560,8 @@ merge combines per-partition top-K into the global top-K for each query.
 
 ## Notes
 
-- Requires a predicate-keys slab file from the `generate predicate-keys` command.
-- Queries with empty predicate-key sets produce sentinel values (-1 indices, infinity distances).
+- Requires a metadata-indices slab file from the `evaluate predicates` command.
+- Queries with empty metadata-index sets produce sentinel values (-1 indices, infinity distances).
 - Thread count of 0 uses the system default (all available cores).
 - Partition caching allows incremental and resumable computation.
 "#, render_options_table(&options)),
@@ -581,7 +585,7 @@ merge combines per-partition top-K into the global top-K for each query.
         let query_str = match options.require("query") {
             Ok(s) => s, Err(e) => return error_result(e, start),
         };
-        let keys_str = match options.require("predicate-keys") {
+        let keys_str = match options.require("metadata-indices") {
             Ok(s) => s, Err(e) => return error_result(e, start),
         };
         let indices_str = match options.require("indices") {
@@ -622,7 +626,12 @@ merge combines per-partition top-K into the global top-K for each query.
             ctx.step_id.clone()
         };
 
-        let base_path = resolve_path(base_str, &ctx.workspace);
+        let base_source = match resolve_source(base_str, &ctx.workspace) {
+            Ok(s) => s,
+            Err(e) => return error_result(e, start),
+        };
+        let base_path = base_source.path.clone();
+        let base_window = base_source.window;
         let query_path = resolve_path(query_str, &ctx.workspace);
         let keys_path = resolve_path(keys_str, &ctx.workspace);
         let indices_path = resolve_path(indices_str, &ctx.workspace);
@@ -641,10 +650,10 @@ merge combines per-partition top-K into the global top-K for each query.
             }
         }
 
-        // Load predicate-keys slab
+        // Load metadata-indices slab
         let keys_reader = match SlabReader::open(&keys_path) {
             Ok(r) => r,
-            Err(e) => return error_result(format!("failed to open predicate-keys: {}", e), start),
+            Err(e) => return error_result(format!("failed to open metadata-indices {}: {}", keys_path.display(), e), start),
         };
 
         // Governor checkpoint
@@ -658,7 +667,7 @@ merge combines per-partition top-K into the global top-K for each query.
                 execute_f32(
                     &base_path, &query_path, &keys_reader, &indices_path,
                     distances_path.as_deref(), k, metric, dist_fn, threads,
-                    partition_size, &step_id, ctx, start,
+                    partition_size, &step_id, base_window, ctx, start,
                 )
             }
             ElementType::F16 => {
@@ -666,7 +675,7 @@ merge combines per-partition top-K into the global top-K for each query.
                 execute_f16(
                     &base_path, &query_path, &keys_reader, &indices_path,
                     distances_path.as_deref(), k, metric, dist_fn, threads,
-                    partition_size, &step_id, ctx, start,
+                    partition_size, &step_id, base_window, ctx, start,
                 )
             }
         }
@@ -676,7 +685,7 @@ merge combines per-partition top-K into the global top-K for each query.
         vec![
             opt("base", "Path", true, None, "Base vectors file (fvec or hvec)"),
             opt("query", "Path", true, None, "Query vectors file (fvec or hvec)"),
-            opt("predicate-keys", "Path", true, None, "Predicate-keys slab from generate predicate-keys"),
+            opt("metadata-indices", "Path", true, None, "Metadata-indices slab from evaluate predicates"),
             opt("indices", "Path", true, None, "Output neighbor indices (ivec)"),
             opt("distances", "Path", false, None, "Output neighbor distances (fvec)"),
             opt("neighbors", "int", true, None, "Number of nearest neighbors (k)"),
@@ -702,6 +711,7 @@ fn execute_f32(
     threads: usize,
     partition_size: usize,
     step_id: &str,
+    base_window: Option<(usize, usize)>,
     ctx: &mut StreamContext,
     start: Instant,
 ) -> CommandResult {
@@ -716,10 +726,20 @@ fn execute_f32(
         Err(e) => return error_result(format!("open query: {}", e), start),
     };
 
-    let base_count = <MmapVectorReader<f32> as VectorReader<f32>>::count(&*base_reader);
+    let file_count = <MmapVectorReader<f32> as VectorReader<f32>>::count(&*base_reader);
     let query_count = <MmapVectorReader<f32> as VectorReader<f32>>::count(&query_reader);
     let keys_count = keys_reader.total_records() as usize;
     let actual_count = query_count.min(keys_count);
+
+    // Apply window to base vectors
+    let (base_offset, base_count) = match base_window {
+        Some((ws, we)) => {
+            let ws = ws.min(file_count);
+            let we = we.min(file_count);
+            (ws, we.saturating_sub(ws))
+        }
+        None => (0, file_count),
+    };
 
     let base_bytes = base_count as u64 * base_reader.entry_size() as u64;
     ctx.ui.log(&format!(
@@ -734,7 +754,7 @@ fn execute_f32(
     ));
 
     execute_with_partitions(
-        &query_reader, &base_reader, keys_reader, base_count, actual_count,
+        &query_reader, &base_reader, keys_reader, base_offset, base_count, actual_count,
         indices_path, distances_path, k, metric, dist_fn, threads, partition_size,
         step_id, ctx, start, compute_partition_filtered_f32,
     )
@@ -755,6 +775,7 @@ fn execute_f16(
     threads: usize,
     partition_size: usize,
     step_id: &str,
+    base_window: Option<(usize, usize)>,
     ctx: &mut StreamContext,
     start: Instant,
 ) -> CommandResult {
@@ -769,10 +790,20 @@ fn execute_f16(
         Err(e) => return error_result(format!("open query: {}", e), start),
     };
 
-    let base_count = <MmapVectorReader<half::f16> as VectorReader<half::f16>>::count(&*base_reader);
+    let file_count = <MmapVectorReader<half::f16> as VectorReader<half::f16>>::count(&*base_reader);
     let query_count = <MmapVectorReader<half::f16> as VectorReader<half::f16>>::count(&query_reader);
     let keys_count = keys_reader.total_records() as usize;
     let actual_count = query_count.min(keys_count);
+
+    // Apply window to base vectors
+    let (base_offset, base_count) = match base_window {
+        Some((ws, we)) => {
+            let ws = ws.min(file_count);
+            let we = we.min(file_count);
+            (ws, we.saturating_sub(ws))
+        }
+        None => (0, file_count),
+    };
 
     let base_bytes = base_count as u64 * base_reader.entry_size() as u64;
     ctx.ui.log(&format!(
@@ -787,7 +818,7 @@ fn execute_f16(
     ));
 
     execute_with_partitions(
-        &query_reader, &base_reader, keys_reader, base_count, actual_count,
+        &query_reader, &base_reader, keys_reader, base_offset, base_count, actual_count,
         indices_path, distances_path, k, metric, dist_fn, threads, partition_size,
         step_id, ctx, start, compute_partition_filtered_f16,
     )
@@ -806,6 +837,7 @@ fn execute_with_partitions<T: Send + Sync + 'static>(
     query_reader: &MmapVectorReader<T>,
     base_reader: &Arc<MmapVectorReader<T>>,
     keys_reader: &SlabReader,
+    base_offset: usize,
     base_count: usize,
     query_count: usize,
     indices_path: &Path,
@@ -828,12 +860,12 @@ fn execute_with_partitions<T: Send + Sync + 'static>(
         let pb = make_query_progress_bar(query_count as u64, &ctx.ui);
         let results = compute_fn(
             query_reader, query_count, base_reader, keys_reader,
-            0, base_count, k, dist_fn, threads, &pb,
+            base_offset, base_offset + base_count, k, dist_fn, threads, &pb,
         );
         pb.finish();
 
         ctx.ui.log("  writing results...");
-        if let Err(e) = write_indices(indices_path, &results, k) {
+        if let Err(e) = write_indices(indices_path, &results, k, base_offset) {
             return error_result(e, start);
         }
         let mut produced = vec![indices_path.to_path_buf()];
@@ -915,10 +947,11 @@ fn execute_with_partitions<T: Send + Sync + 'static>(
 
     let plan_pb = ctx.ui.bar(estimated_partitions as u64, "validating cache");
 
+    let base_end = base_offset + base_count;
     let mut partitions: Vec<PartitionMeta> = Vec::new();
-    let mut part_start = 0;
-    while part_start < base_count {
-        let part_end = std::cmp::min(part_start + partition_size, base_count);
+    let mut part_start = base_offset;
+    while part_start < base_end {
+        let part_end = std::cmp::min(part_start + partition_size, base_end);
         let neighbors_path = build_cache_path(
             &ctx.cache, step_id, part_start, part_end, k, metric, "neighbors", "ivec",
         );
@@ -1028,7 +1061,7 @@ fn execute_with_partitions<T: Send + Sync + 'static>(
     ));
 
     if let Err(e) = merge_partitions(
-        &partitions, indices_path, distances_path, k, query_count, &ctx.ui,
+        &partitions, indices_path, distances_path, k, query_count, base_offset, &ctx.ui,
     ) {
         return error_result(format!("merge failed: {}", e), start);
     }
@@ -1145,6 +1178,7 @@ mod tests {
             step_id: String::new(),
             governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
             ui: crate::ui::UiHandle::new(std::sync::Arc::new(crate::ui::TestSink::new())),
+            status_interval: std::time::Duration::from_secs(1),
         }
     }
 
@@ -1163,7 +1197,7 @@ mod tests {
         path
     }
 
-    /// Create a predicate-keys slab where each record contains the given ordinals.
+    /// Create a metadata-indices slab where each record contains the given ordinals.
     fn create_keys_slab(dir: &std::path::Path, name: &str, keys: &[Vec<i32>]) -> std::path::PathBuf {
         use byteorder::WriteBytesExt;
         let path = dir.join(name);
@@ -1201,7 +1235,7 @@ mod tests {
         let mut opts = Options::new();
         opts.set("base", base_path.to_string_lossy().to_string());
         opts.set("query", query_path.to_string_lossy().to_string());
-        opts.set("predicate-keys", keys_path.to_string_lossy().to_string());
+        opts.set("metadata-indices", keys_path.to_string_lossy().to_string());
         opts.set("indices", indices_path.to_string_lossy().to_string());
         opts.set("neighbors", "3".to_string());
         opts.set("metric", "L2".to_string());
@@ -1232,7 +1266,7 @@ mod tests {
         let mut opts = Options::new();
         opts.set("base", base_path.to_string_lossy().to_string());
         opts.set("query", query_path.to_string_lossy().to_string());
-        opts.set("predicate-keys", keys_path.to_string_lossy().to_string());
+        opts.set("metadata-indices", keys_path.to_string_lossy().to_string());
         opts.set("indices", indices_path.to_string_lossy().to_string());
         opts.set("neighbors", "5".to_string());
         opts.set("metric", "L2".to_string());
@@ -1277,7 +1311,7 @@ mod tests {
         let mut opts = Options::new();
         opts.set("base", base_path.to_string_lossy().to_string());
         opts.set("query", query_path.to_string_lossy().to_string());
-        opts.set("predicate-keys", keys_path.to_string_lossy().to_string());
+        opts.set("metadata-indices", keys_path.to_string_lossy().to_string());
         opts.set("indices", indices_path.to_string_lossy().to_string());
         opts.set("distances", distances_path.to_string_lossy().to_string());
         opts.set("neighbors", "2".to_string());

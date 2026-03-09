@@ -104,7 +104,7 @@ impl CommandOp for AnalyzeVerifyProfilesOp {
         // Open vectors
         let reader = match MmapVectorReader::<f32>::open_fvec(&vectors_path) {
             Ok(r) => r,
-            Err(e) => return error_result(format!("failed to open vectors: {}", e), start),
+            Err(e) => return error_result(format!("failed to open vectors {}: {}", vectors_path.display(), e), start),
         };
 
         let vec_count = <MmapVectorReader<f32> as VectorReader<f32>>::count(&reader);
@@ -360,6 +360,7 @@ mod tests {
             step_id: String::new(),
             governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
             ui: crate::ui::UiHandle::new(std::sync::Arc::new(crate::ui::TestSink::new())),
+            status_interval: std::time::Duration::from_secs(1),
         }
     }
 

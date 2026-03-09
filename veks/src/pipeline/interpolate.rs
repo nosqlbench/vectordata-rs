@@ -155,6 +155,13 @@ pub fn interpolate_options(
         };
         let interpolated = interpolate(&raw, defaults, workspace)
             .map_err(|e| format!("in option '{}': {}", key, e))?;
+        // Fail hard if any ${...} survived interpolation
+        if interpolated.contains("${") {
+            return Err(format!(
+                "in option '{}': unexpanded variable in '{}'",
+                key, interpolated,
+            ));
+        }
         resolved.insert(key.clone(), interpolated);
     }
     Ok(resolved)

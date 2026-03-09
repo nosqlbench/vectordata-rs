@@ -23,6 +23,7 @@ use crate::pipeline::command::{
     CommandDoc, CommandOp, CommandResult, OptionDesc, Options, ResourceDesc, Status, StreamContext,
     render_options_table,
 };
+use super::source_window::resolve_source;
 
 /// Pipeline command: verify KNN results.
 pub struct AnalyzeVerifyKnnOp;
@@ -126,29 +127,32 @@ impl Ord for Neighbor {
 fn find_true_top_k(
     query: &[f32],
     base_reader: &MmapVectorReader<f32>,
+    base_offset: usize,
+    base_end: usize,
     k: usize,
     metric: DistanceMetric,
 ) -> Vec<Neighbor> {
-    let base_count = <MmapVectorReader<f32> as VectorReader<f32>>::count(base_reader);
     let mut heap = BinaryHeap::with_capacity(k + 1);
 
-    for i in 0..base_count {
+    for i in base_offset..base_end {
         let base_vec = match base_reader.get(i) {
             Ok(v) => v,
             Err(_) => continue,
         };
         let dist = metric.distance(query, &base_vec);
 
+        // Store window-relative index
+        let window_idx = (i - base_offset) as u32;
         if heap.len() < k {
             heap.push(Neighbor {
-                index: i as u32,
+                index: window_idx,
                 distance: dist,
             });
         } else if let Some(worst) = heap.peek() {
             if dist < worst.distance {
                 heap.pop();
                 heap.push(Neighbor {
-                    index: i as u32,
+                    index: window_idx,
                     distance: dist,
                 });
             }
@@ -227,7 +231,11 @@ impl CommandOp for AnalyzeVerifyKnnOp {
         // Range of queries to verify (default: all)
         let range_str = options.get("range");
 
-        let base_path = resolve_path(base_str, &ctx.workspace);
+        let base_source = match resolve_source(base_str, &ctx.workspace) {
+            Ok(s) => s,
+            Err(e) => return error_result(e, start),
+        };
+        let base_path = base_source.path.clone();
         let query_path = resolve_path(query_str, &ctx.workspace);
         let indices_path = resolve_path(indices_str, &ctx.workspace);
 
@@ -240,6 +248,17 @@ impl CommandOp for AnalyzeVerifyKnnOp {
                     start,
                 )
             }
+        };
+
+        // Apply window to base vectors
+        let file_count = <MmapVectorReader<f32> as VectorReader<f32>>::count(&base_reader);
+        let (base_offset, base_end) = match base_source.window {
+            Some((ws, we)) => {
+                let ws = ws.min(file_count);
+                let we = we.min(file_count);
+                (ws, we)
+            }
+            None => (0, file_count),
         };
         let query_reader = match MmapVectorReader::<f32>::open_fvec(&query_path) {
             Ok(r) => r,
@@ -314,8 +333,8 @@ impl CommandOp for AnalyzeVerifyKnnOp {
                 Err(e) => return error_result(e, start),
             };
 
-            // Compute true neighbors
-            let true_neighbors = find_true_top_k(&query_vec, &base_reader, k, metric);
+            // Compute true neighbors (within window)
+            let true_neighbors = find_true_top_k(&query_vec, &base_reader, base_offset, base_end, k, metric);
 
             // Compare: check overlap of index sets
             let true_set: std::collections::HashSet<u32> =
@@ -341,7 +360,8 @@ impl CommandOp for AnalyzeVerifyKnnOp {
                     if idx >= 0 && !true_set.contains(&(idx as u32)) {
                         // This index wasn't in true set — check if its distance
                         // is within phi of the worst true neighbor
-                        let base_vec = base_reader.get(idx as usize).unwrap_or_default();
+                        let abs_idx = idx as usize + base_offset;
+                        let base_vec = base_reader.get(abs_idx).unwrap_or_default();
                         let dist = metric.distance(&query_vec, &base_vec);
                         if (dist - worst_true_dist).abs() <= phi {
                             tie_adjusted_matching += 1;
@@ -503,6 +523,7 @@ mod tests {
             step_id: String::new(),
             governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
             ui: crate::ui::UiHandle::new(std::sync::Arc::new(crate::ui::TestSink::new())),
+            status_interval: std::time::Duration::from_secs(1),
         }
     }
 

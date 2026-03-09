@@ -130,13 +130,13 @@ predicated ground truth (KNN over predicate-filtered base vectors).
         let base = match MmapVectorReader::<f32>::open_fvec(&base_path) {
             Ok(r) => r,
             Err(e) => {
-                return error_result(format!("failed to open base.fvec: {}", e), start);
+                return error_result(format!("failed to open base {}: {}", base_path.display(), e), start);
             }
         };
         let query = match MmapVectorReader::<f32>::open_fvec(&query_path) {
             Ok(r) => r,
             Err(e) => {
-                return error_result(format!("failed to open query.fvec: {}", e), start);
+                return error_result(format!("failed to open query {}: {}", query_path.display(), e), start);
             }
         };
 
@@ -618,6 +618,7 @@ mod tests {
             step_id: String::new(),
             governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
             ui: crate::ui::UiHandle::new(std::sync::Arc::new(crate::ui::TestSink::new())),
+            status_interval: std::time::Duration::from_secs(1),
         }
     }
 

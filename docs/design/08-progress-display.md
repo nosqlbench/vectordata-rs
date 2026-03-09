@@ -49,8 +49,8 @@ terminal library, enabling:
  │  │ (stdout)   │ │ (Vec<Event>)│  │
  │  └────────────┘ └─────────────┘  │
  │  ┌─────────────────────────────┐ │
- │  │  RatatuiSink (planned)      │ │
- │  │  Viewport::Inline rendering │ │
+ │  │  RatatuiSink               │ │
+ │  │  Alternate screen + charts │ │
  │  └─────────────────────────────┘ │
  └──────────────────────────────────┘
 ```
@@ -59,12 +59,12 @@ Source modules:
 
 | Module | Purpose |
 |--------|---------|
-| `ui/event.rs` | `UiEvent` enum, `ProgressId`, `ProgressKind` |
+| `ui/event.rs` | `UiEvent` enum, `ProgressId`, `ProgressKind`, `ResourceMetrics` |
 | `ui/sink.rs` | `UiSink` trait |
 | `ui/handle.rs` | `UiHandle` facade, `ProgressHandle` RAII guard |
 | `ui/plain_sink.rs` | Non-TTY sink (stdout text, no progress) |
 | `ui/test_sink.rs` | Test harness sink (records events) |
-| `ui/ratatui_sink.rs` | TTY sink (ratatui `Viewport::Inline` rendering) |
+| `ui/ratatui_sink.rs` | TTY sink (ratatui alternate screen with resource charts) |
 | `ui/mod.rs` | Module root, re-exports, and `auto_ui_handle()` |
 
 ## 8.3 Event Algebra
@@ -94,7 +94,9 @@ Events are `Send`, `Clone`, and carry no rendering state.
 
 | Variant | Fields | Semantics |
 |---------|--------|-----------|
-| `ResourceStatus` | `line: String` | Update the resource-utilization status line (CPU, memory, I/O). |
+| `ResourceStatus` | `line: String`, `metrics: ResourceMetrics` | Update the resource-utilization status. `line` is the formatted text for display; `metrics` carries structured numeric values for chart rendering (see §8.3.6). |
+| `SetContext` | `label: String` | Set the context header (dataset name, profile, step counter). |
+| `SetStepYaml` | `yaml: String` | Set the YAML snippet for the current pipeline step (displayed in the top panel). Empty string clears it. |
 | `SuspendBegin` | *(none)* | Begin a batch — suppress intermediate redraws until `SuspendEnd`. |
 | `SuspendEnd` | *(none)* | End a batch — perform a single atomic redraw. |
 | `Clear` | *(none)* | Clear the entire progress region. |
@@ -114,6 +116,44 @@ pub enum ProgressKind {
     Spinner,  // indeterminate — no known total, rendered as a spinner
 }
 ```
+
+### 8.3.6 ResourceMetrics
+
+The `ResourceMetrics` struct carries structured numeric values from
+`SystemSnapshot::sample()` directly to the TUI, avoiding the anti-pattern
+of formatting values to text and then re-parsing them for charts.
+
+```rust
+pub struct ResourceMetrics {
+    pub rss_bytes: u64,
+    pub rss_ceiling_bytes: u64,
+    pub cpu_pct: f64,
+    pub cpu_ceiling: f64,
+    pub cpu_cores: Vec<u64>,
+    pub threads: usize,
+    pub thread_ceiling: u64,
+    pub io_read_bytes: u64,    // cumulative
+    pub io_write_bytes: u64,   // cumulative
+    pub ioq_read: u64,
+    pub ioq_write: u64,
+    pub page_cache_bytes: u64,
+    pub page_cache_hit_pct: Option<f64>,
+    pub major_faults: u64,     // cumulative
+    pub minor_faults: u64,     // cumulative
+    pub emergency: bool,
+    pub throttle: bool,
+}
+```
+
+The `ResourceStatusSource::status_line_with_metrics()` method produces
+both the formatted text line and `ResourceMetrics` from a single
+`SystemSnapshot::sample()` call. Callers use
+`UiHandle::resource_status_with_metrics()` to publish both together.
+
+The TUI converts byte values to chart-friendly units via `bytes_to_mb()`
+and computes I/O rates and fault rates from cumulative deltas. The text
+`line` field is only used for the extra-budget items (non-standard
+resource types beyond the known chart fields).
 
 ## 8.4 Sink Trait
 
@@ -171,7 +211,8 @@ Methods:
 | `log(message)` | — | Emit a `Log` event. |
 | `emit(text)` | — | Emit raw text (no newline). |
 | `emitln(text)` | — | Emit raw text with newline. |
-| `resource_status(line)` | — | Update the resource status line. |
+| `resource_status(line)` | — | Update the resource status line (text only, no structured metrics). |
+| `resource_status_with_metrics(line, metrics)` | — | Update with both formatted text and structured `ResourceMetrics` for chart rendering. Preferred over `resource_status()`. |
 | `suspend_begin()` | — | Suppress redraws until `suspend_end()`. |
 | `suspend_end()` | — | End batch, trigger atomic redraw. |
 | `clear()` | — | Clear the entire progress region. |
@@ -242,7 +283,7 @@ Helper methods:
 
 ### 8.6.3 RatatuiSink
 
-Rich terminal rendering using ratatui's `Viewport::Inline` mode.
+Rich terminal rendering using ratatui's alternate screen mode.
 
 Source: `ui/ratatui_sink.rs`
 
@@ -251,7 +292,10 @@ Architecture:
   owns the ratatui `Terminal<CrosstermBackend<Stdout>>`.
 - The `RatatuiSink` itself holds only a `Sender` and `AtomicU32`, making
   it `Send + Sync` without locking the terminal.
-- Rate-limited redraws (50ms minimum interval) prevent terminal flooding.
+- Rate-limited redraws (configurable interval, default 1s) prevent terminal
+  flooding.
+- Uses alternate screen mode for full-screen layout without scrollback
+  pollution.
 
 Behavior:
 
@@ -260,12 +304,52 @@ Behavior:
 | `ProgressCreate` | Track bar state; insert into ordered list; mark dirty. |
 | `ProgressUpdate`, `ProgressInc`, `ProgressMessage` | Update tracked state; mark dirty. |
 | `ProgressFinish` | Remove from tracked state; mark dirty. |
-| `Log` | `insert_before()` above the inline progress region. |
+| `Log` | `insert_before()` above the fixed progress region. |
 | `Emit`, `EmitLn` | Combined into lines, inserted above the progress region. |
-| `ResourceStatus` | Rendered as a dim status line below progress bars. |
+| `ResourceStatus` | Chart values read directly from `ResourceMetrics` struct; I/O rates and fault rates computed from cumulative deltas. Extra budget items (non-standard resource types) extracted from the text `line` field. |
 | `SuspendBegin` | Suppress redraws until `SuspendEnd`. |
 | `SuspendEnd` | End batch, trigger single atomic redraw. |
 | `Clear` | Remove all tracked bars and status. |
+
+#### Layout
+
+The TUI is organized into vertical sections:
+
+1. **Context header** (1 line) — dataset name, profile, step counter.
+2. **Progress bars** (1 line each) — active bar/spinner indicators.
+3. **Top panel** (50% of remaining space) — side-by-side: step YAML (left)
+   and throughput (RPS) chart (right). When both top and bottom panels are
+   present, the remaining vertical space is split 50/50 between them.
+4. **Alert/budget line** (1 line, optional) — emergency/throttle alerts and
+   extra budget items.
+5. **Resource charts** (50% of remaining space) — seven horizontally tiled
+   metric charts, all memory-related charts grouped together for correlation:
+
+| Panel | Metric | Color | `ResourceMetrics` field |
+|-------|--------|-------|------------------------|
+| RSS | Process resident set size | Magenta | `rss_bytes` / `rss_ceiling_bytes` |
+| pcache | System page cache size | Yellow | `page_cache_bytes` / `page_cache_hit_pct` |
+| faults | Major page fault rate | Red | `major_faults` (cumulative → delta rate) |
+| CPU | Per-core utilization sparkline | Green | `cpu_cores` |
+| I/O | Read/write throughput | Cyan/Yellow | `io_read_bytes` / `io_write_bytes` (cumulative → delta rate) |
+| ioq | I/O queue depth (inflight) | Cyan/Yellow | `ioq_read` / `ioq_write` |
+| threads | Active thread count | Blue | `threads` / `thread_ceiling` |
+
+#### Keyboard shortcuts
+
+| Key | Action |
+|-----|--------|
+| `?` | Toggle help overlay |
+| `p` | Pause/resume rendering |
+| `↑`/`↓` | Resize step YAML panel |
+| `q` / `Ctrl-C` | Quit |
+
+#### Downsampling
+
+The throughput (RPS) chart uses a `DownsamplingHistory` buffer that
+automatically compacts when full: consecutive sample pairs are averaged,
+halving the point count and doubling the effective sampling period. This
+keeps chart rendering O(capacity) regardless of pipeline duration.
 
 Selection: `auto_ui_handle()` in `ui/mod.rs` selects `RatatuiSink` when
 stdout is a TTY, falling back to `PlainSink` on initialization failure.
@@ -398,7 +482,7 @@ assert_eq!(sink.events().len(), 3);
 | REQ-UI-01 | Done | No pipeline code imports a rendering library. indicatif fully removed. |
 | REQ-UI-02 | Done | `PlainSink`, `TestSink`, and `RatatuiSink` implemented. |
 | REQ-UI-03 | Done | `AtomicU32` id allocation in both sinks. |
-| REQ-UI-04 | Done | `RatatuiSink` uses `Viewport::Inline` with fixed progress region. `auto_ui_handle()` selects it when stdout is a TTY. |
+| REQ-UI-04 | Done | `RatatuiSink` uses alternate screen mode with fixed progress region. `auto_ui_handle()` selects it when stdout is a TTY. |
 | REQ-UI-05 | Done | `ProgressHandle::Drop` sends `ProgressFinish` via `AtomicBool` guard. |
 | REQ-UI-06 | Done | All methods take `&self`; `Arc<dyn UiSink>` shared across threads. |
 | REQ-UI-07 | Done | All scrolling counter patterns replaced with progress bars. |

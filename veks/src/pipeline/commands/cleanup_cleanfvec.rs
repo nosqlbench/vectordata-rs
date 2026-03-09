@@ -143,6 +143,7 @@ impl CommandOp for CleanupCleanfvecOp {
             ctx.ui.log("  governor: throttle active");
         }
 
+        let pb = ctx.ui.bar(complete_vectors as u64, "cleaning");
         for i in 0..complete_vectors {
             let offset = i * bytes_per_vector;
             let record = &data[offset..offset + bytes_per_vector];
@@ -168,7 +169,9 @@ impl CommandOp for CleanupCleanfvecOp {
 
             writer.write_all(record).map_err(|e| e.to_string()).unwrap();
             written += 1;
+            if (i + 1) % 10_000 == 0 { pb.set_position((i + 1) as u64); }
         }
+        pb.finish();
 
         writer.flush().unwrap();
 
@@ -295,6 +298,7 @@ mod tests {
             step_id: String::new(),
             governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
             ui: crate::ui::UiHandle::new(std::sync::Arc::new(crate::ui::TestSink::new())),
+            status_interval: std::time::Duration::from_secs(1),
         }
     }
 

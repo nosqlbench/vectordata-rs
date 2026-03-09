@@ -9,10 +9,14 @@
 //! - Cycles
 //! - Dangling inputs (references to undefined step IDs)
 //! - Output collisions (two steps producing the same file)
+//!
+//! The topological sort is **order-stable**: when multiple steps are ready
+//! (all dependencies satisfied), they are emitted in their original definition
+//! order. This lets authors control execution priority by listing steps
+//! earlier in the YAML.
 
 use std::collections::HashMap;
 
-use petgraph::algo::toposort;
 use petgraph::graph::{DiGraph, NodeIndex};
 
 use super::schema::StepDef;
@@ -123,22 +127,118 @@ pub fn build_dag(steps: &[StepDef]) -> Result<PipelineDag, String> {
         }
     }
 
-    // 5. Topological sort (detects cycles)
-    let sorted = toposort(&graph, None).map_err(|cycle| {
-        let step_idx = graph[cycle.node_id()];
-        format!(
-            "cycle detected involving step '{}'",
-            resolved[step_idx].id
-        )
-    })?;
+    // 5. Order-stable topological sort (Kahn's algorithm).
+    //
+    // When multiple steps are ready (in-degree 0), they are emitted in
+    // their original definition order. This lets authors control execution
+    // priority by listing steps earlier in the YAML.
+    let ordered_steps = {
+        use std::collections::BinaryHeap;
+        use std::cmp::Reverse;
 
-    let ordered_steps: Vec<ResolvedStep> = sorted
-        .into_iter()
-        .map(|node_idx| {
-            let step_idx = graph[node_idx];
-            resolved[step_idx].clone()
-        })
-        .collect();
+        // Compute in-degrees
+        let mut in_degree: Vec<usize> = vec![0; resolved.len()];
+        for edge in graph.edge_indices() {
+            let (_, target) = graph.edge_endpoints(edge).unwrap();
+            let target_step = graph[target];
+            in_degree[target_step] += 1;
+        }
+
+        // Seed with zero-in-degree nodes, ordered by original index (lowest first)
+        let mut ready: BinaryHeap<Reverse<usize>> = BinaryHeap::new();
+        for (i, &deg) in in_degree.iter().enumerate() {
+            if deg == 0 {
+                ready.push(Reverse(i));
+            }
+        }
+
+        let mut result: Vec<ResolvedStep> = Vec::with_capacity(resolved.len());
+        while let Some(Reverse(step_idx)) = ready.pop() {
+            // For each step that depends on this one, decrement in-degree
+            let node = node_indices[step_idx];
+            for neighbor in graph.neighbors(node) {
+                let dep_step = graph[neighbor];
+                in_degree[dep_step] -= 1;
+                if in_degree[dep_step] == 0 {
+                    ready.push(Reverse(dep_step));
+                }
+            }
+            result.push(resolved[step_idx].clone());
+        }
+
+        if result.len() != resolved.len() {
+            // Trace the cycle for a useful error message.
+            // Walk from any stuck node following edges among stuck nodes
+            // until we revisit a node, then collect the cycle.
+            let stuck = in_degree.iter().position(|&d| d > 0).unwrap_or(0);
+            let mut visited = vec![false; resolved.len()];
+            let mut cur = stuck;
+
+            // Phase 1: walk until we revisit a node (find cycle entry)
+            loop {
+                if visited[cur] { break; }
+                visited[cur] = true;
+                let node = node_indices[cur];
+                let mut found_next = false;
+                for neighbor in graph.neighbors(node) {
+                    let dep = graph[neighbor];
+                    if in_degree[dep] > 0 {
+                        cur = dep;
+                        found_next = true;
+                        break;
+                    }
+                }
+                if !found_next { break; }
+            }
+
+            // Phase 2: collect the cycle starting from `cur`
+            let entry = cur;
+            let mut cycle_steps: Vec<String> = vec![resolved[cur].id.clone()];
+            let node = node_indices[cur];
+            let mut found_next = false;
+            for neighbor in graph.neighbors(node) {
+                let dep = graph[neighbor];
+                if in_degree[dep] > 0 {
+                    cur = dep;
+                    found_next = true;
+                    break;
+                }
+            }
+            if found_next {
+                while cur != entry {
+                    cycle_steps.push(resolved[cur].id.clone());
+                    let node = node_indices[cur];
+                    let mut next = false;
+                    for neighbor in graph.neighbors(node) {
+                        let dep = graph[neighbor];
+                        if in_degree[dep] > 0 {
+                            cur = dep;
+                            next = true;
+                            break;
+                        }
+                    }
+                    if !next { break; }
+                }
+                cycle_steps.push(resolved[entry].id.clone()); // close the cycle
+            }
+            // Also list all stuck steps with their dependencies
+            let stuck_info: Vec<String> = in_degree.iter().enumerate()
+                .filter(|&(_, &d)| d > 0)
+                .map(|(i, _)| {
+                    let step = &resolved[i];
+                    let deps: Vec<&str> = step.def.after.iter().map(|s| s.as_str()).collect();
+                    format!("  {} (profiles: {:?}, after: {:?})", step.id, step.def.profiles, deps)
+                })
+                .collect();
+            return Err(format!(
+                "cycle detected: {}\n\nStuck steps:\n{}",
+                cycle_steps.join(" → "),
+                stuck_info.join("\n"),
+            ));
+        }
+
+        result
+    };
 
     Ok(PipelineDag {
         steps: ordered_steps,
@@ -298,5 +398,38 @@ mod tests {
         // A must be first, D must be last
         assert_eq!(dag.steps[0].id, "a");
         assert_eq!(dag.steps[3].id, "d");
+    }
+
+    #[test]
+    fn test_order_stability() {
+        // Two independent chains: vectors→knn and metadata→survey.
+        // "vectors" (idx 0) and "metadata" (idx 2) are both roots, but
+        // vectors is listed first. After vectors completes, knn (idx 1)
+        // becomes ready and has a lower index than metadata (idx 2), so
+        // it runs next. The stable order is: vectors, knn, metadata, survey.
+        let steps = vec![
+            step("vectors", "import vectors", vec![], Some("v.fvec")),
+            step("knn", "compute knn", vec!["vectors"], Some("k.ivec")),
+            step("metadata", "import metadata", vec![], Some("m.slab")),
+            step("survey", "survey", vec!["metadata"], Some("s.json")),
+        ];
+        let dag = build_dag(&steps).unwrap();
+        let ids: Vec<&str> = dag.steps.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, vec!["vectors", "knn", "metadata", "survey"]);
+    }
+
+    #[test]
+    fn test_order_stability_many_independent() {
+        // Five independent steps — must come out in definition order.
+        let steps = vec![
+            step("e", "cmd-e", vec![], Some("e.out")),
+            step("d", "cmd-d", vec![], Some("d.out")),
+            step("c", "cmd-c", vec![], Some("c.out")),
+            step("b", "cmd-b", vec![], Some("b.out")),
+            step("a", "cmd-a", vec![], Some("a.out")),
+        ];
+        let dag = build_dag(&steps).unwrap();
+        let ids: Vec<&str> = dag.steps.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, vec!["e", "d", "c", "b", "a"]);
     }
 }

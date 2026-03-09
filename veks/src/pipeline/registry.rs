@@ -16,7 +16,7 @@ pub type CommandFactory = fn() -> Box<dyn CommandOp>;
 
 /// Registry of available pipeline commands.
 ///
-/// Commands are registered by their canonical path (e.g. `"import facet"`,
+/// Commands are registered by their canonical path (e.g. `"import"`,
 /// `"convert file"`, `"analyze describe"`). The runner resolves step `run`
 /// fields against this registry.
 pub struct CommandRegistry {
@@ -74,7 +74,7 @@ mod tests {
         // Test the with_builtins path
         let reg = CommandRegistry::with_builtins();
         assert!(!reg.command_paths().is_empty());
-        assert!(reg.get("import facet").is_some());
+        assert!(reg.get("import").is_some());
         assert!(reg.get("convert file").is_some());
         assert!(reg.get("analyze describe").is_some());
         assert!(reg.get("nonexistent command").is_none());
@@ -84,7 +84,7 @@ mod tests {
     fn test_registry_command_paths() {
         let reg = CommandRegistry::with_builtins();
         let paths = reg.command_paths();
-        assert!(paths.contains(&"import facet"));
+        assert!(paths.contains(&"import"));
         assert!(paths.contains(&"convert file"));
         assert!(paths.contains(&"analyze describe"));
     }
@@ -92,8 +92,8 @@ mod tests {
     #[test]
     fn test_registry_create_via_get() {
         let reg = CommandRegistry::with_builtins();
-        let factory = reg.get("import facet").expect("import facet not found");
+        let factory = reg.get("import").expect("import not found");
         let cmd = factory();
-        assert_eq!(cmd.command_path(), "import facet");
+        assert_eq!(cmd.command_path(), "import");
     }
 }

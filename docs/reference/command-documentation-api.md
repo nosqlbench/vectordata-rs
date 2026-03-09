@@ -216,7 +216,7 @@ contexts -- if accidentally accepted as input, they parse as a comment:
 
 ```
 $ veks pipeline compute <TAB>
-filtered-knn    # Brute-force filtered KNN with predicate-key pre-filtering
+filtered-knn    # Brute-force filtered KNN with predicate pre-filtering
 knn             # Brute-force exact K-nearest-neighbor computation
 sort            # Sort vectors by ordinal mapping
 ```

@@ -105,7 +105,7 @@ entry types are:
   "io_write_mbps": 320.1,
   "major_faults": 12,
   "active_threads": 8,
-  "step_id": "compute-predicate-keys"
+  "step_id": "evaluate-predicates"
 }
 ```
 
@@ -115,7 +115,7 @@ entry types are:
 {
   "type": "decision",
   "ts": "2026-03-05T06:14:30.125Z",
-  "step_id": "compute-predicate-keys",
+  "step_id": "evaluate-predicates",
   "resource": "segmentsize",
   "old_value": 1000000,
   "new_value": 750000,
@@ -129,7 +129,7 @@ entry types are:
 {
   "type": "throttle",
   "ts": "2026-03-05T06:14:35.001Z",
-  "step_id": "compute-predicate-keys",
+  "step_id": "evaluate-predicates",
   "reason": "RSS exceeded 95% of ceiling; emergency flush requested",
   "resources_affected": ["segmentsize", "threads"]
 }
@@ -141,7 +141,7 @@ entry types are:
 {
   "type": "request",
   "ts": "2026-03-05T06:14:36.100Z",
-  "step_id": "compute-predicate-keys",
+  "step_id": "evaluate-predicates",
   "resource": "segmentsize",
   "requested": 1500000,
   "granted": 750000,
@@ -162,9 +162,9 @@ Different commands have different resource profiles. Not all resources
 apply to every command -- each command declares which resources it
 consumes via `describe_resources()`.
 
-### Predicate-key generation
+### Predicate evaluation
 
-The `generate predicate-keys` command accumulates per-predicate match
+The `evaluate predicates` command accumulates per-predicate match
 ordinal vectors in memory. With many predicates and a large metadata
 corpus, memory can grow rapidly within a segment. Use smaller segment
 sizes to bound peak memory:
@@ -199,7 +199,7 @@ Import and convert commands are I/O-bound. Increasing `iothreads` and
 veks run dataset.yaml --resources 'iothreads:4-8,readahead:64MiB-256MiB'
 ```
 
-## Example: LAION-400M predicate-key generation
+## Example: LAION-400M predicate evaluation
 
 The LAION-400M img2text dataset has 407 million metadata records in a
 207 GB slab file. Evaluating 10,000 predicates against this corpus
