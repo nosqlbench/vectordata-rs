@@ -5,7 +5,7 @@
 //!
 //! A variant of `compute knn` that restricts each query's candidate set to
 //! the base vectors matching a pre-computed predicate. The predicate answer
-//! indices are stored in a slab file produced by `evaluate predicates`:
+//! indices are stored in a slab file produced by `compute predicates`:
 //! each slab record `i` is a packed `[i32 LE]*` array of base ordinals that
 //! satisfy predicate `i`.
 //!
@@ -560,7 +560,7 @@ merge combines per-partition top-K into the global top-K for each query.
 
 ## Notes
 
-- Requires a metadata-indices slab file from the `evaluate predicates` command.
+- Requires a metadata-indices slab file from the `compute predicates` command.
 - Queries with empty metadata-index sets produce sentinel values (-1 indices, infinity distances).
 - Thread count of 0 uses the system default (all available cores).
 - Partition caching allows incremental and resumable computation.
@@ -685,7 +685,7 @@ merge combines per-partition top-K into the global top-K for each query.
         vec![
             opt("base", "Path", true, None, "Base vectors file (fvec or hvec)"),
             opt("query", "Path", true, None, "Query vectors file (fvec or hvec)"),
-            opt("metadata-indices", "Path", true, None, "Metadata-indices slab from evaluate predicates"),
+            opt("metadata-indices", "Path", true, None, "Metadata-indices slab from compute predicates"),
             opt("indices", "Path", true, None, "Output neighbor indices (ivec)"),
             opt("distances", "Path", false, None, "Output neighbor distances (fvec)"),
             opt("neighbors", "int", true, None, "Number of nearest neighbors (k)"),

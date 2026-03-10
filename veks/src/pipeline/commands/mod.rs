@@ -138,7 +138,7 @@ pub fn register_all(registry: &mut CommandRegistry) {
     registry.register("analyze flamegraph", analyze_flamegraph::factory);
     registry.register("generate predicated", gen_predicated::factory);
     registry.register("synthesize predicates", gen_predicates::factory);
-    registry.register("evaluate predicates", gen_predicate_keys::factory);
+    registry.register("compute predicates", gen_predicate_keys::factory);
 
     // Phase 7: inspection
     registry.register("inspect predicate", inspect_predicate::factory);

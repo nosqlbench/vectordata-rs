@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use std::ffi::OsStr;
 
 use clap::{Arg, Command, ValueHint};
-use clap_complete::engine::{ArgValueCandidates, ArgValueCompleter, CompletionCandidate};
+use clap_complete::engine::{ArgValueCompleter, CompletionCandidate};
 use indexmap::IndexMap;
 
 use super::command::{Options, StreamContext};
@@ -57,18 +57,31 @@ pub fn build_pipeline_command() -> Command {
     let mut pipeline_cmd = Command::new("pipeline")
         .about("Execute a single pipeline command directly")
         .subcommand_required(true)
-        .arg_required_else_help(true);
+        .arg_required_else_help(true)
+        .disable_help_subcommand(true);
 
     for (group, commands) in groups {
         let mut group_cmd = Command::new(group.clone())
             .about(format!("{} commands", group))
             .subcommand_required(true)
-            .arg_required_else_help(true);
+            .arg_required_else_help(true)
+            .disable_help_subcommand(true);
 
         for (subname, opts, doc, resources) in commands {
-            let mut sub_cmd = Command::new(subname)
-                .about(doc.summary.clone())
-                .long_about(doc.body.clone())
+            // Single-word commands (e.g. "survey") have no subname — attach
+            // their options directly to the group command.
+            let is_direct = subname.is_empty();
+            let mut sub_cmd = if is_direct {
+                group_cmd.clone()
+                    .about(doc.summary.clone())
+                    .long_about(doc.body.clone())
+                    .subcommand_required(false)
+                    .arg_required_else_help(false)
+            } else {
+                Command::new(subname)
+                    .about(doc.summary.clone())
+                    .long_about(doc.body.clone())
+            }
                 .arg(
                     Arg::new("emit-yaml")
                         .long("emit-yaml")
@@ -164,10 +177,15 @@ pub fn build_pipeline_command() -> Command {
                     .long("governor")
                     .default_value("maximize")
                     .help("Governor strategy: maximize, conservative, fixed")
-                    .add(ArgValueCandidates::new(governor_candidates)),
+                    .add(ArgValueCompleter::new(governor_completer)),
             );
 
-            group_cmd = group_cmd.subcommand(sub_cmd);
+            if is_direct {
+                // Single-word command: replace the group command entirely
+                group_cmd = sub_cmd;
+            } else {
+                group_cmd = group_cmd.subcommand(sub_cmd);
+            }
         }
 
         pipeline_cmd = pipeline_cmd.subcommand(group_cmd);
@@ -229,15 +247,13 @@ fn print_pipeline_help(registry: &CommandRegistry, group: Option<&str>) {
 }
 
 /// Completion candidates for `--governor`: lists strategy names with descriptions.
-pub fn governor_candidates() -> Vec<CompletionCandidate> {
-    vec![
-        CompletionCandidate::new("maximize")
-            .help(Some("Aggressively use resources up to ceiling".into())),
-        CompletionCandidate::new("conservative")
-            .help(Some("Start at floor, increase after sustained low use".into())),
-        CompletionCandidate::new("fixed")
-            .help(Some("Use midpoint values, never adjust".into())),
-    ]
+pub fn governor_completer(current: &OsStr) -> Vec<CompletionCandidate> {
+    let prefix = current.to_string_lossy().to_lowercase();
+    ["maximize", "conservative", "fixed"]
+        .iter()
+        .filter(|v| prefix.is_empty() || v.starts_with(&*prefix))
+        .map(|v| CompletionCandidate::new(*v))
+        .collect()
 }
 
 /// Context-sensitive completer for `--resources` values.
@@ -387,17 +403,28 @@ pub fn run_direct(args: Vec<String>) {
         && registry.command_paths().iter().any(|p| p.starts_with(&format!("{} ", group)));
 
     if is_help_request || is_bare_group {
-        print_pipeline_help(&registry, Some(group));
+        let pipeline_cmd = build_pipeline_command();
+        if let Some(group_cmd) = pipeline_cmd.get_subcommands().find(|c| c.get_name() == group.as_str()) {
+            let mut group_cmd = group_cmd.clone();
+            group_cmd.print_help().ok();
+            println!();
+        } else {
+            print_pipeline_help(&registry, Some(group));
+        }
         std::process::exit(0);
     }
 
-    if args.len() < 2 {
-        println!("Usage: veks pipeline <group> <command> [--option=value ...]");
+    // Try single-word command first (e.g. "survey"), then "group subcommand".
+    let (command_path, option_args) = if registry.get(group).is_some() {
+        (group.to_string(), &args[1..])
+    } else if args.len() >= 2 {
+        (format!("{} {}", group, args[1]), &args[2..])
+    } else {
+        eprintln!("Unknown pipeline command group: '{}'", group);
+        eprintln!();
+        print_pipeline_help(&registry, None);
         std::process::exit(1);
-    }
-
-    let subcommand = &args[1];
-    let command_path = format!("{} {}", group, subcommand);
+    };
 
     let factory = match registry.get(&command_path) {
         Some(f) => f,
@@ -409,9 +436,28 @@ pub fn run_direct(args: Vec<String>) {
         }
     };
 
-    // Check for --help anywhere in args before parsing. This ensures help
-    // is shown even when other options are invalid or incomplete.
-    if args[2..].iter().any(|a| a == "--help" || a == "-h") {
+    // Check for --help anywhere in args before parsing. Show the clap-generated
+    // help which lists all --option flags the command accepts.
+    if option_args.iter().any(|a| a == "--help" || a == "-h") {
+        let pipeline_cmd = build_pipeline_command();
+        // For single-word commands the options are on the group command itself;
+        // for two-word commands navigate to the nested subcommand.
+        let parts: Vec<&str> = command_path.splitn(2, ' ').collect();
+        if let Some(group_cmd) = pipeline_cmd.get_subcommands().find(|c| c.get_name() == parts[0]) {
+            if parts.len() == 1 {
+                // Single-word command: group IS the command
+                let mut cmd = group_cmd.clone();
+                cmd.print_help().ok();
+                println!();
+                std::process::exit(0);
+            } else if let Some(sub_cmd) = group_cmd.get_subcommands().find(|c| c.get_name() == parts[1]) {
+                let mut sub_cmd = sub_cmd.clone();
+                sub_cmd.print_help().ok();
+                println!();
+                std::process::exit(0);
+            }
+        }
+        // Fallback to doc body if clap tree doesn't match
         let cmd = factory();
         let doc = cmd.command_doc();
         println!("{}", doc.body);
@@ -436,7 +482,7 @@ pub fn run_direct(args: Vec<String>) {
     let mut resources_str: Option<String> = None;
     let mut governor_strategy = "maximize".to_string();
     let mut resource_aliases: Vec<(String, String)> = Vec::new();
-    let rest = &args[2..];
+    let rest = option_args;
     let mut i = 0;
     while i < rest.len() {
         let arg = &rest[i];

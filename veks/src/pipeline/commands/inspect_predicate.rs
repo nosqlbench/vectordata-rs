@@ -6,7 +6,7 @@
 //! Given a predicate ordinal, renders the predicate from `predicates.slab`,
 //! looks up matching metadata ordinals from `metadata-indices.slab`, and
 //! renders each matching metadata record.  This illustrates the cross-
-//! reference computed by `evaluate predicates`.
+//! reference computed by `compute predicates`.
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -50,7 +50,7 @@ For a given predicate ordinal, renders the predicate from the predicates slab,
 looks up matching metadata ordinals from the metadata-indices slab, and renders
 each matching metadata record in the specified vernacular.
 
-This illustrates the cross-reference computed by `evaluate predicates`:
+This illustrates the cross-reference computed by `compute predicates`:
 which metadata records satisfy a given predicate.
 
 ## Options
@@ -217,7 +217,7 @@ which metadata records satisfy a given predicate.
         vec![
             opt("predicates", "Path", true, None, "Predicates slab file"),
             opt("metadata", "Path", true, None, "Metadata slab file"),
-            opt("metadata-indices", "Path", true, None, "Predicate-keys slab from evaluate predicates"),
+            opt("metadata-indices", "Path", true, None, "Predicate-keys slab from compute predicates"),
             opt("ordinal", "int", true, None, "Predicate ordinal to inspect"),
             opt("vernacular", "enum", false, Some("readout"), "Rendering format: json, yaml, sql, cql, cddl, readout, display"),
             opt("limit", "int", false, Some("20"), "Max matching metadata records to display"),

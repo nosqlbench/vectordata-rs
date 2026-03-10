@@ -1,7 +1,7 @@
 // Copyright (c) DataStax, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Profiling harness for `evaluate predicates` hot path.
+//! Profiling harness for `compute predicates` hot path.
 //!
 //! Isolates the per-record evaluation loop so perf/flamegraph can pinpoint
 //! allocation and scanning costs.

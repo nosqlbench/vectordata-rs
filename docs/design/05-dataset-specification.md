@@ -570,7 +570,7 @@ upstream:
       seed: 42
 
     - id: compute-predicates
-      run: evaluate predicates
+      run: compute predicates
       after: [import-metadata, synthesize-predicates]
       input: metadata_content.slab
       predicates: predicates.slab

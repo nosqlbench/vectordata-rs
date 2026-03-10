@@ -11,6 +11,7 @@ use crate::import::facet::Facet;
 
 /// Analyze vector data files and datasets
 #[derive(Args)]
+#[command(disable_help_subcommand = true)]
 pub struct AnalyzeArgs {
     #[command(subcommand)]
     pub command: AnalyzeCommand,

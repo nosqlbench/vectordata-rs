@@ -25,7 +25,7 @@ based on observed RSS and system pressure.
 
 ## Predicate evaluation with bounded segments
 
-For the resource-intensive `evaluate predicates` command, limit segment
+For the resource-intensive `compute predicates` command, limit segment
 size to prevent memory spikes:
 
 ```sh

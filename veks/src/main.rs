@@ -1,7 +1,7 @@
 // Copyright (c) DataStax, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use veks::{analyze, bulkdl, catalog, cli, convert, datasets, import, pipeline};
+use veks::{cli, datasets, pipeline};
 
 use clap::{Arg, Command, CommandFactory, Parser, Subcommand};
 use clap_complete::CompleteEnv;
@@ -16,18 +16,8 @@ struct Veks {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Analyze vector data files and datasets
-    Analyze(analyze::AnalyzeArgs),
-    /// Bulk file downloader driven by YAML config with token expansion
-    Bulkdl(bulkdl::BulkDlArgs),
-    /// Generate and manage dataset catalog index files
-    Catalog(catalog::CatalogArgs),
-    /// Browse, search, and manage datasets
+    /// Browse, search, and manage datasets and catalogs
     Datasets(datasets::DatasetsArgs),
-    /// Convert vector data between formats
-    Convert(convert::ConvertArgs),
-    /// Import data into preferred internal format by facet type
-    Import(import::ImportArgs),
     /// Execute a command stream pipeline defined in dataset.yaml
     Run(pipeline::RunArgs),
     /// Emit a dataset pipeline as an equivalent shell script
@@ -211,12 +201,7 @@ async fn main() {
     let veks = Veks::parse();
 
     match veks.command {
-        Commands::Analyze(args) => analyze::run(args),
-        Commands::Bulkdl(args) => bulkdl::run(args).await,
-        Commands::Catalog(args) => catalog::run(args),
-        Commands::Convert(args) => convert::run(args),
         Commands::Datasets(args) => datasets::run(args),
-        Commands::Import(args) => import::run(args),
         Commands::Run(args) => pipeline::run_pipeline(args),
         Commands::Script(args) => pipeline::run_script(args),
         Commands::Pipeline { args } => pipeline::cli::run_direct(args),
@@ -228,12 +213,7 @@ async fn main() {
 /// Root-level command descriptions for `veks help`.
 fn root_commands() -> Vec<(&'static str, &'static str)> {
     vec![
-        ("analyze", "Analyze vector data files and datasets"),
-        ("bulkdl", "Bulk file downloader driven by YAML config with token expansion"),
-        ("catalog", "Generate and manage dataset catalog index files"),
-        ("datasets", "Browse, search, and manage datasets"),
-        ("convert", "Convert vector data between formats"),
-        ("import", "Import data into preferred internal format by facet type"),
+        ("datasets", "Browse, search, and manage datasets and catalogs"),
         ("run", "Execute a command stream pipeline defined in dataset.yaml"),
         ("script", "Emit a dataset pipeline as an equivalent shell script"),
         ("pipeline", "Execute a single pipeline command directly"),

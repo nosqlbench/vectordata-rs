@@ -164,7 +164,7 @@ consumes via `describe_resources()`.
 
 ### Predicate evaluation
 
-The `evaluate predicates` command accumulates per-predicate match
+The `compute predicates` command accumulates per-predicate match
 ordinal vectors in memory. With many predicates and a large metadata
 corpus, memory can grow rapidly within a segment. Use smaller segment
 sizes to bound peak memory:

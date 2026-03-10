@@ -56,7 +56,7 @@ Each command implements:
 | `generate derive` | Derive new facets from existing | Mixed |
 | `generate predicated` | Generate predicated dataset | Mixed |
 | `synthesize predicates` | Generate random filter predicates from metadata survey | **Light**: reads survey JSON, outputs small slab. Fast. |
-| `evaluate predicates` | Evaluate predicates against all metadata records | **CRITICAL: highest resource risk**. Scans entire metadata slab (207 GB for LAION-400M). Segmented processing with cache. Per-segment: reads all pages, evaluates all predicates against every record. Memory: match ordinal vectors per predicate × segment. THIS IS THE COMMAND THAT CAUSED THE SYSTEM LOCKUP. |
+| `compute predicates` | Evaluate predicates against all metadata records | **CRITICAL: highest resource risk**. Scans entire metadata slab (207 GB for LAION-400M). Segmented processing with cache. Per-segment: reads all pages, evaluates all predicates against every record. Memory: match ordinal vectors per predicate × segment. THIS IS THE COMMAND THAT CAUSED THE SYSTEM LOCKUP. |
 
 ### Slab Operations
 
@@ -137,12 +137,12 @@ Each command implements:
 
 | Risk level | Commands | Primary concern |
 |-----------|----------|-----------------|
-| **Critical** | `evaluate predicates` | Memory: accumulates match ordinals for all predicates across all records. At 407M records × 10K predicates, matching ordinal vectors can consume tens of GB. Segmented, but segment size and match density determine peak memory. |
+| **Critical** | `compute predicates` | Memory: accumulates match ordinals for all predicates across all records. At 407M records × 10K predicates, matching ordinal vectors can consume tens of GB. Segmented, but segment size and match density determine peak memory. |
 | **High** | `compute knn`, `compute filtered-knn` | Memory: mmaps full base vector file. CPU: brute-force distance for every query × every base vector. Thread count × working set can overwhelm system. |
 | **Medium** | `import` (parquet→slab), `datasets prebuffer` | I/O: sustained sequential reads and writes at multi-GB/s. Can saturate disk bandwidth and page cache. |
 | **Low** | Most analysis, slab, merkle, config commands | Bounded resource usage. |
 
-## 4.4 evaluate predicates — Deep Dive
+## 4.4 compute predicates — Deep Dive
 
 This is the command that caused the system lockup. Its execution model:
 

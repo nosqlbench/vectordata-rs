@@ -6,13 +6,13 @@
 ## 6.1 The Problem
 
 On 2026-03-05, processing the LAION-400M img2text dataset's
-`evaluate predicates` step caused a complete system lockup. The step
+`compute predicates` step caused a complete system lockup. The step
 was evaluating 10,000 predicates against 407 million metadata records
 (207 GB slab file). The system became unresponsive, requiring a hard reset.
 
 ### Root cause analysis
 
-The `evaluate predicates` command accumulates per-predicate match
+The `compute predicates` command accumulates per-predicate match
 ordinal vectors (`Vec<Vec<i32>>`) across metadata records. With 10,000
 predicates and high-match-rate predicates on a 407M-record corpus:
 
@@ -321,7 +321,7 @@ application is skipped.
 | `compute knn` | `mem`, `threads`, `readahead` |
 | `compute filtered-knn` | `mem`, `threads`, `readahead` |
 | `compute sort` | `mem`, `threads`, `readahead` |
-| `evaluate predicates` | `mem`, `threads`, `segments`, `segmentsize` |
+| `compute predicates` | `mem`, `threads`, `segments`, `segmentsize` |
 | `generate predicated` | `mem`, `threads`, `readahead` |
 | `generate derive` | `mem`, `threads`, `readahead` |
 | `transform fvec-extract` | `readahead` |
@@ -369,7 +369,7 @@ while providing a natural CLI experience. The long-form flags:
 
 ### REQ-RM-09: OOM prevention for predicate evaluation
 
-The `evaluate predicates` command specifically MUST:
+The `compute predicates` command specifically MUST:
 1. Estimate total memory for match vectors before starting each segment
 2. If the estimate exceeds budget, split the predicates into batches
    (process predicate subsets sequentially to bound peak memory)
@@ -455,7 +455,7 @@ dataset-scale. Organized by category:
 
 | Command | Reason |
 |---------|--------|
-| `evaluate predicates` | Scans entire metadata slab; accumulates match ordinals |
+| `compute predicates` | Scans entire metadata slab; accumulates match ordinals |
 | `generate predicated` | Processes full dataset to produce predicated output |
 | `generate derive` | Derives new facets from existing large files |
 | `transform fvec-extract` | Reads from arbitrarily large source vectors |
@@ -1016,7 +1016,7 @@ CPU resources).
 | REQ-RM-03 | Governor publishes throttle/emergency signals; `checkpoint()` called at boundaries in compute knn, filtered-knn, gen metadata-indices, compute sort, convert, import, gen predicated, cleanup cleanfvec, analyze verifyknn | **Done** |
 | REQ-RM-04 | 37 commands implement `describe_resources()` with resource declarations | **Done** |
 | REQ-RM-05 | Commands query `governor.current_or("threads", ...)` for thread count (compute knn, filtered-knn, gen metadata-indices, import, convert) | **Done** |
-| REQ-RM-06 | Segment caching formalized with **file-stem-based keys** for cross-profile reuse: evaluate predicates uses `.cache/{input_stem}.{pred_stem}.seg_{start}_{end}.predkeys.slab`; compute knn uses `.cache/{base_stem}.{query_stem}.range_{start}_{end}.k{k}.{metric}.{ext}`. Cache keys are derived from input file stems (not step IDs) so that overlapping ordinal ranges across profiles share cached segments. Profile barriers ensure smallest-to-largest execution order so cached segments are available for reuse. | **Done** |
+| REQ-RM-06 | Segment caching formalized with **file-stem-based keys** for cross-profile reuse: compute predicates uses `.cache/{input_stem}.{pred_stem}.seg_{start}_{end}.predkeys.slab`; compute knn uses `.cache/{base_stem}.{query_stem}.range_{start}_{end}.k{k}.{metric}.{ext}`. Cache keys are derived from input file stems (not step IDs) so that overlapping ordinal ranges across profiles share cached segments. Profile barriers ensure smallest-to-largest execution order so cached segments are available for reuse. | **Done** |
 | REQ-RM-07 | Per-step `ResourceSummary` (peak RSS, CPU user/system seconds, I/O read/write bytes) captured by runner and stored in `.upstream.progress.yaml`; governor log writes JSON-line observation/decision/throttle/request/ignored entries | **Done** |
 | REQ-RM-08 | `--resources` and `--governor` args on both `run_pipeline()` and per-command direct CLI; long-form resource aliases (e.g., `--mem`, `--readahead`) generated from `describe_resources()` with conflict avoidance; completion filtering shows only applicable resource types per command | **Done** |
 | REQ-RM-09 | Memory-aware segment/partition sizing: gen metadata-indices estimates per-segment memory from selectivity × predicates × 4B × threads and scales down if budget exceeded; compute knn estimates result set + page cache pressure and reduces partition_size accordingly | **Done** |
@@ -1085,7 +1085,7 @@ StreamContext
 For immediate relief, the minimum changes needed:
 
 1. Add `--resources 'mem:...'` CLI parsing with single-value support
-2. Add RSS check in `evaluate predicates` between segments
+2. Add RSS check in `compute predicates` between segments
 3. If RSS exceeds the `mem` ceiling, reduce `segmentsize` by 50% for
    remaining segments
 4. Add `madvise(MADV_SEQUENTIAL)` to `MmapVectorReader` for scan access

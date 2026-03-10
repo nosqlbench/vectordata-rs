@@ -2,11 +2,170 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! `veks datasets prebuffer` — download and cache dataset facets locally.
+//!
+//! Accepts either a catalog dataset specifier (`dataset:profile`) or a local
+//! path to a dataset directory / `dataset.yaml`. When a catalog specifier is
+//! given, the dataset is resolved through the configured catalog chain and
+//! facets are downloaded from the remote source.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-pub fn run(path: &Path, cache_dir: Option<&Path>) {
+use crate::catalog::resolver::Catalog;
+use crate::catalog::sources::CatalogSources;
+
+/// Entry point for `veks datasets prebuffer`.
+///
+/// `dataset_spec` is either:
+/// - A `name:profile` pair resolved via the catalog (e.g. `sift-128:default`)
+/// - A `name` resolved via the catalog (uses the default profile)
+/// - A local directory or path to `dataset.yaml`
+pub fn run(
+    dataset_spec: &str,
+    configdir: &str,
+    extra_catalogs: &[String],
+    at: &[String],
+    cache_dir: Option<&Path>,
+) {
+    let cache = cache_dir
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(default_cache_dir);
+
+    // Try local path first
+    let local = Path::new(dataset_spec);
+    if local.exists() {
+        run_local(local, &cache);
+        return;
+    }
+
+    // Parse dataset:profile specifier
+    let (dataset_name, profile_name) = if let Some(pos) = dataset_spec.find(':') {
+        (&dataset_spec[..pos], &dataset_spec[pos + 1..])
+    } else {
+        (dataset_spec, "default")
+    };
+
+    // Resolve via catalog
+    let sources = build_sources(configdir, extra_catalogs, at);
+    if sources.is_empty() {
+        eprintln!("No catalog sources configured.");
+        eprintln!("Create ~/.config/vectordata/catalogs.yaml or use --catalog/--at to specify locations.");
+        std::process::exit(1);
+    }
+
+    let catalog = Catalog::of(&sources);
+    let entry = match catalog.find_exact(dataset_name) {
+        Some(e) => e,
+        None => {
+            eprintln!("Dataset '{}' not found in catalog.", dataset_name);
+            catalog.list_datasets(dataset_name);
+            std::process::exit(1);
+        }
+    };
+
+    let profile = match entry.layout.profiles.profile(profile_name) {
+        Some(p) => p,
+        None => {
+            eprintln!(
+                "Profile '{}' not found in dataset '{}'. Available: {}",
+                profile_name,
+                entry.name,
+                entry.profile_names().join(", ")
+            );
+            std::process::exit(1);
+        }
+    };
+
+    // Determine base URL for the dataset (entry.path points to dataset.yaml)
+    let base_url = entry.path.rsplit_once('/').map(|(base, _)| base).unwrap_or("");
+
+    let ds_cache = cache.join(&entry.name);
+    std::fs::create_dir_all(&ds_cache).unwrap_or_else(|e| {
+        eprintln!("Failed to create cache dir: {}", e);
+        std::process::exit(1);
+    });
+
+    println!(
+        "Prebuffering {}:{} ({} views)",
+        entry.name,
+        profile_name,
+        profile.view_names().len()
+    );
+
+    let mut downloaded = 0u32;
+    let mut skipped = 0u32;
+    let mut failed = 0u32;
+
+    for view_name in profile.view_names() {
+        let view = profile.view(view_name).unwrap();
+        let source_path = &view.source.path;
+
+        if source_path.is_empty() {
+            continue;
+        }
+
+        // Resolve the full URL for the view source
+        let full_url = if source_path.starts_with("http://") || source_path.starts_with("https://") {
+            source_path.clone()
+        } else {
+            format!("{}/{}", base_url, source_path)
+        };
+
+        let target = ds_cache.join(source_path);
+
+        if target.exists() {
+            let size = std::fs::metadata(&target).map(|m| m.len()).unwrap_or(0);
+            println!("  {} — already cached ({} bytes)", view_name, size);
+            skipped += 1;
+            continue;
+        }
+
+        if full_url.starts_with("http://") || full_url.starts_with("https://") {
+            println!("  {} — downloading from {}", view_name, full_url);
+            match download_file(&full_url, &target) {
+                Ok(size) => {
+                    println!("  {} — downloaded {} bytes", view_name, size);
+                    downloaded += 1;
+                }
+                Err(e) => {
+                    eprintln!("  {} — FAILED: {}", view_name, e);
+                    failed += 1;
+                }
+            }
+        } else {
+            // Local source relative to the entry path
+            let local_src = Path::new(&full_url);
+            if local_src.exists() && *local_src != target {
+                if let Some(parent) = target.parent() {
+                    std::fs::create_dir_all(parent).ok();
+                }
+                if let Err(e) = std::fs::copy(local_src, &target) {
+                    eprintln!("  {} — FAILED to copy: {}", view_name, e);
+                    failed += 1;
+                } else {
+                    println!("  {} — copied from local source", view_name);
+                    downloaded += 1;
+                }
+            } else {
+                eprintln!("  {} — source not available: {}", view_name, full_url);
+                failed += 1;
+            }
+        }
+    }
+
+    println!();
+    println!(
+        "Prebuffer: {} downloaded, {} skipped, {} failed",
+        downloaded, skipped, failed
+    );
+
+    if failed > 0 {
+        std::process::exit(1);
+    }
+}
+
+/// Handle a local dataset directory or yaml path (original behavior).
+fn run_local(path: &Path, cache: &Path) {
     let yaml_path = if path.is_file() {
         path.to_path_buf()
     } else {
@@ -14,17 +173,17 @@ pub fn run(path: &Path, cache_dir: Option<&Path>) {
     };
 
     if !yaml_path.exists() {
-        println!("dataset.yaml not found at {}", yaml_path.display());
+        eprintln!("dataset.yaml not found at {}", yaml_path.display());
         std::process::exit(1);
     }
 
     let content = std::fs::read_to_string(&yaml_path).unwrap_or_else(|e| {
-        println!("Failed to read: {}", e);
+        eprintln!("Failed to read: {}", e);
         std::process::exit(1);
     });
 
     let config: serde_yaml::Value = serde_yaml::from_str(&content).unwrap_or_else(|e| {
-        println!("Failed to parse: {}", e);
+        eprintln!("Failed to parse: {}", e);
         std::process::exit(1);
     });
 
@@ -33,20 +192,16 @@ pub fn run(path: &Path, cache_dir: Option<&Path>) {
         .and_then(|v| v.as_str())
         .unwrap_or("dataset");
 
-    let cache = cache_dir
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(default_cache_dir);
-
     let ds_cache = cache.join(dataset_name);
     std::fs::create_dir_all(&ds_cache).unwrap_or_else(|e| {
-        println!("Failed to create cache dir: {}", e);
+        eprintln!("Failed to create cache dir: {}", e);
         std::process::exit(1);
     });
 
     // Copy dataset.yaml to cache
     let cached_yaml = ds_cache.join("dataset.yaml");
     if let Err(e) = std::fs::copy(&yaml_path, &cached_yaml) {
-        println!("  warning: failed to copy dataset.yaml: {}", e);
+        eprintln!("  warning: failed to copy dataset.yaml: {}", e);
     }
 
     let mut downloaded = 0u32;
@@ -87,7 +242,7 @@ pub fn run(path: &Path, cache_dir: Option<&Path>) {
                             downloaded += 1;
                         }
                         Err(e) => {
-                            println!("  {} — FAILED: {}", view_name, e);
+                            eprintln!("  {} — FAILED: {}", view_name, e);
                             failed += 1;
                         }
                     }
@@ -96,14 +251,14 @@ pub fn run(path: &Path, cache_dir: Option<&Path>) {
                     let local_src = dataset_dir.join(&rel_path);
                     if local_src.exists() && local_src != target {
                         if let Err(e) = std::fs::copy(&local_src, &target) {
-                            println!("  {} — FAILED to copy: {}", view_name, e);
+                            eprintln!("  {} — FAILED to copy: {}", view_name, e);
                             failed += 1;
                         } else {
                             println!("  {} — copied from local source", view_name);
                             downloaded += 1;
                         }
                     } else {
-                        println!("  {} — no source available", view_name);
+                        eprintln!("  {} — no source available", view_name);
                     }
                 }
             }
@@ -119,6 +274,22 @@ pub fn run(path: &Path, cache_dir: Option<&Path>) {
     if failed > 0 {
         std::process::exit(1);
     }
+}
+
+/// Build catalog sources from CLI args (same logic as `datasets list`).
+fn build_sources(configdir: &str, extra_catalogs: &[String], at: &[String]) -> CatalogSources {
+    let mut sources = CatalogSources::new();
+
+    if !at.is_empty() {
+        sources = sources.add_catalogs(at);
+    } else {
+        sources = sources.configure(configdir);
+        if !extra_catalogs.is_empty() {
+            sources = sources.add_catalogs(extra_catalogs);
+        }
+    }
+
+    sources
 }
 
 fn extract_view_path(entry: &serde_yaml::Value) -> String {
@@ -188,7 +359,7 @@ mod tests {
         std::fs::write(ws.join("dataset.yaml"), yaml).unwrap();
 
         let cache = ws.join("cache");
-        run(ws, Some(&cache));
+        run_local(ws, &cache);
 
         assert!(cache.join("test").join("dataset.yaml").exists());
         assert!(cache.join("test").join("data.fvec").exists());

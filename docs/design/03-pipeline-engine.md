@@ -122,7 +122,7 @@ pub struct StreamContext {
   | Command | Cache file pattern |
   |---------|-------------------|
   | `compute knn` | `{base_stem}.{query_stem}.range_{start}_{end}.k{k}.{metric}.{ext}` |
-  | `evaluate predicates` | `{input_stem}.{pred_stem}.seg_{start:010}_{end:010}.predkeys.slab` |
+  | `compute predicates` | `{input_stem}.{pred_stem}.seg_{start:010}_{end:010}.predkeys.slab` |
 
   Profile ordering (smallest to largest, see §3.6.1) ensures that when
   the 110M profile runs, segments `[0,10M)` through `[99M,100M)` are

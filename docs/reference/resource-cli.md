@@ -199,7 +199,7 @@ resources declared by the current command.
 |---------|---------------------|
 | `compute knn` | `mem`, `threads`, `readahead` |
 | `compute filtered-knn` | `mem`, `threads`, `readahead` |
-| `evaluate predicates` | `mem`, `threads`, `segments`, `segmentsize` |
+| `compute predicates` | `mem`, `threads`, `segments`, `segmentsize` |
 | `generate predicated` | `mem`, `threads`, `readahead` |
 | `import` | `threads`, `iothreads`, `readahead` |
 | `convert file` | `iothreads`, `readahead` |

@@ -39,7 +39,7 @@ upstream:
         count: 1000
         to: predicates
 
-    - evaluate predicates:
+    - compute predicates:
         metadata: metadata_content
         predicates: predicates
         survey: survey.json
@@ -52,7 +52,7 @@ upstream:
         to: ground_truth
 ```
 
-The `evaluate predicates` step scans the entire metadata slab once per
+The `compute predicates` step scans the entire metadata slab once per
 segment, evaluating every predicate against every record. The `compute knn`
 step memory-maps the full base vector file and runs brute-force distance
 computations. Both are resource-intensive.
@@ -111,7 +111,7 @@ Now the governor can dynamically adjust:
 
 During the `import` step (I/O-bound, low memory), the governor will
 likely stay in the UNDERUSED band and scale toward the ceiling. During
-`evaluate predicates` (memory-intensive), the governor will scale down
+`compute predicates` (memory-intensive), the governor will scale down
 if RSS climbs into the CAUTION or THROTTLE bands.
 
 ## Step 5: Examine the governor log

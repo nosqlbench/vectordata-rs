@@ -260,7 +260,7 @@ They are used by `compute filtered-knn` to restrict the candidate set:
 ```yaml
 steps:
   - id: evaluate-predicates
-    run: evaluate predicates
+    run: compute predicates
     per_profile: true
     after: [extract-metadata, synthesize-predicates, analyze-metadata]
     input: metadata_content.slab

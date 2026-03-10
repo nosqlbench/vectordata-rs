@@ -42,7 +42,7 @@ pub mod variables;
 use std::path::{Path, PathBuf};
 
 use clap::Args;
-use clap_complete::engine::{ArgValueCandidates, ArgValueCompleter};
+use clap_complete::engine::ArgValueCompleter;
 use indexmap::IndexMap;
 
 use dataset::DatasetConfig;
@@ -102,7 +102,7 @@ pub struct RunArgs {
     /// - `maximize` (default): aggressively use resources up to the configured ceiling
     /// - `conservative`: start at floor values, only increase after sustained low utilization
     /// - `fixed`: use midpoint values, never adjust (useful for benchmarking)
-    #[arg(long, default_value = "maximize", add = ArgValueCandidates::new(cli::governor_candidates))]
+    #[arg(long, default_value = "maximize", add = ArgValueCompleter::new(cli::governor_completer))]
     pub governor: String,
 
     /// Interval in milliseconds between UI status updates and TUI redraws.

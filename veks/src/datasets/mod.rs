@@ -4,7 +4,7 @@
 //! Root-level `veks datasets` command group.
 //!
 //! Provides inventory and exploration of datasets addressable by the catalog
-//! system. Subcommands: list, plan, cache, curlify, prebuffer.
+//! system. Subcommands: list, plan, cache, curlify, prebuffer, catalog.
 //!
 //! These are standalone commands — no pipeline context or StreamContext required.
 
@@ -12,7 +12,6 @@ mod cache;
 mod curlify;
 pub mod filter;
 mod list;
-mod plan;
 mod prebuffer;
 
 use std::path::PathBuf;
@@ -22,6 +21,7 @@ use clap_complete::engine::ArgValueCompleter;
 
 /// Browse, search, and manage datasets
 #[derive(Args)]
+#[command(disable_help_subcommand = true)]
 pub struct DatasetsArgs {
     #[command(subcommand)]
     pub command: DatasetsCommand,
@@ -126,12 +126,6 @@ pub enum DatasetsCommand {
         #[arg(long = "with-data-max", add = ArgValueCompleter::new(filter::data_size_completer))]
         data_max: Option<String>,
     },
-    /// Show which facets are present or missing for a dataset
-    Plan {
-        /// Dataset directory or path to dataset.yaml
-        #[arg(default_value = ".")]
-        path: PathBuf,
-    },
     /// List locally cached datasets
     Cache {
         /// Override cache directory location
@@ -154,13 +148,45 @@ pub enum DatasetsCommand {
     },
     /// Download and cache dataset facets locally
     Prebuffer {
-        /// Dataset directory or path to dataset.yaml
-        #[arg(default_value = ".")]
-        path: PathBuf,
+        /// Dataset specifier: dataset:profile from catalog, or local path
+        #[arg(long, add = ArgValueCompleter::new(filter::select_completer))]
+        dataset: String,
+
+        /// Configuration directory containing catalogs.yaml
+        #[arg(long, default_value = "~/.config/vectordata")]
+        configdir: String,
+
+        /// Additional catalog directories, file paths, or HTTP URLs
+        #[arg(long)]
+        catalog: Vec<String>,
+
+        /// Catalog URLs or paths to use *instead* of configured catalogs
+        #[arg(long = "at")]
+        at: Vec<String>,
 
         /// Override cache directory location
         #[arg(long)]
         cache_dir: Option<PathBuf>,
+    },
+    /// Generate and manage dataset catalog index files
+    #[command(disable_help_subcommand = true)]
+    Catalog {
+        #[command(subcommand)]
+        command: CatalogSubcommand,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum CatalogSubcommand {
+    /// Generate catalog.json and catalog.yaml from dataset directories
+    Generate {
+        /// Root directory to scan for datasets (default: current directory)
+        #[arg(default_value = ".")]
+        input: PathBuf,
+
+        /// Base filename for catalog files (without extension)
+        #[arg(long, default_value = "catalog")]
+        basename: String,
     },
 }
 
@@ -218,17 +244,21 @@ pub fn run(args: DatasetsArgs) {
             let profile_view = filter::ProfileView::new(profile, profile_regex);
             list::run(&configdir, &catalog, &at, &output_format, verbose, &filter, &profile_view, select.as_deref());
         }
-        DatasetsCommand::Plan { path } => {
-            plan::run(&path);
-        }
         DatasetsCommand::Cache { cache_dir, verbose } => {
             cache::run(cache_dir.as_deref(), verbose);
         }
         DatasetsCommand::Curlify { path, output } => {
             curlify::run(&path, output.as_deref());
         }
-        DatasetsCommand::Prebuffer { path, cache_dir } => {
-            prebuffer::run(&path, cache_dir.as_deref());
+        DatasetsCommand::Prebuffer { dataset, configdir, catalog, at, cache_dir } => {
+            prebuffer::run(&dataset, &configdir, &catalog, &at, cache_dir.as_deref());
+        }
+        DatasetsCommand::Catalog { command } => {
+            match command {
+                CatalogSubcommand::Generate { input, basename } => {
+                    crate::catalog::generate::run(&input, &basename);
+                }
+            }
         }
     }
 }
