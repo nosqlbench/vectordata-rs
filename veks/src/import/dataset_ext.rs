@@ -54,6 +54,7 @@ impl DatasetConfigExt for DatasetConfig {
         DatasetConfig {
             name: name.to_string(),
             description: None,
+            attributes: None,
             upstream: None,
             profiles: DSProfileGroup(profiles),
         }

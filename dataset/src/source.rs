@@ -371,6 +371,35 @@ impl<'de> Deserialize<'de> for DSInterval {
                     max_excl: v as u64,
                 })
             }
+
+            fn visit_map<M>(self, mut map: M) -> Result<DSInterval, M::Error>
+            where
+                M: de::MapAccess<'de>,
+            {
+                let mut min_incl: Option<u64> = None;
+                let mut max_excl: Option<u64> = None;
+
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "min_incl" => {
+                            min_incl = Some(map.next_value()?);
+                        }
+                        "max_excl" => {
+                            max_excl = Some(map.next_value()?);
+                        }
+                        _ => {
+                            let _ = map.next_value::<serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+
+                Ok(DSInterval {
+                    min_incl: min_incl.unwrap_or(0),
+                    max_excl: max_excl.ok_or_else(|| {
+                        de::Error::custom("interval map must have 'max_excl' key")
+                    })?,
+                })
+            }
         }
 
         deserializer.deserialize_any(IntervalVisitor)

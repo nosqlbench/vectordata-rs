@@ -1,7 +1,7 @@
 // Copyright (c) DataStax, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use veks::{analyze, bulkdl, cli, convert, datasets, import, pipeline};
+use veks::{analyze, bulkdl, catalog, cli, convert, datasets, import, pipeline};
 
 use clap::{Arg, Command, CommandFactory, Parser, Subcommand};
 use clap_complete::CompleteEnv;
@@ -20,6 +20,8 @@ enum Commands {
     Analyze(analyze::AnalyzeArgs),
     /// Bulk file downloader driven by YAML config with token expansion
     Bulkdl(bulkdl::BulkDlArgs),
+    /// Generate and manage dataset catalog index files
+    Catalog(catalog::CatalogArgs),
     /// Browse, search, and manage datasets
     Datasets(datasets::DatasetsArgs),
     /// Convert vector data between formats
@@ -71,6 +73,24 @@ fn build_augmented_cli() -> clap::Command {
     // tab-completing pipeline group names and command names.
     cmd = cmd.mut_subcommand("help", |_| {
         build_help_completion_command()
+    });
+    // Dynamically hide `datasets list` filter args that can't narrow the
+    // current result set any further.
+    cmd = cmd.mut_subcommand("datasets", |datasets_cmd| {
+        datasets_cmd.mut_subcommand("list", |mut list_cmd| {
+            let hidden = datasets::filter::hidden_list_args();
+            if hidden.contains(&"__disable_help") {
+                // Fully resolved — replace with an empty command so the
+                // completion engine offers nothing at all (not even `--`).
+                return clap::Command::new("list")
+                    .alias("ls")
+                    .disable_help_flag(true);
+            }
+            for id in &hidden {
+                list_cmd = list_cmd.mut_arg(*id, |arg| arg.hide(true));
+            }
+            list_cmd
+        })
     });
     cmd
 }
@@ -193,6 +213,7 @@ async fn main() {
     match veks.command {
         Commands::Analyze(args) => analyze::run(args),
         Commands::Bulkdl(args) => bulkdl::run(args).await,
+        Commands::Catalog(args) => catalog::run(args),
         Commands::Convert(args) => convert::run(args),
         Commands::Datasets(args) => datasets::run(args),
         Commands::Import(args) => import::run(args),
@@ -209,6 +230,7 @@ fn root_commands() -> Vec<(&'static str, &'static str)> {
     vec![
         ("analyze", "Analyze vector data files and datasets"),
         ("bulkdl", "Bulk file downloader driven by YAML config with token expansion"),
+        ("catalog", "Generate and manage dataset catalog index files"),
         ("datasets", "Browse, search, and manage datasets"),
         ("convert", "Convert vector data between formats"),
         ("import", "Import data into preferred internal format by facet type"),

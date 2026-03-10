@@ -1112,7 +1112,9 @@ version = "0.1.0"
 dependencies = [
  "indexmap",
  "serde",
+ "serde_json",
  "serde_yaml",
+ "tempfile",
 ]
 
 [[package]]
@@ -4845,6 +4847,7 @@ dependencies = [
  "rand_xoshiro",
  "ratatui",
  "rayon",
+ "regex",
  "serde",
  "serde_json",
  "serde_yaml",

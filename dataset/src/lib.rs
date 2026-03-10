@@ -21,13 +21,15 @@
 //! both the `vectordata` access layer and the `veks` processing tool can
 //! depend on it without pulling in heavy I/O or CLI dependencies.
 
+pub mod catalog;
 pub mod config;
 pub mod facet;
 pub mod pipeline;
 pub mod profile;
 pub mod source;
 
-pub use config::DatasetConfig;
+pub use catalog::{CatalogEntry, CatalogLayout, find_catalog, load_catalog};
+pub use config::{DatasetAttributes, DatasetConfig};
 pub use facet::StandardFacet;
 pub use pipeline::{OnPartial, PipelineConfig, StepDef};
 pub use profile::{DSProfile, DSProfileGroup, DSView};

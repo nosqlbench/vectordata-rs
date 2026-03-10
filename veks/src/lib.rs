@@ -7,6 +7,7 @@
 
 pub mod analyze;
 pub mod bulkdl;
+pub mod catalog;
 pub mod cli;
 pub mod convert;
 pub mod datasets;

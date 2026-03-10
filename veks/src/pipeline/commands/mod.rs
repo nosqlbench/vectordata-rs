@@ -30,7 +30,6 @@ pub mod compute_knn;
 pub mod compute_sort;
 mod config;
 mod convert;
-mod catalog;
 pub mod fetch_dlhf;
 mod describe;
 pub mod gen_dataset;
@@ -119,7 +118,6 @@ pub fn register_all(registry: &mut CommandRegistry) {
     registry.register("analyze profile", analyze_profile::factory);
     registry.register("analyze model-diff", analyze_modeldiff::factory);
     registry.register("analyze verify-profiles", analyze_verifyprofiles::factory);
-    registry.register("catalog generate", catalog::factory);
     registry.register("fetch dlhf", fetch_dlhf::factory);
 
     // Phase 5 batch 6: slab commands

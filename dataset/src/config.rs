@@ -13,11 +13,51 @@
 
 use std::path::Path;
 
+use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
 use crate::facet::StandardFacet;
 use crate::pipeline::PipelineConfig;
 use crate::profile::{DSProfile, DSProfileGroup};
+
+/// Dataset-level attributes — metadata describing the dataset itself.
+///
+/// Mirrors the upstream Java `RootGroupAttributes` and is emitted as the
+/// `layout.attributes` block in catalog entries. All fields are optional;
+/// only non-`None` values are serialized.
+///
+/// Well-known keys: `model`, `url`, `distance_function`, `license`,
+/// `vendor`, `notes`. Additional freeform tags live under `tags`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct DatasetAttributes {
+    /// Name of the embedding model used to generate vectors (e.g. "CLIP ViT-B/32").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+
+    /// Canonical URL for the dataset source.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+
+    /// Distance function — COSINE, L2, DOT_PRODUCT, etc.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub distance_function: Option<String>,
+
+    /// License identifier (e.g. "Apache-2.0", "CC-BY-4.0").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub license: Option<String>,
+
+    /// Dataset vendor/provider.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vendor: Option<String>,
+
+    /// Freeform notes about the dataset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+
+    /// Freeform key-value tags for categorization.
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+    pub tags: IndexMap<String, String>,
+}
 
 /// A dataset.yaml configuration — describes profiles, views, and optionally
 /// a multi-step command stream pipeline.
@@ -29,6 +69,12 @@ pub struct DatasetConfig {
     /// Description.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+
+    /// Dataset-level attributes (model, distance function, license, etc.).
+    ///
+    /// Emitted as the `layout.attributes` block in catalog entries.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attributes: Option<DatasetAttributes>,
 
     /// Top-level pipeline configuration (shared defaults and steps).
     ///
