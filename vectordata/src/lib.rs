@@ -36,6 +36,7 @@
 //! ```
 
 pub mod cache;
+pub mod dataset;
 pub mod merkle;
 pub mod transport;
 pub mod model;

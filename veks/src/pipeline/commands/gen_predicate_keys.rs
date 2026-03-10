@@ -1720,14 +1720,14 @@ fn parse_ordinal_range(s: &str) -> Result<(i64, Option<i64>), String> {
     let start = if left_str.is_empty() {
         0i64
     } else {
-        let v = dataset::source::parse_number_with_suffix(left_str)? as i64;
+        let v = vectordata::dataset::source::parse_number_with_suffix(left_str)? as i64;
         if left_exclusive { v + 1 } else { v }
     };
 
     let end = if right_str.is_empty() {
         None
     } else {
-        let v = dataset::source::parse_number_with_suffix(right_str)? as i64;
+        let v = vectordata::dataset::source::parse_number_with_suffix(right_str)? as i64;
         Some(if right_inclusive { v + 1 } else { v })
     };
 

@@ -11,7 +11,7 @@ use crate::group::DataSource;
 use crate::io::{HttpVectorReader, MmapVectorReader, VectorReader};
 use crate::model::{FacetConfig, ProfileConfig};
 use crate::{Error, Result};
-use dataset::facet::StandardFacet;
+use crate::dataset::facet::StandardFacet;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;

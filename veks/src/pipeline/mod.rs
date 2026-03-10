@@ -45,7 +45,7 @@ use clap::Args;
 use clap_complete::engine::ArgValueCompleter;
 use indexmap::IndexMap;
 
-use dataset::DatasetConfig;
+use vectordata::dataset::DatasetConfig;
 use command::StreamContext;
 use progress::ProgressLog;
 use registry::CommandRegistry;
@@ -519,7 +519,7 @@ fn filter_steps_for_profile(steps: Vec<schema::StepDef>, profile: &str) -> Vec<s
 /// expansions replace them. Non-template steps pass through unchanged.
 fn expand_per_profile_steps(
     steps: Vec<schema::StepDef>,
-    profiles: &dataset::DSProfileGroup,
+    profiles: &vectordata::dataset::DSProfileGroup,
     query_count: u64,
 ) -> Vec<schema::StepDef> {
     use std::collections::HashSet;
@@ -676,7 +676,7 @@ fn expand_per_profile_steps(
 /// barrier step is inserted that depends on all steps from the previous profile.
 fn insert_profile_barriers(
     steps: &mut Vec<schema::StepDef>,
-    profiles: &dataset::DSProfileGroup,
+    profiles: &vectordata::dataset::DSProfileGroup,
 ) {
     // Barrier order: sized profiles ascending by base_count, then default last.
     // Shared steps (no profiles) are not in the barrier chain — they run
@@ -1332,7 +1332,7 @@ mod tests {
         step
     }
 
-    fn test_profile_group(yaml: &str) -> dataset::DSProfileGroup {
+    fn test_profile_group(yaml: &str) -> vectordata::dataset::DSProfileGroup {
         serde_yaml::from_str(yaml).unwrap()
     }
 

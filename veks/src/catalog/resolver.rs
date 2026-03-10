@@ -8,7 +8,7 @@
 //! a [`CatalogSources`] configuration and fetches `catalog.json` from each
 //! location, remapping layout-embedded entries into a unified list.
 
-use dataset::{CatalogEntry, CatalogLayout};
+use vectordata::dataset::{CatalogEntry, CatalogLayout};
 
 use super::sources::{catalog_file_for, ensure_trailing_slash, CatalogSources};
 
@@ -432,7 +432,7 @@ mod tests {
         for p in profiles {
             profile_group.insert(
                 p.to_string(),
-                dataset::DSProfile {
+                vectordata::dataset::DSProfile {
                     maxk: None,
                     base_count: None,
                     views: IndexMap::new(),
@@ -445,7 +445,7 @@ mod tests {
             dataset_type: "dataset.yaml".to_string(),
             layout: CatalogLayout {
                 attributes: None,
-                profiles: dataset::DSProfileGroup(profile_group),
+                profiles: vectordata::dataset::DSProfileGroup(profile_group),
             },
         }
     }

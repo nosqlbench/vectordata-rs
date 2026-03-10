@@ -15,7 +15,7 @@ use super::args::DescribeArgs;
 use crate::formats::VecFormat;
 use crate::formats::reader::{self, SourceMeta};
 use crate::formats::reader::parquet::ParquetDirReader;
-use dataset::DatasetConfig;
+use vectordata::dataset::DatasetConfig;
 use crate::import::facet::Facet;
 
 /// Run the describe command.

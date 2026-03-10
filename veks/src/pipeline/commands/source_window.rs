@@ -27,7 +27,7 @@
 //! physical file path and the logical record window.
 
 use std::path::{Path, PathBuf};
-use dataset::source::parse_source_string;
+use vectordata::dataset::source::parse_source_string;
 
 /// A resolved source: physical file path plus an optional record range.
 #[derive(Debug, Clone)]

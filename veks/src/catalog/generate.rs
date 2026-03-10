@@ -17,7 +17,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use dataset::{CatalogEntry, CatalogLayout, DatasetConfig};
+use vectordata::dataset::{CatalogEntry, CatalogLayout, DatasetConfig};
 
 /// Internal representation of a discovered dataset before path relativization.
 struct DiscoveredDataset {

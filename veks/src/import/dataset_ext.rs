@@ -9,11 +9,11 @@
 //! `scaffold()` function which depends on veks-specific types (`Facet`,
 //! `VecFormat`).
 
-pub use dataset::DatasetConfig;
+pub use vectordata::dataset::DatasetConfig;
 
 use indexmap::IndexMap;
 
-use dataset::{DSProfile, DSProfileGroup, DSSource, DSView};
+use vectordata::dataset::{DSProfile, DSProfileGroup, DSSource, DSView};
 use super::facet::Facet;
 
 /// Extension trait adding veks-specific operations to `DatasetConfig`.

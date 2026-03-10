@@ -1107,17 +1107,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dataset"
-version = "0.3.0"
-dependencies = [
- "indexmap",
- "serde",
- "serde_json",
- "serde_yaml",
- "tempfile",
-]
-
-[[package]]
 name = "deltae"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4801,13 +4790,14 @@ version = "0.3.0"
 dependencies = [
  "anyhow",
  "byteorder",
- "dataset",
  "half",
  "hex",
+ "indexmap",
  "libc",
  "memmap2",
  "reqwest",
  "serde",
+ "serde_json",
  "serde_yaml",
  "sha2",
  "tempfile",
@@ -4828,7 +4818,6 @@ dependencies = [
  "clap_complete",
  "crossterm",
  "curl",
- "dataset",
  "env_logger",
  "half",
  "indexmap",

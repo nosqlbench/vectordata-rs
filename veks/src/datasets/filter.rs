@@ -17,8 +17,8 @@ use std::sync::OnceLock;
 use regex::RegexBuilder;
 
 use clap_complete::engine::CompletionCandidate;
-use dataset::{CatalogEntry, StandardFacet};
-use dataset::source::parse_number_with_suffix;
+use vectordata::dataset::{CatalogEntry, StandardFacet};
+use vectordata::dataset::source::parse_number_with_suffix;
 
 use crate::catalog::resolver::Catalog;
 use crate::catalog::sources::CatalogSources;
@@ -252,7 +252,7 @@ fn collect_all_view_names(entry: &CatalogEntry) -> Vec<String> {
 
 /// Resolve a user-provided facet name to its canonical form.
 fn resolve_facet_name(name: &str) -> String {
-    dataset::facet::resolve_standard_key(name)
+    vectordata::dataset::facet::resolve_standard_key(name)
         .unwrap_or_else(|| name.to_string())
 }
 
@@ -904,7 +904,7 @@ pub fn size_completer(current: &OsStr) -> Vec<CompletionCandidate> {
 
     sizes
         .iter()
-        .map(|s| dataset::source::format_count_with_suffix(*s))
+        .map(|s| vectordata::dataset::source::format_count_with_suffix(*s))
         .filter(|s| prefix.is_empty() || s.starts_with(prefix.as_ref()))
         .map(|s| CompletionCandidate::new(s))
         .collect()
@@ -967,7 +967,7 @@ pub fn data_size_completer(current: &OsStr) -> Vec<CompletionCandidate> {
 
     sizes
         .iter()
-        .map(|s| dataset::source::format_count_with_suffix(*s))
+        .map(|s| vectordata::dataset::source::format_count_with_suffix(*s))
         .filter(|s| prefix.is_empty() || s.starts_with(prefix.as_ref()))
         .map(|s| CompletionCandidate::new(s))
         .collect()
@@ -1162,7 +1162,7 @@ pub fn hidden_list_args() -> Vec<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dataset::{CatalogLayout, DSProfile, DSProfileGroup};
+    use vectordata::dataset::{CatalogLayout, DSProfile, DSProfileGroup};
     use indexmap::IndexMap;
 
     fn entry_with_views(name: &str, views: &[&str]) -> CatalogEntry {
@@ -1170,11 +1170,11 @@ mod tests {
         for v in views {
             view_map.insert(
                 v.to_string(),
-                dataset::DSView {
-                    source: dataset::DSSource {
+                vectordata::dataset::DSView {
+                    source: vectordata::dataset::DSSource {
                         path: format!("{}.fvec", v),
                         namespace: None,
-                        window: dataset::source::DSWindow::default(),
+                        window: vectordata::dataset::source::DSWindow::default(),
                     },
                     window: None,
                 },
@@ -1202,7 +1202,7 @@ mod tests {
 
     fn entry_with_attrs(name: &str, metric: &str) -> CatalogEntry {
         let mut e = entry_with_views(name, &["base_vectors", "query_vectors"]);
-        e.layout.attributes = Some(dataset::DatasetAttributes {
+        e.layout.attributes = Some(vectordata::dataset::DatasetAttributes {
             distance_function: Some(metric.to_string()),
             ..Default::default()
         });

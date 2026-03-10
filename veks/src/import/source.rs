@@ -7,4 +7,4 @@
 //! are now owned by the `dataset` crate. This module re-exports them
 //! for backwards compatibility within veks.
 
-pub use dataset::source::*;
+pub use vectordata::dataset::source::*;

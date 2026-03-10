@@ -30,7 +30,7 @@ use crate::formats::VecFormat;
 use crate::formats::reader;
 use crate::formats::writer::{self, SinkConfig};
 
-use dataset::DatasetConfig;
+use vectordata::dataset::DatasetConfig;
 use dataset_ext::DatasetConfigExt;
 
 /// Entry point for the import subcommand

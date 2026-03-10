@@ -14,7 +14,7 @@ use crate::catalog::resolver::Catalog;
 use crate::catalog::sources::CatalogSources;
 use super::filter::{DatasetFilter, ProfileView};
 
-use dataset::CatalogEntry;
+use vectordata::dataset::CatalogEntry;
 
 /// Summary used for structured (json/yaml) output.
 #[derive(Debug, serde::Serialize)]

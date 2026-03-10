@@ -983,7 +983,7 @@ struct Range {
 
 /// Parse a number with optional unit suffix, returning usize.
 fn parse_range_number(s: &str) -> Result<usize, String> {
-    let v = dataset::source::parse_number_with_suffix(s)?;
+    let v = vectordata::dataset::source::parse_number_with_suffix(s)?;
     usize::try_from(v).map_err(|_| format!("value too large for usize: {}", v))
 }
 
