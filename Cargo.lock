@@ -1108,7 +1108,7 @@ dependencies = [
 
 [[package]]
 name = "dataset"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "indexmap",
  "serde",
@@ -4818,7 +4818,7 @@ dependencies = [
 
 [[package]]
 name = "veks"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "arrow",
  "atty",
