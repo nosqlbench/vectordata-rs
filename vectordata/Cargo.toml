@@ -1,6 +1,6 @@
 [package]
 name = "vectordata"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "Rust implementation of vectordata tools for dataset.yaml"
 license = "Apache-2.0"
@@ -11,7 +11,7 @@ keywords = ["vector", "dataset", "ann", "testing", "automation"]
 categories = ["filesystem", "network-programming", "science"]
 
 [dependencies]
-dataset = { path = "../dataset" }
+dataset = { path = "../dataset", version = "0.1.0" }
 serde = { version = "1.0", features = ["derive"] }
 serde_yaml = "0.9"
 thiserror = "2.0.18"

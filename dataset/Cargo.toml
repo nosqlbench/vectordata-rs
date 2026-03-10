@@ -9,6 +9,7 @@ repository = "https://github.com/nosqlbench/vectordata-rs"
 readme = "../README.md"
 keywords = ["vector", "dataset", "yaml", "configuration"]
 categories = ["config", "data-structures"]
+publish = false
 
 [dependencies]
 indexmap = { version = "2", features = ["serde"] }
