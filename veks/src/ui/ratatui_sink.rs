@@ -361,6 +361,8 @@ struct RenderState {
     step_yaml: String,
     /// Height of the step YAML panel (user-adjustable via up/down arrows).
     step_yaml_height: u16,
+    /// Width percentage of the YAML panel vs RPS chart (user-adjustable via left/right arrows).
+    yaml_width_pct: u16,
     /// Whether rendering is paused (`p` key toggle).
     paused: bool,
     /// One-shot flag: redraw once to show/hide PAUSED indicator.
@@ -405,6 +407,7 @@ impl RenderState {
             show_help: false,
             step_yaml: String::new(),
             step_yaml_height: 8,
+            yaml_width_pct: 45,
             paused: false,
             pause_redraw_pending: false,
             suspended: false,
@@ -537,6 +540,16 @@ fn render_loop(rx: mpsc::Receiver<RenderMsg>, max_height: u16, redraw_interval: 
                 } else if key.code == KeyCode::Down {
                     if state.step_yaml_height < 30 {
                         state.step_yaml_height += 1;
+                        state.dirty = true;
+                    }
+                } else if key.code == KeyCode::Left {
+                    if state.yaml_width_pct > 15 {
+                        state.yaml_width_pct -= 5;
+                        state.dirty = true;
+                    }
+                } else if key.code == KeyCode::Right {
+                    if state.yaml_width_pct < 85 {
+                        state.yaml_width_pct += 5;
                         state.dirty = true;
                     }
                 }
@@ -949,24 +962,15 @@ fn draw_progress<B: ratatui::backend::Backend>(
         }
         let has_extra = !state.alert.is_empty() || !state.extra_budget.is_empty();
         let has_resource_chart = !state.resource_status.is_empty() && has_chart;
-        if has_top_panel && has_resource_chart {
-            // Both panels present — split remaining space 50/50
-            constraints.push(Constraint::Percentage(50)); // top: YAML + RPS
-            if has_extra {
-                constraints.push(Constraint::Length(1)); // alert/extra budget line
-            }
-            constraints.push(Constraint::Percentage(50)); // bottom: resource charts
-        } else {
-            if has_top_panel {
-                let top_height = if has_yaml { state.step_yaml_height } else { 8 };
-                constraints.push(Constraint::Length(top_height));
-            }
-            if has_extra {
-                constraints.push(Constraint::Length(1));
-            }
-            if has_resource_chart {
-                constraints.push(Constraint::Min(10));
-            }
+        if has_top_panel {
+            let top_height = if has_yaml { state.step_yaml_height } else { 8 };
+            constraints.push(Constraint::Length(top_height));
+        }
+        if has_extra {
+            constraints.push(Constraint::Length(1));
+        }
+        if has_resource_chart {
+            constraints.push(Constraint::Min(10));
         }
         if state.paused {
             constraints.push(Constraint::Length(1)); // paused indicator
@@ -991,7 +995,7 @@ fn draw_progress<B: ratatui::backend::Backend>(
                     &state.context_label,
                     Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled("  (? help  ↑↓ resize)", Style::default().fg(Color::DarkGray)),
+                Span::styled("  (? help  ↑↓ height  ←→ width)", Style::default().fg(Color::DarkGray)),
             ]);
             frame.render_widget(Paragraph::new(ctx_line), chunks[idx]);
             idx += 1;
@@ -1013,8 +1017,8 @@ fn draw_progress<B: ratatui::backend::Backend>(
                     let halves = Layout::default()
                         .direction(Direction::Horizontal)
                         .constraints([
-                            Constraint::Percentage(45),
-                            Constraint::Percentage(55),
+                            Constraint::Percentage(state.yaml_width_pct),
+                            Constraint::Percentage(100 - state.yaml_width_pct),
                         ])
                         .split(top_area);
                     render_step_yaml(frame, halves[0], state);
@@ -1185,7 +1189,11 @@ fn render_help(frame: &mut ratatui::Frame, area: Rect) {
         ]),
         Line::from(vec![
             Span::styled("  ↑ / ↓   ", Style::default().fg(Color::Yellow)),
-            Span::raw("Resize step YAML panel"),
+            Span::raw("Adjust panel height"),
+        ]),
+        Line::from(vec![
+            Span::styled("  ← / →   ", Style::default().fg(Color::Yellow)),
+            Span::raw("Adjust step detail / RPS chart split"),
         ]),
     ];
     let block = Block::default()
