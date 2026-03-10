@@ -202,7 +202,7 @@ mod tests {
         m
     }
 
-    // ── Eq ──
+    // -- Eq --
 
     #[test]
     fn test_eq_int() {
@@ -246,7 +246,7 @@ mod tests {
         assert!(!evaluate(&p, &mnode_one("x", MValue::Bytes(vec![4, 5]))));
     }
 
-    // ── Ne ──
+    // -- Ne --
 
     #[test]
     fn test_ne_int() {
@@ -262,7 +262,7 @@ mod tests {
         assert!(evaluate(&p, &mnode_one("x", MValue::Int(1))));
     }
 
-    // ── Gt / Lt / Ge / Le ──
+    // -- Gt / Lt / Ge / Le --
 
     #[test]
     fn test_gt_int() {
@@ -303,7 +303,7 @@ mod tests {
         assert!(!evaluate(&p, &mnode_one("x", MValue::Text("alice".into()))));
     }
 
-    // ── In ──
+    // -- In --
 
     #[test]
     fn test_in_int() {
@@ -323,7 +323,7 @@ mod tests {
         assert!(!evaluate(&p, &mnode_one("x", MValue::Text("c".into()))));
     }
 
-    // ── Missing field ──
+    // -- Missing field --
 
     #[test]
     fn test_missing_field_eq_null() {
@@ -353,7 +353,7 @@ mod tests {
         assert!(!evaluate(&p, &m));
     }
 
-    // ── Explicit MValue::Null ──
+    // -- Explicit MValue::Null --
 
     #[test]
     fn test_explicit_null_eq_null() {
@@ -373,7 +373,7 @@ mod tests {
         assert!(!evaluate(&p, &mnode_one("x", MValue::Null)));
     }
 
-    // ── Conjugate trees ──
+    // -- Conjugate trees --
 
     #[test]
     fn test_and_conjugate() {
@@ -409,7 +409,7 @@ mod tests {
         assert!(!evaluate(&tree, &mnode_one("x", MValue::Int(3))));
     }
 
-    // ── Cross-width coercion ──
+    // -- Cross-width coercion --
 
     #[test]
     fn test_int32_vs_comparand_int() {
@@ -440,7 +440,7 @@ mod tests {
         assert!(!evaluate(&p, &mnode_one("x", MValue::Float32(5.5))));
     }
 
-    // ── Cross-type numeric ──
+    // -- Cross-type numeric --
 
     #[test]
     fn test_int_vs_comparand_float() {
@@ -470,7 +470,7 @@ mod tests {
         assert!(!evaluate(&p, &mnode_one("x", MValue::Float(10.5))));
     }
 
-    // ── Text subtypes ──
+    // -- Text subtypes --
 
     #[test]
     fn test_ascii_vs_text() {
@@ -484,7 +484,7 @@ mod tests {
         assert!(evaluate(&p, &mnode_one("x", MValue::EnumStr("red".into()))));
     }
 
-    // ── Cross-type mismatch ──
+    // -- Cross-type mismatch --
 
     #[test]
     fn test_text_vs_int_mismatch() {
@@ -498,7 +498,7 @@ mod tests {
         assert!(!evaluate(&p, &mnode_one("x", MValue::Bool(true))));
     }
 
-    // ── FieldRef::Index ──
+    // -- FieldRef::Index --
 
     #[test]
     fn test_field_ref_index() {
@@ -520,7 +520,7 @@ mod tests {
         assert!(evaluate(&p1, &m));
     }
 
-    // ── Matches (unsupported) ──
+    // -- Matches (unsupported) --
 
     #[test]
     fn test_matches_unsupported() {

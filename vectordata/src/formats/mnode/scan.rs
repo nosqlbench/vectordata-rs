@@ -484,7 +484,7 @@ impl CompiledScanPredicates {
         let mut targeted_fields = vec![false; fc];
         let mut condition_counts = condition_counts_orig.to_vec();
 
-        // Build name → schema-index map
+        // Build name -> schema-index map
         let name_to_idx: HashMap<&[u8], usize> = schema
             .field_names
             .iter()
@@ -551,7 +551,7 @@ impl CompiledScanPredicates {
 /// count) and was fully evaluated. Returns `Ok(false)` if the field count
 /// does not match — the caller should fall back to `MNode::from_bytes`.
 ///
-/// `pass_counts` must be pre-zeroed by the caller and have length ≥
+/// `pass_counts` must be pre-zeroed by the caller and have length >=
 /// `compiled.pred_count`.
 pub fn scan_record(
     data: &[u8],
@@ -569,7 +569,7 @@ pub fn scan_record(
     }
     let field_count = read_u16(data, 1) as usize;
     if field_count != compiled.schema_field_count {
-        return Ok(false); // schema mismatch → caller must use fallback
+        return Ok(false); // schema mismatch -> caller must use fallback
     }
 
     let mut pos = 3;
@@ -613,7 +613,7 @@ mod tests {
     use crate::formats::mnode::{MNode, MValue};
     use crate::formats::pnode::{ConjugateNode, PredicateNode};
 
-    // ── skip_value ──
+    // -- skip_value --
 
     #[test]
     fn test_skip_null() {
@@ -671,7 +671,7 @@ mod tests {
         assert!(matches!(skip_value(&data, 0, 1), Err(ScanError::UnexpectedEof)));
     }
 
-    // ── discover_schema ──
+    // -- discover_schema --
 
     #[test]
     fn test_discover_schema_basic() {
@@ -697,7 +697,7 @@ mod tests {
         assert!(schema.field_names.is_empty());
     }
 
-    // ── check_condition_raw ──
+    // -- check_condition_raw --
 
     fn build_record(fields: &[(&str, MValue)]) -> Vec<u8> {
         let mut node = MNode::new();
@@ -900,7 +900,7 @@ mod tests {
         ));
     }
 
-    // ── scan_record ──
+    // -- scan_record --
 
     #[test]
     fn test_scan_record_basic() {
@@ -952,7 +952,7 @@ mod tests {
         let compiled =
             CompiledScanPredicates::compile(1, &fc, &condition_counts, Vec::new(), &schema);
 
-        // missing_field resolved at compile time → condition_counts decremented
+        // missing_field resolved at compile time -> condition_counts decremented
         assert_eq!(compiled.required_count(0), 0);
     }
 
@@ -962,7 +962,7 @@ mod tests {
 
         let schema = discover_schema(&data).unwrap();
 
-        // Predicate: missing_field > 5 → can never match
+        // Predicate: missing_field > 5 -> can never match
         let mut fc: HashMap<String, Vec<(usize, OpType, Vec<Comparand>)>> = HashMap::new();
         fc.entry("missing".into())
             .or_default()
@@ -1048,7 +1048,7 @@ mod tests {
         assert_eq!(pass_counts[0], 1);
     }
 
-    // ── flatten_and ──
+    // -- flatten_and --
 
     #[test]
     fn test_flatten_and_simple_predicate() {
@@ -1113,7 +1113,7 @@ mod tests {
         assert!(flatten_and(&p).is_none());
     }
 
-    // ── missing_field_passes ──
+    // -- missing_field_passes --
 
     #[test]
     fn test_missing_field_eq_null() {

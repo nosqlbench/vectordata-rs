@@ -30,6 +30,7 @@ pub mod compute_knn;
 pub mod compute_sort;
 mod config;
 mod convert;
+pub mod fetch_bulkdl;
 pub mod fetch_dlhf;
 mod describe;
 pub mod gen_dataset;
@@ -119,6 +120,7 @@ pub fn register_all(registry: &mut CommandRegistry) {
     registry.register("analyze model-diff", analyze_modeldiff::factory);
     registry.register("analyze verify-profiles", analyze_verifyprofiles::factory);
     registry.register("fetch dlhf", fetch_dlhf::factory);
+    registry.register("fetch bulkdl", fetch_bulkdl::factory);
 
     // Phase 5 batch 6: slab commands
     registry.register("slab import", slab::import_factory);

@@ -6,7 +6,7 @@
 //!
 //! This is Stage 2 of the two-stage codec pipeline:
 //! ```text
-//! bytes ←→ [Stage 1: ANode binary codec] ←→ ANode ←→ [Stage 2: Vernacular codec] ←→ text
+//! bytes <-> [Stage 1: ANode binary codec] <-> ANode <-> [Stage 2: Vernacular codec] <-> text
 //! ```
 
 use super::anode::ANode;

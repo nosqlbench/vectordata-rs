@@ -9,7 +9,6 @@ repository = "https://github.com/nosqlbench/vectordata-rs"
 readme = "README.md"
 keywords = ["vector", "dataset", "ann", "testing", "automation"]
 categories = ["filesystem", "network-programming", "science"]
-publish = false
 
 [lib]
 name = "veks"

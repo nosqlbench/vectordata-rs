@@ -8,6 +8,12 @@
 
 ## 🛠 The Workspace
 
+### [**vectordata**](./vectordata/) — Transparent Access Layer
+A library for efficient dataset access via `dataset.yaml`.
+- **Zero-copy I/O**: Memory-mapped local access for maximum throughput.
+- **Smart Remote**: On-demand, Merkle-verified retrieval via HTTP Range requests.
+- **Unified API**: One interface for local files and remote URLs.
+
 ### [**veks**](./veks/) — The Umbrella CLI
 The primary entry point for all vector operations.
 - 🔍 **analyze** — Inspect, profile, and visualize vector distributions.
@@ -15,12 +21,6 @@ The primary entry point for all vector operations.
 - 📥 **import** — Canonicalize data into optimized internal formats.
 - 🚀 **pipeline** — Execute complex DAG-ordered data processing streams.
 - 📦 **bulkdl** — Parallel, config-driven dataset downloader.
-
-### [**vectordata**](./vectordata/) — Transparent Access Layer
-A library for efficient dataset access via `dataset.yaml`.
-- **Zero-copy I/O**: Memory-mapped local access for maximum throughput.
-- **Smart Remote**: On-demand, Merkle-verified retrieval via HTTP Range requests.
-- **Unified API**: One interface for local files and remote URLs.
 
 ### [**slabtastic**](./slabtastic/) — Random-Access Storage
 The storage engine for non-uniform data (metadata, predicates, etc.).

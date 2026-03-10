@@ -27,7 +27,7 @@ use arrow::record_batch::RecordBatch;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 use super::{SourceMeta, VecSource};
-use crate::formats::mnode::parquet_compiler::CompiledMnodeWriter;
+use crate::formats::parquet_compiler::CompiledMnodeWriter;
 
 /// Maximum number of loaded files held in memory at once.
 ///

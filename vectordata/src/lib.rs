@@ -37,6 +37,7 @@
 
 pub mod cache;
 pub mod dataset;
+pub mod formats;
 pub mod merkle;
 pub mod transport;
 pub mod model;

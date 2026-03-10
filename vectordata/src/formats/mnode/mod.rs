@@ -30,7 +30,6 @@ pub const DIALECT_MNODE: u8 = 0x01;
 mod tags;
 pub mod scan;
 pub mod vernacular;
-pub mod parquet_compiler;
 
 pub use tags::TypeTag;
 

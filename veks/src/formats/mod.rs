@@ -8,17 +8,20 @@
 //! multiple tools — not just `convert` — and follows a registry pattern similar
 //! to the Java `VectorFileIO` approach.
 
-// mnode and pnode: wire format codecs for metadata and predicate records.
-// The canonical encode/decode types (MNode, MValue, PNode, etc.) are used in
-// tests to verify the wire format produced by the compiled writers at runtime.
+// Wire format codecs re-exported from vectordata so that both crates share
+// a single definition of MNode, PNode, ANode, etc.
 #[allow(dead_code)]
-pub mod mnode;
+pub use vectordata::formats::mnode;
 #[allow(dead_code)]
-pub mod pnode;
+pub use vectordata::formats::pnode;
 #[allow(dead_code)]
-pub mod anode;
+pub use vectordata::formats::anode;
 #[allow(dead_code)]
-pub mod anode_vernacular;
+pub use vectordata::formats::anode_vernacular;
+
+// Arrow-based parquet-to-mnode compiler — stays in veks because it depends on
+// the `arrow` crate which is not a vectordata dependency.
+pub mod parquet_compiler;
 pub mod convert;
 pub mod reader;
 pub mod writer;

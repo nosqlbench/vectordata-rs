@@ -14,7 +14,7 @@ use std::sync::Arc;
 use arrow::array::*;
 use arrow::datatypes::{DataType, Int16Type, Int32Type, Int64Type, Int8Type, Schema};
 
-use super::TypeTag;
+use super::mnode::TypeTag;
 
 /// Determines how to extract a value from an Arrow column and write its MNode
 /// value bytes.
@@ -117,7 +117,7 @@ impl CompiledMnodeWriter {
     /// Prepends the `DIALECT_MNODE` leader byte before the field data.
     /// The caller is responsible for clearing `buf` beforehand if needed.
     pub fn write_row(&self, batch: &RecordBatch, row: usize, buf: &mut Vec<u8>) {
-        buf.push(super::DIALECT_MNODE);
+        buf.push(super::mnode::DIALECT_MNODE);
         buf.extend_from_slice(&self.field_count_header);
         for op in &self.ops {
             buf.extend_from_slice(&op.name_prefix);
