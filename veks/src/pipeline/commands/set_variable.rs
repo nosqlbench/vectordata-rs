@@ -8,7 +8,7 @@
 //! so that downstream steps in the same run can reference it via `${name}`.
 //!
 //! Expressions:
-//! - `count:<path>` — record count of a vector file (fvec/hvec/ivec) or slab
+//! - `count:<path>` — record count of a vector file (fvec/mvec/ivec) or slab
 //! - `dim:<path>` — dimension of a vector file
 //! - `<literal>` — stored as-is
 
@@ -49,8 +49,8 @@ to all subsequent steps via `${{name}}` interpolation.
 
 ## Expressions
 
-- `count:<path>` — record count of a vector file (fvec/hvec/ivec) or slab
-- `dim:<path>` — dimension of a vector file (fvec/hvec/ivec)
+- `count:<path>` — record count of a vector file (fvec/mvec/ivec) or slab
+- `dim:<path>` — dimension of a vector file (fvec/mvec/ivec)
 - Any other value is stored as a literal string.
 
 ## Options
@@ -65,7 +65,7 @@ to all subsequent steps via `${{name}}` interpolation.
   after:
     - import-all
   name: vector_count
-  value: "count:all_vectors.hvec"
+  value: "count:all_vectors.mvec"
 ```
 
 Then reference in a downstream step:
@@ -191,7 +191,7 @@ Place as the first step to ensure a clean variable context:
   after:
     - import-all
   name: vector_count
-  value: "count:all_vectors.hvec"
+  value: "count:all_vectors.mvec"
 ```
 
 CLI equivalent:

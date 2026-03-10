@@ -25,7 +25,7 @@ pub trait VecSource: Send {
     /// Bytes per element in the source data.
     ///
     /// Used to select the correct xvec output variant during import:
-    /// 1 → bvec, 2 → hvec, 4 → fvec, 8 → dvec.
+    /// 1 → bvec, 2 → mvec, 4 → fvec, 8 → dvec.
     fn element_size(&self) -> usize;
 
     /// Total record count, if known ahead of time
@@ -101,7 +101,7 @@ pub fn open_source(path: &Path, format: VecFormat, threads: usize, max_count: Op
         | VecFormat::Ivec
         | VecFormat::Bvec
         | VecFormat::Dvec
-        | VecFormat::Hvec
+        | VecFormat::Mvec
         | VecFormat::Svec => xvec::open_xvec(path, format),
         VecFormat::Npy => npy::NpyDirReader::open(path, threads, max_count),
         VecFormat::Parquet => parquet::ParquetDirReader::open(path, threads),

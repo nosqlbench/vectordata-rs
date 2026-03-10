@@ -37,7 +37,7 @@ Each step in the pipeline goes through:
    only when all of: status is OK, outputs exist with matching sizes, resolved
    options are unchanged, and no input file has a modification time newer than
    the step's completion timestamp. If stale, the reason is logged (e.g.,
-   "stale: input 'source' (base_vectors.hvec) is newer than last run").
+   "stale: input 'source' (base_vectors.mvec) is newer than last run").
 
 3. **Command resolution** — The `run` field (e.g., `"compute knn"`) is looked
    up in the `CommandRegistry` to find the factory function.
@@ -177,16 +177,16 @@ schema_version: 2
 steps:
   import-base:
     status: ok
-    message: imported 407314954 records to base_vectors.hvec
+    message: imported 407314954 records to base_vectors.mvec
     completed_at: '2026-03-05T05:59:50.266068879Z'
     elapsed_secs: 280.878825819
     outputs:
-    - path: base_vectors.hvec
+    - path: base_vectors.mvec
       size: 418719772712
       mtime: '2026-03-05T06:00:01.123456789Z'
     resolved_options:
       from: npy
-      output: base_vectors.hvec
+      output: base_vectors.mvec
       source: ../sourcedata/embeddings/text_emb
       facet: base_vectors
 ```
@@ -234,7 +234,7 @@ Additionally, two whole-log invalidation mechanisms exist:
 
 When a step is stale, `check_step_freshness()` returns a reason string
 (e.g., "options changed", "output 'foo.ivec' missing", "input 'source'
-(base_vectors.hvec) is newer than last run") that is displayed in the
+(base_vectors.mvec) is newer than last run") that is displayed in the
 pipeline log.
 
 ### Output mtime recording
@@ -322,7 +322,7 @@ Format-aware completeness checking via `bound.rs`:
 
 | Format | Check method |
 |--------|-------------|
-| xvec (fvec, ivec, hvec, ...) | File exists + non-empty = Complete |
+| xvec (fvec, ivec, mvec, ...) | File exists + non-empty = Complete |
 | slab | `SlabReader::probe()` — checks pages page exists and has pages |
 | Recognized but unchecked (npy, parquet) | `Unknown` — error: no completeness check for this format |
 | Unrecognized extension | `Unknown` — error: cannot verify completeness |

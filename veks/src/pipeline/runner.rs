@@ -588,7 +588,7 @@ pub fn run_steps(
 ///
 /// Appends `_buffer` before the file extension (or at the end if no extension):
 /// - `foo.slab` → `foo_buffer.slab`
-/// - `data.hvec` → `data_buffer.hvec`
+/// - `data.mvec` → `data_buffer.mvec`
 /// - `noext` → `noext_buffer`
 fn buffer_path_for(path: &std::path::Path) -> PathBuf {
     let stem = path.file_stem().unwrap_or_default().to_string_lossy();

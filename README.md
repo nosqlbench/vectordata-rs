@@ -11,7 +11,7 @@
 ### [**veks**](./veks/) — The Umbrella CLI
 The primary entry point for all vector operations.
 - 🔍 **analyze** — Inspect, profile, and visualize vector distributions.
-- 🔄 **convert** — Seamlessly transform between `.fvec`, `.ivec`, `.hvec`, and more.
+- 🔄 **convert** — Seamlessly transform between `.fvec`, `.ivec`, `.mvec`, and more.
 - 📥 **import** — Canonicalize data into optimized internal formats.
 - 🚀 **pipeline** — Execute complex DAG-ordered data processing streams.
 - 📦 **bulkdl** — Parallel, config-driven dataset downloader.

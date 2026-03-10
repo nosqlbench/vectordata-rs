@@ -43,7 +43,7 @@ fn check_endianness(path: &Path) -> Result<String, String> {
         "fvec" | "ivec" => 4,
         "bvec" => 1,
         "dvec" => 8,
-        "hvec" => 2,
+        "mvec" => 2,
         _ => return Err(format!("unknown vector format: '.{}'", ext)),
     };
 

@@ -122,7 +122,7 @@ steps:
   - id: import-base
     run: import
     source: img_emb/
-    output: base_vectors.hvec
+    output: base_vectors.mvec
 
   - id: import-metadata
     run: import
@@ -140,7 +140,7 @@ For sized profiles, both base vectors and metadata use the same window:
 profiles:
   10m:
     base_count: 10M
-    base_vectors: "base_vectors.hvec[0..10M]"
+    base_vectors: "base_vectors.mvec[0..10M]"
     metadata_content: "metadata_content.slab[0..10M]"
 ```
 
@@ -157,7 +157,7 @@ steps:
   - id: import-all
     run: import
     source: embeddings/
-    output: all_vectors.hvec
+    output: all_vectors.mvec
 
   - id: import-metadata
     run: import
@@ -175,21 +175,21 @@ steps:
 
   # 3. Extract query vectors (first N shuffled indices)
   - id: extract-query
-    run: transform hvec-extract
+    run: transform mvec-extract
     after: [import-all, generate-shuffle]
-    hvec-file: all_vectors.hvec
+    mvec-file: all_vectors.mvec
     ivec-file: shuffle.ivec
-    output: query_vectors.hvec
+    output: query_vectors.mvec
     range: "[0,${query_count})"
 
   # 4. Extract base vectors (remainder of shuffled indices)
   - id: extract-base
-    run: transform hvec-extract
+    run: transform mvec-extract
     per_profile: true
     after: [import-all, generate-shuffle]
-    hvec-file: all_vectors.hvec
+    mvec-file: all_vectors.mvec
     ivec-file: shuffle.ivec
-    output: base_vectors.hvec
+    output: base_vectors.mvec
     range: "[${query_count},${base_end})"
 
   # 5. Extract metadata with the SAME shuffle and range
@@ -205,7 +205,7 @@ steps:
 
 The `transform slab-extract` step applies the same ivec permutation file
 and the same range as `extract-base`, so the output `metadata_content.slab`
-is in the same shuffled order as `base_vectors.hvec`. Without this step,
+is in the same shuffled order as `base_vectors.mvec`. Without this step,
 `metadata_content.slab[i]` would refer to the *original* i-th record, not
 the i-th base vector.
 
@@ -286,8 +286,8 @@ steps:
     run: compute filtered-knn
     per_profile: true
     after: [extract-base, extract-query, evaluate-predicates]
-    base: base_vectors.hvec
-    query: query_vectors.hvec
+    base: base_vectors.mvec
+    query: query_vectors.mvec
     metadata-indices: metadata_indices.slab
     indices: filtered_neighbor_indices.ivec
     distances: filtered_neighbor_distances.fvec

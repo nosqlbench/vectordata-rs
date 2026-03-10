@@ -17,7 +17,7 @@ Fixed-dimension vector files where each record is:
 | `.ivec` | i32 | 4 bytes | Integer vectors, neighbor indices |
 | `.bvec` | u8 | 1 byte (padded to 4) | Byte vectors |
 | `.dvec` | f64 | 8 bytes | Double-precision vectors |
-| `.hvec` | f16 | 2 bytes | Half-precision vectors |
+| `.mvec` | f16 | 2 bytes | Half-precision vectors |
 | `.svec` | i16 | 2 bytes | Short integer vectors |
 
 Access pattern: memory-mapped via `MmapVectorReader<T>`. O(1) random access
@@ -231,8 +231,8 @@ A complete predicated dataset contains:
 
 | Facet | Format | Description |
 |-------|--------|-------------|
-| `base_vectors` | fvec/hvec | Corpus vectors to search |
-| `query_vectors` | fvec/hvec | Query vectors to run |
+| `base_vectors` | fvec/mvec | Corpus vectors to search |
+| `query_vectors` | fvec/mvec | Query vectors to run |
 | `neighbor_indices` | ivec | Ground-truth neighbor indices |
 | `neighbor_distances` | fvec | Ground-truth neighbor distances |
 | `metadata_content` | slab (MNode) | Metadata records per vector |

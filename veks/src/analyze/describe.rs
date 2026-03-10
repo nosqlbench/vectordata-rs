@@ -289,7 +289,7 @@ struct NormResult {
 fn check_normalization(path: &Path, format: VecFormat, meta: &SourceMeta) -> NormResult {
     match format {
         VecFormat::Fvec => check_normalization_fvec(path, meta),
-        VecFormat::Hvec | VecFormat::Dvec | VecFormat::Svec => {
+        VecFormat::Mvec | VecFormat::Dvec | VecFormat::Svec => {
             check_normalization_xvec_seek(path, format, meta)
         }
         VecFormat::Npy => check_normalization_npy_seek(path, meta),
@@ -348,7 +348,7 @@ fn check_normalization_fvec(path: &Path, meta: &SourceMeta) -> NormResult {
     make_norm_result(passed, checked)
 }
 
-/// Check normalization for hvec/dvec/svec via seek-based sampling.
+/// Check normalization for mvec/dvec/svec via seek-based sampling.
 fn check_normalization_xvec_seek(
     path: &Path,
     format: VecFormat,
@@ -402,7 +402,7 @@ fn check_normalization_xvec_seek(
         checked += 1;
 
         let norm_sq = match format {
-            VecFormat::Hvec => l2_norm_sq_half(&buf),
+            VecFormat::Mvec => l2_norm_sq_half(&buf),
             VecFormat::Dvec => l2_norm_sq_f64(&buf),
             VecFormat::Svec => {
                 // svec is short (i16), not float — skip normalization

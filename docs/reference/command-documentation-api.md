@@ -226,8 +226,8 @@ Option-level completions also show descriptions from
 
 ```
 $ veks pipeline compute knn --<TAB>
---base          # Path to base vector file (fvec/hvec)
---query         # Path to query vector file (fvec/hvec)
+--base          # Path to base vector file (fvec/mvec)
+--query         # Path to query vector file (fvec/mvec)
 --neighbors     # Number of neighbors to compute (default: 100)
 --resources     # Resource configuration (mem, threads, readahead)
 ```

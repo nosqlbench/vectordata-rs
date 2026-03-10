@@ -1,7 +1,7 @@
 // Copyright (c) DataStax, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Pipeline commands: fvec-extract, ivec-extract, hvec-extract, and slab-extract.
+//! Pipeline commands: fvec-extract, ivec-extract, mvec-extract, and slab-extract.
 //!
 //! `fvec-extract`: Extracts vectors from an fvec file using indices from an
 //! ivec file. Each index in the ivec is a 1-dimensional record whose value
@@ -9,7 +9,7 @@
 //!
 //! `ivec-extract`: Extracts a range of records from an ivec file.
 //!
-//! `hvec-extract`: Extracts a range of records from an hvec (half-precision
+//! `mvec-extract`: Extracts a range of records from an mvec (half-precision
 //! float16) file.
 //!
 //! `slab-extract`: Extracts and reorders records from a slab file using indices
@@ -483,44 +483,44 @@ Supports range specifications in the format `[start,end)` or `start..end`.
     }
 }
 
-// ---- hvec-extract -----------------------------------------------------------
+// ---- mvec-extract -----------------------------------------------------------
 
-/// Pipeline command: extract records from an hvec (f16) file.
+/// Pipeline command: extract records from an mvec (f16) file.
 ///
 /// Supports two modes:
 /// - **Index-based**: provide `ivec-file` containing indices; each index selects
-///   a vector from the hvec source. `range` selects which ivec entries to use.
+///   a vector from the mvec source. `range` selects which ivec entries to use.
 /// - **Range-based**: omit `ivec-file`; `range` selects a contiguous range of
-///   hvec records directly.
-pub struct GenerateHvecExtractOp;
+///   mvec records directly.
+pub struct GenerateMvecExtractOp;
 
-pub fn hvec_factory() -> Box<dyn CommandOp> {
-    Box::new(GenerateHvecExtractOp)
+pub fn mvec_factory() -> Box<dyn CommandOp> {
+    Box::new(GenerateMvecExtractOp)
 }
 
-impl CommandOp for GenerateHvecExtractOp {
+impl CommandOp for GenerateMvecExtractOp {
     fn command_path(&self) -> &str {
-        "transform hvec-extract"
+        "transform mvec-extract"
     }
 
     fn command_doc(&self) -> CommandDoc {
         let options = self.describe_options();
         CommandDoc {
-            summary: "Extract a subset of vectors from an hvec file".into(),
-            body: format!(r#"# transform hvec-extract
+            summary: "Extract a subset of vectors from an mvec file".into(),
+            body: format!(r#"# transform mvec-extract
 
-Extract a subset of vectors from an hvec file.
+Extract a subset of vectors from an mvec file.
 
 ## Description
 
-Extracts vectors from an hvec (half-precision float16) file. Two modes:
+Extracts vectors from an mvec (half-precision float16) file. Two modes:
 
 **Index-based** (with `ivec-file`): Each index in the ivec is a 1-dimensional
-record whose value selects a vector from the hvec source. The `range` parameter
+record whose value selects a vector from the mvec source. The `range` parameter
 controls which entries of the ivec to use.
 
 **Range-based** (without `ivec-file`): Extracts a contiguous range of records
-from the hvec file directly.
+from the mvec file directly.
 
 Supports range specifications in the format `[start,end)` or `start..end`.
 
@@ -540,7 +540,7 @@ Supports range specifications in the format `[start,end)` or `start..end`.
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
         let start = Instant::now();
 
-        let hvec_str = match options.require("hvec-file") {
+        let mvec_str = match options.require("mvec-file") {
             Ok(s) => s,
             Err(e) => return error_result(e, start),
         };
@@ -549,7 +549,7 @@ Supports range specifications in the format `[start,end)` or `start..end`.
             Err(e) => return error_result(e, start),
         };
 
-        let hvec_path = resolve_path(hvec_str, &ctx.workspace);
+        let mvec_path = resolve_path(mvec_str, &ctx.workspace);
         let output_path = resolve_path(output_str, &ctx.workspace);
         let ivec_path = options.get("ivec-file").map(|s| resolve_path(s, &ctx.workspace));
 
@@ -561,21 +561,21 @@ Supports range specifications in the format `[start,end)` or `start..end`.
             None => Range { start: 0, end: None },
         };
 
-        // Open the hvec file
-        let hvec_reader = match MmapVectorReader::<half::f16>::open_hvec(&hvec_path) {
+        // Open the mvec file
+        let mvec_reader = match MmapVectorReader::<half::f16>::open_mvec(&mvec_path) {
             Ok(r) => r,
             Err(e) => {
                 return error_result(
-                    format!("failed to open hvec file {}: {}", hvec_path.display(), e),
+                    format!("failed to open mvec file {}: {}", mvec_path.display(), e),
                     start,
                 )
             }
         };
 
-        let hvec_count =
-            <MmapVectorReader<half::f16> as VectorReader<half::f16>>::count(&hvec_reader);
+        let mvec_count =
+            <MmapVectorReader<half::f16> as VectorReader<half::f16>>::count(&mvec_reader);
         let dim =
-            <MmapVectorReader<half::f16> as VectorReader<half::f16>>::dim(&hvec_reader) as u32;
+            <MmapVectorReader<half::f16> as VectorReader<half::f16>>::dim(&mvec_reader) as u32;
 
         // Create output directory
         if let Some(parent) = output_path.parent() {
@@ -599,7 +599,7 @@ Supports range specifications in the format `[start,end)` or `start..end`.
         let mut writer = std::io::BufWriter::with_capacity(1 << 20, file);
 
         if let Some(ref ivec_p) = ivec_path {
-            // Index-based extraction: read indices from ivec, look up vectors in hvec.
+            // Index-based extraction: read indices from ivec, look up vectors in mvec.
             //
             // Optimization: sort indices by source position to convert random I/O
             // into sequential I/O, then write each vector at its correct output
@@ -626,8 +626,8 @@ Supports range specifications in the format `[start,end)` or `start..end`.
                 );
             }
             let effective_end = std::cmp::min(range_end, ivec_count);
-            let result = sorted_index_extract_hvec(
-                &hvec_reader, hvec_count, dim,
+            let result = sorted_index_extract_mvec(
+                &mvec_reader, mvec_count, dim,
                 &ivec_reader, range_start, effective_end,
                 &output_path, ctx, start,
             );
@@ -641,29 +641,29 @@ Supports range specifications in the format `[start,end)` or `start..end`.
                 Err(e) => error_result(e, start),
             }
         } else {
-            // Range-based extraction: contiguous range from hvec
+            // Range-based extraction: contiguous range from mvec
             let range_start = range.start;
-            let range_end = range.end.unwrap_or(hvec_count);
-            let effective_end = std::cmp::min(range_end, hvec_count);
+            let range_end = range.end.unwrap_or(mvec_count);
+            let effective_end = std::cmp::min(range_end, mvec_count);
 
-            if range_start >= hvec_count {
+            if range_start >= mvec_count {
                 return error_result(
                     format!(
-                        "range start {} exceeds hvec count {}",
-                        range_start, hvec_count
+                        "range start {} exceeds mvec count {}",
+                        range_start, mvec_count
                     ),
                     start,
                 );
             }
 
-            let pb = ctx.ui.bar((effective_end - range_start) as u64, "extracting hvec");
+            let pb = ctx.ui.bar((effective_end - range_start) as u64, "extracting mvec");
             let mut count: u64 = 0;
             for i in range_start..effective_end {
-                let vec = match hvec_reader.get(i) {
+                let vec = match mvec_reader.get(i) {
                     Ok(v) => v,
                     Err(e) => {
                         return error_result(
-                            format!("failed to read hvec[{}]: {}", i, e),
+                            format!("failed to read mvec[{}]: {}", i, e),
                             start,
                         )
                     }
@@ -686,7 +686,7 @@ Supports range specifications in the format `[start,end)` or `start..end`.
             CommandResult {
                 status: Status::Ok,
                 message: format!(
-                    "extracted {} hvec records (range [{}..{})) to {}",
+                    "extracted {} mvec records (range [{}..{})) to {}",
                     count, range_start, effective_end, output_path.display()
                 ),
                 produced: vec![output_path],
@@ -698,11 +698,11 @@ Supports range specifications in the format `[start,end)` or `start..end`.
     fn describe_options(&self) -> Vec<OptionDesc> {
         vec![
             OptionDesc {
-                name: "hvec-file".to_string(),
+                name: "mvec-file".to_string(),
                 type_name: "Path".to_string(),
                 required: true,
                 default: None,
-                description: "Source hvec file".to_string(),
+                description: "Source mvec file".to_string(),
             },
             OptionDesc {
                 name: "ivec-file".to_string(),
@@ -716,14 +716,14 @@ Supports range specifications in the format `[start,end)` or `start..end`.
                 type_name: "Path".to_string(),
                 required: true,
                 default: None,
-                description: "Output hvec file".to_string(),
+                description: "Output mvec file".to_string(),
             },
             OptionDesc {
                 name: "range".to_string(),
                 type_name: "String".to_string(),
                 required: false,
                 default: None,
-                description: "Range: [start,end) or start..end. Applies to ivec entries (index mode) or hvec records (range mode)".to_string(),
+                description: "Range: [start,end) or start..end. Applies to ivec entries (index mode) or mvec records (range mode)".to_string(),
             },
         ]
     }
@@ -762,7 +762,7 @@ of the ivec to use. This mode reorders the output to match the ivec permutation.
 Use this to maintain ordinal correspondence between metadata and shuffled
 vector files. For example, if base vectors were extracted from a shuffled
 order, the same shuffle + range must be applied to metadata so that
-`metadata.slab[i]` corresponds to `base_vectors.hvec[i]`.
+`metadata.slab[i]` corresponds to `base_vectors.mvec[i]`.
 
 **Range-based** (without `ivec-file`): Extracts a contiguous range of records
 from the slab file directly.
@@ -1076,7 +1076,7 @@ fn half_system_ram() -> u64 {
     }
 }
 
-/// Partitioned-pass extraction for hvec files.
+/// Partitioned-pass extraction for mvec files.
 ///
 /// For each output partition:
 /// 1. Scan the ivec (just integers) to find entries whose output position
@@ -1090,9 +1090,9 @@ fn half_system_ram() -> u64 {
 /// Both reads and writes are sequential. The ivec scan per pass is cheap
 /// (integer range check only). Source data is only read for records in the
 /// current partition.
-fn sorted_index_extract_hvec(
-    hvec_reader: &MmapVectorReader<half::f16>,
-    hvec_count: usize,
+fn sorted_index_extract_mvec(
+    mvec_reader: &MmapVectorReader<half::f16>,
+    mvec_count: usize,
     dim: u32,
     ivec_reader: &MmapVectorReader<i32>,
     range_start: usize,
@@ -1115,7 +1115,7 @@ fn sorted_index_extract_hvec(
     let partition_size = (extract_count + num_partitions - 1) / num_partitions;
 
     ctx.ui.log(&format!(
-        "hvec-extract: {} vectors, {} bytes/record, {} passes (budget: {:.1} GiB, {:.0} MB/partition)",
+        "mvec-extract: {} vectors, {} bytes/record, {} passes (budget: {:.1} GiB, {:.0} MB/partition)",
         extract_count, record_bytes, num_partitions,
         mem_budget as f64 / (1024.0 * 1024.0 * 1024.0),
         (partition_size * record_bytes) as f64 / (1024.0 * 1024.0),
@@ -1161,8 +1161,8 @@ fn sorted_index_extract_hvec(
             let index_vec = ivec_reader.get(i)
                 .map_err(|e| format!("failed to read ivec[{}]: {}", i, e))?;
             let source_idx = index_vec[0] as usize;
-            if source_idx >= hvec_count {
-                return Err(format!("index {} at ivec[{}] exceeds hvec count {}", source_idx, i, hvec_count));
+            if source_idx >= mvec_count {
+                return Err(format!("index {} at ivec[{}] exceeds mvec count {}", source_idx, i, mvec_count));
             }
             read_plan.push((source_idx, local_pos));
             if (local_pos + 1) % 100_000 == 0 { scan_pb.set_position((local_pos + 1) as u64); }
@@ -1173,7 +1173,7 @@ fn sorted_index_extract_hvec(
         // Distribute into buckets in parallel, sort each bucket in
         // parallel, then flatten with prefix-sum offsets.
         let num_buckets = 256usize;
-        let bucket_range = (hvec_count / num_buckets).max(1);
+        let bucket_range = (mvec_count / num_buckets).max(1);
 
         let dist_pb = ctx.ui.bar(read_plan.len() as u64, &format!("bucketing {} entries{}", read_plan.len(), pass_label(pass)));
         let thread_buckets: Vec<Vec<Vec<(usize, usize)>>>;
@@ -1247,10 +1247,10 @@ fn sorted_index_extract_hvec(
         // Step 3: Read source data in parallel, placing each record at its
         // transpose position in the buffer. Each local_pos is unique, so
         // concurrent writes to part_buf are safe (disjoint regions).
-        let read_pb = ctx.ui.bar(read_plan.len() as u64, &format!("reading+transposing hvec{}", pass_label(pass)));
+        let read_pb = ctx.ui.bar(read_plan.len() as u64, &format!("reading+transposing mvec{}", pass_label(pass)));
         let part_buf_len = part_len * record_bytes;
         part_buf[..part_buf_len].fill(0);
-        hvec_reader.advise_sequential();
+        mvec_reader.advise_sequential();
 
         {
             use rayon::prelude::*;
@@ -1260,8 +1260,8 @@ fn sorted_index_extract_hvec(
             let shared_buf = SharedBuf::new(&mut part_buf);
 
             let result: Result<(), String> = read_plan.par_iter().try_for_each(|&(source_idx, local_pos)| {
-                let vector = hvec_reader.get(source_idx)
-                    .map_err(|e| format!("failed to read hvec[{}]: {}", source_idx, e))?;
+                let vector = mvec_reader.get(source_idx)
+                    .map_err(|e| format!("failed to read mvec[{}]: {}", source_idx, e))?;
 
                 let buf_offset = local_pos * record_bytes;
                 let dest = unsafe { shared_buf.slice_mut(buf_offset, record_bytes) };
@@ -1307,7 +1307,7 @@ fn sorted_index_extract_hvec(
         write_pb.finish();
 
         log::debug!(
-            "hvec-extract: pass {}/{}, wrote {} records ({:.1} MB)",
+            "mvec-extract: pass {}/{}, wrote {} records ({:.1} MB)",
             pass + 1, num_partitions, read_plan.len(), write_mb,
         );
 
@@ -1316,14 +1316,14 @@ fn sorted_index_extract_hvec(
     out_file.sync_all().map_err(|e| format!("sync failed: {}", e))?;
 
     Ok(format!(
-        "extracted {} hvec vectors by index (ivec range [{}..{}), {} passes) to {}",
+        "extracted {} mvec vectors by index (ivec range [{}..{}), {} passes) to {}",
         extract_count, range_start, effective_end, num_partitions, output_path.display()
     ))
 }
 
 /// Partitioned-pass extraction for fvec files.
 ///
-/// Same algorithm as hvec: for each output partition, scan ivec to build
+/// Same algorithm as mvec: for each output partition, scan ivec to build
 /// a read plan, sort by source position, read sequentially, write contiguously.
 fn sorted_index_extract_fvec(
     fvec_reader: &MmapVectorReader<f32>,
@@ -1870,7 +1870,7 @@ mod tests {
     }
 
     #[test]
-    fn test_hvec_extract_range() {
+    fn test_mvec_extract_range() {
         use crate::pipeline::command::StreamContext;
         use crate::pipeline::progress::ProgressLog;
         use crate::pipeline::commands::gen_vectors::GenerateVectorsOp;
@@ -1897,9 +1897,9 @@ mod tests {
         };
 
         // Generate 50 f16 vectors of dimension 8
-        let hvec_path = workspace.join("source.hvec");
+        let mvec_path = workspace.join("source.mvec");
         let mut opts = Options::new();
-        opts.set("output", hvec_path.to_string_lossy().to_string());
+        opts.set("output", mvec_path.to_string_lossy().to_string());
         opts.set("dimension", "8");
         opts.set("count", "50");
         opts.set("seed", "42");
@@ -1909,12 +1909,12 @@ mod tests {
         assert_eq!(r.status, Status::Ok);
 
         // Extract first 10 records
-        let out_path = workspace.join("extracted.hvec");
+        let out_path = workspace.join("extracted.mvec");
         let mut opts = Options::new();
-        opts.set("hvec-file", hvec_path.to_string_lossy().to_string());
+        opts.set("mvec-file", mvec_path.to_string_lossy().to_string());
         opts.set("output", out_path.to_string_lossy().to_string());
         opts.set("range", "[0,10)");
-        let mut ext = GenerateHvecExtractOp;
+        let mut ext = GenerateMvecExtractOp;
         let r = ext.execute(&opts, &mut ctx);
         assert_eq!(r.status, Status::Ok);
 
@@ -1923,8 +1923,8 @@ mod tests {
         assert_eq!(size, 10 * (4 + 8 * 2));
 
         // Verify extracted vectors match originals
-        let orig = MmapVectorReader::<half::f16>::open_hvec(&hvec_path).unwrap();
-        let extracted = MmapVectorReader::<half::f16>::open_hvec(&out_path).unwrap();
+        let orig = MmapVectorReader::<half::f16>::open_mvec(&mvec_path).unwrap();
+        let extracted = MmapVectorReader::<half::f16>::open_mvec(&out_path).unwrap();
         assert_eq!(
             <MmapVectorReader<half::f16> as VectorReader<half::f16>>::count(&extracted),
             10
@@ -1939,7 +1939,7 @@ mod tests {
     }
 
     #[test]
-    fn test_hvec_extract_by_index() {
+    fn test_mvec_extract_by_index() {
         use crate::pipeline::command::StreamContext;
         use crate::pipeline::progress::ProgressLog;
         use crate::pipeline::commands::gen_vectors::GenerateVectorsOp;
@@ -1967,9 +1967,9 @@ mod tests {
         };
 
         // Generate 20 f16 vectors of dimension 8
-        let hvec_path = workspace.join("source.hvec");
+        let mvec_path = workspace.join("source.mvec");
         let mut opts = Options::new();
-        opts.set("output", hvec_path.to_string_lossy().to_string());
+        opts.set("output", mvec_path.to_string_lossy().to_string());
         opts.set("dimension", "8");
         opts.set("count", "20");
         opts.set("seed", "42");
@@ -1989,13 +1989,13 @@ mod tests {
         assert_eq!(r.status, Status::Ok);
 
         // Extract first 5 vectors using shuffle indices
-        let out_path = workspace.join("extracted.hvec");
+        let out_path = workspace.join("extracted.mvec");
         let mut opts = Options::new();
-        opts.set("hvec-file", hvec_path.to_string_lossy().to_string());
+        opts.set("mvec-file", mvec_path.to_string_lossy().to_string());
         opts.set("ivec-file", ivec_path.to_string_lossy().to_string());
         opts.set("output", out_path.to_string_lossy().to_string());
         opts.set("range", "[0,5)");
-        let mut ext = GenerateHvecExtractOp;
+        let mut ext = GenerateMvecExtractOp;
         let r = ext.execute(&opts, &mut ctx);
         assert_eq!(r.status, Status::Ok);
 
@@ -2004,8 +2004,8 @@ mod tests {
         assert_eq!(size, 5 * (4 + 8 * 2));
 
         // Verify extracted vectors match shuffled originals
-        let orig = MmapVectorReader::<half::f16>::open_hvec(&hvec_path).unwrap();
-        let extracted = MmapVectorReader::<half::f16>::open_hvec(&out_path).unwrap();
+        let orig = MmapVectorReader::<half::f16>::open_mvec(&mvec_path).unwrap();
+        let extracted = MmapVectorReader::<half::f16>::open_mvec(&out_path).unwrap();
         let shuffle = MmapVectorReader::<i32>::open_ivec(&ivec_path).unwrap();
         assert_eq!(
             <MmapVectorReader<half::f16> as VectorReader<half::f16>>::count(&extracted),

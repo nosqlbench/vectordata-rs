@@ -123,7 +123,7 @@ sort            # Sort vectors by ordinal mapping
 $ veks pipeline generate <TAB>
 derive              # Derive new facets from existing data
 fvec-extract        # Extract a subset of vectors from an fvec file
-hvec-extract        # Extract a subset of vectors from an hvec file
+mvec-extract        # Extract a subset of vectors from an mvec file
 ivec-extract        # Extract a subset of vectors from an ivec file
 metadata-indices      # Evaluate predicates against metadata to produce match ordinals
 predicates          # Generate random predicate trees from metadata survey
@@ -147,8 +147,8 @@ option's description from `describe_options()`:
 
 ```
 $ veks pipeline compute knn --<TAB>
---base          # Path to base vector file (fvec/hvec)
---query         # Path to query vector file (fvec/hvec)
+--base          # Path to base vector file (fvec/mvec)
+--query         # Path to query vector file (fvec/mvec)
 --indices       # Output path for neighbor indices (ivec)
 --distances     # Output path for neighbor distances (fvec)
 --neighbors     # Number of neighbors to compute (default: 100)
@@ -184,7 +184,7 @@ $ veks pipeline compute knn --neighbors <TAB>
 
 ```
 $ veks pipeline compute knn --base <TAB>
-# Path to base vector file (fvec/hvec) (type: Path)
+# Path to base vector file (fvec/mvec) (type: Path)
 <file completions follow>
 ```
 

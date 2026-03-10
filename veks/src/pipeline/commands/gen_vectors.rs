@@ -329,7 +329,7 @@ fn generate_xvec_u8(
     Ok(())
 }
 
-/// Generate f16 vectors in hvec format.
+/// Generate f16 vectors in mvec format.
 fn generate_xvec_f16(
     output: &Path,
     dim: u32,

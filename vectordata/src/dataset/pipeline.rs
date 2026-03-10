@@ -242,7 +242,7 @@ steps:
         let yaml = r#"
 steps:
   - run: import
-    output: all.hvec
+    output: all.mvec
   - run: compute knn
     profiles: [default]
     output: gnd.ivec

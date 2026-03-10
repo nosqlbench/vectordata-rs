@@ -41,8 +41,8 @@ Key Java modules:
 | Feature | Status | Notes |
 |---------|--------|-------|
 | `dataset.yaml` parsing | **Done** | `dataset` crate: profiles, views, windows, aliases, custom facets |
-| Mmap vector readers (fvec, ivec, hvec) | **Done** | `MmapVectorReader<T>` with zero-copy slices, madvise |
-| HTTP Range vector readers | **Partial** | fvec, ivec only; no hvec; no connection pooling |
+| Mmap vector readers (fvec, ivec, mvec) | **Done** | `MmapVectorReader<T>` with zero-copy slices, madvise |
+| HTTP Range vector readers | **Partial** | fvec, ivec only; no mvec; no connection pooling |
 | `TestDataGroup::load()` | **Done** | Local path and HTTP URL |
 | `TestDataView` trait | **Partial** | Typed accessors for standard vector/index facets only |
 | Integration tests over HTTP | **Done** | `testserver` crate with Range support |
@@ -61,7 +61,7 @@ Key Java modules:
 | FacetDescriptor | **P1** | Low | 9.8 |
 | Download progress tracking | **P1** | Low | 9.6 |
 | Dataset metadata (distance_function, etc.) | **P1** | Low | 9.9 |
-| hvec HTTP reader | **P1** | Low | 9.9 |
+| mvec HTTP reader | **P1** | Low | 9.9 |
 | Token/template expansion in source URLs | **P2** | Low | 9.9 |
 | Chunk scheduling strategies | **P2** | Medium | 9.6 |
 
@@ -392,9 +392,9 @@ pub trait TestDataView: Send + Sync {
 
 ## 9.9 Additional Features
 
-### hvec HTTP reader
+### mvec HTTP reader
 
-Add `HttpVectorReader<half::f16>::open_hvec(url)` following the same
+Add `HttpVectorReader<half::f16>::open_mvec(url)` following the same
 pattern as the existing fvec/ivec readers. Entry size = `4 + dim * 2`.
 
 ### Dataset attributes
@@ -462,7 +462,7 @@ Priority: P2 — only needed when datasets use templated source URLs.
 - `FacetDescriptor` struct
 - `facet_manifest()` and `facet()` on `TestDataView`
 - `distance_function()` accessor
-- hvec HTTP reader
+- mvec HTTP reader
 - Update `GenericTestDataView` to use `CachedChannel` for remote access
 
 **Crate location:** `vectordata::view` + `vectordata::io`

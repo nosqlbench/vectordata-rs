@@ -372,7 +372,7 @@ pub fn infer_vtype(entry: &CatalogEntry) -> Option<String> {
 fn vtype_from_extension(path: &str) -> Option<String> {
     if path.ends_with(".fvec") || path.ends_with(".fvecs") {
         Some("float32".to_string())
-    } else if path.ends_with(".hvec") || path.ends_with(".hvecs") {
+    } else if path.ends_with(".mvec") || path.ends_with(".mvecs") {
         Some("float16".to_string())
     } else if path.ends_with(".bvec") || path.ends_with(".bvecs") {
         Some("uint8".to_string())
@@ -865,7 +865,7 @@ pub fn vtype_completer(current: &OsStr) -> Vec<CompletionCandidate> {
         .map(|v| {
             let help = match v.as_str() {
                 "float32" => Some("32-bit float (.fvec)"),
-                "float16" => Some("16-bit float (.hvec)"),
+                "float16" => Some("16-bit float (.mvec)"),
                 "uint8" => Some("8-bit unsigned int (.bvec)"),
                 "int32" => Some("32-bit signed int (.ivec)"),
                 "numpy" => Some("NumPy format (.npy)"),

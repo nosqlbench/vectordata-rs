@@ -9,7 +9,7 @@
 //!   - Header: 4 bytes (int32) representing the dimension.
 //!   - Data: Sequence of vectors, each starting with the dimension (4 bytes) followed by `dim` floats.
 //! - **ivec**: Similar to fvec but for 32-bit integers (used for ground truth indices).
-//! - **hvec**: A binary format for half-precision (f16) vectors.
+//! - **mvec**: A binary format for half-precision (f16) vectors.
 //!   - Header: 4 bytes (int32) representing the dimension.
 //!   - Data: Sequence of vectors, each starting with the dimension (4 bytes) followed by `dim` f16 values (2 bytes each).
 
@@ -329,8 +329,8 @@ impl VectorReader<i32> for MmapVectorReader<i32> {
 }
 
 impl MmapVectorReader<half::f16> {
-    /// Opens a local `.hvec` file for reading half-precision (f16) vectors.
-    pub fn open_hvec(path: &Path) -> Result<Self, IoError> {
+    /// Opens a local `.mvec` file for reading half-precision (f16) vectors.
+    pub fn open_mvec(path: &Path) -> Result<Self, IoError> {
         let file = File::open(path)?;
         let mmap = unsafe { Mmap::map(&file)? };
 
@@ -590,7 +590,7 @@ impl VectorReader<i32> for HttpVectorReader<i32> {
 
 impl HttpVectorReader<half::f16> {
     /// Opens a half-precision vector file from a URL.
-    pub fn open_hvec(url: Url) -> Result<Self, IoError> {
+    pub fn open_mvec(url: Url) -> Result<Self, IoError> {
         let client = Client::new();
 
         let resp = client.get(url.clone())

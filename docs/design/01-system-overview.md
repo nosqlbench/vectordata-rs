@@ -77,7 +77,7 @@ The shared foundation crate. Provides:
 - **`VectorReader<T>` trait** — uniform access to vector files by ordinal
   (`get_slice(index) → &[T]`, `count() → usize`, `dimension() → usize`)
 - **`MmapVectorReader<T>`** — memory-mapped implementation for xvec files
-  (fvec, ivec, hvec, etc.). Opens the file once, mmaps it, and provides O(1)
+  (fvec, ivec, mvec, etc.). Opens the file once, mmaps it, and provides O(1)
   random access to any vector by ordinal. Provides `get_slice()` for
   zero-copy access and `prefetch_range()` / `prefetch_pages()` with
   `MADV_WILLNEED` for page cache warming.
@@ -246,8 +246,8 @@ Observed from LAION-400M processing (407M vectors, 512 dimensions, f16):
 
 | Metric | Value |
 |--------|-------|
-| Base vectors file size | 418 GB (hvec) |
-| Query vectors file size | 418 GB (hvec) |
+| Base vectors file size | 418 GB (mvec) |
+| Query vectors file size | 418 GB (mvec) |
 | Metadata slab file size | 207 GB (407M MNode records) |
 | Metadata import time | ~250 seconds |
 | Base vector import time | ~280 seconds |

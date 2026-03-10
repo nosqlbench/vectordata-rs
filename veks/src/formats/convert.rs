@@ -4,7 +4,7 @@
 //! Element-type conversion for vector data (f16↔f32↔f64).
 //!
 //! When converting between xvec formats with different element sizes
-//! (e.g. hvec→fvec), raw bytes must be re-interpreted and widened or
+//! (e.g. mvec→fvec), raw bytes must be re-interpreted and widened or
 //! narrowed element-by-element. This module provides SIMD-accelerated
 //! conversion where available.
 //!

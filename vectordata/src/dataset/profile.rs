@@ -53,7 +53,7 @@
 //! profiles:
 //!   default:
 //!     maxk: 100
-//!     query_vectors: query_vectors.hvec
+//!     query_vectors: query_vectors.mvec
 //!   sized: [10m, 20m, 100m..400m/100m]
 //! ```
 //!
@@ -626,8 +626,8 @@ impl<'de> Deserialize<'de> for DSProfileGroup {
                 //    sized:
                 //      ranges: ["0m..400m/10m"]
                 //      facets:
-                //        base_vectors: "base_vectors.hvec:${range}"
-                //        query_vectors: query_vectors.hvec
+                //        base_vectors: "base_vectors.mvec:${range}"
+                //        query_vectors: query_vectors.mvec
                 //    ```
                 //
                 // In form 2, facet templates are interpolated per profile:
@@ -804,7 +804,7 @@ distances: gnd/dis.fvecs
         let yaml = r#"
 base_vectors: base.fvec
 model_profile: model.json
-sketch_vectors: sketch.hvec
+sketch_vectors: sketch.mvec
 "#;
         let p: DSProfile = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(p.views.len(), 3);
@@ -1160,11 +1160,11 @@ sized: [50m, 10m, 100m..300m/100m, 20m]
         let yaml = r#"
 default:
   maxk: 100
-  query_vectors: query_vectors.hvec
+  query_vectors: query_vectors.mvec
 sized:
   ranges: ["10m", "20m"]
   facets:
-    base_vectors: "base_vectors.hvec:${range}"
+    base_vectors: "base_vectors.mvec:${range}"
     metadata_content: "metadata.slab:${range}"
     neighbor_indices: "profiles/${profile}/neighbor_indices.ivec"
 "#;
@@ -1178,7 +1178,7 @@ sized:
 
         // base_vectors should have path + window from ${range}
         let bv = p10.view("base_vectors").unwrap();
-        assert_eq!(bv.source.path, "base_vectors.hvec");
+        assert_eq!(bv.source.path, "base_vectors.mvec");
         assert_eq!(bv.source.window.0.len(), 1);
         assert_eq!(bv.source.window.0[0].min_incl, 0);
         assert_eq!(bv.source.window.0[0].max_excl, 10_000_000);
@@ -1237,7 +1237,7 @@ sized: ["mul:1m..16m/2"]
 
         let yaml = r#"
 default:
-  query_vectors: query.hvec
+  query_vectors: query.mvec
 10m:
   base_count: 10000000
 "#;
@@ -1247,7 +1247,7 @@ default:
         let mut opts1 = IndexMap::new();
         opts1.insert(
             "output".to_string(),
-            serde_yaml::Value::String("base_vectors.hvec".to_string()),
+            serde_yaml::Value::String("base_vectors.mvec".to_string()),
         );
         let mut opts2 = IndexMap::new();
         opts2.insert(
@@ -1257,7 +1257,7 @@ default:
         let templates = vec![
             StepDef {
                 id: Some("extract".to_string()),
-                run: "generate hvec-extract".to_string(),
+                run: "generate mvec-extract".to_string(),
                 description: None,
                 after: vec![],
                 profiles: vec![],
@@ -1282,20 +1282,20 @@ default:
         let pdef = profiles.profile("default").unwrap();
         assert_eq!(
             pdef.view("base_vectors").unwrap().path(),
-            "profiles/default/base_vectors.hvec"
+            "profiles/default/base_vectors.mvec"
         );
         assert_eq!(
             pdef.view("neighbor_indices").unwrap().path(),
             "profiles/default/neighbor_indices.ivec"
         );
         // Explicit view preserved
-        assert_eq!(pdef.view("query_vectors").unwrap().path(), "query.hvec");
+        assert_eq!(pdef.view("query_vectors").unwrap().path(), "query.mvec");
 
         // Sized profile gets windowed views referencing default's files
         let p10 = profiles.profile("10m").unwrap();
         assert_eq!(
             p10.view("base_vectors").unwrap().path(),
-            "profiles/default/base_vectors.hvec"
+            "profiles/default/base_vectors.mvec"
         );
         assert!(!p10.view("base_vectors").unwrap().source.window.is_empty());
         assert_eq!(
@@ -1308,6 +1308,6 @@ default:
         );
         assert!(!p10.view("neighbor_indices").unwrap().source.window.is_empty());
         // Inherited shared view unchanged
-        assert_eq!(p10.view("query_vectors").unwrap().path(), "query.hvec");
+        assert_eq!(p10.view("query_vectors").unwrap().path(), "query.mvec");
     }
 }

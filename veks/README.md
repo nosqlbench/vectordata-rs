@@ -28,7 +28,7 @@ veks bulkdl downloads.yaml --concurrency 4
 
 ### convert
 
-Convert vector data between formats (fvec, ivec, bvec, dvec, hvec, svec, npy, parquet, slab).
+Convert vector data between formats (fvec, ivec, bvec, dvec, mvec, svec, npy, parquet, slab).
 
 ```sh
 veks convert --source base.npy --target base.fvec
@@ -97,7 +97,7 @@ veks completions bash > ~/.local/share/bash-completion/completions/veks
 | `.ivec` | integer vectors | 4 bytes (i32) |
 | `.bvec` | byte vectors | 4 bytes (u8 padded) |
 | `.dvec` | double vectors | 8 bytes (f64) |
-| `.hvec` | half-float vectors | 2 bytes (f16) |
+| `.mvec` | half-float vectors | 2 bytes (f16) |
 | `.svec` | short vectors | 2 bytes (i16) |
 | `.npy` | NumPy arrays | varies |
 | `.parquet` | Apache Parquet | varies |

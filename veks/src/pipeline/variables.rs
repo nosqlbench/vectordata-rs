@@ -9,7 +9,7 @@
 //! implicit variables.
 //!
 //! Variables can be set by:
-//! - The `set variable` command (expressions like `count:file.hvec`)
+//! - The `set variable` command (expressions like `count:file.mvec`)
 //! - Direct editing of `variables.yaml`
 //!
 //! Load priority (last wins):
@@ -81,7 +81,7 @@ pub fn set_and_save(dataset_dir: &Path, name: &str, value: &str) -> Result<(), S
 /// Evaluate an expression to a string value.
 ///
 /// Supported expressions:
-/// - `count:<path>` — record count of a vector file (fvec/hvec/ivec) or slab
+/// - `count:<path>` — record count of a vector file (fvec/mvec/ivec) or slab
 /// - `dim:<path>` — dimension of a vector file
 /// - `<literal>` — used as-is
 pub fn evaluate_expr(expr: &str, workspace: &Path) -> Result<String, String> {
@@ -109,8 +109,8 @@ fn count_file(path: &Path) -> Result<String, String> {
                 .map_err(|e| format!("failed to open {}: {}", path.display(), e))?;
             Ok((<MmapVectorReader<f32> as VectorReader<f32>>::count(&reader)).to_string())
         }
-        "hvec" => {
-            let reader = MmapVectorReader::<half::f16>::open_hvec(path)
+        "mvec" => {
+            let reader = MmapVectorReader::<half::f16>::open_mvec(path)
                 .map_err(|e| format!("failed to open {}: {}", path.display(), e))?;
             Ok((<MmapVectorReader<half::f16> as VectorReader<half::f16>>::count(&reader)).to_string())
         }
@@ -139,8 +139,8 @@ fn dim_file(path: &Path) -> Result<String, String> {
                 .map_err(|e| format!("failed to open {}: {}", path.display(), e))?;
             Ok((<MmapVectorReader<f32> as VectorReader<f32>>::dim(&reader)).to_string())
         }
-        "hvec" => {
-            let reader = MmapVectorReader::<half::f16>::open_hvec(path)
+        "mvec" => {
+            let reader = MmapVectorReader::<half::f16>::open_mvec(path)
                 .map_err(|e| format!("failed to open {}: {}", path.display(), e))?;
             Ok((<MmapVectorReader<half::f16> as VectorReader<half::f16>>::dim(&reader)).to_string())
         }
@@ -197,18 +197,18 @@ mod tests {
     }
 
     #[test]
-    fn test_evaluate_count_hvec() {
+    fn test_evaluate_count_mvec() {
         use crate::pipeline::command::{Options, StreamContext};
         use crate::pipeline::commands::gen_vectors::GenerateVectorsOp;
         use crate::pipeline::command::CommandOp;
         use crate::pipeline::progress::ProgressLog;
 
         let tmp = tempfile::tempdir().unwrap();
-        let hvec_path = tmp.path().join("test.hvec");
+        let mvec_path = tmp.path().join("test.mvec");
 
         // Generate 50 f16 vectors
         let mut opts = Options::new();
-        opts.set("output", hvec_path.to_string_lossy().to_string());
+        opts.set("output", mvec_path.to_string_lossy().to_string());
         opts.set("dimension", "8");
         opts.set("count", "50");
         opts.set("seed", "42");
@@ -235,13 +235,13 @@ mod tests {
         op.execute(&opts, &mut ctx);
 
         let count = evaluate_expr(
-            &format!("count:{}", hvec_path.display()),
+            &format!("count:{}", mvec_path.display()),
             tmp.path(),
         ).unwrap();
         assert_eq!(count, "50");
 
         let dim = evaluate_expr(
-            &format!("dim:{}", hvec_path.display()),
+            &format!("dim:{}", mvec_path.display()),
             tmp.path(),
         ).unwrap();
         assert_eq!(dim, "8");

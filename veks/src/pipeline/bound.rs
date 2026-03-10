@@ -71,7 +71,7 @@ fn is_opaque_format(path: &Path) -> bool {
 fn check_format_specific(output: &Path, format: VecFormat, file_size: u64) -> ArtifactState {
     match format {
         VecFormat::Fvec | VecFormat::Ivec | VecFormat::Bvec
-        | VecFormat::Dvec | VecFormat::Hvec | VecFormat::Svec => {
+        | VecFormat::Dvec | VecFormat::Mvec | VecFormat::Svec => {
             check_xvec_completeness(file_size, format)
         }
         VecFormat::Slab => check_slab_completeness(output),

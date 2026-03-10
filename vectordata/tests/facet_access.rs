@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Integration tests for Phase 4: facet manifest, generic facet access,
-//! distance function, and hvec HTTP reader.
+//! distance function, and mvec HTTP reader.
 
 use std::fs;
 use std::io::Write;
@@ -36,8 +36,8 @@ fn write_ivec(path: &Path, dim: u32, count: u32) {
     }
 }
 
-/// Write a small hvec file with `count` vectors of dimension `dim`.
-fn write_hvec(path: &Path, dim: u32, count: u32) {
+/// Write a small mvec file with `count` vectors of dimension `dim`.
+fn write_mvec(path: &Path, dim: u32, count: u32) {
     let mut file = fs::File::create(path).unwrap();
     for i in 0..count {
         file.write_all(&(dim as i32).to_le_bytes()).unwrap();
@@ -55,7 +55,7 @@ fn setup_full_dataset() -> (tempfile::TempDir, TestServer) {
     write_fvec(&dir.path().join("query.fvec"), 4, 5);
     write_ivec(&dir.path().join("neighbors.ivec"), 3, 5);
     write_fvec(&dir.path().join("distances.fvec"), 3, 5);
-    write_hvec(&dir.path().join("base_f16.hvec"), 4, 10);
+    write_mvec(&dir.path().join("base_f16.mvec"), 4, 10);
 
     fs::write(
         dir.path().join("dataset.yaml"),
@@ -189,24 +189,24 @@ fn test_distance_function_absent() {
 }
 
 // ---------------------------------------------------------------------------
-// hvec HTTP reader
+// mvec HTTP reader
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_hvec_http_reader_metadata() {
+fn test_mvec_http_reader_metadata() {
     let (_dir, server) = setup_full_dataset();
-    let url = url::Url::parse(&format!("{}base_f16.hvec", server.base_url())).unwrap();
-    let reader = HttpVectorReader::<half::f16>::open_hvec(url).unwrap();
+    let url = url::Url::parse(&format!("{}base_f16.mvec", server.base_url())).unwrap();
+    let reader = HttpVectorReader::<half::f16>::open_mvec(url).unwrap();
 
     assert_eq!(reader.dim(), 4);
     assert_eq!(reader.count(), 10);
 }
 
 #[test]
-fn test_hvec_http_reader_get_vector() {
+fn test_mvec_http_reader_get_vector() {
     let (_dir, server) = setup_full_dataset();
-    let url = url::Url::parse(&format!("{}base_f16.hvec", server.base_url())).unwrap();
-    let reader = HttpVectorReader::<half::f16>::open_hvec(url).unwrap();
+    let url = url::Url::parse(&format!("{}base_f16.mvec", server.base_url())).unwrap();
+    let reader = HttpVectorReader::<half::f16>::open_mvec(url).unwrap();
 
     let v0 = reader.get(0).unwrap();
     assert_eq!(v0.len(), 4);
@@ -217,10 +217,10 @@ fn test_hvec_http_reader_get_vector() {
 }
 
 #[test]
-fn test_hvec_http_reader_last_vector() {
+fn test_mvec_http_reader_last_vector() {
     let (_dir, server) = setup_full_dataset();
-    let url = url::Url::parse(&format!("{}base_f16.hvec", server.base_url())).unwrap();
-    let reader = HttpVectorReader::<half::f16>::open_hvec(url).unwrap();
+    let url = url::Url::parse(&format!("{}base_f16.mvec", server.base_url())).unwrap();
+    let reader = HttpVectorReader::<half::f16>::open_mvec(url).unwrap();
 
     let v9 = reader.get(9).unwrap();
     assert_eq!(v9[0], half::f16::from_f32(36.0));
@@ -228,10 +228,10 @@ fn test_hvec_http_reader_last_vector() {
 }
 
 #[test]
-fn test_hvec_http_reader_out_of_bounds() {
+fn test_mvec_http_reader_out_of_bounds() {
     let (_dir, server) = setup_full_dataset();
-    let url = url::Url::parse(&format!("{}base_f16.hvec", server.base_url())).unwrap();
-    let reader = HttpVectorReader::<half::f16>::open_hvec(url).unwrap();
+    let url = url::Url::parse(&format!("{}base_f16.mvec", server.base_url())).unwrap();
+    let reader = HttpVectorReader::<half::f16>::open_mvec(url).unwrap();
 
     assert!(reader.get(10).is_err());
 }

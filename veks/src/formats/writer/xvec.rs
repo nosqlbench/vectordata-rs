@@ -18,7 +18,7 @@ const WRITE_BUF_SIZE: usize = 4 << 20;
 /// and release the previous range's now-clean pages via `FADV_DONTNEED`.
 const WRITEBACK_INTERVAL: u64 = 64 << 20; // 64 MiB
 
-/// Writes any xvec format (fvec, ivec, bvec, dvec, hvec, svec).
+/// Writes any xvec format (fvec, ivec, bvec, dvec, mvec, svec).
 ///
 /// Wire format per record: `[dimension: i32 LE][elements: dim * element_size bytes]`
 ///

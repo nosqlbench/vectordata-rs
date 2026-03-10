@@ -460,7 +460,7 @@ dataset-scale. Organized by category:
 | `generate derive` | Derives new facets from existing large files |
 | `transform fvec-extract` | Reads from arbitrarily large source vectors |
 | `transform ivec-extract` | Reads from arbitrarily large source vectors |
-| `transform hvec-extract` | Reads from arbitrarily large source vectors |
+| `transform mvec-extract` | Reads from arbitrarily large source vectors |
 
 **Analyze commands** — open and read dataset-scale files:
 
@@ -914,7 +914,7 @@ idle and memory is in the NOMINAL band, it grants additional threads.
 
 **Example 3: Extract (I/O bound, sequential read)**
 
-The `transform hvec-extract` command uses sorted-index extraction. The
+The `transform mvec-extract` command uses sorted-index extraction. The
 sequential read pattern benefits from increased readahead:
 
 ```rust

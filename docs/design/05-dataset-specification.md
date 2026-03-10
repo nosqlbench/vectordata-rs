@@ -82,18 +82,18 @@ upstream:
   steps:
     - id: import-all          # shared: runs for every profile
       run: import
-      output: all_vectors.hvec
+      output: all_vectors.mvec
 
     - id: extract-base        # default only
-      run: transform hvec-extract
+      run: transform mvec-extract
       profiles: [default]
-      output: base_vectors.hvec
+      output: base_vectors.mvec
       range: "[10000,${vector_count})"
 
     - id: extract-base-10M    # 10M only
-      run: transform hvec-extract
+      run: transform mvec-extract
       profiles: [10M]
-      output: 10M/base_vectors.hvec
+      output: 10M/base_vectors.mvec
       range: "[10000,10010000)"
 ```
 
@@ -121,8 +121,8 @@ Recognized facet keys and their preferred output formats:
 
 | Facet key | Preferred format | Description |
 |-----------|-----------------|-------------|
-| `base_vectors` | fvec/hvec | Corpus vectors |
-| `query_vectors` | fvec/hvec | Query vectors |
+| `base_vectors` | fvec/mvec | Corpus vectors |
+| `query_vectors` | fvec/mvec | Query vectors |
 | `neighbor_indices` | ivec | Ground-truth neighbor indices |
 | `neighbor_distances` | fvec | Ground-truth neighbor distances |
 | `metadata_content` | slab (MNode) | Per-vector metadata records |
@@ -356,7 +356,7 @@ with a list of size specifications:
 profiles:
   default:
     maxk: 100
-    query_vectors: query_vectors.hvec
+    query_vectors: query_vectors.mvec
   sized: [10m, 20m, 100m..400m/100m]
 ```
 
@@ -451,11 +451,11 @@ profile:
 profiles:
   default:
     maxk: 100
-    query_vectors: query_vectors.hvec
+    query_vectors: query_vectors.mvec
   sized:
     ranges: ["10m", "20m"]
     facets:
-      base_vectors: "base_vectors.hvec:${range}"
+      base_vectors: "base_vectors.mvec:${range}"
       metadata_content: "metadata.slab:${range}"
       neighbor_indices: "profiles/${profile}/neighbor_indices.ivec"
 ```
@@ -482,14 +482,14 @@ patterns — some windowed into a shared file, others stored per-profile.
 profiles:
   default:
     maxk: 100
-    base_vectors: base_vectors.hvec
-    query_vectors: query_vectors.hvec
+    base_vectors: base_vectors.mvec
+    query_vectors: query_vectors.mvec
     neighbor_indices: neighbor_indices.ivec
 
   sized: [10m, 20m, 100m..300m/100m]
 
   custom-queries:
-    query_vectors: alt_queries.hvec
+    query_vectors: alt_queries.mvec
     neighbor_indices: alt_indices.ivec
 ```
 
@@ -536,7 +536,7 @@ upstream:
     - id: upcast-base
       run: convert file
       after: [import-base]
-      source: base_vectors.hvec
+      source: base_vectors.mvec
       output: ${scratch}/upcast-base.fvec
       to: fvec
 ```
@@ -579,8 +579,8 @@ upstream:
     - id: compute-filtered-knn
       run: compute filtered-knn
       after: [import-base, import-query, compute-predicates]
-      base: base_vectors.hvec
-      query: query_vectors_10k.hvec
+      base: base_vectors.mvec
+      query: query_vectors_10k.mvec
       metadata-indices: metadata_indices.slab
       indices: filtered_neighbor_indices.ivec
       distances: filtered_neighbor_distances.fvec
@@ -635,8 +635,8 @@ dataset-name/
 ├── .cache/                         # Persistent intermediates (NOT disposable)
 │   ├── compute-knn.part_*.cache    # KNN partition caches
 │   └── compute-predicates.seg_*    # Predicate evaluation segment caches
-├── base_vectors.hvec               # Output facets
-├── query_vectors.hvec
+├── base_vectors.mvec               # Output facets
+├── query_vectors.mvec
 ├── neighbor_indices.ivec
 ├── neighbor_distances.fvec
 ├── metadata_content.slab
@@ -815,7 +815,7 @@ Each record is:
 | `.ivec` | i32 (signed) | 4 bytes | `4 + dim × 4` |
 | `.bvec` | u8 | 1 byte | `4 + dim × 1` |
 | `.dvec` | f64 (IEEE 754) | 8 bytes | `4 + dim × 8` |
-| `.hvec` | f16 (IEEE 754) | 2 bytes | `4 + dim × 2` |
+| `.mvec` | f16 (IEEE 754) | 2 bytes | `4 + dim × 2` |
 | `.svec` | i16 (signed) | 2 bytes | `4 + dim × 2` |
 
 **Key properties**:
@@ -954,7 +954,7 @@ facet, the manifest reports:
 |-------|-------------|
 | `name` | Canonical facet key (after alias resolution) |
 | `source_path` | File path from the view |
-| `source_type` | Inferred format (from file extension: `fvec`, `ivec`, `hvec`, `slab`, etc.) |
+| `source_type` | Inferred format (from file extension: `fvec`, `ivec`, `mvec`, `slab`, etc.) |
 | `is_standard` | Whether this matches one of the 10 standard facets |
 
 This enables "discover then load" patterns where a client enumerates
@@ -972,7 +972,7 @@ A conforming dataset access implementation must support:
 | Profile inheritance from `default` | Yes | Views + `maxk`, not `base_count` |
 | Window parsing (all range forms + suffixes) | Yes | All forms per §5.3 |
 | Windowed record access | Yes | Single and multi-interval |
-| xvec format reading (fvec, ivec at minimum) | Yes | hvec, bvec, dvec, svec recommended |
+| xvec format reading (fvec, ivec at minimum) | Yes | mvec, bvec, dvec, svec recommended |
 | Custom facet preservation | Yes | Non-standard keys pass through |
 | Remote manifest fetch (HTTP GET) | Recommended | Required for remote datasets |
 | Remote data access (HTTP Range) | Recommended | Required for remote datasets |

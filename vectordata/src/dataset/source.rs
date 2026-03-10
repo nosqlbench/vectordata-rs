@@ -829,9 +829,9 @@ window: "0..1000"
 
     #[test]
     fn test_source_mixed_with_interpolated_number() {
-        // Simulates post-interpolation: "base.hvec[0..407000000)"
-        let s = parse_source_string("base.hvec[0..407000000)").unwrap();
-        assert_eq!(s.path, "base.hvec");
+        // Simulates post-interpolation: "base.mvec[0..407000000)"
+        let s = parse_source_string("base.mvec[0..407000000)").unwrap();
+        assert_eq!(s.path, "base.mvec");
         assert_eq!(s.window.0[0].min_incl, 0);
         assert_eq!(s.window.0[0].max_excl, 407_000_000);
     }

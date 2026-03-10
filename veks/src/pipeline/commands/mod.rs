@@ -66,7 +66,7 @@ pub fn register_all(registry: &mut CommandRegistry) {
     registry.register("generate ivec-shuffle", gen_shuffle::factory);
     registry.register("transform fvec-extract", gen_extract::fvec_factory);
     registry.register("transform ivec-extract", gen_extract::ivec_factory);
-    registry.register("transform hvec-extract", gen_extract::hvec_factory);
+    registry.register("transform mvec-extract", gen_extract::mvec_factory);
     registry.register("transform slab-extract", gen_extract::slab_factory);
     registry.register("generate sketch", gen_sketch::factory);
     registry.register("generate from-model", gen_from_model::factory);

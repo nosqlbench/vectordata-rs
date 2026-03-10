@@ -6,7 +6,7 @@
 //! Reads a vector file header and reports format, dimensions, vector count,
 //! file size, element type, and optional sample vectors.
 //!
-//! Supports xvec formats: fvec (f32), ivec (i32), bvec (u8), dvec (f64), hvec (f16).
+//! Supports xvec formats: fvec (f32), ivec (i32), bvec (u8), dvec (f64), mvec (f16).
 //!
 //! Equivalent to the Java `CMD_info_file` command.
 
@@ -50,7 +50,7 @@ fn probe_file(path: &Path) -> Result<FileInfo, String> {
         "ivec" => ("int32", 4),
         "bvec" => ("uint8", 1),
         "dvec" => ("float64", 8),
-        "hvec" => ("float16", 2),
+        "mvec" => ("float16", 2),
         _ => return Err(format!("unknown vector format: '.{}'", ext)),
     };
 
@@ -156,7 +156,7 @@ fn read_samples(
                     ]);
                     format!("{:.6}", v)
                 }
-                "hvec" => {
+                "mvec" => {
                     let bits = u16::from_le_bytes([data[pos], data[pos + 1]]);
                     format!("0x{:04x}", bits)
                 }
@@ -192,7 +192,7 @@ impl CommandOp for InfoFileOp {
                  ## Description\n\n\
                  Reads a vector file header and reports format, dimensions, vector count, \
                  file size, element type, and optional sample vectors. Supports xvec formats: \
-                 fvec, ivec, bvec, dvec, hvec.\n\n\
+                 fvec, ivec, bvec, dvec, mvec.\n\n\
                  ## Options\n\n{}",
                 render_options_table(&options)
             ),

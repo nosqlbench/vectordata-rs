@@ -37,7 +37,7 @@ pub enum VecFormat {
     Ivec,
     Bvec,
     Dvec,
-    Hvec,
+    Mvec,
     Svec,
     Slab,
 }
@@ -52,7 +52,7 @@ impl VecFormat {
             Self::Ivec => "ivec",
             Self::Bvec => "bvec",
             Self::Dvec => "dvec",
-            Self::Hvec => "hvec",
+            Self::Mvec => "mvec",
             Self::Svec => "svec",
             Self::Slab => "slab",
         }
@@ -62,7 +62,7 @@ impl VecFormat {
     pub fn is_xvec(self) -> bool {
         matches!(
             self,
-            Self::Fvec | Self::Ivec | Self::Bvec | Self::Dvec | Self::Hvec | Self::Svec
+            Self::Fvec | Self::Ivec | Self::Bvec | Self::Dvec | Self::Mvec | Self::Svec
         )
     }
 
@@ -71,7 +71,7 @@ impl VecFormat {
         match self {
             Self::Fvec | Self::Ivec | Self::Bvec => 4,
             Self::Dvec => 8,
-            Self::Hvec | Self::Svec => 2,
+            Self::Mvec | Self::Svec => 2,
             Self::Npy | Self::Parquet | Self::Slab => 0,
         }
     }
@@ -86,7 +86,7 @@ impl VecFormat {
             "ivec" | "ivecs" => Some(Self::Ivec),
             "bvec" | "bvecs" => Some(Self::Bvec),
             "dvec" | "dvecs" => Some(Self::Dvec),
-            "hvec" | "hvecs" => Some(Self::Hvec),
+            "mvec" | "mvecs" => Some(Self::Mvec),
             "svec" | "svecs" => Some(Self::Svec),
             _ => None,
         }
@@ -179,7 +179,7 @@ impl VecFormat {
             Self::Ivec => "int",
             Self::Bvec => "byte",
             Self::Dvec => "double",
-            Self::Hvec => "half",
+            Self::Mvec => "half",
             Self::Svec => "short",
             Self::Slab => "bytes",
             Self::Npy => "float",
@@ -196,7 +196,7 @@ impl VecFormat {
                 | Self::Ivec
                 | Self::Bvec
                 | Self::Dvec
-                | Self::Hvec
+                | Self::Mvec
                 | Self::Svec
         )
     }

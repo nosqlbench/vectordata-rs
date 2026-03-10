@@ -49,7 +49,7 @@ Each command implements:
 | `generate ivec-shuffle` | Generate shuffled ordinal permutation | Memory: full ordinal array |
 | `transform fvec-extract` | Extract vector subset | I/O-bound |
 | `transform ivec-extract` | Extract index subset | I/O-bound |
-| `transform hvec-extract` | Extract half-precision subset | I/O-bound |
+| `transform mvec-extract` | Extract half-precision subset | I/O-bound |
 | `generate sketch` | Generate vector sketches | CPU |
 | `generate from-model` | Generate vectors from an ML model | CPU + GPU |
 | `generate dataset` | Generate synthetic dataset | Mixed |

@@ -1,7 +1,7 @@
 // Copyright (c) DataStax, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Profiling harness for hvec→fvec conversion.
+//! Profiling harness for mvec→fvec conversion.
 //!
 //! Replicates the convert pipeline's actual allocation and threading
 //! patterns to diagnose progressive slowdowns. Prints per-interval
@@ -29,7 +29,7 @@ const CHANNEL_BUF: usize = 4096;
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
-        eprintln!("Usage: profile_convert <input.hvec> <output.fvec> [max_records] [mode]");
+        eprintln!("Usage: profile_convert <input.mvec> <output.fvec> [max_records] [mode]");
         eprintln!("  mode: reuse | alloc | channel (default: channel)");
         std::process::exit(1);
     }
@@ -47,7 +47,7 @@ fn main() {
 
     // Read dimension from first record
     let dim = reader.read_i32::<LittleEndian>().expect("read dim") as u32;
-    let src_elem: usize = 2; // hvec = f16
+    let src_elem: usize = 2; // mvec = f16
     let dst_elem: usize = 4; // fvec = f32
     let src_record_bytes = dim as usize * src_elem;
     let dst_record_bytes = dim as usize * dst_elem;

@@ -218,7 +218,7 @@ profiles:
   default:
     base_vectors: base.fvec
     model_profile: model.json
-    sketch_vectors: sketch.hvec
+    sketch_vectors: sketch.mvec
 "#;
         let config: DatasetConfig = serde_yaml::from_str(yaml).unwrap();
         let errors = config.validate(Path::new("."));
@@ -332,7 +332,7 @@ profiles:
     base_vectors: base.fvec
     query_vectors: query.fvec
     model_profile: model.json
-    sketch_vectors: sketch.hvec
+    sketch_vectors: sketch.mvec
 "#;
         let config: DatasetConfig = serde_yaml::from_str(yaml).unwrap();
         let standard = config.standard_facet_keys();

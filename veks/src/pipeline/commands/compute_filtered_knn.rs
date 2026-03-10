@@ -522,7 +522,7 @@ enum ElementType { F32, F16 }
 
 fn detect_element_type(path: &Path) -> ElementType {
     match path.extension().and_then(|e| e.to_str()) {
-        Some("hvec") => ElementType::F16,
+        Some("mvec") => ElementType::F16,
         _ => ElementType::F32,
     }
 }
@@ -683,8 +683,8 @@ merge combines per-partition top-K into the global top-K for each query.
 
     fn describe_options(&self) -> Vec<OptionDesc> {
         vec![
-            opt("base", "Path", true, None, "Base vectors file (fvec or hvec)"),
-            opt("query", "Path", true, None, "Query vectors file (fvec or hvec)"),
+            opt("base", "Path", true, None, "Base vectors file (fvec or mvec)"),
+            opt("query", "Path", true, None, "Query vectors file (fvec or mvec)"),
             opt("metadata-indices", "Path", true, None, "Metadata-indices slab from compute predicates"),
             opt("indices", "Path", true, None, "Output neighbor indices (ivec)"),
             opt("distances", "Path", false, None, "Output neighbor distances (fvec)"),
@@ -780,12 +780,12 @@ fn execute_f16(
     start: Instant,
 ) -> CommandResult {
     ctx.ui.log(&format!("  opening base vectors: {}", base_path.display()));
-    let base_reader = match MmapVectorReader::<half::f16>::open_hvec(base_path) {
+    let base_reader = match MmapVectorReader::<half::f16>::open_mvec(base_path) {
         Ok(r) => Arc::new(r),
         Err(e) => return error_result(format!("open base: {}", e), start),
     };
     ctx.ui.log(&format!("  opening query vectors: {}", query_path.display()));
-    let query_reader = match MmapVectorReader::<half::f16>::open_hvec(query_path) {
+    let query_reader = match MmapVectorReader::<half::f16>::open_mvec(query_path) {
         Ok(r) => r,
         Err(e) => return error_result(format!("open query: {}", e), start),
     };

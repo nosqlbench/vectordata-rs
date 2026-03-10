@@ -27,7 +27,7 @@ pub struct FacetDescriptor {
     pub name: String,
     /// Source file path or filename.
     pub source_path: Option<String>,
-    /// Inferred source format type (e.g., "fvec", "ivec", "hvec", "slab").
+    /// Inferred source format type (e.g., "fvec", "ivec", "mvec", "slab").
     pub source_type: Option<String>,
     /// Matching StandardFacet if this is a recognized standard facet.
     pub standard_kind: Option<StandardFacet>,
@@ -43,7 +43,7 @@ impl FacetDescriptor {
     fn infer_type(source: &str) -> Option<String> {
         let ext = source.rsplit('.').next()?;
         match ext {
-            "fvec" | "ivec" | "hvec" | "slab" | "json" | "parquet" | "npy" => {
+            "fvec" | "ivec" | "mvec" | "slab" | "json" | "parquet" | "npy" => {
                 Some(ext.to_string())
             }
             _ => None,

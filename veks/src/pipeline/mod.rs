@@ -1340,17 +1340,17 @@ mod tests {
     fn test_expand_per_profile_basic() {
         let profiles = test_profile_group(r#"
 default:
-  base_vectors: base.hvec
+  base_vectors: base.mvec
 10M:
   base_count: 10000000
 "#);
         let steps = vec![
-            make_step("shared", "import", vec![], vec![("output", "all.hvec")]),
+            make_step("shared", "import", vec![], vec![("output", "all.mvec")]),
             make_per_profile_step(
                 "extract",
-                "generate hvec-extract",
+                "generate mvec-extract",
                 vec!["shared"],
-                vec![("output", "${profile_dir}base.hvec"), ("range", "[${query_count},${base_end})")],
+                vec![("output", "${profile_dir}base.mvec"), ("range", "[${query_count},${base_end})")],
             ),
         ];
         let expanded = expand_per_profile_steps(steps, &profiles, 10_000);
@@ -1360,14 +1360,14 @@ default:
         assert_eq!(expanded[1].effective_id(), "extract-10M");
         // Check variable resolution in options
         let output = expanded[1].output_path().unwrap();
-        assert_eq!(output, "profiles/10M/base.hvec");
+        assert_eq!(output, "profiles/10M/base.mvec");
         let range_val = expanded[1].options.get("range").unwrap().as_str().unwrap();
         assert_eq!(range_val, "[10000,10010000)");
         // Should be gated to 10M
         assert_eq!(expanded[1].profiles, vec!["10M"]);
         assert_eq!(expanded[2].effective_id(), "extract");
         assert_eq!(expanded[2].profiles, vec!["default"]);
-        assert_eq!(expanded[2].output_path().unwrap(), "profiles/default/base.hvec");
+        assert_eq!(expanded[2].output_path().unwrap(), "profiles/default/base.mvec");
     }
 
     #[test]
@@ -1375,17 +1375,17 @@ default:
         // Test that bare filenames get auto-prefixed without ${profile_dir}
         let profiles = test_profile_group(r#"
 default:
-  base_vectors: base.hvec
+  base_vectors: base.mvec
 10M:
   base_count: 10000000
 "#);
         let steps = vec![
-            make_per_profile_step("extract", "generate hvec-extract", vec![], vec![
-                ("output", "base.hvec"),
+            make_per_profile_step("extract", "generate mvec-extract", vec![], vec![
+                ("output", "base.mvec"),
             ]),
             make_per_profile_step("knn", "compute knn", vec!["extract"], vec![
-                ("base", "base.hvec"),          // cross-ref to template output → prefixed
-                ("query", "query.hvec"),         // not a template output → unchanged
+                ("base", "base.mvec"),          // cross-ref to template output → prefixed
+                ("query", "query.mvec"),         // not a template output → unchanged
                 ("output", "gnd.ivec"),
             ]),
         ];
@@ -1396,9 +1396,9 @@ default:
         // Check 10M knn step
         let knn_10m = expanded.iter().find(|s| s.effective_id() == "knn-10M").unwrap();
         let base_val = knn_10m.options.get("base").unwrap().as_str().unwrap();
-        assert_eq!(base_val, "profiles/10M/base.hvec"); // auto-prefixed
+        assert_eq!(base_val, "profiles/10M/base.mvec"); // auto-prefixed
         let query_val = knn_10m.options.get("query").unwrap().as_str().unwrap();
-        assert_eq!(query_val, "query.hvec"); // not a template output, unchanged
+        assert_eq!(query_val, "query.mvec"); // not a template output, unchanged
         assert_eq!(knn_10m.output_path().unwrap(), "profiles/10M/gnd.ivec");
     }
 
@@ -1406,7 +1406,7 @@ default:
     fn test_expand_per_profile_multiple_profiles() {
         let profiles = test_profile_group(r#"
 default:
-  base_vectors: base.hvec
+  base_vectors: base.mvec
 10M:
   base_count: 10000000
 20M:
@@ -1433,16 +1433,16 @@ default:
     fn test_expand_per_profile_after_rewriting() {
         let profiles = test_profile_group(r#"
 default:
-  base_vectors: base.hvec
+  base_vectors: base.mvec
 10M:
   base_count: 10000000
 "#);
         let steps = vec![
-            make_per_profile_step("extract", "generate hvec-extract", vec![], vec![
-                ("output", "${profile_dir}base.hvec"),
+            make_per_profile_step("extract", "generate mvec-extract", vec![], vec![
+                ("output", "${profile_dir}base.mvec"),
             ]),
             make_per_profile_step("knn", "compute knn", vec!["extract", "shared-query"], vec![
-                ("base", "${profile_dir}base.hvec"),
+                ("base", "${profile_dir}base.mvec"),
             ]),
         ];
         let expanded = expand_per_profile_steps(steps, &profiles, 10_000);
@@ -1466,7 +1466,7 @@ default:
     fn test_expand_no_per_profile_returns_unchanged() {
         let profiles = test_profile_group(r#"
 default:
-  base_vectors: base.hvec
+  base_vectors: base.mvec
 10M:
   base_count: 10000000
 "#);
@@ -1483,11 +1483,11 @@ default:
         // Default profile gets per_profile expansion when no explicit steps exist
         let profiles = test_profile_group(r#"
 default:
-  base_vectors: base.hvec
+  base_vectors: base.mvec
 "#);
         let steps = vec![
-            make_per_profile_step("extract", "generate hvec-extract", vec![], vec![
-                ("output", "base.hvec"),
+            make_per_profile_step("extract", "generate mvec-extract", vec![], vec![
+                ("output", "base.mvec"),
             ]),
         ];
         let expanded = expand_per_profile_steps(steps, &profiles, 10_000);
@@ -1496,7 +1496,7 @@ default:
         assert_eq!(expanded[0].effective_id(), "extract");
         assert_eq!(expanded[0].profiles, vec!["default"]);
         // Output auto-prefixed with profiles/default/
-        assert_eq!(expanded[0].output_path().unwrap(), "profiles/default/base.hvec");
+        assert_eq!(expanded[0].output_path().unwrap(), "profiles/default/base.mvec");
     }
 
     #[test]
@@ -1504,16 +1504,16 @@ default:
         // When explicit default-gated steps exist, templates don't expand for default
         let profiles = test_profile_group(r#"
 default:
-  base_vectors: base.hvec
+  base_vectors: base.mvec
 10M:
   base_count: 10000000
 "#);
         let steps = vec![
-            make_step_with_profiles("extract", "generate hvec-extract", vec![], vec![
-                ("output", "profiles/default/base.hvec"),
+            make_step_with_profiles("extract", "generate mvec-extract", vec![], vec![
+                ("output", "profiles/default/base.mvec"),
             ], vec!["default"]),
-            make_per_profile_step("extract", "generate hvec-extract", vec![], vec![
-                ("output", "base.hvec"),
+            make_per_profile_step("extract", "generate mvec-extract", vec![], vec![
+                ("output", "base.mvec"),
             ]),
         ];
         let expanded = expand_per_profile_steps(steps, &profiles, 10_000);
@@ -1531,14 +1531,14 @@ default:
         // are auto-prefixed with the profile directory, not just "output".
         let profiles = test_profile_group(r#"
 default:
-  base_vectors: base.hvec
+  base_vectors: base.mvec
 10M:
   base_count: 10000000
 "#);
         let steps = vec![
             make_per_profile_step("knn", "compute knn", vec![], vec![
-                ("base", "base_vectors.hvec"),
-                ("query", "query_vectors.hvec"),
+                ("base", "base_vectors.mvec"),
+                ("query", "query_vectors.mvec"),
                 ("indices", "neighbor_indices.ivec"),
                 ("distances", "neighbor_distances.fvec"),
             ]),
@@ -1555,14 +1555,14 @@ default:
         assert_eq!(distances, "profiles/10M/neighbor_distances.fvec");
         // Non-output options should NOT be prefixed
         let query = knn_10m.options.get("query").unwrap().as_str().unwrap();
-        assert_eq!(query, "query_vectors.hvec");
+        assert_eq!(query, "query_vectors.mvec");
     }
 
     #[test]
     fn test_insert_profile_barriers() {
         let profiles = test_profile_group(r#"
 default:
-  base_vectors: base.hvec
+  base_vectors: base.mvec
 10M:
   base_count: 10000000
 20M:
@@ -1609,7 +1609,7 @@ default:
         // Pattern: import (shared) → survey (shared) → extract (per_profile) → evaluate (per_profile)
         let profiles = test_profile_group(r#"
 default:
-  base_vectors: base.hvec
+  base_vectors: base.mvec
 10M:
   base_count: 10000000
 "#);
@@ -1642,13 +1642,13 @@ default:
     fn test_derive_sized_profile_views() {
         let mut profiles = test_profile_group(r#"
 default:
-  query_vectors: query.hvec
+  query_vectors: query.mvec
 10M:
   base_count: 10000000
 "#);
         let templates = vec![
-            make_per_profile_step("extract", "generate hvec-extract", vec![], vec![
-                ("output", "base_vectors.hvec"),
+            make_per_profile_step("extract", "generate mvec-extract", vec![], vec![
+                ("output", "base_vectors.mvec"),
             ]),
             make_per_profile_step("knn", "compute knn", vec![], vec![
                 ("output", "neighbor_indices.ivec"),
@@ -1658,20 +1658,20 @@ default:
 
         // Default gets auto-derived views (no explicit base_vectors view)
         let pdef = profiles.profile("default").unwrap();
-        assert_eq!(pdef.view("base_vectors").unwrap().path(), "profiles/default/base_vectors.hvec");
+        assert_eq!(pdef.view("base_vectors").unwrap().path(), "profiles/default/base_vectors.mvec");
         assert_eq!(pdef.view("neighbor_indices").unwrap().path(), "profiles/default/neighbor_indices.ivec");
         // Explicit view preserved
-        assert_eq!(pdef.view("query_vectors").unwrap().path(), "query.hvec");
+        assert_eq!(pdef.view("query_vectors").unwrap().path(), "query.mvec");
 
         // Sized profile gets window-based views referencing default's files
         let p10 = profiles.profile("10M").unwrap();
-        assert_eq!(p10.view("base_vectors").unwrap().path(), "profiles/default/base_vectors.hvec");
+        assert_eq!(p10.view("base_vectors").unwrap().path(), "profiles/default/base_vectors.mvec");
         assert!(!p10.view("base_vectors").unwrap().source.window.is_empty());
         assert_eq!(p10.view("base_vectors").unwrap().source.window.0[0].max_excl, 10000000);
         assert_eq!(p10.view("neighbor_indices").unwrap().path(), "profiles/default/neighbor_indices.ivec");
         assert!(!p10.view("neighbor_indices").unwrap().source.window.is_empty());
         // Inherited shared view unchanged
-        assert_eq!(p10.view("query_vectors").unwrap().path(), "query.hvec");
+        assert_eq!(p10.view("query_vectors").unwrap().path(), "query.mvec");
     }
 
     #[test]

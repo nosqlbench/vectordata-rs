@@ -59,7 +59,7 @@ impl Facet {
     /// element size to select the correct xvec variant.
     ///
     /// For vector facets, the element size determines the xvec type:
-    /// 1 → bvec, 2 → hvec (IEEE 754 half), 4 → fvec, 8 → dvec.
+    /// 1 → bvec, 2 → mvec (IEEE 754 half), 4 → fvec, 8 → dvec.
     /// Index facets always use ivec. Metadata facets always use slab.
     pub fn preferred_format(self, element_size: usize) -> VecFormat {
         match self {
@@ -171,11 +171,11 @@ impl Facet {
 /// - ivec: 4 bytes (i32)
 /// - bvec: 4 bytes (i32 — "byte vectors stored as integers")
 /// - dvec: 8 bytes (f64)
-/// - hvec: 2 bytes (IEEE 754 half-precision f16)
+/// - mvec: 2 bytes (IEEE 754 half-precision f16)
 /// - svec: 2 bytes (i16)
 fn xvec_for_element_size(element_size: usize) -> VecFormat {
     match element_size {
-        2 => VecFormat::Hvec,
+        2 => VecFormat::Mvec,
         4 => VecFormat::Fvec,
         8 => VecFormat::Dvec,
         _ => VecFormat::Fvec, // fallback to f32
@@ -211,7 +211,7 @@ mod tests {
 
     #[test]
     fn test_preferred_formats_by_element_size() {
-        assert_eq!(Facet::BaseVectors.preferred_format(2), VecFormat::Hvec);
+        assert_eq!(Facet::BaseVectors.preferred_format(2), VecFormat::Mvec);
         assert_eq!(Facet::BaseVectors.preferred_format(4), VecFormat::Fvec);
         assert_eq!(Facet::BaseVectors.preferred_format(8), VecFormat::Dvec);
         // Index facets always ivec regardless of element size

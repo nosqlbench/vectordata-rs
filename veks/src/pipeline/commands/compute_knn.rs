@@ -6,8 +6,8 @@
 //! Computes ground truth KNN for a set of query vectors against a base vector
 //! set. Outputs both neighbor indices (ivec) and distances (fvec).
 //!
-//! Supports both f32 (fvec) and f16 (hvec) input formats. The element type is
-//! detected from the file extension of the base vectors path. When hvec files
+//! Supports both f32 (fvec) and f16 (mvec) input formats. The element type is
+//! detected from the file extension of the base vectors path. When mvec files
 //! are used, native f16 SIMD distance kernels operate directly on half-precision
 //! data without an explicit upcast to f32.
 //!
@@ -380,7 +380,7 @@ enum ElementType {
 /// Detect the vector element type from the file extension.
 fn detect_element_type(path: &Path) -> ElementType {
     match path.extension().and_then(|e| e.to_str()) {
-        Some("hvec") => ElementType::F16,
+        Some("mvec") => ElementType::F16,
         _ => ElementType::F32,
     }
 }
@@ -808,8 +808,8 @@ Brute-force exact K-nearest-neighbor ground truth computation.
 Computes ground truth KNN for a set of query vectors against a base vector
 set. Outputs both neighbor indices (ivec) and distances (fvec).
 
-Supports both f32 (fvec) and f16 (hvec) input formats. The element type is
-detected from the file extension of the base vectors path. When hvec files
+Supports both f32 (fvec) and f16 (mvec) input formats. The element type is
+detected from the file extension of the base vectors path. When mvec files
 are used, native f16 SIMD distance kernels operate directly on half-precision
 data without an explicit upcast to f32.
 
@@ -968,14 +968,14 @@ base-vector ranges.
                 type_name: "Path".to_string(),
                 required: true,
                 default: None,
-                description: "Base vectors file (fvec or hvec)".to_string(),
+                description: "Base vectors file (fvec or mvec)".to_string(),
             },
             OptionDesc {
                 name: "query".to_string(),
                 type_name: "Path".to_string(),
                 required: true,
                 default: None,
-                description: "Query vectors file (fvec or hvec)".to_string(),
+                description: "Query vectors file (fvec or mvec)".to_string(),
             },
             OptionDesc {
                 name: "indices".to_string(),
@@ -1150,7 +1150,7 @@ fn execute_f16(
     start: Instant,
 ) -> CommandResult {
     ctx.ui.log(&format!("  opening base vectors: {}", base_path.display()));
-    let base_reader = match MmapVectorReader::<half::f16>::open_hvec(base_path) {
+    let base_reader = match MmapVectorReader::<half::f16>::open_mvec(base_path) {
         Ok(r) => Arc::new(r),
         Err(e) => {
             return error_result(
@@ -1160,7 +1160,7 @@ fn execute_f16(
         }
     };
     ctx.ui.log(&format!("  opening query vectors: {}", query_path.display()));
-    let query_reader = match MmapVectorReader::<half::f16>::open_hvec(query_path) {
+    let query_reader = match MmapVectorReader::<half::f16>::open_mvec(query_path) {
         Ok(r) => r,
         Err(e) => {
             return error_result(

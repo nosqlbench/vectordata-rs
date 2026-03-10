@@ -25,12 +25,12 @@ const READ_DONTNEED_INTERVAL: u64 = 64 << 20; // 64 MiB
 
 /// Opens an xvec source, dispatching to `MmapVectorReader` for
 /// fvec/ivec (the canonical implementation) and falling back to a manual
-/// stream reader for bvec/dvec/hvec/svec.
+/// stream reader for bvec/dvec/mvec/svec.
 pub fn open_xvec(path: &Path, format: VecFormat) -> Result<Box<dyn VecSource>, String> {
     match format {
         VecFormat::Fvec => open_fvec(path),
         VecFormat::Ivec => open_ivec(path),
-        VecFormat::Bvec | VecFormat::Dvec | VecFormat::Hvec | VecFormat::Svec => {
+        VecFormat::Bvec | VecFormat::Dvec | VecFormat::Mvec | VecFormat::Svec => {
             RawXvecReader::open(path, format)
         }
         _ => Err(format!("{} is not an xvec format", format)),
@@ -193,9 +193,9 @@ impl VecSource for IvecReader {
     }
 }
 
-// -- bvec/dvec/hvec/svec manual reader -----------------------------------------
+// -- bvec/dvec/mvec/svec manual reader -----------------------------------------
 
-/// Reads xvec formats not yet supported by `vectordata` (bvec, dvec, hvec, svec).
+/// Reads xvec formats not yet supported by `vectordata` (bvec, dvec, mvec, svec).
 ///
 /// Wire format per record: `[dimension: i32 LE][elements: dim * element_size bytes]`
 ///
