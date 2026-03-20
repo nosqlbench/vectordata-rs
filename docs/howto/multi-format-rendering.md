@@ -7,9 +7,9 @@ This example shows the same MNode record rendered in every available vernacular
 format.
 
 ```rust
-use veks::formats::mnode::{MNode, MValue};
-use veks::formats::anode::ANode;
-use veks::formats::anode_vernacular::{self, Vernacular};
+use vectordata::formats::mnode::{MNode, MValue};
+use vectordata::formats::anode::ANode;
+use vectordata::formats::anode_vernacular::{self, Vernacular};
 
 let mut node = MNode::new();
 node.insert("name".into(), MValue::Text("alice".into()));

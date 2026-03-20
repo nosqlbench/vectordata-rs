@@ -1,48 +1,59 @@
 //! # Vector Data Tools
 //!
-//! This library provides tools for reading vector datasets defined by a `dataset.yaml` configuration file.
-//! It supports both local file system access and remote access via HTTP/HTTPS.
+//! A Rust library for reading and describing vector datasets defined by
+//! `dataset.yaml` configuration files. Supports local file system access
+//! (memory-mapped) and remote access via HTTP Range requests.
 //!
-//! ## Remote Dataset Access
+//! ## Key modules
 //!
-//! You can access datasets hosted on a remote server by providing an HTTP/HTTPS URL
-//! to `TestDataGroup::load`. The URL should point to a directory containing a `dataset.yaml`
-//! or directly to the `dataset.yaml` file. The library uses Range requests to efficiently
-//! read only the required vector data.
+//! - [`io`] — Vector readers for fvec, ivec, and mvec formats (mmap and HTTP).
+//! - [`dataset`] — Configuration parsing for `dataset.yaml`: profiles, facets,
+//!   pipelines, catalogs, and data source specifications.
+//! - [`formats`] — Wire codecs for structured metadata (MNode), predicate
+//!   trees (PNode), and the unified ANode wrapper.
+//! - [`merkle`] — Content-addressed verification for dataset integrity.
+//! - [`transport`] — HTTP transport layer for remote dataset access.
+//! - [`cache`] — Cached channel utilities for buffered data delivery.
+//!
+//! ## Quick start
 //!
 //! ```no_run
 //! use vectordata::TestDataGroup;
 //!
 //! fn main() -> anyhow::Result<()> {
-//!     // Load a dataset from a remote URL
-//!     // This URL should point to a dataset.yaml or a directory containing one.
-//!     let url = "https://example.com/datasets/glove-100/dataset.yaml";
-//!     let group = TestDataGroup::load(url)?;
+//!     // Load from a local path or remote URL
+//!     let group = TestDataGroup::load("https://example.com/datasets/glove-100/")?;
 //!
-//!     // Get a specific profile view (e.g., "default", "10k", etc.)
+//!     // Access a named profile (e.g., "default", "1M")
 //!     if let Some(view) = group.profile("default") {
-//!         // Access the base vectors
-//!         let base_vectors = view.base_vectors()?;
-//!         println!("Base vectors count: {}", base_vectors.count());
-//!         println!("Vector dimension: {}", base_vectors.dim());
+//!         let base = view.base_vectors()?;
+//!         println!("{} vectors, dim={}", base.count(), base.dim());
 //!
-//!         // Read the first vector
-//!         let first_vector = base_vectors.get(0)?;
-//!         println!("First vector: {:?}", first_vector);
+//!         let first = base.get(0)?;
+//!         println!("First vector: {:?}", first);
 //!     }
 //!
 //!     Ok(())
 //! }
 //! ```
 
+/// Cached channel utilities for buffered data delivery.
 pub mod cache;
+/// Dataset configuration model (profiles, facets, pipelines, catalogs).
 pub mod dataset;
+/// Wire format codecs: MNode, PNode, ANode.
 pub mod formats;
+/// Content-addressed verification for dataset integrity.
 pub mod merkle;
+/// HTTP transport layer for remote dataset access.
 pub mod transport;
+/// Core data models for `dataset.yaml` parsing.
 pub mod model;
+/// Vector I/O: fvec, ivec, mvec readers (mmap and HTTP).
 pub mod io;
+/// Profile views for accessing dataset components.
 pub mod view;
+/// High-level dataset loading and profile access.
 pub mod group;
 
 pub use group::TestDataGroup;
@@ -52,21 +63,28 @@ pub use io::VectorReader;
 
 use thiserror::Error;
 
-/// Top-level error type for the library.
+/// Top-level error type for the vectordata crate.
 #[derive(Error, Debug)]
 pub enum Error {
+    /// A vector I/O operation failed (read, mmap, HTTP fetch).
     #[error("Vector IO error: {0}")]
     VectorIo(#[from] crate::io::IoError),
+    /// The `dataset.yaml` file could not be read from disk or network.
     #[error("Failed to read dataset configuration: {0}")]
     ConfigIo(#[source] std::io::Error),
+    /// The `dataset.yaml` content is not valid YAML or does not match the schema.
     #[error("Failed to parse dataset configuration: {0}")]
     ConfigParse(#[from] serde_yaml::Error),
+    /// A URL string could not be parsed.
     #[error("Invalid URL: {0}")]
     UrlParse(#[from] url::ParseError),
+    /// An HTTP request to a remote dataset failed.
     #[error("HTTP request failed: {0}")]
     Http(#[from] reqwest::Error),
+    /// A required facet (e.g., `base_vectors`) is not defined in the profile.
     #[error("Required facet not defined: {0}")]
     MissingFacet(String),
+    /// Catch-all for errors that do not fit other variants.
     #[error("{0}")]
     Other(String),
 }

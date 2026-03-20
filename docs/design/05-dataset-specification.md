@@ -592,7 +592,7 @@ upstream:
 
 The pipeline automatically skips steps whose outputs are already complete:
 
-1. **Progress log check**: If `.upstream.progress.yaml` records the step
+1. **Progress log check**: If `.cache/.upstream.progress.yaml` records the step
    as OK with matching options and output sizes, skip immediately.
 
 2. **Artifact check**: If the progress log has no record but the output
@@ -630,9 +630,10 @@ network probes.
 ```
 dataset-name/
 ├── dataset.yaml                    # Dataset descriptor
-├── .upstream.progress.yaml         # Pipeline progress log
 ├── .scratch/                       # Temporary files (disposable after success)
 ├── .cache/                         # Persistent intermediates (NOT disposable)
+│   ├── .upstream.progress.yaml     # Pipeline progress log
+│   ├── .governor.log               # Resource governor log (JSON-line)
 │   ├── compute-knn.part_*.cache    # KNN partition caches
 │   └── compute-predicates.seg_*    # Predicate evaluation segment caches
 ├── base_vectors.mvec               # Output facets
@@ -986,7 +987,7 @@ A conforming dataset access implementation must support:
 
 | Language | Module | Scope |
 |----------|--------|-------|
-| Rust | `dataset` crate | YAML parsing, profiles, views, aliases, windows, sized expansion |
+| Rust | `vectordata::dataset` module | YAML parsing, profiles, views, aliases, windows, sized expansion |
 | Rust | `vectordata` crate | VectorReader trait, mmap/HTTP backends, facet manifest, Merkle |
 | Java | `datatools-vectordata` | Full access layer with Merkle, caching, transport |
 

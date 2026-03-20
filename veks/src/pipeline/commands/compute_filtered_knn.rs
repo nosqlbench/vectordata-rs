@@ -47,8 +47,8 @@ use vectordata::VectorReader;
 use vectordata::io::MmapVectorReader;
 
 use crate::pipeline::command::{
-    CommandDoc, CommandOp, CommandResult, OptionDesc, Options, ResourceDesc, Status, StreamContext,
-    render_options_table,
+    ArtifactManifest, CommandDoc, CommandOp, CommandResult, OptionDesc, Options, ResourceDesc,
+    Status, StreamContext, render_options_table,
 };
 use crate::pipeline::simd_distance::{self, Metric};
 use super::source_window::resolve_source;
@@ -545,14 +545,49 @@ Brute-force filtered KNN with metadata-index pre-filtering.
 ## Description
 
 A variant of `compute knn` that restricts each query's candidate set to
-the base vectors matching a pre-computed predicate. Uses the same
-base-vector partitioning, sequential I/O, prefetch, and caching strategy
-as `compute knn`.
+the base vectors matching a pre-computed predicate. Like `compute knn` it
+performs an exhaustive brute-force search, but instead of evaluating every
+base vector for every query it only considers the subset of base vectors
+whose metadata satisfies the query's predicate.
 
-For large base vector sets, the base space is split into partitions.
-Each partition is processed sequentially with a prefetch thread paging in
-upcoming partitions. Results are cached per partition. A cross-partition
-merge combines per-partition top-K into the global top-K for each query.
+### How Filtering Works
+
+Each query has an associated predicate (e.g., "category = shoes AND
+price < 100"). Before distance computation begins, the command loads a
+**metadata-indices** slab file — produced by the `compute predicates`
+command — that maps each query to the set of base-vector ordinals matching
+its predicate. During the distance scan, only those matching ordinals are
+evaluated; all other base vectors are skipped entirely.
+
+Queries whose predicate matches zero base vectors produce sentinel values
+(-1 for indices, infinity for distances) so that downstream evaluation can
+distinguish "no eligible neighbors" from "neighbors not found."
+
+### Partitioned Computation and Caching
+
+For large base vector sets, the base space is split into partitions. Each
+partition is processed sequentially with a prefetch thread paging in
+upcoming partitions. Per-partition top-K results are cached in `.cache/`,
+making runs resumable. A cross-partition merge combines per-partition top-K
+into the global top-K for each query — identical to the strategy used by
+`compute knn`.
+
+### Output Files
+
+The command produces two files:
+
+- **filtered_neighbor_indices.ivec** — for each query, the ordinal indices
+  of its K nearest neighbors among the base vectors that match the query's
+  predicate.
+- **filtered_neighbor_distances.fvec** — the corresponding distances.
+
+### Role in the Pipeline
+
+These output files serve as the ground truth for **filtered (predicated)
+ANN search**. They answer the question: "given this query and this filter,
+what are the true nearest neighbors?" ANN index implementations that
+support query-time metadata filtering are evaluated by comparing their
+results against this exact filtered ground truth.
 
 ## Options
 
@@ -693,6 +728,14 @@ merge combines per-partition top-K into the global top-K for each query.
             opt("threads", "int", false, Some("0"), "Thread count (0 = auto)"),
             opt("partition_size", "int", false, Some("1000000"), "Base vectors per partition for cache-backed computation"),
         ]
+    }
+
+    fn project_artifacts(&self, step_id: &str, options: &Options) -> ArtifactManifest {
+        crate::pipeline::command::manifest_from_keys(
+            step_id, self.command_path(), options,
+            &["base", "query", "metadata-indices"],
+            &["indices", "distances"],
+        )
     }
 }
 

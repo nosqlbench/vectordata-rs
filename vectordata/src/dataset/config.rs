@@ -59,8 +59,10 @@ pub struct DatasetAttributes {
     pub tags: IndexMap<String, String>,
 }
 
-/// A dataset.yaml configuration — describes profiles, views, and optionally
-/// a multi-step command stream pipeline.
+/// Top-level `dataset.yaml` configuration.
+///
+/// Describes the dataset name, attributes, profiles (view mappings), and an
+/// optional upstream pipeline for building the dataset from source data.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DatasetConfig {
     /// Dataset name.
@@ -88,7 +90,7 @@ pub struct DatasetConfig {
 }
 
 impl DatasetConfig {
-    /// Load from a YAML file.
+    /// Load a `DatasetConfig` from a YAML file on disk.
     pub fn load(path: &Path) -> Result<Self, String> {
         let content = std::fs::read_to_string(path)
             .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;

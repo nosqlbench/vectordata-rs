@@ -28,8 +28,8 @@ use vectordata::VectorReader;
 use vectordata::io::MmapVectorReader;
 
 use crate::pipeline::command::{
-    CommandDoc, CommandOp, CommandResult, OptionDesc, Options, ResourceDesc, Status, StreamContext,
-    render_options_table,
+    ArtifactManifest, CommandDoc, CommandOp, CommandResult, OptionDesc, Options, ResourceDesc,
+    Status, StreamContext, render_options_table,
 };
 
 // ---- fvec-extract -----------------------------------------------------------
@@ -56,9 +56,35 @@ Extract a subset of vectors from an fvec file.
 
 ## Description
 
-Extracts vectors from an fvec file using indices from an ivec file. Each
-index in the ivec is a 1-dimensional record whose value selects a vector
-from the fvec source. Supports range specifications to select a subset.
+Extracts f32 vectors from a source fvec file using index-based lookup.
+Each entry in the ivec file is a 1-dimensional record whose value is the
+ordinal of a vector to copy from the source fvec. The `range` parameter
+selects which entries of the ivec to use (not which source records to
+read). For example, `range=[0,1000)` reads the first 1000 ivec entries
+and copies the source vectors they reference.
+
+## Partitioned-pass extraction
+
+When the source file is too large to random-access efficiently, the
+extraction uses a partitioned-pass algorithm. The requested indices are
+sorted and bucketed into contiguous partitions of the source file. Each
+partition is read sequentially in a single pass, and the matching vectors
+are collected. Multiple passes over the source may be needed if the
+indices span the entire file, but each pass reads sequentially, which is
+far more efficient than scattered random reads on large datasets.
+
+## Role in dataset pipelines
+
+This is the workhorse of dataset splitting. After `generate ivec-shuffle`
+produces a random permutation, `fvec-extract` applies it to produce
+disjoint query and base vector sets:
+
+- Query set: `fvec-extract` with `range=[0,K)` on the shuffle ivec
+- Base set: `fvec-extract` with `range=[K,N)` on the shuffle ivec
+
+The same shuffle + range pattern is applied to metadata slabs via
+`slab-extract` so that ordinal correspondence is preserved across all
+facets of the dataset.
 
 ## Options
 
@@ -198,6 +224,14 @@ from the fvec source. Supports range specifications to select a subset.
             },
         ]
     }
+
+    fn project_artifacts(&self, step_id: &str, options: &Options) -> ArtifactManifest {
+        crate::pipeline::command::manifest_from_keys(
+            step_id, self.command_path(), options,
+            &["fvec-file", "ivec-file"],
+            &["output"],
+        )
+    }
 }
 
 // ---- ivec-extract -----------------------------------------------------------
@@ -231,16 +265,36 @@ Extract a subset of vectors from an ivec file.
 
 ## Description
 
-Extracts records from an ivec file. Two modes:
+Extracts records from an ivec file. Two modes are supported:
 
-**Index-based** (with `index-file`): Each index in the index ivec is a
-1-dimensional record whose value selects a record from the source ivec.
-The `range` parameter controls which entries of the index file to use.
+**Index-based** (with `index-file`): Each entry in the index ivec is a
+1-dimensional record whose value is the ordinal of a record to copy from
+the source ivec. The `range` parameter controls which entries of the
+index file to use -- it selects a window into the index array, not the
+source file. For example, `range=[0,1000)` uses the first 1000 index
+entries.
 
-**Range-based** (without `index-file`): Extracts a contiguous range of records
-from the ivec file directly.
+**Range-based** (without `index-file`): Extracts a contiguous slice of
+records from the source ivec directly. The `range` parameter specifies
+the half-open interval of source ordinals to copy.
 
-Supports range specifications in the format `[start,end)` or `start..end`.
+Ranges are specified as `[start,end)` or `start..end`.
+
+## Partitioned-pass extraction (index mode)
+
+For index-based extraction on datasets larger than RAM, the algorithm
+buckets the requested indices into partitions aligned to the source file
+layout. Each partition is read sequentially in a single pass, collecting
+the matching records. This avoids scattered random I/O and keeps memory
+usage bounded regardless of dataset size.
+
+## Role in dataset pipelines
+
+After `generate ivec-shuffle` produces a random permutation, ivec-extract
+can split an existing ivec (e.g. ground truth neighbor indices) into query
+and base portions using the same shuffle + range pattern applied to
+vector files. This ensures all facets of a dataset remain aligned by
+ordinal.
 
 ## Options
 
@@ -481,6 +535,14 @@ Supports range specifications in the format `[start,end)` or `start..end`.
             },
         ]
     }
+
+    fn project_artifacts(&self, step_id: &str, options: &Options) -> ArtifactManifest {
+        crate::pipeline::command::manifest_from_keys(
+            step_id, self.command_path(), options,
+            &["ivec-file"],
+            &["output"],
+        )
+    }
 }
 
 // ---- mvec-extract -----------------------------------------------------------
@@ -513,16 +575,42 @@ Extract a subset of vectors from an mvec file.
 
 ## Description
 
-Extracts vectors from an mvec (half-precision float16) file. Two modes:
+Extracts vectors from an mvec (half-precision float16) file. Two modes
+are supported:
 
-**Index-based** (with `ivec-file`): Each index in the ivec is a 1-dimensional
-record whose value selects a vector from the mvec source. The `range` parameter
-controls which entries of the ivec to use.
+**Index-based** (with `ivec-file`): Each entry in the ivec is a
+1-dimensional record whose value is the ordinal of a vector to copy from
+the mvec source. The `range` parameter controls which entries of the ivec
+to use -- it selects a window into the index array, not the source file.
+For example, `range=[K,N)` reads ivec entries K through N-1 and copies
+the corresponding source vectors.
 
-**Range-based** (without `ivec-file`): Extracts a contiguous range of records
-from the mvec file directly.
+**Range-based** (without `ivec-file`): Extracts a contiguous slice of
+records from the mvec file directly.
 
-Supports range specifications in the format `[start,end)` or `start..end`.
+Ranges are specified as `[start,end)` or `start..end`.
+
+## Partitioned-pass extraction (index mode)
+
+For index-based extraction on large datasets, the algorithm buckets the
+requested indices into partitions of the source file and reads each
+partition sequentially. This avoids scattered random I/O and keeps memory
+usage bounded. Multiple sequential passes over the source may be needed if
+the requested indices span the entire file, but each pass is a linear scan
+rather than random access.
+
+## Role in dataset pipelines
+
+This is typically the primary extract command for datasets stored in
+half-precision format. After `generate ivec-shuffle` produces a random
+permutation, mvec-extract splits the corpus vectors into disjoint query
+and base sets:
+
+- Query set: `mvec-extract` with `range=[0,K)` on the shuffle ivec
+- Base set: `mvec-extract` with `range=[K,N)` on the shuffle ivec
+
+The same shuffle + range is also applied to metadata via `slab-extract`
+so that `base_metadata.slab[i]` corresponds to `base_vectors.mvec[i]`.
 
 ## Options
 
@@ -727,6 +815,14 @@ Supports range specifications in the format `[start,end)` or `start..end`.
             },
         ]
     }
+
+    fn project_artifacts(&self, step_id: &str, options: &Options) -> ArtifactManifest {
+        crate::pipeline::command::manifest_from_keys(
+            step_id, self.command_path(), options,
+            &["mvec-file", "ivec-file"],
+            &["output"],
+        )
+    }
 }
 
 // ---- slab-extract -----------------------------------------------------------
@@ -753,21 +849,46 @@ Extract and reorder records from a slab file.
 
 ## Description
 
-Extracts records from a slab file. Two modes:
+Extracts and reorders records from a slab (structured metadata) file.
+Two modes are supported:
 
-**Index-based** (with `ivec-file`): Each index in the ivec selects a record
-from the source slab by ordinal. The `range` parameter controls which entries
-of the ivec to use. This mode reorders the output to match the ivec permutation.
+**Index-based** (with `ivec-file`): Each entry in the ivec selects a
+record from the source slab by ordinal position. The `range` parameter
+controls which entries of the ivec to use -- it selects a window into
+the index array, not the source slab. The output records are written in
+the order specified by the ivec, effectively reordering the slab to match
+a permutation.
 
-Use this to maintain ordinal correspondence between metadata and shuffled
-vector files. For example, if base vectors were extracted from a shuffled
-order, the same shuffle + range must be applied to metadata so that
-`metadata.slab[i]` corresponds to `base_vectors.mvec[i]`.
+**Range-based** (without `ivec-file`): Extracts a contiguous slice of
+records from the source slab directly, preserving their original order.
 
-**Range-based** (without `ivec-file`): Extracts a contiguous range of records
-from the slab file directly.
+Ranges are specified as `[start,end)` or `start..end`.
 
-Supports range specifications in the format `[start,end)` or `start..end`.
+## Maintaining ordinal correspondence
+
+The critical purpose of slab-extract is to keep metadata aligned with
+vectors after shuffling and splitting. When a dataset is split into query
+and base sets using a shuffle permutation, the same shuffle + range must
+be applied to the metadata slab so that ordinal correspondence is
+preserved: `base_metadata.slab[i]` describes `base_vectors.mvec[i]` (or
+`.fvec[i]`). Without this alignment, predicate evaluation and filtered
+KNN ground truth would reference the wrong metadata records.
+
+## Partitioned-pass extraction (index mode)
+
+For index-based extraction on datasets larger than RAM, the algorithm
+buckets the requested indices into contiguous partitions of the source
+slab and processes each partition in a sequential pass. This keeps memory
+usage bounded and avoids random I/O on multi-gigabyte metadata slabs.
+
+## Role in dataset pipelines
+
+After `generate ivec-shuffle` produces a permutation and vector extract
+commands split the corpus, slab-extract applies the identical shuffle +
+range to every metadata facet. A typical pipeline includes:
+
+- `slab-extract` with `range=[0,K)` to produce `query_metadata.slab`
+- `slab-extract` with `range=[K,N)` to produce `base_metadata.slab`
 
 ## Options
 
@@ -970,6 +1091,14 @@ Supports range specifications in the format `[start,end)` or `start..end`.
                 description: "Preferred page size for output slab".to_string(),
             },
         ]
+    }
+
+    fn project_artifacts(&self, step_id: &str, options: &Options) -> ArtifactManifest {
+        crate::pipeline::command::manifest_from_keys(
+            step_id, self.command_path(), options,
+            &["slab-file", "ivec-file"],
+            &["output"],
+        )
     }
 }
 

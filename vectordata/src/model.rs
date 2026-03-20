@@ -1,7 +1,9 @@
-//! Data models for parsing `dataset.yaml` configuration files.
+//! Legacy data model types for `dataset.yaml` parsing.
 //!
-//! This module defines the structures that map to the `dataset.yaml` file format used
-//! to describe vector datasets.
+//! This module contains the original [`DatasetConfig`], [`ProfileConfig`], and
+//! [`FacetConfig`] types used by [`TestDataGroup`](crate::group::TestDataGroup).
+//! The newer, richer configuration model lives in [`crate::dataset::config`] and
+//! [`crate::dataset::profile`].
 //!
 //! # Example `dataset.yaml`
 //!
@@ -12,20 +14,14 @@
 //!
 //! profiles:
 //!   default:
-//!     base_vectors: base.fvec
+//!     base_vectors: base.mvec
 //!     query_vectors: query.fvec
 //!     neighbor_indices: ground_truth.ivec
 //!     neighbor_distances: distances.fvec
-//!     metadata_content: meta.slab
-//!     metadata_predicates: predicates.slab
-//!     predicate_results: results.slab
-//!     metadata_layout: layout.slab
-//!     filtered_neighbor_indices: filtered_gt.ivec
-//!     filtered_neighbor_distances: filtered_dist.fvec
 //!
 //!   small:
 //!     base_vectors:
-//!       source: base.fvec
+//!       source: base.mvec
 //!       window: 0..1000
 //! ```
 

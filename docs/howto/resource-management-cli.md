@@ -47,17 +47,17 @@ veks pipeline compute knn \
 
 ## Reading the governor log
 
-After a pipeline run, inspect `.governor.log` for resource decisions:
+After a pipeline run, inspect `.cache/.governor.log` for resource decisions:
 
 ```sh
 # Show all throttle events
-grep '"type":"throttle"' .governor.log | jq .
+grep '"type":"throttle"' .cache/.governor.log | jq .
 
 # Show resource adjustments
-grep '"type":"decision"' .governor.log | jq '.resource, .old_value, .new_value, .reason'
+grep '"type":"decision"' .cache/.governor.log | jq '.resource, .old_value, .new_value, .reason'
 
 # Show RSS over time
-grep '"type":"observation"' .governor.log | jq '{ts: .ts, rss_pct: .rss_pct}'
+grep '"type":"observation"' .cache/.governor.log | jq '{ts: .ts, rss_pct: .rss_pct}'
 ```
 
 ## Resource value syntax examples

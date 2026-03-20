@@ -28,9 +28,9 @@ veks pipeline run --steps '
 ## From Rust code
 
 ```rust
-use veks::formats::anode::{self, ANode};
-use veks::formats::anode_vernacular::{self, Vernacular};
-use veks::formats::mnode::{MNode, MValue};
+use vectordata::formats::anode::{self, ANode};
+use vectordata::formats::anode_vernacular::{self, Vernacular};
+use vectordata::formats::mnode::{MNode, MValue};
 
 let mut node = MNode::new();
 node.insert("name".into(), MValue::Text("alice".into()));

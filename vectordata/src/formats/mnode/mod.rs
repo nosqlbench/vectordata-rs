@@ -39,34 +39,66 @@ use std::io::{self, Cursor, Read, Write};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use indexmap::IndexMap;
 
-/// A single typed value in an MNode field
+/// A single typed value in an MNode field.
+///
+/// Each variant maps to a [`TypeTag`] discriminant in the wire format.
+/// Scalar types carry their value directly; containers recurse.
 #[derive(Debug, Clone, PartialEq)]
 pub enum MValue {
+    /// UTF-8 text string.
     Text(String),
+    /// 64-bit signed integer.
     Int(i64),
+    /// 64-bit floating-point number.
     Float(f64),
+    /// Boolean value.
     Bool(bool),
+    /// Raw byte sequence.
     Bytes(Vec<u8>),
+    /// Null / absent value.
     Null,
+    /// Enum value represented as a string label.
     EnumStr(String),
+    /// Enum value represented as an ordinal.
     EnumOrd(i32),
+    /// Heterogeneous list of tagged values.
     List(Vec<MValue>),
+    /// Nested MNode (sub-record).
     Map(MNode),
+    /// ASCII-only string (validated on write).
     Ascii(String),
+    /// 32-bit signed integer.
     Int32(i32),
+    /// 16-bit signed integer.
     Short(i16),
+    /// 32-bit floating-point number.
     Float32(f32),
+    /// IEEE 754 half-precision float stored as raw `u16` bits.
     Half(u16),
+    /// Timestamp in milliseconds since Unix epoch.
     Millis(i64),
-    Nanos { epoch_seconds: i64, nano_adjust: i32 },
+    /// Timestamp with nanosecond precision.
+    Nanos { /// Seconds since Unix epoch.
+        epoch_seconds: i64,
+        /// Sub-second nanosecond adjustment.
+        nano_adjust: i32 },
+    /// Calendar date (ISO 8601 string).
     Date(String),
+    /// Time of day (ISO 8601 string).
     Time(String),
+    /// Date-time (ISO 8601 string).
     DateTime(String),
+    /// Version 1 UUID (time-based).
     UuidV1([u8; 16]),
+    /// Version 7 UUID (Unix epoch-based, sortable).
     UuidV7([u8; 16]),
+    /// ULID (Universally Unique Lexicographically Sortable Identifier).
     Ulid([u8; 16]),
+    /// Homogeneous typed array with element tag.
     Array(TypeTag, Vec<MValue>),
+    /// Unordered set of tagged values.
     Set(Vec<MValue>),
+    /// Map of tagged key-value pairs.
     TypedMap(Vec<(MValue, MValue)>),
 }
 
@@ -107,7 +139,7 @@ impl MValue {
         }
     }
 
-    /// Returns the type tag for this value
+    /// Returns the wire-format [`TypeTag`] for this value.
     pub fn tag(&self) -> TypeTag {
         match self {
             MValue::Text(_) => TypeTag::Text,
@@ -220,14 +252,14 @@ pub struct MNode {
 }
 
 impl MNode {
-    /// Create an empty MNode
+    /// Create an empty MNode with no fields.
     pub fn new() -> Self {
         MNode {
             fields: IndexMap::new(),
         }
     }
 
-    /// Add a field
+    /// Insert a named field, preserving insertion order.
     pub fn insert(&mut self, name: String, value: MValue) {
         self.fields.insert(name, value);
     }

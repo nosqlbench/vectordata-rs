@@ -160,7 +160,7 @@ Telemetry is published through two channels:
    so the TUI renders charts directly from structured data without
    re-parsing the text representation.
 
-2. **Governor log** (`.governor.log`) — JSON-line entries with
+2. **Governor log** (`.cache/.governor.log`) — JSON-line entries with
    observation, decision, throttle, request, and ignored records.
 
 ### REQ-RM-08: Configurable resource limits
@@ -810,7 +810,7 @@ they should archive the log before re-running the pipeline.
 
 #### Relation to progress log
 
-The progress log (`.upstream.progress.yaml`) records per-step *summary*
+The progress log (`.cache/.upstream.progress.yaml`) records per-step *summary*
 resource consumption (peak RSS, total I/O, CPU time). The governor log
 records the *detailed timeline* of observations and decisions within each
 step. Together they provide both the "what" and the "why" of resource usage.
@@ -944,7 +944,7 @@ elevated after a command's workload characteristics change.
 
 #### Logging
 
-Demand offers and governor responses are logged in `.governor.log`:
+Demand offers and governor responses are logged in `.cache/.governor.log`:
 
 ```json
 {
@@ -1017,13 +1017,13 @@ CPU resources).
 | REQ-RM-04 | 37 commands implement `describe_resources()` with resource declarations | **Done** |
 | REQ-RM-05 | Commands query `governor.current_or("threads", ...)` for thread count (compute knn, filtered-knn, gen metadata-indices, import, convert) | **Done** |
 | REQ-RM-06 | Segment caching formalized with **file-stem-based keys** for cross-profile reuse: compute predicates uses `.cache/{input_stem}.{pred_stem}.seg_{start}_{end}.predkeys.slab`; compute knn uses `.cache/{base_stem}.{query_stem}.range_{start}_{end}.k{k}.{metric}.{ext}`. Cache keys are derived from input file stems (not step IDs) so that overlapping ordinal ranges across profiles share cached segments. Profile barriers ensure smallest-to-largest execution order so cached segments are available for reuse. | **Done** |
-| REQ-RM-07 | Per-step `ResourceSummary` (peak RSS, CPU user/system seconds, I/O read/write bytes) captured by runner and stored in `.upstream.progress.yaml`; governor log writes JSON-line observation/decision/throttle/request/ignored entries | **Done** |
+| REQ-RM-07 | Per-step `ResourceSummary` (peak RSS, CPU user/system seconds, I/O read/write bytes) captured by runner and stored in `.cache/.upstream.progress.yaml`; governor log writes JSON-line observation/decision/throttle/request/ignored entries | **Done** |
 | REQ-RM-08 | `--resources` and `--governor` args on both `run_pipeline()` and per-command direct CLI; long-form resource aliases (e.g., `--mem`, `--readahead`) generated from `describe_resources()` with conflict avoidance; completion filtering shows only applicable resource types per command | **Done** |
 | REQ-RM-09 | Memory-aware segment/partition sizing: gen metadata-indices estimates per-segment memory from selectivity × predicates × 4B × threads and scales down if budget exceeded; compute knn estimates result set + page cache pressure and reduces partition_size accordingly | **Done** |
 | REQ-RM-10 | `MmapVectorReader` provides `advise_sequential()` (MADV_SEQUENTIAL), `prefetch_range()` / `prefetch_pages()` (MADV_WILLNEED), and `release_range()` (MADV_DONTNEED); compute knn uses sequential advice at start and releases completed partitions; gen metadata-indices has prefetch thread with MADV_WILLNEED per segment | **Done** |
 | REQ-RM-11 | Runner warns for >1 GiB files without resource declarations; 37 commands comply; runner logs ignored resources for budget items not declared by command | **Done** |
 | REQ-RM-12 | Background governor thread (`governor-bg`) monitors RSS vs mem ceiling, adjusts effective values, and sets throttle/emergency flags between checkpoint() calls; only started when explicit `--resources` with mem budget is provided; 3 built-in strategies (maximize, conservative, fixed) | **Done** |
-| REQ-RM-13 | `GovernorLog` writes to `.governor.log` with JSON-line entries including `Ignored` variant | **Done** |
+| REQ-RM-13 | `GovernorLog` writes to `.cache/.governor.log` with JSON-line entries including `Ignored` variant | **Done** |
 
 ## 6.6 Proposed Architecture: ResourceGovernor
 
@@ -1074,7 +1074,7 @@ StreamContext
      checkpoint
    - Uses a pluggable `GovernorStrategy` (default: `MaximizeUtilizationStrategy`)
    - Writes all observations, decisions, and throttle events to the
-     governor utilization log (`.governor.log`, see REQ-RM-13)
+     governor utilization log (`.cache/.governor.log`, see REQ-RM-13)
 
 6. **Dynamic completion**: `build_augmented_cli()` consults
    `describe_resources()` to populate per-command resource completions
@@ -1134,7 +1134,7 @@ framework.
 
 ### Post-mortem
 
-- Per-step resource usage in `.upstream.progress.yaml`:
+- Per-step resource usage in `.cache/.upstream.progress.yaml`:
   - peak RSS
   - total I/O (read + write bytes)
   - CPU time (user + system)

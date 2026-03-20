@@ -12,7 +12,7 @@ pub mod xvec;
 use std::path::Path;
 
 use super::VecFormat;
-use crate::import::Facet;
+use crate::formats::facet::Facet;
 
 /// Trait for reading vector records from a source format.
 ///

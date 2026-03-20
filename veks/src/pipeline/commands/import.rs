@@ -13,10 +13,10 @@ use std::time::Instant;
 use crate::formats::VecFormat;
 use crate::formats::reader;
 use crate::formats::writer::{self, SinkConfig};
-use crate::import::Facet;
+use crate::formats::facet::Facet;
 use crate::pipeline::command::{
-    CommandDoc, CommandOp, CommandResult, OptionDesc, Options, ResourceDesc, Status, StreamContext,
-    render_options_table,
+    ArtifactManifest, CommandDoc, CommandOp, CommandResult, OptionDesc, Options, ResourceDesc,
+    Status, StreamContext, render_options_table,
 };
 
 /// Pipeline command: import a single facet from source to output.
@@ -36,13 +36,58 @@ impl CommandOp for ImportFacetOp {
         CommandDoc {
             summary: "Import a data facet from source format to output".into(),
             body: format!(
-                "# import\n\n\
-                 Import a data facet from source format to output.\n\n\
-                 ## Description\n\n\
-                 Extracts options from the pipeline options map, constructs the \
-                 appropriate arguments, and delegates to the existing import logic. \
-                 Supports format auto-detection and configurable threading.\n\n\
-                 ## Options\n\n{}",
+                r#"# import
+
+Import a data facet from source format to output.
+
+## Description
+
+The import command is the primary entry point for getting external vector data
+into the pipeline. It reads a directory (or single file) of source vectors and
+writes a single consolidated output file in the pipeline's internal format.
+
+Source files may be in any supported format: npy, fvec, ivec, bvec, parquet, or
+other recognized extensions. When the `format` option is omitted, the command
+auto-detects the source format by inspecting file extensions in the source path.
+If the source is a directory, all files with a matching extension are discovered
+and read in sorted order.
+
+During import, each source format is converted to the appropriate internal
+representation. Numpy `.npy` files are converted to xvec layout, parquet rows
+become slab records, and native xvec/fvec files are read directly. The output
+format is chosen automatically based on the facet type and the element size of
+the source data.
+
+The `facet` option labels this import with a dataset role such as `base_vectors`,
+`query_vectors`, or `ground_truth`. This label determines how the data is used
+in downstream pipeline steps and in the final dataset configuration.
+
+Import is multithreaded: the `threads` option controls how many source reader
+threads run in parallel. The pipeline governor may also adjust thread counts
+dynamically based on observed throughput. For large imports spanning hundreds of
+source files, a progress bar updates per-record so you can monitor throughput.
+
+## Data Preparation Role
+
+Import is the first step in any dataset preparation pipeline. It transforms raw
+source data from its original distribution format into a consolidated internal
+file that subsequent pipeline commands (extract, shuffle, partition) can operate
+on efficiently. Without an import step, no other pipeline command has data to
+work with.
+
+## Notes
+
+- For directories with many small files, increasing `threads` can significantly
+  improve throughput by overlapping I/O across files.
+- The `count` option is useful for creating smaller test datasets from large
+  sources without copying the full data.
+- Throughput statistics are logged at debug level every 5 seconds, including
+  records/sec and MB/s. If sustained throughput is low, the governor may
+  automatically request additional I/O bandwidth.
+
+## Options
+
+{}"#,
                 render_options_table(&options)
             ),
         }
@@ -159,7 +204,7 @@ impl CommandOp for ImportFacetOp {
             (None, None) => None,
         };
         let pb = if let Some(total) = effective_total {
-            ctx.ui.bar(total, "importing records")
+            ctx.ui.bar_with_unit(total, "importing records", "records")
         } else {
             ctx.ui.spinner("importing records")
         };
@@ -296,6 +341,14 @@ impl CommandOp for ImportFacetOp {
                 description: "Maximum number of records to import (all if omitted)".to_string(),
             },
         ]
+    }
+
+    fn project_artifacts(&self, step_id: &str, options: &Options) -> ArtifactManifest {
+        crate::pipeline::command::manifest_from_keys(
+            step_id, self.command_path(), options,
+            &["source"],
+            &["output"],
+        )
     }
 }
 

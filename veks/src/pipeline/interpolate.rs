@@ -9,6 +9,9 @@
 //! - `${env:VAR}` — environment variable
 //! - `${variables:name}` — explicitly from variables.yaml only (short form)
 //! - `${variables.yaml:name}` — explicitly from variables.yaml only (long form)
+//! - `$$` — literal `$` (escape). Use `$${name}` to produce `${name}` in the
+//!   output without variable expansion. Needed for commands like `fetch bulkdl`
+//!   whose token placeholders use `${token}` syntax.
 //!
 //! The qualified `variables:` / `variables.yaml:` prefixes are unambiguous even
 //! on the command line — shells will not expand `${variables:foo}` or
@@ -39,7 +42,11 @@ pub fn interpolate(
     let mut chars = input.chars().peekable();
 
     while let Some(ch) = chars.next() {
-        if ch == '$' && chars.peek() == Some(&'{') {
+        if ch == '$' && chars.peek() == Some(&'$') {
+            // Escaped dollar: `$$` produces a literal `$`.
+            chars.next(); // consume second '$'
+            result.push('$');
+        } else if ch == '$' && chars.peek() == Some(&'{') {
             chars.next(); // consume '{'
             let mut var_expr = String::new();
             let mut depth = 1;
@@ -155,13 +162,6 @@ pub fn interpolate_options(
         };
         let interpolated = interpolate(&raw, defaults, workspace)
             .map_err(|e| format!("in option '{}': {}", key, e))?;
-        // Fail hard if any ${...} survived interpolation
-        if interpolated.contains("${") {
-            return Err(format!(
-                "in option '{}': unexpanded variable in '{}'",
-                key, interpolated,
-            ));
-        }
         resolved.insert(key.clone(), interpolated);
     }
     Ok(resolved)
@@ -331,5 +331,45 @@ mod tests {
         let resolved = interpolate_options(&opts, &defaults(), Path::new("/data")).unwrap();
         assert_eq!(resolved.get("seed").unwrap(), "42");
         assert_eq!(resolved.get("count").unwrap(), "100");
+    }
+
+    #[test]
+    fn test_dollar_escape() {
+        let result = interpolate("url_$${number}.npy", &defaults(), Path::new("/data")).unwrap();
+        assert_eq!(result, "url_${number}.npy");
+    }
+
+    #[test]
+    fn test_dollar_escape_with_vars() {
+        let result = interpolate(
+            "https://host/$${number}.npy?seed=${seed}",
+            &defaults(),
+            Path::new("/data"),
+        )
+        .unwrap();
+        assert_eq!(result, "https://host/${number}.npy?seed=42");
+    }
+
+    #[test]
+    fn test_dollar_escape_standalone() {
+        let result = interpolate("cost: $$5", &defaults(), Path::new("/data")).unwrap();
+        assert_eq!(result, "cost: $5");
+    }
+
+    #[test]
+    fn test_interpolate_options_with_escape() {
+        let mut opts = IndexMap::new();
+        opts.insert(
+            "baseurl".to_string(),
+            serde_yaml::Value::String(
+                "https://host/img_$${number}.npy".to_string(),
+            ),
+        );
+
+        let resolved = interpolate_options(&opts, &defaults(), Path::new("/data")).unwrap();
+        assert_eq!(
+            resolved.get("baseurl").unwrap(),
+            "https://host/img_${number}.npy"
+        );
     }
 }

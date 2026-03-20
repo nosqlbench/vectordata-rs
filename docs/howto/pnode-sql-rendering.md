@@ -7,9 +7,9 @@ This example builds a predicate tree and renders it as a SQL WHERE clause and
 other formats.
 
 ```rust
-use veks::formats::pnode::*;
-use veks::formats::anode::{self, ANode};
-use veks::formats::anode_vernacular::{self, Vernacular};
+use vectordata::formats::pnode::*;
+use vectordata::formats::anode::{self, ANode};
+use vectordata::formats::anode_vernacular::{self, Vernacular};
 
 // Build a predicate: (age > 18 AND (status IN (1, 2, 3) OR score <= 100))
 let tree = PNode::Conjugate(ConjugateNode {

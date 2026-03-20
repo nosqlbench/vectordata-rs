@@ -9,8 +9,8 @@ The vernacular codec can parse JSON objects into MNode records, enabling a text
 ## From Rust code
 
 ```rust
-use veks::formats::anode::{self, ANode};
-use veks::formats::anode_vernacular::{self, Vernacular};
+use vectordata::formats::anode::{self, ANode};
+use vectordata::formats::anode_vernacular::{self, Vernacular};
 
 let json = r#"{"name": "alice", "age": 30, "active": true, "tags": [1, 2, 3]}"#;
 

@@ -3,9 +3,9 @@
 
 # PNode Wire Format Reference
 
-Module: `veks::formats::pnode`
+Module: `vectordata::formats::pnode`
 
-Source: `src/formats/pnode/mod.rs`
+Source: `vectordata/src/formats/pnode/mod.rs`
 
 ## Wire layout
 

@@ -16,8 +16,8 @@ use std::time::Instant;
 use slabtastic::{OpenProgress, SlabReader, SlabWriter, WriterConfig};
 
 use crate::pipeline::command::{
-    CommandDoc, CommandOp, CommandResult, OptionDesc, Options, ResourceDesc, Status, StreamContext,
-    render_options_table,
+    ArtifactManifest, CommandDoc, CommandOp, CommandResult, OptionDesc, Options, ResourceDesc,
+    Status, StreamContext, render_options_table,
 };
 
 // -- Slab Import --------------------------------------------------------------
@@ -39,7 +39,40 @@ impl CommandOp for SlabImportOp {
         CommandDoc {
             summary: "Import records into a slab file".into(),
             body: format!(
-                "# slab import\n\nImport records into a slab file.\n\n## Description\n\nReads records from an input source and writes them into a slab file, creating or overwriting the target file.\n\n## Options\n\n{}",
+                r#"# slab import
+
+Import records into a slab file.
+
+## Description
+
+Reads records from an input source and writes them into a slab file,
+creating or overwriting the target file. The source can be a text file
+(one record per line), a null-delimited binary file (cstrings format),
+or another slab file.
+
+## How It Works
+
+The command reads the entire source file into memory, splits it into
+individual records according to the selected format, then writes each
+record sequentially into a new slab file using the configured page size.
+Records are assigned monotonically increasing ordinals starting from zero.
+The slab writer packs records into pages of the requested size, flushing
+each page to disk when full.
+
+## Data Preparation Role
+
+`slab import` is the primary entry point for converting external metadata
+into the slab binary format used throughout the dataset preparation
+pipeline. Typical usage converts parquet-exported JSONL or raw text files
+into `.slab` files so that downstream commands like `compute predicates`,
+`survey`, and `slab inspect` can operate on them efficiently. Because slab
+files support ordinal-based random access, importing metadata into slab
+format is a prerequisite for any step that needs to cross-reference
+metadata records with vector ordinals.
+
+## Options
+
+{}"#,
                 render_options_table(&options)
             ),
         }
@@ -185,7 +218,36 @@ impl CommandOp for SlabExportOp {
         CommandDoc {
             summary: "Export slab records to text or binary".into(),
             body: format!(
-                "# slab export\n\nExport slab records to text or binary.\n\n## Description\n\nReads records from a slab file and exports them in the specified output format.\n\n## Options\n\n{}",
+                r#"# slab export
+
+Export slab records to text or binary.
+
+## Description
+
+Reads records from a slab file and exports them in the specified output
+format. Supported output formats include plain text (UTF-8 lossy), hex
+dump with ordinal prefixes, raw binary, and JSON with ordinal keys.
+
+## How It Works
+
+The command opens the slab file, iterates over every record in page
+order using batch reads, and writes each record to the output in the
+chosen format. When no output path is given the results are written to
+stdout, making it easy to pipe into other tools. The export streams
+records without loading the entire slab into memory, so it works on
+arbitrarily large files.
+
+## Data Preparation Role
+
+`slab export` is the inverse of `slab import` and is used to inspect
+the contents of metadata slab files in human-readable form. This is
+useful for verifying that an import produced the expected records,
+for extracting metadata into formats consumable by external tools, and
+for debugging predicate or metadata issues during pipeline development.
+
+## Options
+
+{}"#,
                 render_options_table(&options)
             ),
         }
@@ -300,7 +362,38 @@ impl CommandOp for SlabAppendOp {
         CommandDoc {
             summary: "Append records from one slab to another".into(),
             body: format!(
-                "# slab append\n\nAppend records from one slab to another.\n\n## Description\n\nReads records from a source slab file and appends them to a destination slab file.\n\n## Options\n\n{}",
+                r#"# slab append
+
+Append records from one slab to another.
+
+## Description
+
+Reads records from a source slab file and appends them to a destination
+slab file. The appended records receive ordinals that continue from where
+the target file left off. The target file is opened in append mode so
+existing records are preserved.
+
+## How It Works
+
+The command opens the source slab for reading and the target slab in
+append mode. It iterates over every record in the source in page-order
+batches and writes each record into the target's append writer, which
+allocates new pages as needed at the configured page size. After all
+source records have been transferred the writer finalizes the target
+file's page directory.
+
+## Data Preparation Role
+
+`slab append` supports incremental metadata updates in dataset
+preparation pipelines. When new metadata arrives (for example, a new
+partition of a HuggingFace dataset), it can be imported into a
+temporary slab and then appended to the main metadata slab without
+rebuilding from scratch. This is particularly valuable for large
+datasets where a full re-import would be prohibitively expensive.
+
+## Options
+
+{}"#,
                 render_options_table(&options)
             ),
         }
@@ -407,7 +500,37 @@ impl CommandOp for SlabRewriteOp {
         CommandDoc {
             summary: "Rewrite a slab file with new page layout".into(),
             body: format!(
-                "# slab rewrite\n\nRewrite a slab file with new page layout.\n\n## Description\n\nReads a slab file and rewrites it with a new page size or layout configuration.\n\n## Options\n\n{}",
+                r#"# slab rewrite
+
+Rewrite a slab file with new page layout.
+
+## Description
+
+Reads every record from a source slab file and writes them into a new
+destination slab file using a different page size or layout
+configuration. The record data itself is unchanged; only the physical
+page structure differs.
+
+## How It Works
+
+The command performs a full sequential scan of the source slab, reading
+records in page-order batches. Each record is written to a fresh slab
+writer configured with the requested page size. Because the writer
+repacks records from scratch, the destination file will have optimal
+page alignment with no wasted space from prior appends or deletions.
+
+## Data Preparation Role
+
+`slab rewrite` is used to optimize slab layout for specific access
+patterns. A slab originally written with small pages (good for random
+access) can be rewritten with larger pages (better for sequential
+scans), or vice versa. This is typically run as a post-processing step
+after all imports and appends are complete, before the slab is used in
+production queries where page I/O efficiency matters.
+
+## Options
+
+{}"#,
                 render_options_table(&options)
             ),
         }
@@ -522,7 +645,38 @@ impl CommandOp for SlabCheckOp {
         CommandDoc {
             summary: "Verify slab file structural integrity".into(),
             body: format!(
-                "# slab check\n\nVerify slab file structural integrity.\n\n## Description\n\nValidates the internal structure of a slab file, checking page boundaries and record consistency.\n\n## Options\n\n{}",
+                r#"# slab check
+
+Verify slab file structural integrity.
+
+## Description
+
+Validates the internal structure of a slab file by reading and
+deserializing every page. Reports the total number of pages and records
+on success, or lists specific page-level errors on failure.
+
+## How It Works
+
+The command opens the slab file, retrieves the page directory, then
+attempts to read and decode each data page in sequence. For every page
+it verifies that the binary page data can be deserialized without
+errors and that the record count is consistent. In verbose mode it
+prints per-page details including file offset, starting ordinal, and
+record count. Any page that fails to decode is reported as an error.
+
+## Data Preparation Role
+
+`slab check` is a health-verification step that should be run after
+importing, appending, or rewriting slab files to confirm that the
+resulting file is structurally sound. It is especially important after
+bulk operations or interrupted writes, where a partially written page
+could leave the slab in an inconsistent state. Including `slab check`
+in a pipeline provides an early warning before downstream commands
+attempt to read from a corrupted file.
+
+## Options
+
+{}"#,
                 render_options_table(&options)
             ),
         }
@@ -629,7 +783,40 @@ impl CommandOp for SlabGetOp {
         CommandDoc {
             summary: "Retrieve a single record by ordinal".into(),
             body: format!(
-                "# slab get\n\nRetrieve a single record by ordinal.\n\n## Description\n\nLooks up and displays a single record from a slab file by its ordinal position.\n\n## Options\n\n{}",
+                r#"# slab get
+
+Retrieve a single record by ordinal.
+
+## Description
+
+Looks up and displays one or more records from a slab file by their
+ordinal positions. Records can be specified as individual ordinals or
+as ranges, and the output format can be plain text, hexadecimal, or
+raw binary.
+
+## How It Works
+
+The command parses the ordinals specification into a list of i64
+values (supporting comma-separated values and `start..end` ranges).
+For each ordinal it performs a random-access lookup via the slab
+reader's page directory, which binary-searches the page index to find
+the page containing the requested ordinal, then reads and decodes
+that single page to extract the record. This makes individual lookups
+efficient even on very large slab files.
+
+## Data Preparation Role
+
+`slab get` provides point lookups for debugging and spot-checking
+metadata contents. During pipeline development you can use it to
+verify that a specific metadata record (by ordinal) contains the
+expected values, or to inspect the record that corresponds to a
+particular vector ordinal. It is commonly used alongside
+`inspect predicate` to trace the mapping between predicates,
+metadata indices, and raw metadata records.
+
+## Options
+
+{}"#,
                 render_options_table(&options)
             ),
         }
@@ -758,7 +945,40 @@ impl CommandOp for SlabAnalyzeOp {
         CommandDoc {
             summary: "Analyze slab page utilization and statistics".into(),
             body: format!(
-                "# slab analyze\n\nAnalyze slab page utilization and statistics.\n\n## Description\n\nScans a slab file and reports page-level utilization metrics and record statistics.\n\n## Options\n\n{}",
+                r#"# slab analyze
+
+Analyze slab page utilization and statistics.
+
+## Description
+
+Scans a slab file and reports comprehensive statistics about its
+page-level utilization, record size distribution, content type, and
+storage efficiency.
+
+## How It Works
+
+The command reads every page in the slab, collecting per-page record
+counts and serialized page sizes. It also samples record sizes (up to
+100 records per page) to compute min, max, mean, and median record
+sizes. A content-type heuristic examines the first page's records to
+classify the slab as text/ascii, mixed, or binary. Finally it reports
+overall page utilization as a percentage of file size occupied by page
+data versus overhead.
+
+## Data Preparation Role
+
+`slab analyze` helps you understand the storage efficiency of a slab
+file and decide whether a `slab rewrite` with a different page size
+would improve performance. For example, if the analysis reveals that
+records are uniformly small and pages are only partially filled, a
+smaller page size would reduce wasted I/O. Conversely, if records are
+large and pages are fully packed, the current layout is already
+efficient. This command is also useful for validating that an import
+produced the expected number of records and ordinal range.
+
+## Options
+
+{}"#,
                 render_options_table(&options)
             ),
         }
@@ -906,7 +1126,41 @@ impl CommandOp for SlabExplainOp {
         CommandDoc {
             summary: "Decode and display a record's wire format".into(),
             body: format!(
-                "# slab explain\n\nDecode and display a record's wire format.\n\n## Description\n\nRetrieves a record by ordinal and displays its raw wire-format encoding with field annotations.\n\n## Options\n\n{}",
+                r#"# slab explain
+
+Decode and display a record's wire format.
+
+## Description
+
+Retrieves pages from a slab file and displays detailed structural
+information for each page, including file offset, page size, ordinal
+range, record count, and hex previews of the first few records. This
+is a low-level diagnostic that shows the on-disk layout rather than
+the logical record content.
+
+## How It Works
+
+The command opens the slab file and iterates over its page directory.
+For each page (optionally filtered by page index), it reads the page
+data and renders a box-drawing diagram showing the page's metadata
+fields. It then reads the first few records from the page via direct
+ordinal lookup and displays a hex preview of each record's raw bytes.
+After all pages have been displayed, it prints a summary of the page
+directory showing ordinal-to-offset mappings.
+
+## Data Preparation Role
+
+`slab explain` is a debugging tool for understanding the slab binary
+format at the page level. When a slab file behaves unexpectedly --
+for example, when `slab check` reports errors or when ordinal lookups
+return surprising data -- `slab explain` reveals the physical layout
+so you can diagnose whether pages are misaligned, overlapping, or
+contain unexpected data. It is also useful for developing and testing
+changes to the slabtastic writer.
+
+## Options
+
+{}"#,
                 render_options_table(&options)
             ),
         }
@@ -1025,7 +1279,38 @@ impl CommandOp for SlabNamespacesOp {
         CommandDoc {
             summary: "List namespace IDs present in a slab file".into(),
             body: format!(
-                "# slab namespaces\n\nList namespace IDs present in a slab file.\n\n## Description\n\nScans a slab file and lists all distinct namespace identifiers found in its records.\n\n## Options\n\n{}",
+                r#"# slab namespaces
+
+List namespace IDs present in a slab file.
+
+## Description
+
+Scans a slab file and lists all distinct namespace identifiers found
+in its header structure. Each namespace represents an independent
+collection of records within the same physical file, identified by
+name and index.
+
+## How It Works
+
+The command calls the slabtastic library's `list_namespaces` function,
+which reads the slab file header to enumerate all registered
+namespaces. For each namespace it reports the namespace index, name,
+and the file offset of its pages page (the page directory for that
+namespace). This is a metadata-only operation that does not read any
+data pages.
+
+## Data Preparation Role
+
+`slab namespaces` is used to discover the organization of a slab file
+that contains multiple logical datasets. When a pipeline produces a
+multi-namespace slab (for example, separate namespaces for different
+metadata facets), this command lets you verify which namespaces are
+present and confirm that the expected structure was created. It is also
+useful for orienting yourself when working with an unfamiliar slab file.
+
+## Options
+
+{}"#,
                 render_options_table(&options)
             ),
         }
@@ -1094,7 +1379,41 @@ impl CommandOp for SlabInspectOp {
         CommandDoc {
             summary: "Inspect slab file header and page structure".into(),
             body: format!(
-                "# slab inspect\n\nInspect slab file header and page structure.\n\n## Description\n\nDisplays the file header, page directory, and structural details of a slab file.\n\n## Options\n\n{}",
+                r#"# slab inspect
+
+Inspect slab file header and page structure.
+
+## Description
+
+Decodes and renders slab records as structured ANode vernacular text.
+Given a set of ordinals, retrieves each record, decodes it using the
+specified codec (auto, mnode, or pnode), and renders the decoded
+structure in the chosen vernacular format.
+
+## How It Works
+
+The command opens the slab file and performs random-access lookups for
+each requested ordinal. Each record's raw bytes are passed through the
+ANode decoder, which interprets the binary data as either an MNode
+(metadata node) or PNode (predicate node) depending on the codec
+setting. The decoded tree structure is then rendered in the chosen
+vernacular format -- options include CDDL schema notation, SQL, CQL,
+JSON, YAML, a human-readable readout, and a compact display format.
+
+## Data Preparation Role
+
+`slab inspect` is the primary tool for examining the logical content
+of metadata and predicate slab records at the field level. Unlike
+`slab get` (which shows raw bytes or text), `slab inspect` understands
+the ANode encoding and presents records as structured data. This makes
+it essential for verifying that imported metadata has the expected
+schema and values, for debugging predicate synthesis, and for
+understanding the data model that downstream filtered-KNN queries
+will operate on.
+
+## Options
+
+{}"#,
                 render_options_table(&options)
             ),
         }
@@ -1202,7 +1521,44 @@ impl CommandOp for SlabSurveyOp {
         CommandDoc {
             summary: "Survey metadata field value distributions".into(),
             body: format!(
-                "# survey\n\nSurvey metadata field value distributions.\n\n## Description\n\nScans slab records and reports the distribution of values for each metadata field.\n\n## Options\n\n{}",
+                r#"# survey
+
+Survey metadata field value distributions.
+
+## Description
+
+Scans slab records, decodes them as ANode metadata, and reports
+per-field statistics including value type breakdown, numeric ranges,
+string length distributions, and distinct value cardinality. The
+survey can sample a configurable number of records to keep execution
+time manageable on large slabs.
+
+## How It Works
+
+The command opens the slab file and reads up to `samples` records in
+page order. Each record is decoded as an ANode and its fields are
+examined. For every field the command tracks: the number of non-null
+values, a count of values by type tag, numeric min/max/mean for
+numeric fields, string length min/max/mean for string fields, and a
+bounded set of distinct values (up to `max-distinct`). Results are
+printed to the console and optionally written to an output file in a
+structured format suitable for further processing.
+
+## Data Preparation Role
+
+`survey` is a prerequisite for predicate synthesis. Before the pipeline
+can generate predicates for filtered KNN queries, it needs to know
+which metadata fields exist, what types they use, what value ranges
+they span, and how many distinct values they contain. The survey output
+drives decisions about which fields are suitable for predicate
+generation, what bin boundaries to use for numeric fields, and whether
+a field's cardinality is low enough for enumerated predicates. Running
+`survey` early in the pipeline ensures that downstream `compute
+predicates` steps have the schema and cardinality information they need.
+
+## Options
+
+{}"#,
                 render_options_table(&options)
             ),
         }
@@ -1344,6 +1700,14 @@ impl CommandOp for SlabSurveyOp {
             opt("samples", "int", false, Some("1000"), "Max records to sample"),
             opt("max-distinct", "int", false, Some("20"), "Max distinct values tracked per field"),
         ]
+    }
+
+    fn project_artifacts(&self, step_id: &str, options: &Options) -> ArtifactManifest {
+        crate::pipeline::command::manifest_from_keys(
+            step_id, self.command_path(), options,
+            &["input"],
+            &["output"],
+        )
     }
 }
 

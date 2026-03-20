@@ -3,9 +3,15 @@
 
 //! Standard facet kinds for vector datasets.
 //!
-//! Defines the canonical facet names as established by the Java `TestDataKind`
-//! registry. This module provides name resolution (canonical keys and aliases)
-//! without any dependency on file formats or CLI frameworks.
+//! [`StandardFacet`] enumerates the well-known facet types that define a
+//! dataset's layout: `base_vectors`, `query_vectors`, `neighbor_indices`,
+//! `neighbor_distances`, metadata content/predicates/results/layout, and
+//! their filtered variants.
+//!
+//! Each facet has a canonical key name (used in `dataset.yaml` profile
+//! definitions) and a set of shorthand aliases for convenience. This module
+//! provides name resolution without any dependency on file formats or CLI
+//! frameworks.
 //!
 //! Consumers that need format-specific behavior (e.g., preferred output format)
 //! should extend `StandardFacet` in their own crate.

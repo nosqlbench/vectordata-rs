@@ -105,7 +105,35 @@ impl CommandOp for AnalyzeCompareOp {
         CommandDoc {
             summary: "Compare two vector files element-by-element".into(),
             body: format!(
-                "# analyze compare\n\nCompare two vector files element-by-element.\n\n## Description\n\nPerforms a two-sample Kolmogorov-Smirnov test per dimension between two fvec files to determine if their distributions match. Useful for comparing synthetic or generated data against the original dataset.\n\n## Options\n\n{}",
+                "# analyze compare\n\n\
+                Compare two vector files element-by-element.\n\n\
+                ## Description\n\n\
+                Performs a two-sample Kolmogorov-Smirnov (K-S) test per dimension between \
+                two fvec files to determine whether their value distributions match. The \
+                K-S test is a non-parametric test that compares empirical cumulative \
+                distribution functions (CDFs) and is sensitive to differences in shape, \
+                location, and scale.\n\n\
+                ## How It Works\n\n\
+                For each dimension, the command extracts sampled values from both files, \
+                sorts them, and performs a merge-walk to compute the maximum CDF \
+                difference (the D-statistic). An approximate p-value is derived using \
+                the asymptotic Kolmogorov distribution. If the p-value falls below the \
+                significance level (`alpha`), the dimension is flagged as having \
+                different distributions. The final result reports how many dimensions \
+                passed or failed.\n\n\
+                ## Role in Dataset Preparation\n\n\
+                This command is used to verify that data transformations preserve \
+                statistical properties. Common use cases include:\n\n\
+                - Comparing original vs. shuffled data to confirm shuffling did not \
+                corrupt values.\n\
+                - Comparing real vs. synthetically generated vectors to validate that \
+                the generative model captures the original distribution.\n\
+                - Comparing pre- and post-normalization data to understand how \
+                normalization changed value distributions.\n\n\
+                The `dimension` option allows drilling into a specific dimension of \
+                interest, while the `sample` option keeps runtime manageable on \
+                billion-scale datasets.\n\n\
+                ## Options\n\n{}",
                 render_options_table(&options)
             ),
         }

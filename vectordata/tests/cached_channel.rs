@@ -9,7 +9,8 @@
 
 use std::fs;
 
-use testserver::TestServer;
+mod support;
+use support::testserver::TestServer;
 use vectordata::cache::CachedChannel;
 use vectordata::merkle::MerkleRef;
 use vectordata::transport::HttpTransport;

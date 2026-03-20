@@ -12,6 +12,9 @@
       <sourceFolder url="file://$MODULE_DIR$/dataset/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/testserver/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/vectordata/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/veks/examples" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/veks/tests" isTestSource="true" />
+      <excludeFolder url="file://$MODULE_DIR$/links" />
       <excludeFolder url="file://$MODULE_DIR$/target" />
     </content>
     <orderEntry type="inheritedJdk" />

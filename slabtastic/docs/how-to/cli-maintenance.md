@@ -98,7 +98,7 @@ slab export data.slab
 slab export data.slab --output records.txt
 
 # Null-terminated binary
-slab export data.slab --cstrings --output records.bin
+slab export data.slab --format cstrings --output records.bin
 
 # To another slab file
 slab export data.slab --output copy.slab

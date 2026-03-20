@@ -25,13 +25,14 @@ pub mod ratatui_sink;
 pub mod sink;
 pub mod test_sink;
 
-// Re-export the handful of types that most callers need.
+// Re-export the types that most callers need.
 pub use event::{ProgressId, ProgressKind, ResourceMetrics, UiEvent};
 pub use handle::{ProgressHandle, UiHandle};
 pub use plain_sink::PlainSink;
 pub use ratatui_sink::RatatuiSink;
 pub use sink::UiSink;
 pub use test_sink::TestSink;
+
 
 /// Create a `UiHandle` with the appropriate sink for the current environment.
 ///

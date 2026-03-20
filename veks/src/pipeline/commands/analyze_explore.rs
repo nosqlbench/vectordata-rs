@@ -38,7 +38,36 @@ impl CommandOp for AnalyzeExploreOp {
         CommandDoc {
             summary: "Interactive exploration of vector file contents".into(),
             body: format!(
-                "# analyze explore\n\nInteractive exploration of vector file contents.\n\n## Description\n\nOpens a vector file and provides an interactive REPL for querying vectors, computing distances, finding neighbors, and inspecting file contents. Supports scripted commands via the `commands` option.\n\n## Options\n\n{}",
+                "# analyze explore\n\n\
+                Interactive exploration of vector file contents.\n\n\
+                ## Description\n\n\
+                Opens a vector file and provides an interactive REPL (read-eval-print \
+                loop) for browsing vector data, computing distances, inspecting norms, \
+                and viewing per-dimension statistics. The file is memory-mapped, so all \
+                random-access operations are fast regardless of file size.\n\n\
+                ## Available REPL Commands\n\n\
+                - `info` -- show file metadata (vector count, dimensions)\n\
+                - `get <index>` -- display a single vector by index\n\
+                - `range <start> <end>` -- display a range of vectors (capped at 20)\n\
+                - `head [n]` / `tail [n]` -- show first or last n vectors\n\
+                - `dist <metric> <i> <j>` -- compute distance between two vectors \
+                (metrics: l2, cosine, dot)\n\
+                - `norm <index> [n]` -- show L2 norms for n vectors starting at index\n\
+                - `stats [sample]` -- compute per-dimension min/max/mean/std statistics\n\
+                - `help` -- list commands\n\
+                - `quit` -- exit the REPL\n\n\
+                ## Scripted Mode\n\n\
+                When the `commands` option is provided, the REPL executes the given \
+                semicolon-separated commands non-interactively and returns the combined \
+                output. This is useful for automated testing and pipeline integration \
+                without requiring a TTY.\n\n\
+                ## Role in Dataset Preparation\n\n\
+                The explore command provides an ad-hoc investigation tool for when you \
+                need to understand vector file contents without writing custom scripts. \
+                It is particularly useful for diagnosing unexpected KNN results, \
+                inspecting specific vectors flagged by other analysis commands, or \
+                quickly computing distances between vectors of interest.\n\n\
+                ## Options\n\n{}",
                 render_options_table(&options)
             ),
         }

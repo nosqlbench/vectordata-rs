@@ -35,13 +35,45 @@ impl CommandOp for FetchDlhfOp {
         CommandDoc {
             summary: "Download files from HuggingFace Hub".into(),
             body: format!(
-                "# fetch dlhf\n\n\
-                 Download files from HuggingFace Hub.\n\n\
-                 ## Description\n\n\
-                 Given a HuggingFace repository identifier, lists and downloads matching \
-                 files into a local output directory using the HuggingFace HTTP API. \
-                 Supports glob filtering, revision selection, and resume.\n\n\
-                 ## Options\n\n{}",
+                r#"# fetch dlhf
+
+Download files from HuggingFace Hub.
+
+## Description
+
+Given a HuggingFace repository identifier (e.g. `username/dataset-name`),
+lists and downloads matching files into a local output directory using
+the HuggingFace HTTP API. Supports glob filtering, revision/branch
+selection, repository type (dataset or model), and automatic resume of
+previously completed downloads.
+
+## How It Works
+
+The command first queries the HuggingFace tree API
+(`https://huggingface.co/api/<type>s/<repo>/tree/<revision>`) to
+enumerate all files in the repository. The response is filtered by
+the glob pattern to select only matching files. For each matching
+file, the command checks whether a local file of the same name and
+size already exists; if so, the download is skipped. Otherwise, the
+file is downloaded from the HuggingFace resolve endpoint. If the
+`HF_TOKEN` environment variable is set, it is included as a Bearer
+token for authenticated access to private or gated repositories.
+
+## Data Preparation Role
+
+`fetch dlhf` is the primary way to acquire source datasets from
+HuggingFace Hub at the beginning of a dataset preparation pipeline.
+It downloads parquet files, vector files, metadata, and any other
+artifacts published in a HuggingFace dataset repository. The resume
+capability ensures that interrupted downloads can be continued without
+re-downloading completed files, which is critical for large datasets
+that may take hours to transfer. Downloaded files then feed into
+subsequent pipeline steps like parquet-to-JSONL conversion, slab
+import, and vector file assembly.
+
+## Options
+
+{}"#,
                 render_options_table(&options)
             ),
         }

@@ -106,7 +106,7 @@ decisions during execution.
 ### Location
 
 ```
-${workspace}/.governor.log
+${workspace}/.cache/.governor.log
 ```
 
 The log is overwritten at the start of each pipeline run. Each line is

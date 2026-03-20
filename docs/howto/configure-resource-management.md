@@ -85,7 +85,7 @@ pipeline, `maximize` (the default) extracts the best throughput.
 During execution the governor writes a line-oriented JSON log to:
 
 ```
-${workspace}/.governor.log
+${workspace}/.cache/.governor.log
 ```
 
 Each line is a self-contained JSON object with a `type` field. The four
@@ -225,7 +225,7 @@ This configuration:
 Monitor the governor log during execution:
 
 ```sh
-tail -f laion-400m/.governor.log | jq 'select(.type == "decision")'
+tail -f laion-400m/.cache/.governor.log | jq 'select(.type == "decision")'
 ```
 
 If you see repeated segment size reductions, the floor may still be too

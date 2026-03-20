@@ -8,7 +8,7 @@ three places.
 
 ## 1. Add the variant to `Vernacular`
 
-In `src/formats/anode_vernacular.rs`, add your variant to the enum:
+In `vectordata/src/formats/anode_vernacular.rs`, add your variant to the enum:
 
 ```rust
 pub enum Vernacular {

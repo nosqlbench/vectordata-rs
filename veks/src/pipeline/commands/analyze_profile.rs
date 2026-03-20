@@ -63,7 +63,36 @@ impl CommandOp for AnalyzeProfileOp {
         CommandDoc {
             summary: "Profile distance computation performance".into(),
             body: format!(
-                "# analyze profile\n\nProfile distance computation performance.\n\n## Description\n\nAnalyzes base vectors and builds a per-dimension VectorSpaceModel describing the statistical distribution of each component. Outputs a JSON model file suitable for use with `generate from-model`.\n\n## Options\n\n{}",
+                "# analyze profile\n\n\
+                Profile distance computation performance.\n\n\
+                ## Description\n\n\
+                Analyzes base vectors and builds a per-dimension VectorSpaceModel \
+                describing the statistical distribution of each component. For each \
+                dimension, the command fits candidate distributions (Normal, Beta, \
+                Uniform) and selects the best fit using the Kolmogorov-Smirnov \
+                D-statistic. The resulting model is written as a JSON file suitable \
+                for use with `generate from-model` to produce synthetic vectors that \
+                match the original data distribution.\n\n\
+                ## How It Works\n\n\
+                For each dimension, the command:\n\n\
+                1. Extracts sampled values and computes mean, variance, min, and max.\n\
+                2. Fits a Normal distribution using the sample mean and standard deviation.\n\
+                3. If the data appears bounded (values within [-1.5, 1.5]), attempts a \
+                Beta distribution fit using method-of-moments estimation.\n\
+                4. Computes the KS D-statistic for each candidate against the sorted \
+                empirical CDF.\n\
+                5. Selects the model with the lowest KS D-statistic.\n\n\
+                The output JSON contains the dimension count, unique vector count, and \
+                an array of per-dimension scalar model definitions with their fitted \
+                parameters.\n\n\
+                ## Role in Dataset Preparation\n\n\
+                Profiling is a key step when generating synthetic benchmark datasets. \
+                By capturing the statistical fingerprint of a real dataset, synthetic \
+                vectors can be generated that exercise distance functions and indexing \
+                structures in realistic ways. The profile also serves as a baseline for \
+                `analyze verify-profiles` and `analyze model-diff` commands that validate \
+                generated data quality.\n\n\
+                ## Options\n\n{}",
                 render_options_table(&options)
             ),
         }

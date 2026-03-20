@@ -217,13 +217,50 @@ impl CommandOp for JsonJjqOp {
         CommandDoc {
             summary: "Query JSON files with jq-like expressions".into(),
             body: format!(
-                "# json jjq\n\n\
-                 Query JSON files with jq-like expressions.\n\n\
-                 ## Description\n\n\
-                 Applies simple JQ-like expressions to JSONL (JSON Lines) files. Supports \
-                 field extraction, nested access, multi-field selection, filtering with \
-                 `select()`, and `length` counting.\n\n\
-                 ## Options\n\n{}",
+                r#"# json jjq
+
+Query JSON files with jq-like expressions.
+
+## Description
+
+Applies simple JQ-like expressions to JSONL (JSON Lines) files. Each
+line of the input is parsed as a JSON object, the expression is
+applied, and the result is written to the output. Supports field
+extraction, nested access, multi-field selection, filtering with
+`select()`, and `length` counting.
+
+## Supported Expressions
+
+- `.` -- identity (pass through the entire object)
+- `.field` -- extract a single field
+- `.field1.field2` -- nested field access
+- `.field1, .field2` -- select multiple fields (output as object)
+- `select(.field == value)` -- filter records (supports ==, !=, >, <, >=, <=)
+- `length` -- count the number of records
+
+## How It Works
+
+The command opens the input JSONL file and processes it line by line.
+Each line is parsed as a `serde_json::Value`, then the compiled
+expression is applied. For most expressions the result is written as
+a JSON line to the output. For `select()` expressions, lines that do
+not match the predicate are silently dropped. For `length`, the entire
+file is scanned and only the final count is emitted. Output defaults
+to stderr; specify an output path to write to a file, or use `null`
+to discard results (useful with `length`).
+
+## Data Preparation Role
+
+`json jjq` is a lightweight built-in alternative to external `jq` for
+transforming metadata during pipeline execution. Common uses include
+extracting specific fields from parquet-exported JSONL files before
+slab import, filtering records by attribute value, and counting records
+to set pipeline variables. Because it is built into veks, it avoids
+the need for an external `jq` binary on the system.
+
+## Options
+
+{}"#,
                 render_options_table(&options)
             ),
         }

@@ -17,8 +17,8 @@ use crate::formats::pnode::{
     Comparand, ConjugateNode, ConjugateType, FieldRef, OpType, PNode, PredicateNode,
 };
 use crate::pipeline::command::{
-    CommandDoc, CommandOp, CommandResult, OptionDesc, Options, Status, StreamContext,
-    render_options_table,
+    ArtifactManifest, CommandDoc, CommandOp, CommandResult, OptionDesc, Options, Status,
+    StreamContext, render_options_table,
 };
 use crate::pipeline::rng;
 
@@ -47,9 +47,57 @@ Generate random predicate trees from metadata survey.
 
 ## Description
 
-Surveys a metadata slab file to gather per-field value distributions, then
-generates a configurable number of typed PNode predicates with targeted
-selectivity. The generated predicates are written to an output slab file.
+Surveys a metadata slab file (or reads a pre-computed survey JSON) to
+understand the value distributions and cardinalities of each field, then
+generates a configurable number of PNode predicate trees targeting a
+specified selectivity. The generated predicates are written to an output
+slab file where each record is a serialized PNode.
+
+## Survey phase
+
+Before generating predicates, the command needs to understand what fields
+exist in the metadata and what values they contain. This is done by
+reading a sample of records from the metadata slab and collecting per-field
+statistics: distinct value counts, value frequencies, numeric min/max
+ranges, and type distributions. Only fields with eligible types (int,
+float, text, bool, and related variants) are considered for predicate
+generation.
+
+If a `survey` option is provided pointing to a pre-computed survey JSON
+file, the slab survey is skipped entirely and the cached statistics are
+loaded instead. This is useful when the same metadata slab is used to
+generate multiple predicate batches.
+
+## Predicate generation strategies
+
+The `strategy` parameter controls the structure of the generated
+predicates:
+
+- **eq** (default) -- generates single-field `Eq` predicates. The field
+  is chosen by matching its cardinality to the target selectivity (a field
+  with N distinct values has per-value selectivity of roughly 1/N). Within
+  the chosen field, a value is selected whose observed frequency is closest
+  to the target.
+- **compound** -- generates multi-field AND predicates. Fields are added
+  greedily until the cumulative estimated selectivity reaches the target.
+  Each sub-predicate may use Eq, In, or range (Ge/Lt) operators depending
+  on the field's type and cardinality.
+
+## Selectivity control
+
+The `selectivity` parameter (0.0 to 1.0) specifies the target fraction of
+base records that should satisfy each predicate. If `selectivity-max` is
+also set, each predicate's target selectivity is drawn uniformly from
+`[selectivity, selectivity-max]`, producing a mix of easy and hard
+predicates within a single batch.
+
+## Role in dataset pipelines
+
+This command creates the predicate workload for filtered KNN evaluation.
+It is typically followed by `compute predicates`, which evaluates each
+generated predicate against the full metadata slab to produce a boolean
+answer key (which records match). Together, the predicate slab and answer
+key slab provide the ground truth needed to measure filtered-search recall.
 
 ## Options
 
@@ -213,6 +261,14 @@ selectivity. The generated predicates are written to an output slab file.
             opt("strategy", "string", false, Some("eq"), "Predicate strategy: 'eq' (single-field Eq, default) or 'compound' (multi-field AND with mixed ops)"),
             opt("seed", "int", false, Some("42"), "RNG seed"),
         ]
+    }
+
+    fn project_artifacts(&self, step_id: &str, options: &Options) -> ArtifactManifest {
+        crate::pipeline::command::manifest_from_keys(
+            step_id, self.command_path(), options,
+            &["input", "survey"],
+            &["output"],
+        )
     }
 }
 

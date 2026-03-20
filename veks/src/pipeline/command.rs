@@ -97,6 +97,101 @@ pub trait CommandOp: Send {
     fn check_artifact(&self, output: &Path, options: &Options) -> ArtifactState {
         bound::check_artifact_default(output, options)
     }
+
+    /// Project the artifact manifest for this step without executing it.
+    ///
+    /// Given resolved options, returns the exact list of input files consumed
+    /// and output files produced. Every command **must** implement this
+    /// explicitly — the default panics to ensure no command silently returns
+    /// an incorrect manifest.
+    ///
+    /// Paths containing `${cache}` or `.cache/` should be classified as
+    /// intermediates rather than final outputs.
+    fn project_artifacts(&self, step_id: &str, _options: &Options) -> ArtifactManifest {
+        // Commands that have not yet implemented project_artifacts return
+        // an empty manifest with a warning, rather than guessing wrong.
+        log::warn!(
+            "command '{}' (step '{}') has no project_artifacts implementation — \
+             manifest will be incomplete",
+            self.command_path(), step_id,
+        );
+        ArtifactManifest {
+            step_id: step_id.to_string(),
+            command: self.command_path().to_string(),
+            inputs: vec![],
+            outputs: vec![],
+            intermediates: vec![],
+        }
+    }
+}
+
+/// Check if a path looks like a cache/intermediate artifact.
+pub fn is_cache_path(path: &str) -> bool {
+    path.starts_with("${cache}") || path.starts_with(".cache/")
+        || path.contains("/.cache/")
+}
+
+/// Helper to build an ArtifactManifest from explicit input/output option keys.
+///
+/// Reads the named options from `options`, strips window notation from paths,
+/// and classifies outputs as intermediate when they target the cache directory.
+pub fn manifest_from_keys(
+    step_id: &str,
+    command: &str,
+    options: &Options,
+    input_keys: &[&str],
+    output_keys: &[&str],
+) -> ArtifactManifest {
+    let mut inputs = Vec::new();
+    let mut outputs = Vec::new();
+    let mut intermediates = Vec::new();
+
+    for &key in input_keys {
+        if let Some(v) = options.get(key) {
+            // Strip window notation (e.g., "file.mvec[0..1000)")
+            let path = v.split('[').next().unwrap_or(v);
+            if !path.is_empty() && !path.starts_with("count:") {
+                inputs.push(path.to_string());
+            }
+        }
+    }
+
+    for &key in output_keys {
+        if let Some(v) = options.get(key) {
+            if is_cache_path(v) {
+                intermediates.push(v.to_string());
+            } else {
+                outputs.push(v.to_string());
+            }
+        }
+    }
+
+    ArtifactManifest {
+        step_id: step_id.to_string(),
+        command: command.to_string(),
+        inputs,
+        outputs,
+        intermediates,
+    }
+}
+
+/// Projected artifact manifest from a single pipeline step.
+///
+/// Describes the inputs consumed and outputs produced by a step, given
+/// its resolved options, without actually executing the step. Used by
+/// the check system to build a complete workspace manifest.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ArtifactManifest {
+    /// Step ID (from pipeline definition).
+    pub step_id: String,
+    /// Command path (e.g., "compute knn").
+    pub command: String,
+    /// Input files consumed (must exist before execution).
+    pub inputs: Vec<String>,
+    /// Output files produced (final artifacts).
+    pub outputs: Vec<String>,
+    /// Intermediate files produced (cache artifacts, not publishable).
+    pub intermediates: Vec<String>,
 }
 
 /// Outcome of executing a single pipeline step.

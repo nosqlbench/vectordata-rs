@@ -127,10 +127,7 @@ stdout by default, or to a file with `--output`.
 | Flag | Description |
 |------|-------------|
 | `--output <PATH>` | Write output to a file (stdout if omitted) |
-| `--text` | Export as newline-delimited text |
-| `--cstrings` | Export as null-terminated binary |
-| `--slab-format` | Export as slab format (requires `--output`) |
-| `--as-is` | Output records exactly as stored, without adding missing newlines or delimiters |
+| `--format <FORMAT>` | Output format: `raw`, `text`, `cstrings`, `hex`, `slab` |
 | `--range <SPEC>` | Ordinal range to export (e.g. `100`, `[5,10)`) |
 | `--preferred-page-size <N>` | Preferred page size (for slab output) |
 | `--min-page-size <N>` | Minimum page size (for slab output) |
@@ -138,10 +135,8 @@ stdout by default, or to a file with `--output`.
 | `--progress` | Show progress on stderr |
 | `--namespace <NAME>` | Export from a specific namespace |
 
-When no format flag is given, the output format is auto-detected from the
-`--output` extension (`.slab` → slab, everything else → text). By default,
-text mode adds a missing trailing newline to each record
-(`--add-missing-newline` behavior). Use `--as-is` to disable this.
+When `--format` is omitted, the output format is auto-detected from the
+`--output` extension (`.slab` → slab, everything else → raw).
 
 ### `slab explain <FILE>`
 
@@ -163,17 +158,20 @@ with a pages page), reports just the default namespace. For
 multi-namespace files (ending with a namespaces page), lists all
 namespace entries with their index, name, and pages page offset.
 
-### `slab completions <SHELL>`
+### `slab completions`
 
-Generate shell completion scripts for the specified shell. Supported
-shells: `bash`, `zsh`, `fish`, `elvish`, `powershell`.
+Generate shell completion scripts.
+
+| Flag | Description |
+|------|-------------|
+| `--shell <SHELL>` | Shell to generate completions for: `bash`, `zsh`, `fish`, `elvish`, `powershell` |
 
 ```bash
 # Generate bash completions
-slab completions bash > /etc/bash_completion.d/slab
+slab completions --shell bash > /etc/bash_completion.d/slab
 
 # Generate zsh completions
-slab completions zsh > ~/.zfunc/_slab
+slab completions --shell zsh > ~/.zfunc/_slab
 ```
 
 ### `slab rewrite <INPUT> <OUTPUT>`

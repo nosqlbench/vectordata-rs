@@ -119,7 +119,7 @@ if RSS climbs into the CAUTION or THROTTLE bands.
 After the run completes, open the governor log:
 
 ```sh
-cat .governor.log | head -20
+cat .cache/.governor.log | head -20
 ```
 
 Each line is a JSON object. The key entry types are:
@@ -190,13 +190,13 @@ To get a quick summary of how the governor behaved, filter by entry type:
 
 ```sh
 # Count entries by type
-cat .governor.log | jq -r '.type' | sort | uniq -c
+cat .cache/.governor.log | jq -r '.type' | sort | uniq -c
 
 # Show only decisions
-cat .governor.log | jq 'select(.type == "decision")'
+cat .cache/.governor.log | jq 'select(.type == "decision")'
 
 # Show throttle events
-cat .governor.log | jq 'select(.type == "throttle")'
+cat .cache/.governor.log | jq 'select(.type == "throttle")'
 ```
 
 ## Step 6: Tune based on what the log shows
@@ -273,7 +273,7 @@ decisions or throttle events. This confirms that resources were held constant.
 | Ran without `--resources` | Established a baseline with system defaults |
 | Added `--resources 'mem:50%'` | Set a fixed ceiling to prevent OOM |
 | Added `--resources 'mem:25%-50%,threads:4-8'` | Gave the governor room to adapt |
-| Read `.governor.log` | Understood what the governor observed and decided |
+| Read `.cache/.governor.log` | Understood what the governor observed and decided |
 | Tuned floor and ceiling | Matched the resource envelope to the actual workload |
 | Tried `--governor conservative` and `--governor fixed` | Selected a strategy that matches the operational context |
 

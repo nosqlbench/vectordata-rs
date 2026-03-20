@@ -3,9 +3,9 @@
 
 # MNode Wire Format Reference
 
-Module: `veks::formats::mnode`
+Module: `vectordata::formats::mnode`
 
-Source: `src/formats/mnode/mod.rs`
+Source: `vectordata/src/formats/mnode/mod.rs`
 
 ## Wire layout
 

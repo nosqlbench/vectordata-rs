@@ -21,6 +21,7 @@ pub use vectordata::formats::anode_vernacular;
 
 // Arrow-based parquet-to-mnode compiler — stays in veks because it depends on
 // the `arrow` crate which is not a vectordata dependency.
+pub mod facet;
 pub mod parquet_compiler;
 pub mod convert;
 pub mod reader;
@@ -31,22 +32,37 @@ use std::path::Path;
 
 use clap::ValueEnum;
 
-/// A vector data format supported for reading
+/// A vector data format recognized by veks.
+///
+/// Each variant maps to a file extension and encodes vectors with a specific
+/// element type and on-disk layout. The xvec family (`fvec`, `ivec`, etc.)
+/// stores one `[dim_header | elements...]` record per vector. `Npy` and
+/// `Parquet` are third-party container formats. `Slab` is the page-oriented
+/// binary format from the `slabtastic` crate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum VecFormat {
+    /// NumPy `.npy` — float32 arrays.
     Npy,
+    /// Apache Parquet — columnar float vectors.
     Parquet,
+    /// xvec float32 (4 bytes/element).
     Fvec,
+    /// xvec int32 (4 bytes/element).
     Ivec,
+    /// xvec uint8 packed as 4-byte groups (4 bytes/element).
     Bvec,
+    /// xvec float64 (8 bytes/element).
     Dvec,
+    /// xvec float16 / half (2 bytes/element).
     Mvec,
+    /// xvec int16 / short (2 bytes/element).
     Svec,
+    /// Page-oriented slab binary format.
     Slab,
 }
 
 impl VecFormat {
-    /// Human-readable name
+    /// Human-readable name matching the file extension (e.g. `"fvec"`, `"slab"`).
     pub fn name(self) -> &'static str {
         match self {
             Self::Npy => "npy",
@@ -61,7 +77,7 @@ impl VecFormat {
         }
     }
 
-    /// Whether this is an xvec format
+    /// Returns `true` for the xvec family (fvec, ivec, bvec, dvec, mvec, svec).
     pub fn is_xvec(self) -> bool {
         matches!(
             self,
@@ -69,7 +85,7 @@ impl VecFormat {
         )
     }
 
-    /// Element byte width for xvec formats (0 for non-xvec)
+    /// Bytes per element for xvec formats. Returns `0` for non-xvec formats.
     pub fn element_size(self) -> usize {
         match self {
             Self::Fvec | Self::Ivec | Self::Bvec => 4,
@@ -79,7 +95,7 @@ impl VecFormat {
         }
     }
 
-    /// Detect format from a file extension
+    /// Detect format from a bare file extension (e.g. `"fvec"`, `"parquet"`).
     pub fn from_extension(ext: &str) -> Option<Self> {
         match ext {
             "npy" => Some(Self::Npy),
@@ -95,13 +111,14 @@ impl VecFormat {
         }
     }
 
-    /// Detect format from a file path (by extension)
+    /// Detect format from a file path by inspecting its extension.
     pub fn detect_from_path(path: &Path) -> Option<Self> {
         let ext = path.extension()?.to_str()?;
         Self::from_extension(ext)
     }
 
-    /// Detect format from a directory's contents (first matching extension wins)
+    /// Detect format by scanning a directory's files. Returns the first
+    /// recognized format, preferring npy > parquet > xvec > slab.
     pub fn detect_from_directory(dir: &Path) -> Option<Self> {
         let entries: Vec<_> = std::fs::read_dir(dir)
             .ok()?
@@ -148,7 +165,7 @@ impl VecFormat {
         }
     }
 
-    /// Auto-detect format from either a file or directory
+    /// Auto-detect format from either a file path or a directory.
     pub fn detect(path: &Path) -> Option<Self> {
         if path.is_dir() {
             Self::detect_from_directory(path)

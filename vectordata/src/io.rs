@@ -1,17 +1,23 @@
-//! Input/Output operations for reading vector data.
+// Copyright (c) DataStax, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
+//! Vector I/O: readers for fvec, ivec, and mvec binary formats.
 //!
-//! This module provides the `VectorReader` trait and implementations for reading
-//! vectors from local files (memory-mapped) and remote HTTP sources.
+//! Provides the [`VectorReader`] trait and two concrete implementations:
 //!
-//! # Supported Formats
+//! - [`MmapVectorReader`] — memory-mapped local files (zero-copy where possible).
+//! - [`HttpVectorReader`] — remote files accessed via HTTP Range requests.
 //!
-//! - **fvec**: A binary format for floating-point vectors.
-//!   - Header: 4 bytes (int32) representing the dimension.
-//!   - Data: Sequence of vectors, each starting with the dimension (4 bytes) followed by `dim` floats.
-//! - **ivec**: Similar to fvec but for 32-bit integers (used for ground truth indices).
-//! - **mvec**: A binary format for half-precision (f16) vectors.
-//!   - Header: 4 bytes (int32) representing the dimension.
-//!   - Data: Sequence of vectors, each starting with the dimension (4 bytes) followed by `dim` f16 values (2 bytes each).
+//! # Supported formats
+//!
+//! All three formats share the same per-record layout: a 4-byte little-endian
+//! `i32` dimension header followed by `dim` elements.
+//!
+//! | Format | Element type | Element size | Open method |
+//! |--------|-------------|-------------|-------------|
+//! | **fvec** | `f32` | 4 bytes | `open_fvec` |
+//! | **ivec** | `i32` | 4 bytes | `open_ivec` |
+//! | **mvec** | `f16` (half) | 2 bytes | `open_mvec` |
 
 use std::fs::File;
 use std::io::{self, Cursor};
@@ -516,7 +522,7 @@ impl VectorReader<f32> for HttpVectorReader<f32> {
 }
 
 impl HttpVectorReader<i32> {
-    /// Opens a integer vector file from a URL.
+    /// Opens an integer vector file from a URL.
     pub fn open_ivec(url: Url) -> Result<Self, IoError> {
         let client = Client::new();
         

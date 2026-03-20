@@ -28,5 +28,5 @@ url = "2.5"
 [dev-dependencies]
 hex = "0.4"
 tempfile = "3.8"
-testserver = { path = "../testserver" }
+tiny_http = "0.12"
 url = "2.5"

@@ -85,7 +85,7 @@ trailing newline appended.
 ### To null-terminated binary
 
 ```bash
-slab export data.slab --cstrings --output records.bin
+slab export data.slab --format cstrings --output records.bin
 ```
 
 ### To another slab file
@@ -95,7 +95,7 @@ slab export data.slab --output copy.slab
 ```
 
 The output format is auto-detected from the extension (`.slab` → slab
-format). You can also force it with `--slab-format`.
+format). You can also force it with `--format slab`.
 
 ### Exporting a subset
 

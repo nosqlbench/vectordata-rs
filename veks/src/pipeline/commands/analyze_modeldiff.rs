@@ -99,7 +99,35 @@ impl CommandOp for AnalyzeModelDiffOp {
         CommandDoc {
             summary: "Compare vector distributions across two files".into(),
             body: format!(
-                "# analyze model-diff\n\nCompare vector distributions across two files.\n\n## Description\n\nLoads two VectorSpaceModel JSON files and compares them dimension-by-dimension, computing parameter drift percentages and reporting PASS/FAIL based on configurable thresholds.\n\n## Options\n\n{}",
+                "# analyze model-diff\n\n\
+                Compare vector distributions across two files.\n\n\
+                ## Description\n\n\
+                Loads two VectorSpaceModel JSON files (as produced by `analyze profile`) \
+                and compares them dimension-by-dimension. For each dimension, the command \
+                checks that the distribution types match (Normal, Beta, or Uniform) and \
+                computes a normalized parameter drift percentage. The overall result is \
+                PASS or FAIL based on configurable thresholds for average and maximum \
+                drift.\n\n\
+                ## How It Works\n\n\
+                For each dimension pair, the command:\n\n\
+                1. Checks whether the model types match (e.g., both Normal). A type \
+                mismatch is always flagged as a problem dimension.\n\
+                2. Computes normalized drift for each parameter. For Normal models, \
+                this is the average of mu-drift and sigma-drift; for Beta models, \
+                the average of alpha, beta, lower, and upper drifts.\n\
+                3. Drift is computed as `|a - b| / max(|a|, |b|) * 100%`.\n\n\
+                The summary reports the percentage of dimensions with matching types, \
+                the average and maximum drift, and the number of problem dimensions.\n\n\
+                ## Role in Dataset Preparation\n\n\
+                This command is used to verify that two statistical models are \
+                sufficiently similar. Common use cases include:\n\n\
+                - Comparing a profile taken before and after a data transformation \
+                to ensure statistical properties were preserved.\n\
+                - Comparing profiles of two dataset partitions to check for \
+                distribution shift.\n\
+                - Regression testing: ensuring that a new version of the generation \
+                pipeline produces models consistent with a known-good baseline.\n\n\
+                ## Options\n\n{}",
                 render_options_table(&options)
             ),
         }

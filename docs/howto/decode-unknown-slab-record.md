@@ -27,7 +27,7 @@ type:
 ## From Rust code
 
 ```rust
-use veks::formats::anode;
+use vectordata::formats::anode;
 
 let bytes: Vec<u8> = reader.get(ordinal).unwrap();
 

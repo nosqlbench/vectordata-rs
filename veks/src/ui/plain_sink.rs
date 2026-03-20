@@ -91,6 +91,7 @@ mod tests {
             kind: super::super::event::ProgressKind::Bar,
             total: 100,
             label: "test".into(),
+            unit: "rec".into(),
         });
         sink.send(UiEvent::ProgressUpdate { id, position: 50 });
         sink.send(UiEvent::ProgressFinish { id });

@@ -1460,7 +1460,7 @@ impl ResourceGovernor {
         }
 
         let (log, storage) = if let Some(ws) = workspace {
-            (GovernorLog::new(&ws.join(".governor.log")), detect_storage_info(ws))
+            (GovernorLog::new(&ws.join(".cache").join(".governor.log")), detect_storage_info(ws))
         } else {
             (GovernorLog::noop(), None)
         };
@@ -2543,12 +2543,10 @@ mod tests {
         // Should succeed on a real Linux system
         assert!(info.is_some(), "detect_storage_info should work on real Linux");
         let info = info.unwrap();
-        assert!(!info.device.is_empty());
-        // On this system we know it's NVMe-backed
-        assert!(
-            info.storage_type == StorageType::LocalNvme || info.storage_type == StorageType::NetworkBlock,
-            "expected NVMe or network block, got {:?}", info.storage_type,
-        );
+        assert!(!info.device.is_empty(), "device name should be non-empty");
+        // Verify the type is a valid variant (any type is acceptable —
+        // the actual type depends on the host's storage hardware)
+        let _ = info.storage_type.label();
     }
 
     #[test]

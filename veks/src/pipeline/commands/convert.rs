@@ -43,13 +43,59 @@ impl CommandOp for ConvertFileOp {
         CommandDoc {
             summary: "Convert a vector file between formats".into(),
             body: format!(
-                "# convert file\n\n\
-                 Convert a vector file between formats.\n\n\
-                 ## Description\n\n\
-                 Converts a vector file from one format to another, with optional element \
-                 type conversion (e.g. f32 to f16). Uses a read-ahead pipeline for \
-                 throughput.\n\n\
-                 ## Options\n\n{}",
+                r#"# convert file
+
+Convert a vector file between formats.
+
+## Description
+
+The convert file command transforms a vector file from one format to another.
+It supports all recognized vector formats including fvec, ivec, bvec, npy, mvec,
+slab, and xvec. Both the source and target formats can be specified explicitly,
+or the source format can be auto-detected from the file extension.
+
+When the source and target formats use different element sizes, the command
+performs element widening or narrowing automatically. For example, converting
+from fvec (f32, 4 bytes per element) to a half-precision format (f16, 2 bytes
+per element) narrows each element, while going from bvec (u8, 1 byte) to fvec
+widens them. The conversion is applied per-element across every dimension of
+every record.
+
+Internally, the command uses a read-ahead pipeline architecture: a background
+reader thread fills a bounded channel with source records while the main thread
+handles element conversion and writes to the output sink. This design hides I/O
+latency behind conversion work, keeping throughput high even for large files.
+The read-ahead buffer holds up to 4096 records.
+
+Common format pairs include:
+
+- npy to fvec or ivec -- converting numpy exports to native vector formats
+- fvec to mvec -- migrating to memory-mapped layout
+- bvec to fvec -- widening byte vectors to float vectors
+- any format to slab -- converting to paged slab storage
+
+## Data Preparation Role
+
+The convert command is typically used as a standalone operation rather than as
+part of a multi-step pipeline. It is most useful for format migration: when
+source data arrives in one format but downstream tools or benchmarks require
+another. In pipeline contexts, the import command usually handles format
+selection automatically, so explicit conversion is only needed for special cases
+such as changing element precision after an initial import.
+
+## Examples
+
+Convert a numpy file to fvec format:
+
+    convert file --source vectors.npy --output vectors.fvec --to fvec
+
+Convert with explicit source format override:
+
+    convert file --source data.bin --output data.fvec --from bvec --to fvec
+
+## Options
+
+{}"#,
                 render_options_table(&options)
             ),
         }

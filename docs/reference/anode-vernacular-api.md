@@ -3,9 +3,9 @@
 
 # ANode Vernacular API Reference
 
-Module: `veks::formats::anode_vernacular`
+Module: `vectordata::formats::anode_vernacular`
 
-Source: `src/formats/anode_vernacular.rs`
+Source: `vectordata/src/formats/anode_vernacular.rs`
 
 ## Types
 

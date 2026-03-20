@@ -12,7 +12,8 @@
 use std::time::Instant;
 
 use crate::pipeline::command::{
-    CommandDoc, CommandOp, CommandResult, OptionDesc, Options, Status, StreamContext,
+    ArtifactManifest, CommandDoc, CommandOp, CommandResult, OptionDesc, Options, Status,
+    StreamContext,
 };
 
 pub struct BarrierOp;
@@ -29,9 +30,36 @@ impl CommandOp for BarrierOp {
     fn command_doc(&self) -> CommandDoc {
         CommandDoc {
             summary: "Synchronization barrier between profile groups".into(),
-            body: "# barrier\n\nNo-op synchronization point. All steps in the \
-                   next profile group depend on this barrier, ensuring sequential \
-                   profile execution."
+            body: r#"# barrier
+
+No-op synchronization point between profile groups.
+
+## Description
+
+A barrier is a no-op command whose sole purpose is to serve as a
+dependency target in the pipeline execution graph. It produces no
+output and performs no computation.
+
+## How It Works
+
+When the pipeline engine inserts a barrier step between two profile
+groups, it wires the dependency graph so that all steps in the next
+profile group depend on the barrier, and the barrier depends on all
+steps in the previous profile group. This creates a synchronization
+fence: no step in the next group can begin until every step in the
+previous group has completed. The barrier itself executes instantly,
+logging a single status message.
+
+## Data Preparation Role
+
+Barriers enforce sequential execution of profile groups within a
+pipeline. Profiles represent different dataset configurations (e.g.
+a full-scale profile and a 1M-record subset profile) that share
+common base data. The barrier guarantees that shared data preparation
+(downloading, importing, vector assembly) completes before
+profile-specific steps (index building, query set generation) begin.
+Without barriers, the pipeline scheduler could overlap steps from
+different profile groups, leading to race conditions on shared files."#
                 .into(),
         }
     }
@@ -49,5 +77,15 @@ impl CommandOp for BarrierOp {
 
     fn describe_options(&self) -> Vec<OptionDesc> {
         vec![]
+    }
+
+    fn project_artifacts(&self, step_id: &str, _options: &Options) -> ArtifactManifest {
+        ArtifactManifest {
+            step_id: step_id.to_string(),
+            command: self.command_path().to_string(),
+            inputs: vec![],
+            outputs: vec![],
+            intermediates: vec![],
+        }
     }
 }

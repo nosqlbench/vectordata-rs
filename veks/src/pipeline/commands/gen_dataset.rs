@@ -52,10 +52,43 @@ Generate a complete synthetic dataset.
 
 ## Description
 
-Creates a full dataset directory containing base vectors, query vectors,
-ground truth nearest-neighbor indices, ground truth distances, and a
-dataset.yaml descriptor file. Uses SIMD-accelerated distance computation
-for ground truth KNN.
+Creates a fully self-contained dataset directory in a single command by
+orchestrating multiple generation steps internally. The output directory
+contains everything needed for ANN benchmarking:
+
+- `base.fvec` -- the base (corpus) vectors to index
+- `query.fvec` -- the query vectors to search with
+- `indices.ivec` -- ground truth K-nearest-neighbor indices for each query
+- `distances.fvec` -- ground truth distances corresponding to each neighbor
+- `dataset.yaml` -- a descriptor file with metadata (dimension, counts,
+  distance metric, seed, etc.)
+
+## How it works
+
+1. **Base vectors** are generated as uniformly random f32 vectors in the
+   configured `[min, max)` range.
+2. **Query vectors** are generated independently from the same distribution
+   (they are *not* drawn from the base set).
+3. **Ground truth KNN** is computed by brute-force exact search using
+   SIMD-accelerated distance functions. For each query, all base vectors
+   are scored and the top-K nearest neighbors (by the configured distance
+   metric) are retained. Supported metrics include L2, Cosine, DotProduct,
+   and L1.
+
+If a `dataset.yaml` already exists in the output directory, the command
+will refuse to overwrite unless `force=true`.
+
+## Role in dataset pipelines
+
+This is a convenience command for quickly producing small to mid-sized
+test datasets from scratch. It is the fastest way to get a complete
+dataset for development and integration testing.
+
+For larger or more realistic datasets, the individual pipeline steps
+(`generate vectors`, `generate ivec-shuffle`, `transform fvec-extract`,
+and a separate KNN computation) give more control over the generation
+process -- for example, allowing self-search splits, model-based vector
+generation, or half-precision storage.
 
 ## Options
 

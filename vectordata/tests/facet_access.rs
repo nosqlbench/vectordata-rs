@@ -8,7 +8,8 @@ use std::fs;
 use std::io::Write;
 use std::path::Path;
 
-use testserver::TestServer;
+mod support;
+use support::testserver::TestServer;
 use vectordata::io::{HttpVectorReader, VectorReader};
 use vectordata::TestDataGroup;
 

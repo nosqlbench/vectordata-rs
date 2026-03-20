@@ -1,12 +1,14 @@
 // Copyright (c) DataStax, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Shell completion support.
+//! CLI argument parsing and shell completion support.
 //!
-//! Completions are handled dynamically by `veks` itself via
-//! `clap_complete::CompleteEnv`. The `completions` subcommand outputs a
-//! minimal, sourceable registration snippet that wires up the shell to
-//! delegate completion requests back to `veks`.
+//! Built on [`clap`] and [`clap_complete`], this module provides dynamic
+//! shell completions for bash, zsh, fish, elvish, and PowerShell.
+//! Completions are handled by `veks` itself via `clap_complete::CompleteEnv`.
+//! The `completions` subcommand outputs a minimal, sourceable registration
+//! snippet that wires up the shell to delegate completion requests back
+//! to `veks`.
 //!
 //! Usage:
 //! ```sh

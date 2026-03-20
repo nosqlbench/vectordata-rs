@@ -29,6 +29,7 @@ pub mod command;
 pub mod commands;
 pub mod dag;
 pub mod interpolate;
+pub mod manifest;
 pub mod predicate;
 pub mod resource;
 pub mod rng;
@@ -53,8 +54,8 @@ use registry::CommandRegistry;
 /// CLI arguments for `veks run`.
 #[derive(Args)]
 pub struct RunArgs {
-    /// Path to dataset.yaml containing the pipeline definition.
-    pub dataset: PathBuf,
+    /// Path to dataset.yaml (default: dataset.yaml in current directory)
+    pub dataset: Option<PathBuf>,
 
     /// Run steps for a specific profile, or `all` to run every profile
     /// with barriers between them. Steps with a `profiles` field are gated:
@@ -113,8 +114,8 @@ pub struct RunArgs {
 /// CLI arguments for `veks script`.
 #[derive(Args)]
 pub struct ScriptArgs {
-    /// Path to dataset.yaml containing the pipeline definition.
-    pub dataset: PathBuf,
+    /// Path to dataset.yaml (default: dataset.yaml in current directory)
+    pub dataset: Option<PathBuf>,
 
     /// Emit steps for a specific profile, or `all` for every profile.
     #[arg(long, default_value = "all")]
@@ -133,7 +134,17 @@ pub struct ScriptArgs {
 
 /// Entry point for `veks script` — emit a pipeline as CLI commands.
 pub fn run_script(args: ScriptArgs) {
-    let dataset_path = &args.dataset;
+    let dataset_path = args.dataset.unwrap_or_else(|| {
+        let default = PathBuf::from("dataset.yaml");
+        if default.exists() {
+            println!("Using dataset.yaml in current directory");
+            default
+        } else {
+            eprintln!("Error: no dataset.yaml specified and none found in current directory");
+            std::process::exit(1);
+        }
+    });
+    let dataset_path = &dataset_path;
 
     let config = DatasetConfig::load(dataset_path).unwrap_or_else(|e| {
         println!("{}", e);
@@ -231,7 +242,17 @@ pub fn run_script(args: ScriptArgs) {
 
 /// Entry point for `veks run` — execute a command stream pipeline.
 pub fn run_pipeline(args: RunArgs) {
-    let dataset_path = &args.dataset;
+    let dataset_path = args.dataset.unwrap_or_else(|| {
+        let default = PathBuf::from("dataset.yaml");
+        if default.exists() {
+            println!("Using dataset.yaml in current directory");
+            default
+        } else {
+            eprintln!("Error: no dataset.yaml specified and none found in current directory");
+            std::process::exit(1);
+        }
+    });
+    let dataset_path = &dataset_path;
 
     // Load dataset config
     let mut config = DatasetConfig::load(dataset_path).unwrap_or_else(|e| {
@@ -459,23 +480,80 @@ pub fn run_pipeline(args: RunArgs) {
     // Run
     let result = runner::run_steps(&pipeline_dag.steps, &registry, &mut ctx);
 
+    // Retrieve buffered log messages before dropping the TUI.
+    let console_log = ctx.ui.take_console_log();
+
     // Drop ctx (including the UI handle) to restore the terminal before
     // printing any messages. Without this, error output goes to the
     // alternate screen and is lost when the ratatui sink is dropped.
     drop(ctx);
 
-    if let Err(e) = result {
-        eprintln!("\nPipeline failed: {}", e);
-        eprintln!(
-            "Scratch directory preserved for debugging: {}",
-            scratch_dir.display()
-        );
-        eprintln!("Run with --clean to reset.");
-        std::process::exit(1);
+    // Replay buffered log messages to stdout so they persist in scrollback.
+    if !console_log.is_empty() {
+        println!();
+        for msg in &console_log {
+            println!("{}", msg);
+        }
+    }
+
+    match result {
+        Err(e) => {
+            eprintln!("\nPipeline failed: {}", e);
+            eprintln!(
+                "Scratch directory preserved for debugging: {}",
+                scratch_dir.display()
+            );
+            eprintln!("Run with --clean to reset.");
+            std::process::exit(1);
+        }
+        Ok(summary) => {
+            print_run_summary(&summary);
+        }
     }
 
     // On success, clean scratch directory contents
     clean_scratch_contents(&scratch_dir);
+}
+
+/// Print a post-TUI run summary to stdout.
+///
+/// This runs after the ratatui alternate screen is gone, so the output
+/// persists in the user's terminal scrollback.
+fn print_run_summary(summary: &runner::RunSummary) {
+    println!();
+
+    if summary.executed == 0 && summary.skipped == summary.total {
+        // All steps were fresh — show a compact confirmation
+        println!("Pipeline: all {} steps verified fresh — nothing to do.", summary.total);
+        // Show a few representative step names so the user knows what was checked
+        let show = summary.step_outcomes.len().min(6);
+        for (id, _, reason) in &summary.step_outcomes[..show] {
+            println!("  {} — {}", id, reason);
+        }
+        if summary.step_outcomes.len() > show {
+            println!("  ... and {} more", summary.step_outcomes.len() - show);
+        }
+    } else if summary.skipped > 0 {
+        println!(
+            "Pipeline complete: {} executed ({:.1}s), {} skipped (fresh), {} total.",
+            summary.executed,
+            summary.total_elapsed.as_secs_f64(),
+            summary.skipped,
+            summary.total,
+        );
+        // Show what actually ran
+        for (id, executed, msg) in &summary.step_outcomes {
+            if *executed {
+                println!("  {} — {}", id, msg);
+            }
+        }
+    } else {
+        println!(
+            "Pipeline complete: {} steps executed in {:.1}s.",
+            summary.executed,
+            summary.total_elapsed.as_secs_f64(),
+        );
+    }
 }
 
 /// Collect all pipeline steps from the config's top-level upstream.

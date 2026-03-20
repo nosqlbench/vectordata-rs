@@ -5,6 +5,22 @@
 t = "test --release"
 b = "build --release"
 
+# Direct all test temp files to target/test-tmp/ instead of /tmp.
+[env]
+TMPDIR = { value = "target/test-tmp", relative = true }
+
+# Use mold linker for final binaries — dramatically faster than ld for
+# large binaries (~350 MB debug). mold parallelizes across all cores.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+
+[profile.dev]
+# Split debuginfo into separate files — smaller binary, faster link.
+split-debuginfo = "unpacked"
+# Optimize dependencies but not workspace crates (fast recompile of our code).
+[profile.dev.package."*"]
+opt-level = 2
+
 [profile.release]
 # Keep debug info for profiling while still optimizing.
 debug = 1

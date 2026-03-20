@@ -24,4 +24,13 @@ pub trait UiSink: Send + Sync {
 
     /// Allocate a fresh [`ProgressId`] unique within this sink.
     fn next_progress_id(&self) -> ProgressId;
+
+    /// Retrieve buffered log messages for post-session console output.
+    ///
+    /// Sinks that render to an alternate screen (ratatui) buffer all log
+    /// messages so they can be replayed to stdout after the TUI exits.
+    /// Other sinks return an empty vec (their output already went to stdout).
+    fn take_console_log(&self) -> Vec<String> {
+        Vec::new()
+    }
 }

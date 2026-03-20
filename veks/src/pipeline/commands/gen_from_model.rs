@@ -151,9 +151,45 @@ Generate vectors using an embedding model.
 
 ## Description
 
-Loads a VectorSpaceModel JSON file (produced by profile analysis or
-`generate sketch --model-out`) and generates synthetic vectors by sampling
-each dimension from its fitted distribution via inverse CDF transform.
+Reads a `model.json` file describing per-dimension distribution parameters
+and generates synthetic vectors that statistically match a real dataset's
+profile. Each dimension is sampled independently from its fitted
+distribution (Normal, Beta, or Uniform) via inverse CDF transform.
+
+The model JSON format contains a `dimensions` count and a `models` array
+with one entry per dimension. Each entry specifies a distribution type and
+its parameters:
+
+- **normal** -- `mean` and `std_dev`
+- **beta** -- `alpha`, `beta`, `lower`, `upper` (samples are scaled from
+  `[0,1]` to `[lower, upper]`)
+- **uniform** -- `lower` and `upper`
+
+The number of entries in the `models` array must exactly match the
+`dimensions` field; a mismatch is an error.
+
+## Deterministic generation
+
+When the same `seed` is used with the same model file, the output is
+byte-identical across runs. This allows reproducible benchmarks even when
+the underlying real dataset cannot be distributed.
+
+## Role in dataset pipelines
+
+This command is the generation half of the derive-then-generate workflow
+for creating realistic synthetic datasets:
+
+1. **Derive** -- `generate derive` reads a real dataset and extracts a
+   `model.json` capturing per-dimension statistics (mean, variance, shape).
+2. **Generate** -- `generate from-model` reads that `model.json` and
+   produces an arbitrary number of synthetic vectors whose per-dimension
+   distributions match the real data.
+
+The resulting synthetic vectors preserve the statistical fingerprint of
+the original dataset -- dimension-wise means, variances, and distributional
+shapes -- without containing any of the original data. This is useful for
+benchmarking ANN algorithms on realistic workloads when the real dataset
+is proprietary or too large to distribute.
 
 ## Options
 

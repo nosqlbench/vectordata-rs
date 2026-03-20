@@ -70,16 +70,22 @@ use std::io::{self, Cursor, Read, Write};
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 
-/// Conjugate type discriminant — the first byte of every node
+/// Conjugate type discriminant — the first byte of every node.
+///
+/// `Pred` marks a leaf predicate; `And` and `Or` mark interior boolean nodes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum ConjugateType {
+    /// Leaf predicate node.
     Pred = 0,
+    /// Boolean AND conjunction.
     And = 1,
+    /// Boolean OR disjunction.
     Or = 2,
 }
 
 impl ConjugateType {
+    /// Decode from the raw wire byte. Returns `None` for unrecognized values.
     pub fn from_u8(v: u8) -> Option<Self> {
         match v {
             0 => Some(Self::Pred),
@@ -100,21 +106,30 @@ impl fmt::Display for ConjugateType {
     }
 }
 
-/// Comparison operator type
+/// Comparison operator for predicate leaf nodes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum OpType {
+    /// Greater than (`>`).
     Gt = 0,
+    /// Less than (`<`).
     Lt = 1,
+    /// Equal (`=`).
     Eq = 2,
+    /// Not equal (`!=`).
     Ne = 3,
+    /// Greater than or equal (`>=`).
     Ge = 4,
+    /// Less than or equal (`<=`).
     Le = 5,
+    /// Set membership (`IN`).
     In = 6,
+    /// Pattern match (`MATCHES`).
     Matches = 7,
 }
 
 impl OpType {
+    /// Decode from the raw wire byte. Returns `None` for unrecognized values.
     pub fn from_u8(v: u8) -> Option<Self> {
         match v {
             0 => Some(Self::Gt),
@@ -150,10 +165,12 @@ impl fmt::Display for OpType {
     }
 }
 
-/// Field reference — either by index or by name
+/// Field reference in a predicate node — either a positional index or a name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FieldRef {
+    /// Positional field index (indexed wire format).
     Index(u8),
+    /// Field name string (named wire format).
     Named(String),
 }
 
@@ -224,27 +241,35 @@ impl fmt::Display for Comparand {
     }
 }
 
-/// A predicate tree node
+/// A predicate tree node — either a leaf comparison or a boolean combinator.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PNode {
-    /// Leaf predicate: field op comparands
+    /// Leaf predicate: `field op (v1, v2, ...)`.
     Predicate(PredicateNode),
-    /// Boolean conjunction: AND or OR of children
+    /// Boolean conjunction: AND or OR of child nodes.
     Conjugate(ConjugateNode),
 }
 
-/// Leaf node: `field op (v1, v2, ...)`
+/// Leaf predicate node: `field op (v1, v2, ...)`.
+///
+/// For single-comparand operators (Gt, Lt, Eq, etc.) the `comparands` vec
+/// has one element. For `In`, it holds the membership set.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PredicateNode {
+    /// The field this predicate tests.
     pub field: FieldRef,
+    /// The comparison operator.
     pub op: OpType,
+    /// One or more comparand values.
     pub comparands: Vec<Comparand>,
 }
 
-/// Interior node: AND/OR of child nodes
+/// Interior boolean node: AND/OR combining child sub-trees.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ConjugateNode {
+    /// Whether this is an AND or OR combination.
     pub conjugate_type: ConjugateType,
+    /// Child predicate sub-trees.
     pub children: Vec<PNode>,
 }
 

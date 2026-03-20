@@ -1,11 +1,13 @@
 <!-- Copyright (c) DataStax, Inc. -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# Veks Design Documentation
+# vectordata-rs Design Documentation
 
 This directory contains the software requirements and design specification for
-veks, the CLI for bulk processing of vector datasets used in approximate nearest
-neighbor (ANN) benchmarking.
+the vectordata-rs workspace — veks (CLI), vectordata (shared types and access
+layer), and slabtastic (page-aligned record container) — used in bulk
+processing of vector datasets for approximate nearest neighbor (ANN)
+benchmarking.
 
 ## Documents
 
@@ -20,16 +22,19 @@ neighbor (ANN) benchmarking.
 | [07-command-documentation.md](07-command-documentation.md) | Built-in markdown documentation for commands, completion summaries, and help rendering |
 | [08-progress-display.md](08-progress-display.md) | UI-agnostic eventing layer: event algebra, sink trait, handle facade, and rendering backends |
 | [09-vectordata-access-layer.md](09-vectordata-access-layer.md) | vectordata crate: VectorReader trait, mmap/HTTP backends, dataset access |
+| [10-dataset-publishing.md](10-dataset-publishing.md) | S3 publishing: `.publish_url` binding, `veks publish` sync command, file filtering |
+| [11-preflight-checks.md](11-preflight-checks.md) | `veks check`: pipeline completeness, publish URL binding, merkle coverage |
+| [12-dataset-import-flowchart.md](12-dataset-import-flowchart.md) | `datasets import`: universal pipeline generation flowchart, input axes, stage activation rules |
 
 ## Audience
 
 - **Developers** extending or maintaining the veks codebase
 - **Operators** running large-scale dataset preparation pipelines
-- **Architects** designing the active resource management subsystem
+- **Contributors** to the vectordata access layer
 
 ## Scope
 
-This specification covers veks as of `main` branch, March 2026. It captures
+This specification covers the vectordata-rs workspace as of `main` branch, March 2026. It captures
 the current implementation faithfully and identifies gaps — particularly in
 resource management — that must be addressed before running heavy workloads
 reliably on constrained systems.

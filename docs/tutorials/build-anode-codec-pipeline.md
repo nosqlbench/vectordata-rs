@@ -8,13 +8,13 @@ to encode, decode, and render metadata and predicate records.
 
 ## Prerequisites
 
-- The `veks` crate as a dependency (or working within the veks-rs source tree)
+- The `vectordata` crate as a dependency (or working within the vectordata-rs source tree)
 - Basic familiarity with MNode and PNode structures
 
 ## Step 1: Create an MNode record
 
 ```rust
-use veks::formats::mnode::{MNode, MValue};
+use vectordata::formats::mnode::{MNode, MValue};
 
 let mut node = MNode::new();
 node.insert("name".into(), MValue::Text("alice".into()));
@@ -39,7 +39,7 @@ Use the `anode` module to decode bytes without knowing the record type in
 advance:
 
 ```rust
-use veks::formats::anode;
+use vectordata::formats::anode;
 
 let decoded = anode::decode(&bytes).unwrap();
 match &decoded {
@@ -51,7 +51,7 @@ match &decoded {
 ## Step 4: Render to human-readable text (Stage 2)
 
 ```rust
-use veks::formats::anode_vernacular::{self, Vernacular};
+use vectordata::formats::anode_vernacular::{self, Vernacular};
 
 // Render as JSON
 let json = anode_vernacular::render(&decoded, Vernacular::Json);
@@ -79,7 +79,7 @@ let re_encoded = anode::encode(&parsed);
 ## Step 6: Work with PNode records
 
 ```rust
-use veks::formats::pnode::*;
+use vectordata::formats::pnode::*;
 
 let predicate = PNode::Conjugate(ConjugateNode {
     conjugate_type: ConjugateType::And,

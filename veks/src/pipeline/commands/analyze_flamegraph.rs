@@ -262,7 +262,39 @@ impl CommandOp for AnalyzeFlamegraphOp {
         CommandDoc {
             summary: "Generate flamegraph SVG from profiling data".into(),
             body: format!(
-                "# analyze flamegraph\n\nGenerate flamegraph SVG from profiling data.\n\n## Description\n\nReads folded stack trace files (Brendan Gregg's format) and renders a text-based flame graph using Unicode block characters and ANSI colors. Each row represents a stack depth level with wider bars indicating more samples.\n\n## Options\n\n{}",
+                "# analyze flamegraph\n\n\
+                Generate flamegraph SVG from profiling data.\n\n\
+                ## Description\n\n\
+                Reads folded stack trace files in Brendan Gregg's format (as produced by \
+                `perf script | stackcollapse-perf.pl`) and renders a Unicode text-based \
+                flame graph directly in the terminal using block characters and ANSI \
+                256-color coding.\n\n\
+                ## Input Format\n\n\
+                Each line of the input file contains a semicolon-delimited stack trace \
+                followed by a space and a sample count:\n\n\
+                ```\n\
+                main;process;compute 500\n\
+                main;process;io_wait 300\n\
+                main;gc 200\n\
+                ```\n\n\
+                Lines starting with `#` are treated as comments and blank lines are \
+                skipped.\n\n\
+                ## How It Works\n\n\
+                The command parses the folded stacks into a tree structure where each \
+                node tracks self-time and total-time sample counts. The tree is then \
+                rendered level-by-level (BFS order), with each frame's width proportional \
+                to its total sample count relative to the parent. Frames with fewer than \
+                `min-samples` are elided to reduce visual clutter. Color coding uses \
+                heuristics based on frame names: green for Java/JVM frames, orange for \
+                kernel frames, yellow for C++ (demangled names with `::` or `_Z` prefix), \
+                red for libc/syscall frames, and warm tones for everything else.\n\n\
+                ## Role in Dataset Preparation\n\n\
+                Flame graphs are useful for profiling the performance of distance \
+                computation, KNN search, and other CPU-intensive pipeline steps. By \
+                visualizing where time is spent, you can identify bottlenecks in the \
+                vector processing pipeline and decide whether to adjust thread counts, \
+                batch sizes, or algorithmic parameters.\n\n\
+                ## Options\n\n{}",
                 render_options_table(&options)
             ),
         }

@@ -49,12 +49,48 @@ impl CommandOp for CleanupCleanfvecOp {
         CommandDoc {
             summary: "Clean and repair a malformed fvec file".into(),
             body: format!(
-                "# cleanup cleanfvec\n\n\
-                 Clean and repair a malformed fvec file.\n\n\
-                 ## Description\n\n\
-                 Detects and removes trailing bytes, zero vectors, and duplicate vectors. \
-                 Writes a cleaned output file and reports what was removed.\n\n\
-                 ## Options\n\n{}",
+                r#"# cleanup cleanfvec
+
+Clean and repair a malformed fvec file.
+
+## Description
+
+Detects and removes trailing bytes, zero vectors, and duplicate
+vectors from an fvec (float32) vector file. Writes a cleaned output
+file and reports exactly what was removed: trailing byte count, zero
+vectors removed, and duplicate vectors removed.
+
+## How It Works
+
+The command reads the source fvec file, determines the dimension from
+the first record's 4-byte header, and computes the per-vector byte
+size. It then iterates over all complete vectors in the file, applying
+the enabled filters in order:
+
+1. **Trailing bytes**: Any bytes beyond the last complete vector are
+   silently discarded (they indicate truncation or corruption).
+2. **Zero vectors** (enabled by default): Vectors where every
+   component is zero are removed, as they are typically artifacts of
+   failed data extraction.
+3. **Duplicate vectors** (disabled by default): Vectors with identical
+   content (detected via FNV-1a hashing) are deduplicated, keeping
+   only the first occurrence.
+
+Vectors that pass all filters are written to the output file.
+
+## Data Preparation Role
+
+`cleanup cleanfvec` is a data hygiene step applied after downloading
+or extracting vector files. Malformed fvec files are common when
+downloading from external sources -- partial HTTP transfers leave
+trailing bytes, embedding extraction failures produce zero vectors,
+and data pipeline bugs can introduce duplicates. Running this command
+before index building ensures that the vector file contains only valid,
+unique vectors, preventing wasted storage and incorrect KNN results.
+
+## Options
+
+{}"#,
                 render_options_table(&options)
             ),
         }

@@ -125,7 +125,7 @@ derive              # Derive new facets from existing data
 fvec-extract        # Extract a subset of vectors from an fvec file
 mvec-extract        # Extract a subset of vectors from an mvec file
 ivec-extract        # Extract a subset of vectors from an ivec file
-metadata-indices      # Evaluate predicates against metadata to produce match ordinals
+metadata-indices      # Compute predicates against metadata to produce match ordinals
 predicates          # Generate random predicate trees from metadata survey
 vectors             # Generate synthetic random vectors
 ```

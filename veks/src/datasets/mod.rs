@@ -11,8 +11,10 @@
 mod cache;
 mod curlify;
 pub mod filter;
+pub mod import;
 mod list;
 mod prebuffer;
+mod wizard;
 
 use std::path::PathBuf;
 
@@ -27,6 +29,7 @@ pub struct DatasetsArgs {
     pub command: DatasetsCommand,
 }
 
+/// Available subcommands under `veks datasets`.
 #[derive(Subcommand)]
 pub enum DatasetsCommand {
     /// List available datasets from configured or specified catalogs
@@ -168,6 +171,76 @@ pub enum DatasetsCommand {
         #[arg(long)]
         cache_dir: Option<PathBuf>,
     },
+    /// Bootstrap a new dataset directory from source files
+    Import {
+        /// Interactive wizard mode — prompts for each option
+        #[arg(long, short = 'i')]
+        interactive: bool,
+
+        /// Dataset name (required unless --interactive)
+        #[arg(long)]
+        name: Option<String>,
+
+        /// Output directory for the new dataset (required unless --interactive)
+        #[arg(long, short = 'o')]
+        output: Option<PathBuf>,
+
+        /// Path to base vectors (file or directory)
+        #[arg(long)]
+        base_vectors: Option<PathBuf>,
+
+        /// Path to separate query vectors (file or directory)
+        #[arg(long)]
+        query_vectors: Option<PathBuf>,
+
+        /// Extract queries from base via shuffle (default when no --query-vectors)
+        #[arg(long)]
+        self_search: bool,
+
+        /// Number of query vectors in self-search mode
+        #[arg(long, default_value = "10000")]
+        query_count: u32,
+
+        /// Path to metadata (file or directory)
+        #[arg(long)]
+        metadata: Option<PathBuf>,
+
+        /// Pre-computed ground truth indices (ivec file)
+        #[arg(long)]
+        ground_truth: Option<PathBuf>,
+
+        /// Pre-computed ground truth distances (fvec file)
+        #[arg(long)]
+        ground_truth_distances: Option<PathBuf>,
+
+        /// Distance metric for KNN computation
+        #[arg(long, default_value = "L2")]
+        metric: String,
+
+        /// Number of neighbors for KNN ground truth
+        #[arg(long, default_value = "100")]
+        neighbors: u32,
+
+        /// Random seed for shuffle
+        #[arg(long, default_value = "42")]
+        seed: u32,
+
+        /// Dataset description
+        #[arg(long)]
+        description: Option<String>,
+
+        /// Skip deduplication stage
+        #[arg(long)]
+        no_dedup: bool,
+
+        /// Skip filtered KNN even when metadata is present
+        #[arg(long)]
+        no_filtered: bool,
+
+        /// Overwrite existing dataset.yaml
+        #[arg(long)]
+        force: bool,
+    },
     /// Generate and manage dataset catalog index files
     #[command(disable_help_subcommand = true)]
     Catalog {
@@ -176,6 +249,7 @@ pub enum DatasetsCommand {
     },
 }
 
+/// Subcommands under `veks datasets catalog`.
 #[derive(Subcommand)]
 pub enum CatalogSubcommand {
     /// Generate catalog.json and catalog.yaml from dataset directories
@@ -252,6 +326,32 @@ pub fn run(args: DatasetsArgs) {
         }
         DatasetsCommand::Prebuffer { dataset, configdir, catalog, at, cache_dir } => {
             prebuffer::run(&dataset, &configdir, &catalog, &at, cache_dir.as_deref());
+        }
+        DatasetsCommand::Import {
+            interactive, name, output, base_vectors, query_vectors,
+            self_search, query_count, metadata, ground_truth,
+            ground_truth_distances, metric, neighbors, seed, description,
+            no_dedup, no_filtered, force,
+        } => {
+            if interactive {
+                let args = wizard::run_wizard();
+                import::run(args);
+            } else {
+                let name = name.unwrap_or_else(|| {
+                    eprintln!("Error: --name is required (or use --interactive)");
+                    std::process::exit(1);
+                });
+                let output = output.unwrap_or_else(|| {
+                    eprintln!("Error: --output is required (or use --interactive)");
+                    std::process::exit(1);
+                });
+                import::run(import::ImportArgs {
+                    name, output, base_vectors, query_vectors, self_search,
+                    query_count, metadata, ground_truth, ground_truth_distances,
+                    metric, neighbors, seed, description, no_dedup, no_filtered,
+                    force,
+                });
+            }
         }
         DatasetsCommand::Catalog { command } => {
             match command {

@@ -187,13 +187,42 @@ impl CommandOp for InfoFileOp {
         CommandDoc {
             summary: "Display file format, dimensions, and record count".into(),
             body: format!(
-                "# info file\n\n\
-                 Display file format, dimensions, and record count.\n\n\
-                 ## Description\n\n\
-                 Reads a vector file header and reports format, dimensions, vector count, \
-                 file size, element type, and optional sample vectors. Supports xvec formats: \
-                 fvec, ivec, bvec, dvec, mvec.\n\n\
-                 ## Options\n\n{}",
+                r#"# info file
+
+Display file format, dimensions, and record count.
+
+## Description
+
+Reads a vector file header and reports format, dimensions, vector count,
+file size, element type, per-vector byte overhead, and optional sample
+vectors. Supports all xvec formats: fvec (float32), ivec (int32),
+bvec (uint8), dvec (float64), and mvec (float16).
+
+## How It Works
+
+The command detects the file format from the extension, reads the first
+four bytes to obtain the dimension count, then computes the per-vector
+byte size (4-byte header + dimensions * element size). The total vector
+count is derived by dividing the file size by the per-vector size.
+Trailing bytes (file size not evenly divisible) are reported as a
+warning indicating possible truncation or corruption. When samples are
+requested, the command reads the first N vectors and displays their
+component values (up to 8 dimensions shown, with an ellipsis for
+higher-dimensional vectors).
+
+## Data Preparation Role
+
+`info file` provides quick validation of vector file integrity and
+is often the first command run on a newly downloaded or generated
+vector file. It confirms that the file has the expected format,
+dimension, and record count before expensive downstream operations
+like index building or KNN computation begin. The trailing-bytes
+check catches truncated downloads or failed writes that would cause
+subtle errors in later pipeline steps.
+
+## Options
+
+{}"#,
                 render_options_table(&options)
             ),
         }

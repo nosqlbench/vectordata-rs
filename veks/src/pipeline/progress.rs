@@ -4,7 +4,7 @@
 //! Progress log for command stream pipelines.
 //!
 //! Tracks the status of each pipeline step in a persistent YAML file
-//! (`.upstream.progress.yaml`) next to the `dataset.yaml`. This enables
+//! (`.cache/.upstream.progress.yaml`) in the workspace cache directory. This enables
 //! skip-if-fresh semantics: completed steps are skipped on re-run unless
 //! their inputs have changed.
 
@@ -25,7 +25,7 @@ const PROGRESS_SCHEMA_VERSION: u32 = 3;
 
 /// Persistent progress log for a pipeline execution.
 ///
-/// Stored as `.upstream.progress.yaml` next to the dataset.yaml file.
+/// Stored as `.cache/.upstream.progress.yaml` in the workspace cache directory.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProgressLog {
     /// Path to the progress file on disk.
@@ -172,11 +172,39 @@ impl ProgressLog {
 
     /// Derive the progress log path from a dataset.yaml path.
     ///
-    /// Returns `<dir>/.upstream.progress.yaml` where `<dir>` is the directory
-    /// containing the dataset file.
+    /// Returns `<dir>/.cache/.upstream.progress.yaml` where `<dir>` is the
+    /// directory containing the dataset file. The progress log lives in the
+    /// cache directory because it is an expensive-to-recompute workspace
+    /// artifact, not a publishable dataset file.
+    ///
+    /// If a progress log exists at the old location (`<dir>/.upstream.progress.yaml`)
+    /// and not at the new location, it is migrated automatically.
     pub fn path_for_dataset(dataset_path: &Path) -> PathBuf {
         let dir = dataset_path.parent().unwrap_or(Path::new("."));
-        dir.join(".upstream.progress.yaml")
+        let new_path = dir.join(".cache").join(".upstream.progress.yaml");
+        let old_path = dir.join(".upstream.progress.yaml");
+
+        // Migrate from old location if needed
+        if old_path.exists() {
+            if !new_path.exists() {
+                // Ensure .cache/ exists
+                let cache_dir = dir.join(".cache");
+                if std::fs::create_dir_all(&cache_dir).is_ok() {
+                    if std::fs::rename(&old_path, &new_path).is_ok() {
+                        log::info!(
+                            "Migrated progress log: {} → {}",
+                            old_path.display(),
+                            new_path.display(),
+                        );
+                    }
+                }
+            } else {
+                // Both exist — new location is authoritative, remove orphan
+                let _ = std::fs::remove_file(&old_path);
+            }
+        }
+
+        new_path
     }
 
     /// Record a step's execution result.
@@ -329,7 +357,7 @@ mod tests {
         let path = ProgressLog::path_for_dataset(Path::new("/data/my-dataset/dataset.yaml"));
         assert_eq!(
             path,
-            PathBuf::from("/data/my-dataset/.upstream.progress.yaml")
+            PathBuf::from("/data/my-dataset/.cache/.upstream.progress.yaml")
         );
     }
 
@@ -385,14 +413,16 @@ mod tests {
 
     #[test]
     fn test_load_nonexistent() {
-        let (log, _) = ProgressLog::load(Path::new("/nonexistent/.upstream.progress.yaml")).unwrap();
+        let (log, _) = ProgressLog::load(Path::new("/nonexistent/.cache/.upstream.progress.yaml")).unwrap();
         assert!(log.steps.is_empty());
     }
 
     #[test]
     fn test_save_and_load() {
         let tmp_dir = tempfile::tempdir().unwrap();
-        let path = tmp_dir.path().join(".upstream.progress.yaml");
+        let cache_dir = tmp_dir.path().join(".cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let path = cache_dir.join(".upstream.progress.yaml");
 
         let (mut log, _) = ProgressLog::load(&path).unwrap();
         log.record_step(
@@ -417,7 +447,9 @@ mod tests {
     #[test]
     fn test_invalidate_if_stale() {
         let tmp_dir = tempfile::tempdir().unwrap();
-        let progress_path = tmp_dir.path().join(".upstream.progress.yaml");
+        let cache_dir = tmp_dir.path().join(".cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let progress_path = cache_dir.join(".upstream.progress.yaml");
         let dataset_path = tmp_dir.path().join("dataset.yaml");
 
         // Create progress log first
@@ -452,7 +484,9 @@ mod tests {
     #[test]
     fn test_invalidate_if_stale_no_invalidation() {
         let tmp_dir = tempfile::tempdir().unwrap();
-        let progress_path = tmp_dir.path().join(".upstream.progress.yaml");
+        let cache_dir = tmp_dir.path().join(".cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let progress_path = cache_dir.join(".upstream.progress.yaml");
         let dataset_path = tmp_dir.path().join("dataset.yaml");
 
         // Create dataset.yaml first
@@ -660,7 +694,9 @@ mod tests {
     #[test]
     fn test_schema_version_invalidation() {
         let tmp_dir = tempfile::tempdir().unwrap();
-        let path = tmp_dir.path().join(".upstream.progress.yaml");
+        let cache_dir = tmp_dir.path().join(".cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let path = cache_dir.join(".upstream.progress.yaml");
 
         // Write a progress log with an old schema version
         let old_content = "schema_version: 1\nsteps:\n  step1:\n    status: ok\n    message: done\n    completed_at: '2026-01-01T00:00:00Z'\n    elapsed_secs: 1.0\n";

@@ -107,6 +107,46 @@ by selecting from predefined distribution mix strategies. Each dimension of
 a vector is sampled from an independently configured distribution, producing
 datasets useful for testing profile analysis and similarity search.
 
+Unlike `generate vectors` (which draws all elements from a single uniform
+distribution), sketch vectors have per-dimension statistical structure.
+This makes them more representative of real embedding spaces, where
+different dimensions often have distinct value ranges and shapes.
+
+## Distribution strategies
+
+The `mix` parameter selects how per-dimension samplers are assigned:
+
+- **bounded** (default) -- 50% Normal, 30% Beta, 20% Uniform, assigned by
+  dimension index modulo 10. This is a good general-purpose default that
+  produces realistic-looking value distributions.
+- **normal** -- all dimensions use truncated Normal distributions with
+  randomly varied means and standard deviations.
+- **beta** -- all dimensions use Beta distributions with random alpha/beta
+  shape parameters, scaled to the `[lower, upper]` range.
+- **uniform** -- all dimensions use Uniform distributions with slight
+  random variation in bounds.
+- **mixed** -- rotating Normal/Beta/Uniform by dimension index modulo 3.
+
+For each dimension, the sampler's parameters (mean, std_dev, alpha, beta,
+bounds) are drawn from the parameter PRNG seeded by `seed`. A separate
+data PRNG (seeded by `seed + 1`) generates the actual vector elements.
+This two-PRNG design ensures that adding more vectors does not change
+earlier vectors' values.
+
+## Normalization
+
+When `normalize=true` (the default), each vector is L2-normalized after
+sampling so that all output vectors lie on the unit hypersphere. This is
+standard for cosine-similarity workloads.
+
+## Role in dataset pipelines
+
+Sketch datasets provide a compact, controllable representation for
+exploratory analysis and quick similarity checks before running expensive
+exact KNN computations. They are also useful for validating that distance
+functions, indexing algorithms, and recall metrics behave correctly on
+data with known statistical properties.
+
 ## Options
 
 {}"#, render_options_table(&options)),

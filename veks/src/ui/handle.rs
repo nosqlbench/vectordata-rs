@@ -91,14 +91,23 @@ impl UiHandle {
         &self.sink
     }
 
-    /// Create a determinate progress bar.
+    /// Create a determinate progress bar with the default unit "rec".
     pub fn bar(&self, total: u64, label: impl Into<String>) -> ProgressHandle {
+        self.bar_with_unit(total, label, "rec")
+    }
+
+    /// Create a determinate progress bar with a custom unit label.
+    ///
+    /// The `unit` controls how throughput is displayed (e.g., "42 files/s"
+    /// instead of "42 rec/s").
+    pub fn bar_with_unit(&self, total: u64, label: impl Into<String>, unit: impl Into<String>) -> ProgressHandle {
         let id = self.sink.next_progress_id();
         self.sink.send(UiEvent::ProgressCreate {
             id,
             kind: ProgressKind::Bar,
             total,
             label: label.into(),
+            unit: unit.into(),
         });
         ProgressHandle {
             id,
@@ -118,6 +127,7 @@ impl UiHandle {
             kind: ProgressKind::Ratio,
             total,
             label: label.into(),
+            unit: "rec".into(),
         });
         ProgressHandle {
             id,
@@ -134,12 +144,21 @@ impl UiHandle {
             kind: ProgressKind::Spinner,
             total: 0,
             label: label.into(),
+            unit: "rec".into(),
         });
         ProgressHandle {
             id,
             sink: Arc::clone(&self.sink),
             finished: AtomicBool::new(false),
         }
+    }
+
+    /// Retrieve buffered log messages for post-TUI console output.
+    ///
+    /// Call after the TUI session ends to get all log messages that were
+    /// displayed during the session. For non-TUI sinks this returns empty.
+    pub fn take_console_log(&self) -> Vec<String> {
+        self.sink.take_console_log()
     }
 
     /// Emit a log line above the progress region.

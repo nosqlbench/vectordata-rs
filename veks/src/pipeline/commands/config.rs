@@ -98,13 +98,38 @@ impl CommandOp for ConfigShowOp {
         CommandDoc {
             summary: "Display current configuration".into(),
             body: format!(
-                "# config show\n\n\
-                 Display current configuration.\n\n\
-                 ## Description\n\n\
-                 Reads and displays the vectordata configuration from \
-                 `~/.config/vectordata/settings.yaml`, including cache directory \
-                 status and used space.\n\n\
-                 ## Options\n\n{}",
+                r#"# config show
+
+Display current configuration.
+
+## Description
+
+Reads and displays the vectordata configuration from
+`~/.config/vectordata/settings.yaml`, including the cache directory
+path, its active/inactive status, used disk space, and whether the
+settings are write-protected.
+
+## How It Works
+
+The command loads the YAML settings file and parses two fields:
+`cache_dir` (the path where downloaded and cached dataset files are
+stored) and `protect_settings` (a boolean that prevents accidental
+overwrites by `config init`). If a cache directory is configured,
+the command checks whether it exists and is a directory, then walks
+the directory tree to compute total used space. If the settings file
+does not exist, the command suggests running `config init`.
+
+## Data Preparation Role
+
+`config show` is a diagnostic command used to verify that the
+vectordata environment is properly configured before running a
+pipeline. It confirms that the cache directory exists and has
+sufficient space for dataset downloads and intermediate files.
+Pipeline scripts often run `config show` as a preflight check.
+
+## Options
+
+{}"#,
                 render_options_table(&options)
             ),
         }
@@ -189,12 +214,41 @@ impl CommandOp for ConfigInitOp {
         CommandDoc {
             summary: "Initialize a new dataset workspace".into(),
             body: format!(
-                "# config init\n\n\
-                 Initialize a new dataset workspace.\n\n\
-                 ## Description\n\n\
-                 Creates or updates the vectordata cache directory and writes the \
-                 configuration to `~/.config/vectordata/settings.yaml`.\n\n\
-                 ## Options\n\n{}",
+                r#"# config init
+
+Initialize a new dataset workspace.
+
+## Description
+
+Creates or updates the vectordata cache directory and writes the
+configuration to `~/.config/vectordata/settings.yaml`. If the settings
+file already exists and `protect_settings` is true, the command
+refuses to overwrite unless `force=true`.
+
+## How It Works
+
+The command resolves the cache directory path (from the `cache-dir`
+option, or defaulting to `~/.cache/vectordata`), creates the
+directory if it does not exist, then writes a `settings.yaml` file
+with the cache path and `protect_settings: true`. The config
+directory (`~/.config/vectordata/`) is also created if needed. The
+`force` flag bypasses the protection check, allowing reconfiguration
+of an already-initialized environment.
+
+## Data Preparation Role
+
+`config init` is the first command to run when setting up a new
+machine or environment for dataset preparation. It establishes the
+cache directory where `fetch dlhf`, `fetch bulkdl`, and other
+download commands store their files. Without initialization, commands
+that depend on the cache directory will fail or use ad-hoc paths.
+Running `config init` with an explicit `cache-dir` pointing to a
+large-capacity volume is important for datasets that require
+hundreds of gigabytes of storage.
+
+## Options
+
+{}"#,
                 render_options_table(&options)
             ),
         }
@@ -357,12 +411,39 @@ impl CommandOp for ConfigListMountsOp {
         CommandDoc {
             summary: "List configured dataset mount points".into(),
             body: format!(
-                "# config list-mounts\n\n\
-                 List configured dataset mount points.\n\n\
-                 ## Description\n\n\
-                 Lists writable mount points on the system suitable for cache storage, \
-                 showing available and total space.\n\n\
-                 ## Options\n\n{}",
+                r#"# config list-mounts
+
+List configured dataset mount points.
+
+## Description
+
+Lists writable mount points on the system suitable for cache storage,
+showing available space, total space, and write access status. By
+default, mount points with less than 100 MB available are hidden;
+use `all=true` to include them.
+
+## How It Works
+
+On Linux, the command reads `/proc/mounts` to enumerate all mounted
+filesystems, filters out virtual filesystems (proc, sysfs, devtmpfs,
+cgroup, etc.), then calls `statvfs` on each mount point to retrieve
+available and total block counts. Results are sorted by available
+space in descending order and displayed in a tabular format. On
+non-Linux systems, a fallback checks `/`, `/home`, and `/tmp`.
+
+## Data Preparation Role
+
+`config list-mounts` helps you choose the best storage location for
+the vectordata cache directory before running `config init`. Large
+dataset preparation pipelines (especially those involving HuggingFace
+downloads or billion-scale vector files) require substantial disk
+space, and this command identifies which volumes have enough room.
+The output is also useful for diagnosing "out of space" errors during
+pipeline execution.
+
+## Options
+
+{}"#,
                 render_options_table(&options)
             ),
         }

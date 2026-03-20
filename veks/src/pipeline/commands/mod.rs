@@ -25,6 +25,7 @@ pub mod analyze_stats;
 pub mod analyze_verifyknn;
 pub mod analyze_zeros;
 pub mod cleanup_cleanfvec;
+pub mod compute_dedup;
 pub mod compute_filtered_knn;
 pub mod compute_knn;
 pub mod compute_sort;
@@ -76,6 +77,7 @@ pub fn register_all(registry: &mut CommandRegistry) {
     registry.register("compute knn", compute_knn::factory);
     registry.register("compute filtered-knn", compute_filtered_knn::factory);
     registry.register("compute sort", compute_sort::factory);
+    registry.register("compute dedup", compute_dedup::factory);
 
     // Phase 5: analysis, info, and cleanup commands
     registry.register("analyze verify-knn", analyze_verifyknn::factory);

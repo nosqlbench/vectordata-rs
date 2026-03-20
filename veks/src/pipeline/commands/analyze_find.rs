@@ -36,7 +36,31 @@ impl CommandOp for AnalyzeFindOp {
         CommandDoc {
             summary: "Search for vectors matching a value pattern".into(),
             body: format!(
-                "# analyze find\n\nSearch for vectors matching a value pattern.\n\n## Description\n\nReads a vector at a given index from a source file, then searches for it in a target file using either binary search (if sorted) or exhaustive scan.\n\n## Options\n\n{}",
+                "# analyze find\n\n\
+                Search for vectors matching a value pattern.\n\n\
+                ## Description\n\n\
+                Reads a vector at a given index from a source file, then searches for \
+                an exact or close match in a target file. The command automatically \
+                detects whether the target file is lexicographically sorted by sampling \
+                the first and last 100 adjacent pairs. If sorted, it uses binary search \
+                for O(log n) lookup; otherwise, it falls back to an exhaustive linear \
+                scan.\n\n\
+                ## Search Patterns\n\n\
+                The current search pattern is \"find by example\": you specify a source \
+                file and an index within it, and the command extracts that vector as the \
+                search needle. The target file is then searched for:\n\n\
+                - **Exact match**: All components are bitwise identical.\n\
+                - **Closest match**: If no exact match exists, the vector with the most \
+                component-wise matches (within float epsilon) is reported as an \
+                approximate result.\n\n\
+                Lexicographic comparison is used for binary search, with NaN values \
+                sorted to the end.\n\n\
+                ## Role in Dataset Preparation\n\n\
+                This command is useful for verifying that a specific vector from one \
+                file (e.g., the original dataset) appears in another file (e.g., a \
+                shuffled or filtered version). It can also diagnose duplication issues \
+                or confirm that a particular record survived a filtering step.\n\n\
+                ## Options\n\n{}",
                 render_options_table(&options)
             ),
         }

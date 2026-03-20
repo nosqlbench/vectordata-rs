@@ -1,7 +1,8 @@
-//! High-level access to vector datasets.
+//! High-level entry point for loading vector datasets.
 //!
-//! This module provides the `TestDataGroup` struct, which serves as the entry point
-//! for loading and accessing vector datasets.
+//! [`TestDataGroup`] parses a `dataset.yaml` (from a local path or HTTP URL)
+//! and exposes named profiles as [`TestDataView`](crate::view::TestDataView)
+//! instances for reading vectors and metadata.
 
 use crate::model::DatasetConfig;
 use crate::view::{GenericTestDataView, TestDataView};

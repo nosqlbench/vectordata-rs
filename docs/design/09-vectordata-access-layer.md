@@ -28,11 +28,11 @@ Key Java modules:
 
 | Java module | Rust equivalent | Status |
 |-------------|-----------------|--------|
-| `datatools-vectordata` (access layer) | `vectordata` crate | Partial |
-| `datatools-io-transport` (HTTP/file transport) | `vectordata::transport` | Not started |
-| `datatools-vectordata/merklev2` (integrity) | `vectordata::merkle` | Not started |
-| `datatools-vectordata/layoutv2` (profiles) | `dataset` crate | Done |
-| `datatools-vectordata/spec` (facet descriptors) | `dataset` + `vectordata` | Partial |
+| `datatools-vectordata` (access layer) | `vectordata` crate | Done |
+| `datatools-io-transport` (HTTP/file transport) | `vectordata::transport` | Done |
+| `datatools-vectordata/merklev2` (integrity) | `vectordata::merkle` | Done |
+| `datatools-vectordata/layoutv2` (profiles) | `vectordata::dataset` module | Done |
+| `datatools-vectordata/spec` (facet descriptors) | `vectordata::dataset` + `vectordata` | Done |
 
 ## 9.3 Gap Analysis
 
@@ -40,28 +40,28 @@ Key Java modules:
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| `dataset.yaml` parsing | **Done** | `dataset` crate: profiles, views, windows, aliases, custom facets |
+| `dataset.yaml` parsing | **Done** | `vectordata::dataset` module: profiles, views, windows, aliases, custom facets |
 | Mmap vector readers (fvec, ivec, mvec) | **Done** | `MmapVectorReader<T>` with zero-copy slices, madvise |
-| HTTP Range vector readers | **Partial** | fvec, ivec only; no mvec; no connection pooling |
+| HTTP Range vector readers | **Done** | fvec, ivec, mvec; connection pooling via reqwest |
 | `TestDataGroup::load()` | **Done** | Local path and HTTP URL |
-| `TestDataView` trait | **Partial** | Typed accessors for standard vector/index facets only |
-| Integration tests over HTTP | **Done** | `testserver` crate with Range support |
-| Custom facet support in schema | **Done** | `dataset` crate preserves non-standard keys |
+| `TestDataView` trait | **Done** | Typed accessors, facet manifest, generic facet(), distance_function() |
+| Integration tests over HTTP | **Done** | `testserver` utility merged into `vectordata/tests/support/`; cached_channel, http_access, facet_access, transport tests |
+| Custom facet support in schema | **Done** | `vectordata::dataset` module preserves non-standard keys |
 
 ### Missing (Required for Parity)
 
 | Feature | Priority | Complexity | Section |
 |---------|----------|------------|---------|
-| Merkle tree core (wire-compatible) | **P0** | Medium | 9.5 |
-| Merkle state tracking (.mrkl) | **P0** | Medium | 9.5 |
-| Chunked transport with retry | **P0** | Medium | 9.6 |
-| Cache-backed file channel | **P0** | High | 9.7 |
-| Prebuffer (eager download) | **P0** | Low | 9.7 |
-| Facet manifest + generic accessor | **P1** | Low | 9.8 |
-| FacetDescriptor | **P1** | Low | 9.8 |
-| Download progress tracking | **P1** | Low | 9.6 |
-| Dataset metadata (distance_function, etc.) | **P1** | Low | 9.9 |
-| mvec HTTP reader | **P1** | Low | 9.9 |
+| Merkle tree core (wire-compatible) | **Done** | Medium | 9.5 |
+| Merkle state tracking (.mrkl) | **Done** | Medium | 9.5 |
+| Chunked transport with retry | **Done** | Medium | 9.6 |
+| Cache-backed file channel | **Done** | High | 9.7 |
+| Prebuffer (eager download) | **Done** | Low | 9.7 |
+| Facet manifest + generic accessor | **Done** | Low | 9.8 |
+| FacetDescriptor | **Done** | Low | 9.8 |
+| Download progress tracking | **Done** | Low | 9.6 |
+| Dataset metadata (distance_function, etc.) | **Done** | Low | 9.9 |
+| mvec HTTP reader | **Done** | Low | 9.9 |
 | Token/template expansion in source URLs | **P2** | Low | 9.9 |
 | Chunk scheduling strategies | **P2** | Medium | 9.6 |
 
@@ -416,6 +416,8 @@ Priority: P2 — only needed when datasets use templated source URLs.
 
 ### Phase 1: Merkle core (wire-compatible)
 
+**Status: Complete.** Implemented in `vectordata::merkle` — `MerkleRef`, `MerkleState`, `MerkleShape` with full .mref/.mrkl wire compatibility.
+
 **Goal:** Read `.mref` files, write/read `.mrkl` state files, verify chunks.
 
 **Deliverables:**
@@ -429,6 +431,8 @@ Priority: P2 — only needed when datasets use templated source URLs.
 
 ### Phase 2: Chunked transport with retry
 
+**Status: Complete.** Implemented in `vectordata::transport` — `HttpTransport`, `RetryPolicy`, `DownloadProgress`. Integration tests use the `testserver` utility in `vectordata/tests/support/`.
+
 **Goal:** Fetch byte ranges from HTTP with retry, connection pooling, progress.
 
 **Deliverables:**
@@ -436,11 +440,13 @@ Priority: P2 — only needed when datasets use templated source URLs.
 - `HttpTransport` implementation
 - `RetryPolicy` with exponential backoff + jitter
 - `DownloadProgress` with atomic counters
-- Tests using `testserver` crate
+- Tests using `testserver` utility in `vectordata/tests/support/`
 
 **Crate location:** `vectordata::transport` module
 
 ### Phase 3: Cache-backed file channel
+
+**Status: Complete.** Implemented in `vectordata::cache` — `CachedChannel` with on-demand fetch, prebuffer, crash recovery via .mrkl checkpoint. Full integration test suite in `cached_channel.rs`.
 
 **Goal:** Transparent read-through caching with merkle verification.
 
@@ -455,6 +461,8 @@ Priority: P2 — only needed when datasets use templated source URLs.
 **Crate location:** `vectordata::cache` module
 
 ### Phase 4: Facet manifest + view enrichment
+
+**Status: Complete.** `FacetDescriptor`, `facet_manifest()`, `facet()`, `distance_function()` on `TestDataView`. mvec HTTP reader via `HttpVectorReader<half::f16>::open_mvec()`. Integration tests in `facet_access.rs`.
 
 **Goal:** Generic facet discovery and access, dataset metadata.
 
@@ -482,7 +490,7 @@ Priority: P2 — only needed when datasets use templated source URLs.
 - Produce `.mrkl` files in Rust, load in Java (manual or scripted)
 - Byte-for-byte comparison of footer encoding
 
-### Integration tests (using `testserver`)
+### Integration tests (using `testserver` utility)
 
 - Full download lifecycle: cold start → partial download → crash → resume → complete
 - Prebuffer: download all chunks, verify all marked valid

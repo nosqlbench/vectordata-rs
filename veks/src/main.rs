@@ -1,7 +1,7 @@
 // Copyright (c) DataStax, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use veks::{cli, datasets, pipeline};
+use veks::{check, cli, datasets, pipeline, publish};
 
 use clap::{Arg, Command, CommandFactory, Parser, Subcommand};
 use clap_complete::CompleteEnv;
@@ -28,6 +28,10 @@ enum Commands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Pre-flight checks for dataset readiness
+    Check(check::CheckArgs),
+    /// Publish dataset to S3
+    Publish(publish::PublishArgs),
     /// Generate shell completions
     Completions(cli::CompletionsArgs),
     /// Show detailed help for a pipeline command or command group
@@ -205,6 +209,8 @@ async fn main() {
         Commands::Run(args) => pipeline::run_pipeline(args),
         Commands::Script(args) => pipeline::run_script(args),
         Commands::Pipeline { args } => pipeline::cli::run_direct(args),
+        Commands::Check(args) => check::run(args),
+        Commands::Publish(args) => publish::run(args),
         Commands::Completions(args) => cli::completions(args),
         Commands::Help(args) => run_help(args),
     }
@@ -217,6 +223,8 @@ fn root_commands() -> Vec<(&'static str, &'static str)> {
         ("run", "Execute a command stream pipeline defined in dataset.yaml"),
         ("script", "Emit a dataset pipeline as an equivalent shell script"),
         ("pipeline", "Execute a single pipeline command directly"),
+        ("check", "Pre-flight checks for dataset readiness"),
+        ("publish", "Publish dataset to S3"),
         ("completions", "Generate shell completions"),
         ("help", "Show detailed help for a pipeline command or command group"),
     ]

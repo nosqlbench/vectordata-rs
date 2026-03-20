@@ -17,8 +17,8 @@ use std::time::Instant;
 use sha2::{Digest, Sha256};
 
 use crate::pipeline::command::{
-    CommandDoc, CommandOp, CommandResult, OptionDesc, Options, ResourceDesc, Status, StreamContext,
-    render_options_table,
+    ArtifactManifest, CommandDoc, CommandOp, CommandResult, OptionDesc, Options, ResourceDesc,
+    Status, StreamContext, render_options_table,
 };
 
 const DEFAULT_CHUNK_SIZE: usize = 1 << 20; // 1 MiB
@@ -44,31 +44,149 @@ struct MerkleTree {
 }
 
 impl MerkleTree {
-    /// Build a merkle tree from file data.
+    /// Build a merkle tree from file data in memory.
     fn from_data(data: &[u8], chunk_size: usize) -> Self {
-        let file_size = data.len() as u64;
         let leaf_count = if data.is_empty() {
             1
         } else {
             (data.len() + chunk_size - 1) / chunk_size
         };
 
-        // Compute leaf hashes
         let mut leaf_hashes: Vec<[u8; HASH_SIZE]> = Vec::with_capacity(leaf_count);
         for i in 0..leaf_count {
             let start = i * chunk_size;
             let end = std::cmp::min(start + chunk_size, data.len());
-            let chunk = if start < data.len() {
-                &data[start..end]
-            } else {
-                &[]
-            };
-            let hash = Sha256::digest(chunk);
-            leaf_hashes.push(hash.into());
+            let chunk = if start < data.len() { &data[start..end] } else { &[] };
+            leaf_hashes.push(Sha256::digest(chunk).into());
         }
 
+        Self::from_leaf_hashes(leaf_hashes, leaf_count, chunk_size, data.len() as u64)
+    }
+
+    /// Build a merkle tree by streaming chunks with parallel hashing.
+    ///
+    /// A reader thread reads chunks sequentially into a bounded queue.
+    /// `hash_threads` worker threads pull chunks and hash them in parallel.
+    /// Results are collected in chunk-index order so the tree is deterministic.
+    ///
+    /// Calls `progress_fn(chunks_hashed)` as each hash completes.
+    fn from_reader_parallel<R: std::io::Read + Send + 'static>(
+        reader: R,
+        file_size: u64,
+        chunk_size: usize,
+        hash_threads: usize,
+        mut progress_fn: impl FnMut(u64),
+    ) -> std::io::Result<Self> {
+        use std::sync::mpsc;
+
+        let leaf_count = if file_size == 0 {
+            1
+        } else {
+            ((file_size as usize) + chunk_size - 1) / chunk_size
+        };
+
+        // Channel: reader → hash workers (bounded to limit memory)
+        let queue_depth = (hash_threads * 2).max(4);
+        let (chunk_tx, chunk_rx) = mpsc::sync_channel::<(usize, Vec<u8>)>(queue_depth);
+        let chunk_rx = std::sync::Arc::new(std::sync::Mutex::new(chunk_rx));
+
+        // Channel: hash workers → collector (unbounded, hashes are small)
+        let (hash_tx, hash_rx) = mpsc::channel::<(usize, [u8; HASH_SIZE])>();
+
+        // Reader thread: sequential I/O, fills chunk buffers
+        let reader_handle = std::thread::Builder::new()
+            .name("merkle-reader".into())
+            .spawn(move || {
+                let mut reader = std::io::BufReader::with_capacity(chunk_size * 2, reader);
+                let mut chunk_idx = 0usize;
+                loop {
+                    let mut buf = vec![0u8; chunk_size];
+                    let mut filled = 0;
+                    while filled < chunk_size {
+                        match std::io::Read::read(&mut reader, &mut buf[filled..]) {
+                            Ok(0) => break,
+                            Ok(n) => filled += n,
+                            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                            Err(e) => {
+                                log::error!("merkle reader error: {}", e);
+                                return;
+                            }
+                        }
+                    }
+                    if filled == 0 {
+                        break;
+                    }
+                    buf.truncate(filled);
+                    if chunk_tx.send((chunk_idx, buf)).is_err() {
+                        break;
+                    }
+                    chunk_idx += 1;
+                }
+                // chunk_tx drops here, closing the channel
+            })
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+
+        // Hash worker threads: pull chunks, compute SHA-256, send results
+        let mut workers = Vec::with_capacity(hash_threads);
+        for _ in 0..hash_threads {
+            let rx = std::sync::Arc::clone(&chunk_rx);
+            let tx = hash_tx.clone();
+            workers.push(std::thread::Builder::new()
+                .name("merkle-hash".into())
+                .spawn(move || {
+                    loop {
+                        let (idx, data) = match rx.lock().unwrap().recv() {
+                            Ok(item) => item,
+                            Err(_) => break,
+                        };
+                        let hash: [u8; HASH_SIZE] = Sha256::digest(&data).into();
+                        if tx.send((idx, hash)).is_err() {
+                            break;
+                        }
+                    }
+                })
+                .unwrap());
+        }
+        drop(hash_tx); // so collector sees EOF when all workers finish
+
+        // Collect results in order
+        let mut results: Vec<(usize, [u8; HASH_SIZE])> = Vec::with_capacity(leaf_count);
+        let mut done: u64 = 0;
+        for item in hash_rx {
+            results.push(item);
+            done += 1;
+            progress_fn(done);
+        }
+
+        // Wait for threads
+        let _ = reader_handle.join();
+        for w in workers {
+            let _ = w.join();
+        }
+
+        // Sort by chunk index to restore deterministic order
+        results.sort_by_key(|(idx, _)| *idx);
+        let leaf_hashes: Vec<[u8; HASH_SIZE]> = results.into_iter().map(|(_, h)| h).collect();
+
+        if leaf_hashes.is_empty() {
+            return Ok(Self::from_leaf_hashes(
+                vec![Sha256::digest(&[]).into()], 1, chunk_size, file_size,
+            ));
+        }
+
+        let actual_leaf_count = leaf_hashes.len();
+        Ok(Self::from_leaf_hashes(leaf_hashes, actual_leaf_count, chunk_size, file_size))
+    }
+
+    /// Build internal nodes from leaf hashes.
+    fn from_leaf_hashes(
+        mut leaf_hashes: Vec<[u8; HASH_SIZE]>,
+        leaf_count: usize,
+        chunk_size: usize,
+        file_size: u64,
+    ) -> Self {
         // Pad to next power of 2 for balanced tree
-        let padded_leaves = leaf_count.next_power_of_two();
+        let padded_leaves = leaf_count.next_power_of_two().max(1);
         let empty_hash: [u8; HASH_SIZE] = Sha256::digest(&[]).into();
         while leaf_hashes.len() < padded_leaves {
             leaf_hashes.push(empty_hash);
@@ -79,12 +197,10 @@ impl MerkleTree {
         let total = internal_count + padded_leaves;
         let mut hashes = vec![[0u8; HASH_SIZE]; total];
 
-        // Place leaves
         for (i, h) in leaf_hashes.into_iter().enumerate() {
             hashes[internal_count + i] = h;
         }
 
-        // Compute internal nodes (right to left, bottom to top)
         for i in (0..internal_count).rev() {
             let left = 2 * i + 1;
             let right = 2 * i + 2;
@@ -206,13 +322,43 @@ impl CommandOp for MerkleCreateOp {
         CommandDoc {
             summary: "Create a Merkle hash tree for a file".into(),
             body: format!(
-                "# merkle create\n\n\
-                 Create a Merkle hash tree for a file.\n\n\
-                 ## Description\n\n\
-                 Creates a SHA-256 Merkle tree over file chunks and stores it as an \
-                 `.mref` file. Chunk size is configurable (default 1 MiB, must be \
-                 power of 2).\n\n\
-                 ## Options\n\n{}",
+                r#"# merkle create
+
+Create a Merkle hash tree for a file.
+
+## Description
+
+Creates a SHA-256 Merkle tree over file chunks and stores it as an
+`.mref` reference file alongside the source. The chunk size is
+configurable (default 1 MiB) and must be a power of 2. If an
+up-to-date `.mref` already exists (newer than the source), the
+command skips tree creation unless `force=true`.
+
+## How It Works
+
+The source file is read into memory and divided into fixed-size
+chunks. Each chunk is hashed with SHA-256 to produce a leaf node.
+The leaf array is padded to the next power of two (with empty-data
+hashes for padding leaves), then internal nodes are computed
+bottom-up by hashing concatenated child pairs. The resulting binary
+tree -- stored as a flat array with the root at index 0 -- is
+serialized to an `.mref` file containing the chunk size, original
+file size, leaf count, and all node hashes.
+
+## Data Preparation Role
+
+`merkle create` enables chunk-level integrity checking for large
+dataset files such as vector files, metadata slabs, and downloaded
+archives. By creating a Merkle reference at the end of a pipeline
+step that produces a file, subsequent runs can use `merkle verify`
+to confirm that the file has not been corrupted by storage errors,
+incomplete transfers, or accidental modification. The chunk-level
+granularity means that corruption can be localized to specific
+byte ranges rather than requiring a full file re-download.
+
+## Options
+
+{}"#,
                 render_options_table(&options)
             ),
         }
@@ -220,6 +366,7 @@ impl CommandOp for MerkleCreateOp {
 
     fn describe_resources(&self) -> Vec<ResourceDesc> {
         vec![
+            ResourceDesc { name: "threads".into(), description: "Parallel SHA-256 hash workers".into(), adjustable: true },
             ResourceDesc { name: "readahead".into(), description: "Sequential read prefetch for hashing".into(), adjustable: false },
         ]
     }
@@ -245,73 +392,156 @@ impl CommandOp for MerkleCreateOp {
         }
 
         let force = options.get("force").map_or(false, |s| s == "true");
+        let min_size: u64 = options.get("min-size")
+            .and_then(|s| crate::check::parse_size(s))
+            .unwrap_or(100_000_000);
 
         let source_path = resolve_path(source_str, &ctx.workspace);
-        let mref = mref_path(&source_path);
+        let hash_threads = ctx.governor.current_or("threads", ctx.threads as u64)
+            .max(1) as usize;
 
-        // Check if mref already exists and is up-to-date
-        if mref.exists() && !force {
-            let src_modified = std::fs::metadata(&source_path)
-                .and_then(|m| m.modified())
-                .ok();
-            let mref_modified = std::fs::metadata(&mref)
-                .and_then(|m| m.modified())
-                .ok();
-            if let (Some(src_t), Some(mref_t)) = (src_modified, mref_modified) {
-                if mref_t > src_t {
-                    return CommandResult {
-                        status: Status::Ok,
-                        message: format!(
-                            "merkle reference up-to-date: {}",
-                            mref.display()
-                        ),
-                        produced: vec![mref],
-                        elapsed: start.elapsed(),
-                    };
-                }
-            }
-        }
-
-        // Read source file
-        let data = match std::fs::read(&source_path) {
-            Ok(d) => d,
-            Err(e) => {
-                return error_result(
-                    format!("failed to read {}: {}", source_path.display(), e),
-                    start,
-                )
+        // If source is a directory, walk it and process all eligible files.
+        // If source is a single file, process just that file.
+        let files = if source_path.is_dir() {
+            collect_eligible_files(&source_path, min_size)
+        } else {
+            let size = std::fs::metadata(&source_path).map(|m| m.len()).unwrap_or(0);
+            if size >= min_size {
+                vec![source_path.clone()]
+            } else {
+                ctx.ui.log(&format!(
+                    "Merkle: {} ({}) below min-size ({}), skipping",
+                    source_path.file_name().unwrap_or_default().to_string_lossy(),
+                    format_bytes(size),
+                    format_bytes(min_size),
+                ));
+                return CommandResult {
+                    status: Status::Ok,
+                    message: format!("0 files above {} threshold", format_bytes(min_size)),
+                    produced: vec![],
+                    elapsed: start.elapsed(),
+                };
             }
         };
 
-        let tree = MerkleTree::from_data(&data, chunk_size);
+        if files.is_empty() {
+            ctx.ui.log(&format!(
+                "Merkle: no files >= {} in {}",
+                format_bytes(min_size),
+                source_path.display(),
+            ));
+            return CommandResult {
+                status: Status::Ok,
+                message: format!("0 files above {} threshold", format_bytes(min_size)),
+                produced: vec![],
+                elapsed: start.elapsed(),
+            };
+        }
 
         ctx.ui.log(&format!(
-            "Merkle create: {} ({} bytes, {} chunks, root={})",
-            source_path.display(),
-            data.len(),
-            tree.leaf_count,
-            hex::encode(tree.root_hash())
+            "Merkle: {} file(s) to process, min-size={}, {} hash thread(s)",
+            files.len(), format_bytes(min_size), hash_threads,
         ));
 
-        // Write mref
-        let mref_bytes = tree.to_bytes();
-        if let Err(e) = std::fs::write(&mref, &mref_bytes) {
-            return error_result(
-                format!("failed to write {}: {}", mref.display(), e),
-                start,
-            );
+        let mut produced: Vec<PathBuf> = Vec::new();
+        let mut created = 0usize;
+        let mut skipped_fresh = 0usize;
+        let mut total_bytes: u64 = 0;
+
+        // Outer progress: files
+        let files_pb = ctx.ui.bar_with_unit(files.len() as u64, "files", "files");
+        let mut files_done = 0u64;
+
+        for file in &files {
+            let mref = mref_path(file);
+            let file_size = std::fs::metadata(file).map(|m| m.len()).unwrap_or(0);
+            let rel = file.strip_prefix(&ctx.workspace).unwrap_or(file);
+            let rel_name = rel.display().to_string();
+
+            // Check if mref already exists and is up-to-date
+            if mref.exists() && !force {
+                let src_t = std::fs::metadata(file).ok().and_then(|m| m.modified().ok());
+                let mref_t = std::fs::metadata(&mref).ok().and_then(|m| m.modified().ok());
+                if let (Some(st), Some(mt)) = (src_t, mref_t) {
+                    if mt > st {
+                        skipped_fresh += 1;
+                        produced.push(mref);
+                        files_done += 1;
+                        files_pb.set_position(files_done);
+                        continue;
+                    }
+                }
+            }
+
+            let total_chunks = if file_size == 0 { 1 } else {
+                ((file_size as usize) + chunk_size - 1) / chunk_size
+            };
+
+            ctx.ui.log(&format!(
+                "  {} ({}, {} chunks)",
+                rel_name, format_bytes(file_size), total_chunks,
+            ));
+
+            let f = match std::fs::File::open(file) {
+                Ok(f) => f,
+                Err(e) => {
+                    ctx.ui.log(&format!("    ERROR: {}", e));
+                    files_done += 1;
+                    files_pb.set_position(files_done);
+                    continue;
+                }
+            };
+
+            // Inner progress: chunks within this file
+            let chunk_pb = ctx.ui.bar_with_unit(total_chunks as u64, &rel_name, "chunks");
+            let tree = match MerkleTree::from_reader_parallel(f, file_size, chunk_size, hash_threads, |done| {
+                chunk_pb.set_position(done);
+            }) {
+                Ok(t) => t,
+                Err(e) => {
+                    chunk_pb.finish();
+                    ctx.ui.log(&format!("    ERROR hashing: {}", e));
+                    files_done += 1;
+                    files_pb.set_position(files_done);
+                    continue;
+                }
+            };
+            chunk_pb.finish();
+
+            if let Err(e) = std::fs::write(&mref, &tree.to_bytes()) {
+                ctx.ui.log(&format!("    ERROR writing mref: {}", e));
+                files_done += 1;
+                files_pb.set_position(files_done);
+                continue;
+            }
+
+            total_bytes += file_size;
+            created += 1;
+            produced.push(mref);
+            files_done += 1;
+            files_pb.set_position(files_done);
         }
+        files_pb.finish();
+
+        let elapsed = start.elapsed();
+        let throughput = if elapsed.as_secs_f64() > 0.0 {
+            total_bytes as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64()
+        } else {
+            0.0
+        };
+
+        let msg = format!(
+            "{} created, {} up-to-date, {} total ({}, {:.1}s, {:.0} MB/s)",
+            created, skipped_fresh, files.len(),
+            format_bytes(total_bytes), elapsed.as_secs_f64(), throughput,
+        );
+        ctx.ui.log(&msg);
 
         CommandResult {
             status: Status::Ok,
-            message: format!(
-                "created merkle reference {} ({} chunks, {} nodes)",
-                mref.display(),
-                tree.leaf_count,
-                tree.hashes.len()
-            ),
-            produced: vec![mref],
-            elapsed: start.elapsed(),
+            message: msg,
+            produced,
+            elapsed,
         }
     }
 
@@ -322,7 +552,7 @@ impl CommandOp for MerkleCreateOp {
                 type_name: "Path".to_string(),
                 required: true,
                 default: None,
-                description: "File to create merkle reference for".to_string(),
+                description: "File or directory to create merkle references for".to_string(),
             },
             OptionDesc {
                 name: "chunk-size".to_string(),
@@ -338,7 +568,57 @@ impl CommandOp for MerkleCreateOp {
                 default: Some("false".to_string()),
                 description: "Overwrite existing mref even if up-to-date".to_string(),
             },
+            OptionDesc {
+                name: "min-size".to_string(),
+                type_name: "size".to_string(),
+                required: false,
+                default: Some("100M".to_string()),
+                description: "Skip merkle creation for files smaller than this (supports K/M/G suffixes)".to_string(),
+            },
         ]
+    }
+
+    fn project_artifacts(&self, step_id: &str, options: &Options) -> ArtifactManifest {
+        let source_str = options.get("source").unwrap_or(".");
+        let min_size: u64 = options.get("min-size")
+            .and_then(|s| crate::check::parse_size(s))
+            .unwrap_or(100_000_000);
+
+        let source_path = PathBuf::from(source_str);
+
+        let mut inputs = Vec::new();
+        let mut outputs = Vec::new();
+
+        if source_path.is_dir() {
+            // Walk the directory and enumerate actual eligible files
+            let files = collect_eligible_files(&source_path, min_size);
+            for file in &files {
+                let rel = file.strip_prefix(&source_path)
+                    .or_else(|_| file.strip_prefix("."))
+                    .unwrap_or(file);
+                let rel_str = rel.to_string_lossy().to_string();
+                inputs.push(rel_str.clone());
+                outputs.push(format!("{}.mref", rel_str));
+            }
+        } else if source_path.exists() {
+            let size = std::fs::metadata(&source_path).map(|m| m.len()).unwrap_or(0);
+            if size >= min_size {
+                inputs.push(source_str.to_string());
+                outputs.push(format!("{}.mref", source_str));
+            }
+        } else {
+            // Source doesn't exist yet — use the path as-is
+            inputs.push(source_str.to_string());
+            outputs.push(format!("{}.mref", source_str));
+        }
+
+        ArtifactManifest {
+            step_id: step_id.to_string(),
+            command: self.command_path().to_string(),
+            inputs,
+            outputs,
+            intermediates: vec![],
+        }
     }
 }
 
@@ -361,12 +641,41 @@ impl CommandOp for MerkleVerifyOp {
         CommandDoc {
             summary: "Verify file integrity against a Merkle tree".into(),
             body: format!(
-                "# merkle verify\n\n\
-                 Verify file integrity against a Merkle tree.\n\n\
-                 ## Description\n\n\
-                 Rebuilds the Merkle tree from the file data and compares it against \
-                 the stored `.mref` reference to detect corruption.\n\n\
-                 ## Options\n\n{}",
+                r#"# merkle verify
+
+Verify file integrity against a Merkle tree.
+
+## Description
+
+Rebuilds the Merkle tree from the current file data and compares it
+against the stored `.mref` reference to detect corruption. Reports
+whether the file is intact, and if not, identifies which chunks have
+changed.
+
+## How It Works
+
+The command reads the source file, rebuilds a Merkle tree using the
+same chunk size recorded in the `.mref`, and compares the freshly
+computed root hash against the stored root hash. If the roots match,
+the file is verified intact. If they differ, the command performs a
+leaf-by-leaf comparison to identify exactly which chunks have changed
+and reports their indices and byte offsets. A braille-art mismatch
+map provides a visual overview of corruption distribution.
+
+## Data Preparation Role
+
+`merkle verify` is the counterpart to `merkle create` and serves as
+a data integrity gate in pipelines. It is typically placed at the
+beginning of a pipeline run to confirm that previously downloaded or
+generated files are still valid before expensive processing begins.
+This catches silent corruption from storage failures, incomplete
+network transfers, or filesystem errors that would otherwise produce
+subtly wrong results in downstream steps like index building or
+predicate computation.
+
+## Options
+
+{}"#,
                 render_options_table(&options)
             ),
         }
@@ -515,12 +824,41 @@ impl CommandOp for MerkleDiffOp {
         CommandDoc {
             summary: "Diff two Merkle trees to find changed chunks".into(),
             body: format!(
-                "# merkle diff\n\n\
-                 Diff two Merkle trees to find changed chunks.\n\n\
-                 ## Description\n\n\
-                 Compares two `.mref` files and reports which chunks differ between \
-                 them, useful for incremental synchronization.\n\n\
-                 ## Options\n\n{}",
+                r#"# merkle diff
+
+Diff two Merkle trees to find changed chunks.
+
+## Description
+
+Compares two `.mref` files and reports which chunks differ between
+them, along with metadata comparisons (chunk size, file size, leaf
+count) and a visual mismatch map. Requires both trees to use the
+same chunk size for meaningful comparison.
+
+## How It Works
+
+The command loads both `.mref` files and first compares their basic
+metadata: chunk size, total file size, and leaf count. If the chunk
+sizes differ, comparison is not possible and a warning is returned.
+Otherwise, it performs a leaf-by-leaf hash comparison, collecting the
+indices of all mismatched chunks. Results include the number and
+percentage of changed chunks, the first ten mismatched chunk offsets,
+and a braille-art visualization showing the spatial distribution of
+changes across the file.
+
+## Data Preparation Role
+
+`merkle diff` identifies which portions of a file changed between
+two versions. This is useful for incremental dataset updates: when a
+new version of a vector file or metadata slab is produced, diffing
+the Merkle trees reveals exactly which chunks need to be re-processed
+or re-uploaded, avoiding a full re-transfer. It also helps diagnose
+partial corruption by showing whether damage is localized to a few
+chunks or spread across the file.
+
+## Options
+
+{}"#,
                 render_options_table(&options)
             ),
         }
@@ -688,12 +1026,37 @@ impl CommandOp for MerkleSummaryOp {
         CommandDoc {
             summary: "Print Merkle tree summary statistics".into(),
             body: format!(
-                "# merkle summary\n\n\
-                 Print Merkle tree summary statistics.\n\n\
-                 ## Description\n\n\
-                 Loads an `.mref` file and displays summary statistics including \
-                 file size, chunk size, leaf count, tree depth, and root hash.\n\n\
-                 ## Options\n\n{}",
+                r#"# merkle summary
+
+Print Merkle tree summary statistics.
+
+## Description
+
+Loads an `.mref` file and displays summary statistics including the
+original file size, chunk size, leaf count, total node count, tree
+depth, and root hash. This provides a quick overview of the tree's
+structure without performing any verification.
+
+## How It Works
+
+The command reads the `.mref` binary file, deserializes its header
+(chunk size, file size, leaf count), and computes derived metrics: the
+number of internal nodes, total tree nodes, and tree depth
+(log2 of the padded leaf count plus one). The root hash is extracted
+from index zero of the hash array and displayed in hexadecimal.
+
+## Data Preparation Role
+
+`merkle summary` provides a quick sanity check on Merkle reference
+files without the overhead of reading the source data. It is useful
+for confirming that an `.mref` was created correctly (right chunk
+size, expected file size), for comparing tree sizes across different
+files, and for obtaining root hashes to include in dataset manifests
+or integrity reports.
+
+## Options
+
+{}"#,
                 render_options_table(&options)
             ),
         }
@@ -789,12 +1152,39 @@ impl CommandOp for MerkleTreeviewOp {
         CommandDoc {
             summary: "Display Merkle tree structure visually".into(),
             body: format!(
-                "# merkle treeview\n\n\
-                 Display Merkle tree structure visually.\n\n\
-                 ## Description\n\n\
-                 Loads an `.mref` file and renders the tree structure with indented \
-                 hash prefixes, showing internal nodes and leaves.\n\n\
-                 ## Options\n\n{}",
+                r#"# merkle treeview
+
+Display Merkle tree structure visually.
+
+## Description
+
+Loads an `.mref` file and renders the tree structure as an indented
+diagram using box-drawing characters, showing hash prefixes for both
+internal nodes and leaf nodes. The display depth and starting node
+are configurable.
+
+## How It Works
+
+The command loads the Merkle tree from the `.mref` file, then
+recursively renders the tree starting from the specified base node.
+Each node is displayed with its index and a truncated hex hash prefix
+(configurable length). Internal nodes show their children with
+box-drawing connectors, while leaf nodes show the leaf index. The
+rendering stops at the configured depth limit, displaying an
+ellipsis for deeper subtrees.
+
+## Data Preparation Role
+
+`merkle treeview` is a visual diagnostic tool for understanding the
+hierarchical structure of a Merkle tree. It is particularly useful for
+verifying that the tree was constructed correctly, for understanding
+how specific chunks map to internal nodes, and for educational
+purposes when explaining how Merkle integrity verification works in
+the dataset pipeline.
+
+## Options
+
+{}"#,
                 render_options_table(&options)
             ),
         }
@@ -1009,12 +1399,39 @@ impl CommandOp for MerklePathOp {
         CommandDoc {
             summary: "Show the hash path for a specific chunk".into(),
             body: format!(
-                "# merkle path\n\n\
-                 Show the hash path for a specific chunk.\n\n\
-                 ## Description\n\n\
-                 Displays the authentication path from a specific leaf chunk up to \
-                 the root of the Merkle tree, showing sibling hashes at each level.\n\n\
-                 ## Options\n\n{}",
+                r#"# merkle path
+
+Show the hash path for a specific chunk.
+
+## Description
+
+Displays the authentication path from a specific leaf chunk up to
+the root of the Merkle tree, showing the hash at each level. This
+is the sequence of hashes that would be needed to independently
+verify the integrity of a single chunk.
+
+## How It Works
+
+The command loads the `.mref` file and locates the leaf node
+corresponding to the given chunk index. Starting from that leaf, it
+walks up the tree by repeatedly computing the parent index
+(`(node - 1) / 2`) and recording the hash at each level. The path
+is displayed from leaf to root, with each level labeled. The root
+hash is the final entry in the path.
+
+## Data Preparation Role
+
+`merkle path` is useful for debugging chunk-level integrity issues.
+When `merkle verify` reports a corrupted chunk, `merkle path` shows
+the exact chain of hashes from that chunk to the root, making it
+possible to trace where in the tree the mismatch propagates. It also
+demonstrates the logarithmic proof property of Merkle trees: verifying
+a single chunk requires only O(log N) hashes rather than re-reading
+the entire file.
+
+## Options
+
+{}"#,
                 render_options_table(&options)
             ),
         }
@@ -1182,6 +1599,63 @@ mod hex {
     }
 }
 
+fn format_bytes(bytes: u64) -> String {
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * 1024 * 1024;
+    if bytes >= GIB {
+        format!("{:.1} GiB", bytes as f64 / GIB as f64)
+    } else if bytes >= MIB {
+        format!("{:.1} MiB", bytes as f64 / MIB as f64)
+    } else if bytes >= 1024 {
+        format!("{:.1} KiB", bytes as f64 / 1024.0)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
+/// Recursively collect files eligible for merkle tree creation.
+///
+/// Walks a directory tree, skipping hidden directories (dot-prefixed),
+/// `.mref` files, and files below `min_size`. Returns paths sorted for
+/// deterministic ordering.
+fn collect_eligible_files(dir: &Path, min_size: u64) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    collect_eligible_recursive(dir, min_size, &mut files);
+    files.sort();
+    files
+}
+
+fn collect_eligible_recursive(dir: &Path, min_size: u64, files: &mut Vec<PathBuf>) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+
+        // Skip hidden entries
+        if name_str.starts_with('.') {
+            continue;
+        }
+
+        if path.is_dir() {
+            collect_eligible_recursive(&path, min_size, files);
+        } else {
+            // Skip .mref files
+            if name_str.ends_with(".mref") || name_str.ends_with(".mrkl") {
+                continue;
+            }
+            // Skip files below threshold
+            let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            if size >= min_size {
+                files.push(path);
+            }
+        }
+    }
+}
+
 fn resolve_path(path_str: &str, workspace: &Path) -> PathBuf {
     let p = PathBuf::from(path_str);
     if p.is_absolute() {
@@ -1219,12 +1693,41 @@ impl CommandOp for MerkleSpoilbitsOp {
         CommandDoc {
             summary: "Report bit-level differences between trees".into(),
             body: format!(
-                "# merkle spoilbits\n\n\
-                 Report bit-level differences between trees.\n\n\
-                 ## Description\n\n\
-                 Deliberately corrupts random bits in a file and rebuilds the Merkle \
-                 tree to verify that corruption is detected at the correct granularity.\n\n\
-                 ## Options\n\n{}",
+                r#"# merkle spoilbits
+
+Report bit-level differences between trees.
+
+## Description
+
+Deliberately corrupts leaf node hashes in an `.mref` file to simulate
+data corruption at the bit level. A configurable percentage of leaf
+nodes are zeroed out and the internal tree nodes are recomputed. This
+is a testing tool for validating that `merkle verify` correctly
+detects and localizes corruption.
+
+## How It Works
+
+The command loads the `.mref` file, selects a seeded-random subset
+of leaf nodes (controlled by `percentage` and `seed`), replaces their
+hashes with all-zero bytes, then recomputes all internal node hashes
+bottom-up to produce a self-consistent but intentionally corrupted
+tree. The modified tree is written back to the `.mref` file. In
+`dryrun` mode the command previews which leaves would be corrupted
+without modifying the file.
+
+## Data Preparation Role
+
+`merkle spoilbits` is a testing and validation tool used to confirm
+that the Merkle verification pipeline works correctly. By introducing
+known corruption at the hash level (without modifying the source file),
+you can verify that `merkle verify` detects the expected number of
+mismatched chunks and that `merkle diff` correctly identifies the
+corrupted regions. This is typically used during pipeline development
+and integration testing rather than in production dataset preparation.
+
+## Options
+
+{}"#,
                 render_options_table(&options)
             ),
         }
@@ -1363,13 +1866,41 @@ impl CommandOp for MerkleSpoilchunksOp {
         CommandDoc {
             summary: "Report chunk-level differences between trees".into(),
             body: format!(
-                "# merkle spoilchunks\n\n\
-                 Report chunk-level differences between trees.\n\n\
-                 ## Description\n\n\
-                 Deliberately corrupts random chunks in a file and rebuilds the Merkle \
-                 tree to verify that corruption is detected and localized to the \
-                 correct chunks.\n\n\
-                 ## Options\n\n{}",
+                r#"# merkle spoilchunks
+
+Report chunk-level differences between trees.
+
+## Description
+
+Deliberately corrupts random byte ranges in the actual source file
+and rebuilds the Merkle tree to verify that corruption is detected
+and localized to the correct chunks. Unlike `spoilbits` which only
+modifies the `.mref` hashes, `spoilchunks` modifies the real data
+file to simulate realistic storage corruption.
+
+## How It Works
+
+The command reads the source file into memory, selects a seeded-random
+subset of chunks (controlled by `percentage` and `seed`), and XOR-flips
+a configurable number of bytes within each selected chunk. The modified
+data is written back to the source file. The Merkle tree is then
+rebuilt from the corrupted data and compared against the original
+`.mref` to confirm that exactly the expected chunks are flagged as
+changed.
+
+## Data Preparation Role
+
+`merkle spoilchunks` is a more thorough testing tool than `spoilbits`
+because it corrupts the actual file data rather than just the hash
+reference. This validates the full round-trip: corrupted data leads to
+different chunk hashes, which leads to different leaf nodes, which
+propagates up to the root. It is used during pipeline integration
+testing to ensure that the `merkle verify` step would catch real-world
+corruption scenarios such as disk bit-rot or truncated downloads.
+
+## Options
+
+{}"#,
                 render_options_table(&options)
             ),
         }
@@ -1645,6 +2176,7 @@ mod tests {
         opts.set("source", source.to_string_lossy().to_string());
         opts.set("chunk-size", "16");
 
+        opts.set("min-size", "0");
         let mut create_op = MerkleCreateOp;
         let result = create_op.execute(&opts, &mut ctx);
         assert_eq!(result.status, Status::Ok);
@@ -1672,6 +2204,7 @@ mod tests {
         let mut opts = Options::new();
         opts.set("source", source.to_string_lossy().to_string());
         opts.set("chunk-size", "8");
+        opts.set("min-size", "0");
         let mut create_op = MerkleCreateOp;
         create_op.execute(&opts, &mut ctx);
 
@@ -1723,6 +2256,7 @@ mod tests {
         opts.set("source", source.to_string_lossy().to_string());
         opts.set("chunk-size", "100"); // not power of 2
 
+        opts.set("min-size", "0");
         let mut create_op = MerkleCreateOp;
         let result = create_op.execute(&opts, &mut ctx);
         assert_eq!(result.status, Status::Error);
@@ -1748,6 +2282,7 @@ mod tests {
         let mut opts = Options::new();
         opts.set("source", source.to_string_lossy().to_string());
         opts.set("chunk-size", "8");
+        opts.set("min-size", "0");
         let mut create_op = MerkleCreateOp;
         create_op.execute(&opts, &mut ctx);
 
@@ -1783,12 +2318,14 @@ mod tests {
         let mut opts = Options::new();
         opts.set("source", file1.to_string_lossy().to_string());
         opts.set("chunk-size", "8");
+        opts.set("min-size", "0");
         let mut create_op = MerkleCreateOp;
         create_op.execute(&opts, &mut ctx);
 
         let mut opts = Options::new();
         opts.set("source", file2.to_string_lossy().to_string());
         opts.set("chunk-size", "8");
+        opts.set("min-size", "0");
         create_op.execute(&opts, &mut ctx);
 
         // Diff should find mismatches
@@ -1816,6 +2353,7 @@ mod tests {
         let mut opts = Options::new();
         opts.set("source", source.to_string_lossy().to_string());
         opts.set("chunk-size", "8");
+        opts.set("min-size", "0");
         let mut create_op = MerkleCreateOp;
         create_op.execute(&opts, &mut ctx);
 
@@ -1840,6 +2378,7 @@ mod tests {
         let mut opts = Options::new();
         opts.set("source", source.to_string_lossy().to_string());
         opts.set("chunk-size", "8");
+        opts.set("min-size", "0");
         let mut create_op = MerkleCreateOp;
         create_op.execute(&opts, &mut ctx);
 
@@ -1874,6 +2413,7 @@ mod tests {
         let mut opts = Options::new();
         opts.set("source", source.to_string_lossy().to_string());
         opts.set("chunk-size", "8");
+        opts.set("min-size", "0");
         let mut create_op = MerkleCreateOp;
         create_op.execute(&opts, &mut ctx);
 
@@ -1900,6 +2440,7 @@ mod tests {
         let mut opts = Options::new();
         opts.set("source", source.to_string_lossy().to_string());
         opts.set("chunk-size", "8");
+        opts.set("min-size", "0");
         let mut create_op = MerkleCreateOp;
         create_op.execute(&opts, &mut ctx);
 
@@ -1945,6 +2486,7 @@ mod tests {
         let mut create_opts = Options::new();
         create_opts.set("source", data_path.to_string_lossy().to_string());
         create_opts.set("chunk-size", "1024");
+        create_opts.set("min-size", "0");
         let mut create_op = MerkleCreateOp;
         let result = create_op.execute(&create_opts, &mut ctx);
         assert_eq!(result.status, Status::Ok, "create failed: {}", result.message);
@@ -1975,6 +2517,7 @@ mod tests {
         let mut create_opts = Options::new();
         create_opts.set("source", data_path.to_string_lossy().to_string());
         create_opts.set("chunk-size", "1024");
+        create_opts.set("min-size", "0");
         let mut create_op = MerkleCreateOp;
         create_op.execute(&create_opts, &mut ctx);
 
@@ -2007,6 +2550,7 @@ mod tests {
         let mut create_opts = Options::new();
         create_opts.set("source", data_path.to_string_lossy().to_string());
         create_opts.set("chunk-size", "1024");
+        create_opts.set("min-size", "0");
         let mut create_op = MerkleCreateOp;
         create_op.execute(&create_opts, &mut ctx);
 

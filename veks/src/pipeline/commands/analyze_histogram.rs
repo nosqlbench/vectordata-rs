@@ -37,7 +37,29 @@ impl CommandOp for AnalyzeHistogramOp {
         CommandDoc {
             summary: "Generate dimension-value histograms for vector files".into(),
             body: format!(
-                "# analyze histogram\n\nGenerate dimension-value histograms for vector files.\n\n## Description\n\nReads an fvec file and produces an ASCII histogram of values for a specific dimension, showing the distribution shape. Configurable bin count and bar width.\n\n## Options\n\n{}",
+                "# analyze histogram\n\n\
+                Generate dimension-value histograms for vector files.\n\n\
+                ## Description\n\n\
+                Reads an fvec file and builds a frequency distribution for a specific \
+                dimension, then renders it as an ASCII histogram with configurable bin \
+                count and bar width. The output includes the value range, mean, and \
+                standard deviation alongside the bar chart, making it easy to visually \
+                assess distribution shape at a glance.\n\n\
+                ## How It Works\n\n\
+                The command extracts all values for the specified dimension, computes \
+                basic statistics via `DimensionStats`, then bins the values into \
+                equal-width intervals spanning the min-max range. Each bin is rendered \
+                as a row of Unicode block characters whose length is proportional to \
+                the bin count relative to the most populated bin.\n\n\
+                ## Role in Dataset Preparation\n\n\
+                Histograms are useful for spotting quantization artifacts (e.g., values \
+                clustering at specific levels after int8 conversion), skewed or \
+                multi-modal distributions, and unexpected gaps or spikes in data. \
+                Comparing histograms before and after transformations such as \
+                normalization or PCA rotation can reveal whether the transformation \
+                behaved as expected. The `sample` option allows quick inspection of \
+                very large files without reading every vector.\n\n\
+                ## Options\n\n{}",
                 render_options_table(&options)
             ),
         }

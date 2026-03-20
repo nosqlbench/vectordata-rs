@@ -56,9 +56,53 @@ Generate predicated dataset with filtered ground truth.
 
 ## Description
 
-Starting from an existing base dataset (base vectors, queries, ground truth),
-adds structured metadata attributes, query predicates, and recomputed
-predicated ground truth (KNN over predicate-filtered base vectors).
+Starting from an existing base dataset (containing `base.fvec`,
+`query.fvec`, and `dataset.yaml`), this command augments the dataset with
+structured metadata attributes, per-query predicate filters, and
+recomputed ground truth that accounts for those filters. The result is a
+dataset suitable for evaluating **filtered (predicated) ANN search**
+implementations.
+
+## What it produces
+
+- `attribute_schema.yaml` -- field definitions (name, type, cardinality)
+- `attributes_<name>.dat` -- per-field binary column files with synthetic
+  attribute values for each base vector
+- `predicates.pnodes` -- one binary PNode predicate tree per query
+- `predicated_indices.ivec` -- predicated KNN indices (only neighbors
+  that satisfy the query's predicate)
+- `predicated_distances.fvec` -- predicated KNN distances
+
+The existing `dataset.yaml` is updated with references to the new
+predicated facets.
+
+## How it works
+
+1. **Attribute generation** -- for each configured field, a column of
+   synthetic attribute values is generated for every base vector. Field
+   types include `int`, `long`, `enum`, and `enum_set`, each with a
+   configurable cardinality.
+2. **Predicate generation** -- for each query, a PNode predicate tree is
+   synthesized targeting the configured selectivity (fraction of base
+   vectors that satisfy the predicate). Predicate complexity can be
+   `simple` (AND-only) or `compound` (AND/OR).
+3. **Predicated KNN** -- for each query, the base vectors are filtered by
+   the query's predicate, and exact KNN is computed over the filtered
+   subset using SIMD-accelerated distance functions. This produces the
+   ground truth for filtered search evaluation.
+
+## Role in dataset pipelines
+
+Filtered search is a key capability for production vector databases, where
+queries often include metadata constraints (e.g. "find similar images
+where category = 'landscape' AND year >= 2020"). This command creates
+the test harness for measuring filtered-search recall and performance.
+
+The selectivity parameter controls the difficulty of the benchmark: lower
+selectivity means fewer eligible neighbors, which is harder for
+approximate algorithms. The `predicate-complexity` parameter controls
+whether predicates are simple single-clause filters or compound boolean
+trees.
 
 ## Options
 

@@ -53,7 +53,35 @@ impl CommandOp for AnalyzeVerifyProfilesOp {
         CommandDoc {
             summary: "Verify dataset profile facet consistency".into(),
             body: format!(
-                "# analyze verify-profiles\n\nVerify dataset profile facet consistency.\n\n## Description\n\nLoads a model.json and a generated fvec file, then performs per-dimension Kolmogorov-Smirnov tests to verify the vectors match the model's statistical profile within acceptable tolerances.\n\n## Options\n\n{}",
+                "# analyze verify-profiles\n\n\
+                Verify dataset profile facet consistency.\n\n\
+                ## Description\n\n\
+                Loads a VectorSpaceModel JSON file (as produced by `analyze profile`) \
+                and a generated fvec file, then performs per-dimension Kolmogorov-Smirnov \
+                (KS) tests to verify that the vectors match the model's statistical \
+                profile within acceptable tolerances.\n\n\
+                ## How It Works\n\n\
+                For each dimension, the command:\n\n\
+                1. Extracts sampled values from the vector file and sorts them.\n\
+                2. Computes the theoretical CDF from the model definition (Normal CDF \
+                via Abramowitz-Stegun approximation, Uniform CDF, or Beta CDF via \
+                trapezoidal numerical integration).\n\
+                3. Walks the sorted values to find the maximum difference between the \
+                empirical and theoretical CDFs (the KS D-statistic).\n\
+                4. Compares the D-statistic against the configurable threshold to \
+                determine pass/fail for that dimension.\n\n\
+                The overall result is PASS only if all dimensions are within the \
+                threshold. Failed dimensions are always printed regardless of the \
+                verbose setting.\n\n\
+                ## Role in Dataset Preparation\n\n\
+                This command is the counterpart to `analyze profile` and `generate \
+                from-model`. After generating synthetic vectors from a statistical \
+                model, running verify-profiles confirms that the generated data \
+                actually follows the intended distribution. This catches bugs in the \
+                random number generation, distribution sampling code, or parameter \
+                serialization. It is typically the final validation step before \
+                using generated vectors for benchmarking.\n\n\
+                ## Options\n\n{}",
                 render_options_table(&options)
             ),
         }

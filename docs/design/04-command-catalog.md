@@ -47,16 +47,13 @@ Each command implements:
 |---------|-------------|------------------|
 | `generate vectors` | Generate synthetic random vectors | CPU + I/O |
 | `generate ivec-shuffle` | Generate shuffled ordinal permutation | Memory: full ordinal array |
-| `transform fvec-extract` | Extract vector subset | I/O-bound |
-| `transform ivec-extract` | Extract index subset | I/O-bound |
-| `transform mvec-extract` | Extract half-precision subset | I/O-bound |
 | `generate sketch` | Generate vector sketches | CPU |
 | `generate from-model` | Generate vectors from an ML model | CPU + GPU |
 | `generate dataset` | Generate synthetic dataset | Mixed |
 | `generate derive` | Derive new facets from existing | Mixed |
 | `generate predicated` | Generate predicated dataset | Mixed |
 | `synthesize predicates` | Generate random filter predicates from metadata survey | **Light**: reads survey JSON, outputs small slab. Fast. |
-| `compute predicates` | Evaluate predicates against all metadata records | **CRITICAL: highest resource risk**. Scans entire metadata slab (207 GB for LAION-400M). Segmented processing with cache. Per-segment: reads all pages, evaluates all predicates against every record. Memory: match ordinal vectors per predicate × segment. THIS IS THE COMMAND THAT CAUSED THE SYSTEM LOCKUP. |
+| `compute predicates` | Compute predicates against all metadata records | **CRITICAL: highest resource risk**. Scans entire metadata slab (207 GB for LAION-400M). Segmented processing with cache. Per-segment: reads all pages, evaluates all predicates against every record. Memory: match ordinal vectors per predicate × segment. THIS IS THE COMMAND THAT CAUSED THE SYSTEM LOCKUP. |
 
 ### Slab Operations
 
@@ -73,6 +70,15 @@ Each command implements:
 | `slab namespaces` | List namespaces | Light |
 | `slab inspect` | Decode + render records via ANode | Light per record |
 | `survey` | Sample records and analyze field distributions | Memory: sample set |
+
+### Transform
+
+| Command | Description | Resource profile |
+|---------|-------------|------------------|
+| `transform fvec-extract` | Extract vector subset from fvec file | I/O-bound |
+| `transform ivec-extract` | Extract index subset from ivec file | I/O-bound |
+| `transform mvec-extract` | Extract half-precision vector subset from mvec file | I/O-bound |
+| `transform slab-extract` | Extract record subset from slab file | I/O-bound |
 
 ### Analysis
 
@@ -118,6 +124,15 @@ Each command implements:
 | `datasets curlify` | Generate curl commands for downloads | Light |
 | `datasets prebuffer` | Pre-buffer dataset into page cache | I/O-heavy |
 
+### Pipeline Control
+
+| Command | Description | Resource profile |
+|---------|-------------|------------------|
+| `barrier` | Synchronization barrier between pipeline phases | None — no execution, ordering only |
+| `set variable` | Set a pipeline variable for downstream steps | Light |
+| `clear variables` | Clear all pipeline variables | Light |
+| `inspect predicate` | Decode and render a PNode predicate record | Light |
+
 ### Other
 
 | Command | Description | Resource profile |
@@ -131,6 +146,7 @@ Each command implements:
 | `json jjq` | JSON query (jq-like) | Light |
 | `json rjq` | Record-oriented JSON query | Light |
 | `fetch dlhf` | Download from HuggingFace | Network + I/O |
+| `fetch bulkdl` | Bulk parallel file downloads with token expansion | Network + I/O |
 | `catalog generate` | Generate dataset catalog | Light |
 
 ## 4.3 Resource Risk Matrix

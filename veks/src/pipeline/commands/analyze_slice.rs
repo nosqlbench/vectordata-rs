@@ -89,7 +89,31 @@ impl CommandOp for AnalyzeSliceOp {
         CommandDoc {
             summary: "Extract a contiguous range of vectors to a new file".into(),
             body: format!(
-                "# analyze slice\n\nExtract a contiguous range of vectors to a new file.\n\n## Description\n\nExtracts a subset of vectors by ordinal range and a subset of dimensions by component range from an xvec file. Supports text, CSV, TSV, and JSON output formats.\n\n## Options\n\n{}",
+                "# analyze slice\n\n\
+                Extract a contiguous range of vectors to a new file.\n\n\
+                ## Description\n\n\
+                Extracts a subset of vectors by ordinal range and optionally a subset \
+                of dimensions by component range from an xvec file. The extracted data \
+                is printed in one of several output formats: text (human-readable with \
+                fixed-width floats), CSV, TSV, or JSON.\n\n\
+                ## Range Syntax\n\n\
+                Both the `ordinal-range` and `component-range` options accept flexible \
+                range notation:\n\n\
+                - `n` -- first n items: [0, n)\n\
+                - `m..n` -- inclusive both ends: [m, n]\n\
+                - `[m,n)` -- half-open interval\n\
+                - `[m,n]` -- closed interval\n\
+                - `(m,n)` -- open interval\n\
+                - `[n]` -- single element\n\n\
+                ## Role in Dataset Preparation\n\n\
+                This command is primarily a debugging and inspection tool. When working \
+                with large vector files (millions or billions of vectors), it is often \
+                necessary to inspect a small portion to verify correct import, check \
+                value ranges, or confirm that a transformation was applied correctly. \
+                The JSON output mode is useful for piping into other tools or scripts \
+                for further analysis. The `max-vectors` option caps the output in text \
+                mode to prevent flooding the terminal with large slices.\n\n\
+                ## Options\n\n{}",
                 render_options_table(&options)
             ),
         }

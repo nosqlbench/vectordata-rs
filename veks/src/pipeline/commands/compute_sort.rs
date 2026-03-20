@@ -19,8 +19,8 @@ use vectordata::VectorReader;
 use vectordata::io::MmapVectorReader;
 
 use crate::pipeline::command::{
-    CommandDoc, CommandOp, CommandResult, OptionDesc, Options, ResourceDesc, Status, StreamContext,
-    render_options_table,
+    ArtifactManifest, CommandDoc, CommandOp, CommandResult, OptionDesc, Options, ResourceDesc,
+    Status, StreamContext, render_options_table,
 };
 
 /// Pipeline command: sort vectors.
@@ -109,12 +109,41 @@ Sort vectors by ordinal mapping.
 
 ## Description
 
-Reads an fvec file and writes a sorted copy. Sorting criteria include:
-- `norm`: L2 norm of each vector (ascending)
-- `dimension:N`: value of dimension N (ascending)
+Reads an fvec file and writes a new copy with vectors reordered according
+to the chosen sort criterion. The original file is not modified.
 
-For large files, uses an index-sort approach: compute sort keys, sort
-indices, then write output in sorted order via mmap random access.
+### Sort Criteria
+
+The following criteria are supported (all sort ascending):
+
+- **`norm`** / `l2norm` / `l2` — sort by the L2 (Euclidean) norm of each
+  vector. Vectors with smaller magnitudes come first.
+- **`dimension:N`** / `dim:N` — sort by the value of a single dimension N.
+  Useful for ordering vectors by a particular feature axis.
+
+### How It Works
+
+The command uses an **index-sort** approach for efficiency:
+
+1. Compute a scalar sort key for every vector (e.g., its L2 norm).
+2. Build an array of (key, original_index) pairs and sort it. The sort is
+   stable, so vectors with equal keys preserve their original relative
+   order.
+3. Write the output file by reading vectors from the source in the new
+   sorted order via mmap random access.
+
+This strategy avoids shuffling full vector payloads during the sort itself;
+only lightweight index pairs are moved until the final sequential write
+pass.
+
+### Role in the Pipeline
+
+Sorting vectors by ordinal mapping is a preprocessing step that can improve
+data locality for downstream operations. For example, sorting base vectors
+by norm groups similarly-scaled vectors together, which can benefit
+partitioned KNN computation by producing more uniform distance
+distributions within each partition. It can also be used to reorder vectors
+to match an externally defined permutation or clustering assignment.
 
 ## Options
 
@@ -262,6 +291,14 @@ indices, then write output in sorted order via mmap random access.
                 description: "Sort criterion: 'norm' or 'dimension:N'".to_string(),
             },
         ]
+    }
+
+    fn project_artifacts(&self, step_id: &str, options: &Options) -> ArtifactManifest {
+        crate::pipeline::command::manifest_from_keys(
+            step_id, self.command_path(), options,
+            &["source"],
+            &["output"],
+        )
     }
 }
 

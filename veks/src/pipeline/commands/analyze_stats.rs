@@ -142,7 +142,33 @@ impl CommandOp for AnalyzeStatsOp {
         CommandDoc {
             summary: "Compute per-dimension statistics for vector files".into(),
             body: format!(
-                "# analyze stats\n\nCompute per-dimension statistics for vector files.\n\n## Description\n\nComputes per-dimension statistics (min, max, mean, std_dev, skewness, kurtosis) and optional percentiles for fvec files. Can analyze a single dimension with detailed percentile breakdown, all dimensions in a summary table, or global statistics across all dimensions.\n\n## Options\n\n{}",
+                "# analyze stats\n\n\
+                Compute per-dimension statistics for vector files.\n\n\
+                ## Description\n\n\
+                Computes per-dimension statistics (min, max, mean, std_dev, skewness, \
+                kurtosis) and optional percentiles for fvec files. For each dimension, \
+                a two-pass algorithm is used: the first pass computes min, max, and sum \
+                to derive the mean; the second pass computes central moments (variance, \
+                skewness, kurtosis) relative to that mean. The L2 norm is available \
+                implicitly through the variance output.\n\n\
+                ## Analysis Modes\n\n\
+                The command supports three analysis modes depending on the options provided:\n\n\
+                - **Single dimension** (`dimension=N`): Provides a detailed breakdown \
+                for one dimension including percentiles (p1, p5, p25, p50, p75, p95, p99), \
+                interquartile range (IQR), outlier fences, and outlier counts.\n\
+                - **All dimensions** (`all-dimensions=true`): Prints a summary table with \
+                mean, std_dev, min, max, skewness, and kurtosis for every dimension.\n\
+                - **Global** (default): Flattens all dimension values into a single \
+                distribution and reports aggregate statistics.\n\n\
+                ## Role in Dataset Preparation\n\n\
+                This command is typically used after importing or generating vector data \
+                to validate that values are within expected ranges. It can detect anomalies \
+                such as NaN or infinity values, all-zero vectors, unexpectedly large or \
+                small magnitudes, and skewed or heavy-tailed distributions that may cause \
+                issues with distance computations or quantization. Running this command \
+                before and after transformations (e.g., normalization, shuffling) helps \
+                confirm that statistical properties are preserved.\n\n\
+                ## Options\n\n{}",
                 render_options_table(&options)
             ),
         }

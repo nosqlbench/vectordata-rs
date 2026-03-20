@@ -7,7 +7,11 @@
 //! MNode wire format. Tag assignments are stable and match the Java
 //! `datatools-vectordata` implementation.
 
-/// Type tags for MNode field values
+/// Type tags for MNode field values.
+///
+/// Each variant is a single-byte discriminant preceding the value bytes in
+/// the MNode wire format. Assignments are stable and match the Java
+/// `datatools-vectordata` implementation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum TypeTag {

@@ -1,11 +1,14 @@
 // Copyright (c) DataStax, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Views for accessing dataset components.
+//! Profile views for accessing dataset components.
 //!
-//! This module defines traits and structs for accessing the different parts of a
-//! vector dataset (base vectors, query vectors, ground truth) uniformly, regardless
-//! of the underlying data source (local file or HTTP).
+//! Defines the [`TestDataView`] trait and [`GenericTestDataView`] implementation
+//! for uniform access to base vectors, query vectors, ground-truth neighbors,
+//! and metadata facets regardless of backing storage (local mmap or HTTP).
+//!
+//! The [`FacetDescriptor`] type supports discover-then-load patterns by
+//! describing available facets without materializing data.
 
 use crate::group::DataSource;
 use crate::io::{HttpVectorReader, MmapVectorReader, VectorReader};

@@ -26,7 +26,7 @@ by ordinal. Record size = 4 + dimension * element_size.
 ## 2.2 NumPy Format (.npy)
 
 Standard NumPy array format. Used as source data for import. Parsed by the
-npy reader in `veks/src/formats/reader/npy.rs`. Supports dtype detection and
+npy reader in `veks/src/formats/reader/npy.rs` (format readers remain in the veks crate). Supports dtype detection and
 streaming reads.
 
 ## 2.3 Apache Parquet (.parquet)

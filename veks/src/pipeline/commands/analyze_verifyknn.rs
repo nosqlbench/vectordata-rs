@@ -181,7 +181,32 @@ impl CommandOp for AnalyzeVerifyKnnOp {
         CommandDoc {
             summary: "Verify KNN results by recomputing distances".into(),
             body: format!(
-                "# analyze verify-knn\n\nVerify KNN results by recomputing distances.\n\n## Description\n\nLoads base vectors, query vectors, and precomputed neighbor indices, then recomputes distances for a range of queries and verifies the provided neighborhoods match the true nearest neighbors. Supports L2, Cosine, DotProduct, and L1 distance metrics.\n\n## Options\n\n{}",
+                "# analyze verify-knn\n\n\
+                Verify KNN results by recomputing distances.\n\n\
+                ## Description\n\n\
+                Loads base vectors, query vectors, and precomputed neighbor indices, then \
+                recomputes distances for a configurable range of queries using brute-force \
+                exhaustive search. For each query, the true top-k nearest neighbors are \
+                computed from scratch and compared against the stored ground-truth indices. \
+                Supports L2 (Euclidean), Cosine, DotProduct, and L1 (Manhattan) distance \
+                metrics.\n\n\
+                ## How It Works\n\n\
+                For each query vector, the command performs a full scan of the base vector \
+                set (or a windowed subset) to find the exact k nearest neighbors. It then \
+                compares the resulting index set against the precomputed indices from the \
+                ivec file. If the sets do not match, it checks whether the discrepancy is \
+                caused by distance ties (multiple vectors at the same distance from the \
+                query) using the configurable `phi` tolerance. Queries that differ only \
+                due to ties are counted as passes.\n\n\
+                ## Role in Dataset Preparation\n\n\
+                This command is critical for catching data corruption, byte-order \
+                (endianness) issues, shuffle bugs, or off-by-one errors that would \
+                produce incorrect ground-truth files and therefore invalid benchmark \
+                results. It should be run after computing KNN ground truth and again \
+                after any transformation that reorders or modifies the base vectors. \
+                The `range` option allows verifying a subset of queries to save time \
+                on very large datasets while still providing confidence in correctness.\n\n\
+                ## Options\n\n{}",
                 render_options_table(&options)
             ),
         }

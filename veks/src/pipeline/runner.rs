@@ -25,6 +25,16 @@ use super::progress::{OutputRecord, ResourceSummary, StepRecord};
 use super::registry::CommandRegistry;
 use super::schema::OnPartial;
 
+/// Summary of a pipeline run, returned to the caller for post-TUI display.
+pub struct RunSummary {
+    pub total: usize,
+    pub skipped: usize,
+    pub executed: usize,
+    pub total_elapsed: std::time::Duration,
+    /// Per-step outcomes: (step_id, was_executed, message)
+    pub step_outcomes: Vec<(String, bool, String)>,
+}
+
 /// Execute a list of resolved steps in order.
 ///
 /// Steps are expected to already be in topological order (from `build_dag`).
@@ -32,7 +42,7 @@ pub fn run_steps(
     steps: &[ResolvedStep],
     registry: &CommandRegistry,
     ctx: &mut StreamContext,
-) -> Result<(), String> {
+) -> Result<RunSummary, String> {
     let total = steps.len();
 
     // Build a display prefix with dataset name and profile context
@@ -52,6 +62,14 @@ pub fn run_steps(
     // Track which steps actually executed (not skipped) for cascade invalidation.
     // If an upstream step ran, all downstream dependents must also run.
     let mut executed_steps: HashSet<String> = HashSet::new();
+
+    // Summary counters for the final report.
+    let mut skipped_count: usize = 0;
+    let mut executed_count: usize = 0;
+    let mut total_elapsed = std::time::Duration::ZERO;
+    let mut step_outcomes: Vec<(String, bool, String)> = Vec::with_capacity(total);
+
+    let overall_pb = ctx.ui.bar(total as u64, "pipeline");
 
     let profile_count = ctx.profile_names.len();
 
@@ -100,7 +118,10 @@ pub fn run_steps(
         } else {
             match ctx.progress.check_step_freshness(&step.id, Some(&resolved_map), Some(&ctx.workspace)) {
                 None => {
-                    ctx.ui.log(&format!("{} {} — SKIP (fresh)", prefix, step.id));
+                    skipped_count += 1;
+                    step_outcomes.push((step.id.clone(), false, "fresh".into()));
+                    ctx.ui.log(&format!("{} {} — fresh, skipping", prefix, step.id));
+                    overall_pb.inc(1);
                     continue;
                 }
                 Some(reason) => {
@@ -144,7 +165,9 @@ pub fn run_steps(
             match state {
                 ArtifactState::Complete => {
                     // Not in progress log but artifact is complete — record and skip
-                    ctx.ui.log(&format!("{} {} — SKIP (artifact complete)", prefix, step.id));
+                    skipped_count += 1;
+                    step_outcomes.push((step.id.clone(), false, "artifact complete".into()));
+                    ctx.ui.log(&format!("{} {} — artifact complete, skipping", prefix, step.id));
                     // Clean up any stale buffer file
                     let _ = std::fs::remove_file(&buffer_path);
                     ctx.progress.record_step(
@@ -171,6 +194,7 @@ pub fn run_steps(
                     if let Err(e) = ctx.progress.save() {
                         ctx.ui.log(&format!("  warning: failed to save progress: {}", e));
                     }
+                    overall_pb.inc(1);
                     continue;
                 }
                 ArtifactState::Partial => {
@@ -226,6 +250,23 @@ pub fn run_steps(
         // The command writes to the buffer; on success, the runner renames
         // it to the final path. This prevents partially-written files from
         // being mistaken for valid artifacts.
+        //
+        // Buffer-write is skipped for directory outputs (no file extension)
+        // because directory-producing commands like `fetch bulkdl` manage
+        // their own resume state internally. Redirecting to a buffer
+        // directory loses that state and forces full re-downloads.
+        if use_buffer_write {
+            if let Some(ref output_path) = resolved_output {
+                let full_path = if std::path::Path::new(output_path.as_str()).is_absolute() {
+                    PathBuf::from(output_path)
+                } else {
+                    ctx.workspace.join(output_path)
+                };
+                if full_path.is_dir() || full_path.extension().is_none() {
+                    use_buffer_write = false;
+                }
+            }
+        }
         let buffer_final_rename: Option<(PathBuf, PathBuf)> = if use_buffer_write {
             if let Some(ref output_path) = resolved_output {
                 let full_path = if std::path::Path::new(output_path.as_str()).is_absolute() {
@@ -464,6 +505,10 @@ pub fn run_steps(
                 }
 
                 executed_steps.insert(step.id.clone());
+                executed_count += 1;
+                overall_pb.inc(1);
+                total_elapsed += elapsed;
+                step_outcomes.push((step.id.clone(), true, result.message.clone()));
                 let level = if result.status == Status::Ok { "OK" } else { "WARNING" };
                 ctx.ui.log(&format!(
                     "{} {} — {} ({:.1}s): {}",
@@ -576,12 +621,15 @@ pub fn run_steps(
         );
     }
 
-    if ctx_label.is_empty() {
-        ctx.ui.log("\nPipeline complete.");
-    } else {
-        ctx.ui.log(&format!("\n{} — pipeline complete.", ctx_label));
-    }
-    Ok(())
+    overall_pb.finish();
+
+    Ok(RunSummary {
+        total,
+        skipped: skipped_count,
+        executed: executed_count,
+        total_elapsed,
+        step_outcomes,
+    })
 }
 
 /// Compute the buffer path for a given output path.

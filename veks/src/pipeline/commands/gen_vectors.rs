@@ -42,9 +42,42 @@ Generate synthetic random vectors.
 
 ## Description
 
-Generates vectors with independently sampled elements from a uniform
-distribution. Supports f32, i32, f64, u8 (byte), f16 (half), and i16
-element types. Output format is determined by the element type.
+Produces vectors whose elements are independently sampled from a uniform
+distribution over a configurable range. Each generated vector is written as
+a single record in the appropriate xvec binary format, determined by the
+chosen element type:
+
+- `f32` / `float[]` -- fvec (4-byte IEEE 754 floats)
+- `i32` / `int[]` -- ivec (4-byte signed integers)
+- `f64` / `double[]` -- dvec (8-byte IEEE 754 doubles)
+- `u8` / `byte[]` -- bvec (single-byte unsigned integers, full 0-255 range)
+- `f16` / `half` -- mvec (2-byte IEEE 754 half-precision floats)
+- `i16` / `short[]` -- svec (2-byte signed integers)
+
+Every element within a vector is drawn independently -- there is no
+correlation between dimensions. For float and double types, elements are
+uniformly distributed in `[min, max)`. For integer types, elements are
+uniformly distributed in `[int-min, int-max]`.
+
+## Deterministic generation
+
+When a `seed` value is provided, the PRNG is initialized deterministically
+so that repeated runs with the same seed, dimension, count, and type
+produce byte-identical output files. This is critical for reproducible
+benchmarking pipelines where upstream artifacts must be stable.
+
+## Role in dataset pipelines
+
+This command is the simplest way to create test datasets from scratch. It
+is commonly used to fill in vector facets during synthetic dataset
+generation -- for example, producing a `base_vectors.fvec` or
+`query_vectors.fvec` for a new dataset layout.
+
+Because the element values are uniformly random, the resulting vectors have
+no meaningful cluster structure. For datasets that need statistically
+realistic vector distributions, use `generate from-model` instead, which
+samples each dimension from a fitted distribution model derived from real
+data.
 
 ## Options
 

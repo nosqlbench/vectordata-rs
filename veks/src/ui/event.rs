@@ -91,6 +91,8 @@ pub enum UiEvent {
         kind: ProgressKind,
         total: u64,
         label: String,
+        /// The unit label for rate display (e.g., "rec", "files", "chunks").
+        unit: String,
     },
 
     /// Update the absolute position of a progress indicator.

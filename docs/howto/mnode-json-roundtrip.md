@@ -8,9 +8,9 @@ bytes, decode via ANode, render as JSON, parse the JSON back, and verify
 equality.
 
 ```rust
-use veks::formats::mnode::{MNode, MValue};
-use veks::formats::anode::{self, ANode};
-use veks::formats::anode_vernacular::{self, Vernacular};
+use vectordata::formats::mnode::{MNode, MValue};
+use vectordata::formats::anode::{self, ANode};
+use vectordata::formats::anode_vernacular::{self, Vernacular};
 
 // Build an MNode with various types
 let mut node = MNode::new();

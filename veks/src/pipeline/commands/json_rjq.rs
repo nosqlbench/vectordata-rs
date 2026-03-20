@@ -86,13 +86,45 @@ impl CommandOp for JsonRjqOp {
         CommandDoc {
             summary: "Query slab records with jq-like expressions".into(),
             body: format!(
-                "# json rjq\n\n\
-                 Query slab records with jq-like expressions.\n\n\
-                 ## Description\n\n\
-                 Applies full jq expressions to JSONL files via the `jaq` crate — a pure \
-                 Rust implementation of the jq language. Supports pipes, array operations, \
-                 object construction, conditionals, `map`, `select`, `group_by`, and more.\n\n\
-                 ## Options\n\n{}",
+                r#"# json rjq
+
+Query slab records with jq-like expressions.
+
+## Description
+
+Applies full jq expressions to JSONL files via the `jaq` crate -- a
+pure Rust implementation of the jq language. Unlike `json jjq` which
+supports only a simplified subset, `rjq` provides nearly the complete
+jq expression language including pipes, array operations, object
+construction, conditionals, `map`, `select`, `group_by`, `keys`,
+`length`, and more.
+
+## How It Works
+
+The command compiles the jq expression using the `jaq` parser and
+standard library (including `jaq_core` and `jaq_std`), then opens the
+input JSONL file and processes it line by line. Each line is parsed as
+a `serde_json::Value`, converted to a `jaq` `Val`, and run through
+the compiled filter. A single input value may produce zero, one, or
+many output values (for example, `.[]` iterates array elements).
+All output values are serialized as JSON lines. Parse errors and
+evaluation errors are logged (up to 5) and counted in the status.
+
+## Data Preparation Role
+
+`json rjq` is the full-power JSON transformation tool in the pipeline,
+used when `json jjq`'s simplified expressions are insufficient.
+Typical use cases include restructuring complex metadata records,
+computing derived fields, grouping records for aggregation, and
+performing conditional transformations. Because it uses a pure Rust jq
+implementation with no C dependencies, it works on any platform without
+requiring an external `jq` binary. This makes it suitable for
+automated pipeline execution in containerized or restricted
+environments.
+
+## Options
+
+{}"#,
                 render_options_table(&options)
             ),
         }

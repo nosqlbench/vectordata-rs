@@ -44,8 +44,8 @@ use crate::formats::mnode::{MNode, MValue};
 use crate::formats::pnode::eval::evaluate;
 use crate::formats::pnode::{Comparand, OpType, PNode};
 use crate::pipeline::command::{
-    CommandDoc, CommandOp, CommandResult, OptionDesc, Options, ResourceDesc, Status, StreamContext,
-    render_options_table,
+    ArtifactManifest, CommandDoc, CommandOp, CommandResult, OptionDesc, Options, ResourceDesc,
+    Status, StreamContext, render_options_table,
 };
 use super::slab::survey_from_json;
 
@@ -519,10 +519,61 @@ Compute predicates against metadata to produce match ordinals.
 
 ## Description
 
-Evaluates PNode predicates against MNode metadata records and writes
-per-predicate matching ordinal sets to an output slab. Each output record
-is a sequence of i32 LE ordinals identifying the metadata records that
-satisfy the corresponding predicate.
+Evaluates each PNode predicate against every MNode metadata record in
+the input slab and writes per-predicate matching ordinal sets to an
+output slab. Each output record is a sequence of `i32 LE` ordinals
+identifying the metadata records that satisfy the corresponding predicate.
+This serves as a **predicate answer key** -- analogous to KNN ground truth
+indices, but for metadata filtering.
+
+## How it works
+
+Predicates go through two compilation phases for efficient evaluation:
+
+1. **Memoize** -- PNode trees are flattened into field-indexed condition
+   lists (once, at startup). AND-only trees with named fields are
+   decomposed into per-field conditions; other predicates (OR trees,
+   indexed fields) are retained as fallbacks for full tree evaluation.
+2. **Schema-compile** -- after reading the first metadata record, the
+   memoized conditions are mapped to field *positions* in the record
+   layout, producing a compiled predicate set that uses positional
+   dispatch instead of per-field name hashing.
+
+During scanning, each record's raw MNode bytes are walked with zero heap
+allocation: non-targeted fields are skipped in-place and targeted fields
+are compared directly against comparand values. This makes evaluation
+extremely fast even on hundreds of millions of records.
+
+## Segmented processing
+
+Large datasets are split into segments (default 1M records). Each segment
+is processed independently and its results cached to disk, so interrupted
+runs resume from the last completed segment rather than starting over.
+This is essential for multi-billion-record datasets where a full scan can
+take hours.
+
+## Output format
+
+The output slab contains one record per predicate. Each record is a
+packed array of `i32 LE` ordinals -- the indices of metadata records that
+matched the predicate. For a predicate with selectivity 0.1 over 10M
+records, the output record contains approximately 1M ordinal values.
+
+## Role in dataset pipelines
+
+This command is typically the final step in building a filtered-search
+ground truth dataset:
+
+1. `synthesize predicates` generates PNode predicate trees from metadata
+   statistics.
+2. `compute predicates` evaluates those predicates against the full
+   metadata slab to produce per-predicate answer keys.
+
+The answer keys are then used by filtered-KNN ground truth computation:
+for each query, only base vectors whose ordinals appear in the
+corresponding answer key are considered as candidate neighbors. This
+precomputation avoids re-evaluating predicates during the expensive KNN
+sweep.
 
 ## Options
 
@@ -1614,6 +1665,14 @@ satisfy the corresponding predicate.
                 "Ordinal range to scan, e.g. '[0,10000000)'. Limits metadata scanning to a profile subset.",
             ),
         ]
+    }
+
+    fn project_artifacts(&self, step_id: &str, options: &Options) -> ArtifactManifest {
+        crate::pipeline::command::manifest_from_keys(
+            step_id, self.command_path(), options,
+            &["input", "predicates", "survey"],
+            &["output"],
+        )
     }
 }
 

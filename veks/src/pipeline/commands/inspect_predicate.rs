@@ -57,6 +57,30 @@ which metadata records satisfy a given predicate.
 
 {}
 
+## How It Works
+
+The command opens three slab files: the predicates slab, the metadata
+slab, and the metadata-indices slab. It reads the predicate record at
+the given ordinal, decodes it as a PNode, and renders it in the chosen
+vernacular. It then reads the metadata-indices record at the same
+ordinal, which contains a packed array of i32 values representing the
+metadata ordinals that satisfy this predicate. For each matching
+metadata ordinal (up to the display limit), it reads and decodes the
+corresponding metadata record as an MNode and renders it.
+
+## Data Preparation Role
+
+`inspect predicate` is the primary debugging tool for the filtered KNN
+pipeline. After `compute predicates` builds the cross-reference between
+predicates and metadata records, this command lets you verify the
+mapping by picking a specific predicate ordinal and seeing exactly
+which metadata records it matches. This is essential for confirming
+that predicates were synthesized correctly and that the metadata-indices
+mapping accurately reflects the intended filter semantics. When
+filtered KNN queries return unexpected results, `inspect predicate` is
+typically the first diagnostic step to determine whether the issue is
+in predicate synthesis, metadata indexing, or query execution.
+
 ## Notes
 
 - The ordinal indexes into the predicates slab (and the corresponding

@@ -155,7 +155,37 @@ impl CommandOp for AnalyzeCheckEndianOp {
         CommandDoc {
             summary: "Check byte order of a vector file".into(),
             body: format!(
-                "# analyze check-endian\n\nCheck byte order of a vector file.\n\n## Description\n\nReads the dimension header under both little-endian and big-endian interpretations and validates which is correct by checking that the file size is a multiple of the expected record size.\n\n## Options\n\n{}",
+                "# analyze check-endian\n\n\
+                Check byte order of a vector file.\n\n\
+                ## Description\n\n\
+                Reads the first 4-byte dimension header of an xvec file under both \
+                little-endian and big-endian interpretations and validates which \
+                interpretation is correct. Validation works by checking that the \
+                decoded dimension value is reasonable (between 1 and 1,048,576) and \
+                that the total file size is an exact multiple of the computed record \
+                size (4 + dim * element_width). For multi-vector files, the last \
+                record's header is also read to confirm consistency.\n\n\
+                ## Supported Formats\n\n\
+                The command supports fvec (4-byte float), ivec (4-byte int), bvec \
+                (1-byte), dvec (8-byte double), and mvec (2-byte) file extensions. \
+                The element width is determined from the file extension.\n\n\
+                ## Diagnostic Results\n\n\
+                The command reports one of four outcomes:\n\n\
+                - **LITTLE-ENDIAN (correct)**: The file is in the expected native \
+                byte order.\n\
+                - **BIG-ENDIAN (incorrect)**: The file was likely produced on a \
+                big-endian system or transferred without conversion.\n\
+                - **AMBIGUOUS**: Both interpretations produce valid record sizes \
+                (can happen with very small dimension counts).\n\
+                - **INVALID**: Neither interpretation produces a valid file layout.\n\n\
+                ## Role in Dataset Preparation\n\n\
+                This command diagnoses cross-platform file transfer issues. Vector \
+                files downloaded from external sources, transferred between Linux \
+                and network storage, or produced by tools on different architectures \
+                may have incorrect byte order. Running this check immediately after \
+                download prevents hard-to-diagnose garbage data from propagating \
+                through the rest of the pipeline.\n\n\
+                ## Options\n\n{}",
                 render_options_table(&options)
             ),
         }

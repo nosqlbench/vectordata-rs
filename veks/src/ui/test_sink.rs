@@ -117,6 +117,7 @@ mod tests {
             kind: ProgressKind::Bar,
             total: 1000,
             label: "scan".into(),
+            unit: "rec".into(),
         });
         sink.send(UiEvent::ProgressUpdate { id, position: 500 });
         sink.send(UiEvent::ProgressInc { id, delta: 100 });

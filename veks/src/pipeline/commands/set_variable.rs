@@ -15,8 +15,8 @@
 use std::time::Instant;
 
 use crate::pipeline::command::{
-    CommandDoc, CommandOp, CommandResult, OptionDesc, Options, Status, StreamContext,
-    render_options_table,
+    ArtifactManifest, CommandDoc, CommandOp, CommandResult, OptionDesc, Options, Status,
+    StreamContext, render_options_table,
 };
 use crate::pipeline::variables;
 
@@ -56,6 +56,20 @@ to all subsequent steps via `${{name}}` interpolation.
 ## Options
 
 {}
+
+## Data Preparation Role
+
+Variables are the mechanism for passing computed values between pipeline
+steps. Because pipeline steps can run in any order (subject to dependency
+constraints) and may be skipped if their outputs are already up to date,
+direct data flow between steps is not possible. Instead, a step like
+`set variable` evaluates an expression (typically `count:<path>` to
+determine how many records a file contains), persists the result to
+`variables.yaml`, and injects it into the pipeline defaults map. All
+downstream steps can then reference the variable via `${{name}}`
+interpolation in their option values. This pattern is used extensively to
+pass dynamic values like vector counts, dimension sizes, and computed
+thresholds through the pipeline without hard-coding them.
 
 ## Examples
 
@@ -141,6 +155,16 @@ Then reference in a downstream step:
             },
         ]
     }
+
+    fn project_artifacts(&self, step_id: &str, _options: &Options) -> ArtifactManifest {
+        ArtifactManifest {
+            step_id: step_id.to_string(),
+            command: self.command_path().to_string(),
+            inputs: vec![],
+            outputs: vec![],
+            intermediates: vec![],
+        }
+    }
 }
 
 /// Pipeline command: clear all variables in `variables.yaml`.
@@ -177,6 +201,17 @@ on stale variable values will re-execute.
 ## Options
 
 {}
+
+## Data Preparation Role
+
+Variables are the mechanism for passing computed values between pipeline
+steps. When a pipeline is re-run after changes to source data, stale
+variable values from the previous run can cause downstream steps to use
+incorrect parameters (for example, an outdated vector count). Placing
+`clear variables` at the beginning of the pipeline ensures a clean slate,
+forcing all `set variable` steps to re-evaluate their expressions. The
+cascade invalidation ensures that any step depending on a cleared variable
+will re-execute rather than using cached results from a prior run.
 
 ## Examples
 

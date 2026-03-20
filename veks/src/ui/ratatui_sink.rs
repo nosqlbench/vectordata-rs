@@ -12,6 +12,7 @@
 
 use std::collections::HashMap;
 use std::io::{self, Stdout};
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::thread;
@@ -45,10 +46,15 @@ enum RenderMsg {
 ///
 /// Thread-safe: holds only a channel sender and an atomic id counter.
 /// The actual terminal rendering happens on a background thread.
+///
+/// Log messages are buffered in `console_log` so they can be printed
+/// to stdout after the TUI exits (the alternate screen wipes TUI output).
 pub struct RatatuiSink {
     tx: mpsc::Sender<RenderMsg>,
     next_id: AtomicU32,
     render_thread: Option<thread::JoinHandle<()>>,
+    /// Buffered log messages for post-TUI console output.
+    console_log: Arc<Mutex<Vec<String>>>,
 }
 
 impl RatatuiSink {
@@ -62,6 +68,9 @@ impl RatatuiSink {
 
     /// Create a new ratatui-based sink with a custom redraw interval.
     pub fn with_redraw_interval(inline_height: u16, redraw_interval: Duration) -> io::Result<Self> {
+        let console_log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let console_log_clone = Arc::clone(&console_log);
+
         // Install a panic hook that restores the terminal before printing
         // the panic message. Without this, a panic leaves the terminal in
         // raw/alternate screen mode and the error message is invisible.
@@ -83,7 +92,7 @@ impl RatatuiSink {
         let handle = thread::Builder::new()
             .name("ratatui-render".into())
             .spawn(move || {
-                if let Err(e) = render_loop(rx, inline_height, redraw_interval) {
+                if let Err(e) = render_loop(rx, inline_height, redraw_interval, console_log_clone) {
                     // Unconditionally restore terminal state — render_loop may
                     // have entered raw/alternate screen before the error.
                     let _ = disable_raw_mode();
@@ -103,6 +112,7 @@ impl RatatuiSink {
             tx,
             next_id: AtomicU32::new(0),
             render_thread: Some(handle),
+            console_log,
         })
     }
 }
@@ -124,6 +134,10 @@ impl UiSink for RatatuiSink {
     fn next_progress_id(&self) -> ProgressId {
         ProgressId(self.next_id.fetch_add(1, Ordering::Relaxed))
     }
+
+    fn take_console_log(&self) -> Vec<String> {
+        std::mem::take(&mut self.console_log.lock().unwrap())
+    }
 }
 
 // ── Render thread internals ────────────────────────────────────────────
@@ -136,6 +150,8 @@ struct BarState {
     label: String,
     message: String,
     created_at: Instant,
+    /// The unit label for rate display (e.g., "rec", "files", "chunks").
+    unit: String,
 }
 
 /// Ring buffer for time-series data, storing the most recent `capacity` samples.
@@ -460,7 +476,12 @@ fn restore_terminal<B: ratatui::backend::Backend + io::Write>(terminal: &mut Ter
 }
 
 /// Main render loop running on the background thread.
-fn render_loop(rx: mpsc::Receiver<RenderMsg>, max_height: u16, redraw_interval: Duration) -> io::Result<()> {
+fn render_loop(
+    rx: mpsc::Receiver<RenderMsg>,
+    max_height: u16,
+    redraw_interval: Duration,
+    console_log: Arc<Mutex<Vec<String>>>,
+) -> io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     crossterm::execute!(stdout, crossterm::terminal::EnterAlternateScreen)?;
@@ -562,6 +583,12 @@ fn render_loop(rx: mpsc::Receiver<RenderMsg>, max_height: u16, redraw_interval: 
         let mut got_message = false;
 
         while let Ok(msg) = rx.try_recv() {
+            // Buffer log messages for post-TUI console output
+            if let RenderMsg::Event(UiEvent::Log { ref message }) = msg {
+                if let Ok(mut buf) = console_log.lock() {
+                    buf.push(message.clone());
+                }
+            }
             if matches!(msg, RenderMsg::Shutdown) {
                 // Flush any pending output before shutdown.
                 flush_logs(&mut terminal, &pending_logs)?;
@@ -629,7 +656,7 @@ fn process_msg(
     };
 
     match event {
-        UiEvent::ProgressCreate { id, kind, total, label } => {
+        UiEvent::ProgressCreate { id, kind, total, label, unit } => {
             state.bars.insert(*id, BarState {
                 kind: kind.clone(),
                 total: *total,
@@ -637,6 +664,7 @@ fn process_msg(
                 label: label.clone(),
                 message: String::new(),
                 created_at: Instant::now(),
+                unit: unit.clone(),
             });
             state.bar_order.push(*id);
             state.dirty = true;
@@ -1277,12 +1305,17 @@ fn render_step_yaml(frame: &mut ratatui::Frame, area: Rect, state: &RenderState)
 /// Render the RPS time-series chart.
 fn render_rps_chart(frame: &mut ratatui::Frame, area: Rect, state: &RenderState) {
     let dim = Style::default().fg(Color::DarkGray);
+    // Use the most recent bar's unit for the chart, falling back to "rec".
+    let chart_unit = state.bar_order.last()
+        .and_then(|id| state.bars.get(id))
+        .map(|b| b.unit.as_str())
+        .unwrap_or("rec");
     let y_max = state.rps_history.y_bounds()[1];
-    let y_label = format_rate(y_max);
+    let y_label = format_rate(y_max, chart_unit);
     let title_label = {
         // Show current RPS in the title
         let current = state.rps_history.as_slice().last().map(|p| p.1).unwrap_or(0.0);
-        format!(" throughput: {} ", format_rate(current))
+        format!(" throughput: {} ", format_rate(current, chart_unit))
     };
 
     let datasets = vec![
@@ -1535,7 +1568,7 @@ fn render_bar(frame: &mut ratatui::Frame, area: Rect, bar: &BarState) {
             let elapsed = bar.created_at.elapsed().as_secs_f64();
             let rate_eta = if elapsed > 0.5 && bar.position > 0 {
                 let rps = bar.position as f64 / elapsed;
-                let rate = format_rate(rps);
+                let rate = format_rate(rps, &bar.unit);
                 let eta = if bar.total > bar.position && rps > 0.0 {
                     let remaining = (bar.total - bar.position) as f64;
                     format!(" eta {}", format_duration(remaining / rps))
@@ -1600,18 +1633,31 @@ fn render_bar(frame: &mut ratatui::Frame, area: Rect, bar: &BarState) {
     }
 }
 
-/// Format a rate value as a compact human-readable string (e.g. "1.2M/s").
+/// Format a rate value as a compact human-readable string.
 ///
-/// Uses K/M/G suffixes (not B for billion) to avoid confusion with bytes.
-fn format_rate(rps: f64) -> String {
+/// When rate >= 1/s, shows records per second (e.g. "42 rec/s", "1.5K rec/s").
+/// When rate < 1/s, flips to seconds per unit (e.g. "2.0s/file",
+/// "1.5m/chunk") so slow operations still show meaningful progress info.
+///
+/// The `unit` parameter controls the label (e.g., "rec", "files", "chunks").
+fn format_rate(rps: f64, unit: &str) -> String {
     if rps >= 1_000_000_000.0 {
-        format!("{:.1}G/s", rps / 1_000_000_000.0)
+        format!("{:.1}G {}/s", rps / 1_000_000_000.0, unit)
     } else if rps >= 1_000_000.0 {
-        format!("{:.1}M/s", rps / 1_000_000.0)
+        format!("{:.1}M {}/s", rps / 1_000_000.0, unit)
     } else if rps >= 1_000.0 {
-        format!("{:.1}K/s", rps / 1_000.0)
+        format!("{:.1}K {}/s", rps / 1_000.0, unit)
     } else if rps >= 1.0 {
-        format!("{:.0}/s", rps)
+        format!("{:.0} {}/s", rps, unit)
+    } else if rps > 0.0 {
+        let spt = 1.0 / rps;
+        if spt >= 3600.0 {
+            format!("{:.0}h/{}", spt / 3600.0, unit)
+        } else if spt >= 60.0 {
+            format!("{:.1}m/{}", spt / 60.0, unit)
+        } else {
+            format!("{:.1}s/{}", spt, unit)
+        }
     } else {
         String::new()
     }
@@ -1659,11 +1705,25 @@ mod tests {
 
     #[test]
     fn format_rate_compact() {
-        assert_eq!(format_rate(0.5), "");
-        assert_eq!(format_rate(42.0), "42/s");
-        assert_eq!(format_rate(1_500.0), "1.5K/s");
-        assert_eq!(format_rate(2_300_000.0), "2.3M/s");
-        assert_eq!(format_rate(1_200_000_000.0), "1.2G/s");
+        // High rates: records per second (default unit)
+        assert_eq!(format_rate(42.0, "rec"), "42 rec/s");
+        assert_eq!(format_rate(1_500.0, "rec"), "1.5K rec/s");
+        assert_eq!(format_rate(2_300_000.0, "rec"), "2.3M rec/s");
+        assert_eq!(format_rate(1_200_000_000.0, "rec"), "1.2G rec/s");
+
+        // Sub-1/s: flips to seconds per record
+        assert_eq!(format_rate(0.5, "rec"), "2.0s/rec");
+        assert_eq!(format_rate(0.1, "rec"), "10.0s/rec");
+        assert_eq!(format_rate(1.0 / 90.0, "rec"), "1.5m/rec");
+        assert_eq!(format_rate(1.0 / 7200.0, "rec"), "2h/rec");
+
+        // Zero: empty
+        assert_eq!(format_rate(0.0, "rec"), "");
+
+        // Custom units
+        assert_eq!(format_rate(42.0, "files"), "42 files/s");
+        assert_eq!(format_rate(1_500.0, "chunks"), "1.5K chunks/s");
+        assert_eq!(format_rate(0.5, "vectors"), "2.0s/vectors");
     }
 
     #[test]
@@ -1721,6 +1781,7 @@ mod tests {
             label: "test".into(),
             message: String::new(),
             created_at: Instant::now(),
+            unit: "rec".into(),
         });
         assert_eq!(state.visible_lines(), 1);
 
@@ -1755,6 +1816,7 @@ mod tests {
                 kind: ProgressKind::Bar,
                 total: 100,
                 label: "test".into(),
+                unit: "rec".into(),
             }),
             &mut state, &mut logs, &mut emits,
         );
@@ -1843,6 +1905,7 @@ mod tests {
             label: "importing".into(),
             message: String::new(),
             created_at: Instant::now(),
+            unit: "rec".into(),
         });
         state.bar_order.push(id);
 
@@ -1881,6 +1944,7 @@ mod tests {
             label: "scanning".into(),
             message: "file.fvec".into(),
             created_at: Instant::now(),
+            unit: "rec".into(),
         };
 
         terminal.draw(|frame| {
@@ -1916,6 +1980,7 @@ mod tests {
             label: "computing".into(),
             message: String::new(),
             created_at: Instant::now(),
+            unit: "rec".into(),
         });
         state.bar_order.push(id);
         state.resource_status = "mem: 1.2G/4G | threads: 8".into();
@@ -1979,6 +2044,7 @@ mod tests {
                 label: format!("step-{}", i),
                 message: String::new(),
                 created_at: Instant::now(),
+                unit: "rec".into(),
             });
             state.bar_order.push(id);
         }
@@ -2028,6 +2094,7 @@ mod tests {
                 kind: ProgressKind::Bar,
                 total: 100,
                 label: "test".into(),
+                unit: "rec".into(),
             }),
             &mut state, &mut logs, &mut emits,
         );
@@ -2096,6 +2163,7 @@ mod tests {
             label: "computing".into(),
             message: String::new(),
             created_at: Instant::now(),
+            unit: "rec".into(),
         });
         state.bar_order.push(id);
 

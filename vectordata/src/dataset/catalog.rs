@@ -1,15 +1,18 @@
 // Copyright (c) DataStax, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Catalog data model — layout-embedded entries for dataset indexes.
+//! Catalog discovery and loading for dataset indexes.
 //!
-//! A catalog is a JSON or YAML array of `CatalogEntry` values. Each entry
-//! embeds the publishable parts of a `DatasetConfig` (attributes and
-//! profiles) under a `layout` key, alongside the dataset `name`, relative
-//! `path` to the `dataset.yaml`, and a `dataset_type` discriminator.
+//! A catalog is a JSON or YAML array of [`CatalogEntry`] values. Each entry
+//! embeds the publishable parts of a [`DatasetConfig`](super::config::DatasetConfig)
+//! (attributes and profiles) under a `layout` key, alongside the dataset
+//! `name`, relative `path` to the `dataset.yaml`, and a `dataset_type`
+//! discriminator.
 //!
-//! This module defines the shared types used by both catalog generation
-//! (`veks catalog generate`) and catalog consumption (`veks datasets list`).
+//! Use [`find_catalog`] to locate a `catalog.json` or `catalog.yaml` in a
+//! directory, and [`load_catalog`] to parse it. These are used by both
+//! catalog generation (`veks catalog generate`) and catalog consumption
+//! (`veks datasets list`).
 //!
 //! ## Catalog file format
 //!

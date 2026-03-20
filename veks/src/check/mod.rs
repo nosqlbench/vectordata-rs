@@ -1,0 +1,419 @@
+// Copyright (c) DataStax, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
+//! Pre-flight checks for dataset readiness (`veks check`).
+//!
+//! Validates pipeline completeness, publish URL binding, merkle coverage,
+//! and file integrity across a dataset directory tree.
+
+use std::path::{Path, PathBuf};
+
+use clap::Args;
+
+pub mod publish_url;
+pub mod catalogs;
+pub mod extraneous;
+pub mod fix;
+pub mod integrity;
+pub mod merkle;
+pub mod pipelines;
+
+/// Arguments for `veks check`.
+#[derive(Args)]
+pub struct CheckArgs {
+    /// Target directory to check (default: current directory)
+    #[arg(default_value = ".")]
+    pub directory: PathBuf,
+
+    /// Check all categories (default when no --check-* flags given)
+    #[arg(long)]
+    pub check_all: bool,
+
+    /// Check pipeline completeness
+    #[arg(long)]
+    pub check_pipelines: bool,
+
+    /// Check .publish_url binding and transport support
+    #[arg(long)]
+    pub check_publish: bool,
+
+    /// Check merkle (.mref) coverage for large files
+    #[arg(long)]
+    pub check_merkle: bool,
+
+    /// Check file format integrity (geometry, record structure)
+    #[arg(long)]
+    pub check_integrity: bool,
+
+    /// Check catalog files are present and current at every directory level
+    #[arg(long)]
+    pub check_catalogs: bool,
+
+    /// Check for extraneous files not accounted for by pipeline or profiles
+    #[arg(long)]
+    pub check_extraneous: bool,
+
+    /// Remove extraneous publishable files not accounted for by the pipeline
+    #[arg(long)]
+    pub clean_files: bool,
+
+    /// Minimum file size for merkle coverage check
+    #[arg(long, default_value = "100M", value_name = "SIZE")]
+    pub merkle_min_size: String,
+
+    /// Auto-update dataset.yaml with missing pipeline steps (e.g., merkle)
+    #[arg(long)]
+    pub update_pipeline: bool,
+
+    /// Emit results as JSON
+    #[arg(long)]
+    pub json: bool,
+
+    /// Suppress detail; exit code only
+    #[arg(long)]
+    pub quiet: bool,
+}
+
+/// Result of a single check category.
+pub struct CheckResult {
+    pub name: &'static str,
+    pub passed: bool,
+    pub messages: Vec<String>,
+}
+
+impl CheckResult {
+    fn ok(name: &'static str) -> Self {
+        CheckResult { name, passed: true, messages: vec![] }
+    }
+
+    fn fail(name: &'static str, messages: Vec<String>) -> Self {
+        CheckResult { name, passed: false, messages }
+    }
+}
+
+/// Entry point for `veks check`.
+pub fn run(args: CheckArgs) {
+    let directory = if args.directory.is_absolute() {
+        args.directory.clone()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(&args.directory)
+    };
+
+    if !directory.is_dir() {
+        eprintln!("Error: '{}' is not a directory", directory.display());
+        std::process::exit(2);
+    }
+
+    // Determine which checks to run: if no specific --check-* flags are
+    // given, run all (same as --check-all).
+    let any_specific = args.check_pipelines || args.check_publish
+        || args.check_merkle || args.check_integrity || args.check_catalogs
+        || args.check_extraneous;
+    let run_all = args.check_all || !any_specific;
+
+    let run_pipelines = run_all || args.check_pipelines;
+    let run_publish = run_all || args.check_publish;
+    let run_merkle = run_all || args.check_merkle;
+    let run_integrity = run_all || args.check_integrity;
+    let run_catalogs = run_all || args.check_catalogs;
+    let run_extraneous = run_all || args.check_extraneous || args.clean_files;
+
+    let merkle_threshold = parse_size(&args.merkle_min_size).unwrap_or_else(|| {
+        eprintln!("Error: invalid size '{}'", args.merkle_min_size);
+        std::process::exit(2);
+    });
+
+    // Discover all dataset.yaml files under the target directory.
+    let dataset_files = discover_datasets(&directory);
+
+    // Collect publishable files for merkle/integrity checks.
+    let publishable = if run_merkle || run_integrity || run_extraneous {
+        crate::publish::enumerate_publishable_files(&directory)
+    } else {
+        vec![]
+    };
+
+    let mut results: Vec<CheckResult> = Vec::new();
+
+    if run_pipelines {
+        results.push(pipelines::check(&directory, &dataset_files));
+        if run_merkle {
+            results.push(pipelines::check_coverage(
+                &directory, &dataset_files, &publishable, merkle_threshold,
+            ));
+        }
+    }
+    if run_publish {
+        results.push(publish_url::check(&directory, &dataset_files));
+    }
+    if run_merkle {
+        results.push(merkle::check(&directory, &publishable, merkle_threshold));
+    }
+    if run_integrity {
+        results.push(integrity::check(&directory, &publishable));
+    }
+    if run_catalogs {
+        results.push(catalogs::check(&directory, &dataset_files));
+    }
+    if run_extraneous {
+        results.push(extraneous::check(&directory, &dataset_files, &publishable));
+    }
+
+    // Output results.
+    if args.json {
+        print_json(&directory, &results);
+    } else if !args.quiet {
+        print_human(&results);
+    }
+
+    let all_passed = results.iter().all(|r| r.passed);
+
+    // Build fix plans for each dataset.yaml when there are failures
+    if !all_passed && !args.quiet {
+        let missing_merkle: Vec<PathBuf> = if run_merkle {
+            merkle::missing_mref_files(&publishable, merkle_threshold)
+        } else {
+            vec![]
+        };
+        let missing_publish = results.iter()
+            .any(|r| r.name == "publish" && !r.passed);
+        let stale_catalogs = results.iter()
+            .any(|r| r.name == "catalogs" && !r.passed);
+        let stale_steps: Vec<String> = results.iter()
+            .filter(|r| r.name == "pipeline-execution" && !r.passed)
+            .flat_map(|r| r.messages.iter().cloned())
+            .collect();
+
+        // Per-dataset fix plans
+        for ds_path in &dataset_files {
+            let plan = fix::plan_fixes(
+                ds_path,
+                &missing_merkle,
+                missing_publish,
+                stale_catalogs,
+                &stale_steps,
+            );
+
+            // Print advisories
+            if !plan.advisories.is_empty() {
+                println!();
+                println!("To resolve ({}):", ds_path.display());
+                for advice in &plan.advisories {
+                    println!("  {}", advice);
+                }
+            }
+
+            if args.update_pipeline {
+                if !plan.steps_to_add.is_empty() {
+                    println!();
+                    println!(
+                        "Updating {} ({} step(s) to add)...",
+                        ds_path.display(),
+                        plan.steps_to_add.len(),
+                    );
+                    println!("A backup will be created in .backup/ before any changes.");
+                    match fix::apply_fix(&plan) {
+                        Ok(()) => {
+                            println!("Pipeline updated. To execute new steps:\n  veks run {}", ds_path.display());
+                        }
+                        Err(e) => {
+                            eprintln!("Error applying fix: {}", e);
+                        }
+                    }
+                }
+            } else if !plan.steps_to_add.is_empty() {
+                println!();
+                println!(
+                    "{} is missing {} pipeline step(s) (e.g., merkle tree generation).",
+                    ds_path.display(),
+                    plan.steps_to_add.len(),
+                );
+                println!(
+                    "To auto-add them, re-run with:\n  veks check --update-pipeline {}",
+                    args.directory.display(),
+                );
+                println!("(A backup of dataset.yaml will be created in .backup/ before changes.)");
+            }
+        }
+    }
+
+    // Handle --clean-files: remove extraneous publishable files
+    if args.clean_files {
+        for ds_path in &dataset_files {
+            let extra = extraneous::find_extraneous(ds_path, &publishable);
+            if extra.is_empty() {
+                println!("No extraneous files to clean.");
+            } else {
+                println!();
+                println!("Removing {} extraneous file(s):", extra.len());
+                for file in &extra {
+                    let rel = file.strip_prefix(&directory).unwrap_or(file);
+                    match std::fs::remove_file(file) {
+                        Ok(()) => println!("  removed: {}", rel.display()),
+                        Err(e) => eprintln!("  failed:  {} — {}", rel.display(), e),
+                    }
+                }
+                // Clean up empty directories left behind
+                clean_empty_dirs(&directory);
+            }
+        }
+    }
+
+    std::process::exit(if all_passed { 0 } else { 1 });
+}
+
+/// Remove empty directories recursively (bottom-up), excluding hidden dirs.
+fn clean_empty_dirs(dir: &Path) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        if name.to_string_lossy().starts_with('.') {
+            continue;
+        }
+        if path.is_dir() {
+            clean_empty_dirs(&path);
+            // Try to remove — will only succeed if empty
+            let _ = std::fs::remove_dir(&path);
+        }
+    }
+}
+
+/// Discover all `dataset.yaml` files under a directory tree.
+pub fn discover_datasets(root: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    discover_datasets_recursive(root, &mut found);
+    found.sort();
+    found
+}
+
+fn discover_datasets_recursive(dir: &Path, found: &mut Vec<PathBuf>) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+
+        if path.is_dir() {
+            // Skip hidden/excluded directories
+            if name_str.starts_with('.')
+                || name_str == "__pycache__"
+            {
+                continue;
+            }
+            discover_datasets_recursive(&path, found);
+        } else if name_str == "dataset.yaml" || name_str == "dataset.yml" {
+            found.push(path);
+        }
+    }
+}
+
+/// Parse a human-readable size string like "100M", "50MiB", "1G" into bytes.
+pub fn parse_size(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+
+    // Find where digits end and suffix begins
+    let digit_end = s.find(|c: char| !c.is_ascii_digit() && c != '_' && c != '.')
+        .unwrap_or(s.len());
+
+    let num_str: String = s[..digit_end].chars().filter(|c| *c != '_').collect();
+    let suffix = &s[digit_end..];
+
+    let num: f64 = num_str.parse().ok()?;
+
+    let multiplier: u64 = match suffix.to_uppercase().as_str() {
+        "" => 1,
+        "K" => 1_000,
+        "M" => 1_000_000,
+        "G" | "B" => 1_000_000_000,
+        "T" => 1_000_000_000_000,
+        "KB" => 1_000,
+        "MB" => 1_000_000,
+        "GB" => 1_000_000_000,
+        "TB" => 1_000_000_000_000,
+        "KIB" => 1_024,
+        "MIB" => 1_048_576,
+        "GIB" => 1_073_741_824,
+        "TIB" => 1_099_511_627_776,
+        _ => return None,
+    };
+
+    Some((num * multiplier as f64) as u64)
+}
+
+fn print_human(results: &[CheckResult]) {
+    for result in results {
+        let icon = if result.passed { "\u{2713}" } else { "\u{2717}" };
+        if result.passed {
+            println!("{} check {}: ok", icon, result.name);
+        } else {
+            println!("{} check {}: FAILED", icon, result.name);
+            for msg in &result.messages {
+                println!("    {}", msg);
+            }
+        }
+    }
+}
+
+fn print_json(directory: &Path, results: &[CheckResult]) {
+    let overall = if results.iter().all(|r| r.passed) { "ok" } else { "fail" };
+
+    print!("{{\"directory\":");
+    print_json_string(&directory.to_string_lossy());
+    print!(",\"checks\":{{");
+    for (i, r) in results.iter().enumerate() {
+        if i > 0 { print!(","); }
+        print_json_string(r.name);
+        print!(":{{\"status\":");
+        print_json_string(if r.passed { "ok" } else { "fail" });
+        if !r.messages.is_empty() {
+            print!(",\"messages\":[");
+            for (j, m) in r.messages.iter().enumerate() {
+                if j > 0 { print!(","); }
+                print_json_string(m);
+            }
+            print!("]");
+        }
+        print!("}}");
+    }
+    print!("}},\"overall\":");
+    print_json_string(overall);
+    println!("}}");
+}
+
+fn print_json_string(s: &str) {
+    print!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_size() {
+        assert_eq!(parse_size("100M"), Some(100_000_000));
+        assert_eq!(parse_size("50MiB"), Some(52_428_800));
+        assert_eq!(parse_size("1G"), Some(1_000_000_000));
+        assert_eq!(parse_size("1GiB"), Some(1_073_741_824));
+        assert_eq!(parse_size("500"), Some(500));
+        assert_eq!(parse_size("10K"), Some(10_000));
+    }
+
+    #[test]
+    fn test_parse_size_invalid() {
+        assert_eq!(parse_size(""), None);
+        assert_eq!(parse_size("abc"), None);
+    }
+}

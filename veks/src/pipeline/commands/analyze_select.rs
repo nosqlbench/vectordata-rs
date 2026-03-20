@@ -36,7 +36,27 @@ impl CommandOp for AnalyzeSelectOp {
         CommandDoc {
             summary: "Select and print specific vectors by ordinal".into(),
             body: format!(
-                "# analyze select\n\nSelect and print specific vectors by ordinal.\n\n## Description\n\nRetrieves a vector at a specific 0-based index from a vector file and prints its type and values. Supports fvec and ivec formats with text, CSV, and JSON output.\n\n## Options\n\n{}",
+                "# analyze select\n\n\
+                Select and print specific vectors by ordinal.\n\n\
+                ## Description\n\n\
+                Retrieves a single vector at a specific 0-based index from a vector \
+                file and prints its type, dimension count, and component values. The \
+                command uses memory-mapped I/O for random access, so retrieving a vector \
+                from the middle of a multi-gigabyte file is instantaneous -- no sequential \
+                scan is required.\n\n\
+                ## Output Formats\n\n\
+                - **text** (default): Human-readable format showing type, ordinal, \
+                dimension, and bracketed value list.\n\
+                - **csv**: Comma-separated values suitable for spreadsheet import.\n\
+                - **json**: JSON object with ordinal, type, dim, and values fields.\n\n\
+                ## Role in Dataset Preparation\n\n\
+                This command is used for spot-checking specific records during debugging. \
+                For example, after a shuffle operation, you might select the vector that \
+                was originally at index 0 to verify it was moved to the expected new \
+                position. It is also useful for inspecting the query vectors or ground-truth \
+                neighbor indices at particular ordinals when investigating KNN verification \
+                failures. Supports both fvec (float) and ivec (integer) file formats.\n\n\
+                ## Options\n\n{}",
                 render_options_table(&options)
             ),
         }

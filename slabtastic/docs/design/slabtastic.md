@@ -309,7 +309,8 @@ Export content from a slab file. Currently supports text (newline-delimited, def
 supports, with the same parsable check enabled by default, but easy to disable if the user
 trusts the parsability of the data. User can specify the output file name (`--output`), or
 stdout if omitted. Supports `--range` for ordinal range filtering and slab layout parameters
-(for slab output). Supports `--text`, `--cstrings`, `--slab-format` flags.
+(for slab output). Supports `--format <raw|text|cstrings|hex|slab>` to select
+the output format.
 
 ### `slab rewrite <input> <output>`
 

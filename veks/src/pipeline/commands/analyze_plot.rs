@@ -292,7 +292,34 @@ impl CommandOp for AnalyzePlotOp {
         CommandDoc {
             summary: "Generate scatter/distribution plots for vectors".into(),
             body: format!(
-                "# analyze plot\n\nGenerate scatter/distribution plots for vectors.\n\n## Description\n\nRenders histograms and scatter plots using Unicode braille characters for high-resolution terminal output. Supports multiple series overlay with ANSI 256-color coding, dimension selection, configurable bin counts, and sampling.\n\n## Options\n\n{}",
+                "# analyze plot\n\n\
+                Generate scatter/distribution plots for vectors.\n\n\
+                ## Description\n\n\
+                Renders histograms and scatter plots using Unicode braille characters \
+                (U+2800..U+28FF) for high-resolution terminal output. Each braille \
+                character encodes a 2x4 dot matrix, providing 2x horizontal and 4x \
+                vertical resolution relative to character cells. This means an 80-column \
+                by 20-row plot area actually renders at 160x80 pixel resolution.\n\n\
+                ## Plot Types\n\n\
+                - **histogram** (default): Bins values for each selected dimension and \
+                renders vertical bars. The number of bins defaults to Sturges' rule \
+                (log2(n) + 1) but can be overridden. Multiple dimensions produce \
+                separate plots.\n\
+                - **scatter**: Plots pairs of dimensions against each other as 2D point \
+                clouds. Requires at least two dimensions specified (e.g., `dimensions=0,1`). \
+                Pairs are taken from the dimension list in order: (0,1), (2,3), etc.\n\n\
+                ## Multiple Series\n\n\
+                Multiple source files can be specified by separating paths with semicolons. \
+                Each series is rendered in a different ANSI 256-color (red, green, blue, \
+                yellow, magenta, cyan, orange, purple) for easy visual comparison.\n\n\
+                ## Role in Dataset Preparation\n\n\
+                Terminal plots provide instant visual feedback without requiring external \
+                plotting tools or GUI environments. They are useful for quick distribution \
+                checks during interactive development, comparing distributions across \
+                files (e.g., original vs. generated), and spotting obvious anomalies like \
+                clipped values or bimodal distributions. The `sample` option ensures \
+                reasonable performance even on billion-scale files.\n\n\
+                ## Options\n\n{}",
                 render_options_table(&options)
             ),
         }

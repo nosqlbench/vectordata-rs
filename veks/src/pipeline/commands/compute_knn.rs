@@ -34,8 +34,8 @@ use vectordata::VectorReader;
 use vectordata::io::MmapVectorReader;
 
 use crate::pipeline::command::{
-    CommandDoc, CommandOp, CommandResult, OptionDesc, Options, ResourceDesc, Status, StreamContext,
-    render_options_table,
+    ArtifactManifest, CommandDoc, CommandOp, CommandResult, OptionDesc, Options, ResourceDesc,
+    Status, StreamContext, render_options_table,
 };
 use crate::pipeline::simd_distance::{self, Metric};
 use super::source_window::resolve_source;
@@ -808,21 +808,61 @@ Brute-force exact K-nearest-neighbor ground truth computation.
 Computes ground truth KNN for a set of query vectors against a base vector
 set. Outputs both neighbor indices (ivec) and distances (fvec).
 
+This command performs an **exhaustive brute-force search**: for every query
+vector it computes the distance to every base vector, maintaining a max-heap
+of the top-K closest results. Because every (query, base) pair is evaluated,
+this is the most computationally expensive step in a typical dataset
+preparation pipeline — but the results it produces are exact, making them
+the gold-standard "correct answers" that approximate nearest-neighbor (ANN)
+algorithms are benchmarked against.
+
+### Distance Metrics
+
+Supports distance metrics: L2 (Euclidean), Cosine, DotProduct, L1 (Manhattan).
+The metric chosen here must match the metric used during ANN evaluation so
+that the ground truth is meaningful.
+
+### Input Formats
+
 Supports both f32 (fvec) and f16 (mvec) input formats. The element type is
 detected from the file extension of the base vectors path. When mvec files
 are used, native f16 SIMD distance kernels operate directly on half-precision
 data without an explicit upcast to f32.
 
-Supports distance metrics: L2 (Euclidean), Cosine, DotProduct, L1 (Manhattan).
+### Memory-Partitioned Computation
 
-Uses multi-threaded query processing with a max-heap for top-k selection.
-Base vectors are mmap'd for O(1) random access.
+For large base vector sets that exceed available memory, the command supports
+partitioned computation. The base space is split into partitions of
+`partition_size` vectors. Each partition's per-query top-K results are cached
+in a `.cache/` directory, and a merge phase combines partition results into
+the final global top-K. Cached partitions are reusable across runs, so if a
+run is interrupted it can resume from the last completed partition.
 
-For large base vector sets, supports partitioned computation: the base
-space is split into partitions, each partition's per-query top-K results are
-cached in `.cache/`, and a merge phase combines partition results into the
-final global top-K. Cached partitions are reusable across runs with different
-base-vector ranges.
+### Windowed Ranges
+
+Both the base and query paths accept range notation to select a subset of
+vectors (e.g., `base.mvec[0..1000000)`). This allows computing ground truth
+over a specific slice of a large dataset without copying or splitting the
+file.
+
+### Per-Profile Execution
+
+When used inside a sized profile, this command runs once per profile with the
+profile's base range substituted automatically. This lets a single pipeline
+definition produce ground truth files for every dataset size (e.g., 1M, 10M,
+100M) in one invocation.
+
+### Output Files
+
+The command produces two files:
+
+- **neighbor_indices.ivec** — for each query, the ordinal indices of its K
+  nearest neighbors in the base set.
+- **neighbor_distances.fvec** — the corresponding distances, in the same
+  order.
+
+These files are consumed downstream by recall-evaluation commands that
+compare an ANN index's approximate results against this exact ground truth.
 
 ## Options
 
@@ -833,6 +873,8 @@ base-vector ranges.
 - Element type (f32 vs f16) is auto-detected from the base file extension.
 - Partition caching allows incremental and resumable computation.
 - Thread count of 0 uses the system default (all available cores).
+- This is typically the most expensive step in a pipeline; plan for hours on
+  billion-scale datasets even with high thread counts.
 "#, render_options_table(&options)),
         }
     }
@@ -1020,6 +1062,14 @@ base-vector ranges.
                 description: "Base vectors per partition for cache-backed computation".to_string(),
             },
         ]
+    }
+
+    fn project_artifacts(&self, step_id: &str, options: &Options) -> ArtifactManifest {
+        crate::pipeline::command::manifest_from_keys(
+            step_id, self.command_path(), options,
+            &["base", "query"],
+            &["indices", "distances"],
+        )
     }
 }
 
@@ -1380,7 +1430,7 @@ where
         estimated_partitions, format_count(partition_size)
     ));
 
-    let plan_pb = ctx.ui.bar(estimated_partitions as u64, "validating cache");
+    let plan_pb = ctx.ui.bar_with_unit(estimated_partitions as u64, "validating cache", "queries");
 
     let cache_prefix = cache_prefix_for(base_path, query_path);
     let base_end = base_offset + base_count;
@@ -1465,7 +1515,7 @@ where
     let prefetch_bytes_paged = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     // Prefetch progress bar — updated by a background tick thread
-    let prefetch_pb = ctx.ui.bar(total_prefetch_bytes, "paging in");
+    let prefetch_pb = ctx.ui.bar_with_unit(total_prefetch_bytes, "paging in", "queries");
     let prefetch_bytes_for_tick = Arc::clone(&prefetch_bytes_paged);
     let prefetch_tick_handle = std::thread::spawn(move || {
         loop {
@@ -1494,7 +1544,7 @@ where
     // Overall partition progress bar — tracks how many partitions have been
     // computed out of the total uncached count.
     let overall_pb = if to_compute > 1 {
-        Some(ctx.ui.bar(to_compute as u64, "partitions"))
+        Some(ctx.ui.bar_with_unit(to_compute as u64, "partitions", "queries"))
     } else {
         None
     };

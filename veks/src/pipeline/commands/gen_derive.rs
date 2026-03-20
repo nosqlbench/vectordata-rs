@@ -63,10 +63,51 @@ Derive new facets from existing dataset files.
 
 ## Description
 
-Extracts a statistical model (per-dimension distribution parameters) from
-a source dataset's base vectors, then creates a target directory with a
-model.json and dataset.yaml that can be used to generate unlimited
-synthetic vectors matching the source's statistical profile.
+Reads the base vectors from an existing dataset and computes per-dimension
+distribution parameters, producing a statistical model that captures the
+dataset's profile. The output is a target directory containing:
+
+- `model.json` -- a VectorSpaceModel with one scalar model per dimension,
+  encoding the fitted distribution type and parameters (mean, variance,
+  alpha, beta, bounds, etc.)
+- `dataset.yaml` -- a scaffold descriptor for the derived dataset,
+  referencing the model and recording the source dataset's provenance
+
+## Model extraction process
+
+For each dimension, the command samples up to `sample` vectors (default
+10,000) from the source and computes summary statistics: mean, variance,
+min, max, and range. A distribution is fitted using moment-based
+heuristics:
+
+- **Beta** is preferred when the data appears bounded (values within
+  approximately `[-1.5, 1.5]` with non-trivial variance), as is common
+  for normalized embedding vectors. Method-of-moments estimates the
+  alpha and beta shape parameters.
+- **Uniform** is used when variance is near zero (effectively constant
+  dimensions).
+- **Normal** is the default fallback for unbounded or wide-ranging data.
+
+The fitted parameters preserve the statistical fingerprint of the original
+data -- dimension-wise means, variances, and distributional shapes -- so
+that vectors generated from the model exhibit similar distance
+distributions and nearest-neighbor structure.
+
+## Role in dataset pipelines
+
+This command is the first half of the **derive-then-generate** workflow
+for creating realistic synthetic datasets:
+
+1. **Derive** (`generate derive`) -- run once against a real dataset to
+   extract `model.json`.
+2. **Generate** (`generate from-model`) -- run as many times as needed to
+   produce unlimited synthetic vectors that statistically match the real
+   data.
+
+This workflow is valuable when the real dataset is proprietary, too large
+to distribute, or subject to licensing restrictions. The model.json is
+small (a few KB) and contains no original vector data, only summary
+statistics.
 
 ## Options
 

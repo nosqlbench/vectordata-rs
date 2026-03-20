@@ -1,11 +1,13 @@
 // Copyright (c) DataStax, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! YAML schema types for command stream pipeline configuration.
+//! Pipeline configuration for the `upstream` block in `dataset.yaml`.
 //!
-//! Defines the structure of the `upstream` block in `dataset.yaml`. These
-//! types describe the pipeline schema (step definitions, defaults, ordering)
-//! without knowing anything about the commands that execute those steps.
+//! Defines [`PipelineConfig`], [`StepDef`], and [`OnPartial`] — the schema
+//! types for multi-step dataset build pipelines. These describe step
+//! definitions, shared defaults, ordering constraints, and partial-output
+//! behavior without knowing anything about the commands that execute those
+//! steps.
 
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};

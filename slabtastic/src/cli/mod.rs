@@ -2,6 +2,35 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! CLI module for the `slab` file maintenance tool.
+//!
+//! This module implements the `slab` binary, a command-line interface for
+//! creating, inspecting, and transforming slabtastic files. Each
+//! subcommand lives in its own child module and is dispatched by
+//! [`run`].
+//!
+//! ## Subcommands
+//!
+//! | Command       | Description                                              |
+//! |---------------|----------------------------------------------------------|
+//! | `analyze`     | Display file structure and statistics                    |
+//! | `check`       | Validate a slab file for structural errors               |
+//! | `get`         | Retrieve records by ordinal (hex, base64, or raw output) |
+//! | `import`      | Import records from external formats (CSV, JSON, etc.)   |
+//! | `export`      | Export records to external formats or another slab file   |
+//! | `append`      | Append records from stdin or a source file               |
+//! | `rewrite`     | Repack a slab file with new page settings                |
+//! | `explain`     | Display block diagrams of page layouts                   |
+//! | `namespaces`  | List all namespaces in a slab file                       |
+//! | `completions` | Generate shell completions (bash, zsh, fish, etc.)       |
+//!
+//! ## Helpers
+//!
+//! - [`ProgressReporter`] — optional stderr progress line for long-running
+//!   commands.
+//! - [`make_writer_config`] — build a [`WriterConfig`] from optional CLI
+//!   flags, falling back to defaults.
+//! - [`write_with_buffer_rename`] — atomic write via a `.buffer` temp file
+//!   followed by rename.
 
 pub mod append;
 pub mod check;

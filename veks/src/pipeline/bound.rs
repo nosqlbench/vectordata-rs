@@ -31,6 +31,12 @@ pub fn check_artifact_default(output: &Path, _options: &Options) -> ArtifactStat
         Err(_) => return ArtifactState::Absent,
     };
 
+    // Directory outputs (e.g., fetch bulkdl downloads): complete if the
+    // directory exists and contains at least one file.
+    if meta.is_dir() {
+        return check_directory_completeness(output);
+    }
+
     if meta.len() == 0 {
         return ArtifactState::Partial;
     }
@@ -75,11 +81,27 @@ fn check_format_specific(output: &Path, format: VecFormat, file_size: u64) -> Ar
             check_xvec_completeness(file_size, format)
         }
         VecFormat::Slab => check_slab_completeness(output),
-        _ => ArtifactState::Unknown(format!(
-            "format '{}' for '{}' has no completeness check",
-            format.name(),
-            output.display(),
-        )),
+        // Npy and Parquet have no cheap structural probe — treat as
+        // opaque-complete (exists + non-empty is sufficient).
+        VecFormat::Npy | VecFormat::Parquet => ArtifactState::Complete,
+    }
+}
+
+/// Check directory completeness: a directory artifact is complete if it
+/// exists and contains at least one file (not just subdirectories).
+fn check_directory_completeness(dir: &Path) -> ArtifactState {
+    match std::fs::read_dir(dir) {
+        Ok(entries) => {
+            let has_files = entries
+                .filter_map(|e| e.ok())
+                .any(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false));
+            if has_files {
+                ArtifactState::Complete
+            } else {
+                ArtifactState::Partial
+            }
+        }
+        Err(_) => ArtifactState::Absent,
     }
 }
 
@@ -151,6 +173,34 @@ mod tests {
         std::fs::write(&path, b"").unwrap();
         let state = check_artifact_default(&path, &Options::new());
         assert_eq!(state, ArtifactState::Partial);
+    }
+
+    #[test]
+    fn test_directory_with_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let subdir = dir.path().join("output");
+        std::fs::create_dir(&subdir).unwrap();
+        std::fs::write(subdir.join("file.npy"), b"data").unwrap();
+        let state = check_artifact_default(&subdir, &Options::new());
+        assert_eq!(state, ArtifactState::Complete);
+    }
+
+    #[test]
+    fn test_empty_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let subdir = dir.path().join("empty");
+        std::fs::create_dir(&subdir).unwrap();
+        let state = check_artifact_default(&subdir, &Options::new());
+        assert_eq!(state, ArtifactState::Partial);
+    }
+
+    #[test]
+    fn test_npy_file_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vectors.npy");
+        std::fs::write(&path, b"numpy data").unwrap();
+        let state = check_artifact_default(&path, &Options::new());
+        assert_eq!(state, ArtifactState::Complete);
     }
 
     #[test]

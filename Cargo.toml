@@ -1,6 +1,5 @@
 [workspace]
 members = [
-    "testserver",
     "vectordata",
     "veks",
     "slabtastic",

@@ -1,0 +1,214 @@
+// Copyright (c) DataStax, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
+//! Extraneous file detection using projected artifact manifests.
+//!
+//! Each pipeline command's `project_artifacts` method declares its inputs
+//! and outputs without executing. This module collects all manifests,
+//! combines them with profile view paths and known infrastructure files,
+//! and identifies publishable files that aren't accounted for.
+
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+
+use vectordata::dataset::DatasetConfig;
+
+use crate::pipeline::manifest;
+use crate::pipeline::registry::CommandRegistry;
+
+use super::CheckResult;
+
+/// Known infrastructure files that are always expected.
+const KNOWN_INFRA: &[&str] = &[
+    "dataset.yaml",
+    "dataset.yml",
+    "catalog.json",
+    "catalog.yaml",
+    "variables.yaml",
+];
+
+/// Check for extraneous publishable files not accounted for by the pipeline.
+///
+/// Uses `project_artifacts` on every pipeline command to build a complete
+/// manifest, then compares against the actual publishable files on disk.
+pub fn check(
+    _root: &Path,
+    dataset_files: &[PathBuf],
+    publishable: &[PathBuf],
+) -> CheckResult {
+    if dataset_files.is_empty() {
+        return CheckResult::ok("extraneous-files");
+    }
+
+    let registry = CommandRegistry::with_builtins();
+    let mut all_extraneous: Vec<String> = Vec::new();
+
+    for dataset_path in dataset_files {
+        let workspace = dataset_path.parent().unwrap_or(Path::new("."));
+
+        let config = match DatasetConfig::load(dataset_path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        let wm = match manifest::project_workspace(dataset_path, &config, &registry) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+
+        // Build the complete set of accounted-for paths
+        let mut accounted: HashSet<String> = HashSet::new();
+        for p in &wm.final_artifacts {
+            accounted.insert(p.clone());
+        }
+        for p in &wm.intermediates {
+            accounted.insert(p.clone());
+        }
+        // Inputs that are also outputs of other steps are already covered;
+        // inputs that are external sources are not in the workspace.
+
+        // Check each publishable file under this workspace
+        for file in publishable {
+            if !file.starts_with(workspace) {
+                continue;
+            }
+
+            let rel = file.strip_prefix(workspace)
+                .unwrap_or(file)
+                .to_string_lossy()
+                .to_string();
+
+            // Skip known infrastructure
+            let filename = file.file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            if KNOWN_INFRA.contains(&filename.as_str()) {
+                continue;
+            }
+
+            // Skip .mref if base file is accounted for
+            if rel.ends_with(".mref") {
+                let base = &rel[..rel.len() - 5];
+                if accounted.contains(base) {
+                    continue;
+                }
+            }
+
+            // Skip .mrkl files (local merkle state)
+            if rel.ends_with(".mrkl") {
+                continue;
+            }
+
+            if !accounted.contains(&rel) {
+                let size = std::fs::metadata(file).map(|m| m.len()).unwrap_or(0);
+                all_extraneous.push(format!("{} ({})", rel, format_size(size)));
+            }
+        }
+    }
+
+    if all_extraneous.is_empty() {
+        let mut result = CheckResult::ok("extraneous-files");
+        result.messages.push("all publishable files are accounted for by the pipeline".to_string());
+        result
+    } else {
+        let mut messages = vec![
+            format!("{} extraneous file(s) not in any pipeline manifest:", all_extraneous.len()),
+        ];
+        for f in &all_extraneous {
+            messages.push(format!("  {}", f));
+        }
+        CheckResult::fail("extraneous-files", messages)
+    }
+}
+
+/// Find extraneous files and return their paths (for --clean-files).
+pub fn find_extraneous(
+    dataset_path: &Path,
+    publishable: &[PathBuf],
+) -> Vec<PathBuf> {
+    let workspace = dataset_path.parent().unwrap_or(Path::new("."));
+    let registry = CommandRegistry::with_builtins();
+
+    let config = match DatasetConfig::load(dataset_path) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+
+    let wm = match manifest::project_workspace(dataset_path, &config, &registry) {
+        Ok(m) => m,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut accounted: HashSet<String> = HashSet::new();
+    for p in &wm.final_artifacts {
+        accounted.insert(p.clone());
+    }
+    for p in &wm.intermediates {
+        accounted.insert(p.clone());
+    }
+
+    let mut result = Vec::new();
+    for file in publishable {
+        if !file.starts_with(workspace) {
+            continue;
+        }
+
+        let rel = file.strip_prefix(workspace)
+            .unwrap_or(file)
+            .to_string_lossy()
+            .to_string();
+
+        let filename = file.file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if KNOWN_INFRA.contains(&filename.as_str()) {
+            continue;
+        }
+
+        if rel.ends_with(".mref") {
+            let base = &rel[..rel.len() - 5];
+            if accounted.contains(base) {
+                continue;
+            }
+        }
+
+        if rel.ends_with(".mrkl") {
+            continue;
+        }
+
+        if !accounted.contains(&rel) {
+            result.push(file.clone());
+        }
+    }
+
+    result
+}
+
+/// List intermediate (cache) artifacts that are accounted for by the pipeline.
+/// These are safe to keep but not publishable.
+pub fn list_intermediates(
+    dataset_path: &Path,
+) -> Vec<String> {
+    let registry = CommandRegistry::with_builtins();
+    let config = match DatasetConfig::load(dataset_path) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+
+    match manifest::project_workspace(dataset_path, &config, &registry) {
+        Ok(m) => m.intermediates.into_iter().collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+fn format_size(bytes: u64) -> String {
+    if bytes >= 1_073_741_824 {
+        format!("{:.1} GiB", bytes as f64 / 1_073_741_824.0)
+    } else if bytes >= 1_048_576 {
+        format!("{:.1} MiB", bytes as f64 / 1_048_576.0)
+    } else if bytes >= 1024 {
+        format!("{:.1} KiB", bytes as f64 / 1024.0)
+    } else {
+        format!("{} B", bytes)
+    }
+}

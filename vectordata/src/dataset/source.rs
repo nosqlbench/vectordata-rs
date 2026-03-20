@@ -1,11 +1,13 @@
 // Copyright (c) DataStax, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Data source types with sugar parsing for dataset profiles.
+//! Data source specifications: [`DSSource`], [`DSInterval`], [`DSWindow`].
 //!
-//! A `DSSource` identifies a file path plus optional namespace and window
+//! A [`DSSource`] identifies a file path plus optional namespace and window
 //! (record range). Sources can be specified as bare strings with inline
-//! sugar notation or as explicit maps in YAML.
+//! sugar notation or as explicit maps in YAML. The sugar parser
+//! ([`parse_source_string`]) handles bracket/paren windows, colon-delimited
+//! namespaces, and SI-suffixed numbers.
 //!
 //! ## Sugar forms
 //!

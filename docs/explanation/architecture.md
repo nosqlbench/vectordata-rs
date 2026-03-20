@@ -4,31 +4,26 @@
 
 ## System Components
 
-The workspace is organized into four primary crates, each with a distinct responsibility:
+The workspace is organized into three crates, each with a distinct responsibility:
 
-### 1. `dataset` (The Specification)
-The lightweight core crate defining the canonical `dataset.yaml` schema.
-- **Configuration Model**: Owns the `DatasetConfig` and `DSProfile` structures for describing dataset layouts.
-- **Profile System**: Handles inheritance, aliases, and views for complex dataset profiles.
-- **Pipeline Schema**: Defines the structure for pipeline steps and dependencies used by the execution engine.
-
-### 2. `vectordata` (The Access Layer)
-A library providing uniform access to vector datasets by building on the `dataset` specification.
+### 1. `vectordata` (The Access Layer)
+A library providing uniform access to vector datasets, including the dataset specification.
+- **Dataset Specification**: The `vectordata::dataset` module defines the canonical `dataset.yaml` schema, including `DatasetConfig`, `DSProfile`, profile inheritance, aliases, views, and pipeline step definitions.
 - **Unified I/O**: The `VectorReader<T>` trait provides a common interface for reading vectors by ordinal across different storage backends.
+- **Format Codecs**: The `vectordata::formats` module implements the binary and text codecs for metadata (MNode), predicates (PNode), and the unified ANode wrapper with vernacular rendering.
 - **Remote Access**: Handles transparent downloading, Merkle-backed integrity verification, and differential caching for remote datasets.
 - **View Resolution**: Resolves `DSView` definitions into active vector readers for specific facets.
 
-### 3. `slabtastic` (The Storage Engine)
+### 2. `slabtastic` (The Storage Engine)
 A specialized storage library for non-uniform, randomly-accessible data.
 - **Slab Format**: A page-aligned record container that stores opaque byte payloads (like metadata or predicates).
 - **Ordinal Addressing**: Every record is assigned a sequential ordinal, allowing for O(1) expected lookup time.
 - **High Scale**: Designed to handle files up to 2^63 bytes with efficient forward and backward traversal.
 
-### 4. `veks` (The Toolbox)
+### 3. `veks` (The Toolbox)
 The umbrella CLI and pipeline engine that ties everything together.
-- **Command-Stream Pipelines**: A DAG-based execution engine that runs complex data processing steps (import, convert, analyze, etc.) defined in the `dataset` schema.
+- **Command-Stream Pipelines**: A DAG-based execution engine that runs complex data processing steps (import, convert, analyze, etc.) defined in the `vectordata::dataset` schema.
 - **Resource Governance**: A dynamic system that monitors system pressure and adjusts memory/thread allocations in real-time to prevent OOMs.
-- **Format Codecs**: Implements the binary and text codecs for metadata (MNode) and predicates (PNode).
 
 ## Core Design Principles
 

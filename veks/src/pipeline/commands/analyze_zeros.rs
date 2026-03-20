@@ -36,7 +36,31 @@ impl CommandOp for AnalyzeZerosOp {
         CommandDoc {
             summary: "Find and report zero vectors in a vector file".into(),
             body: format!(
-                "# analyze zeros\n\nFind and report zero vectors in a vector file.\n\n## Description\n\nScans an fvec or ivec file and counts vectors where all components are zero. Reports the count and percentage of zero vectors found.\n\n## Options\n\n{}",
+                "# analyze zeros\n\n\
+                Find and report zero vectors in a vector file.\n\n\
+                ## Description\n\n\
+                Scans an fvec or ivec file and counts vectors where all components are \
+                exactly zero. Reports the count and percentage of zero vectors found. \
+                The command performs a sequential scan of every vector in the file, \
+                checking each component against zero.\n\n\
+                ## Why Zero Vectors Matter\n\n\
+                All-zero vectors (and near-zero vectors) are problematic in several \
+                common scenarios:\n\n\
+                - **Cosine similarity**: Division by zero occurs when computing the \
+                L2 norm of a zero vector, producing NaN or infinity results.\n\
+                - **Normalization**: Attempting to L2-normalize a zero vector fails.\n\
+                - **KNN ground truth**: Zero vectors can distort distance rankings \
+                and produce degenerate neighborhoods where many vectors are equidistant.\n\
+                - **Benchmark validity**: Datasets with a significant fraction of zero \
+                vectors may not represent realistic workloads.\n\n\
+                ## Role in Dataset Preparation\n\n\
+                This command serves as a data quality check that should be run early \
+                in a pipeline, immediately after import or download. If zero vectors \
+                are detected, the result status is set to Warning rather than Ok, \
+                alerting downstream pipeline steps. Common remediation strategies \
+                include filtering out zero vectors or replacing them with small random \
+                perturbations.\n\n\
+                ## Options\n\n{}",
                 render_options_table(&options)
             ),
         }

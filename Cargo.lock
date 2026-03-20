@@ -4305,15 +4305,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "testserver"
-version = "0.1.0"
-dependencies = [
- "reqwest",
- "tempfile",
- "tiny_http",
-]
-
-[[package]]
 name = "thiserror"
 version = "1.0.69"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4801,8 +4792,8 @@ dependencies = [
  "serde_yaml",
  "sha2",
  "tempfile",
- "testserver",
  "thiserror 2.0.18",
+ "tiny_http",
  "url",
 ]
 

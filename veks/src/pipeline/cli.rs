@@ -122,10 +122,12 @@ pub fn build_pipeline_command() -> Command {
 
                 if opt.type_name == "Path" {
                     arg = arg.value_hint(ValueHint::AnyPath);
+                    // Path options get file completion (data files) plus variable completion.
+                    arg = arg.add(ArgValueCompleter::new(datafile_completer));
                 }
 
-                // Add variable completion for non-path options so tab-completion
-                // suggests '${variables:name}' from variables.yaml.
+                // Add variable completion so tab-completion suggests
+                // '${variables:name}' from variables.yaml.
                 arg = arg.add(ArgValueCompleter::new(variable_completer));
 
                 sub_cmd = sub_cmd.arg(arg);
@@ -254,6 +256,73 @@ pub fn governor_completer(current: &OsStr) -> Vec<CompletionCandidate> {
         .filter(|v| prefix.is_empty() || v.starts_with(&*prefix))
         .map(|v| CompletionCandidate::new(*v))
         .collect()
+}
+
+/// Recognized data file extensions for pipeline Path-type options.
+///
+/// These cover the vector, slab, and metadata formats that pipeline commands
+/// typically operate on.
+const DATA_EXTENSIONS: &[&str] = &[
+    "fvec", "ivec", "mvec", "bvec", "dvec", "svec",
+    "slab", "npy", "parquet", "json", "yaml",
+];
+
+/// Completion candidates for Path-type options: lists files in the current
+/// directory (recursively one level) whose extension matches a recognized
+/// data format.
+///
+/// When the user types a partial value, only files whose name starts with
+/// that prefix are returned. Directories that contain at least one matching
+/// file are also suggested (with a trailing `/`) so the user can drill down.
+pub fn datafile_completer(current: &OsStr) -> Vec<CompletionCandidate> {
+    let partial = current.to_string_lossy();
+
+    // Split into directory prefix and filename prefix.
+    // e.g. "data/tes" -> dir="data/", file_prefix="tes"
+    //       "tes"      -> dir=".",    file_prefix="tes"
+    let (dir_str, file_prefix) = match partial.rfind('/') {
+        Some(pos) => (&partial[..=pos], &partial[pos + 1..]),
+        None => ("", partial.as_ref()),
+    };
+    let search_dir = if dir_str.is_empty() {
+        std::env::current_dir().unwrap_or_default()
+    } else {
+        std::path::PathBuf::from(dir_str)
+    };
+
+    let entries = match std::fs::read_dir(&search_dir) {
+        Ok(rd) => rd,
+        Err(_) => return vec![],
+    };
+
+    let mut candidates = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+
+        // Filter by the typed filename prefix.
+        if !file_prefix.is_empty() && !name_str.starts_with(file_prefix) {
+            continue;
+        }
+
+        let path = entry.path();
+        if path.is_dir() {
+            // Suggest directories so the user can navigate deeper.
+            let display = format!("{}{}/", dir_str, name_str);
+            candidates.push(CompletionCandidate::new(display)
+                .help(Some("directory".into())));
+        } else if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+            if DATA_EXTENSIONS.iter().any(|de| de.eq_ignore_ascii_case(ext)) {
+                let display = format!("{}{}", dir_str, name_str);
+                let help = format!(".{} file", ext);
+                candidates.push(CompletionCandidate::new(display)
+                    .help(Some(help.into())));
+            }
+        }
+    }
+
+    candidates.sort_by(|a, b| a.get_value().cmp(b.get_value()));
+    candidates
 }
 
 /// Context-sensitive completer for `--resources` values.
@@ -736,6 +805,12 @@ mod tests {
                 group
             );
 
+            if subname.is_empty() {
+                // Single-word command (e.g. "barrier", "survey", "import"):
+                // the group command itself IS the command — no subcommand needed.
+                continue;
+            }
+
             let sub_cmd = group_cmd
                 .unwrap()
                 .get_subcommands()
@@ -885,10 +960,16 @@ mod tests {
                 .get_subcommands()
                 .find(|c| c.get_name() == group)
                 .unwrap();
-            let sub_cmd = group_cmd
-                .get_subcommands()
-                .find(|c| c.get_name() == subname)
-                .unwrap();
+            // Single-word commands (e.g. "barrier") are direct — the group
+            // command itself carries the args.
+            let sub_cmd = if subname.is_empty() {
+                group_cmd
+            } else {
+                group_cmd
+                    .get_subcommands()
+                    .find(|c| c.get_name() == subname)
+                    .unwrap()
+            };
 
             assert!(
                 sub_cmd.get_arguments().any(|a| a.get_id() == "resources"),
@@ -1030,7 +1111,13 @@ mod tests {
         let cmd = build_pipeline_command();
         let mut reachable = 0;
         for group_cmd in cmd.get_subcommands() {
-            reachable += group_cmd.get_subcommands().count();
+            let sub_count = group_cmd.get_subcommands().count();
+            if sub_count == 0 {
+                // Direct (single-word) command — the group itself is the command
+                reachable += 1;
+            } else {
+                reachable += sub_count;
+            }
         }
         assert_eq!(
             reachable, count,

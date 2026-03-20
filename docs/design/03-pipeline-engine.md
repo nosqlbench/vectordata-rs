@@ -23,7 +23,7 @@ runner.rs → step-by-step execution with progress tracking
     ↓ delegate
 registry.rs → CommandRegistry → CommandOp implementations
     ↓ record
-progress.rs → .upstream.progress.yaml
+progress.rs → .cache/.upstream.progress.yaml
 ```
 
 ## 3.2 Step Lifecycle
@@ -170,7 +170,7 @@ declarations; the remainder return an empty vector. See
 
 ### File format
 
-Stored as `.upstream.progress.yaml` adjacent to `dataset.yaml`:
+Stored as `.cache/.upstream.progress.yaml` in the workspace cache directory:
 
 ```yaml
 schema_version: 2
@@ -274,8 +274,8 @@ per-profile copies by `expand_per_profile_steps()`:
 1. **Sorted expansion**: Sized profiles are sorted ascending by
    `base_count` (10M, 20M, 30M, …), then `default` (full dataset) last.
 
-2. **ID suffixing**: Template step `evaluate-predicates` becomes
-   `evaluate-predicates-10m`, `evaluate-predicates-20m`, etc.
+2. **ID suffixing**: Template step `compute-predicates` becomes
+   `compute-predicates-10m`, `compute-predicates-20m`, etc.
 
 3. **Auto-prefixing**: `output` values are prefixed with
    `profiles/{name}/`. Non-output values that match template output
@@ -291,8 +291,8 @@ per-profile copies by `expand_per_profile_steps()`:
    barrier steps between profile groups so that ALL steps for one profile
    complete before any step of the next profile begins. This ensures
    cache segments are available for reuse: the 20M profile's
-   `evaluate-predicates-20m` can reuse segments `[0,10M)` cached by
-   `evaluate-predicates-10m` because the 10M barrier guarantees all 10M
+   `compute-predicates-20m` can reuse segments `[0,10M)` cached by
+   `compute-predicates-10m` because the 10M barrier guarantees all 10M
    steps completed first.
 
 ## 3.7 Variable Interpolation
@@ -359,7 +359,7 @@ The pipeline engine integrates with the `ResourceGovernor` from
 1. **CLI parsing**: `--resources 'mem:25%-50%,threads:4-8'` is parsed into a
    `ResourceBudget` in `run_pipeline()`.
 2. **Governor creation**: `ResourceGovernor::new(budget, workspace)` initializes
-   effective values at midpoints, creates the `.governor.log`, and installs the
+   effective values at midpoints, creates the `.cache/.governor.log`, and installs the
    default `MaximizeUtilizationStrategy`.
 3. **Per-step setup**: Before each step, the runner calls
    `ctx.governor.set_step_id(&step.id)` so log entries are correlated.

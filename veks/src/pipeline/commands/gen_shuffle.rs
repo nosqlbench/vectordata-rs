@@ -13,8 +13,8 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::pipeline::command::{
-    CommandDoc, CommandOp, CommandResult, OptionDesc, Options, Status, StreamContext,
-    render_options_table,
+    ArtifactManifest, CommandDoc, CommandOp, CommandResult, OptionDesc, Options, Status,
+    StreamContext, render_options_table,
 };
 use crate::pipeline::rng;
 
@@ -40,9 +40,43 @@ Generate a random ordinal shuffle mapping.
 
 ## Description
 
-Generates a deterministic Fisher-Yates shuffle of integers `[0, interval)`,
-writing each shuffled value as a 1-dimensional ivec record. The output can
-be used as an index array for downstream extraction steps.
+Creates a random permutation of the integers `[0, interval)` using the
+Fisher-Yates (Knuth) shuffle algorithm and writes the result as a
+1-dimensional ivec file. Each record in the output contains a single i32
+value: record `i` holds the shuffled ordinal that was originally at
+position `i`. The output file is exactly `interval * 8` bytes (4 bytes
+for the dimension header `1` plus 4 bytes for the value, per record).
+
+## Deterministic generation
+
+Given the same `seed` and `interval`, the shuffle is fully deterministic
+and produces a byte-identical output file. This property is critical for
+reproducible train/test splits -- every downstream artifact derived from
+the shuffle will be stable across runs.
+
+## Role in dataset pipelines
+
+The shuffle ivec is the foundation of **self-search dataset construction**.
+In a self-search dataset the query vectors are drawn from the same corpus
+as the base vectors; the corpus must be split into disjoint query and base
+sets with no overlap. The standard pattern is:
+
+1. **Shuffle** -- `generate ivec-shuffle` produces a random permutation of
+   all corpus ordinals.
+2. **Extract queries** -- an extract command (e.g. `transform fvec-extract`
+   or `transform mvec-extract`) reads the first K entries of the shuffle
+   ivec and copies the corresponding source vectors into `query_vectors`.
+3. **Extract base** -- a second extract command reads the remaining entries
+   (from K to the end) and copies them into `base_vectors`.
+
+Because the shuffle is a true permutation, every corpus vector appears in
+exactly one of the two output sets. The `range` option on extract commands
+controls which portion of the shuffle ivec to consume -- `[0,K)` for
+queries and `[K,N)` for the base set.
+
+The same shuffle ivec is also applied to metadata slabs (via
+`transform slab-extract`) so that ordinal correspondence is maintained:
+`base_metadata.slab[i]` describes `base_vectors[i]`.
 
 ## Options
 
@@ -141,6 +175,14 @@ be used as an index array for downstream extraction steps.
                 description: "Random seed for reproducibility".to_string(),
             },
         ]
+    }
+
+    fn project_artifacts(&self, step_id: &str, options: &Options) -> ArtifactManifest {
+        crate::pipeline::command::manifest_from_keys(
+            step_id, self.command_path(), options,
+            &[],
+            &["output"],
+        )
     }
 }
 

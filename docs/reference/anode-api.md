@@ -3,9 +3,9 @@
 
 # ANode API Reference
 
-Module: `veks::formats::anode`
+Module: `vectordata::formats::anode`
 
-Source: `src/formats/anode.rs`
+Source: `vectordata/src/formats/anode.rs`
 
 ## Constants
 
