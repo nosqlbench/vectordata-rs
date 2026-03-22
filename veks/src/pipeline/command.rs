@@ -313,6 +313,20 @@ pub struct StreamContext {
 /// Describes a single accepted option for a `CommandOp`.
 ///
 /// Used for dry-run validation and help output.
+
+/// The role of a pipeline option — whether it's an input file, output file,
+/// or a configuration parameter. Used for TUI display and manifest generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OptionRole {
+    /// An input file or directory consumed by this step.
+    Input,
+    /// An output file or directory produced by this step.
+    Output,
+    /// A configuration parameter (not a file path).
+    #[default]
+    Config,
+}
+
 #[derive(Debug, Clone)]
 pub struct OptionDesc {
     /// Option name (key in the YAML step definition).
@@ -325,7 +339,20 @@ pub struct OptionDesc {
     pub default: Option<String>,
     /// Human-readable description.
     pub description: String,
+    /// Role of this option: input file, output file, or config.
+    /// Defaults to `Config`. Commands should set `Input` or `Output`
+    /// for path-typed options that represent consumed/produced artifacts.
+    pub role: OptionRole,
 }
+
+impl OptionDesc {
+    /// Set the role of this option and return self (builder pattern).
+    pub fn with_role(mut self, role: OptionRole) -> Self {
+        self.role = role;
+        self
+    }
+}
+
 
 #[cfg(test)]
 mod tests {

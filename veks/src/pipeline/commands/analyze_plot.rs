@@ -19,7 +19,7 @@ use vectordata::VectorReader;
 use vectordata::io::MmapVectorReader;
 
 use crate::pipeline::command::{
-    CommandDoc, CommandOp, CommandResult, OptionDesc, Options, ResourceDesc, Status, StreamContext,
+    CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options, ResourceDesc, Status, StreamContext,
     render_options_table,
 };
 use crate::pipeline::rng;
@@ -489,6 +489,7 @@ impl CommandOp for AnalyzePlotOp {
                 default: None,
                 description: "Input fvec file(s), semicolon-separated for multiple series"
                     .to_string(),
+                role: OptionRole::Input,
             },
             OptionDesc {
                 name: "dimensions".to_string(),
@@ -496,28 +497,32 @@ impl CommandOp for AnalyzePlotOp {
                 required: false,
                 default: Some("0".to_string()),
                 description: "Comma-separated dimension indices to plot".to_string(),
-            },
+                        role: OptionRole::Config,
+        },
             OptionDesc {
                 name: "type".to_string(),
                 type_name: "enum".to_string(),
                 required: false,
                 default: Some("histogram".to_string()),
                 description: "Plot type: histogram or scatter".to_string(),
-            },
+                        role: OptionRole::Config,
+        },
             OptionDesc {
                 name: "width".to_string(),
                 type_name: "int".to_string(),
                 required: false,
                 default: Some("80".to_string()),
                 description: "Plot width in character columns".to_string(),
-            },
+                        role: OptionRole::Config,
+        },
             OptionDesc {
                 name: "height".to_string(),
                 type_name: "int".to_string(),
                 required: false,
                 default: Some("20".to_string()),
                 description: "Plot height in character rows".to_string(),
-            },
+                        role: OptionRole::Config,
+        },
             OptionDesc {
                 name: "bins".to_string(),
                 type_name: "int".to_string(),
@@ -525,6 +530,7 @@ impl CommandOp for AnalyzePlotOp {
                 default: None,
                 description: "Number of histogram bins (default: auto via Sturges' rule)"
                     .to_string(),
+                role: OptionRole::Config,
             },
             OptionDesc {
                 name: "sample".to_string(),
@@ -532,14 +538,16 @@ impl CommandOp for AnalyzePlotOp {
                 required: false,
                 default: Some("10000".to_string()),
                 description: "Max vectors to sample".to_string(),
-            },
+                        role: OptionRole::Config,
+        },
             OptionDesc {
                 name: "seed".to_string(),
                 type_name: "int".to_string(),
                 required: false,
                 default: Some("42".to_string()),
                 description: "PRNG seed for sampling".to_string(),
-            },
+                        role: OptionRole::Config,
+        },
         ]
     }
 }

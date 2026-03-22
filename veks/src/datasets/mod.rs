@@ -9,6 +9,7 @@
 //! These are standalone commands — no pipeline context or StreamContext required.
 
 mod cache;
+mod cache_compress;
 mod curlify;
 pub mod filter;
 pub mod import;
@@ -139,6 +140,30 @@ pub enum DatasetsCommand {
         #[arg(long)]
         verbose: bool,
     },
+    /// Compress eligible cache files to save disk space
+    CacheCompress {
+        /// Cache directory to compress (default: .cache/ in current directory)
+        #[arg(default_value = ".cache")]
+        cache_dir: PathBuf,
+
+        /// Compression level (0-9, default 9 = maximum)
+        #[arg(long, default_value = "9")]
+        level: u32,
+
+        /// Dry run — show what would be compressed without changing files
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Decompress cache files back to their original form
+    CacheUncompress {
+        /// Cache directory to uncompress (default: .cache/ in current directory)
+        #[arg(default_value = ".cache")]
+        cache_dir: PathBuf,
+
+        /// Dry run — show what would be uncompressed without changing files
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Generate curl download commands for a dataset
     Curlify {
         /// Dataset directory or path to dataset.yaml
@@ -176,6 +201,10 @@ pub enum DatasetsCommand {
         /// Interactive wizard mode — prompts for each option
         #[arg(long, short = 'i')]
         interactive: bool,
+
+        /// Accept all defaults without prompting (use with -i)
+        #[arg(long, short = 'y')]
+        yes: bool,
 
         /// Dataset name (required unless --interactive)
         #[arg(long)]
@@ -233,13 +262,27 @@ pub enum DatasetsCommand {
         #[arg(long)]
         no_dedup: bool,
 
+        /// Skip zero-vector check and clean ordinals
+        #[arg(long)]
+        no_zero_check: bool,
+
         /// Skip filtered KNN even when metadata is present
         #[arg(long)]
         no_filtered: bool,
 
+        /// L2-normalize vectors during extraction
+        #[arg(long)]
+        normalize: bool,
+
         /// Overwrite existing dataset.yaml
         #[arg(long)]
         force: bool,
+
+        /// Start fresh — ignore existing dataset.yaml, variables.yaml,
+        /// and .cache state. Equivalent to --force but also removes
+        /// variables.yaml and the progress log.
+        #[arg(long)]
+        restart: bool,
     },
     /// Generate and manage dataset catalog index files
     #[command(disable_help_subcommand = true)]
@@ -261,6 +304,23 @@ pub enum CatalogSubcommand {
         /// Base filename for catalog files (without extension)
         #[arg(long, default_value = "catalog")]
         basename: String,
+
+        /// Walk up to the .publish_url root and generate catalogs for the
+        /// entire publish hierarchy. Creates catalog files at every directory
+        /// level from the publish root down to each dataset.
+        #[arg(long)]
+        for_publish_url: bool,
+
+        /// Update only catalog files that already exist in the hierarchy
+        /// (default behavior). Skips directories that have no existing catalog.
+        /// Use --no-update to generate at all hierarchy levels.
+        #[arg(long, overrides_with = "no_update", default_value_t = true)]
+        update: bool,
+
+        /// Disable --update: generate catalogs at all hierarchy levels,
+        /// not just where catalog files already exist.
+        #[arg(long = "no-update", hide = true)]
+        no_update: bool,
     },
 }
 
@@ -321,6 +381,13 @@ pub fn run(args: DatasetsArgs) {
         DatasetsCommand::Cache { cache_dir, verbose } => {
             cache::run(cache_dir.as_deref(), verbose);
         }
+        DatasetsCommand::CacheCompress { cache_dir, level, dry_run } => {
+            crate::pipeline::gz_cache::set_compression_level(level);
+            cache_compress::run(&cache_dir, dry_run);
+        }
+        DatasetsCommand::CacheUncompress { cache_dir, dry_run } => {
+            cache_compress::run_uncompress(&cache_dir, dry_run);
+        }
         DatasetsCommand::Curlify { path, output } => {
             curlify::run(&path, output.as_deref());
         }
@@ -328,13 +395,22 @@ pub fn run(args: DatasetsArgs) {
             prebuffer::run(&dataset, &configdir, &catalog, &at, cache_dir.as_deref());
         }
         DatasetsCommand::Import {
-            interactive, name, output, base_vectors, query_vectors,
+            interactive, yes, name, output, base_vectors, query_vectors,
             self_search, query_count, metadata, ground_truth,
             ground_truth_distances, metric, neighbors, seed, description,
-            no_dedup, no_filtered, force,
+            no_dedup, no_zero_check, no_filtered, normalize, force, restart,
         } => {
+            if restart {
+                // Clean up state files before proceeding
+                let out_dir = output.as_deref()
+                    .unwrap_or_else(|| std::path::Path::new("."));
+                let _ = std::fs::remove_file(out_dir.join("dataset.yaml"));
+                let _ = std::fs::remove_file(out_dir.join("variables.yaml"));
+                let _ = std::fs::remove_file(out_dir.join(".cache/.upstream.progress.yaml"));
+                eprintln!("Restarting: removed dataset.yaml, variables.yaml, and progress log");
+            }
             if interactive {
-                let args = wizard::run_wizard();
+                let args = wizard::run_wizard_with_auto_accept(yes);
                 import::run(args);
             } else {
                 let name = name.unwrap_or_else(|| {
@@ -348,15 +424,20 @@ pub fn run(args: DatasetsArgs) {
                 import::run(import::ImportArgs {
                     name, output, base_vectors, query_vectors, self_search,
                     query_count, metadata, ground_truth, ground_truth_distances,
-                    metric, neighbors, seed, description, no_dedup, no_filtered,
-                    force,
+                    metric, neighbors, seed, description, no_dedup, no_zero_check,
+                    no_filtered, normalize, force: force || restart,
+                    base_convert_format: None,
+                    query_convert_format: None,
+                    compress_cache: true,
+                    sized_profiles: None,
                 });
             }
         }
         DatasetsCommand::Catalog { command } => {
             match command {
-                CatalogSubcommand::Generate { input, basename } => {
-                    crate::catalog::generate::run(&input, &basename);
+                CatalogSubcommand::Generate { input, basename, for_publish_url, update, no_update } => {
+                    let effective_update = update && !no_update;
+                    crate::catalog::generate::run(&input, &basename, for_publish_url, effective_update);
                 }
             }
         }

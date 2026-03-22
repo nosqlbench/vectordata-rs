@@ -23,7 +23,7 @@ use vectordata::VectorReader;
 use vectordata::io::MmapVectorReader;
 
 use crate::pipeline::command::{
-    CommandDoc, CommandOp, CommandResult, OptionDesc, Options, ResourceDesc, Status, StreamContext,
+    CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options, ResourceDesc, Status, StreamContext,
     render_options_table,
 };
 use crate::pipeline::predicate::attribute::{AttributeColumn, FieldType};
@@ -368,6 +368,7 @@ trees.
                 default: None,
                 description: "Existing dataset directory with base.fvec, query.fvec, dataset.yaml"
                     .to_string(),
+                role: OptionRole::Input,
             },
             OptionDesc {
                 name: "output-dir".to_string(),
@@ -375,35 +376,40 @@ trees.
                 required: false,
                 default: None,
                 description: "Output directory (defaults to input-dir)".to_string(),
-            },
+                        role: OptionRole::Output,
+        },
             OptionDesc {
                 name: "fields".to_string(),
                 type_name: "int".to_string(),
                 required: false,
                 default: Some("3".to_string()),
                 description: "Number of attribute fields".to_string(),
-            },
+                        role: OptionRole::Config,
+        },
             OptionDesc {
                 name: "field-types".to_string(),
                 type_name: "String".to_string(),
                 required: false,
                 default: Some("int,enum,enum_set".to_string()),
                 description: "Comma-separated field types (int, long, enum, enum_set)".to_string(),
-            },
+                        role: OptionRole::Config,
+        },
             OptionDesc {
                 name: "cardinalities".to_string(),
                 type_name: "String".to_string(),
                 required: false,
                 default: Some("12,30,28".to_string()),
                 description: "Comma-separated cardinalities per field".to_string(),
-            },
+                        role: OptionRole::Config,
+        },
             OptionDesc {
                 name: "selectivity".to_string(),
                 type_name: "float".to_string(),
                 required: false,
                 default: Some("0.1".to_string()),
                 description: "Target fraction of base vectors satisfying predicates".to_string(),
-            },
+                        role: OptionRole::Config,
+        },
             OptionDesc {
                 name: "predicate-complexity".to_string(),
                 type_name: "enum".to_string(),
@@ -411,6 +417,7 @@ trees.
                 default: Some("simple".to_string()),
                 description: "Predicate complexity: simple (AND-only) or compound (AND/OR)"
                     .to_string(),
+                role: OptionRole::Config,
             },
             OptionDesc {
                 name: "neighbors".to_string(),
@@ -418,14 +425,16 @@ trees.
                 required: false,
                 default: None,
                 description: "K for predicated KNN (default: from dataset.yaml)".to_string(),
-            },
+                        role: OptionRole::Config,
+        },
             OptionDesc {
                 name: "seed".to_string(),
                 type_name: "int".to_string(),
                 required: false,
                 default: Some("42".to_string()),
                 description: "PRNG seed for reproducibility".to_string(),
-            },
+                        role: OptionRole::Config,
+        },
         ]
     }
 }

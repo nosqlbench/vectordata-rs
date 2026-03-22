@@ -16,8 +16,8 @@ use crate::formats::convert::convert_elements_into;
 use crate::formats::reader;
 use crate::formats::writer::{self, SinkConfig};
 use crate::pipeline::command::{
-    CommandDoc, CommandOp, CommandResult, OptionDesc, Options, ResourceDesc, Status, StreamContext,
-    render_options_table,
+    CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options, ResourceDesc, Status,
+    StreamContext, render_options_table,
 };
 
 /// Number of records to buffer in the read-ahead channel.
@@ -309,28 +309,32 @@ Convert with explicit source format override:
                 required: true,
                 default: None,
                 description: "Source file or directory".to_string(),
-            },
+                role: OptionRole::Input,
+        },
             OptionDesc {
                 name: "output".to_string(),
                 type_name: "Path".to_string(),
                 required: true,
                 default: None,
                 description: "Output file path".to_string(),
-            },
+                role: OptionRole::Output,
+        },
             OptionDesc {
                 name: "to".to_string(),
                 type_name: "enum".to_string(),
                 required: true,
                 default: None,
                 description: "Output format (fvec, ivec, slab, etc.)".to_string(),
-            },
+                role: OptionRole::Config,
+        },
             OptionDesc {
                 name: "from".to_string(),
                 type_name: "String".to_string(),
                 required: false,
                 default: None,
                 description: "Source format override (auto-detected if omitted)".to_string(),
-            },
+                role: OptionRole::Config,
+        },
         ]
     }
 }

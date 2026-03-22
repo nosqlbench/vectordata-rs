@@ -15,8 +15,8 @@
 use std::time::Instant;
 
 use crate::pipeline::command::{
-    ArtifactManifest, CommandDoc, CommandOp, CommandResult, OptionDesc, Options, Status,
-    StreamContext, render_options_table,
+    ArtifactManifest, CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options,
+    Status, StreamContext, render_options_table,
 };
 use crate::pipeline::variables;
 
@@ -132,7 +132,11 @@ Then reference in a downstream step:
         CommandResult {
             status: Status::Ok,
             message: format!("set {} = {}", name, value),
-            produced: vec![variables::variables_path(&ctx.workspace)],
+            // Don't list variables.yaml as a produced artifact — it's a shared
+            // append-only resource modified by multiple set-variable steps.
+            // Tracking its size would cause false staleness when a later step
+            // adds another variable.
+            produced: vec![],
             elapsed: start.elapsed(),
         }
     }
@@ -145,14 +149,16 @@ Then reference in a downstream step:
                 required: true,
                 default: None,
                 description: "Variable name (used as ${name} in downstream steps)".to_string(),
-            },
+                role: OptionRole::Config,
+        },
             OptionDesc {
                 name: "value".to_string(),
                 type_name: "String".to_string(),
                 required: true,
                 default: None,
                 description: "Expression: count:<path>, dim:<path>, or a literal value".to_string(),
-            },
+                role: OptionRole::Config,
+        },
         ]
     }
 

@@ -19,7 +19,7 @@ use crate::formats::anode_vernacular::{self, Vernacular};
 use crate::formats::mnode::MNode;
 use crate::formats::pnode::PNode;
 use crate::pipeline::command::{
-    CommandDoc, CommandOp, CommandResult, OptionDesc, Options, ResourceDesc, Status, StreamContext,
+    CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options, ResourceDesc, Status, StreamContext,
     render_options_table,
 };
 
@@ -239,12 +239,12 @@ in predicate synthesis, metadata indexing, or query execution.
 
     fn describe_options(&self) -> Vec<OptionDesc> {
         vec![
-            opt("predicates", "Path", true, None, "Predicates slab file"),
-            opt("metadata", "Path", true, None, "Metadata slab file"),
-            opt("metadata-indices", "Path", true, None, "Predicate-keys slab from compute predicates"),
-            opt("ordinal", "int", true, None, "Predicate ordinal to inspect"),
-            opt("vernacular", "enum", false, Some("readout"), "Rendering format: json, yaml, sql, cql, cddl, readout, display"),
-            opt("limit", "int", false, Some("20"), "Max matching metadata records to display"),
+            opt("predicates", "Path", true, None, "Predicates slab file", OptionRole::Input),
+            opt("metadata", "Path", true, None, "Metadata slab file", OptionRole::Input),
+            opt("metadata-indices", "Path", true, None, "Predicate-keys slab from compute predicates", OptionRole::Input),
+            opt("ordinal", "int", true, None, "Predicate ordinal to inspect", OptionRole::Config),
+            opt("vernacular", "enum", false, Some("readout"), "Rendering format: json, yaml, sql, cql, cddl, readout, display", OptionRole::Config),
+            opt("limit", "int", false, Some("20"), "Max matching metadata records to display", OptionRole::Config),
         ]
     }
 }
@@ -277,12 +277,13 @@ fn error_result(message: String, start: Instant) -> CommandResult {
     }
 }
 
-fn opt(name: &str, type_name: &str, required: bool, default: Option<&str>, desc: &str) -> OptionDesc {
+fn opt(name: &str, type_name: &str, required: bool, default: Option<&str>, desc: &str, role: OptionRole) -> OptionDesc {
     OptionDesc {
         name: name.to_string(),
         type_name: type_name.to_string(),
         required,
         default: default.map(|s| s.to_string()),
         description: desc.to_string(),
-    }
+        role,
+}
 }

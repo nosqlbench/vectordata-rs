@@ -44,8 +44,8 @@ use crate::formats::mnode::{MNode, MValue};
 use crate::formats::pnode::eval::evaluate;
 use crate::formats::pnode::{Comparand, OpType, PNode};
 use crate::pipeline::command::{
-    ArtifactManifest, CommandDoc, CommandOp, CommandResult, OptionDesc, Options, ResourceDesc,
-    Status, StreamContext, render_options_table,
+    ArtifactManifest, CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options,
+    ResourceDesc, Status, StreamContext, render_options_table,
 };
 use super::slab::survey_from_json;
 
@@ -301,6 +301,7 @@ fn plan_segments(
     cache_prefix: &str,
     pred_count: usize,
     first_ordinal: i64,
+    compress_cache: bool,
 ) -> Vec<SegmentInfo> {
     if page_entries.is_empty() || end_ordinal == 0 {
         return Vec::new();
@@ -326,7 +327,7 @@ fn plan_segments(
                     "{}.seg_{:010}_{:010}.predkeys.slab",
                     cache_prefix, seg_start, seg_end,
                 ));
-                let valid = is_cache_valid(&path, pred_count);
+                let valid = is_cache_valid(&path, pred_count, compress_cache);
                 (Some(path), valid)
             }
             None => (None, false),
@@ -348,13 +349,41 @@ fn plan_segments(
 }
 
 /// Check if a cache slab exists and has the expected number of records.
-fn is_cache_valid(path: &Path, expected_records: usize) -> bool {
-    if !path.exists() {
-        return false;
+///
+/// When `compress_cache` is true, also checks for the `.gz` compressed form.
+/// If the compressed form exists, it is decompressed to the original path so
+/// that subsequent `SlabReader::open` calls work normally.
+fn is_cache_valid(path: &Path, expected_records: usize, compress_cache: bool) -> bool {
+    // If the uncompressed file already exists, validate it directly.
+    if path.exists() {
+        return match SlabReader::open(path) {
+            Ok(reader) => reader.total_records() as usize == expected_records,
+            Err(_) => false,
+        };
     }
-    match SlabReader::open(path) {
-        Ok(reader) => reader.total_records() as usize == expected_records,
-        Err(_) => false,
+
+    // If compress-cache is enabled, check for the .gz form.
+    if compress_cache && crate::pipeline::gz_cache::gz_exists(path) {
+        match crate::pipeline::gz_cache::load_gz(path) {
+            Ok(data) => {
+                // Write decompressed data to the original path for SlabReader.
+                if std::fs::write(path, &data).is_err() {
+                    return false;
+                }
+                let valid = match SlabReader::open(path) {
+                    Ok(reader) => reader.total_records() as usize == expected_records,
+                    Err(_) => false,
+                };
+                // Clean up decompressed file if invalid.
+                if !valid {
+                    let _ = std::fs::remove_file(path);
+                }
+                valid
+            }
+            Err(_) => false,
+        }
+    } else {
+        false
     }
 }
 
@@ -661,6 +690,11 @@ sweep.
             range_start = 0;
             range_end = None;
         }
+
+        let compress_cache: bool = options
+            .get("compress-cache")
+            .map(|s| s == "true" || s == "1")
+            .unwrap_or(false);
 
         // ── Phase 1: Load predicates and memoize ─────────────────────────
 
@@ -975,6 +1009,7 @@ sweep.
             &cache_prefix,
             pred_len,
             effective_start,
+            compress_cache,
         );
 
         let cached_count = segments.iter().filter(|s| s.cached).count();
@@ -1409,6 +1444,26 @@ sweep.
                                 "compute predicates: cache write error for segment {}: {} (path: {})",
                                 seg_idx, e, cache_path.display(),
                             );
+                        } else if compress_cache {
+                            // Read back the slab file, compress, and delete the original.
+                            match std::fs::read(cache_path) {
+                                Ok(raw) => {
+                                    if let Err(e) = crate::pipeline::gz_cache::save_gz(cache_path, &raw) {
+                                        log::warn!(
+                                            "compute predicates: compress error for segment {}: {}",
+                                            seg_idx, e,
+                                        );
+                                    } else {
+                                        let _ = std::fs::remove_file(cache_path);
+                                    }
+                                }
+                                Err(e) => {
+                                    log::warn!(
+                                        "compute predicates: failed to read cache for compress, segment {}: {}",
+                                        seg_idx, e,
+                                    );
+                                }
+                            }
                         }
                     }
                     None => {
@@ -1500,6 +1555,28 @@ sweep.
             .enumerate()
             .map(|(seg_idx, seg)| {
                 seg.cache_path.as_ref().and_then(|cp| {
+                    // If compress-cache is enabled and the uncompressed file is
+                    // missing but the .gz form exists, decompress it first.
+                    if compress_cache && !cp.exists() && crate::pipeline::gz_cache::gz_exists(cp) {
+                        match crate::pipeline::gz_cache::load_gz(cp) {
+                            Ok(data) => {
+                                if let Err(e) = std::fs::write(cp, &data) {
+                                    ctx.ui.log(&format!(
+                                        "compute predicates: decompress write error for segment {}: {}",
+                                        seg_idx, e
+                                    ));
+                                    return None;
+                                }
+                            }
+                            Err(e) => {
+                                ctx.ui.log(&format!(
+                                    "compute predicates: decompress error for segment {}: {}",
+                                    seg_idx, e
+                                ));
+                                return None;
+                            }
+                        }
+                    }
                     match SlabReader::open(cp) {
                         Ok(r) => Some(r),
                         Err(e) => {
@@ -1607,6 +1684,7 @@ sweep.
                 true,
                 None,
                 "Metadata slab (MNode records)",
+                OptionRole::Input,
             ),
             opt(
                 "predicates",
@@ -1614,6 +1692,7 @@ sweep.
                 true,
                 None,
                 "Predicate slab (PNode records)",
+                OptionRole::Input,
             ),
             opt(
                 "output",
@@ -1621,6 +1700,7 @@ sweep.
                 true,
                 None,
                 "Output slab for answer key records",
+                OptionRole::Output,
             ),
             opt(
                 "survey",
@@ -1628,6 +1708,7 @@ sweep.
                 true,
                 None,
                 "Survey JSON file (from 'survey') for field statistics and selectivity",
+                OptionRole::Input,
             ),
             opt(
                 "limit",
@@ -1635,6 +1716,7 @@ sweep.
                 false,
                 Some("0"),
                 "Max matches per predicate (0 = unlimited)",
+                OptionRole::Config,
             ),
             opt(
                 "segment_size",
@@ -1642,6 +1724,7 @@ sweep.
                 false,
                 Some("1000000"),
                 "Records per segment for cache partitioning",
+                OptionRole::Config,
             ),
             opt(
                 "selectivity",
@@ -1649,6 +1732,7 @@ sweep.
                 false,
                 None,
                 "Target selectivity from predicate generation (0.0–1.0), for output size estimates",
+                OptionRole::Config,
             ),
             opt(
                 "selectivity-max",
@@ -1656,6 +1740,7 @@ sweep.
                 false,
                 None,
                 "Upper bound of selectivity range (if predicates used a range)",
+                OptionRole::Config,
             ),
             opt(
                 "range",
@@ -1663,6 +1748,15 @@ sweep.
                 false,
                 None,
                 "Ordinal range to scan, e.g. '[0,10000000)'. Limits metadata scanning to a profile subset.",
+                OptionRole::Config,
+            ),
+            opt(
+                "compress-cache",
+                "bool",
+                false,
+                Some("false"),
+                "Gzip-compress segment cache files",
+                OptionRole::Config,
             ),
         ]
     }
@@ -1737,6 +1831,7 @@ fn opt(
     required: bool,
     default: Option<&str>,
     desc: &str,
+    role: OptionRole,
 ) -> OptionDesc {
     OptionDesc {
         name: name.to_string(),
@@ -1744,7 +1839,8 @@ fn opt(
         required,
         default: default.map(|s| s.to_string()),
         description: desc.to_string(),
-    }
+        role,
+}
 }
 
 /// Parse an ordinal range specification like `[0,10000000)` or `[0..10M)`.

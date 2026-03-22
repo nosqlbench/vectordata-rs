@@ -84,7 +84,13 @@ fn default_args(name: &str, output: &Path) -> ImportArgs {
         description: None,
         no_dedup: false,
         no_filtered: false,
+        no_zero_check: false,
+        normalize: false,
         force: false,
+        base_convert_format: None,
+        query_convert_format: None,
+        compress_cache: true,
+        sized_profiles: None,
     }
 }
 
@@ -130,7 +136,7 @@ fn import_native_fvec_self_search() {
     assert!(yaml.contains("extract-query-vectors"), "should have query extract");
     assert!(yaml.contains("extract-base-vectors"), "should have base extract");
     assert!(yaml.contains("compute knn"), "should have KNN");
-    assert!(yaml.contains("compute dedup"), "should have dedup");
+    assert!(yaml.contains("compute dedup"), "should have sort/dedup step");
 
     // Profile should reference the extracted vectors, not the source
     assert!(yaml.contains("profiles/base/base_vectors.mvec")
@@ -203,7 +209,7 @@ fn import_no_dedup_flag() {
     veks::datasets::import::run(args);
 
     let yaml = read_yaml(&out);
-    assert!(!yaml.contains("compute dedup"), "should not have dedup when --no-dedup");
+    assert!(!yaml.contains("compute dedup"), "should not have sort/dedup when --no-dedup");
 }
 
 #[test]
@@ -875,7 +881,8 @@ fn project_artifacts_compute_dedup_non_cache() {
     assert_eq!(manifest.command, "compute dedup");
     assert_eq!(manifest.inputs, vec!["${cache}/all_vectors.mvec"]);
     assert_eq!(manifest.outputs, vec!["dedup_index.ivec", "dedup_report.json"]);
-    assert!(manifest.intermediates.is_empty());
+    assert!(manifest.intermediates.contains(&"${cache}/dedup_runs/".to_string()),
+        "should declare run directory as intermediate");
 }
 
 #[test]
@@ -891,10 +898,9 @@ fn project_artifacts_compute_dedup_cache_outputs() {
     let manifest = cmd.project_artifacts("dedup-cached", &opts);
     assert_eq!(manifest.inputs, vec!["data.mvec"]);
     assert!(manifest.outputs.is_empty());
-    assert_eq!(manifest.intermediates, vec![
-        "${cache}/dedup.ivec",
-        ".cache/dedup.json",
-    ]);
+    assert!(manifest.intermediates.contains(&"${cache}/dedup.ivec".to_string()));
+    assert!(manifest.intermediates.contains(&".cache/dedup.json".to_string()));
+    assert!(manifest.intermediates.contains(&"${cache}/dedup_runs/".to_string()));
 }
 
 #[test]
@@ -1401,6 +1407,347 @@ fn project_artifacts_clear_variables_empty() {
     assert_eq!(manifest.command, "clear variables");
     // May or may not have a custom implementation; should not panic
     assert!(manifest.inputs.is_empty() || !manifest.inputs.is_empty());
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Import flow tests: zero-check, clean-ordinals, normalize, and dependency graph
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Collect step IDs from YAML by parsing "- id: <step-id>" lines.
+fn step_ids_from_yaml(yaml: &str) -> Vec<String> {
+    yaml.lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            if trimmed.starts_with("- id: ") {
+                Some(trimmed.strip_prefix("- id: ").unwrap().to_string())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Extract the "after: [...]" line for a given step ID from the YAML.
+fn after_for_step(yaml: &str, step_id: &str) -> Option<String> {
+    let lines: Vec<&str> = yaml.lines().collect();
+    let mut in_step = false;
+    for (_i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if trimmed == &format!("- id: {}", step_id) {
+            in_step = true;
+            continue;
+        }
+        if in_step {
+            // New step starts with "- id:"
+            if trimmed.starts_with("- id: ") {
+                return None; // no after found for this step
+            }
+            if trimmed.starts_with("after:") {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
+#[test]
+fn import_zero_check_and_clean_ordinals_emitted_by_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let fvec = dir.path().join("base.fvec");
+    write_fvec(&fvec, 50, 4);
+
+    let mut args = default_args("zc-default", &dir.path().join("out"));
+    args.base_vectors = Some(fvec);
+    // defaults: no_zero_check=false, no_dedup=false
+
+    veks::datasets::import::run(args);
+    let yaml = read_yaml(&dir.path().join("out"));
+    let ids = step_ids_from_yaml(&yaml);
+
+    assert!(ids.contains(&"zero-check".to_string()),
+        "zero-check should be emitted by default, got: {:?}", ids);
+    assert!(ids.contains(&"clean-ordinals".to_string()),
+        "clean-ordinals should be emitted by default, got: {:?}", ids);
+}
+
+#[test]
+fn import_no_zero_check_suppresses_zero_check_and_not_clean_ordinals() {
+    // --no-zero-check suppresses zero-check. clean-ordinals is still emitted
+    // because dedup is still active (no_dedup=false, no_zero_check=true →
+    // clean_ordinals is Materialized per the condition !(no_dedup && no_zero_check)).
+    let dir = tempfile::tempdir().unwrap();
+    let fvec = dir.path().join("base.fvec");
+    write_fvec(&fvec, 50, 4);
+
+    let mut args = default_args("zc-off", &dir.path().join("out"));
+    args.base_vectors = Some(fvec);
+    args.no_zero_check = true;
+
+    veks::datasets::import::run(args);
+    let yaml = read_yaml(&dir.path().join("out"));
+    let ids = step_ids_from_yaml(&yaml);
+
+    assert!(!ids.contains(&"zero-check".to_string()),
+        "zero-check should be suppressed when --no-zero-check is set, got: {:?}", ids);
+    // clean-ordinals is still present because dedup is active
+    assert!(ids.contains(&"clean-ordinals".to_string()),
+        "clean-ordinals should still be emitted when only no_zero_check is set, got: {:?}", ids);
+}
+
+#[test]
+fn import_no_zero_check_and_no_dedup_suppresses_both() {
+    // Both --no-zero-check and --no-dedup → neither zero-check nor clean-ordinals
+    let dir = tempfile::tempdir().unwrap();
+    let fvec = dir.path().join("base.fvec");
+    write_fvec(&fvec, 50, 4);
+
+    let mut args = default_args("both-off", &dir.path().join("out"));
+    args.base_vectors = Some(fvec);
+    args.no_zero_check = true;
+    args.no_dedup = true;
+
+    veks::datasets::import::run(args);
+    let yaml = read_yaml(&dir.path().join("out"));
+    let ids = step_ids_from_yaml(&yaml);
+
+    assert!(!ids.contains(&"zero-check".to_string()),
+        "zero-check should be absent, got: {:?}", ids);
+    assert!(!ids.contains(&"clean-ordinals".to_string()),
+        "clean-ordinals should be absent when both no_dedup and no_zero_check, got: {:?}", ids);
+}
+
+#[test]
+fn import_no_dedup_with_zero_check_still_enabled() {
+    // --no-dedup but zero-check is still enabled.
+    // dedup-vectors is absent, but zero-check and clean-ordinals should still appear.
+    // zero-check uses dedup ordinals — when dedup is Identity (empty path),
+    // the zero-check step still references the ordinals slot which is empty.
+    let dir = tempfile::tempdir().unwrap();
+    let fvec = dir.path().join("base.fvec");
+    write_fvec(&fvec, 50, 4);
+
+    let mut args = default_args("nodedup-zc", &dir.path().join("out"));
+    args.base_vectors = Some(fvec);
+    args.no_dedup = true;
+    args.no_zero_check = false;
+
+    veks::datasets::import::run(args);
+    let yaml = read_yaml(&dir.path().join("out"));
+    let ids = step_ids_from_yaml(&yaml);
+
+    assert!(!ids.contains(&"dedup-vectors".to_string()),
+        "dedup-vectors should be absent with --no-dedup, got: {:?}", ids);
+    assert!(ids.contains(&"zero-check".to_string()),
+        "zero-check should be present when no_zero_check=false, got: {:?}", ids);
+    assert!(ids.contains(&"clean-ordinals".to_string()),
+        "clean-ordinals should be present when not both no_dedup and no_zero_check, got: {:?}", ids);
+}
+
+#[test]
+fn import_normalize_adds_normalize_to_extract_steps() {
+    let dir = tempfile::tempdir().unwrap();
+    let fvec = dir.path().join("base.fvec");
+    write_fvec(&fvec, 200, 4);
+
+    let mut args = default_args("norm-test", &dir.path().join("out"));
+    args.base_vectors = Some(fvec);
+    args.normalize = true;
+    args.query_count = 10;
+
+    veks::datasets::import::run(args);
+    let yaml = read_yaml(&dir.path().join("out"));
+
+    // Self-search is implied; extract-query-vectors and extract-base-vectors should exist
+    assert!(yaml.contains("extract-query-vectors"),
+        "should have extract-query-vectors for self-search");
+    assert!(yaml.contains("extract-base-vectors"),
+        "should have extract-base-vectors for self-search");
+
+    // Both extract steps should have normalize: true
+    assert!(yaml.contains("normalize: true"),
+        "normalize: true should appear in extract steps when --normalize is set");
+
+    // Count occurrences of "normalize: true" — should be exactly 2 (one per extract step)
+    let count = yaml.matches("normalize: true").count();
+    assert_eq!(count, 2,
+        "normalize: true should appear exactly twice (query + base extract), found {}", count);
+}
+
+#[test]
+fn import_normalize_separate_query_no_extract_steps() {
+    // Separate query = no self-search, so no extract steps.
+    // Normalization intent has nowhere to be applied (no extract steps emitted).
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("base.fvec");
+    let query = dir.path().join("query.fvec");
+    write_fvec(&base, 100, 4);
+    write_fvec(&query, 10, 4);
+
+    let mut args = default_args("norm-sep", &dir.path().join("out"));
+    args.base_vectors = Some(base);
+    args.query_vectors = Some(query);
+    args.normalize = true;
+
+    veks::datasets::import::run(args);
+    let yaml = read_yaml(&dir.path().join("out"));
+    let ids = step_ids_from_yaml(&yaml);
+
+    // No extract steps with separate query
+    assert!(!ids.contains(&"extract-query-vectors".to_string()),
+        "separate query should not have extract steps, got: {:?}", ids);
+    assert!(!ids.contains(&"extract-base-vectors".to_string()),
+        "separate query should not have extract steps, got: {:?}", ids);
+
+    // normalize: true should NOT appear in the YAML (no extract steps to carry it)
+    assert!(!yaml.contains("normalize: true"),
+        "no extract steps means normalize: true should not appear in YAML");
+}
+
+#[test]
+fn import_full_pipeline_all_features() {
+    // Full pipeline: base fvec (self-search), metadata (parquet dir),
+    // normalize, dedup, zero-check, filtered KNN.
+    let dir = tempfile::tempdir().unwrap();
+    let fvec = dir.path().join("base.fvec");
+    write_fvec(&fvec, 200, 4);
+    let meta = dir.path().join("meta");
+    write_parquet_dir(&meta);
+
+    let mut args = default_args("full-pipeline", &dir.path().join("out"));
+    args.base_vectors = Some(fvec);
+    args.metadata = Some(meta);
+    args.normalize = true;
+    args.query_count = 10;
+
+    veks::datasets::import::run(args);
+    let yaml = read_yaml(&dir.path().join("out"));
+    let ids = step_ids_from_yaml(&yaml);
+
+    // Verify every expected step is present
+    let expected = vec![
+        "set-vector-count",
+        "sort-vectors",
+        "zero-check",
+        "clean-ordinals",
+        "set-clean-count",
+        "shuffle-ordinals",
+        "extract-query-vectors",
+        "extract-base-vectors",
+        "set-base-count",
+        "import-metadata",
+        "survey-metadata",
+        "synthesize-predicates",
+        "evaluate-predicates",
+        "extract-metadata",
+        "compute-knn",
+        "compute-filtered-knn",
+        "verify-knn",
+        "verify-predicates",
+        "merkle-all",
+        "catalog-generate",
+    ];
+    for expected_id in &expected {
+        assert!(ids.contains(&expected_id.to_string()),
+            "expected step '{}' not found in {:?}", expected_id, ids);
+    }
+    assert_eq!(ids.len(), expected.len(),
+        "step count mismatch: expected {} steps, got {} steps: {:?}",
+        expected.len(), ids.len(), ids);
+}
+
+#[test]
+fn import_full_pipeline_everything_disabled() {
+    // Minimal pipeline: base fvec, no_dedup, no_zero_check, no_filtered, normalize=false.
+    // Self-search still activates (base_vectors present, no query_vectors).
+    let dir = tempfile::tempdir().unwrap();
+    let fvec = dir.path().join("base.fvec");
+    write_fvec(&fvec, 200, 4);
+
+    let mut args = default_args("minimal-pipeline", &dir.path().join("out"));
+    args.base_vectors = Some(fvec);
+    args.no_dedup = true;
+    args.no_zero_check = true;
+    args.no_filtered = true;
+    args.normalize = false;
+    args.query_count = 10;
+
+    veks::datasets::import::run(args);
+    let yaml = read_yaml(&dir.path().join("out"));
+    let ids = step_ids_from_yaml(&yaml);
+
+    // Should NOT have these:
+    assert!(!ids.contains(&"sort-vectors".to_string()), "no sort: {:?}", ids);
+    assert!(!ids.contains(&"zero-check".to_string()), "no zero-check: {:?}", ids);
+    assert!(!ids.contains(&"clean-ordinals".to_string()), "no clean-ordinals: {:?}", ids);
+    assert!(!ids.contains(&"import-metadata".to_string()), "no metadata: {:?}", ids);
+    assert!(!ids.contains(&"compute-filtered-knn".to_string()), "no filtered KNN: {:?}", ids);
+
+    // Should still have self-search chain + KNN
+    assert!(ids.contains(&"set-vector-count".to_string()), "set-vector-count: {:?}", ids);
+    assert!(ids.contains(&"shuffle-ordinals".to_string()), "shuffle: {:?}", ids);
+    assert!(ids.contains(&"extract-query-vectors".to_string()), "extract-query: {:?}", ids);
+    assert!(ids.contains(&"extract-base-vectors".to_string()), "extract-base: {:?}", ids);
+    assert!(ids.contains(&"set-base-count".to_string()), "set-base-count: {:?}", ids);
+    assert!(ids.contains(&"compute-knn".to_string()), "compute-knn: {:?}", ids);
+
+    // No normalize: true in YAML
+    assert!(!yaml.contains("normalize: true"),
+        "normalize: true should not appear when normalize=false");
+
+    // Minimal count: set-vector-count, shuffle, extract-query, extract-base,
+    //                set-base-count, compute-knn, verify-knn, merkle-all, catalog-generate = 9
+    assert_eq!(ids.len(), 9,
+        "minimal self-search pipeline should have 9 steps, got {}: {:?}", ids.len(), ids);
+}
+
+#[test]
+fn import_clean_ordinals_depends_on_sort() {
+    let dir = tempfile::tempdir().unwrap();
+    let fvec = dir.path().join("base.fvec");
+    write_fvec(&fvec, 50, 4);
+
+    let mut args = default_args("co-deps", &dir.path().join("out"));
+    args.base_vectors = Some(fvec);
+    // defaults: no_dedup=false, no_zero_check=false
+
+    veks::datasets::import::run(args);
+    let yaml = read_yaml(&dir.path().join("out"));
+
+    // clean-ordinals should have sort-vectors in its after list
+    let after = after_for_step(&yaml, "clean-ordinals");
+    assert!(after.is_some(),
+        "clean-ordinals should have an after clause");
+    let after_str = after.unwrap();
+    assert!(after_str.contains("sort-vectors"),
+        "clean-ordinals should depend on sort-vectors, got: {}", after_str);
+    // Also should depend on zero-check
+    assert!(after_str.contains("zero-check"),
+        "clean-ordinals should depend on zero-check, got: {}", after_str);
+}
+
+#[test]
+fn import_shuffle_depends_on_clean_count() {
+    let dir = tempfile::tempdir().unwrap();
+    let fvec = dir.path().join("base.fvec");
+    write_fvec(&fvec, 200, 4);
+
+    let mut args = default_args("shuffle-deps", &dir.path().join("out"));
+    args.base_vectors = Some(fvec);
+    args.query_count = 10;
+
+    veks::datasets::import::run(args);
+    let yaml = read_yaml(&dir.path().join("out"));
+
+    // shuffle-ordinals should depend on set-clean-count (sort is enabled by default)
+    let after = after_for_step(&yaml, "shuffle-ordinals");
+    assert!(after.is_some(),
+        "shuffle-ordinals should have an after clause");
+    let after_str = after.unwrap();
+    assert!(after_str.contains("set-clean-count"),
+        "shuffle-ordinals should depend on set-clean-count, got: {}", after_str);
+    // It should NOT depend on set-base-count (that comes after extraction)
+    assert!(!after_str.contains("set-base-count"),
+        "shuffle-ordinals should not depend on set-base-count, got: {}", after_str);
 }
 
 #[test]

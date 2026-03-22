@@ -122,13 +122,18 @@ pub fn build_pipeline_command() -> Command {
 
                 if opt.type_name == "Path" {
                     arg = arg.value_hint(ValueHint::AnyPath);
-                    // Path options get file completion (data files) plus variable completion.
-                    arg = arg.add(ArgValueCompleter::new(datafile_completer));
+                    // Path options get combined file + variable completion.
+                    // Only one ArgValueCompleter can be attached per arg (last
+                    // wins), so we merge both into a single closure.
+                    arg = arg.add(ArgValueCompleter::new(|current: &OsStr| {
+                        let mut candidates = datafile_completer(current);
+                        candidates.extend(variable_completer(current));
+                        candidates
+                    }));
+                } else {
+                    // Non-path options get variable completion only.
+                    arg = arg.add(ArgValueCompleter::new(variable_completer));
                 }
-
-                // Add variable completion so tab-completion suggests
-                // '${variables:name}' from variables.yaml.
-                arg = arg.add(ArgValueCompleter::new(variable_completer));
 
                 sub_cmd = sub_cmd.arg(arg);
             }
@@ -312,7 +317,21 @@ pub fn datafile_completer(current: &OsStr) -> Vec<CompletionCandidate> {
             candidates.push(CompletionCandidate::new(display)
                 .help(Some("directory".into())));
         } else if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-            if DATA_EXTENSIONS.iter().any(|de| de.eq_ignore_ascii_case(ext)) {
+            // Check direct extension match, or for .gz files check the
+            // inner extension (e.g. "foo.ivec.gz" → inner ext "ivec").
+            let is_data = if DATA_EXTENSIONS.iter().any(|de| de.eq_ignore_ascii_case(ext)) {
+                true
+            } else if ext.eq_ignore_ascii_case("gz") {
+                // Check inner extension: strip .gz and look at what's underneath
+                std::path::Path::new(path.file_stem().unwrap_or_default())
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(|inner| DATA_EXTENSIONS.iter().any(|de| de.eq_ignore_ascii_case(inner)))
+                    .unwrap_or(false)
+            } else {
+                false
+            };
+            if is_data {
                 let display = format!("{}{}", dir_str, name_str);
                 let help = format!(".{} file", ext);
                 candidates.push(CompletionCandidate::new(display)
@@ -661,7 +680,7 @@ pub fn run_direct(args: Vec<String>) {
         threads,
         step_id: String::new(),
         governor,
-        ui: crate::ui::auto_ui_handle(),
+        ui: crate::ui::UiHandle::new(std::sync::Arc::new(crate::ui::PlainSink::new())),
         status_interval: std::time::Duration::from_secs(1),
     };
 
@@ -729,14 +748,21 @@ pub fn run_direct(args: Vec<String>) {
     // screen and is lost when the ratatui sink is dropped.
     drop(ctx);
 
-    println!("[{}] {}", result.status, result.message);
+    if result.status == super::command::Status::Error {
+        eprintln!("ERROR: {}", result.message);
+    } else {
+        println!("{}", result.message);
+    }
     if !result.produced.is_empty() {
         println!("Produced:");
         for p in &result.produced {
             println!("  {}", p.display());
         }
     }
-    println!("Elapsed: {:.2?}", result.elapsed);
+    // Only show elapsed when it's non-trivial (>100ms)
+    if result.elapsed.as_millis() >= 100 {
+        println!("Elapsed: {:.2?}", result.elapsed);
+    }
 
     if result.status == super::command::Status::Error {
         std::process::exit(1);

@@ -15,9 +15,10 @@ use vectordata::VectorReader;
 use vectordata::io::MmapVectorReader;
 
 use crate::pipeline::command::{
-    CommandDoc, CommandOp, CommandResult, OptionDesc, Options, ResourceDesc, Status, StreamContext,
+    CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options, ResourceDesc, Status, StreamContext,
     render_options_table,
 };
+use crate::pipeline::element_type::ElementType;
 
 /// Pipeline command: select a vector by ordinal.
 pub struct AnalyzeSelectOp;
@@ -87,18 +88,80 @@ impl CommandOp for AnalyzeSelectOp {
         let format = options.get("format").unwrap_or("text");
         let input_path = resolve_path(input_str, &ctx.workspace);
 
-        let ext = input_path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("");
+        let etype = match ElementType::from_path(&input_path) {
+            Ok(t) => t,
+            Err(e) => return error_result(e, start),
+        };
 
-        match ext {
-            "fvec" => select_fvec(&input_path, ordinal, format, start),
-            "ivec" => select_ivec(&input_path, ordinal, format, start),
-            _ => error_result(
-                format!("unsupported file extension: '{}'. Use fvec or ivec", ext),
+        // Open reader and extract (count, dim, get_f64_fn) based on element type.
+        let (count, dim, get_f64): (usize, usize, Box<dyn Fn(usize) -> Vec<f64> + Sync>) = match etype {
+            ElementType::F32 => {
+                let r = match MmapVectorReader::<f32>::open_fvec(&input_path) {
+                    Ok(r) => r, Err(e) => return error_result(format!("open: {}", e), start),
+                };
+                let fc = VectorReader::<f32>::count(&r);
+                let d = VectorReader::<f32>::dim(&r);
+                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
+            }
+            ElementType::F16 => {
+                let r = match MmapVectorReader::<half::f16>::open_mvec(&input_path) {
+                    Ok(r) => r, Err(e) => return error_result(format!("open: {}", e), start),
+                };
+                let fc = VectorReader::<half::f16>::count(&r);
+                let d = VectorReader::<half::f16>::dim(&r);
+                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|v| v.to_f64()).collect()))
+            }
+            ElementType::F64 => {
+                let r = match MmapVectorReader::<f64>::open_dvec(&input_path) {
+                    Ok(r) => r, Err(e) => return error_result(format!("open: {}", e), start),
+                };
+                let fc = VectorReader::<f64>::count(&r);
+                let d = VectorReader::<f64>::dim(&r);
+                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default()))
+            }
+            ElementType::I32 => {
+                let r = match MmapVectorReader::<i32>::open_ivec(&input_path) {
+                    Ok(r) => r, Err(e) => return error_result(format!("open: {}", e), start),
+                };
+                let fc = VectorReader::<i32>::count(&r);
+                let d = VectorReader::<i32>::dim(&r);
+                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
+            }
+            ElementType::I16 => {
+                let r = match MmapVectorReader::<i16>::open_svec(&input_path) {
+                    Ok(r) => r, Err(e) => return error_result(format!("open: {}", e), start),
+                };
+                let fc = VectorReader::<i16>::count(&r);
+                let d = VectorReader::<i16>::dim(&r);
+                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
+            }
+            ElementType::U8 | ElementType::I8 => {
+                let r = match MmapVectorReader::<u8>::open_bvec(&input_path) {
+                    Ok(r) => r, Err(e) => return error_result(format!("open: {}", e), start),
+                };
+                let fc = VectorReader::<u8>::count(&r);
+                let d = VectorReader::<u8>::dim(&r);
+                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
+            }
+        };
+
+        if ordinal >= count {
+            return error_result(
+                format!("ordinal {} out of range (file has {} vectors)", ordinal, count),
                 start,
-            ),
+            );
+        }
+
+        let vec = get_f64(ordinal);
+        let type_name = format!("{}[{}]", etype, dim);
+        let output = format_vector(&type_name, &vec, format, ordinal);
+        log::info!("{}", output);
+
+        CommandResult {
+            status: Status::Ok,
+            message: format!("selected {} vector at ordinal {}", etype, ordinal),
+            produced: vec![],
+            elapsed: start.elapsed(),
         }
     }
 
@@ -110,82 +173,25 @@ impl CommandOp for AnalyzeSelectOp {
                 required: true,
                 default: None,
                 description: "Vector file to read from".to_string(),
-            },
+                        role: OptionRole::Input,
+        },
             OptionDesc {
                 name: "ordinal".to_string(),
                 type_name: "int".to_string(),
                 required: true,
                 default: None,
                 description: "0-based index of the vector to retrieve".to_string(),
-            },
+                        role: OptionRole::Config,
+        },
             OptionDesc {
                 name: "format".to_string(),
                 type_name: "enum".to_string(),
                 required: false,
                 default: Some("text".to_string()),
                 description: "Output format: text, csv, json".to_string(),
-            },
+                        role: OptionRole::Config,
+        },
         ]
-    }
-}
-
-fn select_fvec(path: &Path, ordinal: usize, format: &str, start: Instant) -> CommandResult {
-    let reader = match MmapVectorReader::<f32>::open_fvec(path) {
-        Ok(r) => r,
-        Err(e) => return error_result(format!("failed to open {}: {}", path.display(), e), start),
-    };
-
-    let count = <MmapVectorReader<f32> as VectorReader<f32>>::count(&reader);
-    if ordinal >= count {
-        return error_result(
-            format!("ordinal {} out of range (file has {} vectors)", ordinal, count),
-            start,
-        );
-    }
-
-    let vec = match reader.get(ordinal) {
-        Ok(v) => v,
-        Err(e) => return error_result(format!("read error: {}", e), start),
-    };
-
-    let output = format_vector("float[]", &vec, format, ordinal);
-    log::info!("{}", output);
-
-    CommandResult {
-        status: Status::Ok,
-        message: format!("selected float vector at ordinal {}", ordinal),
-        produced: vec![],
-        elapsed: start.elapsed(),
-    }
-}
-
-fn select_ivec(path: &Path, ordinal: usize, format: &str, start: Instant) -> CommandResult {
-    let reader = match MmapVectorReader::<i32>::open_ivec(path) {
-        Ok(r) => r,
-        Err(e) => return error_result(format!("failed to open {}: {}", path.display(), e), start),
-    };
-
-    let count = <MmapVectorReader<i32> as VectorReader<i32>>::count(&reader);
-    if ordinal >= count {
-        return error_result(
-            format!("ordinal {} out of range (file has {} vectors)", ordinal, count),
-            start,
-        );
-    }
-
-    let vec = match reader.get(ordinal) {
-        Ok(v) => v,
-        Err(e) => return error_result(format!("read error: {}", e), start),
-    };
-
-    let output = format_vector("int[]", &vec, format, ordinal);
-    log::info!("{}", output);
-
-    CommandResult {
-        status: Status::Ok,
-        message: format!("selected int vector at ordinal {}", ordinal),
-        produced: vec![],
-        elapsed: start.elapsed(),
     }
 }
 

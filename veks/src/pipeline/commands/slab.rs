@@ -16,8 +16,8 @@ use std::time::Instant;
 use slabtastic::{OpenProgress, SlabReader, SlabWriter, WriterConfig};
 
 use crate::pipeline::command::{
-    ArtifactManifest, CommandDoc, CommandOp, CommandResult, OptionDesc, Options, ResourceDesc,
-    Status, StreamContext, render_options_table,
+    ArtifactManifest, CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options,
+    ResourceDesc, Status, StreamContext, render_options_table,
 };
 
 // -- Slab Import --------------------------------------------------------------
@@ -152,11 +152,11 @@ metadata records with vector ordinals.
 
     fn describe_options(&self) -> Vec<OptionDesc> {
         vec![
-            opt("from", "Path", true, None, "Source file path"),
-            opt("to", "Path", true, None, "Target slab file path"),
-            opt("format", "enum", false, Some("text"), "Source format: text, cstrings"),
-            opt("page-size", "int", false, Some("65536"), "Preferred page size"),
-            opt("force", "bool", false, Some("false"), "Overwrite existing target"),
+            opt("from", "Path", true, None, "Source file path", OptionRole::Input),
+            opt("to", "Path", true, None, "Target slab file path", OptionRole::Output),
+            opt("format", "enum", false, Some("text"), "Source format: text, cstrings", OptionRole::Config),
+            opt("page-size", "int", false, Some("65536"), "Preferred page size", OptionRole::Config),
+            opt("force", "bool", false, Some("false"), "Overwrite existing target", OptionRole::Config),
         ]
     }
 }
@@ -336,9 +336,9 @@ for debugging predicate or metadata issues during pipeline development.
 
     fn describe_options(&self) -> Vec<OptionDesc> {
         vec![
-            opt("input", "Path", true, None, "Source slab file"),
-            opt("to", "Path", false, None, "Output file (stdout if omitted)"),
-            opt("format", "enum", false, Some("text"), "Output format: text, hex, raw, json"),
+            opt("input", "Path", true, None, "Source slab file", OptionRole::Input),
+            opt("to", "Path", false, None, "Output file (stdout if omitted)", OptionRole::Output),
+            opt("format", "enum", false, Some("text"), "Output format: text, hex, raw, json", OptionRole::Config),
         ]
     }
 }
@@ -474,9 +474,9 @@ datasets where a full re-import would be prohibitively expensive.
 
     fn describe_options(&self) -> Vec<OptionDesc> {
         vec![
-            opt("target", "Path", true, None, "Target slab file to append to"),
-            opt("from", "Path", true, None, "Source slab file"),
-            opt("page-size", "int", false, Some("65536"), "Preferred page size"),
+            opt("target", "Path", true, None, "Target slab file to append to", OptionRole::Output),
+            opt("from", "Path", true, None, "Source slab file", OptionRole::Input),
+            opt("page-size", "int", false, Some("65536"), "Preferred page size", OptionRole::Config),
         ]
     }
 }
@@ -618,10 +618,10 @@ production queries where page I/O efficiency matters.
 
     fn describe_options(&self) -> Vec<OptionDesc> {
         vec![
-            opt("source", "Path", true, None, "Source slab file"),
-            opt("dest", "Path", true, None, "Destination slab file"),
-            opt("page-size", "int", false, Some("65536"), "Preferred page size"),
-            opt("force", "bool", false, Some("false"), "Overwrite existing dest"),
+            opt("source", "Path", true, None, "Source slab file", OptionRole::Input),
+            opt("dest", "Path", true, None, "Destination slab file", OptionRole::Output),
+            opt("page-size", "int", false, Some("65536"), "Preferred page size", OptionRole::Config),
+            opt("force", "bool", false, Some("false"), "Overwrite existing dest", OptionRole::Config),
         ]
     }
 }
@@ -758,8 +758,8 @@ attempt to read from a corrupted file.
 
     fn describe_options(&self) -> Vec<OptionDesc> {
         vec![
-            opt("input", "Path", true, None, "Slab file to check"),
-            opt("verbose", "bool", false, Some("false"), "Show per-page details"),
+            opt("input", "Path", true, None, "Slab file to check", OptionRole::Input),
+            opt("verbose", "bool", false, Some("false"), "Show per-page details", OptionRole::Config),
         ]
     }
 }
@@ -892,9 +892,9 @@ metadata indices, and raw metadata records.
 
     fn describe_options(&self) -> Vec<OptionDesc> {
         vec![
-            opt("input", "Path", true, None, "Slab file"),
-            opt("ordinals", "String", true, None, "Comma-separated ordinals or ranges (e.g. 0,1,5..10)"),
-            opt("format", "enum", false, Some("text"), "Output format: text, hex, raw"),
+            opt("input", "Path", true, None, "Slab file", OptionRole::Input),
+            opt("ordinals", "String", true, None, "Comma-separated ordinals or ranges (e.g. 0,1,5..10)", OptionRole::Config),
+            opt("format", "enum", false, Some("text"), "Output format: text, hex, raw", OptionRole::Config),
         ]
     }
 }
@@ -1102,7 +1102,7 @@ produced the expected number of records and ordinal range.
 
     fn describe_options(&self) -> Vec<OptionDesc> {
         vec![
-            opt("input", "Path", true, None, "Slab file to analyze"),
+            opt("input", "Path", true, None, "Slab file to analyze", OptionRole::Input),
         ]
     }
 }
@@ -1254,8 +1254,8 @@ changes to the slabtastic writer.
 
     fn describe_options(&self) -> Vec<OptionDesc> {
         vec![
-            opt("input", "Path", true, None, "Slab file"),
-            opt("pages", "String", false, None, "Comma-separated page indices to display"),
+            opt("input", "Path", true, None, "Slab file", OptionRole::Input),
+            opt("pages", "String", false, None, "Comma-separated page indices to display", OptionRole::Config),
         ]
     }
 }
@@ -1355,7 +1355,7 @@ useful for orienting yourself when working with an unfamiliar slab file.
 
     fn describe_options(&self) -> Vec<OptionDesc> {
         vec![
-            opt("input", "Path", true, None, "Slab file"),
+            opt("input", "Path", true, None, "Slab file", OptionRole::Input),
         ]
     }
 }
@@ -1492,10 +1492,10 @@ will operate on.
 
     fn describe_options(&self) -> Vec<OptionDesc> {
         vec![
-            opt("input", "Path", true, None, "Slab file"),
-            opt("ordinals", "String", true, None, "Comma-separated ordinals or ranges (e.g. 0,1,5..10)"),
-            opt("codec", "enum", false, Some("auto"), "Codec: auto, mnode, pnode"),
-            opt("format", "enum", false, Some("cddl"), "Vernacular format: cddl, sql, cql, json, jsonl, yaml, readout, display"),
+            opt("input", "Path", true, None, "Slab file", OptionRole::Input),
+            opt("ordinals", "String", true, None, "Comma-separated ordinals or ranges (e.g. 0,1,5..10)", OptionRole::Config),
+            opt("codec", "enum", false, Some("auto"), "Codec: auto, mnode, pnode", OptionRole::Config),
+            opt("format", "enum", false, Some("cddl"), "Vernacular format: cddl, sql, cql, json, jsonl, yaml, readout, display", OptionRole::Config),
         ]
     }
 }
@@ -1584,7 +1584,7 @@ predicates` steps have the schema and cardinality information they need.
 
         let output_path = options.get("output").map(|s| resolve_path(s, &ctx.workspace));
 
-        let survey = match survey_slab(&input_path, max_samples, max_distinct) {
+        let survey = match survey_slab(&input_path, max_samples, max_distinct, Some(&ctx.ui)) {
             Ok(s) => s,
             Err(e) => return error_result(e, start),
         };
@@ -1695,10 +1695,38 @@ predicates` steps have the schema and cardinality information they need.
 
     fn describe_options(&self) -> Vec<OptionDesc> {
         vec![
-            opt("input", "Path", true, None, "Slab file to survey"),
-            opt("output", "Path", false, None, "Optional JSON output file for survey results"),
-            opt("samples", "int", false, Some("1000"), "Max records to sample"),
-            opt("max-distinct", "int", false, Some("20"), "Max distinct values tracked per field"),
+            OptionDesc {
+                name: "input".to_string(),
+                type_name: "Path".to_string(),
+                required: true,
+                default: None,
+                description: "Slab file to survey".to_string(),
+                role: OptionRole::Input,
+            },
+            OptionDesc {
+                name: "output".to_string(),
+                type_name: "Path".to_string(),
+                required: false,
+                default: None,
+                description: "Optional JSON output file for survey results".to_string(),
+                role: OptionRole::Output,
+            },
+            OptionDesc {
+                name: "samples".to_string(),
+                type_name: "int".to_string(),
+                required: false,
+                default: Some("1000".to_string()),
+                description: "Max records to sample".to_string(),
+                role: OptionRole::Config,
+            },
+            OptionDesc {
+                name: "max-distinct".to_string(),
+                type_name: "int".to_string(),
+                required: false,
+                default: Some("20".to_string()),
+                description: "Max distinct values tracked per field".to_string(),
+                role: OptionRole::Config,
+            },
         ]
     }
 
@@ -1857,6 +1885,7 @@ pub(crate) fn survey_slab(
     path: &Path,
     max_samples: usize,
     max_distinct: usize,
+    ui: Option<&crate::ui::UiHandle>,
 ) -> Result<SurveyResult, String> {
     let reader = open_slab(path)
         .map_err(|e| format!("failed to open {}: {}", path.display(), e))?;
@@ -1901,6 +1930,9 @@ pub(crate) fn survey_slab(
     let sample_page_count = sample_indices.len();
     let survey_start = std::time::Instant::now();
     let mut last_report = std::time::Instant::now();
+
+    // Create a progress bar if a UI handle was provided
+    let pb = ui.map(|u| u.bar_with_unit(max_samples as u64, "surveying slab records", "records"));
 
     'outer: for (progress_idx, &page_idx) in sample_indices.iter().enumerate() {
         if progress_idx > 0
@@ -1957,9 +1989,13 @@ pub(crate) fn survey_slab(
                 }
             }
             sampled += 1;
+            if sampled % 100_000 == 0 {
+                if let Some(ref p) = pb { p.set_position(sampled as u64); }
+            }
         }
     }
 
+    if let Some(ref p) = pb { p.finish(); }
     log::info!("survey: complete, {} records sampled", sampled);
 
     Ok(SurveyResult {
@@ -2200,14 +2236,15 @@ fn error_result(message: String, start: Instant) -> CommandResult {
     }
 }
 
-fn opt(name: &str, type_name: &str, required: bool, default: Option<&str>, desc: &str) -> OptionDesc {
+fn opt(name: &str, type_name: &str, required: bool, default: Option<&str>, desc: &str, role: OptionRole) -> OptionDesc {
     OptionDesc {
         name: name.to_string(),
         type_name: type_name.to_string(),
         required,
         default: default.map(|s| s.to_string()),
         description: desc.to_string(),
-    }
+        role,
+}
 }
 
 // -- Tests --------------------------------------------------------------------

@@ -133,9 +133,9 @@ pub fn run(args: PublishArgs) {
         .sum();
 
     // Present summary and get confirmation
-    println!("Publish summary:");
+    println!("{}", crate::term::bold("Publish summary:"));
     println!("  Source:      {}", directory.display());
-    println!("  Destination: {}", s3_url);
+    println!("  Destination: {}", crate::term::info(&s3_url));
     println!("  Files:       {} to sync, {} total",
         publishable.len(),
         format_size(total_size),
@@ -156,7 +156,7 @@ pub fn run(args: PublishArgs) {
         println!();
     } else if !args.yes {
         // Interactive confirmation
-        if !atty::is(atty::Stream::Stdin) {
+        if !crate::term::is_interactive() {
             eprintln!("Error: stdin is not a TTY. Use -y to skip confirmation.");
             std::process::exit(3);
         }
@@ -247,14 +247,17 @@ fn enumerate_recursive(root: &Path, dir: &Path, files: &mut Vec<PathBuf>) {
         let name_str = name.to_string_lossy();
 
         if path.is_dir() {
-            // All hidden directories are local state — never publish
-            if name_str.starts_with('.') || name_str == "__pycache__" {
+            // Hidden (dot-prefix) and local (underscore-prefix) directories
+            // are never published
+            if name_str.starts_with('.') || name_str.starts_with('_') || name_str == "__pycache__" {
                 continue;
             }
             enumerate_recursive(root, &path, files);
         } else {
-            // All hidden files are local state — never publish
+            // Hidden files (dot-prefix) and local workspace files
+            // (underscore-prefix) are never published
             if name_str.starts_with('.')
+                || name_str.starts_with('_')
                 || name_str.ends_with(".tmp")
                 || name_str.ends_with(".partial")
                 || name_str.ends_with(".pyc")

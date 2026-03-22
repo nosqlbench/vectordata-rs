@@ -5,14 +5,14 @@
 //!
 //! Uses a multi-phase external sort with adaptive prefix keys:
 //!
-//! 1. **Variance sampling** — sparse sample to determine how many leading
-//!    vector components (1–10) are needed to distinguish vectors. High
-//!    variance in the norm means fewer prefix components suffice.
+//! 1. **Dimension sampling** — sparse sample to determine how many leading
+//!    vector components (1–10) are needed to distinguish vectors. Measures
+//!    per-dimension distinctness in the sample.
 //!
-//! 2. **Sorted run creation** — process input in batches, compute a
-//!    composite sort key (norm + prefix components), sort in-memory, and
-//!    write intermediate sorted runs to cache. Each run record is
-//!    `(ordinal:u32, prefix[0..N]:f32)`.
+//! 2. **Sorted run creation** — process input in batches, sort by
+//!    **lexicographic order of component values** (not norm), and write
+//!    intermediate sorted runs to cache. Each run record is
+//!    `(ordinal:u32, prefix[0..N]:f32)`. Runs are cached for resume.
 //!
 //! 3. **K-way streaming merge** — merge all sorted runs using prefix
 //!    components for comparison. Only when two adjacent entries have
@@ -25,7 +25,7 @@
 
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -34,8 +34,8 @@ use vectordata::VectorReader;
 use vectordata::io::MmapVectorReader;
 
 use crate::pipeline::command::{
-    ArtifactManifest, CommandDoc, CommandOp, CommandResult, OptionDesc, Options, ResourceDesc,
-    Status, StreamContext, render_options_table,
+    ArtifactManifest, CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options,
+    ResourceDesc, Status, StreamContext, render_options_table,
 };
 
 // ---------------------------------------------------------------------------
@@ -150,10 +150,10 @@ struct RunRecord {
 }
 
 impl RunRecord {
-    /// Compare by prefix components (total order via bit patterns).
+    /// Compare by prefix components using total lexicographic order.
     fn cmp_prefix(&self, other: &RunRecord) -> Ordering {
         for (a, b) in self.prefix.iter().zip(other.prefix.iter()) {
-            let ord = a.to_bits().cmp(&b.to_bits());
+            let ord = float_to_sortable(*a).cmp(&float_to_sortable(*b));
             if ord != Ordering::Equal {
                 return ord;
             }
@@ -166,7 +166,7 @@ impl RunRecord {
     fn prefix_eq(&self, other: &RunRecord) -> bool {
         self.prefix.len() == other.prefix.len()
             && self.prefix.iter().zip(other.prefix.iter())
-                .all(|(a, b)| a.to_bits() == b.to_bits())
+                .all(|(a, b)| float_to_sortable(*a) == float_to_sortable(*b))
     }
 
     /// Write to a buffered writer.
@@ -247,16 +247,17 @@ index** (ivec file) rather than a materialized vector copy.
 
 ### How It Works
 
-1. **Variance sampling** — reads a sparse sample of vectors to estimate
-   how many leading components (1–10) are needed to distinguish most
-   vectors. High variance in the norm means fewer prefix components
-   suffice; low variance means more are needed.
+1. **Dimension sampling** — reads a sparse sample of vectors to determine
+   how many leading dimensions (1–10) are needed to distinguish most
+   vectors. Measures per-dimension distinctness: if the first dimension
+   alone separates 90%+ of the sample, one prefix component suffices.
 
 2. **Sorted run creation** — processes the input in configurable batches
-   (default 1M vectors). For each batch, computes a composite sort key
-   from the L2 norm and the adaptive prefix, sorts in-memory, and writes
-   a sorted run file to the cache directory. Each run record stores only
-   `(ordinal, prefix[0..N])` — not the full vector.
+   (default 1M vectors). For each batch, sorts by **lexicographic order
+   of component values** (dim 0 first, then dim 1, etc.), and writes
+   a sorted run file to the cache directory. Each run record stores
+   `(ordinal, prefix[0..N])` — not the full vector. Run files are
+   preserved in `.cache/dedup_runs/` for resume across interrupted runs.
 
 3. **K-way streaming merge** — opens all sorted run files and merges them
    using a min-heap over prefix keys. Adjacent entries with identical
@@ -267,6 +268,15 @@ index** (ivec file) rather than a materialized vector copy.
 4. **Output** — the merged ordinal sequence (with duplicates optionally
    elided) is written as an ivec file. A JSON report records total,
    unique, and duplicate counts plus the prefix width chosen.
+
+### Lexicographic Ordering
+
+The output index is sorted by component values in lexicographic order,
+not by norm. This means:
+- **Zero vectors sort first** (all components are 0)
+- **Binary search** for any specific vector is O(log N)
+- **Exact duplicates are always adjacent**
+- The index can answer "does vector X exist in this dataset?"
 
 ### Role in the Pipeline
 
@@ -305,6 +315,15 @@ shuffle, KNN, or metadata alignment. The output index can be fed to
         let report_str = options.get("report")
             .map(|s| s.to_string())
             .unwrap_or(report_default);
+        let duplicates_default = {
+            let p = PathBuf::from(&output_str);
+            let stem = p.file_stem().unwrap_or_default().to_string_lossy();
+            let dir = p.parent().unwrap_or(Path::new("."));
+            dir.join(format!("{}_duplicates.ivec", stem)).to_string_lossy().to_string()
+        };
+        let duplicates_str = options.get("duplicates")
+            .map(|s| s.to_string())
+            .unwrap_or(duplicates_default);
         let elide = options.get("elide")
             .map(|s| s != "false")
             .unwrap_or(true);
@@ -314,6 +333,7 @@ shuffle, KNN, or metadata alignment. The output index can be fed to
         let source_path = resolve_path(source_str, &ctx.workspace);
         let output_path = resolve_path(output_str, &ctx.workspace);
         let report_path = resolve_path(&report_str, &ctx.workspace);
+        let duplicates_path = resolve_path(&duplicates_str, &ctx.workspace);
 
         // Open source vectors (auto-detect f32/f16 from extension)
         let reader = match VecReader::open(&source_path) {
@@ -427,9 +447,10 @@ shuffle, KNN, or metadata alignment. The output index can be fed to
         ensure_parent(&output_path);
         ensure_parent(&report_path);
 
+        ensure_parent(&duplicates_path);
         let (unique_count, dup_count) = match merge_runs(
             &run_files, prefix_width, &reader, dim, elide,
-            &output_path, count, ctx,
+            &output_path, &duplicates_path, count, ctx,
         ) {
             Ok(counts) => counts,
             Err(e) => return error_result(e, start),
@@ -449,11 +470,8 @@ shuffle, KNN, or metadata alignment. The output index can be fed to
             return error_result(format!("failed to write report: {}", e), start);
         }
 
-        // Clean up intermediate run files
-        for f in &run_files {
-            let _ = std::fs::remove_file(f);
-        }
-        let _ = std::fs::remove_dir(&run_dir);
+        // Run files are kept in .cache/dedup_runs/ for resume on re-run.
+        // They are cleaned up by `veks run --clean` or manual cache deletion.
 
         let total_elapsed = start.elapsed();
         let total_secs = total_elapsed.as_secs_f64();
@@ -480,7 +498,7 @@ shuffle, KNN, or metadata alignment. The output index can be fed to
         CommandResult {
             status: Status::Ok,
             message: msg,
-            produced: vec![output_path, report_path],
+            produced: vec![output_path, duplicates_path, report_path],
             elapsed: total_elapsed,
         }
     }
@@ -493,44 +511,60 @@ shuffle, KNN, or metadata alignment. The output index can be fed to
                 required: true,
                 default: None,
                 description: "Input fvec file".to_string(),
-            },
+                role: OptionRole::Input,
+        },
             OptionDesc {
                 name: "output".to_string(),
                 type_name: "Path".to_string(),
                 required: true,
                 default: None,
                 description: "Output ivec file (sorted ordinal index)".to_string(),
-            },
+                role: OptionRole::Output,
+        },
+            OptionDesc {
+                name: "duplicates".to_string(),
+                type_name: "Path".to_string(),
+                required: false,
+                default: Some("<output>_duplicates.ivec".to_string()),
+                description: "Output ivec file containing ordinals of duplicate vectors".to_string(),
+                role: OptionRole::Output,
+        },
             OptionDesc {
                 name: "report".to_string(),
                 type_name: "Path".to_string(),
                 required: false,
                 default: Some("<output>.json".to_string()),
                 description: "JSON report with duplicate statistics".to_string(),
-            },
+                role: OptionRole::Output,
+        },
             OptionDesc {
                 name: "elide".to_string(),
                 type_name: "bool".to_string(),
                 required: false,
                 default: Some("true".to_string()),
                 description: "Remove duplicates from the output index".to_string(),
-            },
+                role: OptionRole::Config,
+        },
             OptionDesc {
                 name: "batch-size".to_string(),
                 type_name: "integer".to_string(),
                 required: false,
                 default: Some(DEFAULT_BATCH_SIZE.to_string()),
                 description: "Vectors per sorted run".to_string(),
-            },
+                role: OptionRole::Config,
+        },
         ]
     }
 
     fn project_artifacts(&self, step_id: &str, options: &Options) -> ArtifactManifest {
-        crate::pipeline::command::manifest_from_keys(
+        let mut manifest = crate::pipeline::command::manifest_from_keys(
             step_id, self.command_path(), options,
             &["source"],
-            &["output", "report"],
-        )
+            &["output", "duplicates", "report"],
+        );
+        // Sorted run files in .cache/dedup_runs/ are intermediate artifacts
+        manifest.intermediates.push("${cache}/dedup_runs/".to_string());
+        manifest
     }
 }
 
@@ -541,10 +575,11 @@ shuffle, KNN, or metadata alignment. The output index can be fed to
 /// Sample vectors and choose how many prefix components (1–10) to retain
 /// in sorted run records.
 ///
-/// Strategy: compute the coefficient of variation (CV = stddev/mean) of
-/// the L2 norm across the sample. High CV means the norm alone separates
-/// vectors well → fewer prefix components. Low CV means vectors cluster
-/// tightly in norm space → more prefix components for disambiguation.
+/// Strategy: for each leading dimension, compute the number of distinct
+/// values in the sample. As soon as a dimension has enough distinct values
+/// to separate the sample (≥ 90% unique among sampled values), that many
+/// prefix components suffice. If early dimensions are low-cardinality
+/// (e.g., quantized or categorical), more dimensions are needed.
 fn sample_prefix_width(
     reader: &VecReader,
     count: usize,
@@ -554,91 +589,99 @@ fn sample_prefix_width(
     let sample_count = std::cmp::min(VARIANCE_SAMPLE_SIZE, count);
     let step = if count <= sample_count { 1 } else { count / sample_count };
 
-    let mut norms: Vec<f64> = Vec::with_capacity(sample_count);
+    let max_dims = MAX_PREFIX.min(dim);
 
-    let pb = ctx.ui.bar_with_unit(sample_count as u64, "sampling variance", "vectors");
+    // Collect sampled vectors (first max_dims components each)
+    let mut samples: Vec<Vec<f32>> = Vec::with_capacity(sample_count);
+
+    let pb = ctx.ui.bar_with_unit(sample_count as u64, "sampling dimensions", "vectors");
     let mut sampled = 0usize;
     let mut i = 0usize;
     while i < count && sampled < sample_count {
         if let Ok(vec) = reader.get_f32(i) {
-            let mut sum = 0.0f64;
-            for &v in &vec {
-                let vf = v as f64;
-                sum += vf * vf;
-            }
-            norms.push(sum.sqrt());
+            let prefix: Vec<f32> = vec.iter().take(max_dims).copied().collect();
+            samples.push(prefix);
             sampled += 1;
         }
         i += step;
     }
     pb.finish();
 
-    if norms.len() < 2 {
-        return MAX_PREFIX.min(dim);
+    if samples.len() < 2 {
+        return max_dims;
     }
 
-    let n = norms.len() as f64;
-    let mean = norms.iter().sum::<f64>() / n;
-    let variance = norms.iter().map(|x| (x - mean) * (x - mean)).sum::<f64>() / (n - 1.0);
-    let stddev = variance.sqrt();
-    let cv = if mean.abs() > 1e-12 { stddev / mean.abs() } else { 0.0 };
+    // For each prefix length 1..max_dims, count how many distinct
+    // sort keys exist in the sample. Stop when distinctness ≥ 90%.
+    let threshold = (samples.len() as f64 * 0.90) as usize;
+    let mut chosen_width = max_dims;
 
-    ctx.ui.log(&format!(
-        "  norm stats: mean={:.4}, stddev={:.4}, cv={:.4} (n={})",
-        mean, stddev, cv, norms.len(),
-    ));
+    for width in MIN_PREFIX..=max_dims {
+        let mut keys: Vec<Vec<u32>> = samples.iter()
+            .map(|s| s.iter().take(width).map(|&v| float_to_sortable(v)).collect())
+            .collect();
+        keys.sort();
+        keys.dedup();
+        let distinct = keys.len();
 
-    // Map CV to prefix width:
-    //   CV >= 0.5  → 1 component  (norms spread widely, very discriminating)
-    //   CV ~= 0.25 → 3 components
-    //   CV ~= 0.1  → 5 components
-    //   CV ~= 0.01 → 8 components
-    //   CV < 0.005 → 10 components (nearly identical norms, need many dims)
-    let width = if cv >= 0.50 {
-        1
-    } else if cv >= 0.25 {
-        2
-    } else if cv >= 0.10 {
-        3
-    } else if cv >= 0.05 {
-        5
-    } else if cv >= 0.01 {
-        7
-    } else if cv >= 0.005 {
-        8
-    } else {
-        10
-    };
+        ctx.ui.log(&format!(
+            "  dim prefix {}: {} distinct / {} sampled ({:.1}%)",
+            width, distinct, samples.len(),
+            100.0 * distinct as f64 / samples.len() as f64,
+        ));
 
-    width.max(MIN_PREFIX).min(MAX_PREFIX).min(dim)
+        if distinct >= threshold {
+            chosen_width = width;
+            break;
+        }
+    }
+
+    chosen_width
 }
 
 // ---------------------------------------------------------------------------
 // Phase 1: Create sorted runs
 // ---------------------------------------------------------------------------
 
-/// Build a sort key for one vector: `[norm_bits, prefix_0_bits, ..., prefix_N_bits]`.
-fn build_sort_key(vec: &[f32], prefix_width: usize) -> Vec<u32> {
-    let mut sum = 0.0f64;
-    for &v in vec {
-        let vf = v as f64;
-        sum += vf * vf;
+/// Encode an f32 as a u32 that sorts in the same total order as the float.
+///
+/// IEEE 754 positive floats already sort by bit pattern. For negatives,
+/// the sign bit is set and the magnitude is inverted. This function maps
+/// all f32 values to u32 such that `a < b` iff `float_to_sortable(a) < float_to_sortable(b)`.
+#[inline]
+fn float_to_sortable(f: f32) -> u32 {
+    let bits = f.to_bits();
+    if bits & 0x8000_0000 != 0 {
+        // Negative: flip all bits (sign + magnitude inversion)
+        !bits
+    } else {
+        // Positive (and +0): flip sign bit so positives sort after negatives
+        bits ^ 0x8000_0000
     }
-    let norm = sum.sqrt() as f32;
-
-    let mut key = Vec::with_capacity(1 + prefix_width);
-    key.push(norm.to_bits());
-    for i in 0..prefix_width {
-        if i < vec.len() {
-            key.push(vec[i].to_bits());
-        } else {
-            key.push(0);
-        }
-    }
-    key
 }
 
-/// Create sorted run files from batches of the input.
+/// Build a lexicographic sort key from the full vector components.
+///
+/// The key contains all dimension values encoded as sortable u32s.
+/// This enables binary search for any specific vector and ensures
+/// exact duplicates are always adjacent in sorted order.
+fn build_sort_key(vec: &[f32], _prefix_width: usize) -> Vec<u32> {
+    vec.iter().map(|&v| float_to_sortable(v)).collect()
+}
+
+/// Metadata for a set of sorted runs, used for resume validation.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct RunMeta {
+    count: usize,
+    prefix_width: usize,
+    batch_size: usize,
+    num_runs: u32,
+}
+
+/// Create sorted run files from batches of the input, with resume support.
+///
+/// If valid run files from a previous interrupted attempt exist in `run_dir`
+/// with matching parameters, they are reused. Only missing runs are created.
 fn create_sorted_runs(
     reader: &VecReader,
     count: usize,
@@ -648,7 +691,41 @@ fn create_sorted_runs(
     run_dir: &Path,
     ctx: &mut StreamContext,
 ) -> Result<Vec<PathBuf>, String> {
+    let threads = ctx.governor.current_or("threads", ctx.threads as u64)
+        .max(1) as usize;
+    ctx.ui.log(&format!("  {} threads for parallel read + sort", threads));
+
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build()
+        .ok();
+
+    let expected_runs = ((count + batch_size - 1) / batch_size) as u32;
+
+    // Check for existing runs from a previous attempt
+    let meta_path = run_dir.join("meta.json");
+    let can_resume = if meta_path.exists() {
+        match std::fs::read_to_string(&meta_path) {
+            Ok(content) => match serde_json::from_str::<RunMeta>(&content) {
+                Ok(meta) => {
+                    meta.count == count
+                        && meta.prefix_width == prefix_width
+                        && meta.batch_size == batch_size
+                        && meta.num_runs == expected_runs
+                }
+                Err(_) => false,
+            },
+            Err(_) => false,
+        }
+    } else {
+        false
+    };
+
+    // Record size: 4 bytes ordinal + prefix_width * 4 bytes
+    let record_bytes = 4 + prefix_width * 4;
+
     let mut run_files: Vec<PathBuf> = Vec::new();
+    let mut skipped = 0u32;
     let pb = ctx.ui.bar_with_unit(count as u64, "building runs", "vectors");
 
     let mut batch_start = 0;
@@ -658,48 +735,93 @@ fn create_sorted_runs(
         let batch_end = std::cmp::min(batch_start + batch_size, count);
         let batch_len = batch_end - batch_start;
 
-        // Build (sort_key, RunRecord) for this batch
-        let mut entries: Vec<(Vec<u32>, RunRecord)> = Vec::with_capacity(batch_len);
+        let run_path = run_dir.join(format!("run_{:04}.bin", run_idx));
 
-        for i in batch_start..batch_end {
-            let vec = reader.get_f32(i)?;
-
-            let key = build_sort_key(&vec, prefix_width);
-
-            let mut prefix = Vec::with_capacity(prefix_width);
-            for j in 0..prefix_width {
-                if j < vec.len() {
-                    prefix.push(vec[j]);
-                } else {
-                    prefix.push(0.0);
+        // Resume: skip runs whose .gz file already exists
+        if can_resume && crate::pipeline::gz_cache::gz_exists(&run_path) {
+            // Validate by checking the gzip ISIZE footer matches expected uncompressed size
+            let expected_size = (batch_len * record_bytes) as u32;
+            if let Some(isize_hint) = crate::pipeline::gz_cache::gz_uncompressed_size_hint(&run_path) {
+                if isize_hint == expected_size {
+                    run_files.push(run_path);
+                    run_idx += 1;
+                    skipped += 1;
+                    batch_start = batch_end;
+                    pb.set_position(batch_end as u64);
+                    continue;
                 }
             }
-
-            entries.push((key, RunRecord { ordinal: i as u32, prefix }));
         }
 
-        // Sort batch by composite key
-        entries.sort_by(|a, b| {
-            for (ka, kb) in a.0.iter().zip(b.0.iter()) {
-                let ord = ka.cmp(kb);
-                if ord != Ordering::Equal {
-                    return ord;
-                }
+        // Build (sort_key, RunRecord) for this batch using parallel reads.
+        // Each vector read is independent (mmap random access), and key
+        // computation is pure arithmetic — both parallelize perfectly.
+        let mut entries: Vec<(Vec<u32>, RunRecord)>;
+        {
+            use rayon::prelude::*;
+            use std::sync::atomic::{AtomicU64, Ordering as AtomicOrd};
+
+            let progress = AtomicU64::new(0);
+
+            let build_fn = || {
+                (batch_start..batch_end)
+                    .into_par_iter()
+                    .map(|i| {
+                        let vec = reader.get_f32(i)?;
+                        let key = build_sort_key(&vec, prefix_width);
+                        let prefix: Vec<f32> = vec.iter().take(prefix_width).copied().collect();
+                        let done = progress.fetch_add(1, AtomicOrd::Relaxed) + 1;
+                        if done % 500_000 == 0 {
+                            pb.set_position(batch_start as u64 + done);
+                        }
+                        Ok((key, RunRecord { ordinal: i as u32, prefix }))
+                    })
+                    .collect::<Result<Vec<_>, String>>()
+            };
+
+            let entries_result = if let Some(ref p) = pool {
+                p.install(build_fn)
+            } else {
+                build_fn()
+            };
+
+            entries = match entries_result {
+                Ok(e) => e,
+                Err(e) => return Err(e),
+            };
+        }
+        pb.set_position(batch_end as u64);
+
+        // Parallel sort by composite key (governor-limited thread pool)
+        {
+            use rayon::prelude::*;
+            let sort_sp = ctx.ui.spinner(&format!("sorting run {} ({} entries)", run_idx, batch_len));
+            let sort_fn = |entries: &mut Vec<(Vec<u32>, RunRecord)>| {
+                entries.par_sort_by(|a, b| {
+                    for (ka, kb) in a.0.iter().zip(b.0.iter()) {
+                        let ord = ka.cmp(kb);
+                        if ord != Ordering::Equal {
+                            return ord;
+                        }
+                    }
+                    a.1.ordinal.cmp(&b.1.ordinal)
+                });
+            };
+            if let Some(ref p) = pool {
+                p.install(|| sort_fn(&mut entries));
+            } else {
+                sort_fn(&mut entries);
             }
-            a.1.ordinal.cmp(&b.1.ordinal)
-        });
+            sort_sp.finish();
+        }
 
-        // Write sorted run to disk
-        let run_path = run_dir.join(format!("run_{:04}.bin", run_idx));
-        let file = std::fs::File::create(&run_path)
-            .map_err(|e| format!("failed to create run file: {}", e))?;
-        let mut writer = BufWriter::with_capacity(IO_BUF_SIZE, file);
-
+        // Write sorted run to memory buffer, then compress and save as .gz
+        let mut buf = Vec::with_capacity(batch_len * record_bytes);
         for (_, record) in &entries {
-            record.write_to(&mut writer)
+            record.write_to(&mut buf)
                 .map_err(|e| format!("failed to write run record: {}", e))?;
         }
-        writer.flush().map_err(|e| format!("failed to flush run: {}", e))?;
+        crate::pipeline::gz_cache::save_gz(&run_path, &buf)?;
 
         run_files.push(run_path);
         run_idx += 1;
@@ -714,6 +836,24 @@ fn create_sorted_runs(
     }
     pb.finish();
 
+    if skipped > 0 {
+        ctx.ui.log(&format!(
+            "  resumed: {} of {} runs from cache, {} created fresh",
+            skipped, run_files.len(), run_files.len() as u32 - skipped,
+        ));
+    }
+
+    // Write metadata for future resume
+    let meta = RunMeta {
+        count,
+        prefix_width,
+        batch_size,
+        num_runs: run_files.len() as u32,
+    };
+    if let Ok(json) = serde_json::to_string_pretty(&meta) {
+        let _ = std::fs::write(&meta_path, json);
+    }
+
     Ok(run_files)
 }
 
@@ -723,6 +863,9 @@ fn create_sorted_runs(
 
 /// Merge all sorted run files, streaming through a min-heap.
 ///
+/// Writes the sorted (optionally deduplicated) ordinals to `output_path`
+/// and all duplicate ordinals to `duplicates_path`.
+///
 /// Returns `(unique_count, duplicate_count)`.
 fn merge_runs(
     run_files: &[PathBuf],
@@ -731,20 +874,23 @@ fn merge_runs(
     _dim: usize,
     elide: bool,
     output_path: &Path,
+    duplicates_path: &Path,
     total: usize,
     ctx: &mut StreamContext,
 ) -> Result<(usize, usize), String> {
-    // Open all run files
-    let mut run_readers: Vec<BufReader<std::fs::File>> = Vec::with_capacity(run_files.len());
-    for path in run_files {
-        let file = std::fs::File::open(path)
-            .map_err(|e| format!("failed to open run {}: {}", path.display(), e))?;
-        run_readers.push(BufReader::with_capacity(IO_BUF_SIZE, file));
+    // Decompress all run files into memory, then wrap as cursors for streaming read
+    let mut run_buffers: Vec<std::io::Cursor<Vec<u8>>> = Vec::with_capacity(run_files.len());
+    let decompress_pb = ctx.ui.bar_with_unit(run_files.len() as u64, "loading runs", "files");
+    for (i, path) in run_files.iter().enumerate() {
+        let data = crate::pipeline::gz_cache::load_gz(path)?;
+        run_buffers.push(std::io::Cursor::new(data));
+        decompress_pb.set_position((i + 1) as u64);
     }
+    decompress_pb.finish();
 
     // Initialize the min-heap with the first record from each run
-    let mut heap: BinaryHeap<HeapEntry> = BinaryHeap::with_capacity(run_readers.len());
-    for (idx, rdr) in run_readers.iter_mut().enumerate() {
+    let mut heap: BinaryHeap<HeapEntry> = BinaryHeap::with_capacity(run_buffers.len());
+    for (idx, rdr) in run_buffers.iter_mut().enumerate() {
         if let Some(record) = RunRecord::read_from(rdr, prefix_width)
             .map_err(|e| format!("failed to read run {}: {}", idx, e))?
         {
@@ -752,10 +898,15 @@ fn merge_runs(
         }
     }
 
-    // Open output
+    // Open outputs: sorted ordinals + duplicate ordinals
     let file = std::fs::File::create(output_path)
         .map_err(|e| format!("failed to create output: {}", e))?;
     let mut out = BufWriter::with_capacity(IO_BUF_SIZE, file);
+
+    ensure_parent(duplicates_path);
+    let dup_file = std::fs::File::create(duplicates_path)
+        .map_err(|e| format!("failed to create duplicates file: {}", e))?;
+    let mut dup_out = BufWriter::with_capacity(IO_BUF_SIZE, dup_file);
 
     let pb = ctx.ui.bar_with_unit(total as u64, "merging", "vectors");
 
@@ -769,7 +920,7 @@ fn merge_runs(
         let run_idx = entry.run_idx;
 
         // Refill from the same run
-        if let Some(next) = RunRecord::read_from(&mut run_readers[run_idx], prefix_width)
+        if let Some(next) = RunRecord::read_from(&mut run_buffers[run_idx], prefix_width)
             .map_err(|e| format!("failed to read run {}: {}", run_idx, e))?
         {
             heap.push(HeapEntry { record: next, run_idx });
@@ -789,8 +940,11 @@ fn merge_runs(
 
         if is_dup {
             dup_count += 1;
+            // Always write duplicate ordinals to the duplicates file
+            write_ivec_record(&mut dup_out, record.ordinal)
+                .map_err(|e| format!("dup write error: {}", e))?;
             if !elide {
-                // Still emit the ordinal even though it's a duplicate
+                // Also emit to the main sorted output when not eliding
                 write_ivec_record(&mut out, record.ordinal)
                     .map_err(|e| format!("write error: {}", e))?;
             }
@@ -810,6 +964,7 @@ fn merge_runs(
 
     pb.finish();
     out.flush().map_err(|e| format!("flush error: {}", e))?;
+    dup_out.flush().map_err(|e| format!("dup flush error: {}", e))?;
 
     Ok((unique_count, dup_count))
 }

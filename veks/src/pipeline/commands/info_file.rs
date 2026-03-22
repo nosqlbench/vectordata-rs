@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::pipeline::command::{
-    CommandDoc, CommandOp, CommandResult, OptionDesc, Options, Status, StreamContext,
+    CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options, Status, StreamContext,
     render_options_table,
 };
 
@@ -305,14 +305,16 @@ subtle errors in later pipeline steps.
                 required: true,
                 default: None,
                 description: "Vector file to inspect".to_string(),
-            },
+                        role: OptionRole::Input,
+        },
             OptionDesc {
                 name: "sample".to_string(),
                 type_name: "int".to_string(),
                 required: false,
                 default: Some("0".to_string()),
                 description: "Number of sample vectors to display".to_string(),
-            },
+                        role: OptionRole::Config,
+        },
         ]
     }
 }

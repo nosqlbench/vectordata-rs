@@ -18,6 +18,7 @@
 
 pub mod catalog;
 pub mod config;
+pub mod expansion;
 pub mod facet;
 pub mod pipeline;
 pub mod profile;
@@ -25,6 +26,7 @@ pub mod source;
 
 pub use catalog::{CatalogEntry, CatalogLayout, find_catalog, load_catalog};
 pub use config::{DatasetAttributes, DatasetConfig};
+pub use expansion::{collect_all_steps, expand_per_profile_steps, filter_steps_for_profile, resolve_steps};
 pub use facet::StandardFacet;
 pub use pipeline::{OnPartial, PipelineConfig, StepDef};
 pub use profile::{DSProfile, DSProfileGroup, DSView};

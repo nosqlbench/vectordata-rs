@@ -15,9 +15,10 @@ use vectordata::VectorReader;
 use vectordata::io::MmapVectorReader;
 
 use crate::pipeline::command::{
-    CommandDoc, CommandOp, CommandResult, OptionDesc, Options, ResourceDesc, Status, StreamContext,
+    CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options, ResourceDesc, Status, StreamContext,
     render_options_table,
 };
+use crate::pipeline::element_type::ElementType;
 
 /// Pipeline command: find a specific vector in a target file.
 pub struct AnalyzeFindOp;
@@ -95,18 +96,62 @@ impl CommandOp for AnalyzeFindOp {
         let source_path = resolve_path(source_str, &ctx.workspace);
         let target_path = resolve_path(target_str, &ctx.workspace);
 
-        // Open source and get the needle vector
-        let source_reader = match MmapVectorReader::<f32>::open_fvec(&source_path) {
-            Ok(r) => r,
-            Err(e) => {
-                return error_result(
-                    format!("failed to open source {}: {}", source_path.display(), e),
-                    start,
-                )
+        // Open source file with element-type dispatch
+        let src_etype = match ElementType::from_path(&source_path) {
+            Ok(t) => t,
+            Err(e) => return error_result(e, start),
+        };
+        let (source_count, _src_dim, src_get): (usize, usize, Box<dyn Fn(usize) -> Vec<f64> + Sync>) = match src_etype {
+            ElementType::F32 => {
+                let r = match MmapVectorReader::<f32>::open_fvec(&source_path) {
+                    Ok(r) => r, Err(e) => return error_result(format!("open source: {}", e), start),
+                };
+                let fc = VectorReader::<f32>::count(&r);
+                let d = VectorReader::<f32>::dim(&r);
+                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
+            }
+            ElementType::F16 => {
+                let r = match MmapVectorReader::<half::f16>::open_mvec(&source_path) {
+                    Ok(r) => r, Err(e) => return error_result(format!("open source: {}", e), start),
+                };
+                let fc = VectorReader::<half::f16>::count(&r);
+                let d = VectorReader::<half::f16>::dim(&r);
+                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|v| v.to_f64()).collect()))
+            }
+            ElementType::F64 => {
+                let r = match MmapVectorReader::<f64>::open_dvec(&source_path) {
+                    Ok(r) => r, Err(e) => return error_result(format!("open source: {}", e), start),
+                };
+                let fc = VectorReader::<f64>::count(&r);
+                let d = VectorReader::<f64>::dim(&r);
+                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default()))
+            }
+            ElementType::I32 => {
+                let r = match MmapVectorReader::<i32>::open_ivec(&source_path) {
+                    Ok(r) => r, Err(e) => return error_result(format!("open source: {}", e), start),
+                };
+                let fc = VectorReader::<i32>::count(&r);
+                let d = VectorReader::<i32>::dim(&r);
+                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
+            }
+            ElementType::I16 => {
+                let r = match MmapVectorReader::<i16>::open_svec(&source_path) {
+                    Ok(r) => r, Err(e) => return error_result(format!("open source: {}", e), start),
+                };
+                let fc = VectorReader::<i16>::count(&r);
+                let d = VectorReader::<i16>::dim(&r);
+                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
+            }
+            ElementType::U8 | ElementType::I8 => {
+                let r = match MmapVectorReader::<u8>::open_bvec(&source_path) {
+                    Ok(r) => r, Err(e) => return error_result(format!("open source: {}", e), start),
+                };
+                let fc = VectorReader::<u8>::count(&r);
+                let d = VectorReader::<u8>::dim(&r);
+                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
             }
         };
 
-        let source_count = <MmapVectorReader<f32> as VectorReader<f32>>::count(&source_reader);
         if index >= source_count {
             return error_result(
                 format!(
@@ -117,10 +162,7 @@ impl CommandOp for AnalyzeFindOp {
             );
         }
 
-        let needle = match source_reader.get(index) {
-            Ok(v) => v.to_vec(),
-            Err(e) => return error_result(format!("failed to read source[{}]: {}", index, e), start),
-        };
+        let needle = src_get(index);
         let dim = needle.len();
 
         ctx.ui.log(&format!(
@@ -130,19 +172,61 @@ impl CommandOp for AnalyzeFindOp {
             target_path.display()
         ));
 
-        // Open target
-        let target_reader = match MmapVectorReader::<f32>::open_fvec(&target_path) {
-            Ok(r) => r,
-            Err(e) => {
-                return error_result(
-                    format!("failed to open target {}: {}", target_path.display(), e),
-                    start,
-                )
+        // Open target file with element-type dispatch
+        let tgt_etype = match ElementType::from_path(&target_path) {
+            Ok(t) => t,
+            Err(e) => return error_result(e, start),
+        };
+        let (target_count, target_dim, tgt_get): (usize, usize, Box<dyn Fn(usize) -> Vec<f64> + Sync>) = match tgt_etype {
+            ElementType::F32 => {
+                let r = match MmapVectorReader::<f32>::open_fvec(&target_path) {
+                    Ok(r) => r, Err(e) => return error_result(format!("open target: {}", e), start),
+                };
+                let fc = VectorReader::<f32>::count(&r);
+                let d = VectorReader::<f32>::dim(&r);
+                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
+            }
+            ElementType::F16 => {
+                let r = match MmapVectorReader::<half::f16>::open_mvec(&target_path) {
+                    Ok(r) => r, Err(e) => return error_result(format!("open target: {}", e), start),
+                };
+                let fc = VectorReader::<half::f16>::count(&r);
+                let d = VectorReader::<half::f16>::dim(&r);
+                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|v| v.to_f64()).collect()))
+            }
+            ElementType::F64 => {
+                let r = match MmapVectorReader::<f64>::open_dvec(&target_path) {
+                    Ok(r) => r, Err(e) => return error_result(format!("open target: {}", e), start),
+                };
+                let fc = VectorReader::<f64>::count(&r);
+                let d = VectorReader::<f64>::dim(&r);
+                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default()))
+            }
+            ElementType::I32 => {
+                let r = match MmapVectorReader::<i32>::open_ivec(&target_path) {
+                    Ok(r) => r, Err(e) => return error_result(format!("open target: {}", e), start),
+                };
+                let fc = VectorReader::<i32>::count(&r);
+                let d = VectorReader::<i32>::dim(&r);
+                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
+            }
+            ElementType::I16 => {
+                let r = match MmapVectorReader::<i16>::open_svec(&target_path) {
+                    Ok(r) => r, Err(e) => return error_result(format!("open target: {}", e), start),
+                };
+                let fc = VectorReader::<i16>::count(&r);
+                let d = VectorReader::<i16>::dim(&r);
+                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
+            }
+            ElementType::U8 | ElementType::I8 => {
+                let r = match MmapVectorReader::<u8>::open_bvec(&target_path) {
+                    Ok(r) => r, Err(e) => return error_result(format!("open target: {}", e), start),
+                };
+                let fc = VectorReader::<u8>::count(&r);
+                let d = VectorReader::<u8>::dim(&r);
+                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
             }
         };
-
-        let target_count = <MmapVectorReader<f32> as VectorReader<f32>>::count(&target_reader);
-        let target_dim = <MmapVectorReader<f32> as VectorReader<f32>>::dim(&target_reader);
 
         if dim != target_dim {
             return error_result(
@@ -155,11 +239,11 @@ impl CommandOp for AnalyzeFindOp {
         }
 
         // Check if target is sorted (sample first and last vectors)
-        let is_sorted = check_sorted(&target_reader, target_count);
+        let is_sorted = check_sorted(&*tgt_get, target_count);
 
         if is_sorted {
             ctx.ui.log("Target appears sorted — using binary search");
-            match binary_search(&target_reader, &needle, target_count) {
+            match binary_search(&*tgt_get, &needle, target_count) {
                 Some(found_idx) => {
                     ctx.ui.log(&format!("FOUND at index {}", found_idx));
                     CommandResult {
@@ -184,7 +268,7 @@ impl CommandOp for AnalyzeFindOp {
                 "Target is unsorted — exhaustive scan ({} vectors)",
                 target_count
             ));
-            let result = exhaustive_scan(&target_reader, &needle, target_count);
+            let result = exhaustive_scan(&*tgt_get, &needle, target_count);
             match result {
                 Some((found_idx, exact)) => {
                     if exact {
@@ -226,40 +310,37 @@ impl CommandOp for AnalyzeFindOp {
                 required: true,
                 default: None,
                 description: "Source file containing the vector to find".to_string(),
-            },
+                        role: OptionRole::Input,
+        },
             OptionDesc {
                 name: "target".to_string(),
                 type_name: "Path".to_string(),
                 required: true,
                 default: None,
                 description: "Target file to search in".to_string(),
-            },
+                        role: OptionRole::Input,
+        },
             OptionDesc {
                 name: "index".to_string(),
                 type_name: "int".to_string(),
                 required: true,
                 default: None,
                 description: "0-based index of vector in source file".to_string(),
-            },
+                        role: OptionRole::Config,
+        },
         ]
     }
 }
 
 /// Check if a file appears lexicographically sorted by sampling.
-fn check_sorted(reader: &MmapVectorReader<f32>, count: usize) -> bool {
+fn check_sorted(get_f64: &dyn Fn(usize) -> Vec<f64>, count: usize) -> bool {
     if count <= 1 {
         return true;
     }
     let sample = 100.min(count - 1);
     for i in 0..sample {
-        let a = match reader.get(i) {
-            Ok(v) => v,
-            Err(_) => return false,
-        };
-        let b = match reader.get(i + 1) {
-            Ok(v) => v,
-            Err(_) => return false,
-        };
+        let a = get_f64(i);
+        let b = get_f64(i + 1);
         if compare_vectors(&a, &b) == std::cmp::Ordering::Greater {
             return false;
         }
@@ -267,14 +348,8 @@ fn check_sorted(reader: &MmapVectorReader<f32>, count: usize) -> bool {
     // Also check last few
     if count > sample + 2 {
         for i in (count - sample)..count - 1 {
-            let a = match reader.get(i) {
-                Ok(v) => v,
-                Err(_) => return false,
-            };
-            let b = match reader.get(i + 1) {
-                Ok(v) => v,
-                Err(_) => return false,
-            };
+            let a = get_f64(i);
+            let b = get_f64(i + 1);
             if compare_vectors(&a, &b) == std::cmp::Ordering::Greater {
                 return false;
             }
@@ -284,7 +359,7 @@ fn check_sorted(reader: &MmapVectorReader<f32>, count: usize) -> bool {
 }
 
 /// Lexicographic comparison of two float vectors.
-fn compare_vectors(a: &[f32], b: &[f32]) -> std::cmp::Ordering {
+fn compare_vectors(a: &[f64], b: &[f64]) -> std::cmp::Ordering {
     for i in 0..a.len().min(b.len()) {
         match a[i].partial_cmp(&b[i]) {
             Some(std::cmp::Ordering::Equal) => continue,
@@ -306,15 +381,15 @@ fn compare_vectors(a: &[f32], b: &[f32]) -> std::cmp::Ordering {
 
 /// Binary search for a vector in a sorted file.
 fn binary_search(
-    reader: &MmapVectorReader<f32>,
-    needle: &[f32],
+    get_f64: &dyn Fn(usize) -> Vec<f64>,
+    needle: &[f64],
     count: usize,
 ) -> Option<usize> {
     let mut low = 0usize;
     let mut high = count;
     while low < high {
         let mid = low + (high - low) / 2;
-        let vec = reader.get(mid).ok()?;
+        let vec = get_f64(mid);
         match compare_vectors(&vec, needle) {
             std::cmp::Ordering::Equal => return Some(mid),
             std::cmp::Ordering::Less => low = mid + 1,
@@ -326,25 +401,25 @@ fn binary_search(
 
 /// Exhaustive scan returning (index, is_exact_match).
 fn exhaustive_scan(
-    reader: &MmapVectorReader<f32>,
-    needle: &[f32],
+    get_f64: &dyn Fn(usize) -> Vec<f64>,
+    needle: &[f64],
     count: usize,
 ) -> Option<(usize, bool)> {
     let mut best_idx = 0;
     let mut best_matching = 0usize;
 
     for i in 0..count {
-        let vec = match reader.get(i) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
+        let vec = get_f64(i);
+        if vec.is_empty() {
+            continue;
+        }
         if vec.as_slice() == needle {
             return Some((i, true));
         }
         let matching = vec
             .iter()
             .zip(needle.iter())
-            .filter(|(a, b)| (*a - *b).abs() < f32::EPSILON)
+            .filter(|(a, b)| (*a - *b).abs() < f64::EPSILON)
             .count();
         if matching > best_matching {
             best_matching = matching;
@@ -470,8 +545,8 @@ mod tests {
 
     #[test]
     fn test_compare_vectors() {
-        assert_eq!(compare_vectors(&[1.0, 2.0], &[1.0, 2.0]), std::cmp::Ordering::Equal);
-        assert_eq!(compare_vectors(&[1.0, 2.0], &[1.0, 3.0]), std::cmp::Ordering::Less);
-        assert_eq!(compare_vectors(&[2.0, 0.0], &[1.0, 9.0]), std::cmp::Ordering::Greater);
+        assert_eq!(compare_vectors(&[1.0f64, 2.0], &[1.0, 2.0]), std::cmp::Ordering::Equal);
+        assert_eq!(compare_vectors(&[1.0f64, 2.0], &[1.0, 3.0]), std::cmp::Ordering::Less);
+        assert_eq!(compare_vectors(&[2.0f64, 0.0], &[1.0, 9.0]), std::cmp::Ordering::Greater);
     }
 }

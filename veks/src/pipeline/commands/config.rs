@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::pipeline::command::{
-    CommandDoc, CommandOp, CommandResult, OptionDesc, Options, Status, StreamContext,
+    CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options, Status, StreamContext,
     render_options_table,
 };
 
@@ -320,14 +320,16 @@ hundreds of gigabytes of storage.
                 required: false,
                 default: None,
                 description: "Cache directory path (default: ~/.cache/vectordata)".to_string(),
-            },
+                        role: OptionRole::Config,
+        },
             OptionDesc {
                 name: "force".to_string(),
                 type_name: "bool".to_string(),
                 required: false,
                 default: Some("false".to_string()),
                 description: "Overwrite existing protected settings".to_string(),
-            },
+                        role: OptionRole::Config,
+        },
         ]
     }
 }
@@ -505,7 +507,8 @@ pipeline execution.
             required: false,
             default: Some("false".to_string()),
             description: "Include mount points with minimal space".to_string(),
-        }]
+                role: OptionRole::Config,
+    }]
     }
 }
 

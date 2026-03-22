@@ -37,15 +37,16 @@ Each command implements:
 
 | Command | Description | Resource profile |
 |---------|-------------|------------------|
-| `compute knn` | Brute-force exact K-nearest neighbors | **CPU + memory intensive**: mmaps base vectors (potentially hundreds of GB). Multi-threaded query processing. Partitioned mode caches per-partition results in `.cache/`. |
+| `compute knn` | Brute-force exact K-nearest neighbors. Supports `--compress-cache` to gzip partition cache files. | **CPU + memory intensive**: mmaps base vectors (potentially hundreds of GB). Multi-threaded query processing. Partitioned mode caches per-partition results in `.cache/`. |
 | `compute filtered-knn` | Predicate-filtered exact KNN | **CPU + memory intensive**: mmaps base vectors. Reads matching metadata ordinals from slab. Multi-threaded. |
 | `compute sort` | Sort vectors by some criterion | I/O-bound |
+| `compute dedup` | Lexicographic sort + duplicate detection via external merge-sort. Produces sorted ordinal index (ivec), duplicate ordinals (ivec), and JSON report. Adaptive prefix-key width avoids full-vector I/O for non-duplicates. Cached sorted runs enable resume. Supports `--compress-cache` to gzip sorted run files. | **CPU + I/O**: multi-threaded parallel sort. Memory proportional to batch size (default 1M vectors). Intermediate sorted runs written to `.cache/dedup_runs/`. Governor-aware batch sizing. |
 
 ### Generate
 
 | Command | Description | Resource profile |
 |---------|-------------|------------------|
-| `generate vectors` | Generate synthetic random vectors | CPU + I/O |
+| `generate vectors` | Generate synthetic random vectors. Supports `--zeros-ratio` and `--duplicates-ratio` for injecting test data artifacts (zero vectors, duplicates) at controlled ratios using Vose's alias method for O(1) per-vector disposition sampling. `--append` mode adds vectors to an existing file, matching its dimensionality. All count/dimension options accept ISO suffixes (K, M, G, KiB, MiB, etc.). Generation is embarrassingly parallel via per-chunk deterministic RNGs; duplicates are sourced intra-batch (random earlier vector within the same chunk) so no cross-thread state is needed. Supports all 6 element types (f32, f16, f64, i32, i16, u8). | CPU + I/O (parallel) |
 | `generate ivec-shuffle` | Generate shuffled ordinal permutation | Memory: full ordinal array |
 | `generate sketch` | Generate vector sketches | CPU |
 | `generate from-model` | Generate vectors from an ML model | CPU + GPU |
@@ -53,7 +54,7 @@ Each command implements:
 | `generate derive` | Derive new facets from existing | Mixed |
 | `generate predicated` | Generate predicated dataset | Mixed |
 | `synthesize predicates` | Generate random filter predicates from metadata survey | **Light**: reads survey JSON, outputs small slab. Fast. |
-| `compute predicates` | Compute predicates against all metadata records | **CRITICAL: highest resource risk**. Scans entire metadata slab (207 GB for LAION-400M). Segmented processing with cache. Per-segment: reads all pages, evaluates all predicates against every record. Memory: match ordinal vectors per predicate × segment. THIS IS THE COMMAND THAT CAUSED THE SYSTEM LOCKUP. |
+| `compute predicates` | Compute predicates against all metadata records. Supports `--compress-cache` to gzip segment cache files. | **CRITICAL: highest resource risk**. Scans entire metadata slab (207 GB for LAION-400M). Segmented processing with cache. Per-segment: reads all pages, evaluates all predicates against every record. Memory: match ordinal vectors per predicate × segment. THIS IS THE COMMAND THAT CAUSED THE SYSTEM LOCKUP. |
 
 ### Slab Operations
 
@@ -75,19 +76,27 @@ Each command implements:
 
 | Command | Description | Resource profile |
 |---------|-------------|------------------|
-| `transform fvec-extract` | Extract vector subset from fvec file | I/O-bound |
-| `transform ivec-extract` | Extract index subset from ivec file | I/O-bound |
-| `transform mvec-extract` | Extract half-precision vector subset from mvec file | I/O-bound |
-| `transform slab-extract` | Extract record subset from slab file | I/O-bound |
+| `transform extract` | **Generic extract**: auto-detects source format from file extension and delegates to the appropriate format-specific command. Preferred entry point — avoids format mismatches. | I/O-bound |
+| `transform fvec-extract` | Extract vector subset from fvec file. Validates `.fvec` extension. Supports both **index-based** (with `--ivec-file`) and **range-based** (identity, without `--ivec-file`) extraction. | I/O-bound |
+| `transform ivec-extract` | Extract index subset from ivec file. Supports index-based and range-based modes. | I/O-bound |
+| `transform mvec-extract` | Extract half-precision vector subset from mvec file. Supports index-based and range-based modes. | I/O-bound |
+| `transform slab-extract` | Extract record subset from slab file. Supports index-based and range-based modes. | I/O-bound |
+| `transform clean-ordinals` | Filter ordinal index by excluding duplicate and zero-vector ordinals. Reads a sorted index (from `compute dedup`) plus exclusion lists and writes a clean index suitable for downstream shuffle and extraction. | **Memory**: loads exclusion sets into HashSet. I/O: single streaming pass over input index. |
 
 ### Analysis
 
+All analysis commands support **all 6 xvec element types** (f32, f16, f64,
+i32, i16, u8) via `ElementType` dispatch. Values are converted to f64
+for statistical accumulation. Format is auto-detected from file extension.
+
 | Command | Description | Resource profile |
 |---------|-------------|------------------|
-| `analyze describe` | Describe vector file metadata | Light |
+| `analyze describe` | Describe vector file metadata (format, dim, count, file size) | Light |
 | `analyze stats` | Compute statistical summary | Streaming |
 | `analyze histogram` | Generate dimension histograms | Streaming |
-| `analyze verify-knn` | Validate KNN ground truth | CPU-intensive (re-computes distances) |
+| `analyze verify-knn` | Validate KNN ground truth (legacy, full range) | CPU-intensive (re-computes distances) |
+| `verify knn` | **Pipeline verification**: sparse-sample KNN spot-check using parallel batched SIMD distance recomputation. Samples N queries uniformly at random, recomputes brute-force top-k, compares against stored ground truth with tie tolerance. Writes JSON report. See §12.13.1. | CPU-intensive (parallel, SIMD) |
+| `verify predicates` | **Pipeline verification**: sparse-sample predicate evaluation using SQLite as independent oracle. Loads N sampled metadata rows into in-memory SQLite, translates PNode predicates to SQL WHERE clauses, compares against stored results. Writes JSON report. See §12.13.2. | Memory (SQLite) + CPU |
 | `analyze compare` | Compare two vector files | I/O: reads both files |
 | `analyze select` | Select vectors by predicate | Streaming |
 | `analyze slice` | Extract ordinal range | I/O-bound |
@@ -123,6 +132,9 @@ Each command implements:
 | `datasets cache` | Manage dataset cache | I/O |
 | `datasets curlify` | Generate curl commands for downloads | Light |
 | `datasets prebuffer` | Pre-buffer dataset into page cache | I/O-heavy |
+| `datasets cache-compress` | Retroactively gzip-compress eligible `.cache/` artifacts (dedup runs, KNN partition caches, predicate segment caches). Parallel via rayon. See §5.7 for eligibility rules. | I/O + CPU (parallel) |
+| `datasets cache-uncompress` | Reverse of `cache-compress`: decompress `.gz` cache files back to originals. Parallel via rayon. Preserves file timestamps. | I/O + CPU (parallel) |
+| `datasets import` | Bootstrap a new dataset directory from source files. Interactive wizard (`-i`), auto-accept (`-y`), restart (`--restart`). See §12. | Light |
 
 ### Pipeline Control
 
@@ -248,3 +260,116 @@ The catalog system provides the backing data. Catalogs are configured via
 `veks config` and can reference local directories, remote indexes, or
 HuggingFace repositories. The `veks datasets` command queries these catalogs
 and presents results in a human-readable format.
+
+### `veks datasets catalog generate`
+
+Scans a directory tree for `dataset.yaml` files and writes hierarchical
+`catalog.json` / `catalog.yaml` index files. Each directory level between
+the scan root and each dataset gets its own catalog containing entries for
+all datasets below it.
+
+#### Catalog root detection (`.catalog_root`)
+
+A `.catalog_root` file is a zero-byte sentinel that marks the top of the
+catalog hierarchy. When `catalog generate` is run from any directory below
+a `.catalog_root`, the generator automatically uses the directory containing
+`.catalog_root` as the scan root and generates catalogs at every level from
+there down.
+
+This enables a common pattern where the remote publish URL has an
+uncataloged leading path:
+
+```
+/data/                         ← .publish_url (s3://bucket/data/)
+/data/public/                  ← no catalog here (leading path)
+/data/public/vectordata/       ← .catalog_root (catalog hierarchy starts here)
+/data/public/vectordata/ds-a/  ← dataset.yaml
+/data/public/vectordata/ds-b/  ← dataset.yaml
+```
+
+Running `veks datasets catalog generate` from `/data/public/vectordata/ds-a/`
+detects `.catalog_root` at `/data/public/vectordata/` and generates:
+- `/data/public/vectordata/catalog.json` (lists ds-a and ds-b)
+- `/data/public/vectordata/ds-a/catalog.json` (lists ds-a only)
+- `/data/public/vectordata/ds-b/catalog.json` (lists ds-b only)
+
+No catalog is generated at `/data/public/` or `/data/` because those
+directories are above the `.catalog_root`.
+
+#### `.publish_url` warning
+
+When no `.catalog_root` is present and a `.publish_url` file is detected
+above the scan directory, the command warns that catalog coverage may be
+incomplete. The warning suggests using `--for-publish-url` to regenerate
+the full publish hierarchy, or placing a `.catalog_root` file at the
+desired catalog top level.
+
+When `.catalog_root` is detected, the warning is suppressed because the
+user has explicitly declared the catalog boundary.
+
+#### Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `INPUT` | `.` | Root directory to scan |
+| `--basename` | `catalog` | Filename stem for catalog files |
+| `--for-publish-url` | off | Walk up to `.publish_url` and generate from that root |
+| `--update` | on | Only update existing catalog files; skip directories with no catalog yet |
+| `--no-update` | — | Generate at all hierarchy levels regardless of existing files |
+
+#### Resolution priority
+
+When determining the scan root:
+
+1. **`--for-publish-url`**: walks up to `.publish_url`, generates from that root
+2. **`.catalog_root` in parent path**: uses that directory, generates full hierarchy
+3. **`--update` (default)**: uses `INPUT`, updates only existing catalog files
+4. **`--no-update`**: uses `INPUT`, generates at all hierarchy levels
+
+### `veks check`
+
+Context-aware pre-flight verification. The checks performed depend on
+where the command is run:
+
+#### Context detection
+
+`veks check` examines the target directory and determines the context:
+
+1. **Dataset directory** — contains `dataset.yaml`. Checks focus on the
+   local dataset: pipeline execution, file integrity, merkle coverage,
+   extraneous files.
+
+2. **Publish path** — no `dataset.yaml` in the current directory, but a
+   `.publish_url` or `.catalog_root` is found in the parent path. This
+   indicates the directory is part of a publishable hierarchy. Checks
+   include publish URL binding and catalog chain freshness across the
+   full hierarchy.
+
+3. **Unrecognized** — neither a dataset directory nor part of a publish
+   path. `veks check` exits with an error.
+
+#### Check categories by context
+
+| Check | Dataset dir | Publish path | Description |
+|-------|:-----------:|:------------:|-------------|
+| `pipeline-execution` | yes | — | All pipeline steps fresh |
+| `pipeline-coverage` | yes | — | Every publishable file covered by a pipeline step |
+| `publish` | — | yes | `.publish_url` is valid and transport is supported |
+| `merkle` | yes | — | Every publishable file above threshold has a current `.mref` |
+| `integrity` | yes | — | Every data file passes format-specific structural validation |
+| `catalogs` | — | yes | `catalog.json`/`catalog.yaml` present and current at every directory level from `.catalog_root` (or `.publish_url`) down; parent catalogs not older than child catalogs |
+| `extraneous` | yes | — | No publishable files outside the pipeline manifest |
+
+#### Design rationale
+
+This separation means:
+- Running `veks check` in a dataset directory after `veks run` validates
+  that the dataset is internally consistent — pipeline complete, files
+  intact, merkle hashes current.
+- Running `veks check` from a publishing root (or any intermediate
+  directory with `.catalog_root` or `.publish_url`) validates the
+  catalog chain and publish binding — everything needed before
+  `veks publish`.
+- The two contexts do not overlap: a dataset directory never checks
+  parent catalog chains (that's the publish path's job), and a publish
+  path never checks individual pipeline step freshness.

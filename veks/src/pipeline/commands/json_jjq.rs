@@ -25,7 +25,7 @@ use std::time::Instant;
 use serde_json::Value;
 
 use crate::pipeline::command::{
-    CommandDoc, CommandOp, CommandResult, OptionDesc, Options, ResourceDesc, Status, StreamContext,
+    CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options, ResourceDesc, Status, StreamContext,
     render_options_table,
 };
 
@@ -398,21 +398,24 @@ the need for an external `jq` binary on the system.
                 required: true,
                 default: None,
                 description: "Input JSONL file".to_string(),
-            },
+                        role: OptionRole::Input,
+        },
             OptionDesc {
                 name: "expression".to_string(),
                 type_name: "String".to_string(),
                 required: false,
                 default: Some(".".to_string()),
                 description: "JQ expression (e.g. '.field', 'select(.x == 1)')".to_string(),
-            },
+                        role: OptionRole::Config,
+        },
             OptionDesc {
                 name: "output".to_string(),
                 type_name: "Path".to_string(),
                 required: false,
                 default: None,
                 description: "Output file (default: stderr, 'null' discards)".to_string(),
-            },
+                        role: OptionRole::Output,
+        },
         ]
     }
 }

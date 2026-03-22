@@ -10,15 +10,18 @@
 //! Equivalent to the Java `CMD_analyze_compare` command.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
+use rayon::prelude::*;
 use vectordata::io::MmapVectorReader;
 use vectordata::io::VectorReader;
 
 use crate::pipeline::command::{
-    CommandDoc, CommandOp, CommandResult, OptionDesc, Options, ResourceDesc, Status, StreamContext,
+    CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options, ResourceDesc, Status, StreamContext,
     render_options_table,
 };
+use crate::pipeline::element_type::ElementType;
 
 /// Pipeline command: K-S distribution comparison.
 pub struct AnalyzeCompareOp;
@@ -172,28 +175,117 @@ impl CommandOp for AnalyzeCompareOp {
         let orig_path = resolve_path(original_str, &ctx.workspace);
         let synth_path = resolve_path(synthetic_str, &ctx.workspace);
 
-        // Open both files
-        let orig_reader = match MmapVectorReader::<f32>::open_fvec(&orig_path) {
-            Ok(r) => r,
-            Err(e) => {
-                return error_result(
-                    format!("failed to open original {}: {}", orig_path.display(), e),
-                    start,
-                )
-            }
+        // Open original file with element-type dispatch
+        let orig_etype = match ElementType::from_path(&orig_path) {
+            Ok(t) => t,
+            Err(e) => return error_result(e, start),
         };
-        let synth_reader = match MmapVectorReader::<f32>::open_fvec(&synth_path) {
-            Ok(r) => r,
-            Err(e) => {
-                return error_result(
-                    format!("failed to open synthetic {}: {}", synth_path.display(), e),
-                    start,
-                )
+        let (orig_count, orig_dim, orig_get): (usize, usize, Box<dyn Fn(usize) -> Vec<f64> + Sync>) = match orig_etype {
+            ElementType::F32 => {
+                let r = match MmapVectorReader::<f32>::open_fvec(&orig_path) {
+                    Ok(r) => r, Err(e) => return error_result(format!("open original: {}", e), start),
+                };
+                let fc = VectorReader::<f32>::count(&r);
+                let d = VectorReader::<f32>::dim(&r);
+                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
+            }
+            ElementType::F16 => {
+                let r = match MmapVectorReader::<half::f16>::open_mvec(&orig_path) {
+                    Ok(r) => r, Err(e) => return error_result(format!("open original: {}", e), start),
+                };
+                let fc = VectorReader::<half::f16>::count(&r);
+                let d = VectorReader::<half::f16>::dim(&r);
+                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|v| v.to_f64()).collect()))
+            }
+            ElementType::F64 => {
+                let r = match MmapVectorReader::<f64>::open_dvec(&orig_path) {
+                    Ok(r) => r, Err(e) => return error_result(format!("open original: {}", e), start),
+                };
+                let fc = VectorReader::<f64>::count(&r);
+                let d = VectorReader::<f64>::dim(&r);
+                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default()))
+            }
+            ElementType::I32 => {
+                let r = match MmapVectorReader::<i32>::open_ivec(&orig_path) {
+                    Ok(r) => r, Err(e) => return error_result(format!("open original: {}", e), start),
+                };
+                let fc = VectorReader::<i32>::count(&r);
+                let d = VectorReader::<i32>::dim(&r);
+                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
+            }
+            ElementType::I16 => {
+                let r = match MmapVectorReader::<i16>::open_svec(&orig_path) {
+                    Ok(r) => r, Err(e) => return error_result(format!("open original: {}", e), start),
+                };
+                let fc = VectorReader::<i16>::count(&r);
+                let d = VectorReader::<i16>::dim(&r);
+                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
+            }
+            ElementType::U8 | ElementType::I8 => {
+                let r = match MmapVectorReader::<u8>::open_bvec(&orig_path) {
+                    Ok(r) => r, Err(e) => return error_result(format!("open original: {}", e), start),
+                };
+                let fc = VectorReader::<u8>::count(&r);
+                let d = VectorReader::<u8>::dim(&r);
+                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
             }
         };
 
-        let orig_dim = <MmapVectorReader<f32> as VectorReader<f32>>::dim(&orig_reader);
-        let synth_dim = <MmapVectorReader<f32> as VectorReader<f32>>::dim(&synth_reader);
+        // Open synthetic file with element-type dispatch
+        let synth_etype = match ElementType::from_path(&synth_path) {
+            Ok(t) => t,
+            Err(e) => return error_result(e, start),
+        };
+        let (synth_count, synth_dim, synth_get): (usize, usize, Box<dyn Fn(usize) -> Vec<f64> + Sync>) = match synth_etype {
+            ElementType::F32 => {
+                let r = match MmapVectorReader::<f32>::open_fvec(&synth_path) {
+                    Ok(r) => r, Err(e) => return error_result(format!("open synthetic: {}", e), start),
+                };
+                let fc = VectorReader::<f32>::count(&r);
+                let d = VectorReader::<f32>::dim(&r);
+                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
+            }
+            ElementType::F16 => {
+                let r = match MmapVectorReader::<half::f16>::open_mvec(&synth_path) {
+                    Ok(r) => r, Err(e) => return error_result(format!("open synthetic: {}", e), start),
+                };
+                let fc = VectorReader::<half::f16>::count(&r);
+                let d = VectorReader::<half::f16>::dim(&r);
+                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|v| v.to_f64()).collect()))
+            }
+            ElementType::F64 => {
+                let r = match MmapVectorReader::<f64>::open_dvec(&synth_path) {
+                    Ok(r) => r, Err(e) => return error_result(format!("open synthetic: {}", e), start),
+                };
+                let fc = VectorReader::<f64>::count(&r);
+                let d = VectorReader::<f64>::dim(&r);
+                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default()))
+            }
+            ElementType::I32 => {
+                let r = match MmapVectorReader::<i32>::open_ivec(&synth_path) {
+                    Ok(r) => r, Err(e) => return error_result(format!("open synthetic: {}", e), start),
+                };
+                let fc = VectorReader::<i32>::count(&r);
+                let d = VectorReader::<i32>::dim(&r);
+                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
+            }
+            ElementType::I16 => {
+                let r = match MmapVectorReader::<i16>::open_svec(&synth_path) {
+                    Ok(r) => r, Err(e) => return error_result(format!("open synthetic: {}", e), start),
+                };
+                let fc = VectorReader::<i16>::count(&r);
+                let d = VectorReader::<i16>::dim(&r);
+                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
+            }
+            ElementType::U8 | ElementType::I8 => {
+                let r = match MmapVectorReader::<u8>::open_bvec(&synth_path) {
+                    Ok(r) => r, Err(e) => return error_result(format!("open synthetic: {}", e), start),
+                };
+                let fc = VectorReader::<u8>::count(&r);
+                let d = VectorReader::<u8>::dim(&r);
+                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
+            }
+        };
 
         if orig_dim != synth_dim {
             return error_result(
@@ -204,9 +296,6 @@ impl CommandOp for AnalyzeCompareOp {
                 start,
             );
         }
-
-        let orig_count = <MmapVectorReader<f32> as VectorReader<f32>>::count(&orig_reader);
-        let synth_count = <MmapVectorReader<f32> as VectorReader<f32>>::count(&synth_reader);
 
         let orig_sample = sample_size.min(orig_count);
         let synth_sample = sample_size.min(synth_count);
@@ -223,35 +312,59 @@ impl CommandOp for AnalyzeCompareOp {
             None => (0..orig_dim).collect(),
         };
 
-        // Pre-read sampled vectors
-        let orig_vecs: Vec<Vec<f32>> = (0..orig_sample)
-            .filter_map(|i| orig_reader.get(i).ok())
+        // Pre-read sampled vectors as f64
+        let orig_vecs: Vec<Vec<f64>> = (0..orig_sample)
+            .map(|i| orig_get(i))
             .collect();
-        let synth_vecs: Vec<Vec<f32>> = (0..synth_sample)
-            .filter_map(|i| synth_reader.get(i).ok())
+        let synth_vecs: Vec<Vec<f64>> = (0..synth_sample)
+            .map(|i| synth_get(i))
             .collect();
 
-        // Run K-S test per dimension
-        let mut results = Vec::with_capacity(dims.len());
-        let mut fail_count = 0usize;
+        // Query governor for thread count and build rayon pool
+        let threads = ctx.governor.current_or("threads", ctx.threads as u64).max(1) as usize;
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .ok();
 
-        for &d in &dims {
-            let mut orig_vals: Vec<f64> = orig_vecs.iter().map(|v| v[d] as f64).collect();
-            let mut synth_vals: Vec<f64> = synth_vecs.iter().map(|v| v[d] as f64).collect();
+        // Run K-S test per dimension in parallel
+        let pb = ctx.ui.bar_with_unit(dims.len() as u64, "K-S testing dimensions", "dims");
+        let progress = AtomicU64::new(0);
+        let pb_ref = &pb;
+        let progress_ref = &progress;
 
-            let (d_stat, p_val) = ks_test(&mut orig_vals, &mut synth_vals);
-            let passed = p_val >= alpha;
-            if !passed {
-                fail_count += 1;
-            }
+        let compute_fn = || {
+            dims.par_iter()
+                .map(|&d| {
+                    let mut orig_vals: Vec<f64> = orig_vecs.iter().map(|v| v[d]).collect();
+                    let mut synth_vals: Vec<f64> = synth_vecs.iter().map(|v| v[d]).collect();
 
-            results.push(KsResult {
-                dimension: d,
-                d_statistic: d_stat,
-                p_value: p_val,
-                passed,
-            });
-        }
+                    let (d_stat, p_val) = ks_test(&mut orig_vals, &mut synth_vals);
+                    let passed = p_val >= alpha;
+
+                    let done = progress_ref.fetch_add(1, Ordering::Relaxed) + 1;
+                    if done % 100 == 0 || done == dims.len() as u64 {
+                        pb_ref.set_position(done);
+                    }
+
+                    KsResult {
+                        dimension: d,
+                        d_statistic: d_stat,
+                        p_value: p_val,
+                        passed,
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let results = if let Some(p) = &pool {
+            p.install(compute_fn)
+        } else {
+            compute_fn()
+        };
+        pb.finish();
+
+        let fail_count = results.iter().filter(|r| !r.passed).count();
 
         // Print results table
         ctx.ui.log(&format!(
@@ -319,42 +432,48 @@ impl CommandOp for AnalyzeCompareOp {
                 required: true,
                 default: None,
                 description: "Original/reference fvec file".to_string(),
-            },
+                        role: OptionRole::Input,
+        },
             OptionDesc {
                 name: "synthetic".to_string(),
                 type_name: "Path".to_string(),
                 required: true,
                 default: None,
                 description: "Synthetic/comparison fvec file".to_string(),
-            },
+                        role: OptionRole::Input,
+        },
             OptionDesc {
                 name: "alpha".to_string(),
                 type_name: "float".to_string(),
                 required: false,
                 default: Some("0.05".to_string()),
                 description: "Significance level for K-S test".to_string(),
-            },
+                        role: OptionRole::Config,
+        },
             OptionDesc {
                 name: "sample".to_string(),
                 type_name: "int".to_string(),
                 required: false,
                 default: Some("10000".to_string()),
                 description: "Max vectors to sample from each file".to_string(),
-            },
+                        role: OptionRole::Config,
+        },
             OptionDesc {
                 name: "verbose".to_string(),
                 type_name: "bool".to_string(),
                 required: false,
                 default: Some("false".to_string()),
                 description: "Show all dimensions instead of first 10 + failures".to_string(),
-            },
+                        role: OptionRole::Config,
+        },
             OptionDesc {
                 name: "dimension".to_string(),
                 type_name: "int".to_string(),
                 required: false,
                 default: None,
                 description: "Test only this specific dimension".to_string(),
-            },
+                        role: OptionRole::Config,
+        },
         ]
     }
 }

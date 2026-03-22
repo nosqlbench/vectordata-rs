@@ -63,7 +63,7 @@ impl RatatuiSink {
     /// `inline_height` is the number of terminal lines reserved for the
     /// fixed progress region (typically 4-8).
     pub fn new(inline_height: u16) -> io::Result<Self> {
-        Self::with_redraw_interval(inline_height, Duration::from_secs(1))
+        Self::with_redraw_interval(inline_height, Duration::from_millis(250))
     }
 
     /// Create a new ratatui-based sink with a custom redraw interval.
@@ -385,6 +385,8 @@ struct RenderState {
     pause_redraw_pending: bool,
     suspended: bool,
     dirty: bool,
+    /// Recent log messages for the bottom log window.
+    recent_logs: std::collections::VecDeque<String>,
 }
 
 impl RenderState {
@@ -428,6 +430,7 @@ impl RenderState {
             pause_redraw_pending: false,
             suspended: false,
             dirty: false,
+            recent_logs: std::collections::VecDeque::with_capacity(8),
         }
     }
 
@@ -459,7 +462,8 @@ impl RenderState {
         };
         let status_lines = extra_line + chart_lines;
         let paused_line = if self.paused { 1 } else { 0 };
-        context_line + bar_lines + top_panel_lines + status_lines + paused_line
+        let log_lines = self.recent_logs.len().min(6) as u16;
+        context_line + bar_lines + top_panel_lines + status_lines + paused_line + log_lines
     }
 }
 
@@ -534,7 +538,7 @@ fn render_loop(
                         // Double-Escape within 1 second: terminate like Ctrl-C.
                         let now = Instant::now();
                         if let Some(prev) = last_escape {
-                            if now.duration_since(prev) < Duration::from_secs(1) {
+                            if now.duration_since(prev) < Duration::from_millis(250) {
                                 restore_terminal(&mut terminal);
                                 #[cfg(unix)]
                                 unsafe {
@@ -700,6 +704,12 @@ fn process_msg(
 
         UiEvent::Log { message } => {
             logs.push(message.clone());
+            // Keep recent logs for the TUI log window
+            if state.recent_logs.len() >= 6 {
+                state.recent_logs.pop_front();
+            }
+            state.recent_logs.push_back(message.clone());
+            state.dirty = true;
         }
 
         UiEvent::Emit { text } => {
@@ -832,11 +842,21 @@ fn process_msg(
         }
 
         UiEvent::Clear => {
-            state.bars.clear();
-            state.bar_order.clear();
+            // Reset per-step state but preserve persistent bars (like the
+            // overall pipeline progress bar). Bars from the previous step
+            // will have already been finished/dropped by their ProgressHandle.
+            // Only remove bars that are already finished (position == total).
+            let finished_ids: Vec<ProgressId> = state.bars.iter()
+                .filter(|(_, bar)| bar.kind == ProgressKind::Bar && bar.position >= bar.total && bar.total > 0)
+                .map(|(id, _)| *id)
+                .collect();
+            for id in &finished_ids {
+                state.bars.remove(id);
+                state.bar_order.retain(|x| x != id);
+                state.prev_positions.remove(id);
+            }
             state.resource_status.clear();
             state.rps_history.clear();
-            state.prev_positions.clear();
             state.step_yaml.clear();
             state.dirty = true;
         }
@@ -1007,6 +1027,12 @@ fn draw_progress<B: ratatui::backend::Backend>(
             // Fill remaining space when no chart is shown.
             constraints.push(Constraint::Min(0));
         }
+        // Log window at the bottom — show recent log messages
+        let has_logs = !state.recent_logs.is_empty();
+        if has_logs {
+            let log_height = state.recent_logs.len().min(6) as u16;
+            constraints.push(Constraint::Length(log_height));
+        }
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -1116,6 +1142,17 @@ fn draw_progress<B: ratatui::backend::Backend>(
                 Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
             ));
             frame.render_widget(Paragraph::new(paused_line), chunks[idx]);
+            idx += 1;
+        }
+
+        // Log window at the bottom — recent log messages
+        if has_logs && idx < chunks.len() {
+            let log_lines: Vec<Line> = state.recent_logs.iter()
+                .map(|s| colorize_log(s))
+                .collect();
+            let log_widget = Paragraph::new(log_lines)
+                .style(Style::default().fg(Color::DarkGray));
+            frame.render_widget(log_widget, chunks[idx]);
         }
     })?;
 
@@ -1270,25 +1307,44 @@ fn metric_chart<'a>(
 /// Render the current step's YAML snippet in a bordered panel.
 fn render_step_yaml(frame: &mut ratatui::Frame, area: Rect, state: &RenderState) {
     let dim = Style::default().fg(Color::DarkGray);
+    let input_label = Style::default().fg(Color::Green).add_modifier(Modifier::BOLD);
+    let output_label = Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD);
+    let config_label = Style::default().fg(Color::DarkGray);
     let key_style = Style::default().fg(Color::Cyan);
     let val_style = Style::default().fg(Color::White);
+    let input_val = Style::default().fg(Color::Green);
+    let output_val = Style::default().fg(Color::Yellow);
+
+    // Track current section to color values appropriately
+    let mut current_section = "";
 
     let lines: Vec<Line> = state.step_yaml.lines().map(|line| {
-        // Colorize YAML: keys in cyan, values in white
+        let trimmed = line.trim();
+        // Section headers
+        if trimmed == "inputs:" {
+            current_section = "inputs";
+            return Line::from(Span::styled(line, input_label));
+        } else if trimmed == "outputs:" {
+            current_section = "outputs";
+            return Line::from(Span::styled(line, output_label));
+        } else if trimmed == "config:" {
+            current_section = "config";
+            return Line::from(Span::styled(line, config_label));
+        }
+
+        // Key: value lines
         if let Some(colon_pos) = line.find(':') {
-            let indent_end = line.len() - line.trim_start().len();
             let key_part = &line[..colon_pos + 1];
             let val_part = &line[colon_pos + 1..];
-            if val_part.is_empty() || indent_end <= colon_pos {
-                Line::from(vec![
-                    Span::styled(key_part, key_style),
-                    Span::styled(val_part, val_style),
-                ])
-            } else {
-                Line::from(Span::styled(line, val_style))
-            }
-        } else if line.trim_start().starts_with('-') {
-            Line::from(Span::styled(line, val_style))
+            let val_color = match current_section {
+                "inputs" => input_val,
+                "outputs" => output_val,
+                _ => val_style,
+            };
+            Line::from(vec![
+                Span::styled(key_part, key_style),
+                Span::styled(val_part, val_color),
+            ])
         } else {
             Line::from(Span::styled(line, dim))
         }
@@ -1579,10 +1635,15 @@ fn render_bar(frame: &mut ratatui::Frame, area: Rect, bar: &BarState) {
             } else {
                 String::new()
             };
-            let label_str = if bar.message.is_empty() {
-                format!("{} [{}/{}] {}%{}", bar.label, format_count(bar.position), format_count(bar.total), pct, rate_eta)
+            let (pos_str, total_str) = if bar.unit == "bytes" {
+                (format_bytes(bar.position), format_bytes(bar.total))
             } else {
-                format!("{} [{}/{}] {}%{} {}", bar.label, format_count(bar.position), format_count(bar.total), pct, rate_eta, bar.message)
+                (format_count(bar.position), format_count(bar.total))
+            };
+            let label_str = if bar.message.is_empty() {
+                format!("{} [{}/{}] {}%{}", bar.label, pos_str, total_str, pct, rate_eta)
+            } else {
+                format!("{} [{}/{}] {}%{} {}", bar.label, pos_str, total_str, pct, rate_eta, bar.message)
             };
 
             let gauge = Gauge::default()
@@ -1641,6 +1702,23 @@ fn render_bar(frame: &mut ratatui::Frame, area: Rect, bar: &BarState) {
 ///
 /// The `unit` parameter controls the label (e.g., "rec", "files", "chunks").
 fn format_rate(rps: f64, unit: &str) -> String {
+    // Byte rates use IEC-style formatting (MB/s, GB/s)
+    if unit == "bytes" {
+        if rps >= 1024.0 * 1024.0 * 1024.0 {
+            return format!("{:.1} GB/s", rps / (1024.0 * 1024.0 * 1024.0));
+        } else if rps >= 1024.0 * 1024.0 {
+            return format!("{:.1} MB/s", rps / (1024.0 * 1024.0));
+        } else if rps >= 1024.0 {
+            return format!("{:.1} KB/s", rps / 1024.0);
+        } else if rps >= 1.0 {
+            return format!("{:.0} B/s", rps);
+        } else if rps > 0.0 {
+            return String::new();
+        } else {
+            return String::new();
+        }
+    }
+
     if rps >= 1_000_000_000.0 {
         format!("{:.1}G {}/s", rps / 1_000_000_000.0, unit)
     } else if rps >= 1_000_000.0 {
@@ -1674,6 +1752,21 @@ fn format_duration(secs: f64) -> String {
         let h = s / 3600;
         let m = (s % 3600) / 60;
         format!("{}h{}m", h, m)
+    }
+}
+
+/// Format a byte count as human-readable (KB/MB/GB/TB).
+fn format_bytes(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{} B", bytes)
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else if bytes < 1024 * 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else if bytes < 1024u64 * 1024 * 1024 * 1024 {
+        format!("{:.2} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+    } else {
+        format!("{:.2} TB", bytes as f64 / (1024.0 * 1024.0 * 1024.0 * 1024.0))
     }
 }
 
@@ -2081,21 +2174,37 @@ mod tests {
     }
 
     #[test]
-    fn clear_removes_all_state() {
+    fn clear_removes_finished_bars_and_resets_status() {
         let mut state = RenderState::new();
         let mut logs = Vec::new();
         let mut emits = Vec::new();
 
-        // Add some state
-        let id = ProgressId(0);
+        // Add an unfinished bar (position < total) and a finished bar
+        let live_id = ProgressId(0);
+        let done_id = ProgressId(1);
         process_msg(
             &RenderMsg::Event(UiEvent::ProgressCreate {
-                id,
+                id: live_id,
                 kind: ProgressKind::Bar,
                 total: 100,
-                label: "test".into(),
+                label: "live".into(),
                 unit: "rec".into(),
             }),
+            &mut state, &mut logs, &mut emits,
+        );
+        process_msg(
+            &RenderMsg::Event(UiEvent::ProgressCreate {
+                id: done_id,
+                kind: ProgressKind::Bar,
+                total: 50,
+                label: "done".into(),
+                unit: "rec".into(),
+            }),
+            &mut state, &mut logs, &mut emits,
+        );
+        // Finish the second bar
+        process_msg(
+            &RenderMsg::Event(UiEvent::ProgressUpdate { id: done_id, position: 50 }),
             &mut state, &mut logs, &mut emits,
         );
         process_msg(
@@ -2106,18 +2215,20 @@ mod tests {
             &mut state, &mut logs, &mut emits,
         );
 
-        assert!(!state.bars.is_empty());
+        assert_eq!(state.bars.len(), 2);
         assert!(!state.resource_status.is_empty());
 
-        // Clear
+        // Clear: removes finished bars, keeps live ones, clears status
         process_msg(
             &RenderMsg::Event(UiEvent::Clear),
             &mut state, &mut logs, &mut emits,
         );
 
-        assert!(state.bars.is_empty());
-        assert!(state.bar_order.is_empty());
-        assert!(state.resource_status.is_empty());
+        // Live bar survives, finished bar removed
+        assert_eq!(state.bars.len(), 1, "live bar should survive clear");
+        assert!(state.bars.contains_key(&live_id), "live bar should still exist");
+        assert!(!state.bars.contains_key(&done_id), "finished bar should be removed");
+        assert!(state.resource_status.is_empty(), "resource status should be cleared");
     }
 
     // ── Layout introspection helpers ─────────────────────────────────

@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::pipeline::command::{
-    CommandDoc, CommandOp, CommandResult, OptionDesc, Options, Status, StreamContext,
+    CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options, Status, StreamContext,
     render_options_table,
 };
 
@@ -363,28 +363,32 @@ impl CommandOp for AnalyzeFlamegraphOp {
                 required: true,
                 default: None,
                 description: "Input folded stack trace file".to_string(),
-            },
+                        role: OptionRole::Input,
+        },
             OptionDesc {
                 name: "width".to_string(),
                 type_name: "int".to_string(),
                 required: false,
                 default: Some("120".to_string()),
                 description: "Output width in character columns".to_string(),
-            },
+                        role: OptionRole::Config,
+        },
             OptionDesc {
                 name: "height".to_string(),
                 type_name: "int".to_string(),
                 required: false,
                 default: Some("40".to_string()),
                 description: "Maximum flame graph height in rows".to_string(),
-            },
+                        role: OptionRole::Config,
+        },
             OptionDesc {
                 name: "min-samples".to_string(),
                 type_name: "int".to_string(),
                 required: false,
                 default: Some("10".to_string()),
                 description: "Minimum sample count to display a frame".to_string(),
-            },
+                        role: OptionRole::Config,
+        },
         ]
     }
 }

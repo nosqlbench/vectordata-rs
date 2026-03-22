@@ -9,12 +9,26 @@
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::formats::VecFormat;
 use super::import::ImportArgs;
 
-/// Run the interactive import wizard and return the resolved `ImportArgs`.
+/// When true, all prompts return their default value without waiting for input.
+static AUTO_ACCEPT: AtomicBool = AtomicBool::new(false);
+
+/// Run the wizard with auto-accept disabled (fully interactive).
 pub fn run_wizard() -> ImportArgs {
+    run_wizard_with_auto_accept(false)
+}
+
+/// Run the interactive import wizard. When `auto_accept` is true, all prompts
+/// return their default value without waiting for user input (-y flag).
+pub fn run_wizard_with_auto_accept(auto_accept: bool) -> ImportArgs {
+    AUTO_ACCEPT.store(auto_accept, Ordering::Relaxed);
+    if auto_accept {
+        println!("=== veks datasets import — auto-accept mode (-y) ===");
+    }
     println!("=== veks datasets import — interactive wizard ===");
     println!();
 
@@ -102,6 +116,22 @@ pub fn run_wizard() -> ImportArgs {
         println!("  No base vectors specified. Only metadata operations will be available.");
     }
 
+    // ── Source file location ─────────────────────────────────────────
+    let base_vectors = if let Some(bv) = base_vectors {
+        Some(prompt_source_location(&bv, &output, "Base vectors"))
+    } else {
+        None
+    };
+
+    // ── Precision confirmation for xvec formats ─────────────────────
+    // When the source is already an xvec file, confirm with the user that
+    // the native precision is correct for their use case.
+    let base_convert_format = if let Some(ref bv) = base_vectors {
+        check_vector_precision("Base vectors", bv)
+    } else {
+        None
+    };
+
     // ── Query source ─────────────────────────────────────────────────
     println!();
     println!("--- Query vectors ---");
@@ -114,6 +144,7 @@ pub fn run_wizard() -> ImportArgs {
         match choice.as_str() {
             "2" => {
                 let qv = prompt_optional_path("Path to query vectors");
+                let qv = qv.map(|p| prompt_source_location(&p, &output, "Query vectors"));
                 (qv, false, 10000u32)
             }
             "3" => (None, false, 10000),
@@ -125,6 +156,12 @@ pub fn run_wizard() -> ImportArgs {
         }
     } else {
         (None, false, 10000)
+    };
+
+    let query_convert_format = if let Some(ref qv) = query_vectors {
+        check_vector_precision("Query vectors", qv)
+    } else {
+        None
     };
 
     // ── Metadata ─────────────────────────────────────────────────────
@@ -186,14 +223,83 @@ pub fn run_wizard() -> ImportArgs {
         (None, None)
     };
 
-    // ── Distance metric ──────────────────────────────────────────────
+    // ── Source metric and normalization ─────────────────────────────
+    //
+    // The distance metric is a property of the source data — it describes
+    // how the embedding model was trained. The user can't arbitrarily
+    // change it; the only meaningful transformation is L2-normalization,
+    // which makes Cosine distance equivalent to (negated) Dot Product and
+    // changes the L2 distance ranking to match Cosine ranking.
+    println!();
+    println!("--- Distance metric ---");
+    println!("  The distance metric describes how the source vectors were trained.");
+    println!("  Common metrics:");
+    println!("    L2         — Euclidean distance (most embedding models)");
+    println!("    Cosine     — Cosine similarity (angular distance)");
+    println!("    DotProduct — Inner product (often used with normalized vectors)");
+    println!();
+    let source_metric = prompt_with_default(
+        "What distance metric does this data use?",
+        "L2",
+    );
+
+    // Normalization detection and metric implications
+    let (normalize, metric) = if let Some(ref bv) = base_vectors {
+        eprint!("Sampling vectors for normalization detection... ");
+        use std::io::Write;
+        let _ = std::io::stderr().flush();
+        if let Some((is_normalized, sample_count, mean_norm)) = super::import::detect_normalized(bv) {
+            if is_normalized {
+                eprintln!("done.");
+                println!();
+                println!("  Vectors are L2-normalized (mean norm={:.4}, n={})", mean_norm, sample_count);
+                if source_metric.eq_ignore_ascii_case("Cosine") {
+                    println!("  Since vectors are already normalized, Cosine and DotProduct are equivalent.");
+                    println!("  KNN will use Cosine as specified.");
+                }
+                (false, source_metric)
+            } else {
+                eprintln!("done.");
+                println!();
+                println!("  Vectors are NOT L2-normalized (mean norm={:.4}, n={})", mean_norm, sample_count);
+                println!();
+                println!("  L2-normalizing converts vectors to unit length. This changes distance behavior:");
+                println!("    - L2 distance ranking becomes equivalent to Cosine ranking");
+                println!("    - DotProduct becomes equivalent to Cosine similarity");
+                println!("    - Original magnitude information is lost (irreversible)");
+                println!();
+                if confirm("L2-normalize vectors during extraction?", false) {
+                    println!();
+                    println!("  Normalization will be applied. The effective metric for KNN:");
+                    let effective = if source_metric.eq_ignore_ascii_case("L2") {
+                        println!("    Source metric L2 on normalized vectors → Cosine-equivalent ranking.");
+                        println!("    Using Cosine as the KNN metric.");
+                        "Cosine".to_string()
+                    } else if source_metric.eq_ignore_ascii_case("DotProduct") {
+                        println!("    Source metric DotProduct on normalized vectors → Cosine-equivalent.");
+                        println!("    Using Cosine as the KNN metric.");
+                        "Cosine".to_string()
+                    } else {
+                        println!("    Keeping {} as the KNN metric.", source_metric);
+                        source_metric.clone()
+                    };
+                    (true, effective)
+                } else {
+                    println!("  Keeping vectors unnormalized. KNN will use {} as specified.", source_metric);
+                    (false, source_metric)
+                }
+            }
+        } else {
+            eprintln!("skipped (format not supported for sampling).");
+            (false, source_metric)
+        }
+    } else {
+        (false, source_metric)
+    };
+
+    // ── Remaining configuration ─────────────────────────────────────
     println!();
     println!("--- Configuration ---");
-    let metric = if has_queries && ground_truth.is_none() {
-        prompt_with_default("Distance metric (L2, Cosine, DotProduct)", "L2")
-    } else {
-        "L2".to_string()
-    };
 
     let neighbors = if has_queries {
         let n_str = prompt_with_default("Number of neighbors (k)", "100");
@@ -212,11 +318,88 @@ pub fn run_wizard() -> ImportArgs {
         true
     };
 
+    let no_zero_check = if base_vectors.is_some() {
+        // Default to yes when dedup is enabled (most common case)
+        let default_yes = !no_dedup;
+        !confirm("Check for and exclude zero vectors?", default_yes)
+    } else {
+        true
+    };
+
+    if !no_dedup && !no_zero_check {
+        println!("  A clean ordinal index will be produced excluding both duplicates and zeros.");
+    } else if !no_dedup {
+        println!("  A clean ordinal index will be produced excluding duplicates.");
+    } else if !no_zero_check {
+        println!("  A clean ordinal index will be produced excluding zeros.");
+    }
+
     let no_filtered = if metadata.is_some() && has_queries {
         !confirm("Include filtered KNN (predicated search)?", true)
     } else {
         true
     };
+
+    // ── Sized profiles ────────────────────────────────────────────────
+    let sized_profiles = if let Some(ref bv) = base_vectors {
+        if !has_queries {
+            None
+        } else {
+            let vec_count = probe_vector_count(bv);
+            let effective_max = vec_count
+                .map(|n| n.saturating_sub(query_count as u64))
+                .unwrap_or(0);
+            let max_label = format_count_label(effective_max);
+
+            println!();
+            println!("--- Sized profiles ---");
+            if effective_max > 0 {
+                println!("  Base vector count after query extraction: ~{}", max_label);
+            }
+            println!("  Sized profiles create windowed subsets of the base vectors at");
+            println!("  different scales (e.g., 1M, 2M, 4M, ..., 10M, 20M, ...).");
+            println!();
+            println!("  Why this is useful:");
+            println!("    - Benchmark search performance across dataset sizes");
+            println!("    - Smaller profiles compute KNN much faster, giving early results");
+            println!("    - Verification runs on smaller profiles first, catching errors");
+            println!("      before investing hours on the full dataset");
+            println!("    - KNN partition caches are shared across profiles — partitions");
+            println!("      computed for a 10M profile are reused by 50M, 100M, etc.");
+            println!("    - Incremental workflow: verify correctness at 1M, then 10M,");
+            println!("      then scale up with confidence");
+            println!();
+            if effective_max < 2_000_000 {
+                println!("  Dataset is small enough that sized profiles may not be needed.");
+                if !confirm("Generate sized profiles anyway?", false) {
+                    None
+                } else {
+                    let default_spec = format!("mul:1m..{}/2", max_label);
+                    let spec = prompt_optional(&format!("  Sized profile spec [{}]", default_spec));
+                    Some(spec.unwrap_or(default_spec))
+                }
+            } else if confirm("Generate sized profiles?", true) {
+                let default_spec = format!("mul:1m..{}/2, 0m..{}/10m", max_label, max_label);
+                println!();
+                println!("  Default: {}", default_spec);
+                println!("  Or enter a custom spec, or press Enter for the default.");
+                let spec = prompt_optional("  Sized profile spec (Enter for default)");
+                Some(spec.unwrap_or(default_spec))
+            } else {
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // ── Cache compression ────────────────────────────────────────────
+    println!();
+    println!("--- Cache compression ---");
+    println!("  Eligible cache files (sorted runs, KNN partitions, predicate segments)");
+    println!("  can be gzip-compressed to save disk space. These files are only ever");
+    println!("  read sequentially, so compression has no impact on access patterns.");
+    let compress_cache = confirm("Compress eligible cache files?", true);
 
     // ── Summary ──────────────────────────────────────────────────────
     println!();
@@ -232,10 +415,16 @@ pub fn run_wizard() -> ImportArgs {
     println!("  Metric:        {}", metric);
     println!("  Neighbors:     {}", neighbors);
     println!("  Seed:          {}", seed);
+    println!("  Normalize:     {}", if normalize { "yes" } else { "no" });
     println!("  Dedup:         {}", if no_dedup { "no" } else { "yes" });
+    println!("  Zero check:    {}", if no_zero_check { "no" } else { "yes" });
     if metadata.is_some() && has_queries {
         println!("  Filtered KNN:  {}", if no_filtered { "no" } else { "yes" });
     }
+    if let Some(ref sp) = sized_profiles {
+        println!("  Sized profiles: {}", sp);
+    }
+    println!("  Compress cache: {}", if compress_cache { "yes" } else { "no" });
     println!();
 
     if !confirm("Proceed with this configuration?", true) {
@@ -258,9 +447,235 @@ pub fn run_wizard() -> ImportArgs {
         seed,
         description,
         no_dedup,
+        no_zero_check,
         no_filtered,
+        normalize,
         force: true, // user already confirmed overwrite above
+        base_convert_format,
+        query_convert_format,
+        compress_cache,
+        sized_profiles,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Source file location
+// ---------------------------------------------------------------------------
+
+/// Prompt the user about where to keep a source data file.
+///
+/// Options:
+/// 1. Move to .cache/ (recommended — keeps workspace clean, not published)
+/// 2. Keep in place but rename with _ prefix (not published, stays accessible)
+/// 3. Keep as-is (will be flagged as extraneous if not in pipeline manifest)
+///
+/// Returns the final path to use in the pipeline.
+fn prompt_source_location(source: &Path, output_dir: &Path, label: &str) -> PathBuf {
+    let filename = source.file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    // If already in .cache/ or starts with _, no action needed
+    let source_str = source.to_string_lossy();
+    if source_str.contains(".cache/") || source_str.contains("/.cache/") || filename.starts_with('_') {
+        return source.to_path_buf();
+    }
+
+    println!();
+    println!("  --- {} source file location ---", label);
+    println!("  Source files should not be published. Options:");
+    println!("    1. Rename with _ prefix (not published, stays accessible locally)");
+    println!("    2. Move to .cache/ (not published, workspace stays clean)");
+    println!("    3. Keep as-is (may be flagged as extraneous by veks check)");
+    let choice = prompt_with_default("  Choice [1/2/3]", "1");
+
+    match choice.as_str() {
+        "1" => {
+            let parent = source.parent().unwrap_or(Path::new("."));
+            let new_name = format!("_{}", filename);
+            let dest = parent.join(&new_name);
+            println!("  Renaming {} → {}", source.display(), dest.display());
+            match std::fs::rename(source, &dest) {
+                Ok(()) => {
+                    println!("  Renamed successfully.");
+                    dest
+                }
+                Err(e) => {
+                    println!("  WARNING: rename failed: {}", e);
+                    source.to_path_buf()
+                }
+            }
+        }
+        "2" => {
+            let cache_dir = output_dir.join(".cache");
+            let dest = cache_dir.join(&filename);
+            println!("  Will move {} → {}", source.display(), dest.display());
+
+            if let Err(e) = std::fs::create_dir_all(&cache_dir) {
+                println!("  WARNING: failed to create .cache/: {}", e);
+                println!("  Falling back to keeping file in place.");
+                return source.to_path_buf();
+            }
+            match std::fs::rename(source, &dest) {
+                Ok(()) => {
+                    println!("  Moved successfully.");
+                    dest
+                }
+                Err(_) => {
+                    println!("  Cross-filesystem move — copying...");
+                    match std::fs::copy(source, &dest) {
+                        Ok(_) => {
+                            let _ = std::fs::remove_file(source);
+                            println!("  Copied and removed original.");
+                            dest
+                        }
+                        Err(e) => {
+                            println!("  WARNING: copy failed: {}", e);
+                            println!("  Keeping file in place.");
+                            source.to_path_buf()
+                        }
+                    }
+                }
+            }
+        }
+        _ => {
+            println!("  Keeping file as-is.");
+            source.to_path_buf()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Vector probing
+// ---------------------------------------------------------------------------
+
+/// Probe a vector file for its record count using mmap (no full read).
+fn probe_vector_count(path: &Path) -> Option<u64> {
+    let format = VecFormat::detect(path)?;
+    if path.is_dir() { return None; }
+    let meta = crate::formats::reader::probe_source(path, format).ok()?;
+    meta.record_count
+}
+
+/// Format a count as a clean suffix label (e.g., 407000000 → "407m").
+fn format_count_label(n: u64) -> String {
+    if n >= 1_000_000_000 && n % 1_000_000_000 == 0 {
+        format!("{}b", n / 1_000_000_000)
+    } else if n >= 1_000_000 && n % 1_000_000 == 0 {
+        format!("{}m", n / 1_000_000)
+    } else if n >= 1_000 && n % 1_000 == 0 {
+        format!("{}k", n / 1_000)
+    } else {
+        format!("{}", n)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Precision confirmation
+// ---------------------------------------------------------------------------
+
+/// Element type label for a given element size.
+fn element_label(elem_size: usize) -> &'static str {
+    match elem_size {
+        2 => "float16 (f16, half-precision)",
+        4 => "float32 (f32, single-precision)",
+        8 => "float64 (f64, double-precision)",
+        _ => "unknown",
+    }
+}
+
+/// The xvec floating-point formats in ascending precision order.
+const FLOAT_XVEC_FORMATS: &[(VecFormat, usize, &str)] = &[
+    (VecFormat::Mvec, 2, "mvec / float16"),
+    (VecFormat::Fvec, 4, "fvec / float32"),
+    (VecFormat::Dvec, 8, "dvec / float64"),
+];
+
+/// Check whether the user is satisfied with the native precision of an xvec
+/// vector file, and advise on up-conversion vs down-conversion if not.
+///
+/// Returns the target format name (e.g., `"mvec"`) if conversion is needed,
+/// or `None` if the file should be used as-is.
+fn check_vector_precision(label: &str, path: &Path) -> Option<String> {
+    let format = match VecFormat::detect(path) {
+        Some(f) => f,
+        None => return None, // not a recognized format — nothing to confirm
+    };
+
+    // Only relevant for floating-point xvec formats
+    let current = match format {
+        VecFormat::Fvec => (4usize, "fvec / float32"),
+        VecFormat::Mvec => (2, "mvec / float16"),
+        VecFormat::Dvec => (8, "dvec / float64"),
+        _ => return None, // ivec, bvec, svec, slab, npy, parquet — skip
+    };
+
+    // Probe for dimensions and record count
+    let meta = match crate::formats::reader::probe_source(path, format) {
+        Ok(m) => m,
+        Err(_) => return None,
+    };
+
+    println!();
+    println!("  {} format: {} — {} elements, dim={}, {} records",
+        label, current.1, element_label(current.0),
+        meta.dimension,
+        meta.record_count.map_or("unknown".to_string(), |n| n.to_string()),
+    );
+
+    if confirm(&format!("  Use {} as-is ({})?", label.to_lowercase(), current.1), true) {
+        return None;
+    }
+
+    // User wants a different precision — show options
+    println!();
+    println!("  Available floating-point precisions:");
+    for (i, (_, elem_size, name)) in FLOAT_XVEC_FORMATS.iter().enumerate() {
+        let marker = if *elem_size == current.0 { " (current)" } else { "" };
+        println!("    {}. {}{}", i + 1, name, marker);
+    }
+
+    let choice_str = prompt_optional("  Target precision [1/2/3]");
+    let chosen = match choice_str.as_deref() {
+        Some("1") => Some(&FLOAT_XVEC_FORMATS[0]),
+        Some("2") => Some(&FLOAT_XVEC_FORMATS[1]),
+        Some("3") => Some(&FLOAT_XVEC_FORMATS[2]),
+        _ => None,
+    };
+
+    let (target_fmt, target_size, target_name) = match chosen {
+        Some((fmt, size, name)) => (*fmt, *size, *name),
+        None => {
+            println!("  No change — keeping {} format.", current.1);
+            return None;
+        }
+    };
+
+    if target_size == current.0 {
+        println!("  No change — already {}.", current.1);
+        return None;
+    }
+
+    if target_size > current.0 {
+        // Up-conversion (e.g., f16 → f32)
+        println!();
+        println!("  NOTE: Up-converting from {} to {} does NOT improve accuracy.", current.1, target_name);
+        println!("  The extra precision bits will be zero-filled. This is only useful");
+        println!("  for compatibility with tools that require a specific element width.");
+        println!();
+        println!("  A convert step will be added to the pipeline.");
+    } else {
+        // Down-conversion (e.g., f32 → f16)
+        println!();
+        println!("  WARNING: Down-converting from {} to {} is a lossy operation.", current.1, target_name);
+        println!("  Precision will be permanently reduced. IEEE 754 rounding rules apply");
+        println!("  (round-to-nearest-even). Values outside the target range will saturate");
+        println!("  to ±Inf.");
+        println!();
+        println!("  A convert step will be added to the pipeline.");
+    }
+
+    Some(target_fmt.name().to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -334,8 +749,13 @@ fn dir_size(dir: &Path) -> u64 {
 // Prompt helpers
 // ---------------------------------------------------------------------------
 
-/// Prompt with a default value. Returns the default if the user presses Enter.
+/// Prompt with a default value. Returns the default if the user presses Enter
+/// or if auto-accept mode is active.
 fn prompt_with_default(label: &str, default: &str) -> String {
+    if AUTO_ACCEPT.load(Ordering::Relaxed) {
+        eprintln!("{} [{}]: {}", label, default, default);
+        return default.to_string();
+    }
     eprint!("{} [{}]: ", label, default);
     io::stderr().flush().unwrap_or(());
     let mut input = String::new();
@@ -348,8 +768,12 @@ fn prompt_with_default(label: &str, default: &str) -> String {
     }
 }
 
-/// Prompt for an optional string. Returns None if empty.
+/// Prompt for an optional string. Returns None if empty or in auto-accept mode.
 fn prompt_optional(label: &str) -> Option<String> {
+    if AUTO_ACCEPT.load(Ordering::Relaxed) {
+        eprintln!("{}: (default)", label);
+        return None;
+    }
     eprint!("{}: ", label);
     io::stderr().flush().unwrap_or(());
     let mut input = String::new();
@@ -362,7 +786,7 @@ fn prompt_optional(label: &str) -> Option<String> {
     }
 }
 
-/// Prompt for an optional path. Returns None if empty.
+/// Prompt for an optional path. Returns None if empty or in auto-accept mode.
 fn prompt_optional_path(label: &str) -> Option<PathBuf> {
     prompt_optional(label).map(PathBuf::from)
 }
@@ -372,8 +796,14 @@ fn prompt_path_with_default(label: &str, default: &str) -> PathBuf {
     PathBuf::from(prompt_with_default(label, default))
 }
 
-/// Yes/no confirmation prompt. Returns `default` on empty input.
+/// Yes/no confirmation prompt. Returns `default` on empty input or in
+/// auto-accept mode.
 fn confirm(question: &str, default: bool) -> bool {
+    if AUTO_ACCEPT.load(Ordering::Relaxed) {
+        let answer = if default { "Y" } else { "N" };
+        eprintln!("{} [{}]: {}", question, if default { "Y/n" } else { "y/N" }, answer);
+        return default;
+    }
     let hint = if default { "Y/n" } else { "y/N" };
     eprint!("{} [{}]: ", question, hint);
     io::stderr().flush().unwrap_or(());

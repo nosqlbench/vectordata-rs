@@ -20,7 +20,7 @@ use vectordata::VectorReader;
 use vectordata::io::MmapVectorReader;
 
 use crate::pipeline::command::{
-    CommandDoc, CommandOp, CommandResult, OptionDesc, Options, ResourceDesc, Status, StreamContext,
+    CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options, ResourceDesc, Status, StreamContext,
     render_options_table,
 };
 use super::source_window::resolve_source;
@@ -448,42 +448,48 @@ impl CommandOp for AnalyzeVerifyKnnOp {
                 required: true,
                 default: None,
                 description: "Base vectors file (fvec)".to_string(),
-            },
+                        role: OptionRole::Input,
+        },
             OptionDesc {
                 name: "query".to_string(),
                 type_name: "Path".to_string(),
                 required: true,
                 default: None,
                 description: "Query vectors file (fvec)".to_string(),
-            },
+                        role: OptionRole::Input,
+        },
             OptionDesc {
                 name: "indices".to_string(),
                 type_name: "Path".to_string(),
                 required: true,
                 default: None,
                 description: "Precomputed neighbor indices (ivec)".to_string(),
-            },
+                        role: OptionRole::Input,
+        },
             OptionDesc {
                 name: "metric".to_string(),
                 type_name: "enum".to_string(),
                 required: false,
                 default: Some("L2".to_string()),
                 description: "Distance metric: L2, COSINE, DOT_PRODUCT, L1".to_string(),
-            },
+                        role: OptionRole::Config,
+        },
             OptionDesc {
                 name: "phi".to_string(),
                 type_name: "float".to_string(),
                 required: false,
                 default: Some("0.001".to_string()),
                 description: "Floating-point tolerance for distance comparison".to_string(),
-            },
+                        role: OptionRole::Config,
+        },
             OptionDesc {
                 name: "range".to_string(),
                 type_name: "String".to_string(),
                 required: false,
                 default: None,
                 description: "Query range to verify (e.g. '0..100')".to_string(),
-            },
+                        role: OptionRole::Config,
+        },
         ]
     }
 }

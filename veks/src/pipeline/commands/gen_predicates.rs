@@ -17,8 +17,8 @@ use crate::formats::pnode::{
     Comparand, ConjugateNode, ConjugateType, FieldRef, OpType, PNode, PredicateNode,
 };
 use crate::pipeline::command::{
-    ArtifactManifest, CommandDoc, CommandOp, CommandResult, OptionDesc, Options, Status,
-    StreamContext, render_options_table,
+    ArtifactManifest, CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options,
+    Status, StreamContext, render_options_table,
 };
 use crate::pipeline::rng;
 
@@ -153,7 +153,7 @@ key slab provide the ground truth needed to measure filtered-search recall.
                 Err(e) => return error_result(e, start),
             }
         } else {
-            match survey_slab(&input_path, max_samples, max_distinct) {
+            match survey_slab(&input_path, max_samples, max_distinct, Some(&ctx.ui)) {
                 Ok(s) => s,
                 Err(e) => return error_result(e, start),
             }
@@ -250,16 +250,16 @@ key slab provide the ground truth needed to measure filtered-search recall.
 
     fn describe_options(&self) -> Vec<OptionDesc> {
         vec![
-            opt("input", "Path", true, None, "Metadata slab to survey"),
-            opt("output", "Path", true, None, "Output slab for predicates"),
-            opt("survey", "Path", false, None, "Pre-computed survey JSON from 'survey --output' (skips re-surveying the slab)"),
-            opt("count", "int", false, Some("100"), "Number of predicates to generate"),
-            opt("selectivity", "float", false, Some("0.1"), "Target selectivity (0.0–1.0)"),
-            opt("selectivity-max", "float", false, None, "If set, selectivity is uniform in [selectivity, selectivity-max]"),
-            opt("samples", "int", false, Some("1000"), "Survey sample count"),
-            opt("max-distinct", "int", false, Some("100"), "Max distinct values tracked per field during survey"),
-            opt("strategy", "string", false, Some("eq"), "Predicate strategy: 'eq' (single-field Eq, default) or 'compound' (multi-field AND with mixed ops)"),
-            opt("seed", "int", false, Some("42"), "RNG seed"),
+            opt("input", "Path", true, None, "Metadata slab to survey", OptionRole::Input),
+            opt("output", "Path", true, None, "Output slab for predicates", OptionRole::Output),
+            opt("survey", "Path", false, None, "Pre-computed survey JSON from 'survey --output' (skips re-surveying the slab)", OptionRole::Input),
+            opt("count", "int", false, Some("100"), "Number of predicates to generate", OptionRole::Config),
+            opt("selectivity", "float", false, Some("0.1"), "Target selectivity (0.0–1.0)", OptionRole::Config),
+            opt("selectivity-max", "float", false, None, "If set, selectivity is uniform in [selectivity, selectivity-max]", OptionRole::Config),
+            opt("samples", "int", false, Some("1000"), "Survey sample count", OptionRole::Config),
+            opt("max-distinct", "int", false, Some("100"), "Max distinct values tracked per field during survey", OptionRole::Config),
+            opt("strategy", "string", false, Some("eq"), "Predicate strategy: 'eq' (single-field Eq, default) or 'compound' (multi-field AND with mixed ops)", OptionRole::Config),
+            opt("seed", "int", false, Some("42"), "RNG seed", OptionRole::Config),
         ]
     }
 
@@ -799,14 +799,15 @@ fn error_result(message: String, start: Instant) -> CommandResult {
     }
 }
 
-fn opt(name: &str, type_name: &str, required: bool, default: Option<&str>, desc: &str) -> OptionDesc {
+fn opt(name: &str, type_name: &str, required: bool, default: Option<&str>, desc: &str, role: OptionRole) -> OptionDesc {
     OptionDesc {
         name: name.to_string(),
         type_name: type_name.to_string(),
         required,
         default: default.map(|s| s.to_string()),
         description: desc.to_string(),
-    }
+        role,
+}
 }
 
 #[cfg(test)]

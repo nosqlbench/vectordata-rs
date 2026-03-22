@@ -15,8 +15,8 @@ use crate::formats::reader;
 use crate::formats::writer::{self, SinkConfig};
 use crate::formats::facet::Facet;
 use crate::pipeline::command::{
-    ArtifactManifest, CommandDoc, CommandOp, CommandResult, OptionDesc, Options, ResourceDesc,
-    Status, StreamContext, render_options_table,
+    ArtifactManifest, CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options,
+    ResourceDesc, Status, StreamContext, render_options_table,
 };
 
 /// Pipeline command: import a single facet from source to output.
@@ -161,6 +161,67 @@ work with.
             }
         };
 
+        // Probe source metadata first (without opening a full reader) for
+        // the symlink fast-path check.
+        let probe = match reader::probe_source(&source_path, source_format) {
+            Ok(m) => m,
+            Err(e) => return error_result(format!("failed to probe source {}: {}", source_path.display(), e), start),
+        };
+        let target_format = facet.preferred_format(probe.element_size);
+
+        // Symlink fast path: if the source is already in the target format,
+        // is a single file (not a directory), and no count limit is specified,
+        // create a symlink instead of copying bytes.
+        if source_format == target_format
+            && max_count.is_none()
+            && source_path.is_file()
+        {
+            // Ensure output directory exists
+            if let Some(parent) = output_path.parent() {
+                if !parent.exists() {
+                    if let Err(e) = std::fs::create_dir_all(parent) {
+                        return error_result(
+                            format!("failed to create directory {}: {}", parent.display(), e),
+                            start,
+                        );
+                    }
+                }
+            }
+
+            // Remove existing output if present (could be a stale symlink or file)
+            if output_path.exists() || output_path.symlink_metadata().is_ok() {
+                let _ = std::fs::remove_file(&output_path);
+            }
+
+            // Create absolute symlink
+            let abs_source = if source_path.is_absolute() {
+                source_path.clone()
+            } else {
+                std::env::current_dir().unwrap_or_default().join(&source_path)
+            };
+            match std::os::unix::fs::symlink(&abs_source, &output_path) {
+                Ok(()) => {
+                    let record_str = probe.record_count
+                        .map_or("unknown".to_string(), |n| n.to_string());
+                    return CommandResult {
+                        status: Status::Ok,
+                        message: format!(
+                            "symlinked {} → {} ({} records, format already {})",
+                            output_path.display(), abs_source.display(), record_str, source_format.name(),
+                        ),
+                        produced: vec![output_path],
+                        elapsed: start.elapsed(),
+                    };
+                }
+                Err(e) => {
+                    ctx.ui.log(&format!(
+                        "  symlink failed ({}), falling back to copy", e
+                    ));
+                    // Fall through to normal import
+                }
+            }
+        }
+
         // Open source
         let mut source = match reader::open_source_for_facet(&source_path, source_format, facet, threads, max_count) {
             Ok(s) => s,
@@ -304,42 +365,48 @@ work with.
                 required: true,
                 default: None,
                 description: "Source file or directory".to_string(),
-            },
+                role: OptionRole::Input,
+        },
             OptionDesc {
                 name: "output".to_string(),
                 type_name: "Path".to_string(),
                 required: true,
                 default: None,
                 description: "Output file path".to_string(),
-            },
+                role: OptionRole::Output,
+        },
             OptionDesc {
                 name: "facet".to_string(),
                 type_name: "enum".to_string(),
                 required: true,
                 default: None,
                 description: "Facet type (e.g. base_vectors, query_vectors)".to_string(),
-            },
+                role: OptionRole::Config,
+        },
             OptionDesc {
                 name: "format".to_string(),
                 type_name: "String".to_string(),
                 required: false,
                 default: None,
                 description: "Source format override (auto-detected if omitted)".to_string(),
-            },
+                role: OptionRole::Config,
+        },
             OptionDesc {
                 name: "threads".to_string(),
                 type_name: "int".to_string(),
                 required: false,
                 default: Some("0".to_string()),
                 description: "Number of loader threads (0 = auto)".to_string(),
-            },
+                role: OptionRole::Config,
+        },
             OptionDesc {
                 name: "count".to_string(),
                 type_name: "int".to_string(),
                 required: false,
                 default: None,
                 description: "Maximum number of records to import (all if omitted)".to_string(),
-            },
+                role: OptionRole::Config,
+        },
         ]
     }
 

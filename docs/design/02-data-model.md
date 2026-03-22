@@ -249,7 +249,16 @@ A complete predicated dataset contains:
 | L2 (Euclidean) | simsimd | AVX-512, AVX2, NEON, SVE dispatched |
 | Cosine | simsimd | Hardware-dispatched |
 | DotProduct | simsimd | Hardware-dispatched |
-| L1 (Manhattan) | Hand-rolled | AVX2/AVX-512, simsimd lacks L1 |
+| L1 (Manhattan) | Hand-rolled | AVX2/AVX-512 scalar, simsimd lacks L1 |
 
-All metrics support both f32 and f16 element types via `select_distance_fn`
-and `select_distance_fn_f16`.
+All metrics support **f32, f16, f64, and i8** element types:
+
+| Element type | Distance selector | SIMD | Notes |
+|-------------|------------------|------|-------|
+| f32 | `select_distance_fn` | simsimd + transposed AVX-512 batch | Primary path for fvec |
+| f16 | `select_distance_fn_f16` | simsimd (via f16→f32 conversion) + transposed batch | Primary path for mvec |
+| f64 | `select_distance_fn_f64` | simsimd native f64 SIMD | For dvec (no transposed batch yet) |
+| i8 | `select_distance_fn_i8` | simsimd native i8 SIMD | For quantized data (no transposed batch yet) |
+
+Integer types (i32, i16, u8) do not have dedicated distance functions.
+If distance is needed on integer data, convert to float first.

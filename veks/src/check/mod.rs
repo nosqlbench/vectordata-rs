@@ -106,19 +106,38 @@ pub fn run(args: CheckArgs) {
         std::process::exit(2);
     }
 
-    // Determine which checks to run: if no specific --check-* flags are
-    // given, run all (same as --check-all).
+    // Detect context: dataset directory, publish path, or unrecognized.
+    let has_dataset_yaml = directory.join("dataset.yaml").exists();
+    let has_publish_url = publish_url::find_publish_file(&directory).is_some();
+    let has_catalog_root = find_catalog_root_file(&directory).is_some();
+    let is_publish_path = has_publish_url || has_catalog_root;
+
+    if !has_dataset_yaml && !is_publish_path {
+        eprintln!("Error: '{}' has no dataset.yaml and is not part of a publish path", directory.display());
+        eprintln!("  (no .publish_url or .catalog_root found in any parent directory)");
+        std::process::exit(2);
+    }
+
+    // Determine which checks to run based on context:
+    // - Dataset directory: pipeline, integrity, extraneous, merkle
+    // - Publish path (non-dataset): add publish, catalogs
     let any_specific = args.check_pipelines || args.check_publish
         || args.check_merkle || args.check_integrity || args.check_catalogs
         || args.check_extraneous;
     let run_all = args.check_all || !any_specific;
 
-    let run_pipelines = run_all || args.check_pipelines;
-    let run_publish = run_all || args.check_publish;
-    let run_merkle = run_all || args.check_merkle;
-    let run_integrity = run_all || args.check_integrity;
-    let run_catalogs = run_all || args.check_catalogs;
-    let run_extraneous = run_all || args.check_extraneous || args.clean_files;
+    // Dataset directory context takes precedence over publish path.
+    // When in a dataset directory, only dataset-local checks run.
+    // Publish/catalog checks only run from a non-dataset publish path.
+    let is_dataset_context = has_dataset_yaml;
+    let is_publish_context = !has_dataset_yaml && is_publish_path;
+
+    let run_pipelines = is_dataset_context && (run_all || args.check_pipelines);
+    let run_publish = is_publish_context && (run_all || args.check_publish);
+    let run_merkle = is_dataset_context && (run_all || args.check_merkle);
+    let run_integrity = is_dataset_context && (run_all || args.check_integrity);
+    let run_catalogs = is_publish_context && (run_all || args.check_catalogs);
+    let run_extraneous = is_dataset_context && (run_all || args.check_extraneous || args.clean_files);
 
     let merkle_threshold = parse_size(&args.merkle_min_size).unwrap_or_else(|| {
         eprintln!("Error: invalid size '{}'", args.merkle_min_size);
@@ -317,6 +336,19 @@ fn discover_datasets_recursive(dir: &Path, found: &mut Vec<PathBuf>) {
     }
 }
 
+/// Walk up from `dir` looking for `.catalog_root`.
+fn find_catalog_root_file(dir: &Path) -> Option<PathBuf> {
+    let mut current = std::fs::canonicalize(dir).unwrap_or(dir.to_path_buf());
+    loop {
+        if current.join(".catalog_root").is_file() {
+            return Some(current);
+        }
+        if !current.pop() {
+            return None;
+        }
+    }
+}
+
 /// Parse a human-readable size string like "100M", "50MiB", "1G" into bytes.
 pub fn parse_size(s: &str) -> Option<u64> {
     let s = s.trim();
@@ -354,12 +386,24 @@ pub fn parse_size(s: &str) -> Option<u64> {
 }
 
 fn print_human(results: &[CheckResult]) {
+    use crate::term;
+
     for result in results {
-        let icon = if result.passed { "\u{2713}" } else { "\u{2717}" };
         if result.passed {
-            println!("{} check {}: ok", icon, result.name);
+            println!("{} check {}: {}",
+                term::ok("\u{2713}"),
+                term::bold(result.name),
+                term::ok("ok"),
+            );
+            for msg in &result.messages {
+                println!("    {}", term::dim(msg));
+            }
         } else {
-            println!("{} check {}: FAILED", icon, result.name);
+            println!("{} check {}: {}",
+                term::fail("\u{2717}"),
+                term::bold(result.name),
+                term::fail("FAILED"),
+            );
             for msg in &result.messages {
                 println!("    {}", msg);
             }

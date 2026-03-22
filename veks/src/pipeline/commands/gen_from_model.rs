@@ -30,7 +30,7 @@ use rand_distr::{Beta, Distribution, Normal, Uniform};
 use serde::Deserialize;
 
 use crate::pipeline::command::{
-    CommandDoc, CommandOp, CommandResult, OptionDesc, Options, Status, StreamContext,
+    CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options, Status, StreamContext,
     render_options_table,
 };
 use crate::pipeline::rng;
@@ -306,28 +306,32 @@ is proprietary or too large to distribute.
                 required: true,
                 default: None,
                 description: "VectorSpaceModel JSON file".to_string(),
-            },
+                        role: OptionRole::Input,
+        },
             OptionDesc {
                 name: "output".to_string(),
                 type_name: "Path".to_string(),
                 required: true,
                 default: None,
                 description: "Output fvec file".to_string(),
-            },
+                        role: OptionRole::Output,
+        },
             OptionDesc {
                 name: "count".to_string(),
                 type_name: "int".to_string(),
                 required: true,
                 default: None,
                 description: "Number of vectors to generate".to_string(),
-            },
+                        role: OptionRole::Config,
+        },
             OptionDesc {
                 name: "seed".to_string(),
                 type_name: "int".to_string(),
                 required: false,
                 default: Some("0".to_string()),
                 description: "Random seed".to_string(),
-            },
+                        role: OptionRole::Config,
+        },
         ]
     }
 }

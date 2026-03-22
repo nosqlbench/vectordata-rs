@@ -822,6 +822,152 @@ unsafe fn convert_f16_to_f32_avx2(src: &[half::f16], dst: &mut [f32]) {
     }
 }
 
+// -- f64 distance functions ---------------------------------------------------
+
+/// Select the best distance function for the given metric operating on f64 vectors.
+///
+/// L2, Cosine, and Dot use SimSIMD's native f64 SIMD kernels. L1 uses a scalar
+/// fallback since SimSIMD does not provide L1.
+pub fn select_distance_fn_f64(metric: Metric) -> fn(&[f64], &[f64]) -> f32 {
+    match metric {
+        Metric::L2 => select_l2_f64(),
+        Metric::Cosine => select_cosine_f64(),
+        Metric::DotProduct => select_dot_product_f64(),
+        Metric::L1 => select_l1_f64(),
+    }
+}
+
+fn select_l2_f64() -> fn(&[f64], &[f64]) -> f32 {
+    |a, b| <f64 as SpatialSimilarity>::l2sq(a, b).unwrap_or(0.0) as f32
+}
+
+fn select_cosine_f64() -> fn(&[f64], &[f64]) -> f32 {
+    |a, b| <f64 as SpatialSimilarity>::cos(a, b).unwrap_or(1.0) as f32
+}
+
+fn select_dot_product_f64() -> fn(&[f64], &[f64]) -> f32 {
+    |a, b| -(<f64 as SpatialSimilarity>::dot(a, b).unwrap_or(0.0) as f32)
+}
+
+fn select_l1_f64() -> fn(&[f64], &[f64]) -> f32 {
+    l1_f64_scalar
+}
+
+fn l1_f64_scalar(a: &[f64], b: &[f64]) -> f32 {
+    let mut sum = 0.0f64;
+    for i in 0..a.len() {
+        sum += (a[i] - b[i]).abs();
+    }
+    sum as f32
+}
+
+#[cfg(test)]
+fn l2_f64_scalar(a: &[f64], b: &[f64]) -> f32 {
+    let mut sum = 0.0f64;
+    for i in 0..a.len() {
+        let d = a[i] - b[i];
+        sum += d * d;
+    }
+    sum as f32
+}
+
+#[cfg(test)]
+fn cosine_f64_scalar(a: &[f64], b: &[f64]) -> f32 {
+    let mut dot = 0.0f64;
+    let mut norm_a = 0.0f64;
+    let mut norm_b = 0.0f64;
+    for i in 0..a.len() {
+        dot += a[i] * b[i];
+        norm_a += a[i] * a[i];
+        norm_b += b[i] * b[i];
+    }
+    let denom = (norm_a * norm_b).sqrt();
+    if denom == 0.0 { 1.0 } else { (1.0 - dot / denom) as f32 }
+}
+
+#[cfg(test)]
+fn dot_product_f64_scalar(a: &[f64], b: &[f64]) -> f32 {
+    let mut dot = 0.0f64;
+    for i in 0..a.len() {
+        dot += a[i] * b[i];
+    }
+    -dot as f32
+}
+
+// -- i8 distance functions ----------------------------------------------------
+
+/// Select the best distance function for the given metric operating on i8 vectors.
+///
+/// L2, Cosine, and Dot use SimSIMD's native i8 SIMD kernels. L1 uses a scalar
+/// fallback since SimSIMD does not provide L1.
+pub fn select_distance_fn_i8(metric: Metric) -> fn(&[i8], &[i8]) -> f32 {
+    match metric {
+        Metric::L2 => select_l2_i8(),
+        Metric::Cosine => select_cosine_i8(),
+        Metric::DotProduct => select_dot_product_i8(),
+        Metric::L1 => select_l1_i8(),
+    }
+}
+
+fn select_l2_i8() -> fn(&[i8], &[i8]) -> f32 {
+    |a, b| <i8 as SpatialSimilarity>::l2sq(a, b).unwrap_or(0.0) as f32
+}
+
+fn select_cosine_i8() -> fn(&[i8], &[i8]) -> f32 {
+    |a, b| <i8 as SpatialSimilarity>::cos(a, b).unwrap_or(1.0) as f32
+}
+
+fn select_dot_product_i8() -> fn(&[i8], &[i8]) -> f32 {
+    |a, b| -(<i8 as SpatialSimilarity>::dot(a, b).unwrap_or(0.0) as f32)
+}
+
+fn select_l1_i8() -> fn(&[i8], &[i8]) -> f32 {
+    l1_i8_scalar
+}
+
+fn l1_i8_scalar(a: &[i8], b: &[i8]) -> f32 {
+    let mut sum = 0i64;
+    for i in 0..a.len() {
+        sum += ((a[i] as i32) - (b[i] as i32)).abs() as i64;
+    }
+    sum as f32
+}
+
+#[cfg(test)]
+fn l2_i8_scalar(a: &[i8], b: &[i8]) -> f32 {
+    let mut sum = 0i64;
+    for i in 0..a.len() {
+        let d = (a[i] as i32) - (b[i] as i32);
+        sum += (d * d) as i64;
+    }
+    sum as f32
+}
+
+#[cfg(test)]
+fn cosine_i8_scalar(a: &[i8], b: &[i8]) -> f32 {
+    let mut dot = 0.0f64;
+    let mut norm_a = 0.0f64;
+    let mut norm_b = 0.0f64;
+    for i in 0..a.len() {
+        let ai = a[i] as f64;
+        let bi = b[i] as f64;
+        dot += ai * bi;
+        norm_a += ai * ai;
+        norm_b += bi * bi;
+    }
+    let denom = (norm_a * norm_b).sqrt();
+    if denom == 0.0 { 1.0 } else { (1.0 - dot / denom) as f32 }
+}
+
+#[cfg(test)]
+fn dot_product_i8_scalar(a: &[i8], b: &[i8]) -> f32 {
+    let mut dot = 0i64;
+    for i in 0..a.len() {
+        dot += (a[i] as i64) * (b[i] as i64);
+    }
+    -(dot as f32)
+}
+
 // -- Reporting ---------------------------------------------------------------
 
 /// Report which SIMD level is available on this system.
@@ -1261,6 +1407,166 @@ mod tests {
                 "L1 f16 mismatch at qi={}: batched={}, pairwise={}",
                 qi, batched_out[qi], pairwise
             );
+        }
+    }
+
+    // -- f64 tests ------------------------------------------------------------
+
+    fn make_f64_vecs(len: usize) -> (Vec<f64>, Vec<f64>) {
+        let a: Vec<f64> = (0..len).map(|i| (i as f64) * 0.1).collect();
+        let b: Vec<f64> = (0..len).map(|i| (i as f64) * 0.2 - 5.0).collect();
+        (a, b)
+    }
+
+    #[test]
+    fn test_f64_select_returns_working_fn() {
+        let (a, b) = make_f64_vecs(8);
+        for metric in [Metric::L2, Metric::Cosine, Metric::DotProduct, Metric::L1] {
+            let f = select_distance_fn_f64(metric);
+            let d = f(&a, &b);
+            assert!(d.is_finite(), "f64 metric {:?} returned non-finite: {}", metric, d);
+        }
+    }
+
+    #[test]
+    fn test_f64_simd_matches_scalar_l2() {
+        let (a, b) = make_f64_vecs(128);
+        let scalar = l2_f64_scalar(&a, &b);
+        let simd = select_distance_fn_f64(Metric::L2)(&a, &b);
+        assert!(
+            (scalar - simd).abs() < 1e-2,
+            "f64 L2 mismatch: scalar={}, simd={}",
+            scalar, simd
+        );
+    }
+
+    #[test]
+    fn test_f64_simd_matches_scalar_cosine() {
+        let (a, b) = make_f64_vecs(128);
+        let scalar = cosine_f64_scalar(&a, &b);
+        let simd = select_distance_fn_f64(Metric::Cosine)(&a, &b);
+        assert!(
+            (scalar - simd).abs() < 1e-3,
+            "f64 Cosine mismatch: scalar={}, simd={}",
+            scalar, simd
+        );
+    }
+
+    #[test]
+    fn test_f64_simd_matches_scalar_dot() {
+        let (a, b) = make_f64_vecs(128);
+        let scalar = dot_product_f64_scalar(&a, &b);
+        let simd = select_distance_fn_f64(Metric::DotProduct)(&a, &b);
+        assert!(
+            (scalar - simd).abs() < 1e-1,
+            "f64 Dot mismatch: scalar={}, simd={}",
+            scalar, simd
+        );
+    }
+
+    #[test]
+    fn test_f64_simd_matches_scalar_l1() {
+        let (a, b) = make_f64_vecs(128);
+        let scalar = l1_f64_scalar(&a, &b);
+        let simd = select_distance_fn_f64(Metric::L1)(&a, &b);
+        assert!(
+            (scalar - simd).abs() < 1e-2,
+            "f64 L1 mismatch: scalar={}, simd={}",
+            scalar, simd
+        );
+    }
+
+    #[test]
+    fn test_f64_odd_length_vectors() {
+        for len in [1, 3, 7, 9, 15, 17, 31, 33, 63, 65] {
+            let a: Vec<f64> = (0..len).map(|i| i as f64).collect();
+            let b: Vec<f64> = (0..len).map(|i| (i as f64) * 2.0).collect();
+
+            for metric in [Metric::L2, Metric::Cosine, Metric::DotProduct, Metric::L1] {
+                let f = select_distance_fn_f64(metric);
+                let d = f(&a, &b);
+                assert!(d.is_finite(), "f64 metric {:?} len={} non-finite", metric, len);
+            }
+        }
+    }
+
+    // -- i8 tests -------------------------------------------------------------
+
+    fn make_i8_vecs(len: usize) -> (Vec<i8>, Vec<i8>) {
+        let a: Vec<i8> = (0..len).map(|i| ((i % 127) as i8).wrapping_sub(64)).collect();
+        let b: Vec<i8> = (0..len).map(|i| ((i * 3 % 127) as i8).wrapping_sub(32)).collect();
+        (a, b)
+    }
+
+    #[test]
+    fn test_i8_select_returns_working_fn() {
+        let (a, b) = make_i8_vecs(8);
+        for metric in [Metric::L2, Metric::Cosine, Metric::DotProduct, Metric::L1] {
+            let f = select_distance_fn_i8(metric);
+            let d = f(&a, &b);
+            assert!(d.is_finite(), "i8 metric {:?} returned non-finite: {}", metric, d);
+        }
+    }
+
+    #[test]
+    fn test_i8_simd_matches_scalar_l2() {
+        let (a, b) = make_i8_vecs(128);
+        let scalar = l2_i8_scalar(&a, &b);
+        let simd = select_distance_fn_i8(Metric::L2)(&a, &b);
+        assert!(
+            (scalar - simd).abs() < 1.0,
+            "i8 L2 mismatch: scalar={}, simd={}",
+            scalar, simd
+        );
+    }
+
+    #[test]
+    fn test_i8_simd_matches_scalar_cosine() {
+        let (a, b) = make_i8_vecs(128);
+        let scalar = cosine_i8_scalar(&a, &b);
+        let simd = select_distance_fn_i8(Metric::Cosine)(&a, &b);
+        assert!(
+            (scalar - simd).abs() < 1e-2,
+            "i8 Cosine mismatch: scalar={}, simd={}",
+            scalar, simd
+        );
+    }
+
+    #[test]
+    fn test_i8_simd_matches_scalar_dot() {
+        let (a, b) = make_i8_vecs(128);
+        let scalar = dot_product_i8_scalar(&a, &b);
+        let simd = select_distance_fn_i8(Metric::DotProduct)(&a, &b);
+        assert!(
+            (scalar - simd).abs() < 1.0,
+            "i8 Dot mismatch: scalar={}, simd={}",
+            scalar, simd
+        );
+    }
+
+    #[test]
+    fn test_i8_simd_matches_scalar_l1() {
+        let (a, b) = make_i8_vecs(128);
+        let scalar = l1_i8_scalar(&a, &b);
+        let simd = select_distance_fn_i8(Metric::L1)(&a, &b);
+        assert!(
+            (scalar - simd).abs() < 1.0,
+            "i8 L1 mismatch: scalar={}, simd={}",
+            scalar, simd
+        );
+    }
+
+    #[test]
+    fn test_i8_odd_length_vectors() {
+        for len in [1, 3, 7, 9, 15, 17, 31, 33, 63, 65] {
+            let a: Vec<i8> = (0..len).map(|i| ((i % 127) as i8).wrapping_sub(64)).collect();
+            let b: Vec<i8> = (0..len).map(|i| ((i * 3 % 127) as i8).wrapping_sub(32)).collect();
+
+            for metric in [Metric::L2, Metric::Cosine, Metric::DotProduct, Metric::L1] {
+                let f = select_distance_fn_i8(metric);
+                let d = f(&a, &b);
+                assert!(d.is_finite(), "i8 metric {:?} len={} non-finite", metric, len);
+            }
         }
     }
 }

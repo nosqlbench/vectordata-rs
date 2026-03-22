@@ -12,11 +12,47 @@
 //! - Progress tracking: records each step's result in the progress log
 
 use std::collections::{HashMap, HashSet};
+use std::io::Write;
 use std::path::PathBuf;
 use std::time::Instant;
 
 use chrono::{DateTime, Utc};
 use log::info;
+
+/// Append-only provenance log for dataset preparation.
+///
+/// Records every pipeline run and step outcome in human-readable form
+/// in `dataset.log` at the workspace root. This is a formal record of
+/// how the data was prepared — not hidden in `.cache/`.
+struct DatasetLog {
+    writer: Option<std::io::BufWriter<std::fs::File>>,
+}
+
+impl DatasetLog {
+    fn open(workspace: &std::path::Path) -> Self {
+        let path = workspace.join("dataset.log");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .ok();
+        DatasetLog {
+            writer: file.map(|f| std::io::BufWriter::new(f)),
+        }
+    }
+
+    fn log(&mut self, msg: &str) {
+        if let Some(ref mut w) = self.writer {
+            let _ = writeln!(w, "{}", msg);
+        }
+    }
+
+    fn flush(&mut self) {
+        if let Some(ref mut w) = self.writer {
+            let _ = w.flush();
+        }
+    }
+}
 
 use super::command::{ArtifactState, CommandResult, Options, Status, StreamContext};
 use super::dag::ResolvedStep;
@@ -53,6 +89,11 @@ pub fn run_steps(
         (true, true) => String::new(),
     };
 
+    // Open the provenance log
+    let mut dlog = DatasetLog::open(&ctx.workspace);
+    dlog.log(&format!("\n=== veks run {} ===", chrono::Local::now().format("%Y-%m-%d %H:%M:%S")));
+    dlog.log(&format!("pipeline: {} steps, profile: {}", total, ctx.profile));
+
     if ctx_label.is_empty() {
         ctx.ui.log(&format!("Pipeline: {} step(s) to evaluate\n", total));
     } else {
@@ -69,7 +110,7 @@ pub fn run_steps(
     let mut total_elapsed = std::time::Duration::ZERO;
     let mut step_outcomes: Vec<(String, bool, String)> = Vec::with_capacity(total);
 
-    let overall_pb = ctx.ui.bar(total as u64, "pipeline");
+    let overall_pb = ctx.ui.bar_with_unit(total as u64, "pipeline", "steps");
 
     let profile_count = ctx.profile_names.len();
 
@@ -121,6 +162,7 @@ pub fn run_steps(
                     skipped_count += 1;
                     step_outcomes.push((step.id.clone(), false, "fresh".into()));
                     ctx.ui.log(&format!("{} {} — fresh, skipping", prefix, step.id));
+                    dlog.log(&format!("  [skip] {} — fresh", step.id));
                     overall_pb.inc(1);
                     continue;
                 }
@@ -150,26 +192,47 @@ pub fn run_steps(
             options.set(k, v);
         }
 
-        // 5. Check artifact state (use interpolated output path, not raw)
+        // 5. Check artifact state (skip if upstream ran — cascade invalidation)
         let resolved_output = resolved_opts.get("output").cloned();
-        let mut use_buffer_write = false;
-        if let Some(ref output_path) = resolved_output {
+        if !upstream_ran { if let Some(ref output_path) = resolved_output {
             let full_path = if std::path::Path::new(output_path.as_str()).is_absolute() {
                 PathBuf::from(output_path)
             } else {
                 ctx.workspace.join(output_path)
             };
-            let buffer_path = buffer_path_for(&full_path);
 
             let state = cmd.check_artifact(&full_path, &options);
             match state {
                 ArtifactState::Complete => {
-                    // Not in progress log but artifact is complete — record and skip
+                    // Make-style freshness: if any input is newer than the
+                    // output, the artifact is stale even if structurally valid.
+                    let output_mtime = std::fs::metadata(&full_path)
+                        .ok()
+                        .and_then(|m| m.modified().ok());
+                    let input_newer = output_mtime.map_or(false, |out_t| {
+                        let descs = cmd.describe_options();
+                        resolved_opts.iter().any(|(key, val)| {
+                            // Check if this option is an Input-role path
+                            let is_input = descs.iter().any(|d| d.name == *key && d.role == super::command::OptionRole::Input);
+                            if !is_input { return false; }
+                            // Strip window notation for path check
+                            let clean_path = PathBuf::from(val.split('[').next().unwrap_or(val));
+                            let check_path = if clean_path.is_absolute() { clean_path } else { ctx.workspace.join(clean_path) };
+                            std::fs::metadata(&check_path)
+                                .ok()
+                                .and_then(|m| m.modified().ok())
+                                .map_or(false, |in_t| in_t > out_t)
+                        })
+                    });
+
+                    if input_newer {
+                        ctx.ui.log(&format!("{} {} — artifact exists but input is newer, re-executing", prefix, step.id));
+                        // Fall through to execution
+                    } else {
                     skipped_count += 1;
                     step_outcomes.push((step.id.clone(), false, "artifact complete".into()));
                     ctx.ui.log(&format!("{} {} — artifact complete, skipping", prefix, step.id));
-                    // Clean up any stale buffer file
-                    let _ = std::fs::remove_file(&buffer_path);
+                    dlog.log(&format!("  [skip] {} — artifact complete", step.id));
                     ctx.progress.record_step(
                         &step.id,
                         StepRecord {
@@ -196,6 +259,7 @@ pub fn run_steps(
                     }
                     overall_pb.inc(1);
                     continue;
+                    } // end else (not input_newer)
                 }
                 ArtifactState::Partial => {
                     match step.def.on_partial {
@@ -206,31 +270,22 @@ pub fn run_steps(
                             ));
                             if !ctx.dry_run {
                                 let _ = std::fs::remove_file(&full_path);
-                                let _ = std::fs::remove_file(&buffer_path);
                             }
-                            // Restart writes to buffer
-                            use_buffer_write = true;
                         }
                         OnPartial::Resume => {
                             ctx.ui.log(&format!(
                                 "{} {} — resuming from partial output '{}'",
                                 prefix, step.id, output_path
                             ));
-                            // Resume writes directly — command manages its own state
                         }
                     }
                 }
                 ArtifactState::Absent => {
-                    // Ensure parent directories exist (e.g. profiles/default/)
                     if let Some(parent) = full_path.parent() {
                         if !parent.exists() && !ctx.dry_run {
                             let _ = std::fs::create_dir_all(parent);
                         }
                     }
-                    // Clean up any stale buffer from a prior crash
-                    let _ = std::fs::remove_file(&buffer_path);
-                    // New writes go to buffer
-                    use_buffer_write = true;
                 }
                 ArtifactState::Unknown(ref reason) => {
                     let msg = format!(
@@ -244,47 +299,21 @@ pub fn run_steps(
                     }
                 }
             }
-        }
+        } } // close if !upstream_ran + if let Some(output_path)
 
-        // 5b. Buffer-write: redirect the output option to a _buffer path.
-        // The command writes to the buffer; on success, the runner renames
-        // it to the final path. This prevents partially-written files from
-        // being mistaken for valid artifacts.
-        //
-        // Buffer-write is skipped for directory outputs (no file extension)
-        // because directory-producing commands like `fetch bulkdl` manage
-        // their own resume state internally. Redirecting to a buffer
-        // directory loses that state and forces full re-downloads.
-        if use_buffer_write {
-            if let Some(ref output_path) = resolved_output {
-                let full_path = if std::path::Path::new(output_path.as_str()).is_absolute() {
-                    PathBuf::from(output_path)
-                } else {
-                    ctx.workspace.join(output_path)
-                };
-                if full_path.is_dir() || full_path.extension().is_none() {
-                    use_buffer_write = false;
+        // Ensure output directory exists even when skipping artifact check
+        if let Some(ref output_path) = resolved_output {
+            let full_path = if std::path::Path::new(output_path.as_str()).is_absolute() {
+                PathBuf::from(output_path)
+            } else {
+                ctx.workspace.join(output_path)
+            };
+            if let Some(parent) = full_path.parent() {
+                if !parent.exists() && !ctx.dry_run {
+                    let _ = std::fs::create_dir_all(parent);
                 }
             }
         }
-        let buffer_final_rename: Option<(PathBuf, PathBuf)> = if use_buffer_write {
-            if let Some(ref output_path) = resolved_output {
-                let full_path = if std::path::Path::new(output_path.as_str()).is_absolute() {
-                    PathBuf::from(output_path)
-                } else {
-                    ctx.workspace.join(output_path)
-                };
-                let buf_path = buffer_path_for(&full_path);
-                // Rewrite the output option to the buffer path
-                let buf_str = buf_path.to_string_lossy().to_string();
-                options.set("output", &buf_str);
-                Some((buf_path, full_path))
-            } else {
-                None
-            }
-        } else {
-            None
-        };
 
         // 6. Validate required options from describe_options
         let option_descs = cmd.describe_options();
@@ -380,10 +409,47 @@ pub fn run_steps(
             ctx.ui.set_context(format!("{} [{}/{}] {}{}", ctx_label, step_num, total, step.id, profile_tag));
         }
 
-        // Send the step definition as YAML for the TUI step panel.
-        match serde_yaml::to_string(&step.def) {
-            Ok(yaml) => ctx.ui.set_step_yaml(yaml),
-            Err(_) => ctx.ui.set_step_yaml(""),
+        // Send a structured step summary for the TUI step panel.
+        // Groups options by role (inputs, outputs, config) using OptionDesc metadata.
+        {
+            let option_descs = cmd.describe_options();
+            let mut panel = format!("run: {}\n", step.def.run);
+
+            let mut inputs: Vec<String> = Vec::new();
+            let mut outputs: Vec<String> = Vec::new();
+            let mut config: Vec<String> = Vec::new();
+
+            for desc in &option_descs {
+                if let Some(val) = resolved_opts.get(&desc.name) {
+                    let line = format!("  {}: {}", desc.name, val);
+                    match desc.role {
+                        super::command::OptionRole::Input => inputs.push(line),
+                        super::command::OptionRole::Output => outputs.push(line),
+                        super::command::OptionRole::Config => config.push(line),
+                    }
+                }
+            }
+            // Include any options not in describe_options (extra YAML keys)
+            for (k, v) in &resolved_opts {
+                if !option_descs.iter().any(|d| d.name == *k) {
+                    config.push(format!("  {}: {}", k, v));
+                }
+            }
+
+            if !inputs.is_empty() {
+                panel.push_str("inputs:\n");
+                for line in &inputs { panel.push_str(line); panel.push('\n'); }
+            }
+            if !outputs.is_empty() {
+                panel.push_str("outputs:\n");
+                for line in &outputs { panel.push_str(line); panel.push('\n'); }
+            }
+            if !config.is_empty() {
+                panel.push_str("config:\n");
+                for line in &config { panel.push_str(line); panel.push('\n'); }
+            }
+
+            ctx.ui.set_step_yaml(panel);
         }
 
         if let Some(ref desc) = step.def.description {
@@ -477,33 +543,13 @@ pub fn run_steps(
             io_write_bytes: end_snapshot.io_write_bps.saturating_sub(baseline_snapshot.io_write_bps),
         });
 
-        // 8. Record result
+        // 8. Record result with the original (unmunged) options
         ctx.ui.clear();
         let record = step_record_from_result(&result, &resolved_opts, resource_summary);
         ctx.progress.record_step(&step.id, record);
 
         match result.status {
             Status::Ok | Status::Warning => {
-                // 8a. Buffer-write: rename buffer → final path
-                if let Some((ref buf_path, ref final_path)) = buffer_final_rename {
-                    if buf_path.exists() {
-                        if let Err(e) = std::fs::rename(buf_path, final_path) {
-                            let msg = format!(
-                                "step '{}': failed to rename buffer '{}' → '{}': {}",
-                                step.id,
-                                buf_path.display(),
-                                final_path.display(),
-                                e,
-                            );
-                            ctx.ui.log(&format!("{} {} — ERROR: {}", prefix, step.id, msg));
-                            if let Err(e) = ctx.progress.save() {
-                                ctx.ui.log(&format!("  warning: failed to save progress: {}", e));
-                            }
-                            return Err(msg);
-                        }
-                    }
-                }
-
                 executed_steps.insert(step.id.clone());
                 executed_count += 1;
                 overall_pb.inc(1);
@@ -512,22 +558,21 @@ pub fn run_steps(
                 let level = if result.status == Status::Ok { "OK" } else { "WARNING" };
                 ctx.ui.log(&format!(
                     "{} {} — {} ({:.1}s): {}",
-                    prefix,
-                    step.id,
-                    level,
-                    elapsed.as_secs_f64(),
-                    result.message
+                    prefix, step.id, level, elapsed.as_secs_f64(), result.message
                 ));
+                dlog.log(&format!("  [{}] {} ({:.1}s): {}",
+                    level.to_lowercase(), step.id, elapsed.as_secs_f64(), result.message));
+                dlog.flush();
             }
             Status::Error => {
                 // Leave buffer file in place for diagnostics; clean up on next run
                 ctx.ui.log(&format!(
                     "{} {} — ERROR ({:.1}s): {}",
-                    prefix,
-                    step.id,
-                    elapsed.as_secs_f64(),
-                    result.message
+                    prefix, step.id, elapsed.as_secs_f64(), result.message
                 ));
+                dlog.log(&format!("  [error] {} ({:.1}s): {}",
+                    step.id, elapsed.as_secs_f64(), result.message));
+                dlog.flush();
                 // Save progress so we can resume later
                 if let Err(e) = ctx.progress.save() {
                     ctx.ui.log(&format!("  warning: failed to save progress: {}", e));
@@ -623,6 +668,11 @@ pub fn run_steps(
 
     overall_pb.finish();
 
+    // Write summary to provenance log
+    dlog.log(&format!("summary: {} executed ({:.1}s), {} skipped, {} total",
+        executed_count, total_elapsed.as_secs_f64(), skipped_count, total));
+    dlog.flush();
+
     Ok(RunSummary {
         total,
         skipped: skipped_count,
@@ -632,21 +682,6 @@ pub fn run_steps(
     })
 }
 
-/// Compute the buffer path for a given output path.
-///
-/// Appends `_buffer` before the file extension (or at the end if no extension):
-/// - `foo.slab` → `foo_buffer.slab`
-/// - `data.mvec` → `data_buffer.mvec`
-/// - `noext` → `noext_buffer`
-fn buffer_path_for(path: &std::path::Path) -> PathBuf {
-    let stem = path.file_stem().unwrap_or_default().to_string_lossy();
-    let ext = path.extension().map(|e| e.to_string_lossy());
-    let buffered_name = match ext {
-        Some(e) => format!("{}_buffer.{}", stem, e),
-        None => format!("{}_buffer", stem),
-    };
-    path.with_file_name(buffered_name)
-}
 
 /// Build a `StepRecord` from a `CommandResult`.
 fn step_record_from_result(

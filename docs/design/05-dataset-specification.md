@@ -635,7 +635,15 @@ dataset-name/
 │   ├── .upstream.progress.yaml     # Pipeline progress log
 │   ├── .governor.log               # Resource governor log (JSON-line)
 │   ├── compute-knn.part_*.cache    # KNN partition caches
-│   └── compute-predicates.seg_*    # Predicate evaluation segment caches
+│   ├── compute-predicates.seg_*    # Predicate evaluation segment caches
+│   ├── dedup_ordinals.ivec         # Sorted ordinal index (from compute dedup)
+│   ├── dedup_duplicates.ivec       # Duplicate vector ordinals
+│   ├── dedup_report.json           # Dedup statistics (total, unique, dup counts)
+│   ├── dedup_runs/                 # Intermediate sorted run files (resumable)
+│   │   ├── run_0000.bin
+│   │   ├── run_0001.bin
+│   │   └── meta.json               # Run parameters for resume validation
+│   └── clean_ordinals.ivec         # Clean index (dedup + zero exclusion applied)
 ├── base_vectors.mvec               # Output facets
 ├── query_vectors.mvec
 ├── neighbor_indices.ivec
@@ -663,6 +671,30 @@ re-executions (to fill in missing pieces or extend the dataset) can skip
 already-cached segments. Deleting cache forces full recomputation of all
 intermediate stages and should be treated as a significant operational
 decision, not routine cleanup.
+
+### Compressed cache files
+
+Cache artifacts that are only accessed in sequential/streaming mode or
+that fit in memory as individual segments may be stored as `.gz` files.
+Compressed cache files are created by the `--compress-cache` option on
+pipeline commands that support it, or retroactively by `veks datasets
+cache-compress`.
+
+**Eligible for compression** (sequential or in-memory segment access):
+- Dedup sorted runs (`dedup_runs/run_*.bin.gz`)
+- KNN partition caches (`*.neighbors.ivec.gz`, `*.distances.fvec.gz`)
+- Predicate segment caches (`*.predkeys.slab.gz`)
+
+**Not eligible** (require mmap random access from disk):
+- `all_vectors.mvec` — random access by ordinal
+- `shuffle.ivec` — random access by index
+- `dedup_ordinals.ivec` — binary search
+- `clean_ordinals.ivec` — random access
+- Any final output file referenced by profile views
+
+Files are compressed in memory before writing and decompressed in memory
+after reading, using the `flate2` crate (gzip format). The `.gz` suffix
+is appended to the original filename.
 
 ---
 
@@ -829,8 +861,25 @@ Each record is:
   `record_size` bytes, extract dimension from first 4 bytes, then read
   `dim` elements.
 
+**Cardinality and dimensionality semantics**:
+
+A **zero-byte xvec file is valid** — it represents an empty record set
+with cardinality 0. This is a defined result, not an error condition.
+Pipeline steps that produce empty outputs (e.g., `analyze zeros` when
+no zero vectors exist, or `clean-ordinals` when no records survive
+filtering) write 0-byte files as their formal outputs.
+
+When cardinality is 0, **dimensionality is undefined** — there are no
+records from which to derive a dimension. Implementations must use a
+sentinel value (e.g., `usize::MAX` or `DIM_UNDEFINED`) rather than 0,
+because 0 could be confused with a degenerate zero-dimensional vector.
+Callers must check `count > 0` before relying on `dim`. Attempting to
+read a record from an empty file is an error.
+
 **Dimension detection**: Read the first 4 bytes of the file as `i32 LE`.
 This gives the dimension. Compute `record_size = 4 + dim × element_size`.
+If the file is 0 bytes, skip dimension detection and report
+count = 0, dim = undefined.
 Compute `count = file_size / record_size`.
 
 #### Slab format (.slab)

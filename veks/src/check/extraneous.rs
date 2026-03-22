@@ -25,6 +25,7 @@ const KNOWN_INFRA: &[&str] = &[
     "catalog.json",
     "catalog.yaml",
     "variables.yaml",
+    "dataset.log",
 ];
 
 /// Check for extraneous publishable files not accounted for by the pipeline.
@@ -140,11 +141,38 @@ pub fn find_extraneous(
     };
 
     let mut accounted: HashSet<String> = HashSet::new();
+    let workspace_canonical = workspace.canonicalize().unwrap_or(workspace.to_path_buf());
+
+    // Normalize all manifest paths to relative form for consistent comparison.
+    // Absolute paths are stripped of the workspace prefix; relative paths pass through.
+    let normalize = |p: &str| -> String {
+        let path = std::path::Path::new(p);
+        if path.is_absolute() {
+            // Try stripping workspace prefix (both original and canonical)
+            if let Ok(rel) = path.strip_prefix(workspace) {
+                return rel.to_string_lossy().to_string();
+            }
+            if let Ok(rel) = path.strip_prefix(&workspace_canonical) {
+                return rel.to_string_lossy().to_string();
+            }
+            // Try canonicalizing the path and stripping
+            if let Ok(canon) = path.canonicalize() {
+                if let Ok(rel) = canon.strip_prefix(&workspace_canonical) {
+                    return rel.to_string_lossy().to_string();
+                }
+            }
+        }
+        p.to_string()
+    };
+
     for p in &wm.final_artifacts {
-        accounted.insert(p.clone());
+        accounted.insert(normalize(p));
     }
     for p in &wm.intermediates {
-        accounted.insert(p.clone());
+        accounted.insert(normalize(p));
+    }
+    for p in &wm.inputs {
+        accounted.insert(normalize(p));
     }
 
     let mut result = Vec::new();
@@ -184,9 +212,12 @@ pub fn find_extraneous(
     result
 }
 
-/// List intermediate (cache) artifacts that are accounted for by the pipeline.
-/// These are safe to keep but not publishable.
-pub fn list_intermediates(
+/// List all cache paths that must be retained by the pipeline.
+///
+/// Includes intermediates, inputs that live in cache (e.g., downloaded
+/// source data), and any outputs stored in cache. Anything in `.cache/`
+/// not in this set is safe to delete.
+pub fn retained_cache_paths(
     dataset_path: &Path,
 ) -> Vec<String> {
     let registry = CommandRegistry::with_builtins();
@@ -196,7 +227,7 @@ pub fn list_intermediates(
     };
 
     match manifest::project_workspace(dataset_path, &config, &registry) {
-        Ok(m) => m.intermediates.into_iter().collect(),
+        Ok(m) => m.retained_cache_paths().into_iter().collect(),
         Err(_) => Vec::new(),
     }
 }

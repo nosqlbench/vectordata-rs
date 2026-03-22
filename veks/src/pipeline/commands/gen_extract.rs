@@ -27,9 +27,10 @@ use std::time::Instant;
 use vectordata::VectorReader;
 use vectordata::io::MmapVectorReader;
 
+use crate::pipeline::atomic_write::AtomicWriter;
 use crate::pipeline::command::{
-    ArtifactManifest, CommandDoc, CommandOp, CommandResult, OptionDesc, Options, ResourceDesc,
-    Status, StreamContext, render_options_table,
+    ArtifactManifest, CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options,
+    ResourceDesc, Status, StreamContext, render_options_table,
 };
 
 // ---- fvec-extract -----------------------------------------------------------
@@ -102,10 +103,6 @@ facets of the dataset.
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
         let start = Instant::now();
 
-        let ivec_str = match options.require("ivec-file") {
-            Ok(s) => s,
-            Err(e) => return error_result(e, start),
-        };
         let fvec_str = match options.require("fvec-file") {
             Ok(s) => s,
             Err(e) => return error_result(e, start),
@@ -115,9 +112,9 @@ facets of the dataset.
             Err(e) => return error_result(e, start),
         };
 
-        let ivec_path = resolve_path(ivec_str, &ctx.workspace);
         let fvec_path = resolve_path(fvec_str, &ctx.workspace);
         let output_path = resolve_path(output_str, &ctx.workspace);
+        let ivec_path = options.get("ivec-file").map(|s| resolve_path(s, &ctx.workspace));
 
         // Parse range
         let range = match options.get("range") {
@@ -126,17 +123,6 @@ facets of the dataset.
                 Err(e) => return error_result(format!("invalid range '{}': {}", r, e), start),
             },
             None => Range { start: 0, end: None },
-        };
-
-        // Open the ivec file (index array)
-        let ivec_reader = match MmapVectorReader::<i32>::open_ivec(&ivec_path) {
-            Ok(r) => r,
-            Err(e) => {
-                return error_result(
-                    format!("failed to open ivec file {}: {}", ivec_path.display(), e),
-                    start,
-                )
-            }
         };
 
         // Open the fvec file (source vectors)
@@ -150,22 +136,18 @@ facets of the dataset.
             }
         };
 
-        let ivec_count = <MmapVectorReader<i32> as VectorReader<i32>>::count(&ivec_reader);
+        // Validate extension — catch mismatched formats early
+        if let Some(ext) = fvec_path.extension().and_then(|e| e.to_str()) {
+            if ext != "fvec" {
+                return error_result(
+                    format!("fvec-extract expects a .fvec file, got .{} — use the appropriate *-extract command for this format", ext),
+                    start,
+                );
+            }
+        }
+
         let fvec_count = <MmapVectorReader<f32> as VectorReader<f32>>::count(&fvec_reader);
         let dim = <MmapVectorReader<f32> as VectorReader<f32>>::dim(&fvec_reader) as u32;
-        let range_start = range.start;
-        let range_end = range.end.unwrap_or(ivec_count);
-
-        if range_start >= ivec_count {
-            return error_result(
-                format!(
-                    "range start {} exceeds ivec count {}",
-                    range_start, ivec_count
-                ),
-                start,
-            );
-        }
-        let effective_end = std::cmp::min(range_end, ivec_count);
 
         // Create output directory
         if let Some(parent) = output_path.parent() {
@@ -176,19 +158,87 @@ facets of the dataset.
             }
         }
 
-        let result = sorted_index_extract_fvec(
-            &fvec_reader, fvec_count, dim,
-            &ivec_reader, range_start, effective_end,
-            &output_path, ctx, start,
-        );
-        match result {
-            Ok(msg) => CommandResult {
+        let normalize = options.get("normalize").map(|s| s == "true").unwrap_or(false);
+        if normalize {
+            ctx.ui.log("  L2 normalization enabled during extraction");
+        }
+
+        if let Some(ref ivec_p) = ivec_path {
+            // Index-based extraction via ivec indirection
+            let ivec_reader = match MmapVectorReader::<i32>::open_ivec(ivec_p) {
+                Ok(r) => r,
+                Err(e) => return error_result(
+                    format!("failed to open ivec file {}: {}", ivec_p.display(), e), start,
+                ),
+            };
+            let ivec_count = <MmapVectorReader<i32> as VectorReader<i32>>::count(&ivec_reader);
+            let range_start = range.start;
+            let range_end = range.end.unwrap_or(ivec_count);
+            if range_start >= ivec_count {
+                return error_result(
+                    format!("range start {} exceeds ivec count {}", range_start, ivec_count), start,
+                );
+            }
+            let effective_end = std::cmp::min(range_end, ivec_count);
+            let result = sorted_index_extract_fvec(
+                &fvec_reader, fvec_count, dim,
+                &ivec_reader, range_start, effective_end,
+                &output_path, normalize, ctx, start,
+            );
+            match result {
+                Ok(msg) => CommandResult {
+                    status: Status::Ok,
+                    message: msg,
+                    produced: vec![output_path],
+                    elapsed: start.elapsed(),
+                },
+                Err(e) => error_result(e, start),
+            }
+        } else {
+            // Range-based extraction: identity function over contiguous range
+            use std::io::Write;
+            let range_start = range.start;
+            let range_end = range.end.unwrap_or(fvec_count);
+            let effective_end = std::cmp::min(range_end, fvec_count);
+            if range_start >= fvec_count {
+                return error_result(
+                    format!("range start {} exceeds fvec count {}", range_start, fvec_count), start,
+                );
+            }
+
+            let mut writer = match AtomicWriter::new(&output_path) {
+                Ok(w) => w,
+                Err(e) => return error_result(format!("failed to create {}: {}", output_path.display(), e), start),
+            };
+            let pb = ctx.ui.bar((effective_end - range_start) as u64, "extracting fvec");
+            for i in range_start..effective_end {
+                let vec = match fvec_reader.get(i) {
+                    Ok(v) => v,
+                    Err(e) => return error_result(format!("read error at {}: {}", i, e), start),
+                };
+                let output_vec = if normalize {
+                    let norm: f32 = vec.iter().map(|v| v * v).sum::<f32>().sqrt();
+                    if norm > 0.0 { vec.iter().map(|v| v / norm).collect() } else { vec }
+                } else {
+                    vec
+                };
+                writer.write_all(&(dim as i32).to_le_bytes()).unwrap_or(());
+                for &v in &output_vec {
+                    writer.write_all(&v.to_le_bytes()).unwrap_or(());
+                }
+                pb.inc(1);
+            }
+            pb.finish();
+            if let Err(e) = writer.finish() {
+                return error_result(format!("failed to finalize {}: {}", output_path.display(), e), start);
+            }
+
+            CommandResult {
                 status: Status::Ok,
-                message: msg,
+                message: format!("extracted {} vectors to {}", effective_end - range_start, output_path.display()),
                 produced: vec![output_path],
                 elapsed: start.elapsed(),
-            },
-            Err(e) => error_result(e, start),
+            }
         }
     }
 
@@ -197,31 +247,43 @@ facets of the dataset.
             OptionDesc {
                 name: "ivec-file".to_string(),
                 type_name: "Path".to_string(),
-                required: true,
+                required: false,
                 default: None,
-                description: "Ivec file containing indices".to_string(),
-            },
+                description: "Ivec file containing indices (identity if omitted)".to_string(),
+                role: OptionRole::Input,
+        },
             OptionDesc {
                 name: "fvec-file".to_string(),
                 type_name: "Path".to_string(),
                 required: true,
                 default: None,
                 description: "Fvec file containing source vectors".to_string(),
-            },
+                role: OptionRole::Input,
+        },
             OptionDesc {
                 name: "output".to_string(),
                 type_name: "Path".to_string(),
                 required: true,
                 default: None,
                 description: "Output fvec file".to_string(),
-            },
+                role: OptionRole::Output,
+        },
             OptionDesc {
                 name: "range".to_string(),
                 type_name: "String".to_string(),
                 required: false,
                 default: None,
                 description: "Index range: [start,end) or start..end".to_string(),
-            },
+                role: OptionRole::Config,
+        },
+            OptionDesc {
+                name: "normalize".to_string(),
+                type_name: "bool".to_string(),
+                required: false,
+                default: Some("false".to_string()),
+                description: "L2-normalize vectors during extraction".to_string(),
+                role: OptionRole::Config,
+        },
         ]
     }
 
@@ -511,28 +573,32 @@ ordinal.
                 required: true,
                 default: None,
                 description: "Source ivec file".to_string(),
-            },
+                role: OptionRole::Input,
+        },
             OptionDesc {
                 name: "index-file".to_string(),
                 type_name: "Path".to_string(),
                 required: false,
                 default: None,
                 description: "Ivec file containing indices (enables index-based extraction)".to_string(),
-            },
+                role: OptionRole::Input,
+        },
             OptionDesc {
                 name: "output".to_string(),
                 type_name: "Path".to_string(),
                 required: true,
                 default: None,
                 description: "Output ivec file".to_string(),
-            },
+                role: OptionRole::Output,
+        },
             OptionDesc {
                 name: "range".to_string(),
                 type_name: "String".to_string(),
                 required: false,
                 default: None,
                 description: "Range: [start,end) or start..end. Applies to index-file entries (index mode) or ivec records (range mode)".to_string(),
-            },
+                role: OptionRole::Config,
+        },
         ]
     }
 
@@ -649,6 +715,16 @@ so that `base_metadata.slab[i]` corresponds to `base_vectors.mvec[i]`.
             None => Range { start: 0, end: None },
         };
 
+        // Validate extension
+        if let Some(ext) = mvec_path.extension().and_then(|e| e.to_str()) {
+            if ext != "mvec" {
+                return error_result(
+                    format!("mvec-extract expects a .mvec file, got .{} — use the appropriate *-extract command for this format", ext),
+                    start,
+                );
+            }
+        }
+
         // Open the mvec file
         let mvec_reader = match MmapVectorReader::<half::f16>::open_mvec(&mvec_path) {
             Ok(r) => r,
@@ -672,6 +748,11 @@ so that `base_metadata.slab[i]` corresponds to `base_vectors.mvec[i]`.
                     return error_result(format!("failed to create directory: {}", e), start);
                 }
             }
+        }
+
+        let normalize = options.get("normalize").map(|s| s == "true").unwrap_or(false);
+        if normalize {
+            ctx.ui.log("  L2 normalization enabled during extraction");
         }
 
         use std::io::Write;
@@ -717,7 +798,7 @@ so that `base_metadata.slab[i]` corresponds to `base_vectors.mvec[i]`.
             let result = sorted_index_extract_mvec(
                 &mvec_reader, mvec_count, dim,
                 &ivec_reader, range_start, effective_end,
-                &output_path, ctx, start,
+                &output_path, normalize, ctx, start,
             );
             match result {
                 Ok(msg) => CommandResult {
@@ -791,28 +872,40 @@ so that `base_metadata.slab[i]` corresponds to `base_vectors.mvec[i]`.
                 required: true,
                 default: None,
                 description: "Source mvec file".to_string(),
-            },
+                role: OptionRole::Input,
+        },
             OptionDesc {
                 name: "ivec-file".to_string(),
                 type_name: "Path".to_string(),
                 required: false,
                 default: None,
                 description: "Ivec file containing indices (enables index-based extraction)".to_string(),
-            },
+                role: OptionRole::Input,
+        },
             OptionDesc {
                 name: "output".to_string(),
                 type_name: "Path".to_string(),
                 required: true,
                 default: None,
                 description: "Output mvec file".to_string(),
-            },
+                role: OptionRole::Output,
+        },
             OptionDesc {
                 name: "range".to_string(),
                 type_name: "String".to_string(),
                 required: false,
                 default: None,
                 description: "Range: [start,end) or start..end. Applies to ivec entries (index mode) or mvec records (range mode)".to_string(),
-            },
+                role: OptionRole::Config,
+        },
+            OptionDesc {
+                name: "normalize".to_string(),
+                type_name: "bool".to_string(),
+                required: false,
+                default: Some("false".to_string()),
+                description: "L2-normalize vectors during extraction".to_string(),
+                role: OptionRole::Config,
+        },
         ]
     }
 
@@ -981,6 +1074,7 @@ range to every metadata facet. A typical pipeline includes:
             match sorted_index_extract_slab(
                 &reader, slab_count, &ivec_reader,
                 range_start, effective_end, &output_path, page_size,
+                &slab_path, ivec_p,
                 ctx, start,
             ) {
                 Ok(msg) => CommandResult {
@@ -1061,35 +1155,40 @@ range to every metadata facet. A typical pipeline includes:
                 required: true,
                 default: None,
                 description: "Source slab file".to_string(),
-            },
+                role: OptionRole::Input,
+        },
             OptionDesc {
                 name: "ivec-file".to_string(),
                 type_name: "Path".to_string(),
                 required: false,
                 default: None,
                 description: "Ivec file containing indices (enables index-based extraction)".to_string(),
-            },
+                role: OptionRole::Input,
+        },
             OptionDesc {
                 name: "output".to_string(),
                 type_name: "Path".to_string(),
                 required: true,
                 default: None,
                 description: "Output slab file".to_string(),
-            },
+                role: OptionRole::Output,
+        },
             OptionDesc {
                 name: "range".to_string(),
                 type_name: "String".to_string(),
                 required: false,
                 default: None,
                 description: "Range: [start,end) or start..end. Applies to ivec entries (index mode) or slab records (range mode)".to_string(),
-            },
+                role: OptionRole::Config,
+        },
             OptionDesc {
                 name: "page-size".to_string(),
                 type_name: "int".to_string(),
                 required: false,
                 default: Some("65536".to_string()),
                 description: "Preferred page size for output slab".to_string(),
-            },
+                role: OptionRole::Config,
+        },
         ]
     }
 
@@ -1227,6 +1326,7 @@ fn sorted_index_extract_mvec(
     range_start: usize,
     effective_end: usize,
     output_path: &Path,
+    normalize: bool,
     ctx: &mut StreamContext,
     _start: Instant,
 ) -> Result<String, String> {
@@ -1234,6 +1334,14 @@ fn sorted_index_extract_mvec(
 
     let extract_count = effective_end - range_start;
     let record_bytes = 4 + (dim as usize) * 2; // dim header + f16 values
+
+    // Governor-controlled thread pool for parallel phases
+    let threads = ctx.governor.current_or("threads", ctx.threads as u64).max(1) as usize;
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build()
+        .ok();
+    ctx.ui.log(&format!("mvec-extract: using {} threads", threads));
 
     // Determine partition count from memory budget
     let default_mem = half_system_ram();
@@ -1284,7 +1392,7 @@ fn sorted_index_extract_mvec(
         // partition's global range instead of iterating all entries.
         let global_start = range_start + part_start;
         let global_end = range_start + part_end;
-        let scan_pb = ctx.ui.bar(part_len as u64, &format!("scanning indices{}", pass_label(pass)));
+        let scan_pb = ctx.ui.bar_with_unit(part_len as u64, &format!("scanning indices{}", pass_label(pass)), "vectors");
         read_plan.clear();
         for (local_pos, i) in (global_start..global_end).enumerate() {
             let index_vec = ivec_reader.get(i)
@@ -1304,22 +1412,29 @@ fn sorted_index_extract_mvec(
         let num_buckets = 256usize;
         let bucket_range = (mvec_count / num_buckets).max(1);
 
-        let dist_pb = ctx.ui.bar(read_plan.len() as u64, &format!("bucketing {} entries{}", read_plan.len(), pass_label(pass)));
+        let dist_pb = ctx.ui.bar_with_unit(read_plan.len() as u64, &format!("bucketing {} entries{}", read_plan.len(), pass_label(pass)), "vectors");
         let thread_buckets: Vec<Vec<Vec<(usize, usize)>>>;
         {
             use rayon::prelude::*;
             use std::sync::atomic::{AtomicU64, Ordering};
             let progress = AtomicU64::new(0);
-            thread_buckets = read_plan.par_chunks(64 * 1024).map(|chunk| {
-                let mut local: Vec<Vec<(usize, usize)>> = vec![Vec::new(); num_buckets];
-                for &entry in chunk {
-                    let b = (entry.0 / bucket_range).min(num_buckets - 1);
-                    local[b].push(entry);
-                }
-                let done = progress.fetch_add(chunk.len() as u64, Ordering::Relaxed) + chunk.len() as u64;
-                dist_pb.set_position(done);
-                local
-            }).collect();
+            let bucket_fn = || {
+                read_plan.par_chunks(64 * 1024).map(|chunk| {
+                    let mut local: Vec<Vec<(usize, usize)>> = vec![Vec::new(); num_buckets];
+                    for &entry in chunk {
+                        let b = (entry.0 / bucket_range).min(num_buckets - 1);
+                        local[b].push(entry);
+                    }
+                    let done = progress.fetch_add(chunk.len() as u64, Ordering::Relaxed) + chunk.len() as u64;
+                    dist_pb.set_position(done);
+                    local
+                }).collect()
+            };
+            thread_buckets = if let Some(ref p) = pool {
+                p.install(bucket_fn)
+            } else {
+                bucket_fn()
+            };
         }
         dist_pb.finish();
 
@@ -1336,16 +1451,23 @@ fn sorted_index_extract_mvec(
             }
         }
 
-        let sort_pb = ctx.ui.bar(read_plan.len() as u64, &format!("sorting {} entries by source position{}", read_plan.len(), pass_label(pass)));
+        let sort_pb = ctx.ui.bar_with_unit(read_plan.len() as u64, &format!("sorting {} entries by source position{}", read_plan.len(), pass_label(pass)), "vectors");
         {
             use rayon::prelude::*;
             use std::sync::atomic::{AtomicU64, Ordering};
             let progress = AtomicU64::new(0);
-            buckets.par_iter_mut().for_each(|bucket| {
-                bucket.sort_unstable_by_key(|&(src, _)| src);
-                let done = progress.fetch_add(bucket.len() as u64, Ordering::Relaxed) + bucket.len() as u64;
-                sort_pb.set_position(done);
-            });
+            let mut sort_fn = || {
+                buckets.par_iter_mut().for_each(|bucket| {
+                    bucket.sort_unstable_by_key(|&(src, _)| src);
+                    let done = progress.fetch_add(bucket.len() as u64, Ordering::Relaxed) + bucket.len() as u64;
+                    sort_pb.set_position(done);
+                });
+            };
+            if let Some(ref p) = pool {
+                p.install(sort_fn);
+            } else {
+                sort_fn();
+            }
         }
         sort_pb.finish();
 
@@ -1361,22 +1483,29 @@ fn sorted_index_extract_mvec(
         }
         {
             use rayon::prelude::*;
-            buckets.into_par_iter().enumerate().for_each(|(i, bucket)| {
-                let start = offsets[i];
-                let dest = unsafe {
-                    std::slice::from_raw_parts_mut(
-                        (read_plan.as_ptr() as *mut (usize, usize)).add(start),
-                        bucket.len(),
-                    )
-                };
-                dest.copy_from_slice(&bucket);
-            });
+            let flatten_fn = || {
+                buckets.into_par_iter().enumerate().for_each(|(i, bucket)| {
+                    let start = offsets[i];
+                    let dest = unsafe {
+                        std::slice::from_raw_parts_mut(
+                            (read_plan.as_ptr() as *mut (usize, usize)).add(start),
+                            bucket.len(),
+                        )
+                    };
+                    dest.copy_from_slice(&bucket);
+                });
+            };
+            if let Some(ref p) = pool {
+                p.install(flatten_fn);
+            } else {
+                flatten_fn();
+            }
         }
 
         // Step 3: Read source data in parallel, placing each record at its
         // transpose position in the buffer. Each local_pos is unique, so
         // concurrent writes to part_buf are safe (disjoint regions).
-        let read_pb = ctx.ui.bar(read_plan.len() as u64, &format!("reading+transposing mvec{}", pass_label(pass)));
+        let read_pb = ctx.ui.bar_with_unit(read_plan.len() as u64, &format!("reading+transposing mvec{}", pass_label(pass)), "vectors");
         let part_buf_len = part_len * record_bytes;
         part_buf[..part_buf_len].fill(0);
         mvec_reader.advise_sequential();
@@ -1388,35 +1517,68 @@ fn sorted_index_extract_mvec(
             let progress = AtomicU64::new(0);
             let shared_buf = SharedBuf::new(&mut part_buf);
 
-            let result: Result<(), String> = read_plan.par_iter().try_for_each(|&(source_idx, local_pos)| {
-                let vector = mvec_reader.get(source_idx)
-                    .map_err(|e| format!("failed to read mvec[{}]: {}", source_idx, e))?;
+            let read_fn = || {
+                read_plan.par_iter().try_for_each(|&(source_idx, local_pos)| {
+                    let vector = mvec_reader.get(source_idx)
+                        .map_err(|e| format!("failed to read mvec[{}]: {}", source_idx, e))?;
 
-                let buf_offset = local_pos * record_bytes;
-                let dest = unsafe { shared_buf.slice_mut(buf_offset, record_bytes) };
-                dest[..4].copy_from_slice(&dim_bytes);
-                let slice: &[half::f16] = vector.as_ref();
-                let src_bytes: &[u8] = unsafe {
-                    std::slice::from_raw_parts(slice.as_ptr() as *const u8, slice.len() * 2)
-                };
-                dest[4..].copy_from_slice(src_bytes);
+                    let buf_offset = local_pos * record_bytes;
+                    let dest = unsafe { shared_buf.slice_mut(buf_offset, record_bytes) };
+                    dest[..4].copy_from_slice(&dim_bytes);
+                    let slice: &[half::f16] = vector.as_ref();
+                    let src_bytes: &[u8] = unsafe {
+                        std::slice::from_raw_parts(slice.as_ptr() as *const u8, slice.len() * 2)
+                    };
+                    dest[4..].copy_from_slice(src_bytes);
 
-                let done = progress.fetch_add(1, Ordering::Relaxed) + 1;
-                if done % 100_000 == 0 {
-                    read_pb.set_position(done);
-                }
-                Ok(())
-            });
+                    let done = progress.fetch_add(1, Ordering::Relaxed) + 1;
+                    if done % 100_000 == 0 {
+                        read_pb.set_position(done);
+                    }
+                    Ok(())
+                })
+            };
+            let result: Result<(), String> = if let Some(ref p) = pool {
+                p.install(read_fn)
+            } else {
+                read_fn()
+            };
             result?;
         }
         read_pb.finish();
+
+        // Optional L2 normalization of vectors in the output buffer
+        if normalize {
+            let buf_used = part_len * record_bytes;
+            let dim_usize = dim as usize;
+            let stride = 4 + dim_usize * 2; // dim header + dim f16s
+            for offset in (0..buf_used).step_by(stride) {
+                let values_start = offset + 4;
+                let mut norm_sq = 0.0f64;
+                for d in 0..dim_usize {
+                    let pos = values_start + d * 2;
+                    let v = half::f16::from_le_bytes([part_buf[pos], part_buf[pos + 1]]);
+                    let vf = v.to_f64();
+                    norm_sq += vf * vf;
+                }
+                if norm_sq > 0.0 {
+                    let inv_norm = 1.0 / norm_sq.sqrt();
+                    for d in 0..dim_usize {
+                        let pos = values_start + d * 2;
+                        let v = half::f16::from_le_bytes([part_buf[pos], part_buf[pos + 1]]);
+                        let normalized = half::f16::from_f64(v.to_f64() * inv_norm);
+                        part_buf[pos..pos + 2].copy_from_slice(&normalized.to_le_bytes());
+                    }
+                }
+            }
+        }
 
         // Step 4: Write partition in chunks with progress, including sync
         let total_write_bytes = part_len * record_bytes;
         let write_mb = total_write_bytes as f64 / (1024.0 * 1024.0);
         // Progress covers writes + sync; reserve 5% of bar for the sync phase
         let sync_reserve = total_write_bytes as u64 / 20;
-        let write_pb = ctx.ui.bar(total_write_bytes as u64 + sync_reserve, &format!("writing+syncing {:.0} MB{}", write_mb, pass_label(pass)));
+        let write_pb = ctx.ui.bar_with_unit(total_write_bytes as u64 + sync_reserve, &format!("writing+syncing {:.0} MB{}", write_mb, pass_label(pass)), "bytes");
         let file_offset = (part_start as u64) * (record_bytes as u64);
         use std::io::Seek;
         out_file.seek(std::io::SeekFrom::Start(file_offset))
@@ -1445,8 +1607,8 @@ fn sorted_index_extract_mvec(
     out_file.sync_all().map_err(|e| format!("sync failed: {}", e))?;
 
     Ok(format!(
-        "extracted {} mvec vectors by index (ivec range [{}..{}), {} passes) to {}",
-        extract_count, range_start, effective_end, num_partitions, output_path.display()
+        "extracted {} mvec vectors by index (ivec range [{}..{}), {} passes, {} threads) to {}",
+        extract_count, range_start, effective_end, num_partitions, threads, output_path.display()
     ))
 }
 
@@ -1462,6 +1624,7 @@ fn sorted_index_extract_fvec(
     range_start: usize,
     effective_end: usize,
     output_path: &Path,
+    normalize: bool,
     ctx: &mut StreamContext,
     _start: Instant,
 ) -> Result<String, String> {
@@ -1469,6 +1632,14 @@ fn sorted_index_extract_fvec(
 
     let extract_count = effective_end - range_start;
     let record_bytes = 4 + (dim as usize) * 4; // dim header + f32 values
+
+    // Governor-controlled thread pool for parallel phases
+    let threads = ctx.governor.current_or("threads", ctx.threads as u64).max(1) as usize;
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build()
+        .ok();
+    ctx.ui.log(&format!("fvec-extract: using {} threads", threads));
 
     // Partition sizing
     let default_mem = half_system_ram();
@@ -1517,7 +1688,7 @@ fn sorted_index_extract_fvec(
         // Step 1: Scan ivec for this partition's entries only.
         let global_start = range_start + part_start;
         let global_end = range_start + part_end;
-        let scan_pb = ctx.ui.bar(part_len as u64, &format!("scanning indices{}", pass_label(pass)));
+        let scan_pb = ctx.ui.bar_with_unit(part_len as u64, &format!("scanning indices{}", pass_label(pass)), "vectors");
         read_plan.clear();
         for (local_pos, i) in (global_start..global_end).enumerate() {
             let index_vec = ivec_reader.get(i)
@@ -1535,22 +1706,29 @@ fn sorted_index_extract_fvec(
         let num_buckets = 256usize;
         let bucket_range = (fvec_count / num_buckets).max(1);
 
-        let dist_pb = ctx.ui.bar(read_plan.len() as u64, &format!("bucketing {} entries{}", read_plan.len(), pass_label(pass)));
+        let dist_pb = ctx.ui.bar_with_unit(read_plan.len() as u64, &format!("bucketing {} entries{}", read_plan.len(), pass_label(pass)), "vectors");
         let thread_buckets: Vec<Vec<Vec<(usize, usize)>>>;
         {
             use rayon::prelude::*;
             use std::sync::atomic::{AtomicU64, Ordering};
             let progress = AtomicU64::new(0);
-            thread_buckets = read_plan.par_chunks(64 * 1024).map(|chunk| {
-                let mut local: Vec<Vec<(usize, usize)>> = vec![Vec::new(); num_buckets];
-                for &entry in chunk {
-                    let b = (entry.0 / bucket_range).min(num_buckets - 1);
-                    local[b].push(entry);
-                }
-                let done = progress.fetch_add(chunk.len() as u64, Ordering::Relaxed) + chunk.len() as u64;
-                dist_pb.set_position(done);
-                local
-            }).collect();
+            let bucket_fn = || {
+                read_plan.par_chunks(64 * 1024).map(|chunk| {
+                    let mut local: Vec<Vec<(usize, usize)>> = vec![Vec::new(); num_buckets];
+                    for &entry in chunk {
+                        let b = (entry.0 / bucket_range).min(num_buckets - 1);
+                        local[b].push(entry);
+                    }
+                    let done = progress.fetch_add(chunk.len() as u64, Ordering::Relaxed) + chunk.len() as u64;
+                    dist_pb.set_position(done);
+                    local
+                }).collect()
+            };
+            thread_buckets = if let Some(ref p) = pool {
+                p.install(bucket_fn)
+            } else {
+                bucket_fn()
+            };
         }
         dist_pb.finish();
 
@@ -1566,16 +1744,23 @@ fn sorted_index_extract_fvec(
             }
         }
 
-        let sort_pb = ctx.ui.bar(read_plan.len() as u64, &format!("sorting {} entries by source position{}", read_plan.len(), pass_label(pass)));
+        let sort_pb = ctx.ui.bar_with_unit(read_plan.len() as u64, &format!("sorting {} entries by source position{}", read_plan.len(), pass_label(pass)), "vectors");
         {
             use rayon::prelude::*;
             use std::sync::atomic::{AtomicU64, Ordering};
             let progress = AtomicU64::new(0);
-            buckets.par_iter_mut().for_each(|bucket| {
-                bucket.sort_unstable_by_key(|&(src, _)| src);
-                let done = progress.fetch_add(bucket.len() as u64, Ordering::Relaxed) + bucket.len() as u64;
-                sort_pb.set_position(done);
-            });
+            let mut sort_fn = || {
+                buckets.par_iter_mut().for_each(|bucket| {
+                    bucket.sort_unstable_by_key(|&(src, _)| src);
+                    let done = progress.fetch_add(bucket.len() as u64, Ordering::Relaxed) + bucket.len() as u64;
+                    sort_pb.set_position(done);
+                });
+            };
+            if let Some(ref p) = pool {
+                p.install(sort_fn);
+            } else {
+                sort_fn();
+            }
         }
         sort_pb.finish();
 
@@ -1590,20 +1775,27 @@ fn sorted_index_extract_fvec(
         }
         {
             use rayon::prelude::*;
-            buckets.into_par_iter().enumerate().for_each(|(i, bucket)| {
-                let start = offsets[i];
-                let dest = unsafe {
-                    std::slice::from_raw_parts_mut(
-                        (read_plan.as_ptr() as *mut (usize, usize)).add(start),
-                        bucket.len(),
-                    )
-                };
-                dest.copy_from_slice(&bucket);
-            });
+            let flatten_fn = || {
+                buckets.into_par_iter().enumerate().for_each(|(i, bucket)| {
+                    let start = offsets[i];
+                    let dest = unsafe {
+                        std::slice::from_raw_parts_mut(
+                            (read_plan.as_ptr() as *mut (usize, usize)).add(start),
+                            bucket.len(),
+                        )
+                    };
+                    dest.copy_from_slice(&bucket);
+                });
+            };
+            if let Some(ref p) = pool {
+                p.install(flatten_fn);
+            } else {
+                flatten_fn();
+            }
         }
 
         // Step 3: Read source data in parallel with transpose placement
-        let read_pb = ctx.ui.bar(read_plan.len() as u64, &format!("reading+transposing fvec{}", pass_label(pass)));
+        let read_pb = ctx.ui.bar_with_unit(read_plan.len() as u64, &format!("reading+transposing fvec{}", pass_label(pass)), "vectors");
         let part_buf_len = part_len * record_bytes;
         part_buf[..part_buf_len].fill(0);
         fvec_reader.advise_sequential();
@@ -1615,34 +1807,72 @@ fn sorted_index_extract_fvec(
             let progress = AtomicU64::new(0);
             let shared_buf = SharedBuf::new(&mut part_buf);
 
-            let result: Result<(), String> = read_plan.par_iter().try_for_each(|&(source_idx, local_pos)| {
-                let vector = fvec_reader.get(source_idx)
-                    .map_err(|e| format!("failed to read fvec[{}]: {}", source_idx, e))?;
+            let read_fn = || {
+                read_plan.par_iter().try_for_each(|&(source_idx, local_pos)| {
+                    let vector = fvec_reader.get(source_idx)
+                        .map_err(|e| format!("failed to read fvec[{}]: {}", source_idx, e))?;
 
-                let buf_offset = local_pos * record_bytes;
-                let dest = unsafe { shared_buf.slice_mut(buf_offset, record_bytes) };
-                dest[..4].copy_from_slice(&dim_bytes);
-                let slice: &[f32] = vector.as_ref();
-                let src_bytes: &[u8] = unsafe {
-                    std::slice::from_raw_parts(slice.as_ptr() as *const u8, slice.len() * 4)
-                };
-                dest[4..].copy_from_slice(src_bytes);
+                    let buf_offset = local_pos * record_bytes;
+                    let dest = unsafe { shared_buf.slice_mut(buf_offset, record_bytes) };
+                    dest[..4].copy_from_slice(&dim_bytes);
+                    let slice: &[f32] = vector.as_ref();
+                    let src_bytes: &[u8] = unsafe {
+                        std::slice::from_raw_parts(slice.as_ptr() as *const u8, slice.len() * 4)
+                    };
+                    dest[4..].copy_from_slice(src_bytes);
 
-                let done = progress.fetch_add(1, Ordering::Relaxed) + 1;
-                if done % 100_000 == 0 {
-                    read_pb.set_position(done);
-                }
-                Ok(())
-            });
+                    let done = progress.fetch_add(1, Ordering::Relaxed) + 1;
+                    if done % 100_000 == 0 {
+                        read_pb.set_position(done);
+                    }
+                    Ok(())
+                })
+            };
+            let result: Result<(), String> = if let Some(ref p) = pool {
+                p.install(read_fn)
+            } else {
+                read_fn()
+            };
             result?;
         }
         read_pb.finish();
+
+        // Optional L2 normalization of vectors in the output buffer
+        if normalize {
+            let buf_used = part_len * record_bytes;
+            let dim_usize = dim as usize;
+            let stride = 4 + dim_usize * 4; // dim header + dim f32s
+            for offset in (0..buf_used).step_by(stride) {
+                let values_start = offset + 4;
+                let mut norm_sq = 0.0f64;
+                for d in 0..dim_usize {
+                    let pos = values_start + d * 4;
+                    let v = f32::from_le_bytes([
+                        part_buf[pos], part_buf[pos + 1],
+                        part_buf[pos + 2], part_buf[pos + 3],
+                    ]);
+                    norm_sq += (v as f64) * (v as f64);
+                }
+                if norm_sq > 0.0 {
+                    let inv_norm = (1.0 / norm_sq.sqrt()) as f32;
+                    for d in 0..dim_usize {
+                        let pos = values_start + d * 4;
+                        let v = f32::from_le_bytes([
+                            part_buf[pos], part_buf[pos + 1],
+                            part_buf[pos + 2], part_buf[pos + 3],
+                        ]);
+                        let normalized = v * inv_norm;
+                        part_buf[pos..pos + 4].copy_from_slice(&normalized.to_le_bytes());
+                    }
+                }
+            }
+        }
 
         // Step 4: Write partition in chunks with progress, including sync
         let total_write_bytes = part_len * record_bytes;
         let write_mb = total_write_bytes as f64 / (1024.0 * 1024.0);
         let sync_reserve = total_write_bytes as u64 / 20;
-        let write_pb = ctx.ui.bar(total_write_bytes as u64 + sync_reserve, &format!("writing+syncing {:.0} MB{}", write_mb, pass_label(pass)));
+        let write_pb = ctx.ui.bar_with_unit(total_write_bytes as u64 + sync_reserve, &format!("writing+syncing {:.0} MB{}", write_mb, pass_label(pass)), "bytes");
         let file_offset = (part_start as u64) * (record_bytes as u64);
         use std::io::Seek;
         out_file.seek(std::io::SeekFrom::Start(file_offset))
@@ -1672,9 +1902,24 @@ fn sorted_index_extract_fvec(
     out_file.sync_all().map_err(|e| format!("sync failed: {}", e))?;
 
     Ok(format!(
-        "extracted {} fvec vectors (range [{}..{}), {} passes) to {}",
-        extract_count, range_start, effective_end, num_partitions, output_path.display()
+        "extracted {} fvec vectors (range [{}..{}), {} passes, {} threads) to {}",
+        extract_count, range_start, effective_end, num_partitions, threads, output_path.display()
     ))
+}
+
+/// Metadata for slab-extract resume validation.
+///
+/// Persisted as `slab-extract.meta.json` in the cache directory so that a
+/// subsequent run can detect whether the parameters match and reuse
+/// per-partition cache files.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SlabExtractMeta {
+    slab_path: String,
+    ivec_path: String,
+    range_start: usize,
+    effective_end: usize,
+    num_partitions: usize,
+    page_size: u32,
 }
 
 /// Partitioned-pass extraction for slab files.
@@ -1683,6 +1928,11 @@ fn sorted_index_extract_fvec(
 /// per partition, sort by source ordinal for sequential slab reads, then write
 /// in output order. Since slab records are variable-length, we collect
 /// `(local_out_pos, data)` pairs and sort by output position before writing.
+///
+/// Supports per-partition cache/resume: each partition is written to a cache
+/// file under `ctx.cache`. On re-run with matching parameters, partitions
+/// whose cache file already exists are replayed from cache instead of being
+/// recomputed.
 fn sorted_index_extract_slab(
     reader: &slabtastic::SlabReader,
     slab_count: usize,
@@ -1691,6 +1941,8 @@ fn sorted_index_extract_slab(
     effective_end: usize,
     output_path: &Path,
     page_size: u32,
+    slab_path: &Path,
+    ivec_path: &Path,
     ctx: &mut StreamContext,
     _start: Instant,
 ) -> Result<String, String> {
@@ -1726,6 +1978,58 @@ fn sorted_index_extract_slab(
         mem_budget as f64 / (1024.0 * 1024.0 * 1024.0),
     ));
 
+    // ---- cache / resume validation ----
+    let cache_dir = ctx.cache.join("slab-extract");
+    if let Err(e) = std::fs::create_dir_all(&cache_dir) {
+        return Err(format!("failed to create cache dir {}: {}", cache_dir.display(), e));
+    }
+
+    let meta_path = cache_dir.join("slab-extract.meta.json");
+    let current_meta = SlabExtractMeta {
+        slab_path: slab_path.to_string_lossy().into_owned(),
+        ivec_path: ivec_path.to_string_lossy().into_owned(),
+        range_start,
+        effective_end,
+        num_partitions,
+        page_size,
+    };
+
+    let can_resume = if meta_path.exists() {
+        match std::fs::read_to_string(&meta_path) {
+            Ok(content) => match serde_json::from_str::<SlabExtractMeta>(&content) {
+                Ok(prev) => {
+                    prev.slab_path == current_meta.slab_path
+                        && prev.ivec_path == current_meta.ivec_path
+                        && prev.range_start == current_meta.range_start
+                        && prev.effective_end == current_meta.effective_end
+                        && prev.num_partitions == current_meta.num_partitions
+                        && prev.page_size == current_meta.page_size
+                }
+                Err(_) => false,
+            },
+            Err(_) => false,
+        }
+    } else {
+        false
+    };
+
+    if !can_resume {
+        // Parameters changed — invalidate all existing partition caches.
+        if let Ok(entries) = std::fs::read_dir(&cache_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                if name_str.starts_with("slab-extract.part_") && name_str.ends_with(".cache") {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+        // Write fresh metadata so future runs can resume.
+        if let Ok(json) = serde_json::to_string_pretty(&current_meta) {
+            let _ = std::fs::write(&meta_path, json);
+        }
+    }
+
     let config = match slabtastic::WriterConfig::new(512, page_size, u32::MAX, false) {
         Ok(c) => c,
         Err(e) => return Err(format!("invalid writer config: {}", e)),
@@ -1740,11 +2044,60 @@ fn sorted_index_extract_slab(
     };
 
     let mut read_plan: Vec<(usize, usize)> = Vec::with_capacity(partition_size);
+    let mut resumed_count: usize = 0;
 
     for pass in 0..num_partitions {
         let part_start = pass * partition_size;
         let part_end = std::cmp::min(part_start + partition_size, extract_count);
         let part_len = part_end - part_start;
+
+        // ---- per-partition cache check ----
+        let cache_path = cache_dir.join(format!("slab-extract.part_{:04}.cache", pass));
+        if can_resume && cache_path.exists() {
+            let usable = (|| -> Option<bool> {
+                let file_meta = std::fs::metadata(&cache_path).ok()?;
+                if file_meta.len() == 0 { return None; }
+                let cache_reader = slabtastic::SlabReader::open(&cache_path).ok()?;
+                let cached_count = cache_reader.total_records() as usize;
+                if cached_count != part_len { return None; }
+                Some(true)
+            })();
+
+            if usable == Some(true) {
+                // Replay cached partition into the output writer.
+                let cache_reader = slabtastic::SlabReader::open(&cache_path)
+                    .map_err(|e| format!("failed to reopen cache {}: {}", cache_path.display(), e))?;
+                let cached_count = cache_reader.total_records() as usize;
+                let replay_pb = ctx.ui.bar_with_unit(
+                    cached_count as u64,
+                    &format!("resuming from cache{}", pass_label(pass)),
+                    "records",
+                );
+                for i in 0..cached_count {
+                    let data = cache_reader.get_ref(i as i64)
+                        .map_err(|e| format!(
+                            "failed to read cache record {}: {}", i, e
+                        ))?;
+                    writer.add_record(data)
+                        .map_err(|e| format!(
+                            "write error replaying cache record {}: {}", i, e
+                        ))?;
+                    if (i + 1) % 10_000 == 0 {
+                        replay_pb.set_position((i + 1) as u64);
+                    }
+                }
+                replay_pb.finish();
+                log::debug!(
+                    "slab-extract: pass {}/{}, resumed {} records from cache",
+                    pass + 1, num_partitions, cached_count,
+                );
+                resumed_count += 1;
+                ctx.governor.checkpoint();
+                continue;
+            }
+            // Cache file is unusable — remove it and recompute.
+            let _ = std::fs::remove_file(&cache_path);
+        }
 
         // Step 1: Scan ivec for this partition's entries
         let global_start = range_start + part_start;
@@ -1812,6 +2165,7 @@ fn sorted_index_extract_slab(
         sort_pb.finish();
 
         let total_entries = buckets.iter().map(|b| b.len()).sum::<usize>();
+        let merge_sp = ctx.ui.spinner(&format!("merging {} entries into read plan{}", total_entries, pass_label(pass)));
         read_plan.clear();
         read_plan.resize(total_entries, (0, 0));
         let mut offsets: Vec<usize> = Vec::with_capacity(num_buckets);
@@ -1833,30 +2187,45 @@ fn sorted_index_extract_slab(
                 dest.copy_from_slice(&bucket);
             });
         }
+        merge_sp.finish();
 
         // Step 3: Read slab records in source order, collecting (local_pos, data)
-        let read_pb = ctx.ui.bar(read_plan.len() as u64, &format!("reading slab records{}", pass_label(pass)));
+        let read_pb = ctx.ui.bar_with_unit(read_plan.len() as u64, &format!("reading slab records{}", pass_label(pass)), "records");
         let mut records: Vec<(usize, Vec<u8>)> = Vec::with_capacity(part_len);
         for (i, &(source_idx, local_pos)) in read_plan.iter().enumerate() {
             let data = reader.get_ref(source_idx as i64)
                 .map_err(|e| format!("failed to read slab[{}]: {}", source_idx, e))?;
             records.push((local_pos, data.to_vec()));
-            if (i + 1) % 100_000 == 0 { read_pb.set_position((i + 1) as u64); }
+            if (i + 1) % 10_000 == 0 { read_pb.set_position((i + 1) as u64); }
         }
         read_pb.finish();
 
         // Step 4: Sort by output position and write sequentially
-        let sort_out_pb = ctx.ui.spinner(&format!("sorting by output position{}", pass_label(pass)));
+        let sort_out_sp = ctx.ui.spinner(&format!("sorting by output position{}", pass_label(pass)));
         records.sort_unstable_by_key(|(pos, _)| *pos);
-        sort_out_pb.finish();
+        sort_out_sp.finish();
 
-        let write_pb = ctx.ui.bar(records.len() as u64, &format!("writing {} slab records{}", records.len(), pass_label(pass)));
+        let write_pb = ctx.ui.bar_with_unit(records.len() as u64, &format!("writing slab records{}", pass_label(pass)), "records");
         for (i, (_, data)) in records.iter().enumerate() {
             writer.add_record(data)
                 .map_err(|e| format!("write error at record {}: {}", part_start + i, e))?;
             if (i + 1) % 10_000 == 0 { write_pb.set_position((i + 1) as u64); }
         }
         write_pb.finish();
+
+        // Step 5: Write partition records to cache file for future resume.
+        {
+            let cache_config = slabtastic::WriterConfig::new(512, page_size, u32::MAX, false)
+                .map_err(|e| format!("invalid cache writer config: {}", e))?;
+            let mut cache_writer = slabtastic::SlabWriter::new(&cache_path, cache_config)
+                .map_err(|e| format!("failed to create cache file {}: {}", cache_path.display(), e))?;
+            for (_, data) in &records {
+                cache_writer.add_record(data)
+                    .map_err(|e| format!("cache write error: {}", e))?;
+            }
+            cache_writer.finish()
+                .map_err(|e| format!("failed to finalize cache file: {}", e))?;
+        }
 
         log::debug!(
             "slab-extract: pass {}/{}, wrote {} records",
@@ -1866,12 +2235,21 @@ fn sorted_index_extract_slab(
         ctx.governor.checkpoint();
     }
 
+    if resumed_count > 0 {
+        ctx.ui.log(&format!(
+            "slab-extract: resumed {} of {} partitions from cache",
+            resumed_count, num_partitions,
+        ));
+    }
+
+    let finalize_sp = ctx.ui.spinner("finalizing slab output");
     writer.finish()
         .map_err(|e| format!("failed to finalize output: {}", e))?;
+    finalize_sp.finish();
 
     Ok(format!(
-        "extracted {} slab records by index (ivec range [{}..{}), {} passes) to {}",
-        extract_count, range_start, effective_end, num_partitions, output_path.display()
+        "extracted {} slab records by index (ivec range [{}..{}), {} passes, {} resumed) to {}",
+        extract_count, range_start, effective_end, num_partitions, resumed_count, output_path.display()
     ))
 }
 
@@ -1916,6 +2294,150 @@ fn error_result(message: String, start: Instant) -> CommandResult {
         message,
         produced: vec![],
         elapsed: start.elapsed(),
+    }
+}
+
+// ---- generic extract (auto-detect format) -----------------------------------
+
+/// Pipeline command: extract records from any xvec or slab file.
+///
+/// Detects the source format from the file extension and delegates to the
+/// appropriate format-specific extraction logic.
+pub struct TransformExtractOp;
+
+pub fn extract_factory() -> Box<dyn CommandOp> {
+    Box::new(TransformExtractOp)
+}
+
+impl CommandOp for TransformExtractOp {
+    fn command_path(&self) -> &str {
+        "transform extract"
+    }
+
+    fn command_doc(&self) -> CommandDoc {
+        let options = self.describe_options();
+        CommandDoc {
+            summary: "Extract records from any vector or slab file (auto-detects format)".into(),
+            body: format!(
+                "# transform extract\n\n\
+                Extract records from any xvec or slab file.\n\n\
+                ## Description\n\n\
+                Auto-detects the source file format from its extension (.fvec, .mvec, \
+                .ivec, .dvec, .svec, .bvec, .slab) and delegates to the appropriate \
+                format-specific extract command. Supports both index-based extraction \
+                (with --ivec-file) and range-based extraction (identity, without --ivec-file).\n\n\
+                ## Options\n\n{}",
+                render_options_table(&options)
+            ),
+        }
+    }
+
+    fn describe_resources(&self) -> Vec<ResourceDesc> {
+        vec![
+            ResourceDesc { name: "readahead".into(), description: "Sequential read prefetch".into(), adjustable: false },
+            ResourceDesc { name: "mem".into(), description: "Memory budget for write buffering".into(), adjustable: true },
+        ]
+    }
+
+    fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
+        let start = Instant::now();
+
+        let source_str = match options.require("source") {
+            Ok(s) => s,
+            Err(e) => return error_result(e, start),
+        };
+        let source_path = resolve_path(source_str, &ctx.workspace);
+
+        let ext = source_path.extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
+
+        // Build options for the delegate command, mapping generic names
+        // to format-specific names.
+        let mut delegate_opts = Options::new();
+        match ext {
+            "fvec" => {
+                delegate_opts.set("fvec-file", source_str);
+            }
+            "mvec" => {
+                delegate_opts.set("mvec-file", source_str);
+            }
+            "ivec" => {
+                delegate_opts.set("ivec-file", source_str);
+            }
+            "slab" => {
+                delegate_opts.set("slab-file", source_str);
+            }
+            _ => {
+                return error_result(
+                    format!("unsupported format '.{}' for extract — expected fvec, mvec, ivec, dvec, svec, bvec, or slab", ext),
+                    start,
+                );
+            }
+        }
+
+        // Pass through common options
+        if let Some(v) = options.get("ivec-file") { delegate_opts.set("ivec-file", v); }
+        if let Some(v) = options.get("index-file") { delegate_opts.set("index-file", v); }
+        if let Some(v) = options.get("output") { delegate_opts.set("output", v); }
+        if let Some(v) = options.get("range") { delegate_opts.set("range", v); }
+        if let Some(v) = options.get("normalize") { delegate_opts.set("normalize", v); }
+
+        // Delegate to format-specific command
+        let mut cmd: Box<dyn CommandOp> = match ext {
+            "fvec" => Box::new(GenerateFvecExtractOp),
+            "mvec" => Box::new(GenerateMvecExtractOp),
+            "ivec" => Box::new(GenerateIvecExtractOp),
+            "slab" => Box::new(GenerateSlabExtractOp),
+            _ => unreachable!(),
+        };
+
+        cmd.execute(&delegate_opts, ctx)
+    }
+
+    fn describe_options(&self) -> Vec<OptionDesc> {
+        vec![
+            OptionDesc {
+                name: "source".to_string(),
+                type_name: "Path".to_string(),
+                required: true,
+                default: None,
+                description: "Source file (format auto-detected from extension)".to_string(),
+                role: OptionRole::Input,
+            },
+            OptionDesc {
+                name: "ivec-file".to_string(),
+                type_name: "Path".to_string(),
+                required: false,
+                default: None,
+                description: "Index file for indirect extraction (identity if omitted)".to_string(),
+                role: OptionRole::Input,
+            },
+            OptionDesc {
+                name: "output".to_string(),
+                type_name: "Path".to_string(),
+                required: true,
+                default: None,
+                description: "Output file".to_string(),
+                role: OptionRole::Output,
+            },
+            OptionDesc {
+                name: "range".to_string(),
+                type_name: "String".to_string(),
+                required: false,
+                default: None,
+                description: "Record range: [start,end) or start..end".to_string(),
+                role: OptionRole::Config,
+            },
+            OptionDesc {
+                name: "normalize".to_string(),
+                type_name: "bool".to_string(),
+                required: false,
+                default: Some("false".to_string()),
+                description: "L2-normalize vectors during extraction (fvec/mvec only)".to_string(),
+                role: OptionRole::Config,
+            },
+        ]
     }
 }
 

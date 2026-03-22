@@ -10,16 +10,20 @@
 //! Equivalent to the Java `CMD_analyze_profile` command.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use vectordata::VectorReader;
 use vectordata::io::MmapVectorReader;
 
+use crate::pipeline::atomic_write::AtomicWriter;
 use crate::pipeline::command::{
-    CommandDoc, CommandOp, CommandResult, OptionDesc, Options, ResourceDesc, Status, StreamContext,
+    CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options, ResourceDesc, Status, StreamContext,
     render_options_table,
 };
+use crate::pipeline::element_type::ElementType;
 
 /// Pipeline command: profile a vector dataset.
 pub struct AnalyzeProfileOp;
@@ -126,18 +130,62 @@ impl CommandOp for AnalyzeProfileOp {
             .unwrap_or(10000);
         let verbose = options.get("verbose").map_or(false, |s| s == "true");
 
-        let reader = match MmapVectorReader::<f32>::open_fvec(&source_path) {
-            Ok(r) => r,
-            Err(e) => {
-                return error_result(
-                    format!("failed to open {}: {}", source_path.display(), e),
-                    start,
-                )
+        let etype = match ElementType::from_path(&source_path) {
+            Ok(t) => t,
+            Err(e) => return error_result(e, start),
+        };
+
+        let (total_count, dim, get_f64): (usize, usize, Box<dyn Fn(usize) -> Vec<f64> + Sync>) = match etype {
+            ElementType::F32 => {
+                let r = match MmapVectorReader::<f32>::open_fvec(&source_path) {
+                    Ok(r) => r, Err(e) => return error_result(format!("open: {}", e), start),
+                };
+                let fc = VectorReader::<f32>::count(&r);
+                let d = VectorReader::<f32>::dim(&r);
+                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
+            }
+            ElementType::F16 => {
+                let r = match MmapVectorReader::<half::f16>::open_mvec(&source_path) {
+                    Ok(r) => r, Err(e) => return error_result(format!("open: {}", e), start),
+                };
+                let fc = VectorReader::<half::f16>::count(&r);
+                let d = VectorReader::<half::f16>::dim(&r);
+                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|v| v.to_f64()).collect()))
+            }
+            ElementType::F64 => {
+                let r = match MmapVectorReader::<f64>::open_dvec(&source_path) {
+                    Ok(r) => r, Err(e) => return error_result(format!("open: {}", e), start),
+                };
+                let fc = VectorReader::<f64>::count(&r);
+                let d = VectorReader::<f64>::dim(&r);
+                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default()))
+            }
+            ElementType::I32 => {
+                let r = match MmapVectorReader::<i32>::open_ivec(&source_path) {
+                    Ok(r) => r, Err(e) => return error_result(format!("open: {}", e), start),
+                };
+                let fc = VectorReader::<i32>::count(&r);
+                let d = VectorReader::<i32>::dim(&r);
+                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
+            }
+            ElementType::I16 => {
+                let r = match MmapVectorReader::<i16>::open_svec(&source_path) {
+                    Ok(r) => r, Err(e) => return error_result(format!("open: {}", e), start),
+                };
+                let fc = VectorReader::<i16>::count(&r);
+                let d = VectorReader::<i16>::dim(&r);
+                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
+            }
+            ElementType::U8 | ElementType::I8 => {
+                let r = match MmapVectorReader::<u8>::open_bvec(&source_path) {
+                    Ok(r) => r, Err(e) => return error_result(format!("open: {}", e), start),
+                };
+                let fc = VectorReader::<u8>::count(&r);
+                let d = VectorReader::<u8>::dim(&r);
+                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
             }
         };
 
-        let total_count = <MmapVectorReader<f32> as VectorReader<f32>>::count(&reader);
-        let dim = <MmapVectorReader<f32> as VectorReader<f32>>::dim(&reader);
         let effective = sample.min(total_count);
 
         ctx.ui.log(&format!(
@@ -148,18 +196,57 @@ impl CommandOp for AnalyzeProfileOp {
             effective
         ));
 
+        // Query governor for thread count and build rayon pool
+        let threads = ctx.governor.current_or("threads", ctx.threads as u64).max(1) as usize;
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .ok();
+
+        // Fit per-dimension models in parallel
+        let pb = ctx.ui.bar_with_unit(dim as u64, "fitting per-dimension models", "dims");
+        let progress = AtomicU64::new(0);
+        let pb_ref = &pb;
+        let progress_ref = &progress;
+
+        let compute_fn = || {
+            (0..dim)
+                .into_par_iter()
+                .map(|d| {
+                    let mut values: Vec<f64> = Vec::with_capacity(effective);
+                    for i in 0..effective {
+                        let vec = get_f64(i);
+                        if !vec.is_empty() {
+                            values.push(vec[d]);
+                        }
+                    }
+
+                    let (model, model_type, ks_d) = fit_and_evaluate(&values);
+
+                    let done = progress_ref.fetch_add(1, Ordering::Relaxed) + 1;
+                    if done % 100 == 0 || done == dim as u64 {
+                        pb_ref.set_position(done);
+                    }
+
+                    (d, model, model_type, ks_d)
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let mut par_results = if let Some(p) = &pool {
+            p.install(compute_fn)
+        } else {
+            compute_fn()
+        };
+        pb.finish();
+
+        // Sort by dimension index (par_iter may return out of order)
+        par_results.sort_by_key(|(d, _, _, _)| *d);
+
         let mut models: Vec<ScalarModelDef> = Vec::with_capacity(dim);
         let mut fit_results: Vec<DimFitResult> = Vec::new();
 
-        for d in 0..dim {
-            let mut values: Vec<f64> = Vec::with_capacity(effective);
-            for i in 0..effective {
-                if let Ok(vec) = reader.get(i) {
-                    values.push(vec[d] as f64);
-                }
-            }
-
-            let (model, model_type, ks_d) = fit_and_evaluate(&values);
+        for (d, model, model_type, ks_d) in par_results {
             if verbose || d < 5 || d == dim - 1 {
                 ctx.ui.log(&format!(
                     "  dim[{}]: {} (KS D={:.4})",
@@ -201,8 +288,18 @@ impl CommandOp for AnalyzeProfileOp {
             Ok(j) => j,
             Err(e) => return error_result(format!("serialization error: {}", e), start),
         };
-        if let Err(e) = std::fs::write(&output_path, &json) {
-            return error_result(format!("failed to write {}: {}", output_path.display(), e), start);
+        {
+            use std::io::Write;
+            let mut w = match AtomicWriter::new(&output_path) {
+                Ok(w) => w,
+                Err(e) => return error_result(format!("failed to create {}: {}", output_path.display(), e), start),
+            };
+            if let Err(e) = w.write_all(json.as_bytes()) {
+                return error_result(format!("failed to write {}: {}", output_path.display(), e), start);
+            }
+            if let Err(e) = w.finish() {
+                return error_result(format!("failed to finalize {}: {}", output_path.display(), e), start);
+            }
         }
 
         ctx.ui.log(&format!("Wrote model to {}", output_path.display()));
@@ -226,28 +323,32 @@ impl CommandOp for AnalyzeProfileOp {
                 required: true,
                 default: None,
                 description: "Input fvec file to profile".to_string(),
-            },
+                        role: OptionRole::Input,
+        },
             OptionDesc {
                 name: "output".to_string(),
                 type_name: "Path".to_string(),
                 required: true,
                 default: None,
                 description: "Output JSON model file".to_string(),
-            },
+                        role: OptionRole::Output,
+        },
             OptionDesc {
                 name: "sample".to_string(),
                 type_name: "int".to_string(),
                 required: false,
                 default: Some("10000".to_string()),
                 description: "Max vectors to sample".to_string(),
-            },
+                        role: OptionRole::Config,
+        },
             OptionDesc {
                 name: "verbose".to_string(),
                 type_name: "bool".to_string(),
                 required: false,
                 default: Some("false".to_string()),
                 description: "Show per-dimension details".to_string(),
-            },
+                        role: OptionRole::Config,
+        },
         ]
     }
 }

@@ -1118,6 +1118,14 @@ framework.
   operator warning), aggregated cache files. Cache is not disposable —
   eviction forces recomputation of affected segments.
 
+The `--compress-cache` option provides an additional resource trade-off
+for cache files: gzip compression reduces disk I/O bandwidth and storage
+consumption at the cost of CPU time and memory for in-memory
+compression/decompression. This is beneficial when cache storage is the
+bottleneck (slow or limited disk) but CPU headroom exists. See
+[05-dataset-specification.md](05-dataset-specification.md) §5.7 for
+which cache artifacts are eligible for compression.
+
 ### Scenario: Concurrent pipelines
 
 - **Trigger**: User runs multiple dataset preparations simultaneously

@@ -9,12 +9,14 @@
 //! Equivalent to the Java `CMD_analyze_model_diff` command.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
+use rayon::prelude::*;
 use serde::Deserialize;
 
 use crate::pipeline::command::{
-    CommandDoc, CommandOp, CommandResult, OptionDesc, Options, ResourceDesc, Status, StreamContext,
+    CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options, ResourceDesc, Status, StreamContext,
     render_options_table,
 };
 
@@ -185,6 +187,64 @@ impl CommandOp for AnalyzeModelDiffOp {
         }
 
         let dim_count = orig.scalar_models.len();
+
+        // Query governor for thread count and build rayon pool
+        let threads = ctx.governor.current_or("threads", ctx.threads as u64).max(1) as usize;
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .ok();
+
+        // Compute per-dimension drift in parallel
+        let pb = ctx.ui.bar_with_unit(dim_count as u64, "computing per-dimension drift", "dims");
+        let progress = AtomicU64::new(0);
+        let pb_ref = &pb;
+        let progress_ref = &progress;
+
+        struct DimResult {
+            index: usize,
+            orig_type: String,
+            comp_type: String,
+            types_match: bool,
+            drift: f64,
+        }
+
+        let compute_fn = || {
+            (0..dim_count)
+                .into_par_iter()
+                .map(|i| {
+                    let o = &orig.scalar_models[i];
+                    let c = &comp.scalar_models[i];
+                    let types_match = o.type_name() == c.type_name();
+                    let drift = o.drift(c).unwrap_or(100.0);
+
+                    let done = progress_ref.fetch_add(1, Ordering::Relaxed) + 1;
+                    if done % 100 == 0 || done == dim_count as u64 {
+                        pb_ref.set_position(done);
+                    }
+
+                    DimResult {
+                        index: i,
+                        orig_type: o.type_name().to_string(),
+                        comp_type: c.type_name().to_string(),
+                        types_match,
+                        drift,
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let mut dim_results = if let Some(p) = &pool {
+            p.install(compute_fn)
+        } else {
+            compute_fn()
+        };
+        pb.finish();
+
+        // Sort by index to restore dimension order for reporting
+        dim_results.sort_by_key(|r| r.index);
+
+        // Accumulate and report sequentially
         let mut type_matches = 0usize;
         let mut total_drift = 0.0f64;
         let mut max_drift = 0.0f64;
@@ -196,41 +256,36 @@ impl CommandOp for AnalyzeModelDiffOp {
         ));
         ctx.ui.log(&format!("{}", "-".repeat(52)));
 
-        for i in 0..dim_count {
-            let o = &orig.scalar_models[i];
-            let c = &comp.scalar_models[i];
-            let types_match = o.type_name() == c.type_name();
-            if types_match {
+        for r in &dim_results {
+            if r.types_match {
                 type_matches += 1;
             }
-
-            let drift = o.drift(c).unwrap_or(100.0);
-            total_drift += drift;
-            if drift > max_drift {
-                max_drift = drift;
+            total_drift += r.drift;
+            if r.drift > max_drift {
+                max_drift = r.drift;
             }
 
-            let status = if !types_match {
-                problem_dims.push(i);
+            let status = if !r.types_match {
+                problem_dims.push(r.index);
                 "TYPE MISMATCH"
-            } else if drift > max_drift_threshold {
-                problem_dims.push(i);
+            } else if r.drift > max_drift_threshold {
+                problem_dims.push(r.index);
                 "HIGH DRIFT"
             } else {
                 "ok"
             };
 
-            let show = verbose || i < 10 || problem_dims.contains(&i) || i == dim_count - 1;
+            let show = verbose || r.index < 10 || problem_dims.contains(&r.index) || r.index == dim_count - 1;
             if show {
                 ctx.ui.log(&format!(
                     "{:<6} {:<10} {:<10} {:>9.2}%  {}",
-                    i,
-                    o.type_name(),
-                    c.type_name(),
-                    drift,
+                    r.index,
+                    r.orig_type,
+                    r.comp_type,
+                    r.drift,
                     status
                 ));
-            } else if i == 10 {
+            } else if r.index == 10 {
                 ctx.ui.log("  ...");
             }
         }
@@ -275,35 +330,40 @@ impl CommandOp for AnalyzeModelDiffOp {
                 required: true,
                 default: None,
                 description: "Original model.json file".to_string(),
-            },
+                        role: OptionRole::Input,
+        },
             OptionDesc {
                 name: "compare".to_string(),
                 type_name: "Path".to_string(),
                 required: true,
                 default: None,
                 description: "Model.json file to compare against".to_string(),
-            },
+                        role: OptionRole::Input,
+        },
             OptionDesc {
                 name: "drift-threshold".to_string(),
                 type_name: "float".to_string(),
                 required: false,
                 default: Some("1.0".to_string()),
                 description: "Max allowed average drift percentage".to_string(),
-            },
+                        role: OptionRole::Config,
+        },
             OptionDesc {
                 name: "max-drift-threshold".to_string(),
                 type_name: "float".to_string(),
                 required: false,
                 default: Some("2.0".to_string()),
                 description: "Max allowed single-dimension drift percentage".to_string(),
-            },
+                        role: OptionRole::Config,
+        },
             OptionDesc {
                 name: "verbose".to_string(),
                 type_name: "bool".to_string(),
                 required: false,
                 default: Some("false".to_string()),
                 description: "Show all dimensions".to_string(),
-            },
+                        role: OptionRole::Config,
+        },
         ]
     }
 }

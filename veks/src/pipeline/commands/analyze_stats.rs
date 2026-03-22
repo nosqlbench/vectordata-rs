@@ -9,15 +9,18 @@
 //! Equivalent to the Java `CMD_analyze_stats` command.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
+use rayon::prelude::*;
 use vectordata::VectorReader;
 use vectordata::io::MmapVectorReader;
 
 use crate::pipeline::command::{
-    CommandDoc, CommandOp, CommandResult, OptionDesc, Options, ResourceDesc, Status, StreamContext,
+    CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options, ResourceDesc, Status, StreamContext,
     render_options_table,
 };
+use crate::pipeline::element_type::ElementType;
 use super::source_window::resolve_source;
 
 /// Pipeline command: compute vector statistics.
@@ -41,8 +44,10 @@ pub struct DimensionStats {
 }
 
 impl DimensionStats {
-    /// Compute statistics from a slice of values.
-    pub fn compute(values: &[f32]) -> Self {
+    /// Compute statistics from a slice of f64 values.
+    ///
+    /// Callers should convert their element type to f64 before calling.
+    pub fn compute(values: &[f64]) -> Self {
         let n = values.len();
         if n == 0 {
             return DimensionStats {
@@ -62,14 +67,13 @@ impl DimensionStats {
         let mut max = f64::NEG_INFINITY;
         let mut sum = 0.0f64;
         for &v in values {
-            let vf = v as f64;
-            if vf < min {
-                min = vf;
+            if v < min {
+                min = v;
             }
-            if vf > max {
-                max = vf;
+            if v > max {
+                max = v;
             }
-            sum += vf;
+            sum += v;
         }
         let mean = sum / n as f64;
 
@@ -78,7 +82,7 @@ impl DimensionStats {
         let mut m3 = 0.0f64;
         let mut m4 = 0.0f64;
         for &v in values {
-            let d = v as f64 - mean;
+            let d = v - mean;
             let d2 = d * d;
             m2 += d2;
             m3 += d2 * d;
@@ -199,18 +203,67 @@ impl CommandOp for AnalyzeStatsOp {
         };
         let source_path = source.path.clone();
 
-        let reader = match MmapVectorReader::<f32>::open_fvec(&source_path) {
-            Ok(r) => r,
-            Err(e) => {
-                return error_result(
-                    format!("failed to open {}: {}", source_path.display(), e),
-                    start,
-                )
+        let etype = match ElementType::from_path(&source_path) {
+            Ok(t) => t,
+            Err(e) => return error_result(e, start),
+        };
+
+        // Open reader and extract (file_count, dim, get_f64_fn) based on element type.
+        // We use a boxed closure to erase the reader type while keeping the inner
+        // loops monomorphic through inlining.
+        let (file_count, dim, get_f64): (usize, usize, Box<dyn Fn(usize) -> Vec<f64> + Sync>) = match etype {
+            ElementType::F32 => {
+                let r = match MmapVectorReader::<f32>::open_fvec(&source_path) {
+                    Ok(r) => r, Err(e) => return error_result(format!("open: {}", e), start),
+                };
+                let fc = VectorReader::<f32>::count(&r);
+                let d = VectorReader::<f32>::dim(&r);
+                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
+            }
+            ElementType::F16 => {
+                let r = match MmapVectorReader::<half::f16>::open_mvec(&source_path) {
+                    Ok(r) => r, Err(e) => return error_result(format!("open: {}", e), start),
+                };
+                let fc = VectorReader::<half::f16>::count(&r);
+                let d = VectorReader::<half::f16>::dim(&r);
+                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|v| v.to_f64()).collect()))
+            }
+            ElementType::F64 => {
+                let r = match MmapVectorReader::<f64>::open_dvec(&source_path) {
+                    Ok(r) => r, Err(e) => return error_result(format!("open: {}", e), start),
+                };
+                let fc = VectorReader::<f64>::count(&r);
+                let d = VectorReader::<f64>::dim(&r);
+                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default()))
+            }
+            ElementType::I32 => {
+                let r = match MmapVectorReader::<i32>::open_ivec(&source_path) {
+                    Ok(r) => r, Err(e) => return error_result(format!("open: {}", e), start),
+                };
+                let fc = VectorReader::<i32>::count(&r);
+                let d = VectorReader::<i32>::dim(&r);
+                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
+            }
+            ElementType::I16 => {
+                let r = match MmapVectorReader::<i16>::open_svec(&source_path) {
+                    Ok(r) => r, Err(e) => return error_result(format!("open: {}", e), start),
+                };
+                let fc = VectorReader::<i16>::count(&r);
+                let d = VectorReader::<i16>::dim(&r);
+                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
+            }
+            ElementType::U8 | ElementType::I8 => {
+                let r = match MmapVectorReader::<u8>::open_bvec(&source_path) {
+                    Ok(r) => r, Err(e) => return error_result(format!("open: {}", e), start),
+                };
+                let fc = VectorReader::<u8>::count(&r);
+                let d = VectorReader::<u8>::dim(&r);
+                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
             }
         };
 
-        let file_count = <MmapVectorReader<f32> as VectorReader<f32>>::count(&reader);
-        let dim = <MmapVectorReader<f32> as VectorReader<f32>>::dim(&reader);
+        ctx.ui.log(&format!("  source: {} ({}, dim={}, {} records)", source_path.display(), etype, dim, file_count));
+
         let (base_offset, count) = match source.window {
             Some((ws, we)) => {
                 let ws = ws.min(file_count);
@@ -221,6 +274,12 @@ impl CommandOp for AnalyzeStatsOp {
         };
         let effective_count = sample.map(|s| s.min(count)).unwrap_or(count);
 
+        let threads = ctx.governor.current_or("threads", ctx.threads as u64) as usize;
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .ok();
+
         if let Some(d) = dimension {
             if d >= dim {
                 return error_result(
@@ -230,16 +289,19 @@ impl CommandOp for AnalyzeStatsOp {
             }
 
             // Single dimension analysis with percentiles
-            let mut values: Vec<f32> = Vec::with_capacity(effective_count);
+            let pb = ctx.ui.bar_with_unit(effective_count as u64, "reading dimension values", "vectors");
+            let mut values: Vec<f64> = Vec::with_capacity(effective_count);
             for i in 0..effective_count {
-                let vec = reader.get(base_offset + i).unwrap_or_default();
+                let vec = get_f64(base_offset + i);
                 values.push(vec[d]);
+                if (i + 1) % 100_000 == 0 { pb.set_position((i + 1) as u64); }
             }
+            pb.finish();
 
             let stats = DimensionStats::compute(&values);
 
             // Percentiles
-            let mut sorted: Vec<f64> = values.iter().map(|&v| v as f64).collect();
+            let mut sorted: Vec<f64> = values.clone();
             sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
             let p1 = percentile(&sorted, 1.0);
@@ -279,20 +341,45 @@ impl CommandOp for AnalyzeStatsOp {
                 upper_fence
             ));
         } else if all_dimensions {
-            // Summary table for all dimensions
+            // Summary table for all dimensions -- parallelize per-dimension stats
+            let pb = ctx.ui.bar_with_unit(dim as u64, "computing per-dimension stats", "vectors");
+            let progress = AtomicU64::new(0);
+            let pb_ref = &pb;
+            let progress_ref = &progress;
+
+            let get_f64_ref = &get_f64;
+            let compute_fn = || {
+                (0..dim)
+                    .into_par_iter()
+                    .map(|d| {
+                        let mut values: Vec<f64> = Vec::with_capacity(effective_count);
+                        for i in 0..effective_count {
+                            let vec = get_f64_ref(base_offset + i);
+                            values.push(vec[d]);
+                        }
+                        let done = progress_ref.fetch_add(1, Ordering::Relaxed) + 1;
+                        pb_ref.set_position(done);
+                        (d, DimensionStats::compute(&values))
+                    })
+                    .collect::<Vec<_>>()
+            };
+
+            let mut dim_stats: Vec<(usize, DimensionStats)> = if let Some(ref p) = pool {
+                p.install(compute_fn)
+            } else {
+                compute_fn()
+            };
+            pb.finish();
+
+            dim_stats.sort_by_key(|(d, _)| *d);
+
             ctx.ui.log(&format!(
                 "{:>5} {:>12} {:>12} {:>12} {:>12} {:>10} {:>10}",
                 "Dim", "Mean", "StdDev", "Min", "Max", "Skewness", "Kurtosis"
             ));
             ctx.ui.log(&format!("{}", "-".repeat(83)));
 
-            for d in 0..dim {
-                let mut values: Vec<f32> = Vec::with_capacity(effective_count);
-                for i in 0..effective_count {
-                    let vec = reader.get(i).unwrap_or_default();
-                    values.push(vec[d]);
-                }
-                let stats = DimensionStats::compute(&values);
+            for (d, stats) in &dim_stats {
                 ctx.ui.log(&format!(
                     "{:5} {:12.6} {:12.6} {:12.6} {:12.6} {:10.4} {:10.4}",
                     d, stats.mean, stats.std_dev, stats.min, stats.max, stats.skewness, stats.kurtosis
@@ -300,11 +387,14 @@ impl CommandOp for AnalyzeStatsOp {
             }
         } else {
             // Global stats across all dimensions
-            let mut all_values: Vec<f32> = Vec::with_capacity(effective_count * dim);
+            let pb = ctx.ui.bar_with_unit(effective_count as u64, "reading vectors", "vectors");
+            let mut all_values: Vec<f64> = Vec::with_capacity(effective_count * dim);
             for i in 0..effective_count {
-                let vec = reader.get(base_offset + i).unwrap_or_default();
-                all_values.extend_from_slice(&vec);
+                all_values.extend(get_f64(base_offset + i));
+                if (i + 1) % 100_000 == 0 { pb.set_position((i + 1) as u64); }
             }
+            pb.finish();
+
             let stats = DimensionStats::compute(&all_values);
 
             ctx.ui.log(&format!(
@@ -340,28 +430,32 @@ impl CommandOp for AnalyzeStatsOp {
                 required: true,
                 default: None,
                 description: "Input fvec file".to_string(),
-            },
+                        role: OptionRole::Input,
+        },
             OptionDesc {
                 name: "dimension".to_string(),
                 type_name: "int".to_string(),
                 required: false,
                 default: None,
                 description: "Specific dimension to analyze (0-indexed)".to_string(),
-            },
+                        role: OptionRole::Config,
+        },
             OptionDesc {
                 name: "all-dimensions".to_string(),
                 type_name: "bool".to_string(),
                 required: false,
                 default: Some("false".to_string()),
                 description: "Show summary table for all dimensions".to_string(),
-            },
+                        role: OptionRole::Config,
+        },
             OptionDesc {
                 name: "sample".to_string(),
                 type_name: "int".to_string(),
                 required: false,
                 default: None,
                 description: "Max vectors to sample (default: all)".to_string(),
-            },
+                        role: OptionRole::Config,
+        },
         ]
     }
 }

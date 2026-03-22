@@ -22,9 +22,11 @@ use std::time::Instant;
 
 use rand::Rng;
 use rand_distr::{Beta, Distribution, Normal, Uniform};
+use rayon::prelude::*;
 
+use crate::pipeline::atomic_write::AtomicWriter;
 use crate::pipeline::command::{
-    CommandDoc, CommandOp, CommandResult, OptionDesc, Options, Status, StreamContext,
+    CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options, Status, StreamContext,
     render_options_table,
 };
 use crate::pipeline::rng;
@@ -213,19 +215,34 @@ data with known statistical properties.
             .map(|d| build_sampler(d, mix, lower, upper, &mut param_rng))
             .collect();
 
+        // Query governor for thread count and build rayon pool
+        let threads = ctx.governor.current_or("threads", ctx.threads as u64).max(1) as usize;
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .ok();
+
+        let pb = ctx.ui.bar_with_unit(count, "generating sketch vectors", "vectors");
+
         // Generate vectors
         let mut data_rng = rng::seeded_rng(seed.wrapping_add(1));
-        match generate_sketch_fvec(&output_path, dimension, count, &samplers, normalize, &mut data_rng) {
-            Ok(()) => CommandResult {
-                status: Status::Ok,
-                message: format!(
-                    "generated {} sketch vectors (dim={}, mix={:?}) to {}",
-                    count, dimension, mix, output_path.display()
-                ),
-                produced: vec![output_path],
-                elapsed: start.elapsed(),
-            },
-            Err(e) => error_result(e, start),
+        match generate_sketch_fvec(&output_path, dimension, count, &samplers, normalize, &mut data_rng, &pb, pool.as_ref()) {
+            Ok(()) => {
+                pb.finish();
+                CommandResult {
+                    status: Status::Ok,
+                    message: format!(
+                        "generated {} sketch vectors (dim={}, mix={:?}) to {}",
+                        count, dimension, mix, output_path.display()
+                    ),
+                    produced: vec![output_path],
+                    elapsed: start.elapsed(),
+                }
+            }
+            Err(e) => {
+                pb.finish();
+                error_result(e, start)
+            }
         }
     }
 
@@ -237,56 +254,64 @@ data with known statistical properties.
                 required: true,
                 default: None,
                 description: "Output fvec file".to_string(),
-            },
+                        role: OptionRole::Output,
+        },
             OptionDesc {
                 name: "dimension".to_string(),
                 type_name: "int".to_string(),
                 required: true,
                 default: None,
                 description: "Vector dimensionality".to_string(),
-            },
+                        role: OptionRole::Config,
+        },
             OptionDesc {
                 name: "count".to_string(),
                 type_name: "int".to_string(),
                 required: true,
                 default: None,
                 description: "Number of vectors".to_string(),
-            },
+                        role: OptionRole::Config,
+        },
             OptionDesc {
                 name: "mix".to_string(),
                 type_name: "enum".to_string(),
                 required: false,
                 default: Some("bounded".to_string()),
                 description: "Distribution mix: bounded, normal, beta, uniform, mixed".to_string(),
-            },
+                        role: OptionRole::Config,
+        },
             OptionDesc {
                 name: "seed".to_string(),
                 type_name: "int".to_string(),
                 required: false,
                 default: Some("0".to_string()),
                 description: "Random seed".to_string(),
-            },
+                        role: OptionRole::Config,
+        },
             OptionDesc {
                 name: "lower".to_string(),
                 type_name: "float".to_string(),
                 required: false,
                 default: Some("-1.0".to_string()),
                 description: "Lower bound for distributions".to_string(),
-            },
+                        role: OptionRole::Config,
+        },
             OptionDesc {
                 name: "upper".to_string(),
                 type_name: "float".to_string(),
                 required: false,
                 default: Some("1.0".to_string()),
                 description: "Upper bound for distributions".to_string(),
-            },
+                        role: OptionRole::Config,
+        },
             OptionDesc {
                 name: "normalize".to_string(),
                 type_name: "bool".to_string(),
                 required: false,
                 default: Some("true".to_string()),
                 description: "L2-normalize output vectors".to_string(),
-            },
+                        role: OptionRole::Config,
+        },
         ]
     }
 }
@@ -351,6 +376,9 @@ fn build_sampler(
 }
 
 /// Generate sketch vectors as fvec, optionally L2-normalized.
+///
+/// Vectors are generated sequentially (RNG is stateful) but normalization of
+/// batched chunks is parallelized via rayon when a pool is provided.
 fn generate_sketch_fvec(
     output: &Path,
     dim: u32,
@@ -358,41 +386,69 @@ fn generate_sketch_fvec(
     samplers: &[DimSampler],
     normalize: bool,
     rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
+    pb: &crate::ui::ProgressHandle,
+    pool: Option<&rayon::ThreadPool>,
 ) -> Result<(), String> {
     use std::io::Write;
-    let file = std::fs::File::create(output)
+    let mut writer = AtomicWriter::new(output)
         .map_err(|e| format!("failed to create {}: {}", output.display(), e))?;
-    let mut writer = std::io::BufWriter::with_capacity(1 << 20, file);
 
-    let mut vec_buf: Vec<f32> = vec![0.0; dim as usize];
+    let dim_usize = dim as usize;
+    let batch_size = 10_000usize;
+    let mut written = 0u64;
 
-    for _ in 0..count {
-        // Sample each dimension
-        for (d, sampler) in samplers.iter().enumerate() {
-            vec_buf[d] = sampler.sample(rng) as f32;
-        }
+    while written < count {
+        let batch_count = batch_size.min((count - written) as usize);
 
-        // L2 normalize if requested
-        if normalize {
-            let norm_sq: f64 = vec_buf.iter().map(|v| (*v as f64) * (*v as f64)).sum();
-            if norm_sq > 0.0 {
-                let inv_norm = 1.0 / norm_sq.sqrt();
-                for v in &mut vec_buf {
-                    *v = (*v as f64 * inv_norm) as f32;
-                }
+        // Sample batch sequentially (RNG is stateful)
+        let mut batch: Vec<f32> = vec![0.0; batch_count * dim_usize];
+        for v in 0..batch_count {
+            let offset = v * dim_usize;
+            for (d, sampler) in samplers.iter().enumerate() {
+                batch[offset + d] = sampler.sample(rng) as f32;
             }
         }
 
-        // Write as fvec record
-        writer
-            .write_all(&(dim as i32).to_le_bytes())
-            .map_err(|e| e.to_string())?;
-        for &val in &vec_buf {
-            writer.write_all(&val.to_le_bytes()).map_err(|e| e.to_string())?;
+        // Normalize batch in parallel if requested
+        if normalize {
+            let mut normalize_fn = || {
+                batch
+                    .par_chunks_mut(dim_usize)
+                    .for_each(|vec_buf| {
+                        let norm_sq: f64 = vec_buf.iter().map(|v| (*v as f64) * (*v as f64)).sum();
+                        if norm_sq > 0.0 {
+                            let inv_norm = 1.0 / norm_sq.sqrt();
+                            for v in vec_buf.iter_mut() {
+                                *v = (*v as f64 * inv_norm) as f32;
+                            }
+                        }
+                    });
+            };
+            if let Some(p) = pool {
+                p.install(normalize_fn);
+            } else {
+                normalize_fn();
+            }
         }
+
+        // Write batch to fvec
+        for v in 0..batch_count {
+            let offset = v * dim_usize;
+            writer
+                .write_all(&(dim as i32).to_le_bytes())
+                .map_err(|e| e.to_string())?;
+            for d in 0..dim_usize {
+                writer
+                    .write_all(&batch[offset + d].to_le_bytes())
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+
+        written += batch_count as u64;
+        pb.set_position(written);
     }
 
-    writer.flush().map_err(|e| e.to_string())?;
+    writer.finish().map_err(|e| e.to_string())?;
     Ok(())
 }
 

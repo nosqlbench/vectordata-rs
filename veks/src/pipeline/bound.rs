@@ -37,14 +37,22 @@ pub fn check_artifact_default(output: &Path, _options: &Options) -> ArtifactStat
         return check_directory_completeness(output);
     }
 
+    // Try to detect format and do a format-specific structural check.
+    // For xvec formats, a 0-byte file is valid (0 records) — e.g., an
+    // empty zero_ordinals.ivec when there are no zero vectors.
+    if let Some(format) = VecFormat::detect(output) {
+        if meta.len() == 0 && format.is_xvec() {
+            // Empty xvec = 0 records, structurally valid
+            return ArtifactState::Complete;
+        }
+        return check_format_specific(output, format, meta.len());
+    }
+
     if meta.len() == 0 {
         return ArtifactState::Partial;
     }
 
-    // Try to detect format and do a format-specific structural check
-    if let Some(format) = VecFormat::detect(output) {
-        check_format_specific(output, format, meta.len())
-    } else if is_opaque_format(output) {
+    if is_opaque_format(output) {
         // Opaque but recognized formats (json, yaml, csv, etc.) — no structural
         // integrity check is possible, but exists + non-empty is sufficient.
         ArtifactState::Complete

@@ -39,13 +39,13 @@ pub use test_sink::TestSink;
 /// Uses `RatatuiSink` when stdout is a TTY, `PlainSink` otherwise (pipes, CI).
 /// Falls back to `PlainSink` if the ratatui terminal cannot be initialized.
 pub fn auto_ui_handle() -> UiHandle {
-    auto_ui_handle_with_interval(std::time::Duration::from_secs(1))
+    auto_ui_handle_with_interval(std::time::Duration::from_millis(250))
 }
 
 /// Create a UI handle with a custom redraw interval.
 pub fn auto_ui_handle_with_interval(redraw_interval: std::time::Duration) -> UiHandle {
-    let sink: std::sync::Arc<dyn UiSink> = if atty::is(atty::Stream::Stdout) {
-        match RatatuiSink::with_redraw_interval(16, redraw_interval) {
+    let sink: std::sync::Arc<dyn UiSink> = if crate::term::use_color() {
+        match RatatuiSink::with_redraw_interval(10, redraw_interval) {
             Ok(s) => std::sync::Arc::new(s),
             Err(_) => std::sync::Arc::new(PlainSink::new()),
         }

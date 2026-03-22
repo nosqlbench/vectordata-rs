@@ -12,9 +12,10 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use crate::pipeline::atomic_write::AtomicWriter;
 use crate::pipeline::command::{
-    ArtifactManifest, CommandDoc, CommandOp, CommandResult, OptionDesc, Options, Status,
-    StreamContext, render_options_table,
+    ArtifactManifest, CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options,
+    Status, StreamContext, render_options_table,
 };
 use crate::pipeline::rng;
 
@@ -159,21 +160,24 @@ The same shuffle ivec is also applied to metadata slabs (via
                 required: true,
                 default: None,
                 description: "Output ivec file path".to_string(),
-            },
+                role: OptionRole::Output,
+        },
             OptionDesc {
                 name: "interval".to_string(),
                 type_name: "int".to_string(),
                 required: true,
                 default: None,
                 description: "Number of elements to shuffle (0 to interval-1)".to_string(),
-            },
+                role: OptionRole::Config,
+        },
             OptionDesc {
                 name: "seed".to_string(),
                 type_name: "int".to_string(),
                 required: false,
                 default: Some("0".to_string()),
                 description: "Random seed for reproducibility".to_string(),
-            },
+                role: OptionRole::Config,
+        },
         ]
     }
 
@@ -191,9 +195,8 @@ The same shuffle ivec is also applied to metadata slabs (via
 /// Each record: `[dim=1: i32 LE][value: i32 LE]` = 8 bytes.
 fn write_ivec_1d(output: &Path, values: &[i32], pb: &crate::ui::ProgressHandle) -> Result<(), String> {
     use std::io::Write;
-    let file = std::fs::File::create(output)
+    let mut writer = AtomicWriter::new(output)
         .map_err(|e| format!("failed to create {}: {}", output.display(), e))?;
-    let mut writer = std::io::BufWriter::with_capacity(1 << 20, file);
 
     let dim: i32 = 1;
     let batch = 10_000.max(values.len() / 1000);
@@ -209,7 +212,7 @@ fn write_ivec_1d(output: &Path, values: &[i32], pb: &crate::ui::ProgressHandle) 
         }
     }
     pb.set_position(values.len() as u64);
-    writer.flush().map_err(|e| e.to_string())?;
+    writer.finish().map_err(|e| e.to_string())?;
     Ok(())
 }
 

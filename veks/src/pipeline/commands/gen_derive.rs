@@ -18,7 +18,7 @@ use vectordata::VectorReader;
 use vectordata::io::MmapVectorReader;
 
 use crate::pipeline::command::{
-    CommandDoc, CommandOp, CommandResult, OptionDesc, Options, ResourceDesc, Status, StreamContext,
+    CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options, ResourceDesc, Status, StreamContext,
     render_options_table,
 };
 
@@ -278,42 +278,48 @@ statistics.
                 required: true,
                 default: None,
                 description: "Source dataset directory or fvec file".to_string(),
-            },
+                        role: OptionRole::Input,
+        },
             OptionDesc {
                 name: "target".to_string(),
                 type_name: "Path".to_string(),
                 required: true,
                 default: None,
                 description: "Target directory for derived dataset".to_string(),
-            },
+                        role: OptionRole::Output,
+        },
             OptionDesc {
                 name: "sample".to_string(),
                 type_name: "int".to_string(),
                 required: false,
                 default: Some("10000".to_string()),
                 description: "Max vectors to sample for model extraction".to_string(),
-            },
+                        role: OptionRole::Config,
+        },
             OptionDesc {
                 name: "count".to_string(),
                 type_name: "int".to_string(),
                 required: false,
                 default: Some("0".to_string()),
                 description: "Target vector count (0 = same as source)".to_string(),
-            },
+                        role: OptionRole::Config,
+        },
             OptionDesc {
                 name: "name".to_string(),
                 type_name: "String".to_string(),
                 required: false,
                 default: Some("derived".to_string()),
                 description: "Name for the derived dataset".to_string(),
-            },
+                        role: OptionRole::Config,
+        },
             OptionDesc {
                 name: "force".to_string(),
                 type_name: "bool".to_string(),
                 required: false,
                 default: Some("false".to_string()),
                 description: "Overwrite target if exists".to_string(),
-            },
+                        role: OptionRole::Config,
+        },
         ]
     }
 }

@@ -14,8 +14,8 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::pipeline::command::{
-    CommandDoc, CommandOp, CommandResult, OptionDesc, Options, ResourceDesc, Status, StreamContext,
-    render_options_table,
+    CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options, ResourceDesc, Status,
+    StreamContext, render_options_table,
 };
 
 /// Pipeline command: download from HuggingFace Hub.
@@ -216,35 +216,40 @@ import, and vector file assembly.
                 required: true,
                 default: None,
                 description: "HuggingFace repository (e.g. user/dataset-name)".to_string(),
-            },
+                role: OptionRole::Config,
+        },
             OptionDesc {
                 name: "output".to_string(),
                 type_name: "Path".to_string(),
                 required: false,
                 default: None,
                 description: "Output directory for downloaded files".to_string(),
-            },
+                role: OptionRole::Output,
+        },
             OptionDesc {
                 name: "pattern".to_string(),
                 type_name: "String".to_string(),
                 required: false,
                 default: Some("*".to_string()),
                 description: "Glob pattern for file matching".to_string(),
-            },
+                role: OptionRole::Config,
+        },
             OptionDesc {
                 name: "revision".to_string(),
                 type_name: "String".to_string(),
                 required: false,
                 default: Some("main".to_string()),
                 description: "Branch or revision to download from".to_string(),
-            },
+                role: OptionRole::Config,
+        },
             OptionDesc {
                 name: "type".to_string(),
                 type_name: "String".to_string(),
                 required: false,
                 default: Some("dataset".to_string()),
                 description: "Repository type: dataset or model".to_string(),
-            },
+                role: OptionRole::Config,
+        },
         ]
     }
 }

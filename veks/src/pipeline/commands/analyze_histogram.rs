@@ -11,13 +11,15 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use rayon::prelude::*;
 use vectordata::VectorReader;
 use vectordata::io::MmapVectorReader;
 
 use crate::pipeline::command::{
-    CommandDoc, CommandOp, CommandResult, OptionDesc, Options, ResourceDesc, Status, StreamContext,
+    CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options, ResourceDesc, Status, StreamContext,
     render_options_table,
 };
+use crate::pipeline::element_type::ElementType;
 use super::analyze_stats::DimensionStats;
 
 /// Pipeline command: histogram visualization.
@@ -99,18 +101,62 @@ impl CommandOp for AnalyzeHistogramOp {
 
         let source_path = resolve_path(source_str, &ctx.workspace);
 
-        let reader = match MmapVectorReader::<f32>::open_fvec(&source_path) {
-            Ok(r) => r,
-            Err(e) => {
-                return error_result(
-                    format!("failed to open {}: {}", source_path.display(), e),
-                    start,
-                )
-            }
+        let etype = match ElementType::from_path(&source_path) {
+            Ok(t) => t,
+            Err(e) => return error_result(e, start),
         };
 
-        let count = <MmapVectorReader<f32> as VectorReader<f32>>::count(&reader);
-        let dim = <MmapVectorReader<f32> as VectorReader<f32>>::dim(&reader);
+        // Open reader and extract (count, dim, get_f64_fn) based on element type.
+        let (count, dim, get_f64): (usize, usize, Box<dyn Fn(usize) -> Vec<f64> + Sync>) = match etype {
+            ElementType::F32 => {
+                let r = match MmapVectorReader::<f32>::open_fvec(&source_path) {
+                    Ok(r) => r, Err(e) => return error_result(format!("open: {}", e), start),
+                };
+                let fc = VectorReader::<f32>::count(&r);
+                let d = VectorReader::<f32>::dim(&r);
+                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
+            }
+            ElementType::F16 => {
+                let r = match MmapVectorReader::<half::f16>::open_mvec(&source_path) {
+                    Ok(r) => r, Err(e) => return error_result(format!("open: {}", e), start),
+                };
+                let fc = VectorReader::<half::f16>::count(&r);
+                let d = VectorReader::<half::f16>::dim(&r);
+                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|v| v.to_f64()).collect()))
+            }
+            ElementType::F64 => {
+                let r = match MmapVectorReader::<f64>::open_dvec(&source_path) {
+                    Ok(r) => r, Err(e) => return error_result(format!("open: {}", e), start),
+                };
+                let fc = VectorReader::<f64>::count(&r);
+                let d = VectorReader::<f64>::dim(&r);
+                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default()))
+            }
+            ElementType::I32 => {
+                let r = match MmapVectorReader::<i32>::open_ivec(&source_path) {
+                    Ok(r) => r, Err(e) => return error_result(format!("open: {}", e), start),
+                };
+                let fc = VectorReader::<i32>::count(&r);
+                let d = VectorReader::<i32>::dim(&r);
+                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
+            }
+            ElementType::I16 => {
+                let r = match MmapVectorReader::<i16>::open_svec(&source_path) {
+                    Ok(r) => r, Err(e) => return error_result(format!("open: {}", e), start),
+                };
+                let fc = VectorReader::<i16>::count(&r);
+                let d = VectorReader::<i16>::dim(&r);
+                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
+            }
+            ElementType::U8 | ElementType::I8 => {
+                let r = match MmapVectorReader::<u8>::open_bvec(&source_path) {
+                    Ok(r) => r, Err(e) => return error_result(format!("open: {}", e), start),
+                };
+                let fc = VectorReader::<u8>::count(&r);
+                let d = VectorReader::<u8>::dim(&r);
+                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
+            }
+        };
 
         if dimension >= dim {
             return error_result(
@@ -121,12 +167,22 @@ impl CommandOp for AnalyzeHistogramOp {
 
         let effective_count = sample.map(|s| s.min(count)).unwrap_or(count);
 
-        // Extract values for the dimension
-        let mut values: Vec<f32> = Vec::with_capacity(effective_count);
+        // Query governor for thread count and build rayon pool
+        let threads = ctx.governor.current_or("threads", ctx.threads as u64).max(1) as usize;
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .ok();
+
+        // Extract values for the dimension with progress bar
+        let pb = ctx.ui.bar_with_unit(effective_count as u64, "reading dimension values", "vectors");
+        let mut values: Vec<f64> = Vec::with_capacity(effective_count);
         for i in 0..effective_count {
-            let vec = reader.get(i).unwrap_or_default();
+            let vec = get_f64(i);
             values.push(vec[dimension]);
+            if (i + 1) % 100_000 == 0 { pb.set_position((i + 1) as u64); }
         }
+        pb.finish();
 
         let stats = DimensionStats::compute(&values);
 
@@ -152,13 +208,36 @@ impl CommandOp for AnalyzeHistogramOp {
         }
 
         let bin_width = (max - min) / bins as f64;
-        let mut bin_counts = vec![0usize; bins];
 
-        for &v in &values {
-            let idx = ((v as f64 - min) / bin_width) as usize;
-            let idx = idx.min(bins - 1);
-            bin_counts[idx] += 1;
-        }
+        // Parallelize bin accumulation using per-chunk histograms
+        let bin_fn = || {
+            values
+                .par_chunks(100_000)
+                .map(|chunk| {
+                    let mut local_bins = vec![0usize; bins];
+                    for &v in chunk {
+                        let idx = ((v - min) / bin_width) as usize;
+                        let idx = idx.min(bins - 1);
+                        local_bins[idx] += 1;
+                    }
+                    local_bins
+                })
+                .reduce(
+                    || vec![0usize; bins],
+                    |mut a, b| {
+                        for (i, c) in b.into_iter().enumerate() {
+                            a[i] += c;
+                        }
+                        a
+                    },
+                )
+        };
+
+        let bin_counts = if let Some(p) = &pool {
+            p.install(bin_fn)
+        } else {
+            bin_fn()
+        };
 
         let max_count = *bin_counts.iter().max().unwrap_or(&1);
 
@@ -212,35 +291,40 @@ impl CommandOp for AnalyzeHistogramOp {
                 required: true,
                 default: None,
                 description: "Input fvec file".to_string(),
-            },
+                        role: OptionRole::Input,
+        },
             OptionDesc {
                 name: "dimension".to_string(),
                 type_name: "int".to_string(),
                 required: true,
                 default: None,
                 description: "Dimension index to visualize (0-indexed)".to_string(),
-            },
+                        role: OptionRole::Config,
+        },
             OptionDesc {
                 name: "bins".to_string(),
                 type_name: "int".to_string(),
                 required: false,
                 default: Some("40".to_string()),
                 description: "Number of histogram bins".to_string(),
-            },
+                        role: OptionRole::Config,
+        },
             OptionDesc {
                 name: "width".to_string(),
                 type_name: "int".to_string(),
                 required: false,
                 default: Some("60".to_string()),
                 description: "Width of histogram bars in characters".to_string(),
-            },
+                        role: OptionRole::Config,
+        },
             OptionDesc {
                 name: "sample".to_string(),
                 type_name: "int".to_string(),
                 required: false,
                 default: None,
                 description: "Max vectors to sample (default: all)".to_string(),
-            },
+                        role: OptionRole::Config,
+        },
         ]
     }
 }

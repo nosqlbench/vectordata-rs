@@ -19,6 +19,34 @@ use std::path::{Path, PathBuf};
 
 use vectordata::dataset::{CatalogEntry, CatalogLayout, DatasetConfig};
 
+/// Sentinel file that marks the top of the catalog hierarchy.
+///
+/// When present in a parent directory, `catalog generate` automatically
+/// uses that directory as the scan root and generates catalogs at every
+/// level from there down. This allows the user to keep an uncataloged
+/// leading path in a remote URL while still getting automatic updates.
+const CATALOG_ROOT_FILE: &str = ".catalog_root";
+
+/// Walk up from `dir` looking for a `.catalog_root` file.
+/// Returns the directory containing it, or `None`.
+fn find_catalog_root(dir: &Path) -> Option<PathBuf> {
+    let mut current = if dir.is_absolute() {
+        dir.to_path_buf()
+    } else {
+        std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf())
+    };
+
+    loop {
+        let candidate = current.join(CATALOG_ROOT_FILE);
+        if candidate.is_file() {
+            return Some(current);
+        }
+        if !current.pop() {
+            return None;
+        }
+    }
+}
+
 /// Internal representation of a discovered dataset before path relativization.
 struct DiscoveredDataset {
     /// Absolute (canonical) path to the `dataset.yaml` file.
@@ -53,7 +81,16 @@ impl DiscoveredDataset {
 }
 
 /// Run `veks catalog generate`.
-pub fn run(input: &Path, basename: &str) {
+///
+/// Modes:
+/// - `for_publish_url`: walk up to `.publish_url` root and generate catalogs
+///   for the entire publish hierarchy.
+/// - `update` (default true): only update catalog files that already exist in
+///   the hierarchy. Directories with no existing catalog are skipped.
+/// - Neither: generate catalogs at all hierarchy levels from `input` down.
+///   If `.publish_url` is detected above `input` and `update` is false, warn
+///   that partial catalogs may leave the publish hierarchy out of sync.
+pub fn run(input: &Path, basename: &str, for_publish_url: bool, update: bool) {
     if basename.contains('.') {
         eprintln!("error: basename must not contain a dot");
         std::process::exit(1);
@@ -72,10 +109,76 @@ pub fn run(input: &Path, basename: &str) {
         std::process::exit(1);
     }
 
-    eprintln!("Scanning {} for datasets...", input_path.display());
+    // Resolve the effective scan root based on mode.
+    //
+    // Priority:
+    // 1. --for-publish-url: walk up to .publish_url
+    // 2. .catalog_root in parent path: use that directory automatically
+    // 3. fall back to input directory
+    let scan_root = if for_publish_url {
+        // Walk up to find .publish_url, use its parent as root
+        match crate::check::publish_url::find_publish_file(&input_path) {
+            Some(publish_file) => {
+                let root = publish_file.parent().unwrap().to_path_buf();
+                eprintln!(
+                    "Found {} — scanning from publish root: {}",
+                    publish_file.display(),
+                    root.display()
+                );
+                root
+            }
+            None => {
+                eprintln!("error: --for-publish-url specified but no .publish_url found above {}", input_path.display());
+                std::process::exit(1);
+            }
+        }
+    } else if let Some(catalog_root) = find_catalog_root(&input_path) {
+        // .catalog_root found — use that directory as the scan root and
+        // generate catalogs at every level from there down.
+        eprintln!(
+            "Found {} — catalog root: {}",
+            catalog_root.join(CATALOG_ROOT_FILE).display(),
+            catalog_root.display()
+        );
+        catalog_root
+    } else {
+        input_path.clone()
+    };
+
+    // When .catalog_root was detected, we always generate the full hierarchy
+    // from that root (not just existing catalogs), so override update mode.
+    let catalog_root_detected = !for_publish_url && find_catalog_root(&input_path).is_some();
+    let effective_update = if catalog_root_detected { false } else { update };
+
+    // Detect .publish_url for warning purposes.
+    // When --for-publish-url is active or .catalog_root was detected,
+    // we're already scanning from an appropriate root — no warning needed.
+    // Otherwise, check if the publish root is above our scan root.
+    if !for_publish_url && !catalog_root_detected {
+        if let Some(publish_file) = crate::check::publish_url::find_publish_file(&input_path) {
+            let publish_root = publish_file.parent().unwrap();
+            let scan_canonical = scan_root.canonicalize().unwrap_or(scan_root.clone());
+            let publish_canonical = publish_root.canonicalize().unwrap_or(publish_root.to_path_buf());
+            if publish_canonical != scan_canonical {
+                eprintln!("WARNING: .publish_url found at {}", publish_file.display());
+                eprintln!("  The publish root is above the scan directory.");
+                if effective_update {
+                    eprintln!("  With --update (default), only existing catalog files will be refreshed.");
+                    eprintln!("  Parent directories between {} and {} that lack catalogs will remain uncovered.", scan_root.display(), publish_root.display());
+                } else {
+                    eprintln!("  Generating catalogs only from {} will leave parent catalogs stale.", scan_root.display());
+                }
+                eprintln!("  Use --for-publish-url to regenerate the full publish hierarchy,");
+                eprintln!("  or place a .catalog_root file at the desired catalog top level.");
+                eprintln!();
+            }
+        }
+    }
+
+    eprintln!("Scanning {} for datasets...", scan_root.display());
 
     let mut datasets: Vec<DiscoveredDataset> = Vec::new();
-    walk_for_datasets(&input_path, &mut datasets);
+    walk_for_datasets(&scan_root, &mut datasets);
     datasets.sort_by(|a, b| a.yaml_path.cmp(&b.yaml_path));
 
     eprintln!("Found {} dataset(s)", datasets.len());
@@ -95,25 +198,45 @@ pub fn run(input: &Path, basename: &str) {
         );
     }
 
-    // Determine all catalog directories (hierarchical): every directory
-    // between a dataset root and the input root gets its own catalog.
-    let input_canonical = input_path
+    // Determine all candidate catalog directories (hierarchical): every
+    // directory between a dataset root and the scan root gets a catalog.
+    let root_canonical = scan_root
         .canonicalize()
-        .unwrap_or_else(|_| input_path.clone());
+        .unwrap_or_else(|_| scan_root.clone());
     let mut catalog_dirs: BTreeSet<PathBuf> = BTreeSet::new();
-    catalog_dirs.insert(input_canonical.clone());
+    catalog_dirs.insert(root_canonical.clone());
     for ds in &datasets {
         let ds_dir = ds.yaml_path.parent().unwrap_or(&ds.yaml_path);
         let ds_canonical = ds_dir
             .canonicalize()
             .unwrap_or_else(|_| ds_dir.to_path_buf());
         let mut dir = ds_canonical;
-        while dir.starts_with(&input_canonical) {
+        while dir.starts_with(&root_canonical) {
             catalog_dirs.insert(dir.clone());
             match dir.parent() {
                 Some(parent) => dir = parent.to_path_buf(),
                 None => break,
             }
+        }
+    }
+
+    // In --update mode (and no .catalog_root override), filter to only
+    // directories that already have a catalog
+    if effective_update && !for_publish_url {
+        let before = catalog_dirs.len();
+        catalog_dirs.retain(|dir| {
+            let json_path = dir.join(format!("{}.json", basename));
+            let yaml_path = dir.join(format!("{}.yaml", basename));
+            json_path.exists() || yaml_path.exists()
+        });
+        let skipped = before - catalog_dirs.len();
+        if skipped > 0 {
+            eprintln!("  --update: skipping {} directories with no existing catalog", skipped);
+        }
+        if catalog_dirs.is_empty() {
+            eprintln!("No existing catalog files found to update. Use --no-update to create new ones,");
+            eprintln!("or --for-publish-url to generate the full publish hierarchy.");
+            return;
         }
     }
 

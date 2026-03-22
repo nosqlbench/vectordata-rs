@@ -13,14 +13,17 @@
 //! Equivalent to the Java `CMD_compute_sort` command.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrd};
 use std::time::Instant;
 
+use rayon::prelude::*;
 use vectordata::VectorReader;
 use vectordata::io::MmapVectorReader;
 
+use crate::pipeline::atomic_write::AtomicWriter;
 use crate::pipeline::command::{
-    ArtifactManifest, CommandDoc, CommandOp, CommandResult, OptionDesc, Options, ResourceDesc,
-    Status, StreamContext, render_options_table,
+    ArtifactManifest, CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options,
+    ResourceDesc, Status, StreamContext, render_options_table,
 };
 
 /// Pipeline command: sort vectors.
@@ -211,27 +214,63 @@ to match an externally defined permutation or clustering assignment.
             ctx.ui.log("  governor: throttle active");
         }
 
-        // Compute sort keys and build index
-        let pb = ctx.ui.bar(count as u64, "computing sort keys");
-        let mut indexed_keys: Vec<(usize, f64)> = Vec::with_capacity(count);
-        for i in 0..count {
-            let vec = match reader.get(i) {
-                Ok(v) => v,
-                Err(e) => {
-                    return error_result(
-                        format!("failed to read vector {}: {}", i, e),
-                        start,
-                    )
-                }
+        // Build a scoped rayon thread pool governed by the resource governor.
+        let threads = ctx.governor.current_or("threads", ctx.threads as u64).max(1) as usize;
+        ctx.ui.log(&format!("  {} threads for parallel sort-key computation", threads));
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .ok();
+
+        // Compute sort keys and build index (parallel)
+        let pb = ctx.ui.bar_with_unit(count as u64, "computing sort keys", "vectors");
+        let mut indexed_keys: Vec<(usize, f64)>;
+        {
+            let progress = AtomicU64::new(0);
+
+            let build_fn = || {
+                (0..count)
+                    .into_par_iter()
+                    .map(|i| {
+                        let vec = reader.get(i)
+                            .map_err(|e| format!("failed to read vector {}: {}", i, e))?;
+                        let key = criterion.key(&vec);
+                        let done = progress.fetch_add(1, AtomicOrd::Relaxed) + 1;
+                        if done % 500_000 == 0 {
+                            pb.set_position(done);
+                        }
+                        Ok((i, key))
+                    })
+                    .collect::<Result<Vec<_>, String>>()
             };
-            indexed_keys.push((i, criterion.key(&vec)));
-            if (i + 1) % 10_000 == 0 { pb.set_position((i + 1) as u64); }
+
+            let result = if let Some(ref p) = pool {
+                p.install(build_fn)
+            } else {
+                build_fn()
+            };
+
+            indexed_keys = match result {
+                Ok(v) => v,
+                Err(e) => return error_result(e, start),
+            };
         }
         pb.finish();
 
-        // Sort by key (stable sort to preserve order for equal keys)
+        // Parallel sort by key (stable sort to preserve order for equal keys)
         let sort_sp = ctx.ui.spinner("sorting");
-        indexed_keys.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        {
+            let mut sort_fn = || {
+                indexed_keys.par_sort_by(|a, b| {
+                    a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
+                });
+            };
+            if let Some(ref p) = pool {
+                p.install(sort_fn);
+            } else {
+                sort_fn();
+            }
+        }
         sort_sp.finish();
 
         // Governor checkpoint after sort phase
@@ -275,21 +314,24 @@ to match an externally defined permutation or clustering assignment.
                 required: true,
                 default: None,
                 description: "Input fvec file".to_string(),
-            },
+                role: OptionRole::Input,
+        },
             OptionDesc {
                 name: "output".to_string(),
                 type_name: "Path".to_string(),
                 required: true,
                 default: None,
                 description: "Output sorted fvec file".to_string(),
-            },
+                role: OptionRole::Output,
+        },
             OptionDesc {
                 name: "sort-by".to_string(),
                 type_name: "String".to_string(),
                 required: false,
                 default: Some("norm".to_string()),
                 description: "Sort criterion: 'norm' or 'dimension:N'".to_string(),
-            },
+                role: OptionRole::Config,
+        },
         ]
     }
 
@@ -311,9 +353,8 @@ fn write_sorted_fvec(
 ) -> Result<(), String> {
     use std::io::Write;
 
-    let file = std::fs::File::create(output)
+    let mut writer = AtomicWriter::new(output)
         .map_err(|e| format!("failed to create {}: {}", output.display(), e))?;
-    let mut writer = std::io::BufWriter::with_capacity(1 << 20, file);
 
     let dim_i32 = dim as i32;
     for &(idx, _) in sorted_indices {
@@ -331,7 +372,7 @@ fn write_sorted_fvec(
         }
     }
 
-    writer.flush().map_err(|e| e.to_string())?;
+    writer.finish().map_err(|e| e.to_string())?;
     Ok(())
 }
 

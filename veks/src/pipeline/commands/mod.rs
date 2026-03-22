@@ -8,6 +8,7 @@
 //! pipeline `Options` map and delegating to the underlying logic.
 
 pub mod barrier;
+pub mod catalog_generate;
 pub mod source_window;
 pub mod analyze_explore;
 pub mod analyze_checkendian;
@@ -25,6 +26,7 @@ pub mod analyze_stats;
 pub mod analyze_verifyknn;
 pub mod analyze_zeros;
 pub mod cleanup_cleanfvec;
+pub mod clean_ordinals;
 pub mod compute_dedup;
 pub mod compute_filtered_knn;
 pub mod compute_knn;
@@ -53,6 +55,8 @@ pub mod set_variable;
 pub mod json_rjq;
 pub mod merkle;
 pub mod slab;
+pub mod verify_knn;
+pub mod verify_predicates;
 
 use super::registry::CommandRegistry;
 
@@ -66,6 +70,7 @@ pub fn register_all(registry: &mut CommandRegistry) {
     // Phase 3: generation commands
     registry.register("generate vectors", gen_vectors::factory);
     registry.register("generate ivec-shuffle", gen_shuffle::factory);
+    registry.register("transform extract", gen_extract::extract_factory);
     registry.register("transform fvec-extract", gen_extract::fvec_factory);
     registry.register("transform ivec-extract", gen_extract::ivec_factory);
     registry.register("transform mvec-extract", gen_extract::mvec_factory);
@@ -78,6 +83,7 @@ pub fn register_all(registry: &mut CommandRegistry) {
     registry.register("compute filtered-knn", compute_filtered_knn::factory);
     registry.register("compute sort", compute_sort::factory);
     registry.register("compute dedup", compute_dedup::factory);
+    registry.register("transform clean-ordinals", clean_ordinals::factory);
 
     // Phase 5: analysis, info, and cleanup commands
     registry.register("analyze verify-knn", analyze_verifyknn::factory);
@@ -151,6 +157,11 @@ pub fn register_all(registry: &mut CommandRegistry) {
     registry.register("set variable", set_variable::factory);
     registry.register("clear variables", set_variable::clear_factory);
 
+    // Phase 8b: verification commands
+    registry.register("verify knn", verify_knn::factory);
+    registry.register("verify predicates", verify_predicates::factory);
+
     // Phase 9: pipeline infrastructure
     registry.register("barrier", barrier::factory);
+    registry.register("catalog generate", catalog_generate::factory);
 }

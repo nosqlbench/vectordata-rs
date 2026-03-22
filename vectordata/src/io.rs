@@ -1,7 +1,7 @@
 // Copyright (c) DataStax, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Vector I/O: readers for fvec, ivec, and mvec binary formats.
+//! Vector I/O: readers for fvec, ivec, mvec, dvec, bvec, and svec binary formats.
 //!
 //! Provides the [`VectorReader`] trait and two concrete implementations:
 //!
@@ -10,7 +10,7 @@
 //!
 //! # Supported formats
 //!
-//! All three formats share the same per-record layout: a 4-byte little-endian
+//! All formats share the same per-record layout: a 4-byte little-endian
 //! `i32` dimension header followed by `dim` elements.
 //!
 //! | Format | Element type | Element size | Open method |
@@ -18,6 +18,9 @@
 //! | **fvec** | `f32` | 4 bytes | `open_fvec` |
 //! | **ivec** | `i32` | 4 bytes | `open_ivec` |
 //! | **mvec** | `f16` (half) | 2 bytes | `open_mvec` |
+//! | **dvec** | `f64` | 8 bytes | `open_dvec` |
+//! | **bvec** | `u8` | 1 byte | `open_bvec` |
+//! | **svec** | `i16` | 2 bytes | `open_svec` |
 
 use std::fs::File;
 use std::io::{self, Cursor};
@@ -29,6 +32,30 @@ use thiserror::Error;
 use reqwest::blocking::Client;
 use reqwest::header::{CONTENT_LENGTH, RANGE};
 use url::Url;
+
+/// Sentinel value for dimension when the file has zero records.
+///
+/// Dimensionality is undefined (moot) when cardinality is zero — there are
+/// no records to derive a dimension from. Callers must check `count() > 0`
+/// before relying on `dim()`. Using `usize::MAX` rather than 0 avoids
+/// confusion with a hypothetical zero-dimensional vector.
+pub const DIM_UNDEFINED: usize = usize::MAX;
+
+/// Validate that a file's extension matches the expected format.
+///
+/// Returns `Ok(())` if the extension matches or the file has no extension
+/// (for programmatic paths). Returns an error for mismatches.
+fn validate_extension(path: &Path, expected: &str) -> Result<(), IoError> {
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        if ext != expected {
+            return Err(IoError::InvalidFormat(format!(
+                "file extension '.{}' does not match expected '.{}' for {}: {}",
+                ext, expected, expected, path.display(),
+            )));
+        }
+    }
+    Ok(())
+}
 
 /// Errors that can occur during vector I/O operations.
 #[derive(Error, Debug)]
@@ -166,28 +193,33 @@ impl<T> MmapVectorReader<T> {
 impl MmapVectorReader<f32> {
     /// Opens a local `.fvec` file for reading floating-point vectors.
     pub fn open_fvec(path: &Path) -> Result<Self, IoError> {
+        validate_extension(path, "fvec")?;
         let file = File::open(path)?;
         let mmap = unsafe { Mmap::map(&file)? };
-        
+
+        if mmap.is_empty() {
+            return Ok(Self {
+                mmap,
+                dim: DIM_UNDEFINED,
+                count: 0,
+                entry_size: 0,
+                header_size: 4,
+                _phantom: PhantomData,
+            });
+        }
+
         if mmap.len() < 4 {
             return Err(IoError::InvalidFormat("File too short".into()));
         }
 
         let mut cursor = Cursor::new(&mmap[..]);
         let dim = cursor.read_i32::<LittleEndian>()? as usize;
-        
+
         if dim == 0 {
              return Err(IoError::InvalidFormat("Dimension cannot be 0".into()));
         }
 
-        let entry_size = 4 + dim * 4; // 4 bytes for dim header (repeated per vector) + vectors
-        
-        // Verify size alignment
-        if mmap.len() % entry_size != 0 {
-             // It's possible the last record is incomplete or there's trailing data, but standard fvecs align
-             // We'll calculate count based on integer division
-        }
-        
+        let entry_size = 4 + dim * 4;
         let count = mmap.len() / entry_size;
 
         Ok(Self {
@@ -257,16 +289,24 @@ impl VectorReader<f32> for MmapVectorReader<f32> {
 impl MmapVectorReader<i32> {
     /// Opens a local `.ivec` file for reading integer vectors (e.g., indices).
     pub fn open_ivec(path: &Path) -> Result<Self, IoError> {
+        validate_extension(path, "ivec")?;
         let file = File::open(path)?;
         let mmap = unsafe { Mmap::map(&file)? };
-        
+
+        if mmap.is_empty() {
+            return Ok(Self {
+                mmap, dim: DIM_UNDEFINED, count: 0, entry_size: 0,
+                header_size: 4, _phantom: PhantomData,
+            });
+        }
+
         if mmap.len() < 4 {
             return Err(IoError::InvalidFormat("File too short".into()));
         }
 
         let mut cursor = Cursor::new(&mmap[..]);
         let dim = cursor.read_i32::<LittleEndian>()? as usize;
-        
+
         if dim == 0 {
              return Err(IoError::InvalidFormat("Dimension cannot be 0".into()));
         }
@@ -337,8 +377,16 @@ impl VectorReader<i32> for MmapVectorReader<i32> {
 impl MmapVectorReader<half::f16> {
     /// Opens a local `.mvec` file for reading half-precision (f16) vectors.
     pub fn open_mvec(path: &Path) -> Result<Self, IoError> {
+        validate_extension(path, "mvec")?;
         let file = File::open(path)?;
         let mmap = unsafe { Mmap::map(&file)? };
+
+        if mmap.is_empty() {
+            return Ok(Self {
+                mmap, dim: DIM_UNDEFINED, count: 0, entry_size: 0,
+                header_size: 4, _phantom: PhantomData,
+            });
+        }
 
         if mmap.len() < 4 {
             return Err(IoError::InvalidFormat("File too short".into()));
@@ -351,7 +399,7 @@ impl MmapVectorReader<half::f16> {
             return Err(IoError::InvalidFormat("Dimension cannot be 0".into()));
         }
 
-        let entry_size = 4 + dim * 2; // 4 bytes for dim header + dim * 2 bytes per f16
+        let entry_size = 4 + dim * 2;
 
         let count = mmap.len() / entry_size;
 
@@ -419,6 +467,270 @@ impl VectorReader<half::f16> for MmapVectorReader<half::f16> {
 
         for _ in 0..self.dim {
             vector.push(half::f16::from_bits(cursor.read_u16::<LittleEndian>()?));
+        }
+
+        Ok(vector)
+    }
+}
+
+impl MmapVectorReader<f64> {
+    /// Opens a local `.dvec` file for reading double-precision floating-point vectors.
+    pub fn open_dvec(path: &Path) -> Result<Self, IoError> {
+        validate_extension(path, "dvec")?;
+        let file = File::open(path)?;
+        let mmap = unsafe { Mmap::map(&file)? };
+
+        if mmap.is_empty() {
+            return Ok(Self {
+                mmap, dim: DIM_UNDEFINED, count: 0, entry_size: 0,
+                header_size: 4, _phantom: PhantomData,
+            });
+        }
+
+        if mmap.len() < 4 {
+            return Err(IoError::InvalidFormat("File too short".into()));
+        }
+
+        let mut cursor = Cursor::new(&mmap[..]);
+        let dim = cursor.read_i32::<LittleEndian>()? as usize;
+
+        if dim == 0 {
+             return Err(IoError::InvalidFormat("Dimension cannot be 0".into()));
+        }
+
+        let entry_size = 4 + dim * 8;
+
+        let count = mmap.len() / entry_size;
+
+        Ok(Self {
+            mmap,
+            dim,
+            count,
+            entry_size,
+            header_size: 4,
+            _phantom: PhantomData,
+        })
+    }
+}
+
+impl MmapVectorReader<f64> {
+    /// Returns a zero-copy slice into the mmap'd data for the vector at `index`.
+    ///
+    /// No allocation, no per-element parsing, no dimension validation.
+    /// The caller must ensure `index < self.count()`.
+    #[inline]
+    pub fn get_slice(&self, index: usize) -> &[f64] {
+        let data_start = index * self.entry_size + 4; // skip 4-byte dim header
+        unsafe {
+            std::slice::from_raw_parts(
+                self.mmap.as_ptr().add(data_start) as *const f64,
+                self.dim,
+            )
+        }
+    }
+}
+
+impl VectorReader<f64> for MmapVectorReader<f64> {
+    fn dim(&self) -> usize {
+        self.dim
+    }
+
+    fn count(&self) -> usize {
+        self.count
+    }
+
+    fn get(&self, index: usize) -> Result<Vec<f64>, IoError> {
+        if index >= self.count {
+            return Err(IoError::OutOfBounds(index));
+        }
+
+        let start = index * self.entry_size;
+        let mut cursor = Cursor::new(&self.mmap[start..start + 4]);
+        let dim = cursor.read_i32::<LittleEndian>()? as usize;
+        if dim != self.dim {
+             return Err(IoError::InvalidFormat(format!("Record at index {} has mismatched dimension {}", index, dim)));
+        }
+
+        let vector_start = start + 4;
+        let vector_end = vector_start + self.dim * 8;
+
+        let mut vector = Vec::with_capacity(self.dim);
+        let mut cursor = Cursor::new(&self.mmap[vector_start..vector_end]);
+
+        for _ in 0..self.dim {
+            vector.push(cursor.read_f64::<LittleEndian>()?);
+        }
+
+        Ok(vector)
+    }
+}
+
+impl MmapVectorReader<u8> {
+    /// Opens a local `.bvec` file for reading byte vectors.
+    pub fn open_bvec(path: &Path) -> Result<Self, IoError> {
+        validate_extension(path, "bvec")?;
+        let file = File::open(path)?;
+        let mmap = unsafe { Mmap::map(&file)? };
+
+        if mmap.is_empty() {
+            return Ok(Self {
+                mmap, dim: DIM_UNDEFINED, count: 0, entry_size: 0,
+                header_size: 4, _phantom: PhantomData,
+            });
+        }
+
+        if mmap.len() < 4 {
+            return Err(IoError::InvalidFormat("File too short".into()));
+        }
+
+        let mut cursor = Cursor::new(&mmap[..]);
+        let dim = cursor.read_i32::<LittleEndian>()? as usize;
+
+        if dim == 0 {
+             return Err(IoError::InvalidFormat("Dimension cannot be 0".into()));
+        }
+
+        let entry_size = 4 + dim * 1;
+
+        let count = mmap.len() / entry_size;
+
+        Ok(Self {
+            mmap,
+            dim,
+            count,
+            entry_size,
+            header_size: 4,
+            _phantom: PhantomData,
+        })
+    }
+}
+
+impl MmapVectorReader<u8> {
+    /// Returns a zero-copy slice into the mmap'd data for the vector at `index`.
+    ///
+    /// No allocation, no per-element parsing, no dimension validation.
+    /// The caller must ensure `index < self.count()`.
+    #[inline]
+    pub fn get_slice(&self, index: usize) -> &[u8] {
+        let data_start = index * self.entry_size + 4; // skip 4-byte dim header
+        &self.mmap[data_start..data_start + self.dim]
+    }
+}
+
+impl VectorReader<u8> for MmapVectorReader<u8> {
+    fn dim(&self) -> usize {
+        self.dim
+    }
+
+    fn count(&self) -> usize {
+        self.count
+    }
+
+    fn get(&self, index: usize) -> Result<Vec<u8>, IoError> {
+        if index >= self.count {
+            return Err(IoError::OutOfBounds(index));
+        }
+
+        let start = index * self.entry_size;
+        let mut cursor = Cursor::new(&self.mmap[start..start + 4]);
+        let dim = cursor.read_i32::<LittleEndian>()? as usize;
+        if dim != self.dim {
+             return Err(IoError::InvalidFormat(format!("Record at index {} has mismatched dimension {}", index, dim)));
+        }
+
+        let vector_start = start + 4;
+        let vector_end = vector_start + self.dim;
+
+        Ok(self.mmap[vector_start..vector_end].to_vec())
+    }
+}
+
+impl MmapVectorReader<i16> {
+    /// Opens a local `.svec` file for reading signed 16-bit integer vectors.
+    pub fn open_svec(path: &Path) -> Result<Self, IoError> {
+        validate_extension(path, "svec")?;
+        let file = File::open(path)?;
+        let mmap = unsafe { Mmap::map(&file)? };
+
+        if mmap.is_empty() {
+            return Ok(Self {
+                mmap, dim: DIM_UNDEFINED, count: 0, entry_size: 0,
+                header_size: 4, _phantom: PhantomData,
+            });
+        }
+
+        if mmap.len() < 4 {
+            return Err(IoError::InvalidFormat("File too short".into()));
+        }
+
+        let mut cursor = Cursor::new(&mmap[..]);
+        let dim = cursor.read_i32::<LittleEndian>()? as usize;
+
+        if dim == 0 {
+             return Err(IoError::InvalidFormat("Dimension cannot be 0".into()));
+        }
+
+        let entry_size = 4 + dim * 2;
+
+        let count = mmap.len() / entry_size;
+
+        Ok(Self {
+            mmap,
+            dim,
+            count,
+            entry_size,
+            header_size: 4,
+            _phantom: PhantomData,
+        })
+    }
+}
+
+impl MmapVectorReader<i16> {
+    /// Returns a zero-copy slice into the mmap'd data for the vector at `index`.
+    ///
+    /// No allocation, no per-element parsing, no dimension validation.
+    /// The caller must ensure `index < self.count()`.
+    #[inline]
+    pub fn get_slice(&self, index: usize) -> &[i16] {
+        let data_start = index * self.entry_size + 4; // skip 4-byte dim header
+        unsafe {
+            std::slice::from_raw_parts(
+                self.mmap.as_ptr().add(data_start) as *const i16,
+                self.dim,
+            )
+        }
+    }
+}
+
+impl VectorReader<i16> for MmapVectorReader<i16> {
+    fn dim(&self) -> usize {
+        self.dim
+    }
+
+    fn count(&self) -> usize {
+        self.count
+    }
+
+    fn get(&self, index: usize) -> Result<Vec<i16>, IoError> {
+        if index >= self.count {
+            return Err(IoError::OutOfBounds(index));
+        }
+
+        let start = index * self.entry_size;
+        let mut cursor = Cursor::new(&self.mmap[start..start + 4]);
+        let dim = cursor.read_i32::<LittleEndian>()? as usize;
+        if dim != self.dim {
+             return Err(IoError::InvalidFormat(format!("Record at index {} has mismatched dimension {}", index, dim)));
+        }
+
+        let vector_start = start + 4;
+        let vector_end = vector_start + self.dim * 2;
+
+        let mut vector = Vec::with_capacity(self.dim);
+        let mut cursor = Cursor::new(&self.mmap[vector_start..vector_end]);
+
+        for _ in 0..self.dim {
+            vector.push(cursor.read_i16::<LittleEndian>()?);
         }
 
         Ok(vector)

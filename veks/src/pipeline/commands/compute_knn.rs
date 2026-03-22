@@ -24,7 +24,7 @@
 
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
-use std::io::{BufReader, Read as _, Write};
+use std::io::{BufReader, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -34,8 +34,8 @@ use vectordata::VectorReader;
 use vectordata::io::MmapVectorReader;
 
 use crate::pipeline::command::{
-    ArtifactManifest, CommandDoc, CommandOp, CommandResult, OptionDesc, Options, ResourceDesc,
-    Status, StreamContext, render_options_table,
+    ArtifactManifest, CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options,
+    ResourceDesc, Status, StreamContext, render_options_table,
 };
 use crate::pipeline::simd_distance::{self, Metric};
 use super::source_window::resolve_source;
@@ -372,18 +372,7 @@ fn compute_partition(
 // -- Element type detection ---------------------------------------------------
 
 /// Detected element type based on file extension.
-enum ElementType {
-    F32,
-    F16,
-}
-
-/// Detect the vector element type from the file extension.
-fn detect_element_type(path: &Path) -> ElementType {
-    match path.extension().and_then(|e| e.to_str()) {
-        Some("mvec") => ElementType::F16,
-        _ => ElementType::F32,
-    }
-}
+use crate::pipeline::element_type::ElementType;
 
 // -- f16 KNN functions --------------------------------------------------------
 
@@ -645,6 +634,125 @@ fn compute_partition_f16(
     results
 }
 
+/// Compute KNN for a single partition `[start, end)` across all f64 queries.
+///
+/// Uses pairwise distance computation (no transposed batch kernel for f64 yet).
+#[allow(clippy::too_many_arguments)]
+fn compute_partition_f64(
+    query_reader: &MmapVectorReader<f64>,
+    query_count: usize,
+    base_reader: &Arc<MmapVectorReader<f64>>,
+    start: usize,
+    end: usize,
+    k: usize,
+    dist_fn: fn(&[f64], &[f64]) -> f32,
+    _metric: Metric,
+    _dim: usize,
+    threads: usize,
+    pb: &ProgressHandle,
+) -> Vec<Vec<Neighbor>> {
+    let mut results: Vec<Vec<Neighbor>> = (0..query_count).map(|_| Vec::new()).collect();
+
+    if threads > 1 && query_count > 1 {
+        let effective_threads = std::cmp::min(threads, query_count);
+        let chunk_size = (query_count + effective_threads - 1) / effective_threads;
+
+        let result_chunks: Vec<&mut [Vec<Neighbor>]> =
+            results.chunks_mut(chunk_size).collect();
+
+        std::thread::scope(|scope| {
+            for (ci, chunk) in result_chunks.into_iter().enumerate() {
+                let chunk_start = ci * chunk_size;
+                let chunk_len = chunk.len();
+                let base_ref = Arc::clone(base_reader);
+
+                scope.spawn(move || {
+                    let mut offset = 0;
+                    while offset < chunk_len {
+                        let batch_end = std::cmp::min(offset + QUERY_BATCH_SIZE, chunk_len);
+                        let batch_size = batch_end - offset;
+
+                        let queries: Vec<&[f64]> = (0..batch_size)
+                            .map(|i| query_reader.get_slice(chunk_start + offset + i))
+                            .collect();
+
+                        find_top_k_batch_pairwise_f64(
+                            &queries, &base_ref, start, end, k, dist_fn,
+                            &mut chunk[offset..batch_end],
+                        );
+
+                        pb.inc(batch_size as u64);
+                        offset = batch_end;
+                    }
+                });
+            }
+        });
+    } else {
+        let mut offset = 0;
+        while offset < query_count {
+            let batch_end = std::cmp::min(offset + QUERY_BATCH_SIZE, query_count);
+            let batch_size = batch_end - offset;
+
+            let queries: Vec<&[f64]> = (0..batch_size)
+                .map(|i| query_reader.get_slice(offset + i))
+                .collect();
+
+            find_top_k_batch_pairwise_f64(
+                &queries, base_reader, start, end, k, dist_fn,
+                &mut results[offset..batch_end],
+            );
+
+            pb.inc(batch_size as u64);
+            offset = batch_end;
+        }
+    }
+
+    results
+}
+
+/// Per-pair distance computation for f64 vectors.
+#[inline(never)]
+fn find_top_k_batch_pairwise_f64(
+    queries: &[&[f64]],
+    base_reader: &MmapVectorReader<f64>,
+    start: usize,
+    end: usize,
+    k: usize,
+    dist_fn: fn(&[f64], &[f64]) -> f32,
+    results: &mut [Vec<Neighbor>],
+) {
+    let batch_size = queries.len();
+    let mut heaps: Vec<BinaryHeap<Neighbor>> = (0..batch_size)
+        .map(|_| BinaryHeap::with_capacity(k + 1))
+        .collect();
+    let mut thresholds = vec![f32::INFINITY; batch_size];
+
+    for i in start..end {
+        let base_vec = base_reader.get_slice(i);
+        let idx = i as u32;
+
+        for qi in 0..batch_size {
+            let dist = dist_fn(queries[qi], base_vec);
+
+            if dist < thresholds[qi] {
+                heaps[qi].push(Neighbor { index: idx, distance: dist });
+                if heaps[qi].len() > k {
+                    heaps[qi].pop();
+                }
+                if heaps[qi].len() == k {
+                    thresholds[qi] = heaps[qi].peek().unwrap().distance;
+                }
+            }
+        }
+    }
+
+    for (qi, heap) in heaps.into_iter().enumerate() {
+        let mut sorted: Vec<Neighbor> = heap.into_sorted_vec();
+        sorted.reverse();
+        results[qi] = sorted;
+    }
+}
+
 /// Write partition results to cache files (both ivec and fvec).
 fn write_partition_cache(
     meta: &PartitionMeta,
@@ -668,33 +776,39 @@ fn merge_partitions(
     k: usize,
     query_count: usize,
     base_offset: usize,
+    compress_cache: bool,
     ui: &crate::ui::UiHandle,
 ) -> Result<(), String> {
     // Open all partition files
-    let mut ivec_readers: Vec<BufReader<std::fs::File>> = Vec::with_capacity(partitions.len());
-    let mut fvec_readers: Vec<BufReader<std::fs::File>> = Vec::with_capacity(partitions.len());
+    let mut ivec_readers: Vec<Box<dyn Read>> = Vec::with_capacity(partitions.len());
+    let mut fvec_readers: Vec<Box<dyn Read>> = Vec::with_capacity(partitions.len());
 
     for part in partitions {
-        let ivec_file = std::fs::File::open(&part.neighbors_path)
-            .map_err(|e| format!("open {}: {}", part.neighbors_path.display(), e))?;
-        ivec_readers.push(BufReader::with_capacity(1 << 16, ivec_file));
+        if compress_cache || crate::pipeline::gz_cache::gz_exists(&part.neighbors_path) {
+            let ivec_data = crate::pipeline::gz_cache::load_gz(&part.neighbors_path)?;
+            ivec_readers.push(Box::new(Cursor::new(ivec_data)));
 
-        let fvec_file = std::fs::File::open(&part.distances_path)
-            .map_err(|e| format!("open {}: {}", part.distances_path.display(), e))?;
-        fvec_readers.push(BufReader::with_capacity(1 << 16, fvec_file));
+            let fvec_data = crate::pipeline::gz_cache::load_gz(&part.distances_path)?;
+            fvec_readers.push(Box::new(Cursor::new(fvec_data)));
+        } else {
+            let ivec_file = std::fs::File::open(&part.neighbors_path)
+                .map_err(|e| format!("open {}: {}", part.neighbors_path.display(), e))?;
+            ivec_readers.push(Box::new(BufReader::with_capacity(1 << 16, ivec_file)));
+
+            let fvec_file = std::fs::File::open(&part.distances_path)
+                .map_err(|e| format!("open {}: {}", part.distances_path.display(), e))?;
+            fvec_readers.push(Box::new(BufReader::with_capacity(1 << 16, fvec_file)));
+        }
     }
 
-    // Open output files
-    let idx_file = std::fs::File::create(indices_path)
+    // Open output files via AtomicWriter (temp-then-rename)
+    use crate::pipeline::atomic_write::AtomicWriter;
+    let mut idx_writer = AtomicWriter::with_capacity(1 << 20, indices_path)
         .map_err(|e| format!("create {}: {}", indices_path.display(), e))?;
-    let mut idx_writer = std::io::BufWriter::with_capacity(1 << 20, idx_file);
 
-    let mut dist_writer = match distances_path {
-        Some(p) => {
-            let f = std::fs::File::create(p)
-                .map_err(|e| format!("create {}: {}", p.display(), e))?;
-            Some(std::io::BufWriter::with_capacity(1 << 20, f))
-        }
+    let mut dist_writer: Option<AtomicWriter> = match distances_path {
+        Some(p) => Some(AtomicWriter::with_capacity(1 << 20, p)
+            .map_err(|e| format!("create {}: {}", p.display(), e))?),
         None => None,
     };
 
@@ -780,9 +894,9 @@ fn merge_partitions(
     }
     pb.finish();
 
-    idx_writer.flush().map_err(|e| e.to_string())?;
-    if let Some(ref mut dw) = dist_writer {
-        dw.flush().map_err(|e| e.to_string())?;
+    idx_writer.finish().map_err(|e| e.to_string())?;
+    if let Some(dw) = dist_writer {
+        dw.finish().map_err(|e| e.to_string())?;
     }
 
     Ok(())
@@ -935,6 +1049,8 @@ compare an ANN index's approximate results against this exact ground truth.
             .or_else(|| ctx.governor.current("segmentsize").map(|v| v as usize))
             .unwrap_or(1_000_000);
 
+        let compress_cache = options.get("compress-cache").map(|s| s == "true").unwrap_or(false);
+
         let base_source = match resolve_source(base_str, &ctx.workspace) {
             Ok(s) => s,
             Err(e) => return error_result(e, start),
@@ -965,7 +1081,11 @@ compare an ANN index's approximate results against this exact ground truth.
         let base_window = base_source.window;
 
         // Detect element type from base file extension and dispatch
-        match detect_element_type(&base_path) {
+        let etype = match ElementType::from_path(&base_path) {
+            Ok(t) => t,
+            Err(e) => return error_result(e, start),
+        };
+        match etype {
             ElementType::F16 => {
                 let dist_fn = simd_distance::select_distance_fn_f16(metric);
                 execute_f16(
@@ -979,11 +1099,30 @@ compare an ANN index's approximate results against this exact ground truth.
                     threads,
                     partition_size,
                     base_window,
+                    compress_cache,
                     ctx,
                     start,
                 )
             }
-            ElementType::F32 => {
+            ElementType::F64 => {
+                let dist_fn = simd_distance::select_distance_fn_f64(metric);
+                execute_f64(
+                    &base_path,
+                    &query_path,
+                    &indices_path,
+                    distances_path.as_deref(),
+                    k,
+                    metric,
+                    dist_fn,
+                    threads,
+                    partition_size,
+                    base_window,
+                    compress_cache,
+                    ctx,
+                    start,
+                )
+            }
+            ElementType::F32 | _ => {
                 let dist_fn = simd_distance::select_distance_fn(metric);
                 execute_f32(
                     &base_path,
@@ -996,6 +1135,7 @@ compare an ANN index's approximate results against this exact ground truth.
                     threads,
                     partition_size,
                     base_window,
+                    compress_cache,
                     ctx,
                     start,
                 )
@@ -1010,57 +1150,73 @@ compare an ANN index's approximate results against this exact ground truth.
                 type_name: "Path".to_string(),
                 required: true,
                 default: None,
-                description: "Base vectors file (fvec or mvec)".to_string(),
-            },
+                description: "Base vectors file (fvec, mvec, or dvec)".to_string(),
+                role: OptionRole::Input,
+        },
             OptionDesc {
                 name: "query".to_string(),
                 type_name: "Path".to_string(),
                 required: true,
                 default: None,
-                description: "Query vectors file (fvec or mvec)".to_string(),
-            },
+                description: "Query vectors file (fvec, mvec, or dvec)".to_string(),
+                role: OptionRole::Input,
+        },
             OptionDesc {
                 name: "indices".to_string(),
                 type_name: "Path".to_string(),
                 required: true,
                 default: None,
                 description: "Output neighbor indices (ivec)".to_string(),
-            },
+                role: OptionRole::Output,
+        },
             OptionDesc {
                 name: "distances".to_string(),
                 type_name: "Path".to_string(),
                 required: false,
                 default: None,
                 description: "Output neighbor distances (fvec)".to_string(),
-            },
+                role: OptionRole::Output,
+        },
             OptionDesc {
                 name: "neighbors".to_string(),
                 type_name: "int".to_string(),
                 required: true,
                 default: None,
                 description: "Number of nearest neighbors (k)".to_string(),
-            },
+                role: OptionRole::Config,
+        },
             OptionDesc {
                 name: "metric".to_string(),
                 type_name: "enum".to_string(),
                 required: false,
                 default: Some("L2".to_string()),
                 description: "Distance metric: L2, COSINE, DOT_PRODUCT, L1".to_string(),
-            },
+                role: OptionRole::Config,
+        },
             OptionDesc {
                 name: "threads".to_string(),
                 type_name: "int".to_string(),
                 required: false,
                 default: Some("0".to_string()),
                 description: "Thread count (0 = auto)".to_string(),
-            },
+                role: OptionRole::Config,
+        },
             OptionDesc {
                 name: "partition_size".to_string(),
                 type_name: "int".to_string(),
                 required: false,
                 default: Some("1000000".to_string()),
                 description: "Base vectors per partition for cache-backed computation".to_string(),
-            },
+                role: OptionRole::Config,
+        },
+            OptionDesc {
+                name: "compress-cache".to_string(),
+                type_name: "bool".to_string(),
+                required: false,
+                default: Some("false".to_string()),
+                description: "Gzip-compress partition cache files".to_string(),
+                role: OptionRole::Config,
+        },
         ]
     }
 
@@ -1086,6 +1242,7 @@ fn execute_f32(
     threads: usize,
     partition_size: usize,
     base_window: Option<(usize, usize)>,
+    compress_cache: bool,
     ctx: &mut StreamContext,
     start: Instant,
 ) -> CommandResult {
@@ -1177,6 +1334,7 @@ fn execute_f32(
         partition_size,
         base_path,
         query_path,
+        compress_cache,
         ctx,
         start,
         compute_partition,
@@ -1196,6 +1354,7 @@ fn execute_f16(
     threads: usize,
     partition_size: usize,
     base_window: Option<(usize, usize)>,
+    compress_cache: bool,
     ctx: &mut StreamContext,
     start: Instant,
 ) -> CommandResult {
@@ -1287,9 +1446,103 @@ fn execute_f16(
         partition_size,
         base_path,
         query_path,
+        compress_cache,
         ctx,
         start,
         compute_partition_f16,
+    )
+}
+
+/// Execute KNN computation using f64 vectors.
+#[allow(clippy::too_many_arguments)]
+fn execute_f64(
+    base_path: &Path,
+    query_path: &Path,
+    indices_path: &Path,
+    distances_path: Option<&Path>,
+    k: usize,
+    metric: Metric,
+    dist_fn: fn(&[f64], &[f64]) -> f32,
+    threads: usize,
+    partition_size: usize,
+    base_window: Option<(usize, usize)>,
+    compress_cache: bool,
+    ctx: &mut StreamContext,
+    start: Instant,
+) -> CommandResult {
+    ctx.ui.log(&format!("  opening base vectors: {}", base_path.display()));
+    let base_reader = match MmapVectorReader::<f64>::open_dvec(base_path) {
+        Ok(r) => Arc::new(r),
+        Err(e) => return error_result(format!("failed to open base {}: {}", base_path.display(), e), start),
+    };
+    ctx.ui.log(&format!("  opening query vectors: {}", query_path.display()));
+    let query_reader = match MmapVectorReader::<f64>::open_dvec(query_path) {
+        Ok(r) => r,
+        Err(e) => return error_result(format!("failed to open query {}: {}", query_path.display(), e), start),
+    };
+
+    let file_count = VectorReader::<f64>::count(&*base_reader);
+    let query_count = VectorReader::<f64>::count(&query_reader);
+    let base_dim = VectorReader::<f64>::dim(&*base_reader);
+    let query_dim = VectorReader::<f64>::dim(&query_reader);
+
+    let (base_offset, base_count) = match base_window {
+        Some((ws, we)) => {
+            let ws = ws.min(file_count);
+            let we = we.min(file_count);
+            (ws, we.saturating_sub(ws))
+        }
+        None => (0, file_count),
+    };
+
+    if base_dim != query_dim {
+        return error_result(format!("dimension mismatch: base={}, query={}", base_dim, query_dim), start);
+    }
+
+    let base_bytes = base_count as u64 * base_dim as u64 * 8;
+    let query_bytes = query_count as u64 * query_dim as u64 * 8;
+    if base_offset > 0 {
+        ctx.ui.log(&format!(
+            "KNN: {} queries x {} base vectors (f64, dim={}, window=[{}..{})), k={}, metric={:?}, threads={}, simd={}",
+            format_count(query_count), format_count(base_count), base_dim,
+            format_count(base_offset), format_count(base_offset + base_count),
+            k, metric, threads, simd_distance::simd_level()
+        ));
+    } else {
+        ctx.ui.log(&format!(
+            "KNN: {} queries x {} base vectors (f64, dim={}), k={}, metric={:?}, threads={}, simd={}",
+            format_count(query_count), format_count(base_count), base_dim,
+            k, metric, threads, simd_distance::simd_level()
+        ));
+    }
+    ctx.ui.log(&format!(
+        "  base: {} ({})  query: {} ({})",
+        base_path.file_name().unwrap_or_default().to_string_lossy(),
+        format_bytes(base_bytes),
+        query_path.file_name().unwrap_or_default().to_string_lossy(),
+        format_bytes(query_bytes),
+    ));
+
+    execute_with_partitions(
+        &query_reader,
+        &base_reader,
+        base_offset,
+        base_count,
+        query_count,
+        base_dim,
+        indices_path,
+        distances_path,
+        k,
+        metric,
+        dist_fn,
+        threads,
+        partition_size,
+        base_path,
+        query_path,
+        compress_cache,
+        ctx,
+        start,
+        compute_partition_f64,
     )
 }
 
@@ -1315,6 +1568,7 @@ fn execute_with_partitions<T>(
     partition_size: usize,
     base_path: &Path,
     query_path: &Path,
+    compress_cache: bool,
     ctx: &mut StreamContext,
     start: Instant,
     compute_fn: fn(&MmapVectorReader<T>, usize, &Arc<MmapVectorReader<T>>, usize, usize, usize, fn(&[T], &[T]) -> f32, Metric, usize, usize, &ProgressHandle) -> Vec<Vec<Neighbor>>,
@@ -1430,7 +1684,7 @@ where
         estimated_partitions, format_count(partition_size)
     ));
 
-    let plan_pb = ctx.ui.bar_with_unit(estimated_partitions as u64, "validating cache", "queries");
+    let plan_pb = ctx.ui.bar_with_unit(estimated_partitions as u64, "validating cache", "partitions");
 
     let cache_prefix = cache_prefix_for(base_path, query_path);
     let base_end = base_offset + base_count;
@@ -1444,8 +1698,13 @@ where
         let dist_cache_path = build_cache_path(
             &ctx.cache, &cache_prefix, part_start, part_end, k, metric, "distances", "fvec",
         );
-        let cached = validate_cache_file(&neighbors_path, query_count, k, 4)
-            && validate_cache_file(&dist_cache_path, query_count, k, 4);
+        let cached = if compress_cache {
+            crate::pipeline::gz_cache::gz_exists(&neighbors_path)
+                && crate::pipeline::gz_cache::gz_exists(&dist_cache_path)
+        } else {
+            validate_cache_file(&neighbors_path, query_count, k, 4)
+                && validate_cache_file(&dist_cache_path, query_count, k, 4)
+        };
         partitions.push(PartitionMeta {
             start: part_start,
             end: part_end,
@@ -1515,7 +1774,7 @@ where
     let prefetch_bytes_paged = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     // Prefetch progress bar — updated by a background tick thread
-    let prefetch_pb = ctx.ui.bar_with_unit(total_prefetch_bytes, "paging in", "queries");
+    let prefetch_pb = ctx.ui.bar_with_unit(total_prefetch_bytes, "paging in", "bytes");
     let prefetch_bytes_for_tick = Arc::clone(&prefetch_bytes_paged);
     let prefetch_tick_handle = std::thread::spawn(move || {
         loop {
@@ -1544,7 +1803,7 @@ where
     // Overall partition progress bar — tracks how many partitions have been
     // computed out of the total uncached count.
     let overall_pb = if to_compute > 1 {
-        Some(ctx.ui.bar_with_unit(to_compute as u64, "partitions", "queries"))
+        Some(ctx.ui.bar_with_unit(to_compute as u64, "partitions", "partitions"))
     } else {
         None
     };
@@ -1656,32 +1915,58 @@ where
         let part_query_count = query_count;
         prev_write_start = Some(Instant::now());
         prev_writer = Some(std::thread::spawn(move || {
-            write_indices(&neighbors_path, &results, k, 0)?;
-            write_distances(&distances_path, &results, k)?;
+            if compress_cache {
+                // Serialize to in-memory buffers, then gzip-compress and write
+                let ivec_data = serialize_indices(&results, k, 0)?;
+                crate::pipeline::gz_cache::save_gz(&neighbors_path, &ivec_data)?;
 
-            if !validate_cache_file(&neighbors_path, part_query_count, k, 4)
-                || !validate_cache_file(&distances_path, part_query_count, k, 4)
-            {
-                return Err(format!(
-                    "partition [{}, {}) cache files failed size validation after write",
-                    part_start_idx, part_end_idx,
-                ));
+                let fvec_data = serialize_distances(&results, k)?;
+                crate::pipeline::gz_cache::save_gz(&distances_path, &fvec_data)?;
+
+                let gz_ivec = crate::pipeline::gz_cache::gz_path(&neighbors_path);
+                let gz_fvec = crate::pipeline::gz_cache::gz_path(&distances_path);
+                let ivec_size = std::fs::metadata(&gz_ivec)
+                    .map(|m| m.len()).unwrap_or(0);
+                let fvec_size = std::fs::metadata(&gz_fvec)
+                    .map(|m| m.len()).unwrap_or(0);
+                log::info!(
+                    "→ {}  ({})",
+                    gz_ivec.file_name().unwrap_or_default().to_string_lossy(),
+                    format_bytes(ivec_size),
+                );
+                log::info!(
+                    "→ {}  ({})",
+                    gz_fvec.file_name().unwrap_or_default().to_string_lossy(),
+                    format_bytes(fvec_size),
+                );
+            } else {
+                write_indices(&neighbors_path, &results, k, 0)?;
+                write_distances(&distances_path, &results, k)?;
+
+                if !validate_cache_file(&neighbors_path, part_query_count, k, 4)
+                    || !validate_cache_file(&distances_path, part_query_count, k, 4)
+                {
+                    return Err(format!(
+                        "partition [{}, {}) cache files failed size validation after write",
+                        part_start_idx, part_end_idx,
+                    ));
+                }
+
+                let ivec_size = std::fs::metadata(&neighbors_path)
+                    .map(|m| m.len()).unwrap_or(0);
+                let fvec_size = std::fs::metadata(&distances_path)
+                    .map(|m| m.len()).unwrap_or(0);
+                log::info!(
+                    "→ {}  ({})",
+                    neighbors_path.file_name().unwrap_or_default().to_string_lossy(),
+                    format_bytes(ivec_size),
+                );
+                log::info!(
+                    "→ {}  ({})",
+                    distances_path.file_name().unwrap_or_default().to_string_lossy(),
+                    format_bytes(fvec_size),
+                );
             }
-
-            let ivec_size = std::fs::metadata(&neighbors_path)
-                .map(|m| m.len()).unwrap_or(0);
-            let fvec_size = std::fs::metadata(&distances_path)
-                .map(|m| m.len()).unwrap_or(0);
-            log::info!(
-                "→ {}  ({})",
-                neighbors_path.file_name().unwrap_or_default().to_string_lossy(),
-                format_bytes(ivec_size),
-            );
-            log::info!(
-                "→ {}  ({})",
-                distances_path.file_name().unwrap_or_default().to_string_lossy(),
-                format_bytes(fvec_size),
-            );
             Ok(())
         }));
 
@@ -1751,6 +2036,7 @@ where
         k,
         query_count,
         base_offset,
+        compress_cache,
         &ctx.ui,
     ) {
         return error_result(format!("merge failed: {}", e), start);
@@ -1777,9 +2063,9 @@ where
 /// `base_offset` is subtracted from each neighbor index so output indices are
 /// 0-based relative to the window start.
 fn write_indices(path: &Path, results: &[Vec<Neighbor>], k: usize, base_offset: usize) -> Result<(), String> {
-    let file = std::fs::File::create(path)
+    use crate::pipeline::atomic_write::AtomicWriter;
+    let mut writer = AtomicWriter::with_capacity(1 << 20, path)
         .map_err(|e| format!("failed to create {}: {}", path.display(), e))?;
-    let mut writer = std::io::BufWriter::with_capacity(1 << 20, file);
 
     let dim = k as i32;
     let offset32 = base_offset as u32;
@@ -1798,15 +2084,15 @@ fn write_indices(path: &Path, results: &[Vec<Neighbor>], k: usize, base_offset: 
                 .map_err(|e| e.to_string())?;
         }
     }
-    writer.flush().map_err(|e| e.to_string())?;
+    writer.finish().map_err(|e| e.to_string())?;
     Ok(())
 }
 
 /// Write neighbor distances as fvec (each row: k f32 distances).
 fn write_distances(path: &Path, results: &[Vec<Neighbor>], k: usize) -> Result<(), String> {
-    let file = std::fs::File::create(path)
+    use crate::pipeline::atomic_write::AtomicWriter;
+    let mut writer = AtomicWriter::with_capacity(1 << 20, path)
         .map_err(|e| format!("failed to create {}: {}", path.display(), e))?;
-    let mut writer = std::io::BufWriter::with_capacity(1 << 20, file);
 
     let dim = k as i32;
     for row in results {
@@ -1824,13 +2110,56 @@ fn write_distances(path: &Path, results: &[Vec<Neighbor>], k: usize) -> Result<(
                 .map_err(|e| e.to_string())?;
         }
     }
-    writer.flush().map_err(|e| e.to_string())?;
+    writer.finish().map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// Serialize neighbor indices to an in-memory buffer (ivec format).
+///
+/// Same layout as [`write_indices`] but returns bytes instead of writing to a file.
+fn serialize_indices(results: &[Vec<Neighbor>], k: usize, base_offset: usize) -> Result<Vec<u8>, String> {
+    let row_bytes = 4 + k * 4;
+    let mut buf = Vec::with_capacity(results.len() * row_bytes);
+    let dim = k as i32;
+    let offset32 = base_offset as u32;
+    for row in results {
+        buf.extend_from_slice(&dim.to_le_bytes());
+        for i in 0..k {
+            let idx: i32 = if i < row.len() {
+                (row[i].index - offset32) as i32
+            } else {
+                -1
+            };
+            buf.extend_from_slice(&idx.to_le_bytes());
+        }
+    }
+    Ok(buf)
+}
+
+/// Serialize neighbor distances to an in-memory buffer (fvec format).
+///
+/// Same layout as [`write_distances`] but returns bytes instead of writing to a file.
+fn serialize_distances(results: &[Vec<Neighbor>], k: usize) -> Result<Vec<u8>, String> {
+    let row_bytes = 4 + k * 4;
+    let mut buf = Vec::with_capacity(results.len() * row_bytes);
+    let dim = k as i32;
+    for row in results {
+        buf.extend_from_slice(&dim.to_le_bytes());
+        for i in 0..k {
+            let dist: f32 = if i < row.len() {
+                row[i].distance
+            } else {
+                f32::INFINITY
+            };
+            buf.extend_from_slice(&dist.to_le_bytes());
+        }
+    }
+    Ok(buf)
 }
 
 /// Create a progress bar for query processing within a partition.
 fn make_query_progress_bar(total: u64, ui: &crate::ui::UiHandle) -> ProgressHandle {
-    ui.bar(total, "queries")
+    ui.bar_with_unit(total, "queries", "queries")
 }
 
 /// Format a count with thousands separators.

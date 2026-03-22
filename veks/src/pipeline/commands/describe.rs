@@ -12,7 +12,7 @@ use std::time::Instant;
 use crate::formats::VecFormat;
 use crate::formats::reader;
 use crate::pipeline::command::{
-    CommandDoc, CommandOp, CommandResult, OptionDesc, Options, ResourceDesc, Status, StreamContext,
+    CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options, ResourceDesc, Status, StreamContext,
     render_options_table,
 };
 
@@ -130,15 +130,30 @@ element type does this dataset use?"
             Err(e) => return error_result(format!("failed to probe source: {}", e), start),
         };
 
-        let message = format!(
-            "{}: format={}, dim={}, elem_size={}, records={}",
+        let file_size = std::fs::metadata(&source_path).map(|m| m.len()).ok();
+        let records_str = meta.record_count
+            .map_or("unknown".to_string(), |n| format_count(n));
+        let record_bytes = 4 + meta.dimension as usize * meta.element_size;
+
+        let mut message = format!(
+            "File:        {}\n\
+             Format:      {}\n\
+             Dimensions:  {}\n\
+             Element:     {} bytes ({})\n\
+             Records:     {}",
             source_path.display(),
             format.name(),
             meta.dimension,
             meta.element_size,
-            meta.record_count
-                .map_or("unknown".to_string(), |n| n.to_string()),
+            element_type_label(meta.element_size),
+            records_str,
         );
+        if record_bytes > 0 {
+            message.push_str(&format!("\nRecord size: {} bytes", record_bytes));
+        }
+        if let Some(size) = file_size {
+            message.push_str(&format!("\nFile size:   {}", format_bytes(size)));
+        }
 
         CommandResult {
             status: Status::Ok,
@@ -156,14 +171,16 @@ element type does this dataset use?"
                 required: true,
                 default: None,
                 description: "File or directory to describe".to_string(),
-            },
+                        role: OptionRole::Input,
+        },
             OptionDesc {
                 name: "format".to_string(),
                 type_name: "String".to_string(),
                 required: false,
                 default: None,
                 description: "Format override (auto-detected if omitted)".to_string(),
-            },
+                        role: OptionRole::Config,
+        },
         ]
     }
 }
@@ -183,5 +200,39 @@ fn error_result(message: String, start: Instant) -> CommandResult {
         message,
         produced: vec![],
         elapsed: start.elapsed(),
+    }
+}
+
+fn element_type_label(elem_size: usize) -> &'static str {
+    match elem_size {
+        1 => "u8/i8",
+        2 => "f16/i16",
+        4 => "f32/i32",
+        8 => "f64/i64",
+        _ => "unknown",
+    }
+}
+
+fn format_count(n: u64) -> String {
+    if n >= 1_000_000_000 {
+        format!("{} ({:.2}B)", n, n as f64 / 1e9)
+    } else if n >= 1_000_000 {
+        format!("{} ({:.2}M)", n, n as f64 / 1e6)
+    } else if n >= 10_000 {
+        format!("{} ({:.1}K)", n, n as f64 / 1e3)
+    } else {
+        format!("{}", n)
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{} B", bytes)
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else if bytes < 1024 * 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else {
+        format!("{:.2} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
     }
 }

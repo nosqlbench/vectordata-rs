@@ -16,9 +16,10 @@ use vectordata::io::MmapVectorReader;
 use vectordata::io::VectorReader;
 
 use crate::pipeline::command::{
-    CommandDoc, CommandOp, CommandResult, OptionDesc, Options, ResourceDesc, Status, StreamContext,
+    CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options, ResourceDesc, Status, StreamContext,
     render_options_table,
 };
+use crate::pipeline::element_type::ElementType;
 
 /// Pipeline command: slice vector data.
 pub struct AnalyzeSliceOp;
@@ -142,20 +143,124 @@ impl CommandOp for AnalyzeSliceOp {
 
         let source_path = resolve_path(source_str, &ctx.workspace);
 
-        let ext = source_path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("")
-            .to_lowercase();
+        let etype = match ElementType::from_path(&source_path) {
+            Ok(t) => t,
+            Err(e) => return error_result(e, start),
+        };
 
-        // Dispatch based on format
-        match ext.as_str() {
-            "fvec" => self.slice_fvec(&source_path, options, &format, max_vectors, start),
-            "ivec" => self.slice_ivec(&source_path, options, &format, max_vectors, start),
-            _ => error_result(
-                format!("unsupported format for slicing: '.{}' (supported: fvec, ivec)", ext),
-                start,
+        // Open reader and extract (count, dim, get_f64_fn) based on element type.
+        let (count, dim, get_f64): (usize, usize, Box<dyn Fn(usize) -> Vec<f64> + Sync>) = match etype {
+            ElementType::F32 => {
+                let r = match MmapVectorReader::<f32>::open_fvec(&source_path) {
+                    Ok(r) => r, Err(e) => return error_result(format!("open: {}", e), start),
+                };
+                let fc = VectorReader::<f32>::count(&r);
+                let d = VectorReader::<f32>::dim(&r);
+                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
+            }
+            ElementType::F16 => {
+                let r = match MmapVectorReader::<half::f16>::open_mvec(&source_path) {
+                    Ok(r) => r, Err(e) => return error_result(format!("open: {}", e), start),
+                };
+                let fc = VectorReader::<half::f16>::count(&r);
+                let d = VectorReader::<half::f16>::dim(&r);
+                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|v| v.to_f64()).collect()))
+            }
+            ElementType::F64 => {
+                let r = match MmapVectorReader::<f64>::open_dvec(&source_path) {
+                    Ok(r) => r, Err(e) => return error_result(format!("open: {}", e), start),
+                };
+                let fc = VectorReader::<f64>::count(&r);
+                let d = VectorReader::<f64>::dim(&r);
+                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default()))
+            }
+            ElementType::I32 => {
+                let r = match MmapVectorReader::<i32>::open_ivec(&source_path) {
+                    Ok(r) => r, Err(e) => return error_result(format!("open: {}", e), start),
+                };
+                let fc = VectorReader::<i32>::count(&r);
+                let d = VectorReader::<i32>::dim(&r);
+                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
+            }
+            ElementType::I16 => {
+                let r = match MmapVectorReader::<i16>::open_svec(&source_path) {
+                    Ok(r) => r, Err(e) => return error_result(format!("open: {}", e), start),
+                };
+                let fc = VectorReader::<i16>::count(&r);
+                let d = VectorReader::<i16>::dim(&r);
+                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
+            }
+            ElementType::U8 | ElementType::I8 => {
+                let r = match MmapVectorReader::<u8>::open_bvec(&source_path) {
+                    Ok(r) => r, Err(e) => return error_result(format!("open: {}", e), start),
+                };
+                let fc = VectorReader::<u8>::count(&r);
+                let d = VectorReader::<u8>::dim(&r);
+                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
+            }
+        };
+
+        let (ord_start, ord_end) = match options.get("ordinal-range") {
+            Some(r) => match parse_range(r, count) {
+                Ok(range) => range,
+                Err(e) => return error_result(e, start),
+            },
+            None => (0, count),
+        };
+
+        let (comp_start, comp_end) = match options.get("component-range") {
+            Some(r) => match parse_range(r, dim) {
+                Ok(range) => range,
+                Err(e) => return error_result(e, start),
+            },
+            None => (0, dim),
+        };
+
+        let total = ord_end.saturating_sub(ord_start);
+        let mut output_lines = Vec::new();
+
+        if format == "json" {
+            output_lines.push("[".to_string());
+        }
+
+        let display_count = if format == "text" { max_vectors.min(total) } else { total };
+
+        for (i, ord) in (ord_start..ord_end).enumerate() {
+            if i >= display_count {
+                break;
+            }
+
+            let vec = get_f64(ord);
+            let end = comp_end.min(vec.len());
+            let slice = &vec[comp_start..end];
+            let line = format_slice_f64(ord, slice, &format, i + 1 < display_count);
+            output_lines.push(line);
+        }
+
+        if format == "text" && total > display_count {
+            output_lines.push(format!("... {} more vectors", total - display_count));
+        }
+
+        if format == "json" {
+            output_lines.push("]".to_string());
+        }
+
+        for line in &output_lines {
+            log::info!("{}", line);
+        }
+
+        CommandResult {
+            status: Status::Ok,
+            message: format!(
+                "sliced {} vectors (ordinals {}..{}, components {}..{})",
+                total.min(display_count),
+                ord_start,
+                ord_end,
+                comp_start,
+                comp_end
             ),
+            produced: vec![],
+            elapsed: start.elapsed(),
         }
     }
 
@@ -167,212 +272,45 @@ impl CommandOp for AnalyzeSliceOp {
                 required: true,
                 default: None,
                 description: "Input vector file (fvec or ivec)".to_string(),
-            },
+                        role: OptionRole::Input,
+        },
             OptionDesc {
                 name: "ordinal-range".to_string(),
                 type_name: "String".to_string(),
                 required: false,
                 default: None,
                 description: "Row range: n, m..n, [m,n), [n], etc.".to_string(),
-            },
+                        role: OptionRole::Config,
+        },
             OptionDesc {
                 name: "component-range".to_string(),
                 type_name: "String".to_string(),
                 required: false,
                 default: None,
                 description: "Dimension range within each vector".to_string(),
-            },
+                        role: OptionRole::Config,
+        },
             OptionDesc {
                 name: "format".to_string(),
                 type_name: "String".to_string(),
                 required: false,
                 default: Some("text".to_string()),
                 description: "Output format: text, csv, tsv, json".to_string(),
-            },
+                        role: OptionRole::Config,
+        },
             OptionDesc {
                 name: "max-vectors".to_string(),
                 type_name: "int".to_string(),
                 required: false,
                 default: Some("100".to_string()),
                 description: "Max vectors to display in text mode".to_string(),
-            },
+                        role: OptionRole::Config,
+        },
         ]
     }
 }
 
-impl AnalyzeSliceOp {
-    fn slice_fvec(
-        &self,
-        path: &Path,
-        options: &Options,
-        format: &str,
-        max_vectors: usize,
-        start: Instant,
-    ) -> CommandResult {
-        let reader = match MmapVectorReader::<f32>::open_fvec(path) {
-            Ok(r) => r,
-            Err(e) => return error_result(format!("failed to open {}: {}", path.display(), e), start),
-        };
-
-        let count = <MmapVectorReader<f32> as VectorReader<f32>>::count(&reader);
-        let dim = <MmapVectorReader<f32> as VectorReader<f32>>::dim(&reader);
-
-        let (ord_start, ord_end) = match options.get("ordinal-range") {
-            Some(r) => match parse_range(r, count) {
-                Ok(range) => range,
-                Err(e) => return error_result(e, start),
-            },
-            None => (0, count),
-        };
-
-        let (comp_start, comp_end) = match options.get("component-range") {
-            Some(r) => match parse_range(r, dim) {
-                Ok(range) => range,
-                Err(e) => return error_result(e, start),
-            },
-            None => (0, dim),
-        };
-
-        let total = ord_end.saturating_sub(ord_start);
-        let mut output_lines = Vec::new();
-
-        if format == "json" {
-            output_lines.push("[".to_string());
-        }
-
-        let display_count = if format == "text" { max_vectors.min(total) } else { total };
-
-        for (i, ord) in (ord_start..ord_end).enumerate() {
-            if i >= display_count {
-                break;
-            }
-
-            let vec = match reader.get(ord) {
-                Ok(v) => v,
-                Err(e) => {
-                    return error_result(format!("read error at ordinal {}: {}", ord, e), start);
-                }
-            };
-
-            let slice = &vec[comp_start..comp_end.min(vec.len())];
-            let line = format_slice_f32(ord, slice, format, i + 1 < display_count);
-            output_lines.push(line);
-        }
-
-        if format == "text" && total > display_count {
-            output_lines.push(format!("... {} more vectors", total - display_count));
-        }
-
-        if format == "json" {
-            output_lines.push("]".to_string());
-        }
-
-        for line in &output_lines {
-            log::info!("{}", line);
-        }
-
-        CommandResult {
-            status: Status::Ok,
-            message: format!(
-                "sliced {} vectors (ordinals {}..{}, components {}..{})",
-                total.min(display_count),
-                ord_start,
-                ord_end,
-                comp_start,
-                comp_end
-            ),
-            produced: vec![],
-            elapsed: start.elapsed(),
-        }
-    }
-
-    fn slice_ivec(
-        &self,
-        path: &Path,
-        options: &Options,
-        format: &str,
-        max_vectors: usize,
-        start: Instant,
-    ) -> CommandResult {
-        let reader = match MmapVectorReader::<i32>::open_ivec(path) {
-            Ok(r) => r,
-            Err(e) => return error_result(format!("failed to open {}: {}", path.display(), e), start),
-        };
-
-        let count = <MmapVectorReader<i32> as VectorReader<i32>>::count(&reader);
-        let dim = <MmapVectorReader<i32> as VectorReader<i32>>::dim(&reader);
-
-        let (ord_start, ord_end) = match options.get("ordinal-range") {
-            Some(r) => match parse_range(r, count) {
-                Ok(range) => range,
-                Err(e) => return error_result(e, start),
-            },
-            None => (0, count),
-        };
-
-        let (comp_start, comp_end) = match options.get("component-range") {
-            Some(r) => match parse_range(r, dim) {
-                Ok(range) => range,
-                Err(e) => return error_result(e, start),
-            },
-            None => (0, dim),
-        };
-
-        let total = ord_end.saturating_sub(ord_start);
-        let mut output_lines = Vec::new();
-
-        if format == "json" {
-            output_lines.push("[".to_string());
-        }
-
-        let display_count = if format == "text" { max_vectors.min(total) } else { total };
-
-        for (i, ord) in (ord_start..ord_end).enumerate() {
-            if i >= display_count {
-                break;
-            }
-
-            let vec = match reader.get(ord) {
-                Ok(v) => v,
-                Err(e) => {
-                    return error_result(format!("read error at ordinal {}: {}", ord, e), start);
-                }
-            };
-
-            let slice = &vec[comp_start..comp_end.min(vec.len())];
-            let line = format_slice_i32(ord, slice, format, i + 1 < display_count);
-            output_lines.push(line);
-        }
-
-        if format == "text" && total > display_count {
-            output_lines.push(format!("... {} more vectors", total - display_count));
-        }
-
-        if format == "json" {
-            output_lines.push("]".to_string());
-        }
-
-        for line in &output_lines {
-            log::info!("{}", line);
-        }
-
-        CommandResult {
-            status: Status::Ok,
-            message: format!(
-                "sliced {} vectors (ordinals {}..{}, components {}..{})",
-                total.min(display_count),
-                ord_start,
-                ord_end,
-                comp_start,
-                comp_end
-            ),
-            produced: vec![],
-            elapsed: start.elapsed(),
-        }
-    }
-}
-
-fn format_slice_f32(ordinal: usize, slice: &[f32], format: &str, has_more: bool) -> String {
+fn format_slice_f64(ordinal: usize, slice: &[f64], format: &str, has_more: bool) -> String {
     match format {
         "csv" => {
             let vals: Vec<String> = slice.iter().map(|v| format!("{}", v)).collect();
@@ -390,28 +328,6 @@ fn format_slice_f32(ordinal: usize, slice: &[f32], format: &str, has_more: bool)
         _ => {
             // text
             let vals: Vec<String> = slice.iter().map(|v| format!("{:.6}", v)).collect();
-            format!("[{}] {}", ordinal, vals.join(" "))
-        }
-    }
-}
-
-fn format_slice_i32(ordinal: usize, slice: &[i32], format: &str, has_more: bool) -> String {
-    match format {
-        "csv" => {
-            let vals: Vec<String> = slice.iter().map(|v| format!("{}", v)).collect();
-            format!("{},{}", ordinal, vals.join(","))
-        }
-        "tsv" => {
-            let vals: Vec<String> = slice.iter().map(|v| format!("{}", v)).collect();
-            format!("{}\t{}", ordinal, vals.join("\t"))
-        }
-        "json" => {
-            let vals: Vec<String> = slice.iter().map(|v| format!("{}", v)).collect();
-            let comma = if has_more { "," } else { "" };
-            format!("  {{\"ordinal\": {}, \"values\": [{}]}}{}", ordinal, vals.join(", "), comma)
-        }
-        _ => {
-            let vals: Vec<String> = slice.iter().map(|v| format!("{}", v)).collect();
             format!("[{}] {}", ordinal, vals.join(" "))
         }
     }

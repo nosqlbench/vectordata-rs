@@ -17,8 +17,8 @@ use std::time::Instant;
 use sha2::{Digest, Sha256};
 
 use crate::pipeline::command::{
-    ArtifactManifest, CommandDoc, CommandOp, CommandResult, OptionDesc, Options, ResourceDesc,
-    Status, StreamContext, render_options_table,
+    ArtifactManifest, CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options,
+    ResourceDesc, Status, StreamContext, render_options_table,
 };
 
 const DEFAULT_CHUNK_SIZE: usize = 1 << 20; // 1 MiB
@@ -553,28 +553,32 @@ byte ranges rather than requiring a full file re-download.
                 required: true,
                 default: None,
                 description: "File or directory to create merkle references for".to_string(),
-            },
+                role: OptionRole::Input,
+        },
             OptionDesc {
                 name: "chunk-size".to_string(),
                 type_name: "int".to_string(),
                 required: false,
                 default: Some("1048576".to_string()),
                 description: "Chunk size in bytes (must be power of 2)".to_string(),
-            },
+                role: OptionRole::Config,
+        },
             OptionDesc {
                 name: "force".to_string(),
                 type_name: "bool".to_string(),
                 required: false,
                 default: Some("false".to_string()),
                 description: "Overwrite existing mref even if up-to-date".to_string(),
-            },
+                role: OptionRole::Config,
+        },
             OptionDesc {
                 name: "min-size".to_string(),
                 type_name: "size".to_string(),
                 required: false,
                 default: Some("100M".to_string()),
                 description: "Skip merkle creation for files smaller than this (supports K/M/G suffixes)".to_string(),
-            },
+                role: OptionRole::Config,
+        },
         ]
     }
 
@@ -801,7 +805,8 @@ predicate computation.
             required: true,
             default: None,
             description: "File to verify against its merkle reference".to_string(),
-        }]
+                role: OptionRole::Input,
+    }]
     }
 }
 
@@ -995,14 +1000,16 @@ chunks or spread across the file.
                 required: true,
                 default: None,
                 description: "First file or .mref path".to_string(),
-            },
+                        role: OptionRole::Input,
+        },
             OptionDesc {
                 name: "file2".to_string(),
                 type_name: "Path".to_string(),
                 required: true,
                 default: None,
                 description: "Second file or .mref path".to_string(),
-            },
+                        role: OptionRole::Input,
+        },
         ]
     }
 }
@@ -1129,7 +1136,8 @@ or integrity reports.
             required: true,
             default: None,
             description: "File or .mref path to summarize".to_string(),
-        }]
+                role: OptionRole::Input,
+    }]
     }
 }
 
@@ -1267,28 +1275,32 @@ the dataset pipeline.
                 required: true,
                 default: None,
                 description: "File or .mref path to visualize".to_string(),
-            },
+                        role: OptionRole::Input,
+        },
             OptionDesc {
                 name: "hash-length".to_string(),
                 type_name: "int".to_string(),
                 required: false,
                 default: Some("16".to_string()),
                 description: "Bytes of hash to display per node".to_string(),
-            },
+                        role: OptionRole::Config,
+        },
             OptionDesc {
                 name: "levels".to_string(),
                 type_name: "int".to_string(),
                 required: false,
                 default: Some("4".to_string()),
                 description: "Depth of tree to render".to_string(),
-            },
+                        role: OptionRole::Config,
+        },
             OptionDesc {
                 name: "base".to_string(),
                 type_name: "int".to_string(),
                 required: false,
                 default: Some("0".to_string()),
                 description: "Tree node index to start rendering from".to_string(),
-            },
+                        role: OptionRole::Config,
+        },
         ]
     }
 }
@@ -1514,14 +1526,16 @@ the entire file.
                 required: true,
                 default: None,
                 description: "File or .mref path".to_string(),
-            },
+                        role: OptionRole::Input,
+        },
             OptionDesc {
                 name: "chunk".to_string(),
                 type_name: "int".to_string(),
                 required: true,
                 default: None,
                 description: "Chunk (leaf) index to show path for".to_string(),
-            },
+                        role: OptionRole::Config,
+        },
         ]
     }
 }
@@ -1821,28 +1835,32 @@ and integration testing rather than in production dataset preparation.
                 required: true,
                 default: None,
                 description: "Path to .mref file or source file".to_string(),
-            },
+                        role: OptionRole::Input,
+        },
             OptionDesc {
                 name: "percentage".to_string(),
                 type_name: "float".to_string(),
                 required: false,
                 default: Some("10".to_string()),
                 description: "Percentage of leaf nodes to invalidate (0-100)".to_string(),
-            },
+                        role: OptionRole::Config,
+        },
             OptionDesc {
                 name: "seed".to_string(),
                 type_name: "int".to_string(),
                 required: false,
                 default: Some("42".to_string()),
                 description: "Random seed for reproducible selection".to_string(),
-            },
+                        role: OptionRole::Config,
+        },
             OptionDesc {
                 name: "dryrun".to_string(),
                 type_name: "bool".to_string(),
                 required: false,
                 default: Some("false".to_string()),
                 description: "Preview changes without modifying".to_string(),
-            },
+                        role: OptionRole::Config,
+        },
         ]
     }
 }
@@ -2029,35 +2047,40 @@ corruption scenarios such as disk bit-rot or truncated downloads.
                 required: true,
                 default: None,
                 description: "Path to source file or .mref file".to_string(),
-            },
+                        role: OptionRole::Input,
+        },
             OptionDesc {
                 name: "percentage".to_string(),
                 type_name: "float".to_string(),
                 required: false,
                 default: Some("10".to_string()),
                 description: "Percentage of chunks to corrupt (0-100)".to_string(),
-            },
+                        role: OptionRole::Config,
+        },
             OptionDesc {
                 name: "bytes-to-corrupt".to_string(),
                 type_name: "int".to_string(),
                 required: false,
                 default: Some("1".to_string()),
                 description: "Number of bytes to corrupt per chunk".to_string(),
-            },
+                        role: OptionRole::Config,
+        },
             OptionDesc {
                 name: "seed".to_string(),
                 type_name: "int".to_string(),
                 required: false,
                 default: Some("42".to_string()),
                 description: "Random seed for reproducible selection".to_string(),
-            },
+                        role: OptionRole::Config,
+        },
             OptionDesc {
                 name: "dryrun".to_string(),
                 type_name: "bool".to_string(),
                 required: false,
                 default: Some("false".to_string()),
                 description: "Preview changes without modifying".to_string(),
-            },
+                        role: OptionRole::Config,
+        },
         ]
     }
 }

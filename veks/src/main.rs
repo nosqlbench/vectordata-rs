@@ -446,7 +446,7 @@ fn render_markdown_to_terminal(body: &str) {
     let reset = "\x1b[0m";
     let underline = "\x1b[4m";
 
-    let use_ansi = atty::is(atty::Stream::Stdout);
+    let use_ansi = veks::term::use_color();
     let mut in_code_block = false;
 
     for line in body.lines() {

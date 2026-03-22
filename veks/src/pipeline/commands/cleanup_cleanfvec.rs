@@ -16,10 +16,14 @@
 use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
+use rayon::prelude::*;
+
+use crate::pipeline::atomic_write::AtomicWriter;
 use crate::pipeline::command::{
-    CommandDoc, CommandOp, CommandResult, OptionDesc, Options, ResourceDesc, Status, StreamContext,
+    CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options, ResourceDesc, Status, StreamContext,
     render_options_table,
 };
 
@@ -158,8 +162,8 @@ unique vectors, preventing wasted storage and incorrect KNN results.
             }
         }
 
-        let file = match std::fs::File::create(&output_path) {
-            Ok(f) => f,
+        let mut writer = match AtomicWriter::new(&output_path) {
+            Ok(w) => w,
             Err(e) => {
                 return error_result(
                     format!("failed to create {}: {}", output_path.display(), e),
@@ -167,7 +171,6 @@ unique vectors, preventing wasted storage and incorrect KNN results.
                 )
             }
         };
-        let mut writer = std::io::BufWriter::with_capacity(1 << 20, file);
 
         let mut written = 0usize;
         let mut zeros_removed = 0usize;
@@ -179,7 +182,46 @@ unique vectors, preventing wasted storage and incorrect KNN results.
             ctx.ui.log("  governor: throttle active");
         }
 
-        let pb = ctx.ui.bar(complete_vectors as u64, "cleaning");
+        let threads = ctx.governor.current_or("threads", ctx.threads as u64) as usize;
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .ok();
+
+        // Precompute hashes in parallel when dedup is enabled
+        let hashes: Vec<u64> = if remove_dupes {
+            let hash_pb = ctx.ui.bar_with_unit(complete_vectors as u64, "hashing vectors", "vectors");
+            let progress = AtomicU64::new(0);
+            let progress_ref = &progress;
+            let hash_pb_ref = &hash_pb;
+
+            let hash_fn = || {
+                (0..complete_vectors)
+                    .into_par_iter()
+                    .map(|i| {
+                        let offset = i * bytes_per_vector;
+                        let values_bytes = &data[offset + 4..offset + bytes_per_vector];
+                        let done = progress_ref.fetch_add(1, Ordering::Relaxed) + 1;
+                        if done % 100_000 == 0 {
+                            hash_pb_ref.set_position(done);
+                        }
+                        simple_hash(values_bytes)
+                    })
+                    .collect::<Vec<_>>()
+            };
+
+            let result = if let Some(ref p) = pool {
+                p.install(hash_fn)
+            } else {
+                hash_fn()
+            };
+            hash_pb.finish();
+            result
+        } else {
+            Vec::new()
+        };
+
+        let pb = ctx.ui.bar_with_unit(complete_vectors as u64, "cleaning", "vectors");
         for i in 0..complete_vectors {
             let offset = i * bytes_per_vector;
             let record = &data[offset..offset + bytes_per_vector];
@@ -190,15 +232,16 @@ unique vectors, preventing wasted storage and incorrect KNN results.
                 let is_zero = values_bytes.iter().all(|&b| b == 0);
                 if is_zero {
                     zeros_removed += 1;
+                    if (i + 1) % 10_000 == 0 { pb.set_position((i + 1) as u64); }
                     continue;
                 }
             }
 
-            // Check for duplicate
+            // Check for duplicate using precomputed hash
             if remove_dupes {
-                let hash = simple_hash(values_bytes);
-                if !seen_hashes.insert(hash) {
+                if !seen_hashes.insert(hashes[i]) {
                     dupes_removed += 1;
+                    if (i + 1) % 10_000 == 0 { pb.set_position((i + 1) as u64); }
                     continue;
                 }
             }
@@ -209,7 +252,7 @@ unique vectors, preventing wasted storage and incorrect KNN results.
         }
         pb.finish();
 
-        writer.flush().unwrap();
+        writer.finish().map_err(|e| format!("failed to finalize {}: {}", output_path.display(), e)).unwrap();
 
         let result = CleanResult {
             original_count: complete_vectors,
@@ -257,28 +300,32 @@ unique vectors, preventing wasted storage and incorrect KNN results.
                 required: true,
                 default: None,
                 description: "Input fvec file to clean".to_string(),
-            },
+                        role: OptionRole::Input,
+        },
             OptionDesc {
                 name: "output".to_string(),
                 type_name: "Path".to_string(),
                 required: true,
                 default: None,
                 description: "Output cleaned fvec file".to_string(),
-            },
+                        role: OptionRole::Output,
+        },
             OptionDesc {
                 name: "remove-zeros".to_string(),
                 type_name: "bool".to_string(),
                 required: false,
                 default: Some("true".to_string()),
                 description: "Remove zero vectors".to_string(),
-            },
+                        role: OptionRole::Config,
+        },
             OptionDesc {
                 name: "remove-duplicates".to_string(),
                 type_name: "bool".to_string(),
                 required: false,
                 default: Some("false".to_string()),
                 description: "Remove duplicate vectors (hash-based)".to_string(),
-            },
+                        role: OptionRole::Config,
+        },
         ]
     }
 }

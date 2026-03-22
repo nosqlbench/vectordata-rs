@@ -17,7 +17,7 @@ use vectordata::VectorReader;
 use vectordata::io::MmapVectorReader;
 
 use crate::pipeline::command::{
-    CommandDoc, CommandOp, CommandResult, OptionDesc, Options, ResourceDesc, Status, StreamContext,
+    CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options, ResourceDesc, Status, StreamContext,
     render_options_table,
 };
 
@@ -226,35 +226,40 @@ impl CommandOp for AnalyzeVerifyProfilesOp {
                 required: true,
                 default: None,
                 description: "Model JSON file to verify against".to_string(),
-            },
+                        role: OptionRole::Input,
+        },
             OptionDesc {
                 name: "vectors".to_string(),
                 type_name: "Path".to_string(),
                 required: true,
                 default: None,
                 description: "Vector fvec file to verify".to_string(),
-            },
+                        role: OptionRole::Input,
+        },
             OptionDesc {
                 name: "threshold".to_string(),
                 type_name: "float".to_string(),
                 required: false,
                 default: Some("0.05".to_string()),
                 description: "KS D-statistic threshold for pass/fail".to_string(),
-            },
+                        role: OptionRole::Config,
+        },
             OptionDesc {
                 name: "sample".to_string(),
                 type_name: "int".to_string(),
                 required: false,
                 default: Some("10000".to_string()),
                 description: "Max vectors to sample".to_string(),
-            },
+                        role: OptionRole::Config,
+        },
             OptionDesc {
                 name: "verbose".to_string(),
                 type_name: "bool".to_string(),
                 required: false,
                 default: Some("false".to_string()),
                 description: "Show per-dimension results".to_string(),
-            },
+                        role: OptionRole::Config,
+        },
         ]
     }
 }

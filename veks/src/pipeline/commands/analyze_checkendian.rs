@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::pipeline::command::{
-    CommandDoc, CommandOp, CommandResult, OptionDesc, Options, Status, StreamContext,
+    CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options, Status, StreamContext,
     render_options_table,
 };
 
@@ -230,7 +230,8 @@ impl CommandOp for AnalyzeCheckEndianOp {
             required: true,
             default: None,
             description: "xvec file to check endianness".to_string(),
-        }]
+                role: OptionRole::Input,
+    }]
     }
 }
 

@@ -340,6 +340,16 @@ using `aws-sdk-s3` for tighter progress integration, parallel multipart
 uploads, and elimination of the external CLI dependency. This is not
 required for the initial implementation.
 
+### Transport abstraction
+
+The `vectordata` crate provides a `ChunkedTransport` trait
+(`vectordata::transport::ChunkedTransport`) that abstracts byte-range
+data access across local files and HTTP endpoints. Publishing and data
+access both resolve transport backends through trait-based dispatch
+rather than hard-coded protocol handling. This enables S3-compatible,
+HTTP, and local-file transports to be selected at runtime based on the
+URL scheme in `.publish_url` or the dataset root location.
+
 ---
 
 ## 10.8 Operational Workflow

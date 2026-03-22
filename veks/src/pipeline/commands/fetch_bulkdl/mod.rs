@@ -22,8 +22,8 @@ use config::{StatusFile, parse_token_spec};
 use download::{download_file, head_content_length};
 use expand::expand_tokens;
 use crate::pipeline::command::{
-    ArtifactState, CommandDoc, CommandOp, CommandResult, OptionDesc, Options, ResourceDesc,
-    Status, StreamContext, render_options_table,
+    ArtifactState, CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options,
+    ResourceDesc, Status, StreamContext, render_options_table,
 };
 
 /// Pipeline command: bulk download files from a URL template.
@@ -422,35 +422,40 @@ pipeline runs, picking up where it left off after interruptions.
                 required: true,
                 default: None,
                 description: "URL template with ${token} placeholders".to_string(),
-            },
+                role: OptionRole::Config,
+        },
             OptionDesc {
                 name: "output".to_string(),
                 type_name: "Path".to_string(),
                 required: true,
                 default: None,
                 description: "Output directory for downloaded files".to_string(),
-            },
+                role: OptionRole::Output,
+        },
             OptionDesc {
                 name: "tokens".to_string(),
                 type_name: "String".to_string(),
                 required: false,
                 default: None,
                 description: "Token ranges, e.g. \"number=[0..409]\" or \"x=[0..9],y=[0..9]\"".to_string(),
-            },
+                role: OptionRole::Config,
+        },
             OptionDesc {
                 name: "tries".to_string(),
                 type_name: "int".to_string(),
                 required: false,
                 default: Some("3".to_string()),
                 description: "Number of download attempts per file".to_string(),
-            },
+                role: OptionRole::Config,
+        },
             OptionDesc {
                 name: "concurrency".to_string(),
                 type_name: "int".to_string(),
                 required: false,
                 default: Some("4".to_string()),
                 description: "Maximum concurrent downloads".to_string(),
-            },
+                role: OptionRole::Config,
+        },
         ]
     }
 }

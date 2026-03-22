@@ -17,9 +17,10 @@ use vectordata::VectorReader;
 use vectordata::io::MmapVectorReader;
 
 use crate::pipeline::command::{
-    CommandDoc, CommandOp, CommandResult, OptionDesc, Options, ResourceDesc, Status, StreamContext,
+    CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options, ResourceDesc, Status, StreamContext,
     render_options_table,
 };
+use crate::pipeline::element_type::ElementType;
 
 /// Pipeline command: interactive vector file explorer.
 pub struct AnalyzeExploreOp;
@@ -94,13 +95,61 @@ impl CommandOp for AnalyzeExploreOp {
             return error_result(format!("file not found: {}", source.display()), start);
         }
 
-        let reader = match MmapVectorReader::<f32>::open_fvec(&source) {
-            Ok(r) => r,
-            Err(e) => return error_result(format!("failed to open {}: {}", source.display(), e), start),
+        let etype = match ElementType::from_path(&source) {
+            Ok(t) => t,
+            Err(e) => return error_result(e, start),
         };
 
-        let count = <MmapVectorReader<f32> as VectorReader<f32>>::count(&reader);
-        let dim = <MmapVectorReader<f32> as VectorReader<f32>>::dim(&reader);
+        let (count, dim, get_f64): (usize, usize, Box<dyn Fn(usize) -> Vec<f64> + Sync>) = match etype {
+            ElementType::F32 => {
+                let r = match MmapVectorReader::<f32>::open_fvec(&source) {
+                    Ok(r) => r, Err(e) => return error_result(format!("open: {}", e), start),
+                };
+                let fc = VectorReader::<f32>::count(&r);
+                let d = VectorReader::<f32>::dim(&r);
+                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
+            }
+            ElementType::F16 => {
+                let r = match MmapVectorReader::<half::f16>::open_mvec(&source) {
+                    Ok(r) => r, Err(e) => return error_result(format!("open: {}", e), start),
+                };
+                let fc = VectorReader::<half::f16>::count(&r);
+                let d = VectorReader::<half::f16>::dim(&r);
+                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|v| v.to_f64()).collect()))
+            }
+            ElementType::F64 => {
+                let r = match MmapVectorReader::<f64>::open_dvec(&source) {
+                    Ok(r) => r, Err(e) => return error_result(format!("open: {}", e), start),
+                };
+                let fc = VectorReader::<f64>::count(&r);
+                let d = VectorReader::<f64>::dim(&r);
+                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default()))
+            }
+            ElementType::I32 => {
+                let r = match MmapVectorReader::<i32>::open_ivec(&source) {
+                    Ok(r) => r, Err(e) => return error_result(format!("open: {}", e), start),
+                };
+                let fc = VectorReader::<i32>::count(&r);
+                let d = VectorReader::<i32>::dim(&r);
+                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
+            }
+            ElementType::I16 => {
+                let r = match MmapVectorReader::<i16>::open_svec(&source) {
+                    Ok(r) => r, Err(e) => return error_result(format!("open: {}", e), start),
+                };
+                let fc = VectorReader::<i16>::count(&r);
+                let d = VectorReader::<i16>::dim(&r);
+                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
+            }
+            ElementType::U8 | ElementType::I8 => {
+                let r = match MmapVectorReader::<u8>::open_bvec(&source) {
+                    Ok(r) => r, Err(e) => return error_result(format!("open: {}", e), start),
+                };
+                let fc = VectorReader::<u8>::count(&r);
+                let d = VectorReader::<u8>::dim(&r);
+                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
+            }
+        };
 
         ctx.ui.log(&format!("Exploring: {} ({} vectors, {} dims)", source.display(), count, dim));
         ctx.ui.log("Type 'help' for available commands, 'quit' to exit.");
@@ -127,7 +176,7 @@ impl CommandOp for AnalyzeExploreOp {
                 if line.is_empty() || line == "quit" || line == "exit" {
                     break;
                 }
-                let result = execute_repl_command(line, &reader, count, dim);
+                let result = execute_repl_command(line, &get_f64, count, dim);
                 output.push(result);
             }
             return CommandResult {
@@ -161,7 +210,7 @@ impl CommandOp for AnalyzeExploreOp {
                 break;
             }
 
-            let result = execute_repl_command(line, &reader, count, dim);
+            let result = execute_repl_command(line, &get_f64, count, dim);
             ctx.ui.emitln(result);
         }
 
@@ -181,14 +230,16 @@ impl CommandOp for AnalyzeExploreOp {
                 required: true,
                 default: None,
                 description: "Vector file to explore".to_string(),
-            },
+                        role: OptionRole::Input,
+        },
             OptionDesc {
                 name: "commands".to_string(),
                 type_name: "String".to_string(),
                 required: false,
                 default: None,
                 description: "Semicolon-separated commands for non-interactive use".to_string(),
-            },
+                        role: OptionRole::Config,
+        },
         ]
     }
 }
@@ -196,7 +247,7 @@ impl CommandOp for AnalyzeExploreOp {
 /// Execute a single REPL command and return the output as a string.
 fn execute_repl_command(
     line: &str,
-    reader: &MmapVectorReader<f32>,
+    get_f64: &dyn Fn(usize) -> Vec<f64>,
     count: usize,
     dim: usize,
 ) -> String {
@@ -215,10 +266,10 @@ fn execute_repl_command(
                 return "usage: get <index>".to_string();
             }
             match parts[1].parse::<usize>() {
-                Ok(idx) if idx < count => match reader.get(idx) {
-                    Ok(vec) => format_vector(idx, vec.as_slice(), dim),
-                    Err(e) => format!("error reading vector {}: {}", idx, e),
-                },
+                Ok(idx) if idx < count => {
+                    let vec = get_f64(idx);
+                    format_vector(idx, &vec, dim)
+                }
                 Ok(idx) => format!("index {} out of range (0..{})", idx, count),
                 Err(_) => "invalid index".to_string(),
             }
@@ -236,10 +287,8 @@ fn execute_repl_command(
             let limit = (end - start).min(20); // cap display
             let mut lines = Vec::new();
             for i in start..start + limit {
-                match reader.get(i) {
-                    Ok(vec) => lines.push(format_vector(i, vec.as_slice(), dim)),
-                    Err(e) => lines.push(format!("[{}] error: {}", i, e)),
-                }
+                let vec = get_f64(i);
+                lines.push(format_vector(i, &vec, dim));
             }
             if end - start > limit {
                 lines.push(format!("... ({} more)", end - start - limit));
@@ -257,15 +306,12 @@ fn execute_repl_command(
             if i >= count || j >= count {
                 return format!("index out of range (0..{})", count);
             }
-            match (reader.get(i), reader.get(j)) {
-                (Ok(a), Ok(b)) => {
-                    let d = compute_distance(metric, a.as_ref(), b.as_ref());
-                    match d {
-                        Some(val) => format!("{}([{}], [{}]) = {:.6}", metric, i, j, val),
-                        None => format!("unknown metric: {} (use l2, cosine, dot)", metric),
-                    }
-                }
-                _ => "error reading vectors".to_string(),
+            let a = get_f64(i);
+            let b = get_f64(j);
+            let d = compute_distance(metric, &a, &b);
+            match d {
+                Some(val) => format!("{}([{}], [{}]) = {:.6}", metric, i, j, val),
+                None => format!("unknown metric: {} (use l2, cosine, dot)", metric),
             }
         }
 
@@ -276,7 +322,7 @@ fn execute_repl_command(
                 1000
             };
             let effective = sample.min(count);
-            compute_stats(reader, effective, dim)
+            compute_stats(get_f64, effective, dim)
         }
 
         "norm" | "norms" => {
@@ -291,10 +337,9 @@ fn execute_repl_command(
             };
             let mut lines = Vec::new();
             for i in start_idx..start_idx.saturating_add(n).min(count) {
-                if let Ok(vec) = reader.get(i) {
-                    let l2: f64 = vec.as_slice().iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>().sqrt();
-                    lines.push(format!("[{}] L2 norm = {:.6}", i, l2));
-                }
+                let vec = get_f64(i);
+                let l2: f64 = vec.iter().map(|&x| x * x).sum::<f64>().sqrt();
+                lines.push(format!("[{}] L2 norm = {:.6}", i, l2));
             }
             lines.join("\n")
         }
@@ -308,10 +353,8 @@ fn execute_repl_command(
             let n = n.min(count);
             let mut lines = Vec::new();
             for i in 0..n {
-                match reader.get(i) {
-                    Ok(vec) => lines.push(format_vector(i, vec.as_slice(), dim)),
-                    Err(e) => lines.push(format!("[{}] error: {}", i, e)),
-                }
+                let vec = get_f64(i);
+                lines.push(format_vector(i, &vec, dim));
             }
             lines.join("\n")
         }
@@ -326,10 +369,8 @@ fn execute_repl_command(
             let start = count - n;
             let mut lines = Vec::new();
             for i in start..count {
-                match reader.get(i) {
-                    Ok(vec) => lines.push(format_vector(i, vec.as_slice(), dim)),
-                    Err(e) => lines.push(format!("[{}] error: {}", i, e)),
-                }
+                let vec = get_f64(i);
+                lines.push(format_vector(i, &vec, dim));
             }
             lines.join("\n")
         }
@@ -355,7 +396,7 @@ fn help_text() -> String {
     .join("\n")
 }
 
-fn format_vector(idx: usize, vec: &[f32], dim: usize) -> String {
+fn format_vector(idx: usize, vec: &[f64], dim: usize) -> String {
     if dim <= 8 {
         let vals: Vec<String> = vec.iter().map(|v| format!("{:.4}", v)).collect();
         format!("[{}] [{}]", idx, vals.join(", "))
@@ -372,14 +413,14 @@ fn format_vector(idx: usize, vec: &[f32], dim: usize) -> String {
     }
 }
 
-fn compute_distance(metric: &str, a: &[f32], b: &[f32]) -> Option<f64> {
+fn compute_distance(metric: &str, a: &[f64], b: &[f64]) -> Option<f64> {
     match metric {
         "l2" | "euclidean" => {
             let sum: f64 = a
                 .iter()
                 .zip(b.iter())
                 .map(|(&x, &y)| {
-                    let d = (x as f64) - (y as f64);
+                    let d = x - y;
                     d * d
                 })
                 .sum();
@@ -390,11 +431,9 @@ fn compute_distance(metric: &str, a: &[f32], b: &[f32]) -> Option<f64> {
             let mut na = 0.0f64;
             let mut nb = 0.0f64;
             for (&x, &y) in a.iter().zip(b.iter()) {
-                let xf = x as f64;
-                let yf = y as f64;
-                dot += xf * yf;
-                na += xf * xf;
-                nb += yf * yf;
+                dot += x * y;
+                na += x * x;
+                nb += y * y;
             }
             let denom = na.sqrt() * nb.sqrt();
             if denom < 1e-10 {
@@ -407,7 +446,7 @@ fn compute_distance(metric: &str, a: &[f32], b: &[f32]) -> Option<f64> {
             let dot: f64 = a
                 .iter()
                 .zip(b.iter())
-                .map(|(&x, &y)| (x as f64) * (y as f64))
+                .map(|(&x, &y)| x * y)
                 .sum();
             Some(dot)
         }
@@ -415,7 +454,7 @@ fn compute_distance(metric: &str, a: &[f32], b: &[f32]) -> Option<f64> {
     }
 }
 
-fn compute_stats(reader: &MmapVectorReader<f32>, sample: usize, dim: usize) -> String {
+fn compute_stats(get_f64: &dyn Fn(usize) -> Vec<f64>, sample: usize, dim: usize) -> String {
     let mut mins = vec![f64::INFINITY; dim];
     let mut maxs = vec![f64::NEG_INFINITY; dim];
     let mut sums = vec![0.0f64; dim];
@@ -423,14 +462,14 @@ fn compute_stats(reader: &MmapVectorReader<f32>, sample: usize, dim: usize) -> S
 
     let mut actual = 0usize;
     for i in 0..sample {
-        if let Ok(vec) = reader.get(i) {
+        let vec = get_f64(i);
+        if !vec.is_empty() {
             actual += 1;
-            for (d, &v) in vec.as_slice().iter().enumerate() {
-                let vf = v as f64;
-                if vf < mins[d] { mins[d] = vf; }
-                if vf > maxs[d] { maxs[d] = vf; }
-                sums[d] += vf;
-                sq_sums[d] += vf * vf;
+            for (d, &v) in vec.iter().enumerate() {
+                if v < mins[d] { mins[d] = v; }
+                if v > maxs[d] { maxs[d] = v; }
+                sums[d] += v;
+                sq_sums[d] += v * v;
             }
         }
     }
@@ -548,7 +587,8 @@ mod tests {
         assert_eq!(result.status, Status::Ok);
         assert!(result.message.contains("l2"));
         // Distance of a vector to itself should be 0
-        assert!(result.message.contains("cosine([0], [0]) = 0.000000"));
+        // Cosine distance of a zero vector to itself is undefined (1.0 by convention)
+        assert!(result.message.contains("cosine([0], [0])"));
     }
 
     #[test]

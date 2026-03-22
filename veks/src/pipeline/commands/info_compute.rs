@@ -12,7 +12,7 @@
 use std::time::Instant;
 
 use crate::pipeline::command::{
-    CommandDoc, CommandOp, CommandResult, OptionDesc, Options, Status, StreamContext,
+    CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options, Status, StreamContext,
     render_options_table,
 };
 
@@ -161,7 +161,8 @@ beginning of a pipeline to log the execution environment.
             required: false,
             default: Some("false".to_string()),
             description: "Show one-line summary only".to_string(),
-        }]
+                role: OptionRole::Config,
+    }]
     }
 }
 

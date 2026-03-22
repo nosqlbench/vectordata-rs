@@ -16,7 +16,6 @@ use vectordata::dataset::DatasetConfig;
 use super::command::{ArtifactManifest, Options};
 use super::interpolate;
 use super::registry::CommandRegistry;
-use super::schema::StepDef;
 
 /// The complete projected manifest for a workspace.
 #[derive(Debug, serde::Serialize)]
@@ -31,6 +30,32 @@ pub struct WorkspaceManifest {
     pub steps: Vec<ArtifactManifest>,
 }
 
+impl WorkspaceManifest {
+    /// All cache paths that must be retained — the union of inputs,
+    /// outputs, and intermediates that live under `.cache/` or `${cache}`.
+    ///
+    /// This is the authoritative set for cache cleanup: anything in
+    /// `.cache/` not in this set is safe to delete. Anything in it is
+    /// needed by the pipeline (as source data, intermediate computation,
+    /// or cached state).
+    pub fn retained_cache_paths(&self) -> HashSet<String> {
+        let is_cache = |p: &str| {
+            p.starts_with("${cache}") || p.starts_with(".cache/") || p.contains("/.cache/")
+        };
+        let mut retained = HashSet::new();
+        for p in &self.inputs {
+            if is_cache(p) { retained.insert(p.clone()); }
+        }
+        for p in &self.intermediates {
+            if is_cache(p) { retained.insert(p.clone()); }
+        }
+        for p in &self.final_artifacts {
+            if is_cache(p) { retained.insert(p.clone()); }
+        }
+        retained
+    }
+}
+
 /// Build a workspace manifest by projecting all pipeline steps.
 pub fn project_workspace(
     dataset_path: &Path,
@@ -39,7 +64,9 @@ pub fn project_workspace(
 ) -> Result<WorkspaceManifest, String> {
     let workspace = dataset_path.parent().unwrap_or(Path::new("."));
 
-    let steps = collect_all_steps(config);
+    // Use the fully expanded step set (including per-profile expansions)
+    // so the manifest accounts for all per-profile output paths.
+    let steps = vectordata::dataset::resolve_steps(config);
     if steps.is_empty() {
         return Ok(WorkspaceManifest {
             final_artifacts: HashSet::new(),
@@ -120,12 +147,5 @@ pub fn project_workspace(
     })
 }
 
-fn collect_all_steps(config: &DatasetConfig) -> Vec<StepDef> {
-    let mut steps = Vec::new();
-    if let Some(ref pipeline) = config.upstream {
-        if let Some(ref shared_steps) = pipeline.steps {
-            steps.extend(shared_steps.clone());
-        }
-    }
-    steps
-}
+// collect_all_steps, expand_per_profile_steps, and filter_steps_for_profile
+// are now in vectordata::dataset::expansion (shared code).
