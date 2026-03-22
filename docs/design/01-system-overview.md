@@ -34,7 +34,8 @@ vectordata-rs/                     Cargo workspace root
     ├── formats/                   format codecs, readers (npy, parquet, slab, xvec), writers
     │   ├── reader/                format-specific readers
     │   └── writer/                format-specific writers
-    ├── datasets/                  dataset browsing, cache, curlify, prebuffer
+    ├── datasets/                  dataset consumer commands (list, cache, curlify, prebuffer)
+    ├── prepare/                   dataset producer commands (import, stratify, catalog, cache-compress)
     ├── catalog/                   dataset catalog generation and resolution
     ├── ui/                        UI-agnostic eventing layer (plain, test, ratatui sinks)
     └── pipeline/                  DAG execution engine
@@ -134,9 +135,53 @@ The CLI application. Encompasses:
 | `veks run dataset.yaml`      | Pipeline runner  | Execute DAG-ordered steps from dataset.yaml            |
 | `veks pipeline <group> <cmd>`| Direct command   | Execute a single pipeline command with CLI args        |
 | `veks script dataset.yaml`   | Script export    | Emit a pipeline as an equivalent shell script          |
+| `veks prepare <subcmd>`      | Preparation      | Import, stratify, catalog, compress datasets           |
 | `veks datasets <subcmd>`     | Inventory        | Browse, search, cache, prebuffer, curlify datasets     |
+| `veks check`                 | Validation       | Pre-flight checks for dataset readiness                |
+| `veks publish`               | Publishing       | Publish dataset to S3                                  |
 | `veks help [command]`        | Documentation    | Display help for pipeline commands and groups          |
 | `veks completions`           | Shell setup      | Generate shell completions for bash/zsh/fish           |
+
+### 1.4.1 Shorthand Dispatch and Global Name Uniqueness
+
+**All subcommand names MUST be globally unique across all command
+groups.** This is a normative requirement that enables shorthand
+dispatch: any subcommand can be invoked directly from the root without
+its group prefix when it is unambiguous.
+
+For example, `veks import` dispatches to `veks prepare import` because
+`import` is a unique subcommand name. Similarly, `veks list` dispatches
+to `veks datasets list`.
+
+The dispatch order is:
+
+1. Match against known root-level commands (`run`, `prepare`, etc.)
+2. Look up in the shorthand table (subcommands of `prepare` and `datasets`)
+3. Fall through to the pipeline command registry (`veks pipeline`)
+
+**Shorthand names are NOT included in shell completions** — tab
+completion only shows the canonical group-prefixed forms. This keeps
+the completion output clean while still allowing experienced users to
+type the shorter form.
+
+**Enforcement**: when adding a new subcommand to any group, verify
+that its name does not collide with any existing subcommand in any
+other group. If a collision is detected, one of the conflicting
+commands must be renamed before the change is accepted.
+
+Current subcommand mapping:
+
+| Shorthand | Canonical form |
+|-----------|---------------|
+| `import` | `prepare import` |
+| `stratify` | `prepare stratify` |
+| `catalog` | `prepare catalog` |
+| `cache-compress` | `prepare cache-compress` |
+| `cache-uncompress` | `prepare cache-uncompress` |
+| `list` / `ls` | `datasets list` |
+| `cache` | `datasets cache` |
+| `curlify` | `datasets curlify` |
+| `prebuffer` | `datasets prebuffer` |
 
 ## 1.5 Command Categories
 
@@ -212,7 +257,10 @@ than processing data.
 | `veks run`       | Pipeline runner      | Execute a full pipeline from dataset.yaml          |
 | `veks pipeline`  | Pipeline (direct)    | Execute a single pipeline command with CLI args    |
 | `veks script`    | Pipeline (export)    | Emit a pipeline as an equivalent shell script      |
+| `veks prepare`   | Preparation          | Import, stratify, catalog, compress datasets       |
 | `veks datasets`  | Inventory            | Browse and search datasets from configured catalogs|
+| `veks check`     | Validation           | Pre-flight checks for dataset readiness            |
+| `veks publish`   | Publishing           | Publish dataset to S3                              |
 | `veks help`      | Documentation        | Pipeline command documentation                     |
 | `veks completions`| Inventory           | Shell completion generation                        |
 

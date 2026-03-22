@@ -17,16 +17,26 @@ use super::import::ImportArgs;
 /// When true, all prompts return their default value without waiting for input.
 static AUTO_ACCEPT: AtomicBool = AtomicBool::new(false);
 
+/// When true, strict auto mode is active — all files must have recognized roles.
+static AUTO_MODE: AtomicBool = AtomicBool::new(false);
+
 /// Run the wizard with auto-accept disabled (fully interactive).
 pub fn run_wizard() -> ImportArgs {
-    run_wizard_with_auto_accept(false)
+    run_wizard_with_options(false, false)
 }
 
-/// Run the interactive import wizard. When `auto_accept` is true, all prompts
-/// return their default value without waiting for user input (-y flag).
-pub fn run_wizard_with_auto_accept(auto_accept: bool) -> ImportArgs {
+/// Run the interactive import wizard.
+///
+/// - `auto_accept`: all prompts return their default value (-y flag)
+/// - `auto_mode`: strict mode — all candidate files must be recognized by
+///   role keywords, underscore-prefix renaming is assumed, and unrecognized
+///   files cause a hard stop with guidance on naming conventions.
+pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool) -> ImportArgs {
     AUTO_ACCEPT.store(auto_accept, Ordering::Relaxed);
-    if auto_accept {
+    AUTO_MODE.store(auto_mode, Ordering::Relaxed);
+    if auto_mode {
+        println!("=== veks datasets import — auto mode ===");
+    } else if auto_accept {
         println!("=== veks datasets import — auto-accept mode (-y) ===");
     }
     println!("=== veks datasets import — interactive wizard ===");
@@ -58,6 +68,54 @@ pub fn run_wizard_with_auto_accept(auto_accept: bool) -> ImportArgs {
         println!();
     }
 
+    // ── Filename-keyword role detection ──────────────────────────────
+    let detected = detect_roles(&candidates);
+
+    // In --auto mode, all candidate files must have recognized roles.
+    if AUTO_MODE.load(Ordering::Relaxed) && !detected.unassigned.is_empty() {
+        eprintln!();
+        eprintln!("Error: --auto mode requires all data files to have recognizable role keywords");
+        eprintln!("in their filenames. The following files could not be assigned a role:");
+        eprintln!();
+        for p in &detected.unassigned {
+            eprintln!("  {}", p.display());
+        }
+        eprintln!();
+        eprintln!("Rename files to include one of these keywords (underscore-delimited):");
+        eprintln!();
+        eprintln!("  Role                        Keywords");
+        eprintln!("  ──────────────────────────── ─────────────────────────────────────────");
+        eprintln!("  Base vectors                 base, train");
+        eprintln!("  Query vectors                query, queries, test");
+        eprintln!("  Neighbor indices (GT)        groundtruth, gt, indices, neighbors");
+        eprintln!("  Neighbor distances (GT)      distances");
+        eprintln!("  Metadata content             metadata, content");
+        eprintln!("  Metadata predicates          predicates");
+        eprintln!("  Metadata results             results");
+        eprintln!("  Filtered neighbor indices    filtered + (indices|neighbors|gt)");
+        eprintln!("  Filtered neighbor distances  filtered + distances");
+        eprintln!();
+        eprintln!("Examples:");
+        eprintln!("  base_vectors.fvec          → Base vectors");
+        eprintln!("  query_test.mvec            → Query vectors");
+        eprintln!("  gt_neighbors.ivec          → Neighbor indices");
+        eprintln!("  metadata_content.slab      → Metadata content");
+        eprintln!("  filtered_neighbors.ivec    → Filtered neighbor indices");
+        eprintln!();
+        eprintln!("A leading underscore (e.g., _base_vectors.mvec) is stripped before");
+        eprintln!("keyword matching, so renamed source files are still recognized.");
+        std::process::exit(1);
+    }
+
+    let roles_accepted = if detected.any_detected() {
+        println!("Detected file roles:");
+        detected.print_summary();
+        println!();
+        confirm("Use detected assignments?", true)
+    } else {
+        false
+    };
+
     // ── Dataset name ─────────────────────────────────────────────────
     let dir_name = cwd.file_name()
         .map(|n| n.to_string_lossy().to_string())
@@ -73,43 +131,49 @@ pub fn run_wizard_with_auto_accept(auto_accept: bool) -> ImportArgs {
     // ── Base vectors ─────────────────────────────────────────────────
     println!();
     println!("--- Vector source ---");
-    let vector_candidates: Vec<&(PathBuf, String, u64)> = candidates.iter()
-        .filter(|(_, fmt, _)| {
-            let f = fmt.as_str();
-            f == "fvec" || f == "ivec" || f == "mvec" || f == "bvec" || f == "dvec" || f == "svec" || f == "npy"
-        })
-        .collect();
+    let base_vectors = if roles_accepted && detected.base_vectors.is_some() {
+        let bv = detected.base_vectors.as_ref().unwrap();
+        println!("  Using detected: {}", bv.display());
+        Some(bv.clone())
+    } else {
+        let vector_candidates: Vec<&(PathBuf, String, u64)> = candidates.iter()
+            .filter(|(_, fmt, _)| {
+                let f = fmt.as_str();
+                f == "fvec" || f == "ivec" || f == "mvec" || f == "bvec" || f == "dvec" || f == "svec" || f == "npy"
+            })
+            .collect();
 
-    let base_vectors = if vector_candidates.len() == 1 {
-        let candidate = &vector_candidates[0].0;
-        println!("  Found: {}", candidate.display());
-        if confirm("Use this as base vectors?", true) {
-            Some(candidate.clone())
-        } else {
-            prompt_optional_path("Path to base vectors")
-        }
-    } else if vector_candidates.len() > 1 {
-        println!("  Multiple vector files found:");
-        for (i, (path, fmt, size)) in vector_candidates.iter().enumerate() {
-            println!("    {}. {} ({}, {})", i + 1, path.display(), fmt, format_size(*size));
-        }
-        let choice = prompt_optional(&format!("Choose base vectors [1-{}] or enter path", vector_candidates.len()));
-        match choice {
-            Some(s) => {
-                if let Ok(idx) = s.parse::<usize>() {
-                    if idx >= 1 && idx <= vector_candidates.len() {
-                        Some(vector_candidates[idx - 1].0.clone())
+        if vector_candidates.len() == 1 {
+            let candidate = &vector_candidates[0].0;
+            println!("  Found: {}", candidate.display());
+            if confirm("Use this as base vectors?", true) {
+                Some(candidate.clone())
+            } else {
+                prompt_optional_path("Path to base vectors")
+            }
+        } else if vector_candidates.len() > 1 {
+            println!("  Multiple vector files found:");
+            for (i, (path, fmt, size)) in vector_candidates.iter().enumerate() {
+                println!("    {}. {} ({}, {})", i + 1, path.display(), fmt, format_size(*size));
+            }
+            let choice = prompt_optional(&format!("Choose base vectors [1-{}] or enter path", vector_candidates.len()));
+            match choice {
+                Some(s) => {
+                    if let Ok(idx) = s.parse::<usize>() {
+                        if idx >= 1 && idx <= vector_candidates.len() {
+                            Some(vector_candidates[idx - 1].0.clone())
+                        } else {
+                            Some(PathBuf::from(s))
+                        }
                     } else {
                         Some(PathBuf::from(s))
                     }
-                } else {
-                    Some(PathBuf::from(s))
                 }
+                None => None,
             }
-            None => None,
+        } else {
+            prompt_optional_path("Path to base vectors")
         }
-    } else {
-        prompt_optional_path("Path to base vectors")
     };
 
     if base_vectors.is_none() {
@@ -136,22 +200,31 @@ pub fn run_wizard_with_auto_accept(auto_accept: bool) -> ImportArgs {
     println!();
     println!("--- Query vectors ---");
     let (query_vectors, self_search, query_count) = if base_vectors.is_some() {
-        println!("  Options:");
-        println!("    1. Self-search — extract queries from base via shuffle (recommended)");
-        println!("    2. Separate query file");
-        println!("    3. No query vectors");
-        let choice = prompt_with_default("Choice [1/2/3]", "1");
-        match choice.as_str() {
-            "2" => {
-                let qv = prompt_optional_path("Path to query vectors");
-                let qv = qv.map(|p| prompt_source_location(&p, &output, "Query vectors"));
-                (qv, false, 10000u32)
-            }
-            "3" => (None, false, 10000),
-            _ => {
-                let qc_str = prompt_with_default("Query count", "10000");
-                let qc = qc_str.parse().unwrap_or(10000);
-                (None, true, qc)
+        if roles_accepted && detected.query_vectors.is_some() {
+            // Detected a separate query file — use it directly
+            let qv = detected.query_vectors.as_ref().unwrap().clone();
+            println!("  Using detected: {}", qv.display());
+            (Some(qv), false, 10000u32)
+        } else {
+            // Default: self-search when no query file detected
+            let default_choice = if roles_accepted { "1" } else { "1" };
+            println!("  Options:");
+            println!("    1. Self-search — extract queries from base via shuffle (recommended)");
+            println!("    2. Separate query file");
+            println!("    3. No query vectors");
+            let choice = prompt_with_default("Choice [1/2/3]", default_choice);
+            match choice.as_str() {
+                "2" => {
+                    let qv = prompt_optional_path("Path to query vectors");
+                    let qv = qv.map(|p| prompt_source_location(&p, &output, "Query vectors"));
+                    (qv, false, 10000u32)
+                }
+                "3" => (None, false, 10000),
+                _ => {
+                    let qc_str = prompt_with_default("Query count", "10000");
+                    let qc = qc_str.parse().unwrap_or(10000);
+                    (None, true, qc)
+                }
             }
         }
     } else {
@@ -167,29 +240,35 @@ pub fn run_wizard_with_auto_accept(auto_accept: bool) -> ImportArgs {
     // ── Metadata ─────────────────────────────────────────────────────
     println!();
     println!("--- Metadata ---");
-    let meta_candidates: Vec<&(PathBuf, String, u64)> = candidates.iter()
-        .filter(|(_, fmt, _)| fmt == "slab" || fmt == "parquet")
-        .collect();
+    let metadata = if roles_accepted && detected.metadata.is_some() {
+        let m = detected.metadata.as_ref().unwrap().clone();
+        println!("  Using detected: {}", m.display());
+        Some(m)
+    } else {
+        let meta_candidates: Vec<&(PathBuf, String, u64)> = candidates.iter()
+            .filter(|(_, fmt, _)| fmt == "slab" || fmt == "parquet")
+            .collect();
 
-    let metadata = if !meta_candidates.is_empty() {
-        println!("  Found metadata candidates:");
-        for (path, fmt, size) in &meta_candidates {
-            println!("    {} ({}, {})", path.display(), fmt, format_size(*size));
-        }
-        if confirm("Include metadata in pipeline?", true) {
-            if meta_candidates.len() == 1 {
-                Some(meta_candidates[0].0.clone())
+        if !meta_candidates.is_empty() {
+            println!("  Found metadata candidates:");
+            for (path, fmt, size) in &meta_candidates {
+                println!("    {} ({}, {})", path.display(), fmt, format_size(*size));
+            }
+            if confirm("Include metadata in pipeline?", true) {
+                if meta_candidates.len() == 1 {
+                    Some(meta_candidates[0].0.clone())
+                } else {
+                    prompt_optional_path("Path to metadata source")
+                }
             } else {
-                prompt_optional_path("Path to metadata source")
+                None
             }
         } else {
-            None
-        }
-    } else {
-        if confirm("Include metadata source?", false) {
-            prompt_optional_path("Path to metadata")
-        } else {
-            None
+            if confirm("Include metadata source?", false) {
+                prompt_optional_path("Path to metadata")
+            } else {
+                None
+            }
         }
     };
 
@@ -198,25 +277,38 @@ pub fn run_wizard_with_auto_accept(auto_accept: bool) -> ImportArgs {
     println!("--- Ground truth ---");
     let has_queries = query_vectors.is_some() || self_search;
     let (ground_truth, ground_truth_distances) = if has_queries {
-        let gt_candidates: Vec<&(PathBuf, String, u64)> = candidates.iter()
-            .filter(|(p, fmt, _)| {
-                fmt == "ivec" && p.to_string_lossy().contains("neighbor")
-            })
-            .collect();
-
-        if !gt_candidates.is_empty() {
-            println!("  Found potential ground truth:");
-            for (path, _, size) in &gt_candidates {
-                println!("    {} ({})", path.display(), format_size(*size));
-            }
-        }
-
-        if confirm("Compute KNN ground truth? (choose N to provide pre-computed)", true) {
-            (None, None)
+        if roles_accepted && detected.neighbor_indices.is_some() {
+            // Detected pre-computed ground truth — use it
+            let gt = detected.neighbor_indices.as_ref().unwrap().clone();
+            println!("  Using detected ground truth indices: {}", gt.display());
+            let gtd = if let Some(ref d) = detected.neighbor_distances {
+                println!("  Using detected ground truth distances: {}", d.display());
+                Some(d.clone())
+            } else {
+                None
+            };
+            (Some(gt), gtd)
         } else {
-            let gt = prompt_optional_path("Path to ground truth indices (ivec)");
-            let gtd = prompt_optional_path("Path to ground truth distances (fvec)");
-            (gt, gtd)
+            let gt_candidates: Vec<&(PathBuf, String, u64)> = candidates.iter()
+                .filter(|(p, fmt, _)| {
+                    fmt == "ivec" && p.to_string_lossy().contains("neighbor")
+                })
+                .collect();
+
+            if !gt_candidates.is_empty() {
+                println!("  Found potential ground truth:");
+                for (path, _, size) in &gt_candidates {
+                    println!("    {} ({})", path.display(), format_size(*size));
+                }
+            }
+
+            if confirm("Compute KNN ground truth? (choose N to provide pre-computed)", true) {
+                (None, None)
+            } else {
+                let gt = prompt_optional_path("Path to ground truth indices (ivec)");
+                let gtd = prompt_optional_path("Path to ground truth distances (fvec)");
+                (gt, gtd)
+            }
         }
     } else {
         println!("  No query vectors — skipping ground truth.");
@@ -679,6 +771,216 @@ fn check_vector_precision(label: &str, path: &Path) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
+// Filename-keyword role detection
+// ---------------------------------------------------------------------------
+
+/// Auto-detected file-to-role assignments based on filename keyword hints.
+///
+/// After `scan_candidates()` finds all recognized data files, `detect_roles()`
+/// examines each filename stem for keyword substrings and assigns files to
+/// dataset roles. This eliminates unstable multi-select prompts and makes
+/// `-y` (auto-accept) mode produce valid results when filenames contain
+/// conventional hints like `base`, `query`, `groundtruth`, etc.
+#[derive(Debug, Default)]
+struct DetectedRoles {
+    base_vectors: Option<PathBuf>,
+    query_vectors: Option<PathBuf>,
+    neighbor_indices: Option<PathBuf>,
+    neighbor_distances: Option<PathBuf>,
+    metadata: Option<PathBuf>,
+    metadata_predicates: Option<PathBuf>,
+    metadata_results: Option<PathBuf>,
+    filtered_neighbor_indices: Option<PathBuf>,
+    filtered_neighbor_distances: Option<PathBuf>,
+    unassigned: Vec<PathBuf>,
+}
+
+impl DetectedRoles {
+    /// Returns `true` if at least one role was detected.
+    fn any_detected(&self) -> bool {
+        self.base_vectors.is_some()
+            || self.query_vectors.is_some()
+            || self.neighbor_indices.is_some()
+            || self.neighbor_distances.is_some()
+            || self.metadata.is_some()
+            || self.metadata_predicates.is_some()
+            || self.metadata_results.is_some()
+            || self.filtered_neighbor_indices.is_some()
+            || self.filtered_neighbor_distances.is_some()
+    }
+
+    /// Print detected assignments for user confirmation.
+    fn print_summary(&self) {
+        if let Some(ref p) = self.base_vectors {
+            println!("  Base vectors:              {}", p.display());
+        }
+        if let Some(ref p) = self.query_vectors {
+            println!("  Query vectors:             {}", p.display());
+        }
+        if let Some(ref p) = self.neighbor_indices {
+            println!("  Neighbor indices (GT):     {}", p.display());
+        }
+        if let Some(ref p) = self.neighbor_distances {
+            println!("  Neighbor distances (GT):   {}", p.display());
+        }
+        if let Some(ref p) = self.metadata {
+            println!("  Metadata content:          {}", p.display());
+        }
+        if let Some(ref p) = self.metadata_predicates {
+            println!("  Metadata predicates:       {}", p.display());
+        }
+        if let Some(ref p) = self.metadata_results {
+            println!("  Metadata results:          {}", p.display());
+        }
+        if let Some(ref p) = self.filtered_neighbor_indices {
+            println!("  Filtered neighbor indices: {}", p.display());
+        }
+        if let Some(ref p) = self.filtered_neighbor_distances {
+            println!("  Filtered neighbor distances: {}", p.display());
+        }
+        for p in &self.unassigned {
+            println!("  (unassigned):              {}", p.display());
+        }
+    }
+}
+
+/// Vector format names for matching constraints.
+const VECTOR_FORMATS: &[&str] = &["fvec", "ivec", "mvec", "bvec", "dvec", "svec", "npy"];
+const FLOAT_VECTOR_FORMATS: &[&str] = &["fvec", "dvec", "mvec"];
+
+/// Detect file roles from filename keyword hints.
+///
+/// Examines each candidate's filename stem (lowercased, `_` prefix stripped)
+/// for keyword substrings and assigns it to a dataset role. If two files
+/// claim the same role, neither is assigned (ambiguous — the wizard falls
+/// through to manual selection for that role).
+fn detect_roles(candidates: &[(PathBuf, String, u64)]) -> DetectedRoles {
+    /// Role tag used during detection before resolving ambiguities.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Role {
+        BaseVectors,
+        QueryVectors,
+        NeighborIndices,
+        NeighborDistances,
+        MetadataContent,
+        MetadataPredicates,
+        MetadataResults,
+        FilteredNeighborIndices,
+        FilteredNeighborDistances,
+    }
+
+    let mut assignments: Vec<(Role, &PathBuf)> = Vec::new();
+    let mut unassigned: Vec<PathBuf> = Vec::new();
+
+    for (path, fmt, _) in candidates {
+        let stem = path.file_stem()
+            .map(|s| s.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        // Strip leading `_` prefix (source files renamed by prior import)
+        let stem = stem.strip_prefix('_').unwrap_or(&stem);
+        let fmt_str = fmt.as_str();
+        let is_vector = VECTOR_FORMATS.contains(&fmt_str);
+        let is_float_vector = FLOAT_VECTOR_FORMATS.contains(&fmt_str);
+        let is_ivec = fmt_str == "ivec";
+        let is_slab = fmt_str == "slab";
+        let is_slab_or_parquet = is_slab || fmt_str == "parquet";
+
+        // Split on common delimiters for word-boundary matching.
+        // This avoids false positives like "test" matching "base_test"
+        // or "gt" matching "lighgt".
+        let tokens: Vec<&str> = stem.split(|c: char| c == '_' || c == '-' || c == '.')
+            .filter(|s| !s.is_empty())
+            .collect();
+        let has_token = |keyword: &str| tokens.iter().any(|t| *t == keyword);
+        let has_token_or_substring = |keyword: &str| stem.contains(keyword);
+
+        // Some keywords are safe as substrings (long, unambiguous);
+        // short ones like "gt", "test" use token-boundary matching.
+        let has_filtered = has_token("filtered") || has_token("filter");
+        let has_indices = has_token("indices") || has_token_or_substring("neighbors")
+            || has_token("gt") || has_token_or_substring("groundtruth");
+        let has_distances = has_token_or_substring("distance");
+        let has_base = has_token("base") || has_token("train");
+        let has_query = has_token("query") || has_token("queries")
+            || has_token("test");
+        let has_metadata = has_token_or_substring("metadata") || has_token("content");
+        let has_predicates = has_token_or_substring("predicate");
+        let has_results = has_token_or_substring("result");
+
+        // Filtered variants take priority over non-filtered
+        let role = if has_filtered && has_indices && is_ivec {
+            Some(Role::FilteredNeighborIndices)
+        } else if has_filtered && has_distances && is_float_vector {
+            Some(Role::FilteredNeighborDistances)
+        } else if has_indices && !has_filtered && is_ivec {
+            Some(Role::NeighborIndices)
+        } else if has_distances && !has_filtered && !has_indices && is_float_vector {
+            Some(Role::NeighborDistances)
+        } else if has_predicates && is_slab {
+            Some(Role::MetadataPredicates)
+        } else if has_results && is_slab {
+            Some(Role::MetadataResults)
+        } else if has_metadata && !has_predicates && !has_results && is_slab_or_parquet {
+            Some(Role::MetadataContent)
+        } else if has_base && is_vector {
+            // "base" takes priority over "query"/"test" when both present
+            Some(Role::BaseVectors)
+        } else if has_query && is_vector {
+            Some(Role::QueryVectors)
+        } else {
+            None
+        };
+
+        match role {
+            Some(r) => assignments.push((r, path)),
+            None => unassigned.push(path.clone()),
+        }
+    }
+
+    // Resolve ambiguities: if two files claim the same role, neither wins.
+    let mut result = DetectedRoles::default();
+    let mut seen: std::collections::HashMap<u8, usize> = std::collections::HashMap::new();
+    for (i, (role, _)) in assignments.iter().enumerate() {
+        let key = *role as u8;
+        if seen.contains_key(&key) {
+            // Mark as ambiguous — we'll push both to unassigned
+            seen.insert(key, usize::MAX);
+        } else {
+            seen.insert(key, i);
+        }
+    }
+
+    for (i, (role, path)) in assignments.iter().enumerate() {
+        let key = *role as u8;
+        if seen.get(&key) == Some(&usize::MAX) {
+            // Ambiguous — push to unassigned
+            unassigned.push((*path).clone());
+            continue;
+        }
+        if seen.get(&key) != Some(&i) {
+            // Not the winner (shouldn't happen, but defensive)
+            unassigned.push((*path).clone());
+            continue;
+        }
+        let p = (*path).clone();
+        match role {
+            Role::BaseVectors => result.base_vectors = Some(p),
+            Role::QueryVectors => result.query_vectors = Some(p),
+            Role::NeighborIndices => result.neighbor_indices = Some(p),
+            Role::NeighborDistances => result.neighbor_distances = Some(p),
+            Role::MetadataContent => result.metadata = Some(p),
+            Role::MetadataPredicates => result.metadata_predicates = Some(p),
+            Role::MetadataResults => result.metadata_results = Some(p),
+            Role::FilteredNeighborIndices => result.filtered_neighbor_indices = Some(p),
+            Role::FilteredNeighborDistances => result.filtered_neighbor_distances = Some(p),
+        }
+    }
+
+    result.unassigned = unassigned;
+    result
+}
+
+// ---------------------------------------------------------------------------
 // File scanning
 // ---------------------------------------------------------------------------
 
@@ -899,5 +1201,151 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let results = scan_candidates(dir.path());
         assert!(results.is_empty());
+    }
+
+    // -- detect_roles tests ------------------------------------------------
+
+    /// Helper to build a candidate list from (filename, format) pairs.
+    fn make_candidates(items: &[(&str, &str)]) -> Vec<(PathBuf, String, u64)> {
+        items.iter()
+            .map(|(name, fmt)| (PathBuf::from(name), fmt.to_string(), 1024))
+            .collect()
+    }
+
+    #[test]
+    fn detect_roles_base_and_query() {
+        let candidates = make_candidates(&[
+            ("_base_test.mvec", "mvec"),
+            ("query_vectors.mvec", "mvec"),
+        ]);
+        let roles = detect_roles(&candidates);
+        assert_eq!(roles.base_vectors.as_deref(), Some(Path::new("_base_test.mvec")));
+        assert_eq!(roles.query_vectors.as_deref(), Some(Path::new("query_vectors.mvec")));
+        assert!(roles.unassigned.is_empty());
+    }
+
+    #[test]
+    fn detect_roles_gt_and_distances() {
+        let candidates = make_candidates(&[
+            ("groundtruth_indices.ivec", "ivec"),
+            ("distances.fvec", "fvec"),
+        ]);
+        let roles = detect_roles(&candidates);
+        assert_eq!(roles.neighbor_indices.as_deref(), Some(Path::new("groundtruth_indices.ivec")));
+        assert_eq!(roles.neighbor_distances.as_deref(), Some(Path::new("distances.fvec")));
+    }
+
+    #[test]
+    fn detect_roles_filtered_knn() {
+        let candidates = make_candidates(&[
+            ("filtered_neighbors.ivec", "ivec"),
+            ("filtered_distances.fvec", "fvec"),
+        ]);
+        let roles = detect_roles(&candidates);
+        assert_eq!(roles.filtered_neighbor_indices.as_deref(), Some(Path::new("filtered_neighbors.ivec")));
+        assert_eq!(roles.filtered_neighbor_distances.as_deref(), Some(Path::new("filtered_distances.fvec")));
+        // Should NOT be assigned to non-filtered roles
+        assert!(roles.neighbor_indices.is_none());
+        assert!(roles.neighbor_distances.is_none());
+    }
+
+    #[test]
+    fn detect_roles_metadata_vs_predicates() {
+        let candidates = make_candidates(&[
+            ("metadata_content.slab", "slab"),
+            ("predicates.slab", "slab"),
+        ]);
+        let roles = detect_roles(&candidates);
+        assert_eq!(roles.metadata.as_deref(), Some(Path::new("metadata_content.slab")));
+        assert_eq!(roles.metadata_predicates.as_deref(), Some(Path::new("predicates.slab")));
+    }
+
+    #[test]
+    fn detect_roles_metadata_results() {
+        let candidates = make_candidates(&[
+            ("metadata.slab", "slab"),
+            ("results.slab", "slab"),
+        ]);
+        let roles = detect_roles(&candidates);
+        assert_eq!(roles.metadata.as_deref(), Some(Path::new("metadata.slab")));
+        assert_eq!(roles.metadata_results.as_deref(), Some(Path::new("results.slab")));
+    }
+
+    #[test]
+    fn detect_roles_ambiguous_duplicate() {
+        let candidates = make_candidates(&[
+            ("base_v1.fvec", "fvec"),
+            ("base_v2.fvec", "fvec"),
+        ]);
+        let roles = detect_roles(&candidates);
+        // Neither should be assigned — both are ambiguous
+        assert!(roles.base_vectors.is_none(), "ambiguous base should be None");
+        assert_eq!(roles.unassigned.len(), 2);
+    }
+
+    #[test]
+    fn detect_roles_underscore_prefix_stripped() {
+        let candidates = make_candidates(&[
+            ("_base_test.mvec", "mvec"),
+        ]);
+        let roles = detect_roles(&candidates);
+        assert_eq!(roles.base_vectors.as_deref(), Some(Path::new("_base_test.mvec")));
+    }
+
+    #[test]
+    fn detect_roles_no_keywords() {
+        let candidates = make_candidates(&[
+            ("embeddings.fvec", "fvec"),
+            ("data.mvec", "mvec"),
+        ]);
+        let roles = detect_roles(&candidates);
+        assert!(!roles.any_detected());
+        assert_eq!(roles.unassigned.len(), 2);
+    }
+
+    #[test]
+    fn detect_roles_train_keyword() {
+        let candidates = make_candidates(&[
+            ("train_vectors.fvec", "fvec"),
+            ("test_queries.mvec", "mvec"),
+        ]);
+        let roles = detect_roles(&candidates);
+        assert_eq!(roles.base_vectors.as_deref(), Some(Path::new("train_vectors.fvec")));
+        assert_eq!(roles.query_vectors.as_deref(), Some(Path::new("test_queries.mvec")));
+    }
+
+    #[test]
+    fn detect_roles_gt_alias() {
+        let candidates = make_candidates(&[
+            ("gt_neighbors.ivec", "ivec"),
+        ]);
+        let roles = detect_roles(&candidates);
+        assert_eq!(roles.neighbor_indices.as_deref(), Some(Path::new("gt_neighbors.ivec")));
+    }
+
+    #[test]
+    fn detect_roles_format_constraints() {
+        // ivec file with "base" keyword should NOT match BaseVectors
+        // because ivec is typically indices, not vectors — but our format
+        // constraint allows it (ivec IS a vector format). This test
+        // documents the current behavior.
+        let candidates = make_candidates(&[
+            ("base_indices.ivec", "ivec"),
+        ]);
+        let roles = detect_roles(&candidates);
+        // ivec is in VECTOR_FORMATS, so "base" keyword matches BaseVectors
+        // unless "indices" keyword takes priority → NeighborIndices wins
+        // because has_indices is checked before has_base
+        assert_eq!(roles.neighbor_indices.as_deref(), Some(Path::new("base_indices.ivec")));
+        assert!(roles.base_vectors.is_none());
+    }
+
+    #[test]
+    fn detect_roles_parquet_metadata() {
+        let candidates = make_candidates(&[
+            ("metadata.parquet", "parquet"),
+        ]);
+        let roles = detect_roles(&candidates);
+        assert_eq!(roles.metadata.as_deref(), Some(Path::new("metadata.parquet")));
     }
 }

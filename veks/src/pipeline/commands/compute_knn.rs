@@ -1690,21 +1690,61 @@ where
     let base_end = base_offset + base_count;
     let mut partitions: Vec<PartitionMeta> = Vec::new();
     let mut part_start = base_offset;
+
+    // Scan for existing super-partitions (merged results from smaller profiles)
+    // that cover a prefix of the range. Use the largest available cached partition
+    // starting at part_start before falling back to partition_size chunks.
+    let find_largest_cached = |start: usize, max_end: usize| -> Option<usize> {
+        // Scan candidate endpoints: try the full remaining range first, then
+        // halve down to find the largest cached partition.
+        let mut try_end = max_end;
+        while try_end > start + partition_size {
+            let n_path = build_cache_path(
+                &ctx.cache, &cache_prefix, start, try_end, k, metric, "neighbors", "ivec",
+            );
+            let d_path = build_cache_path(
+                &ctx.cache, &cache_prefix, start, try_end, k, metric, "distances", "fvec",
+            );
+            let exists = if compress_cache {
+                crate::pipeline::gz_cache::gz_exists(&n_path)
+                    && crate::pipeline::gz_cache::gz_exists(&d_path)
+            } else {
+                validate_cache_file(&n_path, query_count, k, 4)
+                    && validate_cache_file(&d_path, query_count, k, 4)
+            };
+            if exists {
+                return Some(try_end);
+            }
+            // Try the next smaller multiple of partition_size
+            try_end = ((try_end - start - 1) / partition_size) * partition_size + start;
+            if try_end <= start { break; }
+        }
+        None
+    };
+
     while part_start < base_end {
-        let part_end = std::cmp::min(part_start + partition_size, base_end);
-        let neighbors_path = build_cache_path(
-            &ctx.cache, &cache_prefix, part_start, part_end, k, metric, "neighbors", "ivec",
-        );
-        let dist_cache_path = build_cache_path(
-            &ctx.cache, &cache_prefix, part_start, part_end, k, metric, "distances", "fvec",
-        );
-        let cached = if compress_cache {
-            crate::pipeline::gz_cache::gz_exists(&neighbors_path)
-                && crate::pipeline::gz_cache::gz_exists(&dist_cache_path)
-        } else {
-            validate_cache_file(&neighbors_path, query_count, k, 4)
-                && validate_cache_file(&dist_cache_path, query_count, k, 4)
-        };
+        // Check for a super-partition first
+        let (part_end, neighbors_path, dist_cache_path, cached) =
+            if let Some(super_end) = find_largest_cached(part_start, base_end) {
+                ctx.ui.log(&format!(
+                    "  reusing cached super-partition [{}, {}) from smaller profile",
+                    format_count(part_start), format_count(super_end),
+                ));
+                let n = build_cache_path(&ctx.cache, &cache_prefix, part_start, super_end, k, metric, "neighbors", "ivec");
+                let d = build_cache_path(&ctx.cache, &cache_prefix, part_start, super_end, k, metric, "distances", "fvec");
+                (super_end, n, d, true)
+            } else {
+                let pe = std::cmp::min(part_start + partition_size, base_end);
+                let n = build_cache_path(&ctx.cache, &cache_prefix, part_start, pe, k, metric, "neighbors", "ivec");
+                let d = build_cache_path(&ctx.cache, &cache_prefix, part_start, pe, k, metric, "distances", "fvec");
+                let c = if compress_cache {
+                    crate::pipeline::gz_cache::gz_exists(&n) && crate::pipeline::gz_cache::gz_exists(&d)
+                } else {
+                    validate_cache_file(&n, query_count, k, 4) && validate_cache_file(&d, query_count, k, 4)
+                };
+                (pe, n, d, c)
+            };
+
         partitions.push(PartitionMeta {
             start: part_start,
             end: part_end,
@@ -2040,6 +2080,31 @@ where
         &ctx.ui,
     ) {
         return error_result(format!("merge failed: {}", e), start);
+    }
+
+    // Save merged result as a cache partition covering the full range.
+    // This allows larger profiles to reuse this as a single "super-partition"
+    // instead of re-reading all the individual smaller partitions.
+    if num_partitions > 1 {
+        let full_neighbors = build_cache_path(
+            &ctx.cache, &cache_prefix, base_offset, base_end, k, metric, "neighbors", "ivec",
+        );
+        let full_distances = build_cache_path(
+            &ctx.cache, &cache_prefix, base_offset, base_end, k, metric, "distances", "fvec",
+        );
+        // Copy (or link) the final output to the cache as the full-range partition
+        if !full_neighbors.exists() {
+            let _ = std::fs::copy(indices_path, &full_neighbors);
+        }
+        if let Some(dp) = distances_path {
+            if !full_distances.exists() {
+                let _ = std::fs::copy(dp, &full_distances);
+            }
+        }
+        ctx.ui.log(&format!(
+            "  cached merged result as partition [{}, {}) for reuse by larger profiles",
+            format_count(base_offset), format_count(base_end),
+        ));
     }
 
     let mut produced = vec![indices_path.to_path_buf()];
@@ -2488,8 +2553,8 @@ mod tests {
             .collect();
         assert_eq!(
             cache_files.len(),
-            10, // 5 partitions x 2 files (ivec + fvec)
-            "expected 10 cache files, found {}",
+            12, // 5 partitions x 2 files (ivec + fvec) + 1 full-range super-partition x 2 files
+            "expected 12 cache files, found {}",
             cache_files.len()
         );
     }

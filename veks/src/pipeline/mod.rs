@@ -486,6 +486,7 @@ pub fn run_pipeline(args: RunArgs) {
         }
         names
     };
+    let cache_dir_for_guidance = cache_dir.clone();
     let mut ctx = StreamContext {
         dataset_name,
         profile: profile_name.clone(),
@@ -537,6 +538,10 @@ pub fn run_pipeline(args: RunArgs) {
         }
         Ok(summary) => {
             print_run_summary(&summary);
+            // Post-completion guidance about the cache directory
+            if summary.executed > 0 {
+                print_cache_guidance(&cache_dir_for_guidance, &pipeline_dag.steps);
+            }
         }
     }
 
@@ -585,6 +590,74 @@ fn print_run_summary(summary: &runner::RunSummary) {
             summary.executed,
             summary.total_elapsed.as_secs_f64(),
         );
+    }
+}
+
+/// Print post-completion guidance about the cache directory.
+///
+/// Informs the user that `.cache/` contains intermediate artifacts that are
+/// expensive to recompute, and suggests `veks datasets cache-compress` if
+/// the pipeline was not already configured with `compress_cache: true`.
+fn print_cache_guidance(cache_dir: &std::path::Path, steps: &[dag::ResolvedStep]) {
+    use crate::term;
+
+    // Check if any step has compress_cache enabled
+    let has_compress = steps.iter().any(|s| {
+        s.def.options.get("compress_cache")
+            .and_then(|v| v.as_str())
+            .map(|v| v == "true")
+            .unwrap_or(false)
+    });
+
+    // Calculate cache size
+    let cache_size = dir_size_recursive(cache_dir);
+    let size_str = if cache_size > 0 {
+        format!(" ({})", format_bytes(cache_size))
+    } else {
+        String::new()
+    };
+
+    println!();
+    println!("{}", term::bold("Next steps:"));
+    println!("  The {} directory{} contains intermediate artifacts.",
+        cache_dir.file_name().unwrap_or_default().to_string_lossy(),
+        size_str,
+    );
+    println!("  Removing it is safe but may require expensive recomputation,");
+    println!("  especially for large datasets (KNN ground truth, sorted runs).");
+    if !has_compress {
+        println!();
+        println!("  To reduce cache size, run:");
+        println!("    {}", term::ok("veks datasets cache-compress"));
+    }
+}
+
+/// Recursively calculate the total size of files in a directory.
+fn dir_size_recursive(dir: &std::path::Path) -> u64 {
+    let mut total = 0u64;
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                total += dir_size_recursive(&path);
+            } else if let Ok(meta) = std::fs::metadata(&path) {
+                total += meta.len();
+            }
+        }
+    }
+    total
+}
+
+/// Format a byte count as human-readable.
+fn format_bytes(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 * 1024 {
+        format!("{:.1} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+    } else if bytes >= 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else if bytes >= 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{} B", bytes)
     }
 }
 

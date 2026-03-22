@@ -456,7 +456,7 @@ impl RenderState {
         let has_extra = !self.alert.is_empty() || !self.extra_budget.is_empty();
         let extra_line = if has_extra { 1u16 } else { 0 };
         let chart_lines = if !self.resource_status.is_empty() && self.rss_history.data.len() >= 2 {
-            10u16 // min chart height
+            10u16 // base chart height (capped at render time)
         } else {
             0
         };
@@ -1018,7 +1018,10 @@ fn draw_progress<B: ratatui::backend::Backend>(
             constraints.push(Constraint::Length(1));
         }
         if has_resource_chart {
-            constraints.push(Constraint::Min(10));
+            // Cap metrics chart: 10 lines or 1/4 of vertical space, whichever is more
+            let quarter = area.height / 4;
+            let chart_height = quarter.max(10).min(area.height.saturating_sub(8));
+            constraints.push(Constraint::Length(chart_height));
         }
         if state.paused {
             constraints.push(Constraint::Length(1)); // paused indicator
@@ -1728,13 +1731,20 @@ fn format_rate(rps: f64, unit: &str) -> String {
     } else if rps >= 1.0 {
         format!("{:.0} {}/s", rps, unit)
     } else if rps > 0.0 {
+        // Inverted rate: show time per unit (e.g., "14.6s /step").
+        // The space before the slash prevents visual misreading — without
+        // it "14.6s/steps" scans as "14.6 steps/s" at a glance.
+        // Also singularize the unit ("step" not "steps") since it's per-one.
         let spt = 1.0 / rps;
+        let singular = unit.strip_suffix('s')
+            .filter(|_| unit.len() > 1 && unit != "bytes")
+            .unwrap_or(unit);
         if spt >= 3600.0 {
-            format!("{:.0}h/{}", spt / 3600.0, unit)
+            format!("{:.0}h /{}", spt / 3600.0, singular)
         } else if spt >= 60.0 {
-            format!("{:.1}m/{}", spt / 60.0, unit)
+            format!("{:.1}m /{}", spt / 60.0, singular)
         } else {
-            format!("{:.1}s/{}", spt, unit)
+            format!("{:.1}s /{}", spt, singular)
         }
     } else {
         String::new()
@@ -1804,11 +1814,11 @@ mod tests {
         assert_eq!(format_rate(2_300_000.0, "rec"), "2.3M rec/s");
         assert_eq!(format_rate(1_200_000_000.0, "rec"), "1.2G rec/s");
 
-        // Sub-1/s: flips to seconds per record
-        assert_eq!(format_rate(0.5, "rec"), "2.0s/rec");
-        assert_eq!(format_rate(0.1, "rec"), "10.0s/rec");
-        assert_eq!(format_rate(1.0 / 90.0, "rec"), "1.5m/rec");
-        assert_eq!(format_rate(1.0 / 7200.0, "rec"), "2h/rec");
+        // Sub-1/s: flips to time per unit with space before slash
+        assert_eq!(format_rate(0.5, "rec"), "2.0s /rec");
+        assert_eq!(format_rate(0.1, "rec"), "10.0s /rec");
+        assert_eq!(format_rate(1.0 / 90.0, "rec"), "1.5m /rec");
+        assert_eq!(format_rate(1.0 / 7200.0, "rec"), "2h /rec");
 
         // Zero: empty
         assert_eq!(format_rate(0.0, "rec"), "");
@@ -1816,7 +1826,9 @@ mod tests {
         // Custom units
         assert_eq!(format_rate(42.0, "files"), "42 files/s");
         assert_eq!(format_rate(1_500.0, "chunks"), "1.5K chunks/s");
-        assert_eq!(format_rate(0.5, "vectors"), "2.0s/vectors");
+        // Plural unit is singularized in inverted format
+        assert_eq!(format_rate(0.5, "vectors"), "2.0s /vector");
+        assert_eq!(format_rate(0.5, "steps"), "2.0s /step");
     }
 
     #[test]

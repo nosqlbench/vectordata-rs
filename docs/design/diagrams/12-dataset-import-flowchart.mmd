@@ -1,0 +1,124 @@
+flowchart TD
+    %% ── Inputs (user-provided) ───────────────────────────────────
+    SRC_VEC[/"vector source"/]:::input
+    SRC_QUERY[/"query source<br/>Option"/]:::input
+    SRC_META[/"metadata source<br/>Option"/]:::input
+    SRC_GT[/"ground truth<br/>Option"/]:::input
+
+    %% ── Vector chain ─────────────────────────────────────────────
+    SRC_VEC --> FETCH["fetch_vectors<br/><i>Identity if no URL</i>"]:::slot
+    FETCH --> IMPORT_V["import_vectors<br/><i>Identity if native xvec<br/>(symlinked when possible)</i>"]:::slot
+    IMPORT_V --> ALL_V["all_vectors"]:::artifact
+
+    ALL_V --> CONV_BASE["convert_base_precision<br/><i>Identity if no conversion<br/>requested; up-convert or<br/>down-convert via IEEE 754</i>"]:::slot
+    CONV_BASE --> CONV_V["converted_vectors<br/>(or alias to all_vectors)"]:::artifact
+
+    CONV_V --> SORT["compute dedup<br/><i>lexicographic external<br/>merge-sort + duplicate<br/>detection as byproduct</i>"]:::slot
+    SORT --> SORTED["sorted_ordinals"]:::artifact
+    SORT --> DUPS["duplicate_ordinals"]:::artifact
+
+    SORTED --> ZERO["analyze zeros<br/><i>binary search sorted<br/>index for [0,0,...,0]</i>"]:::slot
+    CONV_V --> ZERO
+    ZERO --> ZEROS["zero_ordinals"]:::artifact
+
+    SORTED --> CLEAN["clean_ordinals<br/><i>Identity if no dups<br/>and no zeros</i>"]:::slot
+    DUPS --> CLEAN
+    ZEROS --> CLEAN
+    CLEAN --> CLEAN_ORD["clean_ordinals"]:::artifact
+    CLEAN_ORD --> SET_CC["clean_count<br/>set variable"]:::slot
+
+    %% ── Query chain ──────────────────────────────────────────────
+    SRC_QUERY --> IMPORT_Q["import_query<br/><i>Identity if native xvec<br/>(symlinked when possible)</i>"]:::slot
+
+    SET_CC --> SHUFFLE["shuffle<br/><i>Identity if separate query</i>"]:::slot
+    CONV_V --> EXT_Q["extract_query<br/><i>Identity if separate query<br/>normalize option</i>"]:::slot
+    CLEAN_ORD --> EXT_Q
+    SHUFFLE --> EXT_Q
+    IMPORT_Q --> QUERY_V
+
+    EXT_Q --> QUERY_RAW["query_vectors<br/>(pre-convert)"]:::artifact
+    QUERY_RAW --> CONV_Q["convert_query_precision<br/><i>Identity if no conversion</i>"]:::slot
+    CONV_Q --> QUERY_V["query_vectors"]:::artifact
+
+    CONV_V --> EXT_B["extract_base<br/><i>Identity if not self-search<br/>normalize option</i>"]:::slot
+    CLEAN_ORD --> EXT_B
+    SHUFFLE --> EXT_B
+    EXT_B --> BASE_V["base_vectors"]:::artifact
+    BASE_V --> SET_BC["base_count<br/><i>Identity if not self-search</i>"]:::slot
+
+    %% ── Metadata chain (entire subgraph Absent when no metadata) ─
+    SRC_META --> IMPORT_M["import_metadata<br/><i>Identity if native slab</i>"]:::slot
+    IMPORT_M --> META_ALL["metadata_all"]:::artifact
+
+    META_ALL --> EXT_META["extract_metadata<br/><i>Identity if not self-search<br/>uses clean_ordinals + shuffle</i>"]:::slot
+    CLEAN_ORD --> EXT_META
+    SHUFFLE --> EXT_META
+    EXT_META --> META_ALIGNED["metadata_content<br/>(ordinal-aligned)"]:::artifact
+
+    META_ALL --> SURVEY["survey"]:::slot
+    SURVEY --> SYNTH["synthesize predicates"]:::slot
+    META_ALL --> SYNTH
+    SYNTH --> PREDS["predicates.slab"]:::artifact
+
+    PREDS --> EVAL["compute predicates<br/><i>per_profile</i>"]:::slot
+    META_ALIGNED --> EVAL
+    EVAL --> PRED_IDX["metadata_indices"]:::artifact
+
+    %% ── Ground truth chain ───────────────────────────────────────
+    SRC_GT --> KNN
+    SET_BC --> KNN["compute knn<br/><i>Identity if GT provided<br/>Absent if no queries<br/>--compress-cache for partitions</i>"]:::slot
+    QUERY_V --> KNN
+    BASE_V --> KNN
+    KNN --> GT["neighbor_indices<br/>neighbor_distances"]:::artifact
+
+    PRED_IDX --> FKNN["compute filtered-knn<br/><i>Absent if no metadata<br/>or --no-filtered<br/>--compress-cache for partitions</i>"]:::slot
+    SET_BC --> FKNN
+    QUERY_V --> FKNN
+    BASE_V --> FKNN
+    FKNN --> FGT["filtered_neighbor_indices<br/>filtered_neighbor_distances"]:::artifact
+
+    %% ── Verification chain ───────────────────────────────────────
+    GT --> VKNN["verify knn<br/><i>per_profile<br/>sparse-sample brute-force<br/>recomputation</i>"]:::slot
+    BASE_V --> VKNN
+    QUERY_V --> VKNN
+    VKNN --> VKNN_RPT["${cache}/profiles/${profile}/\nverify_knn.json"]:::artifact
+
+    FGT --> VPRED["verify predicates<br/><i>per_profile<br/>SQLite-backed sparse-sample<br/>evaluation</i>"]:::slot
+    META_ALIGNED --> VPRED
+    PREDS --> VPRED
+    PRED_IDX --> VPRED
+    VPRED --> VPRED_RPT["${cache}/profiles/${profile}/\nverify_predicates.json"]:::artifact
+
+    %% ── Merkle hash trees (final pipeline step) ───────────────────
+    VKNN_RPT --> MERKLE["merkle create<br/><i>always last step<br/>produces .mref files</i>"]:::slot
+    VPRED_RPT --> MERKLE
+    GT --> MERKLE
+    FGT --> MERKLE
+    MERKLE --> MREF[".mref files"]:::artifact
+
+    %% ── Catalog generation (final step) ──────────────────────────
+    MREF --> CATGEN["catalog generate<br/><i>always last step<br/>produces catalog.json +<br/>catalog.yaml</i>"]:::slot
+    CATGEN --> CATFILES["catalog.json<br/>catalog.yaml"]:::artifact
+
+    %% ── Cache compression (offline, post-pipeline) ───────────────
+    GT -.-> CACHE_CMP["cache-compress<br/><i>offline retroactive<br/>compression of eligible<br/>cache artifacts</i>"]:::offline
+    FGT -.-> CACHE_CMP
+    SORTED -.-> CACHE_CMP
+
+    %% ── Profile assembly ─────────────────────────────────────────
+    BASE_V --> PROF[/"dataset.yaml<br/>profiles"/]:::output
+    QUERY_V --> PROF
+    META_ALIGNED --> PROF
+    PREDS --> PROF
+    GT --> PROF
+    FGT --> PROF
+    PRED_IDX --> PROF
+    VKNN_RPT --> PROF
+    VPRED_RPT --> PROF
+
+    %% ── Styling ──────────────────────────────────────────────────
+    classDef input fill:#e1f5fe,stroke:#0288d1,stroke-width:2px
+    classDef slot fill:#fff3e0,stroke:#ef6c00,stroke-dasharray:5 5
+    classDef artifact fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+    classDef output fill:#f3e5f5,stroke:#7b1fa2,stroke-width:2px
+    classDef offline fill:#fce4ec,stroke:#c62828,stroke-dasharray:3 3

@@ -233,6 +233,9 @@ fn print_pipeline_help(registry: &CommandRegistry, group: Option<&str>) {
                 println!();
             }
             println!("Use 'veks pipeline <group> <command> --help' for detailed command documentation.");
+            println!();
+            println!("Tip: Distinct commands can be invoked directly, e.g., 'veks import' instead");
+            println!("of 'veks prepare import'. Double-tap Tab to see the expanded command list.");
         }
         Some(g) => {
             if let Some(commands) = groups.get(g) {

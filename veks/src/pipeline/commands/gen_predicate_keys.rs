@@ -310,9 +310,36 @@ fn plan_segments(
     let mut segments = Vec::new();
     let mut seg_start: i64 = first_ordinal;
 
+    // Scan for super-segments from smaller profiles: look for cached segments
+    // covering a larger range than segment_size, starting at seg_start.
+    let find_largest_cached_segment = |start: i64, max_end: i64, dir: &Path| -> Option<i64> {
+        let mut try_end = max_end;
+        while try_end > start + segment_size as i64 {
+            let path = dir.join(format!(
+                "{}.seg_{:010}_{:010}.predkeys.slab",
+                cache_prefix, start, try_end,
+            ));
+            if is_cache_valid(&path, pred_count, compress_cache) {
+                return Some(try_end);
+            }
+            // Step down by segment_size
+            try_end = ((try_end - start - 1) / segment_size as i64) * segment_size as i64 + start;
+            if try_end <= start { break; }
+        }
+        None
+    };
+
     while (seg_start as u64) < end_ordinal {
-        let seg_end = ((seg_start as u64) + segment_size as u64)
-            .min(end_ordinal) as i64;
+        // Check for super-segment first
+        let seg_end = if let Some(dir) = cache_dir {
+            if let Some(super_end) = find_largest_cached_segment(seg_start, end_ordinal as i64, dir) {
+                super_end
+            } else {
+                ((seg_start as u64) + segment_size as u64).min(end_ordinal) as i64
+            }
+        } else {
+            ((seg_start as u64) + segment_size as u64).min(end_ordinal) as i64
+        };
 
         // First page: last page with start_ordinal <= seg_start (contains seg_start).
         let ps = page_entries.partition_point(|e| e.start_ordinal <= seg_start);
@@ -1651,6 +1678,21 @@ sweep.
 
         if let Err(e) = writer.finish() {
             return error_result(format!("finish error: {}", e), start);
+        }
+
+        // Save merged result as a cache super-segment for reuse by larger profiles
+        if segments.len() > 1 {
+            let super_path = cache_dir.join(format!(
+                "{}.seg_{:010}_{:010}.predkeys.slab",
+                cache_prefix, effective_start, effective_end,
+            ));
+            if !super_path.exists() {
+                let _ = std::fs::copy(&output_path, &super_path);
+                ctx.ui.log(&format!(
+                    "  cached merged result as segment [{}, {}) for reuse by larger profiles",
+                    effective_start, effective_end,
+                ));
+            }
         }
 
         let avg_matches = if pred_len > 0 {

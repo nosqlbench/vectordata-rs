@@ -443,7 +443,14 @@ impl<'de> Deserialize<'de> for DSProfile {
 /// - Geometric: `"mul:1m..400m/2"` → compound by factor: start, start×2, start×4, ... (factor can be fractional)
 ///
 /// The profile name is generated from the count using `format_count_with_suffix`.
-fn parse_sized_entry(entry: &str) -> Result<Vec<(String, u64)>, String> {
+/// Parse a sized entry into `(name, base_count)` pairs.
+///
+/// Supported forms:
+/// - `"10m"` → single profile with 10M vectors
+/// - `"100m..400m/100m"` → range with step
+/// - `"mul:1m..400m/2"` → multiplicative range
+/// - `"fib:1m..400m"` → fibonacci range
+pub fn parse_sized_entry(entry: &str) -> Result<Vec<(String, u64)>, String> {
     let entry = entry.trim();
 
     // Check for series generator prefixes

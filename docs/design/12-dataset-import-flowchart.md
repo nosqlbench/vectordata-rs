@@ -98,12 +98,21 @@ the superset graph and its resolution rule.
 | `zero_check` | Ordinals | `--no-zero-check` | `analyze zeros` — binary search the lexicographically sorted ordinal index for the zero vector `[0,0,...,0]` |
 | `clean_ordinals` | Ordinals | No sort and no zero-check | `transform clean-ordinals` — combine duplicate + zero exclusion ordinals, filter the sorted index to produce the clean ordinal set used by shuffle and extraction |
 
-### Count slots
+### Count and statistics slots
 
 | Slot | Type | Identity when | Materialized as |
 |------|------|---------------|-----------------|
-| `clean_count` | Variable | Always needed | `set variable` on clean_ordinals |
+| `vector_count` | Variable | Always materialized | `set variable` — record count of all_vectors |
+| `duplicate_count` | Variable | `--no-dedup` | `set variable` — record count of dedup_duplicates.ivec (number of elided duplicates) |
+| `zero_count` | Variable | `--no-zero-check` | `set variable` — record count of zero_ordinals.ivec (number of zero vectors removed) |
+| `clean_count` | Variable | Always needed when dedup or zero-check active | `set variable` on clean_ordinals |
 | `base_count` | Variable | No self-search (base = all_vectors) | `set variable` on base_vectors |
+
+All count/statistics variables are persisted to `variables.yaml` and
+available to downstream steps via `${name}` interpolation. After a
+pipeline run, `variables.yaml` contains a complete record of dataset
+statistics including `vector_count`, `duplicate_count`, `zero_count`,
+`clean_count`, and (if self-search) `base_count`.
 
 ### Query slots
 
@@ -549,9 +558,12 @@ slot, regardless of whether it is `Materialized` or `Identity`.
 
 | Option | Type | Description |
 |--------|------|-------------|
-| `--name` | string | Dataset name (required) |
-| `-o, --output` | path | Output directory (required) |
+| `--name` | string | Dataset name (required unless `--interactive`) |
+| `-o, --output` | path | Output directory (required unless `--interactive`) |
 | `-i, --interactive` | flag | Launch interactive wizard mode |
+| `-y, --yes` | flag | Accept all wizard defaults without prompting (use with `-i`) |
+| `-r, --restart` | flag | Remove dataset.yaml, variables.yaml, and progress log before proceeding (implies `--force`) |
+| `--auto` | flag | Fully automatic mode — implies `-i -r -y`. Detects file roles by filename keywords, accepts all defaults, starts fresh. Refuses to continue if any candidate file cannot be assigned a role (see §12.16). |
 | `--base-vectors` | path | Base vector source (file or directory) |
 | `--query-vectors` | path | Separate query vectors (file or directory) |
 | `--self-search` | flag | Extract queries from base via shuffle (default when no `--query-vectors`) |
@@ -569,11 +581,10 @@ slot, regardless of whether it is `Materialized` or `Identity`.
 | `--normalize` | flag | L2-normalize vectors during extraction |
 | `--compress-cache` | flag | Enable gzip compression for eligible cache artifacts (default: true) |
 | `--force` | flag | Overwrite existing dataset.yaml |
-| `--restart` | flag | Remove dataset.yaml, variables.yaml, and progress log before proceeding (implies --force) |
-| `-y, --yes` | flag | Accept all wizard defaults without prompting (use with -i) |
 
 ### Implied defaults
 
+- `--auto` → `-i -r -y` (interactive + restart + auto-accept)
 - `--base-vectors` without `--query-vectors` → self-search mode
 - `--metadata` present → full predicate chain unless `--no-filtered`
 - `--ground-truth` → KNN slot collapses to Identity (alias to provided files)
@@ -612,9 +623,25 @@ Non-interactive generation using all default answers, suitable for
 scripting or when the source data is well-understood.
 
 **Preconditions**: source data files present in working directory
-**Invocation**: `veks datasets import -i -y` (or `-i -y --restart`)
+**Invocation**: `veks datasets import -i -y` (or `-iry`)
 **Behavior**: runs the wizard with all prompts returning their default
 values. Still prints each decision to stderr for auditability.
+
+### Scenario 3a: Fully automatic — `--auto`
+
+One-command dataset bootstrap. Detects file roles by filename keywords,
+auto-accepts all defaults, and starts fresh.
+
+**Preconditions**: source data files in working directory with
+recognizable role keywords in filenames (see §12.16)
+**Invocation**: `veks datasets import --auto`
+**Behavior**: equivalent to `-iry` but additionally enforces that every
+candidate data file in the directory has a recognized role assignment.
+If any file cannot be mapped to a role, the command refuses to continue
+and prints a table of recognized keywords so the user can rename files.
+Source files are automatically renamed with a `_` prefix (the default
+source-location option). This is the recommended mode for directories
+that follow the naming conventions.
 
 ### Scenario 4: CLI flags — fully explicit
 
@@ -667,13 +694,47 @@ steps.
 ## 12.10 Interactive Wizard
 
 The `--interactive` flag launches a guided import wizard that walks the
-user through each decision point. The wizard:
+user through each decision point.
+
+### 12.10.1 Reasonable-Default Requirement
+
+**Every interactive prompt MUST provide a reasonable default value that
+produces a correct result when auto-accepted.** This is a normative
+requirement: the interactive wizard is the backbone of `--auto` mode,
+which runs the wizard with all prompts returning their defaults. If any
+prompt's default produces an invalid or incomplete result, `--auto` mode
+is broken. Specifically:
+
+- Every yes/no confirmation must have a default (Y or N) that produces
+  the correct pipeline for the most common case.
+- Every multiple-choice prompt must have a default selection that is
+  stable — it must not depend on the ordering of candidates, which may
+  vary between runs.
+- When filename-keyword role detection assigns a file to a role, that
+  assignment becomes the default for the corresponding prompt, bypassing
+  unstable multi-select menus.
+- The default for source-file location is "rename with `_` prefix"
+  (option 1), ensuring source files are marked as non-publishable.
+
+This requirement ensures that the interactive wizard, auto-accept mode
+(`-iy`), and fully automatic mode (`--auto`) produce identical results
+for the same input files, differing only in whether the user is prompted
+to confirm each step.
+
+### 12.10.2 Wizard Flow
+
+The wizard proceeds through these phases:
 
 1. **Scans the working directory** for recognized data files (xvec,
    npy, parquet, slab) and presents detected candidates.
-2. **Prompts for each option** incrementally, with sensible defaults
-   derived from detected files.
-3. **Precision confirmation**: for floating-point xvec sources (fvec,
+2. **Filename-keyword role detection** (§12.16): examines each
+   candidate's filename for role-hinting keywords and presents a
+   single confirmation prompt for all detected assignments. In
+   `--auto` mode, unrecognized files cause a hard stop with guidance.
+3. **Prompts for each option** incrementally, with sensible defaults
+   derived from detected files. When role detection has assigned a
+   file, the corresponding prompt is pre-filled and skips multi-select.
+4. **Precision confirmation**: for floating-point xvec sources (fvec,
    mvec, dvec), the wizard probes the file and displays its current
    precision (element size, dimensions, record count), then asks whether
    the user wants to keep the native precision or convert:
@@ -683,21 +744,40 @@ user through each decision point. The wizard:
    - **Down-convert** (e.g., f32→f16): warns that this is lossy with
      IEEE 754 round-to-nearest-even semantics and values outside the
      target range saturate to ±Inf; emits a `convert` step.
-4. **Normalization detection**: samples vectors and reports mean L2 norm.
+5. **Normalization detection**: samples vectors and reports mean L2 norm.
    If not normalized, offers to add `--normalize` to extraction steps.
-5. **Cache compression**: asks whether to enable gzip compression for
+6. **Cache compression**: asks whether to enable gzip compression for
    eligible cache artifacts (default: yes). This adds `compress_cache:
    true` to pipeline steps that produce sequential-only intermediates.
-6. **Displays a summary** of all resolved options and asks for
+7. **Displays a summary** of all resolved options and asks for
    confirmation before generating `dataset.yaml`.
 
 The wizard produces the same `ImportArgs` struct as the CLI flags,
 including `base_convert_format` and `query_convert_format` when
 precision conversion is requested.
 
+### 12.10.3 Import Provenance Log
+
+When `datasets import` generates a `dataset.yaml`, it also writes a
+provenance entry to `dataset.log` in the output directory. This entry
+records:
+
+- **Timestamp** of the import
+- **All input arguments**: paths, flags, metric, seed, etc.
+- **Detected starting scenario**: a human-readable label describing the
+  combination of inputs (e.g., "full (base + query + metadata, compute
+  GT)" or "base vectors only (no queries, no metadata)")
+- **Dataflow graph entry points**: the resolution of every slot
+  (Materialized, Identity, or Absent) with output paths
+
+This ensures that `dataset.log` provides a complete audit trail from
+the moment of import, before any pipeline step has run. Subsequent
+pipeline runs append their own entries (step outcomes, timing, errors)
+to the same file.
+
 ---
 
-## 12.10 Precision Conversion
+## 12.11 Precision Conversion
 
 The `convert_base_precision` and `convert_query_precision` slots handle
 element type conversion between the six xvec floating-point and integer
@@ -740,7 +820,7 @@ formats:
 
 ---
 
-## 12.11 Zero-Length Intermediate Products
+## 12.12 Zero-Length Intermediate Products
 
 A pipeline step may legitimately produce a **zero-byte output file**.
 This is a defined result, not an error condition. Examples:
@@ -762,7 +842,7 @@ before relying on `dim`.
 
 ---
 
-## 12.12 Import Optimizations
+## 12.13 Import Optimizations
 
 ### Symlink fast path
 
@@ -836,7 +916,7 @@ KNN partition cache keys are derived from `base_stem.query_stem.range.k.metric`
 
 ---
 
-## 12.12 Output Convention
+## 12.14 Output Convention
 
 Resolved artifact paths follow the workspace layout (§5.7):
 
@@ -853,8 +933,8 @@ Resolved artifact paths follow the workspace layout (§5.7):
 | Shuffle permutation | `${cache}/shuffle.ivec` | cache |
 | Imported metadata | `${cache}/metadata_all.slab` | cache |
 | Metadata survey | `${cache}/metadata_survey.json` | cache |
-| Base vectors | `profiles/base/base_vectors.mvec` | final |
-| Query vectors | `profiles/base/query_vectors.mvec` | final |
+| Base vectors | `profiles/base/base_vectors.<ext>` | final |
+| Query vectors | `profiles/base/query_vectors.<ext>` | final |
 | Metadata content | `profiles/base/metadata_content.slab` | final |
 | Predicates | `predicates.slab` | final |
 | KNN indices | `profiles/${profile}/neighbor_indices.ivec` | final |
@@ -865,16 +945,61 @@ Resolved artifact paths follow the workspace layout (§5.7):
 | KNN verification report | `${cache}/profiles/${profile_name}/verify_knn.json` | cache |
 | Predicate verification report | `${cache}/profiles/${profile_name}/verify_predicates.json` | cache |
 
+### 12.14.1 The `profiles/base/` Directory
+
+The `profiles/base/` directory is the **canonical location for
+full-dataset artifacts** that are shared by all profiles. Named
+profiles (e.g., `default`, `10m`, `50m`) reference these base
+artifacts, potentially with range windows (e.g.,
+`profiles/base/base_vectors.mvec[0..10000000)`).
+
+All profile view paths in `dataset.yaml` point into this canonical
+structure — never to raw source file paths. This ensures:
+
+- **Consistent layout**: every dataset has the same directory structure
+  regardless of how it was created (self-search vs. separate query,
+  native format vs. imported).
+- **Clean publishing**: all publishable data lives under `profiles/`
+  and the dataset root. Source files with `_` prefix are excluded.
+- **Symlink transparency**: when a source file requires no conversion,
+  `profiles/base/<facet>.<ext>` is a symlink to the source. This
+  avoids copying while maintaining the canonical layout.
+
+### 12.14.2 Symlink Semantics
+
+When a source file is already in native format and no transformation
+is needed (Identity resolution), the import command creates a symlink
+at the canonical `profiles/base/` location pointing to the source file:
+
+```
+profiles/base/base_vectors.mvec  →  _base_vectors.mvec
+profiles/base/query_vectors.fvec →  _query_vectors.fvec
+profiles/base/metadata_content.slab → _metadata.slab
+```
+
+When the pipeline runs an extract or import step (Materialized
+resolution), the step writes a real file at the canonical path and
+no symlink is needed.
+
+**Publishing and transport**: Symlinks are **not preserved** through
+any transport or publishing mechanism. Publishing tools (rsync, S3
+upload, archive creation) MUST resolve symlinks and copy the actual
+data. The `_`-prefixed source files are excluded from publishing by
+convention (the `_` prefix marks non-publishable files). Since
+publishing resolves symlinks to real data, the published dataset
+contains only real files at the canonical paths — consumers never see
+symlinks.
+
 ---
 
-## 12.13 Post-Pipeline Verification
+## 12.15 Post-Pipeline Verification
 
 After the compute phases produce KNN ground truth and predicate answer
 keys, two verification pipeline phases perform sparse-sample spot-checks
 to confirm correctness. These are the last steps in the pipeline before
 the dataset is considered publication-ready.
 
-### 12.13.1 KNN Verification (`verify knn`)
+### 12.15.1 KNN Verification (`verify knn`)
 
 Recomputes brute-force exact KNN for a sparse random sample of query
 vectors and compares against the stored ground-truth results. This
@@ -943,7 +1068,7 @@ errors, and distance function mismatches.
 | `phi` | float | 0.001 | Distance tolerance for tie detection |
 | `output` | Path | required | Verification report (JSON) |
 
-### 12.13.2 Predicate Verification (`verify predicates`)
+### 12.15.2 Predicate Verification (`verify predicates`)
 
 Evaluates a sparse random sample of predicates against the full metadata
 set using SQLite as an independent source of truth, and compares the
@@ -1037,7 +1162,7 @@ the predicate evaluator or the metadata import.
 | `query` | Path | optional | Query vectors (for filtered KNN cross-check) |
 | `metric` | enum | L2 | Distance metric (for filtered KNN cross-check) |
 
-### 12.13.3 Design Rationale
+### 12.15.3 Design Rationale
 
 **Why sparse sampling?** Full recomputation of all queries against all
 base vectors is prohibitively expensive for large datasets (407M × 10K
@@ -1061,3 +1186,136 @@ run on fewer queries. Reusing the partitioned computation, SIMD distance
 functions, and governor controls means verification benefits from the
 same optimizations and runs within the same resource constraints as the
 original pipeline.
+
+---
+
+## 12.16 Filename-Keyword Role Detection
+
+The import wizard classifies candidate data files into dataset roles
+based on keyword substrings in their filenames. This eliminates
+unstable multi-select prompts and makes auto-accept mode (`-y`) and
+fully automatic mode (`--auto`) produce valid results when filenames
+follow conventional naming.
+
+### 12.16.1 Detection Algorithm
+
+After `scan_candidates()` finds all recognized data files in the
+working directory, `detect_roles()` examines each file's **stem**
+(filename without extension, lowercased) for keyword substrings and
+assigns it to a `StandardFacet` role.
+
+**Preprocessing:**
+- The filename stem is lowercased.
+- A leading `_` prefix is stripped before matching. This ensures that
+  source files renamed by a prior import (e.g., `_base_vectors.mvec`)
+  are still recognized.
+- The stem is split on delimiters (`_`, `-`, `.`) into tokens for
+  word-boundary matching.
+
+**Matching modes:**
+- **Token match**: short, ambiguous keywords (`base`, `train`, `query`,
+  `test`, `gt`, `content`, `filter`, `filtered`) are matched as whole
+  tokens only (delimited by `_`, `-`, `.`). This prevents false
+  positives like `test` matching inside `base_test` or `gt` matching
+  inside `weight`.
+- **Substring match**: longer, unambiguous keywords (`groundtruth`,
+  `metadata`, `neighbors`, `predicate`, `distance`, `result`) are
+  matched as substrings of the full stem.
+
+### 12.16.2 Role Assignment Rules
+
+Detection is evaluated top-to-bottom; the first matching rule wins.
+Filtered variants take priority over non-filtered. Within the vector
+roles, `base` takes priority over `query`/`test` when both keywords
+are present in the same filename.
+
+| Role | Keywords | Format constraint |
+|------|----------|-------------------|
+| Filtered neighbor indices | `filtered`∣`filter` AND (`indices`∣`neighbors`∣`gt`∣`groundtruth`) | ivec |
+| Filtered neighbor distances | `filtered`∣`filter` AND `distance*` | fvec, dvec, mvec |
+| Neighbor indices (GT) | `groundtruth`, `gt`, `indices`, `neighbors` | ivec |
+| Neighbor distances (GT) | `distance*` (but not also matching indices keywords) | fvec, dvec, mvec |
+| Metadata predicates | `predicate*` | slab |
+| Metadata results | `result*` | slab |
+| Metadata content | `metadata`, `content` (but not also matching predicates/results keywords) | slab, parquet |
+| Base vectors | `base`, `train` | any vector format |
+| Query vectors | `query`, `queries`, `test` | any vector format |
+
+**Vector formats**: fvec, ivec, mvec, bvec, dvec, svec, npy
+**Float vector formats**: fvec, dvec, mvec
+
+### 12.16.3 Ambiguity Resolution
+
+If two or more candidate files claim the same role, **neither is
+assigned** — the role is left unresolved and falls through to the
+wizard's manual selection prompt. This prevents silent misassignment
+when, e.g., two files both contain `base` in their names.
+
+Files that match no role are placed in the **unassigned** list.
+
+### 12.16.4 `--auto` Mode Enforcement
+
+In `--auto` mode, the unassigned list must be empty. If any candidate
+data file cannot be mapped to a role, the command prints an error with:
+
+1. The list of unrecognized files
+2. A table of recognized keywords per role
+3. Examples of correctly-named files
+
+The command then exits with a non-zero status. The user must rename
+their files to include appropriate keywords before retrying.
+
+This strictness is deliberate: `--auto` mode is designed for
+directories where the user has already named files according to
+convention. Ambiguous directories should use interactive mode (`-i`)
+where the user can manually resolve assignments.
+
+### 12.16.5 Wizard Integration
+
+When role detection succeeds, the wizard presents a single confirmation
+prompt showing all detected assignments:
+
+```
+Detected file roles:
+  Base vectors:       _base_vectors.mvec
+  Query vectors:      query_test.mvec
+  Metadata content:   metadata.slab
+
+Use detected assignments? [Y/n]:
+```
+
+When accepted (or auto-accepted with `-y`), the detected files are used
+directly for the corresponding wizard sections, bypassing the unstable
+multi-select menus. When rejected (user answers N), the wizard falls
+through to its existing per-role prompts.
+
+### 12.16.6 Source File Renaming
+
+All source files are automatically renamed with a `_` prefix (the
+wizard's default source-location option) to mark them as
+non-publishable. The `_` prefix is stripped during role detection, so
+files renamed by a prior import retain their role assignments across
+restart cycles.
+
+### 12.16.7 Examples
+
+```
+Directory contents:          Detected roles:
+─────────────────────────    ───────────────────────────
+base_vectors.fvec            → Base vectors
+query_vectors.fvec           → Query vectors
+gt_neighbors.ivec            → Neighbor indices
+gt_distances.fvec            → Neighbor distances
+metadata_content.slab        → Metadata content
+predicates.slab              → Metadata predicates
+filtered_neighbors.ivec      → Filtered neighbor indices
+filtered_distances.fvec      → Filtered neighbor distances
+```
+
+```
+Directory after import:      Role preserved:
+────────────────────────     ─────────────────
+_base_vectors.fvec           → Base vectors (still detected)
+_query_vectors.fvec          → Query vectors (still detected)
+dataset.yaml                 (not a candidate — skipped)
+```

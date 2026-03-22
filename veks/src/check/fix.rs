@@ -153,7 +153,7 @@ pub fn apply_fix(plan: &FixPlan) -> Result<(), String> {
 /// Create a timestamped backup of a file.
 ///
 /// Writes to `.backup/dataset.yaml_<timestamp>` in the same directory.
-fn create_backup(path: &Path) -> Result<PathBuf, String> {
+pub(crate) fn create_backup(path: &Path) -> Result<PathBuf, String> {
     let dir = path.parent().unwrap_or(Path::new("."));
     let backup_dir = dir.join(".backup");
     std::fs::create_dir_all(&backup_dir)

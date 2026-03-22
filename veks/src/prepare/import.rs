@@ -190,22 +190,31 @@ fn resolve_slots(args: &ImportArgs) -> PipelineSlots {
         };
         (Some(shuffle), Some(qv), bv, Some(bc))
     } else if has_separate_query {
-        // Separate query file
+        // Separate query file — use canonical profile paths with symlinks
         let query_source = args.query_vectors.as_ref().unwrap();
         let qv = if is_native_xvec_file(query_source) {
-            Artifact::Identity { path: query_source.to_string_lossy().to_string() }
+            let ext = query_source.extension()
+                .map(|e| e.to_string_lossy().to_string())
+                .unwrap_or_else(|| "fvec".to_string());
+            Artifact::Identity { path: format!("profiles/base/query_vectors.{}", ext) }
         } else {
             Artifact::Materialized {
                 step_id: "import-query".into(),
                 output: "query_vectors.fvec".into(),
             }
         };
-        // Base = all_vectors (identity)
-        let bv = Artifact::Identity { path: all_vectors.path().to_string() };
+        // Base = canonical profile path (symlinked to all_vectors)
+        let ext = args.base_vectors.as_ref()
+            .and_then(|p| p.extension().map(|e| e.to_string_lossy().to_string()))
+            .unwrap_or_else(|| "mvec".to_string());
+        let bv = Artifact::Identity { path: format!("profiles/base/base_vectors.{}", ext) };
         (None, Some(qv), bv, None)
     } else {
-        // No queries at all
-        let bv = Artifact::Identity { path: all_vectors.path().to_string() };
+        // No queries at all — use canonical profile path (symlinked)
+        let ext = args.base_vectors.as_ref()
+            .and_then(|p| p.extension().map(|e| e.to_string_lossy().to_string()))
+            .unwrap_or_else(|| "mvec".to_string());
+        let bv = Artifact::Identity { path: format!("profiles/base/base_vectors.{}", ext) };
         (None, None, bv, None)
     };
 
@@ -229,7 +238,8 @@ fn resolve_slots(args: &ImportArgs) -> PipelineSlots {
                 output: "profiles/base/metadata_content.slab".into(),
             }
         } else {
-            Artifact::Identity { path: metadata_all.path().to_string() }
+            // Canonical profile path — symlinked to source during import
+            Artifact::Identity { path: "profiles/base/metadata_content.slab".into() }
         };
 
         let survey = Artifact::Materialized {
@@ -386,6 +396,21 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs) -> Vec<Step> {
         });
     }
 
+    // set-duplicate-count (after sort, records number of elided duplicates)
+    if slots.sort.is_materialized() {
+        steps.push(Step {
+            id: "set-duplicate-count".into(),
+            run: "set variable".into(),
+            description: None,
+            after: vec!["sort-vectors".into()],
+            per_profile: false,
+            options: vec![
+                ("name".into(), "duplicate_count".into()),
+                ("value".into(), "count:${cache}/dedup_duplicates.ivec".into()),
+            ],
+        });
+    }
+
     // zero-check
     if let Artifact::Materialized { .. } = &slots.zero_check {
         let mut after = vec![];
@@ -404,6 +429,21 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs) -> Vec<Step> {
                 ("source".into(), slots.all_vectors.path().into()),
                 ("ordinals".into(), slots.sort.path().into()),
                 ("output".into(), "${cache}/zero_ordinals.ivec".into()),
+            ],
+        });
+    }
+
+    // set-zero-count (after zero-check, records number of zero vectors removed)
+    if slots.zero_check.is_materialized() {
+        steps.push(Step {
+            id: "set-zero-count".into(),
+            run: "set variable".into(),
+            description: None,
+            after: vec!["zero-check".into()],
+            per_profile: false,
+            options: vec![
+                ("name".into(), "zero_count".into()),
+                ("value".into(), "count:${cache}/zero_ordinals.ivec".into()),
             ],
         });
     }
@@ -659,7 +699,11 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs) -> Vec<Step> {
                 ("predicates".into(), "predicates.slab".into()),
                 ("survey".into(), "${cache}/metadata_survey.json".into()),
                 ("selectivity".into(), "0.0001".into()),
-                ("range".into(), "[0,${base_count})".into()),
+                ("range".into(), if slots.base_count.is_some() {
+                    "[0,${base_count})".into()
+                } else {
+                    "[0,${vector_count})".into()
+                }),
                 ("output".into(), "metadata_indices.slab".into()),
             ],
         });
@@ -686,7 +730,11 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs) -> Vec<Step> {
                 per_profile: true,
                 options: {
                     let mut opts = vec![
-                        ("base".into(), format!("{}[0..${{base_count}})", slots.base_vectors.path())),
+                        ("base".into(), if slots.base_count.is_some() {
+                        format!("{}[0..${{base_count}})", slots.base_vectors.path())
+                    } else {
+                        slots.base_vectors.path().to_string()
+                    }),
                         ("query".into(), slots.query_vectors.as_ref().unwrap().path().into()),
                         ("indices".into(), "neighbor_indices.ivec".into()),
                         ("distances".into(), "neighbor_distances.fvec".into()),
@@ -722,7 +770,11 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs) -> Vec<Step> {
                 per_profile: true,
                 options: {
                     let mut opts = vec![
-                        ("base".into(), format!("{}[0..${{base_count}})", slots.base_vectors.path())),
+                        ("base".into(), if slots.base_count.is_some() {
+                        format!("{}[0..${{base_count}})", slots.base_vectors.path())
+                    } else {
+                        slots.base_vectors.path().to_string()
+                    }),
                         ("query".into(), slots.query_vectors.as_ref().unwrap().path().into()),
                         ("metadata-indices".into(), "metadata_indices.slab".into()),
                         ("indices".into(), "filtered_neighbor_indices.ivec".into()),
@@ -749,7 +801,11 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs) -> Vec<Step> {
                 after: vec!["compute-knn".into()],
                 per_profile: true,
                 options: vec![
-                    ("base".into(), format!("{}[0..${{base_count}})", slots.base_vectors.path())),
+                    ("base".into(), if slots.base_count.is_some() {
+                        format!("{}[0..${{base_count}})", slots.base_vectors.path())
+                    } else {
+                        slots.base_vectors.path().to_string()
+                    }),
                     ("query".into(), slots.query_vectors.as_ref().unwrap().path().into()),
                     ("indices".into(), "neighbor_indices.ivec".into()),
                     ("distances".into(), "neighbor_distances.fvec".into()),
@@ -1071,12 +1127,265 @@ pub fn run(args: ImportArgs) {
         let _ = std::fs::write(&gitignore_path, ".scratch/\n.cache/\n");
     }
 
+    // Create symlinks for Identity artifacts in the canonical profile structure.
+    // When a source file is already in native format (no import/extract needed),
+    // the profile view points to profiles/base/<facet>.<ext> and a symlink is
+    // created there pointing to the actual source file.
+    create_identity_symlinks(output_dir, &args);
+
+    // Write import provenance to dataset.log
+    write_import_log(output_dir, &args, &slots, steps.len());
+
     println!();
     println!("Created {}", dataset_path.display());
     if !steps.is_empty() {
+        // Show a concise run command — just `veks run` if the output dir
+        // is the current working directory, since veks auto-detects dataset.yaml.
+        let cwd = std::env::current_dir().ok();
+        let is_cwd = cwd.as_ref()
+            .and_then(|c| output_dir.canonicalize().ok().map(|o| c.canonicalize().ok() == Some(o)))
+            .unwrap_or(false);
         println!();
         println!("To prepare the dataset, run:");
-        println!("  veks run {}", dataset_path.display());
+        if is_cwd {
+            println!("  veks run");
+        } else {
+            println!("  veks run {}", dataset_path.display());
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Identity symlinks for canonical profile layout
+// ---------------------------------------------------------------------------
+
+/// Create symlinks in `profiles/base/` for source files that are used as-is
+/// (Identity artifacts). This ensures the canonical profile structure exists
+/// even when no import/extract step runs, so all profile views point to
+/// paths under `profiles/base/` rather than raw source paths.
+fn create_identity_symlinks(output_dir: &std::path::Path, args: &ImportArgs) {
+    let base_dir = output_dir.join("profiles/base");
+    if let Err(e) = std::fs::create_dir_all(&base_dir) {
+        eprintln!("Warning: failed to create profiles/base/: {}", e);
+        return;
+    }
+
+    let self_search = args.query_vectors.is_none()
+        && (args.self_search || args.base_vectors.is_some());
+
+    // Base vectors: symlink when not self-search (identity to source)
+    if !self_search {
+        if let Some(ref base_path) = args.base_vectors {
+            if is_native_xvec_file(base_path) {
+                let ext = base_path.extension()
+                    .map(|e| e.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "mvec".to_string());
+                let link = base_dir.join(format!("base_vectors.{}", ext));
+                create_symlink(base_path, &link);
+            }
+        }
+    }
+
+    // Query vectors: symlink when separate native xvec query file
+    if args.query_vectors.is_some() {
+        let query_path = args.query_vectors.as_ref().unwrap();
+        if is_native_xvec_file(query_path) {
+            let ext = query_path.extension()
+                .map(|e| e.to_string_lossy().to_string())
+                .unwrap_or_else(|| "fvec".to_string());
+            let link = base_dir.join(format!("query_vectors.{}", ext));
+            create_symlink(query_path, &link);
+        }
+    }
+
+    // Metadata content: symlink when native slab and not self-search
+    if !self_search {
+        if let Some(ref meta_path) = args.metadata {
+            if is_native_slab_file(meta_path) {
+                let link = base_dir.join("metadata_content.slab");
+                create_symlink(meta_path, &link);
+            }
+        }
+    }
+}
+
+/// Create a symlink, removing any existing one first. Best-effort.
+fn create_symlink(target: &std::path::Path, link: &std::path::Path) {
+    // Resolve target to absolute path for reliable symlinks
+    let abs_target = if target.is_absolute() {
+        target.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(target))
+            .unwrap_or_else(|_| target.to_path_buf())
+    };
+
+    // Remove existing symlink or file at the link location
+    if link.exists() || link.symlink_metadata().is_ok() {
+        let _ = std::fs::remove_file(link);
+    }
+
+    match std::os::unix::fs::symlink(&abs_target, link) {
+        Ok(()) => {
+            println!("  Symlinked {} → {}", link.display(), abs_target.display());
+        }
+        Err(e) => {
+            eprintln!("  Warning: failed to create symlink {} → {}: {}",
+                link.display(), abs_target.display(), e);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Import provenance log
+// ---------------------------------------------------------------------------
+
+/// Write import provenance to `dataset.log`.
+///
+/// Records the import inputs, detected starting scenario, and the dataflow
+/// graph entry points so that `dataset.log` provides a complete audit trail
+/// from the very first step.
+fn write_import_log(
+    output_dir: &std::path::Path,
+    args: &ImportArgs,
+    slots: &PipelineSlots,
+    step_count: usize,
+) {
+    use std::io::Write;
+
+    let path = output_dir.join("dataset.log");
+    let file = match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        Ok(f) => f,
+        Err(_) => return, // best-effort
+    };
+    let mut w = std::io::BufWriter::new(file);
+
+    let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+    let _ = writeln!(w, "=== veks datasets import {} ===", ts);
+    let _ = writeln!(w);
+
+    // ── Inputs ───────────────────────────────────────────────────────
+    let _ = writeln!(w, "Inputs:");
+    let _ = writeln!(w, "  name:           {}", args.name);
+    let _ = writeln!(w, "  output:         {}", args.output.display());
+    match args.base_vectors {
+        Some(ref p) => { let _ = writeln!(w, "  base_vectors:   {}", p.display()); }
+        None => { let _ = writeln!(w, "  base_vectors:   (none)"); }
+    }
+    match args.query_vectors {
+        Some(ref p) => { let _ = writeln!(w, "  query_vectors:  {}", p.display()); }
+        None if args.self_search => {
+            let _ = writeln!(w, "  query_vectors:  self-search (count={})", args.query_count);
+        }
+        None => { let _ = writeln!(w, "  query_vectors:  (none)"); }
+    }
+    match args.metadata {
+        Some(ref p) => { let _ = writeln!(w, "  metadata:       {}", p.display()); }
+        None => { let _ = writeln!(w, "  metadata:       (none)"); }
+    }
+    match args.ground_truth {
+        Some(ref p) => { let _ = writeln!(w, "  ground_truth:   {}", p.display()); }
+        None => { let _ = writeln!(w, "  ground_truth:   (compute)"); }
+    }
+    if let Some(ref p) = args.ground_truth_distances {
+        let _ = writeln!(w, "  gt_distances:   {}", p.display());
+    }
+    let _ = writeln!(w, "  metric:         {}", args.metric);
+    let _ = writeln!(w, "  neighbors:      {}", args.neighbors);
+    let _ = writeln!(w, "  seed:           {}", args.seed);
+    let _ = writeln!(w, "  normalize:      {}", args.normalize);
+    let _ = writeln!(w, "  dedup:          {}", !args.no_dedup);
+    let _ = writeln!(w, "  zero_check:     {}", !args.no_zero_check);
+    let _ = writeln!(w, "  filtered_knn:   {}", !args.no_filtered);
+    let _ = writeln!(w, "  compress_cache: {}", args.compress_cache);
+    if let Some(ref sp) = args.sized_profiles {
+        let _ = writeln!(w, "  sized_profiles: {}", sp);
+    }
+    if let Some(ref fmt) = args.base_convert_format {
+        let _ = writeln!(w, "  base_convert:   {}", fmt);
+    }
+    if let Some(ref fmt) = args.query_convert_format {
+        let _ = writeln!(w, "  query_convert:  {}", fmt);
+    }
+
+    // ── Detected starting scenario ───────────────────────────────────
+    let _ = writeln!(w);
+    let _ = writeln!(w, "Starting scenario:");
+    let has_queries = args.query_vectors.is_some() || args.self_search;
+    let has_metadata = args.metadata.is_some();
+    let has_gt = args.ground_truth.is_some();
+    let scenario = match (args.base_vectors.is_some(), has_queries, has_metadata, has_gt) {
+        (true, true, true, true) => "full (base + query + metadata + pre-computed GT)",
+        (true, true, true, false) => "full (base + query + metadata, compute GT)",
+        (true, true, false, true) => "vectors + pre-computed GT (no metadata)",
+        (true, true, false, false) => "vectors + compute GT (no metadata)",
+        (true, false, true, _) => "base + metadata only (no queries)",
+        (true, false, false, _) => "base vectors only (no queries, no metadata)",
+        (false, _, true, _) => "metadata only (no vectors)",
+        (false, _, _, _) => "minimal (no vectors, no metadata)",
+    };
+    let _ = writeln!(w, "  {}", scenario);
+
+    // ── Dataflow graph entry points ──────────────────────────────────
+    let _ = writeln!(w);
+    let _ = writeln!(w, "Dataflow graph entry points ({} steps):", step_count);
+    log_slot(&mut w, "all_vectors", &slots.all_vectors);
+    log_slot(&mut w, "sort", &slots.sort);
+    log_slot(&mut w, "zero_check", &slots.zero_check);
+    log_slot(&mut w, "clean_ordinals", &slots.clean_ordinals);
+    log_slot(&mut w, "vector_count", &slots.vector_count);
+    if slots.self_search {
+        let _ = writeln!(w, "  mode: self-search (query_count={})", args.query_count);
+    }
+    if let Some(ref s) = slots.shuffle { log_slot(&mut w, "shuffle", s); }
+    if let Some(ref qv) = slots.query_vectors { log_slot(&mut w, "query_vectors", qv); }
+    log_slot(&mut w, "base_vectors", &slots.base_vectors);
+    if let Some(ref bc) = slots.base_count { log_slot(&mut w, "base_count", bc); }
+    if let Some(ref meta) = slots.metadata {
+        log_slot(&mut w, "metadata_all", &meta.metadata_all);
+        log_slot(&mut w, "metadata_content", &meta.metadata_content);
+        log_slot(&mut w, "survey", &meta.survey);
+        log_slot(&mut w, "predicates", &meta.predicates);
+        log_slot(&mut w, "predicate_indices", &meta.predicate_indices);
+    } else {
+        let _ = writeln!(w, "  metadata: Absent");
+    }
+    if let Some(ref knn) = slots.knn {
+        log_slot(&mut w, "knn", knn);
+    } else {
+        let _ = writeln!(w, "  knn: Absent");
+    }
+    if let Some(ref fknn) = slots.filtered_knn {
+        log_slot(&mut w, "filtered_knn", fknn);
+    } else {
+        let _ = writeln!(w, "  filtered_knn: Absent");
+    }
+
+    let _ = writeln!(w);
+    let _ = w.flush();
+}
+
+/// Format a single slot for the provenance log.
+fn log_slot(w: &mut impl std::io::Write, name: &str, artifact: &Artifact) {
+    match artifact {
+        Artifact::Materialized { step_id, output } => {
+            if output.is_empty() {
+                let _ = writeln!(w, "  {}: Materialized ({})", name, step_id);
+            } else {
+                let _ = writeln!(w, "  {}: Materialized ({}) -> {}", name, step_id, output);
+            }
+        }
+        Artifact::Identity { path } => {
+            if path.is_empty() {
+                let _ = writeln!(w, "  {}: Identity (skipped)", name);
+            } else {
+                let _ = writeln!(w, "  {}: Identity -> {}", name, path);
+            }
+        }
     }
 }
 
@@ -1322,10 +1631,14 @@ mod tests {
         assert!(slots.filtered_knn.is_none());
 
         let steps = emit_steps(&slots, &args);
-        // Expected: set-vector-count, sort-vectors, zero-check, clean-ordinals,
-        // set-clean-count, shuffle, extract-query, extract-base, set-base-count,
+        // Expected: set-vector-count, sort-vectors, set-duplicate-count,
+        // zero-check, set-zero-count, clean-ordinals, set-clean-count,
+        // shuffle, extract-query, extract-base, set-base-count,
         // compute-knn, verify-knn, merkle-all, catalog-generate
-        assert_eq!(steps.len(), 13, "steps: {:?}", steps.iter().map(|s| &s.id).collect::<Vec<_>>());
+        assert_eq!(steps.len(), 15, "steps: {:?}", steps.iter().map(|s| &s.id).collect::<Vec<_>>());
+        let step_ids: Vec<&str> = steps.iter().map(|s| s.id.as_str()).collect();
+        assert!(step_ids.contains(&"set-duplicate-count"), "should have set-duplicate-count");
+        assert!(step_ids.contains(&"set-zero-count"), "should have set-zero-count");
     }
 
     // SRD §12.5 Example 3: Native base + separate native query + metadata dir

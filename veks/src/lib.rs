@@ -27,6 +27,7 @@ pub mod cli;
 pub mod datasets;
 pub mod formats;
 pub mod pipeline;
+pub mod prepare;
 pub mod publish;
 pub mod term;
 pub mod ui;

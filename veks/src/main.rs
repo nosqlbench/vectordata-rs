@@ -1,7 +1,7 @@
 // Copyright (c) DataStax, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use veks::{check, cli, datasets, pipeline, publish};
+use veks::{check, cli, datasets, pipeline, prepare, publish};
 
 use clap::{Arg, Command, CommandFactory, Parser, Subcommand};
 use clap_complete::CompleteEnv;
@@ -18,6 +18,8 @@ struct Veks {
 enum Commands {
     /// Browse, search, and manage datasets and catalogs
     Datasets(datasets::DatasetsArgs),
+    /// Import, stratify, and prepare datasets for benchmarking
+    Prepare(prepare::PrepareArgs),
     /// Execute a command stream pipeline defined in dataset.yaml
     Run(pipeline::RunArgs),
     /// Emit a dataset pipeline as an equivalent shell script
@@ -36,6 +38,9 @@ enum Commands {
     Completions(cli::CompletionsArgs),
     /// Show detailed help for a pipeline command or command group
     Help(HelpArgs),
+    /// Catch-all for shorthand subcommands (not shown in help/completions)
+    #[command(external_subcommand)]
+    Shorthand(Vec<String>),
 }
 
 /// Arguments for `veks help`.
@@ -200,12 +205,24 @@ fn build_help_completion_command() -> clap::Command {
 
 #[tokio::main]
 async fn main() {
+    // Double-tap detection: if the user taps Tab repeatedly at the root
+    // level (no subcommand context yet), show the full command list.
+    // Only triggers for root-level completions like `veks <TAB>`, not
+    // when already inside a subcommand like `veks prepare <TAB>`.
+    if std::env::var_os("COMPLETE").is_some() && is_root_completion() {
+        if let Some(output) = check_triple_tap() {
+            print!("{}", output);
+            std::process::exit(0);
+        }
+    }
+
     CompleteEnv::with_factory(build_augmented_cli).complete();
 
     let veks = Veks::parse();
 
     match veks.command {
         Commands::Datasets(args) => datasets::run(args),
+        Commands::Prepare(args) => prepare::run(args),
         Commands::Run(args) => pipeline::run_pipeline(args),
         Commands::Script(args) => pipeline::run_script(args),
         Commands::Pipeline { args } => pipeline::cli::run_direct(args),
@@ -213,7 +230,167 @@ async fn main() {
         Commands::Publish(args) => publish::run(args),
         Commands::Completions(args) => cli::completions(args),
         Commands::Help(args) => run_help(args),
+        Commands::Shorthand(args) => dispatch_shorthand(args),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Triple-tap detection
+// ---------------------------------------------------------------------------
+
+/// Check if the current completion invocation is at the root level.
+///
+/// The shell passes args like `-- veks ""` for `veks <TAB>` (root) vs
+/// `-- veks prepare ""` for `veks prepare <TAB>` (subcommand context).
+/// We only want the expanded list at the root level — when there are at
+/// most 2 real words after `--` (the program name and a partial/empty word).
+fn is_root_completion() -> bool {
+    let args: Vec<String> = std::env::args().collect();
+    // Find `--` separator; everything after it is the completion words.
+    let after_separator = if let Some(pos) = args.iter().position(|a| a == "--") {
+        &args[pos + 1..]
+    } else {
+        // No separator — check raw arg count (program + maybe partial word)
+        return args.len() <= 2;
+    };
+    // Root level: just the program name, or program name + partial/empty word
+    after_separator.len() <= 2
+}
+
+const TAP_FILE: &str = "/tmp/.veks_tab";
+const TAP_COUNT: usize = 2;
+
+/// Check if the user has tapped Tab repeatedly in the same completion state.
+///
+/// Tracks the completion args (cursor position + partial input) in a file.
+/// If the same state is seen `TAP_COUNT` times in a row, the user is
+/// repeatedly hitting Tab without changing their input — trigger the
+/// expanded command list. No timing constraint; purely state-based.
+///
+/// If /tmp is not writable or accessible, silently returns `None`.
+fn check_triple_tap() -> Option<String> {
+    // Build a fingerprint of the current completion state from env/args.
+    // The shell passes the words and cursor index via env vars or args.
+    let state_key: String = std::env::args().skip(1).collect::<Vec<_>>().join("\x00");
+
+    // Read previous state (best-effort)
+    let (prev_key, prev_count) = std::fs::read_to_string(TAP_FILE)
+        .ok()
+        .and_then(|content| {
+            let mut lines = content.lines();
+            let count: usize = lines.next()?.parse().ok()?;
+            let key = lines.next().unwrap_or("").to_string();
+            Some((key, count))
+        })
+        .unwrap_or_default();
+
+    let count = if state_key == prev_key {
+        prev_count + 1
+    } else {
+        1
+    };
+
+    // Write back (best-effort, silently ignore errors)
+    let _ = std::fs::write(TAP_FILE, format!("{}\n{}", count, state_key));
+
+    if count >= TAP_COUNT {
+        // Reset so next tap starts fresh
+        let _ = std::fs::write(TAP_FILE, "");
+        Some(build_full_command_list())
+    } else {
+        None
+    }
+}
+
+/// Build a fish-format completion list of all available commands.
+fn build_full_command_list() -> String {
+    let mut lines: Vec<String> = Vec::new();
+
+    // Root commands
+    lines.push("datasets\tBrowse, search, and manage datasets".into());
+    lines.push("prepare\tImport, stratify, and prepare datasets".into());
+    lines.push("run\tExecute pipeline from dataset.yaml".into());
+    lines.push("script\tEmit pipeline as shell script".into());
+    lines.push("pipeline\tExecute a single pipeline command".into());
+    lines.push("check\tPre-flight checks for dataset readiness".into());
+    lines.push("publish\tPublish dataset to S3".into());
+    lines.push("help\tShow help for a command".into());
+
+    // Prepare subcommands (usable directly via shorthand)
+    lines.push("import\tBootstrap dataset from source files".into());
+    lines.push("stratify\tAdd sized profiles to dataset".into());
+    lines.push("catalog\tGenerate dataset catalog index".into());
+    lines.push("cache-compress\tCompress eligible cache files".into());
+    lines.push("cache-uncompress\tDecompress cache files".into());
+
+    // Datasets subcommands (usable directly via shorthand)
+    lines.push("list\tList available datasets from catalogs".into());
+    lines.push("cache\tList locally cached datasets".into());
+    lines.push("curlify\tGenerate curl download commands".into());
+    lines.push("prebuffer\tDownload and cache dataset facets".into());
+
+    // Pipeline commands from the registry
+    let registry = pipeline::registry::CommandRegistry::with_builtins();
+    for path in registry.command_paths() {
+        lines.push(format!("{}\tpipeline: {}", path, path));
+    }
+
+    lines.join("\n") + "\n"
+}
+
+// ---------------------------------------------------------------------------
+// Shorthand subcommand dispatch
+// ---------------------------------------------------------------------------
+
+/// Subcommand-to-group mapping for shorthand dispatch.
+///
+/// All subcommand names MUST be globally unique across all groups.
+/// This is a design invariant — new subcommands must not collide with
+/// existing names in any group. If a collision is introduced, it must
+/// be resolved by renaming one of the conflicting commands.
+const SHORTHAND_COMMANDS: &[(&str, &str)] = &[
+    // prepare subcommands
+    ("import", "prepare"),
+    ("stratify", "prepare"),
+    ("catalog", "prepare"),
+    ("cache-compress", "prepare"),
+    ("cache-uncompress", "prepare"),
+    // datasets subcommands
+    ("list", "datasets"),
+    ("ls", "datasets"),
+    ("cache", "datasets"),
+    ("curlify", "datasets"),
+    ("prebuffer", "datasets"),
+];
+
+/// Dispatch an unrecognized root-level subcommand.
+///
+/// Looks up the name in the shorthand table. If found, re-parses with
+/// the group prefix inserted. If not found, falls through to the
+/// pipeline command registry as a last resort.
+fn dispatch_shorthand(args: Vec<String>) {
+    if args.is_empty() {
+        eprintln!("Error: no command specified. Run `veks --help` for usage.");
+        std::process::exit(1);
+    }
+
+    let name = &args[0];
+
+    // Look up in the shorthand table
+    if let Some((_, group)) = SHORTHAND_COMMANDS.iter().find(|(cmd, _)| *cmd == name.as_str()) {
+        let mut full_args = vec!["veks".to_string(), group.to_string()];
+        full_args.extend(args);
+        let veks = Veks::parse_from(full_args);
+        match veks.command {
+            Commands::Datasets(a) => datasets::run(a),
+            Commands::Prepare(a) => prepare::run(a),
+            _ => unreachable!(),
+        }
+        return;
+    }
+
+    // Not a known shorthand — try as a pipeline command
+    pipeline::cli::run_direct(args);
 }
 
 /// Root-level command descriptions for `veks help`.

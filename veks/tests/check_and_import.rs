@@ -9,7 +9,7 @@
 use std::path::{Path, PathBuf};
 
 use veks::check;
-use veks::datasets::import::{ImportArgs};
+use veks::prepare::import::{ImportArgs};
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Test helpers
@@ -104,7 +104,7 @@ fn import_minimal_no_inputs() {
     let out = dir.path().join("out");
     let args = default_args("empty-test", &out);
 
-    veks::datasets::import::run(args);
+    veks::prepare::import::run(args);
 
     assert!(has_dataset_yaml(&out));
     let yaml = read_yaml(&out);
@@ -124,7 +124,7 @@ fn import_native_fvec_self_search() {
     args.base_vectors = Some(fvec.clone());
     args.query_count = 10;
 
-    veks::datasets::import::run(args);
+    veks::prepare::import::run(args);
 
     let yaml = read_yaml(&out);
 
@@ -156,7 +156,7 @@ fn import_npy_dir_needs_import_step() {
     args.base_vectors = Some(npy);
     args.query_count = 5;
 
-    veks::datasets::import::run(args);
+    veks::prepare::import::run(args);
 
     let yaml = read_yaml(&out);
 
@@ -178,7 +178,7 @@ fn import_separate_query_no_shuffle() {
     args.base_vectors = Some(base);
     args.query_vectors = Some(query.clone());
 
-    veks::datasets::import::run(args);
+    veks::prepare::import::run(args);
 
     let yaml = read_yaml(&out);
 
@@ -190,9 +190,9 @@ fn import_separate_query_no_shuffle() {
     // KNN should still be present
     assert!(yaml.contains("compute knn"), "should have KNN with separate query");
 
-    // Query should be referenced directly (identity)
-    assert!(yaml.contains(&query.to_string_lossy().to_string()),
-        "query path should be referenced directly");
+    // Query should be at canonical profile path (symlinked to source)
+    assert!(yaml.contains("profiles/base/query_vectors.fvec"),
+        "query should use canonical profile path");
 }
 
 #[test]
@@ -206,7 +206,7 @@ fn import_no_dedup_flag() {
     args.base_vectors = Some(fvec);
     args.no_dedup = true;
 
-    veks::datasets::import::run(args);
+    veks::prepare::import::run(args);
 
     let yaml = read_yaml(&out);
     assert!(!yaml.contains("compute dedup"), "should not have sort/dedup when --no-dedup");
@@ -228,7 +228,7 @@ fn import_with_metadata_generates_predicate_chain() {
     args.query_vectors = Some(query);
     args.metadata = Some(meta);
 
-    veks::datasets::import::run(args);
+    veks::prepare::import::run(args);
 
     let yaml = read_yaml(&out);
     assert!(yaml.contains("import-metadata"), "should import metadata");
@@ -255,7 +255,7 @@ fn import_no_filtered_skips_filtered_knn() {
     args.metadata = Some(meta);
     args.no_filtered = true;
 
-    veks::datasets::import::run(args);
+    veks::prepare::import::run(args);
 
     let yaml = read_yaml(&out);
     // Metadata chain still present
@@ -281,7 +281,7 @@ fn import_precomputed_gt_skips_knn() {
     args.query_vectors = Some(query);
     args.ground_truth = Some(gt.clone());
 
-    veks::datasets::import::run(args);
+    veks::prepare::import::run(args);
 
     let yaml = read_yaml(&out);
     assert!(!yaml.contains("compute knn"), "should not compute KNN when GT provided");
@@ -301,7 +301,7 @@ fn import_force_overwrites_existing() {
     let mut args = default_args("new-name", &out);
     args.force = true;
 
-    veks::datasets::import::run(args);
+    veks::prepare::import::run(args);
 
     let yaml = read_yaml(&out);
     assert!(yaml.contains("name: new-name"), "force should overwrite");
@@ -314,7 +314,7 @@ fn import_creates_gitignore() {
     let out = dir.path().join("dataset");
     let args = default_args("gitignore-test", &out);
 
-    veks::datasets::import::run(args);
+    veks::prepare::import::run(args);
 
     let gitignore = std::fs::read_to_string(out.join(".gitignore")).unwrap();
     assert!(gitignore.contains(".scratch/"));
@@ -533,7 +533,7 @@ fn import_empty_directory_source() {
     args.base_vectors = Some(empty);
 
     // Should not panic — should produce import step (directory → import)
-    veks::datasets::import::run(args);
+    veks::prepare::import::run(args);
     assert!(has_dataset_yaml(&out));
 }
 
@@ -545,7 +545,7 @@ fn import_nonexistent_source() {
     args.base_vectors = Some(PathBuf::from("/nonexistent/path/vectors.fvec"));
 
     // Should still produce a yaml (the path is a reference, not validated at import time)
-    veks::datasets::import::run(args);
+    veks::prepare::import::run(args);
     assert!(has_dataset_yaml(&out));
 }
 
@@ -593,7 +593,7 @@ fn import_both_self_search_and_separate_query() {
     args.query_vectors = Some(query);
     args.self_search = true; // should be overridden by query_vectors
 
-    veks::datasets::import::run(args);
+    veks::prepare::import::run(args);
 
     let yaml = read_yaml(&out);
     // Separate query takes precedence — no shuffle
@@ -1460,7 +1460,7 @@ fn import_zero_check_and_clean_ordinals_emitted_by_default() {
     args.base_vectors = Some(fvec);
     // defaults: no_zero_check=false, no_dedup=false
 
-    veks::datasets::import::run(args);
+    veks::prepare::import::run(args);
     let yaml = read_yaml(&dir.path().join("out"));
     let ids = step_ids_from_yaml(&yaml);
 
@@ -1483,7 +1483,7 @@ fn import_no_zero_check_suppresses_zero_check_and_not_clean_ordinals() {
     args.base_vectors = Some(fvec);
     args.no_zero_check = true;
 
-    veks::datasets::import::run(args);
+    veks::prepare::import::run(args);
     let yaml = read_yaml(&dir.path().join("out"));
     let ids = step_ids_from_yaml(&yaml);
 
@@ -1506,7 +1506,7 @@ fn import_no_zero_check_and_no_dedup_suppresses_both() {
     args.no_zero_check = true;
     args.no_dedup = true;
 
-    veks::datasets::import::run(args);
+    veks::prepare::import::run(args);
     let yaml = read_yaml(&dir.path().join("out"));
     let ids = step_ids_from_yaml(&yaml);
 
@@ -1531,7 +1531,7 @@ fn import_no_dedup_with_zero_check_still_enabled() {
     args.no_dedup = true;
     args.no_zero_check = false;
 
-    veks::datasets::import::run(args);
+    veks::prepare::import::run(args);
     let yaml = read_yaml(&dir.path().join("out"));
     let ids = step_ids_from_yaml(&yaml);
 
@@ -1554,7 +1554,7 @@ fn import_normalize_adds_normalize_to_extract_steps() {
     args.normalize = true;
     args.query_count = 10;
 
-    veks::datasets::import::run(args);
+    veks::prepare::import::run(args);
     let yaml = read_yaml(&dir.path().join("out"));
 
     // Self-search is implied; extract-query-vectors and extract-base-vectors should exist
@@ -1588,7 +1588,7 @@ fn import_normalize_separate_query_no_extract_steps() {
     args.query_vectors = Some(query);
     args.normalize = true;
 
-    veks::datasets::import::run(args);
+    veks::prepare::import::run(args);
     let yaml = read_yaml(&dir.path().join("out"));
     let ids = step_ids_from_yaml(&yaml);
 
@@ -1619,7 +1619,7 @@ fn import_full_pipeline_all_features() {
     args.normalize = true;
     args.query_count = 10;
 
-    veks::datasets::import::run(args);
+    veks::prepare::import::run(args);
     let yaml = read_yaml(&dir.path().join("out"));
     let ids = step_ids_from_yaml(&yaml);
 
@@ -1627,7 +1627,9 @@ fn import_full_pipeline_all_features() {
     let expected = vec![
         "set-vector-count",
         "sort-vectors",
+        "set-duplicate-count",
         "zero-check",
+        "set-zero-count",
         "clean-ordinals",
         "set-clean-count",
         "shuffle-ordinals",
@@ -1671,7 +1673,7 @@ fn import_full_pipeline_everything_disabled() {
     args.normalize = false;
     args.query_count = 10;
 
-    veks::datasets::import::run(args);
+    veks::prepare::import::run(args);
     let yaml = read_yaml(&dir.path().join("out"));
     let ids = step_ids_from_yaml(&yaml);
 
@@ -1710,7 +1712,7 @@ fn import_clean_ordinals_depends_on_sort() {
     args.base_vectors = Some(fvec);
     // defaults: no_dedup=false, no_zero_check=false
 
-    veks::datasets::import::run(args);
+    veks::prepare::import::run(args);
     let yaml = read_yaml(&dir.path().join("out"));
 
     // clean-ordinals should have sort-vectors in its after list
@@ -1735,7 +1737,7 @@ fn import_shuffle_depends_on_clean_count() {
     args.base_vectors = Some(fvec);
     args.query_count = 10;
 
-    veks::datasets::import::run(args);
+    veks::prepare::import::run(args);
     let yaml = read_yaml(&dir.path().join("out"));
 
     // shuffle-ordinals should depend on set-clean-count (sort is enabled by default)
