@@ -28,7 +28,7 @@ pub fn factory() -> Box<dyn CommandOp> {
 
 impl CommandOp for ImportFacetOp {
     fn command_path(&self) -> &str {
-        "import"
+        "transform convert"
     }
 
     fn command_doc(&self) -> CommandDoc {
@@ -36,7 +36,7 @@ impl CommandOp for ImportFacetOp {
         CommandDoc {
             summary: "Import a data facet from source format to output".into(),
             body: format!(
-                r#"# import
+                r#"# transform convert
 
 Import a data facet from source format to output.
 

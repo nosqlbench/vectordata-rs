@@ -28,14 +28,14 @@ pub fn factory() -> Box<dyn CommandOp> {
 
 impl CommandOp for GenerateIvecShuffleOp {
     fn command_path(&self) -> &str {
-        "generate ivec-shuffle"
+        "generate shuffle"
     }
 
     fn command_doc(&self) -> CommandDoc {
         let options = self.describe_options();
         CommandDoc {
             summary: "Generate a random ordinal shuffle mapping".into(),
-            body: format!(r#"# generate ivec-shuffle
+            body: format!(r#"# generate shuffle
 
 Generate a random ordinal shuffle mapping.
 

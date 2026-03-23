@@ -1513,7 +1513,7 @@ pub fn survey_factory() -> Box<dyn CommandOp> {
 
 impl CommandOp for SlabSurveyOp {
     fn command_path(&self) -> &str {
-        "survey"
+        "analyze survey"
     }
 
     fn command_doc(&self) -> CommandDoc {
@@ -1521,7 +1521,7 @@ impl CommandOp for SlabSurveyOp {
         CommandDoc {
             summary: "Survey metadata field value distributions".into(),
             body: format!(
-                r#"# survey
+                r#"# analyze survey
 
 Survey metadata field value distributions.
 

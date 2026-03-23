@@ -35,6 +35,7 @@ pub fn run(
     at: &[String],
     format: &str,
     verbose: bool,
+    group_by: Option<&str>,
     filter: &DatasetFilter,
     profile_view: &ProfileView,
     select: Option<&str>,
@@ -91,7 +92,7 @@ pub fn run(
         "json" => output_json(&filtered, verbose, profile_view),
         "yaml" => output_yaml(&filtered, verbose, profile_view),
         "csv" => output_csv(&filtered, verbose, profile_view),
-        _ => output_text(&filtered, verbose, profile_view),
+        _ => output_text(&filtered, verbose, group_by, profile_view),
     }
 }
 
@@ -188,52 +189,192 @@ fn build_sources(configdir: &str, extra_catalogs: &[String], at: &[String]) -> C
     sources
 }
 
-/// Text output: `dataset:profile` per line, with optional verbose details.
-fn output_text(entries: &[&CatalogEntry], verbose: bool, pv: &ProfileView) {
+/// Detect terminal column width, defaulting to 80 if not on a terminal.
+fn terminal_width() -> usize {
+    crossterm::terminal::size()
+        .map(|(w, _)| w as usize)
+        .unwrap_or(80)
+}
+
+/// Text output: grouped by dataset name, profiles shown inline.
+///
+/// When connected to a terminal, uses the full terminal width to display
+/// datasets. Each dataset is shown once, with its profiles listed
+/// compactly on the same line:
+///
+/// ```text
+/// sift-128             [default, 1m, 2m, 4m, 10m, 20m, 50m, 100m]  L2
+/// glove-100            [default]
+/// laion400m-img-search [default, 10m, 50m, 100m, 200m, 400m]       Cosine
+/// ```
+fn output_text(entries: &[&CatalogEntry], verbose: bool, group_by: Option<&str>, pv: &ProfileView) {
+    if let Some(key) = group_by {
+        output_text_grouped(entries, verbose, key, pv);
+        return;
+    }
+
+    let width = terminal_width();
+
+    // Find the longest dataset name for column alignment
+    let max_name_len = entries.iter()
+        .map(|e| e.name.len())
+        .max()
+        .unwrap_or(0)
+        .min(width / 3); // don't let names take more than 1/3 of the line
+
+    let name_col = max_name_len + 2; // padding
+
     for entry in entries {
         let profile_names = pv.matching_profiles(entry);
         if profile_names.is_empty() {
-            // Only print bare name if the entry genuinely has no profiles;
-            // if a profile view is active and nothing matched, skip entirely.
             if !pv.is_active() {
                 println!("{}", entry.name);
             }
             continue;
         }
-        for profile_name in &profile_names {
-            println!("{}:{}", entry.name, profile_name);
+
+        // Format profile list compactly
+        let profiles_str = if profile_names.len() == 1 && profile_names[0] == "default" {
+            "[default]".to_string()
+        } else {
+            format!("[{}]", profile_names.join(", "))
+        };
+
+        // Attribute summary (distance function, dimension if available)
+        let attr_summary = entry.layout.attributes.as_ref()
+            .and_then(|a| a.distance_function.as_deref())
+            .unwrap_or("");
+
+        // Truncate profiles if they'd overflow the line
+        let name_part = &entry.name;
+        let available = width.saturating_sub(name_col + attr_summary.len() + 2);
+        let profiles_display = if profiles_str.len() > available && available > 10 {
+            // Truncate with count
+            format!("[{} profiles]", profile_names.len())
+        } else {
+            profiles_str
+        };
+
+        // Build the line, ensuring it fits within terminal width.
+        // Reserve 1 column to prevent terminal wrapping on the last column.
+        let usable = width.saturating_sub(1);
+        let name_padded = format!("{:<width$}", name_part, width = name_col);
+
+        if attr_summary.is_empty() {
+            let line = format!("{}{}", name_padded, profiles_display);
+            println!("{}", &line[..line.len().min(usable)]);
+        } else {
+            let fixed_len = name_padded.len() + profiles_display.len() + attr_summary.len();
+            let gap = usable.saturating_sub(fixed_len);
+            let spacer = " ".repeat(gap.max(2));
+            let line = format!("{}{}{}{}", name_padded, profiles_display, spacer, attr_summary);
+            println!("{}", &line[..line.len().min(usable)]);
+        }
+
+        if verbose {
+            // Indented detail lines
+            println!("  url: {}", entry.path);
+            if let Some(ref attrs) = entry.layout.attributes {
+                if let Some(ref model) = attrs.model {
+                    println!("  model: {}", model);
+                }
+                if let Some(ref vendor) = attrs.vendor {
+                    println!("  vendor: {}", vendor);
+                }
+                if let Some(ref license) = attrs.license {
+                    println!("  license: {}", license);
+                }
+                for (k, v) in &attrs.tags {
+                    println!("  tag.{}: {}", k, v);
+                }
+            }
+            // Show views for default profile
+            if let Some(profile) = entry.layout.profiles.0.get("default") {
+                let views: Vec<&str> = profile.view_names();
+                if !views.is_empty() {
+                    println!("  views: {}", views.join(", "));
+                }
+            }
+        }
+    }
+}
+
+/// Text output grouped by a key: `source`, `profile`, or `metric`.
+fn output_text_grouped(entries: &[&CatalogEntry], verbose: bool, key: &str, pv: &ProfileView) {
+    use std::collections::BTreeMap;
+
+    let width = terminal_width();
+
+    // Build (group_key → Vec<(dataset_name, profiles)>) mapping
+    let mut groups: BTreeMap<String, Vec<(&str, Vec<&str>)>> = BTreeMap::new();
+
+    for entry in entries {
+        let profile_names = pv.matching_profiles(entry);
+        if profile_names.is_empty() && pv.is_active() {
+            continue;
+        }
+
+        let group_key = match key {
+            "source" => entry.path.clone(),
+            "metric" => entry.layout.attributes.as_ref()
+                .and_then(|a| a.distance_function.clone())
+                .unwrap_or_else(|| "(unknown)".into()),
+            "profile" => {
+                // Group by profile: each profile becomes a group key
+                for pname in &profile_names {
+                    groups.entry(pname.to_string())
+                        .or_default()
+                        .push((&entry.name, vec![*pname]));
+                }
+                continue;
+            }
+            other => {
+                eprintln!("Error: unknown --group-by key '{}'. Use: source, profile, metric", other);
+                std::process::exit(1);
+            }
+        };
+
+        groups.entry(group_key)
+            .or_default()
+            .push((&entry.name, profile_names));
+    }
+
+    // Find longest dataset name across all groups for alignment
+    let max_name_len = groups.values()
+        .flat_map(|v| v.iter().map(|(name, _)| name.len()))
+        .max()
+        .unwrap_or(0)
+        .min(width / 3);
+    let name_col = max_name_len + 2;
+
+    let usable = width.saturating_sub(1);
+
+    for (group_key, datasets) in &groups {
+        println!("{}:", group_key);
+        for (name, profiles) in datasets {
+            let profiles_str = if profiles.len() == 1 && profiles[0] == "default" {
+                "[default]".to_string()
+            } else {
+                format!("[{}]", profiles.join(", "))
+            };
+
+            let name_padded = format!("  {:<width$}", name, width = name_col);
+            let line = format!("{}{}", name_padded, profiles_str);
+            println!("{}", &line[..line.len().min(usable)]);
 
             if verbose {
-                // URL (the resolved path)
-                println!(" url: {}", entry.path);
-
-                // Attributes
-                if let Some(ref attrs) = entry.layout.attributes {
-                    if let Some(ref df) = attrs.distance_function {
-                        println!(" distance_function: {}", df);
-                    }
-                    if let Some(ref model) = attrs.model {
-                        println!(" model: {}", model);
-                    }
-                    if let Some(ref vendor) = attrs.vendor {
-                        println!(" vendor: {}", vendor);
-                    }
-                    if let Some(ref license) = attrs.license {
-                        println!(" license: {}", license);
-                    }
-                    for (k, v) in &attrs.tags {
-                        println!(" tag.{}: {}", k, v);
-                    }
-                }
-
-                // Views for this profile
-                if let Some(profile) = entry.layout.profiles.0.get(*profile_name) {
-                    for view_name in profile.view_names() {
-                        println!(" view.{}: ...", view_name);
+                // Find the entry to show details
+                if let Some(entry) = entries.iter().find(|e| e.name == **name) {
+                    println!("    url: {}", entry.path);
+                    if let Some(ref attrs) = entry.layout.attributes {
+                        if let Some(ref df) = attrs.distance_function {
+                            println!("    metric: {}", df);
+                        }
                     }
                 }
             }
         }
+        println!();
     }
 }
 

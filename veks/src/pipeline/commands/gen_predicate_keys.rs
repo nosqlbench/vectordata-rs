@@ -562,14 +562,14 @@ impl MemProfile {
 
 impl CommandOp for GenPredicateKeysOp {
     fn command_path(&self) -> &str {
-        "compute predicates"
+        "compute evaluate-predicates"
     }
 
     fn command_doc(&self) -> CommandDoc {
         let options = self.describe_options();
         CommandDoc {
             summary: "Compute predicates against metadata to produce match ordinals".into(),
-            body: format!(r#"# compute predicates
+            body: format!(r#"# compute evaluate-predicates
 
 Compute predicates against metadata to produce match ordinals.
 

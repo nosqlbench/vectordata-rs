@@ -995,47 +995,75 @@ fn draw_progress<B: ratatui::backend::Backend>(
             return;
         }
 
-        // Build constraints: context line + bars + top panel (YAML + RPS) + status/chart + paused.
+        // Build constraints for full-height layout.
+        //
+        // Layout priority (top to bottom):
+        //   1. Context header line (1 line, if present)
+        //   2. Progress bars (1 line each)
+        //   3. Top panel: YAML + RPS chart (20 lines or 1/3 of remaining, whichever is greater)
+        //   4. Alert/extra budget line (1 line, if present)
+        //   5. Metrics chart (10 lines or 1/4 of total height, whichever is more, capped)
+        //   6. Paused indicator (1 line, if paused)
+        //   7. Log window (fills remaining vertical space)
         let has_chart = state.rss_history.data.len() >= 2;
         let has_rps_chart = state.rps_history.data.len() >= 2;
         let has_yaml = !state.step_yaml.is_empty();
         let has_top_panel = has_yaml || has_rps_chart;
-        let mut constraints: Vec<Constraint> = Vec::new();
-
-        if !state.context_label.is_empty() {
-            constraints.push(Constraint::Length(1)); // context header
-        }
-        for _ in &state.bar_order {
-            constraints.push(Constraint::Length(1)); // progress bar
-        }
         let has_extra = !state.alert.is_empty() || !state.extra_budget.is_empty();
         let has_resource_chart = !state.resource_status.is_empty() && has_chart;
+
+        // Calculate fixed-height rows consumed by chrome
+        let context_lines: u16 = if state.context_label.is_empty() { 0 } else { 1 };
+        let bar_lines = state.bar_order.len() as u16;
+        let extra_lines: u16 = if has_extra { 1 } else { 0 };
+        let paused_lines: u16 = if state.paused { 1 } else { 0 };
+
+        // Metrics chart height
+        let chart_height: u16 = if has_resource_chart {
+            let quarter = area.height / 4;
+            quarter.max(10).min(area.height.saturating_sub(8))
+        } else {
+            0
+        };
+
+        // Remaining height after chrome and metrics
+        let chrome = context_lines + bar_lines + extra_lines + paused_lines + chart_height;
+        let remaining = area.height.saturating_sub(chrome);
+
+        // Top panel: 20 lines or 1/3 of remaining, whichever is greater
+        let top_height: u16 = if has_top_panel {
+            let third = remaining / 3;
+            third.max(20).min(remaining.saturating_sub(4)) // leave at least some room for logs
+        } else {
+            0
+        };
+
+        // Log window: everything left over
+        let log_height = remaining.saturating_sub(top_height);
+
+        let mut constraints: Vec<Constraint> = Vec::new();
+
+        if context_lines > 0 {
+            constraints.push(Constraint::Length(1));
+        }
+        for _ in &state.bar_order {
+            constraints.push(Constraint::Length(1));
+        }
         if has_top_panel {
-            let top_height = if has_yaml { state.step_yaml_height } else { 8 };
             constraints.push(Constraint::Length(top_height));
         }
         if has_extra {
             constraints.push(Constraint::Length(1));
         }
         if has_resource_chart {
-            // Cap metrics chart: 10 lines or 1/4 of vertical space, whichever is more
-            let quarter = area.height / 4;
-            let chart_height = quarter.max(10).min(area.height.saturating_sub(8));
             constraints.push(Constraint::Length(chart_height));
         }
         if state.paused {
-            constraints.push(Constraint::Length(1)); // paused indicator
+            constraints.push(Constraint::Length(1));
         }
-        if !has_chart {
-            // Fill remaining space when no chart is shown.
-            constraints.push(Constraint::Min(0));
-        }
-        // Log window at the bottom — show recent log messages
-        let has_logs = !state.recent_logs.is_empty();
-        if has_logs {
-            let log_height = state.recent_logs.len().min(6) as u16;
-            constraints.push(Constraint::Length(log_height));
-        }
+        // Log window always present — fills remaining space
+        constraints.push(Constraint::Length(log_height));
+        let has_logs = true; // always render the log panel
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -1736,9 +1764,18 @@ fn format_rate(rps: f64, unit: &str) -> String {
         // it "14.6s/steps" scans as "14.6 steps/s" at a glance.
         // Also singularize the unit ("step" not "steps") since it's per-one.
         let spt = 1.0 / rps;
-        let singular = unit.strip_suffix('s')
-            .filter(|_| unit.len() > 1 && unit != "bytes")
-            .unwrap_or(unit);
+        let singular_owned;
+        let singular: &str = if unit == "bytes" || unit.len() <= 1 {
+            unit
+        } else if unit.ends_with("ies") && unit.len() > 3 {
+            // queries → query, entries → entry
+            singular_owned = format!("{}y", &unit[..unit.len() - 3]);
+            &singular_owned
+        } else if unit.ends_with('s') {
+            &unit[..unit.len() - 1]
+        } else {
+            unit
+        };
         if spt >= 3600.0 {
             format!("{:.0}h /{}", spt / 3600.0, singular)
         } else if spt >= 60.0 {
@@ -1829,6 +1866,8 @@ mod tests {
         // Plural unit is singularized in inverted format
         assert_eq!(format_rate(0.5, "vectors"), "2.0s /vector");
         assert_eq!(format_rate(0.5, "steps"), "2.0s /step");
+        assert_eq!(format_rate(0.5, "queries"), "2.0s /query");
+        assert_eq!(format_rate(0.5, "entries"), "2.0s /entry");
     }
 
     #[test]

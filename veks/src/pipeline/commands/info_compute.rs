@@ -25,7 +25,7 @@ pub fn factory() -> Box<dyn CommandOp> {
 
 impl CommandOp for InfoComputeOp {
     fn command_path(&self) -> &str {
-        "info compute"
+        "analyze compute-info"
     }
 
     fn command_doc(&self) -> CommandDoc {
@@ -33,7 +33,7 @@ impl CommandOp for InfoComputeOp {
         CommandDoc {
             summary: "Display compute capability information".into(),
             body: format!(
-                r#"# info compute
+                r#"# analyze compute-info
 
 Display compute capability information.
 

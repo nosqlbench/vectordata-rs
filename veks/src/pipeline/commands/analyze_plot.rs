@@ -284,7 +284,7 @@ fn render_scatter(
 
 impl CommandOp for AnalyzePlotOp {
     fn command_path(&self) -> &str {
-        "analyze plot"
+        "analyze visualize-plot"
     }
 
     fn command_doc(&self) -> CommandDoc {

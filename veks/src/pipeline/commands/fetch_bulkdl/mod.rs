@@ -43,7 +43,7 @@ enum DownloadResult {
 
 impl CommandOp for FetchBulkdlOp {
     fn command_path(&self) -> &str {
-        "fetch bulkdl"
+        "download bulk"
     }
 
     fn command_doc(&self) -> CommandDoc {
@@ -51,7 +51,7 @@ impl CommandOp for FetchBulkdlOp {
         CommandDoc {
             summary: "Bulk download files from a URL template".into(),
             body: format!(
-                r#"# fetch bulkdl
+                r#"# download bulk
 
 Bulk download files from a URL template.
 
@@ -495,6 +495,6 @@ mod tests {
     #[test]
     fn test_command_path() {
         let op = FetchBulkdlOp;
-        assert_eq!(op.command_path(), "fetch bulkdl");
+        assert_eq!(op.command_path(), "download bulk");
     }
 }

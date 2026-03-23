@@ -228,7 +228,7 @@ impl Ord for HeapEntry {
 
 impl CommandOp for ComputeDedupOp {
     fn command_path(&self) -> &str {
-        "compute dedup"
+        "compute sort"
     }
 
     fn command_doc(&self) -> CommandDoc {

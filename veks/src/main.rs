@@ -1,14 +1,24 @@
 // Copyright (c) DataStax, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use veks::{check, cli, datasets, pipeline, prepare, publish};
+use veks::{cli, datasets, explore, pipeline, prepare};
 
 use clap::{Arg, Command, CommandFactory, Parser, Subcommand};
 use clap_complete::CompleteEnv;
 
 /// Veks — umbrella CLI for vector data tools
 #[derive(Parser)]
-#[command(name = "veks", version, about, disable_help_subcommand = true)]
+#[command(
+    name = "veks",
+    version,
+    about,
+    disable_help_subcommand = true,
+    after_help = "\
+Most commands are organized under one of the top-level categories above.\n\
+If you know a command, you don't have to use the full `veks <category> ...` format.\n\
+For example, `veks run` is shorthand for `veks prepare run`.\n\n\
+Hit TAB twice to see the full expanded command list."
+)]
 struct Veks {
     #[command(subcommand)]
     command: Commands,
@@ -18,22 +28,16 @@ struct Veks {
 enum Commands {
     /// Browse, search, and manage datasets and catalogs
     Datasets(datasets::DatasetsArgs),
+    /// Interactive data visualization and exploration
+    Visualize(explore::ExploreArgs),
     /// Import, stratify, and prepare datasets for benchmarking
     Prepare(prepare::PrepareArgs),
-    /// Execute a command stream pipeline defined in dataset.yaml
-    Run(pipeline::RunArgs),
-    /// Emit a dataset pipeline as an equivalent shell script
-    Script(pipeline::ScriptArgs),
     /// Execute a single pipeline command directly
     #[command(disable_help_flag = true)]
     Pipeline {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    /// Pre-flight checks for dataset readiness
-    Check(check::CheckArgs),
-    /// Publish dataset to S3
-    Publish(publish::PublishArgs),
     /// Generate shell completions
     Completions(cli::CompletionsArgs),
     /// Show detailed help for a pipeline command or command group
@@ -205,14 +209,28 @@ fn build_help_completion_command() -> clap::Command {
 
 #[tokio::main]
 async fn main() {
-    // Double-tap detection: if the user taps Tab repeatedly at the root
-    // level (no subcommand context yet), show the full command list.
-    // Only triggers for root-level completions like `veks <TAB>`, not
-    // when already inside a subcommand like `veks prepare <TAB>`.
-    if std::env::var_os("COMPLETE").is_some() && is_root_completion() {
-        if let Some(output) = check_triple_tap() {
-            print!("{}", output);
-            std::process::exit(0);
+    // Root-level completion interception:
+    // 1. If the user typed a partial prefix (e.g., `veks se<TAB>`),
+    //    search ALL commands for prefix matches — not just root commands.
+    // 2. If the user typed nothing (e.g., `veks <TAB>`) and taps Tab
+    //    repeatedly, show the full expanded command list.
+    if std::env::var_os("COMPLETE").is_some() {
+        if let Some(prefix) = root_completion_prefix() {
+            if !prefix.is_empty() {
+                // Non-empty prefix: search all commands for matches
+                let filtered = filter_commands_by_prefix(&prefix);
+                if !filtered.is_empty() {
+                    print!("{}", filtered);
+                    std::process::exit(0);
+                }
+                // No matches in expanded set — fall through to clap
+            } else {
+                // Empty prefix: double-tap detection
+                if let Some(output) = check_triple_tap() {
+                    print!("{}", output);
+                    std::process::exit(0);
+                }
+            }
         }
     }
 
@@ -222,12 +240,9 @@ async fn main() {
 
     match veks.command {
         Commands::Datasets(args) => datasets::run(args),
+        Commands::Visualize(args) => explore::run(args),
         Commands::Prepare(args) => prepare::run(args),
-        Commands::Run(args) => pipeline::run_pipeline(args),
-        Commands::Script(args) => pipeline::run_script(args),
         Commands::Pipeline { args } => pipeline::cli::run_direct(args),
-        Commands::Check(args) => check::run(args),
-        Commands::Publish(args) => publish::run(args),
         Commands::Completions(args) => cli::completions(args),
         Commands::Help(args) => run_help(args),
         Commands::Shorthand(args) => dispatch_shorthand(args),
@@ -238,60 +253,97 @@ async fn main() {
 // Triple-tap detection
 // ---------------------------------------------------------------------------
 
-/// Check if the current completion invocation is at the root level.
-///
-/// The shell passes args like `-- veks ""` for `veks <TAB>` (root) vs
-/// `-- veks prepare ""` for `veks prepare <TAB>` (subcommand context).
-/// We only want the expanded list at the root level — when there are at
-/// most 2 real words after `--` (the program name and a partial/empty word).
-fn is_root_completion() -> bool {
+/// If this is a root-level completion, return the partial prefix the user
+/// has typed. Returns `Some("")` for `veks <TAB>`, `Some("se")` for
+/// `veks se<TAB>`, and `None` if we're inside a subcommand context.
+fn root_completion_prefix() -> Option<String> {
     let args: Vec<String> = std::env::args().collect();
-    // Find `--` separator; everything after it is the completion words.
     let after_separator = if let Some(pos) = args.iter().position(|a| a == "--") {
-        &args[pos + 1..]
+        args[pos + 1..].to_vec()
     } else {
-        // No separator — check raw arg count (program + maybe partial word)
-        return args.len() <= 2;
+        if args.len() <= 2 {
+            return Some(args.get(1).cloned().unwrap_or_default());
+        }
+        return None;
     };
-    // Root level: just the program name, or program name + partial/empty word
-    after_separator.len() <= 2
+    // Root level: program name + optional partial word
+    if after_separator.len() <= 2 {
+        Some(after_separator.get(1).cloned().unwrap_or_default())
+    } else {
+        None
+    }
+}
+
+/// Filter the full command list to entries matching a prefix.
+/// Returns fish-format completion output, or empty string if no matches.
+fn filter_commands_by_prefix(prefix: &str) -> String {
+    let full = build_full_command_list();
+    let mut matches = String::new();
+    for line in full.lines() {
+        // Each line is "command\tdescription"
+        let cmd = line.split('\t').next().unwrap_or("");
+        // Match against the first word of multi-word commands too
+        if cmd.starts_with(prefix) || cmd.split(' ').next().map(|w| w.starts_with(prefix)).unwrap_or(false) {
+            matches.push_str(line);
+            matches.push('\n');
+        }
+    }
+    matches
 }
 
 const TAP_FILE: &str = "/tmp/.veks_tab";
-const TAP_COUNT: usize = 2;
+/// Number of identical completion invocations before showing the expanded
+/// command list. Shells typically invoke completion twice per Tab press
+/// (once to compute, once to display), so 3 means: first Tab shows normal
+/// completions, second Tab triggers the expanded list.
+const TAP_COUNT: usize = 3;
+
+/// Maximum age (in seconds) for a tap file entry to be considered valid.
+/// Prevents stale state from a previous session triggering the expanded list.
+const TAP_MAX_AGE_SECS: u64 = 10;
 
 /// Check if the user has tapped Tab repeatedly in the same completion state.
 ///
 /// Tracks the completion args (cursor position + partial input) in a file.
-/// If the same state is seen `TAP_COUNT` times in a row, the user is
-/// repeatedly hitting Tab without changing their input — trigger the
-/// expanded command list. No timing constraint; purely state-based.
+/// If the same state is seen `TAP_COUNT` times in a row within
+/// `TAP_MAX_AGE_SECS`, the user is repeatedly hitting Tab without
+/// changing their input — trigger the expanded command list.
 ///
 /// If /tmp is not writable or accessible, silently returns `None`.
 fn check_triple_tap() -> Option<String> {
+    use std::time::SystemTime;
+
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+
     // Build a fingerprint of the current completion state from env/args.
-    // The shell passes the words and cursor index via env vars or args.
     let state_key: String = std::env::args().skip(1).collect::<Vec<_>>().join("\x00");
 
     // Read previous state (best-effort)
-    let (prev_key, prev_count) = std::fs::read_to_string(TAP_FILE)
+    // Format: count\ntimestamp\nstate_key
+    let (prev_key, prev_count, prev_time) = std::fs::read_to_string(TAP_FILE)
         .ok()
         .and_then(|content| {
             let mut lines = content.lines();
             let count: usize = lines.next()?.parse().ok()?;
+            let timestamp: u64 = lines.next()?.parse().ok()?;
             let key = lines.next().unwrap_or("").to_string();
-            Some((key, count))
+            Some((key, count, timestamp))
         })
         .unwrap_or_default();
 
-    let count = if state_key == prev_key {
+    let is_stale = now.saturating_sub(prev_time) > TAP_MAX_AGE_SECS;
+
+    let count = if state_key == prev_key && !is_stale {
         prev_count + 1
     } else {
         1
     };
 
     // Write back (best-effort, silently ignore errors)
-    let _ = std::fs::write(TAP_FILE, format!("{}\n{}", count, state_key));
+    let _ = std::fs::write(TAP_FILE, format!("{}\n{}\n{}", count, now, state_key));
 
     if count >= TAP_COUNT {
         // Reset so next tap starts fresh
@@ -303,31 +355,35 @@ fn check_triple_tap() -> Option<String> {
 }
 
 /// Build a fish-format completion list of all available commands.
+/// Build the full command list dynamically from the clap tree + pipeline registry.
+///
+/// Used by the double-tap completion and prefix-filtered completion.
+/// Walks the derive-generated command tree so it never goes stale.
 fn build_full_command_list() -> String {
+    let cmd = Veks::command();
     let mut lines: Vec<String> = Vec::new();
 
-    // Root commands
-    lines.push("datasets\tBrowse, search, and manage datasets".into());
-    lines.push("prepare\tImport, stratify, and prepare datasets".into());
-    lines.push("run\tExecute pipeline from dataset.yaml".into());
-    lines.push("script\tEmit pipeline as shell script".into());
-    lines.push("pipeline\tExecute a single pipeline command".into());
-    lines.push("check\tPre-flight checks for dataset readiness".into());
-    lines.push("publish\tPublish dataset to S3".into());
-    lines.push("help\tShow help for a command".into());
+    // Groups whose children should NOT appear as shorthands in the flat list
+    let internal_groups = ["pipeline", "help", "completions"];
 
-    // Prepare subcommands (usable directly via shorthand)
-    lines.push("import\tBootstrap dataset from source files".into());
-    lines.push("stratify\tAdd sized profiles to dataset".into());
-    lines.push("catalog\tGenerate dataset catalog index".into());
-    lines.push("cache-compress\tCompress eligible cache files".into());
-    lines.push("cache-uncompress\tDecompress cache files".into());
+    for sub in cmd.get_subcommands() {
+        let name = sub.get_name();
+        let about = sub.get_about().map(|s| s.to_string()).unwrap_or_default();
 
-    // Datasets subcommands (usable directly via shorthand)
-    lines.push("list\tList available datasets from catalogs".into());
-    lines.push("cache\tList locally cached datasets".into());
-    lines.push("curlify\tGenerate curl download commands".into());
-    lines.push("prebuffer\tDownload and cache dataset facets".into());
+        // Always show the group itself
+        lines.push(format!("{}\t{}", name, about));
+
+        // For non-internal groups with subcommands, also show children as shorthands
+        if !internal_groups.contains(&name) {
+            for child in sub.get_subcommands() {
+                let child_name = child.get_name();
+                let child_about = child.get_about()
+                    .map(|s| s.to_string())
+                    .unwrap_or_default();
+                lines.push(format!("{}\t{}", child_name, child_about));
+            }
+        }
+    }
 
     // Pipeline commands from the registry
     let registry = pipeline::registry::CommandRegistry::with_builtins();
@@ -342,32 +398,54 @@ fn build_full_command_list() -> String {
 // Shorthand subcommand dispatch
 // ---------------------------------------------------------------------------
 
-/// Subcommand-to-group mapping for shorthand dispatch.
+/// Build the shorthand map dynamically by walking the clap command tree.
 ///
-/// All subcommand names MUST be globally unique across all groups.
-/// This is a design invariant — new subcommands must not collide with
-/// existing names in any group. If a collision is introduced, it must
-/// be resolved by renaming one of the conflicting commands.
-const SHORTHAND_COMMANDS: &[(&str, &str)] = &[
-    // prepare subcommands
-    ("import", "prepare"),
-    ("stratify", "prepare"),
-    ("catalog", "prepare"),
-    ("cache-compress", "prepare"),
-    ("cache-uncompress", "prepare"),
-    // datasets subcommands
-    ("list", "datasets"),
-    ("ls", "datasets"),
-    ("cache", "datasets"),
-    ("curlify", "datasets"),
-    ("prebuffer", "datasets"),
-];
+/// Enumerates all subcommands of groups that have nested subcommands
+/// (like `prepare`, `datasets`, `visualize`) and maps each leaf
+/// subcommand name → group name. This eliminates the static table that
+/// was prone to going stale.
+///
+/// All subcommand names MUST be globally unique across all groups
+/// (SRD §1.4.1). If a collision is detected at build time, this will
+/// produce ambiguous results — but the design invariant prevents that.
+fn build_shorthand_map() -> Vec<(String, String)> {
+    let cmd = Veks::command();
+    let mut map = Vec::new();
+
+    // Groups that should NOT have their subcommands exposed as shorthands
+    let skip_groups = ["pipeline", "help", "completions"];
+
+    for sub in cmd.get_subcommands() {
+        let group = sub.get_name().to_string();
+        if skip_groups.contains(&group.as_str()) {
+            continue;
+        }
+
+        let children: Vec<_> = sub.get_subcommands().collect();
+        if children.is_empty() {
+            // No subcommands — this is a leaf root command, not a group
+            continue;
+        }
+
+        for child in children {
+            let name = child.get_name().to_string();
+            map.push((name.clone(), group.clone()));
+
+            // Also register aliases
+            for alias in child.get_all_aliases() {
+                map.push((alias.to_string(), group.clone()));
+            }
+        }
+    }
+
+    map
+}
 
 /// Dispatch an unrecognized root-level subcommand.
 ///
-/// Looks up the name in the shorthand table. If found, re-parses with
-/// the group prefix inserted. If not found, falls through to the
-/// pipeline command registry as a last resort.
+/// Walks the clap command tree to find which group owns this subcommand
+/// name, then re-parses with the group prefix inserted. Falls through
+/// to the pipeline command registry if no match is found.
 fn dispatch_shorthand(args: Vec<String>) {
     if args.is_empty() {
         eprintln!("Error: no command specified. Run `veks --help` for usage.");
@@ -375,14 +453,16 @@ fn dispatch_shorthand(args: Vec<String>) {
     }
 
     let name = &args[0];
+    let shorthand_map = build_shorthand_map();
 
-    // Look up in the shorthand table
-    if let Some((_, group)) = SHORTHAND_COMMANDS.iter().find(|(cmd, _)| *cmd == name.as_str()) {
-        let mut full_args = vec!["veks".to_string(), group.to_string()];
+    // Look up in the dynamic shorthand map
+    if let Some((_, group)) = shorthand_map.iter().find(|(cmd, _)| cmd == name) {
+        let mut full_args = vec!["veks".to_string(), group.clone()];
         full_args.extend(args);
         let veks = Veks::parse_from(full_args);
         match veks.command {
             Commands::Datasets(a) => datasets::run(a),
+            Commands::Visualize(a) => explore::run(a),
             Commands::Prepare(a) => prepare::run(a),
             _ => unreachable!(),
         }

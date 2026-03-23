@@ -156,6 +156,7 @@ pub fn run_script(args: ScriptArgs) {
 
     let raw_workspace = dataset_path
         .parent()
+        .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."))
         .to_path_buf();
 
@@ -243,6 +244,7 @@ pub fn run_script(args: ScriptArgs) {
         &workspace,
         progress.as_ref(),
         workspace_is_cwd,
+        args.absolute,
     );
 }
 
@@ -596,7 +598,7 @@ fn print_run_summary(summary: &runner::RunSummary) {
 /// Print post-completion guidance about the cache directory.
 ///
 /// Informs the user that `.cache/` contains intermediate artifacts that are
-/// expensive to recompute, and suggests `veks datasets cache-compress` if
+/// expensive to recompute, and suggests `veks prepare cache-compress` if
 /// the pipeline was not already configured with `compress_cache: true`.
 fn print_cache_guidance(cache_dir: &std::path::Path, steps: &[dag::ResolvedStep]) {
     use crate::term;
@@ -628,7 +630,7 @@ fn print_cache_guidance(cache_dir: &std::path::Path, steps: &[dag::ResolvedStep]
     if !has_compress {
         println!();
         println!("  To reduce cache size, run:");
-        println!("    {}", term::ok("veks datasets cache-compress"));
+        println!("    {}", term::ok("veks prepare cache-compress"));
     }
 }
 
@@ -692,6 +694,7 @@ fn emit_cli_commands(
     workspace: &Path,
     progress: Option<&ProgressLog>,
     workspace_is_cwd: bool,
+    absolute: bool,
 ) {
     let workspace_str = workspace.to_string_lossy();
 
@@ -749,6 +752,13 @@ fn emit_cli_commands(
                 other => format!("{:?}", other),
             };
 
+            // Relativize absolute paths when --absolute is not set.
+            let val_str = if !absolute && val_str.starts_with('/') {
+                relativize_path(&val_str, workspace)
+            } else {
+                val_str
+            };
+
             // Rewrite unqualified ${name} references to ${variables:name}
             // when the name is a known variables.yaml key.
             let cli_val = rewrite_var_refs(&val_str, &var_names);
@@ -764,6 +774,37 @@ fn emit_cli_commands(
 
         println!("{}", cmd);
         println!();
+    }
+}
+
+/// Make an absolute path relative to the workspace directory.
+///
+/// If the path is under the workspace, returns the relative portion.
+/// If not, returns the original path unchanged (it's external).
+fn relativize_path(path_str: &str, workspace: &Path) -> String {
+    // Handle paths with window suffixes like "/path/to/file.mvec[0..100)"
+    let (path_part, suffix) = if let Some(bracket) = path_str.find('[') {
+        (&path_str[..bracket], &path_str[bracket..])
+    } else if let Some(paren) = path_str.find('(') {
+        (&path_str[..paren], &path_str[paren..])
+    } else {
+        (path_str, "")
+    };
+
+    let abs_path = Path::new(path_part);
+    let abs_workspace = std::fs::canonicalize(workspace)
+        .unwrap_or_else(|_| workspace.to_path_buf());
+
+    if let Ok(rel) = abs_path.strip_prefix(&abs_workspace) {
+        format!("{}{}", rel.display(), suffix)
+    } else {
+        // Try canonicalizing the path too in case of symlinks
+        if let Ok(canonical) = std::fs::canonicalize(abs_path) {
+            if let Ok(rel) = canonical.strip_prefix(&abs_workspace) {
+                return format!("{}{}", rel.display(), suffix);
+            }
+        }
+        path_str.to_string()
     }
 }
 

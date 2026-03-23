@@ -32,7 +32,7 @@ pub fn factory() -> Box<dyn CommandOp> {
 
 impl CommandOp for InspectPredicateOp {
     fn command_path(&self) -> &str {
-        "inspect predicate"
+        "analyze explain-predicates"
     }
 
     fn command_doc(&self) -> CommandDoc {
@@ -40,7 +40,7 @@ impl CommandOp for InspectPredicateOp {
         CommandDoc {
             summary: "Inspect predicate ↔ metadata relationship via metadata-indices".into(),
             body: format!(
-                r#"# inspect predicate
+                r#"# analyze predicate
 
 Inspect predicate ↔ metadata relationship via metadata-indices.
 

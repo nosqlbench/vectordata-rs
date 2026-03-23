@@ -209,7 +209,7 @@ fn compare_values(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
 
 impl CommandOp for JsonJjqOp {
     fn command_path(&self) -> &str {
-        "json jjq"
+        "query json"
     }
 
     fn command_doc(&self) -> CommandDoc {
@@ -217,7 +217,7 @@ impl CommandOp for JsonJjqOp {
         CommandDoc {
             summary: "Query JSON files with jq-like expressions".into(),
             body: format!(
-                r#"# json jjq
+                r#"# query json
 
 Query JSON files with jq-like expressions.
 

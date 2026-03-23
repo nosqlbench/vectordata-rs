@@ -100,7 +100,7 @@ fn ks_p_value(z: f64) -> f64 {
 
 impl CommandOp for AnalyzeCompareOp {
     fn command_path(&self) -> &str {
-        "analyze compare"
+        "analyze compare-files"
     }
 
     fn command_doc(&self) -> CommandDoc {

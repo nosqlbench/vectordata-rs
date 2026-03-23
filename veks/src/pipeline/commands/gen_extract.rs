@@ -44,14 +44,14 @@ pub fn fvec_factory() -> Box<dyn CommandOp> {
 
 impl CommandOp for GenerateFvecExtractOp {
     fn command_path(&self) -> &str {
-        "transform fvec-extract"
+        "transform extract"
     }
 
     fn command_doc(&self) -> CommandDoc {
         let options = self.describe_options();
         CommandDoc {
             summary: "Extract a subset of vectors from an fvec file".into(),
-            body: format!(r#"# transform fvec-extract
+            body: format!(r#"# transform extract
 
 Extract a subset of vectors from an fvec file.
 
@@ -314,14 +314,14 @@ pub fn ivec_factory() -> Box<dyn CommandOp> {
 
 impl CommandOp for GenerateIvecExtractOp {
     fn command_path(&self) -> &str {
-        "transform ivec-extract"
+        "transform extract"
     }
 
     fn command_doc(&self) -> CommandDoc {
         let options = self.describe_options();
         CommandDoc {
             summary: "Extract a subset of vectors from an ivec file".into(),
-            body: format!(r#"# transform ivec-extract
+            body: format!(r#"# transform extract
 
 Extract a subset of vectors from an ivec file.
 
@@ -628,14 +628,14 @@ pub fn mvec_factory() -> Box<dyn CommandOp> {
 
 impl CommandOp for GenerateMvecExtractOp {
     fn command_path(&self) -> &str {
-        "transform mvec-extract"
+        "transform extract"
     }
 
     fn command_doc(&self) -> CommandDoc {
         let options = self.describe_options();
         CommandDoc {
             summary: "Extract a subset of vectors from an mvec file".into(),
-            body: format!(r#"# transform mvec-extract
+            body: format!(r#"# transform extract
 
 Extract a subset of vectors from an mvec file.
 
@@ -929,14 +929,14 @@ pub fn slab_factory() -> Box<dyn CommandOp> {
 
 impl CommandOp for GenerateSlabExtractOp {
     fn command_path(&self) -> &str {
-        "transform slab-extract"
+        "transform extract-slab"
     }
 
     fn command_doc(&self) -> CommandDoc {
         let options = self.describe_options();
         CommandDoc {
             summary: "Extract and reorder records from a slab file".into(),
-            body: format!(r#"# transform slab-extract
+            body: format!(r#"# transform extract-slab
 
 Extract and reorder records from a slab file.
 

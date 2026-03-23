@@ -29,7 +29,7 @@ pub struct PrepareArgs {
 #[derive(Subcommand)]
 pub enum PrepareCommand {
     /// Bootstrap a new dataset directory from source files
-    Import {
+    Bootstrap {
         /// Interactive wizard mode — prompts for each option
         #[arg(long, short = 'i')]
         interactive: bool,
@@ -159,6 +159,14 @@ pub enum PrepareCommand {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Execute the pipeline defined in dataset.yaml
+    Run(crate::pipeline::RunArgs),
+    /// Pre-flight checks for dataset readiness
+    Check(crate::check::CheckArgs),
+    /// Emit a dataset pipeline as an equivalent shell script
+    GenerateScript(crate::pipeline::ScriptArgs),
+    /// Publish dataset to S3
+    Publish(crate::publish::PublishArgs),
     /// Decompress cache files back to their original form
     CacheUncompress {
         /// Cache directory to uncompress (default: .cache/ in current directory)
@@ -202,7 +210,7 @@ pub enum CatalogSubcommand {
 /// Dispatch a prepare subcommand.
 pub fn run(args: PrepareArgs) {
     match args.command {
-        PrepareCommand::Import {
+        PrepareCommand::Bootstrap {
             interactive, yes, name, output, base_vectors, query_vectors,
             self_search, query_count, metadata, ground_truth,
             ground_truth_distances, metric, neighbors, seed, description,
@@ -245,6 +253,18 @@ pub fn run(args: PrepareArgs) {
                     sized_profiles: None,
                 });
             }
+        }
+        PrepareCommand::Run(args) => {
+            crate::pipeline::run_pipeline(args);
+        }
+        PrepareCommand::GenerateScript(args) => {
+            crate::pipeline::run_script(args);
+        }
+        PrepareCommand::Check(args) => {
+            crate::check::run(args);
+        }
+        PrepareCommand::Publish(args) => {
+            crate::publish::run(args);
         }
         PrepareCommand::Stratify { path, spec, force, yes } => {
             stratify::run(&path, spec.as_deref(), force, yes);

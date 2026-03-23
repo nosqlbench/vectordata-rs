@@ -12,7 +12,7 @@ mod cache;
 mod curlify;
 pub mod filter;
 mod list;
-mod prebuffer;
+pub(crate) mod prebuffer;
 
 use std::path::PathBuf;
 
@@ -52,6 +52,10 @@ pub enum DatasetsCommand {
         /// Show detailed information including attributes, tags, and views
         #[arg(long, short = 'v')]
         verbose: bool,
+
+        /// Group output by: source, profile, or metric (text format only)
+        #[arg(long = "group-by", value_name = "KEY")]
+        group_by: Option<String>,
 
         /// Limit output to profiles matching this name (exact, case-insensitive)
         #[arg(long, add = ArgValueCompleter::new(filter::profile_completer))]
@@ -128,7 +132,7 @@ pub enum DatasetsCommand {
         data_max: Option<String>,
     },
     /// List locally cached datasets
-    Cache {
+    ListCache {
         /// Override cache directory location
         #[arg(long)]
         cache_dir: Option<PathBuf>,
@@ -146,6 +150,12 @@ pub enum DatasetsCommand {
         /// Output directory for downloads
         #[arg(long)]
         output: Option<PathBuf>,
+    },
+    /// Configure vectordata settings (cache directory, mounts)
+    #[command(disable_help_subcommand = true)]
+    Config {
+        #[command(subcommand)]
+        command: ConfigSubcommand,
     },
     /// Download and cache dataset facets locally
     Prebuffer {
@@ -171,6 +181,17 @@ pub enum DatasetsCommand {
     },
 }
 
+/// Subcommands under `veks datasets config`.
+#[derive(Subcommand)]
+pub enum ConfigSubcommand {
+    /// Display current vectordata configuration
+    Show,
+    /// Initialize a new vectordata configuration
+    Init,
+    /// List configured dataset mount points
+    ListMounts,
+}
+
 /// Dispatch to the appropriate datasets subcommand.
 pub fn run(args: DatasetsArgs) {
     match args.command {
@@ -180,6 +201,7 @@ pub fn run(args: DatasetsArgs) {
             at,
             output_format,
             verbose,
+            group_by,
             name,
             name_regex,
             facet,
@@ -223,16 +245,59 @@ pub fn run(args: DatasetsArgs) {
                     .unwrap_or_else(|e| { eprintln!("ERROR: --with-data-max: {}", e); std::process::exit(1); }),
             };
             let profile_view = filter::ProfileView::new(profile, profile_regex);
-            list::run(&configdir, &catalog, &at, &output_format, verbose, &filter, &profile_view, select.as_deref());
+            list::run(&configdir, &catalog, &at, &output_format, verbose, group_by.as_deref(), &filter, &profile_view, select.as_deref());
         }
-        DatasetsCommand::Cache { cache_dir, verbose } => {
+        DatasetsCommand::ListCache { cache_dir, verbose } => {
             cache::run(cache_dir.as_deref(), verbose);
         }
         DatasetsCommand::Curlify { path, output } => {
             curlify::run(&path, output.as_deref());
         }
+        DatasetsCommand::Config { command } => {
+            run_config_command(command);
+        }
         DatasetsCommand::Prebuffer { dataset, configdir, catalog, at, cache_dir } => {
             prebuffer::run(&dataset, &configdir, &catalog, &at, cache_dir.as_deref());
         }
+    }
+}
+
+/// Run a config subcommand by dispatching to the pipeline CommandOp.
+fn run_config_command(command: ConfigSubcommand) {
+    use crate::pipeline::command::{CommandOp, Options, StreamContext, Status};
+    use crate::pipeline::progress::ProgressLog;
+    use crate::pipeline::resource::ResourceGovernor;
+    use crate::pipeline::commands::config;
+    use indexmap::IndexMap;
+
+    let mut cmd: Box<dyn CommandOp> = match command {
+        ConfigSubcommand::Show => config::show_factory(),
+        ConfigSubcommand::Init => config::init_factory(),
+        ConfigSubcommand::ListMounts => config::list_mounts_factory(),
+    };
+
+    let workspace = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let mut ctx = StreamContext {
+        dataset_name: String::new(),
+        profile: String::new(),
+        profile_names: vec![],
+        workspace: workspace.clone(),
+        scratch: workspace.join(".scratch"),
+        cache: workspace.join(".cache"),
+        defaults: IndexMap::new(),
+        dry_run: false,
+        progress: ProgressLog::new(),
+        threads: 0,
+        step_id: String::new(),
+        governor: ResourceGovernor::default_governor(),
+        ui: crate::ui::UiHandle::new(std::sync::Arc::new(crate::ui::PlainSink::new())),
+        status_interval: std::time::Duration::from_secs(1),
+    };
+
+    let opts = Options::new();
+    let result = cmd.execute(&opts, &mut ctx);
+    if result.status == Status::Error {
+        eprintln!("Error: {}", result.message);
+        std::process::exit(1);
     }
 }

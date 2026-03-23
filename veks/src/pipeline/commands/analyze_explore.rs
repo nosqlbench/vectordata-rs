@@ -31,7 +31,7 @@ pub fn factory() -> Box<dyn CommandOp> {
 
 impl CommandOp for AnalyzeExploreOp {
     fn command_path(&self) -> &str {
-        "analyze explore"
+        "analyze visualize-explore"
     }
 
     fn command_doc(&self) -> CommandDoc {

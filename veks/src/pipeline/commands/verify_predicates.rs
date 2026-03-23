@@ -30,7 +30,7 @@ pub fn factory() -> Box<dyn CommandOp> {
 
 impl CommandOp for VerifyPredicatesOp {
     fn command_path(&self) -> &str {
-        "verify predicates"
+        "verify predicate-results"
     }
 
     fn command_doc(&self) -> CommandDoc {
@@ -38,7 +38,7 @@ impl CommandOp for VerifyPredicatesOp {
         CommandDoc {
             summary: "Verify predicate evaluation results using SQLite as source of truth".into(),
             body: format!(
-                "# verify predicates\n\n\
+                "# verify predicate-results\n\n\
                 Verify predicate evaluation results using SQLite as source of truth.\n\n\
                 ## Description\n\n\
                 Loads metadata records from a slab file into an in-memory SQLite database, \

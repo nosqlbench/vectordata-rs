@@ -179,7 +179,7 @@ fn read_samples(
 
 impl CommandOp for InfoFileOp {
     fn command_path(&self) -> &str {
-        "info file"
+        "analyze file"
     }
 
     fn command_doc(&self) -> CommandDoc {
@@ -187,7 +187,7 @@ impl CommandOp for InfoFileOp {
         CommandDoc {
             summary: "Display file format, dimensions, and record count".into(),
             body: format!(
-                r#"# info file
+                r#"# analyze file
 
 Display file format, dimensions, and record count.
 

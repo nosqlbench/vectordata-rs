@@ -34,14 +34,14 @@ pub fn factory() -> Box<dyn CommandOp> {
 
 impl CommandOp for GenPredicatesOp {
     fn command_path(&self) -> &str {
-        "synthesize predicates"
+        "generate predicates"
     }
 
     fn command_doc(&self) -> CommandDoc {
         let options = self.describe_options();
         CommandDoc {
             summary: "Generate random predicate trees from metadata survey".into(),
-            body: format!(r#"# synthesize predicates
+            body: format!(r#"# generate predicates
 
 Generate random predicate trees from metadata survey.
 

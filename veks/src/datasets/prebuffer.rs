@@ -316,7 +316,7 @@ fn default_cache_dir() -> PathBuf {
     }
 }
 
-fn download_file(url: &str, dest: &Path) -> Result<u64, String> {
+pub(crate) fn download_file(url: &str, dest: &Path) -> Result<u64, String> {
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("failed to create dir: {}", e))?;

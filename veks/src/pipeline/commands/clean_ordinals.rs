@@ -31,14 +31,14 @@ pub fn factory() -> Box<dyn CommandOp> {
 
 impl CommandOp for CleanOrdinalsOp {
     fn command_path(&self) -> &str {
-        "transform clean-ordinals"
+        "transform ordinals"
     }
 
     fn command_doc(&self) -> CommandDoc {
         let options = self.describe_options();
         CommandDoc {
             summary: "Filter ordinal index by excluding duplicates and zeros".into(),
-            body: format!(r#"# transform clean-ordinals
+            body: format!(r#"# transform ordinals
 
 Filter an ordinal index by excluding duplicate and zero-vector ordinals.
 

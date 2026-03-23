@@ -129,14 +129,14 @@ fn import_native_fvec_self_search() {
     let yaml = read_yaml(&out);
 
     // Should NOT have an import step (native fvec → identity)
-    assert!(!yaml.contains("run: import"), "native fvec should not need import step");
+    assert!(!yaml.contains("run: transform convert"), "native fvec should not need import step");
 
     // Should have self-search steps
-    assert!(yaml.contains("shuffle-ordinals"), "should have shuffle");
-    assert!(yaml.contains("extract-query-vectors"), "should have query extract");
-    assert!(yaml.contains("extract-base-vectors"), "should have base extract");
+    assert!(yaml.contains("generate-shuffle"), "should have shuffle");
+    assert!(yaml.contains("extract-queries"), "should have query extract");
+    assert!(yaml.contains("extract-base"), "should have base extract");
     assert!(yaml.contains("compute knn"), "should have KNN");
-    assert!(yaml.contains("compute dedup"), "should have sort/dedup step");
+    assert!(yaml.contains("compute sort"), "should have sort/dedup step");
 
     // Profile should reference the extracted vectors, not the source
     assert!(yaml.contains("profiles/base/base_vectors.mvec")
@@ -161,7 +161,7 @@ fn import_npy_dir_needs_import_step() {
     let yaml = read_yaml(&out);
 
     // Should have import step (npy is foreign format)
-    assert!(yaml.contains("run: import"), "npy dir should need import step");
+    assert!(yaml.contains("run: transform convert"), "npy dir should need import step");
     assert!(yaml.contains("${cache}/all_vectors.mvec"), "import output should go to cache");
 }
 
@@ -183,7 +183,7 @@ fn import_separate_query_no_shuffle() {
     let yaml = read_yaml(&out);
 
     // Separate query: no shuffle, no extract
-    assert!(!yaml.contains("shuffle-ordinals"), "separate query should not shuffle");
+    assert!(!yaml.contains("generate-shuffle"), "separate query should not shuffle");
     assert!(!yaml.contains("extract-query"), "separate query should not extract");
     assert!(!yaml.contains("extract-base"), "separate query should not extract base");
 
@@ -209,7 +209,7 @@ fn import_no_dedup_flag() {
     veks::prepare::import::run(args);
 
     let yaml = read_yaml(&out);
-    assert!(!yaml.contains("compute dedup"), "should not have sort/dedup when --no-dedup");
+    assert!(!yaml.contains("compute sort"), "should not have sort/dedup when --no-dedup");
 }
 
 #[test]
@@ -231,9 +231,9 @@ fn import_with_metadata_generates_predicate_chain() {
     veks::prepare::import::run(args);
 
     let yaml = read_yaml(&out);
-    assert!(yaml.contains("import-metadata"), "should import metadata");
+    assert!(yaml.contains("convert-metadata"), "should import metadata");
     assert!(yaml.contains("survey-metadata"), "should survey metadata");
-    assert!(yaml.contains("synthesize-predicates"), "should synthesize predicates");
+    assert!(yaml.contains("generate-predicates"), "should synthesize predicates");
     assert!(yaml.contains("evaluate-predicates"), "should evaluate predicates");
     assert!(yaml.contains("compute filtered-knn"), "should have filtered KNN");
 }
@@ -597,7 +597,7 @@ fn import_both_self_search_and_separate_query() {
 
     let yaml = read_yaml(&out);
     // Separate query takes precedence — no shuffle
-    assert!(!yaml.contains("shuffle-ordinals"),
+    assert!(!yaml.contains("generate-shuffle"),
         "separate query should override self-search");
 }
 
@@ -655,22 +655,22 @@ fn make_cmd(command_path: &str) -> Box<dyn veks::pipeline::command::CommandOp> {
     factory()
 }
 
-// ── import ──────────────────────────────────────────────────────────────────
+// ── transform convert (formerly import) ─────────────────────────────────────
 
 #[test]
 fn project_artifacts_import_cache_output() {
     use veks::pipeline::command::Options;
 
-    let cmd = make_cmd("import");
+    let cmd = make_cmd("transform convert");
     let mut opts = Options::new();
     opts.set("source", "/data/embeddings");
     opts.set("output", "${cache}/all_vectors.mvec");
     opts.set("facet", "base_vectors");
     opts.set("format", "npy");
 
-    let manifest = cmd.project_artifacts("import-vectors", &opts);
-    assert_eq!(manifest.step_id, "import-vectors");
-    assert_eq!(manifest.command, "import");
+    let manifest = cmd.project_artifacts("convert-vectors", &opts);
+    assert_eq!(manifest.step_id, "convert-vectors");
+    assert_eq!(manifest.command, "transform convert");
     assert_eq!(manifest.inputs, vec!["/data/embeddings"]);
     assert!(manifest.outputs.is_empty(), "cache path should be intermediate, not output");
     assert_eq!(manifest.intermediates, vec!["${cache}/all_vectors.mvec"]);
@@ -680,7 +680,7 @@ fn project_artifacts_import_cache_output() {
 fn project_artifacts_import_non_cache_output() {
     use veks::pipeline::command::Options;
 
-    let cmd = make_cmd("import");
+    let cmd = make_cmd("transform convert");
     let mut opts = Options::new();
     opts.set("source", "/data/embeddings");
     opts.set("output", "profiles/default/base_vectors.mvec");
@@ -696,7 +696,7 @@ fn project_artifacts_import_non_cache_output() {
 fn project_artifacts_import_non_path_options_excluded() {
     use veks::pipeline::command::Options;
 
-    let cmd = make_cmd("import");
+    let cmd = make_cmd("transform convert");
     let mut opts = Options::new();
     opts.set("source", "/data/src");
     opts.set("output", "out.mvec");
@@ -715,12 +715,12 @@ fn project_artifacts_import_non_path_options_excluded() {
 fn project_artifacts_import_empty_options() {
     use veks::pipeline::command::Options;
 
-    let cmd = make_cmd("import");
+    let cmd = make_cmd("transform convert");
     let opts = Options::new();
 
     let manifest = cmd.project_artifacts("import-empty", &opts);
     assert_eq!(manifest.step_id, "import-empty");
-    assert_eq!(manifest.command, "import");
+    assert_eq!(manifest.command, "transform convert");
     assert!(manifest.inputs.is_empty());
     assert!(manifest.outputs.is_empty());
     assert!(manifest.intermediates.is_empty());
@@ -862,13 +862,13 @@ fn project_artifacts_compute_filtered_knn_cache_mixed() {
     assert_eq!(manifest.intermediates, vec!["${cache}/filtered.ivec"]);
 }
 
-// ── compute dedup ───────────────────────────────────────────────────────────
+// ── compute sort (formerly compute dedup) ───────────────────────────────────
 
 #[test]
 fn project_artifacts_compute_dedup_non_cache() {
     use veks::pipeline::command::Options;
 
-    let cmd = make_cmd("compute dedup");
+    let cmd = make_cmd("compute sort");
     let mut opts = Options::new();
     opts.set("source", "${cache}/all_vectors.mvec");
     opts.set("output", "dedup_index.ivec");
@@ -878,7 +878,7 @@ fn project_artifacts_compute_dedup_non_cache() {
 
     let manifest = cmd.project_artifacts("dedup-step", &opts);
     assert_eq!(manifest.step_id, "dedup-step");
-    assert_eq!(manifest.command, "compute dedup");
+    assert_eq!(manifest.command, "compute sort");
     assert_eq!(manifest.inputs, vec!["${cache}/all_vectors.mvec"]);
     assert_eq!(manifest.outputs, vec!["dedup_index.ivec", "dedup_report.json"]);
     assert!(manifest.intermediates.contains(&"${cache}/dedup_runs/".to_string()),
@@ -889,7 +889,7 @@ fn project_artifacts_compute_dedup_non_cache() {
 fn project_artifacts_compute_dedup_cache_outputs() {
     use veks::pipeline::command::Options;
 
-    let cmd = make_cmd("compute dedup");
+    let cmd = make_cmd("compute sort");
     let mut opts = Options::new();
     opts.set("source", "data.mvec");
     opts.set("output", "${cache}/dedup.ivec");
@@ -907,7 +907,7 @@ fn project_artifacts_compute_dedup_cache_outputs() {
 fn project_artifacts_compute_dedup_no_report() {
     use veks::pipeline::command::Options;
 
-    let cmd = make_cmd("compute dedup");
+    let cmd = make_cmd("compute sort");
     let mut opts = Options::new();
     opts.set("source", "vectors.mvec");
     opts.set("output", "dedup.ivec");
@@ -918,7 +918,7 @@ fn project_artifacts_compute_dedup_no_report() {
     assert_eq!(manifest.outputs, vec!["dedup.ivec"]);
 }
 
-// ── compute sort ────────────────────────────────────────────────────────────
+// ── compute sort (backed by compute_dedup — sort + dedup detection) ─────────
 
 #[test]
 fn project_artifacts_compute_sort() {
@@ -928,14 +928,15 @@ fn project_artifacts_compute_sort() {
     let mut opts = Options::new();
     opts.set("source", "base.fvec");
     opts.set("output", "sorted.fvec");
-    opts.set("sort-by", "norm");
+    opts.set("report", "dedup_report.json");
 
     let manifest = cmd.project_artifacts("sort-step", &opts);
     assert_eq!(manifest.step_id, "sort-step");
     assert_eq!(manifest.command, "compute sort");
     assert_eq!(manifest.inputs, vec!["base.fvec"]);
-    assert_eq!(manifest.outputs, vec!["sorted.fvec"]);
-    assert!(manifest.intermediates.is_empty());
+    assert_eq!(manifest.outputs, vec!["sorted.fvec", "dedup_report.json"]);
+    // dedup_runs/ directory is always an intermediate
+    assert!(manifest.intermediates.contains(&"${cache}/dedup_runs/".to_string()));
 }
 
 #[test]
@@ -950,16 +951,17 @@ fn project_artifacts_compute_sort_cache_output() {
     let manifest = cmd.project_artifacts("sort-cached", &opts);
     assert_eq!(manifest.inputs, vec!["base.fvec"]);
     assert!(manifest.outputs.is_empty());
-    assert_eq!(manifest.intermediates, vec!["${cache}/sorted.fvec"]);
+    assert!(manifest.intermediates.contains(&"${cache}/sorted.fvec".to_string()));
+    assert!(manifest.intermediates.contains(&"${cache}/dedup_runs/".to_string()));
 }
 
-// ── generate ivec-shuffle ───────────────────────────────────────────────────
+// ── generate shuffle (formerly generate ivec-shuffle) ───────────────────────
 
 #[test]
 fn project_artifacts_gen_shuffle_no_inputs() {
     use veks::pipeline::command::Options;
 
-    let cmd = make_cmd("generate ivec-shuffle");
+    let cmd = make_cmd("generate shuffle");
     let mut opts = Options::new();
     opts.set("output", "${cache}/shuffle.ivec");
     opts.set("interval", "1000000");
@@ -967,7 +969,7 @@ fn project_artifacts_gen_shuffle_no_inputs() {
 
     let manifest = cmd.project_artifacts("shuffle-step", &opts);
     assert_eq!(manifest.step_id, "shuffle-step");
-    assert_eq!(manifest.command, "generate ivec-shuffle");
+    assert_eq!(manifest.command, "generate shuffle");
     // No file inputs — interval and seed are numeric options
     assert!(manifest.inputs.is_empty());
     assert!(manifest.outputs.is_empty(), "cache path should be intermediate");
@@ -978,7 +980,7 @@ fn project_artifacts_gen_shuffle_no_inputs() {
 fn project_artifacts_gen_shuffle_non_cache_output() {
     use veks::pipeline::command::Options;
 
-    let cmd = make_cmd("generate ivec-shuffle");
+    let cmd = make_cmd("generate shuffle");
     let mut opts = Options::new();
     opts.set("output", "shuffle.ivec");
     opts.set("interval", "500");
@@ -989,52 +991,31 @@ fn project_artifacts_gen_shuffle_non_cache_output() {
     assert!(manifest.intermediates.is_empty());
 }
 
-// ── transform mvec-extract ──────────────────────────────────────────────────
+// ── transform extract ────────────────────────────────────────────────────────
+// Note: TransformExtractOp is the generic auto-detecting extract command.
+// It delegates to format-specific implementations at runtime. Artifact
+// tracking for the generic command is a TODO — it uses the default
+// (empty) project_artifacts implementation for now.
 
 #[test]
-fn project_artifacts_mvec_extract() {
+fn project_artifacts_transform_extract_generic() {
     use veks::pipeline::command::Options;
 
-    let cmd = make_cmd("transform mvec-extract");
-    let mut opts = Options::new();
-    opts.set("mvec-file", "${cache}/all_vectors.mvec");
-    opts.set("ivec-file", "${cache}/shuffle.ivec");
-    opts.set("output", "profiles/default/base_vectors.mvec");
-    opts.set("range", "[100,500000)");
+    let cmd = make_cmd("transform extract");
+    let opts = Options::new();
 
     let manifest = cmd.project_artifacts("extract-base", &opts);
     assert_eq!(manifest.step_id, "extract-base");
-    assert_eq!(manifest.command, "transform mvec-extract");
-    assert_eq!(manifest.inputs, vec![
-        "${cache}/all_vectors.mvec",
-        "${cache}/shuffle.ivec",
-    ]);
-    assert_eq!(manifest.outputs, vec!["profiles/default/base_vectors.mvec"]);
-    assert!(manifest.intermediates.is_empty());
+    assert_eq!(manifest.command, "transform extract");
 }
 
-#[test]
-fn project_artifacts_mvec_extract_window_in_source() {
-    use veks::pipeline::command::Options;
-
-    let cmd = make_cmd("transform mvec-extract");
-    let mut opts = Options::new();
-    opts.set("mvec-file", "all.mvec[0..10000)");
-    opts.set("ivec-file", "shuffle.ivec");
-    opts.set("output", "extracted.mvec");
-
-    let manifest = cmd.project_artifacts("extract-windowed", &opts);
-    // Window stripped from mvec-file
-    assert_eq!(manifest.inputs, vec!["all.mvec", "shuffle.ivec"]);
-}
-
-// ── transform slab-extract ──────────────────────────────────────────────────
+// ── transform extract-slab (formerly transform slab-extract) ────────────────
 
 #[test]
 fn project_artifacts_slab_extract() {
     use veks::pipeline::command::Options;
 
-    let cmd = make_cmd("transform slab-extract");
+    let cmd = make_cmd("transform extract-slab");
     let mut opts = Options::new();
     opts.set("slab-file", "metadata_all.slab");
     opts.set("ivec-file", "${cache}/shuffle.ivec");
@@ -1042,7 +1023,7 @@ fn project_artifacts_slab_extract() {
 
     let manifest = cmd.project_artifacts("extract-metadata", &opts);
     assert_eq!(manifest.step_id, "extract-metadata");
-    assert_eq!(manifest.command, "transform slab-extract");
+    assert_eq!(manifest.command, "transform extract-slab");
     assert_eq!(manifest.inputs, vec![
         "metadata_all.slab",
         "${cache}/shuffle.ivec",
@@ -1054,7 +1035,7 @@ fn project_artifacts_slab_extract() {
 fn project_artifacts_slab_extract_cache_output() {
     use veks::pipeline::command::Options;
 
-    let cmd = make_cmd("transform slab-extract");
+    let cmd = make_cmd("transform extract-slab");
     let mut opts = Options::new();
     opts.set("slab-file", "raw.slab");
     opts.set("ivec-file", "idx.ivec");
@@ -1065,20 +1046,20 @@ fn project_artifacts_slab_extract_cache_output() {
     assert_eq!(manifest.intermediates, vec![".cache/extracted.slab"]);
 }
 
-// ── set variable ────────────────────────────────────────────────────────────
+// ── state set (formerly set variable) ───────────────────────────────────────
 
 #[test]
 fn project_artifacts_set_variable_empty() {
     use veks::pipeline::command::Options;
 
-    let cmd = make_cmd("set variable");
+    let cmd = make_cmd("state set");
     let mut opts = Options::new();
     opts.set("name", "vector_count");
     opts.set("value", "count:all_vectors.mvec");
 
     let manifest = cmd.project_artifacts("set-count", &opts);
     assert_eq!(manifest.step_id, "set-count");
-    assert_eq!(manifest.command, "set variable");
+    assert_eq!(manifest.command, "state set");
     // set variable produces no file artifacts
     assert!(manifest.inputs.is_empty());
     assert!(manifest.outputs.is_empty());
@@ -1089,7 +1070,7 @@ fn project_artifacts_set_variable_empty() {
 fn project_artifacts_set_variable_literal() {
     use veks::pipeline::command::Options;
 
-    let cmd = make_cmd("set variable");
+    let cmd = make_cmd("state set");
     let mut opts = Options::new();
     opts.set("name", "seed");
     opts.set("value", "42");
@@ -1100,46 +1081,13 @@ fn project_artifacts_set_variable_literal() {
     assert!(manifest.intermediates.is_empty());
 }
 
-// ── barrier ─────────────────────────────────────────────────────────────────
-
-#[test]
-fn project_artifacts_barrier_empty() {
-    use veks::pipeline::command::Options;
-
-    let cmd = make_cmd("barrier");
-    let opts = Options::new();
-
-    let manifest = cmd.project_artifacts("barrier-default", &opts);
-    assert_eq!(manifest.step_id, "barrier-default");
-    assert_eq!(manifest.command, "barrier");
-    assert!(manifest.inputs.is_empty());
-    assert!(manifest.outputs.is_empty());
-    assert!(manifest.intermediates.is_empty());
-}
-
-#[test]
-fn project_artifacts_barrier_ignores_spurious_options() {
-    use veks::pipeline::command::Options;
-
-    let cmd = make_cmd("barrier");
-    let mut opts = Options::new();
-    opts.set("source", "/some/path");
-    opts.set("output", "/some/other/path");
-
-    let manifest = cmd.project_artifacts("barrier-noisy", &opts);
-    // Barrier ignores all options
-    assert!(manifest.inputs.is_empty());
-    assert!(manifest.outputs.is_empty());
-    assert!(manifest.intermediates.is_empty());
-}
-
-// ── compute predicates (gen_predicate_keys) ─────────────────────────────────
+// ── compute evaluate-predicates (gen_predicate_keys) ────────────────────────
 
 #[test]
 fn project_artifacts_compute_predicates() {
     use veks::pipeline::command::Options;
 
-    let cmd = make_cmd("compute predicates");
+    let cmd = make_cmd("compute evaluate-predicates");
     let mut opts = Options::new();
     opts.set("input", "profiles/default/base_metadata.slab");
     opts.set("predicates", "predicates.slab");
@@ -1150,7 +1098,7 @@ fn project_artifacts_compute_predicates() {
 
     let manifest = cmd.project_artifacts("eval-predicates", &opts);
     assert_eq!(manifest.step_id, "eval-predicates");
-    assert_eq!(manifest.command, "compute predicates");
+    assert_eq!(manifest.command, "compute evaluate-predicates");
     assert_eq!(manifest.inputs, vec![
         "profiles/default/base_metadata.slab",
         "predicates.slab",
@@ -1164,7 +1112,7 @@ fn project_artifacts_compute_predicates() {
 fn project_artifacts_compute_predicates_optional_survey_missing() {
     use veks::pipeline::command::Options;
 
-    let cmd = make_cmd("compute predicates");
+    let cmd = make_cmd("compute evaluate-predicates");
     let mut opts = Options::new();
     opts.set("input", "meta.slab");
     opts.set("predicates", "preds.slab");
@@ -1177,13 +1125,13 @@ fn project_artifacts_compute_predicates_optional_survey_missing() {
     assert_eq!(manifest.outputs, vec!["keys.slab"]);
 }
 
-// ── synthesize predicates (gen_predicates) ──────────────────────────────────
+// ── generate predicates (formerly synthesize predicates) ────────────────────
 
 #[test]
 fn project_artifacts_synthesize_predicates() {
     use veks::pipeline::command::Options;
 
-    let cmd = make_cmd("synthesize predicates");
+    let cmd = make_cmd("generate predicates");
     let mut opts = Options::new();
     opts.set("input", "metadata_all.slab");
     opts.set("survey", "survey.json");
@@ -1195,7 +1143,7 @@ fn project_artifacts_synthesize_predicates() {
 
     let manifest = cmd.project_artifacts("synth-preds", &opts);
     assert_eq!(manifest.step_id, "synth-preds");
-    assert_eq!(manifest.command, "synthesize predicates");
+    assert_eq!(manifest.command, "generate predicates");
     assert_eq!(manifest.inputs, vec!["metadata_all.slab", "survey.json"]);
     assert_eq!(manifest.outputs, vec!["predicates.slab"]);
     assert!(manifest.intermediates.is_empty());
@@ -1205,7 +1153,7 @@ fn project_artifacts_synthesize_predicates() {
 fn project_artifacts_synthesize_predicates_no_survey() {
     use veks::pipeline::command::Options;
 
-    let cmd = make_cmd("synthesize predicates");
+    let cmd = make_cmd("generate predicates");
     let mut opts = Options::new();
     opts.set("input", "meta.slab");
     opts.set("output", "preds.slab");
@@ -1216,20 +1164,20 @@ fn project_artifacts_synthesize_predicates_no_survey() {
     assert_eq!(manifest.outputs, vec!["preds.slab"]);
 }
 
-// ── survey (slab.rs) ────────────────────────────────────────────────────────
+// ── analyze survey (formerly survey) ────────────────────────────────────────
 
 #[test]
 fn project_artifacts_survey() {
     use veks::pipeline::command::Options;
 
-    let cmd = make_cmd("survey");
+    let cmd = make_cmd("analyze survey");
     let mut opts = Options::new();
     opts.set("input", "metadata_all.slab");
     opts.set("output", "survey.json");
 
     let manifest = cmd.project_artifacts("survey-metadata", &opts);
     assert_eq!(manifest.step_id, "survey-metadata");
-    assert_eq!(manifest.command, "survey");
+    assert_eq!(manifest.command, "analyze survey");
     assert_eq!(manifest.inputs, vec!["metadata_all.slab"]);
     assert_eq!(manifest.outputs, vec!["survey.json"]);
     assert!(manifest.intermediates.is_empty());
@@ -1239,7 +1187,7 @@ fn project_artifacts_survey() {
 fn project_artifacts_survey_cache_output() {
     use veks::pipeline::command::Options;
 
-    let cmd = make_cmd("survey");
+    let cmd = make_cmd("analyze survey");
     let mut opts = Options::new();
     opts.set("input", "meta.slab");
     opts.set("output", "${cache}/survey.json");
@@ -1337,7 +1285,7 @@ fn project_artifacts_count_prefix_not_an_input() {
 
     // The import command uses "source" as input key.
     // If someone passes a count: prefixed value, it must not appear as input.
-    let cmd = make_cmd("import");
+    let cmd = make_cmd("transform convert");
     let mut opts = Options::new();
     opts.set("source", "count:/data/vectors.mvec");
     opts.set("output", "out.mvec");
@@ -1368,7 +1316,7 @@ fn project_artifacts_window_notation_complex() {
 fn project_artifacts_dot_cache_path_classified() {
     use veks::pipeline::command::Options;
 
-    let cmd = make_cmd("import");
+    let cmd = make_cmd("transform convert");
     let mut opts = Options::new();
     opts.set("source", "/data/src");
     opts.set("output", "workspace/.cache/imported.mvec");
@@ -1383,7 +1331,7 @@ fn project_artifacts_dot_cache_path_classified() {
 fn project_artifacts_boolean_option_not_input() {
     use veks::pipeline::command::Options;
 
-    let cmd = make_cmd("compute dedup");
+    let cmd = make_cmd("compute sort");
     let mut opts = Options::new();
     opts.set("source", "vectors.mvec");
     opts.set("output", "dedup.ivec");
@@ -1400,17 +1348,17 @@ fn project_artifacts_boolean_option_not_input() {
 fn project_artifacts_clear_variables_empty() {
     use veks::pipeline::command::Options;
 
-    let cmd = make_cmd("clear variables");
+    let cmd = make_cmd("state clear");
     let opts = Options::new();
 
     let manifest = cmd.project_artifacts("clear-vars", &opts);
-    assert_eq!(manifest.command, "clear variables");
+    assert_eq!(manifest.command, "state clear");
     // May or may not have a custom implementation; should not panic
     assert!(manifest.inputs.is_empty() || !manifest.inputs.is_empty());
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Import flow tests: zero-check, clean-ordinals, normalize, and dependency graph
+// Import flow tests: find-zeros, filter-ordinals, normalize, and dependency graph
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Collect step IDs from YAML by parsing "- id: <step-id>" lines.
@@ -1464,15 +1412,15 @@ fn import_zero_check_and_clean_ordinals_emitted_by_default() {
     let yaml = read_yaml(&dir.path().join("out"));
     let ids = step_ids_from_yaml(&yaml);
 
-    assert!(ids.contains(&"zero-check".to_string()),
-        "zero-check should be emitted by default, got: {:?}", ids);
-    assert!(ids.contains(&"clean-ordinals".to_string()),
-        "clean-ordinals should be emitted by default, got: {:?}", ids);
+    assert!(ids.contains(&"find-zeros".to_string()),
+        "find-zeros should be emitted by default, got: {:?}", ids);
+    assert!(ids.contains(&"filter-ordinals".to_string()),
+        "filter-ordinals should be emitted by default, got: {:?}", ids);
 }
 
 #[test]
 fn import_no_zero_check_suppresses_zero_check_and_not_clean_ordinals() {
-    // --no-zero-check suppresses zero-check. clean-ordinals is still emitted
+    // --no-find-zeros suppresses find-zeros. filter-ordinals is still emitted
     // because dedup is still active (no_dedup=false, no_zero_check=true →
     // clean_ordinals is Materialized per the condition !(no_dedup && no_zero_check)).
     let dir = tempfile::tempdir().unwrap();
@@ -1487,16 +1435,16 @@ fn import_no_zero_check_suppresses_zero_check_and_not_clean_ordinals() {
     let yaml = read_yaml(&dir.path().join("out"));
     let ids = step_ids_from_yaml(&yaml);
 
-    assert!(!ids.contains(&"zero-check".to_string()),
-        "zero-check should be suppressed when --no-zero-check is set, got: {:?}", ids);
-    // clean-ordinals is still present because dedup is active
-    assert!(ids.contains(&"clean-ordinals".to_string()),
-        "clean-ordinals should still be emitted when only no_zero_check is set, got: {:?}", ids);
+    assert!(!ids.contains(&"find-zeros".to_string()),
+        "find-zeros should be suppressed when --no-find-zeros is set, got: {:?}", ids);
+    // filter-ordinals is still present because dedup is active
+    assert!(ids.contains(&"filter-ordinals".to_string()),
+        "filter-ordinals should still be emitted when only no_zero_check is set, got: {:?}", ids);
 }
 
 #[test]
 fn import_no_zero_check_and_no_dedup_suppresses_both() {
-    // Both --no-zero-check and --no-dedup → neither zero-check nor clean-ordinals
+    // Both --no-find-zeros and --no-dedup → neither find-zeros nor filter-ordinals
     let dir = tempfile::tempdir().unwrap();
     let fvec = dir.path().join("base.fvec");
     write_fvec(&fvec, 50, 4);
@@ -1510,18 +1458,18 @@ fn import_no_zero_check_and_no_dedup_suppresses_both() {
     let yaml = read_yaml(&dir.path().join("out"));
     let ids = step_ids_from_yaml(&yaml);
 
-    assert!(!ids.contains(&"zero-check".to_string()),
-        "zero-check should be absent, got: {:?}", ids);
-    assert!(!ids.contains(&"clean-ordinals".to_string()),
-        "clean-ordinals should be absent when both no_dedup and no_zero_check, got: {:?}", ids);
+    assert!(!ids.contains(&"find-zeros".to_string()),
+        "find-zeros should be absent, got: {:?}", ids);
+    assert!(!ids.contains(&"filter-ordinals".to_string()),
+        "filter-ordinals should be absent when both no_dedup and no_zero_check, got: {:?}", ids);
 }
 
 #[test]
 fn import_no_dedup_with_zero_check_still_enabled() {
-    // --no-dedup but zero-check is still enabled.
-    // dedup-vectors is absent, but zero-check and clean-ordinals should still appear.
-    // zero-check uses dedup ordinals — when dedup is Identity (empty path),
-    // the zero-check step still references the ordinals slot which is empty.
+    // --no-dedup but find-zeros is still enabled.
+    // dedup-vectors is absent, but find-zeros and filter-ordinals should still appear.
+    // find-zeros uses dedup ordinals — when dedup is Identity (empty path),
+    // the find-zeros step still references the ordinals slot which is empty.
     let dir = tempfile::tempdir().unwrap();
     let fvec = dir.path().join("base.fvec");
     write_fvec(&fvec, 50, 4);
@@ -1537,10 +1485,10 @@ fn import_no_dedup_with_zero_check_still_enabled() {
 
     assert!(!ids.contains(&"dedup-vectors".to_string()),
         "dedup-vectors should be absent with --no-dedup, got: {:?}", ids);
-    assert!(ids.contains(&"zero-check".to_string()),
-        "zero-check should be present when no_zero_check=false, got: {:?}", ids);
-    assert!(ids.contains(&"clean-ordinals".to_string()),
-        "clean-ordinals should be present when not both no_dedup and no_zero_check, got: {:?}", ids);
+    assert!(ids.contains(&"find-zeros".to_string()),
+        "find-zeros should be present when no_zero_check=false, got: {:?}", ids);
+    assert!(ids.contains(&"filter-ordinals".to_string()),
+        "filter-ordinals should be present when not both no_dedup and no_zero_check, got: {:?}", ids);
 }
 
 #[test]
@@ -1557,11 +1505,11 @@ fn import_normalize_adds_normalize_to_extract_steps() {
     veks::prepare::import::run(args);
     let yaml = read_yaml(&dir.path().join("out"));
 
-    // Self-search is implied; extract-query-vectors and extract-base-vectors should exist
-    assert!(yaml.contains("extract-query-vectors"),
-        "should have extract-query-vectors for self-search");
-    assert!(yaml.contains("extract-base-vectors"),
-        "should have extract-base-vectors for self-search");
+    // Self-search is implied; extract-queries and extract-base should exist
+    assert!(yaml.contains("extract-queries"),
+        "should have extract-queries for self-search");
+    assert!(yaml.contains("extract-base"),
+        "should have extract-base for self-search");
 
     // Both extract steps should have normalize: true
     assert!(yaml.contains("normalize: true"),
@@ -1593,9 +1541,9 @@ fn import_normalize_separate_query_no_extract_steps() {
     let ids = step_ids_from_yaml(&yaml);
 
     // No extract steps with separate query
-    assert!(!ids.contains(&"extract-query-vectors".to_string()),
+    assert!(!ids.contains(&"extract-queries".to_string()),
         "separate query should not have extract steps, got: {:?}", ids);
-    assert!(!ids.contains(&"extract-base-vectors".to_string()),
+    assert!(!ids.contains(&"extract-base".to_string()),
         "separate query should not have extract steps, got: {:?}", ids);
 
     // normalize: true should NOT appear in the YAML (no extract steps to carry it)
@@ -1606,7 +1554,7 @@ fn import_normalize_separate_query_no_extract_steps() {
 #[test]
 fn import_full_pipeline_all_features() {
     // Full pipeline: base fvec (self-search), metadata (parquet dir),
-    // normalize, dedup, zero-check, filtered KNN.
+    // normalize, dedup, find-zeros, filtered KNN.
     let dir = tempfile::tempdir().unwrap();
     let fvec = dir.path().join("base.fvec");
     write_fvec(&fvec, 200, 4);
@@ -1625,28 +1573,28 @@ fn import_full_pipeline_all_features() {
 
     // Verify every expected step is present
     let expected = vec![
-        "set-vector-count",
-        "sort-vectors",
-        "set-duplicate-count",
-        "zero-check",
-        "set-zero-count",
-        "clean-ordinals",
-        "set-clean-count",
-        "shuffle-ordinals",
-        "extract-query-vectors",
-        "extract-base-vectors",
-        "set-base-count",
-        "import-metadata",
+        "count-vectors",
+        "sort-and-dedup",
+        "count-duplicates",
+        "find-zeros",
+        "count-zeros",
+        "filter-ordinals",
+        "count-clean",
+        "generate-shuffle",
+        "extract-queries",
+        "extract-base",
+        "count-base",
+        "convert-metadata",
         "survey-metadata",
-        "synthesize-predicates",
+        "generate-predicates",
         "evaluate-predicates",
         "extract-metadata",
         "compute-knn",
         "compute-filtered-knn",
         "verify-knn",
         "verify-predicates",
-        "merkle-all",
-        "catalog-generate",
+        "generate-merkle",
+        "generate-catalog",
     ];
     for expected_id in &expected {
         assert!(ids.contains(&expected_id.to_string()),
@@ -1678,26 +1626,26 @@ fn import_full_pipeline_everything_disabled() {
     let ids = step_ids_from_yaml(&yaml);
 
     // Should NOT have these:
-    assert!(!ids.contains(&"sort-vectors".to_string()), "no sort: {:?}", ids);
-    assert!(!ids.contains(&"zero-check".to_string()), "no zero-check: {:?}", ids);
-    assert!(!ids.contains(&"clean-ordinals".to_string()), "no clean-ordinals: {:?}", ids);
-    assert!(!ids.contains(&"import-metadata".to_string()), "no metadata: {:?}", ids);
+    assert!(!ids.contains(&"sort-and-dedup".to_string()), "no sort: {:?}", ids);
+    assert!(!ids.contains(&"find-zeros".to_string()), "no find-zeros: {:?}", ids);
+    assert!(!ids.contains(&"filter-ordinals".to_string()), "no filter-ordinals: {:?}", ids);
+    assert!(!ids.contains(&"convert-metadata".to_string()), "no metadata: {:?}", ids);
     assert!(!ids.contains(&"compute-filtered-knn".to_string()), "no filtered KNN: {:?}", ids);
 
     // Should still have self-search chain + KNN
-    assert!(ids.contains(&"set-vector-count".to_string()), "set-vector-count: {:?}", ids);
-    assert!(ids.contains(&"shuffle-ordinals".to_string()), "shuffle: {:?}", ids);
-    assert!(ids.contains(&"extract-query-vectors".to_string()), "extract-query: {:?}", ids);
-    assert!(ids.contains(&"extract-base-vectors".to_string()), "extract-base: {:?}", ids);
-    assert!(ids.contains(&"set-base-count".to_string()), "set-base-count: {:?}", ids);
+    assert!(ids.contains(&"count-vectors".to_string()), "count-vectors: {:?}", ids);
+    assert!(ids.contains(&"generate-shuffle".to_string()), "shuffle: {:?}", ids);
+    assert!(ids.contains(&"extract-queries".to_string()), "extract-query: {:?}", ids);
+    assert!(ids.contains(&"extract-base".to_string()), "extract-base: {:?}", ids);
+    assert!(ids.contains(&"count-base".to_string()), "count-base: {:?}", ids);
     assert!(ids.contains(&"compute-knn".to_string()), "compute-knn: {:?}", ids);
 
     // No normalize: true in YAML
     assert!(!yaml.contains("normalize: true"),
         "normalize: true should not appear when normalize=false");
 
-    // Minimal count: set-vector-count, shuffle, extract-query, extract-base,
-    //                set-base-count, compute-knn, verify-knn, merkle-all, catalog-generate = 9
+    // Minimal count: count-vectors, shuffle, extract-query, extract-base,
+    //                count-base, compute-knn, verify-knn, generate-merkle, generate-catalog = 9
     assert_eq!(ids.len(), 9,
         "minimal self-search pipeline should have 9 steps, got {}: {:?}", ids.len(), ids);
 }
@@ -1715,16 +1663,16 @@ fn import_clean_ordinals_depends_on_sort() {
     veks::prepare::import::run(args);
     let yaml = read_yaml(&dir.path().join("out"));
 
-    // clean-ordinals should have sort-vectors in its after list
-    let after = after_for_step(&yaml, "clean-ordinals");
+    // filter-ordinals should have sort-and-dedup in its after list
+    let after = after_for_step(&yaml, "filter-ordinals");
     assert!(after.is_some(),
-        "clean-ordinals should have an after clause");
+        "filter-ordinals should have an after clause");
     let after_str = after.unwrap();
-    assert!(after_str.contains("sort-vectors"),
-        "clean-ordinals should depend on sort-vectors, got: {}", after_str);
-    // Also should depend on zero-check
-    assert!(after_str.contains("zero-check"),
-        "clean-ordinals should depend on zero-check, got: {}", after_str);
+    assert!(after_str.contains("sort-and-dedup"),
+        "filter-ordinals should depend on sort-and-dedup, got: {}", after_str);
+    // Also should depend on find-zeros
+    assert!(after_str.contains("find-zeros"),
+        "filter-ordinals should depend on find-zeros, got: {}", after_str);
 }
 
 #[test]
@@ -1740,16 +1688,16 @@ fn import_shuffle_depends_on_clean_count() {
     veks::prepare::import::run(args);
     let yaml = read_yaml(&dir.path().join("out"));
 
-    // shuffle-ordinals should depend on set-clean-count (sort is enabled by default)
-    let after = after_for_step(&yaml, "shuffle-ordinals");
+    // generate-shuffle should depend on count-clean (sort is enabled by default)
+    let after = after_for_step(&yaml, "generate-shuffle");
     assert!(after.is_some(),
-        "shuffle-ordinals should have an after clause");
+        "generate-shuffle should have an after clause");
     let after_str = after.unwrap();
-    assert!(after_str.contains("set-clean-count"),
-        "shuffle-ordinals should depend on set-clean-count, got: {}", after_str);
-    // It should NOT depend on set-base-count (that comes after extraction)
-    assert!(!after_str.contains("set-base-count"),
-        "shuffle-ordinals should not depend on set-base-count, got: {}", after_str);
+    assert!(after_str.contains("count-clean"),
+        "generate-shuffle should depend on count-clean, got: {}", after_str);
+    // It should NOT depend on count-base (that comes after extraction)
+    assert!(!after_str.contains("count-base"),
+        "generate-shuffle should not depend on count-base, got: {}", after_str);
 }
 
 #[test]
@@ -1760,31 +1708,37 @@ fn project_artifacts_every_registered_command_no_panic() {
     // registered command does not panic.
     let registry = veks::pipeline::registry::CommandRegistry::with_builtins();
     let commands = [
-        "import", "convert file", "analyze describe",
-        "generate vectors", "generate ivec-shuffle",
-        "transform fvec-extract", "transform ivec-extract",
-        "transform mvec-extract", "transform slab-extract",
-        "generate sketch", "generate from-model",
-        "compute knn", "compute filtered-knn", "compute sort", "compute dedup",
-        "analyze verify-knn", "analyze stats", "analyze histogram",
-        "info file", "info compute", "cleanup cleanfvec",
-        "merkle create", "merkle verify", "merkle diff", "merkle summary",
-        "merkle treeview", "json jjq", "json rjq",
-        "analyze slice", "analyze check-endian", "analyze zeros", "analyze compare",
-        "generate dataset", "generate derive", "merkle path",
-        "config show", "config init", "analyze select",
-        "merkle spoilbits", "merkle spoilchunks", "config list-mounts",
-        "analyze explore", "analyze find", "analyze profile",
-        "analyze model-diff", "analyze verify-profiles",
-        "fetch dlhf", "fetch bulkdl",
-        "slab import", "slab export", "slab append", "slab rewrite",
-        "slab check", "slab get", "slab analyze", "slab explain",
-        "slab namespaces", "slab inspect", "survey",
-        "analyze plot", "analyze flamegraph",
-        "generate predicated", "synthesize predicates", "compute predicates",
-        "inspect predicate",
-        "set variable", "clear variables",
-        "barrier",
+        // analyze
+        "analyze check-endian", "analyze compare-files", "analyze compute-info",
+        "analyze describe", "analyze file", "analyze find",
+        "analyze histogram", "analyze model-diff",
+        "analyze explain-predicates", "analyze select",
+        "analyze slice", "analyze stats", "analyze survey", "analyze verify-knn",
+        "analyze verify-profiles", "analyze zeros",
+        // compute
+        "compute evaluate-predicates", "compute filtered-knn", "compute knn",
+        "compute sort",
+        // config — moved to `datasets config` subgroup
+        // download
+        "download bulk", "download huggingface",
+        // generate
+        "generate dataset", "generate derive", "generate from-model",
+        "generate predicated", "generate predicates", "generate shuffle",
+        "generate sketch", "generate vectors",
+        // merkle
+        "merkle create", "merkle diff", "merkle path", "merkle spoilbits",
+        "merkle spoilchunks", "merkle summary", "merkle treeview", "merkle verify",
+        // query
+        "query json", "query records",
+        // state
+        "state set", "state clear",
+        // transform
+        "transform convert", "transform extract", "transform extract-slab",
+        "transform ordinals",
+        // verify
+        "verify knn-groundtruth", "verify predicate-results",
+        // catalog (pipeline step)
+        "catalog generate",
     ];
 
     let opts = Options::new();

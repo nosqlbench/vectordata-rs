@@ -29,7 +29,7 @@ pub fn factory() -> Box<dyn CommandOp> {
 
 impl CommandOp for SetVariableOp {
     fn command_path(&self) -> &str {
-        "set variable"
+        "state set"
     }
 
     fn command_doc(&self) -> CommandDoc {
@@ -37,7 +37,7 @@ impl CommandOp for SetVariableOp {
         CommandDoc {
             summary: "Set a pipeline variable from an expression".into(),
             body: format!(
-                r#"# set variable
+                r#"# state set
 
 Set a pipeline variable from an expression.
 
@@ -182,7 +182,7 @@ pub fn clear_factory() -> Box<dyn CommandOp> {
 
 impl CommandOp for ClearVariablesOp {
     fn command_path(&self) -> &str {
-        "clear variables"
+        "state clear"
     }
 
     fn command_doc(&self) -> CommandDoc {
@@ -190,7 +190,7 @@ impl CommandOp for ClearVariablesOp {
         CommandDoc {
             summary: "Clear all pipeline variables (reset variables.yaml)".into(),
             body: format!(
-                r#"# clear variables
+                r#"# state clear
 
 Clear all pipeline variables, resetting `variables.yaml`.
 

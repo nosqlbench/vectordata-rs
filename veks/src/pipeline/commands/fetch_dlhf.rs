@@ -27,7 +27,7 @@ pub fn factory() -> Box<dyn CommandOp> {
 
 impl CommandOp for FetchDlhfOp {
     fn command_path(&self) -> &str {
-        "fetch dlhf"
+        "download huggingface"
     }
 
     fn command_doc(&self) -> CommandDoc {
@@ -35,7 +35,7 @@ impl CommandOp for FetchDlhfOp {
         CommandDoc {
             summary: "Download files from HuggingFace Hub".into(),
             body: format!(
-                r#"# fetch dlhf
+                r#"# download huggingface
 
 Download files from HuggingFace Hub.
 

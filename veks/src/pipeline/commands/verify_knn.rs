@@ -828,7 +828,7 @@ struct VerificationReport {
 
 impl CommandOp for VerifyKnnOp {
     fn command_path(&self) -> &str {
-        "verify knn"
+        "verify knn-groundtruth"
     }
 
     fn command_doc(&self) -> CommandDoc {
@@ -836,7 +836,7 @@ impl CommandOp for VerifyKnnOp {
         CommandDoc {
             summary: "Sparse-sample KNN verification against ground truth".into(),
             body: format!(
-                "# verify knn\n\n\
+                "# verify knn-groundtruth\n\n\
                 Sparse-sample KNN verification against ground truth.\n\n\
                 ## Description\n\n\
                 Recomputes brute-force exact KNN for a sparse random sample of query \

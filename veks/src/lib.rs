@@ -25,6 +25,7 @@ pub mod catalog;
 pub mod check;
 pub mod cli;
 pub mod datasets;
+pub mod explore;
 pub mod formats;
 pub mod pipeline;
 pub mod prepare;

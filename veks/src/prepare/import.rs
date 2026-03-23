@@ -112,9 +112,13 @@ struct PipelineSlots {
 // ---------------------------------------------------------------------------
 
 /// Resolve all slots from user-provided inputs.
+///
+/// All input paths are relativized to the output directory so that
+/// dataset.yaml never contains absolute paths (SRD requirement).
 fn resolve_slots(args: &ImportArgs) -> PipelineSlots {
+    let output_dir = &args.output;
     let base_source = args.base_vectors.as_ref()
-        .map(|p| p.to_string_lossy().to_string())
+        .map(|p| relativize_path(p, output_dir))
         .unwrap_or_default();
 
     // ── Vector chain ─────────────────────────────────────────────────
@@ -124,7 +128,7 @@ fn resolve_slots(args: &ImportArgs) -> PipelineSlots {
 
     let all_vectors = if needs_import {
         Artifact::Materialized {
-            step_id: "import-vectors".into(),
+            step_id: "convert-vectors".into(),
             output: "${cache}/all_vectors.mvec".into(),
         }
     } else {
@@ -135,7 +139,7 @@ fn resolve_slots(args: &ImportArgs) -> PipelineSlots {
         Artifact::Identity { path: String::new() } // no artifact
     } else {
         Artifact::Materialized {
-            step_id: "sort-vectors".into(),
+            step_id: "sort-and-dedup".into(),
             output: "${cache}/sorted_ordinals.ivec".into(),
         }
     };
@@ -144,7 +148,7 @@ fn resolve_slots(args: &ImportArgs) -> PipelineSlots {
         Artifact::Identity { path: String::new() }
     } else {
         Artifact::Materialized {
-            step_id: "zero-check".into(),
+            step_id: "find-zeros".into(),
             output: "${cache}/zero_ordinals.ivec".into(),
         }
     };
@@ -153,13 +157,13 @@ fn resolve_slots(args: &ImportArgs) -> PipelineSlots {
         Artifact::Identity { path: String::new() }
     } else {
         Artifact::Materialized {
-            step_id: "clean-ordinals".into(),
+            step_id: "filter-ordinals".into(),
             output: "${cache}/clean_ordinals.ivec".into(),
         }
     };
 
     let vector_count = Artifact::Materialized {
-        step_id: "set-vector-count".into(),
+        step_id: "count-vectors".into(),
         output: String::new(), // variable, not a file
     };
 
@@ -173,19 +177,19 @@ fn resolve_slots(args: &ImportArgs) -> PipelineSlots {
     let (shuffle, query_vectors, base_vectors, base_count) = if self_search {
         // Self-search: shuffle + extract
         let shuffle = Artifact::Materialized {
-            step_id: "shuffle-ordinals".into(),
+            step_id: "generate-shuffle".into(),
             output: "${cache}/shuffle.ivec".into(),
         };
         let qv = Artifact::Materialized {
-            step_id: "extract-query-vectors".into(),
+            step_id: "extract-queries".into(),
             output: "profiles/base/query_vectors.mvec".into(),
         };
         let bv = Artifact::Materialized {
-            step_id: "extract-base-vectors".into(),
+            step_id: "extract-base".into(),
             output: "profiles/base/base_vectors.mvec".into(),
         };
         let bc = Artifact::Materialized {
-            step_id: "set-base-count".into(),
+            step_id: "count-base".into(),
             output: String::new(),
         };
         (Some(shuffle), Some(qv), bv, Some(bc))
@@ -199,7 +203,7 @@ fn resolve_slots(args: &ImportArgs) -> PipelineSlots {
             Artifact::Identity { path: format!("profiles/base/query_vectors.{}", ext) }
         } else {
             Artifact::Materialized {
-                step_id: "import-query".into(),
+                step_id: "convert-queries".into(),
                 output: "query_vectors.fvec".into(),
             }
         };
@@ -224,11 +228,11 @@ fn resolve_slots(args: &ImportArgs) -> PipelineSlots {
 
         let metadata_all = if needs_meta_import {
             Artifact::Materialized {
-                step_id: "import-metadata".into(),
+                step_id: "convert-metadata".into(),
                 output: "${cache}/metadata_all.slab".into(),
             }
         } else {
-            Artifact::Identity { path: meta_source.to_string_lossy().to_string() }
+            Artifact::Identity { path: relativize_path(meta_source, output_dir) }
         };
 
         // Metadata extract: needed only in self-search (ordinal realignment)
@@ -247,7 +251,7 @@ fn resolve_slots(args: &ImportArgs) -> PipelineSlots {
             output: "${cache}/metadata_survey.json".into(),
         };
         let predicates = Artifact::Materialized {
-            step_id: "synthesize-predicates".into(),
+            step_id: "generate-predicates".into(),
             output: "predicates.slab".into(),
         };
         let predicate_indices = Artifact::Materialized {
@@ -263,7 +267,7 @@ fn resolve_slots(args: &ImportArgs) -> PipelineSlots {
         None
     } else if args.ground_truth.is_some() {
         Some(Artifact::Identity {
-            path: args.ground_truth.as_ref().unwrap().to_string_lossy().to_string(),
+            path: relativize_path(args.ground_truth.as_ref().unwrap(), output_dir),
         })
     } else {
         Some(Artifact::Materialized {
@@ -318,8 +322,8 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs) -> Vec<Step> {
             .map(|f| f.name().to_string())
             .unwrap_or_else(|| "auto".into());
         steps.push(Step {
-            id: "import-vectors".into(),
-            run: "import".into(),
+            id: "convert-vectors".into(),
+            run: "transform convert".into(),
             description: Some("Import base vectors from source format".into()),
             after: vec![],
             per_profile: false,
@@ -333,7 +337,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs) -> Vec<Step> {
     }
 
     let mut last_vector_step = if slots.all_vectors.is_materialized() {
-        "import-vectors"
+        "convert-vectors"
     } else {
         "" // no dependency
     };
@@ -346,8 +350,8 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs) -> Vec<Step> {
         let output = format!("${{cache}}/all_vectors.{}", ext);
         let after = if last_vector_step.is_empty() { vec![] } else { vec![last_vector_step.into()] };
         steps.push(Step {
-            id: "convert-base-precision".into(),
-            run: "convert".into(),
+            id: "convert-precision".into(),
+            run: "transform convert".into(),
             description: Some(format!("Convert base vectors to {} precision", ext)),
             after,
             per_profile: false,
@@ -357,13 +361,13 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs) -> Vec<Step> {
                 ("to".into(), ext.clone()),
             ],
         });
-        last_vector_step = "convert-base-precision";
+        last_vector_step = "convert-precision";
     }
 
     // set-vector-count (always)
     steps.push(Step {
-        id: "set-vector-count".into(),
-        run: "set variable".into(),
+        id: "count-vectors".into(),
+        run: "state set".into(),
         description: None,
         after: if last_vector_step.is_empty() { vec![] } else { vec![last_vector_step.into()] },
         per_profile: false,
@@ -376,8 +380,8 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs) -> Vec<Step> {
     // sort (lexicographic sort + duplicate detection as byproduct)
     if let Artifact::Materialized { .. } = &slots.sort {
         steps.push(Step {
-            id: "sort-vectors".into(),
-            run: "compute dedup".into(),
+            id: "sort-and-dedup".into(),
+            run: "compute sort".into(),
             description: Some("Lexicographic sort producing sorted ordinals + duplicate report".into()),
             after: if last_vector_step.is_empty() { vec![] } else { vec![last_vector_step.into()] },
             per_profile: false,
@@ -399,10 +403,10 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs) -> Vec<Step> {
     // set-duplicate-count (after sort, records number of elided duplicates)
     if slots.sort.is_materialized() {
         steps.push(Step {
-            id: "set-duplicate-count".into(),
-            run: "set variable".into(),
+            id: "count-duplicates".into(),
+            run: "state set".into(),
             description: None,
-            after: vec!["sort-vectors".into()],
+            after: vec!["sort-and-dedup".into()],
             per_profile: false,
             options: vec![
                 ("name".into(), "duplicate_count".into()),
@@ -415,12 +419,12 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs) -> Vec<Step> {
     if let Artifact::Materialized { .. } = &slots.zero_check {
         let mut after = vec![];
         if slots.sort.is_materialized() {
-            after.push("sort-vectors".into());
+            after.push("sort-and-dedup".into());
         } else if !last_vector_step.is_empty() {
             after.push(last_vector_step.into());
         }
         steps.push(Step {
-            id: "zero-check".into(),
+            id: "find-zeros".into(),
             run: "analyze zeros".into(),
             description: Some("Binary search sorted index for zero vector".into()),
             after,
@@ -436,10 +440,10 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs) -> Vec<Step> {
     // set-zero-count (after zero-check, records number of zero vectors removed)
     if slots.zero_check.is_materialized() {
         steps.push(Step {
-            id: "set-zero-count".into(),
-            run: "set variable".into(),
+            id: "count-zeros".into(),
+            run: "state set".into(),
             description: None,
-            after: vec!["zero-check".into()],
+            after: vec!["find-zeros".into()],
             per_profile: false,
             options: vec![
                 ("name".into(), "zero_count".into()),
@@ -452,14 +456,14 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs) -> Vec<Step> {
     if let Artifact::Materialized { .. } = &slots.clean_ordinals {
         let mut after = vec![];
         if slots.sort.is_materialized() {
-            after.push("sort-vectors".into());
+            after.push("sort-and-dedup".into());
         }
         if slots.zero_check.is_materialized() {
-            after.push("zero-check".into());
+            after.push("find-zeros".into());
         }
         steps.push(Step {
-            id: "clean-ordinals".into(),
-            run: "transform clean-ordinals".into(),
+            id: "filter-ordinals".into(),
+            run: "transform ordinals".into(),
             description: Some("Filter sorted ordinals excluding duplicates and zeros".into()),
             after,
             per_profile: false,
@@ -475,10 +479,10 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs) -> Vec<Step> {
     // set-clean-count (after clean-ordinals, used by shuffle)
     if slots.clean_ordinals.is_materialized() {
         steps.push(Step {
-            id: "set-clean-count".into(),
-            run: "set variable".into(),
+            id: "count-clean".into(),
+            run: "state set".into(),
             description: None,
-            after: vec!["clean-ordinals".into()],
+            after: vec!["filter-ordinals".into()],
             per_profile: false,
             options: vec![
                 ("name".into(), "clean_count".into()),
@@ -494,9 +498,9 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs) -> Vec<Step> {
                 // Shuffle depends on clean_count (not vector_count) so it
                 // creates a permutation over only the clean ordinals.
                 let shuffle_after = if slots.clean_ordinals.is_materialized() {
-                    vec!["set-clean-count".into()]
+                    vec!["count-clean".into()]
                 } else {
-                    vec!["set-vector-count".into()]
+                    vec!["count-vectors".into()]
                 };
                 let shuffle_interval = if slots.clean_ordinals.is_materialized() {
                     "${clean_count}".to_string()
@@ -504,8 +508,8 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs) -> Vec<Step> {
                     "${vector_count}".to_string()
                 };
                 steps.push(Step {
-                    id: "shuffle-ordinals".into(),
-                    run: "generate ivec-shuffle".into(),
+                    id: "generate-shuffle".into(),
+                    run: "generate shuffle".into(),
                     description: Some("Reproducible random split via Fisher-Yates shuffle".into()),
                     after: shuffle_after,
                     per_profile: false,
@@ -521,9 +525,9 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs) -> Vec<Step> {
         if let Some(ref qv) = slots.query_vectors {
             if qv.is_materialized() {
                 let vec_deps = if last_vector_step.is_empty() {
-                    vec!["shuffle-ordinals".into()]
+                    vec!["generate-shuffle".into()]
                 } else {
-                    vec![last_vector_step.into(), "shuffle-ordinals".into()]
+                    vec![last_vector_step.into(), "generate-shuffle".into()]
                 };
                 let count_var = if slots.clean_ordinals.is_materialized() {
                     "${clean_count}"
@@ -540,8 +544,8 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs) -> Vec<Step> {
                     query_opts.push(("normalize".into(), "true".into()));
                 }
                 steps.push(Step {
-                    id: "extract-query-vectors".into(),
-                    run: "transform mvec-extract".into(),
+                    id: "extract-queries".into(),
+                    run: "transform extract".into(),
                     description: Some(format!("First {} shuffled vectors -> query set", args.query_count)),
                     after: vec_deps.clone(),
                     per_profile: false,
@@ -557,18 +561,18 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs) -> Vec<Step> {
                     base_opts.push(("normalize".into(), "true".into()));
                 }
                 steps.push(Step {
-                    id: "extract-base-vectors".into(),
-                    run: "transform mvec-extract".into(),
+                    id: "extract-base".into(),
+                    run: "transform extract".into(),
                     description: Some("Remainder of shuffled vectors -> base set".into()),
                     after: vec_deps,
                     per_profile: false,
                     options: base_opts,
                 });
                 steps.push(Step {
-                    id: "set-base-count".into(),
-                    run: "set variable".into(),
+                    id: "count-base".into(),
+                    run: "state set".into(),
                     description: None,
-                    after: vec!["extract-base-vectors".into()],
+                    after: vec!["extract-base".into()],
                     per_profile: false,
                     options: vec![
                         ("name".into(), "base_count".into()),
@@ -585,14 +589,14 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs) -> Vec<Step> {
                 .map(|f| f.name().to_string())
                 .unwrap_or_else(|| "auto".into());
             steps.push(Step {
-                id: "import-query".into(),
-                run: "import".into(),
+                id: "convert-queries".into(),
+                run: "transform convert".into(),
                 description: Some("Import query vectors from source format".into()),
                 after: vec![],
                 per_profile: false,
                 options: vec![
                     ("facet".into(), "query_vectors".into()),
-                    ("source".into(), query_source.to_string_lossy().to_string()),
+                    ("source".into(), relativize_path(query_source, &args.output)),
                     ("from".into(), format),
                     ("output".into(), "query_vectors.fvec".into()),
                 ],
@@ -609,14 +613,14 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs) -> Vec<Step> {
                 .map(|f| f.name().to_string())
                 .unwrap_or_else(|| "parquet".into());
             steps.push(Step {
-                id: "import-metadata".into(),
-                run: "import".into(),
+                id: "convert-metadata".into(),
+                run: "transform convert".into(),
                 description: Some("Import metadata from source format".into()),
                 after: vec![],
                 per_profile: false,
                 options: vec![
                     ("facet".into(), "metadata_content".into()),
-                    ("source".into(), meta_source.to_string_lossy().to_string()),
+                    ("source".into(), relativize_path(meta_source, &args.output)),
                     ("from".into(), format),
                     ("output".into(), "${cache}/metadata_all.slab".into()),
                 ],
@@ -626,14 +630,14 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs) -> Vec<Step> {
         if meta.metadata_content.is_materialized() {
             let mut after = vec![];
             if meta.metadata_all.is_materialized() {
-                after.push("import-metadata".into());
+                after.push("convert-metadata".into());
             }
             if slots.shuffle.as_ref().map(|s| s.is_materialized()).unwrap_or(false) {
-                after.push("shuffle-ordinals".into());
+                after.push("generate-shuffle".into());
             }
             steps.push(Step {
                 id: "extract-metadata".into(),
-                run: "transform slab-extract".into(),
+                run: "transform extract-slab".into(),
                 description: Some("Reorder metadata to match shuffled base vectors".into()),
                 after,
                 per_profile: false,
@@ -648,13 +652,13 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs) -> Vec<Step> {
 
         // survey (always when metadata present)
         let survey_after = if meta.metadata_all.is_materialized() {
-            vec!["import-metadata".into()]
+            vec!["convert-metadata".into()]
         } else {
             vec![]
         };
         steps.push(Step {
             id: "survey-metadata".into(),
-            run: "survey".into(),
+            run: "analyze survey".into(),
             description: Some("Survey metadata to discover schema and value ranges".into()),
             after: survey_after.clone(),
             per_profile: false,
@@ -668,8 +672,8 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs) -> Vec<Step> {
 
         // synthesize predicates
         steps.push(Step {
-            id: "synthesize-predicates".into(),
-            run: "synthesize predicates".into(),
+            id: "generate-predicates".into(),
+            run: "generate predicates".into(),
             description: Some("Generate test predicates from metadata survey".into()),
             after: vec!["survey-metadata".into()],
             per_profile: false,
@@ -684,13 +688,13 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs) -> Vec<Step> {
         });
 
         // compute predicates (per_profile)
-        let mut eval_after = vec!["synthesize-predicates".into()];
+        let mut eval_after = vec!["generate-predicates".into()];
         if meta.metadata_content.is_materialized() {
             eval_after.push("extract-metadata".into());
         }
         steps.push(Step {
             id: "evaluate-predicates".into(),
-            run: "compute predicates".into(),
+            run: "compute evaluate-predicates".into(),
             description: None,
             after: eval_after,
             per_profile: true,
@@ -714,11 +718,11 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs) -> Vec<Step> {
         if knn.is_materialized() {
             let mut after = vec![];
             if slots.base_count.is_some() {
-                after.push("set-base-count".into());
+                after.push("count-base".into());
             }
             if let Some(ref qv) = slots.query_vectors {
                 if qv.is_materialized() {
-                    let qid = if slots.self_search { "extract-query-vectors" } else { "import-query" };
+                    let qid = if slots.self_search { "extract-queries" } else { "convert-queries" };
                     after.push(qid.into());
                 }
             }
@@ -754,11 +758,11 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs) -> Vec<Step> {
         if fknn.is_materialized() {
             let mut after = vec!["evaluate-predicates".into()];
             if slots.base_count.is_some() {
-                after.push("set-base-count".into());
+                after.push("count-base".into());
             }
             if let Some(ref qv) = slots.query_vectors {
                 if qv.is_materialized() {
-                    let qid = if slots.self_search { "extract-query-vectors" } else { "import-query" };
+                    let qid = if slots.self_search { "extract-queries" } else { "convert-queries" };
                     after.push(qid.into());
                 }
             }
@@ -796,7 +800,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs) -> Vec<Step> {
         if knn.is_materialized() {
             steps.push(Step {
                 id: "verify-knn".into(),
-                run: "verify knn".into(),
+                run: "verify knn-groundtruth".into(),
                 description: Some("Sparse-sample KNN verification".into()),
                 after: vec!["compute-knn".into()],
                 per_profile: true,
@@ -822,7 +826,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs) -> Vec<Step> {
         if fknn.is_materialized() {
             steps.push(Step {
                 id: "verify-predicates".into(),
-                run: "verify predicates".into(),
+                run: "verify predicate-results".into(),
                 description: Some("Sparse-sample predicate verification via SQLite".into()),
                 after: vec!["compute-filtered-knn".into()],
                 per_profile: true,
@@ -861,7 +865,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs) -> Vec<Step> {
         }
     }
     steps.push(Step {
-        id: "merkle-all".into(),
+        id: "generate-merkle".into(),
         run: "merkle create".into(),
         description: Some("Create merkle hash trees for all publishable data files".into()),
         after: merkle_after,
@@ -875,10 +879,10 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs) -> Vec<Step> {
     // Always the final step. Generates catalog.json and catalog.yaml
     // for the local dataset directory so the dataset is discoverable.
     steps.push(Step {
-        id: "catalog-generate".into(),
+        id: "generate-catalog".into(),
         run: "catalog generate".into(),
         description: Some("Generate catalog index for the dataset directory".into()),
-        after: vec!["merkle-all".into()],
+        after: vec!["generate-merkle".into()],
         per_profile: false,
         options: vec![
             ("input".into(), ".".into()),
@@ -1637,8 +1641,8 @@ mod tests {
         // compute-knn, verify-knn, merkle-all, catalog-generate
         assert_eq!(steps.len(), 15, "steps: {:?}", steps.iter().map(|s| &s.id).collect::<Vec<_>>());
         let step_ids: Vec<&str> = steps.iter().map(|s| s.id.as_str()).collect();
-        assert!(step_ids.contains(&"set-duplicate-count"), "should have set-duplicate-count");
-        assert!(step_ids.contains(&"set-zero-count"), "should have set-zero-count");
+        assert!(step_ids.contains(&"count-duplicates"), "should have set-duplicate-count");
+        assert!(step_ids.contains(&"count-zeros"), "should have set-zero-count");
     }
 
     // SRD §12.5 Example 3: Native base + separate native query + metadata dir
@@ -1683,14 +1687,14 @@ mod tests {
 
         let steps = emit_steps(&slots, &args);
         let step_ids: Vec<&str> = steps.iter().map(|s| s.id.as_str()).collect();
-        assert!(step_ids.contains(&"import-metadata"), "steps: {:?}", step_ids);
+        assert!(step_ids.contains(&"convert-metadata"), "steps: {:?}", step_ids);
         assert!(step_ids.contains(&"survey-metadata"), "steps: {:?}", step_ids);
         assert!(step_ids.contains(&"compute-knn"), "steps: {:?}", step_ids);
         assert!(step_ids.contains(&"compute-filtered-knn"), "steps: {:?}", step_ids);
         // No shuffle/extract steps
-        assert!(!step_ids.contains(&"shuffle-ordinals"));
-        assert!(!step_ids.contains(&"extract-query-vectors"));
-        assert!(!step_ids.contains(&"extract-base-vectors"));
+        assert!(!step_ids.contains(&"generate-shuffle"));
+        assert!(!step_ids.contains(&"extract-queries"));
+        assert!(!step_ids.contains(&"extract-base"));
     }
 
     // No dedup when --no-dedup is set
@@ -1709,7 +1713,7 @@ mod tests {
 
         let steps = emit_steps(&slots, &args);
         let step_ids: Vec<&str> = steps.iter().map(|s| s.id.as_str()).collect();
-        assert!(!step_ids.contains(&"sort-vectors"));
+        assert!(!step_ids.contains(&"sort-and-dedup"));
     }
 
     // Pre-computed ground truth collapses KNN to identity

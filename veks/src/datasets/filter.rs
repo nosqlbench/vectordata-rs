@@ -451,7 +451,7 @@ pub fn parse_bytes(s: &str) -> Result<u64, String> {
 static COMPLETION_CATALOG: OnceLock<Vec<CatalogEntry>> = OnceLock::new();
 
 /// Load catalog entries for completion, caching on first call.
-fn completion_entries() -> &'static [CatalogEntry] {
+pub(crate) fn completion_entries() -> &'static [CatalogEntry] {
     COMPLETION_CATALOG.get_or_init(|| {
         let sources = CatalogSources::new().configure_default();
         if sources.is_empty() {

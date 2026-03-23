@@ -201,8 +201,9 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool) -> ImportArgs
     println!("--- Query vectors ---");
     let (query_vectors, self_search, query_count) = if base_vectors.is_some() {
         if roles_accepted && detected.query_vectors.is_some() {
-            // Detected a separate query file — use it directly
+            // Detected a separate query file — rename with _ prefix
             let qv = detected.query_vectors.as_ref().unwrap().clone();
+            let qv = prompt_source_location(&qv, &output, "Query vectors");
             println!("  Using detected: {}", qv.display());
             (Some(qv), false, 10000u32)
         } else {
@@ -242,6 +243,7 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool) -> ImportArgs
     println!("--- Metadata ---");
     let metadata = if roles_accepted && detected.metadata.is_some() {
         let m = detected.metadata.as_ref().unwrap().clone();
+        let m = prompt_source_location(&m, &output, "Metadata");
         println!("  Using detected: {}", m.display());
         Some(m)
     } else {
@@ -278,12 +280,14 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool) -> ImportArgs
     let has_queries = query_vectors.is_some() || self_search;
     let (ground_truth, ground_truth_distances) = if has_queries {
         if roles_accepted && detected.neighbor_indices.is_some() {
-            // Detected pre-computed ground truth — use it
+            // Detected pre-computed ground truth — rename with _ prefix
             let gt = detected.neighbor_indices.as_ref().unwrap().clone();
+            let gt = prompt_source_location(&gt, &output, "Ground truth indices");
             println!("  Using detected ground truth indices: {}", gt.display());
             let gtd = if let Some(ref d) = detected.neighbor_distances {
+                let d = prompt_source_location(d, &output, "Ground truth distances");
                 println!("  Using detected ground truth distances: {}", d.display());
-                Some(d.clone())
+                Some(d)
             } else {
                 None
             };

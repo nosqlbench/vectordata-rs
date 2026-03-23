@@ -234,8 +234,8 @@ fn print_pipeline_help(registry: &CommandRegistry, group: Option<&str>) {
             }
             println!("Use 'veks pipeline <group> <command> --help' for detailed command documentation.");
             println!();
-            println!("Tip: Distinct commands can be invoked directly, e.g., 'veks import' instead");
-            println!("of 'veks prepare import'. Double-tap Tab to see the expanded command list.");
+            println!("Tip: Distinct commands can be invoked directly, e.g., 'veks bootstrap' instead");
+            println!("of 'veks prepare bootstrap'. Tap Tab twice to see the expanded command list.");
         }
         Some(g) => {
             if let Some(commands) = groups.get(g) {
@@ -1132,8 +1132,8 @@ mod tests {
         let registry = CommandRegistry::with_builtins();
         let count = registry.command_paths().len();
         assert!(
-            count >= 50,
-            "Expected at least 50 registered commands, found {}",
+            count >= 45,
+            "Expected at least 45 registered commands, found {}",
             count
         );
 

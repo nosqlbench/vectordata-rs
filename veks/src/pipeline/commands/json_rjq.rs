@@ -78,7 +78,7 @@ fn val_to_json(v: Val) -> serde_json::Value {
 
 impl CommandOp for JsonRjqOp {
     fn command_path(&self) -> &str {
-        "json rjq"
+        "query records"
     }
 
     fn command_doc(&self) -> CommandDoc {
@@ -86,7 +86,7 @@ impl CommandOp for JsonRjqOp {
         CommandDoc {
             summary: "Query slab records with jq-like expressions".into(),
             body: format!(
-                r#"# json rjq
+                r#"# query records
 
 Query slab records with jq-like expressions.
 

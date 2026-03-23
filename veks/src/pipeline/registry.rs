@@ -74,8 +74,8 @@ mod tests {
         // Test the with_builtins path
         let reg = CommandRegistry::with_builtins();
         assert!(!reg.command_paths().is_empty());
-        assert!(reg.get("import").is_some());
-        assert!(reg.get("convert file").is_some());
+        assert!(reg.get("transform convert").is_some());
+        assert!(reg.get("compute knn").is_some());
         assert!(reg.get("analyze describe").is_some());
         assert!(reg.get("nonexistent command").is_none());
     }
@@ -84,16 +84,16 @@ mod tests {
     fn test_registry_command_paths() {
         let reg = CommandRegistry::with_builtins();
         let paths = reg.command_paths();
-        assert!(paths.contains(&"import"));
-        assert!(paths.contains(&"convert file"));
+        assert!(paths.contains(&"transform convert"));
+        assert!(paths.contains(&"compute knn"));
         assert!(paths.contains(&"analyze describe"));
     }
 
     #[test]
     fn test_registry_create_via_get() {
         let reg = CommandRegistry::with_builtins();
-        let factory = reg.get("import").expect("import not found");
+        let factory = reg.get("transform convert").expect("transform convert not found");
         let cmd = factory();
-        assert_eq!(cmd.command_path(), "import");
+        assert_eq!(cmd.command_path(), "transform convert");
     }
 }

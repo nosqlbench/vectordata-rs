@@ -183,72 +183,95 @@ Current subcommand mapping:
 | `curlify` | `datasets curlify` |
 | `prebuffer` | `datasets prebuffer` |
 
-## 1.5 Command Categories
+## 1.5 CLI Design Principles
 
-Veks commands are organized into three categories based on their purpose and
-the nature of their output.
+The following principles govern the naming, grouping, and behavior of all
+veks commands. These are normative requirements — new commands and
+refactoring of existing commands must conform.
+
+### 1.5.1 Structural Consistency
+
+- **Group names are verbs** that describe the action category: `analyze`,
+  `compute`, `generate`, `transform`, `verify`, `download`, `query`.
+- **Subcommand names are nouns or noun-phrases** that specify the target:
+  `knn`, `shuffle`, `ordinals`, `knn-groundtruth`.
+- **Command paths read as verb-noun phrases**: `compute knn`, `analyze
+  stats`, `verify knn-groundtruth`, `transform extract`.
+- **Arity consistency**: every pipeline command has a group. No bare
+  commands at the pipeline root. Single-operation groups (like `merkle`)
+  are acceptable when the group represents a cohesive tool domain.
+
+### 1.5.2 Semantic Consistency
+
+- **One concept, one name, one location.** If a name is used, it means
+  the same thing everywhere. `import` does not mean "bootstrap a dataset"
+  in one context and "convert a file format" in another.
+- **Leaf commands are self-describing without parent context.** `verify
+  knn-groundtruth` is clear anywhere; `verify knn` requires knowing
+  what aspect of KNN is being verified.
+- **Format-specific variants collapse to parameterized commands.** One
+  `transform extract` with format auto-detection, not N format-specific
+  commands. Exceptions: when the operation is structurally different
+  (e.g., `transform extract-slab` vs `transform extract`).
+
+### 1.5.3 Perceptual Consistency
+
+- **Pipeline commands vs workflow commands never share a namespace.**
+  Pipeline commands are building blocks (`CommandOp` implementations).
+  Workflow commands (`prepare bootstrap`, `prepare stratify`) orchestrate
+  those building blocks. They live in separate command trees.
+- **Infrastructure commands are visually separated from data processing.**
+  `state set`, `state clear`, `config show` are meta-operations, not
+  data transformations.
+- **Usage modes lay out naturally.** A user exploring the tool encounters
+  workflow commands first (`prepare`, `datasets`, `run`), then discovers
+  pipeline building blocks (`pipeline analyze`, `pipeline compute`).
+
+### 1.5.4 Zero Ambiguity
+
+- **All subcommand names are globally unique** across all command groups
+  (see §1.4.1).
+- **Argument semantics are uniform for a given type.** A `--source` path
+  means the same thing in every command that accepts one. Semantic
+  disambiguation through naming is acceptable (e.g., `--base` vs
+  `--query` for different vector roles).
+
+## 1.6 Command Categories
+
+### Workflow commands
+
+High-level commands that orchestrate pipeline steps, manage dataset
+configuration, and provide user-facing workflows. These are the primary
+entry points for dataset producers and consumers.
+
+| Group | Commands | Purpose |
+|---|---|---|
+| `prepare` | `bootstrap`, `stratify`, `catalog` | Create and configure datasets |
+| `datasets` | `list`, `list-cache`, `prebuffer`, `script curl` | Browse, cache, download datasets |
+| `config` | `show`, `init`, `list-mounts` | Tool and storage configuration |
+| `run` | *(top-level)* | Execute pipeline from dataset.yaml |
+| `script` | *(top-level)* | Emit pipeline as shell script |
+| `check` | *(top-level)* | Pre-flight validation |
+| `publish` | *(top-level)* | Publish to S3 |
 
 ### Pipeline commands
 
-Commands that produce structured, reproducible outputs suitable for data
-processing workflows. These commands can analyze, process, filter, convert,
-compute, generate, import, or otherwise transform data in a deterministic and
-composable way. Pipeline commands live under the `veks pipeline` namespace and
-implement the `CommandOp` trait so they can be composed into DAG-ordered
-pipelines via `dataset.yaml`.
+Building-block commands that implement `CommandOp` and can be composed
+into DAG-ordered pipelines via `dataset.yaml`. Also invocable directly
+via `veks pipeline <group> <command>`.
 
-Pipeline commands are invocable two ways:
-
-- **Via pipeline**: `veks run dataset.yaml` — the runner executes steps in DAG
-  order, passing each command a `StreamContext` with workspace, scratch space,
-  variables, and resource governance.
-- **Directly**: `veks pipeline <group> <command> [options]` — a single
-  command is executed with CLI-provided options and an ad-hoc `StreamContext`.
-
-Pipeline command groups:
-
-| Group         | Purpose                                                                      |
-|---------------|------------------------------------------------------------------------------|
-| `import`      | Import source data into preferred internal format by facet type              |
-| `convert`     | Format-to-format conversion of vector data                                   |
-| `compute`     | Brute-force KNN, filtered KNN, sorting                                       |
-| `generate`    | Synthetic vectors, predicates, metadata indices, shuffles, sketches          |
-| `transform`   | Extract subsets from vector and slab files                                   |
-| `slab`        | Slab file operations (import, export, append, rewrite, check, get, inspect)  |
-| `analyze`     | Stats, histograms, verify-knn, compare, select, slice, zeros, find, plots   |
-| `merkle`      | Merkle tree creation, verification, diff, summary, proof paths              |
-| `datasets`    | List, plan, cache, curlify, prebuffer                                        |
-| `cleanup`     | Repair or remove malformed data files                                        |
-| `config`      | Show, init, list-mounts                                                      |
-| `info`        | File metadata, compute capabilities                                          |
-| `json`        | Record-oriented JSON querying (jjq, rjq)                                     |
-| `fetch`       | Download from external sources (HuggingFace, bulk URL templates)             |
-| `synthesize`  | Generate synthetic predicates from metadata survey                           |
-| `inspect`     | Decode and render predicate records                                          |
-| `set`         | Set and clear pipeline variables                                             |
-| `barrier`     | Synchronization barriers between pipeline phases                             |
-| `survey`      | Sample records and analyze field distributions                               |
-
-### Exploration commands
-
-Commands that help the user navigate datasets, understand data, and illustrate
-results in a human-oriented, often unstructured way. Their output is designed
-for human consumption rather than downstream processing.
-
-| Command                  | Purpose                                                            |
-|--------------------------|--------------------------------------------------------------------|
-| `veks help [command]`    | Display documentation for pipeline commands and groups             |
-
-### Inventory commands
-
-Commands for listing and finding basic elements — datasets, formats,
-capabilities, configuration. Their output enumerates what is available rather
-than processing data.
-
-| Command              | Purpose                                                        |
-|----------------------|----------------------------------------------------------------|
-| `veks datasets`     | Browse, search, and inspect datasets from configured catalogs  |
-| `veks completions`  | Generate shell completions for bash/zsh/fish                   |
+| Group | Purpose | Commands |
+|---|---|---|
+| `analyze` | Examine data, produce reports, inspect structure | `check-endian`, `compare`, `compute-info`, `describe`, `explore`, `file`, `find`, `flamegraph`, `histogram`, `model-diff`, `plot`, `predicate`, `profile`, `select`, `slice`, `stats`, `survey`, `verify-knn`, `verify-profiles`, `zeros` |
+| `cache` | Pipeline cache management | `compress`, `uncompress` |
+| `compute` | Expensive numerical computation | `evaluate-predicates`, `filtered-knn`, `knn`, `sort` |
+| `download` | Fetch from external sources | `bulk`, `huggingface` |
+| `generate` | Create new data from parameters/models | `dataset`, `derive`, `from-model`, `predicated`, `predicates`, `shuffle`, `sketch`, `vectors` |
+| `merkle` | Merkle integrity tree operations | `create`, `diff`, `path`, `spoilbits`, `spoilchunks`, `summary`, `treeview`, `verify` |
+| `query` | Search and filter records | `json`, `records` |
+| `state` | Pipeline variable management | `clear`, `set` |
+| `transform` | Reshape, convert, subset data | `convert`, `extract`, `extract-slab`, `ordinals` |
+| `verify` | Correctness validation | `knn-groundtruth`, `predicate-results` |
 
 ### Root-level command summary
 
@@ -257,14 +280,103 @@ than processing data.
 | `veks run`       | Pipeline runner      | Execute a full pipeline from dataset.yaml          |
 | `veks pipeline`  | Pipeline (direct)    | Execute a single pipeline command with CLI args    |
 | `veks script`    | Pipeline (export)    | Emit a pipeline as an equivalent shell script      |
-| `veks prepare`   | Preparation          | Import, stratify, catalog, compress datasets       |
-| `veks datasets`  | Inventory            | Browse and search datasets from configured catalogs|
+| `veks prepare`   | Preparation          | Bootstrap, stratify, catalog datasets              |
+| `veks datasets`  | Consumer             | Browse, search, cache, download datasets           |
+| `veks config`    | Configuration        | Tool and storage configuration                     |
 | `veks check`     | Validation           | Pre-flight checks for dataset readiness            |
 | `veks publish`   | Publishing           | Publish dataset to S3                              |
 | `veks help`      | Documentation        | Pipeline command documentation                     |
-| `veks completions`| Inventory           | Shell completion generation                        |
+| `veks completions`| Shell setup         | Shell completion generation                        |
 
-## 1.6 Technology Stack
+## 1.6 Visualization Command Requirements
+
+The `veks visualize` command group (`explore-histograms`, `plot`, `pca`)
+provides interactive TUI-based data exploration. These commands are
+normatively required to satisfy the following:
+
+### 1.6.1 Incremental Streaming with TUI Preview
+
+All visualization commands MUST be incremental and TUI-friendly.
+Users must see results appear progressively — not wait for an entire
+computation to finish before seeing anything. Specifically:
+
+- Data is processed in **partitions** (e.g., 1M vectors per partition).
+- After each partition, the TUI updates with the current approximation.
+- The user can press `q` at any time to stop with the current result.
+- For PCA: eigenvectors are recomputed after each partition; the scatter
+  plot refines as more data is processed.
+- For histograms: bins update as more samples are incorporated.
+
+### 1.6.2 Cached Intermediate Artifacts
+
+All visualization commands MUST cache their intermediate products so
+that recomputation is avoided when the source data has not changed:
+
+- Cache location: `.cache/viz/` next to the source file, or in the
+  centrally configured cache directory (from `settings.yaml`) for
+  catalog datasets.
+- Per-partition statistics are cached individually so that adding more
+  partitions only computes the new ones.
+- Final projected/binned results are cached for instant reload.
+- Cache invalidation: mtime comparison — if the source file is newer
+  than the cache, the cache is stale and recomputed.
+
+### 1.6.3 SIMD Optimization
+
+All visualization commands that perform vector arithmetic (dot products,
+distance computations, accumulations) MUST use `simsimd` for the inner
+loops where applicable. The key hot paths are:
+
+- **PCA covariance-vector product**: the `(x - μ) · v` dot product in
+  power iteration is called O(N × iterations) times and dominates
+  runtime for large datasets.
+- **PCA projection**: the `(x - μ) · eigenvector` dot products.
+- **Histogram binning**: not SIMD-critical (single scalar per vector).
+
+Use `simsimd::SpatialSimilarity::dot` for f32 vectors. For f16 (mvec)
+sources, convert individual vectors to f64 on the fly via the
+`AnyVectorReader` abstraction — do NOT bulk-convert the entire file.
+
+### 1.6.4 Format-Agnostic Access
+
+All visualization commands MUST support all primary vector formats
+(fvec, mvec, dvec) through the `AnyVectorReader` abstraction. Format
+is auto-detected from the file extension. Individual vectors are
+converted to f64 at read time — no temporary file conversion.
+
+### 1.6.5 Progress and Abort
+
+All visualization commands MUST show a progress indicator during data
+loading and computation phases:
+
+- Progress updates at **1–4 Hz** (at least once per second, at most
+  4 times per second).
+- Progress shows: phase name, items processed / total, percentage,
+  elapsed time, and estimated time remaining where computable.
+- Progress is rendered to stderr so it doesn't interfere with TUI
+  rendering once the alternate screen is entered.
+
+All visualization commands MUST handle abort signals:
+
+- **Ctrl-C** (SIGINT): caught and interpreted as a clean abort. The
+  command restores the terminal, prints a summary of what was computed
+  so far, and exits with status 130.
+- **Escape**: caught during TUI interaction and during loading phases
+  (via non-blocking key poll). Treated as "stop early with current
+  results" — the TUI displays whatever has been computed so far.
+- **`?` key**: all TUI modes MUST support `?` as a "show keystroke
+  help" toggle. When pressed, an overlay or footer displays all
+  available key bindings and their actions.
+
+### 1.6.6 Remote Dataset Access
+
+All visualization commands MUST accept `dataset:profile[:facet]`
+specifiers in addition to local file paths. Remote datasets are
+resolved via the catalog system and accessed through the configured
+vectordata cache directory (`settings.yaml` → `cache_dir`). The
+default facet is `base_vectors`.
+
+## 1.7 Technology Stack
 
 | Component          | Technology                                                      |
 |--------------------|-----------------------------------------------------------------|

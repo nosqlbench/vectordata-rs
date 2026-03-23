@@ -22,11 +22,30 @@ const CONFIG_DIR: &str = ".config/vectordata";
 const SETTINGS_FILE: &str = "settings.yaml";
 
 /// Get the settings.yaml path.
-fn settings_path() -> PathBuf {
+pub(crate) fn settings_path() -> PathBuf {
     if let Some(home) = std::env::var_os("HOME") {
         PathBuf::from(home).join(CONFIG_DIR).join(SETTINGS_FILE)
     } else {
         PathBuf::from(CONFIG_DIR).join(SETTINGS_FILE)
+    }
+}
+
+/// Resolve the configured cache directory from settings.yaml.
+///
+/// Returns the `cache_dir` from `~/.config/vectordata/settings.yaml`,
+/// or a default fallback if not configured.
+pub(crate) fn configured_cache_dir() -> PathBuf {
+    let path = settings_path();
+    if let Ok(s) = Settings::load(&path) {
+        if let Some(ref dir) = s.cache_dir {
+            return PathBuf::from(dir);
+        }
+    }
+    // Fallback
+    if let Some(home) = std::env::var_os("HOME") {
+        PathBuf::from(home).join(".cache").join("vectordata")
+    } else {
+        PathBuf::from(".cache/vectordata")
     }
 }
 
@@ -555,10 +574,7 @@ fn list_mount_points() -> Vec<MountInfo> {
 
                 let path = PathBuf::from(mount_point);
                 if let Ok(stat) = nix_statvfs(&path) {
-                    let writable = path
-                        .metadata()
-                        .map(|m| !m.permissions().readonly())
-                        .unwrap_or(false);
+                    let writable = is_writable_by_current_user(&path);
                     mounts.push(MountInfo {
                         path: mount_point.to_string(),
                         available: stat.0,
@@ -590,6 +606,55 @@ fn list_mount_points() -> Vec<MountInfo> {
 
     mounts.sort_by(|a, b| b.available.cmp(&a.available));
     mounts
+}
+
+/// Check if the current user can write to a directory using POSIX permission bits.
+///
+/// Checks owner/group/other write bits against the current uid and gids,
+/// matching how the kernel would evaluate access.
+fn is_writable_by_current_user(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    let meta = match path.metadata() {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+
+    let mode = meta.mode();
+    let file_uid = meta.uid();
+    let file_gid = meta.gid();
+
+    let my_uid = unsafe { libc::getuid() };
+    let my_gid = unsafe { libc::getegid() };
+
+    // Root can write anywhere
+    if my_uid == 0 {
+        return true;
+    }
+
+    // Check owner
+    if file_uid == my_uid {
+        return mode & 0o200 != 0; // owner write bit
+    }
+
+    // Check group — need to check all supplementary groups
+    if file_gid == my_gid {
+        return mode & 0o020 != 0; // group write bit
+    }
+
+    // Check supplementary groups
+    let mut groups = vec![0u32; 64];
+    let ngroups: libc::c_int = groups.len() as libc::c_int;
+    let ret = unsafe { libc::getgroups(ngroups, groups.as_mut_ptr() as *mut libc::gid_t) };
+    if ret > 0 {
+        groups.truncate(ret as usize);
+        if groups.contains(&file_gid) {
+            return mode & 0o020 != 0; // group write bit
+        }
+    }
+
+    // Check other
+    mode & 0o002 != 0
 }
 
 /// Get filesystem stats using libc statvfs.
