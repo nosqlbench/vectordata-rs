@@ -22,5 +22,4 @@ split-debuginfo = "unpacked"
 opt-level = 2
 
 [profile.release]
-# Keep debug info for profiling while still optimizing.
-debug = 1
+debug = false
