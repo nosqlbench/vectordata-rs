@@ -2317,15 +2317,22 @@ impl CommandOp for TransformExtractOp {
     fn command_doc(&self) -> CommandDoc {
         let options = self.describe_options();
         CommandDoc {
-            summary: "Extract records from any vector or slab file (auto-detects format)".into(),
+            summary: "Extract records from vector or slab files (auto-detects format)".into(),
             body: format!(
                 "# transform extract\n\n\
-                Extract records from any xvec or slab file.\n\n\
+                Extract records from any supported file format.\n\n\
                 ## Description\n\n\
-                Auto-detects the source file format from its extension (.fvec, .mvec, \
-                .ivec, .dvec, .svec, .bvec, .slab) and delegates to the appropriate \
-                format-specific extract command. Supports both index-based extraction \
-                (with --ivec-file) and range-based extraction (identity, without --ivec-file).\n\n\
+                Auto-detects the source file format from its extension and delegates \
+                to the appropriate format-specific extractor.\n\n\
+                Supported formats:\n\
+                - Vector files: `.fvec` (f32), `.mvec` (f16), `.ivec` (i32), `.dvec`, `.svec`, `.bvec`\n\
+                - Container files: `.slab` (record-oriented binary — may contain vectors, \
+                metadata, predicate keys, or any structured data)\n\n\
+                Two extraction modes:\n\
+                - **Index-based** (with `ivec-file`): select and reorder records by ordinal position\n\
+                - **Range-based** (without `ivec-file`): extract a contiguous slice\n\n\
+                The `normalize` option applies L2-normalization (vector formats only). \
+                The `page-size` option controls slab output page size (slab format only).\n\n\
                 ## Options\n\n{}",
                 render_options_table(&options)
             ),
@@ -2382,6 +2389,7 @@ impl CommandOp for TransformExtractOp {
         if let Some(v) = options.get("output") { delegate_opts.set("output", v); }
         if let Some(v) = options.get("range") { delegate_opts.set("range", v); }
         if let Some(v) = options.get("normalize") { delegate_opts.set("normalize", v); }
+        if let Some(v) = options.get("page-size") { delegate_opts.set("page-size", v); }
 
         // Delegate to format-specific command
         let mut cmd: Box<dyn CommandOp> = match ext {
@@ -2438,6 +2446,36 @@ impl CommandOp for TransformExtractOp {
                 role: OptionRole::Config,
             },
         ]
+    }
+
+    fn project_artifacts(&self, step_id: &str, options: &Options) -> ArtifactManifest {
+        use crate::pipeline::command::is_cache_path;
+
+        let mut inputs = Vec::new();
+        let mut outputs = Vec::new();
+        let mut intermediates = Vec::new();
+
+        if let Some(v) = options.get("source") {
+            inputs.push(v.to_string());
+        }
+        if let Some(v) = options.get("ivec-file") {
+            inputs.push(v.to_string());
+        }
+        if let Some(v) = options.get("output") {
+            if is_cache_path(v) {
+                intermediates.push(v.to_string());
+            } else {
+                outputs.push(v.to_string());
+            }
+        }
+
+        ArtifactManifest {
+            step_id: step_id.to_string(),
+            command: self.command_path().to_string(),
+            inputs,
+            outputs,
+            intermediates,
+        }
     }
 }
 

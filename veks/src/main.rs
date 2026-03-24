@@ -265,9 +265,22 @@ fn main() {
                 }
                 // No matches in expanded set — fall through to clap
             } else {
-                // Empty prefix: double-tap detection
+                // Empty prefix at root: double-tap detection
                 if let Some(output) = check_triple_tap() {
                     print!("{}", output);
+                    std::process::exit(0);
+                }
+            }
+        }
+        // Subcommand-level triple-tap: e.g., `veks pipeline <TAB><TAB>`
+        // When the user repeatedly tabs inside a subcommand that has nested
+        // children, show the full "group child\tdescription" expansion.
+        if let Some((group, child_prefix)) = subcommand_completion_context() {
+            if let Some(output) = check_triple_tap() {
+                // Filter the full list to entries under this group
+                let filtered = filter_subcommand_children(&group, &child_prefix, &output);
+                if !filtered.is_empty() {
+                    print!("{}", filtered);
                     std::process::exit(0);
                 }
             }
@@ -292,6 +305,57 @@ fn main() {
 // ---------------------------------------------------------------------------
 // Triple-tap detection
 // ---------------------------------------------------------------------------
+
+/// Detect if we're completing inside a known subcommand group.
+///
+/// Returns `Some((group_name, child_prefix))` when the user has typed
+/// e.g. `veks pipeline <TAB>` (group="pipeline", child_prefix="") or
+/// `veks pipeline an<TAB>` (group="pipeline", child_prefix="an").
+fn subcommand_completion_context() -> Option<(String, String)> {
+    let args: Vec<String> = std::env::args().collect();
+    let words = if let Some(pos) = args.iter().position(|a| a == "--") {
+        args[pos + 1..].to_vec()
+    } else {
+        args[1..].to_vec()
+    };
+    // Need exactly: program-context group [partial-child]
+    // words[0] = group name, words[1] = partial child (may be empty)
+    if words.len() < 2 || words.len() > 3 {
+        return None;
+    }
+    let group = &words[0];
+    let child_prefix = if words.len() == 3 {
+        words[2].clone()
+    } else {
+        words.get(1).cloned().unwrap_or_default()
+    };
+    // Verify this is a known group with children
+    let cmd = Veks::command();
+    let sub = cmd.get_subcommands().find(|c| c.get_name() == group.as_str())?;
+    if sub.get_subcommands().next().is_some() {
+        Some((group.clone(), child_prefix))
+    } else {
+        None
+    }
+}
+
+/// Filter completion output to show only children of a specific group,
+/// with the group prefix stripped so they complete naturally.
+fn filter_subcommand_children(group: &str, prefix: &str, full_list: &str) -> String {
+    let group_prefix = format!("{} ", group);
+    let mut result = String::new();
+    for line in full_list.lines() {
+        let cmd = line.split('\t').next().unwrap_or("");
+        if let Some(child) = cmd.strip_prefix(&group_prefix) {
+            if prefix.is_empty() || child.starts_with(prefix) {
+                // Emit child name only (strip group prefix) so bash completes correctly
+                let desc = line.split('\t').nth(1).unwrap_or("");
+                result.push_str(&format!("{}\t{}\n", child, desc));
+            }
+        }
+    }
+    result
+}
 
 /// If this is a root-level completion, return the partial prefix the user
 /// has typed. Returns `Some("")` for `veks <TAB>`, `Some("se")` for
@@ -433,10 +497,13 @@ fn build_full_command_list() -> String {
         }
     }
 
-    // Pipeline commands from the registry
+    // Pipeline commands from the registry — add both forms:
+    // 1. "group child" for shorthand completion (e.g., "transform extract")
+    // 2. "pipeline group child" for subcommand-level completion
     let registry = pipeline::registry::CommandRegistry::with_builtins();
     for path in registry.command_paths() {
         lines.push(format!("{}\tpipeline: {}", path, path));
+        lines.push(format!("pipeline {}\t{}", path, path));
     }
 
     lines.join("\n") + "\n"

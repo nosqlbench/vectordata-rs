@@ -713,7 +713,7 @@ pub fn facet_completer(current: &OsStr) -> Vec<CompletionCandidate> {
     if select_already_specified() { return Vec::new(); }
     let prefix = current.to_string_lossy().to_lowercase();
     let entries = filtered_completion_entries();
-    if entries.len() <= 1 { return Vec::new(); }
+    if entries.is_empty() { return Vec::new(); }
 
     let mut facets = BTreeSet::new();
     for e in &entries {
@@ -764,7 +764,7 @@ pub fn metric_completer(current: &OsStr) -> Vec<CompletionCandidate> {
     if select_already_specified() { return Vec::new(); }
     let prefix = current.to_string_lossy().to_lowercase();
     let entries = filtered_completion_entries();
-    if entries.len() <= 1 { return Vec::new(); }
+    if entries.is_empty() { return Vec::new(); }
 
     let mut metrics = BTreeSet::new();
     let mut with_metric = 0usize;
@@ -793,7 +793,7 @@ pub fn metric_completer(current: &OsStr) -> Vec<CompletionCandidate> {
 pub fn profile_completer(current: &OsStr) -> Vec<CompletionCandidate> {
     let prefix = current.to_string_lossy().to_lowercase();
     let entries = filtered_completion_entries();
-    if entries.len() <= 1 { return Vec::new(); }
+    if entries.is_empty() { return Vec::new(); }
 
     let mut profiles = BTreeSet::new();
     for e in &entries {
@@ -818,7 +818,7 @@ pub fn dim_completer(current: &OsStr) -> Vec<CompletionCandidate> {
     if select_already_specified() { return Vec::new(); }
     let prefix = current.to_string_lossy();
     let entries = filtered_completion_entries();
-    if entries.len() <= 1 { return Vec::new(); }
+    if entries.is_empty() { return Vec::new(); }
 
     let mut dims = BTreeSet::new();
     let mut with_dim = 0usize;
@@ -846,7 +846,7 @@ pub fn vtype_completer(current: &OsStr) -> Vec<CompletionCandidate> {
     if select_already_specified() { return Vec::new(); }
     let prefix = current.to_string_lossy().to_lowercase();
     let entries = filtered_completion_entries();
-    if entries.len() <= 1 { return Vec::new(); }
+    if entries.is_empty() { return Vec::new(); }
 
     let mut vtypes = BTreeSet::new();
     let mut with_vtype = 0usize;
@@ -889,7 +889,7 @@ pub fn size_completer(current: &OsStr) -> Vec<CompletionCandidate> {
     if select_already_specified() { return Vec::new(); }
     let prefix = current.to_string_lossy();
     let entries = filtered_completion_entries();
-    if entries.len() <= 1 { return Vec::new(); }
+    if entries.is_empty() { return Vec::new(); }
 
     let mut sizes = BTreeSet::new();
     let mut with_size = 0usize;
@@ -918,7 +918,7 @@ pub fn desc_completer(current: &OsStr) -> Vec<CompletionCandidate> {
     if select_already_specified() { return Vec::new(); }
     let prefix = current.to_string_lossy().to_lowercase();
     let entries = filtered_completion_entries();
-    if entries.len() <= 1 { return Vec::new(); }
+    if entries.is_empty() { return Vec::new(); }
 
     let mut words = BTreeSet::new();
     for e in &entries {
@@ -952,7 +952,7 @@ pub fn data_size_completer(current: &OsStr) -> Vec<CompletionCandidate> {
     if select_already_specified() { return Vec::new(); }
     let prefix = current.to_string_lossy();
     let entries = filtered_completion_entries();
-    if entries.len() <= 1 { return Vec::new(); }
+    if entries.is_empty() { return Vec::new(); }
 
     let mut sizes = BTreeSet::new();
     let mut with_size = 0usize;
@@ -991,7 +991,10 @@ pub fn hidden_list_args() -> Vec<&'static str> {
     // values exist OR if some entries lack the value (coverage < n).
     macro_rules! check_with {
         ($id:expr, $distinct:expr, $coverage:expr) => {
-            if selected || n <= 1 || ($distinct <= 1 && $coverage == n) || $distinct == 0 {
+            // Only hide when --select is active (already resolved to one entry).
+            // Don't hide just because the catalog has few entries — the user
+            // still needs to see available options.
+            if selected {
                 hidden.push($id);
             }
         };

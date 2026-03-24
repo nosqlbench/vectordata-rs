@@ -129,7 +129,6 @@ pub fn register_all(registry: &mut CommandRegistry) {
     // ── transform ────────────────────────────────────────────────────
     registry.register("transform convert", import::factory);
     registry.register("transform extract", gen_extract::extract_factory);
-    registry.register("transform extract-slab", gen_extract::slab_factory);
     registry.register("transform ordinals", clean_ordinals::factory);
 
     // ── verify ───────────────────────────────────────────────────────

@@ -637,12 +637,12 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, output_dir: &std::path::
             }
             steps.push(Step {
                 id: "extract-metadata".into(),
-                run: "transform extract-slab".into(),
+                run: "transform extract".into(),
                 description: Some("Reorder metadata to match shuffled base vectors".into()),
                 after,
                 per_profile: false,
                 options: vec![
-                    ("slab-file".into(), meta.metadata_all.path().into()),
+                    ("source".into(), meta.metadata_all.path().into()),
                     ("ivec-file".into(), "${cache}/shuffle.ivec".into()),
                     ("output".into(), "profiles/base/metadata_content.slab".into()),
                     ("range".into(), "[${query_count},${vector_count})".into()),

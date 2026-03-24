@@ -1076,15 +1076,15 @@ fn project_artifacts_transform_extract_generic() {
 fn project_artifacts_slab_extract() {
     use veks::pipeline::command::Options;
 
-    let cmd = make_cmd("transform extract-slab");
+    let cmd = make_cmd("transform extract");
     let mut opts = Options::new();
-    opts.set("slab-file", "metadata_all.slab");
+    opts.set("source", "metadata_all.slab");
     opts.set("ivec-file", "${cache}/shuffle.ivec");
     opts.set("output", "profiles/default/base_metadata.slab");
 
     let manifest = cmd.project_artifacts("extract-metadata", &opts);
     assert_eq!(manifest.step_id, "extract-metadata");
-    assert_eq!(manifest.command, "transform extract-slab");
+    assert_eq!(manifest.command, "transform extract");
     assert_eq!(manifest.inputs, vec![
         "metadata_all.slab",
         "${cache}/shuffle.ivec",
@@ -1096,9 +1096,9 @@ fn project_artifacts_slab_extract() {
 fn project_artifacts_slab_extract_cache_output() {
     use veks::pipeline::command::Options;
 
-    let cmd = make_cmd("transform extract-slab");
+    let cmd = make_cmd("transform extract");
     let mut opts = Options::new();
-    opts.set("slab-file", "raw.slab");
+    opts.set("source", "raw.slab");
     opts.set("ivec-file", "idx.ivec");
     opts.set("output", ".cache/extracted.slab");
 
@@ -1794,7 +1794,7 @@ fn project_artifacts_every_registered_command_no_panic() {
         // state
         "state set", "state clear",
         // transform
-        "transform convert", "transform extract", "transform extract-slab",
+        "transform convert", "transform extract",
         "transform ordinals",
         // verify
         "verify knn-groundtruth", "verify predicate-results",

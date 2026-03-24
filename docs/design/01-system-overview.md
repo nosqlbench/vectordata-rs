@@ -231,6 +231,12 @@ refactoring of existing commands must conform.
 
 - **All subcommand names are globally unique** across all command groups
   (see §1.4.1).
+- **Sibling subcommands MUST NOT share a common prefix.** Names like
+  `list` and `list-cache` under the same parent create ambiguous
+  tab-completion: typing `list<TAB>` cannot complete unambiguously.
+  Instead, use flags on the base command (e.g., `list --cached`) or
+  choose distinct names. This rule applies at every level of the
+  command tree.
 - **Argument semantics are uniform for a given type.** A `--source` path
   means the same thing in every command that accepts one. Semantic
   disambiguation through naming is acceptable (e.g., `--base` vs

@@ -130,16 +130,14 @@ pub enum DatasetsCommand {
         /// Filter: maximum total data size in bytes (supports K/M/G/T suffixes)
         #[arg(long = "with-data-max", add = ArgValueCompleter::new(filter::data_size_completer))]
         data_max: Option<String>,
-    },
-    /// List locally cached datasets
-    ListCache {
-        /// Override cache directory location
+
+        /// List locally cached datasets instead of catalog entries
+        #[arg(long)]
+        cached: bool,
+
+        /// Override cache directory location (used with --cached)
         #[arg(long)]
         cache_dir: Option<PathBuf>,
-
-        /// Show per-file details
-        #[arg(long)]
-        verbose: bool,
     },
     /// Generate curl download commands for a dataset
     Curlify {
@@ -242,7 +240,13 @@ pub fn run(args: DatasetsArgs) {
             vtype,
             data_min,
             data_max,
+            cached,
+            cache_dir,
         } => {
+            if cached {
+                cache::run(cache_dir.as_deref(), verbose);
+                return;
+            }
             // Parse size values
             let filter = filter::DatasetFilter {
                 name,
@@ -268,9 +272,6 @@ pub fn run(args: DatasetsArgs) {
             };
             let profile_view = filter::ProfileView::new(profile, profile_regex);
             list::run(&configdir, &catalog, &at, &output_format, verbose, group_by.as_deref(), &filter, &profile_view, select.as_deref());
-        }
-        DatasetsCommand::ListCache { cache_dir, verbose } => {
-            cache::run(cache_dir.as_deref(), verbose);
         }
         DatasetsCommand::Curlify { path, output } => {
             curlify::run(&path, output.as_deref());
