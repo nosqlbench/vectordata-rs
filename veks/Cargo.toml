@@ -1,6 +1,6 @@
 [package]
 name = "veks"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2024"
 description = "A vector bulk data processing tool"
 license = "Apache-2.0"
@@ -53,11 +53,11 @@ serde_yaml = "0.9"
 signal-hook = "0.3"
 simsimd = "6"
 rusqlite = { version = "0.31", features = ["bundled"] }
-slabtastic = { path = "../slabtastic", version ="0.8.1" }
+slabtastic = { path = "../slabtastic", version ="0.8.2" }
 tokio = { version = "1", features = ["full"] }
 crossterm = "0.28"
 ratatui = { version = "0.29", features = ["all-widgets"] }
-vectordata = { path = "../vectordata", version="0.3.1" }
+vectordata = { path = "../vectordata", version="0.3.2" }
 
 [dev-dependencies]
 shadow-terminal = "0.2"
