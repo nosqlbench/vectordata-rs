@@ -88,38 +88,44 @@ pub fn check_coverage(
             .unwrap_or(dataset_path)
             .to_string_lossy();
 
-        let workspace = dataset_path.parent().unwrap_or(Path::new("."));
+        let _workspace = dataset_path.parent().unwrap_or(Path::new("."));
 
         // Load pipeline step outputs
         let defined_outputs = load_step_outputs(dataset_path);
 
+        // Check if there's a blanket merkle create step (source: ".")
+        // that covers all files in the workspace.
+        let has_blanket_merkle = defined_outputs.iter()
+            .any(|(cmd, output)| cmd == "merkle create" && (output == "." || output == "./"));
+
+        // If a blanket merkle step exists, individual file coverage is
+        // satisfied — the step walks the directory and creates .mref for everything.
+        if has_blanket_merkle {
+            continue;
+        }
+
         // Check merkle coverage: every publishable file above the threshold
-        // that is a pipeline output should have a corresponding merkle step
+        // should have a corresponding merkle step or existing .mref
         for file in publishable {
-            // Skip small files
             let size = std::fs::metadata(file).map(|m| m.len()).unwrap_or(0);
             if size < merkle_threshold {
                 continue;
             }
 
-            // Skip .mref files themselves
             if file.extension().map(|e| e == "mref").unwrap_or(false) {
                 continue;
             }
 
-            let file_rel = file.strip_prefix(workspace)
-                .unwrap_or(file)
-                .to_string_lossy()
-                .to_string();
+            let file_rel = super::rel_display(file);
 
-            // Check if a merkle create step exists for this file
             let has_merkle_step = defined_outputs.iter()
                 .any(|(cmd, output)| {
                     cmd == "merkle create" && output == &file_rel
                 });
 
-            // Also check if an mref already exists (created outside pipeline)
-            let mref_path = PathBuf::from(format!("{}.mref", file.display()));
+            let mref_path = file.with_extension(
+                format!("{}.mref", file.extension().and_then(|e| e.to_str()).unwrap_or(""))
+            );
             let has_mref = mref_path.exists();
 
             if !has_merkle_step && !has_mref {

@@ -58,7 +58,7 @@ pub struct CheckArgs {
     pub clean_files: bool,
 
     /// Minimum file size for merkle coverage check
-    #[arg(long, default_value = "100M", value_name = "SIZE")]
+    #[arg(long, default_value = "0", value_name = "SIZE")]
     pub merkle_min_size: String,
 
     /// Auto-update dataset.yaml with missing pipeline steps (e.g., merkle)
@@ -93,16 +93,13 @@ impl CheckResult {
 
 /// Entry point for `veks check`.
 pub fn run(args: CheckArgs) {
-    let directory = if args.directory.is_absolute() {
-        args.directory.clone()
-    } else {
-        std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join(&args.directory)
-    };
+    // Keep directory as-is for file operations. The find_publish_file and
+    // find_catalog_root helpers internally canonicalize when needed for
+    // upward traversal, but all user-facing output uses relative paths.
+    let directory = args.directory.clone();
 
     if !directory.is_dir() {
-        eprintln!("Error: '{}' is not a directory", directory.display());
+        eprintln!("Error: '{}' is not a directory", rel_display(&directory));
         std::process::exit(2);
     }
 
@@ -113,7 +110,7 @@ pub fn run(args: CheckArgs) {
     let is_publish_path = has_publish_url || has_catalog_root;
 
     if !has_dataset_yaml && !is_publish_path {
-        eprintln!("Error: '{}' has no dataset.yaml and is not part of a publish path", directory.display());
+        eprintln!("Error: '{}' has no dataset.yaml and is not part of a publish path", rel_display(&directory));
         eprintln!("  (no .publish_url or .catalog_root found in any parent directory)");
         std::process::exit(2);
     }
@@ -147,9 +144,16 @@ pub fn run(args: CheckArgs) {
     // Discover all dataset.yaml files under the target directory.
     let dataset_files = discover_datasets(&directory);
 
-    // Collect publishable files for merkle/integrity checks.
+    // Collect files for merkle/integrity/extraneous checks.
+    // In dataset context, enumerate all non-excluded files under the workspace
+    // (no .publish sentinel required — merkle coverage is always checked).
+    // In publish context, use the publish-aware enumerator which respects .publish.
     let publishable = if run_merkle || run_integrity || run_extraneous {
-        crate::publish::enumerate_publishable_files(&directory)
+        if is_dataset_context {
+            enumerate_workspace_files(&directory)
+        } else {
+            crate::publish::enumerate_publishable_files(&directory)
+        }
     } else {
         vec![]
     };
@@ -218,7 +222,7 @@ pub fn run(args: CheckArgs) {
             // Print advisories
             if !plan.advisories.is_empty() {
                 println!();
-                println!("To resolve ({}):", ds_path.display());
+                println!("To resolve ({}):", rel_display(ds_path));
                 for advice in &plan.advisories {
                     println!("  {}", advice);
                 }
@@ -229,13 +233,13 @@ pub fn run(args: CheckArgs) {
                     println!();
                     println!(
                         "Updating {} ({} step(s) to add)...",
-                        ds_path.display(),
+                        rel_display(ds_path),
                         plan.steps_to_add.len(),
                     );
                     println!("A backup will be created in .backup/ before any changes.");
                     match fix::apply_fix(&plan) {
                         Ok(()) => {
-                            println!("Pipeline updated. To execute new steps:\n  veks run {}", ds_path.display());
+                            println!("Pipeline updated. To execute new steps:\n  veks run {}", rel_display(ds_path));
                         }
                         Err(e) => {
                             eprintln!("Error applying fix: {}", e);
@@ -246,12 +250,12 @@ pub fn run(args: CheckArgs) {
                 println!();
                 println!(
                     "{} is missing {} pipeline step(s) (e.g., merkle tree generation).",
-                    ds_path.display(),
+                    rel_display(ds_path),
                     plan.steps_to_add.len(),
                 );
                 println!(
                     "To auto-add them, re-run with:\n  veks check --update-pipeline {}",
-                    args.directory.display(),
+                    rel_display(&args.directory),
                 );
                 println!("(A backup of dataset.yaml will be created in .backup/ before changes.)");
             }
@@ -278,6 +282,44 @@ pub fn run(args: CheckArgs) {
                 clean_empty_dirs(&directory);
             }
         }
+    }
+
+    // Dataset readout for publish paths: show all discovered datasets
+    // color-coded by publish status (.publish sentinel file).
+    if is_publish_context && !args.quiet && !args.json {
+        println!();
+        println!("{}", crate::term::bold("Datasets in publish tree:"));
+        let mut ds_entries: Vec<(String, bool, String)> = Vec::new(); // (name, publishable, rel_path)
+        for ds_path in &dataset_files {
+            if let Ok(config) = vectordata::dataset::DatasetConfig::load(ds_path) {
+                let ds_dir = ds_path.parent().unwrap_or(std::path::Path::new("."));
+                let publishable = ds_dir.join(".publish").exists();
+                let rel = ds_path.strip_prefix(&directory)
+                    .map(|r| r.parent().unwrap_or(r).to_string_lossy().to_string())
+                    .unwrap_or_else(|_| rel_display(ds_path).to_string());
+                ds_entries.push((config.name, publishable, rel));
+            }
+        }
+        ds_entries.sort_by(|a, b| a.0.cmp(&b.0));
+        let max_name = ds_entries.iter().map(|(n, _, _)| n.len()).max().unwrap_or(10);
+        for (name, publishable, rel_path) in &ds_entries {
+            let status = if *publishable { "publish" } else { "local" };
+            let colored = if *publishable {
+                crate::term::green(&format!("{:<width$}  {:<8}  {}", name, status, rel_path, width = max_name))
+            } else {
+                crate::term::dim(&format!("{:<width$}  {:<8}  {}", name, status, rel_path, width = max_name))
+            };
+            println!("  {}", colored);
+        }
+        let pub_count = ds_entries.iter().filter(|(_, p, _)| *p).count();
+        let local_count = ds_entries.iter().filter(|(_, p, _)| !*p).count();
+        println!();
+        println!("  {} total: {} {} {}",
+            ds_entries.len(),
+            crate::term::green(&format!("{} publishable", pub_count)),
+            crate::term::dim(&format!("{} local", local_count)),
+            "(legend: publish=has .publish file, local=no .publish file)",
+        );
     }
 
     std::process::exit(if all_passed { 0 } else { 1 });
@@ -323,8 +365,9 @@ fn discover_datasets_recursive(dir: &Path, found: &mut Vec<PathBuf>) {
         let name_str = name.to_string_lossy();
 
         if path.is_dir() {
-            // Skip hidden/excluded directories
+            // Skip hidden (.), underscore-prefixed (_), and Python cache directories
             if name_str.starts_with('.')
+                || name_str.starts_with('_')
                 || name_str == "__pycache__"
             {
                 continue;
@@ -336,16 +379,82 @@ fn discover_datasets_recursive(dir: &Path, found: &mut Vec<PathBuf>) {
     }
 }
 
+/// Display a path relative to the current working directory.
+/// Falls back to the full path if stripping fails.
+pub(crate) fn rel_display(path: &Path) -> String {
+    if let Ok(cwd) = std::env::current_dir() {
+        path.strip_prefix(&cwd)
+            .map(|r| {
+                let s = r.to_string_lossy().to_string();
+                if s.is_empty() { ".".to_string() } else { s }
+            })
+            .unwrap_or_else(|_| path.to_string_lossy().to_string())
+    } else {
+        path.to_string_lossy().to_string()
+    }
+}
+
+/// Enumerate all non-excluded files in a dataset workspace.
+///
+/// This is the dataset-context equivalent of `enumerate_publishable_files`.
+/// It doesn't require `.publish` sentinels — it just walks the workspace
+/// and applies the standard exclusion rules (hidden files, underscore prefix,
+/// tmp/partial/pyc).
+fn enumerate_workspace_files(dir: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    enumerate_workspace_recursive(dir, &mut files);
+    files.sort();
+    files
+}
+
+fn enumerate_workspace_recursive(dir: &Path, files: &mut Vec<PathBuf>) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+
+        if path.is_dir() {
+            if name_str.starts_with('.') || name_str.starts_with('_') || name_str == "__pycache__" {
+                continue;
+            }
+            enumerate_workspace_recursive(&path, files);
+        } else {
+            if name_str.starts_with('.')
+                || name_str.starts_with('_')
+                || name_str.ends_with(".tmp")
+                || name_str.ends_with(".partial")
+                || name_str.ends_with(".pyc")
+            {
+                continue;
+            }
+            files.push(path);
+        }
+    }
+}
+
 /// Walk up from `dir` looking for `.catalog_root`.
+/// Returns a relative path from `dir` to the directory containing `.catalog_root`.
 fn find_catalog_root_file(dir: &Path) -> Option<PathBuf> {
-    let mut current = std::fs::canonicalize(dir).unwrap_or(dir.to_path_buf());
+    let abs = std::fs::canonicalize(dir).unwrap_or(dir.to_path_buf());
+    let mut current = abs.clone();
+    let mut levels_up: usize = 0;
+
     loop {
         if current.join(".catalog_root").is_file() {
-            return Some(current);
+            let mut rel = dir.to_path_buf();
+            for _ in 0..levels_up {
+                rel = rel.join("..");
+            }
+            return Some(rel);
         }
         if !current.pop() {
             return None;
         }
+        levels_up += 1;
     }
 }
 

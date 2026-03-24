@@ -80,7 +80,7 @@ fn walk_files(dir: &Path, out: &mut Vec<PathBuf>) {
 /// modifying any files.
 pub fn run(cache_dir: &Path, dry_run: bool) {
     if !cache_dir.exists() {
-        eprintln!("Cache directory does not exist: {}", cache_dir.display());
+        eprintln!("Cache directory does not exist: {}", crate::check::rel_display(&cache_dir.to_path_buf()));
         std::process::exit(1);
     }
 
@@ -99,14 +99,14 @@ pub fn run(cache_dir: &Path, dry_run: bool) {
         .collect();
 
     if eligible.is_empty() {
-        println!("No eligible files found in {}", cache_dir.display());
+        println!("No eligible files found in {}", crate::check::rel_display(&cache_dir.to_path_buf()));
         return;
     }
 
     println!(
         "{} eligible file(s) in {}",
         eligible.len(),
-        cache_dir.display()
+        crate::check::rel_display(&cache_dir.to_path_buf())
     );
     if dry_run {
         println!("(dry run — no files will be modified)");
@@ -202,7 +202,7 @@ pub fn run(cache_dir: &Path, dry_run: bool) {
 /// and preserves the mtime.
 pub fn run_uncompress(cache_dir: &Path, dry_run: bool) {
     if !cache_dir.exists() {
-        eprintln!("Cache directory does not exist: {}", cache_dir.display());
+        eprintln!("Cache directory does not exist: {}", crate::check::rel_display(&cache_dir.to_path_buf()));
         std::process::exit(1);
     }
 
@@ -222,11 +222,11 @@ pub fn run_uncompress(cache_dir: &Path, dry_run: bool) {
         .collect();
 
     if gz_files.is_empty() {
-        println!("No compressed cache files found in {}", cache_dir.display());
+        println!("No compressed cache files found in {}", crate::check::rel_display(&cache_dir.to_path_buf()));
         return;
     }
 
-    println!("{} compressed file(s) in {}", gz_files.len(), cache_dir.display());
+    println!("{} compressed file(s) in {}", gz_files.len(), crate::check::rel_display(&cache_dir.to_path_buf()));
     if dry_run { println!("(dry run — no files will be modified)"); }
     println!();
 

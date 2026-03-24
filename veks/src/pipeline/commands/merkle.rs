@@ -575,7 +575,7 @@ byte ranges rather than requiring a full file re-download.
                 name: "min-size".to_string(),
                 type_name: "size".to_string(),
                 required: false,
-                default: Some("100M".to_string()),
+                default: Some("0".to_string()),
                 description: "Skip merkle creation for files smaller than this (supports K/M/G suffixes)".to_string(),
                 role: OptionRole::Config,
         },
@@ -1649,16 +1649,27 @@ fn collect_eligible_recursive(dir: &Path, min_size: u64, files: &mut Vec<PathBuf
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
 
-        // Skip hidden entries
-        if name_str.starts_with('.') {
+        // Skip hidden and underscore-prefixed entries (consistent with
+        // publish exclusion rules — these are local workspace state)
+        if name_str.starts_with('.') || name_str.starts_with('_') {
             continue;
         }
 
         if path.is_dir() {
+            if name_str == "__pycache__" { continue; }
             collect_eligible_recursive(&path, min_size, files);
         } else {
-            // Skip .mref files
-            if name_str.ends_with(".mref") || name_str.ends_with(".mrkl") {
+            // Skip merkle state files, temp artifacts, and infrastructure
+            if name_str.ends_with(".mref") || name_str.ends_with(".mrkl")
+                || name_str.ends_with(".tmp") || name_str.ends_with(".partial")
+                || name_str.ends_with(".pyc")
+            {
+                continue;
+            }
+            // Skip infrastructure/metadata files (small, frequently regenerated)
+            let infra = ["dataset.yaml", "dataset.yml", "dataset.log",
+                         "catalog.json", "catalog.yaml", "variables.yaml"];
+            if infra.contains(&name_str.as_ref()) {
                 continue;
             }
             // Skip files below threshold

@@ -3,19 +3,19 @@
 
 //! `veks datasets cache` — list locally cached datasets.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 pub fn run(cache_dir: Option<&Path>, verbose: bool) {
     let cache_dir = cache_dir
         .map(|p| p.to_path_buf())
-        .unwrap_or_else(default_cache_dir);
+        .unwrap_or_else(|| crate::pipeline::commands::config::configured_cache_dir());
 
     if !cache_dir.exists() {
-        println!("Cache directory does not exist: {}", cache_dir.display());
+        println!("Cache directory does not exist: {}", crate::check::rel_display(&cache_dir));
         return;
     }
 
-    println!("Cache directory: {}", cache_dir.display());
+    println!("Cache directory: {}", crate::check::rel_display(&cache_dir));
     println!();
 
     let mut datasets = Vec::new();
@@ -72,17 +72,6 @@ pub fn run(cache_dir: Option<&Path>, verbose: bool) {
 
     println!();
     println!("{} dataset(s) cached", datasets.len());
-}
-
-fn default_cache_dir() -> PathBuf {
-    if let Ok(home) = std::env::var("HOME") {
-        PathBuf::from(home)
-            .join(".config")
-            .join("vectordata")
-            .join("cache")
-    } else {
-        PathBuf::from("/tmp/vectordata/cache")
-    }
 }
 
 fn scan_directory(dir: &Path) -> (usize, u64) {

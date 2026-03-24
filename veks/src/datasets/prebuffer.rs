@@ -9,7 +9,7 @@
 //! facets are downloaded from the remote source.
 
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::catalog::resolver::Catalog;
 use crate::catalog::sources::CatalogSources;
@@ -29,7 +29,7 @@ pub fn run(
 ) {
     let cache = cache_dir
         .map(|p| p.to_path_buf())
-        .unwrap_or_else(default_cache_dir);
+        .unwrap_or_else(|| crate::pipeline::commands::config::configured_cache_dir());
 
     // Try local path first
     let local = Path::new(dataset_spec);
@@ -173,7 +173,7 @@ fn run_local(path: &Path, cache: &Path) {
     };
 
     if !yaml_path.exists() {
-        eprintln!("dataset.yaml not found at {}", yaml_path.display());
+        eprintln!("dataset.yaml not found at {}", crate::check::rel_display(&yaml_path));
         std::process::exit(1);
     }
 
@@ -305,14 +305,6 @@ fn extract_view_path(entry: &serde_yaml::Value) -> String {
             .to_string()
     } else {
         String::new()
-    }
-}
-
-fn default_cache_dir() -> PathBuf {
-    if let Ok(home) = std::env::var("HOME") {
-        PathBuf::from(home).join(".config/vectordata/cache")
-    } else {
-        PathBuf::from("/tmp/vectordata/cache")
     }
 }
 

@@ -159,11 +159,12 @@ impl ProgressLog {
         if source_mtime > log_mtime {
             let count = self.steps.len();
             self.steps.clear();
+            let rel = |p: &Path| -> String {
+                crate::check::rel_display(p)
+            };
             Some(format!(
                 "Progress log invalidated: {} is newer than {} ({} step records cleared)",
-                source_path.display(),
-                log_path.display(),
-                count,
+                rel(source_path), rel(log_path), count,
             ))
         } else {
             None

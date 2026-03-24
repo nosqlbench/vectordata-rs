@@ -61,6 +61,7 @@ pub const DIM: &str = "\x1b[2m";
 pub const RED: &str = "\x1b[31m";
 pub const GREEN: &str = "\x1b[32m";
 pub const YELLOW: &str = "\x1b[33m";
+pub const BLUE: &str = "\x1b[34m";
 pub const CYAN: &str = "\x1b[36m";
 
 pub const BOLD_RED: &str = "\x1b[1;31m";
@@ -110,6 +111,11 @@ pub fn warn(text: &str) -> String {
 /// Cyan text (for informational labels).
 pub fn info(text: &str) -> String {
     color(CYAN, text)
+}
+
+/// Blue text (for private/authenticated content).
+pub fn blue(text: &str) -> String {
+    color(BLUE, text)
 }
 
 /// Dim text (for secondary/deemphasized content).

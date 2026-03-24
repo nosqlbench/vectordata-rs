@@ -164,7 +164,7 @@ pub fn run_script(args: ScriptArgs) {
     // keep as-is (may be relative to CWD).
     let workspace = if args.absolute {
         std::fs::canonicalize(&raw_workspace).unwrap_or_else(|e| {
-            println!("Failed to resolve absolute path for {}: {}", raw_workspace.display(), e);
+            println!("Failed to resolve absolute path for {}: {}", crate::check::rel_display(&raw_workspace), e);
             std::process::exit(1);
         })
     } else {
@@ -207,7 +207,7 @@ pub fn run_script(args: ScriptArgs) {
         println!(
             "No pipeline steps found for profile '{}' in {}",
             profile_name,
-            dataset_path.display()
+            crate::check::rel_display(&dataset_path)
         );
         std::process::exit(1);
     }
@@ -343,7 +343,7 @@ pub fn run_pipeline(args: RunArgs) {
         println!(
             "No pipeline steps found for profile '{}' in {}",
             profile_name,
-            dataset_path.display()
+            crate::check::rel_display(&dataset_path)
         );
         println!("Add an 'upstream' section with 'steps' to define a pipeline.");
         std::process::exit(1);
@@ -467,7 +467,7 @@ pub fn run_pipeline(args: RunArgs) {
             chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
             profile_name,
         );
-        let _ = writeln!(w, "dataset: {}", dataset_path.display());
+        let _ = writeln!(w, "dataset: {}", crate::check::rel_display(&dataset_path));
         let _ = writeln!(w, "steps: {}", pipeline_dag.steps.len());
         let _ = w.flush();
     }
@@ -543,6 +543,15 @@ pub fn run_pipeline(args: RunArgs) {
             // Post-completion guidance about the cache directory
             if summary.executed > 0 {
                 print_cache_guidance(&cache_dir_for_guidance, &pipeline_dag.steps);
+            }
+            // Suggest stratification if no sized profiles exist yet
+            let has_sized = config.profiles.0.iter()
+                .any(|(name, _)| name != "default");
+            if !has_sized && summary.executed > 0 {
+                println!();
+                println!("{}",
+                    crate::term::info("Tip: add sized profiles for multi-scale benchmarking:"));
+                println!("  veks prepare stratify");
             }
         }
     }
@@ -712,9 +721,7 @@ fn emit_cli_commands(
         println!("#");
         println!("# WARNING: This script references a workspace outside the current directory.");
         println!("# Each command includes --workspace to resolve relative paths correctly.");
-        println!("# The script is valid when run from: {}", std::env::current_dir()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|_| "(unknown)".into()));
+        println!("# The script is valid when run from: .");
     }
     println!("set -euo pipefail");
     println!();
@@ -777,12 +784,12 @@ fn emit_cli_commands(
     }
 }
 
-/// Make an absolute path relative to the workspace directory.
+/// Make a path relative to the workspace directory.
 ///
-/// If the path is under the workspace, returns the relative portion.
-/// If not, returns the original path unchanged (it's external).
+/// If the path starts with the workspace prefix, strips it.
+/// Handles window suffixes like `file.mvec[0..100)`.
 fn relativize_path(path_str: &str, workspace: &Path) -> String {
-    // Handle paths with window suffixes like "/path/to/file.mvec[0..100)"
+    // Handle paths with window suffixes
     let (path_part, suffix) = if let Some(bracket) = path_str.find('[') {
         (&path_str[..bracket], &path_str[bracket..])
     } else if let Some(paren) = path_str.find('(') {
@@ -791,19 +798,11 @@ fn relativize_path(path_str: &str, workspace: &Path) -> String {
         (path_str, "")
     };
 
-    let abs_path = Path::new(path_part);
-    let abs_workspace = std::fs::canonicalize(workspace)
-        .unwrap_or_else(|_| workspace.to_path_buf());
-
-    if let Ok(rel) = abs_path.strip_prefix(&abs_workspace) {
+    let path = Path::new(path_part);
+    if let Ok(rel) = path.strip_prefix(workspace) {
         format!("{}{}", rel.display(), suffix)
     } else {
-        // Try canonicalizing the path too in case of symlinks
-        if let Ok(canonical) = std::fs::canonicalize(abs_path) {
-            if let Ok(rel) = canonical.strip_prefix(&abs_workspace) {
-                return format!("{}{}", rel.display(), suffix);
-            }
-        }
+        // Already relative or external — return as-is
         path_str.to_string()
     }
 }
@@ -938,26 +937,26 @@ fn clean_pipeline(workspace: &Path, dataset_path: &Path) {
     let progress_path = ProgressLog::path_for_dataset(dataset_path);
     if progress_path.exists() {
         match std::fs::remove_file(&progress_path) {
-            Ok(()) => println!("Removed {}", progress_path.display()),
-            Err(e) => println!("Failed to remove {}: {}", progress_path.display(), e),
+            Ok(()) => println!("Removed {}", crate::check::rel_display(&progress_path)),
+            Err(e) => println!("Failed to remove {}: {}", crate::check::rel_display(&progress_path), e),
         }
     } else {
-        println!("No progress log found at {}", progress_path.display());
+        println!("No progress log found at {}", crate::check::rel_display(&progress_path));
     }
 
     // Delete scratch directory entirely
     let scratch_dir = workspace.join(".scratch");
     if scratch_dir.exists() {
         match std::fs::remove_dir_all(&scratch_dir) {
-            Ok(()) => println!("Removed {}", scratch_dir.display()),
-            Err(e) => println!("Failed to remove {}: {}", scratch_dir.display(), e),
+            Ok(()) => println!("Removed {}", crate::check::rel_display(&scratch_dir)),
+            Err(e) => println!("Failed to remove {}: {}", crate::check::rel_display(&scratch_dir), e),
         }
     }
 
     println!("Clean complete. Cache and output files are preserved.");
     println!(
         "To remove outputs, delete them manually from {}",
-        workspace.display()
+        crate::check::rel_display(&workspace.to_path_buf())
     );
 }
 

@@ -159,8 +159,8 @@ pub enum DatasetsCommand {
     },
     /// Download and cache dataset facets locally
     Prebuffer {
-        /// Dataset specifier: dataset:profile from catalog, or local path
-        #[arg(long, add = ArgValueCompleter::new(filter::select_completer))]
+        /// Dataset specifier: dataset:profile from catalog
+        #[arg(long, add = ArgValueCompleter::new(crate::explore::shared::dataset_completer))]
         dataset: String,
 
         /// Configuration directory containing catalogs.yaml
@@ -187,7 +187,15 @@ pub enum ConfigSubcommand {
     /// Display current vectordata configuration
     Show,
     /// Initialize a new vectordata configuration
-    Init,
+    Init {
+        /// Cache directory path (e.g., /mnt/data/vectordata-cache)
+        #[arg(long = "cache-dir")]
+        cache_dir: Option<String>,
+
+        /// Overwrite existing protected settings
+        #[arg(long)]
+        force: bool,
+    },
     /// List configured dataset mount points
     ListMounts,
 }
@@ -270,10 +278,19 @@ fn run_config_command(command: ConfigSubcommand) {
     use crate::pipeline::commands::config;
     use indexmap::IndexMap;
 
-    let mut cmd: Box<dyn CommandOp> = match command {
-        ConfigSubcommand::Show => config::show_factory(),
-        ConfigSubcommand::Init => config::init_factory(),
-        ConfigSubcommand::ListMounts => config::list_mounts_factory(),
+    let (mut cmd, extra_opts): (Box<dyn CommandOp>, Vec<(&str, String)>) = match command {
+        ConfigSubcommand::Show => (config::show_factory(), vec![]),
+        ConfigSubcommand::Init { cache_dir, force } => {
+            let mut opts = Vec::new();
+            if let Some(dir) = cache_dir {
+                opts.push(("cache-dir", dir));
+            }
+            if force {
+                opts.push(("force", "true".to_string()));
+            }
+            (config::init_factory(), opts)
+        }
+        ConfigSubcommand::ListMounts => (config::list_mounts_factory(), vec![]),
     };
 
     let workspace = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -294,7 +311,10 @@ fn run_config_command(command: ConfigSubcommand) {
         status_interval: std::time::Duration::from_secs(1),
     };
 
-    let opts = Options::new();
+    let mut opts = Options::new();
+    for (k, v) in extra_opts {
+        opts.set(k, &v);
+    }
     let result = cmd.execute(&opts, &mut ctx);
     if result.status == Status::Error {
         eprintln!("Error: {}", result.message);

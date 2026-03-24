@@ -114,15 +114,34 @@ pub fn run(path: &Path, spec: Option<&str>, force: bool, yes: bool) {
     let max_label = format_count_label(effective_max);
 
     // Get the spec
+    // Build a default spec that fits the actual dataset size.
+    // Start at 1/10th of max (rounded to a clean label), double up to max.
+    let build_default_spec = |max: u64| -> String {
+        if max >= 2_000_000 {
+            let ml = format_count_label(max);
+            format!("mul:1m..{}/2, 0m..{}/10m", ml, ml)
+        } else if max >= 100_000 {
+            // Small dataset: start at 10% of max
+            let start = (max / 10).max(1000);
+            let start_label = format_count_label(start);
+            let ml = format_count_label(max);
+            format!("mul:{}..{}/2", start_label, ml)
+        } else if max >= 10_000 {
+            let start = (max / 5).max(1000);
+            let start_label = format_count_label(start);
+            let ml = format_count_label(max);
+            format!("{}..{}/{}",start_label, ml, start_label)
+        } else {
+            // Very small — just one profile at half
+            let half = max / 2;
+            format_count_label(half)
+        }
+    };
+
     let spec_str = if let Some(s) = spec {
         s.to_string()
     } else if yes {
-        // Auto-accept: generate default spec
-        if effective_max >= 2_000_000 {
-            format!("mul:1m..{}/2, 0m..{}/10m", max_label, max_label)
-        } else {
-            format!("mul:1m..{}/2", max_label)
-        }
+        build_default_spec(effective_max)
     } else {
         // Interactive
         println!("--- Sized profiles ---");
@@ -135,11 +154,7 @@ pub fn run(path: &Path, spec: Option<&str>, force: bool, yes: bool) {
         println!("  Examples: 1M, 2M, 4M, ..., 10M, 20M, ...");
         println!();
 
-        let default_spec = if effective_max >= 2_000_000 {
-            format!("mul:1m..{}/2, 0m..{}/10m", max_label, max_label)
-        } else {
-            format!("mul:1m..{}/2", max_label)
-        };
+        let default_spec = build_default_spec(effective_max);
 
         println!("  Default: {}", default_spec);
         eprint!("  Sized profile spec (Enter for default): ");
@@ -230,7 +245,7 @@ pub fn run(path: &Path, spec: Option<&str>, force: bool, yes: bool) {
     // Backup the existing file
     let backup = crate::check::fix::create_backup(&dataset_path);
     match backup {
-        Ok(ref bp) => println!("  Backed up {} → {}", dataset_path.display(), bp.display()),
+        Ok(ref bp) => println!("  Backed up {} → {}", crate::check::rel_display(&dataset_path), crate::check::rel_display(bp)),
         Err(ref e) => eprintln!("  Warning: backup failed: {}", e),
     }
 
@@ -242,7 +257,7 @@ pub fn run(path: &Path, spec: Option<&str>, force: bool, yes: bool) {
 
     let tmp_path = dataset_path.with_extension("yaml.tmp");
     if let Err(e) = std::fs::write(&tmp_path, &yaml) {
-        eprintln!("Error: failed to write {}: {}", tmp_path.display(), e);
+        eprintln!("Error: failed to write {}: {}", crate::check::rel_display(&tmp_path), e);
         std::process::exit(1);
     }
     if let Err(e) = std::fs::rename(&tmp_path, &dataset_path) {
@@ -250,8 +265,20 @@ pub fn run(path: &Path, spec: Option<&str>, force: bool, yes: bool) {
         std::process::exit(1);
     }
 
+    // Touch the progress log so that the pipeline runner doesn't
+    // invalidate all existing step records just because dataset.yaml is
+    // newer. Stratification adds profiles but doesn't change existing
+    // pipeline steps — previously completed steps remain valid.
+    let progress_path = dataset_dir.join(".cache/.upstream.progress.yaml");
+    if progress_path.exists() {
+        let _ = filetime::set_file_mtime(
+            &progress_path,
+            filetime::FileTime::now(),
+        );
+    }
+
     println!();
-    println!("Updated {} with {} sized profiles", dataset_path.display(), pairs.len());
+    println!("Updated {} with {} sized profiles", crate::check::rel_display(&dataset_path), pairs.len());
     println!();
     println!("To compute ground truth for the new profiles, run:");
     println!("  veks run");
@@ -269,7 +296,7 @@ fn resolve_dataset_path(path: &Path) -> (PathBuf, PathBuf) {
     } else {
         let yaml = path.join("dataset.yaml");
         if !yaml.exists() {
-            eprintln!("Error: no dataset.yaml found in {}", path.display());
+            eprintln!("Error: no dataset.yaml found in {}", crate::check::rel_display(&path.to_path_buf()));
             std::process::exit(1);
         }
         (path.to_path_buf(), yaml)

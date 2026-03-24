@@ -23,6 +23,14 @@ pub struct MerkleRef {
 }
 
 impl MerkleRef {
+    /// Construct a `MerkleRef` directly from pre-computed shape and hashes.
+    ///
+    /// Used by `MerkleState::to_ref()` to extract a reference from the
+    /// dual-mode `.mrkl` file without needing a separate `.mref` file.
+    pub fn from_parts(shape: MerkleShape, hashes: Vec<[u8; 32]>) -> Self {
+        MerkleRef { shape, hashes }
+    }
+
     /// Load a `.mref` file from disk.
     pub fn load(path: &Path) -> io::Result<Self> {
         let data = fs::read(path)?;
@@ -38,15 +46,31 @@ impl MerkleRef {
             ));
         }
 
-        let footer_start = data.len() - FOOTER_SIZE;
+        // The last byte is the footer length marker — use it to find the footer start.
+        let actual_footer_size = data[data.len() - 1] as usize;
+        if actual_footer_size < FOOTER_SIZE || data.len() < actual_footer_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid footer size marker: {}", actual_footer_size),
+            ));
+        }
+
+        let footer_start = data.len() - actual_footer_size;
         let shape = MerkleShape::read_footer(&data[footer_start..])?;
 
         let expected_hash_bytes = shape.node_count as usize * HASH_SIZE;
-        if footer_start != expected_hash_bytes {
+
+        // The v2 format includes a validity bitset between the hashes and
+        // the footer. The bitset size is encoded in the footer (v2) or
+        // inferred from leaf_count.
+        let bytes_before_footer = footer_start;
+        let _bitset_bytes = bytes_before_footer.saturating_sub(expected_hash_bytes);
+
+        if bytes_before_footer < expected_hash_bytes {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "hash data size mismatch: expected {} bytes, file has {} before footer",
+                    "hash data size mismatch: expected at least {} bytes, file has {} before footer",
                     expected_hash_bytes, footer_start
                 ),
             ));

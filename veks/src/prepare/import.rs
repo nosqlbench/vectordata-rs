@@ -252,7 +252,7 @@ fn resolve_slots(args: &ImportArgs) -> PipelineSlots {
         };
         let predicates = Artifact::Materialized {
             step_id: "generate-predicates".into(),
-            output: "predicates.slab".into(),
+            output: "profiles/base/predicates.slab".into(),
         };
         let predicate_indices = Artifact::Materialized {
             step_id: "evaluate-predicates".into(),
@@ -307,7 +307,7 @@ struct Step {
 }
 
 /// Walk the resolved slots and emit pipeline steps for materialized slots.
-fn emit_steps(slots: &PipelineSlots, args: &ImportArgs) -> Vec<Step> {
+fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, output_dir: &std::path::Path) -> Vec<Step> {
     let mut steps = Vec::new();
     // Make source paths relative to the output directory when possible,
     // so the dataset.yaml is portable.
@@ -431,7 +431,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs) -> Vec<Step> {
             per_profile: false,
             options: vec![
                 ("source".into(), slots.all_vectors.path().into()),
-                ("ordinals".into(), slots.sort.path().into()),
+                ("index".into(), slots.sort.path().into()),
                 ("output".into(), "${cache}/zero_ordinals.ivec".into()),
             ],
         });
@@ -535,7 +535,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs) -> Vec<Step> {
                     "${vector_count}"
                 };
                 let mut query_opts = vec![
-                    ("mvec-file".into(), slots.all_vectors.path().into()),
+                    ("source".into(), slots.all_vectors.path().into()),
                     ("ivec-file".into(), "${cache}/shuffle.ivec".into()),
                     ("output".into(), "profiles/base/query_vectors.mvec".into()),
                     ("range".into(), "[0,${query_count})".into()),
@@ -552,7 +552,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs) -> Vec<Step> {
                     options: query_opts,
                 });
                 let mut base_opts = vec![
-                    ("mvec-file".into(), slots.all_vectors.path().into()),
+                    ("source".into(), slots.all_vectors.path().into()),
                     ("ivec-file".into(), "${cache}/shuffle.ivec".into()),
                     ("output".into(), "profiles/base/base_vectors.mvec".into()),
                     ("range".into(), format!("[${{query_count}},{})", count_var)),
@@ -680,7 +680,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs) -> Vec<Step> {
             options: vec![
                 ("input".into(), meta.metadata_all.path().into()),
                 ("survey".into(), "${cache}/metadata_survey.json".into()),
-                ("output".into(), "predicates.slab".into()),
+                ("output".into(), "profiles/base/predicates.slab".into()),
                 ("count".into(), "10000".into()),
                 ("selectivity".into(), "0.0001".into()),
                 ("seed".into(), format!("${{{}}}", "seed")),
@@ -700,11 +700,11 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs) -> Vec<Step> {
             per_profile: true,
             options: vec![
                 ("input".into(), meta.metadata_content.path().into()),
-                ("predicates".into(), "predicates.slab".into()),
+                ("predicates".into(), "profiles/base/predicates.slab".into()),
                 ("survey".into(), "${cache}/metadata_survey.json".into()),
                 ("selectivity".into(), "0.0001".into()),
                 ("range".into(), if slots.base_count.is_some() {
-                    "[0,${base_count})".into()
+                    "[0,${base_end})".into()
                 } else {
                     "[0,${vector_count})".into()
                 }),
@@ -714,11 +714,30 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs) -> Vec<Step> {
     }
 
     // ── Ground truth chain ───────────────────────────────────────────
-    if let Some(ref knn) = slots.knn {
-        if knn.is_materialized() {
+    //
+    // When KNN is computed (Materialized), a single per_profile compute-knn
+    // step handles both the default and all sized profiles.
+    //
+    // When KNN is pre-provided (Identity) AND sized profiles are requested,
+    // the pre-provided GT covers the default profile only. Sized profiles
+    // still need computed KNN — add a per_profile compute-knn step.
+    // The default profile will redundantly recompute, but sized profiles
+    // will get the KNN they need.
+    let needs_computed_knn = if let Some(ref knn) = slots.knn {
+        knn.is_materialized() || args.sized_profiles.is_some()
+    } else {
+        false
+    };
+
+    if needs_computed_knn && slots.knn.is_some() {
+        let has_queries = slots.query_vectors.is_some();
+        if has_queries {
             let mut after = vec![];
             if slots.base_count.is_some() {
                 after.push("count-base".into());
+            }
+            if slots.all_vectors.is_materialized() {
+                after.push("convert-vectors".into());
             }
             if let Some(ref qv) = slots.query_vectors {
                 if qv.is_materialized() {
@@ -735,10 +754,10 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs) -> Vec<Step> {
                 options: {
                     let mut opts = vec![
                         ("base".into(), if slots.base_count.is_some() {
-                        format!("{}[0..${{base_count}})", slots.base_vectors.path())
-                    } else {
-                        slots.base_vectors.path().to_string()
-                    }),
+                            format!("{}[0..${{base_count}})", slots.base_vectors.path())
+                        } else {
+                            slots.base_vectors.path().to_string()
+                        }),
                         ("query".into(), slots.query_vectors.as_ref().unwrap().path().into()),
                         ("indices".into(), "neighbor_indices.ivec".into()),
                         ("distances".into(), "neighbor_distances.fvec".into()),
@@ -797,95 +816,136 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs) -> Vec<Step> {
 
     // ── Verification chain ──────────────────────────────────────
     if let Some(ref knn) = slots.knn {
-        if knn.is_materialized() {
-            steps.push(Step {
-                id: "verify-knn".into(),
-                run: "verify knn-groundtruth".into(),
-                description: Some("Sparse-sample KNN verification".into()),
-                after: vec!["compute-knn".into()],
-                per_profile: true,
-                options: vec![
-                    ("base".into(), if slots.base_count.is_some() {
-                        format!("{}[0..${{base_count}})", slots.base_vectors.path())
-                    } else {
-                        slots.base_vectors.path().to_string()
-                    }),
-                    ("query".into(), slots.query_vectors.as_ref().unwrap().path().into()),
-                    ("indices".into(), "neighbor_indices.ivec".into()),
-                    ("distances".into(), "neighbor_distances.fvec".into()),
-                    ("metric".into(), args.metric.clone()),
-                    ("sample".into(), "100".into()),
-                    ("seed".into(), format!("${{{}}}", "seed")),
-                    ("output".into(), "${cache}/profiles/${profile_name}/verify_knn.json".into()),
-                ],
-            });
+        // Verify KNN regardless of whether it was computed or pre-provided.
+        // For computed KNN, verify-knn depends on compute-knn.
+        // For pre-provided KNN, it depends on convert-vectors (base must exist).
+        let verify_after = if needs_computed_knn {
+            // compute-knn step exists (either materialized or sized profiles need it)
+            vec!["compute-knn".into()]
+        } else {
+            // No compute step — depend on whatever produces base/query vectors
+            let mut deps: Vec<String> = Vec::new();
+            if slots.all_vectors.is_materialized() {
+                deps.push("convert-vectors".into());
+            }
+            if slots.query_vectors.as_ref().map(|q| q.is_materialized()).unwrap_or(false) {
+                deps.push("extract-queries".into());
+            }
+            deps
+        };
+        let output_path = if needs_computed_knn {
+            "${cache}/profiles/${profile_name}/verify_knn.json".to_string()
+        } else {
+            "${cache}/verify_knn.json".to_string()
+        };
+        let mut verify_opts = vec![
+            ("base".into(), if slots.base_count.is_some() {
+                format!("{}[0..${{base_count}})", slots.base_vectors.path())
+            } else {
+                slots.base_vectors.path().to_string()
+            }),
+            ("query".into(), slots.query_vectors.as_ref().unwrap().path().into()),
+            ("indices".into(), if needs_computed_knn {
+                "neighbor_indices.ivec".to_string()
+            } else {
+                knn.path().into()
+            }),
+            ("metric".into(), args.metric.clone()),
+            ("sample".into(), "100".into()),
+            ("seed".into(), format!("${{{}}}", "seed")),
+            ("output".into(), output_path),
+        ];
+        // Include distances when available. When compute-knn runs (materialized
+        // or sized profiles need it), it produces neighbor_distances.fvec.
+        if needs_computed_knn {
+            verify_opts.push(("distances".into(), "neighbor_distances.fvec".into()));
+        } else if args.ground_truth_distances.is_some() {
+            let dist_path = relativize_path(args.ground_truth_distances.as_ref().unwrap(), output_dir);
+            verify_opts.push(("distances".into(), dist_path));
         }
+        // Per-profile when compute-knn runs per-profile (either materialized
+        // or pre-provided GT + sized profiles that need computed KNN).
+        let is_per_profile = needs_computed_knn;
+        steps.push(Step {
+            id: "verify-knn".into(),
+            run: "verify knn-groundtruth".into(),
+            description: Some("Sparse-sample KNN verification".into()),
+            after: verify_after,
+            per_profile: is_per_profile,
+            options: verify_opts,
+        });
     }
 
     if let Some(ref fknn) = slots.filtered_knn {
         if fknn.is_materialized() {
+            // For sized profiles, limit verification to the profile's ordinal
+            // range so the verifier doesn't sample records outside the window.
+            // ${base_end} is resolved per-profile by expansion.
+            let mut verify_pred_opts = vec![
+                ("metadata".into(), slots.metadata.as_ref().unwrap().metadata_content.path().into()),
+                ("predicates".into(), "profiles/base/predicates.slab".into()),
+                ("metadata-indices".into(), "metadata_indices.slab".into()),
+                ("sample".into(), "50".into()),
+                ("metadata-sample".into(), "100000".into()),
+                ("seed".into(), format!("${{{}}}", "seed")),
+                ("output".into(), "${cache}/profiles/${profile_name}/verify_predicates.json".into()),
+            ];
+            if slots.base_count.is_some() {
+                verify_pred_opts.push(("range".into(), "[0,${base_end})".into()));
+            }
             steps.push(Step {
                 id: "verify-predicates".into(),
                 run: "verify predicate-results".into(),
                 description: Some("Sparse-sample predicate verification via SQLite".into()),
                 after: vec!["compute-filtered-knn".into()],
                 per_profile: true,
-                options: vec![
-                    ("metadata".into(), slots.metadata.as_ref().unwrap().metadata_content.path().into()),
-                    ("predicates".into(), "predicates.slab".into()),
-                    ("metadata-indices".into(), "metadata_indices.slab".into()),
-                    ("sample".into(), "50".into()),
-                    ("metadata-sample".into(), "100000".into()),
-                    ("seed".into(), format!("${{{}}}", "seed")),
-                    ("output".into(), "${cache}/profiles/${profile_name}/verify_predicates.json".into()),
-                ],
+                options: verify_pred_opts,
             });
         }
     }
 
-    // ── Merkle hash trees ────────────────────────────────────────
-    // Always emit a merkle step as the final pipeline step. This
-    // creates .mref files for all publishable data files, enabling
-    // integrity verification and incremental transfer.
-    let mut merkle_after = Vec::new();
+    // ── Catalog generation ──────────────────────────────────────────
+    // Generates catalog.json and catalog.yaml for the local dataset
+    // directory so the dataset is discoverable by catalog queries.
+    let mut catalog_after = Vec::new();
     if let Some(ref knn) = slots.knn {
-        if knn.is_materialized() {
-            merkle_after.push("verify-knn".into());
+        if knn.is_materialized() || needs_computed_knn {
+            catalog_after.push("verify-knn".into());
         }
     }
     if let Some(ref fknn) = slots.filtered_knn {
         if fknn.is_materialized() {
-            merkle_after.push("verify-predicates".into());
+            catalog_after.push("verify-predicates".into());
         }
     }
-    // If no verification steps, depend on the last compute step
-    if merkle_after.is_empty() {
+    if catalog_after.is_empty() {
         if let Some(last) = steps.last() {
-            merkle_after.push(last.id.clone());
+            catalog_after.push(last.id.clone());
         }
     }
-    steps.push(Step {
-        id: "generate-merkle".into(),
-        run: "merkle create".into(),
-        description: Some("Create merkle hash trees for all publishable data files".into()),
-        after: merkle_after,
-        per_profile: false,
-        options: vec![
-            ("source".into(), ".".into()),
-        ],
-    });
-
-    // ── Catalog generation ──────────────────────────────────────────
-    // Always the final step. Generates catalog.json and catalog.yaml
-    // for the local dataset directory so the dataset is discoverable.
     steps.push(Step {
         id: "generate-catalog".into(),
         run: "catalog generate".into(),
         description: Some("Generate catalog index for the dataset directory".into()),
-        after: vec!["generate-merkle".into()],
+        after: catalog_after,
         per_profile: false,
         options: vec![
             ("input".into(), ".".into()),
+        ],
+    });
+
+    // ── Merkle hash trees ────────────────────────────────────────
+    // MUST be the very last pipeline step — after catalog generation —
+    // so that catalog.json and catalog.yaml get .mref files too.
+    steps.push(Step {
+        id: "generate-merkle".into(),
+        run: "merkle create".into(),
+        description: Some("Create merkle hash trees for all publishable data files".into()),
+        after: vec!["generate-catalog".into()],
+        per_profile: false,
+        options: vec![
+            ("source".into(), ".".into()),
+            ("min-size".into(), "0".into()),
         ],
     });
 
@@ -897,7 +957,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs) -> Vec<Step> {
 // ---------------------------------------------------------------------------
 
 /// Assemble profile views from resolved slot paths.
-fn profile_views(slots: &PipelineSlots) -> Vec<(String, String)> {
+fn profile_views(slots: &PipelineSlots, args: &ImportArgs, output_dir: &std::path::Path) -> Vec<(String, String)> {
     let mut views = Vec::new();
 
     views.push(("base_vectors".into(), slots.base_vectors.path().into()));
@@ -915,6 +975,11 @@ fn profile_views(slots: &PipelineSlots) -> Vec<(String, String)> {
         match knn {
             Artifact::Identity { path } => {
                 views.push(("neighbor_indices".into(), path.clone()));
+                // Include pre-provided distances if available
+                if let Some(ref gt_dist) = args.ground_truth_distances {
+                    views.push(("neighbor_distances".into(),
+                        relativize_path(gt_dist, output_dir)));
+                }
             }
             Artifact::Materialized { .. } => {
                 views.push(("neighbor_indices".into(), "profiles/default/neighbor_indices.ivec".into()));
@@ -946,7 +1011,7 @@ fn generate_yaml(
     args: &ImportArgs,
     steps: &[Step],
     views: &[(String, String)],
-    slots: &PipelineSlots,
+    _slots: &PipelineSlots,
 ) -> String {
     let mut out = String::new();
 
@@ -1000,8 +1065,8 @@ fn generate_yaml(
         out.push_str(&format!("    {}: {}\n", facet, path));
     }
 
-    // Sized profiles (only when self-search produces windowed base vectors)
-    if slots.self_search && args.sized_profiles.is_some() {
+    // Sized profiles — generate windowed sub-profiles at multiple scales
+    if args.sized_profiles.is_some() {
         let spec = args.sized_profiles.as_ref().unwrap();
         out.push_str("\n  sized:\n");
         let specs: Vec<&str> = spec.split(',').map(|s| s.trim()).collect();
@@ -1009,9 +1074,10 @@ fn generate_yaml(
         out.push_str(&format!("    ranges: [{}]\n", formatted.join(", ")));
         out.push_str("    facets:\n");
 
-        // Build sized facets from the default profile views — only include
-        // facets that are actually present. Windowed facets (base vectors,
-        // metadata content) get ${range}; per-profile facets get ${profile}.
+        // Build sized facets from the default profile views plus any
+        // computed per-profile facets needed by sized profiles.
+        let mut sized_facets_written = std::collections::HashSet::new();
+
         for (facet, path) in views.iter() {
             let windowed = facet == "base_vectors" || facet == "metadata_content";
             let per_profile = facet == "neighbor_indices"
@@ -1022,11 +1088,30 @@ fn generate_yaml(
 
             if windowed {
                 out.push_str(&format!("      {}: \"{}:${{range}}\"\n", facet, path));
+                sized_facets_written.insert(facet.as_str());
             } else if per_profile {
-                let templatized = path.replace("profiles/default/", "profiles/${profile}/");
-                out.push_str(&format!("      {}: \"{}\"\n", facet, templatized));
+                if path.contains("profiles/") {
+                    let templatized = path.replace("profiles/default/", "profiles/${profile}/");
+                    out.push_str(&format!("      {}: \"{}\"\n", facet, templatized));
+                    sized_facets_written.insert(facet.as_str());
+                }
+                // Pre-provided paths (e.g., _gt.ivec) are skipped here —
+                // computed equivalents are added below if needed.
             } else {
                 out.push_str(&format!("      {}: {}\n", facet, path));
+                sized_facets_written.insert(facet.as_str());
+            }
+        }
+
+        // When compute-knn runs per-profile (for sized profiles), add the
+        // computed KNN facets even if the default profile uses pre-provided GT.
+        let has_compute_knn = steps.iter().any(|s| s.id == "compute-knn");
+        if has_compute_knn {
+            if !sized_facets_written.contains("neighbor_indices") {
+                out.push_str("      neighbor_indices: \"profiles/${profile}/neighbor_indices.ivec\"\n");
+            }
+            if !sized_facets_written.contains("neighbor_distances") {
+                out.push_str("      neighbor_distances: \"profiles/${profile}/neighbor_distances.fvec\"\n");
             }
         }
     }
@@ -1046,14 +1131,14 @@ pub fn run(args: ImportArgs) {
         if output_dir.join("dataset.yaml").exists() {
             eprintln!(
                 "Error: {} already contains a dataset.yaml. Use --force to overwrite.",
-                output_dir.display()
+                crate::check::rel_display(output_dir)
             );
             std::process::exit(1);
         }
     }
 
     if let Err(e) = std::fs::create_dir_all(output_dir) {
-        eprintln!("Error: failed to create directory {}: {}", output_dir.display(), e);
+        eprintln!("Error: failed to create directory {}: {}", crate::check::rel_display(output_dir), e);
         std::process::exit(1);
     }
 
@@ -1107,8 +1192,8 @@ pub fn run(args: ImportArgs) {
     if let Some(ref fknn) = slots.filtered_knn { print_slot("filtered_knn", fknn); } else { println!("  filtered_knn: Absent"); }
 
     // Emit steps
-    let steps = emit_steps(&slots, &args);
-    let views = profile_views(&slots);
+    let steps = emit_steps(&slots, &args, &args.output);
+    let views = profile_views(&slots, &args, output_dir);
 
     println!();
     println!("{} pipeline step(s) to emit ({} identity-collapsed)",
@@ -1121,7 +1206,7 @@ pub fn run(args: ImportArgs) {
 
     let dataset_path = output_dir.join("dataset.yaml");
     if let Err(e) = std::fs::write(&dataset_path, &yaml) {
-        eprintln!("Error: failed to write {}: {}", dataset_path.display(), e);
+        eprintln!("Error: failed to write {}: {}", crate::check::rel_display(&dataset_path), e);
         std::process::exit(1);
     }
 
@@ -1141,22 +1226,20 @@ pub fn run(args: ImportArgs) {
     write_import_log(output_dir, &args, &slots, steps.len());
 
     println!();
-    println!("Created {}", dataset_path.display());
+    println!("Created {}", crate::check::rel_display(&dataset_path));
     if !steps.is_empty() {
         // Show a concise run command — just `veks run` if the output dir
         // is the current working directory, since veks auto-detects dataset.yaml.
-        let cwd = std::env::current_dir().ok();
-        let is_cwd = cwd.as_ref()
-            .and_then(|c| output_dir.canonicalize().ok().map(|o| c.canonicalize().ok() == Some(o)))
-            .unwrap_or(false);
+        let is_cwd = output_dir == Path::new(".") || output_dir == Path::new("");
         println!();
         println!("To prepare the dataset, run:");
         if is_cwd {
             println!("  veks run");
         } else {
-            println!("  veks run {}", dataset_path.display());
+            println!("  veks run {}", crate::check::rel_display(&dataset_path));
         }
     }
+
 }
 
 // ---------------------------------------------------------------------------
@@ -1213,30 +1296,77 @@ fn create_identity_symlinks(output_dir: &std::path::Path, args: &ImportArgs) {
     }
 }
 
-/// Create a symlink, removing any existing one first. Best-effort.
+/// Create a symlink with a relative target, removing any existing one first.
+///
+/// The symlink target is computed as a relative path from the link's parent
+/// directory to the actual target file. This keeps datasets portable — they
+/// can be moved or shared without breaking internal references.
 fn create_symlink(target: &std::path::Path, link: &std::path::Path) {
-    // Resolve target to absolute path for reliable symlinks
-    let abs_target = if target.is_absolute() {
-        target.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .map(|cwd| cwd.join(target))
-            .unwrap_or_else(|_| target.to_path_buf())
-    };
+    // Compute relative path from the link's parent directory to the target.
+    let link_dir = link.parent().unwrap_or(std::path::Path::new("."));
+    let rel_target = relative_path(link_dir, target);
 
     // Remove existing symlink or file at the link location
     if link.exists() || link.symlink_metadata().is_ok() {
         let _ = std::fs::remove_file(link);
     }
 
-    match std::os::unix::fs::symlink(&abs_target, link) {
+    match std::os::unix::fs::symlink(&rel_target, link) {
         Ok(()) => {
-            println!("  Symlinked {} → {}", link.display(), abs_target.display());
+            println!("  Symlinked {} → {}", crate::check::rel_display(link), rel_target.display());
         }
         Err(e) => {
             eprintln!("  Warning: failed to create symlink {} → {}: {}",
-                link.display(), abs_target.display(), e);
+                crate::check::rel_display(link), rel_target.display(), e);
         }
+    }
+}
+
+/// Compute a relative path from `base` directory to `target` path.
+///
+/// Uses `std::path::Component` iteration rather than `canonicalize()` to
+/// avoid requiring the paths to exist and to avoid producing absolute paths.
+pub fn relative_path(base: &std::path::Path, target: &std::path::Path) -> std::path::PathBuf {
+    use std::path::{Component, PathBuf};
+
+    // Normalize both paths to absolute for comparison
+    let abs_base = if base.is_absolute() {
+        base.to_path_buf()
+    } else {
+        std::env::current_dir().unwrap_or_default().join(base)
+    };
+    let abs_target = if target.is_absolute() {
+        target.to_path_buf()
+    } else {
+        std::env::current_dir().unwrap_or_default().join(target)
+    };
+
+    // Collect normalized components (resolve . and ..)
+    let base_parts: Vec<_> = abs_base.components()
+        .filter(|c| !matches!(c, Component::CurDir))
+        .collect();
+    let target_parts: Vec<_> = abs_target.components()
+        .filter(|c| !matches!(c, Component::CurDir))
+        .collect();
+
+    // Find common prefix length
+    let common = base_parts.iter().zip(target_parts.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+
+    // Build relative path: go up from base, then down to target
+    let mut result = PathBuf::new();
+    for _ in common..base_parts.len() {
+        result.push("..");
+    }
+    for part in &target_parts[common..] {
+        result.push(part);
+    }
+
+    if result.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        result
     }
 }
 
@@ -1269,7 +1399,7 @@ fn write_import_log(
     let mut w = std::io::BufWriter::new(file);
 
     let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-    let _ = writeln!(w, "=== veks datasets import {} ===", ts);
+    let _ = writeln!(w, "=== veks prepare bootstrap {} ===", ts);
     let _ = writeln!(w);
 
     // ── Inputs ───────────────────────────────────────────────────────
@@ -1467,42 +1597,7 @@ pub fn detect_normalized(path: &Path) -> Option<(bool, usize, f64)> {
 /// Make a path relative to a base directory. If the path can't be made
 /// relative (different root), returns the original path as a string.
 fn relativize_path(path: &Path, base: &Path) -> String {
-    let abs_path = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir().unwrap_or_default().join(path)
-    };
-    let abs_base = if base.is_absolute() {
-        base.to_path_buf()
-    } else {
-        std::env::current_dir().unwrap_or_default().join(base)
-    };
-    match abs_path.strip_prefix(&abs_base) {
-        Ok(rel) => rel.to_string_lossy().to_string(),
-        Err(_) => {
-            // Try making a relative path using ../ components
-            if let (Ok(cp), Ok(cb)) = (abs_path.canonicalize(), abs_base.canonicalize()) {
-                if let Ok(rel) = cp.strip_prefix(&cb) {
-                    return rel.to_string_lossy().to_string();
-                }
-                // Walk up from base to find common ancestor
-                let mut up = PathBuf::new();
-                let mut base_cur = cb.as_path();
-                loop {
-                    if let Ok(rel) = cp.strip_prefix(base_cur) {
-                        up.push(rel);
-                        return up.to_string_lossy().to_string();
-                    }
-                    up.push("..");
-                    match base_cur.parent() {
-                        Some(p) => base_cur = p,
-                        None => break,
-                    }
-                }
-            }
-            path.to_string_lossy().to_string()
-        }
-    }
+    relative_path(base, path).to_string_lossy().to_string()
 }
 
 fn is_native_xvec_file(path: &Path) -> bool {
@@ -1634,7 +1729,7 @@ mod tests {
         assert!(slots.metadata.is_none());
         assert!(slots.filtered_knn.is_none());
 
-        let steps = emit_steps(&slots, &args);
+        let steps = emit_steps(&slots, &args, &args.output);
         // Expected: set-vector-count, sort-vectors, set-duplicate-count,
         // zero-check, set-zero-count, clean-ordinals, set-clean-count,
         // shuffle, extract-query, extract-base, set-base-count,
@@ -1685,7 +1780,7 @@ mod tests {
         assert!(slots.knn.as_ref().unwrap().is_materialized());
         assert!(slots.filtered_knn.as_ref().unwrap().is_materialized());
 
-        let steps = emit_steps(&slots, &args);
+        let steps = emit_steps(&slots, &args, &args.output);
         let step_ids: Vec<&str> = steps.iter().map(|s| s.id.as_str()).collect();
         assert!(step_ids.contains(&"convert-metadata"), "steps: {:?}", step_ids);
         assert!(step_ids.contains(&"survey-metadata"), "steps: {:?}", step_ids);
@@ -1711,7 +1806,7 @@ mod tests {
         let slots = resolve_slots(&args);
         assert!(!slots.sort.is_materialized(), "sort should be identity when --no-dedup");
 
-        let steps = emit_steps(&slots, &args);
+        let steps = emit_steps(&slots, &args, &args.output);
         let step_ids: Vec<&str> = steps.iter().map(|s| s.id.as_str()).collect();
         assert!(!step_ids.contains(&"sort-and-dedup"));
     }
@@ -1738,7 +1833,7 @@ mod tests {
         assert!(!knn.is_materialized(), "KNN should be identity when GT provided");
         assert!(knn.path().contains("gt.ivec"));
 
-        let steps = emit_steps(&slots, &args);
+        let steps = emit_steps(&slots, &args, &args.output);
         let step_ids: Vec<&str> = steps.iter().map(|s| s.id.as_str()).collect();
         assert!(!step_ids.contains(&"compute-knn"));
     }
@@ -1762,5 +1857,45 @@ mod tests {
         assert!(slots.query_vectors.is_none());
         assert!(slots.knn.is_none());
         assert!(slots.filtered_knn.is_none());
+    }
+
+    #[test]
+    fn relative_path_sibling() {
+        let base = Path::new("/a/b/c");
+        let target = Path::new("/a/b/d/file.txt");
+        let rel = relative_path(base, target);
+        assert_eq!(rel, PathBuf::from("../d/file.txt"));
+    }
+
+    #[test]
+    fn relative_path_child() {
+        let base = Path::new("/a/b");
+        let target = Path::new("/a/b/c/file.txt");
+        let rel = relative_path(base, target);
+        assert_eq!(rel, PathBuf::from("c/file.txt"));
+    }
+
+    #[test]
+    fn relative_path_same_dir() {
+        let base = Path::new("/a/b");
+        let target = Path::new("/a/b/file.txt");
+        let rel = relative_path(base, target);
+        assert_eq!(rel, PathBuf::from("file.txt"));
+    }
+
+    #[test]
+    fn relative_path_upward() {
+        let base = Path::new("/a/b/c/d");
+        let target = Path::new("/a/x.txt");
+        let rel = relative_path(base, target);
+        assert_eq!(rel, PathBuf::from("../../../x.txt"));
+    }
+
+    #[test]
+    fn relative_path_identical() {
+        let base = Path::new("/a/b");
+        let target = Path::new("/a/b");
+        let rel = relative_path(base, target);
+        assert_eq!(rel, PathBuf::from("."));
     }
 }

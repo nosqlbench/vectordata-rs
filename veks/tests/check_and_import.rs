@@ -377,7 +377,11 @@ fn check_publish_walks_parents() {
 
     let found = check::publish_url::find_publish_file(&child);
     assert!(found.is_some(), "should find publish URL in parent");
-    assert_eq!(found.unwrap(), dir.path().join(".publish_url"));
+    let found_path = found.unwrap();
+    // The returned path is relative from child — verify it resolves to the correct file
+    assert!(found_path.exists(), "returned path should exist: {}", found_path.display());
+    let content = std::fs::read_to_string(&found_path).unwrap();
+    assert!(content.contains("parent-bucket"), "should find the parent's .publish_url");
 }
 
 #[test]
@@ -501,6 +505,7 @@ fn check_catalogs_missing() {
     let dir = tempfile::tempdir().unwrap();
     let ds = dir.path().join("dataset.yaml");
     std::fs::write(&ds, "name: test\nprofiles:\n  default:\n    maxk: 10\n").unwrap();
+    std::fs::write(dir.path().join(".publish"), "").unwrap();
 
     let result = check::catalogs::check(dir.path(), &[ds]);
     assert!(!result.passed, "missing catalog should fail");
@@ -511,6 +516,7 @@ fn check_catalogs_present() {
     let dir = tempfile::tempdir().unwrap();
     let ds = dir.path().join("dataset.yaml");
     std::fs::write(&ds, "name: test\nprofiles:\n  default:\n    maxk: 10\n").unwrap();
+    std::fs::write(dir.path().join(".publish"), "").unwrap();
     std::fs::write(dir.path().join("catalog.json"), "[]").unwrap();
 
     let result = check::catalogs::check(dir.path(), &[ds]);
@@ -625,7 +631,8 @@ fn publish_enumerate_skips_hidden_files() {
     std::fs::write(dir.path().join(".publish_url"), "s3://b/").unwrap();
     std::fs::write(dir.path().join(".gitignore"), "*.tmp").unwrap();
     std::fs::write(dir.path().join("data.fvec"), b"visible").unwrap();
-    std::fs::write(dir.path().join("dataset.yaml"), "name: t\n").unwrap();
+    std::fs::write(dir.path().join("dataset.yaml"), "name: t\nprofiles: {}\n").unwrap();
+    std::fs::write(dir.path().join(".publish"), "").unwrap();
     // Hidden directory should be excluded entirely
     let hidden = dir.path().join(".cache");
     std::fs::create_dir(&hidden).unwrap();

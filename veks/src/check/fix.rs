@@ -47,9 +47,11 @@ pub fn plan_fixes(
     // If there are files without .mref and no "merkle create" step that
     // covers the workspace, add a single directory-walking step.
     if !missing_merkle_files.is_empty() {
-        let has_merkle_all = existing_ids.contains("merkle-all")
-            || existing_ids.iter().any(|id| id.starts_with("merkle"));
-        if !has_merkle_all {
+        let has_merkle_step = existing_ids.iter().any(|id|
+            id == "merkle-all" || id == "generate-merkle"
+            || id.starts_with("merkle") || id.contains("merkle")
+        ) || has_merkle_create_step(dataset_path);
+        if !has_merkle_step {
             let step = concat!(
                 "    - id: merkle-all\n",
                 "      description: Create merkle hash trees for all publishable data files\n",
@@ -60,12 +62,14 @@ pub fn plan_fixes(
         }
     }
 
+    let rel = super::rel_display;
+
     // ── Stale pipeline (needs re-run) ────────────────────────────────
     if !stale_pipeline_steps.is_empty() {
         plan.advisories.push(format!(
             "Execute pipeline to complete {} stale step(s):\n  veks run {}",
             stale_pipeline_steps.len(),
-            dataset_path.display(),
+            rel(dataset_path),
         ));
     }
 
@@ -73,15 +77,15 @@ pub fn plan_fixes(
     if missing_publish {
         plan.advisories.push(format!(
             "Create a publish URL file:\n  echo 's3://your-bucket/prefix/' > {}/.publish_url",
-            workspace.display(),
+            rel(workspace),
         ));
     }
 
     // ── Stale/missing catalogs ───────────────────────────────────────
     if stale_catalogs {
         plan.advisories.push(format!(
-            "Regenerate catalog index:\n  veks datasets catalog generate {}",
-            workspace.display(),
+            "Regenerate catalog index:\n  veks prepare catalog generate {}",
+            rel(workspace),
         ));
     }
 
@@ -98,11 +102,11 @@ pub fn apply_fix(plan: &FixPlan) -> Result<(), String> {
 
     // Create backup
     let backup_path = create_backup(dataset_path)?;
-    println!("Backed up {} -> {}", dataset_path.display(), backup_path.display());
+    println!("Backed up {} -> {}", super::rel_display(dataset_path), super::rel_display(&backup_path));
 
     // Read existing content
     let content = std::fs::read_to_string(dataset_path)
-        .map_err(|e| format!("failed to read {}: {}", dataset_path.display(), e))?;
+        .map_err(|e| format!("failed to read {}: {}", super::rel_display(dataset_path), e))?;
 
     // Find the insertion point: just before the "profiles:" line
     let insert_before = find_profiles_line(&content);
@@ -139,12 +143,12 @@ pub fn apply_fix(plan: &FixPlan) -> Result<(), String> {
     }
 
     std::fs::write(dataset_path, &new_content)
-        .map_err(|e| format!("failed to write {}: {}", dataset_path.display(), e))?;
+        .map_err(|e| format!("failed to write {}: {}", super::rel_display(dataset_path), e))?;
 
     println!(
         "Added {} step(s) to {}",
         plan.steps_to_add.len(),
-        dataset_path.display(),
+        super::rel_display(dataset_path),
     );
 
     Ok(())
@@ -171,6 +175,18 @@ pub(crate) fn create_backup(path: &Path) -> Result<PathBuf, String> {
         .map_err(|e| format!("failed to create backup: {}", e))?;
 
     Ok(backup_path)
+}
+
+/// Check if a dataset.yaml has a `merkle create` step (by command name).
+fn has_merkle_create_step(dataset_path: &Path) -> bool {
+    if let Ok(config) = DatasetConfig::load(dataset_path) {
+        if let Some(ref pipeline) = config.upstream {
+            if let Some(ref steps) = pipeline.steps {
+                return steps.iter().any(|s| s.run == "merkle create");
+            }
+        }
+    }
+    false
 }
 
 /// Load the set of existing step IDs from a dataset.yaml.

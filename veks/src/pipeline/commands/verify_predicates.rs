@@ -89,13 +89,47 @@ impl CommandOp for VerifyPredicatesOp {
         let indices_path = resolve_path(indices_str, &ctx.workspace);
         let output_path = resolve_path(output_str, &ctx.workspace);
 
+        // Parse optional range to limit verification to a profile's window.
+        // Format: [start,end) — e.g., [0,1010000)
+        let (range_start, range_end): (usize, Option<usize>) = if let Some(range_str) = options.get("range") {
+            let s = range_str.trim();
+            let inner = s.trim_start_matches('[').trim_start_matches('(')
+                .trim_end_matches(')').trim_end_matches(']');
+            let parts: Vec<&str> = if inner.contains(',') {
+                inner.splitn(2, ',').collect()
+            } else {
+                inner.splitn(2, "..").collect()
+            };
+            if parts.len() == 2 {
+                let a = parts[0].trim().parse::<usize>().map_err(|e| format!("range start: {}", e));
+                let b = parts[1].trim().parse::<usize>().map_err(|e| format!("range end: {}", e));
+                match (a, b) {
+                    (Ok(a), Ok(b)) => (a, Some(b)),
+                    (Err(e), _) | (_, Err(e)) => return error_result(format!("invalid range '{}': {}", range_str, e), start),
+                }
+            } else {
+                return error_result(format!("invalid range '{}': expected [start,end)", range_str), start);
+            }
+        } else {
+            (0, None)
+        };
+
         // Open metadata slab
         let meta_reader = match SlabReader::open(&metadata_path) {
             Ok(r) => r,
             Err(e) => return error_result(format!("open metadata: {}", e), start),
         };
-        let meta_count = meta_reader.total_records() as usize;
-        ctx.ui.log(&format!("  metadata: {} records from {}", meta_count, metadata_path.display()));
+        let total_meta = meta_reader.total_records() as usize;
+        let meta_count = match range_end {
+            Some(e) => (e as usize).min(total_meta),
+            None => total_meta,
+        };
+        if range_end.is_some() {
+            ctx.ui.log(&format!("  metadata: range [{}, {}) — {} of {} records from {}",
+                range_start, meta_count, meta_count - range_start, total_meta, metadata_path.display()));
+        } else {
+            ctx.ui.log(&format!("  metadata: {} records from {}", meta_count, metadata_path.display()));
+        }
 
         // Open predicates slab
         let pred_reader = match SlabReader::open(&predicates_path) {
@@ -112,17 +146,21 @@ impl CommandOp for VerifyPredicatesOp {
         };
 
         // Phase 1: Load sampled metadata into SQLite
-        let effective_meta_sample = metadata_sample.min(meta_count);
-        ctx.ui.log(&format!("  loading {} sampled metadata records into SQLite (of {} total)...",
-            effective_meta_sample, meta_count));
+        // Sample only from within the range (sized profiles have a subset window).
+        let range_size = meta_count - range_start;
+        let effective_meta_sample = metadata_sample.min(range_size);
+        ctx.ui.log(&format!("  loading {} sampled metadata records into SQLite (of {} in range)...",
+            effective_meta_sample, range_size));
         let load_start = Instant::now();
 
-        // Sample metadata ordinals uniformly
+        // Sample metadata ordinals uniformly within [range_start, meta_count)
         use rand::SeedableRng;
         use rand::seq::index::sample;
         let mut meta_rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(seed.wrapping_add(1));
-        let meta_ordinals = sample(&mut meta_rng, meta_count, effective_meta_sample);
-        let mut meta_ordinals_sorted: Vec<usize> = meta_ordinals.into_iter().collect();
+        let sampled_offsets = sample(&mut meta_rng, range_size, effective_meta_sample);
+        let mut meta_ordinals_sorted: Vec<usize> = sampled_offsets.into_iter()
+            .map(|offset| range_start + offset)
+            .collect();
         meta_ordinals_sorted.sort();
         let meta_ordinal_set: std::collections::HashSet<usize> = meta_ordinals_sorted.iter().copied().collect();
 
@@ -290,6 +328,8 @@ impl CommandOp for VerifyPredicatesOp {
                 description: "Number of metadata records to load into SQLite (bounds memory usage)".into(), role: OptionRole::Config },
             OptionDesc { name: "seed".into(), type_name: "int".into(), required: false, default: Some("42".into()),
                 description: "Random seed for sample selection".into(), role: OptionRole::Config },
+            OptionDesc { name: "range".into(), type_name: "String".into(), required: false, default: None,
+                description: "Ordinal range to limit verification, e.g. '[0,1010000)'. Limits metadata sampling to a profile subset.".into(), role: OptionRole::Config },
         ]
     }
 }

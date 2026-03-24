@@ -25,6 +25,7 @@ benchmarking.
 | [10-dataset-publishing.md](10-dataset-publishing.md) | S3 publishing: `.publish_url` binding, `veks publish` sync command, file filtering |
 | [11-preflight-checks.md](11-preflight-checks.md) | `veks check`: pipeline completeness, publish URL binding, merkle coverage |
 | [12-dataset-import-flowchart.md](12-dataset-import-flowchart.md) | `datasets import`: universal pipeline generation flowchart, input axes, stage activation rules |
+| [13-data-access-layer.md](13-data-access-layer.md) | Data access layer: DatasetLoader API, MAFileChannel, merkle-verified chunk caching, windowed remote access, transport layer |
 
 ## Audience
 

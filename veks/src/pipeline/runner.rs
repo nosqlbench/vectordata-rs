@@ -149,8 +149,13 @@ pub fn run_steps(
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
 
-        // 2. Cascade invalidation: if any dependency executed this run, force re-run
-        let upstream_ran = step.def.after.iter().any(|dep| executed_steps.contains(dep));
+        // 2. Cascade invalidation: if any dependency executed this run, force re-run.
+        // For per-profile expanded steps, a dependency on "verify-knn" should
+        // cascade from "verify-knn-10m", "verify-knn-16m", etc.
+        let upstream_ran = step.def.after.iter().any(|dep| {
+            executed_steps.contains(dep)
+                || executed_steps.iter().any(|es| es.starts_with(dep.as_str()) && es[dep.len()..].starts_with('-'))
+        });
 
         // 3. Check progress log → skip if recorded OK, outputs match, options unchanged,
         //    AND no upstream dependency ran this session
@@ -620,36 +625,17 @@ pub fn run_steps(
             }
         }
 
-        // 9b. Zero-length produced file check — any produced file with size 0 is an error
+        // 9b. Zero-length produced file check — warn but don't fail.
+        // Some commands legitimately produce empty output (e.g., find-zeros
+        // with no zero vectors, find-duplicates with no duplicates).
+        // The command returned Ok, so it knows whether empty is valid.
         for produced_path in &result.produced {
             if let Ok(meta) = std::fs::metadata(produced_path) {
                 if meta.len() == 0 {
-                    let msg = format!(
-                        "step '{}': produced file '{}' is empty (zero bytes)",
-                        step.id,
-                        produced_path.display(),
-                    );
-                    ctx.ui.log(&format!("{} {} — ERROR: {}", prefix, step.id, msg));
-                    ctx.progress.record_step(
-                        &step.id,
-                        StepRecord {
-                            status: Status::Error,
-                            message: msg.clone(),
-                            completed_at: Utc::now(),
-                            elapsed_secs: elapsed.as_secs_f64(),
-                            outputs: vec![],
-                            resolved_options: resolved_opts
-                                .iter()
-                                .map(|(k, v)| (k.clone(), v.clone()))
-                                .collect(),
-                            error: Some(msg.clone()),
-                            resource_summary: None,
-                        },
-                    );
-                    if let Err(e) = ctx.progress.save() {
-                        ctx.ui.log(&format!("  warning: failed to save progress: {}", e));
-                    }
-                    return Err(msg);
+                    ctx.ui.log(&format!(
+                        "{} {} — warning: produced file '{}' is empty (zero bytes)",
+                        prefix, step.id, produced_path.display(),
+                    ));
                 }
             }
         }
@@ -671,6 +657,47 @@ pub fn run_steps(
     // Write summary to provenance log
     dlog.log(&format!("summary: {} executed ({:.1}s), {} skipped, {} total",
         executed_count, total_elapsed.as_secs_f64(), skipped_count, total));
+
+    // Write data flow accounting from variables.yaml
+    if let Ok(vars) = super::variables::load(&ctx.workspace) {
+        if !vars.is_empty() {
+            dlog.log("\ndata flow:");
+            let get = |k: &str| vars.get(k).and_then(|v| v.parse::<u64>().ok());
+            if let Some(vc) = get("vector_count") {
+                dlog.log(&format!("  source vectors:      {:>12}", vc));
+            }
+            if let Some(dc) = get("duplicate_count") {
+                dlog.log(&format!("  duplicates removed:  {:>12}", dc));
+            }
+            if let Some(zc) = get("zero_count") {
+                dlog.log(&format!("  zero vectors:        {:>12}", zc));
+            }
+            if let Some(cc) = get("clean_count") {
+                dlog.log(&format!("  after cleaning:      {:>12}", cc));
+                if let (Some(vc), Some(dc), Some(zc)) = (get("vector_count"), get("duplicate_count"), get("zero_count")) {
+                    let expected = vc.saturating_sub(dc).saturating_sub(zc);
+                    if expected != cc {
+                        dlog.log(&format!("  WARNING: expected {} - {} - {} = {}, got {}",
+                            vc, dc, zc, expected, cc));
+                    }
+                }
+            }
+            if let Some(qc) = vars.get("query_count").and_then(|v| v.parse::<u64>().ok()) {
+                dlog.log(&format!("  query vectors:       {:>12}", qc));
+            }
+            if let Some(bc) = get("base_count") {
+                dlog.log(&format!("  base vectors:        {:>12}", bc));
+                if let (Some(cc), Some(qc)) = (get("clean_count"), vars.get("query_count").and_then(|v| v.parse::<u64>().ok())) {
+                    let expected = cc.saturating_sub(qc);
+                    if expected != bc {
+                        dlog.log(&format!("  WARNING: expected {} - {} = {}, got {}",
+                            cc, qc, expected, bc));
+                    }
+                }
+            }
+        }
+    }
+
     dlog.flush();
 
     Ok(RunSummary {
@@ -703,7 +730,7 @@ fn step_record_from_result(
                     Some(dt.to_rfc3339())
                 });
             OutputRecord {
-                path: p.to_string_lossy().into_owned(),
+                path: crate::check::rel_display(p),
                 size,
                 mtime,
             }

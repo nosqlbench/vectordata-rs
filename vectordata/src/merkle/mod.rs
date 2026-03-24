@@ -25,7 +25,10 @@ use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use std::io::{self, Cursor, Read, Write};
 
 /// Footer size in bytes — fixed at 41 for wire compatibility.
+/// Footer size for the original format (without bitSetSize field).
 pub const FOOTER_SIZE: usize = 41;
+/// Footer size for the v2 format (with bitSetSize field).
+pub const FOOTER_SIZE_V2: usize = 45;
 
 /// SHA-256 hash size.
 pub const HASH_SIZE: usize = 32;
@@ -124,7 +127,10 @@ impl MerkleShape {
         (node - 1) / 2
     }
 
-    /// Read a 41-byte footer from a byte slice.
+    /// Read a footer from a byte slice (supports both v1 41-byte and v2 45-byte formats).
+    ///
+    /// Returns `(MerkleShape, bitset_size)` where `bitset_size` is the number of
+    /// bytes between the hash data and the footer (0 for v1, >0 for v2).
     pub fn read_footer(data: &[u8]) -> io::Result<Self> {
         if data.len() < FOOTER_SIZE {
             return Err(io::Error::new(
@@ -142,14 +148,22 @@ impl MerkleShape {
         let node_count = cursor.read_u32::<BigEndian>()?;
         let offset = cursor.read_u32::<BigEndian>()?;
         let internal_node_count = cursor.read_u32::<BigEndian>()?;
+
+        // V2 format has an additional bitSetSize field (4 bytes) before the length marker
+        let _bitset_size = if data.len() >= FOOTER_SIZE_V2 {
+            cursor.read_u32::<BigEndian>()?
+        } else {
+            0u32
+        };
+
         let footer_length = cursor.read_u8()?;
 
-        if footer_length != FOOTER_SIZE as u8 {
+        if footer_length != FOOTER_SIZE as u8 && footer_length != FOOTER_SIZE_V2 as u8 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "invalid footer length marker: expected {}, got {}",
-                    FOOTER_SIZE, footer_length
+                    "invalid footer length marker: expected {} or {}, got {}",
+                    FOOTER_SIZE, FOOTER_SIZE_V2, footer_length
                 ),
             ));
         }

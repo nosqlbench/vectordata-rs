@@ -170,7 +170,7 @@ fn load_catalog_entries(location: &str, entries: &mut Vec<CatalogEntry>, require
                     yaml
                 } else {
                     if required {
-                        eprintln!("ERROR: no catalog file found in {}", path.display());
+                        eprintln!("ERROR: no catalog file found in {}", crate::check::rel_display(&path.to_path_buf()));
                     }
                     return;
                 }

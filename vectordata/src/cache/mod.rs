@@ -14,10 +14,11 @@
 //! On restart, loading the state file resumes from the last checkpoint — only
 //! unverified chunks are re-downloaded.
 
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Condvar, Mutex};
 
 use crate::merkle::{MerkleRef, MerkleState};
 use crate::transport::{
@@ -47,6 +48,10 @@ pub struct CachedChannel {
     retry_policy: RetryPolicy,
     /// Download concurrency limit.
     concurrency: usize,
+    /// Tracks which chunks are currently being fetched.
+    /// Concurrent readers of the same chunk wait on the Condvar instead
+    /// of issuing duplicate requests.
+    in_flight: Mutex<HashMap<u32, Arc<Condvar>>>,
 }
 
 impl CachedChannel {
@@ -57,8 +62,11 @@ impl CachedChannel {
     /// - `cache_dir`: local directory for cache file and state
     /// - `name`: base name for cache files (e.g., "base_vectors.fvec")
     ///
-    /// If a `.mrkl` state file exists in `cache_dir`, resumes from that
-    /// checkpoint. Otherwise starts fresh.
+    /// Uses a single `.mrkl` file as both reference and state (dual-mode),
+    /// matching the Java `MerkleDataImpl` pattern. If a `.mrkl` exists,
+    /// resumes from that checkpoint and derives the reference from its
+    /// embedded hashes. Otherwise creates the `.mrkl` from the provided
+    /// reference with a zeroed validity bitset.
     pub fn open(
         transport: Box<dyn ChunkedTransport>,
         reference: MerkleRef,
@@ -69,6 +77,19 @@ impl CachedChannel {
 
         let cache_path = cache_dir.join(name);
         let state_path = cache_dir.join(format!("{}.mrkl", name));
+
+        // Dual-mode: .mrkl is the single source of truth.
+        // On resume, load state and derive reference from its embedded hashes.
+        // On first access, create state from the downloaded reference and persist immediately.
+        let (reference, state) = if state_path.exists() {
+            let state = MerkleState::load(&state_path)?;
+            let reference = state.to_ref();
+            (reference, state)
+        } else {
+            let state = MerkleState::from_ref(&reference);
+            state.save(&state_path)?;
+            (reference, state)
+        };
 
         // Open or create the cache file, pre-allocating to full size
         let total_size = reference.shape().total_content_size;
@@ -85,13 +106,6 @@ impl CachedChannel {
             cache_file.set_len(total_size)?;
         }
 
-        // Load or create state
-        let state = if state_path.exists() {
-            MerkleState::load(&state_path)?
-        } else {
-            MerkleState::from_ref(&reference)
-        };
-
         Ok(CachedChannel {
             cache_file: Mutex::new(cache_file),
             cache_path,
@@ -101,6 +115,7 @@ impl CachedChannel {
             reference,
             retry_policy: RetryPolicy::default(),
             concurrency: DEFAULT_CONCURRENCY,
+            in_flight: Mutex::new(HashMap::new()),
         })
     }
 
@@ -152,22 +167,59 @@ impl CachedChannel {
     }
 
     /// Ensure chunks in range `[first, last]` (inclusive) are downloaded and
-    /// verified.
+    /// verified. Deduplicates concurrent requests: if another thread is
+    /// already fetching a chunk, this thread waits for it instead of
+    /// issuing a duplicate request.
     fn ensure_chunks_valid(&self, first: u32, last: u32) -> io::Result<()> {
-        // Collect missing chunks
-        let missing: Vec<u32> = {
+        // Collect chunks that need work — either missing or in-flight
+        let (to_fetch, to_wait): (Vec<u32>, Vec<(u32, Arc<Condvar>)>) = {
             let state = self.state.lock().unwrap();
-            (first..=last).filter(|&i| !state.is_valid(i)).collect()
+            let mut in_flight = self.in_flight.lock().unwrap();
+
+            let mut fetch = Vec::new();
+            let mut wait = Vec::new();
+
+            for i in first..=last {
+                if state.is_valid(i) {
+                    continue; // Already cached
+                }
+                if let Some(cv) = in_flight.get(&i) {
+                    // Another thread is fetching this chunk — we'll wait
+                    wait.push((i, cv.clone()));
+                } else {
+                    // We'll fetch this chunk — register as in-flight
+                    let cv = Arc::new(Condvar::new());
+                    in_flight.insert(i, cv.clone());
+                    fetch.push(i);
+                }
+            }
+
+            (fetch, wait)
         };
 
-        if missing.is_empty() {
+        // Wait for any chunks being fetched by other threads
+        for (chunk_idx, cv) in &to_wait {
+            // Spin-wait with condvar: check state, wait if still invalid
+            let mut state = self.state.lock().unwrap();
+            while !state.is_valid(*chunk_idx) {
+                // Check if it's still in-flight
+                let still_in_flight = self.in_flight.lock().unwrap().contains_key(chunk_idx);
+                if !still_in_flight {
+                    break; // Fetch completed (or failed) — re-check state
+                }
+                // Wait briefly then re-check (condvar with timeout)
+                state = cv.wait_timeout(state, std::time::Duration::from_millis(50))
+                    .unwrap().0;
+            }
+        }
+
+        if to_fetch.is_empty() {
             return Ok(());
         }
 
         let shape = self.reference.shape();
 
-        // Build chunk requests
-        let requests: Vec<ChunkRequest> = missing
+        let requests: Vec<ChunkRequest> = to_fetch
             .iter()
             .map(|&i| ChunkRequest {
                 index: i,
@@ -179,7 +231,6 @@ impl CachedChannel {
         let total_bytes: u64 = requests.iter().map(|r| r.len).sum();
         let progress = DownloadProgress::new(total_bytes, requests.len() as u32);
 
-        // Fetch chunks (parallel if multiple)
         let results = fetch_chunks_parallel(
             self.transport.as_ref(),
             &requests,
@@ -188,10 +239,28 @@ impl CachedChannel {
             self.concurrency,
         );
 
-        // Verify and write each chunk
         for result in results {
             let (chunk_index, data) = result?;
             self.verify_and_cache(chunk_index, &data)?;
+
+            // Notify waiters and remove from in-flight
+            let cv = {
+                let mut in_flight = self.in_flight.lock().unwrap();
+                in_flight.remove(&chunk_index)
+            };
+            if let Some(cv) = cv {
+                cv.notify_all();
+            }
+        }
+
+        // Clean up any remaining in-flight entries (in case of errors)
+        {
+            let mut in_flight = self.in_flight.lock().unwrap();
+            for &idx in &to_fetch {
+                if let Some(cv) = in_flight.remove(&idx) {
+                    cv.notify_all();
+                }
+            }
         }
 
         Ok(())
@@ -307,6 +376,27 @@ impl CachedChannel {
     /// Path to the merkle state file.
     pub fn state_path(&self) -> &Path {
         &self.state_path
+    }
+
+    /// Total content size in bytes.
+    pub fn content_size(&self) -> u64 {
+        self.reference.shape().total_content_size
+    }
+
+    /// The merkle reference tree.
+    pub fn reference(&self) -> &MerkleRef {
+        &self.reference
+    }
+
+    /// Ensure chunks in range `[first, last]` (inclusive) are valid.
+    /// Public wrapper for on-demand fetching.
+    pub fn ensure_range(&self, first: u32, last: u32) -> io::Result<()> {
+        self.ensure_chunks_valid(first, last)
+    }
+
+    /// Number of chunks currently being fetched by background threads.
+    pub fn in_flight_count(&self) -> usize {
+        self.in_flight.lock().map(|m| m.len()).unwrap_or(0)
     }
 }
 

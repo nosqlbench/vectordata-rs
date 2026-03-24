@@ -29,7 +29,7 @@ enum Commands {
     /// Browse, search, and manage datasets and catalogs
     Datasets(datasets::DatasetsArgs),
     /// Interactive data visualization and exploration
-    Visualize(explore::ExploreArgs),
+    Interact(explore::ExploreArgs),
     /// Import, stratify, and prepare datasets for benchmarking
     Prepare(prepare::PrepareArgs),
     /// Execute a single pipeline command directly
@@ -77,6 +77,25 @@ fn build_augmented_cli() -> clap::Command {
     cmd = cmd.mut_subcommand("help", |_| {
         build_help_completion_command()
     });
+    // Add pipeline groups as hidden top-level subcommands so that
+    // `veks merkle <TAB>` offers merkle subcommands with full argument
+    // completion. Reuse the full pipeline command tree (which includes
+    // args, value hints, etc.) rather than building stubs.
+    {
+        let pipeline_cmd = pipeline::cli::build_pipeline_command();
+        for group_sub in pipeline_cmd.get_subcommands() {
+            let group_name = group_sub.get_name();
+            // Skip groups that collide with derive-based subcommands
+            if cmd.get_subcommands().any(|c| c.get_name() == group_name) {
+                continue;
+            }
+            // Clone the full group command (with all child args) and hide it
+            // from --help while keeping it visible to the completion engine.
+            let hidden_group = group_sub.clone().hide(true);
+            cmd = cmd.subcommand(hidden_group);
+        }
+    }
+
     // Dynamically hide `datasets list` filter args that can't narrow the
     // current result set any further.
     cmd = cmd.mut_subcommand("datasets", |datasets_cmd| {
@@ -207,8 +226,7 @@ fn build_help_completion_command() -> clap::Command {
     help_cmd
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
     // Root-level completion interception:
     // 1. If the user typed a partial prefix (e.g., `veks se<TAB>`),
     //    search ALL commands for prefix matches — not just root commands.
@@ -240,7 +258,7 @@ async fn main() {
 
     match veks.command {
         Commands::Datasets(args) => datasets::run(args),
-        Commands::Visualize(args) => explore::run(args),
+        Commands::Interact(args) => explore::run(args),
         Commands::Prepare(args) => prepare::run(args),
         Commands::Pipeline { args } => pipeline::cli::run_direct(args),
         Commands::Completions(args) => cli::completions(args),
@@ -280,10 +298,12 @@ fn filter_commands_by_prefix(prefix: &str) -> String {
     let full = build_full_command_list();
     let mut matches = String::new();
     for line in full.lines() {
-        // Each line is "command\tdescription"
+        // Each line is "group child\tdescription" or "leaf\tdescription"
         let cmd = line.split('\t').next().unwrap_or("");
-        // Match against the first word of multi-word commands too
-        if cmd.starts_with(prefix) || cmd.split(' ').next().map(|w| w.starts_with(prefix)).unwrap_or(false) {
+        // Match against the full command string or the first word (group name).
+        // Do NOT match interior words — "dataset" should not match "generate dataset".
+        let first_word = cmd.split(' ').next().unwrap_or("");
+        if cmd.starts_with(prefix) || first_word.starts_with(prefix) {
             matches.push_str(line);
             matches.push('\n');
         }
@@ -370,18 +390,22 @@ fn build_full_command_list() -> String {
         let name = sub.get_name();
         let about = sub.get_about().map(|s| s.to_string()).unwrap_or_default();
 
-        // Always show the group itself
-        lines.push(format!("{}\t{}", name, about));
+        let has_children = sub.get_subcommands().next().is_some();
 
-        // For non-internal groups with subcommands, also show children as shorthands
-        if !internal_groups.contains(&name) {
+        if has_children && !internal_groups.contains(&name) {
+            // Only show children with "group child" prefix — not the group
+            // itself. Including the bare group name prevents the shell from
+            // advancing past it (it's a prefix of every child).
             for child in sub.get_subcommands() {
                 let child_name = child.get_name();
                 let child_about = child.get_about()
                     .map(|s| s.to_string())
                     .unwrap_or_default();
-                lines.push(format!("{}\t{}", child_name, child_about));
+                lines.push(format!("{} {}\t{}", name, child_name, child_about));
             }
+        } else if !internal_groups.contains(&name) {
+            // Leaf command at root level (no subcommands)
+            lines.push(format!("{}\t{}", name, about));
         }
     }
 
@@ -462,7 +486,7 @@ fn dispatch_shorthand(args: Vec<String>) {
         let veks = Veks::parse_from(full_args);
         match veks.command {
             Commands::Datasets(a) => datasets::run(a),
-            Commands::Visualize(a) => explore::run(a),
+            Commands::Interact(a) => explore::run(a),
             Commands::Prepare(a) => prepare::run(a),
             _ => unreachable!(),
         }
@@ -612,48 +636,93 @@ fn root_command_help(name: &str) -> Option<String> {
 
 /// Print all commands grouped by category (DOC-05 --list mode).
 fn print_command_list(
-    groups: &std::collections::BTreeMap<String, Vec<(&str, String)>>,
+    pipeline_groups: &std::collections::BTreeMap<String, Vec<(&str, String)>>,
     markdown: bool,
 ) {
-    let root_cmds = root_commands();
+    use std::collections::BTreeMap;
+
+    // Build a unified group map: derive-based groups + pipeline groups.
+    // Groups that are parent-only (have children) are shown as groups,
+    // not as standalone root commands.
+    let mut all_groups: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
+
+    // Collect derive-based groups (datasets, visualize, prepare) and their children.
+    let cmd = Veks::command();
+    let internal = ["pipeline", "help", "completions"];
+    let mut leaf_commands: Vec<(String, String)> = Vec::new();
+
+    for sub in cmd.get_subcommands() {
+        let name = sub.get_name().to_string();
+        let about = sub.get_about().map(|s| s.to_string()).unwrap_or_default();
+
+        if internal.contains(&name.as_str()) {
+            continue;
+        }
+
+        let has_children = sub.get_subcommands().next().is_some();
+        if has_children {
+            let children: Vec<(String, String)> = sub.get_subcommands()
+                .map(|child| {
+                    let child_name = child.get_name().to_string();
+                    let child_about = child.get_about().map(|s| s.to_string()).unwrap_or_default();
+                    (child_name, child_about)
+                })
+                .collect();
+            all_groups.insert(name, children);
+        } else {
+            leaf_commands.push((name, about));
+        }
+    }
+
+    // Add pipeline groups
+    for (group, commands) in pipeline_groups {
+        let entries: Vec<(String, String)> = commands.iter()
+            .map(|(path, summary)| {
+                let subname = path.splitn(2, ' ').nth(1).unwrap_or(path).to_string();
+                (subname, summary.clone())
+            })
+            .collect();
+        all_groups.entry(group.clone())
+            .or_default()
+            .extend(entries);
+    }
 
     if markdown {
         println!("# veks commands\n");
-        println!("## root\n");
-        println!("| Command | Summary |");
-        println!("|---------|---------|");
-        for (name, summary) in &root_cmds {
-            println!("| `{}` | {} |", name, summary);
-        }
-        println!();
-        println!("## pipeline commands\n");
-        for (group, commands) in groups {
-            println!("### {}\n", group);
+        if !leaf_commands.is_empty() {
+            println!("## standalone\n");
             println!("| Command | Summary |");
             println!("|---------|---------|");
-            for (path, summary) in commands {
-                let subname = path.splitn(2, ' ').nth(1).unwrap_or(path);
-                println!("| `{}` | {} |", subname, summary);
+            for (name, summary) in &leaf_commands {
+                println!("| `{}` | {} |", name, summary);
+            }
+            println!();
+        }
+        for (group, commands) in &all_groups {
+            println!("## {}\n", group);
+            println!("| Command | Summary |");
+            println!("|---------|---------|");
+            for (name, summary) in commands {
+                println!("| `{} {}` | {} |", group, name, summary);
             }
             println!();
         }
     } else {
-        let max_root = root_cmds.iter().map(|(n, _)| n.len()).max().unwrap_or(0);
-        println!("root:");
-        for (name, summary) in &root_cmds {
-            println!("  {:<width$}  {}", name, summary, width = max_root);
+        if !leaf_commands.is_empty() {
+            let max_len = leaf_commands.iter().map(|(n, _)| n.len()).max().unwrap_or(0);
+            for (name, summary) in &leaf_commands {
+                println!("  {:<width$}  {}", name, summary, width = max_len);
+            }
+            println!();
         }
-        println!();
-        println!("pipeline:");
-        for (group, commands) in groups {
+        for (group, commands) in &all_groups {
             println!("  {}:", group);
             let max_len = commands.iter()
-                .map(|(p, _)| p.splitn(2, ' ').nth(1).unwrap_or(p).len())
+                .map(|(n, _)| n.len())
                 .max()
                 .unwrap_or(0);
-            for (path, summary) in commands {
-                let subname = path.splitn(2, ' ').nth(1).unwrap_or(path);
-                println!("    {:<width$}  {}", subname, summary, width = max_len);
+            for (name, summary) in commands {
+                println!("    {:<width$}  {}", name, summary, width = max_len);
             }
             println!();
         }

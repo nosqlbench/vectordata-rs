@@ -99,9 +99,9 @@ pub fn run(path: &Path, output: Option<&Path>) {
         std::process::exit(1);
     });
 
-    println!("Wrote download script: {}", script_path.display());
+    println!("Wrote download script: {}", crate::check::rel_display(&script_path));
     println!("  {} curl command(s)", file_count);
-    println!("  Run with: bash {}", script_path.display());
+    println!("  Run with: bash {}", crate::check::rel_display(&script_path));
 }
 
 fn extract_view_path(entry: &serde_yaml::Value) -> Option<String> {

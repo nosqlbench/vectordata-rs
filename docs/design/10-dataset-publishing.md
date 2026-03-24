@@ -24,10 +24,46 @@ dataset directory, binding the directory to its remote location.
 
 ---
 
-## 10.2 Publish URL Binding: `.publish_url` File
+## 10.2 Publish Sentinel (`.publish` file)
 
-Each dataset directory that participates in publishing contains a file
-named `.publish_url` at the dataset root, sibling to `dataset.yaml`.
+A dataset directory is included in publishing if and only if it contains
+a `.publish` sentinel file (zero-length or otherwise), sibling to
+`dataset.yaml`.
+
+```
+my-dataset/
+├── dataset.yaml
+├── .publish              ← marks this dataset for publishing
+├── profiles/...
+└── ...
+```
+
+To mark a dataset for publishing:
+```
+touch my-dataset/.publish
+```
+
+To exclude a dataset from publishing:
+```
+rm my-dataset/.publish
+```
+
+The `prepare publish` command MUST only include dataset directories that
+contain a `.publish` file. Datasets without this sentinel are silently
+excluded from the publish set. This is not an error — they are local-only
+datasets that do not participate in remote distribution.
+
+The `veks check` catalog validation also only requires catalog coverage
+for publishable datasets (those with `.publish`). Non-publishable datasets
+are excluded from the catalog completeness check.
+
+The `veks check` dataset readout on publish paths shows publishable
+datasets in green and local datasets in dim white.
+
+## 10.3 Publish URL Binding: `.publish_url` File
+
+Each publish tree contains a file named `.publish_url` at the publish
+root (not necessarily at the individual dataset level).
 
 ### Format
 
@@ -196,6 +232,37 @@ dot-prefixed name.
 This rule is unconditional: `--include` cannot override it for hidden
 entries. Local state must never leak into the published dataset.
 
+### Sentinel Files
+
+Four sentinel files control publishing and catalog behavior:
+
+- **`.publish`** — Marks a dataset directory for publishing (see §10.2).
+  A dataset is included in `prepare publish` and catalog completeness
+  checks only if this file is present alongside `dataset.yaml`.
+
+- **`.publish_url`** — Binds a publish tree to a remote URL. Placed at
+  the publish root (not per-dataset). See §10.3.
+
+- **`.catalog_root`** — Marks the top of the catalog hierarchy. When
+  present, `catalog generate` uses this directory as the scan root and
+  generates catalogs at every level from there down to each dataset.
+
+- **`.do_not_catalog`** — Prevents catalog generation in this directory
+  and all directories below it. The catalog walker skips discovery and
+  will not write `catalog.json` or `catalog.yaml` in any directory that
+  contains this file.
+
+**Catalog completeness rules** (enforced by `veks check`):
+
+1. Every directory between `.catalog_root` (inclusive) and a **publishable**
+   dataset directory (one containing both `dataset.yaml` and `.publish`)
+   MUST have a fresh `catalog.json` and `catalog.yaml`.
+
+2. Any directory with `.do_not_catalog` MUST NOT contain catalog files.
+
+3. Dataset directories without `.publish` are excluded from catalog
+   completeness checks entirely.
+
 ### Additional default exclusions
 
 The following non-hidden patterns are also excluded:
@@ -234,15 +301,53 @@ This matches `aws s3 sync` filter semantics where `--include` after
 
 The publish operation follows `aws s3 sync` conventions:
 
+### Publish root and path structure
+
+The **publish root** is the directory containing the `.publish_url` file.
+The `publish` command syncs the publish root (not the individual dataset
+directory) to preserve the full directory hierarchy in the remote store.
+
+```
+/data/vectordata/                         ← publish root (.publish_url here)
+├── laion400b/
+│   ├── img-search/                       ← dataset (has dataset.yaml)
+│   │   ├── dataset.yaml
+│   │   └── profiles/...
+│   └── import_test/                      ← dataset
+│       ├── dataset.yaml
+│       └── profiles/...
+├── catalog.json                          ← catalog at publish root
+└── laion400b/catalog.json                ← catalog at intermediate level
+```
+
+S3 key: `s3://bucket/laion400b/img-search/profiles/1m/neighbor_indices.ivec`
+
+### Path structure inclusion rule
+
+Only directories that are **on the path to a `dataset.yaml`** are included
+in the publish set. Directories that are not on any path from the publish
+root to a dataset directory, and directories that are not enclosed by a
+directory containing `dataset.yaml`, are excluded by default. This is not
+an error — such directories simply do not participate in the dataset
+hierarchy and are silently skipped.
+
+For example, if the publish root contains `datasets/valid/dataset.yaml`
+and `scratch/temp/data.fvec`, only the `datasets/valid/` subtree is
+published. The `scratch/` tree is ignored.
+
+This rule prevents non-dataset content (work-in-progress, scripts, tools)
+from being accidentally published alongside datasets.
+
 ### Object key mapping
 
 Local files map to S3 object keys by joining the bucket prefix from
-`.publish_url` with the file's path relative to the dataset directory.
+`.publish_url` with the file's path relative to the **publish root**
+(the directory containing `.publish_url`).
 
 ```
-local:  /data/my-dataset/profiles/1m/neighbor_indices.ivec
-bucket: s3://my-datasets/vectordata/my-dataset/
-key:    vectordata/my-dataset/profiles/1m/neighbor_indices.ivec
+publish root: /data/vectordata/           (.publish_url → s3://my-datasets/)
+local:        /data/vectordata/laion400b/img-search/profiles/1m/neighbor_indices.ivec
+key:          laion400b/img-search/profiles/1m/neighbor_indices.ivec
 ```
 
 ### Skip logic

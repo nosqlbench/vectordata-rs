@@ -92,8 +92,12 @@ pub fn resolve_source(source_str: &str, workspace: &Path) -> Result<ResolvedSour
     Ok(ResolvedSource { path, window })
 }
 
-/// Convenience: resolve a source path from an Options value, falling back
-/// to a plain `resolve_path` if no window syntax is present.
+/// Resolve a source path relative to the workspace.
+///
+/// Relative paths are joined with the workspace directory so that file
+/// operations work regardless of the process CWD. The result stays
+/// relative when the workspace itself is relative (e.g., `.`), keeping
+/// user-visible output free of absolute paths per SRD §1.6.7.
 pub fn resolve_path(path_str: &str, workspace: &Path) -> PathBuf {
     let p = PathBuf::from(path_str);
     if p.is_absolute() { p } else { workspace.join(p) }

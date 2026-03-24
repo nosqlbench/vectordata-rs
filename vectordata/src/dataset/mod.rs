@@ -20,9 +20,12 @@ pub mod catalog;
 pub mod config;
 pub mod expansion;
 pub mod facet;
+pub mod loader;
 pub mod pipeline;
 pub mod profile;
+pub mod remote;
 pub mod source;
+pub mod view;
 
 pub use catalog::{CatalogEntry, CatalogLayout, find_catalog, load_catalog};
 pub use config::{DatasetAttributes, DatasetConfig};

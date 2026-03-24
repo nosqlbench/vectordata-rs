@@ -637,7 +637,7 @@ pub fn run_direct(args: Vec<String>) {
         return;
     }
 
-    let workspace = workspace.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let workspace = workspace.unwrap_or_else(|| PathBuf::from("."));
 
     let threads = std::thread::available_parallelism()
         .map(|n| n.get())

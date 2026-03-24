@@ -468,7 +468,8 @@ pub fn parse_sized_entry(entry: &str) -> Result<Vec<(String, u64)>, String> {
         let start = parse_number_with_suffix(start_str.trim())?;
         let end = parse_number_with_suffix(end_str.trim())?;
         if start > end {
-            return Err(format!("sized range start > end in '{}'", entry));
+            // Degenerate range — no profiles to generate
+            return Ok(Vec::new());
         }
 
         let step_trimmed = step_str.trim();
@@ -526,8 +527,11 @@ fn parse_fib_range(range_str: &str) -> Result<Vec<(String, u64)>, String> {
         .ok_or_else(|| format!("invalid fib range '{}': expected fib:start..end", range_str))?;
     let start = parse_number_with_suffix(start_str.trim())?;
     let end = parse_number_with_suffix(end_str.trim())?;
-    if start == 0 || start > end {
-        return Err(format!("fib range requires 0 < start <= end, got {}..{}", start, end));
+    if start == 0 {
+        return Err(format!("fib range requires start > 0, got {}..{}", start, end));
+    }
+    if start > end {
+        return Ok(Vec::new());
     }
 
     // Use start as the base unit; generate fib(n) * start within range
@@ -568,8 +572,12 @@ fn parse_mul_range(spec: &str) -> Result<Vec<(String, u64)>, String> {
     if factor <= 1.0 {
         return Err(format!("mul factor must be > 1.0, got {}", factor));
     }
-    if start == 0 || start > end {
-        return Err(format!("mul range requires 0 < start <= end, got {}..{}", start, end));
+    if start == 0 {
+        return Err(format!("mul range requires start > 0, got {}..{}", start, end));
+    }
+    if start > end {
+        // Degenerate range (e.g., 1m..0) — no profiles to generate
+        return Ok(Vec::new());
     }
 
     let mut result = Vec::new();

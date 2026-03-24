@@ -245,7 +245,7 @@ impl CommandOp for AnalyzeExploreOp {
 }
 
 /// Execute a single REPL command and return the output as a string.
-fn execute_repl_command(
+pub fn execute_repl_command(
     line: &str,
     get_f64: &dyn Fn(usize) -> Vec<f64>,
     count: usize,

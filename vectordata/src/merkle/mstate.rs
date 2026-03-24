@@ -194,6 +194,15 @@ impl MerkleState {
         }
     }
 
+    /// Construct a `MerkleRef` from the hashes embedded in this state.
+    ///
+    /// This enables the dual-mode pattern: a single `.mrkl` file serves as
+    /// both the reference tree (hashes) and the mutable verification state
+    /// (validity bitset), matching the Java `MerkleDataImpl` semantics.
+    pub fn to_ref(&self) -> MerkleRef {
+        MerkleRef::from_parts(self.shape.clone(), self.hashes.clone())
+    }
+
     /// Indices of chunks that have not yet been verified.
     pub fn missing_chunks(&self) -> Vec<u32> {
         (0..self.shape.total_chunks)

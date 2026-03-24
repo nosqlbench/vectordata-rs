@@ -43,7 +43,7 @@ pub fn check(_root: &Path, publishable: &[PathBuf]) -> CheckResult {
         };
 
         if let Err(msg) = result {
-            failures.push(format!("{}: {}", file.display(), msg));
+            failures.push(format!("{}: {}", super::rel_display(file), msg));
         }
     }
 

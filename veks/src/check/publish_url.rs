@@ -27,7 +27,7 @@ pub fn check(root: &Path, dataset_files: &[PathBuf]) -> CheckResult {
             return CheckResult::fail("publish", vec![
                 format!(
                     "no .publish_url file found in '{}' or any parent directory",
-                    root.display(),
+                    super::rel_display(root),
                 ),
             ]);
         }
@@ -37,19 +37,31 @@ pub fn check(root: &Path, dataset_files: &[PathBuf]) -> CheckResult {
         Ok(c) => c,
         Err(e) => {
             return CheckResult::fail("publish", vec![
-                format!("failed to read {}: {}", publish_path.display(), e),
+                format!("failed to read {}: {}", super::rel_display(&publish_path), e),
             ]);
         }
     };
 
     match parse_publish_url(&content) {
         Ok(parsed) => {
+            let publish_root = publish_path.parent().unwrap_or(Path::new("."));
             let mut messages = vec![
                 format!(".publish_url: {} (transport: {})", parsed.url, parsed.scheme),
             ];
             for ds in dataset_files {
                 let ds_dir = ds.parent().unwrap_or(Path::new("."));
-                let rel = ds_dir.strip_prefix(root).unwrap_or(ds_dir);
+                // Path from publish root to the dataset directory
+                // Compute path from publish root to dataset directory
+                let rel = if let Ok(r) = ds_dir.strip_prefix(publish_root) {
+                    r.to_path_buf()
+                } else {
+                    // Canonicalize both for cross-relative/absolute comparison
+                    let abs_ds = std::fs::canonicalize(ds_dir).unwrap_or_else(|_| ds_dir.to_path_buf());
+                    let abs_root = std::fs::canonicalize(publish_root).unwrap_or_else(|_| publish_root.to_path_buf());
+                    abs_ds.strip_prefix(&abs_root)
+                        .map(|r| r.to_path_buf())
+                        .unwrap_or_else(|_| ds_dir.to_path_buf())
+                };
                 let rel_str = rel.to_string_lossy();
                 let target = if rel_str.is_empty() || rel_str == "." {
                     parsed.url.clone()
@@ -57,7 +69,7 @@ pub fn check(root: &Path, dataset_files: &[PathBuf]) -> CheckResult {
                     let base = parsed.url.trim_end_matches('/');
                     format!("{}/{}/", base, rel_str)
                 };
-                messages.push(format!("  {} -> {}", rel.display(), target));
+                messages.push(format!("  {} -> {}", rel_str, target));
             }
             let mut result = CheckResult::ok("publish");
             result.messages = messages;
@@ -65,7 +77,7 @@ pub fn check(root: &Path, dataset_files: &[PathBuf]) -> CheckResult {
         }
         Err(e) => {
             CheckResult::fail("publish", vec![
-                format!("{}: {}", publish_path.display(), e),
+                format!("{}: {}", super::rel_display(&publish_path), e),
             ])
         }
     }
@@ -75,20 +87,26 @@ pub fn check(root: &Path, dataset_files: &[PathBuf]) -> CheckResult {
 ///
 /// Also checks for the legacy `.s3-bucket` filename for backward compatibility.
 pub fn find_publish_file(dir: &Path) -> Option<PathBuf> {
-    let mut current = if dir.is_absolute() {
-        dir.to_path_buf()
-    } else {
-        std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf())
-    };
+    // Walk up using absolute paths internally (pop() needs them),
+    // but return a relative path from the original dir.
+    let abs = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let mut current = abs.clone();
+    let mut levels_up: usize = 0;
 
     loop {
         let candidate = current.join(PUBLISH_FILE);
         if candidate.is_file() {
-            return Some(candidate);
+            // Reconstruct as relative path: dir + "../" * levels_up + filename
+            let mut rel = dir.to_path_buf();
+            for _ in 0..levels_up {
+                rel = rel.join("..");
+            }
+            return Some(rel.join(PUBLISH_FILE));
         }
         if !current.pop() {
             return None;
         }
+        levels_up += 1;
     }
 }
 

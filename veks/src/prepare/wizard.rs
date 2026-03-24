@@ -35,11 +35,11 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool) -> ImportArgs
     AUTO_ACCEPT.store(auto_accept, Ordering::Relaxed);
     AUTO_MODE.store(auto_mode, Ordering::Relaxed);
     if auto_mode {
-        println!("=== veks datasets import — auto mode ===");
+        println!("=== veks prepare bootstrap — auto mode ===");
     } else if auto_accept {
-        println!("=== veks datasets import — auto-accept mode (-y) ===");
+        println!("=== veks prepare bootstrap — auto-accept mode (-y) ===");
     }
-    println!("=== veks datasets import — interactive wizard ===");
+    println!("=== veks prepare bootstrap — interactive wizard ===");
     println!();
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -50,6 +50,12 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool) -> ImportArgs
         if !confirm("Overwrite it?", false) {
             eprintln!("Aborted.");
             std::process::exit(0);
+        }
+        // Back up before overwriting
+        let yaml_path = cwd.join("dataset.yaml");
+        match crate::check::fix::create_backup(&yaml_path) {
+            Ok(bp) => println!("  Backed up {} → {}", crate::check::rel_display(&yaml_path), crate::check::rel_display(&bp)),
+            Err(e) => eprintln!("  Warning: backup failed: {}", e),
         }
         println!();
     }
@@ -126,7 +132,7 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool) -> ImportArgs
     let description = prompt_optional("Description (optional)");
 
     // ── Output directory ─────────────────────────────────────────────
-    let output = prompt_path_with_default("Output directory", &cwd.to_string_lossy());
+    let output = prompt_path_with_default("Output directory", ".");
 
     // ── Base vectors ─────────────────────────────────────────────────
     println!();
@@ -364,7 +370,7 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool) -> ImportArgs
                 println!("    - DotProduct becomes equivalent to Cosine similarity");
                 println!("    - Original magnitude information is lost (irreversible)");
                 println!();
-                if confirm("L2-normalize vectors during extraction?", false) {
+                if confirm("L2-normalize vectors during extraction?", true) {
                     println!();
                     println!("  Normalization will be applied. The effective metric for KNN:");
                     let effective = if source_metric.eq_ignore_ascii_case("L2") {
@@ -397,7 +403,14 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool) -> ImportArgs
     println!();
     println!("--- Configuration ---");
 
-    let neighbors = if has_queries {
+    let has_precomputed_gt = ground_truth.is_some();
+    let neighbors = if has_precomputed_gt {
+        // Infer k from the ground truth ivec dimensionality (each row has k neighbor indices)
+        let gt_path = ground_truth.as_ref().unwrap();
+        let k = probe_vector_dim(gt_path).unwrap_or(100);
+        println!("  Ground truth provided: k={} (inferred from {})", k, gt_path.display());
+        k as u32
+    } else if has_queries {
         let n_str = prompt_with_default("Number of neighbors (k)", "100");
         n_str.parse().unwrap_or(100)
     } else {
@@ -408,18 +421,22 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool) -> ImportArgs
     let seed = seed_str.parse().unwrap_or(42);
 
     // ── Optional features ────────────────────────────────────────────
-    let no_dedup = if base_vectors.is_some() {
-        !confirm("Include deduplication stage?", true)
+    // When pre-computed ground truth is provided, dedup and zero checks
+    // are advisory only — the GT was computed against the original ordinal
+    // space, so we cannot reindex without invalidating it. The checks
+    // still run and report findings, but no exclusion ordinals are generated.
+    let (no_dedup, no_zero_check) = if has_precomputed_gt && base_vectors.is_some() {
+        println!("  Ground truth is pre-computed — dedup/zero checks will be advisory only.");
+        println!("  (Cannot exclude vectors without invalidating ground truth ordinals.)");
+        // Still run the checks but mark them as advisory
+        (true, true) // no ordinal exclusion
+    } else if base_vectors.is_some() {
+        let nd = !confirm("Include deduplication stage?", true);
+        let default_yes = !nd;
+        let nz = !confirm("Check for and exclude zero vectors?", default_yes);
+        (nd, nz)
     } else {
-        true
-    };
-
-    let no_zero_check = if base_vectors.is_some() {
-        // Default to yes when dedup is enabled (most common case)
-        let default_yes = !no_dedup;
-        !confirm("Check for and exclude zero vectors?", default_yes)
-    } else {
-        true
+        (true, true)
     };
 
     if !no_dedup && !no_zero_check {
@@ -445,13 +462,18 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool) -> ImportArgs
             let effective_max = vec_count
                 .map(|n| n.saturating_sub(query_count as u64))
                 .unwrap_or(0);
+
+            if effective_max == 0 {
+                println!();
+                println!("--- Sized profiles ---");
+                println!("  Could not determine base vector count — skipping sized profiles.");
+                None
+            } else {
             let max_label = format_count_label(effective_max);
 
             println!();
             println!("--- Sized profiles ---");
-            if effective_max > 0 {
-                println!("  Base vector count after query extraction: ~{}", max_label);
-            }
+            println!("  Base vector count after query extraction: ~{}", max_label);
             println!("  Sized profiles create windowed subsets of the base vectors at");
             println!("  different scales (e.g., 1M, 2M, 4M, ..., 10M, 20M, ...).");
             println!();
@@ -465,17 +487,34 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool) -> ImportArgs
             println!("    - Incremental workflow: verify correctness at 1M, then 10M,");
             println!("      then scale up with confidence");
             println!();
+            // Build a default spec that fits the actual dataset size
+            let build_spec = || -> String {
+                if effective_max >= 2_000_000 {
+                    format!("mul:1m..{}/2, 0m..{}/10m", max_label, max_label)
+                } else if effective_max >= 100_000 {
+                    let start = (effective_max / 10).max(1000);
+                    let start_label = format_count_label(start);
+                    format!("mul:{}..{}/2", start_label, max_label)
+                } else if effective_max >= 10_000 {
+                    let start = (effective_max / 5).max(1000);
+                    let start_label = format_count_label(start);
+                    format!("{}..{}/{}", start_label, max_label, start_label)
+                } else {
+                    format_count_label(effective_max / 2)
+                }
+            };
+
             if effective_max < 2_000_000 {
                 println!("  Dataset is small enough that sized profiles may not be needed.");
                 if !confirm("Generate sized profiles anyway?", false) {
                     None
                 } else {
-                    let default_spec = format!("mul:1m..{}/2", max_label);
+                    let default_spec = build_spec();
                     let spec = prompt_optional(&format!("  Sized profile spec [{}]", default_spec));
                     Some(spec.unwrap_or(default_spec))
                 }
             } else if confirm("Generate sized profiles?", true) {
-                let default_spec = format!("mul:1m..{}/2, 0m..{}/10m", max_label, max_label);
+                let default_spec = build_spec();
                 println!();
                 println!("  Default: {}", default_spec);
                 println!("  Or enter a custom spec, or press Enter for the default.");
@@ -484,6 +523,7 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool) -> ImportArgs
             } else {
                 None
             }
+            } // close effective_max > 0 else
         }
     } else {
         None
@@ -651,6 +691,13 @@ fn probe_vector_count(path: &Path) -> Option<u64> {
     if path.is_dir() { return None; }
     let meta = crate::formats::reader::probe_source(path, format).ok()?;
     meta.record_count
+}
+
+fn probe_vector_dim(path: &Path) -> Option<u32> {
+    let format = VecFormat::detect(path)?;
+    if path.is_dir() { return None; }
+    let meta = crate::formats::reader::probe_source(path, format).ok()?;
+    Some(meta.dimension)
 }
 
 /// Format a count as a clean suffix label (e.g., 407000000 → "407m").
@@ -1014,7 +1061,9 @@ fn scan_candidates(dir: &Path) -> Vec<(PathBuf, String, u64)> {
 
         if let Some(format) = VecFormat::detect_from_path(&path) {
             let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-            results.push((path, format.name().to_string(), size));
+            // Store as relative path (just the filename within the scan dir)
+            let rel = PathBuf::from(entry.file_name());
+            results.push((rel, format.name().to_string(), size));
         }
     }
 
@@ -1029,7 +1078,8 @@ fn scan_candidates(dir: &Path) -> Vec<(PathBuf, String, u64)> {
 
             if let Some(format) = VecFormat::detect_from_directory(&path) {
                 let size = dir_size(&path);
-                results.push((path, format.name().to_string(), size));
+                let rel = PathBuf::from(entry.file_name());
+                results.push((rel, format.name().to_string(), size));
             }
         }
     }

@@ -1032,15 +1032,21 @@ fn ensure_parent(path: &Path) {
 
 /// Format a count with thousands separators.
 fn format_count(n: usize) -> String {
-    let s = n.to_string();
-    let mut result = String::with_capacity(s.len() + s.len() / 3);
-    for (i, ch) in s.chars().rev().enumerate() {
-        if i > 0 && i % 3 == 0 {
-            result.push(',');
-        }
-        result.push(ch);
+    if n >= 1_000_000_000 && n % 1_000_000_000 == 0 {
+        format!("{}B", n / 1_000_000_000)
+    } else if n >= 1_000_000_000 {
+        format!("{:.1}B", n as f64 / 1_000_000_000.0)
+    } else if n >= 1_000_000 && n % 1_000_000 == 0 {
+        format!("{}M", n / 1_000_000)
+    } else if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 && n % 1_000 == 0 {
+        format!("{}K", n / 1_000)
+    } else if n >= 10_000 {
+        format!("{:.1}K", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
     }
-    result.chars().rev().collect()
 }
 
 /// Format byte count as human-readable size.

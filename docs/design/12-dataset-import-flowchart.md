@@ -94,9 +94,9 @@ the superset graph and its resolution rule.
 | `import_vectors` | Vectors | Source is native xvec single file (symlinked) | `import` (npy/parquet/dir → xvec) |
 | `all_vectors` | Vectors | *(terminal — always resolves to import or source)* | alias chain: fetch → import → source |
 | `convert_base_precision` | Vectors | No precision conversion requested | `convert` (e.g., fvec→mvec or mvec→fvec) |
-| `sort` | Ordinals | `--no-sort` | `compute dedup` — lexicographic external merge-sort producing sorted ordinal index + duplicate report as a byproduct. Duplicate detection retains **one representative** of each duplicate set in the sorted index; only the extra copies are recorded in the duplicates file. The sort enables binary search for zero vectors and produces the canonical ordinal ordering for all downstream steps. |
-| `zero_check` | Ordinals | `--no-zero-check` | `analyze zeros` — binary search the lexicographically sorted ordinal index for the zero vector `[0,0,...,0]` |
-| `clean_ordinals` | Ordinals | No sort and no zero-check | `transform clean-ordinals` — combine duplicate + zero exclusion ordinals, filter the sorted index to produce the clean ordinal set used by shuffle and extraction |
+| `sort` | Ordinals | `--no-sort` | `compute sort` — lexicographic external merge-sort producing sorted ordinal index + duplicate report as a byproduct. Duplicate detection retains **one representative** of each duplicate set in the sorted index; only the extra copies are recorded in the duplicates file. The sort enables binary search for zero vectors and produces the canonical ordinal ordering for all downstream steps. |
+| `zero_check` | Ordinals | `--no-zero-check` | `analyze zeros` — binary search the lexicographically sorted ordinal index (`--index`) for the zero vector `[0,0,...,0]` |
+| `clean_ordinals` | Ordinals | No sort and no zero-check | `transform ordinals` — combine duplicate + zero exclusion ordinals, filter the sorted index to produce the clean ordinal set used by shuffle and extraction |
 
 ### Count and statistics slots
 
@@ -118,22 +118,22 @@ statistics including `vector_count`, `duplicate_count`, `zero_count`,
 
 | Slot | Type | Identity when | Materialized as |
 |------|------|---------------|-----------------|
-| `shuffle` | Ordinals | No self-search (separate query file or no queries) | `generate ivec-shuffle` over clean_count |
-| `query_vectors` | Vectors | Provided as native xvec (symlinked) | `import` or `transform *-extract` (self-search via clean_ordinals; `--normalize` option applies L2 normalization in-flight during extraction) |
-| `convert_query_precision` | Vectors | No precision conversion requested | `convert` (e.g., fvec→mvec or dvec→fvec) |
-| `base_vectors` | Vectors | Not self-search (all_vectors used directly) | `transform *-extract` (self-search range via clean_ordinals; `--normalize` option applies L2 normalization in-flight during extraction) |
+| `shuffle` | Ordinals | No self-search (separate query file or no queries) | `generate shuffle` over clean_count |
+| `query_vectors` | Vectors | Provided as native xvec (symlinked) | `transform convert` or `transform extract` (self-search via shuffle+clean_ordinals; `--normalize` option applies L2 normalization in-flight during extraction) |
+| `convert_query_precision` | Vectors | No precision conversion requested | `transform convert` (e.g., fvec→mvec or dvec→fvec) |
+| `base_vectors` | Vectors | Not self-search (all_vectors used directly) | `transform extract` (self-search range via shuffle+clean_ordinals; `--normalize` option applies L2 normalization in-flight during extraction) |
 
 ### Metadata slots (all `Absent` when `--metadata` not provided)
 
 | Slot | Type | Identity when | Materialized as |
 |------|------|---------------|-----------------|
-| `import_metadata` | Metadata | Source is native slab | `import` (parquet/dir → slab) |
+| `import_metadata` | Metadata | Source is native slab | `transform convert` with `facet: metadata_content` (parquet/dir → slab via MNode reader) |
 | `metadata_all` | Metadata | *(terminal)* | alias: import → source |
-| `extract_metadata` | Metadata | No self-search (ordinals already aligned) | `transform slab-extract` |
+| `extract_metadata` | Metadata | No self-search (ordinals already aligned) | `transform extract-slab` |
 | `metadata_content` | Metadata | *(terminal)* | alias: extract → metadata_all |
 | `survey` | JSON | Never when metadata present | `survey` |
 | `predicates` | Metadata | Never when metadata present | `synthesize predicates` |
-| `predicate_indices` | Metadata | Never when metadata present | `compute predicates` (per_profile) |
+| `predicate_indices` | Metadata | Never when metadata present | `compute evaluate-predicates` (per_profile, range `[0,${base_end})` to match base vector window) |
 
 ### Ground truth slots
 
@@ -146,8 +146,8 @@ statistics including `vector_count`, `duplicate_count`, `zero_count`,
 
 | Slot | Type | Identity when | Materialized as |
 |------|------|---------------|-----------------|
-| `verify_knn` | Report | No KNN computed, or `--no-verify` | `verify knn` (per_profile, sparse-sample brute-force recomputation) |
-| `verify_predicates` | Report | No filtered KNN, no metadata, or `--no-verify` | `verify predicates` (per_profile, SQLite-backed sparse-sample evaluation) |
+| `verify_knn` | Report | No KNN computed, or `--no-verify` | `verify knn-groundtruth` (per_profile, sparse-sample brute-force recomputation) |
+| `verify_predicates` | Report | No filtered KNN, no metadata, or `--no-verify` | `verify predicate-results` (per_profile, SQLite-backed sparse-sample evaluation) |
 
 ### Merkle slots
 
@@ -160,6 +160,37 @@ statistics including `vector_count`, `duplicate_count`, `zero_count`,
 | Slot | Type | Identity when | Materialized as |
 |------|------|---------------|-----------------|
 | `catalog` | Index | Always materialized (final step) | `catalog generate` — produces `catalog.json` and `catalog.yaml` for the local dataset directory so the dataset is discoverable by catalog queries |
+
+### Stratification (post-pipeline)
+
+Sized profiles are NOT part of the bootstrap pipeline DAG. They are
+added as a **separate post-pipeline step** using `veks prepare stratify`,
+which runs after the initial pipeline completes and `variables.yaml` is
+populated with actual vector counts.
+
+This design ensures:
+- Vector counts are **known values** (from `variables.yaml`), not estimates
+- The default spec adapts to the actual dataset size
+- Degenerate specs (start > end) cannot be generated
+
+**Default spec generation** scales to the dataset:
+
+| `effective_max` | Default spec |
+|-----------------|-------------|
+| >= 2M | `mul:1m..{max}/2, 0m..{max}/10m` |
+| >= 100K | `mul:{max/10}..{max}/2` |
+| >= 10K | `{max/5}..{max}/{max/5}` |
+| < 10K | single profile at `max/2` |
+
+After stratification, `veks run` is re-invoked to execute the per-profile
+`compute knn` and `verify knn-groundtruth` steps for each sized profile.
+
+The `veks run` completion message suggests stratification when no sized
+profiles exist:
+```
+Tip: add sized profiles for multi-scale benchmarking:
+  veks prepare stratify
+```
 
 ---
 
@@ -347,12 +378,12 @@ zero_check             → Materialized (binary search sorted index for zero vec
 clean_ordinals         → Materialized (transform clean-ordinals, exclude dups + zeros)
 clean_count            → Materialized (set variable)
 shuffle                → Materialized (generate ivec-shuffle over clean_count)
-extract_query          → Materialized (transform mvec-extract [0, query_count) via clean_ordinals)
+extract_query          → Materialized (transform extract [0, query_count) via shuffle+clean_ordinals)
 convert_query_prec     → Identity (no conversion requested)
-extract_base           → Materialized (transform mvec-extract [query_count, N) via clean_ordinals)
+extract_base           → Materialized (transform extract [query_count, N) via shuffle+clean_ordinals)
 base_count             → Materialized (set variable)
 import_metadata        → Materialized (import parquet → slab)
-extract_metadata       → Materialized (transform slab-extract, clean_ordinals + shuffle aligned)
+extract_metadata       → Materialized (transform extract-slab, clean_ordinals + shuffle aligned)
 survey                 → Materialized (survey)
 predicates             → Materialized (synthesize predicates)
 pred_indices           → Materialized (compute predicates, per_profile)

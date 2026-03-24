@@ -27,14 +27,13 @@ use vectordata::dataset::{CatalogEntry, CatalogLayout, DatasetConfig};
 /// leading path in a remote URL while still getting automatic updates.
 const CATALOG_ROOT_FILE: &str = ".catalog_root";
 
+/// Sentinel file that prevents catalog generation in this directory and below.
+const DO_NOT_CATALOG_FILE: &str = ".do_not_catalog";
+
 /// Walk up from `dir` looking for a `.catalog_root` file.
 /// Returns the directory containing it, or `None`.
 fn find_catalog_root(dir: &Path) -> Option<PathBuf> {
-    let mut current = if dir.is_absolute() {
-        dir.to_path_buf()
-    } else {
-        std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf())
-    };
+    let mut current = dir.to_path_buf();
 
     loop {
         let candidate = current.join(CATALOG_ROOT_FILE);
@@ -96,16 +95,23 @@ pub fn run(input: &Path, basename: &str, for_publish_url: bool, update: bool) {
         std::process::exit(1);
     }
 
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+
+    // Display a path relative to cwd for user-facing output.
+    let rel = |p: &Path| -> String {
+        p.strip_prefix(&cwd)
+            .map(|r| if r.as_os_str().is_empty() { ".".to_string() } else { r.to_string_lossy().to_string() })
+            .unwrap_or_else(|_| p.to_string_lossy().to_string())
+    };
+
     let input_path = if input.is_absolute() {
         input.to_path_buf()
     } else {
-        std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join(input)
+        cwd.join(input)
     };
 
     if !input_path.is_dir() {
-        eprintln!("error: {} is not a directory", input_path.display());
+        eprintln!("error: {} is not a directory", rel(&input_path));
         std::process::exit(1);
     }
 
@@ -122,13 +128,13 @@ pub fn run(input: &Path, basename: &str, for_publish_url: bool, update: bool) {
                 let root = publish_file.parent().unwrap().to_path_buf();
                 eprintln!(
                     "Found {} — scanning from publish root: {}",
-                    publish_file.display(),
-                    root.display()
+                    rel(&publish_file),
+                    rel(&root)
                 );
                 root
             }
             None => {
-                eprintln!("error: --for-publish-url specified but no .publish_url found above {}", input_path.display());
+                eprintln!("error: --for-publish-url specified but no .publish_url found above {}", rel(&input_path));
                 std::process::exit(1);
             }
         }
@@ -137,8 +143,8 @@ pub fn run(input: &Path, basename: &str, for_publish_url: bool, update: bool) {
         // generate catalogs at every level from there down.
         eprintln!(
             "Found {} — catalog root: {}",
-            catalog_root.join(CATALOG_ROOT_FILE).display(),
-            catalog_root.display()
+            rel(&catalog_root.join(CATALOG_ROOT_FILE)),
+            rel(&catalog_root)
         );
         catalog_root
     } else {
@@ -157,16 +163,14 @@ pub fn run(input: &Path, basename: &str, for_publish_url: bool, update: bool) {
     if !for_publish_url && !catalog_root_detected {
         if let Some(publish_file) = crate::check::publish_url::find_publish_file(&input_path) {
             let publish_root = publish_file.parent().unwrap();
-            let scan_canonical = scan_root.canonicalize().unwrap_or(scan_root.clone());
-            let publish_canonical = publish_root.canonicalize().unwrap_or(publish_root.to_path_buf());
-            if publish_canonical != scan_canonical {
-                eprintln!("WARNING: .publish_url found at {}", publish_file.display());
+            if publish_root != scan_root {
+                eprintln!("WARNING: .publish_url found at {}", rel(&publish_file));
                 eprintln!("  The publish root is above the scan directory.");
                 if effective_update {
                     eprintln!("  With --update (default), only existing catalog files will be refreshed.");
-                    eprintln!("  Parent directories between {} and {} that lack catalogs will remain uncovered.", scan_root.display(), publish_root.display());
+                    eprintln!("  Parent directories between {} and {} that lack catalogs will remain uncovered.", rel(&scan_root), rel(publish_root));
                 } else {
-                    eprintln!("  Generating catalogs only from {} will leave parent catalogs stale.", scan_root.display());
+                    eprintln!("  Generating catalogs only from {} will leave parent catalogs stale.", rel(&scan_root));
                 }
                 eprintln!("  Use --for-publish-url to regenerate the full publish hierarchy,");
                 eprintln!("  or place a .catalog_root file at the desired catalog top level.");
@@ -175,10 +179,10 @@ pub fn run(input: &Path, basename: &str, for_publish_url: bool, update: bool) {
         }
     }
 
-    eprintln!("Scanning {} for datasets...", scan_root.display());
+    eprintln!("Scanning {} for datasets...", rel(&scan_root));
 
     let mut datasets: Vec<DiscoveredDataset> = Vec::new();
-    walk_for_datasets(&scan_root, &mut datasets);
+    walk_for_datasets(&scan_root, &mut datasets, &cwd);
     datasets.sort_by(|a, b| a.yaml_path.cmp(&b.yaml_path));
 
     eprintln!("Found {} dataset(s)", datasets.len());
@@ -194,24 +198,18 @@ pub fn run(input: &Path, basename: &str, for_publish_url: bool, update: bool) {
             "  {} — {} profile(s) [{}]",
             ds.config.name,
             profile_count,
-            ds.yaml_path.display()
+            rel(&ds.yaml_path)
         );
     }
 
     // Determine all candidate catalog directories (hierarchical): every
     // directory between a dataset root and the scan root gets a catalog.
-    let root_canonical = scan_root
-        .canonicalize()
-        .unwrap_or_else(|_| scan_root.clone());
     let mut catalog_dirs: BTreeSet<PathBuf> = BTreeSet::new();
-    catalog_dirs.insert(root_canonical.clone());
+    catalog_dirs.insert(scan_root.clone());
     for ds in &datasets {
         let ds_dir = ds.yaml_path.parent().unwrap_or(&ds.yaml_path);
-        let ds_canonical = ds_dir
-            .canonicalize()
-            .unwrap_or_else(|_| ds_dir.to_path_buf());
-        let mut dir = ds_canonical;
-        while dir.starts_with(&root_canonical) {
+        let mut dir = ds_dir.to_path_buf();
+        while dir.starts_with(&scan_root) {
             catalog_dirs.insert(dir.clone());
             match dir.parent() {
                 Some(parent) => dir = parent.to_path_buf(),
@@ -243,15 +241,17 @@ pub fn run(input: &Path, basename: &str, for_publish_url: bool, update: bool) {
     let mut total_files = 0usize;
 
     for catalog_dir in &catalog_dirs {
+        // Skip directories with .do_not_catalog sentinel
+        if catalog_dir.join(DO_NOT_CATALOG_FILE).exists() {
+            eprintln!("  Skipping {} (.do_not_catalog)", rel(catalog_dir));
+            continue;
+        }
+
         // Collect entries whose dataset.yaml is under this directory
         let entries: Vec<CatalogEntry> = datasets
             .iter()
             .filter(|ds| {
-                let ds_canonical = ds
-                    .yaml_path
-                    .canonicalize()
-                    .unwrap_or_else(|_| ds.yaml_path.clone());
-                ds_canonical.starts_with(catalog_dir)
+                ds.yaml_path.starts_with(catalog_dir)
             })
             .map(|ds| ds.to_entry(catalog_dir))
             .collect();
@@ -267,7 +267,7 @@ pub fn run(input: &Path, basename: &str, for_publish_url: bool, update: bool) {
             std::process::exit(1);
         });
         if let Err(e) = std::fs::write(&json_path, &json) {
-            eprintln!("error: failed to write {}: {}", json_path.display(), e);
+            eprintln!("error: failed to write {}: {}", rel(&json_path), e);
             std::process::exit(1);
         }
 
@@ -278,15 +278,15 @@ pub fn run(input: &Path, basename: &str, for_publish_url: bool, update: bool) {
             std::process::exit(1);
         });
         if let Err(e) = std::fs::write(&yaml_path, &yaml) {
-            eprintln!("error: failed to write {}: {}", yaml_path.display(), e);
+            eprintln!("error: failed to write {}: {}", rel(&yaml_path), e);
             std::process::exit(1);
         }
 
         eprintln!(
             "Wrote {} entries to {} and {}",
             entries.len(),
-            json_path.display(),
-            yaml_path.display()
+            rel(&json_path),
+            rel(&yaml_path)
         );
         total_files += 2;
     }
@@ -303,23 +303,26 @@ pub fn run(input: &Path, basename: &str, for_publish_url: bool, update: bool) {
 ///
 /// When a directory contains `dataset.yaml`, it is treated as a dataset
 /// root: the config is loaded and no further descent occurs.
-fn walk_for_datasets(dir: &Path, datasets: &mut Vec<DiscoveredDataset>) {
+fn walk_for_datasets(dir: &Path, datasets: &mut Vec<DiscoveredDataset>, cwd: &Path) {
+    // Skip directories with .do_not_catalog sentinel
+    if dir.join(DO_NOT_CATALOG_FILE).exists() {
+        return;
+    }
+
     let yaml_path = dir.join("dataset.yaml");
     if yaml_path.exists() {
         match DatasetConfig::load(&yaml_path) {
             Ok(config) => {
-                let abs_yaml = yaml_path.canonicalize().unwrap_or(yaml_path);
                 datasets.push(DiscoveredDataset {
-                    yaml_path: abs_yaml,
+                    yaml_path,
                     config,
                 });
             }
             Err(e) => {
-                eprintln!(
-                    "WARNING: failed to load {}: {}",
-                    yaml_path.display(),
-                    e
-                );
+                let rel = yaml_path.strip_prefix(cwd)
+                    .map(|r| r.to_string_lossy().to_string())
+                    .unwrap_or_else(|_| yaml_path.to_string_lossy().to_string());
+                eprintln!("WARNING: failed to load {}: {}", rel, e);
             }
         }
         // Don't descend into dataset directories
@@ -339,7 +342,7 @@ fn walk_for_datasets(dir: &Path, datasets: &mut Vec<DiscoveredDataset>) {
             if name.starts_with('.') || name == "node_modules" || name == "target" {
                 continue;
             }
-            walk_for_datasets(&subdir, datasets);
+            walk_for_datasets(&subdir, datasets, cwd);
         }
     }
 }
@@ -352,7 +355,7 @@ mod tests {
     fn test_walk_empty_dir() {
         let tmp = tempfile::tempdir().unwrap();
         let mut datasets = Vec::new();
-        walk_for_datasets(tmp.path(), &mut datasets);
+        walk_for_datasets(tmp.path(), &mut datasets, tmp.path());
         assert!(datasets.is_empty());
     }
 
@@ -377,7 +380,7 @@ mod tests {
         .unwrap();
 
         let mut datasets = Vec::new();
-        walk_for_datasets(tmp.path(), &mut datasets);
+        walk_for_datasets(tmp.path(), &mut datasets, tmp.path());
         datasets.sort_by(|a, b| a.config.name.cmp(&b.config.name));
 
         assert_eq!(datasets.len(), 2);
@@ -406,7 +409,7 @@ profiles:
         .unwrap();
 
         let mut datasets = Vec::new();
-        walk_for_datasets(tmp.path(), &mut datasets);
+        walk_for_datasets(tmp.path(), &mut datasets, tmp.path());
         assert_eq!(datasets.len(), 1);
 
         let root = tmp.path().canonicalize().unwrap();
@@ -440,7 +443,7 @@ profiles:
         .unwrap();
 
         let mut datasets = Vec::new();
-        walk_for_datasets(tmp.path(), &mut datasets);
+        walk_for_datasets(tmp.path(), &mut datasets, tmp.path());
         assert_eq!(datasets.len(), 1);
 
         let root = tmp.path().canonicalize().unwrap();
@@ -484,7 +487,7 @@ profiles:
         .unwrap();
 
         let mut datasets = Vec::new();
-        walk_for_datasets(tmp.path(), &mut datasets);
+        walk_for_datasets(tmp.path(), &mut datasets, tmp.path());
         assert_eq!(datasets.len(), 1);
         assert_eq!(datasets[0].config.name, "real");
     }

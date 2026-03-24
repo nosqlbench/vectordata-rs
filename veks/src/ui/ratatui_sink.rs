@@ -1819,15 +1819,22 @@ fn format_bytes(bytes: u64) -> String {
 
 /// Format a count with thousands separators.
 fn format_count(n: u64) -> String {
-    let s = n.to_string();
-    let mut result = String::with_capacity(s.len() + s.len() / 3);
-    for (i, ch) in s.chars().rev().enumerate() {
-        if i > 0 && i % 3 == 0 {
-            result.push(',');
-        }
-        result.push(ch);
+    let n = n as usize;
+    if n >= 1_000_000_000 && n % 1_000_000_000 == 0 {
+        format!("{}B", n / 1_000_000_000)
+    } else if n >= 1_000_000_000 {
+        format!("{:.1}B", n as f64 / 1_000_000_000.0)
+    } else if n >= 1_000_000 && n % 1_000_000 == 0 {
+        format!("{}M", n / 1_000_000)
+    } else if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 && n % 1_000 == 0 {
+        format!("{}K", n / 1_000)
+    } else if n >= 10_000 {
+        format!("{:.1}K", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
     }
-    result.chars().rev().collect()
 }
 
 #[cfg(test)]
@@ -1836,11 +1843,13 @@ mod tests {
     use super::super::event::ResourceMetrics;
 
     #[test]
-    fn format_count_thousands() {
+    fn format_count_iso_suffixes() {
         assert_eq!(format_count(0), "0");
         assert_eq!(format_count(999), "999");
-        assert_eq!(format_count(1000), "1,000");
-        assert_eq!(format_count(1_234_567), "1,234,567");
+        assert_eq!(format_count(1000), "1K");
+        assert_eq!(format_count(1_234_567), "1.2M");
+        assert_eq!(format_count(5_000_000), "5M");
+        assert_eq!(format_count(2_000_000_000), "2B");
     }
 
     #[test]

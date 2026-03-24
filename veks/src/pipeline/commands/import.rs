@@ -161,9 +161,9 @@ work with.
             }
         };
 
-        // Probe source metadata first (without opening a full reader) for
-        // the symlink fast-path check.
-        let probe = match reader::probe_source(&source_path, source_format) {
+        // Probe source metadata using the facet-aware probe, which dispatches
+        // metadata parquet to the MNode reader instead of the vector reader.
+        let probe = match reader::probe_source_for_facet(&source_path, source_format, facet) {
             Ok(m) => m,
             Err(e) => return error_result(format!("failed to probe source {}: {}", source_path.display(), e), start),
         };
@@ -193,13 +193,10 @@ work with.
                 let _ = std::fs::remove_file(&output_path);
             }
 
-            // Create absolute symlink
-            let abs_source = if source_path.is_absolute() {
-                source_path.clone()
-            } else {
-                std::env::current_dir().unwrap_or_default().join(&source_path)
-            };
-            match std::os::unix::fs::symlink(&abs_source, &output_path) {
+            // Create relative symlink for portability
+            let link_dir = output_path.parent().unwrap_or(std::path::Path::new("."));
+            let rel_source = crate::prepare::import::relative_path(link_dir, &source_path);
+            match std::os::unix::fs::symlink(&rel_source, &output_path) {
                 Ok(()) => {
                     let record_str = probe.record_count
                         .map_or("unknown".to_string(), |n| n.to_string());
@@ -207,7 +204,7 @@ work with.
                         status: Status::Ok,
                         message: format!(
                             "symlinked {} → {} ({} records, format already {})",
-                            output_path.display(), abs_source.display(), record_str, source_format.name(),
+                            output_path.display(), rel_source.display(), record_str, source_format.name(),
                         ),
                         produced: vec![output_path],
                         elapsed: start.elapsed(),

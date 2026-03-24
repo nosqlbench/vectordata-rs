@@ -372,9 +372,108 @@ All visualization commands MUST handle abort signals:
 
 All visualization commands MUST accept `dataset:profile[:facet]`
 specifiers in addition to local file paths. Remote datasets are
-resolved via the catalog system and accessed through the configured
-vectordata cache directory (`settings.yaml` → `cache_dir`). The
-default facet is `base_vectors`.
+accessed through the vectordata data access layer (SRD §13) which
+provides:
+
+- **Lazy on-demand chunk fetching** with merkle verification
+- **Local caching** in the configured cache directory
+- **Automatic promotion** from channel-backed to mmap-backed access
+  after full caching
+- **Windowed access** for profile-defined subsets of remote files
+
+Visualization commands MUST NOT implement their own download logic.
+They MUST use the `DatasetLoader` API (§13.2) to obtain typed views
+that handle transport, caching, and verification transparently.
+
+### 1.6.7 Path Handling Requirements
+
+**Absolute paths MUST NOT appear in any user-facing output, persisted
+configuration, or stored state.** This is a system-wide requirement
+that applies to ALL commands, checks, error messages, and advisories.
+
+All paths shown to users MUST be relative — either to the current
+working directory, the workspace directory, or the publish root,
+whichever is most natural for the context.
+
+Specific rules:
+
+- **User-facing output** (println, eprintln, log messages, check results,
+  advisory messages): All paths MUST be displayed relative to the current
+  working directory or to a context-appropriate root (e.g., publish root
+  for publish checks, workspace for pipeline messages). Use `rel_display()`
+  or equivalent to strip the cwd prefix.
+- **Symlinks** created during import MUST use relative targets computed
+  from the link's parent directory to the source file.
+- **dataset.yaml** MUST contain only relative paths for source references.
+  Paths are relative to the directory containing dataset.yaml.
+- **Pipeline steps** resolve paths at runtime via `${workspace}` and
+  `${cache}` interpolation. Persisted configuration MUST NOT contain
+  absolute paths.
+- **Catalog entries** store paths relative to the catalog file location.
+- **Check messages** (pipeline, catalogs, publish, merkle, integrity):
+  paths MUST be relative to the check root or publish root, not absolute.
+- **variables.yaml** and **progress log**: paths stored within MUST be
+  relative to the workspace.
+- **`std::fs::canonicalize()`** MAY be used internally for path
+  comparison (e.g., detecting whether two paths refer to the same
+  directory) but MUST NOT appear in user-facing output or persisted
+  state. When canonicalization is needed for upward traversal, the
+  results MUST be relativized before display.
+
+The intent is that:
+1. A dataset directory can be moved, renamed, or shared across machines
+   without breaking internal references.
+2. The system works correctly without full filesystem path traversal
+   privileges.
+3. User-facing output is concise and readable.
+
+### 1.6.8 TUI Thread Architecture
+
+Any UI/console/TUI logic MUST have a **dedicated rendering thread** that
+never blocks on background processes, I/O, or computation:
+
+- The TUI thread's only blocking operation is `event::poll()` with a
+  short timeout (10-100ms). Everything else is non-blocking.
+- All computation (mean accumulation, eigenvector iteration, projection)
+  and all I/O (vector reads, HTTP chunk downloads) MUST run on background
+  threads.
+- Background threads communicate results to the TUI via `mpsc::channel`.
+  The TUI polls with `try_recv()` — never `recv()`.
+- Ctrl-C/q/Esc MUST be responsive within one poll cycle (~10ms during
+  computation, ~100ms when idle), regardless of what background work is
+  in progress.
+- Status lines MUST update every frame with live progress: elapsed time,
+  throughput rates, cache download stats for remote data, and in-flight
+  request counts.
+
+This architecture ensures the TUI never appears frozen, even when
+background operations take seconds per unit of work (e.g., remote chunk
+downloads over slow connections).
+
+### 1.6.9 Wizard Defaults
+
+The interactive wizard (`veks prepare bootstrap`) SHOULD default to
+enabling L2-normalization when vectors are not already normalized.
+Normalized vectors provide consistent distance semantics across metrics
+and are the expected input for most ANN benchmark configurations.
+
+### 1.6.10 Pre-Computed Ground Truth Handling
+
+When the user provides pre-computed ground truth (neighbor_indices and
+optionally neighbor_distances), the wizard MUST:
+
+- **Infer k** from the ground truth ivec dimensionality (each row has k
+  indices). Do NOT prompt the user for neighbor count.
+- **Skip KNN computation** — no `compute-knn` step is generated.
+- **Include KNN verification** — a `verify-knn` step validates a sparse
+  sample of the provided ground truth against recomputed brute-force
+  distances.
+- **Make dedup/zero checks advisory only** — the ground truth was computed
+  against the original base ordinal space. Generating ordinal exclusion
+  filters (which reindex vectors) would invalidate the ground truth. The
+  checks still run and report findings, but no exclusion ordinals are
+  produced. Users are warned about this in the wizard output.
+- **Infer metric** from normalization status when possible (see §1.6.11).
 
 ## 1.7 Technology Stack
 

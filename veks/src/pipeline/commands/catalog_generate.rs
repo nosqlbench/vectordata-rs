@@ -5,7 +5,7 @@
 //!
 //! Scans the workspace directory for `dataset.yaml` files and writes
 //! `catalog.json` / `catalog.yaml` at each directory level. This is
-//! the pipeline-integrated form of `veks datasets catalog generate`.
+//! the pipeline-integrated form of `veks prepare catalog generate`.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -87,14 +87,12 @@ impl CommandOp for CatalogGenerateOp {
 
         ctx.ui.log(&format!("  found {} dataset(s)", datasets.len()));
 
-        let root_canonical = scan_root.canonicalize().unwrap_or(scan_root);
         let mut catalog_dirs: BTreeSet<PathBuf> = BTreeSet::new();
-        catalog_dirs.insert(root_canonical.clone());
+        catalog_dirs.insert(scan_root.clone());
         for ds in &datasets {
             let ds_dir = ds.yaml_path.parent().unwrap_or(&ds.yaml_path);
-            let ds_canonical = ds_dir.canonicalize().unwrap_or(ds_dir.to_path_buf());
-            let mut dir = ds_canonical;
-            while dir.starts_with(&root_canonical) {
+            let mut dir = ds_dir.to_path_buf();
+            while dir.starts_with(&scan_root) {
                 catalog_dirs.insert(dir.clone());
                 match dir.parent() {
                     Some(parent) => dir = parent.to_path_buf(),
@@ -107,12 +105,14 @@ impl CommandOp for CatalogGenerateOp {
         let mut produced = Vec::new();
 
         for catalog_dir in &catalog_dirs {
+            if catalog_dir.join(DO_NOT_CATALOG_FILE).exists() {
+                continue;
+            }
+
             let entries: Vec<CatalogEntry> = datasets
                 .iter()
                 .filter(|ds| {
-                    let ds_canonical = ds.yaml_path.canonicalize()
-                        .unwrap_or(ds.yaml_path.clone());
-                    ds_canonical.starts_with(catalog_dir)
+                    ds.yaml_path.starts_with(catalog_dir)
                 })
                 .map(|ds| ds.to_entry(catalog_dir))
                 .collect();
@@ -183,9 +183,10 @@ impl CommandOp for CatalogGenerateOp {
 // ---------------------------------------------------------------------------
 
 const CATALOG_ROOT_FILE: &str = ".catalog_root";
+const DO_NOT_CATALOG_FILE: &str = ".do_not_catalog";
 
 fn find_catalog_root(dir: &Path) -> Option<PathBuf> {
-    let mut current = std::fs::canonicalize(dir).unwrap_or(dir.to_path_buf());
+    let mut current = dir.to_path_buf();
     loop {
         if current.join(CATALOG_ROOT_FILE).is_file() {
             return Some(current);
@@ -219,12 +220,15 @@ impl DiscoveredDataset {
 }
 
 fn walk_for_datasets(dir: &Path, datasets: &mut Vec<DiscoveredDataset>) {
+    if dir.join(DO_NOT_CATALOG_FILE).exists() {
+        return;
+    }
+
     let yaml_path = dir.join("dataset.yaml");
     if yaml_path.exists() {
         match DatasetConfig::load(&yaml_path) {
             Ok(config) => {
-                let abs_yaml = yaml_path.canonicalize().unwrap_or(yaml_path);
-                datasets.push(DiscoveredDataset { yaml_path: abs_yaml, config });
+                datasets.push(DiscoveredDataset { yaml_path, config });
             }
             Err(e) => {
                 log::warn!("failed to load {}: {}", yaml_path.display(), e);
