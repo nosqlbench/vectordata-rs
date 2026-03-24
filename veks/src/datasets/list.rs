@@ -319,7 +319,7 @@ fn output_text_grouped(entries: &[&CatalogEntry], verbose: bool, key: &str, pv: 
             "source" => entry.path.clone(),
             "metric" => entry.layout.attributes.as_ref()
                 .and_then(|a| a.distance_function.clone())
-                .unwrap_or_else(|| "(unknown)".into()),
+                .unwrap_or_else(|| "(no distance_function in attributes)".into()),
             "profile" => {
                 // Group by profile: each profile becomes a group key
                 for pname in &profile_names {

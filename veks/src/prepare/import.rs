@@ -1023,6 +1023,10 @@ fn generate_yaml(
         out.push_str(&format!("description: >-\n  {}\n", desc));
     }
 
+    // Attributes
+    out.push_str("\nattributes:\n");
+    out.push_str(&format!("  distance_function: {}\n", args.metric));
+
     // Upstream pipeline
     if !steps.is_empty() {
         out.push_str("\nupstream:\n");

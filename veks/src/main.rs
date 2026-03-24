@@ -322,12 +322,12 @@ fn filter_commands_by_prefix(prefix: &str) -> String {
     for line in full.lines() {
         // Each line is "group child\tdescription" or "leaf\tdescription"
         let cmd = line.split('\t').next().unwrap_or("");
-        // Match against the full command string, the first word (group name),
-        // or the last word (leaf command name) — since shorthands let users
-        // type the leaf name directly (e.g., "config" → "datasets config").
+        // Match against the full command string or the first word (group name).
+        // Do NOT match interior/trailing words — "datas" should not match
+        // "generate dataset". Shorthand completion (e.g., "config" → "datasets
+        // config") is handled by hidden root subcommands in build_augmented_cli.
         let first_word = cmd.split(' ').next().unwrap_or("");
-        let last_word = cmd.split(' ').last().unwrap_or("");
-        if cmd.starts_with(prefix) || first_word.starts_with(prefix) || last_word.starts_with(prefix) {
+        if cmd.starts_with(prefix) || first_word.starts_with(prefix) {
             matches.push_str(line);
             matches.push('\n');
         }

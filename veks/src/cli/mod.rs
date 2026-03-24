@@ -44,7 +44,7 @@ EXAMPLES:
 pub struct CompletionsArgs {
     /// Shell to generate completions for (bash, zsh, fish, elvish, powershell)
     #[arg(long, value_enum)]
-    pub shell: Shell,
+    pub shell: Option<Shell>,
 }
 
 /// Print a minimal, sourceable shell snippet that registers dynamic
@@ -56,7 +56,25 @@ pub struct CompletionsArgs {
 /// splits on `COMP_WORDBREAKS` characters (including `:`). This ensures
 /// that values like `mem:25%` are treated as a single token.
 pub fn completions(args: CompletionsArgs) {
-    match args.shell {
+    let shell = match args.shell {
+        Some(s) => s,
+        None => {
+            // Auto-detect shell from environment
+            match detect_shell() {
+                Some(s) => s,
+                None => {
+                    // Emit benign output that won't break eval but tells the user
+                    println!("# veks: could not detect your shell.");
+                    println!("# Use one of:");
+                    println!("#   eval \"$(veks completions --shell bash)\"");
+                    println!("#   eval \"$(veks completions --shell zsh)\"");
+                    println!("#   veks completions --shell fish | source");
+                    return;
+                }
+            }
+        }
+    };
+    match shell {
         Shell::Bash => print_bash_completions(),
         Shell::Zsh => print!(
             r#"source <(COMPLETE=zsh veks)
@@ -74,7 +92,50 @@ pub fn completions(args: CompletionsArgs) {
             r#"(& {{ $env:COMPLETE="powershell"; veks }}) | Invoke-Expression
 "#
         ),
-        _ => println!("Unsupported shell: {:?}", args.shell),
+        _ => {
+            println!("# veks: unsupported shell variant");
+        }
+    }
+}
+
+/// Detect the current shell from environment.
+///
+/// Checks `SHELL` env var first (standard on Unix), then falls back to
+/// inspecting the parent process name on Linux via `/proc`.
+fn detect_shell() -> Option<Shell> {
+    // Try SHELL env var (e.g., /bin/bash, /usr/bin/zsh)
+    if let Ok(shell_path) = std::env::var("SHELL") {
+        let name = std::path::Path::new(&shell_path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+        if let Some(s) = shell_name_to_enum(name) {
+            return Some(s);
+        }
+    }
+
+    // Fallback: check parent process on Linux
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(comm) = std::fs::read_to_string(format!("/proc/{}/comm", std::os::unix::process::parent_id())) {
+            let name = comm.trim();
+            if let Some(s) = shell_name_to_enum(name) {
+                return Some(s);
+            }
+        }
+    }
+
+    None
+}
+
+fn shell_name_to_enum(name: &str) -> Option<Shell> {
+    match name {
+        "bash" => Some(Shell::Bash),
+        "zsh" => Some(Shell::Zsh),
+        "fish" => Some(Shell::Fish),
+        "elvish" => Some(Shell::Elvish),
+        "pwsh" | "powershell" => Some(Shell::PowerShell),
+        _ => None,
     }
 }
 
