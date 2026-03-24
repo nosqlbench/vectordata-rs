@@ -35,6 +35,15 @@ pub(crate) fn parse_sample_mode(s: &str) -> Result<SampleMode, String> {
     }
 }
 
+/// Completer for `--sample-mode`.
+pub(crate) fn sample_mode_completer(current: &std::ffi::OsStr) -> Vec<clap_complete::CompletionCandidate> {
+    let prefix = current.to_string_lossy().to_lowercase();
+    ["streaming", "clumped", "sparse"].iter()
+        .filter(|v| prefix.is_empty() || v.starts_with(&prefix))
+        .map(|v| clap_complete::CompletionCandidate::new(*v))
+        .collect()
+}
+
 /// Recognized data file extensions for explore commands.
 pub(super) const DATA_EXTENSIONS: &[&str] = &[
     "fvec", "fvecs", "ivec", "ivecs", "mvec", "mvecs",
@@ -52,17 +61,18 @@ pub(crate) fn dataset_completer(current: &OsStr) -> Vec<CompletionCandidate> {
 
     let mut candidates = Vec::new();
 
-    // Tier 1: cached datasets only
-    candidates.extend(cached_dataset_candidates(&prefix));
-
-    // Tier 2: all dataset names
-    if tier >= 2 {
-        candidates.extend(catalog_name_candidates(&prefix));
+    // If the user has typed a colon, they want dataset:profile form — show profiles
+    if prefix.contains(':') {
+        candidates.extend(catalog_profile_candidates(&prefix));
+        return candidates;
     }
 
-    // Tier 3: dataset:profile combinations
-    if tier >= 3 {
-        candidates.extend(catalog_profile_candidates(&prefix));
+    // Tier 1: cached datasets only (names without profiles)
+    candidates.extend(cached_dataset_candidates(&prefix));
+
+    // Tier 2: all dataset names from catalog (no profiles — use --profile separately)
+    if tier >= 2 {
+        candidates.extend(catalog_name_candidates(&prefix));
     }
 
     candidates

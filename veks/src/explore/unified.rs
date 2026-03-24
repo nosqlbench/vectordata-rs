@@ -278,6 +278,18 @@ pub(super) fn run_interactive_explore(
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).unwrap();
 
+    // ── View state (persists across sample size restarts) ──
+    let mut view_mode: usize = 0;
+    let mut num_bins: usize = 0; // 0 = auto (fill available width)
+    let mut show_help = false;
+    let mut show_info = false; // per-view theory description (/ key)
+    let mut info_scroll: u16 = 0; // scroll offset for info view
+    let mut rot_y: f64 = 0.0;  // ←→ arrows
+    let mut rot_x: f64 = 0.0;  // ↑↓ arrows
+    let mut rot_z: f64 = 0.0;  // a/d keys
+    let mut rot_w: f64 = 0.0;  // w/s keys
+    let mut pc_axes: [usize; 5] = [0, 1, 2, 3, 4];
+
     // Outer loop: restarts computation when sample size changes
     loop {
     let indices = sample_indices(total, current_sample, seed, sample_mode, clump);
@@ -324,13 +336,8 @@ pub(super) fn run_interactive_explore(
         });
     }
 
-    // ── TUI state ──
+    // ── Computation state (reset on each restart) ──
     let compute_start = Instant::now();
-    let mut view_mode: usize = 0;
-    let mut num_bins: usize = 0; // 0 = auto (fill available width)
-    let mut show_help = false;
-    let mut show_info = false; // per-view theory description (/ key)
-    let mut info_scroll: u16 = 0; // scroll offset for info view
 
     // Phase 1 state
     let mut vector_buf: Vec<f32> = Vec::with_capacity(current_sample * dim);
@@ -366,14 +373,7 @@ pub(super) fn run_interactive_explore(
     let mut proj_rx: Option<mpsc::Receiver<ProjectionMsg>> = None;
     let mut phase4_done = false;
 
-    // PCA rotation
-    let mut rot_y: f64 = 0.0;  // ←→ arrows
-    let mut rot_x: f64 = 0.0;  // ↑↓ arrows
-    let mut rot_z: f64 = 0.0;  // a/d keys
-    let mut rot_w: f64 = 0.0;  // w/s keys
-    // PC axis assignment: which PCs map to spatial X, Y, Z and color, size
-    // Default: [0,1,2,3,4] = PC1→X, PC2→Y, PC3→Z, PC4→color, PC5→size
-    let mut pc_axes: [usize; 5] = [0, 1, 2, 3, 4];
+    // PCA rotation (persists — moved before outer loop)
 
     // Overall phase tracking
     let mut status_msg;

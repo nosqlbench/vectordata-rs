@@ -22,24 +22,27 @@ use clap_complete::Shell;
 
 /// Generate shell completions for veks.
 ///
-/// Source the output in your shell profile for tab completion:
+/// Auto-detects your shell when --shell is omitted:
 ///
-///   bash:  source <(veks completions --shell bash)
-///   zsh:   source <(veks completions --shell zsh)
-///   fish:  veks completions --shell fish | source
+///   eval "$(veks completions)"
+///
+/// Or specify the shell explicitly:
+///
+///   eval "$(veks completions --shell bash)"
+///   eval "$(veks completions --shell zsh)"
+///   veks completions --shell fish | source
 #[derive(Args)]
 #[command(after_long_help = "\
 EXAMPLES:
+  # Auto-detect shell and activate completions:
+  eval \"$(veks completions)\"
+
   # Add to ~/.bashrc for persistent completions:
-  echo 'source <(veks completions --shell bash)' >> ~/.bashrc
+  echo 'eval \"$(veks completions)\"' >> ~/.bashrc
 
-  # Or source directly in the current session:
-  source <(veks completions --shell bash)
-
-  # For zsh (add to ~/.zshrc):
-  source <(veks completions --shell zsh)
-
-  # For fish (add to config.fish):
+  # Or specify the shell explicitly:
+  eval \"$(veks completions --shell bash)\"
+  eval \"$(veks completions --shell zsh)\"
   veks completions --shell fish | source")]
 pub struct CompletionsArgs {
     /// Shell to generate completions for (bash, zsh, fish, elvish, powershell)
@@ -56,24 +59,51 @@ pub struct CompletionsArgs {
 /// splits on `COMP_WORDBREAKS` characters (including `:`). This ensures
 /// that values like `mem:25%` are treated as a single token.
 pub fn completions(args: CompletionsArgs) {
-    let shell = match args.shell {
-        Some(s) => s,
+    match args.shell {
+        Some(shell) => {
+            // Explicit --shell: emit the raw script directly
+            emit_completions(shell);
+        }
         None => {
-            // Auto-detect shell from environment
+            // Auto-detect: emit an indirect one-liner that's safe for
+            // both eval "$(veks completions)" and eval `veks completions`.
+            // The indirection avoids backtick-substitution mangling the
+            // raw script (which contains backslashes and special chars).
+            let veks_path = std::env::current_exe()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|_| "veks".to_string());
             match detect_shell() {
-                Some(s) => s,
+                Some(Shell::Bash) => {
+                    println!("# veks tab-completion for bash");
+                    println!("# To activate:  eval \"$(veks completions)\"");
+                    println!("# To persist:   echo 'eval \"$(veks completions)\"' >> ~/.bashrc");
+                    println!("source <(\"{veks_path}\" completions --shell bash)");
+                }
+                Some(Shell::Zsh) => {
+                    println!("# veks tab-completion for zsh");
+                    println!("# To activate:  eval \"$(veks completions)\"");
+                    println!("# To persist:   echo 'eval \"$(veks completions)\"' >> ~/.zshrc");
+                    println!("source <(\"{veks_path}\" completions --shell zsh)");
+                }
+                Some(Shell::Fish) => {
+                    println!("# veks tab-completion for fish");
+                    println!("# To activate:  eval (veks completions)");
+                    println!("# To persist:   add to ~/.config/fish/config.fish");
+                    println!("\"{veks_path}\" completions --shell fish | source");
+                }
+                Some(shell) => {
+                    emit_completions(shell);
+                }
                 None => {
-                    // Emit benign output that won't break eval but tells the user
                     println!("# veks: could not detect your shell.");
-                    println!("# Use one of:");
-                    println!("#   eval \"$(veks completions --shell bash)\"");
-                    println!("#   eval \"$(veks completions --shell zsh)\"");
-                    println!("#   veks completions --shell fish | source");
-                    return;
+                    println!("# Use: eval \"$(veks completions --shell bash)\"");
                 }
             }
         }
-    };
+    }
+}
+
+fn emit_completions(shell: Shell) {
     match shell {
         Shell::Bash => print_bash_completions(),
         Shell::Zsh => print!(

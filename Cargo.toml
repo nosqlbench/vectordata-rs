@@ -1,6 +1,8 @@
 [workspace]
 members = [
     "vectordata",
+    "veks-core",
+    "veks-pipeline",
     "veks",
     "slabtastic",
 ]

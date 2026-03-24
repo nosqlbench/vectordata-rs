@@ -14,6 +14,8 @@
       <sourceFolder url="file://$MODULE_DIR$/vectordata/tests" isTestSource="true" />
       <sourceFolder url="file://$MODULE_DIR$/veks/examples" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/veks/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/veks-core/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/veks-pipeline/src" isTestSource="false" />
       <excludeFolder url="file://$MODULE_DIR$/links" />
       <excludeFolder url="file://$MODULE_DIR$/target" />
     </content>

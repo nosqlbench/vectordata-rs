@@ -4908,15 +4908,68 @@ dependencies = [
 name = "veks"
 version = "0.3.2"
 dependencies = [
- "arrow",
  "atty",
- "byteorder",
  "chrono",
  "clap",
  "clap_complete",
  "crossterm",
  "curl",
  "env_logger",
+ "filetime",
+ "half",
+ "indexmap",
+ "log",
+ "rand 0.9.2",
+ "rand_xoshiro",
+ "ratatui",
+ "rayon",
+ "regex",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "shadow-terminal",
+ "signal-hook",
+ "simsimd",
+ "slabtastic",
+ "tempfile",
+ "vectordata",
+ "veks-core",
+ "veks-pipeline",
+]
+
+[[package]]
+name = "veks-core"
+version = "0.3.2"
+dependencies = [
+ "arrow",
+ "atty",
+ "byteorder",
+ "clap",
+ "crossterm",
+ "half",
+ "libc",
+ "log",
+ "ndarray",
+ "ndarray-npy",
+ "parquet",
+ "ratatui",
+ "serde",
+ "serde_json",
+ "slabtastic",
+ "tempfile",
+ "vectordata",
+]
+
+[[package]]
+name = "veks-pipeline"
+version = "0.3.2"
+dependencies = [
+ "atty",
+ "byteorder",
+ "chrono",
+ "clap",
+ "clap_complete",
+ "curl",
  "filetime",
  "flate2",
  "half",
@@ -4927,14 +4980,10 @@ dependencies = [
  "jaq-std",
  "libc",
  "log",
- "ndarray",
- "ndarray-npy",
- "parquet",
  "petgraph",
  "rand 0.9.2",
  "rand_distr",
  "rand_xoshiro",
- "ratatui",
  "rayon",
  "regex",
  "rusqlite",
@@ -4942,13 +4991,13 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "sha2",
- "shadow-terminal",
  "signal-hook",
  "simsimd",
  "slabtastic",
  "tempfile",
  "tokio",
  "vectordata",
+ "veks-core",
 ]
 
 [[package]]

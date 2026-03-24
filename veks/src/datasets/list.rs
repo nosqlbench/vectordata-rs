@@ -225,6 +225,12 @@ fn output_text(entries: &[&CatalogEntry], verbose: bool, group_by: Option<&str>,
 
     let name_col = max_name_len + 2; // padding
 
+    // Header
+    println!("{:<width$}  {:<width2$}  {}",
+        "DATASET", "PROFILES", "METRIC",
+        width = name_col.saturating_sub(2),
+        width2 = 30);
+
     for entry in entries {
         let profile_names = pv.matching_profiles(entry);
         if profile_names.is_empty() {

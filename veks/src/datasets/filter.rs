@@ -23,15 +23,62 @@ use vectordata::dataset::source::parse_number_with_suffix;
 use crate::catalog::resolver::Catalog;
 use crate::catalog::sources::CatalogSources;
 
+/// Detect if a string looks like a glob pattern rather than a regex.
+///
+/// Globs use `*` and `?` as wildcards without escaping. Regexes use
+/// these differently (quantifiers). A string is treated as a glob if it
+/// contains unescaped `*` or `?` but no regex-specific syntax like `(`, `|`, `+`.
+fn looks_like_glob(s: &str) -> bool {
+    let has_glob_chars = s.contains('*') || s.contains('?');
+    let has_regex_chars = s.contains('(') || s.contains('|') || s.contains('+')
+        || s.contains('^') || s.contains('$') || s.contains('{');
+    has_glob_chars && !has_regex_chars
+}
+
+/// Convert a glob pattern to a regex pattern.
+///
+/// `*` → `.*`, `?` → `.`, everything else is escaped.
+/// Prints a note to stderr so the user knows the conversion happened.
+fn glob_to_regex_pattern(glob: &str) -> String {
+    let mut regex = String::from("(?i)^");
+    for ch in glob.chars() {
+        match ch {
+            '*' => regex.push_str(".*"),
+            '?' => regex.push('.'),
+            '.' | '+' | '(' | ')' | '[' | ']' | '{' | '}' | '\\' | '^' | '$' | '|' => {
+                regex.push('\\');
+                regex.push(ch);
+            }
+            _ => regex.push(ch),
+        }
+    }
+    regex.push('$');
+    regex
+}
+
+/// Normalize a matching pattern: if it looks like a glob, convert to regex
+/// and notify the user. Returns the pattern ready for regex matching.
+pub fn normalize_match_pattern(pattern: &str, option_name: &str) -> String {
+    if looks_like_glob(pattern) {
+        let converted = glob_to_regex_pattern(pattern);
+        eprintln!("note: {} '{}' looks like a glob, using regex: {}",
+            option_name, pattern, converted);
+        converted
+    } else {
+        pattern.to_string()
+    }
+}
+
 /// Collected filter predicates parsed from CLI arguments.
+///
+/// The `--matching-*` options accept regexes (or globs that are auto-converted).
+/// Plain strings without regex/glob syntax are matched as case-insensitive substrings.
 #[derive(Debug, Default)]
 pub struct DatasetFilter {
     pub name: Option<String>,
-    pub name_regex: Option<String>,
     pub facet: Vec<String>,
     pub metric: Option<String>,
     pub desc: Option<String>,
-    pub desc_regex: Option<String>,
     pub min_size: Option<u64>,
     pub max_size: Option<u64>,
     pub size: Option<u64>,
@@ -47,11 +94,9 @@ impl DatasetFilter {
     /// Returns `true` if no filters are set.
     pub fn is_empty(&self) -> bool {
         self.name.is_none()
-            && self.name_regex.is_none()
             && self.facet.is_empty()
             && self.metric.is_none()
             && self.desc.is_none()
-            && self.desc_regex.is_none()
             && self.min_size.is_none()
             && self.max_size.is_none()
             && self.size.is_none()
@@ -66,13 +111,7 @@ impl DatasetFilter {
     /// Test whether a catalog entry passes all filter predicates.
     pub fn matches(&self, entry: &CatalogEntry) -> bool {
         if let Some(ref name) = self.name {
-            if !entry.name.to_lowercase().contains(&name.to_lowercase()) {
-                return false;
-            }
-        }
-
-        if let Some(ref pat) = self.name_regex {
-            if !simple_match(pat, &entry.name) {
+            if !smart_match(name, &entry.name) {
                 return false;
             }
         }
@@ -100,13 +139,7 @@ impl DatasetFilter {
         }
 
         if let Some(ref desc) = self.desc {
-            if !matches_description(entry, desc) {
-                return false;
-            }
-        }
-
-        if let Some(ref pat) = self.desc_regex {
-            if !matches_description_regex(entry, pat) {
+            if !matches_description_smart(entry, desc) {
                 return false;
             }
         }
@@ -194,42 +227,29 @@ impl DatasetFilter {
 /// When neither is set, all profiles are shown.
 #[derive(Debug, Default)]
 pub struct ProfileView {
-    pub profile: Option<String>,
-    pub profile_regex: Option<String>,
+    pub pattern: Option<String>,
 }
 
 impl ProfileView {
-    pub fn new(profile: Option<String>, profile_regex: Option<String>) -> Self {
-        Self { profile, profile_regex }
+    pub fn new(pattern: Option<String>) -> Self {
+        Self { pattern }
     }
 
     /// Returns `true` if any profile limiting is in effect.
     pub fn is_active(&self) -> bool {
-        self.profile.is_some() || self.profile_regex.is_some()
+        self.pattern.is_some()
     }
 
-    /// Returns the profile names from `entry` that match the view limits.
-    /// If neither `--profile` nor `--profile-regex` is set, returns all profiles.
+    /// Returns the profile names from `entry` that match the pattern.
+    /// If no pattern is set, returns all profiles.
     pub fn matching_profiles<'a>(&self, entry: &'a CatalogEntry) -> Vec<&'a str> {
         let all = entry.profile_names();
-        if self.profile.is_none() && self.profile_regex.is_none() {
-            return all;
+        match &self.pattern {
+            None => all,
+            Some(pat) => all.into_iter()
+                .filter(|name| smart_match(pat, name))
+                .collect(),
         }
-        all.into_iter()
-            .filter(|name| {
-                if let Some(ref exact) = self.profile {
-                    if !name.eq_ignore_ascii_case(exact) {
-                        return false;
-                    }
-                }
-                if let Some(ref pat) = self.profile_regex {
-                    if !simple_match(pat, name) {
-                        return false;
-                    }
-                }
-                true
-            })
-            .collect()
     }
 }
 
@@ -429,6 +449,39 @@ fn simple_match(pattern: &str, text: &str) -> bool {
     }
 }
 
+/// Smart match: if the pattern has regex syntax, use regex matching.
+/// Otherwise, use case-insensitive substring matching.
+/// Glob patterns have already been converted to regex by `normalize_match_pattern`.
+fn smart_match(pattern: &str, text: &str) -> bool {
+    // If it looks like a regex (has anchors, quantifiers, groups, etc.), use regex
+    let is_regex = pattern.contains('(') || pattern.contains('|') || pattern.contains('+')
+        || pattern.contains('^') || pattern.contains('$') || pattern.contains('{')
+        || pattern.contains('.') && pattern.contains('*');
+    if is_regex {
+        simple_match(pattern, text)
+    } else {
+        // Plain substring, case-insensitive
+        text.to_lowercase().contains(&pattern.to_lowercase())
+    }
+}
+
+/// Smart match against description-like fields (name, notes, model, tags).
+fn matches_description_smart(entry: &CatalogEntry, pattern: &str) -> bool {
+    let mut texts = vec![entry.name.clone()];
+    if let Some(ref attrs) = entry.layout.attributes {
+        if let Some(ref notes) = attrs.notes {
+            texts.push(notes.clone());
+        }
+        if let Some(ref model) = attrs.model {
+            texts.push(model.clone());
+        }
+        for v in attrs.tags.values() {
+            texts.push(v.clone());
+        }
+    }
+    texts.iter().any(|t| smart_match(pattern, t))
+}
+
 /// Parse a size value that supports K/M/B suffixes.
 pub fn parse_size(s: &str) -> Result<u64, String> {
     parse_number_with_suffix(s)
@@ -482,7 +535,6 @@ fn parse_active_filters() -> (DatasetFilter, ProfileView) {
     let args: Vec<String> = std::env::args().collect();
     let mut filter = DatasetFilter::default();
     let mut profile: Option<String> = None;
-    let mut profile_regex: Option<String> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -503,15 +555,9 @@ fn parse_active_filters() -> (DatasetFilter, ProfileView) {
         let advance = if inline_val.is_some() { 0 } else { 1 };
 
         match key {
-            "--with-name" => {
+            "--matching-name" => {
                 if let Some(v) = next_val(i, &inline_val, &args) {
                     filter.name = Some(v);
-                    i += advance;
-                }
-            }
-            "--with-name-regex" => {
-                if let Some(v) = next_val(i, &inline_val, &args) {
-                    filter.name_regex = Some(v);
                     i += advance;
                 }
             }
@@ -527,15 +573,9 @@ fn parse_active_filters() -> (DatasetFilter, ProfileView) {
                     i += advance;
                 }
             }
-            "--with-desc" => {
+            "--matching-desc" => {
                 if let Some(v) = next_val(i, &inline_val, &args) {
                     filter.desc = Some(v);
-                    i += advance;
-                }
-            }
-            "--with-desc-regex" => {
-                if let Some(v) = next_val(i, &inline_val, &args) {
-                    filter.desc_regex = Some(v);
                     i += advance;
                 }
             }
@@ -593,15 +633,9 @@ fn parse_active_filters() -> (DatasetFilter, ProfileView) {
                     i += advance;
                 }
             }
-            "--profile" => {
+            "--matching-profile" => {
                 if let Some(v) = next_val(i, &inline_val, &args) {
                     profile = Some(v);
-                    i += advance;
-                }
-            }
-            "--profile-regex" => {
-                if let Some(v) = next_val(i, &inline_val, &args) {
-                    profile_regex = Some(v);
                     i += advance;
                 }
             }
@@ -610,7 +644,7 @@ fn parse_active_filters() -> (DatasetFilter, ProfileView) {
         i += 1;
     }
 
-    (filter, ProfileView::new(profile, profile_regex))
+    (filter, ProfileView::new(profile))
 }
 
 /// Returns `true` if `--select` is already present on the command line,
@@ -692,12 +726,12 @@ pub fn name_completer(current: &OsStr) -> Vec<CompletionCandidate> {
     if select_already_specified() { return Vec::new(); }
     let prefix = current.to_string_lossy().to_lowercase();
     let entries = filtered_completion_entries();
+    if entries.is_empty() { return Vec::new(); }
 
     let mut seen = BTreeSet::new();
     for e in &entries {
         seen.insert(e.name.clone());
     }
-    if seen.len() <= 1 { return Vec::new(); }
 
     seen.iter()
         .filter(|n| prefix.is_empty() || n.to_lowercase().starts_with(&prefix))
@@ -767,16 +801,13 @@ pub fn metric_completer(current: &OsStr) -> Vec<CompletionCandidate> {
     if entries.is_empty() { return Vec::new(); }
 
     let mut metrics = BTreeSet::new();
-    let mut with_metric = 0usize;
     for e in &entries {
         if let Some(ref attrs) = e.layout.attributes {
             if let Some(ref df) = attrs.distance_function {
                 metrics.insert(df.clone());
-                with_metric += 1;
             }
         }
     }
-    if metrics.len() <= 1 && with_metric == entries.len() { return Vec::new(); }
     if metrics.is_empty() { return Vec::new(); }
 
     metrics
@@ -801,8 +832,6 @@ pub fn profile_completer(current: &OsStr) -> Vec<CompletionCandidate> {
             profiles.insert(p.to_string());
         }
     }
-    if profiles.len() <= 1 { return Vec::new(); }
-
     profiles
         .iter()
         .filter(|p| prefix.is_empty() || p.to_lowercase().starts_with(&prefix))
@@ -821,14 +850,11 @@ pub fn dim_completer(current: &OsStr) -> Vec<CompletionCandidate> {
     if entries.is_empty() { return Vec::new(); }
 
     let mut dims = BTreeSet::new();
-    let mut with_dim = 0usize;
     for e in &entries {
         if let Some(d) = infer_dimension(e) {
             dims.insert(d);
-            with_dim += 1;
         }
     }
-    if dims.len() <= 1 && with_dim == entries.len() { return Vec::new(); }
     if dims.is_empty() { return Vec::new(); }
 
     dims.iter()
@@ -849,14 +875,11 @@ pub fn vtype_completer(current: &OsStr) -> Vec<CompletionCandidate> {
     if entries.is_empty() { return Vec::new(); }
 
     let mut vtypes = BTreeSet::new();
-    let mut with_vtype = 0usize;
     for e in &entries {
         if let Some(vt) = infer_vtype(e) {
             vtypes.insert(vt);
-            with_vtype += 1;
         }
     }
-    if vtypes.len() <= 1 && with_vtype == entries.len() { return Vec::new(); }
     if vtypes.is_empty() { return Vec::new(); }
 
     vtypes
@@ -892,14 +915,11 @@ pub fn size_completer(current: &OsStr) -> Vec<CompletionCandidate> {
     if entries.is_empty() { return Vec::new(); }
 
     let mut sizes = BTreeSet::new();
-    let mut with_size = 0usize;
     for e in &entries {
         if let Some(bc) = max_base_count(e) {
             sizes.insert(bc);
-            with_size += 1;
         }
     }
-    if sizes.len() <= 1 && with_size == entries.len() { return Vec::new(); }
     if sizes.is_empty() { return Vec::new(); }
 
     sizes
@@ -955,14 +975,11 @@ pub fn data_size_completer(current: &OsStr) -> Vec<CompletionCandidate> {
     if entries.is_empty() { return Vec::new(); }
 
     let mut sizes = BTreeSet::new();
-    let mut with_size = 0usize;
     for e in &entries {
         if let Some(bytes) = estimate_data_bytes(e) {
             sizes.insert(bytes);
-            with_size += 1;
         }
     }
-    if sizes.len() <= 1 && with_size == entries.len() { return Vec::new(); }
     if sizes.is_empty() { return Vec::new(); }
 
     sizes
@@ -979,33 +996,14 @@ pub fn data_size_completer(current: &OsStr) -> Vec<CompletionCandidate> {
 /// Called from `build_augmented_cli()` to dynamically hide options that would
 /// be useless given the filters already typed on the command line.
 pub fn hidden_list_args() -> Vec<&'static str> {
-    let entries = filtered_completion_entries();
     let (filter, pv) = parse_active_filters();
     let selected = select_already_specified();
-    let n = entries.len();
     let mut hidden = Vec::new();
 
-    // Helper: hide args that can't narrow the result set.
-    // `distinct` = number of distinct values, `coverage` = number of entries
-    // that have any value for this field. Can narrow if multiple distinct
-    // values exist OR if some entries lack the value (coverage < n).
-    macro_rules! check_with {
-        ($id:expr, $distinct:expr, $coverage:expr) => {
-            // Only hide when --select is active (already resolved to one entry).
-            // Don't hide just because the catalog has few entries — the user
-            // still needs to see available options.
-            if selected {
-                hidden.push($id);
-            }
-        };
-    }
-
-    // Hide already-specified single-value --with-* args
-    if filter.name.is_some() { hidden.push("name"); }
-    if filter.name_regex.is_some() { hidden.push("name_regex"); }
+    // Hide already-specified single-value filter args
+    if filter.name.is_some() { hidden.push("matching_name"); }
     if filter.metric.is_some() { hidden.push("metric"); }
-    if filter.desc.is_some() { hidden.push("desc"); }
-    if filter.desc_regex.is_some() { hidden.push("desc_regex"); }
+    if filter.desc.is_some() { hidden.push("matching_desc"); }
     if filter.min_size.is_some() { hidden.push("min_size"); }
     if filter.max_size.is_some() { hidden.push("max_size"); }
     if filter.size.is_some() { hidden.push("size"); }
@@ -1016,120 +1014,20 @@ pub fn hidden_list_args() -> Vec<&'static str> {
     if filter.data_min.is_some() { hidden.push("data_min"); }
     if filter.data_max.is_some() { hidden.push("data_max"); }
 
-    // Hide --profile / --profile-regex when either is already specified or can't narrow
-    if pv.is_active() {
-        hidden.push("profile");
-        hidden.push("profile_regex");
-    }
-    if !hidden.contains(&"profile") {
-        let profiles: BTreeSet<_> = entries.iter()
-            .flat_map(|e| e.profile_names().into_iter().map(|s| s.to_string()).collect::<Vec<_>>())
-            .collect();
-        if selected || n <= 1 || profiles.len() <= 1 {
-            hidden.push("profile");
-            hidden.push("profile_regex");
-        }
+    // Hide --matching-profile when already specified or --select is active
+    if pv.is_active() || selected {
+        hidden.push("matching_profile");
     }
 
-    // Hide --with-* args that can't narrow (only check those not already hidden)
-    if !hidden.contains(&"name") {
-        let names: BTreeSet<_> = entries.iter().map(|e| &e.name).collect();
-        check_with!("name", names.len(), n);
-    }
-    if !hidden.contains(&"name_regex") {
-        let names: BTreeSet<_> = entries.iter().map(|e| &e.name).collect();
-        check_with!("name_regex", names.len(), n);
-    }
-    if !hidden.contains(&"metric") {
-        let mut metrics = BTreeSet::new();
-        let mut with_metric = 0;
-        for e in &entries {
-            if let Some(ref a) = e.layout.attributes {
-                if let Some(ref df) = a.distance_function {
-                    metrics.insert(df.as_str());
-                    with_metric += 1;
-                }
+    // When --select is active, hide all remaining filter args
+    if selected {
+        for id in &["matching_name", "metric", "facet", "matching_desc",
+                     "dim", "min_dim", "max_dim", "vtype", "size", "min_size",
+                     "max_size", "data_min", "data_max"] {
+            if !hidden.contains(id) {
+                hidden.push(id);
             }
         }
-        check_with!("metric", metrics.len(), with_metric);
-    }
-
-    if !hidden.contains(&"facet") {
-        let narrowing_facets = if n > 1 {
-            let mut all_facets = BTreeSet::new();
-            for e in &entries {
-                for v in collect_all_view_names(e) { all_facets.insert(v); }
-            }
-            all_facets.into_iter()
-                .filter(|f| {
-                    let with = entries.iter()
-                        .filter(|e| collect_all_view_names(e).iter().any(|v| v.eq_ignore_ascii_case(f)))
-                        .count();
-                    with < n
-                })
-                .count()
-        } else { 0 };
-        // facets use a different narrowing logic (already computed), pass n as
-        // coverage so the macro's coverage check doesn't suppress it
-        check_with!("facet", narrowing_facets, n);
-    }
-
-    if !hidden.contains(&"desc") {
-        let words: BTreeSet<_> = entries.iter().flat_map(|e| {
-            let mut w = Vec::new();
-            for word in e.name.split(|c: char| c == '_' || c == '-') {
-                if word.len() > 2 && !word.chars().all(|c| c.is_ascii_digit()) {
-                    w.push(word.to_lowercase());
-                }
-            }
-            w
-        }).collect();
-        check_with!("desc", words.len(), n);
-    }
-    if !hidden.contains(&"desc_regex") {
-        let words: BTreeSet<_> = entries.iter().flat_map(|e| {
-            let mut w = Vec::new();
-            for word in e.name.split(|c: char| c == '_' || c == '-') {
-                if word.len() > 2 && !word.chars().all(|c| c.is_ascii_digit()) {
-                    w.push(word.to_lowercase());
-                }
-            }
-            w
-        }).collect();
-        check_with!("desc_regex", words.len(), n);
-    }
-
-    {
-        let mut dims = BTreeSet::new();
-        let mut with_dim = 0;
-        for e in &entries { if let Some(d) = infer_dimension(e) { dims.insert(d); with_dim += 1; } }
-        if !hidden.contains(&"dim") { check_with!("dim", dims.len(), with_dim); }
-        if !hidden.contains(&"min_dim") { check_with!("min_dim", dims.len(), with_dim); }
-        if !hidden.contains(&"max_dim") { check_with!("max_dim", dims.len(), with_dim); }
-    }
-
-    if !hidden.contains(&"vtype") {
-        let mut vtypes = BTreeSet::new();
-        let mut with_vtype = 0;
-        for e in &entries { if let Some(vt) = infer_vtype(e) { vtypes.insert(vt); with_vtype += 1; } }
-        check_with!("vtype", vtypes.len(), with_vtype);
-    }
-
-    {
-        let mut sizes = BTreeSet::new();
-        let mut with_size = 0;
-        for e in &entries { if let Some(bc) = max_base_count(e) { sizes.insert(bc); with_size += 1; } }
-        if !hidden.contains(&"size") { check_with!("size", sizes.len(), with_size); }
-        if !hidden.contains(&"min_size") { check_with!("min_size", sizes.len(), with_size); }
-        if !hidden.contains(&"max_size") { check_with!("max_size", sizes.len(), with_size); }
-    }
-
-    {
-        let mut dsizes = BTreeSet::new();
-        let mut with_dsize = 0;
-        for e in &entries { if let Some(b) = estimate_data_bytes(e) { dsizes.insert(b); with_dsize += 1; } }
-        if !hidden.contains(&"data_min") { check_with!("data_min", dsizes.len(), with_dsize); }
-        if !hidden.contains(&"data_max") { check_with!("data_max", dsizes.len(), with_dsize); }
     }
 
     // Hide --select only when it already has a non-empty value
@@ -1228,7 +1126,7 @@ mod tests {
     #[test]
     fn test_filter_name_regex() {
         let f = DatasetFilter {
-            name_regex: Some("sift.*".to_string()),
+            name: Some("sift.*".to_string()),
             ..Default::default()
         };
         let entry = entry_with_views("sift-128", &["base_vectors"]);
@@ -1317,11 +1215,11 @@ mod tests {
 
     #[test]
     fn test_profile_view_exact() {
-        let pv = ProfileView::new(Some("default".to_string()), None);
+        let pv = ProfileView::new(Some("default".to_string()));
         let entry = entry_with_views("test", &["base_vectors"]);
         assert_eq!(pv.matching_profiles(&entry), vec!["default"]);
 
-        let pv2 = ProfileView::new(Some("10m".to_string()), None);
+        let pv2 = ProfileView::new(Some("10m".to_string()));
         assert!(pv2.matching_profiles(&entry).is_empty());
     }
 
@@ -1347,7 +1245,7 @@ mod tests {
             },
         };
 
-        let pv = ProfileView::new(None, Some(".*m".to_string()));
+        let pv = ProfileView::new(Some(".*m".to_string()));
         let matched = pv.matching_profiles(&entry);
         assert!(matched.contains(&"10m"));
         assert!(matched.contains(&"100m"));
@@ -1356,7 +1254,7 @@ mod tests {
 
     #[test]
     fn test_profile_view_none_returns_all() {
-        let pv = ProfileView::new(None, None);
+        let pv = ProfileView::new(None);
         let entry = entry_with_views("test", &["base_vectors"]);
         assert_eq!(pv.matching_profiles(&entry), vec!["default"]);
     }

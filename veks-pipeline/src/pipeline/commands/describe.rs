@@ -1,0 +1,238 @@
+// Copyright (c) DataStax, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
+//! Pipeline wrapper for the analyze describe operation.
+//!
+//! Runs `analyze describe` on a source file and captures the output as a
+//! command result. This is primarily useful for validation steps in pipelines.
+
+use std::path::{Path, PathBuf};
+use std::time::Instant;
+
+use veks_core::formats::VecFormat;
+use veks_core::formats::reader;
+use crate::pipeline::command::{
+    CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options, ResourceDesc, Status, StreamContext,
+    render_options_table,
+};
+
+/// Pipeline command: describe/analyze a vector file.
+pub struct AnalyzeDescribeOp;
+
+pub fn factory() -> Box<dyn CommandOp> {
+    Box::new(AnalyzeDescribeOp)
+}
+
+impl CommandOp for AnalyzeDescribeOp {
+    fn command_path(&self) -> &str {
+        "analyze describe"
+    }
+
+    fn command_doc(&self) -> CommandDoc {
+        let options = self.describe_options();
+        CommandDoc {
+            summary: "Describe vector file format and dimensions".into(),
+            body: format!(
+                r#"# analyze describe
+
+Describe vector file format and dimensions.
+
+## Description
+
+The analyze describe command inspects a vector file and reports key metadata
+about its structure. It probes the file without reading all records, making it
+fast even for very large files.
+
+The reported fields include:
+
+- **format** -- the detected or overridden vector format (fvec, ivec, bvec,
+  npy, slab, xvec, etc.)
+- **dimension** -- the number of elements per vector record
+- **element size** -- the byte width of each element (e.g. 4 for f32, 2 for
+  f16, 1 for u8)
+- **record count** -- the total number of vector records in the file, when
+  determinable from the file size and format header
+- **file size** -- derived from the underlying file metadata
+
+When the `format` option is omitted, the command auto-detects the format from
+the file extension or header bytes. You can override this with an explicit
+format string if the file has a non-standard extension.
+
+## Data Preparation Role
+
+Describe serves as a debugging and validation tool within dataset preparation
+pipelines. After an import or extract step produces an output file, a describe
+step can confirm that the file has the expected format, dimension, element size,
+and record count. This catches problems early -- such as a dimension mismatch or
+a truncated file -- before downstream steps consume the data.
+
+It is also useful outside of pipelines for quick inspection of any vector file
+on disk, answering questions like "how many vectors are in this file?" or "what
+element type does this dataset use?"
+
+## Notes
+
+- The probe reads only the file header and metadata; it does not scan all
+  records, so it completes in constant time regardless of file size.
+- For slab files, the record count is derived from the slab page index rather
+  than the raw file size.
+- If the file is corrupt or truncated, the probe will report an error rather
+  than returning partial metadata.
+
+## Options
+
+{}"#,
+                render_options_table(&options)
+            ),
+        }
+    }
+
+    fn describe_resources(&self) -> Vec<ResourceDesc> {
+        vec![
+            ResourceDesc { name: "mem".into(), description: "Vector data buffers".into(), adjustable: false },
+            ResourceDesc { name: "readahead".into(), description: "Sequential read prefetch".into(), adjustable: false },
+        ]
+    }
+
+    fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
+        let start = Instant::now();
+
+        let source_str = match options.require("source") {
+            Ok(s) => s,
+            Err(e) => return error_result(e, start),
+        };
+
+        let source_path = resolve_path(source_str, &ctx.workspace);
+
+        let format = if let Some(fmt_str) = options.get("format") {
+            match VecFormat::from_extension(fmt_str) {
+                Some(f) => f,
+                None => return error_result(format!("unknown format: '{}'", fmt_str), start),
+            }
+        } else {
+            match VecFormat::detect(&source_path) {
+                Some(f) => f,
+                None => {
+                    return error_result(
+                        format!(
+                            "cannot detect format for '{}', set 'format' option",
+                            source_path.display()
+                        ),
+                        start,
+                    )
+                }
+            }
+        };
+
+        // Probe the source to get metadata
+        let meta = match reader::probe_source(&source_path, format) {
+            Ok(m) => m,
+            Err(e) => return error_result(format!("failed to probe source: {}", e), start),
+        };
+
+        let file_size = std::fs::metadata(&source_path).map(|m| m.len()).ok();
+        let records_str = meta.record_count
+            .map_or("unknown".to_string(), |n| format_count(n));
+        let record_bytes = 4 + meta.dimension as usize * meta.element_size;
+
+        let mut message = format!(
+            "File:        {}\n\
+             Format:      {}\n\
+             Dimensions:  {}\n\
+             Element:     {} bytes ({})\n\
+             Records:     {}",
+            source_path.display(),
+            format.name(),
+            meta.dimension,
+            meta.element_size,
+            element_type_label(meta.element_size),
+            records_str,
+        );
+        if record_bytes > 0 {
+            message.push_str(&format!("\nRecord size: {} bytes", record_bytes));
+        }
+        if let Some(size) = file_size {
+            message.push_str(&format!("\nFile size:   {}", format_bytes(size)));
+        }
+
+        CommandResult {
+            status: Status::Ok,
+            message,
+            produced: vec![],
+            elapsed: start.elapsed(),
+        }
+    }
+
+    fn describe_options(&self) -> Vec<OptionDesc> {
+        vec![
+            OptionDesc {
+                name: "source".to_string(),
+                type_name: "Path".to_string(),
+                required: true,
+                default: None,
+                description: "File or directory to describe".to_string(),
+                        role: OptionRole::Input,
+        },
+            OptionDesc {
+                name: "format".to_string(),
+                type_name: "String".to_string(),
+                required: false,
+                default: None,
+                description: "Format override (auto-detected if omitted)".to_string(),
+                        role: OptionRole::Config,
+        },
+        ]
+    }
+}
+
+fn resolve_path(path_str: &str, workspace: &Path) -> PathBuf {
+    let p = PathBuf::from(path_str);
+    if p.is_absolute() {
+        p
+    } else {
+        workspace.join(p)
+    }
+}
+
+fn error_result(message: String, start: Instant) -> CommandResult {
+    CommandResult {
+        status: Status::Error,
+        message,
+        produced: vec![],
+        elapsed: start.elapsed(),
+    }
+}
+
+fn element_type_label(elem_size: usize) -> &'static str {
+    match elem_size {
+        1 => "u8/i8",
+        2 => "f16/i16",
+        4 => "f32/i32",
+        8 => "f64/i64",
+        _ => "unknown",
+    }
+}
+
+fn format_count(n: u64) -> String {
+    if n >= 1_000_000_000 {
+        format!("{} ({:.2}B)", n, n as f64 / 1e9)
+    } else if n >= 1_000_000 {
+        format!("{} ({:.2}M)", n, n as f64 / 1e6)
+    } else if n >= 10_000 {
+        format!("{} ({:.1}K)", n, n as f64 / 1e3)
+    } else {
+        format!("{}", n)
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{} B", bytes)
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else if bytes < 1024 * 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else {
+        format!("{:.2} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+    }
+}

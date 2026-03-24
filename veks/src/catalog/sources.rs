@@ -98,6 +98,20 @@ impl CatalogSources {
     }
 }
 
+/// Read raw catalog entries from `catalogs.yaml` without resolving them.
+///
+/// Returns the list of strings exactly as written in the file.
+pub fn raw_catalog_entries(config_dir: &str) -> Vec<String> {
+    let dir = std::path::Path::new(config_dir);
+    let catalogs_yaml = dir.join("catalogs.yaml");
+    if !catalogs_yaml.is_file() { return Vec::new(); }
+    let content = match std::fs::read_to_string(&catalogs_yaml) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    serde_yaml::from_str(&content).unwrap_or_default()
+}
+
 /// Load `catalogs.yaml` from a config directory.
 ///
 /// The file contains a YAML list of strings, each a catalog location.

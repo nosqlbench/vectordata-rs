@@ -32,30 +32,37 @@ pub struct ExploreArgs {
 pub enum ExploreCommand {
     /// Unified vector space explorer — norms, distances, eigenvalues, PCA in one TUI
     Explore {
-        /// Dataset from catalog (three-tier completion: cached → names → profiles)
+        /// Dataset from catalog (e.g., img-search or img-search:default)
         #[arg(long, group = "input", add = ArgValueCompleter::new(dataset_completer))]
         dataset: Option<String>,
         /// Any data source: local file path or dataset:profile:facet
         #[arg(long, group = "input", add = ArgValueCompleter::new(source_completer))]
         source: Option<String>,
+        /// Profile name (used with --dataset; overrides profile in dataset:profile)
+        #[arg(long)]
+        profile: Option<String>,
         /// Number of vectors to sample
         #[arg(long, default_value = "50000")]
         sample: usize,
         /// Random seed
         #[arg(long, default_value = "42")]
         seed: u64,
-        /// Sampling mode
-        #[arg(long, default_value = "streaming", value_parser = parse_sample_mode)]
+        /// Sampling mode [streaming, clumped, sparse]
+        #[arg(long, default_value = "streaming", value_parser = parse_sample_mode,
+              add = ArgValueCompleter::new(shared::sample_mode_completer))]
         sample_mode: SampleMode,
     },
     /// Interactive data exploration shell for vector files
     Shell {
-        /// Dataset from catalog (three-tier completion: cached → names → profiles)
+        /// Dataset from catalog (e.g., img-search or img-search:default)
         #[arg(long, group = "input", add = ArgValueCompleter::new(dataset_completer))]
         dataset: Option<String>,
         /// Any data source: local file path or dataset:profile:facet
         #[arg(long, group = "input", add = ArgValueCompleter::new(source_completer))]
         source: Option<String>,
+        /// Profile name (used with --dataset; overrides profile in dataset:profile)
+        #[arg(long)]
+        profile: Option<String>,
 
         /// Trailing args passed as command options
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -64,8 +71,11 @@ pub enum ExploreCommand {
 }
 
 /// Resolve the data source from mutually exclusive --dataset / --source options.
-fn resolve_input(dataset: Option<String>, source: Option<String>) -> String {
-    match (dataset, source) {
+///
+/// When `--profile` is given with `--dataset`, it's appended as `dataset:profile`.
+/// If the dataset already contains a `:`, the explicit `--profile` overrides it.
+fn resolve_input(dataset: Option<String>, source: Option<String>, profile: Option<String>) -> String {
+    let base = match (dataset, source) {
         (Some(ds), None) => ds,
         (None, Some(src)) => src,
         (None, None) => {
@@ -73,6 +83,15 @@ fn resolve_input(dataset: Option<String>, source: Option<String>) -> String {
             std::process::exit(1);
         }
         (Some(_), Some(_)) => unreachable!("clap group ensures mutual exclusion"),
+    };
+
+    match profile {
+        Some(p) => {
+            // Strip any existing profile from the dataset name
+            let name = base.split(':').next().unwrap_or(&base);
+            format!("{}:{}", name, p)
+        }
+        None => base,
     }
 }
 
@@ -96,12 +115,12 @@ pub fn run(args: ExploreArgs) {
     }));
 
     match args.command {
-        ExploreCommand::Explore { dataset, source, sample, seed, sample_mode } => {
-            let src = resolve_input(dataset, source);
+        ExploreCommand::Explore { dataset, source, profile, sample, seed, sample_mode } => {
+            let src = resolve_input(dataset, source, profile);
             unified::run_interactive_explore(&src, sample, seed, sample_mode);
         }
-        ExploreCommand::Shell { dataset, source, args: extra } => {
-            let src = resolve_input(dataset, source);
+        ExploreCommand::Shell { dataset, source, profile, args: extra } => {
+            let src = resolve_input(dataset, source, profile);
             if extra.is_empty() {
                 data_shell::run_data_shell_interactive(&src);
             } else {

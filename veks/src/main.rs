@@ -38,7 +38,7 @@ enum Commands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    /// Generate shell completions — source <(veks completions --shell bash)
+    /// Generate shell completions — eval "$(veks completions)"
     Completions(cli::CompletionsArgs),
     /// Show detailed help for a pipeline command or command group
     Help(HelpArgs),
@@ -96,17 +96,34 @@ fn build_augmented_cli() -> clap::Command {
         }
     }
 
+    // Dynamically hide `datasets list` filter args that can't narrow the
+    // current result set any further. This must happen BEFORE shorthand
+    // cloning so the hidden args propagate to the root-level aliases.
+    let hidden_args = datasets::filter::hidden_list_args();
+    cmd = cmd.mut_subcommand("datasets", |datasets_cmd| {
+        datasets_cmd.mut_subcommand("list", |mut list_cmd| {
+            if hidden_args.contains(&"__disable_help") {
+                return clap::Command::new("list")
+                    .alias("ls")
+                    .disable_help_flag(true);
+            }
+            for id in &hidden_args {
+                list_cmd = list_cmd.mut_arg(*id, |arg| arg.hide(true));
+            }
+            list_cmd
+        })
+    });
+
     // Add hidden root-level aliases for leaf subcommands of groups so that
     // shorthand completions work: e.g., `veks config <TAB>` resolves
     // `config` to `datasets config` and offers its subcommands.
+    // This runs AFTER arg hiding so clones inherit the hidden state.
     {
         let shorthand_map = build_shorthand_map();
         for (leaf_name, group_name) in &shorthand_map {
-            // Skip if a root command already exists with this name
             if cmd.get_subcommands().any(|c| c.get_name() == leaf_name) {
                 continue;
             }
-            // Find the group's child command and clone it as a hidden root command
             let group_cmd = cmd.get_subcommands().find(|c| c.get_name() == group_name.as_str());
             if let Some(group_cmd) = group_cmd {
                 let child = group_cmd.get_subcommands().find(|c| c.get_name() == leaf_name.as_str());
@@ -117,25 +134,6 @@ fn build_augmented_cli() -> clap::Command {
             }
         }
     }
-
-    // Dynamically hide `datasets list` filter args that can't narrow the
-    // current result set any further.
-    cmd = cmd.mut_subcommand("datasets", |datasets_cmd| {
-        datasets_cmd.mut_subcommand("list", |mut list_cmd| {
-            let hidden = datasets::filter::hidden_list_args();
-            if hidden.contains(&"__disable_help") {
-                // Fully resolved — replace with an empty command so the
-                // completion engine offers nothing at all (not even `--`).
-                return clap::Command::new("list")
-                    .alias("ls")
-                    .disable_help_flag(true);
-            }
-            for id in &hidden {
-                list_cmd = list_cmd.mut_arg(*id, |arg| arg.hide(true));
-            }
-            list_cmd
-        })
-    });
     cmd
 }
 
@@ -341,16 +339,27 @@ fn subcommand_completion_context() -> Option<(String, String)> {
 
 /// Filter completion output to show only children of a specific group,
 /// with the group prefix stripped so they complete naturally.
-fn filter_subcommand_children(group: &str, prefix: &str, full_list: &str) -> String {
-    let group_prefix = format!("{} ", group);
+fn filter_subcommand_children(group: &str, prefix: &str, _full_list: &str) -> String {
     let mut result = String::new();
-    for line in full_list.lines() {
-        let cmd = line.split('\t').next().unwrap_or("");
-        if let Some(child) = cmd.strip_prefix(&group_prefix) {
-            if prefix.is_empty() || child.starts_with(prefix) {
-                // Emit child name only (strip group prefix) so bash completes correctly
-                let desc = line.split('\t').nth(1).unwrap_or("");
-                result.push_str(&format!("{}\t{}\n", child, desc));
+
+    if group == "pipeline" {
+        // Pipeline commands: build from registry (they use "group child" paths)
+        let registry = pipeline::registry::CommandRegistry::with_builtins();
+        for path in registry.command_paths() {
+            if prefix.is_empty() || path.starts_with(prefix) {
+                result.push_str(&format!("{}\t{}\n", path, path));
+            }
+        }
+    } else {
+        // Derive-based groups: walk the clap tree
+        let cmd = Veks::command();
+        if let Some(group_cmd) = cmd.get_subcommands().find(|c| c.get_name() == group) {
+            for child in group_cmd.get_subcommands() {
+                let name = child.get_name();
+                if prefix.is_empty() || name.starts_with(prefix) {
+                    let about = child.get_about().map(|s| s.to_string()).unwrap_or_default();
+                    result.push_str(&format!("{}\t{}\n", name, about));
+                }
             }
         }
     }
@@ -497,13 +506,10 @@ fn build_full_command_list() -> String {
         }
     }
 
-    // Pipeline commands from the registry — add both forms:
-    // 1. "group child" for shorthand completion (e.g., "transform extract")
-    // 2. "pipeline group child" for subcommand-level completion
+    // Pipeline commands from the registry (shorthand form only)
     let registry = pipeline::registry::CommandRegistry::with_builtins();
     for path in registry.command_paths() {
         lines.push(format!("{}\tpipeline: {}", path, path));
-        lines.push(format!("pipeline {}\t{}", path, path));
     }
 
     lines.join("\n") + "\n"

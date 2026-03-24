@@ -38,15 +38,15 @@ pub enum DatasetsCommand {
         configdir: String,
 
         /// Additional catalog directories, file paths, or HTTP URLs
-        #[arg(long)]
+        #[arg(long, add = ArgValueCompleter::new(catalog_completer))]
         catalog: Vec<String>,
 
         /// Catalog URLs or paths to use *instead* of configured catalogs
         #[arg(long = "at")]
         at: Vec<String>,
 
-        /// Output format: text, csv, json, yaml
-        #[arg(long = "output-format", short = 'f', default_value = "text")]
+        /// Output format
+        #[arg(long = "output-format", short = 'f', default_value = "text", value_parser = ["text", "csv", "json", "yaml"])]
         output_format: String,
 
         /// Show detailed information including attributes, tags, and views
@@ -57,27 +57,19 @@ pub enum DatasetsCommand {
         #[arg(long = "group-by", value_name = "KEY", value_parser = ["source", "profile", "metric"])]
         group_by: Option<String>,
 
-        /// Limit output to profiles matching this name (exact, case-insensitive)
-        #[arg(long, add = ArgValueCompleter::new(filter::profile_completer))]
-        profile: Option<String>,
-
-        /// Limit output to profiles matching this regex pattern
-        #[arg(long, add = ArgValueCompleter::new(filter::profile_completer))]
-        profile_regex: Option<String>,
+        /// Filter profiles by name (substring, regex, or glob)
+        #[arg(long = "matching-profile", add = ArgValueCompleter::new(filter::profile_completer))]
+        matching_profile: Option<String>,
 
         /// Select a single dataset:profile; fails if the filters are ambiguous
         #[arg(long, add = ArgValueCompleter::new(filter::select_completer))]
         select: Option<String>,
 
-        // -- Filter predicates (--with-* prefix) --
+        // -- Filter predicates --
 
-        /// Filter by dataset name (substring match, case-insensitive)
-        #[arg(long = "with-name", add = ArgValueCompleter::new(filter::name_completer))]
-        name: Option<String>,
-
-        /// Filter by dataset name (regex pattern)
-        #[arg(long = "with-name-regex", add = ArgValueCompleter::new(filter::name_completer))]
-        name_regex: Option<String>,
+        /// Filter by dataset name (substring, regex, or glob)
+        #[arg(long = "matching-name", add = ArgValueCompleter::new(filter::name_completer))]
+        matching_name: Option<String>,
 
         /// Filter: dataset must contain this facet/view
         #[arg(long = "with-facet", add = ArgValueCompleter::new(filter::facet_completer))]
@@ -87,13 +79,9 @@ pub enum DatasetsCommand {
         #[arg(long = "with-metric", add = ArgValueCompleter::new(filter::metric_completer))]
         metric: Option<String>,
 
-        /// Filter: description/notes/name contains this word (case-insensitive)
-        #[arg(long = "with-desc", add = ArgValueCompleter::new(filter::desc_completer))]
-        desc: Option<String>,
-
-        /// Filter: description/notes/name matches this regex pattern
-        #[arg(long = "with-desc-regex", add = ArgValueCompleter::new(filter::desc_completer))]
-        desc_regex: Option<String>,
+        /// Filter by description/notes/model (substring, regex, or glob)
+        #[arg(long = "matching-desc", add = ArgValueCompleter::new(filter::desc_completer))]
+        matching_desc: Option<String>,
 
         /// Filter: dataset has at least this many base vectors (supports K/M/B suffixes)
         #[arg(long = "with-min-size", add = ArgValueCompleter::new(filter::size_completer))]
@@ -157,16 +145,20 @@ pub enum DatasetsCommand {
     },
     /// Download and cache dataset facets locally
     Prebuffer {
-        /// Dataset specifier: dataset:profile from catalog
+        /// Dataset name or dataset:profile from catalog
         #[arg(long, add = ArgValueCompleter::new(crate::explore::shared::dataset_completer))]
         dataset: String,
+
+        /// Profile name (overrides profile in dataset:profile)
+        #[arg(long)]
+        profile: Option<String>,
 
         /// Configuration directory containing catalogs.yaml
         #[arg(long, default_value = "~/.config/vectordata")]
         configdir: String,
 
         /// Additional catalog directories, file paths, or HTTP URLs
-        #[arg(long)]
+        #[arg(long, add = ArgValueCompleter::new(catalog_completer))]
         catalog: Vec<String>,
 
         /// Catalog URLs or paths to use *instead* of configured catalogs
@@ -222,14 +214,11 @@ pub fn run(args: DatasetsArgs) {
             output_format,
             verbose,
             group_by,
-            name,
-            name_regex,
+            matching_name,
             facet,
             metric,
-            desc,
-            desc_regex,
-            profile,
-            profile_regex,
+            matching_desc,
+            matching_profile,
             select,
             min_size,
             max_size,
@@ -247,14 +236,16 @@ pub fn run(args: DatasetsArgs) {
                 cache::run(cache_dir.as_deref(), verbose);
                 return;
             }
-            // Parse size values
+            // Normalize glob patterns to regex
+            let name = matching_name.map(|p| filter::normalize_match_pattern(&p, "--matching-name"));
+            let desc = matching_desc.map(|p| filter::normalize_match_pattern(&p, "--matching-desc"));
+            let profile_pat = matching_profile.map(|p| filter::normalize_match_pattern(&p, "--matching-profile"));
+
             let filter = filter::DatasetFilter {
                 name,
-                name_regex,
                 facet,
                 metric,
                 desc,
-                desc_regex,
                 min_size: min_size.as_deref().map(filter::parse_size).transpose()
                     .unwrap_or_else(|e| { eprintln!("ERROR: --with-min-size: {}", e); std::process::exit(1); }),
                 max_size: max_size.as_deref().map(filter::parse_size).transpose()
@@ -270,7 +261,7 @@ pub fn run(args: DatasetsArgs) {
                 data_max: data_max.as_deref().map(filter::parse_bytes).transpose()
                     .unwrap_or_else(|e| { eprintln!("ERROR: --with-data-max: {}", e); std::process::exit(1); }),
             };
-            let profile_view = filter::ProfileView::new(profile, profile_regex);
+            let profile_view = filter::ProfileView::new(profile_pat);
             list::run(&configdir, &catalog, &at, &output_format, verbose, group_by.as_deref(), &filter, &profile_view, select.as_deref());
         }
         DatasetsCommand::Curlify { path, output } => {
@@ -279,8 +270,12 @@ pub fn run(args: DatasetsArgs) {
         DatasetsCommand::Config { command } => {
             run_config_command(command);
         }
-        DatasetsCommand::Prebuffer { dataset, configdir, catalog, at, cache_dir } => {
-            prebuffer::run(&dataset, &configdir, &catalog, &at, cache_dir.as_deref());
+        DatasetsCommand::Prebuffer { dataset, profile, configdir, catalog, at, cache_dir } => {
+            let ds = match profile {
+                Some(p) => format!("{}:{}", dataset.split(':').next().unwrap_or(&dataset), p),
+                None => dataset,
+            };
+            prebuffer::run(&ds, &configdir, &catalog, &at, cache_dir.as_deref());
         }
     }
 }
@@ -347,6 +342,19 @@ fn run_config_command(command: ConfigSubcommand) {
         eprintln!("Error: {}", result.message);
         std::process::exit(1);
     }
+}
+
+/// Completer for `--catalog`: suggests configured catalog sources from catalogs.yaml.
+fn catalog_completer(current: &std::ffi::OsStr) -> Vec<clap_complete::CompletionCandidate> {
+    let prefix = current.to_string_lossy();
+    let config_dir = crate::catalog::sources::expand_tilde(
+        crate::catalog::sources::DEFAULT_CONFIG_DIR,
+    );
+    let entries = crate::catalog::sources::raw_catalog_entries(&config_dir);
+    entries.iter()
+        .filter(|e| prefix.is_empty() || e.starts_with(prefix.as_ref()))
+        .map(|e| clap_complete::CompletionCandidate::new(e.as_str()))
+        .collect()
 }
 
 /// Manage catalog sources in `~/.config/vectordata/catalogs.yaml`.
