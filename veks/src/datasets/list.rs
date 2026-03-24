@@ -44,9 +44,10 @@ pub fn run(
 
     if sources.is_empty() {
         eprintln!("No catalog sources configured.");
-        eprintln!(
-            "Create ~/.config/vectordata/catalogs.yaml or use --catalog/--at to specify locations."
-        );
+        eprintln!("Add a catalog with:");
+        eprintln!("  veks datasets config add-catalog <URL-or-path>");
+        eprintln!();
+        eprintln!("Or use --catalog/--at for one-off access.");
         std::process::exit(1);
     }
 

@@ -20,8 +20,27 @@
 use clap::Args;
 use clap_complete::Shell;
 
-/// Arguments for the completions subcommand
+/// Generate shell completions for veks.
+///
+/// Source the output in your shell profile for tab completion:
+///
+///   bash:  source <(veks completions --shell bash)
+///   zsh:   source <(veks completions --shell zsh)
+///   fish:  veks completions --shell fish | source
 #[derive(Args)]
+#[command(after_long_help = "\
+EXAMPLES:
+  # Add to ~/.bashrc for persistent completions:
+  echo 'source <(veks completions --shell bash)' >> ~/.bashrc
+
+  # Or source directly in the current session:
+  source <(veks completions --shell bash)
+
+  # For zsh (add to ~/.zshrc):
+  source <(veks completions --shell zsh)
+
+  # For fish (add to config.fish):
+  veks completions --shell fish | source")]
 pub struct CompletionsArgs {
     /// Shell to generate completions for (bash, zsh, fish, elvish, powershell)
     #[arg(long, value_enum)]

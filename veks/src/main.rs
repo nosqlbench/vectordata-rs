@@ -38,7 +38,7 @@ enum Commands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    /// Generate shell completions
+    /// Generate shell completions — source <(veks completions --shell bash)
     Completions(cli::CompletionsArgs),
     /// Show detailed help for a pipeline command or command group
     Help(HelpArgs),
