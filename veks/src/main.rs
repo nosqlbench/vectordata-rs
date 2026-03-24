@@ -96,6 +96,28 @@ fn build_augmented_cli() -> clap::Command {
         }
     }
 
+    // Add hidden root-level aliases for leaf subcommands of groups so that
+    // shorthand completions work: e.g., `veks config <TAB>` resolves
+    // `config` to `datasets config` and offers its subcommands.
+    {
+        let shorthand_map = build_shorthand_map();
+        for (leaf_name, group_name) in &shorthand_map {
+            // Skip if a root command already exists with this name
+            if cmd.get_subcommands().any(|c| c.get_name() == leaf_name) {
+                continue;
+            }
+            // Find the group's child command and clone it as a hidden root command
+            let group_cmd = cmd.get_subcommands().find(|c| c.get_name() == group_name.as_str());
+            if let Some(group_cmd) = group_cmd {
+                let child = group_cmd.get_subcommands().find(|c| c.get_name() == leaf_name.as_str());
+                if let Some(child) = child {
+                    let hidden = child.clone().hide(true);
+                    cmd = cmd.subcommand(hidden);
+                }
+            }
+        }
+    }
+
     // Dynamically hide `datasets list` filter args that can't narrow the
     // current result set any further.
     cmd = cmd.mut_subcommand("datasets", |datasets_cmd| {
@@ -300,10 +322,12 @@ fn filter_commands_by_prefix(prefix: &str) -> String {
     for line in full.lines() {
         // Each line is "group child\tdescription" or "leaf\tdescription"
         let cmd = line.split('\t').next().unwrap_or("");
-        // Match against the full command string or the first word (group name).
-        // Do NOT match interior words — "dataset" should not match "generate dataset".
+        // Match against the full command string, the first word (group name),
+        // or the last word (leaf command name) — since shorthands let users
+        // type the leaf name directly (e.g., "config" → "datasets config").
         let first_word = cmd.split(' ').next().unwrap_or("");
-        if cmd.starts_with(prefix) || first_word.starts_with(prefix) {
+        let last_word = cmd.split(' ').last().unwrap_or("");
+        if cmd.starts_with(prefix) || first_word.starts_with(prefix) || last_word.starts_with(prefix) {
             matches.push_str(line);
             matches.push('\n');
         }

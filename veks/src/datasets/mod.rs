@@ -54,7 +54,7 @@ pub enum DatasetsCommand {
         verbose: bool,
 
         /// Group output by: source, profile, or metric (text format only)
-        #[arg(long = "group-by", value_name = "KEY")]
+        #[arg(long = "group-by", value_name = "KEY", value_parser = ["source", "profile", "metric"])]
         group_by: Option<String>,
 
         /// Limit output to profiles matching this name (exact, case-insensitive)
