@@ -3982,7 +3982,7 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
 name = "slabtastic"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "clap",
  "clap_complete",
@@ -4861,7 +4861,7 @@ checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
 
 [[package]]
 name = "vectordata"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "byteorder",
@@ -4884,7 +4884,7 @@ dependencies = [
 
 [[package]]
 name = "veks"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "arrow",
  "atty",
