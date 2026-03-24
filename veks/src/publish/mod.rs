@@ -63,22 +63,7 @@ pub struct PublishArgs {
     pub no_check: bool,
 }
 
-/// Default exclusion patterns for publishing.
-///
-/// All hidden files and directories (dot-prefixed) are categorically
-/// excluded — they are local workspace state that must never appear
-/// in the published dataset. The `.*` and `*/.*` patterns handle
-/// top-level and nested hidden entries respectively.
-const DEFAULT_EXCLUDES: &[&str] = &[
-    ".*",
-    "*/.*",
-    "_*",
-    "*/_*",
-    "*.tmp",
-    "*.partial",
-    "__pycache__/*",
-    "*.pyc",
-];
+use crate::filters;
 
 /// Entry point for `veks publish`.
 pub fn run(args: PublishArgs) {
@@ -120,6 +105,38 @@ pub fn run(args: PublishArgs) {
     let publish_root = publish_file.parent().unwrap().to_path_buf();
     let s3_url = parsed.url;
 
+    // Check for parent publish roots — warn if this publish root is interior
+    // to another (the user may intend to publish from the outer root instead)
+    {
+        let abs_root = std::fs::canonicalize(&publish_root).unwrap_or_else(|_| publish_root.clone());
+        let mut walk = abs_root.clone();
+        if walk.pop() { // skip self
+            loop {
+                let candidate = walk.join(".publish_url");
+                if candidate.is_file() {
+                    if let Ok(outer_content) = std::fs::read_to_string(&candidate) {
+                        if let Ok(outer) = crate::check::publish_url::parse_publish_url(&outer_content) {
+                            println!("{}", crate::term::warn("Note: this publish root is interior to another:"));
+                            println!("  {} {} → {}",
+                                crate::term::info("outer:"),
+                                crate::check::rel_display(&walk),
+                                crate::term::info(&outer.url));
+                            println!("  {} {} → {}",
+                                crate::term::info("local:"),
+                                crate::check::rel_display(&publish_root),
+                                crate::term::info(&s3_url));
+                            println!("  Publishing from the {} publish root.",
+                                crate::term::bold("local"));
+                            println!();
+                        }
+                    }
+                    break; // only report the nearest outer root
+                }
+                if !walk.pop() { break; }
+            }
+        }
+    }
+
     // Run pre-flight checks unless --no-check
     if !args.no_check && !args.dry_run {
         let check_ok = run_preflight_checks(&directory);
@@ -131,7 +148,11 @@ pub fn run(args: PublishArgs) {
         }
     }
 
-    // Enumerate publishable files from the publish root (preserves hierarchy)
+    // Enumerate publishable datasets and files from the publish root
+    let mut dataset_dirs: Vec<PathBuf> = Vec::new();
+    find_dataset_dirs(&publish_root, &mut dataset_dirs);
+    dataset_dirs.sort();
+
     let publishable = enumerate_publishable_files(&publish_root);
     let total_size: u64 = publishable.iter()
         .filter_map(|p| std::fs::metadata(p).ok())
@@ -142,6 +163,24 @@ pub fn run(args: PublishArgs) {
     println!("{}", crate::term::bold("Publish summary:"));
     println!("  Source:      {}", crate::check::rel_display(&publish_root));
     println!("  Destination: {}", crate::term::info(&s3_url));
+    println!();
+    println!("  Datasets ({}):", dataset_dirs.len());
+    for ds_dir in &dataset_dirs {
+        let rel = ds_dir.strip_prefix(&publish_root)
+            .map(|r| r.to_string_lossy().to_string())
+            .unwrap_or_else(|_| crate::check::rel_display(ds_dir));
+        // Count files within this dataset
+        let ds_file_count = publishable.iter()
+            .filter(|f| f.starts_with(ds_dir))
+            .count();
+        let ds_size: u64 = publishable.iter()
+            .filter(|f| f.starts_with(ds_dir))
+            .filter_map(|f| std::fs::metadata(f).ok())
+            .map(|m| m.len())
+            .sum();
+        println!("    {} ({} files, {})", rel, ds_file_count, format_size(ds_size));
+    }
+    println!();
     println!("  Files:       {} to sync, {} total",
         publishable.len(),
         format_size(total_size),
@@ -150,10 +189,6 @@ pub fn run(args: PublishArgs) {
         println!("  Delete:      enabled (remote-only objects will be removed)");
     } else {
         println!("  Delete:      disabled");
-    }
-    println!("  Excludes:    {}", DEFAULT_EXCLUDES.join(", "));
-    if !args.exclude.is_empty() {
-        println!("  Extra excl:  {}", args.exclude.join(", "));
     }
     println!();
 
@@ -186,69 +221,21 @@ pub fn run(args: PublishArgs) {
         }
     };
 
-    // Build exclude patterns for directories not on any dataset path.
-    // This prevents non-dataset content (source data, scripts, tools)
-    // from being synced to the remote store.
-    let mut extra_excludes: Vec<String> = args.exclude.clone();
-    {
-        let mut dataset_dirs: Vec<PathBuf> = Vec::new();
-        find_dataset_dirs(&publish_root, &mut dataset_dirs);
-        // Collect all directory names at each level that are on a dataset path
-        let mut on_path_dirs: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
-        for ds_dir in &dataset_dirs {
-            let mut current = ds_dir.clone();
-            loop {
-                on_path_dirs.insert(current.clone());
-                if current == publish_root { break; }
-                if !current.pop() { break; }
-            }
-        }
-        // Exclude directories not on any path to a dataset. Stop recursing
-        // at dataset directories — everything inside a dataset is included.
-        fn add_excludes_for_level(
-            dir: &Path, root: &Path,
-            on_path: &std::collections::HashSet<PathBuf>,
-            ds_dirs: &[PathBuf],
-            excludes: &mut Vec<String>,
-        ) {
-            // If this directory IS a dataset directory, don't exclude anything inside it
-            if dir.join("dataset.yaml").exists() {
-                return;
-            }
-
-            if let Ok(entries) = std::fs::read_dir(dir) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    let name = entry.file_name();
-                    let name_str = name.to_string_lossy();
-                    if !path.is_dir() || is_excluded_dir(&name_str) {
-                        continue;
-                    }
-                    if !on_path.contains(&path) {
-                        // Not on any dataset path — exclude it
-                        let rel = path.strip_prefix(root)
-                            .map(|r| r.to_string_lossy().to_string())
-                            .unwrap_or_else(|_| name_str.to_string());
-                        excludes.push(format!("{}/*", rel));
-                    } else {
-                        // On path — recurse (will stop at dataset dirs)
-                        add_excludes_for_level(&path, root, on_path, ds_dirs, excludes);
-                    }
-                }
-            }
-        }
-        add_excludes_for_level(&publish_root, &publish_root, &on_path_dirs, &dataset_dirs, &mut extra_excludes);
-    }
+    // Build the include list from enumerate_publishable_files — the single
+    // source of truth for what gets published. The sync uses exclude-all +
+    // include-only, so no separate exclude logic is needed.
+    let include_files: Vec<String> = publishable.iter()
+        .filter_map(|p| p.strip_prefix(&publish_root).ok())
+        .map(|r| r.to_string_lossy().to_string())
+        .collect();
 
     let sync_opts = SyncOptions {
         dry_run: args.dry_run,
         delete: args.delete,
         size_only: args.size_only,
-        exclude: &extra_excludes,
-        include: &args.include,
+        include_files: &include_files,
         profile: args.profile.as_deref(),
         endpoint_url: args.endpoint_url.as_deref(),
-        default_excludes: DEFAULT_EXCLUDES,
     };
 
     let exit_code = transport.sync(&publish_root, &s3_url, &sync_opts);
@@ -339,27 +326,11 @@ fn find_dataset_dirs(dir: &Path, result: &mut Vec<PathBuf>) {
             let path = entry.path();
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
-            if path.is_dir() && !name_str.starts_with('.') && !name_str.starts_with('_') {
+            if path.is_dir() && !filters::is_excluded_dir(&name_str) {
                 find_dataset_dirs(&path, result);
             }
         }
     }
-}
-
-/// Check if a file should be excluded by name.
-fn is_excluded_file(name: &str) -> bool {
-    name.starts_with('.')
-        || name.starts_with('_')
-        || name.ends_with(".tmp")
-        || name.ends_with(".partial")
-        || name.ends_with(".pyc")
-}
-
-/// Check if a directory should be skipped entirely.
-/// Hidden dirs (.) and underscore-prefixed dirs (_) are local workspace
-/// state and never published.
-fn is_excluded_dir(name: &str) -> bool {
-    name.starts_with('.') || name.starts_with('_') || name == "__pycache__"
 }
 
 fn enumerate_recursive(
@@ -382,7 +353,7 @@ fn enumerate_recursive(
         let name_str = name.to_string_lossy();
 
         if path.is_dir() {
-            if is_excluded_dir(&name_str) {
+            if filters::is_excluded_dir(&name_str) {
                 continue;
             }
             if inside_dataset {
@@ -393,10 +364,13 @@ fn enumerate_recursive(
                 enumerate_recursive(root, &path, files, on_path_dirs, dataset_dirs);
             }
             // else: not on any dataset path — skip silently
-        } else if !is_excluded_file(&name_str) {
-            if inside_dataset || on_path_dirs.contains(dir) {
-                // File is inside a dataset or in an on-path directory
-                // (catalog files at intermediate levels)
+        } else if !filters::is_excluded_file(&name_str) {
+            if inside_dataset {
+                // Inside a dataset — include all non-excluded files
+                files.push(path);
+            } else if on_path_dirs.contains(dir) && filters::is_intermediate_publishable(&name_str) {
+                // On-path intermediate directory — only infrastructure files
+                // (catalogs and their merkle companions)
                 files.push(path);
             }
         }
@@ -568,6 +542,32 @@ mod tests {
     }
 
     #[test]
+    fn excludes_data_files_at_intermediate_directories() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // Infrastructure at intermediate level — included
+        touch(&root.join("group/catalog.json"));
+        touch(&root.join("group/catalog.yaml"));
+        touch(&root.join("group/catalog.json.mref"));
+        // Data file at intermediate level — NOT a dataset, must be excluded
+        touch(&root.join("group/base_test.mvec"));
+        touch(&root.join("group/stray_data.fvec"));
+        // Actual dataset content — included
+        write_dataset_yaml(&root.join("group/ds"), true);
+        touch(&root.join("group/ds/base.fvec"));
+        let files = publishable_rel(root);
+        // Infrastructure files at intermediate level
+        assert!(files.contains(&"group/catalog.json".to_string()));
+        assert!(files.contains(&"group/catalog.yaml".to_string()));
+        assert!(files.contains(&"group/catalog.json.mref".to_string()));
+        // Dataset content
+        assert!(files.contains(&"group/ds/base.fvec".to_string()));
+        // Data files at intermediate level must NOT be published
+        assert!(!files.iter().any(|f| f.contains("base_test")));
+        assert!(!files.iter().any(|f| f.contains("stray_data")));
+    }
+
+    #[test]
     fn excludes_directories_not_on_dataset_path() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
@@ -659,33 +659,6 @@ mod tests {
         touch(&root.join("subdir/another.bin"));
         let files = enumerate_publishable_files(root);
         assert!(files.is_empty());
-    }
-
-    // ── is_excluded_file unit tests ───────────────────────────────
-
-    #[test]
-    fn test_is_excluded_file() {
-        assert!(is_excluded_file(".hidden"));
-        assert!(is_excluded_file("_source.mvec"));
-        assert!(is_excluded_file("data.tmp"));
-        assert!(is_excluded_file("data.partial"));
-        assert!(is_excluded_file("module.pyc"));
-        assert!(!is_excluded_file("dataset.yaml"));
-        assert!(!is_excluded_file("base.fvec"));
-        assert!(!is_excluded_file("catalog.json"));
-        assert!(!is_excluded_file("neighbor_indices.ivec"));
-    }
-
-    #[test]
-    fn test_is_excluded_dir() {
-        assert!(is_excluded_dir(".cache"));
-        assert!(is_excluded_dir(".git"));
-        assert!(is_excluded_dir("__pycache__"));
-        assert!(is_excluded_dir("_base_img_emb"));
-        assert!(is_excluded_dir("_metadata"));
-        assert!(is_excluded_dir("_source"));
-        assert!(!is_excluded_dir("profiles"));
-        assert!(!is_excluded_dir("datasets"));
     }
 
     // ── Access level rules ────────────────────────────────────────

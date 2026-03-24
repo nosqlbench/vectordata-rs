@@ -212,13 +212,20 @@ fn local_file_candidates(prefix: &str) -> Vec<CompletionCandidate> {
     candidates
 }
 
-/// Tier 1 catalog: datasets that exist in the local cache directory.
+/// Tier 1 catalog: datasets that exist in the local cache AND are also
+/// present in configured catalogs. Cached datasets not in any catalog
+/// are stale/orphaned and should not be suggested.
 fn cached_dataset_candidates(prefix: &str) -> Vec<CompletionCandidate> {
     if prefix.contains('/') || prefix.contains('.') {
         return Vec::new();
     }
 
     let cache_dir = crate::pipeline::commands::config::configured_cache_dir();
+    let catalog_entries = crate::datasets::filter::completion_entries();
+    let catalog_names: std::collections::HashSet<String> = catalog_entries.iter()
+        .map(|e| e.name.to_lowercase())
+        .collect();
+
     let mut candidates = Vec::new();
     let prefix_lower = prefix.to_lowercase();
 
@@ -226,7 +233,10 @@ fn cached_dataset_candidates(prefix: &str) -> Vec<CompletionCandidate> {
         for entry in entries.flatten() {
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
-            if name_str.to_lowercase().starts_with(&prefix_lower) && entry.path().is_dir() {
+            if name_str.to_lowercase().starts_with(&prefix_lower)
+                && entry.path().is_dir()
+                && catalog_names.contains(&name_str.to_lowercase())
+            {
                 candidates.push(
                     CompletionCandidate::new(name_str.to_string())
                         .help(Some("cached".into()))

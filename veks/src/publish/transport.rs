@@ -6,6 +6,11 @@
 //! Each supported URL scheme (`s3://`, etc.) has a corresponding transport
 //! implementation that knows how to synchronize a local directory to the
 //! remote destination.
+//!
+//! The sync uses an **include-only** strategy: exclude everything by default,
+//! then explicitly include only the files that `enumerate_publishable_files`
+//! identified. This ensures the sync matches the enumeration exactly —
+//! one code path decides what's publishable.
 
 use std::path::Path;
 use std::process::Command;
@@ -15,11 +20,10 @@ pub struct SyncOptions<'a> {
     pub dry_run: bool,
     pub delete: bool,
     pub size_only: bool,
-    pub exclude: &'a [String],
-    pub include: &'a [String],
+    /// Relative paths of files to include (from `enumerate_publishable_files`).
+    pub include_files: &'a [String],
     pub profile: Option<&'a str>,
     pub endpoint_url: Option<&'a str>,
-    pub default_excludes: &'a [&'a str],
 }
 
 /// A publish transport that can sync a local directory to a remote URL.
@@ -38,14 +42,12 @@ impl PublishTransport for S3Transport {
         cmd.arg(directory.to_string_lossy().as_ref());
         cmd.arg(url);
 
-        for pattern in opts.default_excludes {
-            cmd.arg("--exclude").arg(pattern);
-        }
-        for pattern in opts.exclude {
-            cmd.arg("--exclude").arg(pattern);
-        }
-        for pattern in opts.include {
-            cmd.arg("--include").arg(pattern);
+        // Exclude everything by default, then include only publishable files.
+        // This is the inverse of building exclusion patterns — simpler and
+        // guaranteed to match enumerate_publishable_files exactly.
+        cmd.arg("--exclude").arg("*");
+        for path in opts.include_files {
+            cmd.arg("--include").arg(path);
         }
 
         if opts.delete { cmd.arg("--delete"); }
@@ -67,7 +69,8 @@ impl PublishTransport for S3Transport {
             Ok(status) => {
                 if status.success() {
                     println!();
-                    println!("Publish complete.");
+                    println!("Publish complete: {} -> {}",
+                        crate::check::rel_display(directory), url);
                     0
                 } else {
                     let code = status.code().unwrap_or(1);

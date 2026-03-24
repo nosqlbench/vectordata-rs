@@ -9,14 +9,7 @@
 use std::path::{Path, PathBuf};
 
 use super::CheckResult;
-
-/// Infrastructure files that don't need merkle protection.
-/// These are small, frequently regenerated metadata files.
-const MERKLE_SKIP_FILES: &[&str] = &[
-    "dataset.yaml", "dataset.yml", "dataset.log",
-    "catalog.json", "catalog.yaml",
-    "variables.yaml",
-];
+use crate::filters;
 
 /// Check merkle (.mref) coverage for publishable data files.
 pub fn check(_root: &Path, publishable: &[PathBuf], threshold: u64) -> CheckResult {
@@ -26,14 +19,8 @@ pub fn check(_root: &Path, publishable: &[PathBuf], threshold: u64) -> CheckResu
     let mut checked = 0u64;
 
     for file in publishable {
-        // Skip .mref files themselves
-        if file.extension().map(|e| e == "mref").unwrap_or(false) {
-            continue;
-        }
-
-        // Skip infrastructure/metadata files that don't need merkle protection
         let fname = file.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-        if MERKLE_SKIP_FILES.contains(&fname.as_str()) {
+        if filters::is_merkle_exempt(&fname) {
             continue;
         }
 

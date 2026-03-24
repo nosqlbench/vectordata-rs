@@ -398,6 +398,60 @@ fn check_publish_child_overrides_parent() {
 }
 
 #[test]
+fn check_publish_endpoint_consistency_pass() {
+    // Two .publish_url files that resolve to the same endpoint for the dataset
+    let dir = tempfile::tempdir().unwrap();
+    let group = dir.path().join("group");
+    let ds = group.join("my-dataset");
+    std::fs::create_dir_all(&ds).unwrap();
+    std::fs::write(ds.join("dataset.yaml"), "name: test\nprofiles: {}\n").unwrap();
+
+    // Root: s3://bucket/ — dataset at group/my-dataset/ → s3://bucket/group/my-dataset/
+    std::fs::write(dir.path().join(".publish_url"), "s3://bucket/\n").unwrap();
+    // Group: s3://bucket/group/ — dataset at my-dataset/ → s3://bucket/group/my-dataset/
+    std::fs::write(group.join(".publish_url"), "s3://bucket/group/\n").unwrap();
+
+    let ds_yaml = ds.join("dataset.yaml");
+    let result = check::publish_url::check(dir.path(), &[ds_yaml]);
+    assert!(result.passed, "consistent endpoints should pass: {:?}", result.messages);
+}
+
+#[test]
+fn check_publish_endpoint_consistency_fail() {
+    // Two .publish_url files that resolve to DIFFERENT endpoints
+    let dir = tempfile::tempdir().unwrap();
+    let group = dir.path().join("group");
+    let ds = group.join("my-dataset");
+    std::fs::create_dir_all(&ds).unwrap();
+    std::fs::write(ds.join("dataset.yaml"), "name: test\nprofiles: {}\n").unwrap();
+
+    // Root: s3://bucket-a/ — dataset → s3://bucket-a/group/my-dataset/
+    std::fs::write(dir.path().join(".publish_url"), "s3://bucket-a/\n").unwrap();
+    // Group: s3://bucket-b/foo/ — dataset → s3://bucket-b/foo/my-dataset/
+    std::fs::write(group.join(".publish_url"), "s3://bucket-b/foo/\n").unwrap();
+
+    let ds_yaml = ds.join("dataset.yaml");
+    let result = check::publish_url::check(dir.path(), &[ds_yaml]);
+    assert!(!result.passed, "inconsistent endpoints should fail: {:?}", result.messages);
+    let msg = result.messages.join(" ");
+    assert!(msg.contains("inconsistent"), "should mention inconsistency: {}", msg);
+}
+
+#[test]
+fn check_publish_single_publish_url_always_consistent() {
+    // Only one .publish_url — always consistent (no conflict possible)
+    let dir = tempfile::tempdir().unwrap();
+    let ds = dir.path().join("my-dataset");
+    std::fs::create_dir_all(&ds).unwrap();
+    std::fs::write(ds.join("dataset.yaml"), "name: test\nprofiles: {}\n").unwrap();
+    std::fs::write(dir.path().join(".publish_url"), "s3://bucket/\n").unwrap();
+
+    let ds_yaml = ds.join("dataset.yaml");
+    let result = check::publish_url::check(dir.path(), &[ds_yaml]);
+    assert!(result.passed, "single publish_url should pass: {:?}", result.messages);
+}
+
+#[test]
 fn check_merkle_all_covered() {
     let dir = tempfile::tempdir().unwrap();
     let big_file = dir.path().join("big.fvec");

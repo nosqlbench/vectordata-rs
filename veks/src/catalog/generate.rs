@@ -115,80 +115,80 @@ pub fn run(input: &Path, basename: &str, for_publish_url: bool, update: bool) {
         std::process::exit(1);
     }
 
-    // Resolve the effective scan root based on mode.
+    // Resolve the effective scan root.
     //
-    // Priority:
-    // 1. --for-publish-url: walk up to .publish_url
-    // 2. .catalog_root in parent path: use that directory automatically
-    // 3. fall back to input directory
-    let scan_root = if for_publish_url {
-        // Walk up to find .publish_url, use its parent as root
+    // Priority: always prefer the outermost enclosing publish root so that
+    // catalogs are generated for the full publish hierarchy. Inner publish
+    // roots are naturally included because we scan downward from the root.
+    //
+    // 1. Walk up from input_path (including itself) to find .publish_url
+    // 2. If not found above, scan immediate children for .publish_url
+    // 3. No .publish_url found → refuse to run
+    let scan_root = {
+        // Walk up from input_path to find enclosing .publish_url
         match crate::check::publish_url::find_publish_file(&input_path) {
-            Some(publish_file) => {
-                let root = publish_file.parent().unwrap().to_path_buf();
-                eprintln!(
-                    "Found {} — scanning from publish root: {}",
-                    rel(&publish_file),
-                    rel(&root)
-                );
+            Some(pf) => {
+                let root = pf.parent().unwrap().to_path_buf();
+                let root = if root.is_absolute() { root } else { cwd.join(&root) };
+                // Canonicalize to resolve any ".." components for reliable path comparisons
+                let root = std::fs::canonicalize(&root).unwrap_or(root);
+                eprintln!("Publish root: {} (from {})", rel(&root), rel(&pf));
                 root
             }
             None => {
-                eprintln!("error: --for-publish-url specified but no .publish_url found above {}", rel(&input_path));
-                std::process::exit(1);
+                // No .publish_url at or above input_path — scan children
+                let mut child_roots: Vec<PathBuf> = Vec::new();
+                if let Ok(entries) = std::fs::read_dir(&input_path) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.is_dir() && path.join(".publish_url").exists() {
+                            child_roots.push(path);
+                        }
+                    }
+                }
+
+                if !child_roots.is_empty() {
+                    // Found publish roots in children — generate catalogs for each
+                    child_roots.sort();
+                    for child_root in &child_roots {
+                        eprintln!("Found child publish root: {}", rel(child_root));
+                        run(child_root, basename, for_publish_url, update);
+                    }
+                    // Also generate a top-level catalog covering all children
+                    eprintln!("Generating top-level catalog at {}", rel(&input_path));
+                    input_path.clone()
+                } else {
+                    eprintln!("error: no .publish_url found at, within, or above {}", rel(&input_path));
+                    eprintln!("  Catalog generation requires a publish tree.");
+                    eprintln!("  Create one with: echo 's3://bucket/prefix/' > .publish_url");
+                    std::process::exit(1);
+                }
             }
         }
-    } else if let Some(catalog_root) = find_catalog_root(&input_path) {
-        // .catalog_root found — use that directory as the scan root and
-        // generate catalogs at every level from there down.
-        eprintln!(
-            "Found {} — catalog root: {}",
-            rel(&catalog_root.join(CATALOG_ROOT_FILE)),
-            rel(&catalog_root)
-        );
-        catalog_root
-    } else {
-        input_path.clone()
     };
 
-    // When .catalog_root was detected, we always generate the full hierarchy
-    // from that root (not just existing catalogs), so override update mode.
-    let catalog_root_detected = !for_publish_url && find_catalog_root(&input_path).is_some();
-    let effective_update = if catalog_root_detected { false } else { update };
+    let effective_update = update;
 
-    // Detect .publish_url for warning purposes.
-    // When --for-publish-url is active or .catalog_root was detected,
-    // we're already scanning from an appropriate root — no warning needed.
-    // Otherwise, check if the publish root is above our scan root.
-    if !for_publish_url && !catalog_root_detected {
-        if let Some(publish_file) = crate::check::publish_url::find_publish_file(&input_path) {
-            let publish_root = publish_file.parent().unwrap();
-            if publish_root != scan_root {
-                eprintln!("WARNING: .publish_url found at {}", rel(&publish_file));
-                eprintln!("  The publish root is above the scan directory.");
-                if effective_update {
-                    eprintln!("  With --update (default), only existing catalog files will be refreshed.");
-                    eprintln!("  Parent directories between {} and {} that lack catalogs will remain uncovered.", rel(&scan_root), rel(publish_root));
-                } else {
-                    eprintln!("  Generating catalogs only from {} will leave parent catalogs stale.", rel(&scan_root));
-                }
-                eprintln!("  Use --for-publish-url to regenerate the full publish hierarchy,");
-                eprintln!("  or place a .catalog_root file at the desired catalog top level.");
-                eprintln!();
-            }
-        }
-    }
+    // Scan input_path (not scan_root) for datasets — the user pointed at
+    // this directory. scan_root is only the upper bound for catalog placement.
+    eprintln!("Scanning {} for datasets...", rel(&input_path));
 
-    eprintln!("Scanning {} for datasets...", rel(&scan_root));
-
-    let mut datasets: Vec<DiscoveredDataset> = Vec::new();
-    walk_for_datasets(&scan_root, &mut datasets, &cwd);
+    let mut all_datasets: Vec<DiscoveredDataset> = Vec::new();
+    walk_for_datasets(&input_path, &mut all_datasets, &cwd);
+    // Only include publishable datasets (those with .publish sentinel)
+    let datasets: Vec<DiscoveredDataset> = all_datasets.into_iter()
+        .filter(|ds| {
+            let ds_dir = ds.yaml_path.parent().unwrap_or(std::path::Path::new("."));
+            ds_dir.join(".publish").exists()
+        })
+        .collect();
+    let mut datasets = datasets;
     datasets.sort_by(|a, b| a.yaml_path.cmp(&b.yaml_path));
 
-    eprintln!("Found {} dataset(s)", datasets.len());
+    eprintln!("Found {} publishable dataset(s)", datasets.len());
 
     if datasets.is_empty() {
-        eprintln!("No datasets found.");
+        eprintln!("No publishable datasets found (no .publish sentinels).");
         return;
     }
 
@@ -304,10 +304,9 @@ pub fn run(input: &Path, basename: &str, for_publish_url: bool, update: bool) {
 /// When a directory contains `dataset.yaml`, it is treated as a dataset
 /// root: the config is loaded and no further descent occurs.
 fn walk_for_datasets(dir: &Path, datasets: &mut Vec<DiscoveredDataset>, cwd: &Path) {
-    // Skip directories with .do_not_catalog sentinel
-    if dir.join(DO_NOT_CATALOG_FILE).exists() {
-        return;
-    }
+    // Note: .do_not_catalog prevents catalog *placement* at a directory,
+    // but does NOT prevent descending through it to find datasets below.
+    // The filtering happens in the catalog-writing loop, not here.
 
     let yaml_path = dir.join("dataset.yaml");
     if yaml_path.exists() {
@@ -339,7 +338,7 @@ fn walk_for_datasets(dir: &Path, datasets: &mut Vec<DiscoveredDataset>, cwd: &Pa
 
         for subdir in subdirs {
             let name = subdir.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if name.starts_with('.') || name == "node_modules" || name == "target" {
+            if crate::filters::is_excluded_dir(name) {
                 continue;
             }
             walk_for_datasets(&subdir, datasets, cwd);

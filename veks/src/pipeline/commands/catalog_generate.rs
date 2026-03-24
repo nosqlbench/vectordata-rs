@@ -245,7 +245,7 @@ fn walk_for_datasets(dir: &Path, datasets: &mut Vec<DiscoveredDataset>) {
         subdirs.sort();
         for subdir in subdirs {
             let name = subdir.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if name.starts_with('.') || name.starts_with('_') || name == "node_modules" || name == "target" {
+            if crate::filters::is_excluded_dir(name) {
                 continue;
             }
             walk_for_datasets(&subdir, datasets);

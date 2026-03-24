@@ -197,13 +197,9 @@ pub enum CatalogSubcommand {
         #[arg(long)]
         for_publish_url: bool,
 
-        /// Update only catalog files that already exist in the hierarchy
-        #[arg(long, overrides_with = "no_update", default_value_t = true)]
+        /// Only update catalog files that already exist (skip new directories)
+        #[arg(long)]
         update: bool,
-
-        /// Disable --update: generate catalogs at all hierarchy levels
-        #[arg(long = "no-update", hide = true)]
-        no_update: bool,
     },
 }
 
@@ -345,9 +341,8 @@ pub fn run(args: PrepareArgs) {
         }
         PrepareCommand::Catalog { command } => {
             match command {
-                CatalogSubcommand::Generate { input, basename, for_publish_url, update, no_update } => {
-                    let effective_update = update && !no_update;
-                    crate::catalog::generate::run(&input, &basename, for_publish_url, effective_update);
+                CatalogSubcommand::Generate { input, basename, for_publish_url, update } => {
+                    crate::catalog::generate::run(&input, &basename, for_publish_url, update);
                 }
             }
         }

@@ -1649,30 +1649,11 @@ fn collect_eligible_recursive(dir: &Path, min_size: u64, files: &mut Vec<PathBuf
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
 
-        // Skip hidden and underscore-prefixed entries (consistent with
-        // publish exclusion rules — these are local workspace state)
-        if name_str.starts_with('.') || name_str.starts_with('_') {
-            continue;
-        }
-
         if path.is_dir() {
-            if name_str == "__pycache__" { continue; }
+            if crate::filters::is_excluded_dir(&name_str) { continue; }
             collect_eligible_recursive(&path, min_size, files);
         } else {
-            // Skip merkle state files, temp artifacts, and infrastructure
-            if name_str.ends_with(".mref") || name_str.ends_with(".mrkl")
-                || name_str.ends_with(".tmp") || name_str.ends_with(".partial")
-                || name_str.ends_with(".pyc")
-            {
-                continue;
-            }
-            // Skip infrastructure/metadata files (small, frequently regenerated)
-            let infra = ["dataset.yaml", "dataset.yml", "dataset.log",
-                         "catalog.json", "catalog.yaml", "variables.yaml"];
-            if infra.contains(&name_str.as_ref()) {
-                continue;
-            }
-            // Skip files below threshold
+            if crate::filters::is_merkle_exempt(&name_str) { continue; }
             let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
             if size >= min_size {
                 files.push(path);

@@ -125,10 +125,21 @@ impl DatasetLoader {
         // 4. Look up in catalog
         let entry = catalog_entries.iter()
             .find(|e| e.name.eq_ignore_ascii_case(dataset_name))
-            .ok_or_else(|| io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("dataset '{}' not found in catalog", dataset_name),
-            ))?;
+            .ok_or_else(|| {
+                let mut msg = format!("dataset '{}' not found in catalog", dataset_name);
+                // Suggest similar names
+                let similar: Vec<&str> = catalog_entries.iter()
+                    .filter(|e| e.name.to_lowercase().contains(&dataset_name.to_lowercase())
+                        || dataset_name.to_lowercase().contains(&e.name.to_lowercase()))
+                    .map(|e| e.name.as_str())
+                    .take(5)
+                    .collect();
+                if !similar.is_empty() {
+                    msg.push_str(&format!(". Similar: {}", similar.join(", ")));
+                }
+                msg.push_str(&format!(" ({} entries loaded)", catalog_entries.len()));
+                io::Error::new(io::ErrorKind::NotFound, msg)
+            })?;
 
         Ok(LoadedDataset::Remote(
             RemoteDatasetView::open(entry, profile_name, &self.cache_dir)?

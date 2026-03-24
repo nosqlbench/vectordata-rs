@@ -123,11 +123,11 @@ pub fn run(args: CheckArgs) {
         || args.check_extraneous;
     let run_all = args.check_all || !any_specific;
 
-    // Dataset directory context takes precedence over publish path.
-    // When in a dataset directory, only dataset-local checks run.
-    // Publish/catalog checks only run from a non-dataset publish path.
+    // A directory can be both dataset context AND publish context when
+    // .publish_url is at or above a dataset directory. Both check modes
+    // run when applicable.
     let is_dataset_context = has_dataset_yaml;
-    let is_publish_context = !has_dataset_yaml && is_publish_path;
+    let is_publish_context = is_publish_path;
 
     let run_pipelines = is_dataset_context && (run_all || args.check_pipelines);
     let run_publish = is_publish_context && (run_all || args.check_publish);
@@ -365,11 +365,7 @@ fn discover_datasets_recursive(dir: &Path, found: &mut Vec<PathBuf>) {
         let name_str = name.to_string_lossy();
 
         if path.is_dir() {
-            // Skip hidden (.), underscore-prefixed (_), and Python cache directories
-            if name_str.starts_with('.')
-                || name_str.starts_with('_')
-                || name_str == "__pycache__"
-            {
+            if crate::filters::is_excluded_dir(&name_str) {
                 continue;
             }
             discover_datasets_recursive(&path, found);
@@ -418,17 +414,12 @@ fn enumerate_workspace_recursive(dir: &Path, files: &mut Vec<PathBuf>) {
         let name_str = name.to_string_lossy();
 
         if path.is_dir() {
-            if name_str.starts_with('.') || name_str.starts_with('_') || name_str == "__pycache__" {
+            if crate::filters::is_excluded_dir(&name_str) {
                 continue;
             }
             enumerate_workspace_recursive(&path, files);
         } else {
-            if name_str.starts_with('.')
-                || name_str.starts_with('_')
-                || name_str.ends_with(".tmp")
-                || name_str.ends_with(".partial")
-                || name_str.ends_with(".pyc")
-            {
+            if crate::filters::is_excluded_file(&name_str) {
                 continue;
             }
             files.push(path);

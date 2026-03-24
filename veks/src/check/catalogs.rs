@@ -63,16 +63,16 @@ pub fn check(root: &Path, dataset_files: &[PathBuf]) -> CheckResult {
     let publish_root = super::publish_url::find_publish_file(root)
         .and_then(|p| p.parent().map(|d| d.to_path_buf()));
 
-    // Validate: if both exist, .catalog_root must be at or below .publish_url
-    if let (Some(cr), Some(pr)) = (&catalog_root, &publish_root) {
-        let cr_canon = std::fs::canonicalize(cr).unwrap_or_else(|_| cr.clone());
-        let pr_canon = std::fs::canonicalize(pr).unwrap_or_else(|_| pr.clone());
-        if !cr_canon.starts_with(&pr_canon) {
+    // Validate: each .catalog_root must belong to at least one publish tree.
+    // Check if there's a .publish_url at or above the catalog root.
+    if let Some(ref cr) = catalog_root {
+        let cr_has_publish = super::publish_url::find_publish_file(cr).is_some();
+        if !cr_has_publish {
             return CheckResult::fail("catalogs", vec![
                 format!(
-                    ".catalog_root at {} is outside the .publish_url root at {} — \
-                     .catalog_root must be at or interior to the publish root",
-                    super::rel_display(cr), super::rel_display(pr),
+                    ".catalog_root at {} is not within any publish tree — \
+                     each .catalog_root must be at or within a directory that has .publish_url",
+                    super::rel_display(cr),
                 ),
             ]);
         }
@@ -194,31 +194,39 @@ pub fn check(root: &Path, dataset_files: &[PathBuf]) -> CheckResult {
         }
     }
 
-    // Check that each catalog is at least as recent as all publishable files
-    // in its directory tree. A stale catalog means data changed without
-    // regenerating the index.
+    // Determine the local publish root (closest .publish_url).
+    // Failures for dirs within it are errors; those outside are warnings.
+    let local_publish_canon = super::publish_url::find_publish_file(root)
+        .and_then(|p| p.parent().map(|d| std::fs::canonicalize(d).unwrap_or_else(|_| d.to_path_buf())));
+
+    let is_local = |dir: &Path| -> bool {
+        match &local_publish_canon {
+            Some(lpc) => dir.starts_with(lpc),
+            None => true, // no publish root — everything is "local"
+        }
+    };
+
+    // Split failures: local (error) vs outer (warning)
+    let mut local_failures: Vec<String> = Vec::new();
+    let mut outer_warnings: Vec<String> = Vec::new();
+
+    // Re-check staleness, classifying by location
     let publishable = crate::publish::enumerate_publishable_files(root);
     for (catalog_dir, catalog_mtime) in &catalog_mtimes {
         for file in &publishable {
             if !file.starts_with(catalog_dir) { continue; }
             let fname = file.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-            if fname == "catalog.json" || fname == "catalog.yaml" || fname.ends_with(".mref") {
-                continue;
-            }
+            if crate::filters::is_catalog_staleness_exempt(&fname) { continue; }
             if let Ok(file_mtime) = std::fs::metadata(file).and_then(|m| m.modified()) {
                 if file_mtime > *catalog_mtime {
-                    failures.push(format!(
-                        "{}: catalog is older than {}",
-                        rel(catalog_dir),
-                        rel(file),
-                    ));
+                    let msg = format!("{}: catalog is older than {}", rel(catalog_dir), rel(file));
+                    if is_local(catalog_dir) { local_failures.push(msg); }
+                    else { outer_warnings.push(msg); }
                     break;
                 }
             }
         }
     }
-
-    // Check timestamp ordering: parent catalogs must be >= all child catalogs
     for i in 0..catalog_mtimes.len() {
         let (ref parent_dir, parent_mtime) = catalog_mtimes[i];
         for j in 0..catalog_mtimes.len() {
@@ -226,24 +234,47 @@ pub fn check(root: &Path, dataset_files: &[PathBuf]) -> CheckResult {
             let (ref child_dir, child_mtime) = catalog_mtimes[j];
             if child_dir.starts_with(parent_dir) && child_dir != parent_dir {
                 if parent_mtime < child_mtime {
-                    failures.push(format!(
-                        "{}: catalog is older than child {}",
-                        rel(parent_dir),
-                        rel(child_dir),
-                    ));
+                    let msg = format!("{}: catalog is older than child {}", rel(parent_dir), rel(child_dir));
+                    if is_local(parent_dir) { local_failures.push(msg); }
+                    else { outer_warnings.push(msg); }
                 }
             }
         }
     }
 
-    if failures.is_empty() {
+    // Also include missing/do_not_catalog failures from earlier
+    // Missing-catalog failures (from the earlier check) are always local
+    local_failures.extend(failures);
+
+    if local_failures.is_empty() && outer_warnings.is_empty() {
         let mut result = CheckResult::ok("catalogs");
-        result.messages.push(format!(
-            "{} directory level(s) checked, all have current catalogs",
-            checked,
-        ));
+        result.messages.push(format!("{} directory level(s) checked, all have current catalogs", checked));
+        result
+    } else if local_failures.is_empty() {
+        let mut result = CheckResult::ok("catalogs");
+        result.messages.push(format!("{} directory level(s) checked, local catalogs current", checked));
+        for w in &outer_warnings {
+            result.messages.push(format!("  warning (outer publish tree): {}", w));
+        }
+        if let Some(cr) = find_catalog_root(root) {
+            result.messages.push(format!("  To update outer catalogs: veks prepare catalog generate {}",
+                super::rel_display(&cr)));
+        }
         result
     } else {
-        CheckResult::fail("catalogs", failures)
+        let mut msgs = local_failures;
+        for w in &outer_warnings {
+            msgs.push(format!("  warning (outer): {}", w));
+        }
+        msgs.push(String::new());
+        msgs.push("To regenerate catalogs:".to_string());
+        msgs.push(format!("  veks prepare catalog generate {}", super::rel_display(root)));
+        if !outer_warnings.is_empty() {
+            if let Some(cr) = find_catalog_root(root) {
+                msgs.push(format!("  veks prepare catalog generate {}  (includes outer tree)",
+                    super::rel_display(&cr)));
+            }
+        }
+        CheckResult::fail("catalogs", msgs)
     }
 }

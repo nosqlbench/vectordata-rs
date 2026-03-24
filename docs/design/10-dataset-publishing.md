@@ -247,21 +247,45 @@ Four sentinel files control publishing and catalog behavior:
   present, `catalog generate` uses this directory as the scan root and
   generates catalogs at every level from there down to each dataset.
 
-- **`.do_not_catalog`** — Prevents catalog generation in this directory
-  and all directories below it. The catalog walker skips discovery and
-  will not write `catalog.json` or `catalog.yaml` in any directory that
-  contains this file.
+- **`.do_not_catalog`** — Prevents catalog file **placement** in this
+  directory. When present, `catalog generate` will not write
+  `catalog.json` or `catalog.yaml` here. However, the dataset discovery
+  walker still descends through directories with `.do_not_catalog` to
+  find datasets below — only catalog output is suppressed, not
+  discovery.
 
 **Catalog completeness rules** (enforced by `veks check`):
 
-1. Every directory between `.catalog_root` (inclusive) and a **publishable**
-   dataset directory (one containing both `dataset.yaml` and `.publish`)
-   MUST have a fresh `catalog.json` and `catalog.yaml`.
+1. Every directory between the publish root (inclusive) and a
+   **publishable** dataset directory (one containing both `dataset.yaml`
+   and `.publish`) MUST have a fresh `catalog.json` and `catalog.yaml`,
+   unless that directory has `.do_not_catalog`.
 
 2. Any directory with `.do_not_catalog` MUST NOT contain catalog files.
 
 3. Dataset directories without `.publish` are excluded from catalog
    completeness checks entirely.
+
+**`catalog generate` scoping**:
+
+When `veks prepare catalog generate [DIR]` is invoked:
+
+1. **Publish root discovery** (catalog placement boundary): Walk UP from
+   `DIR` to find the enclosing `.publish_url`. Catalogs are generated at
+   every directory level from each dataset up to this publish root. If no
+   `.publish_url` exists at or above `DIR`, scan immediate children for
+   child publish roots.
+
+2. **Dataset discovery** (what gets cataloged): Walk DOWN from `DIR` to
+   find `dataset.yaml` files. Only publishable datasets (with `.publish`
+   sentinel) are included in catalog entries.
+
+3. **Catalog placement**: Write `catalog.json` and `catalog.yaml` at
+   every directory on the path from each discovered dataset up to the
+   publish root. Skip directories with `.do_not_catalog`.
+
+By default, catalogs are created at all hierarchy levels. The `--update`
+flag restricts writes to directories that already have catalog files.
 
 ### Additional default exclusions
 
@@ -286,14 +310,18 @@ All other files in the dataset directory are included, notably:
 | JSON metadata | `*.json` |
 | Profile subdirectories | `profiles/*/...` |
 
-### Filter precedence
+### Filter strategy
 
-1. Default exclusions apply first.
-2. User `--exclude` patterns are appended to the exclusion list.
-3. User `--include` patterns override all exclusions (force-include).
+Publishing uses an **include-only** approach rather than building
+exclusion patterns:
 
-This matches `aws s3 sync` filter semantics where `--include` after
-`--exclude` re-includes matched paths.
+1. `enumerate_publishable_files()` determines the exact set of files
+   to publish (applying all rules above).
+2. The sync command excludes everything (`--exclude '*'`), then
+   explicitly includes each publishable file.
+
+This guarantees that checks, merkle coverage, and actual sync all
+operate on the same file set — defined once in `enumerate_publishable_files`.
 
 ---
 
@@ -324,19 +352,37 @@ S3 key: `s3://bucket/laion400b/img-search/profiles/1m/neighbor_indices.ivec`
 
 ### Path structure inclusion rule
 
-Only directories that are **on the path to a `dataset.yaml`** are included
-in the publish set. Directories that are not on any path from the publish
-root to a dataset directory, and directories that are not enclosed by a
-directory containing `dataset.yaml`, are excluded by default. This is not
-an error — such directories simply do not participate in the dataset
-hierarchy and are silently skipped.
+Only directories that are **on the path to a publishable `dataset.yaml`**
+participate in publishing. Directories not on any path from the publish
+root to a publishable dataset directory are excluded entirely.
 
-For example, if the publish root contains `datasets/valid/dataset.yaml`
-and `scratch/temp/data.fvec`, only the `datasets/valid/` subtree is
-published. The `scratch/` tree is ignored.
+**Within dataset directories** (at or below a `dataset.yaml`), all
+non-excluded files are included — these are dataset content files
+(vectors, profiles, metadata).
 
-This rule prevents non-dataset content (work-in-progress, scripts, tools)
-from being accidentally published alongside datasets.
+**At intermediate directories** (on-path but above a dataset directory),
+only catalog infrastructure files (`catalog.json`, `catalog.yaml`) and
+their companion `.mref` files are included. Arbitrary data files at
+intermediate levels are NOT published, even if they happen to be on the
+path to a dataset. This prevents non-dataset content (test files,
+work-in-progress data, scripts) from being accidentally included.
+
+For example:
+
+```
+publish-root/
+├── .publish_url
+├── group/
+│   ├── catalog.json              ← published (infrastructure)
+│   ├── base_test.mvec            ← NOT published (data file at intermediate level)
+│   └── my-dataset/
+│       ├── dataset.yaml
+│       ├── .publish
+│       ├── base.mvec             ← published (inside dataset)
+│       └── profiles/...          ← published (inside dataset)
+└── scratch/
+    └── temp/data.fvec            ← NOT published (not on path to any dataset)
+```
 
 ### Object key mapping
 
@@ -420,20 +466,22 @@ filter rules. This approach:
 The command constructs an invocation equivalent to:
 
 ```bash
-aws s3 sync <dataset-dir> <s3-url> \
-  --exclude '.*' \
-  --exclude '*/.*' \
-  --exclude '*.tmp' \
-  --exclude '*.partial' \
-  --exclude '__pycache__/*' \
-  --exclude '*.pyc' \
+aws s3 sync <publish-root> <s3-url> \
+  --exclude '*' \
+  --include 'path/to/dataset/file1.fvec' \
+  --include 'path/to/dataset/file2.ivec' \
+  --include 'group/catalog.json' \
+  ... \
   [--delete] \
   [--dryrun] \
   [--only-show-errors | progress indicators]
 ```
 
-The `--exclude '.*' --exclude '*/.*'` patterns categorically exclude all
-hidden files and directories at every level.
+The sync uses an **include-only** strategy: `--exclude '*'` first
+excludes everything, then each publishable file (as determined by
+`enumerate_publishable_files`) is explicitly included. This ensures the
+sync matches the file enumeration exactly — one code path decides what's
+publishable, eliminating divergence between checks and actual uploads.
 
 Errors from the subprocess are captured and reported through the
 standard `CommandResult` mechanism.

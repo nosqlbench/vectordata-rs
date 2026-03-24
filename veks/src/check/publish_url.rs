@@ -48,6 +48,7 @@ pub fn check(root: &Path, dataset_files: &[PathBuf]) -> CheckResult {
             let mut messages = vec![
                 format!(".publish_url: {} (transport: {})", parsed.url, parsed.scheme),
             ];
+            let mut failures: Vec<String> = Vec::new();
             for ds in dataset_files {
                 let ds_dir = ds.parent().unwrap_or(Path::new("."));
                 // Path from publish root to the dataset directory
@@ -70,9 +71,58 @@ pub fn check(root: &Path, dataset_files: &[PathBuf]) -> CheckResult {
                     format!("{}/{}/", base, rel_str)
                 };
                 messages.push(format!("  {} -> {}", rel_str, target));
+
+                // Consistency check: find ALL .publish_url files between the
+                // dataset and the filesystem root. Each must resolve to the
+                // same endpoint URL for this dataset.
+                let abs_ds = std::fs::canonicalize(ds_dir).unwrap_or_else(|_| ds_dir.to_path_buf());
+                let mut walk = abs_ds.clone();
+                let mut endpoints: Vec<(PathBuf, String)> = Vec::new();
+                loop {
+                    let candidate = walk.join(PUBLISH_FILE);
+                    if candidate.is_file() {
+                        if let Ok(content) = std::fs::read_to_string(&candidate) {
+                            if let Ok(p) = parse_publish_url(&content) {
+                                let rel_from_this_root = abs_ds.strip_prefix(&walk)
+                                    .map(|r| r.to_string_lossy().to_string())
+                                    .unwrap_or_default();
+                                let endpoint = if rel_from_this_root.is_empty() {
+                                    p.url.clone()
+                                } else {
+                                    format!("{}{}/", p.url.trim_end_matches('/'),
+                                        if rel_from_this_root.starts_with('/') { rel_from_this_root.clone() }
+                                        else { format!("/{}", rel_from_this_root) })
+                                };
+                                endpoints.push((walk.clone(), endpoint));
+                            }
+                        }
+                    }
+                    if !walk.pop() { break; }
+                }
+                if endpoints.len() > 1 {
+                    let first_endpoint = &endpoints[0].1;
+                    for (root_path, endpoint) in &endpoints[1..] {
+                        if endpoint != first_endpoint {
+                            failures.push(format!(
+                                "  {} — inconsistent publish endpoints:\n    \
+                                 local:  {}\n    \
+                                 outer:  {}\n    \
+                                 (outer root: {})",
+                                rel_str,
+                                first_endpoint,
+                                endpoint,
+                                super::rel_display(root_path),
+                            ));
+                        }
+                    }
+                }
             }
             let mut result = CheckResult::ok("publish");
             result.messages = messages;
+            if !failures.is_empty() {
+                result.passed = false;
+                result.messages.extend(failures);
+            }
             result
         }
         Err(e) => {
