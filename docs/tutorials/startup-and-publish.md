@@ -74,7 +74,7 @@ Catalogs are remote indexes that tell veks what datasets are available.
 Add one:
 
 ```shell
-veks datasets config add-catalog https://vectordata-testdata.s3.us-east-1.amazonaws.com/2d9447277b42aeba07efeb154d9c52174f7984b0_laion400b_private/
+veks datasets config add-catalog https://vectordata-testdata.s3.us-east-1.amazonaws.com/askmeforthis/
 ```
 
 Veks verifies the catalog is reachable and reports how many datasets
