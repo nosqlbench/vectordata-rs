@@ -9,6 +9,7 @@
 
 // Removed: barrier, cleanup_cleanfvec
 pub mod catalog_generate;
+pub mod require;
 pub mod source_window;
 pub mod analyze_checkendian;
 pub mod analyze_compare;
@@ -139,4 +140,7 @@ pub fn register_all(registry: &mut CommandRegistry) {
 
     // ── catalog (pipeline step for dataset index generation) ─────────
     registry.register("catalog generate", catalog_generate::factory);
+
+    // ── pipeline orchestration ─────────────────────────────────────
+    registry.register("pipeline require", require::factory);
 }

@@ -113,51 +113,22 @@ pub fn run(path: &Path, spec: Option<&str>, force: bool, yes: bool) {
 
     let max_label = format_count_label(effective_max);
 
-    // Get the spec
-    // Build a default spec that fits the actual dataset size.
-    // Start at 1/10th of max (rounded to a clean label), double up to max.
-    let build_default_spec = |max: u64| -> String {
-        if max >= 2_000_000 {
-            let ml = format_count_label(max);
-            format!("mul:1m..{}/2, 0m..{}/10m", ml, ml)
-        } else if max >= 100_000 {
-            // Small dataset: start at 10% of max
-            let start = (max / 10).max(1000);
-            let start_label = format_count_label(start);
-            let ml = format_count_label(max);
-            format!("mul:{}..{}/2", start_label, ml)
-        } else if max >= 10_000 {
-            let start = (max / 5).max(1000);
-            let start_label = format_count_label(start);
-            let ml = format_count_label(max);
-            format!("{}..{}/{}",start_label, ml, start_label)
-        } else {
-            // Very small — just one profile at half
-            let half = max / 2;
-            format_count_label(half)
-        }
-    };
-
     let spec_str = if let Some(s) = spec {
         s.to_string()
     } else if yes {
-        build_default_spec(effective_max)
+        standard_spec(effective_max)
     } else {
-        // Interactive
+        // Simple prompt with standard spec as default
+        let default_spec = standard_spec(effective_max);
         println!("--- Sized profiles ---");
         println!("  Base vector count: ~{} ({})", max_label, effective_max);
         if is_self_search {
             println!("  (after subtracting {} query vectors)", query_count);
         }
         println!();
-        println!("  Sized profiles create windowed subsets at different scales.");
-        println!("  Examples: 1M, 2M, 4M, ..., 10M, 20M, ...");
-        println!();
-
-        let default_spec = build_default_spec(effective_max);
-
-        println!("  Default: {}", default_spec);
-        eprint!("  Sized profile spec (Enter for default): ");
+        println!("  Standard spec: {}", default_spec);
+        println!("  (Use --interactive for guided setup)");
+        eprint!("  Spec (Enter for standard): ");
         io::stderr().flush().unwrap_or(());
         let mut input = String::new();
         io::stdin().read_line(&mut input).unwrap_or(0);
@@ -374,6 +345,152 @@ fn parse_spec_to_pairs(spec: &str) -> Vec<(String, u64)> {
 }
 
 /// Format a count as a human-readable label.
+/// Build the standard spec: fib + mul/2 + linear(10m), deduped.
+///
+/// This is the default for `--auto` and option 1 in the wizard.
+pub(crate) fn standard_spec(effective_max: u64) -> String {
+    let ml = format_count_label(effective_max);
+    if effective_max >= 2_000_000 {
+        format!("fib:1m..{}, mul:1m..{}/2, 0m..{}/10m", ml, ml, ml)
+    } else if effective_max >= 100_000 {
+        let start = format_count_label((effective_max / 10).max(1000));
+        format!("fib:{}..{}, mul:{}..{}/2", start, ml, start, ml)
+    } else if effective_max >= 10_000 {
+        let half = format_count_label(effective_max / 2);
+        format!("mul:{}..{}/2", half, ml)
+    } else {
+        format_count_label(effective_max / 2)
+    }
+}
+
+/// Interactive wizard for choosing sized profile specs.
+pub fn interactive_spec_wizard(path: &Path) -> String {
+    let (dataset_dir, dataset_path) = resolve_dataset_path(path);
+    let config = DatasetConfig::load(&dataset_path).unwrap_or_else(|e| {
+        eprintln!("Error: {}", e);
+        std::process::exit(1);
+    });
+
+    let base_count = determine_base_count(&dataset_dir, &config);
+    if base_count == 0 {
+        eprintln!("Error: could not determine base vector count");
+        std::process::exit(1);
+    }
+
+    let is_self_search = detect_self_search(&config);
+    let query_count = config.upstream.as_ref()
+        .and_then(|u| u.defaults.as_ref())
+        .and_then(|d| d.get("query_count"))
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+
+    let effective_max = if is_self_search {
+        base_count.saturating_sub(query_count)
+    } else {
+        base_count
+    };
+
+    let max_label = format_count_label(effective_max);
+    let std_spec = standard_spec(effective_max);
+
+    println!();
+    println!("--- Sized Profile Wizard ---");
+    println!();
+    println!("  Dataset: {}", config.name);
+    println!("  Base vectors: ~{} ({})", max_label, effective_max);
+    if is_self_search {
+        println!("  Self-search mode: {} query vectors subtracted", query_count);
+    }
+
+    // Preview standard spec
+    let std_pairs = parse_spec_to_pairs(&std_spec);
+    let std_filtered: Vec<_> = std_pairs.iter().filter(|(_, c)| *c <= effective_max).collect();
+    println!();
+    println!("  Standard spec: {}", std_spec);
+    println!("  ({} profiles: {})",
+        std_filtered.len(),
+        std_filtered.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(", "));
+
+    println!();
+    println!("  Choose a strategy:");
+    println!();
+    println!("    1) Standard — fib + mul/2 + linear/10m (recommended)");
+    println!("    2) Multiplicative only (powers of 2)");
+    println!("    3) Fibonacci only");
+    println!("    4) Linear only (fixed step)");
+    println!("    5) Custom spec");
+    println!();
+
+    let choice = prompt_with_default("  Strategy [1-5]", "1");
+
+    let spec = match choice.trim() {
+        "1" => std_spec,
+        "2" => {
+            let start = prompt_with_default(
+                &format!("  Start size [max={}]", max_label),
+                "1m",
+            );
+            format!("mul:{}..{}/2", start.trim(), max_label)
+        }
+        "3" => {
+            let start = prompt_with_default(
+                &format!("  Start size [max={}]", max_label),
+                "1m",
+            );
+            format!("fib:{}..{}", start.trim(), max_label)
+        }
+        "4" => {
+            let step = prompt_with_default(
+                &format!("  Step size [max={}]", max_label),
+                &format_count_label((effective_max / 10).max(1_000_000)),
+            );
+            format!("0m..{}/{}", max_label, step.trim())
+        }
+        "5" => {
+            let custom = prompt_with_default("  Spec string", &std_spec);
+            custom.trim().to_string()
+        }
+        _ => {
+            eprintln!("  Unknown choice, using standard.");
+            std_spec
+        }
+    };
+
+    // Preview
+    let pairs = parse_spec_to_pairs(&spec);
+    let filtered: Vec<_> = pairs.iter().filter(|(_, c)| *c <= effective_max).collect();
+    println!();
+    println!("  Preview: {} profiles from spec '{}'", filtered.len(), spec);
+    for (name, count) in &filtered {
+        println!("    {:<10} {:>12} vectors", name, count);
+    }
+
+    if filtered.is_empty() {
+        eprintln!("  Warning: spec produced no valid profiles within the size limit.");
+    }
+
+    println!();
+    spec
+}
+
+fn prompt_with_default(prompt: &str, default: &str) -> String {
+    use std::io::Write;
+    if default.is_empty() {
+        eprint!("{}: ", prompt);
+    } else {
+        eprint!("{} [{}]: ", prompt, default);
+    }
+    io::stderr().flush().unwrap_or(());
+    let mut input = String::new();
+    io::stdin().read_line(&mut input).unwrap_or(0);
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        default.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 fn format_count_label(n: u64) -> String {
     if n >= 1_000_000_000 && n % 1_000_000_000 == 0 {
         format!("{}b", n / 1_000_000_000)

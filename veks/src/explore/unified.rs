@@ -103,16 +103,19 @@ const VIEW_INFO: &[&str] = &[
         "  Steps or kinks: Discrete distance shells, common in quantized or\n",
         "  clustered data.",
     ),
-    // 4: Scree plot
+    // 4: Eigen (Scree / CumVar / LogDecay — toggled with m)
     concat!(
-        "Scree Plot (Eigenvalue Decay)\n\n",
-        "Eigenvalues from PCA, largest to smallest. Each eigenvalue represents\n",
-        "the variance captured by that principal component.\n\n",
-        "  Sharp elbow: The data lives on a low-dimensional manifold.\n",
-        "  Components after the elbow are noise. Product quantization (PQ)\n",
-        "  and dimensionality reduction will work well.\n\n",
-        "  Gradual decay: Variance is spread across many dimensions.\n",
-        "  The data is inherently high-dimensional. PQ needs more sub-quantizers.\n\n",
+        "Eigenvalue Analysis (press m to cycle: Scree / CumVar / LogDecay)\n\n",
+        "Three views of the same eigenvalue data, toggled with 'm':\n\n",
+        "SCREE PLOT — eigenvalues largest to smallest:\n",
+        "  Sharp elbow: low-dimensional manifold, PQ/compression works well.\n",
+        "  Gradual decay: high-dimensional, PQ needs more sub-quantizers.\n\n",
+        "CUMULATIVE VARIANCE — running sum as % of total (95% threshold):\n",
+        "  95% at k=20 in 1024-dim: only 20 effective dimensions.\n",
+        "  95% at k=500: data genuinely uses half its dimensions.\n\n",
+        "LOG DECAY — ln(eigenvalue) vs component index:\n",
+        "  Straight line: power-law decay, slope = effective dimensionality.\n",
+        "  Plateau at bottom: noise floor.\n\n",
         "  Power-law decay (straight line on log plot): Common in natural data.\n",
         "  The slope indicates the effective dimensionality.\n\n",
         "Computation:\n",
@@ -122,33 +125,45 @@ const VIEW_INFO: &[&str] = &[
         "  components, 5 for the rest. Eigenvalue = E[dot(Xv, Xv)] = v^T Sigma v.\n",
         "  Uses simsimd SIMD dot products and rayon parallelism.",
     ),
-    // 5: Cumulative variance
+    // 5: PCA Loadings heatmap
     concat!(
-        "Cumulative Variance Explained\n\n",
-        "Running sum of eigenvalues as a percentage of total variance.\n",
-        "The gray line marks 95%.\n\n",
-        "  95% elbow at k=20 in 1024-dim space: Only 20 effective dimensions.\n",
-        "  The remaining 1004 dimensions are noise. Highly compressible.\n\n",
-        "  95% elbow at k=500: The data genuinely uses half its dimensions.\n",
-        "  Compression ratios will be modest.\n\n",
-        "Computation:\n",
-        "  cumvar(k) = sum(lambda_1..lambda_k) / sum(all lambda) * 100%\n",
-        "  Effective rank = exp(H), H = -sum(p_i * ln(p_i)), p_i = lambda_i / sum.\n",
-        "  Intrinsic dim = count of eigenvalues > 1% of lambda_1.\n",
-        "  95% elbow = smallest k where cumvar(k) >= 95%.",
+        "PCA Loadings Heatmap\n\n",
+        "A 2D grid showing how each original dimension contributes to each\n",
+        "principal component. Columns are PCs, rows are original dimensions\n",
+        "(grouped into bands when dimensionality is high).\n\n",
+        "  Bright cells: Strong loading — this dimension heavily influences this PC.\n",
+        "  Dark cells: Near-zero loading — this dimension is irrelevant to this PC.\n\n",
+        "  Interpretation:\n",
+        "  - If PC1 loads heavily on dims 0-50 and PC2 on dims 200-300,\n",
+        "    these dimension ranges capture independent variance axes.\n",
+        "  - Uniform loading across all dims means no single dimension\n",
+        "    dominates — the PC captures a global pattern.\n",
+        "  - Sparse loadings (few bright cells) suggest the data has\n",
+        "    structure aligned with specific input features.\n\n",
+        "  Color scale: magnitude of loading weight (absolute value).\n",
+        "  Blue (low) → Cyan → Yellow → Red (high).\n\n",
+        "  For high-dimensional data (>100 dims), dimensions are grouped\n",
+        "  into bands and the max absolute loading in each band is shown.",
     ),
-    // 6: Log decay
+    // 6: Variance bars
     concat!(
-        "Log Eigenvalue Decay\n\n",
-        "Same eigenvalues as the scree plot, but on a log scale (ln).\n\n",
-        "  Straight line: Power-law decay, lambda_k ~ k^(-alpha).\n",
-        "  The slope alpha determines effective dimensionality.\n",
-        "  alpha > 2: low-dimensional, very compressible.\n",
-        "  alpha < 1: high-dimensional, compression is hard.\n\n",
-        "  Curved (concave up): Faster-than-power-law decay. Excellent for PQ.\n",
-        "  Curved (concave down): Slower decay. More dimensions matter.\n\n",
-        "  Plateau at bottom: Noise floor. Eigenvalues below this are\n",
-        "  dominated by sampling noise, not real structure.",
+        "Variance Explained per Principal Component\n\n",
+        "Bar chart showing each PC's share of total variance.\n\n",
+        "  Dominant first bar: PC1 captures most variance — data has a\n",
+        "  strong primary axis. Common in text embeddings where the first\n",
+        "  component often captures average document length or frequency.\n\n",
+        "  Gradual decline: Variance is distributed across many PCs.\n",
+        "  No single direction dominates. The data is genuinely high-dimensional.\n\n",
+        "  Sharp drop after k bars: Only k dimensions carry signal.\n",
+        "  Remaining PCs are noise. Product quantization with k sub-quantizers\n",
+        "  should capture most of the distance structure.\n\n",
+        "  Color coding:\n",
+        "    Yellow — top 3 components (typically shown in PCA scatter)\n",
+        "    Green — components explaining > 5% of variance\n",
+        "    Gray — minor components (< 5% each)\n\n",
+        "This view complements the Scree plot: the scree shows absolute\n",
+        "eigenvalues (decay shape), while this shows relative contribution\n",
+        "as percentages, making it easy to see how much each PC matters.",
     ),
     // 7: PCA scatter
     concat!(
@@ -173,9 +188,9 @@ const VIEW_NAMES: &[&str] = &[
     "2:NormCurve",
     "3:Distances",
     "4:DistCurve",
-    "5:Scree",
-    "6:CumVar",
-    "7:LogDecay",
+    "5:Eigen",
+    "6:Loadings",
+    "7:VarBars",
     "8:PCA",
 ];
 const NUM_VIEWS: usize = 8;
@@ -241,17 +256,31 @@ impl WelfordStats {
 // Entry point
 // ---------------------------------------------------------------------------
 
+/// How the explore session ended.
+pub(super) enum ExploreExit {
+    /// User pressed q or Ctrl-C — hard quit.
+    Quit,
+    /// User pressed Esc when idle — return to previous screen.
+    Back,
+}
+
 pub(super) fn run_interactive_explore(
     source: &str, sample_size: usize, seed: u64, sample_mode: SampleMode,
-) {
+) -> ExploreExit {
     eprintln!("Opening {}...", source);
     let reader = UnifiedReader::open(source);
     let total = reader.count();
     let dim = reader.dim();
 
     if total == 0 || dim == 0 {
-        eprintln!("Error: no vector data found in '{}'", source);
-        std::process::exit(1);
+        eprintln!("Error: no vector data found in '{}' (count={}, dim={})", source, total, dim);
+        eprintln!("  This may mean the profile doesn't have base_vectors, or the data isn't cached yet.");
+        eprintln!("  Try: veks datasets prebuffer --dataset {} --profile {}",
+            source.split(':').next().unwrap_or(source),
+            source.split(':').nth(1).unwrap_or("default"));
+        // Brief pause so user can read the message before TUI takes over
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        return ExploreExit::Back;
     }
 
     let filename = if super::shared::is_local_source(source) {
@@ -289,13 +318,53 @@ pub(super) fn run_interactive_explore(
     let mut rot_z: f64 = 0.0;  // a/d keys
     let mut rot_w: f64 = 0.0;  // w/s keys
     let mut pc_axes: [usize; 5] = [0, 1, 2, 3, 4];
+    let mut loadings_bar_mode: bool = true; // true=bar chart (default), false=heatmap
+    let mut loadings_band_size: usize = 0;   // 0 = auto-fit to terminal height
+    let mut eigen_sub_mode: usize = 0;       // 0=scree, 1=cumvar, 2=log decay
 
-    // Outer loop: restarts computation when sample size changes
+    // ── Computation state (persists across restarts — old data stays visible) ──
+    let mut compute_start;
+    let mut vector_buf: Vec<f32> = Vec::new();
+    let mut vectors_loaded: usize;
+    let mut all_norms: Vec<f64> = Vec::new();
+    let mut norm_stats;
+    let mut last_cache_stats: Option<CacheStats> = None;
+    let mut phase1_done;
+    let mut sorted_norms: Vec<f64> = Vec::new();
+    let mut sorted_norms_len: usize;
+    let mut sorted_dists: Vec<f64> = Vec::new();
+    let mut sorted_dists_len: usize;
+    let mut all_dists: Vec<f32> = Vec::new();
+    let mut dist_stats;
+    let mut dist_rx: Option<mpsc::Receiver<DistBatch>>;
+    let mut phase2_done;
+    let mut total_pairs;
+    let mut eigenvalues: Vec<f64> = Vec::new();
+    let mut eigenvectors: Vec<Vec<f64>> = Vec::new();
+    let mut eigen_rx: Option<mpsc::Receiver<EigenMsg>>;
+    let mut phase3_done;
+    let eigen_target = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(10usize.min(dim)));
+    let mut avg_eigen_ms;
+    let mut projected: Vec<[f64; 5]> = Vec::new();
+    let mut proj_rx: Option<mpsc::Receiver<ProjectionMsg>>;
+    let mut phase4_done;
+    let mut status_msg;
+    let mut final_elapsed: Option<f64>;
+    let mut frame_count: usize = 0;
+    let mut restart;
+    let mut exit_reason = ExploreExit::Quit;
+    let mut last_esc: Option<std::time::Instant> = None;
+    // read_rx lives across restarts — reassigned each iteration
+    let mut read_rx: mpsc::Receiver<ReadBatch>;
+
+    // Outer loop: restarts computation when sample size changes.
+    // Old data stays visible until new data arrives.
     loop {
     let indices = sample_indices(total, current_sample, seed, sample_mode, clump);
 
     // ── Phase 1: Read vectors + compute norms on background thread ──
-    let (read_tx, read_rx) = mpsc::channel::<ReadBatch>();
+    let (read_tx, new_read_rx) = mpsc::channel::<ReadBatch>();
+    read_rx = new_read_rx;
     {
         let source_owned = source.to_string();
         let indices_clone = indices.clone();
@@ -336,49 +405,28 @@ pub(super) fn run_interactive_explore(
         });
     }
 
-    // ── Computation state (reset on each restart) ──
-    let compute_start = Instant::now();
-
-    // Phase 1 state
-    let mut vector_buf: Vec<f32> = Vec::with_capacity(current_sample * dim);
-    let mut vectors_loaded: usize = 0;
-    let mut all_norms: Vec<f64> = Vec::with_capacity(current_sample);
-    let mut norm_stats = WelfordStats::new();
-    let mut last_cache_stats: Option<CacheStats> = None;
-    let mut phase1_done = false;
-
-    // Sorted caches for curve views (avoid re-sorting every frame)
-    let mut sorted_norms: Vec<f64> = Vec::new();
-    let mut sorted_norms_len: usize = 0;
-    let mut sorted_dists: Vec<f64> = Vec::new();
-    let mut sorted_dists_len: usize = 0;
-
-    // Phase 2 state (distances)
-    let mut all_dists: Vec<f32> = Vec::new();
-    let mut dist_stats = WelfordStats::new();
-    let mut dist_rx: Option<mpsc::Receiver<DistBatch>> = None;
-    let mut phase2_done = false;
-    let total_pairs = (current_sample * 50).min(current_sample.saturating_mul(current_sample.saturating_sub(1)) / 2);
-
-    // Phase 3 state (eigenvalues)
-    let mut eigenvalues: Vec<f64> = Vec::new();
-    let mut eigenvectors: Vec<Vec<f64>> = Vec::new();
-    let mut eigen_rx: Option<mpsc::Receiver<EigenMsg>> = None;
-    let mut phase3_done = false;
-    let num_eigenvalues = 10usize.min(dim);
-    let mut avg_eigen_ms = 0.0f64;
-
-    // Phase 4 state (projection)
-    let mut projected: Vec<[f64; 5]> = Vec::new();
-    let mut proj_rx: Option<mpsc::Receiver<ProjectionMsg>> = None;
-    let mut phase4_done = false;
-
-    // PCA rotation (persists — moved before outer loop)
-
-    // Overall phase tracking
-    let mut status_msg;
-    let mut final_elapsed: Option<f64> = None;
-    let mut restart = false;
+    // Reset computation phases — but keep old rendered data visible.
+    // The pending_clear flag defers clearing until the first new batch
+    // arrives, preventing a blank frame between restarts.
+    compute_start = Instant::now();
+    let mut pending_clear = true;
+    vectors_loaded = 0;
+    norm_stats = WelfordStats::new();
+    phase1_done = false;
+    sorted_norms_len = 0;
+    sorted_dists_len = 0;
+    dist_stats = WelfordStats::new();
+    dist_rx = None;
+    phase2_done = false;
+    total_pairs = (current_sample * 50).min(current_sample.saturating_mul(current_sample.saturating_sub(1)) / 2);
+    eigen_rx = None;
+    phase3_done = false;
+    eigen_target.store(10usize.min(dim), std::sync::atomic::Ordering::Relaxed);
+    avg_eigen_ms = 0.0;
+    proj_rx = None;
+    phase4_done = false;
+    final_elapsed = None;
+    restart = false;
 
     loop {
         if abort_flag.load(Ordering::Relaxed) {
@@ -389,15 +437,33 @@ pub(super) fn run_interactive_explore(
         }
 
         // ── Drain Phase 1 (read + norms) ──
+        // Limit batches per frame so the render updates at least once per second.
         if !phase1_done {
+            let mut batches_this_frame = 0usize;
             loop {
+                if batches_this_frame >= 4 { break; } // yield to render after ~2K vectors
                 match read_rx.try_recv() {
                     Ok(batch) => {
+                        // On first new batch, clear stale data from previous sample
+                        if pending_clear {
+                            pending_clear = false;
+                            vector_buf.clear();
+                            all_norms.clear();
+                            all_dists.clear();
+                            sorted_norms.clear();
+                            sorted_dists.clear();
+                            sorted_norms_len = 0;
+                            sorted_dists_len = 0;
+                            eigenvalues.clear();
+                            eigenvectors.clear();
+                            projected.clear();
+                        }
                         vector_buf.extend_from_slice(&batch.vectors);
                         for &n in &batch.norms { norm_stats.update(n); }
                         all_norms.extend_from_slice(&batch.norms);
                         vectors_loaded += batch.count;
                         if let Some(cs) = batch.cache_stats { last_cache_stats = Some(cs); }
+                        batches_this_frame += 1;
                     }
                     Err(mpsc::TryRecvError::Empty) => break,
                     Err(mpsc::TryRecvError::Disconnected) => {
@@ -437,7 +503,6 @@ pub(super) fn run_interactive_explore(
                             let mut centered_buf = vector_buf.clone();
                             let actual_n = vectors_loaded;
                             let dim_c = dim;
-                            let k = num_eigenvalues;
                             // Compute mean and center
                             let mut mean_f32 = vec![0.0f32; dim_c];
                             for vi in 0..actual_n {
@@ -452,11 +517,15 @@ pub(super) fn run_interactive_explore(
 
                             let (etx, erx) = mpsc::channel::<EigenMsg>();
                             eigen_rx = Some(erx);
+                            let eigen_target_clone = eigen_target.clone();
                             std::thread::spawn(move || {
                                 let mut evecs: Vec<Vec<f64>> = Vec::new();
-                                for ki in 0..k {
+                                let mut ki = 0usize;
+                                loop {
+                                    let target = eigen_target_clone.load(std::sync::atomic::Ordering::Relaxed);
+                                    if ki >= target || ki >= dim_c { break; }
                                     let iters = if ki < 3 { 15 } else { 5 };
-                                    let mut v: Vec<f64> = (0..dim_c).map(|d| ((d * 7 + 13) % 97) as f64 - 48.0).collect();
+                                    let mut v: Vec<f64> = (0..dim_c).map(|d| ((d * 7 + ki * 31 + 13) % 97) as f64 - 48.0).collect();
                                     normalize(&mut v);
                                     let t0 = Instant::now();
                                     for _ in 0..iters {
@@ -488,7 +557,10 @@ pub(super) fn run_interactive_explore(
                                     let eigenvalue = ev_sum / actual_n as f64;
                                     let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
                                     evecs.push(v.clone());
-                                    let _ = etx.send(EigenMsg { ki, eigenvalue, eigenvector: v, elapsed_ms });
+                                    if etx.send(EigenMsg { ki, eigenvalue, eigenvector: v, elapsed_ms }).is_err() {
+                                        break; // receiver dropped
+                                    }
+                                    ki += 1;
                                 }
                             });
                         } else {
@@ -505,11 +577,14 @@ pub(super) fn run_interactive_explore(
         // ── Drain Phase 2 (distances) ──
         if phase1_done && !phase2_done {
             if let Some(ref rx) = dist_rx {
+                let mut batches = 0usize;
                 loop {
+                    if batches >= 4 { break; }
                     match rx.try_recv() {
                         Ok(batch) => {
                             for &d in &batch.distances { dist_stats.update(d as f64); }
                             all_dists.extend_from_slice(&batch.distances);
+                            batches += 1;
                         }
                         Err(mpsc::TryRecvError::Empty) => break,
                         Err(mpsc::TryRecvError::Disconnected) => { phase2_done = true; break; }
@@ -584,6 +659,23 @@ pub(super) fn run_interactive_explore(
             }
         }
 
+        // Auto-deepen eigenvalues when loadings view is active and we have < 30 PCs.
+        // The eigen thread checks the target atomically, so bumping it while
+        // the thread is still running causes it to compute more.
+        if view_mode == 5 && eigenvalues.len() < 30 && eigenvalues.len() < dim {
+            let desired = 30usize.min(dim);
+            let current_target = eigen_target.load(std::sync::atomic::Ordering::Relaxed);
+            if desired > current_target {
+                eigen_target.store(desired, std::sync::atomic::Ordering::Relaxed);
+                // If the thread already finished (phase3_done), un-mark it
+                // so we keep draining. The thread may have exited though —
+                // that's OK, we accept what we got.
+                if phase3_done {
+                    phase3_done = false;
+                }
+            }
+        }
+
         // ── Drain Phase 4 (projection) ──
         if phase3_done && !phase4_done {
             if let Some(ref rx) = proj_rx {
@@ -610,28 +702,35 @@ pub(super) fn run_interactive_explore(
         }
 
         // ── Status ──
+        frame_count += 1;
+        let all_done = phase1_done && phase2_done && phase3_done && phase4_done;
+        let spinner = if all_done { " " } else {
+            const SPIN: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+            SPIN[frame_count % SPIN.len()]
+        };
         status_msg = if !phase1_done {
             let rate = if elapsed > 0.0 { vectors_loaded as f64 / elapsed } else { 0.0 };
             let ci = last_cache_stats.as_ref().map(|cs| {
                 let pct = if cs.total_chunks > 0 { 100.0 * cs.valid_chunks as f64 / cs.total_chunks as f64 } else { 0.0 };
                 format!(" | cache {:.0}%", pct)
             }).unwrap_or_default();
-            format!("Reading: {}/{} ({:.0}/s){}", vectors_loaded, current_sample, rate, ci)
+            format!("{} Reading: {}/{} ({:.0}/s){}", spinner, vectors_loaded, current_sample, rate, ci)
         } else if !phase2_done || !phase3_done {
             let d_status = if phase2_done { format!("dists:{}", all_dists.len()) }
                 else { format!("dists:{}/{}", all_dists.len(), total_pairs) };
+            let et = eigen_target.load(std::sync::atomic::Ordering::Relaxed);
             let e_status = if phase3_done { format!("eigen:{}", eigenvalues.len()) }
                 else {
-                    let rem = num_eigenvalues.saturating_sub(eigenvalues.len());
+                    let rem = et.saturating_sub(eigenvalues.len());
                     let eta = rem as f64 * avg_eigen_ms / 1000.0;
-                    format!("eigen:{}/{} eta:{:.0}s", eigenvalues.len(), num_eigenvalues, eta)
+                    format!("eigen:{}/{} eta:{:.0}s", eigenvalues.len(), et, eta)
                 };
-            format!("Computing: {} | {}", d_status, e_status)
+            format!("{} {} | {}", spinner, d_status, e_status)
         } else if !phase4_done {
-            "Projecting...".into()
+            format!("{} Projecting...", spinner)
         } else {
             let t = *final_elapsed.get_or_insert(elapsed);
-            format!("Ready — {} vectors, {:.1}s total", vectors_loaded, t)
+            format!("  Ready — {} vectors, {:.1}s total", vectors_loaded, t)
         };
 
         // ── Stats line for current view ──
@@ -707,22 +806,55 @@ pub(super) fn run_interactive_explore(
                 );
             } else if show_help {
                 use ratatui::text::Line;
-                let help = vec![
-                    Line::from(Span::styled(" Keyboard Shortcuts", Style::default().fg(Color::Cyan))),
+                let mut help = vec![
+                    Line::from(Span::styled(
+                        format!(" Keyboard Shortcuts — {}", VIEW_NAMES[view_mode]),
+                        Style::default().fg(Color::Cyan))),
                     Line::from(""),
-                    Line::from(" 1-8 / Tab / PgUp/PgDn / F1-F8  Switch view"),
-                    Line::from(" b / B                           Fewer / more histogram bins"),
-                    Line::from(" ←→↑↓                           Rotate PCA (Y/X axes)"),
-                    Line::from(" a / d                           Rotate PCA (Z axis)"),
-                    Line::from(" w / s                           Rotate PCA (W tilt)"),
-                    Line::from(" c / C                           Slide component window (PC1-4 → PC2-5 → ...)"),
-                    Line::from(" x / X                           Rotate axis roles (X→Y→Z→color cycle)"),
-                    Line::from(" r                               Reset all rotations"),
-                    Line::from(" Space                           Double sample size"),
-                    Line::from(" + / =                           Increase sample by 50%"),
-                    Line::from(" ?                               Toggle this help"),
-                    Line::from(" q / Esc / Ctrl-C                Quit"),
+                    Line::from(" Navigation"),
+                    Line::from("   1-8 / Tab / PgDn/PgUp / F1-F8  Switch view"),
+                    Line::from("   /                               View theory & interpretation"),
+                    Line::from("   ?                               Toggle this help"),
+                    Line::from(""),
+                    Line::from(" Sample"),
+                    Line::from("   Space                           Double sample size"),
+                    Line::from("   + / =                           Increase sample by 50%"),
+                    Line::from("   r                               Reset sample size + rotations"),
+                    Line::from("   Esc                             Stop processing / quit"),
+                    Line::from("   q / Ctrl-C                      Quit"),
                 ];
+                // View-specific keys
+                let view_keys: Vec<Line> = match view_mode {
+                    0 | 2 => vec![
+                        Line::from(""),
+                        Line::from(" Histogram"),
+                        Line::from("   b / B                           Fewer / more bins"),
+                    ],
+                    1 | 3 => vec![],
+                    4 => vec![
+                        Line::from(""),
+                        Line::from(" Eigenvalue View"),
+                        Line::from("   m                               Cycle: Scree / CumVar / LogDecay"),
+                    ],
+                    5 => vec![
+                        Line::from(""),
+                        Line::from(" PCA Loadings"),
+                        Line::from("   m                               Toggle bar chart / heatmap"),
+                        Line::from("   b / B                           Halve / double dims per row (powers of 2)"),
+                    ],
+                    6 => vec![],
+                    7 => vec![
+                        Line::from(""),
+                        Line::from(" PCA Scatter"),
+                        Line::from("   ←→↑↓                           Rotate (Y/X axes)"),
+                        Line::from("   a / d                           Rotate (Z axis)"),
+                        Line::from("   w / s                           Rotate (W tilt)"),
+                        Line::from("   c / C                           Slide PC window (PC1-4 → PC2-5 → ...)"),
+                        Line::from("   x / X                           Rotate axis roles (X→Y→Z→color cycle)"),
+                    ],
+                    _ => vec![],
+                };
+                help.extend(view_keys);
                 frame.render_widget(
                     Paragraph::new(help).block(Block::default().borders(Borders::ALL).title(" Help ")),
                     chunks[1],
@@ -737,9 +869,13 @@ pub(super) fn run_interactive_explore(
                 3 => {
                     render_presorted_curve(frame, chunks[1], &sorted_dists, " Sorted Distances ", Color::Cyan);
                 }
-                4 => render_scree(frame, chunks[1], &eigenvalues),
-                5 => render_cumulative(frame, chunks[1], &eigenvalues),
-                6 => render_log_decay(frame, chunks[1], &eigenvalues),
+                4 => match eigen_sub_mode {
+                    0 => render_scree(frame, chunks[1], &eigenvalues),
+                    1 => render_cumulative(frame, chunks[1], &eigenvalues),
+                    _ => render_log_decay(frame, chunks[1], &eigenvalues),
+                },
+                5 => render_loadings(frame, chunks[1], &eigenvectors, &eigenvalues, loadings_bar_mode, loadings_band_size),
+                6 => render_variance_bars(frame, chunks[1], &eigenvalues),
                 7 => render_pca_scatter(frame, chunks[1], &projected, rot_y, rot_x, rot_z, rot_w, &pc_axes, 4),
                 _ => {}
             } } // close match + else
@@ -758,7 +894,14 @@ pub(super) fn run_interactive_explore(
             let view_controls: String = match view_mode {
                 0 | 2 => " b/B: fewer/more bins | +/Space: increase sample".into(),
                 1 | 3 => " +/Space: increase sample".into(),
-                4..=6 => String::new(),
+                4 => {
+                    let mode_name = ["Scree", "CumVar", "LogDecay"][eigen_sub_mode];
+                    format!(" m: cycle mode ({}) | +/Space: increase sample", mode_name)
+                }
+                5 => format!(" m: toggle {}, b/B: resolution ({} dims/row)",
+                    if loadings_bar_mode { "heatmap" } else { "bar chart" },
+                    if loadings_band_size == 0 { "auto".to_string() } else { loadings_band_size.to_string() }),
+                6 => String::new(),
                 7 => format!(" ←→↑↓ a/d w/s: rotate | c/C: slide PCs | x/X: swap axes [X:PC{} Y:PC{} Z:PC{} color:PC{}] | r +/Space",
                     pc_axes[0]+1, pc_axes[1]+1, pc_axes[2]+1, pc_axes[3]+1),
                 _ => String::new(),
@@ -766,18 +909,44 @@ pub(super) fn run_interactive_explore(
             frame.render_widget(Paragraph::new(Span::styled(
                 &view_controls, Style::default().fg(Color::DarkGray))), chunks[4]);
 
-            let sc = if phase4_done { Color::Green } else { Color::Yellow };
+            let sc = if all_done { Color::Green } else { Color::Yellow };
             frame.render_widget(Paragraph::new(Span::styled(&status_msg, Style::default().fg(sc))), chunks[5]);
         }).unwrap();
 
         // ── Events ──
-        let poll_ms = if phase4_done { 100 } else { 10 };
+        let poll_ms = if all_done { 100 } else { 10 };
         if event::poll(std::time::Duration::from_millis(poll_ms)).unwrap() {
             match event::read().unwrap() {
                 Event::Key(key) => {
                     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) { break; }
                     match key.code {
-                        KeyCode::Char('q') | KeyCode::Esc => break,
+                        KeyCode::Char('q') => {
+                            exit_reason = ExploreExit::Quit;
+                            break;
+                        }
+                        KeyCode::Esc => {
+                            if !all_done {
+                                // First Esc: stop processing
+                                phase1_done = true;
+                                phase2_done = true;
+                                phase3_done = true;
+                                phase4_done = true;
+                                dist_rx = None;
+                                eigen_rx = None;
+                                proj_rx = None;
+                                last_esc = None;
+                            } else {
+                                // Double-tap Esc to exit
+                                let now = std::time::Instant::now();
+                                if let Some(prev) = last_esc {
+                                    if now.duration_since(prev).as_millis() < 500 {
+                                        exit_reason = ExploreExit::Back;
+                                        break;
+                                    }
+                                }
+                                last_esc = Some(now);
+                            }
+                        }
                         KeyCode::Char('?') => { show_help = !show_help; show_info = false; }
                         KeyCode::Char('/') => { show_info = !show_info; show_help = false; info_scroll = 0; }
                         // Arrow keys scroll info when info panel is open
@@ -793,9 +962,33 @@ pub(super) fn run_interactive_explore(
                         KeyCode::Char('6') => view_mode = 5,
                         KeyCode::Char('7') => view_mode = 6,
                         KeyCode::Char('8') => view_mode = 7,
-                        KeyCode::Char('0') => view_mode = 9,
+                        KeyCode::Char('b') if view_mode == 5 => {
+                            // Loadings: halve band size (powers of 2)
+                            if loadings_band_size == 0 {
+                                let th = crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(40);
+                                loadings_band_size = (dim as f64 / th.saturating_sub(8) as f64).ceil() as usize;
+                                // Round up to next power of 2
+                                loadings_band_size = loadings_band_size.next_power_of_two();
+                            }
+                            loadings_band_size = (loadings_band_size / 2).max(1);
+                        }
+                        KeyCode::Char('B') if view_mode == 5 => {
+                            // Loadings: double band size (powers of 2)
+                            if loadings_band_size == 0 {
+                                let th = crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(40);
+                                loadings_band_size = (dim as f64 / th.saturating_sub(8) as f64).ceil() as usize;
+                                loadings_band_size = loadings_band_size.next_power_of_two();
+                            }
+                            loadings_band_size = (loadings_band_size * 2).min(dim);
+                        }
+                        KeyCode::Char('m') if view_mode == 4 => {
+                            eigen_sub_mode = (eigen_sub_mode + 1) % 3;
+                        }
+                        KeyCode::Char('m') if view_mode == 5 => {
+                            loadings_bar_mode = !loadings_bar_mode;
+                        }
                         KeyCode::Char('b') => {
-                            if num_bins == 0 { num_bins = 100; } // switch from auto to manual
+                            if num_bins == 0 { num_bins = 100; }
                             num_bins = num_bins.saturating_sub(5).max(10);
                         }
                         KeyCode::Char('B') => {
@@ -811,7 +1004,14 @@ pub(super) fn run_interactive_explore(
                         KeyCode::Char('d') if view_mode == 7 => { rot_z += 0.1; }
                         KeyCode::Char('w') if view_mode == 7 => { rot_w -= 0.1; }
                         KeyCode::Char('s') if view_mode == 7 => { rot_w += 0.1; }
-                        KeyCode::Char('r') => { rot_y = 0.0; rot_x = 0.0; rot_z = 0.0; rot_w = 0.0; }
+                        KeyCode::Char('r') => {
+                            rot_y = 0.0; rot_x = 0.0; rot_z = 0.0; rot_w = 0.0;
+                            if current_sample != sample_size.min(total) {
+                                current_sample = sample_size.min(total);
+                                restart = true;
+                                break;
+                            }
+                        }
                         // c/C: slide the component window (PC1-4 → PC2-5 → PC3-6...)
                         KeyCode::Char('c') if view_mode == 7 => {
                             let max_pc = eigenvalues.len().max(5);
@@ -841,7 +1041,7 @@ pub(super) fn run_interactive_explore(
                         // Page Up/Down for view switching
                         KeyCode::PageDown => { view_mode = (view_mode + 1) % NUM_VIEWS; }
                         KeyCode::PageUp => { view_mode = (view_mode + NUM_VIEWS - 1) % NUM_VIEWS; }
-                        // Function keys F1-F10 as view shortcuts
+                        // Function keys F1-F8 as view shortcuts
                         KeyCode::F(n) if (1..=10).contains(&n) => { view_mode = (n as usize - 1) % NUM_VIEWS; }
                         // Sample size expansion
                         KeyCode::Char(' ') if current_sample < total => {
@@ -868,6 +1068,7 @@ pub(super) fn run_interactive_explore(
 
     let _ = disable_raw_mode();
     let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
+    exit_reason
 }
 
 // ---------------------------------------------------------------------------
@@ -879,7 +1080,7 @@ fn render_histogram(
     values: &[f64], stats: &WelfordStats, num_bins: usize, title: &str, color: Color,
 ) {
     if values.is_empty() {
-        frame.render_widget(Paragraph::new("  Waiting for data...").block(Block::default().borders(Borders::ALL).title(title)), area);
+        frame.render_widget(Block::default().borders(Borders::ALL).title(title), area);
         return;
     }
     // Auto bins: use available width minus borders (2 chars)
@@ -919,7 +1120,7 @@ fn render_presorted_curve(
     sorted: &[f64], title: &str, color: Color,
 ) {
     if sorted.len() < 2 {
-        frame.render_widget(Paragraph::new("  Waiting for data...").block(Block::default().borders(Borders::ALL).title(title)), area);
+        frame.render_widget(Block::default().borders(Borders::ALL).title(title), area);
         return;
     }
     let n = sorted.len();
@@ -943,7 +1144,7 @@ fn render_sorted_curve(
     values: &[f64], title: &str, color: Color,
 ) {
     if values.len() < 2 {
-        frame.render_widget(Paragraph::new("  Waiting for data...").block(Block::default().borders(Borders::ALL).title(title)), area);
+        frame.render_widget(Block::default().borders(Borders::ALL).title(title), area);
         return;
     }
     let mut sorted = values.to_vec();
@@ -960,7 +1161,7 @@ fn render_sorted_curve(
 
 fn render_scree(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, eigenvalues: &[f64]) {
     if eigenvalues.len() < 2 {
-        frame.render_widget(Paragraph::new("  Computing eigenvalues...").block(Block::default().borders(Borders::ALL).title(" Scree Plot ")), area);
+        frame.render_widget(Block::default().borders(Borders::ALL).title(" Scree Plot "), area);
         return;
     }
     let data: Vec<(f64, f64)> = eigenvalues.iter().enumerate().map(|(i, &v)| (i as f64, v)).collect();
@@ -984,7 +1185,7 @@ fn render_scree(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, eigenva
 
 fn render_cumulative(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, eigenvalues: &[f64]) {
     if eigenvalues.is_empty() {
-        frame.render_widget(Paragraph::new("  Computing...").block(Block::default().borders(Borders::ALL).title(" Cumulative Variance ")), area);
+        frame.render_widget(Block::default().borders(Borders::ALL).title(" Cumulative Variance "), area);
         return;
     }
     let total: f64 = eigenvalues.iter().sum();
@@ -1015,7 +1216,7 @@ fn render_cumulative(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, ei
 
 fn render_log_decay(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, eigenvalues: &[f64]) {
     if eigenvalues.len() < 2 {
-        frame.render_widget(Paragraph::new("  Computing...").block(Block::default().borders(Borders::ALL).title(" Log Eigenvalue Decay ")), area);
+        frame.render_widget(Block::default().borders(Borders::ALL).title(" Log Eigenvalue Decay "), area);
         return;
     }
     let data: Vec<(f64, f64)> = eigenvalues.iter().enumerate().filter(|(_, v)| **v > 0.0).map(|(i, &v)| (i as f64, v.ln())).collect();
@@ -1038,14 +1239,255 @@ fn render_log_decay(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, eig
     frame.render_widget(chart, area);
 }
 
+fn render_loadings(
+    frame: &mut ratatui::Frame,
+    area: ratatui::layout::Rect,
+    eigenvectors: &[Vec<f64>],
+    eigenvalues: &[f64],
+    bar_mode: bool,
+    manual_band_size: usize,
+) {
+    use ratatui::text::{Line, Span};
+
+    if eigenvectors.is_empty() {
+        frame.render_widget(
+            Block::default().borders(Borders::ALL).title(" PCA Loadings "),
+            area,
+        );
+        return;
+    }
+
+    let num_pcs = eigenvectors.len();
+    let dim = eigenvectors[0].len();
+    let inner_h = area.height.saturating_sub(2) as usize;
+    let inner_w = area.width.saturating_sub(2) as usize;
+    if inner_h < 3 || inner_w < 10 { return; }
+
+    // Reserve rows: 1 header + 1 legend (heatmap) or 1 header (bars)
+    let legend_rows = if bar_mode { 0 } else { 1 };
+    let data_rows = inner_h.saturating_sub(1 + legend_rows);
+    let band_size = if manual_band_size > 0 {
+        manual_band_size.max(1).min(dim)
+    } else {
+        // Auto-fit: exactly fill the available vertical space
+        (dim as f64 / data_rows as f64).ceil() as usize
+    }.max(1);
+    let num_bands = (dim + band_size - 1) / band_size;
+
+    let total_ev: f64 = eigenvalues.iter().sum();
+
+    let global_max = eigenvectors.iter()
+        .flat_map(|v| v.iter())
+        .map(|x| x.abs())
+        .fold(0.0f64, f64::max)
+        .max(1e-12);
+
+    // Helper: compute max absolute loading for a band in a PC
+    let band_loading = |pc: usize, d_start: usize, d_end: usize| -> f64 {
+        (d_start..d_end)
+            .filter_map(|d| eigenvectors.get(pc).and_then(|v| v.get(d)))
+            .map(|x| x.abs())
+            .fold(0.0f64, f64::max)
+    };
+
+    let label_w = if dim >= 1000 { 10 } else { 8 };
+
+    let band_label = |d_start: usize, d_end: usize| -> String {
+        if band_size == 1 {
+            format!("{:<w$}", format!("d{}", d_start), w = label_w)
+        } else {
+            format!("{:<w$}", format!("d{}-{}", d_start, d_end - 1), w = label_w)
+        }
+    };
+
+    if bar_mode {
+        let bar_w_per_pc = ((inner_w - label_w) / num_pcs.max(1)).max(4);
+        let max_pcs = ((inner_w - label_w) / bar_w_per_pc).min(num_pcs);
+        let bar_fill = bar_w_per_pc.saturating_sub(1);
+
+        // Header
+        let mut header_spans = vec![Span::styled(
+            format!("{:<w$}", "", w = label_w),
+            Style::default().fg(Color::DarkGray),
+        )];
+        for pc in 0..max_pcs {
+            let pct = if total_ev > 0.0 { 100.0 * eigenvalues.get(pc).unwrap_or(&0.0) / total_ev } else { 0.0 };
+            header_spans.push(Span::styled(
+                format!("{:<w$}", format!("PC{} {:.0}%", pc + 1, pct), w = bar_w_per_pc),
+                Style::default().fg(Color::Yellow),
+            ));
+        }
+
+        let mut lines = vec![Line::from(header_spans)];
+        for band in 0..num_bands.min(data_rows) {
+            let d_start = band * band_size;
+            let d_end = (d_start + band_size).min(dim);
+            let mut spans = vec![Span::styled(band_label(d_start, d_end), Style::default().fg(Color::DarkGray))];
+
+            for pc in 0..max_pcs {
+                let intensity = band_loading(pc, d_start, d_end) / global_max;
+                let filled = (intensity * bar_fill as f64).round() as usize;
+                let color = loading_color(intensity);
+
+                // Show numeric value if bar is wide enough (>= 6 chars)
+                if bar_fill >= 6 {
+                    let val_str = format!("{:.2}", intensity);
+                    let val_len = val_str.len();
+                    if filled >= val_len + 1 {
+                        let bar = format!("{}{}{} ",
+                            "█".repeat(filled - val_len),
+                            val_str,
+                            " ".repeat(bar_fill.saturating_sub(filled)));
+                        spans.push(Span::styled(bar, Style::default().fg(color)));
+                    } else {
+                        let bar = format!("{}{} ",
+                            "█".repeat(filled),
+                            " ".repeat(bar_fill.saturating_sub(filled)));
+                        spans.push(Span::styled(bar, Style::default().fg(color)));
+                    }
+                } else {
+                    let bar = format!("{}{} ",
+                        "█".repeat(filled),
+                        " ".repeat(bar_fill.saturating_sub(filled)));
+                    spans.push(Span::styled(bar, Style::default().fg(color)));
+                }
+            }
+            lines.push(Line::from(spans));
+        }
+
+        let title = format!(" PCA Loadings (bars) — {} dims x {} PCs (band={}) ", dim, max_pcs, band_size);
+        frame.render_widget(Paragraph::new(lines)
+            .block(Block::default().borders(Borders::ALL).title(title)), area);
+    } else {
+        // Heatmap mode
+        let pc_col_w = 3;
+        let max_pcs = ((inner_w - label_w) / pc_col_w).min(num_pcs);
+
+        // Header with PC variance percentages
+        let mut header_spans = vec![Span::styled(
+            format!("{:<w$}", "dim", w = label_w),
+            Style::default().fg(Color::DarkGray),
+        )];
+        for pc in 0..max_pcs {
+            let pct = if total_ev > 0.0 { 100.0 * eigenvalues.get(pc).unwrap_or(&0.0) / total_ev } else { 0.0 };
+            header_spans.push(Span::styled(
+                format!("{:>w$}", format!("{:.0}%", pct), w = pc_col_w),
+                Style::default().fg(Color::Yellow),
+            ));
+        }
+
+        let mut lines = vec![Line::from(header_spans)];
+        for band in 0..num_bands.min(data_rows) {
+            let d_start = band * band_size;
+            let d_end = (d_start + band_size).min(dim);
+            let mut spans = vec![Span::styled(band_label(d_start, d_end), Style::default().fg(Color::DarkGray))];
+
+            for pc in 0..max_pcs {
+                let intensity = band_loading(pc, d_start, d_end) / global_max;
+                let color = loading_color(intensity);
+                let ch = loading_char(intensity);
+                spans.push(Span::styled(
+                    format!("{:>w$}", ch, w = pc_col_w),
+                    Style::default().fg(color),
+                ));
+            }
+            lines.push(Line::from(spans));
+        }
+
+        // Legend row
+        let legend = Line::from(vec![
+            Span::styled(format!("{:<w$}", "", w = label_w), Style::default()),
+            Span::styled("· ", Style::default().fg(Color::DarkGray)),
+            Span::styled("<0.1 ", Style::default().fg(Color::DarkGray)),
+            Span::styled("░ ", Style::default().fg(Color::Blue)),
+            Span::styled("<0.3 ", Style::default().fg(Color::Blue)),
+            Span::styled("▒ ", Style::default().fg(Color::Cyan)),
+            Span::styled("<0.5 ", Style::default().fg(Color::Cyan)),
+            Span::styled("▓ ", Style::default().fg(Color::Yellow)),
+            Span::styled("<0.7 ", Style::default().fg(Color::Yellow)),
+            Span::styled("█ ", Style::default().fg(Color::Red)),
+            Span::styled(">=0.7", Style::default().fg(Color::Red)),
+        ]);
+        lines.push(legend);
+
+        let title = format!(" PCA Loadings — {} dims x {} PCs (band={}) ", dim, max_pcs, band_size);
+        frame.render_widget(Paragraph::new(lines)
+            .block(Block::default().borders(Borders::ALL).title(title)), area);
+    }
+}
+
+/// Map loading intensity [0,1] to a color ramp: Blue → Cyan → Yellow → Red.
+fn loading_color(t: f64) -> Color {
+    if t < 0.25 {
+        Color::DarkGray
+    } else if t < 0.5 {
+        Color::Blue
+    } else if t < 0.7 {
+        Color::Cyan
+    } else if t < 0.85 {
+        Color::Yellow
+    } else {
+        Color::Red
+    }
+}
+
+/// Map loading intensity to a block character for density.
+fn loading_char(t: f64) -> &'static str {
+    if t < 0.1 { "·" }
+    else if t < 0.3 { "░" }
+    else if t < 0.5 { "▒" }
+    else if t < 0.7 { "▓" }
+    else { "█" }
+}
+
+fn render_variance_bars(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, eigenvalues: &[f64]) {
+    use ratatui::widgets::{BarChart, Bar, BarGroup};
+
+    if eigenvalues.is_empty() {
+        frame.render_widget(
+            Block::default().borders(Borders::ALL).title(" Variance Explained per PC "),
+            area,
+        );
+        return;
+    }
+
+    let total: f64 = eigenvalues.iter().sum();
+    if total == 0.0 { return; }
+
+    let bars: Vec<Bar> = eigenvalues.iter().enumerate().map(|(i, &v)| {
+        let pct = 100.0 * v / total;
+        Bar::default()
+            .value(pct as u64)
+            .label(format!("PC{}", i + 1).into())
+            .style(Style::default().fg(if i < 3 {
+                Color::Yellow
+            } else if pct > 5.0 {
+                Color::Green
+            } else {
+                Color::DarkGray
+            }))
+            .text_value(format!("{:.1}%", pct))
+    }).collect();
+
+    let bar_group = BarGroup::default().bars(&bars);
+    let chart = BarChart::default()
+        .block(Block::default().borders(Borders::ALL)
+            .title(" Variance Explained per Principal Component "))
+        .data(bar_group)
+        .bar_width(6)
+        .bar_gap(1)
+        .value_style(Style::default().fg(Color::White));
+    frame.render_widget(chart, area);
+}
+
 fn render_pca_scatter(
     frame: &mut ratatui::Frame, area: ratatui::layout::Rect,
     projected: &[[f64; 5]], rot_y: f64, rot_x: f64, rot_z: f64, rot_w: f64,
     pc_axes: &[usize; 5], dims: usize,
 ) {
     if projected.is_empty() {
-        let title = format!(" {}D Scatter — computing... ", dims);
-        frame.render_widget(Paragraph::new("  Projecting...").block(Block::default().borders(Borders::ALL).title(title)), area);
+        let title = format!(" {}D Scatter ", dims);
+        frame.render_widget(Block::default().borders(Borders::ALL).title(title), area);
         return;
     }
 

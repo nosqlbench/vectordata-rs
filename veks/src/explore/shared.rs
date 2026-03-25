@@ -35,6 +35,37 @@ pub(crate) fn parse_sample_mode(s: &str) -> Result<SampleMode, String> {
     }
 }
 
+/// Completer for `--profile`: suggests profiles from the dataset already
+/// specified via `--dataset` on the command line.
+pub(crate) fn profile_completer(current: &std::ffi::OsStr) -> Vec<clap_complete::CompletionCandidate> {
+    let prefix = current.to_string_lossy().to_lowercase();
+
+    // Find --dataset value from the command line
+    let args: Vec<String> = std::env::args().collect();
+    let dataset_name = args.windows(2)
+        .find(|w| w[0] == "--dataset")
+        .map(|w| w[1].clone());
+
+    let dataset_name = match dataset_name {
+        Some(name) => name.split(':').next().unwrap_or(&name).to_string(),
+        None => return Vec::new(),
+    };
+
+    // Load catalog and find the dataset
+    let sources = crate::catalog::sources::CatalogSources::new().configure_default();
+    if sources.is_empty() { return Vec::new(); }
+    let catalog = crate::catalog::resolver::Catalog::of(&sources);
+    let entry = match catalog.find_exact(&dataset_name) {
+        Some(e) => e,
+        None => return Vec::new(),
+    };
+
+    entry.profile_names().into_iter()
+        .filter(|p| prefix.is_empty() || p.to_lowercase().starts_with(&prefix))
+        .map(|p| clap_complete::CompletionCandidate::new(p))
+        .collect()
+}
+
 /// Completer for `--sample-mode`.
 pub(crate) fn sample_mode_completer(current: &std::ffi::OsStr) -> Vec<clap_complete::CompletionCandidate> {
     let prefix = current.to_string_lossy().to_lowercase();

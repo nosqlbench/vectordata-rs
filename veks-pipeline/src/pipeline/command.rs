@@ -234,8 +234,11 @@ impl std::fmt::Display for Status {
 pub enum ArtifactState {
     /// Output exists and passes bound checks — no work needed.
     Complete,
-    /// Output exists but is incomplete or corrupt.
+    /// Output exists but is incomplete — must be deleted and restarted.
     Partial,
+    /// Output exists but is incomplete — can be resumed incrementally.
+    /// The command handles picking up where it left off.
+    PartialResumable,
     /// Output does not exist.
     Absent,
     /// Output exists but its format is unrecognized, so completeness

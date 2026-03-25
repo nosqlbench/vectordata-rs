@@ -143,6 +143,36 @@ pub enum DatasetsCommand {
         #[command(subcommand)]
         command: ConfigSubcommand,
     },
+    /// Show cache status for a dataset (merkle coverage, sizes, completion)
+    CacheStatus {
+        /// Dataset name from catalog (omit with --all for all cached datasets)
+        #[arg(long, add = ArgValueCompleter::new(crate::explore::shared::dataset_completer))]
+        dataset: Option<String>,
+
+        /// Show status for all cached datasets
+        #[arg(long)]
+        all: bool,
+
+        /// Show per-chunk RLE coverage detail
+        #[arg(long, short = 'v')]
+        verbose: bool,
+
+        /// Show file tree of the cache directory
+        #[arg(long)]
+        tree: bool,
+
+        /// Configuration directory containing catalogs.yaml
+        #[arg(long, default_value = "~/.config/vectordata")]
+        configdir: String,
+
+        /// Additional catalog directories, file paths, or HTTP URLs
+        #[arg(long, add = ArgValueCompleter::new(catalog_completer))]
+        catalog: Vec<String>,
+
+        /// Catalog URLs or paths to use *instead* of configured catalogs
+        #[arg(long = "at")]
+        at: Vec<String>,
+    },
     /// Download and cache dataset facets locally
     Prebuffer {
         /// Dataset name or dataset:profile from catalog
@@ -209,7 +239,7 @@ pub fn run(args: DatasetsArgs) {
     match args.command {
         DatasetsCommand::List {
             configdir,
-            catalog,
+            catalog: raw_catalog,
             at,
             output_format,
             verbose,
@@ -236,6 +266,9 @@ pub fn run(args: DatasetsArgs) {
                 cache::run(cache_dir.as_deref(), verbose);
                 return;
             }
+            // Resolve numbered catalog shortcuts
+            let catalog: Vec<String> = raw_catalog.iter().map(|v| resolve_catalog_value(v)).collect();
+
             // Normalize glob patterns to regex
             let name = matching_name.map(|p| filter::normalize_match_pattern(&p, "--matching-name"));
             let desc = matching_desc.map(|p| filter::normalize_match_pattern(&p, "--matching-desc"));
@@ -270,7 +303,28 @@ pub fn run(args: DatasetsArgs) {
         DatasetsCommand::Config { command } => {
             run_config_command(command);
         }
-        DatasetsCommand::Prebuffer { dataset, profile, configdir, catalog, at, cache_dir } => {
+        DatasetsCommand::CacheStatus { dataset, all, verbose, tree, configdir, catalog: raw_catalog, at } => {
+            let catalog: Vec<String> = raw_catalog.iter().map(|v| resolve_catalog_value(v)).collect();
+            if all {
+                cache::run_cache_status_all(verbose, &configdir, &catalog, &at);
+            } else if let Some(ds) = dataset {
+                cache::run_cache_status(&ds, verbose, &configdir, &catalog, &at);
+                if tree {
+                    let cache_dir = crate::pipeline::commands::config::configured_cache_dir();
+                    let ds_cache = cache_dir.join(&ds);
+                    if ds_cache.is_dir() {
+                        println!();
+                        println!("  File tree:");
+                        cache::print_cache_tree(&ds_cache);
+                    }
+                }
+            } else {
+                eprintln!("Specify --dataset <name> or --all");
+                std::process::exit(1);
+            }
+        }
+        DatasetsCommand::Prebuffer { dataset, profile, configdir, catalog: raw_catalog, at, cache_dir } => {
+            let catalog: Vec<String> = raw_catalog.iter().map(|v| resolve_catalog_value(v)).collect();
             let ds = match profile {
                 Some(p) => format!("{}:{}", dataset.split(':').next().unwrap_or(&dataset), p),
                 None => dataset,
@@ -345,6 +399,9 @@ fn run_config_command(command: ConfigSubcommand) {
 }
 
 /// Completer for `--catalog`: suggests configured catalog sources from catalogs.yaml.
+/// Completer for `--catalog`: suggests numbered shortcuts for configured
+/// catalogs (e.g., `1`, `2`) with the URL shown as a description.
+/// The user can also type a free-form URL directly.
 fn catalog_completer(current: &std::ffi::OsStr) -> Vec<clap_complete::CompletionCandidate> {
     let prefix = current.to_string_lossy();
     let config_dir = crate::catalog::sources::expand_tilde(
@@ -352,9 +409,37 @@ fn catalog_completer(current: &std::ffi::OsStr) -> Vec<clap_complete::Completion
     );
     let entries = crate::catalog::sources::raw_catalog_entries(&config_dir);
     entries.iter()
-        .filter(|e| prefix.is_empty() || e.starts_with(prefix.as_ref()))
-        .map(|e| clap_complete::CompletionCandidate::new(e.as_str()))
+        .enumerate()
+        .filter(|(i, _)| {
+            let num = format!("{}", i + 1);
+            prefix.is_empty() || num.starts_with(prefix.as_ref())
+        })
+        .map(|(i, url)| {
+            let label = format!("{}", i + 1);
+            let help: clap_complete::CompletionCandidate = clap_complete::CompletionCandidate::new(&label)
+                .help(Some(url.clone().into()));
+            help
+        })
         .collect()
+}
+
+/// Resolve a `--catalog` value: if it's a number, look up the configured
+/// catalog by index (1-based). Otherwise use it as a literal URL/path.
+fn resolve_catalog_value(value: &str) -> String {
+    if let Ok(n) = value.parse::<usize>() {
+        if n >= 1 {
+            let config_dir = crate::catalog::sources::expand_tilde(
+                crate::catalog::sources::DEFAULT_CONFIG_DIR,
+            );
+            let entries = crate::catalog::sources::raw_catalog_entries(&config_dir);
+            if let Some(url) = entries.get(n - 1) {
+                return url.clone();
+            }
+        }
+        eprintln!("Error: catalog #{} not found. Use 'veks datasets config list-catalogs' to see available catalogs.", value);
+        std::process::exit(1);
+    }
+    value.to_string()
 }
 
 /// Manage catalog sources in `~/.config/vectordata/catalogs.yaml`.

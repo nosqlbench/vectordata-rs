@@ -292,6 +292,24 @@ read(offset, len) →
   4. Return bytes
 ```
 
+### Dataset Metadata Caching
+
+When `RemoteDatasetView::open` is called, `dataset.yaml` is fetched
+and cached to the local cache directory **before** any vector data is
+downloaded. This ensures the metadata is available locally for tools
+that inspect cache directories.
+
+Freshness is maintained using HTTP `Last-Modified` timestamps:
+
+1. On first access: GET `dataset.yaml`, write to cache, set local
+   mtime to the remote `Last-Modified` value.
+2. On subsequent access: HEAD request to check remote `Last-Modified`.
+   If the remote timestamp is newer than local mtime, re-download.
+   Otherwise skip (no data transferred).
+
+This approach avoids re-downloading on every open while detecting
+remote changes (e.g., after re-publishing with new profiles).
+
 ### Initialization
 
 ```

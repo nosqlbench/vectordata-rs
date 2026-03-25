@@ -81,10 +81,12 @@ pub fn is_catalog_staleness_exempt(name: &str) -> bool {
         || name.ends_with(".mref")
 }
 
-/// Files that should never receive merkle coverage.
+/// Files that should not receive their own merkle coverage.
 ///
-/// Includes infrastructure files, merkle state files themselves, and
-/// excluded file types.
+/// Infrastructure files at the dataset root level (dataset.yaml, catalog
+/// files, variables.yaml) are too small to benefit from chunked merkle
+/// verification. Everything within `profiles/` gets coverage categorically.
+/// Merkle state files themselves and excluded files are always exempt.
 pub fn is_merkle_exempt(name: &str) -> bool {
     is_infrastructure_file(name)
         || name.ends_with(".mref")
@@ -143,15 +145,20 @@ mod tests {
 
     #[test]
     fn test_merkle_exempt() {
+        // Infrastructure files at dataset root — exempt (too small)
         assert!(is_merkle_exempt("dataset.yaml"));
         assert!(is_merkle_exempt("catalog.json"));
         assert!(is_merkle_exempt("variables.yaml"));
+        // Merkle files themselves — exempt
         assert!(is_merkle_exempt("base.fvec.mref"));
         assert!(is_merkle_exempt("data.mrkl"));
+        // Excluded files — exempt
         assert!(is_merkle_exempt(".hidden"));
         assert!(is_merkle_exempt("data.tmp"));
+        // Data files — get merkle coverage
         assert!(!is_merkle_exempt("base.fvec"));
-        assert!(!is_merkle_exempt("profiles"));
+        assert!(!is_merkle_exempt("neighbor_indices.ivec"));
+        assert!(!is_merkle_exempt("metadata.slab"));
     }
 
     #[test]

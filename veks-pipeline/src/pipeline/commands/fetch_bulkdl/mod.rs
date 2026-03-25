@@ -16,10 +16,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use log::{error, info, warn};
 
 use config::{StatusFile, parse_token_spec};
-use download::{download_file, head_content_length};
+use download::{download_file, head_content_length_retry};
 use expand::expand_tokens;
 use crate::pipeline::command::{
     ArtifactState, CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options,
@@ -35,8 +34,8 @@ pub fn factory() -> Box<dyn CommandOp> {
 
 /// Result sent from a download worker back to the main thread.
 enum DownloadResult {
-    /// File successfully downloaded or skipped (already correct size).
-    Ok(String),
+    /// File successfully downloaded or skipped. Includes filename and bytes.
+    Ok(String, u64),
     /// All retry attempts failed.
     Failed,
 }
@@ -180,19 +179,66 @@ pipeline runs, picking up where it left off after interruptions.
         let status_path = output_dir.join(".down-rs-status.json");
         let status = Arc::new(Mutex::new(StatusFile::load(&status_path)));
 
-        // Filter out already completed files
-        let pending: Vec<(String, String)> = {
-            let st = status.lock().unwrap();
-            all_files
-                .into_iter()
-                .filter(|(_, filename)| !st.completed.contains(filename))
-                .collect()
-        };
+        // Filter out already completed files.
+        // Two checks: (1) status file from previous runs, and (2) local
+        // file size matches a quick HEAD check. This avoids sending files
+        // to workers that are already fully downloaded but weren't in the
+        // status file (e.g., first run after a manual download).
+        let mut pending: Vec<(String, String)> = Vec::new();
+        let mut pending_bytes: u64 = 0;
+        let mut skipped_status = 0usize;
+        let mut skipped_size = 0usize;
+        let verify_pb = ctx.ui.bar_with_unit(total as u64, "verifying", "files");
+        {
+            let mut st = status.lock().unwrap();
+            for (idx, (url, filename)) in all_files.into_iter().enumerate() {
+                verify_pb.set_position(idx as u64 + 1);
+                if st.completed.contains(&filename) {
+                    skipped_status += 1;
+                    continue;
+                }
+                let dest = output_dir.join(&filename);
+                if dest.exists() {
+                    if let Ok(meta) = fs::metadata(&dest) {
+                        let local_len = meta.len();
+                        if local_len > 0 {
+                            verify_pb.set_message(format!("checking {}", filename));
+                            match head_content_length_retry(&url, 10) {
+                                Ok(remote_len) if local_len == remote_len => {
+                                    st.completed.push(filename.clone());
+                                    skipped_size += 1;
+                                    continue;
+                                }
+                                Ok(remote_len) => {
+                                    ctx.ui.log(&format!("size mismatch {}: local={} remote={}, re-downloading",
+                                        filename, local_len, remote_len));
+                                    pending_bytes += remote_len;
+                                }
+                                Err(e) => {
+                                    ctx.ui.log(&format!("WARNING: could not verify {}: {}", filename, e));
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    verify_pb.set_message(format!("sizing {}", filename));
+                    if let Ok(remote_len) = head_content_length_retry(&url, 3) {
+                        pending_bytes += remote_len;
+                    }
+                }
+                pending.push((url, filename));
+            }
+            if skipped_size > 0 {
+                let _ = st.save(&status_path);
+            }
+        }
 
-        let already_done = total - pending.len();
+        verify_pb.finish();
+
+        let already_done = skipped_status + skipped_size;
         ctx.ui.log(&format!(
-            "bulkdl: {} total files, {} already completed, {} to download",
-            total, already_done, pending.len()
+            "bulkdl: {} total, {} from status, {} size-verified, {} to download",
+            total, skipped_status, skipped_size, pending.len()
         ));
 
         if pending.is_empty() {
@@ -204,8 +250,12 @@ pipeline runs, picking up where it left off after interruptions.
             };
         }
 
-        let pb = ctx.ui.bar_with_unit(total as u64, "downloading", "files");
-        pb.set_position(already_done as u64);
+        let pb = if pending_bytes > 0 {
+            ctx.ui.bar_with_unit(pending_bytes, "downloading", "bytes")
+        } else {
+            ctx.ui.bar_with_unit(pending.len() as u64, "downloading", "files")
+        };
+        let byte_bar = pending_bytes > 0;
         let pb_id = pb.id();
 
         // Channel-based work stealing: a bounded work queue feeds N
@@ -222,11 +272,13 @@ pipeline runs, picking up where it left off after interruptions.
 
         // Spawn persistent worker threads
         let mut workers = Vec::with_capacity(concurrency);
-        for _ in 0..concurrency {
+        for worker_id in 0..concurrency {
             let rx = Arc::clone(&rx);
             let result_tx = result_tx.clone();
             let output_dir = output_dir.clone();
             let ui = ctx.ui.clone();
+            let w_pb_id = pb_id;
+            let w_byte_bar = byte_bar;
 
             workers.push(std::thread::spawn(move || {
                 loop {
@@ -237,15 +289,20 @@ pipeline runs, picking up where it left off after interruptions.
 
                     let dest = output_dir.join(&filename);
 
-                    // Check if file already exists with correct size via HEAD
+                    // Check if file already exists with correct size via HEAD (with retries)
                     if dest.exists() {
-                        if let Some(remote_len) = head_content_length(&url) {
-                            if let Ok(meta) = fs::metadata(&dest) {
-                                if meta.len() == remote_len {
-                                    info!("Skipping {} (size matches)", filename);
-                                    ui.inc_by_id(pb_id, 1);
-                                    let _ = result_tx.send(DownloadResult::Ok(filename));
-                                    continue;
+                        if let Ok(meta) = fs::metadata(&dest) {
+                            if meta.len() > 0 {
+                                if let Ok(remote_len) = head_content_length_retry(&url, 10) {
+                                    if meta.len() == remote_len {
+                                        ui.log(&format!("[w{}] skip {} ({})",
+                                            worker_id, filename, format_size(remote_len)));
+                                        let _ = result_tx.send(DownloadResult::Ok(filename, 0));
+                                        continue;
+                                    } else {
+                                        ui.log(&format!("[w{}] size mismatch {}: local={} remote={}",
+                                            worker_id, filename, meta.len(), remote_len));
+                                    }
                                 }
                             }
                         }
@@ -255,27 +312,48 @@ pipeline runs, picking up where it left off after interruptions.
                     let mut last_err = String::new();
                     let mut succeeded = false;
                     for attempt in 1..=tries {
-                        info!("Downloading {} (attempt {}/{})", url, attempt, tries);
-                        match download_file(&url, &dest) {
+                        if attempt == 1 {
+                            ui.log(&format!("[w{}] {}", worker_id, filename));
+                        } else {
+                            ui.log(&format!("[w{}] {} (retry, tries {}/{})",
+                                worker_id, filename, attempt, tries));
+                        }
+                        let t0 = Instant::now();
+                        // Track bytes for live progress bar updates
+                        let prev_reported = std::sync::atomic::AtomicU64::new(0);
+                        let ui_ref = &ui;
+                        let on_bytes = |total_written: u64| {
+                            if w_byte_bar {
+                                let prev = prev_reported.load(std::sync::atomic::Ordering::Relaxed);
+                                let delta = total_written.saturating_sub(prev);
+                                if delta > 0 {
+                                    ui_ref.inc_by_id(w_pb_id, delta);
+                                    prev_reported.store(total_written, std::sync::atomic::Ordering::Relaxed);
+                                }
+                            }
+                        };
+                        match download_file(&url, &dest, &on_bytes) {
                             Ok(()) => {
-                                info!("Completed: {}", filename);
-                                ui.inc_by_id(pb_id, 1);
-                                let _ = result_tx.send(DownloadResult::Ok(filename.clone()));
+                                let file_size = fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
+                                let secs = t0.elapsed().as_secs_f64();
+                                let mbps = if secs > 0.0 { file_size as f64 / 1_048_576.0 / secs } else { 0.0 };
+                                ui.log(&format!("[w{}] done {} ({} @ {:.1} MiB/s)",
+                                    worker_id, filename, format_size(file_size), mbps));
+                                // Don't send file_size to result — bytes already incremented live
+                                let _ = result_tx.send(DownloadResult::Ok(filename.clone(), file_size));
                                 succeeded = true;
                                 break;
                             }
                             Err(e) => {
                                 last_err = e.clone();
-                                warn!(
-                                    "Attempt {}/{} failed for {}: {}",
-                                    attempt, tries, url, e
-                                );
+                                ui.log(&format!("[w{}] FAIL {}/{} {}: {}",
+                                    worker_id, attempt, tries, filename, e));
                             }
                         }
                     }
                     if !succeeded {
-                        error!("All {} attempts failed for {}: {}", tries, url, last_err);
-                        ui.inc_by_id(pb_id, 1);
+                        ui.log(&format!("[w{}] FAILED {} after {} attempts: {}",
+                            worker_id, filename, tries, last_err));
                         let _ = result_tx.send(DownloadResult::Failed);
                     }
                 }
@@ -298,17 +376,28 @@ pipeline runs, picking up where it left off after interruptions.
             })
         };
 
-        // Collect results on the main thread and flush the status file
-        // periodically (every flush_interval completions).
+        // Collect results on the main thread, track bandwidth, and flush
+        // the status file periodically.
         let flush_interval = concurrency.max(10);
         let mut downloaded_total = 0u32;
+        let mut downloaded_bytes = 0u64;
         let mut failed_total = 0u32;
         let mut since_last_flush = 0usize;
+        let bandwidth_start = Instant::now();
 
         for result in result_rx {
             match result {
-                DownloadResult::Ok(filename) => {
+                DownloadResult::Ok(filename, bytes) => {
                     downloaded_total += 1;
+                    downloaded_bytes += bytes;
+                    if byte_bar {
+                        // Bytes already incremented live by the worker's on_bytes callback.
+                        ctx.ui.set_message_by_id(pb_id, format!(
+                            "{} files", downloaded_total,
+                        ));
+                    } else {
+                        ctx.ui.inc_by_id(pb_id, 1);
+                    }
                     let mut st = status.lock().unwrap();
                     st.completed.push(filename);
                     since_last_flush += 1;
@@ -319,6 +408,9 @@ pipeline runs, picking up where it left off after interruptions.
                 }
                 DownloadResult::Failed => {
                     failed_total += 1;
+                    if !byte_bar {
+                        ctx.ui.inc_by_id(pb_id, 1);
+                    }
                 }
             }
         }
@@ -343,11 +435,15 @@ pipeline runs, picking up where it left off after interruptions.
             Status::Ok
         };
 
+        let total_elapsed = bandwidth_start.elapsed().as_secs_f64().max(0.001);
+        let avg_mbps = (downloaded_bytes as f64 / 1_048_576.0) / total_elapsed;
+
         CommandResult {
             status: status_result,
             message: format!(
-                "{} downloaded, {} skipped, {} failed (of {} total)",
-                downloaded_total, already_done, failed_total, total
+                "{} downloaded ({:.1} MiB, {:.1} MiB/s), {} skipped, {} failed (of {} total)",
+                downloaded_total, downloaded_bytes as f64 / 1_048_576.0, avg_mbps,
+                already_done, failed_total, total
             ),
             produced: vec![output_dir],
             elapsed: start.elapsed(),
@@ -369,16 +465,7 @@ pipeline runs, picking up where it left off after interruptions.
 
         let status_path = output.join(".down-rs-status.json");
         if !status_path.exists() {
-            // No status file — either never run or status was deleted.
-            // Check if directory has any files as a fallback.
-            let has_files = std::fs::read_dir(output)
-                .ok()
-                .map(|entries| entries
-                    .filter_map(|e| e.ok())
-                    .any(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false)
-                        && e.file_name().to_string_lossy() != ".down-rs-status.json"))
-                .unwrap_or(false);
-            return if has_files { ArtifactState::Complete } else { ArtifactState::Partial };
+            return ArtifactState::PartialResumable;
         }
 
         // Parse token specs from options to compute expected file count
@@ -410,7 +497,7 @@ pipeline runs, picking up where it left off after interruptions.
         if completed_count >= expected_count {
             ArtifactState::Complete
         } else {
-            ArtifactState::Partial
+            ArtifactState::PartialResumable
         }
     }
 
@@ -458,6 +545,13 @@ pipeline runs, picking up where it left off after interruptions.
         },
         ]
     }
+}
+
+fn format_size(bytes: u64) -> String {
+    if bytes >= 1_073_741_824 { format!("{:.1} GiB", bytes as f64 / 1_073_741_824.0) }
+    else if bytes >= 1_048_576 { format!("{:.1} MiB", bytes as f64 / 1_048_576.0) }
+    else if bytes >= 1024 { format!("{:.1} KiB", bytes as f64 / 1024.0) }
+    else { format!("{} B", bytes) }
 }
 
 fn resolve_path(path_str: &str, workspace: &Path) -> PathBuf {

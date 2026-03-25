@@ -17,6 +17,70 @@ pub use retry::RetryPolicy;
 
 use std::io;
 
+/// Fetch a small remote file to a local path, preserving the remote
+/// `Last-Modified` timestamp as the local mtime.
+///
+/// On subsequent calls, issues a HEAD request to check if the remote
+/// file has been modified. Only re-downloads if the remote timestamp
+/// is newer than the local copy. Returns `Ok(true)` if the file was
+/// downloaded/updated, `Ok(false)` if the local copy is current.
+pub fn fetch_if_modified(url: &str, local_path: &std::path::Path) -> io::Result<bool> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+    // If we have a local copy, do a quick HEAD check
+    if local_path.exists() {
+        let local_mtime = std::fs::metadata(local_path)?
+            .modified()
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+
+        if let Ok(resp) = client.head(url).send() {
+            if resp.status().is_success() {
+                if let Some(remote_mtime) = parse_last_modified(&resp) {
+                    if remote_mtime <= local_mtime {
+                        return Ok(false); // local is current
+                    }
+                }
+            }
+        }
+        // HEAD failed or no Last-Modified — fall through to re-download
+    }
+
+    // Download the file
+    let resp = client.get(url).send()
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    if !resp.status().is_success() {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("HTTP {} fetching {}", resp.status(), url),
+        ));
+    }
+
+    let remote_mtime = parse_last_modified(&resp);
+    let bytes = resp.bytes()
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+    std::fs::write(local_path, &bytes)?;
+
+    // Set local mtime to match remote Last-Modified
+    if let Some(mtime) = remote_mtime {
+        let ft = filetime::FileTime::from_system_time(mtime);
+        let _ = filetime::set_file_mtime(local_path, ft);
+    }
+
+    Ok(true)
+}
+
+/// Parse `Last-Modified` header into a `SystemTime`.
+fn parse_last_modified(resp: &reqwest::blocking::Response) -> Option<std::time::SystemTime> {
+    let header = resp.headers().get("last-modified")?.to_str().ok()?;
+    // HTTP date format: "Thu, 01 Jan 2025 00:00:00 GMT"
+    let parsed = httpdate::parse_http_date(header).ok()?;
+    Some(parsed)
+}
+
 use semaphore::Semaphore;
 
 /// Byte-range data fetcher — abstracts HTTP vs local file access.

@@ -86,7 +86,35 @@ impl CachedChannel {
             let reference = state.to_ref();
             (reference, state)
         } else {
-            let state = MerkleState::from_ref(&reference);
+            let mut state = MerkleState::from_ref(&reference);
+            if cache_path.exists() {
+                // Cache file exists without merkle state (e.g., from a raw
+                // download). Verify existing content against merkle hashes
+                // to recover valid chunks without re-downloading.
+                let shape = reference.shape();
+                if let Ok(mut f) = fs::File::open(&cache_path) {
+                    let file_len = f.metadata().map(|m| m.len()).unwrap_or(0);
+                    let mut verified = 0u32;
+                    let mut buf = vec![0u8; shape.chunk_size as usize];
+                    for i in 0..shape.total_chunks {
+                        let start = shape.chunk_start(i);
+                        let len = shape.chunk_len(i);
+                        if start + len > file_len { break; }
+                        use std::io::{Read, Seek};
+                        if f.seek(SeekFrom::Start(start)).is_err() { break; }
+                        let chunk_buf = &mut buf[..len as usize];
+                        if f.read_exact(chunk_buf).is_err() { break; }
+                        if reference.verify_chunk(i, chunk_buf) {
+                            state.mark_valid(i);
+                            verified += 1;
+                        }
+                    }
+                    log::info!(
+                        "{}: recovered {}/{} chunks from existing cache file",
+                        name, verified, shape.total_chunks
+                    );
+                }
+            }
             state.save(&state_path)?;
             (reference, state)
         };

@@ -24,6 +24,9 @@ pub struct RemoteDatasetView {
     query_vectors: Option<Box<dyn TypedVectorView>>,
     neighbor_indices: Option<Box<dyn TypedVectorView>>,
     neighbor_distances: Option<Box<dyn TypedVectorView>>,
+    filtered_neighbor_indices: Option<Box<dyn TypedVectorView>>,
+    filtered_neighbor_distances: Option<Box<dyn TypedVectorView>>,
+    metadata_content: Option<Box<dyn TypedVectorView>>,
 }
 
 impl DatasetView for RemoteDatasetView {
@@ -33,18 +36,13 @@ impl DatasetView for RemoteDatasetView {
     fn neighbor_distances(&self) -> Option<Box<dyn TypedVectorView>> { None }
 
     fn prebuffer_all(&self) -> io::Result<()> {
-        // Prebuffer each facet that exists
-        if let Some(ref bv) = self.base_vectors {
-            bv.prebuffer(0, bv.count())?;
-        }
-        if let Some(ref qv) = self.query_vectors {
-            qv.prebuffer(0, qv.count())?;
-        }
-        if let Some(ref ni) = self.neighbor_indices {
-            ni.prebuffer(0, ni.count())?;
-        }
-        if let Some(ref nd) = self.neighbor_distances {
-            nd.prebuffer(0, nd.count())?;
+        for facet in [&self.base_vectors, &self.query_vectors,
+                      &self.neighbor_indices, &self.neighbor_distances,
+                      &self.filtered_neighbor_indices, &self.filtered_neighbor_distances,
+                      &self.metadata_content] {
+            if let Some(v) = facet {
+                v.prebuffer(0, v.count())?;
+            }
         }
         Ok(())
     }
@@ -128,17 +126,42 @@ impl RemoteDatasetView {
             ))?;
 
         // Derive the base URL from the entry path (strip dataset.yaml filename)
-        let base_url = entry.path.rsplit_once('/')
+        // Normalize path: remove "." components that cause S3 URL issues
+        let raw_base = entry.path.rsplit_once('/')
             .map(|(base, _)| base)
             .unwrap_or(&entry.path);
+        let base_url: String = raw_base.split('/')
+            .filter(|c| !c.is_empty() && *c != ".")
+            .collect::<Vec<_>>()
+            .join("/");
 
         let ds_cache = cache_dir.join(&entry.name);
         std::fs::create_dir_all(&ds_cache)?;
 
+        // Sync small infrastructure files using Last-Modified timestamp
+        // comparison. These don't get merkle coverage — mtime is the
+        // freshness check. Local mtime is set to the remote Last-Modified
+        // on download, and a HEAD request checks for changes on each open.
+        for infra_file in &["dataset.yaml", "variables.yaml"] {
+            let local = ds_cache.join(infra_file);
+            let url = format!("{}/{}", base_url, infra_file);
+            let _ = crate::transport::fetch_if_modified(&url, &local);
+        }
+
         let resolve_facet = |facet_name: &str| -> Option<Box<dyn TypedVectorView>> {
-            let view = profile.view(facet_name)?;
+            let view = match profile.view(facet_name) {
+                Some(v) => v,
+                None => {
+                    log::debug!("{}/{}: facet '{}' not found in profile (views: {:?})",
+                        entry.name, profile_name, facet_name, profile.view_names());
+                    return None;
+                }
+            };
             let raw_source_path = &view.source.path;
-            if raw_source_path.is_empty() { return None; }
+            if raw_source_path.is_empty() {
+                log::debug!("{}/{}: facet '{}' has empty source path", entry.name, profile_name, facet_name);
+                return None;
+            }
 
             // Strip window notation from the source path if present.
             // e.g., "base.fvec(0..10000000)" → "base.fvec"
@@ -170,7 +193,6 @@ impl RemoteDatasetView {
             } else {
                 format!("{}/{}", base_url, source_path)
             };
-
 
             // Resolve merkle reference — dual-mode: check .mrkl first (it
             // embeds the reference hashes), only download .mref if no .mrkl exists.
@@ -281,14 +303,14 @@ impl RemoteDatasetView {
             }
         };
 
-        // Only resolve base_vectors eagerly — the primary facet.
-        // Other facets are resolved lazily on first access to avoid
-        // unnecessary .mref downloads and HTTP requests.
         Ok(RemoteDatasetView {
             base_vectors: resolve_facet("base_vectors"),
-            query_vectors: None,
-            neighbor_indices: None,
-            neighbor_distances: None,
+            query_vectors: resolve_facet("query_vectors"),
+            neighbor_indices: resolve_facet("neighbor_indices"),
+            neighbor_distances: resolve_facet("neighbor_distances"),
+            filtered_neighbor_indices: resolve_facet("filtered_neighbor_indices"),
+            filtered_neighbor_distances: resolve_facet("filtered_neighbor_distances"),
+            metadata_content: resolve_facet("metadata_content"),
         })
     }
 
@@ -306,6 +328,18 @@ impl RemoteDatasetView {
 
     pub fn neighbor_distances(&self) -> Option<&dyn TypedVectorView> {
         self.neighbor_distances.as_ref().map(|v| v.as_ref())
+    }
+
+    pub fn filtered_neighbor_indices(&self) -> Option<&dyn TypedVectorView> {
+        self.filtered_neighbor_indices.as_ref().map(|v| v.as_ref())
+    }
+
+    pub fn filtered_neighbor_distances(&self) -> Option<&dyn TypedVectorView> {
+        self.filtered_neighbor_distances.as_ref().map(|v| v.as_ref())
+    }
+
+    pub fn metadata_content(&self) -> Option<&dyn TypedVectorView> {
+        self.metadata_content.as_ref().map(|v| v.as_ref())
     }
 }
 

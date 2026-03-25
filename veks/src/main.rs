@@ -39,6 +39,7 @@ enum Commands {
         args: Vec<String>,
     },
     /// Generate shell completions — eval "$(veks completions)"
+    #[command(hide = true)]
     Completions(cli::CompletionsArgs),
     /// Show detailed help for a pipeline command or command group
     Help(HelpArgs),

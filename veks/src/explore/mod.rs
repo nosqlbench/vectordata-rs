@@ -10,6 +10,7 @@
 
 pub mod shared;
 mod data_shell;
+mod dataset_picker;
 mod unified;
 
 use std::path::PathBuf;
@@ -39,7 +40,7 @@ pub enum ExploreCommand {
         #[arg(long, group = "input", add = ArgValueCompleter::new(source_completer))]
         source: Option<String>,
         /// Profile name (used with --dataset; overrides profile in dataset:profile)
-        #[arg(long)]
+        #[arg(long, add = ArgValueCompleter::new(shared::profile_completer))]
         profile: Option<String>,
         /// Number of vectors to sample
         #[arg(long, default_value = "50000")]
@@ -61,7 +62,7 @@ pub enum ExploreCommand {
         #[arg(long, group = "input", add = ArgValueCompleter::new(source_completer))]
         source: Option<String>,
         /// Profile name (used with --dataset; overrides profile in dataset:profile)
-        #[arg(long)]
+        #[arg(long, add = ArgValueCompleter::new(shared::profile_completer))]
         profile: Option<String>,
 
         /// Trailing args passed as command options
@@ -74,25 +75,27 @@ pub enum ExploreCommand {
 ///
 /// When `--profile` is given with `--dataset`, it's appended as `dataset:profile`.
 /// If the dataset already contains a `:`, the explicit `--profile` overrides it.
-fn resolve_input(dataset: Option<String>, source: Option<String>, profile: Option<String>) -> String {
+fn resolve_input(dataset: Option<String>, source: Option<String>, profile: Option<String>) -> Option<String> {
     let base = match (dataset, source) {
         (Some(ds), None) => ds,
         (None, Some(src)) => src,
-        (None, None) => {
-            eprintln!("Error: specify --dataset or --source");
-            std::process::exit(1);
-        }
+        (None, None) => return None,
         (Some(_), Some(_)) => unreachable!("clap group ensures mutual exclusion"),
     };
 
-    match profile {
+    Some(match profile {
         Some(p) => {
-            // Strip any existing profile from the dataset name
             let name = base.split(':').next().unwrap_or(&base);
             format!("{}:{}", name, p)
         }
-        None => base,
-    }
+        None => {
+            if !base.contains(':') && !base.contains('/') && !base.contains('.') {
+                format!("{}:default", base)
+            } else {
+                base
+            }
+        }
+    })
 }
 
 /// Dispatch a visualize subcommand.
@@ -116,11 +119,36 @@ pub fn run(args: ExploreArgs) {
 
     match args.command {
         ExploreCommand::Explore { dataset, source, profile, sample, seed, sample_mode } => {
-            let src = resolve_input(dataset, source, profile);
-            unified::run_interactive_explore(&src, sample, seed, sample_mode);
+            let from_picker = dataset.is_none() && source.is_none();
+            let mut src = match resolve_input(dataset, source, profile) {
+                Some(s) => s,
+                None => match dataset_picker::run_picker() {
+                    Some(s) => s,
+                    None => { std::process::exit(0); }
+                },
+            };
+            loop {
+                match unified::run_interactive_explore(&src, sample, seed, sample_mode) {
+                    unified::ExploreExit::Quit => break,
+                    unified::ExploreExit::Back if from_picker => {
+                        // Return to dataset picker
+                        match dataset_picker::run_picker() {
+                            Some(s) => { src = s; }
+                            None => break,
+                        }
+                    }
+                    unified::ExploreExit::Back => break, // no picker to go back to
+                }
+            }
         }
         ExploreCommand::Shell { dataset, source, profile, args: extra } => {
-            let src = resolve_input(dataset, source, profile);
+            let src = match resolve_input(dataset, source, profile) {
+                Some(s) => s,
+                None => match dataset_picker::run_picker() {
+                    Some(s) => s,
+                    None => { std::process::exit(0); }
+                },
+            };
             if extra.is_empty() {
                 data_shell::run_data_shell_interactive(&src);
             } else {

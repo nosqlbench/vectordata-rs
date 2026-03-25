@@ -79,14 +79,7 @@ pub fn run(
         }
     };
 
-    // Determine base URL for the dataset (entry.path points to dataset.yaml)
-    let base_url = entry.path.rsplit_once('/').map(|(base, _)| base).unwrap_or("");
-
     let ds_cache = cache.join(&entry.name);
-    std::fs::create_dir_all(&ds_cache).unwrap_or_else(|e| {
-        eprintln!("Failed to create cache dir: {}", e);
-        std::process::exit(1);
-    });
 
     println!(
         "Prebuffering {}:{} ({} views)",
@@ -94,72 +87,68 @@ pub fn run(
         profile_name,
         profile.view_names().len()
     );
+    println!("  Cache: {}", ds_cache.display());
 
-    let mut downloaded = 0u32;
+    // Use the data access layer's RemoteDatasetView which sets up
+    // merkle-verified CachedChannels per facet. The prebuffer method
+    // only downloads chunks covering the profile's windowed range.
+    use vectordata::dataset::remote::RemoteDatasetView;
+    let dataset_view = match RemoteDatasetView::open(entry, profile_name, &cache) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Failed to open remote dataset: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    let facets: &[(&str, fn(&RemoteDatasetView) -> Option<&dyn vectordata::dataset::view::TypedVectorView>)] = &[
+        ("base_vectors", |v| v.base_vectors()),
+        ("query_vectors", |v| v.query_vectors()),
+        ("neighbor_indices", |v| v.neighbor_indices()),
+        ("neighbor_distances", |v| v.neighbor_distances()),
+        ("filtered_neighbor_indices", |v| v.filtered_neighbor_indices()),
+        ("filtered_neighbor_distances", |v| v.filtered_neighbor_distances()),
+        ("metadata_content", |v| v.metadata_content()),
+    ];
+
+    let mut prebuffered = 0u32;
     let mut skipped = 0u32;
     let mut failed = 0u32;
 
-    for view_name in profile.view_names() {
-        let view = profile.view(view_name).unwrap();
-        let source_path = &view.source.path;
+    for &(name, accessor) in facets {
+        if let Some(view) = accessor(&dataset_view) {
+            let count = view.count();
+            if count == 0 { continue; }
 
-        if source_path.is_empty() {
-            continue;
-        }
+            if let Some(stats) = view.cache_stats() {
+                if stats.is_complete {
+                    println!("  {} — complete ({} chunks)", name, stats.total_chunks);
+                    skipped += 1;
+                    continue;
+                }
+                println!("  {} — prebuffering {} vectors ({}/{} chunks cached)...",
+                    name, count, stats.valid_chunks, stats.total_chunks);
+            } else {
+                println!("  {} — prebuffering {} vectors...", name, count);
+            }
 
-        // Resolve the full URL for the view source
-        let full_url = if source_path.starts_with("http://") || source_path.starts_with("https://") {
-            source_path.clone()
-        } else {
-            format!("{}/{}", base_url, source_path)
-        };
-
-        let target = ds_cache.join(source_path);
-
-        if target.exists() {
-            let size = std::fs::metadata(&target).map(|m| m.len()).unwrap_or(0);
-            println!("  {} — already cached ({} bytes)", view_name, size);
-            skipped += 1;
-            continue;
-        }
-
-        if full_url.starts_with("http://") || full_url.starts_with("https://") {
-            println!("  {} — downloading from {}", view_name, full_url);
-            match download_file(&full_url, &target) {
-                Ok(size) => {
-                    println!("  {} — downloaded {} bytes", view_name, size);
-                    downloaded += 1;
+            match view.prebuffer(0, count) {
+                Ok(()) => {
+                    println!("  {} — done", name);
+                    prebuffered += 1;
                 }
                 Err(e) => {
-                    eprintln!("  {} — FAILED: {}", view_name, e);
+                    eprintln!("  {} — FAILED: {}", name, e);
                     failed += 1;
                 }
-            }
-        } else {
-            // Local source relative to the entry path
-            let local_src = Path::new(&full_url);
-            if local_src.exists() && *local_src != target {
-                if let Some(parent) = target.parent() {
-                    std::fs::create_dir_all(parent).ok();
-                }
-                if let Err(e) = std::fs::copy(local_src, &target) {
-                    eprintln!("  {} — FAILED to copy: {}", view_name, e);
-                    failed += 1;
-                } else {
-                    println!("  {} — copied from local source", view_name);
-                    downloaded += 1;
-                }
-            } else {
-                eprintln!("  {} — source not available: {}", view_name, full_url);
-                failed += 1;
             }
         }
     }
 
     println!();
     println!(
-        "Prebuffer: {} downloaded, {} skipped, {} failed",
-        downloaded, skipped, failed
+        "Prebuffer: {} completed, {} already cached, {} failed",
+        prebuffered, skipped, failed
     );
 
     if failed > 0 {
@@ -324,8 +313,27 @@ pub(crate) fn download_file(url: &str, dest: &Path) -> Result<u64, String> {
     easy.url(url).map_err(|e| format!("invalid URL: {}", e))?;
     easy.follow_location(true).ok();
     easy.fail_on_error(true).ok();
+    easy.progress(true).ok();
+
+    let last_print = std::sync::Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
+    let lp = last_print.clone();
 
     let mut transfer = easy.transfer();
+    transfer
+        .progress_function(move |dl_total, dl_now, _, _| {
+            let mut last = lp.lock().unwrap();
+            let now = std::time::Instant::now();
+            if now.duration_since(*last).as_millis() >= 500 && dl_total > 0.0 {
+                let pct = 100.0 * dl_now / dl_total;
+                let dl_mib = dl_now / 1_048_576.0;
+                let total_mib = dl_total / 1_048_576.0;
+                eprint!("\r    {:.1} / {:.1} MiB ({:.0}%)   ", dl_mib, total_mib, pct);
+                let _ = std::io::stderr().flush();
+                *last = now;
+            }
+            true
+        })
+        .map_err(|e| format!("progress setup error: {}", e))?;
     transfer
         .write_function(|data| {
             file.write_all(data).map_or(Ok(0), |()| Ok(data.len()))
@@ -335,6 +343,7 @@ pub(crate) fn download_file(url: &str, dest: &Path) -> Result<u64, String> {
         .perform()
         .map_err(|e| format!("download failed: {}", e))?;
     drop(transfer);
+    eprintln!(); // newline after progress
 
     let size = std::fs::metadata(dest).map(|m| m.len()).unwrap_or(0);
     Ok(size)

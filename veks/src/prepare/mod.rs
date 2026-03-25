@@ -131,6 +131,10 @@ pub enum PrepareCommand {
         #[arg(long)]
         spec: Option<String>,
 
+        /// Interactive wizard to choose sized profile options
+        #[arg(long, short = 'i')]
+        interactive: bool,
+
         /// Overwrite existing sized profiles
         #[arg(long)]
         force: bool,
@@ -138,6 +142,10 @@ pub enum PrepareCommand {
         /// Accept defaults without prompting
         #[arg(long, short = 'y')]
         yes: bool,
+
+        /// Fully automatic — use standard spec, overwrite existing (implies -iy --force)
+        #[arg(long)]
+        auto: bool,
     },
     /// Generate and manage dataset catalog index files
     #[command(disable_help_subcommand = true)]
@@ -336,7 +344,18 @@ pub fn run(args: PrepareArgs) {
         PrepareCommand::Publish(args) => {
             crate::publish::run(args);
         }
-        PrepareCommand::Stratify { path, spec, force, yes } => {
+        PrepareCommand::Stratify { path, spec, interactive, force, yes, auto } => {
+            let interactive = interactive || auto;
+            let yes = yes || auto;
+            let force = force || auto;
+            let spec = if spec.is_some() {
+                spec
+            } else if interactive && !yes {
+                Some(stratify::interactive_spec_wizard(&path))
+            } else {
+                // --yes or --auto: use standard spec without prompting
+                None // stratify::run handles this via the yes path
+            };
             stratify::run(&path, spec.as_deref(), force, yes);
         }
         PrepareCommand::Catalog { command } => {

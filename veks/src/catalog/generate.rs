@@ -67,9 +67,14 @@ impl DiscoveredDataset {
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|_| self.yaml_path.clone());
 
+        // Elide "." components (e.g., "laion400b/./img-search" → "laion400b/img-search")
+        let cleaned: std::path::PathBuf = rel_path.components()
+            .filter(|c| !matches!(c, std::path::Component::CurDir))
+            .collect();
+
         CatalogEntry {
             name: self.config.name.clone(),
-            path: rel_path.to_string_lossy().to_string(),
+            path: cleaned.to_string_lossy().to_string(),
             dataset_type: "dataset.yaml".to_string(),
             layout: CatalogLayout {
                 attributes: self.config.attributes.clone(),

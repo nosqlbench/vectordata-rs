@@ -4887,8 +4887,10 @@ version = "0.3.2"
 dependencies = [
  "anyhow",
  "byteorder",
+ "filetime",
  "half",
  "hex",
+ "httpdate",
  "indexmap",
  "libc",
  "log",

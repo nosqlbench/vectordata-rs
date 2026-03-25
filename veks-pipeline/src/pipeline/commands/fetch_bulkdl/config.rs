@@ -55,14 +55,18 @@ fn default_concurrency() -> u32 {
 
 /// Inclusive integer range for URL template expansion.
 ///
-/// Parsed from bracket notation like `[0..409]`. Both `start` and `end`
-/// are inclusive, so `[0..2]` yields values `0, 1, 2`.
+/// Parsed from bracket notation like `[0..409]` or `[00..31]`.
+/// Both `start` and `end` are inclusive, so `[0..2]` yields `0, 1, 2`.
+/// Leading zeros indicate zero-padding width: `[00..31]` pads to 2 digits
+/// (`00, 01, ..., 31`), `[000..409]` pads to 3 digits (`000, 001, ..., 409`).
 #[derive(Debug)]
 pub struct TokenSpec {
     /// First value in the range (inclusive).
     pub start: i64,
     /// Last value in the range (inclusive).
     pub end: i64,
+    /// Minimum width for zero-padded output. 0 = no padding.
+    pub pad_width: usize,
 }
 
 impl<'de> Deserialize<'de> for TokenSpec {
@@ -80,8 +84,10 @@ impl<'de> Deserialize<'de> for TokenSpec {
     }
 }
 
-/// Parse a token range string like `[0..409]` into an inclusive [`TokenSpec`].
+/// Parse a token range string like `[0..409]` or `[00..31]` into a [`TokenSpec`].
 ///
+/// Leading zeros on the start value indicate zero-padding width:
+/// `[00..31]` → pad to 2 digits, `[000..409]` → pad to 3 digits.
 /// Returns `None` if the string is not in `[start..end]` format.
 pub fn parse_token_spec(s: &str) -> Option<TokenSpec> {
     let s = s.trim();
@@ -93,9 +99,23 @@ pub fn parse_token_spec(s: &str) -> Option<TokenSpec> {
     if parts.len() != 2 {
         return None;
     }
-    let start: i64 = parts[0].trim().parse().ok()?;
-    let end: i64 = parts[1].trim().parse().ok()?;
-    Some(TokenSpec { start, end })
+    let start_str = parts[0].trim();
+    let end_str = parts[1].trim();
+
+    // Detect zero-padding from leading zeros in the start value.
+    // "00" → pad_width=2, "000" → pad_width=3, "0" or "1" → pad_width=0
+    let pad_width = if start_str.len() > 1 && start_str.starts_with('0') {
+        // Also check end value — use the longer of the two
+        start_str.len().max(end_str.len())
+    } else if end_str.len() > 1 && end_str.starts_with('0') {
+        end_str.len()
+    } else {
+        0
+    };
+
+    let start: i64 = start_str.parse().ok()?;
+    let end: i64 = end_str.parse().ok()?;
+    Some(TokenSpec { start, end, pad_width })
 }
 
 /// Persistent JSON file tracking which files have been downloaded.

@@ -310,6 +310,27 @@ All other files in the dataset directory are included, notably:
 | JSON metadata | `*.json` |
 | Profile subdirectories | `profiles/*/...` |
 
+### Merkle coverage requirement
+
+Every file within a dataset's `profiles/` directory MUST have a
+companion `.mref` merkle reference file. This includes all vector
+files, slab files, index files, and any other data content — no
+size threshold, no exceptions within `profiles/`.
+
+Infrastructure files at the dataset root level (`dataset.yaml`,
+`catalog.json`, `catalog.yaml`, `variables.yaml`) are exempt — they
+are too small to benefit from chunked merkle verification and are
+frequently regenerated.
+
+This coverage enables:
+- **Change detection**: any modification to profile data is detectable
+  via root hash comparison
+- **Incremental download**: the cache layer verifies and resumes at
+  chunk granularity for all profile data
+- **Cache recovery**: pre-existing cache files without `.mrkl` state
+  are verified chunk-by-chunk against the `.mref` hashes, recovering
+  valid content without re-downloading
+
 ### Filter strategy
 
 Publishing uses an **include-only** approach rather than building

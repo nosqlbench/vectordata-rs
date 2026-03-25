@@ -1400,9 +1400,24 @@ fn render_rps_chart(frame: &mut ratatui::Frame, area: Rect, state: &RenderState)
     let y_max = state.rps_history.y_bounds()[1];
     let y_label = format_rate(y_max, chart_unit);
     let title_label = {
-        // Show current RPS in the title
-        let current = state.rps_history.as_slice().last().map(|p| p.1).unwrap_or(0.0);
-        format!(" throughput: {} ", format_rate(current, chart_unit))
+        let data = state.rps_history.as_slice();
+        let current = data.last().map(|p| p.1).unwrap_or(0.0);
+        // 1-minute windowed average (~240 samples at 250ms interval)
+        let window = 240usize;
+        let avg_1m = if data.len() >= 2 {
+            let start = data.len().saturating_sub(window);
+            let slice = &data[start..];
+            let sum: f64 = slice.iter().map(|p| p.1).sum();
+            sum / slice.len() as f64
+        } else {
+            current
+        };
+        if chart_unit == "bytes" {
+            format!(" throughput: {} (1m avg: {}) ",
+                format_rate(current, chart_unit), format_rate(avg_1m, chart_unit))
+        } else {
+            format!(" throughput: {} ", format_rate(current, chart_unit))
+        }
     };
 
     let datasets = vec![

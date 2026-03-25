@@ -275,6 +275,8 @@ pub fn run_steps(
                             ));
                             if !ctx.dry_run {
                                 let _ = std::fs::remove_file(&full_path);
+                                // Also try removing as directory for directory-based outputs
+                                let _ = std::fs::remove_dir_all(&full_path);
                             }
                         }
                         OnPartial::Resume => {
@@ -284,6 +286,12 @@ pub fn run_steps(
                             ));
                         }
                     }
+                }
+                ArtifactState::PartialResumable => {
+                    ctx.ui.log(&format!(
+                        "{} {} — resuming incomplete output '{}'",
+                        prefix, step.id, output_path
+                    ));
                 }
                 ArtifactState::Absent => {
                     if let Some(parent) = full_path.parent() {

@@ -50,13 +50,23 @@ pub fn expand_tokens(
         combos = new_combos;
     }
 
+    let pad_widths: Vec<usize> = token_names
+        .iter()
+        .map(|name| tokens[*name].pad_width)
+        .collect();
+
     combos
         .into_iter()
         .map(|vals| {
             let mut url = baseurl.to_string();
             for (i, name) in token_names.iter().enumerate() {
                 let placeholder = format!("${{{}}}", name);
-                url = url.replace(&placeholder, &vals[i].to_string());
+                let formatted = if pad_widths[i] > 0 {
+                    format!("{:0>width$}", vals[i], width = pad_widths[i])
+                } else {
+                    vals[i].to_string()
+                };
+                url = url.replace(&placeholder, &formatted);
             }
             let filename = url_to_filename(&url);
             (url, filename)
@@ -115,7 +125,7 @@ mod tests {
     #[test]
     fn test_expand_tokens_single() {
         let mut tokens = HashMap::new();
-        tokens.insert("i".to_string(), TokenSpec { start: 0, end: 2 });
+        tokens.insert("i".to_string(), TokenSpec { start: 0, end: 2, pad_width: 0 });
         let results = expand_tokens("https://example.com/img_emb_${i}.npy", &tokens);
         assert_eq!(results.len(), 3);
         assert_eq!(results[0].0, "https://example.com/img_emb_0.npy");
@@ -129,5 +139,31 @@ mod tests {
         let results = expand_tokens("https://example.com/single.npy", &tokens);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].1, "single.npy");
+    }
+
+    #[test]
+    fn test_expand_tokens_zero_padded() {
+        let mut tokens = HashMap::new();
+        tokens.insert("part".to_string(), TokenSpec { start: 0, end: 2, pad_width: 2 });
+        let results = expand_tokens("https://example.com/part-${part}.dat", &tokens);
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].0, "https://example.com/part-00.dat");
+        assert_eq!(results[1].0, "https://example.com/part-01.dat");
+        assert_eq!(results[2].0, "https://example.com/part-02.dat");
+    }
+
+    #[test]
+    fn test_parse_token_spec_zero_padded() {
+        let spec = parse_token_spec("[00..31]").unwrap();
+        assert_eq!(spec.start, 0);
+        assert_eq!(spec.end, 31);
+        assert_eq!(spec.pad_width, 2);
+
+        let spec3 = parse_token_spec("[000..409]").unwrap();
+        assert_eq!(spec3.pad_width, 3);
+
+        // No padding
+        let spec_plain = parse_token_spec("[0..409]").unwrap();
+        assert_eq!(spec_plain.pad_width, 0);
     }
 }

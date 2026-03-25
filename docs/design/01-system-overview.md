@@ -276,8 +276,85 @@ via `veks pipeline <group> <command>`.
 | `merkle` | Merkle integrity tree operations | `create`, `diff`, `path`, `spoilbits`, `spoilchunks`, `summary`, `treeview`, `verify` |
 | `query` | Search and filter records | `json`, `records` |
 | `state` | Pipeline variable management | `clear`, `set` |
-| `transform` | Reshape, convert, subset data | `convert`, `extract`, `extract-slab`, `ordinals` |
+| `transform` | Reshape, convert, subset data | `convert`, `extract`, `ordinals` |
 | `verify` | Correctness validation | `knn-groundtruth`, `predicate-results` |
+| `pipeline` | Pipeline orchestration | `require` |
+
+### Pipeline dependencies (`pipeline require`)
+
+Pipeline files can declare dependencies on other pipeline files using
+the `pipeline require` command. This enables multi-file pipeline
+architectures where shared work (e.g., downloading source data) is
+defined once and required by multiple dataset pipelines.
+
+```yaml
+# dataset.yaml
+upstream:
+  steps:
+    - id: require-downloads
+      run: pipeline require
+      description: Ensure source data is downloaded
+      file: ../_sourcedata/download.yaml
+
+    - id: convert-vectors
+      run: transform convert
+      after: [require-downloads]
+      source: ../_sourcedata/embeddings/img_emb/
+      output: ${cache}/all_vectors.mvec
+```
+
+**Semantics:**
+
+- The required pipeline runs in its own workspace (the directory
+  containing the required YAML file), with its own `dataset.log`
+  progress state, `.scratch`, `.cache`, and `variables.yaml`.
+- If all steps in the required pipeline are already complete (from a
+  previous run, whether invoked directly or via `pipeline require`),
+  the command returns immediately.
+- If steps are incomplete, the full pipeline runner is invoked on
+  the required file. The required pipeline's internal resume logic
+  picks up where it left off.
+- The required pipeline's artifact state is `PartialResumable` when
+  incomplete — the runner never deletes its output.
+- Running the required pipeline directly (`veks run download.yaml`)
+  and having it invoked via `pipeline require` produce identical
+  progress state. They are interchangeable.
+
+**Use case: shared source data**
+
+A download pipeline fetches hundreds of GB of source files that feed
+multiple dataset preparation pipelines:
+
+```
+_sourcedata/
+├── download.yaml          ← downloads img/text/metadata shards
+├── embeddings/img_emb/    ← 410 .npy files
+├── embeddings/text_emb/   ← 410 .npy files
+└── embeddings/metadata/   ← 410 .parquet files
+
+img-search/
+├── dataset.yaml           ← requires download.yaml, then processes
+└── ...
+
+text-search/
+├── dataset.yaml           ← also requires download.yaml
+└── ...
+```
+
+### Artifact state model
+
+Pipeline commands report the state of their output artifacts:
+
+| State | Meaning | Runner action |
+|-------|---------|---------------|
+| `Complete` | Output exists and is valid | Skip step |
+| `Partial` | Incomplete, not resumable | Delete output, restart |
+| `PartialResumable` | Incomplete, command handles resume | Keep output, re-run |
+| `Absent` | Output does not exist | Run step |
+
+Commands that accumulate output across runs (like `download bulk` and
+`pipeline require`) return `PartialResumable` so the runner never
+destroys partially-complete work.
 
 ### Root-level command summary
 
@@ -480,6 +557,70 @@ optionally neighbor_distances), the wizard MUST:
   checks still run and report findings, but no exclusion ordinals are
   produced. Users are warned about this in the wizard output.
 - **Infer metric** from normalization status when possible (see §1.6.11).
+
+### 1.6.11 Interactive Configuration Flags
+
+Commands that configure datasets support a consistent set of flags
+for controlling interactivity:
+
+| Flag | Short | Meaning |
+|------|-------|---------|
+| `--interactive` | `-i` | Launch guided wizard with step-by-step prompts |
+| `--yes` | `-y` | Accept all defaults without prompting |
+| `--restart` | `-r` | Delete existing config and start fresh |
+| `--auto` | — | Short-circuit: combines `-i -y -r` behavior |
+
+#### Flag semantics
+
+**`--interactive` (`-i`)**: Launches a multi-step wizard that explains
+each option, shows previews, and lets the user choose between
+strategies. Example: `veks prepare stratify --interactive` walks
+through multiplicative/fibonacci/linear/custom sizing strategies.
+
+**`--yes` (`-y`)**: Accepts the standard defaults for every prompt
+without waiting for input. Useful for scripted/CI pipelines. The
+defaults are the same values the wizard would show as `[default]`.
+
+**`--restart` (`-r`)**: Deletes existing configuration (`dataset.yaml`,
+`variables.yaml`, progress log) and starts fresh. Without this flag,
+existing configuration is preserved and the command either resumes
+or reports an error if it would conflict.
+
+**`--auto`**: Equivalent to `--interactive --yes --restart` — detects
+source files automatically, accepts all standard defaults, and
+overwrites any existing configuration. This is the "do everything
+from scratch with sensible defaults" mode.
+
+#### Combination matrix
+
+| Flags | Behavior |
+|-------|----------|
+| (none) | Simple prompt with default shown, Enter to accept |
+| `-i` | Full wizard with strategy choices and previews |
+| `-y` | Use standard defaults, no prompts |
+| `-i -y` | Run wizard logic to compute defaults, skip prompts |
+| `-r` | Delete existing config, then prompt |
+| `--auto` | Delete existing, detect files, accept all defaults |
+
+#### Standard specs
+
+When computing default values for sized profiles, the **standard
+spec** combines three strategies for comprehensive scale coverage:
+
+```
+fib:1m..{max}, mul:1m..{max}/2, 0m..{max}/10m
+```
+
+This produces profiles at fibonacci points (1m, 2m, 3m, 5m, 8m, 13m,
+21m, 34m...), powers of 2 (1m, 2m, 4m, 8m, 16m, 32m...), and linear
+10m steps (10m, 20m, 30m...) — all deduped and sorted. The resulting
+set gives dense coverage at small scales (important for development
+iteration) and regular large-scale checkpoints.
+
+This standard spec is used by:
+- `veks prepare stratify --yes` / `--auto`
+- `veks prepare stratify --interactive` (option 1, "Standard")
+- `veks prepare bootstrap --auto` when sized profiles are enabled
 
 ## 1.7 Technology Stack
 
