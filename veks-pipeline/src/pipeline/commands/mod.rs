@@ -128,7 +128,7 @@ pub fn register_all(registry: &mut CommandRegistry) {
     registry.register("state clear", set_variable::clear_factory);
 
     // ── transform ────────────────────────────────────────────────────
-    registry.register("transform convert", import::factory);
+    registry.register("transform convert", convert::factory);
     registry.register("transform extract", gen_extract::extract_factory);
     registry.register("transform ordinals", clean_ordinals::factory);
 

@@ -376,6 +376,18 @@ fn finish_result(
         pct
     );
 
+    // Write verified count for the bound checker
+    for p in &produced {
+        if let Some(fname) = p.file_name().and_then(|n| n.to_str()) {
+            let var_name = format!("verified_count:{}", fname);
+            // Walk up from .cache/<file> to workspace
+            let ws = p.parent()
+                .and_then(|d| d.parent())
+                .unwrap_or(Path::new("."));
+            let _ = crate::pipeline::variables::set_and_save(ws, &var_name, &zero_count.to_string());
+        }
+    }
+
     let status = if zero_count > 0 {
         Status::Warning
     } else {

@@ -113,6 +113,9 @@ struct PartitionMeta {
 }
 
 /// Build a cache file path for a partition.
+///
+/// Includes `data_size` in the key so partitions are invalidated when the
+/// base vector file changes (e.g., different fraction → different file size).
 fn build_cache_path(
     cache_dir: &Path,
     step_id: &str,
@@ -120,13 +123,14 @@ fn build_cache_path(
     end: usize,
     k: usize,
     metric: Metric,
+    data_size: u64,
     suffix: &str,
     ext: &str,
 ) -> PathBuf {
     let metric_str = metric_label(metric);
     cache_dir.join(format!(
-        "{}.range_{:06}_{:06}.k{}.{}.fknn.{}.{}",
-        step_id, start, end, k, metric_str, suffix, ext,
+        "{}.range_{:06}_{:06}.k{}.{}.sz{}.fknn.{}.{}",
+        step_id, start, end, k, metric_str, data_size, suffix, ext,
     ))
 }
 
@@ -1112,6 +1116,15 @@ fn execute_with_partitions<T: Send + Sync + 'static>(
             produced.push(dist_path.to_path_buf());
         }
 
+        // Write verified counts for the bound checker
+        for xvec_path in &produced {
+            let var_name = format!("verified_count:{}",
+                xvec_path.file_name().and_then(|n| n.to_str()).unwrap_or("output"));
+            let _ = crate::pipeline::variables::set_and_save(
+                &ctx.workspace, &var_name, &query_count.to_string());
+            ctx.defaults.insert(var_name, query_count.to_string());
+        }
+
         return CommandResult {
             status: Status::Ok,
             message: format!(
@@ -1175,6 +1188,9 @@ fn execute_with_partitions<T: Send + Sync + 'static>(
     }
 
     // Phase 1: Plan partitions and validate cache
+    // Use base_count in the cache key so partitions are invalidated when
+    // the base vector file changes (e.g., different fraction).
+    let base_file_size = base_count as u64;
     let estimated_partitions = (base_count + partition_size - 1) / partition_size;
     ctx.ui.log(&format!(
         "  planning ~{} partitions (partition_size={})...",
@@ -1191,8 +1207,8 @@ fn execute_with_partitions<T: Send + Sync + 'static>(
     let find_largest_cached = |start: usize, max_end: usize| -> Option<usize> {
         let mut try_end = max_end;
         while try_end > start + partition_size {
-            let n = build_cache_path(&ctx.cache, step_id, start, try_end, k, metric, "neighbors", "ivec");
-            let d = build_cache_path(&ctx.cache, step_id, start, try_end, k, metric, "distances", "fvec");
+            let n = build_cache_path(&ctx.cache, step_id, start, try_end, k, metric, base_file_size, "neighbors", "ivec");
+            let d = build_cache_path(&ctx.cache, step_id, start, try_end, k, metric, base_file_size, "distances", "fvec");
             let exists = if compress_cache {
                 crate::pipeline::gz_cache::gz_exists(&n) && crate::pipeline::gz_cache::gz_exists(&d)
             } else {
@@ -1210,13 +1226,13 @@ fn execute_with_partitions<T: Send + Sync + 'static>(
             if let Some(super_end) = find_largest_cached(part_start, base_end) {
                 ctx.ui.log(&format!("  reusing cached super-partition [{}, {})",
                     format_count(part_start), format_count(super_end)));
-                let n = build_cache_path(&ctx.cache, step_id, part_start, super_end, k, metric, "neighbors", "ivec");
-                let d = build_cache_path(&ctx.cache, step_id, part_start, super_end, k, metric, "distances", "fvec");
+                let n = build_cache_path(&ctx.cache, step_id, part_start, super_end, k, metric, base_file_size, "neighbors", "ivec");
+                let d = build_cache_path(&ctx.cache, step_id, part_start, super_end, k, metric, base_file_size, "distances", "fvec");
                 (super_end, n, d, true)
             } else {
                 let pe = std::cmp::min(part_start + partition_size, base_end);
-                let n = build_cache_path(&ctx.cache, step_id, part_start, pe, k, metric, "neighbors", "ivec");
-                let d = build_cache_path(&ctx.cache, step_id, part_start, pe, k, metric, "distances", "fvec");
+                let n = build_cache_path(&ctx.cache, step_id, part_start, pe, k, metric, base_file_size, "neighbors", "ivec");
+                let d = build_cache_path(&ctx.cache, step_id, part_start, pe, k, metric, base_file_size, "distances", "fvec");
                 let c = if compress_cache {
                     crate::pipeline::gz_cache::gz_exists(&n) && crate::pipeline::gz_cache::gz_exists(&d)
                 } else {
@@ -1335,10 +1351,10 @@ fn execute_with_partitions<T: Send + Sync + 'static>(
     // Save merged result as cache partition for reuse by larger profiles
     if num_partitions > 1 {
         let full_neighbors = build_cache_path(
-            &ctx.cache, step_id, base_offset, base_end, k, metric, "neighbors", "ivec",
+            &ctx.cache, step_id, base_offset, base_end, k, metric, base_file_size, "neighbors", "ivec",
         );
         let full_distances = build_cache_path(
-            &ctx.cache, step_id, base_offset, base_end, k, metric, "distances", "fvec",
+            &ctx.cache, step_id, base_offset, base_end, k, metric, base_file_size, "distances", "fvec",
         );
         if !full_neighbors.exists() {
             let _ = std::fs::copy(indices_path, &full_neighbors);
@@ -1357,6 +1373,15 @@ fn execute_with_partitions<T: Send + Sync + 'static>(
     let mut produced = vec![indices_path.to_path_buf()];
     if let Some(dp) = distances_path {
         produced.push(dp.to_path_buf());
+    }
+
+    // Write verified counts for the bound checker
+    for xvec_path in &produced {
+        let var_name = format!("verified_count:{}",
+            xvec_path.file_name().and_then(|n| n.to_str()).unwrap_or("output"));
+        let _ = crate::pipeline::variables::set_and_save(
+            &ctx.workspace, &var_name, &query_count.to_string());
+        ctx.defaults.insert(var_name, query_count.to_string());
     }
 
     CommandResult {

@@ -229,6 +229,14 @@ data with known statistical properties.
         match generate_sketch_fvec(&output_path, dimension, count, &samplers, normalize, &mut data_rng, &pb, pool.as_ref()) {
             Ok(()) => {
                 pb.finish();
+
+                // Write verified count for the bound checker
+                let var_name = format!("verified_count:{}",
+                    output_path.file_name().and_then(|n| n.to_str()).unwrap_or("output"));
+                let _ = crate::pipeline::variables::set_and_save(
+                    &ctx.workspace, &var_name, &count.to_string());
+                ctx.defaults.insert(var_name, count.to_string());
+
                 CommandResult {
                     status: Status::Ok,
                     message: format!(

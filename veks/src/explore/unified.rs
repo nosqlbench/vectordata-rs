@@ -1057,6 +1057,14 @@ pub(super) fn run_interactive_explore(
                         _ => {}
                     }
                 }
+                Event::Resize(_, _) => {
+                    // Terminal resized — reset auto-sizing so the next
+                    // frame recalculates layouts for the new dimensions.
+                    if num_bins == 0 { /* auto bins recalculated each frame */ }
+                    if loadings_band_size == 0 { /* auto band recalculated each frame */ }
+                    sorted_norms_len = 0; // force re-downsample
+                    sorted_dists_len = 0;
+                }
                 _ => {}
             }
         }

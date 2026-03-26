@@ -30,6 +30,9 @@ struct BarState {
 pub struct PlainSink {
     next_id: AtomicU32,
     bars: Mutex<HashMap<ProgressId, BarState>>,
+    /// True if a progress bar line was rendered and the cursor is
+    /// still on it (needs clearing before the next log message).
+    bar_dirty: std::sync::atomic::AtomicBool,
 }
 
 impl PlainSink {
@@ -37,6 +40,7 @@ impl PlainSink {
         PlainSink {
             next_id: AtomicU32::new(0),
             bars: Mutex::new(HashMap::new()),
+            bar_dirty: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -83,12 +87,21 @@ impl PlainSink {
         let pos_str = format_count(bar.position);
         let total_str = format_count(bar.total);
 
+        // \r moves to column 0; trailing spaces overwrite stale text
         let _ = eprint!(
             "\r{} [{}/{}] {}%{}{}    ",
             bar.label, pos_str, total_str, pct, rate_str, eta_str,
         );
         let _ = std::io::stderr().flush();
         bar.last_render = Instant::now();
+    }
+
+    /// Clear the current progress bar line if one was rendered.
+    fn clear_bar_line(&self) {
+        if self.bar_dirty.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            // Move to a new line so the next output doesn't overwrite the bar
+            let _ = eprintln!();
+        }
     }
 }
 
@@ -126,9 +139,9 @@ impl UiSink for PlainSink {
                 let mut bars = self.bars.lock().unwrap();
                 if let Some(bar) = bars.get_mut(&id) {
                     bar.position = position;
-                    // Throttle: render at 4Hz (250ms)
                     if bar.last_render.elapsed().as_millis() >= 250 {
                         Self::render_bar(bar);
+                        self.bar_dirty.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
             }
@@ -139,6 +152,7 @@ impl UiSink for PlainSink {
                     bar.position += delta;
                     if bar.last_render.elapsed().as_millis() >= 500 {
                         Self::render_bar(bar);
+                        self.bar_dirty.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
             }
@@ -156,6 +170,7 @@ impl UiSink for PlainSink {
                     bar.position = bar.total;
                     Self::render_bar(&mut bar);
                     let _ = eprintln!(); // newline after final render
+                    self.bar_dirty.store(false, std::sync::atomic::Ordering::Relaxed);
                 }
             }
 
@@ -167,11 +182,14 @@ impl UiSink for PlainSink {
             | UiEvent::Clear => {}
 
             UiEvent::Log { message } => {
+                self.clear_bar_line();
                 let mut out = std::io::stdout().lock();
                 let _ = writeln!(out, "{}", message);
+                let _ = out.flush();
             }
 
             UiEvent::Emit { text } => {
+                self.clear_bar_line();
                 let mut out = std::io::stdout().lock();
                 let _ = write!(out, "{}", text);
             }

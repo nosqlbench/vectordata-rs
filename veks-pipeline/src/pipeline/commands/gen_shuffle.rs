@@ -101,6 +101,7 @@ The same shuffle ivec is also applied to metadata slabs (via
         };
 
         let seed = rng::parse_seed(options.get("seed"));
+        let ordinals_path = options.get("ordinals").map(|s| resolve_path(s, &ctx.workspace));
         let output_path = resolve_path(output_str, &ctx.workspace);
 
         // Create output directory
@@ -115,8 +116,34 @@ The same shuffle ivec is also applied to metadata slabs (via
             }
         }
 
-        // Build the identity sequence [0, 1, 2, ..., interval-1]
-        let mut values: Vec<i32> = (0..interval as i32).collect();
+        // Build the value sequence to shuffle.
+        // When an ordinals file is provided (e.g., clean_ordinals.ivec),
+        // shuffle those actual ordinals so the output contains source-
+        // level ordinals. Otherwise, generate [0, interval).
+        let mut values: Vec<i32> = if let Some(ref ord_path) = ordinals_path {
+            ctx.ui.log(&format!("  loading ordinals from {}", ord_path.display()));
+            let data = match std::fs::read(ord_path) {
+                Ok(d) => d,
+                Err(e) => return error_result(format!("failed to read ordinals: {}", e), start),
+            };
+            // Parse dim=1 ivec records
+            let mut ords = Vec::with_capacity(interval);
+            let mut pos = 0;
+            while pos + 8 <= data.len() && ords.len() < interval {
+                // skip dim header (always 1)
+                pos += 4;
+                let val = i32::from_le_bytes(data[pos..pos+4].try_into().unwrap());
+                ords.push(val);
+                pos += 4;
+            }
+            if ords.len() != interval {
+                ctx.ui.log(&format!("  warning: ordinals file has {} records, expected {}",
+                    ords.len(), interval));
+            }
+            ords
+        } else {
+            (0..interval as i32).collect()
+        };
 
         // Fisher-Yates shuffle with the seeded PRNG, with progress
         let pb = ctx.ui.bar(interval as u64, "shuffle");
@@ -138,15 +165,24 @@ The same shuffle ivec is also applied to metadata slabs (via
         // Write as 1-dimensional ivec records
         let write_pb = ctx.ui.bar(values.len() as u64, "write");
         match write_ivec_1d(&output_path, &values, &write_pb) {
-            Ok(()) => CommandResult {
-                status: Status::Ok,
-                message: format!(
-                    "generated shuffle permutation of {} elements to {}",
-                    interval,
-                    output_path.display()
-                ),
-                produced: vec![output_path],
-                elapsed: start.elapsed(),
+            Ok(()) => {
+                // Write verified count for the bound checker
+                let var_name = format!("verified_count:{}",
+                    output_path.file_name().and_then(|n| n.to_str()).unwrap_or("output"));
+                let _ = crate::pipeline::variables::set_and_save(
+                    &ctx.workspace, &var_name, &interval.to_string());
+                ctx.defaults.insert(var_name, interval.to_string());
+
+                CommandResult {
+                    status: Status::Ok,
+                    message: format!(
+                        "generated shuffle permutation of {} elements to {}",
+                        interval,
+                        output_path.display()
+                    ),
+                    produced: vec![output_path],
+                    elapsed: start.elapsed(),
+                }
             },
             Err(e) => error_result(e, start),
         }
@@ -177,6 +213,14 @@ The same shuffle ivec is also applied to metadata slabs (via
                 default: Some("0".to_string()),
                 description: "Random seed for reproducibility".to_string(),
                 role: OptionRole::Config,
+        },
+            OptionDesc {
+                name: "ordinals".to_string(),
+                type_name: "Path".to_string(),
+                required: false,
+                default: None,
+                description: "Input ordinals ivec to shuffle (default: generate [0,interval))".to_string(),
+                role: OptionRole::Input,
         },
         ]
     }

@@ -5,6 +5,7 @@ members = [
     "veks-pipeline",
     "veks",
     "slabtastic",
+    "tools",
 ]
 resolver = "3"
 

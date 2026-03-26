@@ -112,6 +112,12 @@ pub struct RunArgs {
     /// Interval in milliseconds between UI status updates and TUI redraws.
     #[arg(long, default_value = "250", value_name = "MS")]
     pub status_interval: u64,
+
+    /// Output mode: tui (rich terminal, default when TTY), basic (plain
+    /// text progress on stderr), batch (log-only, no console output).
+    /// Auto-detected when not specified: tui if TTY, basic otherwise.
+    #[arg(long, default_value = "auto", value_parser = ["auto", "tui", "basic", "batch"])]
+    pub output: String,
 }
 
 /// CLI arguments for `veks script`.
@@ -410,8 +416,16 @@ pub fn run_pipeline(args: RunArgs) {
         println!("{}", msg);
     }
 
-    // Invalidate progress log if dataset.yaml is newer
+    // Invalidate progress log if dataset.yaml is newer (mtime check)
     if let Some(msg) = progress.invalidate_if_stale(dataset_path) {
+        println!("{}", msg);
+    }
+
+    // Invalidate if dataset.yaml content changed (hash check).
+    // This catches config changes that don't update mtime (e.g., restore
+    // from backup) and detects when a re-bootstrap changed the pipeline
+    // shape (e.g., adding --base-fraction).
+    if let Some(msg) = progress.invalidate_if_config_changed(dataset_path) {
         println!("{}", msg);
     }
 
@@ -452,25 +466,9 @@ pub fn run_pipeline(args: RunArgs) {
 
     governor.print_summary();
 
-    // Open run log in .cache/ for persistent pipeline execution history
+    // Persistent run log: all UI log messages are teed to .cache/run.log
+    // for post-session analysis and troubleshooting.
     let run_log_path = cache_dir.join("run.log");
-    let run_log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&run_log_path)
-        .ok()
-        .map(|f| std::sync::Arc::new(std::sync::Mutex::new(std::io::BufWriter::new(f))));
-    if let Some(ref log) = run_log {
-        use std::io::Write;
-        let mut w = log.lock().unwrap();
-        let _ = writeln!(w, "\n--- veks run {} (profile: {}) ---",
-            chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
-            profile_name,
-        );
-        let _ = writeln!(w, "dataset: {}", veks_core::paths::rel_display(&dataset_path));
-        let _ = writeln!(w, "steps: {}", pipeline_dag.steps.len());
-        let _ = w.flush();
-    }
 
     // Build execution context
     let dataset_name = config.name.clone();
@@ -502,7 +500,21 @@ pub fn run_pipeline(args: RunArgs) {
         threads,
         step_id: String::new(),
         governor,
-        ui: veks_core::ui::auto_ui_handle_with_interval(std::time::Duration::from_millis(args.status_interval)),
+        ui: {
+            let handle = match args.output.as_str() {
+                "batch" => veks_core::ui::UiHandle::new(
+                    std::sync::Arc::new(veks_core::ui::HeadlessSink::new())),
+                "basic" => veks_core::ui::UiHandle::new(
+                    std::sync::Arc::new(veks_core::ui::PlainSink::new())),
+                "tui" => veks_core::ui::auto_ui_handle_with_interval(
+                    std::time::Duration::from_millis(args.status_interval)),
+                _ /* auto */ => veks_core::ui::auto_ui_handle_with_interval(
+                    std::time::Duration::from_millis(args.status_interval)),
+            };
+            // Install global logger: Info+ → sink, all levels → .cache/run.log
+            veks_core::ui::install_logger(handle.sink_arc(), Some(&run_log_path));
+            handle
+        },
         status_interval: std::time::Duration::from_millis(args.status_interval),
     };
 
@@ -521,16 +533,24 @@ pub fn run_pipeline(args: RunArgs) {
     drop(ctx);
 
     // Replay buffered log messages to stdout so they persist in scrollback.
+    // Each message gets its own line — the TUI log pane stores them without newlines.
     if !console_log.is_empty() {
-        println!();
+        // Ensure terminal is in a clean state before replaying log
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        let _ = std::io::Write::flush(&mut std::io::stderr());
+        eprintln!(); // start on a fresh line
+
         for msg in &console_log {
-            println!("{}", msg);
+            eprintln!("{}", msg);
         }
+        eprintln!();
     }
 
     match result {
         Err(e) => {
-            eprintln!("\nPipeline failed: {}", e);
+            // Ensure we're on a clean line before printing the error.
+            eprintln!();
+            eprintln!("Pipeline failed: {}", e);
             eprintln!(
                 "Scratch directory preserved for debugging: {}",
                 scratch_dir.display()

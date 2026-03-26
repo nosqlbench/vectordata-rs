@@ -21,11 +21,15 @@ use crate::dataset::view::TypedVectorView;
 ///
 /// # Examples
 ///
-/// ```ignore
-/// let loader = DatasetLoader::new(PathBuf::from("/cache"));
-/// let view = loader.load_view("sift-128:default")?;
-/// let base = view.base_vectors().unwrap();
-/// let vec = base.get_f64(0).unwrap();
+/// ```
+/// use std::path::PathBuf;
+/// use vectordata::dataset::loader::DatasetLoader;
+///
+/// let loader = DatasetLoader::new(PathBuf::from("/tmp/cache"));
+/// // Load a local file (no catalog needed):
+/// // let view = loader.load("vectors.fvec", &[])?;
+/// // Load from catalog (requires catalog entries):
+/// // let view = loader.load("sift-128:default", &catalog)?;
 /// ```
 pub struct DatasetLoader {
     cache_dir: PathBuf,

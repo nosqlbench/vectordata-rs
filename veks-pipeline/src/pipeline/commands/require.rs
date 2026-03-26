@@ -106,11 +106,6 @@ run), the command returns immediately without re-running anything.
             Err(e) => return error_result(format!("failed to load {}: {}", file_str, e), start),
         };
 
-        let sub_workspace = pipeline_path
-            .parent()
-            .unwrap_or(std::path::Path::new("."))
-            .to_path_buf();
-
         let upstream = match &config.upstream {
             Some(u) => u,
             None => {
@@ -129,7 +124,7 @@ run), the command returns immediately without re-running anything.
             .collect();
 
         // Check if all steps are already complete
-        let progress_path = sub_workspace.join("dataset.log");
+        let progress_path = ProgressLog::path_for_dataset(&pipeline_path);
         let progress = ProgressLog::load(&progress_path)
             .map(|(p, _)| p)
             .unwrap_or_else(|_| ProgressLog::new());
@@ -158,6 +153,7 @@ run), the command returns immediately without re-running anything.
             resources: None,
             governor: "maximize".to_string(),
             status_interval: 250,
+            output: "auto".to_string(),
         };
 
         crate::pipeline::run_pipeline(run_args);
@@ -204,11 +200,7 @@ run), the command returns immediately without re-running anything.
             Err(_) => return ArtifactState::Absent,
         };
 
-        let sub_workspace = pipeline_path
-            .parent()
-            .unwrap_or(std::path::Path::new("."))
-            .to_path_buf();
-        let progress_path = sub_workspace.join("dataset.log");
+        let progress_path = ProgressLog::path_for_dataset(&pipeline_path);
         let progress = match ProgressLog::load(&progress_path) {
             Ok((p, _)) => p,
             Err(_) => return ArtifactState::Absent,

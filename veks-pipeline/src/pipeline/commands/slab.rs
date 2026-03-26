@@ -142,6 +142,12 @@ metadata records with vector ordinals.
         let count = records.len();
         ctx.ui.log(&format!("Imported {} records from {} to {}", count, from_path.display(), to_path.display()));
 
+        let var_name = format!("verified_count:{}",
+            to_path.file_name().and_then(|n| n.to_str()).unwrap_or("output"));
+        let _ = crate::pipeline::variables::set_and_save(
+            &ctx.workspace, &var_name, &count.to_string());
+        ctx.defaults.insert(var_name, count.to_string());
+
         CommandResult {
             status: Status::Ok,
             message: format!("imported {} records", count),
@@ -464,6 +470,12 @@ datasets where a full re-import would be prohibitively expensive.
 
         ctx.ui.log(&format!("Appended {} records from {} to {}", count, from_path.display(), target_path.display()));
 
+        let var_name = format!("verified_count:{}",
+            target_path.file_name().and_then(|n| n.to_str()).unwrap_or("output"));
+        let _ = crate::pipeline::variables::set_and_save(
+            &ctx.workspace, &var_name, &count.to_string());
+        ctx.defaults.insert(var_name, count.to_string());
+
         CommandResult {
             status: Status::Ok,
             message: format!("appended {} records", count),
@@ -607,6 +619,12 @@ production queries where page I/O efficiency matters.
         }
 
         ctx.ui.log(&format!("Rewrote {} records from {} to {}", count, source_path.display(), dest_path.display()));
+
+        let var_name = format!("verified_count:{}",
+            dest_path.file_name().and_then(|n| n.to_str()).unwrap_or("output"));
+        let _ = crate::pipeline::variables::set_and_save(
+            &ctx.workspace, &var_name, &count.to_string());
+        ctx.defaults.insert(var_name, count.to_string());
 
         CommandResult {
             status: Status::Ok,

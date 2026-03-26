@@ -229,18 +229,60 @@ bytes ←→ [Stage 1: binary codec] ←→ ANode ←→ [Stage 2: vernacular] �
 
 A complete predicated dataset contains:
 
-| Facet | Format | Description |
-|-------|--------|-------------|
-| `base_vectors` | fvec/mvec | Corpus vectors to search |
-| `query_vectors` | fvec/mvec | Query vectors to run |
-| `neighbor_indices` | ivec | Ground-truth neighbor indices |
-| `neighbor_distances` | fvec | Ground-truth neighbor distances |
-| `metadata_content` | slab (MNode) | Metadata records per vector |
-| `metadata_predicates` | slab (PNode) | Predicate trees per query |
-| `metadata_layout` | slab | Metadata field layout schema |
-| `predicate_results` | slab | Predicate evaluation result bitmaps |
-| `filtered_neighbor_indices` | ivec | Filtered ground-truth indices |
-| `filtered_neighbor_distances` | fvec | Filtered ground-truth distances |
+| Code | Facet | Format | Description |
+|------|-------|--------|-------------|
+| **B** | `base_vectors` | fvec/mvec | Corpus vectors to search |
+| **Q** | `query_vectors` | fvec/mvec | Query vectors to run |
+| **G** | `neighbor_indices` | ivec | Ground-truth neighbor indices |
+| **D** | `neighbor_distances` | fvec | Ground-truth neighbor distances |
+| **M** | `metadata_content` | slab (MNode) | Metadata records per vector |
+| **P** | `metadata_predicates` | slab (PNode) | Predicate trees per query |
+| **R** | `metadata_indices` | slab | Predicate evaluation result indices |
+| **F** | `filtered_neighbor_indices` | ivec | Filtered ground-truth indices |
+| | `filtered_neighbor_distances` | fvec | Filtered ground-truth distances |
+
+### Facet codes
+
+Each facet has a single-letter code used for compact specification and
+display throughout the toolchain:
+
+- **CLI**: `--required-facets BQGD` or `--required-facets "base,query,gt,dist"`
+- **TUI**: The dataset picker shows `BQGDMPRF` indicators per profile
+- **Bootstrap**: Facet codes control which pipeline steps are generated
+
+Codes are case-insensitive on input. The canonical display order is
+`BQGDMPRF`. The **F** code covers both `filtered_neighbor_indices` and
+`filtered_neighbor_distances` (they are always produced as a pair).
+
+### Facet implication rules
+
+When `prepare bootstrap` infers required facets from available inputs:
+
+| Input provided | Implied facets | Reasoning |
+|----------------|----------------|-----------|
+| Base vectors (B) | `BQGD` | Base implies self-search query extraction + KNN ground truth |
+| Metadata (M) | `BQGDMPR` | Metadata implies predicate generation + evaluation |
+| Base + Metadata (B+M) | `BQGDMPRF` | Both implies filtered KNN as well |
+
+These defaults can be overridden with `--required-facets`. For example,
+`--required-facets B` produces a base-only dataset with no queries or
+ground truth. `--required-facets BQG` produces queries and indices but
+no distances.
+
+### Facet code parsing
+
+The `--required-facets` flag accepts any of these formats:
+
+```
+BQGD                        # compact letter codes
+B,Q,G,D                     # comma-separated codes
+base,query,gt,dist          # comma-separated names
+base query gt dist          # space-separated names
+"base_vectors,query_vectors,neighbor_indices"  # full facet names
+```
+
+All formats are normalized to the canonical `BQGDMPRF` code set for
+internal use.
 
 ## 2.9 Distance Metrics
 

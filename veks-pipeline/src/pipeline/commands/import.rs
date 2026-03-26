@@ -200,6 +200,13 @@ work with.
                 Ok(()) => {
                     let record_str = probe.record_count
                         .map_or("unknown".to_string(), |n| n.to_string());
+                    if let Some(rc) = probe.record_count {
+                        let var_name = format!("verified_count:{}",
+                            output_path.file_name().and_then(|n| n.to_str()).unwrap_or("output"));
+                        let _ = crate::pipeline::variables::set_and_save(
+                            &ctx.workspace, &var_name, &rc.to_string());
+                        ctx.defaults.insert(var_name, rc.to_string());
+                    }
                     return CommandResult {
                         status: Status::Ok,
                         message: format!(
@@ -345,6 +352,12 @@ work with.
         if let Err(e) = sink.finish() {
             return error_result(format!("failed to finalize output: {}", e), start);
         }
+
+        let var_name = format!("verified_count:{}",
+            output_path.file_name().and_then(|n| n.to_str()).unwrap_or("output"));
+        let _ = crate::pipeline::variables::set_and_save(
+            &ctx.workspace, &var_name, &count.to_string());
+        ctx.defaults.insert(var_name, count.to_string());
 
         CommandResult {
             status: Status::Ok,

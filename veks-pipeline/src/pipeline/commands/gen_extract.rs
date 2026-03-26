@@ -186,11 +186,21 @@ facets of the dataset.
                 &output_path, normalize, ctx, start,
             );
             match result {
-                Ok(msg) => CommandResult {
-                    status: Status::Ok,
-                    message: msg,
-                    produced: vec![output_path],
-                    elapsed: start.elapsed(),
+                Ok(msg) => {
+                    // Write verified count for the bound checker
+                    let extracted = effective_end - range_start;
+                    let var_name = format!("verified_count:{}",
+                        output_path.file_name().and_then(|n| n.to_str()).unwrap_or("output"));
+                    let _ = crate::pipeline::variables::set_and_save(
+                        &ctx.workspace, &var_name, &extracted.to_string());
+                    ctx.defaults.insert(var_name, extracted.to_string());
+
+                    CommandResult {
+                        status: Status::Ok,
+                        message: msg,
+                        produced: vec![output_path],
+                        elapsed: start.elapsed(),
+                    }
                 },
                 Err(e) => error_result(e, start),
             }
@@ -233,9 +243,17 @@ facets of the dataset.
                 return error_result(format!("failed to finalize {}: {}", output_path.display(), e), start);
             }
 
+            // Write verified count for the bound checker
+            let extracted = effective_end - range_start;
+            let var_name = format!("verified_count:{}",
+                output_path.file_name().and_then(|n| n.to_str()).unwrap_or("output"));
+            let _ = crate::pipeline::variables::set_and_save(
+                &ctx.workspace, &var_name, &extracted.to_string());
+            ctx.defaults.insert(var_name, extracted.to_string());
+
             CommandResult {
                 status: Status::Ok,
-                message: format!("extracted {} vectors to {}", effective_end - range_start, output_path.display()),
+                message: format!("extracted {} vectors to {}", extracted, output_path.display()),
                 produced: vec![output_path],
                 elapsed: start.elapsed(),
             }
@@ -501,6 +519,13 @@ ordinal.
                 return error_result(format!("failed to flush output: {}", e), start);
             }
 
+            // Write verified count for the bound checker
+            let var_name = format!("verified_count:{}",
+                output_path.file_name().and_then(|n| n.to_str()).unwrap_or("output"));
+            let _ = crate::pipeline::variables::set_and_save(
+                &ctx.workspace, &var_name, &count.to_string());
+            ctx.defaults.insert(var_name, count.to_string());
+
             CommandResult {
                 status: Status::Ok,
                 message: format!(
@@ -552,6 +577,13 @@ ordinal.
             if let Err(e) = writer.flush() {
                 return error_result(format!("failed to flush output: {}", e), start);
             }
+
+            // Write verified count for the bound checker
+            let var_name = format!("verified_count:{}",
+                output_path.file_name().and_then(|n| n.to_str()).unwrap_or("output"));
+            let _ = crate::pipeline::variables::set_and_save(
+                &ctx.workspace, &var_name, &count.to_string());
+            ctx.defaults.insert(var_name, count.to_string());
 
             CommandResult {
                 status: Status::Ok,
@@ -801,11 +833,21 @@ so that `base_metadata.slab[i]` corresponds to `base_vectors.mvec[i]`.
                 &output_path, normalize, ctx, start,
             );
             match result {
-                Ok(msg) => CommandResult {
-                    status: Status::Ok,
-                    message: msg,
-                    produced: vec![output_path],
-                    elapsed: start.elapsed(),
+                Ok(msg) => {
+                    // Write verified count for the bound checker
+                    let extracted = effective_end - range_start;
+                    let var_name = format!("verified_count:{}",
+                        output_path.file_name().and_then(|n| n.to_str()).unwrap_or("output"));
+                    let _ = crate::pipeline::variables::set_and_save(
+                        &ctx.workspace, &var_name, &extracted.to_string());
+                    ctx.defaults.insert(var_name, extracted.to_string());
+
+                    CommandResult {
+                        status: Status::Ok,
+                        message: msg,
+                        produced: vec![output_path],
+                        elapsed: start.elapsed(),
+                    }
                 },
                 Err(e) => error_result(e, start),
             }
@@ -851,6 +893,13 @@ so that `base_metadata.slab[i]` corresponds to `base_vectors.mvec[i]`.
             if let Err(e) = writer.flush() {
                 return error_result(format!("failed to flush output: {}", e), start);
             }
+
+            // Write verified count for the bound checker
+            let var_name = format!("verified_count:{}",
+                output_path.file_name().and_then(|n| n.to_str()).unwrap_or("output"));
+            let _ = crate::pipeline::variables::set_and_save(
+                &ctx.workspace, &var_name, &count.to_string());
+            ctx.defaults.insert(var_name, count.to_string());
 
             CommandResult {
                 status: Status::Ok,

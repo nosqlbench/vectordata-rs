@@ -91,6 +91,10 @@ fn default_args(name: &str, output: &Path) -> ImportArgs {
         query_convert_format: None,
         compress_cache: true,
         sized_profiles: None,
+        base_fraction: 1.0,
+        required_facets: None,
+        round_digits: 2,
+        pedantic_dedup: false,
     }
 }
 

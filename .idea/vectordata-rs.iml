@@ -14,10 +14,13 @@
       <sourceFolder url="file://$MODULE_DIR$/vectordata/tests" isTestSource="true" />
       <sourceFolder url="file://$MODULE_DIR$/veks/examples" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/veks/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/tools/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/veks-core/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/veks-pipeline/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/veks-pipeline/tests" isTestSource="true" />
       <excludeFolder url="file://$MODULE_DIR$/links" />
       <excludeFolder url="file://$MODULE_DIR$/target" />
+      <excludeFolder url="file://$MODULE_DIR$/veks/target" />
     </content>
     <orderEntry type="inheritedJdk" />
     <orderEntry type="sourceFolder" forTests="false" />

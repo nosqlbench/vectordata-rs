@@ -21,21 +21,31 @@ use flate2::write::GzEncoder;
 /// Configurable compression level. Defaults to maximum (9).
 /// Cache files are written once and read many times, so we spend
 /// more CPU up front to minimize I/O on every subsequent read.
+/// Set to 0 to disable compression entirely (raw writes).
 static LEVEL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(9);
 
-/// Set the compression level (0-9). Call before any save_gz operations.
+/// Set the compression level (0-9). Call before any save operations.
+/// Level 0 disables compression: files are written raw (no .gz wrapper).
 pub fn set_compression_level(level: u32) {
     LEVEL.store(level.min(9), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Returns the current compression level.
+pub fn compression_enabled() -> bool {
+    LEVEL.load(std::sync::atomic::Ordering::Relaxed) > 0
 }
 
 fn compression_level() -> Compression {
     Compression::new(LEVEL.load(std::sync::atomic::Ordering::Relaxed))
 }
 
-/// Compress data in memory and write to a `.gz` file.
-///
-/// The file is written atomically (write to tmp, rename).
+/// Save data to cache. Compresses as `.gz` when compression level > 0,
+/// writes raw otherwise. Atomic (write to tmp, rename).
 pub fn save_gz(path: &Path, data: &[u8]) -> Result<(), String> {
+    if !compression_enabled() {
+        return save_raw(path, data);
+    }
+
     let gz_path = gz_path(path);
     if let Some(parent) = gz_path.parent() {
         std::fs::create_dir_all(parent)
@@ -57,25 +67,45 @@ pub fn save_gz(path: &Path, data: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-/// Load and decompress a `.gz` file into memory.
-///
-/// Returns the decompressed data as a `Vec<u8>`.
-pub fn load_gz(path: &Path) -> Result<Vec<u8>, String> {
-    let gz_path = gz_path(path);
-    let compressed = std::fs::read(&gz_path)
-        .map_err(|e| format!("failed to read {}: {}", gz_path.display(), e))?;
-
-    let mut decoder = GzDecoder::new(&compressed[..]);
-    let mut data = Vec::with_capacity(compressed.len() * 3);
-    decoder.read_to_end(&mut data)
-        .map_err(|e| format!("gzip decompress error: {}", e))?;
-
-    Ok(data)
+/// Save data as a raw (uncompressed) file. Atomic (write to tmp, rename).
+fn save_raw(path: &Path, data: &[u8]) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create dir for {}: {}", path.display(), e))?;
+    }
+    let tmp_path = path.with_extension("bin.tmp");
+    std::fs::write(&tmp_path, data)
+        .map_err(|e| format!("failed to write {}: {}", tmp_path.display(), e))?;
+    std::fs::rename(&tmp_path, path)
+        .map_err(|e| format!("failed to rename {}: {}", tmp_path.display(), e))?;
+    Ok(())
 }
 
-/// Check if the `.gz` form of a cache file exists.
+/// Load cached data. Tries `.gz` first, then raw file.
+pub fn load_gz(path: &Path) -> Result<Vec<u8>, String> {
+    let gz = gz_path(path);
+    if gz.exists() {
+        let compressed = std::fs::read(&gz)
+            .map_err(|e| format!("failed to read {}: {}", gz.display(), e))?;
+        let mut decoder = GzDecoder::new(&compressed[..]);
+        let mut data = Vec::with_capacity(compressed.len() * 3);
+        decoder.read_to_end(&mut data)
+            .map_err(|e| format!("gzip decompress error: {}", e))?;
+        return Ok(data);
+    }
+
+    // Fall back to raw file
+    if path.exists() {
+        return std::fs::read(path)
+            .map_err(|e| format!("failed to read {}: {}", path.display(), e));
+    }
+
+    Err(format!("cache file not found: {} (checked .gz and raw)", path.display()))
+}
+
+/// Check if a cached file exists (either `.gz` or raw).
 pub fn gz_exists(path: &Path) -> bool {
-    gz_path(path).exists()
+    gz_path(path).exists() || path.exists()
 }
 
 /// Get the `.gz` path for a given cache path.

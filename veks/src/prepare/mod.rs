@@ -9,6 +9,7 @@
 //! counterpart to the consumer-side `veks datasets` commands.
 
 pub(crate) mod cache_compress;
+pub(crate) mod cache_gc;
 pub mod import;
 pub mod stratify;
 pub(crate) mod wizard;
@@ -74,8 +75,8 @@ pub enum PrepareCommand {
         #[arg(long)]
         ground_truth_distances: Option<PathBuf>,
 
-        /// Distance metric for KNN computation
-        #[arg(long, default_value = "L2")]
+        /// Distance metric for KNN computation (auto-detected from data if not specified)
+        #[arg(long, default_value = "auto")]
         metric: String,
 
         /// Number of neighbors for KNN ground truth
@@ -116,6 +117,29 @@ pub enum PrepareCommand {
         #[arg(long, short = 'r')]
         restart: bool,
 
+        /// Fraction of base vectors to use. Use "%" suffix for percentages
+        /// (e.g., "1%", "50%", "100%") or decimal fractions < 1 (e.g., "0.01", "0.5").
+        /// Bare whole numbers like "1" are rejected — use "1%" instead.
+        #[arg(long, default_value = "100%")]
+        base_fraction: String,
+
+        /// Required dataset facets (e.g., "BQGD", "base,query,gt,dist").
+        /// Controls which pipeline steps are generated. When omitted,
+        /// facets are inferred from available inputs (B->BQGD, M->BQGDMPR, B+M->BQGDMPRF).
+        #[arg(long)]
+        required_facets: Option<String>,
+
+        /// Significant digits for computed counts (base_end, etc.).
+        /// Default 2 produces clean sizes (180M instead of 184623729).
+        /// Set to 10+ to disable rounding.
+        #[arg(long, default_value = "2")]
+        round_digits: u32,
+
+        /// Run dedup+zeros on the full input before subsetting (slower but
+        /// stable). Default: subset first, then dedup on the subset.
+        #[arg(long)]
+        pedantic_dedup: bool,
+
         /// Fully automatic mode — implies --interactive --restart --yes (-iry).
         /// Detects files by name, accepts all defaults, and starts fresh.
         #[arg(long)]
@@ -152,6 +176,17 @@ pub enum PrepareCommand {
     Catalog {
         #[command(subcommand)]
         command: CatalogSubcommand,
+    },
+    /// Remove orphaned cache files from .cache/ that are no longer
+    /// referenced by the current pipeline configuration.
+    CacheGc {
+        /// Dataset directory or path to dataset.yaml
+        #[arg(default_value = ".")]
+        path: PathBuf,
+
+        /// Dry run — show what would be removed without deleting
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Compress eligible cache files to save disk space
     CacheCompress {
@@ -211,6 +246,43 @@ pub enum CatalogSubcommand {
     },
 }
 
+/// Parse a fraction string like "50%", "1%", "0.5", or "1.0" into 0.0–1.0.
+/// Parse a fraction string. Accepts:
+/// - "50%" → 0.50  (percentage with suffix)
+/// - "1%" → 0.01
+/// - "0.5" → 0.50  (decimal fraction, must be < 1.0)
+/// - "0.01" → 0.01
+///
+/// Bare whole numbers like "1" or "50" are rejected to avoid ambiguity.
+/// Use "1%" or "0.01" instead.
+fn parse_fraction(s: &str) -> f64 {
+    let s = s.trim();
+    if let Some(pct) = s.strip_suffix('%') {
+        pct.trim().parse::<f64>().unwrap_or(100.0).clamp(0.0, 100.0) / 100.0
+    } else {
+        let v = s.parse::<f64>().unwrap_or(1.0);
+        if v >= 1.0 {
+            if v == 1.0 && !s.contains('.') {
+                // Bare "1" is ambiguous — could mean 1% or 100%.
+                // Require "1%" or "0.01" instead.
+                eprintln!(
+                    "Error: --base-fraction '{}' is ambiguous. Use '{}%' for {}% or '{}' for a decimal fraction.",
+                    s, s, s, format!("0.{:02}", v as u32)
+                );
+                std::process::exit(1);
+            }
+            // Bare whole numbers > 1 are also ambiguous
+            eprintln!(
+                "Error: --base-fraction '{}' is ambiguous. Use '{}%' for {}%.",
+                s, s, s
+            );
+            std::process::exit(1);
+        } else {
+            v.clamp(0.0, 1.0)
+        }
+    }
+}
+
 /// Dispatch a prepare subcommand.
 pub fn run(args: PrepareArgs) {
     match args.command {
@@ -219,11 +291,21 @@ pub fn run(args: PrepareArgs) {
             self_search, query_count, metadata, ground_truth,
             ground_truth_distances, metric, neighbors, seed, description,
             no_dedup, no_zero_check, no_filtered, normalize, force, restart,
-            auto,
+            base_fraction, required_facets, round_digits, pedantic_dedup, auto,
         } => {
             // --auto implies -i -r -y
             let interactive = interactive || auto;
             let yes = yes || auto;
+            let base_fraction = parse_fraction(&base_fraction);
+            let metric = if metric == "auto" {
+                let (m, reason) = base_vectors.as_ref()
+                    .map(|p| import::detect_metric(p))
+                    .unwrap_or_else(|| ("Cosine".to_string(), "default".to_string()));
+                eprintln!("Metric: {} ({})", m, reason);
+                m
+            } else {
+                metric
+            };
             let restart = restart || auto;
 
             if restart {
@@ -283,7 +365,32 @@ pub fn run(args: PrepareArgs) {
                 };
 
                 if interactive {
-                    let args = wizard::run_wizard_with_options(yes, auto);
+                    // CLI flags pre-seed wizard defaults. The wizard presents
+                    // them as the default choice; --auto accepts them all.
+                    let seeds = wizard::WizardSeeds {
+                        name: name.clone(),
+                        output: output.clone(),
+                        base_vectors: base_vectors.clone(),
+                        query_vectors: query_vectors.clone(),
+                        self_search: if self_search { Some(true) } else { None },
+                        query_count: None, // use wizard default (10000)
+                        metadata: metadata.clone(),
+                        ground_truth: ground_truth.clone(),
+                        ground_truth_distances: ground_truth_distances.clone(),
+                        metric: if metric != "auto" { Some(metric.clone()) } else { None },
+                        neighbors: None, // use wizard default
+                        seed: None,
+                        description: description.clone(),
+                        no_dedup: if no_dedup { Some(true) } else { None },
+                        no_zero_check: if no_zero_check { Some(true) } else { None },
+                        no_filtered: if no_filtered { Some(true) } else { None },
+                        normalize: if normalize { Some(true) } else { None },
+                        base_fraction: if base_fraction < 1.0 { Some(base_fraction) } else { None },
+                        pedantic_dedup: if pedantic_dedup { Some(true) } else { None },
+                        required_facets: required_facets.clone(),
+                        round_digits: Some(round_digits),
+                    };
+                    let args = wizard::run_wizard_with_options(yes, auto, seeds);
                     let out = args.output.clone();
                     import::run(args);
                     check_and_restore(&out);
@@ -303,13 +410,40 @@ pub fn run(args: PrepareArgs) {
                         no_filtered, normalize, force: force || restart,
                         base_convert_format: None,
                         query_convert_format: None,
-                        compress_cache: true,
+                        compress_cache: false,
                         sized_profiles: None,
+                        base_fraction,
+                        required_facets: required_facets.clone(),
+                        round_digits,
+                        pedantic_dedup,
                     });
                     check_and_restore(&out);
                 }
             } else if interactive {
-                let args = wizard::run_wizard_with_options(yes, false);
+                let seeds = wizard::WizardSeeds {
+                    name: name.clone(),
+                    output: output.clone(),
+                    base_vectors: base_vectors.clone(),
+                    query_vectors: query_vectors.clone(),
+                    self_search: if self_search { Some(true) } else { None },
+                    query_count: None,
+                    metadata: metadata.clone(),
+                    ground_truth: ground_truth.clone(),
+                    ground_truth_distances: ground_truth_distances.clone(),
+                    metric: if metric != "auto" { Some(metric.clone()) } else { None },
+                    neighbors: None,
+                    seed: None,
+                    description: description.clone(),
+                    no_dedup: if no_dedup { Some(true) } else { None },
+                    no_zero_check: if no_zero_check { Some(true) } else { None },
+                    no_filtered: if no_filtered { Some(true) } else { None },
+                    normalize: if normalize { Some(true) } else { None },
+                    base_fraction: if base_fraction < 1.0 { Some(base_fraction) } else { None },
+                    pedantic_dedup: if pedantic_dedup { Some(true) } else { None },
+                    required_facets: required_facets.clone(),
+                    round_digits: Some(round_digits),
+                };
+                let args = wizard::run_wizard_with_options(yes, false, seeds);
                 import::run(args);
             } else {
                 let name = name.unwrap_or_else(|| {
@@ -327,8 +461,12 @@ pub fn run(args: PrepareArgs) {
                     no_filtered, normalize, force,
                     base_convert_format: None,
                     query_convert_format: None,
-                    compress_cache: true,
+                    compress_cache: false,
                     sized_profiles: None,
+                    base_fraction,
+                    required_facets,
+                    round_digits,
+                    pedantic_dedup,
                 });
             }
         }
@@ -364,6 +502,9 @@ pub fn run(args: PrepareArgs) {
                     crate::catalog::generate::run(&input, &basename, for_publish_url, update);
                 }
             }
+        }
+        PrepareCommand::CacheGc { path, dry_run } => {
+            cache_gc::run(&path, dry_run);
         }
         PrepareCommand::CacheCompress { cache_dir, level, dry_run } => {
             crate::pipeline::gz_cache::set_compression_level(level);

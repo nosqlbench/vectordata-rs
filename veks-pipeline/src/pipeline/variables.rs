@@ -91,8 +91,75 @@ pub fn evaluate_expr(expr: &str, workspace: &Path) -> Result<String, String> {
     } else if let Some(path_str) = expr.strip_prefix("dim:") {
         let path = resolve_path(path_str, workspace);
         dim_file(&path)
+    } else if let Some(rest) = expr.strip_prefix("scale:") {
+        // scale:<integer>*<float> — multiply an integer by a fraction, truncate to u64.
+        // Optionally append :roundN to round to N significant digits.
+        // Examples:
+        //   scale:369247459*0.5          → 184623729
+        //   scale:369247459*0.5:round2   → 180000000
+        //   scale:369247459*0.5:round3   → 185000000
+        let (arith, round_digits) = if let Some(pos) = rest.rfind(":round") {
+            let digits_str = &rest[pos + 6..];
+            let digits: u32 = digits_str.parse().unwrap_or(2);
+            (&rest[..pos], Some(digits))
+        } else {
+            (rest, None)
+        };
+        let parts: Vec<&str> = arith.splitn(2, '*').collect();
+        if parts.len() != 2 {
+            return Err(format!("scale: expected '<int>*<float>', got '{}'", arith));
+        }
+        let base: u64 = parts[0].trim().parse()
+            .map_err(|_| format!("scale: invalid integer '{}'", parts[0]))?;
+        let factor: f64 = parts[1].trim().parse()
+            .map_err(|_| format!("scale: invalid float '{}'", parts[1]))?;
+        let result = (base as f64 * factor) as u64;
+        let result = if let Some(d) = round_digits {
+            round_to_sig_digits(result, d)
+        } else {
+            result
+        };
+        Ok(result.to_string())
     } else {
         Ok(expr.to_string())
+    }
+}
+
+/// Round a u64 to the nearest value with `digits` significant digits.
+///
+/// Picks whichever of round-up or round-down is closer. If the
+/// round-down candidate is zero, uses round-up instead (zero doesn't
+/// count as a valid rounded value for sizing purposes).
+///
+/// Examples (2 significant digits):
+///   184623729 → 180000000
+///   1500      → 1500 (already 2 sig digits)
+///   99        → 99
+///   5         → 5
+///   0         → 0
+fn round_to_sig_digits(value: u64, digits: u32) -> u64 {
+    if value == 0 { return 0; }
+
+    // Find the magnitude: 10^(num_digits_in_value - sig_digits)
+    let num_digits = ((value as f64).log10().floor() as u32) + 1;
+    if num_digits <= digits {
+        return value; // already has ≤ digits significant digits
+    }
+
+    let divisor = 10u64.pow(num_digits - digits);
+    let down = (value / divisor) * divisor;
+    let up = down + divisor;
+
+    // Don't round to zero
+    if down == 0 {
+        return up;
+    }
+
+    // Pick whichever is closer
+    if value - down <= up - value {
+        down
+    } else {
+        up
     }
 }
 
@@ -245,5 +312,45 @@ mod tests {
             tmp.path(),
         ).unwrap();
         assert_eq!(dim, "8");
+    }
+
+    #[test]
+    fn test_round_to_sig_digits() {
+        // 2 significant digits
+        assert_eq!(round_to_sig_digits(184623729, 2), 180000000);
+        assert_eq!(round_to_sig_digits(155000000, 2), 150000000); // tie goes down
+        assert_eq!(round_to_sig_digits(149999999, 2), 150000000);
+        assert_eq!(round_to_sig_digits(1500, 2), 1500);
+        assert_eq!(round_to_sig_digits(99, 2), 99);
+        assert_eq!(round_to_sig_digits(5, 2), 5);
+        assert_eq!(round_to_sig_digits(0, 2), 0);
+
+        // Don't round to zero
+        assert_eq!(round_to_sig_digits(3, 2), 3);
+        assert_eq!(round_to_sig_digits(49, 2), 49);
+
+        // 3 significant digits
+        assert_eq!(round_to_sig_digits(184623729, 3), 185000000);
+        assert_eq!(round_to_sig_digits(1234, 3), 1230);
+
+        // Large round_digits effectively disables rounding
+        assert_eq!(round_to_sig_digits(184623729, 10), 184623729);
+    }
+
+    #[test]
+    fn test_scale_with_round() {
+        let val = evaluate_expr("scale:369247459*0.5:round2", Path::new("/tmp")).unwrap();
+        let n: u64 = val.parse().unwrap();
+        // 369247459 * 0.5 = 184623729, rounded to 2 sig digits = 180000000
+        assert_eq!(n, 180000000);
+
+        let val = evaluate_expr("scale:369247459*0.5:round3", Path::new("/tmp")).unwrap();
+        let n: u64 = val.parse().unwrap();
+        assert_eq!(n, 185000000);
+
+        // No rounding
+        let val = evaluate_expr("scale:369247459*0.5", Path::new("/tmp")).unwrap();
+        let n: u64 = val.parse().unwrap();
+        assert_eq!(n, 184623729);
     }
 }

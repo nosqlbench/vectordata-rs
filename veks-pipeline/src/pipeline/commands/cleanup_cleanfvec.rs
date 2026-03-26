@@ -277,6 +277,12 @@ unique vectors, preventing wasted storage and incorrect KNN results.
             ctx.ui.log(&format!("  Duplicate vectors removed: {}", result.duplicate_vectors_removed));
         }
 
+        let var_name = format!("verified_count:{}",
+            output_path.file_name().and_then(|n| n.to_str()).unwrap_or("output"));
+        let _ = crate::pipeline::variables::set_and_save(
+            &ctx.workspace, &var_name, &result.written_count.to_string());
+        ctx.defaults.insert(var_name, result.written_count.to_string());
+
         CommandResult {
             status: Status::Ok,
             message: format!(

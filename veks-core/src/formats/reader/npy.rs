@@ -27,7 +27,7 @@ use super::VecSource;
 
 /// Detected element type from the npy descriptor
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum NpyDtype {
+pub enum NpyDtype {
     F16, // <f2
     F32, // <f4
     F64, // <f8
@@ -117,7 +117,7 @@ impl WorkQueue {
 }
 
 /// Loaded npy array data, polymorphic over element type
-enum NpyArrayData {
+pub enum NpyArrayData {
     F16 { data: Vec<u8>, rows: usize, cols: usize },
     F32(Array2<f32>),
     F64(Array2<f64>),
@@ -141,7 +141,7 @@ impl NpyArrayData {
     /// and F32/F64 arrays in standard layout on little-endian platforms have
     /// their elements contiguous in wire format. A single `to_vec()` memcpy
     /// at the trait boundary produces the owned `Vec<u8>`.
-    fn row_bytes(&self, row: usize) -> Vec<u8> {
+    pub fn row_bytes(&self, row: usize) -> Vec<u8> {
         match self {
             Self::F16 { data, cols, .. } => {
                 let start = row * cols * 2;
@@ -192,16 +192,44 @@ impl NpyArrayData {
 }
 
 /// Result of scanning npy file headers (no data loaded)
-struct NpyScanResult {
-    files: Vec<std::path::PathBuf>,
-    dtype: NpyDtype,
-    dimension: u32,
-    total_rows: u64,
+pub struct NpyScanResult {
+    pub files: Vec<std::path::PathBuf>,
+    pub dtype: NpyDtype,
+    pub dimension: u32,
+    pub total_rows: u64,
+}
+
+/// Per-file manifest entry for parallel conversion.
+pub struct NpyFileManifest {
+    pub path: std::path::PathBuf,
+    pub rows: u64,
+    /// Cumulative row offset (first record ordinal in this file).
+    pub offset: u64,
+}
+
+/// Scan npy files and return a manifest with per-file row counts and offsets.
+///
+/// Used by the parallel mmap converter to compute write positions.
+pub fn scan_npy_manifest(path: &Path) -> Result<(Vec<NpyFileManifest>, u32, u64), String> {
+    let scan = scan_npy_headers(path, None)?;
+    let mut manifest = Vec::with_capacity(scan.files.len());
+    let mut offset = 0u64;
+    for file in &scan.files {
+        let header = read_npy_header(file)?;
+        let rows = header.rows as u64;
+        manifest.push(NpyFileManifest {
+            path: file.clone(),
+            rows,
+            offset,
+        });
+        offset += rows;
+    }
+    Ok((manifest, scan.dimension, scan.total_rows))
 }
 
 /// Scan a directory of npy files: collect sorted paths, validate headers,
 /// and compute total row count. Only reads headers (a few hundred bytes each).
-fn scan_npy_headers(path: &Path, max_count: Option<u64>) -> Result<NpyScanResult, String> {
+pub fn scan_npy_headers(path: &Path, max_count: Option<u64>) -> Result<NpyScanResult, String> {
     let files: Vec<_> = if path.is_dir() {
         let mut entries: Vec<_> = fs::read_dir(path)
             .map_err(|e| format!("Failed to read directory: {}", e))?
@@ -638,7 +666,7 @@ fn extract_shape(header: &str) -> Option<(usize, usize)> {
 }
 
 /// Load an npy file with the given dtype
-fn load_npy(path: &Path, dtype: NpyDtype) -> Result<NpyArrayData, String> {
+pub fn load_npy(path: &Path, dtype: NpyDtype) -> Result<NpyArrayData, String> {
     match dtype {
         NpyDtype::F32 => {
             let file = fs::File::open(path)
@@ -661,7 +689,7 @@ fn load_npy(path: &Path, dtype: NpyDtype) -> Result<NpyArrayData, String> {
 }
 
 /// Load an f16 npy file by reading raw bytes (ndarray-npy doesn't support f16)
-fn load_npy_f16_raw(path: &Path) -> Result<NpyArrayData, String> {
+pub(crate) fn load_npy_f16_raw(path: &Path) -> Result<NpyArrayData, String> {
     let header = read_npy_header(path)?;
 
     let mut file = BufReader::new(

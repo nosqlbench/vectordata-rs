@@ -151,6 +151,19 @@ unsafe fn f16_to_f32_avx512_into(data: &[u8], out: &mut [u8]) -> usize {
 
 /// Convert f32 bytes to f16 bytes into a pre-allocated buffer.
 fn f32_to_f16_into(data: &[u8], out: &mut [u8]) -> usize {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("f16c") {
+            return unsafe { f32_to_f16_avx512_into(data, out) };
+        }
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("f16c") {
+            return unsafe { f32_to_f16_avx2_into(data, out) };
+        }
+    }
+    f32_to_f16_scalar_into(data, out)
+}
+
+fn f32_to_f16_scalar_into(data: &[u8], out: &mut [u8]) -> usize {
     let n = data.len() / 4;
     for i in 0..n {
         let off = i * 4;
@@ -158,6 +171,80 @@ fn f32_to_f16_into(data: &[u8], out: &mut [u8]) -> usize {
         let h = half::f16::from_f32(val);
         let dst = i * 2;
         out[dst..dst + 2].copy_from_slice(&h.to_le_bytes());
+    }
+    n * 2
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "f16c")]
+unsafe fn f32_to_f16_avx2_into(data: &[u8], out: &mut [u8]) -> usize {
+    use std::arch::x86_64::*;
+    let n = data.len() / 4;
+    let src = data.as_ptr() as *const f32;
+    let dst = out.as_mut_ptr() as *mut u16;
+
+    let chunks = n / 8;
+    for i in 0..chunks {
+        unsafe {
+            let v = _mm256_loadu_ps(src.add(i * 8));
+            let h = _mm256_cvtps_ph(v, _MM_FROUND_TO_NEAREST_INT);
+            _mm_storeu_si128(dst.add(i * 8) as *mut __m128i, h);
+        }
+    }
+    for i in (chunks * 8)..n {
+        unsafe {
+            let val = *src.add(i);
+            let h = half::f16::from_f32(val);
+            *(dst.add(i)) = h.to_bits();
+        }
+    }
+    n * 2
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f", enable = "f16c")]
+unsafe fn f32_to_f16_avx512_into(data: &[u8], out: &mut [u8]) -> usize {
+    use std::arch::x86_64::*;
+    let n = data.len() / 4;
+    let src = data.as_ptr() as *const f32;
+    let dst = out.as_mut_ptr() as *mut u16;
+
+    let chunks = n / 16;
+    for i in 0..chunks {
+        unsafe {
+            let v = _mm512_loadu_ps(src.add(i * 16));
+            let h = _mm512_cvtps_ph(v, _MM_FROUND_TO_NEAREST_INT);
+            _mm256_storeu_si256(dst.add(i * 16) as *mut __m256i, h);
+        }
+    }
+    let remaining_start = chunks * 16;
+    let remaining = n - remaining_start;
+    if remaining >= 8 {
+        let avx_chunks = remaining / 8;
+        for i in 0..avx_chunks {
+            let off = remaining_start + i * 8;
+            unsafe {
+                let v = _mm256_loadu_ps(src.add(off));
+                let h = _mm256_cvtps_ph(v, _MM_FROUND_TO_NEAREST_INT);
+                _mm_storeu_si128(dst.add(off) as *mut __m128i, h);
+            }
+        }
+        let scalar_start = remaining_start + avx_chunks * 8;
+        for i in scalar_start..n {
+            unsafe {
+                let val = *src.add(i);
+                let h = half::f16::from_f32(val);
+                *(dst.add(i)) = h.to_bits();
+            }
+        }
+    } else {
+        for i in remaining_start..n {
+            unsafe {
+                let val = *src.add(i);
+                let h = half::f16::from_f32(val);
+                *(dst.add(i)) = h.to_bits();
+            }
+        }
     }
     n * 2
 }

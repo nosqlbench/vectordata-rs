@@ -397,17 +397,13 @@ mod tests {
         }
     }
 
-    // This test depends on AnalyzeProfileOp which was moved to the
-    // veks-profiling crate. Disabled until verify-profiles can generate
-    // its own model or accept a prebuilt fixture.
-    #[cfg(feature = "__disabled_test")]
     #[test]
     fn test_verify_uniform_vectors() {
         let tmp = tempfile::tempdir().unwrap();
         let ws = tmp.path();
         let mut ctx = test_ctx(ws);
 
-        // Generate random vectors (uniform 0..1)
+        // Generate random vectors (uniform 0..1, dim=2, n=1000)
         let fvec = ws.join("test.fvec");
         let mut gen_opts = Options::new();
         gen_opts.set("output", fvec.to_string_lossy().to_string());
@@ -417,17 +413,11 @@ mod tests {
         let mut gen_op = GenerateVectorsOp;
         gen_op.execute(&gen_opts, &mut ctx);
 
-        // Profile the generated vectors to get a matching model, then verify against it
+        // Build a matching model directly. The generator produces
+        // uniform(-1, 1) on each dimension by default.
+        let model_json = r#"{"dimensions":2,"uniqueVectors":1000,"scalarModels":[{"type":"uniform","lower":-1.0,"upper":1.0},{"type":"uniform","lower":-1.0,"upper":1.0}]}"#;
         let model_path = ws.join("model.json");
-        {
-            use crate::pipeline::commands::analyze_profile::AnalyzeProfileOp;
-            let mut profile_opts = Options::new();
-            profile_opts.set("source", fvec.to_string_lossy().to_string());
-            profile_opts.set("output", model_path.to_string_lossy().to_string());
-            let mut profile_op = AnalyzeProfileOp;
-            let r = profile_op.execute(&profile_opts, &mut ctx);
-            assert_eq!(r.status, Status::Ok);
-        }
+        std::fs::write(&model_path, model_json).unwrap();
 
         let mut opts = Options::new();
         opts.set("model", model_path.to_string_lossy().to_string());

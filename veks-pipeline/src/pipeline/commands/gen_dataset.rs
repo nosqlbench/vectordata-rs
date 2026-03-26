@@ -233,6 +233,20 @@ generation, or half-precision storage.
 
         ctx.ui.log(&format!("  Dataset created: {}", output_dir.display()));
 
+        // Write verified counts for xvec output files
+        for (path, cnt) in [
+            (&base_path, base_count),
+            (&query_path, query_count),
+            (&indices_path, query_count),
+            (&distances_path, query_count),
+        ] {
+            let var_name = format!("verified_count:{}",
+                path.file_name().and_then(|n| n.to_str()).unwrap_or("output"));
+            let _ = crate::pipeline::variables::set_and_save(
+                &ctx.workspace, &var_name, &cnt.to_string());
+            ctx.defaults.insert(var_name, cnt.to_string());
+        }
+
         CommandResult {
             status: Status::Ok,
             message: format!(

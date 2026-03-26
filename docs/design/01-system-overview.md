@@ -341,6 +341,57 @@ text-search/
 └── ...
 ```
 
+### Artifact integrity and failsafe checks
+
+The pipeline runner MUST NOT report success for a step unless the
+output has been affirmatively verified. Specifically:
+
+- **xvec files** (fvec, mvec, ivec, etc.): The bound checker reads
+  the dimension from the first 4 bytes, computes the record stride
+  (`4 + dim × element_size`), and verifies the file size is an exact
+  multiple. A file with trailing bytes is `Partial` — the conversion
+  was interrupted.
+
+- **Verified count**: Every pipeline command that produces an xvec or
+  slab output file **must** write a `verified_count:<filename>` entry
+  to `variables.yaml` (via `variables::set_and_save`) after successful
+  completion. The bound checker reads this entry and compares it against
+  the file's actual record count. A record-aligned file without a
+  verified count is treated as `Partial` (failsafe: the write may have
+  been interrupted at a record boundary). The workspace is located by
+  walking up from the output file's directory until `variables.yaml`
+  is found (supporting outputs in `.cache/`, `profiles/name/`, etc.).
+
+- **Post-write verification**: After writing an xvec file, commands
+  verify that `file_size == count × stride` before reporting success.
+  A mismatch is an error.
+
+- **Progress log authority**: The progress log records success or
+  failure affirmatively. A step without a progress record is treated
+  as incomplete regardless of what the output file looks like on disk.
+  The bound checker provides a secondary check that catches truncated
+  files from killed processes.
+
+- **Failsafe principle**: False positives (reporting success when
+  data is incomplete) are worse than false negatives (re-running a
+  step that was already complete). All checks err on the side of
+  re-running.
+
+### Parallel mmap conversion
+
+When converting a directory of npy files to an xvec format, the
+`transform convert` command uses a parallel mmap write path:
+
+1. Scan all npy file headers → per-file row counts and cumulative offsets
+2. Pre-allocate the output file to exact size via `posix_fallocate` + mmap
+3. Load, convert, and write files in parallel via rayon — each file writes
+   to its computed byte offset in the mmap, with no coordination needed
+4. Periodic `msync(MS_ASYNC)` flushes dirty pages asynchronously
+5. Final `flush()` ensures all data reaches disk
+
+The `SharedMmapWriter` is safe for concurrent disjoint writes because
+each record ordinal maps to a non-overlapping byte range in the file.
+
 ### Artifact state model
 
 Pipeline commands report the state of their output artifacts:

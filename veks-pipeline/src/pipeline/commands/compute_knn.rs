@@ -267,7 +267,11 @@ fn cache_prefix_for(base_path: &Path, query_path: &Path) -> String {
         .file_stem()
         .unwrap_or_default()
         .to_string_lossy();
-    format!("{}.{}", base_stem, query_stem)
+    // Include file sizes in the cache key so partitions are invalidated
+    // when the data changes (e.g., different base_fraction → different vectors).
+    let base_size = std::fs::metadata(base_path).map(|m| m.len()).unwrap_or(0);
+    let query_size = std::fs::metadata(query_path).map(|m| m.len()).unwrap_or(0);
+    format!("{}.{}.{}_{}", base_stem, query_stem, base_size, query_size)
 }
 
 /// Validate that a cache file exists and has the expected byte size.
@@ -1596,6 +1600,15 @@ where
             produced.push(dist_path.to_path_buf());
         }
 
+        // Write verified counts for the bound checker
+        for xvec_path in &produced {
+            let var_name = format!("verified_count:{}",
+                xvec_path.file_name().and_then(|n| n.to_str()).unwrap_or("output"));
+            let _ = crate::pipeline::variables::set_and_save(
+                &ctx.workspace, &var_name, &query_count.to_string());
+            ctx.defaults.insert(var_name, query_count.to_string());
+        }
+
         return CommandResult {
             status: Status::Ok,
             message: format!(
@@ -2110,6 +2123,15 @@ where
     let mut produced = vec![indices_path.to_path_buf()];
     if let Some(dp) = distances_path {
         produced.push(dp.to_path_buf());
+    }
+
+    // Write verified counts for the bound checker
+    for xvec_path in &produced {
+        let var_name = format!("verified_count:{}",
+            xvec_path.file_name().and_then(|n| n.to_str()).unwrap_or("output"));
+        let _ = crate::pipeline::variables::set_and_save(
+            &ctx.workspace, &var_name, &query_count.to_string());
+        ctx.defaults.insert(var_name, query_count.to_string());
     }
 
     CommandResult {

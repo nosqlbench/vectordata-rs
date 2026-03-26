@@ -24,8 +24,7 @@
 //!    sequence as an ivec file, plus a JSON report.
 
 use std::cmp::Ordering;
-use std::collections::BinaryHeap;
-use std::io::{BufWriter, Read, Write};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -115,6 +114,27 @@ impl VecReader {
             VecReader::F16(_) => "f16",
         }
     }
+
+    /// Read the first `n` components of vector at `index` as f32 into `out`.
+    ///
+    /// Zero-allocation for f32 sources (direct mmap slice). For f16 sources,
+    /// upcasts only the requested components — no full-vector allocation.
+    #[inline]
+    fn prefix_f32_into(&self, index: usize, out: &mut [f32]) {
+        let n = out.len();
+        match self {
+            VecReader::F32(r) => {
+                let slice = r.get_slice(index);
+                out.copy_from_slice(&slice[..n]);
+            }
+            VecReader::F16(r) => {
+                let slice = r.get_slice(index);
+                for (dst, src) in out.iter_mut().zip(slice[..n].iter()) {
+                    *dst = src.to_f32();
+                }
+            }
+        }
+    }
 }
 
 /// Pipeline command: deduplicate vectors.
@@ -143,16 +163,32 @@ const IO_BUF_SIZE: usize = 1 << 20;
 ///
 /// Wire format: `[ordinal:u32 LE][prefix_0:f32 LE]...[prefix_N:f32 LE]`
 /// where N = `prefix_width`.
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 struct RunRecord {
     ordinal: u32,
-    prefix: Vec<f32>,
+    prefix: [f32; MAX_PREFIX],
+    prefix_len: u8,
 }
 
 impl RunRecord {
+    /// Create a new record with the given ordinal and prefix components.
+    #[inline]
+    fn new(ordinal: u32, prefix_data: &[f32]) -> Self {
+        let mut prefix = [0.0f32; MAX_PREFIX];
+        let n = prefix_data.len().min(MAX_PREFIX);
+        prefix[..n].copy_from_slice(&prefix_data[..n]);
+        RunRecord { ordinal, prefix, prefix_len: n as u8 }
+    }
+
+    /// The active prefix slice.
+    #[inline]
+    fn prefix(&self) -> &[f32] {
+        &self.prefix[..self.prefix_len as usize]
+    }
+
     /// Compare by prefix components using total lexicographic order.
     fn cmp_prefix(&self, other: &RunRecord) -> Ordering {
-        for (a, b) in self.prefix.iter().zip(other.prefix.iter()) {
+        for (a, b) in self.prefix().iter().zip(other.prefix().iter()) {
             let ord = float_to_sortable(*a).cmp(&float_to_sortable(*b));
             if ord != Ordering::Equal {
                 return ord;
@@ -164,15 +200,15 @@ impl RunRecord {
 
     /// Check if prefix components are identical (potential duplicate).
     fn prefix_eq(&self, other: &RunRecord) -> bool {
-        self.prefix.len() == other.prefix.len()
-            && self.prefix.iter().zip(other.prefix.iter())
+        self.prefix_len == other.prefix_len
+            && self.prefix().iter().zip(other.prefix().iter())
                 .all(|(a, b)| float_to_sortable(*a) == float_to_sortable(*b))
     }
 
     /// Write to a buffered writer.
     fn write_to<W: Write>(&self, w: &mut W) -> std::io::Result<()> {
         w.write_u32::<LittleEndian>(self.ordinal)?;
-        for &v in &self.prefix {
+        for &v in self.prefix() {
             w.write_f32::<LittleEndian>(v)?;
         }
         Ok(())
@@ -185,42 +221,14 @@ impl RunRecord {
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
             Err(e) => return Err(e),
         };
-        let mut prefix = Vec::with_capacity(prefix_width);
-        for _ in 0..prefix_width {
-            prefix.push(r.read_f32::<LittleEndian>()?);
+        let mut prefix = [0.0f32; MAX_PREFIX];
+        for i in 0..prefix_width {
+            prefix[i] = r.read_f32::<LittleEndian>()?;
         }
-        Ok(Some(RunRecord { ordinal, prefix }))
+        Ok(Some(RunRecord { ordinal, prefix, prefix_len: prefix_width as u8 }))
     }
 }
 
-// ---------------------------------------------------------------------------
-// Heap entry for k-way merge
-// ---------------------------------------------------------------------------
-
-/// Entry in the merge heap. Wraps a RunRecord with its source-run index.
-struct HeapEntry {
-    record: RunRecord,
-    run_idx: usize,
-}
-
-// Min-heap: smallest prefix first
-impl PartialEq for HeapEntry {
-    fn eq(&self, other: &Self) -> bool {
-        self.record.cmp_prefix(&other.record) == Ordering::Equal
-    }
-}
-impl Eq for HeapEntry {}
-impl PartialOrd for HeapEntry {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-impl Ord for HeapEntry {
-    fn cmp(&self, other: &Self) -> Ordering {
-        // Reversed for min-heap (BinaryHeap is max-heap)
-        other.record.cmp_prefix(&self.record)
-    }
-}
 
 // ---------------------------------------------------------------------------
 // CommandOp implementation
@@ -330,6 +338,13 @@ shuffle, KNN, or metadata alignment. The output index can be fed to
         let explicit_batch_size: Option<usize> = options.get("batch-size")
             .and_then(|s| s.parse().ok());
 
+        // Cache compression level: 0 = raw (fast), 1-9 = gzip (smaller on disk).
+        // Default 0 (no compression) since run files are ephemeral intermediates.
+        let compress_level: u32 = options.get("compress")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        crate::pipeline::gz_cache::set_compression_level(compress_level);
+
         let source_path = resolve_path(source_str, &ctx.workspace);
         let output_path = resolve_path(output_str, &ctx.workspace);
         let report_path = resolve_path(&report_str, &ctx.workspace);
@@ -405,6 +420,12 @@ shuffle, KNN, or metadata alignment. The output index can be fed to
             };
         }
 
+        // Top-level phase indicator — visible on the progress bar line
+        // throughout the entire command. Sub-phases create their own bars
+        // underneath for detailed progress.
+        let phase = ctx.ui.spinner("sort+dedup");
+        phase.set_message("phase 0/4: sampling variance".to_string());
+
         // ── Phase 0: Variance sampling to determine prefix width ──────
         let phase0_start = Instant::now();
         ctx.ui.log("Phase 0: variance sampling");
@@ -417,6 +438,7 @@ shuffle, KNN, or metadata alignment. The output index can be fed to
 
         // ── Phase 1: Create sorted runs ───────────────────────────────
         let phase1_start = Instant::now();
+        phase.set_message("phase 1/4: building sorted runs".to_string());
         ctx.ui.log("Phase 1: creating sorted runs");
         let run_dir = ctx.cache.join("dedup_runs");
         if let Err(e) = std::fs::create_dir_all(&run_dir) {
@@ -441,9 +463,10 @@ shuffle, KNN, or metadata alignment. The output index can be fed to
             run_files.len(), phase1_secs, phase1_rate, phase1_mbps,
         ));
 
-        // ── Phase 2: K-way streaming merge with dedup ─────────────────
+        // ── Phase 2: Parallel merge + dedup ───────────────────────────
         let phase2_start = Instant::now();
-        ctx.ui.log("Phase 2: k-way merge");
+        phase.set_message("phase 2/4: parallel merge".to_string());
+        ctx.ui.log("Phase 2: parallel merge + dedup");
         ensure_parent(&output_path);
         ensure_parent(&report_path);
 
@@ -466,12 +489,15 @@ shuffle, KNN, or metadata alignment. The output index can be fed to
         ));
 
         // ── Phase 3: Write report and clean up ────────────────────────
+        phase.set_message("phase 3/4: writing report".to_string());
         if let Err(e) = write_report(&report_path, count, unique_count, dup_count, prefix_width) {
             return error_result(format!("failed to write report: {}", e), start);
         }
 
         // Run files are kept in .cache/dedup_runs/ for resume on re-run.
         // They are cleaned up by `veks run --clean` or manual cache deletion.
+
+        phase.finish();
 
         let total_elapsed = start.elapsed();
         let total_secs = total_elapsed.as_secs_f64();
@@ -480,6 +506,20 @@ shuffle, KNN, or metadata alignment. The output index can be fed to
             source_bytes as f64 / (1024.0 * 1024.0) / total_secs
         } else { 0.0 };
         let dup_pct = if count > 0 { 100.0 * dup_count as f64 / count as f64 } else { 0.0 };
+
+        // Write verified counts so the bound checker can validate the output.
+        let output_records = if elide { unique_count } else { count };
+        let var_name = format!("verified_count:{}",
+            output_path.file_name().and_then(|n| n.to_str()).unwrap_or("output"));
+        let _ = crate::pipeline::variables::set_and_save(
+            &ctx.workspace, &var_name, &output_records.to_string());
+        ctx.defaults.insert(var_name, output_records.to_string());
+
+        let dup_var_name = format!("verified_count:{}",
+            duplicates_path.file_name().and_then(|n| n.to_str()).unwrap_or("dups"));
+        let _ = crate::pipeline::variables::set_and_save(
+            &ctx.workspace, &dup_var_name, &dup_count.to_string());
+        ctx.defaults.insert(dup_var_name, dup_count.to_string());
 
         let msg = format!(
             "{} vectors -> {} unique, {} dup ({:.2}%){}, {:.1}s ({:.0} vec/s, {:.1} MB/s), prefix_width={}",
@@ -551,6 +591,14 @@ shuffle, KNN, or metadata alignment. The output index can be fed to
                 required: false,
                 default: Some(DEFAULT_BATCH_SIZE.to_string()),
                 description: "Vectors per sorted run".to_string(),
+                role: OptionRole::Config,
+        },
+            OptionDesc {
+                name: "compress".to_string(),
+                type_name: "integer".to_string(),
+                required: false,
+                default: Some("0".to_string()),
+                description: "Cache compression level (0=raw, 1-9=gzip)".to_string(),
                 role: OptionRole::Config,
         },
         ]
@@ -665,8 +713,14 @@ fn float_to_sortable(f: f32) -> u32 {
 /// The key contains all dimension values encoded as sortable u32s.
 /// This enables binary search for any specific vector and ensures
 /// exact duplicates are always adjacent in sorted order.
-fn build_sort_key(vec: &[f32], _prefix_width: usize) -> Vec<u32> {
-    vec.iter().map(|&v| float_to_sortable(v)).collect()
+/// Build a fixed-size sort key from the prefix components only.
+#[inline]
+fn build_sort_key(prefix: &[f32]) -> [u32; MAX_PREFIX] {
+    let mut key = [0u32; MAX_PREFIX];
+    for (k, &v) in key.iter_mut().zip(prefix.iter()) {
+        *k = float_to_sortable(v);
+    }
+    key
 }
 
 /// Metadata for a set of sorted runs, used for resume validation.
@@ -724,9 +778,10 @@ fn create_sorted_runs(
     // Record size: 4 bytes ordinal + prefix_width * 4 bytes
     let record_bytes = 4 + prefix_width * 4;
 
+    let num_runs = ((count + batch_size - 1) / batch_size).max(1);
     let mut run_files: Vec<PathBuf> = Vec::new();
     let mut skipped = 0u32;
-    let pb = ctx.ui.bar_with_unit(count as u64, "building runs", "vectors");
+    let pb = ctx.ui.bar_with_unit(count as u64, "building runs", "vec");
 
     let mut batch_start = 0;
     let mut run_idx = 0u32;
@@ -737,44 +792,64 @@ fn create_sorted_runs(
 
         let run_path = run_dir.join(format!("run_{:04}.bin", run_idx));
 
-        // Resume: skip runs whose .gz file already exists
+        // Resume: skip runs whose cached file already exists (.gz or raw)
         if can_resume && crate::pipeline::gz_cache::gz_exists(&run_path) {
-            // Validate by checking the gzip ISIZE footer matches expected uncompressed size
-            let expected_size = (batch_len * record_bytes) as u32;
-            if let Some(isize_hint) = crate::pipeline::gz_cache::gz_uncompressed_size_hint(&run_path) {
-                if isize_hint == expected_size {
-                    run_files.push(run_path);
-                    run_idx += 1;
-                    skipped += 1;
-                    batch_start = batch_end;
-                    pb.set_position(batch_end as u64);
-                    continue;
-                }
+            let expected_size = (batch_len * record_bytes) as u64;
+            let size_ok = if crate::pipeline::gz_cache::gz_path(&run_path).exists() {
+                // Compressed: check gzip ISIZE footer
+                crate::pipeline::gz_cache::gz_uncompressed_size_hint(&run_path)
+                    .map(|hint| hint as u64 == expected_size)
+                    .unwrap_or(false)
+            } else {
+                // Raw: check file size directly
+                std::fs::metadata(&run_path)
+                    .map(|m| m.len() == expected_size)
+                    .unwrap_or(false)
+            };
+            if size_ok {
+                run_files.push(run_path);
+                run_idx += 1;
+                skipped += 1;
+                batch_start = batch_end;
+                pb.set_position(batch_end as u64);
+                ctx.ui.log(&format!("  run {}/{}: resumed from cache", run_idx, num_runs));
+                continue;
             }
         }
 
-        // Build (sort_key, RunRecord) for this batch using parallel reads.
-        // Each vector read is independent (mmap random access), and key
-        // computation is pure arithmetic — both parallelize perfectly.
-        let mut entries: Vec<(Vec<u32>, RunRecord)>;
+        // ── Sub-phase A: Read prefix components (parallel) ──────────
+        let sub_start = Instant::now();
+        pb.set_message(format!("run {}/{} reading", run_idx + 1, num_runs));
+        ctx.ui.log(&format!(
+            "  run {}/{}: reading {} vectors [{}-{})",
+            run_idx + 1, num_runs, format_count(batch_len), batch_start, batch_end,
+        ));
+
+        // Each vector read uses get_slice (zero-alloc mmap borrow) and only
+        // reads prefix_width components — not the full vector.
+        let mut entries: Vec<([u32; MAX_PREFIX], RunRecord)>;
         {
             use rayon::prelude::*;
             use std::sync::atomic::{AtomicU64, Ordering as AtomicOrd};
 
             let progress = AtomicU64::new(0);
+            // Update progress every ~0.5% of batch or 5K vectors
+            let update_interval = (batch_len / 200).max(5_000) as u64;
+            let pw = prefix_width;
 
             let build_fn = || {
                 (batch_start..batch_end)
                     .into_par_iter()
                     .map(|i| {
-                        let vec = reader.get_f32(i)?;
-                        let key = build_sort_key(&vec, prefix_width);
-                        let prefix: Vec<f32> = vec.iter().take(prefix_width).copied().collect();
+                        let mut prefix_buf = [0.0f32; MAX_PREFIX];
+                        reader.prefix_f32_into(i, &mut prefix_buf[..pw]);
+                        let key = build_sort_key(&prefix_buf[..pw]);
+                        let record = RunRecord::new(i as u32, &prefix_buf[..pw]);
                         let done = progress.fetch_add(1, AtomicOrd::Relaxed) + 1;
-                        if done % 500_000 == 0 {
+                        if done % update_interval == 0 {
                             pb.set_position(batch_start as u64 + done);
                         }
-                        Ok((key, RunRecord { ordinal: i as u32, prefix }))
+                        Ok::<_, String>((key, record))
                     })
                     .collect::<Result<Vec<_>, String>>()
             };
@@ -791,20 +866,22 @@ fn create_sorted_runs(
             };
         }
         pb.set_position(batch_end as u64);
+        let read_secs = sub_start.elapsed().as_secs_f64();
+        let read_rate = if read_secs > 0.0 { batch_len as f64 / read_secs } else { 0.0 };
+        ctx.ui.log(&format!(
+            "  run {}/{}: read done ({:.1}s, {:.0} vec/s)",
+            run_idx + 1, num_runs, read_secs, read_rate,
+        ));
 
-        // Parallel sort by composite key (governor-limited thread pool)
+        // ── Sub-phase B: Parallel sort ───────────────────────────────
+        let sort_start = Instant::now();
+        pb.set_message(format!("run {}/{} sorting", run_idx + 1, num_runs));
         {
             use rayon::prelude::*;
-            let sort_sp = ctx.ui.spinner(&format!("sorting run {} ({} entries)", run_idx, batch_len));
-            let sort_fn = |entries: &mut Vec<(Vec<u32>, RunRecord)>| {
-                entries.par_sort_by(|a, b| {
-                    for (ka, kb) in a.0.iter().zip(b.0.iter()) {
-                        let ord = ka.cmp(kb);
-                        if ord != Ordering::Equal {
-                            return ord;
-                        }
-                    }
-                    a.1.ordinal.cmp(&b.1.ordinal)
+            let sort_fn = |entries: &mut Vec<([u32; MAX_PREFIX], RunRecord)>| {
+                entries.par_sort_unstable_by(|a, b| {
+                    a.0.cmp(&b.0)
+                        .then_with(|| a.1.ordinal.cmp(&b.1.ordinal))
                 });
             };
             if let Some(ref p) = pool {
@@ -812,21 +889,33 @@ fn create_sorted_runs(
             } else {
                 sort_fn(&mut entries);
             }
-            sort_sp.finish();
         }
+        let sort_secs = sort_start.elapsed().as_secs_f64();
+        let sort_rate = if sort_secs > 0.0 { batch_len as f64 / sort_secs } else { 0.0 };
+        ctx.ui.log(&format!(
+            "  run {}/{}: sort done ({:.1}s, {:.0} vec/s, {} threads)",
+            run_idx + 1, num_runs, sort_secs, sort_rate, threads,
+        ));
 
-        // Write sorted run to memory buffer, then compress and save as .gz
+        // ── Sub-phase C: Serialize + save run to cache ───────────────
+        let write_start = Instant::now();
+        pb.set_message(format!("run {}/{} saving", run_idx + 1, num_runs));
         let mut buf = Vec::with_capacity(batch_len * record_bytes);
         for (_, record) in &entries {
             record.write_to(&mut buf)
                 .map_err(|e| format!("failed to write run record: {}", e))?;
         }
         crate::pipeline::gz_cache::save_gz(&run_path, &buf)?;
+        let write_secs = write_start.elapsed().as_secs_f64();
 
         run_files.push(run_path);
         run_idx += 1;
 
-        pb.set_position(batch_end as u64);
+        let total_secs = sub_start.elapsed().as_secs_f64();
+        ctx.ui.log(&format!(
+            "  run {}/{} done: read {:.1}s + sort {:.1}s + save {:.1}s = {:.1}s",
+            run_idx, num_runs, read_secs, sort_secs, write_secs, total_secs,
+        ));
 
         if ctx.governor.checkpoint() {
             ctx.ui.log("  governor: throttle active");
@@ -858,13 +947,16 @@ fn create_sorted_runs(
 }
 
 // ---------------------------------------------------------------------------
-// Phase 2: K-way streaming merge
+// Phase 2: Parallel merge + dedup
 // ---------------------------------------------------------------------------
 
-/// Merge all sorted run files, streaming through a min-heap.
+/// Load all run files, parallel-sort into a single sorted sequence, then
+/// scan for duplicates and write output.
 ///
-/// Writes the sorted (optionally deduplicated) ordinals to `output_path`
-/// and all duplicate ordinals to `duplicates_path`.
+/// Replaces the old single-threaded k-way heap merge with:
+/// 1. Parallel load: parse all runs into Vec<RunRecord> concurrently
+/// 2. Parallel sort: par_sort_unstable_by on the combined vector
+/// 3. Sequential dedup scan + write (inherently sequential — needs adjacency)
 ///
 /// Returns `(unique_count, duplicate_count)`.
 fn merge_runs(
@@ -878,93 +970,225 @@ fn merge_runs(
     total: usize,
     ctx: &mut StreamContext,
 ) -> Result<(usize, usize), String> {
-    // Decompress all run files into memory, then wrap as cursors for streaming read
-    let mut run_buffers: Vec<std::io::Cursor<Vec<u8>>> = Vec::with_capacity(run_files.len());
-    let decompress_pb = ctx.ui.bar_with_unit(run_files.len() as u64, "loading runs", "files");
-    for (i, path) in run_files.iter().enumerate() {
-        let data = crate::pipeline::gz_cache::load_gz(path)?;
-        run_buffers.push(std::io::Cursor::new(data));
-        decompress_pb.set_position((i + 1) as u64);
+    use rayon::prelude::*;
+
+    let threads = ctx.governor.current_or("threads", ctx.threads as u64)
+        .max(1) as usize;
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build()
+        .ok();
+
+    // ── Sub-phase A: Load all runs in parallel ───────────────────────
+    let load_start = Instant::now();
+    ctx.ui.log(&format!("  loading {} run files ({} threads)...", run_files.len(), threads));
+    let pb = ctx.ui.bar_with_unit(run_files.len() as u64, "loading runs", "files");
+    let pb_id = pb.id();
+
+    let load_fn = || {
+        run_files.par_iter().map(|path| {
+            let data = crate::pipeline::gz_cache::load_gz(path)?;
+            let mut cursor = std::io::Cursor::new(data);
+            let mut records = Vec::new();
+            while let Some(rec) = RunRecord::read_from(&mut cursor, prefix_width)
+                .map_err(|e| format!("failed to parse {}: {}", path.display(), e))?
+            {
+                records.push(rec);
+            }
+            ctx.ui.inc_by_id(pb_id, 1);
+            Ok::<Vec<RunRecord>, String>(records)
+        }).collect::<Result<Vec<Vec<RunRecord>>, String>>()
+    };
+
+    let per_run_records = if let Some(ref p) = pool {
+        p.install(load_fn)
+    } else {
+        load_fn()
+    }?;
+    pb.finish();
+
+    let load_secs = load_start.elapsed().as_secs_f64();
+    ctx.ui.log(&format!("  loaded in {:.1}s", load_secs));
+
+    // Flatten into a single vec
+    let flatten_start = Instant::now();
+    let mut all_records: Vec<RunRecord> = Vec::with_capacity(total);
+    for mut run in per_run_records {
+        all_records.append(&mut run);
     }
-    decompress_pb.finish();
+    let flatten_secs = flatten_start.elapsed().as_secs_f64();
+    ctx.ui.log(&format!(
+        "  {} records collected ({:.1}s, {:.0} MB)",
+        all_records.len(),
+        flatten_secs,
+        (all_records.len() * std::mem::size_of::<RunRecord>()) as f64 / (1024.0 * 1024.0),
+    ));
 
-    // Initialize the min-heap with the first record from each run
-    let mut heap: BinaryHeap<HeapEntry> = BinaryHeap::with_capacity(run_buffers.len());
-    for (idx, rdr) in run_buffers.iter_mut().enumerate() {
-        if let Some(record) = RunRecord::read_from(rdr, prefix_width)
-            .map_err(|e| format!("failed to read run {}: {}", idx, e))?
-        {
-            heap.push(HeapEntry { record, run_idx: idx });
-        }
+    // ── Sub-phase B: Parallel sort ───────────────────────────────────
+    let sort_start = Instant::now();
+    let sort_pb = ctx.ui.spinner(&format!("sorting {} records ({} threads)", all_records.len(), threads));
+
+    let sort_fn = |records: &mut Vec<RunRecord>| {
+        records.par_sort_unstable_by(|a, b| a.cmp_prefix(b));
+    };
+    if let Some(ref p) = pool {
+        p.install(|| sort_fn(&mut all_records));
+    } else {
+        sort_fn(&mut all_records);
+    }
+    sort_pb.finish();
+
+    let sort_secs = sort_start.elapsed().as_secs_f64();
+    let sort_rate = if sort_secs > 0.0 { all_records.len() as f64 / sort_secs } else { 0.0 };
+    ctx.ui.log(&format!("  sorted in {:.1}s ({:.0} rec/s)", sort_secs, sort_rate));
+
+    // ── Sub-phase C: Parallel dedup scan → ivec bytes ──────────────
+    //
+    // Partition the sorted records into chunks and scan each in parallel.
+    // Each chunk builds its output + dup ivec byte buffers directly —
+    // the prefix ("memo header") in each RunRecord drives the dup check
+    // inline, and ivec records (8 bytes: dim=1 + ordinal) are written
+    // straight into the byte buffer. One pass, no intermediate Vec<u32>.
+    //
+    // Boundary pairs (last of chunk N vs first of chunk N+1) are fixed
+    // up in a tiny sequential pass before concatenating the buffers.
+    let scan_start = Instant::now();
+    ctx.ui.log(&format!("  dedup+write: {} threads, {} records", threads, total));
+
+    let chunk_size = (total / threads).max(10_000);
+    let chunks: Vec<&[RunRecord]> = all_records.chunks(chunk_size).collect();
+    let num_chunks = chunks.len();
+
+    let dim_bytes = 1_i32.to_le_bytes();
+
+    struct ChunkResult {
+        out_buf: Vec<u8>,      // ivec bytes for output ordinals
+        dup_buf: Vec<u8>,      // ivec bytes for dup ordinals
+        dup_count: usize,
     }
 
-    // Open outputs: sorted ordinals + duplicate ordinals
-    let file = std::fs::File::create(output_path)
-        .map_err(|e| format!("failed to create output: {}", e))?;
-    let mut out = BufWriter::with_capacity(IO_BUF_SIZE, file);
+    let scan_pb = ctx.ui.bar_with_unit(total as u64, "dedup+write", "vec");
+    let pb_id = scan_pb.id();
 
-    ensure_parent(duplicates_path);
-    let dup_file = std::fs::File::create(duplicates_path)
-        .map_err(|e| format!("failed to create duplicates file: {}", e))?;
-    let mut dup_out = BufWriter::with_capacity(IO_BUF_SIZE, dup_file);
+    let chunk_scan = |chunk: &[RunRecord]| -> ChunkResult {
+        let mut out_buf = Vec::with_capacity(chunk.len() * 8);
+        let mut dup_buf = Vec::new();
+        let mut dups = 0usize;
 
-    let pb = ctx.ui.bar_with_unit(total as u64, "merging", "vectors");
-
-    let mut unique_count = 0usize;
-    let mut dup_count = 0usize;
-    let mut prev: Option<RunRecord> = None;
-    let mut emitted = 0u64;
-
-    while let Some(entry) = heap.pop() {
-        let record = entry.record;
-        let run_idx = entry.run_idx;
-
-        // Refill from the same run
-        if let Some(next) = RunRecord::read_from(&mut run_buffers[run_idx], prefix_width)
-            .map_err(|e| format!("failed to read run {}: {}", run_idx, e))?
-        {
-            heap.push(HeapEntry { record: next, run_idx });
-        }
-
-        // Check for duplicate against previous record
-        let is_dup = if let Some(ref prev_rec) = prev {
-            if prev_rec.prefix_eq(&record) {
-                // Prefixes match — need full vector comparison
-                reader.vectors_equal(prev_rec.ordinal as usize, record.ordinal as usize)
+        for (i, record) in chunk.iter().enumerate() {
+            let is_dup = if i > 0 {
+                let prev = &chunk[i - 1];
+                if prev.prefix_eq(record) {
+                    reader.vectors_equal(prev.ordinal as usize, record.ordinal as usize)
+                } else {
+                    false
+                }
             } else {
                 false
-            }
-        } else {
-            false
-        };
+            };
 
-        if is_dup {
-            dup_count += 1;
-            // Always write duplicate ordinals to the duplicates file
-            write_ivec_record(&mut dup_out, record.ordinal)
-                .map_err(|e| format!("dup write error: {}", e))?;
-            if !elide {
-                // Also emit to the main sorted output when not eliding
-                write_ivec_record(&mut out, record.ordinal)
-                    .map_err(|e| format!("write error: {}", e))?;
+            let ord_bytes = (record.ordinal as i32).to_le_bytes();
+
+            if is_dup {
+                dups += 1;
+                dup_buf.extend_from_slice(&dim_bytes);
+                dup_buf.extend_from_slice(&ord_bytes);
+                if !elide {
+                    out_buf.extend_from_slice(&dim_bytes);
+                    out_buf.extend_from_slice(&ord_bytes);
+                }
+            } else {
+                out_buf.extend_from_slice(&dim_bytes);
+                out_buf.extend_from_slice(&ord_bytes);
             }
-        } else {
-            unique_count += 1;
-            write_ivec_record(&mut out, record.ordinal)
-                .map_err(|e| format!("write error: {}", e))?;
         }
+        ctx.ui.inc_by_id(pb_id, chunk.len() as u64);
+        ChunkResult { out_buf, dup_buf, dup_count: dups }
+    };
 
-        prev = Some(record);
-        emitted += 1;
+    let mut chunk_results: Vec<ChunkResult> = if let Some(ref p) = pool {
+        p.install(|| chunks.par_iter().map(|c| chunk_scan(c)).collect())
+    } else {
+        chunks.iter().map(|c| chunk_scan(c)).collect()
+    };
+    scan_pb.finish();
 
-        if emitted % 500_000 == 0 {
-            pb.set_position(emitted);
+    // Boundary fixup: check last record of chunk N vs first of chunk N+1.
+    // If they're duplicates, patch the byte buffers: remove the first
+    // record from chunk N+1's output buffer and add it to its dup buffer.
+    let mut boundary_dup_count = 0usize;
+    for i in 0..num_chunks.saturating_sub(1) {
+        let last = chunks[i].last().unwrap();
+        let first = chunks[i + 1].first().unwrap();
+        if last.prefix_eq(first)
+            && reader.vectors_equal(last.ordinal as usize, first.ordinal as usize)
+        {
+            boundary_dup_count += 1;
+            let result = &mut chunk_results[i + 1];
+            result.dup_count += 1;
+
+            // The first 8 bytes of out_buf is this record's ivec entry.
+            // Move it to dup_buf (or remove if eliding).
+            let first_record = &result.out_buf[..8];
+            result.dup_buf.extend_from_slice(first_record);
+            if elide {
+                // Remove first 8 bytes from output
+                result.out_buf.drain(..8);
+            }
         }
     }
 
-    pb.finish();
-    out.flush().map_err(|e| format!("flush error: {}", e))?;
-    dup_out.flush().map_err(|e| format!("dup flush error: {}", e))?;
+    // Tally results
+    let dup_count: usize = chunk_results.iter().map(|r| r.dup_count).sum();
+    let unique_count = total - dup_count;
+    let total_out_bytes: usize = chunk_results.iter().map(|r| r.out_buf.len()).sum();
+    let total_dup_bytes: usize = chunk_results.iter().map(|r| r.dup_buf.len()).sum();
+
+    // Free sorted records before allocating output buffers
+    drop(all_records);
+
+    let scan_secs = scan_start.elapsed().as_secs_f64();
+    let scan_rate = if scan_secs > 0.0 { total as f64 / scan_secs } else { 0.0 };
+    ctx.ui.log(&format!(
+        "  dedup: {:.1}s ({:.0} vec/s), {} unique, {} dups ({} boundary)",
+        scan_secs, scan_rate, unique_count, dup_count, boundary_dup_count,
+    ));
+
+    // ── Sub-phase D: Write files ─────────────────────────────────────
+    let write_start = Instant::now();
+    ensure_parent(output_path);
+    ensure_parent(duplicates_path);
+
+    ctx.ui.log(&format!(
+        "  writing {:.1} MB output + {:.1} MB dups...",
+        total_out_bytes as f64 / (1024.0 * 1024.0),
+        total_dup_bytes as f64 / (1024.0 * 1024.0),
+    ));
+
+    // Concatenate output chunks and write in one shot
+    {
+        let mut out_bytes = Vec::with_capacity(total_out_bytes);
+        for r in &chunk_results {
+            out_bytes.extend_from_slice(&r.out_buf);
+        }
+        std::fs::write(output_path, &out_bytes)
+            .map_err(|e| format!("failed to write {}: {}", output_path.display(), e))?;
+    }
+
+    {
+        let mut dup_bytes = Vec::with_capacity(total_dup_bytes);
+        for r in &chunk_results {
+            dup_bytes.extend_from_slice(&r.dup_buf);
+        }
+        std::fs::write(duplicates_path, &dup_bytes)
+            .map_err(|e| format!("failed to write {}: {}", duplicates_path.display(), e))?;
+    }
+
+    let write_secs = write_start.elapsed().as_secs_f64();
+    ctx.ui.log(&format!(
+        "  files written in {:.1}s",
+        write_secs,
+    ));
 
     Ok((unique_count, dup_count))
 }
@@ -982,14 +1206,26 @@ fn write_ivec_record<W: Write>(w: &mut W, ordinal: u32) -> std::io::Result<()> {
 
 /// Write a complete ivec file from a slice of ordinals.
 fn write_ivec(path: &Path, ordinals: &[u32]) -> Result<(), String> {
-    let file = std::fs::File::create(path)
-        .map_err(|e| format!("failed to create {}: {}", path.display(), e))?;
-    let mut writer = BufWriter::with_capacity(IO_BUF_SIZE, file);
-    for &ord in ordinals {
-        write_ivec_record(&mut writer, ord).map_err(|e| e.to_string())?;
+    write_ivec_bulk(path, ordinals)
+}
+
+/// Bulk-write an ivec file from a slice of ordinals.
+///
+/// Builds the entire byte buffer in memory (8 bytes per record:
+/// 4-byte dim=1 header + 4-byte ordinal) and writes it in a single
+/// syscall. This is orders of magnitude faster than per-record writes
+/// for large ordinal lists.
+fn write_ivec_bulk(path: &Path, ordinals: &[u32]) -> Result<(), String> {
+    // 8 bytes per record: dim header (1_i32 LE) + ordinal (i32 LE)
+    let mut buf = vec![0u8; ordinals.len() * 8];
+    let dim_bytes = 1_i32.to_le_bytes();
+    for (i, &ord) in ordinals.iter().enumerate() {
+        let offset = i * 8;
+        buf[offset..offset + 4].copy_from_slice(&dim_bytes);
+        buf[offset + 4..offset + 8].copy_from_slice(&(ord as i32).to_le_bytes());
     }
-    writer.flush().map_err(|e| e.to_string())?;
-    Ok(())
+    std::fs::write(path, &buf)
+        .map_err(|e| format!("failed to write {}: {}", path.display(), e))
 }
 
 /// Write the JSON deduplication report.

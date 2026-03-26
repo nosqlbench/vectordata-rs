@@ -11,12 +11,16 @@
 //! The rename is an inode swap (same filesystem), not a data copy.
 //!
 //! Usage:
-//! ```ignore
-//! let mut w = AtomicWriter::new(&final_path)?;
-//! w.write_all(b"data")?;
-//! w.finish()?; // renames temp → final
-//! // If finish() is not called (e.g., error/panic), the temp file is
-//! // cleaned up on drop.
+//! ```
+//! use std::io::Write;
+//! use veks_pipeline::pipeline::atomic_write::AtomicWriter;
+//!
+//! let dir = tempfile::tempdir().unwrap();
+//! let final_path = dir.path().join("output.fvec");
+//! let mut w = AtomicWriter::new(&final_path).unwrap();
+//! w.write_all(b"data").unwrap();
+//! w.finish().unwrap(); // renames temp → final
+//! assert!(final_path.exists());
 //! ```
 
 use std::fs::File;

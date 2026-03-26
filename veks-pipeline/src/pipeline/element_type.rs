@@ -146,12 +146,20 @@ impl ToF64 for i8 {
 /// The block must return the same type for every arm.
 ///
 /// Usage:
-/// ```ignore
-/// dispatch_reader!(etype, &source_path, reader => {
-///     // `reader` is MmapVectorReader<T> where T: ToF64
-///     let count = VectorReader::<_>::count(&reader);
-///     // ...
-/// })
+/// ```no_run
+/// use std::path::PathBuf;
+/// use veks_pipeline::pipeline::element_type::ElementType;
+/// use veks_pipeline::dispatch_reader;
+///
+/// fn example() -> Result<usize, String> {
+///     let etype = ElementType::F32;
+///     let source_path = PathBuf::from("vectors.fvec");
+///     dispatch_reader!(etype, &source_path, reader => {
+///         use vectordata::VectorReader;
+///         let count = VectorReader::<_>::count(&reader);
+///         Ok(count)
+///     })
+/// }
 /// ```
 #[macro_export]
 macro_rules! dispatch_reader {

@@ -20,9 +20,37 @@ static AUTO_ACCEPT: AtomicBool = AtomicBool::new(false);
 /// When true, strict auto mode is active — all files must have recognized roles.
 static AUTO_MODE: AtomicBool = AtomicBool::new(false);
 
+/// Pre-seeded values from CLI flags. Each `Some` value overrides the
+/// wizard's auto-detected default for that field. `None` means "let
+/// the wizard decide."
+#[derive(Default)]
+pub struct WizardSeeds {
+    pub name: Option<String>,
+    pub output: Option<PathBuf>,
+    pub base_vectors: Option<PathBuf>,
+    pub query_vectors: Option<PathBuf>,
+    pub self_search: Option<bool>,
+    pub query_count: Option<u32>,
+    pub metadata: Option<PathBuf>,
+    pub ground_truth: Option<PathBuf>,
+    pub ground_truth_distances: Option<PathBuf>,
+    pub metric: Option<String>,
+    pub neighbors: Option<u32>,
+    pub seed: Option<u32>,
+    pub description: Option<String>,
+    pub no_dedup: Option<bool>,
+    pub no_zero_check: Option<bool>,
+    pub no_filtered: Option<bool>,
+    pub normalize: Option<bool>,
+    pub base_fraction: Option<f64>,
+    pub pedantic_dedup: Option<bool>,
+    pub required_facets: Option<String>,
+    pub round_digits: Option<u32>,
+}
+
 /// Run the wizard with auto-accept disabled (fully interactive).
 pub fn run_wizard() -> ImportArgs {
-    run_wizard_with_options(false, false)
+    run_wizard_with_options(false, false, WizardSeeds::default())
 }
 
 /// Run the interactive import wizard.
@@ -31,7 +59,8 @@ pub fn run_wizard() -> ImportArgs {
 /// - `auto_mode`: strict mode — all candidate files must be recognized by
 ///   role keywords, underscore-prefix renaming is assumed, and unrecognized
 ///   files cause a hard stop with guidance on naming conventions.
-pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool) -> ImportArgs {
+/// - `seeds`: pre-seeded values from CLI flags that override wizard defaults.
+pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: WizardSeeds) -> ImportArgs {
     AUTO_ACCEPT.store(auto_accept, Ordering::Relaxed);
     AUTO_MODE.store(auto_mode, Ordering::Relaxed);
     if auto_mode {
@@ -126,7 +155,8 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool) -> ImportArgs
     let dir_name = cwd.file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "my-dataset".to_string());
-    let name = prompt_with_default("Dataset name", &dir_name);
+    let name_default = seeds.name.as_deref().unwrap_or(&dir_name);
+    let name = prompt_with_default("Dataset name", name_default);
 
     // ── Description ──────────────────────────────────────────────────
     let description = prompt_optional("Description (optional)");
@@ -325,6 +355,20 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool) -> ImportArgs
         (None, None)
     };
 
+    // ── Base data fraction ─────────────────────────────────────────
+    println!();
+    println!("--- Base data fraction ---");
+    println!("  Controls what percentage of the available base vectors to use.");
+    println!("  100% uses all vectors. Lower values produce a smaller dataset,");
+    println!("  useful for faster iteration during development.");
+    let frac_default = seeds.base_fraction
+        .map(|f| format!("{}", (f * 100.0).round() as u32))
+        .unwrap_or_else(|| "100".to_string());
+    let base_fraction_str = prompt_with_default("Base data percentage (1-100)", &frac_default);
+    let base_fraction = base_fraction_str.trim().parse::<f64>()
+        .unwrap_or(100.0)
+        .clamp(1.0, 100.0) / 100.0;
+
     // ── Source metric and normalization ─────────────────────────────
     //
     // The distance metric is a property of the source data — it describes
@@ -334,15 +378,20 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool) -> ImportArgs
     // changes the L2 distance ranking to match Cosine ranking.
     println!();
     println!("--- Distance metric ---");
-    println!("  The distance metric describes how the source vectors were trained.");
+    // Auto-detect metric from vector data
+    let (detected_metric, detect_reason) = base_vectors.as_ref()
+        .map(|p| crate::prepare::import::detect_metric(p))
+        .unwrap_or_else(|| ("Cosine".to_string(), "default".to_string()));
+    println!("  Detected: {} ({})", detected_metric, detect_reason);
     println!("  Common metrics:");
     println!("    L2         — Euclidean distance (most embedding models)");
     println!("    Cosine     — Cosine similarity (angular distance)");
     println!("    DotProduct — Inner product (often used with normalized vectors)");
     println!();
+    let metric_default = seeds.metric.as_deref().unwrap_or(&detected_metric);
     let source_metric = prompt_with_default(
         "What distance metric does this data use?",
-        "L2",
+        metric_default,
     );
 
     // Normalization detection and metric implications
@@ -532,10 +581,10 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool) -> ImportArgs
     // ── Cache compression ────────────────────────────────────────────
     println!();
     println!("--- Cache compression ---");
-    println!("  Eligible cache files (sorted runs, KNN partitions, predicate segments)");
-    println!("  can be gzip-compressed to save disk space. These files are only ever");
-    println!("  read sequentially, so compression has no impact on access patterns.");
-    let compress_cache = confirm("Compress eligible cache files?", true);
+    println!("  Intermediate cache files can be gzip-compressed to save disk space.");
+    println!("  This slows down processing and can always be done later with");
+    println!("  `veks prepare cache-compress`. Recommended: No for initial runs.");
+    let compress_cache = confirm("Compress cache files?", false);
 
     // ── Summary ──────────────────────────────────────────────────────
     println!();
@@ -559,6 +608,9 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool) -> ImportArgs
     }
     if let Some(ref sp) = sized_profiles {
         println!("  Sized profiles: {}", sp);
+    }
+    if base_fraction < 1.0 {
+        println!("  Base fraction: {:.0}%", base_fraction * 100.0);
     }
     println!("  Compress cache: {}", if compress_cache { "yes" } else { "no" });
     println!();
@@ -591,6 +643,10 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool) -> ImportArgs
         query_convert_format,
         compress_cache,
         sized_profiles,
+        base_fraction,
+        required_facets: seeds.required_facets.clone(),
+        round_digits: seeds.round_digits.unwrap_or(2),
+        pedantic_dedup: seeds.pedantic_dedup.unwrap_or(false),
     }
 }
 

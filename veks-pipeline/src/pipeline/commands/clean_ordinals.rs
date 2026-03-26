@@ -176,6 +176,13 @@ are excluded from the final dataset.
             return error_result(format!("failed to finalize {}: {}", output_path.display(), e), start);
         }
 
+        // Write verified count for the bound checker
+        let var_name = format!("verified_count:{}",
+            output_path.file_name().and_then(|n| n.to_str()).unwrap_or("output"));
+        let _ = crate::pipeline::variables::set_and_save(
+            &ctx.workspace, &var_name, &kept.to_string());
+        ctx.defaults.insert(var_name, kept.to_string());
+
         let msg = format!(
             "{} kept, {} excluded (of {} total)",
             kept, excluded, total,

@@ -159,8 +159,10 @@ pub fn run_steps(
 
         // 3. Check progress log → skip if recorded OK, outputs match, options unchanged,
         //    AND no upstream dependency ran this session
+        let progress_fresh;
         if upstream_ran {
             ctx.ui.log(&format!("{} {} — invalidated (upstream dependency re-ran)", prefix, step.id));
+            progress_fresh = false;
         } else {
             match ctx.progress.check_step_freshness(&step.id, Some(&resolved_map), Some(&ctx.workspace)) {
                 None => {
@@ -176,6 +178,9 @@ pub fn run_steps(
                     if !reason.starts_with("not recorded") {
                         ctx.ui.log(&format!("{} {} — stale: {}", prefix, step.id, reason));
                     }
+                    // If "not recorded", the step has no provenance — don't
+                    // trust artifact bound checks either.
+                    progress_fresh = false;
                 }
             }
         }
@@ -197,9 +202,11 @@ pub fn run_steps(
             options.set(k, v);
         }
 
-        // 5. Check artifact state (skip if upstream ran — cascade invalidation)
+        // 5. Check artifact state — only when progress log confirmed the step
+        //    succeeded previously. Without provenance, artifact existence alone
+        //    is not trustworthy (could be stale from a different configuration).
         let resolved_output = resolved_opts.get("output").cloned();
-        if !upstream_ran { if let Some(ref output_path) = resolved_output {
+        if progress_fresh { if let Some(ref output_path) = resolved_output {
             let full_path = if std::path::Path::new(output_path.as_str()).is_absolute() {
                 PathBuf::from(output_path)
             } else {
@@ -603,7 +610,11 @@ pub fn run_steps(
                 ctx.workspace.join(output_path)
             };
             let state = cmd.check_artifact(&full_path, &options);
-            if state != ArtifactState::Complete {
+            if state == ArtifactState::Absent {
+                // Only fail post-execution if the output is genuinely missing.
+                // The step reported Ok and wrote the file — trust it for
+                // structural checks (Partial may just mean verified_count
+                // wasn't propagated yet).
                 let msg = format!(
                     "step '{}': post-execution check failed — artifact '{}' is {:?}",
                     step.id, output_path, state

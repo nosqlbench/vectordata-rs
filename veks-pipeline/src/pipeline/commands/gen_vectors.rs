@@ -283,20 +283,29 @@ data.
 
         let mode_str = if open_mode { "appended" } else { "generated" };
         match result {
-            Ok(()) => CommandResult {
-                status: Status::Ok,
-                message: format!(
-                    "{} {} {}x{} vectors to {}{}",
-                    mode_str, count, effective_dim, elem_type, actual_output.display(),
-                    if zeros_count > 0 || dups_count > 0 {
-                        format!(" ({} zeros, {} duplicates)", zeros_count, dups_count)
-                    } else {
-                        String::new()
-                    }
-                ),
-                produced: vec![actual_output],
-                elapsed: start.elapsed(),
-            },
+            Ok(()) => {
+                // Write verified count for the bound checker
+                let var_name = format!("verified_count:{}",
+                    actual_output.file_name().and_then(|n| n.to_str()).unwrap_or("output"));
+                let _ = crate::pipeline::variables::set_and_save(
+                    &ctx.workspace, &var_name, &count.to_string());
+                ctx.defaults.insert(var_name, count.to_string());
+
+                CommandResult {
+                    status: Status::Ok,
+                    message: format!(
+                        "{} {} {}x{} vectors to {}{}",
+                        mode_str, count, effective_dim, elem_type, actual_output.display(),
+                        if zeros_count > 0 || dups_count > 0 {
+                            format!(" ({} zeros, {} duplicates)", zeros_count, dups_count)
+                        } else {
+                            String::new()
+                        }
+                    ),
+                    produced: vec![actual_output],
+                    elapsed: start.elapsed(),
+                }
+            }
             Err(e) => error_result(e, start),
         }
     }

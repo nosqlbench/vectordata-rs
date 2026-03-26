@@ -46,5 +46,7 @@ veks-core = { path = "../veks-core" }
 veks-pipeline = { path = "../veks-pipeline" }
 
 [dev-dependencies]
+arrow = "54"
+parquet = "54"
 shadow-terminal = "0.2"
 tempfile = "3"

@@ -181,6 +181,13 @@ key slab provide the ground truth needed to measure filtered-search recall.
                 }
                 Err(e) => return error_result(e, start),
             }
+            // Write verified count for the bound checker
+            let var_name = format!("verified_count:{}",
+                output_path.file_name().and_then(|n| n.to_str()).unwrap_or("output"));
+            let _ = crate::pipeline::variables::set_and_save(
+                &ctx.workspace, &var_name, "0");
+            ctx.defaults.insert(var_name, "0".to_string());
+
             return CommandResult {
                 status: Status::Ok,
                 message: "0 predicates generated (no eligible fields)".into(),
@@ -232,6 +239,13 @@ key slab provide the ground truth needed to measure filtered-search recall.
         if let Err(e) = writer.finish() {
             return error_result(format!("finish error: {}", e), start);
         }
+
+        // Write verified count for the bound checker
+        let var_name = format!("verified_count:{}",
+            output_path.file_name().and_then(|n| n.to_str()).unwrap_or("output"));
+        let _ = crate::pipeline::variables::set_and_save(
+            &ctx.workspace, &var_name, &predicates.len().to_string());
+        ctx.defaults.insert(var_name, predicates.len().to_string());
 
         let message = format!(
             "{} predicates generated from {} eligible fields",

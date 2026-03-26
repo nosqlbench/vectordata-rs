@@ -348,6 +348,18 @@ trees.
             output_dir.display()
         ));
 
+        // Write verified counts for the bound checker
+        for xvec_path in &produced {
+            let ext = xvec_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            if matches!(ext, "fvec" | "ivec" | "bvec" | "dvec" | "mvec" | "svec") {
+                let var_name = format!("verified_count:{}",
+                    xvec_path.file_name().and_then(|n| n.to_str()).unwrap_or("output"));
+                let _ = crate::pipeline::variables::set_and_save(
+                    &ctx.workspace, &var_name, &query_count.to_string());
+                ctx.defaults.insert(var_name, query_count.to_string());
+            }
+        }
+
         CommandResult {
             status: Status::Ok,
             message: format!(

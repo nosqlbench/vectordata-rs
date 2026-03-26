@@ -45,8 +45,13 @@ throughout all reordering and elision operations. Specifically:
   vector extraction and metadata extraction.
 - The same clean ordinals index (`clean_ordinals.ivec`) determines which
   records survive dedup/zero elision for both vectors and metadata.
-- The same range windows (`[query_count, vector_count)`) are used for
-  both base vector extraction and metadata content extraction.
+- The same range windows are used for both base vector extraction and
+  metadata content extraction. When dedup/zero-check is active, the
+  upper bound is `clean_count` (post-elision), not `vector_count`
+  (pre-elision): `[query_count, clean_count)`. When dedup is inactive,
+  `vector_count` is used. The shuffle permutation covers exactly
+  `clean_count` (or `vector_count` if no dedup) entries, so the
+  extraction range must not exceed the shuffle length.
 This ensures that after all pipeline transformations, record N in the
 output base vectors file corresponds to record N in the output metadata
 content file. Violating this invariant would silently corrupt filtered
@@ -94,15 +99,15 @@ the superset graph and its resolution rule.
 | `import_vectors` | Vectors | Source is native xvec single file (symlinked) | `import` (npy/parquet/dir → xvec) |
 | `all_vectors` | Vectors | *(terminal — always resolves to import or source)* | alias chain: fetch → import → source |
 | `convert_base_precision` | Vectors | No precision conversion requested | `convert` (e.g., fvec→mvec or mvec→fvec) |
-| `sort` | Ordinals | `--no-sort` | `compute sort` — lexicographic external merge-sort producing sorted ordinal index + duplicate report as a byproduct. Duplicate detection retains **one representative** of each duplicate set in the sorted index; only the extra copies are recorded in the duplicates file. The sort enables binary search for zero vectors and produces the canonical ordinal ordering for all downstream steps. |
-| `zero_check` | Ordinals | `--no-zero-check` | `analyze zeros` — binary search the lexicographically sorted ordinal index (`--index`) for the zero vector `[0,0,...,0]` |
-| `clean_ordinals` | Ordinals | No sort and no zero-check | `transform ordinals` — combine duplicate + zero exclusion ordinals, filter the sorted index to produce the clean ordinal set used by shuffle and extraction |
+| `sort` | Ordinals | `--no-dedup` or B facet not required | `compute sort` — lexicographic external merge-sort producing sorted ordinal index + duplicate report as a byproduct. Duplicate detection retains **one representative** of each duplicate set in the sorted index; only the extra copies are recorded in the duplicates file. The sort enables binary search for zero vectors and produces the canonical ordinal ordering for all downstream steps. |
+| `zero_check` | Ordinals | `--no-zero-check` or B facet not required | `analyze zeros` — binary search the lexicographically sorted ordinal index (`--index`) for the zero vector `[0,0,...,0]` |
+| `clean_ordinals` | Ordinals | No sort and no zero-check, or B facet not required | `transform ordinals` — combine duplicate + zero exclusion ordinals, filter the sorted index to produce the clean ordinal set used by shuffle and extraction |
 
 ### Count and statistics slots
 
 | Slot | Type | Identity when | Materialized as |
 |------|------|---------------|-----------------|
-| `vector_count` | Variable | Always materialized | `set variable` — record count of all_vectors |
+| `vector_count` | Variable | Base (B) facet not required | `set variable` — record count of all_vectors |
 | `duplicate_count` | Variable | `--no-dedup` | `set variable` — record count of dedup_duplicates.ivec (number of elided duplicates) |
 | `zero_count` | Variable | `--no-zero-check` | `set variable` — record count of zero_ordinals.ivec (number of zero vectors removed) |
 | `clean_count` | Variable | Always needed when dedup or zero-check active | `set variable` on clean_ordinals |
@@ -118,7 +123,7 @@ statistics including `vector_count`, `duplicate_count`, `zero_count`,
 
 | Slot | Type | Identity when | Materialized as |
 |------|------|---------------|-----------------|
-| `shuffle` | Ordinals | No self-search (separate query file or no queries) | `generate shuffle` over clean_count |
+| `shuffle` | Ordinals | Q facet not required, or separate query file provided | `generate shuffle` over clean_count |
 | `query_vectors` | Vectors | Provided as native xvec (symlinked) | `transform convert` or `transform extract` (self-search via shuffle+clean_ordinals; `--normalize` option applies L2 normalization in-flight during extraction) |
 | `convert_query_precision` | Vectors | No precision conversion requested | `transform convert` (e.g., fvec→mvec or dvec→fvec) |
 | `base_vectors` | Vectors | Not self-search (all_vectors used directly) | `transform extract` (self-search range via shuffle+clean_ordinals; `--normalize` option applies L2 normalization in-flight during extraction) |
@@ -139,8 +144,8 @@ statistics including `vector_count`, `duplicate_count`, `zero_count`,
 
 | Slot | Type | Identity when | Materialized as |
 |------|------|---------------|-----------------|
-| `knn` | GroundTruth | Pre-computed GT provided, or no query vectors | `compute knn` (per_profile, `--compress-cache` for partition artifacts) |
-| `filtered_knn` | GroundTruth | No metadata, `--no-filtered`, or no queries | `compute filtered-knn` (per_profile, `--compress-cache` for partition artifacts) |
+| `knn` | GroundTruth | Pre-computed GT provided, or no query vectors | `compute knn` (per_profile, `--compress-cache` for partition artifacts, default off) |
+| `filtered_knn` | GroundTruth | No metadata, `--no-filtered`, or no queries | `compute filtered-knn` (per_profile, `--compress-cache` for partition artifacts, default off) |
 
 ### Verification slots
 
@@ -196,251 +201,126 @@ Tip: add sized profiles for multi-scale benchmarking:
 
 ## 12.4 Universal Flow Graph
 
-The full superset graph with identity collapse annotations. Slots that
-resolve to `Identity` are shown with dashed borders. The graph is always
-this shape; only the resolution of each slot changes.
+The full superset graph is documented as a **facet swimlane diagram** in
+[SRD §15](15-facet-swimlane.md). Each facet code (BQGDMPRF) occupies its
+own vertical lane. Steps flow top-to-bottom within lanes, with cross-lane
+arrows showing data dependencies. Every step is annotated with its
+activation condition and identity collapse rule.
 
-```mermaid
-flowchart TD
-    %% ── Inputs (user-provided) ───────────────────────────────────
-    SRC_VEC([/"vector source"/]):::input
-    SRC_QUERY([/"query source<br/>Option"/]):::input
-    SRC_META([/"metadata source<br/>Option"/]):::input
-    SRC_GT([/"ground truth<br/>Option"/]):::input
+**Rendered SVG**: [`diagrams/15-facet-swimlane.svg`](diagrams/15-facet-swimlane.svg)
+**Generator**: `cargo run -p tools --bin gen_swimlane > docs/design/diagrams/15-facet-swimlane.svg`
 
-    %% ── Vector chain ─────────────────────────────────────────────
-    SRC_VEC --> FETCH["fetch_vectors<br/><i>Identity if no URL</i>"]:::slot
-    FETCH --> IMPORT_V["import_vectors<br/><i>Identity if native xvec<br/>(symlinked when possible)</i>"]:::slot
-    IMPORT_V --> ALL_V["all_vectors"]:::artifact
+The diagram includes:
+- 8 facet lanes with optional user-provided input parallelograms
+- Identity bypass arrows for each lane (dashed, on the right edge)
+- Pipeline variable pills (vector_count, clean_count, base_end, etc.)
+- Intermediate cache artifacts between steps (sorted_ordinals.ivec, etc.)
+- Terminal output artifacts at the bottom of each lane
+- Hover tooltips on every element explaining what it does and when it's active
 
-    ALL_V --> CONV_BASE["convert_base_precision<br/><i>Identity if no conversion<br/>requested; up-convert or<br/>down-convert via IEEE 754</i>"]:::slot
-    CONV_BASE --> CONV_V["converted_vectors<br/>(or alias to all_vectors)"]:::artifact
-
-    CONV_V --> SORT["compute dedup<br/><i>lexicographic external<br/>merge-sort + duplicate<br/>detection as byproduct</i>"]:::slot
-    SORT --> SORTED["sorted_ordinals"]:::artifact
-    SORT --> DUPS["duplicate_ordinals"]:::artifact
-
-    SORTED --> ZERO["analyze zeros<br/><i>binary search sorted<br/>index for [0,0,...,0]</i>"]:::slot
-    CONV_V --> ZERO
-    ZERO --> ZEROS["zero_ordinals"]:::artifact
-
-    SORTED --> CLEAN["clean_ordinals<br/><i>Identity if no dups<br/>and no zeros</i>"]:::slot
-    DUPS --> CLEAN
-    ZEROS --> CLEAN
-    CLEAN --> CLEAN_ORD["clean_ordinals"]:::artifact
-    CLEAN_ORD --> SET_CC["clean_count<br/>set variable"]:::slot
-
-    %% ── Query chain ──────────────────────────────────────────────
-    SRC_QUERY --> IMPORT_Q["import_query<br/><i>Identity if native xvec<br/>(symlinked when possible)</i>"]:::slot
-
-    SET_CC --> SHUFFLE["shuffle<br/><i>Identity if separate query</i>"]:::slot
-    CONV_V --> EXT_Q["extract_query<br/><i>Identity if separate query<br/>normalize option</i>"]:::slot
-    CLEAN_ORD --> EXT_Q
-    SHUFFLE --> EXT_Q
-    IMPORT_Q --> QUERY_V
-
-    EXT_Q --> QUERY_RAW["query_vectors<br/>(pre-convert)"]:::artifact
-    QUERY_RAW --> CONV_Q["convert_query_precision<br/><i>Identity if no conversion</i>"]:::slot
-    CONV_Q --> QUERY_V["query_vectors"]:::artifact
-
-    CONV_V --> EXT_B["extract_base<br/><i>Identity if not self-search<br/>normalize option</i>"]:::slot
-    CLEAN_ORD --> EXT_B
-    SHUFFLE --> EXT_B
-    EXT_B --> BASE_V["base_vectors"]:::artifact
-    BASE_V --> SET_BC["base_count<br/><i>Identity if not self-search</i>"]:::slot
-
-    %% ── Metadata chain (entire subgraph Absent when no metadata) ─
-    SRC_META --> IMPORT_M["import_metadata<br/><i>Identity if native slab</i>"]:::slot
-    IMPORT_M --> META_ALL["metadata_all"]:::artifact
-
-    META_ALL --> EXT_META["extract_metadata<br/><i>Identity if not self-search<br/>uses clean_ordinals + shuffle</i>"]:::slot
-    CLEAN_ORD --> EXT_META
-    SHUFFLE --> EXT_META
-    EXT_META --> META_ALIGNED["metadata_content<br/>(ordinal-aligned)"]:::artifact
-
-    META_ALL --> SURVEY["survey"]:::slot
-    SURVEY --> SYNTH["synthesize predicates"]:::slot
-    META_ALL --> SYNTH
-    SYNTH --> PREDS["predicates.slab"]:::artifact
-
-    PREDS --> EVAL["compute predicates<br/><i>per_profile</i>"]:::slot
-    META_ALIGNED --> EVAL
-    EVAL --> PRED_IDX["metadata_indices"]:::artifact
-
-    %% ── Ground truth chain ───────────────────────────────────────
-    SRC_GT --> KNN
-    SET_BC --> KNN["compute knn<br/><i>Identity if GT provided<br/>Absent if no queries<br/>--compress-cache for partitions</i>"]:::slot
-    QUERY_V --> KNN
-    BASE_V --> KNN
-    KNN --> GT["neighbor_indices<br/>neighbor_distances"]:::artifact
-
-    PRED_IDX --> FKNN["compute filtered-knn<br/><i>Absent if no metadata<br/>or --no-filtered<br/>--compress-cache for partitions</i>"]:::slot
-    SET_BC --> FKNN
-    QUERY_V --> FKNN
-    BASE_V --> FKNN
-    FKNN --> FGT["filtered_neighbor_indices<br/>filtered_neighbor_distances"]:::artifact
-
-    %% ── Verification chain ───────────────────────────────────────
-    GT --> VKNN["verify knn<br/><i>per_profile<br/>sparse-sample brute-force<br/>recomputation</i>"]:::slot
-    BASE_V --> VKNN
-    QUERY_V --> VKNN
-    VKNN --> VKNN_RPT["${cache}/profiles/${profile}/\nverify_knn.json"]:::artifact
-
-    FGT --> VPRED["verify predicates<br/><i>per_profile<br/>SQLite-backed sparse-sample<br/>evaluation</i>"]:::slot
-    META_ALIGNED --> VPRED
-    PREDS --> VPRED
-    PRED_IDX --> VPRED
-    VPRED --> VPRED_RPT["${cache}/profiles/${profile}/\nverify_predicates.json"]:::artifact
-
-    %% ── Merkle hash trees (final pipeline step) ───────────────────
-    VKNN_RPT --> MERKLE["merkle create<br/><i>always last step<br/>produces .mref files</i>"]:::slot
-    VPRED_RPT --> MERKLE
-    GT --> MERKLE
-    FGT --> MERKLE
-    MERKLE --> MREF[".mref files"]:::artifact
-
-    %% ── Catalog generation (final step) ──────────────────────────
-    MREF --> CATGEN["catalog generate<br/><i>always last step<br/>produces catalog.json +<br/>catalog.yaml</i>"]:::slot
-    CATGEN --> CATFILES["catalog.json<br/>catalog.yaml"]:::artifact
-
-    %% ── Cache compression (offline, post-pipeline) ───────────────
-    GT -.-> CACHE_CMP["cache-compress<br/><i>offline retroactive<br/>compression of eligible<br/>cache artifacts</i>"]:::offline
-    FGT -.-> CACHE_CMP
-    SORTED -.-> CACHE_CMP
-
-    %% ── Profile assembly ─────────────────────────────────────────
-    BASE_V --> PROF[/"dataset.yaml<br/>profiles"/]:::output
-    QUERY_V --> PROF
-    META_ALIGNED --> PROF
-    PREDS --> PROF
-    GT --> PROF
-    FGT --> PROF
-    PRED_IDX --> PROF
-    VKNN_RPT --> PROF
-    VPRED_RPT --> PROF
-
-    %% ── Styling ──────────────────────────────────────────────────
-    classDef input fill:#e1f5fe,stroke:#0288d1,stroke-width:2px
-    classDef slot fill:#fff3e0,stroke:#ef6c00,stroke-dasharray:5 5
-    classDef artifact fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
-    classDef output fill:#f3e5f5,stroke:#7b1fa2,stroke-width:2px
-    classDef offline fill:#fce4ec,stroke:#c62828,stroke-dasharray:3 3
-```
-
-**Reading the graph:**
-- **Parallelogram** nodes are user-provided inputs.
-- **Dashed** nodes are slots — each independently resolves to either a
-  materialized step or an identity alias.
-- **Solid green** nodes are artifacts — the resolved output path,
-  regardless of whether it was materialized or aliased.
-- **Dotted red** nodes are offline operations that can be run after the
-  pipeline completes (e.g., `veks datasets cache-compress`).
-- The *italic annotation* on each slot states its identity condition.
-- When an input is `Option::None`, its entire downstream subgraph
-  vanishes from the emitted YAML.
+<!-- Legacy Mermaid flowchart removed. The canonical view is the facet
+     swimlane SVG above. Source: tools/src/bin/gen_swimlane.rs -->
 
 ---
 
 ## 12.5 Identity Collapse Examples
 
-### Example 1: Minimal — native fvec, no queries, no metadata
+
+### Example 1: Minimal — native fvec, `--required-facets B`
 
 ```
-fetch_vectors          → Identity (no URL)
-import_vectors         → Identity (native fvec, symlinked)
-all_vectors            → /data/base.fvec (alias to source)
-convert_base_precision → Identity (no conversion requested)
-sort                   → Materialized (compute dedup → lexicographic sort + duplicate detection)
-zero_check             → Materialized (binary search sorted index for zero vector)
-clean_ordinals         → Materialized (transform clean-ordinals, exclude dups + zeros)
-clean_count            → Materialized (set variable)
-shuffle                → Identity (no self-search)
-extract_query          → Absent (no queries)
-extract_base           → Identity (base = all_vectors)
-base_vectors           → /data/base.fvec (alias)
-metadata chain         → Absent (no metadata)
-knn                    → Absent (no queries)
-filtered_knn           → Absent (no metadata)
+all_vectors            → Identity (native fvec, symlinked)
+vector_count           → Materialized (state set)
+sort                   → Materialized (compute sort — lexicographic merge-sort + dup detection)
+zero_check             → Materialized (analyze zeros — binary search sorted index)
+clean_ordinals         → Materialized (transform ordinals — exclude dups + zeros)
+clean_count            → Materialized (state set)
+shuffle                → Absent (Q not in facets)
+query chain            → Absent (Q not in facets)
+metadata chain         → Absent (M not in facets)
+knn                    → Absent (G not in facets)
+filtered_knn           → Absent (F not in facets)
 ```
 
-Emitted steps: `dedup-vectors`, `zero-check`, `clean-ordinals`,
-`set-clean-count`. Four steps total.
+Emitted steps: `count-vectors`, `sort-and-dedup`, `count-duplicates`,
+`find-zeros`, `count-zeros`, `filter-ordinals`, `count-clean`,
+`generate-catalog`, `generate-merkle`. Nine steps total.
 
 ### Example 2: Maximal — foreign format, self-search, metadata, all GT
 
+Inferred facets: `BQGDMPRF` (base + metadata → all facets).
+
 ```
-fetch_vectors          → Materialized (fetch bulkdl)
-import_vectors         → Materialized (import npy → mvec)
-all_vectors            → ${cache}/all_vectors.mvec
-convert_base_precision → Identity (no conversion requested)
-sort                   → Materialized (compute dedup → lexicographic sort + duplicate detection)
-zero_check             → Materialized (binary search sorted index for zero vector)
-clean_ordinals         → Materialized (transform clean-ordinals, exclude dups + zeros)
-clean_count            → Materialized (set variable)
-shuffle                → Materialized (generate ivec-shuffle over clean_count)
-extract_query          → Materialized (transform extract [0, query_count) via shuffle+clean_ordinals)
-convert_query_prec     → Identity (no conversion requested)
-extract_base           → Materialized (transform extract [query_count, N) via shuffle+clean_ordinals)
-base_count             → Materialized (set variable)
-import_metadata        → Materialized (import parquet → slab)
-extract_metadata       → Materialized (transform extract-slab, clean_ordinals + shuffle aligned)
-survey                 → Materialized (survey)
-predicates             → Materialized (synthesize predicates)
-pred_indices           → Materialized (compute predicates, per_profile)
-knn                    → Materialized (compute knn, per_profile, compress_cache=true)
-filtered_knn           → Materialized (compute filtered-knn, per_profile, compress_cache=true)
-verify_knn             → Materialized (verify knn, per_profile, sparse sample=100)
-verify_predicates      → Materialized (verify predicates, per_profile, sparse sample=50, metadata-sample=100K)
+convert_vectors        → Materialized (transform convert, npy → mvec, fraction if < 100%)
+vector_count           → Materialized (state set, counts converted subset)
+sort                   → Materialized (compute sort — lexicographic merge-sort + duplicate detection)
+zero_check             → Materialized (analyze zeros — binary search sorted index)
+clean_ordinals         → Materialized (transform ordinals — exclude dups + zeros)
+clean_count            → Materialized (state set)
+shuffle                → Materialized (generate shuffle, reads clean_ordinals for actual ordinals)
+extract_query          → Materialized (transform extract [0, query_count) via shuffle)
+extract_base           → Materialized (transform extract [query_count, clean_count) via shuffle)
+base_count             → Materialized (state set)
+convert_metadata       → Materialized (transform convert, parquet → slab via MNode reader, fraction if < 100%)
+extract_metadata       → Materialized (transform extract, same shuffle for ordinal congruency)
+survey                 → Materialized (analyze survey)
+predicates             → Materialized (generate predicates)
+pred_indices           → Materialized (compute evaluate-predicates, per_profile)
+knn                    → Materialized (compute knn, per_profile)
+filtered_knn           → Materialized (compute filtered-knn, per_profile)
+verify_knn             → Materialized (verify knn-groundtruth, per_profile)
+verify_predicates      → Materialized (verify predicate-results, per_profile)
+catalog                → Materialized (catalog generate)
+merkle                 → Materialized (merkle create)
 ```
 
 All slots materialized. This is the laion400m-img-search pattern.
+With `--base-fraction '1%'`, the convert steps import only 1% of
+source records and all downstream steps operate on the subset.
 
 ### Example 3: Native xvec base + separate native query, with metadata
 
+Inferred facets: `BQGDMPRF` (base + query + metadata).
+
 ```
-import_vectors         → Identity (native, symlinked)
-all_vectors            → base.fvec (alias)
-convert_base_precision → Identity (no conversion)
-sort                   → Materialized (compute dedup — lexicographic sort + dup detection)
-zero_check             → Materialized (binary search sorted index)
-clean_ordinals         → Materialized (transform clean-ordinals)
-clean_count            → Materialized (set variable)
-shuffle                → Identity (separate query, no self-search)
-import_query           → Identity (native xvec, symlinked)
+all_vectors            → Identity (native fvec, symlinked)
+vector_count           → Materialized (state set)
+sort                   → Materialized (compute sort — lexicographic merge-sort + dup detection)
+zero_check             → Materialized (analyze zeros — binary search sorted index)
+clean_ordinals         → Materialized (transform ordinals)
+clean_count            → Materialized (state set)
+shuffle                → Identity (separate query file, no self-search)
+query_vectors          → Identity (native xvec, symlinked)
 query_vectors          → query.fvec (alias)
-convert_query_prec     → Identity (no conversion)
-extract_base           → Identity (not self-search)
-base_vectors           → base.fvec (alias)
-import_metadata        → Materialized (parquet → slab)
-extract_metadata       → Identity (no shuffle, ordinals aligned)
-metadata_content       → ${cache}/metadata_all.slab (alias)
-survey                 → Materialized
-predicates             → Materialized
-pred_indices           → Materialized (per_profile)
-knn                    → Materialized (per_profile)
-filtered_knn           → Materialized (per_profile)
-verify_knn             → Materialized (per_profile)
-verify_predicates      → Materialized (per_profile)
+base_vectors           → Identity (not self-search, symlinked to source)
+convert_metadata       → Materialized (transform convert, parquet → slab via MNode reader)
+extract_metadata       → Identity (no shuffle, ordinals already aligned)
+survey                 → Materialized (analyze survey)
+predicates             → Materialized (generate predicates)
+pred_indices           → Materialized (compute evaluate-predicates, per_profile)
+knn                    → Materialized (compute knn, per_profile)
+filtered_knn           → Materialized (compute filtered-knn, per_profile)
+verify_knn             → Materialized (verify knn-groundtruth, per_profile)
+verify_predicates      → Materialized (verify predicate-results, per_profile)
 ```
 
-Import steps collapse; shuffle/extract collapse; metadata extract
-collapses. Dedup, zero-check, and clean-ordinals always run.
-All compute steps still run.
+Shuffle/extract collapse (separate query). Metadata extract collapses
+(no self-search — ordinals already aligned). Dedup, zero-check, and
+clean-ordinals always run. All compute steps still run.
 
 ### Example 4: Precision conversion — f32 source, target f16
 
 ```
-import_vectors         → Identity (native fvec, symlinked)
-all_vectors            → /data/base.fvec (alias)
-convert_base_precision → Materialized (convert fvec → mvec, lossy IEEE 754 round-to-nearest-even)
-converted_vectors      → ${cache}/all_vectors.mvec
-dedup                  → Materialized (compute dedup on converted mvec)
+all_vectors            → Identity (native fvec, symlinked to /data/base.fvec)
+convert_precision      → Materialized (transform convert fvec → mvec, lossy IEEE 754 round-to-nearest-even)
+vector_count           → Materialized (state set, counts ${cache}/all_vectors.mvec)
+sort                   → Materialized (compute sort on converted mvec)
 ...                    → (remainder of graph uses converted mvec)
 ```
 
-The wizard detects the precision mismatch and automatically inserts
-the convert step. Down-conversion (f32→f16) is lossy; up-conversion
-(f16→f32) is lossless but does not improve accuracy.
+The `--base-convert-format mvec` flag inserts the precision conversion
+step. Down-conversion (f32→f16) is lossy; up-conversion (f16→f32)
+is lossless but does not improve accuracy.
 
 ---
 
@@ -451,12 +331,12 @@ use a typed `Option` model in the generator:
 
 ```rust
 struct PipelineSlots {
-    // Required
+    // Required (when B facet active)
     all_vectors: Artifact,
-    dedup: Artifact,            // compute dedup → sorted ordinals + duplicates
-    zero_check: Artifact,       // binary search sorted index for zero vector
-    clean_ordinals: Artifact,   // transform clean-ordinals (exclude dups + zeros)
-    clean_count: Artifact,      // set variable on clean_ordinals
+    sort: Artifact,             // compute sort → sorted ordinals + duplicates
+    zero_check: Artifact,       // analyze zeros → zero ordinals
+    clean_ordinals: Artifact,   // transform ordinals (exclude dups + zeros)
+    vector_count: Artifact,     // state set on all_vectors
 
     // Query axis (None → no KNN, no filtered-KNN)
     self_search: bool,
@@ -602,7 +482,7 @@ slot, regardless of whether it is `Materialized` or `Identity`.
 | `--metadata` | path | Metadata source (file or directory) |
 | `--ground-truth` | path | Pre-computed ground truth indices (ivec) |
 | `--ground-truth-distances` | path | Pre-computed ground truth distances (fvec) |
-| `--metric` | string | Distance metric for KNN: L2, Cosine, DotProduct, L1 (required) |
+| `--metric` | string | Distance metric for KNN: auto, L2, Cosine, DotProduct, L1 (default: auto — probes vector norms, defaults to Cosine) |
 | `--neighbors` | int | Number of neighbors for KNN (default: 100) |
 | `--seed` | int | Random seed for shuffle (default: 42) |
 | `--description` | string | Dataset description |
@@ -610,16 +490,54 @@ slot, regardless of whether it is `Materialized` or `Identity`.
 | `--no-zero-check` | flag | Collapse zero_check slot to identity |
 | `--no-filtered` | flag | Force filtered_knn to Absent |
 | `--normalize` | flag | L2-normalize vectors during extraction |
-| `--compress-cache` | flag | Enable gzip compression for eligible cache artifacts (default: true) |
+| `--compress-cache` | flag | Enable gzip compression for eligible cache artifacts (default: false — can be done later with `cache-compress`) |
 | `--force` | flag | Overwrite existing dataset.yaml |
+| `--required-facets` | string | Required dataset facets as codes (e.g., "BQGD") or names (e.g., "base,query,gt,dist"). Overrides inference. See SRD §2.8. |
+| `--base-fraction` | string | Fraction of base vectors to use. Accepts percentages (`1%`, `50%`), bare numbers ≥ 1 as percentages (`1` = 1%, `50` = 50%, `100` = 100%), or decimal fractions < 1 (`0.01` = 1%, `0.5` = 50%). Default: `100%`. When < 100%, a subset step limits the working set before dedup/sort (fast mode) unless `--pedantic-dedup` forces full-input processing first. |
+| `--pedantic-dedup` | flag | Run dedup+zeros on the full input before subsetting (slower but stable across fractions). Default: off — subset first, then dedup on the subset. |
+| `--round-digits` | int | Significant digits for computed counts (default: 2). Set to 10+ to disable rounding. |
+| `--output` | enum | Output mode: `auto` (default — TUI if TTY, basic otherwise), `tui` (rich terminal), `basic` (plain text progress on stderr), `batch` (log-only, no console). |
 
 ### Implied defaults
 
 - `--auto` → `-i -r -y` (interactive + restart + auto-accept)
-- `--base-vectors` without `--query-vectors` → self-search mode
-- `--metadata` present → full predicate chain unless `--no-filtered`
+- `--metric auto` (default) → probes vector norms, defaults to Cosine
+- `--required-facets` not set → inferred from inputs per SRD §2.8:
+  - Base provided (B) → `BQGD` (self-search queries + ground truth)
+  - Metadata provided (M) → `BQGDMPR`
+  - Both (B+M) → `BQGDMPRF` (includes filtered KNN)
+  - Neither → empty pipeline
+- `--required-facets B` → base-only dataset, no queries or KNN
 - `--ground-truth` → KNN slot collapses to Identity (alias to provided files)
-- `--metric` is required and has no default — user must declare intent
+- `--base-fraction '1%'` or `--base-fraction 0.01` → subset to 1% of source data.
+  In fast mode (default): a `subset-vectors` step runs first, limiting the
+  working set before dedup/sort. In `--pedantic-dedup` mode: full import
+  then subset via `compute-base-end` after dedup.
+  **Format**: use `%` suffix for percentages (`1%`, `50%`, `100%`) or
+  decimal fractions < 1 (`0.01` = 1%, `0.5` = 50%). Bare whole numbers
+  like `1` or `50` are rejected to avoid ambiguity.
+- `--round-digits 2` (default) → computed counts rounded to 2 significant digits
+
+### CLI flags and wizard defaults
+
+CLI flags **pre-seed** the wizard's defaults — they do not bypass the
+wizard. When a CLI flag is provided, the wizard uses it as the default
+value for the corresponding prompt. The user can change it interactively
+or `--auto` (`-y`) auto-accepts it.
+
+This means `--auto --base-fraction '1%'` runs the full wizard with
+every prompt auto-accepted, but the "Base data percentage" default is
+`1` instead of `100`. The wizard still detects files, probes vector
+norms, and makes all other decisions based on what it finds.
+
+| Invocation | Wizard runs? | Prompts? | Uses CLI flags as... |
+|------------|-------------|----------|---------------------|
+| `veks prepare bootstrap -i` | Yes | Interactive | Prompt defaults |
+| `veks prepare bootstrap --auto` | Yes | Auto-accepted | Prompt defaults |
+| `veks prepare bootstrap --name X --output Y ...` | No | N/A | Direct ImportArgs |
+
+When the wizard is NOT used (explicit non-interactive mode), CLI flags
+are required (`--name`, `--output`) and construct `ImportArgs` directly.
 
 ---
 
@@ -935,15 +853,38 @@ eligibility rules and never touch random-access files.
 - `clean_ordinals.ivec` — random access
 - Any final output file referenced by profile views
 
-### KNN partition cache reuse
+### Cache key strategy and data fingerprinting
 
-KNN partition cache keys are derived from `base_stem.query_stem.range.k.metric`
-— deliberately excluding the pipeline step ID. This means:
-- Partitions computed for a smaller profile (e.g., 10M base vectors)
-  are automatically reused by larger profiles (50M, 150M) that share
-  the same base file, query file, k, and metric.
-- Ordering profiles smallest-to-largest in the pipeline maximizes cache
-  reuse. Later profiles skip all overlapping partition ranges.
+All partition and segment caches include a **data fingerprint** in their
+cache key to prevent stale cached results from being reused after the
+underlying data changes. This is critical when `--base-fraction` changes
+(e.g., from 100% to 1%) — the same filename and ordinal ranges may
+refer to completely different records.
+
+**KNN partition cache keys**:
+`base_stem.query_stem.base_size_query_size.range.k.metric.{neighbors|distances}.{ivec|fvec}`
+
+**Filtered KNN partition cache keys**:
+`step_id.range.k.metric.sz{base_count}.fknn.{neighbors|distances}.{ivec|fvec}`
+
+**Predicate evaluation segment cache keys**:
+`input_stem.pred_stem.input_file_size.seg_{start}_{end}.predkeys.slab`
+
+The file size (or record count for filtered KNN) acts as a lightweight
+fingerprint. When the data changes, the size changes, the cache key
+changes, and old segments are not reused. This avoids expensive hashing
+while catching all practical configuration changes.
+
+**Pipeline-level config hash**: The progress log stores an FNV-1a hash
+of `dataset.yaml`. When the config changes (re-bootstrap with different
+options), all step records are invalidated on the next `veks run`,
+forcing re-execution regardless of individual step caches.
+
+**Cache reuse across profiles**: KNN partition keys deliberately exclude
+the pipeline step ID. Partitions computed for a smaller profile (e.g.,
+10M base vectors) are automatically reused by larger profiles (50M,
+150M) that share the same base file, query file, k, and metric.
+Ordering profiles smallest-to-largest maximizes cache reuse.
 
 ---
 

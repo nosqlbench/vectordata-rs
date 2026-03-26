@@ -132,35 +132,60 @@ fn write_and_verify(label: &str, count: u64) {
     println!("[{label}] Page count: {}", reader.page_count());
 }
 
-/// 1 million records (~15 MB file). The smallest large-scale test;
-/// useful for quick smoke-testing of release builds.
+/// 10 thousand records (~150 KB file). Fast CI-friendly test that
+/// exercises the full write/read/verify cycle.
 #[test]
-#[ignore]
-fn test_write_read_1m() {
-    write_and_verify("1M", 1_000_000);
+fn test_write_read_10k() {
+    write_and_verify("10K", 10_000);
 }
 
-/// 10 million records (~150 MB file). Exercises multi-page indexing at
-/// moderate scale.
+/// 100 thousand records (~1.5 MB file). Tests multi-page behavior
+/// without significant time or disk usage.
 #[test]
-#[ignore]
-fn test_write_read_10m() {
-    write_and_verify("10M", 10_000_000);
+fn test_write_read_100k() {
+    write_and_verify("100K", 100_000);
 }
 
-/// 100 million records (~1.5 GB file). Stresses page-flush cadence and
-/// the pages-page index with thousands of entries.
+/// Configurable scale test. Set `SLAB_SCALE` environment variable to
+/// control the record count:
+///
+/// ```sh
+/// # Default (CI): 100K records
+/// cargo test -p slabtastic --test large_scale test_write_read_scaled
+///
+/// # 10M records:
+/// SLAB_SCALE=10m cargo test -p slabtastic --test large_scale test_write_read_scaled
+///
+/// # 1B records (stress test, release mode recommended):
+/// SLAB_SCALE=1b cargo test --release -p slabtastic --test large_scale test_write_read_scaled
+/// ```
+///
+/// Accepted values: 10k, 100k, 1m, 10m, 100m, 1b, or any integer.
 #[test]
-#[ignore]
-fn test_write_read_100m() {
-    write_and_verify("100M", 100_000_000);
+fn test_write_read_scaled() {
+    let scale = std::env::var("SLAB_SCALE").unwrap_or_else(|_| "100k".to_string());
+    let (label, count) = parse_scale(&scale);
+    write_and_verify(&label, count);
 }
 
-/// 1 billion records (~15 GB file). Full-scale stress test. Requires
-/// sufficient disk space and several minutes in release mode. Validates
-/// that the format handles datasets well beyond typical in-memory sizes.
-#[test]
-#[ignore]
-fn test_write_read_1b() {
-    write_and_verify("1B", 1_000_000_000);
+fn parse_scale(s: &str) -> (String, u64) {
+    let s = s.trim().to_lowercase();
+    let (label, count) = match s.as_str() {
+        "10k"  => ("10K".into(),  10_000u64),
+        "100k" => ("100K".into(), 100_000),
+        "1m"   => ("1M".into(),   1_000_000),
+        "10m"  => ("10M".into(),  10_000_000),
+        "100m" => ("100M".into(), 100_000_000),
+        "1b"   => ("1B".into(),   1_000_000_000),
+        _ => {
+            if let Ok(n) = s.parse::<u64>() {
+                (format!("{}", n), n)
+            } else {
+                eprintln!("Unknown SLAB_SCALE '{}', using 100K", s);
+                ("100K".into(), 100_000)
+            }
+        }
+    };
+    println!("Scale test: {} ({} records)", label, count);
+    (label, count)
 }

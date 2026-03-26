@@ -91,6 +91,11 @@ impl UiHandle {
         &self.sink
     }
 
+    /// Clone the underlying sink Arc (for wrapping with LoggingSink, etc.).
+    pub fn sink_arc(&self) -> Arc<dyn UiSink> {
+        self.sink.clone()
+    }
+
     /// Create a determinate progress bar with the default unit "rec".
     pub fn bar(&self, total: u64, label: impl Into<String>) -> ProgressHandle {
         self.bar_with_unit(total, label, "rec")
@@ -162,10 +167,16 @@ impl UiHandle {
     }
 
     /// Emit a log line above the progress region.
+    ///
+    /// Sends the event directly to the sink for immediate display, and
+    /// also emits `log::info!()` for persistent file logging. The
+    /// `PipelineLogger` skips TUI forwarding for "ui" target messages
+    /// to avoid duplication.
     pub fn log(&self, message: &str) {
         self.sink.send(UiEvent::Log {
             message: message.to_string(),
         });
+        log::info!(target: "ui", "{}", message);
     }
 
     /// Emit raw text (no newline).

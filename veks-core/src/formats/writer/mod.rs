@@ -3,6 +3,7 @@
 
 //! Vector data writers for various formats.
 
+pub mod mmap_xvec;
 pub mod slab;
 pub mod xvec;
 

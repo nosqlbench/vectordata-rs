@@ -45,6 +45,116 @@ pub struct ImportArgs {
     /// Sized profile specification (e.g., "mul:1m..400m/2, 0m..400m/10m").
     /// When set, generates sized profiles in the dataset.yaml.
     pub sized_profiles: Option<String>,
+    /// Fraction of base vectors to use (0.0–1.0, default 1.0 = all).
+    /// When < 1.0, the base extraction range is capped so only this
+    /// fraction of the available (post-dedup, post-query-split) vectors
+    /// are used as the base set.
+    pub base_fraction: f64,
+    /// When true and base_fraction < 1.0, run dedup+zeros on the full
+    /// input before subsetting. Slower but guarantees dedup is stable
+    /// regardless of the fraction. When false (default), subset first
+    /// then dedup on just the subset — faster but dedup results may
+    /// differ from the full-input case.
+    pub pedantic_dedup: bool,
+    /// Required facets as a set of single-letter codes (BQGDMPRF).
+    /// When `None`, facets are inferred from available inputs using
+    /// the implication rules in SRD 2.8. When `Some`, only the
+    /// specified facets are produced — overriding inference.
+    pub required_facets: Option<String>,
+    /// Number of significant digits for computed counts (like base_end).
+    /// Default 2 produces clean sizes (e.g., 180000000 instead of 184623729).
+    /// Set to 10+ to effectively disable rounding.
+    pub round_digits: u32,
+}
+
+/// Canonical facet code definitions.
+///
+/// Each code maps to one or more profile facets. The codes are used
+/// throughout the CLI, TUI, and pipeline generation.
+pub const FACET_CODES: &[(&str, char, &str)] = &[
+    ("base_vectors",               'B', "Base vectors"),
+    ("query_vectors",              'Q', "Query vectors"),
+    ("neighbor_indices",           'G', "Ground-truth KNN indices"),
+    ("neighbor_distances",         'D', "Ground-truth KNN distances"),
+    ("metadata_content",           'M', "Metadata content"),
+    ("metadata_predicates",        'P', "Predicates"),
+    ("metadata_indices",           'R', "Predicate evaluation results"),
+    ("filtered_neighbor_indices",  'F', "Filtered KNN"),
+];
+
+/// Parse a facet specification string into a canonical code string.
+///
+/// Accepts:
+/// - `"BQGD"` — compact codes
+/// - `"B,Q,G,D"` or `"base,query,gt,dist"` — comma-separated
+/// - `"base query gt dist"` — space-separated names
+/// - Full facet names like `"base_vectors,query_vectors"`
+pub fn parse_facet_spec(spec: &str) -> String {
+    let spec = spec.trim();
+
+    // If it's all uppercase letters from BQGDMPRF, treat as compact codes
+    if !spec.is_empty()
+        && spec.chars().all(|c| "BQGDMPRFbqgdmprf".contains(c))
+        && !spec.contains(',')
+        && !spec.contains(' ')
+    {
+        return spec.to_uppercase();
+    }
+
+    // Split on comma or space
+    let parts: Vec<&str> = if spec.contains(',') {
+        spec.split(',').map(|s| s.trim()).collect()
+    } else {
+        spec.split_whitespace().collect()
+    };
+
+    let mut codes = String::new();
+    for part in parts {
+        let p = part.to_lowercase();
+        let code = match p.as_str() {
+            "b" | "base" | "base_vectors" => 'B',
+            "q" | "query" | "query_vectors" => 'Q',
+            "g" | "gt" | "groundtruth" | "neighbor_indices" => 'G',
+            "d" | "dist" | "distances" | "neighbor_distances" => 'D',
+            "m" | "meta" | "metadata" | "metadata_content" => 'M',
+            "p" | "pred" | "predicates" | "metadata_predicates" => 'P',
+            "r" | "results" | "metadata_indices" => 'R',
+            "f" | "filtered" | "filtered_neighbor_indices" => 'F',
+            other => {
+                // Single uppercase letter?
+                if other.len() == 1 && "bqgdmprf".contains(other) {
+                    other.to_uppercase().chars().next().unwrap()
+                } else {
+                    eprintln!("Warning: unknown facet '{}', ignoring", other);
+                    continue;
+                }
+            }
+        };
+        if !codes.contains(code) {
+            codes.push(code);
+        }
+    }
+    codes
+}
+
+/// Resolve required facets from explicit spec or input inference.
+///
+/// Returns a canonical code string (e.g., "BQGDMPRF").
+pub fn resolve_facets(args: &ImportArgs) -> String {
+    if let Some(ref spec) = args.required_facets {
+        return parse_facet_spec(spec);
+    }
+
+    // Inference from available inputs (SRD 2.8 implication rules)
+    let has_base = args.base_vectors.is_some();
+    let has_meta = args.metadata.is_some();
+
+    match (has_base, has_meta) {
+        (true, true) => "BQGDMPRF".to_string(),
+        (false, true) => "BQGDMPR".to_string(),
+        (true, false) => "BQGD".to_string(),
+        (false, false) => String::new(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -117,12 +227,15 @@ struct PipelineSlots {
 /// dataset.yaml never contains absolute paths (SRD requirement).
 fn resolve_slots(args: &ImportArgs) -> PipelineSlots {
     let output_dir = &args.output;
+    let facets = resolve_facets(args);
+    let has_base_facet = facets.contains('B');
+
     let base_source = args.base_vectors.as_ref()
         .map(|p| relativize_path(p, output_dir))
         .unwrap_or_default();
 
     // ── Vector chain ─────────────────────────────────────────────────
-    let needs_import = args.base_vectors.as_ref()
+    let needs_import = has_base_facet && args.base_vectors.as_ref()
         .map(|p| !is_native_xvec_file(p))
         .unwrap_or(false);
 
@@ -135,7 +248,7 @@ fn resolve_slots(args: &ImportArgs) -> PipelineSlots {
         Artifact::Identity { path: base_source.clone() }
     };
 
-    let sort = if args.no_dedup {
+    let sort = if !has_base_facet || args.no_dedup {
         Artifact::Identity { path: String::new() } // no artifact
     } else {
         Artifact::Materialized {
@@ -144,7 +257,7 @@ fn resolve_slots(args: &ImportArgs) -> PipelineSlots {
         }
     };
 
-    let zero_check = if args.no_zero_check {
+    let zero_check = if !has_base_facet || args.no_zero_check {
         Artifact::Identity { path: String::new() }
     } else {
         Artifact::Materialized {
@@ -153,7 +266,7 @@ fn resolve_slots(args: &ImportArgs) -> PipelineSlots {
         }
     };
 
-    let clean_ordinals = if args.no_dedup && args.no_zero_check {
+    let clean_ordinals = if !has_base_facet || (args.no_dedup && args.no_zero_check) {
         Artifact::Identity { path: String::new() }
     } else {
         Artifact::Materialized {
@@ -162,17 +275,30 @@ fn resolve_slots(args: &ImportArgs) -> PipelineSlots {
         }
     };
 
-    let vector_count = Artifact::Materialized {
-        step_id: "count-vectors".into(),
-        output: String::new(), // variable, not a file
+    let vector_count = if has_base_facet {
+        Artifact::Materialized {
+            step_id: "count-vectors".into(),
+            output: String::new(), // variable, not a file
+        }
+    } else {
+        Artifact::Identity { path: String::new() }
     };
 
     // ── Query chain ──────────────────────────────────────────────────
+    let facets = resolve_facets(args);
+    let wants_queries = facets.contains('Q');
     let has_separate_query = args.query_vectors.is_some();
-    // Separate query file takes precedence over --self-search flag
-    let self_search = !has_separate_query
-        && (args.self_search || args.base_vectors.is_some());
+    // Self-search when queries are wanted but not provided separately
+    let self_search = wants_queries && !has_separate_query;
     let has_queries = has_separate_query || self_search;
+
+    // Determine output extension from source format
+    let vec_ext = if needs_import { "mvec" } else {
+        args.base_vectors.as_ref()
+            .and_then(|p| p.extension())
+            .and_then(|e| e.to_str())
+            .unwrap_or("fvec")
+    };
 
     let (shuffle, query_vectors, base_vectors, base_count) = if self_search {
         // Self-search: shuffle + extract
@@ -182,11 +308,11 @@ fn resolve_slots(args: &ImportArgs) -> PipelineSlots {
         };
         let qv = Artifact::Materialized {
             step_id: "extract-queries".into(),
-            output: "profiles/base/query_vectors.mvec".into(),
+            output: format!("profiles/base/query_vectors.{}", vec_ext),
         };
         let bv = Artifact::Materialized {
             step_id: "extract-base".into(),
-            output: "profiles/base/base_vectors.mvec".into(),
+            output: format!("profiles/base/base_vectors.{}", vec_ext),
         };
         let bc = Artifact::Materialized {
             step_id: "count-base".into(),
@@ -223,7 +349,8 @@ fn resolve_slots(args: &ImportArgs) -> PipelineSlots {
     };
 
     // ── Metadata chain ───────────────────────────────────────────────
-    let metadata = args.metadata.as_ref().map(|meta_source| {
+    let wants_metadata = facets.contains('M');
+    let metadata = args.metadata.as_ref().filter(|_| wants_metadata).map(|meta_source| {
         let needs_meta_import = !is_native_slab_file(meta_source);
 
         let metadata_all = if needs_meta_import {
@@ -263,7 +390,8 @@ fn resolve_slots(args: &ImportArgs) -> PipelineSlots {
     });
 
     // ── Ground truth chain ───────────────────────────────────────────
-    let knn = if !has_queries {
+    let wants_gt = facets.contains('G');
+    let knn = if !has_queries || !wants_gt {
         None
     } else if args.ground_truth.is_some() {
         Some(Artifact::Identity {
@@ -276,7 +404,8 @@ fn resolve_slots(args: &ImportArgs) -> PipelineSlots {
         })
     };
 
-    let filtered_knn = if !has_queries || metadata.is_none() || args.no_filtered {
+    let wants_filtered = facets.contains('F') && !args.no_filtered;
+    let filtered_knn = if !has_queries || metadata.is_none() || !wants_filtered {
         None
     } else {
         Some(Artifact::Materialized {
@@ -321,18 +450,25 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, output_dir: &std::path::
             .and_then(|p| VecFormat::detect(p))
             .map(|f| f.name().to_string())
             .unwrap_or_else(|| "auto".into());
+        let mut convert_opts = vec![
+            ("facet".into(), "base_vectors".into()),
+            ("source".into(), base_source.clone()),
+            ("from".into(), format),
+            ("output".into(), "${cache}/all_vectors.mvec".into()),
+        ];
+        // When base_fraction < 1.0 and not pedantic, limit the convert
+        // step to only import the needed subset. The convert command
+        // computes the actual limit from source record count × fraction.
+        if args.base_fraction < 1.0 && !args.pedantic_dedup {
+            convert_opts.push(("fraction".into(), args.base_fraction.to_string()));
+        }
         steps.push(Step {
             id: "convert-vectors".into(),
             run: "transform convert".into(),
             description: Some("Import base vectors from source format".into()),
             after: vec![],
             per_profile: false,
-            options: vec![
-                ("facet".into(), "base_vectors".into()),
-                ("source".into(), base_source.clone()),
-                ("from".into(), format),
-                ("output".into(), "${cache}/all_vectors.mvec".into()),
-            ],
+            options: convert_opts,
         });
     }
 
@@ -341,6 +477,39 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, output_dir: &std::path::
     } else {
         "" // no dependency
     };
+
+    // ── Early subset for native sources with fraction < 1.0 ──────
+    //
+    // When the source is native xvec (identity, no convert step) and
+    // the user wants a fraction < 1.0 and NOT pedantic dedup, we need
+    // to extract the subset before dedup runs. This avoids expensive
+    // dedup/sort on the full input.
+    //
+    // For foreign sources, the convert step's `fraction` option already
+    // handles this. For native sources, we insert an explicit extract.
+    if args.base_fraction < 1.0 && !args.pedantic_dedup && !slots.all_vectors.is_materialized() {
+        let source_path = slots.all_vectors.path().to_string();
+        let ext = args.base_vectors.as_ref()
+            .and_then(|p| p.extension())
+            .and_then(|e| e.to_str())
+            .unwrap_or("fvec");
+        let subset_output = format!("${{cache}}/all_vectors.{}", ext);
+        steps.push(Step {
+            id: "subset-vectors".into(),
+            run: "transform convert".into(),
+            description: Some(format!(
+                "Subset to {:.0}% of source vectors (fast mode)",
+                args.base_fraction * 100.0)),
+            after: vec![],
+            per_profile: false,
+            options: vec![
+                ("source".into(), source_path),
+                ("output".into(), subset_output),
+                ("fraction".into(), args.base_fraction.to_string()),
+            ],
+        });
+        last_vector_step = "subset-vectors";
+    }
 
     // Precision convert for base vectors (e.g., f32→f16 or f16→f32)
     if let Some(ref target_fmt) = args.base_convert_format {
@@ -364,18 +533,32 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, output_dir: &std::path::
         last_vector_step = "convert-precision";
     }
 
-    // set-vector-count (always)
-    steps.push(Step {
-        id: "count-vectors".into(),
-        run: "state set".into(),
-        description: None,
-        after: if last_vector_step.is_empty() { vec![] } else { vec![last_vector_step.into()] },
-        per_profile: false,
-        options: vec![
-            ("name".into(), "vector_count".into()),
-            ("value".into(), format!("count:{}", slots.all_vectors.path())),
-        ],
-    });
+    // The working vector path: either the subset output or the original.
+    // All downstream steps (count, sort, zeros, extract) should use this.
+    let working_vectors = if last_vector_step == "subset-vectors" {
+        let ext = args.base_vectors.as_ref()
+            .and_then(|p| p.extension())
+            .and_then(|e| e.to_str())
+            .unwrap_or("fvec");
+        format!("${{cache}}/all_vectors.{}", ext)
+    } else {
+        slots.all_vectors.path().to_string()
+    };
+
+    // set-vector-count (only when base vectors are materialized)
+    if slots.vector_count.is_materialized() {
+        steps.push(Step {
+            id: "count-vectors".into(),
+            run: "state set".into(),
+            description: None,
+            after: if last_vector_step.is_empty() { vec![] } else { vec![last_vector_step.into()] },
+            per_profile: false,
+            options: vec![
+                ("name".into(), "vector_count".into()),
+                ("value".into(), format!("count:{}", working_vectors)),
+            ],
+        });
+    }
 
     // sort (lexicographic sort + duplicate detection as byproduct)
     if let Artifact::Materialized { .. } = &slots.sort {
@@ -387,7 +570,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, output_dir: &std::path::
             per_profile: false,
             options: {
                 let mut opts = vec![
-                    ("source".into(), slots.all_vectors.path().into()),
+                    ("source".into(), working_vectors.clone()),
                     ("output".into(), "${cache}/sorted_ordinals.ivec".into()),
                     ("duplicates".into(), "${cache}/dedup_duplicates.ivec".into()),
                     ("report".into(), "${cache}/dedup_report.json".into()),
@@ -430,7 +613,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, output_dir: &std::path::
             after,
             per_profile: false,
             options: vec![
-                ("source".into(), slots.all_vectors.path().into()),
+                ("source".into(), working_vectors.clone()),
                 ("index".into(), slots.sort.path().into()),
                 ("output".into(), "${cache}/zero_ordinals.ivec".into()),
             ],
@@ -491,6 +674,11 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, output_dir: &std::path::
         });
     }
 
+    // Was the subset already applied by the subset-vectors or convert step?
+    // When true, clean_count is already fractioned — don't apply base_end.
+    let subset_applied = last_vector_step == "subset-vectors"
+        || (slots.all_vectors.is_materialized() && args.base_fraction < 1.0 && !args.pedantic_dedup);
+
     // ── Query chain (self-search) ────────────────────────────────────
     if slots.self_search {
         if let Some(ref shuffle) = slots.shuffle {
@@ -507,17 +695,25 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, output_dir: &std::path::
                 } else {
                     "${vector_count}".to_string()
                 };
+                let mut shuffle_opts = vec![
+                    ("output".into(), "${cache}/shuffle.ivec".into()),
+                    ("interval".into(), shuffle_interval),
+                    ("seed".into(), format!("${{{}}}", "seed")),
+                ];
+                // When clean_ordinals exists, pass it so the shuffle
+                // permutes actual source ordinals (not [0, N) indices).
+                // This ensures the extract steps get valid source ordinals
+                // that exclude duplicates and zero vectors.
+                if slots.clean_ordinals.is_materialized() {
+                    shuffle_opts.push(("ordinals".into(), slots.clean_ordinals.path().into()));
+                }
                 steps.push(Step {
                     id: "generate-shuffle".into(),
                     run: "generate shuffle".into(),
                     description: Some("Reproducible random split via Fisher-Yates shuffle".into()),
                     after: shuffle_after,
                     per_profile: false,
-                    options: vec![
-                        ("output".into(), "${cache}/shuffle.ivec".into()),
-                        ("interval".into(), shuffle_interval),
-                        ("seed".into(), format!("${{{}}}", "seed")),
-                    ],
+                    options: shuffle_opts,
                 });
             }
         }
@@ -529,33 +725,69 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, output_dir: &std::path::
                 } else {
                     vec![last_vector_step.into(), "generate-shuffle".into()]
                 };
-                let count_var = if slots.clean_ordinals.is_materialized() {
+                let total_var = if slots.clean_ordinals.is_materialized() {
                     "${clean_count}"
                 } else {
                     "${vector_count}"
                 };
+
+                // When base_fraction < 1.0, compute a capped base_end — BUT
+                // only if the subset step didn't already apply the fraction.
+                // If subset-vectors ran, clean_count is already fractioned.
+                let base_upper = if args.base_fraction < 1.0 && !subset_applied {
+                    let count_dep = if slots.clean_ordinals.is_materialized() {
+                        "count-clean"
+                    } else {
+                        "count-vectors"
+                    };
+                    // base_end = query_count + (total - query_count) * fraction
+                    // We use scale: expression which operates on the already-
+                    // interpolated variable value at runtime.
+                    steps.push(Step {
+                        id: "compute-base-end".into(),
+                        run: "state set".into(),
+                        description: Some(format!("Cap base set to {:.0}% of available vectors", args.base_fraction * 100.0)),
+                        after: vec![count_dep.into()],
+                        per_profile: false,
+                        options: vec![
+                            ("name".into(), "base_end".into()),
+                            ("value".into(), format!(
+                                "scale:{}*{}:round{}",
+                                total_var, args.base_fraction, args.round_digits,
+                            )),
+                        ],
+                    });
+                    "${base_end}"
+                } else {
+                    total_var
+                };
+
                 let mut query_opts = vec![
-                    ("source".into(), slots.all_vectors.path().into()),
+                    ("source".into(), working_vectors.clone()),
                     ("ivec-file".into(), "${cache}/shuffle.ivec".into()),
-                    ("output".into(), "profiles/base/query_vectors.mvec".into()),
+                    ("output".into(), slots.query_vectors.as_ref().map(|q| q.path().to_string()).unwrap_or_else(|| "profiles/base/query_vectors.fvec".into())),
                     ("range".into(), "[0,${query_count})".into()),
                 ];
                 if args.normalize {
                     query_opts.push(("normalize".into(), "true".into()));
                 }
+                let mut extract_deps = vec_deps.clone();
+                if args.base_fraction < 1.0 && !subset_applied {
+                    extract_deps.push("compute-base-end".into());
+                }
                 steps.push(Step {
                     id: "extract-queries".into(),
                     run: "transform extract".into(),
                     description: Some(format!("First {} shuffled vectors -> query set", args.query_count)),
-                    after: vec_deps.clone(),
+                    after: extract_deps.clone(),
                     per_profile: false,
                     options: query_opts,
                 });
                 let mut base_opts = vec![
-                    ("source".into(), slots.all_vectors.path().into()),
+                    ("source".into(), working_vectors.clone()),
                     ("ivec-file".into(), "${cache}/shuffle.ivec".into()),
-                    ("output".into(), "profiles/base/base_vectors.mvec".into()),
-                    ("range".into(), format!("[${{query_count}},{})", count_var)),
+                    ("output".into(), slots.base_vectors.path().into()),
+                    ("range".into(), format!("[${{query_count}},{})", base_upper)),
                 ];
                 if args.normalize {
                     base_opts.push(("normalize".into(), "true".into()));
@@ -563,8 +795,12 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, output_dir: &std::path::
                 steps.push(Step {
                     id: "extract-base".into(),
                     run: "transform extract".into(),
-                    description: Some("Remainder of shuffled vectors -> base set".into()),
-                    after: vec_deps,
+                    description: Some(if args.base_fraction < 1.0 {
+                        format!("Shuffled vectors -> base set ({:.0}%)", args.base_fraction * 100.0)
+                    } else {
+                        "Remainder of shuffled vectors -> base set".into()
+                    }),
+                    after: extract_deps,
                     per_profile: false,
                     options: base_opts,
                 });
@@ -576,7 +812,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, output_dir: &std::path::
                     per_profile: false,
                     options: vec![
                         ("name".into(), "base_count".into()),
-                        ("value".into(), "count:profiles/base/base_vectors.mvec".into()),
+                        ("value".into(), format!("count:{}", slots.base_vectors.path())),
                     ],
                 });
             }
@@ -612,18 +848,26 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, output_dir: &std::path::
             let format = VecFormat::detect(meta_source)
                 .map(|f| f.name().to_string())
                 .unwrap_or_else(|| "parquet".into());
+            let mut meta_opts = vec![
+                ("facet".into(), "metadata_content".into()),
+                ("source".into(), relativize_path(meta_source, &args.output)),
+                ("from".into(), format),
+                ("output".into(), "${cache}/metadata_all.slab".into()),
+            ];
+            // When base_fraction < 1.0, only import metadata for the same
+            // ordinal range as the base vectors. This preserves pairwise
+            // ordinal alignment and avoids importing 100x more metadata
+            // than needed.
+            if args.base_fraction < 1.0 && !args.pedantic_dedup {
+                meta_opts.push(("fraction".into(), args.base_fraction.to_string()));
+            }
             steps.push(Step {
                 id: "convert-metadata".into(),
                 run: "transform convert".into(),
                 description: Some("Import metadata from source format".into()),
                 after: vec![],
                 per_profile: false,
-                options: vec![
-                    ("facet".into(), "metadata_content".into()),
-                    ("source".into(), relativize_path(meta_source, &args.output)),
-                    ("from".into(), format),
-                    ("output".into(), "${cache}/metadata_all.slab".into()),
-                ],
+                options: meta_opts,
             });
         }
 
@@ -635,6 +879,9 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, output_dir: &std::path::
             if slots.shuffle.as_ref().map(|s| s.is_materialized()).unwrap_or(false) {
                 after.push("generate-shuffle".into());
             }
+            if args.base_fraction < 1.0 && !subset_applied {
+                after.push("compute-base-end".into());
+            }
             steps.push(Step {
                 id: "extract-metadata".into(),
                 run: "transform extract".into(),
@@ -645,7 +892,13 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, output_dir: &std::path::
                     ("source".into(), meta.metadata_all.path().into()),
                     ("ivec-file".into(), "${cache}/shuffle.ivec".into()),
                     ("output".into(), "profiles/base/metadata_content.slab".into()),
-                    ("range".into(), "[${query_count},${vector_count})".into()),
+                    ("range".into(), if args.base_fraction < 1.0 && !subset_applied {
+                        "[${query_count},${base_end})".into()
+                    } else if slots.clean_ordinals.is_materialized() {
+                        "[${query_count},${clean_count})".into()
+                    } else {
+                        "[${query_count},${vector_count})".into()
+                    }),
                 ],
             });
         }
@@ -705,6 +958,8 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, output_dir: &std::path::
                 ("selectivity".into(), "0.0001".into()),
                 ("range".into(), if slots.base_count.is_some() {
                     "[0,${base_end})".into()
+                } else if slots.clean_ordinals.is_materialized() {
+                    "[0,${clean_count})".into()
                 } else {
                     "[0,${vector_count})".into()
                 }),
@@ -1439,6 +1694,9 @@ fn write_import_log(
     let _ = writeln!(w, "  dedup:          {}", !args.no_dedup);
     let _ = writeln!(w, "  zero_check:     {}", !args.no_zero_check);
     let _ = writeln!(w, "  filtered_knn:   {}", !args.no_filtered);
+    if args.base_fraction < 1.0 {
+        let _ = writeln!(w, "  base_fraction:  {:.0}%", args.base_fraction * 100.0);
+    }
     let _ = writeln!(w, "  compress_cache: {}", args.compress_cache);
     if let Some(ref sp) = args.sized_profiles {
         let _ = writeln!(w, "  sized_profiles: {}", sp);
@@ -1598,6 +1856,26 @@ pub fn detect_normalized(path: &Path) -> Option<(bool, usize, f64)> {
     Some((is_normalized, norms.len(), mean))
 }
 
+/// Detect the likely distance metric from vector data.
+///
+/// Heuristic:
+/// - If vectors are L2-normalized → Cosine (norms ≈ 1.0)
+/// - Otherwise → Cosine (safest default; L2 and Cosine rankings are
+///   identical for normalized data, and Cosine is more commonly expected)
+///
+/// Returns the metric name and a human-readable reason.
+pub fn detect_metric(path: &Path) -> (String, String) {
+    if let Some((is_normalized, _n, mean_norm)) = detect_normalized(path) {
+        if is_normalized {
+            ("Cosine".to_string(), format!("vectors are L2-normalized (mean norm={:.4})", mean_norm))
+        } else {
+            ("Cosine".to_string(), format!("default (vectors not normalized, mean norm={:.4})", mean_norm))
+        }
+    } else {
+        ("Cosine".to_string(), "default (could not probe vectors)".to_string())
+    }
+}
+
 /// Make a path relative to a base directory. If the path can't be made
 /// relative (different root), returns the original path as a string.
 fn relativize_path(path: &Path, base: &Path) -> String {
@@ -1695,6 +1973,10 @@ mod tests {
             query_convert_format: None,
             compress_cache: true,
             sized_profiles: None,
+            base_fraction: 1.0,
+            required_facets: None,
+            round_digits: 2,
+            pedantic_dedup: false,
         }
     }
 

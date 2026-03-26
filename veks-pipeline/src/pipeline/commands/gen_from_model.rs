@@ -280,6 +280,13 @@ is proprietary or too large to distribute.
 
         match generate_from_model_fvec(&output_path, model.dimensions, count, &samplers, &mut data_rng) {
             Ok(()) => {
+                // Write verified count for the bound checker
+                let var_name = format!("verified_count:{}",
+                    output_path.file_name().and_then(|n| n.to_str()).unwrap_or("output"));
+                let _ = crate::pipeline::variables::set_and_save(
+                    &ctx.workspace, &var_name, &count.to_string());
+                ctx.defaults.insert(var_name, count.to_string());
+
                 let uv_info = model
                     .unique_vectors
                     .map(|n| format!(", model trained on {} unique vectors", n))

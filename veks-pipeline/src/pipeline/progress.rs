@@ -37,6 +37,12 @@ pub struct ProgressLog {
     #[serde(default)]
     pub schema_version: u32,
 
+    /// Hash of the dataset.yaml content at the time steps were recorded.
+    /// When the config changes, all steps are invalidated because cached
+    /// artifacts may be stale (e.g., fraction changed from 100% to 1%).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_hash: Option<String>,
+
     /// Per-step execution records, keyed by step ID.
     #[serde(default)]
     pub steps: HashMap<String, StepRecord>,
@@ -142,6 +148,7 @@ impl ProgressLog {
             Ok((ProgressLog {
                 path: Some(path.to_path_buf()),
                 schema_version: PROGRESS_SCHEMA_VERSION,
+                config_hash: None,
                 steps: HashMap::new(),
             }, None))
         }
@@ -167,6 +174,33 @@ impl ProgressLog {
                 rel(source_path), rel(log_path), count,
             ))
         } else {
+            None
+        }
+    }
+
+    /// Check if the dataset.yaml content has changed since the progress
+    /// log was last written. If so, invalidate all steps because cached
+    /// artifacts may be stale (e.g., fraction changed from 100% to 1%).
+    ///
+    /// Returns a message if steps were invalidated, None if unchanged.
+    pub fn invalidate_if_config_changed(&mut self, dataset_path: &Path) -> Option<String> {
+        let content = std::fs::read_to_string(dataset_path).ok()?;
+        let hash = simple_hash(&content);
+
+        if let Some(ref stored) = self.config_hash {
+            if *stored == hash {
+                return None; // unchanged
+            }
+            let count = self.steps.len();
+            self.steps.clear();
+            self.config_hash = Some(hash);
+            Some(format!(
+                "Config changed (dataset.yaml hash differs) — {} step records invalidated",
+                count,
+            ))
+        } else {
+            // First run or old progress log without hash — store it
+            self.config_hash = Some(hash);
             None
         }
     }
@@ -248,6 +282,12 @@ impl ProgressLog {
             Some(r) if r.status == Status::Ok => r,
             _ => return Some("not recorded or failed".to_string()),
         };
+
+        // If the step was skipped by the bound checker (never actually ran),
+        // don't trust the record — force the bound checker to re-validate.
+        if record.elapsed_secs == 0.0 && record.outputs.is_empty() {
+            return Some("previous run was a bound-check skip, re-validating".to_string());
+        }
 
         // Check whether resolved options changed since the last run
         if let Some(current) = current_options {
@@ -338,6 +378,17 @@ impl ProgressLog {
 
 /// Resolve a path that may be relative, using the workspace as the base
 /// directory when provided.
+/// Fast non-cryptographic hash for change detection.
+/// Uses FNV-1a (64-bit) — deterministic, no external dependency.
+fn simple_hash(content: &str) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325; // FNV offset basis
+    for byte in content.bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3); // FNV prime
+    }
+    format!("{:016x}", hash)
+}
+
 fn resolve_path(value: &str, workspace: Option<&Path>) -> PathBuf {
     let p = Path::new(value);
     if p.is_absolute() {
@@ -708,5 +759,76 @@ mod tests {
         assert!(msg.unwrap().contains("schema version changed"));
         assert!(log.steps.is_empty(), "steps should be cleared on version mismatch");
         assert_eq!(log.schema_version, PROGRESS_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn test_config_hash_first_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let yaml = tmp.path().join("dataset.yaml");
+        std::fs::write(&yaml, "name: test\nsteps: []").unwrap();
+
+        let mut log = ProgressLog::new();
+        assert!(log.config_hash.is_none());
+
+        // First run: hash is stored, no invalidation
+        let msg = log.invalidate_if_config_changed(&yaml);
+        assert!(msg.is_none(), "first run should not invalidate");
+        assert!(log.config_hash.is_some());
+    }
+
+    #[test]
+    fn test_config_hash_unchanged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let yaml = tmp.path().join("dataset.yaml");
+        std::fs::write(&yaml, "name: test\nsteps: []").unwrap();
+
+        let mut log = ProgressLog::new();
+        log.invalidate_if_config_changed(&yaml); // store hash
+
+        // Add a step record
+        log.record_step("step1", StepRecord {
+            status: Status::Ok,
+            message: "done".into(),
+            completed_at: Utc::now(),
+            elapsed_secs: 1.0,
+            outputs: vec![],
+            resolved_options: HashMap::new(),
+            error: None,
+            resource_summary: None,
+        });
+
+        // Same content: no invalidation
+        let msg = log.invalidate_if_config_changed(&yaml);
+        assert!(msg.is_none(), "unchanged config should not invalidate");
+        assert_eq!(log.steps.len(), 1, "steps should be preserved");
+    }
+
+    #[test]
+    fn test_config_hash_changed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let yaml = tmp.path().join("dataset.yaml");
+        std::fs::write(&yaml, "name: test\nsteps: []").unwrap();
+
+        let mut log = ProgressLog::new();
+        log.invalidate_if_config_changed(&yaml); // store hash
+
+        log.record_step("step1", StepRecord {
+            status: Status::Ok,
+            message: "done".into(),
+            completed_at: Utc::now(),
+            elapsed_secs: 1.0,
+            outputs: vec![],
+            resolved_options: HashMap::new(),
+            error: None,
+            resource_summary: None,
+        });
+
+        // Change the config
+        std::fs::write(&yaml, "name: test\nsteps: []\nfraction: 0.01").unwrap();
+
+        let msg = log.invalidate_if_config_changed(&yaml);
+        assert!(msg.is_some(), "changed config should invalidate");
+        assert!(log.steps.is_empty(), "steps should be cleared");
+        assert!(msg.unwrap().contains("Config changed"));
     }
 }

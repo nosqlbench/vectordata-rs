@@ -20,6 +20,8 @@
 
 pub mod event;
 pub mod handle;
+pub mod headless_sink;
+pub mod logging_sink;
 pub mod plain_sink;
 pub mod ratatui_sink;
 pub mod sink;
@@ -28,6 +30,8 @@ pub mod test_sink;
 // Re-export the types that most callers need.
 pub use event::{ProgressId, ProgressKind, ResourceMetrics, UiEvent};
 pub use handle::{ProgressHandle, UiHandle};
+pub use headless_sink::HeadlessSink;
+pub use logging_sink::install_logger;
 pub use plain_sink::PlainSink;
 pub use ratatui_sink::RatatuiSink;
 pub use sink::UiSink;

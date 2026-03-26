@@ -386,7 +386,7 @@ struct RenderState {
     suspended: bool,
     dirty: bool,
     /// Recent log messages for the bottom log window.
-    recent_logs: std::collections::VecDeque<String>,
+    recent_logs: Vec<String>,
 }
 
 impl RenderState {
@@ -430,7 +430,7 @@ impl RenderState {
             pause_redraw_pending: false,
             suspended: false,
             dirty: false,
-            recent_logs: std::collections::VecDeque::with_capacity(8),
+            recent_logs: Vec::new(),
         }
     }
 
@@ -462,7 +462,9 @@ impl RenderState {
         };
         let status_lines = extra_line + chart_lines;
         let paused_line = if self.paused { 1 } else { 0 };
-        let log_lines = self.recent_logs.len().min(6) as u16;
+        // Log pane fills remaining space — no fixed cap. The layout
+        // gives it Min(1) and it scrolls internally.
+        let log_lines = 0u16; // 0 = use Min constraint instead of fixed Length
         context_line + bar_lines + top_panel_lines + status_lines + paused_line + log_lines
     }
 }
@@ -470,13 +472,18 @@ impl RenderState {
 /// Restore the terminal to a usable state: show cursor, disable raw mode,
 /// and flush stdout.
 fn restore_terminal<B: ratatui::backend::Backend + io::Write>(terminal: &mut Terminal<B>) {
+    // Leave raw mode first so the terminal processes escape sequences normally
+    let _ = disable_raw_mode();
     let _ = crossterm::execute!(
         terminal.backend_mut(),
         crossterm::terminal::LeaveAlternateScreen,
         cursor::Show,
+        // Move cursor to start of line and clear below to prevent
+        // TUI frame artifacts from bleeding into the normal screen
+        crossterm::cursor::MoveToColumn(0),
+        crossterm::terminal::Clear(crossterm::terminal::ClearType::FromCursorDown),
     );
     let _ = io::Write::flush(terminal.backend_mut());
-    let _ = disable_raw_mode();
 }
 
 /// Main render loop running on the background thread.
@@ -705,10 +712,7 @@ fn process_msg(
         UiEvent::Log { message } => {
             logs.push(message.clone());
             // Keep recent logs for the TUI log window
-            if state.recent_logs.len() >= 6 {
-                state.recent_logs.pop_front();
-            }
-            state.recent_logs.push_back(message.clone());
+            state.recent_logs.push(message.clone());
             state.dirty = true;
         }
 
@@ -792,7 +796,8 @@ fn process_msg(
                 state.pgfault_history.push(0.0);
             }
             state.prev_major_faults = major;
-            state.pgfault_readout = format!("{}/{}", m.major_faults, m.minor_faults);
+            state.pgfault_readout = format!("major:{} minor:{}",
+                format_count(m.major_faults), format_count(m.minor_faults));
 
             // Alert state
             if m.emergency {
@@ -1030,16 +1035,21 @@ fn draw_progress<B: ratatui::backend::Backend>(
         let chrome = context_lines + bar_lines + extra_lines + paused_lines + chart_height;
         let remaining = area.height.saturating_sub(chrome);
 
-        // Top panel: 20 lines or 1/3 of remaining, whichever is greater
+        // Reserve minimum space for the log pane
+        let min_log_lines: u16 = 6;
+
+        // Top panel: 20 lines or 1/3 of remaining, whichever is greater,
+        // but always leave room for the log pane
         let top_height: u16 = if has_top_panel {
+            let max_top = remaining.saturating_sub(min_log_lines);
             let third = remaining / 3;
-            third.max(20).min(remaining.saturating_sub(4)) // leave at least some room for logs
+            third.max(12).min(max_top)
         } else {
             0
         };
 
-        // Log window: everything left over
-        let log_height = remaining.saturating_sub(top_height);
+        // Log window: everything left over (at least min_log_lines)
+        let log_height = remaining.saturating_sub(top_height).max(min_log_lines.min(remaining));
 
         let mut constraints: Vec<Constraint> = Vec::new();
 
@@ -1176,9 +1186,12 @@ fn draw_progress<B: ratatui::backend::Backend>(
             idx += 1;
         }
 
-        // Log window at the bottom — recent log messages
+        // Log window at the bottom — show the last N lines that fit
         if has_logs && idx < chunks.len() {
+            let visible_height = chunks[idx].height as usize;
+            let skip = state.recent_logs.len().saturating_sub(visible_height);
             let log_lines: Vec<Line> = state.recent_logs.iter()
+                .skip(skip)
                 .map(|s| colorize_log(s))
                 .collect();
             let log_widget = Paragraph::new(log_lines)

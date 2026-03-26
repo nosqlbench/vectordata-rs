@@ -1,0 +1,539 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1540" height="810" font-family="Helvetica, Arial, sans-serif">
+  <rect width="1540" height="810" fill="white" />
+  <defs>
+    <marker id="arrow-42a5f5" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6" fill="#42a5f5" />
+    </marker>
+    <marker id="arrow-4caf50" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6" fill="#4caf50" />
+    </marker>
+    <marker id="arrow-ab47bc" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6" fill="#ab47bc" />
+    </marker>
+    <marker id="arrow-ef5350" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6" fill="#ef5350" />
+    </marker>
+    <marker id="arrow-ffa726" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6" fill="#ffa726" />
+    </marker>
+  </defs>
+  <rect x="90" y="62" width="170" height="728" fill="#f0f8f0" />
+  <line x1="90" y1="62" x2="90" y2="790" stroke="#4caf50" opacity="0.15" />
+  <rect x="260" y="62" width="170" height="728" fill="#eef5fc" />
+  <line x1="260" y1="62" x2="260" y2="790" stroke="#42a5f5" opacity="0.15" />
+  <rect x="430" y="62" width="170" height="728" fill="#fef6ec" />
+  <line x1="430" y1="62" x2="430" y2="790" stroke="#ffa726" opacity="0.15" />
+  <rect x="600" y="62" width="170" height="728" fill="#fef6ec" />
+  <line x1="600" y1="62" x2="600" y2="790" stroke="#ffa726" opacity="0.15" />
+  <rect x="770" y="62" width="170" height="728" fill="#f6eff9" />
+  <line x1="770" y1="62" x2="770" y2="790" stroke="#ab47bc" opacity="0.15" />
+  <rect x="940" y="62" width="170" height="728" fill="#f6eff9" />
+  <line x1="940" y1="62" x2="940" y2="790" stroke="#ab47bc" opacity="0.15" />
+  <rect x="1110" y="62" width="170" height="728" fill="#f6eff9" />
+  <line x1="1110" y1="62" x2="1110" y2="790" stroke="#ab47bc" opacity="0.15" />
+  <rect x="1280" y="62" width="170" height="728" fill="#fcf0f2" />
+  <line x1="1280" y1="62" x2="1280" y2="790" stroke="#ef5350" opacity="0.15" />
+  <line x1="1450" y1="62" x2="1450" y2="790" stroke="#ef5350" opacity="0.15" />
+  <text x="90" y="22" font-size="9" fill="#888" font-style="italic">optional user-provided inputs (bypass pipeline when present)</text>
+  <g>
+    <title>--base-vectors: Source vector data. Can be fvec/mvec (native), npy dir (foreign), or parquet.
+When native xvec: identity (symlink), no conversion step.
+When foreign: convert step runs to produce all_vectors.mvec.</title>
+    <polygon points="110,28 248,28 240,58 102,58" fill="#f0f8f0" stroke="#4caf50" stroke-width="1.5" stroke-dasharray="4,3" />
+    <text x="175" y="40" text-anchor="middle" font-size="9" fill="#555">vector source</text>
+    <text x="175" y="51" text-anchor="middle" font-size="9" fill="#555">(fvec/npy/dir)</text>
+  </g>
+  <line x1="175" y1="58" x2="175" y2="68" stroke="#4caf50" stroke-width="1.5" stroke-dasharray="4,3" />
+  <polyline points="240,43 245,43 245,762" fill="none" stroke="#4caf50" stroke-width="1" stroke-dasharray="4,3" opacity="0.5" />
+  <text x="242" y="398" text-anchor="end" font-size="7" fill="#4caf50" opacity="0.6">identity</text>
+  <g>
+    <title>--query-vectors: Separate query vector file.
+When provided: no shuffle or extraction needed — queries used directly.
+When absent + self-search: queries extracted from base via shuffle.</title>
+    <polygon points="280,28 418,28 410,58 272,58" fill="#eef5fc" stroke="#42a5f5" stroke-width="1.5" stroke-dasharray="4,3" />
+    <text x="345" y="40" text-anchor="middle" font-size="9" fill="#555">query vectors</text>
+    <text x="345" y="51" text-anchor="middle" font-size="9" fill="#555">(fvec/mvec)</text>
+  </g>
+  <line x1="345" y1="58" x2="345" y2="68" stroke="#42a5f5" stroke-width="1.5" stroke-dasharray="4,3" />
+  <polyline points="410,43 415,43 415,762" fill="none" stroke="#42a5f5" stroke-width="1" stroke-dasharray="4,3" opacity="0.5" />
+  <text x="412" y="398" text-anchor="end" font-size="7" fill="#42a5f5" opacity="0.6">identity</text>
+  <g>
+    <title>--ground-truth: Pre-computed KNN ground truth indices.
+When provided: compute-knn step is elided (identity).
+verify-knn still runs to validate the provided GT.</title>
+    <polygon points="450,28 588,28 580,58 442,58" fill="#fef6ec" stroke="#ffa726" stroke-width="1.5" stroke-dasharray="4,3" />
+    <text x="515" y="40" text-anchor="middle" font-size="9" fill="#555">GT indices</text>
+    <text x="515" y="51" text-anchor="middle" font-size="9" fill="#555">(ivec)</text>
+  </g>
+  <line x1="515" y1="58" x2="515" y2="68" stroke="#ffa726" stroke-width="1.5" stroke-dasharray="4,3" />
+  <polyline points="580,43 585,43 585,762" fill="none" stroke="#ffa726" stroke-width="1" stroke-dasharray="4,3" opacity="0.5" />
+  <text x="582" y="398" text-anchor="end" font-size="7" fill="#ffa726" opacity="0.6">identity</text>
+  <g>
+    <title>--ground-truth-distances: Pre-computed KNN distances.
+Paired with GT indices. When provided: distances artifact is identity.</title>
+    <polygon points="620,28 758,28 750,58 612,58" fill="#fef6ec" stroke="#ffa726" stroke-width="1.5" stroke-dasharray="4,3" />
+    <text x="685" y="40" text-anchor="middle" font-size="9" fill="#555">GT distances</text>
+    <text x="685" y="51" text-anchor="middle" font-size="9" fill="#555">(fvec)</text>
+  </g>
+  <line x1="685" y1="58" x2="685" y2="68" stroke="#ffa726" stroke-width="1.5" stroke-dasharray="4,3" />
+  <polyline points="750,43 755,43 755,762" fill="none" stroke="#ffa726" stroke-width="1" stroke-dasharray="4,3" opacity="0.5" />
+  <text x="752" y="398" text-anchor="end" font-size="7" fill="#ffa726" opacity="0.6">identity</text>
+  <g>
+    <title>--metadata: Metadata source for predicate-filtered search.
+When slab: identity (no conversion).
+When parquet/dir: convert step produces metadata_all.slab.</title>
+    <polygon points="790,28 928,28 920,58 782,58" fill="#f6eff9" stroke="#ab47bc" stroke-width="1.5" stroke-dasharray="4,3" />
+    <text x="855" y="40" text-anchor="middle" font-size="9" fill="#555">metadata</text>
+    <text x="855" y="51" text-anchor="middle" font-size="9" fill="#555">(slab/parquet)</text>
+  </g>
+  <line x1="855" y1="58" x2="855" y2="68" stroke="#ab47bc" stroke-width="1.5" stroke-dasharray="4,3" />
+  <polyline points="920,43 925,43 925,762" fill="none" stroke="#ab47bc" stroke-width="1" stroke-dasharray="4,3" opacity="0.5" />
+  <text x="922" y="398" text-anchor="end" font-size="7" fill="#ab47bc" opacity="0.6">identity</text>
+  <g>
+    <title>User-provided predicates slab.
+When provided: generate-predicates step is elided.
+Rare — usually predicates are synthesized from the metadata survey.</title>
+    <polygon points="960,28 1098,28 1090,58 952,58" fill="#f6eff9" stroke="#ab47bc" stroke-width="1.5" stroke-dasharray="4,3" />
+    <text x="1025" y="40" text-anchor="middle" font-size="9" fill="#555">predicates</text>
+    <text x="1025" y="51" text-anchor="middle" font-size="9" fill="#555">(slab)</text>
+  </g>
+  <line x1="1025" y1="58" x2="1025" y2="68" stroke="#ab47bc" stroke-width="1.5" stroke-dasharray="4,3" />
+  <polyline points="1090,43 1095,43 1095,762" fill="none" stroke="#ab47bc" stroke-width="1" stroke-dasharray="4,3" opacity="0.5" />
+  <text x="1092" y="398" text-anchor="end" font-size="7" fill="#ab47bc" opacity="0.6">identity</text>
+  <g>
+    <title>User-provided predicate evaluation results.
+When provided: evaluate-predicates step is elided.
+Rare — usually computed by the pipeline.</title>
+    <polygon points="1130,28 1268,28 1260,58 1122,58" fill="#f6eff9" stroke="#ab47bc" stroke-width="1.5" stroke-dasharray="4,3" />
+    <text x="1195" y="40" text-anchor="middle" font-size="9" fill="#555">pred results</text>
+    <text x="1195" y="51" text-anchor="middle" font-size="9" fill="#555">(slab)</text>
+  </g>
+  <line x1="1195" y1="58" x2="1195" y2="68" stroke="#ab47bc" stroke-width="1.5" stroke-dasharray="4,3" />
+  <polyline points="1260,43 1265,43 1265,762" fill="none" stroke="#ab47bc" stroke-width="1" stroke-dasharray="4,3" opacity="0.5" />
+  <text x="1262" y="398" text-anchor="end" font-size="7" fill="#ab47bc" opacity="0.6">identity</text>
+  <g>
+    <title>User-provided filtered KNN ground truth.
+When provided: compute-filtered-knn step is elided.
+Rare — usually computed by the pipeline.</title>
+    <polygon points="1300,28 1438,28 1430,58 1292,58" fill="#fcf0f2" stroke="#ef5350" stroke-width="1.5" stroke-dasharray="4,3" />
+    <text x="1365" y="40" text-anchor="middle" font-size="9" fill="#555">filtered GT</text>
+    <text x="1365" y="51" text-anchor="middle" font-size="9" fill="#555">(ivec+fvec)</text>
+  </g>
+  <line x1="1365" y1="58" x2="1365" y2="68" stroke="#ef5350" stroke-width="1.5" stroke-dasharray="4,3" />
+  <polyline points="1430,43 1435,43 1435,762" fill="none" stroke="#ef5350" stroke-width="1" stroke-dasharray="4,3" opacity="0.5" />
+  <text x="1432" y="398" text-anchor="end" font-size="7" fill="#ef5350" opacity="0.6">identity</text>
+  <line x1="175" y1="168" x2="175" y2="180" stroke="#888" stroke-width="1.5" />
+  <line x1="175" y1="224" x2="175" y2="236" stroke="#888" stroke-width="1.5" />
+  <line x1="175" y1="280" x2="175" y2="292" stroke="#888" stroke-width="1.5" />
+  <line x1="175" y1="336" x2="175" y2="348" stroke="#888" stroke-width="1.5" />
+  <line x1="175" y1="392" x2="175" y2="404" stroke="#888" stroke-width="1.5" />
+  <line x1="175" y1="448" x2="175" y2="460" stroke="#888" stroke-width="1.5" />
+  <line x1="175" y1="504" x2="175" y2="516" stroke="#888" stroke-width="1.5" />
+  <line x1="175" y1="560" x2="175" y2="572" stroke="#888" stroke-width="1.5" />
+  <line x1="855" y1="168" x2="855" y2="180" stroke="#888" stroke-width="1.5" />
+  <line x1="855" y1="168" x2="855" y2="460" stroke="#888" stroke-width="1.5" />
+  <line x1="1025" y1="280" x2="1025" y2="740" stroke="#888" stroke-width="1.5" />
+  <line x1="1195" y1="504" x2="1195" y2="740" stroke="#888" stroke-width="1.5" />
+  <line x1="515" y1="672" x2="515" y2="684" stroke="#888" stroke-width="1.5" />
+  <line x1="1365" y1="672" x2="1365" y2="684" stroke="#888" stroke-width="1.5" />
+  <line x1="175" y1="616" x2="175" y2="740" stroke="#888" stroke-width="1.5" />
+  <line x1="855" y1="504" x2="855" y2="740" stroke="#888" stroke-width="1.5" />
+  <line x1="515" y1="728" x2="515" y2="740" stroke="#888" stroke-width="1.5" />
+  <line x1="345" y1="560" x2="345" y2="740" stroke="#888" stroke-width="1.5" />
+  <line x1="1365" y1="728" x2="1365" y2="740" stroke="#888" stroke-width="1.5" />
+  <polyline points="855,224 855,230 1025,230 1025,236" fill="none" stroke="#ab47bc" stroke-width="1.5" stroke-dasharray="5,3" marker-end="url(#arrow-ab47bc)" />
+  <text x="940" y="226" text-anchor="middle" font-size="9" fill="#ab47bc">schema</text>
+  <polyline points="175,504 175,510 345,510 345,516" fill="none" stroke="#42a5f5" stroke-width="1.5" stroke-dasharray="5,3" marker-end="url(#arrow-42a5f5)" />
+  <text x="260" y="506" text-anchor="middle" font-size="9" fill="#42a5f5">shuffle</text>
+  <line x1="248" y1="482" x2="782" y2="482" stroke="#ab47bc" stroke-width="1.5" stroke-dasharray="5,3" marker-end="url(#arrow-ab47bc)" />
+  <text x="515" y="478" text-anchor="middle" font-size="9" fill="#ab47bc">ordinals</text>
+  <line x1="928" y1="482" x2="1122" y2="482" stroke="#ab47bc" stroke-width="1.5" stroke-dasharray="5,3" marker-end="url(#arrow-ab47bc)" />
+  <polyline points="1025,280 1025,370 1195,370 1195,460" fill="none" stroke="#ab47bc" stroke-width="1.5" stroke-dasharray="5,3" marker-end="url(#arrow-ab47bc)" />
+  <text x="1110" y="366" text-anchor="middle" font-size="9" fill="#ab47bc">predicates</text>
+  <polyline points="175,616 175,622 515,622 515,628" fill="none" stroke="#ffa726" stroke-width="1.5" stroke-dasharray="5,3" marker-end="url(#arrow-ffa726)" />
+  <text x="345" y="618" text-anchor="middle" font-size="9" fill="#ffa726">base</text>
+  <polyline points="175,616 175,622 1365,622 1365,628" fill="none" stroke="#ef5350" stroke-width="1.5" stroke-dasharray="5,3" marker-end="url(#arrow-ef5350)" />
+  <text x="770" y="618" text-anchor="middle" font-size="9" fill="#ef5350">base</text>
+  <polyline points="515,672 515,706 685,706 685,740" fill="none" stroke="#ffa726" stroke-width="1.5" stroke-dasharray="5,3" marker-end="url(#arrow-ffa726)" />
+  <text x="600" y="702" text-anchor="middle" font-size="9" fill="#ffa726">paired</text>
+  <a href="02-data-model.md#28-dataset-facets" target="_top">
+    <rect x="102" y="68" width="146" height="44" rx="6" fill="#d7eed8" stroke="#4caf50" stroke-width="2" style="cursor:pointer" />
+    <text x="175" y="84" text-anchor="middle" font-size="11" font-weight="bold">B</text>
+    <text x="175" y="98" text-anchor="middle" font-size="9">Base Vectors</text>
+  </a>
+  <a href="02-data-model.md#28-dataset-facets" target="_top">
+    <rect x="272" y="68" width="146" height="44" rx="6" fill="#d4e6f7" stroke="#42a5f5" stroke-width="2" style="cursor:pointer" />
+    <text x="345" y="84" text-anchor="middle" font-size="11" font-weight="bold">Q</text>
+    <text x="345" y="98" text-anchor="middle" font-size="9">Query Vectors</text>
+  </a>
+  <a href="02-data-model.md#28-dataset-facets" target="_top">
+    <rect x="442" y="68" width="146" height="44" rx="6" fill="#fce8c8" stroke="#ffa726" stroke-width="2" style="cursor:pointer" />
+    <text x="515" y="84" text-anchor="middle" font-size="11" font-weight="bold">G</text>
+    <text x="515" y="98" text-anchor="middle" font-size="9">GT Indices</text>
+  </a>
+  <a href="02-data-model.md#28-dataset-facets" target="_top">
+    <rect x="612" y="68" width="146" height="44" rx="6" fill="#fce8c8" stroke="#ffa726" stroke-width="2" style="cursor:pointer" />
+    <text x="685" y="84" text-anchor="middle" font-size="11" font-weight="bold">D</text>
+    <text x="685" y="98" text-anchor="middle" font-size="9">GT Distances</text>
+  </a>
+  <a href="02-data-model.md#28-dataset-facets" target="_top">
+    <rect x="782" y="68" width="146" height="44" rx="6" fill="#e8d5f0" stroke="#ab47bc" stroke-width="2" style="cursor:pointer" />
+    <text x="855" y="84" text-anchor="middle" font-size="11" font-weight="bold">M</text>
+    <text x="855" y="98" text-anchor="middle" font-size="9">Metadata</text>
+  </a>
+  <a href="02-data-model.md#28-dataset-facets" target="_top">
+    <rect x="952" y="68" width="146" height="44" rx="6" fill="#e8d5f0" stroke="#ab47bc" stroke-width="2" style="cursor:pointer" />
+    <text x="1025" y="84" text-anchor="middle" font-size="11" font-weight="bold">P</text>
+    <text x="1025" y="98" text-anchor="middle" font-size="9">Predicates</text>
+  </a>
+  <a href="02-data-model.md#28-dataset-facets" target="_top">
+    <rect x="1122" y="68" width="146" height="44" rx="6" fill="#e8d5f0" stroke="#ab47bc" stroke-width="2" style="cursor:pointer" />
+    <text x="1195" y="84" text-anchor="middle" font-size="11" font-weight="bold">R</text>
+    <text x="1195" y="98" text-anchor="middle" font-size="9">Pred Results</text>
+  </a>
+  <a href="02-data-model.md#28-dataset-facets" target="_top">
+    <rect x="1292" y="68" width="146" height="44" rx="6" fill="#f5d5de" stroke="#ef5350" stroke-width="2" style="cursor:pointer" />
+    <text x="1365" y="84" text-anchor="middle" font-size="11" font-weight="bold">F</text>
+    <text x="1365" y="98" text-anchor="middle" font-size="9">Filtered KNN</text>
+  </a>
+  <g>
+    <title>transform convert: Convert source vectors (npy, parquet, dir) to native xvec format.
+Active when source is not already a native xvec file.
+Identity (symlink) when source is native fvec/mvec.
+fraction option limits how many records to convert when base_fraction &lt; 1.0.</title>
+    <rect x="102" y="124" width="146" height="44" rx="6" fill="#d7eed8" stroke="#4caf50" stroke-width="1.5" />
+    <text x="175" y="138" text-anchor="middle" font-size="11" fill="#333">convert</text>
+    <text x="175" y="151" text-anchor="middle" font-size="11" fill="#333">vectors</text>
+    <text x="175" y="164" text-anchor="middle" font-size="9" fill="#666">[foreign fmt]</text>
+  </g>
+  <g>
+    <title>transform convert: Convert metadata from parquet/dir to slab format.
+Active when source is not already a native .slab file.
+Identity (symlink) when source is native slab.</title>
+    <rect x="782" y="124" width="146" height="44" rx="6" fill="#e8d5f0" stroke="#ab47bc" stroke-width="1.5" />
+    <text x="855" y="138" text-anchor="middle" font-size="11" fill="#333">convert</text>
+    <text x="855" y="151" text-anchor="middle" font-size="11" fill="#333">metadata</text>
+    <text x="855" y="164" text-anchor="middle" font-size="9" fill="#666">[foreign fmt]</text>
+  </g>
+  <g>
+    <title>state set: Count records in all_vectors and store as ${vector_count} in variables.yaml.
+Always active when B facet is required.</title>
+    <rect x="102" y="180" width="146" height="44" rx="6" fill="#d7eed8" stroke="#4caf50" stroke-width="1.5" />
+    <text x="175" y="200" text-anchor="middle" font-size="11" fill="#333">count</text>
+    <text x="175" y="213" text-anchor="middle" font-size="11" fill="#333">vectors</text>
+  </g>
+  <g>
+    <title>analyze survey: Sample metadata to discover schema and value ranges.
+Produces metadata_survey.json used by predicate generation.
+Always active when M facet is required.</title>
+    <rect x="782" y="180" width="146" height="44" rx="6" fill="#e8d5f0" stroke="#ab47bc" stroke-width="1.5" />
+    <text x="855" y="200" text-anchor="middle" font-size="11" fill="#333">survey</text>
+    <text x="855" y="213" text-anchor="middle" font-size="11" fill="#333">metadata</text>
+  </g>
+  <g>
+    <title>compute sort: External merge-sort with adaptive prefix keys.
+Produces sorted_ordinals.ivec (lexicographic order) and dedup_duplicates.ivec.
+Uses prefix components (1-10 dims) to avoid full-vector comparisons.
+Elided when --no-dedup is set.</title>
+    <rect x="102" y="236" width="146" height="44" rx="6" fill="#d7eed8" stroke="#4caf50" stroke-width="1.5" />
+    <text x="175" y="256" text-anchor="middle" font-size="11" fill="#333">sort + dedup</text>
+    <text x="175" y="269" text-anchor="middle" font-size="9" fill="#666">[!no_dedup]</text>
+  </g>
+  <g>
+    <title>generate predicates: Synthesize test predicates from metadata survey.
+Produces predicates.slab with configurable count and selectivity.
+Always active when M facet is required.</title>
+    <rect x="952" y="236" width="146" height="44" rx="6" fill="#e8d5f0" stroke="#ab47bc" stroke-width="1.5" />
+    <text x="1025" y="256" text-anchor="middle" font-size="11" fill="#333">generate</text>
+    <text x="1025" y="269" text-anchor="middle" font-size="11" fill="#333">predicates</text>
+  </g>
+  <g>
+    <title>analyze zeros: Binary search the sorted ordinal index for the zero vector [0,0,...,0].
+Produces zero_ordinals.ivec listing ordinals of zero vectors.
+Elided when --no-zero-check is set.</title>
+    <rect x="102" y="292" width="146" height="44" rx="6" fill="#d7eed8" stroke="#4caf50" stroke-width="1.5" />
+    <text x="175" y="312" text-anchor="middle" font-size="11" fill="#333">find zeros</text>
+    <text x="175" y="325" text-anchor="middle" font-size="9" fill="#666">[!no_zero_check]</text>
+  </g>
+  <g>
+    <title>transform ordinals: Combine duplicate + zero exclusion lists, filter the sorted index.
+Produces clean_ordinals.ivec — the definitive set of ordinals used by shuffle and extraction.
+Elided when neither sort nor zeros is active.</title>
+    <rect x="102" y="348" width="146" height="44" rx="6" fill="#d7eed8" stroke="#4caf50" stroke-width="1.5" />
+    <text x="175" y="362" text-anchor="middle" font-size="11" fill="#333">filter</text>
+    <text x="175" y="375" text-anchor="middle" font-size="11" fill="#333">ordinals</text>
+    <text x="175" y="388" text-anchor="middle" font-size="9" fill="#666">[sort OR zeros]</text>
+  </g>
+  <g>
+    <title>state set: Compute base_end = scale:${clean_count}*fraction with rounding.
+Caps the extraction range so only a fraction of vectors become the base set.
+Elided when base_fraction = 1.0 (100%).</title>
+    <rect x="102" y="404" width="146" height="44" rx="6" fill="#d7eed8" stroke="#4caf50" stroke-width="1.5" />
+    <text x="175" y="418" text-anchor="middle" font-size="11" fill="#333">compute</text>
+    <text x="175" y="431" text-anchor="middle" font-size="11" fill="#333">base-end</text>
+    <text x="175" y="444" text-anchor="middle" font-size="9" fill="#666">[frac &lt; 1.0]</text>
+  </g>
+  <g>
+    <title>generate shuffle: Fisher-Yates permutation of the clean ordinals.
+Reads clean_ordinals.ivec so output contains actual source ordinals (not [0,N) indices).
+Deterministic given seed. Used by both vector and metadata extraction.
+Elided when separate query file is provided (no self-search).</title>
+    <rect x="102" y="460" width="146" height="44" rx="6" fill="#d7eed8" stroke="#4caf50" stroke-width="1.5" />
+    <text x="175" y="474" text-anchor="middle" font-size="11" fill="#333">generate</text>
+    <text x="175" y="487" text-anchor="middle" font-size="11" fill="#333">shuffle</text>
+    <text x="175" y="500" text-anchor="middle" font-size="9" fill="#666">[Q + self-search]</text>
+  </g>
+  <g>
+    <title>transform extract: Reorder metadata records to match shuffled base vectors.
+Uses the same shuffle as vector extraction to maintain ordinal congruency.
+Range: [query_count, base_end) or [query_count, clean_count).
+Elided when not self-search (metadata already ordinal-aligned).</title>
+    <rect x="782" y="460" width="146" height="44" rx="6" fill="#e8d5f0" stroke="#ab47bc" stroke-width="1.5" />
+    <text x="855" y="474" text-anchor="middle" font-size="11" fill="#333">extract</text>
+    <text x="855" y="487" text-anchor="middle" font-size="11" fill="#333">metadata</text>
+    <text x="855" y="500" text-anchor="middle" font-size="9" fill="#666">[self-search]</text>
+  </g>
+  <g>
+    <title>compute evaluate-predicates: Evaluate each predicate against metadata records.
+Produces metadata_indices.slab with matching record sets per predicate.
+Per-profile: range [0, base_end) matches the profile's base vector window.
+Always active when M facet is required.</title>
+    <rect x="1122" y="460" width="146" height="44" rx="6" fill="#e8d5f0" stroke="#ab47bc" stroke-width="1.5" />
+    <text x="1195" y="480" text-anchor="middle" font-size="11" fill="#333">evaluate</text>
+    <text x="1195" y="493" text-anchor="middle" font-size="11" fill="#333">predicates [pp]</text>
+  </g>
+  <g>
+    <title>transform extract: Extract base vectors from shuffled ordinals.
+Range: [query_count, base_end) — everything after the query split.
+Normalize option applies L2 normalization during extraction.
+Elided when not self-search (base = all_vectors directly).</title>
+    <rect x="102" y="516" width="146" height="44" rx="6" fill="#d7eed8" stroke="#4caf50" stroke-width="1.5" />
+    <text x="175" y="530" text-anchor="middle" font-size="11" fill="#333">extract</text>
+    <text x="175" y="543" text-anchor="middle" font-size="11" fill="#333">base</text>
+    <text x="175" y="556" text-anchor="middle" font-size="9" fill="#666">[Q + self-search]</text>
+  </g>
+  <g>
+    <title>transform extract: Extract query vectors from shuffled ordinals.
+Range: [0, query_count) — the first query_count entries of the shuffle.
+Normalize option applies L2 normalization during extraction.
+Elided when separate query file is provided.</title>
+    <rect x="272" y="516" width="146" height="44" rx="6" fill="#d4e6f7" stroke="#42a5f5" stroke-width="1.5" />
+    <text x="345" y="530" text-anchor="middle" font-size="11" fill="#333">extract</text>
+    <text x="345" y="543" text-anchor="middle" font-size="11" fill="#333">queries</text>
+    <text x="345" y="556" text-anchor="middle" font-size="9" fill="#666">[Q + self-search]</text>
+  </g>
+  <g>
+    <title>state set: Count records in base_vectors and store as ${base_count}.
+Used by compute-knn and compute-filtered-knn to set the search window.
+Always active when self-search produces base vectors.</title>
+    <rect x="102" y="572" width="146" height="44" rx="6" fill="#d7eed8" stroke="#4caf50" stroke-width="1.5" />
+    <text x="175" y="592" text-anchor="middle" font-size="11" fill="#333">count</text>
+    <text x="175" y="605" text-anchor="middle" font-size="11" fill="#333">base</text>
+  </g>
+  <g>
+    <title>compute knn: Brute-force exact K-nearest-neighbor computation.
+Per-profile: uses base_vectors[0..base_count) as corpus, query_vectors as input.
+Produces neighbor_indices.ivec and neighbor_distances.fvec (paired).
+Elided when pre-computed ground truth is provided.</title>
+    <rect x="442" y="628" width="146" height="44" rx="6" fill="#fce8c8" stroke="#ffa726" stroke-width="1.5" />
+    <text x="515" y="642" text-anchor="middle" font-size="11" fill="#333">compute</text>
+    <text x="515" y="655" text-anchor="middle" font-size="11" fill="#333">knn [pp]</text>
+    <text x="515" y="668" text-anchor="middle" font-size="9" fill="#666">[G + !precomputed]</text>
+  </g>
+  <g>
+    <title>compute filtered-knn: KNN with predicate pre-filtering.
+Per-profile: for each query, evaluates its predicate to get eligible base vectors,
+then computes KNN only among eligible vectors.
+Produces filtered_neighbor_indices.ivec and filtered_neighbor_distances.fvec.
+Active when F facet is required and --no-filtered is not set.</title>
+    <rect x="1292" y="628" width="146" height="44" rx="6" fill="#f5d5de" stroke="#ef5350" stroke-width="1.5" />
+    <text x="1365" y="642" text-anchor="middle" font-size="11" fill="#333">compute</text>
+    <text x="1365" y="655" text-anchor="middle" font-size="11" fill="#333">filtered-knn [pp]</text>
+    <text x="1365" y="668" text-anchor="middle" font-size="9" fill="#666">[F]</text>
+  </g>
+  <g>
+    <title>verify knn-groundtruth: Sparse-sample brute-force recomputation.
+Per-profile: randomly samples queries, recomputes KNN from scratch,
+and compares against the stored ground truth to detect corruption.
+Always active when G facet is required.</title>
+    <rect x="442" y="684" width="146" height="44" rx="6" fill="#fce8c8" stroke="#ffa726" stroke-width="1.5" />
+    <text x="515" y="698" text-anchor="middle" font-size="11" fill="#333">verify</text>
+    <text x="515" y="711" text-anchor="middle" font-size="11" fill="#333">knn [pp]</text>
+    <text x="515" y="724" text-anchor="middle" font-size="9" fill="#666">[G]</text>
+  </g>
+  <g>
+    <title>verify predicate-results: Sparse-sample SQLite-backed verification.
+Per-profile: loads metadata into SQLite, evaluates predicates via SQL,
+and compares against the pre-computed metadata_indices to detect mismatches.
+Active when F facet is required.</title>
+    <rect x="1292" y="684" width="146" height="44" rx="6" fill="#f5d5de" stroke="#ef5350" stroke-width="1.5" />
+    <text x="1365" y="698" text-anchor="middle" font-size="11" fill="#333">verify</text>
+    <text x="1365" y="711" text-anchor="middle" font-size="11" fill="#333">predicates [pp]</text>
+    <text x="1365" y="724" text-anchor="middle" font-size="9" fill="#666">[F]</text>
+  </g>
+  <g>
+    <title>Total records in all_vectors (pre-dedup, pre-zero-check).
+Used as shuffle interval when no cleaning is active.</title>
+    <rect x="24" y="194" width="72" height="16" rx="8" fill="white" stroke="#4caf50" stroke-width="1" opacity="0.9" />
+    <text x="60" y="206" text-anchor="middle" font-size="8" fill="#4caf50" font-style="italic">vector_count</text>
+    <line x1="102" y1="202" x2="96" y2="202" stroke="#4caf50" stroke-width="0.8" opacity="0.5" />
+  </g>
+  <g>
+    <title>Number of duplicate vectors found by sort+dedup.
+Informational — recorded in variables.yaml for reporting.</title>
+    <rect x="24" y="250" width="72" height="16" rx="8" fill="white" stroke="#4caf50" stroke-width="1" opacity="0.9" />
+    <text x="60" y="262" text-anchor="middle" font-size="8" fill="#4caf50" font-style="italic">duplicate_count</text>
+    <line x1="102" y1="258" x2="96" y2="258" stroke="#4caf50" stroke-width="0.8" opacity="0.5" />
+  </g>
+  <g>
+    <title>Number of zero vectors found by find-zeros.
+Informational — recorded in variables.yaml for reporting.</title>
+    <rect x="24" y="306" width="72" height="16" rx="8" fill="white" stroke="#4caf50" stroke-width="1" opacity="0.9" />
+    <text x="60" y="318" text-anchor="middle" font-size="8" fill="#4caf50" font-style="italic">zero_count</text>
+    <line x1="102" y1="314" x2="96" y2="314" stroke="#4caf50" stroke-width="0.8" opacity="0.5" />
+  </g>
+  <g>
+    <title>Records in clean_ordinals.ivec (post-dedup, post-zero-check).
+Used as shuffle interval and extraction range upper bound.
+clean_count = vector_count - duplicate_count - zero_count.</title>
+    <rect x="24" y="362" width="72" height="16" rx="8" fill="white" stroke="#4caf50" stroke-width="1" opacity="0.9" />
+    <text x="60" y="374" text-anchor="middle" font-size="8" fill="#4caf50" font-style="italic">clean_count</text>
+    <line x1="102" y1="370" x2="96" y2="370" stroke="#4caf50" stroke-width="0.8" opacity="0.5" />
+  </g>
+  <g>
+    <title>Capped extraction upper bound when base_fraction &lt; 1.0.
+Computed as scale:${clean_count}*fraction with --round-digits rounding.
+Used by extract-base, extract-queries, and extract-metadata ranges.</title>
+    <rect x="24" y="418" width="72" height="16" rx="8" fill="white" stroke="#4caf50" stroke-width="1" opacity="0.9" />
+    <text x="60" y="430" text-anchor="middle" font-size="8" fill="#4caf50" font-style="italic">base_end</text>
+    <line x1="102" y1="426" x2="96" y2="426" stroke="#4caf50" stroke-width="0.8" opacity="0.5" />
+  </g>
+  <g>
+    <title>Records in the extracted base_vectors file.
+base_count = base_end - query_count (or clean_count - query_count if no fraction).
+Used by compute-knn and compute-filtered-knn as the search window size.</title>
+    <rect x="24" y="586" width="72" height="16" rx="8" fill="white" stroke="#4caf50" stroke-width="1" opacity="0.9" />
+    <text x="60" y="598" text-anchor="middle" font-size="8" fill="#4caf50" font-style="italic">base_count</text>
+    <line x1="102" y1="594" x2="96" y2="594" stroke="#4caf50" stroke-width="0.8" opacity="0.5" />
+  </g>
+  <g>
+    <title>All imported vectors in native xvec format.
+Located at ${cache}/all_vectors.{ext}.
+May be a subset when fraction &lt; 1.0.</title>
+    <text x="175" y="172" text-anchor="middle" font-size="7" fill="#4caf50" font-style="italic" opacity="0.7">all_vectors.mvec</text>
+  </g>
+  <g>
+    <title>Lexicographically sorted ordinal index.
+Located at ${cache}/sorted_ordinals.ivec.
+Duplicate ordinals recorded in dedup_duplicates.ivec.</title>
+    <text x="175" y="284" text-anchor="middle" font-size="7" fill="#4caf50" font-style="italic" opacity="0.7">sorted_ordinals.ivec</text>
+  </g>
+  <g>
+    <title>Ordinals of zero vectors found by binary search.
+Located at ${cache}/zero_ordinals.ivec.
+May be empty (0 bytes) when no zeros exist.</title>
+    <text x="175" y="340" text-anchor="middle" font-size="7" fill="#4caf50" font-style="italic" opacity="0.7">zero_ordinals.ivec</text>
+  </g>
+  <g>
+    <title>Definitive ordinal set after excluding dups + zeros.
+Located at ${cache}/clean_ordinals.ivec.
+Fed into generate-shuffle as the ordinals input.</title>
+    <text x="175" y="396" text-anchor="middle" font-size="7" fill="#4caf50" font-style="italic" opacity="0.7">clean_ordinals.ivec</text>
+  </g>
+  <g>
+    <title>Random permutation of clean ordinals.
+Located at ${cache}/shuffle.ivec.
+Deterministic given seed. Used by both vector and metadata extraction.</title>
+    <text x="175" y="508" text-anchor="middle" font-size="7" fill="#4caf50" font-style="italic" opacity="0.7">shuffle.ivec</text>
+  </g>
+  <g>
+    <title>All imported metadata as MNode slab records.
+Located at ${cache}/metadata_all.slab.
+May be a subset when fraction &lt; 1.0.</title>
+    <text x="855" y="172" text-anchor="middle" font-size="7" fill="#ab47bc" font-style="italic" opacity="0.7">metadata_all.slab</text>
+  </g>
+  <g>
+    <title>Schema and value range survey of the metadata.
+Located at ${cache}/metadata_survey.json.
+Used by generate-predicates for selectivity targeting.</title>
+    <text x="855" y="228" text-anchor="middle" font-size="7" fill="#ab47bc" font-style="italic" opacity="0.7">metadata_survey.json</text>
+  </g>
+  <g>
+    <title>B: The corpus vectors to search. Located at profiles/base/base_vectors.{ext}.
+Format matches the source (fvec for f32, mvec for f16).
+Record count = clean_count - query_count (or capped by base_end).</title>
+    <rect x="102" y="740" width="146" height="44" fill="#d7eed8" stroke="#4caf50" stroke-width="2" />
+    <polygon points="238,740 248,750 238,750" fill="white" stroke="#4caf50" stroke-width="1" />
+    <text x="175" y="760" text-anchor="middle" font-size="9" font-weight="bold">base_vectors</text>
+    <text x="175" y="773" text-anchor="middle" font-size="9" font-weight="normal">.fvec/.mvec</text>
+  </g>
+  <g>
+    <title>Q: The query vectors to run against the corpus. Located at profiles/base/query_vectors.{ext}.
+Either extracted from base via shuffle (self-search) or provided directly.
+Record count = query_count.</title>
+    <rect x="272" y="740" width="146" height="44" fill="#d4e6f7" stroke="#42a5f5" stroke-width="2" />
+    <polygon points="408,740 418,750 408,750" fill="white" stroke="#42a5f5" stroke-width="1" />
+    <text x="345" y="760" text-anchor="middle" font-size="9" font-weight="bold">query_vectors</text>
+    <text x="345" y="773" text-anchor="middle" font-size="9" font-weight="normal">.fvec/.mvec</text>
+  </g>
+  <g>
+    <title>G: Ground-truth KNN indices. Per-profile at profiles/{profile}/neighbor_indices.ivec.
+Dimension = neighbors (e.g., 100). Each record lists the K nearest base vector ordinals for one query.
+Either computed by brute-force KNN or provided by user.</title>
+    <rect x="442" y="740" width="146" height="44" fill="#fce8c8" stroke="#ffa726" stroke-width="2" />
+    <polygon points="578,740 588,750 578,750" fill="white" stroke="#ffa726" stroke-width="1" />
+    <text x="515" y="760" text-anchor="middle" font-size="9" font-weight="bold">neighbor_indices</text>
+    <text x="515" y="773" text-anchor="middle" font-size="9" font-weight="normal">.ivec</text>
+  </g>
+  <g>
+    <title>D: Ground-truth KNN distances. Per-profile at profiles/{profile}/neighbor_distances.fvec.
+Paired with neighbor_indices — same shape (query_count x neighbors).
+Each value is the distance from the query to the corresponding neighbor.</title>
+    <rect x="612" y="740" width="146" height="44" fill="#fce8c8" stroke="#ffa726" stroke-width="2" />
+    <polygon points="748,740 758,750 748,750" fill="white" stroke="#ffa726" stroke-width="1" />
+    <text x="685" y="760" text-anchor="middle" font-size="9" font-weight="bold">neighbor_distances</text>
+    <text x="685" y="773" text-anchor="middle" font-size="9" font-weight="normal">.fvec</text>
+  </g>
+  <g>
+    <title>M: Metadata records, ordinal-aligned with base vectors. At profiles/base/metadata_content.slab.
+Each record is an MNode (structured key-value metadata for one base vector).
+Ordinal congruency: record N corresponds to base_vectors record N.</title>
+    <rect x="782" y="740" width="146" height="44" fill="#e8d5f0" stroke="#ab47bc" stroke-width="2" />
+    <polygon points="918,740 928,750 918,750" fill="white" stroke="#ab47bc" stroke-width="1" />
+    <text x="855" y="760" text-anchor="middle" font-size="9" font-weight="bold">metadata_content</text>
+    <text x="855" y="773" text-anchor="middle" font-size="9" font-weight="normal">.slab</text>
+  </g>
+  <g>
+    <title>P: Test predicates for filtered search. At profiles/base/predicates.slab.
+Each record is a PNode (predicate tree) synthesized from the metadata survey.
+Configurable count and selectivity.</title>
+    <rect x="952" y="740" width="146" height="44" fill="#e8d5f0" stroke="#ab47bc" stroke-width="2" />
+    <polygon points="1088,740 1098,750 1088,750" fill="white" stroke="#ab47bc" stroke-width="1" />
+    <text x="1025" y="760" text-anchor="middle" font-size="9" font-weight="bold">metadata_predicates</text>
+    <text x="1025" y="773" text-anchor="middle" font-size="9" font-weight="normal">.slab</text>
+  </g>
+  <g>
+    <title>R: Predicate evaluation results. Per-profile at profiles/{profile}/metadata_indices.slab.
+For each predicate, stores the set of base vector ordinals that match.
+Used by compute-filtered-knn as the pre-filter.</title>
+    <rect x="1122" y="740" width="146" height="44" fill="#e8d5f0" stroke="#ab47bc" stroke-width="2" />
+    <polygon points="1258,740 1268,750 1258,750" fill="white" stroke="#ab47bc" stroke-width="1" />
+    <text x="1195" y="760" text-anchor="middle" font-size="9" font-weight="bold">metadata_indices</text>
+    <text x="1195" y="773" text-anchor="middle" font-size="9" font-weight="normal">.slab</text>
+  </g>
+  <g>
+    <title>F: Filtered KNN results. Per-profile at profiles/{profile}/filtered_neighbor_{indices,distances}.
+Same shape as G/D but computed with predicate pre-filtering.
+Each query uses only base vectors that match its predicate.</title>
+    <rect x="1292" y="740" width="146" height="44" fill="#f5d5de" stroke="#ef5350" stroke-width="2" />
+    <polygon points="1428,740 1438,750 1428,750" fill="white" stroke="#ef5350" stroke-width="1" />
+    <text x="1365" y="760" text-anchor="middle" font-size="9" font-weight="bold">filtered_neighbor</text>
+    <text x="1365" y="773" text-anchor="middle" font-size="9" font-weight="normal">_indices+_distances</text>
+  </g>
+  <text x="90" y="794" font-size="8" fill="#888">
+    <a href="02-data-model.md#28-dataset-facets">Facet codes (§2.8)</a>
+     · <a href="12-dataset-import-flowchart.md#124-universal-flow-graph">Pipeline spec (§12)</a>
+     · <a href="14-pipeline-dag-configurations.md">DAG configs (§14)</a>
+     · <a href="15-facet-swimlane.md">This diagram (§15)</a>
+  </text>
+</svg>

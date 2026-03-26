@@ -1025,7 +1025,12 @@ sweep.
                 .file_stem()
                 .unwrap_or_default()
                 .to_string_lossy();
-            format!("{}.{}", input_stem, pred_stem)
+            // Include metadata file size in the cache key so cached segments
+            // are invalidated when the data changes (e.g., different fraction).
+            let input_size = std::fs::metadata(&input_path)
+                .map(|m| m.len())
+                .unwrap_or(0);
+            format!("{}.{}.{}", input_stem, pred_stem, input_size)
         };
 
         let segments = plan_segments(
@@ -1709,6 +1714,13 @@ sweep.
             start.elapsed().as_secs_f64(),
         );
         ctx.ui.log(&format!("compute predicates: {}", message));
+
+        // Write verified count for the bound checker
+        let var_name = format!("verified_count:{}",
+            output_path.file_name().and_then(|n| n.to_str()).unwrap_or("output"));
+        let _ = crate::pipeline::variables::set_and_save(
+            &ctx.workspace, &var_name, &pred_len.to_string());
+        ctx.defaults.insert(var_name, pred_len.to_string());
 
         CommandResult {
             status: Status::Ok,

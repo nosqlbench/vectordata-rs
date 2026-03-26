@@ -26,6 +26,97 @@ use crate::pipeline::command::{
     ResourceDesc, Status, StreamContext, render_options_table,
 };
 
+// ---------------------------------------------------------------------------
+// Format-agnostic vector reader (f32 and f16 → f32 upcast)
+// ---------------------------------------------------------------------------
+
+/// Uniform read interface that always returns `Vec<f32>`, upcasting f16
+/// when the source is an mvec file.
+enum VecReader {
+    F32(MmapVectorReader<f32>),
+    F16(MmapVectorReader<half::f16>),
+}
+
+impl VecReader {
+    /// Open the appropriate reader based on file extension.
+    fn open(path: &Path) -> Result<Self, String> {
+        match path.extension().and_then(|e| e.to_str()) {
+            Some("mvec") | Some("mvecs") => {
+                MmapVectorReader::<half::f16>::open_mvec(path)
+                    .map(VecReader::F16)
+                    .map_err(|e| format!("failed to open {}: {}", path.display(), e))
+            }
+            _ => {
+                MmapVectorReader::<f32>::open_fvec(path)
+                    .map(VecReader::F32)
+                    .map_err(|e| format!("failed to open {}: {}", path.display(), e))
+            }
+        }
+    }
+
+    fn count(&self) -> usize {
+        match self {
+            VecReader::F32(r) => <MmapVectorReader<f32> as VectorReader<f32>>::count(r),
+            VecReader::F16(r) => <MmapVectorReader<half::f16> as VectorReader<half::f16>>::count(r),
+        }
+    }
+
+    fn dim(&self) -> usize {
+        match self {
+            VecReader::F32(r) => <MmapVectorReader<f32> as VectorReader<f32>>::dim(r),
+            VecReader::F16(r) => <MmapVectorReader<half::f16> as VectorReader<half::f16>>::dim(r),
+        }
+    }
+
+    /// Get vector at index as f32 (upcasting f16 if needed).
+    fn get_f32(&self, index: usize) -> Result<Vec<f32>, String> {
+        match self {
+            VecReader::F32(r) => r.get(index)
+                .map_err(|e| format!("failed to read vector {}: {}", index, e)),
+            VecReader::F16(r) => {
+                let v = r.get(index)
+                    .map_err(|e| format!("failed to read vector {}: {}", index, e))?;
+                Ok(v.iter().map(|x| x.to_f32()).collect())
+            }
+        }
+    }
+
+    /// Get a raw byte view of the vector at index directly from the mmap.
+    ///
+    /// Zero allocation, zero copy — returns a slice into the memory-mapped
+    /// file. The caller can write this directly to the output.
+    fn raw_bytes(&self, index: usize) -> &[u8] {
+        match self {
+            VecReader::F32(r) => {
+                let slice = r.get_slice(index);
+                unsafe {
+                    std::slice::from_raw_parts(
+                        slice.as_ptr() as *const u8,
+                        slice.len() * 4,
+                    )
+                }
+            }
+            VecReader::F16(r) => {
+                let slice = r.get_slice(index);
+                unsafe {
+                    std::slice::from_raw_parts(
+                        slice.as_ptr() as *const u8,
+                        slice.len() * 2,
+                    )
+                }
+            }
+        }
+    }
+
+    /// Element size in bytes for the native format.
+    fn element_size(&self) -> usize {
+        match self {
+            VecReader::F32(_) => 4,
+            VecReader::F16(_) => 2,
+        }
+    }
+}
+
 /// Pipeline command: sort vectors.
 pub struct ComputeSortOp;
 
@@ -185,19 +276,14 @@ to match an externally defined permutation or clustering assignment.
         let source_path = resolve_path(source_str, &ctx.workspace);
         let output_path = resolve_path(output_str, &ctx.workspace);
 
-        // Open source
-        let reader = match MmapVectorReader::<f32>::open_fvec(&source_path) {
+        // Open source (format-agnostic: fvec or mvec)
+        let reader = match VecReader::open(&source_path) {
             Ok(r) => r,
-            Err(e) => {
-                return error_result(
-                    format!("failed to open {}: {}", source_path.display(), e),
-                    start,
-                )
-            }
+            Err(e) => return error_result(e, start),
         };
 
-        let count = <MmapVectorReader<f32> as VectorReader<f32>>::count(&reader);
-        let dim = <MmapVectorReader<f32> as VectorReader<f32>>::dim(&reader);
+        let count = reader.count();
+        let dim = reader.dim();
 
         let criterion = match SortCriterion::from_str(sort_by_str, dim) {
             Ok(c) => c,
@@ -222,21 +308,24 @@ to match an externally defined permutation or clustering assignment.
             .build()
             .ok();
 
-        // Compute sort keys and build index (parallel)
-        let pb = ctx.ui.bar_with_unit(count as u64, "computing sort keys", "vectors");
+        // Phase 1: Compute sort keys (parallel)
+        let phase1_start = Instant::now();
+        ctx.ui.log(&format!("  phase 1/3: computing sort keys for {} vectors...", count));
+        let pb = ctx.ui.bar_with_unit(count as u64, "computing sort keys", "vec");
         let mut indexed_keys: Vec<(usize, f64)>;
         {
             let progress = AtomicU64::new(0);
+            // Update progress every ~10K records or 1% of total, whichever is larger
+            let update_interval = (count / 100).max(10_000);
 
             let build_fn = || {
                 (0..count)
                     .into_par_iter()
                     .map(|i| {
-                        let vec = reader.get(i)
-                            .map_err(|e| format!("failed to read vector {}: {}", i, e))?;
+                        let vec = reader.get_f32(i)?;
                         let key = criterion.key(&vec);
                         let done = progress.fetch_add(1, AtomicOrd::Relaxed) + 1;
-                        if done % 500_000 == 0 {
+                        if done % update_interval as u64 == 0 {
                             pb.set_position(done);
                         }
                         Ok((i, key))
@@ -256,9 +345,12 @@ to match an externally defined permutation or clustering assignment.
             };
         }
         pb.finish();
+        ctx.ui.log(&format!("  phase 1/3 done ({:.1}s)", phase1_start.elapsed().as_secs_f64()));
 
-        // Parallel sort by key (stable sort to preserve order for equal keys)
-        let sort_sp = ctx.ui.spinner("sorting");
+        // Phase 2: Sort by key (parallel, stable)
+        let phase2_start = Instant::now();
+        ctx.ui.log(&format!("  phase 2/3: sorting {} index pairs...", count));
+        let sort_sp = ctx.ui.spinner("sorting index pairs");
         {
             let mut sort_fn = || {
                 indexed_keys.par_sort_by(|a, b| {
@@ -272,6 +364,7 @@ to match an externally defined permutation or clustering assignment.
             }
         }
         sort_sp.finish();
+        ctx.ui.log(&format!("  phase 2/3 done ({:.1}s)", phase2_start.elapsed().as_secs_f64()));
 
         // Governor checkpoint after sort phase
         if ctx.governor.checkpoint() {
@@ -287,10 +380,22 @@ to match an externally defined permutation or clustering assignment.
             }
         }
 
-        // Write sorted vectors
-        if let Err(e) = write_sorted_fvec(&output_path, &reader, dim, &indexed_keys) {
+        // Phase 3: Write sorted vectors (preserves native format)
+        let phase3_start = Instant::now();
+        ctx.ui.log(&format!("  phase 3/3: writing {} sorted vectors...", count));
+        let write_pb = ctx.ui.bar_with_unit(count as u64, "writing sorted vectors", "vec");
+        if let Err(e) = write_sorted_xvec(&output_path, &reader, dim, &indexed_keys, &write_pb) {
             return error_result(e, start);
         }
+        write_pb.finish();
+        ctx.ui.log(&format!("  phase 3/3 done ({:.1}s)", phase3_start.elapsed().as_secs_f64()));
+
+        // Write verified count for the bound checker
+        let var_name = format!("verified_count:{}",
+            output_path.file_name().and_then(|n| n.to_str()).unwrap_or("output"));
+        let _ = crate::pipeline::variables::set_and_save(
+            &ctx.workspace, &var_name, &count.to_string());
+        ctx.defaults.insert(var_name, count.to_string());
 
         CommandResult {
             status: Status::Ok,
@@ -345,30 +450,38 @@ to match an externally defined permutation or clustering assignment.
 }
 
 /// Write vectors in the order specified by sorted indices.
-fn write_sorted_fvec(
+///
+/// Preserves the native element size of the source format — fvec output
+/// for fvec input, mvec output for mvec input.
+fn write_sorted_xvec(
     output: &Path,
-    reader: &MmapVectorReader<f32>,
+    reader: &VecReader,
     dim: usize,
     sorted_indices: &[(usize, f64)],
+    pb: &veks_core::ui::ProgressHandle,
 ) -> Result<(), String> {
     use std::io::Write;
 
     let mut writer = AtomicWriter::new(output)
         .map_err(|e| format!("failed to create {}: {}", output.display(), e))?;
 
+    let update_interval = (sorted_indices.len() / 200).max(1_000);
     let dim_i32 = dim as i32;
-    for &(idx, _) in sorted_indices {
-        let vec = reader
-            .get(idx)
-            .map_err(|e| format!("failed to read vector {}: {}", idx, e))?;
+    let dim_header = dim_i32.to_le_bytes();
+
+    for (i, &(idx, _)) in sorted_indices.iter().enumerate() {
+        // Zero-alloc: raw_bytes is a direct slice into the mmap
+        let raw = reader.raw_bytes(idx);
 
         writer
-            .write_all(&dim_i32.to_le_bytes())
+            .write_all(&dim_header)
             .map_err(|e| e.to_string())?;
-        for &val in &vec {
-            writer
-                .write_all(&val.to_le_bytes())
-                .map_err(|e| e.to_string())?;
+        writer
+            .write_all(raw)
+            .map_err(|e| e.to_string())?;
+
+        if (i + 1) % update_interval == 0 {
+            pb.set_position((i + 1) as u64);
         }
     }
 
