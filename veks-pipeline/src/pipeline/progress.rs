@@ -185,7 +185,7 @@ impl ProgressLog {
     /// Returns a message if steps were invalidated, None if unchanged.
     pub fn invalidate_if_config_changed(&mut self, dataset_path: &Path) -> Option<String> {
         let content = std::fs::read_to_string(dataset_path).ok()?;
-        let hash = simple_hash(&content);
+        let hash = simple_hash(&pipeline_relevant_content(&content));
 
         if let Some(ref stored) = self.config_hash {
             if *stored == hash {
@@ -376,8 +376,33 @@ impl ProgressLog {
 
 }
 
-/// Resolve a path that may be relative, using the workspace as the base
-/// directory when provided.
+/// Extract the pipeline-relevant portion of dataset.yaml for hashing.
+///
+/// Excludes the `profiles:` section which can change (via stratify) without
+/// affecting the core pipeline steps. Without this, adding sized profiles
+/// would invalidate all cached step results and force a full re-run.
+fn pipeline_relevant_content(yaml: &str) -> String {
+    let mut result = String::with_capacity(yaml.len());
+    let mut in_profiles = false;
+
+    for line in yaml.lines() {
+        // Detect top-level YAML keys (no leading whitespace, ends with colon)
+        let is_top_level = !line.starts_with(' ') && !line.starts_with('\t')
+            && !line.starts_with('#') && !line.is_empty()
+            && line.contains(':');
+
+        if is_top_level {
+            in_profiles = line.starts_with("profiles:");
+        }
+
+        if !in_profiles {
+            result.push_str(line);
+            result.push('\n');
+        }
+    }
+    result
+}
+
 /// Fast non-cryptographic hash for change detection.
 /// Uses FNV-1a (64-bit) — deterministic, no external dependency.
 fn simple_hash(content: &str) -> String {

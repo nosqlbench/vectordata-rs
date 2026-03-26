@@ -186,23 +186,55 @@ impl DSProfile {
 ///
 /// When deserialized, profiles named other than `"default"` automatically
 /// inherit views and `maxk` from the default profile.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Default)]
-pub struct DSProfileGroup(pub IndexMap<String, DSProfile>);
+///
+/// Sized entries containing `${variable}` references are stored in
+/// `deferred_sized` and expanded later when variables become available
+/// (after core pipeline stages produce actual counts).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DSProfileGroup {
+    /// Resolved profiles keyed by name.
+    pub profiles: IndexMap<String, DSProfile>,
+    /// Raw sized entries that contain `${...}` variable references.
+    /// These are expanded by `expand_deferred_sized()` once variables
+    /// are available.
+    pub deferred_sized: Vec<String>,
+    /// Facet templates from the `sized:` structured form, stored for
+    /// deferred expansion.
+    pub deferred_facet_templates: Option<IndexMap<String, String>>,
+}
+
+impl Serialize for DSProfileGroup {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.profiles.serialize(serializer)
+    }
+}
 
 impl DSProfileGroup {
+    /// Create a profile group from a map of profiles with no deferred entries.
+    pub fn from_profiles(profiles: IndexMap<String, DSProfile>) -> Self {
+        DSProfileGroup {
+            profiles,
+            deferred_sized: Vec::new(),
+            deferred_facet_templates: None,
+        }
+    }
+
     /// Returns the default profile, if one exists.
     pub fn default_profile(&self) -> Option<&DSProfile> {
-        self.0.get("default")
+        self.profiles.get("default")
     }
 
     /// Look up a profile by name.
     pub fn profile(&self, name: &str) -> Option<&DSProfile> {
-        self.0.get(name)
+        self.profiles.get(name)
     }
 
     /// List all profile names.
     pub fn profile_names(&self) -> Vec<&str> {
-        self.0.keys().map(|k| k.as_str()).collect()
+        self.profiles.keys().map(|k| k.as_str()).collect()
     }
 
     /// Returns view names from the default profile (for display).
@@ -214,7 +246,103 @@ impl DSProfileGroup {
 
     /// Returns `true` if there are no profiles.
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.profiles.is_empty()
+    }
+
+    /// Returns `true` if there are deferred sized entries awaiting expansion.
+    pub fn has_deferred(&self) -> bool {
+        !self.deferred_sized.is_empty()
+    }
+
+    /// Expand deferred sized entries using the provided variable map.
+    ///
+    /// Called by the pipeline runner after core stages have produced actual
+    /// counts (e.g., `base_count` in `variables.yaml`). Entries that still
+    /// contain unresolved variables after interpolation are skipped with a
+    /// warning.
+    ///
+    /// Returns the number of new profiles added.
+    pub fn expand_deferred_sized(&mut self, vars: &IndexMap<String, String>) -> usize {
+        if self.deferred_sized.is_empty() {
+            return 0;
+        }
+
+        let default_profile = self.profiles.get("default").cloned();
+        let templates = self.deferred_facet_templates.take();
+        let entries = std::mem::take(&mut self.deferred_sized);
+        let mut added = 0;
+
+        for entry_str in &entries {
+            // Interpolate variables
+            let mut resolved = entry_str.clone();
+            for (key, val) in vars {
+                resolved = resolved.replace(&format!("${{{}}}", key), val);
+            }
+
+            // Check if any variables remain unresolved
+            if resolved.contains("${") {
+                log::warn!(
+                    "sized entry '{}' still has unresolved variables after interpolation: '{}'",
+                    entry_str, resolved
+                );
+                // Re-defer for next attempt
+                self.deferred_sized.push(entry_str.clone());
+                continue;
+            }
+
+            // Parse the resolved entry
+            let pairs = match parse_sized_entry(&resolved) {
+                Ok(p) => p,
+                Err(e) => {
+                    log::warn!("failed to parse sized entry '{}' (resolved: '{}'): {}", entry_str, resolved, e);
+                    continue;
+                }
+            };
+
+            for (prof_name, count) in pairs {
+                let scaffold_views = if let Some(ref tmpl) = templates {
+                    let range_spec = format!("[0..{}]", count);
+                    let mut views = IndexMap::new();
+                    for (facet_key, template) in tmpl {
+                        let interpolated = template
+                            .replace("${profile}", &prof_name)
+                            .replace("${range}", &range_spec);
+                        let canonical = resolve_standard_key(facet_key)
+                            .unwrap_or_else(|| facet_key.clone());
+                        if let Ok(source) = parse_source_string(&interpolated) {
+                            views.insert(canonical, DSView { source, window: None });
+                        }
+                    }
+                    Some(views)
+                } else {
+                    None
+                };
+
+                let base_views = scaffold_views.unwrap_or_default();
+
+                let merged = if let Some(ref dp) = default_profile {
+                    let mut merged_views = dp.views.clone();
+                    for (k, v) in base_views {
+                        merged_views.insert(k, v);
+                    }
+                    DSProfile {
+                        maxk: dp.maxk,
+                        base_count: Some(count),
+                        views: merged_views,
+                    }
+                } else {
+                    DSProfile {
+                        maxk: None,
+                        base_count: Some(count),
+                        views: base_views,
+                    }
+                };
+                self.profiles.insert(prof_name, merged);
+                added += 1;
+            }
+        }
+
+        added
     }
 
     /// Derive views for sized profiles from per-profile template step outputs.
@@ -249,7 +377,7 @@ impl DSProfileGroup {
             return;
         }
 
-        for (name, profile) in self.0.iter_mut() {
+        for (name, profile) in self.profiles.iter_mut() {
             // Skip profiles without base_count (except default)
             if name != "default" && profile.base_count.is_none() {
                 continue;
@@ -622,6 +750,8 @@ impl<'de> Deserialize<'de> for DSProfileGroup {
         };
 
         let mut profiles = IndexMap::new();
+        let mut deferred_sized: Vec<String> = Vec::new();
+        let mut deferred_facet_templates: Option<IndexMap<String, String>> = None;
 
         for (name, value) in &raw {
             if name == "default" {
@@ -673,11 +803,18 @@ impl<'de> Deserialize<'de> for DSProfileGroup {
                     )),
                 };
 
+                // Separate entries with variable references (deferred)
+                // from those that can be resolved immediately.
+                let mut deferred: Vec<String> = Vec::new();
                 let mut all_pairs: Vec<(String, u64)> = Vec::new();
                 for entry_str in &entries {
-                    let pairs = parse_sized_entry(entry_str)
-                        .map_err(de::Error::custom)?;
-                    all_pairs.extend(pairs);
+                    if entry_str.contains("${") {
+                        deferred.push(entry_str.clone());
+                    } else {
+                        let pairs = parse_sized_entry(entry_str)
+                            .map_err(de::Error::custom)?;
+                        all_pairs.extend(pairs);
+                    }
                 }
                 all_pairs.sort_by_key(|(_, count)| *count);
                 for (prof_name, count) in all_pairs {
@@ -722,6 +859,10 @@ impl<'de> Deserialize<'de> for DSProfileGroup {
                     };
                     profiles.insert(prof_name, merged);
                 }
+                if !deferred.is_empty() {
+                    deferred_sized = deferred;
+                    deferred_facet_templates = facet_templates;
+                }
                 continue;
             }
 
@@ -748,7 +889,11 @@ impl<'de> Deserialize<'de> for DSProfileGroup {
             profiles.insert(name.clone(), merged);
         }
 
-        Ok(DSProfileGroup(profiles))
+        Ok(DSProfileGroup {
+            profiles,
+            deferred_sized,
+            deferred_facet_templates,
+        })
     }
 }
 
@@ -837,7 +982,7 @@ default:
   query_vectors: query.fvec
 "#;
         let g: DSProfileGroup = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(g.0.len(), 1);
+        assert_eq!(g.profiles.len(), 1);
         let dp = g.default_profile().unwrap();
         assert_eq!(dp.maxk, Some(100));
         assert_eq!(dp.views.len(), 2);
@@ -860,7 +1005,7 @@ default:
   neighbor_distances: gnd/dis_1M.fvecs
 "#;
         let g: DSProfileGroup = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(g.0.len(), 2);
+        assert_eq!(g.profiles.len(), 2);
 
         let child = g.profile("1M").unwrap();
         // Should inherit maxk from default
@@ -915,7 +1060,7 @@ only:
 "#;
         let g: DSProfileGroup = serde_yaml::from_str(yaml).unwrap();
         assert!(g.default_profile().is_none());
-        assert_eq!(g.0.len(), 1);
+        assert_eq!(g.profiles.len(), 1);
     }
 
     #[test]
@@ -984,7 +1129,7 @@ sized: [10m, 20m, 50m]
 "#;
         let g: DSProfileGroup = serde_yaml::from_str(yaml).unwrap();
         // default + 3 sized profiles
-        assert_eq!(g.0.len(), 4);
+        assert_eq!(g.profiles.len(), 4);
 
         let p10 = g.profile("10m").unwrap();
         assert_eq!(p10.base_count, Some(10_000_000));
@@ -1004,7 +1149,7 @@ sized: [100m..400m/100m]
 "#;
         let g: DSProfileGroup = serde_yaml::from_str(yaml).unwrap();
         // default + 4 expanded profiles (100m, 200m, 300m, 400m)
-        assert_eq!(g.0.len(), 5);
+        assert_eq!(g.profiles.len(), 5);
         assert_eq!(g.profile("100m").unwrap().base_count, Some(100_000_000));
         assert_eq!(g.profile("200m").unwrap().base_count, Some(200_000_000));
         assert_eq!(g.profile("300m").unwrap().base_count, Some(300_000_000));
@@ -1020,7 +1165,7 @@ sized: [10m, 20m, 100m..300m/100m]
 "#;
         let g: DSProfileGroup = serde_yaml::from_str(yaml).unwrap();
         // default + 10m + 20m + 100m + 200m + 300m = 6
-        assert_eq!(g.0.len(), 6);
+        assert_eq!(g.profiles.len(), 6);
         assert!(g.profile("10m").is_some());
         assert!(g.profile("20m").is_some());
         assert!(g.profile("100m").is_some());
@@ -1034,7 +1179,7 @@ sized: [10m, 20m, 100m..300m/100m]
 sized: [100k, 500k, 1m]
 "#;
         let g: DSProfileGroup = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(g.0.len(), 3);
+        assert_eq!(g.profiles.len(), 3);
         assert_eq!(g.profile("100k").unwrap().base_count, Some(100_000));
         assert_eq!(g.profile("500k").unwrap().base_count, Some(500_000));
         assert_eq!(g.profile("1m").unwrap().base_count, Some(1_000_000));
@@ -1046,7 +1191,7 @@ sized: [100k, 500k, 1m]
 sized: [10m, 20m]
 "#;
         let g: DSProfileGroup = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(g.0.len(), 2);
+        assert_eq!(g.profiles.len(), 2);
         let p = g.profile("10m").unwrap();
         assert_eq!(p.base_count, Some(10_000_000));
         assert!(p.maxk.is_none());
@@ -1066,7 +1211,7 @@ custom:
 "#;
         let g: DSProfileGroup = serde_yaml::from_str(yaml).unwrap();
         // default + 10m + 20m + custom = 4
-        assert_eq!(g.0.len(), 4);
+        assert_eq!(g.profiles.len(), 4);
         assert!(g.profile("10m").is_some());
         assert!(g.profile("custom").is_some());
         assert_eq!(g.profile("custom").unwrap().maxk, Some(50));
@@ -1185,7 +1330,7 @@ sized:
 "#;
         let g: DSProfileGroup = serde_yaml::from_str(yaml).unwrap();
         // default + 2 sized profiles
-        assert_eq!(g.0.len(), 3);
+        assert_eq!(g.profiles.len(), 3);
 
         let p10 = g.profile("10m").unwrap();
         assert_eq!(p10.base_count, Some(10_000_000));
@@ -1228,7 +1373,7 @@ default:
 sized: [10m, 20m]
 "#;
         let g: DSProfileGroup = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(g.0.len(), 3);
+        assert_eq!(g.profiles.len(), 3);
         assert_eq!(g.profile("10m").unwrap().base_count, Some(10_000_000));
     }
 

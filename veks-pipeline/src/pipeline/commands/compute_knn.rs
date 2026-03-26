@@ -1042,16 +1042,19 @@ compare an ANN index's approximate results against this exact ground truth.
                 )
             }
         };
-        let threads: usize = options
-            .get("threads")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or_else(|| ctx.governor.current_or("threads", ctx.threads as u64) as usize);
+        let threads: usize = match options.parse_opt::<usize>("threads") {
+            Ok(Some(v)) => v,
+            Ok(None) => ctx.governor.current_or("threads", ctx.threads as u64) as usize,
+            Err(e) => return error_result(e, start),
+        };
 
-        let partition_size: usize = options
-            .get("partition_size")
-            .and_then(|s| s.parse().ok())
-            .or_else(|| ctx.governor.current("segmentsize").map(|v| v as usize))
-            .unwrap_or(1_000_000);
+        let partition_size: usize = match options.parse_opt::<usize>("partition_size") {
+            Ok(Some(v)) => v,
+            Ok(None) => ctx.governor.current("segmentsize")
+                .map(|v| v as usize)
+                .unwrap_or(1_000_000),
+            Err(e) => return error_result(e, start),
+        };
 
         let compress_cache = options.get("compress-cache").map(|s| s == "true").unwrap_or(false);
 
@@ -1909,6 +1912,13 @@ where
         // this is typically already done (completed during the previous
         // compute + load overlap).
         if let Some(handle) = prev_writer.take() {
+            if let Some(ref opb) = overall_pb {
+                opb.set_message(format!(
+                    "saving partition [{},{})",
+                    format_count(partitions[pi.saturating_sub(1)].start),
+                    format_count(partitions[pi.saturating_sub(1)].end),
+                ));
+            }
             let write_result = join_writer_with_spinner(handle, "previous", &ctx.ui);
             let write_elapsed = prev_write_start.take()
                 .map(|s| s.elapsed())
@@ -1930,6 +1940,12 @@ where
         // lookahead it should be warm by now.
         if let Some(handle) = load_queue.pop_front() {
             if !handle.is_finished() {
+                if let Some(ref opb) = overall_pb {
+                    opb.set_message(format!(
+                        "loading [{},{})",
+                        format_count(part.start), format_count(part.end),
+                    ));
+                }
                 let sp = ctx.ui.spinner(&format!(
                     "waiting for load [{},{})",
                     format_count(part.start), format_count(part.end),

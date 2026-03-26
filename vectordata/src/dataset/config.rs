@@ -128,7 +128,7 @@ impl DatasetConfig {
     pub fn validate(&self, _base_dir: &Path) -> Vec<String> {
         let mut errors = Vec::new();
 
-        for (profile_name, profile) in &self.profiles.0 {
+        for (profile_name, profile) in &self.profiles.profiles {
             for (key, view) in &profile.views {
                 // Reject paths into managed directories
                 let path = Path::new(view.path());

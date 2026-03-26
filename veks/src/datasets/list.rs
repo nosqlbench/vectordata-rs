@@ -296,7 +296,7 @@ fn output_text(entries: &[&CatalogEntry], verbose: bool, group_by: Option<&str>,
                 }
             }
             // Show views for default profile
-            if let Some(profile) = entry.layout.profiles.0.get("default") {
+            if let Some(profile) = entry.layout.profiles.profiles.get("default") {
                 let views: Vec<&str> = profile.view_names();
                 if !views.is_empty() {
                     println!("  views: {}", views.join(", "));
@@ -402,7 +402,7 @@ fn output_csv(entries: &[&CatalogEntry], verbose: bool, pv: &ProfileView) {
                 let vendor = attrs.and_then(|a| a.vendor.as_deref()).unwrap_or("");
                 let license = attrs.and_then(|a| a.license.as_deref()).unwrap_or("");
 
-                let views = entry.layout.profiles.0.get(profile_name)
+                let views = entry.layout.profiles.profiles.get(profile_name)
                     .map(|p| p.view_names().join(";"))
                     .unwrap_or_default();
 
@@ -456,7 +456,7 @@ fn build_structured(entries: &[&CatalogEntry], verbose: bool, pv: &ProfileView) 
                 if let Some(ref attrs) = entry.layout.attributes {
                     summary.attributes = serde_json::to_value(attrs).ok();
                 }
-                if let Some(profile) = entry.layout.profiles.0.get(profile_name) {
+                if let Some(profile) = entry.layout.profiles.profiles.get(profile_name) {
                     let view_names = profile.view_names();
                     if !view_names.is_empty() {
                         summary.views = Some(serde_json::json!(view_names));

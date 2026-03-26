@@ -279,6 +279,33 @@ impl Options {
     pub fn has(&self, name: &str) -> bool {
         self.0.contains_key(name)
     }
+
+    /// Parse an option value, returning a default if unset, or an error
+    /// string if the value is present but cannot be parsed.
+    pub fn parse_or<T: std::str::FromStr>(&self, name: &str, default: T) -> Result<T, String>
+    where
+        T::Err: std::fmt::Display,
+    {
+        match self.get(name) {
+            Some(s) => s.parse::<T>()
+                .map_err(|e| format!("invalid '{}' value '{}': {}", name, s, e)),
+            None => Ok(default),
+        }
+    }
+
+    /// Parse an optional option value, returning `None` if unset, or an error
+    /// string if the value is present but cannot be parsed.
+    pub fn parse_opt<T: std::str::FromStr>(&self, name: &str) -> Result<Option<T>, String>
+    where
+        T::Err: std::fmt::Display,
+    {
+        match self.get(name) {
+            Some(s) => s.parse::<T>()
+                .map(Some)
+                .map_err(|e| format!("invalid '{}' value '{}': {}", name, s, e)),
+            None => Ok(None),
+        }
+    }
 }
 
 /// Execution context shared across all pipeline steps.

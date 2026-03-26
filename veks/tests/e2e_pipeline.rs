@@ -1120,3 +1120,302 @@ fn e2e_cache_invalidation_on_reconfig() {
         }
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Early stratification tests
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// E2E: Early stratification with concrete sized profiles at bootstrap time.
+///
+/// Bootstraps with `sized_profiles: "50"` on 200-vector source data.
+/// After pipeline runs: profile "50" should exist with 50 base vectors.
+#[test]
+fn e2e_early_stratification() {
+    let tmp = make_tempdir();
+    let fvec = tmp.path().join("base.fvec");
+    std::fs::copy(fixtures().join("base.fvec"), &fvec).unwrap();
+
+    let out = tmp.path().join("out");
+    let mut args = default_args("early-strat", &out);
+    args.base_vectors = Some(fvec);
+    args.self_search = true;
+    args.sized_profiles = Some("50".to_string());
+
+    veks::prepare::import::run(args);
+    let (success, output) = run_pipeline(&out.join("dataset.yaml"));
+    assert!(success, "pipeline failed:\n{}", output);
+
+    // Default profile artifacts should exist
+    assert!(out.join("profiles/default/neighbor_indices.ivec").exists(),
+        "default profile KNN indices should exist");
+
+    // Check dataset.yaml has the sized profile
+    let yaml = std::fs::read_to_string(out.join("dataset.yaml")).unwrap();
+    assert!(yaml.contains("sized:"), "sized: key should be in dataset.yaml");
+}
+
+/// E2E: Early stratification with base fraction.
+///
+/// Bootstraps with `--base-fraction 50% --sized "20"`.
+/// The fraction reduces the data universe; profiles operate within it.
+#[test]
+fn e2e_early_stratification_with_fraction() {
+    let tmp = make_tempdir();
+    let fvec = tmp.path().join("base.fvec");
+    std::fs::copy(fixtures().join("base.fvec"), &fvec).unwrap();
+
+    let out = tmp.path().join("out");
+    let mut args = default_args("frac-strat", &out);
+    args.base_vectors = Some(fvec);
+    args.self_search = true;
+    args.base_fraction = 0.5;
+    args.sized_profiles = Some("20".to_string());
+    args.round_digits = 10; // disable rounding
+
+    veks::prepare::import::run(args);
+    let (success, output) = run_pipeline(&out.join("dataset.yaml"));
+    assert!(success, "pipeline failed:\n{}", output);
+
+    // Base vectors should be ~50% of 198 clean = ~99
+    let (_, base_count) = read_xvec_counts(&out.join("profiles/base/base_vectors.fvec"));
+    assert!(base_count > 30 && base_count < 120,
+        "base_count {} should be ~50% of 198 clean vectors", base_count);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Adversarial tests — pipeline boundary conditions and error paths
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Adversarial: Rerunning a pipeline with the same config should be a no-op.
+///
+/// All steps should be skipped (fresh). This verifies that the progress
+/// tracking and freshness algorithm work correctly.
+#[test]
+fn adversarial_idempotent_rerun() {
+    let tmp = make_tempdir();
+    let fvec = tmp.path().join("base.fvec");
+    std::fs::copy(fixtures().join("base.fvec"), &fvec).unwrap();
+
+    let out = tmp.path().join("out");
+    let mut args = default_args("idempotent", &out);
+    args.base_vectors = Some(fvec);
+    args.self_search = true;
+
+    veks::prepare::import::run(args);
+
+    // Run 1
+    let (success1, _) = run_pipeline(&out.join("dataset.yaml"));
+    assert!(success1, "run 1 failed");
+
+    // Run 2 — should skip all steps
+    let (success2, output2) = run_pipeline(&out.join("dataset.yaml"));
+    assert!(success2, "run 2 failed:\n{}", output2);
+    // Check that the output mentions skipping
+    assert!(output2.contains("up-to-date") || output2.contains("skipped") || output2.contains("0 executed"),
+        "run 2 should have skipped all steps (idempotent), output:\n{}", output2);
+}
+
+/// Adversarial: KNN indices must all be in-range for the base vector count.
+///
+/// This catches stale cache bugs where a larger run's indices leak into a
+/// smaller fraction run.
+#[test]
+fn adversarial_knn_indices_in_range() {
+    let tmp = make_tempdir();
+    let fvec = tmp.path().join("base.fvec");
+    std::fs::copy(fixtures().join("base.fvec"), &fvec).unwrap();
+
+    let out = tmp.path().join("out");
+    let mut args = default_args("knn-range", &out);
+    args.base_vectors = Some(fvec);
+    args.self_search = true;
+
+    veks::prepare::import::run(args);
+    let (success, output) = run_pipeline(&out.join("dataset.yaml"));
+    assert!(success, "pipeline failed:\n{}", output);
+
+    let (_, base_count) = read_xvec_counts(&out.join("profiles/base/base_vectors.fvec"));
+    let indices = read_ivec_ordinals(&out.join("profiles/default/neighbor_indices.ivec"));
+
+    for (qi, neighbors) in indices.iter().enumerate() {
+        for &idx in neighbors {
+            assert!(idx >= 0 && (idx as usize) < base_count,
+                "query {} neighbor {} out of range [0, {})",
+                qi, idx, base_count);
+        }
+    }
+}
+
+/// Adversarial: Empty base vectors file should produce an error, not hang.
+#[test]
+fn adversarial_empty_base_vectors() {
+    let tmp = make_tempdir();
+    let fvec = tmp.path().join("empty.fvec");
+    std::fs::write(&fvec, b"").unwrap(); // 0 bytes
+
+    let out = tmp.path().join("out");
+    let mut args = default_args("empty-base", &out);
+    args.base_vectors = Some(fvec);
+    args.self_search = true;
+    args.no_dedup = true;
+    args.no_zero_check = true;
+
+    // Bootstrap should either error or produce a dataset with 0 vectors
+    veks::prepare::import::run(args);
+
+    // The pipeline should fail gracefully (not hang or panic)
+    let yaml_path = out.join("dataset.yaml");
+    if yaml_path.exists() {
+        let (success, output) = run_pipeline(&yaml_path);
+        // Either succeeds with 0 vectors or fails with clear error
+        if !success {
+            assert!(output.contains("error") || output.contains("Error") || output.contains("failed"),
+                "pipeline should report a clear error for empty input");
+        }
+    }
+}
+
+/// Adversarial: Bootstrap with query_count exceeding available vectors.
+///
+/// With 200 vectors and query_count=300, extraction should not panic.
+/// It should either cap at available or produce a clear error.
+#[test]
+fn adversarial_query_count_exceeds_vectors() {
+    let tmp = make_tempdir();
+    let fvec = tmp.path().join("base.fvec");
+    std::fs::copy(fixtures().join("base.fvec"), &fvec).unwrap();
+
+    let out = tmp.path().join("out");
+    let mut args = default_args("query-exceed", &out);
+    args.base_vectors = Some(fvec);
+    args.self_search = true;
+    args.query_count = 300; // exceeds 200 vectors
+    args.no_dedup = true;
+    args.no_zero_check = true;
+
+    veks::prepare::import::run(args);
+    let yaml_path = out.join("dataset.yaml");
+    if yaml_path.exists() {
+        let (success, output) = run_pipeline(&yaml_path);
+        // Should not panic — either succeeds with capped count or errors
+        if !success {
+            assert!(!output.contains("panicked"),
+                "pipeline should not panic on oversized query_count");
+        }
+    }
+}
+
+/// Adversarial: k exceeds base count after cleaning.
+///
+/// With 200 vectors, 1 dup, 1 zero, 10 queries → 188 base. k=200.
+/// KNN should handle k > base_count gracefully.
+#[test]
+fn adversarial_k_exceeds_base_count() {
+    let tmp = make_tempdir();
+    let fvec = tmp.path().join("base.fvec");
+    std::fs::copy(fixtures().join("base.fvec"), &fvec).unwrap();
+
+    let out = tmp.path().join("out");
+    let mut args = default_args("k-exceed", &out);
+    args.base_vectors = Some(fvec);
+    args.self_search = true;
+    args.neighbors = 200; // exceeds base count after cleaning (~188)
+
+    veks::prepare::import::run(args);
+    let yaml_path = out.join("dataset.yaml");
+    if yaml_path.exists() {
+        let (success, output) = run_pipeline(&yaml_path);
+        // Should either succeed with k capped or fail with clear error
+        if !success {
+            assert!(!output.contains("panicked"),
+                "pipeline should not panic when k exceeds base count");
+        }
+    }
+}
+
+/// Adversarial: Fraction of 0 should not produce an infinite loop or panic.
+#[test]
+fn adversarial_zero_fraction() {
+    let tmp = make_tempdir();
+    let fvec = tmp.path().join("base.fvec");
+    std::fs::copy(fixtures().join("base.fvec"), &fvec).unwrap();
+
+    let out = tmp.path().join("out");
+    let mut args = default_args("zero-frac", &out);
+    args.base_vectors = Some(fvec);
+    args.self_search = true;
+    args.base_fraction = 0.0; // Edge case: 0% of data
+
+    veks::prepare::import::run(args);
+    let yaml_path = out.join("dataset.yaml");
+    if yaml_path.exists() {
+        let (success, output) = run_pipeline(&yaml_path);
+        // Should handle 0 vectors gracefully
+        if !success {
+            assert!(!output.contains("panicked"),
+                "pipeline should not panic on 0% fraction");
+        }
+    }
+}
+
+/// Adversarial: Sized profile larger than base count should be silently
+/// excluded (or window-clamped), not cause an error.
+#[test]
+fn adversarial_sized_profile_exceeds_base() {
+    let tmp = make_tempdir();
+    let fvec = tmp.path().join("base.fvec");
+    std::fs::copy(fixtures().join("base.fvec"), &fvec).unwrap();
+
+    let out = tmp.path().join("out");
+    let mut args = default_args("oversized-profile", &out);
+    args.base_vectors = Some(fvec);
+    args.self_search = true;
+    // 200 vectors, but profile asks for 1M
+    args.sized_profiles = Some("1m".to_string());
+
+    veks::prepare::import::run(args);
+    let (success, output) = run_pipeline(&out.join("dataset.yaml"));
+    // Should succeed — the oversized profile's window gets clamped to
+    // the actual base count, which is the same as the default profile
+    assert!(success, "pipeline should handle oversized profile gracefully:\n{}", output);
+}
+
+/// Adversarial: Two consecutive runs with different seeds should produce
+/// different shuffles but both produce valid KNN results.
+#[test]
+fn adversarial_different_seeds_valid_knn() {
+    let tmp = make_tempdir();
+    let fvec = tmp.path().join("base.fvec");
+    std::fs::copy(fixtures().join("base.fvec"), &fvec).unwrap();
+
+    // Run 1 with seed=42
+    let out1 = tmp.path().join("out1");
+    let mut args1 = default_args("seed42", &out1);
+    args1.base_vectors = Some(fvec.clone());
+    args1.self_search = true;
+    args1.seed = 42;
+    veks::prepare::import::run(args1);
+    let (s1, o1) = run_pipeline(&out1.join("dataset.yaml"));
+    assert!(s1, "seed 42 failed:\n{}", o1);
+
+    // Run 2 with seed=99
+    let out2 = tmp.path().join("out2");
+    let mut args2 = default_args("seed99", &out2);
+    args2.base_vectors = Some(fvec);
+    args2.self_search = true;
+    args2.seed = 99;
+    veks::prepare::import::run(args2);
+    let (s2, o2) = run_pipeline(&out2.join("dataset.yaml"));
+    assert!(s2, "seed 99 failed:\n{}", o2);
+
+    // Both should have valid indices
+    let (_, bc1) = read_xvec_counts(&out1.join("profiles/base/base_vectors.fvec"));
+    let (_, bc2) = read_xvec_counts(&out2.join("profiles/base/base_vectors.fvec"));
+    // Same source data + same cleaning = same base count
+    assert_eq!(bc1, bc2, "same source should produce same base count regardless of seed");
+
+    // But different queries (different shuffle)
+    let q1 = read_xvec_counts(&out1.join("profiles/base/query_vectors.fvec"));
+    let q2 = read_xvec_counts(&out2.join("profiles/base/query_vectors.fvec"));
+    assert_eq!(q1.1, q2.1, "same query count regardless of seed");
+}

@@ -52,7 +52,7 @@ enum RenderMsg {
 pub struct RatatuiSink {
     tx: mpsc::Sender<RenderMsg>,
     next_id: AtomicU32,
-    render_thread: Option<thread::JoinHandle<()>>,
+    render_thread: Mutex<Option<thread::JoinHandle<()>>>,
     /// Buffered log messages for post-TUI console output.
     console_log: Arc<Mutex<Vec<String>>>,
 }
@@ -111,7 +111,7 @@ impl RatatuiSink {
         Ok(RatatuiSink {
             tx,
             next_id: AtomicU32::new(0),
-            render_thread: Some(handle),
+            render_thread: Mutex::new(Some(handle)),
             console_log,
         })
     }
@@ -119,8 +119,9 @@ impl RatatuiSink {
 
 impl Drop for RatatuiSink {
     fn drop(&mut self) {
+        // shutdown() may have already joined the thread
         let _ = self.tx.send(RenderMsg::Shutdown);
-        if let Some(h) = self.render_thread.take() {
+        if let Some(h) = self.render_thread.lock().unwrap().take() {
             let _ = h.join();
         }
     }
@@ -137,6 +138,13 @@ impl UiSink for RatatuiSink {
 
     fn take_console_log(&self) -> Vec<String> {
         std::mem::take(&mut self.console_log.lock().unwrap())
+    }
+
+    fn shutdown(&self) {
+        let _ = self.tx.send(RenderMsg::Shutdown);
+        if let Some(h) = self.render_thread.lock().unwrap().take() {
+            let _ = h.join();
+        }
     }
 }
 

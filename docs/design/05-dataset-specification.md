@@ -441,6 +441,35 @@ clean suffix: values divisible by 1B get `b` suffix, by 1M get `m`, by
 1K get `k`, otherwise the raw number is used. Examples: `10000000` →
 `"10m"`, `1500000` → `"1500k"`, `100000` → `"100k"`, `1234` → `"1234"`.
 
+#### Variable references in sized specs
+
+Sized range endpoints may contain `${variable}` references that are
+resolved at expansion time rather than at YAML load time. This enables
+early stratification — declaring sized profiles at bootstrap before the
+pipeline has run.
+
+```yaml
+sized: ["mul:1m..${base_count}/2"]
+```
+
+When the config is loaded and `base_count` is not yet defined (no
+`variables.yaml`), entries containing unresolved variables are stored
+verbatim and skipped. When `expand_per_profile_steps()` runs during
+pipeline execution, the `ctx.defaults` map (populated from
+`variables.yaml`) provides the values and the deferred entries are
+expanded into concrete profiles.
+
+This supports the single-pass workflow:
+```sh
+veks bootstrap --auto --sized 'mul:1m..${base_count}/2'
+veks run    # core stages compute base_count; profiles expand; per-profile stages run
+```
+
+If a variable remains unresolved at expansion time, the entry is silently
+skipped and a warning is logged. This is not an error — it means the
+variable-producing stage has not yet run, and the profiles will be
+generated on the next `veks run` after the variable is available.
+
 #### Structured sized form with facet templates
 
 Instead of a simple list, `sized` can be a map with explicit facet

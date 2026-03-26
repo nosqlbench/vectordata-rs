@@ -831,3 +831,92 @@ fn dag_20_bare_number_fraction_rejected() {
     args.base_fraction = 0.5;
     assert!((args.base_fraction - 0.5).abs() < 1e-10);
 }
+
+// ── Config 21: Early stratification with sized profiles ───────────────
+#[test]
+fn dag_21_early_stratification() {
+    let tmp = make_tempdir();
+    let fvec = tmp.path().join("vectors.fvec");
+    write_fvec(&fvec, 200);
+
+    let out = tmp.path().join("out");
+    let mut args = default_args("early-strat", &out);
+    args.base_vectors = Some(fvec);
+    args.self_search = true;
+    // Sized profiles with concrete values (resolved at bootstrap)
+    args.sized_profiles = Some("50,100".to_string());
+
+    veks::prepare::import::run(args);
+    let yaml = read_yaml(&out);
+    let steps = parse_steps(&yaml);
+
+    // Core stages present
+    assert_step_present(&steps, "count-vectors");
+    assert_step_present(&steps, "sort-and-dedup");
+    assert_step_present(&steps, "generate-shuffle");
+    assert_step_present(&steps, "extract-base");
+    assert_step_present(&steps, "compute-knn");
+
+    // Sized profiles should appear in the yaml
+    assert!(yaml.contains("sized:"), "sized: key should be in dataset.yaml");
+}
+
+// ── Config 22: Base fraction + early stratification ───────────────────
+#[test]
+fn dag_22_fraction_with_early_stratification() {
+    let tmp = make_tempdir();
+    let fvec = tmp.path().join("vectors.fvec");
+    write_fvec(&fvec, 200);
+
+    let out = tmp.path().join("out");
+    let mut args = default_args("frac-strat", &out);
+    args.base_vectors = Some(fvec);
+    args.self_search = true;
+    args.base_fraction = 0.5;
+    args.sized_profiles = Some("20,40".to_string());
+
+    veks::prepare::import::run(args);
+    let yaml = read_yaml(&out);
+    let steps = parse_steps(&yaml);
+
+    // Subset step must be present for fraction
+    assert_step_present(&steps, "subset-vectors");
+
+    // Core KNN must be present
+    assert_step_present(&steps, "compute-knn");
+
+    // Sized profiles in yaml
+    assert!(yaml.contains("sized:"), "sized: key should be in dataset.yaml");
+
+    // The fraction should appear in the upstream defaults
+    assert!(yaml.contains("base_fraction") || yaml.contains("0.5"),
+        "fraction should be recorded in dataset.yaml");
+}
+
+// ── Config 23: All facets with early stratification ───────────────────
+#[test]
+fn dag_23_full_with_early_stratification() {
+    let tmp = make_tempdir();
+    let fvec = tmp.path().join("vectors.fvec");
+    write_fvec(&fvec, 200);
+    let meta_dir = tmp.path().join("metadata");
+    write_parquet_metadata(&meta_dir);
+
+    let out = tmp.path().join("out");
+    let mut args = default_args("full-strat", &out);
+    args.base_vectors = Some(fvec);
+    args.self_search = true;
+    args.metadata = Some(meta_dir);
+    args.sized_profiles = Some("50,100".to_string());
+
+    veks::prepare::import::run(args);
+    let yaml = read_yaml(&out);
+    let steps = parse_steps(&yaml);
+
+    // Full facet chain
+    assert_step_present(&steps, "convert-metadata");
+    assert_step_present(&steps, "compute-filtered-knn");
+
+    // Sized profiles
+    assert!(yaml.contains("sized:"), "sized: key should be in dataset.yaml");
+}

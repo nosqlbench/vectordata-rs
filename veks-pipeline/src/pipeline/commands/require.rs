@@ -125,9 +125,18 @@ run), the command returns immediately without re-running anything.
 
         // Check if all steps are already complete
         let progress_path = ProgressLog::path_for_dataset(&pipeline_path);
-        let progress = ProgressLog::load(&progress_path)
-            .map(|(p, _)| p)
-            .unwrap_or_else(|_| ProgressLog::new());
+        let progress = match ProgressLog::load(&progress_path) {
+            Ok((p, _)) => p,
+            Err(e) => {
+                if progress_path.exists() {
+                    ctx.ui.log(&format!(
+                        "Warning: could not load progress log '{}': {} — treating as empty",
+                        progress_path.display(), e
+                    ));
+                }
+                ProgressLog::new()
+            }
+        };
 
         let all_complete = step_ids.iter().all(|id| step_complete(&progress, id));
 
@@ -159,9 +168,15 @@ run), the command returns immediately without re-running anything.
         crate::pipeline::run_pipeline(run_args);
 
         // Re-check progress after run
-        let progress = ProgressLog::load(&progress_path)
-            .map(|(p, _)| p)
-            .unwrap_or_else(|_| ProgressLog::new());
+        let progress = match ProgressLog::load(&progress_path) {
+            Ok((p, _)) => p,
+            Err(e) => {
+                ctx.ui.log(&format!(
+                    "Warning: could not load progress log after run: {} — treating as empty", e
+                ));
+                ProgressLog::new()
+            }
+        };
         let all_complete = step_ids.iter().all(|id| step_complete(&progress, id));
 
         if all_complete {

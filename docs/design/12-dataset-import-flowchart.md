@@ -166,17 +166,41 @@ statistics including `vector_count`, `duplicate_count`, `zero_count`,
 |------|------|---------------|-----------------|
 | `catalog` | Index | Always materialized (final step) | `catalog generate` — produces `catalog.json` and `catalog.yaml` for the local dataset directory so the dataset is discoverable by catalog queries |
 
-### Stratification (post-pipeline)
+### Stratification
 
-Sized profiles are NOT part of the bootstrap pipeline DAG. They are
-added as a **separate post-pipeline step** using `veks prepare stratify`,
-which runs after the initial pipeline completes and `variables.yaml` is
-populated with actual vector counts.
+Sized profiles define windowed sub-ranges of the base data at multiple
+scales. They can be added either at bootstrap time or after the initial
+pipeline run. Both approaches are fully supported — the pipeline treats
+profiles as a dynamic overlay on the core processing stages, not a
+modification of them. See [SRD §3.13](03-pipeline-engine.md#313-stratification-invariant)
+for the design invariant that guarantees this.
 
-This design ensures:
-- Vector counts are **known values** (from `variables.yaml`), not estimates
-- The default spec adapts to the actual dataset size
-- Degenerate specs (start > end) cannot be generated
+**Early stratification** (at bootstrap): The `--sized` flag or wizard
+prompt embeds a `sized:` spec directly into `dataset.yaml`. Range
+expressions may reference `${base_count}`, which is resolved at run time
+after core stages populate `variables.yaml`. This eliminates the
+two-phase workflow:
+
+```sh
+veks bootstrap --auto --sized 'mul:1m..${base_count}/2'
+veks run    # core stages + all per-profile stages in one pass
+```
+
+**Post-pipeline stratification** (via `veks prepare stratify`): After
+the initial pipeline run populates `variables.yaml`, concrete profile
+sizes can be computed from the actual base count. This is the traditional
+workflow and is still recommended when the user wants to inspect the data
+before choosing profile scales:
+
+```sh
+veks run              # core stages only
+veks prepare stratify # add sized profiles based on actual counts
+veks run              # per-profile stages only (core stages skipped)
+```
+
+In either case, adding profiles never invalidates core pipeline steps.
+The config hash excludes `profiles:`, and per-profile step expansion
+is dynamic (see §3.6.1).
 
 **Default spec generation** scales to the dataset:
 
@@ -186,9 +210,6 @@ This design ensures:
 | >= 100K | `mul:{max/10}..{max}/2` |
 | >= 10K | `{max/5}..{max}/{max/5}` |
 | < 10K | single profile at `max/2` |
-
-After stratification, `veks run` is re-invoked to execute the per-profile
-`compute knn` and `verify knn-groundtruth` steps for each sized profile.
 
 The `veks run` completion message suggests stratification when no sized
 profiles exist:
@@ -516,6 +537,9 @@ slot, regardless of whether it is `Materialized` or `Identity`.
   **Format**: use `%` suffix for percentages (`1%`, `50%`, `100%`) or
   decimal fractions < 1 (`0.01` = 1%, `0.5` = 50%). Bare whole numbers
   like `1` or `50` are rejected to avoid ambiguity.
+  **Immutability**: Once set at bootstrap time, the base fraction is
+  immutable for the lifetime of the dataset. Changing it would break
+  ordinal alignment across all artifacts. See [SRD §3.13](03-pipeline-engine.md#base-fraction-immutability).
 - `--round-digits 2` (default) → computed counts rounded to 2 significant digits
 
 ### CLI flags and wizard defaults

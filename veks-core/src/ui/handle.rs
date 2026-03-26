@@ -166,6 +166,16 @@ impl UiHandle {
         self.sink.take_console_log()
     }
 
+    /// Shut down the UI sink, restoring the terminal to normal mode.
+    ///
+    /// Must be called before printing to stdout/stderr after TUI mode.
+    /// The global logger holds a leaked reference to the sink, so Drop
+    /// alone will never fire — this method is the only way to cleanly
+    /// exit the alternate screen.
+    pub fn shutdown(&self) {
+        self.sink.shutdown();
+    }
+
     /// Emit a log line above the progress region.
     ///
     /// Sends the event directly to the sink for immediate display, and

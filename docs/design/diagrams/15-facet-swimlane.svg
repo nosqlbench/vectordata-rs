@@ -1,5 +1,8 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1540" height="810" font-family="Helvetica, Arial, sans-serif">
-  <rect width="1540" height="810" fill="white" />
+   Compiling tools v0.1.0 (/mnt/datamir/home/jshook/projects/vectordata-rs/tools)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.37s
+     Running `target/debug/gen_swimlane`
+<svg xmlns="http://www.w3.org/2000/svg" width="1540" height="824" font-family="Helvetica, Arial, sans-serif">
+  <rect width="1540" height="824" fill="white" />
   <defs>
     <marker id="arrow-42a5f5" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
       <path d="M0,0 L8,3 L0,6" fill="#42a5f5" />
@@ -530,10 +533,13 @@ Each query uses only base vectors that match its predicate.</title>
     <text x="1365" y="760" text-anchor="middle" font-size="9" font-weight="bold">filtered_neighbor</text>
     <text x="1365" y="773" text-anchor="middle" font-size="9" font-weight="normal">_indices+_distances</text>
   </g>
+  <text x="92" y="738" font-size="8" fill="#666" font-style="italic">⤷ deferred profile expansion: per-profile [pp] steps instantiated after base_count is known</text>
   <text x="90" y="794" font-size="8" fill="#888">
     <a href="02-data-model.md#28-dataset-facets">Facet codes (§2.8)</a>
      · <a href="12-dataset-import-flowchart.md#124-universal-flow-graph">Pipeline spec (§12)</a>
      · <a href="14-pipeline-dag-configurations.md">DAG configs (§14)</a>
      · <a href="15-facet-swimlane.md">This diagram (§15)</a>
+     · <a href="03-invariants.md#313-stratification-invariant">Stratification (§3.13)</a>
   </text>
+  <text x="90" y="806" font-size="8" fill="#666" font-style="italic">Note: profiles expand after base_count is known — see §3.13 Stratification Invariant</text>
 </svg>

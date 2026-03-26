@@ -85,7 +85,7 @@ pub fn expand_per_profile_steps(
     let mut result = regular;
 
     // Collect all profiles to expand: sized ascending by base_count, then default last
-    let mut sized: Vec<(&str, u64)> = profiles.0.iter()
+    let mut sized: Vec<(&str, u64)> = profiles.profiles.iter()
         .filter(|(name, p)| name.as_str() != "default" && p.base_count.is_some())
         .map(|(name, p)| (name.as_str(), p.base_count.unwrap()))
         .collect();
@@ -94,7 +94,7 @@ pub fn expand_per_profile_steps(
     let mut all_profiles: Vec<(&str, Option<u64>)> = sized.into_iter()
         .map(|(name, bc)| (name, Some(bc)))
         .collect();
-    if profiles.0.contains_key("default") && !has_explicit_default_steps {
+    if profiles.profiles.contains_key("default") && !has_explicit_default_steps {
         all_profiles.push(("default", None));
     }
 

@@ -1872,7 +1872,8 @@ pub fn detect_metric(path: &Path) -> (String, String) {
             ("Cosine".to_string(), format!("default (vectors not normalized, mean norm={:.4})", mean_norm))
         }
     } else {
-        ("Cosine".to_string(), "default (could not probe vectors)".to_string())
+        eprintln!("Warning: could not read '{}' to detect metric — using Cosine as default", path.display());
+        ("Cosine".to_string(), format!("default (could not probe '{}')", path.display()))
     }
 }
 

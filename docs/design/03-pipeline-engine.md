@@ -226,11 +226,13 @@ Additionally, two whole-log invalidation mechanisms exist:
   user is informed (e.g., "Progress log schema version 1 differs from
   current 2 — clearing all step records").
 
-- **Pipeline definition mtime**: If `dataset.yaml` has a newer mtime
-  than the progress log file itself, the entire progress log is
-  invalidated (all step records cleared) before any steps are evaluated.
-  This ensures that edits to the pipeline definition trigger full
-  re-evaluation.
+- **Pipeline definition hash**: A FNV-1a hash of the pipeline-relevant
+  content of `dataset.yaml` is stored in the progress log. When the hash
+  changes, all step records are invalidated. The hash **excludes** the
+  `profiles:` section — profile changes (via `stratify` or manual editing)
+  do not invalidate core pipeline steps. Only changes to `steps:`,
+  `upstream:`, `defaults:`, and other non-profile sections trigger
+  invalidation. See §3.13 for the design rationale.
 
 When a step is stale, `check_step_freshness()` returns a reason string
 (e.g., "options changed", "output 'foo.ivec' missing", "input 'source'
@@ -407,3 +409,87 @@ is planned (REQ-RM-12).
 I/O throughput, I/O queue depth, active thread count, per-core CPU
 percentages, and system page cache size from `/proc` on Linux. All metrics
 are charted in the TUI (see §8.6.3).
+
+## 3.13 Stratification Invariant
+
+**Design invariant**: The core pipeline must support stratification with
+no procedural changes to the pipeline definition. Adding, removing, or
+modifying sized profiles must never require re-bootstrapping, editing the
+`steps:` section, or re-running core import/processing stages.
+
+This invariant is maintained through three mechanisms:
+
+1. **Dynamic profile expansion** (§3.6.1): Per-profile steps are expanded
+   at run time by `expand_per_profile_steps()`. The `steps:` section
+   contains profile-agnostic templates; actual per-profile steps are
+   synthesized from the current `profiles:` at each `veks run`. Adding
+   a new profile automatically generates the corresponding KNN, verify,
+   predicate evaluation, and filtered KNN steps.
+
+2. **Profile-excluded config hash** (§3.5): The pipeline definition hash
+   deliberately excludes the `profiles:` section. Editing profiles does
+   not change the hash, so existing step completion records remain valid.
+   Core stages (import, sort, dedup, shuffle, extract, metadata) are
+   never invalidated by profile changes.
+
+3. **Window-based subsetting**: Sized profiles reference the same physical
+   data files as the default profile, using `[0, base_count)` windows to
+   select a prefix. The base vectors, metadata, and other shared artifacts
+   are computed once; profiles merely view different ranges of the same
+   files. Windows are clamped to the actual file size at read time, so a
+   profile whose `base_count` exceeds the available data safely uses all
+   available vectors.
+
+### Corollary: Early Stratification
+
+Because the pipeline supports arbitrary windowed subsets and profile
+expansion is dynamic, sized profiles can be declared at bootstrap time —
+before the pipeline has run and before the actual base vector count is
+known. The `sized:` key in dataset.yaml accepts range expressions that
+are resolved during profile expansion. When the upper bound of a sized
+range uses a variable reference (e.g., `${base_count}`), the profiles
+are materialized at run time with the actual count.
+
+This eliminates the need for the two-phase workflow (run pipeline →
+stratify → run again). Instead:
+
+```
+veks bootstrap --auto --base-fraction '5%' --sized 'mul:1m..${base_count}/2'
+veks run
+```
+
+The bootstrap emits the `sized:` spec into dataset.yaml. On the first
+`veks run`, core stages execute and produce `base_count` in
+`variables.yaml`. Profile expansion then resolves `${base_count}` and
+generates the sized profiles. Per-profile steps (KNN, verify, etc.)
+execute in the same run, smallest to largest. No second invocation is
+needed.
+
+When `--sized` is omitted, the standard spec is auto-generated from the
+detected data scale. When `--auto` is used, a reasonable default set of
+profiles (power-of-ten scales up to the base count) is generated without
+user interaction.
+
+### Base Fraction Immutability
+
+The `--base-fraction` parameter is a bootstrap-time decision that locks in
+the data universe for the dataset. Once the first pipeline run completes:
+
+- The fraction determines how many source vectors are imported
+- Cleaning stages (dedup, zero-check) operate on that imported subset
+- The cleaned result defines `base_count` — the universe for all profiles
+- All downstream artifacts (shuffle, extraction, KNN, predicates) depend
+  on the ordinal space established by the cleaned data
+
+Changing the base fraction after the first run would invalidate every
+artifact in the pipeline because ordinal alignment would be lost. The
+config hash (§3.5) detects this and forces full re-execution.
+
+Stratification, by contrast, is safe at any time because profiles are
+windows into the already-cleaned data. A profile with `base_count: 10M`
+simply uses ordinals `[0, 10M)` from the same cleaned base vectors.
+No ordinal recomputation is needed.
+
+**Invariant**: `base_fraction` is write-once per dataset. The bootstrap
+command sets it; subsequent operations (stratify, run) must not change it.
+To use a different fraction, bootstrap a new dataset.

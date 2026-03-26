@@ -258,9 +258,26 @@ pub enum CatalogSubcommand {
 fn parse_fraction(s: &str) -> f64 {
     let s = s.trim();
     if let Some(pct) = s.strip_suffix('%') {
-        pct.trim().parse::<f64>().unwrap_or(100.0).clamp(0.0, 100.0) / 100.0
+        let pct_val = match pct.trim().parse::<f64>() {
+            Ok(v) => v,
+            Err(_) => {
+                eprintln!("Error: --base-fraction '{}' — '{}' is not a valid number", s, pct.trim());
+                std::process::exit(1);
+            }
+        };
+        if pct_val < 0.0 || pct_val > 100.0 {
+            eprintln!("Error: --base-fraction '{}' — percentage must be between 0% and 100%", s);
+            std::process::exit(1);
+        }
+        pct_val / 100.0
     } else {
-        let v = s.parse::<f64>().unwrap_or(1.0);
+        let v = match s.parse::<f64>() {
+            Ok(v) => v,
+            Err(_) => {
+                eprintln!("Error: --base-fraction '{}' is not a valid number. Use e.g. '5%' or '0.05'", s);
+                std::process::exit(1);
+            }
+        };
         if v >= 1.0 {
             if v == 1.0 && !s.contains('.') {
                 // Bare "1" is ambiguous — could mean 1% or 100%.
@@ -278,7 +295,11 @@ fn parse_fraction(s: &str) -> f64 {
             );
             std::process::exit(1);
         } else {
-            v.clamp(0.0, 1.0)
+            if v < 0.0 {
+                eprintln!("Error: --base-fraction '{}' — fraction must be positive", s);
+                std::process::exit(1);
+            }
+            v
         }
     }
 }
@@ -307,6 +328,33 @@ pub fn run(args: PrepareArgs) {
                 metric
             };
             let restart = restart || auto;
+
+            // Validate explicitly provided paths exist before proceeding.
+            // Without this, a typo or misplaced flag value (e.g. --base-vectors '5%')
+            // silently falls through to auto-detection in the wizard.
+            fn validate_path_arg(name: &str, path: &Option<std::path::PathBuf>) {
+                if let Some(p) = path {
+                    if !p.exists() {
+                        eprintln!("Error: --{name} path '{}' does not exist", p.display());
+                        std::process::exit(1);
+                    }
+                }
+            }
+            validate_path_arg("base-vectors", &base_vectors);
+            validate_path_arg("query-vectors", &query_vectors);
+            validate_path_arg("metadata", &metadata);
+            validate_path_arg("ground-truth", &ground_truth);
+            validate_path_arg("ground-truth-distances", &ground_truth_distances);
+            if let Some(ref o) = output {
+                // output directory is allowed to not exist yet (we'll create it),
+                // but its parent must exist
+                if let Some(parent) = o.parent() {
+                    if !parent.as_os_str().is_empty() && !parent.exists() {
+                        eprintln!("Error: --output parent directory '{}' does not exist", parent.display());
+                        std::process::exit(1);
+                    }
+                }
+            }
 
             if restart {
                 let out_dir = output.as_deref()

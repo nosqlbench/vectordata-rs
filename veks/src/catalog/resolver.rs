@@ -445,7 +445,7 @@ mod tests {
             dataset_type: "dataset.yaml".to_string(),
             layout: CatalogLayout {
                 attributes: None,
-                profiles: vectordata::dataset::DSProfileGroup(profile_group),
+                profiles: vectordata::dataset::DSProfileGroup::from_profiles(profile_group),
             },
         }
     }

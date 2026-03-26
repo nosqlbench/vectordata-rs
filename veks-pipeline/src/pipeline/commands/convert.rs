@@ -158,21 +158,23 @@ Convert with explicit source format override:
             }
         };
 
-        let explicit_limit: Option<u64> = options
-            .get("limit")
-            .and_then(|s| s.parse().ok());
-        let fraction: Option<f64> = options
-            .get("fraction")
-            .and_then(|s| s.parse().ok())
-            .filter(|&f| f > 0.0 && f < 1.0);
+        let explicit_limit: Option<u64> = match options.parse_opt("limit") {
+            Ok(v) => v,
+            Err(e) => return error_result(e, start),
+        };
+        let fraction: Option<f64> = match options.parse_opt::<f64>("fraction") {
+            Ok(v) => v.filter(|&f| f > 0.0 && f < 1.0),
+            Err(e) => return error_result(e, start),
+        };
 
-        let slab_page_size: Option<u32> = options
-            .get("slab_page_size")
-            .and_then(|s| s.parse().ok());
-        let slab_namespace: u8 = options
-            .get("slab_namespace")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(1);
+        let slab_page_size: Option<u32> = match options.parse_opt("slab_page_size") {
+            Ok(v) => v,
+            Err(e) => return error_result(e, start),
+        };
+        let slab_namespace: u8 = match options.parse_or("slab_namespace", 1u8) {
+            Ok(v) => v,
+            Err(e) => return error_result(e, start),
+        };
 
         // Open source
         ctx.ui.log(&format!(
@@ -265,17 +267,14 @@ Convert with explicit source format override:
         let has_count = record_count.is_some();
         let use_mmap_parallel = is_npy && is_xvec && is_dir && has_count;
 
-        let eligibility_msg = format!(
-            "  mmap eligibility: npy={} xvec={} dir={} count={} → {}",
+        log::debug!(
+            "mmap eligibility: npy={} xvec={} dir={} count={} → {}",
             is_npy, is_xvec, is_dir, has_count,
             if use_mmap_parallel { "PARALLEL" } else { "sequential" }
         );
-        ctx.ui.log(&eligibility_msg);
-        // Also emit to stderr directly in case TUI log pane isn't rendering
-        eprintln!("[convert] {}", eligibility_msg);
 
-        ctx.ui.log(&format!("  convert path: {}",
-            if use_mmap_parallel { "PARALLEL MMAP" } else { "sequential" }));
+        log::debug!("convert path: {}",
+            if use_mmap_parallel { "PARALLEL MMAP" } else { "sequential" });
 
         if use_mmap_parallel {
             drop(source); // release the sequential reader
@@ -327,11 +326,10 @@ Convert with explicit source format override:
                 ctx.ui.log(&format!("  limit: {} records, using {} of {} npy files",
                     total, manifest.len(), _total));
             }
-            ctx.ui.log(&format!("  {} npy files, {} total records", manifest.len(), total));
+            log::debug!("{} npy files, {} total records", manifest.len(), total);
 
             // Pre-allocate output file
-            ctx.ui.log(&format!("  pre-allocating {} ...",
-                format_size(total_bytes)));
+            log::debug!("pre-allocating {} ...", format_size(total_bytes));
             let alloc_start = Instant::now();
             let mmap_writer = match veks_core::formats::writer::mmap_xvec::MmapXvecWriter::create(
                 &output_path, dimension, dst_element_size, total,
@@ -339,8 +337,8 @@ Convert with explicit source format override:
                 Ok(w) => w,
                 Err(e) => return error_result(format!("failed to create mmap writer: {}", e), start),
             };
-            ctx.ui.log(&format!("  pre-allocation done ({:.1}s)",
-                alloc_start.elapsed().as_secs_f64()));
+            log::debug!("pre-allocation done ({:.1}s)",
+                alloc_start.elapsed().as_secs_f64());
             let shared_writer = veks_core::formats::writer::mmap_xvec::SharedMmapWriter::new(mmap_writer);
 
             let pb = ctx.ui.bar(total, "converting records");

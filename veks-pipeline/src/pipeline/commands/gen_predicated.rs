@@ -132,16 +132,22 @@ trees.
             .map(|s| resolve_path(s, &ctx.workspace))
             .unwrap_or_else(|| input_dir.clone());
 
-        let field_count: usize = options
-            .get("fields")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(3);
+        let field_count: usize = match options.get("fields") {
+            Some(s) => match s.parse() {
+                Ok(v) => v,
+                Err(e) => return error_result(format!("invalid 'fields' value '{}': {}", s, e), start),
+            },
+            None => 3,
+        };
         let field_types_str = options.get("field-types").unwrap_or("int,enum,enum_set");
         let cardinalities_str = options.get("cardinalities").unwrap_or("12,30,28");
-        let selectivity: f64 = options
-            .get("selectivity")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0.1);
+        let selectivity: f64 = match options.get("selectivity") {
+            Some(s) => match s.parse() {
+                Ok(v) => v,
+                Err(e) => return error_result(format!("invalid 'selectivity' value '{}': {}", s, e), start),
+            },
+            None => 0.1,
+        };
         let complexity = options.get("predicate-complexity").unwrap_or("simple");
         let seed = rng::parse_seed(options.get("seed"));
 
@@ -162,10 +168,13 @@ trees.
         let neighbors_from_yaml: usize = extract_yaml_value(&dataset_yaml, "neighbors")
             .and_then(|s| s.parse().ok())
             .unwrap_or(100);
-        let neighbors: usize = options
-            .get("neighbors")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(neighbors_from_yaml);
+        let neighbors: usize = match options.get("neighbors") {
+            Some(s) => match s.parse() {
+                Ok(v) => v,
+                Err(e) => return error_result(format!("invalid 'neighbors' value '{}': {}", s, e), start),
+            },
+            None => neighbors_from_yaml,
+        };
 
         // Open base and query vectors
         let base_path = input_dir.join("base.fvec");
@@ -189,10 +198,21 @@ trees.
 
         // Parse field types and cardinalities
         let type_strs: Vec<&str> = field_types_str.split(',').map(|s| s.trim()).collect();
-        let cardinalities: Vec<u32> = cardinalities_str
-            .split(',')
-            .filter_map(|s| s.trim().parse().ok())
-            .collect();
+        let cardinalities: Vec<u32> = {
+            let mut vals = Vec::new();
+            for part in cardinalities_str.split(',') {
+                let part = part.trim();
+                if part.is_empty() { continue; }
+                match part.parse::<u32>() {
+                    Ok(v) => vals.push(v),
+                    Err(e) => return error_result(
+                        format!("invalid cardinality '{}' in '{}': {}", part, cardinalities_str, e),
+                        start,
+                    ),
+                }
+            }
+            vals
+        };
 
         // Generate schema
         let schema = generator::generate_schema(field_count, &type_strs, &cardinalities);

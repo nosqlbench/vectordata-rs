@@ -33,4 +33,11 @@ pub trait UiSink: Send + Sync {
     fn take_console_log(&self) -> Vec<String> {
         Vec::new()
     }
+
+    /// Shut down the sink, restoring the terminal to normal mode.
+    ///
+    /// Must be called before printing to stdout/stderr after TUI mode.
+    /// The global `log` crate logger holds a leaked `Arc<dyn UiSink>`,
+    /// so `Drop` alone is insufficient — the refcount never reaches zero.
+    fn shutdown(&self) {}
 }

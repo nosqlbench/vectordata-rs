@@ -289,7 +289,7 @@ fn test_remote_dataset_view() {
                     base_count: None,
                     views,
                 });
-                DSProfileGroup(profiles)
+                DSProfileGroup::from_profiles(profiles)
             },
         },
     };

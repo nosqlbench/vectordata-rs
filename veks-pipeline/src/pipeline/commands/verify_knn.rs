@@ -918,27 +918,26 @@ impl CommandOp for VerifyKnnOp {
             }
         };
 
-        let sample_count: usize = options
-            .get("sample")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(100);
+        let sample_count: usize = match options.parse_or("sample", 100usize) {
+            Ok(v) => v,
+            Err(e) => return error_result(e, start),
+        };
 
-        let seed: u64 = options
-            .get("seed")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(42);
+        let seed: u64 = match options.parse_or("seed", 42u64) {
+            Ok(v) => v,
+            Err(e) => return error_result(e, start),
+        };
 
-        let phi: f32 = options
-            .get("phi")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0.001);
+        let phi: f32 = match options.parse_or("phi", 0.001f32) {
+            Ok(v) => v,
+            Err(e) => return error_result(e, start),
+        };
 
-        let threads: usize = options
-            .get("threads")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or_else(|| {
-                ctx.governor.current_or("threads", ctx.threads as u64) as usize
-            });
+        let threads: usize = match options.parse_opt::<usize>("threads") {
+            Ok(Some(v)) => v,
+            Ok(None) => ctx.governor.current_or("threads", ctx.threads as u64) as usize,
+            Err(e) => return error_result(e, start),
+        };
 
         // -- Resolve paths ----------------------------------------------------
 

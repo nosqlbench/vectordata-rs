@@ -260,7 +260,7 @@ impl ProfileView {
 /// Collect all view (facet) names from all profiles in an entry.
 fn collect_all_view_names(entry: &CatalogEntry) -> Vec<String> {
     let mut names = Vec::new();
-    for (_, profile) in &entry.layout.profiles.0 {
+    for (_, profile) in &entry.layout.profiles.profiles {
         for key in profile.views.keys() {
             if !names.iter().any(|n: &String| n.eq_ignore_ascii_case(key)) {
                 names.push(key.clone());
@@ -322,7 +322,7 @@ fn matches_description_regex(entry: &CatalogEntry, pattern: &str) -> bool {
 /// default profile's base_vectors window size.
 pub fn max_base_count(entry: &CatalogEntry) -> Option<u64> {
     let mut max: Option<u64> = None;
-    for (_, profile) in &entry.layout.profiles.0 {
+    for (_, profile) in &entry.layout.profiles.profiles {
         if let Some(bc) = profile.base_count {
             max = Some(max.map_or(bc, |m: u64| m.max(bc)));
         }
@@ -377,7 +377,7 @@ pub fn infer_vtype(entry: &CatalogEntry) -> Option<String> {
     if entry.dataset_type.eq_ignore_ascii_case("hdf5") {
         return Some("hdf5".to_string());
     }
-    for (_, profile) in &entry.layout.profiles.0 {
+    for (_, profile) in &entry.layout.profiles.profiles {
         if let Some(view) = profile.views.get("base_vectors") {
             return vtype_from_extension(view.path());
         }
@@ -1096,7 +1096,7 @@ mod tests {
             dataset_type: "dataset.yaml".to_string(),
             layout: CatalogLayout {
                 attributes: None,
-                profiles: DSProfileGroup(profiles),
+                profiles: DSProfileGroup::from_profiles(profiles),
             },
         }
     }
@@ -1241,7 +1241,7 @@ mod tests {
             dataset_type: "dataset.yaml".to_string(),
             layout: CatalogLayout {
                 attributes: None,
-                profiles: DSProfileGroup(profiles),
+                profiles: DSProfileGroup::from_profiles(profiles),
             },
         };
 
@@ -1276,7 +1276,7 @@ mod tests {
             dataset_type: "dataset.yaml".to_string(),
             layout: CatalogLayout {
                 attributes: None,
-                profiles: DSProfileGroup(profiles),
+                profiles: DSProfileGroup::from_profiles(profiles),
             },
         };
 

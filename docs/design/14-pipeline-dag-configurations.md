@@ -448,6 +448,41 @@ extract   extract   survey-meta  extract-meta
 - All ranges use `${base_end}`
 - Total ~25 steps
 
+### Configuration 21: Early Stratification with Deferred Profiles
+
+**Scenario**: Bootstrap with `--sized 'mul:1m..${base_count}/2'` — profiles
+declared at bootstrap but expanded after core stages produce `base_count`.
+
+**Input**: fvec base vectors, self-search, sized spec with variable reference
+
+**DAG (Phase 1 — core stages)**:
+```
+import → count → sort → zeros → clean-ordinals → shuffle → extract-queries → extract-base → count-base → compute-knn → verify-knn
+```
+
+**DAG (Phase 2 — deferred profile stages, after base_count known)**:
+Per-profile stages expand dynamically. For a 100K dataset with
+`mul:1m..${base_count}/2`, if `base_count=95000`, no profiles are generated
+(all would exceed the base count). For `base_count=10000000`, profiles
+`1m, 2m, 4m` are generated and processed smallest-first.
+
+**Key properties**:
+- Phase 1 is identical to Configuration 1 (minimal self-search)
+- Phase 2 steps are generated at runtime after `base_count` is known
+- Profile expansion uses the same `expand_per_profile_steps()` as static profiles
+- Cache reuse: 1m partition segments reused by 2m and 4m profiles
+
+### Configuration 22: Base Fraction with Early Stratification
+
+**Scenario**: `--base-fraction '5%' --sized 'mul:1m..${base_count}/2'`
+
+**Input**: fvec base vectors, self-search, 5% fraction, sized spec
+
+**Key property**: The fraction is applied first (during import/subset),
+then cleaning runs on the subset, then `base_count` is computed from
+the cleaned subset. Profiles are derived from this cleaned count.
+Changing the fraction would require a full re-bootstrap.
+
 ---
 
 ## 14.4 Variable Reference Rules
@@ -468,7 +503,73 @@ with `:roundN` for clean dataset sizes (see `--round-digits`).
 
 ---
 
-## 14.5 Test Execution
+### Configuration 21: Early Stratification
+
+**Scenario**: Bootstrap with `--sized '50,100'` on 200-vector source data.
+Profiles are declared at bootstrap time with concrete values.
+
+**Facets**: BQGD (no metadata)
+
+**Key properties**:
+- The `sized:` key appears in `dataset.yaml` at bootstrap time
+- Core stages (import, sort, dedup, shuffle, extract, KNN) run as normal
+- Per-profile steps expand dynamically at `veks run` time
+- Adding more profiles later (via stratify) does not invalidate core steps
+
+**Test**: `dag_21_early_stratification`
+
+---
+
+### Configuration 22: Base Fraction with Early Stratification
+
+**Scenario**: `--base-fraction 50% --sized '20,40'`
+
+**Facets**: BQGD (no metadata)
+
+**Key properties**:
+- The fraction is applied first via `subset-vectors`
+- Cleaning runs on the subset
+- `base_count` is computed from the cleaned subset
+- Sized profiles operate within this reduced universe
+- **Invariant**: changing the fraction invalidates all artifacts (§3.13)
+
+**Test**: `dag_22_fraction_with_early_stratification`
+
+---
+
+### Configuration 23: Full Pipeline with Early Stratification
+
+**Scenario**: All facets (BQGDMPRF) with metadata and `--sized '50,100'`
+
+**Key properties**:
+- Full facet chain including metadata conversion, predicate synthesis,
+  filtered KNN
+- Sized profiles get per-profile KNN and filtered KNN steps
+- Metadata is shared (not per-profile); KNN and filtered KNN are per-profile
+
+**Test**: `dag_23_full_with_early_stratification`
+
+---
+
+## 14.5 Adversarial Test Coverage
+
+The following adversarial conditions are tested in
+`veks/tests/e2e_pipeline.rs` to verify pipeline robustness:
+
+| Test | Condition | Expected behavior |
+|------|-----------|-------------------|
+| `adversarial_idempotent_rerun` | Re-run with same config | All steps skipped (fresh) |
+| `adversarial_knn_indices_in_range` | KNN output validation | All indices in `[0, base_count)` |
+| `adversarial_empty_base_vectors` | 0-byte input file | Graceful error, no hang |
+| `adversarial_query_count_exceeds_vectors` | `query_count > vector_count` | No panic; cap or error |
+| `adversarial_k_exceeds_base_count` | `k > base_count` | No panic; cap or error |
+| `adversarial_zero_fraction` | `--base-fraction 0%` | Graceful handling |
+| `adversarial_sized_profile_exceeds_base` | Profile size > base count | Window clamped, no error |
+| `adversarial_different_seeds_valid_knn` | Same data, different seeds | Both produce valid results |
+
+---
+
+## 14.6 Test Execution
 
 Tests are in `veks/tests/dag_configurations.rs`. Each test:
 

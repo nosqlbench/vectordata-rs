@@ -128,7 +128,7 @@ pub fn project_workspace(
     }
 
     // Also add profile view paths as final artifacts
-    for (_, profile) in &config.profiles.0 {
+    for (_, profile) in &config.profiles.profiles {
         for (_, view) in &profile.views {
             let source = &view.source.path;
             if !source.is_empty() {

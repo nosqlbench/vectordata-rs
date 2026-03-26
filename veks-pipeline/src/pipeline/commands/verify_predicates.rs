@@ -74,15 +74,18 @@ impl CommandOp for VerifyPredicatesOp {
             Ok(s) => s, Err(e) => return error_result(e, start),
         };
 
-        let sample_count: usize = options.get("sample")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(50);
-        let metadata_sample: usize = options.get("metadata-sample")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(100_000);
-        let seed: u64 = options.get("seed")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(42);
+        let sample_count: usize = match options.parse_or("sample", 50usize) {
+            Ok(v) => v,
+            Err(e) => return error_result(e, start),
+        };
+        let metadata_sample: usize = match options.parse_or("metadata-sample", 100_000usize) {
+            Ok(v) => v,
+            Err(e) => return error_result(e, start),
+        };
+        let seed: u64 = match options.parse_or("seed", 42u64) {
+            Ok(v) => v,
+            Err(e) => return error_result(e, start),
+        };
 
         let metadata_path = resolve_path(metadata_str, &ctx.workspace);
         let predicates_path = resolve_path(predicates_str, &ctx.workspace);

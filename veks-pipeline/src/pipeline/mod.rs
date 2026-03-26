@@ -475,13 +475,13 @@ pub fn run_pipeline(args: RunArgs) {
     // Profile names ordered by size: sized ascending, then default last
     let all_profile_names: Vec<String> = {
         let profiles = &config.profiles;
-        let mut sized: Vec<(&str, u64)> = profiles.0.iter()
+        let mut sized: Vec<(&str, u64)> = profiles.profiles.iter()
             .filter(|(name, p)| name.as_str() != "default" && p.base_count.is_some())
             .map(|(name, p)| (name.as_str(), p.base_count.unwrap()))
             .collect();
         sized.sort_by_key(|(_, bc)| *bc);
         let mut names: Vec<String> = sized.into_iter().map(|(n, _)| n.to_string()).collect();
-        if profiles.0.contains_key("default") {
+        if profiles.profiles.contains_key("default") {
             names.push("default".to_string());
         }
         names
@@ -521,15 +521,76 @@ pub fn run_pipeline(args: RunArgs) {
     // Build command registry
     let registry = CommandRegistry::with_builtins();
 
-    // Run
+    // Phase 1: Run steps (core + any already-resolved per-profile steps)
     let result = runner::run_steps(&pipeline_dag.steps, &registry, &mut ctx);
 
-    // Retrieve buffered log messages before dropping the TUI.
+    // Phase 2: If there are deferred sized entries (containing ${variable}
+    // references), expand them now that core steps have produced the actual
+    // counts in variables.yaml, then run the newly generated per-profile steps.
+    let result = if result.is_ok() && config.profiles.has_deferred() {
+        // Reload variables — core steps may have produced base_count etc.
+        match variables::load(&ctx.workspace) {
+            Ok(vars) => {
+                for (k, v) in &vars {
+                    ctx.defaults.insert(k.clone(), v.clone());
+                }
+            }
+            Err(e) => {
+                log::warn!("failed to reload variables for deferred profiles: {}", e);
+            }
+        }
+
+        let added = config.profiles.expand_deferred_sized(&ctx.defaults);
+        if added > 0 {
+            ctx.ui.log(&format!(
+                "Expanded {} deferred sized profiles after core stages", added
+            ));
+
+            // Re-derive views for the new profiles
+            let template_steps: Vec<_> = vectordata::dataset::collect_all_steps(&config)
+                .into_iter()
+                .filter(|s| s.per_profile)
+                .collect();
+            config.profiles.derive_views_from_templates(&template_steps);
+
+            // Re-expand per-profile steps with the new profiles
+            let raw_steps = vectordata::dataset::collect_all_steps(&config);
+            let new_expanded = vectordata::dataset::expand_per_profile_steps(
+                raw_steps, &config.profiles, query_count,
+            );
+
+            // Filter to only the new per-profile steps (skip already-completed core)
+            let new_steps = if profile_name == "all" {
+                new_expanded
+            } else {
+                vectordata::dataset::filter_steps_for_profile(new_expanded, profile_name)
+            };
+
+            match dag::build_dag(&new_steps) {
+                Ok(new_dag) => {
+                    // Run phase 2 steps — already-completed steps will be
+                    // skipped via freshness checks
+                    runner::run_steps(&new_dag.steps, &registry, &mut ctx)
+                }
+                Err(e) => {
+                    Err(format!("DAG error for deferred profiles: {}", e))
+                }
+            }
+        } else {
+            result
+        }
+    } else {
+        result
+    };
+
+    // Retrieve buffered log messages before shutting down the TUI.
     let console_log = ctx.ui.take_console_log();
 
-    // Drop ctx (including the UI handle) to restore the terminal before
-    // printing any messages. Without this, error output goes to the
-    // alternate screen and is lost when the ratatui sink is dropped.
+    // Explicitly shut down the TUI sink to restore the terminal.
+    // The global logger holds a leaked Arc<dyn UiSink>, so Drop alone
+    // never fires — shutdown() sends the Shutdown signal and joins the
+    // render thread, restoring raw mode and the alternate screen.
+    ctx.ui.shutdown();
     drop(ctx);
 
     // Replay buffered log messages to stdout so they persist in scrollback.
@@ -565,8 +626,9 @@ pub fn run_pipeline(args: RunArgs) {
                 print_cache_guidance(&cache_dir_for_guidance, &pipeline_dag.steps);
             }
             // Suggest stratification if no sized profiles exist yet
-            let has_sized = config.profiles.0.iter()
-                .any(|(name, _)| name != "default");
+            let has_sized = config.profiles.profiles.iter()
+                .any(|(name, _)| name != "default")
+                || config.profiles.has_deferred();
             if !has_sized && summary.executed > 0 {
                 println!();
                 println!("{}",

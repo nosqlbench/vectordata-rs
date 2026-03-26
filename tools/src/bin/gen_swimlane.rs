@@ -25,7 +25,7 @@ const BOX_W: i32 = COL_W - 2 * PAD_X;
 const BOX_R: i32 = 6;
 const MARGIN_LR: i32 = 90;
 const MARGIN_TOP: i32 = 62;
-const MARGIN_BOT: i32 = 20;
+const MARGIN_BOT: i32 = 34;
 const FONT: i32 = 11;
 const FONT_SM: i32 = 9;
 const INPUT_H: i32 = 30;
@@ -462,6 +462,13 @@ fn main() {
         writeln!(svg, "  </g>").unwrap();
     }
 
+    // Deferred profile expansion annotation — near the bottom, above the artifact row
+    {
+        let ann_x = MARGIN_LR + 2;
+        let ann_y = cy(11) + ROW_H / 2 + 4;
+        writeln!(svg, r#"  <text x="{ann_x}" y="{ann_y}" font-size="8" fill="{CLR_COND}" font-style="italic">⤷ deferred profile expansion: per-profile [pp] steps instantiated after base_count is known</text>"#).unwrap();
+    }
+
     // Legend with links to SRD sections
     let legend_y = MARGIN_TOP + TOTAL_ROWS * ROW_H + 4;
     writeln!(svg, r#"  <text x="{MARGIN_LR}" y="{legend_y}" font-size="8" fill="{CLR_LABEL}">"#).unwrap();
@@ -469,7 +476,10 @@ fn main() {
     writeln!(svg, r#"     · <a href="12-dataset-import-flowchart.md#124-universal-flow-graph">Pipeline spec (§12)</a>"#).unwrap();
     writeln!(svg, r#"     · <a href="14-pipeline-dag-configurations.md">DAG configs (§14)</a>"#).unwrap();
     writeln!(svg, r#"     · <a href="15-facet-swimlane.md">This diagram (§15)</a>"#).unwrap();
+    writeln!(svg, r#"     · <a href="03-invariants.md#313-stratification-invariant">Stratification (§3.13)</a>"#).unwrap();
     writeln!(svg, "  </text>").unwrap();
+    let note_y = legend_y + 12;
+    writeln!(svg, r#"  <text x="{MARGIN_LR}" y="{note_y}" font-size="8" fill="{CLR_COND}" font-style="italic">Note: profiles expand after base_count is known — see §3.13 Stratification Invariant</text>"#).unwrap();
 
     writeln!(svg, "</svg>").unwrap();
     print!("{svg}");

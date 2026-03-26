@@ -69,7 +69,7 @@ pub fn run(path: &Path, spec: Option<&str>, force: bool, yes: bool) {
     }
 
     // Check for existing sized profiles (any profile with base_count set)
-    let existing_sized: Vec<&str> = config.profiles.0.iter()
+    let existing_sized: Vec<&str> = config.profiles.profiles.iter()
         .filter(|(name, p)| name.as_str() != "default" && p.base_count.is_some())
         .map(|(name, _)| name.as_str())
         .collect();
@@ -84,7 +84,7 @@ pub fn run(path: &Path, spec: Option<&str>, force: bool, yes: bool) {
     if !existing_sized.is_empty() && force {
         let to_remove: Vec<String> = existing_sized.iter().map(|s| s.to_string()).collect();
         for name in &to_remove {
-            config.profiles.0.swap_remove(name);
+            config.profiles.profiles.swap_remove(name);
         }
         println!("Removed {} existing sized profile(s)", to_remove.len());
     }
@@ -210,7 +210,7 @@ pub fn run(path: &Path, spec: Option<&str>, force: bool, yes: bool) {
             base_count: Some(*count),
             views,
         };
-        config.profiles.0.insert(prof_name.clone(), profile);
+        config.profiles.profiles.insert(prof_name.clone(), profile);
     }
 
     // Backup the existing file
