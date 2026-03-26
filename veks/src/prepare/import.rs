@@ -1204,6 +1204,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
     }
     if let Some(ref fknn) = slots.filtered_knn {
         if fknn.is_materialized() {
+            catalog_after.push("verify-filtered-knn".into());
             catalog_after.push("verify-predicates".into());
         }
     }
@@ -1218,7 +1219,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
         description: Some("Generate catalog index for the dataset directory".into()),
         after: catalog_after,
         per_profile: false,
-        phase: 0,
+        phase: 0, // not per-profile, depends on verify steps via after
         options: vec![
             ("input".into(), ".".into()),
         ],

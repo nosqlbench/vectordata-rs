@@ -338,6 +338,10 @@ pub struct StreamContext {
     pub ui: UiHandle,
     /// Interval between resource status polls and TUI redraws.
     pub status_interval: std::time::Duration,
+    /// Estimated total steps including deferred per-profile expansions.
+    /// When > 0 and > the current step count, the runner shows both
+    /// the current batch count and the estimated total.
+    pub estimated_total_steps: usize,
 }
 
 /// Describes a single accepted option for a `CommandOp`.

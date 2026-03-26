@@ -89,15 +89,26 @@ pub fn run_steps(
         (true, true) => String::new(),
     };
 
+    let est_total = ctx.estimated_total_steps;
+    let show_estimate = est_total > total;
+
     // Open the provenance log
     let mut dlog = DatasetLog::open(&ctx.workspace);
     dlog.log(&format!("\n=== veks run {} ===", chrono::Local::now().format("%Y-%m-%d %H:%M:%S")));
     dlog.log(&format!("pipeline: {} steps, profile: {}", total, ctx.profile));
 
     if ctx_label.is_empty() {
-        ctx.ui.log(&format!("Pipeline: {} step(s) to evaluate\n", total));
+        if show_estimate {
+            ctx.ui.log(&format!("Pipeline: {} step(s) ready, ~{} total with deferred profiles\n", total, est_total));
+        } else {
+            ctx.ui.log(&format!("Pipeline: {} step(s) to evaluate\n", total));
+        }
     } else {
-        ctx.ui.log(&format!("{} — {} step(s) to evaluate\n", ctx_label, total));
+        if show_estimate {
+            ctx.ui.log(&format!("{} — {} step(s) ready, ~{} total with deferred profiles\n", ctx_label, total, est_total));
+        } else {
+            ctx.ui.log(&format!("{} — {} step(s) to evaluate\n", ctx_label, total));
+        }
     }
 
     // Track which steps actually executed (not skipped) for cascade invalidation.
@@ -130,10 +141,15 @@ pub fn run_steps(
             String::new()
         };
 
-        let prefix = if ctx_label.is_empty() {
-            format!("[{}/{}]", step_num, total)
+        let step_counter = if show_estimate {
+            format!("[{}/{} of ~{}]", step_num, total, est_total)
         } else {
-            format!("{} [{}/{}]", ctx_label, step_num, total)
+            format!("[{}/{}]", step_num, total)
+        };
+        let prefix = if ctx_label.is_empty() {
+            step_counter.clone()
+        } else {
+            format!("{} {}", ctx_label, step_counter)
         };
 
         // 1. Interpolate options early so we can compare against the progress log

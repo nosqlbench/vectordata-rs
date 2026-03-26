@@ -50,9 +50,50 @@ use clap_complete::engine::ArgValueCompleter;
 use indexmap::IndexMap;
 
 use vectordata::dataset::DatasetConfig;
+use vectordata::dataset::pipeline::StepDef;
 use command::StreamContext;
 use progress::ProgressLog;
 use registry::CommandRegistry;
+
+/// Resolve the full expanded step list for a dataset, including deferred
+/// profile expansion from variables.yaml. This is the single source of
+/// truth for step resolution — used by `run`, `check`, `publish`, and
+/// `dry-run`.
+///
+/// Returns the expanded steps and the mutated config (with profiles resolved).
+pub fn resolve_all_steps(
+    config: &mut DatasetConfig,
+    workspace: &Path,
+) -> Vec<StepDef> {
+    let query_count: u64 = config.upstream.as_ref()
+        .and_then(|p| p.defaults.as_ref())
+        .and_then(|d| d.get("query_count"))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10_000);
+
+    // Resolve deferred sized profiles from variables.yaml
+    if config.profiles.has_deferred() {
+        if let Ok(vars) = variables::load(workspace) {
+            let var_map: indexmap::IndexMap<String, String> = vars.into_iter().collect();
+            let added = config.profiles.expand_deferred_sized(&var_map);
+            if added > 0 {
+                log::info!("Resolved {} deferred sized profiles from variables.yaml", added);
+            }
+        }
+    }
+
+    let raw_steps = vectordata::dataset::collect_all_steps(config);
+    let expanded = vectordata::dataset::expand_per_profile_steps(raw_steps, &config.profiles, query_count);
+
+    // Auto-derive profile views for sized profiles from template outputs
+    let template_steps: Vec<_> = vectordata::dataset::collect_all_steps(config)
+        .into_iter()
+        .filter(|s| s.per_profile)
+        .collect();
+    config.profiles.derive_views_from_templates(&template_steps);
+
+    expanded
+}
 
 /// CLI arguments for `veks run`.
 #[derive(Args)]
@@ -187,21 +228,8 @@ pub fn run_script(args: ScriptArgs) {
 
     let profile_name = &args.profile;
 
-    let raw_steps = vectordata::dataset::collect_all_steps(&config);
-
-    let query_count: u64 = config
-        .upstream
-        .as_ref()
-        .and_then(|p| p.defaults.as_ref())
-        .and_then(|d| d.get("query_count"))
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(10_000);
-
-    let expanded_steps = vectordata::dataset::expand_per_profile_steps(raw_steps, &config.profiles, query_count);
-    // Profile ordering is handled by the sequential executor — steps are
-    // emitted in profile order (sized ascending, then default) by
-    // expand_per_profile_steps, and the sequential runner processes them
-    // in topological order. No synthetic barrier steps needed.
+    let mut config = config; // make mutable for resolve_all_steps
+    let expanded_steps = resolve_all_steps(&mut config, &workspace);
 
     let steps = if profile_name == "all" {
         expanded_steps
@@ -300,48 +328,14 @@ pub fn run_pipeline(args: RunArgs) {
     // Ensure .gitignore covers managed directories
     ensure_gitignore(&workspace);
 
-    // Collect steps and expand per_profile templates
-    let pipeline = config.upstream.as_ref();
+    // Resolve all steps including deferred profile expansion
+    let expanded_steps = resolve_all_steps(&mut config, &workspace);
 
-    // Read query_count from upstream defaults (used by per_profile expansion)
-    let query_count: u64 = pipeline
+    let query_count: u64 = config.upstream.as_ref()
         .and_then(|p| p.defaults.as_ref())
         .and_then(|d| d.get("query_count"))
         .and_then(|s| s.parse().ok())
         .unwrap_or(10_000);
-
-    // Resolve deferred sized profiles if variables.yaml has the needed values.
-    // This handles the case where a previous run produced base_count and
-    // the sized spec uses ${base_count}. Without this, the first re-run
-    // after bootstrap would show no per-profile steps until Phase 2.
-    if config.profiles.has_deferred() {
-        // Load variables early just for profile resolution
-        if let Ok(vars) = variables::load(&workspace) {
-            let var_map: indexmap::IndexMap<String, String> = vars.into_iter().collect();
-            let added = config.profiles.expand_deferred_sized(&var_map);
-            if added > 0 {
-                println!("Resolved {} deferred sized profiles from variables.yaml", added);
-            }
-        }
-    }
-
-    let raw_steps = vectordata::dataset::collect_all_steps(&config);
-
-    // Expand per_profile template steps into concrete profile-gated steps
-    let expanded_steps = vectordata::dataset::expand_per_profile_steps(raw_steps, &config.profiles, query_count);
-
-    // Auto-derive profile views for sized profiles from template outputs
-    let template_steps: Vec<_> = vectordata::dataset::collect_all_steps(&config)
-        .into_iter()
-        .filter(|s| s.per_profile)
-        .collect();
-    config.profiles.derive_views_from_templates(&template_steps);
-
-    // Insert barriers between profile groups (runtime injection, not in YAML)
-    // Profile ordering is handled by the sequential executor — steps are
-    // emitted in profile order (sized ascending, then default) by
-    // expand_per_profile_steps, and the sequential runner processes them
-    // in topological order. No synthetic barrier steps needed.
 
     // Optionally filter to a single profile
     let profile_name = &args.profile;
@@ -378,7 +372,7 @@ pub fn run_pipeline(args: RunArgs) {
 
     // Build defaults from pipeline config + variables.yaml + CLI overrides
     let mut defaults = IndexMap::new();
-    if let Some(pipe) = pipeline {
+    if let Some(ref pipe) = config.upstream {
         if let Some(ref defs) = pipe.defaults {
             defaults.extend(defs.clone());
         }
@@ -492,6 +486,16 @@ pub fn run_pipeline(args: RunArgs) {
         }
         names
     };
+    // Estimate total steps including deferred per-profile expansions.
+    // Deferred profiles will each get one copy of every per_profile template.
+    let per_profile_template_count = vectordata::dataset::collect_all_steps(&config)
+        .iter()
+        .filter(|s| s.per_profile)
+        .count();
+    let deferred_profile_estimate = config.profiles.deferred_sized.len() * 3; // rough: each spec generates ~3 profiles
+    let estimated_total = pipeline_dag.steps.len()
+        + deferred_profile_estimate * per_profile_template_count;
+
     let cache_dir_for_guidance = cache_dir.clone();
     let mut ctx = StreamContext {
         dataset_name,
@@ -522,6 +526,7 @@ pub fn run_pipeline(args: RunArgs) {
             handle
         },
         status_interval: std::time::Duration::from_millis(args.status_interval),
+        estimated_total_steps: estimated_total,
     };
 
     // Build command registry

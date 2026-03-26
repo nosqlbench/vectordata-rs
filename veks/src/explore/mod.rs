@@ -200,6 +200,7 @@ fn run_pipeline_command(
         governor: ResourceGovernor::default_governor(),
         ui: crate::ui::UiHandle::new(std::sync::Arc::new(crate::ui::PlainSink::new())),
         status_interval: std::time::Duration::from_secs(1),
+        estimated_total_steps: 0,
     };
 
     let result = cmd.execute(&opts, &mut ctx);

@@ -52,14 +52,9 @@ pub fn check(
             Err(_) => continue,
         };
 
-        // Resolve deferred sized profiles so the manifest includes
-        // per-profile output paths (profiles/1m/*, profiles/2m/*, etc.)
-        if config.profiles.has_deferred() {
-            if let Ok(vars) = veks_pipeline::pipeline::variables::load(workspace) {
-                let var_map: indexmap::IndexMap<String, String> = vars.into_iter().collect();
-                config.profiles.expand_deferred_sized(&var_map);
-            }
-        }
+        // Resolve all steps (including deferred profile expansion) using
+        // the same logic as veks run — single source of truth.
+        let _ = veks_pipeline::pipeline::resolve_all_steps(&mut config, workspace);
 
         let wm = match manifest::project_workspace(dataset_path, &config, &registry) {
             Ok(m) => m,
