@@ -42,8 +42,8 @@ signal-hook = "0.3"
 simsimd = "6"
 slabtastic = { path = "../slabtastic", version = "0.9.0" }
 vectordata = { path = "../vectordata", version = "0.9.0" }
-veks-core = { path = "../veks-core", version = "0.3.2" }
-veks-pipeline = { path = "../veks-pipeline", version = "0.3.2" }
+veks-core = { path = "../veks-core" }
+veks-pipeline = { path = "../veks-pipeline" }
 
 [dev-dependencies]
 arrow = "54"
