@@ -109,8 +109,8 @@ Tab or F1-F8. Press `?` for the full key reference.
 
 ## Part 3: Preparing a Dataset for Publishing
 
-This section covers taking raw source files (base vectors, query
-vectors, ground truth) and producing a publish-ready dataset.
+This section covers taking raw source files (base vectors, metadata)
+and producing a publish-ready dataset with stratified profiles.
 
 ### Gather Source Files
 
@@ -119,10 +119,9 @@ names so the bootstrap wizard can identify each file's role:
 
 ```
 my-dataset/
-├── _base_vectors.npy       # base corpus vectors
-├── _query_vectors.npy      # query vectors
-├── _ground_truth.ivec      # pre-computed neighbor indices
-└── _ground_truth_dist.fvec # pre-computed neighbor distances (optional)
+├── _base_vectors/          # npy directory with base corpus vectors
+├── _metadata/              # parquet directory with metadata
+└── (optional: _gt.ivec)    # pre-computed neighbor indices
 ```
 
 Underscore-prefixed names (`_base_vectors`) are treated as source
@@ -132,52 +131,127 @@ files and excluded from publishing.
 
 ```shell
 cd my-dataset
-veks prepare bootstrap --interactive
+veks bootstrap --interactive
 ```
 
-The wizard asks about:
-- **Dataset name** — used in catalogs and remote URLs
-- **Distance metric** — L2, Cosine, or DotProduct (describes how the
-  embeddings were trained)
-- **L2 normalization** — whether to normalize vectors (converts L2
-  distance ranking to Cosine-equivalent)
-- **Ground truth** — if you have pre-computed KNN files, the wizard
-  detects them and skips KNN computation
-- **Sized profiles** — generates windowed sub-profiles at multiple
-  scales (e.g., 1M, 2M, 4M, 10M) for benchmarking at different sizes
+The wizard walks through these steps:
+
+1. **File detection** — scans the directory for recognized data files
+   and assigns roles (base vectors, metadata, etc.)
+
+2. **Facet selection** — shows which dataset facets will be produced
+   based on detected inputs, using SRD §2.8 implication rules:
+   ```
+   [x] B  base vectors
+   [x] Q  query vectors
+   [x] G  KNN ground-truth indices
+   [x] D  KNN ground-truth distances
+   [x] M  metadata
+   [x] P  predicates
+   [x] R  predicate results
+   [x] F  filtered KNN ground-truth
+   ```
+   Accept the defaults or type a custom facet string (e.g., `BQGD`
+   to skip metadata).
+
+3. **Base data fraction** — percentage of source vectors to use.
+   This is immutable after the first run (see SRD §3.13). Use 100%
+   for production, lower for fast iteration during development.
+
+4. **Distance metric** — L2, Cosine, or DotProduct. The wizard
+   probes your vectors to detect normalization:
+   - If vectors are L2-normalized, defaults to DotProduct (fastest
+     kernel, no norm computation needed)
+   - If not normalized and metric is Cosine/DotProduct, recommends
+     L2-normalization during extraction
+
+5. **Normalization** — when the metric requires it (Cosine/DotProduct
+   on unnormalized data), the wizard recommends normalizing. This
+   enables the 16-wide AVX-512 batched kernel for KNN computation.
+   Without normalization, the full cosine kernel with norm division
+   is used (correct but slightly slower).
+
+6. **Predicate selectivity** — when metadata is present, controls
+   how selective the synthesized predicates are (0.0001 = very hard,
+   0.1 = easy).
+
+7. **Sized profiles** — generates stratified profiles at multiple
+   scales using `${base_count}` as the upper bound. The profiles
+   are resolved at run time after the pipeline determines the actual
+   base vector count:
+   ```
+   Sized profile spec: mul:1m..${base_count}/2
+   ```
+   This produces profiles at 1M, 2M, 4M, 8M, ... up to the base count.
+
+8. **Summary** — shows a colored artifact lineage view mapping inputs
+   to facets:
+   ```
+   _base_img_emb (npy dir)    ──convert──► B  base vectors    [convert]
+   _base_img_emb (npy dir)    ───split───► Q  query vectors   [self-search]
+   B x Q brute-force          ──compute──► G  KNN indices      [compute]
+   _metadata (parquet dir)    ──convert──► M  metadata         [convert]
+   ```
 
 The wizard creates `dataset.yaml` with a complete pipeline definition.
 
 ### Run the Pipeline
 
 ```shell
-veks prepare run
+veks run
 ```
 
-This executes the pipeline defined in `dataset.yaml`: converting
-formats, shuffling, deduplicating, splitting into base/query sets,
-computing KNN ground truth (if not pre-provided), generating merkle
-trees, and building catalog indexes.
+This executes the pipeline defined in `dataset.yaml`. The pipeline
+runs in phases optimized for I/O cache coherence:
 
-Progress is shown in the terminal. The pipeline is resumable — if
-interrupted, re-run `veks prepare run` to pick up where it left off.
+| Phase | Steps | I/O pattern |
+|-------|-------|-------------|
+| 0 | compute-knn (all profiles) | Base vectors sequential scan |
+| 1 | evaluate-predicates (all profiles) | Metadata I/O |
+| 2 | compute-filtered-knn (all profiles) | Base + predicate indices |
+| 3 | verify-knn (consolidated) | Light sampling, single scan |
+| 4 | verify-predicates (consolidated) | Light sampling |
+| — | generate-catalog, generate-merkle | Final indexing |
 
-### Add Sized Profiles (Optional)
+Within each phase, profiles process smallest to largest. KNN cache
+segments from smaller profiles are automatically reused by larger
+profiles (e.g., the 1M profile's partition [0,1M) is reused by the
+2M, 4M, 8M, ... profiles).
 
-If you want to add windowed profiles after the initial run:
+The pipeline is resumable — if interrupted, re-run `veks run` to pick
+up where it left off. Per-step fingerprints detect configuration
+changes and re-execute only affected steps.
+
+### Output Modes
 
 ```shell
-veks prepare stratify
-veks prepare run
+veks run                     # auto-detect: TUI if terminal, basic otherwise
+veks run --output tui        # rich TUI with progress bars and throughput charts
+veks run --output basic      # plain-text progress on stderr (good for logging)
+veks run --output batch      # log-only, no console output (for CI/scripts)
 ```
 
-Stratification creates sub-profiles (e.g., 1M, 4M, 10M base vectors)
-and the second run computes KNN ground truth for each.
+### Stratification
+
+Sized profiles can be added at any time — either at bootstrap (via
+the wizard) or after the first run:
+
+```shell
+# Option A: included in bootstrap (recommended)
+veks bootstrap --interactive   # wizard asks about sized profiles
+
+# Option B: add after first run
+veks prepare stratify          # adds profiles based on actual base count
+veks run                       # computes per-profile KNN (cached segments reused)
+```
+
+Adding profiles never invalidates core pipeline steps. Profile
+expansion is dynamic — only per-profile steps are added.
 
 ### Verify Readiness
 
 ```shell
-veks prepare check
+veks check
 ```
 
 This runs all pre-flight checks: pipeline completeness, merkle
@@ -209,20 +283,10 @@ touch .publish
 Datasets without `.publish` are local-only and silently excluded
 from publishing and catalog completeness checks.
 
-### Generate Catalogs
-
-```shell
-veks prepare catalog generate .
-```
-
-This scans for publishable datasets and writes `catalog.json` and
-`catalog.yaml` at every directory level from each dataset up to the
-publish root.
-
 ### Final Check
 
 ```shell
-veks prepare check
+veks check
 ```
 
 Verify everything is green — all pipeline steps complete, merkle
@@ -231,7 +295,7 @@ files present, catalogs fresh.
 ### Preview the Upload
 
 ```shell
-veks prepare publish --dry-run
+veks publish --dry-run
 ```
 
 Review the publish summary: source, destination, dataset list with
@@ -240,7 +304,7 @@ file counts and sizes. No data is transferred.
 ### Publish
 
 ```shell
-veks prepare publish
+veks publish
 ```
 
 The summary is shown and you're prompted to type `YES` to confirm.
@@ -267,10 +331,13 @@ veks interact explore --dataset my-dataset
 | Add catalog | `veks datasets config add-catalog <URL>` |
 | List datasets | `veks datasets list` |
 | Explore interactively | `veks interact explore --dataset <name>` |
-| Bootstrap new dataset | `veks prepare bootstrap --interactive` |
-| Run pipeline | `veks prepare run` |
-| Add sized profiles | `veks prepare stratify && veks prepare run` |
-| Pre-flight check | `veks prepare check` |
-| Generate catalogs | `veks prepare catalog generate .` |
-| Publish | `veks prepare publish` |
+| Bootstrap new dataset | `veks bootstrap --interactive` |
+| Bootstrap (auto, no prompts) | `veks bootstrap --auto` |
+| Run pipeline | `veks run` |
+| Run with basic output | `veks run --output basic` |
+| Dry-run (show plan) | `veks run --dry-run` |
+| Add sized profiles | `veks prepare stratify` |
+| Pre-flight check | `veks check` |
+| Publish (dry-run) | `veks publish --dry-run` |
+| Publish | `veks publish` |
 | Pipeline command help | `veks help <command>` |
