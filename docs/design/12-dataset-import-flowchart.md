@@ -717,8 +717,16 @@ The wizard proceeds through these phases:
    - **Down-convert** (e.g., f32→f16): warns that this is lossy with
      IEEE 754 round-to-nearest-even semantics and values outside the
      target range saturate to ±Inf; emits a `convert` step.
-5. **Normalization detection**: samples vectors and reports mean L2 norm.
-   If not normalized, offers to add `--normalize` to extraction steps.
+5. **Metric-driven normalization**: the metric determines whether
+   normalization is required, not a user preference. When the metric is
+   Cosine or DotProduct, vectors MUST be L2-normalized for correct
+   distance computation. The wizard samples vectors to detect if they
+   are already normalized; if not, normalization is applied automatically
+   during extraction. L2 and L1 metrics do not require normalization.
+   This is not optional — the batched AVX-512 cosine kernel computes
+   `1 - dot(a,b)` which is only correct for normalized vectors. Without
+   normalization, the pipeline would fall back to per-pair SimSIMD
+   (which does proper norm division) at ~16x lower throughput.
 6. **Cache compression**: asks whether to enable gzip compression for
    eligible cache artifacts (default: yes). This adds `compress_cache:
    true` to pipeline steps that produce sequential-only intermediates.

@@ -917,6 +917,15 @@ impl CommandOp for VerifyKnnOp {
                 )
             }
         };
+        let normalized = options.get("normalized").map(|s| s == "true").unwrap_or(false);
+        // Use the same kernel metric as compute-knn to ensure distance
+        // values match. Without this, verification recomputes with a
+        // different distance function and reports false failures.
+        let metric = if normalized && (metric == Metric::Cosine || metric == Metric::DotProduct) {
+            Metric::DotProduct
+        } else {
+            metric
+        };
 
         let sample_count: usize = match options.parse_or("sample", 100usize) {
             Ok(v) => v,

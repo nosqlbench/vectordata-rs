@@ -79,6 +79,13 @@ pub struct StepDef {
     #[serde(default, skip_serializing_if = "is_false")]
     pub per_profile: bool,
 
+    /// Execution phase for profile ordering. Per-profile steps are grouped
+    /// by phase: all steps in phase 0 (default) run across all profiles
+    /// before any phase 1 steps begin. This prevents I/O thrashing between
+    /// compute-heavy steps (phase 0) and verification steps (phase 1).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub phase: u32,
+
     /// What to do when the output artifact is partially complete.
     #[serde(default, skip_serializing_if = "OnPartial::is_restart")]
     pub on_partial: OnPartial,
@@ -149,6 +156,10 @@ impl OnPartial {
 
 fn is_false(v: &bool) -> bool {
     !v
+}
+
+fn is_zero(v: &u32) -> bool {
+    *v == 0
 }
 
 #[cfg(test)]

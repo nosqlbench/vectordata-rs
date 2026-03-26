@@ -173,7 +173,7 @@ fn check_execution(dataset_path: &Path) -> Result<StepCounts, Vec<String>> {
         )]);
     }
 
-    let (mut progress, schema_msg) = ProgressLog::load(&progress_path)
+    let (progress, schema_msg) = ProgressLog::load(&progress_path)
         .map_err(|e| vec![format!("failed to load progress log: {}", e)])?;
 
     let mut errors: Vec<String> = Vec::new();
@@ -182,9 +182,8 @@ fn check_execution(dataset_path: &Path) -> Result<StepCounts, Vec<String>> {
         errors.push(msg);
     }
 
-    if let Some(msg) = progress.invalidate_if_stale(dataset_path) {
-        errors.push(msg);
-    }
+    // Per-step fingerprint checking handles invalidation — no whole-log
+    // invalidation needed here.
 
     let workspace = dataset_path.parent().unwrap_or(Path::new("."));
     let mut fresh = 0usize;

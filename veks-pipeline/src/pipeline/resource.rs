@@ -1449,6 +1449,11 @@ impl ResourceGovernor {
                 .unwrap_or(4);
             budget.resources.insert("threads".to_string(), ResourceValue::Fixed(cpus));
         }
+        // segmentsize defaults to 1M — this is the cache artifact granularity
+        // for cross-profile KNN partition reuse. Profile sizes (10M, 20M, etc.)
+        // must be multiples of segmentsize. The KNN command processes multiple
+        // segments per memory pass (controlled by available RAM) but writes
+        // cache files at segment boundaries for reuse by larger profiles.
         if !budget.resources.contains_key("segmentsize") {
             budget.resources.insert("segmentsize".to_string(), ResourceValue::Fixed(1_000_000));
         }

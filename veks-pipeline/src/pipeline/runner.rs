@@ -149,39 +149,47 @@ pub fn run_steps(
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
 
-        // 2. Cascade invalidation: if any dependency executed this run, force re-run.
-        // For per-profile expanded steps, a dependency on "verify-knn" should
-        // cascade from "verify-knn-10m", "verify-knn-16m", etc.
-        let upstream_ran = step.def.after.iter().any(|dep| {
-            executed_steps.contains(dep)
-                || executed_steps.iter().any(|es| es.starts_with(dep.as_str()) && es[dep.len()..].starts_with('-'))
-        });
+        // 2. Compute configuration fingerprint for this step.
+        //    The fingerprint chains through the DAG: it includes the
+        //    fingerprints of all upstream steps. If any upstream step
+        //    re-executed (getting a new fingerprint), this step's
+        //    computed fingerprint will differ from the stored one.
+        let upstream_ids: Vec<&str> = step.def.after.iter()
+            .map(|s| s.as_str())
+            .collect();
+        let fingerprint = ctx.progress.compute_fingerprint(
+            &step.id,
+            &step.def.run,
+            &resolved_map,
+            &upstream_ids,
+        );
 
-        // 3. Check progress log → skip if recorded OK, outputs match, options unchanged,
-        //    AND no upstream dependency ran this session
+        // 3. Check freshness: progress log + fingerprint chain.
+        //    The fingerprint check subsumes the old "upstream dependency
+        //    re-ran" cascade — if an upstream re-executed, its fingerprint
+        //    changed, which changes this step's computed fingerprint.
         let progress_fresh;
-        if upstream_ran {
-            ctx.ui.log(&format!("{} {} — invalidated (upstream dependency re-ran)", prefix, step.id));
-            progress_fresh = false;
-        } else {
-            match ctx.progress.check_step_freshness(&step.id, Some(&resolved_map), Some(&ctx.workspace)) {
-                None => {
-                    skipped_count += 1;
-                    step_outcomes.push((step.id.clone(), false, "fresh".into()));
-                    ctx.ui.log(&format!("{} {} — fresh, skipping", prefix, step.id));
-                    dlog.log(&format!("  [skip] {} — fresh", step.id));
-                    overall_pb.inc(1);
-                    continue;
+        let fingerprint_reason = ctx.progress.check_fingerprint(&step.id, &fingerprint);
+        match ctx.progress.check_step_freshness(&step.id, Some(&resolved_map), Some(&ctx.workspace)) {
+            None if fingerprint_reason.is_none() => {
+                skipped_count += 1;
+                step_outcomes.push((step.id.clone(), false, "fresh".into()));
+                ctx.ui.log(&format!("{} {} — fresh, skipping", prefix, step.id));
+                dlog.log(&format!("  [skip] {} — fresh", step.id));
+                overall_pb.inc(1);
+                continue;
+            }
+            None => {
+                // Outputs/options match but fingerprint changed — upstream config changed
+                ctx.ui.log(&format!("{} {} — stale: {}", prefix, step.id,
+                    fingerprint_reason.as_deref().unwrap_or("fingerprint changed")));
+                progress_fresh = false;
+            }
+            Some(reason) => {
+                if !reason.starts_with("not recorded") {
+                    ctx.ui.log(&format!("{} {} — stale: {}", prefix, step.id, reason));
                 }
-                Some(reason) => {
-                    // Only log the reason for non-trivial cases (not "not recorded")
-                    if !reason.starts_with("not recorded") {
-                        ctx.ui.log(&format!("{} {} — stale: {}", prefix, step.id, reason));
-                    }
-                    // If "not recorded", the step has no provenance — don't
-                    // trust artifact bound checks either.
-                    progress_fresh = false;
-                }
+                progress_fresh = false;
             }
         }
 
@@ -264,6 +272,7 @@ pub fn run_steps(
                                 .collect(),
                             error: None,
                             resource_summary: None,
+                            fingerprint: Some(fingerprint.clone()),
                         },
                     );
                     if let Err(e) = ctx.progress.save() {
@@ -565,7 +574,7 @@ pub fn run_steps(
 
         // 8. Record result with the original (unmunged) options
         ctx.ui.clear();
-        let record = step_record_from_result(&result, &resolved_opts, resource_summary);
+        let record = step_record_from_result(&result, &resolved_opts, resource_summary, Some(fingerprint.clone()));
         ctx.progress.record_step(&step.id, record);
 
         match result.status {
@@ -635,6 +644,7 @@ pub fn run_steps(
                             .collect(),
                         error: Some(msg.clone()),
                         resource_summary: None,
+                        fingerprint: Some(fingerprint.clone()),
                     },
                 );
                 if let Err(e) = ctx.progress.save() {
@@ -734,6 +744,7 @@ fn step_record_from_result(
     result: &CommandResult,
     resolved_opts: &indexmap::IndexMap<String, String>,
     resource_summary: Option<ResourceSummary>,
+    fingerprint: Option<String>,
 ) -> StepRecord {
     let outputs: Vec<OutputRecord> = result
         .produced
@@ -774,5 +785,6 @@ fn step_record_from_result(
             .collect::<HashMap<_, _>>(),
         error,
         resource_summary,
+        fingerprint,
     }
 }

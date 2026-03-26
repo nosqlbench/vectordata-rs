@@ -493,3 +493,22 @@ No ordinal recomputation is needed.
 **Invariant**: `base_fraction` is write-once per dataset. The bootstrap
 command sets it; subsequent operations (stratify, run) must not change it.
 To use a different fraction, bootstrap a new dataset.
+
+### Metric-Driven Normalization
+
+The distance metric determines whether L2-normalization is required:
+
+| Metric | Normalization | Reason |
+|--------|--------------|--------|
+| Cosine | Recommended | The batched AVX-512 kernel computes proper `1 - dot/(|a|*|b|)` for both normalized and unnormalized vectors. Normalization eliminates the per-vector norm computation (minor speedup) and is standard practice for Cosine embeddings |
+| DotProduct | Recommended | Inner product on unnormalized vectors conflates magnitude with similarity. Normalization makes DotProduct equivalent to Cosine |
+| L2 | Not required | Euclidean distance is meaningful on unnormalized vectors |
+| L1 | Not required | Manhattan distance is meaningful on unnormalized vectors |
+
+This is not a user preference — it is a correctness requirement. The bootstrap
+wizard and `--auto` mode automatically apply normalization when the chosen
+metric requires it. If the source vectors are already L2-normalized (detected
+by sampling), normalization is skipped regardless of metric.
+
+Normalization is applied in-flight during the `transform extract` steps
+(extract-queries and extract-base). The source data is never modified.

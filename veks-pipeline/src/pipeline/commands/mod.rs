@@ -53,6 +53,7 @@ pub mod json_rjq;
 pub mod merkle;
 pub mod set_variable;
 pub mod slab;
+pub mod verify_consolidated;
 pub mod verify_knn;
 pub mod verify_predicates;
 
@@ -135,6 +136,9 @@ pub fn register_all(registry: &mut CommandRegistry) {
     // ── verify ───────────────────────────────────────────────────────
     registry.register("verify knn-groundtruth", verify_knn::factory);
     registry.register("verify predicate-results", verify_predicates::factory);
+    registry.register("verify knn-consolidated", verify_consolidated::knn_consolidated_factory);
+    registry.register("verify filtered-knn-consolidated", verify_consolidated::filtered_knn_consolidated_factory);
+    registry.register("verify predicates-consolidated", verify_consolidated::predicates_consolidated_factory);
 
     // config commands moved to `datasets config` subgroup
 

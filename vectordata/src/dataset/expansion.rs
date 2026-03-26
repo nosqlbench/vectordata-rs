@@ -98,6 +98,12 @@ pub fn expand_per_profile_steps(
         all_profiles.push(("default", None));
     }
 
+    // Expand by phase first, then by profile within each phase.
+    // This ensures all phase-0 steps (compute) for all profiles are emitted
+    // before any phase-1 steps (verify), enabling correct phase ordering.
+    let max_phase = templates.iter().map(|t| t.phase).max().unwrap_or(0);
+
+    for phase in 0..=max_phase {
     for (profile_name, base_count_opt) in &all_profiles {
         let profile_dir = format!("profiles/{}/", profile_name);
         let suffix = if *profile_name == "default" {
@@ -111,7 +117,7 @@ pub fn expand_per_profile_steps(
             None => "${vector_count}".to_string(),
         };
 
-        for template in &templates {
+        for template in templates.iter().filter(|t| t.phase == phase) {
             let template_id = template.effective_id();
             let expanded_id = if suffix.is_empty() {
                 template_id.clone()
@@ -174,48 +180,100 @@ pub fn expand_per_profile_steps(
                 after: expanded_after,
                 profiles: vec![profile_name.to_string()],
                 per_profile: false,
+                phase: template.phase,
                 on_partial: template.on_partial.clone(),
                 options: expanded_options,
             });
         }
     }
+    } // close for phase
 
-    // Add linear ordering edges between profiles: the first step of
-    // profile N+1 depends on the last step of profile N. This ensures
-    // profiles execute in order (smallest → largest → default) without
-    // synthetic barrier nodes.
-    if all_profiles.len() > 1 {
-        // Collect the last expanded step ID per profile
-        let mut last_step_per_profile: Vec<Option<String>> = Vec::new();
+    // Phase-aware profile ordering.
+    //
+    // Within each phase, profiles execute smallest → largest → default.
+    // Phase N+1 starts only after phase N completes for ALL profiles.
+    // This prevents I/O thrashing between compute and verification.
+    //
+    // Example with 2 profiles (1m, default) and 2 phases:
+    //   Phase 0: compute-knn-1m → compute-knn (default)
+    //   Phase 1: verify-knn-1m → verify-knn (default)
+    //   Phase 1 depends on phase 0's last step.
+
+    for phase in 0..=max_phase {
+        // Templates in this phase
+        let phase_templates: Vec<&StepDef> = templates.iter()
+            .filter(|t| t.phase == phase)
+            .collect();
+        if phase_templates.is_empty() { continue; }
+
+        // Chain profiles within this phase
+        let mut prev_last_id: Option<String> = None;
+
         for (profile_name, _) in &all_profiles {
             let suffix = if *profile_name == "default" { String::new() }
                 else { format!("-{}", profile_name) };
-            let last_id = templates.last().map(|t| {
+
+            // First step of this profile in this phase
+            let first_id = phase_templates.first().map(|t| {
                 let tid = t.effective_id();
                 if suffix.is_empty() { tid } else { format!("{}{}", tid, suffix) }
             });
-            last_step_per_profile.push(last_id);
+
+            // Last step of this profile in this phase
+            let last_id = phase_templates.last().map(|t| {
+                let tid = t.effective_id();
+                if suffix.is_empty() { tid } else { format!("{}{}", tid, suffix) }
+            });
+
+            // Add dependency on previous profile's last step in this phase
+            if let (Some(prev), Some(first)) = (&prev_last_id, &first_id) {
+                for step in result.iter_mut() {
+                    if step.effective_id() == *first {
+                        if !step.after.contains(prev) {
+                            step.after.push(prev.clone());
+                        }
+                        break;
+                    }
+                }
+            }
+
+            prev_last_id = last_id;
         }
 
-        // For each profile transition, make the first step of the next
-        // profile depend on the last step of the previous profile
-        for i in 1..all_profiles.len() {
-            if let Some(ref prev_last) = last_step_per_profile[i - 1] {
-                let (next_name, _) = &all_profiles[i];
-                let next_suffix = if *next_name == "default" { String::new() }
-                    else { format!("-{}", next_name) };
-                let next_first_id = templates.first().map(|t| {
-                    let tid = t.effective_id();
-                    if next_suffix.is_empty() { tid } else { format!("{}{}", tid, next_suffix) }
-                });
-                if let Some(ref first_id) = next_first_id {
-                    // Find the step and add the dependency
-                    for step in result.iter_mut() {
-                        if step.effective_id() == *first_id {
-                            if !step.after.contains(prev_last) {
-                                step.after.push(prev_last.clone());
+        // If this is phase > 0, add dependency on the last step of the
+        // previous phase's last profile (ensures phase ordering).
+        if phase > 0 {
+            // Find the last step of the previous phase across all profiles
+            let prev_phase_templates: Vec<&StepDef> = templates.iter()
+                .filter(|t| t.phase == phase - 1)
+                .collect();
+            if let Some(last_tmpl) = prev_phase_templates.last() {
+                // Last profile in the ordering
+                if let Some((last_prof_name, _)) = all_profiles.last() {
+                    let last_suffix = if *last_prof_name == "default" { String::new() }
+                        else { format!("-{}", last_prof_name) };
+                    let prev_phase_last_id = {
+                        let tid = last_tmpl.effective_id();
+                        if last_suffix.is_empty() { tid } else { format!("{}{}", tid, last_suffix) }
+                    };
+
+                    // First step of this phase's first profile
+                    if let Some(first_prof) = all_profiles.first() {
+                        let first_suffix = if first_prof.0 == "default" { String::new() }
+                            else { format!("-{}", first_prof.0) };
+                        if let Some(first_tmpl) = phase_templates.first() {
+                            let this_phase_first_id = {
+                                let tid = first_tmpl.effective_id();
+                                if first_suffix.is_empty() { tid } else { format!("{}{}", tid, first_suffix) }
+                            };
+                            for step in result.iter_mut() {
+                                if step.effective_id() == this_phase_first_id {
+                                    if !step.after.contains(&prev_phase_last_id) {
+                                        step.after.push(prev_phase_last_id.clone());
+                                    }
+                                    break;
+                                }
                             }
-                            break;
                         }
                     }
                 }

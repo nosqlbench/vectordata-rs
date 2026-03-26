@@ -154,13 +154,18 @@ impl<T> MmapVectorReader<T> {
 
     /// Force vector data for indices `[start, end)` into the page cache.
     ///
-    /// Issues `madvise(MADV_WILLNEED)` then sequentially touches every
-    /// page in the range via a volatile read. This **blocks** until all
-    /// pages are resident — call from a background thread to overlap
-    /// I/O with compute on a different partition.
+    /// Issues `madvise(MADV_WILLNEED)` to hint the kernel, then
+    /// sequentially touches every page in the range via a volatile read.
+    /// This **blocks** until all pages are resident.
     ///
-    /// If `bytes_paged` is provided, the counter is incremented after each
-    /// page touch so callers can display progress from another thread.
+    /// Call from a **background prefetch thread** that runs 2+ partitions
+    /// ahead of compute. The blocking is intentional — it guarantees
+    /// pages are warm when compute starts. Without the touch loop,
+    /// `madvise` alone is a hint that the kernel may not honor in time,
+    /// causing all compute threads to stall on page faults simultaneously.
+    ///
+    /// The `bytes_paged` counter is incremented after each page touch
+    /// so callers can display I/O progress from another thread.
     pub fn prefetch_pages(
         &self,
         start: usize,
@@ -177,8 +182,9 @@ impl<T> MmapVectorReader<T> {
         // Hint the kernel for sequential readahead
         let _ = self.mmap.advise_range(memmap2::Advice::WillNeed, byte_start, byte_len);
 
-        // Touch every page to force it into the page cache.
-        // Sequential access creates steady I/O instead of random page faults.
+        // Touch every page to guarantee residence. Sequential access
+        // creates steady I/O instead of a thundering herd of random
+        // page faults across all compute threads.
         let data = &self.mmap[byte_start..byte_end];
         let page_size = 4096;
         for offset in (0..data.len()).step_by(page_size) {

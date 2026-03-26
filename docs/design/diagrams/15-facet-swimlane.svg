@@ -1,5 +1,5 @@
    Compiling tools v0.1.0 (/mnt/datamir/home/jshook/projects/vectordata-rs/tools)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.37s
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.35s
      Running `target/debug/gen_swimlane`
 <svg xmlns="http://www.w3.org/2000/svg" width="1540" height="824" font-family="Helvetica, Arial, sans-serif">
   <rect width="1540" height="824" fill="white" />
@@ -308,7 +308,7 @@ Always active when M facet is required.</title>
   <g>
     <title>transform extract: Extract base vectors from shuffled ordinals.
 Range: [query_count, base_end) — everything after the query split.
-Normalize option applies L2 normalization during extraction.
+L2-normalization applied automatically when metric is Cosine or DotProduct.
 Elided when not self-search (base = all_vectors directly).</title>
     <rect x="102" y="516" width="146" height="44" rx="6" fill="#d7eed8" stroke="#4caf50" stroke-width="1.5" />
     <text x="175" y="530" text-anchor="middle" font-size="11" fill="#333">extract</text>
@@ -318,7 +318,7 @@ Elided when not self-search (base = all_vectors directly).</title>
   <g>
     <title>transform extract: Extract query vectors from shuffled ordinals.
 Range: [0, query_count) — the first query_count entries of the shuffle.
-Normalize option applies L2 normalization during extraction.
+L2-normalization applied automatically when metric is Cosine or DotProduct.
 Elided when separate query file is provided.</title>
     <rect x="272" y="516" width="146" height="44" rx="6" fill="#d4e6f7" stroke="#42a5f5" stroke-width="1.5" />
     <text x="345" y="530" text-anchor="middle" font-size="11" fill="#333">extract</text>

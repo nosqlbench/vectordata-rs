@@ -36,11 +36,8 @@ use crate::pipeline::command::{
 // ---- fvec-extract -----------------------------------------------------------
 
 /// Pipeline command: extract fvec vectors by ivec indices.
-pub struct GenerateFvecExtractOp;
-
-pub fn fvec_factory() -> Box<dyn CommandOp> {
-    Box::new(GenerateFvecExtractOp)
-}
+/// Internal delegate for `transform extract` when source is `.fvec`.
+pub(super) struct GenerateFvecExtractOp;
 
 impl CommandOp for GenerateFvecExtractOp {
     fn command_path(&self) -> &str {
@@ -324,11 +321,8 @@ facets of the dataset.
 ///   index-file entries to use.
 /// - **Range-based**: omit `index-file`; `range` selects a contiguous range
 ///   of ivec records directly.
-pub struct GenerateIvecExtractOp;
-
-pub fn ivec_factory() -> Box<dyn CommandOp> {
-    Box::new(GenerateIvecExtractOp)
-}
+/// Internal delegate for `transform extract` when source is `.ivec`.
+pub(super) struct GenerateIvecExtractOp;
 
 impl CommandOp for GenerateIvecExtractOp {
     fn command_path(&self) -> &str {
@@ -652,11 +646,8 @@ ordinal.
 ///   a vector from the mvec source. `range` selects which ivec entries to use.
 /// - **Range-based**: omit `ivec-file`; `range` selects a contiguous range of
 ///   mvec records directly.
-pub struct GenerateMvecExtractOp;
-
-pub fn mvec_factory() -> Box<dyn CommandOp> {
-    Box::new(GenerateMvecExtractOp)
-}
+/// Internal delegate for `transform extract` when source is `.mvec`.
+pub(super) struct GenerateMvecExtractOp;
 
 impl CommandOp for GenerateMvecExtractOp {
     fn command_path(&self) -> &str {
@@ -967,74 +958,24 @@ so that `base_metadata.slab[i]` corresponds to `base_vectors.mvec[i]`.
     }
 }
 
-// ---- slab-extract -----------------------------------------------------------
+// ---- slab-extract (internal delegate for `transform extract`) ---------------
 
-/// Pipeline command: extract and reorder slab records by ivec indices.
-pub struct GenerateSlabExtractOp;
-
-pub fn slab_factory() -> Box<dyn CommandOp> {
-    Box::new(GenerateSlabExtractOp)
-}
+/// Internal delegate: extract and reorder slab records by ivec indices.
+///
+/// Not registered as a standalone command — invoked by `TransformExtractOp`
+/// when the source file has a `.slab` extension.
+pub(super) struct GenerateSlabExtractOp;
 
 impl CommandOp for GenerateSlabExtractOp {
     fn command_path(&self) -> &str {
-        "transform extract-slab"
+        "transform extract" // delegate — same path as parent
     }
 
     fn command_doc(&self) -> CommandDoc {
-        let options = self.describe_options();
         CommandDoc {
-            summary: "Extract and reorder records from a slab file".into(),
-            body: format!(r#"# transform extract-slab
-
-Extract and reorder records from a slab file.
-
-## Description
-
-Extracts and reorders records from a slab (structured metadata) file.
-Two modes are supported:
-
-**Index-based** (with `ivec-file`): Each entry in the ivec selects a
-record from the source slab by ordinal position. The `range` parameter
-controls which entries of the ivec to use -- it selects a window into
-the index array, not the source slab. The output records are written in
-the order specified by the ivec, effectively reordering the slab to match
-a permutation.
-
-**Range-based** (without `ivec-file`): Extracts a contiguous slice of
-records from the source slab directly, preserving their original order.
-
-Ranges are specified as `[start,end)` or `start..end`.
-
-## Maintaining ordinal correspondence
-
-The critical purpose of slab-extract is to keep metadata aligned with
-vectors after shuffling and splitting. When a dataset is split into query
-and base sets using a shuffle permutation, the same shuffle + range must
-be applied to the metadata slab so that ordinal correspondence is
-preserved: `base_metadata.slab[i]` describes `base_vectors.mvec[i]` (or
-`.fvec[i]`). Without this alignment, predicate evaluation and filtered
-KNN ground truth would reference the wrong metadata records.
-
-## Partitioned-pass extraction (index mode)
-
-For index-based extraction on datasets larger than RAM, the algorithm
-buckets the requested indices into contiguous partitions of the source
-slab and processes each partition in a sequential pass. This keeps memory
-usage bounded and avoids random I/O on multi-gigabyte metadata slabs.
-
-## Role in dataset pipelines
-
-After `generate ivec-shuffle` produces a permutation and vector extract
-commands split the corpus, slab-extract applies the identical shuffle +
-range to every metadata facet. A typical pipeline includes:
-
-- `slab-extract` with `range=[0,K)` to produce `query_metadata.slab`
-- `slab-extract` with `range=[K,N)` to produce `base_metadata.slab`
-
-## Options
-
-{}"#, render_options_table(&options)),
+            summary: "Extract and reorder records from a slab file (internal delegate)".into(),
+            body: "Internal delegate for `transform extract` when source is .slab. \
+                   See `transform extract` for documentation.".into(),
         }
     }
 
@@ -1488,6 +1429,7 @@ fn sorted_index_extract_mvec(
         dist_pb.finish();
 
         // Merge thread-local buckets into unified buckets
+        let merge_pb = ctx.ui.spinner(&format!("merging {} thread buckets{}", thread_buckets.len(), pass_label(pass)));
         let mut buckets: Vec<Vec<(usize, usize)>> = vec![Vec::new(); num_buckets];
         for tb in &thread_buckets {
             for (i, b) in tb.iter().enumerate() {
@@ -1499,6 +1441,7 @@ fn sorted_index_extract_mvec(
                 buckets[i].extend(b);
             }
         }
+        merge_pb.finish();
 
         let sort_pb = ctx.ui.bar_with_unit(read_plan.len() as u64, &format!("sorting {} entries by source position{}", read_plan.len(), pass_label(pass)), "vectors");
         {
@@ -1521,6 +1464,7 @@ fn sorted_index_extract_mvec(
         sort_pb.finish();
 
         // Flatten sorted buckets into read_plan using prefix-sum offsets
+        let flatten_pb = ctx.ui.spinner(&format!("flattening read plan{}", pass_label(pass)));
         let total_entries = buckets.iter().map(|b| b.len()).sum::<usize>();
         read_plan.clear();
         read_plan.resize(total_entries, (0, 0));
@@ -1550,6 +1494,8 @@ fn sorted_index_extract_mvec(
                 flatten_fn();
             }
         }
+
+        flatten_pb.finish();
 
         // Step 3: Read source data in parallel, placing each record at its
         // transpose position in the buffer. Each local_pos is unique, so
@@ -1781,6 +1727,7 @@ fn sorted_index_extract_fvec(
         }
         dist_pb.finish();
 
+        let merge_pb = ctx.ui.spinner(&format!("merging {} thread buckets{}", thread_buckets.len(), pass_label(pass)));
         let mut buckets: Vec<Vec<(usize, usize)>> = vec![Vec::new(); num_buckets];
         for tb in &thread_buckets {
             for (i, b) in tb.iter().enumerate() {
@@ -1792,6 +1739,7 @@ fn sorted_index_extract_fvec(
                 buckets[i].extend(b);
             }
         }
+        merge_pb.finish();
 
         let sort_pb = ctx.ui.bar_with_unit(read_plan.len() as u64, &format!("sorting {} entries by source position{}", read_plan.len(), pass_label(pass)), "vectors");
         {
@@ -1813,6 +1761,7 @@ fn sorted_index_extract_fvec(
         }
         sort_pb.finish();
 
+        let flatten_pb = ctx.ui.spinner(&format!("flattening read plan{}", pass_label(pass)));
         let total_entries = buckets.iter().map(|b| b.len()).sum::<usize>();
         read_plan.clear();
         read_plan.resize(total_entries, (0, 0));
@@ -1842,6 +1791,7 @@ fn sorted_index_extract_fvec(
                 flatten_fn();
             }
         }
+        flatten_pb.finish();
 
         // Step 3: Read source data in parallel with transpose placement
         let read_pb = ctx.ui.bar_with_unit(read_plan.len() as u64, &format!("reading+transposing fvec{}", pass_label(pass)), "vectors");
@@ -2492,6 +2442,14 @@ impl CommandOp for TransformExtractOp {
                 required: false,
                 default: Some("false".to_string()),
                 description: "L2-normalize vectors during extraction (fvec/mvec only)".to_string(),
+                role: OptionRole::Config,
+            },
+            OptionDesc {
+                name: "page-size".to_string(),
+                type_name: "int".to_string(),
+                required: false,
+                default: Some("65536".to_string()),
+                description: "Preferred page size for output slab (slab format only)".to_string(),
                 role: OptionRole::Config,
             },
         ]

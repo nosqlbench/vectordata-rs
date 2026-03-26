@@ -46,6 +46,7 @@ pub struct WizardSeeds {
     pub pedantic_dedup: Option<bool>,
     pub required_facets: Option<String>,
     pub round_digits: Option<u32>,
+    pub selectivity: Option<f64>,
 }
 
 /// Run the wizard with auto-accept disabled (fully interactive).
@@ -151,6 +152,101 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
         false
     };
 
+    // ── Facet inference from detected inputs ─────────────────────────
+    // Infer which facets the pipeline should produce based on what
+    // inputs were detected. Present as a checkbox for the user to
+    // confirm or adjust BEFORE asking detailed questions.
+    // Infer facets using the SRD §2.8 implication rules (same logic as
+    // import::resolve_facets). Build a temporary ImportArgs to query it.
+    let has_detected_base = roles_accepted && detected.base_vectors.is_some()
+        || seeds.base_vectors.is_some();
+    let has_detected_meta = roles_accepted && detected.metadata.is_some()
+        || seeds.metadata.is_some();
+
+    let inferred = {
+        let probe = ImportArgs {
+            name: String::new(),
+            output: PathBuf::new(),
+            base_vectors: if has_detected_base { Some(PathBuf::from("probe")) } else { None },
+            query_vectors: None,
+            self_search: false,
+            query_count: 0,
+            metadata: if has_detected_meta { Some(PathBuf::from("probe")) } else { None },
+            ground_truth: None,
+            ground_truth_distances: None,
+            metric: String::new(),
+            neighbors: 0,
+            seed: 0,
+            description: None,
+            no_dedup: false,
+            no_zero_check: false,
+            no_filtered: false,
+            normalize: false,
+            force: false,
+            base_convert_format: None,
+            query_convert_format: None,
+            compress_cache: false,
+            sized_profiles: None,
+            base_fraction: 1.0,
+            required_facets: None,
+            round_digits: 2,
+            pedantic_dedup: false,
+            selectivity: 0.0001,
+        };
+        super::import::resolve_facets(&probe)
+    };
+
+    let facet_labels = [
+        ('B', "base vectors"),
+        ('Q', "query vectors"),
+        ('G', "KNN ground-truth indices"),
+        ('D', "KNN ground-truth distances"),
+        ('M', "metadata"),
+        ('P', "predicates"),
+        ('R', "predicate results"),
+        ('F', "filtered KNN ground-truth"),
+    ];
+
+    println!();
+    println!("--- Dataset facets ---");
+    println!("  Inferred from detected inputs (SRD §2.8):");
+    println!();
+    for &(code, label) in &facet_labels {
+        let on = inferred.contains(code);
+        println!("  [{}] {}  {}", if on { "x" } else { " " }, code, label);
+    }
+    println!();
+
+    let implied_facets = &inferred;
+
+    let confirmed_facets = if let Some(ref seeded) = seeds.required_facets {
+        println!("  (overridden by --required-facets {})", seeded);
+        seeded.to_uppercase()
+    } else {
+        let input = prompt_with_default(
+            "Confirm facets (Enter to accept, or enter e.g. BQGD)",
+            &implied_facets,
+        );
+        input.trim().to_uppercase()
+    };
+
+    // Parse confirmed facets into booleans for gating subsequent questions
+    let want_q = confirmed_facets.contains('Q');
+
+    // ── Base data fraction ─────────────────────────────────────────
+    // Asked early because it's a fundamental parameter that affects
+    // all downstream processing. Immutable after first run (SRD §3.13).
+    let frac_default = seeds.base_fraction
+        .map(|f| format!("{}", (f * 100.0).round() as u32))
+        .unwrap_or_else(|| "100".to_string());
+    let base_fraction_str = prompt_with_default("Base data percentage (1-100)", &frac_default);
+    let base_fraction = base_fraction_str.trim().parse::<f64>()
+        .unwrap_or(100.0)
+        .clamp(1.0, 100.0) / 100.0;
+    let want_g = confirmed_facets.contains('G');
+    let want_m = confirmed_facets.contains('M');
+    let want_f = confirmed_facets.contains('F');
+
     // ── Dataset name ─────────────────────────────────────────────────
     let dir_name = cwd.file_name()
         .map(|n| n.to_string_lossy().to_string())
@@ -164,7 +260,7 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
     // ── Output directory ─────────────────────────────────────────────
     let output = prompt_path_with_default("Output directory", ".");
 
-    // ── Base vectors ─────────────────────────────────────────────────
+    // ── Base vectors (B is always required) ───────────────────────────
     println!();
     println!("--- Vector source ---");
     let base_vectors = if roles_accepted && detected.base_vectors.is_some() {
@@ -232,40 +328,23 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
         None
     };
 
-    // ── Query source ─────────────────────────────────────────────────
-    println!();
-    println!("--- Query vectors ---");
-    let (query_vectors, self_search, query_count) = if base_vectors.is_some() {
-        if roles_accepted && detected.query_vectors.is_some() {
-            // Detected a separate query file — rename with _ prefix
-            let qv = detected.query_vectors.as_ref().unwrap().clone();
-            let qv = prompt_source_location(&qv, &output, "Query vectors");
-            println!("  Using detected: {}", qv.display());
-            (Some(qv), false, 10000u32)
-        } else {
-            // Default: self-search when no query file detected
-            let default_choice = if roles_accepted { "1" } else { "1" };
-            println!("  Options:");
-            println!("    1. Self-search — extract queries from base via shuffle (recommended)");
-            println!("    2. Separate query file");
-            println!("    3. No query vectors");
-            let choice = prompt_with_default("Choice [1/2/3]", default_choice);
-            match choice.as_str() {
-                "2" => {
-                    let qv = prompt_optional_path("Path to query vectors");
-                    let qv = qv.map(|p| prompt_source_location(&p, &output, "Query vectors"));
-                    (qv, false, 10000u32)
-                }
-                "3" => (None, false, 10000),
-                _ => {
-                    let qc_str = prompt_with_default("Query count", "10000");
-                    let qc = qc_str.parse().unwrap_or(10000);
-                    (None, true, qc)
-                }
-            }
-        }
+    // ── Query source — resolved from facets + detected inputs ──────────
+    // Q confirmed + separate query file detected → use it
+    // Q confirmed + no query file → self-search (only ask query count)
+    // Q not confirmed → skip
+    let (query_vectors, self_search, query_count) = if !want_q || base_vectors.is_none() {
+        (None, false, seeds.query_count.unwrap_or(10000))
+    } else if roles_accepted && detected.query_vectors.is_some() {
+        let qv = detected.query_vectors.as_ref().unwrap().clone();
+        let qv = prompt_source_location(&qv, &output, "Query vectors");
+        (Some(qv), false, seeds.query_count.unwrap_or(10000))
     } else {
-        (None, false, 10000)
+        // Self-search — only ask query count
+        let qc_default = seeds.query_count.map(|n| n.to_string())
+            .unwrap_or_else(|| "10000".to_string());
+        let qc_str = prompt_with_default("Query count (self-search)", &qc_default);
+        let qc = qc_str.parse().unwrap_or(10000);
+        (None, true, qc)
     };
 
     let query_convert_format = if let Some(ref qv) = query_vectors {
@@ -274,100 +353,39 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
         None
     };
 
-    // ── Metadata ─────────────────────────────────────────────────────
-    println!();
-    println!("--- Metadata ---");
-    let metadata = if roles_accepted && detected.metadata.is_some() {
+    // ── Metadata — resolved from facets + detected inputs ──────────────
+    // M confirmed + detected → use it. M confirmed + not detected → prompt path.
+    // M not confirmed → skip.
+    let metadata = if !want_m {
+        None
+    } else if roles_accepted && detected.metadata.is_some() {
         let m = detected.metadata.as_ref().unwrap().clone();
-        let m = prompt_source_location(&m, &output, "Metadata");
-        println!("  Using detected: {}", m.display());
-        Some(m)
+        Some(prompt_source_location(&m, &output, "Metadata"))
+    } else if let Some(ref seeded) = seeds.metadata {
+        Some(seeded.clone())
     } else {
-        let meta_candidates: Vec<&(PathBuf, String, u64)> = candidates.iter()
-            .filter(|(_, fmt, _)| fmt == "slab" || fmt == "parquet")
-            .collect();
-
-        if !meta_candidates.is_empty() {
-            println!("  Found metadata candidates:");
-            for (path, fmt, size) in &meta_candidates {
-                println!("    {} ({}, {})", path.display(), fmt, format_size(*size));
-            }
-            if confirm("Include metadata in pipeline?", true) {
-                if meta_candidates.len() == 1 {
-                    Some(meta_candidates[0].0.clone())
-                } else {
-                    prompt_optional_path("Path to metadata source")
-                }
-            } else {
-                None
-            }
-        } else {
-            if confirm("Include metadata source?", false) {
-                prompt_optional_path("Path to metadata")
-            } else {
-                None
-            }
-        }
+        // M facet was confirmed but no metadata detected — ask for path
+        prompt_optional_path("Path to metadata source")
     };
 
-    // ── Ground truth ─────────────────────────────────────────────────
-    println!();
-    println!("--- Ground truth ---");
+    // ── Ground truth — resolved from facets + detected inputs ─────────
+    // G confirmed + detected pre-computed → use it.
+    // G confirmed + not detected → will be computed by the pipeline.
     let has_queries = query_vectors.is_some() || self_search;
-    let (ground_truth, ground_truth_distances) = if has_queries {
-        if roles_accepted && detected.neighbor_indices.is_some() {
-            // Detected pre-computed ground truth — rename with _ prefix
-            let gt = detected.neighbor_indices.as_ref().unwrap().clone();
-            let gt = prompt_source_location(&gt, &output, "Ground truth indices");
-            println!("  Using detected ground truth indices: {}", gt.display());
-            let gtd = if let Some(ref d) = detected.neighbor_distances {
-                let d = prompt_source_location(d, &output, "Ground truth distances");
-                println!("  Using detected ground truth distances: {}", d.display());
-                Some(d)
-            } else {
-                None
-            };
-            (Some(gt), gtd)
-        } else {
-            let gt_candidates: Vec<&(PathBuf, String, u64)> = candidates.iter()
-                .filter(|(p, fmt, _)| {
-                    fmt == "ivec" && p.to_string_lossy().contains("neighbor")
-                })
-                .collect();
-
-            if !gt_candidates.is_empty() {
-                println!("  Found potential ground truth:");
-                for (path, _, size) in &gt_candidates {
-                    println!("    {} ({})", path.display(), format_size(*size));
-                }
-            }
-
-            if confirm("Compute KNN ground truth? (choose N to provide pre-computed)", true) {
-                (None, None)
-            } else {
-                let gt = prompt_optional_path("Path to ground truth indices (ivec)");
-                let gtd = prompt_optional_path("Path to ground truth distances (fvec)");
-                (gt, gtd)
-            }
-        }
+    let (ground_truth, ground_truth_distances) = if !want_g || !has_queries {
+        (None, None)
+    } else if roles_accepted && detected.neighbor_indices.is_some() {
+        let gt = detected.neighbor_indices.as_ref().unwrap().clone();
+        let gt = prompt_source_location(&gt, &output, "Ground truth indices");
+        let gtd = detected.neighbor_distances.as_ref()
+            .map(|d| prompt_source_location(d, &output, "Ground truth distances"));
+        (Some(gt), gtd)
+    } else if let Some(ref seeded) = seeds.ground_truth {
+        (Some(seeded.clone()), seeds.ground_truth_distances.clone())
     } else {
-        println!("  No query vectors — skipping ground truth.");
+        // G confirmed, no pre-computed GT — pipeline will compute it
         (None, None)
     };
-
-    // ── Base data fraction ─────────────────────────────────────────
-    println!();
-    println!("--- Base data fraction ---");
-    println!("  Controls what percentage of the available base vectors to use.");
-    println!("  100% uses all vectors. Lower values produce a smaller dataset,");
-    println!("  useful for faster iteration during development.");
-    let frac_default = seeds.base_fraction
-        .map(|f| format!("{}", (f * 100.0).round() as u32))
-        .unwrap_or_else(|| "100".to_string());
-    let base_fraction_str = prompt_with_default("Base data percentage (1-100)", &frac_default);
-    let base_fraction = base_fraction_str.trim().parse::<f64>()
-        .unwrap_or(100.0)
-        .clamp(1.0, 100.0) / 100.0;
 
     // ── Source metric and normalization ─────────────────────────────
     //
@@ -394,55 +412,44 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
         metric_default,
     );
 
-    // Normalization detection and metric implications
+    // Normalization detection. Normalization is a data transformation
+    // choice — the pipeline supports correct distance computation for
+    // both normalized and unnormalized vectors with any metric.
+    // Normalizing is recommended for Cosine/DotProduct (enables faster
+    // SIMD kernel) but not required.
     let (normalize, metric) = if let Some(ref bv) = base_vectors {
         eprint!("Sampling vectors for normalization detection... ");
         use std::io::Write;
         let _ = std::io::stderr().flush();
-        if let Some((is_normalized, sample_count, mean_norm)) = super::import::detect_normalized(bv) {
-            if is_normalized {
-                eprintln!("done.");
-                println!();
-                println!("  Vectors are L2-normalized (mean norm={:.4}, n={})", mean_norm, sample_count);
-                if source_metric.eq_ignore_ascii_case("Cosine") {
-                    println!("  Since vectors are already normalized, Cosine and DotProduct are equivalent.");
-                    println!("  KNN will use Cosine as specified.");
-                }
-                (false, source_metric)
-            } else {
-                eprintln!("done.");
-                println!();
-                println!("  Vectors are NOT L2-normalized (mean norm={:.4}, n={})", mean_norm, sample_count);
-                println!();
-                println!("  L2-normalizing converts vectors to unit length. This changes distance behavior:");
-                println!("    - L2 distance ranking becomes equivalent to Cosine ranking");
-                println!("    - DotProduct becomes equivalent to Cosine similarity");
-                println!("    - Original magnitude information is lost (irreversible)");
-                println!();
-                if confirm("L2-normalize vectors during extraction?", true) {
-                    println!();
-                    println!("  Normalization will be applied. The effective metric for KNN:");
-                    let effective = if source_metric.eq_ignore_ascii_case("L2") {
-                        println!("    Source metric L2 on normalized vectors → Cosine-equivalent ranking.");
-                        println!("    Using Cosine as the KNN metric.");
-                        "Cosine".to_string()
-                    } else if source_metric.eq_ignore_ascii_case("DotProduct") {
-                        println!("    Source metric DotProduct on normalized vectors → Cosine-equivalent.");
-                        println!("    Using Cosine as the KNN metric.");
-                        "Cosine".to_string()
-                    } else {
-                        println!("    Keeping {} as the KNN metric.", source_metric);
-                        source_metric.clone()
-                    };
-                    (true, effective)
-                } else {
-                    println!("  Keeping vectors unnormalized. KNN will use {} as specified.", source_metric);
-                    (false, source_metric)
-                }
-            }
-        } else {
-            eprintln!("skipped (format not supported for sampling).");
+
+        let detected = super::import::detect_normalized(bv);
+        let already_normalized = detected.as_ref().map(|(n, _, _)| *n).unwrap_or(false);
+
+        if already_normalized {
+            let (_, count, mean) = detected.unwrap();
+            eprintln!("already normalized (mean norm={:.4}, n={}).", mean, count);
             (false, source_metric)
+        } else {
+            if let Some((_, count, mean)) = detected {
+                eprintln!("not normalized (mean norm={:.4}, n={}).", mean, count);
+            } else {
+                eprintln!("could not detect (source format).");
+            }
+            let cosine_or_dot = source_metric.eq_ignore_ascii_case("Cosine")
+                || source_metric.eq_ignore_ascii_case("DotProduct");
+            if cosine_or_dot {
+                println!();
+                println!("  L2-normalizing is recommended for {} metric:", source_metric);
+                println!("    - Enables 16-wide AVX-512 batched distance kernel (~16x faster KNN)");
+                println!("    - Without normalization, KNN falls back to per-pair computation");
+                println!("    - Normalization is applied during extraction (source data unchanged)");
+                println!();
+                let do_normalize = confirm("L2-normalize vectors during extraction?", true);
+                (do_normalize, source_metric)
+            } else {
+                println!("  Metric {} does not benefit from normalization.", source_metric);
+                (false, source_metric)
+            }
         }
     } else {
         (false, source_metric)
@@ -468,6 +475,24 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
 
     let seed_str = prompt_with_default("Random seed", "42");
     let seed = seed_str.parse().unwrap_or(42);
+
+    // Predicate selectivity — only relevant when predicates will be synthesized
+    let selectivity = if confirmed_facets.contains('P') {
+        println!();
+        println!("  Predicate selectivity controls filtering difficulty.");
+        println!("  Lower = harder (fewer matches per query).");
+        println!("    0.1    = 10% of base qualifies   (easy)");
+        println!("    0.01   = 1%                       (moderate)");
+        println!("    0.001  = 0.1%                     (hard)");
+        println!("    0.0001 = 0.01%                    (very hard)");
+        let default = seeds.selectivity
+            .map(|s| format!("{}", s))
+            .unwrap_or_else(|| "0.0001".into());
+        let sel_str = prompt_with_default("Predicate selectivity", &default);
+        sel_str.parse::<f64>().unwrap_or(0.0001)
+    } else {
+        seeds.selectivity.unwrap_or(0.0001)
+    };
 
     // ── Optional features ────────────────────────────────────────────
     // When pre-computed ground truth is provided, dedup and zero checks
@@ -496,33 +521,40 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
         println!("  A clean ordinal index will be produced excluding zeros.");
     }
 
-    let no_filtered = if metadata.is_some() && has_queries {
-        !confirm("Include filtered KNN (predicated search)?", true)
-    } else {
-        true
-    };
+    // no_filtered is determined by the facet confirmation above.
+    let no_filtered = !want_f;
 
     // ── Sized profiles ────────────────────────────────────────────────
+    // Stratified profiles are independent of query vectors — they define
+    // windowed subsets of the base data at multiple scales.
     let sized_profiles = if let Some(ref bv) = base_vectors {
-        if !has_queries {
-            None
-        } else {
+        {
             let vec_count = probe_vector_count(bv);
-            let effective_max = vec_count
-                .map(|n| n.saturating_sub(query_count as u64))
-                .unwrap_or(0);
+            if vec_count.is_none() || vec_count == Some(0) {
+                eprintln!("Error: could not determine vector count from '{}'", bv.display());
+                eprintln!("The source must be readable and contain at least one vector.");
+                std::process::exit(1);
+            }
+            let vec_count = vec_count.unwrap();
+            let query_sub = if self_search { query_count as u64 } else { 0 };
+            let effective_max = vec_count.saturating_sub(query_sub);
 
             if effective_max == 0 {
                 println!();
-                println!("--- Sized profiles ---");
-                println!("  Could not determine base vector count — skipping sized profiles.");
+                println!("  Warning: query_count ({}) >= vector count ({}) — no base vectors remain.",
+                    query_count, vec_count);
+                println!("  Sized profiles are not applicable.");
                 None
             } else {
             let max_label = format_count_label(effective_max);
 
             println!();
             println!("--- Sized profiles ---");
-            println!("  Base vector count after query extraction: ~{}", max_label);
+            if self_search {
+                println!("  Base vector count after query extraction: ~{}", max_label);
+            } else {
+                println!("  Base vector count: ~{}", max_label);
+            }
             println!("  Sized profiles create windowed subsets of the base vectors at");
             println!("  different scales (e.g., 1M, 2M, 4M, ..., 10M, 20M, ...).");
             println!();
@@ -536,18 +568,22 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
             println!("    - Incremental workflow: verify correctness at 1M, then 10M,");
             println!("      then scale up with confidence");
             println!();
-            // Build a default spec that fits the actual dataset size
+            // Build a default spec. The upper bound is always ${base_count}
+            // because the actual count depends on cleaning (dedup, zeros)
+            // and fraction. Resolved at run time by deferred profile expansion.
+            // The effective_max estimate is only used to choose the starting
+            // scale and series type.
             let build_spec = || -> String {
                 if effective_max >= 2_000_000 {
-                    format!("mul:1m..{}/2, 0m..{}/10m", max_label, max_label)
+                    "mul:1m..${base_count}/2".to_string()
                 } else if effective_max >= 100_000 {
                     let start = (effective_max / 10).max(1000);
                     let start_label = format_count_label(start);
-                    format!("mul:{}..{}/2", start_label, max_label)
+                    format!("mul:{}..${{base_count}}/2", start_label)
                 } else if effective_max >= 10_000 {
                     let start = (effective_max / 5).max(1000);
                     let start_label = format_count_label(start);
-                    format!("{}..{}/{}", start_label, max_label, start_label)
+                    format!("{}..${{base_count}}/{}", start_label, start_label)
                 } else {
                     format_count_label(effective_max / 2)
                 }
@@ -586,33 +622,231 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
     println!("  `veks prepare cache-compress`. Recommended: No for initial runs.");
     let compress_cache = confirm("Compress cache files?", false);
 
-    // ── Summary ──────────────────────────────────────────────────────
+    // The confirmed facets drive required_facets for ImportArgs
+    let required_facets = if confirmed_facets == *implied_facets {
+        None // user accepted inference — let import figure it out
+    } else {
+        Some(confirmed_facets.clone())
+    };
+
+    // ── Summary — artifact lineage view ──────────────────────────────
+    use veks_core::term;
+
     println!();
-    println!("=== Summary ===");
-    println!("  Name:          {}", name);
-    if let Some(ref d) = description { println!("  Description:   {}", d); }
-    println!("  Output:        {}", output.display());
-    if let Some(ref bv) = base_vectors { println!("  Base vectors:  {}", bv.display()); }
-    if let Some(ref qv) = query_vectors { println!("  Query vectors: {}", qv.display()); }
-    if self_search { println!("  Query mode:    self-search ({})", query_count); }
-    if let Some(ref m) = metadata { println!("  Metadata:      {}", m.display()); }
-    if let Some(ref gt) = ground_truth { println!("  Ground truth:  {}", gt.display()); }
-    println!("  Metric:        {}", metric);
-    println!("  Neighbors:     {}", neighbors);
-    println!("  Seed:          {}", seed);
-    println!("  Normalize:     {}", if normalize { "yes" } else { "no" });
-    println!("  Dedup:         {}", if no_dedup { "no" } else { "yes" });
-    println!("  Zero check:    {}", if no_zero_check { "no" } else { "yes" });
-    if metadata.is_some() && has_queries {
-        println!("  Filtered KNN:  {}", if no_filtered { "no" } else { "yes" });
+    println!("{}", term::bold("=== Pipeline Summary ==="));
+    println!();
+
+    // Configuration line
+    let frac_str = if base_fraction < 1.0 {
+        format!("{:.0}%", base_fraction * 100.0)
+    } else {
+        "100%".into()
+    };
+    // Pad to visual width BEFORE applying ANSI color codes.
+    // ANSI escapes are invisible but count in format width calculations.
+    let pad = |s: &str, w: usize| -> String {
+        if s.len() >= w { s.to_string() } else { format!("{}{}", s, " ".repeat(w - s.len())) }
+    };
+
+    println!("  {} {} {} {} {} {}",
+        term::dim(&pad("Dataset:", 10)), term::bold(&pad(&name, 18)),
+        term::dim(&pad("Output:", 10)), pad(&output.display().to_string(), 16),
+        term::dim("Fraction:"), frac_str);
+    println!("  {} {} {} {} {} {}",
+        term::dim(&pad("Metric:", 10)), pad(&metric, 18),
+        term::dim(&pad("k:", 10)), pad(&neighbors.to_string(), 16),
+        term::dim("Seed:"), seed);
+    println!("  {} {}", term::dim("Normalize:"),
+        if normalize { term::info("yes") } else { "no".to_string() });
+    if !no_dedup || !no_zero_check {
+        let cleaning: Vec<&str> = [
+            if !no_dedup { Some("dedup") } else { None },
+            if !no_zero_check { Some("zero-check") } else { None },
+        ].into_iter().flatten().collect();
+        println!("  {} {}", term::dim("Cleaning:"), cleaning.join(", "));
     }
     if let Some(ref sp) = sized_profiles {
-        println!("  Sized profiles: {}", sp);
+        println!("  {} {}", term::dim("Stratify:"), sp);
     }
-    if base_fraction < 1.0 {
-        println!("  Base fraction: {:.0}%", base_fraction * 100.0);
+    println!();
+
+    // Artifact lineage: inputs → facets with connection types
+    println!("  {}                              {}",
+        term::bold("Provided inputs"), term::bold("Dataset facets"));
+    println!("  {}    {}",
+        term::dim("─────────────────────────────────────────"),
+        term::dim("──────────────────────────────"));
+
+    // Helper: format an input path for display (truncate to ~35 chars)
+    let fmt_input = |path: &Path, fmt: &str| -> String {
+        let name = path.file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.display().to_string());
+        if name.len() > 30 {
+            format!("{}.. ({})", &name[..28], fmt)
+        } else {
+            format!("{} ({})", name, fmt)
+        }
+    };
+
+    // Determine source format labels
+    let detect_format = |p: &Path| -> String {
+        if p.is_dir() {
+            // Check for npy or parquet inside
+            if std::fs::read_dir(p).ok()
+                .map(|entries| entries.flatten().any(|e| {
+                    e.path().extension().and_then(|x| x.to_str()) == Some("npy")
+                })).unwrap_or(false) {
+                return "npy dir".into();
+            }
+            if std::fs::read_dir(p).ok()
+                .map(|entries| entries.flatten().any(|e| {
+                    e.path().extension().and_then(|x| x.to_str()) == Some("parquet")
+                })).unwrap_or(false) {
+                return "parquet dir".into();
+            }
+            "directory".into()
+        } else if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
+            ext.to_string()
+        } else {
+            VecFormat::detect(p)
+                .map(|f: VecFormat| f.name().to_string())
+                .unwrap_or_else(|| "file".into())
+        }
+    };
+
+    let base_fmt = base_vectors.as_ref()
+        .map(|p| detect_format(p))
+        .unwrap_or_default();
+
+    // Build facet rows: (code, label, connection_type, source_input)
+    // Connection types: "provided" (pre-computed), "convert", "self-search",
+    //                   "compute", "synthesize", "evaluate", "checked"
+    struct FacetRow {
+        code: char,
+        label: &'static str,
+        connection: &'static str,
+        source: String,
     }
-    println!("  Compress cache: {}", if compress_cache { "yes" } else { "no" });
+
+    let has_precomputed_gt = ground_truth.is_some();
+    let base_label = base_vectors.as_ref()
+        .map(|p| fmt_input(p, &base_fmt))
+        .unwrap_or_default();
+    let meta_label = metadata.as_ref()
+        .map(|p| {
+            let ext = detect_format(p);
+            fmt_input(p, &ext)
+        })
+        .unwrap_or_default();
+
+    let facet_rows: Vec<FacetRow> = vec![
+        FacetRow {
+            code: 'B', label: "base vectors",
+            connection: if base_vectors.as_ref().map(|p| {
+                VecFormat::detect(p).map(|f| f.is_xvec()).unwrap_or(false)
+            }).unwrap_or(false) { "identity" } else { "convert" },
+            source: base_label.clone(),
+        },
+        FacetRow {
+            code: 'Q', label: "query vectors",
+            connection: if query_vectors.is_some() { "provided" } else if self_search { "self-search" } else { "—" },
+            source: if query_vectors.is_some() {
+                query_vectors.as_ref().map(|p| fmt_input(p, "xvec")).unwrap_or_default()
+            } else if self_search {
+                format!("{} ({})", base_label, query_count)
+            } else { String::new() },
+        },
+        FacetRow {
+            code: 'G', label: "KNN indices",
+            connection: if has_precomputed_gt { "provided" } else { "compute" },
+            source: if has_precomputed_gt {
+                ground_truth.as_ref().map(|p| fmt_input(p, "ivec")).unwrap_or_default()
+            } else { "B x Q brute-force".into() },
+        },
+        FacetRow {
+            code: 'D', label: "KNN distances",
+            connection: if ground_truth_distances.is_some() { "provided" } else { "compute" },
+            source: if ground_truth_distances.is_some() {
+                ground_truth_distances.as_ref().map(|p| fmt_input(p, "fvec")).unwrap_or_default()
+            } else { "B x Q brute-force".into() },
+        },
+        FacetRow {
+            code: 'M', label: "metadata",
+            connection: if metadata.is_some() { "convert" } else { "—" },
+            source: meta_label.clone(),
+        },
+        FacetRow {
+            code: 'P', label: "predicates",
+            connection: "synthesize",
+            source: "M schema survey".into(),
+        },
+        FacetRow {
+            code: 'R', label: "predicate results",
+            connection: "evaluate",
+            source: "M x P evaluation".into(),
+        },
+        FacetRow {
+            code: 'F', label: "filtered KNN",
+            connection: "compute",
+            source: "B x Q x R filtered search".into(),
+        },
+    ];
+
+    for row in &facet_rows {
+        if !confirmed_facets.contains(row.code) {
+            continue;
+        }
+        // Color the arrow and tag by connection type
+        // All arrows are exactly 12 visual characters wide
+        let (arrow, tag_colored) = match row.connection {
+            "identity" => (    //123456789012
+                term::ok(      "═══════════►"),
+                term::ok("[identity]"),
+            ),
+            "provided" => (    //123456789012
+                term::green(   "───────────►"),
+                term::green("[provided]"),
+            ),
+            "convert" => (     //123456789012
+                term::info(    "──convert──►"),
+                term::info("[convert]"),
+            ),
+            "self-search" => ( //123456789012
+                term::info(    "───split───►"),
+                term::info("[self-search]"),
+            ),
+            "compute" => (     //123456789012
+                term::warn(    "──compute──►"),
+                term::warn("[compute]"),
+            ),
+            "synthesize" => (  //123456789012
+                term::warn(    "─synthesize►"),
+                term::warn("[synthesize]"),
+            ),
+            "evaluate" => (    //123456789012
+                term::warn(    "──evaluate─►"),
+                term::warn("[evaluate]"),
+            ),
+            _ => (
+                "       ►".to_string(),
+                format!("[{}]", row.connection),
+            ),
+        };
+
+        let source_raw = if row.source.is_empty() { "(none)" } else { &row.source };
+        let source_padded = pad(source_raw, 42);
+        let source_display = if row.source.is_empty() {
+            term::dim(&source_padded)
+        } else {
+            source_padded
+        };
+        let facet_code = term::bold(&row.code.to_string());
+        let label_padded = pad(row.label, 20);
+        println!("  {} {} {}  {} {}",
+            source_display, arrow, facet_code, label_padded, tag_colored);
+    }
+    println!();
     println!();
 
     if !confirm("Proceed with this configuration?", true) {
@@ -644,9 +878,10 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
         compress_cache,
         sized_profiles,
         base_fraction,
-        required_facets: seeds.required_facets.clone(),
+        required_facets,
         round_digits: seeds.round_digits.unwrap_or(2),
         pedantic_dedup: seeds.pedantic_dedup.unwrap_or(false),
+        selectivity,
     }
 }
 
@@ -744,15 +979,22 @@ fn prompt_source_location(source: &Path, output_dir: &Path, label: &str) -> Path
 /// Probe a vector file for its record count using mmap (no full read).
 fn probe_vector_count(path: &Path) -> Option<u64> {
     let format = VecFormat::detect(path)?;
-    if path.is_dir() { return None; }
-    let meta = crate::formats::reader::probe_source(path, format).ok()?;
+    if path.is_dir() {
+        // For directories (npy, parquet), open a source reader to get count
+        let source = veks_core::formats::reader::open_source(path, format, 1, None).ok()?;
+        return source.record_count();
+    }
+    let meta = veks_core::formats::reader::probe_source(path, format).ok()?;
     meta.record_count
 }
 
 fn probe_vector_dim(path: &Path) -> Option<u32> {
     let format = VecFormat::detect(path)?;
-    if path.is_dir() { return None; }
-    let meta = crate::formats::reader::probe_source(path, format).ok()?;
+    if path.is_dir() {
+        let source = veks_core::formats::reader::open_source(path, format, 1, Some(1)).ok()?;
+        return Some(source.dimension());
+    }
+    let meta = veks_core::formats::reader::probe_source(path, format).ok()?;
     Some(meta.dimension)
 }
 

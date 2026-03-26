@@ -798,6 +798,7 @@ fn emit_step_yaml(
         after: after.to_vec(),
         profiles: vec![],
         per_profile: false,
+        phase: 0,
         on_partial: Default::default(),
         options: step_options,
     };

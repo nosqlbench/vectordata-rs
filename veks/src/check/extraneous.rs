@@ -47,10 +47,19 @@ pub fn check(
     for dataset_path in dataset_files {
         let workspace = dataset_path.parent().unwrap_or(Path::new("."));
 
-        let config = match DatasetConfig::load(dataset_path) {
+        let mut config = match DatasetConfig::load(dataset_path) {
             Ok(c) => c,
             Err(_) => continue,
         };
+
+        // Resolve deferred sized profiles so the manifest includes
+        // per-profile output paths (profiles/1m/*, profiles/2m/*, etc.)
+        if config.profiles.has_deferred() {
+            if let Ok(vars) = veks_pipeline::pipeline::variables::load(workspace) {
+                let var_map: indexmap::IndexMap<String, String> = vars.into_iter().collect();
+                config.profiles.expand_deferred_sized(&var_map);
+            }
+        }
 
         let wm = match manifest::project_workspace(dataset_path, &config, &registry) {
             Ok(m) => m,

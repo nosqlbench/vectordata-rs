@@ -177,6 +177,7 @@ fn default_args(name: &str, output: &Path) -> ImportArgs {
         required_facets: None,
         round_digits: 2,
         pedantic_dedup: false,
+        selectivity: 0.0001,
     }
 }
 

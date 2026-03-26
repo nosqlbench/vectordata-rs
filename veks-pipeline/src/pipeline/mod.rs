@@ -303,14 +303,29 @@ pub fn run_pipeline(args: RunArgs) {
     // Collect steps and expand per_profile templates
     let pipeline = config.upstream.as_ref();
 
-    let raw_steps = vectordata::dataset::collect_all_steps(&config);
-
     // Read query_count from upstream defaults (used by per_profile expansion)
     let query_count: u64 = pipeline
         .and_then(|p| p.defaults.as_ref())
         .and_then(|d| d.get("query_count"))
         .and_then(|s| s.parse().ok())
         .unwrap_or(10_000);
+
+    // Resolve deferred sized profiles if variables.yaml has the needed values.
+    // This handles the case where a previous run produced base_count and
+    // the sized spec uses ${base_count}. Without this, the first re-run
+    // after bootstrap would show no per-profile steps until Phase 2.
+    if config.profiles.has_deferred() {
+        // Load variables early just for profile resolution
+        if let Ok(vars) = variables::load(&workspace) {
+            let var_map: indexmap::IndexMap<String, String> = vars.into_iter().collect();
+            let added = config.profiles.expand_deferred_sized(&var_map);
+            if added > 0 {
+                println!("Resolved {} deferred sized profiles from variables.yaml", added);
+            }
+        }
+    }
+
+    let raw_steps = vectordata::dataset::collect_all_steps(&config);
 
     // Expand per_profile template steps into concrete profile-gated steps
     let expanded_steps = vectordata::dataset::expand_per_profile_steps(raw_steps, &config.profiles, query_count);
@@ -408,7 +423,7 @@ pub fn run_pipeline(args: RunArgs) {
 
     // Load or create progress log
     let progress_path = ProgressLog::path_for_dataset(dataset_path);
-    let (mut progress, schema_msg) = ProgressLog::load(&progress_path).unwrap_or_else(|e| {
+    let (progress, schema_msg) = ProgressLog::load(&progress_path).unwrap_or_else(|e| {
         println!("Warning: failed to load progress log: {}", e);
         (ProgressLog::new(), None)
     });
@@ -416,18 +431,9 @@ pub fn run_pipeline(args: RunArgs) {
         println!("{}", msg);
     }
 
-    // Invalidate progress log if dataset.yaml is newer (mtime check)
-    if let Some(msg) = progress.invalidate_if_stale(dataset_path) {
-        println!("{}", msg);
-    }
-
-    // Invalidate if dataset.yaml content changed (hash check).
-    // This catches config changes that don't update mtime (e.g., restore
-    // from backup) and detects when a re-bootstrap changed the pipeline
-    // shape (e.g., adding --base-fraction).
-    if let Some(msg) = progress.invalidate_if_config_changed(dataset_path) {
-        println!("{}", msg);
-    }
+    // Invalidation is now per-step via fingerprint chains (computed in
+    // the runner). No whole-log invalidation needed — changing a step's
+    // options only invalidates that step and its dependents.
 
     let threads = if args.threads == 0 {
         std::thread::available_parallelism()
@@ -992,6 +998,7 @@ fn resolve_pipeline_yaml(
             after: step.def.after.clone(),
             profiles: step.def.profiles.clone(),
             per_profile: step.def.per_profile,
+            phase: step.def.phase,
             on_partial: step.def.on_partial.clone(),
             options,
         });

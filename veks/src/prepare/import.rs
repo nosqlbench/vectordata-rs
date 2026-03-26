@@ -65,6 +65,10 @@ pub struct ImportArgs {
     /// Default 2 produces clean sizes (e.g., 180000000 instead of 184623729).
     /// Set to 10+ to effectively disable rounding.
     pub round_digits: u32,
+    /// Selectivity ratio for synthesized predicates.
+    /// Lower values produce harder predicates (fewer qualifying neighbors).
+    /// Default 0.0001 means ~0.01% of base vectors match each predicate.
+    pub selectivity: f64,
 }
 
 /// Canonical facet code definitions.
@@ -432,11 +436,29 @@ struct Step {
     description: Option<String>,
     after: Vec<String>,
     per_profile: bool,
+    /// Execution phase for profile ordering. Phase 0 (compute) runs
+    /// across all profiles before phase 1 (verify) begins.
+    #[allow(dead_code)]
+    phase: u32,
     options: Vec<(String, String)>,
 }
 
+impl Default for Step {
+    fn default() -> Self {
+        Step {
+            id: String::new(),
+            run: String::new(),
+            description: None,
+            after: Vec::new(),
+            per_profile: false,
+            phase: 0,
+            options: Vec::new(),
+        }
+    }
+}
+
 /// Walk the resolved slots and emit pipeline steps for materialized slots.
-fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, output_dir: &std::path::Path) -> Vec<Step> {
+fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path::Path) -> Vec<Step> {
     let mut steps = Vec::new();
     // Make source paths relative to the output directory when possible,
     // so the dataset.yaml is portable.
@@ -468,6 +490,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, output_dir: &std::path::
             description: Some("Import base vectors from source format".into()),
             after: vec![],
             per_profile: false,
+            phase: 0,
             options: convert_opts,
         });
     }
@@ -502,6 +525,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, output_dir: &std::path::
                 args.base_fraction * 100.0)),
             after: vec![],
             per_profile: false,
+            phase: 0,
             options: vec![
                 ("source".into(), source_path),
                 ("output".into(), subset_output),
@@ -524,6 +548,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, output_dir: &std::path::
             description: Some(format!("Convert base vectors to {} precision", ext)),
             after,
             per_profile: false,
+            phase: 0,
             options: vec![
                 ("source".into(), source),
                 ("output".into(), output),
@@ -553,6 +578,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, output_dir: &std::path::
             description: None,
             after: if last_vector_step.is_empty() { vec![] } else { vec![last_vector_step.into()] },
             per_profile: false,
+            phase: 0,
             options: vec![
                 ("name".into(), "vector_count".into()),
                 ("value".into(), format!("count:{}", working_vectors)),
@@ -568,6 +594,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, output_dir: &std::path::
             description: Some("Lexicographic sort producing sorted ordinals + duplicate report".into()),
             after: if last_vector_step.is_empty() { vec![] } else { vec![last_vector_step.into()] },
             per_profile: false,
+            phase: 0,
             options: {
                 let mut opts = vec![
                     ("source".into(), working_vectors.clone()),
@@ -591,6 +618,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, output_dir: &std::path::
             description: None,
             after: vec!["sort-and-dedup".into()],
             per_profile: false,
+            phase: 0,
             options: vec![
                 ("name".into(), "duplicate_count".into()),
                 ("value".into(), "count:${cache}/dedup_duplicates.ivec".into()),
@@ -612,6 +640,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, output_dir: &std::path::
             description: Some("Binary search sorted index for zero vector".into()),
             after,
             per_profile: false,
+            phase: 0,
             options: vec![
                 ("source".into(), working_vectors.clone()),
                 ("index".into(), slots.sort.path().into()),
@@ -628,6 +657,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, output_dir: &std::path::
             description: None,
             after: vec!["find-zeros".into()],
             per_profile: false,
+            phase: 0,
             options: vec![
                 ("name".into(), "zero_count".into()),
                 ("value".into(), "count:${cache}/zero_ordinals.ivec".into()),
@@ -650,6 +680,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, output_dir: &std::path::
             description: Some("Filter sorted ordinals excluding duplicates and zeros".into()),
             after,
             per_profile: false,
+            phase: 0,
             options: vec![
                 ("source".into(), slots.sort.path().into()),
                 ("duplicates".into(), "${cache}/dedup_duplicates.ivec".into()),
@@ -667,6 +698,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, output_dir: &std::path::
             description: None,
             after: vec!["filter-ordinals".into()],
             per_profile: false,
+            phase: 0,
             options: vec![
                 ("name".into(), "clean_count".into()),
                 ("value".into(), "count:${cache}/clean_ordinals.ivec".into()),
@@ -713,6 +745,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, output_dir: &std::path::
                     description: Some("Reproducible random split via Fisher-Yates shuffle".into()),
                     after: shuffle_after,
                     per_profile: false,
+                    phase: 0,
                     options: shuffle_opts,
                 });
             }
@@ -749,6 +782,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, output_dir: &std::path::
                         description: Some(format!("Cap base set to {:.0}% of available vectors", args.base_fraction * 100.0)),
                         after: vec![count_dep.into()],
                         per_profile: false,
+                        phase: 0,
                         options: vec![
                             ("name".into(), "base_end".into()),
                             ("value".into(), format!(
@@ -781,6 +815,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, output_dir: &std::path::
                     description: Some(format!("First {} shuffled vectors -> query set", args.query_count)),
                     after: extract_deps.clone(),
                     per_profile: false,
+                    phase: 0,
                     options: query_opts,
                 });
                 let mut base_opts = vec![
@@ -802,6 +837,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, output_dir: &std::path::
                     }),
                     after: extract_deps,
                     per_profile: false,
+                    phase: 0,
                     options: base_opts,
                 });
                 steps.push(Step {
@@ -810,6 +846,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, output_dir: &std::path::
                     description: None,
                     after: vec!["extract-base".into()],
                     per_profile: false,
+                    phase: 0,
                     options: vec![
                         ("name".into(), "base_count".into()),
                         ("value".into(), format!("count:{}", slots.base_vectors.path())),
@@ -830,6 +867,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, output_dir: &std::path::
                 description: Some("Import query vectors from source format".into()),
                 after: vec![],
                 per_profile: false,
+                phase: 0,
                 options: vec![
                     ("facet".into(), "query_vectors".into()),
                     ("source".into(), relativize_path(query_source, &args.output)),
@@ -867,6 +905,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, output_dir: &std::path::
                 description: Some("Import metadata from source format".into()),
                 after: vec![],
                 per_profile: false,
+                phase: 0,
                 options: meta_opts,
             });
         }
@@ -888,6 +927,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, output_dir: &std::path::
                 description: Some("Reorder metadata to match shuffled base vectors".into()),
                 after,
                 per_profile: false,
+                phase: 0,
                 options: vec![
                     ("source".into(), meta.metadata_all.path().into()),
                     ("ivec-file".into(), "${cache}/shuffle.ivec".into()),
@@ -915,6 +955,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, output_dir: &std::path::
             description: Some("Survey metadata to discover schema and value ranges".into()),
             after: survey_after.clone(),
             per_profile: false,
+            phase: 0,
             options: vec![
                 ("input".into(), meta.metadata_all.path().into()),
                 ("output".into(), "${cache}/metadata_survey.json".into()),
@@ -930,12 +971,13 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, output_dir: &std::path::
             description: Some("Generate test predicates from metadata survey".into()),
             after: vec!["survey-metadata".into()],
             per_profile: false,
+            phase: 0,
             options: vec![
                 ("input".into(), meta.metadata_all.path().into()),
                 ("survey".into(), "${cache}/metadata_survey.json".into()),
                 ("output".into(), "profiles/base/predicates.slab".into()),
                 ("count".into(), "10000".into()),
-                ("selectivity".into(), "0.0001".into()),
+                ("selectivity".into(), args.selectivity.to_string()),
                 ("seed".into(), format!("${{{}}}", "seed")),
             ],
         });
@@ -951,11 +993,12 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, output_dir: &std::path::
             description: None,
             after: eval_after,
             per_profile: true,
+            phase: 1, // after all compute-knn — metadata I/O phase
             options: vec![
                 ("input".into(), meta.metadata_content.path().into()),
                 ("predicates".into(), "profiles/base/predicates.slab".into()),
                 ("survey".into(), "${cache}/metadata_survey.json".into()),
-                ("selectivity".into(), "0.0001".into()),
+                ("selectivity".into(), args.selectivity.to_string()),
                 ("range".into(), if slots.base_count.is_some() {
                     "[0,${base_end})".into()
                 } else if slots.clean_ordinals.is_materialized() {
@@ -1006,6 +1049,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, output_dir: &std::path::
                 description: Some("Compute brute-force exact KNN ground truth".into()),
                 after,
                 per_profile: true,
+                phase: 0,
                 options: {
                     let mut opts = vec![
                         ("base".into(), if slots.base_count.is_some() {
@@ -1021,6 +1065,9 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, output_dir: &std::path::
                     ];
                     if args.compress_cache {
                         opts.push(("compress_cache".into(), "true".into()));
+                    }
+                    if args.normalize {
+                        opts.push(("normalized".into(), "true".into()));
                     }
                     opts
                 },
@@ -1046,6 +1093,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, output_dir: &std::path::
                 description: Some("Compute filtered KNN with predicate pre-filtering".into()),
                 after,
                 per_profile: true,
+                phase: 2, // after all evaluate-predicates — base + pred indices I/O phase
                 options: {
                     let mut opts = vec![
                         ("base".into(), if slots.base_count.is_some() {
@@ -1069,92 +1117,78 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, output_dir: &std::path::
         }
     }
 
-    // ── Verification chain ──────────────────────────────────────
-    if let Some(ref knn) = slots.knn {
-        // Verify KNN regardless of whether it was computed or pre-provided.
-        // For computed KNN, verify-knn depends on compute-knn.
-        // For pre-provided KNN, it depends on convert-vectors (base must exist).
-        let verify_after = if needs_computed_knn {
-            // compute-knn step exists (either materialized or sized profiles need it)
-            vec!["compute-knn".into()]
+    // ── Consolidated verification ─────────────────────────────────
+    // Single-pass verifiers that scan base vectors once and verify all
+    // profiles incrementally. NOT per-profile — runs once after all
+    // compute phases complete.
+    if slots.knn.is_some() {
+        let mut verify_after = Vec::new();
+        if needs_computed_knn {
+            verify_after.push("compute-knn".into());
         } else {
-            // No compute step — depend on whatever produces base/query vectors
-            let mut deps: Vec<String> = Vec::new();
             if slots.all_vectors.is_materialized() {
-                deps.push("convert-vectors".into());
+                verify_after.push("convert-vectors".into());
             }
             if slots.query_vectors.as_ref().map(|q| q.is_materialized()).unwrap_or(false) {
-                deps.push("extract-queries".into());
+                verify_after.push("extract-queries".into());
             }
-            deps
-        };
-        let output_path = if needs_computed_knn {
-            "${cache}/profiles/${profile_name}/verify_knn.json".to_string()
-        } else {
-            "${cache}/verify_knn.json".to_string()
-        };
-        let mut verify_opts = vec![
-            ("base".into(), if slots.base_count.is_some() {
-                format!("{}[0..${{base_count}})", slots.base_vectors.path())
-            } else {
-                slots.base_vectors.path().to_string()
-            }),
-            ("query".into(), slots.query_vectors.as_ref().unwrap().path().into()),
-            ("indices".into(), if needs_computed_knn {
-                "neighbor_indices.ivec".to_string()
-            } else {
-                knn.path().into()
-            }),
-            ("metric".into(), args.metric.clone()),
-            ("sample".into(), "100".into()),
-            ("seed".into(), format!("${{{}}}", "seed")),
-            ("output".into(), output_path),
-        ];
-        // Include distances when available. When compute-knn runs (materialized
-        // or sized profiles need it), it produces neighbor_distances.fvec.
-        if needs_computed_knn {
-            verify_opts.push(("distances".into(), "neighbor_distances.fvec".into()));
-        } else if args.ground_truth_distances.is_some() {
-            let dist_path = relativize_path(args.ground_truth_distances.as_ref().unwrap(), output_dir);
-            verify_opts.push(("distances".into(), dist_path));
         }
-        // Per-profile when compute-knn runs per-profile (either materialized
-        // or pre-provided GT + sized profiles that need computed KNN).
-        let is_per_profile = needs_computed_knn;
         steps.push(Step {
             id: "verify-knn".into(),
-            run: "verify knn-groundtruth".into(),
-            description: Some("Sparse-sample KNN verification".into()),
+            run: "verify knn-consolidated".into(),
+            description: Some("Single-pass KNN verification across all profiles".into()),
             after: verify_after,
-            per_profile: is_per_profile,
-            options: verify_opts,
+            per_profile: false, // NOT per-profile — one step verifies all
+            phase: 0,
+            options: vec![
+                ("base".into(), slots.base_vectors.path().into()),
+                ("query".into(), slots.query_vectors.as_ref().unwrap().path().into()),
+                ("metric".into(), args.metric.clone()),
+                ("normalized".into(), if args.normalize { "true" } else { "false" }.into()),
+                ("sample".into(), "100".into()),
+                ("seed".into(), format!("${{{}}}", "seed")),
+                ("output".into(), "${cache}/verify_knn_consolidated.json".into()),
+            ],
         });
     }
 
     if let Some(ref fknn) = slots.filtered_knn {
         if fknn.is_materialized() {
-            // For sized profiles, limit verification to the profile's ordinal
-            // range so the verifier doesn't sample records outside the window.
-            // ${base_end} is resolved per-profile by expansion.
-            let mut verify_pred_opts = vec![
-                ("metadata".into(), slots.metadata.as_ref().unwrap().metadata_content.path().into()),
-                ("predicates".into(), "profiles/base/predicates.slab".into()),
-                ("metadata-indices".into(), "metadata_indices.slab".into()),
-                ("sample".into(), "50".into()),
-                ("metadata-sample".into(), "100000".into()),
-                ("seed".into(), format!("${{{}}}", "seed")),
-                ("output".into(), "${cache}/profiles/${profile_name}/verify_predicates.json".into()),
-            ];
-            if slots.base_count.is_some() {
-                verify_pred_opts.push(("range".into(), "[0,${base_end})".into()));
-            }
+            steps.push(Step {
+                id: "verify-filtered-knn".into(),
+                run: "verify filtered-knn-consolidated".into(),
+                description: Some("Single-pass filtered KNN verification across all profiles".into()),
+                after: vec!["compute-filtered-knn".into()],
+                per_profile: false,
+                phase: 0,
+                options: vec![
+                    ("base".into(), slots.base_vectors.path().into()),
+                    ("query".into(), slots.query_vectors.as_ref().unwrap().path().into()),
+                    ("metadata".into(), slots.metadata.as_ref().unwrap().metadata_content.path().into()),
+                    ("predicates".into(), "profiles/base/predicates.slab".into()),
+                    ("metric".into(), args.metric.clone()),
+                    ("normalized".into(), if args.normalize { "true" } else { "false" }.into()),
+                    ("sample".into(), "50".into()),
+                    ("seed".into(), format!("${{{}}}", "seed")),
+                    ("output".into(), "${cache}/verify_filtered_knn_consolidated.json".into()),
+                ],
+            });
+
             steps.push(Step {
                 id: "verify-predicates".into(),
-                run: "verify predicate-results".into(),
-                description: Some("Sparse-sample predicate verification via SQLite".into()),
-                after: vec!["compute-filtered-knn".into()],
-                per_profile: true,
-                options: verify_pred_opts,
+                run: "verify predicates-consolidated".into(),
+                description: Some("Single-pass predicate verification across all profiles".into()),
+                after: vec!["evaluate-predicates".into()],
+                per_profile: false,
+                phase: 0,
+                options: vec![
+                    ("metadata".into(), slots.metadata.as_ref().unwrap().metadata_content.path().into()),
+                    ("predicates".into(), "profiles/base/predicates.slab".into()),
+                    ("sample".into(), "50".into()),
+                    ("metadata-sample".into(), "100000".into()),
+                    ("seed".into(), format!("${{{}}}", "seed")),
+                    ("output".into(), "${cache}/verify_predicates_consolidated.json".into()),
+                ],
             });
         }
     }
@@ -1184,6 +1218,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, output_dir: &std::path::
         description: Some("Generate catalog index for the dataset directory".into()),
         after: catalog_after,
         per_profile: false,
+        phase: 0,
         options: vec![
             ("input".into(), ".".into()),
         ],
@@ -1198,6 +1233,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, output_dir: &std::path::
         description: Some("Create merkle hash trees for all publishable data files".into()),
         after: vec!["generate-catalog".into()],
         per_profile: false,
+        phase: 0,
         options: vec![
             ("source".into(), ".".into()),
             ("min-size".into(), "0".into()),
@@ -1298,6 +1334,9 @@ fn generate_yaml(
             out.push_str(&format!("      run: {}\n", step.run));
             if step.per_profile {
                 out.push_str("      per_profile: true\n");
+            }
+            if step.phase > 0 {
+                out.push_str(&format!("      phase: {}\n", step.phase));
             }
             if !step.after.is_empty() {
                 out.push_str(&format!("      after: [{}]\n", step.after.join(", ")));
@@ -1801,12 +1840,13 @@ pub fn detect_normalized(path: &Path) -> Option<(bool, usize, f64)> {
     use vectordata::io::MmapVectorReader;
     use crate::pipeline::element_type::ElementType;
 
+    // Directories (npy) need special handling — probe first npy file directly
+    if path.is_dir() {
+        return probe_directory_vectors(path);
+    }
     let etype = ElementType::from_path(path).ok()?;
     if !etype.is_float() {
         return None; // normalization only meaningful for float vectors
-    }
-    if path.is_dir() {
-        return None;
     }
 
     // Open via mmap — no full-file read
@@ -1856,6 +1896,61 @@ pub fn detect_normalized(path: &Path) -> Option<(bool, usize, f64)> {
     Some((is_normalized, norms.len(), mean))
 }
 
+/// Probe a source directory or file by opening it through the standard
+/// reader infrastructure and sampling vectors for norm computation.
+/// Uses the same code path as the pipeline — supports npy dirs, xvec
+/// files, and any format that `VecFormat::detect` + `open_source` handles.
+fn probe_directory_vectors(path: &Path) -> Option<(bool, usize, f64)> {
+    use veks_core::formats::reader;
+    let format = VecFormat::detect(path)?;
+    let mut source = reader::open_source(path, format, 1, Some(100)).ok()?;
+
+    let dim = source.dimension() as usize;
+    if dim == 0 { return None; }
+
+    // Detect element size from format
+    let elem_size = match format {
+        VecFormat::Mvec => 2,  // f16
+        VecFormat::Dvec => 8,  // f64
+        VecFormat::Bvec => 1,  // u8
+        VecFormat::Svec => 2,  // i16
+        VecFormat::Ivec => 4,  // i32
+        _ => 4,                // f32 (fvec, npy, parquet)
+    };
+    let mut norms = Vec::with_capacity(100);
+    while let Some(record) = source.next_record() {
+        if record.is_empty() { continue; }
+        let actual_elem_size = if record.len() == dim * 2 { 2 }
+            else if record.len() == dim * 4 { 4 }
+            else if record.len() == dim * 8 { 8 }
+            else { elem_size };
+
+        let norm: f64 = (0..dim)
+            .map(|d| {
+                let off = d * actual_elem_size;
+                if off + actual_elem_size > record.len() { return 0.0; }
+                let v: f64 = match actual_elem_size {
+                    2 => half::f16::from_le_bytes([record[off], record[off + 1]]).to_f64(),
+                    8 => f64::from_le_bytes(record[off..off + 8].try_into().unwrap_or([0; 8])),
+                    _ => f32::from_le_bytes(record[off..off + 4].try_into().unwrap_or([0; 4])) as f64,
+                };
+                v * v
+            })
+            .sum::<f64>()
+            .sqrt();
+        norms.push(norm);
+        if norms.len() >= 100 { break; }
+    }
+
+    if norms.is_empty() { return None; }
+
+    let mean = norms.iter().sum::<f64>() / norms.len() as f64;
+    let all_close = norms.iter().all(|n| (n - 1.0).abs() < 0.05);
+    let is_normalized = (mean - 1.0).abs() < 0.01 && all_close;
+
+    Some((is_normalized, norms.len(), mean))
+}
+
 /// Detect the likely distance metric from vector data.
 ///
 /// Heuristic:
@@ -1865,15 +1960,27 @@ pub fn detect_normalized(path: &Path) -> Option<(bool, usize, f64)> {
 ///
 /// Returns the metric name and a human-readable reason.
 pub fn detect_metric(path: &Path) -> (String, String) {
-    if let Some((is_normalized, _n, mean_norm)) = detect_normalized(path) {
+    // For directories (npy), try to probe via a small temp conversion
+    let probe_result = if path.is_dir() {
+        probe_directory_vectors(path)
+    } else {
+        detect_normalized(path)
+    };
+    if let Some((is_normalized, _n, mean_norm)) = probe_result {
         if is_normalized {
-            ("Cosine".to_string(), format!("vectors are L2-normalized (mean norm={:.4})", mean_norm))
+            ("DotProduct".to_string(), format!("vectors are L2-normalized (mean norm={:.4}) — DotProduct is optimal", mean_norm))
         } else {
-            ("Cosine".to_string(), format!("default (vectors not normalized, mean norm={:.4})", mean_norm))
+            ("Cosine".to_string(), format!("vectors not normalized (mean norm={:.4})", mean_norm))
         }
     } else {
-        eprintln!("Warning: could not read '{}' to detect metric — using Cosine as default", path.display());
-        ("Cosine".to_string(), format!("default (could not probe '{}')", path.display()))
+        let detail = if path.is_dir() {
+            "directory probe returned no results"
+        } else if !path.exists() {
+            "path does not exist"
+        } else {
+            "unsupported format for probing"
+        };
+        ("Cosine".to_string(), format!("default — {} ({})", detail, path.display()))
     }
 }
 
@@ -1978,6 +2085,7 @@ mod tests {
             required_facets: None,
             round_digits: 2,
             pedantic_dedup: false,
+            selectivity: 0.0001,
         }
     }
 

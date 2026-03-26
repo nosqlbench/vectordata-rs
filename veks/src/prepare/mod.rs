@@ -318,7 +318,10 @@ pub fn run(args: PrepareArgs) {
             let interactive = interactive || auto;
             let yes = yes || auto;
             let base_fraction = parse_fraction(&base_fraction);
-            let metric = if metric == "auto" {
+            let metric = if metric == "auto" && !interactive {
+                // Non-interactive: detect metric from base vectors now.
+                // Interactive mode: the wizard handles detection after
+                // resolving the actual file path.
                 let (m, reason) = base_vectors.as_ref()
                     .map(|p| import::detect_metric(p))
                     .unwrap_or_else(|| ("Cosine".to_string(), "default".to_string()));
@@ -437,6 +440,7 @@ pub fn run(args: PrepareArgs) {
                         pedantic_dedup: if pedantic_dedup { Some(true) } else { None },
                         required_facets: required_facets.clone(),
                         round_digits: Some(round_digits),
+                        selectivity: None,
                     };
                     let args = wizard::run_wizard_with_options(yes, auto, seeds);
                     let out = args.output.clone();
@@ -464,6 +468,7 @@ pub fn run(args: PrepareArgs) {
                         required_facets: required_facets.clone(),
                         round_digits,
                         pedantic_dedup,
+                        selectivity: 0.0001,
                     });
                     check_and_restore(&out);
                 }
@@ -490,6 +495,7 @@ pub fn run(args: PrepareArgs) {
                     pedantic_dedup: if pedantic_dedup { Some(true) } else { None },
                     required_facets: required_facets.clone(),
                     round_digits: Some(round_digits),
+                    selectivity: None,
                 };
                 let args = wizard::run_wizard_with_options(yes, false, seeds);
                 import::run(args);
@@ -515,6 +521,7 @@ pub fn run(args: PrepareArgs) {
                     required_facets,
                     round_digits,
                     pedantic_dedup,
+                    selectivity: 0.0001,
                 });
             }
         }

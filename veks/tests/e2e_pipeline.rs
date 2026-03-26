@@ -69,6 +69,7 @@ fn default_args(name: &str, output: &Path) -> ImportArgs {
         required_facets: None,
         round_digits: 10, // disable rounding for exact counts in tests
         pedantic_dedup: false,
+        selectivity: 0.0001,
     }
 }
 
