@@ -243,48 +243,41 @@ impl MerkleTree {
     }
 
     /// Serialize to bytes: [chunk_size: u32 LE][file_size: u64 LE][leaf_count: u32 LE][hashes...]
+    /// Serialize to the standard `.mref` format compatible with
+    /// `vectordata::merkle::MerkleRef::from_bytes`.
+    ///
+    /// Layout: `[hashes: node_count * 32 bytes][footer: 41 bytes]`
     fn to_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::new();
-        buf.extend_from_slice(&(self.chunk_size as u32).to_le_bytes());
-        buf.extend_from_slice(&self.file_size.to_le_bytes());
-        buf.extend_from_slice(&(self.leaf_count as u32).to_le_bytes());
-        for h in &self.hashes {
-            buf.extend_from_slice(h);
-        }
-        buf
+        let mref = self.to_merkle_ref();
+        mref.to_bytes()
     }
 
-    /// Deserialize from bytes.
+    /// Convert to a `vectordata::merkle::MerkleRef` for serialization.
+    fn to_merkle_ref(&self) -> vectordata::merkle::MerkleRef {
+        let cap_leaf = (self.leaf_count as u32).next_power_of_two().max(1);
+        let internal_node_count = cap_leaf - 1;
+        let shape = vectordata::merkle::MerkleShape {
+            chunk_size: self.chunk_size as u64,
+            total_content_size: self.file_size,
+            total_chunks: self.leaf_count as u32,
+            leaf_count: cap_leaf,
+            cap_leaf,
+            node_count: self.hashes.len() as u32,
+            offset: internal_node_count,
+            internal_node_count,
+        };
+        vectordata::merkle::MerkleRef::from_parts(shape, self.hashes.clone())
+    }
+
+    /// Deserialize from the standard `.mref` format (Java-compatible).
     fn from_bytes(data: &[u8]) -> Result<Self, String> {
-        if data.len() < 16 {
-            return Err("mref file too small".to_string());
-        }
-        let chunk_size =
-            u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
-        let file_size = u64::from_le_bytes([
-            data[4], data[5], data[6], data[7], data[8], data[9], data[10], data[11],
-        ]);
-        let leaf_count =
-            u32::from_le_bytes([data[12], data[13], data[14], data[15]]) as usize;
-
-        let hash_data = &data[16..];
-        let hash_count = hash_data.len() / HASH_SIZE;
-        if hash_data.len() % HASH_SIZE != 0 {
-            return Err("mref hash data not aligned to 32 bytes".to_string());
-        }
-
-        let mut hashes = Vec::with_capacity(hash_count);
-        for i in 0..hash_count {
-            let mut h = [0u8; HASH_SIZE];
-            h.copy_from_slice(&hash_data[i * HASH_SIZE..(i + 1) * HASH_SIZE]);
-            hashes.push(h);
-        }
-
-        Ok(MerkleTree {
-            hashes,
-            leaf_count,
-            chunk_size,
-            file_size,
+        let mref = vectordata::merkle::MerkleRef::from_bytes(data)
+            .map_err(|e| format!("invalid mref: {}", e))?;
+        Ok(Self {
+            hashes: mref.hashes().to_vec(),
+            leaf_count: mref.shape().leaf_count as usize,
+            chunk_size: mref.shape().chunk_size as usize,
+            file_size: mref.shape().total_content_size,
         })
     }
 }

@@ -176,8 +176,8 @@ pub enum DatasetsCommand {
     },
     /// Probe a remote dataset: verify catalog access, list facets, read a sample
     Probe {
-        /// Catalog base URL (e.g., https://bucket.s3.amazonaws.com/path/)
-        #[arg(long)]
+        /// Catalog base URL or number (e.g., 1, https://bucket.s3.amazonaws.com/path/)
+        #[arg(long, add = ArgValueCompleter::new(catalog_completer))]
         at: String,
 
         /// Dataset name within the catalog
@@ -339,7 +339,8 @@ pub fn run(args: DatasetsArgs) {
             }
         }
         DatasetsCommand::Probe { at, dataset, profile } => {
-            probe::run(&at, &dataset, &profile);
+            let resolved_at = resolve_catalog_value(&at);
+            probe::run(&resolved_at, &dataset, &profile);
         }
         DatasetsCommand::Prebuffer { dataset, profile, configdir, catalog: raw_catalog, at, cache_dir } => {
             let catalog: Vec<String> = raw_catalog.iter().map(|v| resolve_catalog_value(v)).collect();

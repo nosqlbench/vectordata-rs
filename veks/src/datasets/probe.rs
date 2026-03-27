@@ -18,28 +18,36 @@ pub fn run(catalog_base: &str, dataset_name: &str, profile_name: &str) {
     println!("Probing dataset '{}' at {}", dataset_name, base);
     println!();
 
-    // Step 1: Fetch catalog.json to find the dataset
+    // Step 1: Fetch catalog.json to find the dataset and its path
     let catalog_url = format!("{}/catalog.json", base);
     println!("  Fetching catalog: {}", catalog_url);
+    let mut dataset_path_from_catalog: Option<String> = None;
     match fetch_text(&catalog_url) {
         Ok(text) => {
             let size = text.len();
             println!("    OK ({} bytes)", size);
 
-            // Try to parse and find the dataset
-            if let Ok(catalog) = serde_json::from_str::<serde_json::Value>(&text) {
-                if let Some(datasets) = catalog.get("datasets").and_then(|d| d.as_array()) {
-                    let found = datasets.iter().any(|d| {
-                        d.get("name").and_then(|n| n.as_str()) == Some(dataset_name)
+            // Catalog can be either a top-level array or {"datasets": [...]}
+            let entries: Option<Vec<serde_json::Value>> =
+                serde_json::from_str::<Vec<serde_json::Value>>(&text).ok()
+                    .or_else(|| {
+                        serde_json::from_str::<serde_json::Value>(&text).ok()
+                            .and_then(|v| v.get("datasets")?.as_array().cloned())
                     });
-                    if found {
-                        println!("    Dataset '{}' found in catalog", dataset_name);
-                    } else {
-                        let names: Vec<&str> = datasets.iter()
-                            .filter_map(|d| d.get("name").and_then(|n| n.as_str()))
-                            .collect();
-                        println!("    Dataset '{}' NOT found. Available: {:?}", dataset_name, names);
-                    }
+
+            if let Some(datasets) = entries {
+                let entry = datasets.iter().find(|d| {
+                    d.get("name").and_then(|n| n.as_str()) == Some(dataset_name)
+                });
+                if let Some(ds) = entry {
+                    let path = ds.get("path").and_then(|p| p.as_str()).unwrap_or("");
+                    println!("    Dataset '{}' found in catalog (path: {})", dataset_name, path);
+                    dataset_path_from_catalog = Some(path.to_string());
+                } else {
+                    let names: Vec<&str> = datasets.iter()
+                        .filter_map(|d| d.get("name").and_then(|n| n.as_str()))
+                        .collect();
+                    println!("    Dataset '{}' NOT found. Available: {:?}", dataset_name, names);
                 }
             }
         }
@@ -49,8 +57,14 @@ pub fn run(catalog_base: &str, dataset_name: &str, profile_name: &str) {
     }
     println!();
 
-    // Step 2: Fetch dataset.yaml
-    let dataset_url = format!("{}/{}/dataset.yaml", base, dataset_name);
+    // Step 2: Fetch dataset.yaml using the path from the catalog
+    let dataset_url = if let Some(ref cat_path) = dataset_path_from_catalog {
+        // Path from catalog is relative to the catalog directory (e.g., "laion400b/img-search/dataset.yaml")
+        format!("{}/{}", base, cat_path)
+    } else {
+        // Fallback: assume {base}/{name}/dataset.yaml
+        format!("{}/{}/dataset.yaml", base, dataset_name)
+    };
     println!("  Fetching dataset.yaml: {}", dataset_url);
     let config = match fetch_text(&dataset_url) {
         Ok(text) => {

@@ -139,7 +139,31 @@ pub fn check(root: &Path, dataset_files: &[PathBuf]) -> CheckResult {
 pub fn find_publish_file(dir: &Path) -> Option<PathBuf> {
     // Walk up using absolute paths internally (pop() needs them),
     // but return a relative path from the original dir.
-    let abs = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    //
+    // Use the logical path (without resolving symlinks) so that
+    // traversal stays within the user's view of the directory tree.
+    // canonicalize() resolves symlinks, which breaks when the user
+    // works through a symlink into a different filesystem tree.
+    let abs = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
+
+    // Warn if any component is a symlink — path traversal may not
+    // match the user's expectations.
+    {
+        let mut check = dir.to_path_buf();
+        loop {
+            if check.is_symlink() {
+                eprintln!(
+                    "warning: '{}' is a symbolic link; publish root traversal uses the logical path",
+                    check.display(),
+                );
+                break;
+            }
+            if !check.pop() || check.as_os_str().is_empty() {
+                break;
+            }
+        }
+    }
+
     let mut current = abs.clone();
     let mut levels_up: usize = 0;
 

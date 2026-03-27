@@ -135,8 +135,9 @@ pub fn run(input: &Path, basename: &str, for_publish_url: bool, update: bool) {
             Some(pf) => {
                 let root = pf.parent().unwrap().to_path_buf();
                 let root = if root.is_absolute() { root } else { cwd.join(&root) };
-                // Canonicalize to resolve any ".." components for reliable path comparisons
-                let root = std::fs::canonicalize(&root).unwrap_or(root);
+                // Normalize without resolving symlinks (canonicalize breaks
+                // symlink-contained views by crossing into the physical path)
+                let root = normalize_path(&root);
                 eprintln!("Publish root: {} (from {})", rel(&root), rel(&pf));
                 root
             }
@@ -245,7 +246,14 @@ pub fn run(input: &Path, basename: &str, for_publish_url: bool, update: bool) {
 
     let mut total_files = 0usize;
 
-    for catalog_dir in &catalog_dirs {
+    // Write catalogs bottom-up (deepest directories first) so that parent
+    // catalog mtimes are always newer than their children. The staleness
+    // check compares parent vs child mtimes.
+    let mut sorted_dirs: Vec<&PathBuf> = catalog_dirs.iter().collect();
+    sorted_dirs.sort_by(|a, b| b.components().count().cmp(&a.components().count())
+        .then_with(|| a.cmp(b)));
+
+    for catalog_dir in &sorted_dirs {
         // Skip directories with .do_not_catalog sentinel
         if catalog_dir.join(DO_NOT_CATALOG_FILE).exists() {
             eprintln!("  Skipping {} (.do_not_catalog)", rel(catalog_dir));
@@ -349,6 +357,22 @@ fn walk_for_datasets(dir: &Path, datasets: &mut Vec<DiscoveredDataset>, cwd: &Pa
             walk_for_datasets(&subdir, datasets, cwd);
         }
     }
+}
+
+/// Normalize a path by resolving `.` and `..` components without following
+/// symlinks. Unlike `canonicalize`, this preserves the logical path through
+/// symlinks so that relative path computations stay within the user's view.
+fn normalize_path(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut result = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::ParentDir => { result.pop(); }
+            Component::CurDir => {}
+            other => result.push(other),
+        }
+    }
+    result
 }
 
 #[cfg(test)]

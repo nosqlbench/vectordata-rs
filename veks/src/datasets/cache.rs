@@ -184,15 +184,23 @@ pub fn run_cache_status(
         return;
     }
 
+    // Compute column width from longest path
+    let file_w = facet_rows.iter()
+        .map(|(p, ..)| p.len())
+        .max()
+        .unwrap_or(20)
+        .max(20);
+    let line_w = file_w + 2 + 8 + 8 + 6 + 12 + 12 + 4;
+
     // Header
-    println!("  {:<40} {:>8} {:>8} {:>6} {:>12} {:>12}",
+    println!("  {:<file_w$}  {:>8} {:>8} {:>6} {:>12} {:>12}",
         "FILE", "VALID", "TOTAL", "%", "CACHED", "CONTENT");
-    println!("  {}", "-".repeat(88));
+    println!("  {}", "-".repeat(line_w));
 
     for (path, valid, total_c, cached_bytes, content_bytes, complete, rle) in &facet_rows {
         let pct = if *total_c > 0 { 100.0 * *valid as f64 / *total_c as f64 } else { 0.0 };
         let status = if *complete { "OK" } else { "" };
-        println!("  {:<40} {:>8} {:>8} {:>5.0}% {:>12} {:>12} {}",
+        println!("  {:<file_w$}  {:>8} {:>8} {:>5.0}% {:>12} {:>12} {}",
             path, valid, total_c, pct,
             format_size(*cached_bytes), format_size(*content_bytes), status);
         if verbose && !rle.is_empty() && !*complete {
@@ -204,9 +212,9 @@ pub fn run_cache_status(
         total_content_bytes += content_bytes;
     }
 
-    println!("  {}", "-".repeat(88));
+    println!("  {}", "-".repeat(line_w));
     let overall_pct = if total_chunks > 0 { 100.0 * total_valid as f64 / total_chunks as f64 } else { 0.0 };
-    println!("  {:<40} {:>8} {:>8} {:>5.0}% {:>12} {:>12}",
+    println!("  {:<file_w$}  {:>8} {:>8} {:>5.0}% {:>12} {:>12}",
         "TOTAL", total_valid, total_chunks, overall_pct,
         format_size(total_cached_bytes), format_size(total_content_bytes));
 

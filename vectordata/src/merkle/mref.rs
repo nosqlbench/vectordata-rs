@@ -38,20 +38,34 @@ impl MerkleRef {
     }
 
     /// Parse a `.mref` from a byte buffer.
+    ///
+    /// Layout: `[hashes: node_count * 32 bytes][footer: 41 or 45 bytes]`
+    ///
+    /// The last byte is a footer-length marker (41 for v1, 45 for v2).
+    /// This format is byte-compatible with the Java `MerkleTree` serialization.
     pub fn from_bytes(data: &[u8]) -> io::Result<Self> {
         if data.len() < FOOTER_SIZE {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "file too short for footer",
+                format!("mref too short: {} bytes (minimum {})", data.len(), FOOTER_SIZE),
             ));
         }
 
-        // The last byte is the footer length marker — use it to find the footer start.
         let actual_footer_size = data[data.len() - 1] as usize;
-        if actual_footer_size < FOOTER_SIZE || data.len() < actual_footer_size {
+        if actual_footer_size != FOOTER_SIZE && actual_footer_size != super::FOOTER_SIZE_V2 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("invalid footer size marker: {}", actual_footer_size),
+                format!(
+                    "invalid footer length marker: expected {} or {}, got {} — \
+                     this file may need to be regenerated with the current merkle format",
+                    FOOTER_SIZE, super::FOOTER_SIZE_V2, actual_footer_size
+                ),
+            ));
+        }
+        if data.len() < actual_footer_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("mref too short for footer: {} bytes, footer says {}", data.len(), actual_footer_size),
             ));
         }
 
@@ -60,18 +74,12 @@ impl MerkleRef {
 
         let expected_hash_bytes = shape.node_count as usize * HASH_SIZE;
 
-        // The v2 format includes a validity bitset between the hashes and
-        // the footer. The bitset size is encoded in the footer (v2) or
-        // inferred from leaf_count.
-        let bytes_before_footer = footer_start;
-        let _bitset_bytes = bytes_before_footer.saturating_sub(expected_hash_bytes);
-
-        if bytes_before_footer < expected_hash_bytes {
+        if footer_start < expected_hash_bytes {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "hash data size mismatch: expected at least {} bytes, file has {} before footer",
-                    expected_hash_bytes, footer_start
+                    "hash data too short: expected {} bytes ({} nodes), got {} before footer",
+                    expected_hash_bytes, shape.node_count, footer_start
                 ),
             ));
         }
@@ -130,9 +138,21 @@ impl MerkleRef {
         fs::write(path, &buf)
     }
 
+    /// Serialize to bytes in the standard `.mref` format.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(self.hashes.len() * HASH_SIZE + FOOTER_SIZE);
+        self.write(&mut buf).expect("write to Vec cannot fail");
+        buf
+    }
+
     /// Tree geometry.
     pub fn shape(&self) -> &MerkleShape {
         &self.shape
+    }
+
+    /// All node hashes.
+    pub fn hashes(&self) -> &[[u8; 32]] {
+        &self.hashes
     }
 
     /// Hash for a specific node.

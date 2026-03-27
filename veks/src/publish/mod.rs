@@ -229,6 +229,20 @@ pub fn run(args: PublishArgs) {
         .map(|r| r.to_string_lossy().to_string())
         .collect();
 
+    // Log infrastructure files for debugging publish completeness
+    let infra_count = include_files.iter()
+        .filter(|f| {
+            let name = f.rsplit('/').next().unwrap_or(f);
+            filters::is_infrastructure_file(name)
+        })
+        .count();
+    println!("  Includes:    {} files ({} infrastructure: dataset.yaml, catalog.json, etc.)",
+        include_files.len(), infra_count);
+    if infra_count == 0 {
+        eprintln!("  WARNING: no infrastructure files (dataset.yaml, catalog.json) in publish set!");
+        eprintln!("           Check that .publish sentinel exists in the dataset directory.");
+    }
+
     let sync_opts = SyncOptions {
         dry_run: args.dry_run,
         delete: args.delete,

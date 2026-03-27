@@ -30,6 +30,8 @@ use crate::catalog::sources::CatalogSources;
 struct PickerRow {
     dataset: String,
     profile: String,
+    /// Numeric base_count for sorting (0 for default profile).
+    base_count: u64,
     metric: String,
     facets: String,
     size: String,
@@ -55,10 +57,8 @@ fn build_rows(entries: &[CatalogEntry]) -> Vec<PickerRow> {
 
         for profile_name in entry.profile_names() {
             let profile = entry.layout.profiles.profile(profile_name);
-            let size = profile
-                .and_then(|p| p.base_count)
-                .map(format_count)
-                .unwrap_or_default();
+            let bc = profile.and_then(|p| p.base_count).unwrap_or(0);
+            let size = if bc > 0 { format_count(bc) } else { String::new() };
 
             let facets = profile.map(|p| facet_indicators(&p.views)).unwrap_or_default();
 
@@ -81,6 +81,7 @@ fn build_rows(entries: &[CatalogEntry]) -> Vec<PickerRow> {
             rows.push(PickerRow {
                 dataset: entry.name.clone(),
                 profile: profile_name.to_string(),
+                base_count: bc,
                 metric: metric.clone(),
                 facets,
                 size,
@@ -110,6 +111,7 @@ fn build_rows(entries: &[CatalogEntry]) -> Vec<PickerRow> {
                 let b_cached = b.cache_status != "—";
                 b_cached.cmp(&a_cached)
             })
+            .then_with(|| a.base_count.cmp(&b.base_count))
             .then_with(|| a.profile.cmp(&b.profile))
     });
     rows
@@ -324,10 +326,10 @@ pub fn run_picker() -> Option<String> {
                 .max()
                 .unwrap_or(20)
                 .max(10);
-            let prof_w = 12;
-            let facet_w = 10;
-            let metric_w = 8;
-            let size_w = 8;
+            let prof_w = 14;
+            let facet_w = 12;
+            let metric_w = 14;
+            let size_w = 10;
             let cache_w = 18;
 
             let mut lines = vec![Line::from(vec![

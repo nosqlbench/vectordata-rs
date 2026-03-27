@@ -126,14 +126,15 @@ impl RemoteDatasetView {
             ))?;
 
         // Derive the base URL from the entry path (strip dataset.yaml filename)
-        // Normalize path: remove "." components that cause S3 URL issues
         let raw_base = entry.path.rsplit_once('/')
             .map(|(base, _)| base)
             .unwrap_or(&entry.path);
-        let base_url: String = raw_base.split('/')
-            .filter(|c| !c.is_empty() && *c != ".")
-            .collect::<Vec<_>>()
-            .join("/");
+        // Normalize: remove "/." path components that cause S3 URL issues,
+        // but preserve the "://" protocol separator.
+        let base_url = raw_base.replace("/./", "/");
+
+        log::info!("remote open: entry.path={}", entry.path);
+        log::info!("remote open: base_url={}", base_url);
 
         let ds_cache = cache_dir.join(&entry.name);
         std::fs::create_dir_all(&ds_cache)?;
@@ -151,21 +152,14 @@ impl RemoteDatasetView {
         let resolve_facet = |facet_name: &str| -> Option<Box<dyn TypedVectorView>> {
             let view = match profile.view(facet_name) {
                 Some(v) => v,
-                None => {
-                    log::debug!("{}/{}: facet '{}' not found in profile (views: {:?})",
-                        entry.name, profile_name, facet_name, profile.view_names());
-                    return None;
-                }
+                None => return None,
             };
             let raw_source_path = &view.source.path;
             if raw_source_path.is_empty() {
-                log::debug!("{}/{}: facet '{}' has empty source path", entry.name, profile_name, facet_name);
                 return None;
             }
 
             // Strip window notation from the source path if present.
-            // e.g., "base.fvec(0..10000000)" → "base.fvec"
-            // or "base.fvec[0..10000000)" → "base.fvec"
             let source_path = if let Some(bracket) = raw_source_path.find(|c: char| c == '[' || c == '(') {
                 &raw_source_path[..bracket]
             } else {
@@ -182,10 +176,12 @@ impl RemoteDatasetView {
             let etype = match VecElementType::from_extension(&ext) {
                 Some(t) => t,
                 None => {
-                    log::warn!("{}: unsupported format '.{}'", facet_name, ext);
+                    // Non-vector formats (slab, json, etc.) are expected for
+                    // metadata facets — not a warning-worthy situation.
                     return None;
                 }
             };
+
 
             // Resolve full URL
             let full_url = if source_path.starts_with("http://") || source_path.starts_with("https://") {
@@ -196,12 +192,6 @@ impl RemoteDatasetView {
 
             // Resolve merkle reference — dual-mode: check .mrkl first (it
             // embeds the reference hashes), only download .mref if no .mrkl exists.
-            // The .mref is never persisted separately; CachedChannel::open
-            // creates the .mrkl immediately on first access.
-            //
-            // On resume, a lightweight Range request fetches just the remote
-            // root hash (32 bytes) to detect republished content. If it
-            // differs, the local .mrkl and cache are invalidated.
             let mref_url = format!("{}.mref", full_url);
             let content_cache_path_tmp = ds_cache.join(source_path);
             let mrkl_path = content_cache_path_tmp.with_extension(
@@ -209,20 +199,15 @@ impl RemoteDatasetView {
                     .and_then(|e| e.to_str()).unwrap_or("")),
             );
             let mref = if mrkl_path.exists() {
-                // Resume path: load local state, then verify root hash
-                // against remote with a single 32-byte Range request.
                 match MerkleState::load(&mrkl_path) {
                     Ok(state) => {
                         let local_ref = state.to_ref();
-                        // Check remote root hash — if it differs, content was republished
                         match fetch_remote_root_hash(&mref_url) {
                             Ok(remote_root) => {
                                 if remote_root != *local_ref.root_hash() {
-                                    log::info!("{}: remote content changed, re-downloading .mref", facet_name);
-                                    // Invalidate local state and cache
+                                    log::info!("{}: remote content changed, re-downloading", facet_name);
                                     let _ = std::fs::remove_file(&mrkl_path);
                                     let _ = std::fs::remove_file(&content_cache_path_tmp);
-                                    // Fall through to full download
                                     match download_mref(&mref_url) {
                                         Ok(m) => m,
                                         Err(e) => {
@@ -234,22 +219,15 @@ impl RemoteDatasetView {
                                     local_ref
                                 }
                             }
-                            Err(e) => {
-                                // Range request failed — proceed with local state.
-                                // This is non-fatal: offline resume or server
-                                // doesn't support Range are both acceptable.
-                                log::debug!("{}: root hash check unavailable ({}), using cached state", facet_name, e);
-                                local_ref
-                            }
+                            Err(_) => local_ref, // offline resume is OK
                         }
                     }
                     Err(e) => {
-                        log::warn!("{}: failed to load .mrkl: {}", facet_name, e);
+                        log::warn!("{}: failed to load cached merkle state: {}", facet_name, e);
                         return None;
                     }
                 }
             } else {
-                // First access: download .mref (not persisted — .mrkl created by CachedChannel)
                 match download_mref(&mref_url) {
                     Ok(m) => m,
                     Err(e) => {
@@ -273,11 +251,18 @@ impl RemoteDatasetView {
                 let _ = std::fs::create_dir_all(parent);
             }
 
+            let cache_filename = match content_cache_path.file_name().and_then(|n| n.to_str()) {
+                Some(n) => n,
+                None => {
+                    log::warn!("{}: invalid cache path '{}'", facet_name, content_cache_path.display());
+                    return None;
+                }
+            };
             let channel = match CachedChannel::open(
                 Box::new(transport),
                 mref,
                 content_cache_path.parent().unwrap_or(&ds_cache),
-                content_cache_path.file_name()?.to_str()?,
+                cache_filename,
             ) {
                 Ok(c) => c,
                 Err(e) => {
@@ -295,22 +280,27 @@ impl RemoteDatasetView {
             };
 
             match CachedVectorView::new(channel, content_cache_path, etype, window) {
-                Ok(v) => Some(Box::new(v) as Box<dyn TypedVectorView>),
+                Ok(v) => {
+                    Some(Box::new(v) as Box<dyn TypedVectorView>)
+                }
                 Err(e) => {
-                    log::warn!("{}: failed to create view: {}", facet_name, e);
+                    log::warn!("{}: failed to create cached view: {}", facet_name, e);
                     None
                 }
             }
         };
 
+        // Resolve only the facets needed for explore (base_vectors,
+        // query_vectors). Other facets download .mref files which can be
+        // large — defer them until actually needed.
         Ok(RemoteDatasetView {
             base_vectors: resolve_facet("base_vectors"),
             query_vectors: resolve_facet("query_vectors"),
-            neighbor_indices: resolve_facet("neighbor_indices"),
-            neighbor_distances: resolve_facet("neighbor_distances"),
-            filtered_neighbor_indices: resolve_facet("filtered_neighbor_indices"),
-            filtered_neighbor_distances: resolve_facet("filtered_neighbor_distances"),
-            metadata_content: resolve_facet("metadata_content"),
+            neighbor_indices: None,
+            neighbor_distances: None,
+            filtered_neighbor_indices: None,
+            filtered_neighbor_distances: None,
+            metadata_content: None,
         })
     }
 
@@ -349,6 +339,10 @@ impl RemoteDatasetView {
 /// Downloads on a separate thread to avoid conflicts with tokio
 /// runtimes (reqwest::blocking creates its own runtime).
 fn download_mref(url: &str) -> io::Result<MerkleRef> {
+    // Extract filename for progress display
+    let filename = url.rsplit('/').next().unwrap_or(url);
+    log::info!("downloading {}...", filename);
+
     let url_owned = url.to_string();
     let bytes = std::thread::spawn(move || -> io::Result<Vec<u8>> {
         let client = reqwest::blocking::Client::new();
@@ -362,9 +356,16 @@ fn download_mref(url: &str) -> io::Result<MerkleRef> {
             ));
         }
 
-        response.bytes()
+        let content_length = response.content_length();
+        let bytes = response.bytes()
             .map(|b| b.to_vec())
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
+        if let Some(len) = content_length {
+            log::info!("downloaded {} ({} bytes)", url_owned.rsplit('/').next().unwrap_or(""), len);
+        }
+
+        Ok(bytes)
     }).join().map_err(|_| io::Error::new(io::ErrorKind::Other, "download thread panicked"))??;
 
     MerkleRef::from_bytes(&bytes)
