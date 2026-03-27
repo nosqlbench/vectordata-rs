@@ -13,6 +13,7 @@ mod curlify;
 pub mod filter;
 mod list;
 pub(crate) mod prebuffer;
+mod probe;
 
 use std::path::PathBuf;
 
@@ -173,6 +174,20 @@ pub enum DatasetsCommand {
         #[arg(long = "at")]
         at: Vec<String>,
     },
+    /// Probe a remote dataset: verify catalog access, list facets, read a sample
+    Probe {
+        /// Catalog base URL (e.g., https://bucket.s3.amazonaws.com/path/)
+        #[arg(long)]
+        at: String,
+
+        /// Dataset name within the catalog
+        #[arg(long)]
+        dataset: String,
+
+        /// Profile to probe (default: "default")
+        #[arg(long, default_value = "default")]
+        profile: String,
+    },
     /// Download and cache dataset facets locally
     Prebuffer {
         /// Dataset name or dataset:profile from catalog
@@ -322,6 +337,9 @@ pub fn run(args: DatasetsArgs) {
                 eprintln!("Specify --dataset <name> or --all");
                 std::process::exit(1);
             }
+        }
+        DatasetsCommand::Probe { at, dataset, profile } => {
+            probe::run(&at, &dataset, &profile);
         }
         DatasetsCommand::Prebuffer { dataset, profile, configdir, catalog: raw_catalog, at, cache_dir } => {
             let catalog: Vec<String> = raw_catalog.iter().map(|v| resolve_catalog_value(v)).collect();

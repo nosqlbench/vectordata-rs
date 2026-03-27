@@ -272,6 +272,13 @@ impl DSProfileGroup {
         let entries = std::mem::take(&mut self.deferred_sized);
         let mut added = 0;
 
+        // Determine the maximum meaningful profile size from the default
+        // profile's base_count or the base_count variable. Profiles larger
+        // than this are filtered out since they exceed the actual dataset.
+        let max_base_count: Option<u64> = default_profile.as_ref()
+            .and_then(|dp| dp.base_count)
+            .or_else(|| vars.get("base_count").and_then(|v| v.parse().ok()));
+
         for entry_str in &entries {
             // Interpolate variables
             let mut resolved = entry_str.clone();
@@ -290,8 +297,8 @@ impl DSProfileGroup {
                 continue;
             }
 
-            // Parse the resolved entry
-            let pairs = match parse_sized_entry(&resolved) {
+            // Parse the resolved entry, capping unbounded series at the dataset size
+            let pairs = match parse_sized_entry_impl(&resolved, max_base_count) {
                 Ok(p) => p,
                 Err(e) => {
                     log::warn!("failed to parse sized entry '{}' (resolved: '{}'): {}", entry_str, resolved, e);
@@ -578,7 +585,16 @@ impl<'de> Deserialize<'de> for DSProfile {
 /// - `"100m..400m/100m"` → range with step
 /// - `"mul:1m..400m/2"` → multiplicative range
 /// - `"fib:1m..400m"` → fibonacci range
+///
+/// `max_count` caps unbounded series (e.g., `mul:1mi/2` without an explicit
+/// end). When provided, no profile will have a `base_count` exceeding this
+/// value. This is typically the default profile's base_count (the actual
+/// dataset size). Pass `None` at parse time when the dataset size is unknown.
 pub fn parse_sized_entry(entry: &str) -> Result<Vec<(String, u64)>, String> {
+    parse_sized_entry_impl(entry, None)
+}
+
+fn parse_sized_entry_impl(entry: &str, max_count: Option<u64>) -> Result<Vec<(String, u64)>, String> {
     let entry = entry.trim();
 
     // Check for series generator prefixes
@@ -586,7 +602,7 @@ pub fn parse_sized_entry(entry: &str) -> Result<Vec<(String, u64)>, String> {
         return parse_fib_range(rest);
     }
     if let Some(rest) = entry.strip_prefix("mul:") {
-        return parse_mul_range(rest);
+        return parse_mul_range(rest, max_count);
     }
 
     if let Some((range_part, step_str)) = entry.split_once('/') {
@@ -644,6 +660,22 @@ pub fn parse_sized_entry(entry: &str) -> Result<Vec<(String, u64)>, String> {
     }
 }
 
+/// Check if a sized entry is an unbounded series (no explicit end).
+///
+/// Unbounded entries like `"mul:1mi/2"` generate values up to the dataset
+/// size, which isn't known at YAML parse time. These must be deferred to
+/// `expand_deferred_sized` where the `base_count` variable is available.
+fn is_unbounded_series(entry: &str) -> bool {
+    let entry = entry.trim();
+    if let Some(rest) = entry.strip_prefix("mul:") {
+        // Unbounded if there's no ".." — just "start/factor"
+        if let Some((range_part, _)) = rest.split_once('/') {
+            return !range_part.contains("..");
+        }
+    }
+    false
+}
+
 /// Generate fibonacci-progression values within [start, end].
 ///
 /// `fib:1m..400m` produces all fibonacci multiples of the base unit that
@@ -686,15 +718,19 @@ fn parse_fib_range(range_str: &str) -> Result<Vec<(String, u64)>, String> {
 /// `mul:1m..100m/1.5` produces: 1m, 1500k (rounded), etc.
 ///
 /// The factor must be > 1.0. Each successive value is `floor(prev × factor)`.
-fn parse_mul_range(spec: &str) -> Result<Vec<(String, u64)>, String> {
+fn parse_mul_range(spec: &str, max_count: Option<u64>) -> Result<Vec<(String, u64)>, String> {
     let (range_part, factor_str) = spec
         .split_once('/')
-        .ok_or_else(|| format!("invalid mul spec '{}': expected mul:start..end/factor", spec))?;
-    let (start_str, end_str) = range_part
-        .split_once("..")
-        .ok_or_else(|| format!("invalid mul range '{}': expected start..end", range_part))?;
-    let start = parse_number_with_suffix(start_str.trim())?;
-    let end = parse_number_with_suffix(end_str.trim())?;
+        .ok_or_else(|| format!("invalid mul spec '{}': expected mul:start/factor or mul:start..end/factor", spec))?;
+    // Support both mul:start..end/factor and mul:start/factor (no end)
+    let (start, end) = if let Some((start_str, end_str)) = range_part.split_once("..") {
+        (parse_number_with_suffix(start_str.trim())?, parse_number_with_suffix(end_str.trim())?)
+    } else {
+        // No explicit end — use max_count (dataset size) if available,
+        // otherwise a large sentinel. The generated series stops at end.
+        let cap = max_count.unwrap_or(1_000_000_000_000);
+        (parse_number_with_suffix(range_part.trim())?, cap)
+    };
     let factor: f64 = factor_str.trim().parse()
         .map_err(|e| format!("invalid mul factor '{}': {}", factor_str, e))?;
     if factor <= 1.0 {
@@ -712,7 +748,7 @@ fn parse_mul_range(spec: &str) -> Result<Vec<(String, u64)>, String> {
     let mut val_f = start as f64;
     loop {
         let val = val_f as u64;
-        if val > end {
+        if val > end || result.len() >= 100 {
             break;
         }
         // Deduplicate: skip if same as previous
@@ -810,6 +846,11 @@ impl<'de> Deserialize<'de> for DSProfileGroup {
                 for entry_str in &entries {
                     if entry_str.contains("${") {
                         deferred.push(entry_str.clone());
+                    } else if is_unbounded_series(entry_str) {
+                        // Unbounded series (e.g., "mul:1mi/2" without "..end")
+                        // must be deferred until base_count is known so we
+                        // don't generate profiles larger than the dataset.
+                        deferred.push(entry_str.clone());
                     } else {
                         let pairs = parse_sized_entry(entry_str)
                             .map_err(de::Error::custom)?;
@@ -857,6 +898,12 @@ impl<'de> Deserialize<'de> for DSProfileGroup {
                             views: base_views,
                         }
                     };
+                    if profiles.contains_key(&prof_name) {
+                        return Err(de::Error::custom(format!(
+                            "sized profile '{}' conflicts with explicitly defined profile of the same name",
+                            prof_name,
+                        )));
+                    }
                     profiles.insert(prof_name, merged);
                 }
                 if !deferred.is_empty() {
@@ -1391,6 +1438,44 @@ sized: ["mul:1m..16m/2"]
     }
 
     #[test]
+    fn test_mul_implicit_end_in_yaml() {
+        // The implicit-end form `mul:1m/2` is deferred until base_count
+        // is known, then generates profiles capped at the dataset size.
+        let yaml = r#"
+default:
+  maxk: 100
+  base_vectors: base.mvec
+sized: ["mul:1m/2"]
+"#;
+        let mut g: DSProfileGroup = serde_yaml::from_str(yaml).unwrap();
+        // Simulate the runtime expansion with a known base_count
+        let mut vars = indexmap::IndexMap::new();
+        vars.insert("base_count".to_string(), "50000000".to_string()); // 50M
+        let added = g.expand_deferred_sized(&vars);
+        assert!(added > 3, "expected profiles to be added, got {}", added);
+
+        let names = g.profile_names();
+        assert!(names.len() > 5, "expected multiple profiles, got {:?}", names);
+        assert_eq!(names[0], "default");
+        assert_eq!(names[1], "1m");
+        assert_eq!(names[2], "2m");
+        assert_eq!(names[3], "4m");
+        // Should NOT have any profile > 50M
+        for (name, p) in g.profiles.iter() {
+            if let Some(bc) = p.base_count {
+                assert!(bc <= 50_000_000,
+                    "profile '{}' has base_count {} > 50M", name, bc);
+            }
+        }
+        // All sized profiles should inherit base_vectors from default
+        let p1m = g.profile("1m").unwrap();
+        assert!(p1m.base_count.is_some());
+        assert_eq!(p1m.base_count.unwrap(), 1_000_000);
+        assert!(p1m.view("base_vectors").is_some(),
+            "sized profile should inherit base_vectors from default");
+    }
+
+    #[test]
     fn test_derive_views_from_templates() {
         use crate::dataset::pipeline::StepDef;
         use indexmap::IndexMap;
@@ -1422,6 +1507,7 @@ default:
                 after: vec![],
                 profiles: vec![],
                 per_profile: true,
+                phase: 0,
                 on_partial: crate::dataset::pipeline::OnPartial::default(),
                 options: opts1,
             },
@@ -1432,6 +1518,7 @@ default:
                 after: vec![],
                 profiles: vec![],
                 per_profile: true,
+                phase: 0,
                 on_partial: crate::dataset::pipeline::OnPartial::default(),
                 options: opts2,
             },
@@ -1469,5 +1556,93 @@ default:
         assert!(!p10.view("neighbor_indices").unwrap().source.window.is_empty());
         // Inherited shared view unchanged
         assert_eq!(p10.view("query_vectors").unwrap().path(), "query.mvec");
+    }
+
+    #[test]
+    fn test_parse_mul_implicit_end() {
+        // mul:1m/2 (no ..end) generates profiles with implicit upper bound (1T cap)
+        let pairs = parse_sized_entry("mul:1m/2").unwrap();
+        let counts: Vec<u64> = pairs.iter().map(|(_, c)| *c).collect();
+        // Should start at 1m and double: 1m, 2m, 4m, 8m, 16m, 32m, 64m, 128m, ...
+        assert_eq!(counts[0], 1_000_000);
+        assert_eq!(counts[1], 2_000_000);
+        assert_eq!(counts[2], 4_000_000);
+        assert_eq!(counts[3], 8_000_000);
+        // Each successive value should be double the previous
+        for i in 1..counts.len() {
+            assert_eq!(counts[i], counts[i - 1] * 2,
+                "expected doubling at index {}: {} vs {}", i, counts[i], counts[i - 1] * 2);
+        }
+        // Should have many profiles (up to 1T, capped at 100)
+        assert!(counts.len() > 10, "expected more than 10 profiles, got {}", counts.len());
+        // All values should be <= 1T
+        assert!(*counts.last().unwrap() <= 1_000_000_000_000);
+    }
+
+    #[test]
+    fn test_parse_mul_implicit_end_caps_at_100() {
+        // mul:1/1.01 with a tiny factor generates many profiles before
+        // reaching the 1T implicit upper bound. The 100-profile safety cap
+        // should stop expansion at exactly 100 profiles.
+        let pairs = parse_sized_entry("mul:1/1.01").unwrap();
+        assert_eq!(pairs.len(), 100,
+            "expected exactly 100 profiles (safety cap), got {}", pairs.len());
+        // First profile should be 1
+        assert_eq!(pairs[0].1, 1);
+    }
+
+    #[test]
+    fn test_sized_name_conflict_error() {
+        // A sized profile conflicting with an explicitly defined profile should
+        // produce a deserialization error. The explicit profile must appear
+        // before the sized key so it is already in the profile map when sized
+        // expansion tries to insert the same name.
+        let yaml = r#"
+default:
+  maxk: 100
+  base_vectors: base.fvec
+10m:
+  base_count: 10000000
+  base_vectors: custom_base.fvec
+sized: [10m, 20m]
+"#;
+        let result: Result<DSProfileGroup, _> = serde_yaml::from_str(yaml);
+        assert!(result.is_err(), "expected error when sized profile conflicts with explicit profile");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("conflicts"),
+            "error message should mention conflict, got: {}", err_msg);
+    }
+
+    #[test]
+    fn test_sized_and_explicit_complementary() {
+        // Non-conflicting sized + explicit profiles should coexist
+        let yaml = r#"
+default:
+  maxk: 100
+  base_vectors: base.fvec
+  query_vectors: query.fvec
+sized: [10m, 20m]
+custom-queries:
+  query_vectors: alt_queries.fvec
+  neighbor_indices: alt_indices.ivec
+"#;
+        let g: DSProfileGroup = serde_yaml::from_str(yaml).unwrap();
+        // default + 10m + 20m + custom-queries = 4
+        assert_eq!(g.profiles.len(), 4);
+
+        // Sized profiles have base_count set
+        let p10 = g.profile("10m").unwrap();
+        assert_eq!(p10.base_count, Some(10_000_000));
+        assert_eq!(p10.maxk, Some(100)); // inherited from default
+
+        let p20 = g.profile("20m").unwrap();
+        assert_eq!(p20.base_count, Some(20_000_000));
+
+        // Explicit custom-queries profile is unaffected by sized expansion
+        let custom = g.profile("custom-queries").unwrap();
+        assert!(custom.base_count.is_none());
+        assert_eq!(custom.view("query_vectors").unwrap().path(), "alt_queries.fvec");
+        // custom-queries should inherit base_vectors from default
+        assert_eq!(custom.view("base_vectors").unwrap().path(), "base.fvec");
     }
 }

@@ -423,7 +423,7 @@ With base unit 1m, the fibonacci sequence 1, 1, 2, 3, 5, 8, 13, 21, 34,
 55, 89, 144, 233, 377 produces: `1m, 1m, 2m, 3m, 5m, 8m, 13m, 21m,
 34m, 55m, 89m, 144m, 233m, 377m`. Start must be > 0.
 
-**5. Geometric (multiply-by-factor) series** (`mul:start..end/factor`):
+**5. Geometric (multiply-by-factor) series** (`mul:start..end/factor` or `mul:start/factor`):
 ```yaml
 sized: ["mul:1m..100m/2"]
 ```
@@ -434,6 +434,23 @@ With a fractional factor: `"mul:10m..100m/1.5"` → `10m, 15m, 22500k,
 33750k, 50625k, 75937500` (values are `floor(prev × 1.5)`, named with
 the largest clean suffix).
 
+**Implicit upper bound form** (`mul:start/factor`): When the `..end` is
+omitted, the upper bound is implicitly the default profile's `base_count`.
+This is the preferred form for early stratification, since the actual
+dataset size does not need to be known at bootstrap time:
+```yaml
+sized: ["mul:1m/2"]
+```
+Generates profiles `1m, 2m, 4m, 8m, ...` up to the default profile's
+base count. During expansion, profiles whose `base_count` exceeds the
+default profile's base count are filtered out. A safety cap of 100
+profiles prevents runaway expansion.
+
+**Conflict with explicit profiles**: If a sized expansion produces a
+profile name that conflicts with an explicitly defined profile, this is
+a deserialization error. For example, defining both `sized: [10m]` and
+an explicit `10m:` profile in the same `profiles:` block is invalid.
+
 #### Profile naming
 
 Profile names are derived from the `base_count` value using the largest
@@ -441,34 +458,25 @@ clean suffix: values divisible by 1B get `b` suffix, by 1M get `m`, by
 1K get `k`, otherwise the raw number is used. Examples: `10000000` →
 `"10m"`, `1500000` → `"1500k"`, `100000` → `"100k"`, `1234` → `"1234"`.
 
-#### Variable references in sized specs
+#### Variable references in sized specs (deprecated)
 
-Sized range endpoints may contain `${variable}` references that are
-resolved at expansion time rather than at YAML load time. This enables
-early stratification — declaring sized profiles at bootstrap before the
-pipeline has run.
+> **Note**: Variable references in sized specs (e.g., `${base_count}`)
+> are deprecated in favor of the implicit upper bound form. The preferred
+> approach is `mul:1m/2`, which generates profiles up to the default
+> profile's base count without requiring variable interpolation. The
+> variable reference mechanism is retained for backward compatibility but
+> should not be used in new configurations.
 
-```yaml
-sized: ["mul:1m..${base_count}/2"]
-```
+Previously, sized range endpoints could contain `${variable}` references
+resolved at expansion time. This required a deferred two-phase expansion:
+entries with unresolved variables were stored verbatim and expanded later
+when `variables.yaml` became available.
 
-When the config is loaded and `base_count` is not yet defined (no
-`variables.yaml`), entries containing unresolved variables are stored
-verbatim and skipped. When `expand_per_profile_steps()` runs during
-pipeline execution, the `ctx.defaults` map (populated from
-`variables.yaml`) provides the values and the deferred entries are
-expanded into concrete profiles.
-
-This supports the single-pass workflow:
-```sh
-veks bootstrap --auto --sized 'mul:1m..${base_count}/2'
-veks run    # core stages compute base_count; profiles expand; per-profile stages run
-```
-
-If a variable remains unresolved at expansion time, the entry is silently
-skipped and a warning is logged. This is not an error — it means the
-variable-producing stage has not yet run, and the profiles will be
-generated on the next `veks run` after the variable is available.
+The implicit upper bound form (`mul:start/factor`) eliminates this
+complexity. Profile expansion is now a single pass at YAML load time —
+profiles that exceed the default profile's base count are simply filtered
+out during per-profile step expansion, without needing variable
+references or deferred expansion.
 
 #### Structured sized form with facet templates
 

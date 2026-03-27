@@ -568,22 +568,22 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
             println!("    - Incremental workflow: verify correctness at 1M, then 10M,");
             println!("      then scale up with confidence");
             println!();
-            // Build a default spec. The upper bound is always ${base_count}
-            // because the actual count depends on cleaning (dedup, zeros)
-            // and fraction. Resolved at run time by deferred profile expansion.
-            // The effective_max estimate is only used to choose the starting
-            // scale and series type.
+            // Build a default spec. The upper bound is implicit — profiles
+            // are only valid for sizes ≤ the default profile's base count.
+            // Client libraries interpret the sized spec directly.
             let build_spec = || -> String {
                 if effective_max >= 2_000_000 {
-                    "mul:1m..${base_count}/2".to_string()
+                    // Use binary units (1mi = 2^20 = 1,048,576) so the
+                    // doubling series produces clean IEC names:
+                    // 1mi, 2mi, 4mi, ..., 512mi, 1gi, 2gi, ...
+                    "mul:1mi/2".to_string()
                 } else if effective_max >= 100_000 {
                     let start = (effective_max / 10).max(1000);
                     let start_label = format_count_label(start);
-                    format!("mul:{}..${{base_count}}/2", start_label)
+                    format!("mul:{}/2", start_label)
                 } else if effective_max >= 10_000 {
-                    let start = (effective_max / 5).max(1000);
-                    let start_label = format_count_label(start);
-                    format!("{}..${{base_count}}/{}", start_label, start_label)
+                    let half = format_count_label(effective_max / 2);
+                    half
                 } else {
                     format_count_label(effective_max / 2)
                 }

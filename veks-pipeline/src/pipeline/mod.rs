@@ -43,6 +43,48 @@ pub mod runner;
 pub mod schema;
 pub mod variables;
 
+/// Return the number of physical CPU cores (not hyperthreads).
+///
+/// Falls back to `available_parallelism` (logical CPUs) if the physical
+/// count cannot be determined.
+pub(crate) fn physical_core_count() -> usize {
+    // Linux: parse /sys/devices/system/cpu/cpu*/topology/core_id to count
+    // unique (socket, core) pairs.
+    if let Ok(entries) = std::fs::read_dir("/sys/devices/system/cpu") {
+        use std::collections::HashSet;
+        let mut cores = HashSet::new();
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if !name_str.starts_with("cpu")
+                || !name_str[3..]
+                    .chars()
+                    .next()
+                    .map(|c| c.is_ascii_digit())
+                    .unwrap_or(false)
+            {
+                continue;
+            }
+            let topo = entry.path().join("topology");
+            let socket = std::fs::read_to_string(topo.join("physical_package_id"))
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok());
+            let core = std::fs::read_to_string(topo.join("core_id"))
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok());
+            if let (Some(s), Some(c)) = (socket, core) {
+                cores.insert((s, c));
+            }
+        }
+        if !cores.is_empty() {
+            return cores.len();
+        }
+    }
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+}
+
 use std::path::{Path, PathBuf};
 
 use clap::Args;
@@ -430,9 +472,7 @@ pub fn run_pipeline(args: RunArgs) {
     // options only invalidates that step and its dependents.
 
     let threads = if args.threads == 0 {
-        std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4)
+        physical_core_count()
     } else {
         args.threads
     };

@@ -53,6 +53,10 @@ pub struct CheckArgs {
     #[arg(long)]
     pub check_extraneous: bool,
 
+    /// List extraneous files to stdout (one per line), suitable for piping
+    #[arg(long)]
+    pub clean: bool,
+
     /// Remove extraneous publishable files not accounted for by the pipeline
     #[arg(long)]
     pub clean_files: bool,
@@ -121,7 +125,8 @@ pub fn run(args: CheckArgs) {
     let any_specific = args.check_pipelines || args.check_publish
         || args.check_merkle || args.check_integrity || args.check_catalogs
         || args.check_extraneous;
-    let run_all = args.check_all || !any_specific;
+    // --clean only needs the extraneous check, not the full suite
+    let run_all = args.check_all || (!any_specific && !args.clean);
 
     // A directory can be both dataset context AND publish context when
     // .publish_url is at or above a dataset directory. Both check modes
@@ -134,7 +139,7 @@ pub fn run(args: CheckArgs) {
     let run_merkle = is_dataset_context && (run_all || args.check_merkle);
     let run_integrity = is_dataset_context && (run_all || args.check_integrity);
     let run_catalogs = is_publish_context && (run_all || args.check_catalogs);
-    let run_extraneous = is_dataset_context && (run_all || args.check_extraneous || args.clean_files);
+    let run_extraneous = is_dataset_context && (run_all || args.check_extraneous || args.clean || args.clean_files);
 
     let merkle_threshold = parse_size(&args.merkle_min_size).unwrap_or_else(|| {
         eprintln!("Error: invalid size '{}'", args.merkle_min_size);
@@ -182,6 +187,22 @@ pub fn run(args: CheckArgs) {
     }
     if run_extraneous {
         results.push(extraneous::check(&directory, &dataset_files, &publishable));
+    }
+
+    // Handle --clean: list extraneous files to stdout and exit.
+    // No check output, no fix plans — just bare paths for piping.
+    // Exit code 1 if extraneous files exist, 0 if clean.
+    if args.clean {
+        let mut count = 0;
+        for ds_path in &dataset_files {
+            let extra = extraneous::find_extraneous(ds_path, &publishable);
+            for file in &extra {
+                let rel = file.strip_prefix(&directory).unwrap_or(file);
+                println!("{}", rel.display());
+                count += 1;
+            }
+        }
+        std::process::exit(if count > 0 { 1 } else { 0 });
     }
 
     // Output results.

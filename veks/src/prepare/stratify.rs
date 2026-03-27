@@ -348,19 +348,19 @@ fn parse_spec_to_pairs(spec: &str) -> Vec<(String, u64)> {
 /// Build the standard spec: fib + mul/2 + linear(10m), deduped.
 ///
 /// This is the default for `--auto` and option 1 in the wizard.
-/// Build a standard sized profile spec. Uses `${base_count}` as the upper
-/// bound so the spec remains valid if the dataset is re-processed with
-/// different parameters. The `effective_max` estimate is only used to
-/// choose the starting scale and series type.
+/// Build a standard sized profile spec. The upper bound is implicit —
+/// profiles are only valid for sizes ≤ the default profile's base count.
 pub(crate) fn standard_spec(effective_max: u64) -> String {
     if effective_max >= 2_000_000 {
-        "mul:1m..${base_count}/2".to_string()
+        // Use binary units so the doubling series produces clean IEC names:
+        // 1mi, 2mi, 4mi, ..., 512mi, 1gi, 2gi, ...
+        "mul:1mi/2".to_string()
     } else if effective_max >= 100_000 {
         let start = format_count_label((effective_max / 10).max(1000));
-        format!("mul:{}..${{base_count}}/2", start)
+        format!("mul:{}/2", start)
     } else if effective_max >= 10_000 {
         let half = format_count_label(effective_max / 2);
-        format!("mul:{}..${{base_count}}/2", half)
+        half
     } else {
         format_count_label(effective_max / 2)
     }
@@ -431,7 +431,7 @@ pub fn interactive_spec_wizard(path: &Path) -> String {
         "2" => {
             let start = prompt_with_default(
                 &format!("  Start size [max={}]", max_label),
-                "1m",
+                "1mi",
             );
             format!("mul:{}..{}/2", start.trim(), max_label)
         }

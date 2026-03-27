@@ -148,8 +148,10 @@ pub fn factory() -> Box<dyn CommandOp> {
 const DEFAULT_BATCH_SIZE: usize = 1_000_000;
 /// Number of vectors to sample for variance estimation.
 const VARIANCE_SAMPLE_SIZE: usize = 10_000;
-/// Minimum prefix components.
-const MIN_PREFIX: usize = 1;
+/// Minimum prefix components. 10 components provides strong discrimination
+/// for most embedding models, minimizing prefix collision groups that
+/// require full-vector comparison during dedup.
+const MIN_PREFIX: usize = 10;
 /// Maximum prefix components.
 const MAX_PREFIX: usize = 10;
 /// BufReader/BufWriter capacity (1 MiB).
@@ -1067,42 +1069,104 @@ fn merge_runs(
         dup_count: usize,
     }
 
+    /// Stats for prefix group processing — tracks how much random I/O
+    /// the full-vector sort requires, helping diagnose prefix width issues.
+    #[derive(Default)]
+    struct PrefixGroupStats {
+        singleton_groups: usize,        // groups with exactly 1 element (no dup possible)
+        multi_groups: usize,            // groups with 2+ elements (need full-vector sort)
+        multi_group_total_size: usize,  // total records across multi-element groups
+        largest_group: usize,           // biggest prefix collision group
+        full_vector_reads: usize,       // total full-vector reads for hashing
+    }
+
+    impl PrefixGroupStats {
+        fn merge(&mut self, other: &PrefixGroupStats) {
+            self.singleton_groups += other.singleton_groups;
+            self.multi_groups += other.multi_groups;
+            self.multi_group_total_size += other.multi_group_total_size;
+            self.largest_group = self.largest_group.max(other.largest_group);
+            self.full_vector_reads += other.full_vector_reads;
+        }
+    }
+
     let scan_pb = ctx.ui.bar_with_unit(total as u64, "dedup+write", "vec");
     let pb_id = scan_pb.id();
+
+    // Stats for prefix group sorting (tracks how much random I/O the
+    // full-vector sort within prefix groups requires)
+    let prefix_group_stats = std::sync::Mutex::new(PrefixGroupStats::default());
 
     let chunk_scan = |chunk: &[RunRecord]| -> ChunkResult {
         let mut out_buf = Vec::with_capacity(chunk.len() * 8);
         let mut dup_buf = Vec::new();
         let mut dups = 0usize;
+        let mut local_stats = PrefixGroupStats::default();
 
-        for (i, record) in chunk.iter().enumerate() {
-            let is_dup = if i > 0 {
-                let prev = &chunk[i - 1];
-                if prev.prefix_eq(record) {
-                    reader.vectors_equal(prev.ordinal as usize, record.ordinal as usize)
-                } else {
-                    false
-                }
-            } else {
-                false
-            };
-
-            let ord_bytes = (record.ordinal as i32).to_le_bytes();
-
-            if is_dup {
-                dups += 1;
-                dup_buf.extend_from_slice(&dim_bytes);
-                dup_buf.extend_from_slice(&ord_bytes);
-                if !elide {
-                    out_buf.extend_from_slice(&dim_bytes);
-                    out_buf.extend_from_slice(&ord_bytes);
-                }
-            } else {
-                out_buf.extend_from_slice(&dim_bytes);
-                out_buf.extend_from_slice(&ord_bytes);
+        // Process the chunk in prefix groups. Within each group,
+        // sort by full vector content so exact duplicates become
+        // adjacent. This fixes the bug where a non-duplicate
+        // interleaves two true duplicates in the prefix-sorted order.
+        let mut group_start = 0;
+        while group_start < chunk.len() {
+            // Find the extent of this prefix group
+            let mut group_end = group_start + 1;
+            while group_end < chunk.len() && chunk[group_start].prefix_eq(&chunk[group_end]) {
+                group_end += 1;
             }
+            let group_len = group_end - group_start;
+
+            if group_len == 1 {
+                // Single-element group — no duplicates possible
+                let record = &chunk[group_start];
+                out_buf.extend_from_slice(&dim_bytes);
+                out_buf.extend_from_slice(&(record.ordinal as i32).to_le_bytes());
+                local_stats.singleton_groups += 1;
+            } else {
+                // Multi-element prefix group — track the last unique
+                // vector and compare each subsequent record against it.
+                // Only reads full vectors for the comparison, no hashing.
+                // When a record doesn't match the last unique, it becomes
+                // the new last unique reference.
+                local_stats.multi_groups += 1;
+                local_stats.multi_group_total_size += group_len;
+                if group_len > local_stats.largest_group {
+                    local_stats.largest_group = group_len;
+                }
+
+                let mut last_unique_ord = chunk[group_start].ordinal;
+                out_buf.extend_from_slice(&dim_bytes);
+                out_buf.extend_from_slice(&(last_unique_ord as i32).to_le_bytes());
+
+                for record in &chunk[group_start + 1..group_end] {
+                    local_stats.full_vector_reads += 1;
+                    let is_dup = reader.vectors_equal(
+                        last_unique_ord as usize, record.ordinal as usize,
+                    );
+
+                    let ord_bytes = (record.ordinal as i32).to_le_bytes();
+                    if is_dup {
+                        dups += 1;
+                        dup_buf.extend_from_slice(&dim_bytes);
+                        dup_buf.extend_from_slice(&ord_bytes);
+                        if !elide {
+                            out_buf.extend_from_slice(&dim_bytes);
+                            out_buf.extend_from_slice(&ord_bytes);
+                        }
+                    } else {
+                        out_buf.extend_from_slice(&dim_bytes);
+                        out_buf.extend_from_slice(&ord_bytes);
+                        last_unique_ord = record.ordinal;
+                    }
+                }
+            }
+            group_start = group_end;
         }
+
         ctx.ui.inc_by_id(pb_id, chunk.len() as u64);
+        if let Ok(mut stats) = prefix_group_stats.lock() {
+            stats.merge(&local_stats);
+        }
         ChunkResult { out_buf, dup_buf, dup_count: dups }
     };
 
@@ -1113,27 +1177,41 @@ fn merge_runs(
     };
     scan_pb.finish();
 
-    // Boundary fixup: check last record of chunk N vs first of chunk N+1.
-    // If they're duplicates, patch the byte buffers: remove the first
-    // record from chunk N+1's output buffer and add it to its dup buffer.
+    // Boundary fixup: check the boundary between adjacent chunks.
+    // A prefix group can span a chunk boundary, so a duplicate in
+    // chunk N+1 might match a non-adjacent record in chunk N.
+    // Scan backwards from the boundary in chunk N to find the last
+    // unique record in the prefix group, and compare against the
+    // first record of chunk N+1.
     let mut boundary_dup_count = 0usize;
     for i in 0..num_chunks.saturating_sub(1) {
-        let last = chunks[i].last().unwrap();
         let first = chunks[i + 1].first().unwrap();
-        if last.prefix_eq(first)
-            && reader.vectors_equal(last.ordinal as usize, first.ordinal as usize)
-        {
+        // Scan backwards through chunk N's trailing prefix group to
+        // find the last unique vector. Compare the first record of
+        // chunk N+1 against it.
+        let mut found_dup = false;
+        for record in chunks[i].iter().rev() {
+            if !record.prefix_eq(first) {
+                break; // left the prefix group
+            }
+            if reader.vectors_equal(record.ordinal as usize, first.ordinal as usize) {
+                found_dup = true;
+                break;
+            }
+        }
+        if found_dup {
             boundary_dup_count += 1;
             let result = &mut chunk_results[i + 1];
             result.dup_count += 1;
 
             // The first 8 bytes of out_buf is this record's ivec entry.
             // Move it to dup_buf (or remove if eliding).
-            let first_record = &result.out_buf[..8];
-            result.dup_buf.extend_from_slice(first_record);
-            if elide {
-                // Remove first 8 bytes from output
-                result.out_buf.drain(..8);
+            if result.out_buf.len() >= 8 {
+                let first_record = result.out_buf[..8].to_vec();
+                result.dup_buf.extend_from_slice(&first_record);
+                if elide {
+                    result.out_buf.drain(..8);
+                }
             }
         }
     }
@@ -1153,6 +1231,28 @@ fn merge_runs(
         "  dedup: {:.1}s ({:.0} vec/s), {} unique, {} dups ({} boundary)",
         scan_secs, scan_rate, unique_count, dup_count, boundary_dup_count,
     ));
+
+    // Log prefix group stats to help diagnose prefix width effectiveness
+    if let Ok(stats) = prefix_group_stats.lock() {
+        let total_groups = stats.singleton_groups + stats.multi_groups;
+        let collision_pct = if total_groups > 0 {
+            stats.multi_groups as f64 / total_groups as f64 * 100.0
+        } else { 0.0 };
+        ctx.ui.log(&format!(
+            "  prefix groups: {} singleton, {} multi-element ({:.1}% collision rate)",
+            stats.singleton_groups, stats.multi_groups, collision_pct,
+        ));
+        ctx.ui.log(&format!(
+            "  prefix collisions: {} vectors in multi-groups, largest group: {}, full-vector reads: {}",
+            stats.multi_group_total_size, stats.largest_group, stats.full_vector_reads,
+        ));
+        if collision_pct > 20.0 {
+            ctx.ui.log(&format!(
+                "  WARNING: high prefix collision rate ({:.1}%). Consider increasing prefix_width for better dedup performance.",
+                collision_pct,
+            ));
+        }
+    }
 
     // ── Sub-phase D: Write files ─────────────────────────────────────
     let write_start = Instant::now();

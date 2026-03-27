@@ -175,6 +175,7 @@ mod tests {
             after: vec![],
             profiles: vec![],
             per_profile: false,
+            phase: 0,
             on_partial: OnPartial::default(),
             options: IndexMap::new(),
         };
@@ -190,6 +191,7 @@ mod tests {
             after: vec![],
             profiles: vec![],
             per_profile: false,
+            phase: 0,
             on_partial: OnPartial::default(),
             options: IndexMap::new(),
         };
@@ -244,6 +246,7 @@ steps:
             after: vec![],
             profiles: vec![],
             per_profile: false,
+            phase: 0,
             on_partial: OnPartial::default(),
             options: opts,
         };
@@ -279,6 +282,7 @@ steps:
             after: vec![],
             profiles: vec![],
             per_profile: false,
+            phase: 0,
             on_partial: OnPartial::default(),
             options: IndexMap::new(),
         };
@@ -295,6 +299,7 @@ steps:
             after: vec![],
             profiles: vec!["10M".to_string(), "100M".to_string()],
             per_profile: false,
+            phase: 0,
             on_partial: OnPartial::default(),
             options: IndexMap::new(),
         };

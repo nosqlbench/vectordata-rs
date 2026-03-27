@@ -805,6 +805,12 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
                 if args.normalize {
                     query_opts.push(("normalize".into(), "true".into()));
                 }
+                // Perturb each query by a minimal epsilon on dim 0, scaled by
+                // query index. This ensures every query produces a unique
+                // distance surface — no two base vectors are ever equidistant
+                // from a query, making ground truth neighborhoods canonical.
+                query_opts.push(("perturb".into(), "true".into()));
+
                 let mut extract_deps = vec_deps.clone();
                 if args.base_fraction < 1.0 && !subset_applied {
                     extract_deps.push("compute-base-end".into());
@@ -812,7 +818,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
                 steps.push(Step {
                     id: "extract-queries".into(),
                     run: "transform extract".into(),
-                    description: Some(format!("First {} shuffled vectors -> query set", args.query_count)),
+                    description: Some(format!("First {} shuffled vectors -> query set (perturbed)", args.query_count)),
                     after: extract_deps.clone(),
                     per_profile: false,
                     phase: 0,
@@ -1136,7 +1142,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
         steps.push(Step {
             id: "verify-knn".into(),
             run: "verify knn-consolidated".into(),
-            description: Some("Single-pass KNN verification across all profiles".into()),
+            description: Some("Multi-threaded single-pass KNN verification across all profiles".into()),
             after: verify_after,
             per_profile: false, // NOT per-profile — one step verifies all
             phase: 0,

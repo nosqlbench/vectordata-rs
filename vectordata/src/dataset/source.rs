@@ -95,20 +95,76 @@ impl fmt::Display for DSSource {
 // Interval parsing
 // ---------------------------------------------------------------------------
 
-/// Format a count value back to a compact suffix string.
+/// Format a count value to a compact profile name using SI/IEC suffixes.
 ///
-/// Picks the largest clean suffix: `b` (billions), `m` (millions), `k` (thousands).
-/// Falls back to the raw number if no suffix divides evenly.
+/// Never uses decimal points. Uses the shortest integer-only representation,
+/// trying both SI decimal (`t`, `g`, `m`, `k`) and IEC binary (`ti`, `gi`,
+/// `mi`, `ki`) scales. For values that don't divide evenly at one scale,
+/// a compound notation is used (e.g., `1g24m` = 1 billion + 24 million).
+///
+/// This function generates profile directory names on disk.
+///
+/// Examples:
+/// - `1000000` → `1m`
+/// - `1024000000` → `1g24m`
+/// - `524288000000` → `524g288m`
+/// - `1073741824` → `1gi` (exact binary)
+/// - `2000000000` → `2g`
 pub fn format_count_with_suffix(n: u64) -> String {
-    if n > 0 && n % 1_000_000_000 == 0 {
-        format!("{}b", n / 1_000_000_000)
-    } else if n > 0 && n % 1_000_000 == 0 {
-        format!("{}m", n / 1_000_000)
-    } else if n > 0 && n % 1_000 == 0 {
-        format!("{}k", n / 1_000)
-    } else {
-        n.to_string()
+    if n == 0 {
+        return "0".to_string();
     }
+
+    let all_scales: &[(u64, &str)] = &[
+        (1_000_000_000_000, "t"),
+        (1u64 << 40,        "ti"),
+        (1_000_000_000,     "g"),
+        (1u64 << 30,        "gi"),
+        (1_000_000,         "m"),
+        (1u64 << 20,        "mi"),
+        (1_000,             "k"),
+        (1u64 << 10,        "ki"),
+    ];
+
+    let remainder_scales: &[(u64, &str)] = &[
+        (1_000_000_000, "g"),
+        (1u64 << 30,    "gi"),
+        (1_000_000,     "m"),
+        (1u64 << 20,    "mi"),
+        (1_000,         "k"),
+        (1u64 << 10,    "ki"),
+    ];
+
+    let mut best: Option<String> = None;
+
+    for &(divisor, suffix) in all_scales {
+        let quotient = n / divisor;
+        if quotient == 0 || quotient > 999 {
+            continue;
+        }
+        let remainder = n % divisor;
+
+        let candidate = if remainder == 0 {
+            format!("{}{}", quotient, suffix)
+        } else {
+            let mut rem_str = String::new();
+            for &(rd, rs) in remainder_scales {
+                if rd >= divisor { continue; }
+                if remainder >= rd && remainder % rd == 0 {
+                    rem_str = format!("{}{}", remainder / rd, rs);
+                    break;
+                }
+            }
+            if rem_str.is_empty() { continue; }
+            format!("{}{}{}", quotient, suffix, rem_str)
+        };
+
+        if best.as_ref().map_or(true, |b| candidate.len() < b.len()) {
+            best = Some(candidate);
+        }
+    }
+
+    best.unwrap_or_else(|| n.to_string())
 }
 
 /// Parse a unit suffix and return the multiplier.
@@ -130,16 +186,23 @@ pub fn parse_number_with_suffix(s: &str) -> Result<u64, String> {
         return Err("empty number".to_string());
     }
 
+    // Try compound format first: e.g., "1g24m" = 1 billion + 24 million.
+    // Split at positions where a digit is followed by an alpha suffix which
+    // is then followed by another digit (the start of the remainder term).
+    if let Some(total) = try_parse_compound(&s) {
+        return Ok(total);
+    }
+
     // Try multi-char ISO suffixes first (case-insensitive for the letter,
     // but 'i' must be lowercase in binary suffixes: KiB, MiB, GiB, TiB).
     let (num_part, multiplier) = if let Some(n) = s.strip_suffix("TiB") {
-        (n, 1u64 << 40) // 1,099,511,627,776
+        (n, 1u64 << 40)
     } else if let Some(n) = s.strip_suffix("GiB") {
-        (n, 1u64 << 30) // 1,073,741,824
+        (n, 1u64 << 30)
     } else if let Some(n) = s.strip_suffix("MiB") {
-        (n, 1u64 << 20) // 1,048,576
+        (n, 1u64 << 20)
     } else if let Some(n) = s.strip_suffix("KiB") {
-        (n, 1u64 << 10) // 1,024
+        (n, 1u64 << 10)
     } else if let Some(n) = s.strip_suffix("TB").or_else(|| s.strip_suffix("tb")) {
         (n, 1_000_000_000_000u64)
     } else if let Some(n) = s.strip_suffix("GB").or_else(|| s.strip_suffix("gb")) {
@@ -148,6 +211,15 @@ pub fn parse_number_with_suffix(s: &str) -> Result<u64, String> {
         (n, 1_000_000u64)
     } else if let Some(n) = s.strip_suffix("KB").or_else(|| s.strip_suffix("kb")) {
         (n, 1_000u64)
+    // Two-char IEC binary suffixes without "B" (used in profile names)
+    } else if let Some(n) = s.strip_suffix("ti").or_else(|| s.strip_suffix("Ti")) {
+        (n, 1u64 << 40)
+    } else if let Some(n) = s.strip_suffix("gi").or_else(|| s.strip_suffix("Gi")) {
+        (n, 1u64 << 30)
+    } else if let Some(n) = s.strip_suffix("mi").or_else(|| s.strip_suffix("Mi")) {
+        (n, 1u64 << 20)
+    } else if let Some(n) = s.strip_suffix("ki").or_else(|| s.strip_suffix("Ki")) {
+        (n, 1u64 << 10)
     } else {
         // Single-char suffixes
         match s.as_bytes().last() {
@@ -163,6 +235,64 @@ pub fn parse_number_with_suffix(s: &str) -> Result<u64, String> {
         .parse()
         .map_err(|e| format!("invalid number '{}': {}", num_part, e))?;
     Ok(n * multiplier)
+}
+
+/// Try to parse a compound suffix string like `1g24m` or `524g288m`.
+///
+/// Splits into terms where each term is `{digits}{suffix}`. Returns the
+/// sum of all terms, or None if the string doesn't match compound format.
+fn try_parse_compound(s: &str) -> Option<u64> {
+    // Must have at least two terms (digit-suffix-digit pattern)
+    let bytes = s.as_bytes();
+    if bytes.len() < 4 { return None; }
+
+    // Check: does the string have digits, then alpha, then digits again?
+    let has_compound = bytes.windows(2).any(|w| {
+        w[0].is_ascii_alphabetic() && w[1].is_ascii_digit()
+    });
+    if !has_compound { return None; }
+
+    // Split into terms: scan for transitions from alpha to digit
+    let mut terms: Vec<&str> = Vec::new();
+    let mut term_start = 0;
+    for i in 1..bytes.len() {
+        if bytes[i].is_ascii_digit() && bytes[i - 1].is_ascii_alphabetic() {
+            terms.push(&s[term_start..i]);
+            term_start = i;
+        }
+    }
+    terms.push(&s[term_start..]);
+
+    if terms.len() < 2 { return None; }
+
+    // Parse each term as a simple number+suffix
+    let mut total = 0u64;
+    for term in &terms {
+        // Each term must end with a suffix
+        let term_bytes = term.as_bytes();
+        if term_bytes.is_empty() || term_bytes.last()?.is_ascii_digit() {
+            return None;
+        }
+        // Find where digits end and suffix begins
+        let suffix_start = term_bytes.iter().position(|b| b.is_ascii_alphabetic())?;
+        let num_part = &term[..suffix_start];
+        let suffix = &term[suffix_start..];
+        let n: u64 = num_part.parse().ok()?;
+        let multiplier = match suffix.to_lowercase().as_str() {
+            "ti" => 1u64 << 40,
+            "gi" => 1u64 << 30,
+            "mi" => 1u64 << 20,
+            "ki" => 1u64 << 10,
+            "t" => 1_000_000_000_000,
+            "g" | "b" => 1_000_000_000,
+            "m" => 1_000_000,
+            "k" => 1_000,
+            _ => return None,
+        };
+        total += n * multiplier;
+    }
+
+    Some(total)
 }
 
 /// Parse a single interval from a string.

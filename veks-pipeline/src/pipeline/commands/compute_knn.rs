@@ -27,6 +27,7 @@ use std::collections::BinaryHeap;
 use std::io::{BufReader, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::time::Instant;
 
 use veks_core::ui::ProgressHandle;
@@ -47,6 +48,12 @@ pub fn factory() -> Box<dyn CommandOp> {
     Box::new(ComputeKnnOp)
 }
 
+/// Default number of base-vector strides per thread for progress reporting.
+///
+/// Each thread breaks its base-vector scan into this many strides and
+/// updates the shared progress counter between strides.
+const STRIDES_PER_THREAD: usize = 10;
+
 // -- Top-K heap ---------------------------------------------------------------
 
 /// A neighbor candidate with index and distance, ordered by distance descending
@@ -59,7 +66,7 @@ pub(super) struct Neighbor {
 
 impl PartialEq for Neighbor {
     fn eq(&self, other: &Self) -> bool {
-        self.distance == other.distance
+        self.distance == other.distance && self.index == other.index
     }
 }
 
@@ -73,10 +80,19 @@ impl PartialOrd for Neighbor {
 
 impl Ord for Neighbor {
     fn cmp(&self, other: &Self) -> Ordering {
-        // Max-heap: larger distance = higher priority (gets evicted first)
-        self.distance
-            .partial_cmp(&other.distance)
-            .unwrap_or(Ordering::Equal)
+        // Max-heap: larger distance = higher priority (gets evicted first).
+        // Deterministic tiebreaker: when distances are equal, the HIGHER
+        // index is evicted first (lower index is preferred). This ensures
+        // the top-k result is identical regardless of scan order, making
+        // ground truth verification exact.
+        match self.distance.partial_cmp(&other.distance).unwrap_or(Ordering::Equal) {
+            Ordering::Equal => {
+                // Higher index = higher priority in max-heap = evicted first
+                // (so lower index is retained)
+                other.index.cmp(&self.index)
+            }
+            ord => ord,
+        }
     }
 }
 
@@ -96,11 +112,13 @@ fn find_top_k_batch_f32(
     metric: Metric,
     dim: usize,
     results: &mut [Vec<Neighbor>],
+    stride: usize,
+    base_progress: &AtomicU64,
 ) {
     if let Some(bfn) = batched_fn {
-        find_top_k_batch_transposed_f32(queries, base_reader, start, end, k, bfn, metric, dim, results);
+        find_top_k_batch_transposed_f32(queries, base_reader, start, end, k, bfn, metric, dim, results, stride, base_progress);
     } else {
-        find_top_k_batch_pairwise_f32(queries, base_reader, start, end, k, dist_fn, results);
+        find_top_k_batch_pairwise_f32(queries, base_reader, start, end, k, dist_fn, results, stride, base_progress);
     }
 }
 
@@ -114,6 +132,8 @@ fn find_top_k_batch_pairwise_f32(
     k: usize,
     dist_fn: fn(&[f32], &[f32]) -> f32,
     results: &mut [Vec<Neighbor>],
+    stride: usize,
+    base_progress: &AtomicU64,
 ) {
     let batch_size = queries.len();
     let mut heaps: Vec<BinaryHeap<Neighbor>> = (0..batch_size)
@@ -121,23 +141,29 @@ fn find_top_k_batch_pairwise_f32(
         .collect();
     let mut thresholds = vec![f32::INFINITY; batch_size];
 
-    for i in start..end {
-        let base_vec = base_reader.get_slice(i);
-        let idx = i as u32;
+    let mut i = start;
+    while i < end {
+        let stride_end = std::cmp::min(i + stride, end);
+        for j in i..stride_end {
+            let base_vec = base_reader.get_slice(j);
+            let idx = j as u32;
 
-        for qi in 0..batch_size {
-            let dist = dist_fn(queries[qi], base_vec);
+            for qi in 0..batch_size {
+                let dist = dist_fn(queries[qi], base_vec);
 
-            if dist < thresholds[qi] {
-                heaps[qi].push(Neighbor { index: idx, distance: dist });
-                if heaps[qi].len() > k {
-                    heaps[qi].pop();
-                }
-                if heaps[qi].len() == k {
-                    thresholds[qi] = heaps[qi].peek().unwrap().distance;
+                if dist < thresholds[qi] {
+                    heaps[qi].push(Neighbor { index: idx, distance: dist });
+                    if heaps[qi].len() > k {
+                        heaps[qi].pop();
+                    }
+                    if heaps[qi].len() == k {
+                        thresholds[qi] = heaps[qi].peek().unwrap().distance;
+                    }
                 }
             }
         }
+        base_progress.fetch_add((stride_end - i) as u64, AtomicOrdering::Relaxed);
+        i = stride_end;
     }
 
     for (qi, heap) in heaps.into_iter().enumerate() {
@@ -163,8 +189,10 @@ fn find_top_k_batch_transposed_f32(
     metric: Metric,
     dim: usize,
     results: &mut [Vec<Neighbor>],
+    stride: usize,
+    base_progress: &AtomicU64,
 ) {
-    use simd_distance::{SIMD_BATCH_WIDTH, TransposedBatch};
+    use simd_distance::{SIMD_BATCH_WIDTH, PackedBatches, TransposedBatch};
 
     let batch_size = queries.len();
     let mut heaps: Vec<BinaryHeap<Neighbor>> = (0..batch_size)
@@ -172,72 +200,113 @@ fn find_top_k_batch_transposed_f32(
         .collect();
     let mut thresholds = vec![f32::INFINITY; batch_size];
 
-    // Pre-transpose queries into SIMD-width sub-batches
+    // Use packed contiguous layout for DotProduct/Cosine (single sequential
+    // memory stream, L1-friendly). Other metrics use the legacy dual-pair path
+    // with separate TransposedBatch allocations.
+    let use_packed = metric == Metric::DotProduct || metric == Metric::Cosine;
+
+    // Packed path: single contiguous allocation, dimension-interleaved
+    let packed = if use_packed {
+        Some(PackedBatches::from_f32(queries, dim))
+    } else {
+        None
+    };
+    let mut packed_out = if use_packed {
+        let n = packed.as_ref().unwrap().n_batches();
+        vec![0.0f32; n * SIMD_BATCH_WIDTH]
+    } else {
+        Vec::new()
+    };
+
+    // Legacy path: separate TransposedBatch allocations
     let mut sub_batches: Vec<TransposedBatch> = Vec::new();
     let mut sub_offsets: Vec<usize> = Vec::new();
-    let mut offset = 0;
-    while offset < batch_size {
-        let sub_end = std::cmp::min(offset + SIMD_BATCH_WIDTH, batch_size);
-        sub_batches.push(TransposedBatch::from_f32(&queries[offset..sub_end], dim));
-        sub_offsets.push(offset);
-        offset = sub_end;
+    if !use_packed {
+        let mut offset = 0;
+        while offset < batch_size {
+            let sub_end = std::cmp::min(offset + SIMD_BATCH_WIDTH, batch_size);
+            sub_batches.push(TransposedBatch::from_f32(&queries[offset..sub_end], dim));
+            sub_offsets.push(offset);
+            offset = sub_end;
+        }
     }
-
-    // Select dual kernel for paired sub-batch processing (2 FMA ports)
     let dual_fn = simd_distance::select_dual_batched_fn_f32(metric);
-
     let mut dist_buf_16 = [0.0f32; SIMD_BATCH_WIDTH];
     let mut dist_buf_32 = [0.0f32; 32];
 
-    for i in start..end {
-        let base_vec = base_reader.get_slice(i);
-        let idx = i as u32;
+    let mut i = start;
+    while i < end {
+        let stride_end = std::cmp::min(i + stride, end);
+        for j in i..stride_end {
+            let base_vec = base_reader.get_slice(j);
+            let idx = j as u32;
 
-        // Process sub-batches in pairs with dual kernel
-        let mut si = 0;
-        if let Some(dfn) = dual_fn {
-            while si + 1 < sub_batches.len() {
-                dfn(&sub_batches[si], &sub_batches[si + 1], base_vec, &mut dist_buf_32);
-                // First 16 queries
-                let off_a = sub_offsets[si];
-                for qi in 0..sub_batches[si].count() {
-                    let gqi = off_a + qi;
-                    let dist = dist_buf_32[qi];
-                    if dist < thresholds[gqi] {
-                        heaps[gqi].push(Neighbor { index: idx, distance: dist });
-                        if heaps[gqi].len() > k { heaps[gqi].pop(); }
-                        if heaps[gqi].len() == k { thresholds[gqi] = heaps[gqi].peek().unwrap().distance; }
+            if let Some(ref pk) = packed {
+                // Packed tiled path: single sequential stream
+                for v in packed_out.iter_mut() { *v = 0.0; }
+                simd_distance::packed_neg_dot_f32(base_vec, pk, &mut packed_out);
+
+                let n = pk.n_batches();
+                for si in 0..n {
+                    let sub_offset = pk.offset(si);
+                    let count = pk.count(si);
+                    for qi in 0..count {
+                        let gqi = sub_offset + qi;
+                        let dist = packed_out[si * SIMD_BATCH_WIDTH + qi];
+                        if dist < thresholds[gqi] {
+                            heaps[gqi].push(Neighbor { index: idx, distance: dist });
+                            if heaps[gqi].len() > k { heaps[gqi].pop(); }
+                            if heaps[gqi].len() == k { thresholds[gqi] = heaps[gqi].peek().unwrap().distance; }
+                        }
                     }
                 }
-                // Second 16 queries
-                let off_b = sub_offsets[si + 1];
-                for qi in 0..sub_batches[si + 1].count() {
-                    let gqi = off_b + qi;
-                    let dist = dist_buf_32[16 + qi];
-                    if dist < thresholds[gqi] {
-                        heaps[gqi].push(Neighbor { index: idx, distance: dist });
-                        if heaps[gqi].len() > k { heaps[gqi].pop(); }
-                        if heaps[gqi].len() == k { thresholds[gqi] = heaps[gqi].peek().unwrap().distance; }
+            } else {
+                // Legacy dual-pair path for L2/L1
+                let mut si = 0;
+                if let Some(dfn) = dual_fn {
+                    while si + 1 < sub_batches.len() {
+                        dfn(&sub_batches[si], &sub_batches[si + 1], base_vec, &mut dist_buf_32);
+                        let off_a = sub_offsets[si];
+                        for qi in 0..sub_batches[si].count() {
+                            let gqi = off_a + qi;
+                            let dist = dist_buf_32[qi];
+                            if dist < thresholds[gqi] {
+                                heaps[gqi].push(Neighbor { index: idx, distance: dist });
+                                if heaps[gqi].len() > k { heaps[gqi].pop(); }
+                                if heaps[gqi].len() == k { thresholds[gqi] = heaps[gqi].peek().unwrap().distance; }
+                            }
+                        }
+                        let off_b = sub_offsets[si + 1];
+                        for qi in 0..sub_batches[si + 1].count() {
+                            let gqi = off_b + qi;
+                            let dist = dist_buf_32[16 + qi];
+                            if dist < thresholds[gqi] {
+                                heaps[gqi].push(Neighbor { index: idx, distance: dist });
+                                if heaps[gqi].len() > k { heaps[gqi].pop(); }
+                                if heaps[gqi].len() == k { thresholds[gqi] = heaps[gqi].peek().unwrap().distance; }
+                            }
+                        }
+                        si += 2;
                     }
                 }
-                si += 2;
-            }
-        }
-        // Handle leftover (odd sub-batch or no dual kernel)
-        while si < sub_batches.len() {
-            batched_fn(&sub_batches[si], base_vec, &mut dist_buf_16);
-            let sub_offset = sub_offsets[si];
-            for qi in 0..sub_batches[si].count() {
-                let gqi = sub_offset + qi;
-                let dist = dist_buf_16[qi];
-                if dist < thresholds[gqi] {
-                    heaps[gqi].push(Neighbor { index: idx, distance: dist });
-                    if heaps[gqi].len() > k { heaps[gqi].pop(); }
-                    if heaps[gqi].len() == k { thresholds[gqi] = heaps[gqi].peek().unwrap().distance; }
+                while si < sub_batches.len() {
+                    batched_fn(&sub_batches[si], base_vec, &mut dist_buf_16);
+                    let sub_offset = sub_offsets[si];
+                    for qi in 0..sub_batches[si].count() {
+                        let gqi = sub_offset + qi;
+                        let dist = dist_buf_16[qi];
+                        if dist < thresholds[gqi] {
+                            heaps[gqi].push(Neighbor { index: idx, distance: dist });
+                            if heaps[gqi].len() > k { heaps[gqi].pop(); }
+                            if heaps[gqi].len() == k { thresholds[gqi] = heaps[gqi].peek().unwrap().distance; }
+                        }
+                    }
+                    si += 1;
                 }
             }
-            si += 1;
         }
+        base_progress.fetch_add((stride_end - i) as u64, AtomicOrdering::Relaxed);
+        i = stride_end;
     }
 
     for (qi, heap) in heaps.into_iter().enumerate() {
@@ -337,11 +406,22 @@ fn compute_partition(
     // chosen for DotProduct (normalized cosine), the batched kernel should
     // also be DotProduct (neg-dot, no norm division).
     let batched_fn = simd_distance::select_batched_fn_f32(metric);
+    let base_count = end - start;
+    let stride = (base_count + STRIDES_PER_THREAD - 1) / STRIDES_PER_THREAD;
+    let base_progress = Arc::new(AtomicU64::new(0));
     let mut results: Vec<Vec<Neighbor>> = (0..query_count).map(|_| Vec::new()).collect();
 
     if threads > 1 && query_count > 1 {
         let effective_threads = std::cmp::min(threads, query_count);
         let chunk_size = (query_count + effective_threads - 1) / effective_threads;
+        let num_batches: u64 = (0..effective_threads)
+            .map(|t| {
+                let clen = std::cmp::min(chunk_size, query_count.saturating_sub(t * chunk_size));
+                ((clen + QUERY_BATCH_SIZE - 1) / QUERY_BATCH_SIZE) as u64
+            })
+            .sum();
+        let total_base_scans = num_batches * (base_count as u64);
+        pb.set_position(0);
 
         let result_chunks: Vec<&mut [Vec<Neighbor>]> =
             results.chunks_mut(chunk_size).collect();
@@ -351,6 +431,7 @@ fn compute_partition(
                 let chunk_start = ci * chunk_size;
                 let chunk_len = chunk.len();
                 let base_ref = Arc::clone(base_reader);
+                let bp = Arc::clone(&base_progress);
 
                 scope.spawn(move || {
                     let mut offset = 0;
@@ -365,29 +446,48 @@ fn compute_partition(
                         find_top_k_batch_f32(
                             &queries, &base_ref, start, end, k, dist_fn,
                             batched_fn, metric, dim, &mut chunk[offset..batch_end],
+                            stride, &bp,
                         );
 
-                        pb.inc(batch_size as u64);
                         offset = batch_end;
                     }
                 });
             }
+
+            // Tick thread: map aggregate base-vector scans to a single-pass
+            // percentage so the bar reads as "N of base_count vectors".
+            let bc = base_count as u64;
+            let nb = num_batches;
+            scope.spawn(move || {
+                loop {
+                    let scanned = base_progress.load(AtomicOrdering::Relaxed);
+                    // Normalize: total scans / num_batches = one pass over base vectors
+                    pb.set_position(scanned / nb.max(1));
+                    if scanned >= total_base_scans {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                pb.set_position(bc);
+            });
         });
     } else {
+        let num_batches = ((query_count + QUERY_BATCH_SIZE - 1) / QUERY_BATCH_SIZE) as u64;
         let mut offset = 0;
         while offset < query_count {
             let batch_end = std::cmp::min(offset + QUERY_BATCH_SIZE, query_count);
-            let batch_size = batch_end - offset;
-            let queries: Vec<&[f32]> = (0..batch_size)
+            let queries: Vec<&[f32]> = (0..(batch_end - offset))
                 .map(|i| query_reader.get_slice(offset + i))
                 .collect();
             find_top_k_batch_f32(
                 &queries, base_reader, start, end, k, dist_fn,
                 batched_fn, metric, dim, &mut results[offset..batch_end],
+                stride, &base_progress,
             );
-            pb.inc(batch_size as u64);
+            pb.set_position(base_progress.load(AtomicOrdering::Relaxed) / num_batches.max(1));
             offset = batch_end;
         }
+        pb.set_position(base_count as u64);
     }
 
     results
@@ -429,11 +529,13 @@ fn find_top_k_batch_f16(
     metric: Metric,
     dim: usize,
     results: &mut [Vec<Neighbor>],
+    stride: usize,
+    base_progress: &AtomicU64,
 ) {
     if let Some(bfn) = batched_fn {
-        find_top_k_batch_transposed_f16(queries, base_reader, start, end, k, bfn, metric, dim, results);
+        find_top_k_batch_transposed_f16(queries, base_reader, start, end, k, bfn, metric, dim, results, stride, base_progress);
     } else {
-        find_top_k_batch_pairwise_f16(queries, base_reader, start, end, k, dist_fn, results);
+        find_top_k_batch_pairwise_f16(queries, base_reader, start, end, k, dist_fn, results, stride, base_progress);
     }
 }
 
@@ -447,6 +549,8 @@ fn find_top_k_batch_pairwise_f16(
     k: usize,
     dist_fn: fn(&[half::f16], &[half::f16]) -> f32,
     results: &mut [Vec<Neighbor>],
+    stride: usize,
+    base_progress: &AtomicU64,
 ) {
     let batch_size = queries.len();
     let mut heaps: Vec<BinaryHeap<Neighbor>> = (0..batch_size)
@@ -454,23 +558,29 @@ fn find_top_k_batch_pairwise_f16(
         .collect();
     let mut thresholds = vec![f32::INFINITY; batch_size];
 
-    for i in start..end {
-        let base_vec = base_reader.get_slice(i);
-        let idx = i as u32;
+    let mut i = start;
+    while i < end {
+        let stride_end = std::cmp::min(i + stride, end);
+        for j in i..stride_end {
+            let base_vec = base_reader.get_slice(j);
+            let idx = j as u32;
 
-        for qi in 0..batch_size {
-            let dist = dist_fn(queries[qi], base_vec);
+            for qi in 0..batch_size {
+                let dist = dist_fn(queries[qi], base_vec);
 
-            if dist < thresholds[qi] {
-                heaps[qi].push(Neighbor { index: idx, distance: dist });
-                if heaps[qi].len() > k {
-                    heaps[qi].pop();
-                }
-                if heaps[qi].len() == k {
-                    thresholds[qi] = heaps[qi].peek().unwrap().distance;
+                if dist < thresholds[qi] {
+                    heaps[qi].push(Neighbor { index: idx, distance: dist });
+                    if heaps[qi].len() > k {
+                        heaps[qi].pop();
+                    }
+                    if heaps[qi].len() == k {
+                        thresholds[qi] = heaps[qi].peek().unwrap().distance;
+                    }
                 }
             }
         }
+        base_progress.fetch_add((stride_end - i) as u64, AtomicOrdering::Relaxed);
+        i = stride_end;
     }
 
     for (qi, heap) in heaps.into_iter().enumerate() {
@@ -501,8 +611,10 @@ fn find_top_k_batch_transposed_f16(
     metric: Metric,
     dim: usize,
     results: &mut [Vec<Neighbor>],
+    stride: usize,
+    base_progress: &AtomicU64,
 ) {
-    use simd_distance::{SIMD_BATCH_WIDTH, TransposedBatch};
+    use simd_distance::{SIMD_BATCH_WIDTH, PackedBatches, TransposedBatch};
 
     let batch_size = queries.len();
     let mut heaps: Vec<BinaryHeap<Neighbor>> = (0..batch_size)
@@ -510,75 +622,112 @@ fn find_top_k_batch_transposed_f16(
         .collect();
     let mut thresholds = vec![f32::INFINITY; batch_size];
 
-    // Pre-transpose queries into SIMD-width sub-batches (already f32)
-    let mut sub_batches: Vec<TransposedBatch> = Vec::new();
-    let mut sub_offsets: Vec<usize> = Vec::new();
-    let mut offset = 0;
-    while offset < batch_size {
-        let sub_end = std::cmp::min(offset + SIMD_BATCH_WIDTH, batch_size);
-        sub_batches.push(TransposedBatch::from_f16(&queries[offset..sub_end], dim));
-        sub_offsets.push(offset);
-        offset = sub_end;
-    }
-
     // Reusable f32 buffer for base vector conversion
     let mut base_f32 = vec![0.0f32; dim];
+
+    let use_packed = metric == Metric::DotProduct || metric == Metric::Cosine;
+
+    let packed = if use_packed {
+        Some(PackedBatches::from_f16(queries, dim))
+    } else {
+        None
+    };
+    let mut packed_out = if use_packed {
+        let n = packed.as_ref().unwrap().n_batches();
+        vec![0.0f32; n * SIMD_BATCH_WIDTH]
+    } else {
+        Vec::new()
+    };
+
+    let mut sub_batches: Vec<TransposedBatch> = Vec::new();
+    let mut sub_offsets: Vec<usize> = Vec::new();
+    if !use_packed {
+        let mut offset = 0;
+        while offset < batch_size {
+            let sub_end = std::cmp::min(offset + SIMD_BATCH_WIDTH, batch_size);
+            sub_batches.push(TransposedBatch::from_f16(&queries[offset..sub_end], dim));
+            sub_offsets.push(offset);
+            offset = sub_end;
+        }
+    }
+    let dual_fn = simd_distance::select_dual_batched_fn_f32(metric);
     let mut dist_buf_16 = [0.0f32; SIMD_BATCH_WIDTH];
     let mut dist_buf_32 = [0.0f32; 32];
 
-    // Select dual kernel for paired sub-batch processing (2 FMA ports)
-    let dual_fn = simd_distance::select_dual_batched_fn_f32(metric);
+    let mut i = start;
+    while i < end {
+        let stride_end = std::cmp::min(i + stride, end);
+        for j in i..stride_end {
+            let base_f16 = base_reader.get_slice(j);
+            let idx = j as u32;
 
-    for i in start..end {
-        let base_f16 = base_reader.get_slice(i);
-        let idx = i as u32;
+            // Convert base vector f16→f32 ONCE via SIMD bulk conversion
+            simd_distance::convert_f16_to_f32_bulk(base_f16, &mut base_f32);
 
-        // Convert base vector f16→f32 ONCE via SIMD bulk conversion
-        simd_distance::convert_f16_to_f32_bulk(base_f16, &mut base_f32);
+            if let Some(ref pk) = packed {
+                for v in packed_out.iter_mut() { *v = 0.0; }
+                simd_distance::packed_neg_dot_f32(&base_f32, pk, &mut packed_out);
 
-        // Process sub-batches in pairs with dual kernel (2 FMA ports)
-        let mut si = 0;
-        if let Some(dfn) = dual_fn {
-            while si + 1 < sub_batches.len() {
-                dfn(&sub_batches[si], &sub_batches[si + 1], &base_f32, &mut dist_buf_32);
-                let off_a = sub_offsets[si];
-                for qi in 0..sub_batches[si].count() {
-                    let gqi = off_a + qi;
-                    let dist = dist_buf_32[qi];
-                    if dist < thresholds[gqi] {
-                        heaps[gqi].push(Neighbor { index: idx, distance: dist });
-                        if heaps[gqi].len() > k { heaps[gqi].pop(); }
-                        if heaps[gqi].len() == k { thresholds[gqi] = heaps[gqi].peek().unwrap().distance; }
+                let n = pk.n_batches();
+                for si in 0..n {
+                    let sub_offset = pk.offset(si);
+                    let count = pk.count(si);
+                    for qi in 0..count {
+                        let gqi = sub_offset + qi;
+                        let dist = packed_out[si * SIMD_BATCH_WIDTH + qi];
+                        if dist < thresholds[gqi] {
+                            heaps[gqi].push(Neighbor { index: idx, distance: dist });
+                            if heaps[gqi].len() > k { heaps[gqi].pop(); }
+                            if heaps[gqi].len() == k { thresholds[gqi] = heaps[gqi].peek().unwrap().distance; }
+                        }
                     }
                 }
-                let off_b = sub_offsets[si + 1];
-                for qi in 0..sub_batches[si + 1].count() {
-                    let gqi = off_b + qi;
-                    let dist = dist_buf_32[16 + qi];
-                    if dist < thresholds[gqi] {
-                        heaps[gqi].push(Neighbor { index: idx, distance: dist });
-                        if heaps[gqi].len() > k { heaps[gqi].pop(); }
-                        if heaps[gqi].len() == k { thresholds[gqi] = heaps[gqi].peek().unwrap().distance; }
+            } else {
+                let mut si = 0;
+                if let Some(dfn) = dual_fn {
+                    while si + 1 < sub_batches.len() {
+                        dfn(&sub_batches[si], &sub_batches[si + 1], &base_f32, &mut dist_buf_32);
+                        let off_a = sub_offsets[si];
+                        for qi in 0..sub_batches[si].count() {
+                            let gqi = off_a + qi;
+                            let dist = dist_buf_32[qi];
+                            if dist < thresholds[gqi] {
+                                heaps[gqi].push(Neighbor { index: idx, distance: dist });
+                                if heaps[gqi].len() > k { heaps[gqi].pop(); }
+                                if heaps[gqi].len() == k { thresholds[gqi] = heaps[gqi].peek().unwrap().distance; }
+                            }
+                        }
+                        let off_b = sub_offsets[si + 1];
+                        for qi in 0..sub_batches[si + 1].count() {
+                            let gqi = off_b + qi;
+                            let dist = dist_buf_32[16 + qi];
+                            if dist < thresholds[gqi] {
+                                heaps[gqi].push(Neighbor { index: idx, distance: dist });
+                                if heaps[gqi].len() > k { heaps[gqi].pop(); }
+                                if heaps[gqi].len() == k { thresholds[gqi] = heaps[gqi].peek().unwrap().distance; }
+                            }
+                        }
+                        si += 2;
                     }
                 }
-                si += 2;
-            }
-        }
-        // Handle leftover
-        while si < sub_batches.len() {
-            batched_fn(&sub_batches[si], &base_f32, &mut dist_buf_16);
-            let sub_offset = sub_offsets[si];
-            for qi in 0..sub_batches[si].count() {
-                let gqi = sub_offset + qi;
-                let dist = dist_buf_16[qi];
-                if dist < thresholds[gqi] {
-                    heaps[gqi].push(Neighbor { index: idx, distance: dist });
-                    if heaps[gqi].len() > k { heaps[gqi].pop(); }
-                    if heaps[gqi].len() == k { thresholds[gqi] = heaps[gqi].peek().unwrap().distance; }
+                while si < sub_batches.len() {
+                    batched_fn(&sub_batches[si], &base_f32, &mut dist_buf_16);
+                    let sub_offset = sub_offsets[si];
+                    for qi in 0..sub_batches[si].count() {
+                        let gqi = sub_offset + qi;
+                        let dist = dist_buf_16[qi];
+                        if dist < thresholds[gqi] {
+                            heaps[gqi].push(Neighbor { index: idx, distance: dist });
+                            if heaps[gqi].len() > k { heaps[gqi].pop(); }
+                            if heaps[gqi].len() == k { thresholds[gqi] = heaps[gqi].peek().unwrap().distance; }
+                        }
+                    }
+                    si += 1;
                 }
             }
-            si += 1;
         }
+        base_progress.fetch_add((stride_end - i) as u64, AtomicOrdering::Relaxed);
+        i = stride_end;
     }
 
     for (qi, heap) in heaps.into_iter().enumerate() {
@@ -611,11 +760,22 @@ fn compute_partition_f16(
     // chosen for DotProduct (normalized cosine), the batched kernel should
     // also be DotProduct (neg-dot, no norm division).
     let batched_fn = simd_distance::select_batched_fn_f32(metric);
+    let base_count = end - start;
+    let stride = (base_count + STRIDES_PER_THREAD - 1) / STRIDES_PER_THREAD;
+    let base_progress = Arc::new(AtomicU64::new(0));
     let mut results: Vec<Vec<Neighbor>> = (0..query_count).map(|_| Vec::new()).collect();
 
     if threads > 1 && query_count > 1 {
         let effective_threads = std::cmp::min(threads, query_count);
         let chunk_size = (query_count + effective_threads - 1) / effective_threads;
+        let num_batches: u64 = (0..effective_threads)
+            .map(|t| {
+                let clen = std::cmp::min(chunk_size, query_count.saturating_sub(t * chunk_size));
+                ((clen + QUERY_BATCH_SIZE - 1) / QUERY_BATCH_SIZE) as u64
+            })
+            .sum();
+        let total_base_scans = num_batches * (base_count as u64);
+        pb.set_position(0);
 
         let result_chunks: Vec<&mut [Vec<Neighbor>]> =
             results.chunks_mut(chunk_size).collect();
@@ -625,6 +785,7 @@ fn compute_partition_f16(
                 let chunk_start = ci * chunk_size;
                 let chunk_len = chunk.len();
                 let base_ref = Arc::clone(base_reader);
+                let bp = Arc::clone(&base_progress);
 
                 scope.spawn(move || {
                     let mut offset = 0;
@@ -639,29 +800,45 @@ fn compute_partition_f16(
                         find_top_k_batch_f16(
                             &queries, &base_ref, start, end, k, dist_fn,
                             batched_fn, metric, dim, &mut chunk[offset..batch_end],
+                            stride, &bp,
                         );
 
-                        pb.inc(batch_size as u64);
                         offset = batch_end;
                     }
                 });
             }
+
+            let bc = base_count as u64;
+            let nb = num_batches;
+            scope.spawn(move || {
+                loop {
+                    let scanned = base_progress.load(AtomicOrdering::Relaxed);
+                    pb.set_position(scanned / nb.max(1));
+                    if scanned >= total_base_scans {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                pb.set_position(bc);
+            });
         });
     } else {
+        let num_batches = ((query_count + QUERY_BATCH_SIZE - 1) / QUERY_BATCH_SIZE) as u64;
         let mut offset = 0;
         while offset < query_count {
             let batch_end = std::cmp::min(offset + QUERY_BATCH_SIZE, query_count);
-            let batch_size = batch_end - offset;
-            let queries: Vec<&[half::f16]> = (0..batch_size)
+            let queries: Vec<&[half::f16]> = (0..(batch_end - offset))
                 .map(|i| query_reader.get_slice(offset + i))
                 .collect();
             find_top_k_batch_f16(
                 &queries, base_reader, start, end, k, dist_fn,
                 batched_fn, metric, dim, &mut results[offset..batch_end],
+                stride, &base_progress,
             );
-            pb.inc(batch_size as u64);
+            pb.set_position(base_progress.load(AtomicOrdering::Relaxed) / num_batches.max(1));
             offset = batch_end;
         }
+        pb.set_position(base_count as u64);
     }
 
     results
@@ -684,6 +861,9 @@ fn compute_partition_f64(
     threads: usize,
     pb: &ProgressHandle,
 ) -> Vec<Vec<Neighbor>> {
+    let base_count = end - start;
+    let stride = (base_count + STRIDES_PER_THREAD - 1) / STRIDES_PER_THREAD;
+    let base_progress = Arc::new(AtomicU64::new(0));
     let mut results: Vec<Vec<Neighbor>> = (0..query_count).map(|_| Vec::new()).collect();
 
     if threads > 1 && query_count > 1 {
@@ -691,6 +871,14 @@ fn compute_partition_f64(
         // More threads = more redundant base-vector memory reads.
         let effective_threads = std::cmp::min(threads, query_count);
         let chunk_size = (query_count + effective_threads - 1) / effective_threads;
+        let num_batches: u64 = (0..effective_threads)
+            .map(|t| {
+                let clen = std::cmp::min(chunk_size, query_count.saturating_sub(t * chunk_size));
+                ((clen + QUERY_BATCH_SIZE - 1) / QUERY_BATCH_SIZE) as u64
+            })
+            .sum();
+        let total_base_scans = num_batches * (base_count as u64);
+        pb.set_position(0);
 
         let result_chunks: Vec<&mut [Vec<Neighbor>]> =
             results.chunks_mut(chunk_size).collect();
@@ -700,6 +888,7 @@ fn compute_partition_f64(
                 let chunk_start = ci * chunk_size;
                 let chunk_len = chunk.len();
                 let base_ref = Arc::clone(base_reader);
+                let bp = Arc::clone(&base_progress);
 
                 scope.spawn(move || {
                     let mut offset = 0;
@@ -714,32 +903,48 @@ fn compute_partition_f64(
                         find_top_k_batch_pairwise_f64(
                             &queries, &base_ref, start, end, k, dist_fn,
                             &mut chunk[offset..batch_end],
+                            stride, &bp,
                         );
 
-                        pb.inc(batch_size as u64);
                         offset = batch_end;
                     }
                 });
             }
+
+            let bc = base_count as u64;
+            let nb = num_batches;
+            scope.spawn(move || {
+                loop {
+                    let scanned = base_progress.load(AtomicOrdering::Relaxed);
+                    pb.set_position(scanned / nb.max(1));
+                    if scanned >= total_base_scans {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                pb.set_position(bc);
+            });
         });
     } else {
+        let num_batches = ((query_count + QUERY_BATCH_SIZE - 1) / QUERY_BATCH_SIZE) as u64;
         let mut offset = 0;
         while offset < query_count {
             let batch_end = std::cmp::min(offset + QUERY_BATCH_SIZE, query_count);
-            let batch_size = batch_end - offset;
 
-            let queries: Vec<&[f64]> = (0..batch_size)
+            let queries: Vec<&[f64]> = (0..(batch_end - offset))
                 .map(|i| query_reader.get_slice(offset + i))
                 .collect();
 
             find_top_k_batch_pairwise_f64(
                 &queries, base_reader, start, end, k, dist_fn,
                 &mut results[offset..batch_end],
+                stride, &base_progress,
             );
 
-            pb.inc(batch_size as u64);
+            pb.set_position(base_progress.load(AtomicOrdering::Relaxed) / num_batches.max(1));
             offset = batch_end;
         }
+        pb.set_position(base_count as u64);
     }
 
     results
@@ -755,6 +960,8 @@ fn find_top_k_batch_pairwise_f64(
     k: usize,
     dist_fn: fn(&[f64], &[f64]) -> f32,
     results: &mut [Vec<Neighbor>],
+    stride: usize,
+    base_progress: &AtomicU64,
 ) {
     let batch_size = queries.len();
     let mut heaps: Vec<BinaryHeap<Neighbor>> = (0..batch_size)
@@ -762,23 +969,29 @@ fn find_top_k_batch_pairwise_f64(
         .collect();
     let mut thresholds = vec![f32::INFINITY; batch_size];
 
-    for i in start..end {
-        let base_vec = base_reader.get_slice(i);
-        let idx = i as u32;
+    let mut i = start;
+    while i < end {
+        let stride_end = std::cmp::min(i + stride, end);
+        for j in i..stride_end {
+            let base_vec = base_reader.get_slice(j);
+            let idx = j as u32;
 
-        for qi in 0..batch_size {
-            let dist = dist_fn(queries[qi], base_vec);
+            for qi in 0..batch_size {
+                let dist = dist_fn(queries[qi], base_vec);
 
-            if dist < thresholds[qi] {
-                heaps[qi].push(Neighbor { index: idx, distance: dist });
-                if heaps[qi].len() > k {
-                    heaps[qi].pop();
-                }
-                if heaps[qi].len() == k {
-                    thresholds[qi] = heaps[qi].peek().unwrap().distance;
+                if dist < thresholds[qi] {
+                    heaps[qi].push(Neighbor { index: idx, distance: dist });
+                    if heaps[qi].len() > k {
+                        heaps[qi].pop();
+                    }
+                    if heaps[qi].len() == k {
+                        thresholds[qi] = heaps[qi].peek().unwrap().distance;
+                    }
                 }
             }
         }
+        base_progress.fetch_add((stride_end - i) as u64, AtomicOrdering::Relaxed);
+        i = stride_end;
     }
 
     for (qi, heap) in heaps.into_iter().enumerate() {
@@ -1080,9 +1293,15 @@ compare an ANN index's approximate results against this exact ground truth.
                 )
             }
         };
+        // Default to logical CPUs (including hyperthreads) for KNN compute.
+        // Hyperthreads help fill pipeline bubbles during branch-heavy heap
+        // operations and memory stalls, giving ~1.3-1.5× over physical cores.
+        let logical_cpus = std::thread::available_parallelism()
+            .map(|n| n.get() as u64)
+            .unwrap_or(ctx.threads as u64);
         let threads: usize = match options.parse_opt::<usize>("threads") {
             Ok(Some(v)) => v,
-            Ok(None) => ctx.governor.current_or("threads", ctx.threads as u64) as usize,
+            Ok(None) => ctx.governor.current_or("threads", logical_cpus) as usize,
             Err(e) => return error_result(e, start),
         };
 
@@ -1393,6 +1612,7 @@ fn execute_f32(
         base_path,
         query_path,
         compress_cache,
+        "f32",
         ctx,
         start,
         compute_partition,
@@ -1505,6 +1725,7 @@ fn execute_f16(
         base_path,
         query_path,
         compress_cache,
+        "f16",
         ctx,
         start,
         compute_partition_f16,
@@ -1598,6 +1819,7 @@ fn execute_f64(
         base_path,
         query_path,
         compress_cache,
+        "f64",
         ctx,
         start,
         compute_partition_f64,
@@ -1627,6 +1849,7 @@ fn execute_with_partitions<T>(
     base_path: &Path,
     query_path: &Path,
     compress_cache: bool,
+    elem_label: &str,
     ctx: &mut StreamContext,
     start: Instant,
     compute_fn: fn(&MmapVectorReader<T>, usize, &Arc<MmapVectorReader<T>>, usize, usize, usize, fn(&[T], &[T]) -> f32, Metric, usize, usize, &ProgressHandle) -> Vec<Vec<Neighbor>>,
@@ -1634,16 +1857,11 @@ fn execute_with_partitions<T>(
 where
     T: Send + Sync + 'static,
 {
-    // Segment size = cache artifact granularity (default 1M from governor).
-    // This determines how cache files are partitioned for cross-profile reuse.
-    // Profile sizes (10M, 20M, etc.) should be multiples of segment_size.
-    let segment_size = partition_size.max(1);
-
-    // Pass size = how many vectors to process per memory pass.
-    // Auto-sized to ~50% of system RAM. Multiple segments are computed
-    // per pass to amortize page-in overhead, but each segment's results
-    // are written to separate cache files for reuse.
-    let pass_size = {
+    // Auto-size partition when partition_size == 0 (no governor segmentsize).
+    // Target: ~50% of system RAM. This determines how large each cached
+    // partition file is. Profile-aware reuse: the find_largest_cached logic
+    // automatically reuses partitions from smaller profiles.
+    let partition_size = if partition_size == 0 {
         let total_ram: u64 = std::fs::read_to_string("/proc/meminfo").ok()
             .and_then(|s| {
                 s.lines()
@@ -1655,64 +1873,19 @@ where
             .unwrap_or(8 * 1024 * 1024 * 1024);
         let half_ram = (total_ram / 2) as usize;
         let entry_size = base_reader.entry_size().max(1);
-        let auto = (half_ram / entry_size).max(segment_size);
-        // Round down to segment boundary
-        let auto = (auto / segment_size) * segment_size;
-        auto.max(segment_size)
+        let auto = (half_ram / entry_size).max(1_000_000);
+        ctx.ui.log(&format!(
+            "  auto partition size: {} vectors ({:.1} GiB RAM budget)",
+            format_count(auto),
+            half_ram as f64 / (1024.0 * 1024.0 * 1024.0),
+        ));
+        auto
+    } else {
+        partition_size
     };
-    let segments_per_pass = pass_size / segment_size;
 
-    ctx.ui.log(&format!(
-        "  segment size: {} vectors, pass size: {} vectors ({} segments/pass, {:.1} GiB/pass)",
-        format_count(segment_size), format_count(pass_size), segments_per_pass,
-        (pass_size as u64 * base_reader.entry_size() as u64) as f64 / (1024.0 * 1024.0 * 1024.0),
-    ));
-
-    // For cache path generation and partitioning, we use segment_size
-    // as the partition unit. The pass_size controls prefetch grouping.
-    let partition_size = segment_size;
-
-    // Single-partition fast path
-    if base_count <= partition_size {
-        let pb = make_query_progress_bar(query_count as u64, &ctx.ui);
-        let results = compute_fn(query_reader, query_count, base_reader, base_offset, base_offset + base_count, k, dist_fn, metric, dim, threads, &pb);
-        pb.finish();
-
-        ctx.ui.log("  writing results...");
-        if let Err(e) = write_indices(indices_path, &results, k, base_offset) {
-            return error_result(e, start);
-        }
-
-        let mut produced = vec![indices_path.to_path_buf()];
-
-        if let Some(dist_path) = distances_path {
-            if let Err(e) = write_distances(dist_path, &results, k) {
-                return error_result(e, start);
-            }
-            produced.push(dist_path.to_path_buf());
-        }
-
-        // Write verified counts for the bound checker
-        for xvec_path in &produced {
-            let var_name = format!("verified_count:{}",
-                xvec_path.file_name().and_then(|n| n.to_str()).unwrap_or("output"));
-            let _ = crate::pipeline::variables::set_and_save(
-                &ctx.workspace, &var_name, &query_count.to_string());
-            ctx.defaults.insert(var_name, query_count.to_string());
-        }
-
-        return CommandResult {
-            status: Status::Ok,
-            message: format!(
-                "computed KNN: {} queries, k={}, metric={:?}, {} base vectors",
-                query_count, k, metric, base_count
-            ),
-            produced,
-            elapsed: start.elapsed(),
-        };
-    }
-
-    // Partitioned path
+    // Always use the partitioned path so that cache from smaller profiles
+    // is discovered and reused even when base_count fits in a single partition.
 
     // Memory-aware partition sizing (REQ-RM-09).
     //
@@ -1799,11 +1972,16 @@ where
     // Scan for existing super-partitions (merged results from smaller profiles)
     // that cover a prefix of the range. Use the largest available cached partition
     // starting at part_start before falling back to partition_size chunks.
+    // Minimum step size for super-partition search. We check at multiples
+    // of this to avoid scanning every possible range endpoint. Smaller
+    // profiles typically align to common sizes (1M, 10M, etc.) and the
+    // merged super-partition cache uses the exact profile range.
+    let cache_search_step = partition_size.min(1_000_000).max(1);
     let find_largest_cached = |start: usize, max_end: usize| -> Option<usize> {
         // Scan candidate endpoints: try the full remaining range first, then
-        // halve down to find the largest cached partition.
+        // step down to find the largest cached partition from any profile.
         let mut try_end = max_end;
-        while try_end > start + partition_size {
+        while try_end > start {
             let n_path = build_cache_path(
                 &ctx.cache, &cache_prefix, start, try_end, k, metric, "neighbors", "ivec",
             );
@@ -1820,8 +1998,8 @@ where
             if exists {
                 return Some(try_end);
             }
-            // Try the next smaller multiple of partition_size
-            try_end = ((try_end - start - 1) / partition_size) * partition_size + start;
+            // Try the next smaller multiple of cache_search_step
+            try_end = ((try_end - start - 1) / cache_search_step) * cache_search_step + start;
             if try_end <= start { break; }
         }
         None
@@ -1831,12 +2009,18 @@ where
         // Check for a super-partition first
         let (part_end, neighbors_path, dist_cache_path, cached) =
             if let Some(super_end) = find_largest_cached(part_start, base_end) {
-                ctx.ui.log(&format!(
-                    "  reusing cached super-partition [{}, {}) from smaller profile",
-                    format_count(part_start), format_count(super_end),
-                ));
                 let n = build_cache_path(&ctx.cache, &cache_prefix, part_start, super_end, k, metric, "neighbors", "ivec");
                 let d = build_cache_path(&ctx.cache, &cache_prefix, part_start, super_end, k, metric, "distances", "fvec");
+                ctx.ui.log(&format!(
+                    "  precomputed segment [{}, {}) — {}",
+                    format_count(part_start), format_count(super_end),
+                    n.file_name().unwrap_or_default().to_string_lossy(),
+                ));
+                ctx.ui.log(&format!(
+                    "  precomputed segment [{}, {}) — {}",
+                    format_count(part_start), format_count(super_end),
+                    d.file_name().unwrap_or_default().to_string_lossy(),
+                ));
                 (super_end, n, d, true)
             } else {
                 let pe = std::cmp::min(part_start + partition_size, base_end);
@@ -1847,6 +2031,18 @@ where
                 } else {
                     validate_cache_file(&n, query_count, k, 4) && validate_cache_file(&d, query_count, k, 4)
                 };
+                if c {
+                    ctx.ui.log(&format!(
+                        "  precomputed segment [{}, {}) — {}",
+                        format_count(part_start), format_count(pe),
+                        n.file_name().unwrap_or_default().to_string_lossy(),
+                    ));
+                    ctx.ui.log(&format!(
+                        "  precomputed segment [{}, {}) — {}",
+                        format_count(part_start), format_count(pe),
+                        d.file_name().unwrap_or_default().to_string_lossy(),
+                    ));
+                }
                 (pe, n, d, c)
             };
 
@@ -1867,7 +2063,7 @@ where
     let to_compute = num_partitions - cached_count;
 
     ctx.ui.log(&format!(
-        "  {} partitions of {} base vectors ({} cached, {} to compute)",
+        "  {} partitions (segment_size={}, {} cached, {} to compute)",
         num_partitions, format_count(partition_size), cached_count, to_compute
     ));
 
@@ -1908,22 +2104,27 @@ where
     let total_prefetch_bytes: u64 = uncached_indices.iter()
         .map(|&i| ((partitions[i].end - partitions[i].start) as u64) * (base_reader.entry_size() as u64))
         .sum();
+
+    // Prefetch warms base-vector pages ahead of compute. For multi-partition
+    // runs, lookahead overlaps I/O with compute. For single-partition runs,
+    // a single sequential pre-touch avoids scattered page faults across all
+    // compute threads.
     ctx.ui.log(&format!(
-        "  pipeline: {} uncached partition{} ({} to page in)",
+        "  pipeline: {} uncached partition{} ({} base vectors to warm)",
         uncached_indices.len(),
         if uncached_indices.len() == 1 { "" } else { "s" },
         format_bytes(total_prefetch_bytes),
     ));
 
     // Shared counter for the prefetch progress bar
-    let prefetch_bytes_paged = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let prefetch_bytes_paged = Arc::new(AtomicU64::new(0));
 
     // Prefetch progress bar — updated by a background tick thread
-    let prefetch_pb = ctx.ui.bar_with_unit(total_prefetch_bytes, "paging in", "bytes");
+    let prefetch_pb = ctx.ui.bar_with_unit(total_prefetch_bytes, "warming page cache", "bytes");
     let prefetch_bytes_for_tick = Arc::clone(&prefetch_bytes_paged);
     let prefetch_tick_handle = std::thread::spawn(move || {
         loop {
-            let paged = prefetch_bytes_for_tick.load(std::sync::atomic::Ordering::Relaxed);
+            let paged = prefetch_bytes_for_tick.load(AtomicOrdering::Relaxed);
             prefetch_pb.set_position(paged);
             if paged >= total_prefetch_bytes {
                 break;
@@ -1953,9 +2154,8 @@ where
         None
     };
 
-    // Seed the load queue: prefetch by pass_size (multiple segments at once).
-    // This amortizes I/O overhead — one large sequential prefetch instead
-    // of many small ones.
+    // Seed the load queue: prefetch partitions so their pages are warm
+    // by the time we compute them.
     let mut next_load_slot = 0usize;
     while next_load_slot < uncached_indices.len() && load_queue.len() < LOAD_DEPTH {
         // Prefetch a contiguous run of up to segments_per_pass segments
@@ -1963,7 +2163,7 @@ where
         let prefetch_start = partitions[first_idx].start;
         let mut prefetch_end = partitions[first_idx].end;
         let mut slots_covered = 1;
-        while slots_covered < segments_per_pass
+        while false // one partition per prefetch — partitions are large
             && next_load_slot + slots_covered < uncached_indices.len()
         {
             let next_idx = uncached_indices[next_load_slot + slots_covered];
@@ -2034,13 +2234,14 @@ where
         // in the background. Kernel readahead for future partitions
         // runs asynchronously (madvise). No blocking waits needed.
         let part_start_time = Instant::now();
+        let part_base_count = (part.end - part.start) as u64;
         let pb = ctx.ui.bar_with_unit(
-            query_count as u64,
-            &format!("KNN {:?} [{},{}) [{}/{}]",
-                metric,
-                format_count(part.start), format_count(part.end),
-                computed, to_compute),
-            "queries",
+            part_base_count,
+            &format!("KNN {:?} {}x{} {} base x {} queries [{},{})",
+                metric, dim, elem_label,
+                format_count(part_size), format_count(query_count),
+                format_count(part.start), format_count(part.end)),
+            "vectors",
         );
         let results = compute_fn(
             query_reader, query_count, base_reader, part.start, part.end, k, dist_fn, metric, dim, threads, &pb,
@@ -2156,7 +2357,7 @@ where
             let prefetch_start = partitions[first_idx].start;
             let mut prefetch_end = partitions[first_idx].end;
             let mut slots_covered = 1;
-            while slots_covered < segments_per_pass
+            while false // one partition per prefetch — partitions are large
                 && next_load_slot + slots_covered < uncached_indices.len()
             {
                 let next_idx = uncached_indices[next_load_slot + slots_covered];
@@ -2321,18 +2522,10 @@ fn write_distances(path: &Path, results: &[Vec<Neighbor>], k: usize) -> Result<(
 
     let dim = k as i32;
     for row in results {
-        writer
-            .write_all(&dim.to_le_bytes())
-            .map_err(|e| e.to_string())?;
+        writer.write_all(&dim.to_le_bytes()).map_err(|e| e.to_string())?;
         for i in 0..k {
-            let dist: f32 = if i < row.len() {
-                row[i].distance
-            } else {
-                f32::INFINITY
-            };
-            writer
-                .write_all(&dist.to_le_bytes())
-                .map_err(|e| e.to_string())?;
+            let dist: f32 = if i < row.len() { row[i].distance } else { f32::INFINITY };
+            writer.write_all(&dist.to_le_bytes()).map_err(|e| e.to_string())?;
         }
     }
     writer.finish().map_err(|e| e.to_string())?;
@@ -2371,11 +2564,7 @@ fn serialize_distances(results: &[Vec<Neighbor>], k: usize) -> Result<Vec<u8>, S
     for row in results {
         buf.extend_from_slice(&dim.to_le_bytes());
         for i in 0..k {
-            let dist: f32 = if i < row.len() {
-                row[i].distance
-            } else {
-                f32::INFINITY
-            };
+            let dist: f32 = if i < row.len() { row[i].distance } else { f32::INFINITY };
             buf.extend_from_slice(&dist.to_le_bytes());
         }
     }

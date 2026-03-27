@@ -445,25 +445,25 @@ This invariant is maintained through three mechanisms:
 Because the pipeline supports arbitrary windowed subsets and profile
 expansion is dynamic, sized profiles can be declared at bootstrap time —
 before the pipeline has run and before the actual base vector count is
-known. The `sized:` key in dataset.yaml accepts range expressions that
-are resolved during profile expansion. When the upper bound of a sized
-range uses a variable reference (e.g., `${base_count}`), the profiles
-are materialized at run time with the actual count.
+known. The `sized:` key in dataset.yaml accepts range expressions with
+an implicit upper bound: when the `..end` is omitted from a geometric
+spec, the upper bound is implicitly the default profile's `base_count`.
 
 This eliminates the need for the two-phase workflow (run pipeline →
 stratify → run again). Instead:
 
 ```
-veks bootstrap --auto --base-fraction '5%' --sized 'mul:1m..${base_count}/2'
+veks bootstrap --auto --base-fraction '5%' --sized 'mul:1m/2'
 veks run
 ```
 
-The bootstrap emits the `sized:` spec into dataset.yaml. On the first
-`veks run`, core stages execute and produce `base_count` in
-`variables.yaml`. Profile expansion then resolves `${base_count}` and
-generates the sized profiles. Per-profile steps (KNN, verify, etc.)
-execute in the same run, smallest to largest. No second invocation is
-needed.
+The spec `mul:1m/2` generates profiles `1m, 2m, 4m, 8m, ...` up to the
+default profile's base count. Profile expansion is a single pass at YAML
+load time — no variable interpolation or deferred expansion is needed.
+Profiles whose `base_count` exceeds the default profile's base count are
+filtered out during per-profile step expansion. Per-profile steps (KNN,
+verify, etc.) execute in the same run, smallest to largest. No second
+invocation is needed.
 
 When `--sized` is omitted, the standard spec is auto-generated from the
 detected data scale. When `--auto` is used, a reasonable default set of

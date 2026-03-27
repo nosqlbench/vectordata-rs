@@ -206,38 +206,40 @@ pub fn expand_per_profile_steps(
             .collect();
         if phase_templates.is_empty() { continue; }
 
-        // Chain profiles within this phase
-        let mut prev_last_id: Option<String> = None;
+        // Chain profiles within phase 0 to prevent I/O thrashing between
+        // compute-heavy steps. Verify phases (phase > 0) leave profiles
+        // independent so they can run concurrently.
+        if phase == 0 {
+            let mut prev_last_id: Option<String> = None;
 
-        for (profile_name, _) in &all_profiles {
-            let suffix = if *profile_name == "default" { String::new() }
-                else { format!("-{}", profile_name) };
+            for (profile_name, _) in &all_profiles {
+                let suffix = if *profile_name == "default" { String::new() }
+                    else { format!("-{}", profile_name) };
 
-            // First step of this profile in this phase
-            let first_id = phase_templates.first().map(|t| {
-                let tid = t.effective_id();
-                if suffix.is_empty() { tid } else { format!("{}{}", tid, suffix) }
-            });
+                let first_id = phase_templates.first().map(|t| {
+                    let tid = t.effective_id();
+                    if suffix.is_empty() { tid } else { format!("{}{}", tid, suffix) }
+                });
 
-            // Last step of this profile in this phase
-            let last_id = phase_templates.last().map(|t| {
-                let tid = t.effective_id();
-                if suffix.is_empty() { tid } else { format!("{}{}", tid, suffix) }
-            });
+                let last_id = phase_templates.last().map(|t| {
+                    let tid = t.effective_id();
+                    if suffix.is_empty() { tid } else { format!("{}{}", tid, suffix) }
+                });
 
-            // Add dependency on previous profile's last step in this phase
-            if let (Some(prev), Some(first)) = (&prev_last_id, &first_id) {
-                for step in result.iter_mut() {
-                    if step.effective_id() == *first {
-                        if !step.after.contains(prev) {
-                            step.after.push(prev.clone());
+                // Add dependency on previous profile's last step in this phase
+                if let (Some(prev), Some(first)) = (&prev_last_id, &first_id) {
+                    for step in result.iter_mut() {
+                        if step.effective_id() == *first {
+                            if !step.after.contains(prev) {
+                                step.after.push(prev.clone());
+                            }
+                            break;
                         }
-                        break;
                     }
                 }
-            }
 
-            prev_last_id = last_id;
+                prev_last_id = last_id;
+            }
         }
 
         // If this is phase > 0, add dependency on the last step of the
@@ -322,6 +324,7 @@ mod tests {
             after: vec![],
             profiles: vec![],
             per_profile: false,
+            phase: 0,
             on_partial: crate::dataset::pipeline::OnPartial::default(),
             options: Default::default(),
         };
@@ -338,6 +341,7 @@ mod tests {
             after: vec![],
             profiles: vec!["10m".into()],
             per_profile: false,
+            phase: 0,
             on_partial: crate::dataset::pipeline::OnPartial::default(),
             options: Default::default(),
         };

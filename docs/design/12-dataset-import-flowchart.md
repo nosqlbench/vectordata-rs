@@ -176,13 +176,15 @@ modification of them. See [SRD §3.13](03-pipeline-engine.md#313-stratification-
 for the design invariant that guarantees this.
 
 **Early stratification** (at bootstrap): The `--sized` flag or wizard
-prompt embeds a `sized:` spec directly into `dataset.yaml`. Range
-expressions may reference `${base_count}`, which is resolved at run time
-after core stages populate `variables.yaml`. This eliminates the
-two-phase workflow:
+prompt embeds a `sized:` spec directly into `dataset.yaml`. Sized specs
+use an implicit upper bound: when the `..end` is omitted from a
+geometric spec (e.g., `mul:1m/2`), profiles are generated up to the
+default profile's base count. Profile expansion is a single pass at
+YAML load time — no variable interpolation or deferred expansion is
+needed. This eliminates the two-phase workflow:
 
 ```sh
-veks bootstrap --auto --sized 'mul:1m..${base_count}/2'
+veks bootstrap --auto --sized 'mul:1m/2'
 veks run    # core stages + all per-profile stages in one pass
 ```
 

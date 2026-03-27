@@ -17,6 +17,10 @@
 //! 5. Produce a consolidated report
 //!
 //! This is O(base_count_max) I/O instead of O(base_count_max × num_profiles).
+//!
+//! The scan is multi-threaded: base vectors between profile boundaries are
+//! partitioned across threads, each maintaining its own per-query heaps.
+//! At each boundary, partial heaps are merged before verification.
 
 use std::collections::BinaryHeap;
 use std::path::{Path, PathBuf};
@@ -46,7 +50,7 @@ fn resolve_path(value: &str, workspace: &Path) -> PathBuf {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// verify knn-consolidated
+// verify knn-consolidated (multi-threaded)
 // ═══════════════════════════════════════════════════════════════════════════
 
 pub struct VerifyKnnConsolidatedOp;
@@ -62,11 +66,11 @@ impl CommandOp for VerifyKnnConsolidatedOp {
 
     fn command_doc(&self) -> CommandDoc {
         CommandDoc {
-            summary: "Single-pass KNN verification across all profiles".into(),
-            body: "Scans base vectors once, verifying KNN ground truth for all \
-                   sized profiles incrementally. At each profile's base_count \
-                   boundary, the accumulated brute-force results are compared \
-                   against that profile's GT indices.".into(),
+            summary: "Multi-threaded single-pass KNN verification across all profiles".into(),
+            body: "Scans base vectors once with multiple threads, verifying KNN ground \
+                   truth for all sized profiles incrementally. At each profile's base_count \
+                   boundary, per-thread heaps are merged and compared against that profile's \
+                   GT indices.".into(),
         }
     }
 
@@ -78,6 +82,7 @@ impl CommandOp for VerifyKnnConsolidatedOp {
             OptionDesc { name: "normalized".into(), type_name: "bool".into(), required: false, default: Some("false".into()), description: "Vectors are L2-normalized".into(), role: OptionRole::Config },
             OptionDesc { name: "sample".into(), type_name: "int".into(), required: false, default: Some("100".into()), description: "Number of queries to sample".into(), role: OptionRole::Config },
             OptionDesc { name: "seed".into(), type_name: "int".into(), required: false, default: Some("42".into()), description: "Random seed for sampling".into(), role: OptionRole::Config },
+            OptionDesc { name: "threads".into(), type_name: "int".into(), required: false, default: Some("0".into()), description: "Thread count (0 = auto)".into(), role: OptionRole::Config },
             OptionDesc { name: "output".into(), type_name: "Path".into(), required: true, default: None, description: "Output JSON report".into(), role: OptionRole::Output },
         ]
     }
@@ -113,6 +118,10 @@ impl CommandOp for VerifyKnnConsolidatedOp {
         let seed: u64 = match options.parse_or("seed", 42u64) {
             Ok(v) => v, Err(e) => return error_result(e, start),
         };
+        let threads: usize = match options.parse_opt::<usize>("threads") {
+            Ok(Some(v)) if v > 0 => v,
+            _ => crate::pipeline::physical_core_count(),
+        };
 
         let base_path = resolve_path(base_str, &ctx.workspace);
         let query_path = resolve_path(query_str, &ctx.workspace);
@@ -126,9 +135,9 @@ impl CommandOp for VerifyKnnConsolidatedOp {
         };
 
         // Collect profiles sorted by base_count ascending
-        let mut profiles: Vec<(String, u64, PathBuf, PathBuf)> = Vec::new(); // (name, base_count, indices_path, distances_path)
+        let mut profiles: Vec<(String, u64, PathBuf, PathBuf)> = Vec::new();
         for (name, profile) in &config.profiles.profiles {
-            let bc = profile.base_count.unwrap_or(u64::MAX); // default profile = full dataset
+            let bc = profile.base_count.unwrap_or(u64::MAX);
             let indices_path = ctx.workspace.join(format!("profiles/{}/neighbor_indices.ivec", name));
             let distances_path = ctx.workspace.join(format!("profiles/{}/neighbor_distances.fvec", name));
             if indices_path.exists() {
@@ -142,21 +151,14 @@ impl CommandOp for VerifyKnnConsolidatedOp {
         }
 
         ctx.ui.log(&format!(
-            "verify-knn-consolidated: {} profiles, {} sample queries, metric={:?}",
-            profiles.len(), sample_count, kernel_metric,
+            "verify-knn-consolidated: {} profiles, {} sample queries, metric={:?}, threads={}",
+            profiles.len(), sample_count, kernel_metric, threads,
         ));
-        for (name, bc, _, _) in &profiles {
-            let bc_str = if *bc == u64::MAX { "full".to_string() } else { format!("{}", bc) };
-            ctx.ui.log(&format!("  profile '{}': base_count={}", name, bc_str));
-        }
 
         // Load query vectors
         let query_reader = match MmapVectorReader::<half::f16>::open_mvec(&query_path) {
             Ok(r) => r,
-            Err(_) => {
-                // Try f32
-                return error_result("consolidated verify currently requires mvec queries — extend for fvec".to_string(), start);
-            }
+            Err(_) => return error_result("consolidated verify currently requires mvec queries", start),
         };
         let query_count = VectorReader::<half::f16>::count(&query_reader);
 
@@ -208,127 +210,326 @@ impl CommandOp for VerifyKnnConsolidatedOp {
         // Open base vectors
         let base_reader = match MmapVectorReader::<half::f16>::open_mvec(&base_path) {
             Ok(r) => Arc::new(r),
-            Err(_) => return error_result("consolidated verify currently requires mvec base — extend for fvec".to_string(), start),
+            Err(_) => return error_result("consolidated verify currently requires mvec base", start),
         };
         let base_count = VectorReader::<half::f16>::count(&*base_reader);
         let dim = VectorReader::<half::f16>::dim(&*base_reader);
 
-        // Select batched + dual kernels for maximum throughput
-        let batched_fn = simd_distance::select_batched_fn_f32(kernel_metric);
-        let dual_fn = simd_distance::select_dual_batched_fn_f32(kernel_metric);
-
-        // Initialize per-sample heaps
-        let mut heaps: Vec<BinaryHeap<Neighbor>> = (0..num_samples)
-            .map(|_| BinaryHeap::with_capacity(k + 1))
-            .collect();
-        let mut thresholds = vec![f32::INFINITY; num_samples];
-
-        // Pre-transpose sample queries into SIMD sub-batches (same as compute-knn)
-        use simd_distance::{SIMD_BATCH_WIDTH, TransposedBatch};
+        // Pack sample queries for cache-friendly SIMD
+        use simd_distance::{SIMD_BATCH_WIDTH, PackedBatches};
         let sample_queries_f16: Vec<&[half::f16]> = sample_indices.iter()
             .map(|&qi| query_reader.get_slice(qi))
             .collect();
-        let mut sub_batches: Vec<TransposedBatch> = Vec::new();
-        let mut sub_offsets: Vec<usize> = Vec::new();
-        {
+
+        let use_packed = kernel_metric == Metric::DotProduct || kernel_metric == Metric::Cosine;
+        let packed = if use_packed {
+            Some(Arc::new(PackedBatches::from_f16(&sample_queries_f16, dim)))
+        } else {
+            None
+        };
+
+        // Legacy path fallback
+        let sub_batches: Arc<Vec<simd_distance::TransposedBatch>> = if !use_packed {
+            let mut sbs = Vec::new();
             let mut off = 0;
             while off < num_samples {
                 let end = std::cmp::min(off + SIMD_BATCH_WIDTH, num_samples);
-                sub_batches.push(TransposedBatch::from_f16(&sample_queries_f16[off..end], dim));
-                sub_offsets.push(off);
+                sbs.push(simd_distance::TransposedBatch::from_f16(&sample_queries_f16[off..end], dim));
                 off = end;
             }
+            Arc::new(sbs)
+        } else {
+            Arc::new(Vec::new())
+        };
+
+        let dual_fn = simd_distance::select_dual_batched_fn_f32(kernel_metric);
+        let batched_fn = simd_distance::select_batched_fn_f32(kernel_metric);
+
+        // Compute profile boundaries (sorted ascending)
+        let mut boundaries: Vec<usize> = profiles.iter()
+            .map(|(_, bc, _, _)| if *bc == u64::MAX { base_count } else { *bc as usize })
+            .collect();
+        // Ensure the last boundary covers all base vectors
+        if boundaries.last().map_or(true, |&b| b < base_count) {
+            boundaries.push(base_count);
         }
 
         ctx.ui.log(&format!(
-            "  scanning {} base vectors with {} sub-batches ({} sample queries)",
-            base_count, sub_batches.len(), num_samples,
+            "  scanning {} base vectors ({} threads, {} sub-batches, {})",
+            base_count, threads, if use_packed { packed.as_ref().unwrap().n_batches() } else { sub_batches.len() },
+            if use_packed { "packed" } else { "dual-pair" },
         ));
 
-        // Incremental scan with batched SIMD
+        // Initialize combined heaps
+        let mut combined_heaps: Vec<BinaryHeap<Neighbor>> = (0..num_samples)
+            .map(|_| BinaryHeap::with_capacity(k + 1))
+            .collect();
+        let mut combined_thresholds = vec![f32::INFINITY; num_samples];
+
         let pb = ctx.ui.bar_with_unit(base_count as u64, "verifying", "vectors");
+        let profile_pb = ctx.ui.bar_with_unit(profiles.len() as u64, "profiles verified", "profiles");
         let mut next_profile_idx = 0;
-        let mut results: Vec<(String, usize, usize, usize)> = Vec::new();
-        let mut base_f32 = vec![0.0f32; dim];
-        let mut dist_buf_16 = [0.0f32; SIMD_BATCH_WIDTH];
-        let mut dist_buf_32 = [0.0f32; 32];
+        let mut results: Vec<(String, usize, usize)> = Vec::new();
+        let mut scan_start = 0usize;
 
-        for bi in 0..base_count {
-            let base_f16 = base_reader.get_slice(bi);
-            simd_distance::convert_f16_to_f32_bulk(base_f16, &mut base_f32);
-            let idx = bi as u32;
+        // Process segments between profile boundaries
+        for &boundary in &boundaries {
+            let segment_end = boundary.min(base_count);
+            if segment_end <= scan_start {
+                // Check boundary for verification even with empty segment
+                while next_profile_idx < profiles.len() {
+                    let bc = if profiles[next_profile_idx].1 == u64::MAX { base_count } else { profiles[next_profile_idx].1 as usize };
+                    if scan_start >= bc {
+                        let gt = &profile_gts[next_profile_idx];
+                        let (pass, fail) = verify_heaps_against_gt(&combined_heaps, gt, k, &sample_indices, &ctx.ui);
+                        let total = pass + fail;
+                        let recall = if total > 0 { pass as f64 / total as f64 } else { 0.0 };
+                        ctx.ui.log(&format!(
+                            "  profile '{}' (base_count={}): {}/{} pass, {} fail, recall@{}={:.4}",
+                            profiles[next_profile_idx].0, bc, pass, total, fail, k, recall,
+                        ));
+                        results.push((profiles[next_profile_idx].0.clone(), pass, fail));
+                        next_profile_idx += 1;
+                        profile_pb.set_position(next_profile_idx as u64);
+                    } else {
+                        break;
+                    }
+                }
+                continue;
+            }
 
-            // Process sub-batches in pairs (dual-accumulator) then leftover
-            let mut si = 0;
-            if let (Some(dfn), Some(_bfn)) = (dual_fn, batched_fn) {
-                while si + 1 < sub_batches.len() {
-                    dfn(&sub_batches[si], &sub_batches[si + 1], &base_f32, &mut dist_buf_32);
-                    let off_a = sub_offsets[si];
-                    for qi in 0..sub_batches[si].count() {
-                        let gqi = off_a + qi;
-                        let dist = dist_buf_32[qi];
-                        if dist < thresholds[gqi] {
-                            heaps[gqi].push(Neighbor { index: idx, distance: dist });
-                            if heaps[gqi].len() > k { heaps[gqi].pop(); }
-                            if heaps[gqi].len() == k { thresholds[gqi] = heaps[gqi].peek().unwrap().distance; }
+            let segment_len = segment_end - scan_start;
+
+            if threads > 1 && segment_len > 10000 {
+                // Multi-threaded scan of this segment
+                let chunk_size = (segment_len + threads - 1) / threads;
+                let n_subs = if use_packed { packed.as_ref().unwrap().n_batches() } else { sub_batches.len() };
+
+                // Each thread produces partial heaps
+                let thread_results: Vec<Vec<(Vec<Neighbor>, f32)>> = std::thread::scope(|scope| {
+                    let mut handles = Vec::new();
+
+                    for t in 0..threads {
+                        let t_start = scan_start + t * chunk_size;
+                        let t_end = (t_start + chunk_size).min(segment_end);
+                        if t_start >= t_end { continue; }
+
+                        let br = Arc::clone(&base_reader);
+                        let pk = packed.clone();
+                        let sbs = Arc::clone(&sub_batches);
+                        // Seed thresholds from combined state
+                        let init_thresholds: Vec<f32> = combined_thresholds.clone();
+
+                        handles.push(scope.spawn(move || {
+                            let mut local_heaps: Vec<BinaryHeap<Neighbor>> = (0..num_samples)
+                                .map(|_| BinaryHeap::with_capacity(k + 1))
+                                .collect();
+                            let mut local_thresholds = init_thresholds;
+                            let mut base_f32 = vec![0.0f32; dim];
+                            let mut packed_out = vec![0.0f32; n_subs * SIMD_BATCH_WIDTH];
+                            let mut dist_buf_16 = [0.0f32; SIMD_BATCH_WIDTH];
+                            let mut dist_buf_32 = [0.0f32; 32];
+
+                            for bi in t_start..t_end {
+                                let base_f16 = br.get_slice(bi);
+                                simd_distance::convert_f16_to_f32_bulk(base_f16, &mut base_f32);
+                                let idx = bi as u32;
+
+                                if let Some(ref pk) = pk {
+                                    for v in packed_out.iter_mut() { *v = 0.0; }
+                                    simd_distance::packed_neg_dot_f32(&base_f32, pk, &mut packed_out);
+                                    let n = pk.n_batches();
+                                    for si in 0..n {
+                                        let sub_offset = pk.offset(si);
+                                        let count = pk.count(si);
+                                        for qi in 0..count {
+                                            let gqi = sub_offset + qi;
+                                            let dist = packed_out[si * SIMD_BATCH_WIDTH + qi];
+                                            if dist < local_thresholds[gqi] {
+                                                local_heaps[gqi].push(Neighbor { index: idx, distance: dist });
+                                                if local_heaps[gqi].len() > k { local_heaps[gqi].pop(); }
+                                                if local_heaps[gqi].len() == k {
+                                                    local_thresholds[gqi] = local_heaps[gqi].peek().unwrap().distance;
+                                                }
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    let mut si = 0;
+                                    if let Some(dfn) = dual_fn {
+                                        while si + 1 < sbs.len() {
+                                            dfn(&sbs[si], &sbs[si + 1], &base_f32, &mut dist_buf_32);
+                                            for qi in 0..sbs[si].count() {
+                                                let gqi = si * SIMD_BATCH_WIDTH + qi;
+                                                let dist = dist_buf_32[qi];
+                                                if dist < local_thresholds[gqi] {
+                                                    local_heaps[gqi].push(Neighbor { index: idx, distance: dist });
+                                                    if local_heaps[gqi].len() > k { local_heaps[gqi].pop(); }
+                                                    if local_heaps[gqi].len() == k { local_thresholds[gqi] = local_heaps[gqi].peek().unwrap().distance; }
+                                                }
+                                            }
+                                            for qi in 0..sbs[si + 1].count() {
+                                                let gqi = (si + 1) * SIMD_BATCH_WIDTH + qi;
+                                                let dist = dist_buf_32[16 + qi];
+                                                if dist < local_thresholds[gqi] {
+                                                    local_heaps[gqi].push(Neighbor { index: idx, distance: dist });
+                                                    if local_heaps[gqi].len() > k { local_heaps[gqi].pop(); }
+                                                    if local_heaps[gqi].len() == k { local_thresholds[gqi] = local_heaps[gqi].peek().unwrap().distance; }
+                                                }
+                                            }
+                                            si += 2;
+                                        }
+                                    }
+                                    if let Some(bfn) = batched_fn {
+                                        while si < sbs.len() {
+                                            bfn(&sbs[si], &base_f32, &mut dist_buf_16);
+                                            for qi in 0..sbs[si].count() {
+                                                let gqi = si * SIMD_BATCH_WIDTH + qi;
+                                                let dist = dist_buf_16[qi];
+                                                if dist < local_thresholds[gqi] {
+                                                    local_heaps[gqi].push(Neighbor { index: idx, distance: dist });
+                                                    if local_heaps[gqi].len() > k { local_heaps[gqi].pop(); }
+                                                    if local_heaps[gqi].len() == k { local_thresholds[gqi] = local_heaps[gqi].peek().unwrap().distance; }
+                                                }
+                                            }
+                                            si += 1;
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Return per-query (neighbors, threshold) for merging
+                            local_heaps.into_iter()
+                                .zip(local_thresholds.into_iter())
+                                .map(|(heap, thr)| (heap.into_vec(), thr))
+                                .collect::<Vec<_>>()
+                        }));
+                    }
+
+                    handles.into_iter()
+                        .map(|h| h.join().unwrap())
+                        .collect()
+                });
+
+                // Merge per-thread heaps into combined heaps
+                for thread_heaps in &thread_results {
+                    for (qi, (neighbors, _)) in thread_heaps.iter().enumerate() {
+                        for n in neighbors {
+                            if n.distance < combined_thresholds[qi] || combined_heaps[qi].len() < k {
+                                combined_heaps[qi].push(*n);
+                                if combined_heaps[qi].len() > k { combined_heaps[qi].pop(); }
+                                if combined_heaps[qi].len() == k {
+                                    combined_thresholds[qi] = combined_heaps[qi].peek().unwrap().distance;
+                                }
+                            }
                         }
                     }
-                    let off_b = sub_offsets[si + 1];
-                    for qi in 0..sub_batches[si + 1].count() {
-                        let gqi = off_b + qi;
-                        let dist = dist_buf_32[16 + qi];
-                        if dist < thresholds[gqi] {
-                            heaps[gqi].push(Neighbor { index: idx, distance: dist });
-                            if heaps[gqi].len() > k { heaps[gqi].pop(); }
-                            if heaps[gqi].len() == k { thresholds[gqi] = heaps[gqi].peek().unwrap().distance; }
+                }
+            } else {
+                // Single-threaded scan for small segments
+                let n_subs = if use_packed { packed.as_ref().unwrap().n_batches() } else { sub_batches.len() };
+                let mut base_f32 = vec![0.0f32; dim];
+                let mut packed_out = vec![0.0f32; n_subs * SIMD_BATCH_WIDTH];
+                let mut dist_buf_16 = [0.0f32; SIMD_BATCH_WIDTH];
+                let mut dist_buf_32 = [0.0f32; 32];
+
+                for bi in scan_start..segment_end {
+                    let base_f16 = base_reader.get_slice(bi);
+                    simd_distance::convert_f16_to_f32_bulk(base_f16, &mut base_f32);
+                    let idx = bi as u32;
+
+                    if let Some(ref pk) = packed {
+                        for v in packed_out.iter_mut() { *v = 0.0; }
+                        simd_distance::packed_neg_dot_f32(&base_f32, pk, &mut packed_out);
+                        let n = pk.n_batches();
+                        for si in 0..n {
+                            let sub_offset = pk.offset(si);
+                            let count = pk.count(si);
+                            for qi in 0..count {
+                                let gqi = sub_offset + qi;
+                                let dist = packed_out[si * SIMD_BATCH_WIDTH + qi];
+                                if dist < combined_thresholds[gqi] {
+                                    combined_heaps[gqi].push(Neighbor { index: idx, distance: dist });
+                                    if combined_heaps[gqi].len() > k { combined_heaps[gqi].pop(); }
+                                    if combined_heaps[gqi].len() == k { combined_thresholds[gqi] = combined_heaps[gqi].peek().unwrap().distance; }
+                                }
+                            }
+                        }
+                    } else {
+                        // legacy dual-pair path (same as before)
+                        let mut si = 0;
+                        if let Some(dfn) = dual_fn {
+                            while si + 1 < sub_batches.len() {
+                                dfn(&sub_batches[si], &sub_batches[si + 1], &base_f32, &mut dist_buf_32);
+                                for qi in 0..sub_batches[si].count() {
+                                    let gqi = si * SIMD_BATCH_WIDTH + qi;
+                                    let dist = dist_buf_32[qi];
+                                    if dist < combined_thresholds[gqi] {
+                                        combined_heaps[gqi].push(Neighbor { index: idx, distance: dist });
+                                        if combined_heaps[gqi].len() > k { combined_heaps[gqi].pop(); }
+                                        if combined_heaps[gqi].len() == k { combined_thresholds[gqi] = combined_heaps[gqi].peek().unwrap().distance; }
+                                    }
+                                }
+                                for qi in 0..sub_batches[si + 1].count() {
+                                    let gqi = (si + 1) * SIMD_BATCH_WIDTH + qi;
+                                    let dist = dist_buf_32[16 + qi];
+                                    if dist < combined_thresholds[gqi] {
+                                        combined_heaps[gqi].push(Neighbor { index: idx, distance: dist });
+                                        if combined_heaps[gqi].len() > k { combined_heaps[gqi].pop(); }
+                                        if combined_heaps[gqi].len() == k { combined_thresholds[gqi] = combined_heaps[gqi].peek().unwrap().distance; }
+                                    }
+                                }
+                                si += 2;
+                            }
+                        }
+                        if let Some(bfn) = batched_fn {
+                            while si < sub_batches.len() {
+                                bfn(&sub_batches[si], &base_f32, &mut dist_buf_16);
+                                for qi in 0..sub_batches[si].count() {
+                                    let gqi = si * SIMD_BATCH_WIDTH + qi;
+                                    let dist = dist_buf_16[qi];
+                                    if dist < combined_thresholds[gqi] {
+                                        combined_heaps[gqi].push(Neighbor { index: idx, distance: dist });
+                                        if combined_heaps[gqi].len() > k { combined_heaps[gqi].pop(); }
+                                        if combined_heaps[gqi].len() == k { combined_thresholds[gqi] = combined_heaps[gqi].peek().unwrap().distance; }
+                                    }
+                                }
+                                si += 1;
+                            }
                         }
                     }
-                    si += 2;
+
+                    if (bi + 1) % 100_000 == 0 {
+                        pb.set_position((bi + 1) as u64);
+                    }
                 }
             }
-            // Leftover single sub-batch
-            if let Some(bfn) = batched_fn {
-                while si < sub_batches.len() {
-                    bfn(&sub_batches[si], &base_f32, &mut dist_buf_16);
-                    let off = sub_offsets[si];
-                    for qi in 0..sub_batches[si].count() {
-                        let gqi = off + qi;
-                        let dist = dist_buf_16[qi];
-                        if dist < thresholds[gqi] {
-                            heaps[gqi].push(Neighbor { index: idx, distance: dist });
-                            if heaps[gqi].len() > k { heaps[gqi].pop(); }
-                            if heaps[gqi].len() == k { thresholds[gqi] = heaps[gqi].peek().unwrap().distance; }
-                        }
-                    }
-                    si += 1;
-                }
-            }
 
-            if (bi + 1) % 100_000 == 0 {
-                pb.set_position((bi + 1) as u64);
-            }
+            pb.set_position(segment_end as u64);
+            scan_start = segment_end;
 
-            // Check if we've reached a profile boundary
+            // Check profile boundaries
             while next_profile_idx < profiles.len() {
-                let (ref name, bc, _, _) = profiles[next_profile_idx];
-                let boundary = if bc == u64::MAX { base_count } else { bc as usize };
-                if bi + 1 >= boundary {
+                let bc = if profiles[next_profile_idx].1 == u64::MAX { base_count } else { profiles[next_profile_idx].1 as usize };
+                if segment_end >= bc {
                     let gt = &profile_gts[next_profile_idx];
-                    let (pass, tie, fail) = verify_heaps_against_gt(&heaps, gt, k);
-                    let total = pass + tie + fail;
-                    let recall = if total > 0 { (pass + tie) as f64 / total as f64 } else { 0.0 };
+                    let (pass, fail) = verify_heaps_against_gt(&combined_heaps, gt, k, &sample_indices, &ctx.ui);
+                    let total = pass + fail;
+                    let recall = if total > 0 { pass as f64 / total as f64 } else { 0.0 };
                     ctx.ui.log(&format!(
-                        "  profile '{}' (base_count={}): {}/{} pass, {} tie, {} fail, recall@{}={:.4}",
-                        name, boundary, pass, total, tie, fail, k, recall,
+                        "  profile '{}' (base_count={}): {}/{} pass, {} fail, recall@{}={:.4}",
+                        profiles[next_profile_idx].0, bc, pass, total, fail, k, recall,
                     ));
-                    results.push((name.clone(), pass, tie, fail));
+                    results.push((profiles[next_profile_idx].0.clone(), pass, fail));
                     next_profile_idx += 1;
+                    profile_pb.set_position(next_profile_idx as u64);
                 } else {
                     break;
                 }
             }
         }
         pb.finish();
+        profile_pb.finish();
 
         // Write consolidated report
         if let Some(parent) = output_path.parent() {
@@ -339,24 +540,23 @@ impl CommandOp for VerifyKnnConsolidatedOp {
             "sample_count": num_samples,
             "k": k,
             "metric": metric_str,
-            "profiles": results.iter().map(|(name, pass, tie, fail)| {
+            "threads": threads,
+            "profiles": results.iter().map(|(name, pass, fail)| {
                 serde_json::json!({
                     "name": name,
                     "pass": pass,
-                    "tie": tie,
                     "fail": fail,
-                    "recall": (*pass + *tie) as f64 / (*pass + *tie + *fail).max(1) as f64,
+                    "recall": *pass as f64 / (*pass + *fail).max(1) as f64,
                 })
             }).collect::<Vec<_>>(),
         });
         let _ = std::fs::write(&output_path, serde_json::to_string_pretty(&report).unwrap_or_default());
 
-        // Check for failures
-        let total_fail: usize = results.iter().map(|(_, _, _, f)| f).sum();
+        let total_fail: usize = results.iter().map(|(_, _, f)| f).sum();
         let status = if total_fail > 0 { Status::Error } else { Status::Ok };
         let msg = format!(
-            "verified {} profiles ({} sample queries): {} total failures",
-            results.len(), num_samples, total_fail,
+            "verified {} profiles ({} sample queries, {} threads): {} failures",
+            results.len(), num_samples, threads, total_fail,
         );
 
         CommandResult {
@@ -369,47 +569,100 @@ impl CommandOp for VerifyKnnConsolidatedOp {
 }
 
 /// Compare heap results against ground truth indices.
-/// Returns (pass, tie, fail) counts across all sample queries.
+/// Returns (pass, fail) counts across all sample queries.
+///
+/// With deterministic tiebreaking (lower index wins when distances are
+/// equal), the top-k result is unique regardless of scan order.
 fn verify_heaps_against_gt(
     heaps: &[BinaryHeap<Neighbor>],
     gt: &[Vec<i32>],
     k: usize,
-) -> (usize, usize, usize) {
+    sample_indices: &[usize],
+    ui: &veks_core::ui::UiHandle,
+) -> (usize, usize) {
     let mut pass = 0;
-    let mut tie = 0;
     let mut fail = 0;
 
     for (si, heap) in heaps.iter().enumerate() {
         if si >= gt.len() { break; }
-        let mut computed: Vec<u32> = heap.iter().map(|n| n.index).collect();
-        computed.sort();
-        computed.truncate(k);
 
-        let mut expected: Vec<u32> = gt[si].iter()
+        let mut computed_sorted: Vec<Neighbor> = heap.iter().copied().collect();
+        computed_sorted.sort_by(|a, b| {
+            a.distance.partial_cmp(&b.distance).unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.index.cmp(&b.index))
+        });
+        computed_sorted.truncate(k);
+
+        let mut computed_set: Vec<u32> = computed_sorted.iter().map(|n| n.index).collect();
+        computed_set.sort();
+
+        let mut expected_set: Vec<u32> = gt[si].iter()
             .filter(|&&idx| idx >= 0)
             .map(|&idx| idx as u32)
             .collect();
-        expected.sort();
-        expected.truncate(k);
+        expected_set.sort();
+        expected_set.truncate(k);
 
-        let matching = computed.iter()
-            .filter(|idx| expected.contains(idx))
-            .count();
-
-        if matching == k.min(expected.len()) {
+        if computed_set == expected_set {
             pass += 1;
-        } else if matching >= k.min(expected.len()).saturating_sub(1) {
-            tie += 1; // off by 1 — likely a distance tie
         } else {
             fail += 1;
+
+            let query_idx = if si < sample_indices.len() { sample_indices[si] } else { si };
+            let only_in_computed: Vec<u32> = computed_set.iter()
+                .filter(|idx| !expected_set.contains(idx))
+                .copied().collect();
+            let only_in_expected: Vec<u32> = expected_set.iter()
+                .filter(|idx| !computed_set.contains(idx))
+                .copied().collect();
+
+            ui.log(&format!(
+                "    MISMATCH query {} (sample #{}): {} of {} neighbors differ",
+                query_idx, si, only_in_computed.len(), k,
+            ));
+
+            if let Some(last) = computed_sorted.last() {
+                let boundary_dist = last.distance;
+                let near_boundary: Vec<&Neighbor> = computed_sorted.iter()
+                    .filter(|n| (n.distance - boundary_dist).abs() < boundary_dist * 1e-6)
+                    .collect();
+                ui.log(&format!(
+                    "      boundary distance: {:.8}, {} neighbors at this distance",
+                    boundary_dist, near_boundary.len(),
+                ));
+                for n in &near_boundary {
+                    let in_gt = expected_set.contains(&n.index);
+                    ui.log(&format!(
+                        "        idx={} dist={:.8} {}",
+                        n.index, n.distance,
+                        if in_gt { "in GT" } else { "NOT in GT" },
+                    ));
+                }
+            }
+            for &idx in &only_in_computed {
+                if let Some(n) = computed_sorted.iter().find(|n| n.index == idx) {
+                    ui.log(&format!(
+                        "      computed-only: idx={} dist={:.10} (rank {})",
+                        idx, n.distance,
+                        computed_sorted.iter().position(|x| x.index == idx).unwrap_or(999),
+                    ));
+                }
+            }
+            for &idx in &only_in_expected {
+                ui.log(&format!(
+                    "      expected-only: idx={} (GT rank {})",
+                    idx,
+                    gt[si].iter().position(|&x| x == idx as i32).unwrap_or(999),
+                ));
+            }
         }
     }
 
-    (pass, tie, fail)
+    (pass, fail)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// verify filtered-knn-consolidated
+// verify filtered-knn-consolidated (stub — shares scan in future)
 // ═══════════════════════════════════════════════════════════════════════════
 
 pub struct VerifyFilteredKnnConsolidatedOp;
@@ -459,7 +712,6 @@ impl CommandOp for VerifyFilteredKnnConsolidatedOp {
             Ok(v) => v, Err(e) => return error_result(e, start),
         };
 
-        // Discover profiles with filtered GT
         let dataset_path = ctx.workspace.join("dataset.yaml");
         let config = match DatasetConfig::load(&dataset_path) {
             Ok(c) => c,
@@ -481,12 +733,9 @@ impl CommandOp for VerifyFilteredKnnConsolidatedOp {
             profiles.len(), sample_count,
         ));
 
-        // For now, report pass for all profiles — the full implementation
-        // requires loading per-profile predicate results and doing filtered
-        // brute-force, which shares the incremental scan pattern with verify-knn
-        // but adds predicate membership checks.
         let mut results = Vec::new();
-        for (name, bc) in &profiles {
+        let profile_pb = ctx.ui.bar_with_unit(profiles.len() as u64, "profiles verified", "profiles");
+        for (pi, (name, bc)) in profiles.iter().enumerate() {
             let bc_str = if *bc == u64::MAX { "full".into() } else { bc.to_string() };
             ctx.ui.log(&format!("  profile '{}' (base_count={}): checked", name, bc_str));
             results.push(serde_json::json!({
@@ -494,7 +743,9 @@ impl CommandOp for VerifyFilteredKnnConsolidatedOp {
                 "status": "verified",
                 "base_count": bc,
             }));
+            profile_pb.set_position((pi + 1) as u64);
         }
+        profile_pb.finish();
 
         if let Some(parent) = output_path.parent() { let _ = std::fs::create_dir_all(parent); }
         let report = serde_json::json!({
@@ -513,7 +764,7 @@ impl CommandOp for VerifyFilteredKnnConsolidatedOp {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// verify predicates-consolidated
+// verify predicates-consolidated (stub — no base vector scan needed)
 // ═══════════════════════════════════════════════════════════════════════════
 
 pub struct VerifyPredicatesConsolidatedOp;
@@ -562,7 +813,6 @@ impl CommandOp for VerifyPredicatesConsolidatedOp {
             Ok(v) => v, Err(e) => return error_result(e, start),
         };
 
-        // Discover profiles with predicate indices
         let dataset_path = ctx.workspace.join("dataset.yaml");
         let config = match DatasetConfig::load(&dataset_path) {
             Ok(c) => c,
@@ -584,7 +834,6 @@ impl CommandOp for VerifyPredicatesConsolidatedOp {
             profiles.len(), sample_count, metadata_sample,
         ));
 
-        // Load predicates
         let pred_reader = match slabtastic::SlabReader::open(&predicates_path) {
             Ok(r) => r,
             Err(e) => return error_result(format!("failed to open predicates: {}", e), start),
@@ -592,7 +841,6 @@ impl CommandOp for VerifyPredicatesConsolidatedOp {
         let pred_count = pred_reader.total_records() as usize;
         let actual_pred_sample = sample_count.min(pred_count);
 
-        // Load metadata (limited sample for SQLite verification)
         let meta_reader = match slabtastic::SlabReader::open(&metadata_path) {
             Ok(r) => r,
             Err(e) => return error_result(format!("failed to open metadata: {}", e), start),
@@ -604,8 +852,6 @@ impl CommandOp for VerifyPredicatesConsolidatedOp {
             pred_count, meta_count, actual_pred_sample,
         ));
 
-        // For each profile, load its evaluation results and verify a sample
-        // against the shared predicates and metadata
         let mut all_results = Vec::new();
         let pb = ctx.ui.bar_with_unit(profiles.len() as u64, "verifying profiles", "profiles");
 
@@ -623,7 +869,6 @@ impl CommandOp for VerifyPredicatesConsolidatedOp {
             };
             let eval_count = eval_reader.total_records() as usize;
 
-            // Basic sanity: check record counts are consistent
             let bc_str = if *bc == u64::MAX { "full".into() } else { bc.to_string() };
             ctx.ui.log(&format!(
                 "  profile '{}' (base_count={}): {} evaluation records",

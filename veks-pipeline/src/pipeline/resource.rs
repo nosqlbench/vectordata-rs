@@ -1449,14 +1449,11 @@ impl ResourceGovernor {
                 .unwrap_or(4);
             budget.resources.insert("threads".to_string(), ResourceValue::Fixed(cpus));
         }
-        // segmentsize defaults to 1M — this is the cache artifact granularity
-        // for cross-profile KNN partition reuse. Profile sizes (10M, 20M, etc.)
-        // must be multiples of segmentsize. The KNN command processes multiple
-        // segments per memory pass (controlled by available RAM) but writes
-        // cache files at segment boundaries for reuse by larger profiles.
-        if !budget.resources.contains_key("segmentsize") {
-            budget.resources.insert("segmentsize".to_string(), ResourceValue::Fixed(1_000_000));
-        }
+        // segmentsize is NOT defaulted. When absent, compute-knn auto-sizes
+        // partitions based on available RAM. Users can override with
+        // --resources 'segmentsize:1M' for fine-grained cache segments.
+        // Profile-aware segmentation (gap-based) is handled by the pipeline
+        // expanding per-profile compute-knn steps with appropriate ranges.
 
         // Initialize effective values at midpoints
         let mut effective = HashMap::new();
@@ -1582,10 +1579,10 @@ impl ResourceGovernor {
                 .insert("mem".to_string(), ResourceValue::Fixed((ram as f64 * 0.8) as u64));
         }
 
-        // Default threads: num_cpus
-        let cpus = std::thread::available_parallelism()
-            .map(|n| n.get() as u64)
-            .unwrap_or(4);
+        // Default threads: physical core count (not hyperthreads).
+        // Hyperthreads share SIMD execution ports, so using physical cores
+        // avoids contention on bandwidth-bound workloads like KNN scans.
+        let cpus = super::physical_core_count() as u64;
         budget
             .resources
             .insert("threads".to_string(), ResourceValue::Fixed(cpus));

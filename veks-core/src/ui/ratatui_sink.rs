@@ -217,12 +217,20 @@ impl MetricsHistory {
 }
 
 /// Time-series buffer that keeps up to `capacity` data points and
-/// automatically downsamples when full.
+/// automatically downsamples when full (pinned mode) or drops old samples
+/// (scrolling mode).
 ///
-/// When the buffer reaches capacity, consecutive pairs of samples are merged
-/// (averaged), halving the point count and doubling the effective sampling
-/// period. The x-coordinates are normalized to `0..N` so the chart always
-/// stretches from left to right regardless of the sampling period.
+/// **Scrolling mode** (default): keeps only the most recent `capacity` raw
+/// samples, providing a moving window. Y-max is recomputed from the visible
+/// window so the scale adapts to recent throughput.
+///
+/// **Pinned mode**: retains all samples from the beginning. When the buffer
+/// reaches capacity, consecutive pairs are merged (averaged), halving the
+/// point count and doubling the effective sampling period. The x-coordinates
+/// are normalized to `0..N` so the chart always stretches from left to right.
+///
+/// Press `t` in the TUI to toggle between modes. In pinned mode, the chart
+/// title shows `[pinned]`.
 struct DownsamplingHistory {
     data: Vec<(f64, f64)>,
     capacity: usize,
@@ -235,6 +243,9 @@ struct DownsamplingHistory {
     /// Total raw samples received (for stride accounting).
     raw_count: u64,
     max_value: f64,
+    /// When true, keep all history (downsample when full). When false,
+    /// use a scrolling window that drops old samples.
+    pinned: bool,
 }
 
 impl DownsamplingHistory {
@@ -247,31 +258,53 @@ impl DownsamplingHistory {
             stride: 1,
             raw_count: 0,
             max_value: 1.0,
+            pinned: false,
         }
     }
 
     fn push(&mut self, value: f64) {
         self.raw_count += 1;
-        self.pending_count += 1;
-        self.pending_sum += value;
 
-        if self.pending_count >= self.stride {
-            let avg = self.pending_sum / self.pending_count as f64;
-            self.pending_count = 0;
-            self.pending_sum = 0.0;
+        if self.pinned {
+            // Pinned mode: accumulate into stride-averaged slots, compact when full
+            self.pending_count += 1;
+            self.pending_sum += value;
 
+            if self.pending_count >= self.stride {
+                let avg = self.pending_sum / self.pending_count as f64;
+                self.pending_count = 0;
+                self.pending_sum = 0.0;
+
+                if self.data.len() >= self.capacity {
+                    self.compact();
+                }
+                let x = self.data.len() as f64;
+                self.data.push((x, avg));
+                if avg > self.max_value {
+                    self.max_value = avg;
+                }
+            }
+        } else {
+            // Scrolling mode: keep most recent `capacity` raw samples
             if self.data.len() >= self.capacity {
-                self.compact();
+                self.data.remove(0);
+                // Re-index x-coordinates so the chart always starts at 0
+                for (i, pt) in self.data.iter_mut().enumerate() {
+                    pt.0 = i as f64;
+                }
+                // Recompute max from visible window
+                self.max_value = self.data.iter().map(|p| p.1).fold(1.0f64, f64::max);
             }
             let x = self.data.len() as f64;
-            self.data.push((x, avg));
-            if avg > self.max_value {
-                self.max_value = avg;
+            self.data.push((x, value));
+            if value > self.max_value {
+                self.max_value = value;
             }
         }
     }
 
     /// Merge consecutive pairs, halving the data and doubling the stride.
+    /// Only used in pinned mode.
     fn compact(&mut self) {
         let mut compacted = Vec::with_capacity(self.data.len() / 2 + 1);
         let mut i = 0;
@@ -288,6 +321,36 @@ impl DownsamplingHistory {
         self.stride *= 2;
         // Recompute max after compaction (averages may be lower than peaks).
         self.max_value = self.data.iter().map(|p| p.1).fold(1.0f64, f64::max);
+    }
+
+    /// Toggle between scrolling and pinned modes.
+    ///
+    /// When switching to pinned mode, the current data is retained and
+    /// future samples use the keep+resample strategy. When switching
+    /// back to scrolling, data is truncated to the most recent `capacity`
+    /// samples and the stride is reset.
+    fn toggle_pinned(&mut self) {
+        self.pinned = !self.pinned;
+        if !self.pinned {
+            // Switching from pinned → scrolling: reset downsampling state
+            self.stride = 1;
+            self.pending_count = 0;
+            self.pending_sum = 0.0;
+            // Truncate to last `capacity` points
+            if self.data.len() > self.capacity {
+                let start = self.data.len() - self.capacity;
+                self.data = self.data[start..].to_vec();
+            }
+            // Re-index x-coordinates
+            for (i, pt) in self.data.iter_mut().enumerate() {
+                pt.0 = i as f64;
+            }
+            self.max_value = self.data.iter().map(|p| p.1).fold(1.0f64, f64::max);
+        }
+    }
+
+    fn is_pinned(&self) -> bool {
+        self.pinned
     }
 
     fn as_slice(&self) -> &[(f64, f64)] {
@@ -307,6 +370,26 @@ impl DownsamplingHistory {
 
     fn y_bounds(&self) -> [f64; 2] {
         [0.0, self.max_value * 1.25]
+    }
+
+    /// Compute a moving average over the data with the given window size.
+    ///
+    /// Returns a new Vec of (x, avg) points suitable for rendering as a
+    /// second chart line. The window is centered on each point.
+    fn moving_average(&self, window: usize) -> Vec<(f64, f64)> {
+        if self.data.len() < 2 || window < 2 {
+            return Vec::new();
+        }
+        let half = window / 2;
+        let mut result = Vec::with_capacity(self.data.len());
+        for i in 0..self.data.len() {
+            let start = i.saturating_sub(half);
+            let end = (i + half + 1).min(self.data.len());
+            let sum: f64 = self.data[start..end].iter().map(|p| p.1).sum();
+            let avg = sum / (end - start) as f64;
+            result.push((self.data[i].0, avg));
+        }
+        result
     }
 
     fn clear(&mut self) {
@@ -414,7 +497,7 @@ impl RenderState {
             pcache_history: MetricsHistory::new(120),
             ioq_read_history: MetricsHistory::new(120),
             ioq_write_history: MetricsHistory::new(120),
-            rps_history: DownsamplingHistory::new(4096),
+            rps_history: DownsamplingHistory::new(240), // ~1 minute at 250ms sampling
             prev_positions: HashMap::new(),
             last_rps_sample: Instant::now(),
             prev_io_read: 0.0,
@@ -445,7 +528,7 @@ impl RenderState {
     /// Number of lines needed for the progress region.
     fn visible_lines(&self) -> u16 {
         if self.show_help {
-            return 8; // fixed help overlay height
+            return 9; // fixed help overlay height
         }
         let context_line = if self.context_label.is_empty() { 0u16 } else { 1 };
         let bar_lines = self.bar_order.len() as u16;
@@ -592,6 +675,9 @@ fn render_loop(
                         state.yaml_width_pct += 5;
                         state.dirty = true;
                     }
+                } else if key.code == KeyCode::Char('t') {
+                    state.rps_history.toggle_pinned();
+                    state.dirty = true;
                 }
             }
         }
@@ -1312,6 +1398,10 @@ fn render_help(frame: &mut ratatui::Frame, area: Rect) {
             Span::styled("  ← / →   ", Style::default().fg(Color::Yellow)),
             Span::raw("Adjust step detail / RPS chart split"),
         ]),
+        Line::from(vec![
+            Span::styled("  t       ", Style::default().fg(Color::Yellow)),
+            Span::raw("Toggle throughput: scrolling window / pinned history"),
+        ]),
     ];
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1433,15 +1523,19 @@ fn render_rps_chart(frame: &mut ratatui::Frame, area: Rect, state: &RenderState)
         } else {
             current
         };
+        let pin_tag = if state.rps_history.is_pinned() { " [pinned]" } else { "" };
         if chart_unit == "bytes" {
-            format!(" throughput: {} (1m avg: {}) ",
-                format_rate(current, chart_unit), format_rate(avg_1m, chart_unit))
+            format!(" throughput: {} (1m avg: {}){} ",
+                format_rate(current, chart_unit), format_rate(avg_1m, chart_unit), pin_tag)
         } else {
-            format!(" throughput: {} ", format_rate(current, chart_unit))
+            format!(" throughput: {}{} ", format_rate(current, chart_unit), pin_tag)
         }
     };
 
-    let datasets = vec![
+    // Compute the 1-minute moving average (240 samples at 250ms)
+    let ma_data = state.rps_history.moving_average(240);
+
+    let mut datasets = vec![
         Dataset::default()
             .name("rps")
             .marker(symbols::Marker::Braille)
@@ -1449,6 +1543,18 @@ fn render_rps_chart(frame: &mut ratatui::Frame, area: Rect, state: &RenderState)
             .style(Style::default().fg(Color::Yellow))
             .data(state.rps_history.as_slice()),
     ];
+    // Render moving average as a dimmer second line (only when there
+    // are enough samples for it to differ meaningfully from the raw data).
+    if ma_data.len() >= 10 {
+        datasets.push(
+            Dataset::default()
+                .name("1m avg")
+                .marker(symbols::Marker::Braille)
+                .graph_type(GraphType::Line)
+                .style(Style::default().fg(Color::DarkGray))
+                .data(&ma_data),
+        );
+    }
 
     let chart = Chart::new(datasets)
         .block(
@@ -1916,8 +2022,9 @@ mod tests {
     }
 
     #[test]
-    fn downsampling_history_basic() {
+    fn downsampling_history_pinned() {
         let mut h = DownsamplingHistory::new(8);
+        h.pinned = true; // test pinned (keep+resample) mode
         for i in 0..8 {
             h.push(i as f64);
         }
@@ -1940,6 +2047,44 @@ mod tests {
         h.push(300.0);
         assert_eq!(h.data.len(), 6);
         assert!((h.data[5].1 - 250.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn downsampling_history_scrolling() {
+        let mut h = DownsamplingHistory::new(8);
+        // Default is scrolling mode
+        assert!(!h.is_pinned());
+        for i in 0..8 {
+            h.push(i as f64);
+        }
+        assert_eq!(h.data.len(), 8);
+
+        // 9th push drops oldest, keeps 8 most recent
+        h.push(100.0);
+        assert_eq!(h.data.len(), 8);
+        assert_eq!(h.stride, 1); // no compaction in scrolling mode
+        assert!((h.data[7].1 - 100.0).abs() < 0.001);
+        // First element should be 1.0 (0.0 was dropped)
+        assert!((h.data[0].1 - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn downsampling_history_toggle() {
+        let mut h = DownsamplingHistory::new(8);
+        for i in 0..5 {
+            h.push(i as f64);
+        }
+        assert!(!h.is_pinned());
+
+        // Pin it
+        h.toggle_pinned();
+        assert!(h.is_pinned());
+        assert_eq!(h.data.len(), 5);
+
+        // Unpin
+        h.toggle_pinned();
+        assert!(!h.is_pinned());
+        assert_eq!(h.data.len(), 5); // data preserved
     }
 
     #[test]

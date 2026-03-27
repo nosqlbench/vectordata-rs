@@ -98,6 +98,29 @@ impl DatasetConfig {
             .map_err(|e| format!("Failed to parse {}: {}", path.display(), e))
     }
 
+    /// Load a dataset config and resolve deferred sized profiles from
+    /// `variables.yaml` in the same directory (if it exists).
+    ///
+    /// This is the preferred loader for any context that needs the
+    /// complete profile set — catalog resolution, explore, probe, check.
+    /// The pipeline runner uses `resolve_all_steps()` which calls this
+    /// internally.
+    pub fn load_and_resolve(path: &Path) -> Result<Self, String> {
+        let mut config = Self::load(path)?;
+        if config.profiles.has_deferred() {
+            let workspace = path.parent().unwrap_or(std::path::Path::new("."));
+            let vars_path = workspace.join("variables.yaml");
+            if vars_path.exists() {
+                if let Ok(content) = std::fs::read_to_string(&vars_path) {
+                    if let Ok(vars) = serde_yaml::from_str::<indexmap::IndexMap<String, String>>(&content) {
+                        config.profiles.expand_deferred_sized(&vars);
+                    }
+                }
+            }
+        }
+        Ok(config)
+    }
+
     /// Returns the default profile, if one exists.
     pub fn default_profile(&self) -> Option<&DSProfile> {
         self.profiles.default_profile()

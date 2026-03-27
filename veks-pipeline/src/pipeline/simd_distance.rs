@@ -455,6 +455,121 @@ impl TransposedBatch {
     pub fn count(&self) -> usize {
         self.count
     }
+
+    /// Raw pointer to the transposed data.
+    ///
+    /// Layout: `data[d * SIMD_BATCH_WIDTH + qi]` = f32 value for dimension
+    /// `d` of query `qi`.
+    pub fn as_ptr(&self) -> *const f32 {
+        self.data.as_ptr()
+    }
+
+    /// Dimensionality of the vectors in this batch.
+    pub fn dim(&self) -> usize {
+        self.dim
+    }
+}
+
+/// Contiguous packed layout for all sub-batches in a thread's query set.
+///
+/// Layout: `data[d * n_batches * SIMD_BATCH_WIDTH + si * SIMD_BATCH_WIDTH + qi]`
+/// where `d` is the dimension, `si` is the sub-batch index, and `qi` is the
+/// query index within the sub-batch (0..16).
+///
+/// This puts all sub-batches for a given dimension in adjacent cache lines,
+/// giving the hardware prefetcher a single sequential stream to track instead
+/// of N scattered streams from separate heap allocations.
+pub struct PackedBatches {
+    data: Vec<f32>,
+    dim: usize,
+    n_batches: usize,
+    /// Number of actual queries per sub-batch (last may be partial).
+    counts: Vec<usize>,
+    /// Query offset for each sub-batch (index into the original query array).
+    offsets: Vec<usize>,
+}
+
+impl PackedBatches {
+    /// Pack f32 query slices into the contiguous interleaved layout.
+    pub fn from_f32(queries: &[&[f32]], dim: usize) -> Self {
+        let n_queries = queries.len();
+        let n_batches = (n_queries + SIMD_BATCH_WIDTH - 1) / SIMD_BATCH_WIDTH;
+        let stride = n_batches * SIMD_BATCH_WIDTH; // elements per dimension
+        let mut data = vec![0.0f32; dim * stride];
+        let mut counts = Vec::with_capacity(n_batches);
+        let mut offsets = Vec::with_capacity(n_batches);
+
+        let mut qi_global = 0;
+        for si in 0..n_batches {
+            let batch_start = si * SIMD_BATCH_WIDTH;
+            let batch_end = (batch_start + SIMD_BATCH_WIDTH).min(n_queries);
+            let count = batch_end - batch_start;
+            counts.push(count);
+            offsets.push(batch_start);
+
+            for qi in 0..count {
+                let q = queries[batch_start + qi];
+                for d in 0..dim {
+                    data[d * stride + si * SIMD_BATCH_WIDTH + qi] = q[d];
+                }
+                qi_global += 1;
+            }
+        }
+        let _ = qi_global;
+
+        Self { data, dim, n_batches, counts, offsets }
+    }
+
+    /// Pack f16 query slices into the contiguous interleaved layout (f32).
+    pub fn from_f16(queries: &[&[half::f16]], dim: usize) -> Self {
+        let n_queries = queries.len();
+        let n_batches = (n_queries + SIMD_BATCH_WIDTH - 1) / SIMD_BATCH_WIDTH;
+        let stride = n_batches * SIMD_BATCH_WIDTH;
+        let mut data = vec![0.0f32; dim * stride];
+        let mut counts = Vec::with_capacity(n_batches);
+        let mut offsets = Vec::with_capacity(n_batches);
+
+        for si in 0..n_batches {
+            let batch_start = si * SIMD_BATCH_WIDTH;
+            let batch_end = (batch_start + SIMD_BATCH_WIDTH).min(n_queries);
+            counts.push(batch_end - batch_start);
+            offsets.push(batch_start);
+
+            for qi in 0..(batch_end - batch_start) {
+                let q = queries[batch_start + qi];
+                for d in 0..dim {
+                    data[d * stride + si * SIMD_BATCH_WIDTH + qi] = q[d].to_f32();
+                }
+            }
+        }
+
+        Self { data, dim, n_batches, counts, offsets }
+    }
+
+    /// Number of sub-batches.
+    pub fn n_batches(&self) -> usize {
+        self.n_batches
+    }
+
+    /// Number of actual queries in sub-batch `si`.
+    pub fn count(&self, si: usize) -> usize {
+        self.counts[si]
+    }
+
+    /// Query offset for sub-batch `si` (index into the original query array).
+    pub fn offset(&self, si: usize) -> usize {
+        self.offsets[si]
+    }
+
+    /// Raw pointer to the packed data.
+    pub fn as_ptr(&self) -> *const f32 {
+        self.data.as_ptr()
+    }
+
+    /// Elements per dimension row (n_batches × SIMD_BATCH_WIDTH).
+    pub fn row_stride(&self) -> usize {
+        self.n_batches * SIMD_BATCH_WIDTH
+    }
 }
 
 /// Function type for batched distance computation on f16 base vectors.
@@ -1084,6 +1199,294 @@ unsafe fn dual_batched_l1_f32_avx512(a: &TransposedBatch, b: &TransposedBatch, b
         }
         _mm512_storeu_ps(out.as_mut_ptr(), acc_a);
         _mm512_storeu_ps(out.as_mut_ptr().add(16), acc_b);
+    }
+}
+
+// -- Tiled multi-batch distance -----------------------------------------------
+
+/// Dimension tile size for cache-friendly multi-batch distance computation.
+///
+/// Each tile accesses `num_sub_batches × TILE × SIMD_BATCH_WIDTH × 4` bytes
+/// of transposed query data. With 10 sub-batches and TILE=48:
+/// 10 × 48 × 16 × 4 = 30 KB — fits comfortably in L1 (48 KB per core).
+const DIM_TILE: usize = 64;
+
+/// Compute neg-dot-product distances from one f32 base vector to ALL
+/// transposed sub-batches simultaneously, using dimension tiling for L1
+/// cache locality.
+///
+/// This replaces the per-pair `dual_batched_neg_dot_f32` calls with a
+/// single pass that tiles across dimensions. Each base-vector element is
+/// broadcast once and used by ALL sub-batches before advancing to the
+/// next tile — amortizing the broadcast cost and keeping the working set
+/// in L1.
+///
+/// `accumulators` must have length `sub_batches.len()` and each inner
+/// slice must have length `SIMD_BATCH_WIDTH` (16), pre-zeroed by caller.
+#[inline(never)]
+pub fn tiled_neg_dot_all_batches_f32(
+    base: &[f32],
+    sub_batches: &[TransposedBatch],
+    accumulators: &mut [&mut [f32; SIMD_BATCH_WIDTH]],
+    dim: usize,
+) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx512f") {
+            unsafe {
+                tiled_neg_dot_all_batches_f32_avx512(base, sub_batches, accumulators, dim);
+            }
+            return;
+        }
+    }
+    // Scalar fallback
+    for d in 0..dim {
+        let bv = base[d];
+        for (si, batch) in sub_batches.iter().enumerate() {
+            let acc = &mut accumulators[si];
+            for qi in 0..batch.count() {
+                acc[qi] -= bv * batch.data[d * SIMD_BATCH_WIDTH + qi];
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn tiled_neg_dot_all_batches_f32_avx512(
+    base: &[f32],
+    sub_batches: &[TransposedBatch],
+    accumulators: &mut [&mut [f32; SIMD_BATCH_WIDTH]],
+    dim: usize,
+) {
+    unsafe {
+        use std::arch::x86_64::*;
+
+        let base_ptr = base.as_ptr();
+        let n = sub_batches.len();
+
+        const MAX_BATCHES: usize = 20;
+        debug_assert!(n <= MAX_BATCHES);
+        let mut ptrs: [*const f32; MAX_BATCHES] = [std::ptr::null(); MAX_BATCHES];
+        let mut accs: [__m512; MAX_BATCHES] = [_mm512_setzero_ps(); MAX_BATCHES];
+        for i in 0..n {
+            ptrs[i] = sub_batches[i].as_ptr();
+        }
+
+        // Process ALL sub-batches per dimension within each tile.
+        // The inner dimension loop is the tightest loop — for each dimension,
+        // broadcast once and FMA into all accumulators.
+        //
+        // Working set per tile: n × TILE × 16 × 4 bytes.
+        // With n=10 and TILE=48: 30 KB — fits in L1 (48 KB).
+        //
+        // To avoid the variable-length inner loop penalty, use a macro
+        // that unrolls the sub-batch FMA sequence at compile time.
+        macro_rules! fma_unrolled {
+            ($bval:expr, $off:expr, $idx:expr) => {
+                accs[$idx] = _mm512_fmadd_ps(
+                    $bval,
+                    _mm512_loadu_ps(ptrs[$idx].add($off)),
+                    accs[$idx],
+                );
+            };
+        }
+
+        macro_rules! tiled_loop {
+            ($($idx:expr),+) => {{
+                let mut d = 0usize;
+                while d < dim {
+                    let tile_end = (d + DIM_TILE).min(dim);
+                    let mut dd = d;
+                    while dd < tile_end {
+                        let bval = _mm512_set1_ps(*base_ptr.add(dd));
+                        let off = dd * SIMD_BATCH_WIDTH;
+                        $( fma_unrolled!(bval, off, $idx); )+
+                        dd += 1;
+                    }
+                    d = tile_end;
+                }
+            }};
+        }
+
+        // Dispatch to fully-unrolled variants for common sub-batch counts.
+        // 128 threads / 10K queries → 78 queries/thread → ceil(78/16) = 5
+        // 64 threads / 10K queries → 156 queries/thread → ceil(156/16) = 10
+        match n {
+            1 => tiled_loop!(0),
+            2 => tiled_loop!(0, 1),
+            3 => tiled_loop!(0, 1, 2),
+            4 => tiled_loop!(0, 1, 2, 3),
+            5 => tiled_loop!(0, 1, 2, 3, 4),
+            6 => tiled_loop!(0, 1, 2, 3, 4, 5),
+            7 => tiled_loop!(0, 1, 2, 3, 4, 5, 6),
+            8 => tiled_loop!(0, 1, 2, 3, 4, 5, 6, 7),
+            9 => tiled_loop!(0, 1, 2, 3, 4, 5, 6, 7, 8),
+            10 => tiled_loop!(0, 1, 2, 3, 4, 5, 6, 7, 8, 9),
+            11 => tiled_loop!(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10),
+            12 => tiled_loop!(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11),
+            13 => tiled_loop!(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12),
+            14 => tiled_loop!(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13),
+            15 => tiled_loop!(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14),
+            16 => tiled_loop!(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15),
+            _ => {
+                // Fallback for >16 sub-batches: dynamic loop
+                let mut d = 0usize;
+                while d < dim {
+                    let tile_end = (d + DIM_TILE).min(dim);
+                    for dd in d..tile_end {
+                        let bval = _mm512_set1_ps(*base_ptr.add(dd));
+                        let off = dd * SIMD_BATCH_WIDTH;
+                        for si in 0..n {
+                            fma_unrolled!(bval, off, si);
+                        }
+                    }
+                    d = tile_end;
+                }
+            }
+        }
+
+        // Store negated results
+        let zero = _mm512_setzero_ps();
+        for si in 0..n {
+            _mm512_storeu_ps(
+                accumulators[si].as_mut_ptr(),
+                _mm512_sub_ps(zero, accs[si]),
+            );
+        }
+    }
+}
+
+// -- Packed tiled distance (contiguous layout) --------------------------------
+
+/// Compute neg-dot-product distances from one f32 base vector to ALL
+/// sub-batches in a [`PackedBatches`] using the contiguous interleaved layout.
+///
+/// The packed layout places all sub-batches for each dimension in adjacent
+/// cache lines, giving the hardware prefetcher a single sequential stream.
+/// Combined with dimension tiling, the active working set fits in L1.
+///
+/// `out` must have length `n_batches * SIMD_BATCH_WIDTH`, pre-zeroed by caller.
+#[inline(never)]
+pub fn packed_neg_dot_f32(
+    base: &[f32],
+    packed: &PackedBatches,
+    out: &mut [f32],
+) {
+    let dim = packed.dim;
+    let n = packed.n_batches;
+    let stride = packed.row_stride();
+    debug_assert!(out.len() >= n * SIMD_BATCH_WIDTH);
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx512f") {
+            unsafe {
+                packed_neg_dot_f32_avx512(base, packed.as_ptr(), dim, n, stride, out);
+            }
+            return;
+        }
+    }
+    // Scalar fallback
+    for d in 0..dim {
+        let bv = base[d];
+        let row = d * stride;
+        for si in 0..n {
+            let off = row + si * SIMD_BATCH_WIDTH;
+            for qi in 0..SIMD_BATCH_WIDTH {
+                out[si * SIMD_BATCH_WIDTH + qi] -= bv * packed.data[off + qi];
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+#[inline(never)]
+unsafe fn packed_neg_dot_f32_avx512(
+    base: &[f32],
+    packed_ptr: *const f32,
+    dim: usize,
+    n_batches: usize,
+    stride: usize,
+    out: &mut [f32],
+) {
+    unsafe {
+        use std::arch::x86_64::*;
+
+        let base_ptr = base.as_ptr();
+
+        // Use a small fixed-size array of accumulators with the match
+        // ensuring the compiler sees a constant size. Each match arm
+        // uses a const N so the inner loop is fully unrolled.
+        macro_rules! packed_kernel {
+            ($n:expr) => {{
+                let mut accs = [_mm512_setzero_ps(); $n];
+                let mut dd = 0usize;
+                while dd < dim {
+                    let bval = _mm512_set1_ps(*base_ptr.add(dd));
+                    let row_ptr = packed_ptr.add(dd * stride);
+                    let mut si = 0;
+                    while si < $n {
+                        accs[si] = _mm512_fmadd_ps(
+                            bval,
+                            _mm512_loadu_ps(row_ptr.add(si * SIMD_BATCH_WIDTH)),
+                            accs[si],
+                        );
+                        si += 1;
+                    }
+                    dd += 1;
+                }
+                let zero = _mm512_setzero_ps();
+                let mut si = 0;
+                while si < $n {
+                    _mm512_storeu_ps(
+                        out.as_mut_ptr().add(si * SIMD_BATCH_WIDTH),
+                        _mm512_sub_ps(zero, accs[si]),
+                    );
+                    si += 1;
+                }
+            }};
+        }
+
+        match n_batches {
+            1 => packed_kernel!(1),
+            2 => packed_kernel!(2),
+            3 => packed_kernel!(3),
+            4 => packed_kernel!(4),
+            5 => packed_kernel!(5),
+            6 => packed_kernel!(6),
+            7 => packed_kernel!(7),
+            8 => packed_kernel!(8),
+            9 => packed_kernel!(9),
+            10 => packed_kernel!(10),
+            _ => {
+                // Fallback for >10: use array (may spill)
+                const MAX_BATCHES: usize = 20;
+                debug_assert!(n_batches <= MAX_BATCHES);
+                let mut accs: [__m512; MAX_BATCHES] = [_mm512_setzero_ps(); MAX_BATCHES];
+                let mut dd = 0usize;
+                while dd < dim {
+                    let bval = _mm512_set1_ps(*base_ptr.add(dd));
+                    let row_ptr = packed_ptr.add(dd * stride);
+                    for si in 0..n_batches {
+                        accs[si] = _mm512_fmadd_ps(
+                            bval,
+                            _mm512_loadu_ps(row_ptr.add(si * SIMD_BATCH_WIDTH)),
+                            accs[si],
+                        );
+                    }
+                    dd += 1;
+                }
+                let zero = _mm512_setzero_ps();
+                for si in 0..n_batches {
+                    _mm512_storeu_ps(
+                        out.as_mut_ptr().add(si * SIMD_BATCH_WIDTH),
+                        _mm512_sub_ps(zero, accs[si]),
+                    );
+                }
+            }
+        }
     }
 }
 
