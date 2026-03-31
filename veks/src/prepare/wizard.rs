@@ -1460,57 +1460,25 @@ fn dir_size(dir: &Path) -> u64 {
 // Prompt helpers
 // ---------------------------------------------------------------------------
 
-/// Prompt with the default value pre-filled in the input buffer so the
-/// user can edit or append to it. Falls back to `prompt_with_default`
-/// if the terminal doesn't support raw mode.
+/// Prompt where the user's input is appended to the default.
+/// Typing just Enter keeps the default. Typing text appends it as a suffix.
+/// Typing `=something` replaces the default entirely.
 fn prompt_with_prefill(label: &str, default: &str) -> String {
     if AUTO_ACCEPT.load(Ordering::Relaxed) {
-        eprintln!("{}: {}", label, default);
+        eprintln!("{} [{}]: ", label, default);
         return default.to_string();
     }
-    eprint!("{}: {}", label, default);
+    eprint!("{} [{}] (type to append, =to replace): ", label, default);
     io::stderr().flush().unwrap_or(());
-
-    // Inject the default into the terminal input buffer via TIOCSTI
-    // so the user sees it as editable text. If this fails (e.g., no
-    // terminal or insufficient permissions), fall back to bracket display.
-    let injected = inject_input(default);
-    if !injected {
-        // Fallback: clear line, use bracket-default prompt
-        eprint!("\r{} [{}]: ", label, default);
-        io::stderr().flush().unwrap_or(());
-    }
-
     let mut input = String::new();
     io::stdin().read_line(&mut input).unwrap_or(0);
     let trimmed = input.trim();
     if trimmed.is_empty() {
         default.to_string()
+    } else if let Some(replacement) = trimmed.strip_prefix('=') {
+        replacement.to_string()
     } else {
-        trimmed.to_string()
-    }
-}
-
-/// Inject a string into the terminal's input buffer via TIOCSTI.
-/// Returns true if successful.
-fn inject_input(text: &str) -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::unix::io::AsRawFd;
-        let fd = io::stdin().as_raw_fd();
-        for byte in text.bytes() {
-            let b = byte as libc::c_ulong;
-            // TIOCSTI = 0x5412 on Linux
-            if unsafe { libc::ioctl(fd, 0x5412, &b as *const libc::c_ulong) } < 0 {
-                return false;
-            }
-        }
-        true
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = text;
-        false
+        format!("{}{}", default, trimmed)
     }
 }
 
