@@ -4880,7 +4880,7 @@ checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
 
 [[package]]
 name = "vectordata"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "anyhow",
  "byteorder",
@@ -4905,7 +4905,7 @@ dependencies = [
 
 [[package]]
 name = "veks"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "arrow",
  "atty",
@@ -4940,7 +4940,7 @@ dependencies = [
 
 [[package]]
 name = "veks-completion"
-version = "0.10.0"
+version = "0.10.1"
 
 [[package]]
 name = "veks-core"
@@ -4969,7 +4969,7 @@ dependencies = [
 
 [[package]]
 name = "veks-pipeline"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "atty",
  "byteorder",
