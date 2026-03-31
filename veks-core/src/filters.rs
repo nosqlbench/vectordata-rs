@@ -1,4 +1,4 @@
-// Copyright (c) DataStax, Inc.
+// Copyright (c) nosqlbench contributors
 // SPDX-License-Identifier: Apache-2.0
 
 //! Unified file and directory filtering rules for the entire veks crate.

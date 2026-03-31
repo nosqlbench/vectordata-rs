@@ -1,4 +1,4 @@
-// Copyright (c) DataStax, Inc.
+// Copyright (c) nosqlbench contributors
 // SPDX-License-Identifier: Apache-2.0
 
 //! `datasets import` subcommand — bootstrap a new dataset directory.
@@ -61,6 +61,12 @@ pub struct ImportArgs {
     /// the implication rules in SRD 2.8. When `Some`, only the
     /// specified facets are produced — overriding inference.
     pub required_facets: Option<String>,
+    /// Provided facets as a set of single-letter codes (BQGDMPRF).
+    /// Uses the same syntax as `required_facets`. When set, only the
+    /// specified input facets are considered as provided — any detected
+    /// inputs not in this set are disregarded. This helps when multiple
+    /// input facets are detected but some should be ignored.
+    pub provided_facets: Option<String>,
     /// Number of significant digits for computed counts (like base_end).
     /// Default 2 produces clean sizes (e.g., 180000000 instead of 184623729).
     /// Set to 10+ to effectively disable rounding.
@@ -143,20 +149,37 @@ pub fn parse_facet_spec(spec: &str) -> String {
 
 /// Resolve required facets from explicit spec or input inference.
 ///
+/// When `provided_facets` is set, inputs not matching the provided set
+/// are disregarded before inference runs. This lets the user override
+/// auto-detection when multiple input files are present but not all
+/// should be used.
+///
 /// Returns a canonical code string (e.g., "BQGDMPRF").
 pub fn resolve_facets(args: &ImportArgs) -> String {
     if let Some(ref spec) = args.required_facets {
         return parse_facet_spec(spec);
     }
 
-    // Inference from available inputs (SRD 2.8 implication rules)
-    let has_base = args.base_vectors.is_some();
-    let has_meta = args.metadata.is_some();
+    // When provided_facets is set, only consider inputs matching those codes
+    let provided = args.provided_facets.as_ref().map(|s| parse_facet_spec(s));
 
+    let has_base = args.base_vectors.is_some()
+        && provided.as_ref().map_or(true, |p| p.contains('B'));
+    let _has_query = args.query_vectors.is_some()
+        && provided.as_ref().map_or(true, |p| p.contains('Q'));
+    let has_gt = args.ground_truth.is_some()
+        && provided.as_ref().map_or(true, |p| p.contains('G'));
+    let has_meta = args.metadata.is_some()
+        && provided.as_ref().map_or(true, |p| p.contains('M'));
+
+    // Inference from available inputs (SRD 2.8 implication rules)
     match (has_base, has_meta) {
         (true, true) => "BQGDMPRF".to_string(),
         (false, true) => "BQGDMPR".to_string(),
-        (true, false) => "BQGD".to_string(),
+        (true, false) => {
+            if has_gt { "BQGD".to_string() }
+            else { "BQGD".to_string() }
+        }
         (false, false) => String::new(),
     }
 }
@@ -858,6 +881,20 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
                         ("value".into(), format!("count:{}", slots.base_vectors.path())),
                     ],
                 });
+                // Measure normalization precision after base vectors are clean
+                steps.push(Step {
+                    id: "measure-normals".into(),
+                    run: "analyze measure-normals".into(),
+                    description: Some("Measure L2 normalization precision at f64".into()),
+                    after: vec!["extract-base".into()],
+                    per_profile: false,
+                    phase: 0,
+                    options: vec![
+                        ("input".into(), slots.base_vectors.path().into()),
+                        ("sample".into(), "10000".into()),
+                        ("seed".into(), format!("${{{}}}", "seed")),
+                    ],
+                });
             }
         }
     } else if let Some(ref qv) = slots.query_vectors {
@@ -1313,7 +1350,7 @@ fn generate_yaml(
 ) -> String {
     let mut out = String::new();
 
-    out.push_str("# Copyright (c) DataStax, Inc.\n");
+    out.push_str("# Copyright (c) nosqlbench contributors\n");
     out.push_str("# SPDX-License-Identifier: Apache-2.0\n\n");
 
     out.push_str(&format!("name: {}\n", args.name));
@@ -1846,9 +1883,9 @@ fn log_slot(w: &mut impl std::io::Write, name: &str, artifact: &Artifact) {
 
 /// Sample vectors from a file and check if they appear L2-normalized.
 ///
-/// Returns `(is_normalized, sample_count, mean_norm)`. Vectors are considered
-/// normalized if the mean L2 norm of the sample is within 0.01 of 1.0 and
-/// no sampled vector has a norm deviating by more than 0.05 from 1.0.
+/// Returns `(is_normalized, sample_count, mean_norm)`. The normalization
+/// threshold adapts to element precision and dimensionality per SRD §18.3:
+/// `C × ε_mach(element_type) × √dim` (Higham & Mary 2019).
 ///
 /// Uses mmap for sparse sampling — does not read the full file into memory.
 pub fn detect_normalized(path: &Path) -> Option<(bool, usize, f64)> {
@@ -1906,8 +1943,12 @@ pub fn detect_normalized(path: &Path) -> Option<(bool, usize, f64)> {
     if norms.is_empty() { return None; }
 
     let mean = norms.iter().sum::<f64>() / norms.len() as f64;
-    let all_close = norms.iter().all(|n| (n - 1.0).abs() < 0.05);
-    let is_normalized = (mean - 1.0).abs() < 0.01 && all_close;
+    // Precision-aware threshold (SRD §18.3, Higham & Mary 2019)
+    let threshold = etype.normalization_threshold(dim)
+        .unwrap_or(10.0 * 1e-7 * (dim as f64).sqrt());
+    let mean_epsilon = (mean - 1.0).abs();
+    let max_epsilon = norms.iter().map(|n| (n - 1.0).abs()).fold(0.0_f64, f64::max);
+    let is_normalized = mean_epsilon < threshold && max_epsilon < threshold * 5.0;
 
     Some((is_normalized, norms.len(), mean))
 }
@@ -1917,6 +1958,7 @@ pub fn detect_normalized(path: &Path) -> Option<(bool, usize, f64)> {
 /// Uses the same code path as the pipeline — supports npy dirs, xvec
 /// files, and any format that `VecFormat::detect` + `open_source` handles.
 fn probe_directory_vectors(path: &Path) -> Option<(bool, usize, f64)> {
+    use crate::pipeline::element_type::ElementType;
     use veks_core::formats::reader;
     let format = VecFormat::detect(path)?;
     let mut source = reader::open_source(path, format, 1, Some(100)).ok()?;
@@ -1961,8 +2003,17 @@ fn probe_directory_vectors(path: &Path) -> Option<(bool, usize, f64)> {
     if norms.is_empty() { return None; }
 
     let mean = norms.iter().sum::<f64>() / norms.len() as f64;
-    let all_close = norms.iter().all(|n| (n - 1.0).abs() < 0.05);
-    let is_normalized = (mean - 1.0).abs() < 0.01 && all_close;
+    // Infer element type from format for precision-aware threshold (SRD §18.3)
+    let probe_etype = match format {
+        VecFormat::Mvec => ElementType::F16,
+        VecFormat::Dvec => ElementType::F64,
+        _ => ElementType::F32,
+    };
+    let threshold = probe_etype.normalization_threshold(dim)
+        .unwrap_or(10.0 * 1e-7 * (dim as f64).sqrt());
+    let mean_epsilon = (mean - 1.0).abs();
+    let max_epsilon = norms.iter().map(|n| (n - 1.0).abs()).fold(0.0_f64, f64::max);
+    let is_normalized = mean_epsilon < threshold && max_epsilon < threshold * 5.0;
 
     Some((is_normalized, norms.len(), mean))
 }
@@ -2099,6 +2150,7 @@ mod tests {
             sized_profiles: None,
             base_fraction: 1.0,
             required_facets: None,
+            provided_facets: None,
             round_digits: 2,
             pedantic_dedup: false,
             selectivity: 0.0001,

@@ -1,4 +1,4 @@
-<!-- Copyright (c) DataStax, Inc. -->
+<!-- Copyright (c) nosqlbench contributors -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
 # Tutorial: Getting Started with Veks — From Install to Publish

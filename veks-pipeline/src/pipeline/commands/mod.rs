@@ -1,4 +1,4 @@
-// Copyright (c) DataStax, Inc.
+// Copyright (c) nosqlbench contributors
 // SPDX-License-Identifier: Apache-2.0
 
 //! Built-in pipeline command implementations.
@@ -23,6 +23,7 @@ pub mod analyze_slice;
 pub mod analyze_stats;
 pub mod analyze_verifyknn;
 pub mod analyze_verifyprofiles;
+pub mod analyze_normals;
 pub mod analyze_zeros;
 pub mod clean_ordinals;
 pub mod compute_dedup;
@@ -84,6 +85,7 @@ pub fn register_all(registry: &mut CommandRegistry) {
     registry.register("analyze survey", slab::survey_factory);
     registry.register("analyze verify-knn", analyze_verifyknn::factory);
     registry.register("analyze verify-profiles", analyze_verifyprofiles::factory);
+    registry.register("analyze measure-normals", analyze_normals::factory);
     registry.register("analyze zeros", analyze_zeros::factory);
 
     // ── cache ────────────────────────────────────────────────────────

@@ -1,4 +1,4 @@
-<!-- Copyright (c) DataStax, Inc. -->
+<!-- Copyright (c) nosqlbench contributors -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
 # 13 — Data Access Layer
@@ -335,25 +335,253 @@ After prebuffering, subsequent accesses use the mmap fast path.
 
 ## 13.8 Implementation Status
 
-The following components exist in the Rust port:
-
 | Component | Status |
 |---|---|
 | Catalog resolution | Implemented (CatalogSources, Catalog) |
 | Settings/config | Implemented (settings.yaml, cache_dir) |
 | Mount point selection | Implemented (list-mounts) |
-| MmapVectorReader (local) | Implemented |
+| MmapVectorReader (local) | Implemented (f32/f16/f64/i32/i16/u8) |
 | Merkle tree core | Implemented (MerkleRef, MerkleState, .mref/.mrkl) |
-| HTTP transport | Partial (reqwest-based, no chunked/range) |
-| MAFileChannel | **Not implemented** |
-| DatasetLoader | **Not implemented** |
-| VectorView trait | **Not implemented** |
-| On-demand chunk fetching | **Not implemented** |
-| Chunk scheduling | **Not implemented** |
-| Channel → mmap promotion | **Not implemented** |
-| Windowed remote access | **Not implemented** |
+| HTTP transport | Implemented (reqwest, Range requests, parallel chunks) |
+| CachedChannel (MAFileChannel) | Implemented (merkle-verified chunk cache) |
+| DatasetLoader | Implemented (local + catalog specifier resolution) |
+| TypedVectorView trait | Implemented (local + remote, windowed) |
+| On-demand chunk fetching | Implemented (lazy per-chunk download + verify) |
+| Channel → mmap promotion | Implemented (automatic on prebuffer complete) |
+| Windowed remote access | Implemented (window applied at view level) |
+| Dataset attributes + variables | Implemented (synced to dataset.yaml) |
 
-The critical missing piece is the MAFileChannel equivalent — the
-merkle-authenticated, lazily-caching file channel that sits between
-the transport layer and the vector reader. Once this is implemented,
-all other components plug in naturally.
+---
+
+## 13.9 Wire Formats and Interoperability
+
+This section specifies the on-disk and over-the-wire formats precisely
+enough for other languages to implement a compatible client.
+
+### 13.9.1 xvec Binary Format
+
+All vector files (`.fvec`, `.mvec`, `.ivec`, `.dvec`, etc.) use the
+"xvec" format: a flat sequence of records where each record is:
+
+```
+[dim: i32 LE][v0: T][v1: T]...[v_{dim-1}: T]
+```
+
+- `dim` is a 4-byte little-endian signed integer, repeated identically
+  for every record in the file.
+- Each element `v_i` is `sizeof(T)` bytes in little-endian order.
+- The **entry size** is `4 + dim * sizeof(T)` bytes.
+- The **record count** is `file_size / entry_size`.
+
+| Extension | Element type | sizeof(T) |
+|-----------|-------------|-----------|
+| `.fvec`   | float32     | 4         |
+| `.mvec`   | float16     | 2         |
+| `.dvec`   | float64     | 8         |
+| `.ivec`   | int32       | 4         |
+| `.svec`   | int16       | 2         |
+| `.bvec`   | uint8       | 1         |
+
+To read vector `i`: seek to `i * entry_size`, read 4 bytes for dim
+(may be skipped after first read), then read `dim * sizeof(T)` bytes.
+
+### 13.9.2 Merkle Tree Format (.mref)
+
+The `.mref` file contains a complete merkle hash tree over the content
+file, structured as a heap-indexed binary tree:
+
+```
+[node_hashes: node_count * 32 bytes][footer: 41 bytes]
+```
+
+**Hash array layout** (heap-indexed):
+- Index 0: root hash
+- Indices 1..internal_node_count-1: internal nodes
+- Indices internal_node_count..node_count-1: leaf nodes
+- Left child of node `i`: `2*i + 1`
+- Right child of node `i`: `2*i + 2`
+- Parent of node `i`: `(i - 1) / 2`
+
+**Leaf hashes**: `SHA-256(chunk_data)` where each chunk is
+`chunk_size` bytes (last chunk may be shorter).
+
+**Internal node hashes**: `SHA-256(left_child_hash || right_child_hash)`
+
+**Footer (41 bytes, big-endian)**:
+
+| Offset | Size | Type   | Field                |
+|--------|------|--------|----------------------|
+| 0      | 8    | u64 BE | chunk_size           |
+| 8      | 8    | u64 BE | total_content_size   |
+| 16     | 4    | u32 BE | total_chunks         |
+| 20     | 4    | u32 BE | leaf_count (= cap_leaf) |
+| 24     | 4    | u32 BE | cap_leaf (power of 2) |
+| 28     | 4    | u32 BE | node_count           |
+| 32     | 4    | u32 BE | offset (= internal_node_count) |
+| 36     | 4    | u32 BE | internal_node_count  |
+| 40     | 1    | u8     | footer_length (41)   |
+
+**V2 footer (45 bytes)**: Adds `bitset_size: u32 BE` at offset 40,
+footer_length at offset 44 = 45.
+
+This format is byte-compatible with the Java `MerkleTree` serialization.
+
+### 13.9.3 Merkle State Format (.mrkl)
+
+The `.mrkl` file is a superset of `.mref` — the same hash array and
+footer, plus a validity bitset between the hashes and footer:
+
+```
+[node_hashes: node_count * 32 bytes][bitset: ceil(leaf_count/8) bytes][footer]
+```
+
+Each bit in the bitset corresponds to a leaf chunk. Bit `i` = 1 means
+chunk `i` has been downloaded and verified against its hash. Zero bits
+indicate chunks that need to be fetched.
+
+When an `.mref` is first downloaded for a new dataset, it is converted
+to `.mrkl` by appending a zero bitset. As chunks are verified, bits
+are flipped to 1.
+
+### 13.9.4 dataset.yaml Schema
+
+```yaml
+name: string                          # required
+description: string                   # optional
+
+attributes:                           # optional but recommended
+  distance_function: string           # COSINE, L2, DOT_PRODUCT, L1
+  is_normalized: bool                 # vectors are L2-normalized
+  is_zero_vector_free: bool           # required for publishable datasets
+  is_duplicate_vector_free: bool      # required for publishable datasets
+  model: string                       # embedding model name
+  license: string                     # e.g., Apache-2.0
+  vendor: string                      # dataset provider
+  notes: string                       # freeform
+  tags: {key: value, ...}             # freeform key-value
+
+variables:                            # pipeline-produced, dynamic
+  base_count: '340838098'             # after dedup + query extraction
+  vector_count: '407314954'           # raw source vectors
+  duplicate_count: '66466856'         # duplicates removed
+  zero_count: '0'                     # zero vectors found
+  clean_count: '340848098'            # after dedup, before query split
+  # ... additional verified_count:* entries
+
+upstream:                             # pipeline definition
+  defaults:
+    query_count: 10000
+    seed: 42
+  steps:
+    - id: step-name
+      run: "group command"
+      options: {key: value, ...}
+      after: [dependency-ids]
+      per_profile: bool               # expand per sized profile
+      phase: 0                        # execution phase
+
+profiles:
+  default:
+    maxk: 100
+    base_vectors: profiles/base/base_vectors.mvec
+    query_vectors: profiles/base/query_vectors.mvec
+    neighbor_indices: profiles/default/neighbor_indices.ivec
+    neighbor_distances: profiles/default/neighbor_distances.fvec
+  sized:
+    ranges: ["mul:1mi/2"]             # compact spec, expanded at runtime
+    facets:
+      base_vectors: "profiles/base/base_vectors.mvec:${range}"
+      neighbor_indices: "profiles/${profile}/neighbor_indices.ivec"
+```
+
+### 13.9.5 Catalog Format (catalog.json)
+
+```json
+[
+  {
+    "name": "dataset-name",
+    "path": "relative/path/to/dataset.yaml",
+    "dataset_type": "dataset.yaml",
+    "layout": {
+      "attributes": { ... },          // same as dataset.yaml attributes
+      "profiles": {
+        "default": {
+          "maxk": 100,
+          "base_vectors": "profiles/base/base_vectors.mvec",
+          ...
+        },
+        "1mi": {
+          "base_count": 1048576,
+          "base_vectors": {
+            "source": "profiles/base/base_vectors.mvec",
+            "window": [{"min_incl": 0, "max_excl": 1048576}]
+          },
+          ...
+        }
+      }
+    }
+  }
+]
+```
+
+**URL resolution**: Given a catalog at `https://host/path/catalog.json`
+and an entry with `"path": "subdir/dataset.yaml"`, the dataset URL is
+`https://host/path/subdir/dataset.yaml`. Facet URLs are relative to
+the dataset directory: `https://host/path/subdir/profiles/base/file.mvec`.
+
+### 13.9.6 Catalog Discovery
+
+Catalogs are configured in `~/.config/vectordata/catalogs.yaml`:
+
+```yaml
+- https://example.com/datasets/
+- /local/path/to/datasets/
+```
+
+Each entry is a base URL. The client appends `catalog.json` to
+discover datasets. Multiple catalogs are merged — entries from all
+catalogs are visible, with name collisions resolved by first-match.
+
+### 13.9.7 Settings (settings.yaml)
+
+Location: `~/.config/vectordata/settings.yaml`
+
+```yaml
+cache_dir: /path/to/cache      # local cache for remote datasets
+protect_settings: true          # prevent auto-modification
+```
+
+### 13.9.8 Standard Facet Keys
+
+| Key | Description | Format |
+|-----|-------------|--------|
+| `base_vectors` | Corpus vectors for search | fvec/mvec |
+| `query_vectors` | Query vectors for evaluation | fvec/mvec |
+| `neighbor_indices` | Ground-truth KNN neighbor ordinals | ivec |
+| `neighbor_distances` | Ground-truth KNN distances | fvec |
+| `filtered_neighbor_indices` | Filtered KNN neighbor ordinals | ivec |
+| `filtered_neighbor_distances` | Filtered KNN distances | fvec |
+| `metadata_content` | Metadata records | slab |
+| `metadata_predicates` | Predicate trees for filtering | slab |
+| `metadata_indices` | Predicate evaluation results | slab |
+
+### 13.9.9 Profile Naming Convention
+
+Sized profile names use SI/IEC suffixes with compound notation:
+
+| Suffix | Multiplier |
+|--------|-----------|
+| `k`    | 1,000 |
+| `m`    | 1,000,000 |
+| `g`    | 1,000,000,000 |
+| `t`    | 1,000,000,000,000 |
+| `ki`   | 1,024 |
+| `mi`   | 1,048,576 |
+| `gi`   | 1,073,741,824 |
+| `ti`   | 1,099,511,627,776 |
+
+Compound: `1g24m` = 1,024,000,000. Binary doubling series use IEC
+suffixes: `1mi, 2mi, 4mi, ..., 512mi, 1gi, 2gi, ...`.
+
+Profiles are sorted by `base_count` ascending (derived from name if
+not explicit), with `default` always first.

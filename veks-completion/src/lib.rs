@@ -1,4 +1,4 @@
-// Copyright (c) DataStax, Inc.
+// Copyright (c) nosqlbench contributors
 // SPDX-License-Identifier: Apache-2.0
 
 //! Dynamic shell completion engine for CLI tools.
@@ -252,17 +252,26 @@ pub fn complete(tree: &CommandTree, words: &[&str]) -> Vec<String> {
         }
         Node::Leaf { options, value_providers } => {
             // Check if the previous word is an option with a per-command
-            // value provider (e.g., user typed `--dataset <TAB>`)
+            // or global value provider (e.g., user typed `--dataset <TAB>`)
             if let Some(&prev_word) = remaining.last() {
                 if let Some(provider) = value_providers.get(prev_word) {
                     return provider(partial);
                 }
             }
             if partial.starts_with('-') || partial.is_empty() {
-                options.iter()
+                // Include both the command's own options AND global provider
+                // option names (like --dataset) so they complete everywhere.
+                let mut candidates: Vec<String> = options.iter()
                     .filter(|o| o.starts_with(partial))
                     .map(|o| o.to_string())
-                    .collect()
+                    .collect();
+                for global_opt in tree.global_value_providers.keys() {
+                    if global_opt.starts_with(partial) && !candidates.contains(global_opt) {
+                        candidates.push(global_opt.clone());
+                    }
+                }
+                candidates.sort();
+                candidates
             } else {
                 Vec::new()
             }

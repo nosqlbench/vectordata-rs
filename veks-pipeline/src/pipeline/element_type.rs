@@ -1,4 +1,4 @@
-// Copyright (c) DataStax, Inc.
+// Copyright (c) nosqlbench contributors
 // SPDX-License-Identifier: Apache-2.0
 
 //! Shared element type enum for vector file formats.
@@ -74,6 +74,37 @@ impl ElementType {
             self,
             ElementType::F64 | ElementType::F32 | ElementType::F16 | ElementType::I8
         )
+    }
+
+    /// Returns the machine epsilon for floating-point element types.
+    ///
+    /// Machine epsilon is the smallest value such that `1.0 + ε > 1.0` in
+    /// the given precision. For integer types, returns `None`.
+    ///
+    /// | Type | ε_mach          | Significant digits |
+    /// |------|-----------------|--------------------|
+    /// | F16  | 9.77 × 10⁻⁴    | ~3.3               |
+    /// | F32  | 1.19 × 10⁻⁷    | ~7.2               |
+    /// | F64  | 2.22 × 10⁻¹⁶   | ~15.9              |
+    pub fn machine_epsilon(&self) -> Option<f64> {
+        match self {
+            ElementType::F16 => Some(9.77e-4_f64),   // 2^{-10}
+            ElementType::F32 => Some(1.19e-7_f64),   // 2^{-23}
+            ElementType::F64 => Some(2.22e-16_f64),   // 2^{-52}
+            _ => None,
+        }
+    }
+
+    /// Compute the normalization threshold for this element type and dimension.
+    ///
+    /// Uses the probabilistic rounding-error bound from Higham & Mary (2019):
+    /// the expected epsilon for a correctly normalized vector stored at
+    /// precision *p* is O(√dim × ε_mach(p)). The constant C = 10 provides
+    /// ~10× headroom above the expected error floor. See SRD §18.3.
+    ///
+    /// Returns `None` for non-float element types.
+    pub fn normalization_threshold(&self, dim: usize) -> Option<f64> {
+        self.machine_epsilon().map(|eps| 10.0 * eps * (dim as f64).sqrt())
     }
 
     /// Returns the size of a single element in bytes.
@@ -287,5 +318,35 @@ mod tests {
         assert_eq!(format!("{}", ElementType::F64), "f64");
         assert_eq!(format!("{}", ElementType::F32), "f32");
         assert_eq!(format!("{}", ElementType::I8), "i8");
+    }
+
+    #[test]
+    fn test_machine_epsilon() {
+        assert!(ElementType::F16.machine_epsilon().unwrap() > 9e-4);
+        assert!(ElementType::F16.machine_epsilon().unwrap() < 1e-3);
+        assert!(ElementType::F32.machine_epsilon().unwrap() > 1e-7);
+        assert!(ElementType::F32.machine_epsilon().unwrap() < 2e-7);
+        assert!(ElementType::F64.machine_epsilon().unwrap() > 2e-16);
+        assert!(ElementType::F64.machine_epsilon().unwrap() < 3e-16);
+        assert!(ElementType::I32.machine_epsilon().is_none());
+        assert!(ElementType::U8.machine_epsilon().is_none());
+    }
+
+    #[test]
+    fn test_normalization_threshold() {
+        // f32, dim=768: 10 × 1.19e-7 × sqrt(768) ≈ 3.30e-5
+        let t = ElementType::F32.normalization_threshold(768).unwrap();
+        assert!(t > 3e-5 && t < 4e-5, "f32 dim=768 threshold={}", t);
+
+        // f16, dim=128: 10 × 9.77e-4 × sqrt(128) ≈ 0.11
+        let t = ElementType::F16.normalization_threshold(128).unwrap();
+        assert!(t > 0.10 && t < 0.12, "f16 dim=128 threshold={}", t);
+
+        // f64, dim=1536: 10 × 2.22e-16 × sqrt(1536) ≈ 8.7e-14
+        let t = ElementType::F64.normalization_threshold(1536).unwrap();
+        assert!(t > 8e-14 && t < 9e-14, "f64 dim=1536 threshold={}", t);
+
+        // Integer types return None
+        assert!(ElementType::I32.normalization_threshold(768).is_none());
     }
 }

@@ -1,4 +1,4 @@
-// Copyright (c) DataStax, Inc.
+// Copyright (c) nosqlbench contributors
 // SPDX-License-Identifier: Apache-2.0
 
 //! `veks interact explore` — unified vector space analysis TUI.
@@ -291,7 +291,17 @@ impl WelfordStats {
         if x > self.max { self.max = x; }
     }
     fn std_dev(&self) -> f64 { if self.count < 2 { 0.0 } else { (self.m2 / self.count as f64).sqrt() } }
-    fn is_normalized(&self) -> bool { self.count > 10 && self.std_dev() < 0.01 && (self.mean - 1.0).abs() < 0.01 }
+    /// Check if tracked norms indicate normalized vectors (SRD §18.3).
+    ///
+    /// Uses the f32 machine epsilon as a conservative default — covers the
+    /// overwhelmingly common case and errs on the strict side for f16.
+    fn is_normalized(&self, dim: usize) -> bool {
+        if self.count < 10 { return false; }
+        let threshold = 10.0 * 1.19e-7_f64 * (dim as f64).sqrt();
+        let mean_eps = (self.mean - 1.0).abs();
+        let max_eps = (self.min - 1.0).abs().max((self.max - 1.0).abs());
+        mean_eps < threshold && max_eps < threshold * 5.0
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -816,7 +826,7 @@ pub(super) fn run_interactive_explore(
             }
             V_NORMS | V_NORMCURVE => {
                 if norm_stats.count > 0 {
-                    let verdict = if norm_stats.is_normalized() { "NORMALIZED" } else { "not normalized" };
+                    let verdict = if norm_stats.is_normalized(dim) { "NORMALIZED" } else { "not normalized" };
                     format!("mean={:.4} std={:.4} min={:.4} max={:.4} {}", norm_stats.mean, norm_stats.std_dev(), norm_stats.min, norm_stats.max, verdict)
                 } else { String::new() }
             }

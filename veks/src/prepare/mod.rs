@@ -1,4 +1,4 @@
-// Copyright (c) DataStax, Inc.
+// Copyright (c) nosqlbench contributors
 // SPDX-License-Identifier: Apache-2.0
 
 //! `veks prepare` — dataset preparation commands.
@@ -128,6 +128,13 @@ pub enum PrepareCommand {
         /// facets are inferred from available inputs (B->BQGD, M->BQGDMPR, B+M->BQGDMPRF).
         #[arg(long)]
         required_facets: Option<String>,
+
+        /// Provided input facets (e.g., "BQ", "base,query").
+        /// When set, only these inputs are considered as provided — any
+        /// detected inputs not in this set are disregarded. Use when
+        /// multiple input files are present but not all should be used.
+        #[arg(long)]
+        provided_facets: Option<String>,
 
         /// Significant digits for computed counts (base_end, etc.).
         /// Default 2 produces clean sizes (180M instead of 184623729).
@@ -312,7 +319,7 @@ pub fn run(args: PrepareArgs) {
             self_search, query_count, metadata, ground_truth,
             ground_truth_distances, metric, neighbors, seed, description,
             no_dedup, no_zero_check, no_filtered, normalize, force, restart,
-            base_fraction, required_facets, round_digits, pedantic_dedup, auto,
+            base_fraction, required_facets, provided_facets, round_digits, pedantic_dedup, auto,
         } => {
             // --auto implies -i -r -y
             let interactive = interactive || auto;
@@ -466,6 +473,7 @@ pub fn run(args: PrepareArgs) {
                         sized_profiles: None,
                         base_fraction,
                         required_facets: required_facets.clone(),
+                        provided_facets: provided_facets.clone(),
                         round_digits,
                         pedantic_dedup,
                         selectivity: 0.0001,
@@ -519,6 +527,7 @@ pub fn run(args: PrepareArgs) {
                     sized_profiles: None,
                     base_fraction,
                     required_facets,
+                    provided_facets,
                     round_digits,
                     pedantic_dedup,
                     selectivity: 0.0001,

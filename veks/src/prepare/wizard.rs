@@ -1,4 +1,4 @@
-// Copyright (c) DataStax, Inc.
+// Copyright (c) nosqlbench contributors
 // SPDX-License-Identifier: Apache-2.0
 
 //! Interactive wizard for `datasets import --interactive`.
@@ -189,6 +189,7 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
             sized_profiles: None,
             base_fraction: 1.0,
             required_facets: None,
+            provided_facets: None,
             round_digits: 2,
             pedantic_dedup: false,
             selectivity: 0.0001,
@@ -879,6 +880,7 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
         sized_profiles,
         base_fraction,
         required_facets,
+        provided_facets: None,
         round_digits: seeds.round_digits.unwrap_or(2),
         pedantic_dedup: seeds.pedantic_dedup.unwrap_or(false),
         selectivity,

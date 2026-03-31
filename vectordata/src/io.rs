@@ -1,4 +1,4 @@
-// Copyright (c) DataStax, Inc.
+// Copyright (c) nosqlbench contributors
 // SPDX-License-Identifier: Apache-2.0
 
 //! Vector I/O: readers for fvec, ivec, mvec, dvec, bvec, and svec binary formats.

@@ -1,4 +1,4 @@
-<!-- Copyright (c) DataStax, Inc. -->
+<!-- Copyright (c) nosqlbench contributors -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
 # vectordata-rs Design Documentation
@@ -28,6 +28,9 @@ benchmarking.
 | [13-data-access-layer.md](13-data-access-layer.md) | Data access layer: DatasetLoader API, MAFileChannel, merkle-verified chunk caching, windowed remote access, transport layer |
 | [14-pipeline-dag-configurations.md](14-pipeline-dag-configurations.md) | DAG configuration test specification: 18 configurations, ASCII diagrams, variable reference rules |
 | [15-facet-swimlane.md](15-facet-swimlane.md) | Facet swimlane diagram: BQGDMPRF lanes, cross-lane dependencies, activation rules, ordinal congruency |
+| [16-virtdata-vector-generation.md](16-virtdata-vector-generation.md) | VirtData vector generation: VectorSpaceModel JSON, dimension sampling, distribution fitting |
+| [17-vshapes-statistical-modeling.md](17-vshapes-statistical-modeling.md) | Vshapes: statistical model extraction from real vector data, Pearson family fitting |
+| [18-normalization-analysis.md](18-normalization-analysis.md) | Normalization analysis: f64-precision epsilon measurement, dimension/precision-aware threshold (Higham bounds) |
 
 ## Audience
 

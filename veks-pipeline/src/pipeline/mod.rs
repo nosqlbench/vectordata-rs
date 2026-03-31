@@ -1,4 +1,4 @@
-// Copyright (c) DataStax, Inc.
+// Copyright (c) nosqlbench contributors
 // SPDX-License-Identifier: Apache-2.0
 
 //! Command stream pipeline framework for veks.
@@ -731,6 +731,7 @@ fn update_dataset_attributes(dataset_path: &Path, workspace: &Path) {
     // Build attribute lines to inject/update
     let is_zero_free = vars.get("zero_count").map(|v| v == "0");
     let is_dedup_free = vars.get("duplicate_count").map(|v| v == "0");
+    let is_normalized = vars.get("is_normalized").map(|v| v == "true");
 
     // Remove existing variables block if present
     let mut patched = if let Some(pos) = original.find("\nvariables:") {
@@ -801,6 +802,26 @@ fn update_dataset_attributes(dataset_path: &Path, workspace: &Path) {
             let mut new = String::new();
             for line in patched.lines() {
                 if line.trim_start().starts_with("is_duplicate_vector_free:") {
+                    new.push_str(&attr_line);
+                } else {
+                    new.push_str(line);
+                }
+                new.push('\n');
+            }
+            patched = new;
+        } else if let Some(pos) = patched.find("\nattributes:") {
+            let insert_pos = patched[pos + 1..].find('\n').map(|p| pos + 1 + p + 1).unwrap_or(patched.len());
+            patched.insert_str(insert_pos, &format!("{}\n", attr_line));
+        }
+    }
+
+    // Patch is_normalized attribute
+    if let Some(val) = is_normalized {
+        let attr_line = format!("  is_normalized: {}", val);
+        if patched.contains("is_normalized:") {
+            let mut new = String::new();
+            for line in patched.lines() {
+                if line.trim_start().starts_with("is_normalized:") {
                     new.push_str(&attr_line);
                 } else {
                     new.push_str(line);

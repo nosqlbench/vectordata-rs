@@ -1,4 +1,4 @@
-<!-- Copyright (c) DataStax, Inc. -->
+<!-- Copyright (c) nosqlbench contributors -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
 # Example: Rendering One Record in All Formats
