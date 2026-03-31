@@ -457,7 +457,7 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
                 println!("    - Without normalization, KNN falls back to per-pair computation");
                 println!("    - Normalization is applied during extraction (source data unchanged)");
                 println!();
-                let do_normalize = confirm("L2-normalize vectors during extraction?", true);
+                let do_normalize = confirm("L2-normalize vectors during extraction?", false);
                 (do_normalize, source_metric)
             } else {
                 println!("  Metric {} does not benefit from normalization.", source_metric);
