@@ -4905,7 +4905,7 @@ dependencies = [
 
 [[package]]
 name = "veks"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "arrow",
  "atty",
@@ -4940,11 +4940,11 @@ dependencies = [
 
 [[package]]
 name = "veks-completion"
-version = "0.10.1"
+version = "0.11.0"
 
 [[package]]
 name = "veks-core"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "arrow",
  "atty",
@@ -4969,7 +4969,7 @@ dependencies = [
 
 [[package]]
 name = "veks-pipeline"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "atty",
  "byteorder",
