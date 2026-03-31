@@ -357,21 +357,16 @@ fn resolve_slots(args: &ImportArgs) -> PipelineSlots {
         } else {
             Artifact::Materialized {
                 step_id: "convert-queries".into(),
-                output: "query_vectors.fvec".into(),
+                output: format!("query_vectors.{}", vec_ext),
             }
         };
-        // Base = canonical profile path (symlinked to all_vectors)
-        let ext = args.base_vectors.as_ref()
-            .and_then(|p| p.extension().map(|e| e.to_string_lossy().to_string()))
-            .unwrap_or_else(|| "mvec".to_string());
-        let bv = Artifact::Identity { path: format!("profiles/base/base_vectors.{}", ext) };
+        // Base = canonical profile path. When base needed import (HDF5, npy, etc.)
+        // use the converted output extension, not the source extension.
+        let bv = Artifact::Identity { path: format!("profiles/base/base_vectors.{}", vec_ext) };
         (None, Some(qv), bv, None)
     } else {
         // No queries at all — use canonical profile path (symlinked)
-        let ext = args.base_vectors.as_ref()
-            .and_then(|p| p.extension().map(|e| e.to_string_lossy().to_string()))
-            .unwrap_or_else(|| "mvec".to_string());
-        let bv = Artifact::Identity { path: format!("profiles/base/base_vectors.{}", ext) };
+        let bv = Artifact::Identity { path: format!("profiles/base/base_vectors.{}", vec_ext) };
         (None, None, bv, None)
     };
 
