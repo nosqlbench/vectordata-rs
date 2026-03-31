@@ -347,7 +347,7 @@ fn resolve_slots(args: &ImportArgs) -> PipelineSlots {
         };
         (Some(shuffle), Some(qv), bv, Some(bc))
     } else if has_separate_query {
-        // Separate query file — use canonical profile paths with symlinks
+        // Separate query file
         let query_source = args.query_vectors.as_ref().unwrap();
         let qv = if is_native_xvec_file(query_source) {
             let ext = query_source.extension()
@@ -360,9 +360,17 @@ fn resolve_slots(args: &ImportArgs) -> PipelineSlots {
                 output: format!("query_vectors.{}", vec_ext),
             }
         };
-        // Base = canonical profile path. When base needed import (HDF5, npy, etc.)
-        // use the converted output extension, not the source extension.
-        let bv = Artifact::Identity { path: format!("profiles/base/base_vectors.{}", vec_ext) };
+        // Base: when import was needed (HDF5, npy, etc.), extract from
+        // the converted all_vectors to the profile path. When native xvec,
+        // use a symlink (Identity).
+        let bv = if needs_import {
+            Artifact::Materialized {
+                step_id: "extract-base".into(),
+                output: format!("profiles/base/base_vectors.{}", vec_ext),
+            }
+        } else {
+            Artifact::Identity { path: format!("profiles/base/base_vectors.{}", vec_ext) }
+        };
         (None, Some(qv), bv, None)
     } else {
         // No queries at all — use canonical profile path (symlinked)
@@ -910,7 +918,66 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
                     ("facet".into(), "query_vectors".into()),
                     ("source".into(), relativize_path(query_source, &args.output)),
                     ("from".into(), format),
-                    ("output".into(), "query_vectors.fvec".into()),
+                    ("output".into(), qv.path().into()),
+                ],
+            });
+        }
+        // When base needed import (HDF5, npy, etc.) with separate queries,
+        // extract the converted all_vectors to the profile path.
+        if slots.base_vectors.is_materialized() {
+            let working = slots.all_vectors.path();
+            let after = if slots.clean_ordinals.is_materialized() {
+                vec!["filter-ordinals".into()]
+            } else if slots.all_vectors.is_materialized() {
+                vec!["convert-vectors".into()]
+            } else {
+                vec![]
+            };
+            let mut base_opts = vec![
+                ("source".into(), working.into()),
+                ("output".into(), slots.base_vectors.path().into()),
+            ];
+            if slots.clean_ordinals.is_materialized() {
+                base_opts.push(("ivec-file".into(), slots.clean_ordinals.path().into()));
+                base_opts.push(("range".into(), format!("[0,{})", "${vector_count}")));
+            }
+            if args.normalize {
+                base_opts.push(("normalize".into(), "true".into()));
+            }
+            steps.push(Step {
+                id: "extract-base".into(),
+                run: "transform extract".into(),
+                description: Some("Extract base vectors to profile".into()),
+                after,
+                per_profile: false,
+                phase: 0,
+                options: base_opts,
+            });
+            // Count base vectors
+            steps.push(Step {
+                id: "count-base".into(),
+                run: "state set".into(),
+                description: None,
+                after: vec!["extract-base".into()],
+                per_profile: false,
+                phase: 0,
+                options: vec![
+                    ("name".into(), "base_count".into()),
+                    ("value".into(), format!("count:{}", slots.base_vectors.path())),
+                ],
+            });
+            // Measure normalization
+            steps.push(Step {
+                id: "measure-normals".into(),
+                run: "analyze measure-normals".into(),
+                description: Some("Measure L2 normalization precision at f64".into()),
+                after: vec!["extract-base".into()],
+                per_profile: false,
+                phase: 0,
+                options: vec![
+                    ("input".into(), slots.base_vectors.path().into()),
+                    ("sample".into(), "10000".into()),
+                    ("seed".into(), format!("${{{}}}", "seed")),
                 ],
             });
         }
@@ -1356,15 +1423,9 @@ fn generate_yaml(
     // Attributes
     out.push_str("\nattributes:\n");
     out.push_str(&format!("  distance_function: {}\n", args.metric));
-    if args.normalize {
-        out.push_str("  is_normalized: true\n");
-    }
-    if !args.no_dedup {
-        out.push_str("  is_duplicate_vector_free: true\n");
-    }
-    if !args.no_zero_check {
-        out.push_str("  is_zero_vector_free: true\n");
-    }
+    // is_normalized, is_duplicate_vector_free, and is_zero_vector_free
+    // are set by the pipeline after the relevant steps complete — not
+    // at generation time when correctness hasn't been verified yet.
 
     // Upstream pipeline
     if !steps.is_empty() {
