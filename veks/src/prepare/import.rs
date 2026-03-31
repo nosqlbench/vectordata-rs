@@ -1475,7 +1475,18 @@ fn generate_yaml(
 // ---------------------------------------------------------------------------
 
 /// Run the `datasets import` subcommand.
-pub fn run(args: ImportArgs) {
+pub fn run(mut args: ImportArgs) {
+    // Apply --provided-facets masking: null out inputs for facets not
+    // in the provided set so the pipeline generates compute steps for them.
+    if let Some(ref provided) = args.provided_facets {
+        let p = parse_facet_spec(provided);
+        if !p.contains('B') { args.base_vectors = None; }
+        if !p.contains('Q') { args.query_vectors = None; }
+        if !p.contains('G') { args.ground_truth = None; }
+        if !p.contains('D') { args.ground_truth_distances = None; }
+        if !p.contains('M') { args.metadata = None; }
+    }
+
     let output_dir = &args.output;
 
     if output_dir.exists() && !args.force {

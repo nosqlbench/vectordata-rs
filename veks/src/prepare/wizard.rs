@@ -45,6 +45,7 @@ pub struct WizardSeeds {
     pub base_fraction: Option<f64>,
     pub pedantic_dedup: Option<bool>,
     pub required_facets: Option<String>,
+    pub provided_facets: Option<String>,
     pub round_digits: Option<u32>,
     pub selectivity: Option<f64>,
 }
@@ -105,7 +106,18 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
     }
 
     // ── Filename-keyword role detection ──────────────────────────────
-    let detected = detect_roles(&candidates);
+    let mut detected = detect_roles(&candidates);
+
+    // Apply --provided-facets masking: null out detected inputs for
+    // facets not in the provided set so the pipeline computes them.
+    if let Some(ref pf) = seeds.provided_facets {
+        let p = crate::prepare::import::parse_facet_spec(pf);
+        if !p.contains('B') { detected.base_vectors = None; }
+        if !p.contains('Q') { detected.query_vectors = None; }
+        if !p.contains('G') { detected.neighbor_indices = None; }
+        if !p.contains('D') { detected.neighbor_distances = None; }
+        if !p.contains('M') { detected.metadata = None; }
+    }
 
     // In --auto mode, all candidate files must have recognized roles.
     if AUTO_MODE.load(Ordering::Relaxed) && !detected.unassigned.is_empty() {
@@ -189,7 +201,7 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
             sized_profiles: None,
             base_fraction: 1.0,
             required_facets: None,
-            provided_facets: None,
+            provided_facets: seeds.provided_facets.clone(),
             round_digits: 2,
             pedantic_dedup: false,
             selectivity: 0.0001,
@@ -880,7 +892,7 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
         sized_profiles,
         base_fraction,
         required_facets,
-        provided_facets: None,
+        provided_facets: seeds.provided_facets.clone(),
         round_digits: seeds.round_digits.unwrap_or(2),
         pedantic_dedup: seeds.pedantic_dedup.unwrap_or(false),
         selectivity,

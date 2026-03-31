@@ -451,6 +451,7 @@ pub fn run(args: PrepareArgs) {
                         base_fraction: if base_fraction < 1.0 { Some(base_fraction) } else { None },
                         pedantic_dedup: if pedantic_dedup { Some(true) } else { None },
                         required_facets: required_facets.clone(),
+                        provided_facets: provided_facets.clone(),
                         round_digits: Some(round_digits),
                         selectivity: None,
                     };
@@ -507,6 +508,7 @@ pub fn run(args: PrepareArgs) {
                     base_fraction: if base_fraction < 1.0 { Some(base_fraction) } else { None },
                     pedantic_dedup: if pedantic_dedup { Some(true) } else { None },
                     required_facets: required_facets.clone(),
+                    provided_facets: provided_facets.clone(),
                     round_digits: Some(round_digits),
                     selectivity: None,
                 };
