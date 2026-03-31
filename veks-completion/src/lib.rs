@@ -138,11 +138,11 @@ pub struct CommandTree {
     /// Root node (always a group).
     pub root: Node,
     /// Commands that exist but are hidden from root-level listing.
-    pub(crate) hidden: std::collections::HashSet<String>,
+    pub hidden: std::collections::HashSet<String>,
     /// Global value providers keyed by option name. These fire for ANY
     /// command when the previous word matches the option. Used for
     /// ubiquitous options like `--dataset` that appear across many commands.
-    global_value_providers: BTreeMap<String, ValueProvider>,
+    pub global_value_providers: BTreeMap<String, ValueProvider>,
 }
 
 impl CommandTree {

@@ -250,11 +250,11 @@ fn build_help_completion_command() -> clap::Command {
 }
 
 fn main() {
-    // Dynamic completion engine — handles all shell completion.
-    // Handles _VEKS_COMPLETE=bash (from our dyncomp script) and also
-    // intercepts COMPLETE=bash (from any stale clap-generated scripts)
-    // to prevent clap's eager subcommand chaining.
-    if cli::dyncomp::handle_complete_env() {
+    // Dynamic completion engine — walks the augmented clap tree so
+    // completion candidates are always in sync with the actual CLI.
+    // Handles _VEKS_COMPLETE=bash and legacy COMPLETE=bash.
+    let augmented = build_augmented_cli();
+    if cli::dyncomp::handle_complete_env(&augmented) {
         std::process::exit(0);
     }
 

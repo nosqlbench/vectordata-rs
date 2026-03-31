@@ -1,130 +1,38 @@
 // Copyright (c) nosqlbench contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Builds the veks command tree for dynamic completion using `veks-completion`.
+//! Dynamic shell completion engine for veks.
+//!
+//! Walks the clap `Command` tree at completion time so the completion
+//! candidates are always in sync with the actual CLI definition. No
+//! static command map — the tree is built from `build_augmented_cli()`
+//! on every invocation.
 
 use veks_completion::{CommandTree, Node};
 
-/// Build the full veks command tree for shell completion.
-pub fn build_tree() -> CommandTree {
-    let registry = crate::pipeline::registry::CommandRegistry::with_builtins();
+/// Build the completion tree by walking a clap `Command` recursively.
+///
+/// This is the single source of truth: every subcommand, option, and
+/// alias defined via clap's derive macros or `build_augmented_cli()`
+/// appears automatically — nothing to keep in sync by hand.
+pub fn build_tree(cmd: &clap::Command) -> CommandTree {
+    let app_name = cmd.get_name();
+    let root = walk_clap_command(cmd);
 
-    // Build pipeline groups from the command registry
-    let mut pipeline_groups: std::collections::BTreeMap<String, Vec<(String, Vec<String>)>> =
-        std::collections::BTreeMap::new();
-    for path in registry.command_paths() {
-        let mut parts = path.splitn(2, ' ');
-        let group = parts.next().unwrap_or("").to_string();
-        let command = parts.next().unwrap_or("").to_string();
-        let options: Vec<String> = if let Some(factory) = registry.get(&path) {
-            let cmd = factory();
-            cmd.describe_options().iter()
-                .map(|o| format!("--{}", o.name))
-                .collect()
-        } else {
-            Vec::new()
-        };
-        pipeline_groups.entry(group).or_default().push((command, options));
-    }
-
-    // Build pipeline node
-    let mut pipeline_node = Node::empty_group();
-    for (group_name, commands) in &pipeline_groups {
-        let mut group_node = Node::empty_group();
-        for (cmd_name, opts) in commands {
-            if cmd_name.is_empty() {
-                // Direct command (no subcommand within group)
-                group_node = Node::leaf(&opts.iter().map(|s| s.as_str()).collect::<Vec<_>>());
-                break;
-            }
-            let opt_refs: Vec<&str> = opts.iter().map(|s| s.as_str()).collect();
-            group_node = group_node.with_child(cmd_name, Node::leaf(&opt_refs));
-        }
-        pipeline_node = pipeline_node.with_child(group_name, group_node);
-    }
-
-    // Build the tree
-    let mut tree = CommandTree::new("veks")
-        .command("pipeline", pipeline_node.clone())
-        .command("datasets", Node::group(vec![
-            ("cache-status", Node::leaf(&["--dataset", "--all", "--verbose", "--tree", "--configdir", "--catalog", "--at"])),
-            ("config", Node::empty_group()),
-            ("curlify", Node::leaf(&["--dataset", "--profile", "--configdir", "--catalog", "--at"])),
-            ("list", Node::leaf(&["--configdir", "--catalog", "--at", "--output-format", "--verbose", "--group-by",
-                "--matching-profile", "--select", "--matching-name", "--with-facet", "--with-metric",
-                "--matching-desc", "--with-min-size", "--with-max-size", "--with-size",
-                "--with-min-dim", "--with-max-dim", "--with-dim", "--with-vtype",
-                "--with-data-min", "--with-data-max", "--cached"])),
-            ("prebuffer", Node::leaf(&["--dataset", "--profile", "--configdir", "--catalog", "--at", "--cache-dir"])),
-            ("probe", Node::leaf(&["--at", "--dataset", "--profile"])),
-        ]))
-        .command("prepare", Node::group(vec![
-            ("cache-compress", Node::leaf(&[])),
-            ("cache-uncompress", Node::leaf(&[])),
-            ("catalog", Node::group(vec![
-                ("generate", Node::leaf(&["--for-publish-url", "--update", "--no-update"])),
-            ])),
-            ("check", Node::leaf(&["--check-all", "--check-pipelines", "--check-publish",
-                "--check-merkle", "--check-integrity", "--check-catalogs",
-                "--check-extraneous", "--clean", "--clean-files", "--json", "--quiet",
-                "--update-pipeline"])),
-            ("import", Node::leaf(&["--source", "--metric", "--normalize", "--self-search"])),
-            ("run", Node::leaf(&["--dry-run", "--clean", "--threads", "--resources", "--profile"])),
-            ("stratify", Node::leaf(&[])),
-            ("wizard", Node::leaf(&[])),
-        ]))
-        .command("interact", Node::group(vec![
-            ("explore", Node::leaf(&["--dataset", "--source", "--profile", "--sample", "--seed", "--sample-mode"])),
-            ("shell", Node::leaf(&["--dataset", "--source", "--profile"])),
-        ]))
-        .command("help", {
-            // help accepts pipeline group names then command names
-            let mut help_node = Node::empty_group();
-            for (group_name, commands) in &pipeline_groups {
-                let mut group_cmds = Node::empty_group();
-                for (cmd_name, _) in commands {
-                    if !cmd_name.is_empty() {
-                        group_cmds = group_cmds.with_child(cmd_name, Node::leaf(&[]));
-                    }
-                }
-                help_node = help_node.with_child(group_name, group_cmds);
-            }
-            // Also add static commands as help targets
-            for name in &["run", "check", "publish", "explore", "datasets", "prepare"] {
-                help_node = help_node.with_child(name, Node::leaf(&[]));
-            }
-            help_node = help_node.with_child("--list", Node::leaf(&[]));
-            help_node
-        })
-        // Hidden shortcuts for commonly used leaf commands
-        .hidden_command("run", Node::leaf(&["--dry-run", "--clean", "--threads", "--resources", "--profile"]))
-        .hidden_command("check", Node::leaf(&["--check-all", "--check-pipelines", "--check-publish",
-            "--check-merkle", "--check-integrity", "--check-catalogs",
-            "--check-extraneous", "--clean", "--clean-files", "--json", "--quiet",
-            "--update-pipeline"]))
-        .hidden_command("publish", Node::leaf(&["--dry-run", "--delete", "--size-only", "--yes",
-            "--profile", "--endpoint-url"]))
-        .hidden_command("explore", Node::leaf(&["--dataset", "--source", "--profile", "--sample", "--seed"]))
-        .hidden_command("completions", Node::leaf(&["--shell"]));
-
-    // Also add --help and --version as root-level options
-    tree = tree.command("--help", Node::leaf(&[]))
-        .command("--version", Node::leaf(&[]));
-
-    // Add pipeline groups as hidden top-level shortcuts.
-    // Hidden commands don't appear in the initial `veks <TAB>` listing
-    // but DO complete when the user starts typing (e.g., `veks comp<TAB>`).
-    for (group_name, commands) in &pipeline_groups {
-        let mut group_node = Node::empty_group();
-        for (cmd_name, opts) in commands {
-            if cmd_name.is_empty() { continue; }
-            let opt_refs: Vec<&str> = opts.iter().map(|s| s.as_str()).collect();
-            group_node = group_node.with_child(cmd_name, Node::leaf(&opt_refs));
-        }
-        if tree.root.child(group_name).is_none() {
-            tree = tree.hidden_command(group_name, group_node);
+    // Identify hidden commands
+    let mut hidden: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for sub in cmd.get_subcommands() {
+        if sub.is_hide_set() {
+            hidden.insert(sub.get_name().to_string());
         }
     }
+
+    let mut tree = CommandTree {
+        app_name: app_name.to_string(),
+        root,
+        hidden,
+        global_value_providers: std::collections::BTreeMap::new(),
+    };
 
     // Global value providers for options that appear across many commands
     tree = tree
@@ -135,6 +43,46 @@ pub fn build_tree() -> CommandTree {
         .global_value_provider("--shell", complete_shells);
 
     tree
+}
+
+/// Recursively convert a clap `Command` into a completion `Node`.
+fn walk_clap_command(cmd: &clap::Command) -> Node {
+    let subs: Vec<_> = cmd.get_subcommands().collect();
+
+    if subs.is_empty() {
+        // Leaf command — collect its options
+        let options: Vec<String> = cmd.get_arguments()
+            .filter(|a| a.get_id() != "help" && a.get_id() != "version")
+            .flat_map(|a| {
+                let mut names = Vec::new();
+                if let Some(long) = a.get_long() {
+                    names.push(format!("--{}", long));
+                }
+                if names.is_empty() {
+                    if let Some(short) = a.get_short() {
+                        names.push(format!("-{}", short));
+                    }
+                }
+                names
+            })
+            .collect();
+        Node::Leaf {
+            options,
+            value_providers: std::collections::BTreeMap::new(),
+        }
+    } else {
+        // Group command — recurse into children
+        let mut children = std::collections::BTreeMap::new();
+        for sub in subs {
+            let name = sub.get_name().to_string();
+            let child = walk_clap_command(sub);
+            children.insert(name, child);
+        }
+        // If this group also has its own options (e.g., --help, --version
+        // at root), they'll be picked up by the tree walk logic in
+        // veks-completion when the node is a Group with options.
+        Node::Group { children }
+    }
 }
 
 /// Extract the value of a previously typed `--option` from the completion args.
@@ -242,7 +190,10 @@ pub fn print_bash_script() {
 }
 
 /// Handle completion env vars. Returns true if handled (caller should exit).
-pub fn handle_complete_env() -> bool {
-    let tree = build_tree();
+///
+/// The caller must pass the fully augmented `clap::Command` tree so that
+/// completion candidates are derived dynamically — no static map needed.
+pub fn handle_complete_env(cmd: &clap::Command) -> bool {
+    let tree = build_tree(cmd);
     veks_completion::handle_complete_env("veks", &tree)
 }
