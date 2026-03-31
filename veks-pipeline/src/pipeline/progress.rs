@@ -319,12 +319,20 @@ impl ProgressLog {
             }
         }
 
-        // Check output files exist with matching sizes
+        // Check output files exist with matching sizes.
+        // Catalog files are regenerable artifacts that may be updated
+        // externally (e.g., `veks prepare catalog generate` from a parent
+        // directory) — skip size verification for them.
         for output in &record.outputs {
             let path = resolve_path(&output.path, workspace);
+            let filename = std::path::Path::new(&output.path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+            let is_catalog = filename == "catalog.json" || filename == "catalog.yaml";
             match std::fs::metadata(&path) {
                 Ok(meta) => {
-                    if meta.len() != output.size {
+                    if !is_catalog && meta.len() != output.size {
                         return Some(format!(
                             "output '{}' size changed ({} → {})",
                             output.path, output.size, meta.len()
