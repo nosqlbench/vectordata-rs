@@ -916,9 +916,13 @@ fn prompt_source_location(source: &Path, output_dir: &Path, label: &str) -> Path
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default();
 
-    // If already in .cache/ or starts with _, no action needed
+    // If already in .cache/, starts with _, or is an HDF5 # dataset path,
+    // no rename action needed. HDF5 files are read-only sources consumed
+    // by the convert step — renaming individual datasets is meaningless.
     let source_str = source.to_string_lossy();
-    if source_str.contains(".cache/") || source_str.contains("/.cache/") || filename.starts_with('_') {
+    if source_str.contains(".cache/") || source_str.contains("/.cache/")
+        || filename.starts_with('_') || source_str.contains('#')
+    {
         return source.to_path_buf();
     }
 
