@@ -1,4 +1,0 @@
-verified_count:distances.fvec: '10000'
-verified_count:distances_tiled.fvec: '10000'
-verified_count:neighbors.ivec: '10000'
-verified_count:neighbors_tiled.ivec: '10000'
