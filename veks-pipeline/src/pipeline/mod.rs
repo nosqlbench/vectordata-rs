@@ -671,6 +671,10 @@ pub fn run_pipeline(args: RunArgs) {
             std::process::exit(1);
         }
         Ok(summary) => {
+            // Sync variables from variables.yaml into dataset.yaml.
+            // Always attempt — even if all steps were fresh, the variables
+            // may not have been synced yet (e.g., first run after upgrade).
+            update_dataset_attributes(dataset_path, dataset_path.parent().unwrap_or(Path::new(".")));
             print_run_summary(&summary);
             // Post-completion guidance about the cache directory
             if summary.executed > 0 {
@@ -691,6 +695,132 @@ pub fn run_pipeline(args: RunArgs) {
 
     // On success, clean scratch directory contents
     clean_scratch_contents(&scratch_dir);
+}
+
+/// Sync variables from `variables.yaml` into the `variables:` section of
+/// `dataset.yaml` so consumers can see pipeline-produced properties
+/// (counts, flags) without a separate file.
+fn update_dataset_attributes(dataset_path: &Path, workspace: &Path) {
+    let vars = match variables::load(workspace) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("  note: could not load variables.yaml: {}", e);
+            return;
+        }
+    };
+    if vars.is_empty() {
+        return;
+    }
+
+    // Read the raw YAML text so we can patch it surgically without
+    // expanding the compact sized profile syntax.
+    let original = match std::fs::read_to_string(dataset_path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("  note: could not read dataset.yaml: {}", e);
+            return;
+        }
+    };
+
+    // Build the variables YAML block
+    let mut vars_block = String::from("\nvariables:\n");
+    for (k, v) in &vars {
+        vars_block.push_str(&format!("  {}: '{}'\n", k, v));
+    }
+
+    // Build attribute lines to inject/update
+    let is_zero_free = vars.get("zero_count").map(|v| v == "0");
+    let is_dedup_free = vars.get("duplicate_count").map(|v| v == "0");
+
+    // Remove existing variables block if present
+    let mut patched = if let Some(pos) = original.find("\nvariables:") {
+        let rest = &original[pos + 1..];
+        let block_end = rest.find("\n").map(|first_nl| {
+            let mut end = first_nl;
+            for line in rest[first_nl + 1..].lines() {
+                if line.is_empty() || line.starts_with(' ') || line.starts_with('\t') {
+                    end += line.len() + 1;
+                } else {
+                    break;
+                }
+            }
+            end + 1
+        }).unwrap_or(rest.len());
+        format!("{}{}", &original[..pos + 1], &original[pos + 1 + block_end..])
+    } else {
+        original.clone()
+    };
+
+    // Insert variables block right after the attributes block
+    if let Some(attr_pos) = patched.find("\nattributes:") {
+        // Find end of attributes block (next top-level key)
+        let rest = &patched[attr_pos + 1..];
+        let mut attr_end = 0;
+        if let Some(first_nl) = rest.find('\n') {
+            attr_end = first_nl;
+            for line in rest[first_nl + 1..].lines() {
+                if line.is_empty() || line.starts_with(' ') || line.starts_with('\t') {
+                    attr_end += line.len() + 1;
+                } else {
+                    break;
+                }
+            }
+            attr_end += 1;
+        }
+        let insert_pos = attr_pos + 1 + attr_end;
+        patched.insert_str(insert_pos, &vars_block);
+    } else {
+        // No attributes section — append after name/description
+        patched = format!("{}{}", patched.trim_end(), vars_block);
+    };
+
+    // Patch attributes: inject is_zero_vector_free / is_duplicate_vector_free
+    if let Some(val) = is_zero_free {
+        let attr_line = format!("  is_zero_vector_free: {}", val);
+        if patched.contains("is_zero_vector_free:") {
+            // Replace existing line
+            let mut new = String::new();
+            for line in patched.lines() {
+                if line.trim_start().starts_with("is_zero_vector_free:") {
+                    new.push_str(&attr_line);
+                } else {
+                    new.push_str(line);
+                }
+                new.push('\n');
+            }
+            patched = new;
+        } else if let Some(pos) = patched.find("\nattributes:") {
+            // Insert after the attributes: line
+            let insert_pos = patched[pos + 1..].find('\n').map(|p| pos + 1 + p + 1).unwrap_or(patched.len());
+            patched.insert_str(insert_pos, &format!("{}\n", attr_line));
+        }
+    }
+    if let Some(val) = is_dedup_free {
+        let attr_line = format!("  is_duplicate_vector_free: {}", val);
+        if patched.contains("is_duplicate_vector_free:") {
+            let mut new = String::new();
+            for line in patched.lines() {
+                if line.trim_start().starts_with("is_duplicate_vector_free:") {
+                    new.push_str(&attr_line);
+                } else {
+                    new.push_str(line);
+                }
+                new.push('\n');
+            }
+            patched = new;
+        } else if let Some(pos) = patched.find("\nattributes:") {
+            let insert_pos = patched[pos + 1..].find('\n').map(|p| pos + 1 + p + 1).unwrap_or(patched.len());
+            patched.insert_str(insert_pos, &format!("{}\n", attr_line));
+        }
+    }
+
+    if patched != original {
+        if let Err(e) = std::fs::write(dataset_path, &patched) {
+            eprintln!("  warning: failed to write dataset.yaml: {}", e);
+        } else {
+            eprintln!("  synced {} variables to dataset.yaml", vars.len());
+        }
+    }
 }
 
 /// Print a post-TUI run summary to stdout.

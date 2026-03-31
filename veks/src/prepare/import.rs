@@ -1324,6 +1324,15 @@ fn generate_yaml(
     // Attributes
     out.push_str("\nattributes:\n");
     out.push_str(&format!("  distance_function: {}\n", args.metric));
+    if args.normalize {
+        out.push_str("  is_normalized: true\n");
+    }
+    if !args.no_dedup {
+        out.push_str("  is_duplicate_vector_free: true\n");
+    }
+    if !args.no_zero_check {
+        out.push_str("  is_zero_vector_free: true\n");
+    }
 
     // Upstream pipeline
     if !steps.is_empty() {

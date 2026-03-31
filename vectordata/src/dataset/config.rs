@@ -54,9 +54,40 @@ pub struct DatasetAttributes {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,
 
+    /// Whether the base vectors are L2-normalized (all norms ≈ 1.0).
+    ///
+    /// When true, cosine similarity and dot product produce identical
+    /// rankings, and the dot-product kernel can be used for cosine metric.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_normalized: Option<bool>,
+
+    /// Whether the dataset has been deduplicated (no exact duplicate vectors).
+    /// Required for publishable datasets.
+    #[serde(default)]
+    pub is_duplicate_vector_free: Option<bool>,
+
+    /// Whether the dataset contains no zero vectors.
+    /// Required for publishable datasets.
+    #[serde(default)]
+    pub is_zero_vector_free: Option<bool>,
+
     /// Freeform key-value tags for categorization.
     #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
     pub tags: IndexMap<String, String>,
+}
+
+impl DatasetAttributes {
+    /// Check for required attributes. Returns a list of missing fields.
+    pub fn missing_required(&self) -> Vec<&'static str> {
+        let mut missing = Vec::new();
+        if self.is_zero_vector_free.is_none() {
+            missing.push("is_zero_vector_free");
+        }
+        if self.is_duplicate_vector_free.is_none() {
+            missing.push("is_duplicate_vector_free");
+        }
+        missing
+    }
 }
 
 /// Top-level `dataset.yaml` configuration.
@@ -87,6 +118,14 @@ pub struct DatasetConfig {
     /// Named profiles, each mapping view names to data sources.
     #[serde(default)]
     pub profiles: DSProfileGroup,
+
+    /// Pipeline-produced variables (counts, flags, etc.).
+    ///
+    /// Synced from `variables.yaml` into `dataset.yaml` after each pipeline
+    /// run so that consumers (catalogs, access layer, explore) can see
+    /// dataset properties without a separate file.
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+    pub variables: IndexMap<String, String>,
 }
 
 impl DatasetConfig {
@@ -140,6 +179,57 @@ impl DatasetConfig {
     pub fn view_names(&self) -> Vec<&str> {
         self.profiles.view_names()
     }
+
+    // -- Attribute accessors --------------------------------------------------
+
+    /// Distance function (e.g., `"COSINE"`, `"L2"`, `"DOT_PRODUCT"`).
+    pub fn distance_function(&self) -> Option<&str> {
+        self.attributes.as_ref().and_then(|a| a.distance_function.as_deref())
+    }
+
+    /// Whether the base vectors are L2-normalized.
+    pub fn is_normalized(&self) -> Option<bool> {
+        self.attributes.as_ref().and_then(|a| a.is_normalized)
+    }
+
+    /// Whether the dataset contains no zero vectors.
+    pub fn is_zero_vector_free(&self) -> Option<bool> {
+        self.attributes.as_ref().and_then(|a| a.is_zero_vector_free)
+    }
+
+    /// Whether the dataset has been deduplicated.
+    pub fn is_duplicate_vector_free(&self) -> Option<bool> {
+        self.attributes.as_ref().and_then(|a| a.is_duplicate_vector_free)
+    }
+
+    // -- Variable accessors ---------------------------------------------------
+
+    /// Get a pipeline variable by name. Variables are dynamic key-value
+    /// pairs produced by pipeline stages — there is no fixed schema.
+    pub fn variable(&self, name: &str) -> Option<&str> {
+        self.variables.get(name).map(|s| s.as_str())
+    }
+
+    /// Get a pipeline variable parsed as a u64.
+    pub fn variable_u64(&self, name: &str) -> Option<u64> {
+        self.variables.get(name).and_then(|s| s.parse().ok())
+    }
+
+    /// Get a pipeline variable parsed as a bool.
+    pub fn variable_bool(&self, name: &str) -> Option<bool> {
+        self.variables.get(name).and_then(|s| match s.as_str() {
+            "true" | "1" | "yes" => Some(true),
+            "false" | "0" | "no" => Some(false),
+            _ => None,
+        })
+    }
+
+    /// Iterate all variables as `(key, value)` pairs.
+    pub fn variables(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.variables.iter().map(|(k, v)| (k.as_str(), v.as_str()))
+    }
+
+    // -------------------------------------------------------------------------
 
     /// Validate structural rules for all profiles.
     ///

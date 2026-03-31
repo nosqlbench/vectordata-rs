@@ -173,6 +173,10 @@ pub fn run(args: CheckArgs) {
             ));
         }
     }
+    // Check required dataset attributes
+    if is_dataset_context && (run_all || args.check_pipelines) {
+        results.push(check_dataset_attributes(&dataset_files));
+    }
     if run_publish {
         results.push(publish_url::check(&directory, &dataset_files));
     }
@@ -347,6 +351,47 @@ pub fn run(args: CheckArgs) {
 }
 
 /// Remove empty directories recursively (bottom-up), excluding hidden dirs.
+/// Check that each dataset.yaml has the required attributes set.
+fn check_dataset_attributes(dataset_files: &[PathBuf]) -> CheckResult {
+    let mut missing_msgs: Vec<String> = Vec::new();
+
+    for ds_path in dataset_files {
+        let config = match vectordata::dataset::DatasetConfig::load(ds_path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        let ds_dir = ds_path.parent().unwrap_or(std::path::Path::new("."));
+        let ds_rel = rel_display(ds_dir);
+
+        match &config.attributes {
+            None => {
+                missing_msgs.push(format!(
+                    "{}: attributes section missing (need is_zero_vector_free, is_duplicate_vector_free)",
+                    ds_rel,
+                ));
+            }
+            Some(attrs) => {
+                let missing = attrs.missing_required();
+                if !missing.is_empty() {
+                    missing_msgs.push(format!(
+                        "{}: missing required attributes: {}",
+                        ds_rel, missing.join(", "),
+                    ));
+                }
+            }
+        }
+    }
+
+    if missing_msgs.is_empty() {
+        let mut r = CheckResult::ok("dataset-attributes");
+        r.messages.push("all required attributes present".to_string());
+        r
+    } else {
+        CheckResult::fail("dataset-attributes", missing_msgs)
+    }
+}
+
 fn clean_empty_dirs(dir: &Path) {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
