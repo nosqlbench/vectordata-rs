@@ -357,7 +357,7 @@ fn resolve_slots(args: &ImportArgs) -> PipelineSlots {
         } else {
             Artifact::Materialized {
                 step_id: "convert-queries".into(),
-                output: format!("query_vectors.{}", vec_ext),
+                output: format!("profiles/base/query_vectors.{}", vec_ext),
             }
         };
         // Base: when import was needed (HDF5, npy, etc.), extract from

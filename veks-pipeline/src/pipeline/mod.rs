@@ -729,8 +729,11 @@ fn update_dataset_attributes(dataset_path: &Path, workspace: &Path) {
     }
 
     // Build attribute lines to inject/update
-    let is_zero_free = vars.get("zero_count").map(|v| v == "0");
-    let is_dedup_free = vars.get("duplicate_count").map(|v| v == "0");
+    // The pipeline REMOVES zero/duplicate vectors — so the output is free
+    // of them when the steps ran, regardless of how many were found.
+    // The attribute reflects the output state, not the source state.
+    let is_zero_free = vars.get("zero_count").map(|_| true);
+    let is_dedup_free = vars.get("duplicate_count").map(|_| true);
     let is_normalized = vars.get("is_normalized").map(|v| v == "true");
 
     // Remove existing variables block if present
