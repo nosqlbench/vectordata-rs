@@ -5039,6 +5039,7 @@ dependencies = [
  "filetime",
  "half",
  "indexmap",
+ "libc",
  "log",
  "parquet",
  "rand 0.9.2",
