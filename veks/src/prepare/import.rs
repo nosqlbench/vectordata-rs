@@ -266,10 +266,30 @@ fn resolve_slots(args: &ImportArgs) -> PipelineSlots {
         .map(|p| !is_native_xvec_file(p))
         .unwrap_or(false);
 
+    // Determine the output xvec extension from the source element size.
+    // Probe the source to match its native precision instead of
+    // hardcoding mvec (f16).
+    let import_ext = if needs_import {
+        args.base_vectors.as_ref()
+            .and_then(|p| {
+                let fmt = VecFormat::detect(p)?;
+                let meta = veks_core::formats::reader::probe_source(p, fmt).ok()?;
+                Some(match meta.element_size {
+                    1 => "bvec",
+                    2 => "mvec",
+                    8 => "dvec",
+                    _ => "fvec", // 4 bytes (f32/i32) → fvec
+                })
+            })
+            .unwrap_or("fvec")
+    } else {
+        "fvec"
+    };
+
     let all_vectors = if needs_import {
         Artifact::Materialized {
             step_id: "convert-vectors".into(),
-            output: "${cache}/all_vectors.mvec".into(),
+            output: format!("${{cache}}/all_vectors.{}", import_ext),
         }
     } else {
         Artifact::Identity { path: base_source.clone() }
@@ -320,7 +340,7 @@ fn resolve_slots(args: &ImportArgs) -> PipelineSlots {
     let has_queries = has_separate_query || self_search;
 
     // Determine output extension from source format
-    let vec_ext = if needs_import { "mvec" } else {
+    let vec_ext = if needs_import { import_ext } else {
         args.base_vectors.as_ref()
             .and_then(|p| p.extension())
             .and_then(|e| e.to_str())
@@ -502,7 +522,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
             ("facet".into(), "base_vectors".into()),
             ("source".into(), base_source.clone()),
             ("from".into(), format),
-            ("output".into(), "${cache}/all_vectors.mvec".into()),
+            ("output".into(), slots.all_vectors.path().into()),
         ];
         // When base_fraction < 1.0 and not pedantic, limit the convert
         // step to only import the needed subset. The convert command

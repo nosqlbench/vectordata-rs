@@ -702,10 +702,25 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
         }
     };
 
-    // Determine source format labels
+    // Determine source format label, including precision for non-xvec sources.
+    // For HDF5 # paths and other container formats, probe to get element size.
     let detect_format = |p: &Path| -> String {
+        let path_str = p.to_string_lossy();
+        // HDF5 dataset paths
+        if path_str.contains('#') {
+            let fmt = VecFormat::detect(p);
+            if let Some(f) = fmt {
+                if let Ok(meta) = veks_core::formats::reader::probe_source(p, f) {
+                    let prec = match meta.element_size {
+                        1 => "u8", 2 => "f16", 4 => "f32", 8 => "f64",
+                        n => return format!("hdf5 {}B", n),
+                    };
+                    return format!("hdf5#{} dim={}", prec, meta.dimension);
+                }
+            }
+            return "hdf5".into();
+        }
         if p.is_dir() {
-            // Check for npy or parquet inside
             if std::fs::read_dir(p).ok()
                 .map(|entries| entries.flatten().any(|e| {
                     e.path().extension().and_then(|x| x.to_str()) == Some("npy")
@@ -763,9 +778,14 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
         },
         FacetRow {
             code: 'Q', label: "query vectors",
-            connection: if query_vectors.is_some() { "provided" } else if self_search { "self-search" } else { "—" },
+            connection: if query_vectors.is_some() {
+                if query_vectors.as_ref().map(|p| VecFormat::detect(p).map(|f| f.is_xvec()).unwrap_or(false)).unwrap_or(false) {
+                    "provided"
+                } else { "convert" }
+            } else if self_search { "self-search" } else { "—" },
             source: if query_vectors.is_some() {
-                query_vectors.as_ref().map(|p| fmt_input(p, "xvec")).unwrap_or_default()
+                let qfmt = query_vectors.as_ref().map(|p| detect_format(p)).unwrap_or_default();
+                query_vectors.as_ref().map(|p| fmt_input(p, &qfmt)).unwrap_or_default()
             } else if self_search {
                 format!("{} ({})", base_label, query_count)
             } else { String::new() },
