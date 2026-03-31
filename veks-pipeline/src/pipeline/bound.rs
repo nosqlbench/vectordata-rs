@@ -91,7 +91,7 @@ fn check_format_specific(output: &Path, format: VecFormat, _file_size: u64) -> A
         VecFormat::Slab => check_slab_completeness(output),
         // Npy and Parquet have no cheap structural probe — treat as
         // opaque-complete (exists + non-empty is sufficient).
-        VecFormat::Npy | VecFormat::Parquet => ArtifactState::Complete,
+        VecFormat::Npy | VecFormat::Parquet | VecFormat::Hdf5 => ArtifactState::Complete,
     }
 }
 

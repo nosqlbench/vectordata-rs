@@ -1224,9 +1224,16 @@ fn detect_roles(candidates: &[(PathBuf, String, u64)]) -> DetectedRoles {
     let mut unassigned: Vec<PathBuf> = Vec::new();
 
     for (path, fmt, _) in candidates {
-        let stem = path.file_stem()
-            .map(|s| s.to_string_lossy().to_lowercase())
-            .unwrap_or_default();
+        // For HDF5 #dataset paths, use the dataset name for role detection
+        let path_str = path.to_string_lossy();
+        let stem = if let Some(hash_pos) = path_str.rfind('#') {
+            path_str[hash_pos + 1..].to_lowercase()
+        } else {
+            path.file_stem()
+                .map(|s| s.to_string_lossy().to_lowercase())
+                .unwrap_or_default()
+                .to_string()
+        };
         // Strip leading `_` prefix (source files renamed by prior import)
         let stem = stem.strip_prefix('_').unwrap_or(&stem);
         let fmt_str = fmt.as_str();
@@ -1360,10 +1367,42 @@ fn scan_candidates(dir: &Path) -> Vec<(PathBuf, String, u64)> {
         }
 
         if let Some(format) = VecFormat::detect_from_path(&path) {
-            let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-            // Store as relative path (just the filename within the scan dir)
-            let rel = PathBuf::from(entry.file_name());
-            results.push((rel, format.name().to_string(), size));
+            if format == VecFormat::Hdf5 {
+                // HDF5 is a container — list internal datasets as separate candidates.
+                // Each gets a path of the form `file.hdf5#dataset_name`.
+                if let Ok(datasets) = veks_core::formats::reader::hdf5::list_datasets(&path) {
+                    for (ds_name, rows, cols, elem_size) in datasets {
+                        let ds_size = rows * cols as u64 * elem_size as u64;
+                        // Map element size to the xvec format name that the
+                        // downstream role detection uses.
+                        let fmt_name = match elem_size {
+                            4 => {
+                                // Could be f32 or i32 — guess from dataset name
+                                if ds_name.contains("indic") || ds_name.contains("neighbor_ind") {
+                                    "ivec"
+                                } else {
+                                    "fvec"
+                                }
+                            }
+                            8 => "dvec",
+                            2 => "mvec",
+                            1 => "bvec",
+                            _ => "fvec",
+                        };
+                        let rel = PathBuf::from(format!(
+                            "{}#{}",
+                            entry.file_name().to_string_lossy(),
+                            ds_name,
+                        ));
+                        results.push((rel, fmt_name.to_string(), ds_size));
+                    }
+                }
+            } else {
+                let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                // Store as relative path (just the filename within the scan dir)
+                let rel = PathBuf::from(entry.file_name());
+                results.push((rel, format.name().to_string(), size));
+            }
         }
     }
 

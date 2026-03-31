@@ -344,7 +344,12 @@ pub fn run(args: PrepareArgs) {
             // silently falls through to auto-detection in the wizard.
             fn validate_path_arg(name: &str, path: &Option<std::path::PathBuf>) {
                 if let Some(p) = path {
-                    if !p.exists() {
+                    // HDF5 paths use # to select an internal dataset
+                    let check = match p.to_string_lossy().rfind('#') {
+                        Some(pos) => std::path::PathBuf::from(&p.to_string_lossy()[..pos]),
+                        None => p.clone(),
+                    };
+                    if !check.exists() {
                         eprintln!("Error: --{name} path '{}' does not exist", p.display());
                         std::process::exit(1);
                     }

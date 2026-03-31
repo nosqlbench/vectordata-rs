@@ -15,6 +15,7 @@ chrono = "0.4"
 clap = { version = "4", features = ["derive", "string"] }
 crossterm = "0.28"
 half = "2"
+hdf5 = "0.8.1"
 libc = "0.2"
 log = "0.4"
 memmap2 = "0.9"

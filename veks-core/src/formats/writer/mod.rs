@@ -62,7 +62,7 @@ pub fn open_sink(
         | VecFormat::Dvec
         | VecFormat::Mvec
         | VecFormat::Svec => xvec::XvecWriter::open(path, config.dimension),
-        VecFormat::Npy | VecFormat::Parquet => {
+        VecFormat::Npy | VecFormat::Parquet | VecFormat::Hdf5 => {
             Err(format!("{} is not a supported output format", format))
         }
     }

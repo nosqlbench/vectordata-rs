@@ -3,6 +3,7 @@
 
 //! Vector data readers for various formats.
 
+pub mod hdf5;
 pub mod npy;
 pub mod parquet;
 pub mod parquet_mnode;
@@ -54,6 +55,7 @@ pub struct SourceMeta {
 pub fn probe_source(path: &Path, format: VecFormat) -> Result<SourceMeta, String> {
     match format {
         VecFormat::Npy => npy::NpyDirReader::probe(path),
+        VecFormat::Hdf5 => hdf5::probe(path),
         VecFormat::Slab => probe_slab(path),
         _ => {
             // Other formats are lightweight to open — just open and extract
@@ -106,6 +108,7 @@ pub fn open_source(path: &Path, format: VecFormat, threads: usize, max_count: Op
         VecFormat::Npy => npy::NpyDirReader::open(path, threads, max_count),
         VecFormat::Parquet => parquet::ParquetDirReader::open(path, threads),
         VecFormat::Slab => slab::SlabReader::open(path),
+        VecFormat::Hdf5 => hdf5::open(path),
     }
 }
 

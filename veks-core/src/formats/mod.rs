@@ -59,6 +59,10 @@ pub enum VecFormat {
     Svec,
     /// Page-oriented slab binary format.
     Slab,
+    /// HDF5 container — one file may hold multiple named datasets.
+    ///
+    /// Paths use `file.hdf5#dataset` notation to select an internal dataset.
+    Hdf5,
 }
 
 impl VecFormat {
@@ -74,6 +78,7 @@ impl VecFormat {
             Self::Mvec => "mvec",
             Self::Svec => "svec",
             Self::Slab => "slab",
+            Self::Hdf5 => "hdf5",
         }
     }
 
@@ -91,7 +96,7 @@ impl VecFormat {
             Self::Fvec | Self::Ivec | Self::Bvec => 4,
             Self::Dvec => 8,
             Self::Mvec | Self::Svec => 2,
-            Self::Npy | Self::Parquet | Self::Slab => 0,
+            Self::Npy | Self::Parquet | Self::Slab | Self::Hdf5 => 0,
         }
     }
 
@@ -107,12 +112,24 @@ impl VecFormat {
             "dvec" | "dvecs" => Some(Self::Dvec),
             "mvec" | "mvecs" => Some(Self::Mvec),
             "svec" | "svecs" => Some(Self::Svec),
+            "hdf5" | "h5" => Some(Self::Hdf5),
             _ => None,
         }
     }
 
     /// Detect format from a file path by inspecting its extension.
+    ///
+    /// Handles HDF5 `#` notation: `file.hdf5#dataset` → `Hdf5`.
     pub fn detect_from_path(path: &Path) -> Option<Self> {
+        let s = path.to_string_lossy();
+        // Check for HDF5 # notation before standard extension detection
+        if let Some(hash_pos) = s.rfind('#') {
+            let file_part = &s[..hash_pos];
+            let ext = file_part.rsplit('.').next()?;
+            if ext == "hdf5" || ext == "h5" {
+                return Some(Self::Hdf5);
+            }
+        }
         let ext = path.extension()?.to_str()?;
         Self::from_extension(ext)
     }
@@ -204,6 +221,7 @@ impl VecFormat {
             Self::Slab => "bytes",
             Self::Npy => "float",
             Self::Parquet => "float",
+            Self::Hdf5 => "float",
         }
     }
 
