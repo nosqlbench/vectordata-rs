@@ -360,7 +360,7 @@ impl SlabReader {
 
         // Hint the kernel to back this mapping with transparent huge pages
         // (2 MB) where possible, reducing TLB misses for large files.
-        #[cfg(unix)]
+        #[cfg(target_os = "linux")]
         let _ = mmap.advise(Advice::HugePage);
 
         let file_len = mmap.len();
