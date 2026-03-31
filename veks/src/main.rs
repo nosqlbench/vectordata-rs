@@ -1,10 +1,12 @@
 // Copyright (c) DataStax, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(dead_code)] // legacy completion functions pending removal
+
 use veks::{cli, datasets, explore, pipeline, prepare};
 
 use clap::{Arg, Command, CommandFactory, Parser, Subcommand};
-use clap_complete::CompleteEnv;
+
 
 /// Veks — umbrella CLI for vector data tools
 #[derive(Parser)]
@@ -248,45 +250,13 @@ fn build_help_completion_command() -> clap::Command {
 }
 
 fn main() {
-    // Root-level completion interception:
-    // 1. If the user typed a partial prefix (e.g., `veks se<TAB>`),
-    //    search ALL commands for prefix matches — not just root commands.
-    // 2. If the user typed nothing (e.g., `veks <TAB>`) and taps Tab
-    //    repeatedly, show the full expanded command list.
-    if std::env::var_os("COMPLETE").is_some() {
-        if let Some(prefix) = root_completion_prefix() {
-            if !prefix.is_empty() {
-                // Non-empty prefix: search all commands for matches
-                let filtered = filter_commands_by_prefix(&prefix);
-                if !filtered.is_empty() {
-                    print!("{}", filtered);
-                    std::process::exit(0);
-                }
-                // No matches in expanded set — fall through to clap
-            } else {
-                // Empty prefix at root: double-tap detection
-                if let Some(output) = check_triple_tap() {
-                    print!("{}", output);
-                    std::process::exit(0);
-                }
-            }
-        }
-        // Subcommand-level triple-tap: e.g., `veks pipeline <TAB><TAB>`
-        // When the user repeatedly tabs inside a subcommand that has nested
-        // children, show the full "group child\tdescription" expansion.
-        if let Some((group, child_prefix)) = subcommand_completion_context() {
-            if let Some(output) = check_triple_tap() {
-                // Filter the full list to entries under this group
-                let filtered = filter_subcommand_children(&group, &child_prefix, &output);
-                if !filtered.is_empty() {
-                    print!("{}", filtered);
-                    std::process::exit(0);
-                }
-            }
-        }
+    // Dynamic completion engine — handles all shell completion.
+    // Handles _VEKS_COMPLETE=bash (from our dyncomp script) and also
+    // intercepts COMPLETE=bash (from any stale clap-generated scripts)
+    // to prevent clap's eager subcommand chaining.
+    if cli::dyncomp::handle_complete_env() {
+        std::process::exit(0);
     }
-
-    CompleteEnv::with_factory(build_augmented_cli).complete();
 
     let veks = Veks::parse();
 
@@ -307,9 +277,8 @@ fn main() {
 
 /// Detect if we're completing inside a known subcommand group.
 ///
-/// Returns `Some((group_name, child_prefix))` when the user has typed
-/// e.g. `veks pipeline <TAB>` (group="pipeline", child_prefix="") or
-/// `veks pipeline an<TAB>` (group="pipeline", child_prefix="an").
+// Legacy completion functions — retained for reference but replaced by dyncomp.
+#[allow(dead_code)]
 fn subcommand_completion_context() -> Option<(String, String)> {
     let args: Vec<String> = std::env::args().collect();
     let words = if let Some(pos) = args.iter().position(|a| a == "--") {

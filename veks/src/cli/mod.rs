@@ -3,12 +3,10 @@
 
 //! CLI argument parsing and shell completion support.
 //!
-//! Built on [`clap`] and [`clap_complete`], this module provides dynamic
-//! shell completions for bash, zsh, fish, elvish, and PowerShell.
-//! Completions are handled by `veks` itself via `clap_complete::CompleteEnv`.
-//! The `completions` subcommand outputs a minimal, sourceable registration
-//! snippet that wires up the shell to delegate completion requests back
-//! to `veks`.
+//! CLI argument parsing and shell completion support.
+//!
+//! Dynamic completions are handled by the `dyncomp` module. The
+//! `completions` subcommand outputs a sourceable shell snippet.
 //!
 //! Usage:
 //! ```sh
@@ -17,8 +15,19 @@
 //! veks completions --shell fish | source
 //! ```
 
+pub mod dyncomp;
+
 use clap::Args;
-use clap_complete::Shell;
+/// Supported shells for completion script generation.
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+pub enum Shell {
+    Bash,
+    Zsh,
+    Fish,
+    Elvish,
+    #[value(name = "powershell")]
+    PowerShell,
+}
 
 /// Generate shell completions for veks.
 ///
@@ -105,25 +114,16 @@ pub fn completions(args: CompletionsArgs) {
 
 fn emit_completions(shell: Shell) {
     match shell {
-        Shell::Bash => print_bash_completions(),
-        Shell::Zsh => print!(
-            r#"source <(COMPLETE=zsh veks)
-"#
-        ),
-        Shell::Fish => print!(
-            r#"COMPLETE=fish veks | source
-"#
-        ),
-        Shell::Elvish => print!(
-            r#"eval (COMPLETE=elvish veks | slurp)
-"#
-        ),
-        Shell::PowerShell => print!(
-            r#"(& {{ $env:COMPLETE="powershell"; veks }}) | Invoke-Expression
-"#
-        ),
-        _ => {
-            println!("# veks: unsupported shell variant");
+        Shell::Bash => dyncomp::print_bash_script(),
+        Shell::Zsh => {
+            eprintln!("# zsh completions not yet implemented in dyncomp; use bash compatibility mode");
+            dyncomp::print_bash_script(); // bash-compatible fallback
+        }
+        Shell::Fish | Shell::Elvish | Shell::PowerShell => {
+            eprintln!("# {} completions not yet implemented", match shell {
+                Shell::Fish => "fish", Shell::Elvish => "elvish",
+                Shell::PowerShell => "powershell", _ => "unknown",
+            });
         }
     }
 }

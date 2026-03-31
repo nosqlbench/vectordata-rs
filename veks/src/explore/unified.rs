@@ -43,8 +43,23 @@ use vectordata::dataset::view::CacheStats;
 // View definitions
 // ---------------------------------------------------------------------------
 
-/// Per-view theory and interpretation descriptions shown with the / key.
-const VIEW_INFO: &[&str] = &[
+/// Map from display order to VIEW_INFO_RAW index.
+/// VIEW_INFO_RAW preserves the original authoring order; this mapping
+/// reorders them for display (most impressive first).
+const VIEW_INFO_ORDER: [usize; NUM_VIEWS] = [
+    7, // V_PCA -> PCA scatter (was index 7)
+    8, // V_DIMDIST -> Dimension distribution (was index 8)
+    5, // V_LOADINGS -> PCA Loadings (was index 5)
+    4, // V_EIGEN -> Eigenvalue analysis (was index 4)
+    0, // V_NORMS -> Norms histogram (was index 0)
+    1, // V_NORMCURVE -> Sorted norms (was index 1)
+    2, // V_DISTS -> Distance histogram (was index 2)
+    3, // V_DISTCURVE -> Sorted distances (was index 3)
+    6, // V_VARBARS -> Variance bars (was index 6)
+];
+
+/// Per-view theory and interpretation descriptions (original authoring order).
+const VIEW_INFO_RAW: &[&str] = &[
     // 0: Norms histogram
     concat!(
         "L2 Norm Distribution\n\n",
@@ -181,19 +196,46 @@ const VIEW_INFO: &[&str] = &[
         "  of the same high-dimensional data. Some rotations reveal\n",
         "  structure that is invisible from the default viewing angle.",
     ),
+    // 8: Dimension distribution
+    concat!(
+        "Per-Dimension Value Distribution\n\n",
+        "Histogram of values for a single dimension across all sampled vectors.\n",
+        "Navigate dimensions with ←/→ arrow keys.\n\n",
+        "  Gaussian shape: This dimension's values follow a normal distribution,\n",
+        "  typical for well-trained embedding models.\n\n",
+        "  Bimodal or multimodal: Natural clusters along this axis.\n",
+        "  Certain dimensions encode categorical information.\n\n",
+        "  Spike at zero: Many vectors have zero in this dimension.\n",
+        "  Common in sparse or ReLU-activated embeddings.\n\n",
+        "  Uniform spread: No strong structure in this dimension.\n\n",
+        "  Compare across dimensions to find which carry the most information\n",
+        "  (wide spread) vs which are near-constant (tight spike).",
+    ),
 ];
 
+// View index constants — ordered for visual impact (most impressive first).
+const V_PCA: usize = 0;
+const V_DIMDIST: usize = 1;
+const V_LOADINGS: usize = 2;
+const V_EIGEN: usize = 3;
+const V_NORMS: usize = 4;
+const V_NORMCURVE: usize = 5;
+const V_DISTS: usize = 6;
+const V_DISTCURVE: usize = 7;
+const V_VARBARS: usize = 8;
+
 const VIEW_NAMES: &[&str] = &[
-    "1:Norms",
-    "2:NormCurve",
-    "3:Distances",
-    "4:DistCurve",
-    "5:Eigen",
-    "6:Loadings",
-    "7:VarBars",
-    "8:PCA",
+    "F1:PCA",
+    "F2:DimDist",
+    "F3:Loadings",
+    "F4:Eigen",
+    "F5:Norms",
+    "F6:NormCurve",
+    "F7:Distances",
+    "F8:DistCurve",
+    "F9:VarBars",
 ];
-const NUM_VIEWS: usize = 8;
+const NUM_VIEWS: usize = 9;
 
 // ---------------------------------------------------------------------------
 // Background messages
@@ -317,9 +359,11 @@ pub(super) fn run_interactive_explore(
     let mut rot_x: f64 = 0.0;  // ↑↓ arrows
     let mut rot_z: f64 = 0.0;  // a/d keys
     let mut rot_w: f64 = 0.0;  // w/s keys
+    let mut selected_dim: usize = 0; // for DimDist view
     let mut pc_axes: [usize; 5] = [0, 1, 2, 3, 4];
     let mut loadings_bar_mode: bool = true; // true=bar chart (default), false=heatmap
     let mut loadings_band_size: usize = 0;   // 0 = auto-fit to terminal height
+    let mut loadings_scroll: usize = 0;      // vertical scroll offset (band index)
     let mut eigen_sub_mode: usize = 0;       // 0=scree, 1=cumvar, 2=log decay
 
     // ── Computation state (persists across restarts — old data stays visible) ──
@@ -662,7 +706,7 @@ pub(super) fn run_interactive_explore(
         // Auto-deepen eigenvalues when loadings view is active and we have < 30 PCs.
         // The eigen thread checks the target atomically, so bumping it while
         // the thread is still running causes it to compute more.
-        if view_mode == 5 && eigenvalues.len() < 30 && eigenvalues.len() < dim {
+        if view_mode == V_LOADINGS && eigenvalues.len() < 30 && eigenvalues.len() < dim {
             let desired = 30usize.min(dim);
             let current_target = eigen_target.load(std::sync::atomic::Ordering::Relaxed);
             if desired > current_target {
@@ -735,20 +779,29 @@ pub(super) fn run_interactive_explore(
 
         // ── Stats line for current view ──
         let stats_line = match view_mode {
-            0 | 1 => { // Norms
-                if norm_stats.count > 0 {
-                    let verdict = if norm_stats.is_normalized() { "NORMALIZED" } else { "not normalized" };
-                    format!("mean={:.4} std={:.4} min={:.4} max={:.4} {}", norm_stats.mean, norm_stats.std_dev(), norm_stats.min, norm_stats.max, verdict)
+            V_PCA => {
+                if !eigenvalues.is_empty() {
+                    let total_ev: f64 = eigenvalues.iter().sum();
+                    let pcts: Vec<f64> = eigenvalues.iter().take(5).map(|v| 100.0 * v / total_ev).collect();
+                    format!("PC1:{:.1}% PC2:{:.1}% PC3:{:.1}% PC4:{:.1}% PC5:{:.1}%",
+                        pcts.get(0).unwrap_or(&0.0), pcts.get(1).unwrap_or(&0.0),
+                        pcts.get(2).unwrap_or(&0.0), pcts.get(3).unwrap_or(&0.0),
+                        pcts.get(4).unwrap_or(&0.0))
                 } else { String::new() }
             }
-            2 | 3 => { // Distances
-                if dist_stats.count > 0 {
-                    let contrast = if dist_stats.min > 0.0 { (dist_stats.max - dist_stats.min) / dist_stats.min } else { f64::INFINITY };
-                    let cv = if dist_stats.mean > 0.0 { dist_stats.std_dev() / dist_stats.mean } else { 0.0 };
-                    format!("mean={:.4} std={:.4} contrast={:.1} CV={:.3}", dist_stats.mean, dist_stats.std_dev(), contrast, cv)
+            V_DIMDIST => {
+                let n = vectors_loaded;
+                if n > 0 && selected_dim < dim {
+                    let mut ds = WelfordStats::new();
+                    for i in 0..n {
+                        let idx = i * dim + selected_dim;
+                        if idx < vector_buf.len() { ds.update(vector_buf[idx] as f64); }
+                    }
+                    format!("dim[{}]: mean={:.6} std={:.6} min={:.6} max={:.6}",
+                        selected_dim, ds.mean, ds.std_dev(), ds.min, ds.max)
                 } else { String::new() }
             }
-            4..=6 => { // Eigenvalue views
+            V_LOADINGS | V_EIGEN | V_VARBARS => {
                 if !eigenvalues.is_empty() {
                     let total_ev: f64 = eigenvalues.iter().sum();
                     let mut entropy = 0.0f64;
@@ -761,14 +814,17 @@ pub(super) fn run_interactive_explore(
                     format!("eff_rank={:.1} intrinsic_dim={} 95%-elbow={}", eff_rank, intrinsic, elbow)
                 } else { String::new() }
             }
-            7 => { // PCA view
-                if !eigenvalues.is_empty() {
-                    let total_ev: f64 = eigenvalues.iter().sum();
-                    let pcts: Vec<f64> = eigenvalues.iter().take(5).map(|v| 100.0 * v / total_ev).collect();
-                    format!("PC1:{:.1}% PC2:{:.1}% PC3:{:.1}% PC4:{:.1}% PC5:{:.1}%",
-                        pcts.get(0).unwrap_or(&0.0), pcts.get(1).unwrap_or(&0.0),
-                        pcts.get(2).unwrap_or(&0.0), pcts.get(3).unwrap_or(&0.0),
-                        pcts.get(4).unwrap_or(&0.0))
+            V_NORMS | V_NORMCURVE => {
+                if norm_stats.count > 0 {
+                    let verdict = if norm_stats.is_normalized() { "NORMALIZED" } else { "not normalized" };
+                    format!("mean={:.4} std={:.4} min={:.4} max={:.4} {}", norm_stats.mean, norm_stats.std_dev(), norm_stats.min, norm_stats.max, verdict)
+                } else { String::new() }
+            }
+            V_DISTS | V_DISTCURVE => {
+                if dist_stats.count > 0 {
+                    let contrast = if dist_stats.min > 0.0 { (dist_stats.max - dist_stats.min) / dist_stats.min } else { f64::INFINITY };
+                    let cv = if dist_stats.mean > 0.0 { dist_stats.std_dev() / dist_stats.mean } else { 0.0 };
+                    format!("mean={:.4} std={:.4} contrast={:.1} CV={:.3}", dist_stats.mean, dist_stats.std_dev(), contrast, cv)
                 } else { String::new() }
             }
             _ => String::new(),
@@ -793,7 +849,8 @@ pub(super) fn run_interactive_explore(
             // Main view (or help/info overlay)
             if show_info {
                 use ratatui::text::Line;
-                let info_text = VIEW_INFO.get(view_mode).unwrap_or(&"");
+                let raw_idx = VIEW_INFO_ORDER.get(view_mode).copied().unwrap_or(0);
+                let info_text = VIEW_INFO_RAW.get(raw_idx).unwrap_or(&"");
                 let lines: Vec<Line> = info_text.lines()
                     .map(|l| Line::from(Span::styled(l, Style::default().fg(Color::White))))
                     .collect();
@@ -812,7 +869,7 @@ pub(super) fn run_interactive_explore(
                         Style::default().fg(Color::Cyan))),
                     Line::from(""),
                     Line::from(" Navigation"),
-                    Line::from("   1-8 / Tab / PgDn/PgUp / F1-F8  Switch view"),
+                    Line::from("   F1-F9 / Tab / PgDn/PgUp        Switch view"),
                     Line::from("   /                               View theory & interpretation"),
                     Line::from("   ?                               Toggle this help"),
                     Line::from(""),
@@ -825,25 +882,7 @@ pub(super) fn run_interactive_explore(
                 ];
                 // View-specific keys
                 let view_keys: Vec<Line> = match view_mode {
-                    0 | 2 => vec![
-                        Line::from(""),
-                        Line::from(" Histogram"),
-                        Line::from("   b / B                           Fewer / more bins"),
-                    ],
-                    1 | 3 => vec![],
-                    4 => vec![
-                        Line::from(""),
-                        Line::from(" Eigenvalue View"),
-                        Line::from("   m                               Cycle: Scree / CumVar / LogDecay"),
-                    ],
-                    5 => vec![
-                        Line::from(""),
-                        Line::from(" PCA Loadings"),
-                        Line::from("   m                               Toggle bar chart / heatmap"),
-                        Line::from("   b / B                           Halve / double dims per row (powers of 2)"),
-                    ],
-                    6 => vec![],
-                    7 => vec![
+                    V_PCA => vec![
                         Line::from(""),
                         Line::from(" PCA Scatter"),
                         Line::from("   ←→↑↓                           Rotate (Y/X axes)"),
@@ -851,6 +890,31 @@ pub(super) fn run_interactive_explore(
                         Line::from("   w / s                           Rotate (W tilt)"),
                         Line::from("   c / C                           Slide PC window (PC1-4 → PC2-5 → ...)"),
                         Line::from("   x / X                           Rotate axis roles (X→Y→Z→color cycle)"),
+                    ],
+                    V_DIMDIST => vec![
+                        Line::from(""),
+                        Line::from(" Dimension Distribution"),
+                        Line::from("   ←/→                             Navigate dimensions"),
+                        Line::from("   Home / End                      First / last dimension"),
+                        Line::from("   b / B                           Fewer / more bins"),
+                    ],
+                    V_LOADINGS => vec![
+                        Line::from(""),
+                        Line::from(" PCA Loadings"),
+                        Line::from("   ↑/↓                             Scroll up / down"),
+                        Line::from("   Home / End                      Top / bottom"),
+                        Line::from("   m                               Toggle bar chart / heatmap"),
+                        Line::from("   b / B                           Halve / double dims per row (powers of 2)"),
+                    ],
+                    V_EIGEN => vec![
+                        Line::from(""),
+                        Line::from(" Eigenvalue View"),
+                        Line::from("   m                               Cycle: Scree / CumVar / LogDecay"),
+                    ],
+                    V_NORMS | V_DISTS => vec![
+                        Line::from(""),
+                        Line::from(" Histogram"),
+                        Line::from("   b / B                           Fewer / more bins"),
                     ],
                     _ => vec![],
                 };
@@ -860,23 +924,39 @@ pub(super) fn run_interactive_explore(
                     chunks[1],
                 );
             } else { match view_mode {
-                0 => render_histogram(frame, chunks[1], &all_norms, &norm_stats, num_bins, " Norm Distribution ", Color::Green),
-                1 => render_presorted_curve(frame, chunks[1], &sorted_norms, " Sorted Norms ", Color::Green),
-                2 => {
-                    let dists_f64: Vec<f64> = all_dists.iter().map(|&d| d as f64).collect();
-                    render_histogram(frame, chunks[1], &dists_f64, &dist_stats, num_bins, " Distance Distribution (L2) ", Color::Cyan);
+                V_PCA => render_pca_scatter(frame, chunks[1], &projected, rot_y, rot_x, rot_z, rot_w, &pc_axes, 4),
+                V_DIMDIST => {
+                    let n = vectors_loaded;
+                    if n > 0 && dim > 0 && selected_dim < dim {
+                        let mut dim_values: Vec<f64> = Vec::with_capacity(n);
+                        for i in 0..n {
+                            let idx = i * dim + selected_dim;
+                            if idx < vector_buf.len() {
+                                dim_values.push(vector_buf[idx] as f64);
+                            }
+                        }
+                        let mut dim_stats = WelfordStats::new();
+                        for &v in &dim_values { dim_stats.update(v); }
+                        let title = format!(" Dimension {} of {} ({} vectors) ", selected_dim, dim, n);
+                        render_histogram(frame, chunks[1], &dim_values, &dim_stats, num_bins, &title, Color::Magenta);
+                    }
                 }
-                3 => {
-                    render_presorted_curve(frame, chunks[1], &sorted_dists, " Sorted Distances ", Color::Cyan);
-                }
-                4 => match eigen_sub_mode {
+                V_LOADINGS => render_loadings(frame, chunks[1], &eigenvectors, &eigenvalues, loadings_bar_mode, loadings_band_size, &mut loadings_scroll),
+                V_EIGEN => match eigen_sub_mode {
                     0 => render_scree(frame, chunks[1], &eigenvalues),
                     1 => render_cumulative(frame, chunks[1], &eigenvalues),
                     _ => render_log_decay(frame, chunks[1], &eigenvalues),
                 },
-                5 => render_loadings(frame, chunks[1], &eigenvectors, &eigenvalues, loadings_bar_mode, loadings_band_size),
-                6 => render_variance_bars(frame, chunks[1], &eigenvalues),
-                7 => render_pca_scatter(frame, chunks[1], &projected, rot_y, rot_x, rot_z, rot_w, &pc_axes, 4),
+                V_NORMS => render_histogram(frame, chunks[1], &all_norms, &norm_stats, num_bins, " Norm Distribution ", Color::Green),
+                V_NORMCURVE => render_presorted_curve(frame, chunks[1], &sorted_norms, " Sorted Norms ", Color::Green),
+                V_DISTS => {
+                    let dists_f64: Vec<f64> = all_dists.iter().map(|&d| d as f64).collect();
+                    render_histogram(frame, chunks[1], &dists_f64, &dist_stats, num_bins, " Distance Distribution (L2) ", Color::Cyan);
+                }
+                V_DISTCURVE => {
+                    render_presorted_curve(frame, chunks[1], &sorted_dists, " Sorted Distances ", Color::Cyan);
+                }
+                V_VARBARS => render_variance_bars(frame, chunks[1], &eigenvalues),
                 _ => {}
             } } // close match + else
 
@@ -887,23 +967,25 @@ pub(super) fn run_interactive_explore(
                 .map(|(i, n)| if i == view_mode { format!("[{}]", n) } else { n.to_string() })
                 .collect::<Vec<_>>().join(" ");
             frame.render_widget(Paragraph::new(Span::styled(
-                format!(" {} | Tab/PgDn/PgUp | F1-F8 | /: info | ?: help | q quit", vi),
+                format!(" {} | Tab/PgDn/PgUp | /: info | ?: help | q quit", vi),
                 Style::default().fg(Color::DarkGray))), chunks[3]);
 
             // View-specific controls line
             let view_controls: String = match view_mode {
-                0 | 2 => " b/B: fewer/more bins | +/Space: increase sample".into(),
-                1 | 3 => " +/Space: increase sample".into(),
-                4 => {
+                V_PCA => format!(" ←→↑↓ a/d w/s: rotate | c/C: slide PCs | x/X: swap axes [X:PC{} Y:PC{} Z:PC{} color:PC{}] | r +/Space",
+                    pc_axes[0]+1, pc_axes[1]+1, pc_axes[2]+1, pc_axes[3]+1),
+                V_DIMDIST => format!(" ←/→: dimension ({}/{}) | Home/End: first/last | b/B: bins",
+                    selected_dim, dim),
+                V_LOADINGS => format!(" ↑↓: scroll | m: toggle {} | b/B: resolution ({} dims/row)",
+                    if loadings_bar_mode { "heatmap" } else { "bar chart" },
+                    if loadings_band_size == 0 { "auto".to_string() } else { loadings_band_size.to_string() }),
+                V_EIGEN => {
                     let mode_name = ["Scree", "CumVar", "LogDecay"][eigen_sub_mode];
                     format!(" m: cycle mode ({}) | +/Space: increase sample", mode_name)
                 }
-                5 => format!(" m: toggle {}, b/B: resolution ({} dims/row)",
-                    if loadings_bar_mode { "heatmap" } else { "bar chart" },
-                    if loadings_band_size == 0 { "auto".to_string() } else { loadings_band_size.to_string() }),
-                6 => String::new(),
-                7 => format!(" ←→↑↓ a/d w/s: rotate | c/C: slide PCs | x/X: swap axes [X:PC{} Y:PC{} Z:PC{} color:PC{}] | r +/Space",
-                    pc_axes[0]+1, pc_axes[1]+1, pc_axes[2]+1, pc_axes[3]+1),
+                V_NORMS | V_DISTS => " b/B: fewer/more bins | +/Space: increase sample".into(),
+                V_NORMCURVE | V_DISTCURVE => " +/Space: increase sample".into(),
+                V_VARBARS => String::new(),
                 _ => String::new(),
             };
             frame.render_widget(Paragraph::new(Span::styled(
@@ -962,7 +1044,7 @@ pub(super) fn run_interactive_explore(
                         KeyCode::Char('6') => view_mode = 5,
                         KeyCode::Char('7') => view_mode = 6,
                         KeyCode::Char('8') => view_mode = 7,
-                        KeyCode::Char('b') if view_mode == 5 => {
+                        KeyCode::Char('b') if view_mode == V_LOADINGS => {
                             // Loadings: halve band size (powers of 2)
                             if loadings_band_size == 0 {
                                 let th = crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(40);
@@ -972,7 +1054,7 @@ pub(super) fn run_interactive_explore(
                             }
                             loadings_band_size = (loadings_band_size / 2).max(1);
                         }
-                        KeyCode::Char('B') if view_mode == 5 => {
+                        KeyCode::Char('B') if view_mode == V_LOADINGS => {
                             // Loadings: double band size (powers of 2)
                             if loadings_band_size == 0 {
                                 let th = crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(40);
@@ -981,10 +1063,10 @@ pub(super) fn run_interactive_explore(
                             }
                             loadings_band_size = (loadings_band_size * 2).min(dim);
                         }
-                        KeyCode::Char('m') if view_mode == 4 => {
+                        KeyCode::Char('m') if view_mode == V_EIGEN => {
                             eigen_sub_mode = (eigen_sub_mode + 1) % 3;
                         }
-                        KeyCode::Char('m') if view_mode == 5 => {
+                        KeyCode::Char('m') if view_mode == V_LOADINGS => {
                             loadings_bar_mode = !loadings_bar_mode;
                         }
                         KeyCode::Char('b') => {
@@ -996,14 +1078,22 @@ pub(super) fn run_interactive_explore(
                             num_bins = (num_bins + 5).min(500);
                         }
                         // Rotation axes (PCA scatter views only)
-                        KeyCode::Left if view_mode == 7 => { rot_y -= 0.1; }
-                        KeyCode::Right if view_mode == 7 => { rot_y += 0.1; }
-                        KeyCode::Up if view_mode == 7 => { rot_x -= 0.1; }
-                        KeyCode::Down if view_mode == 7 => { rot_x += 0.1; }
-                        KeyCode::Char('a') if view_mode == 7 => { rot_z -= 0.1; }
-                        KeyCode::Char('d') if view_mode == 7 => { rot_z += 0.1; }
-                        KeyCode::Char('w') if view_mode == 7 => { rot_w -= 0.1; }
-                        KeyCode::Char('s') if view_mode == 7 => { rot_w += 0.1; }
+                        KeyCode::Left if view_mode == V_PCA => { rot_y -= 0.1; }
+                        KeyCode::Right if view_mode == V_PCA => { rot_y += 0.1; }
+                        KeyCode::Up if view_mode == V_PCA => { rot_x -= 0.1; }
+                        KeyCode::Down if view_mode == V_PCA => { rot_x += 0.1; }
+                        KeyCode::Left if view_mode == V_DIMDIST => { selected_dim = selected_dim.saturating_sub(1); }
+                        KeyCode::Right if view_mode == V_DIMDIST => { if selected_dim + 1 < dim { selected_dim += 1; } }
+                        KeyCode::Home if view_mode == V_DIMDIST => { selected_dim = 0; }
+                        KeyCode::End if view_mode == V_DIMDIST => { selected_dim = dim.saturating_sub(1); }
+                        KeyCode::Up if view_mode == V_LOADINGS => { loadings_scroll = loadings_scroll.saturating_sub(1); }
+                        KeyCode::Down if view_mode == V_LOADINGS => { loadings_scroll += 1; }
+                        KeyCode::Home if view_mode == V_LOADINGS => { loadings_scroll = 0; }
+                        KeyCode::End if view_mode == V_LOADINGS => { loadings_scroll = usize::MAX; } // clamped in render
+                        KeyCode::Char('a') if view_mode == V_PCA => { rot_z -= 0.1; }
+                        KeyCode::Char('d') if view_mode == V_PCA => { rot_z += 0.1; }
+                        KeyCode::Char('w') if view_mode == V_PCA => { rot_w -= 0.1; }
+                        KeyCode::Char('s') if view_mode == V_PCA => { rot_w += 0.1; }
                         KeyCode::Char('r') => {
                             rot_y = 0.0; rot_x = 0.0; rot_z = 0.0; rot_w = 0.0;
                             if current_sample != sample_size.min(total) {
@@ -1013,25 +1103,25 @@ pub(super) fn run_interactive_explore(
                             }
                         }
                         // c/C: slide the component window (PC1-4 → PC2-5 → PC3-6...)
-                        KeyCode::Char('c') if view_mode == 7 => {
+                        KeyCode::Char('c') if view_mode == V_PCA => {
                             let max_pc = eigenvalues.len().max(5);
                             for a in pc_axes.iter_mut() { *a = (*a + 1) % max_pc; }
                         }
-                        KeyCode::Char('C') if view_mode == 7 => {
+                        KeyCode::Char('C') if view_mode == V_PCA => {
                             let max_pc = eigenvalues.len().max(5);
                             for a in pc_axes.iter_mut() { *a = (*a + max_pc - 1) % max_pc; }
                         }
                         // x/X: rotate axis assignment within the current set
                         // x: X→Y→Z→color cycle (rotate display roles forward)
                         // X: reverse
-                        KeyCode::Char('x') if view_mode == 7 => {
+                        KeyCode::Char('x') if view_mode == V_PCA => {
                             let tmp = pc_axes[0];
                             pc_axes[0] = pc_axes[1];
                             pc_axes[1] = pc_axes[2];
                             pc_axes[2] = pc_axes[3];
                             pc_axes[3] = tmp;
                         }
-                        KeyCode::Char('X') if view_mode == 7 => {
+                        KeyCode::Char('X') if view_mode == V_PCA => {
                             let tmp = pc_axes[3];
                             pc_axes[3] = pc_axes[2];
                             pc_axes[2] = pc_axes[1];
@@ -1254,6 +1344,7 @@ fn render_loadings(
     eigenvalues: &[f64],
     bar_mode: bool,
     manual_band_size: usize,
+    scroll: &mut usize,
 ) {
     use ratatui::text::{Line, Span};
 
@@ -1300,6 +1391,10 @@ fn render_loadings(
 
     let label_w = if dim >= 1000 { 10 } else { 8 };
 
+    // Clamp scroll to valid range
+    let max_scroll = num_bands.saturating_sub(data_rows);
+    if *scroll > max_scroll { *scroll = max_scroll; }
+
     let band_label = |d_start: usize, d_end: usize| -> String {
         if band_size == 1 {
             format!("{:<w$}", format!("d{}", d_start), w = label_w)
@@ -1327,7 +1422,7 @@ fn render_loadings(
         }
 
         let mut lines = vec![Line::from(header_spans)];
-        for band in 0..num_bands.min(data_rows) {
+        for band in *scroll..(*scroll + data_rows).min(num_bands) {
             let d_start = band * band_size;
             let d_end = (d_start + band_size).min(dim);
             let mut spans = vec![Span::styled(band_label(d_start, d_end), Style::default().fg(Color::DarkGray))];
@@ -1367,9 +1462,11 @@ fn render_loadings(
         frame.render_widget(Paragraph::new(lines)
             .block(Block::default().borders(Borders::ALL).title(title)), area);
     } else {
-        // Heatmap mode
-        let pc_col_w = 3;
-        let max_pcs = ((inner_w - label_w) / pc_col_w).min(num_pcs);
+        // Heatmap mode — scale to fill the available width with no gaps.
+        let data_w = inner_w.saturating_sub(label_w);
+        let max_pcs = num_pcs.min(data_w); // at least 1 char per PC
+        let pc_col_w = if max_pcs > 0 { data_w / max_pcs } else { 1 };
+        let max_pcs = if pc_col_w > 0 { (data_w / pc_col_w).min(num_pcs) } else { 0 };
 
         // Header with PC variance percentages
         let mut header_spans = vec![Span::styled(
@@ -1385,7 +1482,7 @@ fn render_loadings(
         }
 
         let mut lines = vec![Line::from(header_spans)];
-        for band in 0..num_bands.min(data_rows) {
+        for band in *scroll..(*scroll + data_rows).min(num_bands) {
             let d_start = band * band_size;
             let d_end = (d_start + band_size).min(dim);
             let mut spans = vec![Span::styled(band_label(d_start, d_end), Style::default().fg(Color::DarkGray))];
@@ -1393,11 +1490,9 @@ fn render_loadings(
             for pc in 0..max_pcs {
                 let intensity = band_loading(pc, d_start, d_end) / global_max;
                 let color = loading_color(intensity);
-                let ch = loading_char(intensity);
-                spans.push(Span::styled(
-                    format!("{:>w$}", ch, w = pc_col_w),
-                    Style::default().fg(color),
-                ));
+                let block = loading_char(intensity);
+                let fill: String = std::iter::repeat(block).take(pc_col_w).collect();
+                spans.push(Span::styled(fill, Style::default().fg(color)));
             }
             lines.push(Line::from(spans));
         }

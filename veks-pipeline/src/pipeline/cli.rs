@@ -56,8 +56,7 @@ pub fn build_pipeline_command() -> Command {
 
     let mut pipeline_cmd = Command::new("pipeline")
         .about("Execute a single pipeline command directly")
-        .subcommand_required(true)
-        .arg_required_else_help(true)
+        .subcommand_required(false)
         .disable_help_subcommand(true);
 
     for (group, commands) in groups {

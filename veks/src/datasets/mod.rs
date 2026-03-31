@@ -18,7 +18,6 @@ mod probe;
 use std::path::PathBuf;
 
 use clap::{Args, Subcommand};
-use clap_complete::engine::ArgValueCompleter;
 
 /// Browse, search, and manage datasets
 #[derive(Args)]
@@ -39,7 +38,7 @@ pub enum DatasetsCommand {
         configdir: String,
 
         /// Additional catalog directories, file paths, or HTTP URLs
-        #[arg(long, add = ArgValueCompleter::new(catalog_completer))]
+        #[arg(long)]
         catalog: Vec<String>,
 
         /// Catalog URLs or paths to use *instead* of configured catalogs
@@ -59,65 +58,65 @@ pub enum DatasetsCommand {
         group_by: Option<String>,
 
         /// Filter profiles by name (substring, regex, or glob)
-        #[arg(long = "matching-profile", add = ArgValueCompleter::new(filter::profile_completer))]
+        #[arg(long = "matching-profile")]
         matching_profile: Option<String>,
 
         /// Select a single dataset:profile; fails if the filters are ambiguous
-        #[arg(long, add = ArgValueCompleter::new(filter::select_completer))]
+        #[arg(long)]
         select: Option<String>,
 
         // -- Filter predicates --
 
         /// Filter by dataset name (substring, regex, or glob)
-        #[arg(long = "matching-name", add = ArgValueCompleter::new(filter::name_completer))]
+        #[arg(long = "matching-name")]
         matching_name: Option<String>,
 
         /// Filter: dataset must contain this facet/view
-        #[arg(long = "with-facet", add = ArgValueCompleter::new(filter::facet_completer))]
+        #[arg(long = "with-facet")]
         facet: Vec<String>,
 
         /// Filter: dataset must use this distance metric
-        #[arg(long = "with-metric", add = ArgValueCompleter::new(filter::metric_completer))]
+        #[arg(long = "with-metric")]
         metric: Option<String>,
 
         /// Filter by description/notes/model (substring, regex, or glob)
-        #[arg(long = "matching-desc", add = ArgValueCompleter::new(filter::desc_completer))]
+        #[arg(long = "matching-desc")]
         matching_desc: Option<String>,
 
         /// Filter: dataset has at least this many base vectors (supports K/M/B suffixes)
-        #[arg(long = "with-min-size", add = ArgValueCompleter::new(filter::size_completer))]
+        #[arg(long = "with-min-size")]
         min_size: Option<String>,
 
         /// Filter: dataset has at most this many base vectors (supports K/M/B suffixes)
-        #[arg(long = "with-max-size", add = ArgValueCompleter::new(filter::size_completer))]
+        #[arg(long = "with-max-size")]
         max_size: Option<String>,
 
         /// Filter: dataset has exactly this many base vectors (supports K/M/B suffixes)
-        #[arg(long = "with-size", add = ArgValueCompleter::new(filter::size_completer))]
+        #[arg(long = "with-size")]
         size: Option<String>,
 
         /// Filter: minimum dimensionality of base vectors
-        #[arg(long = "with-min-dim", add = ArgValueCompleter::new(filter::dim_completer))]
+        #[arg(long = "with-min-dim")]
         min_dim: Option<u32>,
 
         /// Filter: maximum dimensionality of base vectors
-        #[arg(long = "with-max-dim", add = ArgValueCompleter::new(filter::dim_completer))]
+        #[arg(long = "with-max-dim")]
         max_dim: Option<u32>,
 
         /// Filter: exact dimensionality of base vectors
-        #[arg(long = "with-dim", add = ArgValueCompleter::new(filter::dim_completer))]
+        #[arg(long = "with-dim")]
         dim: Option<u32>,
 
         /// Filter: vector data type (float32, float16, uint8, int32, numpy, hdf5)
-        #[arg(long = "with-vtype", add = ArgValueCompleter::new(filter::vtype_completer))]
+        #[arg(long = "with-vtype")]
         vtype: Option<String>,
 
         /// Filter: minimum total data size in bytes (supports K/M/G/T suffixes)
-        #[arg(long = "with-data-min", add = ArgValueCompleter::new(filter::data_size_completer))]
+        #[arg(long = "with-data-min")]
         data_min: Option<String>,
 
         /// Filter: maximum total data size in bytes (supports K/M/G/T suffixes)
-        #[arg(long = "with-data-max", add = ArgValueCompleter::new(filter::data_size_completer))]
+        #[arg(long = "with-data-max")]
         data_max: Option<String>,
 
         /// List locally cached datasets instead of catalog entries
@@ -147,7 +146,7 @@ pub enum DatasetsCommand {
     /// Show cache status for a dataset (merkle coverage, sizes, completion)
     CacheStatus {
         /// Dataset name from catalog (omit with --all for all cached datasets)
-        #[arg(long, add = ArgValueCompleter::new(crate::explore::shared::dataset_completer))]
+        #[arg(long)]
         dataset: Option<String>,
 
         /// Show status for all cached datasets
@@ -167,7 +166,7 @@ pub enum DatasetsCommand {
         configdir: String,
 
         /// Additional catalog directories, file paths, or HTTP URLs
-        #[arg(long, add = ArgValueCompleter::new(catalog_completer))]
+        #[arg(long)]
         catalog: Vec<String>,
 
         /// Catalog URLs or paths to use *instead* of configured catalogs
@@ -177,7 +176,7 @@ pub enum DatasetsCommand {
     /// Probe a remote dataset: verify catalog access, list facets, read a sample
     Probe {
         /// Catalog base URL or number (e.g., 1, https://bucket.s3.amazonaws.com/path/)
-        #[arg(long, add = ArgValueCompleter::new(catalog_completer))]
+        #[arg(long)]
         at: String,
 
         /// Dataset name within the catalog
@@ -191,7 +190,7 @@ pub enum DatasetsCommand {
     /// Download and cache dataset facets locally
     Prebuffer {
         /// Dataset name or dataset:profile from catalog
-        #[arg(long, add = ArgValueCompleter::new(crate::explore::shared::dataset_completer))]
+        #[arg(long)]
         dataset: String,
 
         /// Profile name (overrides profile in dataset:profile)
@@ -203,7 +202,7 @@ pub enum DatasetsCommand {
         configdir: String,
 
         /// Additional catalog directories, file paths, or HTTP URLs
-        #[arg(long, add = ArgValueCompleter::new(catalog_completer))]
+        #[arg(long)]
         catalog: Vec<String>,
 
         /// Catalog URLs or paths to use *instead* of configured catalogs
@@ -420,32 +419,9 @@ fn run_config_command(command: ConfigSubcommand) {
 
 /// Completer for `--catalog`: suggests configured catalog sources from catalogs.yaml.
 /// Completer for `--catalog`: suggests numbered shortcuts for configured
-/// catalogs (e.g., `1`, `2`) with the URL shown as a description.
-/// The user can also type a free-form URL directly.
-fn catalog_completer(current: &std::ffi::OsStr) -> Vec<clap_complete::CompletionCandidate> {
-    let prefix = current.to_string_lossy();
-    let config_dir = crate::catalog::sources::expand_tilde(
-        crate::catalog::sources::DEFAULT_CONFIG_DIR,
-    );
-    let entries = crate::catalog::sources::raw_catalog_entries(&config_dir);
-    entries.iter()
-        .enumerate()
-        .filter(|(i, _)| {
-            let num = format!("{}", i + 1);
-            prefix.is_empty() || num.starts_with(prefix.as_ref())
-        })
-        .map(|(i, url)| {
-            let label = format!("{}", i + 1);
-            let help: clap_complete::CompletionCandidate = clap_complete::CompletionCandidate::new(&label)
-                .help(Some(url.clone().into()));
-            help
-        })
-        .collect()
-}
-
 /// Resolve a `--catalog` value: if it's a number, look up the configured
 /// catalog by index (1-based). Otherwise use it as a literal URL/path.
-fn resolve_catalog_value(value: &str) -> String {
+pub fn resolve_catalog_value(value: &str) -> String {
     if let Ok(n) = value.parse::<usize>() {
         if n >= 1 {
             let config_dir = crate::catalog::sources::expand_tilde(

@@ -134,7 +134,7 @@ impl CommandOp for VerifyKnnConsolidatedOp {
             Err(e) => return error_result(format!("failed to load dataset.yaml: {}", e), start),
         };
 
-        // Collect profiles sorted by base_count ascending
+        // Collect profiles sorted by size ascending
         let mut profiles: Vec<(String, u64, PathBuf, PathBuf)> = Vec::new();
         for (name, profile) in &config.profiles.profiles {
             let bc = profile.base_count.unwrap_or(u64::MAX);
@@ -144,7 +144,11 @@ impl CommandOp for VerifyKnnConsolidatedOp {
                 profiles.push((name.clone(), bc, indices_path, distances_path));
             }
         }
-        profiles.sort_by_key(|(_, bc, _, _)| *bc);
+        profiles.sort_by(|(a_name, _, _, _), (b_name, _, _, _)| {
+            let a_bc = config.profiles.profile(a_name).and_then(|p| p.base_count);
+            let b_bc = config.profiles.profile(b_name).and_then(|p| p.base_count);
+            vectordata::dataset::profile::profile_sort_by_size(a_name, a_bc, b_name, b_bc)
+        });
 
         if profiles.is_empty() {
             return error_result("no profiles with KNN indices found".to_string(), start);
@@ -726,7 +730,11 @@ impl CommandOp for VerifyFilteredKnnConsolidatedOp {
                 profiles.push((name.clone(), bc));
             }
         }
-        profiles.sort_by_key(|(_, bc)| *bc);
+        profiles.sort_by(|(a, _), (b, _)| {
+            let a_bc = config.profiles.profile(a).and_then(|p| p.base_count);
+            let b_bc = config.profiles.profile(b).and_then(|p| p.base_count);
+            vectordata::dataset::profile::profile_sort_by_size(a, a_bc, b, b_bc)
+        });
 
         ctx.ui.log(&format!(
             "verify-filtered-knn-consolidated: {} profiles, {} sample queries",
@@ -827,7 +835,11 @@ impl CommandOp for VerifyPredicatesConsolidatedOp {
                 profiles.push((name.clone(), bc));
             }
         }
-        profiles.sort_by_key(|(_, bc)| *bc);
+        profiles.sort_by(|(a, _), (b, _)| {
+            let a_bc = config.profiles.profile(a).and_then(|p| p.base_count);
+            let b_bc = config.profiles.profile(b).and_then(|p| p.base_count);
+            vectordata::dataset::profile::profile_sort_by_size(a, a_bc, b, b_bc)
+        });
 
         ctx.ui.log(&format!(
             "verify-predicates-consolidated: {} profiles, {} predicate samples, {} metadata records",

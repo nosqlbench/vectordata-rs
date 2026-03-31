@@ -3,6 +3,7 @@ members = [
     "vectordata",
     "veks-core",
     "veks-pipeline",
+    "veks-completion",
     "veks",
     "slabtastic",
     "tools",

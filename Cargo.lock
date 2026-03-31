@@ -4911,7 +4911,6 @@ dependencies = [
  "atty",
  "chrono",
  "clap",
- "clap_complete",
  "crossterm",
  "curl",
  "env_logger",
@@ -4934,9 +4933,14 @@ dependencies = [
  "slabtastic",
  "tempfile",
  "vectordata",
+ "veks-completion",
  "veks-core",
  "veks-pipeline",
 ]
+
+[[package]]
+name = "veks-completion"
+version = "0.10.0"
 
 [[package]]
 name = "veks-core"

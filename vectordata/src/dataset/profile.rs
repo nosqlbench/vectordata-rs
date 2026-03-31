@@ -233,8 +233,14 @@ impl DSProfileGroup {
     }
 
     /// List all profile names.
+    /// Profile names sorted by size ascending, with `default` first.
     pub fn profile_names(&self) -> Vec<&str> {
-        self.profiles.keys().map(|k| k.as_str()).collect()
+        let mut names: Vec<&str> = self.profiles.keys().map(|k| k.as_str()).collect();
+        names.sort_by(|a, b| profile_sort_by_size(
+            a, self.profiles.get(*a).and_then(|p| p.base_count),
+            b, self.profiles.get(*b).and_then(|p| p.base_count),
+        ));
+        names
     }
 
     /// Returns view names from the default profile (for display).
@@ -590,6 +596,36 @@ impl<'de> Deserialize<'de> for DSProfile {
 /// end). When provided, no profile will have a `base_count` exceeding this
 /// value. This is typically the default profile's base_count (the actual
 /// dataset size). Pass `None` at parse time when the dataset size is unknown.
+/// Compute a numeric sort key for a profile.
+///
+/// Uses `base_count` if available, otherwise parses the profile name as a
+/// number with SI/IEC suffix (e.g., `10m` → 10,000,000, `1gi` → 1,073,741,824).
+/// The `default` profile always sorts to the front.
+///
+/// This is the single source of truth for profile ordering across the
+/// entire codebase. All profile list views should use this function.
+pub fn profile_sort_key(name: &str, base_count: Option<u64>) -> u64 {
+    if name == "default" {
+        return 0; // always first
+    }
+    base_count
+        .or_else(|| crate::dataset::source::parse_number_with_suffix(name).ok())
+        .unwrap_or(u64::MAX - 1)
+}
+
+/// Compare two profiles by size for sorting.
+///
+/// `default` first, then ascending by `base_count` (or name-derived size).
+/// Tiebreak by name for profiles with identical sizes.
+pub fn profile_sort_by_size(
+    a_name: &str, a_base_count: Option<u64>,
+    b_name: &str, b_base_count: Option<u64>,
+) -> std::cmp::Ordering {
+    let a_key = profile_sort_key(a_name, a_base_count);
+    let b_key = profile_sort_key(b_name, b_base_count);
+    a_key.cmp(&b_key).then_with(|| a_name.cmp(b_name))
+}
+
 pub fn parse_sized_entry(entry: &str) -> Result<Vec<(String, u64)>, String> {
     parse_sized_entry_impl(entry, None)
 }

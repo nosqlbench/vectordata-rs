@@ -16,10 +16,9 @@ mod unified;
 use std::path::PathBuf;
 
 use clap::{Args, Subcommand};
-use clap_complete::engine::ArgValueCompleter;
 
 pub use shared::SampleMode;
-use shared::{parse_sample_mode, source_completer, dataset_completer};
+use shared::parse_sample_mode;
 
 /// Interactive data exploration and visualization
 #[derive(Args)]
@@ -34,13 +33,13 @@ pub enum ExploreCommand {
     /// Unified vector space explorer — norms, distances, eigenvalues, PCA in one TUI
     Explore {
         /// Dataset from catalog (e.g., img-search or img-search:default)
-        #[arg(long, group = "input", add = ArgValueCompleter::new(dataset_completer))]
+        #[arg(long, group = "input")]
         dataset: Option<String>,
         /// Any data source: local file path or dataset:profile:facet
-        #[arg(long, group = "input", add = ArgValueCompleter::new(source_completer))]
+        #[arg(long, group = "input")]
         source: Option<String>,
         /// Profile name (used with --dataset; overrides profile in dataset:profile)
-        #[arg(long, add = ArgValueCompleter::new(shared::profile_completer))]
+        #[arg(long)]
         profile: Option<String>,
         /// Number of vectors to sample
         #[arg(long, default_value = "50000")]
@@ -49,20 +48,19 @@ pub enum ExploreCommand {
         #[arg(long, default_value = "42")]
         seed: u64,
         /// Sampling mode [streaming, clumped, sparse]
-        #[arg(long, default_value = "streaming", value_parser = parse_sample_mode,
-              add = ArgValueCompleter::new(shared::sample_mode_completer))]
+        #[arg(long, default_value = "streaming", value_parser = parse_sample_mode)]
         sample_mode: SampleMode,
     },
     /// Interactive data exploration shell for vector files
     Shell {
         /// Dataset from catalog (e.g., img-search or img-search:default)
-        #[arg(long, group = "input", add = ArgValueCompleter::new(dataset_completer))]
+        #[arg(long, group = "input")]
         dataset: Option<String>,
         /// Any data source: local file path or dataset:profile:facet
-        #[arg(long, group = "input", add = ArgValueCompleter::new(source_completer))]
+        #[arg(long, group = "input")]
         source: Option<String>,
         /// Profile name (used with --dataset; overrides profile in dataset:profile)
-        #[arg(long, add = ArgValueCompleter::new(shared::profile_completer))]
+        #[arg(long)]
         profile: Option<String>,
 
         /// Trailing args passed as command options

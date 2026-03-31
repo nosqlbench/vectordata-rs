@@ -22,7 +22,7 @@ path = "src/main.rs"
 atty = "0.2"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "string"] }
-clap_complete = { version = "4", features = ["unstable-dynamic"] }
+veks-completion = { path = "../veks-completion" }
 crossterm = "0.28"
 curl = "0.4"
 env_logger = "0.11"
