@@ -100,6 +100,13 @@ impl VecFormat {
         }
     }
 
+    /// Return the canonical (preferred) extension for a recognized extension
+    /// string. For xvec formats the shorter singular form is canonical
+    /// (e.g. `"fvecs"` → `"fvec"`). Returns `None` for unrecognized extensions.
+    pub fn canonical_extension(ext: &str) -> Option<&'static str> {
+        Self::from_extension(ext).map(|f| f.name())
+    }
+
     /// Detect format from a bare file extension (e.g. `"fvec"`, `"parquet"`).
     pub fn from_extension(ext: &str) -> Option<Self> {
         match ext {

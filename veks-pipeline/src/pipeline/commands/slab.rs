@@ -15,6 +15,7 @@ use std::time::Instant;
 
 use slabtastic::{OpenProgress, SlabReader, SlabWriter, WriterConfig};
 
+use crate::pipeline::atomic_write::safe_create_file;
 use crate::pipeline::command::{
     ArtifactManifest, CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options,
     ResourceDesc, Status, StreamContext, render_options_table,
@@ -284,7 +285,7 @@ for debugging predicate or metadata issues during pipeline development.
 
         let mut output: Box<dyn Write> = if let Some(ref path) = output_path {
             Box::new(
-                std::fs::File::create(path)
+                safe_create_file(path)
                     .map_err(|e| format!("create error: {}", e))
                     .unwrap(),
             )
@@ -2290,6 +2291,7 @@ mod tests {
             governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
             ui: veks_core::ui::UiHandle::new(std::sync::Arc::new(veks_core::ui::TestSink::new())),
             status_interval: std::time::Duration::from_secs(1),
+            estimated_total_steps: 0,
         }
     }
 

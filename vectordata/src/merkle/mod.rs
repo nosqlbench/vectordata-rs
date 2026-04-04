@@ -180,8 +180,18 @@ impl MerkleShape {
         })
     }
 
-    /// Write the 41-byte footer.
+    /// Write the 45-byte v2 footer (Java-compatible).
+    ///
+    /// Always writes the v2 format which includes the `bitSetSize` field.
+    /// For `.mref` files pass `bitset_size = 0`. For `.mrkl` files pass
+    /// the actual bitset byte count. This matches the Java
+    /// `Merklev2Footer.FIXED_FOOTER_SIZE` (45 bytes).
     pub fn write_footer<W: Write>(&self, w: &mut W) -> io::Result<()> {
+        self.write_footer_with_bitset(w, 0)
+    }
+
+    /// Write the 45-byte v2 footer with an explicit bitset size.
+    pub fn write_footer_with_bitset<W: Write>(&self, w: &mut W, bitset_size: u32) -> io::Result<()> {
         w.write_u64::<BigEndian>(self.chunk_size)?;
         w.write_u64::<BigEndian>(self.total_content_size)?;
         w.write_u32::<BigEndian>(self.total_chunks)?;
@@ -190,7 +200,8 @@ impl MerkleShape {
         w.write_u32::<BigEndian>(self.node_count)?;
         w.write_u32::<BigEndian>(self.offset)?;
         w.write_u32::<BigEndian>(self.internal_node_count)?;
-        w.write_u8(FOOTER_SIZE as u8)?;
+        w.write_u32::<BigEndian>(bitset_size)?;
+        w.write_u8(FOOTER_SIZE_V2 as u8)?;
         Ok(())
     }
 }
@@ -292,7 +303,7 @@ mod tests {
 
         let mut buf = Vec::new();
         shape.write_footer(&mut buf).unwrap();
-        assert_eq!(buf.len(), FOOTER_SIZE);
+        assert_eq!(buf.len(), FOOTER_SIZE_V2);
 
         let parsed = MerkleShape::read_footer(&buf).unwrap();
         assert_eq!(shape, parsed);
@@ -316,8 +327,10 @@ mod tests {
 
         // Verify big-endian encoding of chunk_size (first 8 bytes)
         assert_eq!(&buf[0..8], &[0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00]);
-        // Last byte is footer length
-        assert_eq!(buf[40], 41);
+        // bitSetSize at bytes 40..44 should be 0
+        assert_eq!(&buf[40..44], &[0x00, 0x00, 0x00, 0x00]);
+        // Last byte is footer length (45 = v2)
+        assert_eq!(buf[44], 45);
     }
 
     #[test]

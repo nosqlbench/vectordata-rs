@@ -47,7 +47,9 @@ pub const DIM_UNDEFINED: usize = usize::MAX;
 /// (for programmatic paths). Returns an error for mismatches.
 fn validate_extension(path: &Path, expected: &str) -> Result<(), IoError> {
     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-        if ext != expected {
+        // Accept both singular (e.g. "fvec") and plural (e.g. "fvecs") forms
+        let plural = format!("{}s", expected);
+        if ext != expected && ext != plural {
             return Err(IoError::InvalidFormat(format!(
                 "file extension '.{}' does not match expected '.{}' for {}: {}",
                 ext, expected, expected, path.display(),

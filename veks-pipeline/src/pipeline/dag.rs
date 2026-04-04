@@ -266,6 +266,7 @@ mod tests {
             after: after.into_iter().map(String::from).collect(),
             profiles: vec![],
             per_profile: false,
+            phase: 0,
             on_partial: OnPartial::default(),
             options,
         }
@@ -318,6 +319,7 @@ mod tests {
                 after: vec![],
                 profiles: vec![],
                 per_profile: false,
+                phase: 0,
                 on_partial: OnPartial::default(),
                 options: b_opts,
             },
@@ -377,6 +379,7 @@ mod tests {
             after: vec![],
             profiles: vec![],
             per_profile: false,
+            phase: 0,
             on_partial: OnPartial::default(),
             options: IndexMap::new(),
         }];

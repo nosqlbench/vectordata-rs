@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
+use crate::pipeline::atomic_write::safe_create_file;
 use veks_core::ui::event::ResourceMetrics;
 
 // ---------------------------------------------------------------------------
@@ -1365,7 +1366,7 @@ struct GovernorLog {
 impl GovernorLog {
     /// Create a new log file at the given path (overwrites existing).
     fn new(path: &Path) -> Self {
-        let file = std::fs::File::create(path)
+        let file = safe_create_file(path)
             .map_err(|e| log::warn!("Cannot create governor log: {}", e))
             .ok();
         GovernorLog { file }

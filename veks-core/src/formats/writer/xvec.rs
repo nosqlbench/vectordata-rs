@@ -43,6 +43,13 @@ pub struct XvecWriter {
 impl XvecWriter {
     /// Open an xvec output file for writing
     pub fn open(path: &Path, dimension: u32) -> Result<Box<dyn VecSink>, String> {
+        // Safety: remove any symlink before writing — symlinks are
+        // read-only aliases to source data.
+        if path.is_symlink() {
+            std::fs::remove_file(path)
+                .map_err(|e| format!("Failed to remove symlink {}: {}", path.display(), e))?;
+            eprintln!("  safety: removed symlink {} before write", path.display());
+        }
         let file = File::create(path)
             .map_err(|e| format!("Failed to create {}: {}", path.display(), e))?;
         Ok(Box::new(XvecWriter {

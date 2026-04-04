@@ -50,12 +50,12 @@ impl ElementType {
             .ok_or_else(|| format!("no file extension: {}", path.display()))?;
 
         match ext {
-            "dvec" => Ok(ElementType::F64),
-            "fvec" => Ok(ElementType::F32),
-            "mvec" => Ok(ElementType::F16),
-            "ivec" => Ok(ElementType::I32),
-            "svec" => Ok(ElementType::I16),
-            "bvec" => Ok(ElementType::U8),
+            "dvec" | "dvecs" => Ok(ElementType::F64),
+            "fvec" | "fvecs" => Ok(ElementType::F32),
+            "mvec" | "mvecs" => Ok(ElementType::F16),
+            "ivec" | "ivecs" => Ok(ElementType::I32),
+            "svec" | "svecs" => Ok(ElementType::I16),
+            "bvec" | "bvecs" => Ok(ElementType::U8),
             _ => Err(format!("unrecognized vector extension '.{}': {}", ext, path.display())),
         }
     }
@@ -95,16 +95,26 @@ impl ElementType {
         }
     }
 
-    /// Compute the normalization threshold for this element type and dimension.
+    /// Fixed normalization threshold for this element type.
     ///
-    /// Uses the probabilistic rounding-error bound from Higham & Mary (2019):
-    /// the expected epsilon for a correctly normalized vector stored at
-    /// precision *p* is O(√dim × ε_mach(p)). The constant C = 10 provides
-    /// ~10× headroom above the expected error floor. See SRD §18.3.
+    /// A vector is considered L2-normalized if its mean norm deviation
+    /// from 1.0 is below this threshold. The thresholds are fixed per
+    /// precision level and do not vary with dimensionality:
+    ///
+    /// | Type | Threshold  |
+    /// |------|------------|
+    /// | F16  | 1.0 × 10⁻¹  |
+    /// | F32  | 1.0 × 10⁻⁵  |
+    /// | F64  | 1.0 × 10⁻¹⁴ |
     ///
     /// Returns `None` for non-float element types.
-    pub fn normalization_threshold(&self, dim: usize) -> Option<f64> {
-        self.machine_epsilon().map(|eps| 10.0 * eps * (dim as f64).sqrt())
+    pub fn normalization_threshold(&self, _dim: usize) -> Option<f64> {
+        match self {
+            ElementType::F16 => Some(1e-1),
+            ElementType::F32 => Some(1e-5),
+            ElementType::F64 => Some(1e-14),
+            _ => None,
+        }
     }
 
     /// Returns the size of a single element in bytes.
@@ -334,17 +344,11 @@ mod tests {
 
     #[test]
     fn test_normalization_threshold() {
-        // f32, dim=768: 10 × 1.19e-7 × sqrt(768) ≈ 3.30e-5
-        let t = ElementType::F32.normalization_threshold(768).unwrap();
-        assert!(t > 3e-5 && t < 4e-5, "f32 dim=768 threshold={}", t);
-
-        // f16, dim=128: 10 × 9.77e-4 × sqrt(128) ≈ 0.11
-        let t = ElementType::F16.normalization_threshold(128).unwrap();
-        assert!(t > 0.10 && t < 0.12, "f16 dim=128 threshold={}", t);
-
-        // f64, dim=1536: 10 × 2.22e-16 × sqrt(1536) ≈ 8.7e-14
-        let t = ElementType::F64.normalization_threshold(1536).unwrap();
-        assert!(t > 8e-14 && t < 9e-14, "f64 dim=1536 threshold={}", t);
+        // Fixed thresholds per element type, independent of dimension
+        assert_eq!(ElementType::F32.normalization_threshold(768).unwrap(), 1e-5);
+        assert_eq!(ElementType::F32.normalization_threshold(128).unwrap(), 1e-5);
+        assert_eq!(ElementType::F16.normalization_threshold(128).unwrap(), 1e-1);
+        assert_eq!(ElementType::F64.normalization_threshold(1536).unwrap(), 1e-14);
 
         // Integer types return None
         assert!(ElementType::I32.normalization_threshold(768).is_none());

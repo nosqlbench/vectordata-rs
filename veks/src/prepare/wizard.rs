@@ -48,6 +48,9 @@ pub struct WizardSeeds {
     pub provided_facets: Option<String>,
     pub round_digits: Option<u32>,
     pub selectivity: Option<f64>,
+    pub force: bool,
+    pub classic: bool,
+    pub sources: Vec<PathBuf>,
 }
 
 /// Run the wizard with auto-accept disabled (fully interactive).
@@ -77,10 +80,14 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
 
     // Pre-check: warn if dataset.yaml already exists
     if cwd.join("dataset.yaml").exists() {
-        println!("Warning: dataset.yaml already exists in this directory.");
-        if !confirm("Overwrite it?", false) {
-            eprintln!("Aborted.");
-            std::process::exit(0);
+        if seeds.force {
+            println!("Overwriting existing dataset.yaml (--overwrite).");
+        } else {
+            println!("Warning: dataset.yaml already exists in this directory.");
+            if !confirm("Overwrite it?", false) {
+                eprintln!("Aborted.");
+                std::process::exit(0);
+            }
         }
         // Back up before overwriting
         let yaml_path = cwd.join("dataset.yaml");
@@ -91,8 +98,37 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
         println!();
     }
 
-    // Scan for candidate data files
-    let candidates = scan_candidates(&cwd);
+    // Scan for candidate data files, or use explicit --source list
+    let candidates = if !seeds.sources.is_empty() {
+        // Build candidates from explicit --source paths
+        let mut explicit = Vec::new();
+        for src in &seeds.sources {
+            let path = if src.is_absolute() { src.clone() } else { cwd.join(src) };
+            if let Some(format) = VecFormat::detect_from_path(&path) {
+                if format == VecFormat::Hdf5 {
+                    if let Ok(datasets) = veks_core::formats::reader::hdf5::list_datasets(&path) {
+                        for (ds_name, rows, cols, elem_size) in datasets {
+                            let ds_size = rows * cols as u64 * elem_size as u64;
+                            let fmt_name = match elem_size {
+                                4 => if ds_name.contains("indic") { "ivec" } else { "fvec" },
+                                8 => "dvec", 2 => "mvec", 1 => "bvec", _ => "fvec",
+                            };
+                            let rel = PathBuf::from(format!("{}#{}", src.display(), ds_name));
+                            explicit.push((rel, fmt_name.to_string(), ds_size));
+                        }
+                    }
+                } else {
+                    let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                    explicit.push((src.clone(), format.name().to_string(), size));
+                }
+            } else {
+                eprintln!("Warning: unrecognized format for --source {}", src.display());
+            }
+        }
+        explicit
+    } else {
+        scan_candidates(&cwd)
+    };
     if !candidates.is_empty() {
         println!("Detected files:");
         for (path, format, size) in &candidates {
@@ -156,10 +192,35 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
     }
 
     let roles_accepted = if detected.any_detected() {
-        println!("Detected file roles:");
-        detected.print_summary();
-        println!();
-        confirm("Use detected assignments?", true)
+        let mut accepted = false;
+        loop {
+            println!("Detected file roles:");
+            detected.print_summary();
+            println!();
+            if confirm("Use detected assignments?", true) {
+                accepted = true;
+                break;
+            }
+            // User rejected — ask for a facet constraint and re-filter
+            println!();
+            println!("Enter provided facet codes to constrain detection");
+            println!("  (e.g., BQ = only base + query, BQGD = all four)");
+            println!("  Or press Enter to skip auto-detection entirely.");
+            let spec = prompt_with_default("Provided facets", "");
+            if spec.is_empty() {
+                break; // skip detection
+            }
+            let p = crate::prepare::import::parse_facet_spec(&spec);
+            // Re-run detection with the new constraint
+            detected = detect_roles(&candidates);
+            if !p.contains('B') { detected.base_vectors = None; }
+            if !p.contains('Q') { detected.query_vectors = None; }
+            if !p.contains('G') { detected.neighbor_indices = None; }
+            if !p.contains('D') { detected.neighbor_distances = None; }
+            if !p.contains('M') { detected.metadata = None; }
+            println!();
+        }
+        accepted
     } else {
         false
     };
@@ -193,7 +254,7 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
             no_dedup: false,
             no_zero_check: false,
             no_filtered: false,
-            normalize: false,
+            normalize: true,
             force: false,
             base_convert_format: None,
             query_convert_format: None,
@@ -205,6 +266,7 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
             round_digits: 2,
             pedantic_dedup: false,
             selectivity: 0.0001,
+            classic: seeds.classic,
         };
         super::import::resolve_facets(&probe)
     };
@@ -221,7 +283,7 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
     ];
 
     println!();
-    println!("--- Dataset facets ---");
+    println!("--- Required facets ---");
     println!("  Inferred from detected inputs (SRD §2.8):");
     println!();
     for &(code, label) in &facet_labels {
@@ -412,7 +474,7 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
     // Auto-detect metric from vector data
     let (detected_metric, detect_reason) = base_vectors.as_ref()
         .map(|p| crate::prepare::import::detect_metric(p))
-        .unwrap_or_else(|| ("Cosine".to_string(), "default".to_string()));
+        .unwrap_or_else(|| ("COSINE".to_string(), "default".to_string()));
     println!("  Detected: {} ({})", detected_metric, detect_reason);
     println!("  Common metrics:");
     println!("    L2         — Euclidean distance (most embedding models)");
@@ -425,47 +487,42 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
         metric_default,
     );
 
-    // Normalization detection. Normalization is a data transformation
-    // choice — the pipeline supports correct distance computation for
-    // both normalized and unnormalized vectors with any metric.
-    // Normalizing is recommended for Cosine/DotProduct (enables faster
-    // SIMD kernel) but not required.
-    let (normalize, metric) = if let Some(ref bv) = base_vectors {
-        eprint!("Sampling vectors for normalization detection... ");
+    let metric = source_metric;
+
+    // Normalization: detect current state and ask user. Default is enabled.
+    println!();
+    println!("--- Normalization ---");
+    let already_normalized = if let Some(ref bv) = base_vectors {
+        eprint!("  Sampling vectors for normalization status... ");
         use std::io::Write;
         let _ = std::io::stderr().flush();
 
         let detected = super::import::detect_normalized(bv);
-        let already_normalized = detected.as_ref().map(|(n, _, _)| *n).unwrap_or(false);
-
-        if already_normalized {
-            let (_, count, mean) = detected.unwrap();
-            eprintln!("already normalized (mean norm={:.4}, n={}).", mean, count);
-            (false, source_metric)
-        } else {
-            if let Some((_, count, mean)) = detected {
+        if let Some((is_norm, count, mean)) = detected {
+            if is_norm {
+                eprintln!("already normalized (mean norm={:.4}, n={}).", mean, count);
+            } else {
                 eprintln!("not normalized (mean norm={:.4}, n={}).", mean, count);
-            } else {
-                eprintln!("could not detect (source format).");
             }
-            let cosine_or_dot = source_metric.eq_ignore_ascii_case("Cosine")
-                || source_metric.eq_ignore_ascii_case("DotProduct");
-            if cosine_or_dot {
-                println!();
-                println!("  L2-normalizing is recommended for {} metric:", source_metric);
-                println!("    - Enables 16-wide AVX-512 batched distance kernel (~16x faster KNN)");
-                println!("    - Without normalization, KNN falls back to per-pair computation");
-                println!("    - Normalization is applied during extraction (source data unchanged)");
-                println!();
-                let do_normalize = confirm("L2-normalize vectors during extraction?", false);
-                (do_normalize, source_metric)
-            } else {
-                println!("  Metric {} does not benefit from normalization.", source_metric);
-                (false, source_metric)
-            }
+            is_norm
+        } else {
+            eprintln!("could not detect (source format).");
+            false
         }
     } else {
-        (false, source_metric)
+        false
+    };
+
+    println!("  L2-normalization ensures all vectors have unit length.");
+    println!("  This is applied during extraction — source data is unchanged.");
+    if already_normalized {
+        println!("  Vectors are already normalized; normalization will be a no-op.");
+    }
+    let normalize = if let Some(seeded) = seeds.normalize {
+        println!("  (seeded: normalize={})", seeded);
+        seeded
+    } else {
+        confirm("L2-normalize vectors during extraction?", true)
     };
 
     // ── Remaining configuration ─────────────────────────────────────
@@ -602,8 +659,8 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
                 }
             };
 
-            if effective_max < 2_000_000 {
-                println!("  Dataset is small enough that sized profiles may not be needed.");
+            if effective_max < 20_000_000 {
+                println!("  Dataset has fewer than 20M vectors — sized profiles are optional.");
                 if !confirm("Generate sized profiles anyway?", false) {
                     None
                 } else {
@@ -683,12 +740,7 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
     }
     println!();
 
-    // Artifact lineage: inputs → facets with connection types
-    println!("  {}                              {}",
-        term::bold("Provided inputs"), term::bold("Dataset facets"));
-    println!("  {}    {}",
-        term::dim("─────────────────────────────────────────"),
-        term::dim("──────────────────────────────"));
+    // (header printed after facet_rows is built)
 
     // Helper: format an input path for display (truncate to ~35 chars)
     let fmt_input = |path: &Path, fmt: &str| -> String {
@@ -826,58 +878,35 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
         },
     ];
 
+    // Even/odd two-line layout: facet info on line 1, source on line 2
+    println!("  {}", term::bold("Pipeline facets"));
+    println!("  {}", term::dim("──────────────────────────────"));
+
     for row in &facet_rows {
         if !confirmed_facets.contains(row.code) {
             continue;
         }
-        // Color the arrow and tag by connection type
-        // All arrows are exactly 12 visual characters wide
-        let (arrow, tag_colored) = match row.connection {
-            "identity" => (    //123456789012
-                term::ok(      "═══════════►"),
-                term::ok("[identity]"),
-            ),
-            "provided" => (    //123456789012
-                term::green(   "───────────►"),
-                term::green("[provided]"),
-            ),
-            "convert" => (     //123456789012
-                term::info(    "──convert──►"),
-                term::info("[convert]"),
-            ),
-            "self-search" => ( //123456789012
-                term::info(    "───split───►"),
-                term::info("[self-search]"),
-            ),
-            "compute" => (     //123456789012
-                term::warn(    "──compute──►"),
-                term::warn("[compute]"),
-            ),
-            "synthesize" => (  //123456789012
-                term::warn(    "─synthesize►"),
-                term::warn("[synthesize]"),
-            ),
-            "evaluate" => (    //123456789012
-                term::warn(    "──evaluate─►"),
-                term::warn("[evaluate]"),
-            ),
-            _ => (
-                "       ►".to_string(),
-                format!("[{}]", row.connection),
-            ),
+        let tag = match row.connection {
+            "identity"    => term::ok("[identity]"),
+            "provided"    => term::green("[provided]"),
+            "convert"     => term::info("[convert]"),
+            "self-search" => term::info("[self-search]"),
+            "compute"     => term::warn("[compute]"),
+            "synthesize"  => term::warn("[synthesize]"),
+            "evaluate"    => term::warn("[evaluate]"),
+            "checked"     => term::ok("[checked]"),
+            _             => format!("[{}]", row.connection),
         };
-
-        let source_raw = if row.source.is_empty() { "(none)" } else { &row.source };
-        let source_padded = pad(source_raw, 42);
-        let source_display = if row.source.is_empty() {
-            term::dim(&source_padded)
+        let source = if row.source.is_empty() {
+            term::dim("(none)")
         } else {
-            source_padded
+            row.source.clone()
         };
-        let facet_code = term::bold(&row.code.to_string());
-        let label_padded = pad(row.label, 20);
-        println!("  {} {} {}  {} {}",
-            source_display, arrow, facet_code, label_padded, tag_colored);
+        println!("  {}  {}  {}",
+            term::bold(&row.code.to_string()),
+            pad(row.label, 22),
+            tag);
+        println!("      {}", term::dim(&source));
     }
     println!();
     println!();
@@ -916,6 +945,7 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
         round_digits: seeds.round_digits.unwrap_or(2),
         pedantic_dedup: seeds.pedantic_dedup.unwrap_or(false),
         selectivity,
+        classic: seeds.classic,
     }
 }
 
@@ -931,17 +961,77 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
 /// 3. Keep as-is (will be flagged as extraneous if not in pipeline manifest)
 ///
 /// Returns the final path to use in the pipeline.
+/// Track HDF5 container files that have already been renamed so we
+/// only prompt once per actual file, not per dataset within the file.
+static HDF5_RENAMES: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
+
 fn prompt_source_location(source: &Path, output_dir: &Path, label: &str) -> PathBuf {
+    let source_str = source.to_string_lossy();
+
+    // HDF5 # paths: rename the container file once, update all references
+    if let Some(hash_pos) = source_str.rfind('#') {
+        let file_part = &source_str[..hash_pos];
+        let dataset_part = &source_str[hash_pos..]; // includes #
+
+        // Check if this container was already renamed
+        if let Ok(renames) = HDF5_RENAMES.lock() {
+            if let Some((_, new_file)) = renames.iter().find(|(old, _)| old == file_part) {
+                return PathBuf::from(format!("{}{}", new_file, dataset_part));
+            }
+        }
+
+        let file_path = Path::new(file_part);
+        let filename = file_path.file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+
+        // Already prefixed or in cache
+        if filename.starts_with('_') || file_part.contains(".cache/") {
+            return source.to_path_buf();
+        }
+
+        // Prompt once for this container file
+        println!();
+        println!("  --- HDF5 source file ---");
+        println!("  {} contains multiple datasets used by this pipeline.", filename);
+        println!("  Source files should not be published. Options:");
+        println!("    1. Rename with _ prefix (not published, stays accessible locally)");
+        println!("    2. Keep as-is (may be flagged as extraneous by veks check)");
+        let choice = prompt_with_default("  Choice [1/2]", "1");
+
+        if choice == "1" {
+            let parent = file_path.parent().unwrap_or(Path::new("."));
+            let new_name = format!("_{}", filename);
+            let dest = parent.join(&new_name);
+            println!("  Renaming {} → {}", file_path.display(), dest.display());
+            match std::fs::rename(file_path, &dest) {
+                Ok(()) => {
+                    println!("  Renamed successfully.");
+                    let new_file = dest.to_string_lossy().to_string();
+                    if let Ok(mut renames) = HDF5_RENAMES.lock() {
+                        renames.push((file_part.to_string(), new_file.clone()));
+                    }
+                    return PathBuf::from(format!("{}{}", new_file, dataset_part));
+                }
+                Err(e) => {
+                    println!("  WARNING: rename failed: {}", e);
+                }
+            }
+        } else {
+            // Record as "kept" so we don't ask again
+            if let Ok(mut renames) = HDF5_RENAMES.lock() {
+                renames.push((file_part.to_string(), file_part.to_string()));
+            }
+        }
+        return source.to_path_buf();
+    }
+
     let filename = source.file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default();
 
-    // If already in .cache/, starts with _, or is an HDF5 # dataset path,
-    // no rename action needed. HDF5 files are read-only sources consumed
-    // by the convert step — renaming individual datasets is meaningless.
-    let source_str = source.to_string_lossy();
     if source_str.contains(".cache/") || source_str.contains("/.cache/")
-        || filename.starts_with('_') || source_str.contains('#')
+        || filename.starts_with('_')
     {
         return source.to_path_buf();
     }
@@ -1169,22 +1259,22 @@ fn check_vector_precision(label: &str, path: &Path) -> Option<String> {
 /// `-y` (auto-accept) mode produce valid results when filenames contain
 /// conventional hints like `base`, `query`, `groundtruth`, etc.
 #[derive(Debug, Default)]
-struct DetectedRoles {
-    base_vectors: Option<PathBuf>,
-    query_vectors: Option<PathBuf>,
-    neighbor_indices: Option<PathBuf>,
-    neighbor_distances: Option<PathBuf>,
-    metadata: Option<PathBuf>,
-    metadata_predicates: Option<PathBuf>,
-    metadata_results: Option<PathBuf>,
-    filtered_neighbor_indices: Option<PathBuf>,
-    filtered_neighbor_distances: Option<PathBuf>,
-    unassigned: Vec<PathBuf>,
+pub(crate) struct DetectedRoles {
+    pub(crate) base_vectors: Option<PathBuf>,
+    pub(crate) query_vectors: Option<PathBuf>,
+    pub(crate) neighbor_indices: Option<PathBuf>,
+    pub(crate) neighbor_distances: Option<PathBuf>,
+    pub(crate) metadata: Option<PathBuf>,
+    pub(crate) metadata_predicates: Option<PathBuf>,
+    pub(crate) metadata_results: Option<PathBuf>,
+    pub(crate) filtered_neighbor_indices: Option<PathBuf>,
+    pub(crate) filtered_neighbor_distances: Option<PathBuf>,
+    pub(crate) unassigned: Vec<PathBuf>,
 }
 
 impl DetectedRoles {
     /// Returns `true` if at least one role was detected.
-    fn any_detected(&self) -> bool {
+    pub(crate) fn any_detected(&self) -> bool {
         self.base_vectors.is_some()
             || self.query_vectors.is_some()
             || self.neighbor_indices.is_some()
@@ -1241,7 +1331,7 @@ const FLOAT_VECTOR_FORMATS: &[&str] = &["fvec", "dvec", "mvec"];
 /// for keyword substrings and assigns it to a dataset role. If two files
 /// claim the same role, neither is assigned (ambiguous — the wizard falls
 /// through to manual selection for that role).
-fn detect_roles(candidates: &[(PathBuf, String, u64)]) -> DetectedRoles {
+pub(crate) fn detect_roles(candidates: &[(PathBuf, String, u64)]) -> DetectedRoles {
     /// Role tag used during detection before resolving ambiguities.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum Role {
@@ -1393,13 +1483,31 @@ fn scan_candidates(dir: &Path) -> Vec<(PathBuf, String, u64)> {
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
 
-        // Skip hidden files and known non-data files
+        // Skip hidden files, known non-data files, and pipeline artifacts.
         if name_str.starts_with('.') || name_str == "dataset.yaml"
             || name_str == "variables.yaml"
             || name_str.ends_with(".json") || name_str.ends_with(".yaml")
             || name_str.ends_with(".yml")
+            || name_str.ends_with(".mref") || name_str.ends_with(".mrkl")
+            || name_str.ends_with(".log")
+            || veks_core::filters::is_infrastructure_file(&name_str)
         {
             continue;
+        }
+        // Skip pipeline-generated artifact names. These are canonical facet
+        // output names that the pipeline produces — not source data.
+        {
+            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+            if matches!(stem,
+                "base_vectors" | "base_vectors_raw"
+                | "query_vectors" | "query_vectors_raw"
+                | "query_vectors_clean"
+                | "neighbor_indices" | "neighbor_distances"
+                | "filtered_neighbor_indices" | "filtered_neighbor_distances"
+                | "metadata_content" | "metadata_predicates" | "metadata_indices"
+            ) {
+                continue;
+            }
         }
 
         if let Some(format) = VecFormat::detect_from_path(&path) {
@@ -1480,26 +1588,72 @@ fn dir_size(dir: &Path) -> u64 {
 // Prompt helpers
 // ---------------------------------------------------------------------------
 
-/// Prompt where the user's input is appended to the default.
-/// Typing just Enter keeps the default. Typing text appends it as a suffix.
-/// Typing `=something` replaces the default entirely.
+/// Prompt with the default pre-filled as editable text.
+/// Uses crossterm raw mode so the user can backspace/edit the default.
 fn prompt_with_prefill(label: &str, default: &str) -> String {
     if AUTO_ACCEPT.load(Ordering::Relaxed) {
-        eprintln!("{} [{}]: ", label, default);
+        eprintln!("{}: {}", label, default);
         return default.to_string();
     }
-    eprint!("{} [{}] (type to append, =to replace): ", label, default);
+
+    use crossterm::{terminal, event::{self, Event, KeyCode, KeyModifiers}};
+    use std::io::Write;
+
+    eprint!("{}: {}", label, default);
     io::stderr().flush().unwrap_or(());
-    let mut input = String::new();
-    io::stdin().read_line(&mut input).unwrap_or(0);
-    let trimmed = input.trim();
-    if trimmed.is_empty() {
-        default.to_string()
-    } else if let Some(replacement) = trimmed.strip_prefix('=') {
-        replacement.to_string()
-    } else {
-        format!("{}{}", default, trimmed)
+
+    let mut buf = default.to_string();
+
+    if terminal::enable_raw_mode().is_err() {
+        // Fallback: plain prompt
+        let _ = terminal::disable_raw_mode();
+        eprint!("\r{} [{}]: ", label, default);
+        io::stderr().flush().unwrap_or(());
+        let mut input = String::new();
+        io::stdin().read_line(&mut input).unwrap_or(0);
+        let trimmed = input.trim();
+        return if trimmed.is_empty() { default.to_string() } else { trimmed.to_string() };
     }
+
+    loop {
+        match event::read() {
+            Ok(Event::Key(key)) => match key.code {
+                KeyCode::Enter => break,
+                KeyCode::Backspace => {
+                    if !buf.is_empty() {
+                        buf.pop();
+                        eprint!("\x08 \x08"); // erase char
+                        io::stderr().flush().unwrap_or(());
+                    }
+                }
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    let _ = terminal::disable_raw_mode();
+                    eprintln!();
+                    std::process::exit(130);
+                }
+                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    // Clear line
+                    let clear = "\x08 \x08".repeat(buf.len());
+                    eprint!("{}", clear);
+                    io::stderr().flush().unwrap_or(());
+                    buf.clear();
+                }
+                KeyCode::Char(c) => {
+                    buf.push(c);
+                    eprint!("{}", c);
+                    io::stderr().flush().unwrap_or(());
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+
+    let _ = terminal::disable_raw_mode();
+    eprintln!(); // newline after Enter
+
+    let trimmed = buf.trim().to_string();
+    if trimmed.is_empty() { default.to_string() } else { trimmed }
 }
 
 /// Prompt with a default value. Returns the default if the user presses Enter

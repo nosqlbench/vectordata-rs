@@ -21,8 +21,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use indexmap::IndexMap;
-use vectordata::VectorReader;
-use vectordata::io::MmapVectorReader;
+
+use crate::pipeline::element_type::ElementType;
 
 /// Path to the variables file relative to a dataset directory.
 pub fn variables_path(dataset_dir: &Path) -> PathBuf {
@@ -170,57 +170,33 @@ fn resolve_path(path_str: &str, workspace: &Path) -> PathBuf {
 
 fn count_file(path: &Path) -> Result<String, String> {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-    match ext {
-        "fvec" => {
-            let reader = MmapVectorReader::<f32>::open_fvec(path)
-                .map_err(|e| format!("failed to open {}: {}", path.display(), e))?;
-            Ok((<MmapVectorReader<f32> as VectorReader<f32>>::count(&reader)).to_string())
-        }
-        "mvec" => {
-            let reader = MmapVectorReader::<half::f16>::open_mvec(path)
-                .map_err(|e| format!("failed to open {}: {}", path.display(), e))?;
-            Ok((<MmapVectorReader<half::f16> as VectorReader<half::f16>>::count(&reader)).to_string())
-        }
-        "ivec" => {
-            let reader = MmapVectorReader::<i32>::open_ivec(path)
-                .map_err(|e| format!("failed to open {}: {}", path.display(), e))?;
-            Ok((<MmapVectorReader<i32> as VectorReader<i32>>::count(&reader)).to_string())
-        }
-        "slab" => {
-            let reader = slabtastic::SlabReader::open(path)
-                .map_err(|e| format!("failed to open {}: {}", path.display(), e))?;
-            Ok(reader.total_records().to_string())
-        }
-        _ => Err(format!(
+    if ext == "slab" {
+        let reader = slabtastic::SlabReader::open(path)
+            .map_err(|e| format!("failed to open {}: {}", path.display(), e))?;
+        return Ok(reader.total_records().to_string());
+    }
+    let etype = ElementType::from_path(path)
+        .map_err(|_| format!(
             "cannot count records in '{}': unsupported extension '.{}'",
             path.display(), ext
-        )),
-    }
+        ))?;
+    crate::dispatch_reader!(etype, path, reader => {
+        use vectordata::VectorReader;
+        Ok(VectorReader::<_>::count(&reader).to_string())
+    })
 }
 
 fn dim_file(path: &Path) -> Result<String, String> {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-    match ext {
-        "fvec" => {
-            let reader = MmapVectorReader::<f32>::open_fvec(path)
-                .map_err(|e| format!("failed to open {}: {}", path.display(), e))?;
-            Ok((<MmapVectorReader<f32> as VectorReader<f32>>::dim(&reader)).to_string())
-        }
-        "mvec" => {
-            let reader = MmapVectorReader::<half::f16>::open_mvec(path)
-                .map_err(|e| format!("failed to open {}: {}", path.display(), e))?;
-            Ok((<MmapVectorReader<half::f16> as VectorReader<half::f16>>::dim(&reader)).to_string())
-        }
-        "ivec" => {
-            let reader = MmapVectorReader::<i32>::open_ivec(path)
-                .map_err(|e| format!("failed to open {}: {}", path.display(), e))?;
-            Ok((<MmapVectorReader<i32> as VectorReader<i32>>::dim(&reader)).to_string())
-        }
-        _ => Err(format!(
+    let etype = ElementType::from_path(path)
+        .map_err(|_| format!(
             "cannot get dimension for '{}': unsupported extension '.{}'",
             path.display(), ext
-        )),
-    }
+        ))?;
+    crate::dispatch_reader!(etype, path, reader => {
+        use vectordata::VectorReader;
+        Ok(VectorReader::<_>::dim(&reader).to_string())
+    })
 }
 
 #[cfg(test)]
@@ -296,6 +272,7 @@ mod tests {
             governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
             ui: veks_core::ui::UiHandle::new(std::sync::Arc::new(veks_core::ui::TestSink::new())),
             status_interval: std::time::Duration::from_secs(1),
+            estimated_total_steps: 0,
         };
 
         let mut op = GenerateVectorsOp;

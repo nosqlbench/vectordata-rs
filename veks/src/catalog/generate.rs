@@ -175,12 +175,13 @@ pub fn run(input: &Path, basename: &str, for_publish_url: bool, update: bool) {
 
     let effective_update = update;
 
-    // Scan input_path (not scan_root) for datasets — the user pointed at
-    // this directory. scan_root is only the upper bound for catalog placement.
-    eprintln!("Scanning {} for datasets...", rel(&input_path));
+    // Scan from the publish/catalog root so that all datasets in the tree
+    // are included — running from a single dataset directory should not
+    // elide sibling datasets from the catalog.
+    eprintln!("Scanning {} for datasets...", rel(&scan_root));
 
     let mut all_datasets: Vec<DiscoveredDataset> = Vec::new();
-    walk_for_datasets(&input_path, &mut all_datasets, &cwd);
+    walk_for_datasets(&scan_root, &mut all_datasets, &cwd);
     // Only include publishable datasets (those with .publish sentinel)
     let datasets: Vec<DiscoveredDataset> = all_datasets.into_iter()
         .filter(|ds| {
@@ -221,6 +222,19 @@ pub fn run(input: &Path, basename: &str, for_publish_url: bool, update: bool) {
                 Some(parent) => dir = parent.to_path_buf(),
                 None => break,
             }
+        }
+    }
+
+    // Respect .catalog_root: don't write catalogs above it.
+    // The scan_root (from .publish_url) may be higher, but .catalog_root
+    // limits how far up the catalog hierarchy extends.
+    if let Some(catalog_root) = find_catalog_root(&input_path) {
+        let before = catalog_dirs.len();
+        catalog_dirs.retain(|dir| dir.starts_with(&catalog_root));
+        let skipped = before - catalog_dirs.len();
+        if skipped > 0 {
+            eprintln!("  .catalog_root at {} — skipping {} parent directories",
+                rel(&catalog_root), skipped);
         }
     }
 
@@ -294,6 +308,7 @@ pub fn run(input: &Path, basename: &str, for_publish_url: bool, update: bool) {
             eprintln!("error: failed to write {}: {}", rel(&yaml_path), e);
             std::process::exit(1);
         }
+
 
         eprintln!(
             "Wrote {} entries to {} and {}",

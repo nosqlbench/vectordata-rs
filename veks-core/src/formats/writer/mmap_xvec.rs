@@ -62,6 +62,15 @@ impl MmapXvecWriter {
                 .map_err(|e| format!("failed to create directory: {}", e))?;
         }
 
+        // Safety: remove any symlink at the target path before writing.
+        // Symlinks are read-only aliases to source data — writing through
+        // them would destroy the original.
+        if path.is_symlink() {
+            std::fs::remove_file(path)
+                .map_err(|e| format!("failed to remove symlink {}: {}", path.display(), e))?;
+            eprintln!("  safety: removed symlink {} before write", path.display());
+        }
+
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)

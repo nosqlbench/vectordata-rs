@@ -27,7 +27,8 @@ use std::time::Instant;
 use vectordata::VectorReader;
 use vectordata::io::MmapVectorReader;
 
-use crate::pipeline::atomic_write::AtomicWriter;
+use crate::pipeline::atomic_write::{AtomicWriter, safe_create_file};
+use crate::pipeline::element_type::ElementType;
 use crate::pipeline::command::{
     ArtifactManifest, CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options,
     ResourceDesc, Status, StreamContext, render_options_table,
@@ -134,13 +135,12 @@ facets of the dataset.
         };
 
         // Validate extension — catch mismatched formats early
-        if let Some(ext) = fvec_path.extension().and_then(|e| e.to_str()) {
-            if ext != "fvec" {
-                return error_result(
-                    format!("fvec-extract expects a .fvec file, got .{} — use the appropriate *-extract command for this format", ext),
-                    start,
-                );
-            }
+        if ElementType::from_path(&fvec_path).ok() != Some(ElementType::F32) {
+            let ext = fvec_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            return error_result(
+                format!("fvec-extract expects a .fvec file, got .{} — use the appropriate *-extract command for this format", ext),
+                start,
+            );
         }
 
         let fvec_count = <MmapVectorReader<f32> as VectorReader<f32>>::count(&fvec_reader);
@@ -430,7 +430,7 @@ ordinal.
         }
 
         use std::io::Write;
-        let file = match std::fs::File::create(&output_path) {
+        let file = match safe_create_file(&output_path) {
             Ok(f) => f,
             Err(e) => {
                 return error_result(
@@ -739,13 +739,12 @@ so that `base_metadata.slab[i]` corresponds to `base_vectors.mvec[i]`.
         };
 
         // Validate extension
-        if let Some(ext) = mvec_path.extension().and_then(|e| e.to_str()) {
-            if ext != "mvec" {
-                return error_result(
-                    format!("mvec-extract expects a .mvec file, got .{} — use the appropriate *-extract command for this format", ext),
-                    start,
-                );
-            }
+        if ElementType::from_path(&mvec_path).ok() != Some(ElementType::F16) {
+            let ext = mvec_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            return error_result(
+                format!("mvec-extract expects a .mvec file, got .{} — use the appropriate *-extract command for this format", ext),
+                start,
+            );
         }
 
         // Open the mvec file
@@ -779,7 +778,7 @@ so that `base_metadata.slab[i]` corresponds to `base_vectors.mvec[i]`.
         }
 
         use std::io::Write;
-        let file = match std::fs::File::create(&output_path) {
+        let file = match safe_create_file(&output_path) {
             Ok(f) => f,
             Err(e) => {
                 return error_result(
@@ -1351,7 +1350,7 @@ fn sorted_index_extract_mvec(
     // Pre-allocate output file
     let total_bytes = (extract_count as u64) * (record_bytes as u64);
     {
-        let f = std::fs::File::create(output_path)
+        let f = safe_create_file(output_path)
             .map_err(|e| format!("failed to create output: {}", e))?;
         f.set_len(total_bytes)
             .map_err(|e| format!("failed to set output size: {}", e))?;
@@ -1623,6 +1622,14 @@ fn sorted_index_extract_fvec(
     ctx: &mut StreamContext,
     _start: Instant,
 ) -> Result<String, String> {
+    // Near-zero threshold from step options (SRD §19). Vectors with
+    // L2 norm below this threshold are skipped during extraction.
+    // The threshold is always active when normalizing — near-zero
+    // vectors produce meaningless unit vectors after normalization.
+    let zero_threshold: f64 = ctx.defaults.get("zero_threshold")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1e-6);
+    let zero_threshold_sq = zero_threshold * zero_threshold;
     use std::io::Write;
 
     let extract_count = effective_end - range_start;
@@ -1636,10 +1643,25 @@ fn sorted_index_extract_fvec(
         .ok();
     ctx.ui.log(&format!("fvec-extract: using {} threads", threads));
 
-    // Partition sizing
-    let default_mem = half_system_ram();
-    let mem_budget = ctx.governor.offer_demand("mem", 0, default_mem);
-    let records_per_partition = (mem_budget as usize / record_bytes).max(1);
+    // Partition sizing — the buffer must fit comfortably in physical RAM
+    // alongside the source mmap, OS page cache, and other allocations.
+    //
+    // Strategy: use at most 25% of system RAM for the partition buffer.
+    // The remaining 75% is for: source mmap page cache, output file
+    // page cache, OS, other process allocations, and headroom.
+    // Floor of 256 MiB ensures progress even on small systems.
+    let system_ram = half_system_ram() as usize * 2;
+    let source_size = fvec_count * record_bytes;
+    let output_size = extract_count * record_bytes;
+
+    // Reserve space for source + output page cache, then take 25% of remainder
+    let page_cache_reserve = source_size.min(system_ram / 4) + output_size.min(system_ram / 4);
+    let available = system_ram.saturating_sub(page_cache_reserve);
+    let safe_budget = (available / 4).max(256 * 1024 * 1024); // min 256 MiB
+
+    let mem_budget = ctx.governor.offer_demand("mem", 0, safe_budget as u64) as usize;
+
+    let records_per_partition = (mem_budget / record_bytes).max(1);
     let raw_partitions = (extract_count + records_per_partition - 1) / records_per_partition;
     let num_partitions = raw_partitions.max(2);
     let partition_size = (extract_count + num_partitions - 1) / num_partitions;
@@ -1654,7 +1676,7 @@ fn sorted_index_extract_fvec(
     // Pre-allocate output
     let total_bytes = (extract_count as u64) * (record_bytes as u64);
     {
-        let f = std::fs::File::create(output_path)
+        let f = safe_create_file(output_path)
             .map_err(|e| format!("failed to create output: {}", e))?;
         f.set_len(total_bytes)
             .map_err(|e| format!("failed to set output size: {}", e))?;
@@ -1674,6 +1696,10 @@ fn sorted_index_extract_fvec(
     let max_part_len = partition_size;
     let mut read_plan: Vec<(usize, usize)> = Vec::with_capacity(max_part_len);
     let mut part_buf: Vec<u8> = vec![0u8; max_part_len * record_bytes];
+
+    // Tracking: near-zero vectors skipped during extraction
+    let mut zero_ordinals: Vec<usize> = Vec::new();
+    let mut total_written: usize = 0;
 
     for pass in 0..num_partitions {
         let part_start = pass * partition_size;
@@ -1697,182 +1723,88 @@ fn sorted_index_extract_fvec(
         }
         scan_pb.finish();
 
-        // Step 2: Sort by source position — parallel bucket + sort.
-        let num_buckets = 256usize;
-        let bucket_range = (fvec_count / num_buckets).max(1);
-
-        let dist_pb = ctx.ui.bar_with_unit(read_plan.len() as u64, &format!("bucketing {} entries{}", read_plan.len(), pass_label(pass)), "vectors");
-        let thread_buckets: Vec<Vec<Vec<(usize, usize)>>>;
-        {
-            use rayon::prelude::*;
-            use std::sync::atomic::{AtomicU64, Ordering};
-            let progress = AtomicU64::new(0);
-            let bucket_fn = || {
-                read_plan.par_chunks(64 * 1024).map(|chunk| {
-                    let mut local: Vec<Vec<(usize, usize)>> = vec![Vec::new(); num_buckets];
-                    for &entry in chunk {
-                        let b = (entry.0 / bucket_range).min(num_buckets - 1);
-                        local[b].push(entry);
-                    }
-                    let done = progress.fetch_add(chunk.len() as u64, Ordering::Relaxed) + chunk.len() as u64;
-                    dist_pb.set_position(done);
-                    local
-                }).collect()
-            };
-            thread_buckets = if let Some(ref p) = pool {
-                p.install(bucket_fn)
-            } else {
-                bucket_fn()
-            };
+        // Step 2: Extract + normalize.
+        //
+        // Detect whether source indices are nearly sorted (dedup ordinals)
+        // or shuffled (random permutation). For sorted ordinals, iterate
+        // in natural order — both reads and writes are sequential. For
+        // shuffled data, sort by source position for sequential reads
+        // (random output writes go to a buffer that fits in memory).
+        let is_sorted = read_plan.windows(2)
+            .all(|w| w[0].0 <= w[1].0);
+        if !is_sorted {
+            read_plan.sort_unstable_by_key(|&(src, _)| src);
         }
-        dist_pb.finish();
 
-        let merge_pb = ctx.ui.spinner(&format!("merging {} thread buckets{}", thread_buckets.len(), pass_label(pass)));
-        let mut buckets: Vec<Vec<(usize, usize)>> = vec![Vec::new(); num_buckets];
-        for tb in &thread_buckets {
-            for (i, b) in tb.iter().enumerate() {
-                buckets[i].reserve(b.len());
-            }
-        }
-        for tb in thread_buckets {
-            for (i, b) in tb.into_iter().enumerate() {
-                buckets[i].extend(b);
-            }
-        }
-        merge_pb.finish();
+        let label = if normalize {
+            format!("extract+normalize{}{}", pass_label(pass),
+                if is_sorted { "" } else { " (shuffled)" })
+        } else {
+            format!("extract{}{}", pass_label(pass),
+                if is_sorted { "" } else { " (shuffled)" })
+        };
+        let extract_pb = ctx.ui.bar_with_unit(read_plan.len() as u64, &label, "vectors");
+        let dim_usize = dim as usize;
 
-        let sort_pb = ctx.ui.bar_with_unit(read_plan.len() as u64, &format!("sorting {} entries by source position{}", read_plan.len(), pass_label(pass)), "vectors");
-        {
-            use rayon::prelude::*;
-            use std::sync::atomic::{AtomicU64, Ordering};
-            let progress = AtomicU64::new(0);
-            let mut sort_fn = || {
-                buckets.par_iter_mut().for_each(|bucket| {
-                    bucket.sort_unstable_by_key(|&(src, _)| src);
-                    let done = progress.fetch_add(bucket.len() as u64, Ordering::Relaxed) + bucket.len() as u64;
-                    sort_pb.set_position(done);
-                });
-            };
-            if let Some(ref p) = pool {
-                p.install(sort_fn);
-            } else {
-                sort_fn();
-            }
-        }
-        sort_pb.finish();
+        let mut write_cursor: usize = 0; // running output position in part_buf
+        for (i, &(source_idx, _local_pos)) in read_plan.iter().enumerate() {
+            let src_slice = fvec_reader.get_slice(source_idx);
 
-        let flatten_pb = ctx.ui.spinner(&format!("flattening read plan{}", pass_label(pass)));
-        let total_entries = buckets.iter().map(|b| b.len()).sum::<usize>();
-        read_plan.clear();
-        read_plan.resize(total_entries, (0, 0));
-        let mut offsets: Vec<usize> = Vec::with_capacity(num_buckets);
-        let mut off = 0usize;
-        for bucket in &buckets {
-            offsets.push(off);
-            off += bucket.len();
-        }
-        {
-            use rayon::prelude::*;
-            let flatten_fn = || {
-                buckets.into_par_iter().enumerate().for_each(|(i, bucket)| {
-                    let start = offsets[i];
-                    let dest = unsafe {
-                        std::slice::from_raw_parts_mut(
-                            (read_plan.as_ptr() as *mut (usize, usize)).add(start),
-                            bucket.len(),
-                        )
-                    };
-                    dest.copy_from_slice(&bucket);
-                });
-            };
-            if let Some(ref p) = pool {
-                p.install(flatten_fn);
-            } else {
-                flatten_fn();
-            }
-        }
-        flatten_pb.finish();
-
-        // Step 3: Read source data in parallel with transpose placement
-        let read_pb = ctx.ui.bar_with_unit(read_plan.len() as u64, &format!("reading+transposing fvec{}", pass_label(pass)), "vectors");
-        let part_buf_len = part_len * record_bytes;
-        part_buf[..part_buf_len].fill(0);
-        fvec_reader.advise_sequential();
-
-        {
-            use rayon::prelude::*;
-            use std::sync::atomic::{AtomicU64, Ordering};
-
-            let progress = AtomicU64::new(0);
-            let shared_buf = SharedBuf::new(&mut part_buf);
-
-            let read_fn = || {
-                read_plan.par_iter().try_for_each(|&(source_idx, local_pos)| {
-                    let vector = fvec_reader.get(source_idx)
-                        .map_err(|e| format!("failed to read fvec[{}]: {}", source_idx, e))?;
-
-                    let buf_offset = local_pos * record_bytes;
-                    let dest = unsafe { shared_buf.slice_mut(buf_offset, record_bytes) };
-                    dest[..4].copy_from_slice(&dim_bytes);
-                    let slice: &[f32] = vector.as_ref();
-                    let src_bytes: &[u8] = unsafe {
-                        std::slice::from_raw_parts(slice.as_ptr() as *const u8, slice.len() * 4)
-                    };
-                    dest[4..].copy_from_slice(src_bytes);
-
-                    let done = progress.fetch_add(1, Ordering::Relaxed) + 1;
-                    if done % 100_000 == 0 {
-                        read_pb.set_position(done);
-                    }
-                    Ok(())
-                })
-            };
-            let result: Result<(), String> = if let Some(ref p) = pool {
-                p.install(read_fn)
-            } else {
-                read_fn()
-            };
-            result?;
-        }
-        read_pb.finish();
-
-        // Optional L2 normalization of vectors in the output buffer
-        if normalize {
-            let buf_used = part_len * record_bytes;
-            let dim_usize = dim as usize;
-            let stride = 4 + dim_usize * 4; // dim header + dim f32s
-            for offset in (0..buf_used).step_by(stride) {
-                let values_start = offset + 4;
+            if normalize {
+                // L2 norm computed in f64 precision (SRD §18, §19).
                 let mut norm_sq = 0.0f64;
                 for d in 0..dim_usize {
-                    let pos = values_start + d * 4;
-                    let v = f32::from_le_bytes([
-                        part_buf[pos], part_buf[pos + 1],
-                        part_buf[pos + 2], part_buf[pos + 3],
-                    ]);
-                    norm_sq += (v as f64) * (v as f64);
+                    let v = src_slice[d] as f64;
+                    norm_sq += v * v;
                 }
-                if norm_sq > 0.0 {
-                    let inv_norm = (1.0 / norm_sq.sqrt()) as f32;
-                    for d in 0..dim_usize {
-                        let pos = values_start + d * 4;
-                        let v = f32::from_le_bytes([
-                            part_buf[pos], part_buf[pos + 1],
-                            part_buf[pos + 2], part_buf[pos + 3],
-                        ]);
-                        let normalized = v * inv_norm;
-                        part_buf[pos..pos + 4].copy_from_slice(&normalized.to_le_bytes());
+
+                // Near-zero filter (SRD §19): skip vectors below threshold
+                if norm_sq < zero_threshold_sq {
+                    zero_ordinals.push(source_idx);
+                    if (i + 1) % 100_000 == 0 {
+                        extract_pb.set_position((i + 1) as u64);
                     }
+                    continue;
                 }
+
+                let buf_offset = write_cursor * record_bytes;
+                let dest = &mut part_buf[buf_offset..buf_offset + record_bytes];
+                dest[..4].copy_from_slice(&dim_bytes);
+                let inv_norm = (1.0f64 / norm_sq.sqrt()) as f32;
+                for d in 0..dim_usize {
+                    let normalized = src_slice[d] * inv_norm;
+                    dest[4 + d * 4..4 + (d + 1) * 4]
+                        .copy_from_slice(&normalized.to_le_bytes());
+                }
+            } else {
+                let buf_offset = write_cursor * record_bytes;
+                let dest = &mut part_buf[buf_offset..buf_offset + record_bytes];
+                dest[..4].copy_from_slice(&dim_bytes);
+                let src_bytes: &[u8] = unsafe {
+                    std::slice::from_raw_parts(
+                        src_slice.as_ptr() as *const u8,
+                        src_slice.len() * 4,
+                    )
+                };
+                dest[4..].copy_from_slice(src_bytes);
+            }
+            write_cursor += 1;
+
+            if (i + 1) % 100_000 == 0 {
+                extract_pb.set_position((i + 1) as u64);
             }
         }
+        let part_written = write_cursor;
+        total_written += part_written;
+        extract_pb.finish();
 
         // Step 4: Write partition in chunks with progress, including sync
-        let total_write_bytes = part_len * record_bytes;
+        let total_write_bytes = part_written * record_bytes;
         let write_mb = total_write_bytes as f64 / (1024.0 * 1024.0);
         let sync_reserve = total_write_bytes as u64 / 20;
         let write_pb = ctx.ui.bar_with_unit(total_write_bytes as u64 + sync_reserve, &format!("writing+syncing {:.0} MB{}", write_mb, pass_label(pass)), "bytes");
-        let file_offset = (part_start as u64) * (record_bytes as u64);
+        // Compacted output — file position tracks total_written minus this partition
+        let file_offset = ((total_written - part_written) as u64) * (record_bytes as u64);
         use std::io::Seek;
         out_file.seek(std::io::SeekFrom::Start(file_offset))
             .map_err(|e| format!("seek failed: {}", e))?;
@@ -1898,11 +1830,62 @@ fn sorted_index_extract_fvec(
         ctx.governor.checkpoint();
     }
 
+    // Truncate output file to actual written size (may be smaller if zeros were skipped)
+    let final_bytes = (total_written as u64) * (record_bytes as u64);
+    out_file.set_len(final_bytes)
+        .map_err(|e| format!("truncate failed: {}", e))?;
     out_file.sync_all().map_err(|e| format!("sync failed: {}", e))?;
 
+    let zero_count = zero_ordinals.len();
+
+    // Write zero ordinals ivec for post-hoc verification
+    if !zero_ordinals.is_empty() {
+        let zeros_path = output_path.with_file_name("zero_ordinals.ivec");
+        // Try to place in .cache/ if output is in profiles/
+        let zeros_path = if let Some(cache) = output_path.parent()
+            .and_then(|p| p.parent())
+            .map(|ws| ws.join(".cache/zero_ordinals.ivec"))
+        {
+            cache
+        } else {
+            zeros_path
+        };
+        if let Some(parent) = zeros_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let mut f = safe_create_file(&zeros_path)
+            .map_err(|e| format!("failed to create {}: {}", zeros_path.display(), e))?;
+        for &ord in &zero_ordinals {
+            f.write_all(&1i32.to_le_bytes())
+                .map_err(|e| format!("write error: {}", e))?;
+            f.write_all(&(ord as i32).to_le_bytes())
+                .map_err(|e| format!("write error: {}", e))?;
+        }
+        ctx.ui.log(&format!("  wrote {} near-zero ordinals to {}", zero_count, zeros_path.display()));
+    }
+
+    // Save provenance metrics as variables
+    let _ = crate::pipeline::variables::set_and_save(
+        &ctx.workspace, "extract_input_count", &extract_count.to_string());
+    ctx.defaults.insert("extract_input_count".into(), extract_count.to_string());
+    let _ = crate::pipeline::variables::set_and_save(
+        &ctx.workspace, "extract_output_count", &total_written.to_string());
+    ctx.defaults.insert("extract_output_count".into(), total_written.to_string());
+    let _ = crate::pipeline::variables::set_and_save(
+        &ctx.workspace, "zero_count", &zero_count.to_string());
+    ctx.defaults.insert("zero_count".into(), zero_count.to_string());
+
+    if zero_count > 0 {
+        ctx.ui.log(&format!(
+            "  filtered {} near-zero vectors (L2 < {:.0e}): {} input → {} output",
+            zero_count, zero_threshold, extract_count, total_written,
+        ));
+    }
+
     Ok(format!(
-        "extracted {} fvec vectors (range [{}..{}), {} passes, {} threads) to {}",
-        extract_count, range_start, effective_end, num_partitions, threads, output_path.display()
+        "extracted {} fvec vectors ({} input, {} near-zero filtered, range [{}..{}), {} passes, {} threads) to {}",
+        total_written, extract_count, zero_count,
+        range_start, effective_end, num_partitions, threads, output_path.display()
     ))
 }
 
@@ -2361,26 +2344,22 @@ impl CommandOp for TransformExtractOp {
         // Build options for the delegate command, mapping generic names
         // to format-specific names.
         let mut delegate_opts = Options::new();
-        match ext {
-            "fvec" => {
-                delegate_opts.set("fvec-file", source_str);
+        let etype = if ext == "slab" {
+            delegate_opts.set("slab-file", source_str);
+            None
+        } else {
+            match ElementType::from_path(&source_path) {
+                Ok(ElementType::F32) => { delegate_opts.set("fvec-file", source_str); Some(ElementType::F32) }
+                Ok(ElementType::F16) => { delegate_opts.set("mvec-file", source_str); Some(ElementType::F16) }
+                Ok(ElementType::I32) => { delegate_opts.set("ivec-file", source_str); Some(ElementType::I32) }
+                Ok(_) | Err(_) => {
+                    return error_result(
+                        format!("unsupported format '.{}' for extract — expected fvec, mvec, ivec, or slab", ext),
+                        start,
+                    );
+                }
             }
-            "mvec" => {
-                delegate_opts.set("mvec-file", source_str);
-            }
-            "ivec" => {
-                delegate_opts.set("ivec-file", source_str);
-            }
-            "slab" => {
-                delegate_opts.set("slab-file", source_str);
-            }
-            _ => {
-                return error_result(
-                    format!("unsupported format '.{}' for extract — expected fvec, mvec, ivec, dvec, svec, bvec, or slab", ext),
-                    start,
-                );
-            }
-        }
+        };
 
         // Pass through common options
         if let Some(v) = options.get("ivec-file") { delegate_opts.set("ivec-file", v); }
@@ -2391,11 +2370,11 @@ impl CommandOp for TransformExtractOp {
         if let Some(v) = options.get("page-size") { delegate_opts.set("page-size", v); }
 
         // Delegate to format-specific command
-        let mut cmd: Box<dyn CommandOp> = match ext {
-            "fvec" => Box::new(GenerateFvecExtractOp),
-            "mvec" => Box::new(GenerateMvecExtractOp),
-            "ivec" => Box::new(GenerateIvecExtractOp),
-            "slab" => Box::new(GenerateSlabExtractOp),
+        let mut cmd: Box<dyn CommandOp> = match etype {
+            Some(ElementType::F32) => Box::new(GenerateFvecExtractOp),
+            Some(ElementType::F16) => Box::new(GenerateMvecExtractOp),
+            Some(ElementType::I32) => Box::new(GenerateIvecExtractOp),
+            None => Box::new(GenerateSlabExtractOp),
             _ => unreachable!(),
         };
 
@@ -2590,6 +2569,7 @@ mod tests {
             governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
             ui: veks_core::ui::UiHandle::new(std::sync::Arc::new(veks_core::ui::TestSink::new())),
             status_interval: std::time::Duration::from_secs(1),
+            estimated_total_steps: 0,
         };
 
         // Generate 50 f16 vectors of dimension 8
@@ -2660,6 +2640,7 @@ mod tests {
             governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
             ui: veks_core::ui::UiHandle::new(std::sync::Arc::new(veks_core::ui::TestSink::new())),
             status_interval: std::time::Duration::from_secs(1),
+            estimated_total_steps: 0,
         };
 
         // Generate 20 f16 vectors of dimension 8
@@ -2743,6 +2724,7 @@ mod tests {
             governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
             ui: veks_core::ui::UiHandle::new(std::sync::Arc::new(veks_core::ui::TestSink::new())),
             status_interval: std::time::Duration::from_secs(1),
+            estimated_total_steps: 0,
         };
 
         // Generate 20 vectors of dimension 4

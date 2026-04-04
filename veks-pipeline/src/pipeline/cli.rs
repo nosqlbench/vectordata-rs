@@ -899,6 +899,7 @@ mod tests {
             after: vec!["download".to_string()],
             profiles: vec![],
             per_profile: false,
+            phase: 0,
             on_partial: Default::default(),
             options: step_options,
         };
@@ -938,6 +939,7 @@ mod tests {
             after: vec![],
             profiles: vec![],
             per_profile: false,
+            phase: 0,
             on_partial: Default::default(),
             options: step_options,
         };

@@ -13,6 +13,8 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use veks_core::formats::VecFormat;
+
 use crate::pipeline::command::{
     CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options, Status, StreamContext,
     render_options_table,
@@ -27,7 +29,7 @@ pub fn factory() -> Box<dyn CommandOp> {
 
 /// Detected file format info.
 struct FileInfo {
-    format: String,
+    vec_format: VecFormat,
     data_type: String,
     bytes_per_element: usize,
     dimensions: usize,
@@ -37,22 +39,33 @@ struct FileInfo {
     trailing_bytes: u64,
 }
 
+/// Human-readable data type label for display (more specific than
+/// [`VecFormat::data_type_name`]).
+fn detailed_type_name(fmt: VecFormat) -> &'static str {
+    match fmt {
+        VecFormat::Fvec => "float32",
+        VecFormat::Ivec => "int32",
+        VecFormat::Bvec => "uint8",
+        VecFormat::Dvec => "float64",
+        VecFormat::Mvec => "float16",
+        VecFormat::Svec => "int16",
+        _ => "unknown",
+    }
+}
+
 /// Detect format from extension and read header.
 fn probe_file(path: &Path) -> Result<FileInfo, String> {
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_lowercase();
+        .unwrap_or("");
 
-    let (data_type, bytes_per_element) = match ext.as_str() {
-        "fvec" => ("float32", 4),
-        "ivec" => ("int32", 4),
-        "bvec" => ("uint8", 1),
-        "dvec" => ("float64", 8),
-        "mvec" => ("float16", 2),
-        _ => return Err(format!("unknown vector format: '.{}'", ext)),
-    };
+    let fmt = VecFormat::from_extension(ext)
+        .filter(|f| f.is_xvec())
+        .ok_or_else(|| format!("unknown vector format: '.{}'", ext))?;
+
+    let data_type = detailed_type_name(fmt);
+    let bytes_per_element = fmt.element_size();
 
     let file_size = std::fs::metadata(path)
         .map_err(|e| format!("failed to stat {}: {}", path.display(), e))?
@@ -82,7 +95,7 @@ fn probe_file(path: &Path) -> Result<FileInfo, String> {
     let trailing_bytes = file_size - (vector_count * bytes_per_vector) as u64;
 
     Ok(FileInfo {
-        format: ext,
+        vec_format: fmt,
         data_type: data_type.to_string(),
         bytes_per_element,
         dimensions,
@@ -123,8 +136,8 @@ fn read_samples(
 
         for d in 0..dims_to_show {
             let pos = offset + d * info.bytes_per_element;
-            let val = match info.format.as_str() {
-                "fvec" => {
+            let val = match info.vec_format {
+                VecFormat::Fvec => {
                     let v = f32::from_le_bytes([
                         data[pos],
                         data[pos + 1],
@@ -133,7 +146,7 @@ fn read_samples(
                     ]);
                     format!("{:.4}", v)
                 }
-                "ivec" => {
+                VecFormat::Ivec => {
                     let v = i32::from_le_bytes([
                         data[pos],
                         data[pos + 1],
@@ -142,8 +155,8 @@ fn read_samples(
                     ]);
                     format!("{}", v)
                 }
-                "bvec" => format!("{}", data[pos]),
-                "dvec" => {
+                VecFormat::Bvec => format!("{}", data[pos]),
+                VecFormat::Dvec => {
                     let v = f64::from_le_bytes([
                         data[pos],
                         data[pos + 1],
@@ -156,7 +169,7 @@ fn read_samples(
                     ]);
                     format!("{:.6}", v)
                 }
-                "mvec" => {
+                VecFormat::Mvec | VecFormat::Svec => {
                     let bits = u16::from_le_bytes([data[pos], data[pos + 1]]);
                     format!("0x{:04x}", bits)
                 }
@@ -253,7 +266,7 @@ subtle errors in later pipeline steps.
 
         ctx.ui.log(&format!("File: {}", source_path.display()));
         ctx.ui.log(&format!("  Size:       {} ({} bytes)", human_bytes(info.file_size), info.file_size));
-        ctx.ui.log(&format!("  Format:     .{} ({})", info.format, info.data_type));
+        ctx.ui.log(&format!("  Format:     .{} ({})", info.vec_format, info.data_type));
         ctx.ui.log(&format!(
             "  Element:    {} bytes per value",
             info.bytes_per_element
@@ -289,7 +302,7 @@ subtle errors in later pipeline steps.
                 "{}: {} .{} vectors (dim={})",
                 source_path.display(),
                 info.vector_count,
-                info.format,
+                info.vec_format,
                 info.dimensions
             ),
             produced: vec![],
@@ -361,6 +374,7 @@ mod tests {
             governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
             ui: veks_core::ui::UiHandle::new(std::sync::Arc::new(veks_core::ui::TestSink::new())),
             status_interval: std::time::Duration::from_secs(1),
+            estimated_total_steps: 0,
         }
     }
 

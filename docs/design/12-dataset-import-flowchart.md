@@ -43,20 +43,30 @@ are provided, the pipeline must maintain pairwise ordinal correspondence
 throughout all reordering and elision operations. Specifically:
 - The same shuffle permutation (`shuffle.ivec`) is applied to both
   vector extraction and metadata extraction.
-- The same clean ordinals index (`clean_ordinals.ivec`) determines which
-  records survive dedup/zero elision for both vectors and metadata.
-- The same range windows are used for both base vector extraction and
-  metadata content extraction. When dedup/zero-check is active, the
-  upper bound is `clean_count` (post-elision), not `vector_count`
-  (pre-elision): `[query_count, clean_count)`. When dedup is inactive,
-  `vector_count` is used. The shuffle permutation covers exactly
-  `clean_count` (or `vector_count` if no dedup) entries, so the
-  extraction range must not exceed the shuffle length.
+- The exclusion set (duplicates ∪ near-zeros) produced by the unified
+  sort step determines which records are elided from both vectors and
+  metadata. The shuffle permutation covers exactly the clean ordinals
+  (sorted ordinals minus exclusions), so extraction ranges cannot
+  exceed the shuffle length.
 This ensures that after all pipeline transformations, record N in the
 output base vectors file corresponds to record N in the output metadata
 content file. Violating this invariant would silently corrupt filtered
 KNN results, since predicate evaluation indexes metadata by the same
 ordinal used to address base vectors.
+
+**Unified cleaning.** Deduplication, L2 normalization, and near-zero
+detection are combined into a single sort pass (SRD §20). While each
+memory-sized segment is loaded for sorting, the pipeline normalizes
+vectors in-place (f64 precision) and detects near-zeros (L2 < 1×10⁻⁶)
+at negligible additional cost. This eliminates separate `find-zeros`,
+`filter-ordinals`, and `count-clean` steps from the DAG.
+
+**Query strategy selection.** Three strategies handle query vector
+provenance (SRD §20.8):
+1. Non-HDF5 B+Q → combine into single source, then sort/dedup/shuffle
+2. HDF5 B+Q → independent processing (base gets full sort; queries
+   get normalize + zero-filter only)
+3. Non-HDF5 B only → self-search via shuffle split
 
 ---
 
@@ -91,42 +101,46 @@ Each slot has an identity predicate — the condition under which it
 collapses to a pass-through. The following table defines every slot in
 the superset graph and its resolution rule.
 
-### Vector slots
+### Source slots
 
 | Slot | Type | Identity when | Materialized as |
 |------|------|---------------|-----------------|
 | `fetch_vectors` | Vectors | No URL provided | `fetch bulkdl` or `fetch dlhf` |
 | `import_vectors` | Vectors | Source is native xvec single file (symlinked) | `import` (npy/parquet/dir → xvec) |
 | `all_vectors` | Vectors | *(terminal — always resolves to import or source)* | alias chain: fetch → import → source |
+| `combine_bq` | Vectors | HDF5 source, or B-only (no separate Q) | Concatenate base + query files into a single source for unified dedup. Non-HDF5 B+Q only. See SRD §20.8 Strategy 1 |
 | `convert_base_precision` | Vectors | No precision conversion requested | `convert` (e.g., fvec→mvec or mvec→fvec) |
-| `sort` | Ordinals | `--no-dedup` or B facet not required | `compute sort` — lexicographic external merge-sort producing sorted ordinal index + duplicate report as a byproduct. Duplicate detection retains **one representative** of each duplicate set in the sorted index; only the extra copies are recorded in the duplicates file. The sort enables binary search for zero vectors and produces the canonical ordinal ordering for all downstream steps. |
-| `zero_check` | Ordinals | `--no-zero-check` or B facet not required | `analyze zeros` — binary search the lexicographically sorted ordinal index (`--index`) for the zero vector `[0,0,...,0]` |
-| `clean_ordinals` | Ordinals | No sort and no zero-check, or B facet not required | `transform ordinals` — combine duplicate + zero exclusion ordinals, filter the sorted index to produce the clean ordinal set used by shuffle and extraction |
+
+### Cleaning slots
+
+| Slot | Type | Identity when | Materialized as |
+|------|------|---------------|-----------------|
+| `sort_normalize` | Ordinals + Data | `--no-dedup` and `--no-normalize` | `compute sort` — external merge sort with in-segment L2 normalization (f64) and near-zero detection (L2 < 1×10⁻⁶). Produces sorted ordinals, duplicate index, zero index, and sorted+normalized run files. See SRD §20.3 |
 
 ### Count and statistics slots
 
 | Slot | Type | Identity when | Materialized as |
 |------|------|---------------|-----------------|
-| `vector_count` | Variable | Base (B) facet not required | `set variable` — record count of all_vectors |
-| `duplicate_count` | Variable | `--no-dedup` | `set variable` — record count of dedup_duplicates.ivec (number of elided duplicates) |
-| `zero_count` | Variable | `--no-zero-check` | `set variable` — record count of zero_ordinals.ivec (number of zero vectors removed) |
-| `clean_count` | Variable | Always needed when dedup or zero-check active | `set variable` on clean_ordinals |
-| `base_count` | Variable | No self-search (base = all_vectors) | `set variable` on base_vectors |
+| `vector_count` | Variable | Base (B) facet not required | `set variable` — record count of all_vectors (or combined B+Q) |
+| `duplicate_count` | Variable | `--no-dedup` | `set variable` — record count of dedup_duplicates.ivec |
+| `zero_count` | Variable | Sort not materialized | `set variable` — record count of zero_ordinals.ivec |
+| `base_count` | Variable | B facet not required | `set variable` on base_vectors |
 
 All count/statistics variables are persisted to `variables.yaml` and
 available to downstream steps via `${name}` interpolation. After a
 pipeline run, `variables.yaml` contains a complete record of dataset
 statistics including `vector_count`, `duplicate_count`, `zero_count`,
-`clean_count`, and (if self-search) `base_count`.
+and `base_count`.
+
+Provenance is verifiable: `vector_count − duplicate_count − zero_count = base_count`
 
 ### Query slots
 
 | Slot | Type | Identity when | Materialized as |
 |------|------|---------------|-----------------|
-| `shuffle` | Ordinals | Q facet not required, or separate query file provided | `generate shuffle` over clean_count |
-| `query_vectors` | Vectors | Provided as native xvec (symlinked) | `transform convert` or `transform extract` (self-search via shuffle+clean_ordinals; `--normalize` option applies L2 normalization in-flight during extraction) |
-| `convert_query_precision` | Vectors | No precision conversion requested | `transform convert` (e.g., fvec→mvec or dvec→fvec) |
-| `base_vectors` | Vectors | Not self-search (all_vectors used directly) | `transform extract` (self-search range via shuffle+clean_ordinals; `--normalize` option applies L2 normalization in-flight during extraction) |
+| `shuffle` | Ordinals | Q facet not required AND no combined B+Q | `generate shuffle` — PRNG permutation over clean ordinals (= sorted ordinals − duplicates − zeros) |
+| `query_vectors` | Vectors | *(never identity — always extracted or converted)* | **Strategy 1/3** (non-HDF5): `transform extract` from shuffle (first `query_count` ordinals). **Strategy 2** (HDF5): `transform convert` + normalize + zero-filter from HDF5 query dataset |
+| `base_vectors` | Vectors | *(never identity — always extracted)* | `transform extract` from sorted+normalized data, eliding excluded ordinals. Strategy 1/3: shuffle remainder. Strategy 2: full clean set |
 
 ### Metadata slots (all `Absent` when `--metadata` not provided)
 

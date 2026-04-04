@@ -7,7 +7,7 @@ use std::fs;
 use std::io::{self, Cursor};
 use std::path::Path;
 
-use super::{FOOTER_SIZE, HASH_SIZE, MerkleShape, read_hashes, sha256, write_hashes};
+use super::{FOOTER_SIZE, FOOTER_SIZE_V2, HASH_SIZE, MerkleShape, read_hashes, sha256, write_hashes};
 
 /// Read-only reference merkle tree. Loaded from `.mref` files produced by
 /// either the Java or Rust tooling.
@@ -133,14 +133,14 @@ impl MerkleRef {
 
     /// Save to a file path.
     pub fn save(&self, path: &Path) -> io::Result<()> {
-        let mut buf = Vec::with_capacity(self.hashes.len() * HASH_SIZE + FOOTER_SIZE);
+        let mut buf = Vec::with_capacity(self.hashes.len() * HASH_SIZE + FOOTER_SIZE_V2);
         self.write(&mut buf)?;
         fs::write(path, &buf)
     }
 
     /// Serialize to bytes in the standard `.mref` format.
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(self.hashes.len() * HASH_SIZE + FOOTER_SIZE);
+        let mut buf = Vec::with_capacity(self.hashes.len() * HASH_SIZE + FOOTER_SIZE_V2);
         self.write(&mut buf).expect("write to Vec cannot fail");
         buf
     }

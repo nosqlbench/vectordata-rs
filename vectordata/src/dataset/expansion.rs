@@ -103,9 +103,21 @@ pub fn expand_per_profile_steps(
     // before any phase-1 steps (verify), enabling correct phase ordering.
     let max_phase = templates.iter().map(|t| t.phase).max().unwrap_or(0);
 
+    // Classic layout: the default profile's outputs go in the dataset root
+    // instead of profiles/default/. Detected from the profile's profile_dir
+    // override or by checking if base_vectors path has no profiles/ prefix.
+    let classic = profiles.profiles.get("default")
+        .and_then(|p| p.views.get("base_vectors"))
+        .map(|bv| !bv.source.path.contains("profiles/"))
+        .unwrap_or(false);
+
     for phase in 0..=max_phase {
     for (profile_name, base_count_opt) in &all_profiles {
-        let profile_dir = format!("profiles/{}/", profile_name);
+        let profile_dir = if classic && *profile_name == "default" {
+            String::new()
+        } else {
+            format!("profiles/{}/", profile_name)
+        };
         let suffix = if *profile_name == "default" {
             String::new()
         } else {

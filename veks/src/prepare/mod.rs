@@ -10,6 +10,8 @@
 
 pub(crate) mod cache_compress;
 pub(crate) mod cache_gc;
+pub(crate) mod cleanup;
+pub(crate) mod infer_manifest;
 pub mod import;
 pub mod stratify;
 pub(crate) mod wizard;
@@ -103,19 +105,33 @@ pub enum PrepareCommand {
         #[arg(long)]
         no_filtered: bool,
 
-        /// L2-normalize vectors during extraction
-        #[arg(long)]
+        /// L2-normalize vectors during extraction (enabled by default)
+        #[arg(long, default_value = "true", action = clap::ArgAction::Set)]
         normalize: bool,
 
+        /// Disable L2-normalization during extraction
+        #[arg(long, conflicts_with = "normalize")]
+        no_normalize: bool,
+
         /// Overwrite existing dataset.yaml
-        #[arg(long)]
+        #[arg(long, alias = "overwrite")]
         force: bool,
 
-        /// Start fresh — ignore existing dataset.yaml, variables.yaml,
-        /// and .cache state. Equivalent to --force but also removes
-        /// variables.yaml and the progress log.
+        /// Start fresh — remove generated artifacts, dataset.yaml,
+        /// variables.yaml, and .cache state, then re-bootstrap from
+        /// initial conditions.
         #[arg(long, short = 'r')]
-        restart: bool,
+        reset: bool,
+
+        /// Remove all generated artifacts (cache, profiles, pipeline outputs)
+        /// and exit without running. Same cleanup as `veks run --clean`.
+        #[arg(long)]
+        clean: bool,
+
+        /// Recursively find and process all dataset.yaml files under the
+        /// current directory. Applies --clean or --reset to each dataset found.
+        #[arg(long, short = 'R')]
+        recursive: bool,
 
         /// Fraction of base vectors to use. Use "%" suffix for percentages
         /// (e.g., "1%", "50%", "100%") or decimal fractions < 1 (e.g., "0.01", "0.5").
@@ -147,10 +163,21 @@ pub enum PrepareCommand {
         #[arg(long)]
         pedantic_dedup: bool,
 
-        /// Fully automatic mode — implies --interactive --restart --yes (-iry).
+        /// Fully automatic mode — implies --interactive --reset --yes (-iry).
         /// Detects files by name, accepts all defaults, and starts fresh.
         #[arg(long)]
         auto: bool,
+
+        /// Classic layout: store all artifacts directly in the dataset
+        /// directory instead of under profiles/base/ and profiles/default/.
+        #[arg(long)]
+        classic: bool,
+
+        /// Explicit source files to consider (repeatable). When provided,
+        /// directory scanning is skipped and only these files are used
+        /// for role detection.
+        #[arg(long = "source", value_hint = clap::ValueHint::FilePath)]
+        sources: Vec<PathBuf>,
     },
     /// Add sized profiles to an existing dataset for multi-scale benchmarking
     Stratify {
@@ -217,6 +244,52 @@ pub enum PrepareCommand {
     GenerateScript(crate::pipeline::ScriptArgs),
     /// Publish dataset to S3
     Publish(crate::publish::PublishArgs),
+    /// Scan a directory hierarchy and generate a inferred-manifest.yaml
+    ///
+    /// Groups files by shared stem prefix after stripping role keywords
+    /// (base, query, train, test, etc.). The output manifest is compatible
+    /// with `veks prepare cleanup` and includes a layout section mapping
+    /// original filenames to detected roles for later relinking.
+    InferManifest {
+        /// Root directory to scan for vector data files
+        #[arg(default_value = ".")]
+        root: PathBuf,
+
+        /// Output path for the manifest file
+        #[arg(long, short = 'o', default_value = "inferred-manifest.yaml")]
+        output: PathBuf,
+    },
+    /// Build a parallel dataset tree from loose files
+    ///
+    /// Reads a YAML manifest mapping dataset names to lists of existing
+    /// file paths, detects base/query vector roles from filenames,
+    /// creates a subdirectory for each dataset under the output directory,
+    /// and populates it with symlinks pointing back to the original files.
+    /// The donor tree is never modified.
+    Cleanup {
+        /// Path to the YAML manifest file
+        manifest: PathBuf,
+
+        /// Output directory for the parallel dataset tree
+        output: PathBuf,
+
+        /// Path to a dataset metadata YAML file (e.g. dataset_metadata.yaml)
+        /// mapping dataset names to properties like similarity_function
+        #[arg(long)]
+        metadata: Option<PathBuf>,
+
+        /// Distance metric (default: auto-detect from data)
+        #[arg(long, default_value = "auto")]
+        metric: String,
+
+        /// Number of neighbors for KNN ground truth
+        #[arg(long, default_value = "100")]
+        neighbors: u32,
+
+        /// Print what would be done without making changes
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Decompress cache files back to their original form
     CacheUncompress {
         /// Cache directory to uncompress (default: .cache/ in current directory)
@@ -260,6 +333,21 @@ pub enum CatalogSubcommand {
 /// - "0.5" → 0.50  (decimal fraction, must be < 1.0)
 /// - "0.01" → 0.01
 ///
+/// Save wizard options to `_bootstrap.json` so they can be replayed.
+fn save_bootstrap_json(args: &import::ImportArgs) {
+    match serde_json::to_string_pretty(args) {
+        Ok(json) => {
+            let path = args.output.join("_bootstrap.json");
+            if let Err(e) = std::fs::write(&path, &json) {
+                eprintln!("Warning: could not save _bootstrap.json: {}", e);
+            } else {
+                eprintln!("Saved options to {}", path.display());
+            }
+        }
+        Err(e) => eprintln!("Warning: could not serialize options: {}", e),
+    }
+}
+
 /// Bare whole numbers like "1" or "50" are rejected to avoid ambiguity.
 /// Use "1%" or "0.01" instead.
 fn parse_fraction(s: &str) -> f64 {
@@ -318,12 +406,195 @@ pub fn run(args: PrepareArgs) {
             interactive, yes, name, output, base_vectors, query_vectors,
             self_search, query_count, metadata, ground_truth,
             ground_truth_distances, metric, neighbors, seed, description,
-            no_dedup, no_zero_check, no_filtered, normalize, force, restart,
-            base_fraction, required_facets, provided_facets, round_digits, pedantic_dedup, auto,
+            no_dedup, no_zero_check, no_filtered, normalize, no_normalize, force, reset, clean, recursive,
+            base_fraction, required_facets, provided_facets, round_digits, pedantic_dedup, auto, classic, sources,
         } => {
+            // Handle --clean: reset all generated artifacts.
+            // If other flags indicate re-bootstrapping (--overwrite, -i, --reset,
+            // etc.), clean first then continue. Otherwise exit after cleaning.
+            if clean {
+                let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                if recursive {
+                    clean_recursive(&root);
+                } else {
+                    clean_single_dataset(&root);
+                }
+                // Only exit if no re-bootstrapping flags are given
+                let will_bootstrap = force || reset || interactive || auto;
+                if !will_bootstrap {
+                    return;
+                }
+            }
+
+            // Handle --recursive: walk directories and re-bootstrap each dataset.
+            // With --reset: clean artifacts first, then re-bootstrap.
+            // CLI flags (--required-facets, -i, --normalize, etc.) override
+            // the stored _bootstrap.json values for each dataset.
+            if recursive {
+                let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                let normalize = normalize && !no_normalize;
+                let mut datasets = Vec::new();
+                collect_dataset_yamls(&root, &mut datasets);
+                datasets.sort();
+
+                if datasets.is_empty() {
+                    eprintln!("No dataset.yaml files found under {}", root.display());
+                    return;
+                }
+
+                println!("Found {} dataset(s) to bootstrap", datasets.len());
+                let mut succeeded: Vec<PathBuf> = Vec::new();
+                let mut failed: Vec<PathBuf> = Vec::new();
+                for ds_path in &datasets {
+                    let workspace = ds_path.parent().unwrap_or(&root).to_path_buf();
+                    println!();
+                    println!("=== {} ===", crate::check::rel_display(&workspace));
+
+                    let saved_dir = std::env::current_dir().ok();
+                    if let Err(e) = std::env::set_current_dir(&workspace) {
+                        eprintln!("  Error: cannot cd to {}: {}", workspace.display(), e);
+                        failed.push(workspace);
+                        continue;
+                    }
+
+                    // Clean artifacts first when --reset
+                    if reset {
+                        clean_single_dataset(&workspace);
+                    }
+
+                    let bf = PathBuf::from("_bootstrap.json");
+                    if bf.exists() {
+                        match std::fs::read_to_string(&bf) {
+                            Ok(json) => match serde_json::from_str::<import::ImportArgs>(&json) {
+                                Ok(mut args) => {
+                                    // CLI flags override stored values
+                                    args.force = true; // always force in recursive mode
+                                    args.normalize = normalize;
+                                    if let Some(ref rf) = required_facets {
+                                        args.required_facets = Some(rf.clone());
+                                    }
+                                    if let Some(ref pf) = provided_facets {
+                                        args.provided_facets = Some(pf.clone());
+                                    }
+                                    if no_dedup { args.no_dedup = true; }
+                                    if no_zero_check { args.no_zero_check = true; }
+                                    if no_filtered { args.no_filtered = true; }
+                                    if classic { args.classic = true; }
+                                    if pedantic_dedup { args.pedantic_dedup = true; }
+
+                                    if interactive {
+                                        // Interactive mode: run wizard with stored values as seeds
+                                        let seeds = wizard::WizardSeeds {
+                                            name: Some(args.name.clone()),
+                                            output: Some(args.output.clone()),
+                                            base_vectors: args.base_vectors.clone(),
+                                            query_vectors: args.query_vectors.clone(),
+                                            self_search: if args.self_search { Some(true) } else { None },
+                                            query_count: None,
+                                            metadata: args.metadata.clone(),
+                                            ground_truth: args.ground_truth.clone(),
+                                            ground_truth_distances: args.ground_truth_distances.clone(),
+                                            metric: Some(args.metric.clone()),
+                                            neighbors: Some(args.neighbors),
+                                            seed: Some(args.seed),
+                                            description: args.description.clone(),
+                                            no_dedup: if args.no_dedup { Some(true) } else { None },
+                                            no_zero_check: if args.no_zero_check { Some(true) } else { None },
+                                            no_filtered: if args.no_filtered { Some(true) } else { None },
+                                            normalize: Some(args.normalize),
+                                            base_fraction: if args.base_fraction < 1.0 { Some(args.base_fraction) } else { None },
+                                            pedantic_dedup: if args.pedantic_dedup { Some(true) } else { None },
+                                            required_facets: args.required_facets.clone(),
+                                            provided_facets: args.provided_facets.clone(),
+                                            round_digits: Some(args.round_digits),
+                                            selectivity: None,
+                                            force: true,
+                                            classic: args.classic,
+                                            sources: vec![],
+                                        };
+                                        let wizard_args = wizard::run_wizard_with_options(yes, auto, seeds);
+                                        import::run(wizard_args);
+                                    } else {
+                                        println!("  Loaded options from _bootstrap.json");
+                                        import::run(args);
+                                    }
+                                    succeeded.push(workspace.join("dataset.yaml"));
+                                }
+                                Err(e) => {
+                                    eprintln!("  Warning: failed to parse _bootstrap.json: {}", e);
+                                    failed.push(workspace.clone());
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("  Warning: failed to read _bootstrap.json: {}", e);
+                                failed.push(workspace.clone());
+                            }
+                        }
+                    } else {
+                        eprintln!("  No _bootstrap.json — skipping (bootstrap manually first)");
+                    }
+
+                    if let Some(d) = saved_dir {
+                        let _ = std::env::set_current_dir(d);
+                    }
+                }
+
+                println!();
+                println!("Bootstrapped {}/{} dataset(s)", succeeded.len(), datasets.len());
+                if !succeeded.is_empty() {
+                    println!("  Succeeded:");
+                    for s in &succeeded {
+                        println!("    {}", crate::check::rel_display(s));
+                    }
+                }
+                if !failed.is_empty() {
+                    println!("  Failed:");
+                    for f in &failed {
+                        println!("    {}", crate::check::rel_display(f));
+                    }
+                    std::process::exit(1);
+                }
+                return;
+            }
+
+            // If _bootstrap.json exists and no significant CLI args given, load from it
+            let bootstrap_file = PathBuf::from("_bootstrap.json");
+            let has_cli_args = name.is_some() || output.is_some() || base_vectors.is_some()
+                || query_vectors.is_some() || interactive || auto || !sources.is_empty()
+                || required_facets.is_some() || provided_facets.is_some();
+            if !has_cli_args && bootstrap_file.exists() {
+                match std::fs::read_to_string(&bootstrap_file) {
+                    Ok(json) => match serde_json::from_str::<import::ImportArgs>(&json) {
+                        Ok(mut args) => {
+                            // CLI flags override stored values
+                            if force || reset { args.force = true; }
+                            if normalize && !no_normalize { args.normalize = true; }
+                            if no_normalize { args.normalize = false; }
+                            if classic { args.classic = true; }
+                            if no_dedup { args.no_dedup = true; }
+                            if no_zero_check { args.no_zero_check = true; }
+                            if no_filtered { args.no_filtered = true; }
+                            if pedantic_dedup { args.pedantic_dedup = true; }
+                            if let Some(ref rf) = required_facets {
+                                args.required_facets = Some(rf.clone());
+                            }
+                            if let Some(ref pf) = provided_facets {
+                                args.provided_facets = Some(pf.clone());
+                            }
+                            println!("Loaded options from _bootstrap.json");
+                            import::run(args);
+                            return;
+                        }
+                        Err(e) => eprintln!("Warning: failed to parse _bootstrap.json: {}", e),
+                    }
+                    Err(e) => eprintln!("Warning: failed to read _bootstrap.json: {}", e),
+                }
+            }
+
             // --auto implies -i -r -y
             let interactive = interactive || auto;
             let yes = yes || auto;
+            let normalize = normalize && !no_normalize;
             let base_fraction = parse_fraction(&base_fraction);
             let metric = if metric == "auto" && !interactive {
                 // Non-interactive: detect metric from base vectors now.
@@ -331,13 +602,13 @@ pub fn run(args: PrepareArgs) {
                 // resolving the actual file path.
                 let (m, reason) = base_vectors.as_ref()
                     .map(|p| import::detect_metric(p))
-                    .unwrap_or_else(|| ("Cosine".to_string(), "default".to_string()));
+                    .unwrap_or_else(|| ("COSINE".to_string(), "default".to_string()));
                 eprintln!("Metric: {} ({})", m, reason);
                 m
             } else {
                 metric
             };
-            let restart = restart || auto;
+            let reset = reset || auto;
 
             // Validate explicitly provided paths exist before proceeding.
             // Without this, a typo or misplaced flag value (e.g. --base-vectors '5%')
@@ -371,7 +642,7 @@ pub fn run(args: PrepareArgs) {
                 }
             }
 
-            if restart {
+            if reset {
                 let out_dir = output.as_deref()
                     .unwrap_or_else(|| std::path::Path::new("."));
                 let yaml_path = out_dir.join("dataset.yaml");
@@ -453,26 +724,31 @@ pub fn run(args: PrepareArgs) {
                         required_facets: required_facets.clone(),
                         provided_facets: provided_facets.clone(),
                         round_digits: Some(round_digits),
+                        force: force || reset,
                         selectivity: None,
+                        classic,
+                        sources: sources.clone(),
                     };
                     let args = wizard::run_wizard_with_options(yes, auto, seeds);
+                    save_bootstrap_json(&args);
                     let out = args.output.clone();
                     import::run(args);
                     check_and_restore(&out);
                 } else {
                     let name = name.unwrap_or_else(|| {
-                        eprintln!("Error: --name is required (or use --interactive)");
-                        std::process::exit(1);
+                        std::env::current_dir().ok()
+                            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+                            .unwrap_or_else(|| {
+                                eprintln!("Error: --name is required (or use --interactive)");
+                                std::process::exit(1);
+                            })
                     });
-                    let out = output.clone().unwrap_or_else(|| {
-                        eprintln!("Error: --output is required (or use --interactive)");
-                        std::process::exit(1);
-                    });
+                    let out = output.clone().unwrap_or_else(|| PathBuf::from("."));
                     import::run(import::ImportArgs {
                         name, output: out.clone(), base_vectors, query_vectors, self_search,
                         query_count, metadata, ground_truth, ground_truth_distances,
                         metric, neighbors, seed, description, no_dedup, no_zero_check,
-                        no_filtered, normalize, force: force || restart,
+                        no_filtered, normalize, force: force || reset,
                         base_convert_format: None,
                         query_convert_format: None,
                         compress_cache: false,
@@ -483,6 +759,7 @@ pub fn run(args: PrepareArgs) {
                         round_digits,
                         pedantic_dedup,
                         selectivity: 0.0001,
+                        classic,
                     });
                     check_and_restore(&out);
                 }
@@ -510,19 +787,24 @@ pub fn run(args: PrepareArgs) {
                     required_facets: required_facets.clone(),
                     provided_facets: provided_facets.clone(),
                     round_digits: Some(round_digits),
+                    force,
                     selectivity: None,
+                    classic,
+                    sources: sources.clone(),
                 };
                 let args = wizard::run_wizard_with_options(yes, false, seeds);
+                save_bootstrap_json(&args);
                 import::run(args);
             } else {
                 let name = name.unwrap_or_else(|| {
-                    eprintln!("Error: --name is required (or use --interactive)");
-                    std::process::exit(1);
+                    std::env::current_dir().ok()
+                        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+                        .unwrap_or_else(|| {
+                            eprintln!("Error: --name is required (or use --interactive)");
+                            std::process::exit(1);
+                        })
                 });
-                let output = output.unwrap_or_else(|| {
-                    eprintln!("Error: --output is required (or use --interactive)");
-                    std::process::exit(1);
-                });
+                let output = output.unwrap_or_else(|| PathBuf::from("."));
                 import::run(import::ImportArgs {
                     name, output, base_vectors, query_vectors, self_search,
                     query_count, metadata, ground_truth, ground_truth_distances,
@@ -538,11 +820,16 @@ pub fn run(args: PrepareArgs) {
                     round_digits,
                     pedantic_dedup,
                     selectivity: 0.0001,
+                    classic,
                 });
             }
         }
         PrepareCommand::Run(args) => {
-            crate::pipeline::run_pipeline(args);
+            if args.recursive {
+                run_recursive(args);
+            } else if let Err(_) = crate::pipeline::run_pipeline(args) {
+                std::process::exit(1);
+            }
         }
         PrepareCommand::GenerateScript(args) => {
             crate::pipeline::run_script(args);
@@ -581,8 +868,196 @@ pub fn run(args: PrepareArgs) {
             crate::pipeline::gz_cache::set_compression_level(level);
             cache_compress::run(&cache_dir, dry_run);
         }
+        PrepareCommand::InferManifest { root, output } => {
+            infer_manifest::run(infer_manifest::InferManifestArgs { root, output });
+        }
+        PrepareCommand::Cleanup { manifest, output, metadata, metric, neighbors, dry_run } => {
+            cleanup::run(cleanup::CleanupArgs {
+                manifest, output, metadata, metric, neighbors, dry_run,
+            });
+        }
         PrepareCommand::CacheUncompress { cache_dir, dry_run } => {
             cache_compress::run_uncompress(&cache_dir, dry_run);
         }
     }
+}
+
+/// Walk a directory tree for `dataset.yaml` files and run each pipeline
+/// in turn, reusing the remaining CLI flags from the original `RunArgs`.
+fn run_recursive(args: crate::pipeline::RunArgs) {
+    use std::path::PathBuf;
+
+    let root = args.dataset.clone().unwrap_or_else(|| PathBuf::from("."));
+    if !root.is_dir() {
+        eprintln!("Error: --recursive requires a directory, but '{}' is not a directory", root.display());
+        std::process::exit(1);
+    }
+
+    let mut datasets: Vec<PathBuf> = Vec::new();
+    collect_dataset_yamls(&root, &mut datasets);
+    // Canonicalize now so paths remain valid after chdir.
+    datasets = datasets.into_iter().filter_map(|p| {
+        p.canonicalize().map_err(|e| {
+            eprintln!("Warning: cannot canonicalize {}: {}", p.display(), e);
+            e
+        }).ok()
+    }).collect();
+    datasets.sort();
+
+    if datasets.is_empty() {
+        eprintln!("No dataset.yaml files found under {}", root.display());
+        std::process::exit(1);
+    }
+
+    println!("Found {} dataset(s) under {}", datasets.len(), root.display());
+    for (i, path) in datasets.iter().enumerate() {
+        println!("  {}. {}", i + 1, path.display());
+    }
+    println!();
+
+    let total = datasets.len();
+    let mut succeeded: Vec<PathBuf> = Vec::new();
+    let mut failed: Vec<PathBuf> = Vec::new();
+
+    let original_dir = std::env::current_dir().unwrap_or_else(|e| {
+        eprintln!("Error: cannot determine current directory: {}", e);
+        std::process::exit(1);
+    });
+
+    for (i, dataset_path) in datasets.into_iter().enumerate() {
+        let dataset_dir = dataset_path.parent().unwrap_or(std::path::Path::new("."));
+        println!("━━ [{}/{}] {} ━━", i + 1, total, dataset_path.display());
+
+        // Change into the dataset's directory so all relative paths resolve
+        // as if the user ran `veks run` from within it.
+        if let Err(e) = std::env::set_current_dir(dataset_dir) {
+            eprintln!("  Error: cannot chdir to {}: {}", dataset_dir.display(), e);
+            failed.push(dataset_path);
+            continue;
+        }
+
+        let child_args = crate::pipeline::RunArgs {
+            dataset: Some(PathBuf::from("dataset.yaml")),
+            recursive: false,
+            profile: args.profile.clone(),
+            dry_run: args.dry_run,
+            clean: args.clean,
+            reset: args.reset,
+            overrides: args.overrides.clone(),
+            threads: args.threads,
+            emit_yaml: args.emit_yaml,
+            resources: args.resources.clone(),
+            governor: args.governor.clone(),
+            status_interval: args.status_interval,
+            output: args.output.clone(),
+        };
+
+        // Catch panics so one dataset failure doesn't abort the rest.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::pipeline::run_pipeline(child_args)
+        }));
+
+        match result {
+            Ok(Ok(())) => {
+                succeeded.push(dataset_path);
+            }
+            Ok(Err(e)) => {
+                eprintln!("  Pipeline failed for {}: {}", dataset_path.display(), e);
+                failed.push(dataset_path);
+            }
+            Err(_) => {
+                eprintln!("  Error: pipeline panicked for {}", dataset_path.display());
+                failed.push(dataset_path);
+            }
+        }
+
+        // Restore original working directory before the next iteration.
+        if let Err(e) = std::env::set_current_dir(&original_dir) {
+            eprintln!("Error: cannot restore working directory to {}: {}", original_dir.display(), e);
+            std::process::exit(1);
+        }
+        println!();
+    }
+
+    println!("━━ Summary ━━");
+    println!("  {} succeeded, {} failed out of {} total", succeeded.len(), failed.len(), total);
+    if !succeeded.is_empty() {
+        println!("  Succeeded:");
+        for s in &succeeded {
+            let dir = s.parent().unwrap_or(std::path::Path::new("."));
+            println!("    {}", crate::check::rel_display(dir));
+        }
+    }
+    if !failed.is_empty() {
+        println!("  Failed:");
+        for f in &failed {
+            let dir = f.parent().unwrap_or(std::path::Path::new("."));
+            println!("    {}", crate::check::rel_display(dir));
+        }
+        std::process::exit(1);
+    }
+}
+
+/// Recursively collect all `dataset.yaml` files under `dir`.
+fn collect_dataset_yamls(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("Warning: cannot read directory {}: {}", dir.display(), e);
+            return;
+        }
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_dataset_yamls(&path, out);
+        } else if path.file_name().and_then(|n| n.to_str()) == Some("dataset.yaml") {
+            out.push(path);
+        }
+    }
+}
+
+/// Clean a single dataset directory.
+fn clean_single_dataset(workspace: &std::path::Path) {
+    let dataset_path = workspace.join("dataset.yaml");
+    if dataset_path.exists() {
+        let config = vectordata::dataset::DatasetConfig::load(&dataset_path)
+            .unwrap_or_else(|e| {
+                eprintln!("Warning: could not load dataset.yaml: {}", e);
+                eprintln!("Cleaning without profile information.");
+                vectordata::dataset::DatasetConfig {
+                    name: String::new(),
+                    description: None,
+                    attributes: None,
+                    profiles: Default::default(),
+                    upstream: None,
+                    variables: Default::default(),
+                }
+            });
+        crate::pipeline::reset_pipeline(workspace, &dataset_path, &config);
+    } else {
+        eprintln!("No dataset.yaml found in {} — nothing to clean.", workspace.display());
+    }
+}
+
+/// Recursively clean all datasets under a directory.
+fn clean_recursive(root: &std::path::Path) {
+    let mut datasets = Vec::new();
+    collect_dataset_yamls(root, &mut datasets);
+    datasets.sort();
+
+    if datasets.is_empty() {
+        eprintln!("No dataset.yaml files found under {}", root.display());
+        return;
+    }
+
+    println!("Found {} dataset(s) to clean", datasets.len());
+    for ds_path in &datasets {
+        let workspace = ds_path.parent().unwrap_or(root);
+        println!();
+        println!("=== {} ===", crate::check::rel_display(workspace));
+        clean_single_dataset(workspace);
+    }
+    println!();
+    println!("Cleaned {} dataset(s)", datasets.len());
 }

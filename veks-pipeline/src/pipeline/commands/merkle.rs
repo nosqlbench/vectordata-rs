@@ -44,8 +44,19 @@ struct MerkleTree {
 }
 
 impl MerkleTree {
+    /// Validate that chunk_size is a positive power of 2.
+    ///
+    /// This matches the Java MerkleTree requirement: chunk sizes must be
+    /// powers of 2 so that tree structure is consistent across
+    /// implementations.
+    fn validate_chunk_size(chunk_size: usize) {
+        assert!(chunk_size > 0 && chunk_size.is_power_of_two(),
+            "chunk size must be a positive power of 2, got {}", chunk_size);
+    }
+
     /// Build a merkle tree from file data in memory.
     fn from_data(data: &[u8], chunk_size: usize) -> Self {
+        Self::validate_chunk_size(chunk_size);
         let leaf_count = if data.is_empty() {
             1
         } else {
@@ -77,6 +88,7 @@ impl MerkleTree {
         hash_threads: usize,
         mut progress_fn: impl FnMut(u64),
     ) -> std::io::Result<Self> {
+        Self::validate_chunk_size(chunk_size);
         use std::sync::mpsc;
 
         let leaf_count = if file_size == 0 {
@@ -273,10 +285,17 @@ impl MerkleTree {
     fn from_bytes(data: &[u8]) -> Result<Self, String> {
         let mref = vectordata::merkle::MerkleRef::from_bytes(data)
             .map_err(|e| format!("invalid mref: {}", e))?;
+        let chunk_size = mref.shape().chunk_size as usize;
+        if chunk_size == 0 || !chunk_size.is_power_of_two() {
+            return Err(format!(
+                "invalid mref: chunk size must be a positive power of 2, got {}",
+                chunk_size
+            ));
+        }
         Ok(Self {
             hashes: mref.hashes().to_vec(),
-            leaf_count: mref.shape().leaf_count as usize,
-            chunk_size: mref.shape().chunk_size as usize,
+            leaf_count: mref.shape().total_chunks as usize,
+            chunk_size,
             file_size: mref.shape().total_content_size,
         })
     }
@@ -2101,6 +2120,23 @@ fn write_mref(path: &Path, tree: &MerkleTree) -> Result<(), String> {
         .map_err(|e| format!("failed to write {}: {}", path.display(), e))
 }
 
+/// Create a merkle `.mref` file for a single file on disk.
+///
+/// Uses the default 1 MiB chunk size. The `.mref` is written as a sibling
+/// file (e.g., `catalog.json` → `catalog.json.mref`). Intended for small
+/// infrastructure files (catalogs) that are generated outside the normal
+/// merkle pipeline step.
+pub fn create_mref_for_file(file_path: &Path) -> Result<PathBuf, String> {
+    let data = std::fs::read(file_path)
+        .map_err(|e| format!("read {}: {}", file_path.display(), e))?;
+    let tree = MerkleTree::from_data(&data, DEFAULT_CHUNK_SIZE);
+    let mref_path = file_path.with_extension(
+        format!("{}.{}", file_path.extension().and_then(|e| e.to_str()).unwrap_or(""), MREF_EXT)
+    );
+    write_mref(&mref_path, &tree)?;
+    Ok(mref_path)
+}
+
 fn resolve_path_ws(path_str: &str, workspace: &Path) -> PathBuf {
     let p = PathBuf::from(path_str);
     if p.is_absolute() {
@@ -2133,6 +2169,7 @@ mod tests {
             governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
             ui: veks_core::ui::UiHandle::new(std::sync::Arc::new(veks_core::ui::TestSink::new())),
             status_interval: std::time::Duration::from_secs(1),
+            estimated_total_steps: 0,
         }
     }
 

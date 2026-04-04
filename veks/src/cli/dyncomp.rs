@@ -50,24 +50,28 @@ fn walk_clap_command(cmd: &clap::Command) -> Node {
     let subs: Vec<_> = cmd.get_subcommands().collect();
 
     if subs.is_empty() {
-        // Leaf command — collect its options
-        let options: Vec<String> = cmd.get_arguments()
-            .filter(|a| a.get_id() != "help" && a.get_id() != "version")
-            .flat_map(|a| {
-                let mut names = Vec::new();
-                if let Some(long) = a.get_long() {
-                    names.push(format!("--{}", long));
-                }
-                if names.is_empty() {
-                    if let Some(short) = a.get_short() {
-                        names.push(format!("-{}", short));
-                    }
-                }
-                names
-            })
-            .collect();
+        // Leaf command — collect its options and identify boolean flags
+        let mut options: Vec<String> = Vec::new();
+        let mut flags: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for a in cmd.get_arguments() {
+            if a.get_id() == "help" || a.get_id() == "version" { continue; }
+            let name = if let Some(long) = a.get_long() {
+                format!("--{}", long)
+            } else if let Some(short) = a.get_short() {
+                format!("-{}", short)
+            } else {
+                continue;
+            };
+            // Boolean flag: takes 0 args (num_args == 0..=0 or action is SetTrue/SetFalse/Count)
+            let is_flag = a.get_action().takes_values() == false;
+            if is_flag {
+                flags.insert(name.clone());
+            }
+            options.push(name);
+        }
         Node::Leaf {
             options,
+            flags,
             value_providers: std::collections::BTreeMap::new(),
         }
     } else {

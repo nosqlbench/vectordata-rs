@@ -176,6 +176,11 @@ impl DSProfile {
         self.views.get(name)
     }
 
+    /// Iterate over all (name, view) pairs in this profile.
+    pub fn views(&self) -> impl Iterator<Item = (&str, &DSView)> {
+        self.views.iter().map(|(k, v)| (k.as_str(), v))
+    }
+
     /// Returns the view names in this profile.
     pub fn view_names(&self) -> Vec<&str> {
         self.views.keys().map(|k| k.as_str()).collect()

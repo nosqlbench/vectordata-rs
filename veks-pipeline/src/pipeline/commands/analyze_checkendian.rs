@@ -17,6 +17,7 @@ use crate::pipeline::command::{
     CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options, Status, StreamContext,
     render_options_table,
 };
+use crate::pipeline::element_type::ElementType;
 
 /// Pipeline command: check endianness of xvec files.
 pub struct AnalyzeCheckEndianOp;
@@ -36,16 +37,11 @@ fn check_endianness(path: &Path) -> Result<String, String> {
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_lowercase();
+        .unwrap_or("");
 
-    let element_width: usize = match ext.as_str() {
-        "fvec" | "ivec" => 4,
-        "bvec" => 1,
-        "dvec" => 8,
-        "mvec" => 2,
-        _ => return Err(format!("unknown vector format: '.{}'", ext)),
-    };
+    let etype = ElementType::from_path(path)
+        .map_err(|_| format!("unknown vector format: '.{}'", ext))?;
+    let element_width = etype.element_size();
 
     let file_size = std::fs::metadata(path)
         .map_err(|e| format!("cannot stat {}: {}", path.display(), e))?
@@ -277,6 +273,7 @@ mod tests {
             governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
             ui: veks_core::ui::UiHandle::new(std::sync::Arc::new(veks_core::ui::TestSink::new())),
             status_interval: std::time::Duration::from_secs(1),
+            estimated_total_steps: 0,
         }
     }
 

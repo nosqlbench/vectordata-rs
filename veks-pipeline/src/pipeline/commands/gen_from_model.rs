@@ -33,6 +33,7 @@ use crate::pipeline::command::{
     CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options, Status, StreamContext,
     render_options_table,
 };
+use crate::pipeline::atomic_write::safe_create_file;
 use crate::pipeline::rng;
 
 /// Pipeline command: generate vectors from a statistical model.
@@ -352,7 +353,7 @@ fn generate_from_model_fvec(
     rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
 ) -> Result<(), String> {
     use std::io::Write;
-    let file = std::fs::File::create(output)
+    let file = safe_create_file(output)
         .map_err(|e| format!("failed to create {}: {}", output.display(), e))?;
     let mut writer = std::io::BufWriter::with_capacity(1 << 20, file);
 
@@ -411,6 +412,7 @@ mod tests {
             governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
             ui: veks_core::ui::UiHandle::new(std::sync::Arc::new(veks_core::ui::TestSink::new())),
             status_interval: std::time::Duration::from_secs(1),
+            estimated_total_steps: 0,
         }
     }
 

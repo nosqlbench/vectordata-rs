@@ -69,11 +69,10 @@ following variables are written to `variables.yaml`:
 - `max_normal_epsilon` — largest deviation (worst-normalized vector)
 - `stddev_normal_epsilon` — standard deviation of the epsilon distribution
 - `median_normal_epsilon` — median deviation
-- `is_normalized` — true if mean epsilon < C × ε_mach(element_type) × √dim
+- `is_normalized` — true if mean epsilon < fixed threshold for element type
 
-The threshold adapts to element precision and dimensionality using the
-probabilistic rounding-error bound from Higham & Mary (2019). C = 10
-provides headroom above the expected error floor. See SRD §18.3.
+The threshold is fixed per precision level: 1e-1 (f16), 1e-5 (f32),
+1e-14 (f64). See SRD §18.3.
 
 ## Options
 
@@ -240,10 +239,9 @@ provides headroom above the expected error floor. See SRD §18.3.
             sorted[sorted.len() / 2]
         };
 
-        // Precision-aware normalization threshold (SRD §18.3).
-        let eps_mach = etype.machine_epsilon().unwrap_or(1e-7);
+        // Fixed normalization threshold per element type.
         let threshold = etype.normalization_threshold(dim)
-            .unwrap_or(10.0 * 1e-7 * (dim as f64).sqrt());
+            .unwrap_or(1e-5);
         let is_normalized = mean < threshold;
 
         ctx.ui.log(&format!(
@@ -251,8 +249,8 @@ provides headroom above the expected error floor. See SRD §18.3.
             mean, stddev, min, max, median,
         ));
         ctx.ui.log(&format!(
-            "  threshold={:.2e} (C=10 × eps={:.2e} × √dim={})",
-            threshold, eps_mach, dim,
+            "  threshold={:.2e} (fixed for {})",
+            threshold, etype,
         ));
         ctx.ui.log(&format!(
             "  is_normalized={} (mean_ε={:.2e} {} threshold)",

@@ -1,12 +1,12 @@
 // Copyright (c) nosqlbench contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Pipeline command: count zero vectors.
+//! Pipeline command: detect near-zero vectors by L2-norm threshold.
 //!
-//! Scans an fvec or ivec file and counts vectors where all components are zero.
-//! Reports the count and percentage.
-//!
-//! Equivalent to the Java `CMD_count_zeros` / `CMD_analyze_zeros` command.
+//! Scans a vector file and identifies vectors whose L2 norm (computed in
+//! f64 precision) falls below a configurable threshold (default 1×10⁻⁶).
+//! Near-zero vectors cause undefined behavior in cosine similarity and
+//! degenerate results after normalization. See SRD §19.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -21,9 +21,13 @@ use crate::pipeline::command::{
     ArtifactManifest, CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options,
     ResourceDesc, Status, StreamContext, render_options_table,
 };
+use crate::pipeline::atomic_write::safe_create_file;
 use crate::pipeline::element_type::ElementType;
 
-/// Pipeline command: count all-zero vectors.
+/// Default L2-norm threshold for near-zero detection.
+const DEFAULT_THRESHOLD: f64 = 1e-6;
+
+/// Pipeline command: detect near-zero vectors.
 pub struct AnalyzeZerosOp;
 
 pub fn factory() -> Box<dyn CommandOp> {
@@ -38,32 +42,30 @@ impl CommandOp for AnalyzeZerosOp {
     fn command_doc(&self) -> CommandDoc {
         let options = self.describe_options();
         CommandDoc {
-            summary: "Find and report zero vectors in a vector file".into(),
+            summary: "Find and report near-zero vectors in a vector file".into(),
             body: format!(
                 "# analyze zeros\n\n\
-                Find and report zero vectors in a vector file.\n\n\
+                Find and report near-zero vectors in a vector file.\n\n\
                 ## Description\n\n\
-                Scans an fvec or ivec file and counts vectors where all components are \
-                exactly zero. Reports the count and percentage of zero vectors found. \
-                The command performs a sequential scan of every vector in the file, \
-                checking each component against zero.\n\n\
-                ## Why Zero Vectors Matter\n\n\
-                All-zero vectors (and near-zero vectors) are problematic in several \
-                common scenarios:\n\n\
-                - **Cosine similarity**: Division by zero occurs when computing the \
-                L2 norm of a zero vector, producing NaN or infinity results.\n\
-                - **Normalization**: Attempting to L2-normalize a zero vector fails.\n\
-                - **KNN ground truth**: Zero vectors can distort distance rankings \
-                and produce degenerate neighborhoods where many vectors are equidistant.\n\
-                - **Benchmark validity**: Datasets with a significant fraction of zero \
-                vectors may not represent realistic workloads.\n\n\
-                ## Role in Dataset Preparation\n\n\
-                This command serves as a data quality check that should be run early \
-                in a pipeline, immediately after import or download. If zero vectors \
-                are detected, the result status is set to Warning rather than Ok, \
-                alerting downstream pipeline steps. Common remediation strategies \
-                include filtering out zero vectors or replacing them with small random \
-                perturbations.\n\n\
+                Scans a vector file and identifies vectors whose L2 norm \
+                (computed entirely in f64 precision) falls below a configurable \
+                threshold (default 1×10⁻⁶). Reports the count and percentage \
+                of near-zero vectors found.\n\n\
+                ## Why Near-Zero Vectors Matter\n\n\
+                Near-zero vectors are problematic in several common scenarios:\n\n\
+                - **Cosine similarity**: Division by near-zero norm produces \
+                numerically unstable results.\n\
+                - **Normalization**: Normalizing a near-zero vector amplifies \
+                quantization noise to unit scale, producing a meaningless \
+                direction vector.\n\
+                - **KNN ground truth**: Near-zero vectors distort distance \
+                rankings and produce degenerate neighborhoods.\n\n\
+                ## Detection Method\n\n\
+                Each vector's L2 norm is computed in f64 precision:\n\n\
+                    ‖x‖₂ = √(Σ xᵢ²)   [all arithmetic in f64]\n\n\
+                A vector is classified as near-zero when ‖x‖₂ < threshold. \
+                The comparison is performed in squared space (Σ xᵢ² < τ²) \
+                to avoid the square root. See SRD §19 for details.\n\n\
                 ## Options\n\n{}",
                 render_options_table(&options)
             ),
@@ -87,7 +89,10 @@ impl CommandOp for AnalyzeZerosOp {
 
         let source_path = resolve_path(source_str, &ctx.workspace);
         let output_path = options.get("output").map(|s| resolve_path(s, &ctx.workspace));
-        let index_path = options.get("index").map(|s| resolve_path(s, &ctx.workspace));
+
+        let threshold: f64 = options.get("threshold")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_THRESHOLD);
 
         let etype = match ElementType::from_path(&source_path) {
             Ok(t) => t,
@@ -95,6 +100,7 @@ impl CommandOp for AnalyzeZerosOp {
         };
 
         // Open reader and extract (count, get_f64_fn) based on element type.
+        // All components are upcast to f64 for norm computation (SRD §19.2).
         let (count, get_f64): (usize, Box<dyn Fn(usize) -> Vec<f64> + Sync>) = match etype {
             ElementType::F32 => {
                 let r = match MmapVectorReader::<f32>::open_fvec(&source_path) {
@@ -140,31 +146,78 @@ impl CommandOp for AnalyzeZerosOp {
             }
         };
 
-        // When an index is provided, use the fast linear-search path.
-        if let Some(ref idx_path) = index_path {
-            return count_zeros_indexed(
-                &source_path, idx_path, &get_f64, count,
-                output_path.as_deref(), start, ctx,
-            );
-        }
-
         let threads = ctx.governor.current_or("threads", ctx.threads as u64) as usize;
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(threads)
             .build()
             .ok();
 
-        count_zeros_generic(
-            &source_path, &get_f64, count,
-            output_path.as_deref(), start, ctx, pool.as_ref(),
-        )
+        // Squared threshold avoids sqrt per vector (SRD §19.2)
+        let threshold_sq = threshold * threshold;
+
+        let pb = ctx.ui.bar_with_unit(count as u64, "scanning for near-zero vectors", "vectors");
+        let progress = AtomicU64::new(0);
+        let pb_ref = &pb;
+        let progress_ref = &progress;
+
+        let need_ordinals = output_path.is_some();
+
+        let scan_fn = || {
+            if need_ordinals {
+                let ordinals: Vec<usize> = (0..count)
+                    .into_par_iter()
+                    .filter_map(|i| {
+                        let components = get_f64(i);
+                        let norm_sq: f64 = components.iter().map(|&v| v * v).sum();
+                        let is_near_zero = norm_sq < threshold_sq;
+                        let done = progress_ref.fetch_add(1, Ordering::Relaxed) + 1;
+                        if done % 100_000 == 0 {
+                            pb_ref.set_position(done);
+                        }
+                        if is_near_zero { Some(i) } else { None }
+                    })
+                    .collect();
+                (ordinals.len(), ordinals)
+            } else {
+                let zero_count: usize = (0..count)
+                    .into_par_iter()
+                    .map(|i| {
+                        let components = get_f64(i);
+                        let norm_sq: f64 = components.iter().map(|&v| v * v).sum();
+                        let is_near_zero = norm_sq < threshold_sq;
+                        let done = progress_ref.fetch_add(1, Ordering::Relaxed) + 1;
+                        if done % 100_000 == 0 {
+                            pb_ref.set_position(done);
+                        }
+                        if is_near_zero { 1usize } else { 0usize }
+                    })
+                    .sum();
+                (zero_count, vec![])
+            }
+        };
+
+        let (zero_count, zero_ordinals) = if let Some(p) = pool {
+            p.install(scan_fn)
+        } else {
+            scan_fn()
+        };
+
+        pb.finish();
+
+        let produced = if let Some(out) = output_path {
+            match write_ordinals_ivec(&out, &zero_ordinals) {
+                Ok(()) => vec![out],
+                Err(e) => return error_result(e, start),
+            }
+        } else {
+            vec![]
+        };
+
+        finish_result(&source_path, zero_count, count, threshold, produced, start)
     }
 
     fn project_artifacts(&self, step_id: &str, options: &Options) -> ArtifactManifest {
-        let mut input_keys: Vec<&str> = vec!["source"];
-        if options.get("index").is_some() {
-            input_keys.push("index");
-        }
+        let input_keys: Vec<&str> = vec!["source"];
         let output_keys: Vec<&str> = if options.get("output").is_some() {
             vec!["output"]
         } else {
@@ -186,17 +239,7 @@ impl CommandOp for AnalyzeZerosOp {
                 type_name: "Path".to_string(),
                 required: true,
                 default: None,
-                description: "Input vector file (fvec or ivec)".to_string(),
-                role: OptionRole::Input,
-            },
-            OptionDesc {
-                name: "index".to_string(),
-                type_name: "Path".to_string(),
-                required: false,
-                default: None,
-                description: "Sorted dedup ordinal index (ivec, dim=1). When provided, \
-                    uses binary search at position 0 instead of a full scan."
-                    .to_string(),
+                description: "Input vector file (fvec, mvec, dvec, ivec, etc.)".to_string(),
                 role: OptionRole::Input,
             },
             OptionDesc {
@@ -204,146 +247,27 @@ impl CommandOp for AnalyzeZerosOp {
                 type_name: "Path".to_string(),
                 required: false,
                 default: None,
-                description: "Output ivec of zero-vector ordinals for downstream clean steps"
+                description: "Output ivec of near-zero vector ordinals for downstream clean steps"
                     .to_string(),
                 role: OptionRole::Output,
+            },
+            OptionDesc {
+                name: "threshold".to_string(),
+                type_name: "float".to_string(),
+                required: false,
+                default: Some("1e-06".to_string()),
+                description: "L2-norm threshold below which a vector is classified as near-zero (SRD §19)"
+                    .to_string(),
+                role: OptionRole::Config,
             },
         ]
     }
 }
 
-/// Generic zero-vector scan using a type-erased f64 accessor.
-fn count_zeros_generic(
-    path: &Path,
-    get_f64: &(dyn Fn(usize) -> Vec<f64> + Sync),
-    count: usize,
-    output: Option<&Path>,
-    start: Instant,
-    ctx: &mut StreamContext,
-    pool: Option<&rayon::ThreadPool>,
-) -> CommandResult {
-    let pb = ctx.ui.bar_with_unit(count as u64, "scanning for zeros", "vectors");
-
-    let progress = AtomicU64::new(0);
-    let pb_ref = &pb;
-    let progress_ref = &progress;
-
-    let need_ordinals = output.is_some();
-
-    let scan_fn = || {
-        if need_ordinals {
-            let ordinals: Vec<usize> = (0..count)
-                .into_par_iter()
-                .filter_map(|i| {
-                    let is_zero = get_f64(i).iter().all(|&v| v == 0.0);
-                    let done = progress_ref.fetch_add(1, Ordering::Relaxed) + 1;
-                    if done % 100_000 == 0 {
-                        pb_ref.set_position(done);
-                    }
-                    if is_zero { Some(i) } else { None }
-                })
-                .collect();
-            (ordinals.len(), ordinals)
-        } else {
-            let zero_count: usize = (0..count)
-                .into_par_iter()
-                .map(|i| {
-                    let is_zero = get_f64(i).iter().all(|&v| v == 0.0);
-                    let done = progress_ref.fetch_add(1, Ordering::Relaxed) + 1;
-                    if done % 100_000 == 0 {
-                        pb_ref.set_position(done);
-                    }
-                    if is_zero { 1usize } else { 0usize }
-                })
-                .sum();
-            (zero_count, vec![])
-        }
-    };
-
-    let (zero_count, zero_ordinals) = if let Some(p) = pool {
-        p.install(scan_fn)
-    } else {
-        scan_fn()
-    };
-
-    pb.finish();
-
-    let produced = if let Some(out) = output {
-        match write_ordinals_ivec(out, &zero_ordinals) {
-            Ok(()) => vec![out.to_path_buf()],
-            Err(e) => return error_result(e, start),
-        }
-    } else {
-        vec![]
-    };
-
-    finish_result(path, zero_count, count, produced, start)
-}
-
-/// Count zero vectors using a sorted dedup ordinal index.
-///
-/// The index is a dim=1 ivec file whose ordinals are sorted by lexicographic
-/// component order (dimension 0 first, then 1, etc.). A zero vector sorts to
-/// position 0, so we read forward from the start until we find a non-zero
-/// vector.
-fn count_zeros_indexed(
-    source_path: &Path,
-    index_path: &Path,
-    get_f64: &(dyn Fn(usize) -> Vec<f64> + Sync),
-    source_count: usize,
-    output: Option<&Path>,
-    start: Instant,
-    ctx: &mut StreamContext,
-) -> CommandResult {
-    let index = match MmapVectorReader::<i32>::open_ivec(index_path) {
-        Ok(r) => r,
-        Err(e) => return error_result(
-            format!("failed to open index {}: {}", index_path.display(), e),
-            start,
-        ),
-    };
-
-    let index_count = <MmapVectorReader<i32> as VectorReader<i32>>::count(&index);
-    let pb = ctx.ui.bar_with_unit(index_count as u64, "index search for zeros", "entries");
-
-    let mut zero_ordinals: Vec<usize> = Vec::new();
-    for pos in 0..index_count {
-        let ordinal = match index.get(pos) {
-            Ok(v) => v[0] as usize,
-            Err(e) => return error_result(
-                format!("failed to read index at {}: {}", pos, e),
-                start,
-            ),
-        };
-        let is_zero = get_f64(ordinal).iter().all(|&v| v == 0.0);
-        pb.set_position((pos + 1) as u64);
-        if is_zero {
-            zero_ordinals.push(ordinal);
-        } else {
-            // Sorted lexicographically: once we see a non-zero, all remaining
-            // entries are also non-zero.
-            break;
-        }
-    }
-    pb.finish();
-
-    let zero_count = zero_ordinals.len();
-    let produced = if let Some(out) = output {
-        match write_ordinals_ivec(out, &zero_ordinals) {
-            Ok(()) => vec![out.to_path_buf()],
-            Err(e) => return error_result(e, start),
-        }
-    } else {
-        vec![]
-    };
-
-    finish_result(source_path, zero_count, source_count, produced, start)
-}
-
 /// Write a list of ordinals as a dim=1 ivec file.
 fn write_ordinals_ivec(path: &Path, ordinals: &[usize]) -> Result<(), String> {
     ensure_parent(path);
-    let mut f = std::fs::File::create(path)
+    let mut f = safe_create_file(path)
         .map_err(|e| format!("failed to create {}: {}", path.display(), e))?;
     for &ord in ordinals {
         f.write_all(&1i32.to_le_bytes())
@@ -359,6 +283,7 @@ fn finish_result(
     path: &Path,
     zero_count: usize,
     total: usize,
+    threshold: f64,
     produced: Vec<PathBuf>,
     start: Instant,
 ) -> CommandResult {
@@ -369,9 +294,10 @@ fn finish_result(
     };
 
     log::info!(
-        "{}: {} zero vectors out of {} total ({:.2}%)",
+        "{}: {} near-zero vectors (L2 < {:.0e}) out of {} total ({:.2}%)",
         path.display(),
         zero_count,
+        threshold,
         total,
         pct
     );
@@ -380,7 +306,6 @@ fn finish_result(
     for p in &produced {
         if let Some(fname) = p.file_name().and_then(|n| n.to_str()) {
             let var_name = format!("verified_count:{}", fname);
-            // Walk up from .cache/<file> to workspace
             let ws = p.parent()
                 .and_then(|d| d.parent())
                 .unwrap_or(Path::new("."));
@@ -397,8 +322,8 @@ fn finish_result(
     CommandResult {
         status,
         message: format!(
-            "{} zero vectors out of {} ({:.2}%)",
-            zero_count, total, pct
+            "{} near-zero vectors (L2 < {:.0e}) out of {} ({:.2}%)",
+            zero_count, threshold, total, pct
         ),
         produced,
         elapsed: start.elapsed(),
@@ -414,13 +339,9 @@ fn ensure_parent(path: &Path) {
     }
 }
 
-fn resolve_path(path_str: &str, workspace: &Path) -> PathBuf {
-    let p = PathBuf::from(path_str);
-    if p.is_absolute() {
-        p
-    } else {
-        workspace.join(p)
-    }
+fn resolve_path(s: &str, workspace: &Path) -> PathBuf {
+    let p = Path::new(s);
+    if p.is_absolute() { p.to_path_buf() } else { workspace.join(p) }
 }
 
 fn error_result(message: String, start: Instant) -> CommandResult {
@@ -435,10 +356,8 @@ fn error_result(message: String, start: Instant) -> CommandResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pipeline::command::StreamContext;
-    use crate::pipeline::progress::ProgressLog;
     use indexmap::IndexMap;
-    use std::io::Write;
+    use crate::pipeline::progress::ProgressLog;
 
     fn test_ctx(dir: &Path) -> StreamContext {
         StreamContext {
@@ -456,85 +375,105 @@ mod tests {
             governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
             ui: veks_core::ui::UiHandle::new(std::sync::Arc::new(veks_core::ui::TestSink::new())),
             status_interval: std::time::Duration::from_secs(1),
+            estimated_total_steps: 0,
         }
     }
 
     fn write_fvec(path: &Path, vectors: &[Vec<f32>]) {
         let mut f = std::fs::File::create(path).unwrap();
-        for v in vectors {
-            let dim = v.len() as i32;
-            f.write_all(&dim.to_le_bytes()).unwrap();
-            for &val in v {
-                f.write_all(&val.to_le_bytes()).unwrap();
-            }
-        }
-    }
-
-    fn write_ivec(path: &Path, vectors: &[Vec<i32>]) {
-        let mut f = std::fs::File::create(path).unwrap();
-        for v in vectors {
-            let dim = v.len() as i32;
-            f.write_all(&dim.to_le_bytes()).unwrap();
-            for &val in v {
-                f.write_all(&val.to_le_bytes()).unwrap();
+        for vec in vectors {
+            f.write_all(&(vec.len() as i32).to_le_bytes()).unwrap();
+            for &v in vec {
+                f.write_all(&v.to_le_bytes()).unwrap();
             }
         }
     }
 
     #[test]
-    fn test_zeros_fvec_no_zeros() {
-        let tmp = tempfile::tempdir().unwrap();
-        let ws = tmp.path();
-        let mut ctx = test_ctx(ws);
+    fn test_exact_zero_detected() {
+        let dir = tempfile::tempdir().unwrap();
+        let fvec = dir.path().join("test.fvec");
+        write_fvec(&fvec, &[
+            vec![1.0, 2.0],
+            vec![0.0, 0.0],  // exact zero — L2 norm = 0
+            vec![3.0, 4.0],
+        ]);
+        let output = dir.path().join("zeros.ivec");
 
-        let input = ws.join("test.fvec");
-        write_fvec(&input, &[vec![1.0, 2.0], vec![3.0, 4.0]]);
-
+        let mut cmd = AnalyzeZerosOp;
         let mut opts = Options::new();
-        opts.set("source", input.to_string_lossy().to_string());
+        opts.set("source", fvec.to_str().unwrap());
+        opts.set("output", output.to_str().unwrap());
 
-        let mut op = AnalyzeZerosOp;
-        let result = op.execute(&opts, &mut ctx);
+        let mut ctx = test_ctx(dir.path());
+        let result = cmd.execute(&opts, &mut ctx);
+
+        assert_eq!(result.status, Status::Warning);
+        assert!(result.message.contains("1 near-zero"));
+    }
+
+    #[test]
+    fn test_near_zero_detected() {
+        let dir = tempfile::tempdir().unwrap();
+        let fvec = dir.path().join("test.fvec");
+        // Vector with L2 norm ≈ 1.41e-08 < 1e-06 threshold
+        write_fvec(&fvec, &[
+            vec![1.0, 2.0],
+            vec![1e-8, 1e-8],  // near-zero
+            vec![3.0, 4.0],
+        ]);
+        let output = dir.path().join("zeros.ivec");
+
+        let mut cmd = AnalyzeZerosOp;
+        let mut opts = Options::new();
+        opts.set("source", fvec.to_str().unwrap());
+        opts.set("output", output.to_str().unwrap());
+
+        let mut ctx = test_ctx(dir.path());
+        let result = cmd.execute(&opts, &mut ctx);
+
+        assert_eq!(result.status, Status::Warning);
+        assert!(result.message.contains("1 near-zero"));
+    }
+
+    #[test]
+    fn test_above_threshold_not_detected() {
+        let dir = tempfile::tempdir().unwrap();
+        let fvec = dir.path().join("test.fvec");
+        // Vector with L2 norm = 1e-05 > 1e-06 threshold
+        write_fvec(&fvec, &[
+            vec![1.0, 2.0],
+            vec![1e-5, 0.0],  // above threshold
+            vec![3.0, 4.0],
+        ]);
+
+        let mut cmd = AnalyzeZerosOp;
+        let mut opts = Options::new();
+        opts.set("source", fvec.to_str().unwrap());
+
+        let mut ctx = test_ctx(dir.path());
+        let result = cmd.execute(&opts, &mut ctx);
+
         assert_eq!(result.status, Status::Ok);
-        assert!(result.message.contains("0 zero vectors"));
+        assert!(result.message.contains("0 near-zero"));
     }
 
     #[test]
-    fn test_zeros_fvec_with_zeros() {
-        let tmp = tempfile::tempdir().unwrap();
-        let ws = tmp.path();
-        let mut ctx = test_ctx(ws);
+    fn test_no_zeros() {
+        let dir = tempfile::tempdir().unwrap();
+        let fvec = dir.path().join("test.fvec");
+        write_fvec(&fvec, &[
+            vec![1.0, 2.0],
+            vec![3.0, 4.0],
+        ]);
 
-        let input = ws.join("test.fvec");
-        write_fvec(
-            &input,
-            &[vec![1.0, 2.0], vec![0.0, 0.0], vec![3.0, 0.0], vec![0.0, 0.0]],
-        );
-
+        let mut cmd = AnalyzeZerosOp;
         let mut opts = Options::new();
-        opts.set("source", input.to_string_lossy().to_string());
+        opts.set("source", fvec.to_str().unwrap());
 
-        let mut op = AnalyzeZerosOp;
-        let result = op.execute(&opts, &mut ctx);
-        assert_eq!(result.status, Status::Warning);
-        assert!(result.message.contains("2 zero vectors"));
-    }
+        let mut ctx = test_ctx(dir.path());
+        let result = cmd.execute(&opts, &mut ctx);
 
-    #[test]
-    fn test_zeros_ivec() {
-        let tmp = tempfile::tempdir().unwrap();
-        let ws = tmp.path();
-        let mut ctx = test_ctx(ws);
-
-        let input = ws.join("test.ivec");
-        write_ivec(&input, &[vec![0, 0, 0], vec![1, 2, 3]]);
-
-        let mut opts = Options::new();
-        opts.set("source", input.to_string_lossy().to_string());
-
-        let mut op = AnalyzeZerosOp;
-        let result = op.execute(&opts, &mut ctx);
-        assert_eq!(result.status, Status::Warning);
-        assert!(result.message.contains("1 zero vectors"));
+        assert_eq!(result.status, Status::Ok);
     }
 }

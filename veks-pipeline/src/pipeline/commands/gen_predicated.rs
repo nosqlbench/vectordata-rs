@@ -26,6 +26,7 @@ use crate::pipeline::command::{
     CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options, ResourceDesc, Status, StreamContext,
     render_options_table,
 };
+use crate::pipeline::atomic_write::safe_create_file;
 use crate::pipeline::predicate::attribute::{AttributeColumn, FieldType};
 use crate::pipeline::predicate::codec;
 use crate::pipeline::predicate::generator;
@@ -272,7 +273,7 @@ trees.
 
         // Write predicates
         let predicates_path = output_dir.join("predicates.pnodes");
-        match std::fs::File::create(&predicates_path) {
+        match safe_create_file(&predicates_path) {
             Ok(f) => {
                 let mut bw = std::io::BufWriter::new(f);
                 if let Err(e) = codec::write_predicates(&mut bw, &predicates) {
@@ -487,11 +488,11 @@ fn compute_predicated_knn(
     let query_count = <MmapVectorReader<f32> as VectorReader<f32>>::count(query);
 
     let mut idx_file = std::io::BufWriter::new(
-        std::fs::File::create(indices_path)
+        safe_create_file(indices_path)
             .map_err(|e| format!("failed to create indices: {}", e))?,
     );
     let mut dist_file = std::io::BufWriter::new(
-        std::fs::File::create(distances_path)
+        safe_create_file(distances_path)
             .map_err(|e| format!("failed to create distances: {}", e))?,
     );
 
@@ -579,7 +580,7 @@ fn compute_predicated_knn(
 
 /// Write an attribute column to a binary file.
 fn write_column(path: &Path, col: &AttributeColumn, _ft: &FieldType) -> Result<(), String> {
-    let mut file = std::fs::File::create(path)
+    let mut file = safe_create_file(path)
         .map_err(|e| format!("failed to create {}: {}", path.display(), e))?;
     let mut buf = std::io::BufWriter::new(&mut file);
 
@@ -704,6 +705,7 @@ mod tests {
             governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
             ui: veks_core::ui::UiHandle::new(std::sync::Arc::new(veks_core::ui::TestSink::new())),
             status_interval: std::time::Duration::from_secs(1),
+            estimated_total_steps: 0,
         }
     }
 

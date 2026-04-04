@@ -43,6 +43,7 @@ pub fn is_excluded_file(name: &str) -> bool {
 const INFRASTRUCTURE_FILES: &[&str] = &[
     "dataset.yaml",
     "dataset.yml",
+    "dataset.json",
     "dataset.log",
     "catalog.json",
     "catalog.yaml",
@@ -73,11 +74,19 @@ pub fn is_intermediate_publishable(name: &str) -> bool {
 
 /// Files to skip when checking catalog staleness.
 ///
-/// Catalog files themselves and merkle references are not compared
-/// against catalog timestamps.
+/// Catalog files themselves, merkle references, the append-only
+/// provenance log, and the JSON format copy of dataset config are
+/// not compared against catalog timestamps. These are all derived
+/// or infrastructure files whose mtime may be newer than catalogs
+/// without indicating actual content changes.
 pub fn is_catalog_staleness_exempt(name: &str) -> bool {
     name == "catalog.json"
         || name == "catalog.yaml"
+        || name == "dataset.yaml"
+        || name == "dataset.yml"
+        || name == "dataset.json"
+        || name == "dataset.log"
+        || name == "variables.yaml"
         || name.ends_with(".mref")
 }
 
@@ -165,8 +174,12 @@ mod tests {
     fn test_catalog_staleness_exempt() {
         assert!(is_catalog_staleness_exempt("catalog.json"));
         assert!(is_catalog_staleness_exempt("catalog.yaml"));
+        assert!(is_catalog_staleness_exempt("dataset.yaml"));
+        assert!(is_catalog_staleness_exempt("dataset.yml"));
+        assert!(is_catalog_staleness_exempt("dataset.json"));
+        assert!(is_catalog_staleness_exempt("dataset.log"));
+        assert!(is_catalog_staleness_exempt("variables.yaml"));
         assert!(is_catalog_staleness_exempt("base.fvec.mref"));
         assert!(!is_catalog_staleness_exempt("base.fvec"));
-        assert!(!is_catalog_staleness_exempt("dataset.yaml"));
     }
 }

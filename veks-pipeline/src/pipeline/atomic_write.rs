@@ -70,6 +70,13 @@ impl AtomicWriter {
     /// on drop.
     pub fn finish(mut self) -> io::Result<()> {
         self.writer.flush()?;
+        // Safety: if the final path is a symlink, remove it before renaming.
+        // POSIX rename() replaces the directory entry (not the symlink target),
+        // but we add an explicit guard to prevent any risk of clobbering
+        // source data through a stale identity symlink.
+        if self.final_path.is_symlink() {
+            std::fs::remove_file(&self.final_path)?;
+        }
         std::fs::rename(&self.temp_path, &self.final_path)?;
         self.finished = true;
         Ok(())
@@ -114,6 +121,54 @@ fn temp_path_for(path: &Path) -> PathBuf {
     let mut p = path.as_os_str().to_owned();
     p.push(".tmp");
     PathBuf::from(p)
+}
+
+/// Reject writes to symlinks (SRD §12 safety invariant).
+///
+/// Symlinks in the dataset workspace are read aliases — they point to
+/// source data that must never be overwritten. Any code path that opens
+/// a file for writing must call this first. If `path` is a symlink, the
+/// symlink is removed so a subsequent `File::create` produces a new
+/// regular file instead of writing through the link to the source.
+///
+/// Returns `Err` only if the symlink exists but cannot be removed.
+pub fn guard_against_symlink_write(path: &Path) -> io::Result<()> {
+    if path.is_symlink() {
+        eprintln!(
+            "  safety: removing symlink {} before write (symlinks are read-only aliases)",
+            path.display(),
+        );
+        std::fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+/// Create a file for writing, with symlink safety.
+///
+/// If `path` is a symlink, removes it first so the write creates a new
+/// regular file instead of clobbering the symlink target. This enforces
+/// the SRD invariant that symlinks are read-only aliases to source data.
+pub fn safe_create_file(path: &Path) -> io::Result<File> {
+    guard_against_symlink_write(path)?;
+    File::create(path)
+}
+
+/// Write bytes to a file, with symlink safety.
+///
+/// If `path` is a symlink, removes it first. Equivalent to
+/// `guard_against_symlink_write` + `std::fs::write`.
+pub fn safe_write(path: &Path, contents: impl AsRef<[u8]>) -> io::Result<()> {
+    guard_against_symlink_write(path)?;
+    std::fs::write(path, contents)
+}
+
+/// Copy a file, with symlink safety on the destination.
+///
+/// If `to` is a symlink, removes it first so the copy creates a new
+/// regular file instead of overwriting the symlink target.
+pub fn safe_copy(from: &Path, to: &Path) -> io::Result<u64> {
+    guard_against_symlink_write(to)?;
+    std::fs::copy(from, to)
 }
 
 #[cfg(test)]

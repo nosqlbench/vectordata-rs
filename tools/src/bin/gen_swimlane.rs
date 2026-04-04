@@ -121,43 +121,37 @@ const LANES: &[Lane] = &[
 
 const STEPS: &[Step] = &[
     Step { row: 1,  col: 0, label: "convert\nvectors",           cond: "[foreign fmt]",      fill_override: None,
-        tooltip: "transform convert: Convert source vectors (npy, parquet, dir) to native xvec format.\nActive when source is not already a native xvec file.\nIdentity (symlink) when source is native fvec/mvec.\nfraction option limits how many records to convert when base_fraction < 1.0." },
+        tooltip: "transform convert: Convert source vectors (npy, parquet, dir) to native xvec format.\nActive when source is not already a native xvec file.\nIdentity (symlink) when source is native fvec/mvec." },
     Step { row: 1,  col: 4, label: "convert\nmetadata",          cond: "[foreign fmt]",      fill_override: None,
         tooltip: "transform convert: Convert metadata from parquet/dir to slab format.\nActive when source is not already a native .slab file.\nIdentity (symlink) when source is native slab." },
     Step { row: 2,  col: 0, label: "count\nvectors",             cond: "",                   fill_override: None,
-        tooltip: "state set: Count records in all_vectors and store as ${vector_count} in variables.yaml.\nAlways active when B facet is required." },
+        tooltip: "state set: Count records in all_vectors (or combined B+Q) and store as ${vector_count}.\nAlways active when B facet is required." },
     Step { row: 2,  col: 4, label: "survey\nmetadata",           cond: "",                   fill_override: None,
         tooltip: "analyze survey: Sample metadata to discover schema and value ranges.\nProduces metadata_survey.json used by predicate generation.\nAlways active when M facet is required." },
-    Step { row: 3,  col: 0, label: "sort + dedup",               cond: "[!no_dedup]",        fill_override: None,
-        tooltip: "compute sort: External merge-sort with adaptive prefix keys.\nProduces sorted_ordinals.ivec (lexicographic order) and dedup_duplicates.ivec.\nUses prefix components (1-10 dims) to avoid full-vector comparisons.\nElided when --no-dedup is set." },
+    Step { row: 3,  col: 0, label: "prepare\nvectors",            cond: "[!no_dedup]",        fill_override: None,
+        tooltip: "prepare-vectors: External merge-sort with in-segment dedup detection,\nL2 normalization (f64), near-zero detection (L2 < 1e-6),\nand normalization quality measurement. See SRD §20.3.\nProduces: sorted_ordinals.ivec, dedup_duplicates.ivec, zero_ordinals.ivec,\nsorted+normalized run files, and norm statistics (is_normalized, mean_epsilon).\nAll cleaning happens in one pass while data is cache-hot." },
     Step { row: 3,  col: 5, label: "generate\npredicates",       cond: "",                   fill_override: None,
         tooltip: "generate predicates: Synthesize test predicates from metadata survey.\nProduces predicates.slab with configurable count and selectivity.\nAlways active when M facet is required." },
-    Step { row: 4,  col: 0, label: "find zeros",                 cond: "[!no_zero_check]",   fill_override: None,
-        tooltip: "analyze zeros: Binary search the sorted ordinal index for the zero vector [0,0,...,0].\nProduces zero_ordinals.ivec listing ordinals of zero vectors.\nElided when --no-zero-check is set." },
-    Step { row: 5,  col: 0, label: "filter\nordinals",           cond: "[sort OR zeros]",    fill_override: None,
-        tooltip: "transform ordinals: Combine duplicate + zero exclusion lists, filter the sorted index.\nProduces clean_ordinals.ivec — the definitive set of ordinals used by shuffle and extraction.\nElided when neither sort nor zeros is active." },
-    Step { row: 6,  col: 0, label: "compute\nbase-end",          cond: "[frac < 1.0]",       fill_override: None,
-        tooltip: "state set: Compute base_end = scale:${clean_count}*fraction with rounding.\nCaps the extraction range so only a fraction of vectors become the base set.\nElided when base_fraction = 1.0 (100%)." },
-    Step { row: 7,  col: 0, label: "generate\nshuffle",          cond: "[Q + self-search]",  fill_override: None,
-        tooltip: "generate shuffle: Fisher-Yates permutation of the clean ordinals.\nReads clean_ordinals.ivec so output contains actual source ordinals (not [0,N) indices).\nDeterministic given seed. Used by both vector and metadata extraction.\nElided when separate query file is provided (no self-search)." },
-    Step { row: 7,  col: 4, label: "extract\nmetadata",          cond: "[self-search]",      fill_override: None,
-        tooltip: "transform extract: Reorder metadata records to match shuffled base vectors.\nUses the same shuffle as vector extraction to maintain ordinal congruency.\nRange: [query_count, base_end) or [query_count, clean_count).\nElided when not self-search (metadata already ordinal-aligned)." },
-    Step { row: 7,  col: 6, label: "evaluate\npredicates [pp]",  cond: "",                   fill_override: None,
-        tooltip: "compute evaluate-predicates: Evaluate each predicate against metadata records.\nProduces metadata_indices.slab with matching record sets per predicate.\nPer-profile: range [0, base_end) matches the profile's base vector window.\nAlways active when M facet is required." },
-    Step { row: 8,  col: 0, label: "extract\nbase",              cond: "[Q + self-search]",  fill_override: None,
-        tooltip: "transform extract: Extract base vectors from shuffled ordinals.\nRange: [query_count, base_end) — everything after the query split.\nL2-normalization applied automatically when metric is Cosine or DotProduct.\nElided when not self-search (base = all_vectors directly)." },
-    Step { row: 8,  col: 1, label: "extract\nqueries",           cond: "[Q + self-search]",  fill_override: Some("#d4e6f7"),
-        tooltip: "transform extract: Extract query vectors from shuffled ordinals.\nRange: [0, query_count) — the first query_count entries of the shuffle.\nL2-normalization applied automatically when metric is Cosine or DotProduct.\nElided when separate query file is provided." },
-    Step { row: 9,  col: 0, label: "count\nbase",                cond: "",                   fill_override: None,
-        tooltip: "state set: Count records in base_vectors and store as ${base_count}.\nUsed by compute-knn and compute-filtered-knn to set the search window.\nAlways active when self-search produces base vectors." },
-    Step { row: 10, col: 2, label: "compute\nknn [pp]",          cond: "[G + !precomputed]", fill_override: None,
-        tooltip: "compute knn: Brute-force exact K-nearest-neighbor computation.\nPer-profile: uses base_vectors[0..base_count) as corpus, query_vectors as input.\nProduces neighbor_indices.ivec and neighbor_distances.fvec (paired).\nElided when pre-computed ground truth is provided." },
-    Step { row: 10, col: 7, label: "compute\nfiltered-knn [pp]", cond: "[F]",                fill_override: None,
-        tooltip: "compute filtered-knn: KNN with predicate pre-filtering.\nPer-profile: for each query, evaluates its predicate to get eligible base vectors,\nthen computes KNN only among eligible vectors.\nProduces filtered_neighbor_indices.ivec and filtered_neighbor_distances.fvec.\nActive when F facet is required and --no-filtered is not set." },
-    Step { row: 11, col: 2, label: "verify\nknn [pp]",           cond: "[G]",                fill_override: None,
-        tooltip: "verify knn-groundtruth: Sparse-sample brute-force recomputation.\nPer-profile: randomly samples queries, recomputes KNN from scratch,\nand compares against the stored ground truth to detect corruption.\nAlways active when G facet is required." },
-    Step { row: 11, col: 7, label: "verify\npredicates [pp]",    cond: "[F]",                fill_override: None,
-        tooltip: "verify predicate-results: Sparse-sample SQLite-backed verification.\nPer-profile: loads metadata into SQLite, evaluates predicates via SQL,\nand compares against the pre-computed metadata_indices to detect mismatches.\nActive when F facet is required." },
+    Step { row: 4,  col: 0, label: "generate\nshuffle",          cond: "[self-search\n OR combined B+Q]", fill_override: None,
+        tooltip: "generate shuffle: Fisher-Yates permutation over clean ordinals\n(sorted ordinals minus duplicates minus zeros).\nDeterministic given seed. Used by vector and metadata extraction.\nElided when HDF5 with separate query (no self-search)." },
+    Step { row: 4,  col: 4, label: "extract\nmetadata",          cond: "[self-search]",      fill_override: None,
+        tooltip: "transform extract: Reorder metadata records to match shuffled base vectors.\nUses same shuffle as vector extraction for ordinal congruency.\nElided when not self-search (metadata already ordinal-aligned)." },
+    Step { row: 4,  col: 6, label: "evaluate\npredicates [pp]",  cond: "",                   fill_override: None,
+        tooltip: "compute evaluate-predicates: Evaluate each predicate against metadata records.\nPer-profile: range [0, base_count) matches the profile's base vector window.\nAlways active when M facet is required." },
+    Step { row: 5,  col: 0, label: "extract\nbase",              cond: "",                   fill_override: None,
+        tooltip: "transform extract: Extract base vectors from sorted+normalized data,\neliding excluded ordinals (duplicates + zeros). See SRD §20.5.\nContiguous-run memcpy between exclusion holes — no per-vector compute.\nSelf-search: uses shuffle remainder. Separate query: full clean set." },
+    Step { row: 5,  col: 1, label: "extract\nqueries",           cond: "[self-search\n OR combined B+Q]",  fill_override: Some("#d4e6f7"),
+        tooltip: "transform extract: Extract query vectors from shuffle.\nFirst query_count shuffled ordinals, eliding excluded.\nElided when HDF5 with separate query file." },
+    Step { row: 6,  col: 0, label: "count\nbase",                cond: "",                   fill_override: None,
+        tooltip: "state set: Count records in base_vectors and store as ${base_count}.\nVerifiable: vector_count - duplicate_count - zero_count = base_count." },
+    Step { row: 7,  col: 2, label: "compute\nknn [pp]",          cond: "[G + !precomputed]", fill_override: None,
+        tooltip: "compute knn: Brute-force exact K-nearest-neighbor computation.\nPer-profile: uses base_vectors[0..base_count) as corpus.\nProduces neighbor_indices.ivec and neighbor_distances.fvec." },
+    Step { row: 7,  col: 7, label: "compute\nfiltered-knn [pp]", cond: "[F]",                fill_override: None,
+        tooltip: "compute filtered-knn: KNN with predicate pre-filtering.\nPer-profile: evaluates predicates to get eligible base vectors,\nthen computes KNN among eligible only." },
+    Step { row: 8, col: 2, label: "verify\nknn [pp]",            cond: "[G]",                fill_override: None,
+        tooltip: "verify knn: Sparse-sample brute-force recomputation.\nPer-profile: samples queries, recomputes KNN, compares to stored GT." },
+    Step { row: 8, col: 7, label: "verify\npredicates [pp]",     cond: "[F]",                fill_override: None,
+        tooltip: "verify predicate-results: SQLite-backed predicate verification.\nPer-profile: compares pre-computed metadata_indices to SQL evaluation." },
 ];
 
 const ARTIFACTS: &[Artifact] = &[
@@ -199,71 +193,62 @@ const INPUTS: &[Input] = &[
 ];
 
 const V_EDGES: &[VEdge] = &[
-    VEdge { from_row: 1, from_col: 0, to_row: 2, to_col: 0 },
-    VEdge { from_row: 2, from_col: 0, to_row: 3, to_col: 0 },
-    VEdge { from_row: 3, from_col: 0, to_row: 4, to_col: 0 },
-    VEdge { from_row: 4, from_col: 0, to_row: 5, to_col: 0 },
-    VEdge { from_row: 5, from_col: 0, to_row: 6, to_col: 0 },
-    VEdge { from_row: 6, from_col: 0, to_row: 7, to_col: 0 },
-    VEdge { from_row: 7, from_col: 0, to_row: 8, to_col: 0 },
-    VEdge { from_row: 8, from_col: 0, to_row: 9, to_col: 0 },
-    VEdge { from_row: 1, from_col: 4, to_row: 2, to_col: 4 },
-    VEdge { from_row: 1, from_col: 4, to_row: 7, to_col: 4 },
-    VEdge { from_row: 3, from_col: 5, to_row: 12, to_col: 5 },
-    VEdge { from_row: 7, from_col: 6, to_row: 12, to_col: 6 },
-    VEdge { from_row: 10, from_col: 2, to_row: 11, to_col: 2 },
-    VEdge { from_row: 10, from_col: 7, to_row: 11, to_col: 7 },
+    VEdge { from_row: 1, from_col: 0, to_row: 2, to_col: 0 },  // convert → count
+    VEdge { from_row: 2, from_col: 0, to_row: 3, to_col: 0 },  // count → sort+dedup+norm+zero
+    VEdge { from_row: 3, from_col: 0, to_row: 4, to_col: 0 },  // sort → shuffle
+    VEdge { from_row: 4, from_col: 0, to_row: 5, to_col: 0 },  // shuffle → extract-base
+    VEdge { from_row: 5, from_col: 0, to_row: 6, to_col: 0 },  // extract → count-base
+    VEdge { from_row: 1, from_col: 4, to_row: 2, to_col: 4 },  // convert-meta → survey
+    VEdge { from_row: 1, from_col: 4, to_row: 4, to_col: 4 },  // convert-meta → extract-meta
+    VEdge { from_row: 3, from_col: 5, to_row: 9, to_col: 5 },  // gen-predicates → artifact
+    VEdge { from_row: 4, from_col: 6, to_row: 9, to_col: 6 },  // eval-predicates → artifact
+    VEdge { from_row: 7, from_col: 2, to_row: 8, to_col: 2 },  // compute-knn → verify
+    VEdge { from_row: 7, from_col: 7, to_row: 8, to_col: 7 },  // compute-fknn → verify-pred
 ];
 
 /// Extra vertical edges from last step to artifact row
 const ARTIFACT_EDGES: &[(i32, i32)] = &[
-    (0, 9), (4, 7), (2, 11), (1, 8), (7, 11),
+    (0, 6), (4, 4), (2, 8), (1, 5), (7, 8),
 ];
 
 const X_EDGES: &[XEdge] = &[
     XEdge { from_row: 2, from_col: 4, to_row: 3, to_col: 5, color: "#ab47bc", label: "schema" },
-    XEdge { from_row: 7, from_col: 0, to_row: 8, to_col: 1, color: "#42a5f5", label: "shuffle" },
-    XEdge { from_row: 7, from_col: 0, to_row: 7, to_col: 4, color: "#ab47bc", label: "ordinals" },
-    XEdge { from_row: 7, from_col: 4, to_row: 7, to_col: 6, color: "#ab47bc", label: "" },
-    XEdge { from_row: 3, from_col: 5, to_row: 7, to_col: 6, color: "#ab47bc", label: "predicates" },
-    XEdge { from_row: 9, from_col: 0, to_row: 10, to_col: 2, color: "#ffa726", label: "base" },
-    XEdge { from_row: 9, from_col: 0, to_row: 10, to_col: 7, color: "#ef5350", label: "base" },
-    XEdge { from_row: 10, from_col: 2, to_row: 12, to_col: 3, color: "#ffa726", label: "paired" },
+    XEdge { from_row: 4, from_col: 0, to_row: 5, to_col: 1, color: "#42a5f5", label: "shuffle" },
+    XEdge { from_row: 4, from_col: 0, to_row: 4, to_col: 4, color: "#ab47bc", label: "ordinals" },
+    XEdge { from_row: 4, from_col: 4, to_row: 4, to_col: 6, color: "#ab47bc", label: "" },
+    XEdge { from_row: 3, from_col: 5, to_row: 4, to_col: 6, color: "#ab47bc", label: "predicates" },
+    XEdge { from_row: 6, from_col: 0, to_row: 7, to_col: 2, color: "#ffa726", label: "base" },
+    XEdge { from_row: 6, from_col: 0, to_row: 7, to_col: 7, color: "#ef5350", label: "base" },
+    XEdge { from_row: 7, from_col: 2, to_row: 9, to_col: 3, color: "#ffa726", label: "paired" },
 ];
 
 const VARIABLES: &[Variable] = &[
     Variable { set_row: 2,  set_col: 0, name: "vector_count",
-        tooltip: "Total records in all_vectors (pre-dedup, pre-zero-check).\nUsed as shuffle interval when no cleaning is active." },
+        tooltip: "Total records in source (or combined B+Q).\nUsed as shuffle interval when no cleaning is active." },
     Variable { set_row: 3,  set_col: 0, name: "duplicate_count",
-        tooltip: "Number of duplicate vectors found by sort+dedup.\nInformational — recorded in variables.yaml for reporting." },
-    Variable { set_row: 4,  set_col: 0, name: "zero_count",
-        tooltip: "Number of zero vectors found by find-zeros.\nInformational — recorded in variables.yaml for reporting." },
-    Variable { set_row: 5,  set_col: 0, name: "clean_count",
-        tooltip: "Records in clean_ordinals.ivec (post-dedup, post-zero-check).\nUsed as shuffle interval and extraction range upper bound.\nclean_count = vector_count - duplicate_count - zero_count." },
-    Variable { set_row: 6,  set_col: 0, name: "base_end",
-        tooltip: "Capped extraction upper bound when base_fraction < 1.0.\nComputed as scale:${clean_count}*fraction with --round-digits rounding.\nUsed by extract-base, extract-queries, and extract-metadata ranges." },
-    Variable { set_row: 9,  set_col: 0, name: "base_count",
-        tooltip: "Records in the extracted base_vectors file.\nbase_count = base_end - query_count (or clean_count - query_count if no fraction).\nUsed by compute-knn and compute-filtered-knn as the search window size." },
+        tooltip: "Number of duplicate vectors found during sort.\nRecorded in variables.yaml for provenance." },
+    Variable { set_row: 3,  set_col: 0, name: "zero_count",
+        tooltip: "Number of near-zero vectors detected (L2 < 1e-6) during prepare-vectors.\nRecorded in variables.yaml for provenance." },
+    Variable { set_row: 3,  set_col: 0, name: "is_normalized",
+        tooltip: "Whether vectors pass normalization quality check.\nComputed during prepare-vectors from L2 norm epsilon distribution (f64).\nThreshold: 1e-5 for f32, 1e-14 for f64, 1e-1 for f16." },
+    Variable { set_row: 6,  set_col: 0, name: "base_count",
+        tooltip: "Records in the extracted base_vectors file.\nbase_count = vector_count - duplicate_count - zero_count (- query_count if self-search).\nUsed by compute-knn as the search window size." },
 ];
 
 const INTERMEDIATES: &[Intermediate] = &[
     Intermediate { row: 1, col: 0, label: "all_vectors.mvec",
-        tooltip: "All imported vectors in native xvec format.\nLocated at ${cache}/all_vectors.{ext}.\nMay be a subset when fraction < 1.0." },
-    Intermediate { row: 3, col: 0, label: "sorted_ordinals.ivec",
-        tooltip: "Lexicographically sorted ordinal index.\nLocated at ${cache}/sorted_ordinals.ivec.\nDuplicate ordinals recorded in dedup_duplicates.ivec." },
-    Intermediate { row: 4, col: 0, label: "zero_ordinals.ivec",
-        tooltip: "Ordinals of zero vectors found by binary search.\nLocated at ${cache}/zero_ordinals.ivec.\nMay be empty (0 bytes) when no zeros exist." },
-    Intermediate { row: 5, col: 0, label: "clean_ordinals.ivec",
-        tooltip: "Definitive ordinal set after excluding dups + zeros.\nLocated at ${cache}/clean_ordinals.ivec.\nFed into generate-shuffle as the ordinals input." },
-    Intermediate { row: 7, col: 0, label: "shuffle.ivec",
-        tooltip: "Random permutation of clean ordinals.\nLocated at ${cache}/shuffle.ivec.\nDeterministic given seed. Used by both vector and metadata extraction." },
+        tooltip: "All imported vectors in native xvec format.\nLocated at ${cache}/all_vectors.{ext}.\nMay include combined B+Q for Strategy 1." },
+    Intermediate { row: 3, col: 0, label: "sorted+normalized\nrun files",
+        tooltip: "Sorted, L2-normalized, dedup-detected, zero-detected run files.\nLocated in ${cache}/dedup_runs/.\nAlso produces: sorted_ordinals.ivec, dedup_duplicates.ivec, zero_ordinals.ivec.\nSee SRD §20.3." },
+    Intermediate { row: 4, col: 0, label: "shuffle.ivec",
+        tooltip: "PRNG permutation of clean ordinals (= sorted minus dups minus zeros).\nLocated at ${cache}/shuffle.ivec.\nDeterministic given seed. Used by vector and metadata extraction." },
     Intermediate { row: 1, col: 4, label: "metadata_all.slab",
-        tooltip: "All imported metadata as MNode slab records.\nLocated at ${cache}/metadata_all.slab.\nMay be a subset when fraction < 1.0." },
+        tooltip: "All imported metadata as MNode slab records.\nLocated at ${cache}/metadata_all.slab." },
     Intermediate { row: 2, col: 4, label: "metadata_survey.json",
         tooltip: "Schema and value range survey of the metadata.\nLocated at ${cache}/metadata_survey.json.\nUsed by generate-predicates for selectivity targeting." },
 ];
 
-const TOTAL_ROWS: i32 = 13;
+const TOTAL_ROWS: i32 = 10;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Geometry helpers
@@ -351,7 +336,7 @@ fn main() {
     for &(col, last_row) in ARTIFACT_EDGES {
         let x = cx(col);
         let y1 = cy(last_row) + ROW_H / 2 - PAD_Y;
-        let y2 = cy(12) - ROW_H / 2 + PAD_Y;
+        let y2 = cy(TOTAL_ROWS - 1) - ROW_H / 2 + PAD_Y;
         writeln!(svg, r#"  <line x1="{x}" y1="{y1}" x2="{x}" y2="{y2}" stroke="{CLR_EDGE}" stroke-width="1.5" />"#).unwrap();
     }
 
@@ -444,7 +429,8 @@ fn main() {
     for art in ARTIFACTS {
         let lane = &LANES[art.col as usize];
         let bx = box_x(art.col);
-        let by = box_y(12);
+        let art_row = TOTAL_ROWS - 1;
+        let by = box_y(art_row);
         writeln!(svg, "  <g>").unwrap();
         writeln!(svg, "    <title>{}</title>", esc(art.tooltip)).unwrap();
         writeln!(svg, r#"    <rect x="{bx}" y="{by}" width="{BOX_W}" height="{}" fill="{}" stroke="{}" stroke-width="2" />"#, box_h(), lane.fill, lane.stroke).unwrap();
@@ -453,7 +439,7 @@ fn main() {
         writeln!(svg, r#"    <polygon points="{fx},{by} {},{} {fx},{}" fill="white" stroke="{}" stroke-width="1" />"#, bx + BOX_W, by + fold, by + fold, lane.stroke).unwrap();
         let lines: Vec<&str> = art.label.split('\n').collect();
         let total_h = lines.len() as i32 * (FONT + 2);
-        let start_y = cy(12) - total_h / 2 + FONT;
+        let start_y = cy(art_row) - total_h / 2 + FONT;
         for (j, line) in lines.iter().enumerate() {
             let fw = if j == 0 { "bold" } else { "normal" };
             writeln!(svg, r#"    <text x="{}" y="{}" text-anchor="middle" font-size="{FONT_SM}" font-weight="{fw}">{}</text>"#,
@@ -465,7 +451,7 @@ fn main() {
     // Deferred profile expansion annotation — near the bottom, above the artifact row
     {
         let ann_x = MARGIN_LR + 2;
-        let ann_y = cy(11) + ROW_H / 2 + 4;
+        let ann_y = cy(TOTAL_ROWS - 2) + ROW_H / 2 + 4;
         writeln!(svg, r#"  <text x="{ann_x}" y="{ann_y}" font-size="8" fill="{CLR_COND}" font-style="italic">⤷ deferred profile expansion: per-profile [pp] steps instantiated after base_count is known</text>"#).unwrap();
     }
 
@@ -476,6 +462,7 @@ fn main() {
     writeln!(svg, r#"     · <a href="12-dataset-import-flowchart.md#124-universal-flow-graph">Pipeline spec (§12)</a>"#).unwrap();
     writeln!(svg, r#"     · <a href="14-pipeline-dag-configurations.md">DAG configs (§14)</a>"#).unwrap();
     writeln!(svg, r#"     · <a href="15-facet-swimlane.md">This diagram (§15)</a>"#).unwrap();
+    writeln!(svg, r#"     · <a href="20-unified-sort-normalize-extract.md">Unified pipeline (§20)</a>"#).unwrap();
     writeln!(svg, r#"     · <a href="03-invariants.md#313-stratification-invariant">Stratification (§3.13)</a>"#).unwrap();
     writeln!(svg, "  </text>").unwrap();
     let note_y = legend_y + 12;

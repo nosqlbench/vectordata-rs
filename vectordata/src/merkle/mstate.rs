@@ -7,7 +7,7 @@ use std::fs;
 use std::io::{self, Cursor};
 use std::path::Path;
 
-use super::{FOOTER_SIZE, HASH_SIZE, MerkleRef, MerkleShape, read_hashes, sha256, write_hashes};
+use super::{FOOTER_SIZE, FOOTER_SIZE_V2, HASH_SIZE, MerkleRef, MerkleShape, read_hashes, sha256, write_hashes};
 
 /// Mutable verification state for a merkle-protected file.
 ///
@@ -71,13 +71,20 @@ impl MerkleState {
             ));
         }
 
-        let footer_start = data.len() - FOOTER_SIZE;
+        // Detect footer version from last byte
+        let actual_footer_size = data[data.len() - 1] as usize;
+        let footer_size = if actual_footer_size == FOOTER_SIZE_V2 {
+            FOOTER_SIZE_V2
+        } else {
+            FOOTER_SIZE
+        };
+        let footer_start = data.len() - footer_size;
         let shape = MerkleShape::read_footer(&data[footer_start..])?;
 
         let hash_bytes = shape.node_count as usize * HASH_SIZE;
         let word_count = Self::word_count_for_leaves(shape.leaf_count);
         let bitset_bytes = word_count * 8;
-        let expected_size = hash_bytes + bitset_bytes + FOOTER_SIZE;
+        let expected_size = hash_bytes + bitset_bytes + footer_size;
 
         if data.len() != expected_size {
             return Err(io::Error::new(
@@ -121,7 +128,7 @@ impl MerkleState {
     /// Save state to a `.mrkl` file.
     pub fn save(&self, path: &Path) -> io::Result<()> {
         let mut buf = Vec::with_capacity(
-            self.hashes.len() * HASH_SIZE + self.bitset_byte_size() + FOOTER_SIZE,
+            self.hashes.len() * HASH_SIZE + self.bitset_byte_size() + FOOTER_SIZE_V2,
         );
         self.write(&mut buf)?;
         fs::write(path, &buf)
@@ -136,7 +143,7 @@ impl MerkleState {
             w.write_all(&word.to_le_bytes())?;
         }
 
-        self.shape.write_footer(w)?;
+        self.shape.write_footer_with_bitset(w, self.bitset_byte_size() as u32)?;
         Ok(())
     }
 

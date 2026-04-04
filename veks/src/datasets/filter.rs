@@ -387,21 +387,24 @@ pub fn infer_vtype(entry: &CatalogEntry) -> Option<String> {
 
 /// Map a file extension to a vector type name.
 fn vtype_from_extension(path: &str) -> Option<String> {
-    if path.ends_with(".fvec") || path.ends_with(".fvecs") {
-        Some("float32".to_string())
-    } else if path.ends_with(".mvec") || path.ends_with(".mvecs") {
-        Some("float16".to_string())
-    } else if path.ends_with(".bvec") || path.ends_with(".bvecs") {
-        Some("uint8".to_string())
-    } else if path.ends_with(".ivec") || path.ends_with(".ivecs") {
-        Some("int32".to_string())
-    } else if path.ends_with(".npy") {
-        Some("numpy".to_string())
-    } else if path.ends_with(".hdf5") || path.ends_with(".h5") {
-        Some("hdf5".to_string())
-    } else {
-        None
-    }
+    use veks_core::formats::VecFormat;
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())?;
+    let fmt = VecFormat::from_extension(ext)?;
+    let name = match fmt {
+        VecFormat::Fvec => "float32",
+        VecFormat::Mvec => "float16",
+        VecFormat::Bvec => "uint8",
+        VecFormat::Ivec => "int32",
+        VecFormat::Dvec => "float64",
+        VecFormat::Svec => "int16",
+        VecFormat::Npy => "numpy",
+        VecFormat::Hdf5 => "hdf5",
+        VecFormat::Parquet => "parquet",
+        VecFormat::Slab => return None,
+    };
+    Some(name.to_string())
 }
 
 /// Rough estimate of total data bytes from base_count × dimension × element_size.

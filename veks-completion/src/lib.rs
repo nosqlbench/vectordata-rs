@@ -42,6 +42,8 @@ pub enum Node {
     /// A leaf command with option names and optional value providers.
     Leaf {
         options: Vec<String>,
+        /// Options that are boolean flags (no value expected).
+        flags: std::collections::HashSet<String>,
         /// Dynamic value providers keyed by option name (e.g., "--dataset").
         value_providers: BTreeMap<String, ValueProvider>,
     },
@@ -52,9 +54,10 @@ pub enum Node {
 impl std::fmt::Debug for Node {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Node::Leaf { options, value_providers } => {
+            Node::Leaf { options, flags, value_providers } => {
                 f.debug_struct("Leaf")
                     .field("options", options)
+                    .field("flags", flags)
                     .field("value_providers", &value_providers.keys().collect::<Vec<_>>())
                     .finish()
             }
@@ -66,10 +69,20 @@ impl std::fmt::Debug for Node {
 }
 
 impl Node {
-    /// Create a leaf node with the given option names.
+    /// Create a leaf node with the given option names (all assumed to take values).
     pub fn leaf(options: &[&str]) -> Self {
         Node::Leaf {
             options: options.iter().map(|s| s.to_string()).collect(),
+            flags: std::collections::HashSet::new(),
+            value_providers: BTreeMap::new(),
+        }
+    }
+
+    /// Create a leaf node with separate value-options and boolean flags.
+    pub fn leaf_with_flags(options: &[&str], flags: &[&str]) -> Self {
+        Node::Leaf {
+            options: options.iter().chain(flags.iter()).map(|s| s.to_string()).collect(),
+            flags: flags.iter().map(|s| s.to_string()).collect(),
             value_providers: BTreeMap::new(),
         }
     }
@@ -81,6 +94,14 @@ impl Node {
             value_providers.insert(option.to_string(), provider);
         }
         self
+    }
+
+    /// Check if an option is a boolean flag (no value expected).
+    pub fn is_flag(&self, option: &str) -> bool {
+        match self {
+            Node::Leaf { flags, .. } => flags.contains(option),
+            _ => false,
+        }
     }
 
     /// Create a group node from a list of `(name, child)` pairs.
@@ -250,12 +271,20 @@ pub fn complete(tree: &CommandTree, words: &[&str]) -> Vec<String> {
             });
             candidates
         }
-        Node::Leaf { options, value_providers } => {
-            // Check if the previous word is an option with a per-command
-            // or global value provider (e.g., user typed `--dataset <TAB>`)
+        Node::Leaf { options, flags, value_providers } => {
+            // Check if the previous word is an option expecting a value.
             if let Some(&prev_word) = remaining.last() {
-                if let Some(provider) = value_providers.get(prev_word) {
-                    return provider(partial);
+                if prev_word.starts_with("--") && !flags.contains(prev_word) {
+                    // Previous word is a value-taking option — check providers
+                    if let Some(provider) = value_providers.get(prev_word) {
+                        return provider(partial);
+                    }
+                    if let Some(provider) = tree.global_value_providers.get(prev_word) {
+                        return provider(partial);
+                    }
+                    // No provider — return empty so bash falls back to
+                    // file completion via -o bashdefault.
+                    return Vec::new();
                 }
             }
             if partial.starts_with('-') || partial.is_empty() {
@@ -332,9 +361,9 @@ pub fn print_bash_script(app_name: &str) {
     COMPREPLY=($({env_var}=bash _COMP_SHELL_PID=$$ "{completer}" -- "${{words[@]}}" 2>/dev/null))
 }}
 if [[ "${{BASH_VERSINFO[0]}}" -eq 4 && "${{BASH_VERSINFO[1]}}" -ge 4 || "${{BASH_VERSINFO[0]}}" -gt 4 ]]; then
-    complete -o bashdefault -o nosort -F _{app}_complete {app}
+    complete -o default -o bashdefault -o nosort -F _{app}_complete {app}
 else
-    complete -o bashdefault -F _{app}_complete {app}
+    complete -o default -o bashdefault -F _{app}_complete {app}
 fi
 "#,
         app = app_name,

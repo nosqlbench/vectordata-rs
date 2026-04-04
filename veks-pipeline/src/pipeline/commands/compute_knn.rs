@@ -101,7 +101,7 @@ impl Ord for Neighbor {
 /// Scans base vectors exactly once per batch, amortizing memory loads.
 /// Uses transposed SIMD kernels when available for the given metric.
 #[inline(never)]
-fn find_top_k_batch_f32(
+pub(super) fn find_top_k_batch_f32(
     queries: &[&[f32]],
     base_reader: &MmapVectorReader<f32>,
     start: usize,
@@ -168,7 +168,8 @@ fn find_top_k_batch_pairwise_f32(
 
     for (qi, heap) in heaps.into_iter().enumerate() {
         let mut v: Vec<Neighbor> = heap.into_vec();
-        v.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap_or(Ordering::Equal));
+        v.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap_or(Ordering::Equal)
+            .then(a.index.cmp(&b.index)));
         results[qi] = v;
     }
 }
@@ -200,10 +201,7 @@ fn find_top_k_batch_transposed_f32(
         .collect();
     let mut thresholds = vec![f32::INFINITY; batch_size];
 
-    // Use packed contiguous layout for DotProduct/Cosine (single sequential
-    // memory stream, L1-friendly). Other metrics use the legacy dual-pair path
-    // with separate TransposedBatch allocations.
-    let use_packed = metric == Metric::DotProduct || metric == Metric::Cosine;
+    let use_packed = simd_distance::metric_uses_packed_path(metric);
 
     // Packed path: single contiguous allocation, dimension-interleaved
     let packed = if use_packed {
@@ -218,7 +216,10 @@ fn find_top_k_batch_transposed_f32(
         Vec::new()
     };
 
-    // Legacy path: separate TransposedBatch allocations
+    // TransposedBatch path: pad to an even number of sub-batches so that
+    // all queries go through the dual-pair kernel exclusively. An odd
+    // trailing sub-batch would fall through to the single-batch kernel,
+    // which can produce subtly different f32 results for the same inputs.
     let mut sub_batches: Vec<TransposedBatch> = Vec::new();
     let mut sub_offsets: Vec<usize> = Vec::new();
     if !use_packed {
@@ -228,6 +229,11 @@ fn find_top_k_batch_transposed_f32(
             sub_batches.push(TransposedBatch::from_f32(&queries[offset..sub_end], dim));
             sub_offsets.push(offset);
             offset = sub_end;
+        }
+        if sub_batches.len() % 2 != 0 {
+            let empty: &[&[f32]] = &[];
+            sub_batches.push(TransposedBatch::from_f32(empty, dim));
+            sub_offsets.push(batch_size); // past end — count=0, no results consumed
         }
     }
     let dual_fn = simd_distance::select_dual_batched_fn_f32(metric);
@@ -311,7 +317,8 @@ fn find_top_k_batch_transposed_f32(
 
     for (qi, heap) in heaps.into_iter().enumerate() {
         let mut v: Vec<Neighbor> = heap.into_vec();
-        v.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap_or(Ordering::Equal));
+        v.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap_or(Ordering::Equal)
+            .then(a.index.cmp(&b.index)));
         results[qi] = v;
     }
 }
@@ -585,7 +592,8 @@ fn find_top_k_batch_pairwise_f16(
 
     for (qi, heap) in heaps.into_iter().enumerate() {
         let mut v: Vec<Neighbor> = heap.into_vec();
-        v.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap_or(Ordering::Equal));
+        v.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap_or(Ordering::Equal)
+            .then(a.index.cmp(&b.index)));
         results[qi] = v;
     }
 }
@@ -625,7 +633,7 @@ fn find_top_k_batch_transposed_f16(
     // Reusable f32 buffer for base vector conversion
     let mut base_f32 = vec![0.0f32; dim];
 
-    let use_packed = metric == Metric::DotProduct || metric == Metric::Cosine;
+    let use_packed = simd_distance::metric_uses_packed_path(metric);
 
     let packed = if use_packed {
         Some(PackedBatches::from_f16(queries, dim))
@@ -732,7 +740,8 @@ fn find_top_k_batch_transposed_f16(
 
     for (qi, heap) in heaps.into_iter().enumerate() {
         let mut v: Vec<Neighbor> = heap.into_vec();
-        v.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap_or(Ordering::Equal));
+        v.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap_or(Ordering::Equal)
+            .then(a.index.cmp(&b.index)));
         results[qi] = v;
     }
 }
@@ -1017,6 +1026,13 @@ fn write_partition_cache(
 /// For each query row, reads that row from every partition's cached ivec and
 /// fvec, collects all (index, distance) candidates, sorts by distance, and
 /// takes the top-K. Memory usage is O(num_partitions * k) per query.
+/// Merge all partition cache files into final output files.
+///
+/// Returns `(queries_with_ties, total_tied_neighbors)`:
+/// - `queries_with_ties`: number of queries where the k-th and (k+1)-th
+///   neighbor have the same distance (boundary tie)
+/// - `total_tied_neighbors`: total count of extra neighbors beyond k that
+///   share the boundary distance across all queries
 fn merge_partitions(
     partitions: &[PartitionMeta],
     indices_path: &Path,
@@ -1026,7 +1042,7 @@ fn merge_partitions(
     base_offset: usize,
     compress_cache: bool,
     ui: &veks_core::ui::UiHandle,
-) -> Result<(), String> {
+) -> Result<(usize, usize), String> {
     // Open all partition files
     let load_pb = ui.bar_with_unit(
         partitions.len() as u64,
@@ -1071,6 +1087,8 @@ fn merge_partitions(
     let mut ivec_row = vec![0u8; row_bytes];
     let mut fvec_row = vec![0u8; row_bytes];
 
+    let mut tie_count: usize = 0;
+    let mut tied_neighbors: usize = 0;
     let pb = make_query_progress_bar(query_count as u64, ui);
     for _qi in 0..query_count {
         // Collect candidates from all partitions
@@ -1109,8 +1127,25 @@ fn merge_partitions(
             }
         }
 
-        // Sort by distance ascending and take top-K
-        candidates.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap_or(Ordering::Equal));
+        // Sort by distance ascending, then by index ascending (lower index wins ties).
+        candidates.sort_by(|a, b| {
+            a.distance.partial_cmp(&b.distance).unwrap_or(Ordering::Equal)
+                .then(a.index.cmp(&b.index))
+        });
+
+        // Detect boundary ties: count how many candidates beyond k share
+        // the same distance as the k-th neighbor.
+        if candidates.len() > k {
+            let kth = candidates[k - 1].distance;
+            let extra = candidates[k..].iter()
+                .take_while(|c| c.distance == kth)
+                .count();
+            if extra > 0 {
+                tie_count += 1;
+                tied_neighbors += extra;
+            }
+        }
+
         candidates.truncate(k);
 
         // Write merged row to indices output
@@ -1154,7 +1189,7 @@ fn merge_partitions(
         dw.finish().map_err(|e| e.to_string())?;
     }
 
-    Ok(())
+    Ok((tie_count, tied_neighbors))
 }
 
 // -- CommandOp impl -----------------------------------------------------------
@@ -1322,11 +1357,12 @@ compare an ANN index's approximate results against this exact ground truth.
         // Use DotProduct kernel (no norm division) for both — faster and
         // numerically identical on unit vectors.
         let kernel_metric = if normalized && (metric == Metric::Cosine || metric == Metric::DotProduct) {
-            log::info!("vectors are normalized — using DotProduct kernel for {} metric", metric_str);
             Metric::DotProduct
         } else {
             metric
         };
+        // Display metric: show the user-facing metric, not the internal kernel
+        let display_metric = metric;
 
         let base_source = match resolve_source(base_str, &ctx.workspace) {
             Ok(s) => s,
@@ -1355,7 +1391,21 @@ compare an ANN index's approximate results against this exact ground truth.
             }
         }
 
-        let base_window = base_source.window;
+        // Window can come from inline notation (base=file.fvec[0,1M))
+        // or from a separate "range" option. The separate option takes
+        // precedence when the inline notation has no window.
+        let base_window = base_source.window.or_else(|| {
+            options.get("range").and_then(|r| {
+                let ds = vectordata::dataset::source::parse_source_string(
+                    &format!("_dummy{}", r)
+                ).ok()?;
+                if ds.window.is_empty() { return None; }
+                let interval = &ds.window.0[0];
+                let start = interval.min_incl as usize;
+                let end = if interval.max_excl == u64::MAX { usize::MAX } else { interval.max_excl as usize };
+                Some((start, end))
+            })
+        });
 
         // Detect element type from base file extension and dispatch
         let etype = match ElementType::from_path(&base_path) {
@@ -1372,6 +1422,7 @@ compare an ANN index's approximate results against this exact ground truth.
                     distances_path.as_deref(),
                     k,
                     kernel_metric,
+                    display_metric,
                     dist_fn,
                     threads,
                     partition_size,
@@ -1390,6 +1441,7 @@ compare an ANN index's approximate results against this exact ground truth.
                     distances_path.as_deref(),
                     k,
                     kernel_metric,
+                    display_metric,
                     dist_fn,
                     threads,
                     partition_size,
@@ -1408,6 +1460,7 @@ compare an ANN index's approximate results against this exact ground truth.
                     distances_path.as_deref(),
                     k,
                     kernel_metric,
+                    display_metric,
                     dist_fn,
                     threads,
                     partition_size,
@@ -1494,6 +1547,14 @@ compare an ANN index's approximate results against this exact ground truth.
                 description: "Gzip-compress partition cache files".to_string(),
                 role: OptionRole::Config,
         },
+            OptionDesc {
+                name: "allow_ties".to_string(),
+                type_name: "bool".to_string(),
+                required: false,
+                default: Some("false".to_string()),
+                description: "Allow boundary ties at rank k (non-deterministic ground truth). Default: error on ties.".to_string(),
+                role: OptionRole::Config,
+        },
         ]
     }
 
@@ -1515,6 +1576,7 @@ fn execute_f32(
     distances_path: Option<&Path>,
     k: usize,
     metric: Metric,
+    display_metric: Metric,
     dist_fn: fn(&[f32], &[f32]) -> f32,
     threads: usize,
     partition_size: usize,
@@ -1578,13 +1640,13 @@ fn execute_f32(
             "KNN: {} queries x {} base vectors (f32, dim={}, window=[{}..{})), k={}, metric={:?}, threads={}, simd={}, batch={}",
             format_count(query_count), format_count(base_count), base_dim,
             format_count(base_offset), format_count(base_offset + base_count),
-            k, metric, threads, simd_distance::simd_level(), batched_mode
+            k, display_metric, threads, simd_distance::simd_level(), batched_mode
         ));
     } else {
         ctx.ui.log(&format!(
             "KNN: {} queries x {} base vectors (f32, dim={}), k={}, metric={:?}, threads={}, simd={}, batch={}",
             format_count(query_count), format_count(base_count), base_dim,
-            k, metric, threads, simd_distance::simd_level(), batched_mode
+            k, display_metric, threads, simd_distance::simd_level(), batched_mode
         ));
     }
     ctx.ui.log(&format!(
@@ -1606,6 +1668,7 @@ fn execute_f32(
         distances_path,
         k,
         metric,
+        display_metric,
         dist_fn,
         threads,
         partition_size,
@@ -1628,6 +1691,7 @@ fn execute_f16(
     distances_path: Option<&Path>,
     k: usize,
     metric: Metric,
+    display_metric: Metric,
     dist_fn: fn(&[half::f16], &[half::f16]) -> f32,
     threads: usize,
     partition_size: usize,
@@ -1691,13 +1755,13 @@ fn execute_f16(
             "KNN: {} queries x {} base vectors (f16, dim={}, window=[{}..{})), k={}, metric={:?}, threads={}, simd={}, batch={}",
             format_count(query_count), format_count(base_count), base_dim,
             format_count(base_offset), format_count(base_offset + base_count),
-            k, metric, threads, simd_distance::simd_level(), batched_mode
+            k, display_metric, threads, simd_distance::simd_level(), batched_mode
         ));
     } else {
         ctx.ui.log(&format!(
             "KNN: {} queries x {} base vectors (f16, dim={}), k={}, metric={:?}, threads={}, simd={}, batch={}",
             format_count(query_count), format_count(base_count), base_dim,
-            k, metric, threads, simd_distance::simd_level(), batched_mode
+            k, display_metric, threads, simd_distance::simd_level(), batched_mode
         ));
     }
     ctx.ui.log(&format!(
@@ -1719,6 +1783,7 @@ fn execute_f16(
         distances_path,
         k,
         metric,
+        display_metric,
         dist_fn,
         threads,
         partition_size,
@@ -1741,6 +1806,7 @@ fn execute_f64(
     distances_path: Option<&Path>,
     k: usize,
     metric: Metric,
+    display_metric: Metric,
     dist_fn: fn(&[f64], &[f64]) -> f32,
     threads: usize,
     partition_size: usize,
@@ -1813,6 +1879,7 @@ fn execute_f64(
         distances_path,
         k,
         metric,
+        display_metric,
         dist_fn,
         threads,
         partition_size,
@@ -1843,6 +1910,7 @@ fn execute_with_partitions<T>(
     distances_path: Option<&Path>,
     k: usize,
     metric: Metric,
+    display_metric: Metric,
     dist_fn: fn(&[T], &[T]) -> f32,
     threads: usize,
     partition_size: usize,
@@ -2205,7 +2273,7 @@ where
             format_count(part.start), format_count(part.end),
             format_count(query_count), format_count(part_size),
             format_bytes(part_bytes),
-            metric,
+            display_metric,
             computed, to_compute,
         ));
 
@@ -2238,7 +2306,7 @@ where
         let pb = ctx.ui.bar_with_unit(
             part_base_count,
             &format!("KNN {:?} {}x{} {} base x {} queries [{},{})",
-                metric, dim, elem_label,
+                display_metric, dim, elem_label,
                 format_count(part_size), format_count(query_count),
                 format_count(part.start), format_count(part.end)),
             "vectors",
@@ -2419,7 +2487,7 @@ where
     // Phase 3: Merge
     ctx.ui.log(&format!("  merging {} partitions ({} queries)...", num_partitions, query_count));
 
-    if let Err(e) = merge_partitions(
+    let (tie_count, tied_neighbors) = match merge_partitions(
         &partitions,
         indices_path,
         distances_path,
@@ -2429,7 +2497,44 @@ where
         compress_cache,
         &ctx.ui,
     ) {
-        return error_result(format!("merge failed: {}", e), start);
+        Ok(v) => v,
+        Err(e) => return error_result(format!("merge failed: {}", e), start),
+    };
+
+    // Save tie metrics as variables so they are visible in dataset metadata.
+    let _ = crate::pipeline::variables::set_and_save(
+        &ctx.workspace, "knn_queries_with_ties", &tie_count.to_string());
+    ctx.defaults.insert("knn_queries_with_ties".into(), tie_count.to_string());
+    let _ = crate::pipeline::variables::set_and_save(
+        &ctx.workspace, "knn_tied_neighbors", &tied_neighbors.to_string());
+    ctx.defaults.insert("knn_tied_neighbors".into(), tied_neighbors.to_string());
+
+    // Boundary tie detection: queries where the k-th and (k+1)-th
+    // neighbors have identical distances, making the ground truth
+    // non-deterministic. Error by default; allow_ties=true downgrades
+    // to a warning.
+    if tie_count > 0 {
+        let allow_ties = ctx.defaults.get("allow_ties")
+            .map(|v| v == "true")
+            .unwrap_or(false);
+        if allow_ties {
+            ctx.ui.log(&format!(
+                "  Warning: {} of {} queries have boundary ties at k={} \
+                 ({} extra tied neighbors) — ground truth may be non-deterministic",
+                tie_count, query_count, k, tied_neighbors,
+            ));
+        } else {
+            return error_result(
+                format!(
+                    "{} of {} queries have boundary ties at k={} ({} extra tied \
+                     neighbors): the k-th and (k+1)-th neighbors have identical \
+                     distances, making ground truth non-deterministic. Set \
+                     allow_ties=true to proceed.",
+                    tie_count, query_count, k, tied_neighbors,
+                ),
+                start,
+            );
+        }
     }
 
     // Save merged result as a cache partition covering the full range.
@@ -2477,7 +2582,7 @@ where
         status: Status::Ok,
         message: format!(
             "computed KNN: {} queries, k={}, metric={:?}, {} base vectors ({} partitions)",
-            query_count, k, metric, base_count, num_partitions
+            query_count, k, display_metric, base_count, num_partitions
         ),
         produced,
         elapsed: start.elapsed(),
@@ -2679,6 +2784,7 @@ mod tests {
             governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
             ui: veks_core::ui::UiHandle::new(std::sync::Arc::new(veks_core::ui::TestSink::new())),
             status_interval: std::time::Duration::from_secs(1),
+            estimated_total_steps: 0,
         }
     }
 
@@ -2874,6 +2980,10 @@ mod tests {
         let mut knn_ref = ComputeKnnOp;
         let r = knn_ref.execute(&opts_ref, &mut ctx);
         assert_eq!(r.status, Status::Ok);
+
+        // Clear cache from the reference run so the partitioned run computes
+        // from scratch rather than reusing the full-range super-partition.
+        let _ = std::fs::remove_dir_all(workspace.join(".cache"));
 
         // Partitioned computation (partition_size=10 → 5 partitions)
         let part_idx = workspace.join("part.ivec");

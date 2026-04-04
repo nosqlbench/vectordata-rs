@@ -16,6 +16,7 @@ use crate::formats::VecFormat;
 // ---------------------------------------------------------------------------
 
 /// Arguments for `datasets import`.
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct ImportArgs {
     pub name: String,
     pub output: PathBuf,
@@ -75,6 +76,30 @@ pub struct ImportArgs {
     /// Lower values produce harder predicates (fewer qualifying neighbors).
     /// Default 0.0001 means ~0.01% of base vectors match each predicate.
     pub selectivity: f64,
+    /// Classic layout: store all artifacts in the dataset root directory
+    /// instead of `profiles/base/` and `profiles/default/`. Simpler layout
+    /// compatible with ann-benchmarks tooling.
+    pub classic: bool,
+}
+
+impl ImportArgs {
+    /// Path prefix for the base/default profile artifacts.
+    /// Classic mode: `""` (root). Standard mode: `"profiles/base/"`.
+    fn profile_prefix(&self) -> &str {
+        if self.classic { "" } else { "profiles/base/" }
+    }
+
+    /// Path prefix for the default profile (computed artifacts like KNN).
+    /// Classic mode: `""`. Standard mode: `"profiles/default/"`.
+    fn default_prefix(&self) -> &str {
+        if self.classic { "" } else { "profiles/default/" }
+    }
+
+    /// Profile path template variable for sized profiles.
+    /// Classic mode: `""`. Standard mode: `"profiles/${profile}/"`.
+    fn sized_prefix(&self) -> &str {
+        if self.classic { "" } else { "profiles/${profile}/" }
+    }
 }
 
 /// Canonical facet code definitions.
@@ -101,6 +126,9 @@ pub const FACET_CODES: &[(&str, char, &str)] = &[
 /// - Full facet names like `"base_vectors,query_vectors"`
 pub fn parse_facet_spec(spec: &str) -> String {
     let spec = spec.trim();
+
+    // Strip leading '=' that can appear from shell quoting like --flag ="value"
+    let spec = spec.strip_prefix('=').unwrap_or(spec);
 
     // If it's all uppercase letters from BQGDMPRF, treat as compact codes
     if !spec.is_empty()
@@ -250,10 +278,13 @@ struct PipelineSlots {
 
 /// Resolve all slots from user-provided inputs.
 ///
+/// Path prefixes for profile artifacts are controlled by `args.classic`.
+///
 /// All input paths are relativized to the output directory so that
 /// dataset.yaml never contains absolute paths (SRD requirement).
 fn resolve_slots(args: &ImportArgs) -> PipelineSlots {
     let output_dir = &args.output;
+    let pp = args.profile_prefix();
     let facets = resolve_facets(args);
     let has_base_facet = facets.contains('B');
 
@@ -304,16 +335,11 @@ fn resolve_slots(args: &ImportArgs) -> PipelineSlots {
         }
     };
 
-    let zero_check = if !has_base_facet || args.no_zero_check {
-        Artifact::Identity { path: String::new() }
-    } else {
-        Artifact::Materialized {
-            step_id: "find-zeros".into(),
-            output: "${cache}/zero_ordinals.ivec".into(),
-        }
-    };
+    // Near-zero detection is integrated into extract-base (SRD §19).
+    // No separate zero_check step — the extract step handles it inline.
+    let zero_check = Artifact::Identity { path: String::new() };
 
-    let clean_ordinals = if !has_base_facet || (args.no_dedup && args.no_zero_check) {
+    let clean_ordinals = if !has_base_facet || args.no_dedup {
         Artifact::Identity { path: String::new() }
     } else {
         Artifact::Materialized {
@@ -339,11 +365,13 @@ fn resolve_slots(args: &ImportArgs) -> PipelineSlots {
     let self_search = wants_queries && !has_separate_query;
     let has_queries = has_separate_query || self_search;
 
-    // Determine output extension from source format
+    // Determine output extension from source format, canonicalized to the
+    // preferred short form (e.g. "fvecs" → "fvec").
     let vec_ext = if needs_import { import_ext } else {
         args.base_vectors.as_ref()
             .and_then(|p| p.extension())
             .and_then(|e| e.to_str())
+            .and_then(VecFormat::canonical_extension)
             .unwrap_or("fvec")
     };
 
@@ -355,11 +383,11 @@ fn resolve_slots(args: &ImportArgs) -> PipelineSlots {
         };
         let qv = Artifact::Materialized {
             step_id: "extract-queries".into(),
-            output: format!("profiles/base/query_vectors.{}", vec_ext),
+            output: format!("{}query_vectors.{}", pp, vec_ext),
         };
         let bv = Artifact::Materialized {
             step_id: "extract-base".into(),
-            output: format!("profiles/base/base_vectors.{}", vec_ext),
+            output: format!("{}base_vectors.{}", pp, vec_ext),
         };
         let bc = Artifact::Materialized {
             step_id: "count-base".into(),
@@ -367,34 +395,42 @@ fn resolve_slots(args: &ImportArgs) -> PipelineSlots {
         };
         (Some(shuffle), Some(qv), bv, Some(bc))
     } else if has_separate_query {
-        // Separate query file
+        // Separate query file.
+        // The profile exposes query_vectors (the canonical facet name)
+        // which is produced by the overlap removal step. The pre-overlap
+        // raw queries go to query_vectors_raw in the same directory.
         let query_source = args.query_vectors.as_ref().unwrap();
-        let qv = if is_native_xvec_file(query_source) {
-            let ext = query_source.extension()
-                .map(|e| e.to_string_lossy().to_string())
-                .unwrap_or_else(|| "fvec".to_string());
-            Artifact::Identity { path: format!("profiles/base/query_vectors.{}", ext) }
+        let qv_ext = if is_native_xvec_file(query_source) {
+            query_source.extension()
+                .and_then(|e| e.to_str())
+                .and_then(VecFormat::canonical_extension)
+                .unwrap_or("fvec")
         } else {
-            Artifact::Materialized {
-                step_id: "convert-queries".into(),
-                output: format!("profiles/base/query_vectors.{}", vec_ext),
-            }
+            vec_ext
         };
-        // Base: when import was needed (HDF5, npy, etc.), extract from
-        // the converted all_vectors to the profile path. When native xvec,
-        // use a symlink (Identity).
-        let bv = if needs_import {
+        let qv = Artifact::Materialized {
+            step_id: "remove-query-duplicates".into(),
+            output: format!("{}query_vectors.{}", pp, qv_ext),
+        };
+        // Base: extract from all_vectors when import was needed (HDF5, npy)
+        // OR when dedup/zero-check is active (native xvec with duplicates).
+        // In both cases, the extract-base step applies clean_ordinals to
+        // produce a deduped base_vectors file. Without this, KNN would scan
+        // the original file including duplicates, causing exact distance
+        // ties that make ground truth non-deterministic.
+        let needs_extraction = needs_import || !(args.no_dedup && args.no_zero_check);
+        let bv = if needs_extraction {
             Artifact::Materialized {
                 step_id: "extract-base".into(),
-                output: format!("profiles/base/base_vectors.{}", vec_ext),
+                output: format!("{}base_vectors.{}", pp, vec_ext),
             }
         } else {
-            Artifact::Identity { path: format!("profiles/base/base_vectors.{}", vec_ext) }
+            Artifact::Identity { path: format!("{}base_vectors.{}", pp, vec_ext) }
         };
         (None, Some(qv), bv, None)
     } else {
         // No queries at all — use canonical profile path (symlinked)
-        let bv = Artifact::Identity { path: format!("profiles/base/base_vectors.{}", vec_ext) };
+        let bv = Artifact::Identity { path: format!("{}base_vectors.{}", pp, vec_ext) };
         (None, None, bv, None)
     };
 
@@ -416,11 +452,11 @@ fn resolve_slots(args: &ImportArgs) -> PipelineSlots {
         let metadata_content = if self_search {
             Artifact::Materialized {
                 step_id: "extract-metadata".into(),
-                output: "profiles/base/metadata_content.slab".into(),
+                output: format!("{}metadata_content.slab", pp),
             }
         } else {
             // Canonical profile path — symlinked to source during import
-            Artifact::Identity { path: "profiles/base/metadata_content.slab".into() }
+            Artifact::Identity { path: format!("{}metadata_content.slab", pp) }
         };
 
         let survey = Artifact::Materialized {
@@ -429,7 +465,7 @@ fn resolve_slots(args: &ImportArgs) -> PipelineSlots {
         };
         let predicates = Artifact::Materialized {
             step_id: "generate-predicates".into(),
-            output: "profiles/base/predicates.slab".into(),
+            output: format!("{}predicates.slab", pp),
         };
         let predicate_indices = Artifact::Materialized {
             step_id: "evaluate-predicates".into(),
@@ -506,6 +542,7 @@ impl Default for Step {
 /// Walk the resolved slots and emit pipeline steps for materialized slots.
 fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path::Path) -> Vec<Step> {
     let mut steps = Vec::new();
+    let pp = args.profile_prefix();
     // Make source paths relative to the output directory when possible,
     // so the dataset.yaml is portable.
     let base_source = args.base_vectors.as_ref()
@@ -561,6 +598,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
         let ext = args.base_vectors.as_ref()
             .and_then(|p| p.extension())
             .and_then(|e| e.to_str())
+            .and_then(VecFormat::canonical_extension)
             .unwrap_or("fvec");
         let subset_output = format!("${{cache}}/all_vectors.{}", ext);
         steps.push(Step {
@@ -610,6 +648,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
         let ext = args.base_vectors.as_ref()
             .and_then(|p| p.extension())
             .and_then(|e| e.to_str())
+            .and_then(VecFormat::canonical_extension)
             .unwrap_or("fvec");
         format!("${{cache}}/all_vectors.{}", ext)
     } else {
@@ -672,44 +711,10 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
         });
     }
 
-    // zero-check
-    if let Artifact::Materialized { .. } = &slots.zero_check {
-        let mut after = vec![];
-        if slots.sort.is_materialized() {
-            after.push("sort-and-dedup".into());
-        } else if !last_vector_step.is_empty() {
-            after.push(last_vector_step.into());
-        }
-        steps.push(Step {
-            id: "find-zeros".into(),
-            run: "analyze zeros".into(),
-            description: Some("Binary search sorted index for zero vector".into()),
-            after,
-            per_profile: false,
-            phase: 0,
-            options: vec![
-                ("source".into(), working_vectors.clone()),
-                ("index".into(), slots.sort.path().into()),
-                ("output".into(), "${cache}/zero_ordinals.ivec".into()),
-            ],
-        });
-    }
-
-    // set-zero-count (after zero-check, records number of zero vectors removed)
-    if slots.zero_check.is_materialized() {
-        steps.push(Step {
-            id: "count-zeros".into(),
-            run: "state set".into(),
-            description: None,
-            after: vec!["find-zeros".into()],
-            per_profile: false,
-            phase: 0,
-            options: vec![
-                ("name".into(), "zero_count".into()),
-                ("value".into(), "count:${cache}/zero_ordinals.ivec".into()),
-            ],
-        });
-    }
+    // Near-zero detection is now integrated into extract-base (SRD §19).
+    // The extract step computes L2 norms for normalization and skips vectors
+    // below the threshold, writing zero_ordinals.ivec as a byproduct.
+    // No separate find-zeros or count-zeros steps are needed.
 
     // clean-ordinals
     if let Artifact::Materialized { .. } = &slots.clean_ordinals {
@@ -717,20 +722,19 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
         if slots.sort.is_materialized() {
             after.push("sort-and-dedup".into());
         }
-        if slots.zero_check.is_materialized() {
-            after.push("find-zeros".into());
-        }
+        // Zero detection is now in extract-base, so filter-ordinals
+        // only excludes duplicates. Near-zero vectors are filtered
+        // during extraction when L2 norms are computed for normalization.
         steps.push(Step {
             id: "filter-ordinals".into(),
             run: "transform ordinals".into(),
-            description: Some("Filter sorted ordinals excluding duplicates and zeros".into()),
+            description: Some("Filter sorted ordinals excluding duplicates".into()),
             after,
             per_profile: false,
             phase: 0,
             options: vec![
                 ("source".into(), slots.sort.path().into()),
                 ("duplicates".into(), "${cache}/dedup_duplicates.ivec".into()),
-                ("zeros".into(), slots.zero_check.path().into()),
                 ("output".into(), "${cache}/clean_ordinals.ivec".into()),
             ],
         });
@@ -845,7 +849,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
                 let mut query_opts = vec![
                     ("source".into(), working_vectors.clone()),
                     ("ivec-file".into(), "${cache}/shuffle.ivec".into()),
-                    ("output".into(), slots.query_vectors.as_ref().map(|q| q.path().to_string()).unwrap_or_else(|| "profiles/base/query_vectors.fvec".into())),
+                    ("output".into(), slots.query_vectors.as_ref().map(|q| q.path().to_string()).unwrap_or_else(|| format!("{}query_vectors.fvec", pp))),
                     ("range".into(), "[0,${query_count})".into()),
                 ];
                 if args.normalize {
@@ -935,15 +939,26 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
                 per_profile: false,
                 phase: 0,
                 options: vec![
-                    ("facet".into(), "query_vectors".into()),
+                    ("facet".into(), "query_vectors_raw".into()),
                     ("source".into(), relativize_path(query_source, &args.output)),
                     ("from".into(), format),
-                    ("output".into(), qv.path().into()),
+                    // Write to _raw so the overlap step can produce the final query_vectors
+                    ("output".into(), {
+                        let p = std::path::Path::new(qv.path());
+                        let dir = p.parent().map(|d| d.to_string_lossy().to_string()).unwrap_or_default();
+                        let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("fvec");
+                        if dir.is_empty() {
+                            format!("query_vectors_raw.{}", ext)
+                        } else {
+                            format!("{}/query_vectors_raw.{}", dir, ext)
+                        }
+                    }),
                 ],
             });
         }
-        // When base needed import (HDF5, npy, etc.) with separate queries,
-        // extract the converted all_vectors to the profile path.
+        // Extract base vectors to the profile path when materialized:
+        // - HDF5/npy sources: extract from converted all_vectors
+        // - Native xvec with dedup: extract clean subset via clean_ordinals
         if slots.base_vectors.is_materialized() {
             let working = slots.all_vectors.path();
             let after = if slots.clean_ordinals.is_materialized() {
@@ -1056,7 +1071,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
                 options: vec![
                     ("source".into(), meta.metadata_all.path().into()),
                     ("ivec-file".into(), "${cache}/shuffle.ivec".into()),
-                    ("output".into(), "profiles/base/metadata_content.slab".into()),
+                    ("output".into(), format!("{}metadata_content.slab", pp)),
                     ("range".into(), if args.base_fraction < 1.0 && !subset_applied {
                         "[${query_count},${base_end})".into()
                     } else if slots.clean_ordinals.is_materialized() {
@@ -1100,7 +1115,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
             options: vec![
                 ("input".into(), meta.metadata_all.path().into()),
                 ("survey".into(), "${cache}/metadata_survey.json".into()),
-                ("output".into(), "profiles/base/predicates.slab".into()),
+                ("output".into(), format!("{}predicates.slab", pp)),
                 ("count".into(), "10000".into()),
                 ("selectivity".into(), args.selectivity.to_string()),
                 ("seed".into(), format!("${{{}}}", "seed")),
@@ -1121,7 +1136,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
             phase: 1, // after all compute-knn — metadata I/O phase
             options: vec![
                 ("input".into(), meta.metadata_content.path().into()),
-                ("predicates".into(), "profiles/base/predicates.slab".into()),
+                ("predicates".into(), format!("{}predicates.slab", pp)),
                 ("survey".into(), "${cache}/metadata_survey.json".into()),
                 ("selectivity".into(), args.selectivity.to_string()),
                 ("range".into(), if slots.base_count.is_some() {
@@ -1158,6 +1173,8 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
             let mut after = vec![];
             if slots.base_count.is_some() {
                 after.push("count-base".into());
+            } else if slots.base_vectors.is_materialized() {
+                after.push("extract-base".into());
             }
             if slots.all_vectors.is_materialized() {
                 after.push("convert-vectors".into());
@@ -1168,6 +1185,48 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
                     after.push(qid.into());
                 }
             }
+
+            // Remove any query vectors that overlap with the base set.
+            // Skipped for self-search: dedup + shuffle + split guarantees
+            // disjointness by construction.
+            // The output goes to a separate file so the original query file
+            // is never modified (directional pipeline model).
+            let query_path_for_knn = if !slots.self_search {
+                let base_path_for_overlap = if slots.base_count.is_some() {
+                    format!("{}[0..${{base_count}})", slots.base_vectors.path())
+                } else {
+                    slots.base_vectors.path().to_string()
+                };
+                // The final query_vectors path (canonical facet name)
+                let final_query_path = slots.query_vectors.as_ref().unwrap().path().to_string();
+                // The raw input: query_vectors_raw in the same directory
+                let p = std::path::Path::new(&final_query_path);
+                let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("fvec");
+                let dir = p.parent().map(|d| d.to_string_lossy().to_string()).unwrap_or_default();
+                let raw_query_path = if dir.is_empty() {
+                    format!("query_vectors_raw.{}", ext)
+                } else {
+                    format!("{}/query_vectors_raw.{}", dir, ext)
+                };
+                steps.push(Step {
+                    id: "remove-query-duplicates".into(),
+                    run: "cleanup overlap".into(),
+                    description: Some("Remove query vectors that are duplicates of base vectors".into()),
+                    after: after.clone(),
+                    per_profile: false,
+                    phase: 0,
+                    options: vec![
+                        ("base".into(), base_path_for_overlap),
+                        ("query".into(), raw_query_path),
+                        ("output".into(), final_query_path.clone()),
+                    ],
+                });
+                after.push("remove-query-duplicates".into());
+                final_query_path
+            } else {
+                slots.query_vectors.as_ref().unwrap().path().to_string()
+            };
+
             steps.push(Step {
                 id: "compute-knn".into(),
                 run: "compute knn".into(),
@@ -1182,7 +1241,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
                         } else {
                             slots.base_vectors.path().to_string()
                         }),
-                        ("query".into(), slots.query_vectors.as_ref().unwrap().path().into()),
+                        ("query".into(), query_path_for_knn.clone()),
                         ("indices".into(), "neighbor_indices.ivec".into()),
                         ("distances".into(), "neighbor_distances.fvec".into()),
                         ("neighbors".into(), args.neighbors.to_string()),
@@ -1290,7 +1349,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
                     ("base".into(), slots.base_vectors.path().into()),
                     ("query".into(), slots.query_vectors.as_ref().unwrap().path().into()),
                     ("metadata".into(), slots.metadata.as_ref().unwrap().metadata_content.path().into()),
-                    ("predicates".into(), "profiles/base/predicates.slab".into()),
+                    ("predicates".into(), format!("{}predicates.slab", pp)),
                     ("metric".into(), args.metric.clone()),
                     ("normalized".into(), if args.normalize { "true" } else { "false" }.into()),
                     ("sample".into(), "50".into()),
@@ -1308,7 +1367,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
                 phase: 0,
                 options: vec![
                     ("metadata".into(), slots.metadata.as_ref().unwrap().metadata_content.path().into()),
-                    ("predicates".into(), "profiles/base/predicates.slab".into()),
+                    ("predicates".into(), format!("{}predicates.slab", pp)),
                     ("sample".into(), "50".into()),
                     ("metadata-sample".into(), "100000".into()),
                     ("seed".into(), format!("${{{}}}", "seed")),
@@ -1318,51 +1377,66 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
         }
     }
 
-    // ── Catalog generation ──────────────────────────────────────────
-    // Generates catalog.json and catalog.yaml for the local dataset
-    // directory so the dataset is discoverable by catalog queries.
-    let mut catalog_after = Vec::new();
+    // ── dataset.json ──────────────────────────────────────────────
+    // Generate a JSON copy of dataset.yaml for clients that prefer JSON.
+    // Runs before merkle so the JSON file gets merkle coverage.
+    let mut json_after = Vec::new();
     if let Some(ref knn) = slots.knn {
         if knn.is_materialized() || needs_computed_knn {
-            catalog_after.push("verify-knn".into());
+            json_after.push("verify-knn".into());
         }
     }
     if let Some(ref fknn) = slots.filtered_knn {
         if fknn.is_materialized() {
-            catalog_after.push("verify-filtered-knn".into());
-            catalog_after.push("verify-predicates".into());
+            json_after.push("verify-filtered-knn".into());
+            json_after.push("verify-predicates".into());
         }
     }
-    if catalog_after.is_empty() {
+    if json_after.is_empty() {
         if let Some(last) = steps.last() {
-            catalog_after.push(last.id.clone());
+            json_after.push(last.id.clone());
         }
     }
     steps.push(Step {
-        id: "generate-catalog".into(),
-        run: "catalog generate".into(),
-        description: Some("Generate catalog index for the dataset directory".into()),
-        after: catalog_after,
+        id: "generate-dataset-json".into(),
+        run: "generate dataset-json".into(),
+        description: Some("Generate dataset.json from dataset.yaml".into()),
+        after: json_after,
         per_profile: false,
-        phase: 0, // not per-profile, depends on verify steps via after
-        options: vec![
-            ("input".into(), ".".into()),
-        ],
+        phase: 0,
+        options: vec![],
     });
 
     // ── Merkle hash trees ────────────────────────────────────────
-    // MUST be the very last pipeline step — after catalog generation —
-    // so that catalog.json and catalog.yaml get .mref files too.
+    // Runs before catalog generation so that all data files have
+    // .mref hashes before the catalog snapshot is taken.
     steps.push(Step {
         id: "generate-merkle".into(),
         run: "merkle create".into(),
         description: Some("Create merkle hash trees for all publishable data files".into()),
-        after: vec!["generate-catalog".into()],
+        after: vec!["generate-dataset-json".into()],
         per_profile: false,
         phase: 0,
         options: vec![
             ("source".into(), ".".into()),
             ("min-size".into(), "0".into()),
+        ],
+    });
+
+    // ── Catalog generation ──────────────────────────────────────────
+    // MUST be the very last pipeline step — after merkle creation —
+    // so the catalog reflects the final dataset state. The catalog
+    // covers the full publish tree (all sibling datasets), not just
+    // the current one.
+    steps.push(Step {
+        id: "generate-catalog".into(),
+        run: "catalog generate".into(),
+        description: Some("Generate catalog index for the dataset directory".into()),
+        after: vec!["generate-merkle".into()],
+        per_profile: false,
+        phase: 0,
+        options: vec![
+            ("input".into(), ".".into()),
         ],
     });
 
@@ -1399,21 +1473,21 @@ fn profile_views(slots: &PipelineSlots, args: &ImportArgs, output_dir: &std::pat
                 }
             }
             Artifact::Materialized { .. } => {
-                views.push(("neighbor_indices".into(), "profiles/default/neighbor_indices.ivec".into()));
-                views.push(("neighbor_distances".into(), "profiles/default/neighbor_distances.fvec".into()));
+                views.push(("neighbor_indices".into(), format!("{}neighbor_indices.ivec", args.default_prefix())));
+                views.push(("neighbor_distances".into(), format!("{}neighbor_distances.fvec", args.default_prefix())));
             }
         }
     }
 
     if let Some(ref meta) = slots.metadata {
-        views.push(("metadata_indices".into(), "profiles/default/metadata_indices.slab".into()));
+        views.push(("metadata_indices".into(), format!("{}metadata_indices.slab", args.default_prefix())));
         let _ = &meta.predicate_indices; // used by per_profile steps
     }
 
     if let Some(ref fknn) = slots.filtered_knn {
         if fknn.is_materialized() {
-            views.push(("filtered_neighbor_indices".into(), "profiles/default/filtered_neighbor_indices.ivec".into()));
-            views.push(("filtered_neighbor_distances".into(), "profiles/default/filtered_neighbor_distances.fvec".into()));
+            views.push(("filtered_neighbor_indices".into(), format!("{}filtered_neighbor_indices.ivec", args.default_prefix())));
+            views.push(("filtered_neighbor_distances".into(), format!("{}filtered_neighbor_distances.fvec", args.default_prefix())));
         }
     }
 
@@ -1517,7 +1591,7 @@ fn generate_yaml(
                 out.push_str(&format!("      {}: \"{}:${{range}}\"\n", facet, path));
                 sized_facets_written.insert(facet.as_str());
             } else if per_profile {
-                if path.contains("profiles/") {
+                if !args.classic && path.contains("profiles/") {
                     let templatized = path.replace("profiles/default/", "profiles/${profile}/");
                     out.push_str(&format!("      {}: \"{}\"\n", facet, templatized));
                     sized_facets_written.insert(facet.as_str());
@@ -1535,10 +1609,12 @@ fn generate_yaml(
         let has_compute_knn = steps.iter().any(|s| s.id == "compute-knn");
         if has_compute_knn {
             if !sized_facets_written.contains("neighbor_indices") {
-                out.push_str("      neighbor_indices: \"profiles/${profile}/neighbor_indices.ivec\"\n");
+                let sp = args.sized_prefix();
+                out.push_str(&format!("      neighbor_indices: \"{}neighbor_indices.ivec\"\n", sp));
             }
             if !sized_facets_written.contains("neighbor_distances") {
-                out.push_str("      neighbor_distances: \"profiles/${profile}/neighbor_distances.fvec\"\n");
+                let sp = args.sized_prefix();
+                out.push_str(&format!("      neighbor_distances: \"{}neighbor_distances.fvec\"\n", sp));
             }
         }
     }
@@ -1561,6 +1637,24 @@ pub fn run(mut args: ImportArgs) {
         if !p.contains('G') { args.ground_truth = None; }
         if !p.contains('D') { args.ground_truth_distances = None; }
         if !p.contains('M') { args.metadata = None; }
+
+        // Validate that the source data actually provides the declared facets.
+        let mut missing = Vec::new();
+        if p.contains('B') && args.base_vectors.is_none() { missing.push("B (base vectors)"); }
+        if p.contains('Q') && args.query_vectors.is_none() { missing.push("Q (query vectors)"); }
+        if p.contains('G') && args.ground_truth.is_none() { missing.push("G (ground truth)"); }
+        if p.contains('D') && args.ground_truth_distances.is_none() { missing.push("D (distances)"); }
+        if p.contains('M') && args.metadata.is_none() { missing.push("M (metadata)"); }
+        if !missing.is_empty() {
+            eprintln!("Error: --provided-facets declares {} but no matching inputs were found:",
+                provided);
+            for m in &missing {
+                eprintln!("  - {}", m);
+            }
+            eprintln!("Provide the missing inputs via CLI flags (--base-vectors, --query-vectors, etc.)");
+            eprintln!("or remove the unmatched facets from --provided-facets.");
+            std::process::exit(1);
+        }
     }
 
     let output_dir = &args.output;
@@ -1658,7 +1752,7 @@ pub fn run(mut args: ImportArgs) {
     // When a source file is already in native format (no import/extract needed),
     // the profile view points to profiles/base/<facet>.<ext> and a symlink is
     // created there pointing to the actual source file.
-    create_identity_symlinks(output_dir, &args);
+    create_identity_symlinks(output_dir, &args, &slots);
 
     // Write import provenance to dataset.log
     write_import_log(output_dir, &args, &slots, steps.len());
@@ -1685,40 +1779,50 @@ pub fn run(mut args: ImportArgs) {
 // ---------------------------------------------------------------------------
 
 /// Create symlinks in `profiles/base/` for source files that are used as-is
-/// (Identity artifacts). This ensures the canonical profile structure exists
-/// even when no import/extract step runs, so all profile views point to
-/// paths under `profiles/base/` rather than raw source paths.
-fn create_identity_symlinks(output_dir: &std::path::Path, args: &ImportArgs) {
-    let base_dir = output_dir.join("profiles/base");
+/// (Identity artifacts). Only creates symlinks for Identity artifacts —
+/// Materialized artifacts will be created by pipeline steps and must NOT
+/// have symlinks that point to source data (writes through symlinks
+/// would destroy the original data).
+fn create_identity_symlinks(output_dir: &std::path::Path, args: &ImportArgs, slots: &PipelineSlots) {
+    // In classic mode, symlinks go directly in the dataset root
+    let base_dir = if args.classic {
+        output_dir.to_path_buf()
+    } else {
+        output_dir.join("profiles/base")
+    };
     if let Err(e) = std::fs::create_dir_all(&base_dir) {
-        eprintln!("Warning: failed to create profiles/base/: {}", e);
+        eprintln!("Warning: failed to create {}: {}", base_dir.display(), e);
         return;
     }
 
     let self_search = args.query_vectors.is_none()
         && (args.self_search || args.base_vectors.is_some());
 
-    // Base vectors: symlink when not self-search (identity to source)
-    if !self_search {
+    // Base vectors: symlink ONLY when Identity (not Materialized).
+    // When Materialized, the extract-base step will create the file.
+    if !self_search && !slots.base_vectors.is_materialized() {
         if let Some(ref base_path) = args.base_vectors {
             if is_native_xvec_file(base_path) {
                 let ext = base_path.extension()
-                    .map(|e| e.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "mvec".to_string());
+                    .and_then(|e| e.to_str())
+                    .and_then(VecFormat::canonical_extension)
+                    .unwrap_or("fvec");
                 let link = base_dir.join(format!("base_vectors.{}", ext));
                 create_symlink(base_path, &link);
             }
         }
     }
 
-    // Query vectors: symlink when separate native xvec query file
-    if args.query_vectors.is_some() {
-        let query_path = args.query_vectors.as_ref().unwrap();
-        if is_native_xvec_file(query_path) {
+    // Query vectors: create a query_vectors_raw symlink for native xvec files.
+    // The overlap step reads from _raw and writes the final query_vectors.
+    // For non-native (HDF5, npy), the convert-queries step handles this.
+    if let Some(ref query_path) = args.query_vectors {
+        if !slots.self_search && is_native_xvec_file(query_path) {
             let ext = query_path.extension()
-                .map(|e| e.to_string_lossy().to_string())
-                .unwrap_or_else(|| "fvec".to_string());
-            let link = base_dir.join(format!("query_vectors.{}", ext));
+                .and_then(|e| e.to_str())
+                .and_then(VecFormat::canonical_extension)
+                .unwrap_or("fvec");
+            let link = base_dir.join(format!("query_vectors_raw.{}", ext));
             create_symlink(query_path, &link);
         }
     }
@@ -1739,7 +1843,7 @@ fn create_identity_symlinks(output_dir: &std::path::Path, args: &ImportArgs) {
 /// The symlink target is computed as a relative path from the link's parent
 /// directory to the actual target file. This keeps datasets portable — they
 /// can be moved or shared without breaking internal references.
-fn create_symlink(target: &std::path::Path, link: &std::path::Path) {
+pub(crate) fn create_symlink(target: &std::path::Path, link: &std::path::Path) {
     // Compute relative path from the link's parent directory to the target.
     let link_dir = link.parent().unwrap_or(std::path::Path::new("."));
     let rel_target = relative_path(link_dir, target);
@@ -1764,7 +1868,7 @@ fn create_symlink(target: &std::path::Path, link: &std::path::Path) {
 ///
 /// Uses `std::path::Component` iteration rather than `canonicalize()` to
 /// avoid requiring the paths to exist and to avoid producing absolute paths.
-pub fn relative_path(base: &std::path::Path, target: &std::path::Path) -> std::path::PathBuf {
+pub(crate) fn relative_path(base: &std::path::Path, target: &std::path::Path) -> std::path::PathBuf {
     use std::path::{Component, PathBuf};
 
     // Normalize both paths to absolute for comparison
@@ -2107,14 +2211,21 @@ fn probe_directory_vectors(path: &Path) -> Option<(bool, usize, f64)> {
 
 /// Detect the likely distance metric from vector data.
 ///
-/// Heuristic:
-/// - If vectors are L2-normalized → Cosine (norms ≈ 1.0)
-/// - Otherwise → Cosine (safest default; L2 and Cosine rankings are
-///   identical for normalized data, and Cosine is more commonly expected)
+/// Always returns Cosine — it is the safest default and produces correct
+/// rankings for both normalized and non-normalized data. The normalization
+/// status is reported in the reason string so the pipeline can set the
+/// `normalized` flag for kernel optimization (DotProduct kernel is faster
+/// when norms are known to be 1.0).
 ///
 /// Returns the metric name and a human-readable reason.
 pub fn detect_metric(path: &Path) -> (String, String) {
-    // For directories (npy), try to probe via a small temp conversion
+    // First: infer metric from filename keywords. The filename (or parent
+    // directory) often encodes the distance function used to train the model.
+    if let Some(metric) = detect_metric_from_filename(path) {
+        return metric;
+    }
+
+    // Fallback: probe vector data for normalization status
     let probe_result = if path.is_dir() {
         probe_directory_vectors(path)
     } else {
@@ -2122,9 +2233,9 @@ pub fn detect_metric(path: &Path) -> (String, String) {
     };
     if let Some((is_normalized, _n, mean_norm)) = probe_result {
         if is_normalized {
-            ("DotProduct".to_string(), format!("vectors are L2-normalized (mean norm={:.4}) — DotProduct is optimal", mean_norm))
+            ("COSINE".to_string(), format!("vectors are L2-normalized (mean norm={:.4})", mean_norm))
         } else {
-            ("Cosine".to_string(), format!("vectors not normalized (mean norm={:.4})", mean_norm))
+            ("COSINE".to_string(), format!("vectors not normalized (mean norm={:.4})", mean_norm))
         }
     } else {
         let detail = if path.is_dir() {
@@ -2134,7 +2245,29 @@ pub fn detect_metric(path: &Path) -> (String, String) {
         } else {
             "unsupported format for probing"
         };
-        ("Cosine".to_string(), format!("default — {} ({})", detail, path.display()))
+        ("COSINE".to_string(), format!("default — {} ({})", detail, path.display()))
+    }
+}
+
+/// Detect distance metric from filename keywords.
+///
+/// Checks the source path (including parent directory and HDF5 dataset
+/// name) for well-known metric keywords. Returns the metric and reason
+/// if a match is found.
+fn detect_metric_from_filename(path: &Path) -> Option<(String, String)> {
+    // Build a lowercased search string from the full path
+    let search = path.to_string_lossy().to_lowercase();
+
+    // Check for specific metric keywords in the path.
+    // Order matters: check more specific patterns first.
+    if search.contains("dot_product") || search.contains("dotproduct") || search.contains("-dot-") {
+        Some(("DOT_PRODUCT".to_string(), format!("filename contains dot product keyword ({})", path.display())))
+    } else if search.contains("euclidean") || search.contains("-l2-") || search.contains("_l2_") || search.contains("-l2.") || search.contains("_l2.") {
+        Some(("L2".to_string(), format!("filename contains L2/euclidean keyword ({})", path.display())))
+    } else if search.contains("angular") || search.contains("cosine") {
+        Some(("COSINE".to_string(), format!("filename contains angular/cosine keyword ({})", path.display())))
+    } else {
+        None
     }
 }
 
@@ -2241,6 +2374,7 @@ mod tests {
             round_digits: 2,
             pedantic_dedup: false,
             selectivity: 0.0001,
+            classic: false,
         }
     }
 

@@ -153,9 +153,11 @@ run), the command returns immediately without re-running anything.
         // Run the required pipeline
         let run_args = crate::pipeline::RunArgs {
             dataset: Some(pipeline_path.clone()),
+            recursive: false,
             profile,
             dry_run: ctx.dry_run,
             clean: false,
+            reset: false,
             overrides: vec![],
             threads: ctx.threads,
             emit_yaml: false,
@@ -165,7 +167,9 @@ run), the command returns immediately without re-running anything.
             output: "auto".to_string(),
         };
 
-        crate::pipeline::run_pipeline(run_args);
+        if let Err(e) = crate::pipeline::run_pipeline(run_args) {
+            return error_result(format!("required pipeline failed: {}", e), start);
+        }
 
         // Re-check progress after run
         let progress = match ProgressLog::load(&progress_path) {

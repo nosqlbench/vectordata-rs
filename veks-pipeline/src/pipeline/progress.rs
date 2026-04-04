@@ -270,6 +270,22 @@ impl ProgressLog {
         self.steps.insert(step_id.to_string(), record);
     }
 
+    /// Update the recorded output size for a file across all steps.
+    ///
+    /// When a downstream step modifies a file that was produced by an
+    /// upstream step (e.g., overlap removal rewrites query_vectors.fvec),
+    /// the stored size becomes stale. This updates ALL step records that
+    /// reference the given path so the freshness check passes.
+    pub fn update_output_size(&mut self, path: &str, new_size: u64) {
+        for record in self.steps.values_mut() {
+            for output in &mut record.outputs {
+                if output.path == path {
+                    output.size = new_size;
+                }
+            }
+        }
+    }
+
     /// Get the record for a step, if any.
     pub fn get_step(&self, step_id: &str) -> Option<&StepRecord> {
         self.steps.get(step_id)

@@ -18,6 +18,8 @@ use crate::pipeline::command::{
     CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options, Status, StreamContext,
     render_options_table,
 };
+use crate::pipeline::atomic_write::safe_create_file;
+use crate::pipeline::element_type::ElementType;
 use crate::pipeline::rng;
 
 /// Parse a u64 with optional ISO suffixes (K, M, G/B, T, KiB, MiB, GiB, TiB).
@@ -121,17 +123,13 @@ data.
         let output_path = resolve_path(&output_str, &ctx.workspace);
 
         // Infer element type from output extension if --type not specified
+        let inferred;
         let elem_type = if let Some(t) = options.get("type") {
             t
         } else {
-            match output_path.extension().and_then(|e| e.to_str()) {
-                Some("fvec") => "f32",
-                Some("mvec") => "f16",
-                Some("dvec") => "f64",
-                Some("ivec") => "i32",
-                Some("svec") => "i16",
-                Some("bvec") => "u8",
-                _ => "float[]", // default fallback
+            match ElementType::from_path(&output_path) {
+                Ok(et) => { inferred = et.to_string(); &inferred }
+                Err(_) => "float[]", // default fallback
             }
         };
 
@@ -587,7 +585,7 @@ fn generate_xvec_with_injection(
     let file = if append {
         std::fs::OpenOptions::new().append(true).open(output)
     } else {
-        std::fs::File::create(output)
+        safe_create_file(output)
     }.map_err(|e| format!("failed to open {}: {}", output.display(), e))?;
     let mut writer = std::io::BufWriter::with_capacity(1 << 22, file);
     for chunk in &chunks {
@@ -610,7 +608,7 @@ fn generate_xvec_f32(
     pb: &veks_core::ui::ProgressHandle,
 ) -> Result<(), String> {
     use std::io::Write;
-    let file = std::fs::File::create(output)
+    let file = safe_create_file(output)
         .map_err(|e| format!("failed to create {}: {}", output.display(), e))?;
     let mut writer = std::io::BufWriter::with_capacity(1 << 20, file);
     let range = max - min;
@@ -641,7 +639,7 @@ fn generate_xvec_i32(
     pb: &veks_core::ui::ProgressHandle,
 ) -> Result<(), String> {
     use std::io::Write;
-    let file = std::fs::File::create(output)
+    let file = safe_create_file(output)
         .map_err(|e| format!("failed to create {}: {}", output.display(), e))?;
     let mut writer = std::io::BufWriter::with_capacity(1 << 20, file);
     let range = (max - min + 1) as u32;
@@ -672,7 +670,7 @@ fn generate_xvec_f64(
     pb: &veks_core::ui::ProgressHandle,
 ) -> Result<(), String> {
     use std::io::Write;
-    let file = std::fs::File::create(output)
+    let file = safe_create_file(output)
         .map_err(|e| format!("failed to create {}: {}", output.display(), e))?;
     let mut writer = std::io::BufWriter::with_capacity(1 << 20, file);
     let range = max - min;
@@ -701,7 +699,7 @@ fn generate_xvec_u8(
     pb: &veks_core::ui::ProgressHandle,
 ) -> Result<(), String> {
     use std::io::Write;
-    let file = std::fs::File::create(output)
+    let file = safe_create_file(output)
         .map_err(|e| format!("failed to create {}: {}", output.display(), e))?;
     let mut writer = std::io::BufWriter::with_capacity(1 << 20, file);
 
@@ -731,7 +729,7 @@ fn generate_xvec_f16(
     pb: &veks_core::ui::ProgressHandle,
 ) -> Result<(), String> {
     use std::io::Write;
-    let file = std::fs::File::create(output)
+    let file = safe_create_file(output)
         .map_err(|e| format!("failed to create {}: {}", output.display(), e))?;
     let mut writer = std::io::BufWriter::with_capacity(1 << 20, file);
     let range = max - min;
@@ -765,7 +763,7 @@ fn generate_xvec_i16(
     pb: &veks_core::ui::ProgressHandle,
 ) -> Result<(), String> {
     use std::io::Write;
-    let file = std::fs::File::create(output)
+    let file = safe_create_file(output)
         .map_err(|e| format!("failed to create {}: {}", output.display(), e))?;
     let mut writer = std::io::BufWriter::with_capacity(1 << 20, file);
     let range = (max as i32 - min as i32 + 1) as u32;
@@ -826,6 +824,7 @@ mod tests {
             governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
             ui: veks_core::ui::UiHandle::new(std::sync::Arc::new(veks_core::ui::TestSink::new())),
             status_interval: std::time::Duration::from_secs(1),
+            estimated_total_steps: 0,
         }
     }
 

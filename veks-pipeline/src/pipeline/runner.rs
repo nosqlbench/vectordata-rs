@@ -501,6 +501,8 @@ pub fn run_steps(
             ctx.ui.log(&format!("{} {} — {}", prefix, step.id, desc));
         }
         ctx.ui.log(&format!("{} {} — running: {}", prefix, step.id, step.def.run));
+        dlog.log(&format!("  [start] {} — {}", step.id, step.def.run));
+        dlog.flush();
         ctx.step_id = step.id.clone();
         ctx.governor.set_step_id(&step.id);
 
@@ -552,6 +554,8 @@ pub fn run_steps(
                             resource_ui.log(&format!(
                                 "  last status: {}", resource_source.status_line()
                             ));
+                            // Shut down the TUI to restore the terminal before exiting
+                            resource_ui.shutdown();
                             std::process::exit(1);
                         }
                     } else {
@@ -592,6 +596,17 @@ pub fn run_steps(
         ctx.ui.clear();
         let record = step_record_from_result(&result, &resolved_opts, resource_summary, Some(fingerprint.clone()));
         ctx.progress.record_step(&step.id, record);
+
+        // If this step modified files that were outputs of previous steps
+        // (e.g., overlap removal rewrites query_vectors.fvec), update the
+        // stored sizes in those earlier step records so freshness checks
+        // don't flag them as stale.
+        for produced_path in &result.produced {
+            let rel = veks_core::paths::rel_display(produced_path);
+            if let Ok(meta) = std::fs::metadata(produced_path) {
+                ctx.progress.update_output_size(&rel, meta.len());
+            }
+        }
 
         match result.status {
             Status::Ok | Status::Warning => {

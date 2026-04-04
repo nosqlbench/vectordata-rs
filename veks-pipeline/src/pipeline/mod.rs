@@ -140,8 +140,15 @@ pub fn resolve_all_steps(
 /// CLI arguments for `veks run`.
 #[derive(Args)]
 pub struct RunArgs {
-    /// Path to dataset.yaml (default: dataset.yaml in current directory)
+    /// Path to dataset.yaml, or a directory when --recursive is given
+    /// (default: dataset.yaml in current directory)
     pub dataset: Option<PathBuf>,
+
+    /// Recursively find and run all dataset.yaml files under the target
+    /// directory. The positional argument is treated as a root directory
+    /// instead of a single dataset.yaml path.
+    #[arg(long, short = 'r')]
+    pub recursive: bool,
 
     /// Run steps for a specific profile, or `all` to run every profile
     /// with barriers between them. Steps with a `profiles` field are gated:
@@ -157,6 +164,13 @@ pub struct RunArgs {
     /// Delete progress log and intermediate files, then exit.
     #[arg(long)]
     pub clean: bool,
+
+    /// Full reset: remove progress log, .cache/, .scratch/, generated
+    /// profile data, and pipeline-produced facet files (neighbors, distances,
+    /// ordinals, etc.), then re-run the pipeline from scratch. Preserves
+    /// dataset.yaml, variables.yaml, identity symlinks, and source data.
+    #[arg(long)]
+    pub reset: bool,
 
     /// Override default variables (format: key=value). Can be specified
     /// multiple times.
@@ -325,7 +339,11 @@ pub fn run_script(args: ScriptArgs) {
 }
 
 /// Entry point for `veks run` — execute a command stream pipeline.
-pub fn run_pipeline(args: RunArgs) {
+///
+/// Returns `Ok(())` on success, `Err(message)` on failure. Callers in
+/// single-dataset mode should `process::exit(1)` on error; callers in
+/// recursive mode should collect the error and continue.
+pub fn run_pipeline(args: RunArgs) -> Result<(), String> {
     let dataset_path = args.dataset.unwrap_or_else(|| {
         let default = PathBuf::from("dataset.yaml");
         if default.exists() {
@@ -349,10 +367,13 @@ pub fn run_pipeline(args: RunArgs) {
         .unwrap_or(Path::new("."))
         .to_path_buf();
 
-    // Handle --clean
-    if args.clean {
-        clean_pipeline(&workspace, dataset_path);
-        return;
+    // Handle --clean: full reset (remove all generated artifacts), then exit.
+    // Handle --reset: same cleanup, then continue to run.
+    if args.clean || args.reset {
+        reset_pipeline(&workspace, dataset_path, &config);
+        if args.clean {
+            return Ok(());
+        }
     }
 
     // Create managed scratch and cache directories
@@ -444,7 +465,7 @@ pub fn run_pipeline(args: RunArgs) {
     // Handle --emit-yaml: resolve and print the pipeline instead of executing
     if args.emit_yaml {
         emit_resolved_yaml(&pipeline_dag, &defaults, &workspace);
-        return;
+        return Ok(());
     }
 
     println!(
@@ -572,6 +593,20 @@ pub fn run_pipeline(args: RunArgs) {
     // Build command registry
     let registry = CommandRegistry::with_builtins();
 
+    // Install a panic hook that restores the terminal before printing
+    // the panic message. Without this, a panic during TUI mode leaves
+    // the terminal in raw/alternate-screen mode with no visible error.
+    {
+        let sink = ctx.ui.sink_arc();
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            // Shut down the TUI to restore the terminal
+            sink.shutdown();
+            // Then show the panic
+            prev_hook(info);
+        }));
+    }
+
     // Phase 1: Run steps (core + any already-resolved per-profile steps)
     let result = runner::run_steps(&pipeline_dag.steps, &registry, &mut ctx);
 
@@ -660,6 +695,9 @@ pub fn run_pipeline(args: RunArgs) {
 
     match result {
         Err(e) => {
+            // Sync variables even on failure — earlier steps (dedup, zeros)
+            // may have completed and their variables should be persisted.
+            update_dataset_attributes(dataset_path, dataset_path.parent().unwrap_or(Path::new(".")));
             // Ensure we're on a clean line before printing the error.
             eprintln!();
             eprintln!("Pipeline failed: {}", e);
@@ -668,7 +706,7 @@ pub fn run_pipeline(args: RunArgs) {
                 scratch_dir.display()
             );
             eprintln!("Run with --clean to reset.");
-            std::process::exit(1);
+            return Err(e);
         }
         Ok(summary) => {
             // Sync variables from variables.yaml into dataset.yaml.
@@ -695,6 +733,7 @@ pub fn run_pipeline(args: RunArgs) {
 
     // On success, clean scratch directory contents
     clean_scratch_contents(&scratch_dir);
+    Ok(())
 }
 
 /// Sync variables from `variables.yaml` into the `variables:` section of
@@ -729,6 +768,9 @@ fn update_dataset_attributes(dataset_path: &Path, workspace: &Path) {
     }
 
     // Build attribute lines to inject/update
+    // The pipeline REMOVES zero/duplicate vectors — so the output is free
+    // of them when the steps ran, regardless of how many were found.
+    // The attribute reflects the output state, not the source state.
     // The pipeline REMOVES zero/duplicate vectors — so the output is free
     // of them when the steps ran, regardless of how many were found.
     // The attribute reflects the output state, not the source state.
@@ -1248,6 +1290,121 @@ fn clean_pipeline(workspace: &Path, dataset_path: &Path) {
     );
 }
 
+/// Full pipeline reset: remove progress, cache, scratch, and all generated artifacts.
+///
+/// Preserves: dataset.yaml, variables.yaml, identity symlinks
+/// (those pointing outside the workspace), and source data files.
+/// Removes _bootstrap.json so the next bootstrap re-detects inputs.
+pub fn reset_pipeline(workspace: &Path, dataset_path: &Path, config: &DatasetConfig) {
+    println!("Resetting pipeline — removing all generated artifacts...");
+
+    // 1. Remove progress log
+    let progress_path = ProgressLog::path_for_dataset(dataset_path);
+    if progress_path.exists() {
+        let _ = std::fs::remove_file(&progress_path);
+        println!("  removed {}", veks_core::paths::rel_display(&progress_path));
+    }
+
+    // 2. Remove .cache/ directory entirely
+    let cache_dir = workspace.join(".cache");
+    if cache_dir.exists() {
+        match std::fs::remove_dir_all(&cache_dir) {
+            Ok(()) => println!("  removed {}", veks_core::paths::rel_display(&cache_dir)),
+            Err(e) => println!("  failed to remove {}: {}", veks_core::paths::rel_display(&cache_dir), e),
+        }
+    }
+
+    // 3. Remove .scratch/ directory entirely
+    let scratch_dir = workspace.join(".scratch");
+    if scratch_dir.exists() {
+        let _ = std::fs::remove_dir_all(&scratch_dir);
+        println!("  removed {}", veks_core::paths::rel_display(&scratch_dir));
+    }
+
+    // 4. Remove profiles/ directory entirely (all generated profile data)
+    let profiles_dir = workspace.join("profiles");
+    if profiles_dir.exists() {
+        match std::fs::remove_dir_all(&profiles_dir) {
+            Ok(()) => println!("  removed {}", veks_core::paths::rel_display(&profiles_dir)),
+            Err(e) => println!("  failed to remove {}: {}", veks_core::paths::rel_display(&profiles_dir), e),
+        }
+    }
+
+    // 5. Remove generated facet files in the workspace root (classic layout).
+    //    These are pipeline outputs like neighbors.ivec, distances.fvec, etc.
+    //    We preserve: dataset.yaml, dataset.json, dataset.log, variables.yaml,
+    //    _bootstrap.json, catalog.*, .publish, .publish_url, .catalog_root,
+    //    .gitignore, and identity symlinks pointing to source data.
+    let preserve = |name: &str| -> bool {
+        name == "dataset.yaml" || name == "dataset.yml" || name == "dataset.json"
+            || name == "dataset.log" || name == "variables.yaml"
+            || name == ".publish" || name == ".publish_url" || name == ".catalog_root"
+            || name == ".do_not_catalog" || name == ".gitignore"
+            || name == "catalog.json" || name == "catalog.yaml"
+    };
+
+    // Collect pipeline output filenames from profile views (classic layout)
+    let mut pipeline_outputs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (_name, profile) in &config.profiles.profiles {
+        for (key, view) in profile.views() {
+            let path = std::path::Path::new(&view.source.path);
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                pipeline_outputs.insert(name.to_string());
+            }
+            // Also the key-based default names
+            pipeline_outputs.insert(format!("{}.ivec", key));
+            pipeline_outputs.insert(format!("{}.fvec", key));
+            pipeline_outputs.insert(format!("{}.mvec", key));
+            pipeline_outputs.insert(format!("{}.slab", key));
+        }
+    }
+
+    if let Ok(entries) = std::fs::read_dir(workspace) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() { continue; }
+            let name = match path.file_name().and_then(|n| n.to_str()) {
+                Some(n) => n.to_string(),
+                None => continue,
+            };
+
+            // Preserve infrastructure files
+            if preserve(&name) { continue; }
+            // Preserve hidden files (other than those we explicitly handle)
+            if name.starts_with('.') { continue; }
+            // Preserve source data files (underscore-prefixed originals)
+            if name.starts_with('_') { continue; }
+
+            // Only remove files that are known pipeline outputs or their
+            // artifacts (.mref, .mrkl). Symlinks are only removed if they
+            // match a pipeline output name — user-created symlinks for
+            // other purposes are preserved.
+            let is_pipeline_output = pipeline_outputs.contains(&name)
+                || name.ends_with(".mref")
+                || name.ends_with(".mrkl");
+
+            if path.is_symlink() {
+                if is_pipeline_output {
+                    let _ = std::fs::remove_file(&path);
+                    println!("  removed symlink {}", name);
+                }
+                continue;
+            }
+
+            // Remove pipeline-generated regular files
+            let is_generated = is_pipeline_output
+                || name.ends_with(".ivec") || name.ends_with(".fvec")
+                || name.ends_with(".mvec") || name.ends_with(".slab");
+            if is_generated {
+                let _ = std::fs::remove_file(&path);
+                println!("  removed {}", name);
+            }
+        }
+    }
+
+    println!("Reset complete. Pipeline will re-run from scratch.");
+}
+
 /// Remove all files inside the scratch directory, leaving the directory itself.
 fn clean_scratch_contents(scratch_dir: &Path) {
     if !scratch_dir.exists() {
@@ -1344,6 +1501,7 @@ mod tests {
             after: after.into_iter().map(String::from).collect(),
             profiles: profiles.into_iter().map(String::from).collect(),
             per_profile: false,
+            phase: 0,
             on_partial: OnPartial::default(),
             options,
         }
@@ -1612,7 +1770,9 @@ default:
         assert_eq!(expanded[1].profiles, vec!["10M"]);
         assert_eq!(expanded[2].effective_id(), "extract");
         assert_eq!(expanded[2].profiles, vec!["default"]);
-        assert_eq!(expanded[2].output_path().unwrap(), "profiles/default/base.mvec");
+        // Classic layout: base_vectors has no profiles/ prefix → default outputs
+        // go in the dataset root, not profiles/default/.
+        assert_eq!(expanded[2].output_path().unwrap(), "base.mvec");
     }
 
     #[test]
@@ -1671,7 +1831,8 @@ default:
         assert_eq!(expanded[1].output_path().unwrap(), "profiles/20M/gnd.ivec");
         assert_eq!(expanded[2].effective_id(), "knn");
         assert_eq!(expanded[2].profiles, vec!["default"]);
-        assert_eq!(expanded[2].output_path().unwrap(), "profiles/default/gnd.ivec");
+        // Classic layout: default outputs go in dataset root.
+        assert_eq!(expanded[2].output_path().unwrap(), "gnd.ivec");
     }
 
     #[test]
@@ -1740,8 +1901,9 @@ default:
         assert_eq!(expanded.len(), 1);
         assert_eq!(expanded[0].effective_id(), "extract");
         assert_eq!(expanded[0].profiles, vec!["default"]);
-        // Output auto-prefixed with profiles/default/
-        assert_eq!(expanded[0].output_path().unwrap(), "profiles/default/base.mvec");
+        // Classic layout: base_vectors has no profiles/ prefix → default outputs
+        // go in the dataset root.
+        assert_eq!(expanded[0].output_path().unwrap(), "base.mvec");
     }
 
     #[test]

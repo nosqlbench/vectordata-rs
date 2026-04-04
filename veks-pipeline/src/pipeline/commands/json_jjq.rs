@@ -24,6 +24,7 @@ use std::time::Instant;
 
 use serde_json::Value;
 
+use crate::pipeline::atomic_write::safe_create_file;
 use crate::pipeline::command::{
     CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options, ResourceDesc, Status, StreamContext,
     render_options_table,
@@ -311,7 +312,7 @@ the need for an external `jq` binary on the system.
                         let _ = std::fs::create_dir_all(parent);
                     }
                 }
-                match std::fs::File::create(p) {
+                match safe_create_file(p) {
                     Ok(f) => Box::new(std::io::BufWriter::new(f)),
                     Err(e) => {
                         return error_result(
@@ -461,6 +462,7 @@ mod tests {
             governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
             ui: veks_core::ui::UiHandle::new(std::sync::Arc::new(veks_core::ui::TestSink::new())),
             status_interval: std::time::Duration::from_secs(1),
+            estimated_total_steps: 0,
         }
     }
 

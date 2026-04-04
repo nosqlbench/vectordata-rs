@@ -24,9 +24,12 @@ pub mod analyze_stats;
 pub mod analyze_verifyknn;
 pub mod analyze_verifyprofiles;
 pub mod analyze_normals;
+pub mod analyze_overlap;
 pub mod analyze_zeros;
+pub mod cleanup_overlap;
 pub mod clean_ordinals;
 pub mod compute_dedup;
+pub mod dataset_json;
 pub mod compute_filtered_knn;
 pub mod compute_knn;
 pub mod compute_sort;
@@ -86,7 +89,11 @@ pub fn register_all(registry: &mut CommandRegistry) {
     registry.register("analyze verify-knn", analyze_verifyknn::factory);
     registry.register("analyze verify-profiles", analyze_verifyprofiles::factory);
     registry.register("analyze measure-normals", analyze_normals::factory);
+    registry.register("analyze overlap", analyze_overlap::factory);
     registry.register("analyze zeros", analyze_zeros::factory);
+
+    // ── cleanup ─────────────────────────────────────────────────────
+    registry.register("cleanup overlap", cleanup_overlap::factory);
 
     // ── cache ────────────────────────────────────────────────────────
     // compress/uncompress are registered as workflow commands in prepare,
@@ -104,6 +111,7 @@ pub fn register_all(registry: &mut CommandRegistry) {
 
     // ── generate ─────────────────────────────────────────────────────
     registry.register("generate dataset", gen_dataset::factory);
+    registry.register("generate dataset-json", dataset_json::factory);
     registry.register("generate derive", gen_derive::factory);
     registry.register("generate from-model", gen_from_model::factory);
     registry.register("generate predicated", gen_predicated::factory);

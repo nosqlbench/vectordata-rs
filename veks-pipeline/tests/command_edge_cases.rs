@@ -38,6 +38,7 @@ fn test_ctx(dir: &Path) -> StreamContext {
         governor: ResourceGovernor::default_governor(),
         ui: UiHandle::new(Arc::new(TestSink::new())),
         status_interval: Duration::from_secs(1),
+        estimated_total_steps: 0,
     }
 }
 

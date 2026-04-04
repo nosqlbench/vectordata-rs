@@ -572,6 +572,21 @@ impl PackedBatches {
     }
 }
 
+/// Whether `metric` should use the packed neg-dot kernel path.
+///
+/// Only DotProduct is eligible: the packed kernel computes raw `-dot(a, b)`
+/// which is only a valid distance for unit-length vectors where cosine
+/// reduces to negative dot product. All other metrics (Cosine, L2, L1) must
+/// use the TransposedBatch path which applies the correct per-metric formula
+/// (norm division, squared differences, etc.).
+///
+/// Every command that chooses between packed and TransposedBatch paths must
+/// call this function instead of making the decision locally — duplicating
+/// this logic is how compute-knn and verify-knn diverged in the past.
+pub fn metric_uses_packed_path(metric: Metric) -> bool {
+    metric == Metric::DotProduct
+}
+
 /// Function type for batched distance computation on f16 base vectors.
 pub type BatchedDistFnF16 = fn(&TransposedBatch, &[half::f16], &mut [f32]);
 

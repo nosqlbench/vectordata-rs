@@ -22,6 +22,7 @@ use super::CheckResult;
 const KNOWN_INFRA: &[&str] = &[
     "dataset.yaml",
     "dataset.yml",
+    "dataset.json",
     "catalog.json",
     "catalog.yaml",
     "variables.yaml",

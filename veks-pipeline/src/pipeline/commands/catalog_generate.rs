@@ -67,14 +67,40 @@ impl CommandOp for CatalogGenerateOp {
             return error_result(format!("{} is not a directory", input_path.display()), start);
         }
 
-        // Use .catalog_root if present, otherwise scan from input
-        let scan_root = find_catalog_root(&input_path).unwrap_or(input_path.clone());
+        // Canonicalize so find_catalog_boundary can walk above a relative "."
+        // workspace to find .catalog_root / .publish_url in ancestor directories.
+        let input_abs = std::fs::canonicalize(&input_path).unwrap_or(input_path.clone());
+
+        // Find the catalog boundary: the closest ancestor (or self) containing
+        // .catalog_root or .publish_url. This is the top of the catalog hierarchy.
+        let boundary = find_catalog_boundary(&input_abs);
+        let scan_root = boundary.clone().unwrap_or(input_abs.clone());
+
+        // If a publish tree exists, ensure the current dataset has a .publish
+        // sentinel so it is included in the catalog and ready for publishing.
+        if boundary.is_some() {
+            let publish_sentinel = input_abs.join(".publish");
+            if !publish_sentinel.exists() {
+                if let Err(e) = std::fs::write(&publish_sentinel, "") {
+                    ctx.ui.log(&format!("  warning: could not create .publish: {}", e));
+                } else {
+                    ctx.ui.log("  created .publish sentinel");
+                }
+            }
+        }
 
         ctx.ui.log(&format!("  scanning {} for datasets...", scan_root.display()));
 
-        let mut datasets = Vec::new();
-        walk_for_datasets(&scan_root, &mut datasets);
-        datasets.sort_by(|a: &DiscoveredDataset, b: &DiscoveredDataset| a.yaml_path.cmp(&b.yaml_path));
+        let mut all_datasets = Vec::new();
+        walk_for_datasets(&scan_root, &mut all_datasets);
+        // Only include publishable datasets (those with .publish sentinel)
+        let mut datasets: Vec<DiscoveredDataset> = all_datasets.into_iter()
+            .filter(|ds| {
+                let ds_dir = ds.yaml_path.parent().unwrap_or(std::path::Path::new("."));
+                ds_dir.join(".publish").exists()
+            })
+            .collect();
+        datasets.sort_by(|a, b| a.yaml_path.cmp(&b.yaml_path));
 
         if datasets.is_empty() {
             return CommandResult {
@@ -85,7 +111,9 @@ impl CommandOp for CatalogGenerateOp {
             };
         }
 
-        ctx.ui.log(&format!("  found {} dataset(s)", datasets.len()));
+        for ds in &datasets {
+            ctx.ui.log(&format!("  dataset: {} [{}]", ds.config.name, ds.yaml_path.display()));
+        }
 
         let mut catalog_dirs: BTreeSet<PathBuf> = BTreeSet::new();
         catalog_dirs.insert(scan_root.clone());
@@ -104,7 +132,13 @@ impl CommandOp for CatalogGenerateOp {
         let mut total_files = 0usize;
         let mut produced = Vec::new();
 
-        for catalog_dir in &catalog_dirs {
+        // Write catalogs depth-first (deepest directories first) so that
+        // parent catalog mtimes are always newer than their children.
+        let mut sorted_dirs: Vec<&PathBuf> = catalog_dirs.iter().collect();
+        sorted_dirs.sort_by(|a, b| b.components().count().cmp(&a.components().count())
+            .then_with(|| a.cmp(b)));
+
+        for catalog_dir in &sorted_dirs {
             if catalog_dir.join(DO_NOT_CATALOG_FILE).exists() {
                 continue;
             }
@@ -139,7 +173,8 @@ impl CommandOp for CatalogGenerateOp {
                 return error_result(format!("failed to write {}: {}", yaml_path.display(), e), start);
             }
 
-            ctx.ui.log(&format!("  wrote {} entries to {}", entries.len(), catalog_dir.display()));
+
+            ctx.ui.log(&format!("  wrote {} entries to {} (catalog.json + catalog.yaml + mrefs)", entries.len(), catalog_dir.display()));
             produced.push(json_path);
             produced.push(yaml_path);
             total_files += 2;
@@ -183,12 +218,18 @@ impl CommandOp for CatalogGenerateOp {
 // ---------------------------------------------------------------------------
 
 const CATALOG_ROOT_FILE: &str = ".catalog_root";
+const PUBLISH_URL_FILE: &str = ".publish_url";
 const DO_NOT_CATALOG_FILE: &str = ".do_not_catalog";
 
-fn find_catalog_root(dir: &Path) -> Option<PathBuf> {
+/// Walk up from `dir` to find the catalog boundary — the closest ancestor
+/// (or self) containing `.catalog_root` or `.publish_url`. This is the
+/// top of the catalog hierarchy for a pipeline-driven catalog rebuild.
+fn find_catalog_boundary(dir: &Path) -> Option<PathBuf> {
     let mut current = dir.to_path_buf();
     loop {
-        if current.join(CATALOG_ROOT_FILE).is_file() {
+        if current.join(CATALOG_ROOT_FILE).is_file()
+            || current.join(PUBLISH_URL_FILE).is_file()
+        {
             return Some(current);
         }
         if !current.pop() {
