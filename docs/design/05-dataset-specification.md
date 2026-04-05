@@ -435,16 +435,38 @@ With a fractional factor: `"mul:10m..100m/1.5"` → `10m, 15m, 22500k,
 the largest clean suffix).
 
 **Implicit upper bound form** (`mul:start/factor`): When the `..end` is
-omitted, the upper bound is implicitly the default profile's `base_count`.
-This is the preferred form for early stratification, since the actual
-dataset size does not need to be known at bootstrap time:
+omitted, the upper bound is the actual base vector count of the dataset.
+This is the preferred form for early stratification:
 ```yaml
 sized: ["mul:1m/2"]
 ```
-Generates profiles `1m, 2m, 4m, 8m, ...` up to the default profile's
-base count. During expansion, profiles whose `base_count` exceeds the
-default profile's base count are filtered out. A safety cap of 100
-profiles prevents runaway expansion.
+Generates profiles `1m, 2m, 4m, 8m, ...` stopping before the actual
+base count. A safety cap of 100 profiles prevents runaway expansion.
+
+#### Base count requirement
+
+Profile expansion **requires** the actual base vector count to be known.
+Every generator checks each candidate value against this bound and stops
+producing profiles when a value would equal or exceed the base count
+(such profiles are redundant with the default profile). **Post-hoc
+filtering of oversized profiles is not allowed** — the invariant is
+enforced at generation time.
+
+Entries that use the implicit upper bound form (`mul:start/factor`) are
+automatically deferred during YAML deserialization and expanded later
+when `base_count` becomes available (after core pipeline stages produce
+`variables.yaml`). Entries with explicit ranges (`mul:1m..100m/2`,
+`fib:1m..400m`, linear ranges) are also capped at `base_count` during
+expansion.
+
+If `base_count` is not available when expansion is attempted, deferred
+entries remain unresolved and a warning is emitted. The pipeline must
+produce `base_count` before per-profile steps can be generated.
+
+This design means that verify-knn and other downstream steps can rely on
+the invariant that every sized profile has `base_count < actual_base_count`.
+No downstream code needs to validate or filter profiles — the invariant
+is established at the single point of profile generation.
 
 **Conflict with explicit profiles**: If a sized expansion produces a
 profile name that conflicts with an explicitly defined profile, this is
@@ -461,22 +483,10 @@ clean suffix: values divisible by 1B get `b` suffix, by 1M get `m`, by
 #### Variable references in sized specs (deprecated)
 
 > **Note**: Variable references in sized specs (e.g., `${base_count}`)
-> are deprecated in favor of the implicit upper bound form. The preferred
-> approach is `mul:1m/2`, which generates profiles up to the default
-> profile's base count without requiring variable interpolation. The
-> variable reference mechanism is retained for backward compatibility but
-> should not be used in new configurations.
-
-Previously, sized range endpoints could contain `${variable}` references
-resolved at expansion time. This required a deferred two-phase expansion:
-entries with unresolved variables were stored verbatim and expanded later
-when `variables.yaml` became available.
-
-The implicit upper bound form (`mul:start/factor`) eliminates this
-complexity. Profile expansion is now a single pass at YAML load time —
-profiles that exceed the default profile's base count are simply filtered
-out during per-profile step expansion, without needing variable
-references or deferred expansion.
+> are deprecated. The preferred approach is `mul:1m/2`, which defers
+> expansion until `base_count` is known and generates only valid profiles.
+> The variable reference mechanism is retained for backward compatibility
+> but should not be used in new configurations.
 
 #### Structured sized form with facet templates
 

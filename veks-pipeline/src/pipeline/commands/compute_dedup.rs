@@ -146,14 +146,12 @@ pub fn factory() -> Box<dyn CommandOp> {
 
 /// Default batch size for sorted run creation.
 const DEFAULT_BATCH_SIZE: usize = 1_000_000;
-/// Number of vectors to sample for variance estimation.
-const VARIANCE_SAMPLE_SIZE: usize = 10_000;
-/// Minimum prefix components. 10 components provides strong discrimination
-/// for most embedding models, minimizing prefix collision groups that
-/// require full-vector comparison during dedup.
-const MIN_PREFIX: usize = 10;
-/// Maximum prefix components.
-const MAX_PREFIX: usize = 10;
+/// Fixed prefix width: 10 leading components for sort-key comparison.
+/// 10 components provides strong discrimination for all known embedding
+/// models, minimizing prefix collision groups that require full-vector
+/// comparison during dedup. No variance sampling needed.
+const PREFIX_WIDTH: usize = 10;
+const MAX_PREFIX: usize = PREFIX_WIDTH;
 /// BufReader/BufWriter capacity (1 MiB).
 const IO_BUF_SIZE: usize = 1 << 20;
 
@@ -425,22 +423,12 @@ shuffle, KNN, or metadata alignment. The output index can be fed to
         // Top-level phase indicator — visible on the progress bar line
         // throughout the entire command. Sub-phases create their own bars
         // underneath for detailed progress.
-        let phase = ctx.ui.spinner("sort+dedup");
-        phase.set_message("phase 0/4: sampling variance".to_string());
-
-        // ── Phase 0: Variance sampling to determine prefix width ──────
-        let phase0_start = Instant::now();
-        ctx.ui.log("Phase 0: variance sampling");
-        let prefix_width = sample_prefix_width(&reader, count, dim, ctx);
-        let phase0_elapsed = phase0_start.elapsed();
-        ctx.ui.log(&format!(
-            "  prefix width: {} component(s), sampled in {:.1}s",
-            prefix_width, phase0_elapsed.as_secs_f64(),
-        ));
+        let phase = ctx.ui.spinner("prepare-vectors");
+        let prefix_width = PREFIX_WIDTH.min(dim);
 
         // ── Phase 1: Create sorted runs ───────────────────────────────
         let phase1_start = Instant::now();
-        phase.set_message("phase 1/4: building sorted runs".to_string());
+        phase.set_message("phase 1/3: building sorted runs".to_string());
         ctx.ui.log("Phase 1: creating sorted runs");
         let run_dir = ctx.cache.join("dedup_runs");
         if let Err(e) = std::fs::create_dir_all(&run_dir) {
@@ -467,7 +455,7 @@ shuffle, KNN, or metadata alignment. The output index can be fed to
 
         // ── Phase 2: Parallel merge + dedup ───────────────────────────
         let phase2_start = Instant::now();
-        phase.set_message("phase 2/4: parallel merge".to_string());
+        phase.set_message("phase 2/3: parallel merge".to_string());
         ctx.ui.log("Phase 2: parallel merge + dedup");
         ensure_parent(&output_path);
         ensure_parent(&report_path);
@@ -490,8 +478,12 @@ shuffle, KNN, or metadata alignment. The output index can be fed to
             format_count(count - dup_count), // non-dup entries never needed full read
         ));
 
+        // Normalization and near-zero detection are handled by the extract
+        // step, which already has each vector in memory for writing. No
+        // separate norm scan is needed here. See SRD §20.
+
         // ── Phase 3: Write report and clean up ────────────────────────
-        phase.set_message("phase 3/4: writing report".to_string());
+        phase.set_message("phase 3/3: writing report".to_string());
         if let Err(e) = write_report(&report_path, count, unique_count, dup_count, prefix_width) {
             return error_result(format!("failed to write report: {}", e), start);
         }
@@ -523,6 +515,14 @@ shuffle, KNN, or metadata alignment. The output index can be fed to
             &ctx.workspace, &dup_var_name, &dup_count.to_string());
         ctx.defaults.insert(dup_var_name, dup_count.to_string());
 
+        // clean_count = unique vectors after dedup (before zero removal).
+        // Used by generate-shuffle and extract steps as the population size.
+        // Zero vectors are filtered later during extraction.
+        let clean_count = if elide { unique_count } else { count };
+        let _ = crate::pipeline::variables::set_and_save(
+            &ctx.workspace, "clean_count", &clean_count.to_string());
+        ctx.defaults.insert("clean_count".into(), clean_count.to_string());
+
         let msg = format!(
             "{} vectors -> {} unique, {} dup ({:.2}%){}, {:.1}s ({:.0} vec/s, {:.1} MB/s), prefix_width={}",
             format_count(count),
@@ -537,10 +537,12 @@ shuffle, KNN, or metadata alignment. The output index can be fed to
         );
         ctx.ui.log(&msg);
 
+        let produced = vec![output_path, duplicates_path, report_path];
+
         CommandResult {
             status: Status::Ok,
             message: msg,
-            produced: vec![output_path, duplicates_path, report_path],
+            produced,
             elapsed: total_elapsed,
         }
     }
@@ -607,10 +609,11 @@ shuffle, KNN, or metadata alignment. The output index can be fed to
     }
 
     fn project_artifacts(&self, step_id: &str, options: &Options) -> ArtifactManifest {
+        let output_keys = vec!["output", "duplicates", "report"];
         let mut manifest = crate::pipeline::command::manifest_from_keys(
             step_id, self.command_path(), options,
             &["source"],
-            &["output", "duplicates", "report"],
+            &output_keys,
         );
         // Sorted run files in .cache/dedup_runs/ are intermediate artifacts
         manifest.intermediates.push("${cache}/dedup_runs/".to_string());
@@ -618,76 +621,9 @@ shuffle, KNN, or metadata alignment. The output index can be fed to
     }
 }
 
-// ---------------------------------------------------------------------------
-// Phase 0: Variance-based prefix width selection
-// ---------------------------------------------------------------------------
-
-/// Sample vectors and choose how many prefix components (1–10) to retain
-/// in sorted run records.
-///
-/// Strategy: for each leading dimension, compute the number of distinct
-/// values in the sample. As soon as a dimension has enough distinct values
-/// to separate the sample (≥ 90% unique among sampled values), that many
-/// prefix components suffice. If early dimensions are low-cardinality
-/// (e.g., quantized or categorical), more dimensions are needed.
-fn sample_prefix_width(
-    reader: &VecReader,
-    count: usize,
-    dim: usize,
-    ctx: &mut StreamContext,
-) -> usize {
-    let sample_count = std::cmp::min(VARIANCE_SAMPLE_SIZE, count);
-    let step = if count <= sample_count { 1 } else { count / sample_count };
-
-    let max_dims = MAX_PREFIX.min(dim);
-
-    // Collect sampled vectors (first max_dims components each)
-    let mut samples: Vec<Vec<f32>> = Vec::with_capacity(sample_count);
-
-    let pb = ctx.ui.bar_with_unit(sample_count as u64, "sampling dimensions", "vectors");
-    let mut sampled = 0usize;
-    let mut i = 0usize;
-    while i < count && sampled < sample_count {
-        if let Ok(vec) = reader.get_f32(i) {
-            let prefix: Vec<f32> = vec.iter().take(max_dims).copied().collect();
-            samples.push(prefix);
-            sampled += 1;
-        }
-        i += step;
-    }
-    pb.finish();
-
-    if samples.len() < 2 {
-        return max_dims;
-    }
-
-    // For each prefix length 1..max_dims, count how many distinct
-    // sort keys exist in the sample. Stop when distinctness ≥ 90%.
-    let threshold = (samples.len() as f64 * 0.90) as usize;
-    let mut chosen_width = max_dims;
-
-    for width in MIN_PREFIX..=max_dims {
-        let mut keys: Vec<Vec<u32>> = samples.iter()
-            .map(|s| s.iter().take(width).map(|&v| float_to_sortable(v)).collect())
-            .collect();
-        keys.sort();
-        keys.dedup();
-        let distinct = keys.len();
-
-        ctx.ui.log(&format!(
-            "  dim prefix {}: {} distinct / {} sampled ({:.1}%)",
-            width, distinct, samples.len(),
-            100.0 * distinct as f64 / samples.len() as f64,
-        ));
-
-        if distinct >= threshold {
-            chosen_width = width;
-            break;
-        }
-    }
-
-    chosen_width
-}
+// Variance sampling (Phase 0) removed — prefix width is fixed at
+// PREFIX_WIDTH (10 components). This provides strong discrimination
+// for all known embedding models.
 
 // ---------------------------------------------------------------------------
 // Phase 1: Create sorted runs

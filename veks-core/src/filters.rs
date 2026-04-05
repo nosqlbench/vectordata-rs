@@ -44,10 +44,13 @@ const INFRASTRUCTURE_FILES: &[&str] = &[
     "dataset.yaml",
     "dataset.yml",
     "dataset.json",
+    "dataset.jsonl",
     "dataset.log",
+    "runlog.jsonl",
     "catalog.json",
     "catalog.yaml",
     "variables.yaml",
+    "variables.json",
 ];
 
 /// Check if a file is infrastructure metadata.
@@ -80,13 +83,7 @@ pub fn is_intermediate_publishable(name: &str) -> bool {
 /// or infrastructure files whose mtime may be newer than catalogs
 /// without indicating actual content changes.
 pub fn is_catalog_staleness_exempt(name: &str) -> bool {
-    name == "catalog.json"
-        || name == "catalog.yaml"
-        || name == "dataset.yaml"
-        || name == "dataset.yml"
-        || name == "dataset.json"
-        || name == "dataset.log"
-        || name == "variables.yaml"
+    is_infrastructure_file(name)
         || name.ends_with(".mref")
 }
 

@@ -248,17 +248,18 @@ struct MetadataSlots {
     predicate_indices: Artifact,
 }
 
-/// The complete resolved pipeline graph.
+/// The complete resolved pipeline graph (SRD §12, §20).
 struct PipelineSlots {
     // Vector chain
     all_vectors: Artifact,
-    sort: Artifact,
-    zero_check: Artifact,
-    clean_ordinals: Artifact,
+    /// Unified prepare step: sort + dedup + normalize + zero-detect + norm-stats
+    prepare: Artifact,
     vector_count: Artifact,
 
     // Query chain
     self_search: bool,
+    /// True when non-HDF5 B+Q are combined into a single source (Strategy 1)
+    combined_bq: bool,
     shuffle: Option<Artifact>,
     query_vectors: Option<Artifact>,
     base_vectors: Artifact,
@@ -326,25 +327,13 @@ fn resolve_slots(args: &ImportArgs) -> PipelineSlots {
         Artifact::Identity { path: base_source.clone() }
     };
 
-    let sort = if !has_base_facet || args.no_dedup {
-        Artifact::Identity { path: String::new() } // no artifact
-    } else {
-        Artifact::Materialized {
-            step_id: "sort-and-dedup".into(),
-            output: "${cache}/sorted_ordinals.ivec".into(),
-        }
-    };
-
-    // Near-zero detection is integrated into extract-base (SRD §19).
-    // No separate zero_check step — the extract step handles it inline.
-    let zero_check = Artifact::Identity { path: String::new() };
-
-    let clean_ordinals = if !has_base_facet || args.no_dedup {
+    // Unified prepare step: sort + dedup + normalize + zero-detect + norm-stats (SRD §20)
+    let prepare = if !has_base_facet || args.no_dedup {
         Artifact::Identity { path: String::new() }
     } else {
         Artifact::Materialized {
-            step_id: "filter-ordinals".into(),
-            output: "${cache}/clean_ordinals.ivec".into(),
+            step_id: "prepare-vectors".into(),
+            output: "${cache}/sorted_ordinals.ivec".into(),
         }
     };
 
@@ -361,12 +350,19 @@ fn resolve_slots(args: &ImportArgs) -> PipelineSlots {
     let facets = resolve_facets(args);
     let wants_queries = facets.contains('Q');
     let has_separate_query = args.query_vectors.is_some();
-    // Self-search when queries are wanted but not provided separately
-    let self_search = wants_queries && !has_separate_query;
+    let is_hdf5_source = args.base_vectors.as_ref()
+        .map(|p| VecFormat::detect_from_path(p) == Some(VecFormat::Hdf5))
+        .unwrap_or(false);
+
+    // Query generation strategy (SRD §20.8):
+    // Strategy 1: Non-HDF5 B+Q → combine into single source, shuffle split
+    // Strategy 2: HDF5 B+Q → independent processing
+    // Strategy 3: Non-HDF5 B only → self-search via shuffle
+    let combined_bq = has_separate_query && !is_hdf5_source;
+    let self_search = wants_queries && (!has_separate_query || combined_bq);
     let has_queries = has_separate_query || self_search;
 
-    // Determine output extension from source format, canonicalized to the
-    // preferred short form (e.g. "fvecs" → "fvec").
+    // Determine output extension from source format
     let vec_ext = if needs_import { import_ext } else {
         args.base_vectors.as_ref()
             .and_then(|p| p.extension())
@@ -376,7 +372,9 @@ fn resolve_slots(args: &ImportArgs) -> PipelineSlots {
     };
 
     let (shuffle, query_vectors, base_vectors, base_count) = if self_search {
-        // Self-search: shuffle + extract
+        // Strategy 1 (combined B+Q) or Strategy 3 (B only): shuffle + extract
+        // For Strategy 1, base+query are combined before prepare-vectors,
+        // then shuffle produces disjoint train/test split.
         let shuffle = Artifact::Materialized {
             step_id: "generate-shuffle".into(),
             output: "${cache}/shuffle.ivec".into(),
@@ -394,44 +392,41 @@ fn resolve_slots(args: &ImportArgs) -> PipelineSlots {
             output: String::new(),
         };
         (Some(shuffle), Some(qv), bv, Some(bc))
-    } else if has_separate_query {
-        // Separate query file.
-        // The profile exposes query_vectors (the canonical facet name)
-        // which is produced by the overlap removal step. The pre-overlap
-        // raw queries go to query_vectors_raw in the same directory.
-        let query_source = args.query_vectors.as_ref().unwrap();
-        let qv_ext = if is_native_xvec_file(query_source) {
-            query_source.extension()
-                .and_then(|e| e.to_str())
-                .and_then(VecFormat::canonical_extension)
-                .unwrap_or("fvec")
-        } else {
-            vec_ext
+    } else if has_separate_query && is_hdf5_source {
+        // Strategy 2: HDF5 with separate query — independent processing.
+        // Queries get normalize + zero-filter via convert-queries.
+        // Base gets full prepare-vectors + shuffle treatment.
+        // The shuffle randomizes the base vector order after dedup,
+        // same as non-HDF5 datasets. Queries are not included in the
+        // shuffle since they come from a separate HDF5 dataset.
+        let shuffle = Artifact::Materialized {
+            step_id: "generate-shuffle".into(),
+            output: "${cache}/shuffle.ivec".into(),
         };
         let qv = Artifact::Materialized {
-            step_id: "remove-query-duplicates".into(),
-            output: format!("{}query_vectors.{}", pp, qv_ext),
+            step_id: "convert-queries".into(),
+            output: format!("{}query_vectors.{}", pp, vec_ext),
         };
-        // Base: extract from all_vectors when import was needed (HDF5, npy)
-        // OR when dedup/zero-check is active (native xvec with duplicates).
-        // In both cases, the extract-base step applies clean_ordinals to
-        // produce a deduped base_vectors file. Without this, KNN would scan
-        // the original file including duplicates, causing exact distance
-        // ties that make ground truth non-deterministic.
-        let needs_extraction = needs_import || !(args.no_dedup && args.no_zero_check);
-        let bv = if needs_extraction {
-            Artifact::Materialized {
-                step_id: "extract-base".into(),
-                output: format!("{}base_vectors.{}", pp, vec_ext),
-            }
-        } else {
-            Artifact::Identity { path: format!("{}base_vectors.{}", pp, vec_ext) }
+        let bv = Artifact::Materialized {
+            step_id: "extract-base".into(),
+            output: format!("{}base_vectors.{}", pp, vec_ext),
         };
-        (None, Some(qv), bv, None)
+        let bc = Artifact::Materialized {
+            step_id: "count-base".into(),
+            output: String::new(),
+        };
+        (Some(shuffle), Some(qv), bv, Some(bc))
     } else {
-        // No queries at all — use canonical profile path (symlinked)
-        let bv = Artifact::Identity { path: format!("{}base_vectors.{}", pp, vec_ext) };
-        (None, None, bv, None)
+        // No queries at all
+        let bv = Artifact::Materialized {
+            step_id: "extract-base".into(),
+            output: format!("{}base_vectors.{}", pp, vec_ext),
+        };
+        let bc = Artifact::Materialized {
+            step_id: "count-base".into(),
+            output: String::new(),
+        };
+        (None, None, bv, Some(bc))
     };
 
     // ── Metadata chain ───────────────────────────────────────────────
@@ -501,8 +496,8 @@ fn resolve_slots(args: &ImportArgs) -> PipelineSlots {
     };
 
     PipelineSlots {
-        all_vectors, sort, zero_check, clean_ordinals, vector_count,
-        self_search, shuffle, query_vectors, base_vectors, base_count,
+        all_vectors, prepare, vector_count,
+        self_search, combined_bq, shuffle, query_vectors, base_vectors, base_count,
         metadata, knn, filtered_knn,
     }
 }
@@ -671,12 +666,83 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
         });
     }
 
-    // sort (lexicographic sort + duplicate detection as byproduct)
-    if let Artifact::Materialized { .. } = &slots.sort {
+    // Source counts: record the original base and query vector counts
+    // before any processing (dedup, combine, zero removal).
+    if let Some(ref base_path) = args.base_vectors {
+        let rel = relativize_path(base_path, &args.output);
         steps.push(Step {
-            id: "sort-and-dedup".into(),
+            id: "count-source-base".into(),
+            run: "state set".into(),
+            description: None,
+            after: if last_vector_step.is_empty() { vec![] } else { vec![last_vector_step.into()] },
+            per_profile: false,
+            phase: 0,
+            options: vec![
+                ("name".into(), "source_base_count".into()),
+                ("value".into(), format!("count:{}", rel)),
+            ],
+        });
+    }
+    if let Some(ref query_path) = args.query_vectors {
+        let rel = relativize_path(query_path, &args.output);
+        steps.push(Step {
+            id: "count-source-queries".into(),
+            run: "state set".into(),
+            description: None,
+            after: vec![],
+            per_profile: false,
+            phase: 0,
+            options: vec![
+                ("name".into(), "source_query_count".into()),
+                ("value".into(), format!("count:{}", rel)),
+            ],
+        });
+    } else if args.self_search {
+        // Self-search: no separate query source
+        steps.push(Step {
+            id: "count-source-queries".into(),
+            run: "state set".into(),
+            description: None,
+            after: vec![],
+            per_profile: false,
+            phase: 0,
+            options: vec![
+                ("name".into(), "source_query_count".into()),
+                ("value".into(), "0".into()),
+            ],
+        });
+    }
+
+    // Dataset metadata flags — persisted to variables.yaml for stats
+    let is_shuffled = slots.shuffle.as_ref().map_or(false, |s| s.is_materialized());
+    for (name, value) in [
+        ("is_shuffled", is_shuffled.to_string()),
+        ("is_self_search", slots.self_search.to_string()),
+        ("combined_bq", slots.combined_bq.to_string()),
+        ("k", args.neighbors.to_string()),
+    ] {
+        steps.push(Step {
+            id: format!("set-{}", name),
+            run: "state set".into(),
+            description: None,
+            after: vec![],
+            per_profile: false,
+            phase: 0,
+            options: vec![
+                ("name".into(), name.into()),
+                ("value".into(), value),
+            ],
+        });
+    }
+
+    // prepare-vectors: sort + dedup (SRD §20)
+    // Normalization and zero detection happen during extraction, where
+    // each vector is already in memory for writing.
+    if let Artifact::Materialized { .. } = &slots.prepare {
+        steps.push(Step {
+            id: "prepare-vectors".into(),
             run: "compute sort".into(),
-            description: Some("Lexicographic sort producing sorted ordinals + duplicate report".into()),
+            description: Some("Sort and deduplicate vectors".into()),
             after: if last_vector_step.is_empty() { vec![] } else { vec![last_vector_step.into()] },
             per_profile: false,
             phase: 0,
@@ -695,13 +761,13 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
         });
     }
 
-    // set-duplicate-count (after sort, records number of elided duplicates)
-    if slots.sort.is_materialized() {
+    // count-duplicates (after prepare-vectors)
+    if slots.prepare.is_materialized() {
         steps.push(Step {
             id: "count-duplicates".into(),
             run: "state set".into(),
             description: None,
-            after: vec!["sort-and-dedup".into()],
+            after: vec!["prepare-vectors".into()],
             per_profile: false,
             phase: 0,
             options: vec![
@@ -709,51 +775,11 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
                 ("value".into(), "count:${cache}/dedup_duplicates.ivec".into()),
             ],
         });
-    }
 
-    // Near-zero detection is now integrated into extract-base (SRD §19).
-    // The extract step computes L2 norms for normalization and skips vectors
-    // below the threshold, writing zero_ordinals.ivec as a byproduct.
-    // No separate find-zeros or count-zeros steps are needed.
-
-    // clean-ordinals
-    if let Artifact::Materialized { .. } = &slots.clean_ordinals {
-        let mut after = vec![];
-        if slots.sort.is_materialized() {
-            after.push("sort-and-dedup".into());
-        }
-        // Zero detection is now in extract-base, so filter-ordinals
-        // only excludes duplicates. Near-zero vectors are filtered
-        // during extraction when L2 norms are computed for normalization.
-        steps.push(Step {
-            id: "filter-ordinals".into(),
-            run: "transform ordinals".into(),
-            description: Some("Filter sorted ordinals excluding duplicates".into()),
-            after,
-            per_profile: false,
-            phase: 0,
-            options: vec![
-                ("source".into(), slots.sort.path().into()),
-                ("duplicates".into(), "${cache}/dedup_duplicates.ivec".into()),
-                ("output".into(), "${cache}/clean_ordinals.ivec".into()),
-            ],
-        });
-    }
-
-    // set-clean-count (after clean-ordinals, used by shuffle)
-    if slots.clean_ordinals.is_materialized() {
-        steps.push(Step {
-            id: "count-clean".into(),
-            run: "state set".into(),
-            description: None,
-            after: vec!["filter-ordinals".into()],
-            per_profile: false,
-            phase: 0,
-            options: vec![
-                ("name".into(), "clean_count".into()),
-                ("value".into(), "count:${cache}/clean_ordinals.ivec".into()),
-            ],
-        });
+        // No separate filter-ordinals, count-clean, find-zeros, count-zeros,
+        // or measure-normals steps. All absorbed into prepare-vectors (SRD §20).
+        // The exclusion set (duplicates ∪ zeros) is applied directly by
+        // extract-base and extract-queries.
     }
 
     // Was the subset already applied by the subset-vectors or convert step?
@@ -761,46 +787,45 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
     let subset_applied = last_vector_step == "subset-vectors"
         || (slots.all_vectors.is_materialized() && args.base_fraction < 1.0 && !args.pedantic_dedup);
 
+    // ── Shuffle (all strategies that need randomized base order) ────
+    // Emitted whenever a shuffle artifact is materialized: self-search
+    // (Strategies 1 & 3) AND HDF5 with separate queries (Strategy 2).
+    // For self-search, the shuffle also provides the train/test split.
+    // For HDF5, the shuffle randomizes base vector order after dedup.
+    if let Some(ref shuffle) = slots.shuffle {
+        if shuffle.is_materialized() {
+            let shuffle_after = if slots.prepare.is_materialized() {
+                vec!["prepare-vectors".into()]
+            } else {
+                vec!["count-vectors".into()]
+            };
+            let shuffle_interval = if slots.prepare.is_materialized() {
+                "${clean_count}".to_string()
+            } else {
+                "${vector_count}".to_string()
+            };
+            let mut shuffle_opts = vec![
+                ("output".into(), "${cache}/shuffle.ivec".into()),
+                ("interval".into(), shuffle_interval),
+                ("seed".into(), format!("${{{}}}", "seed")),
+            ];
+            if slots.prepare.is_materialized() {
+                shuffle_opts.push(("ordinals".into(), slots.prepare.path().into()));
+            }
+            steps.push(Step {
+                id: "generate-shuffle".into(),
+                run: "generate shuffle".into(),
+                description: Some("Reproducible random permutation of base vector order".into()),
+                after: shuffle_after,
+                per_profile: false,
+                phase: 0,
+                options: shuffle_opts,
+            });
+        }
+    }
+
     // ── Query chain (self-search) ────────────────────────────────────
     if slots.self_search {
-        if let Some(ref shuffle) = slots.shuffle {
-            if shuffle.is_materialized() {
-                // Shuffle depends on clean_count (not vector_count) so it
-                // creates a permutation over only the clean ordinals.
-                let shuffle_after = if slots.clean_ordinals.is_materialized() {
-                    vec!["count-clean".into()]
-                } else {
-                    vec!["count-vectors".into()]
-                };
-                let shuffle_interval = if slots.clean_ordinals.is_materialized() {
-                    "${clean_count}".to_string()
-                } else {
-                    "${vector_count}".to_string()
-                };
-                let mut shuffle_opts = vec![
-                    ("output".into(), "${cache}/shuffle.ivec".into()),
-                    ("interval".into(), shuffle_interval),
-                    ("seed".into(), format!("${{{}}}", "seed")),
-                ];
-                // When clean_ordinals exists, pass it so the shuffle
-                // permutes actual source ordinals (not [0, N) indices).
-                // This ensures the extract steps get valid source ordinals
-                // that exclude duplicates and zero vectors.
-                if slots.clean_ordinals.is_materialized() {
-                    shuffle_opts.push(("ordinals".into(), slots.clean_ordinals.path().into()));
-                }
-                steps.push(Step {
-                    id: "generate-shuffle".into(),
-                    run: "generate shuffle".into(),
-                    description: Some("Reproducible random split via Fisher-Yates shuffle".into()),
-                    after: shuffle_after,
-                    per_profile: false,
-                    phase: 0,
-                    options: shuffle_opts,
-                });
-            }
-        }
-
         if let Some(ref qv) = slots.query_vectors {
             if qv.is_materialized() {
                 let vec_deps = if last_vector_step.is_empty() {
@@ -808,7 +833,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
                 } else {
                     vec![last_vector_step.into(), "generate-shuffle".into()]
                 };
-                let total_var = if slots.clean_ordinals.is_materialized() {
+                let total_var = if slots.prepare.is_materialized() {
                     "${clean_count}"
                 } else {
                     "${vector_count}"
@@ -818,8 +843,8 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
                 // only if the subset step didn't already apply the fraction.
                 // If subset-vectors ran, clean_count is already fractioned.
                 let base_upper = if args.base_fraction < 1.0 && !subset_applied {
-                    let count_dep = if slots.clean_ordinals.is_materialized() {
-                        "count-clean"
+                    let count_dep = if slots.prepare.is_materialized() {
+                        "prepare-vectors"
                     } else {
                         "count-vectors"
                     };
@@ -851,10 +876,9 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
                     ("ivec-file".into(), "${cache}/shuffle.ivec".into()),
                     ("output".into(), slots.query_vectors.as_ref().map(|q| q.path().to_string()).unwrap_or_else(|| format!("{}query_vectors.fvec", pp))),
                     ("range".into(), "[0,${query_count})".into()),
+                    ("facet".into(), "query_vectors".into()),
                 ];
-                if args.normalize {
-                    query_opts.push(("normalize".into(), "true".into()));
-                }
+                query_opts.push(("normalize".into(), "true".into()));
                 // Perturb each query by a minimal epsilon on dim 0, scaled by
                 // query index. This ensures every query produces a unique
                 // distance surface — no two base vectors are ever equidistant
@@ -874,15 +898,13 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
                     phase: 0,
                     options: query_opts,
                 });
-                let mut base_opts = vec![
+                let base_opts = vec![
                     ("source".into(), working_vectors.clone()),
                     ("ivec-file".into(), "${cache}/shuffle.ivec".into()),
                     ("output".into(), slots.base_vectors.path().into()),
                     ("range".into(), format!("[${{query_count}},{})", base_upper)),
+                    ("normalize".into(), "true".into()),
                 ];
-                if args.normalize {
-                    base_opts.push(("normalize".into(), "true".into()));
-                }
                 steps.push(Step {
                     id: "extract-base".into(),
                     run: "transform extract".into(),
@@ -908,20 +930,8 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
                         ("value".into(), format!("count:{}", slots.base_vectors.path())),
                     ],
                 });
-                // Measure normalization precision after base vectors are clean
-                steps.push(Step {
-                    id: "measure-normals".into(),
-                    run: "analyze measure-normals".into(),
-                    description: Some("Measure L2 normalization precision at f64".into()),
-                    after: vec!["extract-base".into()],
-                    per_profile: false,
-                    phase: 0,
-                    options: vec![
-                        ("input".into(), slots.base_vectors.path().into()),
-                        ("sample".into(), "10000".into()),
-                        ("seed".into(), format!("${{{}}}", "seed")),
-                    ],
-                });
+                // Normalization stats are computed by prepare-vectors (SRD §20).
+                // No separate measure-normals step needed.
             }
         }
     } else if let Some(ref qv) = slots.query_vectors {
@@ -931,28 +941,21 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
             let format = VecFormat::detect(query_source)
                 .map(|f| f.name().to_string())
                 .unwrap_or_else(|| "auto".into());
+            // Strategy 2 (HDF5): convert queries directly to final output.
+            // Normalize + zero-filter applied during conversion.
             steps.push(Step {
                 id: "convert-queries".into(),
                 run: "transform convert".into(),
-                description: Some("Import query vectors from source format".into()),
+                description: Some("Import and normalize query vectors from source format".into()),
                 after: vec![],
                 per_profile: false,
                 phase: 0,
                 options: vec![
-                    ("facet".into(), "query_vectors_raw".into()),
+                    ("facet".into(), "query_vectors".into()),
                     ("source".into(), relativize_path(query_source, &args.output)),
                     ("from".into(), format),
-                    // Write to _raw so the overlap step can produce the final query_vectors
-                    ("output".into(), {
-                        let p = std::path::Path::new(qv.path());
-                        let dir = p.parent().map(|d| d.to_string_lossy().to_string()).unwrap_or_default();
-                        let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("fvec");
-                        if dir.is_empty() {
-                            format!("query_vectors_raw.{}", ext)
-                        } else {
-                            format!("{}/query_vectors_raw.{}", dir, ext)
-                        }
-                    }),
+                    ("output".into(), qv.path().into()),
+                    ("normalize".into(), "true".into()),
                 ],
             });
         }
@@ -961,8 +964,11 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
         // - Native xvec with dedup: extract clean subset via clean_ordinals
         if slots.base_vectors.is_materialized() {
             let working = slots.all_vectors.path();
-            let after = if slots.clean_ordinals.is_materialized() {
-                vec!["filter-ordinals".into()]
+            let has_shuffle = slots.shuffle.as_ref().map_or(false, |s| s.is_materialized());
+            let after = if has_shuffle {
+                vec!["generate-shuffle".into()]
+            } else if slots.prepare.is_materialized() {
+                vec!["prepare-vectors".into()]
             } else if slots.all_vectors.is_materialized() {
                 vec!["convert-vectors".into()]
             } else {
@@ -972,17 +978,23 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
                 ("source".into(), working.into()),
                 ("output".into(), slots.base_vectors.path().into()),
             ];
-            if slots.clean_ordinals.is_materialized() {
-                base_opts.push(("ivec-file".into(), slots.clean_ordinals.path().into()));
+            if has_shuffle {
+                // Use shuffled ordinals for randomized base vector order
+                base_opts.push(("ivec-file".into(), "${cache}/shuffle.ivec".into()));
+                base_opts.push(("range".into(), format!("[0,{})", "${clean_count}")));
+            } else if slots.prepare.is_materialized() {
+                base_opts.push(("ivec-file".into(), slots.prepare.path().into()));
                 base_opts.push(("range".into(), format!("[0,{})", "${vector_count}")));
             }
-            if args.normalize {
-                base_opts.push(("normalize".into(), "true".into()));
-            }
+            base_opts.push(("normalize".into(), "true".into()));
             steps.push(Step {
                 id: "extract-base".into(),
                 run: "transform extract".into(),
-                description: Some("Extract base vectors to profile".into()),
+                description: Some(if has_shuffle {
+                    "Extract shuffled base vectors to profile".into()
+                } else {
+                    "Extract base vectors to profile".into()
+                }),
                 after,
                 per_profile: false,
                 phase: 0,
@@ -1001,20 +1013,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
                     ("value".into(), format!("count:{}", slots.base_vectors.path())),
                 ],
             });
-            // Measure normalization
-            steps.push(Step {
-                id: "measure-normals".into(),
-                run: "analyze measure-normals".into(),
-                description: Some("Measure L2 normalization precision at f64".into()),
-                after: vec!["extract-base".into()],
-                per_profile: false,
-                phase: 0,
-                options: vec![
-                    ("input".into(), slots.base_vectors.path().into()),
-                    ("sample".into(), "10000".into()),
-                    ("seed".into(), format!("${{{}}}", "seed")),
-                ],
-            });
+            // Normalization stats are computed by prepare-vectors (SRD §20).
         }
     }
 
@@ -1074,7 +1073,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
                     ("output".into(), format!("{}metadata_content.slab", pp)),
                     ("range".into(), if args.base_fraction < 1.0 && !subset_applied {
                         "[${query_count},${base_end})".into()
-                    } else if slots.clean_ordinals.is_materialized() {
+                    } else if slots.prepare.is_materialized() {
                         "[${query_count},${clean_count})".into()
                     } else {
                         "[${query_count},${vector_count})".into()
@@ -1141,7 +1140,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
                 ("selectivity".into(), args.selectivity.to_string()),
                 ("range".into(), if slots.base_count.is_some() {
                     "[0,${base_end})".into()
-                } else if slots.clean_ordinals.is_materialized() {
+                } else if slots.prepare.is_materialized() {
                     "[0,${clean_count})".into()
                 } else {
                     "[0,${vector_count})".into()
@@ -1186,46 +1185,11 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
                 }
             }
 
-            // Remove any query vectors that overlap with the base set.
-            // Skipped for self-search: dedup + shuffle + split guarantees
-            // disjointness by construction.
-            // The output goes to a separate file so the original query file
-            // is never modified (directional pipeline model).
-            let query_path_for_knn = if !slots.self_search {
-                let base_path_for_overlap = if slots.base_count.is_some() {
-                    format!("{}[0..${{base_count}})", slots.base_vectors.path())
-                } else {
-                    slots.base_vectors.path().to_string()
-                };
-                // The final query_vectors path (canonical facet name)
-                let final_query_path = slots.query_vectors.as_ref().unwrap().path().to_string();
-                // The raw input: query_vectors_raw in the same directory
-                let p = std::path::Path::new(&final_query_path);
-                let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("fvec");
-                let dir = p.parent().map(|d| d.to_string_lossy().to_string()).unwrap_or_default();
-                let raw_query_path = if dir.is_empty() {
-                    format!("query_vectors_raw.{}", ext)
-                } else {
-                    format!("{}/query_vectors_raw.{}", dir, ext)
-                };
-                steps.push(Step {
-                    id: "remove-query-duplicates".into(),
-                    run: "cleanup overlap".into(),
-                    description: Some("Remove query vectors that are duplicates of base vectors".into()),
-                    after: after.clone(),
-                    per_profile: false,
-                    phase: 0,
-                    options: vec![
-                        ("base".into(), base_path_for_overlap),
-                        ("query".into(), raw_query_path),
-                        ("output".into(), final_query_path.clone()),
-                    ],
-                });
-                after.push("remove-query-duplicates".into());
-                final_query_path
-            } else {
-                slots.query_vectors.as_ref().unwrap().path().to_string()
-            };
+            // No separate overlap removal step (SRD §20):
+            // - Strategy 1 (combined B+Q): combined before dedup, shuffle guarantees disjointness
+            // - Strategy 2 (HDF5): independent processing, no intermixing
+            // - Strategy 3 (B only): shuffle guarantees disjointness
+            let query_path = slots.query_vectors.as_ref().unwrap().path().to_string();
 
             steps.push(Step {
                 id: "compute-knn".into(),
@@ -1241,7 +1205,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
                         } else {
                             slots.base_vectors.path().to_string()
                         }),
-                        ("query".into(), query_path_for_knn.clone()),
+                        ("query".into(), query_path.clone()),
                         ("indices".into(), "neighbor_indices.ivec".into()),
                         ("distances".into(), "neighbor_distances.fvec".into()),
                         ("neighbors".into(), args.neighbors.to_string()),
@@ -1250,9 +1214,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
                     if args.compress_cache {
                         opts.push(("compress_cache".into(), "true".into()));
                     }
-                    if args.normalize {
-                        opts.push(("normalized".into(), "true".into()));
-                    }
+                    opts.push(("normalized".into(), "true".into()));
                     opts
                 },
             });
@@ -1328,7 +1290,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
                 ("base".into(), slots.base_vectors.path().into()),
                 ("query".into(), slots.query_vectors.as_ref().unwrap().path().into()),
                 ("metric".into(), args.metric.clone()),
-                ("normalized".into(), if args.normalize { "true" } else { "false" }.into()),
+                ("normalized".into(), "true".into()),
                 ("sample".into(), "100".into()),
                 ("seed".into(), format!("${{{}}}", "seed")),
                 ("output".into(), "${cache}/verify_knn_consolidated.json".into()),
@@ -1351,7 +1313,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
                     ("metadata".into(), slots.metadata.as_ref().unwrap().metadata_content.path().into()),
                     ("predicates".into(), format!("{}predicates.slab", pp)),
                     ("metric".into(), args.metric.clone()),
-                    ("normalized".into(), if args.normalize { "true" } else { "false" }.into()),
+                    ("normalized".into(), "true".into()),
                     ("sample".into(), "50".into()),
                     ("seed".into(), format!("${{{}}}", "seed")),
                     ("output".into(), "${cache}/verify_filtered_knn_consolidated.json".into()),
@@ -1407,6 +1369,26 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
         options: vec![],
     });
 
+    // ── JSON copies of YAML artifacts ─────────────────────────
+    steps.push(Step {
+        id: "generate-variables-json".into(),
+        run: "generate variables-json".into(),
+        description: Some("Generate variables.json from variables.yaml".into()),
+        after: vec!["generate-dataset-json".into()],
+        per_profile: false,
+        phase: 0,
+        options: vec![],
+    });
+    steps.push(Step {
+        id: "generate-dataset-log-jsonl".into(),
+        run: "generate dataset-log-jsonl".into(),
+        description: Some("Generate dataset.jsonl from dataset.log".into()),
+        after: vec!["generate-dataset-json".into()],
+        per_profile: false,
+        phase: 0,
+        options: vec![],
+    });
+
     // ── Merkle hash trees ────────────────────────────────────────
     // Runs before catalog generation so that all data files have
     // .mref hashes before the catalog snapshot is taken.
@@ -1414,7 +1396,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
         id: "generate-merkle".into(),
         run: "merkle create".into(),
         description: Some("Create merkle hash trees for all publishable data files".into()),
-        after: vec!["generate-dataset-json".into()],
+        after: vec!["generate-variables-json".into(), "generate-dataset-log-jsonl".into()],
         per_profile: false,
         phase: 0,
         options: vec![
@@ -1498,6 +1480,42 @@ fn profile_views(slots: &PipelineSlots, args: &ImportArgs, output_dir: &std::pat
 // YAML generation
 // ---------------------------------------------------------------------------
 
+/// Produce a human-readable description for a sized profile spec.
+fn describe_sized_spec(spec: &str) -> String {
+    let spec = spec.trim();
+    if let Some(rest) = spec.strip_prefix("mul:") {
+        if let Some((range, factor)) = rest.split_once('/') {
+            if range.contains("..") {
+                let (start, end) = range.split_once("..").unwrap();
+                format!("geometric series from {} to {}, multiplying by {} each step", start.trim(), end.trim(), factor.trim())
+            } else {
+                format!("geometric series from {}, multiplying by {} each step, up to dataset size", range.trim(), factor.trim())
+            }
+        } else {
+            "geometric series".into()
+        }
+    } else if let Some(rest) = spec.strip_prefix("fib:") {
+        if let Some((start, end)) = rest.split_once("..") {
+            format!("fibonacci series from {} to {}", start.trim(), end.trim())
+        } else {
+            "fibonacci series".into()
+        }
+    } else if let Some((range, step)) = spec.split_once('/') {
+        if let Some((start, end)) = range.split_once("..") {
+            let step = step.trim();
+            if step.bytes().any(|b| b.is_ascii_alphabetic()) {
+                format!("linear series from {} to {}, stepping by {}", start.trim(), end.trim(), step)
+            } else {
+                format!("linear series from {} to {}, {} equal divisions", start.trim(), end.trim(), step)
+            }
+        } else {
+            format!("profile at {}", spec)
+        }
+    } else {
+        format!("single profile at {}", spec)
+    }
+}
+
 fn generate_yaml(
     args: &ImportArgs,
     steps: &[Step],
@@ -1571,6 +1589,11 @@ fn generate_yaml(
         let spec = args.sized_profiles.as_ref().unwrap();
         out.push_str("\n  sized:\n");
         let specs: Vec<&str> = spec.split(',').map(|s| s.trim()).collect();
+        // Add a human-readable comment explaining each expression
+        for s in &specs {
+            let desc = describe_sized_spec(s);
+            out.push_str(&format!("    # \"{}\": {}\n", s, desc));
+        }
         let formatted: Vec<String> = specs.iter().map(|s| format!("\"{}\"", s)).collect();
         out.push_str(&format!("    ranges: [{}]\n", formatted.join(", ")));
         out.push_str("    facets:\n");
@@ -1679,16 +1702,10 @@ pub fn run(mut args: ImportArgs) {
         if let Some((is_normalized, sample_count, mean_norm)) = detect_normalized(base_path) {
             if is_normalized {
                 println!("Vectors detected as L2-normalized (mean norm={:.4}, n={})", mean_norm, sample_count);
-                if args.normalize {
-                    println!("  --normalize specified but vectors are already normalized; normalization will be skipped.");
-                }
+                println!("  Normalization during extraction will be a no-op for these vectors.");
             } else {
                 println!("Vectors are NOT L2-normalized (mean norm={:.4}, n={})", mean_norm, sample_count);
-                if args.normalize {
-                    println!("  Normalization will be applied during extraction.");
-                } else {
-                    println!("  Consider using --normalize to L2-normalize during extraction.");
-                }
+                println!("  Normalization will be applied during extraction.");
             }
             println!();
         }
@@ -1700,9 +1717,7 @@ pub fn run(mut args: ImportArgs) {
     // Report what was resolved
     println!("Resolving pipeline slots:");
     print_slot("all_vectors", &slots.all_vectors);
-    print_slot("sort", &slots.sort);
-    print_slot("zero_check", &slots.zero_check);
-    print_slot("clean_ordinals", &slots.clean_ordinals);
+    print_slot("prepare", &slots.prepare);
     print_slot("vector_count", &slots.vector_count);
     if slots.self_search {
         println!("  mode: self-search (query_count={})", args.query_count);
@@ -2013,9 +2028,7 @@ fn write_import_log(
     let _ = writeln!(w);
     let _ = writeln!(w, "Dataflow graph entry points ({} steps):", step_count);
     log_slot(&mut w, "all_vectors", &slots.all_vectors);
-    log_slot(&mut w, "sort", &slots.sort);
-    log_slot(&mut w, "zero_check", &slots.zero_check);
-    log_slot(&mut w, "clean_ordinals", &slots.clean_ordinals);
+    log_slot(&mut w, "prepare", &slots.prepare);
     log_slot(&mut w, "vector_count", &slots.vector_count);
     if slots.self_search {
         let _ = writeln!(w, "  mode: self-search (query_count={})", args.query_count);
@@ -2118,7 +2131,7 @@ pub fn detect_normalized(path: &Path) -> Option<(bool, usize, f64)> {
 
     if count == 0 || dim == 0 { return None; }
 
-    let sample_count = count.min(1000);
+    let sample_count = count.min(100_000);
     let step = if count <= sample_count { 1 } else { count / sample_count };
 
     let mut norms: Vec<f64> = Vec::with_capacity(sample_count);
@@ -2255,17 +2268,42 @@ pub fn detect_metric(path: &Path) -> (String, String) {
 /// name) for well-known metric keywords. Returns the metric and reason
 /// if a match is found.
 fn detect_metric_from_filename(path: &Path) -> Option<(String, String)> {
-    // Build a lowercased search string from the full path
-    let search = path.to_string_lossy().to_lowercase();
+    // Check each name in the symlink chain: the original symlink name,
+    // any intermediate symlinks, and the final target. The first match
+    // in the chain is definitive.
+    let mut current = path.to_path_buf();
+    loop {
+        let search = current.to_string_lossy().to_lowercase();
+        if let Some(result) = check_metric_keywords(&search, &current) {
+            return Some(result);
+        }
+        // Follow one symlink level
+        match std::fs::read_link(&current) {
+            Ok(target) => {
+                // Resolve relative symlink targets against the parent dir
+                current = if target.is_relative() {
+                    current.parent().unwrap_or(Path::new(".")).join(&target)
+                } else {
+                    target
+                };
+            }
+            Err(_) => break, // Not a symlink or error — stop
+        }
+    }
+    None
+}
 
-    // Check for specific metric keywords in the path.
-    // Order matters: check more specific patterns first.
-    if search.contains("dot_product") || search.contains("dotproduct") || search.contains("-dot-") {
-        Some(("DOT_PRODUCT".to_string(), format!("filename contains dot product keyword ({})", path.display())))
+/// Check a single path string for distance metric keywords.
+fn check_metric_keywords(search: &str, display_path: &Path) -> Option<(String, String)> {
+    if search.contains("dot_product") || search.contains("dotproduct")
+        || search.contains("-dot-") || search.contains("_dot_")
+        || search.contains("-dot.") || search.contains("_dot.")
+        || search.contains("/dot-") || search.contains("/dot_") {
+        Some(("DOT_PRODUCT".to_string(), format!("filename contains dot product keyword ({})", display_path.display())))
     } else if search.contains("euclidean") || search.contains("-l2-") || search.contains("_l2_") || search.contains("-l2.") || search.contains("_l2.") {
-        Some(("L2".to_string(), format!("filename contains L2/euclidean keyword ({})", path.display())))
+        Some(("L2".to_string(), format!("filename contains L2/euclidean keyword ({})", display_path.display())))
     } else if search.contains("angular") || search.contains("cosine") {
-        Some(("COSINE".to_string(), format!("filename contains angular/cosine keyword ({})", path.display())))
+        Some(("COSINE".to_string(), format!("filename contains angular/cosine keyword ({})", display_path.display())))
     } else {
         None
     }
@@ -2313,9 +2351,7 @@ fn print_slot(name: &str, artifact: &Artifact) {
 fn count_identity(slots: &PipelineSlots) -> usize {
     let mut n = 0;
     if !slots.all_vectors.is_materialized() { n += 1; }
-    if !slots.sort.is_materialized() { n += 1; }
-    if !slots.zero_check.is_materialized() { n += 1; }
-    if !slots.clean_ordinals.is_materialized() { n += 1; }
+    if !slots.prepare.is_materialized() { n += 1; }
     if !slots.base_vectors.is_materialized() { n += 1; }
     if let Some(ref qv) = slots.query_vectors { if !qv.is_materialized() { n += 1; } }
     if let Some(ref meta) = slots.metadata {
@@ -2398,7 +2434,7 @@ mod tests {
         assert!(slots.all_vectors.path().contains("base.fvec"));
 
         // sort should be materialized
-        assert!(slots.sort.is_materialized());
+        assert!(slots.prepare.is_materialized());
 
         // self-search should be active
         assert!(slots.self_search);
@@ -2488,7 +2524,7 @@ mod tests {
         args.no_dedup = true;
 
         let slots = resolve_slots(&args);
-        assert!(!slots.sort.is_materialized(), "sort should be identity when --no-dedup");
+        assert!(!slots.prepare.is_materialized(), "sort should be identity when --no-dedup");
 
         let steps = emit_steps(&slots, &args, &args.output);
         let step_ids: Vec<&str> = steps.iter().map(|s| s.id.as_str()).collect();

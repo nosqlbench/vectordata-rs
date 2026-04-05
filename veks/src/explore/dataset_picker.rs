@@ -63,9 +63,10 @@ fn build_rows(entries: &[CatalogEntry]) -> Vec<PickerRow> {
 
             let facets = profile.map(|p| facet_indicators(&p.views)).unwrap_or_default();
 
-            // Per-profile cache: check .mrkl files for the facets this profile references
+            // Per-profile cache: check local files or .mrkl download state
+            let ds_workspace = ds_cache.clone(); // download cache mirrors workspace layout
             let (valid_chunks, total_chunks) = if let Some(p) = profile {
-                profile_cache_coverage(&ds_cache, p)
+                profile_cache_coverage(&ds_cache, &ds_workspace, p)
             } else {
                 (0, 0)
             };
@@ -122,11 +123,11 @@ fn build_rows(entries: &[CatalogEntry]) -> Vec<PickerRow> {
 /// that this profile references.
 fn profile_cache_coverage(
     ds_cache: &std::path::Path,
+    ds_workspace: &std::path::Path,
     profile: &vectordata::dataset::profile::DSProfile,
 ) -> (u32, u32) {
     use vectordata::merkle::MerkleState;
 
-    if !ds_cache.is_dir() { return (0, 0); }
     let mut valid = 0u32;
     let mut total = 0u32;
 
@@ -141,12 +142,29 @@ fn profile_cache_coverage(
             source_path.as_str()
         };
 
-        // Check for .mrkl file in the cache
-        let mrkl_path = ds_cache.join(format!("{}.mrkl", clean));
-        if let Ok(state) = MerkleState::load(&mrkl_path) {
-            valid += state.valid_count();
-            total += state.shape().total_chunks;
+        // First: check if the actual file exists in the workspace.
+        // For locally-prepared datasets, files exist directly without
+        // merkle download tracking.
+        let local_path = ds_workspace.join(clean);
+        if local_path.exists() {
+            // File exists locally — count as fully cached (1 chunk = 1 valid)
+            valid += 1;
+            total += 1;
+            continue;
         }
+
+        // Second: check for .mrkl download state in the cache
+        if ds_cache.is_dir() {
+            let mrkl_path = ds_cache.join(format!("{}.mrkl", clean));
+            if let Ok(state) = MerkleState::load(&mrkl_path) {
+                valid += state.valid_count();
+                total += state.shape().total_chunks;
+                continue;
+            }
+        }
+
+        // File not present locally and no cache state — count as missing
+        total += 1;
     }
 
     (valid, total)

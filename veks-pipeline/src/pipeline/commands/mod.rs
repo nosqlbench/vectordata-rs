@@ -9,6 +9,7 @@
 
 // Removed: barrier, cleanup_cleanfvec
 pub mod catalog_generate;
+pub mod catalog_stats;
 pub mod require;
 pub mod source_window;
 pub mod analyze_checkendian;
@@ -24,6 +25,7 @@ pub mod analyze_stats;
 pub mod analyze_verifyknn;
 pub mod analyze_verifyprofiles;
 pub mod analyze_normals;
+pub mod analyze_norms;
 pub mod analyze_overlap;
 pub mod analyze_zeros;
 pub mod cleanup_overlap;
@@ -47,6 +49,8 @@ pub mod gen_predicated;
 pub mod gen_predicates;
 pub mod gen_shuffle;
 pub mod gen_sketch;
+pub mod gen_dataset_log_jsonl;
+pub mod gen_variables_json;
 pub mod gen_vectors;
 mod import;
 pub mod info_compute;
@@ -89,6 +93,7 @@ pub fn register_all(registry: &mut CommandRegistry) {
     registry.register("analyze verify-knn", analyze_verifyknn::factory);
     registry.register("analyze verify-profiles", analyze_verifyprofiles::factory);
     registry.register("analyze measure-normals", analyze_normals::factory);
+    registry.register("analyze norms", analyze_norms::factory);
     registry.register("analyze overlap", analyze_overlap::factory);
     registry.register("analyze zeros", analyze_zeros::factory);
 
@@ -118,6 +123,8 @@ pub fn register_all(registry: &mut CommandRegistry) {
     registry.register("generate predicates", gen_predicates::factory);
     registry.register("generate shuffle", gen_shuffle::factory);
     registry.register("generate sketch", gen_sketch::factory);
+    registry.register("generate dataset-log-jsonl", gen_dataset_log_jsonl::factory);
+    registry.register("generate variables-json", gen_variables_json::factory);
     registry.register("generate vectors", gen_vectors::factory);
 
     // ── merkle ───────────────────────────────────────────────────────
@@ -154,6 +161,7 @@ pub fn register_all(registry: &mut CommandRegistry) {
 
     // ── catalog (pipeline step for dataset index generation) ─────────
     registry.register("catalog generate", catalog_generate::factory);
+    registry.register("catalog stats", catalog_stats::factory);
 
     // ── pipeline orchestration ─────────────────────────────────────
     registry.register("pipeline require", require::factory);

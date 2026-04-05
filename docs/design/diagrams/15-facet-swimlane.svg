@@ -357,8 +357,8 @@ Recorded in variables.yaml for provenance.</title>
   </g>
   <g>
     <title>Whether vectors pass normalization quality check.
-Computed during prepare-vectors from L2 norm epsilon distribution (f64).
-Threshold: 1e-5 for f32, 1e-14 for f64, 1e-1 for f16.</title>
+Set to true by extract-base after L2-normalization during extraction.
+All extracted vectors are normalized by construction.</title>
     <rect x="24" y="250" width="72" height="16" rx="8" fill="white" stroke="#4caf50" stroke-width="1" opacity="0.9" />
     <text x="60" y="262" text-anchor="middle" font-size="8" fill="#4caf50" font-style="italic">is_normalized</text>
     <line x1="102" y1="258" x2="96" y2="258" stroke="#4caf50" stroke-width="0.8" opacity="0.5" />

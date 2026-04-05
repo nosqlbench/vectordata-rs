@@ -152,7 +152,12 @@ impl DatasetConfig {
             if vars_path.exists() {
                 if let Ok(content) = std::fs::read_to_string(&vars_path) {
                     if let Ok(vars) = serde_yaml::from_str::<indexmap::IndexMap<String, String>>(&content) {
-                        config.profiles.expand_deferred_sized(&vars);
+                        let base_count: u64 = vars.get("base_count")
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(0);
+                        if base_count > 0 {
+                            config.profiles.expand_deferred_sized(&vars, base_count);
+                        }
                     }
                 }
             }

@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::event::{ProgressId, ProgressKind, ResourceMetrics, UiEvent};
+use super::logging_sink::LogWriters;
 use super::sink::UiSink;
 
 /// Owned handle to a single progress indicator.
@@ -78,12 +79,21 @@ impl Drop for ProgressHandle {
 #[derive(Clone)]
 pub struct UiHandle {
     sink: Arc<dyn UiSink>,
+    log_writers: Option<LogWriters>,
 }
 
 impl UiHandle {
     /// Wrap a sink in a handle.
     pub fn new(sink: Arc<dyn UiSink>) -> Self {
-        UiHandle { sink }
+        UiHandle { sink, log_writers: None }
+    }
+
+    /// Attach persistent log writers (plain text + JSONL).
+    ///
+    /// Once set, every `log()` call writes to the TUI sink and both
+    /// log files in lock-step.
+    pub fn set_log_writers(&mut self, writers: Option<LogWriters>) {
+        self.log_writers = writers;
     }
 
     /// Access the underlying sink.
@@ -178,15 +188,16 @@ impl UiHandle {
 
     /// Emit a log line above the progress region.
     ///
-    /// Sends the event directly to the sink for immediate display, and
-    /// also emits `log::info!()` for persistent file logging. The
-    /// `PipelineLogger` skips TUI forwarding for "ui" target messages
-    /// to avoid duplication.
+    /// Writes to both the TUI sink and the persistent log file in
+    /// lock-step. The file write is direct (not through `log::set_logger`)
+    /// so it works regardless of whether the global logger was installed.
     pub fn log(&self, message: &str) {
         self.sink.send(UiEvent::Log {
             message: message.to_string(),
         });
-        log::info!(target: "ui", "{}", message);
+        if let Some(ref writers) = self.log_writers {
+            super::logging_sink::write_to_log(writers, message);
+        }
     }
 
     /// Emit raw text (no newline).

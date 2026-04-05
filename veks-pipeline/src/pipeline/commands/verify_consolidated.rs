@@ -24,7 +24,6 @@
 
 use std::collections::BinaryHeap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::Instant;
 
 use crate::pipeline::command::*;
@@ -177,6 +176,7 @@ impl CommandOp for VerifyKnnConsolidatedOp {
     fn describe_resources(&self) -> Vec<ResourceDesc> {
         vec![
             ResourceDesc { name: "threads".into(), description: "Parallel verification".into(), adjustable: true },
+            ResourceDesc { name: "mem".into(), description: "GT indices and heap memory".into(), adjustable: false },
         ]
     }
 
@@ -207,7 +207,7 @@ impl CommandOp for VerifyKnnConsolidatedOp {
         };
         let threads: usize = match options.parse_opt::<usize>("threads") {
             Ok(Some(v)) if v > 0 => v,
-            _ => crate::pipeline::physical_core_count(),
+            _ => ctx.governor.current_or("threads", ctx.threads as u64) as usize,
         };
 
         let base_path = resolve_path(base_str, &ctx.workspace);
@@ -216,7 +216,7 @@ impl CommandOp for VerifyKnnConsolidatedOp {
 
         // Discover profiles from dataset.yaml
         let dataset_path = ctx.workspace.join("dataset.yaml");
-        let config = match DatasetConfig::load(&dataset_path) {
+        let config = match DatasetConfig::load_and_resolve(&dataset_path) {
             Ok(c) => c,
             Err(e) => return error_result(format!("failed to load dataset.yaml: {}", e), start),
         };
@@ -224,6 +224,7 @@ impl CommandOp for VerifyKnnConsolidatedOp {
         // Collect profiles sorted by size ascending.
         // Read KNN paths from profile views rather than assuming a fixed
         // directory layout — classic-mode datasets store files in the root.
+        // Uses load_and_resolve to expand deferred sized profiles.
         let mut profiles: Vec<(String, u64, PathBuf, PathBuf)> = Vec::new();
         for (name, profile) in &config.profiles.profiles {
             let bc = profile.base_count.unwrap_or(u64::MAX);
@@ -237,6 +238,27 @@ impl CommandOp for VerifyKnnConsolidatedOp {
                 profiles.push((name.clone(), bc, indices_path, distances_path));
             }
         }
+
+        // Also discover profiles from the profiles/ directory that may
+        // not be in the config (e.g., sized profiles with deferred expansion).
+        let profiles_dir = ctx.workspace.join("profiles");
+        if profiles_dir.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(&profiles_dir) {
+                for entry in entries.flatten() {
+                    if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) { continue; }
+                    let pname = entry.file_name().to_string_lossy().to_string();
+                    if profiles.iter().any(|(n, _, _, _)| n == &pname) { continue; }
+                    let indices_path = entry.path().join("neighbor_indices.ivec");
+                    let distances_path = entry.path().join("neighbor_distances.fvec");
+                    if indices_path.exists() {
+                        // Parse base_count from the directory name (sized profile names encode the count)
+                        let bc = vectordata::dataset::source::parse_number_with_suffix(&pname)
+                            .unwrap_or(u64::MAX);
+                        profiles.push((pname, bc, indices_path, distances_path));
+                    }
+                }
+            }
+        }
         profiles.sort_by(|(a_name, _, _, _), (b_name, _, _, _)| {
             let a_bc = config.profiles.profile(a_name).and_then(|p| p.base_count);
             let b_bc = config.profiles.profile(b_name).and_then(|p| p.base_count);
@@ -247,10 +269,27 @@ impl CommandOp for VerifyKnnConsolidatedOp {
             return error_result("no profiles with KNN indices found".to_string(), start);
         }
 
-        ctx.ui.log(&format!(
-            "verify-knn-consolidated: {} profiles, {} sample queries, metric={:?}, threads={}",
-            profiles.len(), sample_count, kernel_metric, threads,
-        ));
+        // Open base vectors for the scan.
+        let f32_base_reader = match vectordata::io::MmapVectorReader::<f32>::open_fvec(&base_path) {
+            Ok(r) => r,
+            Err(e) => return error_result(format!("failed to open base as f32: {}", e), start),
+        };
+        let base_count = VectorReader::<f32>::count(&f32_base_reader);
+        let dim = VectorReader::<f32>::dim(&f32_base_reader);
+        f32_base_reader.advise_sequential();
+
+        // Validate: no profile should have base_count exceeding the actual
+        // dataset. Profile expansion is required to enforce this invariant
+        // at generation time — post-hoc filtering is not allowed.
+        for (name, bc, _, _) in &profiles {
+            if *bc != u64::MAX && (*bc as usize) > base_count {
+                return error_result(format!(
+                    "profile '{}' has base_count {} but dataset only has {} base vectors — \
+                     regenerate profiles with correct base_count",
+                    name, bc, base_count,
+                ), start);
+            }
+        }
 
         // Load query vectors (any float format)
         let query_reader = match AnyFloatReader::open(&query_path) {
@@ -273,7 +312,12 @@ impl CommandOp for VerifyKnnConsolidatedOp {
         }
         let num_samples = sample_indices.len();
 
-        // Load GT indices for all profiles
+        ctx.ui.log(&format!(
+            "verify-knn-consolidated: {} profiles, {} sample queries, metric={:?}, threads={}",
+            profiles.len(), sample_count, kernel_metric, threads,
+        ));
+
+        // Load GT indices for valid profiles only
         let mut profile_gts: Vec<Vec<Vec<i32>>> = Vec::with_capacity(profiles.len());
         for (name, _, indices_path, _) in &profiles {
             let gt_reader = match MmapVectorReader::<i32>::open_ivec(indices_path) {
@@ -304,18 +348,7 @@ impl CommandOp for VerifyKnnConsolidatedOp {
             profiles.len(), num_samples, k,
         ));
 
-        // Open base vectors (any float format)
-        let base_reader = match AnyFloatReader::open(&base_path) {
-            Ok(r) => Arc::new(r),
-            Err(e) => return error_result(format!("failed to open base: {}", e), start),
-        };
-        let base_count = base_reader.count();
-        let dim = base_reader.dim();
-
         // Pack sample queries for cache-friendly SIMD.
-        // Convert to f32 vecs for format-agnostic packing.
-        #[allow(unused_imports)]
-        use simd_distance::SIMD_BATCH_WIDTH;
         let sample_queries_f32: Vec<Vec<f32>> = sample_indices.iter()
             .map(|&qi| query_reader.get_f32(qi))
             .collect();
@@ -330,92 +363,143 @@ impl CommandOp for VerifyKnnConsolidatedOp {
         let dist_fn = simd_distance::select_distance_fn(kernel_metric);
         let batched_fn = simd_distance::select_batched_fn_f32(kernel_metric);
 
-        // Open base as MmapVectorReader<f32> for direct use with compute_knn's function
-        let f32_base_reader = match vectordata::io::MmapVectorReader::<f32>::open_fvec(&base_path) {
-            Ok(r) => r,
-            Err(e) => return error_result(format!("failed to open base as f32: {}", e), start),
-        };
-
         ctx.ui.log(&format!(
-            "  scanning {} base vectors (compute-knn path, {} sample queries)",
-            base_count, num_samples,
+            "  scanning {} base vectors ({} sample queries, {} threads)",
+            base_count, num_samples, threads,
         ));
 
         let progress = std::sync::atomic::AtomicU64::new(0);
-        let pb = ctx.ui.bar_with_unit(base_count as u64, "verifying", "vectors");
+        let scan_pb = ctx.ui.bar_with_unit(base_count as u64, "scanning base", "vectors");
         let profile_pb = ctx.ui.bar_with_unit(profiles.len() as u64, "profiles verified", "profiles");
 
-        // Compute profile boundaries (sorted ascending)
-        let mut boundaries: Vec<usize> = profiles.iter()
-            .map(|(_, bc, _, _)| if *bc == u64::MAX { base_count } else { *bc as usize })
-            .collect();
-        if boundaries.last().map_or(true, |&b| b < base_count) {
-            boundaries.push(base_count);
+        // Compute unique profile boundaries (sorted ascending, deduped).
+        // Each boundary is a base_count at which one or more profiles
+        // should be verified.
+        let mut boundary_profiles: Vec<(usize, Vec<usize>)> = Vec::new();
+        {
+            let mut boundary_map: std::collections::BTreeMap<usize, Vec<usize>> =
+                std::collections::BTreeMap::new();
+            for (pi, &(_, pbc, _, _)) in profiles.iter().enumerate() {
+                let bc = if pbc == u64::MAX { base_count } else { (pbc as usize).min(base_count) };
+                boundary_map.entry(bc).or_default().push(pi);
+            }
+            for (bc, pis) in boundary_map {
+                boundary_profiles.push((bc, pis));
+            }
         }
 
-        // For each profile boundary, compute KNN up to that boundary
-        // using the same single-pass function as compute-knn.
-        let mut results: Vec<(String, usize, usize)> = Vec::new();
+        let mut results: Vec<(String, usize, usize)> = vec![
+            (String::new(), 0, 0); profiles.len()
+        ];
         let mut cumulative_results: Vec<Vec<Neighbor>> = (0..num_samples).map(|_| Vec::new()).collect();
+        let stride = 100_000usize;
+        let effective_threads = threads.min(num_samples).max(1);
+        let base_ref = &f32_base_reader;
+        let mut prev_boundary = 0usize;
+        let mut profiles_verified = 0usize;
+        let scan_pb_ref = &scan_pb;
 
-        // Process the largest boundary (covers all profiles)
-        let max_boundary = *boundaries.iter().max().unwrap_or(&base_count);
-        let stride = (max_boundary + 9) / 10;
+        // Scan base vectors in segments between profile boundaries.
+        // After each segment, the cumulative heaps contain the correct
+        // top-k for [0, boundary), so we can verify profiles immediately.
+        for (boundary, profile_indices) in &boundary_profiles {
+            let seg_start = prev_boundary;
+            let seg_end = *boundary;
 
-        super::compute_knn::find_top_k_batch_f32(
-            &sample_query_refs,
-            &f32_base_reader,
-            0,
-            max_boundary.min(base_count),
-            k,
-            dist_fn,
-            batched_fn,
-            kernel_metric,
-            dim,
-            &mut cumulative_results,
-            stride,
-            &progress,
-        );
-        pb.set_position(max_boundary.min(base_count) as u64);
+            if seg_end > seg_start {
+                // Parallel scan of this segment
+                std::thread::scope(|scope| {
+                    let progress_ref = &progress;
 
-        // Build heaps from results for comparison against GT
-        let combined_heaps: Vec<BinaryHeap<Neighbor>> = cumulative_results.iter()
-            .map(|v| v.iter().copied().collect())
-            .collect();
+                    if effective_threads > 1 {
+                        let chunk_size = (num_samples + effective_threads - 1) / effective_threads;
+                        let result_chunks: Vec<&mut [Vec<Neighbor>]> =
+                            cumulative_results.chunks_mut(chunk_size).collect();
 
-        // Check each profile boundary
-        for (pi, &(ref pname, pbc, _, _)) in profiles.iter().enumerate() {
-            let bc = if pbc == u64::MAX { base_count } else { pbc as usize };
-            // For profiles with base_count < max, we need to filter results
-            // to only include neighbors with index < bc
-            let profile_heaps: Vec<BinaryHeap<Neighbor>> = if bc < max_boundary {
-                cumulative_results.iter().map(|v| {
-                    let filtered: Vec<Neighbor> = v.iter()
-                        .filter(|n| (n.index as usize) < bc)
-                        .copied()
-                        .collect();
-                    let mut sorted = filtered;
-                    sorted.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap_or(std::cmp::Ordering::Equal)
-                        .then(a.index.cmp(&b.index)));
-                    sorted.truncate(k);
-                    sorted.into_iter().collect()
-                }).collect()
-            } else {
-                combined_heaps.iter().map(|h| h.clone()).collect()
-            };
+                        for (ci, chunk) in result_chunks.into_iter().enumerate() {
+                            let chunk_start = ci * chunk_size;
+                            let chunk_len = chunk.len();
+                            let chunk_queries: Vec<&[f32]> = (0..chunk_len)
+                                .map(|i| sample_query_refs[chunk_start + i])
+                                .collect();
 
-            let gt = &profile_gts[pi];
-            let (pass, fail) = verify_heaps_against_gt(&profile_heaps, gt, k, &sample_indices, &ctx.ui);
-            let total = pass + fail;
-            let recall = if total > 0 { pass as f64 / total as f64 } else { 0.0 };
-            ctx.ui.log(&format!(
-                "  profile '{}' (base_count={}): {}/{} pass, {} fail, recall@{}={:.4}",
-                pname, bc, pass, total, fail, k, recall,
-            ));
-            results.push((pname.clone(), pass, fail));
-            profile_pb.set_position((pi + 1) as u64);
+                            scope.spawn(move || {
+                                super::compute_knn::find_top_k_batch_f32(
+                                    &chunk_queries,
+                                    base_ref,
+                                    seg_start,
+                                    seg_end,
+                                    k,
+                                    dist_fn,
+                                    batched_fn,
+                                    kernel_metric,
+                                    dim,
+                                    chunk,
+                                    stride,
+                                    progress_ref,
+                                );
+                            });
+                        }
+
+                        // Tick thread for this segment
+                        let num_batches = effective_threads as u64;
+                        scope.spawn(move || {
+                            let target = seg_end as u64 * num_batches;
+                            loop {
+                                let raw = progress_ref.load(std::sync::atomic::Ordering::Relaxed);
+                                scan_pb_ref.set_position(raw / num_batches);
+                                if raw >= target {
+                                    break;
+                                }
+                                std::thread::sleep(std::time::Duration::from_millis(100));
+                            }
+                            scan_pb_ref.set_position(seg_end as u64);
+                        });
+                    } else {
+                        super::compute_knn::find_top_k_batch_f32(
+                            &sample_query_refs,
+                            base_ref,
+                            seg_start,
+                            seg_end,
+                            k,
+                            dist_fn,
+                            batched_fn,
+                            kernel_metric,
+                            dim,
+                            &mut cumulative_results,
+                            stride,
+                            &progress,
+                        );
+                        scan_pb_ref.set_position(
+                            progress.load(std::sync::atomic::Ordering::Relaxed));
+                    }
+                });
+            }
+
+            prev_boundary = seg_end;
+
+            // Verify all profiles at this boundary. The cumulative heaps
+            // now contain the correct top-k for vectors [0, boundary).
+            let verify_heaps: Vec<BinaryHeap<Neighbor>> = cumulative_results.iter()
+                .map(|v| v.iter().copied().collect())
+                .collect();
+
+            for &pi in profile_indices {
+                let (ref pname, _, _, _) = profiles[pi];
+                let gt = &profile_gts[pi];
+                let (pass, fail) = verify_heaps_against_gt(&verify_heaps, gt, k, &sample_indices, &ctx.ui);
+                let total = pass + fail;
+                let recall = if total > 0 { pass as f64 / total as f64 } else { 0.0 };
+                ctx.ui.log(&format!(
+                    "  profile '{}' (base_count={}): {}/{} pass, {} fail, recall@{}={:.4}",
+                    pname, seg_end, pass, total, fail, k, recall,
+                ));
+                results[pi] = (pname.clone(), pass, fail);
+                profiles_verified += 1;
+                profile_pb.set_position(profiles_verified as u64);
+            }
         }
-        pb.finish();
+        scan_pb.finish();
         profile_pb.finish();
 
         // Write consolidated report

@@ -115,7 +115,7 @@ the superset graph and its resolution rule.
 
 | Slot | Type | Identity when | Materialized as |
 |------|------|---------------|-----------------|
-| `sort_normalize` | Ordinals + Data | `--no-dedup` and `--no-normalize` | `compute sort` — external merge sort with in-segment L2 normalization (f64) and near-zero detection (L2 < 1×10⁻⁶). Produces sorted ordinals, duplicate index, zero index, and sorted+normalized run files. See SRD §20.3 |
+| `sort_normalize` | Ordinals | `--no-dedup` | `compute sort` — external merge sort with prefix-key deduplication. Produces sorted ordinals and duplicate index. Normalization and near-zero detection happen during extraction (SRD §20.4) |
 
 ### Count and statistics slots
 

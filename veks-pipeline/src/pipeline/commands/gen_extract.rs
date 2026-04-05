@@ -133,6 +133,7 @@ facets of the dataset.
                 )
             }
         };
+        fvec_reader.advise_sequential();
 
         // Validate extension — catch mismatched formats early
         if ElementType::from_path(&fvec_path).ok() != Some(ElementType::F32) {
@@ -1635,31 +1636,72 @@ fn sorted_index_extract_fvec(
     let extract_count = effective_end - range_start;
     let record_bytes = 4 + (dim as usize) * 4; // dim header + f32 values
 
-    // Governor-controlled thread pool for parallel phases
     let threads = ctx.governor.current_or("threads", ctx.threads as u64).max(1) as usize;
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(threads)
-        .build()
-        .ok();
+
+    // Determine normalization threshold for this element type
+    let etype = crate::pipeline::element_type::ElementType::from_path(output_path)
+        .unwrap_or(crate::pipeline::element_type::ElementType::F32);
+    let norm_threshold = etype.normalization_threshold(dim as usize).unwrap_or(1e-5);
+
+    // If normalize is requested, sample source vectors to detect whether
+    // they are already normalized. If mean |‖x‖₂ − 1| < norm_threshold,
+    // skip the per-component multiply (just copy + zero-detect + stats).
+    let skip_normalize = if normalize {
+        let sample_size = 100_000.min(fvec_count);
+        let step = if sample_size > 0 { fvec_count / sample_size } else { 1 };
+        let dim_usize = dim as usize;
+        let mut epsilon_sum = 0.0f64;
+        let mut sampled = 0usize;
+        for i in (0..fvec_count).step_by(step.max(1)) {
+            let slice = fvec_reader.get_slice(i);
+            let mut norm_sq = 0.0f64;
+            for d in 0..dim_usize {
+                let v = slice[d] as f64;
+                norm_sq += v * v;
+            }
+            epsilon_sum += (norm_sq.sqrt() - 1.0).abs();
+            sampled += 1;
+            if sampled >= sample_size { break; }
+        }
+        let mean_epsilon = if sampled > 0 { epsilon_sum / sampled as f64 } else { f64::MAX };
+        if mean_epsilon < norm_threshold {
+            ctx.ui.log(&format!(
+                "  source already normalized (mean_ε={:.2e} < {:.0e}, {} samples) — skipping normalization multiply",
+                mean_epsilon, norm_threshold, sampled,
+            ));
+            true
+        } else {
+            ctx.ui.log(&format!(
+                "  source not normalized (mean_ε={:.2e} >= {:.0e}) — normalizing during extraction",
+                mean_epsilon, norm_threshold,
+            ));
+            false
+        }
+    } else {
+        false
+    };
+
     ctx.ui.log(&format!("fvec-extract: using {} threads", threads));
 
     // Partition sizing — the buffer must fit comfortably in physical RAM
     // alongside the source mmap, OS page cache, and other allocations.
     //
-    // Strategy: use at most 25% of system RAM for the partition buffer.
-    // The remaining 75% is for: source mmap page cache, output file
-    // page cache, OS, other process allocations, and headroom.
+    // Strategy: use at most 10% of system RAM for the partition buffer.
+    // The remaining 90% is for: source mmap page cache, output file
+    // page cache, OS, thread stacks, and headroom. Conservative to
+    // avoid OOM kills on large datasets.
     // Floor of 256 MiB ensures progress even on small systems.
     let system_ram = half_system_ram() as usize * 2;
     let source_size = fvec_count * record_bytes;
     let output_size = extract_count * record_bytes;
 
-    // Reserve space for source + output page cache, then take 25% of remainder
+    // Reserve space for source + output page cache, then take 10% of remainder
     let page_cache_reserve = source_size.min(system_ram / 4) + output_size.min(system_ram / 4);
     let available = system_ram.saturating_sub(page_cache_reserve);
-    let safe_budget = (available / 4).max(256 * 1024 * 1024); // min 256 MiB
+    let safe_budget = (available / 10).max(256 * 1024 * 1024); // min 256 MiB
 
-    let mem_budget = ctx.governor.offer_demand("mem", 0, safe_budget as u64) as usize;
+    let governor_offer = ctx.governor.offer_demand("mem", 0, safe_budget as u64) as usize;
+    let mem_budget = governor_offer.min(safe_budget);
 
     let records_per_partition = (mem_budget / record_bytes).max(1);
     let raw_partitions = (extract_count + records_per_partition - 1) / records_per_partition;
@@ -1692,14 +1734,27 @@ fn sorted_index_extract_fvec(
         if num_partitions > 1 { format!(" (pass {}/{})", p + 1, num_partitions) } else { String::new() }
     };
 
-    // Pre-allocate buffers outside the loop to avoid huge alloc/dealloc between passes
+    // Pre-allocate read plan outside the loop
     let max_part_len = partition_size;
     let mut read_plan: Vec<(usize, usize)> = Vec::with_capacity(max_part_len);
-    let mut part_buf: Vec<u8> = vec![0u8; max_part_len * record_bytes];
 
     // Tracking: near-zero vectors skipped during extraction
     let mut zero_ordinals: Vec<usize> = Vec::new();
     let mut total_written: usize = 0;
+
+    // Accumulators for norm stats across all passes
+    let mut total_src_norm_sum = 0.0f64;
+    let mut total_src_norm_sum_sq = 0.0f64;
+    let mut total_src_norm_min = f64::MAX;
+    let mut total_src_norm_max = 0.0f64;
+    let mut total_src_norm_count = 0usize;
+    let mut total_src_norm_samples: Vec<f64> = Vec::new();
+    let mut total_out_norm_sum = 0.0f64;
+    let mut total_out_norm_sum_sq = 0.0f64;
+    let mut total_out_norm_min = f64::MAX;
+    let mut total_out_norm_max = 0.0f64;
+    let mut total_out_norm_count = 0usize;
+    let mut total_out_norm_samples: Vec<f64> = Vec::new();
 
     for pass in 0..num_partitions {
         let part_start = pass * partition_size;
@@ -1736,8 +1791,11 @@ fn sorted_index_extract_fvec(
             read_plan.sort_unstable_by_key(|&(src, _)| src);
         }
 
-        let label = if normalize {
+        let label = if normalize && !skip_normalize {
             format!("extract+normalize{}{}", pass_label(pass),
+                if is_sorted { "" } else { " (shuffled)" })
+        } else if normalize && skip_normalize {
+            format!("extract+verify-norms{}{}", pass_label(pass),
                 if is_sorted { "" } else { " (shuffled)" })
         } else {
             format!("extract{}{}", pass_label(pass),
@@ -1746,81 +1804,220 @@ fn sorted_index_extract_fvec(
         let extract_pb = ctx.ui.bar_with_unit(read_plan.len() as u64, &label, "vectors");
         let dim_usize = dim as usize;
 
-        let mut write_cursor: usize = 0; // running output position in part_buf
-        for (i, &(source_idx, _local_pos)) in read_plan.iter().enumerate() {
-            let src_slice = fvec_reader.get_slice(source_idx);
+        // Parallel extract+normalize: split read_plan into chunks, each
+        // thread reads from the mmap, normalizes, and writes into its own
+        // scratch buffer. After all threads complete, compact the thread
+        // buffers into part_buf sequentially (skipping zero-vector gaps).
+        let extract_threads = ctx.governor.current_or("threads", ctx.threads as u64)
+            .max(1) as usize;
+        let chunk_size = (read_plan.len() + extract_threads - 1) / extract_threads;
+        let progress = std::sync::atomic::AtomicU64::new(0);
 
-            if normalize {
-                // L2 norm computed in f64 precision (SRD §18, §19).
-                let mut norm_sq = 0.0f64;
-                for d in 0..dim_usize {
-                    let v = src_slice[d] as f64;
-                    norm_sq += v * v;
-                }
-
-                // Near-zero filter (SRD §19): skip vectors below threshold
-                if norm_sq < zero_threshold_sq {
-                    zero_ordinals.push(source_idx);
-                    if (i + 1) % 100_000 == 0 {
-                        extract_pb.set_position((i + 1) as u64);
-                    }
-                    continue;
-                }
-
-                let buf_offset = write_cursor * record_bytes;
-                let dest = &mut part_buf[buf_offset..buf_offset + record_bytes];
-                dest[..4].copy_from_slice(&dim_bytes);
-                let inv_norm = (1.0f64 / norm_sq.sqrt()) as f32;
-                for d in 0..dim_usize {
-                    let normalized = src_slice[d] * inv_norm;
-                    dest[4 + d * 4..4 + (d + 1) * 4]
-                        .copy_from_slice(&normalized.to_le_bytes());
-                }
-            } else {
-                let buf_offset = write_cursor * record_bytes;
-                let dest = &mut part_buf[buf_offset..buf_offset + record_bytes];
-                dest[..4].copy_from_slice(&dim_bytes);
-                let src_bytes: &[u8] = unsafe {
-                    std::slice::from_raw_parts(
-                        src_slice.as_ptr() as *const u8,
-                        src_slice.len() * 4,
-                    )
-                };
-                dest[4..].copy_from_slice(src_bytes);
-            }
-            write_cursor += 1;
-
-            if (i + 1) % 100_000 == 0 {
-                extract_pb.set_position((i + 1) as u64);
-            }
+        struct ChunkOutput {
+            /// Normalized vector records (contiguous, zeros omitted)
+            buf: Vec<u8>,
+            /// Number of non-zero vectors written to buf
+            written: usize,
+            /// Source ordinals of near-zero vectors found in this chunk
+            zeros: Vec<usize>,
+            /// Pre-normalization (source) norm stats
+            src_norm_sum: f64,
+            src_norm_sum_sq: f64,
+            src_norm_min: f64,
+            src_norm_max: f64,
+            src_norm_count: usize,
+            src_norm_samples: Vec<f64>,
+            /// Post-normalization (output) norm stats
+            out_norm_sum: f64,
+            out_norm_sum_sq: f64,
+            out_norm_min: f64,
+            out_norm_max: f64,
+            out_norm_count: usize,
+            out_norm_samples: Vec<f64>,
         }
-        let part_written = write_cursor;
-        total_written += part_written;
+
+        let chunk_outputs: Vec<ChunkOutput> = {
+            use rayon::prelude::*;
+            let progress_ref = &progress;
+            let fvec_ref = &fvec_reader;
+
+            let compute_fn = || {
+                read_plan.par_chunks(chunk_size).map(|chunk| {
+                    let mut buf = vec![0u8; chunk.len() * record_bytes];
+                    let mut written = 0usize;
+                    let mut zeros = Vec::new();
+                    let mut src_norm_sum = 0.0f64;
+                    let mut src_norm_sum_sq = 0.0f64;
+                    let mut src_norm_min = f64::MAX;
+                    let mut src_norm_max = 0.0f64;
+                    let mut src_norm_count = 0usize;
+                    let mut src_norm_samples = Vec::new();
+                    let mut out_norm_sum = 0.0f64;
+                    let mut out_norm_sum_sq = 0.0f64;
+                    let mut out_norm_min = f64::MAX;
+                    let mut out_norm_max = 0.0f64;
+                    let mut out_norm_count = 0usize;
+                    let mut out_norm_samples = Vec::new();
+                    // Sample every Nth vector for median estimation
+                    let sample_every = (chunk.len() / 1000).max(1);
+
+                    for &(source_idx, _local_pos) in chunk {
+                        let src_slice = fvec_ref.get_slice(source_idx);
+
+                        if normalize {
+                            let mut norm_sq = 0.0f64;
+                            for d in 0..dim_usize {
+                                let v = src_slice[d] as f64;
+                                norm_sq += v * v;
+                            }
+
+                            if norm_sq < zero_threshold_sq {
+                                zeros.push(source_idx);
+                                let done = progress_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                                if done % 100_000 == 0 { extract_pb.set_position(done); }
+                                continue;
+                            }
+
+                            // Source norm stats: epsilon = |norm - 1.0|
+                            let norm = norm_sq.sqrt();
+                            let src_epsilon = (norm - 1.0).abs();
+                            src_norm_sum += src_epsilon;
+                            src_norm_sum_sq += src_epsilon * src_epsilon;
+                            if src_epsilon < src_norm_min { src_norm_min = src_epsilon; }
+                            if src_epsilon > src_norm_max { src_norm_max = src_epsilon; }
+                            if src_norm_count % sample_every == 0 {
+                                src_norm_samples.push(src_epsilon);
+                            }
+                            src_norm_count += 1;
+
+                            let buf_offset = written * record_bytes;
+                            let dest = &mut buf[buf_offset..buf_offset + record_bytes];
+                            dest[..4].copy_from_slice(&dim_bytes);
+
+                            if skip_normalize {
+                                // Source is already normalized — copy raw data
+                                let src_bytes: &[u8] = unsafe {
+                                    std::slice::from_raw_parts(
+                                        src_slice.as_ptr() as *const u8,
+                                        src_slice.len() * 4,
+                                    )
+                                };
+                                dest[4..].copy_from_slice(src_bytes);
+                            } else {
+                                let inv_norm = (1.0 / norm) as f32;
+                                for d in 0..dim_usize {
+                                    let normalized = src_slice[d] * inv_norm;
+                                    dest[4 + d * 4..4 + (d + 1) * 4]
+                                        .copy_from_slice(&normalized.to_le_bytes());
+                                }
+                            }
+
+                            // Output norm stats: measure actual written data
+                            {
+                                let mut out_norm_sq_val = 0.0f64;
+                                for d in 0..dim_usize {
+                                    let v = f32::from_le_bytes([
+                                        dest[4 + d * 4], dest[4 + d * 4 + 1],
+                                        dest[4 + d * 4 + 2], dest[4 + d * 4 + 3],
+                                    ]) as f64;
+                                    out_norm_sq_val += v * v;
+                                }
+                                let out_epsilon = (out_norm_sq_val.sqrt() - 1.0).abs();
+                                out_norm_sum += out_epsilon;
+                                out_norm_sum_sq += out_epsilon * out_epsilon;
+                                if out_epsilon < out_norm_min { out_norm_min = out_epsilon; }
+                                if out_epsilon > out_norm_max { out_norm_max = out_epsilon; }
+                                if out_norm_count % sample_every == 0 {
+                                    out_norm_samples.push(out_epsilon);
+                                }
+                                out_norm_count += 1;
+                            }
+                        } else {
+                            let buf_offset = written * record_bytes;
+                            let dest = &mut buf[buf_offset..buf_offset + record_bytes];
+                            dest[..4].copy_from_slice(&dim_bytes);
+                            let src_bytes: &[u8] = unsafe {
+                                std::slice::from_raw_parts(
+                                    src_slice.as_ptr() as *const u8,
+                                    src_slice.len() * 4,
+                                )
+                            };
+                            dest[4..].copy_from_slice(src_bytes);
+                        }
+                        written += 1;
+
+                        let done = progress_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                        if done % 100_000 == 0 { extract_pb.set_position(done); }
+                    }
+
+                    ChunkOutput {
+                        buf, written, zeros,
+                        src_norm_sum, src_norm_sum_sq, src_norm_min, src_norm_max, src_norm_count, src_norm_samples,
+                        out_norm_sum, out_norm_sum_sq, out_norm_min, out_norm_max, out_norm_count, out_norm_samples,
+                    }
+                }).collect::<Vec<_>>()
+            };
+
+            let extract_pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(extract_threads)
+                .build()
+                .ok();
+            if let Some(ref p) = extract_pool {
+                p.install(compute_fn)
+            } else {
+                compute_fn()
+            }
+        };
+
+        extract_pb.set_position(read_plan.len() as u64);
         extract_pb.finish();
 
-        // Step 4: Write partition in chunks with progress, including sync
+        // Step 4: Write thread buffers directly to output file (no
+        // intermediate compaction). Each thread's buffer is contiguous
+        // normalized vectors with zeros already elided.
+        let part_written: usize = chunk_outputs.iter().map(|co| co.written).sum();
         let total_write_bytes = part_written * record_bytes;
         let write_mb = total_write_bytes as f64 / (1024.0 * 1024.0);
-        let sync_reserve = total_write_bytes as u64 / 20;
-        let write_pb = ctx.ui.bar_with_unit(total_write_bytes as u64 + sync_reserve, &format!("writing+syncing {:.0} MB{}", write_mb, pass_label(pass)), "bytes");
-        // Compacted output — file position tracks total_written minus this partition
-        let file_offset = ((total_written - part_written) as u64) * (record_bytes as u64);
+        let write_pb = ctx.ui.bar_with_unit(
+            total_write_bytes as u64,
+            &format!("writing {:.0} MB{}", write_mb, pass_label(pass)),
+            "bytes",
+        );
+        let file_offset = (total_written as u64) * (record_bytes as u64);
         use std::io::Seek;
         out_file.seek(std::io::SeekFrom::Start(file_offset))
             .map_err(|e| format!("seek failed: {}", e))?;
-        let write_chunk = 8 * 1024 * 1024; // 8 MiB per write call
-        let mut written: usize = 0;
-        while written < total_write_bytes {
-            let end = std::cmp::min(written + write_chunk, total_write_bytes);
-            out_file.write_all(&part_buf[written..end])
-                .map_err(|e| format!("write failed: {}", e))?;
-            written = end;
-            write_pb.set_position(written as u64);
+        let write_chunk = 8 * 1024 * 1024; // 8 MiB per write syscall
+        let mut bytes_written: usize = 0;
+        for co in &chunk_outputs {
+            if co.written > 0 {
+                let src_bytes = co.written * record_bytes;
+                let mut offset = 0;
+                while offset < src_bytes {
+                    let end = std::cmp::min(offset + write_chunk, src_bytes);
+                    out_file.write_all(&co.buf[offset..end])
+                        .map_err(|e| format!("write failed: {}", e))?;
+                    bytes_written += end - offset;
+                    write_pb.set_position(bytes_written as u64);
+                    offset = end;
+                }
+            }
+            zero_ordinals.extend_from_slice(&co.zeros);
+            total_src_norm_sum += co.src_norm_sum;
+            total_src_norm_sum_sq += co.src_norm_sum_sq;
+            if co.src_norm_min < total_src_norm_min { total_src_norm_min = co.src_norm_min; }
+            if co.src_norm_max > total_src_norm_max { total_src_norm_max = co.src_norm_max; }
+            total_src_norm_count += co.src_norm_count;
+            total_src_norm_samples.extend_from_slice(&co.src_norm_samples);
+            total_out_norm_sum += co.out_norm_sum;
+            total_out_norm_sum_sq += co.out_norm_sum_sq;
+            if co.out_norm_min < total_out_norm_min { total_out_norm_min = co.out_norm_min; }
+            if co.out_norm_max > total_out_norm_max { total_out_norm_max = co.out_norm_max; }
+            total_out_norm_count += co.out_norm_count;
+            total_out_norm_samples.extend_from_slice(&co.out_norm_samples);
         }
-        out_file.sync_data()
-            .map_err(|e| format!("sync failed: {}", e))?;
-        write_pb.set_position(total_write_bytes as u64 + sync_reserve);
         write_pb.finish();
+        total_written += part_written;
 
         log::debug!(
             "fvec-extract: pass {}/{}, wrote {} records ({:.1} MB)",
@@ -1865,15 +2062,96 @@ fn sorted_index_extract_fvec(
     }
 
     // Save provenance metrics as variables
-    let _ = crate::pipeline::variables::set_and_save(
-        &ctx.workspace, "extract_input_count", &extract_count.to_string());
-    ctx.defaults.insert("extract_input_count".into(), extract_count.to_string());
-    let _ = crate::pipeline::variables::set_and_save(
-        &ctx.workspace, "extract_output_count", &total_written.to_string());
-    ctx.defaults.insert("extract_output_count".into(), total_written.to_string());
-    let _ = crate::pipeline::variables::set_and_save(
-        &ctx.workspace, "zero_count", &zero_count.to_string());
-    ctx.defaults.insert("zero_count".into(), zero_count.to_string());
+    let set_var = |ctx: &mut StreamContext, name: &str, value: &str| {
+        let _ = crate::pipeline::variables::set_and_save(&ctx.workspace, name, value);
+        ctx.defaults.insert(name.to_string(), value.to_string());
+    };
+
+    // Detect facet from output filename to write facet-specific counts
+    let is_query_facet = output_path.file_stem()
+        .and_then(|s| s.to_str())
+        .map(|s| s.contains("query"))
+        .unwrap_or(false);
+
+    if is_query_facet {
+        set_var(ctx, "query_input_count", &extract_count.to_string());
+        set_var(ctx, "query_output_count", &total_written.to_string());
+        if zero_count > 0 {
+            set_var(ctx, "query_zero_count", &zero_count.to_string());
+        }
+    } else {
+        set_var(ctx, "extract_input_count", &extract_count.to_string());
+        set_var(ctx, "extract_output_count", &total_written.to_string());
+        set_var(ctx, "zero_count", &zero_count.to_string());
+    }
+    set_var(ctx, "dim", &(dim as usize).to_string());
+    // Persist query_count if available (from upstream defaults)
+    if let Some(qc) = ctx.defaults.get("query_count").cloned() {
+        set_var(ctx, "query_count", &qc);
+    }
+    if normalize {
+        set_var(ctx, "is_normalized", "true");
+
+        let etype = crate::pipeline::element_type::ElementType::from_path(output_path)
+            .unwrap_or(crate::pipeline::element_type::ElementType::F32);
+        let norm_threshold = etype.normalization_threshold(dim as usize).unwrap_or(1e-5);
+
+        // Source (pre-normalization) norm quality stats
+        if total_src_norm_count > 0 {
+            let n = total_src_norm_count as f64;
+            let src_mean = total_src_norm_sum / n;
+            let src_var = (total_src_norm_sum_sq / n) - src_mean * src_mean;
+            let src_stddev = if src_var > 0.0 { src_var.sqrt() } else { 0.0 };
+            total_src_norm_samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let src_median = if !total_src_norm_samples.is_empty() {
+                total_src_norm_samples[total_src_norm_samples.len() / 2]
+            } else { 0.0 };
+            let was_normalized = src_mean < norm_threshold;
+
+            set_var(ctx, "source_mean_normal_epsilon", &format!("{:.15e}", src_mean));
+            set_var(ctx, "source_stddev_normal_epsilon", &format!("{:.15e}", src_stddev));
+            set_var(ctx, "source_median_normal_epsilon", &format!("{:.15e}", src_median));
+            set_var(ctx, "source_min_normal_epsilon", &format!("{:.15e}", total_src_norm_min));
+            set_var(ctx, "source_max_normal_epsilon", &format!("{:.15e}", total_src_norm_max));
+            set_var(ctx, "source_was_normalized", &was_normalized.to_string());
+            set_var(ctx, "normal_threshold", &format!("{:.15e}", norm_threshold));
+
+            ctx.ui.log(&format!(
+                "  source norms: mean_ε={:.2e}, stddev={:.2e}, median={:.2e}, max_ε={:.2e}, was_normalized={}",
+                src_mean, src_stddev, src_median, total_src_norm_max, was_normalized,
+            ));
+
+            // Legacy names
+            set_var(ctx, "mean_normal_epsilon", &format!("{:.15e}", src_mean));
+            set_var(ctx, "stddev_normal_epsilon", &format!("{:.15e}", src_stddev));
+            set_var(ctx, "median_normal_epsilon", &format!("{:.15e}", src_median));
+            set_var(ctx, "min_normal_epsilon", &format!("{:.15e}", total_src_norm_min));
+            set_var(ctx, "max_normal_epsilon", &format!("{:.15e}", total_src_norm_max));
+        }
+
+        // Output (post-normalization) norm quality stats
+        if total_out_norm_count > 0 {
+            let n = total_out_norm_count as f64;
+            let out_mean = total_out_norm_sum / n;
+            let out_var = (total_out_norm_sum_sq / n) - out_mean * out_mean;
+            let out_stddev = if out_var > 0.0 { out_var.sqrt() } else { 0.0 };
+            total_out_norm_samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let out_median = if !total_out_norm_samples.is_empty() {
+                total_out_norm_samples[total_out_norm_samples.len() / 2]
+            } else { 0.0 };
+
+            set_var(ctx, "output_mean_normal_epsilon", &format!("{:.15e}", out_mean));
+            set_var(ctx, "output_stddev_normal_epsilon", &format!("{:.15e}", out_stddev));
+            set_var(ctx, "output_median_normal_epsilon", &format!("{:.15e}", out_median));
+            set_var(ctx, "output_min_normal_epsilon", &format!("{:.15e}", total_out_norm_min));
+            set_var(ctx, "output_max_normal_epsilon", &format!("{:.15e}", total_out_norm_max));
+
+            ctx.ui.log(&format!(
+                "  output norms: mean_ε={:.2e}, stddev={:.2e}, median={:.2e}, max_ε={:.2e}",
+                out_mean, out_stddev, out_median, total_out_norm_max,
+            ));
+        }
+    }
 
     if zero_count > 0 {
         ctx.ui.log(&format!(

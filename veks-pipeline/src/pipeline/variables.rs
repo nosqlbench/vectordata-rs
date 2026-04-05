@@ -169,6 +169,28 @@ fn resolve_path(path_str: &str, workspace: &Path) -> PathBuf {
 }
 
 fn count_file(path: &Path) -> Result<String, String> {
+    // Handle HDF5 paths with #dataset selector (e.g., "file.hdf5#train")
+    let path_str = path.to_string_lossy();
+    if let Some(hash_pos) = path_str.rfind('#') {
+        let file_part = &path_str[..hash_pos];
+        let file_path = Path::new(file_part);
+        let file_ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        if file_ext == "hdf5" || file_ext == "h5" {
+            // Use the format-aware source reader which handles HDF5 datasets
+            let format = veks_core::formats::VecFormat::Hdf5;
+            let threads = 1;
+            match veks_core::formats::reader::open_source(path, format, threads, None) {
+                Ok(source) => {
+                    return match source.record_count() {
+                        Some(n) => Ok(n.to_string()),
+                        None => Err(format!("cannot determine record count for HDF5 dataset '{}'", path.display())),
+                    };
+                }
+                Err(e) => return Err(format!("failed to open HDF5 source {}: {}", path.display(), e)),
+            }
+        }
+    }
+
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
     if ext == "slab" {
         let reader = slabtastic::SlabReader::open(path)

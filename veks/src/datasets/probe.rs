@@ -122,9 +122,16 @@ pub fn run(catalog_base: &str, dataset_name: &str, profile_name: &str) {
             Ok(text) => {
                 println!("    OK ({} bytes)", text.len());
                 if let Ok(vars) = serde_yaml::from_str::<indexmap::IndexMap<String, String>>(&text) {
-                    let added = config.profiles.expand_deferred_sized(&vars);
-                    if added > 0 {
-                        println!("    Resolved {} deferred sized profiles", added);
+                    let base_count: u64 = vars.get("base_count")
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(0);
+                    if base_count > 0 {
+                        let added = config.profiles.expand_deferred_sized(&vars, base_count);
+                        if added > 0 {
+                            println!("    Resolved {} deferred sized profiles (base_count={})", added, base_count);
+                        }
+                    } else {
+                        println!("    base_count not available — cannot expand sized profiles");
                     }
                 }
             }

@@ -175,6 +175,10 @@ Convert with explicit source format override:
             Ok(v) => v,
             Err(e) => return error_result(e, start),
         };
+        let normalize = options.get("normalize").map(|s| s == "true").unwrap_or(false);
+        let zero_threshold: f64 = 1e-6;
+        let zero_threshold_sq = zero_threshold * zero_threshold;
+        // skip_normalize is determined after opening the source (need dimension)
 
         // Open source
         ctx.ui.log(&format!(
@@ -240,6 +244,66 @@ Convert with explicit source format override:
             ));
         }
 
+        // Detect if source is already normalized — skip the multiply if so.
+        // Still compute norms for zero detection even when skipping.
+        let skip_normalize = if normalize && dst_element_size == 4 {
+            // Sample up to 100K records to check normalization
+            let sample_size = record_count.map(|n| n.min(100_000) as usize).unwrap_or(100_000);
+            let mut epsilon_sum = 0.0f64;
+            let mut sampled = 0usize;
+            for _ in 0..sample_size {
+                if let Some(data) = source.next_record() {
+                    let dim = data.len() / src_element_size;
+                    let mut norm_sq = 0.0f64;
+                    if src_element_size == 4 {
+                        for d in 0..dim {
+                            let v = f32::from_le_bytes([data[d*4], data[d*4+1], data[d*4+2], data[d*4+3]]) as f64;
+                            norm_sq += v * v;
+                        }
+                    } else if src_element_size == 2 {
+                        for d in 0..dim {
+                            let v = half::f16::from_le_bytes([data[d*2], data[d*2+1]]).to_f64();
+                            norm_sq += v * v;
+                        }
+                    }
+                    epsilon_sum += (norm_sq.sqrt() - 1.0).abs();
+                    sampled += 1;
+                } else {
+                    break;
+                }
+            }
+            // Re-open source since we consumed records
+            drop(source);
+            let source_result2 = match facet {
+                Some(f) => reader::open_source_for_facet(&source_path, source_format, f, threads, None),
+                None => reader::open_source(&source_path, source_format, threads, None),
+            };
+            source = match source_result2 {
+                Ok(s) => s,
+                Err(e) => return error_result(format!("failed to re-open source: {}", e), start),
+            };
+            let norm_threshold = 1e-5;
+            let mean_epsilon = if sampled > 0 { epsilon_sum / sampled as f64 } else { f64::MAX };
+            if mean_epsilon < norm_threshold {
+                ctx.ui.log(&format!(
+                    "  source already normalized (mean_ε={:.2e} < {:.0e}, {} samples) — skipping normalization",
+                    mean_epsilon, norm_threshold, sampled,
+                ));
+                true
+            } else {
+                ctx.ui.log(&format!(
+                    "  source not normalized (mean_ε={:.2e}) — normalizing + zero-filtering during conversion",
+                    mean_epsilon,
+                ));
+                false
+            }
+        } else {
+            if normalize {
+                ctx.ui.log("  normalize requested but output is not f32 — skipping");
+            }
+            false
+        };
+
         // Create output directory
         if let Some(parent) = output_path.parent() {
             if !parent.exists() {
@@ -275,6 +339,9 @@ Convert with explicit source format override:
 
         log::debug!("convert path: {}",
             if use_mmap_parallel { "PARALLEL MMAP" } else { "sequential" });
+
+        let mut input_count: u64 = 0;
+        let mut zero_skipped: u64 = 0;
 
         if use_mmap_parallel {
             drop(source); // release the sequential reader
@@ -475,17 +542,26 @@ Convert with explicit source format override:
                             };
 
                             let file_offset = chunk.file.offset;
+                            let mut norm_buf_local = if normalize { vec![0u8; dimension as usize * dst_element_size] } else { Vec::new() };
                             for row in chunk.start_row..chunk.end_row {
                                 let data = chunk.file.array.row_bytes(row);
                                 let ordinal = file_offset + row as u64;
-                                if needs_conversion {
+                                let record_data: &[u8] = if needs_conversion {
                                     if convert_elements_into(&data, src_element_size, dst_element_size, &mut conv_buf).is_some() {
-                                        writer.write_record_at(ordinal, &conv_buf);
+                                        &conv_buf[..]
                                     } else {
-                                        writer.write_record_at(ordinal, &data);
+                                        &data[..]
                                     }
                                 } else {
-                                    writer.write_record_at(ordinal, &data);
+                                    &data[..]
+                                };
+                                if normalize && dst_element_size == 4 {
+                                    if normalize_f32_record(record_data, &mut norm_buf_local, zero_threshold_sq, skip_normalize) {
+                                        writer.write_record_at(ordinal, &norm_buf_local);
+                                    }
+                                    // near-zero: gap in mmap output — will be compacted or filtered downstream
+                                } else {
+                                    writer.write_record_at(ordinal, record_data);
                                 }
                             }
 
@@ -564,20 +640,33 @@ Convert with explicit source format override:
             log::info!("governor: throttle active");
         }
 
+        let mut norm_buf = if normalize { vec![0u8; dst_record_bytes] } else { Vec::new() };
         count = 0;
         for data in rx {
-            if needs_conversion {
-                if let Some(_n) = convert_elements_into(
+            input_count += 1;
+            let record_data = if needs_conversion {
+                if convert_elements_into(
                     &data, src_element_size, dst_element_size, &mut conv_buf,
-                ) {
-                    sink.write_record(count as i64, &conv_buf);
+                ).is_some() {
+                    &conv_buf[..]
                 } else {
-                    sink.write_record(count as i64, &data);
+                    &data[..]
                 }
             } else {
-                sink.write_record(count as i64, &data);
+                &data[..]
             };
-            count += 1;
+
+            if normalize && dst_element_size == 4 {
+                if normalize_f32_record(record_data, &mut norm_buf, zero_threshold_sq, skip_normalize) {
+                    sink.write_record(count as i64, &norm_buf);
+                    count += 1;
+                } else {
+                    zero_skipped += 1;
+                }
+            } else {
+                sink.write_record(count as i64, record_data);
+                count += 1;
+            };
             pb.inc(1);
             if let Some(lim) = limit {
                 if count >= lim { break; }
@@ -620,13 +709,37 @@ Convert with explicit source format override:
             ctx.defaults.insert(var_name, count.to_string());
         }
 
+        // Save provenance for query vectors (facet-aware variable naming)
+        let facet_name = options.get("facet").unwrap_or("output");
+        let is_query = facet_name == "query_vectors" || facet_name == "query";
+        if normalize && zero_skipped > 0 {
+            ctx.ui.log(&format!(
+                "  {} near-zero vectors filtered ({} input → {} output)",
+                zero_skipped, input_count, count,
+            ));
+        }
+        if is_query {
+            let _ = crate::pipeline::variables::set_and_save(
+                &ctx.workspace, "query_input_count", &input_count.to_string());
+            ctx.defaults.insert("query_input_count".into(), input_count.to_string());
+            let _ = crate::pipeline::variables::set_and_save(
+                &ctx.workspace, "query_output_count", &count.to_string());
+            ctx.defaults.insert("query_output_count".into(), count.to_string());
+            if zero_skipped > 0 {
+                let _ = crate::pipeline::variables::set_and_save(
+                    &ctx.workspace, "query_zero_count", &zero_skipped.to_string());
+                ctx.defaults.insert("query_zero_count".into(), zero_skipped.to_string());
+            }
+        }
+
         CommandResult {
             status: Status::Ok,
             message: format!(
-                "converted {} records ({} -> {}) to {}",
+                "converted {} records ({} -> {}{}) to {}",
                 count,
                 source_format.name(),
                 to_format.name(),
+                if zero_skipped > 0 { format!(", {} zeros filtered", zero_skipped) } else { String::new() },
                 output_path.display()
             ),
             produced: vec![output_path],
@@ -676,6 +789,14 @@ Convert with explicit source format override:
                 description: "Maximum number of records to convert (omit for all)".to_string(),
                 role: OptionRole::Config,
         },
+            OptionDesc {
+                name: "normalize".to_string(),
+                type_name: "bool".to_string(),
+                required: false,
+                default: Some("false".to_string()),
+                description: "L2-normalize f32 vectors during conversion".to_string(),
+                role: OptionRole::Config,
+        },
         ]
     }
 
@@ -702,6 +823,38 @@ fn format_size(bytes: u64) -> String {
     else if bytes >= 1_048_576 { format!("{:.1} MiB", bytes as f64 / 1_048_576.0) }
     else if bytes >= 1024 { format!("{:.1} KiB", bytes as f64 / 1024.0) }
     else { format!("{} B", bytes) }
+}
+
+/// L2-normalize an f32 vector record.
+///
+/// Reads f32 components from `src`, computes the L2 norm in f64,
+/// and writes normalized f32 components to `dst`.
+///
+/// Returns `false` if the vector is near-zero (norm < `zero_threshold`)
+/// and should be skipped. When `skip_normalize` is true, copies raw
+/// data (source already normalized) but still checks for zeros.
+fn normalize_f32_record(src: &[u8], dst: &mut [u8], zero_threshold_sq: f64, skip_normalize: bool) -> bool {
+    let dim = src.len() / 4;
+    debug_assert_eq!(dst.len(), src.len());
+    let mut norm_sq = 0.0f64;
+    for d in 0..dim {
+        let v = f32::from_le_bytes([src[d * 4], src[d * 4 + 1], src[d * 4 + 2], src[d * 4 + 3]]) as f64;
+        norm_sq += v * v;
+    }
+    if norm_sq < zero_threshold_sq {
+        return false; // near-zero — skip
+    }
+    if skip_normalize {
+        dst[..src.len()].copy_from_slice(src);
+    } else {
+        let inv_norm = (1.0f64 / norm_sq.sqrt()) as f32;
+        for d in 0..dim {
+            let v = f32::from_le_bytes([src[d * 4], src[d * 4 + 1], src[d * 4 + 2], src[d * 4 + 3]]);
+            let normalized = v * inv_norm;
+            dst[d * 4..(d + 1) * 4].copy_from_slice(&normalized.to_le_bytes());
+        }
+    }
+    true
 }
 
 fn error_result(message: String, start: Instant) -> CommandResult {

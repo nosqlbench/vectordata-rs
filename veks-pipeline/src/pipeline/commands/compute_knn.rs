@@ -1033,6 +1033,15 @@ fn write_partition_cache(
 ///   neighbor have the same distance (boundary tie)
 /// - `total_tied_neighbors`: total count of extra neighbors beyond k that
 ///   share the boundary distance across all queries
+/// Result of merging partitions, including tie diagnostics.
+struct MergeResult {
+    tie_count: usize,
+    tied_neighbors: usize,
+    tie_details: Vec<String>,
+    /// If true, at least one tie involved identical vectors (duplicate bug).
+    has_duplicate_ties: bool,
+}
+
 fn merge_partitions(
     partitions: &[PartitionMeta],
     indices_path: &Path,
@@ -1041,8 +1050,9 @@ fn merge_partitions(
     query_count: usize,
     base_offset: usize,
     compress_cache: bool,
+    base_path: &Path,
     ui: &veks_core::ui::UiHandle,
-) -> Result<(usize, usize), String> {
+) -> Result<MergeResult, String> {
     // Open all partition files
     let load_pb = ui.bar_with_unit(
         partitions.len() as u64,
@@ -1089,6 +1099,13 @@ fn merge_partitions(
 
     let mut tie_count: usize = 0;
     let mut tied_neighbors: usize = 0;
+    let mut tie_details: Vec<String> = Vec::new();
+    let mut has_duplicate_ties = false;
+
+    // Open base vectors for duplicate checking on ties
+    let base_reader = MmapVectorReader::<f32>::open_fvec(base_path)
+        .map_err(|e| format!("failed to open base for tie check: {}", e))?;
+
     let pb = make_query_progress_bar(query_count as u64, ui);
     for _qi in 0..query_count {
         // Collect candidates from all partitions
@@ -1136,13 +1153,52 @@ fn merge_partitions(
         // Detect boundary ties: count how many candidates beyond k share
         // the same distance as the k-th neighbor.
         if candidates.len() > k {
-            let kth = candidates[k - 1].distance;
+            let kth_dist = candidates[k - 1].distance;
             let extra = candidates[k..].iter()
-                .take_while(|c| c.distance == kth)
+                .take_while(|c| c.distance == kth_dist)
                 .count();
             if extra > 0 {
                 tie_count += 1;
                 tied_neighbors += extra;
+
+                // Check if any tied pair involves identical vectors (duplicate bug)
+                let kth_idx = candidates[k - 1].index as usize;
+                for c in &candidates[k..k + extra] {
+                    let evicted_idx = c.index as usize;
+                    let kth_vec = base_reader.get_slice(kth_idx);
+                    let evicted_vec = base_reader.get_slice(evicted_idx);
+                    let is_dup = kth_vec.len() == evicted_vec.len()
+                        && kth_vec.iter().zip(evicted_vec.iter())
+                            .all(|(a, b)| a.to_bits() == b.to_bits());
+                    if is_dup {
+                        has_duplicate_ties = true;
+                        tie_details.push(format!(
+                            "  query {}: DUPLICATE VECTORS at tie boundary! \
+                             base[{}] and base[{}] are bitwise identical (dist={:.10})",
+                            _qi, kth_idx, evicted_idx, kth_dist,
+                        ));
+                    }
+                }
+
+                // Log details for the first 10 non-duplicate ties
+                if tie_details.len() < 10 && !has_duplicate_ties {
+                    let evicted: Vec<String> = candidates[k..k + extra].iter()
+                        .map(|c| format!("idx={} dist={:.10}", c.index, c.distance))
+                        .collect();
+                    let kept_near: Vec<String> = candidates[k.saturating_sub(3)..k].iter()
+                        .map(|c| format!("idx={} dist={:.10}", c.index, c.distance))
+                        .collect();
+                    tie_details.push(format!(
+                        "  query {}: tie at rank {} (dist={:.10})\n    \
+                         kept (ranks {}-{}): [{}]\n    \
+                         evicted ({} extra): [{}]",
+                        _qi, k, kth_dist,
+                        k - kept_near.len(), k - 1,
+                        kept_near.join(", "),
+                        extra,
+                        evicted.join(", "),
+                    ));
+                }
             }
         }
 
@@ -1189,7 +1245,12 @@ fn merge_partitions(
         dw.finish().map_err(|e| e.to_string())?;
     }
 
-    Ok((tie_count, tied_neighbors))
+    Ok(MergeResult {
+        tie_count,
+        tied_neighbors,
+        tie_details,
+        has_duplicate_ties,
+    })
 }
 
 // -- CommandOp impl -----------------------------------------------------------
@@ -1545,14 +1606,6 @@ compare an ANN index's approximate results against this exact ground truth.
                 required: false,
                 default: Some("false".to_string()),
                 description: "Gzip-compress partition cache files".to_string(),
-                role: OptionRole::Config,
-        },
-            OptionDesc {
-                name: "allow_ties".to_string(),
-                type_name: "bool".to_string(),
-                required: false,
-                default: Some("false".to_string()),
-                description: "Allow boundary ties at rank k (non-deterministic ground truth). Default: error on ties.".to_string(),
                 role: OptionRole::Config,
         },
         ]
@@ -2037,93 +2090,217 @@ where
     let mut partitions: Vec<PartitionMeta> = Vec::new();
     let mut part_start = base_offset;
 
-    // Scan for existing super-partitions (merged results from smaller profiles)
-    // that cover a prefix of the range. Use the largest available cached partition
-    // starting at part_start before falling back to partition_size chunks.
-    // Minimum step size for super-partition search. We check at multiples
-    // of this to avoid scanning every possible range endpoint. Smaller
-    // profiles typically align to common sizes (1M, 10M, etc.) and the
-    // merged super-partition cache uses the exact profile range.
-    let cache_search_step = partition_size.min(1_000_000).max(1);
-    let find_largest_cached = |start: usize, max_end: usize| -> Option<usize> {
-        // Scan candidate endpoints: try the full remaining range first, then
-        // step down to find the largest cached partition from any profile.
-        let mut try_end = max_end;
-        while try_end > start {
+    // Build an index of all reusable KNN segments from:
+    // 1. Cache directory (.cache/) — partition files from this or earlier runs
+    // 2. Profile directories (profiles/*/) — completed KNN outputs from
+    //    smaller profiles, which cover [0, profile_base_count)
+    //
+    // Each segment stores its start, end, and the actual file paths.
+    struct CachedSegment {
+        start: usize,
+        end: usize,
+        neighbors_path: PathBuf,
+        distances_path: PathBuf,
+    }
+
+    let cached_segments: Vec<CachedSegment> = {
+        let metric_str = match metric {
+            Metric::L2 => "l2",
+            Metric::Cosine => "cosine",
+            Metric::DotProduct => "dot_product",
+            Metric::L1 => "l1",
+        };
+        let prefix_pat = format!("{}.range_", cache_prefix);
+        let suffix_pat = format!(".k{}.{}.neighbors.ivec", k, metric_str);
+        let gz_suffix_pat = format!("{}.gz", suffix_pat);
+
+        let check_cache_pair = |s: usize, e: usize| -> bool {
             let n_path = build_cache_path(
-                &ctx.cache, &cache_prefix, start, try_end, k, metric, "neighbors", "ivec",
+                &ctx.cache, &cache_prefix, s, e, k, metric, "neighbors", "ivec",
             );
             let d_path = build_cache_path(
-                &ctx.cache, &cache_prefix, start, try_end, k, metric, "distances", "fvec",
+                &ctx.cache, &cache_prefix, s, e, k, metric, "distances", "fvec",
             );
-            let exists = if compress_cache {
+            if compress_cache {
                 crate::pipeline::gz_cache::gz_exists(&n_path)
                     && crate::pipeline::gz_cache::gz_exists(&d_path)
             } else {
                 validate_cache_file(&n_path, query_count, k, 4)
                     && validate_cache_file(&d_path, query_count, k, 4)
-            };
-            if exists {
-                return Some(try_end);
             }
-            // Try the next smaller multiple of cache_search_step
-            try_end = ((try_end - start - 1) / cache_search_step) * cache_search_step + start;
-            if try_end <= start { break; }
+        };
+
+        let mut segments = Vec::new();
+
+        // Scan .cache/ for partition files
+        if let Ok(entries) = std::fs::read_dir(&ctx.cache) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                if !name_str.starts_with(&prefix_pat) { continue; }
+                let is_match = name_str.ends_with(&suffix_pat)
+                    || name_str.ends_with(&gz_suffix_pat);
+                if !is_match { continue; }
+
+                let after_prefix = &name_str[prefix_pat.len()..];
+                let range_end = after_prefix.find('.').unwrap_or(after_prefix.len());
+                let range_str = &after_prefix[..range_end];
+                if let Some((s_str, e_str)) = range_str.split_once('_') {
+                    if let (Ok(s), Ok(e)) = (s_str.parse::<usize>(), e_str.parse::<usize>()) {
+                        if e > s && check_cache_pair(s, e) {
+                            segments.push(CachedSegment {
+                                start: s,
+                                end: e,
+                                neighbors_path: build_cache_path(&ctx.cache, &cache_prefix, s, e, k, metric, "neighbors", "ivec"),
+                                distances_path: build_cache_path(&ctx.cache, &cache_prefix, s, e, k, metric, "distances", "fvec"),
+                            });
+                        }
+                    }
+                }
+            }
         }
-        None
+
+        // Scan profiles/ for completed KNN outputs from smaller profiles.
+        // Each sized profile directory name is a count suffix (e.g., "4mi",
+        // "10m") that encodes the profile's base_count. If the directory
+        // contains neighbor_indices.ivec with the right size, it covers
+        // [0, profile_base_count) and can be reused as a cached segment.
+        let profiles_dir = ctx.workspace.join("profiles");
+        if profiles_dir.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(&profiles_dir) {
+                for entry in entries.flatten() {
+                    if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                        continue;
+                    }
+                    let pname = entry.file_name();
+                    let pname_str = pname.to_string_lossy();
+                    // Skip "default" — it covers the full range, not a prefix
+                    if pname_str == "default" { continue; }
+                    // Parse the directory name as a count suffix
+                    let pbc = match vectordata::dataset::source::parse_number_with_suffix(&pname_str) {
+                        Ok(v) => v as usize,
+                        Err(_) => continue,
+                    };
+                    if pbc == 0 || pbc >= base_end { continue; }
+                    let idx_path = entry.path().join("neighbor_indices.ivec");
+                    let dist_path = entry.path().join("neighbor_distances.fvec");
+                    if validate_cache_file(&idx_path, query_count, k, 4)
+                        && validate_cache_file(&dist_path, query_count, k, 4)
+                    {
+                        let already = segments.iter().any(|s| s.start == 0 && s.end == pbc);
+                        if !already {
+                            ctx.ui.log(&format!(
+                                "  reusing profile '{}' output as segment [0, {})",
+                                pname_str, format_count(pbc),
+                            ));
+                            segments.push(CachedSegment {
+                                start: 0,
+                                end: pbc,
+                                neighbors_path: idx_path,
+                                distances_path: dist_path,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        // Sort by start, then by size descending (prefer larger segments)
+        segments.sort_by(|a, b| a.start.cmp(&b.start).then(b.end.cmp(&a.end)));
+        segments
     };
 
+    if !cached_segments.is_empty() {
+        ctx.ui.log(&format!("  found {} reusable segments (cache + profiles)", cached_segments.len()));
+    }
+
+    // Find the best cached segment starting at exactly `start` within [start, max_end].
+    // Returns the index into cached_segments of the largest such segment.
+    let find_cached_at = |start: usize, max_end: usize| -> Option<usize> {
+        cached_segments.iter()
+            .enumerate()
+            .filter(|(_, s)| s.start == start && s.end <= max_end)
+            .max_by_key(|(_, s)| s.end)
+            .map(|(i, _)| i)
+    };
+
+    // Phase 1: Greedy chain — at each position, use the largest cached
+    // segment or create a fresh partition of partition_size.
     while part_start < base_end {
-        // Check for a super-partition first
-        let (part_end, neighbors_path, dist_cache_path, cached) =
-            if let Some(super_end) = find_largest_cached(part_start, base_end) {
-                let n = build_cache_path(&ctx.cache, &cache_prefix, part_start, super_end, k, metric, "neighbors", "ivec");
-                let d = build_cache_path(&ctx.cache, &cache_prefix, part_start, super_end, k, metric, "distances", "fvec");
-                ctx.ui.log(&format!(
-                    "  precomputed segment [{}, {}) — {}",
-                    format_count(part_start), format_count(super_end),
-                    n.file_name().unwrap_or_default().to_string_lossy(),
-                ));
-                ctx.ui.log(&format!(
-                    "  precomputed segment [{}, {}) — {}",
-                    format_count(part_start), format_count(super_end),
-                    d.file_name().unwrap_or_default().to_string_lossy(),
-                ));
-                (super_end, n, d, true)
+        let (part_end, neighbors_path, distances_path, cached) =
+            if let Some(si) = find_cached_at(part_start, base_end) {
+                let seg = &cached_segments[si];
+                (seg.end, seg.neighbors_path.clone(), seg.distances_path.clone(), true)
             } else {
                 let pe = std::cmp::min(part_start + partition_size, base_end);
                 let n = build_cache_path(&ctx.cache, &cache_prefix, part_start, pe, k, metric, "neighbors", "ivec");
                 let d = build_cache_path(&ctx.cache, &cache_prefix, part_start, pe, k, metric, "distances", "fvec");
-                let c = if compress_cache {
-                    crate::pipeline::gz_cache::gz_exists(&n) && crate::pipeline::gz_cache::gz_exists(&d)
-                } else {
-                    validate_cache_file(&n, query_count, k, 4) && validate_cache_file(&d, query_count, k, 4)
-                };
-                if c {
-                    ctx.ui.log(&format!(
-                        "  precomputed segment [{}, {}) — {}",
-                        format_count(part_start), format_count(pe),
-                        n.file_name().unwrap_or_default().to_string_lossy(),
-                    ));
-                    ctx.ui.log(&format!(
-                        "  precomputed segment [{}, {}) — {}",
-                        format_count(part_start), format_count(pe),
-                        d.file_name().unwrap_or_default().to_string_lossy(),
-                    ));
-                }
-                (pe, n, d, c)
+                (pe, n, d, false)
             };
 
         partitions.push(PartitionMeta {
             start: part_start,
             end: part_end,
             neighbors_path,
-            distances_path: dist_cache_path,
+            distances_path,
             cached,
         });
         plan_pb.inc(1);
         part_start = part_end;
     }
+
+    // Phase 2: Consolidation — check if any cached segment can replace
+    // a contiguous run of chain entries. A single larger cached result
+    // (from an earlier profile) reduces partition count and merge cost.
+    // Repeat until no further consolidation is possible.
+    let pre_consolidation = partitions.len();
+    let mut consolidation_rounds = 0;
+    loop {
+        let mut did_consolidate = false;
+        for seg in &cached_segments {
+            if seg.end > base_end { continue; }
+            // Find chain entries this segment spans
+            let first = partitions.iter().position(|p| p.start == seg.start);
+            let last = partitions.iter().position(|p| p.end == seg.end);
+            if let (Some(fi), Some(li)) = (first, last) {
+                if li > fi {
+                    let replaced_count = li - fi + 1;
+                    ctx.ui.log(&format!(
+                        "  consolidate: [{}, {}) replaces {} partitions with 1 cached segment",
+                        format_count(seg.start), format_count(seg.end), replaced_count,
+                    ));
+                    let replacement = PartitionMeta {
+                        start: seg.start,
+                        end: seg.end,
+                        neighbors_path: seg.neighbors_path.clone(),
+                        distances_path: seg.distances_path.clone(),
+                        cached: true,
+                    };
+                    partitions.splice(fi..=li, std::iter::once(replacement));
+                    did_consolidate = true;
+                    consolidation_rounds += 1;
+                    break;
+                }
+            }
+        }
+        if !did_consolidate { break; }
+    }
+    if consolidation_rounds > 0 {
+        ctx.ui.log(&format!(
+            "  consolidation: {} rounds, {} → {} partitions",
+            consolidation_rounds, pre_consolidation, partitions.len(),
+        ));
+    }
+
+    // Log the final partition plan
+    for p in &partitions {
+        ctx.ui.log(&format!(
+            "  partition [{}, {}): {}",
+            format_count(p.start), format_count(p.end),
+            if p.cached { "cached" } else { "compute" },
+        ));
+    }
+
     plan_pb.finish();
 
     let num_partitions = partitions.len();
@@ -2162,94 +2339,29 @@ where
     // Hint sequential access pattern for base vectors (REQ-RM-10)
     base_reader.advise_sequential();
 
-    // Collect uncached partition indices for lookahead
+    // Collect uncached partition indices
     let uncached_indices: Vec<usize> = partitions.iter()
         .enumerate()
         .filter(|(_, p)| !p.cached)
         .map(|(i, _)| i)
         .collect();
 
-    let total_prefetch_bytes: u64 = uncached_indices.iter()
-        .map(|&i| ((partitions[i].end - partitions[i].start) as u64) * (base_reader.entry_size() as u64))
-        .sum();
-
-    // Prefetch warms base-vector pages ahead of compute. For multi-partition
-    // runs, lookahead overlaps I/O with compute. For single-partition runs,
-    // a single sequential pre-touch avoids scattered page faults across all
-    // compute threads.
     ctx.ui.log(&format!(
-        "  pipeline: {} uncached partition{} ({} base vectors to warm)",
+        "  {} uncached partition{} to compute",
         uncached_indices.len(),
         if uncached_indices.len() == 1 { "" } else { "s" },
-        format_bytes(total_prefetch_bytes),
     ));
-
-    // Shared counter for the prefetch progress bar
-    let prefetch_bytes_paged = Arc::new(AtomicU64::new(0));
-
-    // Prefetch progress bar — updated by a background tick thread
-    let prefetch_pb = ctx.ui.bar_with_unit(total_prefetch_bytes, "warming page cache", "bytes");
-    let prefetch_bytes_for_tick = Arc::clone(&prefetch_bytes_paged);
-    let prefetch_tick_handle = std::thread::spawn(move || {
-        loop {
-            let paged = prefetch_bytes_for_tick.load(AtomicOrdering::Relaxed);
-            prefetch_pb.set_position(paged);
-            if paged >= total_prefetch_bytes {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-        prefetch_pb.finish();
-    });
 
     let mut computed = 0usize;
     let mut prev_writer: Option<std::thread::JoinHandle<Result<(), String>>> = None;
     let mut prev_write_start: Option<Instant> = None;
 
-    // Lookahead queue for load (prefetch) handles.
-    // We maintain up to LOAD_DEPTH outstanding loads so the I/O channel
-    // is continuously fed. Each entry corresponds to a future uncached
-    // partition whose pages are being warmed.
-    const LOAD_DEPTH: usize = 2;
-    let mut load_queue: std::collections::VecDeque<std::thread::JoinHandle<()>> =
-        std::collections::VecDeque::with_capacity(LOAD_DEPTH);
-
-    // Overall partition progress bar — tracks how many partitions have been
-    // computed out of the total uncached count.
+    // Overall partition progress bar
     let overall_pb = if to_compute > 1 {
         Some(ctx.ui.bar_with_unit(to_compute as u64, "partitions", "partitions"))
     } else {
         None
     };
-
-    // Seed the load queue: prefetch partitions so their pages are warm
-    // by the time we compute them.
-    let mut next_load_slot = 0usize;
-    while next_load_slot < uncached_indices.len() && load_queue.len() < LOAD_DEPTH {
-        // Prefetch a contiguous run of up to segments_per_pass segments
-        let first_idx = uncached_indices[next_load_slot];
-        let prefetch_start = partitions[first_idx].start;
-        let mut prefetch_end = partitions[first_idx].end;
-        let mut slots_covered = 1;
-        while false // one partition per prefetch — partitions are large
-            && next_load_slot + slots_covered < uncached_indices.len()
-        {
-            let next_idx = uncached_indices[next_load_slot + slots_covered];
-            // Only batch contiguous segments
-            if partitions[next_idx].start == prefetch_end {
-                prefetch_end = partitions[next_idx].end;
-                slots_covered += 1;
-            } else {
-                break;
-            }
-        }
-        let reader = Arc::clone(base_reader);
-        let counter = Arc::clone(&prefetch_bytes_paged);
-        load_queue.push_back(std::thread::spawn(move || {
-            reader.prefetch_pages(prefetch_start, prefetch_end, Some(&counter));
-        }));
-        next_load_slot += slots_covered;
-    }
 
     for (_ui_idx, &pi) in uncached_indices.iter().enumerate() {
         let part = &partitions[pi];
@@ -2285,19 +2397,7 @@ where
             ));
         }
 
-        // ── Stage 1: Ensure prefetch issued for this partition ─────
-        // With async madvise, prefetch threads return instantly after
-        // issuing the kernel hint. Just join to confirm it was issued.
-        let stage_t = Instant::now();
-        if let Some(handle) = load_queue.pop_front() {
-            let _ = handle.join();
-        }
-        let prefetch_ms = stage_t.elapsed().as_millis();
-        if prefetch_ms > 100 {
-            ctx.ui.log(&format!("    prefetch join: {}ms", prefetch_ms));
-        }
-
-        // ── Stage 2: Compute ─────────────────────────────────────────
+        // ── Compute ───────────────────────────────────────────────────
         // CPU-bound. Save of the previous partition runs concurrently
         // in the background. Kernel readahead for future partitions
         // runs asynchronously (madvise). No blocking waits needed.
@@ -2305,8 +2405,8 @@ where
         let part_base_count = (part.end - part.start) as u64;
         let pb = ctx.ui.bar_with_unit(
             part_base_count,
-            &format!("KNN {:?} {}x{} {} base x {} queries [{},{})",
-                display_metric, dim, elem_label,
+            &format!("KNN {:?} (kernel {:?}) {}x{} {} base x {} queries [{},{})",
+                display_metric, metric, dim, elem_label,
                 format_count(part_size), format_count(query_count),
                 format_count(part.start), format_count(part.end)),
             "vectors",
@@ -2329,7 +2429,7 @@ where
             opb.inc(1);
         }
 
-        // ── Stage 3: Drain previous save, then spawn new save ────────
+        // ── Drain previous save, then spawn new save ────────────────
         // Block on the previous save only now — right before spawning
         // a new one. This means save(N-1) ran fully concurrent with
         // compute(N). We only block here to bound memory to one result
@@ -2417,36 +2517,6 @@ where
             Ok(())
         }));
 
-        // ── Stage 4: Refill prefetch queue ──────────────────────────
-        // Batch contiguous uncached segments into a single large prefetch
-        // (up to segments_per_pass segments per prefetch call).
-        if load_queue.is_empty() && next_load_slot < uncached_indices.len() {
-            let first_idx = uncached_indices[next_load_slot];
-            let prefetch_start = partitions[first_idx].start;
-            let mut prefetch_end = partitions[first_idx].end;
-            let mut slots_covered = 1;
-            while false // one partition per prefetch — partitions are large
-                && next_load_slot + slots_covered < uncached_indices.len()
-            {
-                let next_idx = uncached_indices[next_load_slot + slots_covered];
-                if partitions[next_idx].start == prefetch_end {
-                    prefetch_end = partitions[next_idx].end;
-                    slots_covered += 1;
-                } else {
-                    break;
-                }
-            }
-            let reader = Arc::clone(base_reader);
-            let counter = Arc::clone(&prefetch_bytes_paged);
-            load_queue.push_back(std::thread::spawn(move || {
-                reader.prefetch_pages(prefetch_start, prefetch_end, Some(&counter));
-            }));
-            next_load_slot += slots_covered;
-        }
-
-        // Release completed partition's pages from page cache (REQ-RM-10)
-        base_reader.release_range(part.start, part.end);
-
         log::info!(
             "partition {}/{} — compute done in {:.1}s (save in background)",
             pi + 1, num_partitions,
@@ -2471,23 +2541,15 @@ where
         }
     }
 
-    // Drain any remaining loads (shouldn't happen but be safe)
-    for handle in load_queue {
-        let _ = handle.join();
-    }
-
     // Finish the overall partition progress bar
     if let Some(opb) = overall_pb {
         opb.finish();
     }
 
-    // Stop the prefetch progress bar tick thread
-    let _ = prefetch_tick_handle.join();
-
     // Phase 3: Merge
     ctx.ui.log(&format!("  merging {} partitions ({} queries)...", num_partitions, query_count));
 
-    let (tie_count, tied_neighbors) = match merge_partitions(
+    let merge_result = match merge_partitions(
         &partitions,
         indices_path,
         distances_path,
@@ -2495,11 +2557,15 @@ where
         query_count,
         base_offset,
         compress_cache,
+        base_path,
         &ctx.ui,
     ) {
         Ok(v) => v,
         Err(e) => return error_result(format!("merge failed: {}", e), start),
     };
+
+    let tie_count = merge_result.tie_count;
+    let tied_neighbors = merge_result.tied_neighbors;
 
     // Save tie metrics as variables so they are visible in dataset metadata.
     let _ = crate::pipeline::variables::set_and_save(
@@ -2509,59 +2575,64 @@ where
         &ctx.workspace, "knn_tied_neighbors", &tied_neighbors.to_string());
     ctx.defaults.insert("knn_tied_neighbors".into(), tied_neighbors.to_string());
 
-    // Boundary tie detection: queries where the k-th and (k+1)-th
-    // neighbors have identical distances, making the ground truth
-    // non-deterministic. Error by default; allow_ties=true downgrades
-    // to a warning.
+    if merge_result.has_duplicate_ties {
+        // Duplicate vectors survived dedup — this is an implementation bug.
+        for detail in &merge_result.tie_details {
+            ctx.ui.log(detail);
+        }
+        return error_result(
+            format!(
+                "IMPLEMENTATION BUG: {} tie(s) involve bitwise-identical vectors that \
+                 should have been removed during deduplication. The prepare-vectors step \
+                 failed to elide all duplicates.",
+                merge_result.tie_details.iter()
+                    .filter(|d| d.contains("DUPLICATE"))
+                    .count(),
+            ),
+            start,
+        );
+    }
+
     if tie_count > 0 {
-        let allow_ties = ctx.defaults.get("allow_ties")
-            .map(|v| v == "true")
-            .unwrap_or(false);
-        if allow_ties {
-            ctx.ui.log(&format!(
-                "  Warning: {} of {} queries have boundary ties at k={} \
-                 ({} extra tied neighbors) — ground truth may be non-deterministic",
-                tie_count, query_count, k, tied_neighbors,
-            ));
-        } else {
-            return error_result(
-                format!(
-                    "{} of {} queries have boundary ties at k={} ({} extra tied \
-                     neighbors): the k-th and (k+1)-th neighbors have identical \
-                     distances, making ground truth non-deterministic. Set \
-                     allow_ties=true to proceed.",
-                    tie_count, query_count, k, tied_neighbors,
-                ),
-                start,
-            );
+        ctx.ui.log(&format!(
+            "  boundary ties: {} of {} queries at k={} ({} extra tied neighbors) — \
+             resolved deterministically (lower index wins)",
+            tie_count, query_count, k, tied_neighbors,
+        ));
+        for detail in &merge_result.tie_details {
+            ctx.ui.log(detail);
+        }
+        if tie_count > merge_result.tie_details.len() {
+            ctx.ui.log(&format!("  ... and {} more", tie_count - merge_result.tie_details.len()));
         }
     }
 
-    // Save merged result as a cache partition covering the full range.
-    // This allows larger profiles to reuse this as a single "super-partition"
-    // instead of re-reading all the individual smaller partitions.
-    if num_partitions > 1 {
+    // Save the result as a cache partition covering [base_offset, base_end).
+    // This allows larger profiles to reuse this profile's result as a
+    // pre-computed "super-partition" rather than recomputing the same range.
+    {
         let full_neighbors = build_cache_path(
             &ctx.cache, &cache_prefix, base_offset, base_end, k, metric, "neighbors", "ivec",
         );
         let full_distances = build_cache_path(
             &ctx.cache, &cache_prefix, base_offset, base_end, k, metric, "distances", "fvec",
         );
-        // Copy the final output to the cache as the full-range partition
-        let cache_sp = ctx.ui.spinner("caching merged result as super-partition");
-        if !full_neighbors.exists() {
-            let _ = std::fs::copy(indices_path, &full_neighbors);
-        }
-        if let Some(dp) = distances_path {
-            if !full_distances.exists() {
-                let _ = std::fs::copy(dp, &full_distances);
+        if !full_neighbors.exists() || !full_distances.exists() {
+            let cache_sp = ctx.ui.spinner("caching result for profile reuse");
+            if !full_neighbors.exists() {
+                let _ = std::fs::copy(indices_path, &full_neighbors);
             }
+            if let Some(dp) = distances_path {
+                if !full_distances.exists() {
+                    let _ = std::fs::copy(dp, &full_distances);
+                }
+            }
+            cache_sp.finish();
+            ctx.ui.log(&format!(
+                "  cached result [{}, {}) for reuse by larger profiles",
+                format_count(base_offset), format_count(base_end),
+            ));
         }
-        cache_sp.finish();
-        ctx.ui.log(&format!(
-            "  cached merged result as partition [{}, {}) for reuse by larger profiles",
-            format_count(base_offset), format_count(base_end),
-        ));
     }
 
     let mut produced = vec![indices_path.to_path_buf()];

@@ -113,14 +113,27 @@ pub fn resolve_all_steps(
         .and_then(|s| s.parse().ok())
         .unwrap_or(10_000);
 
-    // Resolve deferred sized profiles from variables.yaml
+    // Resolve deferred sized profiles. base_count is required — profile
+    // expansion must know the actual dataset size so it never generates
+    // invalid profiles. Check both variables.yaml and config.variables
+    // (the dataset.yaml variables: section).
     if config.profiles.has_deferred() {
-        if let Ok(vars) = variables::load(workspace) {
-            let var_map: indexmap::IndexMap<String, String> = vars.into_iter().collect();
-            let added = config.profiles.expand_deferred_sized(&var_map);
-            if added > 0 {
-                log::info!("Resolved {} deferred sized profiles from variables.yaml", added);
+        let mut var_map: indexmap::IndexMap<String, String> = config.variables.clone();
+        if let Ok(file_vars) = variables::load(workspace) {
+            for (k, v) in file_vars {
+                var_map.insert(k, v);
             }
+        }
+        let base_count: u64 = var_map.get("base_count")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        if base_count > 0 {
+            let added = config.profiles.expand_deferred_sized(&var_map, base_count);
+            if added > 0 {
+                log::info!("Resolved {} deferred sized profiles (base_count={})", added, base_count);
+            }
+        } else {
+            log::warn!("Cannot expand sized profiles: base_count not yet known");
         }
     }
 
@@ -433,14 +446,16 @@ pub fn run_pipeline(args: RunArgs) -> Result<(), String> {
         std::process::exit(1);
     });
 
-    // Build defaults from pipeline config + variables.yaml + CLI overrides
+    // Build defaults from pipeline config + dataset variables + variables.yaml + CLI overrides
     let mut defaults = IndexMap::new();
     if let Some(ref pipe) = config.upstream {
         if let Some(ref defs) = pipe.defaults {
             defaults.extend(defs.clone());
         }
     }
-    // Layer in variables.yaml (overrides upstream.defaults, but CLI wins)
+    // Layer in dataset.yaml variables: section
+    defaults.extend(config.variables.clone());
+    // Layer in variables.yaml (overrides upstream.defaults and dataset variables, but CLI wins)
     match variables::load(&workspace) {
         Ok(vars) => {
             if !vars.is_empty() {
@@ -527,9 +542,9 @@ pub fn run_pipeline(args: RunArgs) -> Result<(), String> {
 
     governor.print_summary();
 
-    // Persistent run log: all UI log messages are teed to .cache/run.log
-    // for post-session analysis and troubleshooting.
+    // Persistent run log: plain text in .cache/run.log, JSONL in workspace/runlog.jsonl
     let run_log_path = cache_dir.join("run.log");
+    let run_jsonl_path = workspace.join("runlog.jsonl");
 
     // Build execution context
     let dataset_name = config.name.clone();
@@ -572,7 +587,7 @@ pub fn run_pipeline(args: RunArgs) -> Result<(), String> {
         step_id: String::new(),
         governor,
         ui: {
-            let handle = match args.output.as_str() {
+            let mut handle = match args.output.as_str() {
                 "batch" => veks_core::ui::UiHandle::new(
                     std::sync::Arc::new(veks_core::ui::HeadlessSink::new())),
                 "basic" => veks_core::ui::UiHandle::new(
@@ -582,13 +597,26 @@ pub fn run_pipeline(args: RunArgs) -> Result<(), String> {
                 _ /* auto */ => veks_core::ui::auto_ui_handle_with_interval(
                     std::time::Duration::from_millis(args.status_interval)),
             };
-            // Install global logger: Info+ → sink, all levels → .cache/run.log
-            veks_core::ui::install_logger(handle.sink_arc(), Some(&run_log_path));
+            // Install global logger and attach log file to UiHandle for
+            // lock-step file writes from ctx.ui.log().
+            let log_writers = veks_core::ui::install_logger(handle.sink_arc(), Some(&run_log_path), Some(&run_jsonl_path));
+            handle.set_log_writers(log_writers);
             handle
         },
         status_interval: std::time::Duration::from_millis(args.status_interval),
         estimated_total_steps: estimated_total,
     };
+
+    ctx.ui.log(&format!("pipeline initialized: {} steps, profile={}",
+        pipeline_dag.steps.len(), profile_name));
+
+    // Persist dataset-level metadata as variables so stats.csv can use them
+    let _ = variables::set_and_save(&ctx.workspace, "dataset_name", &ctx.dataset_name);
+    ctx.defaults.insert("dataset_name".into(), ctx.dataset_name.clone());
+    if let Some(df) = config.distance_function() {
+        let _ = variables::set_and_save(&ctx.workspace, "distance_function", df);
+        ctx.defaults.insert("distance_function".into(), df.to_string());
+    }
 
     // Build command registry
     let registry = CommandRegistry::with_builtins();
@@ -626,10 +654,18 @@ pub fn run_pipeline(args: RunArgs) -> Result<(), String> {
             }
         }
 
-        let added = config.profiles.expand_deferred_sized(&ctx.defaults);
+        let base_count: u64 = ctx.defaults.get("base_count")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let added = if base_count > 0 {
+            config.profiles.expand_deferred_sized(&ctx.defaults, base_count)
+        } else {
+            ctx.ui.log("WARNING: base_count not available — cannot expand sized profiles");
+            0
+        };
         if added > 0 {
             ctx.ui.log(&format!(
-                "Expanded {} deferred sized profiles after core stages", added
+                "Expanded {} deferred sized profiles (base_count={})", added, base_count
             ));
 
             // Re-derive views for the new profiles
@@ -1294,7 +1330,7 @@ fn clean_pipeline(workspace: &Path, dataset_path: &Path) {
 ///
 /// Preserves: dataset.yaml, variables.yaml, identity symlinks
 /// (those pointing outside the workspace), and source data files.
-/// Removes _bootstrap.json so the next bootstrap re-detects inputs.
+/// Preserves source files and configuration for re-bootstrap.
 pub fn reset_pipeline(workspace: &Path, dataset_path: &Path, config: &DatasetConfig) {
     println!("Resetting pipeline — removing all generated artifacts...");
 
@@ -1332,12 +1368,13 @@ pub fn reset_pipeline(workspace: &Path, dataset_path: &Path, config: &DatasetCon
 
     // 5. Remove generated facet files in the workspace root (classic layout).
     //    These are pipeline outputs like neighbors.ivec, distances.fvec, etc.
-    //    We preserve: dataset.yaml, dataset.json, dataset.log, variables.yaml,
-    //    _bootstrap.json, catalog.*, .publish, .publish_url, .catalog_root,
-    //    .gitignore, and identity symlinks pointing to source data.
+    //    We preserve: dataset.yaml, dataset.json, dataset.log, dataset.jsonl,
+    //    variables.yaml, variables.json, catalog.*, .publish, .publish_url,
+    //    .catalog_root, .gitignore, and identity symlinks pointing to source data.
     let preserve = |name: &str| -> bool {
         name == "dataset.yaml" || name == "dataset.yml" || name == "dataset.json"
-            || name == "dataset.log" || name == "variables.yaml"
+            || name == "dataset.log" || name == "dataset.jsonl"
+            || name == "variables.yaml" || name == "variables.json"
             || name == ".publish" || name == ".publish_url" || name == ".catalog_root"
             || name == ".do_not_catalog" || name == ".gitignore"
             || name == "catalog.json" || name == "catalog.yaml"

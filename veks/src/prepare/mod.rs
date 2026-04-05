@@ -324,6 +324,16 @@ pub enum CatalogSubcommand {
         #[arg(long)]
         update: bool,
     },
+    /// Generate aggregated stats.csv across all cataloged datasets
+    Stats {
+        /// Starting directory (walks up to find .catalog_root)
+        #[arg(default_value = ".")]
+        input: PathBuf,
+
+        /// Output CSV filename (relative to catalog root)
+        #[arg(long, default_value = "stats.csv")]
+        output: String,
+    },
 }
 
 /// Parse a fraction string like "50%", "1%", "0.5", or "1.0" into 0.0–1.0.
@@ -333,21 +343,6 @@ pub enum CatalogSubcommand {
 /// - "0.5" → 0.50  (decimal fraction, must be < 1.0)
 /// - "0.01" → 0.01
 ///
-/// Save wizard options to `_bootstrap.json` so they can be replayed.
-fn save_bootstrap_json(args: &import::ImportArgs) {
-    match serde_json::to_string_pretty(args) {
-        Ok(json) => {
-            let path = args.output.join("_bootstrap.json");
-            if let Err(e) = std::fs::write(&path, &json) {
-                eprintln!("Warning: could not save _bootstrap.json: {}", e);
-            } else {
-                eprintln!("Saved options to {}", path.display());
-            }
-        }
-        Err(e) => eprintln!("Warning: could not serialize options: {}", e),
-    }
-}
-
 /// Bare whole numbers like "1" or "50" are rejected to avoid ambiguity.
 /// Use "1%" or "0.01" instead.
 fn parse_fraction(s: &str) -> f64 {
@@ -428,8 +423,8 @@ pub fn run(args: PrepareArgs) {
 
             // Handle --recursive: walk directories and re-bootstrap each dataset.
             // With --reset: clean artifacts first, then re-bootstrap.
-            // CLI flags (--required-facets, -i, --normalize, etc.) override
-            // the stored _bootstrap.json values for each dataset.
+            // CLI flags (--required-facets, -i, --normalize, etc.) are passed
+            // as wizard seeds for each dataset.
             if recursive {
                 let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
                 let normalize = normalize && !no_normalize;
@@ -462,77 +457,39 @@ pub fn run(args: PrepareArgs) {
                         clean_single_dataset(&workspace);
                     }
 
-                    let bf = PathBuf::from("_bootstrap.json");
-                    if bf.exists() {
-                        match std::fs::read_to_string(&bf) {
-                            Ok(json) => match serde_json::from_str::<import::ImportArgs>(&json) {
-                                Ok(mut args) => {
-                                    // CLI flags override stored values
-                                    args.force = true; // always force in recursive mode
-                                    args.normalize = normalize;
-                                    if let Some(ref rf) = required_facets {
-                                        args.required_facets = Some(rf.clone());
-                                    }
-                                    if let Some(ref pf) = provided_facets {
-                                        args.provided_facets = Some(pf.clone());
-                                    }
-                                    if no_dedup { args.no_dedup = true; }
-                                    if no_zero_check { args.no_zero_check = true; }
-                                    if no_filtered { args.no_filtered = true; }
-                                    if classic { args.classic = true; }
-                                    if pedantic_dedup { args.pedantic_dedup = true; }
-
-                                    if interactive {
-                                        // Interactive mode: run wizard with stored values as seeds
-                                        let seeds = wizard::WizardSeeds {
-                                            name: Some(args.name.clone()),
-                                            output: Some(args.output.clone()),
-                                            base_vectors: args.base_vectors.clone(),
-                                            query_vectors: args.query_vectors.clone(),
-                                            self_search: if args.self_search { Some(true) } else { None },
-                                            query_count: None,
-                                            metadata: args.metadata.clone(),
-                                            ground_truth: args.ground_truth.clone(),
-                                            ground_truth_distances: args.ground_truth_distances.clone(),
-                                            metric: Some(args.metric.clone()),
-                                            neighbors: Some(args.neighbors),
-                                            seed: Some(args.seed),
-                                            description: args.description.clone(),
-                                            no_dedup: if args.no_dedup { Some(true) } else { None },
-                                            no_zero_check: if args.no_zero_check { Some(true) } else { None },
-                                            no_filtered: if args.no_filtered { Some(true) } else { None },
-                                            normalize: Some(args.normalize),
-                                            base_fraction: if args.base_fraction < 1.0 { Some(args.base_fraction) } else { None },
-                                            pedantic_dedup: if args.pedantic_dedup { Some(true) } else { None },
-                                            required_facets: args.required_facets.clone(),
-                                            provided_facets: args.provided_facets.clone(),
-                                            round_digits: Some(args.round_digits),
-                                            selectivity: None,
-                                            force: true,
-                                            classic: args.classic,
-                                            sources: vec![],
-                                        };
-                                        let wizard_args = wizard::run_wizard_with_options(yes, auto, seeds);
-                                        import::run(wizard_args);
-                                    } else {
-                                        println!("  Loaded options from _bootstrap.json");
-                                        import::run(args);
-                                    }
-                                    succeeded.push(workspace.join("dataset.yaml"));
-                                }
-                                Err(e) => {
-                                    eprintln!("  Warning: failed to parse _bootstrap.json: {}", e);
-                                    failed.push(workspace.clone());
-                                }
-                            }
-                            Err(e) => {
-                                eprintln!("  Warning: failed to read _bootstrap.json: {}", e);
-                                failed.push(workspace.clone());
-                            }
-                        }
-                    } else {
-                        eprintln!("  No _bootstrap.json — skipping (bootstrap manually first)");
-                    }
+                    // Run wizard with CLI flags as seeds — auto-detect
+                    // inputs from the directory contents.
+                    let seeds = wizard::WizardSeeds {
+                        name: None,
+                        output: Some(".".into()),
+                        base_vectors: None,
+                        query_vectors: None,
+                        self_search: None,
+                        query_count: None,
+                        metadata: None,
+                        ground_truth: None,
+                        ground_truth_distances: None,
+                        metric: None,
+                        neighbors: None,
+                        seed: None,
+                        description: None,
+                        no_dedup: if no_dedup { Some(true) } else { None },
+                        no_zero_check: if no_zero_check { Some(true) } else { None },
+                        no_filtered: if no_filtered { Some(true) } else { None },
+                        normalize: Some(normalize),
+                        base_fraction: None,
+                        pedantic_dedup: if pedantic_dedup { Some(true) } else { None },
+                        required_facets: required_facets.clone(),
+                        provided_facets: provided_facets.clone(),
+                        round_digits: None,
+                        selectivity: None,
+                        force: true,
+                        classic,
+                        sources: vec![],
+                    };
+                    let args = wizard::run_wizard_with_options(yes, auto, seeds);
+                    import::run(args);
+                    succeeded.push(workspace.join("dataset.yaml"));
 
                     if let Some(d) = saved_dir {
                         let _ = std::env::set_current_dir(d);
@@ -555,40 +512,6 @@ pub fn run(args: PrepareArgs) {
                     std::process::exit(1);
                 }
                 return;
-            }
-
-            // If _bootstrap.json exists and no significant CLI args given, load from it
-            let bootstrap_file = PathBuf::from("_bootstrap.json");
-            let has_cli_args = name.is_some() || output.is_some() || base_vectors.is_some()
-                || query_vectors.is_some() || interactive || auto || !sources.is_empty()
-                || required_facets.is_some() || provided_facets.is_some();
-            if !has_cli_args && bootstrap_file.exists() {
-                match std::fs::read_to_string(&bootstrap_file) {
-                    Ok(json) => match serde_json::from_str::<import::ImportArgs>(&json) {
-                        Ok(mut args) => {
-                            // CLI flags override stored values
-                            if force || reset { args.force = true; }
-                            if normalize && !no_normalize { args.normalize = true; }
-                            if no_normalize { args.normalize = false; }
-                            if classic { args.classic = true; }
-                            if no_dedup { args.no_dedup = true; }
-                            if no_zero_check { args.no_zero_check = true; }
-                            if no_filtered { args.no_filtered = true; }
-                            if pedantic_dedup { args.pedantic_dedup = true; }
-                            if let Some(ref rf) = required_facets {
-                                args.required_facets = Some(rf.clone());
-                            }
-                            if let Some(ref pf) = provided_facets {
-                                args.provided_facets = Some(pf.clone());
-                            }
-                            println!("Loaded options from _bootstrap.json");
-                            import::run(args);
-                            return;
-                        }
-                        Err(e) => eprintln!("Warning: failed to parse _bootstrap.json: {}", e),
-                    }
-                    Err(e) => eprintln!("Warning: failed to read _bootstrap.json: {}", e),
-                }
             }
 
             // --auto implies -i -r -y
@@ -730,7 +653,6 @@ pub fn run(args: PrepareArgs) {
                         sources: sources.clone(),
                     };
                     let args = wizard::run_wizard_with_options(yes, auto, seeds);
-                    save_bootstrap_json(&args);
                     let out = args.output.clone();
                     import::run(args);
                     check_and_restore(&out);
@@ -793,7 +715,6 @@ pub fn run(args: PrepareArgs) {
                     sources: sources.clone(),
                 };
                 let args = wizard::run_wizard_with_options(yes, false, seeds);
-                save_bootstrap_json(&args);
                 import::run(args);
             } else {
                 let name = name.unwrap_or_else(|| {
@@ -858,6 +779,16 @@ pub fn run(args: PrepareArgs) {
             match command {
                 CatalogSubcommand::Generate { input, basename, for_publish_url, update } => {
                     crate::catalog::generate::run(&input, &basename, for_publish_url, update);
+                }
+                CatalogSubcommand::Stats { input, output } => {
+                    // Delegate to the pipeline command
+                    let args = vec![
+                        "catalog".to_string(),
+                        "stats".to_string(),
+                        "--input".to_string(), input.to_string_lossy().to_string(),
+                        "--output".to_string(), output,
+                    ];
+                    crate::pipeline::cli::run_direct(args);
                 }
             }
         }
@@ -1009,9 +940,15 @@ fn collect_dataset_yamls(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf
     };
     for entry in entries.flatten() {
         let path = entry.path();
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        // Skip hidden directories and underscore-prefixed directories
         if path.is_dir() {
+            if name_str.starts_with('.') || name_str.starts_with('_') {
+                continue;
+            }
             collect_dataset_yamls(&path, out);
-        } else if path.file_name().and_then(|n| n.to_str()) == Some("dataset.yaml") {
+        } else if name_str == "dataset.yaml" {
             out.push(path);
         }
     }

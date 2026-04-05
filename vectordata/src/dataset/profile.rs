@@ -267,13 +267,21 @@ impl DSProfileGroup {
 
     /// Expand deferred sized entries using the provided variable map.
     ///
+    /// Expand deferred sized profile entries into concrete profiles.
+    ///
+    /// `base_count` is the actual number of clean base vectors in the
+    /// dataset. This is **required** — profile expansion cannot produce
+    /// valid profiles without knowing the dataset size. Every generator
+    /// stops producing candidates as soon as a value would equal or exceed
+    /// `base_count` (such profiles are redundant with the default profile).
+    ///
     /// Called by the pipeline runner after core stages have produced actual
     /// counts (e.g., `base_count` in `variables.yaml`). Entries that still
     /// contain unresolved variables after interpolation are skipped with a
     /// warning.
     ///
     /// Returns the number of new profiles added.
-    pub fn expand_deferred_sized(&mut self, vars: &IndexMap<String, String>) -> usize {
+    pub fn expand_deferred_sized(&mut self, vars: &IndexMap<String, String>, base_count: u64) -> usize {
         if self.deferred_sized.is_empty() {
             return 0;
         }
@@ -282,13 +290,6 @@ impl DSProfileGroup {
         let templates = self.deferred_facet_templates.take();
         let entries = std::mem::take(&mut self.deferred_sized);
         let mut added = 0;
-
-        // Determine the maximum meaningful profile size from the default
-        // profile's base_count or the base_count variable. Profiles larger
-        // than this are filtered out since they exceed the actual dataset.
-        let max_base_count: Option<u64> = default_profile.as_ref()
-            .and_then(|dp| dp.base_count)
-            .or_else(|| vars.get("base_count").and_then(|v| v.parse().ok()));
 
         for entry_str in &entries {
             // Interpolate variables
@@ -308,8 +309,8 @@ impl DSProfileGroup {
                 continue;
             }
 
-            // Parse the resolved entry, capping unbounded series at the dataset size
-            let pairs = match parse_sized_entry_impl(&resolved, max_base_count) {
+            // Parse the resolved entry. Every generator stops at base_count.
+            let pairs = match parse_sized_entry_impl(&resolved, base_count) {
                 Ok(p) => p,
                 Err(e) => {
                     log::warn!("failed to parse sized entry '{}' (resolved: '{}'): {}", entry_str, resolved, e);
@@ -631,16 +632,46 @@ pub fn profile_sort_by_size(
     a_key.cmp(&b_key).then_with(|| a_name.cmp(b_name))
 }
 
-pub fn parse_sized_entry(entry: &str) -> Result<Vec<(String, u64)>, String> {
-    parse_sized_entry_impl(entry, None)
+/// Parse a sized entry without a base count bound. Only valid for forms
+/// with explicit ranges (simple values, linear ranges with explicit ends).
+/// Unbounded series (mul:start/factor, fib: without explicit end) will
+/// use a 0 cap and produce no results.
+/// Returns true if a sized entry uses an implicit upper bound form that
+/// requires `base_count` to be known before expansion. These entries
+/// must be deferred during YAML deserialization.
+///
+/// Currently only `mul:start/factor` (no `..end`) needs deferral.
+pub fn needs_base_count(entry: &str) -> bool {
+    let entry = entry.trim();
+    if let Some(rest) = entry.strip_prefix("mul:") {
+        // mul:start/factor (no ..) needs base_count
+        // mul:start..end/factor has explicit end, does not need it
+        !rest.contains("..")
+    } else {
+        false
+    }
 }
 
-fn parse_sized_entry_impl(entry: &str, max_count: Option<u64>) -> Result<Vec<(String, u64)>, String> {
+/// Parse a sized entry without a base count bound. Only valid for forms
+/// with explicit ranges. Implicit upper bound forms (like `mul:start/factor`)
+/// will return an error — use `parse_sized_entry_impl` with a known
+/// `max_count` instead, or defer the entry.
+pub fn parse_sized_entry(entry: &str) -> Result<Vec<(String, u64)>, String> {
+    parse_sized_entry_impl(entry, 0)
+}
+
+/// Parse a sized entry, producing only profiles with `count < max_count`.
+///
+/// `max_count` is the actual base vector count of the dataset. Every
+/// generator checks each candidate against this bound before emitting it.
+/// A candidate that equals or exceeds `max_count` is not emitted (it
+/// would be redundant with the default profile).
+fn parse_sized_entry_impl(entry: &str, max_count: u64) -> Result<Vec<(String, u64)>, String> {
     let entry = entry.trim();
 
     // Check for series generator prefixes
     if let Some(rest) = entry.strip_prefix("fib:") {
-        return parse_fib_range(rest);
+        return parse_fib_range(rest, max_count);
     }
     if let Some(rest) = entry.strip_prefix("mul:") {
         return parse_mul_range(rest, max_count);
@@ -651,9 +682,10 @@ fn parse_sized_entry_impl(entry: &str, max_count: Option<u64>) -> Result<Vec<(St
             .split_once("..")
             .ok_or_else(|| format!("invalid sized range '{}': expected start..end/step", entry))?;
         let start = parse_number_with_suffix(start_str.trim())?;
-        let end = parse_number_with_suffix(end_str.trim())?;
+        let end_raw = parse_number_with_suffix(end_str.trim())?;
+        // Cap explicit end at max_count (profiles >= max_count are invalid)
+        let end = if max_count > 0 { end_raw.min(max_count - 1) } else { end_raw };
         if start > end {
-            // Degenerate range — no profiles to generate
             return Ok(Vec::new());
         }
 
@@ -669,7 +701,7 @@ fn parse_sized_entry_impl(entry: &str, max_count: Option<u64>) -> Result<Vec<(St
             let mut result = Vec::new();
             let mut v = start;
             while v <= end {
-                if v > 0 {
+                if v > 0 && (max_count == 0 || v < max_count) {
                     result.push((format_count_with_suffix(v), v));
                 }
                 v += step;
@@ -686,7 +718,7 @@ fn parse_sized_entry_impl(entry: &str, max_count: Option<u64>) -> Result<Vec<(St
             let mut result = Vec::new();
             for i in 1..=count {
                 let val = start + (range * i) / count;
-                if val > 0 {
+                if val > 0 && (max_count == 0 || val < max_count) {
                     result.push((format_count_with_suffix(val), val));
                 }
             }
@@ -697,23 +729,29 @@ fn parse_sized_entry_impl(entry: &str, max_count: Option<u64>) -> Result<Vec<(St
     } else {
         // Simple value
         let count = parse_number_with_suffix(entry)?;
+        if max_count > 0 && count >= max_count {
+            return Ok(Vec::new());
+        }
         Ok(vec![(format_count_with_suffix(count), count)])
     }
 }
 
-/// Generate fibonacci-progression values within [start, end].
+/// Generate fibonacci-progression values within [start, end], capped at
+/// `max_count`. No value `>= max_count` is emitted.
 ///
 /// `fib:1m..400m` produces all fibonacci multiples of the base unit that
 /// fall within the range. The base unit is the GCD-friendly smallest value;
 /// the series starts at 1×base and grows by fibonacci steps.
-fn parse_fib_range(range_str: &str) -> Result<Vec<(String, u64)>, String> {
+fn parse_fib_range(range_str: &str, max_count: u64) -> Result<Vec<(String, u64)>, String> {
     let (start_str, end_str) = range_str
         .split_once("..")
         .ok_or_else(|| format!("invalid fib range '{}': expected fib:start..end", range_str))?;
     let start = parse_number_with_suffix(start_str.trim())?;
-    let end = parse_number_with_suffix(end_str.trim())?;
+    let end_raw = parse_number_with_suffix(end_str.trim())?;
+    // Cap at max_count (profiles >= max_count are redundant with default)
+    let end = if max_count > 0 { end_raw.min(max_count - 1) } else { end_raw };
     if start == 0 {
-        return Err(format!("fib range requires start > 0, got {}..{}", start, end));
+        return Err(format!("fib range requires start > 0, got {}..{}", start, end_raw));
     }
     if start > end {
         return Ok(Vec::new());
@@ -727,7 +765,7 @@ fn parse_fib_range(range_str: &str) -> Result<Vec<(String, u64)>, String> {
         if val > end {
             break;
         }
-        if val >= start {
+        if val >= start && (max_count == 0 || val < max_count) {
             result.push((format_count_with_suffix(val), val));
         }
         let next = a.saturating_add(b);
@@ -737,25 +775,32 @@ fn parse_fib_range(range_str: &str) -> Result<Vec<(String, u64)>, String> {
     Ok(result)
 }
 
-/// Generate geometric (compound-by-factor) values within [start, end].
+/// Generate geometric (compound-by-factor) values within [start, end],
+/// capped at `max_count`. No value `>= max_count` is emitted.
 ///
 /// `mul:1m..400m/2` produces: 1m, 2m, 4m, 8m, 16m, 32m, 64m, 128m, 256m
 /// `mul:1m..100m/1.5` produces: 1m, 1500k (rounded), etc.
 ///
 /// The factor must be > 1.0. Each successive value is `floor(prev × factor)`.
-fn parse_mul_range(spec: &str, _max_count: Option<u64>) -> Result<Vec<(String, u64)>, String> {
+fn parse_mul_range(spec: &str, max_count: u64) -> Result<Vec<(String, u64)>, String> {
     let (range_part, factor_str) = spec
         .split_once('/')
         .ok_or_else(|| format!("invalid mul spec '{}': expected mul:start/factor or mul:start..end/factor", spec))?;
     // Support both mul:start..end/factor and mul:start/factor (no end)
-    let (start, end) = if let Some((start_str, end_str)) = range_part.split_once("..") {
-        (parse_number_with_suffix(start_str.trim())?, parse_number_with_suffix(end_str.trim())?)
+    let (start, explicit_end) = if let Some((start_str, end_str)) = range_part.split_once("..") {
+        (parse_number_with_suffix(start_str.trim())?, Some(parse_number_with_suffix(end_str.trim())?))
     } else {
-        // No explicit end — generate up to 1T. Profiles whose base_count
-        // exceeds the actual dataset size are valid: commands gracefully
-        // handle the case by using min(base_count, file_count). The full
-        // series is generated so the manifest matches pipeline output.
-        (parse_number_with_suffix(range_part.trim())?, 1_000_000_000_000u64)
+        (parse_number_with_suffix(range_part.trim())?, None)
+    };
+    // The effective end is the minimum of the explicit end (if any) and
+    // max_count - 1. Profiles at or above max_count are redundant with
+    // the default profile and must never be generated.
+    let end = match (explicit_end, max_count) {
+        (Some(e), mc) if mc > 0 => e.min(mc - 1),
+        (Some(e), _) => e,
+        (None, mc) if mc > 0 => mc - 1,
+        (None, _) => return Err(format!(
+            "implicit upper bound form 'mul:{}' requires a known base count", range_part)),
     };
     let factor: f64 = factor_str.trim().parse()
         .map_err(|e| format!("invalid mul factor '{}': {}", factor_str, e))?;
@@ -766,7 +811,6 @@ fn parse_mul_range(spec: &str, _max_count: Option<u64>) -> Result<Vec<(String, u
         return Err(format!("mul range requires start > 0, got {}..{}", start, end));
     }
     if start > end {
-        // Degenerate range (e.g., 1m..0) — no profiles to generate
         return Ok(Vec::new());
     }
 
@@ -774,7 +818,8 @@ fn parse_mul_range(spec: &str, _max_count: Option<u64>) -> Result<Vec<(String, u
     let mut val_f = start as f64;
     loop {
         let val = val_f as u64;
-        if val > end || result.len() >= 100 {
+        // Stop as soon as a candidate reaches or exceeds max_count
+        if val > end || (max_count > 0 && val >= max_count) || result.len() >= 100 {
             break;
         }
         // Deduplicate: skip if same as previous
@@ -870,7 +915,9 @@ impl<'de> Deserialize<'de> for DSProfileGroup {
                 let mut deferred: Vec<String> = Vec::new();
                 let mut all_pairs: Vec<(String, u64)> = Vec::new();
                 for entry_str in &entries {
-                    if entry_str.contains("${") {
+                    if entry_str.contains("${") || needs_base_count(entry_str) {
+                        // Entries with unresolved variables or implicit upper
+                        // bounds must be deferred until base_count is known.
                         deferred.push(entry_str.clone());
                     } else {
                         let pairs = parse_sized_entry(entry_str)
@@ -1460,23 +1507,38 @@ sized: ["mul:1m..16m/2"]
 
     #[test]
     fn test_mul_implicit_end_in_yaml() {
-        // The implicit-end form `mul:1m/2` resolves immediately at parse time,
-        // generating profiles up to the safety cap (100 profiles max).
+        // The implicit-end form `mul:1m/2` is deferred at parse time since
+        // base_count is not yet known. It expands when expand_deferred_sized
+        // is called with the actual base_count.
         let yaml = r#"
 default:
   maxk: 100
   base_vectors: base.mvec
 sized: ["mul:1m/2"]
 "#;
-        let g: DSProfileGroup = serde_yaml::from_str(yaml).unwrap();
+        let mut g: DSProfileGroup = serde_yaml::from_str(yaml).unwrap();
+        // Only default is present before expansion
+        assert_eq!(g.profile_names(), vec!["default"]);
+        assert!(g.has_deferred());
+
+        // Expand with a known base_count of 200m
+        let vars = indexmap::IndexMap::new();
+        let added = g.expand_deferred_sized(&vars, 200_000_000);
+        assert!(added > 5, "expected multiple profiles, got {}", added);
         let names = g.profile_names();
-        // Should have default + geometric series from 1m doubling
-        assert!(names.len() > 5, "expected multiple profiles, got {:?}", names);
         assert_eq!(names[0], "default");
         assert_eq!(names[1], "1m");
         assert_eq!(names[2], "2m");
         assert_eq!(names[3], "4m");
-        // All sized profiles should inherit base_vectors from default
+        // Last sized profile must be < 200m
+        let last_sized = g.profiles.iter()
+            .filter(|(n, _)| *n != "default")
+            .max_by_key(|(_, p)| p.base_count.unwrap_or(0))
+            .unwrap();
+        assert!(last_sized.1.base_count.unwrap() < 200_000_000,
+            "last profile {} has base_count {} >= 200m",
+            last_sized.0, last_sized.1.base_count.unwrap());
+        // Sized profiles should inherit base_vectors from default
         let p1m = g.profile("1m").unwrap();
         assert!(p1m.base_count.is_some());
         assert_eq!(p1m.base_count.unwrap(), 1_000_000);
@@ -1569,31 +1631,33 @@ default:
 
     #[test]
     fn test_parse_mul_implicit_end() {
-        // mul:1m/2 (no ..end) generates profiles with implicit upper bound (1T cap)
-        let pairs = parse_sized_entry("mul:1m/2").unwrap();
+        // mul:1m/2 (no ..end) requires base_count to be known.
+        // With max_count=0 (unknown), this is an error.
+        assert!(parse_sized_entry("mul:1m/2").is_err());
+
+        // With a known base_count, it generates profiles up to (not including) that count.
+        let pairs = parse_sized_entry_impl("mul:1m/2", 200_000_000).unwrap();
         let counts: Vec<u64> = pairs.iter().map(|(_, c)| *c).collect();
-        // Should start at 1m and double: 1m, 2m, 4m, 8m, 16m, 32m, 64m, 128m, ...
+        // Should start at 1m and double: 1m, 2m, 4m, 8m, 16m, 32m, 64m, 128m
+        // 256m would be >= 200m so it's not generated.
         assert_eq!(counts[0], 1_000_000);
         assert_eq!(counts[1], 2_000_000);
         assert_eq!(counts[2], 4_000_000);
-        assert_eq!(counts[3], 8_000_000);
         // Each successive value should be double the previous
         for i in 1..counts.len() {
             assert_eq!(counts[i], counts[i - 1] * 2,
                 "expected doubling at index {}: {} vs {}", i, counts[i], counts[i - 1] * 2);
         }
-        // Should have many profiles (up to 1T, capped at 100)
-        assert!(counts.len() > 10, "expected more than 10 profiles, got {}", counts.len());
-        // All values should be <= 1T
-        assert!(*counts.last().unwrap() <= 1_000_000_000_000);
+        // Last value must be < 200m
+        assert!(*counts.last().unwrap() < 200_000_000);
+        assert_eq!(*counts.last().unwrap(), 128_000_000);
     }
 
     #[test]
     fn test_parse_mul_implicit_end_caps_at_100() {
-        // mul:1/1.01 with a tiny factor generates many profiles before
-        // reaching the 1T implicit upper bound. The 100-profile safety cap
-        // should stop expansion at exactly 100 profiles.
-        let pairs = parse_sized_entry("mul:1/1.01").unwrap();
+        // mul:1/1.01 with a tiny factor and large base_count generates many
+        // profiles. The 100-profile safety cap should stop at exactly 100.
+        let pairs = parse_sized_entry_impl("mul:1/1.01", 1_000_000_000).unwrap();
         assert_eq!(pairs.len(), 100,
             "expected exactly 100 profiles (safety cap), got {}", pairs.len());
         // First profile should be 1
