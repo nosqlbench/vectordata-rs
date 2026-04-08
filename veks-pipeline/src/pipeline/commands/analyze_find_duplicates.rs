@@ -165,19 +165,22 @@ fn run_dedup(source_path: &Path, ctx: &mut StreamContext) -> Result<DedupResult,
         return Err(result.message);
     }
 
-    // Parse the report for detailed stats
-    let report: serde_json::Value = if report_path.exists() {
+    // Parse the report using the shared DedupReport struct — compile-time
+    // field name verification prevents the kind of key mismatch bug that
+    // happens with raw serde_json::Value field access.
+    use super::compute_dedup::DedupReport;
+    let report: DedupReport = if report_path.exists() {
         let content = std::fs::read_to_string(&report_path)
             .map_err(|e| format!("read report: {}", e))?;
-        serde_json::from_str(&content).unwrap_or_default()
+        serde_json::from_str(&content)
+            .map_err(|e| format!("parse report: {}", e))?
     } else {
-        serde_json::Value::Null
+        return Err("dedup report not written".into());
     };
 
-    let count = report["total"].as_u64().unwrap_or(0) as usize;
-    let unique = report["unique"].as_u64().unwrap_or(0) as usize;
-    let duplicates = report["duplicates"].as_u64().unwrap_or(0) as usize;
-    let dim = report["prefix_width"].as_u64().unwrap_or(0) as usize; // approximate
+    let count = report.total_vectors;
+    let unique = report.unique_vectors;
+    let duplicates = report.duplicate_vectors;
 
     // Get actual dimension from the source
     let actual_dim = ElementType::from_path(source_path).ok()
@@ -194,7 +197,7 @@ fn run_dedup(source_path: &Path, ctx: &mut StreamContext) -> Result<DedupResult,
                 _ => None,
             }
         })
-        .unwrap_or(dim);
+        .unwrap_or(report.prefix_width);
 
     // Analyze duplicate groups from the duplicates ivec
     let group_sizes = if dups_path.exists() && duplicates > 0 {

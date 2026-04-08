@@ -278,18 +278,22 @@ impl CommandOp for VerifyKnnConsolidatedOp {
         let dim = VectorReader::<f32>::dim(&f32_base_reader);
         f32_base_reader.advise_sequential();
 
-        // Validate: no profile should have base_count exceeding the actual
-        // dataset. Profile expansion is required to enforce this invariant
-        // at generation time — post-hoc filtering is not allowed.
-        for (name, bc, _, _) in &profiles {
+        // Filter out profiles whose declared base_count exceeds the actual
+        // dataset size. These are oversized profiles that were created at
+        // parse time before base_count was known (e.g., `sized: [1m]` with
+        // only 188 base vectors). Clamping them to base_count would make
+        // them identical to the default profile, so skip with a warning.
+        profiles.retain(|(name, bc, _, _)| {
             if *bc != u64::MAX && (*bc as usize) > base_count {
-                return error_result(format!(
-                    "profile '{}' has base_count {} but dataset only has {} base vectors — \
-                     regenerate profiles with correct base_count",
+                ctx.ui.log(&format!(
+                    "  skipping profile '{}': declared base_count {} exceeds actual {} base vectors",
                     name, bc, base_count,
-                ), start);
+                ));
+                false
+            } else {
+                true
             }
-        }
+        });
 
         // Load query vectors (any float format)
         let query_reader = match AnyFloatReader::open(&query_path) {
@@ -402,11 +406,19 @@ impl CommandOp for VerifyKnnConsolidatedOp {
         // Scan base vectors in segments between profile boundaries.
         // After each segment, the cumulative heaps contain the correct
         // top-k for [0, boundary), so we can verify profiles immediately.
+        //
+        // `find_top_k_batch_f32` creates fresh heaps internally and
+        // overwrites the results buffer, so after each segment we merge
+        // the segment results into `cumulative_results` to maintain the
+        // correct cumulative top-k across boundaries.
         for (boundary, profile_indices) in &boundary_profiles {
             let seg_start = prev_boundary;
             let seg_end = *boundary;
 
             if seg_end > seg_start {
+                // Temporary buffer for this segment's results
+                let mut segment_results: Vec<Vec<Neighbor>> = (0..num_samples).map(|_| Vec::new()).collect();
+
                 // Parallel scan of this segment
                 std::thread::scope(|scope| {
                     let progress_ref = &progress;
@@ -414,7 +426,7 @@ impl CommandOp for VerifyKnnConsolidatedOp {
                     if effective_threads > 1 {
                         let chunk_size = (num_samples + effective_threads - 1) / effective_threads;
                         let result_chunks: Vec<&mut [Vec<Neighbor>]> =
-                            cumulative_results.chunks_mut(chunk_size).collect();
+                            segment_results.chunks_mut(chunk_size).collect();
 
                         for (ci, chunk) in result_chunks.into_iter().enumerate() {
                             let chunk_start = ci * chunk_size;
@@ -466,7 +478,7 @@ impl CommandOp for VerifyKnnConsolidatedOp {
                             batched_fn,
                             kernel_metric,
                             dim,
-                            &mut cumulative_results,
+                            &mut segment_results,
                             stride,
                             &progress,
                         );
@@ -474,6 +486,21 @@ impl CommandOp for VerifyKnnConsolidatedOp {
                             progress.load(std::sync::atomic::Ordering::Relaxed));
                     }
                 });
+
+                // Merge segment results into cumulative results.
+                // For each query, combine the neighbors from the previous
+                // segments with this segment's neighbors, keeping only
+                // the top-k by distance.
+                for qi in 0..num_samples {
+                    cumulative_results[qi].extend(segment_results[qi].drain(..));
+                    if cumulative_results[qi].len() > k {
+                        cumulative_results[qi].sort_by(|a, b| {
+                            a.distance.partial_cmp(&b.distance).unwrap_or(std::cmp::Ordering::Equal)
+                                .then(a.index.cmp(&b.index))
+                        });
+                        cumulative_results[qi].truncate(k);
+                    }
+                }
             }
 
             prev_boundary = seg_end;

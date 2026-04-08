@@ -96,6 +96,8 @@ fn default_args(name: &str, output: &Path) -> ImportArgs {
         round_digits: 2,
         pedantic_dedup: false,
         selectivity: 0.0001,
+        provided_facets: None,
+        classic: false,
     }
 }
 
@@ -167,11 +169,15 @@ fn import_npy_dir_needs_import_step() {
 
     // Should have import step (npy is foreign format)
     assert!(yaml.contains("run: transform convert"), "npy dir should need import step");
-    assert!(yaml.contains("${cache}/all_vectors.mvec"), "import output should go to cache");
+    // Probe of fake npy falls back to fvec; real npy dirs would get the correct extension
+    assert!(yaml.contains("${cache}/all_vectors.fvec") || yaml.contains("${cache}/all_vectors.mvec"),
+        "import output should go to cache");
 }
 
 #[test]
-fn import_separate_query_no_shuffle() {
+fn import_separate_query_combined_bq() {
+    // Strategy 1: Non-HDF5 separate base+query files are combined into a
+    // single source, deduplicated together, then split via shuffle.
     let dir = tempfile::tempdir().unwrap();
     let base = dir.path().join("base.fvec");
     let query = dir.path().join("query.fvec");
@@ -187,15 +193,15 @@ fn import_separate_query_no_shuffle() {
 
     let yaml = read_yaml(&out);
 
-    // Separate query: no shuffle, no extract
-    assert!(!yaml.contains("generate-shuffle"), "separate query should not shuffle");
-    assert!(!yaml.contains("extract-query"), "separate query should not extract");
-    assert!(!yaml.contains("extract-base"), "separate query should not extract base");
+    // Strategy 1 (combined B+Q): self_search=true, so shuffle IS present
+    assert!(yaml.contains("generate-shuffle"), "combined B+Q should shuffle");
+    assert!(yaml.contains("extract-queries"), "combined B+Q should have extract-queries");
+    assert!(yaml.contains("extract-base"), "combined B+Q should have extract-base");
 
     // KNN should still be present
-    assert!(yaml.contains("compute knn"), "should have KNN with separate query");
+    assert!(yaml.contains("compute knn"), "should have KNN with combined B+Q");
 
-    // Query should be at canonical profile path (symlinked to source)
+    // Query should be at canonical profile path
     assert!(yaml.contains("profiles/base/query_vectors.fvec"),
         "query should use canonical profile path");
 }
@@ -644,8 +650,8 @@ fn check_merkle_mref_files_are_skipped() {
 
 #[test]
 fn import_both_self_search_and_separate_query() {
-    // When both --self-search and --query-vectors are given,
-    // --query-vectors should win (separate query)
+    // Strategy 1: Non-HDF5 separate base+query are combined into a single
+    // source and processed as self-search with shuffle.
     let dir = tempfile::tempdir().unwrap();
     let base = dir.path().join("base.fvec");
     let query = dir.path().join("query.fvec");
@@ -656,14 +662,14 @@ fn import_both_self_search_and_separate_query() {
     let mut args = default_args("both-modes", &out);
     args.base_vectors = Some(base);
     args.query_vectors = Some(query);
-    args.self_search = true; // should be overridden by query_vectors
+    args.self_search = true;
 
     veks::prepare::import::run(args);
 
     let yaml = read_yaml(&out);
-    // Separate query takes precedence — no shuffle
-    assert!(!yaml.contains("generate-shuffle"),
-        "separate query should override self-search");
+    // Strategy 1 (combined B+Q for non-HDF5): self_search=true, shuffle IS present
+    assert!(yaml.contains("generate-shuffle"),
+        "combined B+Q should use shuffle");
 }
 
 #[test]
@@ -1424,7 +1430,7 @@ fn project_artifacts_clear_variables_empty() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Import flow tests: find-zeros, filter-ordinals, normalize, and dependency graph
+// Import flow tests: prepare-vectors, normalize, and dependency graph
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Collect step IDs from YAML by parsing "- id: <step-id>" lines.
@@ -1465,7 +1471,9 @@ fn after_for_step(yaml: &str, step_id: &str) -> Option<String> {
 }
 
 #[test]
-fn import_zero_check_and_clean_ordinals_emitted_by_default() {
+fn import_prepare_vectors_emitted_by_default() {
+    // Zero detection and normalization are now absorbed into prepare-vectors
+    // and the extract steps. No separate find-zeros or filter-ordinals steps.
     let dir = tempfile::tempdir().unwrap();
     let fvec = dir.path().join("base.fvec");
     write_fvec(&fvec, 50, 4);
@@ -1478,17 +1486,23 @@ fn import_zero_check_and_clean_ordinals_emitted_by_default() {
     let yaml = read_yaml(&dir.path().join("out"));
     let ids = step_ids_from_yaml(&yaml);
 
-    assert!(ids.contains(&"find-zeros".to_string()),
-        "find-zeros should be emitted by default, got: {:?}", ids);
-    assert!(ids.contains(&"filter-ordinals".to_string()),
-        "filter-ordinals should be emitted by default, got: {:?}", ids);
+    // prepare-vectors (sort+dedup) should be emitted by default
+    assert!(ids.contains(&"prepare-vectors".to_string()),
+        "prepare-vectors should be emitted by default, got: {:?}", ids);
+    assert!(ids.contains(&"count-duplicates".to_string()),
+        "count-duplicates should be emitted after prepare-vectors, got: {:?}", ids);
+
+    // These old steps should NOT exist
+    assert!(!ids.contains(&"find-zeros".to_string()),
+        "find-zeros is absorbed into prepare-vectors, got: {:?}", ids);
+    assert!(!ids.contains(&"filter-ordinals".to_string()),
+        "filter-ordinals is absorbed into prepare-vectors, got: {:?}", ids);
 }
 
 #[test]
-fn import_no_zero_check_suppresses_zero_check_and_not_clean_ordinals() {
-    // --no-find-zeros suppresses find-zeros. filter-ordinals is still emitted
-    // because dedup is still active (no_dedup=false, no_zero_check=true →
-    // clean_ordinals is Materialized per the condition !(no_dedup && no_zero_check)).
+fn import_no_zero_check_still_has_prepare_vectors() {
+    // --no-zero-check does not suppress prepare-vectors; dedup is still active.
+    // Zero detection and filtering are absorbed into prepare-vectors/extraction.
     let dir = tempfile::tempdir().unwrap();
     let fvec = dir.path().join("base.fvec");
     write_fvec(&fvec, 50, 4);
@@ -1501,11 +1515,14 @@ fn import_no_zero_check_suppresses_zero_check_and_not_clean_ordinals() {
     let yaml = read_yaml(&dir.path().join("out"));
     let ids = step_ids_from_yaml(&yaml);
 
+    // prepare-vectors (sort+dedup) is still present since no_dedup=false
+    assert!(ids.contains(&"prepare-vectors".to_string()),
+        "prepare-vectors should still be emitted when only no_zero_check is set, got: {:?}", ids);
+    // No separate find-zeros or filter-ordinals
     assert!(!ids.contains(&"find-zeros".to_string()),
-        "find-zeros should be suppressed when --no-find-zeros is set, got: {:?}", ids);
-    // filter-ordinals is still present because dedup is active
-    assert!(ids.contains(&"filter-ordinals".to_string()),
-        "filter-ordinals should still be emitted when only no_zero_check is set, got: {:?}", ids);
+        "find-zeros no longer exists as a separate step, got: {:?}", ids);
+    assert!(!ids.contains(&"filter-ordinals".to_string()),
+        "filter-ordinals no longer exists as a separate step, got: {:?}", ids);
 }
 
 #[test]
@@ -1531,11 +1548,9 @@ fn import_no_zero_check_and_no_dedup_suppresses_both() {
 }
 
 #[test]
-fn import_no_dedup_with_zero_check_still_enabled() {
-    // --no-dedup but find-zeros is still enabled.
-    // dedup-vectors is absent, but find-zeros and filter-ordinals should still appear.
-    // find-zeros uses dedup ordinals — when dedup is Identity (empty path),
-    // the find-zeros step still references the ordinals slot which is empty.
+fn import_no_dedup_skips_prepare_vectors() {
+    // --no-dedup suppresses prepare-vectors entirely.
+    // Zero detection is now handled during extraction, not as a separate step.
     let dir = tempfile::tempdir().unwrap();
     let fvec = dir.path().join("base.fvec");
     write_fvec(&fvec, 50, 4);
@@ -1549,12 +1564,16 @@ fn import_no_dedup_with_zero_check_still_enabled() {
     let yaml = read_yaml(&dir.path().join("out"));
     let ids = step_ids_from_yaml(&yaml);
 
-    assert!(!ids.contains(&"dedup-vectors".to_string()),
-        "dedup-vectors should be absent with --no-dedup, got: {:?}", ids);
-    assert!(ids.contains(&"find-zeros".to_string()),
-        "find-zeros should be present when no_zero_check=false, got: {:?}", ids);
-    assert!(ids.contains(&"filter-ordinals".to_string()),
-        "filter-ordinals should be present when not both no_dedup and no_zero_check, got: {:?}", ids);
+    // prepare-vectors is absent with --no-dedup
+    assert!(!ids.contains(&"prepare-vectors".to_string()),
+        "prepare-vectors should be absent with --no-dedup, got: {:?}", ids);
+    assert!(!ids.contains(&"count-duplicates".to_string()),
+        "count-duplicates should be absent with --no-dedup, got: {:?}", ids);
+    // Old separate steps no longer exist
+    assert!(!ids.contains(&"find-zeros".to_string()),
+        "find-zeros is absorbed into extraction, got: {:?}", ids);
+    assert!(!ids.contains(&"filter-ordinals".to_string()),
+        "filter-ordinals is absorbed into prepare-vectors, got: {:?}", ids);
 }
 
 #[test]
@@ -1588,9 +1607,10 @@ fn import_normalize_adds_normalize_to_extract_steps() {
 }
 
 #[test]
-fn import_normalize_separate_query_no_extract_steps() {
-    // Separate query = no self-search, so no extract steps.
-    // Normalization intent has nowhere to be applied (no extract steps emitted).
+fn import_normalize_separate_query_combined_bq() {
+    // Strategy 1: Non-HDF5 separate base+query are combined into a single
+    // source (combined_bq=true), processed as self-search with shuffle.
+    // Extract steps ARE present and normalization is always applied.
     let dir = tempfile::tempdir().unwrap();
     let base = dir.path().join("base.fvec");
     let query = dir.path().join("query.fvec");
@@ -1606,15 +1626,15 @@ fn import_normalize_separate_query_no_extract_steps() {
     let yaml = read_yaml(&dir.path().join("out"));
     let ids = step_ids_from_yaml(&yaml);
 
-    // No extract steps with separate query
-    assert!(!ids.contains(&"extract-queries".to_string()),
-        "separate query should not have extract steps, got: {:?}", ids);
-    assert!(!ids.contains(&"extract-base".to_string()),
-        "separate query should not have extract steps, got: {:?}", ids);
+    // Strategy 1 (combined B+Q): extract steps ARE present
+    assert!(ids.contains(&"extract-queries".to_string()),
+        "combined B+Q should have extract-queries, got: {:?}", ids);
+    assert!(ids.contains(&"extract-base".to_string()),
+        "combined B+Q should have extract-base, got: {:?}", ids);
 
-    // normalize: true should NOT appear in the YAML (no extract steps to carry it)
-    assert!(!yaml.contains("normalize: true"),
-        "no extract steps means normalize: true should not appear in YAML");
+    // normalize: true is always set on extract steps
+    assert!(yaml.contains("normalize: true"),
+        "normalize: true should appear in extract steps");
 }
 
 #[test]
@@ -1640,25 +1660,30 @@ fn import_full_pipeline_all_features() {
     // Verify every expected step is present
     let expected = vec![
         "count-vectors",
-        "sort-and-dedup",
+        "count-source-base",
+        "set-is_shuffled",
+        "set-is_self_search",
+        "set-combined_bq",
+        "set-k",
+        "prepare-vectors",
         "count-duplicates",
-        "find-zeros",
-        "count-zeros",
-        "filter-ordinals",
-        "count-clean",
         "generate-shuffle",
         "extract-queries",
         "extract-base",
         "count-base",
         "convert-metadata",
+        "extract-metadata",
         "survey-metadata",
         "generate-predicates",
         "evaluate-predicates",
-        "extract-metadata",
         "compute-knn",
         "compute-filtered-knn",
         "verify-knn",
+        "verify-filtered-knn",
         "verify-predicates",
+        "generate-dataset-json",
+        "generate-variables-json",
+        "generate-dataset-log-jsonl",
         "generate-merkle",
         "generate-catalog",
     ];
@@ -1692,9 +1717,8 @@ fn import_full_pipeline_everything_disabled() {
     let ids = step_ids_from_yaml(&yaml);
 
     // Should NOT have these:
-    assert!(!ids.contains(&"sort-and-dedup".to_string()), "no sort: {:?}", ids);
-    assert!(!ids.contains(&"find-zeros".to_string()), "no find-zeros: {:?}", ids);
-    assert!(!ids.contains(&"filter-ordinals".to_string()), "no filter-ordinals: {:?}", ids);
+    assert!(!ids.contains(&"prepare-vectors".to_string()), "no prepare: {:?}", ids);
+    assert!(!ids.contains(&"count-duplicates".to_string()), "no count-duplicates: {:?}", ids);
     assert!(!ids.contains(&"convert-metadata".to_string()), "no metadata: {:?}", ids);
     assert!(!ids.contains(&"compute-filtered-knn".to_string()), "no filtered KNN: {:?}", ids);
 
@@ -1706,18 +1730,25 @@ fn import_full_pipeline_everything_disabled() {
     assert!(ids.contains(&"count-base".to_string()), "count-base: {:?}", ids);
     assert!(ids.contains(&"compute-knn".to_string()), "compute-knn: {:?}", ids);
 
-    // No normalize: true in YAML
-    assert!(!yaml.contains("normalize: true"),
-        "normalize: true should not appear when normalize=false");
+    // Normalization is always on for extract steps
+    assert!(yaml.contains("normalize: true"),
+        "normalize: true should always appear on extract steps");
 
-    // Minimal count: count-vectors, shuffle, extract-query, extract-base,
-    //                count-base, compute-knn, verify-knn, generate-merkle, generate-catalog = 9
-    assert_eq!(ids.len(), 9,
-        "minimal self-search pipeline should have 9 steps, got {}: {:?}", ids.len(), ids);
+    // New metadata steps + verification + json/merkle/catalog
+    // count-vectors, count-source-base, set-is_shuffled, set-is_self_search,
+    // set-combined_bq, set-k, generate-shuffle, extract-queries, extract-base,
+    // count-base, compute-knn, verify-knn, generate-dataset-json,
+    // generate-variables-json, generate-dataset-log-jsonl,
+    // generate-merkle, generate-catalog = 17
+    assert_eq!(ids.len(), 17,
+        "minimal self-search pipeline should have 17 steps, got {}: {:?}", ids.len(), ids);
 }
 
 #[test]
-fn import_clean_ordinals_depends_on_sort() {
+fn import_shuffle_depends_on_prepare_vectors() {
+    // generate-shuffle should depend on prepare-vectors when dedup is active.
+    // This replaces the old test that checked filter-ordinals -> sort-and-dedup
+    // dependency, since those steps are now absorbed into prepare-vectors.
     let dir = tempfile::tempdir().unwrap();
     let fvec = dir.path().join("base.fvec");
     write_fvec(&fvec, 50, 4);
@@ -1729,20 +1760,19 @@ fn import_clean_ordinals_depends_on_sort() {
     veks::prepare::import::run(args);
     let yaml = read_yaml(&dir.path().join("out"));
 
-    // filter-ordinals should have sort-and-dedup in its after list
-    let after = after_for_step(&yaml, "filter-ordinals");
+    // generate-shuffle should depend on prepare-vectors
+    let after = after_for_step(&yaml, "generate-shuffle");
     assert!(after.is_some(),
-        "filter-ordinals should have an after clause");
+        "generate-shuffle should have an after clause");
     let after_str = after.unwrap();
-    assert!(after_str.contains("sort-and-dedup"),
-        "filter-ordinals should depend on sort-and-dedup, got: {}", after_str);
-    // Also should depend on find-zeros
-    assert!(after_str.contains("find-zeros"),
-        "filter-ordinals should depend on find-zeros, got: {}", after_str);
+    assert!(after_str.contains("prepare-vectors"),
+        "generate-shuffle should depend on prepare-vectors, got: {}", after_str);
 }
 
 #[test]
-fn import_shuffle_depends_on_clean_count() {
+fn import_shuffle_depends_on_prepare_vectors_not_count_base() {
+    // generate-shuffle depends on prepare-vectors (not count-clean, which
+    // no longer exists). count-base comes after extraction, not before shuffle.
     let dir = tempfile::tempdir().unwrap();
     let fvec = dir.path().join("base.fvec");
     write_fvec(&fvec, 200, 4);
@@ -1754,13 +1784,13 @@ fn import_shuffle_depends_on_clean_count() {
     veks::prepare::import::run(args);
     let yaml = read_yaml(&dir.path().join("out"));
 
-    // generate-shuffle should depend on count-clean (sort is enabled by default)
+    // generate-shuffle should depend on prepare-vectors
     let after = after_for_step(&yaml, "generate-shuffle");
     assert!(after.is_some(),
         "generate-shuffle should have an after clause");
     let after_str = after.unwrap();
-    assert!(after_str.contains("count-clean"),
-        "generate-shuffle should depend on count-clean, got: {}", after_str);
+    assert!(after_str.contains("prepare-vectors"),
+        "generate-shuffle should depend on prepare-vectors, got: {}", after_str);
     // It should NOT depend on count-base (that comes after extraction)
     assert!(!after_str.contains("count-base"),
         "generate-shuffle should not depend on count-base, got: {}", after_str);

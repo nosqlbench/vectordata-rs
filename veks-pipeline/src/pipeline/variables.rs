@@ -197,6 +197,24 @@ fn count_file(path: &Path) -> Result<String, String> {
             .map_err(|e| format!("failed to open {}: {}", path.display(), e))?;
         return Ok(reader.total_records().to_string());
     }
+
+    // Handle directories (e.g. npy, parquet) via format-aware source reader
+    if path.is_dir() {
+        if let Some(format) = veks_core::formats::VecFormat::detect(path) {
+            match veks_core::formats::reader::open_source(path, format, 1, None) {
+                Ok(source) => {
+                    return match source.record_count() {
+                        Some(n) => Ok(n.to_string()),
+                        None => Err(format!("cannot determine record count for directory '{}'", path.display())),
+                    };
+                }
+                Err(e) => return Err(format!("failed to open source {}: {}", path.display(), e)),
+            }
+        } else {
+            return Err(format!("cannot count records in '{}': unrecognized directory format", path.display()));
+        }
+    }
+
     let etype = ElementType::from_path(path)
         .map_err(|_| format!(
             "cannot count records in '{}': unsupported extension '.{}'",

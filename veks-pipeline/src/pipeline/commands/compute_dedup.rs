@@ -1265,6 +1265,18 @@ fn write_ivec_bulk(path: &Path, ordinals: &[u32]) -> Result<(), String> {
 }
 
 /// Write the JSON deduplication report.
+/// Deduplication report — shared between writer and reader.
+/// Used by `compute sort` (write) and `analyze find-duplicates` (read).
+#[derive(serde::Serialize, serde::Deserialize, Debug)]
+pub struct DedupReport {
+    pub total_vectors: usize,
+    pub unique_vectors: usize,
+    pub duplicate_vectors: usize,
+    pub duplicate_ratio: f64,
+    pub has_duplicates: bool,
+    pub prefix_width: usize,
+}
+
 fn write_report(
     path: &Path,
     total: usize,
@@ -1272,24 +1284,16 @@ fn write_report(
     duplicates: usize,
     prefix_width: usize,
 ) -> Result<(), String> {
-    let content = format!(
-        concat!(
-            "{{\n",
-            "  \"total_vectors\": {},\n",
-            "  \"unique_vectors\": {},\n",
-            "  \"duplicate_vectors\": {},\n",
-            "  \"duplicate_ratio\": {:.6},\n",
-            "  \"has_duplicates\": {},\n",
-            "  \"prefix_width\": {}\n",
-            "}}\n",
-        ),
-        total,
-        unique,
-        duplicates,
-        if total > 0 { duplicates as f64 / total as f64 } else { 0.0 },
-        duplicates > 0,
+    let report = DedupReport {
+        total_vectors: total,
+        unique_vectors: unique,
+        duplicate_vectors: duplicates,
+        duplicate_ratio: if total > 0 { duplicates as f64 / total as f64 } else { 0.0 },
+        has_duplicates: duplicates > 0,
         prefix_width,
-    );
+    };
+    let content = serde_json::to_string_pretty(&report)
+        .map_err(|e| format!("serialize report: {}", e))?;
     std::fs::write(path, content)
         .map_err(|e| format!("failed to write {}: {}", path.display(), e))
 }

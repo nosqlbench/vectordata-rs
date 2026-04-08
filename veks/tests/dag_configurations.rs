@@ -178,6 +178,8 @@ fn default_args(name: &str, output: &Path) -> ImportArgs {
         round_digits: 2,
         pedantic_dedup: false,
         selectivity: 0.0001,
+        provided_facets: None,
+        classic: false,
     }
 }
 
@@ -278,9 +280,11 @@ fn dag_01_minimal_self_search() {
 
     // Vector chain
     assert_step_present(&steps, "count-vectors");
-    assert_step_present(&steps, "sort-and-dedup");
-    assert_step_present(&steps, "find-zeros");
-    assert_step_present(&steps, "filter-ordinals");
+    assert_step_present(&steps, "prepare-vectors");
+    // Old steps removed: find-zeros, filter-ordinals absorbed into prepare-vectors
+    assert_step_absent(&steps, "sort-and-dedup");
+    assert_step_absent(&steps, "find-zeros");
+    assert_step_absent(&steps, "filter-ordinals");
 
     // Self-search chain (Q in facets)
     let shuffle = assert_step_present(&steps, "generate-shuffle");
@@ -297,8 +301,8 @@ fn dag_01_minimal_self_search() {
     // KNN (G in facets)
     assert_step_present(&steps, "compute-knn");
 
-    // Variable references
-    assert_step_after(shuffle, "count-clean");
+    // Variable references — shuffle depends on prepare-vectors
+    assert_step_after(shuffle, "prepare-vectors");
     assert_option_contains(shuffle, "interval", "${clean_count}");
 }
 
@@ -350,10 +354,10 @@ fn dag_03_separate_queries() {
     let yaml = read_yaml(&out);
     let steps = parse_steps(&yaml);
 
-    // No self-search chain (queries provided directly)
-    assert_step_absent(&steps, "generate-shuffle");
-    assert_step_absent(&steps, "extract-queries");
-    assert_step_absent(&steps, "extract-base");
+    // Strategy 1 (combined B+Q, non-HDF5): shuffle + extract present
+    assert_step_present(&steps, "generate-shuffle");
+    assert_step_present(&steps, "extract-queries");
+    assert_step_present(&steps, "extract-base");
 
     assert_step_present(&steps, "compute-knn");
 }
@@ -439,12 +443,15 @@ fn dag_06_no_dedup_with_metadata() {
     let yaml = read_yaml(&out);
     let steps = parse_steps(&yaml);
 
+    // prepare-vectors skipped (no_dedup=true), old steps removed
     assert_step_absent(&steps, "sort-and-dedup");
-    assert_step_present(&steps, "find-zeros");
-    assert_step_present(&steps, "filter-ordinals");
+    assert_step_absent(&steps, "prepare-vectors");
+    assert_step_absent(&steps, "find-zeros");
+    assert_step_absent(&steps, "filter-ordinals");
 
+    // With no_dedup, prepare-vectors is skipped so ranges use vector_count
     let extract_meta = assert_step_present(&steps, "extract-metadata");
-    assert_option_contains(extract_meta, "range", "${clean_count}");
+    assert_option_contains(extract_meta, "range", "${vector_count}");
 }
 
 // ── Config 7: Metadata, no filtered KNN (no_filtered=true) ───────────
@@ -757,8 +764,10 @@ fn dag_18_full_pipeline() {
     // All major steps present
     let cv = assert_step_present(&steps, "convert-vectors");
     assert_option_contains(cv, "fraction", "0.75"); // fraction limits import (fast mode)
-    assert_step_present(&steps, "sort-and-dedup");
-    assert_step_present(&steps, "filter-ordinals");
+    assert_step_present(&steps, "prepare-vectors");
+    // Old steps removed: filter-ordinals absorbed into prepare-vectors
+    assert_step_absent(&steps, "sort-and-dedup");
+    assert_step_absent(&steps, "filter-ordinals");
     // No compute-base-end — convert's fraction already applied the subset
     assert_step_absent(&steps, "compute-base-end");
     assert_step_present(&steps, "generate-shuffle");
@@ -853,7 +862,7 @@ fn dag_21_early_stratification() {
 
     // Core stages present
     assert_step_present(&steps, "count-vectors");
-    assert_step_present(&steps, "sort-and-dedup");
+    assert_step_present(&steps, "prepare-vectors");
     assert_step_present(&steps, "generate-shuffle");
     assert_step_present(&steps, "extract-base");
     assert_step_present(&steps, "compute-knn");

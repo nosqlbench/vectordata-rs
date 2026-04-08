@@ -2452,17 +2452,22 @@ mod tests {
         let steps = emit_steps(&slots, &args, &args.output);
         // Expected: set-vector-count, sort-vectors, set-duplicate-count,
         // zero-check, set-zero-count, clean-ordinals, set-clean-count,
-        // shuffle, extract-query, extract-base, set-base-count,
-        // compute-knn, verify-knn, merkle-all, catalog-generate
-        assert_eq!(steps.len(), 15, "steps: {:?}", steps.iter().map(|s| &s.id).collect::<Vec<_>>());
+        // count-source-base, set-is_shuffled, set-is_self_search, set-combined_bq, set-k,
+        // shuffle, extract-query, extract-base, count-base,
+        // compute-knn, verify-knn, generate-dataset-json, generate-variables-json,
+        // generate-dataset-log-jsonl, generate-merkle, generate-catalog
+        assert_eq!(steps.len(), 19, "steps: {:?}", steps.iter().map(|s| &s.id).collect::<Vec<_>>());
         let step_ids: Vec<&str> = steps.iter().map(|s| s.id.as_str()).collect();
-        assert!(step_ids.contains(&"count-duplicates"), "should have set-duplicate-count");
-        assert!(step_ids.contains(&"count-zeros"), "should have set-zero-count");
+        assert!(step_ids.contains(&"count-duplicates"), "should have count-duplicates");
+        assert!(step_ids.contains(&"count-source-base"), "should have count-source-base");
+        assert!(step_ids.contains(&"set-is_shuffled"), "should have set-is_shuffled");
+        assert!(step_ids.contains(&"generate-variables-json"), "should have generate-variables-json");
+        assert!(step_ids.contains(&"generate-dataset-log-jsonl"), "should have generate-dataset-log-jsonl");
     }
 
     // SRD §12.5 Example 3: Native base + separate native query + metadata dir
-    // Expects: import/shuffle/extract all collapse, metadata import materializes,
-    //          metadata extract collapses (no shuffle), compute steps materialize
+    // With Strategy 1 (combined B+Q), base and query are combined before
+    // dedup, then shuffled for train/test split. Metadata materializes.
     #[test]
     fn example3_native_base_separate_query_with_metadata() {
         let dir = tempfile::tempdir().unwrap();
@@ -2482,19 +2487,16 @@ mod tests {
 
         let slots = resolve_slots(&args);
 
-        // all_vectors, query_vectors, base_vectors should be Identity
-        assert!(!slots.all_vectors.is_materialized());
-        assert!(!slots.query_vectors.as_ref().unwrap().is_materialized());
-        assert!(!slots.base_vectors.is_materialized());
+        // Strategy 1: combined B+Q → self_search with shuffle
+        assert!(slots.self_search, "combined B+Q should be self-search");
+        assert!(slots.combined_bq, "should be combined_bq");
+        assert!(slots.shuffle.is_some(), "should have shuffle");
+        assert!(slots.query_vectors.as_ref().unwrap().is_materialized(), "queries extracted from shuffle");
+        assert!(slots.base_vectors.is_materialized(), "base extracted from shuffle");
 
-        // No shuffle (separate query)
-        assert!(!slots.self_search);
-        assert!(slots.shuffle.is_none());
-
-        // Metadata: import materializes (parquet dir), extract is Identity (no shuffle)
+        // Metadata: import materializes (parquet dir), extract materializes (shuffle reorders)
         let meta = slots.metadata.as_ref().unwrap();
         assert!(meta.metadata_all.is_materialized());
-        assert!(!meta.metadata_content.is_materialized(), "no shuffle → metadata_content should be identity");
 
         // KNN + filtered KNN materialize
         assert!(slots.knn.as_ref().unwrap().is_materialized());
@@ -2506,10 +2508,10 @@ mod tests {
         assert!(step_ids.contains(&"survey-metadata"), "steps: {:?}", step_ids);
         assert!(step_ids.contains(&"compute-knn"), "steps: {:?}", step_ids);
         assert!(step_ids.contains(&"compute-filtered-knn"), "steps: {:?}", step_ids);
-        // No shuffle/extract steps
-        assert!(!step_ids.contains(&"generate-shuffle"));
-        assert!(!step_ids.contains(&"extract-queries"));
-        assert!(!step_ids.contains(&"extract-base"));
+        // Strategy 1: shuffle and extract ARE present
+        assert!(step_ids.contains(&"generate-shuffle"), "steps: {:?}", step_ids);
+        assert!(step_ids.contains(&"extract-queries"), "steps: {:?}", step_ids);
+        assert!(step_ids.contains(&"extract-base"), "steps: {:?}", step_ids);
     }
 
     // No dedup when --no-dedup is set

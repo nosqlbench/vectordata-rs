@@ -2026,86 +2026,154 @@ pub(crate) fn survey_slab(
     })
 }
 
-/// Write survey results to a JSON file.
-///
-/// Produces a JSON object with `sampled`, `total_records`, and a `fields`
-/// object containing per-field statistics (types, numeric range, string
-/// lengths, distinct values, etc.).
-fn survey_to_json(survey: &SurveyResult, path: &Path) -> Result<(), String> {
-    use serde_json::{Map, Number, Value};
+// ── Survey JSON serialization structs ────────────────────────────────
+// Shared between writer and reader to guarantee field name consistency.
+// The JSON representation uses computed `mean` instead of raw `sum`.
 
-    let mut root = Map::new();
-    root.insert("sampled".into(), Value::Number(Number::from(survey.sampled)));
-    root.insert("total_records".into(), Value::Number(Number::from(survey.total_records)));
-    root.insert("non_mnode_count".into(), Value::Number(Number::from(survey.non_mnode_count)));
-    root.insert("decode_errors".into(), Value::Number(Number::from(survey.decode_errors)));
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SurveyJson {
+    sampled: usize,
+    total_records: usize,
+    non_mnode_count: usize,
+    decode_errors: usize,
+    fields: indexmap::IndexMap<String, FieldStatsJson>,
+}
 
-    let mut fields = Map::new();
-    for (name, fs) in &survey.field_stats {
-        let mut field_obj = Map::new();
-        field_obj.insert("count".into(), Value::Number(Number::from(fs.count)));
-        field_obj.insert("null_count".into(), Value::Number(Number::from(fs.null_count)));
+#[derive(serde::Serialize, serde::Deserialize)]
+struct FieldStatsJson {
+    count: usize,
+    null_count: usize,
+    types: indexmap::IndexMap<String, usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    numeric: Option<RangeStatsJson>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    strlen: Option<LenStatsJson>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    byteslen: Option<LenStatsJson>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    distinct: Option<indexmap::IndexMap<String, usize>>,
+    #[serde(default)]
+    distinct_overflow: bool,
+}
 
-        let mut types = Map::new();
-        for (tag, cnt) in &fs.type_counts {
-            types.insert(tag.clone(), Value::Number(Number::from(*cnt)));
+#[derive(serde::Serialize, serde::Deserialize)]
+struct RangeStatsJson {
+    min: f64,
+    max: f64,
+    mean: f64,
+    count: usize,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct LenStatsJson {
+    min: usize,
+    max: usize,
+    mean: f64,
+    count: usize,
+}
+
+impl SurveyJson {
+    fn from_survey(survey: &SurveyResult) -> Self {
+        let fields = survey.field_stats.iter().map(|(name, fs)| {
+            let numeric = if fs.numeric_count > 0 {
+                Some(RangeStatsJson {
+                    min: fs.numeric_min,
+                    max: fs.numeric_max,
+                    mean: fs.numeric_sum / fs.numeric_count as f64,
+                    count: fs.numeric_count,
+                })
+            } else { None };
+
+            let strlen = if fs.strlen_count > 0 {
+                Some(LenStatsJson {
+                    min: fs.strlen_min,
+                    max: fs.strlen_max,
+                    mean: fs.strlen_sum as f64 / fs.strlen_count as f64,
+                    count: fs.strlen_count,
+                })
+            } else { None };
+
+            let byteslen = if fs.byteslen_count > 0 {
+                Some(LenStatsJson {
+                    min: fs.byteslen_min,
+                    max: fs.byteslen_max,
+                    mean: fs.byteslen_sum as f64 / fs.byteslen_count as f64,
+                    count: fs.byteslen_count,
+                })
+            } else { None };
+
+            let distinct = if !fs.distinct.is_empty() {
+                Some(fs.distinct.clone())
+            } else { None };
+
+            (name.clone(), FieldStatsJson {
+                count: fs.count,
+                null_count: fs.null_count,
+                types: fs.type_counts.clone(),
+                numeric,
+                strlen,
+                byteslen,
+                distinct,
+                distinct_overflow: fs.distinct_overflow,
+            })
+        }).collect();
+
+        SurveyJson {
+            sampled: survey.sampled,
+            total_records: survey.total_records,
+            non_mnode_count: survey.non_mnode_count,
+            decode_errors: survey.decode_errors,
+            fields,
         }
-        field_obj.insert("types".into(), Value::Object(types));
-
-        if fs.numeric_count > 0 {
-            let mut numeric = Map::new();
-            if let Some(n) = Number::from_f64(fs.numeric_min) {
-                numeric.insert("min".into(), Value::Number(n));
-            }
-            if let Some(n) = Number::from_f64(fs.numeric_max) {
-                numeric.insert("max".into(), Value::Number(n));
-            }
-            let mean = fs.numeric_sum / fs.numeric_count as f64;
-            if let Some(n) = Number::from_f64(mean) {
-                numeric.insert("mean".into(), Value::Number(n));
-            }
-            numeric.insert("count".into(), Value::Number(Number::from(fs.numeric_count)));
-            field_obj.insert("numeric".into(), Value::Object(numeric));
-        }
-
-        if fs.strlen_count > 0 {
-            let mut strlen = Map::new();
-            strlen.insert("min".into(), Value::Number(Number::from(fs.strlen_min)));
-            strlen.insert("max".into(), Value::Number(Number::from(fs.strlen_max)));
-            let mean = fs.strlen_sum as f64 / fs.strlen_count as f64;
-            if let Some(n) = Number::from_f64(mean) {
-                strlen.insert("mean".into(), Value::Number(n));
-            }
-            strlen.insert("count".into(), Value::Number(Number::from(fs.strlen_count)));
-            field_obj.insert("strlen".into(), Value::Object(strlen));
-        }
-
-        if fs.byteslen_count > 0 {
-            let mut byteslen = Map::new();
-            byteslen.insert("min".into(), Value::Number(Number::from(fs.byteslen_min)));
-            byteslen.insert("max".into(), Value::Number(Number::from(fs.byteslen_max)));
-            let mean = fs.byteslen_sum as f64 / fs.byteslen_count as f64;
-            if let Some(n) = Number::from_f64(mean) {
-                byteslen.insert("mean".into(), Value::Number(n));
-            }
-            byteslen.insert("count".into(), Value::Number(Number::from(fs.byteslen_count)));
-            field_obj.insert("byteslen".into(), Value::Object(byteslen));
-        }
-
-        if !fs.distinct.is_empty() {
-            let mut distinct = Map::new();
-            for (val, cnt) in &fs.distinct {
-                distinct.insert(val.clone(), Value::Number(Number::from(*cnt)));
-            }
-            field_obj.insert("distinct".into(), Value::Object(distinct));
-            field_obj.insert("distinct_overflow".into(), Value::Bool(fs.distinct_overflow));
-        }
-
-        fields.insert(name.clone(), Value::Object(field_obj));
     }
-    root.insert("fields".into(), Value::Object(fields));
 
-    let json = serde_json::to_string_pretty(&Value::Object(root))
+    fn to_survey(&self) -> SurveyResult {
+        let field_stats = self.fields.iter().map(|(name, fj)| {
+            let mut fs = FieldStats::new();
+            fs.count = fj.count;
+            fs.null_count = fj.null_count;
+            fs.type_counts = fj.types.clone();
+
+            if let Some(ref n) = fj.numeric {
+                fs.numeric_min = n.min;
+                fs.numeric_max = n.max;
+                fs.numeric_count = n.count;
+                fs.numeric_sum = n.mean * n.count as f64;
+            }
+            if let Some(ref s) = fj.strlen {
+                fs.strlen_min = s.min;
+                fs.strlen_max = s.max;
+                fs.strlen_count = s.count;
+                fs.strlen_sum = (s.mean * s.count as f64) as usize;
+            }
+            if let Some(ref b) = fj.byteslen {
+                fs.byteslen_min = b.min;
+                fs.byteslen_max = b.max;
+                fs.byteslen_count = b.count;
+                fs.byteslen_sum = (b.mean * b.count as f64) as usize;
+            }
+            if let Some(ref d) = fj.distinct {
+                fs.distinct = d.clone();
+            }
+            fs.distinct_overflow = fj.distinct_overflow;
+
+            (name.clone(), fs)
+        }).collect();
+
+        SurveyResult {
+            field_stats,
+            sampled: self.sampled,
+            total_records: self.total_records,
+            non_mnode_count: self.non_mnode_count,
+            decode_errors: self.decode_errors,
+        }
+    }
+}
+
+/// Write survey results to a JSON file.
+fn survey_to_json(survey: &SurveyResult, path: &Path) -> Result<(), String> {
+    let json_obj = SurveyJson::from_survey(survey);
+    let json = serde_json::to_string_pretty(&json_obj)
         .map_err(|e| format!("JSON serialization failed: {}", e))?;
 
     if let Some(parent) = path.parent() {
@@ -2118,75 +2186,16 @@ fn survey_to_json(survey: &SurveyResult, path: &Path) -> Result<(), String> {
         .map_err(|e| format!("failed to write {}: {}", path.display(), e))?;
 
     log::info!("Survey JSON written to {}", path.display());
-
     Ok(())
 }
 
 /// Load survey results from a JSON file previously written by [`survey_to_json`].
-///
-/// Reconstructs a [`SurveyResult`] with [`FieldStats`] populated from the JSON
-/// fields used by predicate generation: `count`, `null_count`, `types`,
-/// `numeric` (min/max), `distinct`, and `distinct_overflow`.
 pub(crate) fn survey_from_json(path: &Path) -> Result<SurveyResult, String> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("failed to read {}: {}", path.display(), e))?;
-    let root: serde_json::Value = serde_json::from_str(&text)
-        .map_err(|e| format!("failed to parse JSON: {}", e))?;
-
-    let sampled = root.get("sampled").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-    let total_records = root.get("total_records").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-    let non_mnode_count = root.get("non_mnode_count").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-    let decode_errors = root.get("decode_errors").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-
-    let mut field_stats = indexmap::IndexMap::new();
-
-    if let Some(fields) = root.get("fields").and_then(|v| v.as_object()) {
-        for (name, fobj) in fields {
-            let mut fs = FieldStats::new();
-
-            fs.count = fobj.get("count").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-            fs.null_count = fobj.get("null_count").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-
-            if let Some(types) = fobj.get("types").and_then(|v| v.as_object()) {
-                for (tag, cnt) in types {
-                    fs.type_counts.insert(tag.clone(), cnt.as_u64().unwrap_or(0) as usize);
-                }
-            }
-
-            if let Some(numeric) = fobj.get("numeric").and_then(|v| v.as_object()) {
-                fs.numeric_min = numeric.get("min").and_then(|v| v.as_f64()).unwrap_or(f64::INFINITY);
-                fs.numeric_max = numeric.get("max").and_then(|v| v.as_f64()).unwrap_or(f64::NEG_INFINITY);
-                let mean = numeric.get("mean").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                fs.numeric_count = numeric.get("count").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-                fs.numeric_sum = mean * fs.numeric_count as f64;
-            }
-
-            if let Some(strlen) = fobj.get("strlen").and_then(|v| v.as_object()) {
-                fs.strlen_min = strlen.get("min").and_then(|v| v.as_u64()).unwrap_or(usize::MAX as u64) as usize;
-                fs.strlen_max = strlen.get("max").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-                fs.strlen_count = strlen.get("count").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-                let mean = strlen.get("mean").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                fs.strlen_sum = (mean * fs.strlen_count as f64) as usize;
-            }
-
-            if let Some(distinct) = fobj.get("distinct").and_then(|v| v.as_object()) {
-                for (val, cnt) in distinct {
-                    fs.distinct.insert(val.clone(), cnt.as_u64().unwrap_or(0) as usize);
-                }
-            }
-            fs.distinct_overflow = fobj.get("distinct_overflow").and_then(|v| v.as_bool()).unwrap_or(false);
-
-            field_stats.insert(name.clone(), fs);
-        }
-    }
-
-    Ok(SurveyResult {
-        field_stats,
-        sampled,
-        total_records,
-        non_mnode_count,
-        decode_errors,
-    })
+    let json_obj: SurveyJson = serde_json::from_str(&text)
+        .map_err(|e| format!("failed to parse survey JSON: {}", e))?;
+    Ok(json_obj.to_survey())
 }
 
 // -- Helpers -------------------------------------------------------------------
