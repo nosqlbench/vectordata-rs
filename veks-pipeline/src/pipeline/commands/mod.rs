@@ -15,6 +15,8 @@ pub mod source_window;
 pub mod analyze_checkendian;
 pub mod analyze_compare;
 pub mod analyze_explore;
+pub mod analyze_find_duplicates;
+pub mod analyze_find_zeros;
 pub mod analyze_find;
 pub mod analyze_histogram;
 pub mod analyze_modeldiff;
@@ -80,6 +82,8 @@ pub fn register_all(registry: &mut CommandRegistry) {
     // visualize-explore — moved to top-level `explore` command group
     registry.register("analyze file", info_file::factory);
     registry.register("analyze find", analyze_find::factory);
+    registry.register("analyze find-duplicates", analyze_find_duplicates::factory);
+    registry.register("analyze find-zeros", analyze_find_zeros::factory);
     // flamegraph — removed, to be moved to separate profiling crate
     registry.register("analyze histogram", analyze_histogram::factory);
     registry.register("analyze model-diff", analyze_modeldiff::factory);
