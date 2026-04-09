@@ -2035,6 +2035,51 @@ fn sorted_index_extract_fvec(
 
     let zero_count = zero_ordinals.len();
 
+    // Count near-zero vectors among the deduplicated duplicates.
+    //
+    // The dedup step removes duplicate vectors before extraction, so
+    // zero vectors that were duplicated N times only appear once in the
+    // extraction set. The true source zero count is:
+    //   source_zero_count = extraction_zeros + duplicate_zeros
+    //
+    // We read the dedup_duplicates.ivec (if it exists) and check each
+    // referenced source vector's L2 norm against the same threshold.
+    let duplicate_zero_count = {
+        let dup_path = ctx.workspace.join(".cache/dedup_duplicates.ivec");
+        if dup_path.exists() {
+            match MmapVectorReader::<i32>::open_ivec(&dup_path) {
+                Ok(dup_reader) => {
+                    let dup_count = <MmapVectorReader<i32> as VectorReader<i32>>::count(&dup_reader);
+                    let mut dz = 0usize;
+                    for i in 0..dup_count {
+                        let ord = dup_reader.get_slice(i)[0] as usize;
+                        if ord < fvec_count {
+                            let vec = fvec_reader.get_slice(ord);
+                            let norm_sq: f64 = vec.iter().map(|&v| {
+                                let vf = v as f64;
+                                vf * vf
+                            }).sum();
+                            if norm_sq < zero_threshold_sq {
+                                dz += 1;
+                            }
+                        }
+                    }
+                    if dz > 0 {
+                        ctx.ui.log(&format!(
+                            "  {} of {} removed duplicates were also near-zero vectors",
+                            dz, dup_count,
+                        ));
+                    }
+                    dz
+                }
+                Err(_) => 0,
+            }
+        } else {
+            0
+        }
+    };
+    let source_zero_count = zero_count + duplicate_zero_count;
+
     // Write zero ordinals ivec for post-hoc verification
     if !zero_ordinals.is_empty() {
         let zeros_path = output_path.with_file_name("zero_ordinals.ivec");
@@ -2083,6 +2128,10 @@ fn sorted_index_extract_fvec(
         set_var(ctx, "extract_input_count", &extract_count.to_string());
         set_var(ctx, "extract_output_count", &total_written.to_string());
         set_var(ctx, "zero_count", &zero_count.to_string());
+        if duplicate_zero_count > 0 {
+            set_var(ctx, "duplicate_zero_count", &duplicate_zero_count.to_string());
+        }
+        set_var(ctx, "source_zero_count", &source_zero_count.to_string());
     }
     set_var(ctx, "dim", &(dim as usize).to_string());
     // Persist query_count if available (from upstream defaults)

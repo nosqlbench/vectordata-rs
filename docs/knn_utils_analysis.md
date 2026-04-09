@@ -405,6 +405,51 @@ GPU support (matching knn\_utils `faiss-gpu` with CUDA 12.1.1):
 - `cargo build --features faiss` enables the knn\_utils personality
 - `cargo build --features faiss-gpu` adds GPU support on top
 
+### BLAS Dependency and Licensing
+
+The knn\_utils personality commands (`compute knn-faiss`,
+`analyze check-normalization-knnutils`, `analyze fvecs-check-knnutils`)
+call BLAS routines (`cblas_snrm2`, `sgemm`) through whatever BLAS library
+is linked at build time. FAISS's cmake `FindBLAS` discovers the system
+BLAS automatically.
+
+**knn\_utils uses Intel MKL** (`mkl=2023.1.0` in `environment.yml`).
+To produce byte-identical results to knn\_utils, the build environment
+must also use MKL. The `libmkl-dev` Debian package is freely distributed
+by Intel via apt under the Intel Simplified Software License (ISSL),
+which permits redistribution of the runtime libraries. The build
+dependency is:
+
+```
+sudo apt-get install libmkl-dev
+```
+
+Then configure the system BLAS alternatives to point to MKL:
+
+```
+sudo update-alternatives --set libblas.so.3-x86_64-linux-gnu \
+    /usr/lib/x86_64-linux-gnu/libmkl_rt.so
+sudo update-alternatives --set libblas.so-x86_64-linux-gnu \
+    /usr/lib/x86_64-linux-gnu/libmkl_rt.so
+sudo update-alternatives --set liblapack.so.3-x86_64-linux-gnu \
+    /usr/lib/x86_64-linux-gnu/libmkl_rt.so
+```
+
+**With MKL:** `compute knn-faiss` output is byte-identical to Python
+`knn_utils` running on the same machine (verified: 10000/10000 queries,
+k=100, exact match).
+
+**With OpenBLAS:** 9993/10000 neighbor sets are identical; 7 queries
+swap a single neighbor at the k=100 boundary where two vectors have
+inner products differing by ~6e-8. These are ULP-level floating-point
+boundary cases caused by different BLAS `sgemm` reduction orders, not
+algorithmic errors.
+
+**Without MKL:** If MKL is not installed, cmake will find OpenBLAS or
+the reference BLAS. The knn\_utils personality commands still work
+correctly but may produce slightly different results at floating-point
+boundaries compared to the knn\_utils reference output.
+
 ---
 
 ## 5. Summary: What veks Already Has vs. Gaps

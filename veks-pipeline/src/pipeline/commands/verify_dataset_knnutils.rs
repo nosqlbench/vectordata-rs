@@ -1,0 +1,518 @@
+// Copyright (c) nosqlbench contributors
+// SPDX-License-Identifier: Apache-2.0
+
+//! Pipeline command: unified dataset verification (knn\_utils personality).
+//!
+//! Runs all the verification checks that knn\_utils users would normally
+//! perform across `fvecs_check.py`, `ivecs_check.py`, and cross-file
+//! consistency checks — in a single pipeline step.
+//!
+//! Checks performed:
+//!
+//! **fvecs checks** (base and query vectors):
+//! - Dimension consistency (all vectors same dim)
+//! - L2 normalization via BLAS `cblas_snrm2` (tol\_norm, default 1e-5)
+//! - Zero/near-zero vectors (tol\_zero, default 1e-6)
+//! - Norm statistics: min, max, mean, max abs deviation from 1.0
+//!
+//! **ivecs checks** (ground truth):
+//! - No duplicate ordinals within any row
+//! - No negative entries
+//! - Row length = k for all rows
+//! - Max ordinal < base vector count
+//!
+//! **Cross-file consistency**:
+//! - base dim = query dim
+//! - Ground truth row count = query count
+//! - Ground truth k matches expected neighbors
+//!
+//! Output follows the knn\_utils report style for familiarity.
+
+use std::collections::HashSet;
+use std::io::Write;
+use std::path::Path;
+use std::time::Instant;
+
+use vectordata::VectorReader;
+use vectordata::io::MmapVectorReader;
+
+use crate::pipeline::command::{
+    ArtifactManifest, CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole,
+    Options, Status, StreamContext, render_options_table,
+};
+
+// BLAS snrm2: same routine knn_utils calls via np.linalg.norm(vector).
+unsafe extern "C" {
+    fn cblas_snrm2(n: i32, x: *const f32, incx: i32) -> f32;
+}
+
+fn blas_snrm2(v: &[f32]) -> f32 {
+    unsafe { cblas_snrm2(v.len() as i32, v.as_ptr(), 1) }
+}
+
+fn error_result(message: impl Into<String>, start: Instant) -> CommandResult {
+    CommandResult {
+        status: Status::Error,
+        message: message.into(),
+        produced: vec![],
+        elapsed: start.elapsed(),
+    }
+}
+
+fn resolve_path(value: &str, workspace: &Path) -> std::path::PathBuf {
+    let p = Path::new(value);
+    if p.is_absolute() { p.to_path_buf() } else { workspace.join(p) }
+}
+
+/// Results from checking one fvecs file.
+struct FvecsCheckResult {
+    path: String,
+    count: usize,
+    dim: usize,
+    zero_count: u64,
+    unnormalized_count: u64,
+    normalized: bool,
+    norm_min: f64,
+    norm_max: f64,
+    norm_mean: f64,
+    max_abs_dev: f64,
+}
+
+/// Results from checking one ivecs file.
+struct IvecsCheckResult {
+    path: String,
+    num_rows: usize,
+    row_length: usize,
+    max_ordinal: i32,
+    duplicate_rows: usize,
+    negative_rows: usize,
+    truncated_rows: usize,
+    overlong_rows: usize,
+    passed: bool,
+}
+
+/// Check an fvecs file — replicates fvecs_check.py logic.
+fn check_fvecs(
+    path: &Path,
+    tol_norm: f64,
+    tol_zero: f64,
+) -> Result<FvecsCheckResult, String> {
+    let reader = MmapVectorReader::<f32>::open_fvec(path)
+        .map_err(|e| format!("open {}: {}", path.display(), e))?;
+    let count = <MmapVectorReader<f32> as VectorReader<f32>>::count(&reader);
+    let dim = <MmapVectorReader<f32> as VectorReader<f32>>::dim(&reader);
+
+    if count == 0 || dim == 0 {
+        return Err(format!("{}: empty file (count={}, dim={})", path.display(), count, dim));
+    }
+
+    let mut zero_count: u64 = 0;
+    let mut unnormalized_count: u64 = 0;
+    let mut normalized = true;
+    let mut norm_sum: f64 = 0.0;
+    let mut norm_min: f64 = f64::INFINITY;
+    let mut norm_max: f64 = f64::NEG_INFINITY;
+
+    for i in 0..count {
+        let slice = reader.get_slice(i);
+        let norm = blas_snrm2(slice) as f64;
+
+        norm_sum += norm;
+        if norm < norm_min { norm_min = norm; }
+        if norm > norm_max { norm_max = norm; }
+
+        if (norm - 1.0).abs() > tol_norm {
+            normalized = false;
+            unnormalized_count += 1;
+        }
+        if norm < tol_zero {
+            zero_count += 1;
+        }
+    }
+
+    let norm_mean = norm_sum / count as f64;
+    let max_abs_dev = (norm_min - 1.0).abs().max((norm_max - 1.0).abs());
+
+    Ok(FvecsCheckResult {
+        path: path.display().to_string(),
+        count,
+        dim,
+        zero_count,
+        unnormalized_count,
+        normalized,
+        norm_min,
+        norm_max,
+        norm_mean,
+        max_abs_dev,
+    })
+}
+
+/// Check an ivecs file — replicates ivecs_check.py logic.
+fn check_ivecs(
+    path: &Path,
+    required_k: usize,
+    max_valid_ordinal: usize,
+) -> Result<IvecsCheckResult, String> {
+    let reader = MmapVectorReader::<i32>::open_ivec(path)
+        .map_err(|e| format!("open {}: {}", path.display(), e))?;
+    let num_rows = <MmapVectorReader<i32> as VectorReader<i32>>::count(&reader);
+    let row_length = <MmapVectorReader<i32> as VectorReader<i32>>::dim(&reader);
+
+    let mut max_ordinal: i32 = -1;
+    let mut duplicate_rows: usize = 0;
+    let mut negative_rows: usize = 0;
+    let mut truncated_rows: usize = 0;
+    let mut overlong_rows: usize = 0;
+
+    for i in 0..num_rows {
+        let row = reader.get_slice(i);
+        let actual_k = row.len();
+
+        if actual_k < required_k {
+            truncated_rows += 1;
+        } else if actual_k > required_k {
+            overlong_rows += 1;
+        }
+
+        let mut has_negative = false;
+        let mut seen = HashSet::with_capacity(actual_k);
+        let mut has_dup = false;
+
+        for &val in row {
+            if val < 0 {
+                has_negative = true;
+            }
+            if val > max_ordinal {
+                max_ordinal = val;
+            }
+            if !seen.insert(val) {
+                has_dup = true;
+            }
+        }
+
+        if has_negative { negative_rows += 1; }
+        if has_dup { duplicate_rows += 1; }
+    }
+
+    let ordinal_in_range = max_ordinal < 0 || (max_ordinal as usize) < max_valid_ordinal;
+    let passed = duplicate_rows == 0
+        && negative_rows == 0
+        && truncated_rows == 0
+        && overlong_rows == 0
+        && ordinal_in_range;
+
+    Ok(IvecsCheckResult {
+        path: path.display().to_string(),
+        num_rows,
+        row_length,
+        max_ordinal,
+        duplicate_rows,
+        negative_rows,
+        truncated_rows,
+        overlong_rows,
+        passed,
+    })
+}
+
+/// Pipeline command: unified knn\_utils-style dataset verification.
+pub struct VerifyDatasetKnnUtilsOp;
+
+pub fn factory() -> Box<dyn CommandOp> {
+    Box::new(VerifyDatasetKnnUtilsOp)
+}
+
+impl CommandOp for VerifyDatasetKnnUtilsOp {
+    fn command_path(&self) -> &str {
+        "verify dataset-knnutils"
+    }
+
+    fn command_doc(&self) -> CommandDoc {
+        let options = self.describe_options();
+        CommandDoc {
+            summary: "Unified dataset verification using knn_utils conventions".into(),
+            body: format!(r#"# verify dataset-knnutils
+
+Runs all verification checks that knn\_utils users would normally perform
+across `fvecs_check.py` and `ivecs_check.py`, plus cross-file consistency
+checks, in a single pipeline step.
+
+## Options
+
+{}
+"#, render_options_table(&options)),
+        }
+    }
+
+    fn describe_options(&self) -> Vec<OptionDesc> {
+        vec![
+            OptionDesc {
+                name: "base".into(),
+                type_name: "Path".into(),
+                required: true,
+                default: None,
+                description: "Base vectors file (fvec)".into(),
+                role: OptionRole::Input,
+            },
+            OptionDesc {
+                name: "query".into(),
+                type_name: "Path".into(),
+                required: true,
+                default: None,
+                description: "Query vectors file (fvec)".into(),
+                role: OptionRole::Input,
+            },
+            OptionDesc {
+                name: "indices".into(),
+                type_name: "Path".into(),
+                required: true,
+                default: None,
+                description: "Ground truth neighbor indices (ivec)".into(),
+                role: OptionRole::Input,
+            },
+            OptionDesc {
+                name: "neighbors".into(),
+                type_name: "int".into(),
+                required: true,
+                default: None,
+                description: "Expected number of neighbors per query (k)".into(),
+                role: OptionRole::Config,
+            },
+            OptionDesc {
+                name: "tol-norm".into(),
+                type_name: "float".into(),
+                required: false,
+                default: Some("1e-5".into()),
+                description: "Normalization tolerance (knn_utils fvecs_check default)".into(),
+                role: OptionRole::Config,
+            },
+            OptionDesc {
+                name: "tol-zero".into(),
+                type_name: "float".into(),
+                required: false,
+                default: Some("1e-6".into()),
+                description: "Zero-vector tolerance (knn_utils fvecs_check default)".into(),
+                role: OptionRole::Config,
+            },
+            OptionDesc {
+                name: "report".into(),
+                type_name: "Path".into(),
+                required: false,
+                default: None,
+                description: "Output report file path".into(),
+                role: OptionRole::Output,
+            },
+        ]
+    }
+
+    fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
+        let start = Instant::now();
+
+        let base_str = match options.require("base") {
+            Ok(s) => s, Err(e) => return error_result(e, start),
+        };
+        let query_str = match options.require("query") {
+            Ok(s) => s, Err(e) => return error_result(e, start),
+        };
+        let indices_str = match options.require("indices") {
+            Ok(s) => s, Err(e) => return error_result(e, start),
+        };
+        let k: usize = match options.require("neighbors") {
+            Ok(s) => match s.parse() {
+                Ok(n) if n > 0 => n,
+                _ => return error_result(format!("invalid neighbors: '{}'", s), start),
+            },
+            Err(e) => return error_result(e, start),
+        };
+        let tol_norm: f64 = match options.parse_or("tol-norm", 1e-5_f64) {
+            Ok(v) => v, Err(e) => return error_result(e, start),
+        };
+        let tol_zero: f64 = match options.parse_or("tol-zero", 1e-6_f64) {
+            Ok(v) => v, Err(e) => return error_result(e, start),
+        };
+
+        let base_path = resolve_path(base_str, &ctx.workspace);
+        let query_path = resolve_path(query_str, &ctx.workspace);
+        let indices_path = resolve_path(indices_str, &ctx.workspace);
+
+        let report_path = match options.get("report") {
+            Some(s) => resolve_path(s, &ctx.workspace),
+            None => ctx.workspace.join(".cache/verify_dataset_knnutils.txt"),
+        };
+
+        let mut report = Vec::<String>::new();
+        let mut all_passed = true;
+
+        // Helper to emit to both log and report
+        let mut emit = |ctx: &mut StreamContext, line: &str| {
+            ctx.ui.log(line);
+            report.push(line.to_string());
+        };
+
+        emit(ctx, "=== knn_utils Dataset Verification ===");
+        emit(ctx, "");
+
+        // ── fvecs check: base vectors ───────────────────────────────────
+        emit(ctx, &format!("--- Base Vectors: {} ---", base_path.display()));
+
+        let base_result = match check_fvecs(&base_path, tol_norm, tol_zero) {
+            Ok(r) => r,
+            Err(e) => {
+                emit(ctx, &format!("  FAIL: {}", e));
+                return error_result(e, start);
+            }
+        };
+
+        emit(ctx, &format!("  Total embeddings: {}", base_result.count));
+        emit(ctx, &format!("  Dimensionality: {}", base_result.dim));
+        emit(ctx, &format!("  Zero vectors (< {:.0e}): {}", tol_zero, base_result.zero_count));
+        emit(ctx, &format!("  Unnormalized vectors (|norm-1| > {:.0e}): {}",
+            tol_norm, base_result.unnormalized_count));
+        emit(ctx, &format!("  Norm max abs deviation from 1.0: {:.9e}", base_result.max_abs_dev));
+        emit(ctx, &format!("  Norm mean: {:.9e}", base_result.norm_mean));
+        emit(ctx, &format!("  Norm range: [{:.9e}, {:.9e}]", base_result.norm_min, base_result.norm_max));
+
+        let base_status = if base_result.normalized && base_result.zero_count == 0 {
+            "PASS"
+        } else {
+            all_passed = false;
+            "FAIL"
+        };
+        emit(ctx, &format!("  Normalized: {} (tol={:.0e})", base_result.normalized, tol_norm));
+        emit(ctx, &format!("  Status: {}", base_status));
+        emit(ctx, "");
+
+        // ── fvecs check: query vectors ──────────────────────────────────
+        emit(ctx, &format!("--- Query Vectors: {} ---", query_path.display()));
+
+        let query_result = match check_fvecs(&query_path, tol_norm, tol_zero) {
+            Ok(r) => r,
+            Err(e) => {
+                emit(ctx, &format!("  FAIL: {}", e));
+                return error_result(e, start);
+            }
+        };
+
+        emit(ctx, &format!("  Total embeddings: {}", query_result.count));
+        emit(ctx, &format!("  Dimensionality: {}", query_result.dim));
+        emit(ctx, &format!("  Zero vectors (< {:.0e}): {}", tol_zero, query_result.zero_count));
+        emit(ctx, &format!("  Unnormalized vectors (|norm-1| > {:.0e}): {}",
+            tol_norm, query_result.unnormalized_count));
+        emit(ctx, &format!("  Norm max abs deviation from 1.0: {:.9e}", query_result.max_abs_dev));
+        emit(ctx, &format!("  Norm mean: {:.9e}", query_result.norm_mean));
+        emit(ctx, &format!("  Norm range: [{:.9e}, {:.9e}]", query_result.norm_min, query_result.norm_max));
+
+        let query_status = if query_result.normalized && query_result.zero_count == 0 {
+            "PASS"
+        } else {
+            all_passed = false;
+            "FAIL"
+        };
+        emit(ctx, &format!("  Normalized: {} (tol={:.0e})", query_result.normalized, tol_norm));
+        emit(ctx, &format!("  Status: {}", query_status));
+        emit(ctx, "");
+
+        // ── ivecs check: ground truth ───────────────────────────────────
+        emit(ctx, &format!("--- Ground Truth: {} ---", indices_path.display()));
+
+        let ivecs_result = match check_ivecs(&indices_path, k, base_result.count) {
+            Ok(r) => r,
+            Err(e) => {
+                emit(ctx, &format!("  FAIL: {}", e));
+                return error_result(e, start);
+            }
+        };
+
+        emit(ctx, &format!("  Rows read: {}", ivecs_result.num_rows));
+        emit(ctx, &format!("  Row length (k): {}", ivecs_result.row_length));
+        emit(ctx, &format!("  Max ordinal: {}", ivecs_result.max_ordinal));
+
+        // Per-check PASS/FAIL (matching ivecs_check.py report style)
+        let dup_ok = ivecs_result.duplicate_rows == 0;
+        let neg_ok = ivecs_result.negative_rows == 0;
+        let trunc_ok = ivecs_result.truncated_rows == 0;
+        let over_ok = ivecs_result.overlong_rows == 0;
+        let ord_ok = ivecs_result.max_ordinal < 0
+            || (ivecs_result.max_ordinal as usize) < base_result.count;
+
+        emit(ctx, &format!("  Duplicate ordinals:  {} ({})",
+            if dup_ok { "PASS" } else { "FAIL" }, ivecs_result.duplicate_rows));
+        emit(ctx, &format!("  Negative entries:    {} ({})",
+            if neg_ok { "PASS" } else { "FAIL" }, ivecs_result.negative_rows));
+        emit(ctx, &format!("  Truncated rows:      {} ({})",
+            if trunc_ok { "PASS" } else { "FAIL" }, ivecs_result.truncated_rows));
+        emit(ctx, &format!("  Overlong rows:       {} ({})",
+            if over_ok { "PASS" } else { "FAIL" }, ivecs_result.overlong_rows));
+        emit(ctx, &format!("  Ordinals in range:   {} (max {} < base count {})",
+            if ord_ok { "PASS" } else { "FAIL" },
+            ivecs_result.max_ordinal, base_result.count));
+
+        let ivecs_status = if ivecs_result.passed && ord_ok { "PASS" } else {
+            all_passed = false;
+            "FAIL"
+        };
+        emit(ctx, &format!("  Status: {}", ivecs_status));
+        emit(ctx, "");
+
+        // ── Cross-file consistency ──────────────────────────────────────
+        emit(ctx, "--- Cross-File Consistency ---");
+
+        let dim_ok = base_result.dim == query_result.dim;
+        emit(ctx, &format!("  Dimension match (base={}, query={}): {}",
+            base_result.dim, query_result.dim,
+            if dim_ok { "PASS" } else { all_passed = false; "FAIL" }));
+
+        let count_ok = query_result.count == ivecs_result.num_rows;
+        emit(ctx, &format!("  Query count = GT rows ({} = {}): {}",
+            query_result.count, ivecs_result.num_rows,
+            if count_ok { "PASS" } else { all_passed = false; "FAIL" }));
+
+        let k_ok = ivecs_result.row_length == k;
+        emit(ctx, &format!("  GT row length = k ({} = {}): {}",
+            ivecs_result.row_length, k,
+            if k_ok { "PASS" } else { all_passed = false; "FAIL" }));
+
+        emit(ctx, "");
+
+        // ── Overall ─────────────────────────────────────────────────────
+        let overall = if all_passed { "PASS" } else { "FAIL" };
+        emit(ctx, &format!("=== Overall: {} ===", overall));
+
+        // Write report file
+        let mut produced = Vec::new();
+        if let Some(parent) = report_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        match std::fs::File::create(&report_path) {
+            Ok(mut f) => {
+                let content = report.join("\n") + "\n";
+                if f.write_all(content.as_bytes()).is_ok() {
+                    produced.push(report_path.clone());
+                    ctx.ui.log(&format!("  Report saved to {}", report_path.display()));
+                }
+            }
+            Err(e) => {
+                ctx.ui.log(&format!("  Warning: failed to write report: {}", e));
+            }
+        }
+
+        CommandResult {
+            status: if all_passed { Status::Ok } else { Status::Error },
+            message: format!(
+                "base={} query={} gt={}: {} (base:{} query:{} ivecs:{} cross:{})",
+                base_result.count, query_result.count, ivecs_result.num_rows,
+                overall, base_status, query_status, ivecs_status,
+                if dim_ok && count_ok && k_ok { "PASS" } else { "FAIL" },
+            ),
+            produced,
+            elapsed: start.elapsed(),
+        }
+    }
+
+    fn project_artifacts(&self, step_id: &str, options: &Options) -> ArtifactManifest {
+        crate::pipeline::command::manifest_from_keys(
+            step_id, self.command_path(), options,
+            &["base", "query", "indices"],
+            &["report"],
+        )
+    }
+}

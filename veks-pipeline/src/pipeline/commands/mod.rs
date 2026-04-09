@@ -14,6 +14,8 @@ pub mod require;
 pub mod source_window;
 pub mod analyze_checkendian;
 pub mod analyze_compare;
+#[cfg(feature = "faiss")]
+pub mod analyze_fvecs_check_knnutils;
 pub mod analyze_explore;
 pub mod analyze_find_duplicates;
 pub mod analyze_find_zeros;
@@ -27,6 +29,8 @@ pub mod analyze_stats;
 pub mod analyze_verifyknn;
 pub mod analyze_verifyprofiles;
 pub mod analyze_normals;
+#[cfg(feature = "faiss")]
+pub mod analyze_normals_knnutils;
 pub mod analyze_norms;
 pub mod analyze_overlap;
 pub mod analyze_zeros;
@@ -66,6 +70,8 @@ pub mod merkle;
 pub mod set_variable;
 pub mod slab;
 pub mod verify_consolidated;
+#[cfg(feature = "faiss")]
+pub mod verify_dataset_knnutils;
 pub mod verify_knn;
 pub mod verify_predicates;
 
@@ -79,6 +85,8 @@ pub fn register_all(registry: &mut CommandRegistry) {
     // ── analyze ──────────────────────────────────────────────────────
     registry.register("analyze check-endian", analyze_checkendian::factory);
     registry.register("analyze compare-files", analyze_compare::factory);
+    #[cfg(feature = "faiss")]
+    registry.register("analyze fvecs-check-knnutils", analyze_fvecs_check_knnutils::factory);
     registry.register("analyze compute-info", info_compute::factory);
     registry.register("analyze describe", describe::factory);
     // visualize-explore — moved to top-level `explore` command group
@@ -99,6 +107,8 @@ pub fn register_all(registry: &mut CommandRegistry) {
     registry.register("analyze verify-knn", analyze_verifyknn::factory);
     registry.register("analyze verify-profiles", analyze_verifyprofiles::factory);
     registry.register("analyze measure-normals", analyze_normals::factory);
+    #[cfg(feature = "faiss")]
+    registry.register("analyze check-normalization-knnutils", analyze_normals_knnutils::factory);
     registry.register("analyze norms", analyze_norms::factory);
     registry.register("analyze overlap", analyze_overlap::factory);
     registry.register("analyze zeros", analyze_zeros::factory);
@@ -159,6 +169,8 @@ pub fn register_all(registry: &mut CommandRegistry) {
     registry.register("transform ordinals", clean_ordinals::factory);
 
     // ── verify ───────────────────────────────────────────────────────
+    #[cfg(feature = "faiss")]
+    registry.register("verify dataset-knnutils", verify_dataset_knnutils::factory);
     registry.register("verify knn-groundtruth", verify_knn::factory);
     registry.register("verify predicate-results", verify_predicates::factory);
     registry.register("verify knn-consolidated", verify_consolidated::knn_consolidated_factory);
