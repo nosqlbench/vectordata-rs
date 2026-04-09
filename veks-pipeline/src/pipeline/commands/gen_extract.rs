@@ -1836,7 +1836,165 @@ fn sorted_index_extract_fvec(
             out_norm_samples: Vec<f64>,
         }
 
-        let chunk_outputs: Vec<ChunkOutput> = {
+        // When the read plan is not sorted (shuffled indices), we use
+        // a transpose approach matching the mvec extractor: allocate a
+        // single shared partition buffer and write each vector at its
+        // destination position (local_pos * record_bytes). Each local_pos
+        // is unique within the partition, so concurrent writes are safe.
+        //
+        // When sorted, vectors are read and written sequentially using the
+        // per-chunk approach (no transpose needed).
+        let chunk_outputs: Vec<ChunkOutput> = if !is_sorted {
+            // ── Transpose mode: shared buffer, position-aware writes ────
+            use rayon::prelude::*;
+            use std::sync::atomic::{AtomicU64, AtomicUsize};
+
+            let mut part_buf = vec![0u8; part_len * record_bytes];
+            let shared_buf = SharedBuf::new(&mut part_buf);
+            let progress_counter = AtomicU64::new(0);
+            let written_counter = AtomicUsize::new(0);
+            let zero_list = std::sync::Mutex::new(Vec::<usize>::new());
+            let src_stats = std::sync::Mutex::new((0.0f64, 0.0f64, f64::MAX, 0.0f64, 0usize, Vec::<f64>::new()));
+            let out_stats = std::sync::Mutex::new((0.0f64, 0.0f64, f64::MAX, 0.0f64, 0usize, Vec::<f64>::new()));
+
+            let transpose_fn = || {
+                let sample_every = (read_plan.len() / 1000).max(1);
+                read_plan.par_iter().for_each(|&(source_idx, local_pos)| {
+                    let src_slice = fvec_reader.get_slice(source_idx);
+
+                    if normalize {
+                        let mut norm_sq = 0.0f64;
+                        for d in 0..dim_usize {
+                            let v = src_slice[d] as f64;
+                            norm_sq += v * v;
+                        }
+
+                        if norm_sq < zero_threshold_sq {
+                            if let Ok(mut zl) = zero_list.lock() { zl.push(source_idx); }
+                            let done = progress_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                            if done % 100_000 == 0 { extract_pb.set_position(done); }
+                            return;
+                        }
+
+                        let norm = norm_sq.sqrt();
+                        let src_epsilon = (norm - 1.0).abs();
+                        if let Ok(mut s) = src_stats.lock() {
+                            s.0 += src_epsilon; s.1 += src_epsilon * src_epsilon;
+                            if src_epsilon < s.2 { s.2 = src_epsilon; }
+                            if src_epsilon > s.3 { s.3 = src_epsilon; }
+                            if s.4 % sample_every == 0 { s.5.push(src_epsilon); }
+                            s.4 += 1;
+                        }
+
+                        let buf_offset = local_pos * record_bytes;
+                        let dest = unsafe { shared_buf.slice_mut(buf_offset, record_bytes) };
+                        dest[..4].copy_from_slice(&dim_bytes);
+
+                        if skip_normalize {
+                            let src_bytes: &[u8] = unsafe {
+                                std::slice::from_raw_parts(
+                                    src_slice.as_ptr() as *const u8,
+                                    src_slice.len() * 4,
+                                )
+                            };
+                            dest[4..].copy_from_slice(src_bytes);
+                        } else {
+                            let inv_norm = (1.0 / norm) as f32;
+                            for d in 0..dim_usize {
+                                let normalized = src_slice[d] * inv_norm;
+                                dest[4 + d * 4..4 + (d + 1) * 4]
+                                    .copy_from_slice(&normalized.to_le_bytes());
+                            }
+                        }
+
+                        {
+                            let mut out_norm_sq_val = 0.0f64;
+                            for d in 0..dim_usize {
+                                let v = f32::from_le_bytes([
+                                    dest[4 + d * 4], dest[4 + d * 4 + 1],
+                                    dest[4 + d * 4 + 2], dest[4 + d * 4 + 3],
+                                ]) as f64;
+                                out_norm_sq_val += v * v;
+                            }
+                            let out_epsilon = (out_norm_sq_val.sqrt() - 1.0).abs();
+                            if let Ok(mut s) = out_stats.lock() {
+                                s.0 += out_epsilon; s.1 += out_epsilon * out_epsilon;
+                                if out_epsilon < s.2 { s.2 = out_epsilon; }
+                                if out_epsilon > s.3 { s.3 = out_epsilon; }
+                                if s.4 % sample_every == 0 { s.5.push(out_epsilon); }
+                                s.4 += 1;
+                            }
+                        }
+                    } else {
+                        let buf_offset = local_pos * record_bytes;
+                        let dest = unsafe { shared_buf.slice_mut(buf_offset, record_bytes) };
+                        dest[..4].copy_from_slice(&dim_bytes);
+                        let src_bytes: &[u8] = unsafe {
+                            std::slice::from_raw_parts(
+                                src_slice.as_ptr() as *const u8,
+                                src_slice.len() * 4,
+                            )
+                        };
+                        dest[4..].copy_from_slice(src_bytes);
+                    }
+                    written_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+                    let done = progress_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    if done % 100_000 == 0 { extract_pb.set_position(done); }
+                });
+            };
+
+            let extract_pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(extract_threads)
+                .build()
+                .ok();
+            if let Some(ref p) = extract_pool {
+                p.install(transpose_fn);
+            } else {
+                transpose_fn();
+            }
+
+            let w = written_counter.load(std::sync::atomic::Ordering::Relaxed);
+            let zeros = zero_list.into_inner().unwrap_or_default();
+            let (ss0, ss1, ss2, ss3, ss4, ss5) = src_stats.into_inner().unwrap_or_default();
+            let (os0, os1, os2, os3, os4, os5) = out_stats.into_inner().unwrap_or_default();
+
+            // When zeros were skipped, the transpose buffer has gaps at
+            // those local_pos slots. Compact the buffer by removing the
+            // gap slots. We know which slots were filled by checking the
+            // dim header (filled slots have dim_bytes, gaps are all-zero).
+            if !zeros.is_empty() {
+                let mut compacted = Vec::with_capacity(w * record_bytes);
+                for pos in 0..part_len {
+                    let offset = pos * record_bytes;
+                    if offset + 4 <= part_buf.len() {
+                        let dim_val = i32::from_le_bytes(
+                            part_buf[offset..offset + 4].try_into().unwrap_or([0; 4])
+                        );
+                        if dim_val > 0 {
+                            compacted.extend_from_slice(
+                                &part_buf[offset..offset + record_bytes]
+                            );
+                        }
+                    }
+                }
+                part_buf = compacted;
+            }
+
+            // Produce a single ChunkOutput containing the full transpose buffer
+            vec![ChunkOutput {
+                buf: part_buf,
+                written: w,
+                zeros,
+                src_norm_sum: ss0, src_norm_sum_sq: ss1,
+                src_norm_min: ss2, src_norm_max: ss3,
+                src_norm_count: ss4, src_norm_samples: ss5,
+                out_norm_sum: os0, out_norm_sum_sq: os1,
+                out_norm_min: os2, out_norm_max: os3,
+                out_norm_count: os4, out_norm_samples: os5,
+            }]
+        } else {
+            // ── Sequential mode: per-chunk buffers, written in order ────
             use rayon::prelude::*;
             let progress_ref = &progress;
             let fvec_ref = &fvec_reader;
@@ -1858,7 +2016,6 @@ fn sorted_index_extract_fvec(
                     let mut out_norm_max = 0.0f64;
                     let mut out_norm_count = 0usize;
                     let mut out_norm_samples = Vec::new();
-                    // Sample every Nth vector for median estimation
                     let sample_every = (chunk.len() / 1000).max(1);
 
                     for &(source_idx, _local_pos) in chunk {
@@ -1878,7 +2035,6 @@ fn sorted_index_extract_fvec(
                                 continue;
                             }
 
-                            // Source norm stats: epsilon = |norm - 1.0|
                             let norm = norm_sq.sqrt();
                             let src_epsilon = (norm - 1.0).abs();
                             src_norm_sum += src_epsilon;
@@ -1895,7 +2051,6 @@ fn sorted_index_extract_fvec(
                             dest[..4].copy_from_slice(&dim_bytes);
 
                             if skip_normalize {
-                                // Source is already normalized — copy raw data
                                 let src_bytes: &[u8] = unsafe {
                                     std::slice::from_raw_parts(
                                         src_slice.as_ptr() as *const u8,
@@ -1912,7 +2067,6 @@ fn sorted_index_extract_fvec(
                                 }
                             }
 
-                            // Output norm stats: measure actual written data
                             {
                                 let mut out_norm_sq_val = 0.0f64;
                                 for d in 0..dim_usize {

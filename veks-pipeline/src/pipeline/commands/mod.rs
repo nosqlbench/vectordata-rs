@@ -42,6 +42,8 @@ pub mod compute_filtered_knn;
 pub mod compute_knn;
 #[cfg(feature = "faiss")]
 pub mod compute_knn_faiss;
+#[cfg(feature = "faiss")]
+pub mod compute_sort_knnutils;
 pub mod compute_sort;
 pub mod config;
 mod convert;
@@ -56,6 +58,8 @@ pub mod gen_predicate_keys;
 pub mod gen_predicated;
 pub mod gen_predicates;
 pub mod gen_shuffle;
+#[cfg(feature = "faiss")]
+pub mod gen_shuffle_knnutils;
 pub mod gen_sketch;
 pub mod gen_dataset_log_jsonl;
 pub mod gen_variables_json;
@@ -70,6 +74,10 @@ pub mod merkle;
 pub mod set_variable;
 pub mod slab;
 pub mod verify_consolidated;
+#[cfg(feature = "faiss")]
+pub mod transform_normalize_knnutils;
+#[cfg(feature = "faiss")]
+pub mod transform_remove_zeros_knnutils;
 #[cfg(feature = "faiss")]
 pub mod verify_dataset_knnutils;
 pub mod verify_knn;
@@ -127,6 +135,8 @@ pub fn register_all(registry: &mut CommandRegistry) {
     #[cfg(feature = "faiss")]
     registry.register("compute knn-faiss", compute_knn_faiss::factory);
     registry.register("compute sort", compute_dedup::factory);
+    #[cfg(feature = "faiss")]
+    registry.register("compute sort-knnutils", compute_sort_knnutils::factory);
 
     // ── download ─────────────────────────────────────────────────────
     registry.register("download bulk", fetch_bulkdl::factory);
@@ -140,6 +150,8 @@ pub fn register_all(registry: &mut CommandRegistry) {
     registry.register("generate predicated", gen_predicated::factory);
     registry.register("generate predicates", gen_predicates::factory);
     registry.register("generate shuffle", gen_shuffle::factory);
+    #[cfg(feature = "faiss")]
+    registry.register("generate shuffle-knnutils", gen_shuffle_knnutils::factory);
     registry.register("generate sketch", gen_sketch::factory);
     registry.register("generate dataset-log-jsonl", gen_dataset_log_jsonl::factory);
     registry.register("generate variables-json", gen_variables_json::factory);
@@ -167,6 +179,10 @@ pub fn register_all(registry: &mut CommandRegistry) {
     registry.register("transform convert", convert::factory);
     registry.register("transform extract", gen_extract::extract_factory);
     registry.register("transform ordinals", clean_ordinals::factory);
+    #[cfg(feature = "faiss")]
+    registry.register("transform normalize-knnutils", transform_normalize_knnutils::factory);
+    #[cfg(feature = "faiss")]
+    registry.register("transform remove-zeros-knnutils", transform_remove_zeros_knnutils::factory);
 
     // ── verify ───────────────────────────────────────────────────────
     #[cfg(feature = "faiss")]

@@ -8,11 +8,12 @@ homepage = "https://github.com/nosqlbench/vectordata-rs"
 repository = "https://github.com/nosqlbench/vectordata-rs"
 
 [features]
-faiss = ["dep:faiss"]
+faiss = ["dep:faiss", "dep:rand_mt"]
 
 [dependencies]
 byteorder = "1"
 faiss = { version = "0.13", features = ["static"], optional = true }
+rand_mt = { version = "6", optional = true }
 chrono = { version = "0.4", features = ["serde"] }
 atty = "0.2"
 clap = { version = "4", features = ["derive", "string"] }
