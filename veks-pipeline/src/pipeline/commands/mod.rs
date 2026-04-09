@@ -36,6 +36,8 @@ pub mod compute_dedup;
 pub mod dataset_json;
 pub mod compute_filtered_knn;
 pub mod compute_knn;
+#[cfg(feature = "faiss")]
+pub mod compute_knn_faiss;
 pub mod compute_sort;
 pub mod config;
 mod convert;
@@ -112,6 +114,8 @@ pub fn register_all(registry: &mut CommandRegistry) {
     registry.register("compute evaluate-predicates", gen_predicate_keys::factory);
     registry.register("compute filtered-knn", compute_filtered_knn::factory);
     registry.register("compute knn", compute_knn::factory);
+    #[cfg(feature = "faiss")]
+    registry.register("compute knn-faiss", compute_knn_faiss::factory);
     registry.register("compute sort", compute_dedup::factory);
 
     // ── download ─────────────────────────────────────────────────────

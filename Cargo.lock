@@ -1257,6 +1257,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "faiss"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3618cbbe48ebdc63b461cd1bf52f64c27a40e4d294beceedbf2fd4898571e204"
+dependencies = [
+ "faiss-sys",
+]
+
+[[package]]
+name = "faiss-sys"
+version = "0.7.0"
+dependencies = [
+ "cmake",
+]
+
+[[package]]
 name = "fallible-iterator"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5102,6 +5118,7 @@ dependencies = [
  "clap_complete",
  "criterion",
  "curl",
+ "faiss",
  "filetime",
  "flate2",
  "half",

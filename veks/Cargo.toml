@@ -46,6 +46,9 @@ veks-core = { path = "../veks-core", version = "0.11.0" }
 veks-pipeline = { path = "../veks-pipeline", version = "0.11.0" }
 libc = "0.2.183"
 
+[features]
+faiss = ["veks-pipeline/faiss"]
+
 [dev-dependencies]
 arrow = "54"
 parquet = "54"

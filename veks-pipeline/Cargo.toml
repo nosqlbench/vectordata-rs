@@ -7,8 +7,12 @@ license = "Apache-2.0"
 homepage = "https://github.com/nosqlbench/vectordata-rs"
 repository = "https://github.com/nosqlbench/vectordata-rs"
 
+[features]
+faiss = ["dep:faiss"]
+
 [dependencies]
 byteorder = "1"
+faiss = { version = "0.13", features = ["static"], optional = true }
 chrono = { version = "0.4", features = ["serde"] }
 atty = "0.2"
 clap = { version = "4", features = ["derive", "string"] }
