@@ -6,9 +6,9 @@
 //! The core entry point is [`evaluate`], which recursively walks the predicate
 //! tree and tests each leaf against the corresponding field in the MNode.
 
-use crate::formats::mnode::MValue;
-use crate::formats::mnode::MNode;
-use crate::formats::pnode::{
+use crate::mnode::MValue;
+use crate::mnode::MNode;
+use crate::pnode::{
     Comparand, ConjugateType, FieldRef, OpType, PNode,
 };
 
@@ -93,22 +93,22 @@ fn compare_eq(mv: &MValue, c: &Comparand) -> bool {
 
         // Int types vs Int comparand
         (mv, Comparand::Int(ci)) if is_int_type(mv) => {
-            extract_i64(mv).map_or(false, |v| v == *ci)
+            extract_i64(mv) == Some(*ci)
         }
 
         // Float types vs Float comparand
         (mv, Comparand::Float(cf)) if is_float_type(mv) => {
-            extract_f64(mv).map_or(false, |v| v == *cf)
+            extract_f64(mv) == Some(*cf)
         }
 
         // Cross-type numeric: Int MValue vs Float comparand
         (mv, Comparand::Float(cf)) if is_int_type(mv) => {
-            extract_i64(mv).map_or(false, |v| (v as f64) == *cf)
+            extract_i64(mv).map(|v| v as f64) == Some(*cf)
         }
 
         // Cross-type numeric: Float MValue vs Int comparand
         (mv, Comparand::Int(ci)) if is_float_type(mv) => {
-            extract_f64(mv).map_or(false, |v| v == (*ci as f64))
+            extract_f64(mv) == Some(*ci as f64)
         }
 
         // All other type combinations are mismatches
@@ -184,7 +184,7 @@ fn extract_f64(mv: &MValue) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::formats::pnode::{ConjugateNode, PredicateNode};
+    use crate::pnode::{ConjugateNode, PredicateNode};
 
     /// Build a simple leaf predicate with a named field.
     fn pred(name: &str, op: OpType, comparands: Vec<Comparand>) -> PNode {

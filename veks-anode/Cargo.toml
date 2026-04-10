@@ -1,0 +1,18 @@
+[package]
+name = "veks-anode"
+version = "0.13.0"
+edition = "2024"
+description = "Self-describing binary wire formats for structured metadata (MNode), predicate trees (PNode), and annotation nodes (ANode)"
+license = "Apache-2.0"
+homepage = "https://github.com/nosqlbench/vectordata-rs"
+repository = "https://github.com/nosqlbench/vectordata-rs"
+keywords = ["wire-format", "binary", "metadata", "predicate", "codec"]
+categories = ["encoding", "data-structures"]
+
+[dependencies]
+byteorder = "1.5"
+indexmap = "2"
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"

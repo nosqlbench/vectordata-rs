@@ -1,12 +1,18 @@
 # veks-completion
 
-Dynamic shell completion engine for the veks CLI.
+Dynamic shell completion engine for Rust CLI tools.
 
-## Why not clap's built-in completion?
+Zero dependencies. Define your command tree, get context-aware tab completion
+with option filtering, value providers, and dynamic discovery — no static
+code generation.
+
+## Why not clap_complete?
 
 Clap provides `clap_complete` for generating static shell completion scripts.
 It works well for simple CLIs with a fixed command tree, but it breaks down
-for veks for several reasons:
+for tools with dynamic commands, multi-level subgroups, or context-sensitive
+value completion. This crate was built for the veks CLI but is fully generic
+and reusable. Here are the specific limitations it addresses:
 
 ### 1. Dynamic pipeline commands
 
@@ -74,13 +80,43 @@ installed binary.
 
 ## Usage
 
-```bash
-# Add to .bashrc / .zshrc:
-eval "$(veks completions)"
+```rust
+use veks_completion::{CommandTree, Node, handle_complete_env, print_bash_script};
+
+let tree = CommandTree::new("myapp")
+    .command("run", Node::leaf_with_flags(
+        &["--input", "--output", "--threads"],
+        &["--verbose", "--dry-run"],
+    ))
+    .group("compute", Node::group(vec![
+        ("knn", Node::leaf(&["--base", "--query", "--metric"])),
+        ("stats", Node::leaf(&["--input"])),
+    ]))
+    .hidden_command("_debug", Node::leaf(&["--trace"]));
+
+// In main(), before argument parsing:
+if handle_complete_env("myapp", &tree) {
+    std::process::exit(0);
+}
+
+// Add a "completions" subcommand that prints the bash script:
+// eval "$(myapp completions)"
 ```
 
-This registers a bash completion function that calls `veks` with
-`_VEKS_COMPLETE=bash` on each tab press.
+Users enable completion with:
+
+```bash
+# Add to .bashrc:
+eval "$(myapp completions)"
+```
+
+## Examples
+
+See `examples/basic.rs` for a complete working demo:
+
+```bash
+cargo run --example basic -p veks-completion
+```
 
 ## Architecture
 

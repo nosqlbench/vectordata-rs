@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "vectordata",
+    "veks-anode",
     "veks-core",
     "veks-pipeline",
     "veks-completion",

@@ -25,8 +25,8 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fmt;
 
-use crate::formats::mnode::DIALECT_MNODE;
-use crate::formats::pnode::{Comparand, ConjugateType, FieldRef, OpType, PNode};
+use crate::mnode::DIALECT_MNODE;
+use crate::pnode::{Comparand, ConjugateType, FieldRef, OpType, PNode};
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -71,7 +71,7 @@ pub fn skip_value(data: &[u8], pos: usize, tag: u8) -> Result<usize, ScanError> 
         7 | 12 | 16 => check_bounds(data, pos, 4), // EnumOrd, Int32, Float32
         1 | 2 | 18 => check_bounds(data, pos, 8),  // Int, Float, Millis
         19 => check_bounds(data, pos, 12),     // Nanos (i64 + i32)
-        23 | 24 | 25 => check_bounds(data, pos, 16), // UuidV1, UuidV7, Ulid
+        23..=25 => check_bounds(data, pos, 16), // UuidV1, UuidV7, Ulid
         // Length-prefixed: Text(0), Bytes(4), EnumStr(6), Map(9),
         //   TextValidated(10), Ascii(11), Date(20), Time(21), DateTime(22)
         0 | 4 | 6 | 9 | 10 | 11 | 20 | 21 | 22 => skip_len32(data, pos),
@@ -407,12 +407,15 @@ pub fn discover_schema(data: &[u8]) -> Result<RecordSchema, ScanError> {
 /// compile time: `Eq Null` / `In Null` conditions always pass (the required
 /// count is decremented), while other conditions mark the predicate as
 /// unmatchable.
+/// A single compiled condition: `(predicate_index, operator, comparand_values)`.
+pub type FieldCondition = (usize, OpType, Vec<Comparand>);
+
 pub struct CompiledScanPredicates {
     /// Total number of predicates.
     pub pred_count: usize,
     /// `field_conditions[field_idx]` = conditions to evaluate at that position.
     /// Empty `Vec` means the field is not referenced by any predicate.
-    field_conditions: Vec<Vec<(usize, OpType, Vec<Comparand>)>>,
+    field_conditions: Vec<Vec<FieldCondition>>,
     /// `condition_counts[pred_idx]` = number of conditions that must pass.
     /// Adjusted during compilation for always-missing fields.
     /// `u32::MAX` marks predicates that can never match.
@@ -473,13 +476,13 @@ impl CompiledScanPredicates {
     /// conditions are resolved at compile time.
     pub fn compile(
         pred_count: usize,
-        field_conditions_by_name: &HashMap<String, Vec<(usize, OpType, Vec<Comparand>)>>,
+        field_conditions_by_name: &HashMap<String, Vec<FieldCondition>>,
         condition_counts_orig: &[u32],
         fallback: Vec<(usize, PNode)>,
         schema: &RecordSchema,
     ) -> Self {
         let fc = schema.field_count;
-        let mut field_conditions: Vec<Vec<(usize, OpType, Vec<Comparand>)>> =
+        let mut field_conditions: Vec<Vec<FieldCondition>> =
             vec![Vec::new(); fc];
         let mut targeted_fields = vec![false; fc];
         let mut condition_counts = condition_counts_orig.to_vec();
@@ -610,8 +613,8 @@ pub fn scan_record(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::formats::mnode::{MNode, MValue};
-    use crate::formats::pnode::{ConjugateNode, PredicateNode};
+    use crate::mnode::{MNode, MValue};
+    use crate::pnode::{ConjugateNode, PredicateNode};
 
     // -- skip_value --
 
@@ -914,7 +917,7 @@ mod tests {
 
         // Predicate 0: user_id > 5
         // Predicate 1: name = 'alice'
-        let mut fc: HashMap<String, Vec<(usize, OpType, Vec<Comparand>)>> = HashMap::new();
+        let mut fc: HashMap<String, Vec<FieldCondition>> = HashMap::new();
         fc.entry("user_id".into())
             .or_default()
             .push((0, OpType::Gt, vec![Comparand::Int(5)]));
@@ -943,7 +946,7 @@ mod tests {
         let schema = discover_schema(&data).unwrap();
 
         // Predicate: missing_field Eq Null
-        let mut fc: HashMap<String, Vec<(usize, OpType, Vec<Comparand>)>> = HashMap::new();
+        let mut fc: HashMap<String, Vec<FieldCondition>> = HashMap::new();
         fc.entry("missing_field".into())
             .or_default()
             .push((0, OpType::Eq, vec![Comparand::Null]));
@@ -963,7 +966,7 @@ mod tests {
         let schema = discover_schema(&data).unwrap();
 
         // Predicate: missing_field > 5 -> can never match
-        let mut fc: HashMap<String, Vec<(usize, OpType, Vec<Comparand>)>> = HashMap::new();
+        let mut fc: HashMap<String, Vec<FieldCondition>> = HashMap::new();
         fc.entry("missing".into())
             .or_default()
             .push((0, OpType::Gt, vec![Comparand::Int(5)]));
@@ -1005,7 +1008,7 @@ mod tests {
         ]);
         let schema = discover_schema(&data).unwrap();
 
-        let mut fc: HashMap<String, Vec<(usize, OpType, Vec<Comparand>)>> = HashMap::new();
+        let mut fc: HashMap<String, Vec<FieldCondition>> = HashMap::new();
         fc.entry("user_id".into())
             .or_default()
             .push((0, OpType::Ge, vec![Comparand::Int(10)]));
@@ -1033,7 +1036,7 @@ mod tests {
         ]);
         let schema = discover_schema(&data).unwrap();
 
-        let mut fc: HashMap<String, Vec<(usize, OpType, Vec<Comparand>)>> = HashMap::new();
+        let mut fc: HashMap<String, Vec<FieldCondition>> = HashMap::new();
         fc.entry("score".into())
             .or_default()
             .push((0, OpType::Gt, vec![Comparand::Float(50.0)]));

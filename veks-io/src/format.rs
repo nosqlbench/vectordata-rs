@@ -115,18 +115,16 @@ impl VecFormat {
         if s.contains('#') {
             let hash_pos = s.rfind('#').unwrap();
             let file_part = &s[..hash_pos];
-            if let Some(ext) = Path::new(file_part).extension().and_then(|e| e.to_str()) {
-                if ext == "hdf5" || ext == "h5" {
-                    return None;
-                }
+            if let Some(ext) = Path::new(file_part).extension().and_then(|e| e.to_str())
+                && (ext == "hdf5" || ext == "h5") {
+                return None;
             }
         }
 
         // Try file extension
-        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-            if let Some(fmt) = Self::from_extension(ext) {
-                return Some(fmt);
-            }
+        if let Some(ext) = path.extension().and_then(|e| e.to_str())
+            && let Some(fmt) = Self::from_extension(ext) {
+            return Some(fmt);
         }
 
         // For directories, detect by contents

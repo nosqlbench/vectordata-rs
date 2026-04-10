@@ -12,6 +12,7 @@ categories = ["filesystem", "network-programming", "science"]
 
 [dependencies]
 indexmap = { version = "2", features = ["serde"] }
+veks-anode = { path = "../veks-anode", version = "0.13.0" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"

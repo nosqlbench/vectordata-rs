@@ -14,7 +14,6 @@
 use std::path::Path;
 use std::time::Instant;
 
-use indexmap::IndexMap;
 use rand::SeedableRng;
 use rand::Rng;
 use rand_xoshiro::Xoshiro256PlusPlus;
@@ -237,6 +236,7 @@ compatible with `generate predicates` and `compute evaluate-predicates`.
 #[cfg(test)]
 mod tests {
     use super::*;
+    use indexmap::IndexMap;
     use crate::pipeline::command::{Options, Status, StreamContext};
     use crate::pipeline::progress::ProgressLog;
 

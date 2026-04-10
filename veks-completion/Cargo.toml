@@ -6,3 +6,5 @@ license = "Apache-2.0"
 description = "Dynamic shell completion engine for CLI tools"
 homepage = "https://github.com/nosqlbench/vectordata-rs"
 repository = "https://github.com/nosqlbench/vectordata-rs"
+keywords = ["completion", "cli", "shell", "bash", "tab-completion"]
+categories = ["command-line-utilities"]

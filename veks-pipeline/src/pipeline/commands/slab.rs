@@ -1454,7 +1454,7 @@ will operate on.
         let codec = options.get("codec").unwrap_or("auto");
         let format_str = options.get("format").unwrap_or("cddl");
 
-        let vernacular = match veks_core::formats::anode_vernacular::Vernacular::from_str(format_str) {
+        let vernacular = match veks_core::formats::anode_vernacular::Vernacular::parse(format_str) {
             Some(v) => v,
             None => return error_result(format!("unknown format: '{}'", format_str), start),
         };

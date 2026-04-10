@@ -120,7 +120,7 @@ in predicate synthesis, metadata indexing, or query execution.
             Err(e) => return error_result(e, start),
         };
         let vernacular_str = options.get("vernacular").unwrap_or("readout");
-        let vernacular = match Vernacular::from_str(vernacular_str) {
+        let vernacular = match Vernacular::parse(vernacular_str) {
             Some(v) => v,
             None => return error_result(
                 format!("unknown vernacular: '{}'. Use json, yaml, sql, cql, cddl, readout, display", vernacular_str),

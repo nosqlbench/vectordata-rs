@@ -199,6 +199,10 @@ pub struct CommandTree {
 }
 
 impl CommandTree {
+    /// Create a new command tree with an empty root group.
+    ///
+    /// The `app_name` is used to construct the environment variable name
+    /// for completion callbacks (e.g., `_MYAPP_COMPLETE=bash`).
     pub fn new(app_name: &str) -> Self {
         CommandTree {
             app_name: app_name.to_string(),
@@ -208,20 +212,35 @@ impl CommandTree {
         }
     }
 
+    /// Add a top-level command (leaf or group) to the tree.
+    ///
+    /// This is a builder method — it consumes and returns `self` for chaining.
     pub fn command(mut self, name: &str, node: Node) -> Self {
         self.root = self.root.with_child(name, node);
         self
     }
 
+    /// Add a top-level group to the tree. Alias for [`command`](Self::command).
     pub fn group(self, name: &str, node: Node) -> Self {
         self.command(name, node)
     }
 
+    /// Add a command that is registered but hidden from root-level listing.
+    ///
+    /// Hidden commands are still completable if the user types the name
+    /// prefix directly — they are just excluded from the initial empty-prefix
+    /// candidate list. Useful for aliases and shorthands.
     pub fn hidden_command(mut self, name: &str, node: Node) -> Self {
         self.hidden.insert(name.to_string());
         self.command(name, node)
     }
 
+    /// Register a value provider that applies to an option name across all
+    /// leaf commands in the tree.
+    ///
+    /// When the user types `--dataset <TAB>`, the provider is called regardless
+    /// of which leaf command is active. Per-leaf providers registered via
+    /// [`Node::with_value_provider`] take precedence over global providers.
     pub fn global_value_provider(mut self, option: &str, provider: ValueProvider) -> Self {
         self.global_value_providers.insert(option.to_string(), provider);
         self
@@ -234,8 +253,7 @@ impl CommandTree {
 fn word_matches_option(word: &str, option: &str) -> bool {
     if word == option { return true; }
 
-    if option.ends_with('=') {
-        let key = &option[..option.len() - 1];
+    if let Some(key) = option.strip_suffix('=') {
         if word.starts_with(key) && word[key.len()..].starts_with('=') {
             return true;
         }
@@ -286,7 +304,7 @@ fn is_consumed(option: &str, consumed: &std::collections::HashSet<String>) -> bo
 pub fn complete(tree: &CommandTree, words: &[&str]) -> Vec<String> {
     if words.len() <= 1 {
         let mut cmds: Vec<String> = tree.root.child_names().iter()
-            .filter(|s| !tree.hidden.contains(&s.to_string()))
+            .filter(|s| !tree.hidden.contains(**s))
             .map(|s| s.to_string())
             .collect();
         cmds.sort_by(|a, b| {
@@ -311,10 +329,9 @@ pub fn complete(tree: &CommandTree, words: &[&str]) -> Vec<String> {
     let remaining = &completed[remaining_start..];
 
     // Check global value providers for the previous word.
-    if let Some(&prev_word) = completed.last() {
-        if let Some(provider) = tree.global_value_providers.get(prev_word) {
-            return provider(partial, remaining);
-        }
+    if let Some(&prev_word) = completed.last()
+        && let Some(provider) = tree.global_value_providers.get(prev_word) {
+        return provider(partial, remaining);
     }
 
     match node {
@@ -331,16 +348,15 @@ pub fn complete(tree: &CommandTree, words: &[&str]) -> Vec<String> {
         }
         Node::Leaf { options, flags, value_providers, dynamic_options } => {
             // Check if the previous word is a --option expecting a separate value.
-            if let Some(&prev_word) = remaining.last() {
-                if prev_word.starts_with("--") && !prev_word.contains('=') && !flags.contains(prev_word) {
-                    if let Some(provider) = value_providers.get(prev_word) {
-                        return provider(partial, remaining);
-                    }
-                    if let Some(provider) = tree.global_value_providers.get(prev_word) {
-                        return provider(partial, remaining);
-                    }
-                    return Vec::new();
+            if let Some(&prev_word) = remaining.last()
+                && prev_word.starts_with("--") && !prev_word.contains('=') && !flags.contains(prev_word) {
+                if let Some(provider) = value_providers.get(prev_word) {
+                    return provider(partial, remaining);
                 }
+                if let Some(provider) = tree.global_value_providers.get(prev_word) {
+                    return provider(partial, remaining);
+                }
+                return Vec::new();
             }
 
             // Collect all available options: static + dynamic from context.
