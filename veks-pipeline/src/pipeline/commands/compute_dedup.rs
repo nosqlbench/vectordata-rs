@@ -108,6 +108,47 @@ impl VecReader {
         }
     }
 
+    /// Full lexicographic comparison of two vectors.
+    fn compare_vectors(&self, a: usize, b: usize) -> std::cmp::Ordering {
+        match self {
+            VecReader::F32(r) => {
+                let va = r.get_slice(a);
+                let vb = r.get_slice(b);
+                for i in 0..va.len().min(vb.len()) {
+                    match va[i].partial_cmp(&vb[i]) {
+                        Some(std::cmp::Ordering::Equal) => continue,
+                        Some(ord) => return ord,
+                        None => {
+                            // NaN handling: treat NaN as greater than all values
+                            if va[i].is_nan() && vb[i].is_nan() { continue; }
+                            if va[i].is_nan() { return std::cmp::Ordering::Greater; }
+                            return std::cmp::Ordering::Less;
+                        }
+                    }
+                }
+                va.len().cmp(&vb.len())
+            }
+            VecReader::F16(r) => {
+                let va = r.get_slice(a);
+                let vb = r.get_slice(b);
+                for i in 0..va.len().min(vb.len()) {
+                    let fa = va[i].to_f32();
+                    let fb = vb[i].to_f32();
+                    match fa.partial_cmp(&fb) {
+                        Some(std::cmp::Ordering::Equal) => continue,
+                        Some(ord) => return ord,
+                        None => {
+                            if fa.is_nan() && fb.is_nan() { continue; }
+                            if fa.is_nan() { return std::cmp::Ordering::Greater; }
+                            return std::cmp::Ordering::Less;
+                        }
+                    }
+                }
+                va.len().cmp(&vb.len())
+            }
+        }
+    }
+
     fn format_name(&self) -> &'static str {
         match self {
             VecReader::F32(_) => "f32",
@@ -1059,28 +1100,38 @@ fn merge_runs(
                 out_buf.extend_from_slice(&(record.ordinal as i32).to_le_bytes());
                 local_stats.singleton_groups += 1;
             } else {
-                // Multi-element prefix group — track the last unique
-                // vector and compare each subsequent record against it.
-                // Only reads full vectors for the comparison, no hashing.
-                // When a record doesn't match the last unique, it becomes
-                // the new last unique reference.
+                // Multi-element prefix group — sort by full vector content
+                // within the group so that non-identical vectors are in
+                // lexicographic order. Then deduplicate by comparing
+                // consecutive entries (identical vectors are now adjacent).
                 local_stats.multi_groups += 1;
                 local_stats.multi_group_total_size += group_len;
                 if group_len > local_stats.largest_group {
                     local_stats.largest_group = group_len;
                 }
+                local_stats.full_vector_reads += group_len;
 
-                let mut last_unique_ord = chunk[group_start].ordinal;
+                // Sort the group slice by full vector content.
+                // We collect ordinals, sort them by vector data, then
+                // process in sorted order.
+                let mut group_ords: Vec<u32> = chunk[group_start..group_end]
+                    .iter()
+                    .map(|r| r.ordinal)
+                    .collect();
+                group_ords.sort_unstable_by(|&a, &b| {
+                    reader.compare_vectors(a as usize, b as usize)
+                });
+
+                let mut last_unique_ord = group_ords[0];
                 out_buf.extend_from_slice(&dim_bytes);
                 out_buf.extend_from_slice(&(last_unique_ord as i32).to_le_bytes());
 
-                for record in &chunk[group_start + 1..group_end] {
-                    local_stats.full_vector_reads += 1;
+                for &ord in &group_ords[1..] {
                     let is_dup = reader.vectors_equal(
-                        last_unique_ord as usize, record.ordinal as usize,
+                        last_unique_ord as usize, ord as usize,
                     );
 
-                    let ord_bytes = (record.ordinal as i32).to_le_bytes();
+                    let ord_bytes = (ord as i32).to_le_bytes();
                     if is_dup {
                         dups += 1;
                         dup_buf.extend_from_slice(&dim_bytes);
@@ -1092,7 +1143,7 @@ fn merge_runs(
                     } else {
                         out_buf.extend_from_slice(&dim_bytes);
                         out_buf.extend_from_slice(&ord_bytes);
-                        last_unique_ord = record.ordinal;
+                        last_unique_ord = ord;
                     }
                 }
             }

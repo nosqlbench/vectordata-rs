@@ -2232,8 +2232,6 @@ fn sorted_index_extract_fvec(
             0
         }
     };
-    let source_zero_count = zero_count + duplicate_zero_count;
-
     // Write zero ordinals ivec for post-hoc verification
     if !zero_ordinals.is_empty() {
         let zeros_path = output_path.with_file_name("zero_ordinals.ivec");
@@ -2285,7 +2283,17 @@ fn sorted_index_extract_fvec(
         if duplicate_zero_count > 0 {
             set_var(ctx, "duplicate_zero_count", &duplicate_zero_count.to_string());
         }
-        set_var(ctx, "source_zero_count", &source_zero_count.to_string());
+    }
+    // source_zero_count: total zeros in the original source, computed
+    // across both query and base extractions plus duplicate zeros.
+    // Accumulate from any previously set query_zero_count (query extract
+    // may have run before base extract).
+    {
+        let prev_source_zc: usize = ctx.defaults.get("source_zero_count")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let new_source_zc = prev_source_zc + zero_count + duplicate_zero_count;
+        set_var(ctx, "source_zero_count", &new_source_zc.to_string());
     }
     set_var(ctx, "dim", &(dim as usize).to_string());
     // Persist query_count if available (from upstream defaults)
@@ -3243,5 +3251,205 @@ mod tests {
         // Output should have 10 records of dim 4: 10 * (4 + 4*4) = 200 bytes
         let size = std::fs::metadata(&out_path).unwrap().len();
         assert_eq!(size, 10 * (4 + 4 * 4));
+
+        // Verify extracted vectors match shuffled originals (ordering test).
+        // This is the critical test for the transpose fix — previously
+        // the fvec extract did not preserve ivec ordering for shuffled
+        // (non-sorted) indices.
+        let orig = MmapVectorReader::<f32>::open_fvec(&fvec_path).unwrap();
+        let extracted = MmapVectorReader::<f32>::open_fvec(&out_path).unwrap();
+        let shuffle = MmapVectorReader::<i32>::open_ivec(&ivec_path).unwrap();
+        assert_eq!(
+            <MmapVectorReader<f32> as VectorReader<f32>>::count(&extracted),
+            10
+        );
+        for i in 0..10 {
+            let shuf_idx = shuffle.get(i).unwrap()[0] as usize;
+            let o = orig.get_slice(shuf_idx);
+            let e = extracted.get_slice(i);
+            assert_eq!(o, e, "fvec ordering mismatch at extracted[{}] (orig[{}])", i, shuf_idx);
+        }
+    }
+
+    /// Verify fvec extract preserves ivec ordering for a reversed
+    /// permutation (maximally non-sorted indices).
+    #[test]
+    fn test_fvec_extract_reverse_order() {
+        use crate::pipeline::command::StreamContext;
+        use crate::pipeline::progress::ProgressLog;
+        use crate::pipeline::commands::gen_vectors::GenerateVectorsOp;
+        use indexmap::IndexMap;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path();
+
+        let mut ctx = StreamContext {
+            dataset_name: String::new(),
+            profile: String::new(),
+            profile_names: vec![],
+            workspace: workspace.to_path_buf(),
+            scratch: workspace.join(".scratch"),
+            cache: workspace.join(".cache"),
+            defaults: IndexMap::new(),
+            dry_run: false,
+            progress: ProgressLog::new(),
+            threads: 4,
+            step_id: String::new(),
+            governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
+            ui: veks_core::ui::UiHandle::new(std::sync::Arc::new(veks_core::ui::TestSink::new())),
+            status_interval: std::time::Duration::from_secs(1),
+            estimated_total_steps: 0,
+        };
+
+        // Generate 100 vectors of dimension 8
+        let fvec_path = workspace.join("source.fvec");
+        let mut opts = Options::new();
+        opts.set("output", fvec_path.to_string_lossy().to_string());
+        opts.set("dimension", "8");
+        opts.set("count", "100");
+        opts.set("seed", "7");
+        let mut gen_op = GenerateVectorsOp;
+        let r = gen_op.execute(&opts, &mut ctx);
+        assert_eq!(r.status, Status::Ok);
+
+        // Write a REVERSED ivec: [99, 98, 97, ..., 0]
+        let ivec_path = workspace.join("reverse.ivec");
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&ivec_path).unwrap();
+            for i in (0..100i32).rev() {
+                f.write_all(&1i32.to_le_bytes()).unwrap();
+                f.write_all(&i.to_le_bytes()).unwrap();
+            }
+        }
+
+        // Extract all 100 via reversed indices
+        let out_path = workspace.join("reversed.fvec");
+        let mut opts = Options::new();
+        opts.set("fvec-file", fvec_path.to_string_lossy().to_string());
+        opts.set("ivec-file", ivec_path.to_string_lossy().to_string());
+        opts.set("output", out_path.to_string_lossy().to_string());
+        let mut ext = GenerateFvecExtractOp;
+        let r = ext.execute(&opts, &mut ctx);
+        assert_eq!(r.status, Status::Ok);
+
+        let orig = MmapVectorReader::<f32>::open_fvec(&fvec_path).unwrap();
+        let extracted = MmapVectorReader::<f32>::open_fvec(&out_path).unwrap();
+        assert_eq!(
+            <MmapVectorReader<f32> as VectorReader<f32>>::count(&extracted),
+            100
+        );
+
+        // extracted[0] should be orig[99], extracted[1] = orig[98], etc.
+        for i in 0..100 {
+            let expected_idx = 99 - i;
+            let o = orig.get_slice(expected_idx);
+            let e = extracted.get_slice(i);
+            assert_eq!(o, e,
+                "reverse ordering mismatch: extracted[{}] should be orig[{}]",
+                i, expected_idx);
+        }
+    }
+
+    /// Verify fvec extract with shuffle + normalize handles zero vectors
+    /// correctly in transpose mode (zeros should be filtered and the
+    /// remaining vectors should preserve ivec ordering).
+    #[test]
+    fn test_fvec_extract_shuffle_normalize_with_zeros() {
+        use crate::pipeline::command::StreamContext;
+        use crate::pipeline::progress::ProgressLog;
+        use indexmap::IndexMap;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path();
+
+        let mut ctx = StreamContext {
+            dataset_name: String::new(),
+            profile: String::new(),
+            profile_names: vec![],
+            workspace: workspace.to_path_buf(),
+            scratch: workspace.join(".scratch"),
+            cache: workspace.join(".cache"),
+            defaults: IndexMap::new(),
+            dry_run: false,
+            progress: ProgressLog::new(),
+            threads: 2,
+            step_id: String::new(),
+            governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
+            ui: veks_core::ui::UiHandle::new(std::sync::Arc::new(veks_core::ui::TestSink::new())),
+            status_interval: std::time::Duration::from_secs(1),
+            estimated_total_steps: 0,
+        };
+
+        // Write 10 vectors of dim 4: vectors 0,3,7 are zero vectors
+        let fvec_path = workspace.join("source.fvec");
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&fvec_path).unwrap();
+            for i in 0..10u32 {
+                f.write_all(&4i32.to_le_bytes()).unwrap();
+                if i == 0 || i == 3 || i == 7 {
+                    // Zero vector
+                    for _ in 0..4 { f.write_all(&0.0f32.to_le_bytes()).unwrap(); }
+                } else {
+                    // Non-zero vector: [i+0.1, i+0.2, i+0.3, i+0.4]
+                    for d in 0..4 {
+                        let v = i as f32 + (d as f32 + 1.0) * 0.1;
+                        f.write_all(&v.to_le_bytes()).unwrap();
+                    }
+                }
+            }
+        }
+
+        // Write shuffled ivec: [9, 7, 5, 3, 1, 8, 6, 4, 2, 0]
+        let ivec_path = workspace.join("shuffle.ivec");
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&ivec_path).unwrap();
+            for &idx in &[9i32, 7, 5, 3, 1, 8, 6, 4, 2, 0] {
+                f.write_all(&1i32.to_le_bytes()).unwrap();
+                f.write_all(&idx.to_le_bytes()).unwrap();
+            }
+        }
+
+        // Extract with normalize=true (which filters near-zero vectors)
+        let out_path = workspace.join("extracted.fvec");
+        let mut opts = Options::new();
+        opts.set("fvec-file", fvec_path.to_string_lossy().to_string());
+        opts.set("ivec-file", ivec_path.to_string_lossy().to_string());
+        opts.set("output", out_path.to_string_lossy().to_string());
+        opts.set("normalize", "true");
+        let mut ext = GenerateFvecExtractOp;
+        let r = ext.execute(&opts, &mut ctx);
+        assert_eq!(r.status, Status::Ok);
+
+        // ivec order: [9, 7, 5, 3, 1, 8, 6, 4, 2, 0]
+        // zeros at source indices 0, 3, 7
+        // After filtering: [9, _, 5, _, 1, 8, 6, 4, 2, _] → 7 non-zero vectors
+        // Output should have 7 vectors in order: source[9], source[5], source[1],
+        //   source[8], source[6], source[4], source[2]
+        let extracted = MmapVectorReader::<f32>::open_fvec(&out_path).unwrap();
+        let count = <MmapVectorReader<f32> as VectorReader<f32>>::count(&extracted);
+        assert_eq!(count, 7, "should have 7 non-zero vectors after filtering");
+
+        // Verify the vectors are from the correct source indices, in ivec order
+        // (exact float values will differ due to normalization, but the source
+        // index should be recoverable from the relative magnitudes)
+        let orig = MmapVectorReader::<f32>::open_fvec(&fvec_path).unwrap();
+        let expected_sources = [9usize, 5, 1, 8, 6, 4, 2];
+        for (out_i, &src_i) in expected_sources.iter().enumerate() {
+            let e = extracted.get_slice(out_i);
+            let o = orig.get_slice(src_i);
+            // After normalization, e = o / ||o||. Check direction matches.
+            let o_norm: f32 = o.iter().map(|v| v * v).sum::<f32>().sqrt();
+            for d in 0..4 {
+                let expected = o[d] / o_norm;
+                assert!(
+                    (e[d] - expected).abs() < 1e-5,
+                    "direction mismatch at extracted[{}][{}] (from source[{}]): got {} expected {}",
+                    out_i, d, src_i, e[d], expected
+                );
+            }
+        }
     }
 }

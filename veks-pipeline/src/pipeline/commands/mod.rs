@@ -14,7 +14,7 @@ pub mod require;
 pub mod source_window;
 pub mod analyze_checkendian;
 pub mod analyze_compare;
-#[cfg(feature = "faiss")]
+#[cfg(feature = "knnutils")]
 pub mod analyze_fvecs_check_knnutils;
 pub mod analyze_explore;
 pub mod analyze_find_duplicates;
@@ -29,7 +29,7 @@ pub mod analyze_stats;
 pub mod analyze_verifyknn;
 pub mod analyze_verifyprofiles;
 pub mod analyze_normals;
-#[cfg(feature = "faiss")]
+#[cfg(feature = "knnutils")]
 pub mod analyze_normals_knnutils;
 pub mod analyze_norms;
 pub mod analyze_overlap;
@@ -40,9 +40,11 @@ pub mod compute_dedup;
 pub mod dataset_json;
 pub mod compute_filtered_knn;
 pub mod compute_knn;
+#[cfg(feature = "knnutils")]
+pub mod compute_knn_blas;
 #[cfg(feature = "faiss")]
 pub mod compute_knn_faiss;
-#[cfg(feature = "faiss")]
+#[cfg(feature = "knnutils")]
 pub mod compute_sort_knnutils;
 pub mod compute_sort;
 pub mod config;
@@ -58,7 +60,7 @@ pub mod gen_predicate_keys;
 pub mod gen_predicated;
 pub mod gen_predicates;
 pub mod gen_shuffle;
-#[cfg(feature = "faiss")]
+#[cfg(feature = "knnutils")]
 pub mod gen_shuffle_knnutils;
 pub mod gen_sketch;
 pub mod gen_dataset_log_jsonl;
@@ -74,11 +76,11 @@ pub mod merkle;
 pub mod set_variable;
 pub mod slab;
 pub mod verify_consolidated;
-#[cfg(feature = "faiss")]
+#[cfg(feature = "knnutils")]
 pub mod transform_normalize_knnutils;
-#[cfg(feature = "faiss")]
+#[cfg(feature = "knnutils")]
 pub mod transform_remove_zeros_knnutils;
-#[cfg(feature = "faiss")]
+#[cfg(feature = "knnutils")]
 pub mod verify_dataset_knnutils;
 pub mod verify_knn;
 pub mod verify_predicates;
@@ -93,21 +95,17 @@ pub fn register_all(registry: &mut CommandRegistry) {
     // ── analyze ──────────────────────────────────────────────────────
     registry.register("analyze check-endian", analyze_checkendian::factory);
     registry.register("analyze compare-files", analyze_compare::factory);
-    #[cfg(feature = "faiss")]
+    #[cfg(feature = "knnutils")]
     registry.register("analyze fvecs-check-knnutils", analyze_fvecs_check_knnutils::factory);
     registry.register("analyze compute-info", info_compute::factory);
     registry.register("analyze describe", describe::factory);
-    // visualize-explore — moved to top-level `explore` command group
     registry.register("analyze file", info_file::factory);
     registry.register("analyze find", analyze_find::factory);
     registry.register("analyze find-duplicates", analyze_find_duplicates::factory);
     registry.register("analyze find-zeros", analyze_find_zeros::factory);
-    // flamegraph — removed, to be moved to separate profiling crate
     registry.register("analyze histogram", analyze_histogram::factory);
     registry.register("analyze model-diff", analyze_modeldiff::factory);
-    // visualize-plot — moved to top-level `explore` command group
     registry.register("analyze explain-predicates", inspect_predicate::factory);
-    // profile — removed, to be moved to separate profiling crate
     registry.register("analyze select", analyze_select::factory);
     registry.register("analyze slice", analyze_slice::factory);
     registry.register("analyze stats", analyze_stats::factory);
@@ -115,7 +113,7 @@ pub fn register_all(registry: &mut CommandRegistry) {
     registry.register("analyze verify-knn", analyze_verifyknn::factory);
     registry.register("analyze verify-profiles", analyze_verifyprofiles::factory);
     registry.register("analyze measure-normals", analyze_normals::factory);
-    #[cfg(feature = "faiss")]
+    #[cfg(feature = "knnutils")]
     registry.register("analyze check-normalization-knnutils", analyze_normals_knnutils::factory);
     registry.register("analyze norms", analyze_norms::factory);
     registry.register("analyze overlap", analyze_overlap::factory);
@@ -124,18 +122,16 @@ pub fn register_all(registry: &mut CommandRegistry) {
     // ── cleanup ─────────────────────────────────────────────────────
     registry.register("cleanup overlap", cleanup_overlap::factory);
 
-    // ── cache ────────────────────────────────────────────────────────
-    // compress/uncompress are registered as workflow commands in prepare,
-    // not as pipeline CommandOp commands (they don't implement CommandOp).
-
     // ── compute ──────────────────────────────────────────────────────
     registry.register("compute evaluate-predicates", gen_predicate_keys::factory);
     registry.register("compute filtered-knn", compute_filtered_knn::factory);
     registry.register("compute knn", compute_knn::factory);
+    #[cfg(feature = "knnutils")]
+    registry.register("compute knn-blas", compute_knn_blas::factory);
     #[cfg(feature = "faiss")]
     registry.register("compute knn-faiss", compute_knn_faiss::factory);
     registry.register("compute sort", compute_dedup::factory);
-    #[cfg(feature = "faiss")]
+    #[cfg(feature = "knnutils")]
     registry.register("compute sort-knnutils", compute_sort_knnutils::factory);
 
     // ── download ─────────────────────────────────────────────────────
@@ -150,7 +146,7 @@ pub fn register_all(registry: &mut CommandRegistry) {
     registry.register("generate predicated", gen_predicated::factory);
     registry.register("generate predicates", gen_predicates::factory);
     registry.register("generate shuffle", gen_shuffle::factory);
-    #[cfg(feature = "faiss")]
+    #[cfg(feature = "knnutils")]
     registry.register("generate shuffle-knnutils", gen_shuffle_knnutils::factory);
     registry.register("generate sketch", gen_sketch::factory);
     registry.register("generate dataset-log-jsonl", gen_dataset_log_jsonl::factory);
@@ -179,13 +175,13 @@ pub fn register_all(registry: &mut CommandRegistry) {
     registry.register("transform convert", convert::factory);
     registry.register("transform extract", gen_extract::extract_factory);
     registry.register("transform ordinals", clean_ordinals::factory);
-    #[cfg(feature = "faiss")]
+    #[cfg(feature = "knnutils")]
     registry.register("transform normalize-knnutils", transform_normalize_knnutils::factory);
-    #[cfg(feature = "faiss")]
+    #[cfg(feature = "knnutils")]
     registry.register("transform remove-zeros-knnutils", transform_remove_zeros_knnutils::factory);
 
     // ── verify ───────────────────────────────────────────────────────
-    #[cfg(feature = "faiss")]
+    #[cfg(feature = "knnutils")]
     registry.register("verify dataset-knnutils", verify_dataset_knnutils::factory);
     registry.register("verify knn-groundtruth", verify_knn::factory);
     registry.register("verify predicate-results", verify_predicates::factory);
@@ -193,9 +189,7 @@ pub fn register_all(registry: &mut CommandRegistry) {
     registry.register("verify filtered-knn-consolidated", verify_consolidated::filtered_knn_consolidated_factory);
     registry.register("verify predicates-consolidated", verify_consolidated::predicates_consolidated_factory);
 
-    // config commands moved to `datasets config` subgroup
-
-    // ── catalog (pipeline step for dataset index generation) ─────────
+    // ── catalog ──────────────────────────────────────────────────────
     registry.register("catalog generate", catalog_generate::factory);
     registry.register("catalog stats", catalog_stats::factory);
 

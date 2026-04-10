@@ -1120,3 +1120,749 @@ fn zeros_single_zero_last() {
     assert_eq!(ordinals.len(), 1, "expected 1 zero vector, got {}", ordinals.len());
     assert_eq!(ordinals[0], 3, "zero vector should be at index 3");
 }
+
+// ===========================================================================
+// dedup_prefix_group_ordering: vectors with shared prefixes but different
+// later components should be in full lexicographic order in the output.
+// ===========================================================================
+
+#[test]
+fn dedup_prefix_group_ordering() {
+    let tmp = tmp_dir();
+    let ws = tmp.path();
+
+    // Vectors share first 12 components (all zero), differ at component 12+.
+    // With a prefix width of 10, all vectors collide into one prefix group.
+    // The fix ensures they are sorted by full content within the group.
+    let mut vectors = Vec::new();
+    for i in (0..5).rev() {
+        let mut v = vec![0.0f32; 20];
+        v[15] = (i + 1) as f32;  // differ at component 15
+        vectors.push(v);
+    }
+    // vectors[0] has v[15]=5, vectors[1] has v[15]=4, ..., vectors[4] has v[15]=1
+    // Expected sorted order: v[15]=1 < 2 < 3 < 4 < 5 → indices [4, 3, 2, 1, 0]
+
+    let source = ws.join("prefix_group.fvec");
+    write_test_fvec(&source, &vectors);
+
+    let output = ws.join("sorted.ivec");
+    let dups = ws.join("dups.ivec");
+
+    let mut opts = Options::new();
+    opts.set("source", source.to_string_lossy().to_string());
+    opts.set("output", output.to_string_lossy().to_string());
+    opts.set("duplicates", dups.to_string_lossy().to_string());
+    opts.set("elide", "true");
+
+    let mut op = veks_pipeline::pipeline::commands::compute_dedup::factory();
+    let mut ctx = test_ctx(ws);
+    let result = op.execute(&opts, &mut ctx);
+    assert_eq!(result.status, Status::Ok, "dedup: {}", result.message);
+
+    let ordinals = read_ivec_1d(&output);
+    assert_eq!(ordinals.len(), 5, "no duplicates expected");
+
+    // Verify full lexicographic ordering: the vectors should be sorted
+    // by component 15 ascending → source indices [4, 3, 2, 1, 0]
+    assert_eq!(ordinals, vec![4, 3, 2, 1, 0],
+        "prefix group should be sorted by full vector content, got {:?}", ordinals);
+}
+
+// ===========================================================================
+// analyze find-duplicates
+// ===========================================================================
+
+#[test]
+fn analyze_find_duplicates_basic() {
+    let tmp = tmp_dir();
+    let ws = tmp.path();
+
+    // Vectors: 0==1 (dup), 2 unique, 3==4==5 (triple dup)
+    write_test_fvec(&ws.join("source.fvec"), &[
+        vec![1.0, 2.0], vec![1.0, 2.0],
+        vec![3.0, 4.0],
+        vec![5.0, 6.0], vec![5.0, 6.0], vec![5.0, 6.0],
+    ]);
+
+    let mut opts = Options::new();
+    opts.set("source", ws.join("source.fvec").to_string_lossy().to_string());
+    opts.set("output", ws.join("dups.ivec").to_string_lossy().to_string());
+
+    let registry = veks_pipeline::pipeline::registry::CommandRegistry::with_builtins();
+    let factory = registry.get("analyze find-duplicates").unwrap();
+    let mut cmd = factory();
+    let mut ctx = test_ctx(ws);
+    let result = cmd.execute(&opts, &mut ctx);
+    // Should succeed and find duplicates
+    assert!(result.status == Status::Ok || result.status == Status::Warning,
+        "find-duplicates: {}", result.message);
+}
+
+#[test]
+fn analyze_find_duplicates_no_dups() {
+    let tmp = tmp_dir();
+    let ws = tmp.path();
+
+    write_test_fvec(&ws.join("source.fvec"), &[
+        vec![1.0, 2.0], vec![3.0, 4.0], vec![5.0, 6.0],
+    ]);
+
+    let mut opts = Options::new();
+    opts.set("source", ws.join("source.fvec").to_string_lossy().to_string());
+    opts.set("output", ws.join("dups.ivec").to_string_lossy().to_string());
+
+    let registry = veks_pipeline::pipeline::registry::CommandRegistry::with_builtins();
+    let factory = registry.get("analyze find-duplicates").unwrap();
+    let mut cmd = factory();
+    let mut ctx = test_ctx(ws);
+    let result = cmd.execute(&opts, &mut ctx);
+    assert_eq!(result.status, Status::Ok, "no-dups: {}", result.message);
+}
+
+// ===========================================================================
+// analyze find-zeros
+// ===========================================================================
+
+#[test]
+fn analyze_find_zeros_mixed() {
+    let tmp = tmp_dir();
+    let ws = tmp.path();
+
+    write_test_fvec(&ws.join("source.fvec"), &[
+        vec![1.0, 2.0],
+        vec![0.0, 0.0],  // zero
+        vec![3.0, 4.0],
+        vec![0.0, 0.0],  // zero
+        vec![5.0, 6.0],
+    ]);
+
+    let mut opts = Options::new();
+    opts.set("source", ws.join("source.fvec").to_string_lossy().to_string());
+
+    let registry = veks_pipeline::pipeline::registry::CommandRegistry::with_builtins();
+    let factory = registry.get("analyze find-zeros").unwrap();
+    let mut cmd = factory();
+    let mut ctx = test_ctx(ws);
+    let result = cmd.execute(&opts, &mut ctx);
+    // find-zeros reports zeros to stdout, status Warning when zeros found
+    assert!(result.status == Status::Ok || result.status == Status::Warning,
+        "find-zeros: {}", result.message);
+}
+
+#[test]
+fn analyze_find_zeros_none() {
+    let tmp = tmp_dir();
+    let ws = tmp.path();
+
+    write_test_fvec(&ws.join("source.fvec"), &[
+        vec![1.0, 0.0], vec![0.0, 1.0],
+    ]);
+
+    let mut opts = Options::new();
+    opts.set("source", ws.join("source.fvec").to_string_lossy().to_string());
+
+    let registry = veks_pipeline::pipeline::registry::CommandRegistry::with_builtins();
+    let factory = registry.get("analyze find-zeros").unwrap();
+    let mut cmd = factory();
+    let mut ctx = test_ctx(ws);
+    let result = cmd.execute(&opts, &mut ctx);
+    assert_eq!(result.status, Status::Ok, "no zeros: {}", result.message);
+}
+
+// ===========================================================================
+// analyze norms — L2 norm distribution analysis
+// ===========================================================================
+
+#[test]
+fn analyze_norms_basic() {
+    let tmp = tmp_dir();
+    let ws = tmp.path();
+
+    // Mix of normalized and unnormalized vectors
+    write_test_fvec(&ws.join("source.fvec"), &[
+        vec![1.0, 0.0, 0.0],    // norm = 1
+        vec![0.0, 1.0, 0.0],    // norm = 1
+        vec![3.0, 4.0, 0.0],    // norm = 5
+        vec![0.0, 0.0, 0.0],    // norm = 0
+    ]);
+
+    let mut opts = Options::new();
+    opts.set("source", ws.join("source.fvec").to_string_lossy().to_string());
+
+    let registry = veks_pipeline::pipeline::registry::CommandRegistry::with_builtins();
+    let factory = registry.get("analyze norms").unwrap();
+    let mut cmd = factory();
+    let mut ctx = test_ctx(ws);
+    let result = cmd.execute(&opts, &mut ctx);
+    assert_eq!(result.status, Status::Ok, "norms: {}", result.message);
+}
+
+// ===========================================================================
+// analyze measure-normals — normalization precision
+// ===========================================================================
+
+#[test]
+fn analyze_measure_normals_unit_vectors() {
+    let tmp = tmp_dir();
+    let ws = tmp.path();
+
+    // All unit vectors
+    let s = 1.0f32 / 2.0f32.sqrt();
+    write_test_fvec(&ws.join("source.fvec"), &[
+        vec![1.0, 0.0, 0.0],
+        vec![0.0, 1.0, 0.0],
+        vec![s, s, 0.0],
+    ]);
+
+    let mut opts = Options::new();
+    opts.set("input", ws.join("source.fvec").to_string_lossy().to_string());
+    opts.set("sample", "3");
+
+    let registry = veks_pipeline::pipeline::registry::CommandRegistry::with_builtins();
+    let factory = registry.get("analyze measure-normals").unwrap();
+    let mut cmd = factory();
+    let mut ctx = test_ctx(ws);
+    let result = cmd.execute(&opts, &mut ctx);
+    assert_eq!(result.status, Status::Ok, "measure-normals: {}", result.message);
+    // Should set is_normalized = true
+    assert_eq!(ctx.defaults.get("is_normalized").map(|s| s.as_str()), Some("true"),
+        "unit vectors should be detected as normalized");
+}
+
+#[test]
+fn analyze_measure_normals_unnormalized() {
+    let tmp = tmp_dir();
+    let ws = tmp.path();
+
+    write_test_fvec(&ws.join("source.fvec"), &[
+        vec![3.0, 4.0],  // norm = 5
+        vec![5.0, 12.0], // norm = 13
+    ]);
+
+    let mut opts = Options::new();
+    opts.set("input", ws.join("source.fvec").to_string_lossy().to_string());
+    opts.set("sample", "2");
+
+    let registry = veks_pipeline::pipeline::registry::CommandRegistry::with_builtins();
+    let factory = registry.get("analyze measure-normals").unwrap();
+    let mut cmd = factory();
+    let mut ctx = test_ctx(ws);
+    let result = cmd.execute(&opts, &mut ctx);
+    assert_eq!(result.status, Status::Ok, "measure-normals: {}", result.message);
+    assert_eq!(ctx.defaults.get("is_normalized").map(|s| s.as_str()), Some("false"),
+        "unnormalized vectors should be detected as not normalized");
+}
+
+// ===========================================================================
+// analyze describe
+// ===========================================================================
+
+#[test]
+fn analyze_describe_basic() {
+    let tmp = tmp_dir();
+    let ws = tmp.path();
+
+    write_test_fvec(&ws.join("source.fvec"), &[
+        vec![1.0, 2.0, 3.0],
+        vec![4.0, 5.0, 6.0],
+    ]);
+
+    let mut opts = Options::new();
+    opts.set("source", ws.join("source.fvec").to_string_lossy().to_string());
+
+    let registry = veks_pipeline::pipeline::registry::CommandRegistry::with_builtins();
+    let factory = registry.get("analyze describe").unwrap();
+    let mut cmd = factory();
+    let mut ctx = test_ctx(ws);
+    let result = cmd.execute(&opts, &mut ctx);
+    assert_eq!(result.status, Status::Ok, "describe: {}", result.message);
+}
+
+// ===========================================================================
+// analyze overlap — find overlapping vectors between two files
+// ===========================================================================
+
+#[test]
+fn analyze_overlap_with_shared_vectors() {
+    let tmp = tmp_dir();
+    let ws = tmp.path();
+
+    write_test_fvec(&ws.join("a.fvec"), &[
+        vec![1.0, 2.0], vec![3.0, 4.0], vec![5.0, 6.0],
+    ]);
+    write_test_fvec(&ws.join("b.fvec"), &[
+        vec![3.0, 4.0], vec![7.0, 8.0], vec![5.0, 6.0],
+    ]);
+
+    let mut opts = Options::new();
+    opts.set("base", ws.join("a.fvec").to_string_lossy().to_string());
+    opts.set("query", ws.join("b.fvec").to_string_lossy().to_string());
+
+    let registry = veks_pipeline::pipeline::registry::CommandRegistry::with_builtins();
+    let factory = registry.get("analyze overlap").unwrap();
+    let mut cmd = factory();
+    let mut ctx = test_ctx(ws);
+    let result = cmd.execute(&opts, &mut ctx);
+    // overlap command returns Error when overlap is detected (it's a data quality issue)
+    assert_eq!(result.status, Status::Error,
+        "overlap should be detected as an error: {}", result.message);
+    assert!(result.message.contains("overlap=2") || result.message.contains("66"),
+        "should report 2 overlapping vectors: {}", result.message);
+}
+
+#[test]
+fn analyze_overlap_no_shared() {
+    let tmp = tmp_dir();
+    let ws = tmp.path();
+
+    write_test_fvec(&ws.join("a.fvec"), &[vec![1.0, 2.0]]);
+    write_test_fvec(&ws.join("b.fvec"), &[vec![3.0, 4.0]]);
+
+    let mut opts = Options::new();
+    opts.set("base", ws.join("a.fvec").to_string_lossy().to_string());
+    opts.set("query", ws.join("b.fvec").to_string_lossy().to_string());
+
+    let registry = veks_pipeline::pipeline::registry::CommandRegistry::with_builtins();
+    let factory = registry.get("analyze overlap").unwrap();
+    let mut cmd = factory();
+    let mut ctx = test_ctx(ws);
+    let result = cmd.execute(&opts, &mut ctx);
+    assert_eq!(result.status, Status::Ok, "no-overlap: {}", result.message);
+}
+
+// ===========================================================================
+// analyze stats — basic vector statistics
+// ===========================================================================
+
+#[test]
+fn analyze_stats_basic() {
+    let tmp = tmp_dir();
+    let ws = tmp.path();
+
+    write_test_fvec(&ws.join("source.fvec"), &[
+        vec![1.0, 2.0, 3.0],
+        vec![4.0, 5.0, 6.0],
+        vec![7.0, 8.0, 9.0],
+    ]);
+
+    let mut opts = Options::new();
+    opts.set("source", ws.join("source.fvec").to_string_lossy().to_string());
+
+    let registry = veks_pipeline::pipeline::registry::CommandRegistry::with_builtins();
+    let factory = registry.get("analyze stats").unwrap();
+    let mut cmd = factory();
+    let mut ctx = test_ctx(ws);
+    let result = cmd.execute(&opts, &mut ctx);
+    assert_eq!(result.status, Status::Ok, "stats: {}", result.message);
+}
+
+// ===========================================================================
+// verify knn-groundtruth — basic KNN verification
+// ===========================================================================
+
+#[test]
+fn verify_knn_groundtruth_correct() {
+    let tmp = tmp_dir();
+    let ws = tmp.path();
+
+    // 4 base vectors, 2 queries, dim=2
+    write_test_fvec(&ws.join("base.fvec"), &[
+        vec![1.0, 0.0], vec![0.0, 1.0], vec![1.0, 1.0], vec![0.5, 0.5],
+    ]);
+    write_test_fvec(&ws.join("query.fvec"), &[
+        vec![0.9, 0.1], vec![0.1, 0.9],
+    ]);
+
+    // Compute correct GT: for L2, nearest to (0.9,0.1) is (1,0)=idx0
+    // nearest to (0.1,0.9) is (0,1)=idx1
+    // GT ivec: each row = [k values]
+    let gt_path = ws.join("gt.ivec");
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&gt_path).unwrap();
+        // query 0: nearest = [0, 3] (L2 dist: 0.02, 0.32)
+        f.write_all(&2i32.to_le_bytes()).unwrap();
+        f.write_all(&0i32.to_le_bytes()).unwrap();
+        f.write_all(&3i32.to_le_bytes()).unwrap();
+        // query 1: nearest = [1, 3]
+        f.write_all(&2i32.to_le_bytes()).unwrap();
+        f.write_all(&1i32.to_le_bytes()).unwrap();
+        f.write_all(&3i32.to_le_bytes()).unwrap();
+    }
+
+    let mut opts = Options::new();
+    opts.set("base", ws.join("base.fvec").to_string_lossy().to_string());
+    opts.set("query", ws.join("query.fvec").to_string_lossy().to_string());
+    opts.set("indices", ws.join("gt.ivec").to_string_lossy().to_string());
+    opts.set("output", ws.join("report.json").to_string_lossy().to_string());
+    opts.set("metric", "L2");
+    opts.set("sample", "2");
+    opts.set("seed", "42");
+
+    let registry = veks_pipeline::pipeline::registry::CommandRegistry::with_builtins();
+    let factory = registry.get("verify knn-groundtruth").unwrap();
+    let mut cmd = factory();
+    let mut ctx = test_ctx(ws);
+    let result = cmd.execute(&opts, &mut ctx);
+    assert_eq!(result.status, Status::Ok, "verify-knn: {}", result.message);
+}
+
+// ===========================================================================
+// Adversarial: single vector in all operations
+// ===========================================================================
+
+#[test]
+fn single_vector_through_pipeline_commands() {
+    let tmp = tmp_dir();
+    let ws = tmp.path();
+
+    write_test_fvec(&ws.join("single.fvec"), &[vec![1.0, 2.0, 3.0]]);
+
+    let registry = veks_pipeline::pipeline::registry::CommandRegistry::with_builtins();
+    let mut ctx = test_ctx(ws);
+
+    // analyze describe
+    let mut opts = Options::new();
+    opts.set("source", ws.join("single.fvec").to_string_lossy().to_string());
+    let mut cmd = registry.get("analyze describe").unwrap()();
+    let r = cmd.execute(&opts, &mut ctx);
+    assert_eq!(r.status, Status::Ok, "describe single: {}", r.message);
+
+    // analyze norms
+    let mut opts = Options::new();
+    opts.set("source", ws.join("single.fvec").to_string_lossy().to_string());
+    let mut cmd = registry.get("analyze norms").unwrap()();
+    let r = cmd.execute(&opts, &mut ctx);
+    assert_eq!(r.status, Status::Ok, "norms single: {}", r.message);
+
+    // analyze measure-normals
+    let mut opts = Options::new();
+    opts.set("input", ws.join("single.fvec").to_string_lossy().to_string());
+    opts.set("sample", "1");
+    let mut cmd = registry.get("analyze measure-normals").unwrap()();
+    let r = cmd.execute(&opts, &mut ctx);
+    assert_eq!(r.status, Status::Ok, "measure-normals single: {}", r.message);
+
+    // compute sort (dedup)
+    let mut opts = Options::new();
+    opts.set("source", ws.join("single.fvec").to_string_lossy().to_string());
+    opts.set("output", ws.join("sorted.ivec").to_string_lossy().to_string());
+    opts.set("duplicates", ws.join("dups.ivec").to_string_lossy().to_string());
+    let mut cmd = registry.get("compute sort").unwrap()();
+    let r = cmd.execute(&opts, &mut ctx);
+    assert_eq!(r.status, Status::Ok, "sort single: {}", r.message);
+    assert_eq!(read_ivec_1d(&ws.join("sorted.ivec")).len(), 1);
+    assert_eq!(read_ivec_1d(&ws.join("dups.ivec")).len(), 0);
+}
+
+// ===========================================================================
+// Adversarial: dimension 1 vectors
+// ===========================================================================
+
+#[test]
+fn dimension_one_vectors() {
+    let tmp = tmp_dir();
+    let ws = tmp.path();
+
+    write_test_fvec(&ws.join("source.fvec"), &[
+        vec![5.0], vec![1.0], vec![3.0], vec![1.0], vec![4.0],
+    ]);
+
+    let mut opts = Options::new();
+    opts.set("source", ws.join("source.fvec").to_string_lossy().to_string());
+    opts.set("output", ws.join("sorted.ivec").to_string_lossy().to_string());
+    opts.set("duplicates", ws.join("dups.ivec").to_string_lossy().to_string());
+
+    let registry = veks_pipeline::pipeline::registry::CommandRegistry::with_builtins();
+    let mut cmd = registry.get("compute sort").unwrap()();
+    let mut ctx = test_ctx(ws);
+    let r = cmd.execute(&opts, &mut ctx);
+    assert_eq!(r.status, Status::Ok, "dim1 sort: {}", r.message);
+
+    let ordinals = read_ivec_1d(&ws.join("sorted.ivec"));
+    assert_eq!(ordinals.len(), 4, "should have 4 unique (1 dup of 1.0)");
+    let dups = read_ivec_1d(&ws.join("dups.ivec"));
+    assert_eq!(dups.len(), 1, "should have 1 duplicate");
+}
+
+// ===========================================================================
+// Adversarial: all-NaN vectors (edge case for sort/norm)
+// ===========================================================================
+
+#[test]
+fn nan_vectors_handled() {
+    let tmp = tmp_dir();
+    let ws = tmp.path();
+
+    write_test_fvec(&ws.join("source.fvec"), &[
+        vec![f32::NAN, 1.0],
+        vec![1.0, 2.0],
+        vec![f32::NAN, f32::NAN],
+    ]);
+
+    // analyze norms should not crash
+    let mut opts = Options::new();
+    opts.set("source", ws.join("source.fvec").to_string_lossy().to_string());
+    let registry = veks_pipeline::pipeline::registry::CommandRegistry::with_builtins();
+    let mut cmd = registry.get("analyze norms").unwrap()();
+    let mut ctx = test_ctx(ws);
+    let r = cmd.execute(&opts, &mut ctx);
+    assert_eq!(r.status, Status::Ok, "norms with NaN: {}", r.message);
+
+    // compute sort should not crash
+    let mut opts = Options::new();
+    opts.set("source", ws.join("source.fvec").to_string_lossy().to_string());
+    opts.set("output", ws.join("sorted.ivec").to_string_lossy().to_string());
+    opts.set("duplicates", ws.join("dups.ivec").to_string_lossy().to_string());
+    let mut cmd = registry.get("compute sort").unwrap()();
+    let r = cmd.execute(&opts, &mut ctx);
+    assert_eq!(r.status, Status::Ok, "sort with NaN: {}", r.message);
+}
+
+// ===========================================================================
+// compute sort: large number of duplicates (stress dedup)
+// ===========================================================================
+
+#[test]
+fn dedup_many_duplicates() {
+    let tmp = tmp_dir();
+    let ws = tmp.path();
+
+    // 100 vectors where every 10 are identical → 10 unique, 90 dups
+    let mut vecs = Vec::new();
+    for group in 0..10 {
+        for _ in 0..10 {
+            vecs.push(vec![group as f32, (group * 2) as f32, (group * 3) as f32]);
+        }
+    }
+    write_test_fvec(&ws.join("source.fvec"), &vecs);
+
+    let mut opts = Options::new();
+    opts.set("source", ws.join("source.fvec").to_string_lossy().to_string());
+    opts.set("output", ws.join("sorted.ivec").to_string_lossy().to_string());
+    opts.set("duplicates", ws.join("dups.ivec").to_string_lossy().to_string());
+
+    let registry = veks_pipeline::pipeline::registry::CommandRegistry::with_builtins();
+    let mut cmd = registry.get("compute sort").unwrap()();
+    let mut ctx = test_ctx(ws);
+    let r = cmd.execute(&opts, &mut ctx);
+    assert_eq!(r.status, Status::Ok, "many dups: {}", r.message);
+
+    let unique = read_ivec_1d(&ws.join("sorted.ivec"));
+    let dups = read_ivec_1d(&ws.join("dups.ivec"));
+    assert_eq!(unique.len(), 10, "should have 10 unique groups");
+    assert_eq!(dups.len(), 90, "should have 90 duplicates");
+}
+
+// ===========================================================================
+// compute sort: already sorted input (lexicographic)
+// ===========================================================================
+
+#[test]
+fn dedup_presorted_lexicographic() {
+    let tmp = tmp_dir();
+    let ws = tmp.path();
+
+    write_test_fvec(&ws.join("source.fvec"), &[
+        vec![0.0, 0.0, 1.0],
+        vec![0.0, 1.0, 0.0],
+        vec![1.0, 0.0, 0.0],
+    ]);
+
+    let mut opts = Options::new();
+    opts.set("source", ws.join("source.fvec").to_string_lossy().to_string());
+    opts.set("output", ws.join("sorted.ivec").to_string_lossy().to_string());
+    opts.set("duplicates", ws.join("dups.ivec").to_string_lossy().to_string());
+
+    let registry = veks_pipeline::pipeline::registry::CommandRegistry::with_builtins();
+    let mut cmd = registry.get("compute sort").unwrap()();
+    let mut ctx = test_ctx(ws);
+    let r = cmd.execute(&opts, &mut ctx);
+    assert_eq!(r.status, Status::Ok, "already sorted: {}", r.message);
+
+    let unique = read_ivec_1d(&ws.join("sorted.ivec"));
+    assert_eq!(unique.len(), 3);
+    // Should be in same order since already sorted
+    assert_eq!(unique, vec![0, 1, 2]);
+}
+
+// ===========================================================================
+// transform extract: zero-length range produces empty output
+// ===========================================================================
+
+#[test]
+fn extract_zero_length_range() {
+    let tmp = tmp_dir();
+    let ws = tmp.path();
+
+    write_test_fvec(&ws.join("source.fvec"), &[
+        vec![1.0, 2.0], vec![3.0, 4.0], vec![5.0, 6.0],
+    ]);
+
+    let mut opts = Options::new();
+    opts.set("source", ws.join("source.fvec").to_string_lossy().to_string());
+    opts.set("output", ws.join("empty.fvec").to_string_lossy().to_string());
+    opts.set("range", "[0,0)");
+
+    let registry = veks_pipeline::pipeline::registry::CommandRegistry::with_builtins();
+    let mut cmd = registry.get("transform extract").unwrap()();
+    let mut ctx = test_ctx(ws);
+    let r = cmd.execute(&opts, &mut ctx);
+    assert_eq!(r.status, Status::Ok, "empty range: {}", r.message);
+
+    let result = read_fvec(&ws.join("empty.fvec"));
+    assert_eq!(result.len(), 0, "empty range should produce empty output");
+}
+
+// ===========================================================================
+// transform extract: range beyond file size clamps
+// ===========================================================================
+
+#[test]
+fn extract_range_beyond_end() {
+    let tmp = tmp_dir();
+    let ws = tmp.path();
+
+    write_test_fvec(&ws.join("source.fvec"), &[
+        vec![1.0, 2.0], vec![3.0, 4.0],
+    ]);
+
+    let mut opts = Options::new();
+    opts.set("source", ws.join("source.fvec").to_string_lossy().to_string());
+    opts.set("output", ws.join("out.fvec").to_string_lossy().to_string());
+    opts.set("range", "[0,1000)");
+
+    let registry = veks_pipeline::pipeline::registry::CommandRegistry::with_builtins();
+    let mut cmd = registry.get("transform extract").unwrap()();
+    let mut ctx = test_ctx(ws);
+    let r = cmd.execute(&opts, &mut ctx);
+    assert_eq!(r.status, Status::Ok, "beyond end: {}", r.message);
+
+    let result = read_fvec(&ws.join("out.fvec"));
+    assert_eq!(result.len(), 2, "should clamp to actual file size");
+}
+
+// ===========================================================================
+// generate shuffle: interval=1 produces trivial permutation
+// ===========================================================================
+
+#[test]
+fn shuffle_trivial_single_element() {
+    let tmp = tmp_dir();
+    let ws = tmp.path();
+
+    let mut opts = Options::new();
+    opts.set("output", ws.join("shuffle.ivec").to_string_lossy().to_string());
+    opts.set("interval", "1");
+    opts.set("seed", "42");
+
+    let registry = veks_pipeline::pipeline::registry::CommandRegistry::with_builtins();
+    let mut cmd = registry.get("generate shuffle").unwrap()();
+    let mut ctx = test_ctx(ws);
+    let r = cmd.execute(&opts, &mut ctx);
+    assert_eq!(r.status, Status::Ok, "shuffle 1: {}", r.message);
+
+    let values = read_ivec_1d(&ws.join("shuffle.ivec"));
+    assert_eq!(values, vec![0], "single element shuffle should be [0]");
+}
+
+// ===========================================================================
+// generate vectors: dimension 1, count 1 (minimal)
+// ===========================================================================
+
+#[test]
+fn gen_vectors_minimal() {
+    let tmp = tmp_dir();
+    let ws = tmp.path();
+
+    let mut opts = Options::new();
+    opts.set("output", ws.join("minimal.fvec").to_string_lossy().to_string());
+    opts.set("dimension", "1");
+    opts.set("count", "1");
+    opts.set("seed", "0");
+
+    let registry = veks_pipeline::pipeline::registry::CommandRegistry::with_builtins();
+    let mut cmd = registry.get("generate vectors").unwrap()();
+    let mut ctx = test_ctx(ws);
+    let r = cmd.execute(&opts, &mut ctx);
+    assert_eq!(r.status, Status::Ok, "minimal gen: {}", r.message);
+
+    let vecs = read_fvec(&ws.join("minimal.fvec"));
+    assert_eq!(vecs.len(), 1);
+    assert_eq!(vecs[0].len(), 1);
+}
+
+// ===========================================================================
+// transform convert: fvec → fvec identity conversion
+// ===========================================================================
+
+#[test]
+fn convert_identity_fvec_to_fvec() {
+    let tmp = tmp_dir();
+    let ws = tmp.path();
+
+    let original = vec![vec![1.0, 2.0, 3.0], vec![4.0, 5.0, 6.0]];
+    write_test_fvec(&ws.join("source.fvec"), &original);
+
+    let mut opts = Options::new();
+    opts.set("source", ws.join("source.fvec").to_string_lossy().to_string());
+    opts.set("output", ws.join("copy.fvec").to_string_lossy().to_string());
+
+    let registry = veks_pipeline::pipeline::registry::CommandRegistry::with_builtins();
+    let mut cmd = registry.get("transform convert").unwrap()();
+    let mut ctx = test_ctx(ws);
+    let r = cmd.execute(&opts, &mut ctx);
+    assert_eq!(r.status, Status::Ok, "identity convert: {}", r.message);
+
+    let result = read_fvec(&ws.join("copy.fvec"));
+    assert_eq!(result, original, "identity conversion should preserve data");
+}
+
+// ===========================================================================
+// analyze compare-files: identical files
+// ===========================================================================
+
+#[test]
+fn compare_identical_files() {
+    let tmp = tmp_dir();
+    let ws = tmp.path();
+
+    let vecs = vec![vec![1.0, 2.0], vec![3.0, 4.0]];
+    write_test_fvec(&ws.join("a.fvec"), &vecs);
+    write_test_fvec(&ws.join("b.fvec"), &vecs);
+
+    let mut opts = Options::new();
+    opts.set("original", ws.join("a.fvec").to_string_lossy().to_string());
+    opts.set("synthetic", ws.join("b.fvec").to_string_lossy().to_string());
+
+    let registry = veks_pipeline::pipeline::registry::CommandRegistry::with_builtins();
+    let mut cmd = registry.get("analyze compare-files").unwrap()();
+    let mut ctx = test_ctx(ws);
+    let r = cmd.execute(&opts, &mut ctx);
+    assert_eq!(r.status, Status::Ok, "compare identical: {}", r.message);
+}
+
+// ===========================================================================
+// analyze histogram: basic operation
+// ===========================================================================
+
+#[test]
+fn histogram_basic() {
+    let tmp = tmp_dir();
+    let ws = tmp.path();
+
+    write_test_fvec(&ws.join("source.fvec"), &[
+        vec![1.0, 2.0], vec![3.0, 4.0], vec![5.0, 6.0],
+    ]);
+
+    let mut opts = Options::new();
+    opts.set("source", ws.join("source.fvec").to_string_lossy().to_string());
+    opts.set("dimension", "0");  // 0 = auto-detect from file
+
+    let registry = veks_pipeline::pipeline::registry::CommandRegistry::with_builtins();
+    let mut cmd = registry.get("analyze histogram").unwrap()();
+    let mut ctx = test_ctx(ws);
+    let r = cmd.execute(&opts, &mut ctx);
+    assert_eq!(r.status, Status::Ok, "histogram: {}", r.message);
+}

@@ -80,6 +80,16 @@ pub struct ImportArgs {
     /// instead of `profiles/base/` and `profiles/default/`. Simpler layout
     /// compatible with ann-benchmarks tooling.
     pub classic: bool,
+    /// Pipeline personality: "native" (default) or "knn_utils".
+    /// When "knn_utils", emit_steps generates BLAS/numpy-compatible
+    /// commands (sort-knnutils, shuffle-knnutils, normalize-knnutils,
+    /// knn-blas) instead of the native SimSIMD-based commands.
+    #[serde(default = "default_personality")]
+    pub personality: String,
+}
+
+fn default_personality() -> String {
+    "native".to_string()
 }
 
 impl ImportArgs {
@@ -534,6 +544,38 @@ impl Default for Step {
     }
 }
 
+/// Command name mapping for the knn_utils personality.
+///
+/// Returns the knn_utils-compatible command name when personality is
+/// "knn_utils", otherwise returns the native command name.
+fn cmd_sort(personality: &str) -> &'static str {
+    match personality {
+        "knn_utils" => "compute sort-knnutils",
+        _ => "compute sort",
+    }
+}
+
+fn cmd_shuffle(personality: &str) -> &'static str {
+    match personality {
+        "knn_utils" => "generate shuffle-knnutils",
+        _ => "generate shuffle",
+    }
+}
+
+fn cmd_knn(personality: &str) -> &'static str {
+    match personality {
+        "knn_utils" => "compute knn-blas",
+        _ => "compute knn",
+    }
+}
+
+fn cmd_verify_knn(personality: &str) -> &'static str {
+    match personality {
+        "knn_utils" => "verify dataset-knnutils",
+        _ => "verify knn-consolidated",
+    }
+}
+
 /// Walk the resolved slots and emit pipeline steps for materialized slots.
 fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path::Path) -> Vec<Step> {
     let mut steps = Vec::new();
@@ -741,7 +783,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
     if let Artifact::Materialized { .. } = &slots.prepare {
         steps.push(Step {
             id: "prepare-vectors".into(),
-            run: "compute sort".into(),
+            run: cmd_sort(&args.personality).into(),
             description: Some("Sort and deduplicate vectors".into()),
             after: if last_vector_step.is_empty() { vec![] } else { vec![last_vector_step.into()] },
             per_profile: false,
@@ -814,7 +856,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
             }
             steps.push(Step {
                 id: "generate-shuffle".into(),
-                run: "generate shuffle".into(),
+                run: cmd_shuffle(&args.personality).into(),
                 description: Some("Reproducible random permutation of base vector order".into()),
                 after: shuffle_after,
                 per_profile: false,
@@ -1193,7 +1235,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
 
             steps.push(Step {
                 id: "compute-knn".into(),
-                run: "compute knn".into(),
+                run: cmd_knn(&args.personality).into(),
                 description: Some("Compute brute-force exact KNN ground truth".into()),
                 after,
                 per_profile: true,
@@ -1281,7 +1323,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
         }
         steps.push(Step {
             id: "verify-knn".into(),
-            run: "verify knn-consolidated".into(),
+            run: cmd_verify_knn(&args.personality).into(),
             description: Some("Multi-threaded single-pass KNN verification across all profiles".into()),
             after: verify_after,
             per_profile: false, // NOT per-profile — one step verifies all
@@ -1534,6 +1576,9 @@ fn generate_yaml(
 
     // Attributes
     out.push_str("\nattributes:\n");
+    if args.personality != "native" {
+        out.push_str(&format!("  personality: {}\n", args.personality));
+    }
     out.push_str(&format!("  distance_function: {}\n", args.metric));
     // is_normalized, is_duplicate_vector_free, and is_zero_vector_free
     // are set by the pipeline after the relevant steps complete — not
@@ -2411,6 +2456,7 @@ mod tests {
             pedantic_dedup: false,
             selectivity: 0.0001,
             classic: false,
+            personality: "native".to_string(),
         }
     }
 
@@ -2619,5 +2665,40 @@ mod tests {
         let target = Path::new("/a/b");
         let rel = relative_path(base, target);
         assert_eq!(rel, PathBuf::from("."));
+    }
+
+    #[test]
+    fn personality_native_uses_native_commands() {
+        let mut args = default_args();
+        args.personality = "native".into();
+        args.base_vectors = Some(PathBuf::from("/fake/base.fvec"));
+        args.self_search = true;
+        args.normalize = true;
+        let slots = resolve_slots(&args);
+        let steps = emit_steps(&slots, &args, Path::new("/tmp"));
+        let runs: Vec<&str> = steps.iter().map(|s| s.run.as_str()).collect();
+        assert!(runs.contains(&"compute sort"), "native should use 'compute sort': {:?}", runs);
+        assert!(runs.contains(&"generate shuffle"), "native should use 'generate shuffle': {:?}", runs);
+        assert!(runs.contains(&"compute knn"), "native should use 'compute knn': {:?}", runs);
+    }
+
+    #[test]
+    fn personality_knnutils_uses_knnutils_commands() {
+        let mut args = default_args();
+        args.personality = "knn_utils".into();
+        args.base_vectors = Some(PathBuf::from("/fake/base.fvec"));
+        args.self_search = true;
+        args.normalize = true;
+        let slots = resolve_slots(&args);
+        let steps = emit_steps(&slots, &args, Path::new("/tmp"));
+        let runs: Vec<&str> = steps.iter().map(|s| s.run.as_str()).collect();
+        assert!(runs.contains(&"compute sort-knnutils"),
+            "knn_utils personality should use 'compute sort-knnutils': {:?}", runs);
+        assert!(runs.contains(&"generate shuffle-knnutils"),
+            "knn_utils personality should use 'generate shuffle-knnutils': {:?}", runs);
+        assert!(runs.contains(&"compute knn-blas"),
+            "knn_utils personality should use 'compute knn-blas': {:?}", runs);
+        assert!(runs.contains(&"verify dataset-knnutils"),
+            "knn_utils personality should use 'verify dataset-knnutils': {:?}", runs);
     }
 }

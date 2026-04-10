@@ -173,6 +173,13 @@ pub enum PrepareCommand {
         #[arg(long)]
         classic: bool,
 
+        /// Pipeline personality: selects alternative command implementations.
+        /// "native" (default) uses SimSIMD-based pipeline commands.
+        /// "knn_utils" uses BLAS/numpy-compatible commands that produce
+        /// byte-identical results to the knn_utils Python pipeline.
+        #[arg(long, default_value = "native")]
+        personality: String,
+
         /// Explicit source files to consider (repeatable). When provided,
         /// directory scanning is skipped and only these files are used
         /// for role detection.
@@ -403,6 +410,7 @@ pub fn run(args: PrepareArgs) {
             ground_truth_distances, metric, neighbors, seed, description,
             no_dedup, no_zero_check, no_filtered, normalize, no_normalize, force, reset, clean, recursive,
             base_fraction, required_facets, provided_facets, round_digits, pedantic_dedup, auto, classic, sources,
+            personality,
         } => {
             // Handle --clean: reset all generated artifacts.
             // If other flags indicate re-bootstrapping (--overwrite, -i, --reset,
@@ -682,6 +690,7 @@ pub fn run(args: PrepareArgs) {
                         pedantic_dedup,
                         selectivity: 0.0001,
                         classic,
+                        personality: personality.clone(),
                     });
                     check_and_restore(&out);
                 }
@@ -742,6 +751,7 @@ pub fn run(args: PrepareArgs) {
                     pedantic_dedup,
                     selectivity: 0.0001,
                     classic,
+                    personality: personality.clone(),
                 });
             }
         }

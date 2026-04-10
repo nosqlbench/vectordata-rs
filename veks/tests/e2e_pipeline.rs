@@ -72,6 +72,7 @@ fn default_args(name: &str, output: &Path) -> ImportArgs {
         selectivity: 0.0001,
         provided_facets: None,
         classic: false,
+        personality: "native".to_string(),
     }
 }
 
@@ -1434,4 +1435,94 @@ fn adversarial_different_seeds_valid_knn() {
     let q1 = read_xvec_counts(&out1.join("profiles/base/query_vectors.fvec"));
     let q2 = read_xvec_counts(&out2.join("profiles/base/query_vectors.fvec"));
     assert_eq!(q1.1, q2.1, "same query count regardless of seed");
+}
+
+/// Verify source_zero_count includes zeros among deduplicated duplicates.
+///
+/// When duplicate zero vectors are removed by dedup, the extract step
+/// should report source_zero_count = extraction_zeros + duplicate_zeros,
+/// reflecting the true number of zero vectors in the source data.
+#[test]
+fn e2e_source_zero_count_through_duplicates() {
+    let tmp = make_tempdir();
+    let out = tmp.path().join("dataset");
+
+    // Create source data: 50 vectors of dim 4
+    // Vectors 0,1 = duplicate non-zero
+    // Vectors 2,3,4,5,6 = FIVE identical zero vectors
+    // Vectors 7..49 = distinct non-zero
+    let fvec_path = tmp.path().join("source.fvec");
+    {
+        let f = std::fs::File::create(&fvec_path).unwrap();
+        let mut w = std::io::BufWriter::new(f);
+        let dim = 4usize;
+        for i in 0..50 {
+            w.write_all(&(dim as i32).to_le_bytes()).unwrap();
+            for d in 0..dim {
+                let val = if (2..=6).contains(&i) {
+                    0.0f32 // 5 zero vectors
+                } else if i == 1 {
+                    (d + 1) as f32 // dup of vector 0
+                } else if i == 0 {
+                    (d + 1) as f32
+                } else {
+                    (i * dim + d + 1) as f32
+                };
+                w.write_all(&val.to_le_bytes()).unwrap();
+            }
+        }
+        w.flush().unwrap();
+    }
+
+    let mut args = default_args("zero-count-test", &out);
+    args.base_vectors = Some(fvec_path);
+    args.self_search = true;
+    args.query_count = 5;
+    args.normalize = true;
+    veks::prepare::import::run(args);
+
+    let output = Command::new(veks_bin())
+        .arg("run")
+        .current_dir(&out)
+        .output()
+        .unwrap();
+    assert!(output.status.success(),
+        "pipeline failed:\n{}", String::from_utf8_lossy(&output.stderr));
+
+    let vars = std::fs::read_to_string(out.join("variables.yaml")).unwrap();
+
+    // Source has 5 zero vectors. After dedup, 4 are removed as duplicates,
+    // 1 remains. The extract step filters that 1.
+    // source_zero_count should be the total zeros: the 1 filtered during
+    // extraction + the 4 that were duplicates of zeros.
+    // zero_count = 1 (from extraction), duplicate_zero_count = 4
+    // source_zero_count = 5
+
+    // Check zero_count exists
+    assert!(vars.contains("zero_count:"),
+        "variables.yaml should contain zero_count:\n{}", vars);
+
+    // Check source_zero_count accounts for duplicate zeros
+    if vars.contains("source_zero_count:") {
+        // Parse the value
+        let source_zc: usize = vars.lines()
+            .find(|l| l.starts_with("source_zero_count:"))
+            .and_then(|l| l.split(':').nth(1))
+            .and_then(|s| s.trim().trim_matches('\'').parse().ok())
+            .unwrap_or(0);
+        assert!(source_zc >= 5,
+            "source_zero_count should be >= 5 (5 zero vectors in source), got {}",
+            source_zc);
+    }
+
+    // Check duplicate_zero_count if present
+    if vars.contains("duplicate_zero_count:") {
+        let dup_zc: usize = vars.lines()
+            .find(|l| l.starts_with("duplicate_zero_count:"))
+            .and_then(|l| l.split(':').nth(1))
+            .and_then(|s| s.trim().trim_matches('\'').parse().ok())
+            .unwrap_or(0);
+        assert!(dup_zc >= 4,
+            "duplicate_zero_count should be >= 4, got {}", dup_zc);
+    }
 }

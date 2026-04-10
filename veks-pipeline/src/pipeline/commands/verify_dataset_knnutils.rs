@@ -40,6 +40,7 @@ use std::io::Write;
 use std::path::Path;
 use std::time::Instant;
 
+#[cfg(feature = "faiss")]
 use faiss::Index;
 
 use vectordata::VectorReader;
@@ -505,9 +506,9 @@ checks, in a single pipeline step.
         // ── KNN Accuracy (replicates validate_knn_utils.py) ─────────────
         emit(ctx, "--- KNN Accuracy Check ---");
 
-        let faiss_mt = match metric_str.to_uppercase().as_str() {
-            "IP" | "DOT_PRODUCT" | "COSINE" => faiss::MetricType::InnerProduct,
-            "L2" => faiss::MetricType::L2,
+        let faiss_mt_is_ip = match metric_str.to_uppercase().as_str() {
+            "IP" | "DOT_PRODUCT" | "COSINE" => true,
+            "L2" => false,
             other => {
                 emit(ctx, &format!("  SKIP: unsupported metric '{}' for accuracy check", other));
                 emit(ctx, "");
@@ -538,7 +539,7 @@ checks, in a single pipeline step.
         emit(ctx, &format!("  Sampling {} of {} queries, metric={}, k={}",
             actual_sample, query_result.count, metric_str, k));
 
-        // Build FAISS index from base vectors
+        // Recompute KNN for sampled queries using BLAS sgemm
         let base_reader = MmapVectorReader::<f32>::open_fvec(&base_path)
             .map_err(|e| format!("reopen base: {}", e));
         let base_reader = match base_reader {
@@ -558,49 +559,63 @@ checks, in a single pipeline step.
             Err(e) => return error_result(e, start),
         };
 
-        let d = base_result.dim as u32;
+        let dim = base_result.dim;
 
-        // Load all base vectors into FAISS index
-        emit(ctx, "  Building FAISS index...");
-        let mut base_data: Vec<f32> = Vec::with_capacity(base_result.count * base_result.dim);
+        // Load all base vectors
+        emit(ctx, "  Loading base vectors for verification...");
+        let mut base_data: Vec<f32> = Vec::with_capacity(base_result.count * dim);
         for i in 0..base_result.count {
             base_data.extend_from_slice(base_reader.get_slice(i));
         }
 
-        let mut index = match faiss::index::flat::FlatIndex::new(d, faiss_mt) {
-            Ok(idx) => idx,
-            Err(e) => return error_result(format!("FAISS index creation: {}", e), start),
-        };
-        if let Err(e) = index.add(&base_data) {
-            return error_result(format!("FAISS index.add: {}", e), start);
-        }
-
-        // Generate deterministic sample indices (matching seed=42 convention)
+        // Generate deterministic sample indices
         let mut sample_indices: Vec<usize> = Vec::with_capacity(actual_sample);
         if actual_sample >= query_result.count {
             sample_indices.extend(0..query_result.count);
         } else {
-            // Evenly spaced sample
             let step = query_result.count as f64 / actual_sample as f64;
             for i in 0..actual_sample {
                 sample_indices.push((i as f64 * step) as usize);
             }
         }
 
-        // Batch all sampled queries into a single contiguous buffer and
-        // search in one call. This matches the code path used by
-        // compute knn-faiss (which also does a single batched search),
-        // ensuring FAISS uses the same sgemm code path and produces
-        // identical floating-point results.
-        let mut sample_query_data: Vec<f32> = Vec::with_capacity(actual_sample * base_result.dim);
+        // Load sampled queries
+        let mut sample_query_data: Vec<f32> = Vec::with_capacity(actual_sample * dim);
         for &qi in &sample_indices {
             sample_query_data.extend_from_slice(query_reader.get_slice(qi));
         }
 
-        let batch_result = match index.search(&sample_query_data, k) {
-            Ok(r) => r,
-            Err(e) => return error_result(format!("FAISS batch search failed: {}", e), start),
-        };
+        // Compute scores via BLAS sgemm: scores = queries @ base.T
+        let use_ip = faiss_mt_is_ip;
+        let n_base = base_result.count;
+        let mut scores: Vec<f32> = vec![0.0f32; actual_sample * n_base];
+
+        unsafe {
+            super::compute_knn_blas::blas_sgemm_scores(
+                &sample_query_data, actual_sample,
+                &base_data, n_base,
+                dim, use_ip,
+                &mut scores,
+            );
+        }
+
+        // Top-k selection for each query
+        struct VerifyResult {
+            labels: Vec<i32>,  // flattened [actual_sample * k]
+        }
+        let mut labels = Vec::with_capacity(actual_sample * k);
+        for qi in 0..actual_sample {
+            let row = &scores[qi * n_base..(qi + 1) * n_base];
+            let topk = super::compute_knn_blas::topk_indices(row, k);
+            for j in 0..k {
+                if j < topk.len() {
+                    labels.push(topk[j].index as i32);
+                } else {
+                    labels.push(-1);
+                }
+            }
+        }
+        let batch_result = VerifyResult { labels };
 
         // Compare each sampled query's result against ground truth.
         //
@@ -619,27 +634,26 @@ checks, in a single pipeline step.
         let boundary_threshold = 5;
 
         for (si, &qi) in sample_indices.iter().enumerate() {
-            let faiss_neighbors: HashSet<i32> = batch_result.labels[si * k..(si + 1) * k]
+            let recomputed_neighbors: HashSet<i32> = batch_result.labels[si * k..(si + 1) * k]
                 .iter()
-                .filter_map(|idx| idx.get().map(|v| v as i32))
+                .cloned()
+                .filter(|&v| v >= 0)
                 .collect();
 
             let gt_row = gt_reader.get_slice(qi);
             let gt_neighbors: HashSet<i32> = gt_row.iter().cloned().filter(|&v| v >= 0).collect();
 
-            if faiss_neighbors == gt_neighbors {
-                let faiss_ordered: Vec<i32> = batch_result.labels[si * k..(si + 1) * k]
-                    .iter()
-                    .filter_map(|idx| idx.get().map(|v| v as i32))
-                    .collect();
+            if recomputed_neighbors == gt_neighbors {
+                let recomputed_ordered: Vec<i32> = batch_result.labels[si * k..(si + 1) * k]
+                    .to_vec();
                 let gt_ordered: Vec<i32> = gt_row.iter().cloned().collect();
-                if faiss_ordered == gt_ordered {
+                if recomputed_ordered == gt_ordered {
                     exact_match += 1;
                 } else {
                     set_match += 1;
                 }
             } else {
-                let diff_count = gt_neighbors.symmetric_difference(&faiss_neighbors).count() / 2;
+                let diff_count = gt_neighbors.symmetric_difference(&recomputed_neighbors).count() / 2;
                 if diff_count <= boundary_threshold {
                     boundary_mismatch += 1;
                 } else {
@@ -716,5 +730,211 @@ checks, in a single pipeline step.
             &["base", "query", "indices"],
             &["report"],
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pipeline::command::{Options, Status, StreamContext};
+    use crate::pipeline::progress::ProgressLog;
+    use indexmap::IndexMap;
+
+    fn make_ctx(workspace: &std::path::Path) -> StreamContext {
+        StreamContext {
+            dataset_name: String::new(),
+            profile: String::new(),
+            profile_names: vec![],
+            workspace: workspace.to_path_buf(),
+            scratch: workspace.join(".scratch"),
+            cache: workspace.join(".cache"),
+            defaults: IndexMap::new(),
+            dry_run: false,
+            progress: ProgressLog::new(),
+            threads: 1,
+            step_id: String::new(),
+            governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
+            ui: veks_core::ui::UiHandle::new(std::sync::Arc::new(veks_core::ui::TestSink::new())),
+            status_interval: std::time::Duration::from_secs(1),
+            estimated_total_steps: 0,
+        }
+    }
+
+    fn write_fvec(path: &std::path::Path, vectors: &[Vec<f32>]) {
+        use std::io::Write;
+        let mut f = std::fs::File::create(path).unwrap();
+        for v in vectors {
+            let dim = v.len() as i32;
+            f.write_all(&dim.to_le_bytes()).unwrap();
+            for &val in v { f.write_all(&val.to_le_bytes()).unwrap(); }
+        }
+    }
+
+    fn write_ivec(path: &std::path::Path, rows: &[Vec<i32>]) {
+        use std::io::Write;
+        let mut f = std::fs::File::create(path).unwrap();
+        for row in rows {
+            let k = row.len() as i32;
+            f.write_all(&k.to_le_bytes()).unwrap();
+            for &val in row { f.write_all(&val.to_le_bytes()).unwrap(); }
+        }
+    }
+
+    /// Build a valid small dataset and verify it passes all checks.
+    #[test]
+    fn test_verify_valid_dataset() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = make_ctx(tmp.path());
+        let _ = std::fs::create_dir_all(tmp.path().join(".cache"));
+
+        // 5 base vectors, 2 queries, dim=3, k=2 — all unit-normalized
+        let s2 = 1.0f32 / 2.0f32.sqrt();
+        let s3 = 1.0f32 / 3.0f32.sqrt();
+        let base = vec![
+            vec![1.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0],
+            vec![0.0, 0.0, 1.0],
+            vec![s2, s2, 0.0],
+            vec![s3, s3, s3],
+        ];
+        let q_norm = (0.81f32 + 0.01).sqrt();
+        let query = vec![
+            vec![0.9 / q_norm, 0.1 / q_norm, 0.0],
+            vec![0.0, 0.0, 1.0],
+        ];
+        write_fvec(&tmp.path().join("base.fvec"), &base);
+        write_fvec(&tmp.path().join("query.fvec"), &query);
+
+        // Compute GT via BLAS sgemm
+        let mut knn_opts = Options::new();
+        knn_opts.set("base", tmp.path().join("base.fvec").to_string_lossy().to_string());
+        knn_opts.set("query", tmp.path().join("query.fvec").to_string_lossy().to_string());
+        knn_opts.set("indices", tmp.path().join("gt.ivec").to_string_lossy().to_string());
+        knn_opts.set("neighbors", "2");
+        knn_opts.set("metric", "IP");
+        let mut knn = crate::pipeline::commands::compute_knn_blas::ComputeKnnBlasOp;
+        let r = knn.execute(&knn_opts, &mut ctx);
+        assert_eq!(r.status, Status::Ok);
+
+        // Now verify
+        let mut opts = Options::new();
+        opts.set("base", tmp.path().join("base.fvec").to_string_lossy().to_string());
+        opts.set("query", tmp.path().join("query.fvec").to_string_lossy().to_string());
+        opts.set("indices", tmp.path().join("gt.ivec").to_string_lossy().to_string());
+        opts.set("neighbors", "2");
+        opts.set("metric", "IP");
+        opts.set("sample", "2");
+
+        let mut op = VerifyDatasetKnnUtilsOp;
+        let r = op.execute(&opts, &mut ctx);
+        assert_eq!(r.status, Status::Ok,
+            "valid dataset should pass verification: {}", r.message);
+    }
+
+    /// Dimension mismatch between base and query should fail.
+    #[test]
+    fn test_verify_dimension_mismatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = make_ctx(tmp.path());
+        let _ = std::fs::create_dir_all(tmp.path().join(".cache"));
+
+        write_fvec(&tmp.path().join("base.fvec"), &[vec![1.0, 2.0, 3.0]]);
+        write_fvec(&tmp.path().join("query.fvec"), &[vec![1.0, 2.0]]);
+        write_ivec(&tmp.path().join("gt.ivec"), &[vec![0]]);
+
+        let mut opts = Options::new();
+        opts.set("base", tmp.path().join("base.fvec").to_string_lossy().to_string());
+        opts.set("query", tmp.path().join("query.fvec").to_string_lossy().to_string());
+        opts.set("indices", tmp.path().join("gt.ivec").to_string_lossy().to_string());
+        opts.set("neighbors", "1");
+        opts.set("metric", "IP");
+        opts.set("sample", "0");
+
+        let mut op = VerifyDatasetKnnUtilsOp;
+        let r = op.execute(&opts, &mut ctx);
+        // The verify command should detect dimension mismatch and report FAIL
+        assert_eq!(r.status, Status::Error,
+            "dimension mismatch should fail: {}", r.message);
+    }
+
+    /// GT with duplicate ordinals should be detected.
+    #[test]
+    fn test_verify_detects_duplicate_ordinals() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = make_ctx(tmp.path());
+        let _ = std::fs::create_dir_all(tmp.path().join(".cache"));
+
+        write_fvec(&tmp.path().join("base.fvec"), &[vec![1.0, 0.0], vec![0.0, 1.0], vec![0.5, 0.5]]);
+        write_fvec(&tmp.path().join("query.fvec"), &[vec![0.9, 0.1]]);
+        // GT with duplicate: index 0 appears twice
+        write_ivec(&tmp.path().join("gt.ivec"), &[vec![0, 0, 1]]);
+
+        let mut opts = Options::new();
+        opts.set("base", tmp.path().join("base.fvec").to_string_lossy().to_string());
+        opts.set("query", tmp.path().join("query.fvec").to_string_lossy().to_string());
+        opts.set("indices", tmp.path().join("gt.ivec").to_string_lossy().to_string());
+        opts.set("neighbors", "3");
+        opts.set("metric", "IP");
+        opts.set("sample", "0");
+
+        let mut op = VerifyDatasetKnnUtilsOp;
+        let r = op.execute(&opts, &mut ctx);
+        assert_eq!(r.status, Status::Error,
+            "duplicate ordinals should fail: {}", r.message);
+        assert!(r.message.contains("ivecs:FAIL"),
+            "should report ivecs failure: {}", r.message);
+    }
+
+    /// GT with negative indices should be detected.
+    #[test]
+    fn test_verify_detects_negative_indices() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = make_ctx(tmp.path());
+        let _ = std::fs::create_dir_all(tmp.path().join(".cache"));
+
+        write_fvec(&tmp.path().join("base.fvec"), &[vec![1.0, 0.0], vec![0.0, 1.0]]);
+        write_fvec(&tmp.path().join("query.fvec"), &[vec![0.9, 0.1]]);
+        write_ivec(&tmp.path().join("gt.ivec"), &[vec![-1, 0]]);
+
+        let mut opts = Options::new();
+        opts.set("base", tmp.path().join("base.fvec").to_string_lossy().to_string());
+        opts.set("query", tmp.path().join("query.fvec").to_string_lossy().to_string());
+        opts.set("indices", tmp.path().join("gt.ivec").to_string_lossy().to_string());
+        opts.set("neighbors", "2");
+        opts.set("metric", "IP");
+        opts.set("sample", "0");
+
+        let mut op = VerifyDatasetKnnUtilsOp;
+        let r = op.execute(&opts, &mut ctx);
+        assert_eq!(r.status, Status::Error,
+            "negative indices should fail: {}", r.message);
+    }
+
+    /// Query count != GT row count should fail cross-file check.
+    #[test]
+    fn test_verify_count_mismatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = make_ctx(tmp.path());
+        let _ = std::fs::create_dir_all(tmp.path().join(".cache"));
+
+        write_fvec(&tmp.path().join("base.fvec"), &[vec![1.0, 0.0], vec![0.0, 1.0]]);
+        write_fvec(&tmp.path().join("query.fvec"), &[vec![0.9, 0.1], vec![0.1, 0.9]]);
+        // GT has 1 row but query has 2 vectors
+        write_ivec(&tmp.path().join("gt.ivec"), &[vec![0, 1]]);
+
+        let mut opts = Options::new();
+        opts.set("base", tmp.path().join("base.fvec").to_string_lossy().to_string());
+        opts.set("query", tmp.path().join("query.fvec").to_string_lossy().to_string());
+        opts.set("indices", tmp.path().join("gt.ivec").to_string_lossy().to_string());
+        opts.set("neighbors", "2");
+        opts.set("metric", "IP");
+        opts.set("sample", "0");
+
+        let mut op = VerifyDatasetKnnUtilsOp;
+        let r = op.execute(&opts, &mut ctx);
+        assert_eq!(r.status, Status::Error,
+            "count mismatch should fail: {}", r.message);
+        assert!(r.message.contains("cross:FAIL"),
+            "should report cross-file failure: {}", r.message);
     }
 }

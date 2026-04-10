@@ -59,14 +59,27 @@ detection are combined into a single sort pass (SRD §20). While each
 memory-sized segment is loaded for sorting, the pipeline normalizes
 vectors in-place (f64 precision) and detects near-zeros (L2 < 1×10⁻⁶)
 at negligible additional cost. This eliminates separate `find-zeros`,
-`filter-ordinals`, and `count-clean` steps from the DAG.
+`filter-ordinals`, and `count-clean` steps from the DAG. The
+`source_zero_count` variable accumulates zeros across both query and
+base extractions, including zeros among removed duplicates.
 
 **Query strategy selection.** Three strategies handle query vector
 provenance (SRD §20.8):
 1. Non-HDF5 B+Q → combine into single source, then sort/dedup/shuffle
-2. HDF5 B+Q → independent processing (base gets full sort; queries
-   get normalize + zero-filter only)
+2. HDF5-origin B+Q → independent processing (base gets full sort;
+   queries get normalize + zero-filter only). Note: HDF5 I/O has been
+   removed; HDF5 files must be pre-converted to fvec format. The
+   "HDF5 origin" strategy is detected by the filename containing
+   `.hdf5` or `.h5`, not by actual format probing.
 3. Non-HDF5 B only → self-search via shuffle split
+
+**Personality system.** The `--personality` flag on `veks prepare
+bootstrap` selects alternative command implementations. When set to
+`knn_utils`, the generated pipeline uses BLAS/numpy-compatible commands
+(`compute sort-knnutils`, `generate shuffle-knnutils`, `compute knn-blas`,
+`verify dataset-knnutils`) that produce byte-identical results to the
+knn\_utils Python pipeline. The default `native` personality uses
+SimSIMD-based commands.
 
 ---
 
@@ -270,7 +283,7 @@ all_vectors            → Identity (native fvec, symlinked)
 vector_count           → Materialized (state set)
 sort                   → Materialized (compute sort — lexicographic merge-sort + dup detection)
 zero_check             → Materialized (analyze zeros — binary search sorted index)
-clean_ordinals         → Materialized (transform ordinals — exclude dups + zeros)
+clean_count            → Materialized (state set — count sorted ordinals after dedup)
 clean_count            → Materialized (state set)
 shuffle                → Absent (Q not in facets)
 query chain            → Absent (Q not in facets)
@@ -292,9 +305,9 @@ convert_vectors        → Materialized (transform convert, npy → mvec, fracti
 vector_count           → Materialized (state set, counts converted subset)
 sort                   → Materialized (compute sort — lexicographic merge-sort + duplicate detection)
 zero_check             → Materialized (analyze zeros — binary search sorted index)
-clean_ordinals         → Materialized (transform ordinals — exclude dups + zeros)
+clean_count            → Materialized (state set — count sorted ordinals after dedup)
 clean_count            → Materialized (state set)
-shuffle                → Materialized (generate shuffle, reads clean_ordinals for actual ordinals)
+shuffle                → Materialized (generate shuffle, reads sorted_ordinals for actual ordinals)
 extract_query          → Materialized (transform extract [0, query_count) via shuffle)
 extract_base           → Materialized (transform extract [query_count, clean_count) via shuffle)
 base_count             → Materialized (state set)
@@ -324,7 +337,7 @@ all_vectors            → Identity (native fvec, symlinked)
 vector_count           → Materialized (state set)
 sort                   → Materialized (compute sort — lexicographic merge-sort + dup detection)
 zero_check             → Materialized (analyze zeros — binary search sorted index)
-clean_ordinals         → Materialized (transform ordinals)
+clean_count            → Materialized (state set — count sorted ordinals)
 clean_count            → Materialized (state set)
 shuffle                → Identity (separate query file, no self-search)
 query_vectors          → Identity (native xvec, symlinked)
@@ -370,9 +383,9 @@ use a typed `Option` model in the generator:
 struct PipelineSlots {
     // Required (when B facet active)
     all_vectors: Artifact,
-    sort: Artifact,             // compute sort → sorted ordinals + duplicates
-    zero_check: Artifact,       // analyze zeros → zero ordinals
-    clean_ordinals: Artifact,   // transform ordinals (exclude dups + zeros)
+    prepare: Artifact,          // compute sort → sorted ordinals + duplicates
+    //                          // (zero detection happens during extraction, not as
+    //                          //  a separate step; clean_ordinals was removed)
     vector_count: Artifact,     // state set on all_vectors
 
     // Query axis (None → no KNN, no filtered-KNN)
@@ -450,7 +463,7 @@ fn emit_pipeline(slots: &PipelineSlots, args: &ImportArgs) -> Vec<StepDef> {
     if let Materialized { .. } = slots.zero_check {
         steps.push(/* binary search sorted index for zero vector */);
     }
-    if let Materialized { .. } = slots.clean_ordinals {
+    if let Materialized { .. } = slots.prepare {
         steps.push(/* transform clean-ordinals — exclude dups + zeros */);
     }
     steps.push(/* set-clean-count — always */);
@@ -898,7 +911,7 @@ eligibility rules and never touch random-access files.
 - `all_vectors.mvec` — random access by ordinal
 - `shuffle.ivec` — random access by index
 - `dedup_ordinals.ivec` — binary search
-- `clean_ordinals.ivec` — random access
+- `sorted_ordinals.ivec` — random access (dedup output, used by shuffle)
 - Any final output file referenced by profile views
 
 ### Cache key strategy and data fingerprinting
@@ -948,7 +961,7 @@ Resolved artifact paths follow the workspace layout (§5.7):
 | Duplicate ordinals | `${cache}/dedup_duplicates.ivec` | cache |
 | Dedup report | `${cache}/dedup_report.json` | cache |
 | Zero ordinals | `${cache}/zero_ordinals.ivec` | cache |
-| Clean ordinals | `${cache}/clean_ordinals.ivec` | cache |
+| Sorted ordinals | `${cache}/sorted_ordinals.ivec` | cache |
 | Dedup sorted runs | `${cache}/dedup_runs/` | cache |
 | Shuffle permutation | `${cache}/shuffle.ivec` | cache |
 | Imported metadata | `${cache}/metadata_all.slab` | cache |

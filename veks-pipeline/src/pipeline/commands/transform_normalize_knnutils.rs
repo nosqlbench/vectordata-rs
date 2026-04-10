@@ -186,3 +186,117 @@ print(f'{{n}} {{zero_count}}')
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pipeline::command::{Options, Status, StreamContext};
+    use crate::pipeline::progress::ProgressLog;
+    use indexmap::IndexMap;
+    use vectordata::VectorReader;
+    use vectordata::io::MmapVectorReader;
+
+    fn make_ctx(workspace: &std::path::Path) -> StreamContext {
+        StreamContext {
+            dataset_name: String::new(),
+            profile: String::new(),
+            profile_names: vec![],
+            workspace: workspace.to_path_buf(),
+            scratch: workspace.join(".scratch"),
+            cache: workspace.join(".cache"),
+            defaults: IndexMap::new(),
+            dry_run: false,
+            progress: ProgressLog::new(),
+            threads: 1,
+            step_id: String::new(),
+            governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
+            ui: veks_core::ui::UiHandle::new(std::sync::Arc::new(veks_core::ui::TestSink::new())),
+            status_interval: std::time::Duration::from_secs(1),
+            estimated_total_steps: 0,
+        }
+    }
+
+    fn write_fvec(path: &std::path::Path, vectors: &[Vec<f32>]) {
+        use std::io::Write;
+        let mut f = std::fs::File::create(path).unwrap();
+        for v in vectors {
+            let dim = v.len() as i32;
+            f.write_all(&dim.to_le_bytes()).unwrap();
+            for &val in v { f.write_all(&val.to_le_bytes()).unwrap(); }
+        }
+    }
+
+    /// Normalize non-zero vectors, zero vectors pass through.
+    #[test]
+    fn test_normalize_basic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = make_ctx(tmp.path());
+
+        let vectors = vec![
+            vec![3.0, 4.0],    // norm=5, normalized=[0.6, 0.8]
+            vec![0.0, 0.0],    // zero → pass through
+            vec![1.0, 0.0],    // norm=1, normalized=[1.0, 0.0]
+        ];
+        let src = tmp.path().join("source.fvec");
+        write_fvec(&src, &vectors);
+
+        let out = tmp.path().join("normed.fvec");
+        let mut opts = Options::new();
+        opts.set("source", src.to_string_lossy().to_string());
+        opts.set("output", out.to_string_lossy().to_string());
+
+        let mut op = TransformNormalizeKnnUtilsOp;
+        let r = op.execute(&opts, &mut ctx);
+        assert_eq!(r.status, Status::Ok);
+
+        let reader = MmapVectorReader::<f32>::open_fvec(&out).unwrap();
+        let count = <MmapVectorReader<f32> as VectorReader<f32>>::count(&reader);
+        assert_eq!(count, 3);
+
+        // [3,4] → [0.6, 0.8]
+        let v0 = reader.get_slice(0);
+        assert!((v0[0] - 0.6).abs() < 1e-6, "v0[0]={}", v0[0]);
+        assert!((v0[1] - 0.8).abs() < 1e-6, "v0[1]={}", v0[1]);
+
+        // [0,0] → [0,0] unchanged
+        let v1 = reader.get_slice(1);
+        assert_eq!(v1[0], 0.0);
+        assert_eq!(v1[1], 0.0);
+
+        // [1,0] → [1,0]
+        let v2 = reader.get_slice(2);
+        assert!((v2[0] - 1.0).abs() < 1e-6);
+        assert!((v2[1] - 0.0).abs() < 1e-6);
+    }
+
+    /// Output has same vector count as input.
+    #[test]
+    fn test_normalize_preserves_count() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = make_ctx(tmp.path());
+
+        let vectors: Vec<Vec<f32>> = (0..50).map(|i| vec![i as f32 + 1.0, 2.0, 3.0]).collect();
+        let src = tmp.path().join("source.fvec");
+        write_fvec(&src, &vectors);
+
+        let out = tmp.path().join("normed.fvec");
+        let mut opts = Options::new();
+        opts.set("source", src.to_string_lossy().to_string());
+        opts.set("output", out.to_string_lossy().to_string());
+
+        let mut op = TransformNormalizeKnnUtilsOp;
+        let r = op.execute(&opts, &mut ctx);
+        assert_eq!(r.status, Status::Ok);
+
+        let reader = MmapVectorReader::<f32>::open_fvec(&out).unwrap();
+        assert_eq!(<MmapVectorReader<f32> as VectorReader<f32>>::count(&reader), 50);
+
+        // All output vectors should have norm ≈ 1.0
+        for i in 0..50 {
+            let v = reader.get_slice(i);
+            let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            assert!((norm - 1.0).abs() < 1e-5,
+                "vector {} has norm {} (expected ~1.0)", i, norm);
+        }
+    }
+}

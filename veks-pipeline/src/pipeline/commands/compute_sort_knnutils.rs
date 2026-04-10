@@ -324,3 +324,226 @@ byte-identical shuffle results.
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pipeline::command::{Options, Status, StreamContext};
+    use crate::pipeline::progress::ProgressLog;
+    use indexmap::IndexMap;
+    use vectordata::VectorReader;
+    use vectordata::io::MmapVectorReader;
+
+    fn make_ctx(workspace: &std::path::Path) -> StreamContext {
+        StreamContext {
+            dataset_name: String::new(),
+            profile: String::new(),
+            profile_names: vec![],
+            workspace: workspace.to_path_buf(),
+            scratch: workspace.join(".scratch"),
+            cache: workspace.join(".cache"),
+            defaults: IndexMap::new(),
+            dry_run: false,
+            progress: ProgressLog::new(),
+            threads: 2,
+            step_id: String::new(),
+            governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
+            ui: veks_core::ui::UiHandle::new(std::sync::Arc::new(veks_core::ui::TestSink::new())),
+            status_interval: std::time::Duration::from_secs(1),
+            estimated_total_steps: 0,
+        }
+    }
+
+    fn write_fvec(path: &std::path::Path, vectors: &[Vec<f32>]) {
+        use std::io::Write;
+        let mut f = std::fs::File::create(path).unwrap();
+        for v in vectors {
+            let dim = v.len() as i32;
+            f.write_all(&dim.to_le_bytes()).unwrap();
+            for &val in v {
+                f.write_all(&val.to_le_bytes()).unwrap();
+            }
+        }
+    }
+
+    fn read_ivec_values(path: &std::path::Path) -> Vec<i32> {
+        let reader = MmapVectorReader::<i32>::open_ivec(path).unwrap();
+        let count = <MmapVectorReader<i32> as VectorReader<i32>>::count(&reader);
+        (0..count).map(|i| reader.get_slice(i)[0]).collect()
+    }
+
+    /// Basic sort: verifies vectors are output in lexicographic order.
+    #[test]
+    fn test_sort_lexicographic_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = make_ctx(tmp.path());
+
+        let vectors = vec![
+            vec![0.5, 0.1, 0.0],
+            vec![0.1, 0.9, 0.0],
+            vec![0.1, 0.2, 0.0],
+            vec![0.5, 0.0, 0.0],
+            vec![0.0, 0.0, 0.1],
+        ];
+        let fvec = tmp.path().join("source.fvec");
+        write_fvec(&fvec, &vectors);
+
+        let out = tmp.path().join("sorted.ivec");
+        let dups = tmp.path().join("dups.ivec");
+        let mut opts = Options::new();
+        opts.set("source", fvec.to_string_lossy().to_string());
+        opts.set("output", out.to_string_lossy().to_string());
+        opts.set("duplicates", dups.to_string_lossy().to_string());
+
+        let mut op = ComputeSortKnnUtilsOp;
+        let r = op.execute(&opts, &mut ctx);
+        assert_eq!(r.status, Status::Ok);
+
+        let ordinals = read_ivec_values(&out);
+        // Expected lexicographic order:
+        // [0.0, 0.0, 0.1] < [0.1, 0.2, 0.0] < [0.1, 0.9, 0.0] < [0.5, 0.0, 0.0] < [0.5, 0.1, 0.0]
+        // Indices: 4, 2, 1, 3, 0
+        assert_eq!(ordinals, vec![4, 2, 1, 3, 0],
+            "ordinals should be in lexicographic order of vectors");
+
+        let dup_ordinals = read_ivec_values(&dups);
+        assert_eq!(dup_ordinals.len(), 0, "no duplicates expected");
+    }
+
+    /// Dedup: exact duplicate vectors are removed.
+    #[test]
+    fn test_sort_removes_duplicates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = make_ctx(tmp.path());
+
+        let vectors = vec![
+            vec![1.0, 2.0],
+            vec![3.0, 4.0],
+            vec![1.0, 2.0],  // dup of 0
+            vec![5.0, 6.0],
+            vec![3.0, 4.0],  // dup of 1
+        ];
+        let fvec = tmp.path().join("source.fvec");
+        write_fvec(&fvec, &vectors);
+
+        let out = tmp.path().join("sorted.ivec");
+        let dups = tmp.path().join("dups.ivec");
+        let mut opts = Options::new();
+        opts.set("source", fvec.to_string_lossy().to_string());
+        opts.set("output", out.to_string_lossy().to_string());
+        opts.set("duplicates", dups.to_string_lossy().to_string());
+
+        let mut op = ComputeSortKnnUtilsOp;
+        let r = op.execute(&opts, &mut ctx);
+        assert_eq!(r.status, Status::Ok);
+
+        let ordinals = read_ivec_values(&out);
+        assert_eq!(ordinals.len(), 3, "should have 3 unique vectors");
+
+        let dup_ordinals = read_ivec_values(&dups);
+        assert_eq!(dup_ordinals.len(), 2, "should have 2 duplicate vectors");
+
+        // Verify the sorted unique ordinals reference distinct vectors
+        let reader = MmapVectorReader::<f32>::open_fvec(&fvec).unwrap();
+        for i in 0..ordinals.len() - 1 {
+            let a = reader.get_slice(ordinals[i] as usize);
+            let b = reader.get_slice(ordinals[i + 1] as usize);
+            assert_ne!(a, b, "adjacent sorted vectors should be different");
+            // Verify lexicographic order
+            for d in 0..a.len() {
+                if a[d] < b[d] { break; }
+                if a[d] > b[d] { panic!("sort order violated at position {}", i); }
+            }
+        }
+    }
+
+    /// Adversarial: vectors that share long prefixes but differ in late
+    /// components. This is the case that the native prefix-based sort
+    /// may not order correctly within prefix groups.
+    #[test]
+    fn test_sort_long_shared_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = make_ctx(tmp.path());
+
+        // Vectors share first 20 components, differ only at position 20
+        let mut vectors = Vec::new();
+        for i in (0..5).rev() {
+            let mut v = vec![0.0f32; 25];
+            v[20] = i as f32 * 0.1;
+            vectors.push(v);
+        }
+        // vectors[0] has v[20]=0.4, vectors[1] has v[20]=0.3, ..., vectors[4] has v[20]=0.0
+
+        let fvec = tmp.path().join("source.fvec");
+        write_fvec(&fvec, &vectors);
+
+        let out = tmp.path().join("sorted.ivec");
+        let dups = tmp.path().join("dups.ivec");
+        let mut opts = Options::new();
+        opts.set("source", fvec.to_string_lossy().to_string());
+        opts.set("output", out.to_string_lossy().to_string());
+        opts.set("duplicates", dups.to_string_lossy().to_string());
+
+        let mut op = ComputeSortKnnUtilsOp;
+        let r = op.execute(&opts, &mut ctx);
+        assert_eq!(r.status, Status::Ok);
+
+        let ordinals = read_ivec_values(&out);
+        // Lexicographic order: component 20 determines order.
+        // 0.0 < 0.1 < 0.2 < 0.3 < 0.4 → indices 4, 3, 2, 1, 0
+        assert_eq!(ordinals, vec![4, 3, 2, 1, 0],
+            "should sort correctly on late-differing component");
+    }
+
+    /// Adversarial: single vector, no dedup needed.
+    #[test]
+    fn test_sort_single_vector() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = make_ctx(tmp.path());
+
+        let vectors = vec![vec![1.0, 2.0, 3.0]];
+        let fvec = tmp.path().join("source.fvec");
+        write_fvec(&fvec, &vectors);
+
+        let out = tmp.path().join("sorted.ivec");
+        let dups = tmp.path().join("dups.ivec");
+        let mut opts = Options::new();
+        opts.set("source", fvec.to_string_lossy().to_string());
+        opts.set("output", out.to_string_lossy().to_string());
+        opts.set("duplicates", dups.to_string_lossy().to_string());
+
+        let mut op = ComputeSortKnnUtilsOp;
+        let r = op.execute(&opts, &mut ctx);
+        assert_eq!(r.status, Status::Ok);
+
+        assert_eq!(read_ivec_values(&out), vec![0]);
+        assert_eq!(read_ivec_values(&dups).len(), 0);
+    }
+
+    /// Adversarial: all vectors identical → all but one are duplicates.
+    #[test]
+    fn test_sort_all_identical() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = make_ctx(tmp.path());
+
+        let vectors: Vec<Vec<f32>> = (0..10).map(|_| vec![1.0, 2.0]).collect();
+        let fvec = tmp.path().join("source.fvec");
+        write_fvec(&fvec, &vectors);
+
+        let out = tmp.path().join("sorted.ivec");
+        let dups = tmp.path().join("dups.ivec");
+        let mut opts = Options::new();
+        opts.set("source", fvec.to_string_lossy().to_string());
+        opts.set("output", out.to_string_lossy().to_string());
+        opts.set("duplicates", dups.to_string_lossy().to_string());
+
+        let mut op = ComputeSortKnnUtilsOp;
+        let r = op.execute(&opts, &mut ctx);
+        assert_eq!(r.status, Status::Ok);
+
+        let ordinals = read_ivec_values(&out);
+        assert_eq!(ordinals.len(), 1, "all identical → 1 unique");
+        let dup_ordinals = read_ivec_values(&dups);
+        assert_eq!(dup_ordinals.len(), 9, "9 duplicates");
+    }
+}

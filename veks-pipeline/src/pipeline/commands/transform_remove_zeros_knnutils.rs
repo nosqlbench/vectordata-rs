@@ -218,3 +218,155 @@ Norm is computed via BLAS `cblas_snrm2` (matching knn\_utils which uses
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pipeline::command::{Options, Status, StreamContext};
+    use crate::pipeline::progress::ProgressLog;
+    use indexmap::IndexMap;
+    use vectordata::VectorReader;
+    use vectordata::io::MmapVectorReader;
+
+    fn make_ctx(workspace: &std::path::Path) -> StreamContext {
+        StreamContext {
+            dataset_name: String::new(),
+            profile: String::new(),
+            profile_names: vec![],
+            workspace: workspace.to_path_buf(),
+            scratch: workspace.join(".scratch"),
+            cache: workspace.join(".cache"),
+            defaults: IndexMap::new(),
+            dry_run: false,
+            progress: ProgressLog::new(),
+            threads: 1,
+            step_id: String::new(),
+            governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
+            ui: veks_core::ui::UiHandle::new(std::sync::Arc::new(veks_core::ui::TestSink::new())),
+            status_interval: std::time::Duration::from_secs(1),
+            estimated_total_steps: 0,
+        }
+    }
+
+    fn write_fvec(path: &std::path::Path, vectors: &[Vec<f32>]) {
+        use std::io::Write;
+        let mut f = std::fs::File::create(path).unwrap();
+        for v in vectors {
+            let dim = v.len() as i32;
+            f.write_all(&dim.to_le_bytes()).unwrap();
+            for &val in v { f.write_all(&val.to_le_bytes()).unwrap(); }
+        }
+    }
+
+    /// Remove exact zeros (default tolerance=0.0).
+    #[test]
+    fn test_remove_exact_zeros() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = make_ctx(tmp.path());
+
+        let vectors = vec![
+            vec![1.0, 2.0, 3.0],
+            vec![0.0, 0.0, 0.0],  // zero
+            vec![4.0, 5.0, 6.0],
+            vec![0.0, 0.0, 0.0],  // zero
+            vec![7.0, 8.0, 9.0],
+        ];
+        let src = tmp.path().join("source.fvec");
+        write_fvec(&src, &vectors);
+
+        let out = tmp.path().join("clean.fvec");
+        let mut opts = Options::new();
+        opts.set("source", src.to_string_lossy().to_string());
+        opts.set("output", out.to_string_lossy().to_string());
+
+        let mut op = TransformRemoveZerosKnnUtilsOp;
+        let r = op.execute(&opts, &mut ctx);
+        assert_eq!(r.status, Status::Ok);
+
+        let reader = MmapVectorReader::<f32>::open_fvec(&out).unwrap();
+        assert_eq!(<MmapVectorReader<f32> as VectorReader<f32>>::count(&reader), 3);
+        assert_eq!(reader.get_slice(0), &[1.0, 2.0, 3.0]);
+        assert_eq!(reader.get_slice(1), &[4.0, 5.0, 6.0]);
+        assert_eq!(reader.get_slice(2), &[7.0, 8.0, 9.0]);
+    }
+
+    /// All-zero file → error (all removed, empty output).
+    #[test]
+    fn test_remove_zeros_all_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = make_ctx(tmp.path());
+
+        let vectors = vec![
+            vec![0.0, 0.0],
+            vec![0.0, 0.0],
+        ];
+        let src = tmp.path().join("source.fvec");
+        write_fvec(&src, &vectors);
+
+        let out = tmp.path().join("clean.fvec");
+        let mut opts = Options::new();
+        opts.set("source", src.to_string_lossy().to_string());
+        opts.set("output", out.to_string_lossy().to_string());
+
+        let mut op = TransformRemoveZerosKnnUtilsOp;
+        let r = op.execute(&opts, &mut ctx);
+        assert_eq!(r.status, Status::Ok);
+
+        let reader = MmapVectorReader::<f32>::open_fvec(&out).unwrap();
+        assert_eq!(<MmapVectorReader<f32> as VectorReader<f32>>::count(&reader), 0);
+    }
+
+    /// No zeros → output identical to input.
+    #[test]
+    fn test_remove_zeros_none_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = make_ctx(tmp.path());
+
+        let vectors = vec![
+            vec![1.0, 0.0],
+            vec![0.0, 1.0],
+        ];
+        let src = tmp.path().join("source.fvec");
+        write_fvec(&src, &vectors);
+
+        let out = tmp.path().join("clean.fvec");
+        let mut opts = Options::new();
+        opts.set("source", src.to_string_lossy().to_string());
+        opts.set("output", out.to_string_lossy().to_string());
+
+        let mut op = TransformRemoveZerosKnnUtilsOp;
+        let r = op.execute(&opts, &mut ctx);
+        assert_eq!(r.status, Status::Ok);
+
+        let reader = MmapVectorReader::<f32>::open_fvec(&out).unwrap();
+        assert_eq!(<MmapVectorReader<f32> as VectorReader<f32>>::count(&reader), 2);
+    }
+
+    /// Custom tolerance removes near-zero vectors.
+    #[test]
+    fn test_remove_zeros_with_tolerance() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = make_ctx(tmp.path());
+
+        let vectors = vec![
+            vec![1.0, 2.0],
+            vec![0.0001, 0.0001],  // norm ≈ 0.00014, below 0.001
+            vec![3.0, 4.0],
+        ];
+        let src = tmp.path().join("source.fvec");
+        write_fvec(&src, &vectors);
+
+        let out = tmp.path().join("clean.fvec");
+        let mut opts = Options::new();
+        opts.set("source", src.to_string_lossy().to_string());
+        opts.set("output", out.to_string_lossy().to_string());
+        opts.set("tolerance", "0.001");
+
+        let mut op = TransformRemoveZerosKnnUtilsOp;
+        let r = op.execute(&opts, &mut ctx);
+        assert_eq!(r.status, Status::Ok);
+
+        let reader = MmapVectorReader::<f32>::open_fvec(&out).unwrap();
+        assert_eq!(<MmapVectorReader<f32> as VectorReader<f32>>::count(&reader), 2);
+    }
+}

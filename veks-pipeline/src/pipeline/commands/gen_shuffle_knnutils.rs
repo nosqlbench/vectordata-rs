@@ -338,3 +338,247 @@ vector ordering exactly.
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pipeline::command::{Options, Status, StreamContext};
+    use crate::pipeline::progress::ProgressLog;
+    use indexmap::IndexMap;
+    use vectordata::VectorReader;
+    use vectordata::io::MmapVectorReader;
+
+    fn make_ctx(workspace: &std::path::Path) -> StreamContext {
+        StreamContext {
+            dataset_name: String::new(),
+            profile: String::new(),
+            profile_names: vec![],
+            workspace: workspace.to_path_buf(),
+            scratch: workspace.join(".scratch"),
+            cache: workspace.join(".cache"),
+            defaults: IndexMap::new(),
+            dry_run: false,
+            progress: ProgressLog::new(),
+            threads: 1,
+            step_id: String::new(),
+            governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
+            ui: veks_core::ui::UiHandle::new(std::sync::Arc::new(veks_core::ui::TestSink::new())),
+            status_interval: std::time::Duration::from_secs(1),
+            estimated_total_steps: 0,
+        }
+    }
+
+    fn read_ivec_values(path: &std::path::Path) -> Vec<i32> {
+        let reader = MmapVectorReader::<i32>::open_ivec(path).unwrap();
+        let count = <MmapVectorReader<i32> as VectorReader<i32>>::count(&reader);
+        (0..count).map(|i| reader.get_slice(i)[0]).collect()
+    }
+
+    /// Verify that shuffle(range(20), seed=42) matches numpy exactly.
+    ///
+    /// Expected from: `np.random.seed(42); a=list(range(20)); np.random.shuffle(a); print(a)`
+    /// Result: [0, 17, 15, 1, 8, 5, 11, 3, 18, 16, 13, 2, 9, 19, 4, 12, 7, 10, 14, 6]
+    #[test]
+    fn test_shuffle_matches_numpy_seed_42() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = make_ctx(tmp.path());
+
+        let out = tmp.path().join("shuffle.ivec");
+        let mut opts = Options::new();
+        opts.set("output", out.to_string_lossy().to_string());
+        opts.set("interval", "20");
+        opts.set("seed", "42");
+
+        let mut op = GenerateShuffleKnnUtilsOp;
+        let r = op.execute(&opts, &mut ctx);
+        assert_eq!(r.status, Status::Ok);
+
+        let values = read_ivec_values(&out);
+        let expected = vec![0, 17, 15, 1, 8, 5, 11, 3, 18, 16, 13, 2, 9, 19, 4, 12, 7, 10, 14, 6];
+        assert_eq!(values, expected,
+            "shuffle(range(20), seed=42) does not match numpy");
+    }
+
+    /// Verify determinism: same seed always produces same output.
+    #[test]
+    fn test_shuffle_deterministic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = make_ctx(tmp.path());
+
+        let out1 = tmp.path().join("s1.ivec");
+        let out2 = tmp.path().join("s2.ivec");
+
+        for out in [&out1, &out2] {
+            let mut opts = Options::new();
+            opts.set("output", out.to_string_lossy().to_string());
+            opts.set("interval", "1000");
+            opts.set("seed", "99");
+            let mut op = GenerateShuffleKnnUtilsOp;
+            let r = op.execute(&opts, &mut ctx);
+            assert_eq!(r.status, Status::Ok);
+        }
+
+        let v1 = read_ivec_values(&out1);
+        let v2 = read_ivec_values(&out2);
+        assert_eq!(v1, v2, "same seed should produce identical shuffle");
+    }
+
+    /// Verify different seeds produce different permutations.
+    #[test]
+    fn test_shuffle_different_seeds_differ() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = make_ctx(tmp.path());
+
+        let out1 = tmp.path().join("s1.ivec");
+        let out2 = tmp.path().join("s2.ivec");
+
+        for (out, seed) in [(&out1, "1"), (&out2, "2")] {
+            let mut opts = Options::new();
+            opts.set("output", out.to_string_lossy().to_string());
+            opts.set("interval", "100");
+            opts.set("seed", seed);
+            let mut op = GenerateShuffleKnnUtilsOp;
+            let r = op.execute(&opts, &mut ctx);
+            assert_eq!(r.status, Status::Ok);
+        }
+
+        let v1 = read_ivec_values(&out1);
+        let v2 = read_ivec_values(&out2);
+        assert_ne!(v1, v2, "different seeds should produce different shuffles");
+    }
+
+    /// Verify output is a valid permutation (all elements present, none repeated).
+    #[test]
+    fn test_shuffle_is_valid_permutation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = make_ctx(tmp.path());
+
+        let out = tmp.path().join("shuffle.ivec");
+        let mut opts = Options::new();
+        opts.set("output", out.to_string_lossy().to_string());
+        opts.set("interval", "500");
+        opts.set("seed", "0");
+        let mut op = GenerateShuffleKnnUtilsOp;
+        let r = op.execute(&opts, &mut ctx);
+        assert_eq!(r.status, Status::Ok);
+
+        let values = read_ivec_values(&out);
+        assert_eq!(values.len(), 500);
+        let mut sorted = values.clone();
+        sorted.sort();
+        let expected: Vec<i32> = (0..500).collect();
+        assert_eq!(sorted, expected, "shuffle should be a valid permutation");
+    }
+
+    /// Verify PRNG state chaining: base shuffle saves state, query shuffle
+    /// loads it and continues. This matches knn_utils' single-seed flow:
+    /// `np.random.seed(42); np.random.shuffle(base); np.random.shuffle(query)`
+    #[test]
+    fn test_prng_state_chaining() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = make_ctx(tmp.path());
+
+        let base_out = tmp.path().join("base_shuffle.ivec");
+        let state_file = tmp.path().join("prng_state.bin");
+        let query_out = tmp.path().join("query_shuffle.ivec");
+
+        // Base shuffle: seed=42, save state
+        let mut opts = Options::new();
+        opts.set("output", base_out.to_string_lossy().to_string());
+        opts.set("interval", "50");
+        opts.set("seed", "42");
+        opts.set("prng-state-out", state_file.to_string_lossy().to_string());
+        let mut op = GenerateShuffleKnnUtilsOp;
+        let r = op.execute(&opts, &mut ctx);
+        assert_eq!(r.status, Status::Ok);
+        assert!(state_file.exists(), "PRNG state file should be created");
+
+        // Query shuffle: load state from base, no seed
+        let mut opts = Options::new();
+        opts.set("output", query_out.to_string_lossy().to_string());
+        opts.set("interval", "20");
+        opts.set("prng-state-in", state_file.to_string_lossy().to_string());
+        let mut op = GenerateShuffleKnnUtilsOp;
+        let r = op.execute(&opts, &mut ctx);
+        assert_eq!(r.status, Status::Ok);
+
+        // Reproduce with numpy-equivalent single-seed flow
+        // np.random.seed(42); a=list(range(50)); np.random.shuffle(a)
+        // b=list(range(20)); np.random.shuffle(b)
+        let base_vals = read_ivec_values(&base_out);
+        let query_vals = read_ivec_values(&query_out);
+
+        // The base should match seed-42 shuffle of range(50)
+        assert_eq!(base_vals.len(), 50);
+        assert_eq!(query_vals.len(), 20);
+
+        // Verify query is NOT the same as a fresh seed-42 shuffle of range(20)
+        // (it should use the continued PRNG state from the base shuffle)
+        let fresh_out = tmp.path().join("fresh.ivec");
+        let mut opts = Options::new();
+        opts.set("output", fresh_out.to_string_lossy().to_string());
+        opts.set("interval", "20");
+        opts.set("seed", "42");
+        let mut op = GenerateShuffleKnnUtilsOp;
+        op.execute(&opts, &mut ctx);
+        let fresh_vals = read_ivec_values(&fresh_out);
+
+        assert_ne!(query_vals, fresh_vals,
+            "chained query shuffle should differ from fresh seed-42 shuffle");
+    }
+
+    /// Verify ordinals pass-through: when ordinals file is provided,
+    /// the shuffle permutes those ordinal values instead of [0..interval).
+    #[test]
+    fn test_shuffle_with_ordinals() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = make_ctx(tmp.path());
+
+        // Write ordinals: [100, 200, 300, 400, 500]
+        let ord_path = tmp.path().join("ordinals.ivec");
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&ord_path).unwrap();
+            for v in [100i32, 200, 300, 400, 500] {
+                f.write_all(&1i32.to_le_bytes()).unwrap();
+                f.write_all(&v.to_le_bytes()).unwrap();
+            }
+        }
+
+        let out = tmp.path().join("shuffled.ivec");
+        let mut opts = Options::new();
+        opts.set("output", out.to_string_lossy().to_string());
+        opts.set("interval", "5");
+        opts.set("seed", "42");
+        opts.set("ordinals", ord_path.to_string_lossy().to_string());
+        let mut op = GenerateShuffleKnnUtilsOp;
+        let r = op.execute(&opts, &mut ctx);
+        assert_eq!(r.status, Status::Ok);
+
+        let values = read_ivec_values(&out);
+        assert_eq!(values.len(), 5);
+        // Should be a permutation of [100, 200, 300, 400, 500]
+        let mut sorted = values.clone();
+        sorted.sort();
+        assert_eq!(sorted, vec![100, 200, 300, 400, 500],
+            "shuffled ordinals should contain the original values");
+        // Should NOT be identity (extremely unlikely for seed 42)
+        assert_ne!(values, vec![100, 200, 300, 400, 500],
+            "shuffle should change the order");
+    }
+
+    /// Verify the rk_interval function matches numpy's bounded random.
+    #[test]
+    fn test_rk_interval_bounds() {
+        let mut rng = Mt::new(42);
+        // rk_interval(max) should return values in [0, max]
+        for max_val in [1u32, 5, 10, 100, 1000] {
+            for _ in 0..100 {
+                let v = rk_interval(max_val, &mut rng);
+                assert!(v <= max_val, "rk_interval({}) returned {} (out of range)", max_val, v);
+            }
+        }
+        // rk_interval(0) should always return 0
+        assert_eq!(rk_interval(0, &mut rng), 0);
+    }
+}

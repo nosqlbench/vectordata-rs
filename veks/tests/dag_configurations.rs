@@ -180,6 +180,7 @@ fn default_args(name: &str, output: &Path) -> ImportArgs {
         selectivity: 0.0001,
         provided_facets: None,
         classic: false,
+        personality: "native".to_string(),
     }
 }
 

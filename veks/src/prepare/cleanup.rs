@@ -363,6 +363,7 @@ pub fn run(args: CleanupArgs) {
             pedantic_dedup: false,
             selectivity: 0.0001,
             classic: true,
+            personality: "native".to_string(),
         };
 
         import::run(import_args);

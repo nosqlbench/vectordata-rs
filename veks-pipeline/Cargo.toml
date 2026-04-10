@@ -8,7 +8,8 @@ homepage = "https://github.com/nosqlbench/vectordata-rs"
 repository = "https://github.com/nosqlbench/vectordata-rs"
 
 [features]
-faiss = ["dep:faiss", "dep:rand_mt"]
+knnutils = ["dep:rand_mt"]
+faiss = ["knnutils", "dep:faiss"]
 
 [dependencies]
 byteorder = "1"

@@ -394,3 +394,260 @@ Only f32 (fvec) inputs are supported.
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pipeline::command::{Options, Status, StreamContext};
+    use crate::pipeline::progress::ProgressLog;
+    use indexmap::IndexMap;
+    use vectordata::VectorReader;
+    use vectordata::io::MmapVectorReader;
+
+    fn make_ctx(workspace: &std::path::Path) -> StreamContext {
+        StreamContext {
+            dataset_name: String::new(),
+            profile: String::new(),
+            profile_names: vec![],
+            workspace: workspace.to_path_buf(),
+            scratch: workspace.join(".scratch"),
+            cache: workspace.join(".cache"),
+            defaults: IndexMap::new(),
+            dry_run: false,
+            progress: ProgressLog::new(),
+            threads: 1,
+            step_id: String::new(),
+            governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
+            ui: veks_core::ui::UiHandle::new(std::sync::Arc::new(veks_core::ui::TestSink::new())),
+            status_interval: std::time::Duration::from_secs(1),
+            estimated_total_steps: 0,
+        }
+    }
+
+    fn write_fvec(path: &std::path::Path, vectors: &[Vec<f32>]) {
+        use std::io::Write;
+        let mut f = std::fs::File::create(path).unwrap();
+        for v in vectors {
+            let dim = v.len() as i32;
+            f.write_all(&dim.to_le_bytes()).unwrap();
+            for &val in v {
+                f.write_all(&val.to_le_bytes()).unwrap();
+            }
+        }
+    }
+
+    fn read_ivec_rows(path: &std::path::Path) -> Vec<Vec<i32>> {
+        let reader = MmapVectorReader::<i32>::open_ivec(path).unwrap();
+        let count = <MmapVectorReader<i32> as VectorReader<i32>>::count(&reader);
+        (0..count).map(|i| reader.get_slice(i).to_vec()).collect()
+    }
+
+    /// Compute KNN with inner product on a small synthetic dataset
+    /// with known correct neighbors.
+    #[test]
+    fn test_knn_faiss_ip_known_neighbors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = make_ctx(tmp.path());
+
+        // 5 base vectors in 3D (unit-ish for IP)
+        let base = vec![
+            vec![1.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0],
+            vec![0.7, 0.7, 0.0],
+            vec![0.0, 0.0, 1.0],
+            vec![0.5, 0.5, 0.5],
+        ];
+        let query = vec![
+            vec![0.9, 0.1, 0.0],  // closest to base[0] (IP=0.9), then base[2] (0.7)
+        ];
+        let base_path = tmp.path().join("base.fvec");
+        let query_path = tmp.path().join("query.fvec");
+        write_fvec(&base_path, &base);
+        write_fvec(&query_path, &query);
+
+        let indices_path = tmp.path().join("indices.ivec");
+        let distances_path = tmp.path().join("distances.fvec");
+
+        let mut opts = Options::new();
+        opts.set("base", base_path.to_string_lossy().to_string());
+        opts.set("query", query_path.to_string_lossy().to_string());
+        opts.set("indices", indices_path.to_string_lossy().to_string());
+        opts.set("distances", distances_path.to_string_lossy().to_string());
+        opts.set("neighbors", "3");
+        opts.set("metric", "IP");
+
+        let mut op = ComputeKnnFaissOp;
+        let r = op.execute(&opts, &mut ctx);
+        assert_eq!(r.status, Status::Ok);
+
+        let rows = read_ivec_rows(&indices_path);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].len(), 3);
+
+        // IP scores: base[0]=0.9, base[1]=0.1, base[2]=0.7*0.9+0.7*0.1=0.7,
+        //            base[3]=0.0, base[4]=0.5*0.9+0.5*0.1=0.5
+        // Top 3: base[0] (0.9), base[2] (0.7), base[4] (0.5)
+        assert_eq!(rows[0][0], 0, "top-1 should be base[0]");
+        assert_eq!(rows[0][1], 2, "top-2 should be base[2]");
+        assert_eq!(rows[0][2], 4, "top-3 should be base[4]");
+    }
+
+    /// Compute KNN with L2 metric.
+    #[test]
+    fn test_knn_faiss_l2() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = make_ctx(tmp.path());
+
+        let base = vec![
+            vec![0.0, 0.0],
+            vec![1.0, 0.0],
+            vec![0.0, 1.0],
+            vec![1.0, 1.0],
+        ];
+        let query = vec![
+            vec![0.1, 0.1],  // closest to [0,0]
+        ];
+        let base_path = tmp.path().join("base.fvec");
+        let query_path = tmp.path().join("query.fvec");
+        write_fvec(&base_path, &base);
+        write_fvec(&query_path, &query);
+
+        let indices_path = tmp.path().join("indices.ivec");
+
+        let mut opts = Options::new();
+        opts.set("base", base_path.to_string_lossy().to_string());
+        opts.set("query", query_path.to_string_lossy().to_string());
+        opts.set("indices", indices_path.to_string_lossy().to_string());
+        opts.set("neighbors", "2");
+        opts.set("metric", "L2");
+
+        let mut op = ComputeKnnFaissOp;
+        let r = op.execute(&opts, &mut ctx);
+        assert_eq!(r.status, Status::Ok);
+
+        let rows = read_ivec_rows(&indices_path);
+        assert_eq!(rows[0][0], 0, "L2 top-1 should be [0,0]");
+    }
+
+    /// Verify output ivec format is correct (dim header + k values per row).
+    #[test]
+    fn test_knn_faiss_output_format() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = make_ctx(tmp.path());
+
+        let base = vec![vec![1.0, 2.0]; 10];
+        let query = vec![vec![1.0, 2.0]; 3];
+        let base_path = tmp.path().join("base.fvec");
+        let query_path = tmp.path().join("query.fvec");
+        write_fvec(&base_path, &base);
+        write_fvec(&query_path, &query);
+
+        let indices_path = tmp.path().join("indices.ivec");
+        let distances_path = tmp.path().join("distances.fvec");
+
+        let mut opts = Options::new();
+        opts.set("base", base_path.to_string_lossy().to_string());
+        opts.set("query", query_path.to_string_lossy().to_string());
+        opts.set("indices", indices_path.to_string_lossy().to_string());
+        opts.set("distances", distances_path.to_string_lossy().to_string());
+        opts.set("neighbors", "5");
+        opts.set("metric", "IP");
+
+        let mut op = ComputeKnnFaissOp;
+        let r = op.execute(&opts, &mut ctx);
+        assert_eq!(r.status, Status::Ok);
+
+        // 3 queries x (4 + 5*4) = 3 * 24 = 72 bytes for indices
+        let idx_size = std::fs::metadata(&indices_path).unwrap().len();
+        assert_eq!(idx_size, 3 * (4 + 5 * 4));
+
+        // distances: same layout with f32
+        let dist_size = std::fs::metadata(&distances_path).unwrap().len();
+        assert_eq!(dist_size, 3 * (4 + 5 * 4));
+
+        // All indices should be in [0, 10)
+        let rows = read_ivec_rows(&indices_path);
+        for (qi, row) in rows.iter().enumerate() {
+            for &idx in row {
+                assert!(idx >= 0 && idx < 10,
+                    "query {} has out-of-range index {}", qi, idx);
+            }
+        }
+    }
+
+    /// Adversarial: k > base count. FAISS pads with -1.
+    #[test]
+    fn test_knn_faiss_k_exceeds_base() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = make_ctx(tmp.path());
+
+        let base = vec![vec![1.0, 2.0], vec![3.0, 4.0]];
+        let query = vec![vec![1.5, 3.0]];
+        let base_path = tmp.path().join("base.fvec");
+        let query_path = tmp.path().join("query.fvec");
+        write_fvec(&base_path, &base);
+        write_fvec(&query_path, &query);
+
+        let indices_path = tmp.path().join("indices.ivec");
+
+        let mut opts = Options::new();
+        opts.set("base", base_path.to_string_lossy().to_string());
+        opts.set("query", query_path.to_string_lossy().to_string());
+        opts.set("indices", indices_path.to_string_lossy().to_string());
+        opts.set("neighbors", "5");
+        opts.set("metric", "IP");
+
+        let mut op = ComputeKnnFaissOp;
+        let r = op.execute(&opts, &mut ctx);
+        assert_eq!(r.status, Status::Ok);
+
+        let rows = read_ivec_rows(&indices_path);
+        assert_eq!(rows[0].len(), 5);
+        // First 2 should be valid indices, rest should be -1
+        assert!(rows[0][0] >= 0 && rows[0][0] < 2);
+        assert!(rows[0][1] >= 0 && rows[0][1] < 2);
+        assert_eq!(rows[0][2], -1, "padding should be -1");
+        assert_eq!(rows[0][3], -1);
+        assert_eq!(rows[0][4], -1);
+    }
+
+    /// Multiple queries with different nearest neighbors.
+    #[test]
+    fn test_knn_faiss_multiple_queries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = make_ctx(tmp.path());
+
+        let base = vec![
+            vec![1.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0],
+            vec![0.0, 0.0, 1.0],
+        ];
+        let query = vec![
+            vec![1.0, 0.0, 0.0],  // nearest: base[0]
+            vec![0.0, 1.0, 0.0],  // nearest: base[1]
+            vec![0.0, 0.0, 1.0],  // nearest: base[2]
+        ];
+        let base_path = tmp.path().join("base.fvec");
+        let query_path = tmp.path().join("query.fvec");
+        write_fvec(&base_path, &base);
+        write_fvec(&query_path, &query);
+
+        let indices_path = tmp.path().join("indices.ivec");
+
+        let mut opts = Options::new();
+        opts.set("base", base_path.to_string_lossy().to_string());
+        opts.set("query", query_path.to_string_lossy().to_string());
+        opts.set("indices", indices_path.to_string_lossy().to_string());
+        opts.set("neighbors", "1");
+        opts.set("metric", "IP");
+
+        let mut op = ComputeKnnFaissOp;
+        let r = op.execute(&opts, &mut ctx);
+        assert_eq!(r.status, Status::Ok);
+
+        let rows = read_ivec_rows(&indices_path);
+        assert_eq!(rows[0][0], 0, "query 0 nearest should be base 0");
+        assert_eq!(rows[1][0], 1, "query 1 nearest should be base 1");
+        assert_eq!(rows[2][0], 2, "query 2 nearest should be base 2");
+    }
+}

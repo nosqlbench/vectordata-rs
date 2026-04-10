@@ -267,6 +267,7 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
             pedantic_dedup: false,
             selectivity: 0.0001,
             classic: seeds.classic,
+            personality: "native".to_string(),
         };
         super::import::resolve_facets(&probe)
     };
@@ -946,6 +947,7 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
         pedantic_dedup: seeds.pedantic_dedup.unwrap_or(false),
         selectivity,
         classic: seeds.classic,
+        personality: "native".to_string(),
     }
 }
 
