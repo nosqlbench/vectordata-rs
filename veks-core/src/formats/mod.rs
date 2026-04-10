@@ -8,6 +8,11 @@
 //! multiple tools — not just `convert` — and follows a registry pattern similar
 //! to the Java `VectorFileIO` approach.
 
+// Re-export veks-io traits so downstream code can access them via veks-core.
+// The standalone veks-io crate provides the same interface for external projects.
+pub use veks_io::{VecSource as IoVecSource, VecSink as IoVecSink, SourceMeta as IoSourceMeta};
+pub use veks_io::MmapReader as IoMmapReader;
+
 // Wire format codecs re-exported from vectordata so that both crates share
 // a single definition of MNode, PNode, ANode, etc.
 #[allow(dead_code)]

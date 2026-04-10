@@ -6,6 +6,7 @@ members = [
     "veks-completion",
     "veks",
     "slabtastic",
+    "veks-io",
     "tools",
 ]
 resolver = "3"

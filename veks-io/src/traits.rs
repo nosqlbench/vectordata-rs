@@ -1,0 +1,51 @@
+// Copyright (c) nosqlbench contributors
+// SPDX-License-Identifier: Apache-2.0
+
+//! Core traits for reading and writing vector data.
+
+/// Metadata about a vector data source.
+#[derive(Debug, Clone)]
+pub struct SourceMeta {
+    /// Vector dimension (number of elements per record).
+    pub dimension: u32,
+    /// Bytes per element (4 for f32, 2 for f16, 8 for f64, etc.).
+    pub element_size: usize,
+    /// Total number of records, if known without a full scan.
+    pub record_count: Option<u64>,
+}
+
+/// Streaming reader for vector data.
+///
+/// Records are returned as raw little-endian bytes (no dimension prefix).
+/// The format and element type are determined at open time; the consumer
+/// interprets bytes according to `element_size()`.
+///
+/// Implementations exist for all xvec formats (fvec, ivec, mvec, dvec,
+/// bvec, svec) and optionally for npy, parquet, and slab formats.
+pub trait VecSource: Send {
+    /// Vector dimension (number of elements per record).
+    fn dimension(&self) -> u32;
+
+    /// Bytes per element in the source data.
+    fn element_size(&self) -> usize;
+
+    /// Total record count, if known without a full scan.
+    fn record_count(&self) -> Option<u64>;
+
+    /// Read the next record as raw bytes (element data only, no dim prefix).
+    /// Returns `None` when exhausted.
+    fn next_record(&mut self) -> Option<Vec<u8>>;
+}
+
+/// Streaming writer for vector data.
+///
+/// Records are raw element bytes (no dimension prefix). The dimension is
+/// configured at writer construction time.
+pub trait VecSink {
+    /// Write a record. `data` is raw element bytes (length = dim × element_size).
+    /// `ordinal` is the logical record index (used by slab for addressing).
+    fn write_record(&mut self, ordinal: i64, data: &[u8]);
+
+    /// Finalize the output (flush buffers, write footers, etc.).
+    fn finish(self: Box<Self>) -> Result<(), String>;
+}

@@ -4997,6 +4997,24 @@ dependencies = [
  "slabtastic",
  "tempfile",
  "vectordata",
+ "veks-io",
+]
+
+[[package]]
+name = "veks-io"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "byteorder",
+ "half",
+ "libc",
+ "log",
+ "memmap2",
+ "ndarray",
+ "ndarray-npy",
+ "parquet",
+ "slabtastic",
+ "tempfile",
 ]
 
 [[package]]
