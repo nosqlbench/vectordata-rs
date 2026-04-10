@@ -84,7 +84,7 @@ The threshold is fixed per precision level: 1e-1 (f16), 1e-5 (f32),
     fn describe_options(&self) -> Vec<OptionDesc> {
         vec![
             OptionDesc {
-                name: "input".into(),
+                name: "source".into(),
                 type_name: "Path".into(),
                 required: true,
                 default: None,
@@ -113,7 +113,7 @@ The threshold is fixed per precision level: 1e-1 (f16), 1e-5 (f32),
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
         let start = Instant::now();
 
-        let input_str = match options.require("input") {
+        let input_str = match options.require("source") {
             Ok(s) => s,
             Err(e) => return error_result(e, start),
         };

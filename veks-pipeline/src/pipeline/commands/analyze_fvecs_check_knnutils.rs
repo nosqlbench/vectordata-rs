@@ -97,7 +97,7 @@ from the knn\_utils project.
     fn describe_options(&self) -> Vec<OptionDesc> {
         vec![
             OptionDesc {
-                name: "input".into(),
+                name: "source".into(),
                 type_name: "Path".into(),
                 required: true,
                 default: None,
@@ -134,7 +134,7 @@ from the knn\_utils project.
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
         let start = Instant::now();
 
-        let input_str = match options.require("input") {
+        let input_str = match options.require("source") {
             Ok(s) => s,
             Err(e) => return error_result(e, start),
         };
@@ -353,7 +353,7 @@ from the knn\_utils project.
     fn project_artifacts(&self, step_id: &str, options: &Options) -> ArtifactManifest {
         crate::pipeline::command::manifest_from_keys(
             step_id, self.command_path(), options,
-            &["input"],
+            &["source"],
             &["report"],
         )
     }

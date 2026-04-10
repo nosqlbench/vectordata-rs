@@ -20,7 +20,7 @@ pub enum VecFormat {
     Fvec,
     /// xvec int32 (4 bytes/element).
     Ivec,
-    /// xvec uint8 (1 byte/element, stored in 4-byte groups).
+    /// xvec uint8 (1 byte/element).
     Bvec,
     /// xvec float64 (8 bytes/element).
     Dvec,
@@ -56,9 +56,10 @@ impl VecFormat {
     /// Bytes per element for xvec formats. Returns 0 for container formats.
     pub fn element_size(self) -> usize {
         match self {
-            Self::Fvec | Self::Ivec | Self::Bvec => 4,
+            Self::Fvec | Self::Ivec => 4,
             Self::Dvec => 8,
             Self::Mvec | Self::Svec => 2,
+            Self::Bvec => 1,
             Self::Npy | Self::Parquet | Self::Slab => 0,
         }
     }
@@ -206,8 +207,11 @@ mod tests {
     #[test]
     fn test_element_size() {
         assert_eq!(VecFormat::Fvec.element_size(), 4);
+        assert_eq!(VecFormat::Ivec.element_size(), 4);
         assert_eq!(VecFormat::Mvec.element_size(), 2);
         assert_eq!(VecFormat::Dvec.element_size(), 8);
+        assert_eq!(VecFormat::Bvec.element_size(), 1);
+        assert_eq!(VecFormat::Svec.element_size(), 2);
         assert_eq!(VecFormat::Npy.element_size(), 0);
     }
 

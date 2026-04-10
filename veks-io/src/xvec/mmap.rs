@@ -143,7 +143,7 @@ impl MmapReader<f64> {
 }
 
 impl MmapReader<u8> {
-    /// Open a bvec file (uint8 vectors).
+    /// Open a bvec file (uint8 vectors, 1 byte per element).
     pub fn open_bvec(path: &Path) -> Result<Self, MmapError> {
         Self::open_impl(path, 1)
     }

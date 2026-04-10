@@ -31,7 +31,7 @@ pub fn factory() -> Box<dyn CommandOp> {
 
 impl CommandOp for AnalyzeHistogramOp {
     fn command_path(&self) -> &str {
-        "analyze histogram"
+        "analyze display-histogram"
     }
 
     fn command_doc(&self) -> CommandDoc {

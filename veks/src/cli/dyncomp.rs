@@ -73,6 +73,7 @@ fn walk_clap_command(cmd: &clap::Command) -> Node {
             options,
             flags,
             value_providers: std::collections::BTreeMap::new(),
+            dynamic_options: None,
         }
     } else {
         // Group command — recurse into children
@@ -123,7 +124,7 @@ fn resolve_catalog() -> crate::catalog::resolver::Catalog {
 }
 
 /// Suggest dataset names from catalogs (respects `--at`).
-fn complete_dataset_names(partial: &str) -> Vec<String> {
+fn complete_dataset_names(partial: &str, _context: &[&str]) -> Vec<String> {
     let catalog = resolve_catalog();
     let prefix = partial.to_lowercase();
     catalog.datasets().iter()
@@ -133,7 +134,7 @@ fn complete_dataset_names(partial: &str) -> Vec<String> {
 }
 
 /// Suggest profile names (respects `--at` and `--dataset`).
-fn complete_profile_names(partial: &str) -> Vec<String> {
+fn complete_profile_names(partial: &str, _context: &[&str]) -> Vec<String> {
     let catalog = resolve_catalog();
     let prefix = partial.to_lowercase();
     let dataset_name = extract_option("--dataset");
@@ -153,7 +154,7 @@ fn complete_profile_names(partial: &str) -> Vec<String> {
 }
 
 /// Suggest distance metrics.
-fn complete_metrics(partial: &str) -> Vec<String> {
+fn complete_metrics(partial: &str, _context: &[&str]) -> Vec<String> {
     let metrics = ["L2", "COSINE", "DOT_PRODUCT", "L1"];
     let prefix = partial.to_uppercase();
     metrics.iter()
@@ -163,7 +164,7 @@ fn complete_metrics(partial: &str) -> Vec<String> {
 }
 
 /// Suggest configured catalog URLs by number.
-fn complete_catalog_urls(partial: &str) -> Vec<String> {
+fn complete_catalog_urls(partial: &str, _context: &[&str]) -> Vec<String> {
     let config_dir = crate::catalog::sources::expand_tilde(
         crate::catalog::sources::DEFAULT_CONFIG_DIR,
     );
@@ -179,7 +180,7 @@ fn complete_catalog_urls(partial: &str) -> Vec<String> {
 }
 
 /// Suggest shell names.
-fn complete_shells(partial: &str) -> Vec<String> {
+fn complete_shells(partial: &str, _context: &[&str]) -> Vec<String> {
     let shells = ["bash", "zsh", "fish", "elvish", "powershell"];
     let prefix = partial.to_lowercase();
     shells.iter()

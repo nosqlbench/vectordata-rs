@@ -10,3 +10,4 @@
 pub mod reader;
 pub mod writer;
 pub mod mmap;
+pub mod varlen;

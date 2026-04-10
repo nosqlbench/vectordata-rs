@@ -50,6 +50,7 @@ pub mod xvec;
 
 pub use format::VecFormat;
 pub use traits::{SourceMeta, VecSink, VecSource};
+pub use traits::{VarlenRecord, VarlenSink, VarlenSource};
 pub use xvec::mmap::MmapReader;
 
 use std::path::Path;
@@ -138,6 +139,52 @@ pub fn probe(path: impl AsRef<Path>) -> Result<SourceMeta, String> {
     let format = VecFormat::detect(path)
         .ok_or_else(|| format!("cannot detect format for {}", path.display()))?;
     probe_format(path, format)
+}
+
+/// Open a vector file for variable-length streaming reading.
+///
+/// Unlike [`open`], this reader handles files where records may have
+/// different dimensions. Each record carries its own dimension.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// let mut reader = veks_io::open_varlen("data.fvec").unwrap();
+/// while let Some(record) = reader.next_record() {
+///     println!("dim={}, bytes={}", record.dimension, record.data.len());
+/// }
+/// ```
+pub fn open_varlen(path: impl AsRef<Path>) -> Result<Box<dyn VarlenSource>, String> {
+    let path = path.as_ref();
+    let format = VecFormat::detect(path)
+        .ok_or_else(|| format!("cannot detect format for {}", path.display()))?;
+    if !format.is_xvec() {
+        return Err(format!("varlen reading only supported for xvec formats, got {}", format));
+    }
+    xvec::varlen::open_reader(path, format)
+}
+
+/// Create a vector file for variable-length writing.
+///
+/// Unlike [`create`], this writer accepts a per-record dimension,
+/// allowing records with different dimensions in the same file.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// let mut writer = veks_io::create_varlen("output.fvec").unwrap();
+/// writer.write_record(128, &vec![0u8; 128 * 4]);  // dim=128
+/// writer.write_record(256, &vec![0u8; 256 * 4]);  // dim=256
+/// writer.finish().unwrap();
+/// ```
+pub fn create_varlen(path: impl AsRef<Path>) -> Result<Box<dyn VarlenSink>, String> {
+    let path = path.as_ref();
+    let format = VecFormat::detect(path)
+        .ok_or_else(|| format!("cannot detect format for {}", path.display()))?;
+    if !format.is_xvec() {
+        return Err(format!("varlen writing only supported for xvec formats, got {}", format));
+    }
+    xvec::varlen::open_writer(path)
 }
 
 /// Probe with an explicit format.
@@ -320,17 +367,15 @@ mod tests {
         let tmp = make_tmp();
         let path = tmp.path().join("test.bvec");
 
-        let mut writer = create(&path, 3).unwrap();
-        // bvec element_size is 4 (stores u8 in 4-byte groups per the format)
-        // but the raw data written is 3*4=12 bytes
-        let v0: Vec<u8> = [10u32, 20, 30].iter()
-            .flat_map(|v| v.to_le_bytes()).collect();
+        let mut writer = create(&path, 5).unwrap();
+        // bvec: 1 byte per element (u8 vectors)
+        let v0: Vec<u8> = vec![10, 20, 30, 40, 50];
         writer.write_record(0, &v0);
         writer.finish().unwrap();
 
         let mut reader = open(&path).unwrap();
-        assert_eq!(reader.dimension(), 3);
-        assert_eq!(reader.element_size(), 4);
+        assert_eq!(reader.dimension(), 5);
+        assert_eq!(reader.element_size(), 1);
         let r0 = reader.next_record().unwrap();
         assert_eq!(r0, v0);
     }
@@ -581,7 +626,7 @@ mod tests {
     fn probe_all_xvec_formats() {
         let tmp = make_tmp();
 
-        for (ext, elem_size) in [("fvec", 4), ("ivec", 4), ("dvec", 8), ("mvec", 2), ("svec", 2), ("bvec", 4)] {
+        for (ext, elem_size) in [("fvec", 4), ("ivec", 4), ("dvec", 8), ("mvec", 2), ("svec", 2), ("bvec", 1)] {
             let path = tmp.path().join(format!("test.{}", ext));
             let dim = 5u32;
             let mut writer = create(&path, dim).unwrap();

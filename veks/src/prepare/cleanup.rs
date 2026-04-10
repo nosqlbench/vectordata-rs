@@ -364,6 +364,10 @@ pub fn run(args: CleanupArgs) {
             selectivity: 0.0001,
             classic: true,
             personality: "native".to_string(),
+            synthesize_metadata: false,
+            metadata_fields: 3,
+            metadata_range_min: 0,
+            metadata_range_max: 1000,
         };
 
         import::run(import_args);

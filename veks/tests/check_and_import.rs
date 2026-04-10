@@ -99,6 +99,10 @@ fn default_args(name: &str, output: &Path) -> ImportArgs {
         provided_facets: None,
         classic: false,
         personality: "native".to_string(),
+        synthesize_metadata: false,
+        metadata_fields: 3,
+        metadata_range_min: 0,
+        metadata_range_max: 1000,
     }
 }
 
@@ -1808,7 +1812,7 @@ fn project_artifacts_every_registered_command_no_panic() {
         // analyze
         "analyze check-endian", "analyze compare-files", "analyze compute-info",
         "analyze describe", "analyze file", "analyze find",
-        "analyze histogram", "analyze model-diff",
+        "analyze display-histogram", "analyze model-diff",
         "analyze explain-predicates", "analyze select",
         "analyze slice", "analyze stats", "analyze survey", "analyze verify-knn",
         "analyze verify-profiles", "analyze zeros",

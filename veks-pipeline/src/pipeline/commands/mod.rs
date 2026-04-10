@@ -55,6 +55,7 @@ pub mod fetch_dlhf;
 pub mod gen_dataset;
 pub mod gen_derive;
 pub mod gen_extract;
+pub mod gen_metadata;
 pub mod gen_from_model;
 pub mod gen_predicate_keys;
 pub mod gen_predicated;
@@ -103,7 +104,7 @@ pub fn register_all(registry: &mut CommandRegistry) {
     registry.register("analyze find", analyze_find::factory);
     registry.register("analyze find-duplicates", analyze_find_duplicates::factory);
     registry.register("analyze find-zeros", analyze_find_zeros::factory);
-    registry.register("analyze histogram", analyze_histogram::factory);
+    registry.register("analyze display-histogram", analyze_histogram::factory);
     registry.register("analyze model-diff", analyze_modeldiff::factory);
     registry.register("analyze explain-predicates", inspect_predicate::factory);
     registry.register("analyze select", analyze_select::factory);
@@ -115,7 +116,7 @@ pub fn register_all(registry: &mut CommandRegistry) {
     registry.register("analyze measure-normals", analyze_normals::factory);
     #[cfg(feature = "knnutils")]
     registry.register("analyze check-normalization-knnutils", analyze_normals_knnutils::factory);
-    registry.register("analyze norms", analyze_norms::factory);
+    registry.register("analyze display-norms", analyze_norms::factory);
     registry.register("analyze overlap", analyze_overlap::factory);
     registry.register("analyze zeros", analyze_zeros::factory);
 
@@ -143,6 +144,7 @@ pub fn register_all(registry: &mut CommandRegistry) {
     registry.register("generate dataset-json", dataset_json::factory);
     registry.register("generate derive", gen_derive::factory);
     registry.register("generate from-model", gen_from_model::factory);
+    registry.register("generate metadata", gen_metadata::factory);
     registry.register("generate predicated", gen_predicated::factory);
     registry.register("generate predicates", gen_predicates::factory);
     registry.register("generate shuffle", gen_shuffle::factory);

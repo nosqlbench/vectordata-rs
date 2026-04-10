@@ -42,7 +42,7 @@ pub fn factory() -> Box<dyn CommandOp> {
 
 impl CommandOp for AnalyzeNormsOp {
     fn command_path(&self) -> &str {
-        "analyze norms"
+        "analyze display-norms"
     }
 
     fn command_doc(&self) -> CommandDoc {

@@ -1291,7 +1291,7 @@ fn analyze_norms_basic() {
     opts.set("source", ws.join("source.fvec").to_string_lossy().to_string());
 
     let registry = veks_pipeline::pipeline::registry::CommandRegistry::with_builtins();
-    let factory = registry.get("analyze norms").unwrap();
+    let factory = registry.get("analyze display-norms").unwrap();
     let mut cmd = factory();
     let mut ctx = test_ctx(ws);
     let result = cmd.execute(&opts, &mut ctx);
@@ -1316,7 +1316,7 @@ fn analyze_measure_normals_unit_vectors() {
     ]);
 
     let mut opts = Options::new();
-    opts.set("input", ws.join("source.fvec").to_string_lossy().to_string());
+    opts.set("source", ws.join("source.fvec").to_string_lossy().to_string());
     opts.set("sample", "3");
 
     let registry = veks_pipeline::pipeline::registry::CommandRegistry::with_builtins();
@@ -1341,7 +1341,7 @@ fn analyze_measure_normals_unnormalized() {
     ]);
 
     let mut opts = Options::new();
-    opts.set("input", ws.join("source.fvec").to_string_lossy().to_string());
+    opts.set("source", ws.join("source.fvec").to_string_lossy().to_string());
     opts.set("sample", "2");
 
     let registry = veks_pipeline::pipeline::registry::CommandRegistry::with_builtins();
@@ -1532,13 +1532,13 @@ fn single_vector_through_pipeline_commands() {
     // analyze norms
     let mut opts = Options::new();
     opts.set("source", ws.join("single.fvec").to_string_lossy().to_string());
-    let mut cmd = registry.get("analyze norms").unwrap()();
+    let mut cmd = registry.get("analyze display-norms").unwrap()();
     let r = cmd.execute(&opts, &mut ctx);
     assert_eq!(r.status, Status::Ok, "norms single: {}", r.message);
 
     // analyze measure-normals
     let mut opts = Options::new();
-    opts.set("input", ws.join("single.fvec").to_string_lossy().to_string());
+    opts.set("source", ws.join("single.fvec").to_string_lossy().to_string());
     opts.set("sample", "1");
     let mut cmd = registry.get("analyze measure-normals").unwrap()();
     let r = cmd.execute(&opts, &mut ctx);
@@ -1605,7 +1605,7 @@ fn nan_vectors_handled() {
     let mut opts = Options::new();
     opts.set("source", ws.join("source.fvec").to_string_lossy().to_string());
     let registry = veks_pipeline::pipeline::registry::CommandRegistry::with_builtins();
-    let mut cmd = registry.get("analyze norms").unwrap()();
+    let mut cmd = registry.get("analyze display-norms").unwrap()();
     let mut ctx = test_ctx(ws);
     let r = cmd.execute(&opts, &mut ctx);
     assert_eq!(r.status, Status::Ok, "norms with NaN: {}", r.message);
@@ -1861,7 +1861,7 @@ fn histogram_basic() {
     opts.set("dimension", "0");  // 0 = auto-detect from file
 
     let registry = veks_pipeline::pipeline::registry::CommandRegistry::with_builtins();
-    let mut cmd = registry.get("analyze histogram").unwrap()();
+    let mut cmd = registry.get("analyze display-histogram").unwrap()();
     let mut ctx = test_ctx(ws);
     let r = cmd.execute(&opts, &mut ctx);
     assert_eq!(r.status, Status::Ok, "histogram: {}", r.message);

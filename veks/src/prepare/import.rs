@@ -86,11 +86,28 @@ pub struct ImportArgs {
     /// knn-blas) instead of the native SimSIMD-based commands.
     #[serde(default = "default_personality")]
     pub personality: String,
+    /// Synthesize metadata when none is provided.
+    /// When true and metadata is required (M facet) but no `--metadata`
+    /// source is given, a `generate metadata` step is emitted.
+    #[serde(default)]
+    pub synthesize_metadata: bool,
+    /// Number of integer fields for synthesized metadata (default 3).
+    #[serde(default = "default_metadata_fields")]
+    pub metadata_fields: u32,
+    /// Minimum value (inclusive) for synthesized metadata integer range.
+    #[serde(default)]
+    pub metadata_range_min: i32,
+    /// Maximum value (exclusive) for synthesized metadata integer range.
+    #[serde(default = "default_metadata_range_max")]
+    pub metadata_range_max: i32,
 }
 
 fn default_personality() -> String {
     "native".to_string()
 }
+
+fn default_metadata_fields() -> u32 { 3 }
+fn default_metadata_range_max() -> i32 { 1000 }
 
 impl ImportArgs {
     /// Path prefix for the base/default profile artifacts.
@@ -139,6 +156,11 @@ pub fn parse_facet_spec(spec: &str) -> String {
 
     // Strip leading '=' that can appear from shell quoting like --flag ="value"
     let spec = spec.strip_prefix('=').unwrap_or(spec);
+
+    // '*' or 'all' → every facet
+    if spec == "*" || spec.eq_ignore_ascii_case("all") {
+        return "BQGDMPRF".to_string();
+    }
 
     // If it's all uppercase letters from BQGDMPRF, treat as compact codes
     if !spec.is_empty()
@@ -440,8 +462,22 @@ fn resolve_slots(args: &ImportArgs) -> PipelineSlots {
     };
 
     // ── Metadata chain ───────────────────────────────────────────────
+    // Validate: predicates (P/F) without metadata is an error
     let wants_metadata = facets.contains('M');
-    let metadata = args.metadata.as_ref().filter(|_| wants_metadata).map(|meta_source| {
+    let wants_predicates = facets.contains('P') || facets.contains('F');
+    if wants_predicates && !wants_metadata && args.metadata.is_none() && !args.synthesize_metadata {
+        eprintln!("Error: predicates (P/F facets) require metadata (M facet).");
+        eprintln!("  Provide --metadata <file> or use --synthesize-metadata to generate random metadata.");
+        std::process::exit(1);
+    }
+
+    // When metadata synthesis is requested and no source is provided,
+    // create a synthetic metadata source via `generate metadata`.
+    let has_metadata_source = args.metadata.is_some();
+    let synthesize = args.synthesize_metadata && !has_metadata_source && wants_metadata;
+
+    let metadata = if has_metadata_source && wants_metadata {
+        args.metadata.as_ref().map(|meta_source| {
         let needs_meta_import = !is_native_slab_file(meta_source);
 
         let metadata_all = if needs_meta_import {
@@ -478,7 +514,37 @@ fn resolve_slots(args: &ImportArgs) -> PipelineSlots {
         };
 
         MetadataSlots { metadata_all, metadata_content, survey, predicates, predicate_indices }
-    });
+    })
+    } else if synthesize {
+        // Synthesize metadata — generate metadata step produces the slab
+        let metadata_all = Artifact::Materialized {
+            step_id: "generate-metadata".into(),
+            output: "${cache}/metadata_all.slab".into(),
+        };
+        let metadata_content = if self_search {
+            Artifact::Materialized {
+                step_id: "extract-metadata".into(),
+                output: format!("{}metadata_content.slab", pp),
+            }
+        } else {
+            Artifact::Identity { path: format!("{}metadata_content.slab", pp) }
+        };
+        let survey = Artifact::Materialized {
+            step_id: "survey-metadata".into(),
+            output: "${cache}/metadata_survey.json".into(),
+        };
+        let predicates = Artifact::Materialized {
+            step_id: "generate-predicates".into(),
+            output: format!("{}predicates.slab", pp),
+        };
+        let predicate_indices = Artifact::Materialized {
+            step_id: "evaluate-predicates".into(),
+            output: "metadata_indices.slab".into(),
+        };
+        Some(MetadataSlots { metadata_all, metadata_content, survey, predicates, predicate_indices })
+    } else {
+        None
+    };
 
     // ── Ground truth chain ───────────────────────────────────────────
     let wants_gt = facets.contains('G');
@@ -1061,40 +1127,60 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
 
     // ── Metadata chain ───────────────────────────────────────────────
     if let Some(ref meta) = slots.metadata {
-        let meta_source = args.metadata.as_ref().unwrap();
-
         if meta.metadata_all.is_materialized() {
-            let format = VecFormat::detect(meta_source)
-                .map(|f| f.name().to_string())
-                .unwrap_or_else(|| "parquet".into());
-            let mut meta_opts = vec![
-                ("facet".into(), "metadata_content".into()),
-                ("source".into(), relativize_path(meta_source, &args.output)),
-                ("from".into(), format),
-                ("output".into(), "${cache}/metadata_all.slab".into()),
-            ];
-            // When base_fraction < 1.0, only import metadata for the same
-            // ordinal range as the base vectors. This preserves pairwise
-            // ordinal alignment and avoids importing 100x more metadata
-            // than needed.
-            if args.base_fraction < 1.0 && !args.pedantic_dedup {
-                meta_opts.push(("fraction".into(), args.base_fraction.to_string()));
+            if let Some(meta_source) = args.metadata.as_ref() {
+                // Import from existing metadata file
+                let format = VecFormat::detect(meta_source)
+                    .map(|f| f.name().to_string())
+                    .unwrap_or_else(|| "parquet".into());
+                let mut meta_opts = vec![
+                    ("facet".into(), "metadata_content".into()),
+                    ("source".into(), relativize_path(meta_source, &args.output)),
+                    ("from".into(), format),
+                    ("output".into(), "${cache}/metadata_all.slab".into()),
+                ];
+                if args.base_fraction < 1.0 && !args.pedantic_dedup {
+                    meta_opts.push(("fraction".into(), args.base_fraction.to_string()));
+                }
+                steps.push(Step {
+                    id: "convert-metadata".into(),
+                    run: "transform convert".into(),
+                    description: Some("Import metadata from source format".into()),
+                    after: vec![],
+                    per_profile: false,
+                    phase: 0,
+                    options: meta_opts,
+                });
+            } else if args.synthesize_metadata {
+                // Synthesize metadata via generate metadata command
+                steps.push(Step {
+                    id: "generate-metadata".into(),
+                    run: "generate metadata".into(),
+                    description: Some("Synthesize random integer metadata".into()),
+                    after: vec!["count-vectors".into()],
+                    per_profile: false,
+                    phase: 0,
+                    options: vec![
+                        ("output".into(), "${cache}/metadata_all.slab".into()),
+                        ("count".into(), "${vector_count}".into()),
+                        ("fields".into(), args.metadata_fields.to_string()),
+                        ("range-min".into(), args.metadata_range_min.to_string()),
+                        ("range-max".into(), args.metadata_range_max.to_string()),
+                        ("seed".into(), args.seed.to_string()),
+                    ],
+                });
             }
-            steps.push(Step {
-                id: "convert-metadata".into(),
-                run: "transform convert".into(),
-                description: Some("Import metadata from source format".into()),
-                after: vec![],
-                per_profile: false,
-                phase: 0,
-                options: meta_opts,
-            });
         }
 
         if meta.metadata_content.is_materialized() {
             let mut after = vec![];
             if meta.metadata_all.is_materialized() {
-                after.push("convert-metadata".into());
+                // Depends on whichever step produced metadata_all
+                if args.metadata.is_some() {
+                    after.push("convert-metadata".into());
+                } else if args.synthesize_metadata {
+                    after.push("generate-metadata".into());
+                }
             }
             if slots.shuffle.as_ref().map(|s| s.is_materialized()).unwrap_or(false) {
                 after.push("generate-shuffle".into());
@@ -2457,6 +2543,10 @@ mod tests {
             selectivity: 0.0001,
             classic: false,
             personality: "native".to_string(),
+            synthesize_metadata: false,
+            metadata_fields: 3,
+            metadata_range_min: 0,
+            metadata_range_max: 1000,
         }
     }
 
@@ -2700,5 +2790,28 @@ mod tests {
             "knn_utils personality should use 'compute knn-blas': {:?}", runs);
         assert!(runs.contains(&"verify dataset-knnutils"),
             "knn_utils personality should use 'verify dataset-knnutils': {:?}", runs);
+    }
+
+    #[test]
+    fn parse_facet_spec_star_is_all() {
+        assert_eq!(parse_facet_spec("*"), "BQGDMPRF");
+    }
+
+    #[test]
+    fn parse_facet_spec_all_keyword() {
+        assert_eq!(parse_facet_spec("all"), "BQGDMPRF");
+        assert_eq!(parse_facet_spec("ALL"), "BQGDMPRF");
+    }
+
+    #[test]
+    fn parse_facet_spec_compact_codes() {
+        assert_eq!(parse_facet_spec("BQ"), "BQ");
+        assert_eq!(parse_facet_spec("bqgd"), "BQGD");
+    }
+
+    #[test]
+    fn parse_facet_spec_long_names() {
+        assert_eq!(parse_facet_spec("base,query"), "BQ");
+        assert_eq!(parse_facet_spec("base,query,gt,dist"), "BQGD");
     }
 }

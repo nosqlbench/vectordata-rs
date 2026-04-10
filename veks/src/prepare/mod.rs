@@ -180,6 +180,21 @@ pub enum PrepareCommand {
         #[arg(long, default_value = "native")]
         personality: String,
 
+        /// Synthesize metadata when none is provided. When set and the M
+        /// facet is required but no --metadata file is given, random integer
+        /// metadata is generated for each base vector.
+        #[arg(long)]
+        synthesize_metadata: bool,
+
+        /// Number of integer fields for synthesized metadata (default 3).
+        #[arg(long, default_value = "3")]
+        metadata_fields: u32,
+
+        /// Value range for synthesized metadata fields as "min..max"
+        /// (default "0..1000"). Each field is drawn uniformly from [min, max).
+        #[arg(long, default_value = "0..1000")]
+        metadata_range: String,
+
         /// Explicit source files to consider (repeatable). When provided,
         /// directory scanning is skipped and only these files are used
         /// for role detection.
@@ -410,8 +425,20 @@ pub fn run(args: PrepareArgs) {
             ground_truth_distances, metric, neighbors, seed, description,
             no_dedup, no_zero_check, no_filtered, normalize, no_normalize, force, reset, clean, recursive,
             base_fraction, required_facets, provided_facets, round_digits, pedantic_dedup, auto, classic, sources,
-            personality,
+            personality, synthesize_metadata, metadata_fields, metadata_range,
         } => {
+            // Parse metadata range "min..max"
+            let (metadata_range_min, metadata_range_max) = {
+                let parts: Vec<&str> = metadata_range.split("..").collect();
+                if parts.len() == 2 {
+                    let min: i32 = parts[0].parse().unwrap_or(0);
+                    let max: i32 = parts[1].parse().unwrap_or(1000);
+                    (min, max)
+                } else {
+                    (0, 1000)
+                }
+            };
+
             // Handle --clean: reset all generated artifacts.
             // If other flags indicate re-bootstrapping (--overwrite, -i, --reset,
             // etc.), clean first then continue. Otherwise exit after cleaning.
@@ -691,6 +718,10 @@ pub fn run(args: PrepareArgs) {
                         selectivity: 0.0001,
                         classic,
                         personality: personality.clone(),
+                        synthesize_metadata,
+                        metadata_fields,
+                        metadata_range_min,
+                        metadata_range_max,
                     });
                     check_and_restore(&out);
                 }
@@ -752,6 +783,10 @@ pub fn run(args: PrepareArgs) {
                     selectivity: 0.0001,
                     classic,
                     personality: personality.clone(),
+                    synthesize_metadata,
+                    metadata_fields,
+                    metadata_range_min,
+                    metadata_range_max,
                 });
             }
         }

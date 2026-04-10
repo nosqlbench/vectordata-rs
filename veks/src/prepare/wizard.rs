@@ -268,6 +268,10 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
             selectivity: 0.0001,
             classic: seeds.classic,
             personality: "native".to_string(),
+            synthesize_metadata: false,
+            metadata_fields: 3,
+            metadata_range_min: 0,
+            metadata_range_max: 1000,
         };
         super::import::resolve_facets(&probe)
     };
@@ -948,6 +952,10 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
         selectivity,
         classic: seeds.classic,
         personality: "native".to_string(),
+        synthesize_metadata: false,
+        metadata_fields: 3,
+        metadata_range_min: 0,
+        metadata_range_max: 1000,
     }
 }
 

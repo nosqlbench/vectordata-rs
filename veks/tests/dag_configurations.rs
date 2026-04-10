@@ -181,6 +181,10 @@ fn default_args(name: &str, output: &Path) -> ImportArgs {
         provided_facets: None,
         classic: false,
         personality: "native".to_string(),
+        synthesize_metadata: false,
+        metadata_fields: 3,
+        metadata_range_min: 0,
+        metadata_range_max: 1000,
     }
 }
 
