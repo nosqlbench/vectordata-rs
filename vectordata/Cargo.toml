@@ -1,6 +1,6 @@
 [package]
 name = "vectordata"
-version = "0.12.0"
+version = "0.14.0"
 edition = "2024"
 description = "Rust implementation of vectordata tools for dataset.yaml"
 license = "Apache-2.0"
@@ -12,7 +12,7 @@ categories = ["filesystem", "network-programming", "science"]
 
 [dependencies]
 indexmap = { version = "2", features = ["serde"] }
-veks-anode = { path = "../veks-anode", version = "0.13.0" }
+veks-anode = { path = "../veks-anode", version = "0.14.0" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"

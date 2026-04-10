@@ -1,6 +1,6 @@
 [package]
 name = "veks"
-version = "0.13.0"
+version = "0.14.0"
 edition = "2024"
 description = "A vector bulk data processing tool"
 license = "Apache-2.0"
@@ -22,7 +22,7 @@ path = "src/main.rs"
 atty = "0.2"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "string"] }
-veks-completion = { path = "../veks-completion", version = "0.13.0" }
+veks-completion = { path = "../veks-completion", version = "0.14.0" }
 crossterm = "0.28"
 curl = "0.4"
 env_logger = "0.11"
@@ -41,9 +41,9 @@ serde_yaml = "0.9"
 signal-hook = "0.3"
 simsimd = "6"
 slabtastic = { path = "../slabtastic", version = "0.12.0" }
-vectordata = { path = "../vectordata", version = "0.12.0" }
-veks-core = { path = "../veks-core", version = "0.13.0" }
-veks-pipeline = { path = "../veks-pipeline", version = "0.13.0" }
+vectordata = { path = "../vectordata", version = "0.14.0" }
+veks-core = { path = "../veks-core", version = "0.14.0" }
+veks-pipeline = { path = "../veks-pipeline", version = "0.14.0" }
 libc = "0.2.183"
 
 [features]
