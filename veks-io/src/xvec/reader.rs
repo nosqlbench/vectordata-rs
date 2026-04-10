@@ -52,7 +52,6 @@ pub fn open(path: &Path, format: VecFormat) -> Result<Box<dyn VecSource>, String
         elem_size,
         total_records,
         records_read: 0,
-        record_bytes,
     }))
 }
 
@@ -87,7 +86,6 @@ struct XvecReader {
     elem_size: usize,
     total_records: u64,
     records_read: u64,
-    record_bytes: usize,
 }
 
 impl VecSource for XvecReader {
