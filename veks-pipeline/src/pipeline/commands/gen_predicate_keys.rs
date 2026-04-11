@@ -557,6 +557,143 @@ impl MemProfile {
 }
 
 // ---------------------------------------------------------------------------
+// Simple-int-eq evaluation
+// ---------------------------------------------------------------------------
+
+impl GenPredicateKeysOp {
+    fn execute_simple_int_eq(
+        &self,
+        options: &Options,
+        ctx: &mut StreamContext,
+        start: Instant,
+    ) -> CommandResult {
+        let input_str = match options.require("source") {
+            Ok(s) => s,
+            Err(e) => return error_result(e, start),
+        };
+        let predicates_str = match options.require("predicates") {
+            Ok(s) => s,
+            Err(e) => return error_result(e, start),
+        };
+        let output_str = match options.require("output") {
+            Ok(s) => s,
+            Err(e) => return error_result(e, start),
+        };
+
+        let input_path = resolve_path(input_str, &ctx.workspace);
+        let predicates_path = resolve_path(predicates_str, &ctx.workspace);
+        let output_path = resolve_path(output_str, &ctx.workspace);
+
+        let fields: usize = options.parse_or("fields", 1u32).unwrap_or(1) as usize;
+
+        if let Some(parent) = output_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+
+        // Read metadata ivec: each record is `fields` i32 values
+        let meta_data = std::fs::read(&input_path)
+            .map_err(|e| format!("read {}: {}", input_path.display(), e));
+        let meta_bytes = match meta_data {
+            Ok(b) => b,
+            Err(e) => return error_result(e, start),
+        };
+        let record_bytes = 4 + fields * 4; // dim header + data
+        let meta_count = meta_bytes.len() / record_bytes;
+        ctx.ui.log(&format!("  evaluate: {} metadata records, {} fields", meta_count, fields));
+
+        // Parse metadata into Vec<Vec<i32>>
+        let mut metadata: Vec<Vec<i32>> = Vec::with_capacity(meta_count);
+        for i in 0..meta_count {
+            let base = i * record_bytes + 4; // skip dim header
+            let vals: Vec<i32> = (0..fields)
+                .map(|f| i32::from_le_bytes([
+                    meta_bytes[base + f*4],
+                    meta_bytes[base + f*4 + 1],
+                    meta_bytes[base + f*4 + 2],
+                    meta_bytes[base + f*4 + 3],
+                ]))
+                .collect();
+            metadata.push(vals);
+        }
+
+        // Read predicate ivec
+        let pred_data = std::fs::read(&predicates_path)
+            .map_err(|e| format!("read {}: {}", predicates_path.display(), e));
+        let pred_bytes = match pred_data {
+            Ok(b) => b,
+            Err(e) => return error_result(e, start),
+        };
+        let pred_count = pred_bytes.len() / record_bytes;
+        ctx.ui.log(&format!("  evaluate: {} predicates", pred_count));
+
+        // Parse predicates
+        let mut predicates: Vec<Vec<i32>> = Vec::with_capacity(pred_count);
+        for i in 0..pred_count {
+            let base = i * record_bytes + 4;
+            let vals: Vec<i32> = (0..fields)
+                .map(|f| i32::from_le_bytes([
+                    pred_bytes[base + f*4],
+                    pred_bytes[base + f*4 + 1],
+                    pred_bytes[base + f*4 + 2],
+                    pred_bytes[base + f*4 + 3],
+                ]))
+                .collect();
+            predicates.push(vals);
+        }
+
+        // Evaluate: for each predicate, find matching metadata ordinals
+        let pb = ctx.ui.bar(pred_count as u64, "evaluating predicates");
+        let mut results: Vec<Vec<i32>> = Vec::with_capacity(pred_count);
+        for (pi, pred) in predicates.iter().enumerate() {
+            let mut matches: Vec<i32> = Vec::new();
+            for (mi, meta) in metadata.iter().enumerate() {
+                if pred.iter().zip(meta.iter()).all(|(p, m)| p == m) {
+                    matches.push(mi as i32);
+                }
+            }
+            results.push(matches);
+            if (pi + 1) % 1000 == 0 { pb.set_position((pi + 1) as u64); }
+        }
+        pb.finish();
+
+        // Write output as ivec (each record = matching ordinals)
+        {
+            use std::io::Write;
+            let mut f = match std::fs::File::create(&output_path) {
+                Ok(f) => std::io::BufWriter::new(f),
+                Err(e) => return error_result(format!("create {}: {}", output_path.display(), e), start),
+            };
+            for matches in &results {
+                let dim = matches.len() as i32;
+                f.write_all(&dim.to_le_bytes()).unwrap_or(());
+                for &ord in matches {
+                    f.write_all(&ord.to_le_bytes()).unwrap_or(());
+                }
+            }
+        }
+
+        let total_matches: usize = results.iter().map(|r| r.len()).sum();
+        let avg_matches = if pred_count > 0 { total_matches as f64 / pred_count as f64 } else { 0.0 };
+        ctx.ui.log(&format!("  {} predicates evaluated, avg {:.1} matches/predicate",
+            pred_count, avg_matches));
+
+        // Write verified count
+        let var_name = format!("verified_count:{}",
+            output_path.file_name().and_then(|n| n.to_str()).unwrap_or("output"));
+        let _ = crate::pipeline::variables::set_and_save(
+            &ctx.workspace, &var_name, &pred_count.to_string());
+        ctx.defaults.insert(var_name, pred_count.to_string());
+
+        CommandResult {
+            status: Status::Ok,
+            message: format!("{} predicates, avg {:.1} matches", pred_count, avg_matches),
+            produced: vec![output_path],
+            elapsed: start.elapsed(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // CommandOp implementation
 // ---------------------------------------------------------------------------
 
@@ -649,7 +786,12 @@ sweep.
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
         let start = Instant::now();
 
-        let input_str = match options.require("input") {
+        let mode = options.get("mode").unwrap_or("survey");
+        if mode == "simple-int-eq" {
+            return self.execute_simple_int_eq(options, ctx, start);
+        }
+
+        let input_str = match options.require("source") {
             Ok(s) => s,
             Err(e) => return error_result(e, start),
         };
@@ -1733,11 +1875,11 @@ sweep.
     fn describe_options(&self) -> Vec<OptionDesc> {
         vec![
             opt(
-                "input",
+                "source",
                 "Path",
                 true,
                 None,
-                "Metadata slab (MNode records)",
+                "Metadata source (slab or ivec)",
                 OptionRole::Input,
             ),
             opt(
@@ -1759,10 +1901,26 @@ sweep.
             opt(
                 "survey",
                 "Path",
-                true,
+                false,
                 None,
-                "Survey JSON file (from 'survey') for field statistics and selectivity",
+                "Survey JSON file (not needed for simple-int-eq mode)",
                 OptionRole::Input,
+            ),
+            opt(
+                "mode",
+                "string",
+                false,
+                Some("survey"),
+                "Evaluation mode: 'survey' (slab-based) or 'simple-int-eq' (ivec integer equality)",
+                OptionRole::Config,
+            ),
+            opt(
+                "fields",
+                "int",
+                false,
+                Some("1"),
+                "Number of integer fields (simple-int-eq mode)",
+                OptionRole::Config,
             ),
             opt(
                 "limit",
@@ -2098,7 +2256,7 @@ mod tests {
         let output_path = ws.join("keys.slab");
 
         let mut opts = Options::new();
-        opts.set("input", meta_path.to_string_lossy().to_string());
+        opts.set("source", meta_path.to_string_lossy().to_string());
         opts.set("predicates", pred_path.to_string_lossy().to_string());
         opts.set("output", output_path.to_string_lossy().to_string());
         let survey_path = create_test_survey(ws, 20);
@@ -2143,7 +2301,7 @@ mod tests {
         let output_path = ws.join("keys.slab");
 
         let mut opts = Options::new();
-        opts.set("input", meta_path.to_string_lossy().to_string());
+        opts.set("source", meta_path.to_string_lossy().to_string());
         opts.set("predicates", pred_path.to_string_lossy().to_string());
         opts.set("output", output_path.to_string_lossy().to_string());
         opts.set("limit", "3".to_string());
@@ -2195,7 +2353,7 @@ mod tests {
         let output_path = ws.join("keys.slab");
 
         let mut opts = Options::new();
-        opts.set("input", meta_path.to_string_lossy().to_string());
+        opts.set("source", meta_path.to_string_lossy().to_string());
         opts.set("predicates", pred_path.to_string_lossy().to_string());
         opts.set("output", output_path.to_string_lossy().to_string());
         let survey_path = create_test_survey(ws, 20);
@@ -2232,7 +2390,7 @@ mod tests {
         let output_path = ws.join("keys.slab");
 
         let mut opts = Options::new();
-        opts.set("input", meta_path.to_string_lossy().to_string());
+        opts.set("source", meta_path.to_string_lossy().to_string());
         opts.set("predicates", pred_path.to_string_lossy().to_string());
         opts.set("output", output_path.to_string_lossy().to_string());
         let survey_path = create_test_survey(ws, 20);

@@ -73,15 +73,12 @@ impl CommandOp for AnalyzeSelectOp {
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
         let start = Instant::now();
 
-        let input_str = match options.require("input") {
+        let input_str = match options.require("source") {
             Ok(s) => s,
             Err(e) => return error_result(e, start),
         };
-        let ordinal: usize = match options.require("ordinal") {
-            Ok(s) => match s.parse() {
-                Ok(n) => n,
-                _ => return error_result(format!("invalid ordinal: '{}'", s), start),
-            },
+        let ordinal_str = match options.require("range") {
+            Ok(s) => s.to_string(),
             Err(e) => return error_result(e, start),
         };
 
@@ -143,23 +140,63 @@ impl CommandOp for AnalyzeSelectOp {
                 let d = VectorReader::<u8>::dim(&r);
                 (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
             }
+            ElementType::U16 => {
+                let r = match MmapVectorReader::<i16>::open_svec(&input_path) {
+                    Ok(r) => r, Err(e) => return error_result(format!("open: {}", e), start),
+                };
+                let fc = VectorReader::<i16>::count(&r);
+                let d = VectorReader::<i16>::dim(&r);
+                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
+            }
+            ElementType::U32 => {
+                let r = match MmapVectorReader::<i32>::open_ivec(&input_path) {
+                    Ok(r) => r, Err(e) => return error_result(format!("open: {}", e), start),
+                };
+                let fc = VectorReader::<i32>::count(&r);
+                let d = VectorReader::<i32>::dim(&r);
+                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
+            }
+            ElementType::U64 | ElementType::I64 => {
+                let r = match MmapVectorReader::<f64>::open_dvec(&input_path) {
+                    Ok(r) => r, Err(e) => return error_result(format!("open: {}", e), start),
+                };
+                let fc = VectorReader::<f64>::count(&r);
+                let d = VectorReader::<f64>::dim(&r);
+                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
+            }
         };
 
-        if ordinal >= count {
-            return error_result(
-                format!("ordinal {} out of range (file has {} vectors)", ordinal, count),
-                start,
-            );
+        // Parse ordinal spec: single number, comma-separated, or range [start,end)
+        let ordinals = parse_ordinal_spec(&ordinal_str, count);
+        if ordinals.is_err() {
+            return error_result(ordinals.unwrap_err(), start);
+        }
+        let ordinals = ordinals.unwrap();
+
+        if ordinals.is_empty() {
+            return error_result("no ordinals in range".into(), start);
         }
 
-        let vec = get_f64(ordinal);
         let type_name = format!("{}[{}]", etype, dim);
-        let output = format_vector(&type_name, &vec, format, ordinal);
-        log::info!("{}", output);
+        let is_integer = matches!(etype, ElementType::I32 | ElementType::I16 | ElementType::U8 | ElementType::I8);
+
+        for &ordinal in &ordinals {
+            let vec = get_f64(ordinal);
+            if format == "json" {
+                let output = format_vector(&type_name, &vec, format, ordinal, is_integer);
+                ctx.ui.log(&output);
+            } else if format == "csv" {
+                let output = format_vector(&type_name, &vec, format, ordinal, is_integer);
+                ctx.ui.log(&output);
+            } else {
+                let output = format_vector(&type_name, &vec, format, ordinal, is_integer);
+                ctx.ui.log(&output);
+            }
+        }
 
         CommandResult {
             status: Status::Ok,
-            message: format!("selected {} vector at ordinal {}", etype, ordinal),
+            message: format!("selected {} {} vectors", ordinals.len(), etype),
             produced: vec![],
             elapsed: start.elapsed(),
         }
@@ -168,7 +205,7 @@ impl CommandOp for AnalyzeSelectOp {
     fn describe_options(&self) -> Vec<OptionDesc> {
         vec![
             OptionDesc {
-                name: "input".to_string(),
+                name: "source".to_string(),
                 type_name: "Path".to_string(),
                 required: true,
                 default: None,
@@ -176,11 +213,11 @@ impl CommandOp for AnalyzeSelectOp {
                         role: OptionRole::Input,
         },
             OptionDesc {
-                name: "ordinal".to_string(),
-                type_name: "int".to_string(),
+                name: "range".to_string(),
+                type_name: "string".to_string(),
                 required: true,
                 default: None,
-                description: "0-based index of the vector to retrieve".to_string(),
+                description: "Ordinal(s): single (42), range ([0,10) or 0..10 or 0-9), or comma-separated (0,1,2)".to_string(),
                         role: OptionRole::Config,
         },
             OptionDesc {
@@ -195,32 +232,99 @@ impl CommandOp for AnalyzeSelectOp {
     }
 }
 
-fn format_vector<T: std::fmt::Display>(type_name: &str, values: &[T], format: &str, ordinal: usize) -> String {
+/// Parse an ordinal spec into a list of ordinals.
+///
+/// Supports: single number (`42`), comma-separated (`0,1,2`),
+/// range syntax (`[0,10)`, `0..10`, `5-9`).
+fn parse_ordinal_spec(spec: &str, count: usize) -> Result<Vec<usize>, String> {
+    let spec = spec.trim();
+
+    // Range: [start,end) or [start,end]
+    if spec.starts_with('[') {
+        let inner = spec.trim_start_matches('[').trim_end_matches(')').trim_end_matches(']');
+        let exclusive = spec.ends_with(')');
+        let parts: Vec<&str> = inner.split(',').collect();
+        if parts.len() == 2 {
+            let start: usize = parts[0].trim().parse()
+                .map_err(|_| format!("invalid range start: '{}'", parts[0]))?;
+            let end: usize = parts[1].trim().parse()
+                .map_err(|_| format!("invalid range end: '{}'", parts[1]))?;
+            let end = if exclusive { end } else { end + 1 };
+            let end = end.min(count);
+            if start >= end { return Err(format!("empty range [{}, {})", start, end)); }
+            return Ok((start..end).collect());
+        }
+    }
+
+    // Range: start..end
+    if spec.contains("..") {
+        let parts: Vec<&str> = spec.split("..").collect();
+        if parts.len() == 2 {
+            let start: usize = parts[0].trim().parse()
+                .map_err(|_| format!("invalid range start: '{}'", parts[0]))?;
+            let end: usize = parts[1].trim().parse()
+                .map_err(|_| format!("invalid range end: '{}'", parts[1]))?;
+            let end = end.min(count);
+            if start >= end { return Err(format!("empty range {}..{}", start, end)); }
+            return Ok((start..end).collect());
+        }
+    }
+
+    // Range: start-end (only if both parts are numeric)
+    if spec.contains('-') && !spec.starts_with('-') {
+        let parts: Vec<&str> = spec.splitn(2, '-').collect();
+        if parts.len() == 2 {
+            if let (Ok(start), Ok(end)) = (parts[0].parse::<usize>(), parts[1].parse::<usize>()) {
+                let end = (end + 1).min(count);
+                if start >= end { return Err(format!("empty range {}-{}", start, end - 1)); }
+                return Ok((start..end).collect());
+            }
+        }
+    }
+
+    // Comma-separated
+    if spec.contains(',') {
+        let mut ordinals = Vec::new();
+        for part in spec.split(',') {
+            let ord: usize = part.trim().parse()
+                .map_err(|_| format!("invalid ordinal: '{}'", part.trim()))?;
+            if ord >= count {
+                return Err(format!("ordinal {} out of range (file has {} vectors)", ord, count));
+            }
+            ordinals.push(ord);
+        }
+        return Ok(ordinals);
+    }
+
+    // Single ordinal
+    let ord: usize = spec.parse()
+        .map_err(|_| format!("invalid ordinal: '{}'", spec))?;
+    if ord >= count {
+        return Err(format!("ordinal {} out of range (file has {} vectors)", ord, count));
+    }
+    Ok(vec![ord])
+}
+
+fn format_vector(type_name: &str, values: &[f64], format: &str, ordinal: usize, is_integer: bool) -> String {
+    let fmt_val = |v: &f64| -> String {
+        if is_integer { format!("{}", *v as i64) } else { format!("{}", v) }
+    };
+
     match format {
         "json" => {
-            let vals: Vec<String> = values.iter().map(|v| format!("{}", v)).collect();
+            let vals: Vec<String> = values.iter().map(fmt_val).collect();
             format!(
                 "{{\"ordinal\":{},\"type\":\"{}\",\"dim\":{},\"values\":[{}]}}",
-                ordinal,
-                type_name,
-                values.len(),
-                vals.join(",")
+                ordinal, type_name, values.len(), vals.join(",")
             )
         }
         "csv" => {
-            let vals: Vec<String> = values.iter().map(|v| format!("{}", v)).collect();
-            vals.join(",")
+            let vals: Vec<String> = values.iter().map(fmt_val).collect();
+            format!("{},{}", ordinal, vals.join(","))
         }
         _ => {
-            // text format
-            let vals: Vec<String> = values.iter().map(|v| format!("{}", v)).collect();
-            format!(
-                "Vector Data:\n  type: {}\n  ordinal: {}\n  dim: {}\n  values: [{}]",
-                type_name,
-                ordinal,
-                values.len(),
-                vals.join(", ")
-            )
+            let vals: Vec<String> = values.iter().map(fmt_val).collect();
+            format!("[{}] {}", ordinal, vals.join(", "))
         }
     }
 }
@@ -289,8 +393,8 @@ mod tests {
 
         // Select vector at ordinal 5
         let mut opts = Options::new();
-        opts.set("input", path.to_string_lossy().to_string());
-        opts.set("ordinal", "5");
+        opts.set("source", path.to_string_lossy().to_string());
+        opts.set("range", "5");
         let mut op = AnalyzeSelectOp;
         let result = op.execute(&opts, &mut ctx);
         assert_eq!(result.status, Status::Ok);
@@ -312,8 +416,8 @@ mod tests {
         gen_op.execute(&opts, &mut ctx);
 
         let mut opts = Options::new();
-        opts.set("input", path.to_string_lossy().to_string());
-        opts.set("ordinal", "10");
+        opts.set("source", path.to_string_lossy().to_string());
+        opts.set("range", "10");
         let mut op = AnalyzeSelectOp;
         let result = op.execute(&opts, &mut ctx);
         assert_eq!(result.status, Status::Error);
@@ -336,8 +440,8 @@ mod tests {
         gen_op.execute(&opts, &mut ctx);
 
         let mut opts = Options::new();
-        opts.set("input", path.to_string_lossy().to_string());
-        opts.set("ordinal", "0");
+        opts.set("source", path.to_string_lossy().to_string());
+        opts.set("range", "0");
         opts.set("format", "json");
         let mut op = AnalyzeSelectOp;
         let result = op.execute(&opts, &mut ctx);
@@ -346,16 +450,23 @@ mod tests {
 
     #[test]
     fn test_format_vector_text() {
-        let values = vec![1.0f32, 2.5, 3.7];
-        let output = format_vector("float[]", &values, "text", 0);
-        assert!(output.contains("float[]"));
-        assert!(output.contains("dim: 3"));
+        let values = vec![1.0, 2.5, 3.7];
+        let output = format_vector("float[]", &values, "text", 0, false);
+        assert!(output.contains("1, 2.5, 3.7"));
     }
 
     #[test]
     fn test_format_vector_csv() {
-        let values = vec![1, 2, 3];
-        let output = format_vector("int[]", &values, "csv", 0);
-        assert_eq!(output, "1,2,3");
+        let values = vec![1.0, 2.0, 3.0];
+        let output = format_vector("int[]", &values, "csv", 0, true);
+        assert_eq!(output, "0,1,2,3");
+    }
+
+    #[test]
+    fn test_format_vector_json() {
+        let values = vec![42.0];
+        let output = format_vector("i32[1]", &values, "json", 5, true);
+        assert!(output.contains("\"ordinal\":5"));
+        assert!(output.contains("[42]"));
     }
 }

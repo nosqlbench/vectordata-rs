@@ -273,12 +273,18 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
             round_digits: 2,
             pedantic_dedup: false,
             selectivity: 0.0001,
+            predicate_count: 10000,
+            predicate_strategy: "eq".to_string(),
             classic: seeds.classic,
             personality: "native".to_string(),
             synthesize_metadata: false,
+            synthesis_mode: "simple-int-eq".to_string(),
+            synthesis_format: "slab".to_string(),
             metadata_fields: 3,
             metadata_range_min: 0,
             metadata_range_max: 1000,
+            predicate_range_min: 0,
+            predicate_range_max: 1000,
         };
         super::import::resolve_facets(&probe)
     };
@@ -312,12 +318,18 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
         parsed
     } else {
         let input = prompt_with_default(
-            "Confirm facets (Enter to accept, or enter e.g. BQGD)",
+            "Facets to include in dataset (* for all)",
             &implied_facets,
         );
         let parsed = crate::prepare::import::parse_facet_spec(input.trim());
-        if parsed != input.trim().to_uppercase() || parsed.len() > 4 {
-            println!("  → Required facets: {}", parsed);
+        // Show what was selected, and note which facets will be generated
+        let extra: String = parsed.chars()
+            .filter(|c| !implied_facets.contains(*c))
+            .collect();
+        if !extra.is_empty() {
+            println!("  → Facets: {}  ({}  will be generated)", parsed, extra);
+        } else if parsed != input.trim().to_uppercase() {
+            println!("  → Facets: {}", parsed);
         }
         parsed
     };
@@ -438,38 +450,93 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
     };
 
     // ── Metadata — resolved from facets + detected inputs ──────────────
-    // M confirmed + detected → use it. M confirmed + not detected → prompt path.
-    // M not confirmed → skip. No path → offer synthesis.
-    let (metadata, synthesize_metadata, metadata_fields, metadata_range_min, metadata_range_max) = if !want_m {
-        (None, false, 3, 0, 1000)
+    // M confirmed + detected → use it. M confirmed + not detected → synthesis.
+    // M not confirmed → skip.
+    // For simple-int-eq mode, predicate count is asked here to avoid
+    // a redundant predicate config section later.
+    let mut simple_int_eq_predicate_count: Option<u32> = None;
+    #[allow(clippy::type_complexity)]
+    let (metadata, synthesize_metadata, synthesis_mode, synthesis_format,
+         metadata_fields, metadata_range_min, metadata_range_max,
+         predicate_range_min, predicate_range_max)
+    : (Option<PathBuf>, bool, String, String, u32, i32, i32, i32, i32) = if !want_m {
+        (None, false, "simple-int-eq".into(), "slab".into(), 3, 0, 1000, 0, 1000)
     } else if roles_accepted && detected.metadata.is_some() {
         let m = detected.metadata.as_ref().unwrap().clone();
-        (Some(m), false, 3, 0, 1000)
+        (Some(m), false, "simple-int-eq".into(), "slab".into(), 3, 0, 1000, 0, 1000)
     } else if let Some(ref seeded) = seeds.metadata {
-        (Some(seeded.clone()), false, 3, 0, 1000)
+        (Some(seeded.clone()), false, "simple-int-eq".into(), "slab".into(), 3, 0, 1000, 0, 1000)
     } else {
-        // M facet was confirmed but no metadata detected — ask for path or synthesize
-        let path = prompt_optional_path("Path to metadata source");
-        if let Some(m) = path {
-            (Some(m), false, 3, 0, 1000)
-        } else {
-            // No path provided — offer synthesis
+        // M facet was confirmed but no metadata file is available.
+        // Offer synthesis modes.
+        {
             println!();
-            println!("  No metadata source provided. Metadata can be synthesized with");
-            println!("  random integer fields for predicate testing.");
-            if confirm("Synthesize metadata?", true) {
-                let fields_str = prompt_with_default("Number of integer fields per record", "3");
-                let fields: u32 = fields_str.parse().unwrap_or(3);
+            println!("--- Metadata & Predicate Synthesis ---");
+            println!("  No metadata source detected. Choose a synthesis mode:");
+            println!();
+            println!("    1. Simple integer equality");
+            println!("       Each record gets integer fields in a range.");
+            println!("       Predicates are single-field equality checks.");
+            println!();
+            println!("    2. Conjugate & selectivity synthesis (not yet implemented)");
+            println!("       Compound AND/OR predicates with selectivity control.");
+            println!();
+
+            let mode_choice = prompt_with_default("Synthesis mode [1/2]", "1");
+
+            if mode_choice == "2" {
+                println!("  Conjugate synthesis is not yet implemented.");
+                println!("  Falling back to simple integer equality.");
+            }
+
+            if mode_choice == "1" || mode_choice == "2" {
+                println!();
+                println!("  Metadata — each record gets integer fields drawn from a range.");
+                let fields_str = prompt_with_default("Number of integer fields per record", "1");
+                let fields: u32 = fields_str.parse().unwrap_or(1);
                 let rmin_str = prompt_with_default("Range minimum (inclusive)", "0");
                 let rmin: i32 = rmin_str.parse().unwrap_or(0);
-                let rmax_str = prompt_with_default("Range maximum (exclusive)", "1000");
-                let rmax: i32 = rmax_str.parse().unwrap_or(1000);
-                (None, true, fields, rmin, rmax)
+                let rmax_str = prompt_with_default("Range maximum (exclusive)", "100");
+                let rmax: i32 = rmax_str.parse().unwrap_or(100);
+
+                let range_size = (rmax - rmin).max(1) as f64;
+                println!();
+                println!("  Predicates — each predicate is \"field == value\".");
+                println!("  Predicate values are drawn from a range (can differ from metadata).");
+                let pred_rmin_str = prompt_with_default("Predicate range minimum (inclusive)",
+                    &rmin.to_string());
+                let pred_rmin: i32 = pred_rmin_str.parse().unwrap_or(rmin);
+                let pred_rmax_str = prompt_with_default("Predicate range maximum (exclusive)",
+                    &rmax.to_string());
+                let pred_rmax: i32 = pred_rmax_str.parse().unwrap_or(rmax);
+                let pred_range = (pred_rmax - pred_rmin).max(1) as f64;
+                let match_pct = if pred_rmax <= rmax && pred_rmin >= rmin {
+                    100.0 / range_size  // predicate values all within metadata range
+                } else {
+                    // some predicate values may be outside metadata range → lower match rate
+                    let overlap = (rmax.min(pred_rmax) - rmin.max(pred_rmin)).max(0) as f64;
+                    (overlap / pred_range) * (100.0 / range_size)
+                };
+                println!("  Each predicate matches ~{:.1}% of records.", match_pct);
+
+                let count_str = prompt_with_default("Number of predicates to generate", "10000");
+                let pred_count: u32 = count_str.parse().unwrap_or(10000);
+
+                println!();
+                println!("  Storage format for metadata and predicates:");
+                println!("    slab  — canonical MNode/PNode in slab files (full type system)");
+                println!("    ivec  — plain integer vectors (lightweight, fast)");
+                let format = prompt_with_default("Storage format", "ivec");
+
+                // Stash predicate config for later — avoids redundant prompts
+                simple_int_eq_predicate_count = Some(pred_count);
+
+                (None, true, "simple-int-eq".into(), format, fields, rmin, rmax, pred_rmin, pred_rmax)
             } else {
-                // User declined synthesis — drop M and dependent facets
+                // User entered something unexpected — drop M facets
                 println!("  Dropping M facet (no metadata source).");
                 confirmed_facets.retain(|c| !matches!(c, 'M' | 'P' | 'R' | 'F'));
-                (None, false, 3, 0, 1000)
+                (None, false, "simple-int-eq".into(), "slab".into(), 3, 0, 1000, 0, 1000)
             }
         }
     };
@@ -544,6 +611,7 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
 
     println!("  L2-normalization ensures all vectors have unit length.");
     println!("  This is applied during extraction — source data is unchanged.");
+    let has_precomputed_gt = ground_truth.is_some();
     let normalize = if let Some(seeded) = seeds.normalize {
         println!("  (seeded: normalize={})", seeded);
         seeded
@@ -556,8 +624,12 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
             println!("  Skipping normalization (already normalized).");
             false
         }
+    } else if has_precomputed_gt {
+        println!("  Pre-computed ground truth provided — normalizing would");
+        println!("  change distances and invalidate the GT neighbors.");
+        confirm("L2-normalize vectors? (will invalidate GT)", false)
     } else {
-        confirm("Normalize if needed?", true)
+        confirm("L2-normalize vectors?", true)
     };
 
     // ── Remaining configuration ─────────────────────────────────────
@@ -596,22 +668,42 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
         }
     };
 
-    // Predicate selectivity — only relevant when predicates will be synthesized
-    let selectivity = if confirmed_facets.contains('P') {
+    // Predicate configuration — skip if already configured by simple-int-eq synthesis
+    let (selectivity, predicate_count, predicate_strategy) = if let Some(count) = simple_int_eq_predicate_count {
+        // Simple-int-eq: strategy is always "eq", selectivity is 1/range
+        let range = (metadata_range_max - metadata_range_min).max(1) as f64;
+        (1.0 / range, count, "eq".to_string())
+    } else if confirmed_facets.contains('P') {
+        // Non-synthesis predicates — full configuration prompt
         println!();
-        println!("  Predicate selectivity controls filtering difficulty.");
+        println!("--- Predicates ---");
+
+        let natural_selectivity = 0.0001;
+
+        println!("  Predicate strategy:");
+        println!("    eq       — single-field equality (simple, default)");
+        println!("    compound — multi-field AND (harder, mixed operators)");
+        let strategy = prompt_with_default("Strategy", "eq");
+
+        let count_str = prompt_with_default("Number of predicates to generate", "10000");
+        let count: u32 = count_str.parse().unwrap_or(10000);
+
+        println!();
+        println!("  Selectivity controls filtering difficulty.");
         println!("  Lower = harder (fewer matches per query).");
         println!("    0.1    = 10% of base qualifies   (easy)");
         println!("    0.01   = 1%                       (moderate)");
         println!("    0.001  = 0.1%                     (hard)");
         println!("    0.0001 = 0.01%                    (very hard)");
-        let default = seeds.selectivity
+        let default_sel = seeds.selectivity
             .map(|s| format!("{}", s))
-            .unwrap_or_else(|| "0.0001".into());
-        let sel_str = prompt_with_default("Predicate selectivity", &default);
-        sel_str.parse::<f64>().unwrap_or(0.0001)
+            .unwrap_or_else(|| format!("{}", natural_selectivity));
+        let sel_str = prompt_with_default("Predicate selectivity", &default_sel);
+        let sel = sel_str.parse::<f64>().unwrap_or(natural_selectivity);
+
+        (sel, count, strategy)
     } else {
-        seeds.selectivity.unwrap_or(0.0001)
+        (seeds.selectivity.unwrap_or(0.0001), 10000, "eq".to_string())
     };
 
     // ── Optional features ────────────────────────────────────────────
@@ -997,12 +1089,18 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
         round_digits: seeds.round_digits.unwrap_or(2),
         pedantic_dedup: seeds.pedantic_dedup.unwrap_or(false),
         selectivity,
+        predicate_count,
+        predicate_strategy,
         classic: seeds.classic,
         personality: "native".to_string(),
         synthesize_metadata,
+        synthesis_mode,
+        synthesis_format,
         metadata_fields,
         metadata_range_min,
         metadata_range_max,
+        predicate_range_min,
+        predicate_range_max,
     }
 }
 

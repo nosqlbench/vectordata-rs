@@ -114,52 +114,75 @@ compatible with `generate predicates` and `compute evaluate-predicates`.
             }
         }
 
+        let format = options.get("format").unwrap_or("slab");
+
         ctx.ui.log(&format!(
-            "  generate metadata: {} records, {} fields, range [{}..{}), seed={}",
-            count, fields, range_min, range_max, seed,
+            "  generate metadata: {} records, {} fields, range [{}..{}), seed={}, format={}",
+            count, fields, range_min, range_max, seed, format,
         ));
 
-        // Generate field names
-        let field_names: Vec<String> = (0..fields)
-            .map(|i| format!("field_{}", i))
-            .collect();
-
-        // Open slab writer
-        let config = match slabtastic::WriterConfig::new(512, 4096, u32::MAX, false) {
-            Ok(c) => c,
-            Err(e) => return error_result(format!("slab config: {}", e), start),
-        };
-        let mut writer = match slabtastic::SlabWriter::new(&output_path, config) {
-            Ok(w) => w,
-            Err(e) => return error_result(format!("create slab: {}", e), start),
-        };
-
         let mut rng = Xoshiro256PlusPlus::seed_from_u64(seed);
-        let pb = ctx.ui.bar_with_unit(count as u64, "generating metadata", "records");
         let range = range_max - range_min;
 
-        for ordinal in 0..count {
-            // Build MNode record with integer fields
-            let mut node = MNode::new();
-            for name in &field_names {
-                let value = range_min + rng.random_range(0..range);
-                node.fields.insert(name.clone(), MValue::Int32(value));
+        if format == "ivec" {
+            // Write as ivec: each record is `fields` i32 values
+            use std::io::Write;
+            let mut f = match std::fs::File::create(&output_path) {
+                Ok(f) => std::io::BufWriter::new(f),
+                Err(e) => return error_result(format!("create {}: {}", output_path.display(), e), start),
+            };
+            let pb = ctx.ui.bar_with_unit(count as u64, "generating metadata", "records");
+            for ordinal in 0..count {
+                // Write dimension header
+                if f.write_all(&(fields as i32).to_le_bytes()).is_err() {
+                    return error_result(format!("write record {}", ordinal), start);
+                }
+                for _ in 0..fields {
+                    let value = range_min + rng.random_range(0..range);
+                    if f.write_all(&value.to_le_bytes()).is_err() {
+                        return error_result(format!("write record {}", ordinal), start);
+                    }
+                }
+                if (ordinal + 1) % 10_000 == 0 {
+                    pb.set_position((ordinal + 1) as u64);
+                }
             }
+            pb.finish();
+        } else {
+            // Write as slab of MNode records
+            let field_names: Vec<String> = (0..fields)
+                .map(|i| format!("field_{}", i))
+                .collect();
 
-            // Serialize and write to slab
-            let bytes = node.to_bytes();
-            if let Err(e) = writer.add_record(&bytes) {
-                return error_result(format!("write record {}: {}", ordinal, e), start);
+            let config = match slabtastic::WriterConfig::new(512, 4096, u32::MAX, false) {
+                Ok(c) => c,
+                Err(e) => return error_result(format!("slab config: {}", e), start),
+            };
+            let mut writer = match slabtastic::SlabWriter::new(&output_path, config) {
+                Ok(w) => w,
+                Err(e) => return error_result(format!("create slab: {}", e), start),
+            };
+
+            let pb = ctx.ui.bar_with_unit(count as u64, "generating metadata", "records");
+            for ordinal in 0..count {
+                let mut node = MNode::new();
+                for name in &field_names {
+                    let value = range_min + rng.random_range(0..range);
+                    node.fields.insert(name.clone(), MValue::Int32(value));
+                }
+                let bytes = node.to_bytes();
+                if let Err(e) = writer.add_record(&bytes) {
+                    return error_result(format!("write record {}: {}", ordinal, e), start);
+                }
+                if (ordinal + 1) % 10_000 == 0 {
+                    pb.set_position((ordinal + 1) as u64);
+                }
             }
+            pb.finish();
 
-            if (ordinal + 1) % 10_000 == 0 {
-                pb.set_position((ordinal + 1) as u64);
+            if let Err(e) = writer.finish() {
+                return error_result(format!("finalize slab: {}", e), start);
             }
-        }
-        pb.finish();
-
-        if let Err(e) = writer.finish() {
-            return error_result(format!("finalize slab: {}", e), start);
         }
 
         // Set verified count variable

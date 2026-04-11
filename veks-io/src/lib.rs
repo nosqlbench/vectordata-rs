@@ -45,6 +45,7 @@
 //! - `slab` — Slab format read/write (adds slabtastic dependency)
 
 pub mod format;
+pub mod scalar;
 pub mod traits;
 pub mod xvec;
 
@@ -77,23 +78,19 @@ pub fn open(path: impl AsRef<Path>) -> Result<Box<dyn VecSource>, String> {
 
 /// Open a vector file with an explicit format.
 pub fn open_format(path: &Path, format: VecFormat) -> Result<Box<dyn VecSource>, String> {
+    if format.is_xvec() {
+        return xvec::reader::open(path, format);
+    }
+    if format.is_scalar() {
+        return scalar::reader::open(path, format);
+    }
     match format {
-        VecFormat::Fvec | VecFormat::Ivec | VecFormat::Bvec
-        | VecFormat::Dvec | VecFormat::Mvec | VecFormat::Svec => {
-            xvec::reader::open(path, format)
-        }
         #[cfg(feature = "npy")]
-        VecFormat::Npy => {
-            Err("npy reading not yet implemented in veks-io".into())
-        }
+        VecFormat::Npy => Err("npy reading not yet implemented in veks-io".into()),
         #[cfg(feature = "parquet")]
-        VecFormat::Parquet => {
-            Err("parquet reading not yet implemented in veks-io".into())
-        }
+        VecFormat::Parquet => Err("parquet reading not yet implemented in veks-io".into()),
         #[cfg(feature = "slab")]
-        VecFormat::Slab => {
-            Err("slab reading not yet implemented in veks-io".into())
-        }
+        VecFormat::Slab => Err("slab reading not yet implemented in veks-io".into()),
         _ => Err(format!("{} format is not supported", format)),
     }
 }
@@ -122,13 +119,13 @@ pub fn create_format(path: &Path, format: VecFormat, dimension: u32) -> Result<B
     if !format.is_writable() {
         return Err(format!("{} is not a writable format", format));
     }
-    match format {
-        VecFormat::Fvec | VecFormat::Ivec | VecFormat::Bvec
-        | VecFormat::Dvec | VecFormat::Mvec | VecFormat::Svec => {
-            xvec::writer::open(path, dimension)
-        }
-        _ => Err(format!("{} writing not yet implemented in veks-io", format)),
+    if format.is_xvec() {
+        return xvec::writer::open(path, dimension);
     }
+    if format.is_scalar() {
+        return scalar::writer::open(path, format);
+    }
+    Err(format!("{} writing not yet implemented in veks-io", format))
 }
 
 /// Probe a vector file for metadata without reading all data.
@@ -189,13 +186,13 @@ pub fn create_varlen(path: impl AsRef<Path>) -> Result<Box<dyn VarlenSink>, Stri
 
 /// Probe with an explicit format.
 pub fn probe_format(path: &Path, format: VecFormat) -> Result<SourceMeta, String> {
-    match format {
-        VecFormat::Fvec | VecFormat::Ivec | VecFormat::Bvec
-        | VecFormat::Dvec | VecFormat::Mvec | VecFormat::Svec => {
-            xvec::reader::probe(path, format)
-        }
-        _ => Err(format!("{} probing not yet implemented in veks-io", format)),
+    if format.is_xvec() {
+        return xvec::reader::probe(path, format);
     }
+    if format.is_scalar() {
+        return scalar::reader::probe(path, format);
+    }
+    Err(format!("{} probing not yet implemented in veks-io", format))
 }
 
 #[cfg(test)]
@@ -655,5 +652,174 @@ mod tests {
     #[test]
     fn create_unwritable_path() {
         assert!(create(Path::new("/proc/data.fvec"), 10).is_err());
+    }
+
+    // ── scalar format roundtrips ────────────────────────────────────
+
+    #[test]
+    fn scalar_u8_roundtrip() {
+        let tmp = make_tmp();
+        let path = tmp.path().join("data.u8");
+        let mut w = create(&path, 1).unwrap();
+        for v in [0u8, 127, 255] {
+            w.write_record(0, &[v]);
+        }
+        w.finish().unwrap();
+
+        let meta = probe(&path).unwrap();
+        assert_eq!(meta.dimension, 1);
+        assert_eq!(meta.element_size, 1);
+        assert_eq!(meta.record_count, Some(3));
+
+        let mut r = open(&path).unwrap();
+        assert_eq!(r.next_record().unwrap(), vec![0u8]);
+        assert_eq!(r.next_record().unwrap(), vec![127u8]);
+        assert_eq!(r.next_record().unwrap(), vec![255u8]);
+        assert!(r.next_record().is_none());
+    }
+
+    #[test]
+    fn scalar_i32_roundtrip() {
+        let tmp = make_tmp();
+        let path = tmp.path().join("data.i32");
+        let mut w = create(&path, 1).unwrap();
+        for v in [-1i32, 0, 42, i32::MAX, i32::MIN] {
+            w.write_record(0, &v.to_le_bytes());
+        }
+        w.finish().unwrap();
+
+        let meta = probe(&path).unwrap();
+        assert_eq!(meta.dimension, 1);
+        assert_eq!(meta.element_size, 4);
+        assert_eq!(meta.record_count, Some(5));
+
+        let mut r = open(&path).unwrap();
+        let v0 = r.next_record().unwrap();
+        assert_eq!(i32::from_le_bytes(v0[..4].try_into().unwrap()), -1);
+        let v3 = { r.next_record(); r.next_record(); r.next_record().unwrap() };
+        assert_eq!(i32::from_le_bytes(v3[..4].try_into().unwrap()), i32::MAX);
+    }
+
+    #[test]
+    fn scalar_u64_roundtrip() {
+        let tmp = make_tmp();
+        let path = tmp.path().join("data.u64");
+        let mut w = create(&path, 1).unwrap();
+        for v in [0u64, 1, u64::MAX] {
+            w.write_record(0, &v.to_le_bytes());
+        }
+        w.finish().unwrap();
+
+        let meta = probe(&path).unwrap();
+        assert_eq!(meta.record_count, Some(3));
+        assert_eq!(meta.element_size, 8);
+    }
+
+    #[test]
+    fn scalar_all_types_probe() {
+        let tmp = make_tmp();
+        for (ext, elem_size) in [
+            ("u8", 1), ("i8", 1), ("u16", 2), ("i16", 2),
+            ("u32", 4), ("i32", 4), ("u64", 8), ("i64", 8),
+        ] {
+            let path = tmp.path().join(format!("data.{}", ext));
+            let data = vec![0u8; elem_size * 10]; // 10 records
+            std::fs::write(&path, &data).unwrap();
+
+            let meta = probe(&path).unwrap();
+            assert_eq!(meta.dimension, 1, "dim for {}", ext);
+            assert_eq!(meta.element_size, elem_size, "elem_size for {}", ext);
+            assert_eq!(meta.record_count, Some(10), "count for {}", ext);
+        }
+    }
+
+    #[test]
+    fn scalar_invalid_file_size_rejected() {
+        let tmp = make_tmp();
+        let path = tmp.path().join("bad.i32");
+        std::fs::write(&path, &[0u8; 5]).unwrap(); // 5 bytes, not divisible by 4
+        assert!(open(&path).is_err());
+        assert!(probe(&path).is_err());
+    }
+
+    // ── new vector format roundtrips ────────────────────────────────
+
+    #[test]
+    fn roundtrip_i8vec() {
+        let tmp = make_tmp();
+        let path = tmp.path().join("data.i8vec");
+        let mut w = create(&path, 3).unwrap();
+        let v: Vec<u8> = [-1i8, 0, 127].iter().map(|v| *v as u8).collect();
+        w.write_record(0, &v);
+        w.finish().unwrap();
+
+        let mut r = open(&path).unwrap();
+        assert_eq!(r.dimension(), 3);
+        assert_eq!(r.element_size(), 1);
+        let rec = r.next_record().unwrap();
+        assert_eq!(rec[0] as i8, -1);
+        assert_eq!(rec[1] as i8, 0);
+        assert_eq!(rec[2] as i8, 127);
+    }
+
+    #[test]
+    fn roundtrip_u16vec() {
+        let tmp = make_tmp();
+        let path = tmp.path().join("data.u16vec");
+        let mut w = create(&path, 2).unwrap();
+        let v: Vec<u8> = [1000u16, 65535].iter()
+            .flat_map(|v| v.to_le_bytes()).collect();
+        w.write_record(0, &v);
+        w.finish().unwrap();
+
+        let mut r = open(&path).unwrap();
+        assert_eq!(r.dimension(), 2);
+        assert_eq!(r.element_size(), 2);
+    }
+
+    #[test]
+    fn roundtrip_u32vec() {
+        let tmp = make_tmp();
+        let path = tmp.path().join("data.u32vec");
+        let mut w = create(&path, 2).unwrap();
+        let v: Vec<u8> = [0u32, u32::MAX].iter()
+            .flat_map(|v| v.to_le_bytes()).collect();
+        w.write_record(0, &v);
+        w.finish().unwrap();
+
+        let mut r = open(&path).unwrap();
+        assert_eq!(r.dimension(), 2);
+        assert_eq!(r.element_size(), 4);
+    }
+
+    #[test]
+    fn roundtrip_i64vec() {
+        let tmp = make_tmp();
+        let path = tmp.path().join("data.i64vec");
+        let mut w = create(&path, 1).unwrap();
+        let v = i64::MIN.to_le_bytes().to_vec();
+        w.write_record(0, &v);
+        w.finish().unwrap();
+
+        let mut r = open(&path).unwrap();
+        assert_eq!(r.dimension(), 1);
+        assert_eq!(r.element_size(), 8);
+        let rec = r.next_record().unwrap();
+        assert_eq!(i64::from_le_bytes(rec[..8].try_into().unwrap()), i64::MIN);
+    }
+
+    #[test]
+    fn roundtrip_u64vec() {
+        let tmp = make_tmp();
+        let path = tmp.path().join("data.u64vec");
+        let mut w = create(&path, 1).unwrap();
+        let v = u64::MAX.to_le_bytes().to_vec();
+        w.write_record(0, &v);
+        w.finish().unwrap();
+
+        let mut r = open(&path).unwrap();
+        assert_eq!(r.element_size(), 8);
+        let rec = r.next_record().unwrap();
+        assert_eq!(u64::from_le_bytes(rec[..8].try_into().unwrap()), u64::MAX);
     }
 }

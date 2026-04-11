@@ -96,13 +96,19 @@ fn default_args(name: &str, output: &Path) -> ImportArgs {
         round_digits: 2,
         pedantic_dedup: false,
         selectivity: 0.0001,
+        predicate_count: 10000,
+        predicate_strategy: "eq".to_string(),
         provided_facets: None,
         classic: false,
         personality: "native".to_string(),
         synthesize_metadata: false,
+            synthesis_mode: "simple-int-eq".to_string(),
+            synthesis_format: "slab".to_string(),
         metadata_fields: 3,
         metadata_range_min: 0,
         metadata_range_max: 1000,
+            predicate_range_min: 0,
+            predicate_range_max: 1000,
     }
 }
 

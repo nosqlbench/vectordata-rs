@@ -67,8 +67,12 @@ pub enum DatasetsCommand {
 
         // -- Filter predicates --
 
-        /// Filter by dataset name (substring, regex, or glob)
-        #[arg(long = "matching-name")]
+        /// Filter by dataset name (exact match, substring, regex, or glob)
+        #[arg(long, short = 'd')]
+        dataset: Option<String>,
+
+        /// Filter by dataset name (substring, regex, or glob) — alias for --dataset
+        #[arg(long = "matching-name", conflicts_with = "dataset")]
         matching_name: Option<String>,
 
         /// Filter: dataset must contain this facet/view
@@ -258,6 +262,7 @@ pub fn run(args: DatasetsArgs) {
             output_format,
             verbose,
             group_by,
+            dataset,
             matching_name,
             facet,
             metric,
@@ -283,8 +288,9 @@ pub fn run(args: DatasetsArgs) {
             // Resolve numbered catalog shortcuts
             let catalog: Vec<String> = raw_catalog.iter().map(|v| resolve_catalog_value(v)).collect();
 
-            // Normalize glob patterns to regex
-            let name = matching_name.map(|p| filter::normalize_match_pattern(&p, "--matching-name"));
+            // Normalize glob patterns to regex (--dataset takes precedence)
+            let name_filter = dataset.or(matching_name);
+            let name = name_filter.map(|p| filter::normalize_match_pattern(&p, "--dataset"));
             let desc = matching_desc.map(|p| filter::normalize_match_pattern(&p, "--matching-desc"));
             let profile_pat = matching_profile.map(|p| filter::normalize_match_pattern(&p, "--matching-profile"));
 

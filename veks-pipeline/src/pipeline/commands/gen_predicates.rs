@@ -32,83 +32,9 @@ pub fn factory() -> Box<dyn CommandOp> {
     Box::new(GenPredicatesOp)
 }
 
-impl CommandOp for GenPredicatesOp {
-    fn command_path(&self) -> &str {
-        "generate predicates"
-    }
-
-    fn command_doc(&self) -> CommandDoc {
-        let options = self.describe_options();
-        CommandDoc {
-            summary: "Generate random predicate trees from metadata survey".into(),
-            body: format!(r#"# generate predicates
-
-Generate random predicate trees from metadata survey.
-
-## Description
-
-Surveys a metadata slab file (or reads a pre-computed survey JSON) to
-understand the value distributions and cardinalities of each field, then
-generates a configurable number of PNode predicate trees targeting a
-specified selectivity. The generated predicates are written to an output
-slab file where each record is a serialized PNode.
-
-## Survey phase
-
-Before generating predicates, the command needs to understand what fields
-exist in the metadata and what values they contain. This is done by
-reading a sample of records from the metadata slab and collecting per-field
-statistics: distinct value counts, value frequencies, numeric min/max
-ranges, and type distributions. Only fields with eligible types (int,
-float, text, bool, and related variants) are considered for predicate
-generation.
-
-If a `survey` option is provided pointing to a pre-computed survey JSON
-file, the slab survey is skipped entirely and the cached statistics are
-loaded instead. This is useful when the same metadata slab is used to
-generate multiple predicate batches.
-
-## Predicate generation strategies
-
-The `strategy` parameter controls the structure of the generated
-predicates:
-
-- **eq** (default) -- generates single-field `Eq` predicates. The field
-  is chosen by matching its cardinality to the target selectivity (a field
-  with N distinct values has per-value selectivity of roughly 1/N). Within
-  the chosen field, a value is selected whose observed frequency is closest
-  to the target.
-- **compound** -- generates multi-field AND predicates. Fields are added
-  greedily until the cumulative estimated selectivity reaches the target.
-  Each sub-predicate may use Eq, In, or range (Ge/Lt) operators depending
-  on the field's type and cardinality.
-
-## Selectivity control
-
-The `selectivity` parameter (0.0 to 1.0) specifies the target fraction of
-base records that should satisfy each predicate. If `selectivity-max` is
-also set, each predicate's target selectivity is drawn uniformly from
-`[selectivity, selectivity-max]`, producing a mix of easy and hard
-predicates within a single batch.
-
-## Role in dataset pipelines
-
-This command creates the predicate workload for filtered KNN evaluation.
-It is typically followed by `compute predicates`, which evaluates each
-generated predicate against the full metadata slab to produce a boolean
-answer key (which records match). Together, the predicate slab and answer
-key slab provide the ground truth needed to measure filtered-search recall.
-
-## Options
-
-{}"#, render_options_table(&options)),
-        }
-    }
-
-    fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
-        let start = Instant::now();
-
-        let input_str = match options.require("input") {
+impl GenPredicatesOp {
+    fn execute_survey(&mut self, options: &Options, ctx: &mut StreamContext, start: Instant) -> CommandResult {
+        let input_str = match options.require("source") {
             Ok(s) => s,
             Err(e) => return error_result(e, start),
         };
@@ -262,17 +188,178 @@ key slab provide the ground truth needed to measure filtered-search recall.
         }
     }
 
+}
+
+impl GenPredicatesOp {
+    fn execute_simple_int_eq(
+        &self,
+        options: &Options,
+        ctx: &mut StreamContext,
+        start: Instant,
+    ) -> CommandResult {
+        let output_str = match options.require("output") {
+            Ok(s) => s,
+            Err(e) => return error_result(e, start),
+        };
+        let output_path = resolve_path(output_str, &ctx.workspace);
+
+        let count: usize = options.get("count").and_then(|s| s.parse().ok()).unwrap_or(100);
+        let fields: usize = options.get("fields").and_then(|s| s.parse().ok()).unwrap_or(1);
+        let range_min: i32 = options.parse_or("range-min", 0i32).unwrap_or(0);
+        let range_max: i32 = options.parse_or("range-max", 100i32).unwrap_or(100);
+        let seed: u64 = rng::parse_seed(options.get("seed"));
+        let format = options.get("format").unwrap_or("slab");
+
+        if range_max <= range_min {
+            return error_result(
+                format!("range-max ({}) must be > range-min ({})", range_max, range_min),
+                start,
+            );
+        }
+
+        let range = range_max - range_min;
+        let mut rng_inst = rng::seeded_rng(seed);
+
+        if let Some(parent) = output_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+
+        ctx.ui.log(&format!(
+            "  generate predicates: {} simple-int-eq, {} fields, range [{}, {}), seed={}",
+            count, fields, range_min, range_max, seed,
+        ));
+
+        if format == "ivec" {
+            // Write as ivec: each predicate is a vector of `fields` i32 values
+            use std::io::Write;
+            let mut f = match std::fs::File::create(&output_path) {
+                Ok(f) => std::io::BufWriter::new(f),
+                Err(e) => return error_result(format!("create {}: {}", output_path.display(), e), start),
+            };
+            let pb = ctx.ui.bar(count as u64, "generating predicates");
+            for i in 0..count {
+                // Write dimension header
+                if f.write_all(&(fields as i32).to_le_bytes()).is_err() {
+                    return error_result("write error".into(), start);
+                }
+                // Write one random value per field
+                for _ in 0..fields {
+                    let val = range_min + rng_inst.random_range(0..range);
+                    if f.write_all(&val.to_le_bytes()).is_err() {
+                        return error_result("write error".into(), start);
+                    }
+                }
+                if (i + 1) % 10_000 == 0 { pb.set_position((i + 1) as u64); }
+            }
+            pb.finish();
+        } else {
+            // Write as slab of PNode records
+            let config = match WriterConfig::new(512, 4096, u32::MAX, false) {
+                Ok(c) => c,
+                Err(e) => return error_result(format!("writer config: {}", e), start),
+            };
+            let mut writer = match SlabWriter::new(&output_path, config) {
+                Ok(w) => w,
+                Err(e) => return error_result(format!("create slab: {}", e), start),
+            };
+            let pb = ctx.ui.bar(count as u64, "generating predicates");
+            for i in 0..count {
+                // Single-field equality: field_0 == random_value
+                // For multi-field: AND(field_0 == v0, field_1 == v1, ...)
+                let pnode = if fields == 1 {
+                    let val = range_min + rng_inst.random_range(0..range);
+                    PNode::Predicate(PredicateNode {
+                        field: FieldRef::Named("field_0".into()),
+                        op: OpType::Eq,
+                        comparands: vec![Comparand::Int(val as i64)],
+                    })
+                } else {
+                    let children: Vec<PNode> = (0..fields).map(|fi| {
+                        let val = range_min + rng_inst.random_range(0..range);
+                        PNode::Predicate(PredicateNode {
+                            field: FieldRef::Named(format!("field_{}", fi)),
+                            op: OpType::Eq,
+                            comparands: vec![Comparand::Int(val as i64)],
+                        })
+                    }).collect();
+                    PNode::Conjugate(ConjugateNode {
+                        conjugate_type: ConjugateType::And,
+                        children,
+                    })
+                };
+                let bytes = pnode.to_bytes_named();
+                if let Err(e) = writer.add_record(&bytes) {
+                    return error_result(format!("write record {}: {}", i, e), start);
+                }
+                if (i + 1) % 10_000 == 0 { pb.set_position((i + 1) as u64); }
+            }
+            pb.finish();
+            if let Err(e) = writer.finish() {
+                return error_result(format!("finalize: {}", e), start);
+            }
+        }
+
+        // Write verified count
+        let var_name = format!("verified_count:{}",
+            output_path.file_name().and_then(|n| n.to_str()).unwrap_or("output"));
+        let _ = crate::pipeline::variables::set_and_save(
+            &ctx.workspace, &var_name, &count.to_string());
+        ctx.defaults.insert(var_name, count.to_string());
+
+        ctx.ui.log(&format!("  wrote {} predicates to {}", count, output_path.display()));
+
+        CommandResult {
+            status: Status::Ok,
+            message: format!("{} simple-int-eq predicates, {} fields, range [{}, {})",
+                count, fields, range_min, range_max),
+            produced: vec![output_path],
+            elapsed: start.elapsed(),
+        }
+    }
+}
+
+impl CommandOp for GenPredicatesOp {
+    fn command_path(&self) -> &str {
+        "generate predicates"
+    }
+
+    fn command_doc(&self) -> CommandDoc {
+        let options = self.describe_options();
+        CommandDoc {
+            summary: "Generate predicates from metadata survey or configured ranges".into(),
+            body: format!(
+                "# generate predicates\n\nTwo modes:\n\n\
+                 - **survey** (default): Survey metadata slab, generate predicates targeting selectivity.\n\
+                 - **simple-int-eq**: Generate integer equality predicates from configured ranges.\n\n\
+                 ## Options\n\n{}", render_options_table(&options)),
+        }
+    }
+
+    fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
+        let start = Instant::now();
+        let mode = options.get("mode").unwrap_or("survey");
+        if mode == "simple-int-eq" {
+            return self.execute_simple_int_eq(options, ctx, start);
+        }
+        self.execute_survey(options, ctx, start)
+    }
+
     fn describe_options(&self) -> Vec<OptionDesc> {
         vec![
-            opt("input", "Path", true, None, "Metadata slab to survey", OptionRole::Input),
-            opt("output", "Path", true, None, "Output slab for predicates", OptionRole::Output),
-            opt("survey", "Path", false, None, "Pre-computed survey JSON from 'survey --output' (skips re-surveying the slab)", OptionRole::Input),
+            opt("source", "Path", false, None, "Metadata source to survey (not needed for simple-int-eq mode)", OptionRole::Input),
+            opt("output", "Path", true, None, "Output file for predicates", OptionRole::Output),
+            opt("mode", "string", false, Some("survey"), "Generation mode: 'survey' (from metadata) or 'simple-int-eq' (direct integer equality)", OptionRole::Config),
+            opt("survey", "Path", false, None, "Pre-computed survey JSON (skips re-surveying)", OptionRole::Input),
             opt("count", "int", false, Some("100"), "Number of predicates to generate", OptionRole::Config),
-            opt("selectivity", "float", false, Some("0.1"), "Target selectivity (0.0–1.0)", OptionRole::Config),
-            opt("selectivity-max", "float", false, None, "If set, selectivity is uniform in [selectivity, selectivity-max]", OptionRole::Config),
+            opt("fields", "int", false, Some("1"), "Number of integer fields (simple-int-eq mode)", OptionRole::Config),
+            opt("range-min", "int", false, Some("0"), "Predicate value range minimum (simple-int-eq mode)", OptionRole::Config),
+            opt("range-max", "int", false, Some("100"), "Predicate value range maximum (simple-int-eq mode)", OptionRole::Config),
+            opt("format", "string", false, Some("slab"), "Output format: 'slab' or 'ivec' (simple-int-eq mode)", OptionRole::Config),
+            opt("selectivity", "float", false, Some("0.1"), "Target selectivity (survey mode)", OptionRole::Config),
+            opt("selectivity-max", "float", false, None, "Upper selectivity bound for uniform range (survey mode)", OptionRole::Config),
             opt("samples", "int", false, Some("1000"), "Survey sample count", OptionRole::Config),
-            opt("max-distinct", "int", false, Some("100"), "Max distinct values tracked per field during survey", OptionRole::Config),
-            opt("strategy", "string", false, Some("eq"), "Predicate strategy: 'eq' (single-field Eq, default) or 'compound' (multi-field AND with mixed ops)", OptionRole::Config),
+            opt("max-distinct", "int", false, Some("100"), "Max distinct values tracked per field", OptionRole::Config),
+            opt("strategy", "string", false, Some("eq"), "Predicate strategy: 'eq' or 'compound' (survey mode)", OptionRole::Config),
             opt("seed", "int", false, Some("42"), "RNG seed", OptionRole::Config),
         ]
     }
@@ -890,7 +977,7 @@ mod tests {
         let output_path = ws.join("predicates.slab");
 
         let mut opts = Options::new();
-        opts.set("input", input_path.to_string_lossy().to_string());
+        opts.set("source", input_path.to_string_lossy().to_string());
         opts.set("output", output_path.to_string_lossy().to_string());
         opts.set("count", "10".to_string());
         opts.set("seed", "42".to_string());
@@ -928,7 +1015,7 @@ mod tests {
         let output_path = ws.join("predicates.slab");
 
         let mut opts = Options::new();
-        opts.set("input", input_path.to_string_lossy().to_string());
+        opts.set("source", input_path.to_string_lossy().to_string());
         opts.set("output", output_path.to_string_lossy().to_string());
         opts.set("count", "20".to_string());
         opts.set("selectivity", "0.05".to_string());
@@ -963,7 +1050,7 @@ mod tests {
         let output_path = ws.join("predicates.slab");
 
         let mut opts = Options::new();
-        opts.set("input", input_path.to_string_lossy().to_string());
+        opts.set("source", input_path.to_string_lossy().to_string());
         opts.set("output", output_path.to_string_lossy().to_string());
         opts.set("count", "10".to_string());
 

@@ -37,6 +37,16 @@ pub trait VecSource: Send {
     fn next_record(&mut self) -> Option<Vec<u8>>;
 }
 
+/// Adapter to wrap a `veks_io::VecSource` as a `veks_core::formats::reader::VecSource`.
+struct IoSourceAdapter(Box<dyn veks_io::VecSource>);
+
+impl VecSource for IoSourceAdapter {
+    fn dimension(&self) -> u32 { self.0.dimension() }
+    fn element_size(&self) -> usize { self.0.element_size() }
+    fn record_count(&self) -> Option<u64> { self.0.record_count() }
+    fn next_record(&mut self) -> Option<Vec<u8>> { self.0.next_record() }
+}
+
 /// Lightweight metadata from probing a source without opening a full reader.
 ///
 /// This avoids spawning background threads or loading data — only reads
@@ -98,17 +108,21 @@ fn probe_slab(path: &Path) -> Result<SourceMeta, String> {
 /// (npy, parquet). Pass `0` to auto-detect from available CPU parallelism.
 /// Readers that don't support multi-threading ignore this parameter.
 pub fn open_source(path: &Path, format: VecFormat, threads: usize, max_count: Option<u64>) -> Result<Box<dyn VecSource>, String> {
+    if format.is_xvec() {
+        return xvec::open_xvec(path, format);
+    }
+    if format.is_scalar() {
+        let io_fmt = veks_io::VecFormat::from_extension(format.name())
+            .unwrap_or(veks_io::VecFormat::ScalarU8);
+        let io_reader = veks_io::scalar::reader::open(path, io_fmt)?;
+        return Ok(Box::new(IoSourceAdapter(io_reader)));
+    }
     match format {
-        VecFormat::Fvec
-        | VecFormat::Ivec
-        | VecFormat::Bvec
-        | VecFormat::Dvec
-        | VecFormat::Mvec
-        | VecFormat::Svec => xvec::open_xvec(path, format),
         VecFormat::Npy => npy::NpyDirReader::open(path, threads, max_count),
         VecFormat::Parquet => parquet::ParquetDirReader::open(path, threads),
         VecFormat::Slab => slab::SlabReader::open(path),
         VecFormat::Hdf5 => hdf5::open(path),
+        _ => Err(format!("{} format not supported for reading", format)),
     }
 }
 

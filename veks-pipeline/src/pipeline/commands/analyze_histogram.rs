@@ -81,13 +81,9 @@ impl CommandOp for AnalyzeHistogramOp {
             Ok(s) => s,
             Err(e) => return error_result(e, start),
         };
-        let dimension: usize = match options.require("dimension") {
-            Ok(s) => match s.parse() {
-                Ok(d) => d,
-                _ => return error_result(format!("invalid dimension: '{}'", s), start),
-            },
-            Err(e) => return error_result(e, start),
-        };
+        let dimension: usize = options.get("dimension")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
 
         let bins: usize = options
             .get("bins")
@@ -156,6 +152,30 @@ impl CommandOp for AnalyzeHistogramOp {
                 let d = VectorReader::<u8>::dim(&r);
                 (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
             }
+            ElementType::U16 => {
+                let r = match MmapVectorReader::<i16>::open_svec(&source_path) {
+                    Ok(r) => r, Err(e) => return error_result(format!("open: {}", e), start),
+                };
+                let fc = VectorReader::<i16>::count(&r);
+                let d = VectorReader::<i16>::dim(&r);
+                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
+            }
+            ElementType::U32 => {
+                let r = match MmapVectorReader::<i32>::open_ivec(&source_path) {
+                    Ok(r) => r, Err(e) => return error_result(format!("open: {}", e), start),
+                };
+                let fc = VectorReader::<i32>::count(&r);
+                let d = VectorReader::<i32>::dim(&r);
+                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
+            }
+            ElementType::U64 | ElementType::I64 => {
+                let r = match MmapVectorReader::<f64>::open_dvec(&source_path) {
+                    Ok(r) => r, Err(e) => return error_result(format!("open: {}", e), start),
+                };
+                let fc = VectorReader::<f64>::count(&r);
+                let d = VectorReader::<f64>::dim(&r);
+                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
+            }
         };
 
         if dimension >= dim {
@@ -207,66 +227,102 @@ impl CommandOp for AnalyzeHistogramOp {
             };
         }
 
+        // Single-pass: build range bins AND discrete counts simultaneously.
+        // If discrete values stay under the threshold, use them. Otherwise
+        // fall back to range bins. No second pass over the data.
+        let max_discrete = bins.min(100);
         let bin_width = (max - min) / bins as f64;
+        let mut range_bins = vec![0usize; bins];
+        let mut discrete_counts: std::collections::BTreeMap<i64, usize> = std::collections::BTreeMap::new();
+        let mut discrete_viable = true;
 
-        // Parallelize bin accumulation using per-chunk histograms
-        let bin_fn = || {
-            values
-                .par_chunks(100_000)
-                .map(|chunk| {
-                    let mut local_bins = vec![0usize; bins];
-                    for &v in chunk {
-                        let idx = ((v - min) / bin_width) as usize;
-                        let idx = idx.min(bins - 1);
-                        local_bins[idx] += 1;
+        for &v in &values {
+            // Range bin — always accumulated
+            let idx = ((v - min) / bin_width) as usize;
+            range_bins[idx.min(bins - 1)] += 1;
+
+            // Discrete tracking — accumulated until overflow
+            if discrete_viable {
+                let rounded = v.round();
+                if (v - rounded).abs() > 1e-9 {
+                    discrete_viable = false;
+                } else {
+                    *discrete_counts.entry(rounded as i64).or_insert(0) += 1;
+                    if discrete_counts.len() > max_discrete {
+                        discrete_viable = false;
                     }
-                    local_bins
-                })
-                .reduce(
-                    || vec![0usize; bins],
-                    |mut a, b| {
-                        for (i, c) in b.into_iter().enumerate() {
-                            a[i] += c;
-                        }
-                        a
-                    },
-                )
-        };
+                }
+            }
+        }
 
-        let bin_counts = if let Some(p) = &pool {
-            p.install(bin_fn)
-        } else {
-            bin_fn()
-        };
+        let use_discrete = discrete_viable && !discrete_counts.is_empty();
 
-        let max_count = *bin_counts.iter().max().unwrap_or(&1);
+        if use_discrete {
+            // Discrete histogram: one bar per distinct value
+            let max_count = *discrete_counts.values().max().unwrap_or(&1);
+            let n_distinct = discrete_counts.len();
 
-        // Print header
-        ctx.ui.log(&format!(
-            "Histogram: dimension {} ({} vectors)",
-            dimension, effective_count
-        ));
-        ctx.ui.log(&format!(
-            "  Range: [{:.4}, {:.4}], Mean: {:.4}, StdDev: {:.4}",
-            min, max, stats.mean, stats.std_dev
-        ));
-        ctx.ui.log(&format!("  {} bins, bin width: {:.6}", bins, bin_width));
-        ctx.ui.log("");
-
-        // Print histogram
-        for (i, &count) in bin_counts.iter().enumerate() {
-            let lo = min + i as f64 * bin_width;
-            let hi = lo + bin_width;
-            let bar_len = if max_count > 0 {
-                (count as f64 / max_count as f64 * width as f64) as usize
-            } else {
-                0
-            };
-            let bar: String = "\u{2588}".repeat(bar_len);
             ctx.ui.log(&format!(
-                "  [{:8.4}, {:8.4}) {:6} |{}",
-                lo, hi, count, bar
+                "Histogram: dimension {} ({} vectors, {} distinct values)",
+                dimension, effective_count, n_distinct
             ));
+            ctx.ui.log(&format!(
+                "  Range: [{}, {}], Mean: {:.4}, StdDev: {:.4}",
+                discrete_counts.keys().next().unwrap(),
+                discrete_counts.keys().last().unwrap(),
+                stats.mean, stats.std_dev
+            ));
+            ctx.ui.log("");
+
+            let label_width = discrete_counts.keys().last()
+                .map(|v| format!("{}", v).len())
+                .unwrap_or(1)
+                .max(discrete_counts.keys().next()
+                    .map(|v| format!("{}", v).len())
+                    .unwrap_or(1));
+
+            for (&val, &count) in &discrete_counts {
+                let bar_len = if max_count > 0 {
+                    (count as f64 / max_count as f64 * width as f64) as usize
+                } else {
+                    0
+                };
+                let bar: String = "\u{2588}".repeat(bar_len);
+                let pct = 100.0 * count as f64 / effective_count as f64;
+                ctx.ui.log(&format!(
+                    "  {:>w$} {:6} ({:5.1}%) |{}",
+                    val, count, pct, bar, w = label_width
+                ));
+            }
+        } else {
+            // Range histogram: equal-width bins (already accumulated)
+            let max_count = *range_bins.iter().max().unwrap_or(&1);
+
+            ctx.ui.log(&format!(
+                "Histogram: dimension {} ({} vectors)",
+                dimension, effective_count
+            ));
+            ctx.ui.log(&format!(
+                "  Range: [{:.4}, {:.4}], Mean: {:.4}, StdDev: {:.4}",
+                min, max, stats.mean, stats.std_dev
+            ));
+            ctx.ui.log(&format!("  {} bins, bin width: {:.6}", bins, bin_width));
+            ctx.ui.log("");
+
+            for (i, &count) in range_bins.iter().enumerate() {
+                let lo = min + i as f64 * bin_width;
+                let hi = lo + bin_width;
+                let bar_len = if max_count > 0 {
+                    (count as f64 / max_count as f64 * width as f64) as usize
+                } else {
+                    0
+                };
+                let bar: String = "\u{2588}".repeat(bar_len);
+                ctx.ui.log(&format!(
+                    "  [{:8.4}, {:8.4}) {:6} |{}",
+                    lo, hi, count, bar
+                ));
+            }
         }
 
         CommandResult {
@@ -296,8 +352,8 @@ impl CommandOp for AnalyzeHistogramOp {
             OptionDesc {
                 name: "dimension".to_string(),
                 type_name: "int".to_string(),
-                required: true,
-                default: None,
+                required: false,
+                default: Some("0".into()),
                 description: "Dimension index to visualize (0-indexed)".to_string(),
                         role: OptionRole::Config,
         },

@@ -26,6 +26,24 @@ pub trait VecSink {
     fn finish(self: Box<Self>) -> Result<(), String>;
 }
 
+/// Adapter to wrap a `veks_io::VecSink` as a `veks_core::formats::writer::VecSink`.
+struct IoSinkAdapter(Option<Box<dyn veks_io::VecSink>>);
+
+impl VecSink for IoSinkAdapter {
+    fn write_record(&mut self, ordinal: i64, data: &[u8]) {
+        if let Some(ref mut inner) = self.0 {
+            inner.write_record(ordinal, data);
+        }
+    }
+    fn finish(mut self: Box<Self>) -> Result<(), String> {
+        if let Some(inner) = self.0.take() {
+            inner.finish()
+        } else {
+            Ok(())
+        }
+    }
+}
+
 /// Configuration for opening a sink writer
 pub struct SinkConfig {
     pub dimension: u32,
@@ -43,7 +61,7 @@ pub fn open_sink(
 ) -> Result<Box<dyn VecSink>, String> {
     match format {
         VecFormat::Slab => {
-            let element_size = if config.source_format.is_xvec() {
+            let element_size = if config.source_format.is_xvec() || config.source_format.is_scalar() {
                 config.source_format.element_size()
             } else {
                 4 // default to f32 for npy/parquet sources
@@ -56,14 +74,13 @@ pub fn open_sink(
                 config.slab_namespace,
             )
         }
-        VecFormat::Fvec
-        | VecFormat::Ivec
-        | VecFormat::Bvec
-        | VecFormat::Dvec
-        | VecFormat::Mvec
-        | VecFormat::Svec => xvec::XvecWriter::open(path, config.dimension),
-        VecFormat::Npy | VecFormat::Parquet | VecFormat::Hdf5 => {
-            Err(format!("{} is not a supported output format", format))
+        _ if format.is_xvec() => xvec::XvecWriter::open(path, config.dimension),
+        _ if format.is_scalar() => {
+            let io_fmt = veks_io::VecFormat::from_extension(format.name())
+                .unwrap_or(veks_io::VecFormat::ScalarU8);
+            let io_writer = veks_io::scalar::writer::open(path, io_fmt)?;
+            Ok(Box::new(IoSinkAdapter(Some(io_writer))))
         }
+        _ => Err(format!("{} is not a supported output format", format)),
     }
 }

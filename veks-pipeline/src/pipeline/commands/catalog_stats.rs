@@ -82,7 +82,7 @@ impl CommandOp for CatalogStatsOp {
     fn describe_options(&self) -> Vec<OptionDesc> {
         vec![
             OptionDesc {
-                name: "input".into(),
+                name: "source".into(),
                 type_name: "Path".into(),
                 required: false,
                 default: Some(".".into()),
@@ -103,7 +103,7 @@ impl CommandOp for CatalogStatsOp {
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
         let start = Instant::now();
 
-        let input_str = options.get("input").unwrap_or(".");
+        let input_str = options.get("source").unwrap_or(".");
         let output_name = options.get("output").unwrap_or("stats.csv");
         let input_path = if Path::new(input_str).is_absolute() {
             PathBuf::from(input_str)

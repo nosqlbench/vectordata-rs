@@ -396,13 +396,20 @@ fn vtype_from_extension(path: &str) -> Option<String> {
         VecFormat::Fvec => "float32",
         VecFormat::Mvec => "float16",
         VecFormat::Bvec => "uint8",
+        VecFormat::I8vec => "int8",
         VecFormat::Ivec => "int32",
         VecFormat::Dvec => "float64",
         VecFormat::Svec => "int16",
+        VecFormat::U16vec => "uint16",
+        VecFormat::U32vec => "uint32",
+        VecFormat::I64vec => "int64",
+        VecFormat::U64vec => "uint64",
         VecFormat::Npy => "numpy",
         VecFormat::Hdf5 => "hdf5",
         VecFormat::Parquet => "parquet",
         VecFormat::Slab => return None,
+        // Scalar formats have no vector type name
+        _ => return None,
     };
     Some(name.to_string())
 }

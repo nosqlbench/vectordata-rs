@@ -1754,7 +1754,7 @@ and integration testing rather than in production dataset preparation.
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
         let start = Instant::now();
 
-        let input_str = match options.require("input") {
+        let input_str = match options.require("source") {
             Ok(s) => s,
             Err(e) => return error_result(e, start),
         };
@@ -1834,7 +1834,7 @@ and integration testing rather than in production dataset preparation.
     fn describe_options(&self) -> Vec<OptionDesc> {
         vec![
             OptionDesc {
-                name: "input".to_string(),
+                name: "source".to_string(),
                 type_name: "Path".to_string(),
                 required: true,
                 default: None,
@@ -1931,7 +1931,7 @@ corruption scenarios such as disk bit-rot or truncated downloads.
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
         let start = Instant::now();
 
-        let input_str = match options.require("input") {
+        let input_str = match options.require("source") {
             Ok(s) => s,
             Err(e) => return error_result(e, start),
         };
@@ -2046,7 +2046,7 @@ corruption scenarios such as disk bit-rot or truncated downloads.
     fn describe_options(&self) -> Vec<OptionDesc> {
         vec![
             OptionDesc {
-                name: "input".to_string(),
+                name: "source".to_string(),
                 type_name: "Path".to_string(),
                 required: true,
                 default: None,
@@ -2538,7 +2538,7 @@ mod tests {
 
         // Spoilbits in dry-run mode
         let mut opts = Options::new();
-        opts.set("input", data_path.to_string_lossy().to_string());
+        opts.set("source", data_path.to_string_lossy().to_string());
         opts.set("percentage", "50");
         opts.set("dryrun", "true");
         let mut op = MerkleSpoilbitsOp;
@@ -2571,7 +2571,7 @@ mod tests {
 
         // Spoil bits
         let mut opts = Options::new();
-        opts.set("input", data_path.to_string_lossy().to_string());
+        opts.set("source", data_path.to_string_lossy().to_string());
         opts.set("percentage", "50");
         opts.set("seed", "42");
         let mut op = MerkleSpoilbitsOp;
@@ -2601,7 +2601,7 @@ mod tests {
 
         // Spoil chunks
         let mut opts = Options::new();
-        opts.set("input", data_path.to_string_lossy().to_string());
+        opts.set("source", data_path.to_string_lossy().to_string());
         opts.set("percentage", "25");
         opts.set("bytes-to-corrupt", "2");
         opts.set("seed", "42");

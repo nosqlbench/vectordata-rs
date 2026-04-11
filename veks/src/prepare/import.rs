@@ -76,6 +76,13 @@ pub struct ImportArgs {
     /// Lower values produce harder predicates (fewer qualifying neighbors).
     /// Default 0.0001 means ~0.01% of base vectors match each predicate.
     pub selectivity: f64,
+    /// Number of predicates to generate (default 10000).
+    #[serde(default = "default_predicate_count")]
+    pub predicate_count: u32,
+    /// Predicate generation strategy: "eq" (single-field equality) or
+    /// "compound" (multi-field AND).
+    #[serde(default = "default_predicate_strategy")]
+    pub predicate_strategy: String,
     /// Classic layout: store all artifacts in the dataset root directory
     /// instead of `profiles/base/` and `profiles/default/`. Simpler layout
     /// compatible with ann-benchmarks tooling.
@@ -88,9 +95,18 @@ pub struct ImportArgs {
     pub personality: String,
     /// Synthesize metadata when none is provided.
     /// When true and metadata is required (M facet) but no `--metadata`
-    /// source is given, a `generate metadata` step is emitted.
+    /// source is given, a synthesis step is emitted.
     #[serde(default)]
     pub synthesize_metadata: bool,
+    /// Synthesis mode: "simple-int-eq" (integer equality) or
+    /// "conjugate" (compound predicates with selectivity control).
+    #[serde(default = "default_synthesis_mode")]
+    pub synthesis_mode: String,
+    /// Storage format for synthesized metadata/predicates:
+    /// "slab" (canonical MNode/PNode in slab files) or
+    /// "ivec" (plain integer vectors, lightweight).
+    #[serde(default = "default_synthesis_format")]
+    pub synthesis_format: String,
     /// Number of integer fields for synthesized metadata (default 3).
     #[serde(default = "default_metadata_fields")]
     pub metadata_fields: u32,
@@ -100,6 +116,14 @@ pub struct ImportArgs {
     /// Maximum value (exclusive) for synthesized metadata integer range.
     #[serde(default = "default_metadata_range_max")]
     pub metadata_range_max: i32,
+    /// Minimum value (inclusive) for synthesized predicate value range.
+    /// Defaults to metadata_range_min.
+    #[serde(default)]
+    pub predicate_range_min: i32,
+    /// Maximum value (exclusive) for synthesized predicate value range.
+    /// Defaults to metadata_range_max.
+    #[serde(default = "default_metadata_range_max")]
+    pub predicate_range_max: i32,
 }
 
 fn default_personality() -> String {
@@ -108,6 +132,10 @@ fn default_personality() -> String {
 
 fn default_metadata_fields() -> u32 { 3 }
 fn default_metadata_range_max() -> i32 { 1000 }
+fn default_predicate_count() -> u32 { 10000 }
+fn default_predicate_strategy() -> String { "eq".to_string() }
+fn default_synthesis_mode() -> String { "simple-int-eq".to_string() }
+fn default_synthesis_format() -> String { "slab".to_string() }
 
 impl ImportArgs {
     /// Path prefix for the base/default profile artifacts.
@@ -269,6 +297,13 @@ impl Artifact {
     fn is_materialized(&self) -> bool {
         matches!(self, Artifact::Materialized { .. })
     }
+
+    fn step_id(&self) -> &str {
+        match self {
+            Artifact::Materialized { step_id, .. } => step_id,
+            Artifact::Identity { .. } => "",
+        }
+    }
 }
 
 /// Metadata sub-graph slots (all absent when no metadata provided).
@@ -390,7 +425,11 @@ fn resolve_slots(args: &ImportArgs) -> PipelineSlots {
     // Strategy 1: Non-HDF5 B+Q → combine into single source, shuffle split
     // Strategy 2: HDF5 B+Q → independent processing
     // Strategy 3: Non-HDF5 B only → self-search via shuffle
-    let combined_bq = has_separate_query && !is_hdf5_source;
+    // combined_bq: combine base+query into one source for shuffle-based splitting.
+    // Only when: separate query exists, not HDF5, AND no pre-computed ground truth
+    // (pre-computed GT implies queries are truly independent, not to be recombined).
+    let has_precomputed_gt = args.ground_truth.is_some();
+    let combined_bq = has_separate_query && !is_hdf5_source && !has_precomputed_gt;
     let self_search = wants_queries && (!has_separate_query || combined_bq);
     let has_queries = has_separate_query || self_search;
 
@@ -453,6 +492,49 @@ fn resolve_slots(args: &ImportArgs) -> PipelineSlots {
             output: String::new(),
         };
         (shuffle, Some(qv), bv, Some(bc))
+    } else if has_separate_query {
+        // Separate query file with independent processing (e.g., pre-computed GT).
+        let shuffle = if shuffle_enabled {
+            Some(Artifact::Materialized {
+                step_id: "generate-shuffle".into(),
+                output: "${cache}/shuffle.ivec".into(),
+            })
+        } else {
+            None
+        };
+        // Query: needs convert step only if format conversion or normalize is needed
+        let needs_query_convert = needs_import || args.normalize;
+        let qv = if needs_query_convert {
+            Artifact::Materialized {
+                step_id: "convert-queries".into(),
+                output: format!("{}query_vectors.{}", pp, vec_ext),
+            }
+        } else {
+            Artifact::Identity {
+                path: relativize_path(args.query_vectors.as_ref().unwrap(), output_dir),
+            }
+        };
+        // Base: needs extract only if dedup, shuffle, or normalize
+        let needs_base_extract = !args.no_dedup || shuffle_enabled || args.normalize;
+        let bv = if needs_base_extract {
+            Artifact::Materialized {
+                step_id: "extract-base".into(),
+                output: format!("{}base_vectors.{}", pp, vec_ext),
+            }
+        } else {
+            Artifact::Identity {
+                path: relativize_path(args.base_vectors.as_ref().unwrap(), output_dir),
+            }
+        };
+        let bc = if needs_base_extract {
+            Some(Artifact::Materialized {
+                step_id: "count-base".into(),
+                output: String::new(),
+            })
+        } else {
+            None
+        };
+        (shuffle, Some(qv), bv, bc)
     } else {
         // No queries at all
         let bv = Artifact::Materialized {
@@ -521,30 +603,52 @@ fn resolve_slots(args: &ImportArgs) -> PipelineSlots {
         MetadataSlots { metadata_all, metadata_content, survey, predicates, predicate_indices }
     })
     } else if synthesize {
-        // Synthesize metadata — generate metadata step produces the slab
-        let metadata_all = Artifact::Materialized {
-            step_id: "generate-metadata".into(),
-            output: "${cache}/metadata_all.slab".into(),
+        // Synthesize metadata — generate metadata step produces the data.
+        // When not self-search (no shuffle/reorder), generate directly to
+        // the final location — no extract step needed.
+        let is_simple = args.synthesis_mode == "simple-int-eq";
+        let ext = if is_simple && args.synthesis_format != "slab" {
+            &args.synthesis_format
+        } else {
+            "slab"
+        };
+
+        let metadata_all = if self_search {
+            Artifact::Materialized {
+                step_id: "generate-metadata".into(),
+                output: format!("${{cache}}/metadata_all.{}", ext),
+            }
+        } else {
+            Artifact::Materialized {
+                step_id: "generate-metadata".into(),
+                output: format!("{}metadata_content.{}", pp, ext),
+            }
         };
         let metadata_content = if self_search {
             Artifact::Materialized {
                 step_id: "extract-metadata".into(),
-                output: format!("{}metadata_content.slab", pp),
+                output: format!("{}metadata_content.{}", pp, ext),
             }
         } else {
-            Artifact::Identity { path: format!("{}metadata_content.slab", pp) }
+            metadata_all.clone()
         };
-        let survey = Artifact::Materialized {
-            step_id: "survey-metadata".into(),
-            output: "${cache}/metadata_survey.json".into(),
+        // Simple-int-eq: no survey needed (schema is known from config).
+        // Predicates are generated directly from the configured ranges.
+        let survey = if is_simple {
+            Artifact::Identity { path: String::new() }
+        } else {
+            Artifact::Materialized {
+                step_id: "survey-metadata".into(),
+                output: "${cache}/metadata_survey.json".into(),
+            }
         };
         let predicates = Artifact::Materialized {
             step_id: "generate-predicates".into(),
-            output: format!("{}predicates.slab", pp),
+            output: format!("{}predicates.{}", pp, ext),
         };
         let predicate_indices = Artifact::Materialized {
             step_id: "evaluate-predicates".into(),
-            output: "metadata_indices.slab".into(),
+            output: format!("metadata_indices.{}", ext),
         };
         Some(MetadataSlots { metadata_all, metadata_content, survey, predicates, predicate_indices })
     } else {
@@ -567,7 +671,8 @@ fn resolve_slots(args: &ImportArgs) -> PipelineSlots {
     };
 
     let wants_filtered = facets.contains('F') && !args.no_filtered;
-    let filtered_knn = if !has_queries || metadata.is_none() || !wants_filtered {
+    let is_simple_synth = args.synthesis_mode == "simple-int-eq" && args.synthesize_metadata;
+    let filtered_knn = if !has_queries || metadata.is_none() || !wants_filtered || is_simple_synth {
         None
     } else {
         Some(Artifact::Materialized {
@@ -1063,13 +1168,18 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
                 after: vec![],
                 per_profile: false,
                 phase: 0,
-                options: vec![
-                    ("facet".into(), "query_vectors".into()),
-                    ("source".into(), relativize_path(query_source, &args.output)),
-                    ("from".into(), format),
-                    ("output".into(), qv.path().into()),
-                    ("normalize".into(), "true".into()),
-                ],
+                options: {
+                    let mut opts = vec![
+                        ("facet".into(), "query_vectors".into()),
+                        ("source".into(), relativize_path(query_source, &args.output)),
+                        ("from".into(), format),
+                        ("output".into(), qv.path().into()),
+                    ];
+                    if args.normalize {
+                        opts.push(("normalize".into(), "true".into()));
+                    }
+                    opts
+                },
             });
         }
         // Extract base vectors to the profile path when materialized:
@@ -1099,7 +1209,9 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
                 base_opts.push(("ivec-file".into(), slots.prepare.path().into()));
                 base_opts.push(("range".into(), format!("[0,{})", "${vector_count}")));
             }
-            base_opts.push(("normalize".into(), "true".into()));
+            if args.normalize {
+                base_opts.push(("normalize".into(), "true".into()));
+            }
             steps.push(Step {
                 id: "extract-base".into(),
                 run: "transform extract".into(),
@@ -1158,6 +1270,17 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
                 });
             } else if args.synthesize_metadata {
                 // Synthesize metadata via generate metadata command
+                let mut gen_meta_opts = vec![
+                    ("output".into(), meta.metadata_all.path().into()),
+                    ("count".into(), "${vector_count}".into()),
+                    ("fields".into(), args.metadata_fields.to_string()),
+                    ("range-min".into(), args.metadata_range_min.to_string()),
+                    ("range-max".into(), args.metadata_range_max.to_string()),
+                    ("seed".into(), format!("${{{}}}", "seed")),
+                ];
+                if args.synthesis_mode == "simple-int-eq" && args.synthesis_format != "slab" {
+                    gen_meta_opts.push(("format".into(), args.synthesis_format.clone()));
+                }
                 steps.push(Step {
                     id: "generate-metadata".into(),
                     run: "generate metadata".into(),
@@ -1165,27 +1288,17 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
                     after: vec!["count-vectors".into()],
                     per_profile: false,
                     phase: 0,
-                    options: vec![
-                        ("output".into(), "${cache}/metadata_all.slab".into()),
-                        ("count".into(), "${vector_count}".into()),
-                        ("fields".into(), args.metadata_fields.to_string()),
-                        ("range-min".into(), args.metadata_range_min.to_string()),
-                        ("range-max".into(), args.metadata_range_max.to_string()),
-                        ("seed".into(), args.seed.to_string()),
-                    ],
+                    options: gen_meta_opts,
                 });
             }
         }
 
-        if meta.metadata_content.is_materialized() {
+        // extract-metadata: only when metadata_content has its own step
+        // (i.e., step_id is "extract-metadata", not shared with metadata_all)
+        if meta.metadata_content.step_id() == "extract-metadata" {
             let mut after = vec![];
             if meta.metadata_all.is_materialized() {
-                // Depends on whichever step produced metadata_all
-                if args.metadata.is_some() {
-                    after.push("convert-metadata".into());
-                } else if args.synthesize_metadata {
-                    after.push("generate-metadata".into());
-                }
+                after.push(meta.metadata_all.step_id().into());
             }
             if slots.shuffle.as_ref().map(|s| s.is_materialized()).unwrap_or(false) {
                 after.push("generate-shuffle".into());
@@ -1215,71 +1328,112 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
             });
         }
 
-        // survey (always when metadata present)
-        let survey_after = if meta.metadata_all.is_materialized() {
-            vec!["convert-metadata".into()]
+        // survey — skip for simple-int-eq (schema is known from config)
+        let is_simple = args.synthesis_mode == "simple-int-eq" && args.synthesize_metadata;
+        if meta.survey.is_materialized() {
+            let survey_after = if meta.metadata_all.is_materialized() {
+                vec![meta.metadata_all.step_id().into()]
+            } else {
+                vec![]
+            };
+            steps.push(Step {
+                id: "survey-metadata".into(),
+                run: "analyze survey".into(),
+                description: Some("Survey metadata to discover schema and value ranges".into()),
+                after: survey_after.clone(),
+                per_profile: false,
+                phase: 0,
+                options: vec![
+                    ("source".into(), meta.metadata_all.path().into()),
+                    ("output".into(), "${cache}/metadata_survey.json".into()),
+                    ("samples".into(), "10000".into()),
+                    ("max-distinct".into(), "100".into()),
+                ],
+            });
+        }
+
+        // synthesize predicates
+        let pred_after = if meta.survey.is_materialized() {
+            vec!["survey-metadata".into()]
+        } else if meta.metadata_all.is_materialized() {
+            vec![meta.metadata_all.step_id().into()]
         } else {
             vec![]
         };
-        steps.push(Step {
-            id: "survey-metadata".into(),
-            run: "analyze survey".into(),
-            description: Some("Survey metadata to discover schema and value ranges".into()),
-            after: survey_after.clone(),
-            per_profile: false,
-            phase: 0,
-            options: vec![
-                ("input".into(), meta.metadata_all.path().into()),
-                ("output".into(), "${cache}/metadata_survey.json".into()),
-                ("samples".into(), "10000".into()),
-                ("max-distinct".into(), "100".into()),
-            ],
-        });
-
-        // synthesize predicates
+        let pred_ext = if is_simple && args.synthesis_format != "slab" {
+            &args.synthesis_format
+        } else {
+            "slab"
+        };
+        let mut pred_opts = vec![
+            ("output".into(), meta.predicates.path().into()),
+            ("count".into(), args.predicate_count.to_string()),
+            ("seed".into(), format!("${{{}}}", "seed")),
+        ];
+        if is_simple {
+            // Simple-int-eq: predicates are generated from configured ranges,
+            // no survey needed. Pass range params directly.
+            pred_opts.push(("mode".into(), "simple-int-eq".into()));
+            pred_opts.push(("fields".into(), args.metadata_fields.to_string()));
+            pred_opts.push(("range-min".into(), args.predicate_range_min.to_string()));
+            pred_opts.push(("range-max".into(), args.predicate_range_max.to_string()));
+            pred_opts.push(("format".into(), args.synthesis_format.clone()));
+        } else {
+            // Survey-based: pass survey file and strategy
+            pred_opts.push(("source".into(), meta.metadata_all.path().into()));
+            pred_opts.push(("survey".into(), "${cache}/metadata_survey.json".into()));
+            pred_opts.push(("strategy".into(), args.predicate_strategy.clone()));
+            pred_opts.push(("selectivity".into(), args.selectivity.to_string()));
+        }
         steps.push(Step {
             id: "generate-predicates".into(),
             run: "generate predicates".into(),
-            description: Some("Generate test predicates from metadata survey".into()),
-            after: vec!["survey-metadata".into()],
+            description: Some(if is_simple {
+                "Generate simple integer equality predicates".into()
+            } else {
+                "Generate test predicates from metadata survey".into()
+            }),
+            after: pred_after,
             per_profile: false,
             phase: 0,
-            options: vec![
-                ("input".into(), meta.metadata_all.path().into()),
-                ("survey".into(), "${cache}/metadata_survey.json".into()),
-                ("output".into(), format!("{}predicates.slab", pp)),
-                ("count".into(), "10000".into()),
-                ("selectivity".into(), args.selectivity.to_string()),
-                ("seed".into(), format!("${{{}}}", "seed")),
-            ],
+            options: pred_opts,
         });
 
         // compute predicates (per_profile)
         let mut eval_after = vec!["generate-predicates".into()];
-        if meta.metadata_content.is_materialized() {
+        if meta.metadata_content.step_id() == "extract-metadata" {
             eval_after.push("extract-metadata".into());
+        } else if meta.metadata_content.is_materialized() {
+            eval_after.push(meta.metadata_content.step_id().into());
         }
+        let mut eval_opts = vec![
+            ("source".into(), meta.metadata_content.path().into()),
+            ("predicates".into(), meta.predicates.path().into()),
+        ];
+        if !is_simple {
+            eval_opts.push(("survey".into(), "${cache}/metadata_survey.json".into()));
+        }
+        eval_opts.push(("selectivity".into(), args.selectivity.to_string()));
+        if is_simple {
+            eval_opts.push(("mode".into(), "simple-int-eq".into()));
+            eval_opts.push(("fields".into(), args.metadata_fields.to_string()));
+        }
+        eval_opts.push(("range".into(), if slots.base_count.is_some() {
+            "[0,${base_end})".into()
+        } else if slots.prepare.is_materialized() {
+            "[0,${clean_count})".into()
+        } else {
+            "[0,${vector_count})".into()
+        }));
+        eval_opts.push(("output".into(), meta.predicate_indices.path().into()));
         steps.push(Step {
             id: "evaluate-predicates".into(),
             run: "compute evaluate-predicates".into(),
             description: None,
             after: eval_after,
             per_profile: true,
-            phase: 1, // after all compute-knn — metadata I/O phase
-            options: vec![
-                ("input".into(), meta.metadata_content.path().into()),
-                ("predicates".into(), format!("{}predicates.slab", pp)),
-                ("survey".into(), "${cache}/metadata_survey.json".into()),
-                ("selectivity".into(), args.selectivity.to_string()),
-                ("range".into(), if slots.base_count.is_some() {
-                    "[0,${base_end})".into()
-                } else if slots.prepare.is_materialized() {
-                    "[0,${clean_count})".into()
-                } else {
-                    "[0,${vector_count})".into()
-                }),
-                ("output".into(), "metadata_indices.slab".into()),
-            ],
+            phase: 1,
+            options: eval_opts,
         });
     }
 
@@ -1306,15 +1460,14 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
             if slots.base_count.is_some() {
                 after.push("count-base".into());
             } else if slots.base_vectors.is_materialized() {
-                after.push("extract-base".into());
+                after.push(slots.base_vectors.step_id().into());
             }
             if slots.all_vectors.is_materialized() {
                 after.push("convert-vectors".into());
             }
             if let Some(ref qv) = slots.query_vectors {
                 if qv.is_materialized() {
-                    let qid = if slots.self_search { "extract-queries" } else { "convert-queries" };
-                    after.push(qid.into());
+                    after.push(qv.step_id().into());
                 }
             }
 
@@ -1362,8 +1515,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
             }
             if let Some(ref qv) = slots.query_vectors {
                 if qv.is_materialized() {
-                    let qid = if slots.self_search { "extract-queries" } else { "convert-queries" };
-                    after.push(qid.into());
+                    after.push(qv.step_id().into());
                 }
             }
             steps.push(Step {
@@ -1381,7 +1533,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
                         slots.base_vectors.path().to_string()
                     }),
                         ("query".into(), slots.query_vectors.as_ref().unwrap().path().into()),
-                        ("metadata-indices".into(), "metadata_indices.slab".into()),
+                        ("metadata-indices".into(), slots.metadata.as_ref().unwrap().predicate_indices.path().into()),
                         ("indices".into(), "filtered_neighbor_indices.ivec".into()),
                         ("distances".into(), "filtered_neighbor_distances.fvec".into()),
                         ("neighbors".into(), args.neighbors.to_string()),
@@ -1408,8 +1560,10 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
             if slots.all_vectors.is_materialized() {
                 verify_after.push("convert-vectors".into());
             }
-            if slots.query_vectors.as_ref().map(|q| q.is_materialized()).unwrap_or(false) {
-                verify_after.push("extract-queries".into());
+            if let Some(ref qv) = slots.query_vectors {
+                if qv.is_materialized() {
+                    verify_after.push(qv.step_id().into());
+                }
             }
         }
         steps.push(Step {
@@ -1431,8 +1585,9 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
         });
     }
 
+    let is_simple_synth = args.synthesis_mode == "simple-int-eq" && args.synthesize_metadata;
     if let Some(ref fknn) = slots.filtered_knn {
-        if fknn.is_materialized() {
+        if fknn.is_materialized() && !is_simple_synth {
             steps.push(Step {
                 id: "verify-filtered-knn".into(),
                 run: "verify filtered-knn-consolidated".into(),
@@ -1453,22 +1608,24 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
                 ],
             });
 
-            steps.push(Step {
-                id: "verify-predicates".into(),
-                run: "verify predicates-consolidated".into(),
-                description: Some("Single-pass predicate verification across all profiles".into()),
-                after: vec!["evaluate-predicates".into()],
-                per_profile: false,
-                phase: 0,
-                options: vec![
-                    ("metadata".into(), slots.metadata.as_ref().unwrap().metadata_content.path().into()),
-                    ("predicates".into(), format!("{}predicates.slab", pp)),
-                    ("sample".into(), "50".into()),
-                    ("metadata-sample".into(), "100000".into()),
-                    ("seed".into(), format!("${{{}}}", "seed")),
-                    ("output".into(), "${cache}/verify_predicates_consolidated.json".into()),
-                ],
-            });
+            if !is_simple_synth {
+                steps.push(Step {
+                    id: "verify-predicates".into(),
+                    run: "verify predicates-consolidated".into(),
+                    description: Some("Single-pass predicate verification across all profiles".into()),
+                    after: vec!["evaluate-predicates".into()],
+                    per_profile: false,
+                    phase: 0,
+                    options: vec![
+                        ("metadata".into(), slots.metadata.as_ref().unwrap().metadata_content.path().into()),
+                        ("predicates".into(), format!("{}predicates.slab", pp)),
+                        ("sample".into(), "50".into()),
+                        ("metadata-sample".into(), "100000".into()),
+                        ("seed".into(), format!("${{{}}}", "seed")),
+                        ("output".into(), "${cache}/verify_predicates_consolidated.json".into()),
+                    ],
+                });
+            }
         }
     }
 
@@ -1482,9 +1639,12 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
         }
     }
     if let Some(ref fknn) = slots.filtered_knn {
-        if fknn.is_materialized() {
+        if fknn.is_materialized() && !is_simple_synth {
             json_after.push("verify-filtered-knn".into());
             json_after.push("verify-predicates".into());
+        } else if fknn.is_materialized() {
+            // simple-int-eq: depend on evaluate-predicates instead
+            json_after.push("evaluate-predicates".into());
         }
     }
     if json_after.is_empty() {
@@ -1551,7 +1711,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
         per_profile: false,
         phase: 0,
         options: vec![
-            ("input".into(), ".".into()),
+            ("source".into(), ".".into()),
         ],
     });
 
@@ -2546,12 +2706,18 @@ mod tests {
             round_digits: 2,
             pedantic_dedup: false,
             selectivity: 0.0001,
+            predicate_count: 10000,
+            predicate_strategy: "eq".to_string(),
             classic: false,
             personality: "native".to_string(),
             synthesize_metadata: false,
+            synthesis_mode: "simple-int-eq".to_string(),
+            synthesis_format: "slab".to_string(),
             metadata_fields: 3,
             metadata_range_min: 0,
             metadata_range_max: 1000,
+            predicate_range_min: 0,
+            predicate_range_max: 1000,
         }
     }
 

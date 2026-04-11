@@ -84,14 +84,13 @@ fn is_opaque_format(path: &Path) -> bool {
 /// Check completeness using format-specific heuristics.
 fn check_format_specific(output: &Path, format: VecFormat, _file_size: u64) -> ArtifactState {
     match format {
-        VecFormat::Fvec | VecFormat::Ivec | VecFormat::Bvec
-        | VecFormat::Dvec | VecFormat::Mvec | VecFormat::Svec => {
+        _ if format.is_xvec() => {
             check_xvec_alignment(output)
         }
         VecFormat::Slab => check_slab_completeness(output),
-        // Npy and Parquet have no cheap structural probe — treat as
-        // opaque-complete (exists + non-empty is sufficient).
-        VecFormat::Npy | VecFormat::Parquet | VecFormat::Hdf5 => ArtifactState::Complete,
+        // Npy, Parquet, Hdf5, and scalar formats have no cheap structural
+        // probe — treat as opaque-complete (exists + non-empty is sufficient).
+        _ => ArtifactState::Complete,
     }
 }
 

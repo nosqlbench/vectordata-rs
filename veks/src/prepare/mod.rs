@@ -105,8 +105,8 @@ pub enum PrepareCommand {
         #[arg(long)]
         no_filtered: bool,
 
-        /// L2-normalize vectors during extraction (enabled by default)
-        #[arg(long, default_value = "true", action = clap::ArgAction::Set)]
+        /// L2-normalize vectors during extraction
+        #[arg(long)]
         normalize: bool,
 
         /// Disable L2-normalization during extraction
@@ -194,6 +194,16 @@ pub enum PrepareCommand {
         /// (default "0..1000"). Each field is drawn uniformly from [min, max).
         #[arg(long, default_value = "0..1000")]
         metadata_range: String,
+
+        /// Synthesis mode: "simple-int-eq" (integer equality, default) or
+        /// "conjugate" (compound predicates, not yet implemented).
+        #[arg(long, default_value = "simple-int-eq")]
+        synthesis_mode: String,
+
+        /// Storage format for synthesized metadata/predicates:
+        /// "slab" (canonical MNode/PNode) or "ivec" (plain integer vectors).
+        #[arg(long, default_value = "slab")]
+        synthesis_format: String,
 
         /// Explicit source files to consider (repeatable). When provided,
         /// directory scanning is skipped and only these files are used
@@ -426,6 +436,7 @@ pub fn run(args: PrepareArgs) {
             no_dedup, no_zero_check, no_filtered, normalize, no_normalize, force, reset, clean, recursive,
             base_fraction, required_facets, provided_facets, round_digits, pedantic_dedup, auto, classic, sources,
             personality, synthesize_metadata, metadata_fields, metadata_range,
+            synthesis_mode, synthesis_format,
         } => {
             // Parse metadata range "min..max"
             let (metadata_range_min, metadata_range_max) = {
@@ -511,7 +522,7 @@ pub fn run(args: PrepareArgs) {
                         no_dedup: if no_dedup { Some(true) } else { None },
                         no_zero_check: if no_zero_check { Some(true) } else { None },
                         no_filtered: if no_filtered { Some(true) } else { None },
-                        normalize: Some(normalize),
+                        normalize: if normalize { Some(true) } else if no_normalize { Some(false) } else { None },
                         base_fraction: None,
                         pedantic_dedup: if pedantic_dedup { Some(true) } else { None },
                         required_facets: required_facets.clone(),
@@ -676,7 +687,7 @@ pub fn run(args: PrepareArgs) {
                         no_dedup: if no_dedup { Some(true) } else { None },
                         no_zero_check: if no_zero_check { Some(true) } else { None },
                         no_filtered: if no_filtered { Some(true) } else { None },
-                        normalize: if normalize { Some(true) } else { None },
+                        normalize: if normalize { Some(true) } else if no_normalize { Some(false) } else { None },
                         base_fraction: if base_fraction < 1.0 { Some(base_fraction) } else { None },
                         pedantic_dedup: if pedantic_dedup { Some(true) } else { None },
                         required_facets: required_facets.clone(),
@@ -716,12 +727,18 @@ pub fn run(args: PrepareArgs) {
                         round_digits,
                         pedantic_dedup,
                         selectivity: 0.0001,
+                        predicate_count: 10000,
+                        predicate_strategy: "eq".to_string(),
                         classic,
                         personality: personality.clone(),
                         synthesize_metadata,
+                        synthesis_mode: synthesis_mode.clone(),
+                        synthesis_format: synthesis_format.clone(),
                         metadata_fields,
                         metadata_range_min,
                         metadata_range_max,
+                        predicate_range_min: metadata_range_min,
+                        predicate_range_max: metadata_range_max,
                     });
                     check_and_restore(&out);
                 }
@@ -781,12 +798,18 @@ pub fn run(args: PrepareArgs) {
                     round_digits,
                     pedantic_dedup,
                     selectivity: 0.0001,
+                    predicate_count: 10000,
+                    predicate_strategy: "eq".to_string(),
                     classic,
                     personality: personality.clone(),
                     synthesize_metadata,
+                    synthesis_mode: synthesis_mode.clone(),
+                    synthesis_format: synthesis_format.clone(),
                     metadata_fields,
                     metadata_range_min,
                     metadata_range_max,
+                    predicate_range_min: metadata_range_min,
+                    predicate_range_max: metadata_range_max,
                 });
             }
         }

@@ -141,7 +141,7 @@ environments.
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
         let start = Instant::now();
 
-        let input_str = match options.require("input") {
+        let input_str = match options.require("source") {
             Ok(s) => s,
             Err(e) => return error_result(e, start),
         };
@@ -277,7 +277,7 @@ environments.
     fn describe_options(&self) -> Vec<OptionDesc> {
         vec![
             OptionDesc {
-                name: "input".to_string(),
+                name: "source".to_string(),
                 type_name: "Path".to_string(),
                 required: true,
                 default: None,
@@ -387,7 +387,7 @@ mod tests {
 
         let output = ws.join("output.jsonl");
         let mut opts = Options::new();
-        opts.set("input", input.to_string_lossy().to_string());
+        opts.set("source", input.to_string_lossy().to_string());
         opts.set("output", output.to_string_lossy().to_string());
 
         let mut op = JsonRjqOp;
@@ -414,7 +414,7 @@ mod tests {
 
         let output = ws.join("output.jsonl");
         let mut opts = Options::new();
-        opts.set("input", input.to_string_lossy().to_string());
+        opts.set("source", input.to_string_lossy().to_string());
         opts.set("output", output.to_string_lossy().to_string());
         opts.set("expression", ".name");
 
@@ -442,7 +442,7 @@ mod tests {
 
         let output = ws.join("output.jsonl");
         let mut opts = Options::new();
-        opts.set("input", input.to_string_lossy().to_string());
+        opts.set("source", input.to_string_lossy().to_string());
         opts.set("output", output.to_string_lossy().to_string());
         opts.set("expression", "select(.age >= 25)");
 
@@ -471,7 +471,7 @@ mod tests {
 
         let output = ws.join("output.jsonl");
         let mut opts = Options::new();
-        opts.set("input", input.to_string_lossy().to_string());
+        opts.set("source", input.to_string_lossy().to_string());
         opts.set("output", output.to_string_lossy().to_string());
         opts.set("expression", ".items | length");
 
@@ -498,7 +498,7 @@ mod tests {
 
         let output = ws.join("output.jsonl");
         let mut opts = Options::new();
-        opts.set("input", input.to_string_lossy().to_string());
+        opts.set("source", input.to_string_lossy().to_string());
         opts.set("output", output.to_string_lossy().to_string());
         opts.set("expression", "{name: .first, surname: .last}");
 
@@ -522,7 +522,7 @@ mod tests {
 
         let output = ws.join("output.jsonl");
         let mut opts = Options::new();
-        opts.set("input", input.to_string_lossy().to_string());
+        opts.set("source", input.to_string_lossy().to_string());
         opts.set("output", output.to_string_lossy().to_string());
         opts.set("expression", "keys");
 
@@ -546,7 +546,7 @@ mod tests {
         std::fs::write(&input, "{\"a\":1}\n").unwrap();
 
         let mut opts = Options::new();
-        opts.set("input", input.to_string_lossy().to_string());
+        opts.set("source", input.to_string_lossy().to_string());
         opts.set("expression", "invalid syntax [[[");
 
         let mut op = JsonRjqOp;

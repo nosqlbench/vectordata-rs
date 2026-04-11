@@ -229,6 +229,30 @@ impl CommandOp for AnalyzeCompareOp {
                 let d = VectorReader::<u8>::dim(&r);
                 (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
             }
+            ElementType::U16 => {
+                let r = match MmapVectorReader::<i16>::open_svec(&orig_path) {
+                    Ok(r) => r, Err(e) => return error_result(format!("open original: {}", e), start),
+                };
+                let fc = VectorReader::<i16>::count(&r);
+                let d = VectorReader::<i16>::dim(&r);
+                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
+            }
+            ElementType::U32 => {
+                let r = match MmapVectorReader::<i32>::open_ivec(&orig_path) {
+                    Ok(r) => r, Err(e) => return error_result(format!("open original: {}", e), start),
+                };
+                let fc = VectorReader::<i32>::count(&r);
+                let d = VectorReader::<i32>::dim(&r);
+                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
+            }
+            ElementType::U64 | ElementType::I64 => {
+                let r = match MmapVectorReader::<f64>::open_dvec(&orig_path) {
+                    Ok(r) => r, Err(e) => return error_result(format!("open original: {}", e), start),
+                };
+                let fc = VectorReader::<f64>::count(&r);
+                let d = VectorReader::<f64>::dim(&r);
+                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
+            }
         };
 
         // Open synthetic file with element-type dispatch
@@ -283,6 +307,30 @@ impl CommandOp for AnalyzeCompareOp {
                 };
                 let fc = VectorReader::<u8>::count(&r);
                 let d = VectorReader::<u8>::dim(&r);
+                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
+            }
+            ElementType::U16 => {
+                let r = match MmapVectorReader::<i16>::open_svec(&synth_path) {
+                    Ok(r) => r, Err(e) => return error_result(format!("open synthetic: {}", e), start),
+                };
+                let fc = VectorReader::<i16>::count(&r);
+                let d = VectorReader::<i16>::dim(&r);
+                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
+            }
+            ElementType::U32 => {
+                let r = match MmapVectorReader::<i32>::open_ivec(&synth_path) {
+                    Ok(r) => r, Err(e) => return error_result(format!("open synthetic: {}", e), start),
+                };
+                let fc = VectorReader::<i32>::count(&r);
+                let d = VectorReader::<i32>::dim(&r);
+                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
+            }
+            ElementType::U64 | ElementType::I64 => {
+                let r = match MmapVectorReader::<f64>::open_dvec(&synth_path) {
+                    Ok(r) => r, Err(e) => return error_result(format!("open synthetic: {}", e), start),
+                };
+                let fc = VectorReader::<f64>::count(&r);
+                let d = VectorReader::<f64>::dim(&r);
                 (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
             }
         };

@@ -269,7 +269,7 @@ for debugging predicate or metadata issues during pipeline development.
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
         let start = Instant::now();
 
-        let input_str = match options.require("input") {
+        let input_str = match options.require("source") {
             Ok(s) => s,
             Err(e) => return error_result(e, start),
         };
@@ -343,7 +343,7 @@ for debugging predicate or metadata issues during pipeline development.
 
     fn describe_options(&self) -> Vec<OptionDesc> {
         vec![
-            opt("input", "Path", true, None, "Source slab file", OptionRole::Input),
+            opt("source", "Path", true, None, "Source slab file", OptionRole::Input),
             opt("to", "Path", false, None, "Output file (stdout if omitted)", OptionRole::Output),
             opt("format", "enum", false, Some("text"), "Output format: text, hex, raw, json", OptionRole::Config),
         ]
@@ -704,7 +704,7 @@ attempt to read from a corrupted file.
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
         let start = Instant::now();
 
-        let input_str = match options.require("input") {
+        let input_str = match options.require("source") {
             Ok(s) => s,
             Err(e) => return error_result(e, start),
         };
@@ -777,7 +777,7 @@ attempt to read from a corrupted file.
 
     fn describe_options(&self) -> Vec<OptionDesc> {
         vec![
-            opt("input", "Path", true, None, "Slab file to check", OptionRole::Input),
+            opt("source", "Path", true, None, "Slab file to check", OptionRole::Input),
             opt("verbose", "bool", false, Some("false"), "Show per-page details", OptionRole::Config),
         ]
     }
@@ -844,7 +844,7 @@ metadata indices, and raw metadata records.
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
         let start = Instant::now();
 
-        let input_str = match options.require("input") {
+        let input_str = match options.require("source") {
             Ok(s) => s,
             Err(e) => return error_result(e, start),
         };
@@ -911,7 +911,7 @@ metadata indices, and raw metadata records.
 
     fn describe_options(&self) -> Vec<OptionDesc> {
         vec![
-            opt("input", "Path", true, None, "Slab file", OptionRole::Input),
+            opt("source", "Path", true, None, "Slab file", OptionRole::Input),
             opt("ordinals", "String", true, None, "Comma-separated ordinals or ranges (e.g. 0,1,5..10)", OptionRole::Config),
             opt("format", "enum", false, Some("text"), "Output format: text, hex, raw", OptionRole::Config),
         ]
@@ -1006,7 +1006,7 @@ produced the expected number of records and ordinal range.
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
         let start = Instant::now();
 
-        let input_str = match options.require("input") {
+        let input_str = match options.require("source") {
             Ok(s) => s,
             Err(e) => return error_result(e, start),
         };
@@ -1121,7 +1121,7 @@ produced the expected number of records and ordinal range.
 
     fn describe_options(&self) -> Vec<OptionDesc> {
         vec![
-            opt("input", "Path", true, None, "Slab file to analyze", OptionRole::Input),
+            opt("source", "Path", true, None, "Slab file to analyze", OptionRole::Input),
         ]
     }
 }
@@ -1188,7 +1188,7 @@ changes to the slabtastic writer.
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
         let start = Instant::now();
 
-        let input_str = match options.require("input") {
+        let input_str = match options.require("source") {
             Ok(s) => s,
             Err(e) => return error_result(e, start),
         };
@@ -1273,7 +1273,7 @@ changes to the slabtastic writer.
 
     fn describe_options(&self) -> Vec<OptionDesc> {
         vec![
-            opt("input", "Path", true, None, "Slab file", OptionRole::Input),
+            opt("source", "Path", true, None, "Slab file", OptionRole::Input),
             opt("pages", "String", false, None, "Comma-separated page indices to display", OptionRole::Config),
         ]
     }
@@ -1338,7 +1338,7 @@ useful for orienting yourself when working with an unfamiliar slab file.
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
         let start = Instant::now();
 
-        let input_str = match options.require("input") {
+        let input_str = match options.require("source") {
             Ok(s) => s,
             Err(e) => return error_result(e, start),
         };
@@ -1374,7 +1374,7 @@ useful for orienting yourself when working with an unfamiliar slab file.
 
     fn describe_options(&self) -> Vec<OptionDesc> {
         vec![
-            opt("input", "Path", true, None, "Slab file", OptionRole::Input),
+            opt("source", "Path", true, None, "Slab file", OptionRole::Input),
         ]
     }
 }
@@ -1441,7 +1441,7 @@ will operate on.
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
         let start = Instant::now();
 
-        let input_str = match options.require("input") {
+        let input_str = match options.require("source") {
             Ok(s) => s,
             Err(e) => return error_result(e, start),
         };
@@ -1511,7 +1511,7 @@ will operate on.
 
     fn describe_options(&self) -> Vec<OptionDesc> {
         vec![
-            opt("input", "Path", true, None, "Slab file", OptionRole::Input),
+            opt("source", "Path", true, None, "Slab file", OptionRole::Input),
             opt("ordinals", "String", true, None, "Comma-separated ordinals or ranges (e.g. 0,1,5..10)", OptionRole::Config),
             opt("codec", "enum", false, Some("auto"), "Codec: auto, mnode, pnode", OptionRole::Config),
             opt("format", "enum", false, Some("cddl"), "Vernacular format: cddl, sql, cql, json, jsonl, yaml, readout, display", OptionRole::Config),
@@ -1586,7 +1586,7 @@ predicates` steps have the schema and cardinality information they need.
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
         let start = Instant::now();
 
-        let input_str = match options.require("input") {
+        let input_str = match options.require("source") {
             Ok(s) => s,
             Err(e) => return error_result(e, start),
         };
@@ -1603,9 +1603,17 @@ predicates` steps have the schema and cardinality information they need.
 
         let output_path = options.get("output").map(|s| resolve_path(s, &ctx.workspace));
 
-        let survey = match survey_slab(&input_path, max_samples, max_distinct, Some(&ctx.ui)) {
-            Ok(s) => s,
-            Err(e) => return error_result(e, start),
+        let is_ivec = input_path.extension().and_then(|e| e.to_str()) == Some("ivec");
+        let survey = if is_ivec {
+            match survey_ivec(&input_path, max_samples, max_distinct) {
+                Ok(s) => s,
+                Err(e) => return error_result(e, start),
+            }
+        } else {
+            match survey_slab(&input_path, max_samples, max_distinct, Some(&ctx.ui)) {
+                Ok(s) => s,
+                Err(e) => return error_result(e, start),
+            }
         };
 
         // Print results
@@ -1715,7 +1723,7 @@ predicates` steps have the schema and cardinality information they need.
     fn describe_options(&self) -> Vec<OptionDesc> {
         vec![
             OptionDesc {
-                name: "input".to_string(),
+                name: "source".to_string(),
                 type_name: "Path".to_string(),
                 required: true,
                 default: None,
@@ -2170,6 +2178,69 @@ impl SurveyJson {
     }
 }
 
+/// Survey an ivec file: each record is [dim:i32, val0:i32, val1:i32, ...].
+/// Produces per-field statistics matching the slab survey format.
+fn survey_ivec(
+    path: &Path,
+    max_samples: usize,
+    max_distinct: usize,
+) -> Result<SurveyResult, String> {
+    use std::io::Read;
+    let data = std::fs::read(path)
+        .map_err(|e| format!("read {}: {}", path.display(), e))?;
+    if data.len() < 4 {
+        return Err(format!("{}: too small for ivec", path.display()));
+    }
+    let dim = i32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+    let record_bytes = 4 + dim * 4;
+    let total_records = data.len() / record_bytes;
+    let sample_count = total_records.min(max_samples);
+
+    let mut field_stats: indexmap::IndexMap<String, FieldStats> = indexmap::IndexMap::new();
+    for f in 0..dim {
+        field_stats.insert(format!("field_{}", f), FieldStats::new());
+    }
+
+    // Sample uniformly
+    let step = if total_records <= sample_count { 1 } else { total_records / sample_count };
+    let mut sampled = 0;
+    let mut i = 0;
+    while i < total_records && sampled < sample_count {
+        let base = i * record_bytes + 4; // skip dim header
+        for f in 0..dim {
+            let val = i32::from_le_bytes([
+                data[base + f*4], data[base + f*4 + 1],
+                data[base + f*4 + 2], data[base + f*4 + 3],
+            ]);
+            let fs = field_stats.get_index_mut(f).unwrap().1;
+            fs.count += 1;
+            fs.numeric_count += 1;
+            let fval = val as f64;
+            if fval < fs.numeric_min { fs.numeric_min = fval; }
+            if fval > fs.numeric_max { fs.numeric_max = fval; }
+            fs.numeric_sum += fval;
+            fs.type_counts.entry("int32".into()).and_modify(|c| *c += 1).or_insert(1);
+            if !fs.distinct_overflow {
+                let key = val.to_string();
+                *fs.distinct.entry(key).or_insert(0) += 1;
+                if fs.distinct.len() > max_distinct {
+                    fs.distinct_overflow = true;
+                }
+            }
+        }
+        sampled += 1;
+        i += step;
+    }
+
+    Ok(SurveyResult {
+        field_stats,
+        sampled,
+        total_records,
+        non_mnode_count: 0,
+        decode_errors: 0,
+    })
+}
+
 /// Write survey results to a JSON file.
 fn survey_to_json(survey: &SurveyResult, path: &Path) -> Result<(), String> {
     let json_obj = SurveyJson::from_survey(survey);
@@ -2349,7 +2420,7 @@ mod tests {
         let slab_path = create_test_slab(ws, "test.slab", &[b"rec1", b"rec2", b"rec3"]);
 
         let mut opts = Options::new();
-        opts.set("input", slab_path.to_string_lossy().to_string());
+        opts.set("source", slab_path.to_string_lossy().to_string());
         let mut op = SlabCheckOp;
         let result = op.execute(&opts, &mut ctx);
         assert_eq!(result.status, Status::Ok, "check failed: {}", result.message);
@@ -2364,7 +2435,7 @@ mod tests {
         let slab_path = create_test_slab(ws, "test.slab", &[b"alpha", b"beta", b"gamma"]);
 
         let mut opts = Options::new();
-        opts.set("input", slab_path.to_string_lossy().to_string());
+        opts.set("source", slab_path.to_string_lossy().to_string());
         opts.set("ordinals", "0,2");
         let mut op = SlabGetOp;
         let result = op.execute(&opts, &mut ctx);
@@ -2381,7 +2452,7 @@ mod tests {
         let slab_path = create_test_slab(ws, "test.slab", &[b"only"]);
 
         let mut opts = Options::new();
-        opts.set("input", slab_path.to_string_lossy().to_string());
+        opts.set("source", slab_path.to_string_lossy().to_string());
         opts.set("ordinals", "0,99");
         let mut op = SlabGetOp;
         let result = op.execute(&opts, &mut ctx);
@@ -2398,7 +2469,7 @@ mod tests {
         let slab_path = create_test_slab(ws, "test.slab", &[b"hello world", b"test data", b"more stuff"]);
 
         let mut opts = Options::new();
-        opts.set("input", slab_path.to_string_lossy().to_string());
+        opts.set("source", slab_path.to_string_lossy().to_string());
         let mut op = SlabAnalyzeOp;
         let result = op.execute(&opts, &mut ctx);
         assert_eq!(result.status, Status::Ok, "analyze failed: {}", result.message);
@@ -2436,7 +2507,7 @@ mod tests {
         let out_path = ws.join("output.txt");
 
         let mut opts = Options::new();
-        opts.set("input", slab_path.to_string_lossy().to_string());
+        opts.set("source", slab_path.to_string_lossy().to_string());
         opts.set("to", out_path.to_string_lossy().to_string());
         opts.set("format", "text");
         let mut op = SlabExportOp;
@@ -2514,7 +2585,7 @@ mod tests {
         );
 
         let mut opts = Options::new();
-        opts.set("input", slab_path.to_string_lossy().to_string());
+        opts.set("source", slab_path.to_string_lossy().to_string());
         opts.set("samples", "100");
         let mut op = SlabSurveyOp;
         let result = op.execute(&opts, &mut ctx);
@@ -2533,7 +2604,7 @@ mod tests {
         let slab_path = create_test_slab(ws, "empty.slab", &[]);
 
         let mut opts = Options::new();
-        opts.set("input", slab_path.to_string_lossy().to_string());
+        opts.set("source", slab_path.to_string_lossy().to_string());
         let mut op = SlabSurveyOp;
         let result = op.execute(&opts, &mut ctx);
         assert_eq!(result.status, Status::Ok, "survey empty failed: {}", result.message);
@@ -2549,7 +2620,7 @@ mod tests {
         let slab_path = create_test_slab(ws, "test.slab", &[b"hello", b"world"]);
 
         let mut opts = Options::new();
-        opts.set("input", slab_path.to_string_lossy().to_string());
+        opts.set("source", slab_path.to_string_lossy().to_string());
         let mut op = SlabExplainOp;
         let result = op.execute(&opts, &mut ctx);
         assert_eq!(result.status, Status::Ok);
