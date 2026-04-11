@@ -263,39 +263,29 @@ struct HfFileEntry {
 
 /// List files in a HuggingFace repo via the API.
 fn list_hf_files(api_url: &str) -> Result<Vec<HfFileEntry>, String> {
-    let mut response_data = Vec::new();
+    let mut client_builder = reqwest::blocking::Client::builder()
+        .user_agent("veks/0.14")
+        .redirect(reqwest::redirect::Policy::limited(10));
 
-    let mut easy = curl::easy::Easy::new();
-    easy.url(api_url)
-        .map_err(|e| format!("invalid URL: {}", e))?;
-    easy.follow_location(true).ok();
-    easy.fail_on_error(true).ok();
-    easy.useragent("vecs-rs/1.0").ok();
+    let client = client_builder.build()
+        .map_err(|e| format!("HTTP client error: {}", e))?;
+
+    let mut request = client.get(api_url);
 
     // Check for HF_TOKEN env var for authenticated access
     if let Ok(token) = std::env::var("HF_TOKEN") {
-        let mut headers = curl::easy::List::new();
-        headers
-            .append(&format!("Authorization: Bearer {}", token))
-            .ok();
-        easy.http_headers(headers).ok();
+        request = request.bearer_auth(token);
     }
 
-    {
-        let mut transfer = easy.transfer();
-        transfer
-            .write_function(|data| {
-                response_data.extend_from_slice(data);
-                Ok(data.len())
-            })
-            .map_err(|e| format!("transfer setup error: {}", e))?;
-        transfer
-            .perform()
-            .map_err(|e| format!("API request failed: {}", e))?;
+    let response = request.send()
+        .map_err(|e| format!("API request failed: {}", e))?;
+
+    if !response.status().is_success() {
+        return Err(format!("HTTP {} from {}", response.status().as_u16(), api_url));
     }
 
-    let json_str =
-        String::from_utf8(response_data).map_err(|e| format!("invalid UTF-8: {}", e))?;
+    let json_str = response.text()
+        .map_err(|e| format!("invalid response: {}", e))?;
 
     // Parse the JSON array of file entries
     let entries: Vec<serde_json::Value> =
@@ -340,30 +330,26 @@ fn download_file(url: &str, dest: &Path) -> Result<u64, String> {
     let mut file =
         std::fs::File::create(dest).map_err(|e| format!("failed to create {}: {}", dest.display(), e))?;
 
-    let mut easy = curl::easy::Easy::new();
-    easy.url(url).map_err(|e| format!("invalid URL: {}", e))?;
-    easy.follow_location(true).ok();
-    easy.fail_on_error(true).ok();
-    easy.useragent("vecs-rs/1.0").ok();
+    let client = reqwest::blocking::Client::builder()
+        .user_agent("veks/0.14")
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .build()
+        .map_err(|e| format!("HTTP client error: {}", e))?;
 
+    let mut request = client.get(url);
     if let Ok(token) = std::env::var("HF_TOKEN") {
-        let mut headers = curl::easy::List::new();
-        headers
-            .append(&format!("Authorization: Bearer {}", token))
-            .ok();
-        easy.http_headers(headers).ok();
+        request = request.bearer_auth(token);
     }
 
-    let mut transfer = easy.transfer();
-    transfer
-        .write_function(|data| {
-            file.write_all(data).map_or(Ok(0), |()| Ok(data.len()))
-        })
-        .map_err(|e| format!("transfer setup error: {}", e))?;
-    transfer
-        .perform()
+    let mut response = request.send()
         .map_err(|e| format!("download failed: {}", e))?;
-    drop(transfer);
+
+    if !response.status().is_success() {
+        return Err(format!("HTTP {} from {}", response.status().as_u16(), url));
+    }
+
+    std::io::copy(&mut response, &mut file)
+        .map_err(|e| format!("write error: {}", e))?;
 
     let size = std::fs::metadata(dest).map(|m| m.len()).unwrap_or(0);
     Ok(size)

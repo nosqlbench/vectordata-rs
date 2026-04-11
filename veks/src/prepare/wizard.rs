@@ -225,6 +225,13 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
         false
     };
 
+    // ── Rename source files early ─────────────────────────────────────
+    // Prompt to underscore-prefix any detected source files that don't
+    // already have it. Done early so the user sees it right after detection.
+    if roles_accepted {
+        rename_detected_sources(&mut detected);
+    }
+
     // ── Facet inference from detected inputs ─────────────────────────
     // Infer which facets the pipeline should produce based on what
     // inputs were detected. Present as a checkbox for the user to
@@ -300,17 +307,23 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
     let implied_facets = &inferred;
 
     let confirmed_facets = if let Some(ref seeded) = seeds.required_facets {
-        println!("  (overridden by --required-facets {})", seeded);
-        seeded.to_uppercase()
+        let parsed = crate::prepare::import::parse_facet_spec(seeded);
+        println!("  (overridden by --required-facets → {})", parsed);
+        parsed
     } else {
         let input = prompt_with_default(
             "Confirm facets (Enter to accept, or enter e.g. BQGD)",
             &implied_facets,
         );
-        input.trim().to_uppercase()
+        let parsed = crate::prepare::import::parse_facet_spec(input.trim());
+        if parsed != input.trim().to_uppercase() || parsed.len() > 4 {
+            println!("  → Required facets: {}", parsed);
+        }
+        parsed
     };
 
     // Parse confirmed facets into booleans for gating subsequent questions
+    let mut confirmed_facets = confirmed_facets;
     let want_q = confirmed_facets.contains('Q');
 
     // ── Base data fraction ─────────────────────────────────────────
@@ -325,7 +338,6 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
         .clamp(1.0, 100.0) / 100.0;
     let want_g = confirmed_facets.contains('G');
     let want_m = confirmed_facets.contains('M');
-    let want_f = confirmed_facets.contains('F');
 
     // ── Dataset name ─────────────────────────────────────────────────
     let dir_name = cwd.file_name()
@@ -392,13 +404,6 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
         println!("  No base vectors specified. Only metadata operations will be available.");
     }
 
-    // ── Source file location ─────────────────────────────────────────
-    let base_vectors = if let Some(bv) = base_vectors {
-        Some(prompt_source_location(&bv, &output, "Base vectors"))
-    } else {
-        None
-    };
-
     // ── Precision confirmation for xvec formats ─────────────────────
     // When the source is already an xvec file, confirm with the user that
     // the native precision is correct for their use case.
@@ -416,7 +421,6 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
         (None, false, seeds.query_count.unwrap_or(10000))
     } else if roles_accepted && detected.query_vectors.is_some() {
         let qv = detected.query_vectors.as_ref().unwrap().clone();
-        let qv = prompt_source_location(&qv, &output, "Query vectors");
         (Some(qv), false, seeds.query_count.unwrap_or(10000))
     } else {
         // Self-search — only ask query count
@@ -435,17 +439,39 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
 
     // ── Metadata — resolved from facets + detected inputs ──────────────
     // M confirmed + detected → use it. M confirmed + not detected → prompt path.
-    // M not confirmed → skip.
-    let metadata = if !want_m {
-        None
+    // M not confirmed → skip. No path → offer synthesis.
+    let (metadata, synthesize_metadata, metadata_fields, metadata_range_min, metadata_range_max) = if !want_m {
+        (None, false, 3, 0, 1000)
     } else if roles_accepted && detected.metadata.is_some() {
         let m = detected.metadata.as_ref().unwrap().clone();
-        Some(prompt_source_location(&m, &output, "Metadata"))
+        (Some(m), false, 3, 0, 1000)
     } else if let Some(ref seeded) = seeds.metadata {
-        Some(seeded.clone())
+        (Some(seeded.clone()), false, 3, 0, 1000)
     } else {
-        // M facet was confirmed but no metadata detected — ask for path
-        prompt_optional_path("Path to metadata source")
+        // M facet was confirmed but no metadata detected — ask for path or synthesize
+        let path = prompt_optional_path("Path to metadata source");
+        if let Some(m) = path {
+            (Some(m), false, 3, 0, 1000)
+        } else {
+            // No path provided — offer synthesis
+            println!();
+            println!("  No metadata source provided. Metadata can be synthesized with");
+            println!("  random integer fields for predicate testing.");
+            if confirm("Synthesize metadata?", true) {
+                let fields_str = prompt_with_default("Number of integer fields per record", "3");
+                let fields: u32 = fields_str.parse().unwrap_or(3);
+                let rmin_str = prompt_with_default("Range minimum (inclusive)", "0");
+                let rmin: i32 = rmin_str.parse().unwrap_or(0);
+                let rmax_str = prompt_with_default("Range maximum (exclusive)", "1000");
+                let rmax: i32 = rmax_str.parse().unwrap_or(1000);
+                (None, true, fields, rmin, rmax)
+            } else {
+                // User declined synthesis — drop M and dependent facets
+                println!("  Dropping M facet (no metadata source).");
+                confirmed_facets.retain(|c| !matches!(c, 'M' | 'P' | 'R' | 'F'));
+                (None, false, 3, 0, 1000)
+            }
+        }
     };
 
     // ── Ground truth — resolved from facets + detected inputs ─────────
@@ -456,9 +482,7 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
         (None, None)
     } else if roles_accepted && detected.neighbor_indices.is_some() {
         let gt = detected.neighbor_indices.as_ref().unwrap().clone();
-        let gt = prompt_source_location(&gt, &output, "Ground truth indices");
-        let gtd = detected.neighbor_distances.as_ref()
-            .map(|d| prompt_source_location(d, &output, "Ground truth distances"));
+        let gtd = detected.neighbor_distances.clone();
         (Some(gt), gtd)
     } else if let Some(ref seeded) = seeds.ground_truth {
         (Some(seeded.clone()), seeds.ground_truth_distances.clone())
@@ -520,14 +544,20 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
 
     println!("  L2-normalization ensures all vectors have unit length.");
     println!("  This is applied during extraction — source data is unchanged.");
-    if already_normalized {
-        println!("  Vectors are already normalized; normalization will be a no-op.");
-    }
     let normalize = if let Some(seeded) = seeds.normalize {
         println!("  (seeded: normalize={})", seeded);
         seeded
+    } else if already_normalized {
+        println!("  Vectors are already normalized.");
+        let force = confirm("Normalize anyway (re-normalize)?", false);
+        if force {
+            true
+        } else {
+            println!("  Skipping normalization (already normalized).");
+            false
+        }
     } else {
-        confirm("L2-normalize vectors during extraction?", true)
+        confirm("Normalize if needed?", true)
     };
 
     // ── Remaining configuration ─────────────────────────────────────
@@ -548,8 +578,23 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
         100
     };
 
-    let seed_str = prompt_with_default("Random seed", "42");
-    let seed = seed_str.parse().unwrap_or(42);
+    // Shuffling: optional, seed 0 disables it
+    let seed = if let Some(seeded) = seeds.seed {
+        if seeded == 0 {
+            println!("  (seeded: shuffle disabled)");
+        } else {
+            println!("  (seeded: shuffle seed={})", seeded);
+        }
+        seeded
+    } else {
+        let shuffle = confirm("Shuffle base vectors?", true);
+        if shuffle {
+            let seed_str = prompt_with_default("Shuffle seed", "42");
+            seed_str.parse().unwrap_or(42)
+        } else {
+            0 // seed 0 disables shuffling
+        }
+    };
 
     // Predicate selectivity — only relevant when predicates will be synthesized
     let selectivity = if confirmed_facets.contains('P') {
@@ -597,7 +642,7 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
     }
 
     // no_filtered is determined by the facet confirmation above.
-    let no_filtered = !want_f;
+    let no_filtered = !confirmed_facets.contains('F');
 
     // ── Sized profiles ────────────────────────────────────────────────
     // Stratified profiles are independent of query vectors — they define
@@ -730,9 +775,11 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
     println!("  {} {} {} {} {} {}",
         term::dim(&pad("Metric:", 10)), pad(&metric, 18),
         term::dim(&pad("k:", 10)), pad(&neighbors.to_string(), 16),
-        term::dim("Seed:"), seed);
-    println!("  {} {}", term::dim("Normalize:"),
-        if normalize { term::info("yes") } else { "no".to_string() });
+        term::dim("Seed:"), if seed == 0 { "none".to_string() } else { seed.to_string() });
+    println!("  {} {} {} {}", term::dim(&pad("Normalize:", 10)),
+        pad(&if normalize { term::info("yes") } else { "no".to_string() }, 18),
+        term::dim("Shuffle:"),
+        if seed == 0 { "no".to_string() } else { term::info("yes") });
     if !no_dedup || !no_zero_check {
         let cleaning: Vec<&str> = [
             if !no_dedup { Some("dedup") } else { None },
@@ -952,10 +999,101 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
         selectivity,
         classic: seeds.classic,
         personality: "native".to_string(),
-        synthesize_metadata: false,
-        metadata_fields: 3,
-        metadata_range_min: 0,
-        metadata_range_max: 1000,
+        synthesize_metadata,
+        metadata_fields,
+        metadata_range_min,
+        metadata_range_max,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Source file renaming (early, right after detection)
+// ---------------------------------------------------------------------------
+
+/// Prompt to underscore-prefix all detected source files that don't already
+/// have a `_` prefix. Updates the paths in `detected` in place.
+fn rename_detected_sources(detected: &mut DetectedRoles) {
+    fn needs_prefix(path: &Option<PathBuf>) -> bool {
+        path.as_ref().map_or(false, |p| {
+            let fname = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            !fname.starts_with('_') && !fname.is_empty()
+        })
+    }
+
+    fn do_rename(path: &mut Option<PathBuf>) {
+        if let Some(ref p) = *path {
+            let fname = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            if !fname.starts_with('_') && !fname.is_empty() {
+                let parent = p.parent().unwrap_or(Path::new("."));
+                let dest = parent.join(format!("_{}", fname));
+                match std::fs::rename(p, &dest) {
+                    Ok(()) => {
+                        println!("  {} → {}", p.display(), dest.display());
+                        *path = Some(dest);
+                    }
+                    Err(e) => {
+                        println!("  WARNING: rename {} failed: {}", p.display(), e);
+                    }
+                }
+            }
+        }
+    }
+
+    // Collect labels for display
+    let labels: Vec<(&str, bool)> = vec![
+        ("Base vectors", needs_prefix(&detected.base_vectors)),
+        ("Query vectors", needs_prefix(&detected.query_vectors)),
+        ("Neighbor indices", needs_prefix(&detected.neighbor_indices)),
+        ("Neighbor distances", needs_prefix(&detected.neighbor_distances)),
+        ("Metadata", needs_prefix(&detected.metadata)),
+        ("Metadata predicates", needs_prefix(&detected.metadata_predicates)),
+        ("Metadata results", needs_prefix(&detected.metadata_results)),
+        ("Filtered neighbor indices", needs_prefix(&detected.filtered_neighbor_indices)),
+        ("Filtered neighbor distances", needs_prefix(&detected.filtered_neighbor_distances)),
+    ];
+
+    let any_need = labels.iter().any(|(_, need)| *need);
+    if !any_need {
+        return;
+    }
+
+    println!();
+    println!("--- Source file prefixing ---");
+    println!("  Source files are prefixed with _ to exclude them from published datasets.");
+    println!("  The following detected files do not have a _ prefix:");
+    println!();
+
+    let all_fields: [(&str, &Option<PathBuf>); 9] = [
+        ("Base vectors", &detected.base_vectors),
+        ("Query vectors", &detected.query_vectors),
+        ("Neighbor indices", &detected.neighbor_indices),
+        ("Neighbor distances", &detected.neighbor_distances),
+        ("Metadata", &detected.metadata),
+        ("Metadata predicates", &detected.metadata_predicates),
+        ("Metadata results", &detected.metadata_results),
+        ("Filtered neighbor indices", &detected.filtered_neighbor_indices),
+        ("Filtered neighbor distances", &detected.filtered_neighbor_distances),
+    ];
+    for (label, path) in &all_fields {
+        if let Some(ref p) = **path {
+            let fname = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            if !fname.starts_with('_') && !fname.is_empty() {
+                println!("    {}:  {}", label, p.display());
+            }
+        }
+    }
+    println!();
+
+    if confirm("Rename these files with _ prefix?", true) {
+        do_rename(&mut detected.base_vectors);
+        do_rename(&mut detected.query_vectors);
+        do_rename(&mut detected.neighbor_indices);
+        do_rename(&mut detected.neighbor_distances);
+        do_rename(&mut detected.metadata);
+        do_rename(&mut detected.metadata_predicates);
+        do_rename(&mut detected.metadata_results);
+        do_rename(&mut detected.filtered_neighbor_indices);
+        do_rename(&mut detected.filtered_neighbor_distances);
     }
 }
 

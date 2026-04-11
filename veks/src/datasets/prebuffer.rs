@@ -8,7 +8,7 @@
 //! given, the dataset is resolved through the configured catalog chain and
 //! facets are downloaded from the remote source.
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::Path;
 
 use crate::catalog::resolver::Catalog;
@@ -309,40 +309,42 @@ pub(crate) fn download_file(url: &str, dest: &Path) -> Result<u64, String> {
     let mut file = std::fs::File::create(dest)
         .map_err(|e| format!("failed to create {}: {}", dest.display(), e))?;
 
-    let mut easy = curl::easy::Easy::new();
-    easy.url(url).map_err(|e| format!("invalid URL: {}", e))?;
-    easy.follow_location(true).ok();
-    easy.fail_on_error(true).ok();
-    easy.progress(true).ok();
+    let client = reqwest::blocking::Client::builder()
+        .user_agent("veks/0.14")
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .build()
+        .map_err(|e| format!("HTTP client error: {}", e))?;
 
-    let last_print = std::sync::Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
-    let lp = last_print.clone();
-
-    let mut transfer = easy.transfer();
-    transfer
-        .progress_function(move |dl_total, dl_now, _, _| {
-            let mut last = lp.lock().unwrap();
-            let now = std::time::Instant::now();
-            if now.duration_since(*last).as_millis() >= 500 && dl_total > 0.0 {
-                let pct = 100.0 * dl_now / dl_total;
-                let dl_mib = dl_now / 1_048_576.0;
-                let total_mib = dl_total / 1_048_576.0;
-                eprint!("\r    {:.1} / {:.1} MiB ({:.0}%)   ", dl_mib, total_mib, pct);
-                let _ = std::io::stderr().flush();
-                *last = now;
-            }
-            true
-        })
-        .map_err(|e| format!("progress setup error: {}", e))?;
-    transfer
-        .write_function(|data| {
-            file.write_all(data).map_or(Ok(0), |()| Ok(data.len()))
-        })
-        .map_err(|e| format!("transfer setup error: {}", e))?;
-    transfer
-        .perform()
+    let mut response = client.get(url).send()
         .map_err(|e| format!("download failed: {}", e))?;
-    drop(transfer);
+
+    if !response.status().is_success() {
+        return Err(format!("HTTP {} from {}", response.status().as_u16(), url));
+    }
+
+    let total_size = response.content_length().unwrap_or(0);
+    let mut downloaded: u64 = 0;
+    let mut last_print = std::time::Instant::now();
+    let mut buf = vec![0u8; 256 * 1024];
+
+    loop {
+        let n = response.read(&mut buf)
+            .map_err(|e| format!("read error: {}", e))?;
+        if n == 0 { break; }
+        file.write_all(&buf[..n])
+            .map_err(|e| format!("write error: {}", e))?;
+        downloaded += n as u64;
+
+        let now = std::time::Instant::now();
+        if now.duration_since(last_print).as_millis() >= 500 && total_size > 0 {
+            let pct = 100.0 * downloaded as f64 / total_size as f64;
+            let dl_mib = downloaded as f64 / 1_048_576.0;
+            let total_mib = total_size as f64 / 1_048_576.0;
+            eprint!("\r    {:.1} / {:.1} MiB ({:.0}%)   ", dl_mib, total_mib, pct);
+            let _ = std::io::stderr().flush();
+            last_print = now;
+        }
+    }
     eprintln!(); // newline after progress
 
     let size = std::fs::metadata(dest).map(|m| m.len()).unwrap_or(0);

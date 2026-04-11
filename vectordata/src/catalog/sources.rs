@@ -160,10 +160,9 @@ fn resolve_catalog_path(path: &str) -> Vec<String> {
     if p.is_dir() {
         // Directory with catalogs.yaml → load recursively
         let catalogs_yaml = p.join("catalogs.yaml");
-        if catalogs_yaml.is_file() {
-            if let Ok(locations) = load_config(path) {
-                return locations;
-            }
+        if catalogs_yaml.is_file()
+            && let Ok(locations) = load_config(path) {
+            return locations;
         }
 
         // Directory with catalog.json or catalog.yaml → use it
@@ -194,10 +193,9 @@ fn resolve_catalog_path(path: &str) -> Vec<String> {
 
 /// Expand `~` prefix to the user's home directory.
 pub fn expand_tilde(path: &str) -> String {
-    if path.starts_with("~/") || path == "~" {
-        if let Some(home) = home_dir() {
-            return format!("{}{}", home, &path[1..]);
-        }
+    if (path.starts_with("~/") || path == "~")
+        && let Some(home) = home_dir() {
+        return format!("{}{}", home, &path[1..]);
     }
     path.to_string()
 }
@@ -227,12 +225,10 @@ pub fn catalog_file_for(location: &str) -> String {
 
     // If it's a path to an existing file that looks like a catalog, use it
     let p = Path::new(location);
-    if p.is_file() {
-        if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
-            if name.starts_with("catalog") && (name.ends_with(".json") || name.ends_with(".yaml")) {
-                return location.to_string();
-            }
-        }
+    if p.is_file()
+        && let Some(name) = p.file_name().and_then(|n| n.to_str())
+        && name.starts_with("catalog") && (name.ends_with(".json") || name.ends_with(".yaml")) {
+        return location.to_string();
     }
 
     let base = ensure_trailing_slash(location);

@@ -8,7 +8,7 @@
 //! a [`CatalogSources`] configuration and fetches `catalog.json` from each
 //! location, remapping layout-embedded entries into a unified list.
 
-use vectordata::dataset::{CatalogEntry, CatalogLayout};
+use crate::dataset::{CatalogEntry, CatalogLayout};
 
 use super::sources::{catalog_file_for, ensure_trailing_slash, CatalogSources};
 
@@ -170,7 +170,7 @@ fn load_catalog_entries(location: &str, entries: &mut Vec<CatalogEntry>, require
                     yaml
                 } else {
                     if required {
-                        eprintln!("ERROR: no catalog file found in {}", crate::check::rel_display(&path.to_path_buf()));
+                        eprintln!("ERROR: no catalog file found in {}", path.display());
                     }
                     return;
                 }
@@ -320,41 +320,24 @@ fn dir_name_of_path(path: &str) -> String {
     }
 }
 
-/// Fetch content from an HTTP(S) URL using curl.
+/// Fetch content from an HTTP(S) URL using reqwest (blocking).
 fn fetch_http(url: &str) -> Result<String, String> {
-    let mut data = Vec::new();
-    let mut handle = curl::easy::Easy::new();
-    handle
-        .url(url)
-        .map_err(|e| format!("curl error: {}", e))?;
-    handle
-        .follow_location(true)
-        .map_err(|e| format!("curl error: {}", e))?;
-    handle
-        .useragent("veks/0.2")
-        .map_err(|e| format!("curl error: {}", e))?;
+    let client = reqwest::blocking::Client::builder()
+        .user_agent("vectordata/0.14")
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .build()
+        .map_err(|e| format!("HTTP client error: {}", e))?;
 
-    {
-        let mut transfer = handle.transfer();
-        transfer
-            .write_function(|buf| {
-                data.extend_from_slice(buf);
-                Ok(buf.len())
-            })
-            .map_err(|e| format!("curl error: {}", e))?;
-        transfer
-            .perform()
-            .map_err(|e| format!("HTTP request to {} failed: {}", url, e))?;
+    let response = client.get(url).send()
+        .map_err(|e| format!("HTTP request to {} failed: {}", url, e))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!("HTTP {} from {}", status.as_u16(), url));
     }
 
-    let code = handle
-        .response_code()
-        .map_err(|e| format!("curl error: {}", e))?;
-    if code != 200 {
-        return Err(format!("HTTP {} from {}", code, url));
-    }
-
-    String::from_utf8(data).map_err(|e| format!("invalid UTF-8 in response from {}: {}", url, e))
+    response.text()
+        .map_err(|e| format!("failed to read response from {}: {}", url, e))
 }
 
 /// Convert a simple glob pattern to a regex-style matcher.
@@ -381,6 +364,7 @@ fn glob_to_regex(pattern: &str) -> String {
 ///
 /// Supports: `^...$` anchored, `.*` any, `.` single char, literal text.
 /// Returns `None` for patterns too complex to handle.
+#[allow(clippy::type_complexity)]
 fn simple_regex_match(pattern: &str) -> Option<Box<dyn Fn(&str) -> bool>> {
     // For simple substring/exact matching
     let pat = pattern.to_string();
@@ -432,7 +416,7 @@ mod tests {
         for p in profiles {
             profile_group.insert(
                 p.to_string(),
-                vectordata::dataset::DSProfile {
+                crate::dataset::DSProfile {
                     maxk: None,
                     base_count: None,
                     views: IndexMap::new(),
@@ -445,7 +429,7 @@ mod tests {
             dataset_type: "dataset.yaml".to_string(),
             layout: CatalogLayout {
                 attributes: None,
-                profiles: vectordata::dataset::DSProfileGroup::from_profiles(profile_group),
+                profiles: crate::dataset::DSProfileGroup::from_profiles(profile_group),
             },
         }
     }

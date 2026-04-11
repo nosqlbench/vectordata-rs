@@ -215,64 +215,59 @@ pub fn run(catalog_base: &str, dataset_name: &str, profile_name: &str) {
 
 /// Fetch a text resource via HTTP GET.
 fn fetch_text(url: &str) -> Result<String, String> {
-    let mut data = Vec::new();
-    let mut handle = curl::easy::Easy::new();
-    handle.url(url).map_err(|e| format!("curl: {}", e))?;
-    handle.follow_location(true).map_err(|e| format!("curl: {}", e))?;
-    handle.useragent("veks/0.9").map_err(|e| format!("curl: {}", e))?;
-    handle.timeout(std::time::Duration::from_secs(30)).map_err(|e| format!("curl: {}", e))?;
-    {
-        let mut transfer = handle.transfer();
-        transfer.write_function(|buf| {
-            data.extend_from_slice(buf);
-            Ok(buf.len())
-        }).map_err(|e| format!("curl: {}", e))?;
-        transfer.perform().map_err(|e| format!("HTTP GET {} failed: {}", url, e))?;
+    let client = reqwest::blocking::Client::builder()
+        .user_agent("veks/0.14")
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| format!("HTTP client: {}", e))?;
+    let resp = client.get(url).send()
+        .map_err(|e| format!("HTTP GET {} failed: {}", url, e))?;
+    let status = resp.status().as_u16();
+    if status != 200 {
+        return Err(format!("HTTP {} from {}", status, url));
     }
-    let code = handle.response_code().map_err(|e| format!("curl: {}", e))?;
-    if code != 200 {
-        return Err(format!("HTTP {} from {}", code, url));
-    }
-    String::from_utf8(data).map_err(|e| format!("invalid UTF-8 from {}: {}", url, e))
+    resp.text().map_err(|e| format!("invalid response from {}: {}", url, e))
 }
 
 /// HEAD request — returns (status_code, content_length).
 fn probe_url(url: &str) -> Result<(u32, u64), String> {
-    let mut handle = curl::easy::Easy::new();
-    handle.url(url).map_err(|e| format!("curl: {}", e))?;
-    handle.nobody(true).map_err(|e| format!("curl: {}", e))?; // HEAD
-    handle.follow_location(true).map_err(|e| format!("curl: {}", e))?;
-    handle.useragent("veks/0.9").map_err(|e| format!("curl: {}", e))?;
-    handle.timeout(std::time::Duration::from_secs(15)).map_err(|e| format!("curl: {}", e))?;
-    handle.perform().map_err(|e| format!("HEAD {} failed: {}", url, e))?;
-    let code = handle.response_code().map_err(|e| format!("curl: {}", e))?;
-    let size = handle.content_length_download().unwrap_or(-1.0);
-    Ok((code, if size >= 0.0 { size as u64 } else { 0 }))
+    let client = reqwest::blocking::Client::builder()
+        .user_agent("veks/0.14")
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| format!("HTTP client: {}", e))?;
+    let resp = client.head(url).send()
+        .map_err(|e| format!("HEAD {} failed: {}", url, e))?;
+    let code = resp.status().as_u16() as u32;
+    let size = resp.headers().get(reqwest::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    Ok((code, size))
 }
 
 /// Fetch a byte range via HTTP Range request.
 fn fetch_range(url: &str, offset: u64, length: u64) -> Result<Vec<u8>, String> {
-    let mut data = Vec::new();
-    let mut handle = curl::easy::Easy::new();
-    handle.url(url).map_err(|e| format!("curl: {}", e))?;
-    handle.follow_location(true).map_err(|e| format!("curl: {}", e))?;
-    handle.useragent("veks/0.9").map_err(|e| format!("curl: {}", e))?;
-    handle.range(&format!("{}-{}", offset, offset + length - 1))
-        .map_err(|e| format!("curl: {}", e))?;
-    handle.timeout(std::time::Duration::from_secs(15)).map_err(|e| format!("curl: {}", e))?;
-    {
-        let mut transfer = handle.transfer();
-        transfer.write_function(|buf| {
-            data.extend_from_slice(buf);
-            Ok(buf.len())
-        }).map_err(|e| format!("curl: {}", e))?;
-        transfer.perform().map_err(|e| format!("Range GET {} failed: {}", url, e))?;
-    }
-    let code = handle.response_code().map_err(|e| format!("curl: {}", e))?;
+    let client = reqwest::blocking::Client::builder()
+        .user_agent("veks/0.14")
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| format!("HTTP client: {}", e))?;
+    let range = format!("bytes={}-{}", offset, offset + length - 1);
+    let resp = client.get(url)
+        .header(reqwest::header::RANGE, &range)
+        .send()
+        .map_err(|e| format!("Range GET {} failed: {}", url, e))?;
+    let code = resp.status().as_u16();
     if code != 200 && code != 206 {
         return Err(format!("HTTP {} from {} (expected 200 or 206)", code, url));
     }
-    Ok(data)
+    resp.bytes()
+        .map(|b| b.to_vec())
+        .map_err(|e| format!("read error from {}: {}", url, e))
 }
 
 fn format_size(bytes: u64) -> String {

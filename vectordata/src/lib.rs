@@ -39,6 +39,8 @@
 
 /// Cached channel utilities for buffered data delivery.
 pub mod cache;
+/// Dataset catalog resolution — load catalogs from local and remote sources.
+pub mod catalog;
 /// Dataset configuration model (profiles, facets, pipelines, catalogs).
 pub mod dataset;
 /// Wire format codecs: MNode, PNode, ANode.

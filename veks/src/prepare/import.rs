@@ -403,10 +403,13 @@ fn resolve_slots(args: &ImportArgs) -> PipelineSlots {
             .unwrap_or("fvec")
     };
 
+    let shuffle_enabled = args.seed != 0;
+
     let (shuffle, query_vectors, base_vectors, base_count) = if self_search {
         // Strategy 1 (combined B+Q) or Strategy 3 (B only): shuffle + extract
         // For Strategy 1, base+query are combined before prepare-vectors,
         // then shuffle produces disjoint train/test split.
+        // Shuffle is always required for self-search (provides train/test split).
         let shuffle = Artifact::Materialized {
             step_id: "generate-shuffle".into(),
             output: "${cache}/shuffle.ivec".into(),
@@ -428,12 +431,14 @@ fn resolve_slots(args: &ImportArgs) -> PipelineSlots {
         // Strategy 2: HDF5 with separate query — independent processing.
         // Queries get normalize + zero-filter via convert-queries.
         // Base gets full prepare-vectors + shuffle treatment.
-        // The shuffle randomizes the base vector order after dedup,
-        // same as non-HDF5 datasets. Queries are not included in the
-        // shuffle since they come from a separate HDF5 dataset.
-        let shuffle = Artifact::Materialized {
-            step_id: "generate-shuffle".into(),
-            output: "${cache}/shuffle.ivec".into(),
+        // Shuffle randomizes the base vector order after dedup (optional).
+        let shuffle = if shuffle_enabled {
+            Some(Artifact::Materialized {
+                step_id: "generate-shuffle".into(),
+                output: "${cache}/shuffle.ivec".into(),
+            })
+        } else {
+            None
         };
         let qv = Artifact::Materialized {
             step_id: "convert-queries".into(),
@@ -447,7 +452,7 @@ fn resolve_slots(args: &ImportArgs) -> PipelineSlots {
             step_id: "count-base".into(),
             output: String::new(),
         };
-        (Some(shuffle), Some(qv), bv, Some(bc))
+        (shuffle, Some(qv), bv, Some(bc))
     } else {
         // No queries at all
         let bv = Artifact::Materialized {
