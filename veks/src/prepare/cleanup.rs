@@ -374,6 +374,7 @@ pub fn run(args: CleanupArgs) {
             metadata_range_max: 1000,
             predicate_range_min: 0,
             predicate_range_max: 1000,
+            verify_knn_sample: 0,
         };
 
         import::run(import_args);

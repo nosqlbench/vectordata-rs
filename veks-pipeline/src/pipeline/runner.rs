@@ -500,8 +500,10 @@ pub fn run_steps(
         if let Some(ref desc) = step.def.description {
             ctx.ui.log(&format!("{} {} — {}", prefix, step.id, desc));
         }
+        ctx.ui.clear_step_log();
         ctx.ui.log(&format!("{} {} — running: {}", prefix, step.id, step.def.run));
-        dlog.log(&format!("  [start] {} — {}", step.id, step.def.run));
+        dlog.log(&format!("  {} [start] {} — {}",
+            chrono::Local::now().format("%H:%M:%S"), step.id, step.def.run));
         dlog.flush();
         ctx.step_id = step.id.clone();
         ctx.governor.set_step_id(&step.id);
@@ -620,8 +622,14 @@ pub fn run_steps(
                     "{} {} — {} ({:.1}s): {}",
                     prefix, step.id, level, elapsed.as_secs_f64(), result.message
                 ));
-                dlog.log(&format!("  [{}] {} ({:.1}s): {}",
+                dlog.log(&format!("  {} [{}] {} ({:.1}s): {}",
+                    chrono::Local::now().format("%H:%M:%S"),
                     level.to_lowercase(), step.id, elapsed.as_secs_f64(), result.message));
+                // Flush all captured step log lines with timestamps
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                for line in ctx.ui.drain_step_log() {
+                    dlog.log(&format!("  {} | {}", ts, line));
+                }
                 dlog.flush();
             }
             Status::Error => {
@@ -630,8 +638,14 @@ pub fn run_steps(
                     "{} {} — ERROR ({:.1}s): {}",
                     prefix, step.id, elapsed.as_secs_f64(), result.message
                 ));
-                dlog.log(&format!("  [error] {} ({:.1}s): {}",
+                dlog.log(&format!("  {} [error] {} ({:.1}s): {}",
+                    chrono::Local::now().format("%H:%M:%S"),
                     step.id, elapsed.as_secs_f64(), result.message));
+                // Flush step log lines for error diagnostics
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                for line in ctx.ui.drain_step_log() {
+                    dlog.log(&format!("  {} | {}", ts, line));
+                }
                 dlog.flush();
                 // Save progress so we can resume later
                 if let Err(e) = ctx.progress.save() {

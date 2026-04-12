@@ -102,6 +102,16 @@ pub trait TestDataView: Send + Sync {
     /// the generic access path. Returns f32 vectors.
     fn facet(&self, name: &str) -> Result<Arc<dyn VectorReader<f32>>>;
 
+    // -- Typed facet access --
+
+    /// Returns the native element type of a named facet, inferred from
+    /// the file extension in the profile config.
+    ///
+    /// ```rust,ignore
+    /// let etype = view.facet_element_type("metadata_content")?; // → ElementType::U8
+    /// ```
+    fn facet_element_type(&self, name: &str) -> Result<crate::typed_access::ElementType>;
+
     // -- Dataset metadata --
 
     /// Returns the distance function name if declared in attributes.
@@ -257,6 +267,57 @@ impl GenericTestDataView {
     }
 }
 
+impl GenericTestDataView {
+    /// Look up a facet by name and return its FacetConfig.
+    fn facet_config_by_name(&self, name: &str) -> Option<&FacetConfig> {
+        match name {
+            "base_vectors" => self.config.base_vectors.as_ref(),
+            "query_vectors" => self.config.query_vectors.as_ref(),
+            "neighbor_indices" => self.config.neighbor_indices.as_ref(),
+            "neighbor_distances" => self.config.neighbor_distances.as_ref(),
+            "metadata_content" => self.config.metadata_content.as_ref(),
+            "metadata_predicates" => self.config.metadata_predicates.as_ref(),
+            "predicate_results" => self.config.predicate_results.as_ref(),
+            "metadata_layout" => self.config.metadata_layout.as_ref(),
+            "filtered_neighbor_indices" => self.config.filtered_neighbor_indices.as_ref(),
+            "filtered_neighbor_distances" => self.config.filtered_neighbor_distances.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// Open a named facet as a typed reader.
+    ///
+    /// Fails at open time if T is narrower than the native element type.
+    /// Same-width cross-sign (e.g., u8↔i8) is allowed but checked per-value.
+    ///
+    /// ```rust,ignore
+    /// // Open with native type — zero-copy access
+    /// let r = view.open_facet_typed::<u8>("metadata_content")?;
+    ///
+    /// // Open with wider type — always succeeds
+    /// let r = view.open_facet_typed::<i32>("metadata_content")?;
+    /// ```
+    pub fn open_facet_typed<T: crate::typed_access::TypedElement>(
+        &self,
+        name: &str,
+    ) -> std::result::Result<crate::typed_access::TypedReader<T>, crate::typed_access::TypedAccessError> {
+        let path = self.resolve_facet_path(name)
+            .map_err(|e| crate::typed_access::TypedAccessError::Io(e.to_string()))?;
+        crate::typed_access::TypedReader::<T>::open(&path)
+    }
+
+    /// Resolve a facet name to a filesystem path.
+    fn resolve_facet_path(&self, name: &str) -> Result<PathBuf> {
+        let facet = self.facet_config_by_name(name)
+            .ok_or_else(|| Error::MissingFacet(name.to_string()))?;
+        match self.resolve_resource(facet)? {
+            ResourceLocation::FileSystem(path) => Ok(path),
+            ResourceLocation::Http(_) => Err(Error::Other(
+                format!("typed access not supported for HTTP facets ({})", name))),
+        }
+    }
+}
+
 enum ResourceLocation {
     FileSystem(PathBuf),
     Http(Url),
@@ -338,6 +399,12 @@ impl TestDataView for GenericTestDataView {
             Some(fc) => self.open_facet_as_fvec(fc),
             None => Err(Error::MissingFacet(name.to_string())),
         }
+    }
+
+    fn facet_element_type(&self, name: &str) -> Result<crate::typed_access::ElementType> {
+        let path = self.resolve_facet_path(name)?;
+        crate::typed_access::ElementType::from_path(&path)
+            .map_err(Error::Other)
     }
 
     fn distance_function(&self) -> Option<String> {

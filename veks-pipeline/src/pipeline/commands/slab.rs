@@ -1760,7 +1760,7 @@ predicates` steps have the schema and cardinality information they need.
     fn project_artifacts(&self, step_id: &str, options: &Options) -> ArtifactManifest {
         crate::pipeline::command::manifest_from_keys(
             step_id, self.command_path(), options,
-            &["input"],
+            &["source"],
             &["output"],
         )
     }
@@ -2185,7 +2185,6 @@ fn survey_ivec(
     max_samples: usize,
     max_distinct: usize,
 ) -> Result<SurveyResult, String> {
-    use std::io::Read;
     let data = std::fs::read(path)
         .map_err(|e| format!("read {}: {}", path.display(), e))?;
     if data.len() < 4 {

@@ -83,6 +83,7 @@ fn default_args(name: &str, output: &Path) -> ImportArgs {
         metadata_range_max: 1000,
             predicate_range_min: 0,
             predicate_range_max: 1000,
+            verify_knn_sample: 0,
     }
 }
 

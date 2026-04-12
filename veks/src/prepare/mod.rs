@@ -739,6 +739,7 @@ pub fn run(args: PrepareArgs) {
                         metadata_range_max,
                         predicate_range_min: metadata_range_min,
                         predicate_range_max: metadata_range_max,
+                        verify_knn_sample: 0,
                     });
                     check_and_restore(&out);
                 }
@@ -810,6 +811,7 @@ pub fn run(args: PrepareArgs) {
                     metadata_range_max,
                     predicate_range_min: metadata_range_min,
                     predicate_range_max: metadata_range_max,
+                    verify_knn_sample: 0,
                 });
             }
         }

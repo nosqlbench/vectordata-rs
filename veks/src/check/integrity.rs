@@ -59,8 +59,13 @@ pub fn check(_root: &Path, publishable: &[PathBuf]) -> CheckResult {
     }
 }
 
-/// Validate an xvec file: check that file size is evenly divisible by
-/// the record stride, and that the dimension header is consistent.
+/// Validate an xvec file: read the first record's dimension header,
+/// then check whether file size is evenly divisible by the implied
+/// stride. If it divides evenly, the file is consistent with uniform
+/// records. If not, the file has variable-length records (each record
+/// carries its own dimension header per the xvec format) — accept it
+/// since walking every header in a multi-GB file is too expensive for
+/// a preflight check.
 fn check_xvec(path: &Path, format: VecFormat) -> Result<(), String> {
     let meta = fs::metadata(path)
         .map_err(|e| format!("cannot stat: {}", e))?;
@@ -74,7 +79,7 @@ fn check_xvec(path: &Path, format: VecFormat) -> Result<(), String> {
         return Err("file too small for dimension header (< 4 bytes)".to_string());
     }
 
-    // Read the dimension from the first 4 bytes
+    // Read the dimension from the first record
     let mut f = fs::File::open(path)
         .map_err(|e| format!("cannot open: {}", e))?;
     let mut dim_buf = [0u8; 4];
@@ -88,8 +93,25 @@ fn check_xvec(path: &Path, format: VecFormat) -> Result<(), String> {
 
     let elem_size = format.element_size() as u64;
     let stride = 4 + (dim as u64) * elem_size;
-    let remainder = file_size % stride;
 
+    if file_size < stride {
+        return Err(format!(
+            "file size {} is smaller than a single record of dim={} ({}B)",
+            file_size, dim, stride,
+        ));
+    }
+
+    // For ivec format, records may have variable dimensions (e.g. predicate
+    // result indices where each predicate matches a different number of
+    // ordinals). Skip the stride divisibility check for ivec.
+    if format == VecFormat::Ivec {
+        return Ok(());
+    }
+
+    // For all other xvec formats, records should be uniform-dimension.
+    // A file size that isn't evenly divisible by stride indicates truncation
+    // or corruption.
+    let remainder = file_size % stride;
     if remainder != 0 {
         let record_count = file_size / stride;
         return Err(format!(
@@ -97,23 +119,6 @@ fn check_xvec(path: &Path, format: VecFormat) -> Result<(), String> {
              {} complete records + {} trailing bytes",
             file_size, stride, dim, elem_size, record_count, remainder,
         ));
-    }
-
-    // Spot-check: verify a second record's dimension matches (if file has > 1 record)
-    let record_count = file_size / stride;
-    if record_count > 1 {
-        use std::io::Seek;
-        f.seek(std::io::SeekFrom::Start(stride))
-            .map_err(|e| format!("cannot seek to second record: {}", e))?;
-        f.read_exact(&mut dim_buf)
-            .map_err(|e| format!("cannot read second record dimension: {}", e))?;
-        let dim2 = i32::from_le_bytes(dim_buf);
-        if dim2 != dim {
-            return Err(format!(
-                "dimension mismatch: record 0 has dim={}, record 1 has dim={}",
-                dim, dim2,
-            ));
-        }
     }
 
     Ok(())

@@ -9,7 +9,6 @@
 //!
 //! Equivalent to the Java `CMD_fetch_dlhf` / `bulkdl` command.
 
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -263,7 +262,7 @@ struct HfFileEntry {
 
 /// List files in a HuggingFace repo via the API.
 fn list_hf_files(api_url: &str) -> Result<Vec<HfFileEntry>, String> {
-    let mut client_builder = reqwest::blocking::Client::builder()
+    let client_builder = reqwest::blocking::Client::builder()
         .user_agent("veks/0.14")
         .redirect(reqwest::redirect::Policy::limited(10));
 

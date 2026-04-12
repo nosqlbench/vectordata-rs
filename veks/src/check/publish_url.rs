@@ -48,7 +48,6 @@ pub fn check(root: &Path, dataset_files: &[PathBuf]) -> CheckResult {
             let mut messages = vec![
                 format!(".publish_url: {} (transport: {})", parsed.url, parsed.scheme),
             ];
-            let mut failures: Vec<String> = Vec::new();
             for ds in dataset_files {
                 let ds_dir = ds.parent().unwrap_or(Path::new("."));
                 // Path from publish root to the dataset directory
@@ -101,12 +100,16 @@ pub fn check(root: &Path, dataset_files: &[PathBuf]) -> CheckResult {
                 }
                 if endpoints.len() > 1 {
                     let first_endpoint = &endpoints[0].1;
+                    // The most interior (closest to dataset) publish root wins.
+                    // Outer roots with different endpoints are noted as warnings
+                    // but do not cause a check failure.
                     for (root_path, endpoint) in &endpoints[1..] {
                         if endpoint != first_endpoint {
-                            failures.push(format!(
-                                "  {} — inconsistent publish endpoints:\n    \
-                                 local:  {}\n    \
-                                 outer:  {}\n    \
+                            messages.push(format!(
+                                "  {} — note: nested publish roots with different endpoints \
+                                 (using interior root):\n    \
+                                 interior: {}\n    \
+                                 outer:    {}\n    \
                                  (outer root: {})",
                                 rel_str,
                                 first_endpoint,
@@ -119,10 +122,6 @@ pub fn check(root: &Path, dataset_files: &[PathBuf]) -> CheckResult {
             }
             let mut result = CheckResult::ok("publish");
             result.messages = messages;
-            if !failures.is_empty() {
-                result.passed = false;
-                result.messages.extend(failures);
-            }
             result
         }
         Err(e) => {

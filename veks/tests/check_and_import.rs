@@ -109,6 +109,7 @@ fn default_args(name: &str, output: &Path) -> ImportArgs {
         metadata_range_max: 1000,
             predicate_range_min: 0,
             predicate_range_max: 1000,
+            verify_knn_sample: 0,
     }
 }
 
@@ -454,9 +455,10 @@ fn check_publish_endpoint_consistency_fail() {
 
     let ds_yaml = ds.join("dataset.yaml");
     let result = check::publish_url::check(dir.path(), &[ds_yaml]);
-    assert!(!result.passed, "inconsistent endpoints should fail: {:?}", result.messages);
+    // Nested publish roots are warnings, not failures — the interior root wins
+    assert!(result.passed, "nested publish roots should pass (warning only): {:?}", result.messages);
     let msg = result.messages.join(" ");
-    assert!(msg.contains("inconsistent"), "should mention inconsistency: {}", msg);
+    assert!(msg.contains("nested publish roots"), "should note nested roots: {}", msg);
 }
 
 #[test]
@@ -1172,7 +1174,7 @@ fn project_artifacts_compute_predicates() {
 
     let cmd = make_cmd("compute evaluate-predicates");
     let mut opts = Options::new();
-    opts.set("input", "profiles/default/base_metadata.slab");
+    opts.set("source", "profiles/default/base_metadata.slab");
     opts.set("predicates", "predicates.slab");
     opts.set("survey", "survey.json");
     opts.set("output", "profiles/default/predicate_keys.slab");
@@ -1197,7 +1199,7 @@ fn project_artifacts_compute_predicates_optional_survey_missing() {
 
     let cmd = make_cmd("compute evaluate-predicates");
     let mut opts = Options::new();
-    opts.set("input", "meta.slab");
+    opts.set("source", "meta.slab");
     opts.set("predicates", "preds.slab");
     opts.set("output", "keys.slab");
     // survey not set
@@ -1216,7 +1218,7 @@ fn project_artifacts_synthesize_predicates() {
 
     let cmd = make_cmd("generate predicates");
     let mut opts = Options::new();
-    opts.set("input", "metadata_all.slab");
+    opts.set("source", "metadata_all.slab");
     opts.set("survey", "survey.json");
     opts.set("output", "predicates.slab");
     opts.set("count", "1000");
@@ -1238,7 +1240,7 @@ fn project_artifacts_synthesize_predicates_no_survey() {
 
     let cmd = make_cmd("generate predicates");
     let mut opts = Options::new();
-    opts.set("input", "meta.slab");
+    opts.set("source", "meta.slab");
     opts.set("output", "preds.slab");
     // no survey
 
@@ -1255,7 +1257,7 @@ fn project_artifacts_survey() {
 
     let cmd = make_cmd("analyze survey");
     let mut opts = Options::new();
-    opts.set("input", "metadata_all.slab");
+    opts.set("source", "metadata_all.slab");
     opts.set("output", "survey.json");
 
     let manifest = cmd.project_artifacts("survey-metadata", &opts);
@@ -1272,7 +1274,7 @@ fn project_artifacts_survey_cache_output() {
 
     let cmd = make_cmd("analyze survey");
     let mut opts = Options::new();
-    opts.set("input", "meta.slab");
+    opts.set("source", "meta.slab");
     opts.set("output", "${cache}/survey.json");
 
     let manifest = cmd.project_artifacts("survey-cached", &opts);

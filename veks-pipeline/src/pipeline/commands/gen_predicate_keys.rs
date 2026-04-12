@@ -557,6 +557,63 @@ impl MemProfile {
 }
 
 // ---------------------------------------------------------------------------
+// Format-aware record parsing
+// ---------------------------------------------------------------------------
+
+/// Parse records from scalar (u8, i16, etc.) or ivec format into Vec<Vec<i32>>.
+fn parse_scalar_records(data: &[u8], ext: &str, fields: usize) -> Vec<Vec<i32>> {
+    let elem_size: usize = match ext {
+        "u8" | "i8" => 1,
+        "u16" | "i16" => 2,
+        "u32" | "i32" => 4,
+        "u64" | "i64" => 8,
+        "ivec" | "ivecs" => 0, // xvec with dim header
+        _ => 0,
+    };
+
+    let mut records = Vec::new();
+
+    if elem_size > 0 {
+        // Scalar format: flat packed, no header
+        let record_size = elem_size * fields;
+        if record_size == 0 { return records; }
+        let total = data.len() / record_size;
+        for i in 0..total {
+            let offset = i * record_size;
+            let mut vals = Vec::with_capacity(fields);
+            for f in 0..fields {
+                let fo = offset + f * elem_size;
+                let val: i32 = match elem_size {
+                    1 => data[fo] as i32,
+                    2 => i16::from_le_bytes([data[fo], data[fo+1]]) as i32,
+                    4 => i32::from_le_bytes(data[fo..fo+4].try_into().unwrap()),
+                    8 => i64::from_le_bytes(data[fo..fo+8].try_into().unwrap()) as i32,
+                    _ => 0,
+                };
+                vals.push(val);
+            }
+            records.push(vals);
+        }
+    } else {
+        // ivec format: [dim:i32, val0:i32, val1:i32, ...]
+        let mut offset = 0;
+        while offset + 4 <= data.len() {
+            let dim = i32::from_le_bytes(data[offset..offset+4].try_into().unwrap()) as usize;
+            offset += 4;
+            if offset + dim * 4 > data.len() { break; }
+            let mut vals = Vec::with_capacity(fields.min(dim));
+            for f in 0..fields.min(dim) {
+                let fo = offset + f * 4;
+                vals.push(i32::from_le_bytes(data[fo..fo+4].try_into().unwrap()));
+            }
+            records.push(vals);
+            offset += dim * 4;
+        }
+    }
+    records
+}
+
+// ---------------------------------------------------------------------------
 // Simple-int-eq evaluation
 // ---------------------------------------------------------------------------
 
@@ -590,71 +647,63 @@ impl GenPredicateKeysOp {
             let _ = std::fs::create_dir_all(parent);
         }
 
-        // Read metadata ivec: each record is `fields` i32 values
-        let meta_data = std::fs::read(&input_path)
-            .map_err(|e| format!("read {}: {}", input_path.display(), e));
-        let meta_bytes = match meta_data {
+        // Read metadata: detect format from extension
+        let meta_bytes = match std::fs::read(&input_path) {
             Ok(b) => b,
-            Err(e) => return error_result(e, start),
+            Err(e) => return error_result(format!("read {}: {}", input_path.display(), e), start),
         };
-        let record_bytes = 4 + fields * 4; // dim header + data
-        let meta_count = meta_bytes.len() / record_bytes;
-        ctx.ui.log(&format!("  evaluate: {} metadata records, {} fields", meta_count, fields));
+        let meta_ext = input_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        let metadata = parse_scalar_records(&meta_bytes, meta_ext, fields);
+        ctx.ui.log(&format!("  evaluate: {} metadata records, {} fields (format={})",
+            metadata.len(), fields, meta_ext));
 
-        // Parse metadata into Vec<Vec<i32>>
-        let mut metadata: Vec<Vec<i32>> = Vec::with_capacity(meta_count);
-        for i in 0..meta_count {
-            let base = i * record_bytes + 4; // skip dim header
-            let vals: Vec<i32> = (0..fields)
-                .map(|f| i32::from_le_bytes([
-                    meta_bytes[base + f*4],
-                    meta_bytes[base + f*4 + 1],
-                    meta_bytes[base + f*4 + 2],
-                    meta_bytes[base + f*4 + 3],
-                ]))
-                .collect();
-            metadata.push(vals);
-        }
-
-        // Read predicate ivec
-        let pred_data = std::fs::read(&predicates_path)
-            .map_err(|e| format!("read {}: {}", predicates_path.display(), e));
-        let pred_bytes = match pred_data {
+        // Read predicate file
+        let pred_bytes = match std::fs::read(&predicates_path) {
             Ok(b) => b,
-            Err(e) => return error_result(e, start),
+            Err(e) => return error_result(format!("read {}: {}", predicates_path.display(), e), start),
         };
-        let pred_count = pred_bytes.len() / record_bytes;
-        ctx.ui.log(&format!("  evaluate: {} predicates", pred_count));
+        let pred_ext = predicates_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        let predicates = parse_scalar_records(&pred_bytes, pred_ext, fields);
+        ctx.ui.log(&format!("  evaluate: {} predicates (format={})", predicates.len(), pred_ext));
 
-        // Parse predicates
-        let mut predicates: Vec<Vec<i32>> = Vec::with_capacity(pred_count);
-        for i in 0..pred_count {
-            let base = i * record_bytes + 4;
-            let vals: Vec<i32> = (0..fields)
-                .map(|f| i32::from_le_bytes([
-                    pred_bytes[base + f*4],
-                    pred_bytes[base + f*4 + 1],
-                    pred_bytes[base + f*4 + 2],
-                    pred_bytes[base + f*4 + 3],
-                ]))
-                .collect();
-            predicates.push(vals);
-        }
+        // Build index: map from field values → matching ordinals
+        // For single-field: HashMap<i32, Vec<i32>>
+        // For multi-field: HashMap<Vec<i32>, Vec<i32>>
+        let pred_count = predicates.len();
 
-        // Evaluate: for each predicate, find matching metadata ordinals
-        let pb = ctx.ui.bar(pred_count as u64, "evaluating predicates");
-        let mut results: Vec<Vec<i32>> = Vec::with_capacity(pred_count);
-        for (pi, pred) in predicates.iter().enumerate() {
-            let mut matches: Vec<i32> = Vec::new();
+        let results: Vec<Vec<i32>> = if fields == 1 {
+            // Single-field fast path: hash map from value → ordinals
+            let mut index: std::collections::HashMap<i32, Vec<i32>> =
+                std::collections::HashMap::new();
             for (mi, meta) in metadata.iter().enumerate() {
-                if pred.iter().zip(meta.iter()).all(|(p, m)| p == m) {
-                    matches.push(mi as i32);
-                }
+                index.entry(meta[0]).or_default().push(mi as i32);
             }
-            results.push(matches);
-            if (pi + 1) % 1000 == 0 { pb.set_position((pi + 1) as u64); }
-        }
-        pb.finish();
+            ctx.ui.log(&format!("  built index: {} distinct values", index.len()));
+
+            let pb = ctx.ui.bar(pred_count as u64, "evaluating predicates");
+            let results: Vec<Vec<i32>> = predicates.iter().enumerate().map(|(pi, pred)| {
+                if (pi + 1) % 10_000 == 0 { pb.set_position((pi + 1) as u64); }
+                index.get(&pred[0]).cloned().unwrap_or_default()
+            }).collect();
+            pb.finish();
+            results
+        } else {
+            // Multi-field: hash map from value tuple → ordinals
+            let mut index: std::collections::HashMap<Vec<i32>, Vec<i32>> =
+                std::collections::HashMap::new();
+            for (mi, meta) in metadata.iter().enumerate() {
+                index.entry(meta.clone()).or_default().push(mi as i32);
+            }
+            ctx.ui.log(&format!("  built index: {} distinct value tuples", index.len()));
+
+            let pb = ctx.ui.bar(pred_count as u64, "evaluating predicates");
+            let results: Vec<Vec<i32>> = predicates.iter().enumerate().map(|(pi, pred)| {
+                if (pi + 1) % 10_000 == 0 { pb.set_position((pi + 1) as u64); }
+                index.get(pred).cloned().unwrap_or_default()
+            }).collect();
+            pb.finish();
+            results
+        };
 
         // Write output as ivec (each record = matching ordinals)
         {
@@ -1976,7 +2025,7 @@ sweep.
     fn project_artifacts(&self, step_id: &str, options: &Options) -> ArtifactManifest {
         crate::pipeline::command::manifest_from_keys(
             step_id, self.command_path(), options,
-            &["input", "predicates", "survey"],
+            &["source", "predicates", "survey"],
             &["output"],
         )
     }

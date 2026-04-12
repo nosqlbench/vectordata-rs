@@ -571,7 +571,7 @@ fn print_human(results: &[CheckResult]) {
                 term::fail("FAILED"),
             );
             for msg in &result.messages {
-                println!("    {}", msg);
+                println!("    {}", term::red(msg));
             }
         }
     }

@@ -242,6 +242,10 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
         || seeds.base_vectors.is_some();
     let has_detected_meta = roles_accepted && detected.metadata.is_some()
         || seeds.metadata.is_some();
+    let has_detected_gt = roles_accepted && detected.neighbor_indices.is_some()
+        || seeds.ground_truth.is_some();
+    let has_detected_gtd = roles_accepted && detected.neighbor_distances.is_some()
+        || seeds.ground_truth_distances.is_some();
 
     let inferred = {
         let probe = ImportArgs {
@@ -252,8 +256,8 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
             self_search: false,
             query_count: 0,
             metadata: if has_detected_meta { Some(PathBuf::from("probe")) } else { None },
-            ground_truth: None,
-            ground_truth_distances: None,
+            ground_truth: if has_detected_gt { Some(PathBuf::from("probe")) } else { None },
+            ground_truth_distances: if has_detected_gtd { Some(PathBuf::from("probe")) } else { None },
             metric: String::new(),
             neighbors: 0,
             seed: 0,
@@ -285,6 +289,7 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
             metadata_range_max: 1000,
             predicate_range_min: 0,
             predicate_range_max: 1000,
+            verify_knn_sample: 0,
         };
         super::import::resolve_facets(&probe)
     };
@@ -523,10 +528,25 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
                 let pred_count: u32 = count_str.parse().unwrap_or(10000);
 
                 println!();
+                // Pick the smallest format that fits the value range
+                let unsigned = rmin >= 0;
+                let abs_max = rmax.unsigned_abs().max(rmin.unsigned_abs()) as u64;
+                let default_fmt = if unsigned && abs_max <= 255 { "u8" }
+                    else if !unsigned && abs_max <= 127 { "i8" }
+                    else if unsigned && abs_max <= 65535 { "u16" }
+                    else if !unsigned && abs_max <= 32767 { "i16" }
+                    else if unsigned && abs_max <= u32::MAX as u64 { "u32" }
+                    else { "i32" };
+
                 println!("  Storage format for metadata and predicates:");
-                println!("    slab  — canonical MNode/PNode in slab files (full type system)");
-                println!("    ivec  — plain integer vectors (lightweight, fast)");
-                let format = prompt_with_default("Storage format", "ivec");
+                println!("  → {}    (recommended for range [{}, {}))", default_fmt, rmin, rmax);
+                println!("  Scalar formats (flat packed, 1 value per ordinal):");
+                println!("    u8, i8, u16, i16, u32, i32, u64, i64");
+                println!("  Vector formats (xvec structured, dim header):");
+                println!("    ivec, svec, bvec, u16vec, u32vec, i64vec, u64vec");
+                println!("  Other:");
+                println!("    slab  — canonical MNode/PNode (full type system)");
+                let format = prompt_with_default("Storage format", default_fmt);
 
                 // Stash predicate config for later — avoids redundant prompts
                 simple_int_eq_predicate_count = Some(pred_count);
@@ -650,6 +670,62 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
         100
     };
 
+    // KNN verification: how many queries to brute-force verify
+    let base_vec_count = base_vectors.as_ref().and_then(|p| probe_vector_count(p)).unwrap_or(0);
+    let query_vec_count = query_vectors.as_ref()
+        .and_then(|p| probe_vector_count(p))
+        .or_else(|| if self_search { Some(query_count as u64) } else { None })
+        .unwrap_or(0);
+    let dim = base_vectors.as_ref().and_then(|p| probe_vector_dim(p)).unwrap_or(128) as u64;
+    let verify_knn_sample = if query_vec_count > 0 && base_vec_count > 0 {
+        println!();
+        println!("--- KNN Verification ---");
+        println!("  Each verified query requires a brute-force scan of all {} base vectors.", base_vec_count);
+        println!("  Compute cost projections (dim={}):", dim);
+        let show_cost = |n: u64, label: &str| {
+            let ops = n * base_vec_count * dim;
+            let cost_str = if ops >= 1_000_000_000_000 {
+                format!("{:.1}T", ops as f64 / 1e12)
+            } else if ops >= 1_000_000_000 {
+                format!("{:.1}G", ops as f64 / 1e9)
+            } else if ops >= 1_000_000 {
+                format!("{:.1}M", ops as f64 / 1e6)
+            } else {
+                format!("{}", ops)
+            };
+            println!("    {:>6} queries ({:>5}) → {} distance ops",
+                n, label, cost_str);
+        };
+        // Show projections for key percentages
+        let q = query_vec_count;
+        if q <= 1000 {
+            show_cost(q, "100%");
+        } else {
+            for &pct in &[100u64, 10, 1] {
+                let n = (q * pct / 100).max(1);
+                show_cost(n, &format!("{}%", pct));
+            }
+            show_cost(100.min(q), "fixed");
+        }
+
+        // Default: 100% for small datasets, 100 queries for large
+        let default = if base_vec_count <= 2_000_000 && q <= 50_000 {
+            format!("{}",  q) // all queries
+        } else {
+            "100".to_string()
+        };
+        let input = prompt_with_default("Queries to verify (number or %)", &default);
+        let input = input.trim();
+        if input.ends_with('%') {
+            let pct: f64 = input.trim_end_matches('%').parse().unwrap_or(100.0);
+            ((q as f64 * pct / 100.0).round() as u32).max(1)
+        } else {
+            input.parse::<u32>().unwrap_or(100)
+        }
+    } else {
+        0
+    };
+
     // Shuffling: optional, seed 0 disables it
     let seed = if let Some(seeded) = seeds.seed {
         if seeded == 0 {
@@ -659,7 +735,9 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
         }
         seeded
     } else {
-        let shuffle = confirm("Shuffle base vectors?", true);
+        let has_all_bqg = base_vectors.is_some() && query_vectors.is_some() && ground_truth.is_some();
+        let shuffle_default = !has_all_bqg;
+        let shuffle = confirm("Shuffle base vectors?", shuffle_default);
         if shuffle {
             let seed_str = prompt_with_default("Shuffle seed", "42");
             seed_str.parse().unwrap_or(42)
@@ -1101,6 +1179,7 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
         metadata_range_max,
         predicate_range_min,
         predicate_range_max,
+        verify_knn_sample,
     }
 }
 
@@ -1151,10 +1230,8 @@ fn rename_detected_sources(detected: &mut DetectedRoles) {
     ];
 
     let any_need = labels.iter().any(|(_, need)| *need);
-    if !any_need {
-        return;
-    }
 
+    if any_need {
     println!();
     println!("--- Source file prefixing ---");
     println!("  Source files are prefixed with _ to exclude them from published datasets.");
@@ -1192,6 +1269,45 @@ fn rename_detected_sources(detected: &mut DetectedRoles) {
         do_rename(&mut detected.metadata_results);
         do_rename(&mut detected.filtered_neighbor_indices);
         do_rename(&mut detected.filtered_neighbor_distances);
+    }
+    } // end if any_need
+
+    // Unassigned files: data files that weren't matched to any role.
+    // Offer to underscore-prefix them so they're excluded from publishing.
+    let unassigned_need: Vec<usize> = detected.unassigned.iter().enumerate()
+        .filter(|(_, p)| {
+            let fname = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            !fname.starts_with('_') && !fname.is_empty()
+        })
+        .map(|(i, _)| i)
+        .collect();
+
+    if !unassigned_need.is_empty() {
+        println!();
+        println!("--- Unassigned source files ---");
+        println!("  The following data files were not assigned to any dataset role.");
+        println!("  Prefixing with _ excludes them from publishing:");
+        println!();
+        for &i in &unassigned_need {
+            println!("    {}", detected.unassigned[i].display());
+        }
+        println!();
+        if confirm("Rename unassigned files with _ prefix?", true) {
+            for &i in &unassigned_need {
+                let p = &detected.unassigned[i];
+                let fname = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                let parent = p.parent().unwrap_or(Path::new("."));
+                let dest = parent.join(format!("_{}", fname));
+                match std::fs::rename(p, &dest) {
+                    Ok(()) => {
+                        println!("  {} → {}", p.display(), dest.display());
+                    }
+                    Err(e) => {
+                        println!("  WARNING: rename {} failed: {}", p.display(), e);
+                    }
+                }
+            }
+        }
     }
 }
 

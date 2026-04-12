@@ -380,13 +380,10 @@ pub fn run_pipeline(args: RunArgs) -> Result<(), String> {
         .unwrap_or(Path::new("."))
         .to_path_buf();
 
-    // Handle --clean: full reset (remove all generated artifacts), then exit.
-    // Handle --reset: same cleanup, then continue to run.
+    // Handle --clean / --reset: full reset (remove all generated artifacts),
+    // then continue to run the pipeline from scratch.
     if args.clean || args.reset {
         reset_pipeline(&workspace, dataset_path, &config);
-        if args.clean {
-            return Ok(());
-        }
     }
 
     // Create managed scratch and cache directories
@@ -798,7 +795,7 @@ fn update_dataset_attributes(dataset_path: &Path, workspace: &Path) {
     };
 
     // Build the variables YAML block
-    let mut vars_block = String::from("\nvariables:\n");
+    let mut vars_block = String::from("\n\nvariables:\n");
     for (k, v) in &vars {
         vars_block.push_str(&format!("  {}: '{}'\n", k, v));
     }
@@ -1371,10 +1368,18 @@ pub fn reset_pipeline(workspace: &Path, dataset_path: &Path, config: &DatasetCon
     //    We preserve: dataset.yaml, dataset.json, dataset.log, dataset.jsonl,
     //    variables.yaml, variables.json, catalog.*, .publish, .publish_url,
     //    .catalog_root, .gitignore, and identity symlinks pointing to source data.
+    // Remove generated log/variable/json files
+    for name in &["dataset.json", "dataset.jsonl", "dataset.log",
+                   "runlog.jsonl", "variables.yaml", "variables.json"] {
+        let p = workspace.join(name);
+        if p.exists() {
+            let _ = std::fs::remove_file(&p);
+            println!("  removed {}", veks_core::paths::rel_display(&p));
+        }
+    }
+
     let preserve = |name: &str| -> bool {
-        name == "dataset.yaml" || name == "dataset.yml" || name == "dataset.json"
-            || name == "dataset.log" || name == "dataset.jsonl"
-            || name == "variables.yaml" || name == "variables.json"
+        name == "dataset.yaml" || name == "dataset.yml"
             || name == ".publish" || name == ".publish_url" || name == ".catalog_root"
             || name == ".do_not_catalog" || name == ".gitignore"
             || name == "catalog.json" || name == "catalog.yaml"

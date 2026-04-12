@@ -229,7 +229,37 @@ impl GenPredicatesOp {
             count, fields, range_min, range_max, seed,
         ));
 
-        if format == "ivec" {
+        let is_scalar = matches!(format, "u8" | "i8" | "u16" | "i16" | "u32" | "i32" | "u64" | "i64");
+        let scalar_elem_size: usize = match format {
+            "u8" | "i8" => 1, "u16" | "i16" => 2, "u32" | "i32" => 4, "u64" | "i64" => 8, _ => 0,
+        };
+
+        if is_scalar {
+            // Write as flat packed scalar
+            use std::io::Write;
+            let mut f = match std::fs::File::create(&output_path) {
+                Ok(f) => std::io::BufWriter::new(f),
+                Err(e) => return error_result(format!("create {}: {}", output_path.display(), e), start),
+            };
+            let pb = ctx.ui.bar(count as u64, "generating predicates");
+            for i in 0..count {
+                for _ in 0..fields {
+                    let val = range_min + rng_inst.random_range(0..range);
+                    let write_ok = match scalar_elem_size {
+                        1 => f.write_all(&[val as u8]).is_ok(),
+                        2 => f.write_all(&(val as i16).to_le_bytes()).is_ok(),
+                        4 => f.write_all(&val.to_le_bytes()).is_ok(),
+                        8 => f.write_all(&(val as i64).to_le_bytes()).is_ok(),
+                        _ => false,
+                    };
+                    if !write_ok {
+                        return error_result("write error".into(), start);
+                    }
+                }
+                if (i + 1) % 10_000 == 0 { pb.set_position((i + 1) as u64); }
+            }
+            pb.finish();
+        } else if format == "ivec" {
             // Write as ivec: each predicate is a vector of `fields` i32 values
             use std::io::Write;
             let mut f = match std::fs::File::create(&output_path) {
@@ -367,7 +397,7 @@ impl CommandOp for GenPredicatesOp {
     fn project_artifacts(&self, step_id: &str, options: &Options) -> ArtifactManifest {
         crate::pipeline::command::manifest_from_keys(
             step_id, self.command_path(), options,
-            &["input", "survey"],
+            &["source", "survey"],
             &["output"],
         )
     }

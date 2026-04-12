@@ -23,10 +23,13 @@ const KNOWN_INFRA: &[&str] = &[
     "dataset.yaml",
     "dataset.yml",
     "dataset.json",
+    "dataset.jsonl",
+    "dataset.log",
     "catalog.json",
     "catalog.yaml",
+    "variables.json",
     "variables.yaml",
-    "dataset.log",
+    "runlog.jsonl",
 ];
 
 /// Check for extraneous publishable files not accounted for by the pipeline.

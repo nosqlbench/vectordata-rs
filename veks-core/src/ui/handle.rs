@@ -80,12 +80,14 @@ impl Drop for ProgressHandle {
 pub struct UiHandle {
     sink: Arc<dyn UiSink>,
     log_writers: Option<LogWriters>,
+    /// Lines emitted via `log()` during the current step, for dataset.log capture.
+    step_log: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 impl UiHandle {
     /// Wrap a sink in a handle.
     pub fn new(sink: Arc<dyn UiSink>) -> Self {
-        UiHandle { sink, log_writers: None }
+        UiHandle { sink, log_writers: None, step_log: Arc::new(std::sync::Mutex::new(Vec::new())) }
     }
 
     /// Attach persistent log writers (plain text + JSONL).
@@ -197,6 +199,25 @@ impl UiHandle {
         });
         if let Some(ref writers) = self.log_writers {
             super::logging_sink::write_to_log(writers, message);
+        }
+        if let Ok(mut buf) = self.step_log.lock() {
+            buf.push(message.to_string());
+        }
+    }
+
+    /// Clear the step log buffer (call at step start).
+    pub fn clear_step_log(&self) {
+        if let Ok(mut buf) = self.step_log.lock() {
+            buf.clear();
+        }
+    }
+
+    /// Drain the step log buffer and return all captured lines.
+    pub fn drain_step_log(&self) -> Vec<String> {
+        if let Ok(mut buf) = self.step_log.lock() {
+            std::mem::take(&mut *buf)
+        } else {
+            Vec::new()
         }
     }
 

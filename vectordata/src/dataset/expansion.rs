@@ -104,11 +104,12 @@ pub fn expand_per_profile_steps(
     let max_phase = templates.iter().map(|t| t.phase).max().unwrap_or(0);
 
     // Classic layout: the default profile's outputs go in the dataset root
-    // instead of profiles/default/. Detected from the profile's profile_dir
-    // override or by checking if base_vectors path has no profiles/ prefix.
+    // instead of profiles/default/. Detected by checking whether ANY profile
+    // view uses a "profiles/" prefix. Source files (base_vectors, query_vectors)
+    // may live at root even in standard layout — only computed artifact paths
+    // are reliable signals.
     let classic = profiles.profiles.get("default")
-        .and_then(|p| p.views.get("base_vectors"))
-        .map(|bv| !bv.source.path.contains("profiles/"))
+        .map(|p| !p.views.values().any(|v| v.source.path.contains("profiles/")))
         .unwrap_or(false);
 
     for phase in 0..=max_phase {

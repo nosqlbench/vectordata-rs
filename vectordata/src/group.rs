@@ -126,6 +126,19 @@ impl TestDataGroup {
         Some(Arc::new(view))
     }
 
+    /// Returns the concrete `GenericTestDataView` for typed facet access.
+    ///
+    /// Unlike `profile()` which returns a trait object, this returns the
+    /// concrete type so clients can call `open_facet_typed::<T>()`.
+    pub fn generic_view(&self, name: &str) -> Option<GenericTestDataView> {
+        let profile_config = self.config.profiles.get(name)?;
+        Some(GenericTestDataView::with_attributes(
+            self.source.clone(),
+            profile_config.clone(),
+            self.config.attributes.clone(),
+        ))
+    }
+
     /// Retrieves a top-level attribute from the dataset configuration.
     pub fn attribute(&self, name: &str) -> Option<&serde_yaml::Value> {
         self.config.attributes.get(name)

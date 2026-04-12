@@ -11,7 +11,6 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use rayon::prelude::*;
 use vectordata::VectorReader;
 use vectordata::io::MmapVectorReader;
 
@@ -187,12 +186,8 @@ impl CommandOp for AnalyzeHistogramOp {
 
         let effective_count = sample.map(|s| s.min(count)).unwrap_or(count);
 
-        // Query governor for thread count and build rayon pool
-        let threads = ctx.governor.current_or("threads", ctx.threads as u64).max(1) as usize;
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(threads)
-            .build()
-            .ok();
+        // Thread count from governor (used by range-bin parallel accumulation)
+        let _threads = ctx.governor.current_or("threads", ctx.threads as u64).max(1) as usize;
 
         // Extract values for the dimension with progress bar
         let pb = ctx.ui.bar_with_unit(effective_count as u64, "reading dimension values", "vectors");

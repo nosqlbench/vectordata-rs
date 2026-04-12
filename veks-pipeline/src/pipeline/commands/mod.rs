@@ -85,6 +85,7 @@ pub mod transform_remove_zeros_knnutils;
 pub mod verify_dataset_knnutils;
 pub mod verify_knn;
 pub mod verify_predicates;
+pub mod verify_predicates_sqlite;
 
 use super::registry::CommandRegistry;
 
@@ -190,6 +191,7 @@ pub fn register_all(registry: &mut CommandRegistry) {
     registry.register("verify knn-consolidated", verify_consolidated::knn_consolidated_factory);
     registry.register("verify filtered-knn-consolidated", verify_consolidated::filtered_knn_consolidated_factory);
     registry.register("verify predicates-consolidated", verify_consolidated::predicates_consolidated_factory);
+    registry.register("verify predicates-sqlite", verify_predicates_sqlite::factory);
 
     // ── catalog ──────────────────────────────────────────────────────
     registry.register("catalog generate", catalog_generate::factory);

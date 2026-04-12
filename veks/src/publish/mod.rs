@@ -284,9 +284,11 @@ fn run_preflight_checks(directory: &Path) -> bool {
     let mut all_ok = true;
     for result in &checks {
         if !result.passed {
-            eprintln!("Pre-flight check failed: {}", result.name);
+            eprintln!("{} {}",
+                veks_core::term::fail("Pre-flight check failed:"),
+                veks_core::term::bold(&result.name));
             for msg in &result.messages {
-                eprintln!("  {}", msg);
+                eprintln!("  {}", veks_core::term::red(msg));
             }
             all_ok = false;
         }

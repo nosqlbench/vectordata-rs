@@ -124,6 +124,9 @@ pub struct ImportArgs {
     /// Defaults to metadata_range_max.
     #[serde(default = "default_metadata_range_max")]
     pub predicate_range_max: i32,
+    /// Number of queries to verify in verify-knn. 0 means all queries.
+    #[serde(default)]
+    pub verify_knn_sample: u32,
 }
 
 fn default_personality() -> String {
@@ -260,16 +263,31 @@ pub fn resolve_facets(args: &ImportArgs) -> String {
     let has_meta = args.metadata.is_some()
         && provided.as_ref().map_or(true, |p| p.contains('M'));
 
+    let has_gt_dist = args.ground_truth_distances.is_some()
+        && provided.as_ref().map_or(true, |p| p.contains('D'));
+
     // Inference from available inputs (SRD 2.8 implication rules)
-    match (has_base, has_meta) {
-        (true, true) => "BQGDMPRF".to_string(),
-        (false, true) => "BQGDMPR".to_string(),
-        (true, false) => {
-            if has_gt { "BQGD".to_string() }
-            else { "BQGD".to_string() }
+    let mut facets = String::new();
+    if has_base {
+        facets.push('B');
+        facets.push('Q'); // Q always implied by B
+        facets.push('G'); // G always implied by B+Q
+        // D only if distances are explicitly provided — computing D
+        // requires a full KNN pass which is expensive and unnecessary
+        // when GT indices are already provided
+        if has_gt_dist {
+            facets.push('D');
         }
-        (false, false) => String::new(),
+        // MPRF: include when metadata is provided OR when BQG are all
+        // provided (metadata can be synthesized)
+        if has_meta || has_gt {
+            facets.push('M');
+            facets.push('P');
+            facets.push('R');
+            facets.push('F');
+        }
     }
+    facets
 }
 
 // ---------------------------------------------------------------------------
@@ -646,9 +664,11 @@ fn resolve_slots(args: &ImportArgs) -> PipelineSlots {
             step_id: "generate-predicates".into(),
             output: format!("{}predicates.{}", pp, ext),
         };
+        // R (predicate results) is always ivec — each record is a
+        // variable-length list of matching ordinals, not a scalar value
         let predicate_indices = Artifact::Materialized {
             step_id: "evaluate-predicates".into(),
-            output: format!("metadata_indices.{}", ext),
+            output: "metadata_indices.ivec".into(),
         };
         Some(MetadataSlots { metadata_all, metadata_content, survey, predicates, predicate_indices })
     } else {
@@ -671,8 +691,7 @@ fn resolve_slots(args: &ImportArgs) -> PipelineSlots {
     };
 
     let wants_filtered = facets.contains('F') && !args.no_filtered;
-    let is_simple_synth = args.synthesis_mode == "simple-int-eq" && args.synthesize_metadata;
-    let filtered_knn = if !has_queries || metadata.is_none() || !wants_filtered || is_simple_synth {
+    let filtered_knn = if !has_queries || metadata.is_none() || !wants_filtered {
         None
     } else {
         Some(Artifact::Materialized {
@@ -1360,7 +1379,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
         } else {
             vec![]
         };
-        let pred_ext = if is_simple && args.synthesis_format != "slab" {
+        let _pred_ext = if is_simple && args.synthesis_format != "slab" {
             &args.synthesis_format
         } else {
             "slab"
@@ -1500,7 +1519,8 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
                     if args.compress_cache {
                         opts.push(("compress_cache".into(), "true".into()));
                     }
-                    opts.push(("normalized".into(), "true".into()));
+                    opts.push(("normalized".into(),
+                        if args.normalize { "true" } else { "false" }.into()));
                     opts
                 },
             });
@@ -1509,7 +1529,12 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
 
     if let Some(ref fknn) = slots.filtered_knn {
         if fknn.is_materialized() {
-            let mut after = vec!["evaluate-predicates".into()];
+            let simple = args.synthesis_mode == "simple-int-eq" && args.synthesize_metadata;
+            let mut after = if simple {
+                vec!["verify-predicates-sqlite".into()]
+            } else {
+                vec!["evaluate-predicates".into()]
+            };
             if slots.base_count.is_some() {
                 after.push("count-base".into());
             }
@@ -1577,8 +1602,12 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
                 ("base".into(), slots.base_vectors.path().into()),
                 ("query".into(), slots.query_vectors.as_ref().unwrap().path().into()),
                 ("metric".into(), args.metric.clone()),
-                ("normalized".into(), "true".into()),
-                ("sample".into(), "100".into()),
+                ("normalized".into(), if args.normalize { "true" } else { "false" }.into()),
+                ("sample".into(), if args.verify_knn_sample == 0 {
+                    "0".into()
+                } else {
+                    args.verify_knn_sample.to_string()
+                }),
                 ("seed".into(), format!("${{{}}}", "seed")),
                 ("output".into(), "${cache}/verify_knn_consolidated.json".into()),
             ],
@@ -1586,46 +1615,75 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
     }
 
     let is_simple_synth = args.synthesis_mode == "simple-int-eq" && args.synthesize_metadata;
+    // ── Predicate verification ───────────────────────────────────────
+    // verify-predicates-sqlite: SQLite oracle verification of R
+    // Runs after evaluate-predicates, before compute-filtered-knn
+    if is_simple_synth {
+        if let Some(ref meta) = slots.metadata {
+            if meta.predicate_indices.is_materialized() {
+                steps.push(Step {
+                    id: "verify-predicates-sqlite".into(),
+                    run: "verify predicates-sqlite".into(),
+                    description: Some("Verify predicate evaluations using SQLite oracle".into()),
+                    after: vec!["evaluate-predicates".into()],
+                    per_profile: true,
+                    phase: 1,
+                    options: vec![
+                        ("metadata".into(), meta.metadata_content.path().into()),
+                        ("predicates".into(), meta.predicates.path().into()),
+                        ("results".into(), meta.predicate_indices.path().into()),
+                        ("fields".into(), args.metadata_fields.to_string()),
+                        ("output".into(), "${cache}/verify_predicates_sqlite.json".into()),
+                    ],
+                });
+            }
+        }
+    } else if let Some(ref meta) = slots.metadata {
+        // Slab mode: consolidated predicate verification
+        if meta.predicate_indices.is_materialized() {
+            steps.push(Step {
+                id: "verify-predicates".into(),
+                run: "verify predicates-consolidated".into(),
+                description: Some("Verify predicate evaluations across all profiles".into()),
+                after: vec!["evaluate-predicates".into()],
+                per_profile: false,
+                phase: 0,
+                options: vec![
+                    ("metadata".into(), meta.metadata_content.path().into()),
+                    ("predicates".into(), meta.predicates.path().into()),
+                    ("sample".into(), "50".into()),
+                    ("metadata-sample".into(), "100000".into()),
+                    ("seed".into(), format!("${{{}}}", "seed")),
+                    ("output".into(), "${cache}/verify_predicates.json".into()),
+                ],
+            });
+        }
+    }
+
+    // ── Filtered KNN + verification ─────────────────────────────────
     if let Some(ref fknn) = slots.filtered_knn {
-        if fknn.is_materialized() && !is_simple_synth {
+        if fknn.is_materialized() {
+            let meta = slots.metadata.as_ref().unwrap();
+            // verify-filtered-knn: brute-force re-computation of filtered KNN
             steps.push(Step {
                 id: "verify-filtered-knn".into(),
                 run: "verify filtered-knn-consolidated".into(),
-                description: Some("Single-pass filtered KNN verification across all profiles".into()),
+                description: Some("Verify filtered KNN results via brute-force recomputation".into()),
                 after: vec!["compute-filtered-knn".into()],
                 per_profile: false,
                 phase: 0,
                 options: vec![
                     ("base".into(), slots.base_vectors.path().into()),
                     ("query".into(), slots.query_vectors.as_ref().unwrap().path().into()),
-                    ("metadata".into(), slots.metadata.as_ref().unwrap().metadata_content.path().into()),
-                    ("predicates".into(), format!("{}predicates.slab", pp)),
+                    ("metadata".into(), meta.metadata_content.path().into()),
+                    ("predicates".into(), meta.predicates.path().into()),
                     ("metric".into(), args.metric.clone()),
-                    ("normalized".into(), "true".into()),
+                    ("normalized".into(), if args.normalize { "true" } else { "false" }.into()),
                     ("sample".into(), "50".into()),
                     ("seed".into(), format!("${{{}}}", "seed")),
-                    ("output".into(), "${cache}/verify_filtered_knn_consolidated.json".into()),
+                    ("output".into(), "${cache}/verify_filtered_knn.json".into()),
                 ],
             });
-
-            if !is_simple_synth {
-                steps.push(Step {
-                    id: "verify-predicates".into(),
-                    run: "verify predicates-consolidated".into(),
-                    description: Some("Single-pass predicate verification across all profiles".into()),
-                    after: vec!["evaluate-predicates".into()],
-                    per_profile: false,
-                    phase: 0,
-                    options: vec![
-                        ("metadata".into(), slots.metadata.as_ref().unwrap().metadata_content.path().into()),
-                        ("predicates".into(), format!("{}predicates.slab", pp)),
-                        ("sample".into(), "50".into()),
-                        ("metadata-sample".into(), "100000".into()),
-                        ("seed".into(), format!("${{{}}}", "seed")),
-                        ("output".into(), "${cache}/verify_predicates_consolidated.json".into()),
-                    ],
-                });
-            }
         }
     }
 
@@ -1639,13 +1697,12 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
         }
     }
     if let Some(ref fknn) = slots.filtered_knn {
-        if fknn.is_materialized() && !is_simple_synth {
+        if fknn.is_materialized() {
             json_after.push("verify-filtered-knn".into());
-            json_after.push("verify-predicates".into());
-        } else if fknn.is_materialized() {
-            // simple-int-eq: depend on evaluate-predicates instead
-            json_after.push("evaluate-predicates".into());
         }
+    }
+    if is_simple_synth && slots.metadata.is_some() {
+        json_after.push("verify-predicates-sqlite".into());
     }
     if json_after.is_empty() {
         if let Some(last) = steps.last() {
@@ -1723,13 +1780,40 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
 // ---------------------------------------------------------------------------
 
 /// Assemble profile views from resolved slot paths.
-fn profile_views(slots: &PipelineSlots, args: &ImportArgs, output_dir: &std::path::Path) -> Vec<(String, String)> {
+fn profile_views(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path::Path) -> Vec<(String, String)> {
     let mut views = Vec::new();
 
-    views.push(("base_vectors".into(), slots.base_vectors.path().into()));
+    // Base vectors: when Identity (source used as-is), the canonical path is
+    // the symlink in profiles/base/. When Materialized, the step output path
+    // already includes the profile prefix.
+    match &slots.base_vectors {
+        Artifact::Identity { path } => {
+            let ext = std::path::Path::new(path).extension()
+                .and_then(|e| e.to_str())
+                .and_then(crate::formats::VecFormat::canonical_extension)
+                .unwrap_or("fvec");
+            views.push(("base_vectors".into(),
+                format!("{}base_vectors.{}", args.profile_prefix(), ext)));
+        }
+        Artifact::Materialized { .. } => {
+            views.push(("base_vectors".into(), slots.base_vectors.path().into()));
+        }
+    }
 
     if let Some(ref qv) = slots.query_vectors {
-        views.push(("query_vectors".into(), qv.path().into()));
+        match qv {
+            Artifact::Identity { path } => {
+                let ext = std::path::Path::new(path).extension()
+                    .and_then(|e| e.to_str())
+                    .and_then(crate::formats::VecFormat::canonical_extension)
+                    .unwrap_or("fvec");
+                views.push(("query_vectors".into(),
+                    format!("{}query_vectors.{}", args.profile_prefix(), ext)));
+            }
+            Artifact::Materialized { .. } => {
+                views.push(("query_vectors".into(), qv.path().into()));
+            }
+        }
     }
 
     if let Some(ref meta) = slots.metadata {
@@ -1740,11 +1824,20 @@ fn profile_views(slots: &PipelineSlots, args: &ImportArgs, output_dir: &std::pat
     if let Some(ref knn) = slots.knn {
         match knn {
             Artifact::Identity { path } => {
-                views.push(("neighbor_indices".into(), path.clone()));
+                let ext = std::path::Path::new(path).extension()
+                    .and_then(|e| e.to_str())
+                    .and_then(crate::formats::VecFormat::canonical_extension)
+                    .unwrap_or("ivec");
+                views.push(("neighbor_indices".into(),
+                    format!("{}neighbor_indices.{}", args.profile_prefix(), ext)));
                 // Include pre-provided distances if available
                 if let Some(ref gt_dist) = args.ground_truth_distances {
+                    let dext = gt_dist.extension()
+                        .and_then(|e| e.to_str())
+                        .and_then(crate::formats::VecFormat::canonical_extension)
+                        .unwrap_or("fvec");
                     views.push(("neighbor_distances".into(),
-                        relativize_path(gt_dist, output_dir)));
+                        format!("{}neighbor_distances.{}", args.profile_prefix(), dext)));
                 }
             }
             Artifact::Materialized { .. } => {
@@ -1755,8 +1848,8 @@ fn profile_views(slots: &PipelineSlots, args: &ImportArgs, output_dir: &std::pat
     }
 
     if let Some(ref meta) = slots.metadata {
-        views.push(("metadata_indices".into(), format!("{}metadata_indices.slab", args.default_prefix())));
-        let _ = &meta.predicate_indices; // used by per_profile steps
+        views.push(("metadata_indices".into(),
+            format!("{}{}", args.default_prefix(), meta.predicate_indices.path())));
     }
 
     if let Some(ref fknn) = slots.filtered_knn {
@@ -2124,17 +2217,52 @@ fn create_identity_symlinks(output_dir: &std::path::Path, args: &ImportArgs, slo
         }
     }
 
-    // Query vectors: create a query_vectors_raw symlink for native xvec files.
-    // The overlap step reads from _raw and writes the final query_vectors.
-    // For non-native (HDF5, npy), the convert-queries step handles this.
-    if let Some(ref query_path) = args.query_vectors {
-        if !slots.self_search && is_native_xvec_file(query_path) {
-            let ext = query_path.extension()
-                .and_then(|e| e.to_str())
-                .and_then(VecFormat::canonical_extension)
-                .unwrap_or("fvec");
-            let link = base_dir.join(format!("query_vectors_raw.{}", ext));
-            create_symlink(query_path, &link);
+    // Query vectors: when Identity (used as-is), create a query_vectors symlink.
+    // When Materialized, the processing step creates the final file and a
+    // query_vectors_raw symlink is created for the overlap step's input.
+    if let Some(ref qv) = slots.query_vectors {
+        if let Some(ref query_path) = args.query_vectors {
+            if !slots.self_search && is_native_xvec_file(query_path) {
+                let ext = query_path.extension()
+                    .and_then(|e| e.to_str())
+                    .and_then(VecFormat::canonical_extension)
+                    .unwrap_or("fvec");
+                if qv.is_materialized() {
+                    // Overlap/convert step reads from _raw
+                    let link = base_dir.join(format!("query_vectors_raw.{}", ext));
+                    create_symlink(query_path, &link);
+                } else {
+                    // Identity: final query_vectors symlink
+                    let link = base_dir.join(format!("query_vectors.{}", ext));
+                    create_symlink(query_path, &link);
+                }
+            }
+        }
+    }
+
+    // Ground truth: symlink when Identity and native xvec
+    if let Some(ref knn) = slots.knn {
+        if !knn.is_materialized() {
+            if let Some(ref gt_path) = args.ground_truth {
+                if is_native_xvec_file(gt_path) {
+                    let ext = gt_path.extension()
+                        .and_then(|e| e.to_str())
+                        .and_then(VecFormat::canonical_extension)
+                        .unwrap_or("ivec");
+                    let link = base_dir.join(format!("neighbor_indices.{}", ext));
+                    create_symlink(gt_path, &link);
+                }
+            }
+            if let Some(ref gt_dist) = args.ground_truth_distances {
+                if is_native_xvec_file(gt_dist) {
+                    let ext = gt_dist.extension()
+                        .and_then(|e| e.to_str())
+                        .and_then(VecFormat::canonical_extension)
+                        .unwrap_or("fvec");
+                    let link = base_dir.join(format!("neighbor_distances.{}", ext));
+                    create_symlink(gt_dist, &link);
+                }
+            }
         }
     }
 
@@ -2718,6 +2846,7 @@ mod tests {
             metadata_range_max: 1000,
             predicate_range_min: 0,
             predicate_range_max: 1000,
+            verify_knn_sample: 0,
         }
     }
 

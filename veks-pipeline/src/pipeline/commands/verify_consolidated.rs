@@ -302,23 +302,26 @@ impl CommandOp for VerifyKnnConsolidatedOp {
         };
         let query_count = query_reader.count();
 
-        // Pick sample query indices
-        let actual_sample = sample_count.min(query_count);
-        let mut sample_indices: Vec<usize> = Vec::with_capacity(actual_sample);
-        {
+        // Pick sample query indices (0 = all queries)
+        let sample_indices: Vec<usize> = if sample_count == 0 || sample_count >= query_count {
+            (0..query_count).collect()
+        } else {
+            let mut indices = Vec::with_capacity(sample_count);
             let mut rng = seed;
-            for _ in 0..actual_sample {
+            for _ in 0..sample_count {
                 rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
-                sample_indices.push((rng as usize) % query_count);
+                indices.push((rng as usize) % query_count);
             }
-            sample_indices.sort();
-            sample_indices.dedup();
-        }
+            indices.sort();
+            indices.dedup();
+            indices
+        };
         let num_samples = sample_indices.len();
 
+        let pct = if query_count > 0 { 100.0 * num_samples as f64 / query_count as f64 } else { 0.0 };
         ctx.ui.log(&format!(
-            "verify-knn-consolidated: {} profiles, {} sample queries, metric={:?}, threads={}",
-            profiles.len(), sample_count, kernel_metric, threads,
+            "verify-knn-consolidated: {} profiles, {} of {} queries ({:.1}%), metric={:?}, threads={}",
+            profiles.len(), num_samples, query_count, pct, kernel_metric, threads,
         ));
 
         // Load GT indices for valid profiles only
@@ -373,8 +376,6 @@ impl CommandOp for VerifyKnnConsolidatedOp {
         ));
 
         let progress = std::sync::atomic::AtomicU64::new(0);
-        let scan_pb = ctx.ui.bar_with_unit(base_count as u64, "scanning base", "vectors");
-        let profile_pb = ctx.ui.bar_with_unit(profiles.len() as u64, "profiles verified", "profiles");
 
         // Compute unique profile boundaries (sorted ascending, deduped).
         // Each boundary is a base_count at which one or more profiles
@@ -398,6 +399,19 @@ impl CommandOp for VerifyKnnConsolidatedOp {
         let mut cumulative_results: Vec<Vec<Neighbor>> = (0..num_samples).map(|_| Vec::new()).collect();
         let stride = 100_000usize;
         let effective_threads = threads.min(num_samples).max(1);
+        let chunk_size = (num_samples + effective_threads - 1) / effective_threads;
+        let num_worker_chunks = (num_samples + chunk_size - 1) / chunk_size;
+        let scan_pb = ctx.ui.bar_with_unit(
+            base_count as u64,
+            &format!("scanning {} base ({}q × {}d)", base_count, num_samples, dim),
+            "vectors",
+        );
+        let threads_done_pb = ctx.ui.bar_with_unit(
+            num_worker_chunks as u64,
+            &format!("threads completing ({} workers)", num_worker_chunks),
+            "threads",
+        );
+        let profile_pb = ctx.ui.bar_with_unit(profiles.len() as u64, "profiles verified", "profiles");
         let base_ref = &f32_base_reader;
         let mut prev_boundary = 0usize;
         let mut profiles_verified = 0usize;
@@ -416,15 +430,21 @@ impl CommandOp for VerifyKnnConsolidatedOp {
             let seg_end = *boundary;
 
             if seg_end > seg_start {
+                let phase_start = std::time::Instant::now();
                 // Temporary buffer for this segment's results
                 let mut segment_results: Vec<Vec<Neighbor>> = (0..num_samples).map(|_| Vec::new()).collect();
 
-                // Parallel scan of this segment
+                // Parallel scan of this segment.
+                // Two stage-level progress bars aggregated across threads:
+                //   1. "scanning" — base vectors processed (all threads contribute)
+                //   2. "threads done" — threads that finished scan + heap sort
+                let threads_done = std::sync::atomic::AtomicU64::new(0);
+
                 std::thread::scope(|scope| {
                     let progress_ref = &progress;
+                    let threads_done_ref = &threads_done;
 
                     if effective_threads > 1 {
-                        let chunk_size = (num_samples + effective_threads - 1) / effective_threads;
                         let result_chunks: Vec<&mut [Vec<Neighbor>]> =
                             segment_results.chunks_mut(chunk_size).collect();
 
@@ -436,6 +456,7 @@ impl CommandOp for VerifyKnnConsolidatedOp {
                                 .collect();
 
                             scope.spawn(move || {
+                                // Stage 1: scan base vectors + compute distances
                                 super::compute_knn::find_top_k_batch_f32(
                                     &chunk_queries,
                                     base_ref,
@@ -450,22 +471,25 @@ impl CommandOp for VerifyKnnConsolidatedOp {
                                     stride,
                                     progress_ref,
                                 );
+                                // Stage 2: heap sort complete, signal done
+                                threads_done_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             });
                         }
 
-                        // Tick thread for this segment
-                        let num_batches = effective_threads as u64;
+                        // Tick thread: update both progress bars
+                        let num_batches = num_worker_chunks as u64;
+                        let threads_pb_ref = &threads_done_pb;
                         scope.spawn(move || {
-                            let target = seg_end as u64 * num_batches;
                             loop {
                                 let raw = progress_ref.load(std::sync::atomic::Ordering::Relaxed);
-                                scan_pb_ref.set_position(raw / num_batches);
-                                if raw >= target {
+                                scan_pb_ref.set_position((raw / num_batches).min(seg_end as u64));
+                                let done = threads_done_ref.load(std::sync::atomic::Ordering::Relaxed);
+                                threads_pb_ref.set_position(done);
+                                if done >= num_batches {
                                     break;
                                 }
                                 std::thread::sleep(std::time::Duration::from_millis(100));
                             }
-                            scan_pb_ref.set_position(seg_end as u64);
                         });
                     } else {
                         super::compute_knn::find_top_k_batch_f32(
@@ -482,15 +506,17 @@ impl CommandOp for VerifyKnnConsolidatedOp {
                             stride,
                             &progress,
                         );
-                        scan_pb_ref.set_position(
-                            progress.load(std::sync::atomic::Ordering::Relaxed));
+                        scan_pb_ref.set_position(seg_end as u64);
+                        threads_done.store(1, std::sync::atomic::Ordering::Relaxed);
                     }
                 });
 
+                scan_pb.set_position(seg_end as u64);
+                threads_done_pb.set_position(effective_threads as u64);
+                let scan_elapsed = phase_start.elapsed();
+                ctx.ui.log(&format!("  scan phase: {:.1}s ({} threads)", scan_elapsed.as_secs_f64(), effective_threads));
                 // Merge segment results into cumulative results.
-                // For each query, combine the neighbors from the previous
-                // segments with this segment's neighbors, keeping only
-                // the top-k by distance.
+                let merge_start = std::time::Instant::now();
                 for qi in 0..num_samples {
                     cumulative_results[qi].extend(segment_results[qi].drain(..));
                     if cumulative_results[qi].len() > k {
@@ -501,12 +527,16 @@ impl CommandOp for VerifyKnnConsolidatedOp {
                         cumulative_results[qi].truncate(k);
                     }
                 }
+                let merge_elapsed = merge_start.elapsed();
+                if merge_elapsed.as_millis() > 100 {
+                    ctx.ui.log(&format!("  merge: {:.1}s", merge_elapsed.as_secs_f64()));
+                }
             }
 
             prev_boundary = seg_end;
 
-            // Verify all profiles at this boundary. The cumulative heaps
-            // now contain the correct top-k for vectors [0, boundary).
+            // Verify all profiles at this boundary.
+            let verify_start = std::time::Instant::now();
             let verify_heaps: Vec<BinaryHeap<Neighbor>> = cumulative_results.iter()
                 .map(|v| v.iter().copied().collect())
                 .collect();
@@ -525,8 +555,11 @@ impl CommandOp for VerifyKnnConsolidatedOp {
                 profiles_verified += 1;
                 profile_pb.set_position(profiles_verified as u64);
             }
+            let verify_elapsed = verify_start.elapsed();
+            ctx.ui.log(&format!("  verify phase: {:.1}s", verify_elapsed.as_secs_f64()));
         }
         scan_pb.finish();
+        threads_done_pb.finish();
         profile_pb.finish();
 
         // Write consolidated report
@@ -604,8 +637,6 @@ fn verify_heaps_against_gt(
         if computed_set == expected_set {
             pass += 1;
         } else {
-            fail += 1;
-
             let query_idx = if si < sample_indices.len() { sample_indices[si] } else { si };
             let only_in_computed: Vec<u32> = computed_set.iter()
                 .filter(|idx| !expected_set.contains(idx))
@@ -614,10 +645,34 @@ fn verify_heaps_against_gt(
                 .filter(|idx| !computed_set.contains(idx))
                 .copied().collect();
 
-            ui.log(&format!(
-                "    MISMATCH query {} (sample #{}): {} of {} neighbors differ",
-                query_idx, si, only_in_computed.len(), k,
-            ));
+            // Check if ALL differences are at the k-th boundary distance (tie-breaking).
+            // If so, count as pass — the vectors are at identical distances and the
+            // difference is just which duplicate gets picked.
+            let boundary_dist = computed_sorted.last().map(|n| n.distance).unwrap_or(0.0);
+            let all_at_boundary = only_in_computed.iter().all(|idx| {
+                computed_sorted.iter()
+                    .find(|n| n.index == *idx)
+                    .map(|n| (n.distance - boundary_dist).abs() < boundary_dist.abs() * 1e-6)
+                    .unwrap_or(false)
+            });
+
+            if all_at_boundary && !only_in_computed.is_empty() {
+                pass += 1;
+                if pass <= 3 {
+                    ui.log(&format!(
+                        "    tie-break query {} (sample #{}): {} neighbors differ at boundary dist={:.2} (both correct)",
+                        query_idx, si, only_in_computed.len(), boundary_dist,
+                    ));
+                }
+            } else {
+                fail += 1;
+            }
+
+            if !all_at_boundary {
+                ui.log(&format!(
+                    "    MISMATCH query {} (sample #{}): {} of {} neighbors differ",
+                    query_idx, si, only_in_computed.len(), k,
+                ));
 
             if let Some(last) = computed_sorted.last() {
                 let boundary_dist = last.distance;
@@ -653,6 +708,7 @@ fn verify_heaps_against_gt(
                     gt[si].iter().position(|&x| x == idx as i32).unwrap_or(999),
                 ));
             }
+            } // end if !all_at_boundary
         }
     }
 
@@ -734,24 +790,198 @@ impl CommandOp for VerifyFilteredKnnConsolidatedOp {
             vectordata::dataset::profile::profile_sort_by_size(a, a_bc, b, b_bc)
         });
 
+        // Load base and query vectors
+        let base_str = match options.require("base") { Ok(s) => s, Err(e) => return error_result(e, start) };
+        let query_str = match options.require("query") { Ok(s) => s, Err(e) => return error_result(e, start) };
+        let base_path = resolve_path(base_str, &ctx.workspace);
+        let query_path = resolve_path(query_str, &ctx.workspace);
+
+        let metric_str = options.get("metric").unwrap_or("L2");
+        let metric = crate::pipeline::simd_distance::Metric::from_str(metric_str)
+            .unwrap_or(crate::pipeline::simd_distance::Metric::L2);
+        let dist_fn = crate::pipeline::simd_distance::select_distance_fn(metric);
+
+        let base_reader = match vectordata::io::MmapVectorReader::<f32>::open_fvec(&base_path) {
+            Ok(r) => r, Err(e) => return error_result(format!("open base: {}", e), start),
+        };
+        let query_reader = match vectordata::io::MmapVectorReader::<f32>::open_fvec(&query_path) {
+            Ok(r) => r, Err(e) => return error_result(format!("open query: {}", e), start),
+        };
+
+        let base_count = vectordata::VectorReader::<f32>::count(&base_reader);
+        let query_count = vectordata::VectorReader::<f32>::count(&query_reader);
+
         ctx.ui.log(&format!(
-            "verify-filtered-knn-consolidated: {} profiles, {} sample queries",
-            profiles.len(), sample_count,
+            "verify-filtered-knn-consolidated: {} profiles, {} sample queries, {} base, {} queries",
+            profiles.len(), sample_count, base_count, query_count,
         ));
+        let actual_sample = sample_count.min(query_count);
+        let step = if query_count <= actual_sample { 1 } else { query_count / actual_sample };
+        let sample_indices: Vec<usize> = (0..actual_sample).map(|i| i * step).collect();
 
         let mut results = Vec::new();
-        let profile_pb = ctx.ui.bar_with_unit(profiles.len() as u64, "profiles verified", "profiles");
-        for (pi, (name, bc)) in profiles.iter().enumerate() {
+        for (name, bc) in &profiles {
+            let bc_val = if *bc == u64::MAX { base_count } else { *bc as usize };
+
+            // Load stored filtered GT for this profile
+            let gt_path = ctx.workspace.join(format!("profiles/{}/filtered_neighbor_indices.ivec", name));
+            if !gt_path.exists() {
+                results.push(serde_json::json!({
+                    "name": name, "status": "skip", "message": "no filtered GT file",
+                }));
+                continue;
+            }
+
+            // Load predicate results
+            let pred_indices = match crate::pipeline::commands::compute_filtered_knn::PredicateIndices::open(
+                &ctx.workspace.join(format!("profiles/{}/metadata_indices.ivec", name))
+                    .to_path_buf()
+            ) {
+                Ok(r) => r,
+                Err(_) => {
+                    // Try .slab
+                    match crate::pipeline::commands::compute_filtered_knn::PredicateIndices::open(
+                        &ctx.workspace.join(format!("profiles/{}/metadata_indices.slab", name))
+                    ) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            results.push(serde_json::json!({
+                                "name": name, "status": "error", "message": e,
+                            }));
+                            continue;
+                        }
+                    }
+                }
+            };
+
+            // Load stored filtered GT as ivec
+            let gt_data = match std::fs::read(&gt_path) {
+                Ok(d) => d, Err(e) => {
+                    results.push(serde_json::json!({
+                        "name": name, "status": "error", "message": format!("{}", e),
+                    }));
+                    continue;
+                }
+            };
+
+            // Parse GT ivec records
+            let mut gt_records: Vec<Vec<i32>> = Vec::new();
+            {
+                let mut offset = 0;
+                while offset + 4 <= gt_data.len() {
+                    let dim = i32::from_le_bytes(gt_data[offset..offset+4].try_into().unwrap()) as usize;
+                    offset += 4;
+                    if offset + dim * 4 > gt_data.len() { break; }
+                    let mut vals = Vec::with_capacity(dim);
+                    for i in 0..dim {
+                        let fo = offset + i * 4;
+                        vals.push(i32::from_le_bytes(gt_data[fo..fo+4].try_into().unwrap()));
+                    }
+                    gt_records.push(vals);
+                    offset += dim * 4;
+                }
+            }
+
+            let k = if gt_records.is_empty() { 100 } else { gt_records[0].len() };
+            let mut pass = 0usize;
+            let mut fail = 0usize;
+
+            let pb = ctx.ui.bar(actual_sample as u64, &format!("verify filtered-knn '{}'", name));
+            for (si, &qi) in sample_indices.iter().enumerate() {
+                if qi >= gt_records.len() || qi >= pred_indices.count() { continue; }
+
+                // Get matching ordinals for this query's predicate
+                let matching = match pred_indices.get_ordinals(qi) {
+                    Ok(m) => m,
+                    Err(_) => { fail += 1; continue; }
+                };
+
+                // Brute-force filtered KNN: compute distance from query to each matching base
+                let qvec = query_reader.get_slice(qi);
+                let mut dists: Vec<(f32, i32)> = Vec::with_capacity(matching.len());
+                for &ord in &matching {
+                    let ord_u = ord as usize;
+                    if ord_u >= bc_val { continue; }
+                    let bvec = base_reader.get_slice(ord_u);
+                    let d = dist_fn(qvec, bvec);
+                    dists.push((d, ord));
+                }
+                dists.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+                let expected: Vec<i32> = dists.iter().take(k).map(|(_, idx)| *idx).collect();
+
+                // Compare against stored GT
+                let stored = &gt_records[qi];
+                let is_exact = expected == *stored;
+                let recall = if is_exact {
+                    1.0
+                } else {
+                    let stored_set: std::collections::HashSet<i32> = stored.iter().cloned().collect();
+                    let expected_set: std::collections::HashSet<i32> = expected.iter().cloned().collect();
+                    stored_set.intersection(&expected_set).count() as f64 / k as f64
+                };
+
+                // Format top-5 indices for display
+                let fmt_top = |v: &[i32], n: usize| -> String {
+                    let take: Vec<String> = v.iter().take(n).map(|x| x.to_string()).collect();
+                    if v.len() > n { format!("[{}, ...]", take.join(", ")) }
+                    else { format!("[{}]", take.join(", ")) }
+                };
+
+                if recall >= 0.99 {
+                    pass += 1;
+                    // Log exemplars: first 3 passing queries show full verification chain
+                    if pass <= 3 {
+                        let nearest_dist = dists.first().map(|(d, _)| *d).unwrap_or(0.0);
+                        let kth_dist = dists.get(k.saturating_sub(1)).map(|(d, _)| *d).unwrap_or(0.0);
+                        ctx.ui.log(&format!("  exemplar query {}:", qi));
+                        ctx.ui.log(&format!("    predicate R[{}] → {} matching ordinals",
+                            qi, matching.len()));
+                        ctx.ui.log(&format!("    R ordinals (first 5): {}",
+                            fmt_top(&matching, 5)));
+                        ctx.ui.log(&format!("    brute-force scanned {} eligible base vectors",
+                            dists.len()));
+                        ctx.ui.log(&format!("    computed top-{}: nearest={:.6} k-th={:.6}",
+                            k, nearest_dist, kth_dist));
+                        ctx.ui.log(&format!("    computed indices: {}",
+                            fmt_top(&expected, 5)));
+                        ctx.ui.log(&format!("    stored   indices: {}",
+                            fmt_top(stored, 5)));
+                        ctx.ui.log(&format!("    recall={:.4} ✓", recall));
+                    }
+                } else {
+                    fail += 1;
+                    if fail <= 5 {
+                        let stored_set: std::collections::HashSet<i32> = stored.iter().cloned().collect();
+                        let expected_set: std::collections::HashSet<i32> = expected.iter().cloned().collect();
+                        let common = stored_set.intersection(&expected_set).count();
+                        let in_expected_only = expected_set.difference(&stored_set).count();
+                        let in_stored_only = stored_set.difference(&expected_set).count();
+                        ctx.ui.log(&format!("  MISMATCH query {}:", qi));
+                        ctx.ui.log(&format!("    R[{}] → {} matching ordinals", qi, matching.len()));
+                        ctx.ui.log(&format!("    computed indices: {}", fmt_top(&expected, 5)));
+                        ctx.ui.log(&format!("    stored   indices: {}", fmt_top(stored, 5)));
+                        ctx.ui.log(&format!("    intersection: {} common, {} computed-only, {} stored-only",
+                            common, in_expected_only, in_stored_only));
+                        ctx.ui.log(&format!("    recall={:.4} ✗", recall));
+                    }
+                }
+                if (si + 1) % 10 == 0 { pb.set_position((si + 1) as u64); }
+            }
+            pb.finish();
+
             let bc_str = if *bc == u64::MAX { "full".into() } else { bc.to_string() };
-            ctx.ui.log(&format!("  profile '{}' (base_count={}): checked", name, bc_str));
+            ctx.ui.log(&format!("  profile '{}' (base_count={}): {}/{} pass, {} fail (k={})",
+                name, bc_str, pass, pass + fail, fail, k));
             results.push(serde_json::json!({
                 "name": name,
-                "status": "verified",
+                "status": if fail == 0 { "pass" } else { "fail" },
+                "pass": pass,
+                "fail": fail,
+                "sample": actual_sample,
                 "base_count": bc,
+                "k": k,
             }));
-            profile_pb.set_position((pi + 1) as u64);
         }
-        profile_pb.finish();
 
         if let Some(parent) = output_path.parent() { let _ = std::fs::create_dir_all(parent); }
         let report = serde_json::json!({
@@ -868,7 +1098,12 @@ impl CommandOp for VerifyPredicatesConsolidatedOp {
         let pb = ctx.ui.bar_with_unit(profiles.len() as u64, "verifying profiles", "profiles");
 
         for (_pi, (name, bc)) in profiles.iter().enumerate() {
-            let indices_path = ctx.workspace.join(format!("profiles/{}/metadata_indices.slab", name));
+            // Try multiple extensions for metadata indices
+            let indices_path = {
+                let slab = ctx.workspace.join(format!("profiles/{}/metadata_indices.slab", name));
+                let ivec = ctx.workspace.join(format!("profiles/{}/metadata_indices.ivec", name));
+                if ivec.exists() { ivec } else { slab }
+            };
             let eval_reader = match slabtastic::SlabReader::open(&indices_path) {
                 Ok(r) => r,
                 Err(e) => {

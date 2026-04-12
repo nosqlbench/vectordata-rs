@@ -191,6 +191,7 @@ fn default_args(name: &str, output: &Path) -> ImportArgs {
         metadata_range_max: 1000,
             predicate_range_min: 0,
             predicate_range_max: 1000,
+            verify_knn_sample: 0,
     }
 }
 
@@ -488,7 +489,7 @@ fn dag_07_metadata_no_filtered() {
     assert_step_present(&steps, "convert-metadata");
     assert_step_present(&steps, "evaluate-predicates");
     assert_step_absent(&steps, "compute-filtered-knn");
-    assert_step_absent(&steps, "verify-predicates");
+    assert_step_present(&steps, "verify-predicates");
 }
 
 // ── Config 8: Foreign base (npy, requires convert) ────────────────────
@@ -747,7 +748,7 @@ fn dag_17_metadata_explicit_no_filtered() {
 
     // No filtered KNN (F not in facets)
     assert_step_absent(&steps, "compute-filtered-knn");
-    assert_step_absent(&steps, "verify-predicates");
+    assert_step_present(&steps, "verify-predicates");
 }
 
 // ── Config 18: Full pipeline (everything enabled) ─────────────────────

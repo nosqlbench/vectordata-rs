@@ -53,6 +53,33 @@ pub mod transport;
 pub mod model;
 /// Vector I/O: fvec, ivec, mvec readers (mmap and HTTP).
 pub mod io;
+/// Typed data access with runtime type negotiation.
+///
+/// Provides [`typed_access::TypedReader`] for opening vector and scalar files
+/// with compile-time type safety and runtime width validation.
+///
+/// ```rust,no_run
+/// use vectordata::typed_access::{ElementType, TypedReader};
+///
+/// // Interrogate the native type from the file extension
+/// let etype = ElementType::from_path("metadata.u8").unwrap();
+///
+/// // Open with native type (zero-copy access)
+/// let reader = TypedReader::<u8>::open("metadata.u8").unwrap();
+/// let val: u8 = reader.get_native(0);
+///
+/// // Open with wider type (always succeeds)
+/// let reader = TypedReader::<i32>::open("metadata.u8").unwrap();
+/// let val: i32 = reader.get_value(0).unwrap();
+///
+/// // Narrowing is rejected at open time
+/// assert!(TypedReader::<u8>::open("data.i32").is_err());
+/// ```
+///
+/// For dataset access through profiles, use
+/// [`TestDataView::facet_element_type`] and
+/// [`GenericTestDataView::open_facet_typed`].
+pub mod typed_access;
 /// Profile views for accessing dataset components.
 pub mod view;
 /// High-level dataset loading and profile access.

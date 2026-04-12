@@ -42,7 +42,6 @@ use std::time::Instant;
 use byteorder::{LittleEndian, ReadBytesExt};
 use half;
 use veks_core::ui::{ProgressHandle, UiHandle};
-use slabtastic::SlabReader;
 use vectordata::VectorReader;
 use vectordata::io::MmapVectorReader;
 
@@ -99,6 +98,88 @@ fn read_ordinals(data: &[u8]) -> Vec<i32> {
         result.push(v);
     }
     result
+}
+
+/// Abstraction over predicate indices storage.
+///
+/// Reads per-predicate ordinal lists from either slab or ivec format.
+pub(crate) enum PredicateIndices {
+    /// Slab: each record is packed i32 LE ordinals.
+    Slab(slabtastic::SlabReader),
+    /// Ivec: each record is `[dim:i32, data:i32 × dim]`.
+    Ivec(Vec<Vec<i32>>),
+}
+
+impl PredicateIndices {
+    /// Open predicate indices from a file, auto-detecting format.
+    pub fn open(path: &std::path::Path) -> Result<Self, String> {
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        match ext {
+            "slab" => {
+                let reader = slabtastic::SlabReader::open(path)
+                    .map_err(|e| format!("open slab {}: {}", path.display(), e))?;
+                Ok(Self::Slab(reader))
+            }
+            "ivec" | "ivecs" => {
+                // Read all ivec records into memory
+                let data = std::fs::read(path)
+                    .map_err(|e| format!("read {}: {}", path.display(), e))?;
+                let mut records = Vec::new();
+                let mut offset = 0;
+                while offset + 4 <= data.len() {
+                    let dim = i32::from_le_bytes([
+                        data[offset], data[offset+1], data[offset+2], data[offset+3],
+                    ]) as usize;
+                    offset += 4;
+                    let end = offset + dim * 4;
+                    if end > data.len() { break; }
+                    let mut vals = Vec::with_capacity(dim);
+                    for i in 0..dim {
+                        let base = offset + i * 4;
+                        vals.push(i32::from_le_bytes([
+                            data[base], data[base+1], data[base+2], data[base+3],
+                        ]));
+                    }
+                    records.push(vals);
+                    offset = end;
+                }
+                Ok(Self::Ivec(records))
+            }
+            _ => {
+                // Try slab first, fallback to error
+                match slabtastic::SlabReader::open(path) {
+                    Ok(r) => Ok(Self::Slab(r)),
+                    Err(e) => Err(format!("unsupported indices format '{}': {}", ext, e)),
+                }
+            }
+        }
+    }
+
+    /// Get ordinals for predicate at the given index.
+    pub fn get_ordinals(&self, index: usize) -> Result<Vec<i32>, String> {
+        match self {
+            Self::Slab(reader) => {
+                let data = reader.get(index as i64)
+                    .map_err(|e| format!("read slab record {}: {}", index, e))?;
+                Ok(read_ordinals(&data))
+            }
+            Self::Ivec(records) => {
+                if index >= records.len() {
+                    Err(format!("index {} out of range ({})", index, records.len()))
+                } else {
+                    Ok(records[index].clone())
+                }
+            }
+        }
+    }
+
+    /// Number of predicate records.
+    pub fn count(&self) -> usize {
+        match self {
+            Self::Slab(reader) => reader.total_records() as usize,
+            Self::Ivec(records) => records.len(),
+        }
+    }
 }
 
 // -- Partition infrastructure -------------------------------------------------
@@ -420,7 +501,7 @@ fn compute_partition_filtered_f64(
     query_reader: &MmapVectorReader<f64>,
     query_count: usize,
     base_reader: &Arc<MmapVectorReader<f64>>,
-    keys_reader: &SlabReader,
+    keys_reader: &PredicateIndices,
     start: usize,
     end: usize,
     k: usize,
@@ -444,8 +525,8 @@ fn compute_partition_filtered_f64(
                 scope.spawn(move || {
                     for qi in 0..chunk_len {
                         let global_qi = chunk_start + qi;
-                        let ordinals = match keys_reader.get(global_qi as i64) {
-                            Ok(data) => read_ordinals(&data),
+                        let ordinals = match keys_reader.get_ordinals(global_qi as usize) {
+                            Ok(ords) => ords,
                             Err(_) => Vec::new(),
                         };
                         let filtered: Vec<i32> = ordinals.into_iter()
@@ -462,8 +543,8 @@ fn compute_partition_filtered_f64(
         });
     } else {
         for qi in 0..query_count {
-            let ordinals = match keys_reader.get(qi as i64) {
-                Ok(data) => read_ordinals(&data),
+            let ordinals = match keys_reader.get_ordinals(qi as usize) {
+                Ok(ords) => ords,
                 Err(_) => Vec::new(),
             };
             let filtered: Vec<i32> = ordinals.into_iter()
@@ -490,7 +571,7 @@ fn compute_partition_filtered_f32(
     query_reader: &MmapVectorReader<f32>,
     query_count: usize,
     base_reader: &Arc<MmapVectorReader<f32>>,
-    keys_reader: &SlabReader,
+    keys_reader: &PredicateIndices,
     start: usize,
     end: usize,
     k: usize,
@@ -516,8 +597,8 @@ fn compute_partition_filtered_f32(
                 scope.spawn(move || {
                     for qi in 0..chunk_len {
                         let global_qi = chunk_start + qi;
-                        let ordinals = match keys_reader.get(global_qi as i64) {
-                            Ok(data) => read_ordinals(&data),
+                        let ordinals = match keys_reader.get_ordinals(global_qi as usize) {
+                            Ok(ords) => ords,
                             Err(_) => Vec::new(),
                         };
                         let filtered: Vec<i32> = ordinals.into_iter()
@@ -537,8 +618,8 @@ fn compute_partition_filtered_f32(
         });
     } else {
         for qi in 0..query_count {
-            let ordinals = match keys_reader.get(qi as i64) {
-                Ok(data) => read_ordinals(&data),
+            let ordinals = match keys_reader.get_ordinals(qi as usize) {
+                Ok(ords) => ords,
                 Err(_) => Vec::new(),
             };
             let filtered: Vec<i32> = ordinals.into_iter()
@@ -563,7 +644,7 @@ fn compute_partition_filtered_f16(
     query_reader: &MmapVectorReader<half::f16>,
     query_count: usize,
     base_reader: &Arc<MmapVectorReader<half::f16>>,
-    keys_reader: &SlabReader,
+    keys_reader: &PredicateIndices,
     start: usize,
     end: usize,
     k: usize,
@@ -589,8 +670,8 @@ fn compute_partition_filtered_f16(
                 scope.spawn(move || {
                     for qi in 0..chunk_len {
                         let global_qi = chunk_start + qi;
-                        let ordinals = match keys_reader.get(global_qi as i64) {
-                            Ok(data) => read_ordinals(&data),
+                        let ordinals = match keys_reader.get_ordinals(global_qi as usize) {
+                            Ok(ords) => ords,
                             Err(_) => Vec::new(),
                         };
                         let filtered: Vec<i32> = ordinals.into_iter()
@@ -610,8 +691,8 @@ fn compute_partition_filtered_f16(
         });
     } else {
         for qi in 0..query_count {
-            let ordinals = match keys_reader.get(qi as i64) {
-                Ok(data) => read_ordinals(&data),
+            let ordinals = match keys_reader.get_ordinals(qi as usize) {
+                Ok(ords) => ords,
                 Err(_) => Vec::new(),
             };
             let filtered: Vec<i32> = ordinals.into_iter()
@@ -796,8 +877,8 @@ results against this exact filtered ground truth.
             }
         }
 
-        // Load metadata-indices slab
-        let keys_reader = match SlabReader::open(&keys_path) {
+        // Load metadata-indices (slab or ivec)
+        let keys_reader = match PredicateIndices::open(&keys_path) {
             Ok(r) => r,
             Err(e) => return error_result(format!("failed to open metadata-indices {}: {}", keys_path.display(), e), start),
         };
@@ -879,7 +960,7 @@ results against this exact filtered ground truth.
 fn execute_f32(
     base_path: &Path,
     query_path: &Path,
-    keys_reader: &SlabReader,
+    keys_reader: &PredicateIndices,
     indices_path: &Path,
     distances_path: Option<&Path>,
     k: usize,
@@ -906,7 +987,7 @@ fn execute_f32(
 
     let file_count = <MmapVectorReader<f32> as VectorReader<f32>>::count(&*base_reader);
     let query_count = <MmapVectorReader<f32> as VectorReader<f32>>::count(&query_reader);
-    let keys_count = keys_reader.total_records() as usize;
+    let keys_count = keys_reader.count();
     let actual_count = query_count.min(keys_count);
 
     // Apply window to base vectors
@@ -944,7 +1025,7 @@ fn execute_f32(
 fn execute_f16(
     base_path: &Path,
     query_path: &Path,
-    keys_reader: &SlabReader,
+    keys_reader: &PredicateIndices,
     indices_path: &Path,
     distances_path: Option<&Path>,
     k: usize,
@@ -971,7 +1052,7 @@ fn execute_f16(
 
     let file_count = <MmapVectorReader<half::f16> as VectorReader<half::f16>>::count(&*base_reader);
     let query_count = <MmapVectorReader<half::f16> as VectorReader<half::f16>>::count(&query_reader);
-    let keys_count = keys_reader.total_records() as usize;
+    let keys_count = keys_reader.count();
     let actual_count = query_count.min(keys_count);
 
     // Apply window to base vectors
@@ -1008,7 +1089,7 @@ fn execute_f16(
 fn execute_f64(
     base_path: &Path,
     query_path: &Path,
-    keys_reader: &SlabReader,
+    keys_reader: &PredicateIndices,
     indices_path: &Path,
     distances_path: Option<&Path>,
     k: usize,
@@ -1035,7 +1116,7 @@ fn execute_f64(
 
     let file_count = VectorReader::<f64>::count(&*base_reader);
     let query_count = VectorReader::<f64>::count(&query_reader);
-    let keys_count = keys_reader.total_records() as usize;
+    let keys_count = keys_reader.count();
     let actual_count = query_count.min(keys_count);
 
     let (base_offset, base_count) = match base_window {
@@ -1078,7 +1159,7 @@ fn execute_f64(
 fn execute_with_partitions<T: Send + Sync + 'static>(
     query_reader: &MmapVectorReader<T>,
     base_reader: &Arc<MmapVectorReader<T>>,
-    keys_reader: &SlabReader,
+    keys_reader: &PredicateIndices,
     base_offset: usize,
     base_count: usize,
     query_count: usize,
@@ -1094,7 +1175,7 @@ fn execute_with_partitions<T: Send + Sync + 'static>(
     ctx: &mut StreamContext,
     start: Instant,
     compute_fn: fn(
-        &MmapVectorReader<T>, usize, &Arc<MmapVectorReader<T>>, &SlabReader,
+        &MmapVectorReader<T>, usize, &Arc<MmapVectorReader<T>>, &PredicateIndices,
         usize, usize, usize, fn(&[T], &[T]) -> f32, usize, &ProgressHandle,
     ) -> Vec<Vec<Neighbor>>,
 ) -> CommandResult {
