@@ -34,7 +34,7 @@ let record: Vec<i32> = reader.get(0)?;        // variable length per record
 let dim: usize = reader.dim_at(0)?;           // dimension of record 0
 ```
 
-Load a dataset by catalog:
+Load a dataset by URL:
 
 ```rust
 use vectordata::TestDataGroup;
@@ -48,9 +48,122 @@ let gt = view.neighbor_indices()?;         // Arc<dyn VectorReader<i32>>
 let mi = view.metadata_indices()?;         // Arc<dyn VvecReader<i32>>
 ```
 
+Find and load a dataset from configured catalogs:
+
+```rust
+use vectordata::catalog::sources::CatalogSources;
+use vectordata::catalog::resolver::Catalog;
+
+// Load catalogs from ~/.config/vectordata/catalogs.yaml
+let sources = CatalogSources::new().configure_default();
+let catalog = Catalog::of(&sources);
+
+// Find a dataset by name
+let entry = catalog.find_exact("sift1m").expect("dataset not found");
+println!("found: {} at {}", entry.name, entry.path);
+println!("profiles: {:?}", entry.profile_names());
+
+// Load it — the entry's path is relative to its catalog URL
+// Use TestDataGroup::load with the catalog base URL + entry path
+```
+
 ---
 
-## 23.2 File Extension Scheme
+## 23.2 Catalog-Based Dataset Discovery
+
+### Catalog configuration
+
+Catalogs are configured in `~/.config/vectordata/catalogs.yaml`:
+
+```yaml
+# Each entry is an HTTP URL or local path pointing to a directory
+# containing a catalog.json (which indexes all datasets under it)
+- https://vectordata-datasets.s3.amazonaws.com/production/
+- https://internal-bucket.s3.us-east-1.amazonaws.com/testing/
+- /mnt/data/local-datasets/
+```
+
+Manage catalogs via the CLI:
+
+```bash
+veks datasets config add-catalog https://example.com/datasets/
+veks datasets config list-catalogs
+veks datasets config remove-catalog 2
+```
+
+### Discovering datasets
+
+```rust
+use vectordata::catalog::sources::CatalogSources;
+use vectordata::catalog::resolver::Catalog;
+
+// Load from ~/.config/vectordata/catalogs.yaml
+let sources = CatalogSources::new().configure_default();
+let catalog = Catalog::of(&sources);
+
+// List all available datasets
+for entry in catalog.datasets() {
+    println!("{} (profiles: {})",
+        entry.name,
+        entry.profile_names().join(", "));
+}
+
+// Find by exact name (case-insensitive)
+if let Some(entry) = catalog.find_exact("sift1m") {
+    println!("found: {}", entry.name);
+    println!("path: {}", entry.path);
+    println!("views: {:?}", entry.view_names());
+}
+
+// Find by glob pattern
+let matches = catalog.match_glob("sift*");
+for entry in matches {
+    println!("  {}", entry.name);
+}
+```
+
+### Loading a discovered dataset
+
+`CatalogEntry` provides the dataset's `path` relative to the catalog
+root. Construct the full URL and pass it to `TestDataGroup::load`:
+
+```rust
+use vectordata::TestDataGroup;
+use vectordata::view::TestDataView;
+use vectordata::catalog::sources::CatalogSources;
+use vectordata::catalog::resolver::Catalog;
+
+let sources = CatalogSources::new().configure_default();
+let catalog = Catalog::of(&sources);
+let entry = catalog.find_exact("sift1m").expect("not found");
+
+// The catalog source URL + entry path gives the dataset URL
+// For a catalog at https://host/datasets/ with entry path "sift1m",
+// the dataset URL is https://host/datasets/sift1m/
+let group = TestDataGroup::load("https://host/datasets/sift1m/")?;
+let view = group.profile("default").unwrap();
+
+// Now use the standard facet methods
+let base = view.base_vectors()?;
+let gt = view.neighbor_indices()?;
+let mi = view.metadata_indices()?;
+```
+
+### Adding catalogs programmatically
+
+```rust
+// Use specific catalog URLs (overrides ~/.config)
+let sources = CatalogSources::new()
+    .add_catalogs(&[
+        "https://my-bucket.s3.amazonaws.com/datasets/".into(),
+        "/local/path/to/datasets/".into(),
+    ]);
+let catalog = Catalog::of(&sources);
+```
+
+---
+
+## 23.3 File Extension Scheme
 
 See [SRD §22](22-vector-file-extensions.md) for the full specification.
 
@@ -76,7 +189,7 @@ a different dimension. Random access requires an offset index file
 
 ---
 
-## 23.3 Unified Open Functions
+## 23.4 Unified Open Functions
 
 ### `open_vec<T>(path_or_url) → Box<dyn VectorReader<T>>`
 
@@ -125,7 +238,7 @@ The reader fetches it automatically.
 
 ---
 
-## 23.4 Traits
+## 23.5 Traits
 
 ### `VectorReader<T>` — Uniform Vectors
 
@@ -169,7 +282,7 @@ Implemented for: `u8`, `i8`, `u16`, `i16`, `u32`, `i32`, `u64`, `i64`,
 
 ---
 
-## 23.5 Dataset Access via TestDataGroup
+## 23.6 Dataset Access via TestDataGroup
 
 ### Loading a dataset
 
@@ -247,7 +360,7 @@ let err = gview.open_facet_typed::<u8>("some_i32_facet");  // Err(Narrowing)
 
 ---
 
-## 23.6 Dataset YAML Profile Schema
+## 23.7 Dataset YAML Profile Schema
 
 A `dataset.yaml` profile section maps canonical facet names to file
 paths. All paths are relative to the dataset directory:
@@ -272,7 +385,7 @@ internally (serde alias).
 
 ---
 
-## 23.7 Facet Reference
+## 23.8 Facet Reference
 
 | Facet code | YAML key | Trait method | Reader type | Typical format |
 |-----------|----------|-------------|-------------|---------------|
@@ -291,7 +404,7 @@ typed data access.
 
 ---
 
-## 23.8 Complete Example: Verify Filtered KNN
+## 23.9 Complete Example: Verify Filtered KNN
 
 ```rust
 use vectordata::TestDataGroup;
@@ -338,7 +451,7 @@ fn verify_filtered_knn(dataset_url: &str) -> anyhow::Result<()> {
 
 ---
 
-## 23.9 Offset Index Files
+## 23.10 Offset Index Files
 
 Variable-length vector files (`.ivvec`, `.fvvec`, etc.) require a
 companion offset index for random access:
@@ -362,7 +475,7 @@ the index via HTTP, then uses it for Range requests to the data file.
 
 ---
 
-## 23.10 Error Handling
+## 23.11 Error Handling
 
 ```rust
 use vectordata::io::IoError;
@@ -383,3 +496,310 @@ match open_vec::<f32>("data.fvec") {
 `VariableLengthRecords` is returned by `open_vec` (which expects
 uniform records) when the file has variable-length records. The caller
 should switch to `open_vvec`.
+
+---
+
+## 23.12 Prebuffering and Caching
+
+### Cache location
+
+Dataset facets downloaded from remote catalogs are cached locally.
+The default cache directory is `~/.cache/vectordata/`. Each dataset
+gets a subdirectory containing its cached facet files.
+
+Configure the cache location in `~/.config/vectordata/settings.yaml`:
+
+```yaml
+cache_dir: /mnt/fast-storage/vectordata-cache
+```
+
+Or via the CLI:
+
+```bash
+# Set the cache directory
+veks datasets config set-cache /mnt/fast-storage/vectordata-cache
+
+# View current settings
+veks datasets config show
+```
+
+The resolution order is:
+1. `--cache-dir` CLI flag (per-command override)
+2. `cache_dir` in `~/.config/vectordata/settings.yaml`
+3. `$HOME/.cache/vectordata/` (default fallback)
+
+### Prebuffering datasets
+
+Prebuffering downloads all facets for a dataset profile into the local
+cache so they can be accessed offline without further HTTP requests:
+
+```bash
+# Prebuffer from configured catalogs (looks up by name)
+veks datasets prebuffer --dataset sift1m
+
+# Prebuffer a specific profile
+veks datasets prebuffer --dataset sift1m:default
+
+# Prebuffer from a specific catalog URL
+veks datasets prebuffer --dataset sift1m --at https://host/datasets/
+
+# Prebuffer with a custom cache directory
+veks datasets prebuffer --dataset sift1m --cache-dir /tmp/vd-cache
+```
+
+The prebuffer command:
+1. Resolves the dataset via the catalog chain
+2. Opens each facet view (base vectors, queries, GT, metadata, etc.)
+3. Downloads all chunks, verified against merkle hashes (`.mref` files)
+4. Stores the data in `<cache_dir>/<dataset_name>/`
+5. Skips facets that are already fully cached
+
+### Listing cached datasets
+
+```bash
+veks datasets cache
+```
+
+Output:
+
+```
+Cache directory: /home/user/.cache/vectordata
+
+Dataset                        Files         Size
+----------------------------------------------------
+sift1m                            12      523.4 MiB
+glove-100                          8       48.2 MiB
+```
+
+### How caching works
+
+When `TestDataGroup::load` opens a remote dataset, subsequent
+`VectorReader::get()` calls issue HTTP Range requests for individual
+records. This is efficient for random access but slow for sequential
+scans.
+
+Prebuffering downloads the full files up front. Once cached, the
+`CachedChannel` layer serves reads from disk instead of HTTP. The
+cache is merkle-verified: each chunk's hash is checked against the
+`.mref` file to detect corruption or incomplete downloads.
+
+Cache files are stored as:
+
+```
+~/.cache/vectordata/
+├── sift1m/
+│   ├── dataset.yaml
+│   ├── profiles/
+│   │   ├── base/
+│   │   │   ├── base_vectors.fvec
+│   │   │   ├── base_vectors.fvec.mrkl    # local merkle state
+│   │   │   ├── query_vectors.fvec
+│   │   │   └── ...
+│   │   └── default/
+│   │       ├── neighbor_indices.ivec
+│   │       ├── metadata_indices.ivvec
+│   │       ├── IDXFOR__metadata_indices.ivvec.i32
+│   │       └── ...
+```
+
+The `.mrkl` files track which chunks have been downloaded and verified.
+They are local state, not published.
+
+---
+
+## 23.13 Thread Safety
+
+All reader types are `Send + Sync`:
+
+- `VectorReader<T>` trait requires `Send + Sync`
+- `VvecReader<T>` trait requires `Send + Sync`
+- `MmapVectorReader<T>` — backed by `Mmap` which is `Sync`
+- `IndexedXvecReader` — backed by `Mmap` + `Vec<u64>`, both `Sync`
+- `HttpVectorReader<T>` — uses `reqwest::blocking::Client` which is `Sync`
+- `Arc<dyn VectorReader<T>>` and `Arc<dyn VvecReader<T>>` — returned
+  by `TestDataView` methods, safe to share across threads
+
+Typical parallel access pattern:
+
+```rust
+use std::sync::Arc;
+use rayon::prelude::*;
+use vectordata::TestDataGroup;
+use vectordata::view::TestDataView;
+
+let group = TestDataGroup::load("https://host/dataset/")?;
+let view = group.profile("default").unwrap();
+let base = view.base_vectors()?;  // Arc<dyn VectorReader<f32>>
+
+// Safe to share across threads
+let results: Vec<f64> = (0..base.count())
+    .into_par_iter()
+    .map(|i| {
+        let v = base.get(i).unwrap();
+        v.iter().map(|x| (*x as f64) * (*x as f64)).sum::<f64>().sqrt()
+    })
+    .collect();
+```
+
+---
+
+## 23.14 Profiles
+
+A dataset can have multiple profiles representing different subsets
+or configurations of the same data:
+
+- **`default`** — the full dataset, always present
+- **Sized profiles** — subsets like `10K`, `100K`, `1M` with a
+  `base_count` that limits the number of base vectors
+
+### Accessing profiles
+
+```rust
+use vectordata::TestDataGroup;
+use vectordata::view::TestDataView;
+
+let group = TestDataGroup::load("./my-dataset/")?;
+
+// List available profiles (via facet manifest on each)
+if let Some(view) = group.profile("default") {
+    let manifest = view.facet_manifest();
+    println!("default profile has {} facets", manifest.len());
+}
+
+// Access a sized profile
+if let Some(view) = group.profile("100K") {
+    let base = view.base_vectors()?;
+    println!("100K profile: {} vectors", base.count());
+}
+
+// Concrete view for typed access
+let gview = group.generic_view("default").unwrap();
+let etype = gview.facet_element_type("metadata_content")?;
+```
+
+### Profile YAML structure
+
+```yaml
+profiles:
+  default:
+    maxk: 100
+    base_vectors: profiles/base/base_vectors.fvec
+    query_vectors: profiles/base/query_vectors.fvec
+    neighbor_indices: profiles/default/neighbor_indices.ivec
+    metadata_content: profiles/base/metadata_content.u8
+    metadata_indices: profiles/default/metadata_indices.ivvec
+
+  100K:
+    base_count: 100000
+    maxk: 100
+    base_vectors: profiles/base/base_vectors.fvec
+    query_vectors: profiles/base/query_vectors.fvec
+    neighbor_indices: profiles/100K/neighbor_indices.ivec
+```
+
+Sized profiles share base/query source data but have their own
+computed KNN, filtered results, and metadata indices. The pipeline's
+`per_profile` mechanism generates these automatically.
+
+---
+
+## 23.15 Dataset Attributes and Metadata
+
+### Required attributes
+
+Every published dataset must declare these attributes in
+`dataset.yaml`:
+
+```yaml
+attributes:
+  distance_function: L2          # L2, COSINE, or DOT_PRODUCT
+  is_zero_vector_free: true      # no zero vectors in base data
+  is_duplicate_vector_free: true  # no duplicate vectors in base data
+```
+
+These are set automatically by the pipeline after scanning or dedup.
+
+### Accessing attributes
+
+```rust
+use vectordata::TestDataGroup;
+
+let group = TestDataGroup::load("./dataset/")?;
+
+// Top-level attributes
+let dist = group.attribute("distance_function")
+    .and_then(|v| v.as_str())
+    .unwrap_or("unknown");
+println!("distance function: {}", dist);
+
+let zero_free = group.attribute("is_zero_vector_free")
+    .and_then(|v| v.as_bool())
+    .unwrap_or(false);
+println!("zero-free: {}", zero_free);
+
+// Distance function is also available on the view
+let view = group.profile("default").unwrap();
+if let Some(df) = view.distance_function() {
+    println!("metric: {}", df);
+}
+```
+
+### Metadata facets
+
+Metadata (M) and predicates (P) are scalar files — flat-packed arrays
+with no per-record header. Access them via `TypedReader`:
+
+```rust
+let gview = group.generic_view("default").unwrap();
+
+// Metadata content (e.g., labels as u8)
+let meta = gview.open_facet_typed::<u8>("metadata_content")?;
+println!("{} metadata records", meta.count());
+for i in 0..5 {
+    println!("  base[{}] label = {}", i, meta.get_native(i));
+}
+
+// Predicates (e.g., equality filters as u8)
+let pred = gview.open_facet_typed::<u8>("metadata_predicates")?;
+println!("{} predicates", pred.count());
+for i in 0..5 {
+    println!("  query[{}] filter = field_0 == {}", i, pred.get_native(i));
+}
+
+// Predicate results (variable-length ordinal lists)
+let mi = view.metadata_indices()?;
+for qi in 0..5 {
+    let matching = mi.get(qi)?;
+    let pred_val = pred.get_native(qi);
+    println!("  query[{}] (field_0 == {}): {} matching base vectors",
+        qi, pred_val, matching.len());
+}
+```
+
+### Element type interrogation
+
+Before opening a facet, you can query its native element type:
+
+```rust
+use vectordata::typed_access::ElementType;
+
+let gview = group.generic_view("default").unwrap();
+
+let etype = gview.facet_element_type("metadata_content")?;
+match etype {
+    ElementType::U8 => {
+        let r = gview.open_facet_typed::<u8>("metadata_content")?;
+        // zero-copy native access
+        let val: u8 = r.get_native(0);
+    }
+    ElementType::I32 => {
+        let r = gview.open_facet_typed::<i32>("metadata_content")?;
+        let val: i32 = r.get_native(0);
+    }
+    other => {
+        // Widen to i64 for any integer type
+        let r = gview.open_facet_typed::<i64>("metadata_content")?;
+        let val: i64 = r.get_value(0)?;
+    }
+}
+```
