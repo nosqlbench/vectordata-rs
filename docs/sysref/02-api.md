@@ -59,7 +59,7 @@ let sources = CatalogSources::new().configure_default();
 let catalog = Catalog::of(&sources);
 
 // Find a dataset by name
-let entry = catalog.find_exact("sift1m").expect("dataset not found");
+let entry = catalog.find_exact("my-dataset").expect("dataset not found");
 println!("found: {} at {}", entry.name, entry.path);
 println!("profiles: {:?}", entry.profile_names());
 
@@ -109,7 +109,7 @@ for entry in catalog.datasets() {
 }
 
 // Find by exact name (case-insensitive)
-if let Some(entry) = catalog.find_exact("sift1m") {
+if let Some(entry) = catalog.find_exact("my-dataset") {
     println!("found: {}", entry.name);
     println!("path: {}", entry.path);
     println!("views: {:?}", entry.view_names());
@@ -135,12 +135,12 @@ use vectordata::catalog::resolver::Catalog;
 
 let sources = CatalogSources::new().configure_default();
 let catalog = Catalog::of(&sources);
-let entry = catalog.find_exact("sift1m").expect("not found");
+let entry = catalog.find_exact("my-dataset").expect("not found");
 
 // The catalog source URL + entry path gives the dataset URL
-// For a catalog at https://host/datasets/ with entry path "sift1m",
-// the dataset URL is https://host/datasets/sift1m/
-let group = TestDataGroup::load("https://host/datasets/sift1m/")?;
+// For a catalog at https://host/datasets/ with entry path "my-dataset",
+// the dataset URL is https://host/datasets/my-dataset/
+let group = TestDataGroup::load("https://host/datasets/my-dataset/")?;
 let view = group.profile("default").unwrap();
 
 // Now use the standard facet methods
@@ -294,7 +294,7 @@ use vectordata::view::TestDataView;
 let group = TestDataGroup::load("./my-dataset/")?;
 
 // From an HTTP URL (fetches dataset.yaml, then Range-requests for data)
-let group = TestDataGroup::load("https://host/datasets/sift1m/")?;
+let group = TestDataGroup::load("https://host/datasets/my-dataset/")?;
 
 // Access dataset-level attributes
 let dist = group.attribute("distance_function");  // Option<&Value>
@@ -535,16 +535,16 @@ cache so they can be accessed offline without further HTTP requests:
 
 ```bash
 # Prebuffer from configured catalogs (looks up by name)
-veks datasets prebuffer --dataset sift1m
+veks datasets prebuffer --dataset my-dataset
 
 # Prebuffer a specific profile
-veks datasets prebuffer --dataset sift1m:default
+veks datasets prebuffer --dataset my-dataset:default
 
 # Prebuffer from a specific catalog URL
-veks datasets prebuffer --dataset sift1m --at https://host/datasets/
+veks datasets prebuffer --dataset my-dataset --at https://host/datasets/
 
 # Prebuffer with a custom cache directory
-veks datasets prebuffer --dataset sift1m --cache-dir /tmp/vd-cache
+veks datasets prebuffer --dataset my-dataset --cache-dir /tmp/vd-cache
 ```
 
 The prebuffer command:
@@ -567,8 +567,8 @@ Cache directory: /home/user/.cache/vectordata
 
 Dataset                        Files         Size
 ----------------------------------------------------
-sift1m                            12      523.4 MiB
-glove-100                          8       48.2 MiB
+my-dataset                            12      523.4 MiB
+other-dataset                          8       48.2 MiB
 ```
 
 ### How caching works
@@ -587,7 +587,7 @@ Cache files are stored as:
 
 ```
 ~/.cache/vectordata/
-├── sift1m/
+├── my-dataset/
 │   ├── dataset.yaml
 │   ├── profiles/
 │   │   ├── base/

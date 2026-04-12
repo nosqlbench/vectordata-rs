@@ -51,16 +51,16 @@ veks datasets config add-catalog https://example.com/datasets/
 ```shell
 veks datasets list
 veks datasets list --matching-name "sift*"
-veks datasets probe --dataset sift1m
+veks datasets probe --dataset my-dataset
 ```
 
 ### Prebuffer for Offline Use
 
 ```shell
-veks datasets prebuffer --dataset sift1m
+veks datasets prebuffer --dataset my-dataset
 ```
 
-Downloads all facets into `~/.cache/vectordata/sift1m/`, verified
+Downloads all facets into `~/.cache/vectordata/my-dataset/`, verified
 against merkle hashes. Configure the cache location:
 
 ```shell

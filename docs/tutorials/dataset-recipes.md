@@ -34,7 +34,7 @@ veks run dataset.yaml
 When you already have KNN results:
 
 ```bash
-mkdir sift1m && cd sift1m
+mkdir my-dataset && cd my-dataset
 cp /path/to/base.fvecs _sift_base.fvecs
 cp /path/to/query.fvecs _sift_query.fvecs
 cp /path/to/gt.ivecs _sift_groundtruth.ivecs
@@ -112,8 +112,8 @@ veks bootstrap -i
 When base and query vectors come from the same source:
 
 ```bash
-mkdir glove && cd glove
-cp /path/to/glove.fvec _base_vectors.fvec
+mkdir my-dataset && cd my-dataset
+cp /path/to/source.fvec _base_vectors.fvec
 veks bootstrap -i
 # Choose self_search=true, query_count=10000
 ```

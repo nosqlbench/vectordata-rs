@@ -84,7 +84,29 @@ All legacy extensions are fully supported as aliases. Plural forms
 | NumPy | `.npy` | Import source for vector arrays |
 | Parquet | `.parquet` | Import source for structured metadata |
 | Slab | `.slab` | Variable-length binary records (metadata, predicates) |
-| HDF5 | `.hdf5`, `.h5` | Import source (datasets via `#path` notation) |
+| HDF5 | `.hdf5`, `.h5` | Import source (pre-convert to xvec; see note below) |
+
+### HDF5 note
+
+HDF5 is supported as an import source but the `libhdf5` C library
+dependency was removed from the default build. HDF5 introduced
+significant build complexity (cmake, C compiler, system library
+version conflicts) and runtime linking issues across platforms.
+
+To work with HDF5 datasets, pre-convert them to xvec format using
+Python or any HDF5-capable tool:
+
+```python
+import h5py, numpy as np
+with h5py.File('dataset.hdf5', 'r') as f:
+    vecs = np.array(f['train'], dtype=np.float32)
+    with open('base_vectors.fvec', 'wb') as out:
+        for v in vecs:
+            out.write(np.int32(len(v)).tobytes())
+            out.write(v.tobytes())
+```
+
+Then use the resulting `.fvec` file as input to `veks bootstrap`.
 
 ### Slab internals
 

@@ -3,6 +3,10 @@
 All commands are available both as pipeline steps (`run: command path`)
 and directly via the CLI (`veks pipeline command path --option=value`).
 
+For working examples with real output, see the
+[Command Reference](./commands/README.md) — one page per command,
+each run against the synthetic-1k test fixture.
+
 ---
 
 ## 5.1 Analyze

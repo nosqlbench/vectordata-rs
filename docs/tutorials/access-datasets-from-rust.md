@@ -19,10 +19,10 @@ use vectordata::TestDataGroup;
 use vectordata::view::TestDataView;
 
 // From a local directory
-let group = TestDataGroup::load("./sift1m/")?;
+let group = TestDataGroup::load("./my-dataset/")?;
 
 // From an HTTP URL
-let group = TestDataGroup::load("https://example.com/datasets/sift1m/")?;
+let group = TestDataGroup::load("https://example.com/datasets/my-dataset/")?;
 
 // Access a profile
 let view = group.profile("default").unwrap();
@@ -93,7 +93,7 @@ for entry in catalog.datasets() {
     println!("{} (profiles: {})", entry.name, entry.profile_names().join(", "));
 }
 
-if let Some(entry) = catalog.find_exact("sift1m") {
+if let Some(entry) = catalog.find_exact("my-dataset") {
     println!("found: {}", entry.name);
 }
 ```

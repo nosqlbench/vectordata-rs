@@ -38,7 +38,7 @@ for entry in catalog.datasets() {
     println!("{} (profiles: {})", entry.name, entry.profile_names().join(", "));
 }
 
-if let Some(entry) = catalog.find_exact("sift1m") {
+if let Some(entry) = catalog.find_exact("my-dataset") {
     println!("found at path: {}", entry.path);
 }
 
@@ -138,8 +138,8 @@ Resolution order: `--cache-dir` flag > `settings.yaml` > `$HOME/.cache/vectordat
 Downloads all facets for offline access, verified against merkle hashes:
 
 ```bash
-veks datasets prebuffer --dataset sift1m
-veks datasets prebuffer --dataset sift1m:default --at https://example.com/datasets/
+veks datasets prebuffer --dataset my-dataset
+veks datasets prebuffer --dataset my-dataset:default --at https://example.com/datasets/
 ```
 
 ### Cache inspection

@@ -90,8 +90,42 @@ impl CommandOp for AnalyzeSelectOp {
             Err(e) => return error_result(e, start),
         };
 
+        // Detect scalar format (no xvec header — flat packed values)
+        let ext = input_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        let is_scalar = veks_core::formats::VecFormat::from_extension(ext)
+            .map(|f| f.is_scalar())
+            .unwrap_or(false);
+
         // Open reader and extract (count, dim, get_f64_fn) based on element type.
-        let (count, _dim, get_f64): (usize, usize, Box<dyn Fn(usize) -> Vec<f64> + Sync>) = match etype {
+        let (count, _dim, get_f64): (usize, usize, Box<dyn Fn(usize) -> Vec<f64> + Sync>) = if is_scalar {
+            // Scalar file: each record is a single element, no dim header
+            let file_size = std::fs::metadata(&input_path).map(|m| m.len()).unwrap_or(0);
+            let elem_size = etype.element_size();
+            let rc = if elem_size > 0 { file_size as usize / elem_size } else { 0 };
+            let path_clone = input_path.clone();
+            (rc, 1, Box::new(move |i: usize| {
+                use std::io::{Read, Seek, SeekFrom};
+                let elem_size = match ext {
+                    "u8" | "i8" => 1, "u16" | "i16" => 2,
+                    "u32" | "i32" => 4, "u64" | "i64" => 8,
+                    _ => 1,
+                };
+                let mut f = match std::fs::File::open(&path_clone) {
+                    Ok(f) => f, Err(_) => return vec![],
+                };
+                let _ = f.seek(SeekFrom::Start(i as u64 * elem_size as u64));
+                let mut buf = [0u8; 8];
+                let _ = f.read_exact(&mut buf[..elem_size]);
+                let val: f64 = match elem_size {
+                    1 => buf[0] as f64,
+                    2 => i16::from_le_bytes([buf[0], buf[1]]) as f64,
+                    4 => i32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as f64,
+                    8 => i64::from_le_bytes(buf) as f64,
+                    _ => 0.0,
+                };
+                vec![val]
+            }) as Box<dyn Fn(usize) -> Vec<f64> + Sync>)
+        } else { match etype {
             ElementType::F32 => {
                 let r = match MmapVectorReader::<f32>::open_fvec(&input_path) {
                     Ok(r) => r, Err(e) => return error_result(format!("open: {}", e), start),
@@ -178,7 +212,7 @@ impl CommandOp for AnalyzeSelectOp {
                 let d = VectorReader::<f64>::dim(&r);
                 (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
             }
-        };
+        } }; // close match etype + else
 
         // Parse ordinal spec: single number, comma-separated, or range [start,end)
         let ordinals = parse_ordinal_spec(&ordinal_str, count);

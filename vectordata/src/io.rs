@@ -41,22 +41,56 @@ use url::Url;
 /// confusion with a hypothetical zero-dimensional vector.
 pub const DIM_UNDEFINED: usize = usize::MAX;
 
-/// Validate that a file's extension matches the expected format.
+/// Validate that a file's extension is compatible with the expected format.
 ///
-/// Returns `Ok(())` if the extension matches or the file has no extension
-/// (for programmatic paths). Returns an error for mismatches.
+/// Accepts the expected extension, its plural form, and canonical aliases
+/// (e.g., `.u8` and `.u8vec` are compatible with `.bvec`). Returns `Ok(())`
+/// if compatible or if the file has no extension.
 fn validate_extension(path: &Path, expected: &str) -> Result<(), IoError> {
     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-        // Accept both singular (e.g. "fvec") and plural (e.g. "fvecs") forms
-        let plural = format!("{}s", expected);
-        if ext != expected && ext != plural {
-            return Err(IoError::InvalidFormat(format!(
-                "file extension '.{}' does not match expected '.{}' for {}: {}",
-                ext, expected, expected, path.display(),
-            )));
+        let ext_lower = ext.to_lowercase();
+        let expected_lower = expected.to_lowercase();
+
+        // Direct match or plural
+        if ext_lower == expected_lower || ext_lower == format!("{}s", expected_lower) {
+            return Ok(());
         }
+
+        // Check if both map to the same element size via the format system
+        let ext_size = infer_elem_size(&ext_lower);
+        let expected_size = infer_elem_size(&expected_lower);
+        if ext_size > 0 && ext_size == expected_size {
+            return Ok(());
+        }
+
+        return Err(IoError::InvalidFormat(format!(
+            "file extension '.{}' does not match expected '.{}' for {}: {}",
+            ext, expected, expected, path.display(),
+        )));
     }
     Ok(())
+}
+
+/// Infer element size from an extension string (0 = unknown).
+fn infer_elem_size(ext: &str) -> usize {
+    match ext {
+        "fvec" | "fvecs" | "f32vec" | "f32vecs" | "ivec" | "ivecs" | "i32vec" | "i32vecs"
+        | "u32vec" | "u32vecs" | "fvvec" | "fvvecs" | "ivvec" | "ivvecs"
+        | "f32vvec" | "f32vvecs" | "i32vvec" | "i32vvecs" | "u32vvec" | "u32vvecs"
+        | "u32" | "i32" => 4,
+        "dvec" | "dvecs" | "f64vec" | "f64vecs" | "dvvec" | "dvvecs"
+        | "i64vec" | "i64vecs" | "u64vec" | "u64vecs"
+        | "f64vvec" | "f64vvecs" | "i64vvec" | "i64vvecs" | "u64vvec" | "u64vvecs"
+        | "u64" | "i64" => 8,
+        "mvec" | "mvecs" | "f16vec" | "f16vecs" | "svec" | "svecs" | "i16vec" | "i16vecs"
+        | "u16vec" | "u16vecs" | "mvvec" | "mvvecs" | "svvec" | "svvecs"
+        | "f16vvec" | "f16vvecs" | "i16vvec" | "i16vvecs" | "u16vvec" | "u16vvecs"
+        | "u16" | "i16" => 2,
+        "bvec" | "bvecs" | "u8vec" | "u8vecs" | "i8vec" | "i8vecs"
+        | "bvvec" | "bvvecs" | "u8vvec" | "u8vvecs" | "i8vvec" | "i8vvecs"
+        | "u8" | "i8" => 1,
+        _ => 0,
+    }
 }
 
 /// Errors that can occur during vector I/O operations.

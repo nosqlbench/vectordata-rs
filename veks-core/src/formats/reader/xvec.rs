@@ -30,9 +30,7 @@ pub fn open_xvec(path: &Path, format: VecFormat) -> Result<Box<dyn VecSource>, S
     match format {
         VecFormat::Fvec => open_fvec(path),
         VecFormat::Ivec => open_ivec(path),
-        VecFormat::Bvec | VecFormat::Dvec | VecFormat::Mvec | VecFormat::Svec => {
-            RawXvecReader::open(path, format)
-        }
+        _ if format.is_xvec() => RawXvecReader::open(path, format),
         _ => Err(format!("{} is not an xvec format", format)),
     }
 }
