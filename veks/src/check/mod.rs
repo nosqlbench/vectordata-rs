@@ -1,4 +1,4 @@
-// Copyright (c) nosqlbench contributors
+// Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
 //! Pre-flight checks for dataset readiness (`veks check`).

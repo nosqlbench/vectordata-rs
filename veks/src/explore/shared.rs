@@ -1,4 +1,4 @@
-// Copyright (c) nosqlbench contributors
+// Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
 //! Shared infrastructure for explore subcommands: data access, sampling,

@@ -1,4 +1,4 @@
-// Copyright (c) nosqlbench contributors
+// Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
 //! Evaluate a [`PNode`] predicate tree against an [`MNode`] record.

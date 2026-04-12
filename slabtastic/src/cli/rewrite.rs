@@ -1,4 +1,4 @@
-// Copyright 2026 nosqlbench contributors
+// Copyright 2026 Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
 //! `slab rewrite` subcommand — rewrite a slabtastic file, reordering by

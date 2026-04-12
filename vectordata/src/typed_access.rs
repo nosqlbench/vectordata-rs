@@ -1,4 +1,4 @@
-// Copyright (c) nosqlbench contributors
+// Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
 //! Typed data access with runtime type negotiation.
@@ -68,18 +68,18 @@ impl ElementType {
             "i32" => Some(Self::I32),
             "u64" => Some(Self::U64),
             "i64" => Some(Self::I64),
-            // Vector formats (xvec)
-            "bvec" | "bvecs" | "u8vec" | "u8vecs" => Some(Self::U8),
-            "i8vec" | "i8vecs" => Some(Self::I8),
-            "svec" | "svecs" | "i16vec" | "i16vecs" => Some(Self::I16),
-            "u16vec" | "u16vecs" => Some(Self::U16),
-            "ivec" | "ivecs" | "i32vec" | "i32vecs" => Some(Self::I32),
-            "u32vec" | "u32vecs" => Some(Self::U32),
-            "i64vec" | "i64vecs" => Some(Self::I64),
-            "u64vec" | "u64vecs" => Some(Self::U64),
-            "fvec" | "fvecs" => Some(Self::F32),
-            "mvec" | "mvecs" => Some(Self::F16),
-            "dvec" | "dvecs" => Some(Self::F64),
+            // Vector formats (xvec — uniform and variable)
+            "bvec" | "bvecs" | "u8vec" | "u8vecs" | "bvvec" | "bvvecs" | "u8vvec" | "u8vvecs" => Some(Self::U8),
+            "i8vec" | "i8vecs" | "i8vvec" | "i8vvecs" => Some(Self::I8),
+            "svec" | "svecs" | "i16vec" | "i16vecs" | "svvec" | "svvecs" | "i16vvec" | "i16vvecs" => Some(Self::I16),
+            "u16vec" | "u16vecs" | "u16vvec" | "u16vvecs" => Some(Self::U16),
+            "ivec" | "ivecs" | "i32vec" | "i32vecs" | "ivvec" | "ivvecs" | "i32vvec" | "i32vvecs" => Some(Self::I32),
+            "u32vec" | "u32vecs" | "u32vvec" | "u32vvecs" => Some(Self::U32),
+            "i64vec" | "i64vecs" | "i64vvec" | "i64vvecs" => Some(Self::I64),
+            "u64vec" | "u64vecs" | "u64vvec" | "u64vvecs" => Some(Self::U64),
+            "fvec" | "fvecs" | "fvvec" | "fvvecs" | "f32vec" | "f32vecs" | "f32vvec" | "f32vvecs" => Some(Self::F32),
+            "mvec" | "mvecs" | "mvvec" | "mvvecs" | "f16vec" | "f16vecs" | "f16vvec" | "f16vvecs" => Some(Self::F16),
+            "dvec" | "dvecs" | "dvvec" | "dvvecs" | "f64vec" | "f64vecs" | "f64vvec" | "f64vvecs" => Some(Self::F64),
             _ => None,
         }
     }

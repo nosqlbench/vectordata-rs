@@ -1,4 +1,4 @@
-// Copyright 2026 nosqlbench contributors
+// Copyright 2026 Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
 //! `slab import` subcommand — import data from external file formats into a slab file.

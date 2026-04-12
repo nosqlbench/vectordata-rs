@@ -1,4 +1,4 @@
-// Copyright (c) nosqlbench contributors
+// Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
 //! Pipeline command: find duplicate vectors in a source file.
@@ -306,6 +306,11 @@ fn scan_single_file(source_path: &Path, ctx: &mut StreamContext, start: Instant)
                 ctx.ui.log("  No duplicates found — all vectors are unique.");
             }
 
+            // Set pipeline variable so dataset attributes can be populated
+            let _ = crate::pipeline::variables::set_and_save(
+                &ctx.workspace, "duplicate_count", &result.duplicates.to_string());
+            ctx.defaults.insert("duplicate_count".into(), result.duplicates.to_string());
+
             CommandResult {
                 status: Status::Ok,
                 message: format!("{} duplicates in {} vectors ({:.2}%)",
@@ -451,6 +456,11 @@ fn scan_directory_dedup(dir: &Path, ctx: &mut StreamContext, start: Instant) -> 
         total_vectors, total_dups, total_pct, files.len(), files_with_dups,
         total_secs, total_rate_str,
     ));
+
+    // Set pipeline variable
+    let _ = crate::pipeline::variables::set_and_save(
+        &ctx.workspace, "duplicate_count", &total_dups.to_string());
+    ctx.defaults.insert("duplicate_count".into(), total_dups.to_string());
 
     CommandResult {
         status: Status::Ok,

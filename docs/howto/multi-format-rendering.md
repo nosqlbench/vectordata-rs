@@ -1,4 +1,4 @@
-<!-- Copyright (c) nosqlbench contributors -->
+<!-- Copyright (c) Jonathan Shook -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
 # Example: Rendering One Record in All Formats

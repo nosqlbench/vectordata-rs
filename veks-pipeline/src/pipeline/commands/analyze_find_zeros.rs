@@ -1,4 +1,4 @@
-// Copyright (c) nosqlbench contributors
+// Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
 //! Pipeline command: brute-force scan for near-zero vectors.
@@ -378,6 +378,15 @@ fn report_zeros_f32(
         ));
     }
 
+    // Set pipeline variables
+    let zero_count = zeros.len();
+    let _ = crate::pipeline::variables::set_and_save(
+        &ctx.workspace, "zero_count", &zero_count.to_string());
+    ctx.defaults.insert("zero_count".into(), zero_count.to_string());
+    let _ = crate::pipeline::variables::set_and_save(
+        &ctx.workspace, "source_zero_count", &zero_count.to_string());
+    ctx.defaults.insert("source_zero_count".into(), zero_count.to_string());
+
     CommandResult {
         status: Status::Ok,
         message: format!("{} near-zero vectors in {} (threshold {:.0e})",
@@ -440,6 +449,15 @@ fn report_zeros_f16(
             exact_count, near_count, threshold,
         ));
     }
+
+    // Set pipeline variables
+    let zc = zeros.len();
+    let _ = crate::pipeline::variables::set_and_save(
+        &ctx.workspace, "zero_count", &zc.to_string());
+    ctx.defaults.insert("zero_count".into(), zc.to_string());
+    let _ = crate::pipeline::variables::set_and_save(
+        &ctx.workspace, "source_zero_count", &zc.to_string());
+    ctx.defaults.insert("source_zero_count".into(), zc.to_string());
 
     CommandResult {
         status: Status::Ok,
@@ -558,6 +576,14 @@ fn scan_directory(
         total_vectors, total_zeros, total_exact, files.len(), files_with_zeros,
         total_secs, total_rate_str,
     ));
+
+    // Set pipeline variables so dataset attributes can be populated
+    let _ = crate::pipeline::variables::set_and_save(
+        &ctx.workspace, "zero_count", &total_zeros.to_string());
+    ctx.defaults.insert("zero_count".into(), total_zeros.to_string());
+    let _ = crate::pipeline::variables::set_and_save(
+        &ctx.workspace, "source_zero_count", &total_zeros.to_string());
+    ctx.defaults.insert("source_zero_count".into(), total_zeros.to_string());
 
     CommandResult {
         status: Status::Ok,

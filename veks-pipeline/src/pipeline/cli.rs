@@ -1,4 +1,4 @@
-// Copyright (c) nosqlbench contributors
+// Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
 //! Direct CLI invocation of pipeline commands.
@@ -271,6 +271,12 @@ pub fn governor_completer(current: &OsStr) -> Vec<CompletionCandidate> {
 /// typically operate on.
 const DATA_EXTENSIONS: &[&str] = &[
     "fvec", "ivec", "mvec", "bvec", "dvec", "svec",
+    "fvvec", "ivvec", "mvvec", "bvvec", "dvvec", "svvec",
+    "i8vec", "u16vec", "i32vec", "u32vec", "i64vec", "u64vec",
+    "i8vvec", "u16vvec", "i32vvec", "u32vvec", "i64vvec", "u64vvec",
+    "f16vec", "f32vec", "f64vec", "f16vvec", "f32vvec", "f64vvec",
+    "u8vec", "u8vvec",
+    "u8", "i8", "u16", "i16", "u32", "i32", "u64", "i64",
     "slab", "npy", "parquet", "json", "yaml",
 ];
 

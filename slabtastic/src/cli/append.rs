@@ -1,4 +1,4 @@
-// Copyright 2026 nosqlbench contributors
+// Copyright 2026 Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
 //! `slab append` subcommand — append data to an existing slabtastic file.

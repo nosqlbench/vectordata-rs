@@ -1,4 +1,4 @@
-// Copyright (c) nosqlbench contributors
+// Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
 //! Consolidated multi-profile verifiers.
@@ -832,24 +832,32 @@ impl CommandOp for VerifyFilteredKnnConsolidatedOp {
                 continue;
             }
 
-            // Load predicate results
-            let pred_indices = match crate::pipeline::commands::compute_filtered_knn::PredicateIndices::open(
-                &ctx.workspace.join(format!("profiles/{}/metadata_indices.ivec", name))
-                    .to_path_buf()
-            ) {
-                Ok(r) => r,
-                Err(_) => {
-                    // Try .slab
-                    match crate::pipeline::commands::compute_filtered_knn::PredicateIndices::open(
-                        &ctx.workspace.join(format!("profiles/{}/metadata_indices.slab", name))
-                    ) {
-                        Ok(r) => r,
-                        Err(e) => {
-                            results.push(serde_json::json!({
-                                "name": name, "status": "error", "message": e,
-                            }));
-                            continue;
+            // Load predicate results — try ivvec (canonical), ivec (legacy), slab
+            let pred_indices_candidates = [
+                format!("profiles/{}/metadata_indices.ivvec", name),
+                format!("profiles/{}/metadata_indices.ivec", name),
+                format!("profiles/{}/metadata_indices.slab", name),
+            ];
+            let pred_indices = {
+                let mut loaded = None;
+                let mut last_err = String::new();
+                for candidate in &pred_indices_candidates {
+                    let path = ctx.workspace.join(candidate);
+                    if path.exists() {
+                        match crate::pipeline::commands::compute_filtered_knn::PredicateIndices::open(&path) {
+                            Ok(r) => { loaded = Some(r); break; }
+                            Err(e) => { last_err = e; }
                         }
+                    }
+                }
+                match loaded {
+                    Some(r) => r,
+                    None => {
+                        results.push(serde_json::json!({
+                            "name": name, "status": "error",
+                            "message": if last_err.is_empty() { "no metadata_indices file found".into() } else { last_err },
+                        }));
+                        continue;
                     }
                 }
             };
@@ -1060,8 +1068,10 @@ impl CommandOp for VerifyPredicatesConsolidatedOp {
         let mut profiles: Vec<(String, u64)> = Vec::new();
         for (name, profile) in &config.profiles.profiles {
             let bc = profile.base_count.unwrap_or(u64::MAX);
-            let indices_path = ctx.workspace.join(format!("profiles/{}/metadata_indices.slab", name));
-            if indices_path.exists() {
+            let has_indices = ["ivvec", "ivec", "slab"].iter().any(|ext| {
+                ctx.workspace.join(format!("profiles/{}/metadata_indices.{}", name, ext)).exists()
+            });
+            if has_indices {
                 profiles.push((name.clone(), bc));
             }
         }
@@ -1099,22 +1109,51 @@ impl CommandOp for VerifyPredicatesConsolidatedOp {
 
         for (_pi, (name, bc)) in profiles.iter().enumerate() {
             // Try multiple extensions for metadata indices
-            let indices_path = {
-                let slab = ctx.workspace.join(format!("profiles/{}/metadata_indices.slab", name));
-                let ivec = ctx.workspace.join(format!("profiles/{}/metadata_indices.ivec", name));
-                if ivec.exists() { ivec } else { slab }
+            let indices_candidates = ["ivvec", "ivec", "slab"];
+            let indices_path = indices_candidates.iter()
+                .map(|ext| ctx.workspace.join(format!("profiles/{}/metadata_indices.{}", name, ext)))
+                .find(|p| p.exists())
+                .unwrap_or_else(|| ctx.workspace.join(format!("profiles/{}/metadata_indices.slab", name)));
+
+            let indices_ext = indices_path.extension().and_then(|e| e.to_str()).unwrap_or("slab");
+            let eval_count: usize;
+            let _eval_get: Box<dyn Fn(usize) -> Result<Vec<i32>, String>>;
+
+            if indices_ext == "slab" {
+                let reader = match slabtastic::SlabReader::open(&indices_path) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        ctx.ui.log(&format!("  profile '{}': failed to open eval results: {}", name, e));
+                        all_results.push(serde_json::json!({
+                            "name": name, "status": "error", "message": e.to_string(),
+                        }));
+                        continue;
+                    }
+                };
+                eval_count = reader.total_records() as usize;
+                _eval_get = Box::new(move |i: usize| {
+                    let data = reader.get(i as i64).map_err(|e| format!("{}", e))?;
+                    Ok(data.chunks_exact(4)
+                        .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                        .collect())
+                });
+            } else {
+                // ivvec or ivec — use IndexedXvecReader
+                let reader = match vectordata::io::IndexedXvecReader::open_ivec(&indices_path) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        ctx.ui.log(&format!("  profile '{}': failed to open eval results: {}", name, e));
+                        all_results.push(serde_json::json!({
+                            "name": name, "status": "error", "message": e.to_string(),
+                        }));
+                        continue;
+                    }
+                };
+                eval_count = reader.count();
+                _eval_get = Box::new(move |i: usize| {
+                    reader.get_i32(i).map_err(|e| format!("{}", e))
+                });
             };
-            let eval_reader = match slabtastic::SlabReader::open(&indices_path) {
-                Ok(r) => r,
-                Err(e) => {
-                    ctx.ui.log(&format!("  profile '{}': failed to open eval results: {}", name, e));
-                    all_results.push(serde_json::json!({
-                        "name": name, "status": "error", "message": e.to_string(),
-                    }));
-                    continue;
-                }
-            };
-            let eval_count = eval_reader.total_records() as usize;
 
             let bc_str = if *bc == u64::MAX { "full".into() } else { bc.to_string() };
             ctx.ui.log(&format!(

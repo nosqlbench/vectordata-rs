@@ -1,4 +1,4 @@
-// Copyright (c) nosqlbench contributors
+// Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
 //! Extraneous file detection using projected artifact manifests.
@@ -108,6 +108,22 @@ pub fn check(
                 continue;
             }
 
+            // Skip IDXFOR__ index files if their data file is accounted for
+            if filename.starts_with("IDXFOR__") {
+                // IDXFOR__metadata_indices.ivvec.i32 → metadata_indices.ivvec
+                let data_name = filename.strip_prefix("IDXFOR__")
+                    .and_then(|s| s.rsplit_once('.'))  // strip .i32/.i64
+                    .map(|(base, _)| base);
+                if let Some(dn) = data_name {
+                    let data_rel = rel.rsplit_once('/')
+                        .map(|(dir, _)| format!("{}/{}", dir, dn))
+                        .unwrap_or_else(|| dn.to_string());
+                    if accounted.contains(&data_rel) {
+                        continue;
+                    }
+                }
+            }
+
             if !accounted.contains(&rel) {
                 let size = std::fs::metadata(file).map(|m| m.len()).unwrap_or(0);
                 all_extraneous.push(format!("{} ({})", rel, format_size(size)));
@@ -210,6 +226,21 @@ pub fn find_extraneous(
 
         if rel.ends_with(".mrkl") {
             continue;
+        }
+
+        // Skip IDXFOR__ index files if their data file is accounted for
+        if filename.starts_with("IDXFOR__") {
+            let data_name = filename.strip_prefix("IDXFOR__")
+                .and_then(|s| s.rsplit_once('.'))
+                .map(|(base, _)| base);
+            if let Some(dn) = data_name {
+                let data_rel = rel.rsplit_once('/')
+                    .map(|(dir, _)| format!("{}/{}", dir, dn))
+                    .unwrap_or_else(|| dn.to_string());
+                if accounted.contains(&data_rel) {
+                    continue;
+                }
+            }
         }
 
         if !accounted.contains(&rel) {

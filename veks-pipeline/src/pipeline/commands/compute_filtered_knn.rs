@@ -1,4 +1,4 @@
-// Copyright (c) nosqlbench contributors
+// Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
 //! Pipeline command: compute predicate-filtered exact K-nearest neighbors.
@@ -106,8 +106,8 @@ fn read_ordinals(data: &[u8]) -> Vec<i32> {
 pub(crate) enum PredicateIndices {
     /// Slab: each record is packed i32 LE ordinals.
     Slab(slabtastic::SlabReader),
-    /// Ivec: each record is `[dim:i32, data:i32 × dim]`.
-    Ivec(Vec<Vec<i32>>),
+    /// Ivec: variable-length records accessed via offset index.
+    Ivec(vectordata::io::IndexedXvecReader),
 }
 
 impl PredicateIndices {
@@ -120,30 +120,10 @@ impl PredicateIndices {
                     .map_err(|e| format!("open slab {}: {}", path.display(), e))?;
                 Ok(Self::Slab(reader))
             }
-            "ivec" | "ivecs" => {
-                // Read all ivec records into memory
-                let data = std::fs::read(path)
-                    .map_err(|e| format!("read {}: {}", path.display(), e))?;
-                let mut records = Vec::new();
-                let mut offset = 0;
-                while offset + 4 <= data.len() {
-                    let dim = i32::from_le_bytes([
-                        data[offset], data[offset+1], data[offset+2], data[offset+3],
-                    ]) as usize;
-                    offset += 4;
-                    let end = offset + dim * 4;
-                    if end > data.len() { break; }
-                    let mut vals = Vec::with_capacity(dim);
-                    for i in 0..dim {
-                        let base = offset + i * 4;
-                        vals.push(i32::from_le_bytes([
-                            data[base], data[base+1], data[base+2], data[base+3],
-                        ]));
-                    }
-                    records.push(vals);
-                    offset = end;
-                }
-                Ok(Self::Ivec(records))
+            "ivec" | "ivecs" | "ivvec" | "ivvecs" | "i32vvec" | "i32vvecs" => {
+                let reader = vectordata::io::IndexedXvecReader::open_ivec(path)
+                    .map_err(|e| format!("open indexed ivec {}: {}", path.display(), e))?;
+                Ok(Self::Ivec(reader))
             }
             _ => {
                 // Try slab first, fallback to error
@@ -163,12 +143,9 @@ impl PredicateIndices {
                     .map_err(|e| format!("read slab record {}: {}", index, e))?;
                 Ok(read_ordinals(&data))
             }
-            Self::Ivec(records) => {
-                if index >= records.len() {
-                    Err(format!("index {} out of range ({})", index, records.len()))
-                } else {
-                    Ok(records[index].clone())
-                }
+            Self::Ivec(reader) => {
+                reader.get_i32(index)
+                    .map_err(|e| format!("read ivec record {}: {}", index, e))
             }
         }
     }
@@ -177,7 +154,7 @@ impl PredicateIndices {
     pub fn count(&self) -> usize {
         match self {
             Self::Slab(reader) => reader.total_records() as usize,
-            Self::Ivec(records) => records.len(),
+            Self::Ivec(reader) => reader.count(),
         }
     }
 }

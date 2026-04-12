@@ -1,4 +1,4 @@
-// Copyright 2026 nosqlbench contributors
+// Copyright 2026 Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
 //! The pages page — the file-level index of a slabtastic file.

@@ -1,4 +1,4 @@
-// Copyright (c) nosqlbench contributors
+// Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
 //! Pipeline commands: slabtastic file operations.
@@ -1603,7 +1603,9 @@ predicates` steps have the schema and cardinality information they need.
 
         let output_path = options.get("output").map(|s| resolve_path(s, &ctx.workspace));
 
-        let is_ivec = input_path.extension().and_then(|e| e.to_str()) == Some("ivec");
+        let is_ivec = input_path.extension().and_then(|e| e.to_str())
+            .map(|e| matches!(e, "ivec" | "ivecs" | "ivvec" | "ivvecs" | "i32vvec" | "i32vvecs"))
+            .unwrap_or(false);
         let survey = if is_ivec {
             match survey_ivec(&input_path, max_samples, max_distinct) {
                 Ok(s) => s,

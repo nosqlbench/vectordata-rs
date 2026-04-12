@@ -1,4 +1,4 @@
-// Copyright (c) nosqlbench contributors
+// Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
 //! Built-in pipeline command implementations.
@@ -58,6 +58,7 @@ pub mod gen_extract;
 pub mod gen_metadata;
 pub mod gen_from_model;
 pub mod gen_predicate_keys;
+pub mod inspect_filtered_knn;
 pub mod gen_predicates;
 pub mod gen_shuffle;
 #[cfg(feature = "knnutils")]
@@ -66,6 +67,7 @@ pub mod gen_sketch;
 pub mod gen_dataset_log_jsonl;
 pub mod gen_variables_json;
 pub mod gen_vectors;
+pub mod gen_vvec_index;
 mod import;
 pub mod info_compute;
 pub mod info_file;
@@ -107,6 +109,7 @@ pub fn register_all(registry: &mut CommandRegistry) {
     registry.register("analyze display-histogram", analyze_histogram::factory);
     registry.register("analyze model-diff", analyze_modeldiff::factory);
     registry.register("analyze explain-predicates", inspect_predicate::factory);
+    registry.register("analyze explain-filtered-knn", inspect_filtered_knn::factory);
     registry.register("analyze select", analyze_select::factory);
     registry.register("analyze slice", analyze_slice::factory);
     registry.register("analyze stats", analyze_stats::factory);
@@ -153,6 +156,7 @@ pub fn register_all(registry: &mut CommandRegistry) {
     registry.register("generate dataset-log-jsonl", gen_dataset_log_jsonl::factory);
     registry.register("generate variables-json", gen_variables_json::factory);
     registry.register("generate vectors", gen_vectors::factory);
+    registry.register("generate vvec-index", gen_vvec_index::factory);
 
     // ── merkle ───────────────────────────────────────────────────────
     registry.register("merkle create", merkle::create_factory);

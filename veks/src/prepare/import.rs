@@ -1,4 +1,4 @@
-// Copyright (c) nosqlbench contributors
+// Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
 //! `datasets import` subcommand — bootstrap a new dataset directory.
@@ -668,7 +668,7 @@ fn resolve_slots(args: &ImportArgs) -> PipelineSlots {
         // variable-length list of matching ordinals, not a scalar value
         let predicate_indices = Artifact::Materialized {
             step_id: "evaluate-predicates".into(),
-            output: "metadata_indices.ivec".into(),
+            output: "metadata_indices.ivvec".into(),
         };
         Some(MetadataSlots { metadata_all, metadata_content, survey, predicates, predicate_indices })
     } else {
@@ -1017,6 +1017,32 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
         // or measure-normals steps. All absorbed into prepare-vectors (SRD §20).
         // The exclusion set (duplicates ∪ zeros) is applied directly by
         // extract-base and extract-queries.
+    } else if !slots.base_vectors.path().is_empty() {
+        // When prepare-vectors is skipped (Identity base, no dedup), scan
+        // the source vectors for zeros and duplicates so the dataset
+        // attributes can be populated with verified values.
+        steps.push(Step {
+            id: "scan-zeros".into(),
+            run: "analyze find-zeros".into(),
+            description: Some("Scan source vectors for zero vectors".into()),
+            after: vec!["count-vectors".into()],
+            per_profile: false,
+            phase: 0,
+            options: vec![
+                ("source".into(), slots.base_vectors.path().into()),
+            ],
+        });
+        steps.push(Step {
+            id: "scan-duplicates".into(),
+            run: "analyze find-duplicates".into(),
+            description: Some("Scan source vectors for duplicates".into()),
+            after: vec!["count-vectors".into()],
+            per_profile: false,
+            phase: 0,
+            options: vec![
+                ("source".into(), slots.base_vectors.path().into()),
+            ],
+        });
     }
 
     // Was the subset already applied by the subset-vectors or convert step?
@@ -1739,6 +1765,22 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
         options: vec![],
     });
 
+    // ── VVec index generation ──────────────────────────────────────
+    // Build offset index files for any variable-length vector files
+    // so downstream consumers can random-access them after download.
+    // Runs before merkle so the index files get .mref coverage.
+    steps.push(Step {
+        id: "generate-vvec-index".into(),
+        run: "generate vvec-index".into(),
+        description: Some("Build offset indices for variable-length vector files".into()),
+        after: vec!["generate-variables-json".into(), "generate-dataset-log-jsonl".into()],
+        per_profile: false,
+        phase: 0,
+        options: vec![
+            ("source".into(), ".".into()),
+        ],
+    });
+
     // ── Merkle hash trees ────────────────────────────────────────
     // Runs before catalog generation so that all data files have
     // .mref hashes before the catalog snapshot is taken.
@@ -1746,7 +1788,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
         id: "generate-merkle".into(),
         run: "merkle create".into(),
         description: Some("Create merkle hash trees for all publishable data files".into()),
-        after: vec!["generate-variables-json".into(), "generate-dataset-log-jsonl".into()],
+        after: vec!["generate-vvec-index".into()],
         per_profile: false,
         phase: 0,
         options: vec![
@@ -1910,7 +1952,7 @@ fn generate_yaml(
 ) -> String {
     let mut out = String::new();
 
-    out.push_str("# Copyright (c) nosqlbench contributors\n");
+    out.push_str("# Copyright (c) Jonathan Shook\n");
     out.push_str("# SPDX-License-Identifier: Apache-2.0\n\n");
 
     out.push_str(&format!("name: {}\n", args.name));
@@ -2892,7 +2934,7 @@ mod tests {
         // shuffle, extract-query, extract-base, count-base,
         // compute-knn, verify-knn, generate-dataset-json, generate-variables-json,
         // generate-dataset-log-jsonl, generate-merkle, generate-catalog
-        assert_eq!(steps.len(), 19, "steps: {:?}", steps.iter().map(|s| &s.id).collect::<Vec<_>>());
+        assert_eq!(steps.len(), 20, "steps: {:?}", steps.iter().map(|s| &s.id).collect::<Vec<_>>());
         let step_ids: Vec<&str> = steps.iter().map(|s| s.id.as_str()).collect();
         assert!(step_ids.contains(&"count-duplicates"), "should have count-duplicates");
         assert!(step_ids.contains(&"count-source-base"), "should have count-source-base");

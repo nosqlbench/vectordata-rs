@@ -1,4 +1,4 @@
-// Copyright (c) nosqlbench contributors
+// Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
 //! Pipeline command: evaluate PNode predicates against MNode metadata records
@@ -718,6 +718,18 @@ impl GenPredicateKeysOp {
                 for &ord in matches {
                     f.write_all(&ord.to_le_bytes()).unwrap_or(());
                 }
+            }
+        }
+
+        // Build offset index for variable-length output (vvec/ivvec)
+        let out_ext = output_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        if veks_core::formats::VecFormat::from_extension(out_ext)
+            .map(|f| f.is_vvec()).unwrap_or(false)
+            || out_ext == "ivec" || out_ext == "ivecs"
+        {
+            match vectordata::io::IndexedXvecReader::open_ivec(&output_path) {
+                Ok(r) => ctx.ui.log(&format!("  built offset index ({} records)", r.count())),
+                Err(e) => ctx.ui.log(&format!("  WARNING: failed to build offset index: {}", e)),
             }
         }
 

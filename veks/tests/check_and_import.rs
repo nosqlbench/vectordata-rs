@@ -1,4 +1,4 @@
-// Copyright (c) nosqlbench contributors
+// Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
 //! Comprehensive tests for `datasets import` and `veks check`.
@@ -1697,6 +1697,7 @@ fn import_full_pipeline_all_features() {
         "generate-dataset-json",
         "generate-variables-json",
         "generate-dataset-log-jsonl",
+        "generate-vvec-index",
         "generate-merkle",
         "generate-catalog",
     ];
@@ -1753,8 +1754,8 @@ fn import_full_pipeline_everything_disabled() {
     // count-base, compute-knn, verify-knn, generate-dataset-json,
     // generate-variables-json, generate-dataset-log-jsonl,
     // generate-merkle, generate-catalog = 17
-    assert_eq!(ids.len(), 17,
-        "minimal self-search pipeline should have 17 steps, got {}: {:?}", ids.len(), ids);
+    assert_eq!(ids.len(), 20,
+        "minimal self-search pipeline should have 20 steps, got {}: {:?}", ids.len(), ids);
 }
 
 #[test]
@@ -1821,7 +1822,7 @@ fn project_artifacts_every_registered_command_no_panic() {
         "analyze check-endian", "analyze compare-files", "analyze compute-info",
         "analyze describe", "analyze file", "analyze find",
         "analyze display-histogram", "analyze model-diff",
-        "analyze explain-predicates", "analyze select",
+        "analyze explain-predicates", "analyze explain-filtered-knn", "analyze select",
         "analyze slice", "analyze stats", "analyze survey", "analyze verify-knn",
         "analyze verify-profiles", "analyze zeros",
         // compute
@@ -1832,8 +1833,8 @@ fn project_artifacts_every_registered_command_no_panic() {
         "download bulk", "download huggingface",
         // generate
         "generate dataset", "generate derive", "generate from-model",
-        "generate predicated", "generate predicates", "generate shuffle",
-        "generate sketch", "generate vectors",
+        "generate predicates", "generate shuffle",
+        "generate sketch", "generate vectors", "generate vvec-index",
         // merkle
         "merkle create", "merkle diff", "merkle path", "merkle spoilbits",
         "merkle spoilchunks", "merkle summary", "merkle treeview", "merkle verify",

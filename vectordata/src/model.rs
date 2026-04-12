@@ -75,6 +75,7 @@ pub struct ProfileConfig {
     /// Metadata predicate trees (PNode-encoded slab).
     pub metadata_predicates: Option<FacetConfig>,
     /// Predicate result indices — ordinals matching metadata records for each predicate.
+    #[serde(alias = "metadata_indices")]
     pub predicate_results: Option<FacetConfig>,
     /// Metadata layout describing the field schema.
     pub metadata_layout: Option<FacetConfig>,

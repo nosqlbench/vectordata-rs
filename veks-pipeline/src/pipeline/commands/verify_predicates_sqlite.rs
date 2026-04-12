@@ -1,4 +1,4 @@
-// Copyright (c) nosqlbench contributors
+// Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
 //! Pipeline command: SQLite oracle verification for simple-int-eq predicates.
@@ -403,7 +403,7 @@ fn load_scalar_predicates(path: &Path, ext: &str, fields: usize) -> Result<Vec<V
         "u16" | "i16" => 2,
         "u32" | "i32" => 4,
         "u64" | "i64" => 8,
-        "ivec" | "ivecs" => 0,
+        "ivec" | "ivecs" | "ivvec" | "ivvecs" | "i32vvec" | "i32vvecs" => 0,
         _ => return Err(format!("unsupported predicate format: {}", ext)),
     };
 
@@ -450,27 +450,32 @@ fn load_scalar_predicates(path: &Path, ext: &str, fields: usize) -> Result<Vec<V
 
 /// Load predicate results (ivec of matching ordinals per predicate).
 fn load_results(path: &Path, ext: &str) -> Result<Vec<Vec<i32>>, String> {
-    let data = std::fs::read(path).map_err(|e| format!("read {}: {}", path.display(), e))?;
-    let mut results = Vec::new();
-
     match ext {
-        "ivec" | "ivecs" => {
-            let mut offset = 0;
-            while offset + 4 <= data.len() {
-                let dim = i32::from_le_bytes(data[offset..offset+4].try_into().unwrap()) as usize;
-                offset += 4;
-                if offset + dim * 4 > data.len() { break; }
-                let mut vals = Vec::with_capacity(dim);
-                for i in 0..dim {
-                    let fo = offset + i * 4;
-                    vals.push(i32::from_le_bytes(data[fo..fo+4].try_into().unwrap()));
-                }
-                results.push(vals);
-                offset += dim * 4;
+        "ivec" | "ivecs" | "ivvec" | "ivvecs" | "i32vvec" | "i32vvecs" => {
+            // Use IndexedXvecReader for both uniform and variable-length ivec
+            let reader = vectordata::io::IndexedXvecReader::open_ivec(path)
+                .map_err(|e| format!("{}: {}", path.display(), e))?;
+            let mut results = Vec::with_capacity(reader.count());
+            for i in 0..reader.count() {
+                results.push(reader.get_i32(i).map_err(|e| format!("record {}: {}", i, e))?);
             }
+            Ok(results)
         }
-        _ => return Err(format!("unsupported results format: {}", ext)),
+        "slab" => {
+            let reader = slabtastic::SlabReader::open(path)
+                .map_err(|e| format!("open slab {}: {}", path.display(), e))?;
+            let count = reader.total_records();
+            let mut results = Vec::with_capacity(count as usize);
+            for i in 0..count {
+                let data = reader.get(i as i64)
+                    .map_err(|e| format!("read slab record {}: {}", i, e))?;
+                let vals: Vec<i32> = data.chunks_exact(4)
+                    .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect();
+                results.push(vals);
+            }
+            Ok(results)
+        }
+        _ => Err(format!("unsupported results format: {}", ext)),
     }
-
-    Ok(results)
 }

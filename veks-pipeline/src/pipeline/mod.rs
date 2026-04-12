@@ -1,4 +1,4 @@
-// Copyright (c) nosqlbench contributors
+// Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
 //! Command stream pipeline framework for veks.
@@ -1353,13 +1353,12 @@ pub fn reset_pipeline(workspace: &Path, dataset_path: &Path, config: &DatasetCon
         println!("  removed {}", veks_core::paths::rel_display(&scratch_dir));
     }
 
-    // 4. Remove profiles/ directory entirely (all generated profile data)
+    // 4. Remove generated files in profiles/ but preserve Identity symlinks
+    //    (symlinks to source data created during bootstrap). These point to
+    //    files outside the workspace and must survive --clean.
     let profiles_dir = workspace.join("profiles");
     if profiles_dir.exists() {
-        match std::fs::remove_dir_all(&profiles_dir) {
-            Ok(()) => println!("  removed {}", veks_core::paths::rel_display(&profiles_dir)),
-            Err(e) => println!("  failed to remove {}: {}", veks_core::paths::rel_display(&profiles_dir), e),
-        }
+        clean_profiles_preserving_symlinks(&profiles_dir);
     }
 
     // 5. Remove generated facet files in the workspace root (classic layout).
@@ -1462,6 +1461,57 @@ fn clean_scratch_contents(scratch_dir: &Path) {
         } else {
             let _ = std::fs::remove_file(&path);
         }
+    }
+}
+
+/// Remove generated files in profiles/ but preserve symlinks to source data.
+///
+/// Identity symlinks (created by bootstrap's `create_identity_symlinks`) point
+/// to source files outside the pipeline's control. Removing them during --clean
+/// would break subsequent runs that depend on the symlinked data.
+fn clean_profiles_preserving_symlinks(profiles_dir: &Path) {
+    let entries = match std::fs::read_dir(profiles_dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            // Recurse into profile subdirs (e.g., profiles/base/, profiles/default/)
+            clean_profile_dir(&path);
+            // Remove dir if empty after cleaning
+            let _ = std::fs::remove_dir(&path);
+        } else if !path.is_symlink() {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+    // Remove profiles/ itself if empty
+    let _ = std::fs::remove_dir(profiles_dir);
+}
+
+/// Remove non-symlink files from a profile directory, preserving symlinks.
+fn clean_profile_dir(dir: &Path) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    let mut removed = 0;
+    let mut kept = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_symlink() {
+            kept += 1; // preserve Identity symlinks
+        } else if path.is_dir() {
+            let _ = std::fs::remove_dir_all(&path);
+            removed += 1;
+        } else {
+            let _ = std::fs::remove_file(&path);
+            removed += 1;
+        }
+    }
+    if removed > 0 || kept > 0 {
+        println!("  cleaned {} ({} files removed, {} symlinks preserved)",
+            veks_core::paths::rel_display(dir), removed, kept);
     }
 }
 

@@ -1,4 +1,4 @@
-<!-- Copyright (c) nosqlbench contributors -->
+<!-- Copyright (c) Jonathan Shook -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
 # 19 — Zero Vector Detection and L2-Norm Pipeline Integration

@@ -1,4 +1,4 @@
-// Copyright (c) nosqlbench contributors
+// Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
 //! Shared element type enum for vector and scalar file formats.
@@ -47,17 +47,17 @@ impl ElementType {
             .ok_or_else(|| format!("no file extension: {}", path.display()))?;
 
         match ext.to_lowercase().as_str() {
-            "dvec" | "dvecs" => Ok(Self::F64),
-            "fvec" | "fvecs" => Ok(Self::F32),
-            "mvec" | "mvecs" => Ok(Self::F16),
-            "bvec" | "bvecs" | "u8vec" | "u8vecs" | "u8" => Ok(Self::U8),
-            "i8vec" | "i8vecs" | "i8" => Ok(Self::I8),
-            "u16vec" | "u16vecs" | "u16" => Ok(Self::U16),
-            "svec" | "svecs" | "i16vec" | "i16vecs" | "i16" => Ok(Self::I16),
-            "u32vec" | "u32vecs" | "u32" => Ok(Self::U32),
-            "ivec" | "ivecs" | "i32vec" | "i32vecs" | "i32" => Ok(Self::I32),
-            "u64vec" | "u64vecs" | "u64" => Ok(Self::U64),
-            "i64vec" | "i64vecs" | "i64" => Ok(Self::I64),
+            "dvec" | "dvecs" | "dvvec" | "dvvecs" | "f64vec" | "f64vecs" | "f64vvec" | "f64vvecs" => Ok(Self::F64),
+            "fvec" | "fvecs" | "fvvec" | "fvvecs" | "f32vec" | "f32vecs" | "f32vvec" | "f32vvecs" => Ok(Self::F32),
+            "mvec" | "mvecs" | "mvvec" | "mvvecs" | "f16vec" | "f16vecs" | "f16vvec" | "f16vvecs" => Ok(Self::F16),
+            "bvec" | "bvecs" | "bvvec" | "bvvecs" | "u8vec" | "u8vecs" | "u8vvec" | "u8vvecs" | "u8" => Ok(Self::U8),
+            "i8vec" | "i8vecs" | "i8vvec" | "i8vvecs" | "i8" => Ok(Self::I8),
+            "u16vec" | "u16vecs" | "u16vvec" | "u16vvecs" | "u16" => Ok(Self::U16),
+            "svec" | "svecs" | "svvec" | "svvecs" | "i16vec" | "i16vecs" | "i16vvec" | "i16vvecs" | "i16" => Ok(Self::I16),
+            "u32vec" | "u32vecs" | "u32vvec" | "u32vvecs" | "u32" => Ok(Self::U32),
+            "ivec" | "ivecs" | "ivvec" | "ivvecs" | "i32vec" | "i32vecs" | "i32vvec" | "i32vvecs" | "i32" => Ok(Self::I32),
+            "u64vec" | "u64vecs" | "u64vvec" | "u64vvecs" | "u64" => Ok(Self::U64),
+            "i64vec" | "i64vecs" | "i64vvec" | "i64vvecs" | "i64" => Ok(Self::I64),
             _ => Err(format!("unrecognized vector extension '.{}': {}", ext, path.display())),
         }
     }

@@ -1,4 +1,4 @@
-// Copyright (c) nosqlbench contributors
+// Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
 //! Pipeline command: select and display a single vector by ordinal.
@@ -91,7 +91,7 @@ impl CommandOp for AnalyzeSelectOp {
         };
 
         // Open reader and extract (count, dim, get_f64_fn) based on element type.
-        let (count, dim, get_f64): (usize, usize, Box<dyn Fn(usize) -> Vec<f64> + Sync>) = match etype {
+        let (count, _dim, get_f64): (usize, usize, Box<dyn Fn(usize) -> Vec<f64> + Sync>) = match etype {
             ElementType::F32 => {
                 let r = match MmapVectorReader::<f32>::open_fvec(&input_path) {
                     Ok(r) => r, Err(e) => return error_result(format!("open: {}", e), start),
@@ -117,12 +117,26 @@ impl CommandOp for AnalyzeSelectOp {
                 (fc, d, Box::new(move |i| r.get(i).unwrap_or_default()))
             }
             ElementType::I32 => {
-                let r = match MmapVectorReader::<i32>::open_ivec(&input_path) {
-                    Ok(r) => r, Err(e) => return error_result(format!("open: {}", e), start),
-                };
-                let fc = VectorReader::<i32>::count(&r);
-                let d = VectorReader::<i32>::dim(&r);
-                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
+                match MmapVectorReader::<i32>::open_ivec(&input_path) {
+                    Ok(r) => {
+                        // Uniform-dimension ivec
+                        let fc = VectorReader::<i32>::count(&r);
+                        let d = VectorReader::<i32>::dim(&r);
+                        (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
+                    }
+                    Err(vectordata::io::IoError::VariableLengthRecords(_)) => {
+                        // Variable-length ivec — use indexed reader
+                        let r = match vectordata::io::IndexedXvecReader::open_ivec(&input_path) {
+                            Ok(r) => r,
+                            Err(e) => return error_result(format!("open indexed ivec: {}", e), start),
+                        };
+                        let rc = r.count();
+                        (rc, 0, Box::new(move |i: usize| {
+                            r.get_i32(i).unwrap_or_default().iter().map(|&v| v as f64).collect()
+                        }) as Box<dyn Fn(usize) -> Vec<f64> + Sync>)
+                    }
+                    Err(e) => return error_result(format!("open: {}", e), start),
+                }
             }
             ElementType::I16 => {
                 let r = match MmapVectorReader::<i16>::open_svec(&input_path) {
@@ -177,21 +191,15 @@ impl CommandOp for AnalyzeSelectOp {
             return error_result("no ordinals in range".into(), start);
         }
 
-        let type_name = format!("{}[{}]", etype, dim);
-        let is_integer = matches!(etype, ElementType::I32 | ElementType::I16 | ElementType::U8 | ElementType::I8);
+        let is_integer = matches!(etype, ElementType::I32 | ElementType::I16 | ElementType::U8 | ElementType::I8
+            | ElementType::U16 | ElementType::U32 | ElementType::U64 | ElementType::I64);
 
         for &ordinal in &ordinals {
             let vec = get_f64(ordinal);
-            if format == "json" {
-                let output = format_vector(&type_name, &vec, format, ordinal, is_integer);
-                ctx.ui.log(&output);
-            } else if format == "csv" {
-                let output = format_vector(&type_name, &vec, format, ordinal, is_integer);
-                ctx.ui.log(&output);
-            } else {
-                let output = format_vector(&type_name, &vec, format, ordinal, is_integer);
-                ctx.ui.log(&output);
-            }
+            // Use actual record length for type label (matters for variable-length)
+            let type_name = format!("{}[{}]", etype, vec.len());
+            let output = format_vector(&type_name, &vec, format, ordinal, is_integer);
+            ctx.ui.log(&output);
         }
 
         CommandResult {

@@ -1,4 +1,4 @@
-// Copyright (c) nosqlbench contributors
+// Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
 //! End-to-end pipeline execution tests.
@@ -1537,3 +1537,9 @@ fn e2e_source_zero_count_through_duplicates() {
             "duplicate_zero_count should be >= 4, got {}", dup_zc);
     }
 }
+
+// The full BQGDMPRF e2e test is now the synthetic-1k fixture in
+// vectordata/tests/http_access.rs — a self-contained dataset.yaml
+// pipeline that generates all facets from scratch and is tested
+// behind an HTTP server with the unified vectordata API.
+

@@ -1,4 +1,4 @@
-// Copyright (c) nosqlbench contributors
+// Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
 //! Pipeline wrapper for the analyze describe operation.
@@ -155,6 +155,50 @@ element type does this dataset use?"
             message.push_str(&format!("\nFile size:   {}", format_bytes(size)));
         }
 
+        // For xvec formats, report whether records are uniform or variable length
+        if format.is_xvec() {
+            if let Some(size) = file_size {
+                let stride = record_bytes as u64;
+                if stride > 0 && size % stride == 0 {
+                    let count = size / stride;
+                    message.push_str(&format!(
+                        "\nStructure:   uniform (all records dim={}, {} records)", meta.dimension, count));
+                } else {
+                    message.push_str("\nStructure:   variable-length (records have different dimensions)");
+                }
+            }
+        }
+
+        // --scan: walk all records and build a histogram of record lengths
+        let do_scan = options.get("scan").map(|s| s != "false").unwrap_or(false);
+        if do_scan && format.is_xvec() {
+            if let Some(size) = file_size {
+                match scan_xvec_records(&source_path, format, size, ctx) {
+                    Ok(scan) => {
+                        message.push_str(&format!("\n\n── Record length scan ({} records) ──", scan.total_records));
+                        if scan.distinct_dims.len() == 1 {
+                            message.push_str(&format!("\n  All records: dim={}", scan.distinct_dims[0].0));
+                        } else {
+                            message.push_str(&format!("\n  {} distinct dimensions:", scan.distinct_dims.len()));
+                            message.push_str(&format!("\n  {:>10}  {:>10}  {:>8}", "dim", "count", "pct"));
+                            message.push_str(&format!("\n  {:>10}  {:>10}  {:>8}", "───", "─────", "───"));
+                            for (dim, count) in &scan.distinct_dims {
+                                let pct = 100.0 * *count as f64 / scan.total_records.max(1) as f64;
+                                message.push_str(&format!("\n  {:>10}  {:>10}  {:>7.2}%", dim, count, pct));
+                            }
+                            message.push_str(&format!("\n  min dim: {}  max dim: {}  median dim: {}",
+                                scan.min_dim, scan.max_dim, scan.median_dim));
+                            message.push_str(&format!("\n  mean dim: {:.1}  stddev: {:.1}",
+                                scan.mean_dim, scan.stddev_dim));
+                        }
+                    }
+                    Err(e) => {
+                        message.push_str(&format!("\n  scan error: {}", e));
+                    }
+                }
+            }
+        }
+
         CommandResult {
             status: Status::Ok,
             message,
@@ -179,8 +223,16 @@ element type does this dataset use?"
                 required: false,
                 default: None,
                 description: "Format override (auto-detected if omitted)".to_string(),
-                        role: OptionRole::Config,
-        },
+                role: OptionRole::Config,
+            },
+            OptionDesc {
+                name: "scan".to_string(),
+                type_name: "bool".to_string(),
+                required: false,
+                default: Some("false".to_string()),
+                description: "Scan all records to build a dimension histogram (xvec only)".to_string(),
+                role: OptionRole::Config,
+            },
         ]
     }
 }
@@ -223,6 +275,102 @@ fn format_count(n: u64) -> String {
     } else {
         format!("{}", n)
     }
+}
+
+struct ScanResult {
+    total_records: u64,
+    distinct_dims: Vec<(i32, u64)>,  // (dim, count) sorted by count descending
+    min_dim: i32,
+    max_dim: i32,
+    median_dim: i32,
+    mean_dim: f64,
+    stddev_dim: f64,
+}
+
+/// Walk all records in an xvec file, counting dimensions.
+fn scan_xvec_records(
+    path: &Path,
+    format: VecFormat,
+    file_size: u64,
+    ctx: &mut StreamContext,
+) -> Result<ScanResult, String> {
+    use std::collections::HashMap;
+    use std::io::{Read, Seek, SeekFrom};
+
+    let elem_size = format.element_size() as u64;
+    let mut f = std::fs::File::open(path)
+        .map_err(|e| format!("open: {}", e))?;
+    let mut dim_buf = [0u8; 4];
+
+    let mut dim_counts: HashMap<i32, u64> = HashMap::new();
+    let mut all_dims: Vec<i32> = Vec::new();
+    let mut offset: u64 = 0;
+    let mut record_idx: u64 = 0;
+
+    // Progress bar
+    let pb = ctx.ui.bar(file_size, "scanning records");
+
+    loop {
+        if offset >= file_size { break; }
+        if offset + 4 > file_size {
+            return Err(format!("truncated dim header at offset {}", offset));
+        }
+
+        f.seek(SeekFrom::Start(offset))
+            .map_err(|e| format!("seek record {}: {}", record_idx, e))?;
+        f.read_exact(&mut dim_buf)
+            .map_err(|e| format!("read dim record {}: {}", record_idx, e))?;
+        let dim = i32::from_le_bytes(dim_buf);
+
+        if dim <= 0 {
+            return Err(format!("invalid dim {} at record {} (offset {})", dim, record_idx, offset));
+        }
+
+        let record_size = 4 + dim as u64 * elem_size;
+        if offset + record_size > file_size {
+            return Err(format!("record {} truncated at offset {}", record_idx, offset));
+        }
+
+        *dim_counts.entry(dim).or_insert(0) += 1;
+        all_dims.push(dim);
+
+        offset += record_size;
+        record_idx += 1;
+
+        if record_idx % 10_000 == 0 {
+            pb.set_position(offset);
+        }
+    }
+    pb.finish();
+
+    if all_dims.is_empty() {
+        return Ok(ScanResult {
+            total_records: 0,
+            distinct_dims: vec![],
+            min_dim: 0, max_dim: 0, median_dim: 0,
+            mean_dim: 0.0, stddev_dim: 0.0,
+        });
+    }
+
+    all_dims.sort_unstable();
+    let min_dim = all_dims[0];
+    let max_dim = *all_dims.last().unwrap();
+    let median_dim = all_dims[all_dims.len() / 2];
+    let mean_dim = all_dims.iter().map(|&d| d as f64).sum::<f64>() / all_dims.len() as f64;
+    let variance = all_dims.iter()
+        .map(|&d| { let diff = d as f64 - mean_dim; diff * diff })
+        .sum::<f64>() / all_dims.len() as f64;
+    let stddev_dim = variance.sqrt();
+
+    let mut distinct: Vec<(i32, u64)> = dim_counts.into_iter().collect();
+    distinct.sort_by(|a, b| b.1.cmp(&a.1)); // sort by count descending
+
+    Ok(ScanResult {
+        total_records: record_idx,
+        distinct_dims: distinct,
+        min_dim, max_dim, median_dim,
+        mean_dim, stddev_dim,
+    })
 }
 
 fn format_bytes(bytes: u64) -> String {

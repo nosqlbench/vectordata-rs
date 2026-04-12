@@ -1,4 +1,4 @@
-// Copyright (c) nosqlbench contributors
+// Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
 //! Vector data format support.
@@ -78,6 +78,32 @@ pub enum VecFormat {
     /// xvec uint64 (8 bytes/element). Extension: `.u64vec`
     U64vec,
 
+    // ── Variable-length vector formats (vvec) ──────────────────────
+    // Same per-record layout as xvec but records may have different
+    // dimensions. Random access requires an offset index (IDXFOR__).
+    /// vvec float32 (4 bytes/element). Extension: `.fvvec` or `.f32vvec`
+    Fvvec,
+    /// vvec float64 (8 bytes/element). Extension: `.dvvec` or `.f64vvec`
+    Dvvec,
+    /// vvec float16 (2 bytes/element). Extension: `.mvvec` or `.f16vvec`
+    Mvvec,
+    /// vvec uint8 (1 byte/element). Extension: `.bvvec` or `.u8vvec`
+    Bvvec,
+    /// vvec int8 (1 byte/element). Extension: `.i8vvec`
+    I8vvec,
+    /// vvec int16 (2 bytes/element). Extension: `.svvec` or `.i16vvec`
+    Svvec,
+    /// vvec uint16 (2 bytes/element). Extension: `.u16vvec`
+    U16vvec,
+    /// vvec int32 (4 bytes/element). Extension: `.ivvec` or `.i32vvec`
+    Ivvec,
+    /// vvec uint32 (4 bytes/element). Extension: `.u32vvec`
+    U32vvec,
+    /// vvec int64 (8 bytes/element). Extension: `.i64vvec`
+    I64vvec,
+    /// vvec uint64 (8 bytes/element). Extension: `.u64vvec`
+    U64vvec,
+
     // ── Scalar formats (flat packed, no header) ───────────────────
     /// Scalar uint8 (1 byte/element). Extension: `.u8`
     ScalarU8,
@@ -116,6 +142,17 @@ impl VecFormat {
             Self::U32vec => "u32vec",
             Self::I64vec => "i64vec",
             Self::U64vec => "u64vec",
+            Self::Fvvec => "fvvec",
+            Self::Dvvec => "dvvec",
+            Self::Mvvec => "mvvec",
+            Self::Bvvec => "bvvec",
+            Self::I8vvec => "i8vvec",
+            Self::Svvec => "svvec",
+            Self::U16vvec => "u16vvec",
+            Self::Ivvec => "ivvec",
+            Self::U32vvec => "u32vvec",
+            Self::I64vvec => "i64vvec",
+            Self::U64vvec => "u64vvec",
             Self::ScalarU8 => "u8",
             Self::ScalarI8 => "i8",
             Self::ScalarU16 => "u16",
@@ -128,13 +165,30 @@ impl VecFormat {
     }
 
     /// True for the xvec family (vector formats with `[dim:i32, data...]` header).
+    /// Includes both uniform (`vec`) and variable-length (`vvec`) formats.
     pub fn is_xvec(self) -> bool {
+        self.is_uniform_xvec() || self.is_vvec()
+    }
+
+    /// True for uniform xvec (all records have the same dimension).
+    pub fn is_uniform_xvec(self) -> bool {
         matches!(self,
             Self::Fvec | Self::Dvec | Self::Mvec |
             Self::Bvec | Self::I8vec |
             Self::Svec | Self::U16vec |
             Self::Ivec | Self::U32vec |
             Self::I64vec | Self::U64vec
+        )
+    }
+
+    /// True for variable-length vector formats (per-record dimension).
+    pub fn is_vvec(self) -> bool {
+        matches!(self,
+            Self::Fvvec | Self::Dvvec | Self::Mvvec |
+            Self::Bvvec | Self::I8vvec |
+            Self::Svvec | Self::U16vvec |
+            Self::Ivvec | Self::U32vvec |
+            Self::I64vvec | Self::U64vvec
         )
     }
 
@@ -148,11 +202,13 @@ impl VecFormat {
         )
     }
 
-    /// True for integer element types (scalar or vector).
+    /// True for integer element types (scalar, uniform, or variable vector).
     pub fn is_integer(self) -> bool {
         matches!(self,
             Self::Bvec | Self::I8vec | Self::Svec | Self::U16vec |
             Self::Ivec | Self::U32vec | Self::I64vec | Self::U64vec |
+            Self::Bvvec | Self::I8vvec | Self::Svvec | Self::U16vvec |
+            Self::Ivvec | Self::U32vvec | Self::I64vvec | Self::U64vvec |
             Self::ScalarU8 | Self::ScalarI8 | Self::ScalarU16 | Self::ScalarI16 |
             Self::ScalarU32 | Self::ScalarI32 | Self::ScalarU64 | Self::ScalarI64
         )
@@ -161,10 +217,14 @@ impl VecFormat {
     /// Bytes per element. Returns `0` for container formats.
     pub fn element_size(self) -> usize {
         match self {
-            Self::Bvec | Self::I8vec | Self::ScalarU8 | Self::ScalarI8 => 1,
-            Self::Mvec | Self::Svec | Self::U16vec | Self::ScalarU16 | Self::ScalarI16 => 2,
-            Self::Fvec | Self::Ivec | Self::U32vec | Self::ScalarU32 | Self::ScalarI32 => 4,
-            Self::Dvec | Self::I64vec | Self::U64vec | Self::ScalarU64 | Self::ScalarI64 => 8,
+            Self::Bvec | Self::I8vec | Self::Bvvec | Self::I8vvec |
+                Self::ScalarU8 | Self::ScalarI8 => 1,
+            Self::Mvec | Self::Svec | Self::U16vec | Self::Mvvec | Self::Svvec | Self::U16vvec |
+                Self::ScalarU16 | Self::ScalarI16 => 2,
+            Self::Fvec | Self::Ivec | Self::U32vec | Self::Fvvec | Self::Ivvec | Self::U32vvec |
+                Self::ScalarU32 | Self::ScalarI32 => 4,
+            Self::Dvec | Self::I64vec | Self::U64vec | Self::Dvvec | Self::I64vvec | Self::U64vvec |
+                Self::ScalarU64 | Self::ScalarI64 => 8,
             Self::Npy | Self::Parquet | Self::Slab | Self::Hdf5 => 0,
         }
     }
@@ -199,6 +259,18 @@ impl VecFormat {
             "i32vec" | "i32vecs" => Some(Self::Ivec),
             "i64vec" | "i64vecs" => Some(Self::I64vec),
             "u64vec" | "u64vecs" => Some(Self::U64vec),
+            // Variable-length vector (vvec)
+            "fvvec" | "fvvecs" | "f32vvec" | "f32vvecs" => Some(Self::Fvvec),
+            "dvvec" | "dvvecs" | "f64vvec" | "f64vvecs" => Some(Self::Dvvec),
+            "mvvec" | "mvvecs" | "f16vvec" | "f16vvecs" => Some(Self::Mvvec),
+            "bvvec" | "bvvecs" | "u8vvec" | "u8vvecs" => Some(Self::Bvvec),
+            "i8vvec" | "i8vvecs" => Some(Self::I8vvec),
+            "svvec" | "svvecs" | "i16vvec" | "i16vvecs" => Some(Self::Svvec),
+            "u16vvec" | "u16vvecs" => Some(Self::U16vvec),
+            "ivvec" | "ivvecs" | "i32vvec" | "i32vvecs" => Some(Self::Ivvec),
+            "u32vvec" | "u32vvecs" => Some(Self::U32vvec),
+            "i64vvec" | "i64vvecs" => Some(Self::I64vvec),
+            "u64vvec" | "u64vvecs" => Some(Self::U64vvec),
             // Scalar (flat packed)
             "u8" => Some(Self::ScalarU8),
             "i8" => Some(Self::ScalarI8),
@@ -273,7 +345,9 @@ impl VecFormat {
     /// For xvec: `records × (4 + dimension × element_size)`.
     /// For scalar: `records × element_size`.
     pub fn expected_file_size(self, record_count: u64, dimension: u32) -> Option<u64> {
-        if self.is_xvec() {
+        if self.is_vvec() {
+            None // Variable-length — cannot predict size from count + dim
+        } else if self.is_uniform_xvec() {
             let stride = 4u64 + (dimension as u64) * (self.element_size() as u64);
             Some(record_count * stride)
         } else if self.is_scalar() {
@@ -286,17 +360,17 @@ impl VecFormat {
     /// Human-readable data type name.
     pub fn data_type_name(self) -> &'static str {
         match self {
-            Self::Fvec => "float32",
-            Self::Dvec => "float64",
-            Self::Mvec => "float16",
-            Self::Bvec | Self::ScalarU8 => "uint8",
-            Self::I8vec | Self::ScalarI8 => "int8",
-            Self::U16vec | Self::ScalarU16 => "uint16",
-            Self::Svec | Self::ScalarI16 => "int16",
-            Self::U32vec | Self::ScalarU32 => "uint32",
-            Self::Ivec | Self::ScalarI32 => "int32",
-            Self::U64vec | Self::ScalarU64 => "uint64",
-            Self::I64vec | Self::ScalarI64 => "int64",
+            Self::Fvec | Self::Fvvec => "float32",
+            Self::Dvec | Self::Dvvec => "float64",
+            Self::Mvec | Self::Mvvec => "float16",
+            Self::Bvec | Self::Bvvec | Self::ScalarU8 => "uint8",
+            Self::I8vec | Self::I8vvec | Self::ScalarI8 => "int8",
+            Self::U16vec | Self::U16vvec | Self::ScalarU16 => "uint16",
+            Self::Svec | Self::Svvec | Self::ScalarI16 => "int16",
+            Self::U32vec | Self::U32vvec | Self::ScalarU32 => "uint32",
+            Self::Ivec | Self::Ivvec | Self::ScalarI32 => "int32",
+            Self::U64vec | Self::U64vvec | Self::ScalarU64 => "uint64",
+            Self::I64vec | Self::I64vvec | Self::ScalarI64 => "int64",
             Self::Slab => "bytes",
             Self::Npy | Self::Parquet | Self::Hdf5 => "float",
         }

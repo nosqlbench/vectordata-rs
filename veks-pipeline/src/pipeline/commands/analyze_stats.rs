@@ -1,4 +1,4 @@
-// Copyright (c) nosqlbench contributors
+// Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
 //! Pipeline command: compute statistics for vector dimensions.
@@ -237,12 +237,23 @@ impl CommandOp for AnalyzeStatsOp {
                 (fc, d, Box::new(move |i| r.get(i).unwrap_or_default()))
             }
             ElementType::I32 => {
-                let r = match MmapVectorReader::<i32>::open_ivec(&source_path) {
-                    Ok(r) => r, Err(e) => return error_result(format!("open: {}", e), start),
-                };
-                let fc = VectorReader::<i32>::count(&r);
-                let d = VectorReader::<i32>::dim(&r);
-                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
+                match MmapVectorReader::<i32>::open_ivec(&source_path) {
+                    Ok(r) => {
+                        let fc = VectorReader::<i32>::count(&r);
+                        let d = VectorReader::<i32>::dim(&r);
+                        (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
+                    }
+                    Err(vectordata::io::IoError::VariableLengthRecords(_)) => {
+                        let r = match vectordata::io::IndexedXvecReader::open_ivec(&source_path) {
+                            Ok(r) => r, Err(e) => return error_result(format!("open indexed ivec: {}", e), start),
+                        };
+                        let rc = r.count();
+                        (rc, 0, Box::new(move |i: usize| {
+                            r.get_i32(i).unwrap_or_default().iter().map(|&v| v as f64).collect()
+                        }) as Box<dyn Fn(usize) -> Vec<f64> + Sync>)
+                    }
+                    Err(e) => return error_result(format!("open: {}", e), start),
+                }
             }
             ElementType::I16 => {
                 let r = match MmapVectorReader::<i16>::open_svec(&source_path) {
@@ -269,12 +280,23 @@ impl CommandOp for AnalyzeStatsOp {
                 (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
             }
             ElementType::U32 => {
-                let r = match MmapVectorReader::<i32>::open_ivec(&source_path) {
-                    Ok(r) => r, Err(e) => return error_result(format!("open: {}", e), start),
-                };
-                let fc = VectorReader::<i32>::count(&r);
-                let d = VectorReader::<i32>::dim(&r);
-                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
+                match MmapVectorReader::<i32>::open_ivec(&source_path) {
+                    Ok(r) => {
+                        let fc = VectorReader::<i32>::count(&r);
+                        let d = VectorReader::<i32>::dim(&r);
+                        (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
+                    }
+                    Err(vectordata::io::IoError::VariableLengthRecords(_)) => {
+                        let r = match vectordata::io::IndexedXvecReader::open_ivec(&source_path) {
+                            Ok(r) => r, Err(e) => return error_result(format!("open indexed ivec: {}", e), start),
+                        };
+                        let rc = r.count();
+                        (rc, 0, Box::new(move |i: usize| {
+                            r.get_i32(i).unwrap_or_default().iter().map(|&v| v as f64).collect()
+                        }) as Box<dyn Fn(usize) -> Vec<f64> + Sync>)
+                    }
+                    Err(e) => return error_result(format!("open: {}", e), start),
+                }
             }
             ElementType::U64 | ElementType::I64 => {
                 let r = match MmapVectorReader::<f64>::open_dvec(&source_path) {

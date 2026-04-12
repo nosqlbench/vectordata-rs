@@ -1,4 +1,4 @@
-// Copyright (c) nosqlbench contributors
+// Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
 //! Pipeline command: inspect predicate ↔ metadata relationships.
@@ -90,6 +90,9 @@ in predicate synthesis, metadata indexing, or query execution.
 
 ## Notes
 
+- When run in a directory with `dataset.yaml`, the predicates, metadata,
+  and metadata-indices paths are auto-resolved from the profile views.
+  Use `--profile` to select a non-default profile.
 - The ordinal indexes into the predicates file (and the corresponding
   metadata-indices record at the same ordinal).
 - Use `limit` to cap the number of matching metadata records shown.
@@ -109,17 +112,49 @@ in predicate synthesis, metadata indexing, or query execution.
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
         let start = Instant::now();
 
-        let predicates_str = match options.require("predicates") {
-            Ok(s) => s,
-            Err(e) => return error_result(e, start),
-        };
-        let metadata_str = match options.require("metadata") {
-            Ok(s) => s,
-            Err(e) => return error_result(e, start),
-        };
-        let keys_str = match options.require("metadata-indices") {
-            Ok(s) => s,
-            Err(e) => return error_result(e, start),
+        let profile_name = options.get("profile").unwrap_or("default");
+
+        // Try explicit options first; fall back to dataset.yaml profile views
+        let (predicates_str, metadata_str, keys_str) = match (
+            options.get("predicates"),
+            options.get("metadata"),
+            options.get("metadata-indices"),
+        ) {
+            (Some(p), Some(m), Some(k)) => (p.to_string(), m.to_string(), k.to_string()),
+            _ => {
+                // Load dataset.yaml and resolve from profile
+                let ds_path = ctx.workspace.join("dataset.yaml");
+                let config = match vectordata::dataset::DatasetConfig::load(&ds_path) {
+                    Ok(c) => c,
+                    Err(e) => return error_result(
+                        format!("no explicit paths and no dataset.yaml found: {}", e), start),
+                };
+                let profile = match config.profiles.profiles.get(profile_name) {
+                    Some(p) => p,
+                    None => return error_result(
+                        format!("profile '{}' not found in dataset.yaml", profile_name), start),
+                };
+                let resolve = |facet: &str, explicit: Option<&str>| -> Result<String, String> {
+                    if let Some(s) = explicit {
+                        return Ok(s.to_string());
+                    }
+                    profile.view(facet)
+                        .map(|v| v.path().to_string())
+                        .ok_or_else(|| format!("facet '{}' not found in profile '{}'", facet, profile_name))
+                };
+                let p = match resolve("metadata_predicates", options.get("predicates")) {
+                    Ok(s) => s, Err(e) => return error_result(e, start),
+                };
+                let m = match resolve("metadata_content", options.get("metadata")) {
+                    Ok(s) => s, Err(e) => return error_result(e, start),
+                };
+                let k = match resolve("metadata_indices", options.get("metadata-indices")) {
+                    Ok(s) => s, Err(e) => return error_result(e, start),
+                };
+                ctx.ui.log(&format!("  resolved from profile '{}': predicates={} metadata={} indices={}",
+                    profile_name, p, m, k));
+                (p, m, k)
+            }
         };
         let ordinal: usize = match options.require("ordinal") {
             Ok(s) => match s.parse() {
@@ -141,9 +176,9 @@ in predicate synthesis, metadata indexing, or query execution.
             .and_then(|s| s.parse().ok())
             .unwrap_or(20);
 
-        let predicates_path = resolve_path(predicates_str, &ctx.workspace);
-        let metadata_path = resolve_path(metadata_str, &ctx.workspace);
-        let keys_path = resolve_path(keys_str, &ctx.workspace);
+        let predicates_path = resolve_path(&predicates_str, &ctx.workspace);
+        let metadata_path = resolve_path(&metadata_str, &ctx.workspace);
+        let keys_path = resolve_path(&keys_str, &ctx.workspace);
 
         let pred_ext = file_ext(&predicates_path);
         let meta_ext = file_ext(&metadata_path);
@@ -201,10 +236,38 @@ in predicate synthesis, metadata indexing, or query execution.
             }
         }
 
+        // Determine total metadata record count for selectivity
+        let total_metadata = if meta_ext == "slab" {
+            SlabReader::open(&metadata_path)
+                .map(|r| r.total_records() as usize)
+                .unwrap_or(0)
+        } else {
+            // Scalar: file_size / element_size
+            let elem_size = match meta_ext.as_str() {
+                "u8" | "i8" => 1usize,
+                "u16" | "i16" => 2,
+                "u32" | "i32" => 4,
+                "u64" | "i64" => 8,
+                _ => 0,
+            };
+            if elem_size > 0 {
+                std::fs::metadata(&metadata_path)
+                    .map(|m| m.len() as usize / elem_size)
+                    .unwrap_or(0)
+            } else { 0 }
+        };
+
+        let selectivity = if total_metadata > 0 {
+            matching_ordinals.len() as f64 / total_metadata as f64
+        } else { 0.0 };
+
         ctx.ui.log(&format!(
-            "\n── matching metadata: {} record{} ──────────────────────────",
+            "\n── matching metadata: {} of {} record{} (selectivity {:.4} = {:.2}%) ──",
             matching_ordinals.len(),
+            total_metadata,
             if matching_ordinals.len() == 1 { "" } else { "s" },
+            selectivity,
+            selectivity * 100.0,
         ));
 
         // Render matching metadata records
@@ -279,9 +342,10 @@ in predicate synthesis, metadata indexing, or query execution.
 
     fn describe_options(&self) -> Vec<OptionDesc> {
         vec![
-            opt("predicates", "Path", true, None, "Predicates file (slab or scalar format)", OptionRole::Input),
-            opt("metadata", "Path", true, None, "Metadata file (slab or scalar format)", OptionRole::Input),
-            opt("metadata-indices", "Path", true, None, "Predicate-keys file (slab or ivec)", OptionRole::Input),
+            opt("predicates", "Path", false, None, "Predicates file (auto-resolved from dataset.yaml if omitted)", OptionRole::Input),
+            opt("metadata", "Path", false, None, "Metadata file (auto-resolved from dataset.yaml if omitted)", OptionRole::Input),
+            opt("metadata-indices", "Path", false, None, "Predicate-keys file (auto-resolved from dataset.yaml if omitted)", OptionRole::Input),
+            opt("profile", "string", false, Some("default"), "Profile to resolve facets from", OptionRole::Config),
             opt("ordinal", "int", true, None, "Predicate ordinal to inspect", OptionRole::Config),
             opt("vernacular", "enum", false, Some("readout"), "Rendering format (slab only): json, yaml, sql, cql, cddl, readout, display", OptionRole::Config),
             opt("limit", "int", false, Some("20"), "Max matching metadata records to display", OptionRole::Config),

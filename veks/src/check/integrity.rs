@@ -1,4 +1,4 @@
-// Copyright (c) nosqlbench contributors
+// Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
 //! File integrity check.
@@ -101,10 +101,9 @@ fn check_xvec(path: &Path, format: VecFormat) -> Result<(), String> {
         ));
     }
 
-    // For ivec format, records may have variable dimensions (e.g. predicate
-    // result indices where each predicate matches a different number of
-    // ordinals). Skip the stride divisibility check for ivec.
-    if format == VecFormat::Ivec {
+    // For vvec formats (and legacy ivec which may also be variable-length),
+    // records may have different dimensions. Skip stride validation.
+    if format.is_vvec() || format == VecFormat::Ivec {
         return Ok(());
     }
 

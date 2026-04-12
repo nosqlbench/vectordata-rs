@@ -1,4 +1,4 @@
-// Copyright (c) nosqlbench contributors
+// Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
 //! Profile views for accessing dataset components.
@@ -11,7 +11,7 @@
 //! describing available facets without materializing data.
 
 use crate::group::DataSource;
-use crate::io::{HttpVectorReader, MmapVectorReader, VectorReader};
+use crate::io::{self, VectorReader, VvecReader, VvecElement, OpenableElement};
 use crate::model::{FacetConfig, ProfileConfig};
 use crate::{Error, Result};
 use crate::dataset::facet::StandardFacet;
@@ -78,7 +78,7 @@ pub trait TestDataView: Send + Sync {
     /// Returns a reader for the filtered neighbor distances.
     fn filtered_neighbor_distances(&self) -> Result<Arc<dyn VectorReader<f32>>>;
 
-    // -- Metadata facets (config access) --
+    // -- Metadata facets --
 
     /// Returns the facet config for metadata content, if present.
     fn metadata_content(&self) -> Option<&FacetConfig>;
@@ -88,6 +88,11 @@ pub trait TestDataView: Send + Sync {
     fn predicate_results(&self) -> Option<&FacetConfig>;
     /// Returns the facet config for metadata layout, if present.
     fn metadata_layout(&self) -> Option<&FacetConfig>;
+
+    /// Returns a reader for predicate result indices (metadata_indices).
+    /// This is typically a variable-length file (ivvec) where each
+    /// predicate maps to a different number of matching base ordinals.
+    fn metadata_indices(&self) -> Result<Arc<dyn VvecReader<i32>>>;
 
     // -- Facet discovery --
 
@@ -167,67 +172,43 @@ impl GenericTestDataView {
         }
     }
 
-    fn open_fvec(
+    /// Open a uniform vector facet with the unified `open_vec` API.
+    /// Handles local (mmap) and remote (HTTP) transparently.
+    fn open_uniform<T: OpenableElement>(
         &self,
         facet_opt: Option<&FacetConfig>,
         name: &str,
-    ) -> Result<Arc<dyn VectorReader<f32>>> {
+    ) -> Result<Arc<dyn VectorReader<T>>> {
         let facet = facet_opt.ok_or_else(|| Error::MissingFacet(name.to_string()))?;
-        let location = self.resolve_resource(facet)?;
-
-        match location {
-            ResourceLocation::FileSystem(path) => {
-                let reader = MmapVectorReader::open_fvec(&path)?;
-                Ok(Arc::new(reader))
-            }
-            ResourceLocation::Http(url) => {
-                let reader = HttpVectorReader::open_fvec(url.clone())?;
-                Ok(Arc::new(reader))
-            }
-        }
+        let path_or_url = self.resolve_as_string(facet)?;
+        let reader = io::open_vec::<T>(&path_or_url)?;
+        Ok(Arc::from(reader))
     }
 
-    fn open_ivec(
+    /// Open a variable-length vector facet with the unified `open_vvec` API.
+    /// Handles local (mmap + index) and remote (HTTP + index) transparently.
+    fn open_variable<T: VvecElement>(
         &self,
         facet_opt: Option<&FacetConfig>,
         name: &str,
-    ) -> Result<Arc<dyn VectorReader<i32>>> {
+    ) -> Result<Arc<dyn VvecReader<T>>> {
         let facet = facet_opt.ok_or_else(|| Error::MissingFacet(name.to_string()))?;
-        let location = self.resolve_resource(facet)?;
-
-        match location {
-            ResourceLocation::FileSystem(path) => {
-                let reader = MmapVectorReader::open_ivec(&path)?;
-                Ok(Arc::new(reader))
-            }
-            ResourceLocation::Http(url) => {
-                let reader = HttpVectorReader::open_ivec(url.clone())?;
-                Ok(Arc::new(reader))
-            }
-        }
+        let path_or_url = self.resolve_as_string(facet)?;
+        let reader = io::open_vvec::<T>(&path_or_url)?;
+        Ok(Arc::from(reader))
     }
 
-    /// Open a facet as an f32 reader regardless of the underlying format.
-    ///
-    /// Determines the format from the file extension.
-    fn open_facet_as_fvec(&self, facet: &FacetConfig) -> Result<Arc<dyn VectorReader<f32>>> {
-        let source = facet.source();
-        let location = self.resolve_resource(facet)?;
-
-        // Determine format from extension
-        let ext = source.rsplit('.').next().unwrap_or("");
-
-        match (ext, location) {
-            ("fvec", ResourceLocation::FileSystem(path)) => {
-                Ok(Arc::new(MmapVectorReader::open_fvec(&path)?))
+    /// Resolve a facet to a path string (local) or URL string (remote).
+    fn resolve_as_string(&self, facet: &FacetConfig) -> Result<String> {
+        let source_str = facet.source();
+        match &self.source {
+            DataSource::FileSystem(base_path) => {
+                Ok(base_path.join(source_str).to_string_lossy().to_string())
             }
-            ("fvec", ResourceLocation::Http(url)) => {
-                Ok(Arc::new(HttpVectorReader::open_fvec(url)?))
+            DataSource::Http(base_url) => {
+                let url = base_url.join(source_str)?;
+                Ok(url.to_string())
             }
-            _ => Err(Error::Other(format!(
-                "unsupported format '{}' for generic facet access",
-                ext
-            ))),
         }
     }
 
@@ -325,30 +306,30 @@ enum ResourceLocation {
 
 impl TestDataView for GenericTestDataView {
     fn base_vectors(&self) -> Result<Arc<dyn VectorReader<f32>>> {
-        self.open_fvec(self.config.base_vectors.as_ref(), "base_vectors")
+        self.open_uniform(self.config.base_vectors.as_ref(), "base_vectors")
     }
 
     fn query_vectors(&self) -> Result<Arc<dyn VectorReader<f32>>> {
-        self.open_fvec(self.config.query_vectors.as_ref(), "query_vectors")
+        self.open_uniform(self.config.query_vectors.as_ref(), "query_vectors")
     }
 
     fn neighbor_indices(&self) -> Result<Arc<dyn VectorReader<i32>>> {
-        self.open_ivec(self.config.neighbor_indices.as_ref(), "neighbor_indices")
+        self.open_uniform(self.config.neighbor_indices.as_ref(), "neighbor_indices")
     }
 
     fn neighbor_distances(&self) -> Result<Arc<dyn VectorReader<f32>>> {
-        self.open_fvec(self.config.neighbor_distances.as_ref(), "neighbor_distances")
+        self.open_uniform(self.config.neighbor_distances.as_ref(), "neighbor_distances")
     }
 
     fn filtered_neighbor_indices(&self) -> Result<Arc<dyn VectorReader<i32>>> {
-        self.open_ivec(
+        self.open_uniform(
             self.config.filtered_neighbor_indices.as_ref(),
             "filtered_neighbor_indices",
         )
     }
 
     fn filtered_neighbor_distances(&self) -> Result<Arc<dyn VectorReader<f32>>> {
-        self.open_fvec(
+        self.open_uniform(
             self.config.filtered_neighbor_distances.as_ref(),
             "filtered_neighbor_distances",
         )
@@ -374,8 +355,12 @@ impl TestDataView for GenericTestDataView {
         self.collect_facets()
     }
 
+    fn metadata_indices(&self) -> Result<Arc<dyn VvecReader<i32>>> {
+        self.open_variable(self.config.predicate_results.as_ref(), "metadata_indices")
+    }
+
     fn facet(&self, name: &str) -> Result<Arc<dyn VectorReader<f32>>> {
-        // Try standard facets first
+        // Try standard facets first (uniform vector types)
         match name {
             "base_vectors" => return self.base_vectors(),
             "query_vectors" => return self.query_vectors(),
@@ -384,19 +369,10 @@ impl TestDataView for GenericTestDataView {
             _ => {}
         }
 
-        // For other facets, try to find a FacetConfig and open generically
-        let facet_config = match name {
-            "neighbor_indices" => self.config.neighbor_indices.as_ref(),
-            "filtered_neighbor_indices" => self.config.filtered_neighbor_indices.as_ref(),
-            "metadata_content" => self.config.metadata_content.as_ref(),
-            "metadata_predicates" => self.config.metadata_predicates.as_ref(),
-            "predicate_results" => self.config.predicate_results.as_ref(),
-            "metadata_layout" => self.config.metadata_layout.as_ref(),
-            _ => None,
-        };
-
+        // For f32-compatible facets, open via unified API
+        let facet_config = self.facet_config_by_name(name);
         match facet_config {
-            Some(fc) => self.open_facet_as_fvec(fc),
+            Some(fc) => self.open_uniform::<f32>(Some(fc), name),
             None => Err(Error::MissingFacet(name.to_string())),
         }
     }

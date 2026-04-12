@@ -1,0 +1,256 @@
+# Fully synthetic BQGDMPRF dataset — 1M base vectors, dim=128
+#
+# This dataset is self-contained: every artifact is generated from
+# scratch by the pipeline. No external source files are needed.
+# It serves as the canonical test fixture for:
+#   - Full pipeline execution (all facets)
+#   - vectordata unified API integration tests
+#   - Remote (HTTP) access tests via test server
+#   - Variable-length vvec with offset index
+#
+# Usage:
+#   veks run dataset.yaml          # generate everything
+#   veks run dataset.yaml --clean  # regenerate from scratch
+#
+# Pipeline stages:
+#   1. Generate random base vectors (1M × 128, f32)
+#   2. Generate random query vectors (10K × 128, f32)
+#   3. Compute brute-force KNN ground truth (k=100)
+#   4. Verify KNN correctness
+#   5. Generate random metadata labels (1M × u8, range 0..12)
+#   6. Generate random equality predicates (10K × u8, range 0..12)
+#   7. Evaluate predicates → variable-length ivvec results
+#   8. Verify predicates via SQLite oracle
+#   9. Compute filtered KNN (brute-force, predicate pre-filtering)
+#  10. Verify filtered KNN
+#  11. Build vvec offset indices
+#  12. Generate merkle trees + catalog
+
+name: synthetic-1m
+
+attributes:
+  is_duplicate_vector_free: true
+  is_zero_vector_free: true
+  distance_function: L2
+
+
+
+variables:
+  clean_count: '1000000'
+  dataset_name: 'synthetic-1m'
+  distance_function: 'L2'
+  duplicate_count: '0'
+  knn_queries_with_ties: '0'
+  knn_tied_neighbors: '0'
+  source_zero_count: '0'
+  verified_count:base_vectors.fvec: '1000000'
+  verified_count:duplicates.ivec: '0'
+  verified_count:filtered_neighbor_distances.fvec: '10000'
+  verified_count:filtered_neighbor_indices.ivec: '10000'
+  verified_count:metadata_content.u8: '1000000'
+  verified_count:metadata_indices.ivvec: '10000'
+  verified_count:neighbor_distances.fvec: '10000'
+  verified_count:neighbor_indices.ivec: '10000'
+  verified_count:predicates.u8: '10000'
+  verified_count:query_vectors.fvec: '10000'
+  verified_count:sorted.ivec: '1000000'
+  zero_count: '0'
+upstream:
+  defaults:
+    seed: 42
+
+  steps:
+    # ── Generate source vectors ──────────────────────────────────
+
+    - id: generate-base
+      description: Generate 1M random base vectors
+      run: generate vectors
+      output: profiles/base/base_vectors.fvec
+      dimension: 128
+      count: 1000000
+      seed: 42
+      distribution: gaussian
+
+    - id: generate-queries
+      description: Generate 10K random query vectors
+      run: generate vectors
+      output: profiles/base/query_vectors.fvec
+      dimension: 128
+      count: 10000
+      seed: 1337
+      distribution: gaussian
+
+    # ── Scan source vectors ──────────────────────────────────────
+
+    - id: scan-zeros
+      description: Scan base vectors for zero vectors
+      run: analyze find-zeros
+      after: [generate-base]
+      source: profiles/base/base_vectors.fvec
+
+    - id: scan-duplicates
+      description: Scan base vectors for duplicates
+      run: analyze find-duplicates
+      after: [generate-base]
+      source: profiles/base/base_vectors.fvec
+
+    # ── Ground truth KNN ─────────────────────────────────────────
+
+    - id: compute-knn
+      description: Compute brute-force exact KNN ground truth
+      run: compute knn
+      per_profile: true
+      after: [generate-base, generate-queries]
+      base: profiles/base/base_vectors.fvec
+      query: profiles/base/query_vectors.fvec
+      indices: neighbor_indices.ivec
+      distances: neighbor_distances.fvec
+      neighbors: 100
+      metric: L2
+      normalized: false
+
+    - id: verify-knn
+      description: Verify KNN ground truth via brute-force recomputation
+      run: verify knn-consolidated
+      after: [compute-knn]
+      base: profiles/base/base_vectors.fvec
+      query: profiles/base/query_vectors.fvec
+      metric: L2
+      normalized: false
+      sample: 100
+      seed: 42
+      output: "${cache}/verify_knn.json"
+
+    # ── Metadata synthesis ───────────────────────────────────────
+
+    - id: generate-metadata
+      description: Generate random integer metadata labels
+      run: generate metadata
+      after: [generate-base]
+      output: profiles/base/metadata_content.u8
+      count: 1000000
+      fields: 1
+      range-min: 0
+      range-max: 12
+      seed: 42
+      format: u8
+
+    - id: generate-predicates
+      description: Generate simple integer equality predicates
+      run: generate predicates
+      after: [generate-metadata]
+      output: profiles/base/predicates.u8
+      count: 10000
+      seed: 42
+      mode: simple-int-eq
+      fields: 1
+      range-min: 0
+      range-max: 12
+      format: u8
+
+    # ── Predicate evaluation ─────────────────────────────────────
+
+    - id: evaluate-predicates
+      description: Evaluate predicates against metadata
+      run: compute evaluate-predicates
+      per_profile: true
+      phase: 1
+      after: [generate-predicates, generate-metadata]
+      source: profiles/base/metadata_content.u8
+      predicates: profiles/base/predicates.u8
+      selectivity: 0.08333333333333333
+      mode: simple-int-eq
+      fields: 1
+      range: "[0,1000000)"
+      output: metadata_indices.ivvec
+
+    - id: verify-predicates-sqlite
+      description: Verify predicate evaluations using SQLite oracle
+      run: verify predicates-sqlite
+      per_profile: true
+      phase: 1
+      after: [evaluate-predicates]
+      metadata: profiles/base/metadata_content.u8
+      predicates: profiles/base/predicates.u8
+      results: metadata_indices.ivvec
+      fields: 1
+      output: "${cache}/verify_predicates_sqlite.json"
+
+    # ── Filtered KNN ─────────────────────────────────────────────
+
+    - id: compute-filtered-knn
+      description: Compute filtered KNN with predicate pre-filtering
+      run: compute filtered-knn
+      per_profile: true
+      phase: 2
+      after: [verify-predicates-sqlite]
+      base: profiles/base/base_vectors.fvec
+      query: profiles/base/query_vectors.fvec
+      metadata-indices: metadata_indices.ivvec
+      indices: filtered_neighbor_indices.ivec
+      distances: filtered_neighbor_distances.fvec
+      neighbors: 100
+      metric: L2
+
+    - id: verify-filtered-knn
+      description: Verify filtered KNN results
+      run: verify filtered-knn-consolidated
+      after: [compute-filtered-knn]
+      base: profiles/base/base_vectors.fvec
+      query: profiles/base/query_vectors.fvec
+      metadata: profiles/base/metadata_content.u8
+      predicates: profiles/base/predicates.u8
+      metric: L2
+      normalized: false
+      sample: 50
+      seed: 42
+      output: "${cache}/verify_filtered_knn.json"
+
+    # ── Finalize ─────────────────────────────────────────────────
+
+    - id: generate-dataset-json
+      description: Generate dataset.json
+      run: generate dataset-json
+      after: [verify-filtered-knn, verify-predicates-sqlite]
+
+    - id: generate-variables-json
+      description: Generate variables.json
+      run: generate variables-json
+      after: [generate-dataset-json]
+
+    - id: generate-dataset-log-jsonl
+      description: Generate dataset.jsonl
+      run: generate dataset-log-jsonl
+      after: [generate-dataset-json]
+
+    - id: generate-vvec-index
+      description: Build offset indices for vvec files
+      run: generate vvec-index
+      after: [generate-variables-json, generate-dataset-log-jsonl]
+      source: .
+
+    - id: generate-merkle
+      description: Create merkle hash trees
+      run: merkle create
+      after: [generate-vvec-index]
+      source: .
+      min-size: 0
+
+    - id: generate-catalog
+      description: Generate catalog index
+      run: catalog generate
+      after: [generate-merkle]
+      source: .
+
+profiles:
+  default:
+    maxk: 100
+    base_vectors: profiles/base/base_vectors.fvec
+    query_vectors: profiles/base/query_vectors.fvec
+    neighbor_indices: profiles/default/neighbor_indices.ivec
+    neighbor_distances: profiles/default/neighbor_distances.fvec
+    metadata_content: profiles/base/metadata_content.u8
+    metadata_predicates: profiles/base/predicates.u8
+    metadata_indices: profiles/default/metadata_indices.ivvec
+    filtered_neighbor_indices: profiles/default/filtered_neighbor_indices.ivec
+    filtered_neighbor_distances: profiles/default/filtered_neighbor_distances.fvec

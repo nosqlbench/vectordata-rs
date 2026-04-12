@@ -1,4 +1,4 @@
-// Copyright (c) nosqlbench contributors
+// Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
 //! Interactive wizard for `datasets import --interactive`.
@@ -380,7 +380,7 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
         let vector_candidates: Vec<&(PathBuf, String, u64)> = candidates.iter()
             .filter(|(_, fmt, _)| {
                 let f = fmt.as_str();
-                f == "fvec" || f == "ivec" || f == "mvec" || f == "bvec" || f == "dvec" || f == "svec" || f == "npy"
+                VECTOR_FORMATS.contains(&f) || f == "npy"
             })
             .collect();
 
@@ -1684,8 +1684,16 @@ impl DetectedRoles {
 }
 
 /// Vector format names for matching constraints.
-const VECTOR_FORMATS: &[&str] = &["fvec", "ivec", "mvec", "bvec", "dvec", "svec", "npy"];
-const FLOAT_VECTOR_FORMATS: &[&str] = &["fvec", "dvec", "mvec"];
+const VECTOR_FORMATS: &[&str] = &[
+    "fvec", "ivec", "mvec", "bvec", "dvec", "svec", "npy",
+    "fvvec", "ivvec", "mvvec", "bvvec", "dvvec", "svvec",
+    "i8vec", "u16vec", "i32vec", "u32vec", "i64vec", "u64vec",
+    "i8vvec", "u16vvec", "i32vvec", "u32vvec", "i64vvec", "u64vvec",
+    "f16vec", "f32vec", "f64vec", "f16vvec", "f32vvec", "f64vvec",
+    "u8vec",
+];
+const FLOAT_VECTOR_FORMATS: &[&str] = &["fvec", "dvec", "mvec", "fvvec", "dvvec", "mvvec",
+    "f16vec", "f32vec", "f64vec", "f16vvec", "f32vvec", "f64vvec"];
 
 /// Detect file roles from filename keyword hints.
 ///
