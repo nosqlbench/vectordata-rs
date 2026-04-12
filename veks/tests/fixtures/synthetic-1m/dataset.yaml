@@ -211,34 +211,33 @@ upstream:
     - id: generate-dataset-json
       description: Generate dataset.json
       run: generate dataset-json
+      finalize: true
       after: [verify-filtered-knn, verify-predicates-sqlite]
 
     - id: generate-variables-json
       description: Generate variables.json
       run: generate variables-json
+      finalize: true
       after: [generate-dataset-json]
 
     - id: generate-dataset-log-jsonl
       description: Generate dataset.jsonl
       run: generate dataset-log-jsonl
+      finalize: true
       after: [generate-dataset-json]
-
-    - id: generate-vvec-index
-      description: Build offset indices for vvec files
-      run: generate vvec-index
-      after: [generate-variables-json, generate-dataset-log-jsonl]
-      source: .
 
     - id: generate-merkle
       description: Create merkle hash trees
       run: merkle create
-      after: [generate-vvec-index]
+      finalize: true
+      after: [generate-variables-json, generate-dataset-log-jsonl]
       source: .
       min-size: 0
 
     - id: generate-catalog
       description: Generate catalog index
       run: catalog generate
+      finalize: true
       after: [generate-merkle]
       source: .
 

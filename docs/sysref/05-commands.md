@@ -36,6 +36,7 @@ each run against the synthetic-1k test fixture.
 | `compute filtered-knn` | KNN with predicate pre-filtering |
 | `compute evaluate-predicates` | Evaluate predicates against metadata → vvec results |
 | `compute sort` | Sort vectors for deduplication |
+| `compute partition-profiles` | Extract per-label base vectors and register partition profiles |
 
 ---
 

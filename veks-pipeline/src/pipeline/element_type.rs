@@ -101,6 +101,18 @@ impl ElementType {
             Self::U8 | Self::I8 => 1,
         }
     }
+
+    /// Returns `true` if the file extension is a bare scalar format (`.u8`,
+    /// `.i32`, etc.) rather than an xvec format (`.fvec`, `.ivec`, `.bvec`).
+    ///
+    /// Scalar files have one element per record with no dimension header.
+    /// Xvec files have a 4-byte dimension prefix per record.
+    pub fn is_scalar_extension(ext: &str) -> bool {
+        matches!(ext.to_lowercase().as_str(),
+            "u8" | "i8" | "u16" | "i16" | "u32" | "i32" | "u64" | "i64"
+            | "f32" | "f64"
+        )
+    }
 }
 
 impl std::fmt::Display for ElementType {

@@ -705,6 +705,9 @@ impl GenPredicateKeysOp {
             results
         };
 
+        // Remove stale index before rewriting the vvec file
+        vectordata::io::remove_vvec_index(&output_path);
+
         // Write output as ivec (each record = matching ordinals)
         {
             use std::io::Write;

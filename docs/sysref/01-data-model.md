@@ -212,6 +212,7 @@ describe a vector search benchmark:
 | **P** | Metadata predicates | scalar | `.u8` | Per-query filter values |
 | **R** | Predicate results | variable vec | `.ivvec` | Base ordinals matching each predicate |
 | **F** | Filtered KNN | uniform vec | `.ivec` + `.fvec` | KNN results after predicate filtering |
+| **O** | Oracle partitions | per-label profiles | directories | Per-label base vectors + partitioned KNN |
 
 ### Facet inference
 
@@ -224,6 +225,7 @@ The pipeline infers which facets to produce from the inputs provided:
 | B + Q + GT | B Q G (D only if distances provided) |
 | B + Q + M | B Q G D M P R F |
 | B + Q + GT + synthesize | B Q G M P R F |
+| above + oracle partitions | B Q G M P R F O (O must be explicit) |
 
 ---
 
@@ -303,10 +305,19 @@ profiles:
 
 ### Profiles
 
-- **`default`** — the full dataset, always present
-- **Sized profiles** — subsets with `base_count` (e.g., `100K`, `1M`)
-  that share source data but have independently computed KNN and
-  filtered results
+Every profile declares `base_count` — the number of base vectors
+accessible through that profile. This is part of the basic contract
+for all dataset profiles and is used by consumers to size buffers,
+estimate costs, and display summaries.
+
+- **`default`** — the full dataset, always present. `base_count`
+  set by the pipeline after vector preparation.
+- **Sized profiles** — subsets (e.g., `100K`, `1M`) with an explicit
+  `base_count` that windows into shared source data.
+- **Partition profiles** — per-label subsets (e.g., `label-0`) with
+  `base_count` equal to the number of base vectors matching that
+  label. Each has its own extracted base vectors and independently
+  computed KNN in its own ordinal space.
 
 ### Required attributes
 

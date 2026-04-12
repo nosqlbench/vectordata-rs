@@ -21,7 +21,12 @@ use super::command::Status;
 /// Bump this whenever cache key algorithms, segment naming conventions,
 /// or other internal formats change. On load, if the stored version does
 /// not match, all step records are cleared (the user is notified).
-const PROGRESS_SCHEMA_VERSION: u32 = 3;
+///
+/// History:
+/// - v3: fingerprint chains for DAG-based staleness
+/// - v4: build_version in StepRecord, mtime-based staleness removed,
+///        fingerprint now includes command build version
+const PROGRESS_SCHEMA_VERSION: u32 = 4;
 
 /// Persistent progress log for a pipeline execution.
 ///
@@ -81,11 +86,16 @@ pub struct StepRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource_summary: Option<ResourceSummary>,
     /// Configuration fingerprint: hash of this step's identity (id, command,
-    /// resolved options) plus the fingerprints of all upstream dependencies.
-    /// When the fingerprint changes, this step and all downstream dependents
-    /// must re-execute.
+    /// resolved options, build version) plus the fingerprints of all upstream
+    /// dependencies. When the fingerprint changes, this step and all
+    /// downstream dependents must re-execute.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fingerprint: Option<String>,
+    /// Build version of the command that produced this result.
+    /// When the current command's build_version differs from this stored
+    /// value, the step is stale — the command logic may have changed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_version: Option<String>,
 }
 
 /// Record of a single output artifact at completion time.
@@ -168,11 +178,14 @@ impl ProgressLog {
         run_command: &str,
         resolved_options: &HashMap<String, String>,
         upstream_ids: &[&str],
+        build_version: &str,
     ) -> String {
         let mut hasher = FnvHasher::new();
         hasher.write(step_id.as_bytes());
         hasher.write(b"\0");
         hasher.write(run_command.as_bytes());
+        hasher.write(b"\0");
+        hasher.write(build_version.as_bytes());
         hasher.write(b"\0");
 
         // Sort options for deterministic ordering
@@ -286,6 +299,11 @@ impl ProgressLog {
         }
     }
 
+    /// Remove a step's progress record, forcing it to re-execute.
+    pub fn clear_step(&mut self, step_id: &str) {
+        self.steps.remove(step_id);
+    }
+
     /// Get the record for a step, if any.
     pub fn get_step(&self, step_id: &str) -> Option<&StepRecord> {
         self.steps.get(step_id)
@@ -307,10 +325,15 @@ impl ProgressLog {
     /// Check whether a step needs to be re-run, returning a reason if stale.
     ///
     /// Returns `None` if the step is fresh, or `Some(reason)` describing why
-    /// it is stale (input newer than output, options changed, etc.).
+    /// it is stale (options changed, outputs missing/corrupted, etc.).
+    ///
+    /// Staleness from upstream changes is handled by the fingerprint chain
+    /// (see `compute_fingerprint` and `check_fingerprint`) — not by mtime
+    /// comparisons. This method only checks local state: options match,
+    /// outputs exist with correct sizes.
     ///
     /// When `workspace` is provided, relative paths in options are resolved
-    /// against it for mtime comparisons.
+    /// against it for output file checks.
     pub fn check_step_freshness(
         &self,
         step_id: &str,
@@ -356,49 +379,6 @@ impl ProgressLog {
                     }
                 }
                 Err(_) => return Some(format!("output '{}' missing", output.path)),
-            }
-        }
-
-        // Check input file mtimes: if any input is newer than the step's
-        // completion time, the step is stale.
-        if let Some(current) = current_options {
-            let completed = record.completed_at;
-            // Use sub-second precision to avoid false positives when files
-            // are written in the same second as step completion.
-            let completed_nanos = completed.timestamp_nanos_opt().unwrap_or(
-                completed.timestamp() as i64 * 1_000_000_000
-            );
-            let completed_systime = std::time::SystemTime::UNIX_EPOCH
-                + std::time::Duration::from_nanos(completed_nanos as u64);
-
-            // Collect recorded output paths so we can skip them in the mtime
-            // check.  Options like "indices" and "distances" are outputs even
-            // though they are not named "output".
-            let output_paths: std::collections::HashSet<&str> = record
-                .outputs
-                .iter()
-                .map(|o| o.path.as_str())
-                .collect();
-
-            for (key, value) in current {
-                // Skip options whose values match a recorded output path —
-                // those are produced by this step, not consumed.
-                if key == "output" || output_paths.contains(value.as_str()) {
-                    continue;
-                }
-                let path = resolve_path(value, workspace);
-                if path.is_file() {
-                    if let Ok(meta) = std::fs::metadata(&path) {
-                        if let Ok(mtime) = meta.modified() {
-                            if mtime > completed_systime {
-                                return Some(format!(
-                                    "input '{}' ({}) is newer than last run",
-                                    key, value,
-                                ));
-                            }
-                        }
-                    }
-                }
             }
         }
 
@@ -489,6 +469,7 @@ mod tests {
                 error: None,
                 resource_summary: None,
                 fingerprint: None,
+                build_version: None,
             },
         );
 
@@ -515,6 +496,7 @@ mod tests {
                 error: None,
                 resource_summary: None,
                 fingerprint: None,
+                build_version: None,
             },
         );
 
@@ -550,6 +532,7 @@ mod tests {
                 error: None,
                 resource_summary: None,
                 fingerprint: None,
+                build_version: None,
             },
         );
         log.save().unwrap();
@@ -565,13 +548,13 @@ mod tests {
         opts.insert("source".to_string(), "base.fvec".to_string());
         opts.insert("output".to_string(), "out.fvec".to_string());
 
-        let fp1 = log.compute_fingerprint("step1", "transform extract", &opts, &[]);
-        let fp2 = log.compute_fingerprint("step1", "transform extract", &opts, &[]);
+        let fp1 = log.compute_fingerprint("step1", "transform extract", &opts, &[], "");
+        let fp2 = log.compute_fingerprint("step1", "transform extract", &opts, &[], "");
         assert_eq!(fp1, fp2, "same inputs should produce same fingerprint");
 
         // Change an option
         opts.insert("source".to_string(), "other.fvec".to_string());
-        let fp3 = log.compute_fingerprint("step1", "transform extract", &opts, &[]);
+        let fp3 = log.compute_fingerprint("step1", "transform extract", &opts, &[], "");
         assert_ne!(fp1, fp3, "different options should produce different fingerprint");
     }
 
@@ -590,10 +573,11 @@ mod tests {
             error: None,
             resource_summary: None,
             fingerprint: Some("aaaa".to_string()),
+            build_version: None,
         });
 
         let opts = HashMap::new();
-        let fp1 = log.compute_fingerprint("downstream", "compute knn", &opts, &["upstream"]);
+        let fp1 = log.compute_fingerprint("downstream", "compute knn", &opts, &["upstream"], "");
 
         // Change upstream fingerprint
         log.record_step("upstream", StepRecord {
@@ -606,9 +590,10 @@ mod tests {
             error: None,
             resource_summary: None,
             fingerprint: Some("bbbb".to_string()),
+            build_version: None,
         });
 
-        let fp2 = log.compute_fingerprint("downstream", "compute knn", &opts, &["upstream"]);
+        let fp2 = log.compute_fingerprint("downstream", "compute knn", &opts, &["upstream"], "");
         assert_ne!(fp1, fp2, "upstream fingerprint change should cascade");
     }
 
@@ -625,6 +610,7 @@ mod tests {
             error: None,
             resource_summary: None,
             fingerprint: Some("abc123".to_string()),
+            build_version: None,
         });
 
         assert!(log.check_fingerprint("step1", "abc123").is_none(), "matching fingerprint should be fresh");
@@ -644,6 +630,7 @@ mod tests {
             error: None,
             resource_summary: None,
             fingerprint: None, // legacy — no fingerprint
+            build_version: None,
         });
 
         // Legacy records without fingerprint should be trusted (not forced stale)
@@ -652,181 +639,125 @@ mod tests {
     }
 
     #[test]
-    fn test_check_step_freshness_input_mtime() {
+    fn test_staleness_from_upstream_via_fingerprint() {
+        // When an upstream step changes its fingerprint (re-executed),
+        // the downstream step's computed fingerprint changes, making it stale.
+        // This replaces the old mtime-based staleness detection.
+        let mut log = ProgressLog::new();
+
+        // Record upstream step with fingerprint "aaa"
+        log.record_step("extract", StepRecord {
+            status: Status::Ok,
+            message: "done".into(),
+            completed_at: Utc::now(),
+            elapsed_secs: 1.0,
+            outputs: vec![],
+            resolved_options: HashMap::new(),
+            error: None,
+            resource_summary: None,
+            fingerprint: Some("aaa".to_string()),
+            build_version: Some("0.1.0+abc".to_string()),
+        });
+
+        // Compute downstream fingerprint with upstream at "aaa"
+        let opts = HashMap::new();
+        let fp1 = log.compute_fingerprint("knn", "compute knn", &opts, &["extract"], "0.1.0+abc");
+
+        // Record downstream step with this fingerprint
+        log.record_step("knn", StepRecord {
+            status: Status::Ok,
+            message: "done".into(),
+            completed_at: Utc::now(),
+            elapsed_secs: 2.0,
+            outputs: vec![],
+            resolved_options: opts.clone(),
+            error: None,
+            resource_summary: None,
+            fingerprint: Some(fp1.clone()),
+            build_version: Some("0.1.0+abc".to_string()),
+        });
+
+        // Fingerprint should match — step is fresh
+        assert!(log.check_fingerprint("knn", &fp1).is_none(), "should be fresh initially");
+
+        // Now upstream re-executes with a new fingerprint
+        log.record_step("extract", StepRecord {
+            status: Status::Ok,
+            message: "re-ran".into(),
+            completed_at: Utc::now(),
+            elapsed_secs: 1.0,
+            outputs: vec![],
+            resolved_options: HashMap::new(),
+            error: None,
+            resource_summary: None,
+            fingerprint: Some("bbb".to_string()),
+            build_version: Some("0.1.0+abc".to_string()),
+        });
+
+        // Recompute downstream fingerprint — it should differ
+        let fp2 = log.compute_fingerprint("knn", "compute knn", &opts, &["extract"], "0.1.0+abc");
+        assert_ne!(fp1, fp2, "upstream change should produce different fingerprint");
+        assert!(log.check_fingerprint("knn", &fp2).is_some(),
+            "stored fingerprint should be stale after upstream change");
+    }
+
+    #[test]
+    fn test_staleness_from_build_version_change() {
+        // When the command's build version changes (recompilation), the
+        // fingerprint changes, making the step stale.
+        let log = ProgressLog::new();
+        let opts = HashMap::new();
+
+        let fp_v1 = log.compute_fingerprint("step1", "compute knn", &opts, &[], "0.17.0+abc123");
+        let fp_v2 = log.compute_fingerprint("step1", "compute knn", &opts, &[], "0.17.0+def456");
+
+        assert_ne!(fp_v1, fp_v2,
+            "different build versions should produce different fingerprints");
+    }
+
+    #[test]
+    fn test_check_step_freshness_output_files_verified() {
+        // Freshness check verifies output files exist with correct sizes.
+        // Missing or size-changed outputs make the step stale.
         let tmp_dir = tempfile::tempdir().unwrap();
-        let input_path = tmp_dir.path().join("input.fvec");
         let output_path = tmp_dir.path().join("output.ivec");
 
-        // Create input file
-        std::fs::write(&input_path, "data").unwrap();
-
-        // Record step as completed "in the past"
-        let mut log = ProgressLog::new();
-        let past = Utc::now() - chrono::Duration::seconds(60);
-        log.record_step(
-            "knn",
-            StepRecord {
-                status: Status::Ok,
-                message: "ok".to_string(),
-                completed_at: past,
-                elapsed_secs: 1.0,
-                outputs: vec![OutputRecord {
-                    path: output_path.to_string_lossy().into_owned(),
-                    size: 6,
-                    mtime: None,
-                }],
-                resolved_options: {
-                    let mut m = HashMap::new();
-                    m.insert("source".to_string(), input_path.to_string_lossy().into_owned());
-                    m.insert("output".to_string(), output_path.to_string_lossy().into_owned());
-                    m
-                },
-                error: None,
-                resource_summary: None,
-                fingerprint: None,
-            },
-        );
-
-        // Create output file with correct size
+        // Create output file
         std::fs::write(&output_path, "result").unwrap();
 
-        // Input is newer than the step's completed_at — should be stale
-        let opts: HashMap<String, String> = [
-            ("source".to_string(), input_path.to_string_lossy().into_owned()),
-            ("output".to_string(), output_path.to_string_lossy().into_owned()),
-        ].into_iter().collect();
-
-        let reason = log.check_step_freshness("knn", Some(&opts), None);
-        assert!(reason.is_some(), "expected stale due to input mtime");
-        assert!(reason.unwrap().contains("input"), "reason should mention input");
-    }
-
-    #[test]
-    fn test_check_step_freshness_output_option_not_treated_as_input() {
-        let tmp_dir = tempfile::tempdir().unwrap();
-        let input_path = tmp_dir.path().join("input.fvec");
-        let indices_path = tmp_dir.path().join("indices.ivec");
-        let distances_path = tmp_dir.path().join("distances.fvec");
-
-        // Create all files
-        std::fs::write(&input_path, "data").unwrap();
-        std::fs::write(&indices_path, "result").unwrap();
-        std::fs::write(&distances_path, "result").unwrap();
-
-        // Record step as completed in the past. The output files ("indices"
-        // and "distances") are recorded as produced outputs even though they
-        // are not named "output".
         let mut log = ProgressLog::new();
-        let past = Utc::now() - chrono::Duration::seconds(60);
-        log.record_step(
-            "knn",
-            StepRecord {
-                status: Status::Ok,
-                message: "ok".to_string(),
-                completed_at: past,
-                elapsed_secs: 1.0,
-                outputs: vec![
-                    OutputRecord {
-                        path: indices_path.to_string_lossy().into_owned(),
-                        size: 6,
-                        mtime: None,
-                    },
-                    OutputRecord {
-                        path: distances_path.to_string_lossy().into_owned(),
-                        size: 6,
-                        mtime: None,
-                    },
-                ],
-                resolved_options: {
-                    let mut m = HashMap::new();
-                    m.insert("base".to_string(), input_path.to_string_lossy().into_owned());
-                    m.insert("indices".to_string(), indices_path.to_string_lossy().into_owned());
-                    m.insert("distances".to_string(), distances_path.to_string_lossy().into_owned());
-                    m
-                },
-                error: None,
-                resource_summary: None,
-                fingerprint: None,
-            },
-        );
+        log.record_step("step1", StepRecord {
+            status: Status::Ok,
+            message: "done".into(),
+            completed_at: Utc::now(),
+            elapsed_secs: 1.0,
+            outputs: vec![OutputRecord {
+                path: output_path.to_string_lossy().into_owned(),
+                size: 6, // matches "result" (6 bytes)
+                mtime: None,
+            }],
+            resolved_options: HashMap::new(),
+            error: None,
+            resource_summary: None,
+            fingerprint: None,
+            build_version: None,
+        });
 
-        // The indices and distances files were just created (mtime = now),
-        // which is newer than completed_at (60s ago). Without the fix, these
-        // would falsely trigger "input is newer than last run".
-        let opts: HashMap<String, String> = [
-            ("base".to_string(), input_path.to_string_lossy().into_owned()),
-            ("indices".to_string(), indices_path.to_string_lossy().into_owned()),
-            ("distances".to_string(), distances_path.to_string_lossy().into_owned()),
-        ].into_iter().collect();
+        // Fresh when output exists with correct size
+        let reason = log.check_step_freshness("step1", None, None);
+        assert!(reason.is_none(), "should be fresh: {:?}", reason);
 
-        let reason = log.check_step_freshness("knn", Some(&opts), None);
-        // The input file (base) IS newer, so the step should be stale for
-        // that reason. But indices and distances should NOT trigger staleness.
-        assert!(reason.is_some(), "expected stale due to input mtime");
-        let reason_str = reason.unwrap();
-        assert!(reason_str.contains("base"), "reason should mention 'base', got: {}", reason_str);
-        assert!(!reason_str.contains("indices"), "indices should not be treated as input");
-        assert!(!reason_str.contains("distances"), "distances should not be treated as input");
-    }
+        // Stale when output size changes
+        std::fs::write(&output_path, "longer result").unwrap();
+        let reason = log.check_step_freshness("step1", None, None);
+        assert!(reason.is_some(), "should be stale after size change");
+        assert!(reason.unwrap().contains("size changed"));
 
-    #[test]
-    fn test_check_step_freshness_output_files_skipped_even_when_newer() {
-        let tmp_dir = tempfile::tempdir().unwrap();
-        let indices_path = tmp_dir.path().join("indices.ivec");
-        let distances_path = tmp_dir.path().join("distances.fvec");
-
-        // Create output files (mtime = now)
-        std::fs::write(&indices_path, "result").unwrap();
-        std::fs::write(&distances_path, "result").unwrap();
-
-        // Record step as completed in the past with only output files
-        // (no true input files). The step should be FRESH because the
-        // output files should not be checked as inputs.
-        let mut log = ProgressLog::new();
-        let past = Utc::now() - chrono::Duration::seconds(60);
-        log.record_step(
-            "knn",
-            StepRecord {
-                status: Status::Ok,
-                message: "ok".to_string(),
-                completed_at: past,
-                elapsed_secs: 1.0,
-                outputs: vec![
-                    OutputRecord {
-                        path: indices_path.to_string_lossy().into_owned(),
-                        size: 6,
-                        mtime: None,
-                    },
-                    OutputRecord {
-                        path: distances_path.to_string_lossy().into_owned(),
-                        size: 6,
-                        mtime: None,
-                    },
-                ],
-                resolved_options: {
-                    let mut m = HashMap::new();
-                    m.insert("indices".to_string(), indices_path.to_string_lossy().into_owned());
-                    m.insert("distances".to_string(), distances_path.to_string_lossy().into_owned());
-                    m.insert("neighbors".to_string(), "100".to_string());
-                    m.insert("metric".to_string(), "L2".to_string());
-                    m
-                },
-                error: None,
-                resource_summary: None,
-                fingerprint: None,
-            },
-        );
-
-        let opts: HashMap<String, String> = [
-            ("indices".to_string(), indices_path.to_string_lossy().into_owned()),
-            ("distances".to_string(), distances_path.to_string_lossy().into_owned()),
-            ("neighbors".to_string(), "100".to_string()),
-            ("metric".to_string(), "L2".to_string()),
-        ].into_iter().collect();
-
-        // Should be FRESH — output files are not treated as inputs
-        let reason = log.check_step_freshness("knn", Some(&opts), None);
-        assert!(reason.is_none(), "expected fresh but got: {:?}", reason);
+        // Stale when output is deleted
+        std::fs::remove_file(&output_path).unwrap();
+        let reason = log.check_step_freshness("step1", None, None);
+        assert!(reason.is_some(), "should be stale when output missing");
+        assert!(reason.unwrap().contains("missing"));
     }
 
     #[test]

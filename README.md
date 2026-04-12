@@ -101,6 +101,7 @@ A dataset is a set of typed facets describing a vector search benchmark:
 | **P** | Predicates | Per-query filters (for filtered search) |
 | **R** | Predicate results | Which base vectors pass each filter |
 | **F** | Filtered KNN | Nearest neighbors after filtering |
+| **O** | Oracle partitions | Per-label base vectors + partitioned KNN |
 
 Files come in three flavors: **scalar** (`.u8`, `.i32` — flat arrays),
 **uniform vector** (`.fvec`, `.ivec` — fixed dimension per record), and

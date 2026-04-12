@@ -472,7 +472,7 @@ fn http_ivvec_remote_random_access() {
     let dir = setup_all_formats_dir();
     let path = dir.path().join("varindices.ivvec");
 
-    // Pre-build the index (simulates pipeline generate-vvec-index step)
+    // Pre-build the index (simulates pipeline writing + indexing)
     let local = IndexedXvecReader::open_ivec(&path).unwrap();
     assert_eq!(local.count(), 5);
 
@@ -1136,5 +1136,565 @@ fn synthetic_http_facet_manifest() {
     assert!(manifest.contains_key("metadata_predicates"), "missing metadata_predicates");
     assert!(manifest.contains_key("filtered_neighbor_indices"), "missing filtered_neighbor_indices");
     assert!(manifest.contains_key("filtered_neighbor_distances"), "missing filtered_neighbor_distances");
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Partition profiles: base_count, profile enumeration, data access
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Check that partition profiles exist and can be listed.
+fn require_partition_profiles() -> std::path::PathBuf {
+    let dir = require_synthetic_1k();
+    let label_dir = dir.join("profiles/label-0");
+    if !label_dir.exists() {
+        panic!("partition profiles not built — run compute partition-profiles on synthetic-1k first");
+    }
+    dir
+}
+
+#[test]
+fn partition_profile_enumeration() {
+    let dir = require_partition_profiles();
+    let group = TestDataGroup::load(dir.to_str().unwrap()).unwrap();
+
+    let names = group.profile_names();
+    assert!(names.contains(&"default".to_string()), "should have default");
+    assert!(names.contains(&"label-0".to_string()), "should have label-0");
+    assert!(names.len() >= 13, "should have default + 12 partitions, got {}", names.len());
+}
+
+#[test]
+fn partition_profile_base_count() {
+    let dir = require_partition_profiles();
+    let group = TestDataGroup::load(dir.to_str().unwrap()).unwrap();
+
+    // Default profile — base_count may or may not be set
+    let default_view = group.profile("default").unwrap();
+
+    // Partition profile — must have base_count
+    let label0 = group.profile("label-0").unwrap();
+    let bc = label0.base_count();
+    assert!(bc.is_some(), "partition profile must have base_count");
+    let count = bc.unwrap();
+    assert!(count > 0 && count < 1000,
+        "label-0 base_count {} should be between 1 and 999", count);
+}
+
+#[test]
+fn partition_profile_base_vectors_match_count() {
+    let dir = require_partition_profiles();
+    let group = TestDataGroup::load(dir.to_str().unwrap()).unwrap();
+
+    let label0 = group.profile("label-0").unwrap();
+    let bc = label0.base_count().unwrap();
+    let base = label0.base_vectors().unwrap();
+
+    assert_eq!(base.count() as u64, bc,
+        "base_vectors count {} should match base_count {}", base.count(), bc);
+    assert_eq!(base.dim(), 128, "dim should be 128");
+}
+
+#[test]
+fn partition_profile_over_http() {
+    let dir = require_partition_profiles();
+    let server = TestServer::start(&dir).unwrap();
+
+    let group = TestDataGroup::load(&server.base_url()).unwrap();
+
+    // Access partition profile via HTTP
+    let label0 = group.profile("label-0").unwrap();
+    let bc = label0.base_count();
+    assert!(bc.is_some(), "partition base_count via HTTP");
+
+    let base = label0.base_vectors().unwrap();
+    assert_eq!(base.count() as u64, bc.unwrap());
+    assert_eq!(base.dim(), 128);
+
+    // First vector should be readable
+    let v0 = base.get(0).unwrap();
+    assert_eq!(v0.len(), 128);
+    assert!(v0.iter().all(|v| v.is_finite()));
+}
+
+#[test]
+fn partition_profile_query_vectors_shared() {
+    let dir = require_partition_profiles();
+    let group = TestDataGroup::load(dir.to_str().unwrap()).unwrap();
+
+    let default_view = group.profile("default").unwrap();
+    let label0 = group.profile("label-0").unwrap();
+
+    let default_q = default_view.query_vectors().unwrap();
+    let label0_q = label0.query_vectors().unwrap();
+
+    // Same query count
+    assert_eq!(default_q.count(), label0_q.count(),
+        "query count should be same across profiles");
+
+    // Same query data
+    assert_eq!(default_q.get(0).unwrap(), label0_q.get(0).unwrap(),
+        "query[0] should be identical across profiles");
+}
+
+#[test]
+fn partition_all_profiles_have_base_count_over_http() {
+    let dir = require_partition_profiles();
+    let server = TestServer::start(&dir).unwrap();
+
+    let group = TestDataGroup::load(&server.base_url()).unwrap();
+
+    for name in group.profile_names() {
+        if name.starts_with("label-") {
+            let view = group.profile(&name).unwrap();
+            assert!(view.base_count().is_some(),
+                "partition profile '{}' must have base_count", name);
+            let bc = view.base_count().unwrap();
+            assert!(bc > 0, "partition '{}' base_count must be > 0", name);
+        }
+    }
+}
+
+#[test]
+fn partition_profile_ordering_consistent() {
+    // Profile ordering is by ascending base_count, with natural name sort
+    // as tiebreak for equal sizes. This test verifies that:
+    // 1. default comes first
+    // 2. Partition profiles are in ascending base_count order
+    // 3. Within the same base_count, natural name ordering applies
+    //    (e.g., label-2 before label-10)
+    let dir = require_partition_profiles();
+    let group = TestDataGroup::load(dir.to_str().unwrap()).unwrap();
+
+    let names = group.profile_names();
+    assert_eq!(names[0], "default", "default should be first");
+
+    // Verify ascending base_count order among partition profiles
+    let partitions: Vec<_> = names.iter()
+        .filter(|n| n.starts_with("label-"))
+        .collect();
+    for i in 1..partitions.len() {
+        let prev_view = group.profile(partitions[i - 1]).unwrap();
+        let curr_view = group.profile(partitions[i]).unwrap();
+        let prev_bc = prev_view.base_count().unwrap_or(0);
+        let curr_bc = curr_view.base_count().unwrap_or(0);
+        assert!(prev_bc <= curr_bc,
+            "profiles should be in ascending base_count order: {} ({}) before {} ({})",
+            partitions[i - 1], prev_bc, partitions[i], curr_bc);
+    }
+}
+
+#[test]
+fn partition_profile_ordering_consistent_over_http() {
+    let dir = require_partition_profiles();
+    let server = TestServer::start(&dir).unwrap();
+    let group = TestDataGroup::load(&server.base_url()).unwrap();
+
+    let names = group.profile_names();
+    assert_eq!(names[0], "default", "default should be first over HTTP");
+
+    let partitions: Vec<_> = names.iter()
+        .filter(|n| n.starts_with("label-"))
+        .collect();
+    for i in 1..partitions.len() {
+        let prev_view = group.profile(partitions[i - 1]).unwrap();
+        let curr_view = group.profile(partitions[i]).unwrap();
+        let prev_bc = prev_view.base_count().unwrap_or(0);
+        let curr_bc = curr_view.base_count().unwrap_or(0);
+        assert!(prev_bc <= curr_bc,
+            "HTTP profiles should be in ascending order: {} ({}) before {} ({})",
+            partitions[i - 1], prev_bc, partitions[i], curr_bc);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Format coverage tests
+//
+// Verify that every valid file format can be read in the positions where
+// it's used, both locally and over HTTP.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Write an fvec (f32 xvec) file.
+fn write_fvec_data(path: &std::path::Path, dim: usize, count: usize) {
+    let f = std::fs::File::create(path).unwrap();
+    let mut w = std::io::BufWriter::new(f);
+    for i in 0..count {
+        w.write_all(&(dim as i32).to_le_bytes()).unwrap();
+        for d in 0..dim {
+            let val = (i * dim + d + 1) as f32;
+            w.write_all(&val.to_le_bytes()).unwrap();
+        }
+    }
+    w.flush().unwrap();
+}
+
+/// Write an ivec (i32 xvec) file.
+fn write_ivec_data(path: &std::path::Path, dim: usize, count: usize) {
+    let f = std::fs::File::create(path).unwrap();
+    let mut w = std::io::BufWriter::new(f);
+    for i in 0..count {
+        w.write_all(&(dim as i32).to_le_bytes()).unwrap();
+        for d in 0..dim {
+            let val = ((i * dim + d) % 50) as i32; // ordinals within base count
+            w.write_all(&val.to_le_bytes()).unwrap();
+        }
+    }
+    w.flush().unwrap();
+}
+
+/// Write a scalar file (one element per record, no dim header).
+fn write_scalar(path: &std::path::Path, count: usize, elem_size: usize) {
+    let f = std::fs::File::create(path).unwrap();
+    let mut w = std::io::BufWriter::new(f);
+    for i in 0..count {
+        let val = (i % 256) as u32;
+        match elem_size {
+            1 => w.write_all(&[val as u8]).unwrap(),
+            2 => w.write_all(&(val as u16).to_le_bytes()).unwrap(),
+            4 => w.write_all(&(val as i32).to_le_bytes()).unwrap(),
+            8 => w.write_all(&(val as i64).to_le_bytes()).unwrap(),
+            _ => panic!("unsupported elem_size"),
+        }
+    }
+    w.flush().unwrap();
+}
+
+/// Write a variable-length ivvec file from explicit records.
+fn write_ivvec_records(path: &std::path::Path, records: &[Vec<i32>]) {
+    let f = std::fs::File::create(path).unwrap();
+    let mut w = std::io::BufWriter::new(f);
+    for record in records {
+        w.write_all(&(record.len() as i32).to_le_bytes()).unwrap();
+        for &val in record {
+            w.write_all(&val.to_le_bytes()).unwrap();
+        }
+    }
+    w.flush().unwrap();
+}
+
+/// Create a format coverage dataset with all valid file types.
+fn create_format_coverage_dataset(dir: &std::path::Path) {
+    use std::io::Write;
+
+    let dim = 4;
+    let base_count = 50;
+    let query_count = 10;
+    let k = 5;
+    let pred_count = 20;
+
+    // ── Base and query vectors: fvec (f32 xvec) ──
+    write_fvec_data(&dir.join("base_vectors.fvec"), dim, base_count);
+    write_fvec_data(&dir.join("query_vectors.fvec"), dim, query_count);
+
+    // ── KNN results: ivec (i32 indices) + fvec (f32 distances) ──
+    write_ivec_data(&dir.join("neighbor_indices.ivec"), k, query_count);
+    write_fvec_data(&dir.join("neighbor_distances.fvec"), k, query_count);
+
+    // ── Filtered KNN: same formats ──
+    write_ivec_data(&dir.join("filtered_neighbor_indices.ivec"), k, query_count);
+    write_fvec_data(&dir.join("filtered_neighbor_distances.fvec"), k, query_count);
+
+    // ── Metadata content: u8 scalar ──
+    write_scalar(&dir.join("metadata_content.u8"), base_count, 1);
+
+    // ── Metadata predicates: u8 scalar ──
+    write_scalar(&dir.join("predicates.u8"), pred_count, 1);
+
+    // ── Metadata indices: ivvec (variable-length i32) ──
+    let ivvec_records: Vec<Vec<i32>> = (0..pred_count).map(|i| {
+        (0..((i % 5) + 1) as i32).collect()
+    }).collect();
+    write_ivvec_records(&dir.join("metadata_indices.ivvec"), &ivvec_records);
+    // Build offset index
+    let _ = vectordata::io::IndexedXvecReader::open_ivec(&dir.join("metadata_indices.ivvec"));
+
+    // ── dataset.yaml ──
+    let yaml = format!(r#"name: format-coverage
+profiles:
+  default:
+    maxk: {k}
+    base_vectors: base_vectors.fvec
+    query_vectors: query_vectors.fvec
+    neighbor_indices: neighbor_indices.ivec
+    neighbor_distances: neighbor_distances.fvec
+    metadata_content: metadata_content.u8
+    metadata_predicates: predicates.u8
+    metadata_indices: metadata_indices.ivvec
+    filtered_neighbor_indices: filtered_neighbor_indices.ivec
+    filtered_neighbor_distances: filtered_neighbor_distances.fvec
+"#);
+    std::fs::write(dir.join("dataset.yaml"), &yaml).unwrap();
+}
+
+#[test]
+fn format_coverage_local_all_facets() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    create_format_coverage_dataset(dir);
+
+    let group = TestDataGroup::load(dir.to_str().unwrap()).unwrap();
+    let view = group.profile("default").unwrap();
+
+    // Base vectors: fvec (f32)
+    let base = view.base_vectors().unwrap();
+    assert_eq!(base.count(), 50, "base_vectors count");
+    assert_eq!(base.dim(), 4, "base_vectors dim");
+    let v0 = base.get(0).unwrap();
+    assert_eq!(v0.len(), 4);
+    assert!(v0[0].is_finite());
+
+    // Query vectors: fvec (f32)
+    let query = view.query_vectors().unwrap();
+    assert_eq!(query.count(), 10, "query_vectors count");
+    assert_eq!(query.dim(), 4, "query_vectors dim");
+
+    // Neighbor indices: ivec (i32)
+    let indices = view.neighbor_indices().unwrap();
+    assert_eq!(indices.count(), 10, "neighbor_indices count");
+    assert_eq!(indices.dim(), 5, "neighbor_indices dim (k)");
+
+    // Neighbor distances: fvec (f32)
+    let distances = view.neighbor_distances().unwrap();
+    assert_eq!(distances.count(), 10, "neighbor_distances count");
+    assert_eq!(distances.dim(), 5, "neighbor_distances dim (k)");
+
+    // Filtered indices + distances
+    let filt_idx = view.filtered_neighbor_indices().unwrap();
+    assert_eq!(filt_idx.count(), 10, "filtered_indices count");
+    let filt_dist = view.filtered_neighbor_distances().unwrap();
+    assert_eq!(filt_dist.count(), 10, "filtered_distances count");
+
+    // Metadata indices: ivvec (variable-length i32)
+    let meta_idx = view.metadata_indices().unwrap();
+    assert!(meta_idx.count() > 0, "metadata_indices should have records");
+}
+
+#[test]
+fn format_coverage_http_all_facets() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    create_format_coverage_dataset(dir);
+
+    let server = TestServer::start(dir).unwrap();
+    let group = TestDataGroup::load(&server.base_url()).unwrap();
+    let view = group.profile("default").unwrap();
+
+    // Base vectors over HTTP
+    let base = view.base_vectors().unwrap();
+    assert_eq!(base.count(), 50, "HTTP base_vectors count");
+    assert_eq!(base.dim(), 4, "HTTP base_vectors dim");
+    let v0 = base.get(0).unwrap();
+    assert!(v0[0].is_finite(), "HTTP base vector should be readable");
+
+    // Query vectors over HTTP
+    let query = view.query_vectors().unwrap();
+    assert_eq!(query.count(), 10, "HTTP query_vectors count");
+
+    // KNN over HTTP
+    let indices = view.neighbor_indices().unwrap();
+    assert_eq!(indices.count(), 10, "HTTP neighbor_indices count");
+    let distances = view.neighbor_distances().unwrap();
+    assert_eq!(distances.count(), 10, "HTTP neighbor_distances count");
+
+    // Filtered KNN over HTTP
+    let filt_idx = view.filtered_neighbor_indices().unwrap();
+    assert_eq!(filt_idx.count(), 10, "HTTP filtered_indices count");
+    let filt_dist = view.filtered_neighbor_distances().unwrap();
+    assert_eq!(filt_dist.count(), 10, "HTTP filtered_distances count");
+
+    // Variable-length metadata indices over HTTP
+    let meta_idx = view.metadata_indices().unwrap();
+    assert!(meta_idx.count() > 0, "HTTP metadata_indices count");
+}
+
+#[test]
+fn format_coverage_mvec_base_vectors() {
+    // mvec (f16) base vectors — opened via open_vec::<half::f16>
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+
+    // Write mvec file (2-byte f16 elements)
+    let dim = 4;
+    let count = 20;
+    {
+        let f = std::fs::File::create(dir.join("base.mvec")).unwrap();
+        let mut w = std::io::BufWriter::new(f);
+        for i in 0..count {
+            w.write_all(&(dim as i32).to_le_bytes()).unwrap();
+            for d in 0..dim {
+                let val = half::f16::from_f32((i * dim + d + 1) as f32);
+                w.write_all(&val.to_le_bytes()).unwrap();
+            }
+        }
+        w.flush().unwrap();
+    }
+
+    // Read via open_vec::<half::f16>
+    let reader = vectordata::io::open_vec::<half::f16>(
+        dir.join("base.mvec").to_str().unwrap()
+    ).unwrap();
+    assert_eq!(reader.count(), count);
+    assert_eq!(reader.dim(), dim);
+    let v0 = reader.get(0).unwrap();
+    assert_eq!(v0.len(), dim);
+    assert_eq!(v0[0], half::f16::from_f32(1.0));
+}
+
+#[test]
+fn format_coverage_bvec_base_vectors() {
+    // bvec (u8) base vectors — opened via open_vec::<u8>
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+
+    let dim = 4;
+    let count = 20;
+    {
+        let f = std::fs::File::create(dir.join("base.bvec")).unwrap();
+        let mut w = std::io::BufWriter::new(f);
+        for i in 0..count {
+            w.write_all(&(dim as i32).to_le_bytes()).unwrap();
+            for d in 0..dim {
+                w.write_all(&[((i * dim + d + 1) % 256) as u8]).unwrap();
+            }
+        }
+        w.flush().unwrap();
+    }
+
+    let reader = vectordata::io::open_vec::<u8>(
+        dir.join("base.bvec").to_str().unwrap()
+    ).unwrap();
+    assert_eq!(reader.count(), count);
+    assert_eq!(reader.dim(), dim);
+    let v0 = reader.get(0).unwrap();
+    assert_eq!(v0, vec![1, 2, 3, 4]);
+}
+
+#[test]
+fn format_coverage_mvec_over_http() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+
+    let dim = 4;
+    let count = 20;
+    {
+        let f = std::fs::File::create(dir.join("base.mvec")).unwrap();
+        let mut w = std::io::BufWriter::new(f);
+        for i in 0..count {
+            w.write_all(&(dim as i32).to_le_bytes()).unwrap();
+            for d in 0..dim {
+                let val = half::f16::from_f32((i * dim + d + 1) as f32);
+                w.write_all(&val.to_le_bytes()).unwrap();
+            }
+        }
+        w.flush().unwrap();
+    }
+
+    let server = TestServer::start(dir).unwrap();
+    let url = format!("{}/base.mvec", server.base_url().trim_end_matches('/'));
+    let reader = vectordata::io::open_vec::<half::f16>(&url).unwrap();
+    assert_eq!(reader.count(), count, "HTTP mvec count");
+    assert_eq!(reader.dim(), dim, "HTTP mvec dim");
+    let v0 = reader.get(0).unwrap();
+    assert_eq!(v0[0], half::f16::from_f32(1.0));
+}
+
+// ── Typed access coverage ──────────────────────────────────────────
+
+#[test]
+fn format_coverage_typed_access_scalar_formats() {
+    use vectordata::typed_access::TypedReader;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+
+    // Write scalar files in various formats
+    write_scalar(dir.join("meta.u8").as_path(), 100, 1);
+    write_scalar(dir.join("meta.i32").as_path(), 100, 4);
+    write_scalar(dir.join("meta.u16").as_path(), 100, 2);
+    write_scalar(dir.join("meta.i64").as_path(), 100, 8);
+
+    // Native access — each type matches exactly
+    let r_u8 = TypedReader::<u8>::open(dir.join("meta.u8")).unwrap();
+    assert_eq!(r_u8.count(), 100);
+    assert_eq!(r_u8.dim(), 1); // scalar = dim 1
+
+    let r_i32 = TypedReader::<i32>::open(dir.join("meta.i32")).unwrap();
+    assert_eq!(r_i32.count(), 100);
+
+    let r_u16 = TypedReader::<u16>::open(dir.join("meta.u16")).unwrap();
+    assert_eq!(r_u16.count(), 100);
+
+    let r_i64 = TypedReader::<i64>::open(dir.join("meta.i64")).unwrap();
+    assert_eq!(r_i64.count(), 100);
+
+    // Widening access — u8 as i32 (always succeeds)
+    let r_wide = TypedReader::<i32>::open(dir.join("meta.u8")).unwrap();
+    assert_eq!(r_wide.count(), 100);
+    let val = r_wide.get_value(0).unwrap();
+    assert_eq!(val, 0_i32); // first u8 value (0 % 256)
+
+    // Narrowing access — i32 as u8 should fail
+    let r_narrow = TypedReader::<u8>::open(dir.join("meta.i32"));
+    assert!(r_narrow.is_err(), "narrowing i32→u8 should fail at open");
+}
+
+#[test]
+fn format_coverage_typed_access_via_profile() {
+    use vectordata::typed_access::TypedReader;
+    use vectordata::view::GenericTestDataView;
+    use vectordata::group::DataSource;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+
+    // Create a dataset with u8 metadata and u16 predicates
+    write_fvec_data(&dir.join("base.fvec"), 4, 50);
+    write_fvec_data(&dir.join("query.fvec"), 4, 10);
+    write_ivec_data(&dir.join("indices.ivec"), 5, 10);
+    write_fvec_data(&dir.join("distances.fvec"), 5, 10);
+    write_scalar(&dir.join("meta.u8"), 50, 1);
+    write_scalar(&dir.join("preds.u16"), 20, 2);
+
+    let yaml = r#"name: typed-access-test
+profiles:
+  default:
+    maxk: 5
+    base_vectors: base.fvec
+    query_vectors: query.fvec
+    neighbor_indices: indices.ivec
+    neighbor_distances: distances.fvec
+    metadata_content: meta.u8
+    metadata_predicates: preds.u16
+"#;
+    std::fs::write(dir.join("dataset.yaml"), yaml).unwrap();
+
+    let group = TestDataGroup::load(dir.to_str().unwrap()).unwrap();
+
+    // Load the config and create a GenericTestDataView for typed access
+    let config: vectordata::model::DatasetConfig =
+        serde_yaml::from_str(yaml).unwrap();
+    let default_cfg = config.profiles.get("default").unwrap();
+    let view = GenericTestDataView::new(
+        DataSource::FileSystem(dir.to_path_buf()),
+        default_cfg.clone(),
+    );
+
+    // Open metadata_content as native u8
+    let r_native: TypedReader<u8> = view.open_facet_typed("metadata_content").unwrap();
+    assert_eq!(r_native.count(), 50);
+    assert!(r_native.is_native());
+
+    // Open metadata_content as widened i32
+    let r_wide: TypedReader<i32> = view.open_facet_typed("metadata_content").unwrap();
+    assert_eq!(r_wide.count(), 50);
+    assert!(!r_wide.is_native()); // widened, not native
+
+    // Open predicates as native u16
+    let r_pred: TypedReader<u16> = view.open_facet_typed("metadata_predicates").unwrap();
+    assert_eq!(r_pred.count(), 20);
+    assert!(r_pred.is_native());
+
+    // Open predicates as widened i32
+    let r_pred_wide: TypedReader<i32> = view.open_facet_typed("metadata_predicates").unwrap();
+    assert_eq!(r_pred_wide.count(), 20);
 }
 

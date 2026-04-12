@@ -117,6 +117,11 @@ pub trait TestDataView: Send + Sync {
     /// ```
     fn facet_element_type(&self, name: &str) -> Result<crate::typed_access::ElementType>;
 
+    // -- Profile metadata --
+
+    /// Returns the base vector count for this profile, if declared.
+    fn base_count(&self) -> Option<u64>;
+
     // -- Dataset metadata --
 
     /// Returns the distance function name if declared in attributes.
@@ -299,6 +304,7 @@ impl GenericTestDataView {
     }
 }
 
+#[allow(dead_code)]
 enum ResourceLocation {
     FileSystem(PathBuf),
     Http(Url),
@@ -381,6 +387,10 @@ impl TestDataView for GenericTestDataView {
         let path = self.resolve_facet_path(name)?;
         crate::typed_access::ElementType::from_path(&path)
             .map_err(Error::Other)
+    }
+
+    fn base_count(&self) -> Option<u64> {
+        self.config.base_count
     }
 
     fn distance_function(&self) -> Option<String> {

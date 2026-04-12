@@ -127,7 +127,19 @@ pub struct ImportArgs {
     /// Number of queries to verify in verify-knn. 0 means all queries.
     #[serde(default)]
     pub verify_knn_sample: u32,
+    /// Create oracle partition profiles (one per label value).
+    #[serde(default)]
+    pub partition_oracles: bool,
+    /// Maximum number of partition profiles to create.
+    #[serde(default = "default_max_partitions")]
+    pub max_partitions: u32,
+    /// Behavior when a partition has fewer than k vectors: "error", "warn", "include".
+    #[serde(default = "default_on_undersized")]
+    pub on_undersized: String,
 }
+
+fn default_max_partitions() -> u32 { 100 }
+fn default_on_undersized() -> String { "error".to_string() }
 
 fn default_personality() -> String {
     "native".to_string()
@@ -173,6 +185,7 @@ pub const FACET_CODES: &[(&str, char, &str)] = &[
     ("metadata_predicates",        'P', "Predicates"),
     ("metadata_indices",           'R', "Predicate evaluation results"),
     ("filtered_neighbor_indices",  'F', "Filtered KNN"),
+    ("oracle_partitions",          'O', "Oracle partition profiles"),
 ];
 
 /// Parse a facet specification string into a canonical code string.
@@ -182,24 +195,30 @@ pub const FACET_CODES: &[(&str, char, &str)] = &[
 /// - `"B,Q,G,D"` or `"base,query,gt,dist"` — comma-separated
 /// - `"base query gt dist"` — space-separated names
 /// - Full facet names like `"base_vectors,query_vectors"`
+/// All recognized single-letter facet codes.
+const ALL_FACET_CHARS: &str = "BQGDMPRFObqgdmprfo";
+
 pub fn parse_facet_spec(spec: &str) -> String {
     let spec = spec.trim();
 
     // Strip leading '=' that can appear from shell quoting like --flag ="value"
     let spec = spec.strip_prefix('=').unwrap_or(spec);
 
-    // '*' or 'all' → every facet
+    // '*' or 'all' → every facet (O excluded — must be explicit)
     if spec == "*" || spec.eq_ignore_ascii_case("all") {
         return "BQGDMPRF".to_string();
     }
 
-    // If it's all uppercase letters from BQGDMPRF, treat as compact codes
+    // If it's all recognized facet letters (compact codes), treat directly
     if !spec.is_empty()
-        && spec.chars().all(|c| "BQGDMPRFbqgdmprf".contains(c))
+        && spec.chars().all(|c| ALL_FACET_CHARS.contains(c) || c == '+')
         && !spec.contains(',')
         && !spec.contains(' ')
     {
-        return spec.to_uppercase();
+        // Handle '+' prefix: "+O" means "add O to inferred facets"
+        // "+MPRFO" means "add MPRFO to inferred facets"
+        // The '+' is stripped — the caller handles merging with inferred set
+        return spec.replace('+', "").to_uppercase();
     }
 
     // Split on comma or space
@@ -221,9 +240,10 @@ pub fn parse_facet_spec(spec: &str) -> String {
             "p" | "pred" | "predicates" | "metadata_predicates" => 'P',
             "r" | "results" | "metadata_indices" => 'R',
             "f" | "filtered" | "filtered_neighbor_indices" => 'F',
+            "o" | "oracle" | "oracles" | "oracle_partitions" | "partitions" => 'O',
             other => {
                 // Single uppercase letter?
-                if other.len() == 1 && "bqgdmprf".contains(other) {
+                if other.len() == 1 && "bqgdmprfo".contains(other) {
                     other.to_uppercase().chars().next().unwrap()
                 } else {
                     eprintln!("Warning: unknown facet '{}', ignoring", other);
@@ -722,6 +742,9 @@ struct Step {
     /// across all profiles before phase 1 (verify) begins.
     #[allow(dead_code)]
     phase: u32,
+    /// When true, this step runs in the finalization pass — after all
+    /// compute phases (core, deferred sized, partition expansion) complete.
+    finalize: bool,
     options: Vec<(String, String)>,
 }
 
@@ -734,6 +757,7 @@ impl Default for Step {
             after: Vec::new(),
             per_profile: false,
             phase: 0,
+            finalize: false,
             options: Vec::new(),
         }
     }
@@ -806,6 +830,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
             after: vec![],
             per_profile: false,
             phase: 0,
+            finalize: false,
             options: convert_opts,
         });
     }
@@ -842,6 +867,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
             after: vec![],
             per_profile: false,
             phase: 0,
+            finalize: false,
             options: vec![
                 ("source".into(), source_path),
                 ("output".into(), subset_output),
@@ -865,6 +891,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
             after,
             per_profile: false,
             phase: 0,
+            finalize: false,
             options: vec![
                 ("source".into(), source),
                 ("output".into(), output),
@@ -896,6 +923,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
             after: if last_vector_step.is_empty() { vec![] } else { vec![last_vector_step.into()] },
             per_profile: false,
             phase: 0,
+            finalize: false,
             options: vec![
                 ("name".into(), "vector_count".into()),
                 ("value".into(), format!("count:{}", working_vectors)),
@@ -914,6 +942,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
             after: if last_vector_step.is_empty() { vec![] } else { vec![last_vector_step.into()] },
             per_profile: false,
             phase: 0,
+            finalize: false,
             options: vec![
                 ("name".into(), "source_base_count".into()),
                 ("value".into(), format!("count:{}", rel)),
@@ -929,6 +958,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
             after: vec![],
             per_profile: false,
             phase: 0,
+            finalize: false,
             options: vec![
                 ("name".into(), "source_query_count".into()),
                 ("value".into(), format!("count:{}", rel)),
@@ -943,6 +973,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
             after: vec![],
             per_profile: false,
             phase: 0,
+            finalize: false,
             options: vec![
                 ("name".into(), "source_query_count".into()),
                 ("value".into(), "0".into()),
@@ -965,6 +996,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
             after: vec![],
             per_profile: false,
             phase: 0,
+            finalize: false,
             options: vec![
                 ("name".into(), name.into()),
                 ("value".into(), value),
@@ -983,6 +1015,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
             after: if last_vector_step.is_empty() { vec![] } else { vec![last_vector_step.into()] },
             per_profile: false,
             phase: 0,
+            finalize: false,
             options: {
                 let mut opts = vec![
                     ("source".into(), working_vectors.clone()),
@@ -1007,6 +1040,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
             after: vec!["prepare-vectors".into()],
             per_profile: false,
             phase: 0,
+            finalize: false,
             options: vec![
                 ("name".into(), "duplicate_count".into()),
                 ("value".into(), "count:${cache}/dedup_duplicates.ivec".into()),
@@ -1028,6 +1062,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
             after: vec!["count-vectors".into()],
             per_profile: false,
             phase: 0,
+            finalize: false,
             options: vec![
                 ("source".into(), slots.base_vectors.path().into()),
             ],
@@ -1039,6 +1074,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
             after: vec!["count-vectors".into()],
             per_profile: false,
             phase: 0,
+            finalize: false,
             options: vec![
                 ("source".into(), slots.base_vectors.path().into()),
             ],
@@ -1082,6 +1118,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
                 after: shuffle_after,
                 per_profile: false,
                 phase: 0,
+                finalize: false,
                 options: shuffle_opts,
             });
         }
@@ -1121,6 +1158,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
                         after: vec![count_dep.into()],
                         per_profile: false,
                         phase: 0,
+                        finalize: false,
                         options: vec![
                             ("name".into(), "base_end".into()),
                             ("value".into(), format!(
@@ -1159,6 +1197,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
                     after: extract_deps.clone(),
                     per_profile: false,
                     phase: 0,
+                    finalize: false,
                     options: query_opts,
                 });
                 let base_opts = vec![
@@ -1179,6 +1218,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
                     after: extract_deps,
                     per_profile: false,
                     phase: 0,
+                    finalize: false,
                     options: base_opts,
                 });
                 steps.push(Step {
@@ -1188,6 +1228,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
                     after: vec!["extract-base".into()],
                     per_profile: false,
                     phase: 0,
+                    finalize: false,
                     options: vec![
                         ("name".into(), "base_count".into()),
                         ("value".into(), format!("count:{}", slots.base_vectors.path())),
@@ -1213,6 +1254,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
                 after: vec![],
                 per_profile: false,
                 phase: 0,
+                finalize: false,
                 options: {
                     let mut opts = vec![
                         ("facet".into(), "query_vectors".into()),
@@ -1268,6 +1310,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
                 after,
                 per_profile: false,
                 phase: 0,
+                finalize: false,
                 options: base_opts,
             });
             // Count base vectors
@@ -1278,6 +1321,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
                 after: vec!["extract-base".into()],
                 per_profile: false,
                 phase: 0,
+                finalize: false,
                 options: vec![
                     ("name".into(), "base_count".into()),
                     ("value".into(), format!("count:{}", slots.base_vectors.path())),
@@ -1311,6 +1355,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
                     after: vec![],
                     per_profile: false,
                     phase: 0,
+                    finalize: false,
                     options: meta_opts,
                 });
             } else if args.synthesize_metadata {
@@ -1333,6 +1378,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
                     after: vec!["count-vectors".into()],
                     per_profile: false,
                     phase: 0,
+                    finalize: false,
                     options: gen_meta_opts,
                 });
             }
@@ -1351,6 +1397,10 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
             if args.base_fraction < 1.0 && !subset_applied {
                 after.push("compute-base-end".into());
             }
+            // Determine metadata output extension from the source format
+            let meta_ext = std::path::Path::new(meta.metadata_all.path())
+                .extension().and_then(|e| e.to_str()).unwrap_or("slab");
+
             steps.push(Step {
                 id: "extract-metadata".into(),
                 run: "transform extract".into(),
@@ -1358,10 +1408,11 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
                 after,
                 per_profile: false,
                 phase: 0,
+                finalize: false,
                 options: vec![
                     ("source".into(), meta.metadata_all.path().into()),
                     ("ivec-file".into(), "${cache}/shuffle.ivec".into()),
-                    ("output".into(), format!("{}metadata_content.slab", pp)),
+                    ("output".into(), format!("{}metadata_content.{}", pp, meta_ext)),
                     ("range".into(), if args.base_fraction < 1.0 && !subset_applied {
                         "[${query_count},${base_end})".into()
                     } else if slots.prepare.is_materialized() {
@@ -1388,6 +1439,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
                 after: survey_after.clone(),
                 per_profile: false,
                 phase: 0,
+                finalize: false,
                 options: vec![
                     ("source".into(), meta.metadata_all.path().into()),
                     ("output".into(), "${cache}/metadata_survey.json".into()),
@@ -1441,6 +1493,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
             after: pred_after,
             per_profile: false,
             phase: 0,
+            finalize: false,
             options: pred_opts,
         });
 
@@ -1478,6 +1531,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
             after: eval_after,
             per_profile: true,
             phase: 1,
+            finalize: false,
             options: eval_opts,
         });
     }
@@ -1529,6 +1583,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
                 after,
                 per_profile: true,
                 phase: 0,
+                finalize: false,
                 options: {
                     let mut opts = vec![
                         ("base".into(), if slots.base_count.is_some() {
@@ -1576,6 +1631,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
                 after,
                 per_profile: true,
                 phase: 2, // after all evaluate-predicates — base + pred indices I/O phase
+                finalize: false,
                 options: {
                     let mut opts = vec![
                         ("base".into(), if slots.base_count.is_some() {
@@ -1624,6 +1680,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
             after: verify_after,
             per_profile: false, // NOT per-profile — one step verifies all
             phase: 0,
+            finalize: false,
             options: vec![
                 ("base".into(), slots.base_vectors.path().into()),
                 ("query".into(), slots.query_vectors.as_ref().unwrap().path().into()),
@@ -1654,12 +1711,13 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
                     after: vec!["evaluate-predicates".into()],
                     per_profile: true,
                     phase: 1,
+                    finalize: false,
                     options: vec![
                         ("metadata".into(), meta.metadata_content.path().into()),
                         ("predicates".into(), meta.predicates.path().into()),
                         ("results".into(), meta.predicate_indices.path().into()),
                         ("fields".into(), args.metadata_fields.to_string()),
-                        ("output".into(), "${cache}/verify_predicates_sqlite.json".into()),
+                        ("output".into(), "${cache}/${profile_name}_verify_predicates_sqlite.json".into()),
                     ],
                 });
             }
@@ -1674,6 +1732,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
                 after: vec!["evaluate-predicates".into()],
                 per_profile: false,
                 phase: 0,
+                finalize: false,
                 options: vec![
                     ("metadata".into(), meta.metadata_content.path().into()),
                     ("predicates".into(), meta.predicates.path().into()),
@@ -1698,6 +1757,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
                 after: vec!["compute-filtered-knn".into()],
                 per_profile: false,
                 phase: 0,
+                finalize: false,
                 options: vec![
                     ("base".into(), slots.base_vectors.path().into()),
                     ("query".into(), slots.query_vectors.as_ref().unwrap().path().into()),
@@ -1730,6 +1790,36 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
     if is_simple_synth && slots.metadata.is_some() {
         json_after.push("verify-predicates-sqlite".into());
     }
+    // ── Oracle partition profiles ────────────────────────────────
+    let facets = resolve_facets(args);
+    let wants_oracles = args.partition_oracles || facets.contains('O');
+    if wants_oracles && slots.metadata.is_some() && slots.filtered_knn.is_some() {
+        let partition_after = if slots.filtered_knn.as_ref().map(|f| f.is_materialized()).unwrap_or(false) {
+            vec!["verify-filtered-knn".into()]
+        } else {
+            vec!["evaluate-predicates".into()]
+        };
+        steps.push(Step {
+            id: "partition-profiles".into(),
+            run: "compute partition-profiles".into(),
+            description: Some("Create per-label oracle partition profiles".into()),
+            after: partition_after,
+            per_profile: false,
+            phase: 0,
+            finalize: false,
+            options: vec![
+                ("base".into(), slots.base_vectors.path().into()),
+                ("query".into(), slots.query_vectors.as_ref().unwrap().path().into()),
+                ("metadata".into(), slots.metadata.as_ref().unwrap().metadata_content.path().into()),
+                ("neighbors".into(), args.neighbors.to_string()),
+                ("metric".into(), args.metric.clone()),
+                ("allowed-partitions".into(), args.max_partitions.to_string()),
+                ("on-undersized".into(), args.on_undersized.clone()),
+            ],
+        });
+        json_after.push("partition-profiles".into());
+    }
+
     if json_after.is_empty() {
         if let Some(last) = steps.last() {
             json_after.push(last.id.clone());
@@ -1742,6 +1832,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
         after: json_after,
         per_profile: false,
         phase: 0,
+        finalize: true,
         options: vec![],
     });
 
@@ -1753,6 +1844,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
         after: vec!["generate-dataset-json".into()],
         per_profile: false,
         phase: 0,
+        finalize: true,
         options: vec![],
     });
     steps.push(Step {
@@ -1762,35 +1854,23 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
         after: vec!["generate-dataset-json".into()],
         per_profile: false,
         phase: 0,
+        finalize: true,
         options: vec![],
-    });
-
-    // ── VVec index generation ──────────────────────────────────────
-    // Build offset index files for any variable-length vector files
-    // so downstream consumers can random-access them after download.
-    // Runs before merkle so the index files get .mref coverage.
-    steps.push(Step {
-        id: "generate-vvec-index".into(),
-        run: "generate vvec-index".into(),
-        description: Some("Build offset indices for variable-length vector files".into()),
-        after: vec!["generate-variables-json".into(), "generate-dataset-log-jsonl".into()],
-        per_profile: false,
-        phase: 0,
-        options: vec![
-            ("source".into(), ".".into()),
-        ],
     });
 
     // ── Merkle hash trees ────────────────────────────────────────
     // Runs before catalog generation so that all data files have
     // .mref hashes before the catalog snapshot is taken.
+    // VVec offset indices are built automatically at write time by
+    // evaluate-predicates — no separate step needed.
     steps.push(Step {
         id: "generate-merkle".into(),
         run: "merkle create".into(),
         description: Some("Create merkle hash trees for all publishable data files".into()),
-        after: vec!["generate-vvec-index".into()],
+        after: vec!["generate-variables-json".into(), "generate-dataset-log-jsonl".into()],
         per_profile: false,
         phase: 0,
+        finalize: true,
         options: vec![
             ("source".into(), ".".into()),
             ("min-size".into(), "0".into()),
@@ -1809,6 +1889,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
         after: vec!["generate-merkle".into()],
         per_profile: false,
         phase: 0,
+        finalize: true,
         options: vec![
             ("source".into(), ".".into()),
         ],
@@ -1966,6 +2047,8 @@ fn generate_yaml(
         out.push_str(&format!("  personality: {}\n", args.personality));
     }
     out.push_str(&format!("  distance_function: {}\n", args.metric));
+    out.push_str(&format!("  veks_version: {}\n", env!("CARGO_PKG_VERSION")));
+    out.push_str(&format!("  veks_build: {}\n", env!("VEKS_BUILD_HASH")));
     // is_normalized, is_duplicate_vector_free, and is_zero_vector_free
     // are set by the pipeline after the relevant steps complete — not
     // at generation time when correctness hasn't been verified yet.
@@ -1989,6 +2072,9 @@ fn generate_yaml(
             }
             if step.phase > 0 {
                 out.push_str(&format!("      phase: {}\n", step.phase));
+            }
+            if step.finalize {
+                out.push_str("      finalize: true\n");
             }
             if !step.after.is_empty() {
                 out.push_str(&format!("      after: [{}]\n", step.after.join(", ")));
@@ -2889,6 +2975,9 @@ mod tests {
             predicate_range_min: 0,
             predicate_range_max: 1000,
             verify_knn_sample: 0,
+            partition_oracles: false,
+            max_partitions: 100,
+            on_undersized: "error".to_string(),
         }
     }
 
@@ -2934,7 +3023,7 @@ mod tests {
         // shuffle, extract-query, extract-base, count-base,
         // compute-knn, verify-knn, generate-dataset-json, generate-variables-json,
         // generate-dataset-log-jsonl, generate-merkle, generate-catalog
-        assert_eq!(steps.len(), 20, "steps: {:?}", steps.iter().map(|s| &s.id).collect::<Vec<_>>());
+        assert_eq!(steps.len(), 19, "steps: {:?}", steps.iter().map(|s| &s.id).collect::<Vec<_>>());
         let step_ids: Vec<&str> = steps.iter().map(|s| s.id.as_str()).collect();
         assert!(step_ids.contains(&"count-duplicates"), "should have count-duplicates");
         assert!(step_ids.contains(&"count-source-base"), "should have count-source-base");

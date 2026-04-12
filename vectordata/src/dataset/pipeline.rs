@@ -86,6 +86,16 @@ pub struct StepDef {
     #[serde(default, skip_serializing_if = "is_zero")]
     pub phase: u32,
 
+    /// When true, this step runs in the finalization pass — after all
+    /// compute phases (core, deferred sized, partition expansion) have
+    /// completed. Finalization steps are held out of the Phase 1/2/3
+    /// DAGs and executed once at the end, ensuring they see the full
+    /// set of profiles and artifacts. Typical finalization steps:
+    /// generate-dataset-json, generate-variables-json, generate-merkle,
+    /// generate-catalog.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub finalize: bool,
+
     /// What to do when the output artifact is partially complete.
     #[serde(default, skip_serializing_if = "OnPartial::is_restart")]
     pub on_partial: OnPartial,
@@ -176,6 +186,7 @@ mod tests {
             profiles: vec![],
             per_profile: false,
             phase: 0,
+            finalize: false,
             on_partial: OnPartial::default(),
             options: IndexMap::new(),
         };
@@ -192,6 +203,7 @@ mod tests {
             profiles: vec![],
             per_profile: false,
             phase: 0,
+            finalize: false,
             on_partial: OnPartial::default(),
             options: IndexMap::new(),
         };
@@ -247,6 +259,7 @@ steps:
             profiles: vec![],
             per_profile: false,
             phase: 0,
+            finalize: false,
             on_partial: OnPartial::default(),
             options: opts,
         };
@@ -283,6 +296,7 @@ steps:
             profiles: vec![],
             per_profile: false,
             phase: 0,
+            finalize: false,
             on_partial: OnPartial::default(),
             options: IndexMap::new(),
         };
@@ -300,6 +314,7 @@ steps:
             profiles: vec!["10M".to_string(), "100M".to_string()],
             per_profile: false,
             phase: 0,
+            finalize: false,
             on_partial: OnPartial::default(),
             options: IndexMap::new(),
         };

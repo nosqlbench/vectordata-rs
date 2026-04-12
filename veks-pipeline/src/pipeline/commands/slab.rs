@@ -2192,7 +2192,11 @@ fn survey_ivec(
     if data.len() < 4 {
         return Err(format!("{}: too small for ivec", path.display()));
     }
-    let dim = i32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+    let dim_i32 = i32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+    if dim_i32 <= 0 {
+        return Err(format!("{}: invalid dimension {}", path.display(), dim_i32));
+    }
+    let dim = dim_i32 as usize;
     let record_bytes = 4 + dim * 4;
     let total_records = data.len() / record_bytes;
     let sample_count = total_records.min(max_samples);

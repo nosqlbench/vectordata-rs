@@ -84,6 +84,9 @@ fn default_args(name: &str, output: &Path) -> ImportArgs {
             predicate_range_min: 0,
             predicate_range_max: 1000,
             verify_knn_sample: 0,
+            partition_oracles: false,
+            max_partitions: 100,
+            on_undersized: "error".to_string(),
     }
 }
 
@@ -742,11 +745,11 @@ fn e2e_dedup_correctness() {
     assert!(vars.contains("duplicate_count: '1'") || vars.contains("duplicate_count: \"1\""),
         "expected duplicate_count=1 in variables.yaml, got:\n{}", vars);
 
-    // clean_count should be 199 (200 - 1 dup, set by prepare-vectors)
+    // clean_count should be 198 (200 - 1 dup - 1 zero, set by prepare-vectors)
     // Zero detection happens during extraction, which may not run in
     // base-only mode without self-search.
-    assert!(vars.contains("clean_count: '199'") || vars.contains("clean_count: \"199\""),
-        "expected clean_count=199 in variables.yaml, got:\n{}", vars);
+    assert!(vars.contains("clean_count: '198'") || vars.contains("clean_count: \"198\""),
+        "expected clean_count=198 in variables.yaml, got:\n{}", vars);
 }
 
 /// E2E Config 11: Base fraction 10% via CLI bootstrap --auto.
@@ -1542,4 +1545,271 @@ fn e2e_source_zero_count_through_duplicates() {
 // vectordata/tests/http_access.rs — a self-contained dataset.yaml
 // pipeline that generates all facets from scratch and is tested
 // behind an HTTP server with the unified vectordata API.
+
+/// E2E test: finalize steps run after all compute steps.
+///
+/// Bootstraps a self-search pipeline, runs it, and reads the progress
+/// log to verify that every finalize step completed AFTER every compute
+/// step. This is the core invariant ensured by the finalize pass.
+#[test]
+fn e2e_finalize_steps_run_after_compute() {
+    let tmp = make_tempdir();
+    let fvec = tmp.path().join("vectors.fvec");
+    copy_fixture("base.fvec", &fvec);
+
+    let out = tmp.path().join("dataset");
+    let mut args = default_args("e2e-finalize-order", &out);
+    args.base_vectors = Some(fvec);
+    args.self_search = true;
+
+    // Bootstrap
+    veks::prepare::import::run(args);
+    let dataset_yaml = out.join("dataset.yaml");
+    assert!(dataset_yaml.exists(), "dataset.yaml not generated");
+
+    // Verify finalize: true is in the emitted YAML
+    let yaml_content = std::fs::read_to_string(&dataset_yaml).unwrap();
+    assert!(yaml_content.contains("finalize: true"),
+        "emitted dataset.yaml should contain finalize: true");
+
+    // Run pipeline
+    let (success, output) = run_pipeline(&dataset_yaml);
+    assert!(success, "pipeline failed:\n{}", output);
+
+    // The run log should show the finalization banner
+    let run_log = std::fs::read_to_string(out.join(".cache/run.log"))
+        .unwrap_or_default();
+    assert!(run_log.contains("Finalization:") || output.contains("Finalization:"),
+        "run log or output should show 'Finalization:' banner.\n\
+         run.log:\n{}\n\noutput:\n{}", run_log, output);
+
+    // Read progress log and verify ordering
+    let progress_path = out.join(".cache/.upstream.progress.yaml");
+    assert!(progress_path.exists(), "progress log should exist");
+    let progress_content = std::fs::read_to_string(&progress_path).unwrap();
+
+    // Parse completion timestamps from the progress log.
+    // Each step has a `completed_at:` field in RFC 3339 format.
+    let finalize_ids = [
+        "generate-dataset-json",
+        "generate-variables-json",
+        "generate-dataset-log-jsonl",
+        "generate-merkle",
+        "generate-catalog",
+    ];
+
+    // Extract (step_id, completed_at) pairs from the YAML
+    let progress: serde_yaml::Value = serde_yaml::from_str(&progress_content).unwrap();
+    let steps = progress.get("steps").and_then(|s| s.as_mapping()).unwrap();
+
+    let mut compute_max_time: Option<String> = None;
+    let mut finalize_min_time: Option<String> = None;
+
+    for (key, val) in steps {
+        let step_id = key.as_str().unwrap();
+        let completed = val.get("completed_at")
+            .and_then(|t| t.as_str())
+            .unwrap_or("");
+
+        if finalize_ids.contains(&step_id) {
+            match &finalize_min_time {
+                None => finalize_min_time = Some(completed.to_string()),
+                Some(current) if completed < current.as_str() =>
+                    finalize_min_time = Some(completed.to_string()),
+                _ => {}
+            }
+        } else {
+            match &compute_max_time {
+                None => compute_max_time = Some(completed.to_string()),
+                Some(current) if completed > current.as_str() =>
+                    compute_max_time = Some(completed.to_string()),
+                _ => {}
+            }
+        }
+    }
+
+    // The earliest finalize step should complete no earlier than
+    // the latest compute step. (They could be equal if sub-second
+    // precision rounds the same second, but never reversed.)
+    if let (Some(compute_max), Some(finalize_min)) = (&compute_max_time, &finalize_min_time) {
+        assert!(finalize_min >= compute_max,
+            "finalize step started at {} but compute step completed at {} — \
+             finalize should run AFTER all compute steps",
+            finalize_min, compute_max);
+    }
+
+    // Verify all expected finalize steps are present in the progress log
+    for id in &finalize_ids {
+        assert!(steps.get(serde_yaml::Value::String(id.to_string())).is_some(),
+            "finalize step '{}' should be in progress log", id);
+    }
+
+    // Verify finalize artifacts exist
+    assert!(out.join("dataset.json").exists(),
+        "dataset.json should be produced by finalize pass");
+    assert!(out.join("variables.json").exists(),
+        "variables.json should be produced by finalize pass");
+}
+
+/// E2E test: oracle partition profiles through the full pipeline.
+///
+/// Bootstraps with synthesized u8 metadata + partition_oracles=true, runs
+/// the pipeline through Phase 3 expansion, and verifies:
+/// - Partition profiles created with base_count
+/// - Base vectors files exist on disk
+/// - Query vectors symlinks resolve
+/// - Natural ordering by base_count
+/// - Finalization artifacts (dataset.json, variables.json) include partitions
+///
+/// Uses 2000 vectors (dim=8) with no zeros or duplicates to avoid edge cases.
+#[test]
+fn e2e_partition_profiles_full_pipeline() {
+    let tmp = make_tempdir();
+    let fvec = tmp.path().join("vectors.fvec");
+    // Write 2000 distinct non-zero vectors (dim=8) — large enough for
+    // realistic KNN and partitioning without corner case workarounds.
+    write_distinct_fvec(&fvec, 2000, 8, 1);
+
+    let out = tmp.path().join("dataset");
+    let mut args = default_args("e2e-partitions", &out);
+    args.base_vectors = Some(fvec);
+    args.self_search = true;
+    args.synthesize_metadata = true;
+    args.synthesis_format = "u8".to_string();
+    args.metadata_fields = 1;
+    args.metadata_range_min = 0;
+    args.metadata_range_max = 4; // 5 distinct labels → up to 5 partitions
+    args.partition_oracles = true;
+    args.on_undersized = "warn".to_string();
+    args.required_facets = Some("BQGDMPRFO".to_string());
+
+    // Bootstrap
+    veks::prepare::import::run(args);
+    let dataset_yaml = out.join("dataset.yaml");
+    assert!(dataset_yaml.exists(), "dataset.yaml not generated");
+
+    // Verify bootstrap emitted the partition-profiles step
+    let yaml_before = std::fs::read_to_string(&dataset_yaml).unwrap();
+    assert!(yaml_before.contains("partition-profiles"),
+        "bootstrap should emit partition-profiles step");
+
+    // Run pipeline
+    let (success, output) = run_pipeline(&dataset_yaml);
+    assert!(success, "pipeline failed:\n{}", output);
+
+    // Load the final dataset config
+    let config = vectordata::dataset::DatasetConfig::load(&dataset_yaml).unwrap();
+
+    // Verify partition_count was set
+    let partition_count: usize = config.variable("partition_count")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    assert!(partition_count > 0,
+        "partition_count should be > 0, got {}", partition_count);
+
+    // Collect partition profile names
+    let partition_names: Vec<&str> = config.profile_names()
+        .into_iter()
+        .filter(|n| n.starts_with("label-"))
+        .collect();
+    assert_eq!(partition_names.len(), partition_count,
+        "partition_names count ({}) should match partition_count ({})",
+        partition_names.len(), partition_count);
+
+    // Verify each partition profile has base_vectors and the file exists
+    for name in &partition_names {
+        let profile = config.profile(name).unwrap();
+        assert!(profile.base_count.is_some(),
+            "profile '{}' should have base_count", name);
+        let base_view = profile.view("base_vectors").unwrap();
+        let base_path = out.join(base_view.path());
+        assert!(base_path.exists(),
+            "base_vectors for '{}' should exist: {}", name, base_path.display());
+    }
+
+    // Verify ascending base_count ordering
+    for i in 1..partition_names.len() {
+        let prev_bc = config.profile(partition_names[i-1]).unwrap().base_count.unwrap_or(0);
+        let curr_bc = config.profile(partition_names[i]).unwrap().base_count.unwrap_or(0);
+        assert!(prev_bc <= curr_bc,
+            "profiles should be ascending: {} ({}) before {} ({})",
+            partition_names[i-1], prev_bc, partition_names[i], curr_bc);
+    }
+
+    // Default profile KNN should exist
+    assert!(out.join("profiles/default/neighbor_indices.ivec").exists());
+
+    // Finalize artifacts
+    assert!(out.join("dataset.json").exists());
+    assert!(out.join("variables.json").exists());
+
+    // veks_version stamped
+    let attrs = config.attributes.as_ref().unwrap();
+    assert!(attrs.veks_version.is_some(), "veks_version should be set");
+    assert!(attrs.veks_build.is_some(), "veks_build should be set");
+}
+
+/// E2E test: partition profile configuration is correct in the synthetic-1k fixture.
+///
+/// The synthetic-1k fixture has partition profiles (label-0 through label-11)
+/// already built by a previous pipeline run. This test verifies the config
+/// model: profiles exist with correct views, base_count, and natural ordering.
+#[test]
+fn e2e_partition_profile_config() {
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/synthetic-1k");
+    let dataset_yaml = fixture.join("dataset.yaml");
+    assert!(dataset_yaml.exists(), "synthetic-1k fixture must exist");
+
+    let config = vectordata::dataset::DatasetConfig::load(&dataset_yaml).unwrap();
+
+    // Collect partition profile names
+    let partition_names: Vec<&str> = config.profile_names()
+        .into_iter()
+        .filter(|n| n.starts_with("label-"))
+        .collect();
+    assert!(!partition_names.is_empty(),
+        "synthetic-1k should have partition profiles");
+
+    // Verify ascending base_count ordering (natural name sort as tiebreak)
+    for i in 1..partition_names.len() {
+        let prev = partition_names[i - 1];
+        let curr = partition_names[i];
+        let prev_bc = config.profile(prev).and_then(|p| p.base_count).unwrap_or(0);
+        let curr_bc = config.profile(curr).and_then(|p| p.base_count).unwrap_or(0);
+        assert!(prev_bc <= curr_bc,
+            "partition profiles should be in ascending base_count order: {} ({}) before {} ({})",
+            prev, prev_bc, curr, curr_bc);
+    }
+
+    // Verify each partition profile has the expected structure
+    for name in &partition_names {
+        let profile = config.profile(name)
+            .unwrap_or_else(|| panic!("partition profile '{}' not found", name));
+
+        assert!(profile.base_count.is_some(),
+            "partition profile '{}' should have base_count", name);
+
+        assert!(profile.view("base_vectors").is_some(),
+            "partition profile '{}' should have base_vectors view", name);
+
+        assert!(profile.view("query_vectors").is_some(),
+            "partition profile '{}' should have query_vectors view", name);
+
+        // Base vectors file should exist on disk
+        let base_path = fixture.join(profile.view("base_vectors").unwrap().path());
+        assert!(base_path.exists(),
+            "base_vectors file should exist: {}", base_path.display());
+    }
+
+    // Default profile should have full views
+    let default = config.default_profile().unwrap();
+    assert!(default.view("base_vectors").is_some());
+    assert!(default.view("query_vectors").is_some());
+    assert!(default.view("neighbor_indices").is_some());
+    assert!(default.view("neighbor_distances").is_some());
+
+    // veks_version should be present after pipeline run + save
+    // (may not be present in legacy fixtures — skip if absent)
+}
 

@@ -83,6 +83,19 @@ pub trait CommandOp: Send {
         }
     }
 
+    /// Build version string for provenance tracking.
+    ///
+    /// Returns a version identifier that changes whenever the command's
+    /// logic changes. The default combines the crate version and git
+    /// commit hash, injected at compile time. This ensures that
+    /// recompiling with code changes automatically invalidates cached
+    /// results from the previous build.
+    ///
+    /// Format: `{CARGO_PKG_VERSION}+{git_short_hash}`
+    fn build_version(&self) -> &str {
+        concat!(env!("CARGO_PKG_VERSION"), "+", env!("VEKS_BUILD_HASH"))
+    }
+
     /// Declare which resource types this command consumes.
     ///
     /// Commands that process arbitrarily large data MUST override this

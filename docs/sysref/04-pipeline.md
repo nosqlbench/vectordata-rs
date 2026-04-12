@@ -43,7 +43,17 @@ steps:
 | `per_profile` | no | Expand for each profile (default: false) |
 | `phase` | no | Ordering group within per-profile expansion |
 | `description` | no | Human-readable purpose |
+| `finalize` | no | If `true`, step runs in the finalization pass (default: false) |
 | All others | — | Passed as command options |
+
+Steps marked `finalize: true` are separated from compute steps and run in a dedicated final pass after all compute phases complete. This ensures finalization steps (e.g., `generate-dataset-json`, `generate-variables-json`, `generate-dataset-log-jsonl`, `generate-merkle`, `generate-catalog`) see the full set of profiles and artifacts, including any profiles created by partition expansion.
+
+```yaml
+  - id: generate-catalog
+    run: generate catalog
+    after: [generate-merkle]
+    finalize: true
+```
 
 ---
 
@@ -68,16 +78,29 @@ output: "${cache}/sorted.ivec"    # .cache/ directory
 
 ### Freshness checking
 
-Steps are skipped when:
-- The output file exists
-- The output is newer than all inputs
-- The step's configuration fingerprint matches the progress log
+Staleness is fingerprint-based, not mtime-based. A step is skipped when:
+- The output file exists and has non-zero size
+- The step's configuration fingerprint (which chains through the DAG and includes the build version) matches the progress log
 
-`--clean` removes all generated artifacts and forces re-execution.
+The fingerprint incorporates all step options, dependency fingerprints, and the build version, so any code change or option change propagates staleness through downstream steps. `--clean` removes all generated artifacts and forces re-execution.
 
 ---
 
-## 4.4 Per-Profile Expansion
+## 4.4 Execution Phases
+
+The pipeline executes in four phases:
+
+1. **Phase 1 — Core + resolved per-profile steps.** All steps whose dependencies are already satisfiable run first. This includes non-per-profile steps and per-profile steps for profiles that exist at bootstrap time.
+
+2. **Phase 2 — Deferred sized expansion.** When a step like `count-vectors` resolves `base_count`, size-bucketed profiles (e.g., `100K`, `250K`) become concrete. Per-profile templates are re-expanded for these new profiles and appended to the DAG.
+
+3. **Phase 3 — Partition expansion.** When `partition-profiles` creates new profiles from metadata labels, per-profile templates (e.g., `compute-knn`) are expanded again for each partition profile. The engine calls `build_dag_partial` to splice new steps into the running DAG.
+
+4. **Finalization.** Steps with `finalize: true` are held back and run once after all three compute phases complete. They are added to the DAG via a final `build_dag_partial` call, ensuring they see every profile and artifact.
+
+---
+
+## 4.5 Per-Profile Expansion
 
 Steps with `per_profile: true` are templates. The engine expands them
 once per profile, prefixing output paths:
@@ -93,7 +116,7 @@ steps for all profiles run before any phase-1 steps.
 
 ---
 
-## 4.5 Resource Governance
+## 4.6 Resource Governance
 
 The resource governor limits memory and thread usage per step:
 
@@ -109,7 +132,19 @@ The governor prevents system lockups during large-scale operations
 
 ---
 
-## 4.6 Progress and Logging
+## 4.7 Build Versioning
+
+Each command exposes `build_version()` returning a string of the form `{CARGO_PKG_VERSION}+{git_hash}`. This version is included in the step fingerprint — recompiling with code changes automatically invalidates cached results without manual `--clean`. At bootstrap time, `veks_version` and `veks_build` are stamped into `dataset.yaml` attributes so consumers can trace which build produced a dataset.
+
+```yaml
+attributes:
+  veks_version: "0.9.0"
+  veks_build: "0.9.0+a3f7c2d"
+```
+
+---
+
+## 4.8 Progress and Logging
 
 - **Progress bars** — per-step progress via the UI handle
 - **dataset.log** — timestamped log of all step output

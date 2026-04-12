@@ -192,6 +192,9 @@ fn default_args(name: &str, output: &Path) -> ImportArgs {
             predicate_range_min: 0,
             predicate_range_max: 1000,
             verify_knn_sample: 0,
+            partition_oracles: false,
+            max_partitions: 100,
+            on_undersized: "error".to_string(),
     }
 }
 
@@ -941,4 +944,230 @@ fn dag_23_full_with_early_stratification() {
 
     // Sized profiles
     assert!(yaml.contains("sized:"), "sized: key should be in dataset.yaml");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Finalization pass tests
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Verify that bootstrap emits `finalize: true` on all finalization steps
+/// and only on those steps.
+#[test]
+fn dag_finalize_field_emitted_correctly() {
+    let tmp = make_tempdir();
+    let fvec = tmp.path().join("vectors.fvec");
+    write_fvec(&fvec, 200);
+
+    let out = tmp.path().join("out");
+    let mut args = default_args("finalize-test", &out);
+    args.base_vectors = Some(fvec);
+    args.self_search = true;
+
+    veks::prepare::import::run(args);
+    let yaml = read_yaml(&out);
+
+    // These step IDs must have finalize: true
+    let finalize_ids = [
+        "generate-dataset-json",
+        "generate-variables-json",
+        "generate-dataset-log-jsonl",
+        "generate-merkle",
+        "generate-catalog",
+    ];
+
+    // Parse each step and check its finalize field
+    let steps = parse_steps(&yaml);
+    for step in &steps {
+        let is_finalize_step = finalize_ids.contains(&step.id.as_str());
+        // The parse_steps helper puts finalize in options since it's a
+        // key-value pair that's not "description" or "per_profile".
+        let has_finalize_true = step.options.get("finalize")
+            .map(|v| v == "true")
+            .unwrap_or(false);
+        if is_finalize_step {
+            assert!(has_finalize_true,
+                "step '{}' should have finalize: true", step.id);
+        } else {
+            assert!(!has_finalize_true,
+                "step '{}' should NOT have finalize: true", step.id);
+        }
+    }
+}
+
+/// Verify that finalize steps are partitioned out of the compute DAG
+/// and form their own valid DAG via build_dag_partial.
+#[test]
+fn dag_finalize_partitioning() {
+    let tmp = make_tempdir();
+    let fvec = tmp.path().join("vectors.fvec");
+    write_fvec(&fvec, 200);
+
+    let out = tmp.path().join("out");
+    let mut args = default_args("partition-test", &out);
+    args.base_vectors = Some(fvec);
+    args.self_search = true;
+
+    veks::prepare::import::run(args);
+
+    // Load the dataset config and resolve steps
+    let dataset_path = out.join("dataset.yaml");
+    let mut config = vectordata::dataset::DatasetConfig::load(&dataset_path).unwrap();
+    let all_steps = veks_pipeline::pipeline::resolve_all_steps(&mut config, &out);
+
+    // Partition into compute and finalize
+    let compute_steps: Vec<_> = all_steps.iter().filter(|s| !s.finalize).cloned().collect();
+    let finalize_steps: Vec<_> = all_steps.iter().filter(|s| s.finalize).cloned().collect();
+
+    assert!(!compute_steps.is_empty(), "should have compute steps");
+    assert!(!finalize_steps.is_empty(), "should have finalize steps");
+
+    // Every finalize step should have an id we recognize
+    let finalize_ids: Vec<String> = finalize_steps.iter()
+        .map(|s| s.effective_id())
+        .collect();
+    for id in &finalize_ids {
+        assert!(
+            id.starts_with("generate-") || id.starts_with("generate-merkle")
+                || id == "generate-catalog",
+            "unexpected finalize step id: {}", id
+        );
+    }
+
+    // Compute DAG should build cleanly without finalize steps
+    let compute_dag = veks_pipeline::pipeline::dag::build_dag(&compute_steps)
+        .expect("compute DAG should build without finalize steps");
+    assert!(!compute_dag.steps.is_empty());
+
+    // No compute step should have finalize: true
+    for step in &compute_dag.steps {
+        assert!(!step.def.finalize,
+            "compute DAG should not contain finalize step '{}'", step.id);
+    }
+
+    // Finalize DAG should build via build_dag_partial (ignoring
+    // dangling after-refs to compute steps)
+    let finalize_dag = veks_pipeline::pipeline::dag::build_dag_partial(&finalize_steps)
+        .expect("finalize DAG should build with partial refs");
+    assert_eq!(finalize_dag.steps.len(), finalize_steps.len());
+
+    // Finalize DAG ordering: gen-dataset-json should come first (root
+    // after dangling compute refs are dropped), gen-catalog should come last
+    let first = &finalize_dag.steps[0];
+    assert_eq!(first.id, "generate-dataset-json",
+        "first finalize step should be generate-dataset-json, got {}", first.id);
+    let last = &finalize_dag.steps[finalize_dag.steps.len() - 1];
+    assert_eq!(last.id, "generate-catalog",
+        "last finalize step should be generate-catalog, got {}", last.id);
+}
+
+/// Verify that when per-profile steps are expanded (as in Phase 2/3),
+/// the finalize: true steps are correctly excluded from the compute DAG.
+/// Simulates the partition expansion scenario where new profiles
+/// appear and compute steps re-expand, but finalize steps stay in the
+/// final pass.
+#[test]
+fn dag_finalize_excluded_from_reexpansion() {
+    let tmp = make_tempdir();
+    let fvec = tmp.path().join("vectors.fvec");
+    write_fvec(&fvec, 200);
+
+    let out = tmp.path().join("out");
+    let mut args = default_args("reexpand-test", &out);
+    args.base_vectors = Some(fvec);
+    args.self_search = true;
+    // Add sized profiles so per_profile expansion happens
+    args.sized_profiles = Some("50,100".to_string());
+
+    veks::prepare::import::run(args);
+
+    let dataset_path = out.join("dataset.yaml");
+    let mut config = vectordata::dataset::DatasetConfig::load(&dataset_path).unwrap();
+
+    // Inject base_count so deferred profiles expand during resolve_all_steps.
+    // Write a variables.yaml that resolve_all_steps will load.
+    let vars_content = "base_count: '190'\n";
+    std::fs::write(out.join("variables.yaml"), vars_content).unwrap();
+
+    let all_steps = veks_pipeline::pipeline::resolve_all_steps(&mut config, &out);
+
+    // Should have per-profile steps for multiple profiles (default + sized)
+    let profile_count = config.profiles.profiles.len();
+    assert!(profile_count >= 2,
+        "expected at least 2 profiles (default + sized), got {}", profile_count);
+
+    // Partition: compute vs finalize
+    let compute_steps: Vec<_> = all_steps.iter().filter(|s| !s.finalize).cloned().collect();
+    let finalize_steps: Vec<_> = all_steps.iter().filter(|s| s.finalize).cloned().collect();
+
+    // Re-expansion should produce per-profile compute steps
+    // but finalize steps should NOT be duplicated per profile
+    assert!(compute_steps.len() > finalize_steps.len(),
+        "compute steps ({}) should outnumber finalize steps ({})",
+        compute_steps.len(), finalize_steps.len());
+
+    // Finalize steps should still be exactly 5 (not multiplied by profile count)
+    assert_eq!(finalize_steps.len(), 5,
+        "should have exactly 5 finalize steps after re-expansion, got {}",
+        finalize_steps.len());
+
+    // No finalize step should have per_profile set
+    for step in &finalize_steps {
+        assert!(!step.per_profile,
+            "finalize step '{}' should not be per_profile", step.effective_id());
+    }
+
+    // Compute DAG should build without finalize steps
+    let compute_dag = veks_pipeline::pipeline::dag::build_dag(&compute_steps)
+        .expect("compute DAG should build without finalize steps");
+    for step in &compute_dag.steps {
+        assert!(!step.def.finalize,
+            "compute DAG contains finalize step '{}' — should have been filtered",
+            step.id);
+    }
+
+    // Finalize DAG should build with partial refs (dangling compute refs ignored)
+    let finalize_dag = veks_pipeline::pipeline::dag::build_dag_partial(&finalize_steps)
+        .expect("finalize DAG should build after profile expansion");
+    assert_eq!(finalize_dag.steps.len(), 5);
+}
+
+/// Verify that when dataset.yaml has finalize steps, the full DAG
+/// (compute + finalize) and the partitioned DAGs have consistent
+/// step counts.
+#[test]
+fn dag_finalize_step_count_consistency() {
+    let tmp = make_tempdir();
+    let fvec = tmp.path().join("vectors.fvec");
+    write_fvec(&fvec, 200);
+    let meta = tmp.path().join("meta");
+    write_parquet_metadata(&meta);
+
+    let out = tmp.path().join("out");
+    let mut args = default_args("count-test", &out);
+    args.base_vectors = Some(fvec);
+    args.self_search = true;
+    args.metadata = Some(meta);
+
+    veks::prepare::import::run(args);
+
+    let dataset_path = out.join("dataset.yaml");
+    let mut config = vectordata::dataset::DatasetConfig::load(&dataset_path).unwrap();
+    let all_steps = veks_pipeline::pipeline::resolve_all_steps(&mut config, &out);
+
+    let compute_count = all_steps.iter().filter(|s| !s.finalize).count();
+    let finalize_count = all_steps.iter().filter(|s| s.finalize).count();
+
+    // Partition should cover all steps
+    assert_eq!(compute_count + finalize_count, all_steps.len(),
+        "compute ({}) + finalize ({}) should equal total ({})",
+        compute_count, finalize_count, all_steps.len());
+
+    // Should have exactly 5 finalize steps
+    assert_eq!(finalize_count, 5,
+        "expected 5 finalize steps, got {}", finalize_count);
+
+    // The full DAG should also build successfully (for emit-yaml, script)
+    let full_dag = veks_pipeline::pipeline::dag::build_dag(&all_steps)
+        .expect("full DAG (compute + finalize) should build");
+    assert_eq!(full_dag.steps.len(), all_steps.len());
 }

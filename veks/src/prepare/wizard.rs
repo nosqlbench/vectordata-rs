@@ -290,6 +290,9 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
             predicate_range_min: 0,
             predicate_range_max: 1000,
             verify_knn_sample: 0,
+            partition_oracles: false,
+            max_partitions: 100,
+            on_undersized: "error".to_string(),
         };
         super::import::resolve_facets(&probe)
     };
@@ -303,6 +306,7 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
         ('P', "predicates"),
         ('R', "predicate results"),
         ('F', "filtered KNN ground-truth"),
+        ('O', "oracle partition profiles"),
     ];
 
     println!();
@@ -322,20 +326,35 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
         println!("  (overridden by --required-facets → {})", parsed);
         parsed
     } else {
+        println!("  (use +O to add oracle partitions, e.g., +MPRFO)");
         let input = prompt_with_default(
-            "Facets to include in dataset (* for all)",
+            "Facets to include in dataset (* for all, +X to add)",
             &implied_facets,
         );
-        let parsed = crate::prepare::import::parse_facet_spec(input.trim());
-        // Show what was selected, and note which facets will be generated
-        let extra: String = parsed.chars()
-            .filter(|c| !implied_facets.contains(*c))
-            .collect();
-        if !extra.is_empty() {
-            println!("  → Facets: {}  ({}  will be generated)", parsed, extra);
-        } else if parsed != input.trim().to_uppercase() {
-            println!("  → Facets: {}", parsed);
-        }
+        let trimmed = input.trim();
+        let parsed = if trimmed.starts_with('+') {
+            // '+' prefix: add to inferred facets
+            let additions = crate::prepare::import::parse_facet_spec(trimmed);
+            let mut merged = implied_facets.clone();
+            for c in additions.chars() {
+                if !merged.contains(c) {
+                    merged.push(c);
+                }
+            }
+            println!("  → Facets: {}  (+{} added to {})", merged, additions, implied_facets);
+            merged
+        } else {
+            let parsed = crate::prepare::import::parse_facet_spec(trimmed);
+            let extra: String = parsed.chars()
+                .filter(|c| !implied_facets.contains(*c))
+                .collect();
+            if !extra.is_empty() {
+                println!("  → Facets: {}  ({}  will be generated)", parsed, extra);
+            } else if parsed != trimmed.to_uppercase() {
+                println!("  → Facets: {}", parsed);
+            }
+            parsed
+        };
         parsed
     };
 
@@ -726,6 +745,20 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
         0
     };
 
+    // Oracle partition profiles (O facet): configured when O is in the
+    // confirmed facet set, same as any other facet.
+    let (partition_oracles, max_partitions, on_undersized) = if confirmed_facets.contains('O') {
+        println!();
+        println!("--- Oracle Partition Configuration ---");
+        let max = prompt_with_default("Maximum partitions", "100");
+        let max_val: u32 = max.trim().parse().unwrap_or(100);
+        let undersized = prompt_with_default(
+            "When partition < k vectors (error/warn/include)", "error");
+        (true, max_val, undersized.trim().to_string())
+    } else {
+        (false, 100u32, "error".to_string())
+    };
+
     // Shuffling: optional, seed 0 disables it
     let seed = if let Some(seeded) = seeds.seed {
         if seeded == 0 {
@@ -1080,13 +1113,20 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
         },
         FacetRow {
             code: 'M', label: "metadata",
-            connection: if metadata.is_some() { "convert" } else { "—" },
-            source: meta_label.clone(),
+            connection: if metadata.is_some() { "convert" }
+                else if synthesize_metadata { "synthesize" }
+                else { "—" },
+            source: if metadata.is_some() { meta_label.clone() }
+                else if synthesize_metadata { format!("random {} (range {}..{})",
+                    synthesis_format, metadata_range_min, metadata_range_max) }
+                else { String::new() },
         },
         FacetRow {
             code: 'P', label: "predicates",
             connection: "synthesize",
-            source: "M schema survey".into(),
+            source: if synthesize_metadata && synthesis_mode == "simple-int-eq" {
+                format!("simple-int-eq (range {}..{})", predicate_range_min, predicate_range_max)
+            } else { "M schema survey".into() },
         },
         FacetRow {
             code: 'R', label: "predicate results",
@@ -1097,6 +1137,11 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
             code: 'F', label: "filtered KNN",
             connection: "compute",
             source: "B x Q x R filtered search".into(),
+        },
+        FacetRow {
+            code: 'O', label: "oracle partitions",
+            connection: "compute",
+            source: format!("per-label KNN (max {} partitions)", max_partitions),
         },
     ];
 
@@ -1180,6 +1225,9 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
         predicate_range_min,
         predicate_range_max,
         verify_knn_sample,
+        partition_oracles,
+        max_partitions,
+        on_undersized,
     }
 }
 

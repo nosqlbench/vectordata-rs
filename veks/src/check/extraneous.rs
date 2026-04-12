@@ -76,6 +76,17 @@ pub fn check(
         // Inputs that are also outputs of other steps are already covered;
         // inputs that are external sources are not in the workspace.
 
+        // Add all profile view paths — these are dataset artifacts even
+        // if they're symlinks (e.g., partition profile query_vectors).
+        for (_name, profile) in &config.profiles.profiles {
+            for (_facet, view) in profile.views() {
+                let path = view.path();
+                if !path.is_empty() {
+                    accounted.insert(path.to_string());
+                }
+            }
+        }
+
         // Check each publishable file under this workspace
         for file in publishable {
             if !file.starts_with(workspace) {
@@ -197,6 +208,16 @@ pub fn find_extraneous(
     }
     for p in &wm.inputs {
         accounted.insert(normalize(p));
+    }
+
+    // Add all profile view paths
+    for (_name, profile) in &config.profiles.profiles {
+        for (_facet, view) in profile.views() {
+            let path = view.path();
+            if !path.is_empty() {
+                accounted.insert(path.to_string());
+            }
+        }
     }
 
     let mut result = Vec::new();

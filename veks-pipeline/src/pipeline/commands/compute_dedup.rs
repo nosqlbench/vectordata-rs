@@ -519,9 +519,56 @@ shuffle, KNN, or metadata alignment. The output index can be fed to
             format_count(count - dup_count), // non-dup entries never needed full read
         ));
 
-        // Normalization and near-zero detection are handled by the extract
-        // step, which already has each vector in memory for writing. No
-        // separate norm scan is needed here. See SRD §20.
+        // ── Zero vector removal ──────────────────────────────────────
+        // Scan the deduped ordinals for zero vectors and remove them.
+        // This ensures clean_count excludes zeros, so all downstream
+        // extractions (base vectors AND metadata) use the same ordinal
+        // set. Attempting to L2-normalize a zero vector is an error —
+        // zeros must be caught here, not silently dropped during extraction.
+        let zero_count = {
+            let ord_data = match std::fs::read(&output_path) {
+                Ok(d) => d,
+                Err(e) => return error_result(format!("read ordinals for zero scan: {}", e), start),
+            };
+            let record_size = 4 + 4; // dim=1 (i32) + ordinal (i32)
+            let ord_count = ord_data.len() / record_size;
+            let mut zeros: Vec<usize> = Vec::new(); // indices into ordinals that are zero vectors
+
+            for i in 0..ord_count {
+                let offset = i * record_size + 4; // skip dim header
+                let ordinal = i32::from_le_bytes([
+                    ord_data[offset], ord_data[offset+1],
+                    ord_data[offset+2], ord_data[offset+3],
+                ]) as usize;
+                // Read the source vector and check norm
+                let vec = match reader.get_f32(ordinal) {
+                    Ok(v) => v,
+                    Err(e) => return error_result(format!("zero scan: {}", e), start),
+                };
+                let norm_sq: f64 = vec.iter().map(|&v| (v as f64) * (v as f64)).sum();
+                if norm_sq == 0.0 {
+                    zeros.push(i);
+                }
+            }
+
+            if !zeros.is_empty() {
+                // Rewrite ordinals without zero vectors
+                let zero_set: std::collections::HashSet<usize> = zeros.iter().copied().collect();
+                let mut clean_data = Vec::with_capacity(ord_data.len());
+                for i in 0..ord_count {
+                    if !zero_set.contains(&i) {
+                        let start = i * record_size;
+                        clean_data.extend_from_slice(&ord_data[start..start + record_size]);
+                    }
+                }
+                if let Err(e) = std::fs::write(&output_path, &clean_data) {
+                    return error_result(format!("rewrite ordinals without zeros: {}", e), start);
+                }
+                ctx.ui.log(&format!("  removed {} zero vector(s) from ordinals", zeros.len()));
+            }
+
+            zeros.len()
+        };
 
         // ── Phase 3: Write report and clean up ────────────────────────
         phase.set_message("phase 3/3: writing report".to_string());
@@ -543,7 +590,8 @@ shuffle, KNN, or metadata alignment. The output index can be fed to
         let dup_pct = if count > 0 { 100.0 * dup_count as f64 / count as f64 } else { 0.0 };
 
         // Write verified counts so the bound checker can validate the output.
-        let output_records = if elide { unique_count } else { count };
+        // Excludes zero vectors (already removed from the ordinals file).
+        let output_records = (if elide { unique_count } else { count }) - zero_count;
         let var_name = format!("verified_count:{}",
             output_path.file_name().and_then(|n| n.to_str()).unwrap_or("output"));
         let _ = crate::pipeline::variables::set_and_save(
@@ -556,13 +604,18 @@ shuffle, KNN, or metadata alignment. The output index can be fed to
             &ctx.workspace, &dup_var_name, &dup_count.to_string());
         ctx.defaults.insert(dup_var_name, dup_count.to_string());
 
-        // clean_count = unique vectors after dedup (before zero removal).
-        // Used by generate-shuffle and extract steps as the population size.
-        // Zero vectors are filtered later during extraction.
-        let clean_count = if elide { unique_count } else { count };
+        // clean_count = unique vectors after dedup AND zero removal.
+        // This is the definitive population size for shuffle and all
+        // downstream extractions (base vectors, metadata, predicates).
+        let clean_count = (if elide { unique_count } else { count }) - zero_count;
         let _ = crate::pipeline::variables::set_and_save(
             &ctx.workspace, "clean_count", &clean_count.to_string());
         ctx.defaults.insert("clean_count".into(), clean_count.to_string());
+
+        // Record zero count
+        let _ = crate::pipeline::variables::set_and_save(
+            &ctx.workspace, "zero_count", &zero_count.to_string());
+        ctx.defaults.insert("zero_count".into(), zero_count.to_string());
 
         let msg = format!(
             "{} vectors -> {} unique, {} dup ({:.2}%){}, {:.1}s ({:.0} vec/s, {:.1} MB/s), prefix_width={}",

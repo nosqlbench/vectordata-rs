@@ -740,6 +740,9 @@ pub fn run(args: PrepareArgs) {
                         predicate_range_min: metadata_range_min,
                         predicate_range_max: metadata_range_max,
                         verify_knn_sample: 0,
+            partition_oracles: false,
+            max_partitions: 100,
+            on_undersized: "error".to_string(),
                     });
                     check_and_restore(&out);
                 }
@@ -812,6 +815,9 @@ pub fn run(args: PrepareArgs) {
                     predicate_range_min: metadata_range_min,
                     predicate_range_max: metadata_range_max,
                     verify_knn_sample: 0,
+            partition_oracles: false,
+            max_partitions: 100,
+            on_undersized: "error".to_string(),
                 });
             }
         }

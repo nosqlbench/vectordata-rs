@@ -139,6 +139,17 @@ impl TestDataGroup {
         ))
     }
 
+    /// Returns the names of all available profiles.
+    pub fn profile_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.config.profiles.keys().cloned().collect();
+        names.sort_by(|a, b| {
+            let a_bc = self.config.profiles.get(a).and_then(|p| p.base_count);
+            let b_bc = self.config.profiles.get(b).and_then(|p| p.base_count);
+            crate::dataset::profile::profile_sort_by_size(a, a_bc, b, b_bc)
+        });
+        names
+    }
+
     /// Retrieves a top-level attribute from the dataset configuration.
     pub fn attribute(&self, name: &str) -> Option<&serde_yaml::Value> {
         self.config.attributes.get(name)

@@ -59,7 +59,12 @@ fn build_rows(entries: &[CatalogEntry]) -> Vec<PickerRow> {
             let profile = entry.layout.profiles.profile(profile_name);
             let bc = vectordata::dataset::profile::profile_sort_key(
                 profile_name, profile.and_then(|p| p.base_count));
-            let size = if bc > 0 { format_count(bc) } else { String::new() };
+            // Show count from profile's base_count (partition profiles, sized profiles)
+            let explicit_count = profile.and_then(|p| p.base_count);
+            let size = match explicit_count {
+                Some(c) if c > 0 => format_count(c),
+                _ => String::new(),
+            };
 
             let facets = profile.map(|p| facet_indicators(&p.views)).unwrap_or_default();
 

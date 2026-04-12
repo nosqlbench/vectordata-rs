@@ -308,7 +308,28 @@ show data dependencies.
   ├───────────┼───────────┤           │     │     │     │     ├──────────┤  compute  │
   │           │           │           │     │     │     │     │          │  filtered │
   │           │           │           │     │     │     │     │          │  knn ─────┤
+  │           │           │           │     │     │     │     │          │           │
+  ├───────────┤           │           │     │     │     │     │          │  partition │
+  │           │           │           │     │     │     │     │          │  profiles  │
+  │           │           │           │     │     │     │     │          │     │      │
+  │           │           │           │     │     │     │     │          │  ── re-expand ──
+  │           │           │           │     │     │     │     │          │  compute-knn  │
+  │           │           │           │     │     │     │     │          │  (per label)  │
 ```
+
+When `partition_oracles = true`, the pipeline has three phases:
+
+1. **Phase 1** (core): generate data, compute default-profile KNN,
+   evaluate predicates, compute filtered KNN
+
+2. **Phase 2** (partition preparation): `partition-profiles` extracts
+   base vectors per label and registers profiles in dataset.yaml
+
+3. **Phase 3** (partition KNN): pipeline re-loads dataset.yaml, sees
+   new partition profiles, re-expands `per_profile` templates
+   (compute-knn, verify-knn) for each partition. The same compute-knn
+   code path with SimSIMD + batching + caching runs for each partition.
+   Already-completed steps skip via freshness checks.
 
 ### Step activation conditions
 
@@ -326,6 +347,7 @@ show data dependencies.
 | compute-filtered-knn | R + B + Q present |
 | scan-zeros | prepare skipped |
 | scan-duplicates | prepare skipped |
+| partition-profiles | partition_oracles + M + F present |
 
 To derive a specific pipeline configuration, remove steps whose
 conditions are not met. The remaining steps form the DAG.
@@ -343,6 +365,7 @@ Common configurations arising from different input combinations:
 | B+Q | base + queries | count → prepare → extract-B → extract-Q → compute-knn → verify → ... |
 | B+Q+GT | base + queries + ground truth | count → scan-zeros → scan-dups → (symlinks) → verify-knn → ... |
 | B+Q+GT+synth | above + synthesize_metadata | above + generate-M → generate-P → evaluate-P → verify-sqlite → compute-filtered → verify-filtered → ... |
+| above + partitions | above + partition_oracles | above + partition-profiles → ... |
 
 ### Facet inference rules
 

@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use vectordata::VectorReader;
-use vectordata::io::MmapVectorReader;
+use vectordata::io::{IndexedXvecReader, MmapVectorReader, VvecReader};
 
 use crate::pipeline::atomic_write::{AtomicWriter, safe_create_file};
 use crate::pipeline::element_type::ElementType;
@@ -113,6 +113,32 @@ facets of the dataset.
         let fvec_path = resolve_path(fvec_str, &ctx.workspace);
         let output_path = resolve_path(output_str, &ctx.workspace);
         let ivec_path = options.get("ivec-file").map(|s| resolve_path(s, &ctx.workspace));
+
+        // Support reading ordinals from a vvec record: --vvec-ordinals file[idx]
+        let _vvec_ordinals: Option<Vec<i32>> = if let Some(spec) = options.get("vvec-ordinals") {
+            if let Some(bracket) = spec.find('[') {
+                let path_str = &spec[..bracket];
+                let idx_str = spec[bracket+1..].trim_end_matches(']');
+                let record_idx: usize = idx_str.parse().unwrap_or(0);
+                let vvec_path = resolve_path(path_str, &ctx.workspace);
+                match vectordata::io::IndexedXvecReader::open_ivec(&vvec_path) {
+                    Ok(reader) => match reader.get_i32(record_idx) {
+                        Ok(ords) => {
+                            ctx.ui.log(&format!("  read {} ordinals from {}[{}]",
+                                ords.len(), vvec_path.display(), record_idx));
+                            Some(ords)
+                        }
+                        Err(e) => return error_result(
+                            format!("read vvec record {}: {}", record_idx, e), start),
+                    }
+                    Err(e) => return error_result(
+                        format!("open vvec {}: {}", vvec_path.display(), e), start),
+                }
+            } else {
+                return error_result(
+                    "vvec-ordinals format: path[record_index] (e.g., metadata_indices.ivvec[5])".into(), start);
+            }
+        } else { None };
 
         // Parse range
         let range = match options.get("range") {
@@ -1276,6 +1302,24 @@ fn parse_range(s: &str) -> Result<Range, String> {
     }
 
     Ok(Range { start, end })
+}
+
+/// Parse an optional range specification, returning (start, end) tuple.
+///
+/// When `range_str` is `None`, returns `(0, total_count)`. When present,
+/// parses the range and clamps to `total_count`.
+fn parse_range_opt(range_str: Option<&str>, total_count: usize) -> (usize, usize) {
+    if let Some(s) = range_str {
+        if let Ok(r) = parse_range(s) {
+            let start = r.start.min(total_count);
+            let end = r.end.unwrap_or(total_count).min(total_count);
+            (start, end)
+        } else {
+            (0, total_count)
+        }
+    } else {
+        (0, total_count)
+    }
 }
 
 /// Return half of system RAM in bytes, clamping to at least 256 MiB.
@@ -2768,9 +2812,138 @@ fn error_result(message: String, start: Instant) -> CommandResult {
     }
 }
 
+// ---- scalar extract -----------------------------------------------------------
+
+/// Pipeline command: extract and reorder records from a scalar file.
+///
+/// Scalar files have one fixed-size element per record (no dimension header).
+/// Used for metadata labels (`.u8`), predicate keys, and similar per-vector
+/// scalar data that must be reordered to match shuffled/partitioned vectors.
+struct GenerateScalarExtractOp;
+
+impl CommandOp for GenerateScalarExtractOp {
+    fn command_path(&self) -> &str {
+        "transform extract"
+    }
+
+    fn command_doc(&self) -> CommandDoc {
+        CommandDoc {
+            summary: "Extract and reorder records from a scalar file".into(),
+            body: "Internal delegate for transform extract when source is a scalar format.".into(),
+        }
+    }
+
+    fn describe_resources(&self) -> Vec<ResourceDesc> {
+        vec![
+            ResourceDesc { name: "mem".into(), description: "Memory for scalar data".into(), adjustable: false },
+        ]
+    }
+
+    fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
+        let start = Instant::now();
+
+        let source_str = match options.require("source") {
+            Ok(s) => s, Err(e) => return error_result(e, start),
+        };
+        let output_str = match options.require("output") {
+            Ok(s) => s, Err(e) => return error_result(e, start),
+        };
+
+        let source_path = resolve_path(source_str, &ctx.workspace);
+        let output_path = resolve_path(output_str, &ctx.workspace);
+
+        let elem_type = match ElementType::from_path(&source_path) {
+            Ok(et) => et,
+            Err(e) => return error_result(format!("detect element type: {}", e), start),
+        };
+        let elem_size = elem_type.element_size();
+
+        // Read source
+        let source_data = match std::fs::read(&source_path) {
+            Ok(d) => d,
+            Err(e) => return error_result(format!("read {}: {}", source_path.display(), e), start),
+        };
+        let record_count = source_data.len() / elem_size;
+        if source_data.len() % elem_size != 0 {
+            return error_result(format!(
+                "source file size {} is not a multiple of element size {}",
+                source_data.len(), elem_size), start);
+        }
+
+        // Determine extraction mode: index-based or range-based
+        let index_str = options.get("ivec-file").or_else(|| options.get("index-file"));
+
+        let indices: Vec<usize> = if let Some(ivec_str) = index_str {
+            // Index-based: read ivec file, apply range if specified
+            let ivec_path = resolve_path(ivec_str, &ctx.workspace);
+            let ivec_reader = match MmapVectorReader::<i32>::open_ivec(&ivec_path) {
+                Ok(r) => r,
+                Err(e) => return error_result(format!("open index file: {}", e), start),
+            };
+            let ivec_count = VectorReader::<i32>::count(&ivec_reader);
+
+            let (range_start, range_end) = parse_range_opt(options.get("range"), ivec_count);
+
+            (range_start..range_end)
+                .map(|i| {
+                    let slice = ivec_reader.get_slice(i);
+                    slice[0] as usize
+                })
+                .collect()
+        } else {
+            // Range-based: contiguous slice
+            let (range_start, range_end) = parse_range_opt(options.get("range"), record_count);
+            (range_start..range_end).collect()
+        };
+
+        // Extract records
+        let mut output_data = Vec::with_capacity(indices.len() * elem_size);
+        for &idx in &indices {
+            if idx >= record_count {
+                return error_result(format!(
+                    "index {} out of bounds (record_count={})", idx, record_count), start);
+            }
+            let offset = idx * elem_size;
+            output_data.extend_from_slice(&source_data[offset..offset + elem_size]);
+        }
+
+        // Write output
+        if let Some(parent) = output_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Err(e) = std::fs::write(&output_path, &output_data) {
+            return error_result(format!("write {}: {}", output_path.display(), e), start);
+        }
+
+        ctx.ui.log(&format!("  extracted {} records ({} bytes, {} format)",
+            indices.len(), output_data.len(), elem_type));
+
+        CommandResult {
+            status: Status::Ok,
+            message: format!("{} {} records extracted from {}",
+                indices.len(), elem_type, source_path.file_name().unwrap_or_default().to_string_lossy()),
+            produced: vec![output_path],
+            elapsed: start.elapsed(),
+        }
+    }
+
+    fn describe_options(&self) -> Vec<OptionDesc> {
+        vec![
+            OptionDesc { name: "source".into(), type_name: "Path".into(), required: true, default: None,
+                description: "Source scalar file".into(), role: OptionRole::Input },
+            OptionDesc { name: "ivec-file".into(), type_name: "Path".into(), required: false, default: None,
+                description: "Index file for indirect extraction".into(), role: OptionRole::Input },
+            OptionDesc { name: "output".into(), type_name: "Path".into(), required: true, default: None,
+                description: "Output file".into(), role: OptionRole::Output },
+            OptionDesc { name: "range".into(), type_name: "String".into(), required: false, default: None,
+                description: "Record range: [start,end) or start..end".into(), role: OptionRole::Config },
+        ]
+    }
+}
+
 // ---- generic extract (auto-detect format) -----------------------------------
 
-/// Pipeline command: extract records from any xvec or slab file.
+/// Pipeline command: extract records from any xvec, scalar, or slab file.
 ///
 /// Detects the source format from the file extension and delegates to the
 /// appropriate format-specific extraction logic.
@@ -2797,11 +2970,16 @@ impl CommandOp for TransformExtractOp {
                 to the appropriate format-specific extractor.\n\n\
                 Supported formats:\n\
                 - Vector files: `.fvec` (f32), `.mvec` (f16), `.ivec` (i32), `.dvec`, `.svec`, `.bvec`\n\
+                - Scalar files: `.u8`, `.i8`, `.u16`, `.i16`, `.u32`, `.i32`, `.u64`, `.i64` \
+                (one element per record, no dimension header)\n\
                 - Container files: `.slab` (record-oriented binary — may contain vectors, \
                 metadata, predicate keys, or any structured data)\n\n\
-                Two extraction modes:\n\
+                Three extraction modes:\n\
                 - **Index-based** (with `ivec-file`): select and reorder records by ordinal position\n\
-                - **Range-based** (without `ivec-file`): extract a contiguous slice\n\n\
+                - **Range-based** (without `ivec-file`): extract a contiguous slice\n\
+                - **Predicate-based** (with `index-source` + `predicate-index`): read ordinals \
+                from a specific record in an ivvec file and use those as indices. Enables \
+                composable partition extraction through the pipeline DAG.\n\n\
                 The `normalize` option applies L2-normalization (vector formats only). \
                 The `page-size` option controls slab output page size (slab format only).\n\n\
                 ## Options\n\n{}",
@@ -2833,38 +3011,112 @@ impl CommandOp for TransformExtractOp {
         // Build options for the delegate command, mapping generic names
         // to format-specific names.
         let mut delegate_opts = Options::new();
+        // Detect format: slab, xvec (fvec/mvec/ivec), or scalar (u8/i32/etc.)
+        let is_scalar = ElementType::is_scalar_extension(ext);
         let etype = if ext == "slab" {
             delegate_opts.set("slab-file", source_str);
             None
+        } else if is_scalar {
+            // Scalar files (u8, i8, u16, i32, etc.) — single element per record
+            delegate_opts.set("source", source_str);
+            ElementType::from_path(&source_path).ok()
         } else {
             match ElementType::from_path(&source_path) {
                 Ok(ElementType::F32) => { delegate_opts.set("fvec-file", source_str); Some(ElementType::F32) }
                 Ok(ElementType::F16) => { delegate_opts.set("mvec-file", source_str); Some(ElementType::F16) }
                 Ok(ElementType::I32) => { delegate_opts.set("ivec-file", source_str); Some(ElementType::I32) }
-                Ok(_) | Err(_) => {
+                Ok(et) => {
                     return error_result(
-                        format!("unsupported format '.{}' for extract — expected fvec, mvec, ivec, or slab", ext),
+                        format!("unsupported xvec format '.{}' ({}) for extract", ext, et),
+                        start,
+                    );
+                }
+                Err(e) => {
+                    return error_result(
+                        format!("unsupported format '.{}' for extract: {}", ext, e),
                         start,
                     );
                 }
             }
         };
 
+        // If predicate-index is specified, resolve ordinals from an ivvec
+        // record and write a temporary ivec for the delegate to use.
+        let _temp_ivec: Option<PathBuf>; // keep alive for delegate
+        if let (Some(ivvec_str), Some(pred_idx_str)) = (
+            options.get("index-source"),
+            options.get("predicate-index"),
+        ) {
+            let pred_idx: usize = match pred_idx_str.parse() {
+                Ok(n) => n,
+                Err(_) => return error_result(
+                    format!("invalid predicate-index: '{}'", pred_idx_str), start),
+            };
+            let ivvec_path = resolve_path(ivvec_str, &ctx.workspace);
+            let reader = match vectordata::io::IndexedXvecReader::open_ivec(&ivvec_path) {
+                Ok(r) => r,
+                Err(e) => return error_result(
+                    format!("open index-source {}: {}", ivvec_path.display(), e), start),
+            };
+            let record_count = <IndexedXvecReader as VvecReader<i32>>::count(&reader);
+            if pred_idx >= record_count {
+                return error_result(format!(
+                    "predicate-index {} out of bounds (ivvec has {} records)",
+                    pred_idx, record_count), start);
+            }
+            let ordinals = match <IndexedXvecReader as VvecReader<i32>>::get(&reader, pred_idx) {
+                Ok(v) => v,
+                Err(e) => return error_result(
+                    format!("read predicate-index {}: {}", pred_idx, e), start),
+            };
+
+            // Write temporary ivec with these ordinals
+            let tmp_ivec = ctx.scratch.join(format!("_predicate_{}.ivec", pred_idx));
+            {
+                use std::io::Write;
+                let f = match std::fs::File::create(&tmp_ivec) {
+                    Ok(f) => f,
+                    Err(e) => return error_result(
+                        format!("create temp ivec: {}", e), start),
+                };
+                let mut w = std::io::BufWriter::new(f);
+                for &ord in &ordinals {
+                    w.write_all(&1i32.to_le_bytes()).unwrap_or(()); // dim=1
+                    w.write_all(&ord.to_le_bytes()).unwrap_or(());
+                }
+                let _ = w.flush();
+            }
+            ctx.ui.log(&format!("  predicate-index {}: {} ordinals from {}",
+                pred_idx, ordinals.len(), ivvec_path.file_name().unwrap_or_default().to_string_lossy()));
+            delegate_opts.set("ivec-file",
+                tmp_ivec.to_string_lossy().to_string());
+            _temp_ivec = Some(tmp_ivec);
+        } else {
+            _temp_ivec = None;
+        }
+
         // Pass through common options
-        if let Some(v) = options.get("ivec-file") { delegate_opts.set("ivec-file", v); }
-        if let Some(v) = options.get("index-file") { delegate_opts.set("index-file", v); }
+        if _temp_ivec.is_none() {
+            // Only pass ivec-file if we didn't resolve from predicate-index
+            if let Some(v) = options.get("ivec-file") { delegate_opts.set("ivec-file", v); }
+            if let Some(v) = options.get("index-file") { delegate_opts.set("index-file", v); }
+        }
         if let Some(v) = options.get("output") { delegate_opts.set("output", v); }
         if let Some(v) = options.get("range") { delegate_opts.set("range", v); }
         if let Some(v) = options.get("normalize") { delegate_opts.set("normalize", v); }
         if let Some(v) = options.get("page-size") { delegate_opts.set("page-size", v); }
 
         // Delegate to format-specific command
-        let mut cmd: Box<dyn CommandOp> = match etype {
-            Some(ElementType::F32) => Box::new(GenerateFvecExtractOp),
-            Some(ElementType::F16) => Box::new(GenerateMvecExtractOp),
-            Some(ElementType::I32) => Box::new(GenerateIvecExtractOp),
-            None => Box::new(GenerateSlabExtractOp),
-            _ => unreachable!(),
+        let mut cmd: Box<dyn CommandOp> = if is_scalar {
+            Box::new(GenerateScalarExtractOp)
+        } else {
+            match etype {
+                Some(ElementType::F32) => Box::new(GenerateFvecExtractOp),
+                Some(ElementType::F16) => Box::new(GenerateMvecExtractOp),
+                Some(ElementType::I32) => Box::new(GenerateIvecExtractOp),
+                None => Box::new(GenerateSlabExtractOp),
+                _ => unreachable!(),
+            }
         };
 
         cmd.execute(&delegate_opts, ctx)
@@ -2918,6 +3170,22 @@ impl CommandOp for TransformExtractOp {
                 required: false,
                 default: Some("65536".to_string()),
                 description: "Preferred page size for output slab (slab format only)".to_string(),
+                role: OptionRole::Config,
+            },
+            OptionDesc {
+                name: "index-source".to_string(),
+                type_name: "Path".to_string(),
+                required: false,
+                default: None,
+                description: "Variable-length ivvec file to read ordinals from (use with predicate-index)".to_string(),
+                role: OptionRole::Input,
+            },
+            OptionDesc {
+                name: "predicate-index".to_string(),
+                type_name: "int".to_string(),
+                required: false,
+                default: None,
+                description: "Record index in the ivvec index-source to use as ordinal set".to_string(),
                 role: OptionRole::Config,
             },
         ]

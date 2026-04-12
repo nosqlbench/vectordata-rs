@@ -174,7 +174,19 @@ impl CommandOp for CatalogGenerateOp {
             }
 
 
-            ctx.ui.log(&format!("  wrote {} entries to {} (catalog.json + catalog.yaml + mrefs)", entries.len(), catalog_dir.display()));
+            // Generate knn_entries.yaml for jvector/knn tooling compatibility
+            let knn_path = catalog_dir.join("knn_entries.yaml");
+            let knn_content = generate_knn_entries(&datasets, catalog_dir, &scan_root);
+            if !knn_content.is_empty() {
+                if let Err(e) = std::fs::write(&knn_path, &knn_content) {
+                    ctx.ui.log(&format!("  warning: failed to write {}: {}", knn_path.display(), e));
+                } else {
+                    produced.push(knn_path);
+                    total_files += 1;
+                }
+            }
+
+            ctx.ui.log(&format!("  wrote {} entries to {} (catalog.json + catalog.yaml + knn_entries.yaml)", entries.len(), catalog_dir.display()));
             produced.push(json_path);
             produced.push(yaml_path);
             total_files += 2;
@@ -290,6 +302,86 @@ fn walk_for_datasets(dir: &Path, datasets: &mut Vec<DiscoveredDataset>) {
                 continue;
             }
             walk_for_datasets(&subdir, datasets);
+        }
+    }
+}
+
+/// Generate knn_entries.yaml content in jvector-compatible format.
+///
+/// Produces one entry per dataset:profile pair with `base`, `query`, `gt`
+/// filenames relative to the dataset directory. The `_defaults.base_url`
+/// is derived from the .publish_url if available.
+fn generate_knn_entries(
+    datasets: &[DiscoveredDataset],
+    catalog_dir: &Path,
+    scan_root: &Path,
+) -> String {
+    let mut out = String::new();
+
+    // Derive base_url from .publish_url if present
+    let publish_url = find_publish_url(scan_root);
+    if let Some(ref url) = publish_url {
+        out.push_str("_defaults:\n");
+        out.push_str(&format!("  base_url: {}\n\n", url.trim_end_matches('/')));
+    }
+
+    for ds in datasets {
+        if !ds.yaml_path.starts_with(catalog_dir) {
+            continue;
+        }
+
+        let ds_dir = ds.yaml_path.parent().unwrap_or(Path::new("."));
+        let ds_rel = ds_dir.strip_prefix(catalog_dir)
+            .map(|r| r.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let ds_prefix = if ds_rel.is_empty() { String::new() } else { format!("{}/", ds_rel) };
+
+        // Load profiles from the dataset config
+        let config = &ds.config;
+
+        for (profile_name, profile) in &config.profiles.profiles {
+            let entry_name = format!("{}:{}", config.name, profile_name);
+
+            // Find base_vectors, query_vectors, neighbor_indices view paths
+            let base_path = profile.view("base_vectors").map(|v| v.path());
+            let query_path = profile.view("query_vectors").map(|v| v.path());
+            let gt_path = profile.view("neighbor_indices").map(|v| v.path());
+
+            // Skip profiles without the essential BQG facets
+            if base_path.is_none() || query_path.is_none() || gt_path.is_none() {
+                continue;
+            }
+
+            // Quote the entry name since it contains ':'
+            out.push_str(&format!("\"{}\":\n", entry_name));
+            out.push_str(&format!("  base: {}{}\n", ds_prefix, base_path.unwrap()));
+            out.push_str(&format!("  query: {}{}\n", ds_prefix, query_path.unwrap()));
+            out.push_str(&format!("  gt: {}{}\n", ds_prefix, gt_path.unwrap()));
+            out.push('\n');
+        }
+    }
+
+    out
+}
+
+/// Find .publish_url content by walking up from the given directory.
+fn find_publish_url(dir: &Path) -> Option<String> {
+    let mut current = dir.to_path_buf();
+    loop {
+        let candidate = current.join(PUBLISH_URL_FILE);
+        if candidate.is_file() {
+            if let Ok(content) = std::fs::read_to_string(&candidate) {
+                let url = content.lines()
+                    .map(|l| l.trim())
+                    .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                    .collect::<String>();
+                if !url.is_empty() {
+                    return Some(url);
+                }
+            }
+        }
+        if !current.pop() {
+            return None;
         }
     }
 }

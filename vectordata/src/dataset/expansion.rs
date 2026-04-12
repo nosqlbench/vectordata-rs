@@ -194,6 +194,7 @@ pub fn expand_per_profile_steps(
                 profiles: vec![profile_name.to_string()],
                 per_profile: false,
                 phase: template.phase,
+                finalize: template.finalize,
                 on_partial: template.on_partial.clone(),
                 options: expanded_options,
             });
@@ -338,6 +339,7 @@ mod tests {
             profiles: vec![],
             per_profile: false,
             phase: 0,
+            finalize: false,
             on_partial: crate::dataset::pipeline::OnPartial::default(),
             options: Default::default(),
         };
@@ -355,6 +357,7 @@ mod tests {
             profiles: vec!["10m".into()],
             per_profile: false,
             phase: 0,
+            finalize: false,
             on_partial: crate::dataset::pipeline::OnPartial::default(),
             options: Default::default(),
         };

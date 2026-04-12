@@ -44,6 +44,13 @@ pub struct DatasetConfig {
 /// Facet names match the canonical keys from the Java `TestDataKind` enum.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProfileConfig {
+    /// Number of base vectors in this profile. Set for all profile types:
+    /// default (full dataset), sized (windowed subset), partition (per-label).
+    pub base_count: Option<u64>,
+
+    /// Maximum k for KNN queries in this profile.
+    pub maxk: Option<u32>,
+
     // -- Vector facets --
 
     /// Configuration for the base (database) vectors.

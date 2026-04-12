@@ -206,6 +206,14 @@ pub struct DSProfileGroup {
     /// Facet templates from the `sized:` structured form, stored for
     /// deferred expansion.
     pub deferred_facet_templates: Option<IndexMap<String, String>>,
+    /// All raw sized entries from the original YAML, preserved for
+    /// round-trip serialization. Includes both immediately expanded
+    /// entries and deferred entries.
+    pub raw_sized: Vec<String>,
+    /// Profile names that were generated from `sized:` expansion (not
+    /// explicitly defined). These are omitted from `save()` output
+    /// since they'll be re-generated from the `sized:` entries on reload.
+    pub sized_profile_names: Vec<String>,
 }
 
 impl Serialize for DSProfileGroup {
@@ -224,6 +232,8 @@ impl DSProfileGroup {
             profiles,
             deferred_sized: Vec::new(),
             deferred_facet_templates: None,
+            raw_sized: Vec::new(),
+            sized_profile_names: Vec::new(),
         }
     }
 
@@ -417,27 +427,57 @@ impl DSProfileGroup {
                     continue;
                 }
 
-                // For non-default sized profiles, reference the default profile's
-                // file with a window [0, base_count) instead of creating a
-                // separate extracted file.
+                // For non-default sized profiles that are subsets of the default
+                // dataset, reference the default profile's file with a window
+                // [0, base_count). Partition profiles (which have their own
+                // independent base_vectors, not windowed from default) get
+                // direct paths to their own profile directory instead.
                 if name != "default" {
                     if let Some(bc) = profile.base_count {
-                        let default_path = format!("profiles/default/{}", filename);
-                        let window = DSWindow(vec![DSInterval {
-                            min_incl: 0,
-                            max_excl: bc,
-                        }]);
-                        profile.views.insert(
-                            stem,
-                            DSView {
-                                source: DSSource {
-                                    path: default_path,
-                                    namespace: None,
-                                    window,
+                        // Check if this profile has its own base_vectors (not
+                        // windowed from default) — this indicates a partition
+                        // profile with independent data.
+                        let is_partition = profile.views.get("base_vectors")
+                            .map(|v| {
+                                v.source.window.is_empty()
+                                    && v.source.path.contains(&format!("profiles/{}/", name))
+                            })
+                            .unwrap_or(false);
+
+                        if is_partition {
+                            // Partition profile: KNN outputs are in the
+                            // profile's own directory
+                            let resolved_path = format!("{}{}", profile_dir, filename);
+                            profile.views.insert(
+                                stem,
+                                DSView {
+                                    source: DSSource {
+                                        path: resolved_path,
+                                        namespace: None,
+                                        window: DSWindow::default(),
+                                    },
+                                    window: None,
                                 },
-                                window: None,
-                            },
-                        );
+                            );
+                        } else {
+                            // Sized subset profile: window into default
+                            let default_path = format!("profiles/default/{}", filename);
+                            let window = DSWindow(vec![DSInterval {
+                                min_incl: 0,
+                                max_excl: bc,
+                            }]);
+                            profile.views.insert(
+                                stem,
+                                DSView {
+                                    source: DSSource {
+                                        path: default_path,
+                                        namespace: None,
+                                        window,
+                                    },
+                                    window: None,
+                                },
+                            );
+                        }
                         continue;
                     }
                 }
@@ -629,7 +669,57 @@ pub fn profile_sort_by_size(
 ) -> std::cmp::Ordering {
     let a_key = profile_sort_key(a_name, a_base_count);
     let b_key = profile_sort_key(b_name, b_base_count);
-    a_key.cmp(&b_key).then_with(|| a_name.cmp(b_name))
+    a_key.cmp(&b_key).then_with(|| natural_cmp(a_name, b_name))
+}
+
+/// Natural comparison: splits strings into alphabetic and numeric segments,
+/// comparing numbers by value (so "label-2" < "label-10") and text
+/// lexicographically.
+fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    let mut ai = a.chars().peekable();
+    let mut bi = b.chars().peekable();
+
+    loop {
+        match (ai.peek(), bi.peek()) {
+            (None, None) => return std::cmp::Ordering::Equal,
+            (None, Some(_)) => return std::cmp::Ordering::Less,
+            (Some(_), None) => return std::cmp::Ordering::Greater,
+            (Some(&ac), Some(&bc)) => {
+                if ac.is_ascii_digit() && bc.is_ascii_digit() {
+                    // Both at a digit run — extract full number and compare by value
+                    let an = take_number(&mut ai);
+                    let bn = take_number(&mut bi);
+                    match an.cmp(&bn) {
+                        std::cmp::Ordering::Equal => continue,
+                        other => return other,
+                    }
+                } else {
+                    match ac.cmp(&bc) {
+                        std::cmp::Ordering::Equal => {
+                            ai.next();
+                            bi.next();
+                        }
+                        other => return other,
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Consume consecutive digits from a peekable char iterator, returning
+/// the numeric value.
+fn take_number(iter: &mut std::iter::Peekable<std::str::Chars<'_>>) -> u64 {
+    let mut n: u64 = 0;
+    while let Some(&c) = iter.peek() {
+        if c.is_ascii_digit() {
+            n = n.saturating_mul(10).saturating_add((c as u64) - ('0' as u64));
+            iter.next();
+        } else {
+            break;
+        }
+    }
+    n
 }
 
 /// Parse a sized entry without a base count bound. Only valid for forms
@@ -859,6 +949,7 @@ impl<'de> Deserialize<'de> for DSProfileGroup {
         let mut profiles = IndexMap::new();
         let mut deferred_sized: Vec<String> = Vec::new();
         let mut deferred_facet_templates: Option<IndexMap<String, String>> = None;
+        let mut sized_profile_names: Vec<String> = Vec::new();
 
         for (name, value) in &raw {
             if name == "default" {
@@ -972,6 +1063,7 @@ impl<'de> Deserialize<'de> for DSProfileGroup {
                             prof_name,
                         )));
                     }
+                    sized_profile_names.push(prof_name.clone());
                     profiles.insert(prof_name, merged);
                 }
                 if !deferred.is_empty() {
@@ -1004,10 +1096,29 @@ impl<'de> Deserialize<'de> for DSProfileGroup {
             profiles.insert(name.clone(), merged);
         }
 
+        // Collect all raw sized entries for round-trip serialization
+        let raw_sized: Vec<String> = raw.get("sized").map(|value| {
+            match value {
+                serde_yaml::Value::Sequence(_) => {
+                    serde_yaml::from_value::<Vec<String>>(value.clone()).unwrap_or_default()
+                }
+                serde_yaml::Value::Mapping(_) => {
+                    let map: IndexMap<String, serde_yaml::Value> =
+                        serde_yaml::from_value(value.clone()).unwrap_or_default();
+                    map.get("ranges")
+                        .and_then(|v| serde_yaml::from_value::<Vec<String>>(v.clone()).ok())
+                        .unwrap_or_default()
+                }
+                _ => Vec::new(),
+            }
+        }).unwrap_or_default();
+
         Ok(DSProfileGroup {
             profiles,
             deferred_sized,
             deferred_facet_templates,
+            raw_sized,
+            sized_profile_names,
         })
     }
 }
@@ -1579,6 +1690,7 @@ default:
                 profiles: vec![],
                 per_profile: true,
                 phase: 0,
+                finalize: false,
                 on_partial: crate::dataset::pipeline::OnPartial::default(),
                 options: opts1,
             },
@@ -1590,6 +1702,7 @@ default:
                 profiles: vec![],
                 per_profile: true,
                 phase: 0,
+                finalize: false,
                 on_partial: crate::dataset::pipeline::OnPartial::default(),
                 options: opts2,
             },
@@ -1717,5 +1830,49 @@ custom-queries:
         assert_eq!(custom.view("query_vectors").unwrap().path(), "alt_queries.fvec");
         // custom-queries should inherit base_vectors from default
         assert_eq!(custom.view("base_vectors").unwrap().path(), "base.fvec");
+    }
+
+    #[test]
+    fn test_natural_sort_partition_profiles() {
+        // Verify that partition profiles sort in natural numeric order,
+        // not lexicographic ASCII order.
+        assert_eq!(super::natural_cmp("label-0", "label-1"), std::cmp::Ordering::Less);
+        assert_eq!(super::natural_cmp("label-2", "label-10"), std::cmp::Ordering::Less);
+        assert_eq!(super::natural_cmp("label-9", "label-10"), std::cmp::Ordering::Less);
+        assert_eq!(super::natural_cmp("label-10", "label-10"), std::cmp::Ordering::Equal);
+        assert_eq!(super::natural_cmp("label-100", "label-20"), std::cmp::Ordering::Greater);
+        assert_eq!(super::natural_cmp("abc", "def"), std::cmp::Ordering::Less);
+        assert_eq!(super::natural_cmp("a1b", "a2b"), std::cmp::Ordering::Less);
+        assert_eq!(super::natural_cmp("a10b", "a2b"), std::cmp::Ordering::Greater);
+    }
+
+    #[test]
+    fn test_profile_names_natural_order() {
+        // Profile names with numeric suffixes should sort naturally.
+        let yaml = r#"
+default:
+  base_vectors: base.fvec
+label-0:
+  base_count: 100
+  base_vectors: profiles/label-0/base_vectors.fvec
+label-1:
+  base_count: 100
+  base_vectors: profiles/label-1/base_vectors.fvec
+label-10:
+  base_count: 100
+  base_vectors: profiles/label-10/base_vectors.fvec
+label-2:
+  base_count: 100
+  base_vectors: profiles/label-2/base_vectors.fvec
+label-9:
+  base_count: 100
+  base_vectors: profiles/label-9/base_vectors.fvec
+"#;
+        let g: DSProfileGroup = serde_yaml::from_str(yaml).unwrap();
+        let names = g.profile_names();
+        // default first, then label-0, 1, 2, 9, 10 in natural order
+        // (all have same base_count, so tiebreak is by natural name sort)
+        assert_eq!(names, vec!["default", "label-0", "label-1", "label-2", "label-9", "label-10"],
+            "profile names should be in natural numeric order: {:?}", names);
     }
 }

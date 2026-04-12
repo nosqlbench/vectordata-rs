@@ -805,6 +805,7 @@ fn emit_step_yaml(
         profiles: vec![],
         per_profile: false,
         phase: 0,
+        finalize: false,
         on_partial: Default::default(),
         options: step_options,
     };
@@ -906,6 +907,7 @@ mod tests {
             profiles: vec![],
             per_profile: false,
             phase: 0,
+            finalize: false,
             on_partial: Default::default(),
             options: step_options,
         };
@@ -946,6 +948,7 @@ mod tests {
             profiles: vec![],
             per_profile: false,
             phase: 0,
+            finalize: false,
             on_partial: Default::default(),
             options: step_options,
         };

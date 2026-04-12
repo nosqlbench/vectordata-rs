@@ -230,8 +230,8 @@ impl<T: VvecElement> VvecReader<T> for HttpIndexedXvecReader {
 /// - **HTTP URLs**: uses `HttpIndexedXvecReader` (fetches index, Range requests)
 ///
 /// The element size is inferred from the file extension. The companion
-/// `IDXFOR__` index file must exist (created by `generate vvec-index`
-/// pipeline step or `IndexedXvecReader::open`).
+/// `IDXFOR__` index file must exist (created automatically at write
+/// time by pipeline steps, or by `IndexedXvecReader::open`).
 ///
 /// ```no_run
 /// use vectordata::io::open_vvec;
@@ -575,11 +575,12 @@ impl MmapVectorReader<f32> {
         }
 
         let mut cursor = Cursor::new(&mmap[..]);
-        let dim = cursor.read_i32::<LittleEndian>()? as usize;
-
-        if dim == 0 {
-             return Err(IoError::InvalidFormat("Dimension cannot be 0".into()));
+        let dim_i32 = cursor.read_i32::<LittleEndian>()?;
+        if dim_i32 <= 0 {
+             return Err(IoError::InvalidFormat(
+                format!("invalid dimension {} in {}", dim_i32, path.display())));
         }
+        let dim = dim_i32 as usize;
 
         let entry_size = 4 + dim * 4;
         let count = mmap.len() / entry_size;
@@ -667,11 +668,12 @@ impl MmapVectorReader<i32> {
         }
 
         let mut cursor = Cursor::new(&mmap[..]);
-        let dim = cursor.read_i32::<LittleEndian>()? as usize;
-
-        if dim == 0 {
-             return Err(IoError::InvalidFormat("Dimension cannot be 0".into()));
+        let dim_i32 = cursor.read_i32::<LittleEndian>()?;
+        if dim_i32 <= 0 {
+             return Err(IoError::InvalidFormat(
+                format!("invalid dimension {} in {}", dim_i32, path.display())));
         }
+        let dim = dim_i32 as usize;
 
         let entry_size = 4 + dim * 4;
 
@@ -1389,6 +1391,24 @@ impl IndexedXvecReader {
 
 /// Compute the index file path for a given data file.
 /// Uses `.i32` for files up to 2GB, `.i64` for larger.
+/// Remove any existing IDXFOR__ index files for a data file.
+///
+/// Call this before rewriting a vvec file to ensure stale indices
+/// are cleaned up. The index will be rebuilt by `IndexedXvecReader::open`.
+pub fn remove_vvec_index(data_path: &Path) {
+    let parent = data_path.parent().unwrap_or(Path::new("."));
+    let name = data_path.file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    if name.is_empty() { return; }
+    for ext in &["i32", "i64"] {
+        let idx = parent.join(format!("IDXFOR__{}.{}", name, ext));
+        if idx.exists() {
+            let _ = std::fs::remove_file(&idx);
+        }
+    }
+}
+
 fn index_path_for(data_path: &Path, file_size: u64) -> std::path::PathBuf {
     let parent = data_path.parent().unwrap_or(Path::new("."));
     let name = data_path.file_name()
@@ -1444,9 +1464,12 @@ fn build_offset_index(mmap: &[u8], elem_size: usize) -> Result<Vec<u64>, IoError
         offsets.push(offset);
         let o = offset as usize;
         let dim = i32::from_le_bytes([mmap[o], mmap[o+1], mmap[o+2], mmap[o+3]]);
-        if dim <= 0 {
+        // Negative dimension is invalid. Zero dimension is valid for
+        // variable-length (vvec) files — it represents an empty record
+        // (e.g., a predicate with no matching vectors).
+        if dim < 0 {
             return Err(IoError::InvalidFormat(format!(
-                "invalid dimension {} at offset {}", dim, offset)));
+                "negative dimension {} at offset {}", dim, offset)));
         }
         offset += 4 + dim as u64 * elem_size as u64;
     }
@@ -1555,7 +1578,7 @@ impl HttpIndexedXvecReader {
 
         let offsets = offsets.ok_or_else(|| IoError::InvalidFormat(format!(
             "no IDXFOR__ index file found for {}. \
-             Run `veks run` or `veks pipeline generate vvec-index` to create it.",
+             Run `veks run` to create it (indices are built automatically at write time).",
             data_name,
         )))?;
 

@@ -110,6 +110,9 @@ fn default_args(name: &str, output: &Path) -> ImportArgs {
             predicate_range_min: 0,
             predicate_range_max: 1000,
             verify_knn_sample: 0,
+            partition_oracles: false,
+            max_partitions: 100,
+            on_undersized: "error".to_string(),
     }
 }
 
@@ -1697,7 +1700,6 @@ fn import_full_pipeline_all_features() {
         "generate-dataset-json",
         "generate-variables-json",
         "generate-dataset-log-jsonl",
-        "generate-vvec-index",
         "generate-merkle",
         "generate-catalog",
     ];
@@ -1754,8 +1756,8 @@ fn import_full_pipeline_everything_disabled() {
     // count-base, compute-knn, verify-knn, generate-dataset-json,
     // generate-variables-json, generate-dataset-log-jsonl,
     // generate-merkle, generate-catalog = 17
-    assert_eq!(ids.len(), 20,
-        "minimal self-search pipeline should have 20 steps, got {}: {:?}", ids.len(), ids);
+    assert_eq!(ids.len(), 19,
+        "minimal self-search pipeline should have 19 steps, got {}: {:?}", ids.len(), ids);
 }
 
 #[test]
@@ -1834,7 +1836,7 @@ fn project_artifacts_every_registered_command_no_panic() {
         // generate
         "generate dataset", "generate derive", "generate from-model",
         "generate predicates", "generate shuffle",
-        "generate sketch", "generate vectors", "generate vvec-index",
+        "generate sketch", "generate vectors",
         // merkle
         "merkle create", "merkle diff", "merkle path", "merkle spoilbits",
         "merkle spoilchunks", "merkle summary", "merkle treeview", "merkle verify",

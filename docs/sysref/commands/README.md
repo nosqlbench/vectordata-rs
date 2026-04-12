@@ -15,6 +15,7 @@ Every command with a working example run against the
 | [analyze explain-predicates](./analyze-explain-predicates.md) | Trace predicate → matching metadata |
 | [analyze explain-filtered-knn](./analyze-explain-filtered-knn.md) | Full query trace through all pipeline stages |
 | [analyze file](./analyze-file.md) | Low-level file metadata |
+| [analyze explain-partitions](./analyze-explain-partitions.md) | Trace query through partition oracle creation |
 | [analyze check-endian](./analyze-check-endian.md) | Verify byte order |
 
 ## Compute
@@ -24,6 +25,7 @@ Every command with a working example run against the
 | [compute knn](./compute-knn.md) | Brute-force exact KNN ground truth |
 | [compute filtered-knn](./compute-filtered-knn.md) | KNN with predicate pre-filtering |
 | [compute evaluate-predicates](./compute-evaluate-predicates.md) | Evaluate predicates against metadata |
+| [compute partition-profiles](./compute-partition-profiles.md) | Per-label partition profiles with partitioned KNN |
 
 ## Generate
 

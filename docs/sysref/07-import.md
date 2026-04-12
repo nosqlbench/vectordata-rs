@@ -58,6 +58,30 @@ Each data facet resolves to one of two artifact types:
 | Query vectors | no format conversion, no overlap removal |
 | Ground truth | pre-computed GT provided |
 
+### The O facet (oracle partitions)
+
+The O facet is never auto-inferred — it must be explicitly requested:
+
+```
+veks bootstrap -i                        # wizard asks if MPRF present
+veks bootstrap -i --required-facets BQGDMPRFO   # explicit
+```
+
+In the wizard, users can add O to the inferred facets with `+` syntax:
+
+```
+Facets to include in dataset (* for all, +X to add) [BQGMPRF]: +O
+  → Facets: BQGMPRFO  (+O added to BQGMPRF)
+```
+
+When O is included, the wizard prompts for partition configuration
+(max partitions, undersized handling), and the pipeline adds a
+`partition-profiles` step that extracts per-label base vectors and
+registers partition profiles. The existing `per_profile` compute-knn
+template then naturally runs for each partition.
+
+The `partition-profiles` step reads metadata labels (scalar or slab format), identifies unique label values, extracts the base vectors belonging to each label, and registers a new profile per partition in `dataset.yaml`. This triggers pipeline Phase 3 (see §4.4), which re-expands `per_profile` templates like `compute-knn` for each partition profile. The `--partition-oracles` flag is equivalent to adding `+O` in the wizard.
+
 ### Profile view paths
 
 Profile views always use canonical paths regardless of artifact type:
@@ -110,6 +134,7 @@ count-vectors → scan-zeros → scan-duplicates
 | Dedup | `!no_dedup` (default: on) |
 | Filtered KNN | metadata present and `!no_filtered` |
 | Scan steps | emitted when `prepare-vectors` is skipped (Identity base) |
+| Zero removal | zeros detected and excluded from ordinals during sort/dedup |
 
 ---
 
@@ -126,3 +151,23 @@ count-vectors → scan-zeros → scan-duplicates
 
 Identity symlinks survive `--clean` so subsequent runs can find the
 source data without re-bootstrapping.
+
+---
+
+## 7.6 Zero Vector Handling
+
+Zero vectors (all-component-zero) are detected and removed from the ordinal set during the sort/dedup step. The `clean_count` variable excludes both duplicates and zeros, ensuring ordinal congruency between base vectors and any metadata extractions (predicates, labels). This prevents downstream KNN and filtered-KNN computations from operating on degenerate vectors that would produce undefined distance results.
+
+---
+
+## 7.7 DatasetConfig Round-Trip Serialization
+
+`DatasetConfig.save()` writes `dataset.yaml` with canonical field ordering: `name` → `description` → `attributes` → `upstream` → `profiles` → `variables`. It preserves `sized:` compact syntax (e.g., `sized: 100K`) and is round-trip safe — load, modify, save without format loss. Pipeline commands like `update_dataset_attributes` and `compute partition-profiles` use `DatasetConfig.save()` instead of text surgery, ensuring consistent formatting.
+
+```yaml
+# Compact sized syntax preserved on round-trip
+profiles:
+  100K:
+    sized: 100K
+    base_count: 100000
+```

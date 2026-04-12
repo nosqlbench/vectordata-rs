@@ -375,6 +375,9 @@ pub fn run(args: CleanupArgs) {
             predicate_range_min: 0,
             predicate_range_max: 1000,
             verify_knn_sample: 0,
+            partition_oracles: false,
+            max_partitions: 100,
+            on_undersized: "error".to_string(),
         };
 
         import::run(import_args);

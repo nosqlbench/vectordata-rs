@@ -79,16 +79,17 @@ fn probe_file(path: &Path) -> Result<FileInfo, String> {
     let header_bytes = std::fs::read(path)
         .map_err(|e| format!("failed to read {}: {}", path.display(), e))?;
 
-    let dimensions = i32::from_le_bytes([
+    let dim_i32 = i32::from_le_bytes([
         header_bytes[0],
         header_bytes[1],
         header_bytes[2],
         header_bytes[3],
-    ]) as usize;
+    ]);
 
-    if dimensions == 0 {
-        return Err("dimension count is 0".to_string());
+    if dim_i32 <= 0 {
+        return Err(format!("invalid dimension {} in {}", dim_i32, path.display()));
     }
+    let dimensions = dim_i32 as usize;
 
     let bytes_per_vector = 4 + dimensions * bytes_per_element;
     let vector_count = file_size as usize / bytes_per_vector;

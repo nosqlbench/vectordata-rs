@@ -211,34 +211,33 @@ upstream:
     - id: generate-dataset-json
       description: Generate dataset.json
       run: generate dataset-json
+      finalize: true
       after: [verify-filtered-knn, verify-predicates-sqlite]
 
     - id: generate-variables-json
       description: Generate variables.json
       run: generate variables-json
+      finalize: true
       after: [generate-dataset-json]
 
     - id: generate-dataset-log-jsonl
       description: Generate dataset.jsonl
       run: generate dataset-log-jsonl
+      finalize: true
       after: [generate-dataset-json]
-
-    - id: generate-vvec-index
-      description: Build offset indices for vvec files
-      run: generate vvec-index
-      after: [generate-variables-json, generate-dataset-log-jsonl]
-      source: .
 
     - id: generate-merkle
       description: Create merkle hash trees
       run: merkle create
-      after: [generate-vvec-index]
+      finalize: true
+      after: [generate-variables-json, generate-dataset-log-jsonl]
       source: .
       min-size: 0
 
     - id: generate-catalog
       description: Generate catalog index
       run: catalog generate
+      finalize: true
       after: [generate-merkle]
       source: .
 
@@ -254,3 +253,51 @@ profiles:
     metadata_indices: profiles/default/metadata_indices.ivvec
     filtered_neighbor_indices: profiles/default/filtered_neighbor_indices.ivec
     filtered_neighbor_distances: profiles/default/filtered_neighbor_distances.fvec
+  label-0:
+    base_count: 80
+    base_vectors: profiles/label-0/base_vectors.fvec
+    query_vectors: profiles/label-0/query_vectors.fvec
+  label-1:
+    base_count: 77
+    base_vectors: profiles/label-1/base_vectors.fvec
+    query_vectors: profiles/label-1/query_vectors.fvec
+  label-2:
+    base_count: 80
+    base_vectors: profiles/label-2/base_vectors.fvec
+    query_vectors: profiles/label-2/query_vectors.fvec
+  label-3:
+    base_count: 94
+    base_vectors: profiles/label-3/base_vectors.fvec
+    query_vectors: profiles/label-3/query_vectors.fvec
+  label-4:
+    base_count: 87
+    base_vectors: profiles/label-4/base_vectors.fvec
+    query_vectors: profiles/label-4/query_vectors.fvec
+  label-5:
+    base_count: 73
+    base_vectors: profiles/label-5/base_vectors.fvec
+    query_vectors: profiles/label-5/query_vectors.fvec
+  label-6:
+    base_count: 92
+    base_vectors: profiles/label-6/base_vectors.fvec
+    query_vectors: profiles/label-6/query_vectors.fvec
+  label-7:
+    base_count: 84
+    base_vectors: profiles/label-7/base_vectors.fvec
+    query_vectors: profiles/label-7/query_vectors.fvec
+  label-8:
+    base_count: 77
+    base_vectors: profiles/label-8/base_vectors.fvec
+    query_vectors: profiles/label-8/query_vectors.fvec
+  label-9:
+    base_count: 81
+    base_vectors: profiles/label-9/base_vectors.fvec
+    query_vectors: profiles/label-9/query_vectors.fvec
+  label-10:
+    base_count: 85
+    base_vectors: profiles/label-10/base_vectors.fvec
+    query_vectors: profiles/label-10/query_vectors.fvec
+  label-11:
+    base_count: 90
+    base_vectors: profiles/label-11/base_vectors.fvec
+    query_vectors: profiles/label-11/query_vectors.fvec

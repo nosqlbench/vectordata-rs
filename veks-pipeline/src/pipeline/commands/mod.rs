@@ -40,6 +40,7 @@ pub mod compute_dedup;
 pub mod dataset_json;
 pub mod compute_filtered_knn;
 pub mod compute_knn;
+pub mod compute_partition_profiles;
 #[cfg(feature = "knnutils")]
 pub mod compute_knn_blas;
 #[cfg(feature = "faiss")]
@@ -59,6 +60,7 @@ pub mod gen_metadata;
 pub mod gen_from_model;
 pub mod gen_predicate_keys;
 pub mod inspect_filtered_knn;
+pub mod inspect_partition;
 pub mod gen_predicates;
 pub mod gen_shuffle;
 #[cfg(feature = "knnutils")]
@@ -67,7 +69,6 @@ pub mod gen_sketch;
 pub mod gen_dataset_log_jsonl;
 pub mod gen_variables_json;
 pub mod gen_vectors;
-pub mod gen_vvec_index;
 mod import;
 pub mod info_compute;
 pub mod info_file;
@@ -110,6 +111,7 @@ pub fn register_all(registry: &mut CommandRegistry) {
     registry.register("analyze model-diff", analyze_modeldiff::factory);
     registry.register("analyze explain-predicates", inspect_predicate::factory);
     registry.register("analyze explain-filtered-knn", inspect_filtered_knn::factory);
+    registry.register("analyze explain-partitions", inspect_partition::factory);
     registry.register("analyze select", analyze_select::factory);
     registry.register("analyze slice", analyze_slice::factory);
     registry.register("analyze stats", analyze_stats::factory);
@@ -130,6 +132,7 @@ pub fn register_all(registry: &mut CommandRegistry) {
     registry.register("compute evaluate-predicates", gen_predicate_keys::factory);
     registry.register("compute filtered-knn", compute_filtered_knn::factory);
     registry.register("compute knn", compute_knn::factory);
+    registry.register("compute partition-profiles", compute_partition_profiles::factory);
     #[cfg(feature = "knnutils")]
     registry.register("compute knn-blas", compute_knn_blas::factory);
     #[cfg(feature = "faiss")]
@@ -156,7 +159,6 @@ pub fn register_all(registry: &mut CommandRegistry) {
     registry.register("generate dataset-log-jsonl", gen_dataset_log_jsonl::factory);
     registry.register("generate variables-json", gen_variables_json::factory);
     registry.register("generate vectors", gen_vectors::factory);
-    registry.register("generate vvec-index", gen_vvec_index::factory);
 
     // ── merkle ───────────────────────────────────────────────────────
     registry.register("merkle create", merkle::create_factory);

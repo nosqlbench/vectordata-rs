@@ -1651,7 +1651,9 @@ fn dedup_many_duplicates() {
 
     let unique = read_ivec_1d(&ws.join("sorted.ivec"));
     let dups = read_ivec_1d(&ws.join("dups.ivec"));
-    assert_eq!(unique.len(), 10, "should have 10 unique groups");
+    // 10 groups → 10 unique after dedup. Group 0 is [0,0,0] (zero vector),
+    // removed during zero detection → 9 unique in output.
+    assert_eq!(unique.len(), 9, "should have 9 unique (10 groups - 1 zero)");
     assert_eq!(dups.len(), 90, "should have 90 duplicates");
 }
 
@@ -1865,4 +1867,567 @@ fn histogram_basic() {
     let mut ctx = test_ctx(ws);
     let r = cmd.execute(&opts, &mut ctx);
     assert_eq!(r.status, Status::Ok, "histogram: {}", r.message);
+}
+
+// ---------------------------------------------------------------------------
+// Scalar extract tests
+// ---------------------------------------------------------------------------
+
+/// Write a u8 scalar file (one byte per record, no headers).
+fn write_scalar_u8(path: &Path, values: &[u8]) {
+    std::fs::write(path, values).unwrap();
+}
+
+/// Write an ivec file with 1-dimensional records (ordinals).
+fn write_ivec_ordinals(path: &Path, ordinals: &[i32]) {
+    use std::io::Write;
+    let f = std::fs::File::create(path).unwrap();
+    let mut w = std::io::BufWriter::new(f);
+    for &ord in ordinals {
+        w.write_all(&1i32.to_le_bytes()).unwrap(); // dim = 1
+        w.write_all(&ord.to_le_bytes()).unwrap();
+    }
+    w.flush().unwrap();
+}
+
+#[test]
+fn scalar_extract_u8_by_index() {
+    let tmp = tmp_dir();
+    let ws = tmp.path();
+
+    // Source: 10 u8 values [0, 10, 20, 30, 40, 50, 60, 70, 80, 90]
+    let source: Vec<u8> = (0..10).map(|i| i * 10).collect();
+    write_scalar_u8(&ws.join("labels.u8"), &source);
+
+    // Index: reorder to [5, 3, 7, 1] → expect [50, 30, 70, 10]
+    write_ivec_ordinals(&ws.join("shuffle.ivec"), &[5, 3, 7, 1]);
+
+    let mut opts = Options::new();
+    opts.set("source", "labels.u8");
+    opts.set("ivec-file", "shuffle.ivec");
+    opts.set("output", "extracted.u8");
+
+    let registry = veks_pipeline::pipeline::registry::CommandRegistry::with_builtins();
+    let mut cmd = registry.get("transform extract").unwrap()();
+    let mut ctx = test_ctx(ws);
+    let r = cmd.execute(&opts, &mut ctx);
+    assert_eq!(r.status, Status::Ok, "scalar extract: {}", r.message);
+
+    let output = std::fs::read(ws.join("extracted.u8")).unwrap();
+    assert_eq!(output, vec![50, 30, 70, 10],
+        "extracted values should match index-based reorder");
+}
+
+#[test]
+fn scalar_extract_u8_by_range() {
+    let tmp = tmp_dir();
+    let ws = tmp.path();
+
+    let source: Vec<u8> = (0..20).collect();
+    write_scalar_u8(&ws.join("data.u8"), &source);
+
+    let mut opts = Options::new();
+    opts.set("source", "data.u8");
+    opts.set("output", "slice.u8");
+    opts.set("range", "[5,10)");
+
+    let registry = veks_pipeline::pipeline::registry::CommandRegistry::with_builtins();
+    let mut cmd = registry.get("transform extract").unwrap()();
+    let mut ctx = test_ctx(ws);
+    let r = cmd.execute(&opts, &mut ctx);
+    assert_eq!(r.status, Status::Ok, "scalar range extract: {}", r.message);
+
+    let output = std::fs::read(ws.join("slice.u8")).unwrap();
+    assert_eq!(output, vec![5, 6, 7, 8, 9],
+        "extracted range [5,10) should be [5,6,7,8,9]");
+}
+
+#[test]
+fn scalar_extract_i32_by_index() {
+    let tmp = tmp_dir();
+    let ws = tmp.path();
+
+    // Source: 5 i32 values [100, 200, 300, 400, 500]
+    let source: Vec<u8> = [100i32, 200, 300, 400, 500].iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
+    std::fs::write(ws.join("values.i32"), &source).unwrap();
+
+    // Index: [4, 2, 0] → expect [500, 300, 100]
+    write_ivec_ordinals(&ws.join("order.ivec"), &[4, 2, 0]);
+
+    let mut opts = Options::new();
+    opts.set("source", "values.i32");
+    opts.set("ivec-file", "order.ivec");
+    opts.set("output", "reordered.i32");
+
+    let registry = veks_pipeline::pipeline::registry::CommandRegistry::with_builtins();
+    let mut cmd = registry.get("transform extract").unwrap()();
+    let mut ctx = test_ctx(ws);
+    let r = cmd.execute(&opts, &mut ctx);
+    assert_eq!(r.status, Status::Ok, "i32 scalar extract: {}", r.message);
+
+    let output = std::fs::read(ws.join("reordered.i32")).unwrap();
+    let values: Vec<i32> = output.chunks(4)
+        .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    assert_eq!(values, vec![500, 300, 100],
+        "i32 extracted values should match reorder");
+}
+
+#[test]
+fn scalar_extract_u8_index_with_range() {
+    let tmp = tmp_dir();
+    let ws = tmp.path();
+
+    // Source: 10 u8 values
+    let source: Vec<u8> = (0..10).map(|i| i * 10).collect();
+    write_scalar_u8(&ws.join("data.u8"), &source);
+
+    // Index: full shuffle [9, 8, 7, 6, 5, 4, 3, 2, 1, 0]
+    let ordinals: Vec<i32> = (0..10).rev().collect();
+    write_ivec_ordinals(&ws.join("shuffle.ivec"), &ordinals);
+
+    // Range: [0, 3) of the index → first 3 entries → ordinals [9, 8, 7]
+    let mut opts = Options::new();
+    opts.set("source", "data.u8");
+    opts.set("ivec-file", "shuffle.ivec");
+    opts.set("output", "slice.u8");
+    opts.set("range", "[0,3)");
+
+    let registry = veks_pipeline::pipeline::registry::CommandRegistry::with_builtins();
+    let mut cmd = registry.get("transform extract").unwrap()();
+    let mut ctx = test_ctx(ws);
+    let r = cmd.execute(&opts, &mut ctx);
+    assert_eq!(r.status, Status::Ok, "scalar extract with range: {}", r.message);
+
+    let output = std::fs::read(ws.join("slice.u8")).unwrap();
+    assert_eq!(output, vec![90, 80, 70],
+        "range [0,3) of reversed shuffle should give [90, 80, 70]");
+}
+
+// ---------------------------------------------------------------------------
+// Partition profiles tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn partition_profiles_u8_metadata() {
+    let tmp = tmp_dir();
+    let ws = tmp.path();
+
+    // Base vectors: 20 vectors, dim=2
+    write_test_fvec(&ws.join("base.fvec"), &(0..20).map(|i|
+        vec![(i + 1) as f32, (i * 2 + 1) as f32]
+    ).collect::<Vec<_>>());
+
+    // Metadata: 20 u8 labels in 4 groups (0, 1, 2, 3, 0, 1, 2, 3, ...)
+    let labels: Vec<u8> = (0..20).map(|i| (i % 4) as u8).collect();
+    std::fs::write(ws.join("labels.u8"), &labels).unwrap();
+
+    // Query vectors: 5 vectors
+    write_test_fvec(&ws.join("query.fvec"), &(0..5).map(|i|
+        vec![(i + 100) as f32, (i * 3 + 100) as f32]
+    ).collect::<Vec<_>>());
+
+    let mut opts = Options::new();
+    opts.set("base", "base.fvec");
+    opts.set("query", "query.fvec");
+    opts.set("metadata", "labels.u8");
+    opts.set("neighbors", "3");
+    opts.set("metric", "L2");
+    opts.set("prefix", "label");
+    opts.set("allowed-partitions", "10");
+    opts.set("on-undersized", "warn");
+
+    // Create profiles dir and dataset.yaml for profile registration
+    std::fs::create_dir_all(ws.join("profiles")).unwrap();
+    std::fs::write(ws.join("dataset.yaml"),
+        "name: test\nprofiles:\n  default:\n    maxk: 3\n    base_vectors: base.fvec\n").unwrap();
+
+    let registry = veks_pipeline::pipeline::registry::CommandRegistry::with_builtins();
+    let mut cmd = registry.get("compute partition-profiles").unwrap()();
+    let mut ctx = test_ctx(ws);
+    let r = cmd.execute(&opts, &mut ctx);
+    assert_eq!(r.status, Status::Ok, "partition-profiles u8: {}", r.message);
+
+    // Should have created 4 partition directories
+    for i in 0..4 {
+        let pdir = ws.join(format!("profiles/label-{}", i));
+        assert!(pdir.exists(), "partition dir label-{} should exist", i);
+        assert!(pdir.join("base_vectors.fvec").exists(),
+            "label-{}/base_vectors.fvec should exist", i);
+    }
+
+    // Each partition should have 5 vectors (20 / 4)
+    let data = std::fs::read(ws.join("profiles/label-0/base_vectors.fvec")).unwrap();
+    let dim = i32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+    let stride = 4 + dim * 4;
+    let count = data.len() / stride;
+    assert_eq!(count, 5, "label-0 should have 5 vectors");
+
+    // Check partition_count variable
+    assert_eq!(ctx.defaults.get("partition_count").map(|s| s.as_str()), Some("4"));
+}
+
+#[test]
+fn partition_profiles_slab_metadata() {
+    use slabtastic::{SlabWriter, WriterConfig};
+
+    let tmp = tmp_dir();
+    let ws = tmp.path();
+
+    // Base vectors: 30 vectors, dim=2
+    write_test_fvec(&ws.join("base.fvec"), &(0..30).map(|i|
+        vec![(i + 1) as f32, (i * 2 + 1) as f32]
+    ).collect::<Vec<_>>());
+
+    // Query vectors: 5 vectors
+    write_test_fvec(&ws.join("query.fvec"), &(0..5).map(|i|
+        vec![(i + 100) as f32, (i * 3 + 100) as f32]
+    ).collect::<Vec<_>>());
+
+    // Create slab metadata: 30 records with label values 0-2 (3 groups).
+    // Each slab record is: [field_len: u16 LE] [field_data: field_len bytes]
+    // For i32 labels: field_len=4, field_data=i32 LE
+    {
+        let config = WriterConfig::new(512, 4096, u32::MAX, false).unwrap();
+        let mut writer = SlabWriter::new(ws.join("metadata.slab"), config).unwrap();
+        for i in 0..30u32 {
+            let label = (i % 3) as i32;
+            let mut record = Vec::new();
+            record.extend_from_slice(&4u16.to_le_bytes()); // field_len = 4
+            record.extend_from_slice(&label.to_le_bytes()); // field_data = i32
+            writer.add_record(&record).unwrap();
+        }
+        writer.finish().unwrap();
+    }
+
+    // Run partition-profiles with slab metadata
+    let mut opts = Options::new();
+    opts.set("base", "base.fvec");
+    opts.set("query", "query.fvec");
+    opts.set("metadata", "metadata.slab");
+    opts.set("neighbors", "3");
+    opts.set("metric", "L2");
+    opts.set("prefix", "label");
+    opts.set("allowed-partitions", "10");
+    opts.set("on-undersized", "warn");
+
+    std::fs::create_dir_all(ws.join("profiles")).unwrap();
+    std::fs::write(ws.join("dataset.yaml"),
+        "name: test\nprofiles:\n  default:\n    maxk: 3\n    base_vectors: base.fvec\n").unwrap();
+
+    let registry = veks_pipeline::pipeline::registry::CommandRegistry::with_builtins();
+    let mut cmd = registry.get("compute partition-profiles").unwrap()();
+    let mut ctx = test_ctx(ws);
+    let r = cmd.execute(&opts, &mut ctx);
+    assert_eq!(r.status, Status::Ok, "partition-profiles slab: {}", r.message);
+
+    // Should have created 3 partition directories
+    for i in 0..3 {
+        let pdir = ws.join(format!("profiles/label-{}", i));
+        assert!(pdir.exists(), "partition dir label-{} should exist", i);
+        assert!(pdir.join("base_vectors.fvec").exists(),
+            "label-{}/base_vectors.fvec should exist", i);
+    }
+
+    // Each partition should have 10 vectors (30 / 3)
+    let data = std::fs::read(ws.join("profiles/label-0/base_vectors.fvec")).unwrap();
+    let dim = i32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+    let stride = 4 + dim * 4;
+    let count = data.len() / stride;
+    assert_eq!(count, 10, "label-0 should have 10 vectors");
+
+    assert_eq!(ctx.defaults.get("partition_count").map(|s| s.as_str()), Some("3"));
+}
+
+// ---------------------------------------------------------------------------
+// Predicate-index extraction tests
+// ---------------------------------------------------------------------------
+
+/// Write an ivvec file with explicit variable-length records.
+fn write_test_ivvec(path: &std::path::Path, records: &[Vec<i32>]) {
+    use std::io::Write;
+    let f = std::fs::File::create(path).unwrap();
+    let mut w = std::io::BufWriter::new(f);
+    for record in records {
+        w.write_all(&(record.len() as i32).to_le_bytes()).unwrap();
+        for &val in record {
+            w.write_all(&val.to_le_bytes()).unwrap();
+        }
+    }
+    w.flush().unwrap();
+    // Build offset index
+    let _ = vectordata::io::IndexedXvecReader::open_ivec(path);
+}
+
+#[test]
+fn extract_fvec_by_predicate_index() {
+    let tmp = tmp_dir();
+    let ws = tmp.path();
+
+    // Source: 10 vectors, dim=2
+    write_test_fvec(&ws.join("base.fvec"), &(0..10).map(|i|
+        vec![(i + 1) as f32, (i * 2 + 1) as f32]
+    ).collect::<Vec<_>>());
+
+    // ivvec with 3 predicates:
+    //   pred 0: ordinals [0, 2, 4]     → vectors 1, 3, 5
+    //   pred 1: ordinals [1, 3, 5, 7]  → vectors 2, 4, 6, 8
+    //   pred 2: ordinals [9]           → vector 10
+    write_test_ivvec(&ws.join("results.ivvec"), &[
+        vec![0, 2, 4],
+        vec![1, 3, 5, 7],
+        vec![9],
+    ]);
+
+    // Extract base vectors matching predicate 1 (ordinals [1,3,5,7])
+    std::fs::create_dir_all(ws.join(".scratch")).unwrap();
+    let mut opts = Options::new();
+    opts.set("source", "base.fvec");
+    opts.set("index-source", "results.ivvec");
+    opts.set("predicate-index", "1");
+    opts.set("output", "partition.fvec");
+
+    let registry = veks_pipeline::pipeline::registry::CommandRegistry::with_builtins();
+    let mut cmd = registry.get("transform extract").unwrap()();
+    let mut ctx = test_ctx(ws);
+    let r = cmd.execute(&opts, &mut ctx);
+    assert_eq!(r.status, Status::Ok, "predicate-index extract: {}", r.message);
+
+    // Output should have 4 vectors (ordinals 1,3,5,7)
+    let data = std::fs::read(ws.join("partition.fvec")).unwrap();
+    let dim = i32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+    assert_eq!(dim, 2);
+    let stride = 4 + dim * 4;
+    let count = data.len() / stride;
+    assert_eq!(count, 4, "should extract 4 vectors for predicate 1");
+
+    // First extracted vector should be source vector at ordinal 1
+    // Source vec[1] = [2.0, 3.0]
+    let v0_offset = 4;
+    let v0_0 = f32::from_le_bytes(data[v0_offset..v0_offset+4].try_into().unwrap());
+    assert_eq!(v0_0, 2.0, "first extracted vector should be source[1]");
+}
+
+#[test]
+fn extract_scalar_by_predicate_index() {
+    let tmp = tmp_dir();
+    let ws = tmp.path();
+
+    // Source: 10 u8 labels
+    write_scalar_u8(&ws.join("labels.u8"), &[10, 20, 30, 40, 50, 60, 70, 80, 90, 100]);
+
+    // ivvec predicate results: pred 0 matches ordinals [2, 5, 8]
+    write_test_ivvec(&ws.join("results.ivvec"), &[
+        vec![2, 5, 8],
+    ]);
+
+    std::fs::create_dir_all(ws.join(".scratch")).unwrap();
+    let mut opts = Options::new();
+    opts.set("source", "labels.u8");
+    opts.set("index-source", "results.ivvec");
+    opts.set("predicate-index", "0");
+    opts.set("output", "partition_labels.u8");
+
+    let registry = veks_pipeline::pipeline::registry::CommandRegistry::with_builtins();
+    let mut cmd = registry.get("transform extract").unwrap()();
+    let mut ctx = test_ctx(ws);
+    let r = cmd.execute(&opts, &mut ctx);
+    assert_eq!(r.status, Status::Ok, "scalar predicate-index: {}", r.message);
+
+    let output = std::fs::read(ws.join("partition_labels.u8")).unwrap();
+    // Ordinals [2,5,8] → labels [30, 60, 90]
+    assert_eq!(output, vec![30, 60, 90]);
+}
+
+// ===========================================================================
+// Per-command fuzz tests
+//
+// Every registered command is tested against adversarial inputs to verify
+// it returns Status::Error (not panic) for invalid arguments.
+// ===========================================================================
+
+/// All non-feature-gated command paths in the registry.
+const ALL_COMMANDS: &[&str] = &[
+    // analyze
+    "analyze check-endian", "analyze compare-files", "analyze compute-info",
+    "analyze describe", "analyze file", "analyze find",
+    "analyze find-duplicates", "analyze find-zeros",
+    "analyze display-histogram", "analyze model-diff",
+    "analyze explain-predicates", "analyze explain-filtered-knn",
+    "analyze explain-partitions",
+    "analyze select", "analyze slice", "analyze stats", "analyze survey",
+    "analyze verify-knn", "analyze verify-profiles",
+    "analyze measure-normals", "analyze display-norms",
+    "analyze overlap", "analyze zeros",
+    // cleanup
+    "cleanup overlap",
+    // compute
+    "compute evaluate-predicates", "compute filtered-knn", "compute knn",
+    "compute partition-profiles", "compute sort",
+    // download
+    "download bulk", "download huggingface",
+    // generate
+    "generate dataset", "generate derive", "generate from-model",
+    "generate metadata", "generate predicates", "generate shuffle",
+    "generate sketch", "generate dataset-log-jsonl",
+    "generate variables-json", "generate vectors",
+    // merkle
+    "merkle create", "merkle diff", "merkle path", "merkle spoilbits",
+    "merkle spoilchunks", "merkle summary", "merkle treeview", "merkle verify",
+    // query
+    "query json", "query records",
+    // state
+    "state set", "state clear",
+    // transform
+    "transform convert", "transform extract", "transform ordinals",
+    // verify
+    "verify knn-groundtruth", "verify predicate-results",
+    "verify knn-consolidated", "verify filtered-knn-consolidated",
+    "verify predicates-consolidated", "verify predicates-sqlite",
+    // catalog
+    "catalog generate",
+];
+
+/// Fuzz: every command with empty options should error, not panic.
+#[test]
+fn fuzz_empty_options_no_panic() {
+    let registry = veks_pipeline::pipeline::registry::CommandRegistry::with_builtins();
+    let tmp = tmp_dir();
+    let ws = tmp.path();
+    std::fs::create_dir_all(ws.join(".scratch")).unwrap();
+    std::fs::create_dir_all(ws.join(".cache")).unwrap();
+
+    for &cmd_path in ALL_COMMANDS {
+        let factory = match registry.get(cmd_path) {
+            Some(f) => f,
+            None => continue, // feature-gated command not compiled in
+        };
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut cmd = factory();
+            let opts = Options::new();
+            let mut ctx = test_ctx(ws);
+            cmd.execute(&opts, &mut ctx)
+        }));
+        match result {
+            Ok(_) => {} // Ok or Error — either is fine, just no panic
+            Err(panic_info) => {
+                panic!("command '{}' panicked with empty options: {:?}", cmd_path, panic_info);
+            }
+        }
+    }
+}
+
+/// Fuzz: every command with a nonexistent source file should error, not panic.
+#[test]
+fn fuzz_missing_source_no_panic() {
+    let registry = veks_pipeline::pipeline::registry::CommandRegistry::with_builtins();
+    let tmp = tmp_dir();
+    let ws = tmp.path();
+    std::fs::create_dir_all(ws.join(".scratch")).unwrap();
+    std::fs::create_dir_all(ws.join(".cache")).unwrap();
+
+    for &cmd_path in ALL_COMMANDS {
+        let factory = match registry.get(cmd_path) {
+            Some(f) => f,
+            None => continue,
+        };
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut cmd = factory();
+            let mut opts = Options::new();
+            opts.set("source", "/nonexistent/path/data.fvec");
+            opts.set("output", ws.join("out.fvec").to_string_lossy().to_string());
+            let mut ctx = test_ctx(ws);
+            cmd.execute(&opts, &mut ctx)
+        }));
+        match result {
+            Ok(_) => {} // error or ok, either is fine — just no panic
+            Err(panic_info) => {
+                panic!("command '{}' panicked with missing source: {:?}", cmd_path, panic_info);
+            }
+        }
+    }
+}
+
+/// Fuzz: every command with a zero-length source file should error, not panic.
+#[test]
+fn fuzz_zero_length_file_no_panic() {
+    let registry = veks_pipeline::pipeline::registry::CommandRegistry::with_builtins();
+    let tmp = tmp_dir();
+    let ws = tmp.path();
+    std::fs::create_dir_all(ws.join(".scratch")).unwrap();
+    std::fs::create_dir_all(ws.join(".cache")).unwrap();
+
+    // Create zero-length files in various formats
+    for ext in &["fvec", "ivec", "mvec", "u8", "i32", "slab"] {
+        std::fs::write(ws.join(format!("empty.{}", ext)), b"").unwrap();
+    }
+
+    for &cmd_path in ALL_COMMANDS {
+        let factory = match registry.get(cmd_path) {
+            Some(f) => f,
+            None => continue,
+        };
+        for ext in &["fvec", "ivec", "u8", "slab"] {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut cmd = factory();
+                let mut opts = Options::new();
+                opts.set("source", format!("empty.{}", ext));
+                opts.set("output", format!("out_{}.{}", cmd_path.replace(' ', "_"), ext));
+                let mut ctx = test_ctx(ws);
+                cmd.execute(&opts, &mut ctx)
+            }));
+            match result {
+                Ok(_) => {} // fine
+                Err(panic_info) => {
+                    panic!("command '{}' panicked with zero-length .{} file: {:?}",
+                        cmd_path, ext, panic_info);
+                }
+            }
+        }
+    }
+}
+
+/// Fuzz: every command with a truncated/corrupt source file should not panic.
+#[test]
+fn fuzz_corrupt_file_no_panic() {
+    let registry = veks_pipeline::pipeline::registry::CommandRegistry::with_builtins();
+    let tmp = tmp_dir();
+    let ws = tmp.path();
+    std::fs::create_dir_all(ws.join(".scratch")).unwrap();
+    std::fs::create_dir_all(ws.join(".cache")).unwrap();
+
+    // Create files with garbage data (wrong format, truncated headers)
+    std::fs::write(ws.join("corrupt.fvec"), b"\x04\x00\x00\x00\x01").unwrap(); // dim=4 but only 1 data byte
+    std::fs::write(ws.join("corrupt.ivec"), b"\xff\xff\xff\xff").unwrap(); // dim=-1
+    std::fs::write(ws.join("corrupt.u8"), &[42, 43, 44]).unwrap(); // valid u8 but tiny
+    std::fs::write(ws.join("corrupt.slab"), b"NOT_A_SLAB").unwrap(); // invalid slab header
+
+    let corrupt_files = ["corrupt.fvec", "corrupt.ivec", "corrupt.u8", "corrupt.slab"];
+
+    for &cmd_path in ALL_COMMANDS {
+        let factory = match registry.get(cmd_path) {
+            Some(f) => f,
+            None => continue,
+        };
+        for &corrupt in &corrupt_files {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut cmd = factory();
+                let mut opts = Options::new();
+                opts.set("source", corrupt);
+                opts.set("output", format!("out_corrupt_{}_{}", cmd_path.replace(' ', "_"),
+                    corrupt.replace('.', "_")));
+                let mut ctx = test_ctx(ws);
+                cmd.execute(&opts, &mut ctx)
+            }));
+            match result {
+                Ok(_) => {}
+                Err(panic_info) => {
+                    panic!("command '{}' panicked with corrupt file '{}': {:?}",
+                        cmd_path, corrupt, panic_info);
+                }
+            }
+        }
+    }
 }

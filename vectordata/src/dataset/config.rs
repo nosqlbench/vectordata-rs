@@ -71,6 +71,14 @@ pub struct DatasetAttributes {
     #[serde(default)]
     pub is_zero_vector_free: Option<bool>,
 
+    /// Version of veks that created this dataset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub veks_version: Option<String>,
+
+    /// Build hash of veks that created this dataset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub veks_build: Option<String>,
+
     /// Freeform key-value tags for categorization.
     #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
     pub tags: IndexMap<String, String>,
@@ -232,6 +240,162 @@ impl DatasetConfig {
     /// Iterate all variables as `(key, value)` pairs.
     pub fn variables(&self) -> impl Iterator<Item = (&str, &str)> {
         self.variables.iter().map(|(k, v)| (k.as_str(), v.as_str()))
+    }
+
+    // -- Mutation helpers ------------------------------------------------------
+
+    /// Add or replace a profile in the config.
+    pub fn set_profile(&mut self, name: &str, profile: DSProfile) {
+        self.profiles.profiles.insert(name.to_string(), profile);
+    }
+
+    /// Set a variable in the config.
+    pub fn set_variable(&mut self, key: &str, value: &str) {
+        self.variables.insert(key.to_string(), value.to_string());
+    }
+
+    /// Set an attribute field. Returns `false` if the key is not recognized.
+    pub fn set_attribute(&mut self, key: &str, value: &str) -> bool {
+        let attrs = self.attributes.get_or_insert_with(DatasetAttributes::default);
+        match key {
+            "is_normalized" => { attrs.is_normalized = Some(value == "true"); true }
+            "is_zero_vector_free" => { attrs.is_zero_vector_free = Some(value == "true"); true }
+            "is_duplicate_vector_free" => { attrs.is_duplicate_vector_free = Some(value == "true"); true }
+            "distance_function" => { attrs.distance_function = Some(value.to_string()); true }
+            "model" => { attrs.model = Some(value.to_string()); true }
+            "url" => { attrs.url = Some(value.to_string()); true }
+            "license" => { attrs.license = Some(value.to_string()); true }
+            "vendor" => { attrs.vendor = Some(value.to_string()); true }
+            "notes" => { attrs.notes = Some(value.to_string()); true }
+            "veks_version" => { attrs.veks_version = Some(value.to_string()); true }
+            "veks_build" => { attrs.veks_build = Some(value.to_string()); true }
+            "personality" => {
+                attrs.tags.insert("personality".to_string(), value.to_string());
+                true
+            }
+            _ => false,
+        }
+    }
+
+    // -- Save ---------------------------------------------------------------
+
+    /// Save the config to a YAML file with canonical field ordering.
+    ///
+    /// Field order: name, description, attributes, upstream, profiles, variables.
+    /// The license header comment is preserved if the file already has one,
+    /// or added if absent.
+    pub fn save(&self, path: &Path) -> Result<(), String> {
+        // If the file exists, extract the leading comment block
+        let existing_header = if path.exists() {
+            std::fs::read_to_string(path).ok().and_then(|content| {
+                let header: String = content.lines()
+                    .take_while(|l| l.starts_with('#') || l.is_empty())
+                    .map(|l| format!("{}\n", l))
+                    .collect();
+                if header.is_empty() { None } else { Some(header) }
+            })
+        } else {
+            None
+        };
+
+        let header = existing_header.unwrap_or_else(|| {
+            "# Copyright (c) Jonathan Shook\n# SPDX-License-Identifier: Apache-2.0\n\n".to_string()
+        });
+
+        let mut out = header;
+
+        // name
+        out.push_str(&format!("name: {}\n", self.name));
+
+        // description
+        if let Some(ref desc) = self.description {
+            out.push_str(&format!("description: >-\n  {}\n", desc));
+        }
+
+        // attributes
+        if let Some(ref attrs) = self.attributes {
+            out.push_str("\nattributes:\n");
+            if let Some(ref v) = attrs.distance_function { out.push_str(&format!("  distance_function: {}\n", v)); }
+            if let Some(v) = attrs.is_normalized { out.push_str(&format!("  is_normalized: {}\n", v)); }
+            if let Some(v) = attrs.is_zero_vector_free { out.push_str(&format!("  is_zero_vector_free: {}\n", v)); }
+            if let Some(v) = attrs.is_duplicate_vector_free { out.push_str(&format!("  is_duplicate_vector_free: {}\n", v)); }
+            if let Some(ref v) = attrs.model { out.push_str(&format!("  model: {}\n", v)); }
+            if let Some(ref v) = attrs.url { out.push_str(&format!("  url: {}\n", v)); }
+            if let Some(ref v) = attrs.license { out.push_str(&format!("  license: {}\n", v)); }
+            if let Some(ref v) = attrs.vendor { out.push_str(&format!("  vendor: {}\n", v)); }
+            if let Some(ref v) = attrs.notes { out.push_str(&format!("  notes: {}\n", v)); }
+            if let Some(ref v) = attrs.veks_version { out.push_str(&format!("  veks_version: {}\n", v)); }
+            if let Some(ref v) = attrs.veks_build { out.push_str(&format!("  veks_build: {}\n", v)); }
+            for (k, v) in &attrs.tags {
+                out.push_str(&format!("  {}: {}\n", k, v));
+            }
+        }
+
+        // upstream
+        if let Some(ref upstream) = self.upstream {
+            let upstream_yaml = serde_yaml::to_string(upstream)
+                .map_err(|e| format!("serialize upstream: {}", e))?;
+            out.push_str("\nupstream:\n");
+            for line in upstream_yaml.lines() {
+                if line.is_empty() { out.push('\n'); }
+                else { out.push_str(&format!("  {}\n", line)); }
+            }
+        }
+
+        // profiles
+        if !self.profiles.is_empty() || self.profiles.has_deferred() {
+            out.push_str("\nprofiles:\n");
+
+            // Sized entries — preserved as compact syntax for round-tripping
+            if !self.profiles.raw_sized.is_empty() {
+                let entries: Vec<&str> = self.profiles.raw_sized.iter()
+                    .map(|s| s.as_str()).collect();
+                out.push_str(&format!("  sized: [{}]\n", entries.join(", ")));
+            }
+
+            // Materialized profiles (skip those generated from sized: entries —
+            // they'll be re-generated from the raw_sized entries on reload)
+            for name in self.profiles.profile_names() {
+                if self.profiles.sized_profile_names.contains(&name.to_string()) {
+                    continue;
+                }
+                let profile = self.profiles.profiles.get(name).unwrap();
+                out.push_str(&format!("  {}:\n", name));
+                if let Some(maxk) = profile.maxk {
+                    out.push_str(&format!("    maxk: {}\n", maxk));
+                }
+                if let Some(base_count) = profile.base_count {
+                    out.push_str(&format!("    base_count: {}\n", base_count));
+                }
+                for (key, view) in &profile.views {
+                    if view.window.is_none()
+                        && view.source.namespace.is_none()
+                        && view.source.window.is_empty()
+                    {
+                        out.push_str(&format!("    {}: {}\n", key, view.source.path));
+                    } else {
+                        out.push_str(&format!("    {}:\n", key));
+                        out.push_str(&format!("      source: {}\n", view.source.path));
+                        if let Some(ref w) = view.window {
+                            out.push_str(&format!("      window: \"{}\"\n", w));
+                        } else if !view.source.window.is_empty() {
+                            out.push_str(&format!("      window: \"{}\"\n", view.source.window));
+                        }
+                    }
+                }
+            }
+        }
+
+        // variables
+        if !self.variables.is_empty() {
+            out.push_str("\nvariables:\n");
+            for (k, v) in &self.variables {
+                out.push_str(&format!("  {}: '{}'\n", k, v));
+            }
+        }
+
+        std::fs::write(path, &out)
+            .map_err(|e| format!("write {}: {}", path.display(), e))
     }
 
     // -------------------------------------------------------------------------
@@ -463,5 +627,141 @@ profiles:
         assert_eq!(custom.len(), 2);
         assert!(custom.contains(&"model_profile"));
         assert!(custom.contains(&"sketch_vectors"));
+    }
+
+    #[test]
+    fn test_save_roundtrip() {
+        let yaml = r#"
+name: roundtrip-test
+description: >-
+  A test dataset
+attributes:
+  distance_function: Cosine
+  is_normalized: true
+profiles:
+  default:
+    maxk: 100
+    base_vectors: base.fvec
+    query_vectors: query.fvec
+variables:
+  base_count: '500'
+  query_count: '100'
+"#;
+        let config: DatasetConfig = serde_yaml::from_str(yaml).unwrap();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        config.save(tmp.path()).unwrap();
+
+        let saved = std::fs::read_to_string(tmp.path()).unwrap();
+
+        // Re-parse and verify
+        let reloaded: DatasetConfig = serde_yaml::from_str(&saved).unwrap();
+        assert_eq!(reloaded.name, "roundtrip-test");
+        assert_eq!(reloaded.distance_function(), Some("Cosine"));
+        assert_eq!(reloaded.is_normalized(), Some(true));
+        assert_eq!(reloaded.default_profile().unwrap().maxk, Some(100));
+        assert_eq!(reloaded.variable("base_count"), Some("500"));
+        assert_eq!(reloaded.variable("query_count"), Some("100"));
+    }
+
+    #[test]
+    fn test_save_canonical_ordering() {
+        let yaml = r#"
+name: order-test
+variables:
+  x: '1'
+profiles:
+  default:
+    base_vectors: base.fvec
+attributes:
+  distance_function: L2
+"#;
+        let config: DatasetConfig = serde_yaml::from_str(yaml).unwrap();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        config.save(tmp.path()).unwrap();
+
+        let saved = std::fs::read_to_string(tmp.path()).unwrap();
+
+        // Verify canonical ordering: name < attributes < profiles < variables
+        let name_pos = saved.find("\nname:").or_else(|| if saved.starts_with("name:") { Some(0) } else { None });
+        let attr_pos = saved.find("\nattributes:");
+        let prof_pos = saved.find("\nprofiles:");
+        let var_pos = saved.find("\nvariables:");
+
+        assert!(name_pos.is_some(), "name: should exist");
+        assert!(attr_pos.is_some(), "attributes: should exist");
+        assert!(prof_pos.is_some(), "profiles: should exist");
+        assert!(var_pos.is_some(), "variables: should exist");
+
+        assert!(name_pos.unwrap() < attr_pos.unwrap(), "name before attributes");
+        assert!(attr_pos.unwrap() < prof_pos.unwrap(), "attributes before profiles");
+        assert!(prof_pos.unwrap() < var_pos.unwrap(), "profiles before variables");
+    }
+
+    #[test]
+    fn test_save_preserves_header_comment() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let header = "# Custom header\n# Another line\n\n";
+        std::fs::write(tmp.path(), format!("{}name: test\n", header)).unwrap();
+
+        let config: DatasetConfig = serde_yaml::from_str("name: test\n").unwrap();
+        config.save(tmp.path()).unwrap();
+
+        let saved = std::fs::read_to_string(tmp.path()).unwrap();
+        assert!(saved.starts_with("# Custom header\n# Another line\n"),
+            "header should be preserved:\n{}", saved);
+    }
+
+    #[test]
+    fn test_save_with_partition_profiles() {
+        let yaml = r#"
+name: partition-test
+profiles:
+  default:
+    maxk: 50
+    base_vectors: base.fvec
+    query_vectors: query.fvec
+"#;
+        let mut config: DatasetConfig = serde_yaml::from_str(yaml).unwrap();
+
+        // Add partition profiles via the API
+        config.set_profile("label-0", DSProfile {
+            maxk: Some(50),
+            base_count: Some(100),
+            views: {
+                use super::super::profile::DSView;
+                use super::super::source::{DSSource, DSWindow};
+                let mut v = IndexMap::new();
+                v.insert("base_vectors".to_string(), DSView {
+                    source: DSSource { path: "profiles/label-0/base_vectors.fvec".into(), namespace: None, window: DSWindow::default() },
+                    window: None,
+                });
+                v.insert("query_vectors".to_string(), DSView {
+                    source: DSSource { path: "profiles/label-0/query_vectors.fvec".into(), namespace: None, window: DSWindow::default() },
+                    window: None,
+                });
+                v
+            },
+        });
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        config.save(tmp.path()).unwrap();
+
+        let saved = std::fs::read_to_string(tmp.path()).unwrap();
+        let reloaded: DatasetConfig = serde_yaml::from_str(&saved).unwrap();
+
+        assert!(reloaded.profile("label-0").is_some());
+        assert_eq!(reloaded.profile("label-0").unwrap().base_count, Some(100));
+        assert!(reloaded.profile("default").is_some());
+    }
+
+    #[test]
+    fn test_set_attribute() {
+        let mut config: DatasetConfig = serde_yaml::from_str("name: test\n").unwrap();
+        assert!(config.set_attribute("is_normalized", "true"));
+        assert!(config.set_attribute("distance_function", "Cosine"));
+        assert!(!config.set_attribute("nonexistent_field", "value"));
+
+        assert_eq!(config.is_normalized(), Some(true));
+        assert_eq!(config.distance_function(), Some("Cosine"));
     }
 }

@@ -436,8 +436,16 @@ pub fn run_pipeline(args: RunArgs) -> Result<(), String> {
         std::process::exit(1);
     }
 
-    // Build DAG
-    let pipeline_dag = dag::build_dag(&steps).unwrap_or_else(|e| {
+    // Partition steps: compute steps run in Phases 1/2/3, finalize steps
+    // run once at the end after all expansion phases complete. This ensures
+    // finalization (merkle, catalog, dataset-json) sees the full set of
+    // profiles and artifacts without needing progress invalidation hacks.
+    let compute_steps: Vec<_> = steps.iter().filter(|s| !s.finalize).cloned().collect();
+    let has_finalize_steps = steps.iter().any(|s| s.finalize);
+
+    // Build DAG from compute steps only — finalize steps run in a
+    // separate pass after all expansion phases.
+    let pipeline_dag = dag::build_dag(&compute_steps).unwrap_or_else(|e| {
         println!("Pipeline DAG error: {}", e);
         std::process::exit(1);
     });
@@ -473,19 +481,34 @@ pub fn run_pipeline(args: RunArgs) -> Result<(), String> {
         }
     }
 
-    // Handle --emit-yaml: resolve and print the pipeline instead of executing
+    // Handle --emit-yaml: resolve and print the full pipeline (compute + finalize)
     if args.emit_yaml {
-        emit_resolved_yaml(&pipeline_dag, &defaults, &workspace);
+        let full_dag = dag::build_dag(&steps).unwrap_or_else(|e| {
+            println!("Pipeline DAG error: {}", e);
+            std::process::exit(1);
+        });
+        emit_resolved_yaml(&full_dag, &defaults, &workspace);
         return Ok(());
     }
 
+    let finalize_step_count = steps.len() - compute_steps.len();
     println!(
-        "Pipeline: {} steps in topological order (profile: {})",
+        "Pipeline: {} compute + {} finalize steps in topological order (profile: {})",
         pipeline_dag.steps.len(),
+        finalize_step_count,
         profile_name,
     );
     for (i, step) in pipeline_dag.steps.iter().enumerate() {
         println!("  {}. {} ({})", i + 1, step.id, step.def.run);
+    }
+    if finalize_step_count > 0 {
+        println!("  --- finalization (runs after all phases) ---");
+        for step in &steps {
+            if step.finalize {
+                let id = step.effective_id();
+                println!("  · {} ({})", id, step.run);
+            }
+        }
     }
     println!();
 
@@ -566,7 +589,8 @@ pub fn run_pipeline(args: RunArgs) -> Result<(), String> {
         .count();
     let deferred_profile_estimate = config.profiles.deferred_sized.len() * 3; // rough: each spec generates ~3 profiles
     let estimated_total = pipeline_dag.steps.len()
-        + deferred_profile_estimate * per_profile_template_count;
+        + deferred_profile_estimate * per_profile_template_count
+        + finalize_step_count;
 
     let cache_dir_for_guidance = cache_dir.clone();
     let mut ctx = StreamContext {
@@ -677,12 +701,12 @@ pub fn run_pipeline(args: RunArgs) -> Result<(), String> {
                 raw_steps, &config.profiles, query_count,
             );
 
-            // Filter to only the new per-profile steps (skip already-completed core)
-            let new_steps = if profile_name == "all" {
+            // Filter to only compute steps (finalize runs in a separate final pass)
+            let new_steps: Vec<_> = if profile_name == "all" {
                 new_expanded
             } else {
                 vectordata::dataset::filter_steps_for_profile(new_expanded, profile_name)
-            };
+            }.into_iter().filter(|s| !s.finalize).collect();
 
             match dag::build_dag(&new_steps) {
                 Ok(new_dag) => {
@@ -696,6 +720,105 @@ pub fn run_pipeline(args: RunArgs) -> Result<(), String> {
             }
         } else {
             result
+        }
+    } else {
+        result
+    };
+
+    // Phase 3: If partition profiles were created by prepare-partitions,
+    // reload dataset.yaml, pick up the new profiles, and re-expand
+    // per_profile templates (compute-knn, verify-knn) for each partition.
+    let result = if result.is_ok() {
+        // Check if partition profiles were generated
+        let partition_count: usize = ctx.defaults.get("partition_count")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+
+        if partition_count > 0 {
+            ctx.ui.log(&format!(
+                "Re-expanding pipeline for {} partition profiles...", partition_count));
+
+            // Reload dataset.yaml to pick up the new profile entries
+            match vectordata::dataset::DatasetConfig::load(&dataset_path) {
+                Ok(mut updated_config) => {
+                    // Derive views for partition profiles so compute-knn
+                    // outputs are registered as profile views.
+                    let template_steps: Vec<_> = vectordata::dataset::collect_all_steps(&updated_config)
+                        .into_iter()
+                        .filter(|s| s.per_profile)
+                        .collect();
+                    updated_config.profiles.derive_views_from_templates(&template_steps);
+
+                    let raw_steps = vectordata::dataset::collect_all_steps(&updated_config);
+                    let new_expanded = vectordata::dataset::expand_per_profile_steps(
+                        raw_steps, &updated_config.profiles, query_count,
+                    );
+
+                    // Compute steps only — finalize runs in the final pass
+                    let new_steps: Vec<_> = if profile_name == "all" {
+                        new_expanded
+                    } else {
+                        vectordata::dataset::filter_steps_for_profile(new_expanded, profile_name)
+                    }.into_iter().filter(|s| !s.finalize).collect();
+
+                    match dag::build_dag(&new_steps) {
+                        Ok(new_dag) => {
+                            let result = runner::run_steps(&new_dag.steps, &registry, &mut ctx);
+                            // After partition compute steps complete, save the
+                            // updated config with derived views (neighbor_indices,
+                            // neighbor_distances) so finalization and consumers see them.
+                            if result.is_ok() {
+                                if let Err(e) = updated_config.save(&dataset_path) {
+                                    ctx.ui.log(&format!("  warning: failed to save updated views: {}", e));
+                                }
+                            }
+                            result
+                        }
+                        Err(e) => Err(format!("DAG error for partition profiles: {}", e)),
+                    }
+                }
+                Err(e) => {
+                    ctx.ui.log(&format!("WARNING: could not reload dataset.yaml for partition expansion: {}", e));
+                    result
+                }
+            }
+        } else {
+            result
+        }
+    } else {
+        result
+    };
+
+    // Finalization pass: run finalize steps once, after all compute phases
+    // (core, deferred sized, partition expansion) have completed. This
+    // ensures merkle, catalog, dataset-json, and variables-json see the
+    // full set of profiles and artifacts.
+    let result = if result.is_ok() && has_finalize_steps {
+        // Reload dataset.yaml to get the final state (may include
+        // partition profiles added during Phase 3).
+        let finalize_config = vectordata::dataset::DatasetConfig::load(&dataset_path)
+            .unwrap_or_else(|_| config.clone());
+        let raw_steps = vectordata::dataset::collect_all_steps(&finalize_config);
+        let all_expanded = vectordata::dataset::expand_per_profile_steps(
+            raw_steps, &finalize_config.profiles, query_count,
+        );
+
+        let finalize_steps: Vec<_> = all_expanded.into_iter()
+            .filter(|s| s.finalize)
+            .collect();
+
+        if finalize_steps.is_empty() {
+            result
+        } else {
+            ctx.ui.log(&format!(
+                "Finalization: {} step(s) to run", finalize_steps.len()));
+
+            match dag::build_dag_partial(&finalize_steps) {
+                Ok(finalize_dag) => {
+                    runner::run_steps(&finalize_dag.steps, &registry, &mut ctx)
+                }
+                Err(e) => Err(format!("DAG error for finalization steps: {}", e)),
+            }
         }
     } else {
         result
@@ -768,9 +891,12 @@ pub fn run_pipeline(args: RunArgs) -> Result<(), String> {
     Ok(())
 }
 
-/// Sync variables from `variables.yaml` into the `variables:` section of
-/// `dataset.yaml` so consumers can see pipeline-produced properties
-/// (counts, flags) without a separate file.
+/// Sync variables from `variables.yaml` into `dataset.yaml` so consumers
+/// can see pipeline-produced properties (counts, flags) without a separate
+/// file. Also updates derived attributes (is_normalized, is_zero_vector_free,
+/// is_duplicate_vector_free).
+///
+/// Uses the `DatasetConfig::save()` API for canonical serialization.
 fn update_dataset_attributes(dataset_path: &Path, workspace: &Path) {
     let vars = match variables::load(workspace) {
         Ok(v) => v,
@@ -783,141 +909,36 @@ fn update_dataset_attributes(dataset_path: &Path, workspace: &Path) {
         return;
     }
 
-    // Read the raw YAML text so we can patch it surgically without
-    // expanding the compact sized profile syntax.
-    let original = match std::fs::read_to_string(dataset_path) {
-        Ok(s) => s,
+    let mut config = match DatasetConfig::load(dataset_path) {
+        Ok(c) => c,
         Err(e) => {
-            eprintln!("  note: could not read dataset.yaml: {}", e);
+            eprintln!("  note: could not load dataset.yaml: {}", e);
             return;
         }
     };
 
-    // Build the variables YAML block
-    let mut vars_block = String::from("\n\nvariables:\n");
+    // Sync all variables
     for (k, v) in &vars {
-        vars_block.push_str(&format!("  {}: '{}'\n", k, v));
+        config.set_variable(k, v);
     }
 
-    // Build attribute lines to inject/update
+    // Derive attributes from pipeline results.
     // The pipeline REMOVES zero/duplicate vectors — so the output is free
     // of them when the steps ran, regardless of how many were found.
-    // The attribute reflects the output state, not the source state.
-    // The pipeline REMOVES zero/duplicate vectors — so the output is free
-    // of them when the steps ran, regardless of how many were found.
-    // The attribute reflects the output state, not the source state.
-    let is_zero_free = vars.get("zero_count").map(|_| true);
-    let is_dedup_free = vars.get("duplicate_count").map(|_| true);
-    let is_normalized = vars.get("is_normalized").map(|v| v == "true");
+    if vars.contains_key("zero_count") {
+        config.set_attribute("is_zero_vector_free", "true");
+    }
+    if vars.contains_key("duplicate_count") {
+        config.set_attribute("is_duplicate_vector_free", "true");
+    }
+    if let Some(v) = vars.get("is_normalized") {
+        config.set_attribute("is_normalized", v);
+    }
 
-    // Remove existing variables block if present
-    let mut patched = if let Some(pos) = original.find("\nvariables:") {
-        let rest = &original[pos + 1..];
-        let block_end = rest.find("\n").map(|first_nl| {
-            let mut end = first_nl;
-            for line in rest[first_nl + 1..].lines() {
-                if line.is_empty() || line.starts_with(' ') || line.starts_with('\t') {
-                    end += line.len() + 1;
-                } else {
-                    break;
-                }
-            }
-            end + 1
-        }).unwrap_or(rest.len());
-        format!("{}{}", &original[..pos + 1], &original[pos + 1 + block_end..])
+    if let Err(e) = config.save(dataset_path) {
+        eprintln!("  warning: failed to save dataset.yaml: {}", e);
     } else {
-        original.clone()
-    };
-
-    // Insert variables block right after the attributes block
-    if let Some(attr_pos) = patched.find("\nattributes:") {
-        // Find end of attributes block (next top-level key)
-        let rest = &patched[attr_pos + 1..];
-        let mut attr_end = 0;
-        if let Some(first_nl) = rest.find('\n') {
-            attr_end = first_nl;
-            for line in rest[first_nl + 1..].lines() {
-                if line.is_empty() || line.starts_with(' ') || line.starts_with('\t') {
-                    attr_end += line.len() + 1;
-                } else {
-                    break;
-                }
-            }
-            attr_end += 1;
-        }
-        let insert_pos = attr_pos + 1 + attr_end;
-        patched.insert_str(insert_pos, &vars_block);
-    } else {
-        // No attributes section — append after name/description
-        patched = format!("{}{}", patched.trim_end(), vars_block);
-    };
-
-    // Patch attributes: inject is_zero_vector_free / is_duplicate_vector_free
-    if let Some(val) = is_zero_free {
-        let attr_line = format!("  is_zero_vector_free: {}", val);
-        if patched.contains("is_zero_vector_free:") {
-            // Replace existing line
-            let mut new = String::new();
-            for line in patched.lines() {
-                if line.trim_start().starts_with("is_zero_vector_free:") {
-                    new.push_str(&attr_line);
-                } else {
-                    new.push_str(line);
-                }
-                new.push('\n');
-            }
-            patched = new;
-        } else if let Some(pos) = patched.find("\nattributes:") {
-            // Insert after the attributes: line
-            let insert_pos = patched[pos + 1..].find('\n').map(|p| pos + 1 + p + 1).unwrap_or(patched.len());
-            patched.insert_str(insert_pos, &format!("{}\n", attr_line));
-        }
-    }
-    if let Some(val) = is_dedup_free {
-        let attr_line = format!("  is_duplicate_vector_free: {}", val);
-        if patched.contains("is_duplicate_vector_free:") {
-            let mut new = String::new();
-            for line in patched.lines() {
-                if line.trim_start().starts_with("is_duplicate_vector_free:") {
-                    new.push_str(&attr_line);
-                } else {
-                    new.push_str(line);
-                }
-                new.push('\n');
-            }
-            patched = new;
-        } else if let Some(pos) = patched.find("\nattributes:") {
-            let insert_pos = patched[pos + 1..].find('\n').map(|p| pos + 1 + p + 1).unwrap_or(patched.len());
-            patched.insert_str(insert_pos, &format!("{}\n", attr_line));
-        }
-    }
-
-    // Patch is_normalized attribute
-    if let Some(val) = is_normalized {
-        let attr_line = format!("  is_normalized: {}", val);
-        if patched.contains("is_normalized:") {
-            let mut new = String::new();
-            for line in patched.lines() {
-                if line.trim_start().starts_with("is_normalized:") {
-                    new.push_str(&attr_line);
-                } else {
-                    new.push_str(line);
-                }
-                new.push('\n');
-            }
-            patched = new;
-        } else if let Some(pos) = patched.find("\nattributes:") {
-            let insert_pos = patched[pos + 1..].find('\n').map(|p| pos + 1 + p + 1).unwrap_or(patched.len());
-            patched.insert_str(insert_pos, &format!("{}\n", attr_line));
-        }
-    }
-
-    if patched != original {
-        if let Err(e) = std::fs::write(dataset_path, &patched) {
-            eprintln!("  warning: failed to write dataset.yaml: {}", e);
-        } else {
-            eprintln!("  synced {} variables to dataset.yaml", vars.len());
-        }
+        eprintln!("  synced {} variables to dataset.yaml", vars.len());
     }
 }
 
@@ -1272,6 +1293,7 @@ fn resolve_pipeline_yaml(
             profiles: step.def.profiles.clone(),
             per_profile: step.def.per_profile,
             phase: step.def.phase,
+            finalize: step.def.finalize,
             on_partial: step.def.on_partial.clone(),
             options,
         });
@@ -1593,6 +1615,7 @@ mod tests {
             profiles: profiles.into_iter().map(String::from).collect(),
             per_profile: false,
             phase: 0,
+            finalize: false,
             on_partial: OnPartial::default(),
             options,
         }

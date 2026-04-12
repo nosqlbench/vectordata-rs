@@ -165,11 +165,25 @@ pub fn run_steps(
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
 
-        // 2. Compute configuration fingerprint for this step.
+        // 2. Resolve command from registry (needed for build_version in fingerprint)
+        let factory = registry.get(&step.def.run).ok_or_else(|| {
+            format!(
+                "step '{}': unknown command '{}'. Available: {:?}",
+                step.id,
+                step.def.run,
+                registry.command_paths()
+            )
+        })?;
+
+        let mut cmd = factory();
+        let cmd_build_version = cmd.build_version().to_string();
+
+        // 3. Compute configuration fingerprint for this step.
         //    The fingerprint chains through the DAG: it includes the
-        //    fingerprints of all upstream steps. If any upstream step
-        //    re-executed (getting a new fingerprint), this step's
-        //    computed fingerprint will differ from the stored one.
+        //    fingerprints of all upstream steps and the command's build
+        //    version. If any upstream step re-executed (new fingerprint),
+        //    or the command was recompiled (new build version), this
+        //    step's computed fingerprint will differ from the stored one.
         let upstream_ids: Vec<&str> = step.def.after.iter()
             .map(|s| s.as_str())
             .collect();
@@ -178,12 +192,13 @@ pub fn run_steps(
             &step.def.run,
             &resolved_map,
             &upstream_ids,
+            &cmd_build_version,
         );
 
-        // 3. Check freshness: progress log + fingerprint chain.
-        //    The fingerprint check subsumes the old "upstream dependency
-        //    re-ran" cascade — if an upstream re-executed, its fingerprint
-        //    changed, which changes this step's computed fingerprint.
+        // 4. Check freshness: progress log + fingerprint chain.
+        //    The fingerprint check subsumes mtime-based cascade —
+        //    if an upstream re-executed, its fingerprint changed,
+        //    which changes this step's computed fingerprint.
         let progress_fresh;
         let fingerprint_reason = ctx.progress.check_fingerprint(&step.id, &fingerprint);
         match ctx.progress.check_step_freshness(&step.id, Some(&resolved_map), Some(&ctx.workspace)) {
@@ -196,7 +211,7 @@ pub fn run_steps(
                 continue;
             }
             None => {
-                // Outputs/options match but fingerprint changed — upstream config changed
+                // Outputs/options match but fingerprint changed — upstream config or build changed
                 ctx.ui.log(&format!("{} {} — stale: {}", prefix, step.id,
                     fingerprint_reason.as_deref().unwrap_or("fingerprint changed")));
                 progress_fresh = false;
@@ -208,18 +223,6 @@ pub fn run_steps(
                 progress_fresh = false;
             }
         }
-
-        // 4. Resolve command from registry
-        let factory = registry.get(&step.def.run).ok_or_else(|| {
-            format!(
-                "step '{}': unknown command '{}'. Available: {:?}",
-                step.id,
-                step.def.run,
-                registry.command_paths()
-            )
-        })?;
-
-        let mut cmd = factory();
 
         let mut options = Options::new();
         for (k, v) in &resolved_opts {
@@ -289,6 +292,7 @@ pub fn run_steps(
                             error: None,
                             resource_summary: None,
                             fingerprint: Some(fingerprint.clone()),
+                            build_version: Some(cmd_build_version.clone()),
                         },
                     );
                     if let Err(e) = ctx.progress.save() {
@@ -596,7 +600,7 @@ pub fn run_steps(
 
         // 8. Record result with the original (unmunged) options
         ctx.ui.clear();
-        let record = step_record_from_result(&result, &resolved_opts, resource_summary, Some(fingerprint.clone()));
+        let record = step_record_from_result(&result, &resolved_opts, resource_summary, Some(fingerprint.clone()), Some(cmd_build_version.clone()));
         ctx.progress.record_step(&step.id, record);
 
         // If this step modified files that were outputs of previous steps
@@ -690,6 +694,7 @@ pub fn run_steps(
                         error: Some(msg.clone()),
                         resource_summary: None,
                         fingerprint: Some(fingerprint.clone()),
+                        build_version: Some(cmd_build_version.clone()),
                     },
                 );
                 if let Err(e) = ctx.progress.save() {
@@ -790,6 +795,7 @@ fn step_record_from_result(
     resolved_opts: &indexmap::IndexMap<String, String>,
     resource_summary: Option<ResourceSummary>,
     fingerprint: Option<String>,
+    build_version: Option<String>,
 ) -> StepRecord {
     let outputs: Vec<OutputRecord> = result
         .produced
@@ -831,5 +837,6 @@ fn step_record_from_result(
         error,
         resource_summary,
         fingerprint,
+        build_version,
     }
 }
