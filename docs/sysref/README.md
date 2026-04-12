@@ -76,3 +76,20 @@ The bootstrap wizard and pipeline generation for new datasets.
 - Identity vs Materialized artifacts
 - Profile layout: profiles/base/ and profiles/default/
 - Sized profile generation (stratification)
+
+### [8. Architecture](./08-architecture.md)
+Internal design of the pipeline engine, CLI framework, and UI layer.
+
+- CommandOp trait and command documentation
+- Resource governance (memory/thread budgets, OOM prevention)
+- UI eventing layer (sinks, handles, progress bars)
+- Facet swimlane diagram (superset pipeline visualization)
+- Pipeline DAG configurations and variable reference
+
+### [9. Algorithms](./09-algorithms.md)
+Detailed specifications for statistical and numerical algorithms.
+
+- Normalization analysis (Higham bounds, precision-aware thresholds)
+- Statistical vector generation (Virtdata: deterministic inverse CDF)
+- Statistical model extraction (Vshapes: Pearson classification, EM clustering)
+- Shared numerical utilities (log gamma, incomplete beta/gamma)

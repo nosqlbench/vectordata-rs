@@ -138,6 +138,8 @@ veks check                           # all green
 | [Commands](./docs/sysref/05-commands.md) | All 50+ pipeline and analysis commands |
 | [Processing](./docs/sysref/06-processing.md) | Dedup, normalization, zero detection, KNN, predicates |
 | [Import](./docs/sysref/07-import.md) | Bootstrap wizard, source detection, pipeline generation |
+| [Architecture](./docs/sysref/08-architecture.md) | CommandOp trait, resource governance, UI eventing, swimlane |
+| [Algorithms](./docs/sysref/09-algorithms.md) | Normalization, vector generation, model extraction, numerical methods |
 
 ---
 
