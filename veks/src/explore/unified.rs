@@ -77,7 +77,7 @@ const VIEW_INFO_RAW: &[&str] = &[
         "  Stats use Welford's online algorithm for numerically stable\n",
         "  incremental mean and variance.\n",
         "  NORMALIZED verdict: std < 0.01 AND |mean - 1.0| < 0.01.\n\n",
-        "Use b/B to adjust bin count for finer or coarser resolution.",
+        "Use ↑/↓ arrows to adjust bin count for finer or coarser resolution.",
     ),
     // 1: Sorted norms
     concat!(
@@ -906,25 +906,25 @@ pub(super) fn run_interactive_explore(
                         Line::from(" Dimension Distribution"),
                         Line::from("   ←/→                             Navigate dimensions"),
                         Line::from("   Home / End                      First / last dimension"),
-                        Line::from("   b / B                           Fewer / more bins"),
+                        Line::from("   ↑/↓                             More / fewer bins"),
                     ],
                     V_LOADINGS => vec![
                         Line::from(""),
                         Line::from(" PCA Loadings"),
-                        Line::from("   ↑/↓                             Scroll up / down"),
-                        Line::from("   Home / End                      Top / bottom"),
+                        Line::from("   ↑/↓                             Increase / decrease resolution"),
+                        Line::from("   Home / End                      Top / bottom (scroll)"),
                         Line::from("   m                               Toggle bar chart / heatmap"),
-                        Line::from("   b / B                           Halve / double dims per row (powers of 2)"),
                     ],
                     V_EIGEN => vec![
                         Line::from(""),
                         Line::from(" Eigenvalue View"),
-                        Line::from("   m                               Cycle: Scree / CumVar / LogDecay"),
+                        Line::from("   ↑/↓                             Cycle: Scree / CumVar / LogDecay"),
+                        Line::from("   m                               Cycle mode (same)"),
                     ],
                     V_NORMS | V_DISTS => vec![
                         Line::from(""),
                         Line::from(" Histogram"),
-                        Line::from("   b / B                           Fewer / more bins"),
+                        Line::from("   ↑/↓                             More / fewer bins"),
                     ],
                     _ => vec![],
                 };
@@ -984,16 +984,16 @@ pub(super) fn run_interactive_explore(
             let view_controls: String = match view_mode {
                 V_PCA => format!(" ←→↑↓ a/d w/s: rotate | c/C: slide PCs | x/X: swap axes [X:PC{} Y:PC{} Z:PC{} color:PC{}] | r +/Space",
                     pc_axes[0]+1, pc_axes[1]+1, pc_axes[2]+1, pc_axes[3]+1),
-                V_DIMDIST => format!(" ←/→: dimension ({}/{}) | Home/End: first/last | b/B: bins",
+                V_DIMDIST => format!(" ←/→: dimension ({}/{}) | Home/End: first/last | ↑↓: bins | b/B: bins",
                     selected_dim, dim),
-                V_LOADINGS => format!(" ↑↓: scroll | m: toggle {} | b/B: resolution ({} dims/row)",
+                V_LOADINGS => format!(" ↑↓: resolution | m: toggle {} | Home/End: scroll ({} dims/row)",
                     if loadings_bar_mode { "heatmap" } else { "bar chart" },
                     if loadings_band_size == 0 { "auto".to_string() } else { loadings_band_size.to_string() }),
                 V_EIGEN => {
                     let mode_name = ["Scree", "CumVar", "LogDecay"][eigen_sub_mode];
-                    format!(" m: cycle mode ({}) | +/Space: increase sample", mode_name)
+                    format!(" ↑↓/m: cycle mode ({}) | +/Space: increase sample", mode_name)
                 }
-                V_NORMS | V_DISTS => " b/B: fewer/more bins | +/Space: increase sample".into(),
+                V_NORMS | V_DISTS => " ↑↓: fewer/more bins | +/Space: increase sample".into(),
                 V_NORMCURVE | V_DISTCURVE => " +/Space: increase sample".into(),
                 V_VARBARS => String::new(),
                 _ => String::new(),
@@ -1054,36 +1054,19 @@ pub(super) fn run_interactive_explore(
                         KeyCode::Char('6') => view_mode = 5,
                         KeyCode::Char('7') => view_mode = 6,
                         KeyCode::Char('8') => view_mode = 7,
-                        KeyCode::Char('b') if view_mode == V_LOADINGS => {
-                            // Loadings: halve band size (powers of 2)
-                            if loadings_band_size == 0 {
-                                let th = crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(40);
-                                loadings_band_size = (dim as f64 / th.saturating_sub(8) as f64).ceil() as usize;
-                                // Round up to next power of 2
-                                loadings_band_size = loadings_band_size.next_power_of_two();
-                            }
-                            loadings_band_size = (loadings_band_size / 2).max(1);
-                        }
-                        KeyCode::Char('B') if view_mode == V_LOADINGS => {
-                            // Loadings: double band size (powers of 2)
-                            if loadings_band_size == 0 {
-                                let th = crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(40);
-                                loadings_band_size = (dim as f64 / th.saturating_sub(8) as f64).ceil() as usize;
-                                loadings_band_size = loadings_band_size.next_power_of_two();
-                            }
-                            loadings_band_size = (loadings_band_size * 2).min(dim);
-                        }
+                        // Loadings resolution moved to Up/Down arrows below
                         KeyCode::Char('m') if view_mode == V_EIGEN => {
                             eigen_sub_mode = (eigen_sub_mode + 1) % 3;
                         }
                         KeyCode::Char('m') if view_mode == V_LOADINGS => {
                             loadings_bar_mode = !loadings_bar_mode;
                         }
-                        KeyCode::Char('b') => {
+                        // b/B kept as aliases for bin adjustment in histogram views
+                        KeyCode::Char('b') if matches!(view_mode, V_DIMDIST | V_NORMS | V_DISTS) => {
                             if num_bins == 0 { num_bins = 100; }
                             num_bins = num_bins.saturating_sub(5).max(10);
                         }
-                        KeyCode::Char('B') => {
+                        KeyCode::Char('B') if matches!(view_mode, V_DIMDIST | V_NORMS | V_DISTS) => {
                             if num_bins == 0 { num_bins = 100; }
                             num_bins = (num_bins + 5).min(500);
                         }
@@ -1096,8 +1079,40 @@ pub(super) fn run_interactive_explore(
                         KeyCode::Right if view_mode == V_DIMDIST => { if selected_dim + 1 < dim { selected_dim += 1; } }
                         KeyCode::Home if view_mode == V_DIMDIST => { selected_dim = 0; }
                         KeyCode::End if view_mode == V_DIMDIST => { selected_dim = dim.saturating_sub(1); }
-                        KeyCode::Up if view_mode == V_LOADINGS => { loadings_scroll = loadings_scroll.saturating_sub(1); }
-                        KeyCode::Down if view_mode == V_LOADINGS => { loadings_scroll += 1; }
+                        KeyCode::Up if view_mode == V_LOADINGS => {
+                            // Increase resolution (fewer dims per row)
+                            if loadings_band_size == 0 {
+                                let th = crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(40);
+                                loadings_band_size = (dim as f64 / th.saturating_sub(8) as f64).ceil() as usize;
+                                loadings_band_size = loadings_band_size.next_power_of_two();
+                            }
+                            loadings_band_size = (loadings_band_size / 2).max(1);
+                        }
+                        KeyCode::Down if view_mode == V_LOADINGS => {
+                            // Decrease resolution (more dims per row)
+                            if loadings_band_size == 0 {
+                                let th = crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(40);
+                                loadings_band_size = (dim as f64 / th.saturating_sub(8) as f64).ceil() as usize;
+                                loadings_band_size = loadings_band_size.next_power_of_two();
+                            }
+                            loadings_band_size = (loadings_band_size * 2).min(dim);
+                        }
+                        // Histogram views: Up/Down adjusts bin count
+                        KeyCode::Up if matches!(view_mode, V_DIMDIST | V_NORMS | V_DISTS) => {
+                            if num_bins == 0 { num_bins = 100; }
+                            num_bins = (num_bins + 5).min(500);
+                        }
+                        KeyCode::Down if matches!(view_mode, V_DIMDIST | V_NORMS | V_DISTS) => {
+                            if num_bins == 0 { num_bins = 100; }
+                            num_bins = num_bins.saturating_sub(5).max(10);
+                        }
+                        // Eigen: Up/Down cycles sub-mode
+                        KeyCode::Up if view_mode == V_EIGEN => {
+                            eigen_sub_mode = if eigen_sub_mode == 0 { 2 } else { eigen_sub_mode - 1 };
+                        }
+                        KeyCode::Down if view_mode == V_EIGEN => {
+                            eigen_sub_mode = (eigen_sub_mode + 1) % 3;
+                        }
                         KeyCode::Home if view_mode == V_LOADINGS => { loadings_scroll = 0; }
                         KeyCode::End if view_mode == V_LOADINGS => { loadings_scroll = usize::MAX; } // clamped in render
                         KeyCode::Char('a') if view_mode == V_PCA => { rot_z -= 0.1; }

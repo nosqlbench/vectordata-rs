@@ -163,20 +163,46 @@ fn complete_metrics(partial: &str, _context: &[&str]) -> Vec<String> {
         .collect()
 }
 
-/// Suggest configured catalog URLs by number.
+/// Suggest configured catalog URLs by index.
+///
+/// Each configured catalog can be referenced by its 1-based index or its
+/// full URL. When multiple candidates match, the index-to-URL mapping is
+/// printed to stderr (which goes to /dev/tty) so the user can see what
+/// each number means. Only the numbers are returned as completable values.
+///
+/// Bash calls the completer twice per tab press (generate + display).
+/// We use a lock file keyed on the partial string to avoid printing
+/// descriptions twice.
 fn complete_catalog_urls(partial: &str, _context: &[&str]) -> Vec<String> {
     let config_dir = crate::catalog::sources::expand_tilde(
         crate::catalog::sources::DEFAULT_CONFIG_DIR,
     );
     let entries = crate::catalog::sources::raw_catalog_entries(&config_dir);
-    entries.iter()
-        .enumerate()
-        .filter(|(i, _)| {
-            let num = format!("{}", i + 1);
-            partial.is_empty() || num.starts_with(partial)
-        })
-        .map(|(i, _)| format!("{}", i + 1))
-        .collect()
+    let mut results: Vec<(String, String)> = Vec::new();
+    for (i, url) in entries.iter().enumerate() {
+        let num = format!("{}", i + 1);
+        if partial.is_empty() || num.starts_with(partial) || url.starts_with(partial) {
+            results.push((num, url.clone()));
+        }
+    }
+    // Only show descriptions when there are multiple candidates.
+    // Use a temp file to avoid printing twice per tab press.
+    if results.len() > 1 {
+        let lock = format!("/tmp/.veks_comp_at_{}", partial);
+        let lock_path = std::path::Path::new(&lock);
+        let stale = lock_path.metadata()
+            .and_then(|m| m.modified())
+            .map(|t| t.elapsed().unwrap_or_default().as_secs() > 2)
+            .unwrap_or(true);
+        if stale {
+            let _ = std::fs::write(lock_path, "");
+            eprintln!();
+            for (num, url) in &results {
+                eprintln!("  {} = {}", num, url);
+            }
+        }
+    }
+    results.into_iter().map(|(num, _)| num).collect()
 }
 
 /// Suggest shell names.

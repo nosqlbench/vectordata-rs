@@ -9,7 +9,7 @@
 //!
 //! ```text
 //! veks pipeline analyze stats --source=test.fvec
-//! veks pipeline generate predicated --input-dir=./dataset --selectivity=0.1
+//! veks pipeline generate predicates --output=predicates.u8 --count=10000
 //! ```
 
 use std::collections::BTreeMap;

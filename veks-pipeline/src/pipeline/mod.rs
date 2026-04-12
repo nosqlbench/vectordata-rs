@@ -33,7 +33,6 @@ pub mod element_type;
 pub mod gz_cache;
 pub mod interpolate;
 pub mod manifest;
-pub mod predicate;
 pub mod resource;
 pub mod rng;
 pub mod simd_distance;

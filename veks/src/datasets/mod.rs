@@ -179,9 +179,10 @@ pub enum DatasetsCommand {
     },
     /// Probe a remote dataset: verify catalog access, list facets, read a sample
     Probe {
-        /// Catalog base URL or number (e.g., 1, https://bucket.s3.amazonaws.com/path/)
+        /// Catalog base URL or number (e.g., 1, https://bucket.s3.amazonaws.com/path/).
+        /// If omitted, searches configured catalogs for the dataset.
         #[arg(long)]
-        at: String,
+        at: Option<String>,
 
         /// Dataset name within the catalog
         #[arg(long)]
@@ -344,7 +345,35 @@ pub fn run(args: DatasetsArgs) {
             }
         }
         DatasetsCommand::Probe { at, dataset, profile } => {
-            let resolved_at = resolve_catalog_value(&at);
+            let resolved_at = match at {
+                Some(ref a) => resolve_catalog_value(a),
+                None => {
+                    // Search each configured catalog source for the dataset
+                    let sources = crate::catalog::sources::CatalogSources::new().configure_default();
+                    let all_locations: Vec<String> = sources.required().iter()
+                        .chain(sources.optional().iter())
+                        .cloned()
+                        .collect();
+                    let mut found: Option<String> = None;
+                    for loc in &all_locations {
+                        let single = crate::catalog::sources::CatalogSources::new()
+                            .add_catalogs(&[loc.clone()]);
+                        let cat = crate::catalog::resolver::Catalog::of(&single);
+                        if cat.find_exact(&dataset).is_some() {
+                            found = Some(loc.clone());
+                            break;
+                        }
+                    }
+                    match found {
+                        Some(url) => url,
+                        None => {
+                            eprintln!("Dataset '{}' not found in configured catalogs.", dataset);
+                            eprintln!("Use --at <URL> to specify a catalog, or 'veks datasets config add-catalog <URL>' to add one.");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+            };
             probe::run(&resolved_at, &dataset, &profile);
         }
         DatasetsCommand::Prebuffer { dataset, profile, configdir, catalog: raw_catalog, at, cache_dir } => {

@@ -441,7 +441,7 @@ pub fn print_bash_script(app_name: &str) {
     words+=("$word")
 
     local IFS=$'\n'
-    COMPREPLY=($({env_var}=bash _COMP_SHELL_PID=$$ "{completer}" -- "${{words[@]}}" 2>/dev/null))
+    COMPREPLY=($({env_var}=bash _COMP_SHELL_PID=$$ "{completer}" -- "${{words[@]}}" 2>/dev/tty))
 }}
 if [[ "${{BASH_VERSINFO[0]}}" -eq 4 && "${{BASH_VERSINFO[1]}}" -ge 4 || "${{BASH_VERSINFO[0]}}" -gt 4 ]]; then
     complete -o default -o bashdefault -o nosort -F _{app}_complete {app}

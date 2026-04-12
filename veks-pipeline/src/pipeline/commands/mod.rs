@@ -58,7 +58,6 @@ pub mod gen_extract;
 pub mod gen_metadata;
 pub mod gen_from_model;
 pub mod gen_predicate_keys;
-pub mod gen_predicated;
 pub mod gen_predicates;
 pub mod gen_shuffle;
 #[cfg(feature = "knnutils")]
@@ -146,7 +145,6 @@ pub fn register_all(registry: &mut CommandRegistry) {
     registry.register("generate derive", gen_derive::factory);
     registry.register("generate from-model", gen_from_model::factory);
     registry.register("generate metadata", gen_metadata::factory);
-    registry.register("generate predicated", gen_predicated::factory);
     registry.register("generate predicates", gen_predicates::factory);
     registry.register("generate shuffle", gen_shuffle::factory);
     #[cfg(feature = "knnutils")]

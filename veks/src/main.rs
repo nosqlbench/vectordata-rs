@@ -30,7 +30,8 @@ struct Veks {
 enum Commands {
     /// Browse, search, and manage datasets and catalogs
     Datasets(datasets::DatasetsArgs),
-    /// Interactive data visualization and exploration
+    /// Interactive data visualization and exploration (under development)
+    #[command(hide = true)]
     Interact(explore::ExploreArgs),
     /// Import, stratify, and prepare datasets for benchmarking
     Prepare(prepare::PrepareArgs),
