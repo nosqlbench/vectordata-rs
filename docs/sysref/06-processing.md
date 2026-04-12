@@ -95,22 +95,42 @@ evaluates every predicate via SQL, comparing against the stored results.
 
 ## 6.6 KNN Computation
 
-Brute-force exact k-nearest-neighbor search:
+Two implementations, selectable by personality:
+
+| Personality | Command | Distance kernel | PRNG |
+|-------------|---------|----------------|------|
+| native (default) | `compute knn` | SimSIMD | — |
+| knn_utils | `compute knn-blas` | BLAS `cblas_sgemm` | — |
+
+Both produce exact brute-force k-nearest-neighbor results. The
+knn_utils personality matches the Python knn_utils project
+byte-for-byte when using the same BLAS library. See
+[§12 knn_utils Verification](./12-knn-utils-verification.md) for
+the definitive quality reference and cross-verification methodology.
+
+### Algorithm
 
 1. For each query, compute distance to every base vector
 2. Maintain a max-heap of size k
 3. Write indices (`.ivec`) and distances (`.fvec`)
 
-Metrics: L2, Cosine, DotProduct. Multi-threaded with configurable
-thread count.
+Metrics: L2, Cosine, DotProduct. Multi-threaded.
 
 ### Filtered KNN
 
 Predicate-filtered KNN pre-filters the candidate set:
 
-1. Load predicate results (`.ivvec`) for the query's predicate
+1. Load predicate results (`.ivvec` or `.slab`) for the query's predicate
 2. Compute distances only to matching base vectors
 3. Top-k from the filtered set
+
+### Verification
+
+KNN results are verified by independent brute-force recomputation on
+sample queries. The `verify dataset-knnutils` command provides the
+most thorough verification, checking format, zeros, normalization,
+duplicates, and KNN accuracy against knn_utils standards. See the
+[verification tutorial](../tutorials/verify-with-knn-utils.md).
 
 ### Tie-break handling
 

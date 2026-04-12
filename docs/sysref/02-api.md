@@ -605,6 +605,19 @@ Cache files are stored as:
 The `.mrkl` files track which chunks have been downloaded and verified.
 They are local state, not published.
 
+### How chunked verification works
+
+1. **`.mref` file** (published) — precomputed Merkle tree with SHA-256
+   hashes for all fixed-size data chunks (typically 64 KB)
+2. **`.mrkl` file** (local) — bitfield tracking which chunks have been
+   downloaded and verified
+3. **Read path**: check local cache → fetch chunk if missing →
+   SHA-256 hash → compare against Merkle leaf → save to cache →
+   update `.mrkl` → return bytes
+4. **Prebuffer**: eagerly downloads all unverified chunks; after
+   completion, backend switches to direct local-file I/O with no
+   per-read overhead
+
 ---
 
 ## 2.13 Thread Safety

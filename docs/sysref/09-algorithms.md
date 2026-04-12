@@ -2,6 +2,12 @@
 
 Detailed specifications for statistical and numerical algorithms.
 
+For KNN computation, KNN verification, and dataset quality assurance,
+the Python [knn_utils](./12-knn-utils-verification.md) project is the
+definitive reference implementation. The `--personality knn_utils`
+pipeline mode reproduces knn_utils behavior with byte-identical results
+when using the same BLAS library.
+
 ---
 
 ## 9.1 Normalization Analysis

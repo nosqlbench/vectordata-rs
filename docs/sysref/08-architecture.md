@@ -1,10 +1,35 @@
 # 8. Architecture
 
-Internal design of the pipeline engine, CLI framework, and UI layer.
+Internal design of the workspace, pipeline engine, CLI framework,
+and UI layer.
 
 ---
 
-## 8.0 Workspace Structure
+## 8.0 Design Principles
+
+- **Performance at scale** — zero-copy I/O (mmap), SIMD distance
+  kernels, resource-aware operations governed by `ResourceGovernor`
+- **Storage/logic decoupling** — slab files store opaque bytes;
+  interpretation happens in the ANode codec layer above
+- **Location transparency** — same API for local and remote datasets;
+  Merkle trees + HTTP Range requests make remote feel local
+- **Declarative pipelines** — `dataset.yaml` defines the full
+  processing graph; the engine handles ordering, caching, resumption
+
+### Technology stack
+
+| Role | Crate |
+|------|-------|
+| CLI | clap v4 |
+| I/O | memmap2, reqwest |
+| Concurrency | std::thread::scope, rayon |
+| SIMD distance | simsimd |
+| Progress | indicatif |
+| TUI | ratatui |
+
+---
+
+## 8.1 Workspace Structure
 
 ```
 vectordata-rs/
@@ -43,7 +68,7 @@ vectordata-rs/
 
 ---
 
-## 8.1 Command Framework
+## 8.2 Command Framework
 
 Every pipeline command implements the `CommandOp` trait:
 
@@ -90,6 +115,22 @@ ResourceDesc {
 }
 ```
 
+### CommandDoc
+
+Every command carries compiled-in markdown documentation:
+
+```rust
+CommandDoc {
+    summary: "one-line for completions".into(),
+    body: "# command\n\n## Description\n\n...".into(),
+}
+```
+
+Accessed via `veks help <command>` or `--help`. Options and resources
+tables are auto-generated from `describe_options()` and
+`describe_resources()`. Test suite verifies every command has non-empty
+docs mentioning all declared options.
+
 ### StreamContext
 
 The execution environment passed to every command:
@@ -108,7 +149,7 @@ pub struct StreamContext {
 
 ---
 
-## 8.2 Resource Governance
+## 8.3 Resource Governance
 
 ### Problem
 
@@ -132,6 +173,26 @@ ResourceGovernor
 3. Command queries `ctx.governor.current_or("mem", default)` for limits
 4. Governor logs utilization after completion
 
+### Operating bands
+
+Memory pressure is classified into bands that drive governor decisions:
+
+| Band | RSS % of ceiling | Governor action |
+|------|-----------------|----------------|
+| UNDERUSED | < 70% | May increase allocations toward ceiling |
+| NOMINAL | 70–85% | Allocations stable |
+| CAUTION | 85–90% | Begin reducing allocations |
+| THROTTLE | 90–95% | Commands told to slow down |
+| EMERGENCY | > 95% | Aggressive reclamation to prevent OOM |
+
+### Strategies
+
+| Strategy | Behavior |
+|----------|----------|
+| `maximize` (default) | Use as much budget as pressure allows |
+| `conservative` | Start near floor, grow slowly |
+| `fixed` | Lock at midpoint, no adjustment |
+
 ### Failure mitigation
 
 | Scenario | Mitigation |
@@ -139,11 +200,11 @@ ResourceGovernor
 | RSS exceeds budget | Reduce batch size, switch to streaming |
 | Thread contention | Governor caps thread pool size |
 | Mmap pressure | Advise sequential/random as appropriate |
-| Page cache thrashing | Detect storage type (SSD vs HDD), adjust prefetch |
+| Page cache thrashing | Detect storage type, adjust prefetch |
 
 ---
 
-## 8.3 UI Eventing Layer
+## 8.4 UI Eventing Layer
 
 The pipeline decouples computation from display via an event-based
 UI architecture.
@@ -213,7 +274,7 @@ Deterministic output capture for unit tests:
 
 ---
 
-## 8.4 Facet Swimlane
+## 8.5 Facet Swimlane
 
 The pipeline superset viewed as a swimlane diagram. Each facet code
 occupies a vertical lane. Steps flow top-to-bottom. Cross-lane arrows
@@ -271,7 +332,7 @@ conditions are not met. The remaining steps form the DAG.
 
 ---
 
-## 8.5 Pipeline DAG Configurations
+## 8.6 Pipeline DAG Configurations
 
 Common configurations arising from different input combinations:
 

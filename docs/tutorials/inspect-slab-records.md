@@ -1,79 +1,88 @@
 <!-- Copyright (c) Jonathan Shook -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# Tutorial: Inspecting Slab Records with `slab inspect`
+# Tutorial: Inspecting Slab Records
 
-This tutorial walks you through using `veks pipeline slab inspect` to decode and render records in various human-readable formats.
+Decode and render slab records in human-readable formats.
 
 ## Prerequisites
 
-- A built `veks` binary.
-- A slab file containing MNode or PNode records (e.g., `metadata.slab`).
+- A built `veks` binary
+- A slab file containing MNode or PNode records (e.g., `metadata.slab`)
 
-## Step 1: Inspect records with the default format
-
-The simplest invocation retrieves specific records by ordinal and renders them as CDDL (the default format).
+## Inspect records
 
 ```bash
-veks pipeline slab inspect --input metadata.slab --ordinals "0,1,2"
+veks pipeline slab inspect --source metadata.slab --ordinals "0,1,2"
 ```
 
-Output:
+## Output formats
 
-```
-[0]: {
-  name : tstr,
-  age : int,
-  score : float
-}
-```
-
-## Step 2: Try different vernacular formats
-
-### JSON (pretty-printed)
+### JSON
 
 ```bash
-veks pipeline slab inspect --input metadata.slab --ordinals "0" --format json
+veks pipeline slab inspect --source metadata.slab --ordinals "0" --format json
 ```
 
 ### SQL VALUES
 
 ```bash
-veks pipeline slab inspect --input metadata.slab --ordinals "0" --format sql
+veks pipeline slab inspect --source metadata.slab --ordinals "0" --format sql
 ```
 
 ### YAML
 
 ```bash
-veks pipeline slab inspect --input metadata.slab --ordinals "0" --format yaml
+veks pipeline slab inspect --source metadata.slab --ordinals "0" --format yaml
 ```
 
 ### Readout (tab-indented, colon-aligned)
 
 ```bash
-veks pipeline slab inspect --input metadata.slab --ordinals "0" --format readout
+veks pipeline slab inspect --source metadata.slab --ordinals "0" --format readout
 ```
 
-## Step 3: Use ordinal ranges
-
-You can specify ranges with the `..` syntax (exclusive end):
+## Ordinal ranges
 
 ```bash
-veks pipeline slab inspect --input metadata.slab --ordinals "0..5,10,20..25" --format jsonl
+veks pipeline slab inspect --source metadata.slab --ordinals "0..5,10,20..25"
 ```
 
-This inspects ordinals 0–4, 10, and 20–24.
+Inspects ordinals 0-4, 10, and 20-24.
 
-## Step 4: Force a specific codec
-
-By default, `slab inspect` auto-detects the record type from the dialect leader byte. You can override this if needed:
+## Force a specific codec
 
 ```bash
-veks pipeline slab inspect --input predicates.slab --ordinals "0" --codec pnode --format sql
+veks pipeline slab inspect --source predicates.slab --ordinals "0" --codec pnode
 ```
 
-## Summary
+## Compact output for scripting
 
-- Use `veks pipeline slab inspect` for direct record decoding.
-- Available formats: `cddl` (default), `sql`, `cql`, `json`, `jsonl`, `yaml`, `readout`.
-- Ordinals can be single numbers, lists, or ranges.
+```bash
+veks pipeline slab inspect --source metadata.slab --ordinals "0..1000" --format jsonl
+```
+
+Each record on a single line — pipe to `jq` or other tools.
+
+## Decoding unknown records from Rust
+
+When you don't know if a slab contains MNode or PNode records,
+use ANode auto-detection:
+
+```rust
+use veks_anode::anode;
+
+let bytes: Vec<u8> = reader.get(ordinal).unwrap();
+
+match anode::decode(&bytes) {
+    Ok(anode::ANode::MNode(m)) => println!("Metadata: {} fields", m.fields.len()),
+    Ok(anode::ANode::PNode(p)) => println!("Predicate: {}", p),
+    Err(e) => eprintln!("Unknown record type: {}", e),
+}
+```
+
+The first byte determines the type: `0x01` = MNode, `0x02` = PNode.
+
+## Available formats
+
+`cddl` (default), `json`, `jsonl`, `yaml`, `sql`, `cql`, `readout`

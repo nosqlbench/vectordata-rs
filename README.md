@@ -140,6 +140,9 @@ veks check                           # all green
 | [Import](./docs/sysref/07-import.md) | Bootstrap wizard, source detection, pipeline generation |
 | [Architecture](./docs/sysref/08-architecture.md) | CommandOp trait, resource governance, UI eventing, swimlane |
 | [Algorithms](./docs/sysref/09-algorithms.md) | Normalization, vector generation, model extraction, numerical methods |
+| [ANode Codec](./docs/sysref/10-anode-codec.md) | MNode/PNode wire formats, 13 vernacular renderers, codec architecture |
+| [Completions](./docs/sysref/11-completions.md) | Dynamic shell completion engine, value providers, bash integration |
+| [knn_utils](./docs/sysref/12-knn-utils-verification.md) | Cross-verification against Python knn_utils reference |
 
 ---
 

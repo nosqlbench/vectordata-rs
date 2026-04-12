@@ -86,9 +86,96 @@ All legacy extensions are fully supported as aliases. Plural forms
 | Slab | `.slab` | Variable-length binary records (metadata, predicates) |
 | HDF5 | `.hdf5`, `.h5` | Import source (datasets via `#path` notation) |
 
+### Slab internals
+
+Page-aligned record container (provided by `slabtastic`). Records are
+opaque byte slices addressed by ordinal. A **dialect leader byte** at
+the start of each record identifies its type:
+
+| Leader | Type | Codec |
+|--------|------|-------|
+| `0x01` | MNode | Metadata record |
+| `0x02` | PNode | Predicate tree |
+| `0x03` | Generic | Raw data |
+
+This decouples storage from logic — `SlabReader`/`SlabWriter` handle
+I/O while the ANode codec handles interpretation.
+
 ---
 
-## 1.4 Dataset Facets (BQGDMPRF)
+## 1.4 Wire Formats (MNode / PNode)
+
+Binary codecs for structured metadata and predicate records, provided
+by the `veks-anode` crate.
+
+### MNode (metadata records)
+
+Dialect leader: `0x01`. Encodes a named-field record with 28 type tags.
+
+```
+[0x01][field_count: u16 LE]
+per field:
+  [name_len: u16 LE][name: UTF-8]
+  [type_tag: u8]
+  [value: variable]
+```
+
+| Tag | Type | Encoding |
+|-----|------|----------|
+| 0 | text | u32 LE length + UTF-8 |
+| 1 | int | i64 LE |
+| 2 | float | f64 LE |
+| 3 | bool | u8 (0/1) |
+| 4 | bytes | u32 LE length + raw |
+| 5 | null | (none) |
+| 8 | list | u32 LE count + tagged values |
+| 9 | map | u32 LE length + nested MNode (no leader) |
+| 12 | int32 | i32 LE |
+| 13 | short | i16 LE |
+| 16 | float32 | f32 LE |
+| 17 | half | u16 LE (IEEE 754 f16) |
+| 26 | array | u8 elem_tag + u32 LE count + untagged values |
+
+Full tag list: 0-28 (text, int, float, bool, bytes, null, enum_str,
+enum_ord, list, map, text_validated, ascii, int32, short, decimal,
+varint, float32, half, millis, nanos, date, time, datetime, uuid_v1,
+uuid_v7, ulid, array, set, typed_map).
+
+Framed variant: `[payload_len: u32 LE][payload...]` for stream embedding.
+
+### PNode (predicate trees)
+
+Dialect leader: `0x02`. Recursive pre-order tree encoding.
+
+```
+[0x02][node...]
+```
+
+Node types:
+
+| Byte | Type | Encoding |
+|------|------|----------|
+| 0 | Predicate | field + op + comparands |
+| 1 | AND | child_count: u8 + children |
+| 2 | OR | child_count: u8 + children |
+
+Predicate encoding (named mode):
+
+```
+[0x00][name_len: u16 LE][name: UTF-8][op: u8][count: i16 LE][comparands: i64 LE * n]
+```
+
+Predicate encoding (indexed mode):
+
+```
+[0x00][field_index: u8][op: u8][count: i16 LE][comparands: i64 LE * n]
+```
+
+Operators: 0=GT, 1=LT, 2=EQ, 3=NE, 4=GE, 5=LE, 6=IN, 7=MATCHES.
+
+---
+
+## 1.5 Dataset Facets (BQGDMPRF)
 
 A dataset is a collection of facets — typed data files that together
 describe a vector search benchmark:
@@ -118,7 +205,7 @@ The pipeline infers which facets to produce from the inputs provided:
 
 ---
 
-## 1.5 Dataset Layout
+## 1.6 Dataset Layout
 
 ### Standard layout
 
@@ -153,7 +240,7 @@ dataset-name/
 
 ---
 
-## 1.6 dataset.yaml
+## 1.7 dataset.yaml
 
 The manifest file that defines a dataset:
 

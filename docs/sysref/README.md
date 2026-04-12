@@ -93,3 +93,27 @@ Detailed specifications for statistical and numerical algorithms.
 - Statistical vector generation (Virtdata: deterministic inverse CDF)
 - Statistical model extraction (Vshapes: Pearson classification, EM clustering)
 - Shared numerical utilities (log gamma, incomplete beta/gamma)
+
+### [10. ANode Codec](./10-anode-codec.md)
+Binary codecs and human-readable renderers for metadata and predicates.
+
+- Two-stage architecture (bytes ↔ ANode ↔ text)
+- 13 vernacular formats (JSON, SQL, CQL, CDDL, YAML, etc.)
+- MNode and PNode usage with code examples
+- Type mapping, roundtrip verification, extending with new formats
+
+### [11. Shell Completions](./11-completions.md)
+Dynamic tab-completion engine for bash and other shells.
+
+- Two-crate architecture (veks-completion + dyncomp)
+- Value providers for datasets, profiles, catalogs, metrics
+- Completion algorithm and consumed-option filtering
+- Bash script generation
+
+### [12. knn_utils Verification](./12-knn-utils-verification.md)
+Cross-verification against the Python knn_utils reference implementation.
+
+- knn_utils personality (BLAS, MT19937, numpy normalization)
+- Verification levels: byte-identical, set-equivalent, self-consistent
+- BLAS and numerical precision considerations
+- A/B testing with FAISS

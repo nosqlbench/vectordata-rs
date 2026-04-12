@@ -82,4 +82,31 @@ and directly via the CLI (`veks pipeline command path --option=value`).
 | `catalog generate` | Generate catalog.json index |
 | `state set` / `state clear` | Pipeline variable management |
 | `download huggingface` | Download from Hugging Face Hub |
-| `download bulk` | Parallel bulk download |
+| `download bulk` | Parallel bulk download (see config below) |
+
+### Bulkdl configuration
+
+The `download bulk` command uses a YAML config file for parallel
+downloads with token-expanded URLs:
+
+```yaml
+datasets:
+ - name: base
+   baseurl: 'https://example.com/data/emb_${number}.npy'
+   tokens:
+    number: [0..409]
+   savedir: embeddings/
+   tries: 5
+   concurrency: 5
+```
+
+| Field | Description |
+|-------|-------------|
+| `name` | Identifier for this download set |
+| `baseurl` | URL template with `${token}` placeholders |
+| `tokens` | Token ranges; `[0..409]` = 0 through 409 inclusive |
+| `savedir` | Local save directory (created automatically) |
+| `tries` | Max retry attempts per file |
+| `concurrency` | Concurrent download threads |
+
+Existing files are skipped if remote Content-Length matches local size.
