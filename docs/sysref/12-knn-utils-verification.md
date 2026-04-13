@@ -84,7 +84,7 @@ When using the same BLAS library (MKL) and knn_utils personality,
 output files match byte-for-byte:
 
 ```
-sift128e: base BYTE-IDENTICAL, query BYTE-IDENTICAL, GT BYTE-IDENTICAL
+example-dataset: base BYTE-IDENTICAL, query BYTE-IDENTICAL, GT BYTE-IDENTICAL
 ```
 
 This means every float value, every ordinal, every byte in the output
@@ -97,7 +97,7 @@ When using different BLAS (OpenBLAS vs MKL), distances may differ by
 the k-th boundary where multiple vectors have the same distance:
 
 ```
-sift128e (OpenBLAS): 9998/10000 exact match, 2 set match, 0 real differences
+example-dataset (OpenBLAS): 9998/10000 exact match, 2 set match, 0 real differences
 ```
 
 Set-equivalent means the same neighbors appear, possibly in different

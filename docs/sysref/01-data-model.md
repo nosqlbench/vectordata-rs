@@ -268,7 +268,7 @@ dataset-name/
 
 ### File naming conventions
 
-- `_` prefix: source files excluded from publishing (e.g., `_sift_base.fvecs`)
+- `_` prefix: source files excluded from publishing (e.g., `_source_base.fvecs`)
 - `IDXFOR__` prefix: offset index companion files (auto-generated, published)
 - `.mref`: merkle hash tree (one per data file, published)
 - `.mrkl`: local merkle cache state (not published)

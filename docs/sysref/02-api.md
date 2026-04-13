@@ -48,6 +48,20 @@ let gt = view.neighbor_indices()?;         // Arc<dyn VectorReader<i32>>
 let mi = view.metadata_indices()?;         // Arc<dyn VvecReader<i32>>
 ```
 
+Load from `knn_entries.yaml` (jvector-compatible format — automatic
+fallback when `dataset.yaml` is not found):
+
+```rust
+// Works for both local directories and HTTP URLs.
+// If dataset.yaml is absent but knn_entries.yaml exists, it's used.
+let group = TestDataGroup::load("/path/to/dataset/")?;
+let group = TestDataGroup::load("https://example.com/dataset/")?;
+
+// knn_entries entries become profiles: "name:profile" → profile
+let view = group.profile("default").unwrap();
+let base = view.base_vectors()?;
+```
+
 Find and load a dataset from configured catalogs:
 
 ```rust
@@ -116,7 +130,7 @@ if let Some(entry) = catalog.find_exact("my-dataset") {
 }
 
 // Find by glob pattern
-let matches = catalog.match_glob("sift*");
+let matches = catalog.match_glob("my-vectors*");
 for entry in matches {
     println!("  {}", entry.name);
 }
@@ -382,6 +396,59 @@ profiles:
 
 The `metadata_indices` key maps to the `predicate_results` field
 internally (serde alias).
+
+### Partition profiles
+
+Partition profiles are marked with `partition: true`. They have
+independent base vectors (not windowed from default) and do NOT
+inherit views from the default profile:
+
+```yaml
+  label-0:
+    maxk: 100
+    base_count: 82993
+    partition: true
+    base_vectors: profiles/label-0/base_vectors.fvec
+    query_vectors: profiles/label-0/query_vectors.fvec
+    neighbor_indices: profiles/label-0/neighbor_indices.ivec
+    neighbor_distances: profiles/label-0/neighbor_distances.fvec
+```
+
+Filter partition profiles from the profile list:
+
+```rust
+for name in group.profile_names() {
+    let view = group.profile(&name).unwrap();
+    // Partition profiles have "label-" prefix by convention
+    // but are identified by the partition: true field in dataset.yaml
+}
+```
+
+### knn_entries.yaml fallback
+
+When `dataset.yaml` is not found, `TestDataGroup::load` falls back
+to `knn_entries.yaml` (jvector-compatible format). Each entry maps
+`"name:profile"` to base/query/gt paths:
+
+```yaml
+_defaults:
+  base_url: https://example.com/data
+
+"my-dataset:default":
+  base: profiles/base/base_vectors.fvec
+  query: profiles/base/query_vectors.fvec
+  gt: profiles/base/neighbor_indices.ivec
+```
+
+The `knn_entries` module can also be used directly:
+
+```rust
+use vectordata::knn_entries::KnnEntries;
+
+let entries = KnnEntries::load("knn_entries.yaml")?;
+println!("datasets: {:?}", entries.dataset_names());
+let config = entries.to_config();  // → DatasetConfig
+```
 
 ---
 

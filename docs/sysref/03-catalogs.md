@@ -43,7 +43,7 @@ if let Some(entry) = catalog.find_exact("my-dataset") {
 }
 
 // Glob matching
-let matches = catalog.match_glob("sift*");
+let matches = catalog.match_glob("my-vectors*");
 ```
 
 ---
