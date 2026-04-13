@@ -840,6 +840,11 @@ pub fn run_pipeline(args: RunArgs) -> Result<(), String> {
     // full set of profiles and artifacts.
     let result = if result.is_ok() && has_finalize_steps {
         // Reload dataset.yaml to get the final state (may include
+        // Sync variables and derived attributes to dataset.yaml BEFORE
+        // finalization, so generate-dataset-json and generate-catalog see
+        // the updated is_normalized, is_zero_vector_free, etc.
+        update_dataset_attributes(dataset_path, dataset_path.parent().unwrap_or(Path::new(".")));
+
         // partition profiles added during Phase 3).
         let finalize_config = vectordata::dataset::DatasetConfig::load(&dataset_path)
             .unwrap_or_else(|_| config.clone());
@@ -968,15 +973,22 @@ fn update_dataset_attributes(dataset_path: &Path, workspace: &Path) {
     }
 
     // Derive attributes from pipeline results.
-    // The pipeline REMOVES zero/duplicate vectors — so the output is free
-    // of them when the steps ran, regardless of how many were found.
-    if vars.contains_key("zero_count") {
-        config.set_attribute("is_zero_vector_free", "true");
+    // The attribute reflects the actual output state:
+    // - If the pipeline removed zeros/duplicates, the output is free of them.
+    // - If the pipeline only scanned (--no-dedup), the attribute reflects
+    //   whether any were found (count == 0 means free).
+    if let Some(zc) = vars.get("zero_count") {
+        let is_free = zc == "0";
+        config.set_attribute("is_zero_vector_free", if is_free { "true" } else { "false" });
     }
-    if vars.contains_key("duplicate_count") {
-        config.set_attribute("is_duplicate_vector_free", "true");
+    if let Some(dc) = vars.get("duplicate_count") {
+        let is_free = dc == "0";
+        config.set_attribute("is_duplicate_vector_free", if is_free { "true" } else { "false" });
     }
+    // Normalization: check is_normalized first, fall back to source_was_normalized
     if let Some(v) = vars.get("is_normalized") {
+        config.set_attribute("is_normalized", v);
+    } else if let Some(v) = vars.get("source_was_normalized") {
         config.set_attribute("is_normalized", v);
     }
 

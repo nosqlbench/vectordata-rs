@@ -287,6 +287,7 @@ fn test_remote_dataset_view() {
                 profiles.insert("default".to_string(), DSProfile {
                     maxk: Some(100),
                     base_count: None,
+                    partition: false,
                     views,
                 });
                 DSProfileGroup::from_profiles(profiles)

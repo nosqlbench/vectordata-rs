@@ -163,9 +163,8 @@ pub fn expand_per_profile_steps_scoped(
 
         // Detect if this is a partition profile (own base_vectors, not
         // windowed from default) vs a sized profile (subset of default).
-        let is_partition = *profile_name != "default" && profiles.profiles.get(*profile_name)
-            .and_then(|p| p.views.get("base_vectors"))
-            .map(|v| v.source.window.is_empty() && v.source.path.contains(&format!("profiles/{}/", profile_name)))
+        let is_partition = profiles.profiles.get(*profile_name)
+            .map(|p| p.partition)
             .unwrap_or(false);
 
         for template in templates.iter().filter(|t| t.phase == phase) {

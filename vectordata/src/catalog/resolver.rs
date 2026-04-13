@@ -419,6 +419,7 @@ mod tests {
                 crate::dataset::DSProfile {
                     maxk: None,
                     base_count: None,
+                    partition: false,
                     views: IndexMap::new(),
                 },
             );

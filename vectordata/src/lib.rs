@@ -53,6 +53,7 @@ pub mod transport;
 pub mod model;
 /// Vector I/O: fvec, ivec, mvec readers (mmap and HTTP).
 pub mod io;
+pub mod knn_entries;
 /// Typed data access with runtime type negotiation.
 ///
 /// Provides [`typed_access::TypedReader`] for opening vector and scalar files

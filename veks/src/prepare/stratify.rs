@@ -208,6 +208,7 @@ pub fn run(path: &Path, spec: Option<&str>, force: bool, yes: bool) {
         let profile = DSProfile {
             maxk: default.maxk,
             base_count: Some(*count),
+            partition: false,
             views,
         };
         config.profiles.profiles.insert(prof_name.clone(), profile);

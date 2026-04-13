@@ -253,6 +253,7 @@ templates (compute-knn, verify-knn) for the new partition profiles.
                         config.set_profile(name, DSProfile {
                             maxk: Some(maxk),
                             base_count: Some(*count as u64),
+                            partition: true,
                             views,
                         });
                     }

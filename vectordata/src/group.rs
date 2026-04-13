@@ -55,6 +55,8 @@ impl TestDataGroup {
     }
 
     /// Loads a TestDataGroup from a local directory path or a dataset.yaml file.
+    ///
+    /// Falls back to `knn_entries.yaml` if `dataset.yaml` is not found.
     pub fn load_from_path<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref();
         let (dir, yaml_path) = if path.is_dir() {
@@ -65,34 +67,56 @@ impl TestDataGroup {
                 path.to_path_buf(),
             )
         } else {
-            // Assume it is a directory if no extension, or let fs error handle it
              (path.to_path_buf(), path.join("dataset.yaml"))
         };
 
+        // Try dataset.yaml first
+        if yaml_path.exists() {
+            let yaml_content = fs::read_to_string(&yaml_path)
+                .map_err(Error::ConfigIo)?;
+            let config: DatasetConfig = serde_yaml::from_str(&yaml_content)?;
+            return Ok(Self {
+                source: DataSource::FileSystem(dir),
+                config,
+            });
+        }
+
+        // Fall back to knn_entries.yaml
+        let knn_path = dir.join("knn_entries.yaml");
+        if knn_path.exists() {
+            let entries = crate::knn_entries::KnnEntries::load(&knn_path)
+                .map_err(|e| Error::Other(e))?;
+            let config = entries.to_config();
+            return Ok(Self {
+                source: DataSource::FileSystem(dir),
+                config,
+            });
+        }
+
+        // Neither found — return the original error
         let yaml_content = fs::read_to_string(&yaml_path)
             .map_err(Error::ConfigIo)?;
-        
         let config: DatasetConfig = serde_yaml::from_str(&yaml_content)?;
-
-        Ok(Self { 
+        Ok(Self {
             source: DataSource::FileSystem(dir),
-            config 
+            config,
         })
     }
 
     /// Loads a TestDataGroup from a URL.
+    ///
+    /// Falls back to `knn_entries.yaml` if `dataset.yaml` is not found (HTTP 404).
     pub fn load_from_url(url_str: &str) -> Result<Self> {
         let mut url = Url::parse(url_str)?;
-        
-        // If URL doesn't end in .yaml, assume it's a directory and append dataset.yaml
+
+        // If URL doesn't end in .yaml, assume it's a directory
         if !url.path().ends_with(".yaml") && !url.path().ends_with(".yml") {
             if !url.path().ends_with('/') {
                 url.set_path(&(url.path().to_owned() + "/"));
             }
-            url = url.join("dataset.yaml")?;
         }
 
-        // Base URL is the parent directory
+        // Base URL is the directory
         let base_url = if url.path().ends_with('/') {
             url.clone()
         } else {
@@ -100,16 +124,30 @@ impl TestDataGroup {
         };
 
         let client = Client::new();
-        let yaml_content = client.get(url.clone())
-            .send()?
-            .error_for_status()?
-            .text()?;
 
-        let config: DatasetConfig = serde_yaml::from_str(&yaml_content)?;
+        // Try dataset.yaml first
+        let dataset_url = base_url.join("dataset.yaml")?;
+        let resp = client.get(dataset_url.clone()).send()?;
+        if resp.status().is_success() {
+            let yaml_content = resp.text()?;
+            let config: DatasetConfig = serde_yaml::from_str(&yaml_content)?;
+            return Ok(Self {
+                source: DataSource::Http(base_url),
+                config,
+            });
+        }
+
+        // Fall back to knn_entries.yaml
+        let knn_url = base_url.join("knn_entries.yaml")?;
+        let resp = client.get(knn_url).send()?.error_for_status()?;
+        let yaml_content = resp.text()?;
+        let entries = crate::knn_entries::KnnEntries::parse(&yaml_content)
+            .map_err(|e| Error::Other(e))?;
+        let config = entries.to_config();
 
         Ok(Self {
             source: DataSource::Http(base_url),
-            config
+            config,
         })
     }
 

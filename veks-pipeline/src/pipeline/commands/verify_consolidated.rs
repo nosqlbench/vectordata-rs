@@ -227,6 +227,13 @@ impl CommandOp for VerifyKnnConsolidatedOp {
         // Uses load_and_resolve to expand deferred sized profiles.
         let mut profiles: Vec<(String, u64, PathBuf, PathBuf)> = Vec::new();
         for (name, profile) in &config.profiles.profiles {
+            // Skip partition profiles — they have their own verify-knn-partition
+            // step. Partition profiles have independent base vectors (not windowed
+            // from default) and must NOT be verified against the full base set.
+            if profile.partition {
+                continue;
+            }
+
             let bc = profile.base_count.unwrap_or(u64::MAX);
             let indices_path = profile.views.get("neighbor_indices")
                 .map(|v| ctx.workspace.join(&v.source.path))
@@ -775,6 +782,9 @@ impl CommandOp for VerifyFilteredKnnConsolidatedOp {
 
         let mut profiles: Vec<(String, u64)> = Vec::new();
         for (name, profile) in &config.profiles.profiles {
+            // Skip partition profiles
+            if profile.partition { continue; }
+
             let bc = profile.base_count.unwrap_or(u64::MAX);
             let indices_path = profile.views.get("filtered_neighbor_indices")
                 .map(|v| ctx.workspace.join(&v.source.path))

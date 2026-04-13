@@ -795,6 +795,7 @@ mod tests {
             DSProfile {
                 maxk: Some(100),
                 base_count: None,
+                partition: false,
                 views: view_map,
             },
         );
@@ -935,13 +936,13 @@ mod tests {
     fn test_profile_view_regex() {
         let mut profiles = IndexMap::new();
         profiles.insert("default".to_string(), DSProfile {
-            maxk: None, base_count: None, views: IndexMap::new(),
+            maxk: None, base_count: None, partition: false, views: IndexMap::new(),
         });
         profiles.insert("10m".to_string(), DSProfile {
-            maxk: None, base_count: Some(10_000_000), views: IndexMap::new(),
+            maxk: None, base_count: Some(10_000_000), partition: false, views: IndexMap::new(),
         });
         profiles.insert("100m".to_string(), DSProfile {
-            maxk: None, base_count: Some(100_000_000), views: IndexMap::new(),
+            maxk: None, base_count: Some(100_000_000), partition: false, views: IndexMap::new(),
         });
         let entry = CatalogEntry {
             name: "test".to_string(),
@@ -975,6 +976,7 @@ mod tests {
             DSProfile {
                 maxk: None,
                 base_count: Some(1_000_000),
+                partition: false,
                 views: IndexMap::new(),
             },
         );

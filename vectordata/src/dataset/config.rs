@@ -348,8 +348,9 @@ impl DatasetConfig {
 
             // Sized entries — preserved as compact syntax for round-tripping
             if !self.profiles.raw_sized.is_empty() {
-                let entries: Vec<&str> = self.profiles.raw_sized.iter()
-                    .map(|s| s.as_str()).collect();
+                let entries: Vec<String> = self.profiles.raw_sized.iter()
+                    .map(|s| format!("\"{}\"", s))
+                    .collect();
                 out.push_str(&format!("  sized: [{}]\n", entries.join(", ")));
             }
 
@@ -378,6 +379,9 @@ impl DatasetConfig {
                 }
                 if let Some(base_count) = profile.base_count {
                     out.push_str(&format!("    base_count: {}\n", base_count));
+                }
+                if profile.partition {
+                    out.push_str("    partition: true\n");
                 }
                 for (key, view) in &profile.views {
                     if view.window.is_none()
@@ -739,6 +743,7 @@ profiles:
         config.set_profile("label-0", DSProfile {
             maxk: Some(50),
             base_count: Some(100),
+            partition: true,
             views: {
                 use super::super::profile::DSView;
                 use super::super::source::{DSSource, DSWindow};

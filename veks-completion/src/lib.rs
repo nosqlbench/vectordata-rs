@@ -359,6 +359,25 @@ pub fn complete(tree: &CommandTree, words: &[&str]) -> Vec<String> {
                 return Vec::new();
             }
 
+            // Check if partial is "key=value_prefix" — call value provider for that key.
+            if let Some(eq_pos) = partial.find('=') {
+                let key = &partial[..eq_pos];
+                let value_partial = &partial[eq_pos + 1..];
+                let key_eq = format!("{key}=");
+                let dashed_key = format!("--{key}");
+                // Try value provider by "key=" or "--key"
+                if let Some(provider) = value_providers.get(&key_eq)
+                    .or_else(|| value_providers.get(&dashed_key))
+                    .or_else(|| tree.global_value_providers.get(&key_eq))
+                    .or_else(|| tree.global_value_providers.get(&dashed_key))
+                {
+                    let values = provider(value_partial, remaining);
+                    return values.into_iter()
+                        .map(|v| format!("{key}={v}"))
+                        .collect();
+                }
+            }
+
             // Collect all available options: static + dynamic from context.
             let mut all_options: Vec<String> = options.clone();
             if let Some(provider) = dynamic_options {

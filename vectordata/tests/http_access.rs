@@ -1698,3 +1698,139 @@ profiles:
     assert_eq!(r_pred_wide.count(), 20);
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// knn_entries.yaml support
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Create a directory with knn_entries.yaml (no dataset.yaml) and data files.
+fn create_knn_entries_fixture(dir: &std::path::Path) {
+    let dim = 4;
+    let base_count = 30;
+    let query_count = 5;
+    let k = 3;
+
+    write_fvec_data(&dir.join("base.fvec"), dim, base_count);
+    write_fvec_data(&dir.join("query.fvec"), dim, query_count);
+    write_ivec_data(&dir.join("gt.ivec"), k, query_count);
+
+    let knn_yaml = r#"
+_defaults:
+  base_url: http://localhost/test
+
+"testdata:default":
+  base: base.fvec
+  query: query.fvec
+  gt: gt.ivec
+
+"testdata:small":
+  base: base.fvec
+  query: query.fvec
+  gt: gt.ivec
+"#;
+    std::fs::write(dir.join("knn_entries.yaml"), knn_yaml).unwrap();
+}
+
+#[test]
+fn knn_entries_local_fallback() {
+    // When a directory has knn_entries.yaml but NO dataset.yaml,
+    // TestDataGroup::load should use it.
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    create_knn_entries_fixture(dir);
+
+    // No dataset.yaml exists
+    assert!(!dir.join("dataset.yaml").exists());
+
+    let group = TestDataGroup::load(dir.to_str().unwrap()).unwrap();
+
+    // Should have profiles from knn_entries
+    let names = group.profile_names();
+    assert!(names.iter().any(|n| n == "default"),
+        "should have default profile: {:?}", names);
+
+    // Access base vectors
+    let view = group.profile("default").unwrap();
+    let base = view.base_vectors().unwrap();
+    assert_eq!(base.count(), 30, "base count");
+    assert_eq!(base.dim(), 4, "base dim");
+
+    // Access query vectors
+    let query = view.query_vectors().unwrap();
+    assert_eq!(query.count(), 5, "query count");
+
+    // Access ground truth
+    let gt = view.neighbor_indices().unwrap();
+    assert_eq!(gt.count(), 5, "gt count");
+    assert_eq!(gt.dim(), 3, "gt dim (k)");
+}
+
+#[test]
+fn knn_entries_http_fallback() {
+    // When HTTP directory has knn_entries.yaml but no dataset.yaml,
+    // TestDataGroup::load should fall back to knn_entries.
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    create_knn_entries_fixture(dir);
+
+    let server = TestServer::start(dir).unwrap();
+
+    let group = TestDataGroup::load(&server.base_url()).unwrap();
+    let names = group.profile_names();
+    assert!(names.iter().any(|n| n == "default"),
+        "HTTP: should have default profile: {:?}", names);
+
+    let view = group.profile("default").unwrap();
+
+    let base = view.base_vectors().unwrap();
+    assert_eq!(base.count(), 30, "HTTP base count");
+    assert_eq!(base.dim(), 4, "HTTP base dim");
+
+    let query = view.query_vectors().unwrap();
+    assert_eq!(query.count(), 5, "HTTP query count");
+
+    let gt = view.neighbor_indices().unwrap();
+    assert_eq!(gt.count(), 5, "HTTP gt count");
+}
+
+#[test]
+fn knn_entries_multiple_profiles() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    create_knn_entries_fixture(dir);
+
+    let group = TestDataGroup::load(dir.to_str().unwrap()).unwrap();
+    let names = group.profile_names();
+    assert!(names.iter().any(|n| n == "small"),
+        "should have 'small' profile: {:?}", names);
+
+    let small = group.profile("small").unwrap();
+    let base = small.base_vectors().unwrap();
+    assert_eq!(base.count(), 30); // same file, different profile
+}
+
+#[test]
+fn knn_entries_parse_roundtrip() {
+    use vectordata::knn_entries::KnnEntries;
+
+    let yaml = r#"
+_defaults:
+  base_url: https://example.com/data
+
+"mydata:default":
+  base: profiles/base/base_vectors.fvec
+  query: profiles/base/query_vectors.fvec
+  gt: profiles/base/neighbor_indices.ivec
+"#;
+    let entries = KnnEntries::parse(yaml).unwrap();
+    assert_eq!(entries.base_url, Some("https://example.com/data".to_string()));
+    assert_eq!(entries.entries.len(), 1);
+    assert_eq!(entries.dataset_names(), vec!["mydata"]);
+
+    let config = entries.to_config();
+    assert!(config.profiles.contains_key("default"));
+    let p = &config.profiles["default"];
+    assert!(p.base_vectors.is_some());
+    assert!(p.query_vectors.is_some());
+    assert!(p.neighbor_indices.is_some());
+}
+

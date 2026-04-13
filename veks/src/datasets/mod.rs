@@ -243,11 +243,14 @@ pub enum ConfigSubcommand {
         /// Catalog URL or path (e.g., https://host/path/ or /local/path)
         source: String,
     },
-    /// Remove a catalog source from catalogs.yaml
+    /// Remove a catalog source from catalogs.yaml (by URL/path or index)
     #[command(alias = "rm")]
     RemoveCatalog {
         /// Catalog URL or path to remove
-        source: String,
+        source: Option<String>,
+        /// Remove by 1-based index (from `list-catalogs` output)
+        #[arg(long)]
+        at: Option<usize>,
     },
     /// List configured catalog sources
     ListCatalogs,
@@ -412,8 +415,37 @@ fn run_config_command(command: ConfigSubcommand) {
             run_catalog_config("add", &source);
             return;
         }
-        ConfigSubcommand::RemoveCatalog { source } => {
-            run_catalog_config("remove", &source);
+        ConfigSubcommand::RemoveCatalog { source, at } => {
+            match (source, at) {
+                (Some(s), _) => {
+                    run_catalog_config("remove", &s);
+                }
+                (None, Some(idx)) => {
+                    // Resolve index to source URL by loading the catalog list
+                    let config_dir = crate::catalog::sources::expand_tilde(
+                        crate::catalog::sources::DEFAULT_CONFIG_DIR,
+                    );
+                    let catalogs_path = std::path::Path::new(&config_dir).join("catalogs.yaml");
+                    let entries: Vec<String> = if catalogs_path.is_file() {
+                        let content = std::fs::read_to_string(&catalogs_path).unwrap_or_default();
+                        serde_yaml::from_str(&content).unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
+                    if idx == 0 || idx > entries.len() {
+                        eprintln!("Error: index {} out of range (1..{})", idx, entries.len());
+                        std::process::exit(1);
+                    }
+                    let source = &entries[idx - 1];
+                    println!("Removing catalog #{}: {}", idx, source);
+                    run_catalog_config("remove", source);
+                }
+                (None, None) => {
+                    eprintln!("Error: specify a catalog URL/path or --at <index>");
+                    eprintln!("  Use `veks config list-catalogs` to see available indices.");
+                    std::process::exit(1);
+                }
+            }
             return;
         }
         ConfigSubcommand::ListCatalogs => {

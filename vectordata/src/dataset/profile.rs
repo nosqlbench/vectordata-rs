@@ -139,6 +139,13 @@ pub struct DSProfile {
     /// pipeline steps are expanded for this profile with `${base_count}` and
     /// `${base_end}` variables.
     pub base_count: Option<u64>,
+    /// When true, this is an oracle partition profile with independent
+    /// base vectors (not a windowed subset of the default profile).
+    /// Partition profiles are created by `compute partition-profiles`
+    /// and have their own KNN computation + verification steps.
+    /// They are excluded from consolidated verification and do not
+    /// inherit metadata/filtered-KNN views from the default profile.
+    pub partition: bool,
     /// Views keyed by canonical facet name (standard facets) or custom name.
     pub views: IndexMap<String, DSView>,
 }
@@ -150,18 +157,18 @@ impl Serialize for DSProfile {
     {
         use serde::ser::SerializeMap;
         let mut len = self.views.len();
-        if self.maxk.is_some() {
-            len += 1;
-        }
-        if self.base_count.is_some() {
-            len += 1;
-        }
+        if self.maxk.is_some() { len += 1; }
+        if self.base_count.is_some() { len += 1; }
+        if self.partition { len += 1; }
         let mut map = serializer.serialize_map(Some(len))?;
         if let Some(maxk) = self.maxk {
             map.serialize_entry("maxk", &maxk)?;
         }
         if let Some(base_count) = self.base_count {
             map.serialize_entry("base_count", &base_count)?;
+        }
+        if self.partition {
+            map.serialize_entry("partition", &true)?;
         }
         for (key, view) in &self.views {
             map.serialize_entry(key, view)?;
@@ -357,12 +364,14 @@ impl DSProfileGroup {
                     DSProfile {
                         maxk: dp.maxk,
                         base_count: Some(count),
+                        partition: false,
                         views: merged_views,
                     }
                 } else {
                     DSProfile {
                         maxk: None,
                         base_count: Some(count),
+                        partition: false,
                         views: base_views,
                     }
                 };
@@ -390,15 +399,20 @@ impl DSProfileGroup {
     pub fn derive_views_from_templates(&mut self, templates: &[crate::dataset::pipeline::StepDef]) {
         use super::source::{DSInterval, DSSource, DSWindow};
 
-        // Collect bare output filenames from per_profile templates
-        let template_outputs: Vec<String> = templates
+        // Collect bare output filenames from per_profile templates,
+        // paired with the template's command name for facet-scope filtering.
+        // Skip cache outputs and variable-interpolated names — these are
+        // intermediate artifacts, not dataset views.
+        let template_outputs: Vec<(String, String)> = templates
             .iter()
             .filter(|s| s.per_profile)
-            .filter_map(|s| s.output_path())
-            .map(|p| {
-                p.strip_prefix("${profile_dir}")
+            .filter_map(|s| s.output_path().map(|p| (p, s.run.clone())))
+            .filter(|(p, _)| !p.contains("${cache}") && !p.contains("${profile_name}"))
+            .map(|(p, cmd)| {
+                let cleaned = p.strip_prefix("${profile_dir}")
                     .unwrap_or(&p)
-                    .to_string()
+                    .to_string();
+                (cleaned, cmd)
             })
             .collect();
 
@@ -414,7 +428,7 @@ impl DSProfileGroup {
 
             let profile_dir = format!("profiles/{}/", name);
 
-            for filename in &template_outputs {
+            for (filename, _cmd) in &template_outputs {
                 // Derive the view key from the filename stem
                 let path = std::path::Path::new(filename);
                 let stem = match path.file_stem().and_then(|s| s.to_str()) {
@@ -434,17 +448,16 @@ impl DSProfileGroup {
                 // direct paths to their own profile directory instead.
                 if name != "default" {
                     if let Some(bc) = profile.base_count {
-                        // Check if this profile has its own base_vectors (not
-                        // windowed from default) — this indicates a partition
-                        // profile with independent data.
-                        let is_partition = profile.views.get("base_vectors")
-                            .map(|v| {
-                                v.source.window.is_empty()
-                                    && v.source.path.contains(&format!("profiles/{}/", name))
-                            })
-                            .unwrap_or(false);
+                        if profile.partition {
+                            // Partition profiles only get views for facets
+                            // in their scope (default BQG). Skip metadata,
+                            // filtered KNN, and predicate views.
+                            let is_knn_view = stem == "neighbor_indices"
+                                || stem == "neighbor_distances";
+                            if !is_knn_view {
+                                continue;
+                            }
 
-                        if is_partition {
                             // Partition profile: KNN outputs are in the
                             // profile's own directory
                             let resolved_path = format!("{}{}", profile_dir, filename);
@@ -585,6 +598,7 @@ impl<'de> Deserialize<'de> for DSProfile {
 
         let mut maxk: Option<u32> = None;
         let mut base_count: Option<u64> = None;
+        let mut partition = false;
         let mut views = IndexMap::new();
 
         for (key, value) in raw {
@@ -604,6 +618,14 @@ impl<'de> Deserialize<'de> for DSProfile {
                 };
                 continue;
             }
+            if key == "partition" {
+                partition = match &value {
+                    serde_yaml::Value::Bool(b) => *b,
+                    serde_yaml::Value::String(s) => s == "true",
+                    _ => false,
+                };
+                continue;
+            }
 
             // Resolve alias to canonical name; custom facets pass through as-is
             let canonical = resolve_standard_key(&key).unwrap_or_else(|| key.clone());
@@ -612,7 +634,7 @@ impl<'de> Deserialize<'de> for DSProfile {
             views.insert(canonical, view);
         }
 
-        Ok(DSProfile { maxk, base_count, views })
+        Ok(DSProfile { maxk, base_count, partition, views })
     }
 }
 
@@ -1048,12 +1070,14 @@ impl<'de> Deserialize<'de> for DSProfileGroup {
                         DSProfile {
                             maxk: dp.maxk,
                             base_count: Some(count),
+                            partition: false,
                             views: merged_views,
                         }
                     } else {
                         DSProfile {
                             maxk: None,
                             base_count: Some(count),
+                            partition: false,
                             views: base_views,
                         }
                     };
@@ -1077,8 +1101,18 @@ impl<'de> Deserialize<'de> for DSProfileGroup {
             let child: DSProfile =
                 serde_yaml::from_value(value.clone()).map_err(de::Error::custom)?;
 
-            // Inherit from default
-            let merged = if let Some(ref dp) = default_profile {
+            // Inherit from default — but NOT for partition profiles.
+            // Partition profiles have independent data and must not
+            // inherit metadata, filtered KNN, or other views from default.
+            let merged = if child.partition {
+                // Partition: inherit only maxk, keep own views
+                DSProfile {
+                    maxk: child.maxk.or(default_profile.as_ref().and_then(|dp| dp.maxk)),
+                    base_count: child.base_count,
+                    partition: true,
+                    views: child.views,
+                }
+            } else if let Some(ref dp) = default_profile {
                 let mut merged_views = dp.views.clone();
                 // Overlay child views on top of default
                 for (k, v) in child.views {
@@ -1086,7 +1120,8 @@ impl<'de> Deserialize<'de> for DSProfileGroup {
                 }
                 DSProfile {
                     maxk: child.maxk.or(dp.maxk),
-                    base_count: child.base_count, // never inherit base_count
+                    base_count: child.base_count,
+                    partition: false,
                     views: merged_views,
                 }
             } else {
