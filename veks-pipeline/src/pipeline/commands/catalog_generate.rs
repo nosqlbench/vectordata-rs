@@ -155,6 +155,19 @@ impl CommandOp for CatalogGenerateOp {
                 continue;
             }
 
+            // Generate knn_entries.yaml FIRST — catalog files must be
+            // newer for publish pre-flight mtime checks.
+            let knn_path = catalog_dir.join("knn_entries.yaml");
+            let knn_content = generate_knn_entries(&datasets, catalog_dir, &scan_root);
+            if !knn_content.is_empty() {
+                if let Err(e) = std::fs::write(&knn_path, &knn_content) {
+                    ctx.ui.log(&format!("  warning: failed to write {}: {}", knn_path.display(), e));
+                } else {
+                    produced.push(knn_path);
+                    total_files += 1;
+                }
+            }
+
             let json_path = catalog_dir.join(format!("{}.json", basename));
             let json = match serde_json::to_string_pretty(&entries) {
                 Ok(j) => j,
@@ -173,20 +186,7 @@ impl CommandOp for CatalogGenerateOp {
                 return error_result(format!("failed to write {}: {}", yaml_path.display(), e), start);
             }
 
-
-            // Generate knn_entries.yaml for jvector/knn tooling compatibility
-            let knn_path = catalog_dir.join("knn_entries.yaml");
-            let knn_content = generate_knn_entries(&datasets, catalog_dir, &scan_root);
-            if !knn_content.is_empty() {
-                if let Err(e) = std::fs::write(&knn_path, &knn_content) {
-                    ctx.ui.log(&format!("  warning: failed to write {}: {}", knn_path.display(), e));
-                } else {
-                    produced.push(knn_path);
-                    total_files += 1;
-                }
-            }
-
-            ctx.ui.log(&format!("  wrote {} entries to {} (catalog.json + catalog.yaml + knn_entries.yaml)", entries.len(), catalog_dir.display()));
+            ctx.ui.log(&format!("  wrote {} entries to {} (knn_entries.yaml + catalog.json + catalog.yaml)", entries.len(), catalog_dir.display()));
             produced.push(json_path);
             produced.push(yaml_path);
             total_files += 2;
