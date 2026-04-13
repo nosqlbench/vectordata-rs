@@ -226,20 +226,20 @@ upstream:
       finalize: true
       after: [generate-dataset-json]
 
-    - id: generate-merkle
-      description: Create merkle hash trees
-      run: merkle create
-      finalize: true
-      after: [generate-variables-json, generate-dataset-log-jsonl]
-      source: .
-      min-size: 0
-
     - id: generate-catalog
       description: Generate catalog index
       run: catalog generate
       finalize: true
-      after: [generate-merkle]
+      after: [generate-variables-json, generate-dataset-log-jsonl]
       source: .
+
+    - id: generate-merkle
+      description: Create merkle hash trees
+      run: merkle create
+      finalize: true
+      after: [generate-catalog]
+      source: .
+      min-size: 0
 
 profiles:
   default:

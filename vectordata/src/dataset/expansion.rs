@@ -52,10 +52,41 @@ pub fn filter_steps_for_profile(steps: Vec<StepDef>, profile: &str) -> Vec<StepD
 ///
 /// Template steps (per_profile=true) are removed; their expansions replace them.
 /// Non-template steps pass through unchanged.
+/// Map a pipeline command name to the facet code it implements.
+/// Returns None for commands that aren't facet-specific (e.g., state set).
+fn command_facet(run: &str) -> Option<char> {
+    match run {
+        "compute knn" | "compute knn-blas" | "compute knn-faiss" => Some('G'),
+        "verify knn-consolidated" | "verify dataset-knnutils" | "verify knn-groundtruth" => Some('G'),
+        "compute evaluate-predicates" => Some('R'),
+        "verify predicates-sqlite" | "verify predicate-results"
+            | "verify predicates-consolidated" => Some('R'),
+        "compute filtered-knn" => Some('F'),
+        "verify filtered-knn-consolidated" => Some('F'),
+        "generate predicates" => Some('P'),
+        _ => None,
+    }
+}
+
 pub fn expand_per_profile_steps(
     steps: Vec<StepDef>,
     profiles: &DSProfileGroup,
     query_count: u64,
+) -> Vec<StepDef> {
+    expand_per_profile_steps_scoped(steps, profiles, query_count, None)
+}
+
+/// Expand per_profile templates, optionally restricting partition profiles
+/// to a sub-facet scope.
+///
+/// When `oracle_sub_facets` is Some (e.g., "BQG"), partition profiles
+/// only get templates whose command maps to a facet in the sub-set.
+/// Sized profiles and the default profile always get all templates.
+pub fn expand_per_profile_steps_scoped(
+    steps: Vec<StepDef>,
+    profiles: &DSProfileGroup,
+    query_count: u64,
+    oracle_sub_facets: Option<&str>,
 ) -> Vec<StepDef> {
     let (templates, regular): (Vec<_>, Vec<_>) = steps
         .into_iter()
@@ -84,16 +115,16 @@ pub fn expand_per_profile_steps(
 
     let mut result = regular;
 
-    // Collect all profiles to expand: sized ascending by base_count, then default last
-    let mut sized: Vec<(&str, u64)> = profiles.profiles.iter()
-        .filter(|(name, p)| name.as_str() != "default" && p.base_count.is_some())
-        .map(|(name, p)| (name.as_str(), p.base_count.unwrap()))
+    // Collect all profiles to expand: natural name order, then default last.
+    // Natural order ensures label-0, label-1, ..., label-9, label-10
+    // (not ASCII order or size order which is arbitrary for partitions).
+    let mut non_default: Vec<(&str, Option<u64>)> = profiles.profiles.iter()
+        .filter(|(name, _)| name.as_str() != "default")
+        .map(|(name, p)| (name.as_str(), p.base_count))
         .collect();
-    sized.sort_by_key(|(_, bc)| *bc);
+    non_default.sort_by(|(a, _), (b, _)| super::profile::natural_cmp(a, b));
 
-    let mut all_profiles: Vec<(&str, Option<u64>)> = sized.into_iter()
-        .map(|(name, bc)| (name, Some(bc)))
-        .collect();
+    let mut all_profiles: Vec<(&str, Option<u64>)> = non_default;
     if profiles.profiles.contains_key("default") && !has_explicit_default_steps {
         all_profiles.push(("default", None));
     }
@@ -130,8 +161,35 @@ pub fn expand_per_profile_steps(
             None => "${vector_count}".to_string(),
         };
 
+        // Detect if this is a partition profile (own base_vectors, not
+        // windowed from default) vs a sized profile (subset of default).
+        let is_partition = *profile_name != "default" && profiles.profiles.get(*profile_name)
+            .and_then(|p| p.views.get("base_vectors"))
+            .map(|v| v.source.window.is_empty() && v.source.path.contains(&format!("profiles/{}/", profile_name)))
+            .unwrap_or(false);
+
         for template in templates.iter().filter(|t| t.phase == phase) {
             let template_id = template.effective_id();
+
+            // Templates with "partition" in the ID only expand for partition
+            // profiles — never for default or sized profiles.
+            if !is_partition && template_id.contains("partition") {
+                continue;
+            }
+
+            // For partition profiles, skip templates outside the oracle scope.
+            // E.g., with oracle scope "BQG", skip evaluate-predicates (R),
+            // compute-filtered-knn (F), etc.
+            if is_partition {
+                if let Some(scope) = oracle_sub_facets {
+                    if let Some(facet) = command_facet(&template.run) {
+                        if !scope.contains(facet) {
+                            continue;
+                        }
+                    }
+                }
+            }
+
             let expanded_id = if suffix.is_empty() {
                 template_id.clone()
             } else {
@@ -177,8 +235,9 @@ pub fn expand_per_profile_steps(
                 }
             }
 
-            // Auto-inject range for sized profiles
-            if base_count_opt.is_some() && !expanded_options.contains_key("range") {
+            // Auto-inject range for sized profiles (not partition profiles —
+            // partition base vectors are already the exact subset, no windowing needed)
+            if base_count_opt.is_some() && !is_partition && !expanded_options.contains_key("range") {
                 let base_end = query_count + base_count_opt.unwrap();
                 expanded_options.insert(
                     "range".to_string(),
@@ -256,43 +315,32 @@ pub fn expand_per_profile_steps(
             }
         }
 
-        // If this is phase > 0, add dependency on the last step of the
-        // previous phase's last profile (ensures phase ordering).
-        if phase > 0 {
-            // Find the last step of the previous phase across all profiles
-            let prev_phase_templates: Vec<&StepDef> = templates.iter()
-                .filter(|t| t.phase == phase - 1)
-                .collect();
-            if let Some(last_tmpl) = prev_phase_templates.last() {
-                // Last profile in the ordering
-                if let Some((last_prof_name, _)) = all_profiles.last() {
-                    let last_suffix = if *last_prof_name == "default" { String::new() }
-                        else { format!("-{}", last_prof_name) };
-                    let prev_phase_last_id = {
-                        let tid = last_tmpl.effective_id();
-                        if last_suffix.is_empty() { tid } else { format!("{}{}", tid, last_suffix) }
-                    };
+    }
 
-                    // First step of this phase's first profile
-                    if let Some(first_prof) = all_profiles.first() {
-                        let first_suffix = if first_prof.0 == "default" { String::new() }
-                            else { format!("-{}", first_prof.0) };
-                        if let Some(first_tmpl) = phase_templates.first() {
-                            let this_phase_first_id = {
-                                let tid = first_tmpl.effective_id();
-                                if first_suffix.is_empty() { tid } else { format!("{}{}", tid, first_suffix) }
-                            };
-                            for step in result.iter_mut() {
-                                if step.effective_id() == this_phase_first_id {
-                                    if !step.after.contains(&prev_phase_last_id) {
-                                        step.after.push(prev_phase_last_id.clone());
-                                    }
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
+    // Post-hoc phase ordering: for each phase > 0, the first emitted step
+    // of that phase depends on the last emitted step of the previous phase.
+    // This is done after all expansion so we reference actual emitted steps,
+    // not template names that may have been skipped.
+    // Collect the IDs of steps that were produced by per_profile expansion
+    // (they have a non-empty profiles field). Phase ordering only applies
+    // to these — regular steps like partition-profiles are not part of the
+    // per_profile phase sequence.
+    let expanded_ids: std::collections::HashSet<String> = result.iter()
+        .filter(|s| !s.profiles.is_empty())
+        .map(|s| s.effective_id())
+        .collect();
+
+    for phase in 1..=max_phase {
+        let prev_phase_last = result.iter()
+            .filter(|s| s.phase == phase - 1 && !s.finalize && expanded_ids.contains(&s.effective_id()))
+            .last()
+            .map(|s| s.effective_id());
+        let this_phase_first_idx = result.iter()
+            .position(|s| s.phase == phase && !s.finalize && expanded_ids.contains(&s.effective_id()));
+
+        if let (Some(prev_id), Some(idx)) = (prev_phase_last, this_phase_first_idx) {
+            if !result[idx].after.contains(&prev_id) {
+                result[idx].after.push(prev_id);
             }
         }
     }

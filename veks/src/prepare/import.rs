@@ -267,8 +267,13 @@ pub fn parse_facet_spec(spec: &str) -> String {
 ///
 /// Returns a canonical code string (e.g., "BQGDMPRF").
 pub fn resolve_facets(args: &ImportArgs) -> String {
+    // '+' prefix means additive: infer first, then add the extra codes.
+    // Without '+', the spec replaces inference entirely.
     if let Some(ref spec) = args.required_facets {
-        return parse_facet_spec(spec);
+        if !spec.trim().starts_with('+') {
+            return parse_facet_spec(spec);
+        }
+        // Fall through to inference, then merge below
     }
 
     // When provided_facets is set, only consider inputs matching those codes
@@ -307,7 +312,52 @@ pub fn resolve_facets(args: &ImportArgs) -> String {
             facets.push('F');
         }
     }
+
+    // Merge additive extras from '+' prefix (e.g., "+O" → add O to inferred)
+    if let Some(ref spec) = args.required_facets {
+        if spec.trim().starts_with('+') {
+            let extras = parse_facet_spec(spec);
+            for c in extras.chars() {
+                if !facets.contains(c) {
+                    facets.push(c);
+                }
+            }
+        }
+    }
+
     facets
+}
+
+/// Extract the oracle partition sub-facets from a facet string.
+///
+/// The O code carries its own scope: characters after O (in lower or upper
+/// case) specify which facets to compute within each partition.
+///
+/// - `BQGDMPRFO` or `+O` → `O` with default sub-facets `bqg`
+/// - `BQGDMPRFObqg` → same (explicit)
+/// - `BQGDMPRFObqgmprf` → partitions get full MPRF too
+/// - `BQGDMPRFOBQGD` → partitions get BQG + distances
+///
+/// Returns `(main_facets, oracle_sub_facets)` where main_facets has O
+/// stripped and oracle_sub_facets is the uppercase set of per-partition
+/// facets (default "BQG" if none specified after O).
+pub fn parse_oracle_scope(facets: &str) -> (String, Option<String>) {
+    if let Some(o_pos) = facets.find('O') {
+        let main = facets[..o_pos].to_string();
+        let after_o = &facets[o_pos + 1..];
+
+        let sub_facets = if after_o.is_empty() {
+            // O alone → default sub-facets BQG
+            "BQG".to_string()
+        } else {
+            // Characters after O are the partition sub-facets
+            after_o.to_uppercase()
+        };
+
+        (main, Some(sub_facets))
+    } else {
+        (facets.to_string(), None)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -480,7 +530,11 @@ fn resolve_slots(args: &ImportArgs) -> PipelineSlots {
             .unwrap_or("fvec")
     };
 
-    let shuffle_enabled = args.seed != 0;
+    // Shuffling randomizes vector order for train/test splitting.
+    // Disabled when ground truth is pre-provided (Identity) — shuffling
+    // would change ordinals and invalidate the GT.
+    let has_precomputed_gt = args.ground_truth.is_some();
+    let shuffle_enabled = args.seed != 0 && !has_precomputed_gt;
 
     let (shuffle, query_vectors, base_vectors, base_count) = if self_search {
         // Strategy 1 (combined B+Q) or Strategy 3 (B only): shuffle + extract
@@ -1546,6 +1600,10 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
     // still need computed KNN — add a per_profile compute-knn step.
     // The default profile will redundantly recompute, but sized profiles
     // will get the KNN they need.
+    let facets_check = resolve_facets(args);
+    let (_, oracle_check) = parse_oracle_scope(&facets_check);
+    let wants_partition_verify = args.partition_oracles || oracle_check.is_some();
+
     let needs_computed_knn = if let Some(ref knn) = slots.knn {
         knn.is_materialized() || args.sized_profiles.is_some()
     } else {
@@ -1600,6 +1658,40 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
                     if args.compress_cache {
                         opts.push(("compress_cache".into(), "true".into()));
                     }
+                    opts.push(("normalized".into(),
+                        if args.normalize { "true" } else { "false" }.into()));
+                    opts
+                },
+            });
+        }
+    }
+
+    // Per-partition KNN computation — only emitted when partitions are
+    // enabled AND base GT is pre-provided (Identity). When KNN is already
+    // Materialized (compute-knn template exists), partitions use that same
+    // template via Phase 3 expansion. This template has "partition" in the
+    // ID so it only expands for partition profiles, not default/sized.
+    if wants_partition_verify && !needs_computed_knn && slots.knn.is_some() {
+        let has_queries = slots.query_vectors.is_some();
+        if has_queries {
+            let query_path = slots.query_vectors.as_ref().unwrap().path().to_string();
+            steps.push(Step {
+                id: "compute-knn-partition".into(),
+                run: cmd_knn(&args.personality).into(),
+                description: Some("Compute KNN for oracle partition profiles".into()),
+                after: vec!["partition-profiles".into(), "verify-knn".into()],
+                per_profile: true,
+                phase: 0,
+                finalize: false,
+                options: {
+                    let mut opts = vec![
+                        ("base".into(), "${profile_dir}base_vectors.fvec".into()),
+                        ("query".into(), query_path),
+                        ("indices".into(), "neighbor_indices.ivec".into()),
+                        ("distances".into(), "neighbor_distances.fvec".into()),
+                        ("neighbors".into(), args.neighbors.to_string()),
+                        ("metric".into(), args.metric.clone()),
+                    ];
                     opts.push(("normalized".into(),
                         if args.normalize { "true" } else { "false" }.into()));
                     opts
@@ -1673,6 +1765,23 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
                 }
             }
         }
+        // When ground truth is pre-provided (Identity), use the source
+        // base vectors for verification — the GT ordinals reference the
+        // original ordering, not the post-extraction/shuffle ordering.
+        let verify_base = if !needs_computed_knn {
+            slots.all_vectors.path().to_string()
+        } else {
+            slots.base_vectors.path().to_string()
+        };
+        let verify_query = if !needs_computed_knn && args.query_vectors.is_some() {
+            // Use original query source when GT is pre-provided
+            slots.query_vectors.as_ref()
+                .map(|q| if q.is_materialized() { q.path().to_string() } else { q.path().to_string() })
+                .unwrap_or_else(|| "query_vectors.fvec".to_string())
+        } else {
+            slots.query_vectors.as_ref().unwrap().path().to_string()
+        };
+
         steps.push(Step {
             id: "verify-knn".into(),
             run: cmd_verify_knn(&args.personality).into(),
@@ -1682,8 +1791,8 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
             phase: 0,
             finalize: false,
             options: vec![
-                ("base".into(), slots.base_vectors.path().into()),
-                ("query".into(), slots.query_vectors.as_ref().unwrap().path().into()),
+                ("base".into(), verify_base),
+                ("query".into(), verify_query),
                 ("metric".into(), args.metric.clone()),
                 ("normalized".into(), if args.normalize { "true" } else { "false" }.into()),
                 ("sample".into(), if args.verify_knn_sample == 0 {
@@ -1693,6 +1802,41 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
                 }),
                 ("seed".into(), format!("${{{}}}", "seed")),
                 ("output".into(), "${cache}/verify_knn_consolidated.json".into()),
+            ],
+        });
+    }
+
+    // Per-partition KNN verification — runs after Phase 3 compute-knn
+    // for each partition profile. Uses the per-profile groundtruth verifier
+    // (not consolidated). Only expands for partition profiles via oracle
+    // scope filtering (facet G).
+    if wants_partition_verify && slots.knn.is_some() {
+        steps.push(Step {
+            id: "verify-knn-partition".into(),
+            run: "verify knn-groundtruth".into(),
+            description: Some("Verify partition KNN against brute-force recomputation".into()),
+            after: if needs_computed_knn {
+                vec!["compute-knn".into()]
+            } else {
+                vec!["compute-knn-partition".into()]
+            },
+            per_profile: true,
+            phase: 1, // verify phase — runs after all phase 0 compute-knn
+            finalize: false,
+            options: vec![
+                ("base".into(), "${profile_dir}base_vectors.fvec".into()),
+                ("query".into(), slots.query_vectors.as_ref().unwrap().path().into()),
+                ("indices".into(), "${profile_dir}neighbor_indices.ivec".into()),
+                ("distances".into(), "${profile_dir}neighbor_distances.fvec".into()),
+                ("metric".into(), args.metric.clone()),
+                ("neighbors".into(), args.neighbors.to_string()),
+                ("sample".into(), if args.verify_knn_sample == 0 {
+                    "50".into() // default sample for partition verify
+                } else {
+                    args.verify_knn_sample.to_string()
+                }),
+                ("seed".into(), format!("${{{}}}", "seed")),
+                ("output".into(), "${cache}/${profile_name}_verify_knn_partition.json".into()),
             ],
         });
     }
@@ -1791,13 +1935,25 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
         json_after.push("verify-predicates-sqlite".into());
     }
     // ── Oracle partition profiles ────────────────────────────────
+    // O facet carries sub-facets: +O means Obqg (BQG per partition),
+    // +Obqgmprf means full MPRF within each partition too.
     let facets = resolve_facets(args);
-    let wants_oracles = args.partition_oracles || facets.contains('O');
-    if wants_oracles && slots.metadata.is_some() && slots.filtered_knn.is_some() {
+    let (_, oracle_scope) = parse_oracle_scope(&facets);
+    let wants_oracles = args.partition_oracles || oracle_scope.is_some();
+    if wants_oracles && slots.metadata.is_some() {
+        // Partition-profiles depends on whatever produced the metadata labels.
+        // If filtered KNN was computed, wait for its verification first.
+        // Otherwise, just wait for metadata to be ready.
         let partition_after = if slots.filtered_knn.as_ref().map(|f| f.is_materialized()).unwrap_or(false) {
             vec!["verify-filtered-knn".into()]
+        } else if let Some(ref meta) = slots.metadata {
+            if meta.metadata_content.is_materialized() {
+                vec![meta.metadata_content.step_id().into()]
+            } else {
+                vec![]
+            }
         } else {
-            vec!["evaluate-predicates".into()]
+            vec![]
         };
         steps.push(Step {
             id: "partition-profiles".into(),
@@ -1858,40 +2014,36 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
         options: vec![],
     });
 
-    // ── Merkle hash trees ────────────────────────────────────────
-    // Runs before catalog generation so that all data files have
-    // .mref hashes before the catalog snapshot is taken.
-    // VVec offset indices are built automatically at write time by
-    // evaluate-predicates — no separate step needed.
+    // ── Catalog generation ──────────────────────────────────────────
+    // Produces catalog.json, catalog.yaml, and knn_entries.yaml.
+    // Runs before merkle so knn_entries.yaml gets .mref coverage.
     steps.push(Step {
-        id: "generate-merkle".into(),
-        run: "merkle create".into(),
-        description: Some("Create merkle hash trees for all publishable data files".into()),
+        id: "generate-catalog".into(),
+        run: "catalog generate".into(),
+        description: Some("Generate catalog index for the dataset directory".into()),
         after: vec!["generate-variables-json".into(), "generate-dataset-log-jsonl".into()],
         per_profile: false,
         phase: 0,
         finalize: true,
         options: vec![
             ("source".into(), ".".into()),
-            ("min-size".into(), "0".into()),
         ],
     });
 
-    // ── Catalog generation ──────────────────────────────────────────
-    // MUST be the very last pipeline step — after merkle creation —
-    // so the catalog reflects the final dataset state. The catalog
-    // covers the full publish tree (all sibling datasets), not just
-    // the current one.
+    // ── Merkle hash trees ────────────────────────────────────────
+    // Runs AFTER catalog so knn_entries.yaml is covered. Catalog
+    // does not read .mref files — it reads dataset.yaml only.
     steps.push(Step {
-        id: "generate-catalog".into(),
-        run: "catalog generate".into(),
-        description: Some("Generate catalog index for the dataset directory".into()),
-        after: vec!["generate-merkle".into()],
+        id: "generate-merkle".into(),
+        run: "merkle create".into(),
+        description: Some("Create merkle hash trees for all publishable data files".into()),
+        after: vec!["generate-catalog".into()],
         per_profile: false,
         phase: 0,
         finalize: true,
         options: vec![
             ("source".into(), ".".into()),
+            ("min-size".into(), "0".into()),
         ],
     });
 
@@ -2049,6 +2201,12 @@ fn generate_yaml(
     out.push_str(&format!("  distance_function: {}\n", args.metric));
     out.push_str(&format!("  veks_version: {}\n", env!("CARGO_PKG_VERSION")));
     out.push_str(&format!("  veks_build: {}\n", env!("VEKS_BUILD_HASH")));
+    // Record oracle partition scope if O facet is active
+    let facets_for_scope = resolve_facets(args);
+    let (_, oracle_scope_opt) = parse_oracle_scope(&facets_for_scope);
+    if let Some(ref scope) = oracle_scope_opt {
+        out.push_str(&format!("  oracle_scope: {}\n", scope));
+    }
     // is_normalized, is_duplicate_vector_free, and is_zero_vector_free
     // are set by the pipeline after the relevant steps complete — not
     // at generation time when correctness hasn't been verified yet.

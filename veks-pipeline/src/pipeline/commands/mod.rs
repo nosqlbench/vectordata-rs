@@ -54,6 +54,7 @@ mod describe;
 pub mod fetch_bulkdl;
 pub mod fetch_dlhf;
 pub mod gen_dataset;
+pub mod knn_compare;
 pub mod gen_derive;
 pub mod gen_extract;
 pub mod gen_metadata;

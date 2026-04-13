@@ -136,8 +136,24 @@ pub fn resolve_all_steps(
         }
     }
 
+    // Detect oracle sub-facet scope from the pipeline steps.
+    // If a partition-profiles step exists, determine the scope from the
+    // facet spec stored in the oracle_scope attribute, or default to BQG.
     let raw_steps = vectordata::dataset::collect_all_steps(config);
-    let expanded = vectordata::dataset::expand_per_profile_steps(raw_steps, &config.profiles, query_count);
+    let has_partition_step = raw_steps.iter().any(|s| s.effective_id() == "partition-profiles");
+    let oracle_scope = if has_partition_step {
+        config.attributes.as_ref()
+            .and_then(|a| a.tags.get("oracle_scope"))
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "BQG".to_string())
+    } else {
+        String::new()
+    };
+    let oracle_ref = if has_partition_step { Some(oracle_scope.as_str()) } else { None };
+
+    let expanded = vectordata::dataset::expand_per_profile_steps_scoped(
+        raw_steps, &config.profiles, query_count, oracle_ref,
+    );
 
     // Auto-derive profile views for sized profiles from template outputs
     let template_steps: Vec<_> = vectordata::dataset::collect_all_steps(config)
@@ -400,8 +416,29 @@ pub fn run_pipeline(args: RunArgs) -> Result<(), String> {
     // Ensure .gitignore covers managed directories
     ensure_gitignore(&workspace);
 
+    // Recover identity symlinks if they were removed (e.g., by a
+    // previous --clean with different logic, or manual deletion).
+    // Profile views that point to non-existent files are checked against
+    // their original source targets.
+    recover_identity_symlinks(&workspace, &config);
+
     // Resolve all steps including deferred profile expansion
     let expanded_steps = resolve_all_steps(&mut config, &workspace);
+
+    // Extract oracle sub-facet scope for partition profile filtering.
+    // Used by all expansion phases to restrict per_profile templates.
+    let oracle_scope: Option<String> = {
+        let raw = vectordata::dataset::collect_all_steps(&config);
+        let has_partition = raw.iter().any(|s| s.effective_id() == "partition-profiles");
+        if has_partition {
+            Some(config.attributes.as_ref()
+                .and_then(|a| a.tags.get("oracle_scope"))
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "BQG".to_string()))
+        } else {
+            None
+        }
+    };
 
     let query_count: u64 = config.upstream.as_ref()
         .and_then(|p| p.defaults.as_ref())
@@ -500,6 +537,14 @@ pub fn run_pipeline(args: RunArgs) -> Result<(), String> {
     );
     for (i, step) in pipeline_dag.steps.iter().enumerate() {
         println!("  {}. {} ({})", i + 1, step.id, step.def.run);
+    }
+    // Show partition expansion note if partition-profiles step exists
+    let has_partition_step = compute_steps.iter()
+        .any(|s| s.effective_id() == "partition-profiles");
+    if has_partition_step {
+        let scope = oracle_scope.as_deref().unwrap_or("BQG");
+        println!("  --- after partition-profiles: Phase 3 re-expansion ---");
+        println!("  · per-partition steps for sub-facets: {}", scope);
     }
     if finalize_step_count > 0 {
         println!("  --- finalization (runs after all phases) ---");
@@ -697,8 +742,8 @@ pub fn run_pipeline(args: RunArgs) -> Result<(), String> {
 
             // Re-expand per-profile steps with the new profiles
             let raw_steps = vectordata::dataset::collect_all_steps(&config);
-            let new_expanded = vectordata::dataset::expand_per_profile_steps(
-                raw_steps, &config.profiles, query_count,
+            let new_expanded = vectordata::dataset::expand_per_profile_steps_scoped(
+                raw_steps, &config.profiles, query_count, oracle_scope.as_deref(),
             );
 
             // Filter to only compute steps (finalize runs in a separate final pass)
@@ -750,8 +795,8 @@ pub fn run_pipeline(args: RunArgs) -> Result<(), String> {
                     updated_config.profiles.derive_views_from_templates(&template_steps);
 
                     let raw_steps = vectordata::dataset::collect_all_steps(&updated_config);
-                    let new_expanded = vectordata::dataset::expand_per_profile_steps(
-                        raw_steps, &updated_config.profiles, query_count,
+                    let new_expanded = vectordata::dataset::expand_per_profile_steps_scoped(
+                        raw_steps, &updated_config.profiles, query_count, oracle_scope.as_deref(),
                     );
 
                     // Compute steps only — finalize runs in the final pass
@@ -799,8 +844,8 @@ pub fn run_pipeline(args: RunArgs) -> Result<(), String> {
         let finalize_config = vectordata::dataset::DatasetConfig::load(&dataset_path)
             .unwrap_or_else(|_| config.clone());
         let raw_steps = vectordata::dataset::collect_all_steps(&finalize_config);
-        let all_expanded = vectordata::dataset::expand_per_profile_steps(
-            raw_steps, &finalize_config.profiles, query_count,
+        let all_expanded = vectordata::dataset::expand_per_profile_steps_scoped(
+            raw_steps, &finalize_config.profiles, query_count, oracle_scope.as_deref(),
         );
 
         let finalize_steps: Vec<_> = all_expanded.into_iter()
@@ -1486,6 +1531,80 @@ fn clean_scratch_contents(scratch_dir: &Path) {
     }
 }
 
+/// Recover identity symlinks that may have been removed by --clean or
+/// manual deletion. Scans profile views for files that don't exist on
+/// disk but whose original source (underscore-prefixed file in the
+/// workspace root) does exist, and recreates the symlink.
+fn recover_identity_symlinks(workspace: &Path, config: &DatasetConfig) {
+    for (_name, profile) in &config.profiles.profiles {
+        for (_facet, view) in profile.views() {
+            let view_path = workspace.join(view.path());
+            if view_path.exists() || view_path.symlink_metadata().is_ok() {
+                continue; // file or symlink exists
+            }
+            // Check if this looks like a profile path (profiles/<name>/<file>)
+            let components: Vec<_> = std::path::Path::new(view.path()).components().collect();
+            if components.len() < 3 { continue; }
+            let filename = components.last()
+                .and_then(|c| c.as_os_str().to_str())
+                .unwrap_or("");
+
+            // Look for underscore-prefixed source files in workspace root
+            // that match the view's filename pattern
+            if let Ok(entries) = std::fs::read_dir(workspace) {
+                for entry in entries.flatten() {
+                    let source_name = entry.file_name().to_string_lossy().to_string();
+                    if !source_name.starts_with('_') { continue; }
+                    // Match by extension and approximate name
+                    let view_ext = std::path::Path::new(filename).extension()
+                        .and_then(|e| e.to_str()).unwrap_or("");
+                    let source_ext = entry.path().extension()
+                        .and_then(|e| e.to_str().map(|s| s.to_string())).unwrap_or_default();
+                    if view_ext != source_ext { continue; }
+
+                    // Check if this source was the original symlink target
+                    // by matching the canonical facet name in the filename
+                    let facet_in_source = source_name.to_lowercase();
+                    let facet_in_view = filename.to_lowercase();
+                    let is_match = (facet_in_view.contains("base") && facet_in_source.contains("base"))
+                        || (facet_in_view.contains("query") && facet_in_source.contains("query"))
+                        || (facet_in_view.contains("neighbor") && facet_in_source.contains("groundtruth"))
+                        || (facet_in_view.contains("neighbor") && facet_in_source.contains("gt"))
+                        || (facet_in_view.contains("distance") && facet_in_source.contains("dist"));
+
+                    if is_match {
+                        // Compute relative symlink target
+                        if let Some(parent) = view_path.parent() {
+                            let _ = std::fs::create_dir_all(parent);
+                            // Compute relative path from the view directory to the source
+                            let rel = {
+                                let from = std::fs::canonicalize(parent).unwrap_or(parent.to_path_buf());
+                                let to = std::fs::canonicalize(entry.path()).unwrap_or(entry.path());
+                                let from_parts: Vec<_> = from.components().collect();
+                                let to_parts: Vec<_> = to.components().collect();
+                                let common = from_parts.iter().zip(to_parts.iter())
+                                    .take_while(|(a, b)| a == b).count();
+                                let mut rel = PathBuf::new();
+                                for _ in common..from_parts.len() { rel.push(".."); }
+                                for part in &to_parts[common..] { rel.push(part); }
+                                rel
+                            };
+                            match std::os::unix::fs::symlink(&rel, &view_path) {
+                                Ok(()) => println!("  recovered symlink: {} → {}",
+                                    veks_core::paths::rel_display(&view_path),
+                                    rel.display()),
+                                Err(e) => println!("  warning: failed to recover symlink {}: {}",
+                                    view_path.display(), e),
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Remove generated files in profiles/ but preserve symlinks to source data.
 ///
 /// Identity symlinks (created by bootstrap's `create_identity_symlinks`) point
@@ -1499,10 +1618,26 @@ fn clean_profiles_preserving_symlinks(profiles_dir: &Path) {
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            // Recurse into profile subdirs (e.g., profiles/base/, profiles/default/)
-            clean_profile_dir(&path);
-            // Remove dir if empty after cleaning
-            let _ = std::fs::remove_dir(&path);
+            let dir_name = path.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+            // Only preserve symlinks in base/ and default/ directories
+            // (identity symlinks to source data). Partition profile
+            // directories (label-*, or anything else) are entirely
+            // pipeline-generated and should be removed completely.
+            if dir_name == "base" || dir_name == "default" {
+                clean_profile_dir(&path);
+                // Remove dir if empty after cleaning
+                let _ = std::fs::remove_dir(&path);
+            } else {
+                // Partition profile — remove entirely
+                match std::fs::remove_dir_all(&path) {
+                    Ok(()) => println!("  removed partition profile {}",
+                        veks_core::paths::rel_display(&path)),
+                    Err(e) => println!("  warning: failed to remove {}: {}",
+                        veks_core::paths::rel_display(&path), e),
+                }
+            }
         } else if !path.is_symlink() {
             let _ = std::fs::remove_file(&path);
         }

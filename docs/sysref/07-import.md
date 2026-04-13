@@ -60,27 +60,45 @@ Each data facet resolves to one of two artifact types:
 
 ### The O facet (oracle partitions)
 
-The O facet is never auto-inferred — it must be explicitly requested:
+The O facet is never auto-inferred — it must be explicitly requested.
+It carries **sub-facets** that control what is computed within each
+partition:
+
+| Spec | Main facets | Per-partition facets |
+|------|-------------|---------------------|
+| `BQGDMPRFO` | BQGDMPRF | BQG (default) |
+| `BQGDMPRFObqg` | BQGDMPRF | BQG (explicit) |
+| `BQGDMPRFObqgd` | BQGDMPRF | BQGD (with distances) |
+| `BQGDMPRFObqgmprf` | BQGDMPRF | BQGMPRF (full) |
+| `+O` (wizard) | inferred | BQG (default) |
+
+Characters after `O` (upper or lower case) specify which facets to
+compute within each partition. When no sub-facets follow `O`, the
+default is `bqg` — partitioned base vectors, shared queries, and
+KNN per partition.
 
 ```
-veks bootstrap -i                        # wizard asks if MPRF present
-veks bootstrap -i --required-facets BQGDMPRFO   # explicit
+veks bootstrap -i                                  # wizard offers +O
+veks bootstrap --required-facets BQGDMPRFO         # O with default bqg
+veks bootstrap --required-facets BQGDMPRFObqgmprf  # full facets per partition
 ```
 
-In the wizard, users can add O to the inferred facets with `+` syntax:
+In the wizard, users add O to the inferred facets with `+` syntax:
 
 ```
 Facets to include in dataset (* for all, +X to add) [BQGMPRF]: +O
-  → Facets: BQGMPRFO  (+O added to BQGMPRF)
+  → Facets: BQGMPRFO  (+O added to BQGMPRF, partitions get BQG)
 ```
 
-When O is included, the wizard prompts for partition configuration
-(max partitions, undersized handling), and the pipeline adds a
-`partition-profiles` step that extracts per-label base vectors and
-registers partition profiles. The existing `per_profile` compute-knn
-template then naturally runs for each partition.
+The `partition-profiles` step reads metadata labels (scalar or slab
+format), identifies unique label values, extracts base vectors per
+label, and registers a partition profile in `dataset.yaml`. Pipeline
+Phase 3 (see §4.4) then re-expands `per_profile` templates for each
+partition — but only for the sub-facets specified after `O`.
 
-The `partition-profiles` step reads metadata labels (scalar or slab format), identifies unique label values, extracts the base vectors belonging to each label, and registers a new profile per partition in `dataset.yaml`. This triggers pipeline Phase 3 (see §4.4), which re-expands `per_profile` templates like `compute-knn` for each partition profile. The `--partition-oracles` flag is equivalent to adding `+O` in the wizard.
+The O facet requires metadata content (M) to be available — it reads
+the label values to determine partition membership. It does NOT require
+filtered KNN (F) on the main dataset.
 
 ### Profile view paths
 

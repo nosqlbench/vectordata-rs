@@ -675,7 +675,7 @@ pub fn profile_sort_by_size(
 /// Natural comparison: splits strings into alphabetic and numeric segments,
 /// comparing numbers by value (so "label-2" < "label-10") and text
 /// lexicographically.
-fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+pub fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
     let mut ai = a.chars().peekable();
     let mut bi = b.chars().peekable();
 

@@ -157,10 +157,11 @@ struct StepCounts {
 
 /// Check execution state for a single dataset.yaml.
 fn check_execution(dataset_path: &Path) -> Result<StepCounts, Vec<String>> {
-    let config = DatasetConfig::load(dataset_path)
+    let mut config = DatasetConfig::load(dataset_path)
         .map_err(|e| vec![format!("failed to parse: {}", e)])?;
 
-    let steps = collect_steps(&config);
+    let workspace = dataset_path.parent().unwrap_or(Path::new("."));
+    let steps = veks_pipeline::pipeline::resolve_all_steps(&mut config, workspace);
     if steps.is_empty() {
         return Ok(StepCounts { total: 0, fresh: 0 });
     }

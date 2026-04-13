@@ -718,62 +718,53 @@ fn verify_f64(
     compare_results_generic(&recomputed, &queries_data, base_offset, k, phi)
 }
 
-/// Generic comparison that does not require the base reader (tie detection
-/// uses the recomputed result's distance profile).
+/// Generic comparison using the canonical knn_compare logic.
+///
+/// Delegates to `knn_compare::compare_query_ordinals` for set-based
+/// comparison with boundary swap detection.
 fn compare_results_generic(
     recomputed: &[Vec<Neighbor>],
     queries_data: &[(usize, Vec<i32>)],
     base_offset: usize,
     k: usize,
-    phi: f32,
+    _phi: f32,
 ) -> Vec<QueryVerification> {
+    use super::knn_compare;
+
     recomputed
         .iter()
         .zip(queries_data.iter())
         .map(|(true_neighbors, (qi, provided_indices))| {
-            let true_set: HashSet<u32> = true_neighbors.iter().map(|n| n.index).collect();
+            // Recomputed neighbors → i32 ordinals (these are the "expected" truth)
+            let expected_ordinals: Vec<i32> = true_neighbors.iter()
+                .map(|n| n.index as i32)
+                .collect();
 
-            let matching = provided_indices
-                .iter()
-                .filter(|&&idx| idx >= 0 && true_set.contains(&((idx as usize + base_offset) as u32)))
-                .count();
+            // Provided GT indices → i32 ordinals (offset-adjusted)
+            let computed_ordinals: Vec<i32> = provided_indices.iter()
+                .map(|&idx| {
+                    if idx < 0 { idx } else { (idx as usize + base_offset) as i32 }
+                })
+                .collect();
 
-            if matching == k {
-                return QueryVerification {
-                    query_index: *qi,
-                    status: VerifyStatus::Pass,
-                    matching_count: k,
-                    tie_adjusted_count: k,
-                    mismatched_indices: vec![],
-                };
-            }
+            let result = knn_compare::compare_query_ordinals(&computed_ordinals, &expected_ordinals);
 
-            // Check for distance ties at the k-th boundary
-            let worst_true_dist = true_neighbors
-                .last()
-                .map(|n| n.distance)
-                .unwrap_or(0.0);
+            let true_set: HashSet<i32> = expected_ordinals.iter().copied().filter(|&v| v >= 0).collect();
+            let mismatched: Vec<i32> = computed_ordinals.iter()
+                .filter(|&&idx| idx >= 0 && !true_set.contains(&idx))
+                .copied()
+                .collect();
 
-            let tie_count_at_boundary = true_neighbors
-                .iter()
-                .filter(|n| (n.distance - worst_true_dist).abs() <= phi)
-                .count();
+            let status = match &result {
+                knn_compare::QueryResult::ExactMatch | knn_compare::QueryResult::SetMatch => VerifyStatus::Pass,
+                knn_compare::QueryResult::BoundaryMismatch(_) => VerifyStatus::Tie,
+                knn_compare::QueryResult::RealMismatch(_) => VerifyStatus::Fail,
+            };
 
-            let mut tie_adjusted = matching;
-            let mut mismatched = Vec::new();
-            for &idx in provided_indices {
-                if idx >= 0 && !true_set.contains(&((idx as usize + base_offset) as u32)) {
-                    mismatched.push(idx);
-                    if tie_count_at_boundary > 1 {
-                        tie_adjusted += 1;
-                    }
-                }
-            }
-
-            let status = if tie_adjusted >= k {
-                VerifyStatus::Tie
-            } else {
-                VerifyStatus::Fail
+            let matching = k - mismatched.len();
+            let tie_adjusted = matching + match &result {
+                knn_compare::QueryResult::BoundaryMismatch(n) => *n,
+                _ => 0,
             };
 
             QueryVerification {

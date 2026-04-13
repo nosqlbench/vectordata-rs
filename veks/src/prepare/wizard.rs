@@ -327,35 +327,58 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
         parsed
     } else {
         println!("  (use +O to add oracle partitions, e.g., +MPRFO)");
-        let input = prompt_with_default(
-            "Facets to include in dataset (* for all, +X to add)",
-            &implied_facets,
-        );
-        let trimmed = input.trim();
-        let parsed = if trimmed.starts_with('+') {
-            // '+' prefix: add to inferred facets
-            let additions = crate::prepare::import::parse_facet_spec(trimmed);
-            let mut merged = implied_facets.clone();
-            for c in additions.chars() {
-                if !merged.contains(c) {
-                    merged.push(c);
+        loop {
+            let input = prompt_with_default(
+                "Facets to include in dataset (* for all, +X to add)",
+                &implied_facets,
+            );
+            let trimmed = input.trim();
+
+            // Validate: must be *, all, or valid facet codes (with optional + prefix)
+            if trimmed.is_empty() {
+                break implied_facets.clone();
+            }
+            let check = trimmed.strip_prefix('+').unwrap_or(trimmed);
+            if check != "*" && !check.eq_ignore_ascii_case("all") {
+                let invalid: Vec<char> = check.chars()
+                    .filter(|c| !"BQGDMPRFObqgdmprfo, ".contains(*c))
+                    .collect();
+                if !invalid.is_empty() {
+                    println!("  Error: unrecognized facet code(s): {:?}", invalid);
+                    println!("  Valid codes: B Q G D M P R F O (or * for all, +X to add)");
+                    continue;
+                }
+                let parsed_check = crate::prepare::import::parse_facet_spec(check);
+                if parsed_check.is_empty() {
+                    println!("  Error: no valid facet codes found in '{}'", trimmed);
+                    println!("  Valid codes: B Q G D M P R F O (or * for all, +X to add)");
+                    continue;
                 }
             }
-            println!("  → Facets: {}  (+{} added to {})", merged, additions, implied_facets);
-            merged
-        } else {
-            let parsed = crate::prepare::import::parse_facet_spec(trimmed);
-            let extra: String = parsed.chars()
-                .filter(|c| !implied_facets.contains(*c))
-                .collect();
-            if !extra.is_empty() {
-                println!("  → Facets: {}  ({}  will be generated)", parsed, extra);
-            } else if parsed != trimmed.to_uppercase() {
-                println!("  → Facets: {}", parsed);
-            }
-            parsed
-        };
-        parsed
+
+            break if trimmed.starts_with('+') {
+                let additions = crate::prepare::import::parse_facet_spec(trimmed);
+                let mut merged = implied_facets.clone();
+                for c in additions.chars() {
+                    if !merged.contains(c) {
+                        merged.push(c);
+                    }
+                }
+                println!("  → Facets: {}  (+{} added to {})", merged, additions, implied_facets);
+                merged
+            } else {
+                let parsed = crate::prepare::import::parse_facet_spec(trimmed);
+                let extra: String = parsed.chars()
+                    .filter(|c| !implied_facets.contains(*c))
+                    .collect();
+                if !extra.is_empty() {
+                    println!("  → Facets: {}  ({}  will be generated)", parsed, extra);
+                } else if parsed != trimmed.to_uppercase() {
+                    println!("  → Facets: {}", parsed);
+                }
+                parsed
+            };
+        }
     };
 
     // Parse confirmed facets into booleans for gating subsequent questions

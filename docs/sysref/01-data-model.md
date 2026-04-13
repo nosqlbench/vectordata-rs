@@ -214,6 +214,17 @@ describe a vector search benchmark:
 | **F** | Filtered KNN | uniform vec | `.ivec` + `.fvec` | KNN results after predicate filtering |
 | **O** | Oracle partitions | per-label profiles | directories | Per-label base vectors + partitioned KNN |
 
+The **O** facet carries sub-facets controlling what is computed per
+partition. Characters after `O` specify the per-partition scope
+(default `bqg` when none specified):
+
+```
+BQGDMPRFO       → main=BQGDMPRF, per-partition=BQG
+BQGDMPRFObqg    → same (explicit)
+BQGDMPRFObqgd   → per-partition also gets distances
+BQGDMPRFObqgmprf → full facets within each partition
+```
+
 ### Facet inference
 
 The pipeline infers which facets to produce from the inputs provided:
@@ -225,7 +236,7 @@ The pipeline infers which facets to produce from the inputs provided:
 | B + Q + GT | B Q G (D only if distances provided) |
 | B + Q + M | B Q G D M P R F |
 | B + Q + GT + synthesize | B Q G M P R F |
-| above + oracle partitions | B Q G M P R F O (O must be explicit) |
+| above + `+O` | B Q G M P R F O (O must be explicit, partitions get BQG) |
 
 ---
 

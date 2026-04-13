@@ -587,8 +587,8 @@ fn e2e_precomputed_gt() {
     // queries, so verify-knn will fail because the GT doesn't match the
     // actual post-shuffle query/base geometry.
     let (success, output) = run_pipeline(&out.join("dataset.yaml"));
-    assert!(!success, "pipeline should fail: pre-computed GT is stale after combined_bq");
-    assert!(output.contains("verify-knn"), "failure should be at verify-knn step");
+    // With pre-provided GT, shuffle is disabled to preserve ordinal congruency.
+    assert!(success, "pipeline should succeed with pre-provided GT (no shuffle):\n{}", output);
 }
 
 /// E2E Config 7: Pre-computed GT + distances.
@@ -616,9 +616,9 @@ fn e2e_precomputed_gt_and_distances() {
 
     veks::prepare::import::run(args);
     let (success, output) = run_pipeline(&out.join("dataset.yaml"));
-    // Same as e2e_precomputed_gt: combined_bq invalidates the pre-computed GT
-    assert!(!success, "pipeline should fail: pre-computed GT is stale after combined_bq");
-    assert!(output.contains("verify-knn"), "failure should be at verify-knn step");
+    // With pre-provided GT, shuffle is disabled to preserve ordinal congruency.
+    // The pipeline should succeed — base vectors stay in original order.
+    assert!(success, "pipeline should succeed with pre-provided GT (no shuffle):\n{}", output);
 }
 
 /// E2E Config 8: Normalize vectors during extraction.

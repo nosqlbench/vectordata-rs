@@ -1056,8 +1056,8 @@ fn dag_finalize_partitioning() {
     assert_eq!(first.id, "generate-dataset-json",
         "first finalize step should be generate-dataset-json, got {}", first.id);
     let last = &finalize_dag.steps[finalize_dag.steps.len() - 1];
-    assert_eq!(last.id, "generate-catalog",
-        "last finalize step should be generate-catalog, got {}", last.id);
+    assert_eq!(last.id, "generate-merkle",
+        "last finalize step should be generate-merkle, got {}", last.id);
 }
 
 /// Verify that when per-profile steps are expanded (as in Phase 2/3),

@@ -634,81 +634,80 @@ fn verify_heaps_against_gt(
         expected_set.sort();
         expected_set.truncate(k);
 
-        if computed_set == expected_set {
-            pass += 1;
-        } else {
-            let query_idx = if si < sample_indices.len() { sample_indices[si] } else { si };
-            let only_in_computed: Vec<u32> = computed_set.iter()
-                .filter(|idx| !expected_set.contains(idx))
-                .copied().collect();
-            let only_in_expected: Vec<u32> = expected_set.iter()
-                .filter(|idx| !computed_set.contains(idx))
-                .copied().collect();
+        // Use canonical comparison logic
+        {
+            use super::knn_compare;
 
-            // Check if ALL differences are at the k-th boundary distance (tie-breaking).
-            // If so, count as pass — the vectors are at identical distances and the
-            // difference is just which duplicate gets picked.
-            let boundary_dist = computed_sorted.last().map(|n| n.distance).unwrap_or(0.0);
-            let all_at_boundary = only_in_computed.iter().all(|idx| {
-                computed_sorted.iter()
-                    .find(|n| n.index == *idx)
-                    .map(|n| (n.distance - boundary_dist).abs() < boundary_dist.abs() * 1e-6)
-                    .unwrap_or(false)
-            });
+            let computed_ordinals: Vec<i32> = computed_sorted.iter()
+                .map(|n| n.index as i32)
+                .collect();
+            let expected_ordinals: Vec<i32> = expected_set.iter()
+                .map(|&idx| idx as i32)
+                .collect();
 
-            if all_at_boundary && !only_in_computed.is_empty() {
+            let result = knn_compare::compare_query_ordinals(&computed_ordinals, &expected_ordinals);
+
+            if result.is_acceptable() {
                 pass += 1;
-                if pass <= 3 {
-                    ui.log(&format!(
-                        "    tie-break query {} (sample #{}): {} neighbors differ at boundary dist={:.2} (both correct)",
-                        query_idx, si, only_in_computed.len(), boundary_dist,
-                    ));
+                if let knn_compare::QueryResult::BoundaryMismatch(n) = &result {
+                    if pass <= 3 {
+                        let query_idx = if si < sample_indices.len() { sample_indices[si] } else { si };
+                        ui.log(&format!(
+                            "    tie-break query {} (sample #{}): {} boundary swaps (acceptable)",
+                            query_idx, si, n,
+                        ));
+                    }
                 }
             } else {
                 fail += 1;
-            }
-
-            if !all_at_boundary {
+                let query_idx = if si < sample_indices.len() { sample_indices[si] } else { si };
+                let only_in_computed: Vec<u32> = computed_set.iter()
+                    .filter(|idx| !expected_set.contains(idx))
+                    .copied().collect();
+                let only_in_expected: Vec<u32> = expected_set.iter()
+                    .filter(|idx| !computed_set.contains(idx))
+                    .copied().collect();
                 ui.log(&format!(
                     "    MISMATCH query {} (sample #{}): {} of {} neighbors differ",
                     query_idx, si, only_in_computed.len(), k,
                 ));
 
-            if let Some(last) = computed_sorted.last() {
-                let boundary_dist = last.distance;
-                let near_boundary: Vec<&Neighbor> = computed_sorted.iter()
-                    .filter(|n| (n.distance - boundary_dist).abs() < boundary_dist.abs() * 1e-6)
-                    .collect();
-                ui.log(&format!(
-                    "      boundary distance: {:.8}, {} neighbors at this distance",
-                    boundary_dist, near_boundary.len(),
-                ));
-                for n in &near_boundary {
-                    let in_gt = expected_set.contains(&n.index);
+                if let Some(last) = computed_sorted.last() {
+                    let boundary_dist = last.distance;
+                    let epsilon = boundary_dist.abs() * 1e-6_f32;
+                    let near_boundary: Vec<&Neighbor> = computed_sorted.iter()
+                        .filter(|n| (n.distance - boundary_dist).abs() < epsilon)
+                        .collect();
                     ui.log(&format!(
-                        "        idx={} dist={:.8} {}",
-                        n.index, n.distance,
-                        if in_gt { "in GT" } else { "NOT in GT" },
+                        "      boundary distance: {:.8}, {} neighbors at this distance",
+                        boundary_dist, near_boundary.len(),
+                    ));
+                    for n in &near_boundary {
+                        let in_gt = expected_set.contains(&n.index);
+                        ui.log(&format!(
+                            "        idx={} dist={:.8} {}",
+                            n.index, n.distance,
+                            if in_gt { "in GT" } else { "NOT in GT" },
+                        ));
+                    }
+                }
+                for &idx in &only_in_computed {
+                    if let Some(n) = computed_sorted.iter().find(|n| n.index == idx) {
+                        ui.log(&format!(
+                            "      computed-only: idx={} dist={:.10} (rank {})",
+                            idx, n.distance,
+                            computed_sorted.iter().position(|x| x.index == idx).unwrap_or(999),
+                        ));
+                    }
+                }
+                for &idx in &only_in_expected {
+                    ui.log(&format!(
+                        "      expected-only: idx={} (GT rank {})",
+                        idx,
+                        gt[si].iter().position(|&x| x == idx as i32).unwrap_or(999),
                     ));
                 }
             }
-            for &idx in &only_in_computed {
-                if let Some(n) = computed_sorted.iter().find(|n| n.index == idx) {
-                    ui.log(&format!(
-                        "      computed-only: idx={} dist={:.10} (rank {})",
-                        idx, n.distance,
-                        computed_sorted.iter().position(|x| x.index == idx).unwrap_or(999),
-                    ));
-                }
-            }
-            for &idx in &only_in_expected {
-                ui.log(&format!(
-                    "      expected-only: idx={} (GT rank {})",
-                    idx,
-                    gt[si].iter().position(|&x| x == idx as i32).unwrap_or(999),
-                ));
-            }
-            } // end if !all_at_boundary
         }
     }
 

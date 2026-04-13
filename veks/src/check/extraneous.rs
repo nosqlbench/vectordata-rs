@@ -87,6 +87,29 @@ pub fn check(
             }
         }
 
+        // Account for partition profile artifacts that are produced by
+        // Phase 3 re-expansion (per_profile steps for partition profiles).
+        // These aren't in the initial step resolution but ARE legitimate
+        // pipeline outputs.
+        for (name, _profile) in &config.profiles.profiles {
+            if name == "default" { continue; }
+            let profile_dir = format!("profiles/{}", name);
+            let profile_path = workspace.join(&profile_dir);
+            if profile_path.is_dir() {
+                if let Ok(entries) = std::fs::read_dir(&profile_path) {
+                    for entry in entries.flatten() {
+                        let fname = entry.file_name().to_string_lossy().to_string();
+                        // Skip IDXFOR files (handled separately below)
+                        if fname.starts_with("IDXFOR__") { continue; }
+                        accounted.insert(format!("{}/{}", profile_dir, fname));
+                    }
+                }
+            }
+        }
+
+        // knn_entries.yaml is produced by catalog generate
+        accounted.insert("knn_entries.yaml".to_string());
+
         // Check each publishable file under this workspace
         for file in publishable {
             if !file.starts_with(workspace) {

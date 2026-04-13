@@ -353,9 +353,21 @@ impl DatasetConfig {
                 out.push_str(&format!("  sized: [{}]\n", entries.join(", ")));
             }
 
-            // Materialized profiles (skip those generated from sized: entries —
-            // they'll be re-generated from the raw_sized entries on reload)
-            for name in self.profiles.profile_names() {
+            // Materialized profiles in canonical order: default first, then
+            // natural alphabetical. This is deterministic regardless of
+            // base_count values (which may change between runs).
+            // Skip profiles generated from sized: entries — they'll be
+            // re-generated from the raw_sized entries on reload.
+            let mut save_names: Vec<&str> = self.profiles.profiles.keys()
+                .map(|k| k.as_str()).collect();
+            save_names.sort_by(|a, b| {
+                match (a == &"default", b == &"default") {
+                    (true, false) => std::cmp::Ordering::Less,
+                    (false, true) => std::cmp::Ordering::Greater,
+                    _ => crate::dataset::profile::natural_cmp(a, b),
+                }
+            });
+            for name in save_names {
                 if self.profiles.sized_profile_names.contains(&name.to_string()) {
                     continue;
                 }
