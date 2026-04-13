@@ -621,6 +621,32 @@ The prebuffer command:
 4. Stores the data in `<cache_dir>/<dataset_name>/`
 5. Skips facets that are already fully cached
 
+### Progress tracking during prebuffer
+
+The `prebuffer_with_progress` API provides real-time download tracking
+via `DownloadProgress` — a thread-safe atomic counter struct:
+
+```rust
+use vectordata::cache::CachedDataset;
+use vectordata::transport::DownloadProgress;
+
+let cached = CachedDataset::open("https://example.com/dataset/")?;
+cached.prebuffer_with_progress(|progress: &DownloadProgress| {
+    let pct = if progress.total_bytes() > 0 {
+        100.0 * progress.downloaded_bytes() as f64 / progress.total_bytes() as f64
+    } else { 0.0 };
+    eprintln!("{:.1}% ({}/{} chunks)",
+        pct, progress.completed_chunks(), progress.total_chunks());
+});
+```
+
+`DownloadProgress` fields:
+- `total_bytes()` / `downloaded_bytes()` — byte-level progress
+- `total_chunks()` / `completed_chunks()` — chunk-level progress
+- `fraction()` — convenience `0.0..1.0` ratio
+- `is_failed()` — true if any chunk failed permanently
+- `is_complete()` — true when all chunks are downloaded
+
 ### Listing cached datasets
 
 ```bash
