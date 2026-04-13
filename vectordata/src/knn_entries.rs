@@ -102,6 +102,7 @@ impl KnnEntries {
             profiles.insert(profile_name, ProfileConfig {
                 maxk: None,
                 base_count: None,
+                partition: false,
                 base_vectors: Some(FacetConfig::Simple(entry.base.clone())),
                 base_content: None,
                 query_vectors: Some(FacetConfig::Simple(entry.query.clone())),

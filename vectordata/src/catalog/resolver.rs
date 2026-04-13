@@ -91,6 +91,38 @@ impl Catalog {
         }
     }
 
+    /// Open a dataset by name, returning a `TestDataGroup` ready for
+    /// facet access.
+    ///
+    /// This is the primary entry point for consumers: name → data.
+    /// No URL construction needed — the catalog resolves the location.
+    ///
+    /// ```rust,ignore
+    /// let catalog = Catalog::of(&CatalogSources::new().configure_default());
+    /// let group = catalog.open("my-dataset")?;
+    /// let view = group.profile("default").unwrap();
+    /// let base = view.base_vectors()?;
+    /// ```
+    pub fn open(&self, name: &str) -> crate::Result<crate::TestDataGroup> {
+        let entry = self.find_exact(name)
+            .ok_or_else(|| crate::Error::Other(format!("dataset '{}' not found in catalog", name)))?;
+        crate::TestDataGroup::load(&entry.path)
+    }
+
+    /// Open a specific profile of a dataset by name, returning the view
+    /// directly.
+    ///
+    /// ```rust,ignore
+    /// let catalog = Catalog::of(&CatalogSources::new().configure_default());
+    /// let view = catalog.open_profile("my-dataset", "default")?;
+    /// let base = view.base_vectors()?;
+    /// ```
+    pub fn open_profile(&self, name: &str, profile: &str) -> crate::Result<std::sync::Arc<dyn crate::view::TestDataView>> {
+        let group = self.open(name)?;
+        group.profile(profile)
+            .ok_or_else(|| crate::Error::Other(format!("profile '{}' not found in dataset '{}'", profile, name)))
+    }
+
     /// Print all datasets to stderr, highlighting any that contain the
     /// search term as a substring.
     pub fn list_datasets(&self, search: &str) {

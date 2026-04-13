@@ -1834,3 +1834,94 @@ _defaults:
     assert!(p.neighbor_indices.is_some());
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// API discovery: profile names, facet manifest, generic facet access
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn api_discover_profiles_and_facets_local() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    create_format_coverage_dataset(dir);
+
+    let group = TestDataGroup::load(dir.to_str().unwrap()).unwrap();
+
+    // Discover profile names
+    let names = group.profile_names();
+    assert!(names.contains(&"default".to_string()), "should have default profile");
+
+    // Discover facets on a profile
+    let view = group.profile("default").unwrap();
+    let manifest = view.facet_manifest();
+    assert!(manifest.contains_key("base_vectors"),
+        "manifest should contain base_vectors: {:?}", manifest.keys().collect::<Vec<_>>());
+    assert!(manifest.contains_key("query_vectors"));
+    assert!(manifest.contains_key("neighbor_indices"));
+
+    // FacetDescriptor gives source info
+    let base_desc = &manifest["base_vectors"];
+    assert_eq!(base_desc.source_type.as_deref(), Some("fvec"));
+    assert!(base_desc.is_standard());
+
+    // Generic facet access by name
+    let base = view.facet("base_vectors").unwrap();
+    assert_eq!(base.count(), 50);
+    assert_eq!(base.dim(), 4);
+}
+
+#[test]
+fn api_discover_profiles_and_facets_http() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    create_format_coverage_dataset(dir);
+
+    let server = TestServer::start(dir).unwrap();
+    let group = TestDataGroup::load(&server.base_url()).unwrap();
+
+    // Profile discovery over HTTP
+    let names = group.profile_names();
+    assert!(names.contains(&"default".to_string()));
+
+    // Facet discovery over HTTP
+    let view = group.profile("default").unwrap();
+    let manifest = view.facet_manifest();
+    assert!(manifest.contains_key("base_vectors"));
+    assert!(manifest.contains_key("neighbor_indices"));
+
+    // Generic facet access over HTTP
+    let base = view.facet("base_vectors").unwrap();
+    assert_eq!(base.count(), 50);
+}
+
+#[test]
+fn api_facet_manifest_excludes_absent_facets() {
+    // A dataset with only BQG should not list metadata facets
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+
+    write_fvec_data(&dir.join("base.fvec"), 4, 20);
+    write_fvec_data(&dir.join("query.fvec"), 4, 5);
+    write_ivec_data(&dir.join("gt.ivec"), 3, 5);
+
+    let yaml = r#"name: minimal
+profiles:
+  default:
+    base_vectors: base.fvec
+    query_vectors: query.fvec
+    neighbor_indices: gt.ivec
+"#;
+    std::fs::write(dir.join("dataset.yaml"), yaml).unwrap();
+
+    let group = TestDataGroup::load(dir.to_str().unwrap()).unwrap();
+    let view = group.profile("default").unwrap();
+    let manifest = view.facet_manifest();
+
+    assert!(manifest.contains_key("base_vectors"));
+    assert!(manifest.contains_key("query_vectors"));
+    assert!(manifest.contains_key("neighbor_indices"));
+    assert!(!manifest.contains_key("metadata_content"),
+        "minimal dataset should not have metadata_content");
+    assert!(!manifest.contains_key("filtered_neighbor_indices"),
+        "minimal dataset should not have filtered facets");
+}
+

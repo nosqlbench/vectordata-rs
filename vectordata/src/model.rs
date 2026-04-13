@@ -51,6 +51,11 @@ pub struct ProfileConfig {
     /// Maximum k for KNN queries in this profile.
     pub maxk: Option<u32>,
 
+    /// When true, this is an oracle partition profile with independent
+    /// base vectors (not a windowed subset of the default profile).
+    #[serde(default)]
+    pub partition: bool,
+
     // -- Vector facets --
 
     /// Configuration for the base (database) vectors.

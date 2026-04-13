@@ -159,16 +159,15 @@ impl Serialize for DSProfile {
         let mut len = self.views.len();
         if self.maxk.is_some() { len += 1; }
         if self.base_count.is_some() { len += 1; }
-        if self.partition { len += 1; }
+        // partition is NOT serialized inside the profile body — it's
+        // listed in the top-level partition_profiles key instead, so
+        // external clients don't see unknown keys among facet entries.
         let mut map = serializer.serialize_map(Some(len))?;
         if let Some(maxk) = self.maxk {
             map.serialize_entry("maxk", &maxk)?;
         }
         if let Some(base_count) = self.base_count {
             map.serialize_entry("base_count", &base_count)?;
-        }
-        if self.partition {
-            map.serialize_entry("partition", &true)?;
         }
         for (key, view) in &self.views {
             map.serialize_entry(key, view)?;
@@ -1101,27 +1100,34 @@ impl<'de> Deserialize<'de> for DSProfileGroup {
             let child: DSProfile =
                 serde_yaml::from_value(value.clone()).map_err(de::Error::custom)?;
 
-            // Inherit from default — but NOT for partition profiles.
-            // Partition profiles have independent data and must not
-            // inherit metadata, filtered KNN, or other views from default.
-            let merged = if child.partition {
-                // Partition: inherit only maxk, keep own views
+            // Inherit views from default only if the child doesn't declare
+            // its own base_vectors. Profiles with their own base_vectors are
+            // self-contained (partition profiles, externally provided data)
+            // and should NOT inherit metadata, filtered KNN, etc.
+            // Self-contained: profile has base_vectors in its own directory
+            // (e.g., profiles/label-0/base_vectors.fvec). Sized profiles that
+            // reference the default's file with a window are NOT self-contained.
+            let own_dir = format!("profiles/{}/", name);
+            let is_self_contained = name != "default" && child.views.get("base_vectors")
+                .map(|v| v.source.path.starts_with(&own_dir))
+                .unwrap_or(false);
+            let merged = if is_self_contained {
+                // Self-contained: inherit only maxk
                 DSProfile {
                     maxk: child.maxk.or(default_profile.as_ref().and_then(|dp| dp.maxk)),
                     base_count: child.base_count,
-                    partition: true,
+                    partition: is_self_contained,
                     views: child.views,
                 }
             } else if let Some(ref dp) = default_profile {
                 let mut merged_views = dp.views.clone();
-                // Overlay child views on top of default
                 for (k, v) in child.views {
                     merged_views.insert(k, v);
                 }
                 DSProfile {
                     maxk: child.maxk.or(dp.maxk),
                     base_count: child.base_count,
-                    partition: false,
+                    partition: child.partition,
                     views: merged_views,
                 }
             } else {

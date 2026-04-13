@@ -138,6 +138,9 @@ pub struct DatasetConfig {
 
 impl DatasetConfig {
     /// Load a `DatasetConfig` from a YAML file on disk.
+    ///
+    /// After deserialization, applies the `partition_profiles` list to
+    /// set `partition: true` on the named profiles.
     pub fn load(path: &Path) -> Result<Self, String> {
         let content = std::fs::read_to_string(path)
             .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
@@ -380,9 +383,8 @@ impl DatasetConfig {
                 if let Some(base_count) = profile.base_count {
                     out.push_str(&format!("    base_count: {}\n", base_count));
                 }
-                if profile.partition {
-                    out.push_str("    partition: true\n");
-                }
+                // partition is derived structurally (non-default + has own
+                // base_vectors) — not stored in the YAML.
                 for (key, view) in &profile.views {
                     if view.window.is_none()
                         && view.source.namespace.is_none()
@@ -766,9 +768,22 @@ profiles:
         let saved = std::fs::read_to_string(tmp.path()).unwrap();
         let reloaded: DatasetConfig = serde_yaml::from_str(&saved).unwrap();
 
+        // partition: true must NOT appear in dataset.yaml or dataset.json
+        assert!(!saved.contains("partition: true"),
+            "partition should not be in saved YAML:\n{}", saved);
+        let json = serde_json::to_string_pretty(&config).unwrap();
+        assert!(!json.contains("\"partition\""),
+            "partition should not be in JSON:\n{}", json);
+
+        // Round-trip: partition is derived structurally (has own base_vectors)
+        let reloaded = DatasetConfig::load(tmp.path()).unwrap();
         assert!(reloaded.profile("label-0").is_some());
         assert_eq!(reloaded.profile("label-0").unwrap().base_count, Some(100));
+        let label0 = reloaded.profiles.profiles.get("label-0").unwrap();
+        assert!(label0.partition, "partition should be derived from base_vectors path");
         assert!(reloaded.profile("default").is_some());
+        let default = reloaded.profiles.profiles.get("default").unwrap();
+        assert!(!default.partition, "default should not be partition");
     }
 
     #[test]

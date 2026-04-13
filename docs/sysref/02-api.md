@@ -13,10 +13,52 @@ Add the dependency:
 
 ```toml
 [dependencies]
-vectordata = "0.17"
+vectordata = "0.18"
 ```
 
-Open and read vectors:
+### Find and use a dataset by name
+
+The primary access path: catalog → dataset → profile → facet → vectors.
+No URLs or paths — just names:
+
+```rust
+use vectordata::catalog::sources::CatalogSources;
+use vectordata::catalog::resolver::Catalog;
+
+// Load configured catalogs (~/.config/vectordata/catalogs.yaml)
+let catalog = Catalog::of(&CatalogSources::new().configure_default());
+
+// Open a dataset by name → get vectors in two calls
+let group = catalog.open("my-dataset")?;
+let view = group.profile("default").unwrap();
+let base = view.base_vectors()?;
+println!("{} vectors, dim={}", base.count(), base.dim());
+let v: Vec<f32> = base.get(42)?;
+
+// Or even shorter — open a profile directly
+let view = catalog.open_profile("my-dataset", "default")?;
+let gt = view.neighbor_indices()?;
+```
+
+### Discover available profiles and facets
+
+```rust
+// List profiles
+let group = catalog.open("my-dataset")?;
+for name in group.profile_names() {
+    let view = group.profile(&name).unwrap();
+
+    // List facets on this profile
+    let manifest = view.facet_manifest();
+    for (facet_name, desc) in &manifest {
+        println!("  {} ({})", facet_name, desc.source_type.as_deref().unwrap_or("?"));
+    }
+}
+```
+
+### Open raw vector files directly
+
+For low-level access without catalogs:
 
 ```rust
 use vectordata::io::{open_vec, open_vvec, VectorReader, VvecReader};
