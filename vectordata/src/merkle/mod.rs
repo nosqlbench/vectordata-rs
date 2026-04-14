@@ -366,4 +366,74 @@ mod tests {
         assert_eq!(shape.parent(4), 1);
         assert_eq!(shape.parent(1), 0);
     }
+
+    #[test]
+    fn test_shape_power_of_two_8_chunks() {
+        let shape = MerkleShape::for_content(1024, 8192); // 8 * 1024
+        assert_eq!(shape.total_chunks, 8);
+        assert_eq!(shape.cap_leaf, 8);
+        assert_eq!(shape.leaf_count, 8);
+        assert_eq!(shape.internal_node_count, 7);
+        assert_eq!(shape.node_count, 15);
+        assert_eq!(shape.offset, 7);
+    }
+
+    #[test]
+    fn test_shape_power_of_two_16_chunks() {
+        let shape = MerkleShape::for_content(256, 4096); // 16 * 256
+        assert_eq!(shape.total_chunks, 16);
+        assert_eq!(shape.cap_leaf, 16);
+        assert_eq!(shape.leaf_count, 16);
+        assert_eq!(shape.internal_node_count, 15);
+        assert_eq!(shape.node_count, 31);
+        assert_eq!(shape.offset, 15);
+    }
+
+    #[test]
+    fn test_shape_chunk_size_larger_than_content() {
+        let shape = MerkleShape::for_content(4096, 100);
+        assert_eq!(shape.total_chunks, 1);
+        assert_eq!(shape.cap_leaf, 1);
+        assert_eq!(shape.leaf_count, 1);
+        assert_eq!(shape.internal_node_count, 0);
+        assert_eq!(shape.node_count, 1);
+        assert_eq!(shape.offset, 0);
+        assert_eq!(shape.chunk_start(0), 0);
+        assert_eq!(shape.chunk_len(0), 100);
+    }
+
+    #[test]
+    fn test_chunk_start_and_len_all_chunks() {
+        // 7 chunks of 100 bytes each + partial last chunk (total = 750)
+        let shape = MerkleShape::for_content(100, 750);
+        assert_eq!(shape.total_chunks, 8); // ceil(750/100)
+
+        // Verify every chunk's start and length
+        let mut total_covered = 0u64;
+        for i in 0..shape.total_chunks {
+            let start = shape.chunk_start(i);
+            let len = shape.chunk_len(i);
+            assert_eq!(start, i as u64 * 100);
+            if i < shape.total_chunks - 1 {
+                assert_eq!(len, 100, "chunk {} should be full size", i);
+            } else {
+                // Last chunk: 750 - 700 = 50
+                assert_eq!(len, 50, "last chunk should be remainder");
+            }
+            total_covered += len;
+        }
+        assert_eq!(total_covered, 750);
+    }
+
+    #[test]
+    fn test_chunk_start_and_len_exact_division() {
+        // Content divides evenly into chunks
+        let shape = MerkleShape::for_content(256, 1024);
+        assert_eq!(shape.total_chunks, 4);
+
+        for i in 0..shape.total_chunks {
+            assert_eq!(shape.chunk_start(i), i as u64 * 256);
+            assert_eq!(shape.chunk_len(i), 256);
+        }
+    }
 }

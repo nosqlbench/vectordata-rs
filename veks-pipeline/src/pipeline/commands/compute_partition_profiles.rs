@@ -142,12 +142,16 @@ templates (compute-knn, verify-knn) for the new partition profiles.
             "  {} unique labels → {} partition profiles (limit: {})",
             partitions.len(), partitions.len(), max_partitions));
 
+        // Compute digit padding width from the max label value
+        let max_label = partitions.keys().last().copied().unwrap_or(0);
+        let pad_width = if max_label == 0 { 1 } else { (max_label as f64).log10().floor() as usize + 1 };
+
         let pb = ctx.ui.bar(partitions.len() as u64, "extracting partitions");
         let mut profiles_created = 0u32;
         let mut profile_names: Vec<(String, usize)> = Vec::new(); // (name, base_count)
 
         for (&label, ordinals) in &partitions {
-            let profile_name = format!("{}-{}", prefix, label);
+            let profile_name = format!("{}_{:0>width$}", prefix, label, width = pad_width);
             let profile_dir = ctx.workspace.join("profiles").join(&profile_name);
             let _ = std::fs::create_dir_all(&profile_dir);
 

@@ -405,7 +405,10 @@ impl DSProfileGroup {
         let template_outputs: Vec<(String, String)> = templates
             .iter()
             .filter(|s| s.per_profile)
-            .filter_map(|s| s.output_path().map(|p| (p, s.run.clone())))
+            .flat_map(|s| {
+                let cmd = s.run.clone();
+                s.output_paths().into_iter().map(move |p| (p, cmd.clone()))
+            })
             .filter(|(p, _)| !p.contains("${cache}") && !p.contains("${profile_name}"))
             .map(|(p, cmd)| {
                 let cleaned = p.strip_prefix("${profile_dir}")
@@ -694,7 +697,7 @@ pub fn profile_sort_by_size(
 }
 
 /// Natural comparison: splits strings into alphabetic and numeric segments,
-/// comparing numbers by value (so "label-2" < "label-10") and text
+/// comparing numbers by value (so "label_2" < "label_10") and text
 /// lexicographically.
 pub fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
     let mut ai = a.chars().peekable();
@@ -1105,7 +1108,7 @@ impl<'de> Deserialize<'de> for DSProfileGroup {
             // self-contained (partition profiles, externally provided data)
             // and should NOT inherit metadata, filtered KNN, etc.
             // Self-contained: profile has base_vectors in its own directory
-            // (e.g., profiles/label-0/base_vectors.fvec). Sized profiles that
+            // (e.g., profiles/label_0/base_vectors.fvec). Sized profiles that
             // reference the default's file with a window are NOT self-contained.
             let own_dir = format!("profiles/{}/", name);
             let is_self_contained = name != "default" && child.views.get("base_vectors")
@@ -1877,11 +1880,11 @@ custom-queries:
     fn test_natural_sort_partition_profiles() {
         // Verify that partition profiles sort in natural numeric order,
         // not lexicographic ASCII order.
-        assert_eq!(super::natural_cmp("label-0", "label-1"), std::cmp::Ordering::Less);
-        assert_eq!(super::natural_cmp("label-2", "label-10"), std::cmp::Ordering::Less);
-        assert_eq!(super::natural_cmp("label-9", "label-10"), std::cmp::Ordering::Less);
-        assert_eq!(super::natural_cmp("label-10", "label-10"), std::cmp::Ordering::Equal);
-        assert_eq!(super::natural_cmp("label-100", "label-20"), std::cmp::Ordering::Greater);
+        assert_eq!(super::natural_cmp("label_0", "label_1"), std::cmp::Ordering::Less);
+        assert_eq!(super::natural_cmp("label_2", "label_10"), std::cmp::Ordering::Less);
+        assert_eq!(super::natural_cmp("label_9", "label_10"), std::cmp::Ordering::Less);
+        assert_eq!(super::natural_cmp("label_10", "label_10"), std::cmp::Ordering::Equal);
+        assert_eq!(super::natural_cmp("label_100", "label_20"), std::cmp::Ordering::Greater);
         assert_eq!(super::natural_cmp("abc", "def"), std::cmp::Ordering::Less);
         assert_eq!(super::natural_cmp("a1b", "a2b"), std::cmp::Ordering::Less);
         assert_eq!(super::natural_cmp("a10b", "a2b"), std::cmp::Ordering::Greater);
@@ -1893,27 +1896,27 @@ custom-queries:
         let yaml = r#"
 default:
   base_vectors: base.fvec
-label-0:
+label_00:
   base_count: 100
-  base_vectors: profiles/label-0/base_vectors.fvec
-label-1:
+  base_vectors: profiles/label_00/base_vectors.fvec
+label_01:
   base_count: 100
-  base_vectors: profiles/label-1/base_vectors.fvec
-label-10:
+  base_vectors: profiles/label_01/base_vectors.fvec
+label_10:
   base_count: 100
-  base_vectors: profiles/label-10/base_vectors.fvec
-label-2:
+  base_vectors: profiles/label_10/base_vectors.fvec
+label_02:
   base_count: 100
-  base_vectors: profiles/label-2/base_vectors.fvec
-label-9:
+  base_vectors: profiles/label_02/base_vectors.fvec
+label_09:
   base_count: 100
-  base_vectors: profiles/label-9/base_vectors.fvec
+  base_vectors: profiles/label_09/base_vectors.fvec
 "#;
         let g: DSProfileGroup = serde_yaml::from_str(yaml).unwrap();
         let names = g.profile_names();
-        // default first, then label-0, 1, 2, 9, 10 in natural order
+        // default first, then label_00, 01, 02, 09, 10 in natural order
         // (all have same base_count, so tiebreak is by natural name sort)
-        assert_eq!(names, vec!["default", "label-0", "label-1", "label-2", "label-9", "label-10"],
+        assert_eq!(names, vec!["default", "label_00", "label_01", "label_02", "label_09", "label_10"],
             "profile names should be in natural numeric order: {:?}", names);
     }
 }

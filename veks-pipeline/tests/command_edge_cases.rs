@@ -2052,18 +2052,18 @@ fn partition_profiles_u8_metadata() {
 
     // Should have created 4 partition directories
     for i in 0..4 {
-        let pdir = ws.join(format!("profiles/label-{}", i));
-        assert!(pdir.exists(), "partition dir label-{} should exist", i);
+        let pdir = ws.join(format!("profiles/label_{}", i));
+        assert!(pdir.exists(), "partition dir label_{} should exist", i);
         assert!(pdir.join("base_vectors.fvec").exists(),
-            "label-{}/base_vectors.fvec should exist", i);
+            "label_{}/base_vectors.fvec should exist", i);
     }
 
     // Each partition should have 5 vectors (20 / 4)
-    let data = std::fs::read(ws.join("profiles/label-0/base_vectors.fvec")).unwrap();
+    let data = std::fs::read(ws.join("profiles/label_0/base_vectors.fvec")).unwrap();
     let dim = i32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
     let stride = 4 + dim * 4;
     let count = data.len() / stride;
-    assert_eq!(count, 5, "label-0 should have 5 vectors");
+    assert_eq!(count, 5, "label_0 should have 5 vectors");
 
     // Check partition_count variable
     assert_eq!(ctx.defaults.get("partition_count").map(|s| s.as_str()), Some("4"));
@@ -2125,18 +2125,18 @@ fn partition_profiles_slab_metadata() {
 
     // Should have created 3 partition directories
     for i in 0..3 {
-        let pdir = ws.join(format!("profiles/label-{}", i));
-        assert!(pdir.exists(), "partition dir label-{} should exist", i);
+        let pdir = ws.join(format!("profiles/label_{}", i));
+        assert!(pdir.exists(), "partition dir label_{} should exist", i);
         assert!(pdir.join("base_vectors.fvec").exists(),
-            "label-{}/base_vectors.fvec should exist", i);
+            "label_{}/base_vectors.fvec should exist", i);
     }
 
     // Each partition should have 10 vectors (30 / 3)
-    let data = std::fs::read(ws.join("profiles/label-0/base_vectors.fvec")).unwrap();
+    let data = std::fs::read(ws.join("profiles/label_0/base_vectors.fvec")).unwrap();
     let dim = i32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
     let stride = 4 + dim * 4;
     let count = data.len() / stride;
-    assert_eq!(count, 10, "label-0 should have 10 vectors");
+    assert_eq!(count, 10, "label_0 should have 10 vectors");
 
     assert_eq!(ctx.defaults.get("partition_count").map(|s| s.as_str()), Some("3"));
 }

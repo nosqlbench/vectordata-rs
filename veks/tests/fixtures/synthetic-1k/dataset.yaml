@@ -253,51 +253,51 @@ profiles:
     metadata_indices: profiles/default/metadata_indices.ivvec
     filtered_neighbor_indices: profiles/default/filtered_neighbor_indices.ivec
     filtered_neighbor_distances: profiles/default/filtered_neighbor_distances.fvec
-  label-0:
+  label_00:
     base_count: 80
-    base_vectors: profiles/label-0/base_vectors.fvec
-    query_vectors: profiles/label-0/query_vectors.fvec
-  label-1:
+    base_vectors: profiles/label_00/base_vectors.fvec
+    query_vectors: profiles/label_00/query_vectors.fvec
+  label_01:
     base_count: 77
-    base_vectors: profiles/label-1/base_vectors.fvec
-    query_vectors: profiles/label-1/query_vectors.fvec
-  label-2:
+    base_vectors: profiles/label_01/base_vectors.fvec
+    query_vectors: profiles/label_01/query_vectors.fvec
+  label_02:
     base_count: 80
-    base_vectors: profiles/label-2/base_vectors.fvec
-    query_vectors: profiles/label-2/query_vectors.fvec
-  label-3:
+    base_vectors: profiles/label_02/base_vectors.fvec
+    query_vectors: profiles/label_02/query_vectors.fvec
+  label_03:
     base_count: 94
-    base_vectors: profiles/label-3/base_vectors.fvec
-    query_vectors: profiles/label-3/query_vectors.fvec
-  label-4:
+    base_vectors: profiles/label_03/base_vectors.fvec
+    query_vectors: profiles/label_03/query_vectors.fvec
+  label_04:
     base_count: 87
-    base_vectors: profiles/label-4/base_vectors.fvec
-    query_vectors: profiles/label-4/query_vectors.fvec
-  label-5:
+    base_vectors: profiles/label_04/base_vectors.fvec
+    query_vectors: profiles/label_04/query_vectors.fvec
+  label_05:
     base_count: 73
-    base_vectors: profiles/label-5/base_vectors.fvec
-    query_vectors: profiles/label-5/query_vectors.fvec
-  label-6:
+    base_vectors: profiles/label_05/base_vectors.fvec
+    query_vectors: profiles/label_05/query_vectors.fvec
+  label_06:
     base_count: 92
-    base_vectors: profiles/label-6/base_vectors.fvec
-    query_vectors: profiles/label-6/query_vectors.fvec
-  label-7:
+    base_vectors: profiles/label_06/base_vectors.fvec
+    query_vectors: profiles/label_06/query_vectors.fvec
+  label_07:
     base_count: 84
-    base_vectors: profiles/label-7/base_vectors.fvec
-    query_vectors: profiles/label-7/query_vectors.fvec
-  label-8:
+    base_vectors: profiles/label_07/base_vectors.fvec
+    query_vectors: profiles/label_07/query_vectors.fvec
+  label_08:
     base_count: 77
-    base_vectors: profiles/label-8/base_vectors.fvec
-    query_vectors: profiles/label-8/query_vectors.fvec
-  label-9:
+    base_vectors: profiles/label_08/base_vectors.fvec
+    query_vectors: profiles/label_08/query_vectors.fvec
+  label_09:
     base_count: 81
-    base_vectors: profiles/label-9/base_vectors.fvec
-    query_vectors: profiles/label-9/query_vectors.fvec
-  label-10:
+    base_vectors: profiles/label_09/base_vectors.fvec
+    query_vectors: profiles/label_09/query_vectors.fvec
+  label_10:
     base_count: 85
-    base_vectors: profiles/label-10/base_vectors.fvec
-    query_vectors: profiles/label-10/query_vectors.fvec
-  label-11:
+    base_vectors: profiles/label_10/base_vectors.fvec
+    query_vectors: profiles/label_10/query_vectors.fvec
+  label_11:
     base_count: 90
-    base_vectors: profiles/label-11/base_vectors.fvec
-    query_vectors: profiles/label-11/query_vectors.fvec
+    base_vectors: profiles/label_11/base_vectors.fvec
+    query_vectors: profiles/label_11/query_vectors.fvec

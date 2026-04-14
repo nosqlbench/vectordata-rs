@@ -313,8 +313,23 @@ macro_rules! impl_openable {
                 Ok(Box::new(reader))
             }
             fn open_remote(url: Url) -> Result<Box<dyn VectorReader<Self>>, IoError> {
-                let reader = HttpVectorReader::<$t>::open_xvec_generic(url, <$t as VvecElement>::ELEM_SIZE)?;
-                Ok(Box::new(reader))
+                // Try cache-backed reader first (downloads + caches with merkle verification).
+                // Falls back to direct HTTP if no .mref exists for this file.
+                let cache_root = crate::cache::reader::default_cache_dir();
+                match crate::cache::reader::CachedVectorReader::<$t>::open(
+                    url.clone(), <$t as VvecElement>::ELEM_SIZE, &cache_root,
+                ) {
+                    Ok(reader) => {
+                        log::debug!("opened cached reader for {}", url);
+                        Ok(Box::new(reader))
+                    }
+                    Err(_) => {
+                        // No .mref available — fall back to direct HTTP Range requests
+                        log::debug!("no .mref for {}, using direct HTTP", url);
+                        let reader = HttpVectorReader::<$t>::open_xvec_generic(url, <$t as VvecElement>::ELEM_SIZE)?;
+                        Ok(Box::new(reader))
+                    }
+                }
             }
         }
     };

@@ -265,4 +265,138 @@ mod tests {
         // Other chunks still valid
         assert!(mref.verify_chunk(1, &data[1024..2048]));
     }
+
+    #[test]
+    fn test_single_byte_content() {
+        let data = [0x42u8];
+        let mref = MerkleRef::from_content(&data, 4096);
+
+        assert_eq!(mref.shape().total_chunks, 1);
+        assert_eq!(mref.shape().chunk_size, 4096);
+        assert_eq!(mref.shape().total_content_size, 1);
+        // Single chunk tree: 1 node (leaf is root)
+        assert_eq!(mref.shape().node_count, 1);
+        assert!(mref.verify_chunk(0, &data));
+        assert!(!mref.verify_chunk(0, &[0x43u8]));
+    }
+
+    #[test]
+    fn test_content_exactly_one_chunk() {
+        let data = vec![0xABu8; 4096];
+        let mref = MerkleRef::from_content(&data, 4096);
+
+        assert_eq!(mref.shape().total_chunks, 1);
+        assert_eq!(mref.shape().total_content_size, 4096);
+        assert_eq!(mref.shape().node_count, 1);
+        assert!(mref.verify_chunk(0, &data));
+    }
+
+    #[test]
+    fn test_content_exactly_two_chunks() {
+        let chunk_size = 4096usize;
+        let data = vec![0xCDu8; chunk_size * 2];
+        let mref = MerkleRef::from_content(&data, chunk_size as u64);
+
+        assert_eq!(mref.shape().total_chunks, 2);
+        assert_eq!(mref.shape().total_content_size, (chunk_size * 2) as u64);
+        // 2 leaves → cap_leaf=2, internal=1, total=3
+        assert_eq!(mref.shape().node_count, 3);
+        assert!(mref.verify_chunk(0, &data[..chunk_size]));
+        assert!(mref.verify_chunk(1, &data[chunk_size..]));
+    }
+
+    #[test]
+    fn test_content_chunk_size_minus_one() {
+        let chunk_size = 4096usize;
+        let data = vec![0xEFu8; chunk_size - 1];
+        let mref = MerkleRef::from_content(&data, chunk_size as u64);
+
+        assert_eq!(mref.shape().total_chunks, 1);
+        assert_eq!(mref.shape().total_content_size, (chunk_size - 1) as u64);
+        assert_eq!(mref.shape().chunk_len(0), (chunk_size - 1) as u64);
+        assert!(mref.verify_chunk(0, &data));
+    }
+
+    #[test]
+    fn test_content_chunk_size_plus_one() {
+        let chunk_size = 4096usize;
+        let data = vec![0x99u8; chunk_size + 1];
+        let mref = MerkleRef::from_content(&data, chunk_size as u64);
+
+        assert_eq!(mref.shape().total_chunks, 2);
+        assert_eq!(mref.shape().chunk_len(0), chunk_size as u64);
+        assert_eq!(mref.shape().chunk_len(1), 1); // tiny second chunk
+        assert!(mref.verify_chunk(0, &data[..chunk_size]));
+        assert!(mref.verify_chunk(1, &data[chunk_size..]));
+        // Second chunk is just one byte
+        assert_eq!(data[chunk_size..].len(), 1);
+    }
+
+    #[test]
+    fn test_flipping_any_single_byte_detected() {
+        // Use 3 chunks of 64 bytes to keep the test fast
+        let chunk_size = 64usize;
+        let data: Vec<u8> = (0..192).map(|i| (i & 0xFF) as u8).collect();
+        let mref = MerkleRef::from_content(&data, chunk_size as u64);
+
+        assert_eq!(mref.shape().total_chunks, 3);
+
+        // For each chunk, flip every single byte position and confirm detection
+        for chunk_idx in 0..3u32 {
+            let start = chunk_idx as usize * chunk_size;
+            let len = mref.shape().chunk_len(chunk_idx) as usize;
+            let original = &data[start..start + len];
+            assert!(mref.verify_chunk(chunk_idx, original));
+
+            for byte_pos in 0..len {
+                let mut corrupted = original.to_vec();
+                corrupted[byte_pos] ^= 0x01; // flip lowest bit
+                assert!(
+                    !mref.verify_chunk(chunk_idx, &corrupted),
+                    "flipping byte {} in chunk {} was not detected",
+                    byte_pos,
+                    chunk_idx
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_verify_first_and_last_chunk_independently() {
+        let chunk_size = 128usize;
+        // 5 chunks: 4 full + 1 partial (total = 128*4 + 50 = 562)
+        let data: Vec<u8> = (0..562).map(|i| (i % 251) as u8).collect();
+        let mref = MerkleRef::from_content(&data, chunk_size as u64);
+
+        assert_eq!(mref.shape().total_chunks, 5);
+
+        // Verify chunk 0 independently
+        assert!(mref.verify_chunk(0, &data[0..128]));
+        assert!(!mref.verify_chunk(0, &data[128..256])); // wrong data
+
+        // Verify last chunk independently
+        let last = mref.shape().total_chunks - 1;
+        let last_start = mref.shape().chunk_start(last) as usize;
+        let last_len = mref.shape().chunk_len(last) as usize;
+        assert!(mref.verify_chunk(last, &data[last_start..last_start + last_len]));
+
+        // Corrupt last chunk
+        let mut bad_last = data[last_start..last_start + last_len].to_vec();
+        bad_last[0] ^= 0xFF;
+        assert!(!mref.verify_chunk(last, &bad_last));
+    }
+
+    #[test]
+    fn test_round_trip_single_byte() {
+        // Ensure save/load works for the degenerate single-byte case
+        let data = [0x01u8];
+        let mref = MerkleRef::from_content(&data, 4096);
+
+        let bytes = mref.to_bytes();
+        let loaded = MerkleRef::from_bytes(&bytes).unwrap();
+
+        assert_eq!(mref.shape(), loaded.shape());
+        assert_eq!(mref.root_hash(), loaded.root_hash());
+        assert!(loaded.verify_chunk(0, &data));
+    }
 }

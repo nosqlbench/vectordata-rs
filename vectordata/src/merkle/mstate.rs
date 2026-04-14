@@ -388,4 +388,115 @@ mod tests {
         assert!(loaded.is_valid(65));
         assert!(!loaded.is_valid(64));
     }
+
+    #[test]
+    fn test_corrupt_mrkl_truncated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("corrupt_trunc.mrkl");
+
+        // Write a file that is too short to contain even a footer
+        fs::write(&path, &[0u8; 10]).unwrap();
+        let result = MerkleState::load(&path);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_corrupt_mrkl_random_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("corrupt_rand.mrkl");
+
+        // Write random-ish bytes that are footer-sized but invalid
+        let garbage: Vec<u8> = (0..200).map(|i| (i * 37 + 13) as u8).collect();
+        fs::write(&path, &garbage).unwrap();
+        let result = MerkleState::load(&path);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_corrupt_mrkl_valid_footer_wrong_size() {
+        // Create a valid state, save it, then truncate the file
+        let data = vec![0u8; 4096];
+        let mref = MerkleRef::from_content(&data, 1024);
+        let state = MerkleState::from_ref(&mref);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("corrupt_trunc2.mrkl");
+        state.save(&path).unwrap();
+
+        // Read the file, chop off some bytes from the middle
+        let mut file_data = fs::read(&path).unwrap();
+        file_data.truncate(file_data.len() / 2);
+        fs::write(&path, &file_data).unwrap();
+
+        let result = MerkleState::load(&path);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_single_chunk_mark_complete() {
+        let data = vec![0xFFu8; 100];
+        let mref = MerkleRef::from_content(&data, 4096);
+        let mut state = MerkleState::from_ref(&mref);
+
+        assert_eq!(state.shape().total_chunks, 1);
+        assert!(!state.is_complete());
+        assert_eq!(state.valid_count(), 0);
+
+        state.mark_valid(0);
+        assert!(state.is_valid(0));
+        assert!(state.is_complete());
+        assert_eq!(state.valid_count(), 1);
+    }
+
+    #[test]
+    fn test_1000_chunks_all_valid() {
+        let chunk_size = 64usize;
+        let data = vec![0u8; chunk_size * 1000];
+        let mref = MerkleRef::from_content(&data, chunk_size as u64);
+        let mut state = MerkleState::from_ref(&mref);
+
+        assert_eq!(state.shape().total_chunks, 1000);
+        assert!(!state.is_complete());
+
+        for i in 0..1000u32 {
+            state.mark_valid(i);
+        }
+
+        assert!(state.is_complete());
+        assert_eq!(state.valid_count(), 1000);
+    }
+
+    #[test]
+    fn test_round_trip_large_bitset() {
+        // 1000 chunks exercises multi-word bitset (16 u64 words)
+        let chunk_size = 64usize;
+        let data = vec![0u8; chunk_size * 1000];
+        let mref = MerkleRef::from_content(&data, chunk_size as u64);
+        let mut state = MerkleState::from_ref(&mref);
+
+        // Mark a scattered pattern of valid chunks
+        for i in (0..1000u32).step_by(3) {
+            state.mark_valid(i);
+        }
+
+        let expected_count = state.valid_count();
+        assert!(expected_count > 300);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large_bitset.mrkl");
+        state.save(&path).unwrap();
+
+        let loaded = MerkleState::load(&path).unwrap();
+        assert_eq!(loaded.valid_count(), expected_count);
+
+        // Verify exact bitset equality
+        for i in 0..1000u32 {
+            assert_eq!(
+                loaded.is_valid(i),
+                state.is_valid(i),
+                "mismatch at chunk {}",
+                i
+            );
+        }
+    }
 }

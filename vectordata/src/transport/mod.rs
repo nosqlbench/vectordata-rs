@@ -7,7 +7,7 @@
 //! remote sources, with retry logic, connection pooling, and parallel download
 //! support. It is used by the cache layer to download merkle-verified chunks.
 
-mod http;
+pub mod http;
 mod progress;
 mod retry;
 

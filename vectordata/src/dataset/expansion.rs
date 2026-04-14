@@ -116,7 +116,7 @@ pub fn expand_per_profile_steps_scoped(
     let mut result = regular;
 
     // Collect all profiles to expand: natural name order, then default last.
-    // Natural order ensures label-0, label-1, ..., label-9, label-10
+    // Natural order ensures label_0, label_1, ..., label_9, label_10
     // (not ASCII order or size order which is arbitrary for partitions).
     let mut non_default: Vec<(&str, Option<u64>)> = profiles.profiles.iter()
         .filter(|(name, _)| name.as_str() != "default")

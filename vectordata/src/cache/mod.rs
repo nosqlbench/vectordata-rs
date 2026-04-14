@@ -14,6 +14,8 @@
 //! On restart, loading the state file resumes from the last checkpoint — only
 //! unverified chunks are re-downloaded.
 
+pub mod reader;
+
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -432,3 +434,145 @@ impl CachedChannel {
 // The Mutexes ensure thread safety.
 unsafe impl Send for CachedChannel {}
 unsafe impl Sync for CachedChannel {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::merkle::MerkleRef;
+    use crate::transport::ChunkedTransport;
+
+    /// In-memory transport for testing cached channel behavior.
+    struct MemoryTransport {
+        data: Vec<u8>,
+    }
+
+    impl MemoryTransport {
+        fn new(data: Vec<u8>) -> Self {
+            MemoryTransport { data }
+        }
+    }
+
+    impl ChunkedTransport for MemoryTransport {
+        fn fetch_range(&self, start: u64, len: u64) -> io::Result<Vec<u8>> {
+            let s = start as usize;
+            let e = s + len as usize;
+            if e > self.data.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!("range [{}, {}) exceeds content length {}", s, e, self.data.len()),
+                ));
+            }
+            Ok(self.data[s..e].to_vec())
+        }
+
+        fn content_length(&self) -> io::Result<u64> {
+            Ok(self.data.len() as u64)
+        }
+
+        fn supports_range(&self) -> bool {
+            true
+        }
+    }
+
+    /// Create test data, merkle ref, and a CachedChannel in a temp dir.
+    fn setup_cached_channel(
+        data: &[u8],
+        chunk_size: u64,
+    ) -> (tempfile::TempDir, CachedChannel) {
+        let dir = tempfile::tempdir().unwrap();
+        let mref = MerkleRef::from_content(data, chunk_size);
+        let transport = Box::new(MemoryTransport::new(data.to_vec()));
+        let channel = CachedChannel::open(transport, mref, dir.path(), "test.dat").unwrap();
+        (dir, channel)
+    }
+
+    #[test]
+    fn test_mref_content_size_mismatch_detected() {
+        // Build a merkle ref for 1024 bytes of content, but provide a transport
+        // that only has 512 bytes. When we try to read beyond the transport's
+        // content, the fetch should fail.
+        let real_data = vec![0xABu8; 512];
+        let fake_data = vec![0xABu8; 1024];
+        let mref = MerkleRef::from_content(&fake_data, 256);
+
+        let dir = tempfile::tempdir().unwrap();
+        let transport = Box::new(MemoryTransport::new(real_data));
+        let channel = CachedChannel::open(transport, mref, dir.path(), "mismatch.dat").unwrap();
+
+        // Reading from chunk 2 (offset 512) should fail because the transport
+        // only has 512 bytes
+        let result = channel.read(512, 256);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_download_resume_with_partial_cache() {
+        let chunk_size = 256u64;
+        let data: Vec<u8> = (0..1024).map(|i| (i % 251) as u8).collect();
+        let mref = MerkleRef::from_content(&data, chunk_size);
+
+        let dir = tempfile::tempdir().unwrap();
+
+        // Phase 1: open channel, download first two chunks, then drop
+        {
+            let transport = Box::new(MemoryTransport::new(data.clone()));
+            let channel = CachedChannel::open(
+                transport, mref.clone(), dir.path(), "resume.dat",
+            ).unwrap();
+
+            // Read from the first two chunks to trigger download
+            let chunk0 = channel.read(0, 256).unwrap();
+            assert_eq!(&chunk0, &data[0..256]);
+            let chunk1 = channel.read(256, 256).unwrap();
+            assert_eq!(&chunk1, &data[256..512]);
+
+            assert_eq!(channel.valid_count(), 2);
+            assert!(!channel.is_complete());
+        }
+        // channel is dropped, state is persisted
+
+        // Phase 2: reopen — should resume from checkpoint
+        {
+            let transport = Box::new(MemoryTransport::new(data.clone()));
+            let channel = CachedChannel::open(
+                transport, mref.clone(), dir.path(), "resume.dat",
+            ).unwrap();
+
+            // Should already have 2 valid chunks from the previous session
+            assert_eq!(channel.valid_count(), 2);
+
+            // Read remaining chunks
+            let chunk2 = channel.read(512, 256).unwrap();
+            assert_eq!(&chunk2, &data[512..768]);
+            let chunk3 = channel.read(768, 256).unwrap();
+            assert_eq!(&chunk3, &data[768..1024]);
+
+            assert!(channel.is_complete());
+        }
+    }
+
+    #[test]
+    fn test_basic_read_through() {
+        let data: Vec<u8> = (0..2048).map(|i| (i % 256) as u8).collect();
+        let (_dir, channel) = setup_cached_channel(&data, 512);
+
+        // Read that spans two chunks
+        let result = channel.read(400, 300).unwrap();
+        assert_eq!(&result, &data[400..700]);
+        assert!(channel.valid_count() >= 2);
+    }
+
+    #[test]
+    fn test_full_prebuffer() {
+        let data: Vec<u8> = (0..4096).map(|i| (i % 256) as u8).collect();
+        let (_dir, channel) = setup_cached_channel(&data, 1024);
+
+        assert!(!channel.is_complete());
+        channel.prebuffer().unwrap();
+        assert!(channel.is_complete());
+
+        // Verify all data is correct
+        let all = channel.read(0, 4096).unwrap();
+        assert_eq!(&all, &data);
+    }
+}

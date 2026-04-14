@@ -1710,7 +1710,7 @@ fn e2e_partition_profiles_full_pipeline() {
     // Collect partition profile names
     let partition_names: Vec<&str> = config.profile_names()
         .into_iter()
-        .filter(|n| n.starts_with("label-"))
+        .filter(|n| n.starts_with("label_"))
         .collect();
     assert_eq!(partition_names.len(), partition_count,
         "partition_names count ({}) should match partition_count ({})",
@@ -1751,7 +1751,7 @@ fn e2e_partition_profiles_full_pipeline() {
 
 /// E2E test: partition profile configuration is correct in the synthetic-1k fixture.
 ///
-/// The synthetic-1k fixture has partition profiles (label-0 through label-11)
+/// The synthetic-1k fixture has partition profiles (label_00 through label_11)
 /// already built by a previous pipeline run. This test verifies the config
 /// model: profiles exist with correct views, base_count, and natural ordering.
 #[test]
@@ -1766,7 +1766,7 @@ fn e2e_partition_profile_config() {
     // Collect partition profile names
     let partition_names: Vec<&str> = config.profile_names()
         .into_iter()
-        .filter(|n| n.starts_with("label-"))
+        .filter(|n| n.starts_with("label_"))
         .collect();
     assert!(!partition_names.is_empty(),
         "synthetic-1k should have partition profiles");
