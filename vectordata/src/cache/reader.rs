@@ -28,8 +28,30 @@ use crate::transport::http::HttpTransport;
 
 use super::CachedChannel;
 
-/// Default cache directory: `~/.cache/vectordata/`
+/// Resolve the configured cache directory.
+///
+/// Checks `~/.config/vectordata/settings.yaml` for a `cache_dir` setting.
+/// Falls back to `~/.cache/vectordata/` if not configured.
 pub fn default_cache_dir() -> PathBuf {
+    // Check settings.yaml
+    let settings_path = if let Some(home) = std::env::var_os("HOME") {
+        PathBuf::from(home).join(".config/vectordata/settings.yaml")
+    } else {
+        PathBuf::from(".config/vectordata/settings.yaml")
+    };
+    if let Ok(content) = std::fs::read_to_string(&settings_path) {
+        for line in content.lines() {
+            let line = line.trim();
+            if let Some(val) = line.strip_prefix("cache_dir:") {
+                let val = val.trim().trim_matches('"').trim_matches('\'');
+                if !val.is_empty() {
+                    return PathBuf::from(val);
+                }
+            }
+        }
+    }
+
+    // Fallback
     if let Some(home) = std::env::var_os("HOME") {
         PathBuf::from(home).join(".cache").join("vectordata")
     } else {

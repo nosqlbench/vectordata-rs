@@ -287,19 +287,20 @@ impl GenericTestDataView {
         &self,
         name: &str,
     ) -> std::result::Result<crate::typed_access::TypedReader<T>, crate::typed_access::TypedAccessError> {
-        let path = self.resolve_facet_path(name)
-            .map_err(|e| crate::typed_access::TypedAccessError::Io(e.to_string()))?;
-        crate::typed_access::TypedReader::<T>::open(&path)
-    }
-
-    /// Resolve a facet name to a filesystem path.
-    fn resolve_facet_path(&self, name: &str) -> Result<PathBuf> {
         let facet = self.facet_config_by_name(name)
-            .ok_or_else(|| Error::MissingFacet(name.to_string()))?;
-        match self.resolve_resource(facet)? {
-            ResourceLocation::FileSystem(path) => Ok(path),
-            ResourceLocation::Http(_) => Err(Error::Other(
-                format!("typed access not supported for HTTP facets ({})", name))),
+            .ok_or_else(|| crate::typed_access::TypedAccessError::Io(
+                format!("facet '{}' not found", name)))?;
+        let resource = self.resolve_resource(facet)
+            .map_err(|e| crate::typed_access::TypedAccessError::Io(e.to_string()))?;
+        match resource {
+            ResourceLocation::FileSystem(path) => {
+                crate::typed_access::TypedReader::<T>::open(&path)
+            }
+            ResourceLocation::Http(url) => {
+                let native_type = crate::typed_access::ElementType::from_url(&url)
+                    .map_err(|e| crate::typed_access::TypedAccessError::Io(e))?;
+                crate::typed_access::TypedReader::<T>::open_url(url, native_type)
+            }
         }
     }
 }
@@ -384,9 +385,12 @@ impl TestDataView for GenericTestDataView {
     }
 
     fn facet_element_type(&self, name: &str) -> Result<crate::typed_access::ElementType> {
-        let path = self.resolve_facet_path(name)?;
-        crate::typed_access::ElementType::from_path(&path)
-            .map_err(Error::Other)
+        let facet = self.facet_config_by_name(name)
+            .ok_or_else(|| Error::MissingFacet(name.to_string()))?;
+        let source = facet.source();
+        crate::typed_access::ElementType::from_extension(
+            source.rsplit('.').next().unwrap_or("")
+        ).ok_or_else(|| Error::Other(format!("unknown element type for facet '{name}'")))
     }
 
     fn base_count(&self) -> Option<u64> {

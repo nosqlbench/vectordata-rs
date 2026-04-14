@@ -2373,3 +2373,226 @@ fn cached_http_fallback_when_no_mref() {
     assert_eq!(base.dim(), 4);
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// TypedReader over HTTP — full chain from catalog to typed ordinal access
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn typed_reader_open_url_ivec() {
+    use vectordata::typed_access::{ElementType, TypedReader};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write_ivec_data(&dir.join("gt.ivec"), 5, 20);
+
+    let server = TestServer::start(dir).unwrap();
+    let url = url::Url::parse(&format!("{}/gt.ivec", server.base_url().trim_end_matches('/'))).unwrap();
+
+    let reader = TypedReader::<i32>::open_url(url, ElementType::I32).unwrap();
+    assert_eq!(reader.count(), 20);
+    assert_eq!(reader.dim(), 5);
+
+    let val = reader.get_value(0).unwrap();
+    assert!(val >= 0);
+
+    let record = reader.get_record(0).unwrap();
+    assert_eq!(record.len(), 5);
+}
+
+#[test]
+fn typed_reader_open_url_scalar_u8() {
+    use vectordata::typed_access::{ElementType, TypedReader};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write_scalar(&dir.join("labels.u8"), 100, 1);
+
+    let server = TestServer::start(dir).unwrap();
+    let url = url::Url::parse(&format!("{}/labels.u8", server.base_url().trim_end_matches('/'))).unwrap();
+
+    let reader = TypedReader::<u8>::open_url(url, ElementType::U8).unwrap();
+    assert_eq!(reader.count(), 100);
+    assert_eq!(reader.dim(), 1);
+    assert!(reader.is_native());
+
+    let val = reader.get_value(0).unwrap();
+    assert_eq!(val, 0_u8); // first value is 0 % 256
+
+    // get_native falls back to get_value for HTTP
+    let native_val = reader.get_native(0);
+    assert_eq!(native_val, 0_u8);
+}
+
+#[test]
+fn typed_reader_open_url_widening() {
+    use vectordata::typed_access::{ElementType, TypedReader};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write_scalar(&dir.join("labels.u8"), 50, 1);
+
+    let server = TestServer::start(dir).unwrap();
+    let url = url::Url::parse(&format!("{}/labels.u8", server.base_url().trim_end_matches('/'))).unwrap();
+
+    // Open u8 file as i32 (widening)
+    let reader = TypedReader::<i32>::open_url(url, ElementType::U8).unwrap();
+    assert_eq!(reader.count(), 50);
+    assert!(!reader.is_native());
+
+    let val = reader.get_value(0).unwrap();
+    assert_eq!(val, 0_i32);
+}
+
+#[test]
+fn typed_reader_open_url_narrowing_rejected() {
+    use vectordata::typed_access::{ElementType, TypedReader};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write_scalar(&dir.join("values.i32"), 10, 4);
+
+    let server = TestServer::start(dir).unwrap();
+    let url = url::Url::parse(&format!("{}/values.i32", server.base_url().trim_end_matches('/'))).unwrap();
+
+    // Opening i32 as u8 should fail (narrowing)
+    let result = TypedReader::<u8>::open_url(url, ElementType::I32);
+    assert!(result.is_err());
+}
+
+#[test]
+fn typed_reader_open_auto_dispatches() {
+    use vectordata::typed_access::{ElementType, TypedReader};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write_scalar(&dir.join("data.u8"), 20, 1);
+
+    // Local path
+    let reader = TypedReader::<u8>::open_auto(
+        dir.join("data.u8").to_str().unwrap(), ElementType::U8,
+    ).unwrap();
+    assert_eq!(reader.count(), 20);
+    assert!(reader.is_native());
+
+    // HTTP URL
+    let server = TestServer::start(dir).unwrap();
+    let url = format!("{}/data.u8", server.base_url().trim_end_matches('/'));
+    let reader = TypedReader::<u8>::open_auto(&url, ElementType::U8).unwrap();
+    assert_eq!(reader.count(), 20);
+}
+
+#[test]
+fn typed_reader_via_profile_over_http() {
+    use vectordata::typed_access::TypedReader;
+    use vectordata::view::GenericTestDataView;
+    use vectordata::group::DataSource;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+
+    write_ivec_data(&dir.join("gt.ivec"), 5, 30);
+    write_scalar(&dir.join("meta.u8"), 30, 1);
+
+    let yaml = r#"name: typed-http-test
+profiles:
+  default:
+    neighbor_indices: gt.ivec
+    metadata_content: meta.u8
+"#;
+    std::fs::write(dir.join("dataset.yaml"), yaml).unwrap();
+
+    let config: vectordata::model::DatasetConfig =
+        serde_yaml::from_str(yaml).unwrap();
+    let default_cfg = config.profiles.get("default").unwrap();
+
+    let server = TestServer::start(dir).unwrap();
+    let base_url = url::Url::parse(&server.base_url()).unwrap();
+    let view = GenericTestDataView::new(
+        DataSource::Http(base_url),
+        default_cfg.clone(),
+    );
+
+    // open_facet_typed for neighbor_indices (i32) over HTTP
+    let r_idx: TypedReader<i32> = view.open_facet_typed("neighbor_indices").unwrap();
+    assert_eq!(r_idx.count(), 30);
+    assert_eq!(r_idx.dim(), 5);
+    assert!(r_idx.is_native());
+    let val = r_idx.get_value(0).unwrap();
+    assert!(val >= 0);
+
+    // open_facet_typed for metadata_content (u8) over HTTP
+    let r_meta: TypedReader<u8> = view.open_facet_typed("metadata_content").unwrap();
+    assert_eq!(r_meta.count(), 30);
+    assert!(r_meta.is_native());
+
+    // Widened access: u8 metadata as i32 over HTTP
+    let r_wide: TypedReader<i32> = view.open_facet_typed("metadata_content").unwrap();
+    assert_eq!(r_wide.count(), 30);
+    assert!(!r_wide.is_native());
+    let val_i32 = r_wide.get_value(0).unwrap();
+    assert_eq!(val_i32, 0_i32);
+}
+
+#[test]
+fn typed_reader_element_type_from_url() {
+    use vectordata::typed_access::ElementType;
+
+    let url = url::Url::parse("https://example.com/data/base.fvec").unwrap();
+    assert_eq!(ElementType::from_url(&url).unwrap(), ElementType::F32);
+
+    let url = url::Url::parse("https://example.com/meta.u8").unwrap();
+    assert_eq!(ElementType::from_url(&url).unwrap(), ElementType::U8);
+
+    let url = url::Url::parse("https://example.com/indices.ivec").unwrap();
+    assert_eq!(ElementType::from_url(&url).unwrap(), ElementType::I32);
+}
+
+#[test]
+fn typed_reader_get_native_slice_returns_none_for_http() {
+    use vectordata::typed_access::{ElementType, TypedReader};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write_scalar(&dir.join("labels.u8"), 20, 1);
+
+    let server = TestServer::start(dir).unwrap();
+    let url = url::Url::parse(&format!("{}/labels.u8", server.base_url().trim_end_matches('/'))).unwrap();
+
+    let reader = TypedReader::<u8>::open_url(url, ElementType::U8).unwrap();
+
+    // get_native_slice returns None for HTTP (can't return reference)
+    assert!(reader.get_native_slice(0).is_none());
+
+    // But get_record works (returns owned Vec)
+    let record = reader.get_record(0).unwrap();
+    assert_eq!(record.len(), 1);
+}
+
+#[test]
+fn typed_reader_data_matches_local_and_http() {
+    use vectordata::typed_access::{ElementType, TypedReader};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write_scalar(&dir.join("data.u8"), 25, 1);
+
+    let server = TestServer::start(dir).unwrap();
+
+    // Local reader
+    let local = TypedReader::<u8>::open(dir.join("data.u8")).unwrap();
+
+    // HTTP reader
+    let url = url::Url::parse(&format!("{}/data.u8", server.base_url().trim_end_matches('/'))).unwrap();
+    let remote = TypedReader::<u8>::open_url(url, ElementType::U8).unwrap();
+
+    assert_eq!(local.count(), remote.count());
+    assert_eq!(local.dim(), remote.dim());
+
+    // Compare every record
+    for i in 0..25 {
+        let local_val = local.get_value(i).unwrap();
+        let remote_val = remote.get_value(i).unwrap();
+        assert_eq!(local_val, remote_val, "value {} should match", i);
+    }
+}
+

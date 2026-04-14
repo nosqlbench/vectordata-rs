@@ -56,6 +56,15 @@ impl ElementType {
             .ok_or_else(|| format!("unknown extension '.{}': {}", ext, path.display()))
     }
 
+    /// Detect from a URL path extension.
+    pub fn from_url(url: &url::Url) -> Result<Self, String> {
+        let path = url.path();
+        let ext = path.rsplit('.').next()
+            .ok_or_else(|| format!("no extension in URL: {url}"))?;
+        Self::from_extension(ext)
+            .ok_or_else(|| format!("unknown extension '.{ext}' in URL: {url}"))
+    }
+
     /// Detect from a bare extension string.
     pub fn from_extension(ext: &str) -> Option<Self> {
         match ext.to_lowercase().as_str() {
@@ -206,10 +215,11 @@ fn read_native_value(data: &[u8], native: ElementType) -> i128 {
 
 /// A typed reader for vector or scalar data files.
 ///
-/// Opens a file and provides access as type T, with runtime validation
+/// Opens local files via mmap or remote files via HTTP range requests.
+/// Provides ordinal-based access as type T, with runtime validation
 /// that T is wide enough to hold the native values.
 pub struct TypedReader<T: TypedElement> {
-    data: memmap2::Mmap,
+    backend: TypedBackend,
     native_type: ElementType,
     native_width: usize,
     is_scalar: bool,
@@ -218,8 +228,51 @@ pub struct TypedReader<T: TypedElement> {
     _phantom: std::marker::PhantomData<T>,
 }
 
+enum TypedBackend {
+    Mmap(memmap2::Mmap),
+    Http {
+        client: reqwest::blocking::Client,
+        url: url::Url,
+        total_size: u64,
+    },
+}
+
+impl TypedBackend {
+    fn read_bytes(&self, offset: usize, len: usize) -> Result<Vec<u8>, TypedAccessError> {
+        match self {
+            TypedBackend::Mmap(mmap) => {
+                if offset + len > mmap.len() {
+                    return Err(TypedAccessError::Io(
+                        format!("read past end: offset={offset} len={len} size={}", mmap.len())));
+                }
+                Ok(mmap[offset..offset + len].to_vec())
+            }
+            TypedBackend::Http { client, url, .. } => {
+                use reqwest::header::RANGE;
+                let end = offset + len - 1;
+                let resp = client.get(url.clone())
+                    .header(RANGE, format!("bytes={offset}-{end}"))
+                    .send()
+                    .map_err(|e| TypedAccessError::Io(format!("HTTP range request: {e}")))?
+                    .error_for_status()
+                    .map_err(|e| TypedAccessError::Io(format!("HTTP error: {e}")))?;
+                Ok(resp.bytes()
+                    .map_err(|e| TypedAccessError::Io(format!("HTTP read: {e}")))?
+                    .to_vec())
+            }
+        }
+    }
+
+    fn mmap_slice(&self, offset: usize, len: usize) -> Option<&[u8]> {
+        match self {
+            TypedBackend::Mmap(mmap) => Some(&mmap[offset..offset + len]),
+            TypedBackend::Http { .. } => None,
+        }
+    }
+}
+
 impl<T: TypedElement> TypedReader<T> {
-    /// Open a file for typed reading.
+    /// Open a local file for typed reading.
     ///
     /// Fails immediately if T is narrower than the native element type.
     /// Same-width cross-sign is allowed (checked per-value on access).
@@ -247,7 +300,6 @@ impl<T: TypedElement> TypedReader<T> {
             let count = mmap.len() / native_width;
             (1, count)
         } else {
-            // xvec: read dim from first record header
             if mmap.len() < 4 {
                 (1, 0)
             } else {
@@ -259,7 +311,7 @@ impl<T: TypedElement> TypedReader<T> {
         };
 
         Ok(TypedReader {
-            data: mmap,
+            backend: TypedBackend::Mmap(mmap),
             native_type,
             native_width,
             is_scalar,
@@ -267,6 +319,88 @@ impl<T: TypedElement> TypedReader<T> {
             count,
             _phantom: std::marker::PhantomData,
         })
+    }
+
+    /// Open a remote file for typed reading via HTTP range requests.
+    ///
+    /// Reads the file header to determine dimension and count,
+    /// then provides ordinal-based access via range requests.
+    pub fn open_url(url: url::Url, native_type: ElementType) -> Result<Self, TypedAccessError> {
+        if T::width() < native_type.byte_width() {
+            return Err(TypedAccessError::Narrowing {
+                native: native_type,
+                target: T::type_name(),
+            });
+        }
+
+        let client = reqwest::blocking::Client::new();
+        let native_width = native_type.byte_width();
+
+        // Get total file size
+        let resp = client.head(url.clone())
+            .send()
+            .map_err(|e| TypedAccessError::Io(format!("HTTP HEAD: {e}")))?
+            .error_for_status()
+            .map_err(|e| TypedAccessError::Io(format!("HTTP HEAD error: {e}")))?;
+        let total_size: u64 = resp.headers()
+            .get(reqwest::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse().ok())
+            .ok_or_else(|| TypedAccessError::Io("Missing Content-Length".into()))?;
+
+        // Determine if scalar by URL extension
+        let is_scalar = url.path().ends_with(".u8")
+            || url.path().ends_with(".i8")
+            || url.path().ends_with(".u16")
+            || url.path().ends_with(".i16")
+            || url.path().ends_with(".u32")
+            || url.path().ends_with(".i32")
+            || url.path().ends_with(".u64")
+            || url.path().ends_with(".i64")
+            || url.path().ends_with(".f32")
+            || url.path().ends_with(".f64");
+
+        let (dim, count) = if is_scalar {
+            (1, (total_size / native_width as u64) as usize)
+        } else {
+            // Read first 4 bytes for dim header
+            use reqwest::header::RANGE;
+            let resp = client.get(url.clone())
+                .header(RANGE, "bytes=0-3")
+                .send()
+                .map_err(|e| TypedAccessError::Io(format!("HTTP range: {e}")))?;
+            let bytes = resp.bytes()
+                .map_err(|e| TypedAccessError::Io(format!("HTTP read: {e}")))?;
+            if bytes.len() < 4 {
+                (1, 0)
+            } else {
+                let dim = i32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+                let record_bytes = 4 + dim * native_width;
+                let count = if record_bytes > 0 { (total_size / record_bytes as u64) as usize } else { 0 };
+                (dim, count)
+            }
+        };
+
+        Ok(TypedReader {
+            backend: TypedBackend::Http { client, url, total_size },
+            native_type,
+            native_width,
+            is_scalar,
+            dim,
+            count,
+            _phantom: std::marker::PhantomData,
+        })
+    }
+
+    /// Open from a path-or-URL string, dispatching automatically.
+    pub fn open_auto(path_or_url: &str, native_type: ElementType) -> Result<Self, TypedAccessError> {
+        if path_or_url.starts_with("http://") || path_or_url.starts_with("https://") {
+            let url = url::Url::parse(path_or_url)
+                .map_err(|e| TypedAccessError::Io(format!("invalid URL: {e}")))?;
+            Self::open_url(url, native_type)
+        } else {
+            Self::open(path_or_url)
+        }
     }
 
     /// The native element type of the underlying file.
@@ -295,9 +429,10 @@ impl<T: TypedElement> TypedReader<T> {
             ordinal * self.native_width
         } else {
             let record_bytes = 4 + self.dim * self.native_width;
-            ordinal * record_bytes + 4 // skip dim header
+            ordinal * record_bytes + 4
         };
-        let val = read_native_value(&self.data[offset..], self.native_type);
+        let bytes = self.backend.read_bytes(offset, self.native_width)?;
+        let val = read_native_value(&bytes, self.native_type);
         T::from_i128(val).ok_or_else(|| TypedAccessError::ValueOverflow {
             ordinal,
             value: val,
@@ -320,10 +455,12 @@ impl<T: TypedElement> TypedReader<T> {
             let record_bytes = 4 + self.dim * self.native_width;
             ordinal * record_bytes + 4
         };
+        let total_bytes = self.dim * self.native_width;
+        let bytes = self.backend.read_bytes(offset, total_bytes)?;
         let mut result = Vec::with_capacity(self.dim);
         for d in 0..self.dim {
-            let elem_offset = offset + d * self.native_width;
-            let val = read_native_value(&self.data[elem_offset..], self.native_type);
+            let elem_offset = d * self.native_width;
+            let val = read_native_value(&bytes[elem_offset..], self.native_type);
             result.push(T::from_i128(val).ok_or_else(|| TypedAccessError::ValueOverflow {
                 ordinal,
                 value: val,
@@ -337,17 +474,23 @@ impl<T: TypedElement> TypedReader<T> {
 // ── Native zero-copy access (only when T matches native type) ────────
 
 impl TypedReader<u8> {
-    /// Zero-copy access to the raw native value. Panics if not native u8.
+    /// Zero-copy access to the raw native value. Only works for mmap backend.
+    /// Falls back to get_value for HTTP.
     pub fn get_native(&self, ordinal: usize) -> u8 {
         debug_assert!(self.native_type == ElementType::U8);
         let offset = if self.is_scalar { ordinal } else {
             4 + ordinal * (4 + self.dim)
         };
-        self.data[offset]
+        if let Some(slice) = self.backend.mmap_slice(offset, 1) {
+            slice[0]
+        } else {
+            self.get_value(ordinal).unwrap_or(0)
+        }
     }
 
-    /// Zero-copy slice of a record's native data. Panics if not native u8.
-    pub fn get_native_slice(&self, ordinal: usize) -> &[u8] {
+    /// Zero-copy slice of a record's native data. Only works for mmap backend.
+    /// Returns None for HTTP backend (use get_record instead).
+    pub fn get_native_slice(&self, ordinal: usize) -> Option<&[u8]> {
         debug_assert!(self.native_type == ElementType::U8);
         let (offset, len) = if self.is_scalar {
             (ordinal * self.dim, self.dim)
@@ -355,7 +498,7 @@ impl TypedReader<u8> {
             let record_bytes = 4 + self.dim;
             (ordinal * record_bytes + 4, self.dim)
         };
-        &self.data[offset..offset + len]
+        self.backend.mmap_slice(offset, len)
     }
 }
 
@@ -369,7 +512,11 @@ impl TypedReader<i32> {
             let record_bytes = 4 + self.dim * 4;
             ordinal * record_bytes + 4
         };
-        i32::from_le_bytes(self.data[offset..offset+4].try_into().unwrap())
+        if let Some(slice) = self.backend.mmap_slice(offset, 4) {
+            i32::from_le_bytes(slice.try_into().unwrap())
+        } else {
+            self.get_value(ordinal).unwrap_or(0)
+        }
     }
 }
 
