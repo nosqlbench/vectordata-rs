@@ -233,7 +233,6 @@ enum TypedBackend {
     Http {
         client: reqwest::blocking::Client,
         url: url::Url,
-        total_size: u64,
     },
 }
 
@@ -382,7 +381,7 @@ impl<T: TypedElement> TypedReader<T> {
         };
 
         Ok(TypedReader {
-            backend: TypedBackend::Http { client, url, total_size },
+            backend: TypedBackend::Http { client, url },
             native_type,
             native_width,
             is_scalar,

@@ -1184,7 +1184,7 @@ fn partition_profile_base_count() {
     let group = TestDataGroup::load(dir.to_str().unwrap()).unwrap();
 
     // Default profile — base_count may or may not be set
-    let default_view = group.profile("default").unwrap();
+    let _default_view = group.profile("default").unwrap();
 
     // Partition profile — must have base_count
     let label0 = group.profile("label_00").unwrap();
@@ -1388,8 +1388,6 @@ fn write_ivvec_records(path: &std::path::Path, records: &[Vec<i32>]) {
 
 /// Create a format coverage dataset with all valid file types.
 fn create_format_coverage_dataset(dir: &std::path::Path) {
-    use std::io::Write;
-
     let dim = 4;
     let base_count = 50;
     let query_count = 10;
@@ -1682,7 +1680,7 @@ profiles:
 "#;
     std::fs::write(dir.join("dataset.yaml"), yaml).unwrap();
 
-    let group = TestDataGroup::load(dir.to_str().unwrap()).unwrap();
+    let _group = TestDataGroup::load(dir.to_str().unwrap()).unwrap();
 
     // Load the config and create a GenericTestDataView for typed access
     let config: vectordata::model::DatasetConfig =
@@ -2034,7 +2032,6 @@ fn cached_http_prebuffer_downloads_all() {
     }
 }
 
-#[test]
 #[test]
 fn cached_http_survives_short_read_with_retry() {
     // Test that the cache layer retries and recovers from transient errors.

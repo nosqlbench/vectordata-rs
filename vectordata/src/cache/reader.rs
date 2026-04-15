@@ -181,20 +181,6 @@ impl<T: VvecElement> CachedVectorReader<T> {
         }
     }
 
-    /// Read record bytes — mmap if complete, channel otherwise.
-    fn read_record(&self, index: usize) -> Result<&[u8], IoError> {
-        // This returns a reference only when mmap is available
-        if let Some(mmap) = self.mmap.get() {
-            let start = index * self.entry_size;
-            let end = start + self.entry_size;
-            if end > mmap.len() {
-                return Err(IoError::OutOfBounds(index));
-            }
-            Ok(&mmap[start..end])
-        } else {
-            Err(IoError::OutOfBounds(usize::MAX)) // signal to use channel path
-        }
-    }
 }
 
 impl<T: VvecElement> crate::VectorReader<T> for CachedVectorReader<T> {

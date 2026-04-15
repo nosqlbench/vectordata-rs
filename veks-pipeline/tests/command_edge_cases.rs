@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use indexmap::IndexMap;
-use veks_pipeline::pipeline::command::{CommandOp, Options, Status, StreamContext};
+use veks_pipeline::pipeline::command::{Options, Status, StreamContext};
 use veks_pipeline::pipeline::progress::ProgressLog;
 use veks_pipeline::pipeline::resource::ResourceGovernor;
 use veks_core::ui::{TestSink, UiHandle};

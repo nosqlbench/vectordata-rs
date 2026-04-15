@@ -772,7 +772,7 @@ mod tests {
         w.write_record(0, &v);
         w.finish().unwrap();
 
-        let mut r = open(&path).unwrap();
+        let r = open(&path).unwrap();
         assert_eq!(r.dimension(), 2);
         assert_eq!(r.element_size(), 2);
     }
@@ -787,7 +787,7 @@ mod tests {
         w.write_record(0, &v);
         w.finish().unwrap();
 
-        let mut r = open(&path).unwrap();
+        let r = open(&path).unwrap();
         assert_eq!(r.dimension(), 2);
         assert_eq!(r.element_size(), 4);
     }

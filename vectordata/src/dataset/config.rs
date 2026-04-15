@@ -766,7 +766,7 @@ profiles:
         config.save(tmp.path()).unwrap();
 
         let saved = std::fs::read_to_string(tmp.path()).unwrap();
-        let reloaded: DatasetConfig = serde_yaml::from_str(&saved).unwrap();
+        let _reloaded: DatasetConfig = serde_yaml::from_str(&saved).unwrap();
 
         // partition: true must NOT appear in dataset.yaml or dataset.json
         assert!(!saved.contains("partition: true"),

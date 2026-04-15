@@ -1,12 +1,13 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(dead_code)]
+
 //! HTTP file server for integration tests.
 //!
 //! Uses axum + tower-http ServeDir for correct static file serving
 //! with HEAD, GET, and Range request support.
 
-use std::net::SocketAddr;
 use std::path::Path;
 
 /// An HTTP server that serves files from a directory.
