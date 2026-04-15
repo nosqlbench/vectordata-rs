@@ -1,6 +1,6 @@
 [package]
 name = "veks-io"
-version = "0.17.0"
+version = "0.21.0"
 edition = "2024"
 description = "Standalone vector data I/O — read and write fvec, ivec, mvec, dvec, bvec, svec, npy, parquet, and slab formats"
 license = "Apache-2.0"
