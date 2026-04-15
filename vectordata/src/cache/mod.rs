@@ -497,7 +497,14 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let transport = Box::new(MemoryTransport::new(real_data));
-        let channel = CachedChannel::open(transport, mref, dir.path(), "mismatch.dat").unwrap();
+        let channel = CachedChannel::open(transport, mref, dir.path(), "mismatch.dat")
+            .unwrap()
+            .with_retry_policy(crate::transport::RetryPolicy {
+                max_retries: 1,
+                base_delay_ms: 1,
+                max_delay_ms: 1,
+                jitter_fraction: 0.0,
+            });
 
         // Reading from chunk 2 (offset 512) should fail because the transport
         // only has 512 bytes
