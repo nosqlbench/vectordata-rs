@@ -1,89 +1,115 @@
-//! # Vector Data Tools
+//! # vectordata — typed access to vector search datasets
 //!
-//! A Rust library for reading and describing vector datasets defined by
-//! `dataset.yaml` configuration files. Supports local file system access
-//! (memory-mapped) and remote access via HTTP Range requests.
+//! Find datasets by name, discover profiles and facets, read vectors.
+//! No URLs or file paths needed — the catalog system resolves everything.
 //!
-//! ## Key modules
-//!
-//! - [`io`] — Vector readers for fvec, ivec, and mvec formats (mmap and HTTP).
-//! - [`dataset`] — Configuration parsing for `dataset.yaml`: profiles, facets,
-//!   pipelines, catalogs, and data source specifications.
-//! - [`formats`] — Wire codecs for structured metadata (MNode), predicate
-//!   trees (PNode), and the unified ANode wrapper.
-//! - [`merkle`] — Content-addressed verification for dataset integrity.
-//! - [`transport`] — HTTP transport layer for remote dataset access.
-//! - [`cache`] — Cached channel utilities for buffered data delivery.
-//!
-//! ## Quick start
+//! ## Find and use a dataset
 //!
 //! ```no_run
-//! use vectordata::TestDataGroup;
+//! use vectordata::catalog::sources::CatalogSources;
+//! use vectordata::catalog::resolver::Catalog;
 //!
 //! fn main() -> anyhow::Result<()> {
-//!     // Load from a local path or remote URL
-//!     let group = TestDataGroup::load("https://example.com/datasets/glove-100/")?;
+//!     // Load catalogs from ~/.config/vectordata/catalogs.yaml
+//!     let catalog = Catalog::of(&CatalogSources::new().configure_default());
 //!
-//!     // Access a named profile (e.g., "default", "1M")
-//!     if let Some(view) = group.profile("default") {
-//!         let base = view.base_vectors()?;
-//!         println!("{} vectors, dim={}", base.count(), base.dim());
-//!
-//!         let first = base.get(0)?;
-//!         println!("First vector: {:?}", first);
-//!     }
+//!     // Open a dataset by name — two calls to vectors
+//!     let view = catalog.open_profile("my-dataset", "default")?;
+//!     let base = view.base_vectors()?;
+//!     println!("{} vectors, dim={}", base.count(), base.dim());
+//!     let v: Vec<f32> = base.get(42)?;
 //!
 //!     Ok(())
 //! }
 //! ```
+//!
+//! ## Discover profiles and facets
+//!
+//! ```no_run
+//! # use vectordata::catalog::sources::CatalogSources;
+//! # use vectordata::catalog::resolver::Catalog;
+//! # let catalog = Catalog::of(&CatalogSources::new().configure_default());
+//! let group = catalog.open("my-dataset")?;
+//! for name in group.profile_names() {
+//!     let view = group.profile(&name).unwrap();
+//!     let manifest = view.facet_manifest();
+//!     for (facet, desc) in &manifest {
+//!         println!("  {}:{} → {}", name, facet,
+//!             desc.source_type.as_deref().unwrap_or("?"));
+//!     }
+//! }
+//! # Ok::<(), vectordata::Error>(())
+//! ```
+//!
+//! ## Typed ordinal access
+//!
+//! For metadata and scalar facets, [`typed_access::TypedReader`] provides
+//! ordinal-based access with automatic type widening:
+//!
+//! ```no_run
+//! use vectordata::typed_access::{ElementType, TypedReader};
+//!
+//! // Open a scalar metadata file — u8 read as i32 (automatic widening)
+//! let meta = TypedReader::<i32>::open_auto("metadata.u8", ElementType::U8)?;
+//! let label: i32 = meta.get_value(42)?;
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```
+//!
+//! ## Caching
+//!
+//! Remote data is automatically cached locally with merkle verification.
+//! Downloaded chunks are persisted to `~/.cache/vectordata/` (configurable
+//! via `~/.config/vectordata/settings.yaml`). Once fully cached, readers
+//! switch to mmap for zero-copy access.
+//!
+//! ## Module overview
+//!
+//! - **catalog** — find datasets by name from configured catalog sources
+//! - **group** — load a dataset, list profiles, get views
+//! - **view** — access facets on a profile (base vectors, GT, metadata)
+//! - **typed_access** — ordinal-based typed readers with widening
+//! - **io** — low-level vector file readers (mmap + HTTP)
+//! - **cache** — merkle-verified download cache
+//! - **merkle** — content-addressed integrity verification
+//! - **dataset** — dataset.yaml configuration model
 
-/// Cached channel utilities for buffered data delivery.
+/// Merkle-verified download cache for remote datasets.
 pub mod cache;
-/// Dataset catalog resolution — load catalogs from local and remote sources.
+/// Catalog discovery — find datasets by name from configured sources.
+///
+/// This is the recommended entry point. Configure catalog sources in
+/// `~/.config/vectordata/catalogs.yaml`, then use [`catalog::resolver::Catalog`]
+/// to find and open datasets by name.
 pub mod catalog;
 /// Dataset configuration model (profiles, facets, pipelines, catalogs).
 pub mod dataset;
 /// Wire format codecs: MNode, PNode, ANode.
 pub mod formats;
-/// Content-addressed verification for dataset integrity.
+/// Content-addressed integrity verification (SHA-256 merkle trees).
 pub mod merkle;
-/// HTTP transport layer for remote dataset access.
+/// HTTP transport layer (internal — used by cache and readers).
 pub mod transport;
 /// Core data models for `dataset.yaml` parsing.
 pub mod model;
-/// Vector I/O: fvec, ivec, mvec readers (mmap and HTTP).
+/// Low-level vector file readers (mmap + cached HTTP).
+///
+/// Most users should access data through [`catalog`] → [`view::TestDataView`]
+/// rather than opening files directly with [`io::open_vec`].
 pub mod io;
+/// Parser for `knn_entries.yaml` (jvector-compatible dataset index).
 pub mod knn_entries;
-/// Typed data access with runtime type negotiation.
+/// Typed ordinal access with runtime type negotiation.
 ///
-/// Provides [`typed_access::TypedReader`] for opening vector and scalar files
-/// with compile-time type safety and runtime width validation.
-///
-/// ```rust,no_run
-/// use vectordata::typed_access::{ElementType, TypedReader};
-///
-/// // Interrogate the native type from the file extension
-/// let etype = ElementType::from_path("metadata.u8").unwrap();
-///
-/// // Open with native type (zero-copy access)
-/// let reader = TypedReader::<u8>::open("metadata.u8").unwrap();
-/// let val: u8 = reader.get_native(0);
-///
-/// // Open with wider type (always succeeds)
-/// let reader = TypedReader::<i32>::open("metadata.u8").unwrap();
-/// let val: i32 = reader.get_value(0).unwrap();
-///
-/// // Narrowing is rejected at open time
-/// assert!(TypedReader::<u8>::open("data.i32").is_err());
-/// ```
-///
-/// For dataset access through profiles, use
-/// [`TestDataView::facet_element_type`] and
-/// [`GenericTestDataView::open_facet_typed`].
+/// [`typed_access::TypedReader`] provides ordinal-based access to scalar
+/// and vector data with automatic type widening. Access through profiles
+/// via [`view::GenericTestDataView::open_facet_typed`].
 pub mod typed_access;
-/// Profile views for accessing dataset components.
+/// Profile views — access facets (base vectors, GT, metadata) on a dataset profile.
 pub mod view;
-/// High-level dataset loading and profile access.
+/// Dataset loading and profile access.
+///
+/// [`TestDataGroup::load`] opens a dataset from a path or URL.
+/// Prefer [`catalog::resolver::Catalog::open`] for name-based access.
 pub mod group;
 
 pub use group::TestDataGroup;

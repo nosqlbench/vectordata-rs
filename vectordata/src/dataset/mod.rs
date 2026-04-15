@@ -9,12 +9,12 @@
 //!
 //! ## Sub-modules
 //!
-//! - [`config`] — Top-level `DatasetConfig` and `DatasetAttributes`.
-//! - [`profile`] — `DSProfile`, `DSProfileGroup`, `DSView` with inheritance.
-//! - [`facet`] — `StandardFacet` enum (canonical facet names and aliases).
-//! - [`source`] — `DSSource`, `DSInterval`, `DSWindow` (path + range parsing).
-//! - [`pipeline`] — `PipelineConfig`, `StepDef`, `OnPartial` (upstream build steps).
-//! - [`catalog`] — `CatalogEntry`, `CatalogLayout` (dataset index files).
+//! - **config** — Top-level `DatasetConfig` and `DatasetAttributes`.
+//! - **profile** — `DSProfile`, `DSProfileGroup`, `DSView` with inheritance.
+//! - **facet** — `StandardFacet` enum (canonical facet names and aliases).
+//! - **source** — `DSSource`, `DSInterval`, `DSWindow` (path + range parsing).
+//! - **pipeline** — `PipelineConfig`, `StepDef`, `OnPartial` (upstream build steps).
+//! - **catalog** — `CatalogEntry`, `CatalogLayout` (dataset index files).
 
 pub mod catalog;
 pub mod config;

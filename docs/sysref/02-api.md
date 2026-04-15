@@ -13,7 +13,7 @@ Add the dependency:
 
 ```toml
 [dependencies]
-vectordata = "0.18"
+vectordata = "0.19"
 ```
 
 ### Find and use a dataset by name
@@ -56,9 +56,10 @@ for name in group.profile_names() {
 }
 ```
 
-### Open raw vector files directly
+### Low-level file access (advanced)
 
-For low-level access without catalogs:
+For direct file access without catalogs — typically only needed for
+testing, debugging, or building tools on top of the library:
 
 ```rust
 use vectordata::io::{open_vec, open_vvec, VectorReader, VvecReader};

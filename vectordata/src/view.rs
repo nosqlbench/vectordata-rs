@@ -3,7 +3,7 @@
 
 //! Profile views for accessing dataset components.
 //!
-//! Defines the [`TestDataView`] trait and [`GenericTestDataView`] implementation
+//! Defines the [`TestDataView`] trait and `GenericTestDataView` implementation
 //! for uniform access to base vectors, query vectors, ground-truth neighbors,
 //! and metadata facets regardless of backing storage (local mmap or HTTP).
 //!

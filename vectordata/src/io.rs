@@ -5,8 +5,8 @@
 //!
 //! Provides the [`VectorReader`] trait and two concrete implementations:
 //!
-//! - [`MmapVectorReader`] — memory-mapped local files (zero-copy where possible).
-//! - [`HttpVectorReader`] — remote files accessed via HTTP Range requests.
+//! - `MmapVectorReader` — memory-mapped local files (zero-copy where possible).
+//! - `HttpVectorReader` — remote files accessed via HTTP Range requests.
 //!
 //! # Supported formats
 //!
@@ -1355,7 +1355,7 @@ impl IndexedXvecReader {
         Ok(dim)
     }
 
-    /// Read record at the given ordinal as a Vec<i32>.
+    /// Read record at the given ordinal as a `Vec<i32>`.
     pub fn get_i32(&self, index: usize) -> Result<Vec<i32>, IoError> {
         if index >= self.offsets.len() {
             return Err(IoError::OutOfBounds(index));
@@ -1656,7 +1656,7 @@ impl HttpIndexedXvecReader {
         Ok(resp.bytes()?.to_vec())
     }
 
-    /// Read record at the given ordinal as a Vec<i32> via Range request.
+    /// Read record at the given ordinal as a `Vec<i32>` via Range request.
     pub fn get_i32(&self, index: usize) -> Result<Vec<i32>, IoError> {
         let data = self.get_bytes(index)?;
         let vals: Vec<i32> = data.chunks_exact(4)

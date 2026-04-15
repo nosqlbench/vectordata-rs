@@ -5,7 +5,7 @@
 //!
 //! [`DatasetLoader`] is the primary entry point for all dataset access.
 //! It resolves specifiers (local paths, URLs, `dataset:profile` catalog
-//! references) to typed [`DatasetView`] implementations that provide
+//! references) to typed data view implementations that provide
 //! transparent access regardless of data location.
 
 use std::io;

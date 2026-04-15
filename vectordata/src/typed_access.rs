@@ -3,7 +3,7 @@
 
 //! Typed data access with runtime type negotiation.
 //!
-//! Provides [`TypedReader`] for opening vector and scalar files with
+//! Provides `TypedReader` for opening vector and scalar files with
 //! compile-time type safety and runtime width/signedness validation.
 //!
 //! # Access modes
@@ -439,7 +439,7 @@ impl<T: TypedElement> TypedReader<T> {
         })
     }
 
-    /// Get a record as Vec<T>, with checked conversion per element.
+    /// Get a record as `Vec<T>`, with checked conversion per element.
     ///
     /// For scalar files (dim=1), returns a single-element vec.
     /// For xvec files, returns all elements of the record.

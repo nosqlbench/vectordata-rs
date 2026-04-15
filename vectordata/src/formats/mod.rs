@@ -3,9 +3,9 @@
 
 //! Wire format codecs for metadata and predicate records.
 //!
-//! - [`mnode`]: Self-describing binary metadata records (MNode/MValue).
-//! - [`pnode`]: Binary predicate expression trees (PNode).
-//! - [`anode`]: Annotation nodes combining mnode and pnode data.
+//! - **mnode**: Self-describing binary metadata records (MNode/MValue).
+//! - **pnode**: Binary predicate expression trees (PNode).
+//! - **anode**: Annotation nodes combining mnode and pnode data.
 
 pub mod mnode;
 pub mod pnode;
