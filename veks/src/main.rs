@@ -8,11 +8,73 @@ use veks::{cli, datasets, explore, pipeline, prepare};
 use clap::{Arg, Command, CommandFactory, Parser, Subcommand};
 
 
+/// Full version string including git sha, build number, and build time.
+fn long_version() -> &'static str {
+    use std::sync::OnceLock;
+    static VERSION: OnceLock<String> = OnceLock::new();
+    VERSION.get_or_init(|| {
+        let epoch: u64 = env!("VEKS_BUILD_NUMBER").parse().unwrap_or(0);
+        let ts = std::time::UNIX_EPOCH + std::time::Duration::from_secs(epoch);
+        let build_time = ts.duration_since(std::time::UNIX_EPOCH).map(|d| {
+            // UTC timestamp from epoch seconds
+            let s = d.as_secs();
+            let days = s / 86400;
+            let time = s % 86400;
+            let h = time / 3600;
+            let m = (time % 3600) / 60;
+            let sec = time % 60;
+            // Days since epoch to Y-M-D (simplified: good through 2099)
+            let mut y = 1970i64;
+            let mut rem = days as i64;
+            loop {
+                let ydays = if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) { 366 } else { 365 };
+                if rem < ydays { break; }
+                rem -= ydays;
+                y += 1;
+            }
+            let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+            let mdays = [31, if leap {29} else {28}, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+            let mut mo = 0usize;
+            while mo < 12 && rem >= mdays[mo] { rem -= mdays[mo]; mo += 1; }
+            format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, mo + 1, rem + 1, h, m, sec)
+        }).unwrap_or_else(|_| "unknown".to_string());
+        let now_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let age_secs = now_epoch.saturating_sub(epoch);
+        let age_str = if age_secs < 60 {
+            format!("{} seconds ago", age_secs)
+        } else if age_secs < 3600 {
+            format!("{} minutes ago", age_secs / 60)
+        } else if age_secs < 86400 {
+            let h = age_secs / 3600;
+            let m = (age_secs % 3600) / 60;
+            if m == 0 { format!("{} hours ago", h) }
+            else { format!("{}h {}m ago", h, m) }
+        } else {
+            let d = age_secs / 86400;
+            let h = (age_secs % 86400) / 3600;
+            if d == 1 { format!("1 day {}h ago", h) }
+            else { format!("{} days {}h ago", d, h) }
+        };
+        format!("{}\ngit:    {}\nbuild:  {} ({}, {})\nrustc:  {}",
+            env!("CARGO_PKG_VERSION"),
+            env!("VEKS_BUILD_HASH"),
+            env!("VEKS_BUILD_NUMBER"),
+            build_time,
+            age_str,
+            env!("VEKS_RUSTC_VERSION"),
+        )
+    })
+}
+
 /// Veks — umbrella CLI for vector data tools
 #[derive(Parser)]
 #[command(
     name = "veks",
     version,
+    long_version = long_version(),
     about,
     disable_help_subcommand = true,
     after_help = "\

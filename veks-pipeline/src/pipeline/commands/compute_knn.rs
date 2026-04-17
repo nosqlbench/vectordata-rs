@@ -1257,16 +1257,16 @@ fn merge_partitions(
 
 impl CommandOp for ComputeKnnOp {
     fn command_path(&self) -> &str {
-        "compute knn"
+        "compute knn-metal"
     }
 
     fn command_doc(&self) -> CommandDoc {
         let options = self.describe_options();
         CommandDoc {
-            summary: "Brute-force exact K-nearest-neighbor ground truth computation".into(),
-            body: format!(r#"# compute knn
+            summary: "Brute-force exact KNN via SimSIMD (AVX-512/NEON)".into(),
+            body: format!(r#"# compute knn-metal
 
-Brute-force exact K-nearest-neighbor ground truth computation.
+Brute-force exact K-nearest-neighbor ground truth computation using SimSIMD.
 
 ## Description
 

@@ -10,6 +10,7 @@
 
 mod cache;
 mod curlify;
+mod drop_cache;
 pub mod filter;
 mod list;
 pub(crate) mod prebuffer;
@@ -191,6 +192,24 @@ pub enum DatasetsCommand {
         /// Profile to probe (default: "default")
         #[arg(long, default_value = "default")]
         profile: String,
+    },
+    /// Remove cached datasets from the local cache directory
+    #[command(alias = "purge")]
+    DropCache {
+        /// Dataset names or glob patterns to drop (default: all cached)
+        datasets: Vec<String>,
+
+        /// Skip confirmation prompts
+        #[arg(short = 'y', long)]
+        yes: bool,
+
+        /// List all files in each dataset before dropping
+        #[arg(long, short = 'v')]
+        verbose: bool,
+
+        /// Override cache directory location
+        #[arg(long)]
+        cache_dir: Option<PathBuf>,
     },
     /// Download and cache dataset facets locally
     Prebuffer {
@@ -378,6 +397,9 @@ pub fn run(args: DatasetsArgs) {
                 }
             };
             probe::run(&resolved_at, &dataset, &profile);
+        }
+        DatasetsCommand::DropCache { datasets, yes, verbose, cache_dir } => {
+            drop_cache::run(&datasets, cache_dir.as_deref(), yes, verbose);
         }
         DatasetsCommand::Prebuffer { dataset, profile, configdir, catalog: raw_catalog, at, cache_dir } => {
             let catalog: Vec<String> = raw_catalog.iter().map(|v| resolve_catalog_value(v)).collect();

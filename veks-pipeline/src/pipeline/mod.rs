@@ -672,8 +672,9 @@ pub fn run_pipeline(args: RunArgs) -> Result<(), String> {
         estimated_total_steps: estimated_total,
     };
 
-    ctx.ui.log(&format!("pipeline initialized: {} steps, profile={}",
-        pipeline_dag.steps.len(), profile_name));
+    ctx.ui.log(&format!("pipeline initialized: {} steps, profile={}, build={}",
+        pipeline_dag.steps.len(), profile_name,
+        concat!(env!("CARGO_PKG_VERSION"), "+", env!("VEKS_BUILD_HASH"), ".", env!("VEKS_BUILD_NUMBER"))));
 
     // Persist dataset-level metadata as variables so stats.csv can use them
     let _ = variables::set_and_save(&ctx.workspace, "dataset_name", &ctx.dataset_name);
@@ -1549,6 +1550,11 @@ fn clean_scratch_contents(scratch_dir: &Path) {
 /// workspace root) does exist, and recreates the symlink.
 fn recover_identity_symlinks(workspace: &Path, config: &DatasetConfig) {
     for (_name, profile) in &config.profiles.profiles {
+        // Skip partition profiles — their files are pipeline-generated,
+        // not identity symlinks to source data.
+        if profile.partition {
+            continue;
+        }
         for (_facet, view) in profile.views() {
             let view_path = workspace.join(view.path());
             if view_path.exists() || view_path.symlink_metadata().is_ok() {

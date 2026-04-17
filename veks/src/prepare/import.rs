@@ -1674,7 +1674,6 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
     if wants_partition_verify && !needs_computed_knn && slots.knn.is_some() {
         let has_queries = slots.query_vectors.is_some();
         if has_queries {
-            let query_path = slots.query_vectors.as_ref().unwrap().path().to_string();
             steps.push(Step {
                 id: "compute-knn-partition".into(),
                 run: cmd_knn(&args.personality).into(),
@@ -1686,7 +1685,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
                 options: {
                     let mut opts = vec![
                         ("base".into(), "${profile_dir}base_vectors.fvec".into()),
-                        ("query".into(), query_path),
+                        ("query".into(), "${profile_dir}query_vectors.fvec".into()),
                         ("indices".into(), "neighbor_indices.ivec".into()),
                         ("distances".into(), "neighbor_distances.fvec".into()),
                         ("neighbors".into(), args.neighbors.to_string()),
@@ -1825,7 +1824,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
             finalize: false,
             options: vec![
                 ("base".into(), "${profile_dir}base_vectors.fvec".into()),
-                ("query".into(), slots.query_vectors.as_ref().unwrap().path().into()),
+                ("query".into(), "${profile_dir}query_vectors.fvec".into()),
                 ("indices".into(), "${profile_dir}neighbor_indices.ivec".into()),
                 ("distances".into(), "${profile_dir}neighbor_distances.fvec".into()),
                 ("metric".into(), args.metric.clone()),
@@ -1967,6 +1966,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
                 ("base".into(), slots.base_vectors.path().into()),
                 ("query".into(), slots.query_vectors.as_ref().unwrap().path().into()),
                 ("metadata".into(), slots.metadata.as_ref().unwrap().metadata_content.path().into()),
+                ("predicates".into(), slots.metadata.as_ref().unwrap().predicates.path().into()),
                 ("neighbors".into(), args.neighbors.to_string()),
                 ("metric".into(), args.metric.clone()),
                 ("allowed-partitions".into(), args.max_partitions.to_string()),
@@ -2014,6 +2014,23 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
         options: vec![],
     });
 
+    // ── Documentation generation ───────────────────────────────────
+    // Produces docs/dataset.md (and optionally docs/exemplars.md).
+    // Runs after dataset.yaml is finalized but before catalog/merkle
+    // so docs/ files get catalog and merkle coverage.
+    steps.push(Step {
+        id: "generate-docs".into(),
+        run: "analyze describe-dataset".into(),
+        description: Some("Generate dataset documentation in docs/".into()),
+        after: vec!["generate-variables-json".into(), "generate-dataset-log-jsonl".into()],
+        per_profile: false,
+        phase: 0,
+        finalize: true,
+        options: vec![
+            ("exemplars".into(), "true".into()),
+        ],
+    });
+
     // ── Catalog generation ──────────────────────────────────────────
     // Produces catalog.json, catalog.yaml, and knn_entries.yaml.
     // Runs before merkle so knn_entries.yaml gets .mref coverage.
@@ -2021,7 +2038,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
         id: "generate-catalog".into(),
         run: "catalog generate".into(),
         description: Some("Generate catalog index for the dataset directory".into()),
-        after: vec!["generate-variables-json".into(), "generate-dataset-log-jsonl".into()],
+        after: vec!["generate-docs".into()],
         per_profile: false,
         phase: 0,
         finalize: true,
@@ -2200,7 +2217,7 @@ fn generate_yaml(
     }
     out.push_str(&format!("  distance_function: {}\n", args.metric));
     out.push_str(&format!("  veks_version: {}\n", env!("CARGO_PKG_VERSION")));
-    out.push_str(&format!("  veks_build: {}\n", env!("VEKS_BUILD_HASH")));
+    out.push_str(&format!("  veks_build: {}.{}\n", env!("VEKS_BUILD_HASH"), env!("VEKS_BUILD_NUMBER")));
     // Record oracle partition scope if O facet is active
     let facets_for_scope = resolve_facets(args);
     let (_, oracle_scope_opt) = parse_oracle_scope(&facets_for_scope);

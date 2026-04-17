@@ -323,4 +323,29 @@ steps:
         let reparsed: StepDef = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(reparsed.profiles, vec!["10M", "100M"]);
     }
+
+    #[test]
+    fn test_step_flattened_options_preserved() {
+        let yaml = r#"
+id: partition-profiles
+run: compute partition-profiles
+base: base.fvec
+query: query.fvec
+metadata: meta.u8
+predicates: pred.u8
+neighbors: 100
+metric: L2
+"#;
+        let step: StepDef = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(step.effective_id(), "partition-profiles");
+        assert!(step.options.contains_key("predicates"),
+            "flattened options should contain 'predicates': {:?}", step.options.keys().collect::<Vec<_>>());
+        assert_eq!(
+            step.options.get("predicates").and_then(|v| v.as_str()),
+            Some("pred.u8"),
+        );
+        assert!(step.options.contains_key("base"));
+        assert!(step.options.contains_key("metadata"));
+        assert!(step.options.contains_key("neighbors"));
+    }
 }

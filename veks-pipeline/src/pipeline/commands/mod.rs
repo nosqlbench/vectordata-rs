@@ -45,12 +45,16 @@ pub mod compute_partition_profiles;
 pub mod compute_knn_blas;
 #[cfg(feature = "faiss")]
 pub mod compute_knn_faiss;
+#[cfg(feature = "faiss")]
+pub mod verify_knn_faiss;
 #[cfg(feature = "knnutils")]
 pub mod compute_sort_knnutils;
 pub mod compute_sort;
 pub mod config;
 mod convert;
+pub mod compute_knn_stdarch;
 mod describe;
+pub mod describe_dataset;
 pub mod fetch_bulkdl;
 pub mod fetch_dlhf;
 pub mod gen_dataset;
@@ -104,6 +108,7 @@ pub fn register_all(registry: &mut CommandRegistry) {
     registry.register("analyze fvecs-check-knnutils", analyze_fvecs_check_knnutils::factory);
     registry.register("analyze compute-info", info_compute::factory);
     registry.register("analyze describe", describe::factory);
+    registry.register("analyze describe-dataset", describe_dataset::factory);
     registry.register("analyze file", info_file::factory);
     registry.register("analyze find", analyze_find::factory);
     registry.register("analyze find-duplicates", analyze_find_duplicates::factory);
@@ -132,12 +137,20 @@ pub fn register_all(registry: &mut CommandRegistry) {
     // ── compute ──────────────────────────────────────────────────────
     registry.register("compute evaluate-predicates", gen_predicate_keys::factory);
     registry.register("compute filtered-knn", compute_filtered_knn::factory);
-    registry.register("compute knn", compute_knn::factory);
+    registry.register("compute knn-metal", compute_knn::factory);
+    registry.register("compute knn-stdarch", compute_knn_stdarch::factory);
     registry.register("compute partition-profiles", compute_partition_profiles::factory);
     #[cfg(feature = "knnutils")]
     registry.register("compute knn-blas", compute_knn_blas::factory);
+    // "compute knn" → FAISS when available, otherwise SimSIMD
+    #[cfg(feature = "faiss")]
+    registry.register("compute knn", compute_knn_faiss::factory);
+    #[cfg(not(feature = "faiss"))]
+    registry.register("compute knn", compute_knn::factory);
     #[cfg(feature = "faiss")]
     registry.register("compute knn-faiss", compute_knn_faiss::factory);
+    #[cfg(feature = "faiss")]
+    registry.register("verify knn-faiss", verify_knn_faiss::factory);
     registry.register("compute sort", compute_dedup::factory);
     #[cfg(feature = "knnutils")]
     registry.register("compute sort-knnutils", compute_sort_knnutils::factory);
@@ -191,9 +204,19 @@ pub fn register_all(registry: &mut CommandRegistry) {
     // ── verify ───────────────────────────────────────────────────────
     #[cfg(feature = "knnutils")]
     registry.register("verify dataset-knnutils", verify_dataset_knnutils::factory);
+    // verify knn-groundtruth: per-profile KNN verification
+    #[cfg(feature = "faiss")]
+    registry.register("verify knn-groundtruth", verify_knn_faiss::factory);
+    #[cfg(not(feature = "faiss"))]
     registry.register("verify knn-groundtruth", verify_knn::factory);
+    registry.register("verify knn-groundtruth-metal", verify_knn::factory);
     registry.register("verify predicate-results", verify_predicates::factory);
+    // verify knn-consolidated: multi-profile single-pass verification
+    #[cfg(feature = "faiss")]
+    registry.register("verify knn-consolidated", verify_knn_faiss::consolidated_factory);
+    #[cfg(not(feature = "faiss"))]
     registry.register("verify knn-consolidated", verify_consolidated::knn_consolidated_factory);
+    registry.register("verify knn-consolidated-metal", verify_consolidated::knn_consolidated_factory);
     registry.register("verify filtered-knn-consolidated", verify_consolidated::filtered_knn_consolidated_factory);
     registry.register("verify predicates-consolidated", verify_consolidated::predicates_consolidated_factory);
     registry.register("verify predicates-sqlite", verify_predicates_sqlite::factory);

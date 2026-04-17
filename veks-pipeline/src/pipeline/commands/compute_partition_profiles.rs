@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use vectordata::VectorReader;
+use vectordata::formats::pnode::{PNode, Comparand};
 use vectordata::io::MmapVectorReader;
 
 use crate::pipeline::command::{
@@ -73,6 +74,7 @@ templates (compute-knn, verify-knn) for the new partition profiles.
 
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
         let start = Instant::now();
+        ctx.ui.log(&format!("  partition-profiles build: {}", self.build_version()));
 
         let base_str = match options.require("base") {
             Ok(s) => s, Err(e) => return error_result(e, start),
@@ -99,6 +101,39 @@ templates (compute-knn, verify-knn) for the new partition profiles.
             .unwrap_or(50);
         let on_undersized = options.get("on-undersized").unwrap_or("error");
 
+        // Auto-discover predicates file when not explicitly provided.
+        // This handles datasets generated before the predicates option
+        // was added to the partition-profiles template.
+        let discovered_predicates: Option<String> = if options.get("predicates").is_none() {
+            let ds_path = ctx.workspace.join("dataset.yaml");
+            if let Ok(config) = vectordata::dataset::DatasetConfig::load(&ds_path) {
+                if let Some(profile) = config.default_profile() {
+                    if let Some(view) = profile.views.get("metadata_predicates") {
+                        let pred_path = ctx.workspace.join(&view.source.path);
+                        if pred_path.exists() {
+                            ctx.ui.log(&format!("  auto-discovered predicates from dataset.yaml: {}", view.source.path));
+                            Some(view.source.path.clone())
+                        } else { None }
+                    } else { None }
+                } else { None }
+            } else {
+                // Fall back: scan for common predicate file patterns
+                let mut found = None;
+                for ext in &["u8", "i8", "u16", "i16", "u32", "i32", "u64", "i64", "slab"] {
+                    let candidate = ctx.workspace.join(format!("profiles/base/predicates.{}", ext));
+                    if candidate.exists() {
+                        let p = format!("profiles/base/predicates.{}", ext);
+                        ctx.ui.log(&format!("  auto-discovered predicates file: {}", p));
+                        found = Some(p);
+                        break;
+                    }
+                }
+                found
+            }
+        } else { None };
+        let predicates_str: Option<&str> = options.get("predicates")
+            .or(discovered_predicates.as_deref());
+
         let base_path = resolve_path(base_str, &ctx.workspace);
         let query_path = resolve_path(query_str, &ctx.workspace);
         let metadata_path = resolve_path(metadata_str, &ctx.workspace);
@@ -111,11 +146,43 @@ templates (compute-knn, verify-knn) for the new partition profiles.
         let base_count = VectorReader::<f32>::count(&base_reader);
         let dim = VectorReader::<f32>::dim(&base_reader);
 
+        // Open query vectors (needed for per-label query extraction)
+        let query_reader = match MmapVectorReader::<f32>::open_fvec(&query_path) {
+            Ok(r) => r,
+            Err(e) => return error_result(format!("open query: {}", e), start),
+        };
+        let query_count = VectorReader::<f32>::count(&query_reader);
+        let query_dim = VectorReader::<f32>::dim(&query_reader);
+        if query_dim != dim {
+            return error_result(format!(
+                "query dim {} != base dim {}", query_dim, dim), start);
+        }
+
         // Read metadata labels — supports scalar formats (u8, i32, etc.)
         // and slab files (reads first field from each record).
         let labels = match read_metadata_labels(&metadata_path, base_count) {
             Ok(l) => l,
             Err(e) => return error_result(e, start),
+        };
+
+        // Read predicate labels for queries — determines which queries
+        // target which partition. Each predicate is a label value that
+        // the query's filter matches against.
+        let query_labels: Option<Vec<u64>> = if let Some(pred_str) = predicates_str {
+            let pred_path = resolve_path(pred_str, &ctx.workspace);
+            ctx.ui.log(&format!("  predicates: {} (expected {} entries)", pred_path.display(), query_count));
+            match read_predicate_labels(&pred_path, query_count) {
+                Ok(l) => {
+                    ctx.ui.log(&format!("  loaded {} query predicate labels", l.len()));
+                    Some(l)
+                }
+                Err(e) => return error_result(
+                    format!("failed to read predicates: {} — cannot partition queries without predicate labels", e),
+                    start),
+            }
+        } else {
+            ctx.ui.log("  no predicates option — using shared queries for all partitions");
+            None
         };
 
         // Build partitions: label → [ordinals]
@@ -173,10 +240,11 @@ templates (compute-knn, verify-knn) for the new partition profiles.
                     _ => {} // "include" — proceed
                 }
             }
-            ctx.ui.log(&format!("  {} ({} vectors)", profile_name, partition_size));
+            ctx.ui.log(&format!("  {} ({} base vectors)", profile_name, partition_size));
 
             // Extract partition base vectors
             let part_base_path = profile_dir.join("base_vectors.fvec");
+            remove_if_symlink(&part_base_path);
             {
                 let mut f = match std::fs::File::create(&part_base_path) {
                     Ok(f) => std::io::BufWriter::new(f),
@@ -195,12 +263,51 @@ templates (compute-knn, verify-knn) for the new partition profiles.
                 }
             }
 
-            // Symlink query vectors
+            // Extract per-label query vectors — only queries whose predicate
+            // matches this partition's label. If no predicates file, fall back
+            // to symlinking the full query set.
             let part_query_path = profile_dir.join("query_vectors.fvec");
-            if !part_query_path.exists() {
+            // Symlink interlock: always remove existing symlinks before
+            // writing. File::create follows symlinks, which would silently
+            // corrupt the target file.
+            remove_if_symlink(&part_query_path);
+            let _query_subset_count = if let Some(ref ql) = query_labels {
+                // Extract queries matching this label
+                let matching: Vec<usize> = ql.iter().enumerate()
+                    .filter(|(_, qlabel)| **qlabel == label)
+                    .map(|(i, _)| i)
+                    .collect();
+                if matching.is_empty() {
+                    ctx.ui.log(&format!("    warning: no queries match label {} — symlinking full set", label));
+                    let rel = relative_path(&profile_dir, &query_path);
+                    let _ = std::os::unix::fs::symlink(&rel, &part_query_path);
+                    query_count
+                } else {
+                    let mut f = match std::fs::File::create(&part_query_path) {
+                        Ok(f) => std::io::BufWriter::new(f),
+                        Err(e) => {
+                            ctx.ui.log(&format!("    ERROR creating {}: {}", part_query_path.display(), e));
+                            continue;
+                        }
+                    };
+                    let dim_bytes = (dim as i32).to_le_bytes();
+                    for &qi in &matching {
+                        let slice = query_reader.get_slice(qi);
+                        f.write_all(&dim_bytes).unwrap_or(());
+                        for &val in slice {
+                            f.write_all(&val.to_le_bytes()).unwrap_or(());
+                        }
+                    }
+                    ctx.ui.log(&format!("    {} queries (of {} total) match label {}",
+                        matching.len(), query_count, label));
+                    matching.len()
+                }
+            } else {
+                // No predicates — symlink full query set
                 let rel = relative_path(&profile_dir, &query_path);
                 let _ = std::os::unix::fs::symlink(&rel, &part_query_path);
-            }
+                query_count
+            };
 
             profile_names.push((profile_name, partition_size));
             profiles_created += 1;
@@ -292,6 +399,7 @@ templates (compute-knn, verify-knn) for the new partition profiles.
             opt("base", "Path", true, None, "Base vectors file (full dataset)"),
             opt("query", "Path", true, None, "Query vectors file"),
             opt("metadata", "Path", true, None, "Metadata labels file (scalar u8/i32/etc. or slab)"),
+            opt("predicates", "Path", false, None, "Predicate keys file (per-query label for partitioned query extraction)"),
             opt("neighbors", "int", true, None, "k — partitions smaller than k are rejected or skipped"),
             opt("metric", "string", true, None, "Distance metric (passed to per-profile compute-knn)"),
             opt("prefix", "string", false, Some("label"), "Profile name prefix"),
@@ -437,6 +545,89 @@ fn read_slab_labels(path: &Path, expected_count: usize) -> Result<Vec<u64>, Stri
     }
 
     Ok(labels)
+}
+
+/// Remove a path if it is a symlink. This interlock prevents
+/// `File::create` from following a symlink and silently corrupting
+/// the target file.
+fn remove_if_symlink(path: &Path) {
+    if path.symlink_metadata().map(|m| m.file_type().is_symlink()).unwrap_or(false) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Read predicate label values from a predicates file.
+///
+/// Supports:
+/// - Scalar formats (`.u8`, `.i32`, etc.): flat packed, one label per record
+/// - Slab PNode format (`.slab`): decodes each PNode and extracts the
+///   first comparand value as the label (for simple-int-eq predicates)
+///
+/// Returns one label value per predicate. Validates that the count
+/// matches `expected_count`.
+fn read_predicate_labels(path: &Path, expected_count: usize) -> Result<Vec<u64>, String> {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+
+    if ext == "slab" {
+        return read_slab_predicate_labels(path, expected_count);
+    }
+
+    // Scalar format — delegate to the existing metadata reader
+    read_metadata_labels(path, expected_count)
+}
+
+/// Read predicate labels from a slab of PNode records.
+///
+/// Each slab record is a PNode (predicate tree). For single-field
+/// equality predicates (simple-int-eq), the first comparand value
+/// is the label. For multi-field AND predicates, the first child's
+/// first comparand is used.
+fn read_slab_predicate_labels(path: &Path, expected_count: usize) -> Result<Vec<u64>, String> {
+    use slabtastic::SlabReader;
+
+    let reader = SlabReader::open(path)
+        .map_err(|e| format!("open slab {}: {}", path.display(), e))?;
+
+    let total = reader.total_records() as usize;
+    if total != expected_count {
+        return Err(format!(
+            "predicate slab count {} != query count {}", total, expected_count));
+    }
+
+    let mut labels = Vec::with_capacity(total);
+    for i in 0..total {
+        let data = reader.get(i as i64)
+            .map_err(|e| format!("read predicate {}: {}", i, e))?;
+        let pnode = PNode::from_bytes_named(&data)
+            .map_err(|e| format!("decode predicate {}: {}", i, e))?;
+        let label = extract_predicate_label(&pnode)
+            .ok_or_else(|| format!(
+                "predicate {} has no extractable integer label — \
+                 only simple equality predicates are supported for partitioning", i))?;
+        labels.push(label);
+    }
+
+    Ok(labels)
+}
+
+/// Extract the integer label value from a PNode predicate.
+///
+/// For `Predicate { op: Eq, comparands: [Int(v)] }` → returns `v`.
+/// For `Conjugate { And, children: [Predicate { ... }, ...] }` → returns
+/// the first child's comparand value (first field determines partition).
+fn extract_predicate_label(pnode: &PNode) -> Option<u64> {
+    match pnode {
+        PNode::Predicate(pred) => {
+            pred.comparands.first().and_then(|c| match c {
+                Comparand::Int(v) => Some(*v as u64),
+                _ => None,
+            })
+        }
+        PNode::Conjugate(conj) => {
+            // Multi-field predicate: use first child's label
+            conj.children.first().and_then(extract_predicate_label)
+        }
+    }
 }
 
 /// Compute relative path from `from` directory to `to` file.

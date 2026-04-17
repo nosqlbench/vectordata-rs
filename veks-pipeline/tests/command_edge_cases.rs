@@ -2070,6 +2070,69 @@ fn partition_profiles_u8_metadata() {
 }
 
 #[test]
+fn partition_profiles_per_label_queries() {
+    let tmp = tmp_dir();
+    let ws = tmp.path();
+
+    // Base vectors: 20 vectors, dim=2
+    write_test_fvec(&ws.join("base.fvec"), &(0..20).map(|i|
+        vec![(i + 1) as f32, (i * 2 + 1) as f32]
+    ).collect::<Vec<_>>());
+
+    // Metadata: 20 u8 labels, 4 groups (0,1,2,3,0,1,2,3,...)
+    let labels: Vec<u8> = (0..20).map(|i| (i % 4) as u8).collect();
+    std::fs::write(ws.join("labels.u8"), &labels).unwrap();
+
+    // Query vectors: 8 vectors, dim=2
+    write_test_fvec(&ws.join("query.fvec"), &(0..8).map(|i|
+        vec![(i + 100) as f32, (i * 3 + 100) as f32]
+    ).collect::<Vec<_>>());
+
+    // Predicates: 8 u8 labels (2 queries per label group)
+    // queries 0,1 target label 0; queries 2,3 target label 1; etc.
+    let predicates: Vec<u8> = vec![0, 0, 1, 1, 2, 2, 3, 3];
+    std::fs::write(ws.join("predicates.u8"), &predicates).unwrap();
+
+    let mut opts = Options::new();
+    opts.set("base", "base.fvec");
+    opts.set("query", "query.fvec");
+    opts.set("metadata", "labels.u8");
+    opts.set("predicates", "predicates.u8");
+    opts.set("neighbors", "3");
+    opts.set("metric", "L2");
+    opts.set("prefix", "label");
+    opts.set("allowed-partitions", "10");
+    opts.set("on-undersized", "warn");
+
+    std::fs::create_dir_all(ws.join("profiles")).unwrap();
+    std::fs::write(ws.join("dataset.yaml"),
+        "name: test\nprofiles:\n  default:\n    maxk: 3\n    base_vectors: base.fvec\n").unwrap();
+
+    let registry = veks_pipeline::pipeline::registry::CommandRegistry::with_builtins();
+    let mut cmd = registry.get("compute partition-profiles").unwrap()();
+    let mut ctx = test_ctx(ws);
+    std::fs::create_dir_all(ws.join(".scratch")).unwrap();
+    let r = cmd.execute(&opts, &mut ctx);
+    assert_eq!(r.status, Status::Ok, "partition with predicates: {}", r.message);
+
+    // Each partition should have its own query_vectors.fvec (NOT a symlink)
+    for i in 0..4 {
+        let qpath = ws.join(format!("profiles/label_{}/query_vectors.fvec", i));
+        assert!(qpath.exists(), "label_{}/query_vectors.fvec should exist", i);
+        assert!(!qpath.is_symlink(),
+            "label_{}/query_vectors.fvec should NOT be a symlink — should be extracted per-label queries", i);
+
+        // Each partition should have exactly 2 queries (8 total / 4 labels)
+        let data = std::fs::read(&qpath).unwrap();
+        let dim = i32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+        let stride = 4 + dim * 4;
+        let query_count = data.len() / stride;
+        assert_eq!(query_count, 2,
+            "label_{} should have 2 queries, got {}", i, query_count);
+    }
+}
+
+#[test]
 fn partition_profiles_slab_metadata() {
     use slabtastic::{SlabWriter, WriterConfig};
 
@@ -2139,6 +2202,244 @@ fn partition_profiles_slab_metadata() {
     assert_eq!(count, 10, "label_0 should have 10 vectors");
 
     assert_eq!(ctx.defaults.get("partition_count").map(|s| s.as_str()), Some("3"));
+}
+
+/// Partition profiles with slab PNode predicates — the production format.
+///
+/// Validates that PNode-encoded equality predicates are correctly decoded
+/// to extract per-label query vectors. This is the format used by sift1m
+/// and any dataset with `synthesis_format: slab`.
+#[test]
+fn partition_profiles_slab_pnode_predicates() {
+    use slabtastic::{SlabWriter, WriterConfig};
+    use vectordata::formats::pnode::{PNode, PredicateNode, OpType, Comparand, FieldRef};
+
+    let tmp = tmp_dir();
+    let ws = tmp.path();
+
+    // Base vectors: 20 vectors, dim=2
+    write_test_fvec(&ws.join("base.fvec"), &(0..20).map(|i|
+        vec![(i + 1) as f32, (i * 2 + 1) as f32]
+    ).collect::<Vec<_>>());
+
+    // Metadata: 20 u8 labels (0,1,2,3,0,1,2,3,...)
+    let labels: Vec<u8> = (0..20).map(|i| (i % 4) as u8).collect();
+    std::fs::write(ws.join("labels.u8"), &labels).unwrap();
+
+    // Query vectors: 8 vectors, dim=2
+    write_test_fvec(&ws.join("query.fvec"), &(0..8).map(|i|
+        vec![(i + 100) as f32, (i * 3 + 100) as f32]
+    ).collect::<Vec<_>>());
+
+    // Predicates: 8 PNode slab records (simple-int-eq format)
+    // queries 0,1 target label 0; queries 2,3 target label 1; etc.
+    {
+        let config = WriterConfig::new(512, 4096, u32::MAX, false).unwrap();
+        let mut writer = SlabWriter::new(ws.join("predicates.slab"), config).unwrap();
+        for qi in 0..8u32 {
+            let label = qi / 2; // 0,0,1,1,2,2,3,3
+            let pnode = PNode::Predicate(PredicateNode {
+                field: FieldRef::Named("field_0".into()),
+                op: OpType::Eq,
+                comparands: vec![Comparand::Int(label as i64)],
+            });
+            writer.add_record(&pnode.to_bytes_named()).unwrap();
+        }
+        writer.finish().unwrap();
+    }
+
+    let mut opts = Options::new();
+    opts.set("base", "base.fvec");
+    opts.set("query", "query.fvec");
+    opts.set("metadata", "labels.u8");
+    opts.set("predicates", "predicates.slab");
+    opts.set("neighbors", "3");
+    opts.set("metric", "L2");
+    opts.set("prefix", "label");
+    opts.set("allowed-partitions", "10");
+    opts.set("on-undersized", "warn");
+
+    std::fs::create_dir_all(ws.join("profiles")).unwrap();
+    std::fs::write(ws.join("dataset.yaml"),
+        "name: test\nprofiles:\n  default:\n    maxk: 3\n    base_vectors: base.fvec\n").unwrap();
+
+    let registry = veks_pipeline::pipeline::registry::CommandRegistry::with_builtins();
+    let mut cmd = registry.get("compute partition-profiles").unwrap()();
+    let mut ctx = test_ctx(ws);
+    std::fs::create_dir_all(ws.join(".scratch")).unwrap();
+    let r = cmd.execute(&opts, &mut ctx);
+    assert_eq!(r.status, Status::Ok, "partition with slab predicates: {}", r.message);
+
+    // Each partition should have per-label query_vectors.fvec (NOT a symlink)
+    for i in 0..4 {
+        let qpath = ws.join(format!("profiles/label_{}/query_vectors.fvec", i));
+        assert!(qpath.exists(), "label_{}/query_vectors.fvec should exist", i);
+        assert!(!qpath.is_symlink(),
+            "label_{}/query_vectors.fvec should NOT be a symlink — PNode predicates must produce extracted queries", i);
+
+        // Each partition should have exactly 2 queries (8 total / 4 labels)
+        let data = std::fs::read(&qpath).unwrap();
+        let dim = i32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+        let stride = 4 + dim * 4;
+        let query_count = data.len() / stride;
+        assert_eq!(query_count, 2,
+            "label_{} should have 2 queries from PNode predicates, got {}", i, query_count);
+    }
+}
+
+/// Verify symlink interlock: re-running partition-profiles must replace
+/// existing symlinks with real files, never writing through them.
+#[test]
+fn partition_profiles_replaces_symlinks_on_rerun() {
+    let tmp = tmp_dir();
+    let ws = tmp.path();
+
+    // Base vectors: 10 vectors, dim=2
+    write_test_fvec(&ws.join("base.fvec"), &(0..10).map(|i|
+        vec![(i + 1) as f32, (i * 2 + 1) as f32]
+    ).collect::<Vec<_>>());
+
+    // Metadata: 10 u8 labels, 2 groups
+    let labels: Vec<u8> = (0..10).map(|i| (i % 2) as u8).collect();
+    std::fs::write(ws.join("labels.u8"), &labels).unwrap();
+
+    // Query vectors: 4 vectors, dim=2
+    write_test_fvec(&ws.join("query.fvec"), &(0..4).map(|i|
+        vec![(i + 100) as f32, (i * 3 + 100) as f32]
+    ).collect::<Vec<_>>());
+
+    // Predicates: 4 u8 labels (2 queries per group)
+    let predicates: Vec<u8> = vec![0, 0, 1, 1];
+    std::fs::write(ws.join("predicates.u8"), &predicates).unwrap();
+
+    std::fs::create_dir_all(ws.join("profiles")).unwrap();
+    std::fs::write(ws.join("dataset.yaml"),
+        "name: test\nprofiles:\n  default:\n    maxk: 3\n    base_vectors: base.fvec\n").unwrap();
+
+    // Pre-create symlinks (simulating a previous run without predicates)
+    for i in 0..2 {
+        let pdir = ws.join(format!("profiles/label_{}", i));
+        std::fs::create_dir_all(&pdir).unwrap();
+        std::os::unix::fs::symlink("../../query.fvec", pdir.join("query_vectors.fvec")).unwrap();
+    }
+    // Verify symlinks exist before re-run
+    assert!(ws.join("profiles/label_0/query_vectors.fvec").symlink_metadata()
+        .unwrap().file_type().is_symlink());
+
+    let mut opts = Options::new();
+    opts.set("base", "base.fvec");
+    opts.set("query", "query.fvec");
+    opts.set("metadata", "labels.u8");
+    opts.set("predicates", "predicates.u8");
+    opts.set("neighbors", "3");
+    opts.set("metric", "L2");
+    opts.set("prefix", "label");
+    opts.set("allowed-partitions", "10");
+
+    let registry = veks_pipeline::pipeline::registry::CommandRegistry::with_builtins();
+    let mut cmd = registry.get("compute partition-profiles").unwrap()();
+    let mut ctx = test_ctx(ws);
+    std::fs::create_dir_all(ws.join(".scratch")).unwrap();
+    let r = cmd.execute(&opts, &mut ctx);
+    assert_eq!(r.status, Status::Ok, "rerun with predicates: {}", r.message);
+
+    // After re-run: symlinks must be gone, replaced by real files
+    for i in 0..2 {
+        let qpath = ws.join(format!("profiles/label_{}/query_vectors.fvec", i));
+        assert!(qpath.exists(), "label_{}/query_vectors.fvec should exist after rerun", i);
+        assert!(!qpath.symlink_metadata().unwrap().file_type().is_symlink(),
+            "label_{}/query_vectors.fvec must NOT be a symlink after rerun — symlink interlock failed", i);
+
+        let data = std::fs::read(&qpath).unwrap();
+        let dim = i32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+        let stride = 4 + dim * 4;
+        let count = data.len() / stride;
+        assert_eq!(count, 2, "label_{} should have 2 queries, got {}", i, count);
+    }
+
+    // Verify the original query file was NOT corrupted
+    let orig_data = std::fs::read(ws.join("query.fvec")).unwrap();
+    let dim = i32::from_le_bytes(orig_data[0..4].try_into().unwrap()) as usize;
+    let stride = 4 + dim * 4;
+    let orig_count = orig_data.len() / stride;
+    assert_eq!(orig_count, 4, "original query.fvec must still have 4 vectors, not corrupted");
+}
+
+/// Auto-discover predicates when the option is not passed but the file
+/// exists on disk — covers datasets generated before the predicates
+/// option was added to the partition-profiles template.
+#[test]
+fn partition_profiles_auto_discovers_predicates() {
+    let tmp = tmp_dir();
+    let ws = tmp.path();
+
+    // Base vectors: 20 vectors, dim=2
+    write_test_fvec(&ws.join("base.fvec"), &(0..20).map(|i|
+        vec![(i + 1) as f32, (i * 2 + 1) as f32]
+    ).collect::<Vec<_>>());
+
+    // Metadata: 20 u8 labels (0,1,2,3,0,1,2,3,...)
+    let labels: Vec<u8> = (0..20).map(|i| (i % 4) as u8).collect();
+    std::fs::write(ws.join("labels.u8"), &labels).unwrap();
+
+    // Query vectors: 8 vectors, dim=2
+    write_test_fvec(&ws.join("query.fvec"), &(0..8).map(|i|
+        vec![(i + 100) as f32, (i * 3 + 100) as f32]
+    ).collect::<Vec<_>>());
+
+    // Predicates file exists at profiles/base/predicates.u8 but is NOT
+    // passed as an option — the command must auto-discover it.
+    std::fs::create_dir_all(ws.join("profiles/base")).unwrap();
+    let predicates: Vec<u8> = vec![0, 0, 1, 1, 2, 2, 3, 3];
+    std::fs::write(ws.join("profiles/base/predicates.u8"), &predicates).unwrap();
+
+    // dataset.yaml references the predicates file in the default profile
+    std::fs::write(ws.join("dataset.yaml"), "\
+name: test
+profiles:
+  default:
+    maxk: 3
+    views:
+      base_vectors:
+        source: base.fvec
+      query_vectors:
+        source: query.fvec
+      metadata_predicates:
+        source: profiles/base/predicates.u8
+").unwrap();
+
+    // Note: NO "predicates" option — auto-discovery must find it
+    let mut opts = Options::new();
+    opts.set("base", "base.fvec");
+    opts.set("query", "query.fvec");
+    opts.set("metadata", "labels.u8");
+    opts.set("neighbors", "3");
+    opts.set("metric", "L2");
+    opts.set("prefix", "label");
+    opts.set("allowed-partitions", "10");
+    opts.set("on-undersized", "warn");
+
+    let registry = veks_pipeline::pipeline::registry::CommandRegistry::with_builtins();
+    let mut cmd = registry.get("compute partition-profiles").unwrap()();
+    let mut ctx = test_ctx(ws);
+    std::fs::create_dir_all(ws.join(".scratch")).unwrap();
+    let r = cmd.execute(&opts, &mut ctx);
+    assert_eq!(r.status, Status::Ok, "auto-discover predicates: {}", r.message);
+
+    // Each partition should have per-label queries, NOT symlinks
+    for i in 0..4 {
+        let qpath = ws.join(format!("profiles/label_{}/query_vectors.fvec", i));
+        assert!(qpath.exists(), "label_{}/query_vectors.fvec should exist", i);
+        assert!(!qpath.symlink_metadata().unwrap().file_type().is_symlink(),
+            "label_{}/query_vectors.fvec must NOT be a symlink — auto-discovery should have found predicates", i);
+
+        let data = std::fs::read(&qpath).unwrap();
+        let dim = i32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+        let stride = 4 + dim * 4;
+        let query_count = data.len() / stride;
+        assert_eq!(query_count, 2,
+            "label_{} should have 2 queries via auto-discovered predicates, got {}", i, query_count);
+    }
 }
 
 // ---------------------------------------------------------------------------

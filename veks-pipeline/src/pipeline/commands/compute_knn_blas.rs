@@ -133,21 +133,21 @@ pub(super) unsafe fn blas_sgemm_scores(
     scores: &mut [f32],
 ) {
     if use_ip {
-        cblas_sgemm(
+        unsafe { cblas_sgemm(
             CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_TRANS,
             n_query as i32, n_base as i32, dim as i32,
             1.0, query_data.as_ptr(), dim as i32,
             base_data.as_ptr(), dim as i32,
             0.0, scores.as_mut_ptr(), n_base as i32,
-        );
+        ) };
     } else {
-        cblas_sgemm(
+        unsafe { cblas_sgemm(
             CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_TRANS,
             n_query as i32, n_base as i32, dim as i32,
             -2.0, query_data.as_ptr(), dim as i32,
             base_data.as_ptr(), dim as i32,
             0.0, scores.as_mut_ptr(), n_base as i32,
-        );
+        ) };
         for qi in 0..n_query {
             let q_slice = &query_data[qi * dim..(qi + 1) * dim];
             let q_norm_sq: f32 = q_slice.iter().map(|v| v * v).sum();

@@ -114,6 +114,7 @@ mod tests {
         assert!(is_excluded_dir("target"));
         assert!(!is_excluded_dir("profiles"));
         assert!(!is_excluded_dir("datasets"));
+        assert!(!is_excluded_dir("docs"), "docs/ is a standard dataset artifact directory");
     }
 
     #[test]

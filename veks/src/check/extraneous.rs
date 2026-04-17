@@ -110,6 +110,20 @@ pub fn check(
         // knn_entries.yaml is produced by catalog generate
         accounted.insert("knn_entries.yaml".to_string());
 
+        // docs/ directory is a standard dataset artifact directory —
+        // all files within it are part of the dataset.
+        let docs_dir = workspace.join("docs");
+        if docs_dir.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(&docs_dir) {
+                for entry in entries.flatten() {
+                    if entry.path().is_file() {
+                        let name = entry.file_name().to_string_lossy().to_string();
+                        accounted.insert(format!("docs/{}", name));
+                    }
+                }
+            }
+        }
+
         // Check each publishable file under this workspace
         for file in publishable {
             if !file.starts_with(workspace) {

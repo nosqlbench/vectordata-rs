@@ -219,14 +219,18 @@ Only f32 (fvec) inputs are supported.
         ));
 
         // -- Load base vectors into contiguous buffer --------------------
-        ctx.ui.log("  loading base vectors into memory...");
+        let t0 = Instant::now();
+        ctx.ui.log(&format!("  loading {} base vectors ({:.1} MiB)...",
+            base_n, (base_n * base_dim * 4) as f64 / 1_048_576.0));
         let mut base_data: Vec<f32> = Vec::with_capacity(base_n * base_dim);
         for i in 0..base_n {
             base_data.extend_from_slice(base_reader.get_slice(base_offset + i));
         }
+        ctx.ui.log(&format!("  loaded in {:.1}s", t0.elapsed().as_secs_f64()));
 
         // -- Build FAISS index -------------------------------------------
-        ctx.ui.log("  building FAISS index...");
+        let t1 = Instant::now();
+        ctx.ui.log("  building FAISS FlatIndex...");
         let mut index = match faiss::index::flat::FlatIndex::new(d, faiss_mt) {
             Ok(idx) => idx,
             Err(e) => return error_result(format!("FAISS index creation failed: {}", e), start),
@@ -234,73 +238,93 @@ Only f32 (fvec) inputs are supported.
         if let Err(e) = index.add(&base_data) {
             return error_result(format!("FAISS index.add failed: {}", e), start);
         }
-        ctx.ui.log(&format!("  FAISS index built, ntotal={}", index.ntotal()));
+        ctx.ui.log(&format!("  FAISS index ready: ntotal={}, built in {:.1}s",
+            index.ntotal(), t1.elapsed().as_secs_f64()));
 
         // -- Load query vectors ------------------------------------------
-        ctx.ui.log("  loading query vectors...");
+        ctx.ui.log(&format!("  loading {} query vectors...", query_count));
         let mut query_data: Vec<f32> = Vec::with_capacity(query_count * query_dim);
         for i in 0..query_count {
             query_data.extend_from_slice(query_reader.get_slice(i));
         }
 
-        // -- Search ------------------------------------------------------
-        ctx.ui.log(&format!("  searching k={} neighbors for {} queries...", k, query_count));
-        let result = match index.search(&query_data, k) {
-            Ok(r) => r,
-            Err(e) => return error_result(format!("FAISS search failed: {}", e), start),
-        };
-
-        // -- Write output ------------------------------------------------
-        ctx.ui.log(&format!("  writing indices to {}", indices_path.display()));
+        // -- Open output files before search -----------------------------
         let mut idx_file = match std::fs::File::create(&indices_path) {
             Ok(f) => std::io::BufWriter::new(f),
             Err(e) => return error_result(
-                format!("create {}: {}", indices_path.display(), e), start,
-            ),
+                format!("create {}: {}", indices_path.display(), e), start),
         };
         let mut dist_file = match &distances_path {
-            Some(dp) => {
-                ctx.ui.log(&format!("  writing distances to {}", dp.display()));
-                match std::fs::File::create(dp) {
-                    Ok(f) => Some(std::io::BufWriter::new(f)),
-                    Err(e) => return error_result(
-                        format!("create {}: {}", dp.display(), e), start,
-                    ),
-                }
-            }
+            Some(dp) => match std::fs::File::create(dp) {
+                Ok(f) => Some(std::io::BufWriter::new(f)),
+                Err(e) => return error_result(
+                    format!("create {}: {}", dp.display(), e), start),
+            },
             None => None,
         };
 
+        // -- Chunked search + streaming write ----------------------------
+        // faiss-sys has an ABI issue with MKL LP64 where large query
+        // batches produce corrupt results at high dimensions. Cap batch
+        // size to keep nq * dim <= 65536. See docs/design/faiss-blas-abi-bug.md.
+        let max_queries_per_batch = (65536 / base_dim).max(1);
+        let chunk_size = max_queries_per_batch.min(query_count);
+        let n_chunks = (query_count + chunk_size - 1) / chunk_size;
+        let evals = query_count as f64 * base_n as f64;
+
+        ctx.ui.log(&format!("  FAISS search: {} queries x {} base, k={} ({} batches)...",
+            query_count, base_n, k, n_chunks));
+
+        let search_start = Instant::now();
+        let pb = ctx.ui.bar(query_count as u64, "FAISS search");
         let dim_bytes = (k as i32).to_le_bytes();
-        for q in 0..query_count {
-            // Write ivec record: [k:i32, idx0:i32, idx1:i32, ...]
-            if let Err(e) = idx_file.write_all(&dim_bytes) {
-                return error_result(format!("write indices: {}", e), start);
-            }
-            for j in 0..k {
-                let label = result.labels[q * k + j];
-                let idx: i32 = match label.get() {
-                    Some(v) => v as i32,
-                    None => -1,
-                };
-                if let Err(e) = idx_file.write_all(&idx.to_le_bytes()) {
+
+        for chunk_start in (0..query_count).step_by(chunk_size) {
+            let chunk_end = (chunk_start + chunk_size).min(query_count);
+            let chunk_data = &query_data[chunk_start * base_dim..chunk_end * base_dim];
+
+            let result = match index.search(chunk_data, k) {
+                Ok(r) => r,
+                Err(e) => return error_result(
+                    format!("FAISS search batch {}: {}", chunk_start / chunk_size, e), start),
+            };
+
+            // Stream results directly to output files
+            let chunk_n = chunk_end - chunk_start;
+            for qi in 0..chunk_n {
+                // ivec record
+                if let Err(e) = idx_file.write_all(&dim_bytes) {
                     return error_result(format!("write indices: {}", e), start);
                 }
-            }
-
-            // Write fvec record: [k:f32-as-i32, dist0:f32, dist1:f32, ...]
-            if let Some(ref mut dw) = dist_file {
-                if let Err(e) = dw.write_all(&dim_bytes) {
-                    return error_result(format!("write distances: {}", e), start);
-                }
                 for j in 0..k {
-                    let dist = result.distances[q * k + j];
-                    if let Err(e) = dw.write_all(&dist.to_le_bytes()) {
+                    let label = result.labels[qi * k + j];
+                    let idx: i32 = label.get().map(|v| v as i32).unwrap_or(-1);
+                    if let Err(e) = idx_file.write_all(&idx.to_le_bytes()) {
+                        return error_result(format!("write indices: {}", e), start);
+                    }
+                }
+
+                // fvec record (distances)
+                if let Some(ref mut dw) = dist_file {
+                    if let Err(e) = dw.write_all(&dim_bytes) {
                         return error_result(format!("write distances: {}", e), start);
+                    }
+                    for j in 0..k {
+                        let dist = result.distances[qi * k + j];
+                        if let Err(e) = dw.write_all(&dist.to_le_bytes()) {
+                            return error_result(format!("write distances: {}", e), start);
+                        }
                     }
                 }
             }
+
+            pb.set_position(chunk_end as u64);
         }
+        pb.finish();
+
+        let search_secs = search_start.elapsed().as_secs_f64();
+        ctx.ui.log(&format!("  search + write complete in {:.2}s ({:.1}B dist/s)",
+            search_secs, evals / search_secs / 1e9));
 
         if let Err(e) = idx_file.flush() {
             return error_result(format!("flush indices: {}", e), start);
@@ -318,8 +342,8 @@ Only f32 (fvec) inputs are supported.
 
         let elapsed = start.elapsed();
         ctx.ui.log(&format!(
-            "  FAISS KNN complete: {} queries x {} neighbors in {:.1}s",
-            query_count, k, elapsed.as_secs_f64()
+            "  FAISS KNN complete: {} queries x {} base x k={} in {:.1}s",
+            query_count, base_n, k, elapsed.as_secs_f64()
         ));
 
         CommandResult {
@@ -381,6 +405,39 @@ Only f32 (fvec) inputs are supported.
                 required: false,
                 default: Some("L2".to_string()),
                 description: "Distance metric: L2, DOT_PRODUCT, COSINE, IP".to_string(),
+                role: OptionRole::Config,
+            },
+            // Accept but ignore options from compute-knn for drop-in compatibility
+            OptionDesc {
+                name: "normalized".to_string(),
+                type_name: "bool".to_string(),
+                required: false,
+                default: Some("false".to_string()),
+                description: "Whether vectors are normalized (accepted for compatibility)".to_string(),
+                role: OptionRole::Config,
+            },
+            OptionDesc {
+                name: "threads".to_string(),
+                type_name: "int".to_string(),
+                required: false,
+                default: Some("0".to_string()),
+                description: "Ignored (FAISS uses OpenMP threads)".to_string(),
+                role: OptionRole::Config,
+            },
+            OptionDesc {
+                name: "partition_size".to_string(),
+                type_name: "int".to_string(),
+                required: false,
+                default: None,
+                description: "Ignored (FAISS indexes all base vectors at once)".to_string(),
+                role: OptionRole::Config,
+            },
+            OptionDesc {
+                name: "compress-cache".to_string(),
+                type_name: "bool".to_string(),
+                required: false,
+                default: Some("false".to_string()),
+                description: "Ignored (no partition cache with FAISS)".to_string(),
                 role: OptionRole::Config,
             },
         ]
@@ -649,5 +706,114 @@ mod tests {
         assert_eq!(rows[0][0], 0, "query 0 nearest should be base 0");
         assert_eq!(rows[1][0], 1, "query 1 nearest should be base 1");
         assert_eq!(rows[2][0], 2, "query 2 nearest should be base 2");
+    }
+
+    /// Drop-in compatibility: compute-knn-faiss produces the same results as
+    /// compute-knn on the same input data.
+    #[test]
+    fn test_knn_faiss_matches_compute_knn() {
+        use crate::pipeline::commands::compute_knn;
+        use std::collections::HashSet;
+
+        let tmp = tempfile::tempdir().unwrap();
+
+        // 100 base vectors, 10 queries, dim=8, k=5 — large enough to be meaningful
+        let mut rng = 42u64;
+        let mut next_f32 = || -> f32 {
+            rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+            (rng as f32 / u64::MAX as f32) * 2.0 - 1.0
+        };
+
+        let base: Vec<Vec<f32>> = (0..100).map(|_|
+            (0..8).map(|_| next_f32()).collect()
+        ).collect();
+        let query: Vec<Vec<f32>> = (0..10).map(|_|
+            (0..8).map(|_| next_f32()).collect()
+        ).collect();
+
+        let base_path = tmp.path().join("base.fvec");
+        let query_path = tmp.path().join("query.fvec");
+        write_fvec(&base_path, &base);
+        write_fvec(&query_path, &query);
+
+        // Run compute-knn (SimSIMD)
+        let simsimd_indices = tmp.path().join("simsimd_indices.ivec");
+        let simsimd_distances = tmp.path().join("simsimd_distances.fvec");
+        {
+            let mut ctx = make_ctx(tmp.path());
+            let mut opts = Options::new();
+            opts.set("base", base_path.to_string_lossy().to_string());
+            opts.set("query", query_path.to_string_lossy().to_string());
+            opts.set("indices", simsimd_indices.to_string_lossy().to_string());
+            opts.set("distances", simsimd_distances.to_string_lossy().to_string());
+            opts.set("neighbors", "5");
+            opts.set("metric", "L2");
+
+            let mut op = compute_knn::factory();
+            let r = op.execute(&opts, &mut ctx);
+            assert_eq!(r.status, Status::Ok, "compute-knn failed: {}", r.message);
+        }
+
+        // Run compute-knn-faiss
+        let faiss_indices = tmp.path().join("faiss_indices.ivec");
+        let faiss_distances = tmp.path().join("faiss_distances.fvec");
+        {
+            let mut ctx = make_ctx(tmp.path());
+            let mut opts = Options::new();
+            opts.set("base", base_path.to_string_lossy().to_string());
+            opts.set("query", query_path.to_string_lossy().to_string());
+            opts.set("indices", faiss_indices.to_string_lossy().to_string());
+            opts.set("distances", faiss_distances.to_string_lossy().to_string());
+            opts.set("neighbors", "5");
+            opts.set("metric", "L2");
+
+            let mut op = ComputeKnnFaissOp;
+            let r = op.execute(&opts, &mut ctx);
+            assert_eq!(r.status, Status::Ok, "compute-knn-faiss failed: {}", r.message);
+        }
+
+        // Compare: neighbor SETS should match (order may differ due to ties)
+        let simsimd_rows = read_ivec_rows(&simsimd_indices);
+        let faiss_rows = read_ivec_rows(&faiss_indices);
+        assert_eq!(simsimd_rows.len(), faiss_rows.len(), "different query counts");
+
+        for q in 0..simsimd_rows.len() {
+            let ss_set: HashSet<i32> = simsimd_rows[q].iter().copied().collect();
+            let ff_set: HashSet<i32> = faiss_rows[q].iter().copied().collect();
+            let diff = ss_set.symmetric_difference(&ff_set).count();
+            assert!(diff <= 2,
+                "query {}: SimSIMD neighbors {:?} vs FAISS {:?} — {} differ (max 2 boundary allowed)",
+                q, &simsimd_rows[q], &faiss_rows[q], diff);
+        }
+    }
+
+    /// Drop-in compatibility: extra options from compute-knn are accepted without error.
+    #[test]
+    fn test_knn_faiss_accepts_compute_knn_options() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = make_ctx(tmp.path());
+
+        let base = vec![vec![1.0, 2.0]; 5];
+        let query = vec![vec![1.0, 2.0]; 2];
+        write_fvec(&tmp.path().join("b.fvec"), &base);
+        write_fvec(&tmp.path().join("q.fvec"), &query);
+
+        let mut opts = Options::new();
+        opts.set("base", "b.fvec");
+        opts.set("query", "q.fvec");
+        opts.set("indices", "out.ivec");
+        opts.set("distances", "out.fvec");
+        opts.set("neighbors", "3");
+        opts.set("metric", "L2");
+        // These are compute-knn options that must be accepted
+        opts.set("normalized", "false");
+        opts.set("threads", "4");
+        opts.set("partition_size", "500000");
+        opts.set("compress-cache", "false");
+
+        let mut op = ComputeKnnFaissOp;
+        let r = op.execute(&opts, &mut ctx);
+        assert_eq!(r.status, Status::Ok,
+            "compute-knn-faiss should accept compute-knn options: {}", r.message);
     }
 }

@@ -87,13 +87,14 @@ pub trait CommandOp: Send {
     ///
     /// Returns a version identifier that changes whenever the command's
     /// logic changes. The default combines the crate version and git
-    /// commit hash, injected at compile time. This ensures that
-    /// recompiling with code changes automatically invalidates cached
-    /// results from the previous build.
+    /// commit hash and build number, injected at compile time. The build
+    /// number (epoch seconds) changes every compilation, so fingerprints
+    /// always invalidate when the binary is rebuilt — even if the git SHA
+    /// is unchanged.
     ///
-    /// Format: `{CARGO_PKG_VERSION}+{git_short_hash}`
+    /// Format: `{CARGO_PKG_VERSION}+{git_short_hash}.{build_number}`
     fn build_version(&self) -> &str {
-        concat!(env!("CARGO_PKG_VERSION"), "+", env!("VEKS_BUILD_HASH"))
+        concat!(env!("CARGO_PKG_VERSION"), "+", env!("VEKS_BUILD_HASH"), ".", env!("VEKS_BUILD_NUMBER"))
     }
 
     /// Declare which resource types this command consumes.

@@ -40,9 +40,6 @@ use std::io::Write;
 use std::path::Path;
 use std::time::Instant;
 
-#[cfg(feature = "faiss")]
-use faiss::Index;
-
 use vectordata::VectorReader;
 use vectordata::io::MmapVectorReader;
 

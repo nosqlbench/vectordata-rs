@@ -1594,6 +1594,7 @@ fn e2e_finalize_steps_run_after_compute() {
         "generate-dataset-json",
         "generate-variables-json",
         "generate-dataset-log-jsonl",
+        "generate-docs",
         "generate-merkle",
         "generate-catalog",
     ];
@@ -1679,6 +1680,9 @@ fn e2e_partition_profiles_full_pipeline() {
     args.metadata_fields = 1;
     args.metadata_range_min = 0;
     args.metadata_range_max = 4; // 5 distinct labels → up to 5 partitions
+    args.predicate_range_min = 0;
+    args.predicate_range_max = 4; // predicate labels match metadata labels
+    args.predicate_count = 10; // 1:1 with query count for oracle partitions
     args.partition_oracles = true;
     args.on_undersized = "warn".to_string();
     args.required_facets = Some("BQGDMPRFO".to_string());
@@ -1716,7 +1720,15 @@ fn e2e_partition_profiles_full_pipeline() {
         "partition_names count ({}) should match partition_count ({})",
         partition_names.len(), partition_count);
 
-    // Verify each partition profile has base_vectors and the file exists
+    // Verify the partition-profiles step has the predicates option
+    assert!(yaml_before.contains("predicates:") || {
+        let yaml_after = std::fs::read_to_string(&dataset_yaml).unwrap();
+        yaml_after.contains("predicates:")
+    }, "partition-profiles step should have predicates option in dataset.yaml");
+
+    // Verify each partition profile has base_vectors and per-label query_vectors
+    let total_query_count: usize = 2000 - 10; // 2000 vectors, 10 queries in self-search
+    // With 5 labels, queries should be split ~evenly
     for name in &partition_names {
         let profile = config.profile(name).unwrap();
         assert!(profile.base_count.is_some(),
@@ -1725,6 +1737,26 @@ fn e2e_partition_profiles_full_pipeline() {
         let base_path = out.join(base_view.path());
         assert!(base_path.exists(),
             "base_vectors for '{}' should exist: {}", name, base_path.display());
+
+        // Query vectors MUST be a real file, NOT a symlink
+        let query_path = out.join(format!("profiles/{}/query_vectors.fvec", name));
+        assert!(query_path.exists(),
+            "query_vectors for '{}' should exist", name);
+        assert!(!query_path.is_symlink(),
+            "query_vectors for '{}' MUST be a real file (per-label extraction), not a symlink", name);
+
+        // Query count should be less than total (per-label subset)
+        let query_data = std::fs::read(&query_path).unwrap();
+        if query_data.len() >= 4 {
+            let qdim = i32::from_le_bytes(query_data[0..4].try_into().unwrap()) as usize;
+            let qstride = 4 + qdim * 4;
+            let qcount = query_data.len() / qstride;
+            assert!(qcount < total_query_count,
+                "partition '{}' should have fewer queries ({}) than total ({})",
+                name, qcount, total_query_count);
+            assert!(qcount > 0,
+                "partition '{}' should have at least 1 query", name);
+        }
     }
 
     // Verify ascending base_count ordering

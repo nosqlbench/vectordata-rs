@@ -27,8 +27,6 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use rand_mt::Mt;
-use vectordata::VectorReader;
-use vectordata::io::MmapVectorReader;
 
 use crate::pipeline::atomic_write::AtomicWriter;
 use crate::pipeline::command::{

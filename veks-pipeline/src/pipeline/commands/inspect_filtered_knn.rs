@@ -71,6 +71,17 @@ profile.
   is skipped and only the filtered results are shown.
 - Distance values are read from `filtered_neighbor_distances` (D facet)
   when available.
+
+## Oracle Partitions
+
+When oracle partition profiles exist (O facet), each partition contains
+only the queries whose predicate matches that partition's label. A query
+with predicate `field_0 == 5` appears only in the `label_05` partition,
+not in the other partitions. This means the partition's KNN result files
+are indexed by partition query ordinal, not global query ordinal.
+
+Use `analyze explain-partitions --ordinal N` to trace the full
+global → partition query mapping and see the partition-specific KNN.
 "#,
                 render_options_table(&options)
             ),
@@ -144,6 +155,19 @@ profile.
         ctx.ui.log(&format!(
             "\n═══ Query ordinal {} ═══════════════════════════════════════",
             ordinal));
+
+        // Check for oracle partition profiles — if they exist, note that
+        // within each partition only the queries matching that partition's
+        // label are evaluated.
+        let has_partitions = config.profiles.profiles.iter()
+            .any(|(_, p)| p.partition);
+        if has_partitions {
+            ctx.ui.log("");
+            ctx.ui.log("  ℹ Oracle partition profiles exist for this dataset.");
+            ctx.ui.log("    Within each partition, only queries whose predicate");
+            ctx.ui.log("    matches the partition label are included in KNN.");
+            ctx.ui.log("    Use `analyze explain-partitions` for partition details.");
+        }
 
         ctx.ui.log("\n┌─ Stage 1: Predicate ─────────────────────────────────────");
         if pred_ext == "slab" {
