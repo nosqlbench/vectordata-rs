@@ -37,13 +37,13 @@ use super::compute_knn::Neighbor;
 
 /// Format-agnostic float vector reader for verification.
 /// Provides f32 slices regardless of storage precision.
-enum AnyFloatReader {
+pub(super) enum AnyFloatReader {
     F16(MmapVectorReader<half::f16>),
     F32(MmapVectorReader<f32>),
 }
 
 impl AnyFloatReader {
-    fn open(path: &Path) -> Result<Self, String> {
+    pub(super) fn open(path: &Path) -> Result<Self, String> {
         let etype = ElementType::from_path(path)
             .unwrap_or(ElementType::F32);
         match etype {
@@ -63,7 +63,7 @@ impl AnyFloatReader {
         }
     }
 
-    fn dim(&self) -> usize {
+    pub(super) fn dim(&self) -> usize {
         match self {
             AnyFloatReader::F16(r) => VectorReader::<half::f16>::dim(r),
             AnyFloatReader::F32(r) => VectorReader::<f32>::dim(r),
@@ -103,7 +103,7 @@ impl AnyFloatReader {
     }
 
     /// Fill buffer with f32 values for the given vector index.
-    fn fill_f32(&self, index: usize, buf: &mut [f32]) {
+    pub(super) fn fill_f32(&self, index: usize, buf: &mut [f32]) {
         match self {
             AnyFloatReader::F16(r) => {
                 let slice = r.get_slice(index);

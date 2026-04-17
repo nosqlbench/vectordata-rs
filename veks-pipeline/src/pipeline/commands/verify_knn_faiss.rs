@@ -515,14 +515,20 @@ impl CommandOp for VerifyKnnFaissConsolidatedOp {
     }
 
     fn command_doc(&self) -> CommandDoc {
+        let options = self.describe_options();
         CommandDoc {
             summary: "FAISS-based consolidated KNN verification across all profiles".into(),
-            body: "Verifies KNN ground truth for all sized profiles using FAISS. \
-                   Base vectors are loaded once and shared across profiles. \
-                   Profiles are sorted by base_count ascending — the FAISS index \
-                   is rebuilt incrementally for each profile size. Partition \
-                   profiles are verified independently with their own base vectors. \
-                   Sample queries are shared across profiles for consistency.".into(),
+            body: format!(
+                "Verifies KNN ground truth for all sized profiles using FAISS.\n\n\
+                 Loads base and query vectors once, sharing them across all sized \
+                 profiles. Profiles are sorted by base_count ascending — the FAISS \
+                 index is rebuilt for each profile size using a prefix of the shared \
+                 base data. Partition profiles are verified independently in parallel \
+                 with their own base vectors. The sample and seed options control \
+                 query sampling. The metric and normalized options control distance \
+                 computation. Results are written to the output JSON report.\n\n\
+                 ## Options\n\n{}",
+                render_options_table(&options)),
         }
     }
 

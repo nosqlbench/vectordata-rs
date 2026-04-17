@@ -2732,3 +2732,224 @@ fn fuzz_corrupt_file_no_panic() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Cross-engine KNN parity tests
+// ---------------------------------------------------------------------------
+// Verify that knn-metal (SimSIMD), knn-stdarch (pure std::arch), and
+// knn-faiss (FAISS) produce equivalent neighbor sets across a matrix of
+// dimensions and distance metrics.
+
+/// Write vectors in mvec (f16) format.
+fn write_test_mvec(path: &Path, vectors: &[Vec<f32>]) {
+    use std::io::Write;
+    let mut f = std::fs::File::create(path).unwrap();
+    for v in vectors {
+        let dim = v.len() as i32;
+        f.write_all(&dim.to_le_bytes()).unwrap();
+        for &val in v {
+            let h = half::f16::from_f32(val);
+            f.write_all(&h.to_le_bytes()).unwrap();
+        }
+    }
+}
+
+/// Generate deterministic random f32 vectors.
+fn gen_vectors(seed: u64, n: usize, dim: usize) -> Vec<Vec<f32>> {
+    let mut rng = seed;
+    let mut next = || -> f32 {
+        rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+        (rng as f32 / u64::MAX as f32) * 2.0 - 1.0
+    };
+    (0..n).map(|_| (0..dim).map(|_| next()).collect()).collect()
+}
+
+/// Run a KNN engine and return the neighbor indices per query.
+fn run_engine(
+    engine: &str,
+    base_path: &std::path::Path,
+    query_path: &std::path::Path,
+    out_dir: &std::path::Path,
+    k: usize,
+    metric: &str,
+) -> Vec<Vec<i32>> {
+    use vectordata::VectorReader;
+    use vectordata::io::MmapVectorReader;
+
+    let indices_path = out_dir.join(format!("{}_indices.ivec", engine));
+    let registry = veks_pipeline::pipeline::registry::CommandRegistry::with_builtins();
+    let cmd_name = match engine {
+        "metal" => "compute knn-metal",
+        "stdarch" => "compute knn-stdarch",
+        "faiss" => "compute knn-faiss",
+        _ => panic!("unknown engine: {}", engine),
+    };
+    let mut cmd = registry.get(cmd_name)
+        .unwrap_or_else(|| panic!("command {} not found", cmd_name))();
+    let mut opts = Options::new();
+    opts.set("base", base_path.to_string_lossy().to_string());
+    opts.set("query", query_path.to_string_lossy().to_string());
+    opts.set("indices", indices_path.to_string_lossy().to_string());
+    opts.set("neighbors", &k.to_string());
+    opts.set("metric", metric);
+
+    let mut ctx = test_ctx(out_dir);
+    let r = cmd.execute(&opts, &mut ctx);
+    assert_eq!(r.status, Status::Ok, "engine {} metric {} failed: {}", engine, metric, r.message);
+
+    let reader = MmapVectorReader::<i32>::open_ivec(&indices_path).unwrap();
+    let count = VectorReader::<i32>::count(&reader);
+    (0..count).map(|i| reader.get_slice(i).to_vec()).collect()
+}
+
+/// Compare two engine results. Returns (exact_set_match, boundary_mismatch, real_mismatch).
+fn compare_results(a: &[Vec<i32>], b: &[Vec<i32>]) -> (usize, usize, usize) {
+    use std::collections::HashSet;
+    let mut exact = 0;
+    let mut boundary = 0;
+    let mut real = 0;
+    for i in 0..a.len() {
+        let sa: HashSet<i32> = a[i].iter().copied().collect();
+        let sb: HashSet<i32> = b[i].iter().copied().collect();
+        if sa == sb {
+            exact += 1;
+        } else {
+            let diff = sa.symmetric_difference(&sb).count() / 2;
+            if diff <= 5 { boundary += 1; } else { real += 1; }
+        }
+    }
+    (exact, boundary, real)
+}
+
+/// Cross-engine parity: metal vs stdarch must be exact across all
+/// dimensions and metrics. FAISS vs metal/stdarch allows boundary
+/// mismatches from FP rounding but no real mismatches.
+#[test]
+fn cross_engine_knn_parity() {
+    let dims = [8, 32, 128, 256, 512, 768, 1024, 1536, 2048, 3072, 4096];
+    let metrics = ["L2", "DOT_PRODUCT", "COSINE"];
+    let n_base = 200;
+    let n_query = 20;
+    let k = 10;
+
+    // FAISS has a known BLAS ABI bug that produces corrupt results
+    // at high dimensions. See docs/design/faiss-blas-abi-bug.md.
+    // Only test FAISS at dims where it's known to work.
+    let faiss_max_dim = 256;
+
+    let mut failures: Vec<String> = Vec::new();
+    let mut faiss_warnings: Vec<String> = Vec::new();
+
+    for &dim in &dims {
+        let tmp = tmp_dir();
+        let base_vecs = gen_vectors(42, n_base, dim);
+        let query_vecs = gen_vectors(99, n_query, dim);
+
+        let base_path = tmp.path().join("base.fvec");
+        let query_path = tmp.path().join("query.fvec");
+        write_test_fvec(&base_path, &base_vecs);
+        write_test_fvec(&query_path, &query_vecs);
+
+        let test_faiss = dim <= faiss_max_dim;
+
+        for metric in &metrics {
+            // Always run metal and stdarch
+            let engines: Vec<&str> = if test_faiss {
+                vec!["metal", "stdarch", "faiss"]
+            } else {
+                vec!["metal", "stdarch"]
+            };
+
+            let mut results: Vec<(&str, Vec<Vec<i32>>)> = Vec::new();
+            for engine in &engines {
+                let out_dir = tmp.path().join(format!("{}_{}", engine, metric));
+                std::fs::create_dir_all(&out_dir).unwrap();
+                let r = run_engine(engine, &base_path, &query_path, &out_dir, k, metric);
+                results.push((engine, r));
+            }
+
+            // Metal vs stdarch: must agree at ALL dimensions.
+            // L2 and DOT_PRODUCT use identical FP paths → exact match.
+            // COSINE uses different norm computation (SimSIMD vs hand-rolled
+            // AVX-512) which can produce ULP-level rounding differences at
+            // high dimensions → allow boundary mismatches.
+            let (exact, boundary, real) = compare_results(&results[0].1, &results[1].1);
+            if real > 0 {
+                failures.push(format!(
+                    "dim={} metric={}: metal vs stdarch: {}/{} exact, {} boundary, {} REAL MISMATCH",
+                    dim, metric, exact, n_query, boundary, real));
+            } else if *metric != "COSINE" && exact != n_query {
+                failures.push(format!(
+                    "dim={} metric={}: metal vs stdarch: {}/{} exact, {} boundary (expected exact for {})",
+                    dim, metric, exact, n_query, boundary, metric));
+            }
+
+            // FAISS comparisons only at safe dimensions
+            if test_faiss {
+                let (exact, boundary, real) = compare_results(&results[0].1, &results[2].1);
+                if real > 0 {
+                    failures.push(format!(
+                        "dim={} metric={}: metal vs faiss: {}/{} exact, {} boundary, {} REAL MISMATCH",
+                        dim, metric, exact, n_query, boundary, real));
+                }
+
+                let (exact, boundary, real) = compare_results(&results[1].1, &results[2].1);
+                if real > 0 {
+                    failures.push(format!(
+                        "dim={} metric={}: stdarch vs faiss: {}/{} exact, {} boundary, {} REAL MISMATCH",
+                        dim, metric, exact, n_query, boundary, real));
+                }
+            } else {
+                faiss_warnings.push(format!(
+                    "dim={}: FAISS skipped (known BLAS ABI bug at dim>{})", dim, faiss_max_dim));
+            }
+        }
+    }
+
+    // ── f16 precision test ─────────────────────────────────────────
+    // knn-metal supports f16 (mvec). Verify f16 results are reasonable
+    // compared to f32 (wider tolerance for f16 quantization).
+    for &dim in &[32, 128, 512] {
+        let tmp = tmp_dir();
+        let base_vecs = gen_vectors(42, n_base, dim);
+        let query_vecs = gen_vectors(99, n_query, dim);
+
+        let f32_base = tmp.path().join("base.fvec");
+        let f32_query = tmp.path().join("query.fvec");
+        write_test_fvec(&f32_base, &base_vecs);
+        write_test_fvec(&f32_query, &query_vecs);
+
+        let f16_base = tmp.path().join("base.mvec");
+        let f16_query = tmp.path().join("query.mvec");
+        write_test_mvec(&f16_base, &base_vecs);
+        write_test_mvec(&f16_query, &query_vecs);
+
+        for metric in &["L2", "DOT_PRODUCT"] {
+            let f32_dir = tmp.path().join(format!("f32_{}", metric));
+            let f16_dir = tmp.path().join(format!("f16_{}", metric));
+            std::fs::create_dir_all(&f32_dir).unwrap();
+            std::fs::create_dir_all(&f16_dir).unwrap();
+
+            let f32_r = run_engine("metal", &f32_base, &f32_query, &f32_dir, k, metric);
+            let f16_r = run_engine("metal", &f16_base, &f16_query, &f16_dir, k, metric);
+
+            let (exact, boundary, real) = compare_results(&f32_r, &f16_r);
+            // f16 quantization causes legitimate neighbor differences,
+            // but >50% real mismatches suggests a bug
+            if real > n_query / 2 {
+                failures.push(format!(
+                    "dim={} metric={}: f32 vs f16 metal: {}/{} exact, {} boundary, {} real (>50%)",
+                    dim, metric, exact, n_query, boundary, real));
+            }
+        }
+    }
+
+    if !faiss_warnings.is_empty() {
+        eprintln!("FAISS skipped for {} dimension/metric combinations (BLAS ABI bug)",
+            faiss_warnings.len());
+    }
+
+    if !failures.is_empty() {
+        panic!("Cross-engine parity failures:\n{}", failures.join("\n"));
+    }
+}

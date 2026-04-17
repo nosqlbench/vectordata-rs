@@ -1102,9 +1102,13 @@ fn merge_partitions(
     let mut tie_details: Vec<String> = Vec::new();
     let mut has_duplicate_ties = false;
 
-    // Open base vectors for duplicate checking on ties
-    let base_reader = MmapVectorReader::<f32>::open_fvec(base_path)
+    // Open base vectors for duplicate checking on ties.
+    // Use the format-aware reader so this works with fvec, mvec, and dvec.
+    let base_reader = super::verify_consolidated::AnyFloatReader::open(base_path)
         .map_err(|e| format!("failed to open base for tie check: {}", e))?;
+    let tie_dim = base_reader.dim();
+    let mut tie_buf_a = vec![0.0f32; tie_dim];
+    let mut tie_buf_b = vec![0.0f32; tie_dim];
 
     let pb = make_query_progress_bar(query_count as u64, ui);
     for _qi in 0..query_count {
@@ -1165,11 +1169,10 @@ fn merge_partitions(
                 let kth_idx = candidates[k - 1].index as usize;
                 for c in &candidates[k..k + extra] {
                     let evicted_idx = c.index as usize;
-                    let kth_vec = base_reader.get_slice(kth_idx);
-                    let evicted_vec = base_reader.get_slice(evicted_idx);
-                    let is_dup = kth_vec.len() == evicted_vec.len()
-                        && kth_vec.iter().zip(evicted_vec.iter())
-                            .all(|(a, b)| a.to_bits() == b.to_bits());
+                    base_reader.fill_f32(kth_idx, &mut tie_buf_a);
+                    base_reader.fill_f32(evicted_idx, &mut tie_buf_b);
+                    let is_dup = tie_buf_a.iter().zip(tie_buf_b.iter())
+                        .all(|(a, b)| a.to_bits() == b.to_bits());
                     if is_dup {
                         has_duplicate_ties = true;
                         tie_details.push(format!(

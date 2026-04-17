@@ -305,6 +305,9 @@ const BATCH_WIDTH: usize = 16;
 /// Layout: `data[d * BATCH_WIDTH + qi]` — one contiguous f32x16 per dimension.
 struct TransposedQueries {
     data: Vec<f32>,
+    /// Precomputed L2 norm of each query (for cosine distance).
+    /// Unused slots = 1.0 to avoid division by zero.
+    query_norms: [f32; BATCH_WIDTH],
     dim: usize,
     count: usize,
 }
@@ -314,12 +317,16 @@ impl TransposedQueries {
         let count = queries.len();
         assert!(count <= BATCH_WIDTH);
         let mut data = vec![0.0f32; dim * BATCH_WIDTH];
+        let mut query_norms = [1.0f32; BATCH_WIDTH];
         for (qi, q) in queries.iter().enumerate() {
+            let mut norm_sq = 0.0f32;
             for d in 0..dim {
                 data[d * BATCH_WIDTH + qi] = q[d];
+                norm_sq += q[d] * q[d];
             }
+            query_norms[qi] = norm_sq.sqrt().max(f32::EPSILON);
         }
-        Self { data, dim, count }
+        Self { data, query_norms, dim, count }
     }
 }
 
@@ -377,6 +384,49 @@ unsafe fn neg_dot_batch16_avx512(
     }
 }
 
+/// Compute cosine distance from one base vector to 16 transposed queries.
+/// cosine_dist = 1.0 - dot(base, query) / (norm(base) * norm(query))
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn cosine_batch16_avx512(
+    base_vec: &[f32],
+    transposed: &TransposedQueries,
+    out: &mut [f32; BATCH_WIDTH],
+) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let dim = transposed.dim;
+        let tp = transposed.data.as_ptr();
+        let bp = base_vec.as_ptr();
+        let mut dot_acc = _mm512_setzero_ps();
+        let mut base_norm_acc = _mm512_setzero_ps();
+
+        for d in 0..dim {
+            let bval = _mm512_set1_ps(*bp.add(d));
+            let qvals = _mm512_loadu_ps(tp.add(d * BATCH_WIDTH));
+            dot_acc = _mm512_fmadd_ps(bval, qvals, dot_acc);
+            base_norm_acc = _mm512_fmadd_ps(bval, bval, base_norm_acc);
+        }
+
+        // base_norm is the same for all 16 queries — reduce and broadcast
+        let base_norm = _mm512_reduce_add_ps(base_norm_acc).sqrt().max(f32::EPSILON);
+        let base_norm_v = _mm512_set1_ps(base_norm);
+
+        // query norms are precomputed
+        let q_norms = _mm512_loadu_ps(transposed.query_norms.as_ptr());
+
+        // denom = base_norm * query_norms
+        let denom = _mm512_mul_ps(base_norm_v, q_norms);
+
+        // cosine_dist = 1.0 - dot / denom
+        let one = _mm512_set1_ps(1.0);
+        let cos_sim = _mm512_div_ps(dot_acc, denom);
+        let cos_dist = _mm512_sub_ps(one, cos_sim);
+
+        _mm512_storeu_ps(out.as_mut_ptr(), cos_dist);
+    }
+}
+
 /// Batch distance function type for transposed queries.
 type BatchDistFn = unsafe fn(&[f32], &TransposedQueries, &mut [f32; BATCH_WIDTH]);
 
@@ -387,7 +437,7 @@ fn select_batch_dist_fn(metric: Metric) -> Option<BatchDistFn> {
             return Some(match metric {
                 Metric::L2 => l2sq_batch16_avx512,
                 Metric::DotProduct => neg_dot_batch16_avx512,
-                Metric::Cosine => return None, // cosine needs norms, use pairwise
+                Metric::Cosine => cosine_batch16_avx512,
             });
         }
     }

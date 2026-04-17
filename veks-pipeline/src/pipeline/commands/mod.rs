@@ -142,11 +142,8 @@ pub fn register_all(registry: &mut CommandRegistry) {
     registry.register("compute partition-profiles", compute_partition_profiles::factory);
     #[cfg(feature = "knnutils")]
     registry.register("compute knn-blas", compute_knn_blas::factory);
-    // "compute knn" → FAISS when available, otherwise SimSIMD
-    #[cfg(feature = "faiss")]
-    registry.register("compute knn", compute_knn_faiss::factory);
-    #[cfg(not(feature = "faiss"))]
-    registry.register("compute knn", compute_knn::factory);
+    // "compute knn" → stdarch (pure std::arch, zero external deps)
+    registry.register("compute knn", compute_knn_stdarch::factory);
     #[cfg(feature = "faiss")]
     registry.register("compute knn-faiss", compute_knn_faiss::factory);
     #[cfg(feature = "faiss")]
