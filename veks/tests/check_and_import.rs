@@ -113,6 +113,7 @@ fn default_args(name: &str, output: &Path) -> ImportArgs {
             partition_oracles: false,
             max_partitions: 100,
             on_undersized: "error".to_string(),
+            cosine_mode: None,
     }
 }
 
@@ -1739,6 +1740,12 @@ fn import_full_pipeline_everything_disabled() {
     assert!(!ids.contains(&"count-duplicates".to_string()), "no count-duplicates: {:?}", ids);
     assert!(!ids.contains(&"convert-metadata".to_string()), "no metadata: {:?}", ids);
     assert!(!ids.contains(&"compute-filtered-knn".to_string()), "no filtered KNN: {:?}", ids);
+    // --no-dedup and --no-zero-check mean NO scan, not even advisory.
+    // Honoring the user's "no" is a hard rule (sysref §7.4.1).
+    assert!(!ids.contains(&"scan-zeros".to_string()),
+        "no_zero_check=true → no scan-zeros: {:?}", ids);
+    assert!(!ids.contains(&"scan-duplicates".to_string()),
+        "no_dedup=true → no scan-duplicates: {:?}", ids);
 
     // Should still have self-search chain + KNN
     assert!(ids.contains(&"count-vectors".to_string()), "count-vectors: {:?}", ids);
@@ -1752,15 +1759,14 @@ fn import_full_pipeline_everything_disabled() {
     assert!(yaml.contains("normalize: true"),
         "normalize: true should always appear on extract steps");
 
-    // New metadata steps + verification + json/merkle/catalog
     // count-vectors, count-source-base, set-is_shuffled, set-is_self_search,
-    // set-combined_bq, set-k, scan-zeros, scan-duplicates,
-    // generate-shuffle, extract-queries, extract-base, count-base,
-    // compute-knn, verify-knn, generate-dataset-json,
+    // set-combined_bq, set-k, generate-shuffle, extract-queries, extract-base,
+    // count-base, compute-knn, verify-knn, generate-dataset-json,
     // generate-variables-json, generate-dataset-log-jsonl, generate-docs,
-    // generate-merkle, generate-catalog = 20
-    assert_eq!(ids.len(), 20,
-        "minimal self-search pipeline should have 20 steps, got {}: {:?}", ids.len(), ids);
+    // generate-merkle, generate-catalog = 18
+    // (scan-zeros + scan-duplicates removed — user's "no" is honored.)
+    assert_eq!(ids.len(), 18,
+        "minimal self-search pipeline should have 18 steps, got {}: {:?}", ids.len(), ids);
 }
 
 #[test]

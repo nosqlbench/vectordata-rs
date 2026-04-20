@@ -136,6 +136,15 @@ pub struct ImportArgs {
     /// Behavior when a partition has fewer than k vectors: "error", "warn", "include".
     #[serde(default = "default_on_undersized")]
     pub on_undersized: String,
+    /// For COSINE metric: which cosine strategy the KNN engines should
+    /// use. `Some("assume_normalized")` uses the inner product on the
+    /// assumption that inputs are already unit-normalized (FAISS /
+    /// numpy / knn_utils convention). `Some("proper")` computes cosine
+    /// in-kernel as `dot / (|q| × |b|)`. `None` means unset — bootstrap
+    /// will prompt (or error in non-interactive mode) when metric is
+    /// COSINE. Ignored for L2 and DOT_PRODUCT.
+    #[serde(default)]
+    pub cosine_mode: Option<String>,
 }
 
 fn default_max_partitions() -> u32 { 100 }
@@ -509,15 +518,27 @@ fn resolve_slots(args: &ImportArgs) -> PipelineSlots {
         .map(|p| VecFormat::detect_from_path(p) == Some(VecFormat::Hdf5))
         .unwrap_or(false);
 
-    // Query generation strategy (SRD §20.8):
-    // Strategy 1: Non-HDF5 B+Q → combine into single source, shuffle split
-    // Strategy 2: HDF5 B+Q → independent processing
-    // Strategy 3: Non-HDF5 B only → self-search via shuffle
-    // combined_bq: combine base+query into one source for shuffle-based splitting.
-    // Only when: separate query exists, not HDF5, AND no pre-computed ground truth
-    // (pre-computed GT implies queries are truly independent, not to be recombined).
+    // Shuffling randomizes vector order for train/test splitting.
+    // Disabled when ground truth is pre-provided (Identity) — shuffling
+    // would change ordinals and invalidate the GT.
     let has_precomputed_gt = args.ground_truth.is_some();
-    let combined_bq = has_separate_query && !is_hdf5_source && !has_precomputed_gt;
+    let shuffle_enabled = args.seed != 0 && !has_precomputed_gt;
+
+    // Query generation strategy (SRD §7.4.1, §20.8):
+    //   Strategy 1: Non-HDF5 B+Q → combine into single source, shuffle split
+    //   Strategy 2: HDF5 B+Q     → independent processing (no combine)
+    //   Strategy 3: B only       → self-search via shuffle
+    //
+    // `combined_bq` is the Strategy 1 path: combine separate B+Q into one
+    // source so dedup/sort work over the union, then use the shuffle to
+    // split back out. It requires shuffle to function — without shuffle
+    // there's no way to recover the train/test split. So gate it on
+    // `shuffle_enabled`. If the user disabled shuffle and provided Q
+    // separately, treat the inputs as independent (use Q as-is) per the
+    // sysref §7.4.1 rule: a user-supplied "no shuffle" is never silently
+    // overridden, and Q-provided is categorically not self-search.
+    let combined_bq = has_separate_query && !is_hdf5_source
+        && !has_precomputed_gt && shuffle_enabled;
     let self_search = wants_queries && (!has_separate_query || combined_bq);
     let has_queries = has_separate_query || self_search;
 
@@ -530,17 +551,27 @@ fn resolve_slots(args: &ImportArgs) -> PipelineSlots {
             .unwrap_or("fvecs")
     };
 
-    // Shuffling randomizes vector order for train/test splitting.
-    // Disabled when ground truth is pre-provided (Identity) — shuffling
-    // would change ordinals and invalidate the GT.
-    let has_precomputed_gt = args.ground_truth.is_some();
-    let shuffle_enabled = args.seed != 0 && !has_precomputed_gt;
-
     let (shuffle, query_vectors, base_vectors, base_count) = if self_search {
-        // Strategy 1 (combined B+Q) or Strategy 3 (B only): shuffle + extract
-        // For Strategy 1, base+query are combined before prepare-vectors,
-        // then shuffle produces disjoint train/test split.
-        // Shuffle is always required for self-search (provides train/test split).
+        // Strategy 1 (combined B+Q) or Strategy 3 (B only): shuffle + extract.
+        // Self-search uses the shuffle output to choose which base rows
+        // become queries (train/test split) — there is no other path.
+        //
+        // Hard rule (sysref §7): a user-supplied "no shuffle" answer is
+        // never silently overridden. If the caller asked for self-search
+        // AND disabled shuffle (seed=0), the configuration is internally
+        // contradictory; refuse to emit a graph that ignores the
+        // user's answer.
+        if !shuffle_enabled {
+            eprintln!(
+                "Error: self-search requires the shuffle to pick the train/test split, \
+                 but shuffle was disabled (seed=0).\n\
+                 Resolve by either:\n  \
+                   - providing a separate query file (--query-vectors), or\n  \
+                   - enabling shuffle with a non-zero seed.\n\
+                 The pipeline will not silently override your shuffle preference."
+            );
+            std::process::exit(1);
+        }
         let shuffle = Artifact::Materialized {
             step_id: "generate-shuffle".into(),
             output: "${cache}/shuffle.ivecs".into(),
@@ -836,9 +867,68 @@ fn cmd_shuffle(personality: &str) -> &'static str {
 }
 
 fn cmd_knn(personality: &str) -> &'static str {
+    // knn-blas is the canonical default: numpy / knn_utils kernel
+    // parity with segment-cache + streaming pread. It requires the
+    // `knnutils` feature (system BLAS at link time). When that
+    // feature isn't compiled in, fall back to `compute knn` (the
+    // stdarch alias) so generated dataset.yaml files reference a
+    // command the binary actually registers.
+    //
+    // Datasets whose base is f16 (mvec) should point the `run:` field
+    // at `compute knn` explicitly — knn-blas is f32-only.
     match personality {
-        "knn_utils" => "compute knn-blas",
-        _ => "compute knn",
+        "knn_utils" => {
+            #[cfg(feature = "knnutils")]
+            { "compute knn-blas" }
+            #[cfg(not(feature = "knnutils"))]
+            {
+                eprintln!(
+                    "Warning: --personality knn_utils selected but the `knnutils` feature \
+                     is not compiled in. Falling back to `compute knn` (stdarch)."
+                );
+                "compute knn"
+            }
+        }
+        _ => {
+            #[cfg(feature = "knnutils")]
+            { "compute knn-blas" }
+            #[cfg(not(feature = "knnutils"))]
+            { "compute knn" }
+        }
+    }
+}
+
+/// Build the cosine-mode options for a KNN step. When metric is
+/// COSINE, returns one of the two explicit flags based on the
+/// `cosine_mode` the caller chose. For non-cosine metrics, returns
+/// nothing (the flags don't apply).
+///
+/// The legacy `normalized` option is still emitted as a
+/// back-compat alias when applicable — existing consumers of the
+/// generated dataset.yaml that don't know the new flags will still
+/// understand `normalized`.
+fn knn_cosine_opts(args: &ImportArgs) -> Vec<(String, String)> {
+    if args.metric.to_uppercase() != "COSINE" {
+        // L2 / DOT_PRODUCT: carry the normalized hint through so
+        // downstream steps (compute_filtered_knn, etc.) that still
+        // read it can infer pipeline-level normalization.
+        return vec![
+            ("normalized".into(), if args.normalize { "true" } else { "false" }.into()),
+        ];
+    }
+    let mode = args.cosine_mode.as_deref().unwrap_or("assume_normalized");
+    match mode {
+        "proper" => vec![
+            ("use_proper_cosine_metric".into(), "true".into()),
+            // If the pipeline still normalizes the data, note it for
+            // downstream consumers — doesn't change kernel behavior
+            // under `use_proper_cosine_metric`, just informational.
+            ("normalized".into(), if args.normalize { "true" } else { "false" }.into()),
+        ],
+        _ => vec![
+            ("assume_normalized_like_faiss".into(), "true".into()),
+            ("normalized".into(), "true".into()),
+        ],
     }
 }
 
@@ -1119,33 +1209,40 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
         // The exclusion set (duplicates ∪ zeros) is applied directly by
         // extract-base and extract-queries.
     } else if !slots.base_vectors.path().is_empty() {
-        // When prepare-vectors is skipped (Identity base, no dedup), scan
-        // the source vectors for zeros and duplicates so the dataset
-        // attributes can be populated with verified values.
-        steps.push(Step {
-            id: "scan-zeros".into(),
-            run: "analyze find-zeros".into(),
-            description: Some("Scan source vectors for zero vectors".into()),
-            after: vec!["count-vectors".into()],
-            per_profile: false,
-            phase: 0,
-            finalize: false,
-            options: vec![
-                ("source".into(), slots.base_vectors.path().into()),
-            ],
-        });
-        steps.push(Step {
-            id: "scan-duplicates".into(),
-            run: "analyze find-duplicates".into(),
-            description: Some("Scan source vectors for duplicates".into()),
-            after: vec!["count-vectors".into()],
-            per_profile: false,
-            phase: 0,
-            finalize: false,
-            options: vec![
-                ("source".into(), slots.base_vectors.path().into()),
-            ],
-        });
+        // When prepare-vectors is skipped (Identity base, no dedup), the
+        // dataset attributes for zero/duplicate counts come from these
+        // standalone scans. Respect the user's --no-zero-check /
+        // --no-dedup answers per the sysref §7.4.1 rule: a user-supplied
+        // "no" is never silently overridden — even when the side-effect
+        // is just dataset-attribute population.
+        if !args.no_zero_check {
+            steps.push(Step {
+                id: "scan-zeros".into(),
+                run: "analyze find-zeros".into(),
+                description: Some("Scan source vectors for zero vectors".into()),
+                after: vec!["count-vectors".into()],
+                per_profile: false,
+                phase: 0,
+                finalize: false,
+                options: vec![
+                    ("source".into(), slots.base_vectors.path().into()),
+                ],
+            });
+        }
+        if !args.no_dedup {
+            steps.push(Step {
+                id: "scan-duplicates".into(),
+                run: "analyze find-duplicates".into(),
+                description: Some("Scan source vectors for duplicates".into()),
+                after: vec!["count-vectors".into()],
+                per_profile: false,
+                phase: 0,
+                finalize: false,
+                options: vec![
+                    ("source".into(), slots.base_vectors.path().into()),
+                ],
+            });
+        }
     }
 
     // Was the subset already applied by the subset-vectors or convert step?
@@ -1677,8 +1774,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
                     if args.compress_cache {
                         opts.push(("compress_cache".into(), "true".into()));
                     }
-                    opts.push(("normalized".into(),
-                        if args.normalize { "true" } else { "false" }.into()));
+                    opts.extend(knn_cosine_opts(args));
                     opts
                 },
             });
@@ -1710,8 +1806,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
                         ("neighbors".into(), args.neighbors.to_string()),
                         ("metric".into(), args.metric.clone()),
                     ];
-                    opts.push(("normalized".into(),
-                        if args.normalize { "true" } else { "false" }.into()));
+                    opts.extend(knn_cosine_opts(args));
                     opts
                 },
             });
@@ -3217,6 +3312,7 @@ mod tests {
             partition_oracles: false,
             max_partitions: 100,
             on_undersized: "error".to_string(),
+            cosine_mode: None,
         }
     }
 
@@ -3439,7 +3535,10 @@ mod tests {
         let runs: Vec<&str> = steps.iter().map(|s| s.run.as_str()).collect();
         assert!(runs.contains(&"compute sort"), "native should use 'compute sort': {:?}", runs);
         assert!(runs.contains(&"generate shuffle"), "native should use 'generate shuffle': {:?}", runs);
-        assert!(runs.contains(&"compute knn"), "native should use 'compute knn': {:?}", runs);
+        // Native personality now defaults to knn-blas for KNN (numpy
+        // / knn_utils kernel parity). sort / shuffle remain native.
+        assert!(runs.contains(&"compute knn-blas"),
+            "native should use 'compute knn-blas' by default: {:?}", runs);
     }
 
     #[test]

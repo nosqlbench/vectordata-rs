@@ -158,19 +158,47 @@ impl DatasetConfig {
     pub fn load_and_resolve(path: &Path) -> Result<Self, String> {
         let mut config = Self::load(path)?;
         if config.profiles.has_deferred() {
+            // Variables come from two sources:
+            //   1. The `variables:` block inside dataset.yaml (frozen
+            //      at bootstrap / manual edit time).
+            //   2. `variables.yaml` alongside, rewritten by each
+            //      pipeline run (base_count, clean_count, etc.).
+            // Merge them with (2) winning on key conflicts, so a fresh
+            // run's numbers override any stale dataset.yaml baseline —
+            // but if variables.yaml is absent (e.g. just after
+            // `veks run --clean`), dataset.yaml's frozen values still
+            // drive sized-profile expansion.
             let workspace = path.parent().unwrap_or(std::path::Path::new("."));
+            let mut vars: indexmap::IndexMap<String, String> = config.variables.clone();
+
             let vars_path = workspace.join("variables.yaml");
             if vars_path.exists() {
                 if let Ok(content) = std::fs::read_to_string(&vars_path) {
-                    if let Ok(vars) = serde_yaml::from_str::<indexmap::IndexMap<String, String>>(&content) {
-                        let base_count: u64 = vars.get("base_count")
-                            .and_then(|v| v.parse().ok())
-                            .unwrap_or(0);
-                        if base_count > 0 {
-                            config.profiles.expand_deferred_sized(&vars, base_count);
+                    if let Ok(file_vars) = serde_yaml::from_str::<indexmap::IndexMap<String, String>>(&content) {
+                        for (k, v) in file_vars {
+                            vars.insert(k, v);
                         }
                     }
                 }
+            }
+
+            // Fall through several count variables in priority order.
+            // Different stages of the pipeline produce different ones:
+            //   base_count        → count-base step (post extract-base)
+            //   clean_count       → prepare-vectors (post dedup/zero)
+            //   vector_count      → count-vectors (very early)
+            //   source_base_count → source counter alias
+            // For sized-profile expansion we just need *some* positive
+            // upper bound on the base size. Picking the first
+            // available means expansion works even on a freshly
+            // cleaned workspace where only the early counters have
+            // been written.
+            let base_count: u64 = ["base_count", "clean_count", "vector_count", "source_base_count"]
+                .iter()
+                .find_map(|k| vars.get(*k).and_then(|v| v.parse().ok()).filter(|&n: &u64| n > 0))
+                .unwrap_or(0);
+            if base_count > 0 {
+                config.profiles.expand_deferred_sized(&vars, base_count);
             }
         }
         Ok(config)
@@ -477,6 +505,156 @@ impl DatasetConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `load_and_resolve` must expand sized profiles when only
+    /// `vector_count` is available in `variables.yaml` (no `base_count`).
+    /// This is the post-clean-bootstrap state: the early
+    /// `count-vectors` step writes `vector_count` but `count-base`
+    /// hasn't run yet because it's downstream of extract-base.
+    #[test]
+    fn test_load_and_resolve_expands_sized_with_vector_count_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dataset_yaml = r#"
+name: test
+profiles:
+  default:
+    maxk: 100
+    base_vectors: base.fvec
+  sized: ["mul:1m/2"]
+"#;
+        std::fs::write(tmp.path().join("dataset.yaml"), dataset_yaml).unwrap();
+        std::fs::write(
+            tmp.path().join("variables.yaml"),
+            "vector_count: '50000000'\nsource_base_count: '50000000'\n",
+        ).unwrap();
+
+        let config = DatasetConfig::load_and_resolve(&tmp.path().join("dataset.yaml"))
+            .expect("load_and_resolve");
+        let names: Vec<&str> = config.profiles.profiles.keys()
+            .map(|s| s.as_str()).collect();
+        assert!(
+            names.len() > 1,
+            "expected sized profiles to expand using vector_count fallback, got only: {:?}",
+            names,
+        );
+        assert!(names.contains(&"1m"), "expected 1m profile in {:?}", names);
+    }
+
+    /// Same scenario but the count comes from `dataset.yaml`'s
+    /// `variables:` block. Survives `--clean` removing
+    /// `variables.yaml`.
+    #[test]
+    fn test_load_and_resolve_expands_sized_from_dataset_variables() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dataset_yaml = r#"
+name: test
+variables:
+  vector_count: '50000000'
+profiles:
+  default:
+    maxk: 100
+    base_vectors: base.fvec
+  sized: ["mul:1m/2"]
+"#;
+        std::fs::write(tmp.path().join("dataset.yaml"), dataset_yaml).unwrap();
+        // Deliberately no variables.yaml — simulates post-clean state.
+
+        let config = DatasetConfig::load_and_resolve(&tmp.path().join("dataset.yaml"))
+            .expect("load_and_resolve");
+        let names: Vec<&str> = config.profiles.profiles.keys()
+            .map(|s| s.as_str()).collect();
+        assert!(
+            names.len() > 1,
+            "expected sized profiles to expand from dataset.yaml variables block, got only: {:?}",
+            names,
+        );
+    }
+
+    /// User's exact variables.yaml shape (no `base_count`, only the
+    /// upstream counters produced by count-vectors / count-source-base).
+    /// This mirrors the production scenario where prepare-vectors is
+    /// skipped (Identity base) so extract-base / count-base are never
+    /// emitted.
+    #[test]
+    fn test_load_and_resolve_user_scenario_identity_base() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Bootstrap-generated structured form: `profiles.sized` is a
+        // mapping with `ranges` + `facets` keys, not a flat list.
+        let dataset_yaml = r#"
+name: ibm-datapile-1b
+profiles:
+  default:
+    maxk: 100
+    base_vectors: profiles/base/base_vectors.fvecs
+    query_vectors: profiles/base/query_vectors.fvecs
+    neighbor_indices: profiles/default/neighbor_indices.ivecs
+    neighbor_distances: profiles/default/neighbor_distances.fvecs
+  sized:
+    ranges: ["mul:1mi/2", "fib:1m", "linear:10m/10m"]
+    facets:
+      base_vectors: "profiles/base/base_vectors.fvecs:${range}"
+      query_vectors: profiles/base/query_vectors.fvecs
+      neighbor_indices: "profiles/${profile}/neighbor_indices.ivecs"
+      neighbor_distances: "profiles/${profile}/neighbor_distances.fvecs"
+"#;
+        std::fs::write(tmp.path().join("dataset.yaml"), dataset_yaml).unwrap();
+        std::fs::write(
+            tmp.path().join("variables.yaml"),
+            "combined_bq: 'false'\n\
+             dataset_name: ibm-datapile-1b\n\
+             distance_function: DOT_PRODUCT\n\
+             is_self_search: 'false'\n\
+             is_shuffled: 'false'\n\
+             k: '100'\n\
+             source_base_count: '963689881'\n\
+             source_query_count: '10000'\n\
+             vector_count: '963689881'\n",
+        ).unwrap();
+
+        let config = DatasetConfig::load_and_resolve(&tmp.path().join("dataset.yaml"))
+            .expect("load_and_resolve");
+        let names: Vec<&str> = config.profiles.profiles.keys()
+            .map(|s| s.as_str()).collect();
+        assert!(
+            names.len() > 10,
+            "expected ~120 sized profiles to expand for user's scenario, got {}: {:?}",
+            names.len(), names,
+        );
+    }
+
+    /// `variables.yaml` overrides the dataset.yaml block on conflict
+    /// — a fresh pipeline run's actual count beats the bootstrap's
+    /// stale baseline.
+    #[test]
+    fn test_load_and_resolve_variables_yaml_wins_on_conflict() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dataset_yaml = r#"
+name: test
+variables:
+  vector_count: '10000000'
+profiles:
+  default:
+    maxk: 100
+    base_vectors: base.fvec
+  sized: ["mul:1m/2"]
+"#;
+        std::fs::write(tmp.path().join("dataset.yaml"), dataset_yaml).unwrap();
+        std::fs::write(
+            tmp.path().join("variables.yaml"),
+            "vector_count: '50000000'\n",
+        ).unwrap();
+
+        let config = DatasetConfig::load_and_resolve(&tmp.path().join("dataset.yaml"))
+            .expect("load_and_resolve");
+        let names: Vec<&str> = config.profiles.profiles.keys()
+            .map(|s| s.as_str()).collect();
+        // With cap=10m we get 1m, 2m, 4m, 8m. With cap=50m we also get 16m, 32m.
+        assert!(
+            names.contains(&"32m"),
+            "variables.yaml should override dataset.yaml; got: {:?}",
+            names,
+        );
+    }
 
     #[test]
     fn test_validate_rejects_scratch_path() {

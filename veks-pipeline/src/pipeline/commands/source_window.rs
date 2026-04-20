@@ -92,6 +92,53 @@ pub fn resolve_source(source_str: &str, workspace: &Path) -> Result<ResolvedSour
     Ok(ResolvedSource { path, window })
 }
 
+/// Resolve the effective base-vector window for a KNN compute step.
+///
+/// Two upstream mechanisms can pin a step to a sub-range of the source
+/// base file:
+///
+/// 1. **Inline path window** — a user-typed source like `base.fvec[0..1M]`
+///    parses into `ResolvedSource.window`. This is the authoring-time
+///    form.
+/// 2. **Injected `range` option** — for sized profiles, the expansion
+///    logic in `vectordata::dataset::expansion` auto-injects a
+///    per-profile `range: "[0,base_end)"` option (see
+///    `expansion.rs:237-245`). This is the runtime form that each
+///    sized profile uses to window a shared base file.
+///
+/// This helper consolidates the precedence across all KNN engines:
+/// inline wins when set, otherwise fall back to the `range` option,
+/// otherwise `None`.
+///
+/// Previously each engine open-coded the precedence; knn-metal had the
+/// full logic, knn-stdarch and knn-blas only read the inline form —
+/// which made sized profiles silently scan the full base. Factoring it
+/// here ensures every engine treats the upstream segment mapping the
+/// same way.
+pub fn resolve_window(
+    inline: Option<(usize, usize)>,
+    range_option: Option<&str>,
+) -> Option<(usize, usize)> {
+    if inline.is_some() { return inline; }
+    let r = range_option?;
+    let ds = parse_source_string(&format!("_dummy{}", r)).ok()?;
+    if ds.window.is_empty() { return None; }
+    // Skip empty intervals (`min == max`) and pick the first non-empty
+    // one. Defensive: callers historically wrote `"[0,N)"` which
+    // parse_window splits on `,` into [0,0) and [0,N), and naively
+    // taking window.0[0] picked up the empty [0,0). The injection
+    // path now uses `..`, but the helper stays robust regardless.
+    let interval = ds.window.0.iter()
+        .find(|i| i.max_excl > i.min_incl)?;
+    let start = interval.min_incl as usize;
+    let end = if interval.max_excl == u64::MAX {
+        usize::MAX
+    } else {
+        interval.max_excl as usize
+    };
+    Some((start, end))
+}
+
 /// Resolve a source path relative to the workspace.
 ///
 /// Relative paths are joined with the workspace directory so that file

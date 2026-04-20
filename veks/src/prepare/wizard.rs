@@ -293,6 +293,7 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
             partition_oracles: false,
             max_partitions: 100,
             on_undersized: "error".to_string(),
+            cosine_mode: None,
         };
         super::import::resolve_facets(&probe)
     };
@@ -472,17 +473,32 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
         None
     };
 
-    // ── Query source — resolved from facets + detected inputs ──────────
-    // Q confirmed + separate query file detected → use it
-    // Q confirmed + no query file → self-search (only ask query count)
-    // Q not confirmed → skip
+    // ── Query source — resolved from FACETS, not detection state ──────
+    //
+    // Rule (sysref §7): self-search is defined by the input set, not by
+    // detection fallback. It applies iff Q ∈ required ∧ Q ∉ provided.
+    // If Q is provided by *any* source — detection, CLI flag, or
+    // explicit path — self-search is categorically excluded.
+    //
+    // Branches:
+    //   Q not requested OR no base vectors          → no query, no search
+    //   Q provided (detection or CLI)                → use the provided file
+    //   Q requested but missing                      → self-search
+    let q_provided_path: Option<PathBuf> = if roles_accepted && detected.query_vectors.is_some() {
+        detected.query_vectors.clone()
+    } else if seeds.query_vectors.is_some() {
+        seeds.query_vectors.clone()
+    } else {
+        None
+    };
+
     let (query_vectors, self_search, query_count) = if !want_q || base_vectors.is_none() {
         (None, false, seeds.query_count.unwrap_or(10000))
-    } else if roles_accepted && detected.query_vectors.is_some() {
-        let qv = detected.query_vectors.as_ref().unwrap().clone();
+    } else if let Some(qv) = q_provided_path {
         (Some(qv), false, seeds.query_count.unwrap_or(10000))
     } else {
-        // Self-search — only ask query count
+        // Q is in `required` but nothing in `provided` resolves it.
+        // Pipeline must derive Q from B via shuffle + extract.
         let qc_default = seeds.query_count.map(|n| n.to_string())
             .unwrap_or_else(|| "10000".to_string());
         let qc_str = prompt_with_default("Query count (self-search)", &qc_default);
@@ -692,6 +708,29 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
         confirm("L2-normalize vectors? (will invalidate GT)", false)
     } else {
         confirm("L2-normalize vectors?", true)
+    };
+
+    // Cosine strategy — only asked when metric is COSINE. The KNN
+    // engines (knn-blas, knn-stdarch, knn-metal) require one of two
+    // explicit options: "assume normalized and use inner product"
+    // (FAISS / numpy / knn_utils convention) or "compute proper
+    // cosine in-kernel". Default is to assume normalized because
+    // that's the knn_utils convention and the numerically-exact
+    // match against FAISS / numpy.
+    let cosine_mode: Option<String> = if metric.to_uppercase() == "COSINE" {
+        println!();
+        println!("--- Cosine strategy ---");
+        println!("  knn_utils / FAISS / numpy treat COSINE as inner product on");
+        println!("  pre-normalized vectors (faster, bit-compatible with BLAS).");
+        println!("  The alternative is to compute cosine properly in-kernel");
+        println!("  (correct on arbitrary inputs, extra norm work).");
+        let assume = confirm(
+            "Assume normalization and use inner product like FAISS does?",
+            normalize || already_normalized,
+        );
+        Some(if assume { "assume_normalized".to_string() } else { "proper".to_string() })
+    } else {
+        None
     };
 
     // ── Remaining configuration ─────────────────────────────────────
@@ -1303,6 +1342,7 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
         partition_oracles,
         max_partitions,
         on_undersized,
+        cosine_mode,
     }
 }
 

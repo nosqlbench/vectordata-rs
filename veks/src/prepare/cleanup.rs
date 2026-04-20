@@ -377,7 +377,7 @@ pub fn run(args: CleanupArgs) {
             verify_knn_sample: 0,
             partition_oracles: false,
             max_partitions: 100,
-            on_undersized: "error".to_string(),
+            on_undersized: "error".to_string(), cosine_mode: None,
         };
 
         import::run(import_args);

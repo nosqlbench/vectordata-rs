@@ -1415,15 +1415,22 @@ compare an ANN index's approximate results against this exact ground truth.
         };
 
         let compress_cache = options.get("compress-cache").map(|s| s == "true").unwrap_or(false);
-        let normalized = options.get("normalized").map(|s| s == "true").unwrap_or(false);
 
-        // When vectors are normalized, Cosine = 1 - dot and DotProduct = -dot.
-        // Use DotProduct kernel (no norm division) for both — faster and
-        // numerically identical on unit vectors.
-        let kernel_metric = if normalized && (metric == Metric::Cosine || metric == Metric::DotProduct) {
-            Metric::DotProduct
-        } else {
-            metric
+        // Cosine-handling strategy. Required when metric=COSINE; the
+        // validator errors if neither or both flags are set. L2 and
+        // DOT_PRODUCT runs ignore this.
+        let cosine_mode = match super::knn_segment::resolve_cosine_mode_for(
+            metric == Metric::Cosine, options,
+        ) {
+            Ok(m) => m,
+            Err(e) => return error_result(e, start),
+        };
+        // Collapse COSINE+AssumeNormalized to DotProduct so the
+        // kernel path, cache key, and output match a direct DOT run
+        // on the same pre-normalized data.
+        let kernel_metric = match (metric, cosine_mode) {
+            (Metric::Cosine, Some(super::knn_segment::CosineMode::AssumeNormalized)) => Metric::DotProduct,
+            _ => metric,
         };
         // Display metric: show the user-facing metric, not the internal kernel
         let display_metric = metric;
@@ -1455,21 +1462,14 @@ compare an ANN index's approximate results against this exact ground truth.
             }
         }
 
-        // Window can come from inline notation (base=file.fvec[0,1M))
-        // or from a separate "range" option. The separate option takes
-        // precedence when the inline notation has no window.
-        let base_window = base_source.window.or_else(|| {
-            options.get("range").and_then(|r| {
-                let ds = vectordata::dataset::source::parse_source_string(
-                    &format!("_dummy{}", r)
-                ).ok()?;
-                if ds.window.is_empty() { return None; }
-                let interval = &ds.window.0[0];
-                let start = interval.min_incl as usize;
-                let end = if interval.max_excl == u64::MAX { usize::MAX } else { interval.max_excl as usize };
-                Some((start, end))
-            })
-        });
+        // Window comes from inline notation (`base=file.fvec[0,1M)`) OR
+        // from the injected `range` option that sized-profile expansion
+        // puts on every per-profile step. Precedence: inline > range.
+        // Factored into `source_window::resolve_window` so every KNN
+        // engine agrees on the upstream segment mapping.
+        let base_window = super::source_window::resolve_window(
+            base_source.window, options.get("range"),
+        );
 
         // Detect element type from base file extension and dispatch
         let etype = match ElementType::from_path(&base_path) {
@@ -1609,6 +1609,30 @@ compare an ANN index's approximate results against this exact ground truth.
                 required: false,
                 default: Some("false".to_string()),
                 description: "Gzip-compress partition cache files".to_string(),
+                role: OptionRole::Config,
+        },
+            OptionDesc {
+                name: "assume_normalized_like_faiss".to_string(),
+                type_name: "bool".to_string(),
+                required: false,
+                default: Some("false".to_string()),
+                description: "For COSINE metric: treat inputs as pre-normalized and evaluate cosine as inner product (FAISS / numpy / knn_utils convention). Exactly one of this and use_proper_cosine_metric must be set when metric=COSINE.".to_string(),
+                role: OptionRole::Config,
+        },
+            OptionDesc {
+                name: "use_proper_cosine_metric".to_string(),
+                type_name: "bool".to_string(),
+                required: false,
+                default: Some("false".to_string()),
+                description: "For COSINE metric: compute cosine in-kernel as dot / (|q| × |b|). Correct for arbitrary inputs. Exactly one of this and assume_normalized_like_faiss must be set when metric=COSINE.".to_string(),
+                role: OptionRole::Config,
+        },
+            OptionDesc {
+                name: "normalized".to_string(),
+                type_name: "bool".to_string(),
+                required: false,
+                default: Some("false".to_string()),
+                description: "Deprecated alias for assume_normalized_like_faiss; kept for back-compat.".to_string(),
                 role: OptionRole::Config,
         },
         ]

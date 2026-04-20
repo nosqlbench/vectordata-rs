@@ -147,12 +147,49 @@ count-vectors → scan-zeros → scan-duplicates
 
 | Decision | Condition |
 |----------|-----------|
-| Shuffle | `seed != 0` (disabled for pre-computed GT) |
+| Self-search | `Q ∈ required ∧ Q ∉ provided` (see §7.4.1) |
+| Shuffle | `seed != 0` — *user-supplied no never silently overridden* (see §7.4.1) |
 | Normalize | explicit opt-in (disabled by default with pre-computed GT) |
 | Dedup | `!no_dedup` (default: on) |
 | Filtered KNN | metadata present and `!no_filtered` |
 | Scan steps | emitted when `prepare-vectors` is skipped (Identity base) |
 | Zero removal | zeros detected and excluded from ordinals during sort/dedup |
+
+### 7.4.1 Self-search and shuffle
+
+Self-search is **defined by the input set, not by detection fallback**. Two
+facet sets matter:
+
+- **provided**: facets the user brought as inputs (what's on disk, what's
+  passed via `--base-vectors` / `--query-vectors`, what `detect_roles`
+  identified, what the user confirmed in the wizard).
+- **required**: facets the pipeline must produce (from `--required-facets`
+  or the wizard's facet confirmation step).
+
+Self-search applies iff `Q ∈ required ∧ Q ∉ provided`. In that case the
+pipeline must derive queries from base via shuffle + extract.
+
+If `Q ∈ provided` — regardless of whether detection found it, the user
+typed the path, or it came in via CLI — **self-search is categorically
+excluded**. The wizard must not pick it, the import generator must not
+emit `extract-queries`, and the shuffle is not forced.
+
+The wizard always asks "Shuffle base vectors?" and the user's answer
+drives `seed` (`No → seed=0 → shuffle disabled`). The user's answer is
+**never silently overridden**:
+
+- If the chosen mode does not require shuffle, the answer is honored
+  directly: `seed=0` produces no `generate-shuffle` step.
+- If the chosen mode is self-search and the user answered No, the
+  configuration is internally contradictory (self-search needs shuffle
+  to pick the train/test split). The import generator fails fast with
+  an error directing the user to either provide a separate query file
+  or enable shuffle. It does **not** silently materialize a shuffle the
+  user said they did not want.
+
+This rule applies more broadly: anywhere a user-supplied flag could
+collide with a mode-implied requirement, the pipeline fails fast rather
+than overriding the user.
 
 ---
 

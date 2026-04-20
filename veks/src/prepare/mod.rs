@@ -113,6 +113,20 @@ pub enum PrepareCommand {
         #[arg(long, conflicts_with = "normalize")]
         no_normalize: bool,
 
+        /// For COSINE metric: assume vectors are pre-normalized and
+        /// evaluate cosine as inner product (FAISS / numpy /
+        /// knn_utils convention). Cannot be combined with
+        /// `--use-proper-cosine-metric`.
+        #[arg(long, conflicts_with = "use_proper_cosine_metric")]
+        assume_normalized_like_faiss: bool,
+
+        /// For COSINE metric: compute cosine in-kernel as
+        /// `dot / (|q| × |b|)` — correct on arbitrary inputs, costs
+        /// extra norm work. Cannot be combined with
+        /// `--assume-normalized-like-faiss`.
+        #[arg(long, conflicts_with = "assume_normalized_like_faiss")]
+        use_proper_cosine_metric: bool,
+
         /// Overwrite existing dataset.yaml
         #[arg(long, alias = "overwrite")]
         force: bool,
@@ -433,11 +447,25 @@ pub fn run(args: PrepareArgs) {
             interactive, yes, name, output, base_vectors, query_vectors,
             self_search, query_count, metadata, ground_truth,
             ground_truth_distances, metric, neighbors, seed, description,
-            no_dedup, no_zero_check, no_filtered, normalize, no_normalize, force, reset, clean, recursive,
+            no_dedup, no_zero_check, no_filtered, normalize, no_normalize,
+            assume_normalized_like_faiss, use_proper_cosine_metric,
+            force, reset, clean, recursive,
             base_fraction, required_facets, provided_facets, round_digits, pedantic_dedup, auto, classic, sources,
             personality, synthesize_metadata, metadata_fields, metadata_range,
             synthesis_mode, synthesis_format,
         } => {
+            // Derive cosine_mode from the two mutually-exclusive
+            // flags. Clap already enforces "can't both be true".
+            // Non-interactive mode with metric=COSINE requires one
+            // of the flags — we detect that later when we have the
+            // resolved metric in hand.
+            let cosine_mode: Option<String> = if assume_normalized_like_faiss {
+                Some("assume_normalized".to_string())
+            } else if use_proper_cosine_metric {
+                Some("proper".to_string())
+            } else {
+                None
+            };
             // Parse metadata range "min..max"
             let (metadata_range_min, metadata_range_max) = {
                 let parts: Vec<&str> = metadata_range.split("..").collect();
@@ -742,7 +770,7 @@ pub fn run(args: PrepareArgs) {
                         verify_knn_sample: 0,
             partition_oracles: false,
             max_partitions: 100,
-            on_undersized: "error".to_string(),
+            on_undersized: "error".to_string(), cosine_mode: cosine_mode.clone(),
                     });
                     check_and_restore(&out);
                 }
@@ -817,7 +845,7 @@ pub fn run(args: PrepareArgs) {
                     verify_knn_sample: 0,
             partition_oracles: false,
             max_partitions: 100,
-            on_undersized: "error".to_string(),
+            on_undersized: "error".to_string(), cosine_mode: cosine_mode.clone(),
                 });
             }
         }

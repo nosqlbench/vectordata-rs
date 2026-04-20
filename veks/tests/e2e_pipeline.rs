@@ -87,6 +87,7 @@ fn default_args(name: &str, output: &Path) -> ImportArgs {
             partition_oracles: false,
             max_partitions: 100,
             on_undersized: "error".to_string(),
+            cosine_mode: None,
     }
 }
 

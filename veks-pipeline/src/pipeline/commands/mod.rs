@@ -41,6 +41,7 @@ pub mod dataset_json;
 pub mod compute_filtered_knn;
 pub mod compute_knn;
 pub mod compute_partition_profiles;
+pub mod knn_segment;
 #[cfg(feature = "knnutils")]
 pub mod compute_knn_blas;
 #[cfg(feature = "faiss")]
@@ -142,7 +143,12 @@ pub fn register_all(registry: &mut CommandRegistry) {
     registry.register("compute partition-profiles", compute_partition_profiles::factory);
     #[cfg(feature = "knnutils")]
     registry.register("compute knn-blas", compute_knn_blas::factory);
-    // "compute knn" → stdarch (pure std::arch, zero external deps)
+    // "compute knn" → stdarch (pure std::arch, zero external deps,
+    // supports f32/f16/f64). Kept as the safe default so existing
+    // dataset.yaml files that reference `compute knn` keep working
+    // regardless of input element type. New pipelines emitted by
+    // `prepare bootstrap` prefer `compute knn-blas` explicitly when
+    // the workload is f32 and the knnutils feature is available.
     registry.register("compute knn", compute_knn_stdarch::factory);
     #[cfg(feature = "faiss")]
     registry.register("compute knn-faiss", compute_knn_faiss::factory);

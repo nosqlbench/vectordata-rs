@@ -14,7 +14,7 @@
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -43,19 +43,15 @@ pub fn factory() -> Box<dyn CommandOp> {
 /// Distance function type.
 type DistFn = fn(&[f32], &[f32]) -> f32;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Metric { L2, DotProduct, Cosine }
+// Metric enum, cache helpers, and segment discovery are shared across
+// all brute-force KNN engines via `super::knn_segment`.
+use super::knn_segment::{
+    CosineMode, Metric, build_cache_path, cache_prefix_for,
+    load_segment_cache, merge_segment_into_heaps, resolve_cosine_mode,
+    scan_cached_segments, write_segment_cache,
+};
 
-impl Metric {
-    fn from_str(s: &str) -> Option<Self> {
-        match s.to_uppercase().as_str() {
-            "L2" => Some(Metric::L2),
-            "DOT_PRODUCT" | "IP" => Some(Metric::DotProduct),
-            "COSINE" => Some(Metric::Cosine),
-            _ => None,
-        }
-    }
-}
+const ENGINE_NAME: &str = "knn-stdarch";
 
 fn select_dist_fn(metric: Metric) -> (DistFn, &'static str) {
     #[cfg(target_arch = "x86_64")]
@@ -572,325 +568,6 @@ fn error_result(msg: impl Into<String>, start: Instant) -> CommandResult {
     CommandResult { status: Status::Error, message: msg.into(), produced: vec![], elapsed: start.elapsed() }
 }
 
-// ═══════════════════════════════════════════════════════════════════════
-// Per-segment cache (resumability)
-//
-// Each base-vector segment's per-query top-k contribution is written to
-// two files in `.cache/`: an ivec (neighbor indices) and an fvec (the
-// matching distances). File naming is keyed to the base/query files'
-// stems and sizes + segment byte range + k + metric, so:
-//   - Re-runs with the same inputs reuse completed segments verbatim.
-//   - Changing the base file (new size) invalidates all caches.
-//   - Different k or metric gets a disjoint cache space.
-//
-// Cache version bump: when the segment-compute algorithm changes in a
-// way that would affect output, bump `CACHE_VERSION` to force
-// re-computation.
-// ═══════════════════════════════════════════════════════════════════════
-
-const CACHE_VERSION: &str = "v1";
-
-/// Map our local `Metric` enum to a stable filename token. This must be
-/// stable across releases — changing it invalidates existing caches.
-fn metric_cache_tag(metric: Metric) -> &'static str {
-    match metric {
-        Metric::L2 => "l2",
-        Metric::DotProduct => "dot_product",
-        Metric::Cosine => "cosine",
-    }
-}
-
-/// Derive a cache-key prefix from the base and query file paths.
-/// Includes file sizes so the cache is auto-invalidated when data
-/// changes (e.g., after `prepare-vectors` produces new base ordinals
-/// → new base_vectors.fvecs of different size).
-fn cache_prefix_for(base_path: &Path, query_path: &Path) -> String {
-    let base_stem = base_path.file_stem().unwrap_or_default().to_string_lossy();
-    let query_stem = query_path.file_stem().unwrap_or_default().to_string_lossy();
-    let base_size = std::fs::metadata(base_path).map(|m| m.len()).unwrap_or(0);
-    let query_size = std::fs::metadata(query_path).map(|m| m.len()).unwrap_or(0);
-    format!("{}.{}.{}_{}", base_stem, query_stem, base_size, query_size)
-}
-
-/// Build a cache file path for a segment (`start..end` base-vector
-/// range) of the current (base, query, k, metric) tuple.
-#[allow(clippy::too_many_arguments)]
-fn build_cache_path(
-    cache_dir: &Path,
-    cache_prefix: &str,
-    start: usize,
-    end: usize,
-    k: usize,
-    metric: Metric,
-    suffix: &str,
-    ext: &str,
-) -> PathBuf {
-    cache_dir.join(format!(
-        "knn-stdarch.{}.{}.range_{:012}_{:012}.k{}.{}.{}.{}",
-        CACHE_VERSION,
-        cache_prefix,
-        start, end, k,
-        metric_cache_tag(metric),
-        suffix,
-        ext,
-    ))
-}
-
-/// A segment cache's two files are **both** `query_count × (4 + k × elem_size)`
-/// bytes — one ivec row of k i32 neighbor indices + dim header per query.
-/// Validate by exact byte-size equality; any size mismatch means the cache
-/// was written with different settings and must not be loaded.
-fn validate_cache_file(path: &Path, query_count: usize, k: usize, elem_size: usize) -> bool {
-    let expected = query_count as u64 * (4 + k as u64 * elem_size as u64);
-    match std::fs::metadata(path) {
-        Ok(meta) => meta.len() == expected,
-        Err(_) => false,
-    }
-}
-
-/// Write a segment's per-query top-k contribution to `ivec_path` (indices)
-/// + `fvec_path` (distances). The file layout matches the final output
-/// format so a cache file can be directly inspected with the same tools.
-fn write_segment_cache(
-    ivec_path: &Path,
-    fvec_path: &Path,
-    per_query: &[Vec<Neighbor>],
-    k: usize,
-) -> Result<(), String> {
-    use std::io::BufWriter;
-    let dim_bytes = (k as i32).to_le_bytes();
-
-    // .tmp + rename so a crash mid-write never leaves a half-file that
-    // the resumability check would mistakenly treat as valid.
-    let ivec_tmp = ivec_path.with_extension("tmp");
-    let fvec_tmp = fvec_path.with_extension("tmp");
-
-    let ivec_f = std::fs::File::create(&ivec_tmp)
-        .map_err(|e| format!("create {}: {}", ivec_tmp.display(), e))?;
-    let fvec_f = std::fs::File::create(&fvec_tmp)
-        .map_err(|e| format!("create {}: {}", fvec_tmp.display(), e))?;
-    let mut iw = BufWriter::with_capacity(1 << 20, ivec_f);
-    let mut fw = BufWriter::with_capacity(1 << 20, fvec_f);
-
-    for row in per_query {
-        iw.write_all(&dim_bytes).map_err(|e| e.to_string())?;
-        fw.write_all(&dim_bytes).map_err(|e| e.to_string())?;
-        for j in 0..k {
-            let (idx_i32, dist_f32) = if j < row.len() {
-                (row[j].index as i32, row[j].distance)
-            } else {
-                (-1i32, f32::INFINITY)
-            };
-            iw.write_all(&idx_i32.to_le_bytes()).map_err(|e| e.to_string())?;
-            fw.write_all(&dist_f32.to_le_bytes()).map_err(|e| e.to_string())?;
-        }
-    }
-    iw.flush().map_err(|e| e.to_string())?;
-    fw.flush().map_err(|e| e.to_string())?;
-    drop(iw);
-    drop(fw);
-    std::fs::rename(&ivec_tmp, ivec_path)
-        .map_err(|e| format!("rename {} → {}: {}", ivec_tmp.display(), ivec_path.display(), e))?;
-    std::fs::rename(&fvec_tmp, fvec_path)
-        .map_err(|e| format!("rename {} → {}: {}", fvec_tmp.display(), fvec_path.display(), e))?;
-    Ok(())
-}
-
-/// Load a previously-written segment cache back into a
-/// `per_query: Vec<Vec<Neighbor>>` structure. Padding entries (index
-/// `-1`, distance `+∞`) are stripped.
-fn load_segment_cache(
-    ivec_path: &Path,
-    fvec_path: &Path,
-    k: usize,
-    query_count: usize,
-) -> Result<Vec<Vec<Neighbor>>, String> {
-    use std::io::BufReader;
-    let mut iw = BufReader::with_capacity(1 << 20, std::fs::File::open(ivec_path)
-        .map_err(|e| format!("open {}: {}", ivec_path.display(), e))?);
-    let mut fw = BufReader::with_capacity(1 << 20, std::fs::File::open(fvec_path)
-        .map_err(|e| format!("open {}: {}", fvec_path.display(), e))?);
-
-    let mut result: Vec<Vec<Neighbor>> = Vec::with_capacity(query_count);
-    let mut hdr = [0u8; 4];
-    let mut idx_buf = [0u8; 4];
-    let mut dist_buf = [0u8; 4];
-    for _ in 0..query_count {
-        // Skip dim header (already validated via file size)
-        iw.read_exact(&mut hdr).map_err(|e| format!("read ivec dim: {}", e))?;
-        fw.read_exact(&mut hdr).map_err(|e| format!("read fvec dim: {}", e))?;
-        let mut row: Vec<Neighbor> = Vec::with_capacity(k);
-        for _ in 0..k {
-            iw.read_exact(&mut idx_buf).map_err(|e| format!("read ivec body: {}", e))?;
-            fw.read_exact(&mut dist_buf).map_err(|e| format!("read fvec body: {}", e))?;
-            let idx = i32::from_le_bytes(idx_buf);
-            let dist = f32::from_le_bytes(dist_buf);
-            if idx >= 0 {
-                row.push(Neighbor { index: idx as u32, distance: dist });
-            }
-        }
-        result.push(row);
-    }
-    Ok(result)
-}
-
-/// Merge a segment's per-query top-k contribution into the global
-/// running heaps. Mirrors the inline merge in the segment loop.
-fn merge_segment_into_heaps(
-    segment: &[Vec<Neighbor>],
-    all_heaps: &mut [BinaryHeap<Neighbor>],
-    all_thresholds: &mut [f32],
-    k: usize,
-) {
-    for (qi, neighbors) in segment.iter().enumerate() {
-        for n in neighbors {
-            if n.distance < all_thresholds[qi] {
-                all_heaps[qi].push(*n);
-                if all_heaps[qi].len() > k {
-                    all_heaps[qi].pop();
-                    all_thresholds[qi] = all_heaps[qi].peek().unwrap().distance;
-                }
-            }
-        }
-    }
-}
-
-/// One cached segment discovered during cache scan. Could come from
-/// this profile's `.cache/` entries OR from another profile's
-/// published ground-truth output (`profiles/<size>/neighbor_*.ivecs`).
-struct CachedSegment {
-    start: usize,
-    end: usize,
-    ivec_path: PathBuf,
-    fvec_path: PathBuf,
-}
-
-/// Scan the cache directory (and sibling profile outputs) for every
-/// segment whose per-query top-K results could feed this run's KNN.
-///
-/// A segment is "reusable" when it covers a contiguous [start..end)
-/// base-vector range and its (ivec, fvec) pair exist at the exact
-/// expected byte size (`query_count × (4 + k × 4)` each). Cache-keying
-/// embeds the source files' stems and SIZES, so a size-mismatch on
-/// either side silently invalidates (no accidental reuse across
-/// regenerated data).
-///
-/// Two discovery paths:
-///   1. `.cache/knn-stdarch.v1.{prefix}.range_*.k{k}.{metric}.neighbors.ivec`
-///      — segments we or a prior run of THIS command wrote.
-///   2. `profiles/{size}/neighbor_indices.ivecs` + `.../neighbor_distances.fvecs`
-///      — completed ground truth from a SMALLER sized profile. The
-///      directory name (e.g. "50m", "4mi") encodes the profile's
-///      base count N, so the file covers the [0..N) range natively.
-///      Catching these means a 100m profile naturally reuses the 50m
-///      profile's final output as its [0..50m) segment without
-///      needing the 50m profile to have been computed via this
-///      command's cache path.
-fn scan_cached_segments(
-    cache_dir: &Path,
-    cache_prefix: &str,
-    k: usize,
-    metric: Metric,
-    query_count: usize,
-    workspace: &Path,
-    base_end: usize,
-    ui: &veks_core::ui::UiHandle,
-) -> Vec<CachedSegment> {
-    let metric_tag = metric_cache_tag(metric);
-    let prefix_pat = format!(
-        "knn-stdarch.{}.{}.range_",
-        CACHE_VERSION, cache_prefix,
-    );
-    // What we look for after the range: ".k{k}.{metric}.neighbors.ivec"
-    let suffix_pat = format!(".k{}.{}.neighbors.ivec", k, metric_tag);
-
-    let mut segments: Vec<CachedSegment> = Vec::new();
-
-    // ── Path 1: scan .cache/ for segments written by this command ──
-    if let Ok(entries) = std::fs::read_dir(cache_dir) {
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
-            if !name_str.starts_with(&prefix_pat) { continue; }
-            if !name_str.ends_with(&suffix_pat) { continue; }
-
-            // Extract the range part: everything between the prefix
-            // and the first '.' in the tail.
-            let after_prefix = &name_str[prefix_pat.len()..];
-            let range_end = after_prefix.find('.').unwrap_or(after_prefix.len());
-            let range_str = &after_prefix[..range_end];
-            let (s_str, e_str) = match range_str.split_once('_') {
-                Some(pair) => pair,
-                None => continue,
-            };
-            let (s, e) = match (s_str.parse::<usize>(), e_str.parse::<usize>()) {
-                (Ok(a), Ok(b)) if b > a => (a, b),
-                _ => continue,
-            };
-
-            let ivec = build_cache_path(cache_dir, cache_prefix, s, e, k, metric, "neighbors", "ivec");
-            let fvec = build_cache_path(cache_dir, cache_prefix, s, e, k, metric, "distances", "fvec");
-            if validate_cache_file(&ivec, query_count, k, 4)
-                && validate_cache_file(&fvec, query_count, k, 4)
-            {
-                segments.push(CachedSegment { start: s, end: e, ivec_path: ivec, fvec_path: fvec });
-            }
-        }
-    }
-
-    // ── Path 2: scan profiles/ for smaller-profile final outputs ──
-    //
-    // The pipeline writes each sized profile's ground truth to
-    // `profiles/<size>/neighbor_indices.ivecs` (+ distances). The
-    // directory name encodes the profile's base count. Any such
-    // output whose base count is < this run's base_end covers
-    // [0..N) and can drop in as a cached segment — no need for the
-    // smaller profile to have been computed via this command's own
-    // cache path.
-    let profiles_dir = workspace.join("profiles");
-    if profiles_dir.is_dir() {
-        if let Ok(entries) = std::fs::read_dir(&profiles_dir) {
-            for entry in entries.flatten() {
-                if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                    continue;
-                }
-                let pname = entry.file_name();
-                let pname_str = pname.to_string_lossy();
-                if pname_str == "default" { continue; }
-
-                let pbc = match vectordata::dataset::source::parse_number_with_suffix(&pname_str) {
-                    Ok(v) => v as usize,
-                    Err(_) => continue,
-                };
-                if pbc == 0 || pbc >= base_end { continue; }
-
-                let idx_path = entry.path().join("neighbor_indices.ivecs");
-                let dist_path = entry.path().join("neighbor_distances.fvecs");
-                if validate_cache_file(&idx_path, query_count, k, 4)
-                    && validate_cache_file(&dist_path, query_count, k, 4)
-                {
-                    let already = segments.iter().any(|s| s.start == 0 && s.end == pbc);
-                    if !already {
-                        ui.log(&format!(
-                            "  reusing profile '{}' output as segment [0, {})",
-                            pname_str, pbc,
-                        ));
-                        segments.push(CachedSegment {
-                            start: 0, end: pbc,
-                            ivec_path: idx_path,
-                            fvec_path: dist_path,
-                        });
-                    }
-                }
-            }
-        }
-    }
-
-    // Sort by start, then by size descending — the greedy matcher
-    // picks the largest segment starting at a given position.
-    segments.sort_by(|a, b| a.start.cmp(&b.start).then(b.end.cmp(&a.end)));
-    segments
-}
 
 impl CommandOp for ComputeKnnStdarchOp {
     fn command_path(&self) -> &str {
@@ -938,14 +615,25 @@ on `std::arch` alone, without SimSIMD, FAISS, or BLAS.
             Err(e) => return error_result(e, start),
         };
         let metric_str = options.get("metric").unwrap_or("L2");
-        let normalized = options.get("normalized").map(|s| s == "true").unwrap_or(false);
         let metric = match Metric::from_str(metric_str) {
             Some(m) => m,
             None => return error_result(format!("unknown metric: '{}'", metric_str), start),
         };
-        let kernel_metric = if normalized && (metric == Metric::Cosine || metric == Metric::DotProduct) {
-            Metric::DotProduct
-        } else { metric };
+        let cosine_mode = match resolve_cosine_mode(metric, options) {
+            Ok(m) => m,
+            Err(e) => return error_result(e, start),
+        };
+        // Kernel-metric selection:
+        //   L2 / DOT_PRODUCT: unaffected by cosine_mode
+        //   COSINE + AssumeNormalized: collapse to DotProduct (IP
+        //     on pre-normalized inputs) — bit-matches the BLAS path
+        //     and lets cached segments be shared with DOT runs.
+        //   COSINE + ProperMetric: run the proper cosine kernel
+        //     (sqrt/divide in-kernel).
+        let kernel_metric = match (metric, cosine_mode) {
+            (Metric::Cosine, Some(CosineMode::AssumeNormalized)) => Metric::DotProduct,
+            _ => metric,
+        };
 
         let logical_cpus = std::thread::available_parallelism()
             .map(|n| n.get())
@@ -991,8 +679,20 @@ on `std::arch` alone, without SimSIMD, FAISS, or BLAS.
         let query_count = VectorReader::<f32>::count(query_reader.as_ref());
         let dim = VectorReader::<f32>::dim(base_reader.as_ref());
 
-        let (base_offset, base_n) = match base_source.window {
-            Some((ws, we)) => (ws.min(base_count), we.min(base_count).saturating_sub(ws.min(base_count))),
+        // Resolve the effective base window from BOTH the inline path
+        // syntax (`base.fvec[0..N]`) and the injected `range` option
+        // that sized-profile expansion puts on every per-profile
+        // step. Previously this only read the inline form, so sized
+        // profiles silently scanned the full base. See
+        // `source_window::resolve_window` for the full rationale.
+        let effective_window = super::source_window::resolve_window(
+            base_source.window, options.get("range"),
+        );
+        let (base_offset, base_n) = match effective_window {
+            Some((ws, we)) => {
+                let s = ws.min(base_count);
+                (s, we.min(base_count).saturating_sub(s))
+            }
             None => (0, base_count),
         };
 
@@ -1050,7 +750,6 @@ on `std::arch` alone, without SimSIMD, FAISS, or BLAS.
             nominal_segments, segment_size));
 
         let chunk_size = (query_count + threads - 1) / threads;
-        let pb = ctx.ui.bar(base_n as u64, "KNN-stdarch");
 
         // Per-query heaps persist across segments
         let mut all_heaps: Vec<BinaryHeap<Neighbor>> = (0..query_count)
@@ -1079,7 +778,7 @@ on `std::arch` alone, without SimSIMD, FAISS, or BLAS.
         let base_end = base_offset + base_n;
 
         let cached_segments = scan_cached_segments(
-            &ctx.cache, &cache_prefix, k, kernel_metric, query_count,
+            &ctx.cache, ENGINE_NAME, &cache_prefix, k, kernel_metric, query_count,
             &ctx.workspace, base_end, &ctx.ui,
         );
 
@@ -1117,8 +816,8 @@ on `std::arch` alone, without SimSIMD, FAISS, or BLAS.
                 let pe = (pos + segment_size).min(base_end);
                 plan.push(PlannedSegment {
                     start: pos, end: pe,
-                    ivec_path: build_cache_path(&ctx.cache, &cache_prefix, pos, pe, k, kernel_metric, "neighbors", "ivec"),
-                    fvec_path: build_cache_path(&ctx.cache, &cache_prefix, pos, pe, k, kernel_metric, "distances", "fvec"),
+                    ivec_path: build_cache_path(&ctx.cache, ENGINE_NAME, &cache_prefix, pos, pe, k, kernel_metric, "neighbors", "ivec"),
+                    fvec_path: build_cache_path(&ctx.cache, ENGINE_NAME, &cache_prefix, pos, pe, k, kernel_metric, "distances", "fvec"),
                     cached: false,
                 });
                 pos = pe;
@@ -1133,6 +832,16 @@ on `std::arch` alone, without SimSIMD, FAISS, or BLAS.
             .filter(|p| p.cached)
             .map(|p| p.end - p.start)
             .sum();
+
+        // Progress bar sized to the COMPUTE-ONLY workload. Cached
+        // segment replay is reported separately and must not inflate
+        // the rate or collapse the ETA.
+        let compute_bases: usize = plan.iter()
+            .filter(|p| !p.cached)
+            .map(|p| p.end - p.start)
+            .sum();
+        let pb = ctx.ui.bar(compute_bases as u64, "KNN-stdarch");
+        let mut compute_progress: u64 = 0;
 
         if cached_count > 0 {
             let base_pct = 100.0 * cached_bases as f64 / base_n as f64;
@@ -1180,7 +889,11 @@ on `std::arch` alone, without SimSIMD, FAISS, or BLAS.
                     seg_idx + 1, n_segments, p.start, p.end,
                     p.ivec_path.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
                 ));
-                pb.set_position((p.end - base_start) as u64);
+                // Cache replay is reported separately via the log
+                // line above; the compute-only progress bar stays at
+                // 0 so its rec/s reflects actual sgemm throughput and
+                // its ETA reflects remaining compute work.
+                let _ = base_start;
             }
             let replay_secs = replay_start.elapsed().as_secs_f64();
             ctx.ui.log(&format!(
@@ -1358,7 +1071,9 @@ on `std::arch` alone, without SimSIMD, FAISS, or BLAS.
                 if !is_last {
                     std::mem::swap(&mut buf_a, &mut buf_b);
                 }
-                pb.set_position((cur_first + cur_n - base_offset) as u64);
+                compute_progress += cur_n as u64;
+                pb.set_position(compute_progress);
+                let _ = (cur_first, base_offset);
             }
 
             // Collect per-thread heaps into absolute-indexed per_query
@@ -1491,7 +1206,17 @@ on `std::arch` alone, without SimSIMD, FAISS, or BLAS.
             OptionDesc { name: "distances".into(), type_name: "Path".into(), required: false, default: None, description: "Output neighbor distances (fvec)".into(), role: OptionRole::Output },
             OptionDesc { name: "neighbors".into(), type_name: "int".into(), required: true, default: None, description: "k (number of neighbors)".into(), role: OptionRole::Config },
             OptionDesc { name: "metric".into(), type_name: "enum".into(), required: false, default: Some("L2".into()), description: "L2, DOT_PRODUCT, COSINE, IP".into(), role: OptionRole::Config },
-            OptionDesc { name: "normalized".into(), type_name: "bool".into(), required: false, default: Some("false".into()), description: "Vectors are L2-normalized".into(), role: OptionRole::Config },
+            OptionDesc { name: "assume_normalized_like_faiss".into(), type_name: "bool".into(), required: false,
+                default: Some("false".into()),
+                description: "For COSINE metric: treat inputs as pre-normalized and evaluate cosine as inner product (FAISS / numpy / knn_utils convention). Exactly one of this and use_proper_cosine_metric must be set when metric=COSINE.".into(),
+                role: OptionRole::Config },
+            OptionDesc { name: "use_proper_cosine_metric".into(), type_name: "bool".into(), required: false,
+                default: Some("false".into()),
+                description: "For COSINE metric: compute cosine in-kernel as dot / (|q| × |b|). Correct for arbitrary inputs. Exactly one of this and assume_normalized_like_faiss must be set when metric=COSINE.".into(),
+                role: OptionRole::Config },
+            OptionDesc { name: "normalized".into(), type_name: "bool".into(), required: false, default: Some("false".into()),
+                description: "Deprecated alias for assume_normalized_like_faiss; kept for back-compat.".into(),
+                role: OptionRole::Config },
             OptionDesc { name: "threads".into(), type_name: "int".into(), required: false, default: Some("0".into()), description: "Thread count (0 = auto)".into(), role: OptionRole::Config },
             // Accept but ignore knn-metal options for drop-in compatibility
             OptionDesc { name: "partition_size".into(), type_name: "int".into(), required: false, default: None, description: "Override auto-sized segment length (for testing or finer cache granularity)".into(), role: OptionRole::Config },

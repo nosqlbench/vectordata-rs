@@ -437,6 +437,54 @@ pub fn run_pipeline(args: RunArgs) -> Result<(), String> {
     // Resolve all steps including deferred profile expansion
     let expanded_steps = resolve_all_steps(&mut config, &workspace);
 
+    // When sized profiles are still deferred (their base_count is not
+    // yet known from variables.yaml), defer EVERY per-profile step out
+    // of phase 1 — including the default profile's compute-knn.
+    // Reason: without this filter, phase 1 runs the default profile's
+    // full-base compute-knn before sized profiles get expanded, forcing
+    // the user to wait for the largest scan before any smaller sized
+    // profile produces output. Deferring per-profile steps to phase 2
+    // lets expansion.rs:274's "smallest → largest → default" ordering
+    // actually take effect: sized 1m → 2m → ... → default.
+    //
+    // Steps removed here are re-added by phase 2's re-expansion at
+    // mod.rs:762 once sized profiles have been added to the config.
+    let expanded_steps = if config.profiles.has_deferred() {
+        use std::collections::HashSet;
+        let per_profile_template_ids: HashSet<String> = vectordata::dataset::collect_all_steps(&config)
+            .into_iter()
+            .filter(|s| s.per_profile)
+            .map(|s| s.effective_id())
+            .collect();
+
+        // Build the transitive closure: any step (per-profile or not)
+        // that depends directly or indirectly on a per-profile template
+        // must also be deferred — otherwise the phase 1 DAG has a
+        // dangling `after:` reference. Common case: `verify-knn`
+        // (per_profile=false) depends on `compute-knn` (per_profile=
+        // true); if we remove compute-knn without also removing
+        // verify-knn, DAG build fails.
+        let mut deferred: HashSet<String> = per_profile_template_ids.clone();
+        loop {
+            let mut added = false;
+            for s in &expanded_steps {
+                let id = s.effective_id();
+                if deferred.contains(&id) { continue; }
+                if s.after.iter().any(|d| deferred.contains(d)) {
+                    deferred.insert(id);
+                    added = true;
+                }
+            }
+            if !added { break; }
+        }
+
+        expanded_steps.into_iter()
+            .filter(|s| !deferred.contains(&s.effective_id()))
+            .collect()
+    } else {
+        expanded_steps
+    };
+
     // Extract oracle sub-facet scope for partition profile filtering.
     // Used by all expansion phases to restrict per_profile templates.
     let oracle_scope: Option<String> = {
@@ -731,13 +779,20 @@ pub fn run_pipeline(args: RunArgs) -> Result<(), String> {
             }
         }
 
-        let base_count: u64 = ctx.defaults.get("base_count")
-            .and_then(|v| v.parse().ok())
+        // Fall through to whichever count is currently known. Different
+        // pipelines populate different counters depending on which
+        // upstream steps materialize: prepare-vectors writes
+        // `clean_count`, count-base writes `base_count`, count-vectors
+        // writes `vector_count` very early. Any positive value is a
+        // valid upper bound for sized-profile expansion.
+        let base_count: u64 = ["base_count", "clean_count", "vector_count", "source_base_count"]
+            .iter()
+            .find_map(|k| ctx.defaults.get(*k).and_then(|v| v.parse().ok()).filter(|&n: &u64| n > 0))
             .unwrap_or(0);
         let added = if base_count > 0 {
             config.profiles.expand_deferred_sized(&ctx.defaults, base_count)
         } else {
-            ctx.ui.log("WARNING: base_count not available — cannot expand sized profiles");
+            ctx.ui.log("WARNING: no count variable available (base_count, clean_count, vector_count, source_base_count) — cannot expand sized profiles");
             0
         };
         if added > 0 {

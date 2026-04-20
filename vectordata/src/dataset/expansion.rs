@@ -235,12 +235,20 @@ pub fn expand_per_profile_steps_scoped(
             }
 
             // Auto-inject range for sized profiles (not partition profiles —
-            // partition base vectors are already the exact subset, no windowing needed)
+            // partition base vectors are already the exact subset, no windowing needed).
+            //
+            // Syntax note: use `..` not `,`. The source-string grammar
+            // (`vectordata/src/dataset/source.rs::parse_window`) treats
+            // `,` as a MULTI-INTERVAL separator: `"0,N"` parses as two
+            // intervals `[0,0)` and `[0,N)`, and any consumer that reads
+            // `window.0[0]` picks up the empty `[0,0)` → base_n = 0 →
+            // divide-by-zero downstream. `..` is the interval separator,
+            // matching the inline authoring form `file.fvec[0..N)`.
             if base_count_opt.is_some() && !is_partition && !expanded_options.contains_key("range") {
                 let base_end = query_count + base_count_opt.unwrap();
                 expanded_options.insert(
                     "range".to_string(),
-                    serde_yaml::Value::String(format!("[0,{})", base_end)),
+                    serde_yaml::Value::String(format!("[0..{})", base_end)),
                 );
             }
 
