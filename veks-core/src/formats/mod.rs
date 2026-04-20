@@ -24,6 +24,8 @@ pub use vectordata::formats::anode_vernacular;
 
 pub mod facet;
 pub mod parquet_compiler;
+pub mod parquet_vector_compiler;
+pub mod xvec_dir_compiler;
 pub mod convert;
 pub mod reader;
 pub mod writer;
@@ -229,9 +231,53 @@ impl VecFormat {
         }
     }
 
-    /// Canonical extension for a recognized extension string.
+    /// Preferred file extension for writing a new file of this format.
+    ///
+    /// For xvec and vvec formats this returns the plural form (e.g.
+    /// `"fvecs"`, `"ivvecs"`) — the convention this project now writes. For
+    /// scalar and container formats it matches [`name`](Self::name) (they
+    /// have no singular/plural split).
+    ///
+    /// Reading accepts both singular and plural forms; see
+    /// [`from_extension`](Self::from_extension).
+    pub fn preferred_extension(self) -> &'static str {
+        match self {
+            // Uniform xvec
+            Self::Fvec => "fvecs",
+            Self::Dvec => "dvecs",
+            Self::Mvec => "mvecs",
+            Self::Bvec => "bvecs",
+            Self::I8vec => "i8vecs",
+            Self::Svec => "svecs",
+            Self::U16vec => "u16vecs",
+            Self::Ivec => "ivecs",
+            Self::U32vec => "u32vecs",
+            Self::I64vec => "i64vecs",
+            Self::U64vec => "u64vecs",
+            // Variable-length vvec
+            Self::Fvvec => "fvvecs",
+            Self::Dvvec => "dvvecs",
+            Self::Mvvec => "mvvecs",
+            Self::Bvvec => "bvvecs",
+            Self::I8vvec => "i8vvecs",
+            Self::Svvec => "svvecs",
+            Self::U16vvec => "u16vvecs",
+            Self::Ivvec => "ivvecs",
+            Self::U32vvec => "u32vvecs",
+            Self::I64vvec => "i64vvecs",
+            Self::U64vvec => "u64vvecs",
+            // Scalars and containers: no plural convention.
+            _ => self.name(),
+        }
+    }
+
+    /// Normalize an extension string to the preferred canonical form.
+    ///
+    /// Accepts any recognized synonym (e.g. `"fvec"`, `"fvecs"`, `"f32vec"`)
+    /// and returns the preferred extension string to use when writing a new
+    /// file of the same format — the plural form for xvec/vvec types.
     pub fn canonical_extension(ext: &str) -> Option<&'static str> {
-        Self::from_extension(ext).map(|f| f.name())
+        Self::from_extension(ext).map(|f| f.preferred_extension())
     }
 
     /// Detect format from a bare file extension.

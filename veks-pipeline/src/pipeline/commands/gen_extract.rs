@@ -205,7 +205,7 @@ facets of the dataset.
             }
             let effective_end = std::cmp::min(range_end, ivec_count);
             let result = sorted_index_extract_fvec(
-                &fvec_reader, fvec_count, dim,
+                &fvec_reader, &fvec_path, fvec_count, dim,
                 &ivec_reader, range_start, effective_end,
                 &output_path, normalize, ctx, start,
             );
@@ -1657,6 +1657,7 @@ fn sorted_index_extract_mvec(
 /// a read plan, sort by source position, read sequentially, write contiguously.
 fn sorted_index_extract_fvec(
     fvec_reader: &MmapVectorReader<f32>,
+    fvec_path: &Path,
     fvec_count: usize,
     dim: u32,
     ivec_reader: &MmapVectorReader<i32>,
@@ -1667,6 +1668,39 @@ fn sorted_index_extract_fvec(
     ctx: &mut StreamContext,
     _start: Instant,
 ) -> Result<String, String> {
+    // Open a separate File handle for pread-based vector reads. The
+    // hot loops below avoid `mmap.get_slice` (which faults source
+    // pages into our address space and inflates RSS to multi-100 GiB
+    // on shuffled access patterns over multi-TB inputs) in favor of
+    // `pread` into per-call heap buffers — bytes flow through the
+    // kernel page cache the same way, but never get mapped into our
+    // process, so RSS stays bounded. `File` is `Sync` for `read_at`,
+    // so a single fd is safe for parallel rayon access.
+    let fvec_file = std::fs::File::open(fvec_path)
+        .map_err(|e| format!("open {} for pread: {}", fvec_path.display(), e))?;
+    let entry_size = fvec_reader.entry_size();
+    // Helper: pread one vector's f32 components into a fresh Vec<f32>.
+    // Allocates per-call (per-thread allocator slabs handle this
+    // efficiently for the ~1.5 KiB sizes here). `_ = entry_size; _ = &fvec_file;`
+    // keeps the closure capturing them so it can be moved into
+    // par_iter without borrowing `fvec_path`.
+    let pread_vector = |source_idx: usize| -> std::io::Result<Vec<f32>> {
+        use std::os::unix::fs::FileExt;
+        let dim_u = dim as usize;
+        let value_bytes = entry_size - 4;
+        let mut bytes = vec![0u8; value_bytes];
+        let offset = (source_idx * entry_size + 4) as u64;
+        fvec_file.read_exact_at(&mut bytes, offset)?;
+        let mut out = Vec::with_capacity(dim_u);
+        for i in 0..dim_u {
+            out.push(f32::from_le_bytes([
+                bytes[i * 4], bytes[i * 4 + 1],
+                bytes[i * 4 + 2], bytes[i * 4 + 3],
+            ]));
+        }
+        Ok(out)
+    };
+    let _ = &pread_vector; // anchor the binding for closures below
     // Near-zero threshold from step options (SRD §19). Vectors with
     // L2 norm below this threshold are skipped during extraction.
     // The threshold is always active when normalizing — near-zero
@@ -1904,7 +1938,22 @@ fn sorted_index_extract_fvec(
             let transpose_fn = || {
                 let sample_every = (read_plan.len() / 1000).max(1);
                 read_plan.par_iter().for_each(|&(source_idx, local_pos)| {
-                    let src_slice = fvec_reader.get_slice(source_idx);
+                    // pread the source vector into a heap buffer rather
+                    // than mmap.get_slice — see the file header comment
+                    // for the RSS rationale. The Vec<f32> drops at
+                    // closure end, returning the memory immediately.
+                    let src_vec = match pread_vector(source_idx) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            // Best-effort: count this as a "zero" so it
+                            // gets skipped; the source-fault would have
+                            // crashed the run anyway.
+                            eprintln!("pread error at source_idx={}: {}", source_idx, e);
+                            if let Ok(mut zl) = zero_list.lock() { zl.push(source_idx); }
+                            return;
+                        }
+                    };
+                    let src_slice: &[f32] = &src_vec;
 
                     if normalize {
                         let mut norm_sq = 0.0f64;
@@ -2041,7 +2090,10 @@ fn sorted_index_extract_fvec(
             // ── Sequential mode: per-chunk buffers, written in order ────
             use rayon::prelude::*;
             let progress_ref = &progress;
-            let fvec_ref = &fvec_reader;
+            // fvec_reader's mmap is no longer touched in the hot loop
+            // (we pread instead — see file header comment for why);
+            // the mmap binding stays around so other call sites and
+            // metadata accessors keep working, but isn't borrowed here.
 
             let compute_fn = || {
                 read_plan.par_chunks(chunk_size).map(|chunk| {
@@ -2063,7 +2115,17 @@ fn sorted_index_extract_fvec(
                     let sample_every = (chunk.len() / 1000).max(1);
 
                     for &(source_idx, _local_pos) in chunk {
-                        let src_slice = fvec_ref.get_slice(source_idx);
+                        // pread (heap buffer) instead of mmap.get_slice;
+                        // see file header comment for the RSS rationale.
+                        let src_vec = match pread_vector(source_idx) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                eprintln!("pread error at source_idx={}: {}", source_idx, e);
+                                zeros.push(source_idx);
+                                continue;
+                            }
+                        };
+                        let src_slice: &[f32] = &src_vec;
 
                         if normalize {
                             let mut norm_sq = 0.0f64;
@@ -2240,10 +2302,10 @@ fn sorted_index_extract_fvec(
     // extraction set. The true source zero count is:
     //   source_zero_count = extraction_zeros + duplicate_zeros
     //
-    // We read the dedup_duplicates.ivec (if it exists) and check each
+    // We read the dedup_duplicates.ivecs (if it exists) and check each
     // referenced source vector's L2 norm against the same threshold.
     let duplicate_zero_count = {
-        let dup_path = ctx.workspace.join(".cache/dedup_duplicates.ivec");
+        let dup_path = ctx.workspace.join(".cache/dedup_duplicates.ivecs");
         if dup_path.exists() {
             match MmapVectorReader::<i32>::open_ivec(&dup_path) {
                 Ok(dup_reader) => {
@@ -2278,11 +2340,11 @@ fn sorted_index_extract_fvec(
     };
     // Write zero ordinals ivec for post-hoc verification
     if !zero_ordinals.is_empty() {
-        let zeros_path = output_path.with_file_name("zero_ordinals.ivec");
+        let zeros_path = output_path.with_file_name("zero_ordinals.ivecs");
         // Try to place in .cache/ if output is in profiles/
         let zeros_path = if let Some(cache) = output_path.parent()
             .and_then(|p| p.parent())
-            .map(|ws| ws.join(".cache/zero_ordinals.ivec"))
+            .map(|ws| ws.join(".cache/zero_ordinals.ivecs"))
         {
             cache
         } else {
@@ -3070,8 +3132,11 @@ impl CommandOp for TransformExtractOp {
                     format!("read predicate-index {}: {}", pred_idx, e), start),
             };
 
-            // Write temporary ivec with these ordinals
-            let tmp_ivec = ctx.scratch.join(format!("_predicate_{}.ivec", pred_idx));
+            // Write temporary ivec with these ordinals into the cache dir
+            // (which may not exist yet — pipeline runs always create it,
+            // but ad-hoc calls via tests may not).
+            let _ = std::fs::create_dir_all(&ctx.cache);
+            let tmp_ivec = ctx.cache.join(format!("_predicate_{}.ivec", pred_idx));
             {
                 use std::io::Write;
                 let f = match std::fs::File::create(&tmp_ivec) {
@@ -3316,7 +3381,6 @@ mod tests {
             profile: String::new(),
             profile_names: vec![],
             workspace: workspace.to_path_buf(),
-            scratch: workspace.join(".scratch"),
             cache: workspace.join(".cache"),
             defaults: IndexMap::new(),
             dry_run: false,
@@ -3387,7 +3451,6 @@ mod tests {
             profile: String::new(),
             profile_names: vec![],
             workspace: workspace.to_path_buf(),
-            scratch: workspace.join(".scratch"),
             cache: workspace.join(".cache"),
             defaults: IndexMap::new(),
             dry_run: false,
@@ -3413,7 +3476,7 @@ mod tests {
         assert_eq!(r.status, Status::Ok);
 
         // Generate shuffle of 20 elements
-        let ivec_path = workspace.join("shuffle.ivec");
+        let ivec_path = workspace.join("shuffle.ivecs");
         let mut opts = Options::new();
         opts.set("output", ivec_path.to_string_lossy().to_string());
         opts.set("interval", "20");
@@ -3471,7 +3534,6 @@ mod tests {
             profile: String::new(),
             profile_names: vec![],
             workspace: workspace.to_path_buf(),
-            scratch: workspace.join(".scratch"),
             cache: workspace.join(".cache"),
             defaults: IndexMap::new(),
             dry_run: false,
@@ -3496,7 +3558,7 @@ mod tests {
         assert_eq!(r.status, Status::Ok);
 
         // Generate shuffle of 20 elements
-        let ivec_path = workspace.join("shuffle.ivec");
+        let ivec_path = workspace.join("shuffle.ivecs");
         let mut opts = Options::new();
         opts.set("output", ivec_path.to_string_lossy().to_string());
         opts.set("interval", "20");
@@ -3556,7 +3618,6 @@ mod tests {
             profile: String::new(),
             profile_names: vec![],
             workspace: workspace.to_path_buf(),
-            scratch: workspace.join(".scratch"),
             cache: workspace.join(".cache"),
             defaults: IndexMap::new(),
             dry_run: false,
@@ -3636,7 +3697,6 @@ mod tests {
             profile: String::new(),
             profile_names: vec![],
             workspace: workspace.to_path_buf(),
-            scratch: workspace.join(".scratch"),
             cache: workspace.join(".cache"),
             defaults: IndexMap::new(),
             dry_run: false,
@@ -3670,7 +3730,7 @@ mod tests {
         }
 
         // Write shuffled ivec: [9, 7, 5, 3, 1, 8, 6, 4, 2, 0]
-        let ivec_path = workspace.join("shuffle.ivec");
+        let ivec_path = workspace.join("shuffle.ivecs");
         {
             use std::io::Write;
             let mut f = std::fs::File::create(&ivec_path).unwrap();

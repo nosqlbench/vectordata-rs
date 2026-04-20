@@ -393,7 +393,7 @@ mod tests {
         let mut b_opts = IndexMap::new();
         b_opts.insert(
             "source".to_string(),
-            serde_yaml::Value::String("shuffle.ivec".to_string()),
+            serde_yaml::Value::String("shuffle.ivecs".to_string()),
         );
         b_opts.insert(
             "output".to_string(),
@@ -401,7 +401,7 @@ mod tests {
         );
 
         let steps = vec![
-            step("a", "generate ivec-shuffle", vec![], Some("shuffle.ivec")),
+            step("a", "generate ivec-shuffle", vec![], Some("shuffle.ivecs")),
             StepDef {
                 id: Some("b".to_string()),
                 run: "generate fvec-extract".to_string(),

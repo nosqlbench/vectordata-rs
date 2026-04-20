@@ -560,12 +560,20 @@ pub fn run_direct(args: Vec<String>) {
         std::process::exit(0);
     }
 
-    // Collect resource names declared by this command for alias recognition.
+    // Collect resource names declared by this command for alias recognition,
+    // and the ordered list of required Input-role option names so we can
+    // accept bare positional args as shorthand for them (in declaration order).
     let cmd_instance = factory();
     let declared_resources = cmd_instance.describe_resources();
     let resource_names: Vec<String> = declared_resources
         .iter()
         .filter_map(|r| ResourceType::from_name(&r.name).map(|_| r.name.clone()))
+        .collect();
+    let positional_targets: Vec<String> = cmd_instance
+        .describe_options()
+        .into_iter()
+        .filter(|d| d.required && d.role == super::command::OptionRole::Input)
+        .map(|d| d.name)
         .collect();
     drop(cmd_instance);
 
@@ -580,6 +588,7 @@ pub fn run_direct(args: Vec<String>) {
     let mut resource_aliases: Vec<(String, String)> = Vec::new();
     let rest = option_args;
     let mut i = 0;
+    let mut next_positional = 0usize;
     while i < rest.len() {
         let arg = &rest[i];
         if let Some(stripped) = arg.strip_prefix("--") {
@@ -617,6 +626,15 @@ pub fn run_direct(args: Vec<String>) {
                 // Boolean flag — set to "true".
                 options.set(stripped, "true");
             }
+        } else if next_positional < positional_targets.len() {
+            // Bare positional: assign to the next unfilled required-Input option.
+            // An explicit --key=value earlier still wins because Options::set
+            // overwrites; we only fill slots that the user hasn't already named.
+            let target = &positional_targets[next_positional];
+            if options.get(target).is_none() {
+                options.set(target, arg);
+            }
+            next_positional += 1;
         } else {
             println!("Unexpected argument: '{}'", arg);
             std::process::exit(1);
@@ -673,14 +691,12 @@ pub fn run_direct(args: Vec<String>) {
         }
     }
 
-    let scratch = workspace.join(".scratch");
     let cache = workspace.join(".cache");
     let mut ctx = StreamContext {
         dataset_name: String::new(),
         profile: String::new(),
         profile_names: vec![],
         workspace,
-        scratch,
         cache,
         defaults: IndexMap::new(),
         dry_run: false,
@@ -727,14 +743,28 @@ pub fn run_direct(args: Vec<String>) {
                     let reduction = overage.floor() as u32;
                     let grace_ticks = base_ticks.saturating_sub(reduction).max(1);
                     if emergency_ticks >= grace_ticks {
-                        resource_ui.log(&format!(
+                        // Build messages once, log them to the TUI
+                        // (so they end up in runlog.jsonl), then shut
+                        // down the TUI and re-emit on stderr so the
+                        // user actually sees them at the shell prompt.
+                        // Without the stderr emission, the alt-screen
+                        // swallows the log and the user gets a silent
+                        // exit 1.
+                        let fatal = format!(
                             "FATAL: resource emergency for {:.1}s, RSS {:.0}% over ceiling — aborting to prevent system lockup",
                             emergency_ticks as f64 * tick_secs,
                             overage,
-                        ));
-                        resource_ui.log(&format!(
-                            "  last status: {}", resource_source.status_line()
-                        ));
+                        );
+                        let status = format!(
+                            "  last status: {}", resource_source.status_line(),
+                        );
+                        resource_ui.log(&fatal);
+                        resource_ui.log(&status);
+                        resource_ui.shutdown();
+                        eprintln!();
+                        eprintln!("{}", fatal);
+                        eprintln!("{}", status);
+                        eprintln!("Hint: lower the in-flight count, narrow the workload, or pass `--mem <smaller>` and re-run.");
                         std::process::exit(1);
                     }
                 } else {

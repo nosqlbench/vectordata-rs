@@ -41,10 +41,32 @@ pub trait VecSource: Send {
 ///
 /// Records are raw element bytes (no dimension prefix). The dimension is
 /// configured at writer construction time.
-pub trait VecSink {
+pub trait VecSink: Send {
     /// Write a record. `data` is raw element bytes (length = dim × element_size).
     /// `ordinal` is the logical record index (used by slab for addressing).
     fn write_record(&mut self, ordinal: i64, data: &[u8]);
+
+    /// Write many consecutive fixed-dim records from a contiguous packed
+    /// buffer. The default implementation fans out to `write_record`; sinks
+    /// like the xvec writer override this to amortize per-record virtual
+    /// dispatch across the whole batch.
+    ///
+    /// `packed` must contain exactly `count * record_size` bytes of element
+    /// data (no dim headers — xvec sinks insert those themselves).
+    fn write_records_fixed_dim(
+        &mut self,
+        ordinal_start: i64,
+        packed: &[u8],
+        count: usize,
+        record_size: usize,
+    ) {
+        debug_assert_eq!(packed.len(), count * record_size);
+        let mut off = 0;
+        for i in 0..count {
+            self.write_record(ordinal_start + i as i64, &packed[off..off + record_size]);
+            off += record_size;
+        }
+    }
 
     /// Finalize the output (flush buffers, write footers, etc.).
     fn finish(self: Box<Self>) -> Result<(), String>;

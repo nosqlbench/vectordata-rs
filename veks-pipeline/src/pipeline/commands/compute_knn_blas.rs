@@ -501,7 +501,6 @@ mod tests {
         StreamContext {
             dataset_name: String::new(), profile: String::new(), profile_names: vec![],
             workspace: workspace.to_path_buf(),
-            scratch: workspace.join(".scratch"), cache: workspace.join(".cache"),
             defaults: IndexMap::new(), dry_run: false, progress: ProgressLog::new(),
             threads: 1, step_id: String::new(),
             governor: crate::pipeline::resource::ResourceGovernor::default_governor(),

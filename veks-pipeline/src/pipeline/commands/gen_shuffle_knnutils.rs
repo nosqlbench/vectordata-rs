@@ -352,7 +352,6 @@ mod tests {
             profile: String::new(),
             profile_names: vec![],
             workspace: workspace.to_path_buf(),
-            scratch: workspace.join(".scratch"),
             cache: workspace.join(".cache"),
             defaults: IndexMap::new(),
             dry_run: false,
@@ -381,7 +380,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut ctx = make_ctx(tmp.path());
 
-        let out = tmp.path().join("shuffle.ivec");
+        let out = tmp.path().join("shuffle.ivecs");
         let mut opts = Options::new();
         opts.set("output", out.to_string_lossy().to_string());
         opts.set("interval", "20");
@@ -451,7 +450,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut ctx = make_ctx(tmp.path());
 
-        let out = tmp.path().join("shuffle.ivec");
+        let out = tmp.path().join("shuffle.ivecs");
         let mut opts = Options::new();
         opts.set("output", out.to_string_lossy().to_string());
         opts.set("interval", "500");
@@ -476,9 +475,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut ctx = make_ctx(tmp.path());
 
-        let base_out = tmp.path().join("base_shuffle.ivec");
+        let base_out = tmp.path().join("base_shuffle.ivecs");
         let state_file = tmp.path().join("prng_state.bin");
-        let query_out = tmp.path().join("query_shuffle.ivec");
+        let query_out = tmp.path().join("query_shuffle.ivecs");
 
         // Base shuffle: seed=42, save state
         let mut opts = Options::new();

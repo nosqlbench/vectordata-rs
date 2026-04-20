@@ -319,8 +319,8 @@ auto-resolved from the profile.
         ctx.ui.log(&format!("├─ Stage 5: Partition KNN (profile: {}) ─────────────────",
             partition_profile));
 
-        let part_gt_path = ctx.workspace.join(format!("profiles/{}/neighbor_indices.ivec", partition_profile));
-        let part_dist_path = ctx.workspace.join(format!("profiles/{}/neighbor_distances.fvec", partition_profile));
+        let part_gt_path = ctx.workspace.join(format!("profiles/{}/neighbor_indices.ivecs", partition_profile));
+        let part_dist_path = ctx.workspace.join(format!("profiles/{}/neighbor_distances.fvecs", partition_profile));
         let part_query_path = ctx.workspace.join(format!("profiles/{}/query_vectors.fvec", partition_profile));
 
         // Determine which ordinal to use for reading partition KNN.

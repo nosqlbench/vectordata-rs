@@ -157,6 +157,7 @@ run), the command returns immediately without re-running anything.
             profile,
             dry_run: ctx.dry_run,
             clean: false,
+            clean_last: false,
             reset: false,
             overrides: vec![],
             threads: ctx.threads,

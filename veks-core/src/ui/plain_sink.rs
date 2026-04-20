@@ -179,6 +179,7 @@ impl UiSink for PlainSink {
             | UiEvent::SetStepYaml { .. }
             | UiEvent::SuspendBegin
             | UiEvent::SuspendEnd
+            | UiEvent::ProgressAnchorRate { .. }
             | UiEvent::Clear => {}
 
             UiEvent::Log { message } => {

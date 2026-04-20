@@ -291,7 +291,6 @@ mod tests {
             profile: String::new(),
             profile_names: vec![],
             workspace: dir.to_path_buf(),
-            scratch: dir.join(".scratch"),
             cache: dir.join(".cache"),
             defaults: IndexMap::new(),
             dry_run: false,
@@ -308,7 +307,7 @@ mod tests {
     #[test]
     fn test_shuffle_output_size() {
         let tmp = tempfile::tempdir().unwrap();
-        let out = tmp.path().join("shuffle.ivec");
+        let out = tmp.path().join("shuffle.ivecs");
 
         let mut opts = Options::new();
         opts.set("output", out.to_string_lossy().to_string());
@@ -328,7 +327,7 @@ mod tests {
     #[test]
     fn test_shuffle_is_permutation() {
         let tmp = tempfile::tempdir().unwrap();
-        let out = tmp.path().join("shuffle.ivec");
+        let out = tmp.path().join("shuffle.ivecs");
 
         let mut opts = Options::new();
         opts.set("output", out.to_string_lossy().to_string());

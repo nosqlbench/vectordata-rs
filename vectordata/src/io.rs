@@ -457,6 +457,22 @@ impl<T> MmapVectorReader<T> {
         let _ = self.mmap.advise(memmap2::Advice::Sequential);
     }
 
+    /// Advise the kernel that the mmap will be accessed in essentially
+    /// random order (no useful readahead). Issues
+    /// `madvise(MADV_RANDOM)` on the full mapping.
+    ///
+    /// Important for *small-payload-per-vector* read patterns (e.g.,
+    /// reading just the leading prefix of each vector for sort-key
+    /// construction): without this, the kernel's default readahead
+    /// fetches ~256 KB on each access, mapping in 64× more pages than
+    /// the read actually needs and inflating process RSS proportionally.
+    /// On a multi-TB source file with parallel readers, that
+    /// over-fetch is the dominant cause of "RSS over ceiling — aborting
+    /// to prevent system lockup."
+    pub fn advise_random(&self) {
+        let _ = self.mmap.advise(memmap2::Advice::Random);
+    }
+
     /// Advise the kernel that vector data for indices `[start, end)` is
     /// no longer needed.
     ///

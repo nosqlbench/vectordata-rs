@@ -11,6 +11,7 @@ repository = "https://github.com/nosqlbench/vectordata-rs"
 arrow = "54"
 atty = "0.2"
 byteorder = "1"
+bytes = "1"
 chrono = "0.4"
 clap = { version = "4", features = ["derive", "string"] }
 crossterm = "0.28"

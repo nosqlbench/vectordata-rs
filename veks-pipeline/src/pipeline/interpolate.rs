@@ -20,7 +20,6 @@
 //! Implicit variables available in every context:
 //! - `${dataset_dir}` — directory containing the dataset.yaml
 //! - `${workspace}` — same as dataset_dir (alias)
-//! - `${scratch}` — temporary scratch directory (`<workspace>/.scratch`)
 //! - `${cache}` — reusable cache directory (`<workspace>/.cache`)
 
 use std::path::Path;
@@ -121,9 +120,6 @@ fn resolve_var(
     match name {
         "dataset_dir" | "workspace" => {
             return Ok(workspace.to_string_lossy().into_owned());
-        }
-        "scratch" => {
-            return Ok(workspace.join(".scratch").to_string_lossy().into_owned());
         }
         "cache" => {
             return Ok(workspace.join(".cache").to_string_lossy().into_owned());
@@ -239,13 +235,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result, "fallback");
-    }
-
-    #[test]
-    fn test_scratch_implicit() {
-        let result =
-            interpolate("${scratch}/tmp.fvec", &defaults(), Path::new("/my/data")).unwrap();
-        assert_eq!(result, "/my/data/.scratch/tmp.fvec");
     }
 
     #[test]

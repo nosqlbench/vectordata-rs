@@ -742,10 +742,10 @@ into the global top-K for each query — identical to the strategy used by
 
 The command produces two files:
 
-- **filtered_neighbor_indices.ivec** — for each query, the ordinal indices
+- **filtered_neighbor_indices.ivecs** — for each query, the ordinal indices
   of its K nearest neighbors among the base vectors that match the query's
   predicate.
-- **filtered_neighbor_distances.fvec** — the corresponding distances.
+- **filtered_neighbor_distances.fvecs** — the corresponding distances.
 
 ### Role in the Pipeline
 
@@ -1544,7 +1544,6 @@ mod tests {
             profile: String::new(),
             profile_names: vec![],
             workspace: dir.to_path_buf(),
-            scratch: dir.join(".scratch"),
             cache: dir.join(".cache"),
             defaults: IndexMap::new(),
             dry_run: false,

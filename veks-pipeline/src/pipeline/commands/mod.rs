@@ -146,8 +146,6 @@ pub fn register_all(registry: &mut CommandRegistry) {
     registry.register("compute knn", compute_knn_stdarch::factory);
     #[cfg(feature = "faiss")]
     registry.register("compute knn-faiss", compute_knn_faiss::factory);
-    #[cfg(feature = "faiss")]
-    registry.register("verify knn-faiss", verify_knn_faiss::factory);
     registry.register("compute sort", compute_dedup::factory);
     #[cfg(feature = "knnutils")]
     registry.register("compute sort-knnutils", compute_sort_knnutils::factory);
@@ -201,19 +199,16 @@ pub fn register_all(registry: &mut CommandRegistry) {
     // ── verify ───────────────────────────────────────────────────────
     #[cfg(feature = "knnutils")]
     registry.register("verify dataset-knnutils", verify_dataset_knnutils::factory);
-    // verify knn-groundtruth: per-profile KNN verification
-    #[cfg(feature = "faiss")]
-    registry.register("verify knn-groundtruth", verify_knn_faiss::factory);
-    #[cfg(not(feature = "faiss"))]
+    // verify knn-groundtruth: per-profile, default is SimSIMD (metal)
     registry.register("verify knn-groundtruth", verify_knn::factory);
-    registry.register("verify knn-groundtruth-metal", verify_knn::factory);
     registry.register("verify predicate-results", verify_predicates::factory);
-    // verify knn-consolidated: multi-profile single-pass verification
-    #[cfg(feature = "faiss")]
-    registry.register("verify knn-consolidated", verify_knn_faiss::consolidated_factory);
-    #[cfg(not(feature = "faiss"))]
+    // verify knn-consolidated: multi-profile single-pass, default is SimSIMD
     registry.register("verify knn-consolidated", verify_consolidated::knn_consolidated_factory);
-    registry.register("verify knn-consolidated-metal", verify_consolidated::knn_consolidated_factory);
+    // FAISS verify: explicit opt-in, safe-sampled to avoid BLAS ABI bug
+    #[cfg(feature = "faiss")]
+    registry.register("verify knn-faiss", verify_knn_faiss::factory);
+    #[cfg(feature = "faiss")]
+    registry.register("verify knn-faiss-consolidated", verify_knn_faiss::consolidated_factory);
     registry.register("verify filtered-knn-consolidated", verify_consolidated::filtered_knn_consolidated_factory);
     registry.register("verify predicates-consolidated", verify_consolidated::predicates_consolidated_factory);
     registry.register("verify predicates-sqlite", verify_predicates_sqlite::factory);

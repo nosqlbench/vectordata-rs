@@ -202,7 +202,6 @@ mod tests {
             profile: String::new(),
             profile_names: vec![],
             workspace: workspace.to_path_buf(),
-            scratch: workspace.join(".scratch"),
             cache: workspace.join(".cache"),
             defaults: IndexMap::new(),
             dry_run: false,

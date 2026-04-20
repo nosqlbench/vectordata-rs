@@ -158,6 +158,13 @@ struct BarState {
     label: String,
     message: String,
     created_at: Instant,
+    /// Optional `(position, time)` anchor for rate calculation. When
+    /// present, the displayed rate is `(position - p0) / (now - t0)`
+    /// instead of `position / (now - created_at)`. Set via
+    /// [`UiEvent::ProgressAnchorRate`] to exclude an early burst of
+    /// trivial-cost progress (e.g. cache-skipped shards) from the
+    /// throughput display.
+    rate_anchor: Option<(u64, Instant)>,
     /// The unit label for rate display (e.g., "rec", "files", "chunks").
     unit: String,
 }
@@ -769,10 +776,17 @@ fn process_msg(
                 label: label.clone(),
                 message: String::new(),
                 created_at: Instant::now(),
+                rate_anchor: None,
                 unit: unit.clone(),
             });
             state.bar_order.push(*id);
             state.dirty = true;
+        }
+
+        UiEvent::ProgressAnchorRate { id } => {
+            if let Some(bar) = state.bars.get_mut(id) {
+                bar.rate_anchor = Some((bar.position, Instant::now()));
+            }
         }
 
         UiEvent::ProgressUpdate { id, position } => {
@@ -1794,9 +1808,20 @@ fn render_bar(frame: &mut ratatui::Frame, area: Rect, bar: &BarState) {
                 0.0
             };
             let pct = (ratio * 100.0) as u16;
-            let elapsed = bar.created_at.elapsed().as_secs_f64();
-            let rate_eta = if elapsed > 0.5 && bar.position > 0 {
-                let rps = bar.position as f64 / elapsed;
+            // Rate calc respects an explicit anchor (set when the
+            // caller wants to exclude an early burst of free progress
+            // from the rate average — e.g. cache-skipped shards).
+            // Falls back to bar-creation time and full position when
+            // unanchored.
+            let (rate_pos, rate_elapsed) = match bar.rate_anchor {
+                Some((p0, t0)) => (
+                    bar.position.saturating_sub(p0),
+                    t0.elapsed().as_secs_f64(),
+                ),
+                None => (bar.position, bar.created_at.elapsed().as_secs_f64()),
+            };
+            let rate_eta = if rate_elapsed > 0.5 && rate_pos > 0 {
+                let rps = rate_pos as f64 / rate_elapsed;
                 let rate = format_rate(rps, &bar.unit);
                 let eta = if bar.total > bar.position && rps > 0.0 {
                     let remaining = (bar.total - bar.position) as f64;
@@ -2115,6 +2140,7 @@ mod tests {
             label: "test".into(),
             message: String::new(),
             created_at: Instant::now(),
+            rate_anchor: None,
             unit: "rec".into(),
         });
         assert_eq!(state.visible_lines(), 1);
@@ -2239,6 +2265,7 @@ mod tests {
             label: "importing".into(),
             message: String::new(),
             created_at: Instant::now(),
+            rate_anchor: None,
             unit: "rec".into(),
         });
         state.bar_order.push(id);
@@ -2278,6 +2305,7 @@ mod tests {
             label: "scanning".into(),
             message: "file.fvec".into(),
             created_at: Instant::now(),
+            rate_anchor: None,
             unit: "rec".into(),
         };
 
@@ -2314,6 +2342,7 @@ mod tests {
             label: "computing".into(),
             message: String::new(),
             created_at: Instant::now(),
+            rate_anchor: None,
             unit: "rec".into(),
         });
         state.bar_order.push(id);
@@ -2378,6 +2407,7 @@ mod tests {
                 label: format!("step-{}", i),
                 message: String::new(),
                 created_at: Instant::now(),
+                rate_anchor: None,
                 unit: "rec".into(),
             });
             state.bar_order.push(id);
@@ -2515,6 +2545,7 @@ mod tests {
             label: "computing".into(),
             message: String::new(),
             created_at: Instant::now(),
+            rate_anchor: None,
             unit: "rec".into(),
         });
         state.bar_order.push(id);

@@ -138,7 +138,7 @@ fn import_minimal_no_inputs() {
 #[test]
 fn import_native_fvec_self_search() {
     let dir = tempfile::tempdir().unwrap();
-    let fvec = dir.path().join("vectors.fvec");
+    let fvec = dir.path().join("vectors.fvecs");
     write_fvec(&fvec, 200, 4);
 
     let out = dir.path().join("dataset");
@@ -161,8 +161,8 @@ fn import_native_fvec_self_search() {
     assert!(yaml.contains("compute sort"), "should have sort/dedup step");
 
     // Profile should reference the extracted vectors, not the source
-    assert!(yaml.contains("profiles/base/base_vectors.mvec")
-        || yaml.contains("profiles/base/base_vectors.fvec")
+    assert!(yaml.contains("profiles/base/base_vectors.mvecs")
+        || yaml.contains("profiles/base/base_vectors.fvecs")
         || yaml.contains(&fvec.to_string_lossy().to_string()),
         "profile should reference vectors");
 }
@@ -185,7 +185,7 @@ fn import_npy_dir_needs_import_step() {
     // Should have import step (npy is foreign format)
     assert!(yaml.contains("run: transform convert"), "npy dir should need import step");
     // Probe of fake npy falls back to fvec; real npy dirs would get the correct extension
-    assert!(yaml.contains("${cache}/all_vectors.fvec") || yaml.contains("${cache}/all_vectors.mvec"),
+    assert!(yaml.contains("${cache}/all_vectors.fvecs") || yaml.contains("${cache}/all_vectors.mvecs"),
         "import output should go to cache");
 }
 
@@ -194,8 +194,8 @@ fn import_separate_query_combined_bq() {
     // Strategy 1: Non-HDF5 separate base+query files are combined into a
     // single source, deduplicated together, then split via shuffle.
     let dir = tempfile::tempdir().unwrap();
-    let base = dir.path().join("base.fvec");
-    let query = dir.path().join("query.fvec");
+    let base = dir.path().join("base.fvecs");
+    let query = dir.path().join("query.fvecs");
     write_fvec(&base, 100, 3);
     write_fvec(&query, 10, 3);
 
@@ -217,14 +217,14 @@ fn import_separate_query_combined_bq() {
     assert!(yaml.contains("compute knn"), "should have KNN with combined B+Q");
 
     // Query should be at canonical profile path
-    assert!(yaml.contains("profiles/base/query_vectors.fvec"),
+    assert!(yaml.contains("profiles/base/query_vectors.fvecs"),
         "query should use canonical profile path");
 }
 
 #[test]
 fn import_no_dedup_flag() {
     let dir = tempfile::tempdir().unwrap();
-    let fvec = dir.path().join("base.fvec");
+    let fvec = dir.path().join("base.fvecs");
     write_fvec(&fvec, 50, 2);
 
     let out = dir.path().join("dataset");
@@ -241,8 +241,8 @@ fn import_no_dedup_flag() {
 #[test]
 fn import_with_metadata_generates_predicate_chain() {
     let dir = tempfile::tempdir().unwrap();
-    let base = dir.path().join("base.fvec");
-    let query = dir.path().join("query.fvec");
+    let base = dir.path().join("base.fvecs");
+    let query = dir.path().join("query.fvecs");
     let meta = dir.path().join("meta");
     write_fvec(&base, 100, 3);
     write_fvec(&query, 10, 3);
@@ -267,8 +267,8 @@ fn import_with_metadata_generates_predicate_chain() {
 #[test]
 fn import_no_filtered_skips_filtered_knn() {
     let dir = tempfile::tempdir().unwrap();
-    let base = dir.path().join("base.fvec");
-    let query = dir.path().join("query.fvec");
+    let base = dir.path().join("base.fvecs");
+    let query = dir.path().join("query.fvecs");
     let meta = dir.path().join("meta");
     write_fvec(&base, 100, 3);
     write_fvec(&query, 10, 3);
@@ -294,9 +294,9 @@ fn import_no_filtered_skips_filtered_knn() {
 #[test]
 fn import_precomputed_gt_skips_knn() {
     let dir = tempfile::tempdir().unwrap();
-    let base = dir.path().join("base.fvec");
-    let query = dir.path().join("query.fvec");
-    let gt = dir.path().join("gt.ivec");
+    let base = dir.path().join("base.fvecs");
+    let query = dir.path().join("query.fvecs");
+    let gt = dir.path().join("gt.ivecs");
     write_fvec(&base, 100, 3);
     write_fvec(&query, 10, 3);
     std::fs::write(&gt, b"fake ground truth").unwrap();
@@ -481,9 +481,9 @@ fn check_publish_single_publish_url_always_consistent() {
 #[test]
 fn check_merkle_all_covered() {
     let dir = tempfile::tempdir().unwrap();
-    let big_file = dir.path().join("big.fvec");
+    let big_file = dir.path().join("big.fvecs");
     write_fvec(&big_file, 1000, 100); // ~400KB — below 100MB threshold
-    let mref = dir.path().join("big.fvec.mref");
+    let mref = dir.path().join("big.fvecs.mref");
     std::fs::write(&mref, b"fake mref").unwrap();
 
     let files = vec![big_file];
@@ -495,7 +495,7 @@ fn check_merkle_all_covered() {
 #[test]
 fn check_merkle_missing_mref() {
     let dir = tempfile::tempdir().unwrap();
-    let big_file = dir.path().join("big.fvec");
+    let big_file = dir.path().join("big.fvecs");
     write_fvec(&big_file, 1000, 100);
 
     let files = vec![big_file];
@@ -506,7 +506,7 @@ fn check_merkle_missing_mref() {
 #[test]
 fn check_merkle_below_threshold() {
     let dir = tempfile::tempdir().unwrap();
-    let small = dir.path().join("small.fvec");
+    let small = dir.path().join("small.fvecs");
     write_fvec(&small, 5, 3); // tiny file
 
     let files = vec![small];
@@ -518,7 +518,7 @@ fn check_merkle_below_threshold() {
 #[test]
 fn check_integrity_valid_fvec() {
     let dir = tempfile::tempdir().unwrap();
-    let fvec = dir.path().join("valid.fvec");
+    let fvec = dir.path().join("valid.fvecs");
     write_fvec(&fvec, 10, 4);
 
     let files = vec![fvec];
@@ -529,7 +529,7 @@ fn check_integrity_valid_fvec() {
 #[test]
 fn check_integrity_truncated_fvec() {
     let dir = tempfile::tempdir().unwrap();
-    let fvec = dir.path().join("truncated.fvec");
+    let fvec = dir.path().join("truncated.fvecs");
     write_fvec(&fvec, 10, 4);
 
     // Truncate the file mid-record
@@ -546,7 +546,7 @@ fn check_integrity_truncated_fvec() {
 #[test]
 fn check_integrity_empty_fvec() {
     let dir = tempfile::tempdir().unwrap();
-    let fvec = dir.path().join("empty.fvec");
+    let fvec = dir.path().join("empty.fvecs");
     std::fs::write(&fvec, b"").unwrap();
 
     let files = vec![fvec];
@@ -558,7 +558,7 @@ fn check_integrity_empty_fvec() {
 #[test]
 fn check_integrity_bad_dimension() {
     let dir = tempfile::tempdir().unwrap();
-    let fvec = dir.path().join("bad_dim.fvec");
+    let fvec = dir.path().join("bad_dim.fvecs");
     // Write a negative dimension
     use std::io::Write;
     let mut f = std::fs::File::create(&fvec).unwrap();
@@ -573,7 +573,7 @@ fn check_integrity_bad_dimension() {
 #[test]
 fn check_integrity_mvec_valid() {
     let dir = tempfile::tempdir().unwrap();
-    let mvec = dir.path().join("valid.mvec");
+    let mvec = dir.path().join("valid.mvecs");
     write_mvec(&mvec, 10, 4);
 
     let files = vec![mvec];
@@ -629,7 +629,7 @@ fn import_nonexistent_source() {
     let dir = tempfile::tempdir().unwrap();
     let out = dir.path().join("dataset");
     let mut args = default_args("nonexistent", &out);
-    args.base_vectors = Some(PathBuf::from("/nonexistent/path/vectors.fvec"));
+    args.base_vectors = Some(PathBuf::from("/nonexistent/path/vectors.fvecs"));
 
     // Should still produce a yaml (the path is a reference, not validated at import time)
     veks::prepare::import::run(args);
@@ -669,8 +669,8 @@ fn import_both_self_search_and_separate_query() {
     // Strategy 1: Non-HDF5 separate base+query are combined into a single
     // source and processed as self-search with shuffle.
     let dir = tempfile::tempdir().unwrap();
-    let base = dir.path().join("base.fvec");
-    let query = dir.path().join("query.fvec");
+    let base = dir.path().join("base.fvecs");
+    let query = dir.path().join("query.fvecs");
     write_fvec(&base, 100, 3);
     write_fvec(&query, 10, 3);
 
@@ -711,24 +711,24 @@ fn publish_enumerate_skips_hidden_files() {
     // Hidden file should be excluded
     std::fs::write(dir.path().join(".publish_url"), "s3://b/").unwrap();
     std::fs::write(dir.path().join(".gitignore"), "*.tmp").unwrap();
-    std::fs::write(dir.path().join("data.fvec"), b"visible").unwrap();
+    std::fs::write(dir.path().join("data.fvecs"), b"visible").unwrap();
     std::fs::write(dir.path().join("dataset.yaml"), "name: t\nprofiles: {}\n").unwrap();
     std::fs::write(dir.path().join(".publish"), "").unwrap();
     // Hidden directory should be excluded entirely
     let hidden = dir.path().join(".cache");
     std::fs::create_dir(&hidden).unwrap();
-    std::fs::write(hidden.join("big.fvec"), b"cached").unwrap();
+    std::fs::write(hidden.join("big.fvecs"), b"cached").unwrap();
 
     let files = veks::publish::enumerate_publishable_files(dir.path());
     let names: Vec<String> = files.iter()
         .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
         .collect();
 
-    assert!(names.contains(&"data.fvec".to_string()), "visible files should be included");
+    assert!(names.contains(&"data.fvecs".to_string()), "visible files should be included");
     assert!(names.contains(&"dataset.yaml".to_string()), "dataset.yaml should be included");
     assert!(!names.contains(&".publish_url".to_string()), "hidden files should be excluded");
     assert!(!names.contains(&".gitignore".to_string()), "hidden files should be excluded");
-    assert!(!names.contains(&"big.fvec".to_string()), "files in hidden dirs should be excluded");
+    assert!(!names.contains(&"big.fvecs".to_string()), "files in hidden dirs should be excluded");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -752,7 +752,7 @@ fn project_artifacts_import_cache_output() {
     let cmd = make_cmd("transform convert");
     let mut opts = Options::new();
     opts.set("source", "/data/embeddings");
-    opts.set("output", "${cache}/all_vectors.mvec");
+    opts.set("output", "${cache}/all_vectors.mvecs");
     opts.set("facet", "base_vectors");
     opts.set("format", "npy");
 
@@ -761,7 +761,7 @@ fn project_artifacts_import_cache_output() {
     assert_eq!(manifest.command, "transform convert");
     assert_eq!(manifest.inputs, vec!["/data/embeddings"]);
     assert!(manifest.outputs.is_empty(), "cache path should be intermediate, not output");
-    assert_eq!(manifest.intermediates, vec!["${cache}/all_vectors.mvec"]);
+    assert_eq!(manifest.intermediates, vec!["${cache}/all_vectors.mvecs"]);
 }
 
 #[test]
@@ -771,12 +771,12 @@ fn project_artifacts_import_non_cache_output() {
     let cmd = make_cmd("transform convert");
     let mut opts = Options::new();
     opts.set("source", "/data/embeddings");
-    opts.set("output", "profiles/default/base_vectors.mvec");
+    opts.set("output", "profiles/default/base_vectors.mvecs");
     opts.set("facet", "base_vectors");
 
     let manifest = cmd.project_artifacts("import-base", &opts);
     assert_eq!(manifest.inputs, vec!["/data/embeddings"]);
-    assert_eq!(manifest.outputs, vec!["profiles/default/base_vectors.mvec"]);
+    assert_eq!(manifest.outputs, vec!["profiles/default/base_vectors.mvecs"]);
     assert!(manifest.intermediates.is_empty());
 }
 
@@ -787,7 +787,7 @@ fn project_artifacts_import_non_path_options_excluded() {
     let cmd = make_cmd("transform convert");
     let mut opts = Options::new();
     opts.set("source", "/data/src");
-    opts.set("output", "out.mvec");
+    opts.set("output", "out.mvecs");
     opts.set("facet", "base_vectors");
     opts.set("format", "npy");
     opts.set("threads", "8");
@@ -796,7 +796,7 @@ fn project_artifacts_import_non_path_options_excluded() {
     let manifest = cmd.project_artifacts("import-with-extras", &opts);
     // Only source should appear as input; format, threads, count are not file paths
     assert_eq!(manifest.inputs, vec!["/data/src"]);
-    assert_eq!(manifest.outputs, vec!["out.mvec"]);
+    assert_eq!(manifest.outputs, vec!["out.mvecs"]);
 }
 
 #[test]
@@ -822,24 +822,25 @@ fn project_artifacts_compute_knn_basic() {
 
     let cmd = make_cmd("compute knn");
     let mut opts = Options::new();
-    opts.set("base", "profiles/default/base_vectors.mvec");
-    opts.set("query", "query_vectors.mvec");
-    opts.set("indices", "profiles/default/neighbor_indices.ivec");
-    opts.set("distances", "profiles/default/neighbor_distances.fvec");
+    opts.set("base", "profiles/default/base_vectors.mvecs");
+    opts.set("query", "query_vectors.mvecs");
+    opts.set("indices", "profiles/default/neighbor_indices.ivecs");
+    opts.set("distances", "profiles/default/neighbor_distances.fvecs");
     opts.set("neighbors", "100");
     opts.set("metric", "L2");
     opts.set("threads", "4");
 
     let manifest = cmd.project_artifacts("compute-knn", &opts);
     assert_eq!(manifest.step_id, "compute-knn");
-    assert_eq!(manifest.command, "compute knn");
+    // The "compute knn" alias resolves to the stdarch implementation.
+    assert_eq!(manifest.command, "compute knn-stdarch");
     assert_eq!(manifest.inputs, vec![
-        "profiles/default/base_vectors.mvec",
-        "query_vectors.mvec",
+        "profiles/default/base_vectors.mvecs",
+        "query_vectors.mvecs",
     ]);
     assert_eq!(manifest.outputs, vec![
-        "profiles/default/neighbor_indices.ivec",
-        "profiles/default/neighbor_distances.fvec",
+        "profiles/default/neighbor_indices.ivecs",
+        "profiles/default/neighbor_distances.fvecs",
     ]);
     assert!(manifest.intermediates.is_empty());
 }
@@ -850,15 +851,15 @@ fn project_artifacts_compute_knn_window_stripped() {
 
     let cmd = make_cmd("compute knn");
     let mut opts = Options::new();
-    opts.set("base", "base.mvec[0..${base_count})");
-    opts.set("query", "query.mvec[0..1000)");
-    opts.set("indices", "gnd.ivec");
+    opts.set("base", "base.mvecs[0..${base_count})");
+    opts.set("query", "query.mvecs[0..1000)");
+    opts.set("indices", "gnd.ivecs");
     opts.set("neighbors", "10");
 
     let manifest = cmd.project_artifacts("knn-windowed", &opts);
     // Window notation should be stripped from inputs
-    assert_eq!(manifest.inputs, vec!["base.mvec", "query.mvec"]);
-    assert_eq!(manifest.outputs, vec!["gnd.ivec"]);
+    assert_eq!(manifest.inputs, vec!["base.mvecs", "query.mvecs"]);
+    assert_eq!(manifest.outputs, vec!["gnd.ivecs"]);
 }
 
 #[test]
@@ -867,17 +868,17 @@ fn project_artifacts_compute_knn_cache_outputs() {
 
     let cmd = make_cmd("compute knn");
     let mut opts = Options::new();
-    opts.set("base", "base.mvec");
-    opts.set("query", "query.mvec");
-    opts.set("indices", "${cache}/gnd.ivec");
-    opts.set("distances", ".cache/gnd_dist.fvec");
+    opts.set("base", "base.mvecs");
+    opts.set("query", "query.mvecs");
+    opts.set("indices", "${cache}/gnd.ivecs");
+    opts.set("distances", ".cache/gnd_dist.fvecs");
     opts.set("neighbors", "10");
 
     let manifest = cmd.project_artifacts("knn-cached", &opts);
     assert!(manifest.outputs.is_empty(), "cache outputs should be intermediates");
     assert_eq!(manifest.intermediates, vec![
-        "${cache}/gnd.ivec",
-        ".cache/gnd_dist.fvec",
+        "${cache}/gnd.ivecs",
+        ".cache/gnd_dist.fvecs",
     ]);
 }
 
@@ -887,14 +888,14 @@ fn project_artifacts_compute_knn_no_distances() {
 
     let cmd = make_cmd("compute knn");
     let mut opts = Options::new();
-    opts.set("base", "base.fvec");
-    opts.set("query", "query.fvec");
-    opts.set("indices", "out.ivec");
+    opts.set("base", "base.fvecs");
+    opts.set("query", "query.fvecs");
+    opts.set("indices", "out.ivecs");
     opts.set("neighbors", "10");
     // No distances option
 
     let manifest = cmd.project_artifacts("knn-no-dist", &opts);
-    assert_eq!(manifest.outputs, vec!["out.ivec"]);
+    assert_eq!(manifest.outputs, vec!["out.ivecs"]);
     assert!(manifest.intermediates.is_empty());
 }
 
@@ -906,11 +907,11 @@ fn project_artifacts_compute_filtered_knn() {
 
     let cmd = make_cmd("compute filtered-knn");
     let mut opts = Options::new();
-    opts.set("base", "base.mvec[0..${base_count})");
-    opts.set("query", "query.mvec");
+    opts.set("base", "base.mvecs[0..${base_count})");
+    opts.set("query", "query.mvecs");
     opts.set("metadata-indices", "predicate_keys.slab");
-    opts.set("indices", "profiles/default/filtered_indices.ivec");
-    opts.set("distances", "profiles/default/filtered_distances.fvec");
+    opts.set("indices", "profiles/default/filtered_indices.ivecs");
+    opts.set("distances", "profiles/default/filtered_distances.fvecs");
     opts.set("neighbors", "100");
     opts.set("metric", "COSINE");
     opts.set("threads", "16");
@@ -921,13 +922,13 @@ fn project_artifacts_compute_filtered_knn() {
     assert_eq!(manifest.command, "compute filtered-knn");
     // Window notation stripped from base
     assert_eq!(manifest.inputs, vec![
-        "base.mvec",
-        "query.mvec",
+        "base.mvecs",
+        "query.mvecs",
         "predicate_keys.slab",
     ]);
     assert_eq!(manifest.outputs, vec![
-        "profiles/default/filtered_indices.ivec",
-        "profiles/default/filtered_distances.fvec",
+        "profiles/default/filtered_indices.ivecs",
+        "profiles/default/filtered_distances.fvecs",
     ]);
     assert!(manifest.intermediates.is_empty());
 }
@@ -938,16 +939,16 @@ fn project_artifacts_compute_filtered_knn_cache_mixed() {
 
     let cmd = make_cmd("compute filtered-knn");
     let mut opts = Options::new();
-    opts.set("base", "base.mvec");
-    opts.set("query", "query.mvec");
+    opts.set("base", "base.mvecs");
+    opts.set("query", "query.mvecs");
     opts.set("metadata-indices", "keys.slab");
-    opts.set("indices", "${cache}/filtered.ivec");
-    opts.set("distances", "profiles/default/filtered_dist.fvec");
+    opts.set("indices", "${cache}/filtered.ivecs");
+    opts.set("distances", "profiles/default/filtered_dist.fvecs");
     opts.set("neighbors", "10");
 
     let manifest = cmd.project_artifacts("fknn-mixed", &opts);
-    assert_eq!(manifest.outputs, vec!["profiles/default/filtered_dist.fvec"]);
-    assert_eq!(manifest.intermediates, vec!["${cache}/filtered.ivec"]);
+    assert_eq!(manifest.outputs, vec!["profiles/default/filtered_dist.fvecs"]);
+    assert_eq!(manifest.intermediates, vec!["${cache}/filtered.ivecs"]);
 }
 
 // ── compute sort (formerly compute dedup) ───────────────────────────────────
@@ -958,8 +959,8 @@ fn project_artifacts_compute_dedup_non_cache() {
 
     let cmd = make_cmd("compute sort");
     let mut opts = Options::new();
-    opts.set("source", "${cache}/all_vectors.mvec");
-    opts.set("output", "dedup_index.ivec");
+    opts.set("source", "${cache}/all_vectors.mvecs");
+    opts.set("output", "dedup_index.ivecs");
     opts.set("report", "dedup_report.json");
     opts.set("elide", "true");
     opts.set("batch-size", "500000");
@@ -967,8 +968,8 @@ fn project_artifacts_compute_dedup_non_cache() {
     let manifest = cmd.project_artifacts("dedup-step", &opts);
     assert_eq!(manifest.step_id, "dedup-step");
     assert_eq!(manifest.command, "compute sort");
-    assert_eq!(manifest.inputs, vec!["${cache}/all_vectors.mvec"]);
-    assert_eq!(manifest.outputs, vec!["dedup_index.ivec", "dedup_report.json"]);
+    assert_eq!(manifest.inputs, vec!["${cache}/all_vectors.mvecs"]);
+    assert_eq!(manifest.outputs, vec!["dedup_index.ivecs", "dedup_report.json"]);
     assert!(manifest.intermediates.contains(&"${cache}/dedup_runs/".to_string()),
         "should declare run directory as intermediate");
 }
@@ -979,14 +980,14 @@ fn project_artifacts_compute_dedup_cache_outputs() {
 
     let cmd = make_cmd("compute sort");
     let mut opts = Options::new();
-    opts.set("source", "data.mvec");
-    opts.set("output", "${cache}/dedup.ivec");
+    opts.set("source", "data.mvecs");
+    opts.set("output", "${cache}/dedup.ivecs");
     opts.set("report", ".cache/dedup.json");
 
     let manifest = cmd.project_artifacts("dedup-cached", &opts);
-    assert_eq!(manifest.inputs, vec!["data.mvec"]);
+    assert_eq!(manifest.inputs, vec!["data.mvecs"]);
     assert!(manifest.outputs.is_empty());
-    assert!(manifest.intermediates.contains(&"${cache}/dedup.ivec".to_string()));
+    assert!(manifest.intermediates.contains(&"${cache}/dedup.ivecs".to_string()));
     assert!(manifest.intermediates.contains(&".cache/dedup.json".to_string()));
     assert!(manifest.intermediates.contains(&"${cache}/dedup_runs/".to_string()));
 }
@@ -997,13 +998,13 @@ fn project_artifacts_compute_dedup_no_report() {
 
     let cmd = make_cmd("compute sort");
     let mut opts = Options::new();
-    opts.set("source", "vectors.mvec");
-    opts.set("output", "dedup.ivec");
+    opts.set("source", "vectors.mvecs");
+    opts.set("output", "dedup.ivecs");
     // No report option
 
     let manifest = cmd.project_artifacts("dedup-no-report", &opts);
-    assert_eq!(manifest.inputs, vec!["vectors.mvec"]);
-    assert_eq!(manifest.outputs, vec!["dedup.ivec"]);
+    assert_eq!(manifest.inputs, vec!["vectors.mvecs"]);
+    assert_eq!(manifest.outputs, vec!["dedup.ivecs"]);
 }
 
 // ── compute sort (backed by compute_dedup — sort + dedup detection) ─────────
@@ -1014,15 +1015,15 @@ fn project_artifacts_compute_sort() {
 
     let cmd = make_cmd("compute sort");
     let mut opts = Options::new();
-    opts.set("source", "base.fvec");
-    opts.set("output", "sorted.fvec");
+    opts.set("source", "base.fvecs");
+    opts.set("output", "sorted.fvecs");
     opts.set("report", "dedup_report.json");
 
     let manifest = cmd.project_artifacts("sort-step", &opts);
     assert_eq!(manifest.step_id, "sort-step");
     assert_eq!(manifest.command, "compute sort");
-    assert_eq!(manifest.inputs, vec!["base.fvec"]);
-    assert_eq!(manifest.outputs, vec!["sorted.fvec", "dedup_report.json"]);
+    assert_eq!(manifest.inputs, vec!["base.fvecs"]);
+    assert_eq!(manifest.outputs, vec!["sorted.fvecs", "dedup_report.json"]);
     // dedup_runs/ directory is always an intermediate
     assert!(manifest.intermediates.contains(&"${cache}/dedup_runs/".to_string()));
 }
@@ -1033,13 +1034,13 @@ fn project_artifacts_compute_sort_cache_output() {
 
     let cmd = make_cmd("compute sort");
     let mut opts = Options::new();
-    opts.set("source", "base.fvec");
-    opts.set("output", "${cache}/sorted.fvec");
+    opts.set("source", "base.fvecs");
+    opts.set("output", "${cache}/sorted.fvecs");
 
     let manifest = cmd.project_artifacts("sort-cached", &opts);
-    assert_eq!(manifest.inputs, vec!["base.fvec"]);
+    assert_eq!(manifest.inputs, vec!["base.fvecs"]);
     assert!(manifest.outputs.is_empty());
-    assert!(manifest.intermediates.contains(&"${cache}/sorted.fvec".to_string()));
+    assert!(manifest.intermediates.contains(&"${cache}/sorted.fvecs".to_string()));
     assert!(manifest.intermediates.contains(&"${cache}/dedup_runs/".to_string()));
 }
 
@@ -1051,7 +1052,7 @@ fn project_artifacts_gen_shuffle_no_inputs() {
 
     let cmd = make_cmd("generate shuffle");
     let mut opts = Options::new();
-    opts.set("output", "${cache}/shuffle.ivec");
+    opts.set("output", "${cache}/shuffle.ivecs");
     opts.set("interval", "1000000");
     opts.set("seed", "42");
 
@@ -1061,7 +1062,7 @@ fn project_artifacts_gen_shuffle_no_inputs() {
     // No file inputs — interval and seed are numeric options
     assert!(manifest.inputs.is_empty());
     assert!(manifest.outputs.is_empty(), "cache path should be intermediate");
-    assert_eq!(manifest.intermediates, vec!["${cache}/shuffle.ivec"]);
+    assert_eq!(manifest.intermediates, vec!["${cache}/shuffle.ivecs"]);
 }
 
 #[test]
@@ -1070,12 +1071,12 @@ fn project_artifacts_gen_shuffle_non_cache_output() {
 
     let cmd = make_cmd("generate shuffle");
     let mut opts = Options::new();
-    opts.set("output", "shuffle.ivec");
+    opts.set("output", "shuffle.ivecs");
     opts.set("interval", "500");
 
     let manifest = cmd.project_artifacts("shuffle-final", &opts);
     assert!(manifest.inputs.is_empty());
-    assert_eq!(manifest.outputs, vec!["shuffle.ivec"]);
+    assert_eq!(manifest.outputs, vec!["shuffle.ivecs"]);
     assert!(manifest.intermediates.is_empty());
 }
 
@@ -1106,7 +1107,7 @@ fn project_artifacts_slab_extract() {
     let cmd = make_cmd("transform extract");
     let mut opts = Options::new();
     opts.set("source", "metadata_all.slab");
-    opts.set("ivec-file", "${cache}/shuffle.ivec");
+    opts.set("ivec-file", "${cache}/shuffle.ivecs");
     opts.set("output", "profiles/default/base_metadata.slab");
 
     let manifest = cmd.project_artifacts("extract-metadata", &opts);
@@ -1114,7 +1115,7 @@ fn project_artifacts_slab_extract() {
     assert_eq!(manifest.command, "transform extract");
     assert_eq!(manifest.inputs, vec![
         "metadata_all.slab",
-        "${cache}/shuffle.ivec",
+        "${cache}/shuffle.ivecs",
     ]);
     assert_eq!(manifest.outputs, vec!["profiles/default/base_metadata.slab"]);
 }
@@ -1126,7 +1127,7 @@ fn project_artifacts_slab_extract_cache_output() {
     let cmd = make_cmd("transform extract");
     let mut opts = Options::new();
     opts.set("source", "raw.slab");
-    opts.set("ivec-file", "idx.ivec");
+    opts.set("ivec-file", "idx.ivecs");
     opts.set("output", ".cache/extracted.slab");
 
     let manifest = cmd.project_artifacts("slab-cached", &opts);
@@ -1143,7 +1144,7 @@ fn project_artifacts_set_variable_empty() {
     let cmd = make_cmd("state set");
     let mut opts = Options::new();
     opts.set("name", "vector_count");
-    opts.set("value", "count:all_vectors.mvec");
+    opts.set("value", "count:all_vectors.mvecs");
 
     let manifest = cmd.project_artifacts("set-count", &opts);
     assert_eq!(manifest.step_id, "set-count");
@@ -1293,7 +1294,7 @@ fn project_artifacts_merkle_create_single_file() {
     use veks::pipeline::command::Options;
 
     // Since the source does not exist yet, merkle uses the path as-is
-    let nonexistent = "/tmp/nonexistent_test_path_for_merkle.fvec";
+    let nonexistent = "/tmp/nonexistent_test_path_for_merkle.fvecs";
 
     let cmd = make_cmd("merkle create");
     let mut opts = Options::new();
@@ -1318,8 +1319,8 @@ fn project_artifacts_merkle_create_directory() {
     std::fs::create_dir_all(&profiles).unwrap();
 
     // Create large-enough files (merkle min-size = 0 for test)
-    write_fvec(&profiles.join("base.fvec"), 100, 4);
-    write_fvec(&profiles.join("query.fvec"), 10, 4);
+    write_fvec(&profiles.join("base.fvecs"), 100, 4);
+    write_fvec(&profiles.join("query.fvecs"), 10, 4);
     // Create a small non-vector file that should also match at min-size=0
     std::fs::write(profiles.join("meta.json"), "{}").unwrap();
 
@@ -1349,11 +1350,11 @@ fn project_artifacts_merkle_create_min_size_filter() {
 
     let dir = tempfile::tempdir().unwrap();
     // Write a very small file that should be filtered by min-size
-    write_fvec(&dir.path().join("tiny.fvec"), 1, 2);
+    write_fvec(&dir.path().join("tiny.fvecs"), 1, 2);
 
     let cmd = make_cmd("merkle create");
     let mut opts = Options::new();
-    opts.set("source", dir.path().join("tiny.fvec").to_string_lossy().as_ref());
+    opts.set("source", dir.path().join("tiny.fvecs").to_string_lossy().as_ref());
     // Default min-size is 100M, tiny.fvec is ~12 bytes
     opts.set("min-size", "100M");
 
@@ -1375,8 +1376,8 @@ fn project_artifacts_count_prefix_not_an_input() {
     // If someone passes a count: prefixed value, it must not appear as input.
     let cmd = make_cmd("transform convert");
     let mut opts = Options::new();
-    opts.set("source", "count:/data/vectors.mvec");
-    opts.set("output", "out.mvec");
+    opts.set("source", "count:/data/vectors.mvecs");
+    opts.set("output", "out.mvecs");
     opts.set("facet", "base_vectors");
 
     let manifest = cmd.project_artifacts("count-prefix-test", &opts);
@@ -1391,13 +1392,13 @@ fn project_artifacts_window_notation_complex() {
 
     let cmd = make_cmd("compute knn");
     let mut opts = Options::new();
-    opts.set("base", "base.mvec[0..${base_count})");
-    opts.set("query", "query.mvec[${query_start}..${query_end})");
-    opts.set("indices", "out.ivec");
+    opts.set("base", "base.mvecs[0..${base_count})");
+    opts.set("query", "query.mvecs[${query_start}..${query_end})");
+    opts.set("indices", "out.ivecs");
     opts.set("neighbors", "10");
 
     let manifest = cmd.project_artifacts("window-complex", &opts);
-    assert_eq!(manifest.inputs, vec!["base.mvec", "query.mvec"]);
+    assert_eq!(manifest.inputs, vec!["base.mvecs", "query.mvecs"]);
 }
 
 #[test]
@@ -1407,12 +1408,12 @@ fn project_artifacts_dot_cache_path_classified() {
     let cmd = make_cmd("transform convert");
     let mut opts = Options::new();
     opts.set("source", "/data/src");
-    opts.set("output", "workspace/.cache/imported.mvec");
+    opts.set("output", "workspace/.cache/imported.mvecs");
 
     let manifest = cmd.project_artifacts("dot-cache-test", &opts);
     // Contains /.cache/ — should be intermediate
     assert!(manifest.outputs.is_empty());
-    assert_eq!(manifest.intermediates, vec!["workspace/.cache/imported.mvec"]);
+    assert_eq!(manifest.intermediates, vec!["workspace/.cache/imported.mvecs"]);
 }
 
 #[test]
@@ -1421,15 +1422,15 @@ fn project_artifacts_boolean_option_not_input() {
 
     let cmd = make_cmd("compute sort");
     let mut opts = Options::new();
-    opts.set("source", "vectors.mvec");
-    opts.set("output", "dedup.ivec");
+    opts.set("source", "vectors.mvecs");
+    opts.set("output", "dedup.ivecs");
     opts.set("elide", "true");
     opts.set("batch-size", "1000000");
 
     let manifest = cmd.project_artifacts("bool-test", &opts);
     // elide and batch-size are not file paths, only source is an input
-    assert_eq!(manifest.inputs, vec!["vectors.mvec"]);
-    assert_eq!(manifest.outputs, vec!["dedup.ivec"]);
+    assert_eq!(manifest.inputs, vec!["vectors.mvecs"]);
+    assert_eq!(manifest.outputs, vec!["dedup.ivecs"]);
 }
 
 #[test]
@@ -1491,7 +1492,7 @@ fn import_prepare_vectors_emitted_by_default() {
     // Zero detection and normalization are now absorbed into prepare-vectors
     // and the extract steps. No separate find-zeros or filter-ordinals steps.
     let dir = tempfile::tempdir().unwrap();
-    let fvec = dir.path().join("base.fvec");
+    let fvec = dir.path().join("base.fvecs");
     write_fvec(&fvec, 50, 4);
 
     let mut args = default_args("zc-default", &dir.path().join("out"));
@@ -1520,7 +1521,7 @@ fn import_no_zero_check_still_has_prepare_vectors() {
     // --no-zero-check does not suppress prepare-vectors; dedup is still active.
     // Zero detection and filtering are absorbed into prepare-vectors/extraction.
     let dir = tempfile::tempdir().unwrap();
-    let fvec = dir.path().join("base.fvec");
+    let fvec = dir.path().join("base.fvecs");
     write_fvec(&fvec, 50, 4);
 
     let mut args = default_args("zc-off", &dir.path().join("out"));
@@ -1545,7 +1546,7 @@ fn import_no_zero_check_still_has_prepare_vectors() {
 fn import_no_zero_check_and_no_dedup_suppresses_both() {
     // Both --no-find-zeros and --no-dedup → neither find-zeros nor filter-ordinals
     let dir = tempfile::tempdir().unwrap();
-    let fvec = dir.path().join("base.fvec");
+    let fvec = dir.path().join("base.fvecs");
     write_fvec(&fvec, 50, 4);
 
     let mut args = default_args("both-off", &dir.path().join("out"));
@@ -1568,7 +1569,7 @@ fn import_no_dedup_skips_prepare_vectors() {
     // --no-dedup suppresses prepare-vectors entirely.
     // Zero detection is now handled during extraction, not as a separate step.
     let dir = tempfile::tempdir().unwrap();
-    let fvec = dir.path().join("base.fvec");
+    let fvec = dir.path().join("base.fvecs");
     write_fvec(&fvec, 50, 4);
 
     let mut args = default_args("nodedup-zc", &dir.path().join("out"));
@@ -1595,7 +1596,7 @@ fn import_no_dedup_skips_prepare_vectors() {
 #[test]
 fn import_normalize_adds_normalize_to_extract_steps() {
     let dir = tempfile::tempdir().unwrap();
-    let fvec = dir.path().join("base.fvec");
+    let fvec = dir.path().join("base.fvecs");
     write_fvec(&fvec, 200, 4);
 
     let mut args = default_args("norm-test", &dir.path().join("out"));
@@ -1628,8 +1629,8 @@ fn import_normalize_separate_query_combined_bq() {
     // source (combined_bq=true), processed as self-search with shuffle.
     // Extract steps ARE present and normalization is always applied.
     let dir = tempfile::tempdir().unwrap();
-    let base = dir.path().join("base.fvec");
-    let query = dir.path().join("query.fvec");
+    let base = dir.path().join("base.fvecs");
+    let query = dir.path().join("query.fvecs");
     write_fvec(&base, 100, 4);
     write_fvec(&query, 10, 4);
 
@@ -1658,7 +1659,7 @@ fn import_full_pipeline_all_features() {
     // Full pipeline: base fvec (self-search), metadata (parquet dir),
     // normalize, dedup, find-zeros, filtered KNN.
     let dir = tempfile::tempdir().unwrap();
-    let fvec = dir.path().join("base.fvec");
+    let fvec = dir.path().join("base.fvecs");
     write_fvec(&fvec, 200, 4);
     let meta = dir.path().join("meta");
     write_parquet_dir(&meta);
@@ -1700,6 +1701,7 @@ fn import_full_pipeline_all_features() {
         "generate-dataset-json",
         "generate-variables-json",
         "generate-dataset-log-jsonl",
+        "generate-docs",
         "generate-merkle",
         "generate-catalog",
     ];
@@ -1717,7 +1719,7 @@ fn import_full_pipeline_everything_disabled() {
     // Minimal pipeline: base fvec, no_dedup, no_zero_check, no_filtered, normalize=false.
     // Self-search still activates (base_vectors present, no query_vectors).
     let dir = tempfile::tempdir().unwrap();
-    let fvec = dir.path().join("base.fvec");
+    let fvec = dir.path().join("base.fvecs");
     write_fvec(&fvec, 200, 4);
 
     let mut args = default_args("minimal-pipeline", &dir.path().join("out"));
@@ -1752,12 +1754,13 @@ fn import_full_pipeline_everything_disabled() {
 
     // New metadata steps + verification + json/merkle/catalog
     // count-vectors, count-source-base, set-is_shuffled, set-is_self_search,
-    // set-combined_bq, set-k, generate-shuffle, extract-queries, extract-base,
-    // count-base, compute-knn, verify-knn, generate-dataset-json,
-    // generate-variables-json, generate-dataset-log-jsonl,
-    // generate-merkle, generate-catalog = 17
-    assert_eq!(ids.len(), 19,
-        "minimal self-search pipeline should have 19 steps, got {}: {:?}", ids.len(), ids);
+    // set-combined_bq, set-k, scan-zeros, scan-duplicates,
+    // generate-shuffle, extract-queries, extract-base, count-base,
+    // compute-knn, verify-knn, generate-dataset-json,
+    // generate-variables-json, generate-dataset-log-jsonl, generate-docs,
+    // generate-merkle, generate-catalog = 20
+    assert_eq!(ids.len(), 20,
+        "minimal self-search pipeline should have 20 steps, got {}: {:?}", ids.len(), ids);
 }
 
 #[test]
@@ -1766,7 +1769,7 @@ fn import_shuffle_depends_on_prepare_vectors() {
     // This replaces the old test that checked filter-ordinals -> sort-and-dedup
     // dependency, since those steps are now absorbed into prepare-vectors.
     let dir = tempfile::tempdir().unwrap();
-    let fvec = dir.path().join("base.fvec");
+    let fvec = dir.path().join("base.fvecs");
     write_fvec(&fvec, 50, 4);
 
     let mut args = default_args("co-deps", &dir.path().join("out"));
@@ -1790,7 +1793,7 @@ fn import_shuffle_depends_on_prepare_vectors_not_count_base() {
     // generate-shuffle depends on prepare-vectors (not count-clean, which
     // no longer exists). count-base comes after extraction, not before shuffle.
     let dir = tempfile::tempdir().unwrap();
-    let fvec = dir.path().join("base.fvec");
+    let fvec = dir.path().join("base.fvecs");
     write_fvec(&fvec, 200, 4);
 
     let mut args = default_args("shuffle-deps", &dir.path().join("out"));

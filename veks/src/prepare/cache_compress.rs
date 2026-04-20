@@ -31,7 +31,7 @@ const ELIGIBLE_PATTERNS: &[&str] = &[
 const SKIP_NAMES: &[&str] = &[
     "all_vectors.mvec",
     "all_vectors.hvec", // legacy name before hvec→mvec rename
-    "shuffle.ivec",
+    "shuffle.ivecs",
     "dedup_ordinals.ivec",
     "clean_ordinals.ivec",
     "meta.json",
@@ -343,7 +343,7 @@ mod tests {
     #[test]
     fn skip_patterns() {
         assert!(!is_eligible("all_vectors.mvec"));
-        assert!(!is_eligible("shuffle.ivec"));
+        assert!(!is_eligible("shuffle.ivecs"));
         assert!(!is_eligible("dedup_ordinals.ivec"));
         assert!(!is_eligible("clean_ordinals.ivec"));
         assert!(!is_eligible("meta.json"));

@@ -949,6 +949,7 @@ fn run_recursive(args: crate::pipeline::RunArgs) {
             profile: args.profile.clone(),
             dry_run: args.dry_run,
             clean: args.clean,
+            clean_last: args.clean_last,
             reset: args.reset,
             overrides: args.overrides.clone(),
             threads: args.threads,

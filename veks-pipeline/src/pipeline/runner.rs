@@ -451,11 +451,19 @@ pub fn run_steps(
         // 7. Execute
         ctx.ui.clear();
 
-        // Update UI context header with dataset/profile/step info
+        // Update UI context header with dataset/profile/step info.
+        // Append the step's description (when set) so the running-step
+        // banner conveys what the step actually does, not just its id —
+        // e.g. "prepare-vectors — External merge-sort + duplicate
+        // detection" is meaningful, "prepare-vectors" alone isn't.
+        let step_label = match step.def.description.as_deref() {
+            Some(desc) if !desc.is_empty() => format!("{} — {}", step.id, desc),
+            _ => step.id.clone(),
+        };
         if ctx_label.is_empty() {
-            ctx.ui.set_context(format!("[{}/{}] {}{}", step_num, total, step.id, profile_tag));
+            ctx.ui.set_context(format!("[{}/{}] {}{}", step_num, total, step_label, profile_tag));
         } else {
-            ctx.ui.set_context(format!("{} [{}/{}] {}{}", ctx_label, step_num, total, step.id, profile_tag));
+            ctx.ui.set_context(format!("{} [{}/{}] {}{}", ctx_label, step_num, total, step_label, profile_tag));
         }
 
         // Send a structured step summary for the TUI step panel.
@@ -519,6 +527,13 @@ pub fn run_steps(
         let resource_stop2 = resource_stop.clone();
         let resource_ui = ctx.ui.clone();
         let poll_interval = ctx.status_interval;
+        // Capture the step id so the emergency-abort path can name
+        // which step blew the budget. Without this the user gets a
+        // FATAL with no context about where in the pipeline it died.
+        let resource_step_id = step.id.clone();
+        let resource_step_num = step_num;
+        let resource_step_total = total;
+        let resource_step_run = step.def.run.clone();
         let resource_handle = std::thread::Builder::new()
             .name("resource-status".into())
             .spawn(move || {
@@ -552,16 +567,38 @@ pub fn run_steps(
                         let reduction = overage.floor() as u32;
                         let grace_ticks = base_ticks.saturating_sub(reduction).max(1);
                         if emergency_ticks >= grace_ticks {
-                            resource_ui.log(&format!(
-                                "FATAL: resource emergency for {:.1}s, RSS {:.0}% over ceiling — aborting to prevent system lockup",
+                            // Build the message lines once. They go to:
+                            //   1. The TUI log pane (so they appear in
+                            //      runlog.jsonl alongside other ticks).
+                            //   2. stderr after the TUI tears down (so
+                            //      the user actually sees them at the
+                            //      shell prompt — without this stderr
+                            //      print, the alt-screen swallows them
+                            //      and the user gets a silent exit 1).
+                            // Include the step identity so the user
+                            // knows exactly where in the pipeline we
+                            // blew the budget — without it the FATAL
+                            // is context-free.
+                            let fatal = format!(
+                                "FATAL: step [{}/{}] {} ({}) — resource emergency for {:.1}s, RSS {:.0}% over ceiling — aborting to prevent system lockup",
+                                resource_step_num, resource_step_total,
+                                resource_step_id, resource_step_run,
                                 emergency_ticks as f64 * tick_secs,
                                 overage,
-                            ));
-                            resource_ui.log(&format!(
-                                "  last status: {}", resource_source.status_line()
-                            ));
-                            // Shut down the TUI to restore the terminal before exiting
+                            );
+                            let status = format!(
+                                "  last status: {}", resource_source.status_line(),
+                            );
+                            resource_ui.log(&fatal);
+                            resource_ui.log(&status);
+                            // Shut down the TUI to restore the terminal,
+                            // then print to stderr so the message is
+                            // visible after the alt-screen exits.
                             resource_ui.shutdown();
+                            eprintln!();
+                            eprintln!("{}", fatal);
+                            eprintln!("{}", status);
+                            eprintln!("Hint: lower the in-flight count, narrow the workload, or pass `--mem <smaller>` and re-run.");
                             std::process::exit(1);
                         }
                     } else {

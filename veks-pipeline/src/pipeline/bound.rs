@@ -39,7 +39,7 @@ pub fn check_artifact_default(output: &Path, _options: &Options) -> ArtifactStat
 
     // Try to detect format and do a format-specific structural check.
     // For xvec formats, a 0-byte file is valid (0 records) — e.g., an
-    // empty zero_ordinals.ivec when there are no zero vectors.
+    // empty zero_ordinals.ivecs when there are no zero vectors.
     if let Some(format) = VecFormat::detect(output) {
         if meta.len() == 0 && format.is_xvec() {
             // Empty xvec = 0 records, structurally valid

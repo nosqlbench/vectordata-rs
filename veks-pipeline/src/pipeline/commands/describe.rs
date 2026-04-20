@@ -124,39 +124,128 @@ element type does this dataset use?"
             }
         };
 
-        // Probe the source to get metadata
-        let meta = match reader::probe_source(&source_path, format) {
-            Ok(m) => m,
-            Err(e) => return error_result(format!("failed to probe source: {}", e), start),
+        let full_scan = options.get("full-scan").map(|s| s != "false").unwrap_or(false);
+        let sparse_scan = options.get("sparse-scan").map(|s| s != "false").unwrap_or(false);
+        if sparse_scan && full_scan {
+            return error_result(
+                "--sparse-scan and --full-scan are mutually exclusive".into(),
+                start,
+            );
+        }
+
+        // Three paths from here on:
+        //   - directory + sparse:  walk + stat all; probe FIRST file only;
+        //                          estimate cardinality from amortized
+        //                          per-record bytes (size_first / rows_first).
+        //   - directory + default: walk + stat all; probe whole dir for an
+        //                          exact record count from per-file metadata.
+        //   - file:                probe just the file.
+        let (meta, dir_agg, estimate) = if source_path.is_dir() {
+            let agg = match aggregate_directory(&source_path, format, ctx) {
+                Ok(a) => a,
+                Err(e) => return error_result(format!("scan directory: {}", e), start),
+            };
+            if sparse_scan {
+                let m = match reader::probe_source(&agg.first_file, format) {
+                    Ok(m) => m,
+                    Err(e) => return error_result(
+                        format!("probe first file: {}", e),
+                        start,
+                    ),
+                };
+                let est = m.record_count.and_then(|first_rows| {
+                    if first_rows == 0 || agg.first_file_bytes == 0 {
+                        return None;
+                    }
+                    let bpr = agg.first_file_bytes as f64 / first_rows as f64;
+                    if bpr <= 0.0 { return None; }
+                    Some(EstimatedRecords {
+                        rows: (agg.total_bytes as f64 / bpr).round() as u64,
+                        amortized_bpr: bpr,
+                        first_file_rows: first_rows,
+                        first_file_bytes: agg.first_file_bytes,
+                    })
+                });
+                (m, Some(agg), est)
+            } else {
+                let m = match reader::probe_source(&source_path, format) {
+                    Ok(m) => m,
+                    Err(e) => return error_result(
+                        format!("failed to probe source: {}", e),
+                        start,
+                    ),
+                };
+                (m, Some(agg), None)
+            }
+        } else {
+            let m = match reader::probe_source(&source_path, format) {
+                Ok(m) => m,
+                Err(e) => return error_result(
+                    format!("failed to probe source: {}", e),
+                    start,
+                ),
+            };
+            (m, None, None)
         };
 
-        let file_size = std::fs::metadata(&source_path).map(|m| m.len()).ok();
-        let records_str = meta.record_count
-            .map_or("unknown".to_string(), |n| format_count(n));
+        let file_size = match &dir_agg {
+            Some(a) => Some(a.total_bytes),
+            None => std::fs::metadata(&source_path).map(|m| m.len()).ok(),
+        };
+        let records_str = if let Some(est) = &estimate {
+            format!("~{} (estimated)", format_count(est.rows))
+        } else {
+            meta.record_count
+                .map_or("unknown".to_string(), |n| format_count(n))
+        };
         let record_bytes = 4 + meta.dimension as usize * meta.element_size;
 
+        let display_path = source_path
+            .canonicalize()
+            .unwrap_or_else(|_| source_path.clone());
+        let path_label = if dir_agg.is_some() { "Directory:  " } else { "File:       " };
+        let size_label = if dir_agg.is_some() { "Total size: " } else { "File size:  " };
         let mut message = format!(
-            "File:        {}\n\
-             Format:      {}\n\
-             Dimensions:  {}\n\
-             Element:     {} bytes ({})\n\
-             Records:     {}",
-            source_path.display(),
+            "{}{}\n\
+             Format:     {}\n\
+             Dimensions: {}\n\
+             Element:    {} bytes ({})\n\
+             Records:    {}",
+            path_label,
+            display_path.display(),
             format.name(),
             meta.dimension,
             meta.element_size,
             element_type_label(meta.element_size),
             records_str,
         );
+        if let Some(a) = &dir_agg {
+            message.push_str(&format!("\nFiles:      {}", a.file_count));
+        }
         if record_bytes > 0 {
-            message.push_str(&format!("\nRecord size: {} bytes", record_bytes));
+            message.push_str(&format!("\nRecord size:{} bytes", format!(" {}", record_bytes)));
         }
         if let Some(size) = file_size {
-            message.push_str(&format!("\nFile size:   {}", format_bytes(size)));
+            message.push_str(&format!("\n{}{}", size_label, format_bytes(size)));
+        }
+
+        if let Some(est) = &estimate {
+            message.push_str(&format!(
+                "\n\nEstimate basis (--sparse-scan):\n\
+                 \x20 First file:        {} rows in {}\n\
+                 \x20 Amortized bytes/record: {:.2}\n\
+                 \x20 Projected total:   ~{} rows ({} / {:.2})",
+                format_count(est.first_file_rows),
+                format_bytes(est.first_file_bytes),
+                est.amortized_bpr,
+                format_count(est.rows),
+                format_bytes(file_size.unwrap_or(0)),
+                est.amortized_bpr,
+            ));
         }
 
         // For xvec formats, report whether records are uniform or variable length
-        if format.is_xvec() {
+        if format.is_xvec() && dir_agg.is_none() {
             if let Some(size) = file_size {
                 let stride = record_bytes as u64;
                 if stride > 0 && size % stride == 0 {
@@ -169,9 +258,23 @@ element type does this dataset use?"
             }
         }
 
-        // --scan: walk all records and build a histogram of record lengths
-        let do_scan = options.get("scan").map(|s| s != "false").unwrap_or(false);
-        if do_scan && format.is_xvec() {
+        // Hint on directories: tell the caller about the alternative scan
+        // modes available (sparse for speed, full-scan for per-record verify).
+        if dir_agg.is_some() && !full_scan {
+            let hint = if sparse_scan {
+                "\n\nNote: estimate from first-file amortized rate. \
+                 Drop --sparse-scan for an exact count from per-file metadata, \
+                 or pass --full-scan to walk every record."
+            } else {
+                "\n\nNote: per-file metadata only. \
+                 Pass --sparse-scan for a faster first-file-only estimate, \
+                 or --full-scan to walk every record."
+            };
+            message.push_str(hint);
+        }
+
+        // --full-scan: walk all records and build a histogram of record lengths
+        if full_scan && format.is_xvec() && dir_agg.is_none() {
             if let Some(size) = file_size {
                 match scan_xvec_records(&source_path, format, size, ctx) {
                     Ok(scan) => {
@@ -226,11 +329,19 @@ element type does this dataset use?"
                 role: OptionRole::Config,
             },
             OptionDesc {
-                name: "scan".to_string(),
+                name: "full-scan".to_string(),
                 type_name: "bool".to_string(),
                 required: false,
                 default: Some("false".to_string()),
-                description: "Scan all records to build a dimension histogram (xvec only)".to_string(),
+                description: "Walk every record (xvec dim histogram); without it, only file/footer metadata is read".to_string(),
+                role: OptionRole::Config,
+            },
+            OptionDesc {
+                name: "sparse-scan".to_string(),
+                type_name: "bool".to_string(),
+                required: false,
+                default: Some("false".to_string()),
+                description: "Estimate cardinality from the first file only (stat all files, probe first); fastest mode for huge corpora".to_string(),
                 role: OptionRole::Config,
             },
         ]
@@ -263,6 +374,90 @@ fn element_type_label(elem_size: usize) -> &'static str {
         8 => "f64/i64",
         _ => "unknown",
     }
+}
+
+struct DirAggregate {
+    file_count: usize,
+    total_bytes: u64,
+    /// First file in sorted order — used as the representative sample for
+    /// `--sparse-scan` cardinality estimation.
+    first_file: PathBuf,
+    /// On-disk bytes of the first file (cached so callers don't re-stat it).
+    first_file_bytes: u64,
+}
+
+struct EstimatedRecords {
+    rows: u64,
+    /// Bytes of file storage attributable to one record on average — derived
+    /// from the first file (`first_file_bytes / first_file_rows`). This
+    /// captures format overhead (parquet footer, column metadata, dictionary
+    /// pages, etc.) along with the per-record payload, so multiplying by the
+    /// total directory size yields a usable estimate in O(1) read I/O.
+    amortized_bpr: f64,
+    first_file_rows: u64,
+    first_file_bytes: u64,
+}
+
+/// Walk a directory and aggregate the on-disk size of every file whose
+/// extension matches the chosen format. Stat-only — no file contents are
+/// read here, so this stays cheap on huge corpora. Progress is reported
+/// in file-count units via `ctx.ui`.
+fn aggregate_directory(
+    dir: &Path,
+    format: VecFormat,
+    ctx: &mut StreamContext,
+) -> Result<DirAggregate, String> {
+    let ext = format.preferred_extension().to_ascii_lowercase();
+    // Some formats accept multiple extensions (e.g. .fvec/.fvecs); match
+    // by VecFormat::from_extension on the candidate to stay consistent
+    // with detection logic elsewhere.
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)
+        .map_err(|e| format!("read dir {}: {}", dir.display(), e))?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.is_file() && match p.extension().and_then(|s| s.to_str()) {
+                Some(e) => {
+                    let lower = e.to_ascii_lowercase();
+                    lower == ext || VecFormat::from_extension(&lower) == Some(format)
+                }
+                None => false,
+            }
+        })
+        .collect();
+    // Stable sort so "first file" is deterministic across runs.
+    entries.sort();
+
+    if entries.is_empty() {
+        return Err(format!("no .{} files under {}", ext, dir.display()));
+    }
+
+    let first_file = entries[0].clone();
+    let pb = ctx.ui.bar_with_unit(entries.len() as u64, "scanning", "files");
+    let mut total_bytes: u64 = 0;
+    let mut first_file_bytes: u64 = 0;
+    for (i, p) in entries.iter().enumerate() {
+        match std::fs::metadata(p) {
+            Ok(m) => {
+                let len = m.len();
+                if i == 0 { first_file_bytes = len; }
+                total_bytes += len;
+            }
+            Err(e) => {
+                pb.finish();
+                return Err(format!("stat {}: {}", p.display(), e));
+            }
+        }
+        pb.inc(1);
+    }
+    pb.finish();
+
+    Ok(DirAggregate {
+        file_count: entries.len(),
+        total_bytes,
+        first_file,
+        first_file_bytes,
+    })
 }
 
 fn format_count(n: u64) -> String {

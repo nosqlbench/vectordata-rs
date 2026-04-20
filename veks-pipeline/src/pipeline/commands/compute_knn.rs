@@ -1324,9 +1324,9 @@ definition produce ground truth files for every dataset size (e.g., 1M, 10M,
 
 The command produces two files:
 
-- **neighbor_indices.ivec** — for each query, the ordinal indices of its K
+- **neighbor_indices.ivecs** — for each query, the ordinal indices of its K
   nearest neighbors in the base set.
-- **neighbor_distances.fvec** — the corresponding distances, in the same
+- **neighbor_distances.fvecs** — the corresponding distances, in the same
   order.
 
 These files are consumed downstream by recall-evaluation commands that
@@ -2166,7 +2166,7 @@ where
         // Scan profiles/ for completed KNN outputs from smaller profiles.
         // Each sized profile directory name is a count suffix (e.g., "4mi",
         // "10m") that encodes the profile's base_count. If the directory
-        // contains neighbor_indices.ivec with the right size, it covers
+        // contains neighbor_indices.ivecs with the right size, it covers
         // [0, profile_base_count) and can be reused as a cached segment.
         let profiles_dir = ctx.workspace.join("profiles");
         if profiles_dir.is_dir() {
@@ -2185,8 +2185,8 @@ where
                         Err(_) => continue,
                     };
                     if pbc == 0 || pbc >= base_end { continue; }
-                    let idx_path = entry.path().join("neighbor_indices.ivec");
-                    let dist_path = entry.path().join("neighbor_distances.fvec");
+                    let idx_path = entry.path().join("neighbor_indices.ivecs");
+                    let dist_path = entry.path().join("neighbor_distances.fvecs");
                     if validate_cache_file(&idx_path, query_count, k, 4)
                         && validate_cache_file(&dist_path, query_count, k, 4)
                     {
@@ -2848,7 +2848,6 @@ mod tests {
             profile: String::new(),
             profile_names: vec![],
             workspace: dir.to_path_buf(),
-            scratch: dir.join(".scratch"),
             cache: dir.join(".cache"),
             defaults: IndexMap::new(),
             dry_run: false,

@@ -280,6 +280,15 @@ impl UiHandle {
         self.sink.send(UiEvent::ProgressFinish { id });
     }
 
+    /// Re-anchor the rate calculation on a progress indicator to "now".
+    /// Subsequent rate displays (and ETA derived from them) are computed
+    /// from the anchored position/time, not from the bar's creation
+    /// time. Use this after a fast cache-skip phase to exclude its
+    /// trivial elapsed time from the displayed throughput.
+    pub fn anchor_rate_by_id(&self, id: ProgressId) {
+        self.sink.send(UiEvent::ProgressAnchorRate { id });
+    }
+
     /// Set the context label shown in the progress region header.
     pub fn set_context(&self, label: impl Into<String>) {
         self.sink.send(UiEvent::SetContext {

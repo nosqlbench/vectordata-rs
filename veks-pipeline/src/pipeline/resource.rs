@@ -1431,16 +1431,31 @@ impl ResourceGovernor {
     /// Create a new governor from a parsed budget.
     ///
     /// Merges system defaults for any resource types not explicitly specified:
-    /// - `mem`: 80% of system RAM
+    /// - `mem`: 65% of system RAM (see note below)
     /// - `threads`: available CPU parallelism
     /// - `segmentsize`: 1,000,000 records
+    ///
+    /// The 65% mem default leaves ~35% of physical RAM as headroom for:
+    ///   1. **mmap pages from input files counted toward RSS.** Large
+    ///      vector files mapped by readers add to the process's RSS as
+    ///      their pages become resident. A naive batch loop can drive
+    ///      RSS up by GiBs per batch even when our heap allocations
+    ///      are tiny — the kernel only evicts mmap pages under
+    ///      pressure or when we explicitly `madvise(DONTNEED)`.
+    ///   2. **Kernel page-cache used by other processes** on shared
+    ///      hosts (e.g. an EBS-backed dataset volume's cache).
+    ///   3. **Burst allocations during merge / sort phases** that
+    ///      briefly spike beyond the steady-state working set.
+    /// Users who need more can opt in with `--mem 80%` or similar;
+    /// the safer default here errs on the side of avoiding the
+    /// "RSS over ceiling — aborting to prevent system lockup" path.
     pub fn new(mut budget: ResourceBudget, workspace: Option<&Path>) -> Self {
         // Backfill defaults for unspecified resources
         if !budget.resources.contains_key("mem") {
             if let Some(ram) = get_system_ram() {
                 budget.resources.insert(
                     "mem".to_string(),
-                    ResourceValue::Fixed((ram as f64 * 0.8) as u64),
+                    ResourceValue::Fixed((ram as f64 * 0.65) as u64),
                 );
             }
         }
@@ -1628,6 +1643,13 @@ impl ResourceGovernor {
     /// Set the current step ID (called by the runner before each step).
     pub fn set_step_id(&self, step_id: &str) {
         *self.step_id.write().unwrap() = step_id.to_string();
+    }
+
+    /// Read the current step ID. Used by the resource monitor's
+    /// emergency abort path to attribute the fatal message to a
+    /// specific step.
+    pub fn current_step_id(&self) -> String {
+        self.step_id.read().unwrap().clone()
     }
 
     /// Get the current effective value for a resource.

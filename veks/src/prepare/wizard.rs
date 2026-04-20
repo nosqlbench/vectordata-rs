@@ -914,10 +914,12 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
             println!("    - Incremental workflow: verify correctness at 1M, then 10M,");
             println!("      then scale up with confidence");
             println!();
-            // Build a default spec. The upper bound is implicit — profiles
-            // are only valid for sizes ≤ the default profile's base count.
-            // Client libraries interpret the sized spec directly.
-            let build_spec = || -> String {
+            // Build the binomial-only fallback spec for very small datasets
+            // and as the seed for the per-stratification choices below. The
+            // upper bound is implicit — profiles are only valid for sizes
+            // ≤ the default profile's base count. Client libraries interpret
+            // the spec string directly.
+            let binomial_spec = || -> String {
                 if effective_max >= 2_000_000 {
                     // Use binary units (1mi = 2^20 = 1,048,576) so the
                     // doubling series produces clean IEC names:
@@ -928,10 +930,53 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
                     let start_label = format_count_label(start);
                     format!("mul:{}/2", start_label)
                 } else if effective_max >= 10_000 {
-                    let half = format_count_label(effective_max / 2);
-                    half
+                    format_count_label(effective_max / 2)
                 } else {
                     format_count_label(effective_max / 2)
+                }
+            };
+
+            // Compose a sized-profile spec by asking for each stratification
+            // strategy independently. The three strategies produce
+            // *different* size series; users typically want all of them so
+            // verification and benchmarking sweep both fast doublings and
+            // dense linear samples. Defaults are Y across the board.
+            let prompt_strategies = |effective_max: u64| -> Option<String> {
+                let want_binomial = confirm(
+                    "  Include binomial (×2 doubling) profiles?",
+                    true,
+                );
+                let want_fib = confirm(
+                    "  Include Fibonacci-progression profiles?",
+                    true,
+                );
+                // Linear-by-10M only makes sense once the dataset is at
+                // least ~10M vectors; below that the step would yield zero
+                // or one profile and the question would just be noise.
+                let want_linear = if effective_max >= 10_000_000 {
+                    confirm("  Include every-10M linear profiles?", true)
+                } else {
+                    false
+                };
+
+                // Each part is open-ended on the upper side: the spec
+                // stored in dataset.yaml stays independent of the exact
+                // base-vector count, and the parser resolves the upper
+                // bound at runtime from the actual cardinality.
+                let mut parts: Vec<String> = Vec::new();
+                if want_binomial {
+                    parts.push(binomial_spec());
+                }
+                if want_fib {
+                    parts.push("fib:1m".to_string());
+                }
+                if want_linear {
+                    parts.push("linear:10m/10m".to_string());
+                }
+                if parts.is_empty() {
+                    None
+                } else {
+                    Some(parts.join(","))
                 }
             };
 
@@ -940,16 +985,23 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
                 if !confirm("Generate sized profiles anyway?", false) {
                     None
                 } else {
-                    let default_spec = build_spec();
-                    let spec = prompt_optional(&format!("  Sized profile spec [{}]", default_spec));
+                    let default_spec = prompt_strategies(effective_max)
+                        .unwrap_or_else(binomial_spec);
+                    println!();
+                    println!("  Composed spec: {}", default_spec);
+                    let spec = prompt_optional(
+                        "  Override with a custom spec (Enter to keep composed)",
+                    );
                     Some(spec.unwrap_or(default_spec))
                 }
             } else if confirm("Generate sized profiles?", true) {
-                let default_spec = build_spec();
+                let default_spec = prompt_strategies(effective_max)
+                    .unwrap_or_else(binomial_spec);
                 println!();
-                println!("  Default: {}", default_spec);
-                println!("  Or enter a custom spec, or press Enter for the default.");
-                let spec = prompt_optional("  Sized profile spec (Enter for default)");
+                println!("  Composed spec: {}", default_spec);
+                let spec = prompt_optional(
+                    "  Override with a custom spec (Enter to keep composed)",
+                );
                 Some(spec.unwrap_or(default_spec))
             } else {
                 None
@@ -1755,8 +1807,15 @@ impl DetectedRoles {
 }
 
 /// Vector format names for matching constraints.
+///
+/// `parquet` is treated as a vector-capable format for role detection: a
+/// parquet file or directory named with a `base`/`query`/etc keyword can
+/// carry vectors (a parquet column of float arrays). Parquet also appears
+/// in `is_slab_or_parquet` for `MetadataContent` detection, and that arm
+/// runs first in the role-assignment chain, so parquet files named with
+/// `metadata` still resolve to metadata rather than to base vectors.
 const VECTOR_FORMATS: &[&str] = &[
-    "fvec", "ivec", "mvec", "bvec", "dvec", "svec", "npy",
+    "fvec", "ivec", "mvec", "bvec", "dvec", "svec", "npy", "parquet",
     "fvvec", "ivvec", "mvvec", "bvvec", "dvvec", "svvec",
     "i8vec", "u16vec", "i32vec", "u32vec", "i64vec", "u64vec",
     "i8vvec", "u16vvec", "i32vvec", "u32vvec", "i64vvec", "u64vvec",
@@ -2393,5 +2452,53 @@ mod tests {
         ]);
         let roles = detect_roles(&candidates);
         assert_eq!(roles.metadata.as_deref(), Some(Path::new("metadata.parquet")));
+    }
+
+    /// A parquet directory (or file) whose name contains `base` should be
+    /// detected as the base-vectors source. Regression: before parquet was
+    /// added to VECTOR_FORMATS, the `has_base && is_vector` arm in
+    /// `detect_roles` rejected parquet and the user had to assign it by hand.
+    #[test]
+    fn detect_roles_parquet_base_vectors() {
+        let candidates = make_candidates(&[
+            ("_base_dot_parquet", "parquet"),
+        ]);
+        let roles = detect_roles(&candidates);
+        assert_eq!(
+            roles.base_vectors.as_deref(),
+            Some(Path::new("_base_dot_parquet")),
+        );
+
+        // Also: `base.parquet` with a real dot extension.
+        let candidates = make_candidates(&[
+            ("base.parquet", "parquet"),
+        ]);
+        let roles = detect_roles(&candidates);
+        assert_eq!(roles.base_vectors.as_deref(), Some(Path::new("base.parquet")));
+    }
+
+    /// Parquet named with `metadata` still wins the metadata role (and not
+    /// base vectors) because the MetadataContent arm runs first.
+    #[test]
+    fn detect_roles_parquet_metadata_beats_base() {
+        let candidates = make_candidates(&[
+            ("base_metadata.parquet", "parquet"),
+        ]);
+        let roles = detect_roles(&candidates);
+        assert_eq!(
+            roles.metadata.as_deref(),
+            Some(Path::new("base_metadata.parquet")),
+        );
+        assert!(roles.base_vectors.is_none());
+    }
+
+    /// Parquet named with `query` lands on query vectors.
+    #[test]
+    fn detect_roles_parquet_query_vectors() {
+        let candidates = make_candidates(&[
+            ("query.parquet", "parquet"),
+        ]);
+        let roles = detect_roles(&candidates);
+        assert_eq!(roles.query_vectors.as_deref(), Some(Path::new("query.parquet")));
     }
 }

@@ -332,8 +332,6 @@ pub struct StreamContext {
     pub profile_names: Vec<String>,
     /// Workspace directory (usually the directory containing `dataset.yaml`).
     pub workspace: PathBuf,
-    /// Scratch directory for temporary files deleted after pipeline success.
-    pub scratch: PathBuf,
     /// Cache directory for reusable intermediates persisted across runs.
     pub cache: PathBuf,
     /// Shared default variables available for interpolation.

@@ -448,7 +448,6 @@ mod tests {
             profile: String::new(),
             profile_names: vec![],
             workspace: dir.to_path_buf(),
-            scratch: dir.join(".scratch"),
             cache: dir.join(".cache"),
             defaults: IndexMap::new(),
             dry_run: false,

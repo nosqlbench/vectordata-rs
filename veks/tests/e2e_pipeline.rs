@@ -170,37 +170,37 @@ fn fixtures() -> &'static Path {
         std::fs::create_dir_all(&dir).unwrap();
 
         // Base fvec: 200 vectors, dim=4, with known dups and zeros
-        let fvec = dir.join("base.fvec");
+        let fvec = dir.join("base.fvecs");
         if !fvec.exists() {
             write_test_fvec(&fvec, 200, 4);
         }
 
         // Separate query fvec: 20 distinct vectors
-        let query = dir.join("queries.fvec");
+        let query = dir.join("queries.fvecs");
         if !query.exists() {
             write_distinct_fvec(&query, 20, 4, 1000);
         }
 
         // Pre-computed ground truth: 20 queries × 5 neighbors
-        let gt = dir.join("gt.ivec");
+        let gt = dir.join("gt.ivecs");
         if !gt.exists() {
             write_fake_ivec(&gt, 20, 5);
         }
 
         // Pre-computed distances: 20 queries × 5 distances
-        let dist = dir.join("gt_dist.fvec");
+        let dist = dir.join("gt_dist.fvecs");
         if !dist.exists() {
             write_fake_fvec_distances(&dist, 20, 5);
         }
 
         // Small fvec: 50 vectors for KNN verification
-        let small = dir.join("small.fvec");
+        let small = dir.join("small.fvecs");
         if !small.exists() {
             write_test_fvec(&small, 50, 4);
         }
 
         // Large fvec: 500 vectors for fraction tests
-        let large = dir.join("large.fvec");
+        let large = dir.join("large.fvecs");
         if !large.exists() {
             write_test_fvec(&large, 500, 4);
         }
@@ -376,8 +376,8 @@ fn run_pipeline(dataset_yaml: &Path) -> (bool, String) {
 #[test]
 fn e2e_self_search_with_dedup() {
     let tmp = make_tempdir();
-    let fvec = tmp.path().join("vectors.fvec");
-    copy_fixture("base.fvec", &fvec);
+    let fvec = tmp.path().join("vectors.fvecs");
+    copy_fixture("base.fvecs", &fvec);
 
     let out = tmp.path().join("dataset");
     let mut args = default_args("e2e-self-search", &out);
@@ -394,8 +394,8 @@ fn e2e_self_search_with_dedup() {
     assert!(success, "pipeline failed:\n{}", output);
 
     // Verify outputs exist
-    let base = out.join("profiles/base/base_vectors.fvec");
-    let query = out.join("profiles/base/query_vectors.fvec");
+    let base = out.join("profiles/base/base_vectors.fvecs");
+    let query = out.join("profiles/base/query_vectors.fvecs");
     assert!(base.exists(), "base_vectors not produced");
     assert!(query.exists(), "query_vectors not produced");
 
@@ -409,7 +409,7 @@ fn e2e_self_search_with_dedup() {
     assert_eq!(base_count, 188, "expected 188 base vectors (200 - 1 dup - 1 zero - 10 queries)");
 
     // Verify KNN output exists with correct shape
-    let indices_path = out.join("profiles/default/neighbor_indices.ivec");
+    let indices_path = out.join("profiles/default/neighbor_indices.ivecs");
     assert!(indices_path.exists(), "neighbor_indices not produced");
     let indices = read_ivec_ordinals(&indices_path);
     assert_eq!(indices.len(), 10, "expected 10 query results");
@@ -440,8 +440,8 @@ fn e2e_self_search_with_dedup() {
 #[test]
 fn e2e_no_cleaning() {
     let tmp = make_tempdir();
-    let fvec = tmp.path().join("vectors.fvec");
-    copy_fixture("base.fvec", &fvec);
+    let fvec = tmp.path().join("vectors.fvecs");
+    copy_fixture("base.fvecs", &fvec);
 
     let out = tmp.path().join("dataset");
     let mut args = default_args("e2e-no-clean", &out);
@@ -454,8 +454,8 @@ fn e2e_no_cleaning() {
     let (success, output) = run_pipeline(&out.join("dataset.yaml"));
     assert!(success, "pipeline failed:\n{}", output);
 
-    let (_, base_count) = read_xvec_counts(&out.join("profiles/base/base_vectors.fvec"));
-    let (_, query_count) = read_xvec_counts(&out.join("profiles/base/query_vectors.fvec"));
+    let (_, base_count) = read_xvec_counts(&out.join("profiles/base/base_vectors.fvecs"));
+    let (_, query_count) = read_xvec_counts(&out.join("profiles/base/query_vectors.fvecs"));
     assert_eq!(query_count, 10);
     // 200 - 10 queries - 1 zero = 189 (zero detection is always active during extraction)
     assert_eq!(base_count, 189, "expected 189 base vectors (200 - 10 queries - 1 zero)");
@@ -467,9 +467,9 @@ fn e2e_no_cleaning() {
 #[test]
 fn e2e_separate_queries() {
     let tmp = make_tempdir();
-    let base_fvec = tmp.path().join("base.fvec");
-    let query_fvec = tmp.path().join("queries.fvec");
-    copy_fixture("base.fvec", &base_fvec);
+    let base_fvec = tmp.path().join("base.fvecs");
+    let query_fvec = tmp.path().join("queries.fvecs");
+    copy_fixture("base.fvecs", &base_fvec);
     // Write 20 distinct query vectors (no dups, no zeros)
     {
         let f = std::fs::File::create(&query_fvec).unwrap();
@@ -494,7 +494,7 @@ fn e2e_separate_queries() {
     assert!(success, "pipeline failed:\n{}", output);
 
     // KNN should exist
-    let indices_path = out.join("profiles/default/neighbor_indices.ivec");
+    let indices_path = out.join("profiles/default/neighbor_indices.ivecs");
     assert!(indices_path.exists(), "neighbor_indices not produced");
     let indices = read_ivec_ordinals(&indices_path);
     // Strategy 1 (combined B+Q): separate queries are combined with base,
@@ -508,8 +508,8 @@ fn e2e_separate_queries() {
 #[test]
 fn e2e_base_only() {
     let tmp = make_tempdir();
-    let fvec = tmp.path().join("vectors.fvec");
-    copy_fixture("base.fvec", &fvec);
+    let fvec = tmp.path().join("vectors.fvecs");
+    copy_fixture("base.fvecs", &fvec);
 
     let out = tmp.path().join("dataset");
     let mut args = default_args("e2e-base-only", &out);
@@ -521,7 +521,7 @@ fn e2e_base_only() {
     assert!(success, "pipeline failed:\n{}", output);
 
     // No KNN, no queries, no shuffle — just catalog + merkle
-    assert!(!out.join("profiles/default/neighbor_indices.ivec").exists(),
+    assert!(!out.join("profiles/default/neighbor_indices.ivecs").exists(),
         "KNN should not be produced for B-only");
 }
 
@@ -532,8 +532,8 @@ fn e2e_base_only() {
 #[test]
 fn e2e_base_fraction() {
     let tmp = make_tempdir();
-    let fvec = tmp.path().join("vectors.fvec");
-    copy_fixture("base.fvec", &fvec);
+    let fvec = tmp.path().join("vectors.fvecs");
+    copy_fixture("base.fvecs", &fvec);
 
     let out = tmp.path().join("dataset");
     let mut args = default_args("e2e-fraction", &out);
@@ -545,8 +545,8 @@ fn e2e_base_fraction() {
     let (success, output) = run_pipeline(&out.join("dataset.yaml"));
     assert!(success, "pipeline failed:\n{}", output);
 
-    let (_, base_count) = read_xvec_counts(&out.join("profiles/base/base_vectors.fvec"));
-    let (_, query_count) = read_xvec_counts(&out.join("profiles/base/query_vectors.fvec"));
+    let (_, base_count) = read_xvec_counts(&out.join("profiles/base/base_vectors.fvecs"));
+    let (_, query_count) = read_xvec_counts(&out.join("profiles/base/query_vectors.fvecs"));
     assert_eq!(query_count, 10);
     // 198 clean * 0.5 = 99 base_end, minus 10 queries = 89 base
     assert!(base_count < 190, "base_count {} should be < 190 (capped by fraction)", base_count);
@@ -560,12 +560,12 @@ fn e2e_base_fraction() {
 #[test]
 fn e2e_precomputed_gt() {
     let tmp = make_tempdir();
-    let base = tmp.path().join("base.fvec");
-    let query = tmp.path().join("queries.fvec");
-    let gt = tmp.path().join("gt.ivec");
-    copy_fixture("base.fvec", &base);
-    copy_fixture("queries.fvec", &query);
-    copy_fixture("gt.ivec", &gt);
+    let base = tmp.path().join("base.fvecs");
+    let query = tmp.path().join("queries.fvecs");
+    let gt = tmp.path().join("gt.ivecs");
+    copy_fixture("base.fvecs", &base);
+    copy_fixture("queries.fvecs", &query);
+    copy_fixture("gt.ivecs", &gt);
 
     let out = tmp.path().join("dataset");
     let mut args = default_args("e2e-precomputed-gt", &out);
@@ -598,14 +598,14 @@ fn e2e_precomputed_gt() {
 #[test]
 fn e2e_precomputed_gt_and_distances() {
     let tmp = make_tempdir();
-    let base = tmp.path().join("base.fvec");
-    let query = tmp.path().join("queries.fvec");
-    let gt = tmp.path().join("gt.ivec");
-    let dist = tmp.path().join("gt_dist.fvec");
-    copy_fixture("base.fvec", &base);
-    copy_fixture("queries.fvec", &query);
-    copy_fixture("gt.ivec", &gt);
-    copy_fixture("gt_dist.fvec", &dist);
+    let base = tmp.path().join("base.fvecs");
+    let query = tmp.path().join("queries.fvecs");
+    let gt = tmp.path().join("gt.ivecs");
+    let dist = tmp.path().join("gt_dist.fvecs");
+    copy_fixture("base.fvecs", &base);
+    copy_fixture("queries.fvecs", &query);
+    copy_fixture("gt.ivecs", &gt);
+    copy_fixture("gt_dist.fvecs", &dist);
 
     let out = tmp.path().join("dataset");
     let mut args = default_args("e2e-gt-and-dist", &out);
@@ -627,8 +627,8 @@ fn e2e_precomputed_gt_and_distances() {
 #[test]
 fn e2e_normalize() {
     let tmp = make_tempdir();
-    let fvec = tmp.path().join("vectors.fvec");
-    copy_fixture("base.fvec", &fvec);
+    let fvec = tmp.path().join("vectors.fvecs");
+    copy_fixture("base.fvecs", &fvec);
 
     let out = tmp.path().join("dataset");
     let mut args = default_args("e2e-normalize", &out);
@@ -641,7 +641,7 @@ fn e2e_normalize() {
     assert!(success, "pipeline failed:\n{}", output);
 
     // Read output base vectors and verify all are L2-normalized
-    let base_path = out.join("profiles/base/base_vectors.fvec");
+    let base_path = out.join("profiles/base/base_vectors.fvecs");
     let vecs = read_fvec_vectors(&base_path);
     assert!(!vecs.is_empty(), "no base vectors produced");
 
@@ -662,8 +662,8 @@ fn e2e_normalize() {
 #[test]
 fn e2e_knn_numerical_correctness() {
     let tmp = make_tempdir();
-    let fvec = tmp.path().join("vectors.fvec");
-    copy_fixture("small.fvec", &fvec);
+    let fvec = tmp.path().join("vectors.fvecs");
+    copy_fixture("small.fvecs", &fvec);
 
     let out = tmp.path().join("dataset");
     let mut args = default_args("e2e-knn-verify", &out);
@@ -681,9 +681,9 @@ fn e2e_knn_numerical_correctness() {
     assert!(success, "pipeline failed:\n{}", output);
 
     // Read query vectors, base vectors, and KNN indices
-    let query_vecs = read_fvec_vectors(&out.join("profiles/base/query_vectors.fvec"));
-    let base_vecs = read_fvec_vectors(&out.join("profiles/base/base_vectors.fvec"));
-    let indices = read_ivec_ordinals(&out.join("profiles/default/neighbor_indices.ivec"));
+    let query_vecs = read_fvec_vectors(&out.join("profiles/base/query_vectors.fvecs"));
+    let base_vecs = read_fvec_vectors(&out.join("profiles/base/base_vectors.fvecs"));
+    let indices = read_ivec_ordinals(&out.join("profiles/default/neighbor_indices.ivecs"));
 
     assert_eq!(query_vecs.len(), 5, "expected 5 queries");
     assert_eq!(indices.len(), 5, "expected 5 KNN results");
@@ -722,8 +722,8 @@ fn l2_distance(a: &[f32], b: &[f32]) -> f64 {
 #[test]
 fn e2e_dedup_correctness() {
     let tmp = make_tempdir();
-    let fvec = tmp.path().join("vectors.fvec");
-    copy_fixture("base.fvec", &fvec);
+    let fvec = tmp.path().join("vectors.fvecs");
+    copy_fixture("base.fvecs", &fvec);
 
     let out = tmp.path().join("dataset");
     let mut args = default_args("e2e-dedup-verify", &out);
@@ -772,8 +772,8 @@ fn e2e_base_fraction_10_percent_cli() {
     std::fs::create_dir_all(&dataset_dir).unwrap();
 
     // Create source data: 500 vectors with known properties
-    let fvec = dataset_dir.join("_base_vectors.fvec");
-    copy_fixture("large.fvec", &fvec);
+    let fvec = dataset_dir.join("_base_vectors.fvecs");
+    copy_fixture("large.fvecs", &fvec);
 
     // Bootstrap via CLI with explicit flags
     let bootstrap_out = Command::new(veks_bin())
@@ -855,8 +855,8 @@ fn e2e_base_fraction_10_percent_cli() {
         "base_count ({}) should be <= 55 (10% of ~500 minus queries)", base_count);
 
     // ── Verify output artifact sizes ───────────────────────────────
-    let base_path = dataset_dir.join("profiles/base/base_vectors.fvec");
-    let query_path = dataset_dir.join("profiles/base/query_vectors.fvec");
+    let base_path = dataset_dir.join("profiles/base/base_vectors.fvecs");
+    let query_path = dataset_dir.join("profiles/base/query_vectors.fvecs");
     assert!(base_path.exists(), "base_vectors not produced");
     assert!(query_path.exists(), "query_vectors not produced");
 
@@ -876,7 +876,7 @@ fn e2e_base_fraction_10_percent_cli() {
         "base_vectors has {} records, expected <= 55 for 10% fraction", actual_base_count);
 
     // ── Verify KNN output ──────────────────────────────────────────
-    let indices_path = dataset_dir.join("profiles/default/neighbor_indices.ivec");
+    let indices_path = dataset_dir.join("profiles/default/neighbor_indices.ivecs");
     assert!(indices_path.exists(), "neighbor_indices not produced");
     let indices = read_ivec_ordinals(&indices_path);
     assert_eq!(indices.len(), actual_query_count,
@@ -968,20 +968,20 @@ fn e2e_npy_source() {
     assert!(success, "pipeline failed:\n{}", output);
 
     // Output matches source precision: npy f32 → fvec (f32)
-    let base_path = out.join("profiles/base/base_vectors.fvec");
+    let base_path = out.join("profiles/base/base_vectors.fvecs");
     assert!(base_path.exists(), "base_vectors.fvec not produced");
 
     let (base_dim, base_count) = read_xvec_counts(&base_path);
     assert_eq!(base_dim, 4, "dimension mismatch");
     assert!(base_count > 0 && base_count <= 50, "base_count {} out of range", base_count);
 
-    let query_path = out.join("profiles/base/query_vectors.fvec");
+    let query_path = out.join("profiles/base/query_vectors.fvecs");
     assert!(query_path.exists(), "query_vectors.fvec not produced");
     let (_, query_count) = read_xvec_counts(&query_path);
     assert_eq!(query_count, 5, "expected 5 queries");
 
     // KNN should exist
-    let indices = out.join("profiles/default/neighbor_indices.ivec");
+    let indices = out.join("profiles/default/neighbor_indices.ivecs");
     assert!(indices.exists(), "KNN indices not produced");
 }
 
@@ -992,8 +992,8 @@ fn e2e_npy_source() {
 #[test]
 fn e2e_metadata_pipeline() {
     let tmp = make_tempdir();
-    let fvec = tmp.path().join("vectors.fvec");
-    copy_fixture("base.fvec", &fvec);
+    let fvec = tmp.path().join("vectors.fvecs");
+    copy_fixture("base.fvecs", &fvec);
 
     let meta = tmp.path().join("metadata");
     let src_meta = fixtures().join("metadata");
@@ -1030,7 +1030,7 @@ fn e2e_metadata_pipeline() {
     assert!(vars.contains("base_count"), "missing base_count");
 
     // No filtered KNN (no_filtered=true)
-    assert!(!out.join("profiles/default/filtered_neighbor_indices.ivec").exists(),
+    assert!(!out.join("profiles/default/filtered_neighbor_indices.ivecs").exists(),
         "filtered KNN should not be produced with no_filtered=true");
 }
 
@@ -1041,8 +1041,8 @@ fn e2e_metadata_pipeline() {
 #[test]
 fn e2e_metadata_with_fraction() {
     let tmp = make_tempdir();
-    let fvec = tmp.path().join("vectors.fvec");
-    copy_fixture("base.fvec", &fvec);
+    let fvec = tmp.path().join("vectors.fvecs");
+    copy_fixture("base.fvecs", &fvec);
 
     let meta = tmp.path().join("metadata");
     let src_meta = fixtures().join("metadata");
@@ -1073,7 +1073,7 @@ fn e2e_metadata_with_fraction() {
     assert!(success, "pipeline failed:\n{}", output);
 
     // Base and metadata should have same number of records
-    let base_path = out.join("profiles/base/base_vectors.fvec");
+    let base_path = out.join("profiles/base/base_vectors.fvecs");
     let meta_path = out.join("profiles/base/metadata_content.slab");
     assert!(base_path.exists(), "base_vectors not produced");
     assert!(meta_path.exists(), "metadata_content not produced");
@@ -1096,8 +1096,8 @@ fn e2e_metadata_with_fraction() {
 #[test]
 fn e2e_cache_invalidation_on_reconfig() {
     let tmp = make_tempdir();
-    let fvec = tmp.path().join("vectors.fvec");
-    copy_fixture("base.fvec", &fvec);
+    let fvec = tmp.path().join("vectors.fvecs");
+    copy_fixture("base.fvecs", &fvec);
 
     let out = tmp.path().join("dataset");
 
@@ -1110,11 +1110,11 @@ fn e2e_cache_invalidation_on_reconfig() {
     let (success, output) = run_pipeline(&out.join("dataset.yaml"));
     assert!(success, "run 1 failed:\n{}", output);
 
-    let (_, base_count_1) = read_xvec_counts(&out.join("profiles/base/base_vectors.fvec"));
+    let (_, base_count_1) = read_xvec_counts(&out.join("profiles/base/base_vectors.fvecs"));
     assert!(base_count_1 > 150, "run 1 base_count {} too small", base_count_1);
 
     // Verify KNN exists from run 1
-    let indices_1 = read_ivec_ordinals(&out.join("profiles/default/neighbor_indices.ivec"));
+    let indices_1 = read_ivec_ordinals(&out.join("profiles/default/neighbor_indices.ivecs"));
     assert_eq!(indices_1.len(), 10, "run 1: expected 10 query results");
 
     // ── Re-bootstrap with 50% fraction ────────────────────────
@@ -1129,7 +1129,7 @@ fn e2e_cache_invalidation_on_reconfig() {
     let (success, output) = run_pipeline(&out.join("dataset.yaml"));
     assert!(success, "run 2 failed:\n{}", output);
 
-    let (_, base_count_2) = read_xvec_counts(&out.join("profiles/base/base_vectors.fvec"));
+    let (_, base_count_2) = read_xvec_counts(&out.join("profiles/base/base_vectors.fvecs"));
 
     // Run 2 should have fewer base vectors (50% subset)
     assert!(base_count_2 < base_count_1,
@@ -1140,7 +1140,7 @@ fn e2e_cache_invalidation_on_reconfig() {
         base_count_2);
 
     // KNN indices from run 2 must be in range [0, base_count_2)
-    let indices_2 = read_ivec_ordinals(&out.join("profiles/default/neighbor_indices.ivec"));
+    let indices_2 = read_ivec_ordinals(&out.join("profiles/default/neighbor_indices.ivecs"));
     assert_eq!(indices_2.len(), 10, "run 2: expected 10 query results");
     for (qi, neighbors) in indices_2.iter().enumerate() {
         for &idx in neighbors {
@@ -1163,8 +1163,8 @@ fn e2e_cache_invalidation_on_reconfig() {
 #[test]
 fn e2e_early_stratification() {
     let tmp = make_tempdir();
-    let fvec = tmp.path().join("base.fvec");
-    std::fs::copy(fixtures().join("base.fvec"), &fvec).unwrap();
+    let fvec = tmp.path().join("base.fvecs");
+    std::fs::copy(fixtures().join("base.fvecs"), &fvec).unwrap();
 
     let out = tmp.path().join("out");
     let mut args = default_args("early-strat", &out);
@@ -1177,7 +1177,7 @@ fn e2e_early_stratification() {
     assert!(success, "pipeline failed:\n{}", output);
 
     // Default profile artifacts should exist
-    assert!(out.join("profiles/default/neighbor_indices.ivec").exists(),
+    assert!(out.join("profiles/default/neighbor_indices.ivecs").exists(),
         "default profile KNN indices should exist");
 
     // Check dataset.yaml has the sized profile
@@ -1192,8 +1192,8 @@ fn e2e_early_stratification() {
 #[test]
 fn e2e_early_stratification_with_fraction() {
     let tmp = make_tempdir();
-    let fvec = tmp.path().join("base.fvec");
-    std::fs::copy(fixtures().join("base.fvec"), &fvec).unwrap();
+    let fvec = tmp.path().join("base.fvecs");
+    std::fs::copy(fixtures().join("base.fvecs"), &fvec).unwrap();
 
     let out = tmp.path().join("out");
     let mut args = default_args("frac-strat", &out);
@@ -1208,7 +1208,7 @@ fn e2e_early_stratification_with_fraction() {
     assert!(success, "pipeline failed:\n{}", output);
 
     // Base vectors should be ~50% of 198 clean = ~99
-    let (_, base_count) = read_xvec_counts(&out.join("profiles/base/base_vectors.fvec"));
+    let (_, base_count) = read_xvec_counts(&out.join("profiles/base/base_vectors.fvecs"));
     assert!(base_count > 30 && base_count < 120,
         "base_count {} should be ~50% of 198 clean vectors", base_count);
 }
@@ -1224,8 +1224,8 @@ fn e2e_early_stratification_with_fraction() {
 #[test]
 fn adversarial_idempotent_rerun() {
     let tmp = make_tempdir();
-    let fvec = tmp.path().join("base.fvec");
-    std::fs::copy(fixtures().join("base.fvec"), &fvec).unwrap();
+    let fvec = tmp.path().join("base.fvecs");
+    std::fs::copy(fixtures().join("base.fvecs"), &fvec).unwrap();
 
     let out = tmp.path().join("out");
     let mut args = default_args("idempotent", &out);
@@ -1253,8 +1253,8 @@ fn adversarial_idempotent_rerun() {
 #[test]
 fn adversarial_knn_indices_in_range() {
     let tmp = make_tempdir();
-    let fvec = tmp.path().join("base.fvec");
-    std::fs::copy(fixtures().join("base.fvec"), &fvec).unwrap();
+    let fvec = tmp.path().join("base.fvecs");
+    std::fs::copy(fixtures().join("base.fvecs"), &fvec).unwrap();
 
     let out = tmp.path().join("out");
     let mut args = default_args("knn-range", &out);
@@ -1265,8 +1265,8 @@ fn adversarial_knn_indices_in_range() {
     let (success, output) = run_pipeline(&out.join("dataset.yaml"));
     assert!(success, "pipeline failed:\n{}", output);
 
-    let (_, base_count) = read_xvec_counts(&out.join("profiles/base/base_vectors.fvec"));
-    let indices = read_ivec_ordinals(&out.join("profiles/default/neighbor_indices.ivec"));
+    let (_, base_count) = read_xvec_counts(&out.join("profiles/base/base_vectors.fvecs"));
+    let indices = read_ivec_ordinals(&out.join("profiles/default/neighbor_indices.ivecs"));
 
     for (qi, neighbors) in indices.iter().enumerate() {
         for &idx in neighbors {
@@ -1281,7 +1281,7 @@ fn adversarial_knn_indices_in_range() {
 #[test]
 fn adversarial_empty_base_vectors() {
     let tmp = make_tempdir();
-    let fvec = tmp.path().join("empty.fvec");
+    let fvec = tmp.path().join("empty.fvecs");
     std::fs::write(&fvec, b"").unwrap(); // 0 bytes
 
     let out = tmp.path().join("out");
@@ -1313,8 +1313,8 @@ fn adversarial_empty_base_vectors() {
 #[test]
 fn adversarial_query_count_exceeds_vectors() {
     let tmp = make_tempdir();
-    let fvec = tmp.path().join("base.fvec");
-    std::fs::copy(fixtures().join("base.fvec"), &fvec).unwrap();
+    let fvec = tmp.path().join("base.fvecs");
+    std::fs::copy(fixtures().join("base.fvecs"), &fvec).unwrap();
 
     let out = tmp.path().join("out");
     let mut args = default_args("query-exceed", &out);
@@ -1343,8 +1343,8 @@ fn adversarial_query_count_exceeds_vectors() {
 #[test]
 fn adversarial_k_exceeds_base_count() {
     let tmp = make_tempdir();
-    let fvec = tmp.path().join("base.fvec");
-    std::fs::copy(fixtures().join("base.fvec"), &fvec).unwrap();
+    let fvec = tmp.path().join("base.fvecs");
+    std::fs::copy(fixtures().join("base.fvecs"), &fvec).unwrap();
 
     let out = tmp.path().join("out");
     let mut args = default_args("k-exceed", &out);
@@ -1368,8 +1368,8 @@ fn adversarial_k_exceeds_base_count() {
 #[test]
 fn adversarial_zero_fraction() {
     let tmp = make_tempdir();
-    let fvec = tmp.path().join("base.fvec");
-    std::fs::copy(fixtures().join("base.fvec"), &fvec).unwrap();
+    let fvec = tmp.path().join("base.fvecs");
+    std::fs::copy(fixtures().join("base.fvecs"), &fvec).unwrap();
 
     let out = tmp.path().join("out");
     let mut args = default_args("zero-frac", &out);
@@ -1394,8 +1394,8 @@ fn adversarial_zero_fraction() {
 #[test]
 fn adversarial_sized_profile_exceeds_base() {
     let tmp = make_tempdir();
-    let fvec = tmp.path().join("base.fvec");
-    std::fs::copy(fixtures().join("base.fvec"), &fvec).unwrap();
+    let fvec = tmp.path().join("base.fvecs");
+    std::fs::copy(fixtures().join("base.fvecs"), &fvec).unwrap();
 
     let out = tmp.path().join("out");
     let mut args = default_args("oversized-profile", &out);
@@ -1416,8 +1416,8 @@ fn adversarial_sized_profile_exceeds_base() {
 #[test]
 fn adversarial_different_seeds_valid_knn() {
     let tmp = make_tempdir();
-    let fvec = tmp.path().join("base.fvec");
-    std::fs::copy(fixtures().join("base.fvec"), &fvec).unwrap();
+    let fvec = tmp.path().join("base.fvecs");
+    std::fs::copy(fixtures().join("base.fvecs"), &fvec).unwrap();
 
     // Run 1 with seed=42
     let out1 = tmp.path().join("out1");
@@ -1440,14 +1440,14 @@ fn adversarial_different_seeds_valid_knn() {
     assert!(s2, "seed 99 failed:\n{}", o2);
 
     // Both should have valid indices
-    let (_, bc1) = read_xvec_counts(&out1.join("profiles/base/base_vectors.fvec"));
-    let (_, bc2) = read_xvec_counts(&out2.join("profiles/base/base_vectors.fvec"));
+    let (_, bc1) = read_xvec_counts(&out1.join("profiles/base/base_vectors.fvecs"));
+    let (_, bc2) = read_xvec_counts(&out2.join("profiles/base/base_vectors.fvecs"));
     // Same source data + same cleaning = same base count
     assert_eq!(bc1, bc2, "same source should produce same base count regardless of seed");
 
     // But different queries (different shuffle)
-    let q1 = read_xvec_counts(&out1.join("profiles/base/query_vectors.fvec"));
-    let q2 = read_xvec_counts(&out2.join("profiles/base/query_vectors.fvec"));
+    let q1 = read_xvec_counts(&out1.join("profiles/base/query_vectors.fvecs"));
+    let q2 = read_xvec_counts(&out2.join("profiles/base/query_vectors.fvecs"));
     assert_eq!(q1.1, q2.1, "same query count regardless of seed");
 }
 
@@ -1465,7 +1465,7 @@ fn e2e_source_zero_count_through_duplicates() {
     // Vectors 0,1 = duplicate non-zero
     // Vectors 2,3,4,5,6 = FIVE identical zero vectors
     // Vectors 7..49 = distinct non-zero
-    let fvec_path = tmp.path().join("source.fvec");
+    let fvec_path = tmp.path().join("source.fvecs");
     {
         let f = std::fs::File::create(&fvec_path).unwrap();
         let mut w = std::io::BufWriter::new(f);
@@ -1554,8 +1554,8 @@ fn e2e_source_zero_count_through_duplicates() {
 #[test]
 fn e2e_finalize_steps_run_after_compute() {
     let tmp = make_tempdir();
-    let fvec = tmp.path().join("vectors.fvec");
-    copy_fixture("base.fvec", &fvec);
+    let fvec = tmp.path().join("vectors.fvecs");
+    copy_fixture("base.fvecs", &fvec);
 
     let out = tmp.path().join("dataset");
     let mut args = default_args("e2e-finalize-order", &out);
@@ -1666,7 +1666,7 @@ fn e2e_finalize_steps_run_after_compute() {
 #[test]
 fn e2e_partition_profiles_full_pipeline() {
     let tmp = make_tempdir();
-    let fvec = tmp.path().join("vectors.fvec");
+    let fvec = tmp.path().join("vectors.fvecs");
     // Write 2000 distinct non-zero vectors (dim=8) — large enough for
     // realistic KNN and partitioning without corner case workarounds.
     write_distinct_fvec(&fvec, 2000, 8, 1);
@@ -1739,7 +1739,7 @@ fn e2e_partition_profiles_full_pipeline() {
             "base_vectors for '{}' should exist: {}", name, base_path.display());
 
         // Query vectors MUST be a real file, NOT a symlink
-        let query_path = out.join(format!("profiles/{}/query_vectors.fvec", name));
+        let query_path = out.join(format!("profiles/{}/query_vectors.fvecs", name));
         assert!(query_path.exists(),
             "query_vectors for '{}' should exist", name);
         assert!(!query_path.is_symlink(),
@@ -1769,7 +1769,7 @@ fn e2e_partition_profiles_full_pipeline() {
     }
 
     // Default profile KNN should exist
-    assert!(out.join("profiles/default/neighbor_indices.ivec").exists());
+    assert!(out.join("profiles/default/neighbor_indices.ivecs").exists());
 
     // Finalize artifacts
     assert!(out.join("dataset.json").exists());

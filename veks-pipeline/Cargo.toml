@@ -8,7 +8,7 @@ homepage = "https://github.com/nosqlbench/vectordata-rs"
 repository = "https://github.com/nosqlbench/vectordata-rs"
 
 [features]
-default = ["faiss"]
+default = []
 knnutils = ["dep:rand_mt"]
 faiss = ["knnutils", "dep:faiss"]
 
@@ -42,6 +42,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
 sha2 = "0.10"
+hmac = "0.12"
+hex = "0.4"
+quick-xml = "0.36"
 signal-hook = "0.3"
 simsimd = "6"
 slabtastic = { path = "../slabtastic", version = "0.17.0" }

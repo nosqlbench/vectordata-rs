@@ -754,16 +754,31 @@ fn take_number(iter: &mut std::iter::Peekable<std::str::Chars<'_>>) -> u64 {
 /// requires `base_count` to be known before expansion. These entries
 /// must be deferred during YAML deserialization.
 ///
-/// Currently only `mul:start/factor` (no `..end`) needs deferral.
+/// Three open-ended forms exist:
+///   - `mul:start/factor`        — no `..end`
+///   - `fib:start`               — no `..end` (just the start scalar)
+///   - `linear:start/step`       — no `..end` in the range portion
+/// All three are resolved at runtime once the base count is materialized.
 pub fn needs_base_count(entry: &str) -> bool {
     let entry = entry.trim();
     if let Some(rest) = entry.strip_prefix("mul:") {
         // mul:start/factor (no ..) needs base_count
         // mul:start..end/factor has explicit end, does not need it
-        !rest.contains("..")
-    } else {
-        false
+        return !rest.contains("..");
     }
+    if let Some(rest) = entry.strip_prefix("fib:") {
+        // fib:start (no ..) needs base_count
+        // fib:start..end has explicit end, does not need it
+        return !rest.contains("..");
+    }
+    if let Some(rest) = entry.strip_prefix("linear:") {
+        // linear:start/step (no ..) needs base_count
+        // linear:start..end/step has explicit end, does not need it
+        // The `..` only appears in the range part (left of `/`).
+        let range_part = rest.split_once('/').map(|(r, _)| r).unwrap_or(rest);
+        return !range_part.contains("..");
+    }
+    false
 }
 
 /// Parse a sized entry without a base count bound. Only valid for forms
@@ -789,6 +804,9 @@ fn parse_sized_entry_impl(entry: &str, max_count: u64) -> Result<Vec<(String, u6
     }
     if let Some(rest) = entry.strip_prefix("mul:") {
         return parse_mul_range(rest, max_count);
+    }
+    if let Some(rest) = entry.strip_prefix("linear:") {
+        return parse_linear_range(rest, max_count);
     }
 
     if let Some((range_part, step_str)) = entry.split_once('/') {
@@ -857,15 +875,27 @@ fn parse_sized_entry_impl(entry: &str, max_count: u64) -> Result<Vec<(String, u6
 /// fall within the range. The base unit is the GCD-friendly smallest value;
 /// the series starts at 1×base and grows by fibonacci steps.
 fn parse_fib_range(range_str: &str, max_count: u64) -> Result<Vec<(String, u64)>, String> {
-    let (start_str, end_str) = range_str
-        .split_once("..")
-        .ok_or_else(|| format!("invalid fib range '{}': expected fib:start..end", range_str))?;
-    let start = parse_number_with_suffix(start_str.trim())?;
-    let end_raw = parse_number_with_suffix(end_str.trim())?;
-    // Cap at max_count (profiles >= max_count are redundant with default)
-    let end = if max_count > 0 { end_raw.min(max_count - 1) } else { end_raw };
+    // Accept both `fib:start..end` (explicit upper bound) and `fib:start`
+    // (open-ended, capped at runtime by `max_count`). The open form is
+    // what the wizard emits so the spec stored in dataset.yaml stays
+    // independent of the dataset's exact size.
+    let (start, explicit_end) = if let Some((start_str, end_str)) = range_str.split_once("..") {
+        (
+            parse_number_with_suffix(start_str.trim())?,
+            Some(parse_number_with_suffix(end_str.trim())?),
+        )
+    } else {
+        (parse_number_with_suffix(range_str.trim())?, None)
+    };
+    let end = match (explicit_end, max_count) {
+        (Some(e), mc) if mc > 0 => e.min(mc - 1),
+        (Some(e), _) => e,
+        (None, mc) if mc > 0 => mc - 1,
+        (None, _) => return Err(format!(
+            "implicit upper bound form 'fib:{}' requires a known base count", range_str)),
+    };
     if start == 0 {
-        return Err(format!("fib range requires start > 0, got {}..{}", start, end_raw));
+        return Err(format!("fib range requires start > 0, got {}..{}", start, end));
     }
     if start > end {
         return Ok(Vec::new());
@@ -945,6 +975,57 @@ fn parse_mul_range(spec: &str, max_count: u64) -> Result<Vec<(String, u64)>, Str
         if val_f as u64 == val {
             val_f = (val + 1) as f64;
         }
+    }
+    Ok(result)
+}
+
+/// Generate a linear (additive-step) sequence within `[start, end]`,
+/// capped at `max_count`. Accepts both `linear:start..end/step` and
+/// `linear:start/step` (open-ended, end resolved to `max_count - 1`).
+///
+/// Mirrors the open-ended-by-default style of `mul:start/factor` so a
+/// spec stored in dataset.yaml stays independent of the dataset's exact
+/// cardinality and resolves at runtime.
+fn parse_linear_range(spec: &str, max_count: u64) -> Result<Vec<(String, u64)>, String> {
+    let (range_part, step_str) = spec.split_once('/').ok_or_else(|| {
+        format!(
+            "invalid linear spec '{}': expected linear:start/step or linear:start..end/step",
+            spec,
+        )
+    })?;
+    let (start, explicit_end) = if let Some((start_str, end_str)) = range_part.split_once("..") {
+        (
+            parse_number_with_suffix(start_str.trim())?,
+            Some(parse_number_with_suffix(end_str.trim())?),
+        )
+    } else {
+        (parse_number_with_suffix(range_part.trim())?, None)
+    };
+    let end = match (explicit_end, max_count) {
+        (Some(e), mc) if mc > 0 => e.min(mc - 1),
+        (Some(e), _) => e,
+        (None, mc) if mc > 0 => mc - 1,
+        (None, _) => return Err(format!(
+            "implicit upper bound form 'linear:{}' requires a known base count", spec)),
+    };
+    let step = parse_number_with_suffix(step_str.trim())?;
+    if step == 0 {
+        return Err(format!("linear step must be > 0 in '{}'", spec));
+    }
+    if start == 0 {
+        return Err(format!("linear start must be > 0 in '{}'", spec));
+    }
+    if start > end {
+        return Ok(Vec::new());
+    }
+    let mut result = Vec::new();
+    let mut v = start;
+    while v <= end {
+        if max_count == 0 || v < max_count {
+            result.push((format_count_with_suffix(v), v));
+        }
+        v = v.saturating_add(step);
+        if v == 0 { break; }
     }
     Ok(result)
 }
@@ -1527,6 +1608,48 @@ sized: [50m, 10m, 100m..300m/100m, 20m]
         for i in 0..10 {
             assert_eq!(pairs[i].1, (i as u64 + 1) * 40_000_000);
         }
+    }
+
+    #[test]
+    fn test_parse_fib_open_resolves_at_runtime() {
+        // No max → error (cannot resolve open-ended upper bound)
+        assert!(parse_sized_entry("fib:1m").is_err());
+        // With a max → caps at max - 1
+        let pairs = parse_sized_entry_impl("fib:1m", 100_000_000).unwrap();
+        assert!(!pairs.is_empty());
+        assert!(pairs.iter().all(|(_, v)| *v < 100_000_000));
+        assert_eq!(pairs[0].1, 1_000_000);
+    }
+
+    #[test]
+    fn test_parse_linear_open_resolves_at_runtime() {
+        assert!(parse_sized_entry("linear:10m/10m").is_err());
+        let pairs = parse_sized_entry_impl("linear:10m/10m", 100_000_000).unwrap();
+        // 10m, 20m, ..., 90m (100m excluded since v < max_count)
+        assert_eq!(pairs.len(), 9);
+        assert_eq!(pairs[0].1, 10_000_000);
+        assert_eq!(pairs[8].1, 90_000_000);
+    }
+
+    #[test]
+    fn test_parse_linear_explicit_range() {
+        let pairs = parse_sized_entry("linear:5m..20m/5m").unwrap();
+        assert_eq!(pairs.iter().map(|(_, v)| *v).collect::<Vec<_>>(),
+                   vec![5_000_000, 10_000_000, 15_000_000, 20_000_000]);
+    }
+
+    #[test]
+    fn test_composed_spec_with_open_ended_parts() {
+        // The exact spec the wizard now emits — must parse under a runtime
+        // cardinality and yield a non-empty mix of all three families.
+        let spec = "mul:1mi/2,fib:1m,linear:10m/10m";
+        let mut count = 0;
+        for entry in spec.split(',') {
+            let pairs = parse_sized_entry_impl(entry.trim(), 50_000_000).unwrap();
+            assert!(!pairs.is_empty(), "empty pairs for entry {}", entry);
+            count += pairs.len();
+        }
+        assert!(count > 10, "expected >10 total profiles, got {}", count);
     }
 
     #[test]

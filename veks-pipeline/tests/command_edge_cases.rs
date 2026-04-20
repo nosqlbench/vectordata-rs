@@ -28,7 +28,6 @@ fn test_ctx(dir: &Path) -> StreamContext {
         profile: String::new(),
         profile_names: vec![],
         workspace: dir.to_path_buf(),
-        scratch: dir.join(".scratch"),
         cache: dir.join(".cache"),
         defaults: IndexMap::new(),
         dry_run: false,
@@ -145,10 +144,10 @@ fn convert_empty_source() {
     let ws = tmp.path();
 
     // Write a 0-record fvec (empty file)
-    let source = ws.join("empty.fvec");
+    let source = ws.join("empty.fvecs");
     write_test_fvec(&source, &[]);
 
-    let output = ws.join("out.fvec");
+    let output = ws.join("out.fvecs");
     let mut opts = Options::new();
     opts.set("source", source.to_string_lossy().to_string());
     opts.set("output", output.to_string_lossy().to_string());
@@ -159,7 +158,7 @@ fn convert_empty_source() {
     // compute_dedup handles count==0 by producing empty output.
     let mut dedup_opts = Options::new();
     dedup_opts.set("source", source.to_string_lossy().to_string());
-    dedup_opts.set("output", ws.join("dedup_out.ivec").to_string_lossy().to_string());
+    dedup_opts.set("output", ws.join("dedup_out.ivecs").to_string_lossy().to_string());
 
     let mut dedup_op = veks_pipeline::pipeline::commands::compute_dedup::factory();
     let result = dedup_op.execute(&dedup_opts, &mut ctx);
@@ -178,11 +177,11 @@ fn convert_single_record() {
     let ws = tmp.path();
 
     // Write a 1-record fvec
-    let source = ws.join("single.fvec");
+    let source = ws.join("single.fvecs");
     write_test_fvec(&source, &[vec![1.0, 2.0, 3.0]]);
 
     // Use the extract command to copy that single record via range-based mode
-    let output = ws.join("out.fvec");
+    let output = ws.join("out.fvecs");
     let mut opts = Options::new();
     opts.set("source", source.to_string_lossy().to_string());
     opts.set("output", output.to_string_lossy().to_string());
@@ -207,7 +206,7 @@ fn shuffle_interval_one() {
     let tmp = tmp_dir();
     let ws = tmp.path();
 
-    let output = ws.join("shuffle.ivec");
+    let output = ws.join("shuffle.ivecs");
     let mut opts = Options::new();
     opts.set("output", output.to_string_lossy().to_string());
     opts.set("interval", "1");
@@ -232,7 +231,7 @@ fn shuffle_interval_zero() {
     let tmp = tmp_dir();
     let ws = tmp.path();
 
-    let output = ws.join("shuffle.ivec");
+    let output = ws.join("shuffle.ivecs");
     let mut opts = Options::new();
     opts.set("output", output.to_string_lossy().to_string());
     opts.set("interval", "0");
@@ -256,12 +255,12 @@ fn dedup_all_identical() {
     let ws = tmp.path();
 
     // 5 identical vectors
-    let source = ws.join("identical.fvec");
+    let source = ws.join("identical.fvecs");
     let v = vec![1.0f32, 2.0, 3.0];
     write_test_fvec(&source, &vec![v.clone(); 5]);
 
-    let output = ws.join("dedup.ivec");
-    let dups = ws.join("dedup_duplicates.ivec");
+    let output = ws.join("dedup.ivecs");
+    let dups = ws.join("dedup_duplicates.ivecs");
     let mut opts = Options::new();
     opts.set("source", source.to_string_lossy().to_string());
     opts.set("output", output.to_string_lossy().to_string());
@@ -293,7 +292,7 @@ fn dedup_all_unique() {
     let ws = tmp.path();
 
     // 5 distinct vectors
-    let source = ws.join("unique.fvec");
+    let source = ws.join("unique.fvecs");
     write_test_fvec(&source, &[
         vec![1.0, 0.0, 0.0],
         vec![0.0, 1.0, 0.0],
@@ -302,8 +301,8 @@ fn dedup_all_unique() {
         vec![5.0, 6.0, 7.0],
     ]);
 
-    let output = ws.join("dedup.ivec");
-    let dups = ws.join("dedup_duplicates.ivec");
+    let output = ws.join("dedup.ivecs");
+    let dups = ws.join("dedup_duplicates.ivecs");
     let mut opts = Options::new();
     opts.set("source", source.to_string_lossy().to_string());
     opts.set("output", output.to_string_lossy().to_string());
@@ -332,11 +331,11 @@ fn dedup_single_vector() {
     let tmp = tmp_dir();
     let ws = tmp.path();
 
-    let source = ws.join("single.fvec");
+    let source = ws.join("single.fvecs");
     write_test_fvec(&source, &[vec![42.0, 0.5, -1.0]]);
 
-    let output = ws.join("dedup.ivec");
-    let dups = ws.join("dedup_duplicates.ivec");
+    let output = ws.join("dedup.ivecs");
+    let dups = ws.join("dedup_duplicates.ivecs");
     let mut opts = Options::new();
     opts.set("source", source.to_string_lossy().to_string());
     opts.set("output", output.to_string_lossy().to_string());
@@ -366,7 +365,7 @@ fn zeros_all_zeros() {
     let ws = tmp.path();
 
     // 4 all-zero vectors
-    let source = ws.join("allzeros.fvec");
+    let source = ws.join("allzeros.fvecs");
     write_test_fvec(&source, &[
         vec![0.0, 0.0, 0.0],
         vec![0.0, 0.0, 0.0],
@@ -374,7 +373,7 @@ fn zeros_all_zeros() {
         vec![0.0, 0.0, 0.0],
     ]);
 
-    let output = ws.join("zeros.ivec");
+    let output = ws.join("zeros.ivecs");
     let mut opts = Options::new();
     opts.set("source", source.to_string_lossy().to_string());
     opts.set("output", output.to_string_lossy().to_string());
@@ -399,14 +398,14 @@ fn zeros_no_zeros() {
     let tmp = tmp_dir();
     let ws = tmp.path();
 
-    let source = ws.join("nonzero.fvec");
+    let source = ws.join("nonzero.fvecs");
     write_test_fvec(&source, &[
         vec![1.0, 2.0, 3.0],
         vec![4.0, 5.0, 6.0],
         vec![7.0, 8.0, 9.0],
     ]);
 
-    let output = ws.join("zeros.ivec");
+    let output = ws.join("zeros.ivecs");
     let mut opts = Options::new();
     opts.set("source", source.to_string_lossy().to_string());
     opts.set("output", output.to_string_lossy().to_string());
@@ -431,16 +430,16 @@ fn ordinals_empty_exclusion() {
     let ws = tmp.path();
 
     // Source: ordinal index with 5 entries
-    let source = ws.join("ordinals.ivec");
+    let source = ws.join("ordinals.ivecs");
     write_test_ivec_1d(&source, &[0, 1, 2, 3, 4]);
 
     // Empty dup and zero files
-    let dups = ws.join("dups.ivec");
+    let dups = ws.join("dups.ivecs");
     write_test_ivec_1d(&dups, &[]);
-    let zeros = ws.join("zeros.ivec");
+    let zeros = ws.join("zeros.ivecs");
     write_test_ivec_1d(&zeros, &[]);
 
-    let output = ws.join("clean.ivec");
+    let output = ws.join("clean.ivecs");
     let mut opts = Options::new();
     opts.set("source", source.to_string_lossy().to_string());
     opts.set("output", output.to_string_lossy().to_string());
@@ -467,14 +466,14 @@ fn ordinals_all_excluded() {
     let ws = tmp.path();
 
     // Source: ordinal index with 3 entries
-    let source = ws.join("ordinals.ivec");
+    let source = ws.join("ordinals.ivecs");
     write_test_ivec_1d(&source, &[0, 1, 2]);
 
     // Mark all as duplicates
-    let dups = ws.join("dups.ivec");
+    let dups = ws.join("dups.ivecs");
     write_test_ivec_1d(&dups, &[0, 1, 2]);
 
-    let output = ws.join("clean.ivec");
+    let output = ws.join("clean.ivecs");
     let mut opts = Options::new();
     opts.set("source", source.to_string_lossy().to_string());
     opts.set("output", output.to_string_lossy().to_string());
@@ -500,7 +499,7 @@ fn extract_empty_range() {
     let ws = tmp.path();
 
     // Source: 5-record fvec
-    let source = ws.join("base.fvec");
+    let source = ws.join("base.fvecs");
     write_test_fvec(&source, &[
         vec![1.0, 0.0],
         vec![2.0, 0.0],
@@ -509,7 +508,7 @@ fn extract_empty_range() {
         vec![5.0, 0.0],
     ]);
 
-    let output = ws.join("out.fvec");
+    let output = ws.join("out.fvecs");
     let mut opts = Options::new();
     opts.set("source", source.to_string_lossy().to_string());
     opts.set("output", output.to_string_lossy().to_string());
@@ -536,17 +535,17 @@ fn knn_k_exceeds_count() {
     let ws = tmp.path();
 
     // 3 base vectors, 1 query vector, k=10
-    let base = ws.join("base.fvec");
+    let base = ws.join("base.fvecs");
     write_test_fvec(&base, &[
         vec![1.0, 0.0],
         vec![0.0, 1.0],
         vec![1.0, 1.0],
     ]);
-    let query = ws.join("query.fvec");
+    let query = ws.join("query.fvecs");
     write_test_fvec(&query, &[vec![0.0, 0.0]]);
 
-    let indices = ws.join("indices.ivec");
-    let distances = ws.join("distances.fvec");
+    let indices = ws.join("indices.ivecs");
+    let distances = ws.join("distances.fvecs");
     let mut opts = Options::new();
     opts.set("base", base.to_string_lossy().to_string());
     opts.set("query", query.to_string_lossy().to_string());
@@ -587,13 +586,13 @@ fn knn_identical_vectors() {
 
     // 5 identical base vectors and 1 query (same vector)
     let v = vec![1.0f32, 2.0, 3.0];
-    let base = ws.join("base.fvec");
+    let base = ws.join("base.fvecs");
     write_test_fvec(&base, &vec![v.clone(); 5]);
-    let query = ws.join("query.fvec");
+    let query = ws.join("query.fvecs");
     write_test_fvec(&query, &[v]);
 
-    let indices = ws.join("indices.ivec");
-    let distances = ws.join("distances.fvec");
+    let indices = ws.join("indices.ivecs");
+    let distances = ws.join("distances.fvecs");
     let mut opts = Options::new();
     opts.set("base", base.to_string_lossy().to_string());
     opts.set("query", query.to_string_lossy().to_string());
@@ -633,10 +632,10 @@ fn convert_with_fraction() {
     for i in 0..100usize {
         vecs.push(vec![i as f32, (i*2) as f32, (i*3) as f32, (i*4) as f32]);
     }
-    let fvec = ws.join("input.fvec");
+    let fvec = ws.join("input.fvecs");
     write_test_fvec(&fvec, &vecs);
 
-    let output = ws.join("output.fvec");
+    let output = ws.join("output.fvecs");
     let mut opts = Options::new();
     opts.set("source", fvec.to_string_lossy().to_string());
     opts.set("output", output.to_string_lossy().to_string());
@@ -663,14 +662,14 @@ fn convert_f32_to_f16() {
     let ws = tmp.path();
     let mut ctx = test_ctx(ws);
 
-    let source = ws.join("input.fvec");
+    let source = ws.join("input.fvecs");
     write_test_fvec(&source, &[
         vec![1.0, 2.0, 3.0],
         vec![4.0, 5.0, 6.0],
         vec![7.0, 8.0, 9.0],
     ]);
 
-    let output = ws.join("output.mvec");
+    let output = ws.join("output.mvecs");
     let mut opts = Options::new();
     opts.set("source", source.to_string_lossy().to_string());
     opts.set("output", output.to_string_lossy().to_string());
@@ -717,14 +716,14 @@ fn convert_identity_same_format() {
     let ws = tmp.path();
     let mut ctx = test_ctx(ws);
 
-    let source = ws.join("input.fvec");
+    let source = ws.join("input.fvecs");
     let vecs = vec![
         vec![1.0f32, 2.0, 3.0],
         vec![4.0, 5.0, 6.0],
     ];
     write_test_fvec(&source, &vecs);
 
-    let output = ws.join("output.fvec");
+    let output = ws.join("output.fvecs");
     let mut opts = Options::new();
     opts.set("source", source.to_string_lossy().to_string());
     opts.set("output", output.to_string_lossy().to_string());
@@ -750,12 +749,12 @@ fn dedup_two_vectors_identical() {
     let ws = tmp.path();
     let mut ctx = test_ctx(ws);
 
-    let source = ws.join("two_ident.fvec");
+    let source = ws.join("two_ident.fvecs");
     let v = vec![1.0f32, 2.0, 3.0];
     write_test_fvec(&source, &[v.clone(), v]);
 
-    let output = ws.join("dedup.ivec");
-    let dups = ws.join("dedup_duplicates.ivec");
+    let output = ws.join("dedup.ivecs");
+    let dups = ws.join("dedup_duplicates.ivecs");
     let mut opts = Options::new();
     opts.set("source", source.to_string_lossy().to_string());
     opts.set("output", output.to_string_lossy().to_string());
@@ -786,7 +785,7 @@ fn dedup_already_sorted() {
     let mut ctx = test_ctx(ws);
 
     // Vectors already in lexicographic order
-    let source = ws.join("sorted.fvec");
+    let source = ws.join("sorted.fvecs");
     write_test_fvec(&source, &[
         vec![0.0, 0.0, 1.0],
         vec![0.0, 1.0, 0.0],
@@ -794,8 +793,8 @@ fn dedup_already_sorted() {
         vec![1.0, 1.0, 1.0],
     ]);
 
-    let output = ws.join("dedup.ivec");
-    let dups = ws.join("dedup_duplicates.ivec");
+    let output = ws.join("dedup.ivecs");
+    let dups = ws.join("dedup_duplicates.ivecs");
     let mut opts = Options::new();
     opts.set("source", source.to_string_lossy().to_string());
     opts.set("output", output.to_string_lossy().to_string());
@@ -826,8 +825,8 @@ fn shuffle_deterministic() {
 
     let registry = veks_pipeline::pipeline::registry::CommandRegistry::with_builtins();
 
-    let out1 = ws.join("shuffle_a.ivec");
-    let out2 = ws.join("shuffle_b.ivec");
+    let out1 = ws.join("shuffle_a.ivecs");
+    let out2 = ws.join("shuffle_b.ivecs");
 
     for out in [&out1, &out2] {
         let mut opts = Options::new();
@@ -858,10 +857,10 @@ fn shuffle_with_ordinals() {
     let mut ctx = test_ctx(ws);
 
     // Write an ordinals file with values [10, 20, 30, 40, 50]
-    let ordinals_path = ws.join("ordinals.ivec");
+    let ordinals_path = ws.join("ordinals.ivecs");
     write_test_ivec_1d(&ordinals_path, &[10, 20, 30, 40, 50]);
 
-    let output = ws.join("shuffled.ivec");
+    let output = ws.join("shuffled.ivecs");
     let mut opts = Options::new();
     opts.set("output", output.to_string_lossy().to_string());
     opts.set("interval", "5");
@@ -894,7 +893,7 @@ fn extract_full_range() {
     let ws = tmp.path();
     let mut ctx = test_ctx(ws);
 
-    let source = ws.join("base.fvec");
+    let source = ws.join("base.fvecs");
     let vecs = vec![
         vec![1.0f32, 2.0],
         vec![3.0, 4.0],
@@ -903,7 +902,7 @@ fn extract_full_range() {
     ];
     write_test_fvec(&source, &vecs);
 
-    let output = ws.join("out.fvec");
+    let output = ws.join("out.fvecs");
     let mut opts = Options::new();
     opts.set("source", source.to_string_lossy().to_string());
     opts.set("output", output.to_string_lossy().to_string());
@@ -929,11 +928,11 @@ fn extract_single_record_range() {
     let ws = tmp.path();
     let mut ctx = test_ctx(ws);
 
-    let source = ws.join("base.fvec");
+    let source = ws.join("base.fvecs");
     let vecs: Vec<Vec<f32>> = (0..10).map(|i| vec![i as f32, (i * 10) as f32]).collect();
     write_test_fvec(&source, &vecs);
 
-    let output = ws.join("out.fvec");
+    let output = ws.join("out.fvecs");
     let mut opts = Options::new();
     opts.set("source", source.to_string_lossy().to_string());
     opts.set("output", output.to_string_lossy().to_string());
@@ -961,18 +960,18 @@ fn knn_single_query() {
     let mut ctx = test_ctx(ws);
 
     // 10 base vectors, dim=3
-    let base_path = ws.join("base.fvec");
+    let base_path = ws.join("base.fvecs");
     let base_vecs: Vec<Vec<f32>> = (0..10)
         .map(|i| vec![i as f32, (i * 2) as f32, (i * 3) as f32])
         .collect();
     write_test_fvec(&base_path, &base_vecs);
 
     // 1 query vector
-    let query_path = ws.join("query.fvec");
+    let query_path = ws.join("query.fvecs");
     write_test_fvec(&query_path, &[vec![0.0, 0.0, 0.0]]);
 
-    let indices = ws.join("indices.ivec");
-    let distances = ws.join("distances.fvec");
+    let indices = ws.join("indices.ivecs");
+    let distances = ws.join("distances.fvecs");
     let mut opts = Options::new();
     opts.set("base", base_path.to_string_lossy().to_string());
     opts.set("query", query_path.to_string_lossy().to_string());
@@ -1005,7 +1004,7 @@ fn knn_cosine_metric() {
     let mut ctx = test_ctx(ws);
 
     // 5 base vectors with non-zero components (avoid zero-norm issues)
-    let base_path = ws.join("base.fvec");
+    let base_path = ws.join("base.fvecs");
     write_test_fvec(&base_path, &[
         vec![1.0, 0.0, 0.0],
         vec![0.0, 1.0, 0.0],
@@ -1015,14 +1014,14 @@ fn knn_cosine_metric() {
     ]);
 
     // 2 queries
-    let query_path = ws.join("query.fvec");
+    let query_path = ws.join("query.fvecs");
     write_test_fvec(&query_path, &[
         vec![1.0, 0.0, 0.0],
         vec![0.0, 0.0, 1.0],
     ]);
 
-    let indices = ws.join("indices.ivec");
-    let distances = ws.join("distances.fvec");
+    let indices = ws.join("indices.ivecs");
+    let distances = ws.join("distances.fvecs");
     let mut opts = Options::new();
     opts.set("base", base_path.to_string_lossy().to_string());
     opts.set("query", query_path.to_string_lossy().to_string());
@@ -1063,7 +1062,7 @@ fn zeros_single_zero_first() {
     let ws = tmp.path();
     let mut ctx = test_ctx(ws);
 
-    let source = ws.join("first_zero.fvec");
+    let source = ws.join("first_zero.fvecs");
     write_test_fvec(&source, &[
         vec![0.0, 0.0, 0.0],  // index 0: zero
         vec![1.0, 2.0, 3.0],
@@ -1071,7 +1070,7 @@ fn zeros_single_zero_first() {
         vec![7.0, 8.0, 9.0],
     ]);
 
-    let output = ws.join("zeros.ivec");
+    let output = ws.join("zeros.ivecs");
     let mut opts = Options::new();
     opts.set("source", source.to_string_lossy().to_string());
     opts.set("output", output.to_string_lossy().to_string());
@@ -1097,7 +1096,7 @@ fn zeros_single_zero_last() {
     let ws = tmp.path();
     let mut ctx = test_ctx(ws);
 
-    let source = ws.join("last_zero.fvec");
+    let source = ws.join("last_zero.fvecs");
     write_test_fvec(&source, &[
         vec![1.0, 2.0, 3.0],
         vec![4.0, 5.0, 6.0],
@@ -1105,7 +1104,7 @@ fn zeros_single_zero_last() {
         vec![0.0, 0.0, 0.0],  // index 3: zero
     ]);
 
-    let output = ws.join("zeros.ivec");
+    let output = ws.join("zeros.ivecs");
     let mut opts = Options::new();
     opts.set("source", source.to_string_lossy().to_string());
     opts.set("output", output.to_string_lossy().to_string());
@@ -1143,11 +1142,11 @@ fn dedup_prefix_group_ordering() {
     // vectors[0] has v[15]=5, vectors[1] has v[15]=4, ..., vectors[4] has v[15]=1
     // Expected sorted order: v[15]=1 < 2 < 3 < 4 < 5 → indices [4, 3, 2, 1, 0]
 
-    let source = ws.join("prefix_group.fvec");
+    let source = ws.join("prefix_group.fvecs");
     write_test_fvec(&source, &vectors);
 
-    let output = ws.join("sorted.ivec");
-    let dups = ws.join("dups.ivec");
+    let output = ws.join("sorted.ivecs");
+    let dups = ws.join("dups.ivecs");
 
     let mut opts = Options::new();
     opts.set("source", source.to_string_lossy().to_string());
@@ -1179,15 +1178,15 @@ fn analyze_find_duplicates_basic() {
     let ws = tmp.path();
 
     // Vectors: 0==1 (dup), 2 unique, 3==4==5 (triple dup)
-    write_test_fvec(&ws.join("source.fvec"), &[
+    write_test_fvec(&ws.join("source.fvecs"), &[
         vec![1.0, 2.0], vec![1.0, 2.0],
         vec![3.0, 4.0],
         vec![5.0, 6.0], vec![5.0, 6.0], vec![5.0, 6.0],
     ]);
 
     let mut opts = Options::new();
-    opts.set("source", ws.join("source.fvec").to_string_lossy().to_string());
-    opts.set("output", ws.join("dups.ivec").to_string_lossy().to_string());
+    opts.set("source", ws.join("source.fvecs").to_string_lossy().to_string());
+    opts.set("output", ws.join("dups.ivecs").to_string_lossy().to_string());
 
     let registry = veks_pipeline::pipeline::registry::CommandRegistry::with_builtins();
     let factory = registry.get("analyze find-duplicates").unwrap();
@@ -1204,13 +1203,13 @@ fn analyze_find_duplicates_no_dups() {
     let tmp = tmp_dir();
     let ws = tmp.path();
 
-    write_test_fvec(&ws.join("source.fvec"), &[
+    write_test_fvec(&ws.join("source.fvecs"), &[
         vec![1.0, 2.0], vec![3.0, 4.0], vec![5.0, 6.0],
     ]);
 
     let mut opts = Options::new();
-    opts.set("source", ws.join("source.fvec").to_string_lossy().to_string());
-    opts.set("output", ws.join("dups.ivec").to_string_lossy().to_string());
+    opts.set("source", ws.join("source.fvecs").to_string_lossy().to_string());
+    opts.set("output", ws.join("dups.ivecs").to_string_lossy().to_string());
 
     let registry = veks_pipeline::pipeline::registry::CommandRegistry::with_builtins();
     let factory = registry.get("analyze find-duplicates").unwrap();
@@ -1229,7 +1228,7 @@ fn analyze_find_zeros_mixed() {
     let tmp = tmp_dir();
     let ws = tmp.path();
 
-    write_test_fvec(&ws.join("source.fvec"), &[
+    write_test_fvec(&ws.join("source.fvecs"), &[
         vec![1.0, 2.0],
         vec![0.0, 0.0],  // zero
         vec![3.0, 4.0],
@@ -1238,7 +1237,7 @@ fn analyze_find_zeros_mixed() {
     ]);
 
     let mut opts = Options::new();
-    opts.set("source", ws.join("source.fvec").to_string_lossy().to_string());
+    opts.set("source", ws.join("source.fvecs").to_string_lossy().to_string());
 
     let registry = veks_pipeline::pipeline::registry::CommandRegistry::with_builtins();
     let factory = registry.get("analyze find-zeros").unwrap();
@@ -1255,12 +1254,12 @@ fn analyze_find_zeros_none() {
     let tmp = tmp_dir();
     let ws = tmp.path();
 
-    write_test_fvec(&ws.join("source.fvec"), &[
+    write_test_fvec(&ws.join("source.fvecs"), &[
         vec![1.0, 0.0], vec![0.0, 1.0],
     ]);
 
     let mut opts = Options::new();
-    opts.set("source", ws.join("source.fvec").to_string_lossy().to_string());
+    opts.set("source", ws.join("source.fvecs").to_string_lossy().to_string());
 
     let registry = veks_pipeline::pipeline::registry::CommandRegistry::with_builtins();
     let factory = registry.get("analyze find-zeros").unwrap();
@@ -1280,7 +1279,7 @@ fn analyze_norms_basic() {
     let ws = tmp.path();
 
     // Mix of normalized and unnormalized vectors
-    write_test_fvec(&ws.join("source.fvec"), &[
+    write_test_fvec(&ws.join("source.fvecs"), &[
         vec![1.0, 0.0, 0.0],    // norm = 1
         vec![0.0, 1.0, 0.0],    // norm = 1
         vec![3.0, 4.0, 0.0],    // norm = 5
@@ -1288,7 +1287,7 @@ fn analyze_norms_basic() {
     ]);
 
     let mut opts = Options::new();
-    opts.set("source", ws.join("source.fvec").to_string_lossy().to_string());
+    opts.set("source", ws.join("source.fvecs").to_string_lossy().to_string());
 
     let registry = veks_pipeline::pipeline::registry::CommandRegistry::with_builtins();
     let factory = registry.get("analyze display-norms").unwrap();
@@ -1309,14 +1308,14 @@ fn analyze_measure_normals_unit_vectors() {
 
     // All unit vectors
     let s = 1.0f32 / 2.0f32.sqrt();
-    write_test_fvec(&ws.join("source.fvec"), &[
+    write_test_fvec(&ws.join("source.fvecs"), &[
         vec![1.0, 0.0, 0.0],
         vec![0.0, 1.0, 0.0],
         vec![s, s, 0.0],
     ]);
 
     let mut opts = Options::new();
-    opts.set("source", ws.join("source.fvec").to_string_lossy().to_string());
+    opts.set("source", ws.join("source.fvecs").to_string_lossy().to_string());
     opts.set("sample", "3");
 
     let registry = veks_pipeline::pipeline::registry::CommandRegistry::with_builtins();
@@ -1335,13 +1334,13 @@ fn analyze_measure_normals_unnormalized() {
     let tmp = tmp_dir();
     let ws = tmp.path();
 
-    write_test_fvec(&ws.join("source.fvec"), &[
+    write_test_fvec(&ws.join("source.fvecs"), &[
         vec![3.0, 4.0],  // norm = 5
         vec![5.0, 12.0], // norm = 13
     ]);
 
     let mut opts = Options::new();
-    opts.set("source", ws.join("source.fvec").to_string_lossy().to_string());
+    opts.set("source", ws.join("source.fvecs").to_string_lossy().to_string());
     opts.set("sample", "2");
 
     let registry = veks_pipeline::pipeline::registry::CommandRegistry::with_builtins();
@@ -1363,13 +1362,13 @@ fn analyze_describe_basic() {
     let tmp = tmp_dir();
     let ws = tmp.path();
 
-    write_test_fvec(&ws.join("source.fvec"), &[
+    write_test_fvec(&ws.join("source.fvecs"), &[
         vec![1.0, 2.0, 3.0],
         vec![4.0, 5.0, 6.0],
     ]);
 
     let mut opts = Options::new();
-    opts.set("source", ws.join("source.fvec").to_string_lossy().to_string());
+    opts.set("source", ws.join("source.fvecs").to_string_lossy().to_string());
 
     let registry = veks_pipeline::pipeline::registry::CommandRegistry::with_builtins();
     let factory = registry.get("analyze describe").unwrap();
@@ -1388,16 +1387,16 @@ fn analyze_overlap_with_shared_vectors() {
     let tmp = tmp_dir();
     let ws = tmp.path();
 
-    write_test_fvec(&ws.join("a.fvec"), &[
+    write_test_fvec(&ws.join("a.fvecs"), &[
         vec![1.0, 2.0], vec![3.0, 4.0], vec![5.0, 6.0],
     ]);
-    write_test_fvec(&ws.join("b.fvec"), &[
+    write_test_fvec(&ws.join("b.fvecs"), &[
         vec![3.0, 4.0], vec![7.0, 8.0], vec![5.0, 6.0],
     ]);
 
     let mut opts = Options::new();
-    opts.set("base", ws.join("a.fvec").to_string_lossy().to_string());
-    opts.set("query", ws.join("b.fvec").to_string_lossy().to_string());
+    opts.set("base", ws.join("a.fvecs").to_string_lossy().to_string());
+    opts.set("query", ws.join("b.fvecs").to_string_lossy().to_string());
 
     let registry = veks_pipeline::pipeline::registry::CommandRegistry::with_builtins();
     let factory = registry.get("analyze overlap").unwrap();
@@ -1416,12 +1415,12 @@ fn analyze_overlap_no_shared() {
     let tmp = tmp_dir();
     let ws = tmp.path();
 
-    write_test_fvec(&ws.join("a.fvec"), &[vec![1.0, 2.0]]);
-    write_test_fvec(&ws.join("b.fvec"), &[vec![3.0, 4.0]]);
+    write_test_fvec(&ws.join("a.fvecs"), &[vec![1.0, 2.0]]);
+    write_test_fvec(&ws.join("b.fvecs"), &[vec![3.0, 4.0]]);
 
     let mut opts = Options::new();
-    opts.set("base", ws.join("a.fvec").to_string_lossy().to_string());
-    opts.set("query", ws.join("b.fvec").to_string_lossy().to_string());
+    opts.set("base", ws.join("a.fvecs").to_string_lossy().to_string());
+    opts.set("query", ws.join("b.fvecs").to_string_lossy().to_string());
 
     let registry = veks_pipeline::pipeline::registry::CommandRegistry::with_builtins();
     let factory = registry.get("analyze overlap").unwrap();
@@ -1440,14 +1439,14 @@ fn analyze_stats_basic() {
     let tmp = tmp_dir();
     let ws = tmp.path();
 
-    write_test_fvec(&ws.join("source.fvec"), &[
+    write_test_fvec(&ws.join("source.fvecs"), &[
         vec![1.0, 2.0, 3.0],
         vec![4.0, 5.0, 6.0],
         vec![7.0, 8.0, 9.0],
     ]);
 
     let mut opts = Options::new();
-    opts.set("source", ws.join("source.fvec").to_string_lossy().to_string());
+    opts.set("source", ws.join("source.fvecs").to_string_lossy().to_string());
 
     let registry = veks_pipeline::pipeline::registry::CommandRegistry::with_builtins();
     let factory = registry.get("analyze stats").unwrap();
@@ -1467,17 +1466,17 @@ fn verify_knn_groundtruth_correct() {
     let ws = tmp.path();
 
     // 4 base vectors, 2 queries, dim=2
-    write_test_fvec(&ws.join("base.fvec"), &[
+    write_test_fvec(&ws.join("base.fvecs"), &[
         vec![1.0, 0.0], vec![0.0, 1.0], vec![1.0, 1.0], vec![0.5, 0.5],
     ]);
-    write_test_fvec(&ws.join("query.fvec"), &[
+    write_test_fvec(&ws.join("query.fvecs"), &[
         vec![0.9, 0.1], vec![0.1, 0.9],
     ]);
 
     // Compute correct GT: for L2, nearest to (0.9,0.1) is (1,0)=idx0
     // nearest to (0.1,0.9) is (0,1)=idx1
     // GT ivec: each row = [k values]
-    let gt_path = ws.join("gt.ivec");
+    let gt_path = ws.join("gt.ivecs");
     {
         use std::io::Write;
         let mut f = std::fs::File::create(&gt_path).unwrap();
@@ -1492,9 +1491,9 @@ fn verify_knn_groundtruth_correct() {
     }
 
     let mut opts = Options::new();
-    opts.set("base", ws.join("base.fvec").to_string_lossy().to_string());
-    opts.set("query", ws.join("query.fvec").to_string_lossy().to_string());
-    opts.set("indices", ws.join("gt.ivec").to_string_lossy().to_string());
+    opts.set("base", ws.join("base.fvecs").to_string_lossy().to_string());
+    opts.set("query", ws.join("query.fvecs").to_string_lossy().to_string());
+    opts.set("indices", ws.join("gt.ivecs").to_string_lossy().to_string());
     opts.set("output", ws.join("report.json").to_string_lossy().to_string());
     opts.set("metric", "L2");
     opts.set("sample", "2");
@@ -1517,28 +1516,28 @@ fn single_vector_through_pipeline_commands() {
     let tmp = tmp_dir();
     let ws = tmp.path();
 
-    write_test_fvec(&ws.join("single.fvec"), &[vec![1.0, 2.0, 3.0]]);
+    write_test_fvec(&ws.join("single.fvecs"), &[vec![1.0, 2.0, 3.0]]);
 
     let registry = veks_pipeline::pipeline::registry::CommandRegistry::with_builtins();
     let mut ctx = test_ctx(ws);
 
     // analyze describe
     let mut opts = Options::new();
-    opts.set("source", ws.join("single.fvec").to_string_lossy().to_string());
+    opts.set("source", ws.join("single.fvecs").to_string_lossy().to_string());
     let mut cmd = registry.get("analyze describe").unwrap()();
     let r = cmd.execute(&opts, &mut ctx);
     assert_eq!(r.status, Status::Ok, "describe single: {}", r.message);
 
     // analyze norms
     let mut opts = Options::new();
-    opts.set("source", ws.join("single.fvec").to_string_lossy().to_string());
+    opts.set("source", ws.join("single.fvecs").to_string_lossy().to_string());
     let mut cmd = registry.get("analyze display-norms").unwrap()();
     let r = cmd.execute(&opts, &mut ctx);
     assert_eq!(r.status, Status::Ok, "norms single: {}", r.message);
 
     // analyze measure-normals
     let mut opts = Options::new();
-    opts.set("source", ws.join("single.fvec").to_string_lossy().to_string());
+    opts.set("source", ws.join("single.fvecs").to_string_lossy().to_string());
     opts.set("sample", "1");
     let mut cmd = registry.get("analyze measure-normals").unwrap()();
     let r = cmd.execute(&opts, &mut ctx);
@@ -1546,14 +1545,14 @@ fn single_vector_through_pipeline_commands() {
 
     // compute sort (dedup)
     let mut opts = Options::new();
-    opts.set("source", ws.join("single.fvec").to_string_lossy().to_string());
-    opts.set("output", ws.join("sorted.ivec").to_string_lossy().to_string());
-    opts.set("duplicates", ws.join("dups.ivec").to_string_lossy().to_string());
+    opts.set("source", ws.join("single.fvecs").to_string_lossy().to_string());
+    opts.set("output", ws.join("sorted.ivecs").to_string_lossy().to_string());
+    opts.set("duplicates", ws.join("dups.ivecs").to_string_lossy().to_string());
     let mut cmd = registry.get("compute sort").unwrap()();
     let r = cmd.execute(&opts, &mut ctx);
     assert_eq!(r.status, Status::Ok, "sort single: {}", r.message);
-    assert_eq!(read_ivec_1d(&ws.join("sorted.ivec")).len(), 1);
-    assert_eq!(read_ivec_1d(&ws.join("dups.ivec")).len(), 0);
+    assert_eq!(read_ivec_1d(&ws.join("sorted.ivecs")).len(), 1);
+    assert_eq!(read_ivec_1d(&ws.join("dups.ivecs")).len(), 0);
 }
 
 // ===========================================================================
@@ -1565,14 +1564,14 @@ fn dimension_one_vectors() {
     let tmp = tmp_dir();
     let ws = tmp.path();
 
-    write_test_fvec(&ws.join("source.fvec"), &[
+    write_test_fvec(&ws.join("source.fvecs"), &[
         vec![5.0], vec![1.0], vec![3.0], vec![1.0], vec![4.0],
     ]);
 
     let mut opts = Options::new();
-    opts.set("source", ws.join("source.fvec").to_string_lossy().to_string());
-    opts.set("output", ws.join("sorted.ivec").to_string_lossy().to_string());
-    opts.set("duplicates", ws.join("dups.ivec").to_string_lossy().to_string());
+    opts.set("source", ws.join("source.fvecs").to_string_lossy().to_string());
+    opts.set("output", ws.join("sorted.ivecs").to_string_lossy().to_string());
+    opts.set("duplicates", ws.join("dups.ivecs").to_string_lossy().to_string());
 
     let registry = veks_pipeline::pipeline::registry::CommandRegistry::with_builtins();
     let mut cmd = registry.get("compute sort").unwrap()();
@@ -1580,9 +1579,9 @@ fn dimension_one_vectors() {
     let r = cmd.execute(&opts, &mut ctx);
     assert_eq!(r.status, Status::Ok, "dim1 sort: {}", r.message);
 
-    let ordinals = read_ivec_1d(&ws.join("sorted.ivec"));
+    let ordinals = read_ivec_1d(&ws.join("sorted.ivecs"));
     assert_eq!(ordinals.len(), 4, "should have 4 unique (1 dup of 1.0)");
-    let dups = read_ivec_1d(&ws.join("dups.ivec"));
+    let dups = read_ivec_1d(&ws.join("dups.ivecs"));
     assert_eq!(dups.len(), 1, "should have 1 duplicate");
 }
 
@@ -1595,7 +1594,7 @@ fn nan_vectors_handled() {
     let tmp = tmp_dir();
     let ws = tmp.path();
 
-    write_test_fvec(&ws.join("source.fvec"), &[
+    write_test_fvec(&ws.join("source.fvecs"), &[
         vec![f32::NAN, 1.0],
         vec![1.0, 2.0],
         vec![f32::NAN, f32::NAN],
@@ -1603,7 +1602,7 @@ fn nan_vectors_handled() {
 
     // analyze norms should not crash
     let mut opts = Options::new();
-    opts.set("source", ws.join("source.fvec").to_string_lossy().to_string());
+    opts.set("source", ws.join("source.fvecs").to_string_lossy().to_string());
     let registry = veks_pipeline::pipeline::registry::CommandRegistry::with_builtins();
     let mut cmd = registry.get("analyze display-norms").unwrap()();
     let mut ctx = test_ctx(ws);
@@ -1612,9 +1611,9 @@ fn nan_vectors_handled() {
 
     // compute sort should not crash
     let mut opts = Options::new();
-    opts.set("source", ws.join("source.fvec").to_string_lossy().to_string());
-    opts.set("output", ws.join("sorted.ivec").to_string_lossy().to_string());
-    opts.set("duplicates", ws.join("dups.ivec").to_string_lossy().to_string());
+    opts.set("source", ws.join("source.fvecs").to_string_lossy().to_string());
+    opts.set("output", ws.join("sorted.ivecs").to_string_lossy().to_string());
+    opts.set("duplicates", ws.join("dups.ivecs").to_string_lossy().to_string());
     let mut cmd = registry.get("compute sort").unwrap()();
     let r = cmd.execute(&opts, &mut ctx);
     assert_eq!(r.status, Status::Ok, "sort with NaN: {}", r.message);
@@ -1636,12 +1635,12 @@ fn dedup_many_duplicates() {
             vecs.push(vec![group as f32, (group * 2) as f32, (group * 3) as f32]);
         }
     }
-    write_test_fvec(&ws.join("source.fvec"), &vecs);
+    write_test_fvec(&ws.join("source.fvecs"), &vecs);
 
     let mut opts = Options::new();
-    opts.set("source", ws.join("source.fvec").to_string_lossy().to_string());
-    opts.set("output", ws.join("sorted.ivec").to_string_lossy().to_string());
-    opts.set("duplicates", ws.join("dups.ivec").to_string_lossy().to_string());
+    opts.set("source", ws.join("source.fvecs").to_string_lossy().to_string());
+    opts.set("output", ws.join("sorted.ivecs").to_string_lossy().to_string());
+    opts.set("duplicates", ws.join("dups.ivecs").to_string_lossy().to_string());
 
     let registry = veks_pipeline::pipeline::registry::CommandRegistry::with_builtins();
     let mut cmd = registry.get("compute sort").unwrap()();
@@ -1649,8 +1648,8 @@ fn dedup_many_duplicates() {
     let r = cmd.execute(&opts, &mut ctx);
     assert_eq!(r.status, Status::Ok, "many dups: {}", r.message);
 
-    let unique = read_ivec_1d(&ws.join("sorted.ivec"));
-    let dups = read_ivec_1d(&ws.join("dups.ivec"));
+    let unique = read_ivec_1d(&ws.join("sorted.ivecs"));
+    let dups = read_ivec_1d(&ws.join("dups.ivecs"));
     // 10 groups → 10 unique after dedup. Group 0 is [0,0,0] (zero vector),
     // removed during zero detection → 9 unique in output.
     assert_eq!(unique.len(), 9, "should have 9 unique (10 groups - 1 zero)");
@@ -1666,16 +1665,16 @@ fn dedup_presorted_lexicographic() {
     let tmp = tmp_dir();
     let ws = tmp.path();
 
-    write_test_fvec(&ws.join("source.fvec"), &[
+    write_test_fvec(&ws.join("source.fvecs"), &[
         vec![0.0, 0.0, 1.0],
         vec![0.0, 1.0, 0.0],
         vec![1.0, 0.0, 0.0],
     ]);
 
     let mut opts = Options::new();
-    opts.set("source", ws.join("source.fvec").to_string_lossy().to_string());
-    opts.set("output", ws.join("sorted.ivec").to_string_lossy().to_string());
-    opts.set("duplicates", ws.join("dups.ivec").to_string_lossy().to_string());
+    opts.set("source", ws.join("source.fvecs").to_string_lossy().to_string());
+    opts.set("output", ws.join("sorted.ivecs").to_string_lossy().to_string());
+    opts.set("duplicates", ws.join("dups.ivecs").to_string_lossy().to_string());
 
     let registry = veks_pipeline::pipeline::registry::CommandRegistry::with_builtins();
     let mut cmd = registry.get("compute sort").unwrap()();
@@ -1683,7 +1682,7 @@ fn dedup_presorted_lexicographic() {
     let r = cmd.execute(&opts, &mut ctx);
     assert_eq!(r.status, Status::Ok, "already sorted: {}", r.message);
 
-    let unique = read_ivec_1d(&ws.join("sorted.ivec"));
+    let unique = read_ivec_1d(&ws.join("sorted.ivecs"));
     assert_eq!(unique.len(), 3);
     // Should be in same order since already sorted
     assert_eq!(unique, vec![0, 1, 2]);
@@ -1698,13 +1697,13 @@ fn extract_zero_length_range() {
     let tmp = tmp_dir();
     let ws = tmp.path();
 
-    write_test_fvec(&ws.join("source.fvec"), &[
+    write_test_fvec(&ws.join("source.fvecs"), &[
         vec![1.0, 2.0], vec![3.0, 4.0], vec![5.0, 6.0],
     ]);
 
     let mut opts = Options::new();
-    opts.set("source", ws.join("source.fvec").to_string_lossy().to_string());
-    opts.set("output", ws.join("empty.fvec").to_string_lossy().to_string());
+    opts.set("source", ws.join("source.fvecs").to_string_lossy().to_string());
+    opts.set("output", ws.join("empty.fvecs").to_string_lossy().to_string());
     opts.set("range", "[0,0)");
 
     let registry = veks_pipeline::pipeline::registry::CommandRegistry::with_builtins();
@@ -1713,7 +1712,7 @@ fn extract_zero_length_range() {
     let r = cmd.execute(&opts, &mut ctx);
     assert_eq!(r.status, Status::Ok, "empty range: {}", r.message);
 
-    let result = read_fvec(&ws.join("empty.fvec"));
+    let result = read_fvec(&ws.join("empty.fvecs"));
     assert_eq!(result.len(), 0, "empty range should produce empty output");
 }
 
@@ -1726,13 +1725,13 @@ fn extract_range_beyond_end() {
     let tmp = tmp_dir();
     let ws = tmp.path();
 
-    write_test_fvec(&ws.join("source.fvec"), &[
+    write_test_fvec(&ws.join("source.fvecs"), &[
         vec![1.0, 2.0], vec![3.0, 4.0],
     ]);
 
     let mut opts = Options::new();
-    opts.set("source", ws.join("source.fvec").to_string_lossy().to_string());
-    opts.set("output", ws.join("out.fvec").to_string_lossy().to_string());
+    opts.set("source", ws.join("source.fvecs").to_string_lossy().to_string());
+    opts.set("output", ws.join("out.fvecs").to_string_lossy().to_string());
     opts.set("range", "[0,1000)");
 
     let registry = veks_pipeline::pipeline::registry::CommandRegistry::with_builtins();
@@ -1741,7 +1740,7 @@ fn extract_range_beyond_end() {
     let r = cmd.execute(&opts, &mut ctx);
     assert_eq!(r.status, Status::Ok, "beyond end: {}", r.message);
 
-    let result = read_fvec(&ws.join("out.fvec"));
+    let result = read_fvec(&ws.join("out.fvecs"));
     assert_eq!(result.len(), 2, "should clamp to actual file size");
 }
 
@@ -1755,7 +1754,7 @@ fn shuffle_trivial_single_element() {
     let ws = tmp.path();
 
     let mut opts = Options::new();
-    opts.set("output", ws.join("shuffle.ivec").to_string_lossy().to_string());
+    opts.set("output", ws.join("shuffle.ivecs").to_string_lossy().to_string());
     opts.set("interval", "1");
     opts.set("seed", "42");
 
@@ -1765,7 +1764,7 @@ fn shuffle_trivial_single_element() {
     let r = cmd.execute(&opts, &mut ctx);
     assert_eq!(r.status, Status::Ok, "shuffle 1: {}", r.message);
 
-    let values = read_ivec_1d(&ws.join("shuffle.ivec"));
+    let values = read_ivec_1d(&ws.join("shuffle.ivecs"));
     assert_eq!(values, vec![0], "single element shuffle should be [0]");
 }
 
@@ -1779,7 +1778,7 @@ fn gen_vectors_minimal() {
     let ws = tmp.path();
 
     let mut opts = Options::new();
-    opts.set("output", ws.join("minimal.fvec").to_string_lossy().to_string());
+    opts.set("output", ws.join("minimal.fvecs").to_string_lossy().to_string());
     opts.set("dimension", "1");
     opts.set("count", "1");
     opts.set("seed", "0");
@@ -1790,9 +1789,80 @@ fn gen_vectors_minimal() {
     let r = cmd.execute(&opts, &mut ctx);
     assert_eq!(r.status, Status::Ok, "minimal gen: {}", r.message);
 
-    let vecs = read_fvec(&ws.join("minimal.fvec"));
+    let vecs = read_fvec(&ws.join("minimal.fvecs"));
     assert_eq!(vecs.len(), 1);
     assert_eq!(vecs[0].len(), 1);
+}
+
+// ===========================================================================
+// transform convert: require_fast routing
+// ===========================================================================
+
+/// `require_fast: true` + `normalize: true` on a parquet source should
+/// surface as an explicit error rather than silently falling back to the
+/// per-record slow path. The check happens on options before any file
+/// I/O, so the test does not need a real parquet file.
+#[test]
+fn convert_require_fast_errors_on_normalize_blocker() {
+    let tmp = tmp_dir();
+    let ws = tmp.path();
+    let fake_parquet = ws.join("source.parquet");
+    std::fs::write(&fake_parquet, b"not really parquet").unwrap();
+
+    let mut opts = Options::new();
+    opts.set("source", fake_parquet.to_string_lossy().to_string());
+    opts.set("output", ws.join("out.fvecs").to_string_lossy().to_string());
+    opts.set("from", "parquet");
+    opts.set("to", "fvecs");
+    opts.set("normalize", "true");
+    opts.set("require_fast", "true");
+
+    let registry = veks_pipeline::pipeline::registry::CommandRegistry::with_builtins();
+    let mut cmd = registry.get("transform convert").unwrap()();
+    let mut ctx = test_ctx(ws);
+    let r = cmd.execute(&opts, &mut ctx);
+    assert_eq!(r.status, Status::Error, "expected error, got: {}", r.message);
+    assert!(
+        r.message.contains("require_fast"),
+        "error message should mention require_fast: {}", r.message,
+    );
+    assert!(
+        r.message.contains("normalize"),
+        "error message should explain normalize blocker: {}", r.message,
+    );
+}
+
+/// Same blocker without `require_fast` falls through silently to the slow
+/// path. The slow path will then fail to actually parse the fake parquet
+/// payload, but the failure is from the slow path's reader (not from the
+/// fast-path router).
+#[test]
+fn convert_normalize_alone_does_not_demand_fast_path() {
+    let tmp = tmp_dir();
+    let ws = tmp.path();
+    let fake_parquet = ws.join("source.parquet");
+    std::fs::write(&fake_parquet, b"not really parquet").unwrap();
+
+    let mut opts = Options::new();
+    opts.set("source", fake_parquet.to_string_lossy().to_string());
+    opts.set("output", ws.join("out.fvecs").to_string_lossy().to_string());
+    opts.set("from", "parquet");
+    opts.set("to", "fvecs");
+    opts.set("normalize", "true");
+    // require_fast NOT set
+
+    let registry = veks_pipeline::pipeline::registry::CommandRegistry::with_builtins();
+    let mut cmd = registry.get("transform convert").unwrap()();
+    let mut ctx = test_ctx(ws);
+    let r = cmd.execute(&opts, &mut ctx);
+    // Will error because the fake parquet can't be parsed by the slow path,
+    // but the error must NOT mention require_fast — that's the diagnostic
+    // signal that the fast-path router stayed out of the way.
+    assert_eq!(r.status, Status::Error, "expected error, got: {}", r.message);
+    assert!(
+        !r.message.contains("require_fast"),
+        "error must not mention require_fast: {}", r.message,
+    );
 }
 
 // ===========================================================================
@@ -1805,11 +1875,11 @@ fn convert_identity_fvec_to_fvec() {
     let ws = tmp.path();
 
     let original = vec![vec![1.0, 2.0, 3.0], vec![4.0, 5.0, 6.0]];
-    write_test_fvec(&ws.join("source.fvec"), &original);
+    write_test_fvec(&ws.join("source.fvecs"), &original);
 
     let mut opts = Options::new();
-    opts.set("source", ws.join("source.fvec").to_string_lossy().to_string());
-    opts.set("output", ws.join("copy.fvec").to_string_lossy().to_string());
+    opts.set("source", ws.join("source.fvecs").to_string_lossy().to_string());
+    opts.set("output", ws.join("copy.fvecs").to_string_lossy().to_string());
 
     let registry = veks_pipeline::pipeline::registry::CommandRegistry::with_builtins();
     let mut cmd = registry.get("transform convert").unwrap()();
@@ -1817,7 +1887,7 @@ fn convert_identity_fvec_to_fvec() {
     let r = cmd.execute(&opts, &mut ctx);
     assert_eq!(r.status, Status::Ok, "identity convert: {}", r.message);
 
-    let result = read_fvec(&ws.join("copy.fvec"));
+    let result = read_fvec(&ws.join("copy.fvecs"));
     assert_eq!(result, original, "identity conversion should preserve data");
 }
 
@@ -1831,12 +1901,12 @@ fn compare_identical_files() {
     let ws = tmp.path();
 
     let vecs = vec![vec![1.0, 2.0], vec![3.0, 4.0]];
-    write_test_fvec(&ws.join("a.fvec"), &vecs);
-    write_test_fvec(&ws.join("b.fvec"), &vecs);
+    write_test_fvec(&ws.join("a.fvecs"), &vecs);
+    write_test_fvec(&ws.join("b.fvecs"), &vecs);
 
     let mut opts = Options::new();
-    opts.set("original", ws.join("a.fvec").to_string_lossy().to_string());
-    opts.set("synthetic", ws.join("b.fvec").to_string_lossy().to_string());
+    opts.set("original", ws.join("a.fvecs").to_string_lossy().to_string());
+    opts.set("synthetic", ws.join("b.fvecs").to_string_lossy().to_string());
 
     let registry = veks_pipeline::pipeline::registry::CommandRegistry::with_builtins();
     let mut cmd = registry.get("analyze compare-files").unwrap()();
@@ -1854,12 +1924,12 @@ fn histogram_basic() {
     let tmp = tmp_dir();
     let ws = tmp.path();
 
-    write_test_fvec(&ws.join("source.fvec"), &[
+    write_test_fvec(&ws.join("source.fvecs"), &[
         vec![1.0, 2.0], vec![3.0, 4.0], vec![5.0, 6.0],
     ]);
 
     let mut opts = Options::new();
-    opts.set("source", ws.join("source.fvec").to_string_lossy().to_string());
+    opts.set("source", ws.join("source.fvecs").to_string_lossy().to_string());
     opts.set("dimension", "0");  // 0 = auto-detect from file
 
     let registry = veks_pipeline::pipeline::registry::CommandRegistry::with_builtins();
@@ -1900,11 +1970,11 @@ fn scalar_extract_u8_by_index() {
     write_scalar_u8(&ws.join("labels.u8"), &source);
 
     // Index: reorder to [5, 3, 7, 1] → expect [50, 30, 70, 10]
-    write_ivec_ordinals(&ws.join("shuffle.ivec"), &[5, 3, 7, 1]);
+    write_ivec_ordinals(&ws.join("shuffle.ivecs"), &[5, 3, 7, 1]);
 
     let mut opts = Options::new();
     opts.set("source", "labels.u8");
-    opts.set("ivec-file", "shuffle.ivec");
+    opts.set("ivec-file", "shuffle.ivecs");
     opts.set("output", "extracted.u8");
 
     let registry = veks_pipeline::pipeline::registry::CommandRegistry::with_builtins();
@@ -1954,11 +2024,11 @@ fn scalar_extract_i32_by_index() {
     std::fs::write(ws.join("values.i32"), &source).unwrap();
 
     // Index: [4, 2, 0] → expect [500, 300, 100]
-    write_ivec_ordinals(&ws.join("order.ivec"), &[4, 2, 0]);
+    write_ivec_ordinals(&ws.join("order.ivecs"), &[4, 2, 0]);
 
     let mut opts = Options::new();
     opts.set("source", "values.i32");
-    opts.set("ivec-file", "order.ivec");
+    opts.set("ivec-file", "order.ivecs");
     opts.set("output", "reordered.i32");
 
     let registry = veks_pipeline::pipeline::registry::CommandRegistry::with_builtins();
@@ -1986,12 +2056,12 @@ fn scalar_extract_u8_index_with_range() {
 
     // Index: full shuffle [9, 8, 7, 6, 5, 4, 3, 2, 1, 0]
     let ordinals: Vec<i32> = (0..10).rev().collect();
-    write_ivec_ordinals(&ws.join("shuffle.ivec"), &ordinals);
+    write_ivec_ordinals(&ws.join("shuffle.ivecs"), &ordinals);
 
     // Range: [0, 3) of the index → first 3 entries → ordinals [9, 8, 7]
     let mut opts = Options::new();
     opts.set("source", "data.u8");
-    opts.set("ivec-file", "shuffle.ivec");
+    opts.set("ivec-file", "shuffle.ivecs");
     opts.set("output", "slice.u8");
     opts.set("range", "[0,3)");
 
@@ -2016,7 +2086,7 @@ fn partition_profiles_u8_metadata() {
     let ws = tmp.path();
 
     // Base vectors: 20 vectors, dim=2
-    write_test_fvec(&ws.join("base.fvec"), &(0..20).map(|i|
+    write_test_fvec(&ws.join("base.fvecs"), &(0..20).map(|i|
         vec![(i + 1) as f32, (i * 2 + 1) as f32]
     ).collect::<Vec<_>>());
 
@@ -2025,13 +2095,13 @@ fn partition_profiles_u8_metadata() {
     std::fs::write(ws.join("labels.u8"), &labels).unwrap();
 
     // Query vectors: 5 vectors
-    write_test_fvec(&ws.join("query.fvec"), &(0..5).map(|i|
+    write_test_fvec(&ws.join("query.fvecs"), &(0..5).map(|i|
         vec![(i + 100) as f32, (i * 3 + 100) as f32]
     ).collect::<Vec<_>>());
 
     let mut opts = Options::new();
-    opts.set("base", "base.fvec");
-    opts.set("query", "query.fvec");
+    opts.set("base", "base.fvecs");
+    opts.set("query", "query.fvecs");
     opts.set("metadata", "labels.u8");
     opts.set("neighbors", "3");
     opts.set("metric", "L2");
@@ -2054,12 +2124,12 @@ fn partition_profiles_u8_metadata() {
     for i in 0..4 {
         let pdir = ws.join(format!("profiles/label_{}", i));
         assert!(pdir.exists(), "partition dir label_{} should exist", i);
-        assert!(pdir.join("base_vectors.fvec").exists(),
+        assert!(pdir.join("base_vectors.fvecs").exists(),
             "label_{}/base_vectors.fvec should exist", i);
     }
 
     // Each partition should have 5 vectors (20 / 4)
-    let data = std::fs::read(ws.join("profiles/label_0/base_vectors.fvec")).unwrap();
+    let data = std::fs::read(ws.join("profiles/label_0/base_vectors.fvecs")).unwrap();
     let dim = i32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
     let stride = 4 + dim * 4;
     let count = data.len() / stride;
@@ -2075,7 +2145,7 @@ fn partition_profiles_per_label_queries() {
     let ws = tmp.path();
 
     // Base vectors: 20 vectors, dim=2
-    write_test_fvec(&ws.join("base.fvec"), &(0..20).map(|i|
+    write_test_fvec(&ws.join("base.fvecs"), &(0..20).map(|i|
         vec![(i + 1) as f32, (i * 2 + 1) as f32]
     ).collect::<Vec<_>>());
 
@@ -2084,7 +2154,7 @@ fn partition_profiles_per_label_queries() {
     std::fs::write(ws.join("labels.u8"), &labels).unwrap();
 
     // Query vectors: 8 vectors, dim=2
-    write_test_fvec(&ws.join("query.fvec"), &(0..8).map(|i|
+    write_test_fvec(&ws.join("query.fvecs"), &(0..8).map(|i|
         vec![(i + 100) as f32, (i * 3 + 100) as f32]
     ).collect::<Vec<_>>());
 
@@ -2094,8 +2164,8 @@ fn partition_profiles_per_label_queries() {
     std::fs::write(ws.join("predicates.u8"), &predicates).unwrap();
 
     let mut opts = Options::new();
-    opts.set("base", "base.fvec");
-    opts.set("query", "query.fvec");
+    opts.set("base", "base.fvecs");
+    opts.set("query", "query.fvecs");
     opts.set("metadata", "labels.u8");
     opts.set("predicates", "predicates.u8");
     opts.set("neighbors", "3");
@@ -2117,7 +2187,7 @@ fn partition_profiles_per_label_queries() {
 
     // Each partition should have its own query_vectors.fvec (NOT a symlink)
     for i in 0..4 {
-        let qpath = ws.join(format!("profiles/label_{}/query_vectors.fvec", i));
+        let qpath = ws.join(format!("profiles/label_{}/query_vectors.fvecs", i));
         assert!(qpath.exists(), "label_{}/query_vectors.fvec should exist", i);
         assert!(!qpath.is_symlink(),
             "label_{}/query_vectors.fvec should NOT be a symlink — should be extracted per-label queries", i);
@@ -2140,12 +2210,12 @@ fn partition_profiles_slab_metadata() {
     let ws = tmp.path();
 
     // Base vectors: 30 vectors, dim=2
-    write_test_fvec(&ws.join("base.fvec"), &(0..30).map(|i|
+    write_test_fvec(&ws.join("base.fvecs"), &(0..30).map(|i|
         vec![(i + 1) as f32, (i * 2 + 1) as f32]
     ).collect::<Vec<_>>());
 
     // Query vectors: 5 vectors
-    write_test_fvec(&ws.join("query.fvec"), &(0..5).map(|i|
+    write_test_fvec(&ws.join("query.fvecs"), &(0..5).map(|i|
         vec![(i + 100) as f32, (i * 3 + 100) as f32]
     ).collect::<Vec<_>>());
 
@@ -2167,8 +2237,8 @@ fn partition_profiles_slab_metadata() {
 
     // Run partition-profiles with slab metadata
     let mut opts = Options::new();
-    opts.set("base", "base.fvec");
-    opts.set("query", "query.fvec");
+    opts.set("base", "base.fvecs");
+    opts.set("query", "query.fvecs");
     opts.set("metadata", "metadata.slab");
     opts.set("neighbors", "3");
     opts.set("metric", "L2");
@@ -2190,12 +2260,12 @@ fn partition_profiles_slab_metadata() {
     for i in 0..3 {
         let pdir = ws.join(format!("profiles/label_{}", i));
         assert!(pdir.exists(), "partition dir label_{} should exist", i);
-        assert!(pdir.join("base_vectors.fvec").exists(),
+        assert!(pdir.join("base_vectors.fvecs").exists(),
             "label_{}/base_vectors.fvec should exist", i);
     }
 
     // Each partition should have 10 vectors (30 / 3)
-    let data = std::fs::read(ws.join("profiles/label_0/base_vectors.fvec")).unwrap();
+    let data = std::fs::read(ws.join("profiles/label_0/base_vectors.fvecs")).unwrap();
     let dim = i32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
     let stride = 4 + dim * 4;
     let count = data.len() / stride;
@@ -2218,7 +2288,7 @@ fn partition_profiles_slab_pnode_predicates() {
     let ws = tmp.path();
 
     // Base vectors: 20 vectors, dim=2
-    write_test_fvec(&ws.join("base.fvec"), &(0..20).map(|i|
+    write_test_fvec(&ws.join("base.fvecs"), &(0..20).map(|i|
         vec![(i + 1) as f32, (i * 2 + 1) as f32]
     ).collect::<Vec<_>>());
 
@@ -2227,7 +2297,7 @@ fn partition_profiles_slab_pnode_predicates() {
     std::fs::write(ws.join("labels.u8"), &labels).unwrap();
 
     // Query vectors: 8 vectors, dim=2
-    write_test_fvec(&ws.join("query.fvec"), &(0..8).map(|i|
+    write_test_fvec(&ws.join("query.fvecs"), &(0..8).map(|i|
         vec![(i + 100) as f32, (i * 3 + 100) as f32]
     ).collect::<Vec<_>>());
 
@@ -2249,8 +2319,8 @@ fn partition_profiles_slab_pnode_predicates() {
     }
 
     let mut opts = Options::new();
-    opts.set("base", "base.fvec");
-    opts.set("query", "query.fvec");
+    opts.set("base", "base.fvecs");
+    opts.set("query", "query.fvecs");
     opts.set("metadata", "labels.u8");
     opts.set("predicates", "predicates.slab");
     opts.set("neighbors", "3");
@@ -2272,7 +2342,7 @@ fn partition_profiles_slab_pnode_predicates() {
 
     // Each partition should have per-label query_vectors.fvec (NOT a symlink)
     for i in 0..4 {
-        let qpath = ws.join(format!("profiles/label_{}/query_vectors.fvec", i));
+        let qpath = ws.join(format!("profiles/label_{}/query_vectors.fvecs", i));
         assert!(qpath.exists(), "label_{}/query_vectors.fvec should exist", i);
         assert!(!qpath.is_symlink(),
             "label_{}/query_vectors.fvec should NOT be a symlink — PNode predicates must produce extracted queries", i);
@@ -2295,7 +2365,7 @@ fn partition_profiles_replaces_symlinks_on_rerun() {
     let ws = tmp.path();
 
     // Base vectors: 10 vectors, dim=2
-    write_test_fvec(&ws.join("base.fvec"), &(0..10).map(|i|
+    write_test_fvec(&ws.join("base.fvecs"), &(0..10).map(|i|
         vec![(i + 1) as f32, (i * 2 + 1) as f32]
     ).collect::<Vec<_>>());
 
@@ -2304,7 +2374,7 @@ fn partition_profiles_replaces_symlinks_on_rerun() {
     std::fs::write(ws.join("labels.u8"), &labels).unwrap();
 
     // Query vectors: 4 vectors, dim=2
-    write_test_fvec(&ws.join("query.fvec"), &(0..4).map(|i|
+    write_test_fvec(&ws.join("query.fvecs"), &(0..4).map(|i|
         vec![(i + 100) as f32, (i * 3 + 100) as f32]
     ).collect::<Vec<_>>());
 
@@ -2320,15 +2390,15 @@ fn partition_profiles_replaces_symlinks_on_rerun() {
     for i in 0..2 {
         let pdir = ws.join(format!("profiles/label_{}", i));
         std::fs::create_dir_all(&pdir).unwrap();
-        std::os::unix::fs::symlink("../../query.fvec", pdir.join("query_vectors.fvec")).unwrap();
+        std::os::unix::fs::symlink("../../query.fvecs", pdir.join("query_vectors.fvecs")).unwrap();
     }
     // Verify symlinks exist before re-run
-    assert!(ws.join("profiles/label_0/query_vectors.fvec").symlink_metadata()
+    assert!(ws.join("profiles/label_0/query_vectors.fvecs").symlink_metadata()
         .unwrap().file_type().is_symlink());
 
     let mut opts = Options::new();
-    opts.set("base", "base.fvec");
-    opts.set("query", "query.fvec");
+    opts.set("base", "base.fvecs");
+    opts.set("query", "query.fvecs");
     opts.set("metadata", "labels.u8");
     opts.set("predicates", "predicates.u8");
     opts.set("neighbors", "3");
@@ -2345,7 +2415,7 @@ fn partition_profiles_replaces_symlinks_on_rerun() {
 
     // After re-run: symlinks must be gone, replaced by real files
     for i in 0..2 {
-        let qpath = ws.join(format!("profiles/label_{}/query_vectors.fvec", i));
+        let qpath = ws.join(format!("profiles/label_{}/query_vectors.fvecs", i));
         assert!(qpath.exists(), "label_{}/query_vectors.fvec should exist after rerun", i);
         assert!(!qpath.symlink_metadata().unwrap().file_type().is_symlink(),
             "label_{}/query_vectors.fvec must NOT be a symlink after rerun — symlink interlock failed", i);
@@ -2358,7 +2428,7 @@ fn partition_profiles_replaces_symlinks_on_rerun() {
     }
 
     // Verify the original query file was NOT corrupted
-    let orig_data = std::fs::read(ws.join("query.fvec")).unwrap();
+    let orig_data = std::fs::read(ws.join("query.fvecs")).unwrap();
     let dim = i32::from_le_bytes(orig_data[0..4].try_into().unwrap()) as usize;
     let stride = 4 + dim * 4;
     let orig_count = orig_data.len() / stride;
@@ -2374,7 +2444,7 @@ fn partition_profiles_auto_discovers_predicates() {
     let ws = tmp.path();
 
     // Base vectors: 20 vectors, dim=2
-    write_test_fvec(&ws.join("base.fvec"), &(0..20).map(|i|
+    write_test_fvec(&ws.join("base.fvecs"), &(0..20).map(|i|
         vec![(i + 1) as f32, (i * 2 + 1) as f32]
     ).collect::<Vec<_>>());
 
@@ -2383,7 +2453,7 @@ fn partition_profiles_auto_discovers_predicates() {
     std::fs::write(ws.join("labels.u8"), &labels).unwrap();
 
     // Query vectors: 8 vectors, dim=2
-    write_test_fvec(&ws.join("query.fvec"), &(0..8).map(|i|
+    write_test_fvec(&ws.join("query.fvecs"), &(0..8).map(|i|
         vec![(i + 100) as f32, (i * 3 + 100) as f32]
     ).collect::<Vec<_>>());
 
@@ -2410,8 +2480,8 @@ profiles:
 
     // Note: NO "predicates" option — auto-discovery must find it
     let mut opts = Options::new();
-    opts.set("base", "base.fvec");
-    opts.set("query", "query.fvec");
+    opts.set("base", "base.fvecs");
+    opts.set("query", "query.fvecs");
     opts.set("metadata", "labels.u8");
     opts.set("neighbors", "3");
     opts.set("metric", "L2");
@@ -2428,7 +2498,7 @@ profiles:
 
     // Each partition should have per-label queries, NOT symlinks
     for i in 0..4 {
-        let qpath = ws.join(format!("profiles/label_{}/query_vectors.fvec", i));
+        let qpath = ws.join(format!("profiles/label_{}/query_vectors.fvecs", i));
         assert!(qpath.exists(), "label_{}/query_vectors.fvec should exist", i);
         assert!(!qpath.symlink_metadata().unwrap().file_type().is_symlink(),
             "label_{}/query_vectors.fvec must NOT be a symlink — auto-discovery should have found predicates", i);
@@ -2468,7 +2538,7 @@ fn extract_fvec_by_predicate_index() {
     let ws = tmp.path();
 
     // Source: 10 vectors, dim=2
-    write_test_fvec(&ws.join("base.fvec"), &(0..10).map(|i|
+    write_test_fvec(&ws.join("base.fvecs"), &(0..10).map(|i|
         vec![(i + 1) as f32, (i * 2 + 1) as f32]
     ).collect::<Vec<_>>());
 
@@ -2476,7 +2546,7 @@ fn extract_fvec_by_predicate_index() {
     //   pred 0: ordinals [0, 2, 4]     → vectors 1, 3, 5
     //   pred 1: ordinals [1, 3, 5, 7]  → vectors 2, 4, 6, 8
     //   pred 2: ordinals [9]           → vector 10
-    write_test_ivvec(&ws.join("results.ivvec"), &[
+    write_test_ivvec(&ws.join("results.ivvecs"), &[
         vec![0, 2, 4],
         vec![1, 3, 5, 7],
         vec![9],
@@ -2485,10 +2555,10 @@ fn extract_fvec_by_predicate_index() {
     // Extract base vectors matching predicate 1 (ordinals [1,3,5,7])
     std::fs::create_dir_all(ws.join(".scratch")).unwrap();
     let mut opts = Options::new();
-    opts.set("source", "base.fvec");
-    opts.set("index-source", "results.ivvec");
+    opts.set("source", "base.fvecs");
+    opts.set("index-source", "results.ivvecs");
     opts.set("predicate-index", "1");
-    opts.set("output", "partition.fvec");
+    opts.set("output", "partition.fvecs");
 
     let registry = veks_pipeline::pipeline::registry::CommandRegistry::with_builtins();
     let mut cmd = registry.get("transform extract").unwrap()();
@@ -2497,7 +2567,7 @@ fn extract_fvec_by_predicate_index() {
     assert_eq!(r.status, Status::Ok, "predicate-index extract: {}", r.message);
 
     // Output should have 4 vectors (ordinals 1,3,5,7)
-    let data = std::fs::read(ws.join("partition.fvec")).unwrap();
+    let data = std::fs::read(ws.join("partition.fvecs")).unwrap();
     let dim = i32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
     assert_eq!(dim, 2);
     let stride = 4 + dim * 4;
@@ -2520,14 +2590,14 @@ fn extract_scalar_by_predicate_index() {
     write_scalar_u8(&ws.join("labels.u8"), &[10, 20, 30, 40, 50, 60, 70, 80, 90, 100]);
 
     // ivvec predicate results: pred 0 matches ordinals [2, 5, 8]
-    write_test_ivvec(&ws.join("results.ivvec"), &[
+    write_test_ivvec(&ws.join("results.ivvecs"), &[
         vec![2, 5, 8],
     ]);
 
     std::fs::create_dir_all(ws.join(".scratch")).unwrap();
     let mut opts = Options::new();
     opts.set("source", "labels.u8");
-    opts.set("index-source", "results.ivvec");
+    opts.set("index-source", "results.ivvecs");
     opts.set("predicate-index", "0");
     opts.set("output", "partition_labels.u8");
 
@@ -2637,8 +2707,8 @@ fn fuzz_missing_source_no_panic() {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut cmd = factory();
             let mut opts = Options::new();
-            opts.set("source", "/nonexistent/path/data.fvec");
-            opts.set("output", ws.join("out.fvec").to_string_lossy().to_string());
+            opts.set("source", "/nonexistent/path/data.fvecs");
+            opts.set("output", ws.join("out.fvecs").to_string_lossy().to_string());
             let mut ctx = test_ctx(ws);
             cmd.execute(&opts, &mut ctx)
         }));
@@ -2700,12 +2770,12 @@ fn fuzz_corrupt_file_no_panic() {
     std::fs::create_dir_all(ws.join(".cache")).unwrap();
 
     // Create files with garbage data (wrong format, truncated headers)
-    std::fs::write(ws.join("corrupt.fvec"), b"\x04\x00\x00\x00\x01").unwrap(); // dim=4 but only 1 data byte
-    std::fs::write(ws.join("corrupt.ivec"), b"\xff\xff\xff\xff").unwrap(); // dim=-1
+    std::fs::write(ws.join("corrupt.fvecs"), b"\x04\x00\x00\x00\x01").unwrap(); // dim=4 but only 1 data byte
+    std::fs::write(ws.join("corrupt.ivecs"), b"\xff\xff\xff\xff").unwrap(); // dim=-1
     std::fs::write(ws.join("corrupt.u8"), &[42, 43, 44]).unwrap(); // valid u8 but tiny
     std::fs::write(ws.join("corrupt.slab"), b"NOT_A_SLAB").unwrap(); // invalid slab header
 
-    let corrupt_files = ["corrupt.fvec", "corrupt.ivec", "corrupt.u8", "corrupt.slab"];
+    let corrupt_files = ["corrupt.fvecs", "corrupt.ivecs", "corrupt.u8", "corrupt.slab"];
 
     for &cmd_path in ALL_COMMANDS {
         let factory = match registry.get(cmd_path) {
@@ -2776,7 +2846,7 @@ fn run_engine(
     use vectordata::VectorReader;
     use vectordata::io::MmapVectorReader;
 
-    let indices_path = out_dir.join(format!("{}_indices.ivec", engine));
+    let indices_path = out_dir.join(format!("{}_indices.ivecs", engine));
     let registry = veks_pipeline::pipeline::registry::CommandRegistry::with_builtins();
     let cmd_name = match engine {
         "metal" => "compute knn-metal",
@@ -2802,23 +2872,160 @@ fn run_engine(
     (0..count).map(|i| reader.get_slice(i).to_vec()).collect()
 }
 
-/// Compare two engine results. Returns (exact_set_match, boundary_mismatch, real_mismatch).
-fn compare_results(a: &[Vec<i32>], b: &[Vec<i32>]) -> (usize, usize, usize) {
-    use std::collections::HashSet;
-    let mut exact = 0;
-    let mut boundary = 0;
-    let mut real = 0;
-    for i in 0..a.len() {
-        let sa: HashSet<i32> = a[i].iter().copied().collect();
-        let sb: HashSet<i32> = b[i].iter().copied().collect();
-        if sa == sb {
-            exact += 1;
-        } else {
-            let diff = sa.symmetric_difference(&sb).count() / 2;
-            if diff <= 5 { boundary += 1; } else { real += 1; }
+// ─── Quality measurement against f64 brute-force ground truth ──────────
+//
+// Set-level comparison (symmetric-difference counting) treats a true FP
+// tie-swap the same as a real ranking miss. That conflates two very
+// different things: a swap between two candidates whose distances agree
+// to the last bit of f32, and a swap that pulls in a meaningfully
+// worse neighbor. Instead we (a) compute the exact top-k with f64
+// brute force as ground truth, (b) recompute each engine's returned
+// indices' distances in f64, and (c) report recall (set overlap) plus
+// the relative distance excess (how much worse were the engine's
+// neighbors than the optimum, in units of the truth's kth distance).
+//
+// The relative-excess metric is scale- and metric-sign-invariant
+// because the optimal engine always has `engine_kth_dist >=
+// truth_kth_dist` (truth is the minimum by construction), so the
+// excess is always non-negative regardless of metric sign.
+
+/// Recompute distance between a single base/query pair in f64 —
+/// canonical reference used for truth and for scoring engine outputs.
+fn recompute_dist_f64(base: &[f32], query: &[f32], metric: &str) -> f64 {
+    match metric {
+        "L2" => base.iter().zip(query)
+            .map(|(x, y)| { let d = (*x as f64) - (*y as f64); d * d })
+            .sum(),
+        "DOT_PRODUCT" => -base.iter().zip(query)
+            .map(|(x, y)| (*x as f64) * (*y as f64))
+            .sum::<f64>(),
+        "COSINE" => {
+            let mut dot = 0.0f64;
+            let mut nb = 0.0f64;
+            let mut nq = 0.0f64;
+            for (x, y) in base.iter().zip(query) {
+                let xf = *x as f64;
+                let yf = *y as f64;
+                dot += xf * yf;
+                nb += xf * xf;
+                nq += yf * yf;
+            }
+            let denom = nb.sqrt() * nq.sqrt();
+            if denom == 0.0 { 0.0 } else { -(dot / denom) }
         }
+        _ => panic!("unknown metric: {}", metric),
     }
-    (exact, boundary, real)
+}
+
+/// Compute the exact top-k via f64 brute force. Returns
+/// `(indices, distances)` both in ascending-distance order, with
+/// index as deterministic tiebreaker.
+fn brute_force_top_k(
+    base: &[Vec<f32>],
+    query: &[f32],
+    k: usize,
+    metric: &str,
+) -> (Vec<i32>, Vec<f64>) {
+    let mut all: Vec<(i32, f64)> = (0..base.len())
+        .map(|i| (i as i32, recompute_dist_f64(&base[i], query, metric)))
+        .collect();
+    all.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
+        .then(a.0.cmp(&b.0)));
+    all.truncate(k);
+    let indices: Vec<i32> = all.iter().map(|(i, _)| *i).collect();
+    let dists: Vec<f64> = all.iter().map(|(_, d)| *d).collect();
+    (indices, dists)
+}
+
+/// Per-query quality metrics of an engine result against ground truth.
+#[derive(Clone, Copy, Debug)]
+struct QualityStats {
+    /// |engine ∩ truth| / k — fraction of optimal neighbors found.
+    /// Informational: tie-swaps between candidates of near-equal
+    /// distance can drop recall without any quality loss, so the
+    /// primary correctness gate is `kth_excess_rel`, not recall.
+    recall: f64,
+    /// `(engine_kth_dist - truth_kth_dist) / max(|truth_kth_dist|, 1e-12)`
+    /// — unit-less relative quality loss of the worst neighbor in
+    /// the returned top-k. Always ≥ 0 (truth is the minimum by
+    /// construction). Invariant across metric sign.
+    /// 0 = identical quality, 1e-5 = ULP-level FP drift,
+    /// > 1e-2 = real ranking error.
+    kth_excess_rel: f64,
+    /// Position-wise mean of `(engine_i_dist - truth_i_dist) /
+    /// max(|truth_i_dist|, 1e-12)` across all i in [0, k).
+    /// Catches drift even when the k-th happens to line up.
+    mean_excess_rel: f64,
+}
+
+fn quality_vs_truth(
+    engine_indices: &[i32],
+    base: &[Vec<f32>],
+    query: &[f32],
+    truth_indices: &[i32],
+    truth_sorted_dists: &[f64],
+    k: usize,
+    metric: &str,
+) -> QualityStats {
+    use std::collections::HashSet;
+    let ts: HashSet<i32> = truth_indices.iter().copied().collect();
+    let es: HashSet<i32> = engine_indices.iter().copied().collect();
+    let recall = es.intersection(&ts).count() as f64 / k as f64;
+
+    let mut engine_dists: Vec<f64> = engine_indices.iter()
+        .map(|&i| recompute_dist_f64(&base[i as usize], query, metric))
+        .collect();
+    engine_dists.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    let truth_kth_mag = truth_sorted_dists[k - 1].abs().max(1e-12);
+    let kth_excess_rel = (engine_dists[k - 1] - truth_sorted_dists[k - 1]) / truth_kth_mag;
+
+    let mean_excess_rel = engine_dists.iter().zip(truth_sorted_dists).map(|(e, t)| {
+        let denom = t.abs().max(1e-12);
+        (e - t) / denom
+    }).sum::<f64>() / k as f64;
+
+    QualityStats { recall, kth_excess_rel, mean_excess_rel }
+}
+
+/// Aggregate per-query stats into a report row.
+#[derive(Clone, Copy, Debug, Default)]
+struct AggStats {
+    recall_min: f64,
+    recall_mean: f64,
+    recall_p99_worst: f64,   // worst recall at the 99th-percentile-bad end
+    kth_excess_rel_max: f64,
+    kth_excess_rel_p99: f64,
+    mean_excess_rel_max: f64,
+}
+
+fn aggregate(stats: &[QualityStats]) -> AggStats {
+    assert!(!stats.is_empty());
+    let n = stats.len();
+    let recalls: Vec<f64> = stats.iter().map(|s| s.recall).collect();
+    let kth_rels: Vec<f64> = stats.iter().map(|s| s.kth_excess_rel).collect();
+    let mean_rels: Vec<f64> = stats.iter().map(|s| s.mean_excess_rel).collect();
+
+    let recall_min = recalls.iter().cloned().fold(f64::INFINITY, f64::min);
+    let recall_mean = recalls.iter().sum::<f64>() / n as f64;
+    // p99 worst = the 1st-percentile lowest recall.
+    let mut r_sorted = recalls.clone();
+    r_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let p99_idx = (n as f64 * 0.01).ceil() as usize;
+    let recall_p99_worst = r_sorted[p99_idx.min(n - 1)];
+
+    let kth_excess_rel_max = kth_rels.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let mut k_sorted = kth_rels.clone();
+    k_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let p99_idx_hi = (n as f64 * 0.99).floor() as usize;
+    let kth_excess_rel_p99 = k_sorted[p99_idx_hi.min(n - 1)];
+
+    let mean_excess_rel_max = mean_rels.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+
+    AggStats {
+        recall_min, recall_mean, recall_p99_worst,
+        kth_excess_rel_max, kth_excess_rel_p99, mean_excess_rel_max,
+    }
 }
 
 /// Cross-engine parity: metal vs stdarch must be exact across all
@@ -2834,72 +3041,123 @@ fn cross_engine_knn_parity() {
 
     // FAISS has a known BLAS ABI bug that produces corrupt results
     // at high dimensions. See docs/design/faiss-blas-abi-bug.md.
-    // Only test FAISS at dims where it's known to work.
+    // Only test FAISS at dims where it's known to work, and only
+    // when the faiss feature is enabled.
     let faiss_max_dim = 256;
+    let faiss_available = {
+        let reg = veks_pipeline::pipeline::registry::CommandRegistry::with_builtins();
+        reg.get("compute knn-faiss").is_some()
+    };
+
+    // Gate thresholds, per metric and per engine class.
+    //
+    // The **primary** correctness gate is `kth_excess_rel_max` — the
+    // worst-case relative quality loss of any returned neighbor,
+    // measured via f64-recomputed distances. This captures true
+    // ranking errors while letting tie-swaps (where an engine picks
+    // one of two candidates whose distances agree to ULP) through
+    // as zero-cost.
+    //
+    // `recall_mean` is a **sanity** gate: a correctly-ranked engine
+    // may occasionally drop recall on a single query via tie-swap
+    // without any quality loss, so gating on `recall_min` would
+    // false-alarm on ULP noise. Averaging over queries catches
+    // systemic drift while tolerating individual ties.
+    //
+    // Engine classes:
+    //  - `exact`: metal, stdarch — AVX-512 FMA paths. L2 and DOT
+    //    accumulate in the same order and are byte-identical.
+    //    COSINE uses different norm paths so ULP drift is allowed.
+    //  - `faiss`: BLAS-backed matmul path. Different accumulation
+    //    order; wider tolerance.
+    //  - `f16`: quantization introduces real quality loss.
+    struct Gate {
+        min_recall_mean: f64,
+        max_kth_excess_rel: f64,
+    }
+    let gate_exact = |metric: &str| -> Gate {
+        match metric {
+            "COSINE" => Gate { min_recall_mean: 0.95, max_kth_excess_rel: 1e-3 },
+            _ => Gate { min_recall_mean: 0.999, max_kth_excess_rel: 1e-5 },
+        }
+    };
+    let gate_faiss = |_metric: &str| -> Gate {
+        Gate { min_recall_mean: 0.90, max_kth_excess_rel: 1e-2 }
+    };
+    let gate_f16 = |_metric: &str| -> Gate {
+        Gate { min_recall_mean: 0.70, max_kth_excess_rel: 2e-2 }
+    };
 
     let mut failures: Vec<String> = Vec::new();
     let mut faiss_warnings: Vec<String> = Vec::new();
+    let mut report: Vec<String> = Vec::new();
+    report.push(format!(
+        "  {:<5} {:<11} {:<8} {:>6} {:>6} {:>6}   {:>10} {:>10}   {:>10}",
+        "dim", "metric", "engine", "r_min", "r_mean", "r_p99", "kth_max", "kth_p99", "mean_max",
+    ));
 
     for &dim in &dims {
         let tmp = tmp_dir();
         let base_vecs = gen_vectors(42, n_base, dim);
         let query_vecs = gen_vectors(99, n_query, dim);
 
-        let base_path = tmp.path().join("base.fvec");
-        let query_path = tmp.path().join("query.fvec");
+        let base_path = tmp.path().join("base.fvecs");
+        let query_path = tmp.path().join("query.fvecs");
         write_test_fvec(&base_path, &base_vecs);
         write_test_fvec(&query_path, &query_vecs);
 
-        let test_faiss = dim <= faiss_max_dim;
+        let test_faiss = faiss_available && dim <= faiss_max_dim;
 
         for metric in &metrics {
-            // Always run metal and stdarch
+            // Ground truth via f64 brute force — the canonical reference
+            // every engine is scored against. Computed once per (dim,
+            // metric), reused for all engines below.
+            let truth: Vec<(Vec<i32>, Vec<f64>)> = query_vecs.iter()
+                .map(|q| brute_force_top_k(&base_vecs, q, k, metric))
+                .collect();
+
             let engines: Vec<&str> = if test_faiss {
                 vec!["metal", "stdarch", "faiss"]
             } else {
                 vec!["metal", "stdarch"]
             };
 
-            let mut results: Vec<(&str, Vec<Vec<i32>>)> = Vec::new();
             for engine in &engines {
                 let out_dir = tmp.path().join(format!("{}_{}", engine, metric));
                 std::fs::create_dir_all(&out_dir).unwrap();
-                let r = run_engine(engine, &base_path, &query_path, &out_dir, k, metric);
-                results.push((engine, r));
+                let engine_result = run_engine(engine, &base_path, &query_path, &out_dir, k, metric);
+
+                // Per-query quality against truth.
+                let per_query: Vec<QualityStats> = engine_result.iter().enumerate()
+                    .map(|(qi, idx)| quality_vs_truth(
+                        idx, &base_vecs, &query_vecs[qi],
+                        &truth[qi].0, &truth[qi].1, k, metric,
+                    ))
+                    .collect();
+                let agg = aggregate(&per_query);
+
+                report.push(format!(
+                    "  {:<5} {:<11} {:<8} {:>6.3} {:>6.3} {:>6.3}   {:>10.2e} {:>10.2e}   {:>10.2e}",
+                    dim, metric, engine,
+                    agg.recall_min, agg.recall_mean, agg.recall_p99_worst,
+                    agg.kth_excess_rel_max, agg.kth_excess_rel_p99,
+                    agg.mean_excess_rel_max,
+                ));
+
+                let gate = if *engine == "faiss" { gate_faiss(metric) } else { gate_exact(metric) };
+                if agg.recall_mean < gate.min_recall_mean {
+                    failures.push(format!(
+                        "dim={} metric={} engine={}: recall_mean={:.3} < gate {:.3}",
+                        dim, metric, engine, agg.recall_mean, gate.min_recall_mean));
+                }
+                if agg.kth_excess_rel_max > gate.max_kth_excess_rel {
+                    failures.push(format!(
+                        "dim={} metric={} engine={}: kth_excess_rel_max={:.2e} > gate {:.2e}",
+                        dim, metric, engine, agg.kth_excess_rel_max, gate.max_kth_excess_rel));
+                }
             }
 
-            // Metal vs stdarch: must agree at ALL dimensions.
-            // L2 and DOT_PRODUCT use identical FP paths → exact match.
-            // COSINE uses different norm computation (SimSIMD vs hand-rolled
-            // AVX-512) which can produce ULP-level rounding differences at
-            // high dimensions → allow boundary mismatches.
-            let (exact, boundary, real) = compare_results(&results[0].1, &results[1].1);
-            if real > 0 {
-                failures.push(format!(
-                    "dim={} metric={}: metal vs stdarch: {}/{} exact, {} boundary, {} REAL MISMATCH",
-                    dim, metric, exact, n_query, boundary, real));
-            } else if *metric != "COSINE" && exact != n_query {
-                failures.push(format!(
-                    "dim={} metric={}: metal vs stdarch: {}/{} exact, {} boundary (expected exact for {})",
-                    dim, metric, exact, n_query, boundary, metric));
-            }
-
-            // FAISS comparisons only at safe dimensions
-            if test_faiss {
-                let (exact, boundary, real) = compare_results(&results[0].1, &results[2].1);
-                if real > 0 {
-                    failures.push(format!(
-                        "dim={} metric={}: metal vs faiss: {}/{} exact, {} boundary, {} REAL MISMATCH",
-                        dim, metric, exact, n_query, boundary, real));
-                }
-
-                let (exact, boundary, real) = compare_results(&results[1].1, &results[2].1);
-                if real > 0 {
-                    failures.push(format!(
-                        "dim={} metric={}: stdarch vs faiss: {}/{} exact, {} boundary, {} REAL MISMATCH",
-                        dim, metric, exact, n_query, boundary, real));
-                }
-            } else {
+            if !test_faiss {
                 faiss_warnings.push(format!(
                     "dim={}: FAISS skipped (known BLAS ABI bug at dim>{})", dim, faiss_max_dim));
             }
@@ -2907,45 +3165,72 @@ fn cross_engine_knn_parity() {
     }
 
     // ── f16 precision test ─────────────────────────────────────────
-    // knn-metal supports f16 (mvec). Verify f16 results are reasonable
-    // compared to f32 (wider tolerance for f16 quantization).
+    // knn-metal supports f16 (mvec). f16 quantization causes real
+    // quality loss; gate is wider but still meaningful.
     for &dim in &[32, 128, 512] {
         let tmp = tmp_dir();
         let base_vecs = gen_vectors(42, n_base, dim);
         let query_vecs = gen_vectors(99, n_query, dim);
 
-        let f32_base = tmp.path().join("base.fvec");
-        let f32_query = tmp.path().join("query.fvec");
+        let f32_base = tmp.path().join("base.fvecs");
+        let f32_query = tmp.path().join("query.fvecs");
         write_test_fvec(&f32_base, &base_vecs);
         write_test_fvec(&f32_query, &query_vecs);
 
-        let f16_base = tmp.path().join("base.mvec");
-        let f16_query = tmp.path().join("query.mvec");
+        let f16_base = tmp.path().join("base.mvecs");
+        let f16_query = tmp.path().join("query.mvecs");
         write_test_mvec(&f16_base, &base_vecs);
         write_test_mvec(&f16_query, &query_vecs);
 
         for metric in &["L2", "DOT_PRODUCT"] {
-            let f32_dir = tmp.path().join(format!("f32_{}", metric));
+            let truth: Vec<(Vec<i32>, Vec<f64>)> = query_vecs.iter()
+                .map(|q| brute_force_top_k(&base_vecs, q, k, metric))
+                .collect();
+
             let f16_dir = tmp.path().join(format!("f16_{}", metric));
-            std::fs::create_dir_all(&f32_dir).unwrap();
             std::fs::create_dir_all(&f16_dir).unwrap();
+            let f16_result = run_engine("metal", &f16_base, &f16_query, &f16_dir, k, metric);
 
-            let f32_r = run_engine("metal", &f32_base, &f32_query, &f32_dir, k, metric);
-            let f16_r = run_engine("metal", &f16_base, &f16_query, &f16_dir, k, metric);
+            let per_query: Vec<QualityStats> = f16_result.iter().enumerate()
+                .map(|(qi, idx)| quality_vs_truth(
+                    idx, &base_vecs, &query_vecs[qi],
+                    &truth[qi].0, &truth[qi].1, k, metric,
+                ))
+                .collect();
+            let agg = aggregate(&per_query);
 
-            let (exact, boundary, real) = compare_results(&f32_r, &f16_r);
-            // f16 quantization causes legitimate neighbor differences,
-            // but >50% real mismatches suggests a bug
-            if real > n_query / 2 {
+            report.push(format!(
+                "  {:<5} {:<11} {:<8} {:>6.3} {:>6.3} {:>6.3}   {:>10.2e} {:>10.2e}   {:>10.2e}",
+                dim, metric, "metal/f16",
+                agg.recall_min, agg.recall_mean, agg.recall_p99_worst,
+                agg.kth_excess_rel_max, agg.kth_excess_rel_p99,
+                agg.mean_excess_rel_max,
+            ));
+
+            let g = gate_f16(metric);
+            if agg.recall_mean < g.min_recall_mean {
                 failures.push(format!(
-                    "dim={} metric={}: f32 vs f16 metal: {}/{} exact, {} boundary, {} real (>50%)",
-                    dim, metric, exact, n_query, boundary, real));
+                    "dim={} metric={} metal/f16: recall_mean={:.3} < gate {:.3}",
+                    dim, metric, agg.recall_mean, g.min_recall_mean));
+            }
+            if agg.kth_excess_rel_max > g.max_kth_excess_rel {
+                failures.push(format!(
+                    "dim={} metric={} metal/f16: kth_excess_rel_max={:.2e} > gate {:.2e}",
+                    dim, metric, agg.kth_excess_rel_max, g.max_kth_excess_rel));
             }
         }
     }
 
+    // Emit the quality report unconditionally — users running with
+    // --nocapture see every (dim, metric, engine) row so they can spot
+    // drift over time even when the gates still hold.
+    eprintln!("\n  KNN engine quality vs f64 brute-force truth");
+    eprintln!("  (recall: fraction of truth's top-k found. kth/mean: f64-recomputed distance excess, relative to truth)");
+    for line in &report { eprintln!("{}", line); }
+    eprintln!();
+
     if !faiss_warnings.is_empty() {
-        eprintln!("FAISS skipped for {} dimension/metric combinations (BLAS ABI bug)",
+        eprintln!("  FAISS skipped for {} dimension/metric combinations (BLAS ABI bug)",
             faiss_warnings.len());
     }
 

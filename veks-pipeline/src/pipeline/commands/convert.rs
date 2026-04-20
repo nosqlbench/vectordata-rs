@@ -13,11 +13,12 @@ use std::time::Instant;
 
 use veks_core::formats::VecFormat;
 use veks_core::formats::convert::convert_elements_into;
+use veks_core::formats::parquet_vector_compiler;
 use veks_core::formats::reader;
 use veks_core::formats::writer::{self, SinkConfig};
 use crate::pipeline::command::{
-    ArtifactManifest, CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options,
-    ResourceDesc, Status, StreamContext, render_options_table,
+    ArtifactManifest, ArtifactState, CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole,
+    Options, ResourceDesc, Status, StreamContext, render_options_table,
 };
 
 /// Number of records to buffer in the read-ahead channel.
@@ -188,6 +189,30 @@ Convert with explicit source format override:
             output_path.display(),
             to_format.name(),
         ));
+
+        // Fast path: parquet → uniform xvec with no element conversion, no
+        // normalization, no limit/fraction, and no metadata facet. Routes
+        // to the compiled batch-granularity extractor.
+        if let Some(result) = try_fast_parquet_to_xvec(
+            &source_path, &output_path,
+            source_format, to_format,
+            options, ctx, start,
+        ) {
+            return result;
+        }
+
+        // Fast path: directory of uniform xvec shards → single xvec output
+        // (identity element type). Pure I/O — each shard is read with
+        // sequential-readahead hints and pwritten to its pre-computed
+        // offset; no decoder, no per-record loop.
+        if let Some(result) = try_fast_xvec_dir_to_xvec(
+            &source_path, &output_path,
+            source_format, to_format,
+            options, ctx, start,
+        ) {
+            return result;
+        }
+
         ctx.ui.log("  opening source...");
         let threads = ctx.governor.current_or("threads", ctx.threads as u64) as usize;
         // Use facet-aware reader: metadata_content parquet uses the MNode
@@ -797,6 +822,31 @@ Convert with explicit source format override:
                 description: "L2-normalize f32 vectors during conversion".to_string(),
                 role: OptionRole::Config,
         },
+            OptionDesc {
+                name: "require_fast".to_string(),
+                type_name: "bool".to_string(),
+                required: false,
+                default: Some("false".to_string()),
+                description:
+                    "When true, require the compiled parquet→xvec fast path. \
+                     Raises an error if surface conditions match but something \
+                     blocks it (element conversion needed, normalize/limit/fraction \
+                     set, schema probe fails). Use on parquet source steps where \
+                     silently falling back to the slow path would be a regression."
+                        .to_string(),
+                role: OptionRole::Config,
+        },
+            OptionDesc {
+                name: "column".to_string(),
+                type_name: "String".to_string(),
+                required: false,
+                default: None,
+                description:
+                    "[parquet sources] Column name to extract. Defaults to the \
+                     first list-of-numeric column in the schema."
+                        .to_string(),
+                role: OptionRole::Config,
+        },
         ]
     }
 
@@ -806,6 +856,26 @@ Convert with explicit source format override:
             &["source"],
             &["output"],
         )
+    }
+
+    /// Override the default check to detect interrupted parquet → xvec
+    /// fast-path runs.
+    ///
+    /// The fast path uses an atomic-rename pattern: phase 2 writes to
+    /// `<output>.tmp` and `rename`s it into place at the very end. The
+    /// existence of `output` is therefore the success contract. There
+    /// is one in-flight footprint to look out for though: the
+    /// `<output>.shards` directory. If that exists alongside `output`,
+    /// we crashed in phase 2 between the first concat and the final
+    /// rename — the output is stale and must be re-built (cheaply,
+    /// because the shards themselves are still good and will skip
+    /// re-decoding).
+    fn check_artifact(&self, output: &Path, options: &Options) -> ArtifactState {
+        let shards_dir = parquet_vector_compiler::shards_dir_for(output);
+        if shards_dir.exists() {
+            return ArtifactState::PartialResumable;
+        }
+        crate::pipeline::bound::check_artifact_default(output, options)
     }
 }
 
@@ -863,6 +933,397 @@ fn error_result(message: String, start: Instant) -> CommandResult {
         message,
         produced: vec![],
         elapsed: start.elapsed(),
+    }
+}
+
+/// Format an ETA in seconds as the most natural human unit.
+fn format_eta(secs: u64) -> String {
+    if secs < 60 { format!("{}s", secs) }
+    else if secs < 3600 { format!("{}m{:02}s", secs / 60, secs % 60) }
+    else if secs < 86400 { format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60) }
+    else { format!("{}d{:02}h", secs / 86400, (secs % 86400) / 3600) }
+}
+
+/// Compact human-readable count: 1234 → "1.2K", 1_234_567 → "1.2M",
+/// 1_234_567_890 → "1.2B". Used for the trailing rate text on the
+/// concat progress bar.
+fn humanize_count_short(n: u64) -> String {
+    const K: u64 = 1_000;
+    const M: u64 = 1_000_000;
+    const G: u64 = 1_000_000_000;
+    const T: u64 = 1_000_000_000_000;
+    if n >= T { format!("{:.1}T", n as f64 / T as f64) }
+    else if n >= G { format!("{:.1}B", n as f64 / G as f64) }
+    else if n >= M { format!("{:.1}M", n as f64 / M as f64) }
+    else if n >= K { format!("{:.1}K", n as f64 / K as f64) }
+    else { format!("{}", n) }
+}
+
+/// Fast-path router for parquet → uniform xvec conversion.
+///
+/// Dispatches to the compiled-extractor orchestrator in veks-core when the
+/// surface conditions are met (parquet source, uniform-xvec target, no
+/// normalize, no limit/fraction, no metadata facet, element type matches).
+///
+/// `require_fast` (option) controls how mismatches are surfaced:
+///
+/// - `false` (default) — applicable-but-blocked cases (e.g. element
+///   conversion needed) silently fall through to the generic slow path.
+///   The decision is logged either way.
+/// - `true` — applicable-but-blocked cases become explicit errors with a
+///   precise reason. Used by bootstrap-generated YAML for `convert-vectors`
+///   on parquet sources, where regressing to the slow path is itself a bug
+///   to surface (the upstream pipeline assumes the fast path).
+///
+/// "Not applicable" cases (source not parquet, target not xvec, metadata
+/// facet) always fall through silently — `require_fast` is interpreted as
+/// "if the fast path applies, take it," not "force parquet input."
+fn try_fast_parquet_to_xvec(
+    source_path: &Path,
+    output_path: &Path,
+    source_format: VecFormat,
+    to_format: VecFormat,
+    options: &Options,
+    ctx: &mut StreamContext,
+    start: Instant,
+) -> Option<CommandResult> {
+    let require_fast = options.get("require_fast").map(|s| s == "true").unwrap_or(false);
+
+    // ── Tier 1: NOT APPLICABLE — fast path doesn't even consider this case.
+    // Silent fall-through regardless of require_fast.
+    if source_format != VecFormat::Parquet { return None; }
+    if !to_format.is_uniform_xvec() { return None; }
+    if let Some(f) = options.get("facet") {
+        use veks_core::formats::facet::Facet;
+        if let Some(facet) = Facet::from_key(f).or_else(|| Facet::from_alias(f)) {
+            if matches!(
+                facet,
+                Facet::MetadataContent
+                    | Facet::MetadataPredicates
+                    | Facet::MetadataResults
+                    | Facet::MetadataLayout
+            ) {
+                return None;
+            }
+        }
+    }
+
+    // From here on, source IS parquet and target IS uniform xvec, so the
+    // fast path is the *expected* path. Any failure to take it is a
+    // first-class signal — log loudly always, and error when require_fast.
+
+    // ── Tier 2: APPLICABLE BUT BLOCKED by user-requested behavior.
+    let mut blockers: Vec<&str> = Vec::new();
+    if options.get("normalize").map(|s| s == "true").unwrap_or(false) {
+        blockers.push("normalize=true (per-record norm computation needed)");
+    }
+    if options.has("limit") || options.has("fraction") {
+        blockers.push("limit/fraction set (per-record counting needed)");
+    }
+    if !blockers.is_empty() {
+        let reason = blockers.join(", ");
+        if require_fast {
+            return Some(error_result(
+                format!(
+                    "require_fast=true but fast parquet→{} path cannot apply: {}",
+                    to_format.name(), reason,
+                ),
+                start,
+            ));
+        }
+        ctx.ui.log(&format!(
+            "  fast path skipped (slow path will handle): {}", reason
+        ));
+        return None;
+    }
+
+    // ── Tier 3: probe the schema to check element-type compatibility.
+    let column_hint = options.get("column");
+    let probe = match parquet_vector_compiler::probe_parquet_vectors(source_path, column_hint) {
+        Ok(p) => p,
+        Err(e) => {
+            if require_fast {
+                return Some(error_result(
+                    format!("require_fast=true but parquet schema probe failed: {}", e),
+                    start,
+                ));
+            }
+            ctx.ui.log(&format!(
+                "  fast path skipped (slow path will retry): probe failed: {}", e
+            ));
+            return None;
+        }
+    };
+
+    let natural = probe.extractor.preferred_xvec_format();
+    if natural != to_format {
+        let reason = format!(
+            "parquet element {:?} produces {} but target is {} — element conversion needed, \
+             which the fast path does not perform (use the slow path or specify the \
+             matching xvec target)",
+            probe.extractor.element(),
+            natural.name(),
+            to_format.name(),
+        );
+        if require_fast {
+            return Some(error_result(
+                format!("require_fast=true but {}", reason), start,
+            ));
+        }
+        ctx.ui.log(&format!("  fast path skipped (element conversion needed): {}", reason));
+        return None;
+    }
+
+    // ── Tier 4: execute.
+    let threads = ctx.governor.current_or("threads", ctx.threads as u64) as usize;
+    ctx.ui.log(&format!(
+        "  fast path: {} parquet file(s), {} rows, dim {}, element {}, {} loader thread(s) — batch-granularity extractor",
+        probe.file_count,
+        probe.row_count,
+        probe.extractor.dimension(),
+        to_format.name(),
+        threads.max(1),
+    ));
+
+    // Bar is in **shards** — one increment per parquet file completed
+    // (whether decoded fresh or skipped because a valid cached shard
+    // already existed). Total is the file count, which is small enough
+    // to read at a glance and increments at human-meaningful granularity.
+    //
+    // Trailing message reports the *honest* decode-only rate and ETA:
+    //   - Numerator = records actually decoded on this run (excludes
+    //     anything skipped from the resumable cache prefix).
+    //   - Denominator = wall-clock seconds since the *first* real
+    //     decode began (excludes the near-zero cache-skip phase).
+    // Without this, a resume that finds 90% cached would average
+    // hundreds of millions rec/s over the cache prefix and then
+    // collapse to the real rate, producing a useless ETA.
+    let pb = ctx.ui.bar_with_unit(probe.file_count as u64, "extracting", "shards");
+    let pb_id = pb.id();
+    let progress_ui = ctx.ui.clone();
+    // Tracks whether we've already re-anchored the bar's rate clock to
+    // the first real decode. Cache-skipped shards complete in
+    // microseconds; without re-anchoring, they'd dominate the bar's
+    // built-in shards/s rate (and ETA derived from it) for most of the
+    // run. AtomicBool because the orchestrator's ticker callback is
+    // typed `Fn + Sync` (no mutable closure state).
+    let anchored_cb = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let progress_cb = move |tick: &parquet_vector_compiler::ExtractProgressTick| {
+        progress_ui.inc_by_id(pb_id, tick.shards_delta as u64);
+        if tick.decoded_records == 0 || tick.decode_elapsed_secs <= 0.0 {
+            // No real decode has happened yet — every completed shard so
+            // far was a cache-hit skip. Show records-done but no rate.
+            progress_ui.set_message_by_id(pb_id, format!(
+                "{}/{} records (resuming from cache)",
+                humanize_count_short(tick.records_done),
+                humanize_count_short(tick.records_total),
+            ));
+            return;
+        }
+        // First tick that includes real decode work — re-anchor the
+        // bar's built-in rate calc so the shards/s and ETA on the bar
+        // reflect actual decode work, not the (near-zero) cache-skip
+        // phase. CAS so only the first tick re-anchors.
+        if anchored_cb.compare_exchange(
+            false, true,
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+        ).is_ok() {
+            progress_ui.anchor_rate_by_id(pb_id);
+        }
+        let rate = tick.decoded_records as f64 / tick.decode_elapsed_secs;
+        let remaining = tick.records_total.saturating_sub(tick.records_done);
+        let eta_msg = if rate > 0.0 {
+            let secs = (remaining as f64 / rate) as u64;
+            format!(", ETA {}", format_eta(secs))
+        } else {
+            String::new()
+        };
+        progress_ui.set_message_by_id(pb_id, format!(
+            "{}/{} records, {}/s decode rate{}",
+            humanize_count_short(tick.records_done),
+            humanize_count_short(tick.records_total),
+            humanize_count_short(rate as u64),
+            eta_msg,
+        ));
+    };
+
+    let log_ui = ctx.ui.clone();
+    let log_cb = move |msg: &str| {
+        log_ui.log(msg);
+    };
+
+    let result = parquet_vector_compiler::extract_parquet_to_xvec_threaded(
+        source_path,
+        output_path,
+        to_format,
+        column_hint,
+        Some(&progress_cb),
+        Some(&log_cb),
+        threads,
+    );
+    pb.finish();
+
+    match result {
+        Ok(rows) => Some(CommandResult {
+            status: Status::Ok,
+            message: format!(
+                "extracted {} records (dim {}, {}) from {} parquet file(s) via compiled extractor",
+                rows,
+                probe.extractor.dimension(),
+                to_format.name(),
+                probe.file_count,
+            ),
+            produced: vec![output_path.to_path_buf()],
+            elapsed: start.elapsed(),
+        }),
+        Err(e) => Some(error_result(
+            format!("parquet→xvec fast path failed: {}", e),
+            start,
+        )),
+    }
+}
+
+/// Fast directory-of-xvec → single-xvec gather. Mirrors the parquet fast
+/// path's tiered eligibility: silent fall-through when not applicable,
+/// loud skip with a reason when blocked, hard error when `require_fast`
+/// is set, and execute when everything lines up.
+fn try_fast_xvec_dir_to_xvec(
+    source_path: &Path,
+    output_path: &Path,
+    source_format: VecFormat,
+    to_format: VecFormat,
+    options: &Options,
+    ctx: &mut StreamContext,
+    start: Instant,
+) -> Option<CommandResult> {
+    let require_fast = options.get("require_fast").map(|s| s == "true").unwrap_or(false);
+
+    // ── Tier 1: NOT APPLICABLE — silent fall-through.
+    if !source_format.is_uniform_xvec() { return None; }
+    if source_format != to_format { return None; }    // identity only
+    if !source_path.is_dir() { return None; }
+    // Only the metadata facets need the MNode reader; vector facets
+    // (base_vectors, query_vectors, etc.) are pure xvec payloads and
+    // are exactly what this fast path is built to gather.
+    if let Some(f) = options.get("facet") {
+        use veks_core::formats::facet::Facet;
+        if let Some(facet) = Facet::from_key(f).or_else(|| Facet::from_alias(f)) {
+            if matches!(
+                facet,
+                Facet::MetadataContent
+                    | Facet::MetadataPredicates
+                    | Facet::MetadataResults
+                    | Facet::MetadataLayout
+            ) {
+                return None;
+            }
+        }
+    }
+
+    // ── Tier 2: applicable but BLOCKED by user-requested behavior.
+    let mut blockers: Vec<&str> = Vec::new();
+    if options.get("normalize").map(|s| s == "true").unwrap_or(false) {
+        blockers.push("normalize=true");
+    }
+    if options.has("limit") || options.has("fraction") {
+        blockers.push("limit/fraction set");
+    }
+    if !blockers.is_empty() {
+        let reason = blockers.join(", ");
+        if require_fast {
+            return Some(error_result(
+                format!(
+                    "require_fast=true but fast xvec-dir→{} concat path cannot apply: {}",
+                    to_format.name(), reason,
+                ),
+                start,
+            ));
+        }
+        ctx.ui.log(&format!(
+            "  fast path skipped (slow path will handle): {}", reason
+        ));
+        return None;
+    }
+
+    // ── Tier 3: probe the directory for shape consistency.
+    let probe = match veks_core::formats::xvec_dir_compiler::probe_xvec_directory(
+        source_path, source_format,
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            if require_fast {
+                return Some(error_result(
+                    format!("require_fast=true but xvec-dir probe failed: {}", e),
+                    start,
+                ));
+            }
+            ctx.ui.log(&format!(
+                "  fast path skipped (slow path will retry): probe failed: {}", e
+            ));
+            return None;
+        }
+    };
+
+    // ── Tier 4: execute.
+    let threads = ctx.governor.current_or("threads", ctx.threads as u64) as usize;
+    ctx.ui.log(&format!(
+        "  fast path: {} {} shard(s), {} records (dim {}), {} reader thread(s) — pwrite concat",
+        probe.file_count(),
+        source_format.name(),
+        probe.total_records(),
+        probe.dimension,
+        threads.max(1),
+    ));
+
+    let pb = ctx.ui.bar_with_unit(probe.file_count() as u64, "concatenating", "shards");
+    let pb_id = pb.id();
+    let progress_ui = ctx.ui.clone();
+    // Capture the wall-clock start so the trailing rate is averaged over
+    // the run, which smooths out per-file variance and matches what users
+    // intuitively read off a long-running progress bar.
+    let phase_start = Instant::now();
+    let progress_cb = move |shards_this_tick: usize, _cum_shards: u64, cum_records: u64| {
+        progress_ui.inc_by_id(pb_id, shards_this_tick as u64);
+        let secs = phase_start.elapsed().as_secs_f64().max(0.001);
+        let rate = cum_records as f64 / secs;
+        progress_ui.set_message_by_id(pb_id, format!(
+            "{} records, {}/s avg",
+            humanize_count_short(cum_records),
+            humanize_count_short(rate as u64),
+        ));
+    };
+    let log_ui = ctx.ui.clone();
+    let log_cb = move |msg: &str| { log_ui.log(msg); };
+
+    let result = veks_core::formats::xvec_dir_compiler::extract_xvec_dir_to_xvec_threaded(
+        source_path,
+        output_path,
+        to_format,
+        Some(&progress_cb),
+        Some(&log_cb),
+        threads,
+    );
+    pb.finish();
+
+    match result {
+        Ok(rows) => Some(CommandResult {
+            status: Status::Ok,
+            message: format!(
+                "concatenated {} records (dim {}, {}) from {} {} shard(s)",
+                rows,
+                probe.dimension,
+                to_format.name(),
+                probe.file_count(),
+                source_format.name(),
+            ),
+            produced: vec![output_path.to_path_buf()],
+            elapsed: start.elapsed(),
+        }),
+        Err(e) => Some(error_result(
+            format!("xvec-dir→xvec fast path failed: {}", e),
+            start,
+        )),
     }
 }
 

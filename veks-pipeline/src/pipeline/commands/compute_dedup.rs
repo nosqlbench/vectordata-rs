@@ -26,6 +26,7 @@
 use std::cmp::Ordering;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
@@ -43,97 +44,151 @@ use crate::pipeline::command::{
 
 /// Uniform read interface that always returns `Vec<f32>`, upcasting f16
 /// when the source is an mvec file.
+///
+/// Carries a separate `pread_file` handle for the phase-1 prefix pass.
+/// That pass copies bytes through `read_at` into a per-batch heap
+/// buffer rather than touching the mmap, so the source pages never
+/// get mapped into this process's address space and never inflate RSS.
+/// The mmap is still used for phase-2 random-access full-vector
+/// comparisons (where the get_slice zero-copy path is faster than a
+/// per-call pread).
 enum VecReader {
-    F32(MmapVectorReader<f32>),
-    F16(MmapVectorReader<half::f16>),
+    F32 { mmap: MmapVectorReader<f32>, pread_file: Arc<std::fs::File>, entry_size: usize },
+    F16 { mmap: MmapVectorReader<half::f16>, pread_file: Arc<std::fs::File>, entry_size: usize },
 }
 
 impl VecReader {
     /// Open the appropriate reader based on file extension.
     fn open(path: &Path) -> Result<Self, String> {
+        let pread_file = std::fs::File::open(path)
+            .map_err(|e| format!("failed to open {} for pread: {}", path.display(), e))?;
+        let pread_file = Arc::new(pread_file);
         match path.extension().and_then(|e| e.to_str()) {
             Some("mvec") | Some("mvecs") => {
-                MmapVectorReader::<half::f16>::open_mvec(path)
-                    .map(VecReader::F16)
-                    .map_err(|e| format!("failed to open {}: {}", path.display(), e))
+                let mmap = MmapVectorReader::<half::f16>::open_mvec(path)
+                    .map_err(|e| format!("failed to open {}: {}", path.display(), e))?;
+                let entry_size = mmap.entry_size();
+                Ok(VecReader::F16 { mmap, pread_file, entry_size })
             }
             _ => {
-                MmapVectorReader::<f32>::open_fvec(path)
-                    .map(VecReader::F32)
-                    .map_err(|e| format!("failed to open {}: {}", path.display(), e))
+                let mmap = MmapVectorReader::<f32>::open_fvec(path)
+                    .map_err(|e| format!("failed to open {}: {}", path.display(), e))?;
+                let entry_size = mmap.entry_size();
+                Ok(VecReader::F32 { mmap, pread_file, entry_size })
             }
         }
     }
 
     fn count(&self) -> usize {
         match self {
-            VecReader::F32(r) => <MmapVectorReader<f32> as VectorReader<f32>>::count(r),
-            VecReader::F16(r) => <MmapVectorReader<half::f16> as VectorReader<half::f16>>::count(r),
+            VecReader::F32 { mmap, .. } => <MmapVectorReader<f32> as VectorReader<f32>>::count(mmap),
+            VecReader::F16 { mmap, .. } => <MmapVectorReader<half::f16> as VectorReader<half::f16>>::count(mmap),
         }
     }
 
     fn dim(&self) -> usize {
         match self {
-            VecReader::F32(r) => <MmapVectorReader<f32> as VectorReader<f32>>::dim(r),
-            VecReader::F16(r) => <MmapVectorReader<half::f16> as VectorReader<half::f16>>::dim(r),
+            VecReader::F32 { mmap, .. } => <MmapVectorReader<f32> as VectorReader<f32>>::dim(mmap),
+            VecReader::F16 { mmap, .. } => <MmapVectorReader<half::f16> as VectorReader<half::f16>>::dim(mmap),
         }
     }
 
-    /// Get vector at index as f32 (upcasting f16 if needed).
+    fn entry_size(&self) -> usize {
+        match self {
+            VecReader::F32 { entry_size, .. } => *entry_size,
+            VecReader::F16 { entry_size, .. } => *entry_size,
+        }
+    }
+
+    fn pread_file(&self) -> &Arc<std::fs::File> {
+        match self {
+            VecReader::F32 { pread_file, .. } => pread_file,
+            VecReader::F16 { pread_file, .. } => pread_file,
+        }
+    }
+
+    /// Read the raw bytes (excluding the 4-byte dim header) of one
+    /// vector at `index` into a fresh `Vec<u8>` via `pread`. Used by
+    /// the phase-2 full-vector compare path so we don't touch the
+    /// mmap and don't leak page maps into process RSS — the bytes
+    /// flow through the kernel page cache (cache-warm if recently
+    /// touched) and are copied into the returned buffer, then dropped
+    /// at the end of the comparison call.
+    fn pread_one_vector_bytes(&self, index: usize) -> Result<Vec<u8>, String> {
+        use std::os::unix::fs::FileExt;
+        let entry_size = self.entry_size();
+        let value_bytes = entry_size - 4;
+        let byte_offset = (index * entry_size + 4) as u64;  // skip i32 dim header
+        let mut buf = vec![0u8; value_bytes];
+        self.pread_file()
+            .read_exact_at(&mut buf, byte_offset)
+            .map_err(|e| format!("pread vector {}: {}", index, e))?;
+        Ok(buf)
+    }
+
+    /// Get vector at index as f32 (upcasting f16 if needed). Uses
+    /// `pread` (heap buffer, no mmap touch) so calls in tight loops
+    /// don't accumulate mmap RSS.
     fn get_f32(&self, index: usize) -> Result<Vec<f32>, String> {
+        let bytes = self.pread_one_vector_bytes(index)?;
+        let dim = self.dim();
         match self {
-            VecReader::F32(r) => r.get(index)
-                .map_err(|e| format!("failed to read vector {}: {}", index, e)),
-            VecReader::F16(r) => {
-                let v = r.get(index)
-                    .map_err(|e| format!("failed to read vector {}: {}", index, e))?;
-                Ok(v.iter().map(|x| x.to_f32()).collect())
-            }
-        }
-    }
-
-    /// Bitwise equality check — works at native precision (no upcast).
-    fn vectors_equal(&self, a: usize, b: usize) -> bool {
-        match self {
-            VecReader::F32(r) => {
-                let va = match r.get(a) { Ok(v) => v, Err(_) => return false };
-                let vb = match r.get(b) { Ok(v) => v, Err(_) => return false };
-                va.len() == vb.len() && va.iter().zip(vb.iter()).all(|(x, y)| x.to_bits() == y.to_bits())
-            }
-            VecReader::F16(r) => {
-                let va = match r.get(a) { Ok(v) => v, Err(_) => return false };
-                let vb = match r.get(b) { Ok(v) => v, Err(_) => return false };
-                va.len() == vb.len() && va.iter().zip(vb.iter()).all(|(x, y)| x.to_bits() == y.to_bits())
-            }
-        }
-    }
-
-    /// Full lexicographic comparison of two vectors.
-    fn compare_vectors(&self, a: usize, b: usize) -> std::cmp::Ordering {
-        match self {
-            VecReader::F32(r) => {
-                let va = r.get_slice(a);
-                let vb = r.get_slice(b);
-                for i in 0..va.len().min(vb.len()) {
-                    match va[i].partial_cmp(&vb[i]) {
-                        Some(std::cmp::Ordering::Equal) => continue,
-                        Some(ord) => return ord,
-                        None => {
-                            // NaN handling: treat NaN as greater than all values
-                            if va[i].is_nan() && vb[i].is_nan() { continue; }
-                            if va[i].is_nan() { return std::cmp::Ordering::Greater; }
-                            return std::cmp::Ordering::Less;
-                        }
-                    }
+            VecReader::F32 { .. } => {
+                let mut out = Vec::with_capacity(dim);
+                for i in 0..dim {
+                    out.push(f32::from_le_bytes([
+                        bytes[i * 4], bytes[i * 4 + 1],
+                        bytes[i * 4 + 2], bytes[i * 4 + 3],
+                    ]));
                 }
-                va.len().cmp(&vb.len())
+                Ok(out)
             }
-            VecReader::F16(r) => {
-                let va = r.get_slice(a);
-                let vb = r.get_slice(b);
-                for i in 0..va.len().min(vb.len()) {
-                    let fa = va[i].to_f32();
-                    let fb = vb[i].to_f32();
+            VecReader::F16 { .. } => {
+                let mut out = Vec::with_capacity(dim);
+                for i in 0..dim {
+                    let bits = u16::from_le_bytes([bytes[i * 2], bytes[i * 2 + 1]]);
+                    out.push(half::f16::from_bits(bits).to_f32());
+                }
+                Ok(out)
+            }
+        }
+    }
+
+    /// Bitwise equality check at native precision — pread both
+    /// vectors' raw bytes and compare. Same RSS-safety contract as
+    /// `get_f32`: no mmap touch.
+    fn vectors_equal(&self, a: usize, b: usize) -> bool {
+        let ba = match self.pread_one_vector_bytes(a) { Ok(v) => v, Err(_) => return false };
+        let bb = match self.pread_one_vector_bytes(b) { Ok(v) => v, Err(_) => return false };
+        ba == bb
+    }
+
+    /// Full lexicographic comparison of two vectors via `pread`. Used
+    /// by the phase-2 in-group sort. The buffers live for the
+    /// duration of one comparison and are dropped on return — no
+    /// mmap pages get mapped into this process during the millions of
+    /// compares phase 2 may issue.
+    fn compare_vectors(&self, a: usize, b: usize) -> std::cmp::Ordering {
+        let ba = match self.pread_one_vector_bytes(a) {
+            Ok(v) => v,
+            Err(_) => return std::cmp::Ordering::Equal,
+        };
+        let bb = match self.pread_one_vector_bytes(b) {
+            Ok(v) => v,
+            Err(_) => return std::cmp::Ordering::Equal,
+        };
+        let dim = self.dim();
+        match self {
+            VecReader::F32 { .. } => {
+                for i in 0..dim {
+                    let fa = f32::from_le_bytes([
+                        ba[i * 4], ba[i * 4 + 1],
+                        ba[i * 4 + 2], ba[i * 4 + 3],
+                    ]);
+                    let fb = f32::from_le_bytes([
+                        bb[i * 4], bb[i * 4 + 1],
+                        bb[i * 4 + 2], bb[i * 4 + 3],
+                    ]);
                     match fa.partial_cmp(&fb) {
                         Some(std::cmp::Ordering::Equal) => continue,
                         Some(ord) => return ord,
@@ -144,34 +199,144 @@ impl VecReader {
                         }
                     }
                 }
-                va.len().cmp(&vb.len())
+                std::cmp::Ordering::Equal
+            }
+            VecReader::F16 { .. } => {
+                for i in 0..dim {
+                    let fa = half::f16::from_bits(
+                        u16::from_le_bytes([ba[i * 2], ba[i * 2 + 1]])
+                    ).to_f32();
+                    let fb = half::f16::from_bits(
+                        u16::from_le_bytes([bb[i * 2], bb[i * 2 + 1]])
+                    ).to_f32();
+                    match fa.partial_cmp(&fb) {
+                        Some(std::cmp::Ordering::Equal) => continue,
+                        Some(ord) => return ord,
+                        None => {
+                            if fa.is_nan() && fb.is_nan() { continue; }
+                            if fa.is_nan() { return std::cmp::Ordering::Greater; }
+                            return std::cmp::Ordering::Less;
+                        }
+                    }
+                }
+                std::cmp::Ordering::Equal
             }
         }
     }
 
     fn format_name(&self) -> &'static str {
         match self {
-            VecReader::F32(_) => "f32",
-            VecReader::F16(_) => "f16",
+            VecReader::F32 { .. } => "f32",
+            VecReader::F16 { .. } => "f16",
         }
     }
 
-    /// Read the first `n` components of vector at `index` as f32 into `out`.
+    /// Hint the kernel to drop the page-cache pages backing source
+    /// vectors `[start, end)`. Called after a batch's prefix reads
+    /// complete to keep page-cache footprint bounded — without this,
+    /// the source mmap holds onto every page touched, growing pcache
+    /// linearly with bytes read until the kernel hits memory pressure
+    /// (or the governor aborts the run for exceeding RSS ceiling).
+    fn release_range(&self, start: usize, end: usize) {
+        match self {
+            VecReader::F32 { mmap, .. } => mmap.release_range(start, end),
+            VecReader::F16 { mmap, .. } => mmap.release_range(start, end),
+        }
+    }
+
+    /// Disable kernel readahead on the source mmap. Critical for the
+    /// prefix-read pass: without it, every 4-byte prefix access faults
+    /// in 256 KB of surrounding pages, inflating RSS by 64× more than
+    /// the data we actually consume.
+    fn advise_random(&self) {
+        match self {
+            VecReader::F32 { mmap, .. } => mmap.advise_random(),
+            VecReader::F16 { mmap, .. } => mmap.advise_random(),
+        }
+    }
+
+    /// Read a contiguous range of vector bytes via `pread` into the
+    /// caller's pre-allocated buffer. Used by the phase-1 prefix
+    /// pass — see `pread_vector_range_into`.
     ///
-    /// Zero-allocation for f32 sources (direct mmap slice). For f16 sources,
-    /// upcasts only the requested components — no full-vector allocation.
-    #[inline]
-    fn prefix_f32_into(&self, index: usize, out: &mut [f32]) {
+    /// `buf` is resized (via `set_len`) to fit exactly the requested
+    /// byte range and then filled by parallel `pread` calls. Caller
+    /// owns the allocation and reuses it across batches — critical
+    /// to avoid paying ~50M anonymous-page-fault first-touch cost on
+    /// every batch.
+    fn pread_vector_range_into(
+        &self,
+        start: usize,
+        end: usize,
+        buf: &mut Vec<u8>,
+    ) -> Result<(), String> {
+        use rayon::prelude::*;
+        use std::os::unix::fs::FileExt;
+        let entry_size = self.entry_size();
+        let byte_start = (start * entry_size) as u64;
+        let byte_len = (end - start) * entry_size;
+
+        // Resize to exactly the bytes we need. If the buffer's
+        // existing capacity is enough, this is a no-op alloc; if
+        // it's not, we grow it once (the caller's job to size it
+        // for the largest batch up front so we never grow).
+        if buf.capacity() < byte_len {
+            buf.reserve(byte_len - buf.capacity());
+        }
+        // Promise the bytes are valid; they'll be filled below. The
+        // first batch pays the page-fault cost; subsequent batches
+        // hit already-committed pages.
+        unsafe { buf.set_len(byte_len); }
+
+        // Pick a parallelism that scales with the read size. Each
+        // chunk should be large enough that the storage likes the
+        // I/O size (>= 1 MiB) but small enough that we get real
+        // parallelism across rayon threads.
+        const CHUNK_BYTES: usize = 16 * 1024 * 1024;
+        let n_chunks = ((byte_len + CHUNK_BYTES - 1) / CHUNK_BYTES).max(1);
+        let chunk_size = (byte_len + n_chunks - 1) / n_chunks;
+        let file = self.pread_file();
+
+        buf.par_chunks_mut(chunk_size)
+            .enumerate()
+            .try_for_each(|(i, slice)| {
+                let off = byte_start + (i * chunk_size) as u64;
+                file.read_exact_at(slice, off).map_err(|e| format!(
+                    "pread chunk {} ({} bytes @ {}): {}",
+                    i, slice.len(), off, e,
+                ))
+            })
+    }
+
+    /// Decode the prefix of vector `local_idx` (offset within `batch_buf`)
+    /// into `out`. `batch_buf` must be the bytes from
+    /// [`pread_vector_range`] for this vector range. Decodes
+    /// f16 → f32 in-line for f16 sources.
+    fn prefix_from_buf_into(
+        &self,
+        batch_buf: &[u8],
+        local_idx: usize,
+        out: &mut [f32],
+    ) {
+        let entry_size = self.entry_size();
+        let entry_offset = local_idx * entry_size + 4;  // skip i32 dim header
         let n = out.len();
         match self {
-            VecReader::F32(r) => {
-                let slice = r.get_slice(index);
-                out.copy_from_slice(&slice[..n]);
+            VecReader::F32 { .. } => {
+                let bytes_needed = n * 4;
+                let src = &batch_buf[entry_offset..entry_offset + bytes_needed];
+                for i in 0..n {
+                    out[i] = f32::from_le_bytes([
+                        src[i * 4], src[i * 4 + 1], src[i * 4 + 2], src[i * 4 + 3],
+                    ]);
+                }
             }
-            VecReader::F16(r) => {
-                let slice = r.get_slice(index);
-                for (dst, src) in out.iter_mut().zip(slice[..n].iter()) {
-                    *dst = src.to_f32();
+            VecReader::F16 { .. } => {
+                let bytes_needed = n * 2;
+                let src = &batch_buf[entry_offset..entry_offset + bytes_needed];
+                for i in 0..n {
+                    let bits = u16::from_le_bytes([src[i * 2], src[i * 2 + 1]]);
+                    out[i] = half::f16::from_bits(bits).to_f32();
                 }
             }
         }
@@ -408,23 +573,46 @@ shuffle, KNN, or metadata alignment. The output index can be fed to
             explicit
         } else if let Some(mem_ceiling) = ctx.governor.mem_ceiling() {
             let snapshot = crate::pipeline::resource::SystemSnapshot::sample();
-            let target = (mem_ceiling as f64 * 0.70) as u64;
+            // Aim for the per-batch peak to land at ~40% of ceiling.
+            // The other ~25% headroom (we're already capped at 65% of
+            // physical RAM) covers:
+            //   - phase-2 `all_records` (~48 B/record, can be 30+ GiB
+            //     on billion-record inputs, lives concurrently with
+            //     output buffers, sort scratch, etc.);
+            //   - kernel page cache for the source file that the
+            //     governor counts as RSS-equivalent pressure;
+            //   - allocator slack and rayon thread-local buffers.
+            let target = (mem_ceiling as f64 * 0.40) as u64;
             let available = if snapshot.rss_bytes < target {
                 target - snapshot.rss_bytes
             } else {
-                (mem_ceiling as f64 * 0.15) as u64
+                (mem_ceiling as f64 * 0.10) as u64
             };
-            // Bytes per entry: sort key vec (~48B) + RunRecord (~48B) + overhead
-            let bytes_per_entry: u64 = 96 + (MAX_PREFIX as u64 * 8);
+            // True per-batch peak memory cost. Contributions:
+            //   - `batch_buf`:   one pread'd vector per entry → entry_size B
+            //   - `entries`:     RunRecord + sort key → ~96 B + MAX_PREFIX*8 B
+            //   - sort scratch:  rayon's par_sort_unstable_by uses a
+            //                    temporary buffer roughly the same
+            //                    size as the input → +entries again
+            //   - allocator slack: jemalloc/glibc rounds up; conservatively
+            //                    add 20% to the heap entries we control
+            // Final factor: ~1.4× the strict accounting of (batch_buf +
+            // entries) to leave headroom against measurement error.
+            let entry_size = reader.entry_size() as u64;
+            let strict = entry_size + 2 * (96 + (MAX_PREFIX as u64 * 8));
+            let bytes_per_entry: u64 = (strict as f64 * 1.20) as u64;
             let governor_batch = (available / bytes_per_entry) as usize;
-            let clamped = governor_batch.max(10_000).min(10_000_000);
+            // Floor at 10K so tiny inputs still get a real batch.
+            // No hard upper cap — the governor sized this.
+            let clamped = governor_batch.max(10_000).min(count.max(1));
             if clamped != DEFAULT_BATCH_SIZE {
                 ctx.ui.log(&format!(
-                    "  governor-derived batch size: {} (available: {} MiB, RSS: {} MiB, ceiling: {} MiB)",
+                    "  governor-derived batch size: {} (available: {} MiB, RSS: {} MiB, ceiling: {} MiB, per-entry: {} B incl. overhead)",
                     clamped,
                     available / (1 << 20),
                     snapshot.rss_bytes / (1 << 20),
                     mem_ceiling / (1 << 20),
+                    bytes_per_entry,
                 ));
             }
             clamped
@@ -504,7 +692,9 @@ shuffle, KNN, or metadata alignment. The output index can be fed to
         ensure_parent(&duplicates_path);
         let (unique_count, dup_count) = match merge_runs(
             &run_files, prefix_width, &reader, dim, elide,
-            &output_path, &duplicates_path, count, ctx,
+            &output_path, &duplicates_path, count,
+            Some(phase.id()),
+            ctx,
         ) {
             Ok(counts) => counts,
             Err(e) => return error_result(e, start),
@@ -519,46 +709,101 @@ shuffle, KNN, or metadata alignment. The output index can be fed to
             format_count(count - dup_count), // non-dup entries never needed full read
         ));
 
-        // ── Zero vector removal ──────────────────────────────────────
-        // Scan the deduped ordinals for zero vectors and remove them.
-        // This ensures clean_count excludes zeros, so all downstream
-        // extractions (base vectors AND metadata) use the same ordinal
-        // set. Attempting to L2-normalize a zero vector is an error —
-        // zeros must be caught here, not silently dropped during extraction.
-        let zero_count = {
+        // ── Zero vector accounting + removal ─────────────────────────
+        // Tell the parent step spinner we've left phase 2 so the
+        // user sees the new "phase 3/3: zero scan" message instead of
+        // the stale "phase 2/3: parallel merge" while this scan runs.
+        phase.set_message("phase 3/3: zero scan + report".to_string());
+        // Attempting to L2-normalize a zero vector is an error, so
+        // every zero must be caught here, not silently dropped during
+        // extraction. The subtlety: dedup already ran, and if the
+        // dataset contains N identical zero vectors, dedup routed one
+        // survivor to the output ordinals and (N-1) to the duplicates
+        // ordinals — misattributing (N-1) zeros as "duplicates".
+        //
+        // To report counts accurately we must scan BOTH files for
+        // zero-norm vectors:
+        //   - Zeros in `output_path` are removed (rewrite without them).
+        //   - Zeros in `duplicates_path` are counted toward `zero_count`
+        //     and subtracted from `dup_count`. They can stay in the
+        //     duplicates ordinals file — downstream consumers use that
+        //     list to *exclude* ordinals anyway, so zero-duplicates
+        //     still correctly get excluded. Only the reported counts
+        //     need fixing.
+        // Parallel zero scan. The scan is one pread + norm² per
+        // ordinal, and on a billion-record input that's a billion
+        // syscalls — single-threaded this takes 15+ minutes of silent
+        // wall time even with all pages cache-warm. Rayon-parallelize
+        // and emit a progress bar so the step is observable.
+        let scan_zeros = |data: &[u8], label: &str| -> Result<Vec<usize>, String> {
+            use rayon::prelude::*;
+            let record_size = 4 + 4; // dim=1 (i32) + ordinal (i32)
+            let ord_count = data.len() / record_size;
+            if ord_count == 0 { return Ok(Vec::new()); }
+
+            let pb = ctx.ui.bar_with_unit(ord_count as u64, label, "vec");
+            let pb_id = pb.id();
+            let progress = std::sync::atomic::AtomicU64::new(0);
+            // Flush ~200 progress updates total over the whole scan.
+            let flush_every = ((ord_count / 200).max(50_000)) as u64;
+
+            let result: Result<Vec<usize>, String> = (0..ord_count)
+                .into_par_iter()
+                .filter_map(|i| {
+                    let offset = i * record_size + 4;
+                    let ordinal = i32::from_le_bytes([
+                        data[offset], data[offset+1],
+                        data[offset+2], data[offset+3],
+                    ]) as usize;
+                    let vec = match reader.get_f32(ordinal) {
+                        Ok(v) => v,
+                        Err(e) => return Some(Err(format!("zero scan: {}", e))),
+                    };
+                    // Throttled progress flush.
+                    let done = progress.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    if done % flush_every == 0 {
+                        ctx.ui.inc_by_id(pb_id, flush_every);
+                    }
+                    // norm² == 0 ⇔ all components exactly zero in f32;
+                    // keep it as a squared-sum (no sqrt needed).
+                    let norm_sq: f64 = vec.iter().map(|&v| (v as f64) * (v as f64)).sum();
+                    if norm_sq == 0.0 {
+                        Some(Ok(i))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            // Final flush of any remainder.
+            let total_done = progress.load(std::sync::atomic::Ordering::Relaxed);
+            let last_full_flush = (total_done / flush_every) * flush_every;
+            let tail = total_done.saturating_sub(last_full_flush);
+            if tail > 0 {
+                ctx.ui.inc_by_id(pb_id, tail);
+            }
+            pb.finish();
+            result
+        };
+
+        // Scan the surviving-uniques path and rewrite it without zeros.
+        let output_zero_count = {
             let ord_data = match std::fs::read(&output_path) {
                 Ok(d) => d,
                 Err(e) => return error_result(format!("read ordinals for zero scan: {}", e), start),
             };
-            let record_size = 4 + 4; // dim=1 (i32) + ordinal (i32)
+            let record_size = 4 + 4;
             let ord_count = ord_data.len() / record_size;
-            let mut zeros: Vec<usize> = Vec::new(); // indices into ordinals that are zero vectors
-
-            for i in 0..ord_count {
-                let offset = i * record_size + 4; // skip dim header
-                let ordinal = i32::from_le_bytes([
-                    ord_data[offset], ord_data[offset+1],
-                    ord_data[offset+2], ord_data[offset+3],
-                ]) as usize;
-                // Read the source vector and check norm
-                let vec = match reader.get_f32(ordinal) {
-                    Ok(v) => v,
-                    Err(e) => return error_result(format!("zero scan: {}", e), start),
-                };
-                let norm_sq: f64 = vec.iter().map(|&v| (v as f64) * (v as f64)).sum();
-                if norm_sq == 0.0 {
-                    zeros.push(i);
-                }
-            }
-
+            let zeros = match scan_zeros(&ord_data, "zero scan: uniques") {
+                Ok(z) => z,
+                Err(e) => return error_result(e, start),
+            };
             if !zeros.is_empty() {
-                // Rewrite ordinals without zero vectors
                 let zero_set: std::collections::HashSet<usize> = zeros.iter().copied().collect();
                 let mut clean_data = Vec::with_capacity(ord_data.len());
                 for i in 0..ord_count {
                     if !zero_set.contains(&i) {
-                        let start = i * record_size;
-                        clean_data.extend_from_slice(&ord_data[start..start + record_size]);
+                        let s = i * record_size;
+                        clean_data.extend_from_slice(&ord_data[s..s + record_size]);
                     }
                 }
                 if let Err(e) = std::fs::write(&output_path, &clean_data) {
@@ -566,9 +811,44 @@ shuffle, KNN, or metadata alignment. The output index can be fed to
                 }
                 ctx.ui.log(&format!("  removed {} zero vector(s) from ordinals", zeros.len()));
             }
-
             zeros.len()
         };
+
+        // Scan the duplicates path — every zero found here was a zero
+        // that dedup saw as a "duplicate of another zero". For
+        // accurate attribution, count it as a zero, not a dup.
+        let dup_zero_count = match std::fs::read(&duplicates_path) {
+            Ok(data) if !data.is_empty() => {
+                let zeros = match scan_zeros(&data, "zero scan: dups") {
+                    Ok(z) => z,
+                    Err(e) => return error_result(e, start),
+                };
+                zeros.len()
+            }
+            _ => 0,
+        };
+        if dup_zero_count > 0 {
+            ctx.ui.log(&format!(
+                "  reclassified {} zero vector(s) from duplicate list (they were duplicates-of-zero)",
+                dup_zero_count,
+            ));
+        }
+
+        // Accurate, non-overlapping counts. The three buckets must
+        // partition `count` exactly:
+        //   count = unique_count + dup_count + zero_count
+        // Re-attribute the zero ordinals dedup misclassified as
+        // duplicates of each other:
+        //   - `output_zero_count` zeros came from the survivors-of-
+        //     dedup bucket (`unique_count`); they're now zeros.
+        //   - `dup_zero_count` zeros came from the duplicates-of-
+        //     each-other bucket (`dup_count`); they're now zeros.
+        let zero_count = output_zero_count + dup_zero_count;
+        let unique_count = unique_count.saturating_sub(output_zero_count);
+        let dup_count = dup_count.saturating_sub(dup_zero_count);
+        debug_assert_eq!(unique_count + dup_count + zero_count, count,
+            "bucket partition broken: unique={} + dup={} + zero={} != count={}",
+            unique_count, dup_count, zero_count, count);
 
         // ── Phase 3: Write report and clean up ────────────────────────
         phase.set_message("phase 3/3: writing report".to_string());
@@ -589,25 +869,37 @@ shuffle, KNN, or metadata alignment. The output index can be fed to
         } else { 0.0 };
         let dup_pct = if count > 0 { 100.0 * dup_count as f64 / count as f64 } else { 0.0 };
 
-        // Write verified counts so the bound checker can validate the output.
-        // Excludes zero vectors (already removed from the ordinals file).
-        let output_records = (if elide { unique_count } else { count }) - zero_count;
+        // Write verified counts so the bound checker can validate the
+        // output. `unique_count` is already post-zero-removal — it
+        // excludes the zeros that survived dedup — so the file at
+        // `output_path` (with elide=true) has exactly `unique_count`
+        // records. With elide=false the file holds (count - zero_count)
+        // records: dups stay in but zeros were removed from output_path
+        // by the rewrite above.
+        let output_records = if elide { unique_count } else { count - zero_count };
         let var_name = format!("verified_count:{}",
             output_path.file_name().and_then(|n| n.to_str()).unwrap_or("output"));
         let _ = crate::pipeline::variables::set_and_save(
             &ctx.workspace, &var_name, &output_records.to_string());
         ctx.defaults.insert(var_name, output_records.to_string());
 
+        // The duplicates file still physically contains zero ordinals
+        // (we didn't move them out — exclusion-by-list still works
+        // identically). The reported count is the true non-zero dup
+        // count, but the file's record count is dup_count + dup_zero_count.
+        let dup_file_records = dup_count + dup_zero_count;
         let dup_var_name = format!("verified_count:{}",
             duplicates_path.file_name().and_then(|n| n.to_str()).unwrap_or("dups"));
         let _ = crate::pipeline::variables::set_and_save(
-            &ctx.workspace, &dup_var_name, &dup_count.to_string());
-        ctx.defaults.insert(dup_var_name, dup_count.to_string());
+            &ctx.workspace, &dup_var_name, &dup_file_records.to_string());
+        ctx.defaults.insert(dup_var_name, dup_file_records.to_string());
 
-        // clean_count = unique vectors after dedup AND zero removal.
-        // This is the definitive population size for shuffle and all
-        // downstream extractions (base vectors, metadata, predicates).
-        let clean_count = (if elide { unique_count } else { count }) - zero_count;
+        // clean_count = the population available for downstream sampling
+        // (shuffle, extract-base, extract-queries). Always equals
+        // `unique_count` post-zero-removal regardless of elide setting,
+        // since every consumer applies the duplicates list as an
+        // exclusion filter.
+        let clean_count = unique_count;
         let _ = crate::pipeline::variables::set_and_save(
             &ctx.workspace, "clean_count", &clean_count.to_string());
         ctx.defaults.insert("clean_count".into(), clean_count.to_string());
@@ -813,7 +1105,24 @@ fn create_sorted_runs(
     let num_runs = ((count + batch_size - 1) / batch_size).max(1);
     let mut run_files: Vec<PathBuf> = Vec::new();
     let mut skipped = 0u32;
+    // The prefix-read pass touches only ~4–40 bytes per vector but
+    // those reads are spread across a multi-TB file. Default kernel
+    // readahead would map in ~256 KB around each access, inflating
+    // process RSS by 64×+ over the actual prefix data — the dominant
+    // cause of the "RSS over ceiling" abort on huge sources. Disable
+    // readahead for this pass; on-demand single-page faults are what
+    // we want here.
+    reader.advise_random();
+
     let pb = ctx.ui.bar_with_unit(count as u64, "building runs", "vec");
+
+    // Reusable batch buffer. Pre-allocate to the largest batch's
+    // byte size so it never grows during the run, and the
+    // first-touch anonymous-page faults happen ONCE on the first
+    // batch instead of on every batch. For a 192 GiB buffer that's
+    // ~50 saved batches × ~30s of fault overhead each.
+    let max_batch_bytes = batch_size * reader.entry_size();
+    let mut batch_buf: Vec<u8> = Vec::with_capacity(max_batch_bytes);
 
     let mut batch_start = 0;
     let mut run_idx = 0u32;
@@ -857,8 +1166,19 @@ fn create_sorted_runs(
             run_idx + 1, num_runs, format_count(batch_len), batch_start, batch_end,
         ));
 
-        // Each vector read uses get_slice (zero-alloc mmap borrow) and only
-        // reads prefix_width components — not the full vector.
+        // Pull the entire batch's bytes into our reusable heap
+        // buffer via parallel pread. Bypasses the source mmap
+        // entirely — the bytes flow through the kernel page cache
+        // (cache-warm if the file's been touched recently) but are
+        // copied into our owned buffer rather than mapped into our
+        // address space.
+        //
+        // The buffer is owned outside this loop and reused across
+        // every batch, so the per-batch first-touch page-fault cost
+        // is paid once on iteration 1 and the rest hit committed
+        // pages.
+        reader.pread_vector_range_into(batch_start, batch_end, &mut batch_buf)?;
+
         let mut entries: Vec<([u32; MAX_PREFIX], RunRecord)>;
         {
             use rayon::prelude::*;
@@ -870,11 +1190,12 @@ fn create_sorted_runs(
             let pw = prefix_width;
 
             let build_fn = || {
-                (batch_start..batch_end)
+                (0..batch_len)
                     .into_par_iter()
-                    .map(|i| {
+                    .map(|local_i| {
+                        let i = batch_start + local_i;
                         let mut prefix_buf = [0.0f32; MAX_PREFIX];
-                        reader.prefix_f32_into(i, &mut prefix_buf[..pw]);
+                        reader.prefix_from_buf_into(&batch_buf, local_i, &mut prefix_buf[..pw]);
                         let key = build_sort_key(&prefix_buf[..pw]);
                         let record = RunRecord::new(i as u32, &prefix_buf[..pw]);
                         let done = progress.fetch_add(1, AtomicOrd::Relaxed) + 1;
@@ -897,6 +1218,8 @@ fn create_sorted_runs(
                 Err(e) => return Err(e),
             };
         }
+        // batch_buf is owned by the loop scope — it'll be reused
+        // for the next batch (committed pages, no faults).
         pb.set_position(batch_end as u64);
         let read_secs = sub_start.elapsed().as_secs_f64();
         let read_rate = if read_secs > 0.0 { batch_len as f64 / read_secs } else { 0.0 };
@@ -942,6 +1265,17 @@ fn create_sorted_runs(
 
         run_files.push(run_path);
         run_idx += 1;
+
+        // Drop the page-cache pages backing this batch's source range.
+        // Without this, the source mmap accumulates every byte we
+        // touched into pcache — for a 1.4 TB input that means pcache
+        // grows linearly and eventually pushes the process past the
+        // governor's RSS ceiling. The merge phase later does sparse
+        // random-access reads into the same file; those will re-fault
+        // pages on demand, which is fine — the cost is ~one page per
+        // full-vector compare, which only happens for prefix-collision
+        // groups (already a small fraction of records).
+        reader.release_range(batch_start, batch_end);
 
         let total_secs = sub_start.elapsed().as_secs_f64();
         ctx.ui.log(&format!(
@@ -1000,9 +1334,24 @@ fn merge_runs(
     output_path: &Path,
     duplicates_path: &Path,
     total: usize,
+    phase_id: Option<veks_core::ui::ProgressId>,
     ctx: &mut StreamContext,
 ) -> Result<(usize, usize), String> {
     use rayon::prelude::*;
+
+    // Macro that updates the parent step spinner's message so the
+    // user sees which sub-phase of phase 2 is currently running. The
+    // top-line spinner otherwise stays on a stale "phase 2/3:
+    // parallel merge" for the full ~minute the merge takes. (Macro
+    // rather than closure so it doesn't fight with `ctx`'s mutable
+    // borrow elsewhere in this function.)
+    macro_rules! set_phase_msg {
+        ($msg:expr) => {
+            if let Some(id) = phase_id {
+                ctx.ui.set_message_by_id(id, $msg.to_string());
+            }
+        };
+    }
 
     let threads = ctx.governor.current_or("threads", ctx.threads as u64)
         .max(1) as usize;
@@ -1012,6 +1361,7 @@ fn merge_runs(
         .ok();
 
     // ── Sub-phase A: Load all runs in parallel ───────────────────────
+    set_phase_msg!("phase 2/3: loading sorted runs");
     let load_start = Instant::now();
     ctx.ui.log(&format!("  loading {} run files ({} threads)...", run_files.len(), threads));
     let pb = ctx.ui.bar_with_unit(run_files.len() as u64, "loading runs", "files");
@@ -1043,6 +1393,7 @@ fn merge_runs(
     ctx.ui.log(&format!("  loaded in {:.1}s", load_secs));
 
     // Flatten into a single vec
+    set_phase_msg!("phase 2/3: flattening run records");
     let flatten_start = Instant::now();
     let mut all_records: Vec<RunRecord> = Vec::with_capacity(total);
     for mut run in per_run_records {
@@ -1057,6 +1408,7 @@ fn merge_runs(
     ));
 
     // ── Sub-phase B: Parallel sort ───────────────────────────────────
+    set_phase_msg!("phase 2/3: sorting all records by prefix");
     let sort_start = Instant::now();
     let sort_pb = ctx.ui.spinner(&format!("sorting {} records ({} threads)", all_records.len(), threads));
 
@@ -1084,6 +1436,7 @@ fn merge_runs(
     //
     // Boundary pairs (last of chunk N vs first of chunk N+1) are fixed
     // up in a tiny sequential pass before concatenating the buffers.
+    set_phase_msg!("phase 2/3: dedup scan + emit ordinals");
     let scan_start = Instant::now();
     ctx.ui.log(&format!("  dedup+write: {} threads, {} records", threads, total));
 
@@ -1132,6 +1485,16 @@ fn merge_runs(
         let mut dup_buf = Vec::new();
         let mut dups = 0usize;
         let mut local_stats = PrefixGroupStats::default();
+
+        // Throttled in-chunk progress reporting. With 128 parallel
+        // chunks each holding ~7-8M records and the dedup pass taking
+        // ~tens of seconds per chunk, a single inc-at-end means the
+        // bar appears frozen for the whole phase then jumps to 100%.
+        // Flush the local counter every PROGRESS_FLUSH records so the
+        // bar advances smoothly while keeping the UI event volume
+        // bounded (~20 inc events per chunk per 100k records).
+        const PROGRESS_FLUSH: usize = 100_000;
+        let mut progress_pending: usize = 0;
 
         // Process the chunk in prefix groups. Within each group,
         // sort by full vector content so exact duplicates become
@@ -1200,10 +1563,22 @@ fn merge_runs(
                     }
                 }
             }
+            // Account every record in the group toward progress —
+            // singletons are O(1), multi-element groups did the work
+            // of sorting and dedup'ing, but from the user's
+            // perspective they've all been "processed".
+            progress_pending += group_len;
+            if progress_pending >= PROGRESS_FLUSH {
+                ctx.ui.inc_by_id(pb_id, progress_pending as u64);
+                progress_pending = 0;
+            }
             group_start = group_end;
         }
 
-        ctx.ui.inc_by_id(pb_id, chunk.len() as u64);
+        // Flush any remaining tail.
+        if progress_pending > 0 {
+            ctx.ui.inc_by_id(pb_id, progress_pending as u64);
+        }
         if let Ok(mut stats) = prefix_group_stats.lock() {
             stats.merge(&local_stats);
         }
@@ -1295,6 +1670,7 @@ fn merge_runs(
     }
 
     // ── Sub-phase D: Write files ─────────────────────────────────────
+    set_phase_msg!("phase 2/3: writing output ordinals");
     let write_start = Instant::now();
     ensure_parent(output_path);
     ensure_parent(duplicates_path);

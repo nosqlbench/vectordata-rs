@@ -188,7 +188,6 @@ fn run_pipeline_command(
         profile: String::new(),
         profile_names: vec![],
         workspace: workspace.clone(),
-        scratch: workspace.join(".scratch"),
         cache: workspace.join(".cache"),
         defaults: IndexMap::new(),
         dry_run: false,

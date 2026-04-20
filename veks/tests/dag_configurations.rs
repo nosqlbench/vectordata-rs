@@ -280,7 +280,7 @@ fn read_yaml(dir: &Path) -> String {
 #[test]
 fn dag_01_minimal_self_search() {
     let tmp = make_tempdir();
-    let fvec = tmp.path().join("vectors.fvec");
+    let fvec = tmp.path().join("vectors.fvecs");
     write_fvec(&fvec, 200);
 
     let out = tmp.path().join("out");
@@ -325,7 +325,7 @@ fn dag_01_minimal_self_search() {
 #[test]
 fn dag_02_no_cleaning() {
     let tmp = make_tempdir();
-    let fvec = tmp.path().join("vectors.fvec");
+    let fvec = tmp.path().join("vectors.fvecs");
     write_fvec(&fvec, 200);
 
     let out = tmp.path().join("out");
@@ -355,8 +355,8 @@ fn dag_02_no_cleaning() {
 #[test]
 fn dag_03_separate_queries() {
     let tmp = make_tempdir();
-    let base = tmp.path().join("base.fvec");
-    let query = tmp.path().join("query.fvec");
+    let base = tmp.path().join("base.fvecs");
+    let query = tmp.path().join("query.fvecs");
     write_fvec(&base, 200);
     write_fvec(&query, 50);
 
@@ -381,7 +381,7 @@ fn dag_03_separate_queries() {
 #[test]
 fn dag_04_with_metadata() {
     let tmp = make_tempdir();
-    let fvec = tmp.path().join("vectors.fvec");
+    let fvec = tmp.path().join("vectors.fvecs");
     write_fvec(&fvec, 200);
     let meta = tmp.path().join("meta");
     write_parquet_metadata(&meta);
@@ -413,7 +413,7 @@ fn dag_04_with_metadata() {
 #[test]
 fn dag_05_base_fraction() {
     let tmp = make_tempdir();
-    let fvec = tmp.path().join("vectors.fvec");
+    let fvec = tmp.path().join("vectors.fvecs");
     write_fvec(&fvec, 200);
 
     let out = tmp.path().join("out");
@@ -442,7 +442,7 @@ fn dag_05_base_fraction() {
 #[test]
 fn dag_06_no_dedup_with_metadata() {
     let tmp = make_tempdir();
-    let fvec = tmp.path().join("vectors.fvec");
+    let fvec = tmp.path().join("vectors.fvecs");
     write_fvec(&fvec, 200);
     let meta = tmp.path().join("meta");
     write_parquet_metadata(&meta);
@@ -473,7 +473,7 @@ fn dag_06_no_dedup_with_metadata() {
 #[test]
 fn dag_07_metadata_no_filtered() {
     let tmp = make_tempdir();
-    let fvec = tmp.path().join("vectors.fvec");
+    let fvec = tmp.path().join("vectors.fvecs");
     write_fvec(&fvec, 200);
     let meta = tmp.path().join("meta");
     write_parquet_metadata(&meta);
@@ -523,9 +523,9 @@ fn dag_08_foreign_base_npy() {
 #[test]
 fn dag_09_precomputed_gt() {
     let tmp = make_tempdir();
-    let base = tmp.path().join("base.fvec");
-    let query = tmp.path().join("query.fvec");
-    let gt = tmp.path().join("gt.ivec");
+    let base = tmp.path().join("base.fvecs");
+    let query = tmp.path().join("query.fvecs");
+    let gt = tmp.path().join("gt.ivecs");
     write_fvec(&base, 200);
     write_fvec(&query, 50);
     write_ivec(&gt, 50, 10); // 50 queries × 10 neighbors
@@ -550,7 +550,7 @@ fn dag_09_precomputed_gt() {
 #[test]
 fn dag_10_normalize() {
     let tmp = make_tempdir();
-    let fvec = tmp.path().join("vectors.fvec");
+    let fvec = tmp.path().join("vectors.fvecs");
     write_fvec(&fvec, 200);
 
     let out = tmp.path().join("out");
@@ -574,7 +574,7 @@ fn dag_10_normalize() {
 #[test]
 fn dag_11_fraction_with_metadata() {
     let tmp = make_tempdir();
-    let fvec = tmp.path().join("vectors.fvec");
+    let fvec = tmp.path().join("vectors.fvecs");
     write_fvec(&fvec, 200);
     let meta = tmp.path().join("meta");
     write_parquet_metadata(&meta);
@@ -606,7 +606,7 @@ fn dag_11_fraction_with_metadata() {
 #[test]
 fn dag_12_base_only_no_queries() {
     let tmp = make_tempdir();
-    let fvec = tmp.path().join("vectors.fvec");
+    let fvec = tmp.path().join("vectors.fvecs");
     write_fvec(&fvec, 200);
 
     let out = tmp.path().join("out");
@@ -632,7 +632,7 @@ fn dag_12_base_only_no_queries() {
 #[test]
 fn dag_13_explicit_bqg() {
     let tmp = make_tempdir();
-    let fvec = tmp.path().join("vectors.fvec");
+    let fvec = tmp.path().join("vectors.fvecs");
     write_fvec(&fvec, 200);
 
     let out = tmp.path().join("out");
@@ -681,10 +681,10 @@ fn dag_14_no_inputs() {
 #[test]
 fn dag_15_precomputed_gt_and_distances() {
     let tmp = make_tempdir();
-    let base = tmp.path().join("base.fvec");
-    let query = tmp.path().join("query.fvec");
-    let gt = tmp.path().join("gt.ivec");
-    let dist = tmp.path().join("dist.fvec");
+    let base = tmp.path().join("base.fvecs");
+    let query = tmp.path().join("query.fvecs");
+    let gt = tmp.path().join("gt.ivecs");
+    let dist = tmp.path().join("dist.fvecs");
     write_fvec(&base, 200);
     write_fvec(&query, 50);
     write_ivec(&gt, 50, 10);
@@ -709,7 +709,7 @@ fn dag_15_precomputed_gt_and_distances() {
 #[test]
 fn dag_16_sized_profiles() {
     let tmp = make_tempdir();
-    let fvec = tmp.path().join("vectors.fvec");
+    let fvec = tmp.path().join("vectors.fvecs");
     write_fvec(&fvec, 200);
 
     let out = tmp.path().join("out");
@@ -730,7 +730,7 @@ fn dag_16_sized_profiles() {
 #[test]
 fn dag_17_metadata_explicit_no_filtered() {
     let tmp = make_tempdir();
-    let fvec = tmp.path().join("vectors.fvec");
+    let fvec = tmp.path().join("vectors.fvecs");
     write_fvec(&fvec, 200);
     let meta = tmp.path().join("meta");
     write_parquet_metadata(&meta);
@@ -812,7 +812,7 @@ fn dag_18_full_pipeline() {
 #[test]
 fn dag_19_fraction_metadata_import() {
     let tmp = make_tempdir();
-    let fvec = tmp.path().join("vectors.fvec");
+    let fvec = tmp.path().join("vectors.fvecs");
     write_fvec(&fvec, 200);
     let meta = tmp.path().join("meta");
     write_parquet_metadata(&meta);
@@ -861,7 +861,7 @@ fn dag_20_bare_number_fraction_rejected() {
 #[test]
 fn dag_21_early_stratification() {
     let tmp = make_tempdir();
-    let fvec = tmp.path().join("vectors.fvec");
+    let fvec = tmp.path().join("vectors.fvecs");
     write_fvec(&fvec, 200);
 
     let out = tmp.path().join("out");
@@ -890,7 +890,7 @@ fn dag_21_early_stratification() {
 #[test]
 fn dag_22_fraction_with_early_stratification() {
     let tmp = make_tempdir();
-    let fvec = tmp.path().join("vectors.fvec");
+    let fvec = tmp.path().join("vectors.fvecs");
     write_fvec(&fvec, 200);
 
     let out = tmp.path().join("out");
@@ -922,7 +922,7 @@ fn dag_22_fraction_with_early_stratification() {
 #[test]
 fn dag_23_full_with_early_stratification() {
     let tmp = make_tempdir();
-    let fvec = tmp.path().join("vectors.fvec");
+    let fvec = tmp.path().join("vectors.fvecs");
     write_fvec(&fvec, 200);
     let meta_dir = tmp.path().join("metadata");
     write_parquet_metadata(&meta_dir);
@@ -955,7 +955,7 @@ fn dag_23_full_with_early_stratification() {
 #[test]
 fn dag_finalize_field_emitted_correctly() {
     let tmp = make_tempdir();
-    let fvec = tmp.path().join("vectors.fvec");
+    let fvec = tmp.path().join("vectors.fvecs");
     write_fvec(&fvec, 200);
 
     let out = tmp.path().join("out");
@@ -971,6 +971,7 @@ fn dag_finalize_field_emitted_correctly() {
         "generate-dataset-json",
         "generate-variables-json",
         "generate-dataset-log-jsonl",
+        "generate-docs",
         "generate-merkle",
         "generate-catalog",
     ];
@@ -999,7 +1000,7 @@ fn dag_finalize_field_emitted_correctly() {
 #[test]
 fn dag_finalize_partitioning() {
     let tmp = make_tempdir();
-    let fvec = tmp.path().join("vectors.fvec");
+    let fvec = tmp.path().join("vectors.fvecs");
     write_fvec(&fvec, 200);
 
     let out = tmp.path().join("out");
@@ -1068,7 +1069,7 @@ fn dag_finalize_partitioning() {
 #[test]
 fn dag_finalize_excluded_from_reexpansion() {
     let tmp = make_tempdir();
-    let fvec = tmp.path().join("vectors.fvec");
+    let fvec = tmp.path().join("vectors.fvecs");
     write_fvec(&fvec, 200);
 
     let out = tmp.path().join("out");
@@ -1105,9 +1106,9 @@ fn dag_finalize_excluded_from_reexpansion() {
         "compute steps ({}) should outnumber finalize steps ({})",
         compute_steps.len(), finalize_steps.len());
 
-    // Finalize steps should still be exactly 5 (not multiplied by profile count)
-    assert_eq!(finalize_steps.len(), 5,
-        "should have exactly 5 finalize steps after re-expansion, got {}",
+    // Finalize steps should still be exactly 6 (not multiplied by profile count)
+    assert_eq!(finalize_steps.len(), 6,
+        "should have exactly 6 finalize steps after re-expansion, got {}",
         finalize_steps.len());
 
     // No finalize step should have per_profile set
@@ -1128,7 +1129,7 @@ fn dag_finalize_excluded_from_reexpansion() {
     // Finalize DAG should build with partial refs (dangling compute refs ignored)
     let finalize_dag = veks_pipeline::pipeline::dag::build_dag_partial(&finalize_steps)
         .expect("finalize DAG should build after profile expansion");
-    assert_eq!(finalize_dag.steps.len(), 5);
+    assert_eq!(finalize_dag.steps.len(), 6);
 }
 
 /// Verify that when dataset.yaml has finalize steps, the full DAG
@@ -1137,7 +1138,7 @@ fn dag_finalize_excluded_from_reexpansion() {
 #[test]
 fn dag_finalize_step_count_consistency() {
     let tmp = make_tempdir();
-    let fvec = tmp.path().join("vectors.fvec");
+    let fvec = tmp.path().join("vectors.fvecs");
     write_fvec(&fvec, 200);
     let meta = tmp.path().join("meta");
     write_parquet_metadata(&meta);
@@ -1162,9 +1163,10 @@ fn dag_finalize_step_count_consistency() {
         "compute ({}) + finalize ({}) should equal total ({})",
         compute_count, finalize_count, all_steps.len());
 
-    // Should have exactly 5 finalize steps
-    assert_eq!(finalize_count, 5,
-        "expected 5 finalize steps, got {}", finalize_count);
+    // Should have exactly 6 finalize steps
+    // (dataset-json, variables-json, dataset-log-jsonl, generate-docs, merkle, catalog)
+    assert_eq!(finalize_count, 6,
+        "expected 6 finalize steps, got {}", finalize_count);
 
     // The full DAG should also build successfully (for emit-yaml, script)
     let full_dag = veks_pipeline::pipeline::dag::build_dag(&all_steps)

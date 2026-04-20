@@ -193,9 +193,18 @@ pub struct RunArgs {
     #[arg(long)]
     pub clean: bool,
 
-    /// Full reset: remove progress log, .cache/, .scratch/, generated
-    /// profile data, and pipeline-produced facet files (neighbors, distances,
-    /// ordinals, etc.), then re-run the pipeline from scratch. Preserves
+    /// Rewind progress by one step: remove only the artifacts of the
+    /// most recently completed (or partially completed) step and its
+    /// progress entry, then exit. Lets you re-run just the last step
+    /// — typically because its inputs changed, the run aborted, or
+    /// you want to retry it with different options — without
+    /// invalidating any of the earlier steps' work.
+    #[arg(long)]
+    pub clean_last: bool,
+
+    /// Full reset: remove progress log, .cache/, generated profile data,
+    /// and pipeline-produced facet files (neighbors, distances, ordinals,
+    /// etc.), then re-run the pipeline from scratch. Preserves
     /// dataset.yaml, variables.yaml, identity symlinks, and source data.
     #[arg(long)]
     pub reset: bool,
@@ -401,13 +410,16 @@ pub fn run_pipeline(args: RunArgs) -> Result<(), String> {
         reset_pipeline(&workspace, dataset_path, &config);
     }
 
-    // Create managed scratch and cache directories
-    let scratch_dir = workspace.join(".scratch");
-    let cache_dir = workspace.join(".cache");
-    if let Err(e) = std::fs::create_dir_all(&scratch_dir) {
-        println!("Failed to create scratch directory: {}", e);
-        std::process::exit(1);
+    // Handle --clean-last: rewind one step and exit. Doesn't continue
+    // into the run — the user can re-invoke `veks run` (without
+    // --clean-last) to actually re-execute the rewound step.
+    if args.clean_last {
+        clean_last_step(&workspace, dataset_path);
+        return Ok(());
     }
+
+    // Create managed cache directory.
+    let cache_dir = workspace.join(".cache");
     if let Err(e) = std::fs::create_dir_all(&cache_dir) {
         println!("Failed to create cache directory: {}", e);
         std::process::exit(1);
@@ -643,7 +655,6 @@ pub fn run_pipeline(args: RunArgs) -> Result<(), String> {
         profile: profile_name.clone(),
         profile_names: all_profile_names,
         workspace,
-        scratch: scratch_dir.clone(),
         cache: cache_dir,
         defaults,
         dry_run: args.dry_run,
@@ -907,10 +918,6 @@ pub fn run_pipeline(args: RunArgs) -> Result<(), String> {
             // Ensure we're on a clean line before printing the error.
             eprintln!();
             eprintln!("Pipeline failed: {}", e);
-            eprintln!(
-                "Scratch directory preserved for debugging: {}",
-                scratch_dir.display()
-            );
             eprintln!("Run with --clean to reset.");
             return Err(e);
         }
@@ -937,8 +944,6 @@ pub fn run_pipeline(args: RunArgs) -> Result<(), String> {
         }
     }
 
-    // On success, clean scratch directory contents
-    clean_scratch_contents(&scratch_dir);
     Ok(())
 }
 
@@ -1371,10 +1376,109 @@ fn resolve_pipeline_yaml(
     serde_yaml::to_string(&config).map_err(|e| format!("Failed to serialize pipeline: {}", e))
 }
 
-/// Clean up pipeline artifacts: remove progress log and scratch directory.
+/// Clean up pipeline artifacts: remove the progress log.
 ///
 /// The `.cache/` directory is intentionally preserved — users can delete it
 /// manually if they want to discard cached intermediates.
+/// Rewind progress by one step: identify the most recently
+/// completed (or partially completed) step from the progress log,
+/// delete its recorded output artifacts, and remove its progress
+/// entry. Subsequent `veks run` invocations re-execute that step
+/// (and only that step — earlier steps stay marked fresh).
+///
+/// "Most recent" is determined by `StepRecord::completed_at`; both
+/// `Status::Ok` and `Status::Error` records count, so this also
+/// rewinds a step that aborted partway through. Steps that were
+/// killed before any record was written naturally don't appear in
+/// the log; in that case `--clean-last` rewinds the previous
+/// successfully-finished step instead, which is the right behavior
+/// (the killed step has no recorded artifacts to clean up).
+fn clean_last_step(_workspace: &Path, dataset_path: &Path) {
+    let progress_path = ProgressLog::path_for_dataset(dataset_path);
+    if !progress_path.exists() {
+        println!("No progress log at {} — nothing to rewind.",
+            veks_core::paths::rel_display(&progress_path));
+        return;
+    }
+
+    let (mut log, version_msg) = match ProgressLog::load(&progress_path) {
+        Ok(t) => t,
+        Err(e) => {
+            println!("Failed to load progress log: {}", e);
+            return;
+        }
+    };
+    if let Some(msg) = version_msg {
+        println!("{}", msg);
+    }
+
+    // Find the step with the latest completed_at timestamp.
+    let last = log.steps.iter()
+        .max_by(|(_, a), (_, b)| a.completed_at.cmp(&b.completed_at))
+        .map(|(id, rec)| (id.clone(), rec.clone()));
+
+    let (step_id, record) = match last {
+        Some(t) => t,
+        None => {
+            println!("Progress log has no recorded steps — nothing to rewind.");
+            return;
+        }
+    };
+
+    println!(
+        "Rewinding last step: {} (status={}, completed_at={})",
+        step_id, record.status, record.completed_at,
+    );
+
+    // Delete each recorded output file. A step's recorded outputs
+    // are the artifacts it produced; downstream steps' inputs may
+    // reference these by path. Removing them forces this step to
+    // re-execute on the next run, and the freshness check on every
+    // downstream step will see its input is gone (or its
+    // fingerprint changed once this step re-runs) and cascade
+    // re-execution.
+    let mut removed = 0usize;
+    let mut missing = 0usize;
+    let mut failed = 0usize;
+    for out in &record.outputs {
+        let p = std::path::Path::new(&out.path);
+        match std::fs::metadata(p) {
+            Ok(_) => match std::fs::remove_file(p) {
+                Ok(()) => {
+                    println!("  removed {}", veks_core::paths::rel_display(&p.to_path_buf()));
+                    removed += 1;
+                }
+                Err(e) => {
+                    println!("  failed to remove {}: {}", veks_core::paths::rel_display(&p.to_path_buf()), e);
+                    failed += 1;
+                }
+            },
+            Err(_) => {
+                println!("  skipped {} (already gone)", veks_core::paths::rel_display(&p.to_path_buf()));
+                missing += 1;
+            }
+        }
+    }
+    if record.outputs.is_empty() {
+        println!("  (no recorded output artifacts for this step)");
+    }
+
+    // Drop the step's progress entry so the freshness check on the
+    // next run treats it as never-executed.
+    log.steps.remove(&step_id);
+    if let Err(e) = log.save() {
+        println!("Warning: failed to save progress log after rewind: {}", e);
+    } else {
+        println!("Removed progress entry for step '{}'.", step_id);
+    }
+
+    println!(
+        "Rewound 1 step: {} artifact(s) removed, {} already missing, {} failed.",
+        removed, missing, failed,
+    );
+    println!("Re-run `veks run` to re-execute this step (and any downstream steps).");
+}
+
 fn clean_pipeline(workspace: &Path, dataset_path: &Path) {
     let progress_path = ProgressLog::path_for_dataset(dataset_path);
     if progress_path.exists() {
@@ -1386,15 +1490,6 @@ fn clean_pipeline(workspace: &Path, dataset_path: &Path) {
         println!("No progress log found at {}", veks_core::paths::rel_display(&progress_path));
     }
 
-    // Delete scratch directory entirely
-    let scratch_dir = workspace.join(".scratch");
-    if scratch_dir.exists() {
-        match std::fs::remove_dir_all(&scratch_dir) {
-            Ok(()) => println!("Removed {}", veks_core::paths::rel_display(&scratch_dir)),
-            Err(e) => println!("Failed to remove {}: {}", veks_core::paths::rel_display(&scratch_dir), e),
-        }
-    }
-
     println!("Clean complete. Cache and output files are preserved.");
     println!(
         "To remove outputs, delete them manually from {}",
@@ -1402,7 +1497,7 @@ fn clean_pipeline(workspace: &Path, dataset_path: &Path) {
     );
 }
 
-/// Full pipeline reset: remove progress, cache, scratch, and all generated artifacts.
+/// Full pipeline reset: remove progress, cache, and all generated artifacts.
 ///
 /// Preserves: dataset.yaml, variables.yaml, identity symlinks
 /// (those pointing outside the workspace), and source data files.
@@ -1426,14 +1521,7 @@ pub fn reset_pipeline(workspace: &Path, dataset_path: &Path, config: &DatasetCon
         }
     }
 
-    // 3. Remove .scratch/ directory entirely
-    let scratch_dir = workspace.join(".scratch");
-    if scratch_dir.exists() {
-        let _ = std::fs::remove_dir_all(&scratch_dir);
-        println!("  removed {}", veks_core::paths::rel_display(&scratch_dir));
-    }
-
-    // 4. Remove generated files in profiles/ but preserve Identity symlinks
+    // 3. Remove generated files in profiles/ but preserve Identity symlinks
     //    (symlinks to source data created during bootstrap). These point to
     //    files outside the workspace and must survive --clean.
     let profiles_dir = workspace.join("profiles");
@@ -1523,25 +1611,6 @@ pub fn reset_pipeline(workspace: &Path, dataset_path: &Path, config: &DatasetCon
     }
 
     println!("Reset complete. Pipeline will re-run from scratch.");
-}
-
-/// Remove all files inside the scratch directory, leaving the directory itself.
-fn clean_scratch_contents(scratch_dir: &Path) {
-    if !scratch_dir.exists() {
-        return;
-    }
-    let entries = match std::fs::read_dir(scratch_dir) {
-        Ok(entries) => entries,
-        Err(_) => return,
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            let _ = std::fs::remove_dir_all(&path);
-        } else {
-            let _ = std::fs::remove_file(&path);
-        }
-    }
 }
 
 /// Recover identity symlinks that may have been removed by --clean or
@@ -2213,8 +2282,8 @@ default:
             make_per_profile_step("knn", "compute knn", vec![], vec![
                 ("base", "base_vectors.mvec"),
                 ("query", "query_vectors.mvec"),
-                ("indices", "neighbor_indices.ivec"),
-                ("distances", "neighbor_distances.fvec"),
+                ("indices", "neighbor_indices.ivecs"),
+                ("distances", "neighbor_distances.fvecs"),
             ]),
         ];
         let expanded = vectordata::dataset::expand_per_profile_steps(steps, &profiles, 10_000);
@@ -2224,9 +2293,9 @@ default:
 
         let knn_10m = expanded.iter().find(|s| s.effective_id() == "knn-10M").unwrap();
         let indices = knn_10m.options.get("indices").unwrap().as_str().unwrap();
-        assert_eq!(indices, "profiles/10M/neighbor_indices.ivec");
+        assert_eq!(indices, "profiles/10M/neighbor_indices.ivecs");
         let distances = knn_10m.options.get("distances").unwrap().as_str().unwrap();
-        assert_eq!(distances, "profiles/10M/neighbor_distances.fvec");
+        assert_eq!(distances, "profiles/10M/neighbor_distances.fvecs");
         // Non-output options should NOT be prefixed
         let query = knn_10m.options.get("query").unwrap().as_str().unwrap();
         assert_eq!(query, "query_vectors.mvec");
@@ -2246,7 +2315,7 @@ default:
                 ("output", "base_vectors.mvec"),
             ]),
             make_per_profile_step("knn", "compute knn", vec![], vec![
-                ("output", "neighbor_indices.ivec"),
+                ("output", "neighbor_indices.ivecs"),
             ]),
         ];
         profiles.derive_views_from_templates(&templates);
@@ -2254,7 +2323,7 @@ default:
         // Default gets auto-derived views (no explicit base_vectors view)
         let pdef = profiles.profile("default").unwrap();
         assert_eq!(pdef.view("base_vectors").unwrap().path(), "profiles/default/base_vectors.mvec");
-        assert_eq!(pdef.view("neighbor_indices").unwrap().path(), "profiles/default/neighbor_indices.ivec");
+        assert_eq!(pdef.view("neighbor_indices").unwrap().path(), "profiles/default/neighbor_indices.ivecs");
         // Explicit view preserved
         assert_eq!(pdef.view("query_vectors").unwrap().path(), "query.mvec");
 
@@ -2263,28 +2332,183 @@ default:
         assert_eq!(p10.view("base_vectors").unwrap().path(), "profiles/default/base_vectors.mvec");
         assert!(!p10.view("base_vectors").unwrap().source.window.is_empty());
         assert_eq!(p10.view("base_vectors").unwrap().source.window.0[0].max_excl, 10000000);
-        assert_eq!(p10.view("neighbor_indices").unwrap().path(), "profiles/default/neighbor_indices.ivec");
+        assert_eq!(p10.view("neighbor_indices").unwrap().path(), "profiles/default/neighbor_indices.ivecs");
         assert!(!p10.view("neighbor_indices").unwrap().source.window.is_empty());
         // Inherited shared view unchanged
         assert_eq!(p10.view("query_vectors").unwrap().path(), "query.mvec");
     }
 
-    #[test]
-    fn test_clean_scratch_contents() {
-        let tmp = tempfile::tempdir().unwrap();
-        let scratch = tmp.path().join(".scratch");
-        std::fs::create_dir_all(&scratch).unwrap();
-        std::fs::write(scratch.join("tmp1.fvec"), b"data").unwrap();
-        std::fs::write(scratch.join("tmp2.fvec"), b"data").unwrap();
-        let subdir = scratch.join("subdir");
-        std::fs::create_dir_all(&subdir).unwrap();
-        std::fs::write(subdir.join("nested.fvec"), b"data").unwrap();
+    // ─── --clean-last (rewind by one step) tests ────────────────────
 
-        clean_scratch_contents(&scratch);
+    use std::collections::HashMap;
+    use chrono::{TimeZone, Utc};
+    use progress::{StepRecord, OutputRecord};
+    use crate::pipeline::command::Status;
 
-        // Directory itself should still exist
-        assert!(scratch.exists());
-        // But contents should be gone
-        assert_eq!(std::fs::read_dir(&scratch).unwrap().count(), 0);
+    /// Build a minimal `dataset.yaml` so `clean_last_step` can locate
+    /// the progress file (it derives `<dir>/.cache/.upstream.progress.yaml`
+    /// from the dataset path).
+    fn make_dataset(dir: &Path) -> PathBuf {
+        std::fs::create_dir_all(dir.join(".cache")).unwrap();
+        let dsy = dir.join("dataset.yaml");
+        std::fs::write(&dsy, "name: test\n").unwrap();
+        dsy
     }
+
+    /// Append a step record with a controllable timestamp + outputs.
+    fn record(
+        log: &mut ProgressLog,
+        id: &str,
+        completed_at: chrono::DateTime<Utc>,
+        outputs: Vec<&str>,
+        status: Status,
+    ) {
+        let outs = outputs.into_iter().map(|p| OutputRecord {
+            path: p.to_string(),
+            size: 0,
+            mtime: None,
+        }).collect();
+        log.record_step(id, StepRecord {
+            status,
+            message: format!("{} done", id),
+            completed_at,
+            elapsed_secs: 1.0,
+            outputs: outs,
+            resolved_options: HashMap::new(),
+            error: None,
+            resource_summary: None,
+            fingerprint: None,
+            build_version: None,
+        });
+    }
+
+    /// `--clean-last` should remove the artifacts of the
+    /// most-recently-completed step and drop its progress entry,
+    /// while leaving older steps' artifacts and entries intact.
+    #[test]
+    fn clean_last_removes_only_most_recent_step() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dsy = make_dataset(tmp.path());
+
+        // Three step artifacts on disk
+        let a = tmp.path().join("a.bin");
+        let b = tmp.path().join("b.bin");
+        let c = tmp.path().join("c.bin");
+        std::fs::write(&a, b"a").unwrap();
+        std::fs::write(&b, b"b").unwrap();
+        std::fs::write(&c, b"c").unwrap();
+
+        // Build progress log with strictly increasing completion times.
+        let progress_path = ProgressLog::path_for_dataset(&dsy);
+        let (mut log, _) = ProgressLog::load(&progress_path).unwrap();
+        record(&mut log, "step-a", Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+            vec![a.to_str().unwrap()], Status::Ok);
+        record(&mut log, "step-b", Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 1).unwrap(),
+            vec![b.to_str().unwrap()], Status::Ok);
+        record(&mut log, "step-c", Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 2).unwrap(),
+            vec![c.to_str().unwrap()], Status::Ok);
+        log.save().unwrap();
+
+        clean_last_step(tmp.path(), &dsy);
+
+        // Most recent (c) is gone. Earlier ones survive.
+        assert!(!c.exists(), "c.bin should have been removed");
+        assert!(a.exists(), "a.bin must remain");
+        assert!(b.exists(), "b.bin must remain");
+
+        // Progress entry for step-c is gone; a and b remain.
+        let (reloaded, _) = ProgressLog::load(&progress_path).unwrap();
+        assert!(reloaded.steps.contains_key("step-a"));
+        assert!(reloaded.steps.contains_key("step-b"));
+        assert!(!reloaded.steps.contains_key("step-c"),
+            "step-c's progress entry must be removed");
+    }
+
+    /// A failed (partially-completed) step is the most recent → it's
+    /// what `--clean-last` rewinds. This is the "abort happened mid-
+    /// step, want to retry" case.
+    #[test]
+    fn clean_last_rewinds_a_failed_step() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dsy = make_dataset(tmp.path());
+        let good = tmp.path().join("good.bin");
+        let partial = tmp.path().join("partial.bin");
+        std::fs::write(&good, b"complete").unwrap();
+        std::fs::write(&partial, b"half").unwrap();
+
+        let progress_path = ProgressLog::path_for_dataset(&dsy);
+        let (mut log, _) = ProgressLog::load(&progress_path).unwrap();
+        record(&mut log, "step-good", Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+            vec![good.to_str().unwrap()], Status::Ok);
+        record(&mut log, "step-aborted", Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 1).unwrap(),
+            vec![partial.to_str().unwrap()], Status::Error);
+        log.save().unwrap();
+
+        clean_last_step(tmp.path(), &dsy);
+
+        assert!(good.exists(), "earlier successful step's artifact must remain");
+        assert!(!partial.exists(), "aborted step's partial artifact must be removed");
+
+        let (reloaded, _) = ProgressLog::load(&progress_path).unwrap();
+        assert!(reloaded.steps.contains_key("step-good"));
+        assert!(!reloaded.steps.contains_key("step-aborted"));
+    }
+
+    /// Missing artifact paths are tolerated (logged + skipped) — the
+    /// progress entry should still be removed so the next run
+    /// re-executes the step.
+    #[test]
+    fn clean_last_tolerates_already_missing_artifacts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dsy = make_dataset(tmp.path());
+
+        let progress_path = ProgressLog::path_for_dataset(&dsy);
+        let (mut log, _) = ProgressLog::load(&progress_path).unwrap();
+        // Output path doesn't exist on disk.
+        record(&mut log, "step-only",
+            Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+            vec![tmp.path().join("never-existed.bin").to_str().unwrap()],
+            Status::Ok);
+        log.save().unwrap();
+
+        clean_last_step(tmp.path(), &dsy);
+
+        let (reloaded, _) = ProgressLog::load(&progress_path).unwrap();
+        assert!(!reloaded.steps.contains_key("step-only"),
+            "progress entry must be removed even when artifacts were already gone");
+    }
+
+    /// Missing progress log: no-op (reports no work to do, doesn't
+    /// crash). Equivalent to a fresh dataset that's never been run.
+    #[test]
+    fn clean_last_with_no_progress_log_is_safe() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dsy = make_dataset(tmp.path());
+        // Don't write any progress file.
+
+        // Just shouldn't panic.
+        clean_last_step(tmp.path(), &dsy);
+
+        let progress_path = ProgressLog::path_for_dataset(&dsy);
+        assert!(!progress_path.exists(),
+            "no progress file should be created by --clean-last on a fresh tree");
+    }
+
+    /// An empty progress log (file exists but has no step records):
+    /// no-op, doesn't crash, doesn't break the file.
+    #[test]
+    fn clean_last_with_empty_progress_log_is_safe() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dsy = make_dataset(tmp.path());
+        let progress_path = ProgressLog::path_for_dataset(&dsy);
+        let (log, _) = ProgressLog::load(&progress_path).unwrap();
+        log.save().unwrap();
+
+        clean_last_step(tmp.path(), &dsy);
+
+        // File still loadable, still empty.
+        let (reloaded, _) = ProgressLog::load(&progress_path).unwrap();
+        assert!(reloaded.steps.is_empty());
+    }
+
 }

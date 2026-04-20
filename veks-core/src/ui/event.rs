@@ -118,6 +118,16 @@ pub enum UiEvent {
         id: ProgressId,
     },
 
+    /// Re-anchor a progress indicator's rate calculation to "now". The
+    /// rate it displays from this point forward is computed as
+    /// `(position - position_at_anchor) / (now - time_at_anchor)`,
+    /// which lets a caller exclude an early burst of free progress
+    /// (e.g. resumed-from-cache shards that complete in microseconds)
+    /// from the displayed throughput.
+    ProgressAnchorRate {
+        id: ProgressId,
+    },
+
     // ── Text output ─────────────────────────────────────────────────
 
     /// A log line that scrolls above the progress region.

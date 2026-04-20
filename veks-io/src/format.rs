@@ -152,9 +152,38 @@ impl VecFormat {
         self.is_xvec() || self.is_scalar() || self == Self::Slab
     }
 
-    /// Normalize extension variants (e.g., `"fvecs"` → `"fvec"`).
+    /// Preferred file extension for writing a new file of this format.
+    ///
+    /// For xvec formats this returns the plural form (e.g. `"fvecs"`) — the
+    /// convention this project now writes. For scalar and container formats
+    /// it matches [`name`](Self::name) (they have no singular/plural split).
+    ///
+    /// Reading accepts both singular and plural forms; see
+    /// [`from_extension`](Self::from_extension).
+    pub fn preferred_extension(self) -> &'static str {
+        match self {
+            Self::Fvec => "fvecs",
+            Self::Dvec => "dvecs",
+            Self::Mvec => "mvecs",
+            Self::Bvec => "bvecs",
+            Self::I8vec => "i8vecs",
+            Self::Svec => "svecs",
+            Self::U16vec => "u16vecs",
+            Self::Ivec => "ivecs",
+            Self::U32vec => "u32vecs",
+            Self::I64vec => "i64vecs",
+            Self::U64vec => "u64vecs",
+            _ => self.name(),
+        }
+    }
+
+    /// Normalize an extension string to the preferred canonical form.
+    ///
+    /// Accepts any recognized synonym (e.g. `"fvec"`, `"fvecs"`, `"f32vec"`)
+    /// and returns the preferred extension string to use when writing a new
+    /// file of the same format — the plural form for xvec/vvec types.
     pub fn canonical_extension(ext: &str) -> Option<&'static str> {
-        Self::from_extension(ext).map(|f| f.name())
+        Self::from_extension(ext).map(|f| f.preferred_extension())
     }
 
     /// Detect format from a file extension string.
@@ -484,5 +513,48 @@ mod tests {
             let detected = VecFormat::from_extension(ext);
             assert_eq!(detected, Some(fmt), "roundtrip failed for {}", ext);
         }
+    }
+
+    /// `preferred_extension()` returns the plural form for xvec types and
+    /// equals `name()` for everything else. Reading the plural form must
+    /// always round-trip back to the same format.
+    #[test]
+    fn preferred_extension_round_trips() {
+        let all_formats = [
+            VecFormat::Fvec, VecFormat::Dvec, VecFormat::Mvec,
+            VecFormat::Bvec, VecFormat::I8vec, VecFormat::Svec, VecFormat::U16vec,
+            VecFormat::Ivec, VecFormat::U32vec, VecFormat::I64vec, VecFormat::U64vec,
+            VecFormat::ScalarU8, VecFormat::ScalarI8, VecFormat::ScalarU16, VecFormat::ScalarI16,
+            VecFormat::ScalarU32, VecFormat::ScalarI32, VecFormat::ScalarU64, VecFormat::ScalarI64,
+            VecFormat::Slab, VecFormat::Npy, VecFormat::Parquet,
+        ];
+        for fmt in all_formats {
+            let ext = fmt.preferred_extension();
+            let detected = VecFormat::from_extension(ext);
+            assert_eq!(detected, Some(fmt), "round-trip via preferred_extension failed for {:?}", fmt);
+            if fmt.is_xvec() {
+                assert!(ext.ends_with('s'),
+                    "xvec format {:?} should have plural preferred_extension, got {:?}", fmt, ext);
+                // The singular form must still parse to the same format.
+                assert_eq!(VecFormat::from_extension(fmt.name()), Some(fmt));
+            } else {
+                // Scalars and containers: plural and singular are identical.
+                assert_eq!(ext, fmt.name(), "non-xvec format {:?} should have no plural form", fmt);
+            }
+        }
+    }
+
+    /// `canonical_extension` is the project-wide normalizer: a singular
+    /// input must produce the plural output (the form we now write).
+    #[test]
+    fn canonical_extension_normalizes_singular_to_plural() {
+        assert_eq!(VecFormat::canonical_extension("fvec"), Some("fvecs"));
+        assert_eq!(VecFormat::canonical_extension("fvecs"), Some("fvecs"));
+        assert_eq!(VecFormat::canonical_extension("ivec"), Some("ivecs"));
+        assert_eq!(VecFormat::canonical_extension("u8vec"), Some("bvecs"));
+        // Scalars and containers: no plural change.
+        assert_eq!(VecFormat::canonical_extension("u8"), Some("u8"));
+        assert_eq!(VecFormat::canonical_extension("slab"), Some("slab"));
+        assert_eq!(VecFormat::canonical_extension("parquet"), Some("parquet"));
     }
 }

@@ -237,10 +237,10 @@ impl CommandOp for VerifyKnnConsolidatedOp {
             let bc = profile.base_count.unwrap_or(u64::MAX);
             let indices_path = profile.views.get("neighbor_indices")
                 .map(|v| ctx.workspace.join(&v.source.path))
-                .unwrap_or_else(|| ctx.workspace.join(format!("profiles/{}/neighbor_indices.ivec", name)));
+                .unwrap_or_else(|| ctx.workspace.join(format!("profiles/{}/neighbor_indices.ivecs", name)));
             let distances_path = profile.views.get("neighbor_distances")
                 .map(|v| ctx.workspace.join(&v.source.path))
-                .unwrap_or_else(|| ctx.workspace.join(format!("profiles/{}/neighbor_distances.fvec", name)));
+                .unwrap_or_else(|| ctx.workspace.join(format!("profiles/{}/neighbor_distances.fvecs", name)));
             if indices_path.exists() {
                 profiles.push((name.clone(), bc, indices_path, distances_path));
             }
@@ -255,8 +255,8 @@ impl CommandOp for VerifyKnnConsolidatedOp {
                     if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) { continue; }
                     let pname = entry.file_name().to_string_lossy().to_string();
                     if profiles.iter().any(|(n, _, _, _)| n == &pname) { continue; }
-                    let indices_path = entry.path().join("neighbor_indices.ivec");
-                    let distances_path = entry.path().join("neighbor_distances.fvec");
+                    let indices_path = entry.path().join("neighbor_indices.ivecs");
+                    let distances_path = entry.path().join("neighbor_distances.fvecs");
                     if indices_path.exists() {
                         // Parse base_count from the directory name (sized profile names encode the count)
                         let bc = vectordata::dataset::source::parse_number_with_suffix(&pname)
@@ -788,7 +788,7 @@ impl CommandOp for VerifyFilteredKnnConsolidatedOp {
             let bc = profile.base_count.unwrap_or(u64::MAX);
             let indices_path = profile.views.get("filtered_neighbor_indices")
                 .map(|v| ctx.workspace.join(&v.source.path))
-                .unwrap_or_else(|| ctx.workspace.join(format!("profiles/{}/filtered_neighbor_indices.ivec", name)));
+                .unwrap_or_else(|| ctx.workspace.join(format!("profiles/{}/filtered_neighbor_indices.ivecs", name)));
             if indices_path.exists() {
                 profiles.push((name.clone(), bc));
             }
@@ -833,7 +833,7 @@ impl CommandOp for VerifyFilteredKnnConsolidatedOp {
             let bc_val = if *bc == u64::MAX { base_count } else { *bc as usize };
 
             // Load stored filtered GT for this profile
-            let gt_path = ctx.workspace.join(format!("profiles/{}/filtered_neighbor_indices.ivec", name));
+            let gt_path = ctx.workspace.join(format!("profiles/{}/filtered_neighbor_indices.ivecs", name));
             if !gt_path.exists() {
                 results.push(serde_json::json!({
                     "name": name, "status": "skip", "message": "no filtered GT file",

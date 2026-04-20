@@ -594,9 +594,11 @@ orphans:
         let ext = source.extension()
             .and_then(|e| e.to_str())
             .and_then(VecFormat::canonical_extension)
-            .unwrap_or("fvec");
+            .unwrap_or("fvecs");
         let link_name = format!("_{}.{}", stem, ext);
-        assert_eq!(link_name, "_sift_base.fvec");
+        // `canonical_extension` normalizes to the plural form (the convention
+        // this project writes), so a `.fvec` source resolves to `.fvecs`.
+        assert_eq!(link_name, "_sift_base.fvecs");
     }
 
     #[test]
@@ -606,9 +608,9 @@ orphans:
         let ext = source.extension()
             .and_then(|e| e.to_str())
             .and_then(VecFormat::canonical_extension)
-            .unwrap_or("fvec");
+            .unwrap_or("fvecs");
         let link_name = format!("_{}.{}", stem, ext);
-        assert_eq!(link_name, "_base_vectors.mvec");
+        assert_eq!(link_name, "_base_vectors.mvecs");
     }
 
     #[test]

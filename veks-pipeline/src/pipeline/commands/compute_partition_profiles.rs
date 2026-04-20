@@ -243,7 +243,7 @@ templates (compute-knn, verify-knn) for the new partition profiles.
             ctx.ui.log(&format!("  {} ({} base vectors)", profile_name, partition_size));
 
             // Extract partition base vectors
-            let part_base_path = profile_dir.join("base_vectors.fvec");
+            let part_base_path = profile_dir.join("base_vectors.fvecs");
             remove_if_symlink(&part_base_path);
             {
                 let mut f = match std::fs::File::create(&part_base_path) {
@@ -266,7 +266,7 @@ templates (compute-knn, verify-knn) for the new partition profiles.
             // Extract per-label query vectors — only queries whose predicate
             // matches this partition's label. If no predicates file, fall back
             // to symlinking the full query set.
-            let part_query_path = profile_dir.join("query_vectors.fvec");
+            let part_query_path = profile_dir.join("query_vectors.fvecs");
             // Symlink interlock: always remove existing symlinks before
             // writing. File::create follows symlinks, which would silently
             // corrupt the target file.
@@ -341,7 +341,7 @@ templates (compute-knn, verify-knn) for the new partition profiles.
                         let mut views = indexmap::IndexMap::new();
                         views.insert("base_vectors".to_string(), DSView {
                             source: DSSource {
-                                path: format!("profiles/{}/base_vectors.fvec", name),
+                                path: format!("profiles/{}/base_vectors.fvecs", name),
                                 namespace: None,
                                 window: DSWindow::default(),
                             },
@@ -349,7 +349,7 @@ templates (compute-knn, verify-knn) for the new partition profiles.
                         });
                         views.insert("query_vectors".to_string(), DSView {
                             source: DSSource {
-                                path: format!("profiles/{}/query_vectors.fvec", name),
+                                path: format!("profiles/{}/query_vectors.fvecs", name),
                                 namespace: None,
                                 window: DSWindow::default(),
                             },

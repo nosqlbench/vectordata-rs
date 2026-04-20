@@ -462,15 +462,15 @@ fn resolve_slots(args: &ImportArgs) -> PipelineSlots {
                 let fmt = VecFormat::detect(p)?;
                 let meta = veks_core::formats::reader::probe_source(p, fmt).ok()?;
                 Some(match meta.element_size {
-                    1 => "bvec",
-                    2 => "mvec",
-                    8 => "dvec",
-                    _ => "fvec", // 4 bytes (f32/i32) → fvec
+                    1 => "bvecs",
+                    2 => "mvecs",
+                    8 => "dvecs",
+                    _ => "fvecs", // 4 bytes (f32/i32) → fvecs
                 })
             })
-            .unwrap_or("fvec")
+            .unwrap_or("fvecs")
     } else {
-        "fvec"
+        "fvecs"
     };
 
     let all_vectors = if needs_import {
@@ -488,7 +488,7 @@ fn resolve_slots(args: &ImportArgs) -> PipelineSlots {
     } else {
         Artifact::Materialized {
             step_id: "prepare-vectors".into(),
-            output: "${cache}/sorted_ordinals.ivec".into(),
+            output: "${cache}/sorted_ordinals.ivecs".into(),
         }
     };
 
@@ -527,7 +527,7 @@ fn resolve_slots(args: &ImportArgs) -> PipelineSlots {
             .and_then(|p| p.extension())
             .and_then(|e| e.to_str())
             .and_then(VecFormat::canonical_extension)
-            .unwrap_or("fvec")
+            .unwrap_or("fvecs")
     };
 
     // Shuffling randomizes vector order for train/test splitting.
@@ -543,7 +543,7 @@ fn resolve_slots(args: &ImportArgs) -> PipelineSlots {
         // Shuffle is always required for self-search (provides train/test split).
         let shuffle = Artifact::Materialized {
             step_id: "generate-shuffle".into(),
-            output: "${cache}/shuffle.ivec".into(),
+            output: "${cache}/shuffle.ivecs".into(),
         };
         let qv = Artifact::Materialized {
             step_id: "extract-queries".into(),
@@ -566,7 +566,7 @@ fn resolve_slots(args: &ImportArgs) -> PipelineSlots {
         let shuffle = if shuffle_enabled {
             Some(Artifact::Materialized {
                 step_id: "generate-shuffle".into(),
-                output: "${cache}/shuffle.ivec".into(),
+                output: "${cache}/shuffle.ivecs".into(),
             })
         } else {
             None
@@ -589,7 +589,7 @@ fn resolve_slots(args: &ImportArgs) -> PipelineSlots {
         let shuffle = if shuffle_enabled {
             Some(Artifact::Materialized {
                 step_id: "generate-shuffle".into(),
-                output: "${cache}/shuffle.ivec".into(),
+                output: "${cache}/shuffle.ivecs".into(),
             })
         } else {
             None
@@ -742,7 +742,7 @@ fn resolve_slots(args: &ImportArgs) -> PipelineSlots {
         // variable-length list of matching ordinals, not a scalar value
         let predicate_indices = Artifact::Materialized {
             step_id: "evaluate-predicates".into(),
-            output: "metadata_indices.ivvec".into(),
+            output: "metadata_indices.ivvecs".into(),
         };
         Some(MetadataSlots { metadata_all, metadata_content, survey, predicates, predicate_indices })
     } else {
@@ -760,7 +760,7 @@ fn resolve_slots(args: &ImportArgs) -> PipelineSlots {
     } else {
         Some(Artifact::Materialized {
             step_id: "compute-knn".into(),
-            output: "neighbor_indices.ivec".into(), // per_profile
+            output: "neighbor_indices.ivecs".into(), // per_profile
         })
     };
 
@@ -770,7 +770,7 @@ fn resolve_slots(args: &ImportArgs) -> PipelineSlots {
     } else {
         Some(Artifact::Materialized {
             step_id: "compute-filtered-knn".into(),
-            output: "filtered_neighbor_indices.ivec".into(), // per_profile
+            output: "filtered_neighbor_indices.ivecs".into(), // per_profile
         })
     };
 
@@ -861,8 +861,8 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
 
     // ── Vector chain ─────────────────────────────────────────────────
     if let Artifact::Materialized { .. } = &slots.all_vectors {
-        let format = args.base_vectors.as_ref()
-            .and_then(|p| VecFormat::detect(p))
+        let source_vec_format = args.base_vectors.as_ref().and_then(|p| VecFormat::detect(p));
+        let format = source_vec_format
             .map(|f| f.name().to_string())
             .unwrap_or_else(|| "auto".into());
         let mut convert_opts = vec![
@@ -874,8 +874,18 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
         // When base_fraction < 1.0 and not pedantic, limit the convert
         // step to only import the needed subset. The convert command
         // computes the actual limit from source record count × fraction.
-        if args.base_fraction < 1.0 && !args.pedantic_dedup {
+        let uses_fraction = args.base_fraction < 1.0 && !args.pedantic_dedup;
+        if uses_fraction {
             convert_opts.push(("fraction".into(), args.base_fraction.to_string()));
+        }
+        // Pin the compiled parquet→xvec fast path when the source is a
+        // parquet file/dir and no option would block it. This makes
+        // bootstrap-generated pipelines assert on the fast path: if
+        // something later causes `transform convert` to silently fall
+        // back to the per-record slow path for this step, the pipeline
+        // errors out instead of quietly running 10× slower.
+        if source_vec_format == Some(VecFormat::Parquet) && !uses_fraction {
+            convert_opts.push(("require_fast".into(), "true".into()));
         }
         steps.push(Step {
             id: "convert-vectors".into(),
@@ -1065,7 +1075,10 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
         steps.push(Step {
             id: "prepare-vectors".into(),
             run: cmd_sort(&args.personality).into(),
-            description: Some("Sort and deduplicate vectors".into()),
+            description: Some(
+                "External merge-sort + duplicate detection \
+                 (builds sorted-ordinal index in lex order)".into(),
+            ),
             after: if last_vector_step.is_empty() { vec![] } else { vec![last_vector_step.into()] },
             per_profile: false,
             phase: 0,
@@ -1073,8 +1086,8 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
             options: {
                 let mut opts = vec![
                     ("source".into(), working_vectors.clone()),
-                    ("output".into(), "${cache}/sorted_ordinals.ivec".into()),
-                    ("duplicates".into(), "${cache}/dedup_duplicates.ivec".into()),
+                    ("output".into(), "${cache}/sorted_ordinals.ivecs".into()),
+                    ("duplicates".into(), "${cache}/dedup_duplicates.ivecs".into()),
                     ("report".into(), "${cache}/dedup_report.json".into()),
                 ];
                 if args.compress_cache {
@@ -1097,7 +1110,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
             finalize: false,
             options: vec![
                 ("name".into(), "duplicate_count".into()),
-                ("value".into(), "count:${cache}/dedup_duplicates.ivec".into()),
+                ("value".into(), "count:${cache}/dedup_duplicates.ivecs".into()),
             ],
         });
 
@@ -1158,7 +1171,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
                 "${vector_count}".to_string()
             };
             let mut shuffle_opts = vec![
-                ("output".into(), "${cache}/shuffle.ivec".into()),
+                ("output".into(), "${cache}/shuffle.ivecs".into()),
                 ("interval".into(), shuffle_interval),
                 ("seed".into(), format!("${{{}}}", "seed")),
             ];
@@ -1228,8 +1241,8 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
 
                 let mut query_opts = vec![
                     ("source".into(), working_vectors.clone()),
-                    ("ivec-file".into(), "${cache}/shuffle.ivec".into()),
-                    ("output".into(), slots.query_vectors.as_ref().map(|q| q.path().to_string()).unwrap_or_else(|| format!("{}query_vectors.fvec", pp))),
+                    ("ivec-file".into(), "${cache}/shuffle.ivecs".into()),
+                    ("output".into(), slots.query_vectors.as_ref().map(|q| q.path().to_string()).unwrap_or_else(|| format!("{}query_vectors.fvecs", pp))),
                     ("range".into(), "[0,${query_count})".into()),
                     ("facet".into(), "query_vectors".into()),
                 ];
@@ -1256,7 +1269,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
                 });
                 let base_opts = vec![
                     ("source".into(), working_vectors.clone()),
-                    ("ivec-file".into(), "${cache}/shuffle.ivec".into()),
+                    ("ivec-file".into(), "${cache}/shuffle.ivecs".into()),
                     ("output".into(), slots.base_vectors.path().into()),
                     ("range".into(), format!("[${{query_count}},{})", base_upper)),
                     ("normalize".into(), "true".into()),
@@ -1296,7 +1309,8 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
         // Separate query import
         if qv.is_materialized() {
             let query_source = args.query_vectors.as_ref().unwrap();
-            let format = VecFormat::detect(query_source)
+            let query_vec_format = VecFormat::detect(query_source);
+            let format = query_vec_format
                 .map(|f| f.name().to_string())
                 .unwrap_or_else(|| "auto".into());
             // Strategy 2 (HDF5): convert queries directly to final output.
@@ -1318,6 +1332,11 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
                     ];
                     if args.normalize {
                         opts.push(("normalize".into(), "true".into()));
+                    }
+                    // Pin the fast path when applicable (parquet source, no
+                    // normalize). See `convert-vectors` above for rationale.
+                    if query_vec_format == Some(VecFormat::Parquet) && !args.normalize {
+                        opts.push(("require_fast".into(), "true".into()));
                     }
                     opts
                 },
@@ -1344,7 +1363,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
             ];
             if has_shuffle {
                 // Use shuffled ordinals for randomized base vector order
-                base_opts.push(("ivec-file".into(), "${cache}/shuffle.ivec".into()));
+                base_opts.push(("ivec-file".into(), "${cache}/shuffle.ivecs".into()));
                 base_opts.push(("range".into(), format!("[0,{})", "${clean_count}")));
             } else if slots.prepare.is_materialized() {
                 base_opts.push(("ivec-file".into(), slots.prepare.path().into()));
@@ -1465,7 +1484,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
                 finalize: false,
                 options: vec![
                     ("source".into(), meta.metadata_all.path().into()),
-                    ("ivec-file".into(), "${cache}/shuffle.ivec".into()),
+                    ("ivec-file".into(), "${cache}/shuffle.ivecs".into()),
                     ("output".into(), format!("{}metadata_content.{}", pp, meta_ext)),
                     ("range".into(), if args.base_fraction < 1.0 && !subset_applied {
                         "[${query_count},${base_end})".into()
@@ -1650,8 +1669,8 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
                             slots.base_vectors.path().to_string()
                         }),
                         ("query".into(), query_path.clone()),
-                        ("indices".into(), "neighbor_indices.ivec".into()),
-                        ("distances".into(), "neighbor_distances.fvec".into()),
+                        ("indices".into(), "neighbor_indices.ivecs".into()),
+                        ("distances".into(), "neighbor_distances.fvecs".into()),
                         ("neighbors".into(), args.neighbors.to_string()),
                         ("metric".into(), args.metric.clone()),
                     ];
@@ -1684,10 +1703,10 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
                 finalize: false,
                 options: {
                     let mut opts = vec![
-                        ("base".into(), "${profile_dir}base_vectors.fvec".into()),
-                        ("query".into(), "${profile_dir}query_vectors.fvec".into()),
-                        ("indices".into(), "neighbor_indices.ivec".into()),
-                        ("distances".into(), "neighbor_distances.fvec".into()),
+                        ("base".into(), "${profile_dir}base_vectors.fvecs".into()),
+                        ("query".into(), "${profile_dir}query_vectors.fvecs".into()),
+                        ("indices".into(), "neighbor_indices.ivecs".into()),
+                        ("distances".into(), "neighbor_distances.fvecs".into()),
                         ("neighbors".into(), args.neighbors.to_string()),
                         ("metric".into(), args.metric.clone()),
                     ];
@@ -1732,8 +1751,8 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
                     }),
                         ("query".into(), slots.query_vectors.as_ref().unwrap().path().into()),
                         ("metadata-indices".into(), slots.metadata.as_ref().unwrap().predicate_indices.path().into()),
-                        ("indices".into(), "filtered_neighbor_indices.ivec".into()),
-                        ("distances".into(), "filtered_neighbor_distances.fvec".into()),
+                        ("indices".into(), "filtered_neighbor_indices.ivecs".into()),
+                        ("distances".into(), "filtered_neighbor_distances.fvecs".into()),
                         ("neighbors".into(), args.neighbors.to_string()),
                         ("metric".into(), args.metric.clone()),
                     ];
@@ -1776,7 +1795,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
             // Use original query source when GT is pre-provided
             slots.query_vectors.as_ref()
                 .map(|q| if q.is_materialized() { q.path().to_string() } else { q.path().to_string() })
-                .unwrap_or_else(|| "query_vectors.fvec".to_string())
+                .unwrap_or_else(|| "query_vectors.fvecs".to_string())
         } else {
             slots.query_vectors.as_ref().unwrap().path().to_string()
         };
@@ -1823,10 +1842,10 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
             phase: 1, // verify phase — runs after all phase 0 compute-knn
             finalize: false,
             options: vec![
-                ("base".into(), "${profile_dir}base_vectors.fvec".into()),
-                ("query".into(), "${profile_dir}query_vectors.fvec".into()),
-                ("indices".into(), "${profile_dir}neighbor_indices.ivec".into()),
-                ("distances".into(), "${profile_dir}neighbor_distances.fvec".into()),
+                ("base".into(), "${profile_dir}base_vectors.fvecs".into()),
+                ("query".into(), "${profile_dir}query_vectors.fvecs".into()),
+                ("indices".into(), "${profile_dir}neighbor_indices.ivecs".into()),
+                ("distances".into(), "${profile_dir}neighbor_distances.fvecs".into()),
                 ("metric".into(), args.metric.clone()),
                 ("neighbors".into(), args.neighbors.to_string()),
                 ("sample".into(), if args.verify_knn_sample == 0 {
@@ -2133,8 +2152,8 @@ fn profile_views(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::pa
                 }
             }
             Artifact::Materialized { .. } => {
-                views.push(("neighbor_indices".into(), format!("{}neighbor_indices.ivec", args.default_prefix())));
-                views.push(("neighbor_distances".into(), format!("{}neighbor_distances.fvec", args.default_prefix())));
+                views.push(("neighbor_indices".into(), format!("{}neighbor_indices.ivecs", args.default_prefix())));
+                views.push(("neighbor_distances".into(), format!("{}neighbor_distances.fvecs", args.default_prefix())));
             }
         }
     }
@@ -2146,8 +2165,8 @@ fn profile_views(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::pa
 
     if let Some(ref fknn) = slots.filtered_knn {
         if fknn.is_materialized() {
-            views.push(("filtered_neighbor_indices".into(), format!("{}filtered_neighbor_indices.ivec", args.default_prefix())));
-            views.push(("filtered_neighbor_distances".into(), format!("{}filtered_neighbor_distances.fvec", args.default_prefix())));
+            views.push(("filtered_neighbor_indices".into(), format!("{}filtered_neighbor_indices.ivecs", args.default_prefix())));
+            views.push(("filtered_neighbor_distances".into(), format!("{}filtered_neighbor_distances.fvecs", args.default_prefix())));
         }
     }
 
@@ -2325,11 +2344,11 @@ fn generate_yaml(
         if has_compute_knn {
             if !sized_facets_written.contains("neighbor_indices") {
                 let sp = args.sized_prefix();
-                out.push_str(&format!("      neighbor_indices: \"{}neighbor_indices.ivec\"\n", sp));
+                out.push_str(&format!("      neighbor_indices: \"{}neighbor_indices.ivecs\"\n", sp));
             }
             if !sized_facets_written.contains("neighbor_distances") {
                 let sp = args.sized_prefix();
-                out.push_str(&format!("      neighbor_distances: \"{}neighbor_distances.fvec\"\n", sp));
+                out.push_str(&format!("      neighbor_distances: \"{}neighbor_distances.fvecs\"\n", sp));
             }
         }
     }
@@ -2858,17 +2877,62 @@ pub fn detect_normalized(path: &Path) -> Option<(bool, usize, f64)> {
 
     if count == 0 || dim == 0 { return None; }
 
-    let sample_count = count.min(100_000);
-    let step = if count <= sample_count { 1 } else { count / sample_count };
-
+    // Sample strategy: rather than 100k scattered random-access reads
+    // (which on a multi-TB EBS file means 100k cold-cache page faults
+    // — minutes of silence), take a smaller number of small *contiguous
+    // windows*. Same statistical coverage when the data is shuffled
+    // (which it is for the wizard's typical input), one sequential
+    // EBS read per window instead of thousands of random ones.
+    //
+    // 32 windows × 256 records ≈ 8k samples spread across the file.
+    // At dim=384 / f32 that's 32 × 384 KiB = ~12 MiB of sequential I/O
+    // total — under a second on cold EBS, vs minutes of random-access.
+    const WINDOWS: usize = 32;
+    const WINDOW_RECORDS: usize = 256;
+    let sample_count = count.min(WINDOWS * WINDOW_RECORDS);
     let mut norms: Vec<f64> = Vec::with_capacity(sample_count);
 
-    for s in 0..sample_count {
-        let idx = s * step;
-        if idx >= count { break; }
-        let vec = get_f64(idx);
-        let sum: f64 = vec.iter().map(|v| v * v).sum();
-        norms.push(sum.sqrt());
+    // Periodic progress feedback to stderr so the user sees we're alive
+    // on big-file runs. Carriage return lets it overwrite in place.
+    let mut next_tick = std::time::Instant::now();
+    let tick_interval = std::time::Duration::from_millis(250);
+    let print_progress = |done: usize, total: usize| {
+        use std::io::Write;
+        eprint!("\r  Sampling vectors for normalization status... [{}/{}]    ", done, total);
+        let _ = std::io::stderr().flush();
+    };
+
+    let actual_windows = WINDOWS.min((count + WINDOW_RECORDS - 1) / WINDOW_RECORDS).max(1);
+    let window_stride = if actual_windows == 1 {
+        0
+    } else {
+        // Spread the windows evenly across the file with the last one
+        // ending just before `count`. (count - WINDOW_RECORDS) span,
+        // divided into (actual_windows - 1) gaps.
+        count.saturating_sub(WINDOW_RECORDS) / (actual_windows - 1).max(1)
+    };
+    let mut done = 0usize;
+    'outer: for w in 0..actual_windows {
+        let start = w * window_stride;
+        for j in 0..WINDOW_RECORDS {
+            let idx = start + j;
+            if idx >= count { break 'outer; }
+            let vec = get_f64(idx);
+            let sum: f64 = vec.iter().map(|v| v * v).sum();
+            norms.push(sum.sqrt());
+            done += 1;
+            if std::time::Instant::now() >= next_tick {
+                print_progress(done, sample_count);
+                next_tick = std::time::Instant::now() + tick_interval;
+            }
+        }
+    }
+    // Wipe the in-place progress line so the caller's "is normalized"
+    // message starts from column 0.
+    {
+        use std::io::Write;
+        eprint!("\r  Sampling vectors for normalization status... ");
+        let _ = std::io::stderr().flush();
     }
 
     if norms.is_empty() { return None; }
@@ -3192,13 +3256,13 @@ mod tests {
         assert!(slots.filtered_knn.is_none());
 
         let steps = emit_steps(&slots, &args, &args.output);
-        // Expected: set-vector-count, sort-vectors, set-duplicate-count,
-        // zero-check, set-zero-count, clean-ordinals, set-clean-count,
-        // count-source-base, set-is_shuffled, set-is_self_search, set-combined_bq, set-k,
-        // shuffle, extract-query, extract-base, count-base,
-        // compute-knn, verify-knn, generate-dataset-json, generate-variables-json,
-        // generate-dataset-log-jsonl, generate-merkle, generate-catalog
-        assert_eq!(steps.len(), 19, "steps: {:?}", steps.iter().map(|s| &s.id).collect::<Vec<_>>());
+        // Expected: count-vectors, count-source-base, set-is_shuffled,
+        // set-is_self_search, set-combined_bq, set-k, prepare-vectors,
+        // count-duplicates, generate-shuffle, extract-queries, extract-base,
+        // count-base, compute-knn, verify-knn, generate-dataset-json,
+        // generate-variables-json, generate-dataset-log-jsonl, generate-docs,
+        // generate-catalog, generate-merkle.
+        assert_eq!(steps.len(), 20, "steps: {:?}", steps.iter().map(|s| &s.id).collect::<Vec<_>>());
         let step_ids: Vec<&str> = steps.iter().map(|s| s.id.as_str()).collect();
         assert!(step_ids.contains(&"count-duplicates"), "should have count-duplicates");
         assert!(step_ids.contains(&"count-source-base"), "should have count-source-base");

@@ -133,19 +133,24 @@ data.
             }
         };
 
-        // Validate that the output extension matches the element type
+        // Validate that the output extension matches the element type.
+        // Accept both singular and plural forms (`.fvec` and `.fvecs` etc.)
+        // by comparing through the format enum, which canonicalizes both.
         let expected_ext = match elem_type {
-            "float[]" | "f32" => "fvec",
-            "half" | "f16" => "mvec",
-            "double[]" | "f64" => "dvec",
-            "int[]" | "i32" => "ivec",
-            "short[]" | "i16" => "svec",
-            "byte[]" | "u8" => "bvec",
+            "float[]" | "f32" => "fvecs",
+            "half" | "f16" => "mvecs",
+            "double[]" | "f64" => "dvecs",
+            "int[]" | "i32" => "ivecs",
+            "short[]" | "i16" => "svecs",
+            "byte[]" | "u8" => "bvecs",
             _ => "",
         };
         if !expected_ext.is_empty() {
             if let Some(ext) = output_path.extension().and_then(|e| e.to_str()) {
-                if ext != expected_ext {
+                let actual_fmt = veks_core::formats::VecFormat::from_extension(ext);
+                let expected_fmt =
+                    veks_core::formats::VecFormat::from_extension(expected_ext);
+                if actual_fmt != expected_fmt {
                     return error_result(
                         format!(
                             "output extension '.{}' does not match element type '{}' (expected '.{}'). \
@@ -814,7 +819,6 @@ mod tests {
             profile: String::new(),
             profile_names: vec![],
             workspace: dir.to_path_buf(),
-            scratch: dir.join(".scratch"),
             cache: dir.join(".cache"),
             defaults: IndexMap::new(),
             dry_run: false,

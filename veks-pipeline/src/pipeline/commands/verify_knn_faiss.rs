@@ -370,12 +370,26 @@ fn verify_profile(
             base_count, query_count, dim, k, metric_str));
     }
 
+    // Cap sample size to stay within FAISS safe batch zone.
+    // faiss-sys has a BLAS ABI bug where nq * dim > 65536 produces
+    // corrupt results. Cap the verify sample to stay well within this.
+    let faiss_safe_max = (65536 / dim).max(1);
+    let effective_sample = if sample > 0 {
+        sample.min(faiss_safe_max)
+    } else {
+        verify_count.min(faiss_safe_max)
+    };
+    if effective_sample < verify_count {
+        ctx.ui.log(&format!("  FAISS safe mode: sampling {} of {} queries (dim={}, max safe batch={})",
+            effective_sample, verify_count, dim, faiss_safe_max));
+    }
+
     // Determine which queries to verify.
-    let query_indices: Vec<usize> = if sample > 0 && sample < verify_count {
+    let query_indices: Vec<usize> = if effective_sample < verify_count {
         use std::collections::BTreeSet;
         let mut rng = simple_rng(42);
         let mut selected = BTreeSet::new();
-        while selected.len() < sample {
+        while selected.len() < effective_sample {
             selected.insert(rng.next() as usize % verify_count);
         }
         selected.into_iter().collect()
@@ -643,11 +657,23 @@ impl CommandOp for VerifyKnnFaissConsolidatedOp {
         }
         ctx.ui.log(&format!("  loaded in {:.1}s", t0.elapsed().as_secs_f64()));
 
+        // Cap sample to FAISS safe batch size
+        let faiss_safe_max = (65536 / dim).max(1);
+        let effective_sample = if sample_count > 0 {
+            sample_count.min(faiss_safe_max)
+        } else {
+            query_count.min(faiss_safe_max)
+        };
+        if effective_sample < query_count {
+            ctx.ui.log(&format!("  FAISS safe mode: sampling {} of {} queries (max safe={})",
+                effective_sample, query_count, faiss_safe_max));
+        }
+
         // Select sample queries (shared across all profiles)
-        let sample_indices: Vec<usize> = if sample_count > 0 && sample_count < query_count {
+        let sample_indices: Vec<usize> = if effective_sample < query_count {
             let mut rng = simple_rng(seed);
             let mut selected = std::collections::BTreeSet::new();
-            while selected.len() < sample_count {
+            while selected.len() < effective_sample {
                 selected.insert(rng.next() as usize % query_count);
             }
             selected.into_iter().collect()
@@ -804,7 +830,8 @@ impl CommandOp for VerifyKnnFaissConsolidatedOp {
                         let d = VectorReader::<f32>::dim(&base_reader);
                         let gc = VectorReader::<i32>::count(&gt_reader);
                         let k = VectorReader::<i32>::dim(&gt_reader);
-                        let vc = qc.min(gc);
+                        let faiss_safe = (65536 / d).max(1);
+                        let vc = qc.min(gc).min(faiss_safe);
 
                         // Load base
                         let mut base_data = Vec::with_capacity(bc * d);

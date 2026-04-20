@@ -13,10 +13,11 @@
 
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
-use std::io::Write;
-use std::path::Path;
+use std::fs::File;
+use std::io::{Read, Write};
+use std::os::unix::fs::FileExt;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::time::Instant;
 
 use vectordata::VectorReader;
@@ -444,45 +445,87 @@ fn select_batch_dist_fn(metric: Metric) -> Option<BatchDistFn> {
     None
 }
 
-/// Scan one base-vector segment for a set of queries. Returns per-query
-/// top-k candidates (not globally merged yet). Accepts initial thresholds
-/// from prior segments for early pruning.
-fn find_top_k_segment(
+// ═══════════════════════════════════════════════════════════════════════
+// Streaming pread scanner
+// ═══════════════════════════════════════════════════════════════════════
+//
+// Mmap is the wrong primitive for a single-pass sequential scan: page-
+// fault latency ends up in the compute hot path, RSS grows with segment
+// size, and the leading compute thread bottlenecks on kernel readahead.
+// Instead we pread the segment in chunks into a pair of aligned heap
+// buffers, alternating reader/writer every iteration. While compute
+// threads scan buffer A for the current chunk, one I/O task preads
+// the next chunk into buffer B. The `std::thread::scope` join is the
+// natural barrier; after it, swap roles and advance.
+//
+// Layout notes:
+//  - fvec entry stride is `entry_size = 4 + dim*4` bytes: a 4-byte dim
+//    header followed by `dim` f32 payload elements.
+//  - We pread whole entries (including headers) as raw bytes but back
+//    the buffer with `Vec<f32>` so alignment is guaranteed to be 4
+//    bytes for all derived `&[f32]` slices.
+//  - Given any vector index `j` within the chunk, the start of its
+//    f32 payload in f32-units is `j * (1 + dim) + 1` — the `+1` steps
+//    past the dim header. No unsafe needed.
+
+/// Target chunk size for pread streaming. 64 MiB balances single-
+/// syscall I/O throughput, page-cache friendliness, and L3 residence.
+/// Undersized chunks cost in syscall overhead and buffer management;
+/// oversized chunks spoil cache locality and let the leading edge
+/// outrun prefetch.
+const STREAM_CHUNK_BYTES: usize = 64 * 1024 * 1024;
+
+/// Allocate a chunk buffer as `Vec<f32>`. Backing with f32 (not u8)
+/// guarantees 4-byte alignment for the payload slices the scan loop
+/// extracts, so the inner loop stays in safe code.
+fn alloc_chunk_buf(chunk_capacity_bytes: usize) -> Vec<f32> {
+    // Round up so the byte capacity can hold any entry-sized chunk.
+    let n_f32 = (chunk_capacity_bytes + 3) / 4;
+    vec![0.0f32; n_f32]
+}
+
+/// View a `&mut [f32]` buffer as `&mut [u8]` for pread. Safe because
+/// f32 has stricter alignment than u8 and shares the same raw
+/// storage.
+fn buf_bytes_mut(buf: &mut [f32]) -> &mut [u8] {
+    let ptr = buf.as_mut_ptr() as *mut u8;
+    let len = std::mem::size_of_val(buf);
+    unsafe { std::slice::from_raw_parts_mut(ptr, len) }
+}
+
+/// Scan one chunk of base vectors against a thread's query subset,
+/// updating the thread's persistent heaps/thresholds in place.
+///
+/// `chunk_buf` is the full chunk's raw f32 storage (entries as laid
+/// out in the fvec file, including 4-byte dim headers). `n_vecs` is
+/// the number of base vectors actually present in this chunk; the
+/// buffer may be larger (capacity-sized).
+///
+/// `chunk_first_idx` is the absolute base-vector index of the
+/// chunk's first vector, used to tag `Neighbor` records with the
+/// file-level index.
+fn scan_chunk_f32(
+    chunk_buf: &[f32],
+    n_vecs: usize,
+    chunk_first_idx: usize,
+    dim: usize,
     queries: &[&[f32]],
-    base_reader: &MmapVectorReader<f32>,
-    start: usize,
-    end: usize,
+    sub_batches: &[TransposedQueries],
+    sub_offsets: &[usize],
     k: usize,
     dist_fn: DistFn,
-    metric: Metric,
-    dim: usize,
-    initial_thresholds: &[f32],
-) -> Vec<Vec<Neighbor>> {
+    batch_fn: Option<BatchDistFn>,
+    heaps: &mut [BinaryHeap<Neighbor>],
+    thresholds: &mut [f32],
+) {
+    let stride_f32 = 1 + dim; // header (1 f32) + payload (dim f32s)
     let n_queries = queries.len();
-    let batch_fn = select_batch_dist_fn(metric);
-
-    // Build transposed sub-batches
-    let mut sub_batches: Vec<TransposedQueries> = Vec::new();
-    let mut sub_offsets: Vec<usize> = Vec::new();
-    if batch_fn.is_some() {
-        let mut offset = 0;
-        while offset < n_queries {
-            let sub_end = (offset + BATCH_WIDTH).min(n_queries);
-            sub_batches.push(TransposedQueries::new(&queries[offset..sub_end], dim));
-            sub_offsets.push(offset);
-            offset = sub_end;
-        }
-    }
-
-    let mut heaps: Vec<BinaryHeap<Neighbor>> = (0..n_queries)
-        .map(|_| BinaryHeap::with_capacity(k + 1))
-        .collect();
-    let mut thresholds: Vec<f32> = initial_thresholds.to_vec();
     let mut dist_buf = [0.0f32; BATCH_WIDTH];
 
-    for j in start..end {
-        let base_vec = base_reader.get_slice(j);
-        let idx = j as u32;
+    for j in 0..n_vecs {
+        let payload_off = j * stride_f32 + 1;
+        let base_vec: &[f32] = &chunk_buf[payload_off..payload_off + dim];
+        let idx = (chunk_first_idx + j) as u32;
 
         if let Some(bfn) = batch_fn {
             for (si, batch) in sub_batches.iter().enumerate() {
@@ -514,100 +557,6 @@ fn find_top_k_segment(
             }
         }
     }
-
-    heaps.into_iter().map(|h| h.into_vec()).collect()
-}
-
-/// Per-thread KNN scan with transposed 16-wide SIMD batching.
-///
-/// Groups queries into sub-batches of 16, transposes each into
-/// dimension-major layout, then for each base vector computes 16
-/// distances with one FMA per dimension. Falls back to pairwise
-/// for the tail sub-batch and non-AVX-512 platforms.
-fn find_top_k(
-    queries: &[&[f32]],
-    base_reader: &MmapVectorReader<f32>,
-    start: usize,
-    end: usize,
-    k: usize,
-    dist_fn: DistFn,
-    metric: Metric,
-    dim: usize,
-    results: &mut [Vec<Neighbor>],
-    progress: &AtomicU64,
-) {
-    let n_queries = queries.len();
-    let batch_fn = select_batch_dist_fn(metric);
-
-    // Build transposed sub-batches of 16 queries each
-    let mut sub_batches: Vec<TransposedQueries> = Vec::new();
-    let mut sub_offsets: Vec<usize> = Vec::new();
-    if batch_fn.is_some() {
-        let mut offset = 0;
-        while offset < n_queries {
-            let sub_end = (offset + BATCH_WIDTH).min(n_queries);
-            sub_batches.push(TransposedQueries::new(&queries[offset..sub_end], dim));
-            sub_offsets.push(offset);
-            offset = sub_end;
-        }
-    }
-
-    let mut heaps: Vec<BinaryHeap<Neighbor>> = (0..n_queries)
-        .map(|_| BinaryHeap::with_capacity(k + 1))
-        .collect();
-    let mut thresholds = vec![f32::INFINITY; n_queries];
-    let mut dist_buf = [0.0f32; BATCH_WIDTH];
-
-    let stride = ((end - start) / 10).max(1);
-    let mut i = start;
-    while i < end {
-        let stride_end = (i + stride).min(end);
-        for j in i..stride_end {
-            let base_vec = base_reader.get_slice(j);
-            let idx = j as u32;
-
-            if let Some(bfn) = batch_fn {
-                // Transposed batch path: 16 distances per SIMD pass
-                for (si, batch) in sub_batches.iter().enumerate() {
-                    unsafe { bfn(base_vec, batch, &mut dist_buf) };
-                    let sub_offset = sub_offsets[si];
-                    let count = batch.count;
-                    for qi in 0..count {
-                        let gqi = sub_offset + qi;
-                        let dist = dist_buf[qi];
-                        if dist < thresholds[gqi] {
-                            heaps[gqi].push(Neighbor { index: idx, distance: dist });
-                            if heaps[gqi].len() > k { heaps[gqi].pop(); }
-                            if heaps[gqi].len() == k {
-                                thresholds[gqi] = heaps[gqi].peek().unwrap().distance;
-                            }
-                        }
-                    }
-                }
-            } else {
-                // Pairwise fallback
-                for qi in 0..n_queries {
-                    let dist = dist_fn(queries[qi], base_vec);
-                    if dist < thresholds[qi] {
-                        heaps[qi].push(Neighbor { index: idx, distance: dist });
-                        if heaps[qi].len() > k { heaps[qi].pop(); }
-                        if heaps[qi].len() == k {
-                            thresholds[qi] = heaps[qi].peek().unwrap().distance;
-                        }
-                    }
-                }
-            }
-        }
-        progress.fetch_add((stride_end - i) as u64, AtomicOrdering::Relaxed);
-        i = stride_end;
-    }
-
-    for (qi, heap) in heaps.into_iter().enumerate() {
-        let mut v: Vec<Neighbor> = heap.into_vec();
-        v.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap_or(Ordering::Equal)
-            .then(a.index.cmp(&b.index)));
-        results[qi] = v;
-    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -621,6 +570,326 @@ fn resolve_path(s: &str, workspace: &Path) -> std::path::PathBuf {
 
 fn error_result(msg: impl Into<String>, start: Instant) -> CommandResult {
     CommandResult { status: Status::Error, message: msg.into(), produced: vec![], elapsed: start.elapsed() }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Per-segment cache (resumability)
+//
+// Each base-vector segment's per-query top-k contribution is written to
+// two files in `.cache/`: an ivec (neighbor indices) and an fvec (the
+// matching distances). File naming is keyed to the base/query files'
+// stems and sizes + segment byte range + k + metric, so:
+//   - Re-runs with the same inputs reuse completed segments verbatim.
+//   - Changing the base file (new size) invalidates all caches.
+//   - Different k or metric gets a disjoint cache space.
+//
+// Cache version bump: when the segment-compute algorithm changes in a
+// way that would affect output, bump `CACHE_VERSION` to force
+// re-computation.
+// ═══════════════════════════════════════════════════════════════════════
+
+const CACHE_VERSION: &str = "v1";
+
+/// Map our local `Metric` enum to a stable filename token. This must be
+/// stable across releases — changing it invalidates existing caches.
+fn metric_cache_tag(metric: Metric) -> &'static str {
+    match metric {
+        Metric::L2 => "l2",
+        Metric::DotProduct => "dot_product",
+        Metric::Cosine => "cosine",
+    }
+}
+
+/// Derive a cache-key prefix from the base and query file paths.
+/// Includes file sizes so the cache is auto-invalidated when data
+/// changes (e.g., after `prepare-vectors` produces new base ordinals
+/// → new base_vectors.fvecs of different size).
+fn cache_prefix_for(base_path: &Path, query_path: &Path) -> String {
+    let base_stem = base_path.file_stem().unwrap_or_default().to_string_lossy();
+    let query_stem = query_path.file_stem().unwrap_or_default().to_string_lossy();
+    let base_size = std::fs::metadata(base_path).map(|m| m.len()).unwrap_or(0);
+    let query_size = std::fs::metadata(query_path).map(|m| m.len()).unwrap_or(0);
+    format!("{}.{}.{}_{}", base_stem, query_stem, base_size, query_size)
+}
+
+/// Build a cache file path for a segment (`start..end` base-vector
+/// range) of the current (base, query, k, metric) tuple.
+#[allow(clippy::too_many_arguments)]
+fn build_cache_path(
+    cache_dir: &Path,
+    cache_prefix: &str,
+    start: usize,
+    end: usize,
+    k: usize,
+    metric: Metric,
+    suffix: &str,
+    ext: &str,
+) -> PathBuf {
+    cache_dir.join(format!(
+        "knn-stdarch.{}.{}.range_{:012}_{:012}.k{}.{}.{}.{}",
+        CACHE_VERSION,
+        cache_prefix,
+        start, end, k,
+        metric_cache_tag(metric),
+        suffix,
+        ext,
+    ))
+}
+
+/// A segment cache's two files are **both** `query_count × (4 + k × elem_size)`
+/// bytes — one ivec row of k i32 neighbor indices + dim header per query.
+/// Validate by exact byte-size equality; any size mismatch means the cache
+/// was written with different settings and must not be loaded.
+fn validate_cache_file(path: &Path, query_count: usize, k: usize, elem_size: usize) -> bool {
+    let expected = query_count as u64 * (4 + k as u64 * elem_size as u64);
+    match std::fs::metadata(path) {
+        Ok(meta) => meta.len() == expected,
+        Err(_) => false,
+    }
+}
+
+/// Write a segment's per-query top-k contribution to `ivec_path` (indices)
+/// + `fvec_path` (distances). The file layout matches the final output
+/// format so a cache file can be directly inspected with the same tools.
+fn write_segment_cache(
+    ivec_path: &Path,
+    fvec_path: &Path,
+    per_query: &[Vec<Neighbor>],
+    k: usize,
+) -> Result<(), String> {
+    use std::io::BufWriter;
+    let dim_bytes = (k as i32).to_le_bytes();
+
+    // .tmp + rename so a crash mid-write never leaves a half-file that
+    // the resumability check would mistakenly treat as valid.
+    let ivec_tmp = ivec_path.with_extension("tmp");
+    let fvec_tmp = fvec_path.with_extension("tmp");
+
+    let ivec_f = std::fs::File::create(&ivec_tmp)
+        .map_err(|e| format!("create {}: {}", ivec_tmp.display(), e))?;
+    let fvec_f = std::fs::File::create(&fvec_tmp)
+        .map_err(|e| format!("create {}: {}", fvec_tmp.display(), e))?;
+    let mut iw = BufWriter::with_capacity(1 << 20, ivec_f);
+    let mut fw = BufWriter::with_capacity(1 << 20, fvec_f);
+
+    for row in per_query {
+        iw.write_all(&dim_bytes).map_err(|e| e.to_string())?;
+        fw.write_all(&dim_bytes).map_err(|e| e.to_string())?;
+        for j in 0..k {
+            let (idx_i32, dist_f32) = if j < row.len() {
+                (row[j].index as i32, row[j].distance)
+            } else {
+                (-1i32, f32::INFINITY)
+            };
+            iw.write_all(&idx_i32.to_le_bytes()).map_err(|e| e.to_string())?;
+            fw.write_all(&dist_f32.to_le_bytes()).map_err(|e| e.to_string())?;
+        }
+    }
+    iw.flush().map_err(|e| e.to_string())?;
+    fw.flush().map_err(|e| e.to_string())?;
+    drop(iw);
+    drop(fw);
+    std::fs::rename(&ivec_tmp, ivec_path)
+        .map_err(|e| format!("rename {} → {}: {}", ivec_tmp.display(), ivec_path.display(), e))?;
+    std::fs::rename(&fvec_tmp, fvec_path)
+        .map_err(|e| format!("rename {} → {}: {}", fvec_tmp.display(), fvec_path.display(), e))?;
+    Ok(())
+}
+
+/// Load a previously-written segment cache back into a
+/// `per_query: Vec<Vec<Neighbor>>` structure. Padding entries (index
+/// `-1`, distance `+∞`) are stripped.
+fn load_segment_cache(
+    ivec_path: &Path,
+    fvec_path: &Path,
+    k: usize,
+    query_count: usize,
+) -> Result<Vec<Vec<Neighbor>>, String> {
+    use std::io::BufReader;
+    let mut iw = BufReader::with_capacity(1 << 20, std::fs::File::open(ivec_path)
+        .map_err(|e| format!("open {}: {}", ivec_path.display(), e))?);
+    let mut fw = BufReader::with_capacity(1 << 20, std::fs::File::open(fvec_path)
+        .map_err(|e| format!("open {}: {}", fvec_path.display(), e))?);
+
+    let mut result: Vec<Vec<Neighbor>> = Vec::with_capacity(query_count);
+    let mut hdr = [0u8; 4];
+    let mut idx_buf = [0u8; 4];
+    let mut dist_buf = [0u8; 4];
+    for _ in 0..query_count {
+        // Skip dim header (already validated via file size)
+        iw.read_exact(&mut hdr).map_err(|e| format!("read ivec dim: {}", e))?;
+        fw.read_exact(&mut hdr).map_err(|e| format!("read fvec dim: {}", e))?;
+        let mut row: Vec<Neighbor> = Vec::with_capacity(k);
+        for _ in 0..k {
+            iw.read_exact(&mut idx_buf).map_err(|e| format!("read ivec body: {}", e))?;
+            fw.read_exact(&mut dist_buf).map_err(|e| format!("read fvec body: {}", e))?;
+            let idx = i32::from_le_bytes(idx_buf);
+            let dist = f32::from_le_bytes(dist_buf);
+            if idx >= 0 {
+                row.push(Neighbor { index: idx as u32, distance: dist });
+            }
+        }
+        result.push(row);
+    }
+    Ok(result)
+}
+
+/// Merge a segment's per-query top-k contribution into the global
+/// running heaps. Mirrors the inline merge in the segment loop.
+fn merge_segment_into_heaps(
+    segment: &[Vec<Neighbor>],
+    all_heaps: &mut [BinaryHeap<Neighbor>],
+    all_thresholds: &mut [f32],
+    k: usize,
+) {
+    for (qi, neighbors) in segment.iter().enumerate() {
+        for n in neighbors {
+            if n.distance < all_thresholds[qi] {
+                all_heaps[qi].push(*n);
+                if all_heaps[qi].len() > k {
+                    all_heaps[qi].pop();
+                    all_thresholds[qi] = all_heaps[qi].peek().unwrap().distance;
+                }
+            }
+        }
+    }
+}
+
+/// One cached segment discovered during cache scan. Could come from
+/// this profile's `.cache/` entries OR from another profile's
+/// published ground-truth output (`profiles/<size>/neighbor_*.ivecs`).
+struct CachedSegment {
+    start: usize,
+    end: usize,
+    ivec_path: PathBuf,
+    fvec_path: PathBuf,
+}
+
+/// Scan the cache directory (and sibling profile outputs) for every
+/// segment whose per-query top-K results could feed this run's KNN.
+///
+/// A segment is "reusable" when it covers a contiguous [start..end)
+/// base-vector range and its (ivec, fvec) pair exist at the exact
+/// expected byte size (`query_count × (4 + k × 4)` each). Cache-keying
+/// embeds the source files' stems and SIZES, so a size-mismatch on
+/// either side silently invalidates (no accidental reuse across
+/// regenerated data).
+///
+/// Two discovery paths:
+///   1. `.cache/knn-stdarch.v1.{prefix}.range_*.k{k}.{metric}.neighbors.ivec`
+///      — segments we or a prior run of THIS command wrote.
+///   2. `profiles/{size}/neighbor_indices.ivecs` + `.../neighbor_distances.fvecs`
+///      — completed ground truth from a SMALLER sized profile. The
+///      directory name (e.g. "50m", "4mi") encodes the profile's
+///      base count N, so the file covers the [0..N) range natively.
+///      Catching these means a 100m profile naturally reuses the 50m
+///      profile's final output as its [0..50m) segment without
+///      needing the 50m profile to have been computed via this
+///      command's cache path.
+fn scan_cached_segments(
+    cache_dir: &Path,
+    cache_prefix: &str,
+    k: usize,
+    metric: Metric,
+    query_count: usize,
+    workspace: &Path,
+    base_end: usize,
+    ui: &veks_core::ui::UiHandle,
+) -> Vec<CachedSegment> {
+    let metric_tag = metric_cache_tag(metric);
+    let prefix_pat = format!(
+        "knn-stdarch.{}.{}.range_",
+        CACHE_VERSION, cache_prefix,
+    );
+    // What we look for after the range: ".k{k}.{metric}.neighbors.ivec"
+    let suffix_pat = format!(".k{}.{}.neighbors.ivec", k, metric_tag);
+
+    let mut segments: Vec<CachedSegment> = Vec::new();
+
+    // ── Path 1: scan .cache/ for segments written by this command ──
+    if let Ok(entries) = std::fs::read_dir(cache_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if !name_str.starts_with(&prefix_pat) { continue; }
+            if !name_str.ends_with(&suffix_pat) { continue; }
+
+            // Extract the range part: everything between the prefix
+            // and the first '.' in the tail.
+            let after_prefix = &name_str[prefix_pat.len()..];
+            let range_end = after_prefix.find('.').unwrap_or(after_prefix.len());
+            let range_str = &after_prefix[..range_end];
+            let (s_str, e_str) = match range_str.split_once('_') {
+                Some(pair) => pair,
+                None => continue,
+            };
+            let (s, e) = match (s_str.parse::<usize>(), e_str.parse::<usize>()) {
+                (Ok(a), Ok(b)) if b > a => (a, b),
+                _ => continue,
+            };
+
+            let ivec = build_cache_path(cache_dir, cache_prefix, s, e, k, metric, "neighbors", "ivec");
+            let fvec = build_cache_path(cache_dir, cache_prefix, s, e, k, metric, "distances", "fvec");
+            if validate_cache_file(&ivec, query_count, k, 4)
+                && validate_cache_file(&fvec, query_count, k, 4)
+            {
+                segments.push(CachedSegment { start: s, end: e, ivec_path: ivec, fvec_path: fvec });
+            }
+        }
+    }
+
+    // ── Path 2: scan profiles/ for smaller-profile final outputs ──
+    //
+    // The pipeline writes each sized profile's ground truth to
+    // `profiles/<size>/neighbor_indices.ivecs` (+ distances). The
+    // directory name encodes the profile's base count. Any such
+    // output whose base count is < this run's base_end covers
+    // [0..N) and can drop in as a cached segment — no need for the
+    // smaller profile to have been computed via this command's own
+    // cache path.
+    let profiles_dir = workspace.join("profiles");
+    if profiles_dir.is_dir() {
+        if let Ok(entries) = std::fs::read_dir(&profiles_dir) {
+            for entry in entries.flatten() {
+                if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    continue;
+                }
+                let pname = entry.file_name();
+                let pname_str = pname.to_string_lossy();
+                if pname_str == "default" { continue; }
+
+                let pbc = match vectordata::dataset::source::parse_number_with_suffix(&pname_str) {
+                    Ok(v) => v as usize,
+                    Err(_) => continue,
+                };
+                if pbc == 0 || pbc >= base_end { continue; }
+
+                let idx_path = entry.path().join("neighbor_indices.ivecs");
+                let dist_path = entry.path().join("neighbor_distances.fvecs");
+                if validate_cache_file(&idx_path, query_count, k, 4)
+                    && validate_cache_file(&dist_path, query_count, k, 4)
+                {
+                    let already = segments.iter().any(|s| s.start == 0 && s.end == pbc);
+                    if !already {
+                        ui.log(&format!(
+                            "  reusing profile '{}' output as segment [0, {})",
+                            pname_str, pbc,
+                        ));
+                        segments.push(CachedSegment {
+                            start: 0, end: pbc,
+                            ivec_path: idx_path,
+                            fvec_path: dist_path,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // Sort by start, then by size descending — the greedy matcher
+    // picks the largest segment starting at a given position.
+    segments.sort_by(|a, b| a.start.cmp(&b.start).then(b.end.cmp(&a.end)));
+    segments
 }
 
 impl CommandOp for ComputeKnnStdarchOp {
@@ -700,12 +969,22 @@ on `std::arch` alone, without SimSIMD, FAISS, or BLAS.
             }
         }
 
-        // Open readers
+        // Open readers. The mmap readers are used for metadata (dim,
+        // count) and for query slices. The base vectors are streamed
+        // through a separate pread(2) path during compute so no base
+        // bytes ever enter the process address space — see the scanner
+        // module above for rationale.
         let base_reader = match MmapVectorReader::<f32>::open_fvec(&base_path) {
             Ok(r) => Arc::new(r), Err(e) => return error_result(format!("open base: {}", e), start),
         };
         let query_reader = match MmapVectorReader::<f32>::open_fvec(&query_path) {
             Ok(r) => Arc::new(r), Err(e) => return error_result(format!("open query: {}", e), start),
+        };
+        // File handle used exclusively for pread-based streaming.
+        // Opened once and shared across all segment scans.
+        let base_file = match File::open(&base_path) {
+            Ok(f) => Arc::new(f),
+            Err(e) => return error_result(format!("open base for streaming: {}", e), start),
         };
 
         let base_count = VectorReader::<f32>::count(base_reader.as_ref());
@@ -735,25 +1014,40 @@ on `std::arch` alone, without SimSIMD, FAISS, or BLAS.
         // Per-query heaps persist across segments and accumulate the
         // global top-k.
         let segment_size = {
-            // Target: ~50% of system RAM for the segment's page cache footprint.
-            // Each base vector is dim*4 bytes. With all threads reading the
-            // same segment, only one copy lives in page cache.
-            let total_ram: u64 = std::fs::read_to_string("/proc/meminfo").ok()
-                .and_then(|s| s.lines()
-                    .find(|l| l.starts_with("MemTotal:"))
-                    .and_then(|l| l.split_whitespace().nth(1))
-                    .and_then(|n| n.parse::<u64>().ok())
-                    .map(|kb| kb * 1024))
-                .unwrap_or(8 * 1024 * 1024 * 1024);
-            let budget = (total_ram / 2) as usize;
-            let entry_bytes = dim * 4;
-            let auto = (budget / entry_bytes.max(1)).max(10_000);
-            auto.min(base_n) // don't exceed actual base count
+            // Explicit override wins — tests use it to force multiple
+            // small segments, and users can use it to force finer
+            // cache granularity on huge inputs (trade more cache
+            // files for finer resume granularity).
+            let explicit: Option<usize> = options.get("partition_size")
+                .and_then(|s| s.parse().ok())
+                .filter(|&n: &usize| n > 0);
+            if let Some(n) = explicit {
+                n.min(base_n)
+            } else {
+                // Target: ~50% of system RAM for the segment's page cache footprint.
+                // Each base vector is dim*4 bytes. With all threads reading the
+                // same segment, only one copy lives in page cache.
+                let total_ram: u64 = std::fs::read_to_string("/proc/meminfo").ok()
+                    .and_then(|s| s.lines()
+                        .find(|l| l.starts_with("MemTotal:"))
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .and_then(|n| n.parse::<u64>().ok())
+                        .map(|kb| kb * 1024))
+                    .unwrap_or(8 * 1024 * 1024 * 1024);
+                let budget = (total_ram / 2) as usize;
+                let entry_bytes = dim * 4;
+                let auto = (budget / entry_bytes.max(1)).max(10_000);
+                auto.min(base_n) // don't exceed actual base count
+            }
         };
 
-        let n_segments = (base_n + segment_size - 1) / segment_size;
-        ctx.ui.log(&format!("  {} base-vector segments ({} vectors each)",
-            n_segments, segment_size));
+        // Nominal segment count — the actual plan may produce
+        // fewer/differently-sized segments when scan_cached_segments
+        // greedy-matches cached ranges that don't align with this
+        // value. This log is just the "fresh-compute baseline."
+        let nominal_segments = (base_n + segment_size - 1) / segment_size;
+        ctx.ui.log(&format!("  {} base-vector segments @ {} vectors each (nominal, before cache reuse)",
+            nominal_segments, segment_size));
 
         let chunk_size = (query_count + threads - 1) / threads;
         let pb = ctx.ui.bar(base_n as u64, "KNN-stdarch");
@@ -764,65 +1058,367 @@ on `std::arch` alone, without SimSIMD, FAISS, or BLAS.
             .collect();
         let mut all_thresholds = vec![f32::INFINITY; query_count];
 
+        // ── Discover reusable segments + plan ──────────────────────
+        //
+        // Scan the cache directory for every segment previously
+        // written by this command (across prior runs of ANY profile),
+        // plus any completed smaller-profile outputs that naturally
+        // cover [0..N). Build a segment plan that greedy-prefers the
+        // largest cached segment at each position, filling gaps with
+        // fresh partition_size chunks.
+        //
+        // Cross-profile reuse is the point here: when profiles run
+        // small-to-large (the usual sized-profile sweep), every
+        // larger profile picks up the previous profiles' work from
+        // disk instead of recomputing [0..smaller) from scratch.
+        if !ctx.cache.exists() {
+            let _ = std::fs::create_dir_all(&ctx.cache);
+        }
+        let cache_prefix = cache_prefix_for(&base_path, &query_path);
+        let base_start = base_offset;
+        let base_end = base_offset + base_n;
+
+        let cached_segments = scan_cached_segments(
+            &ctx.cache, &cache_prefix, k, kernel_metric, query_count,
+            &ctx.workspace, base_end, &ctx.ui,
+        );
+
+        /// A single entry in the planned segment chain — either a
+        /// ready-to-replay cached segment or a fresh range that
+        /// needs computation (and will write its own cache on
+        /// completion).
+        struct PlannedSegment {
+            start: usize,
+            end: usize,
+            ivec_path: PathBuf,
+            fvec_path: PathBuf,
+            cached: bool,
+        }
+
+        // Greedy chain build: at each position, prefer the largest
+        // cache starting exactly there whose end stays within
+        // `base_end`. Otherwise lay down a fresh partition_size
+        // segment.
+        let mut plan: Vec<PlannedSegment> = Vec::new();
+        let mut pos = base_start;
+        while pos < base_end {
+            let best = cached_segments.iter()
+                .filter(|s| s.start == pos && s.end <= base_end && s.end > pos)
+                .max_by_key(|s| s.end);
+            if let Some(seg) = best {
+                plan.push(PlannedSegment {
+                    start: seg.start, end: seg.end,
+                    ivec_path: seg.ivec_path.clone(),
+                    fvec_path: seg.fvec_path.clone(),
+                    cached: true,
+                });
+                pos = seg.end;
+            } else {
+                let pe = (pos + segment_size).min(base_end);
+                plan.push(PlannedSegment {
+                    start: pos, end: pe,
+                    ivec_path: build_cache_path(&ctx.cache, &cache_prefix, pos, pe, k, kernel_metric, "neighbors", "ivec"),
+                    fvec_path: build_cache_path(&ctx.cache, &cache_prefix, pos, pe, k, kernel_metric, "distances", "fvec"),
+                    cached: false,
+                });
+                pos = pe;
+            }
+        }
+
+        let n_segments = plan.len();
+        let cached_count = plan.iter().filter(|p| p.cached).count();
+        let to_compute = n_segments - cached_count;
+        // Base-vectors covered by cache (for % savings banner).
+        let cached_bases: usize = plan.iter()
+            .filter(|p| p.cached)
+            .map(|p| p.end - p.start)
+            .sum();
+
+        if cached_count > 0 {
+            let base_pct = 100.0 * cached_bases as f64 / base_n as f64;
+            ctx.ui.log(&format!(
+                "  ┌─── segment cache: {}/{} segments reusable ({} of {} base vectors, {:.0}%) ───",
+                cached_count, n_segments,
+                cached_bases, base_n, base_pct,
+            ));
+            ctx.ui.log(&format!(
+                "  │  will REPLAY {} segment(s) from disk, COMPUTE {} fresh",
+                cached_count, to_compute,
+            ));
+            ctx.ui.log(&format!(
+                "  │  cache dir: {}",
+                ctx.cache.display(),
+            ));
+            ctx.ui.log("  └──────────────────────────────────────────────────────");
+
+            // Replay every cached segment into the global heaps up
+            // front — this tightens `all_thresholds` before the
+            // compute loop starts, maximizing early-exit pruning
+            // when the fresh segments actually run.
+            let replay_start = Instant::now();
+            let mut replayed_bytes: u64 = 0;
+            for (seg_idx, p) in plan.iter().enumerate() {
+                if !p.cached { continue; }
+                let seg = match load_segment_cache(
+                    &p.ivec_path, &p.fvec_path, k, query_count,
+                ) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        return error_result(
+                            format!("failed to replay segment {} [{}..{}): {}",
+                                seg_idx, p.start, p.end, e),
+                            start,
+                        );
+                    }
+                };
+                merge_segment_into_heaps(&seg, &mut all_heaps, &mut all_thresholds, k);
+                let ivec_sz = std::fs::metadata(&p.ivec_path).map(|m| m.len()).unwrap_or(0);
+                let fvec_sz = std::fs::metadata(&p.fvec_path).map(|m| m.len()).unwrap_or(0);
+                replayed_bytes += ivec_sz + fvec_sz;
+                ctx.ui.log(&format!(
+                    "  ▸ [seg {:>3}/{}] REUSED range [{}..{}) from {}",
+                    seg_idx + 1, n_segments, p.start, p.end,
+                    p.ivec_path.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
+                ));
+                pb.set_position((p.end - base_start) as u64);
+            }
+            let replay_secs = replay_start.elapsed().as_secs_f64();
+            ctx.ui.log(&format!(
+                "  ✓ replay complete: {} segment(s), {:.1} MiB read from cache in {:.1}s",
+                cached_count,
+                replayed_bytes as f64 / (1024.0 * 1024.0),
+                replay_secs,
+            ));
+        } else {
+            ctx.ui.log(&format!(
+                "  segment cache: 0 reusable — {} segment(s) will be computed fresh (cache will be populated for future profiles)",
+                n_segments,
+            ));
+        }
+
+        // ── Streaming pread pipeline ────────────────────────────────
+        // Segment compute reads base vectors via pread into heap
+        // buffers (not mmap). Two buffers alternate: while compute
+        // threads scan chunk N, an I/O task preads chunk N+1 into
+        // the other buffer. The scope join is the chunk barrier.
+        let entry_size = 4 + dim * 4;
+        let vecs_per_chunk = (STREAM_CHUNK_BYTES / entry_size).max(1);
+        let chunk_byte_cap = vecs_per_chunk * entry_size;
+        let mut buf_a = alloc_chunk_buf(chunk_byte_cap);
+        let mut buf_b = alloc_chunk_buf(chunk_byte_cap);
+        let batch_fn = select_batch_dist_fn(kernel_metric);
+
+        let mut computed_count = 0usize;
         for seg_idx in 0..n_segments {
-            let seg_start = base_offset + seg_idx * segment_size;
-            let seg_end = (seg_start + segment_size).min(base_offset + base_n);
+            let p = &plan[seg_idx];
 
-            // Each thread scans this segment for its subset of queries,
-            // returning partial heaps that we merge into the global heaps.
-            let segment_results: Vec<Vec<(usize, Vec<Neighbor>)>> =
+            // Skip if this segment's contribution was loaded from cache above.
+            if p.cached {
+                continue;
+            }
+
+            let seg_start = p.start;
+            let seg_end = p.end;
+            let seg_len = seg_end - seg_start;
+            let n_chunks = (seg_len + vecs_per_chunk - 1) / vecs_per_chunk;
+            let seg_compute_start = Instant::now();
+            ctx.ui.log(&format!(
+                "  ▶ [seg {:>3}/{}] COMPUTE range [{}..{}) ({} base × {} queries, {} chunk(s) ≤ {} vecs)",
+                seg_idx + 1, n_segments,
+                seg_start, seg_end,
+                seg_len, query_count,
+                n_chunks, vecs_per_chunk,
+            ));
+
+            // Per-thread persistent state across this segment's chunks.
+            // Heaps accumulate across chunks; thresholds tighten as
+            // the per-thread top-K fills up.
+            struct ThreadCtx<'a> {
+                q_start: usize,
+                queries: Vec<&'a [f32]>,
+                sub_batches: Vec<TransposedQueries>,
+                sub_offsets: Vec<usize>,
+                heaps: Vec<BinaryHeap<Neighbor>>,
+                thresholds: Vec<f32>,
+            }
+            let mut thread_ctxs: Vec<ThreadCtx> = (0..threads).filter_map(|ti| {
+                let q_start = ti * chunk_size;
+                if q_start >= query_count { return None; }
+                let q_end = (q_start + chunk_size).min(query_count);
+                let q_len = q_end - q_start;
+                let queries: Vec<&[f32]> = (0..q_len)
+                    .map(|i| query_reader.get_slice(q_start + i))
+                    .collect();
+                let mut sub_batches: Vec<TransposedQueries> = Vec::new();
+                let mut sub_offsets: Vec<usize> = Vec::new();
+                if batch_fn.is_some() {
+                    let mut off = 0;
+                    while off < q_len {
+                        let se = (off + BATCH_WIDTH).min(q_len);
+                        sub_batches.push(TransposedQueries::new(&queries[off..se], dim));
+                        sub_offsets.push(off);
+                        off = se;
+                    }
+                }
+                let heaps: Vec<BinaryHeap<Neighbor>> = (0..q_len)
+                    .map(|_| BinaryHeap::with_capacity(k + 1))
+                    .collect();
+                // Seed thresholds from the global top-K accumulated by
+                // prior segments — lets us prune early on any base
+                // vector that can't beat what we've already found.
+                let thresholds: Vec<f32> = all_thresholds[q_start..q_end].to_vec();
+                Some(ThreadCtx {
+                    q_start, queries, sub_batches, sub_offsets, heaps, thresholds,
+                })
+            }).collect();
+
+            // Helper: absolute-index range of chunk `c` within this segment.
+            let chunk_range = |c: usize| -> (usize, usize) {
+                let s = seg_start + c * vecs_per_chunk;
+                let e = (s + vecs_per_chunk).min(seg_end);
+                (s, e - s)
+            };
+
+            // Prime buf_a with chunk 0 synchronously — nothing to
+            // overlap with yet. After this, every subsequent chunk's
+            // I/O overlaps with the previous chunk's compute.
+            let (c0_first, c0_n) = chunk_range(0);
+            let c0_bytes = c0_n * entry_size;
+            let c0_off = (c0_first as u64) * (entry_size as u64);
+            if let Err(e) = base_file.read_exact_at(
+                &mut buf_bytes_mut(&mut buf_a)[..c0_bytes], c0_off,
+            ) {
+                return error_result(
+                    format!("pread seg {} chunk 0: {}", seg_idx, e),
+                    start,
+                );
+            }
+
+            // I/O errors from the prefetch task are captured here
+            // and surfaced after the scope joins.
+            let io_err: Arc<std::sync::Mutex<Option<String>>> =
+                Arc::new(std::sync::Mutex::new(None));
+
+            for chunk_i in 0..n_chunks {
+                let is_last = chunk_i + 1 == n_chunks;
+                let (cur_first, cur_n) = chunk_range(chunk_i);
+                let (next_first, next_n) = if is_last {
+                    (0, 0)
+                } else {
+                    chunk_range(chunk_i + 1)
+                };
+                let next_bytes = next_n * entry_size;
+                let next_off = (next_first as u64) * (entry_size as u64);
+
                 std::thread::scope(|scope| {
-                    let handles: Vec<_> = (0..threads).filter_map(|ti| {
-                        let q_start = ti * chunk_size;
-                        if q_start >= query_count { return None; }
-                        let q_end = (q_start + chunk_size).min(query_count);
-                        let q_len = q_end - q_start;
-
-                        let base_ref = Arc::clone(&base_reader);
-                        let query_ref = Arc::clone(&query_reader);
-                        // Pass current thresholds to the thread for early pruning
-                        let thresh: Vec<f32> = all_thresholds[q_start..q_end].to_vec();
-
-                        Some(scope.spawn(move || {
-                            let queries: Vec<&[f32]> = (0..q_len)
-                                .map(|i| query_ref.get_slice(q_start + i))
-                                .collect();
-
-                            find_top_k_segment(
-                                &queries, &base_ref,
-                                seg_start, seg_end,
-                                k, dist_fn, kernel_metric, dim,
-                                &thresh,
-                            ).into_iter()
-                                .enumerate()
-                                .map(|(i, heap)| (q_start + i, heap))
-                                .collect::<Vec<_>>()
-                        }))
-                    }).collect();
-
-                    handles.into_iter()
-                        .map(|h| h.join().unwrap())
-                        .collect()
+                    // I/O task: fill buf_b with the next chunk.
+                    if !is_last {
+                        let rb: &mut Vec<f32> = &mut buf_b;
+                        let bf = Arc::clone(&base_file);
+                        let err_slot = Arc::clone(&io_err);
+                        scope.spawn(move || {
+                            if let Err(e) = bf.read_exact_at(
+                                &mut buf_bytes_mut(rb)[..next_bytes], next_off,
+                            ) {
+                                *err_slot.lock().unwrap() =
+                                    Some(format!("pread chunk@{}: {}", next_first, e));
+                            }
+                        });
+                    }
+                    // Compute tasks: each thread scans buf_a for its
+                    // query subset, updating its persistent heaps.
+                    let sb: &[f32] = &buf_a;
+                    for tc in thread_ctxs.iter_mut() {
+                        let queries_ref: &[&[f32]] = &tc.queries;
+                        let subs_ref: &[TransposedQueries] = &tc.sub_batches;
+                        let offs_ref: &[usize] = &tc.sub_offsets;
+                        let heaps_ref: &mut [BinaryHeap<Neighbor>] = &mut tc.heaps;
+                        let thr_ref: &mut [f32] = &mut tc.thresholds;
+                        scope.spawn(move || {
+                            scan_chunk_f32(
+                                sb, cur_n, cur_first, dim,
+                                queries_ref, subs_ref, offs_ref,
+                                k, dist_fn, batch_fn,
+                                heaps_ref, thr_ref,
+                            );
+                        });
+                    }
                 });
 
-            // Merge segment results into global heaps
-            for thread_results in segment_results {
-                for (qi, neighbors) in thread_results {
-                    for n in neighbors {
-                        if n.distance < all_thresholds[qi] {
-                            all_heaps[qi].push(n);
-                            if all_heaps[qi].len() > k {
-                                all_heaps[qi].pop();
-                                all_thresholds[qi] = all_heaps[qi].peek().unwrap().distance;
-                            }
-                        }
-                    }
+                // Surface any I/O error after the scope joins — we
+                // must not proceed to swap + scan a buffer whose
+                // contents are undefined.
+                if let Some(msg) = io_err.lock().unwrap().take() {
+                    return error_result(
+                        format!("seg {}: {}", seg_idx, msg),
+                        start,
+                    );
+                }
+
+                if !is_last {
+                    std::mem::swap(&mut buf_a, &mut buf_b);
+                }
+                pb.set_position((cur_first + cur_n - base_offset) as u64);
+            }
+
+            // Collect per-thread heaps into absolute-indexed per_query
+            // for cache write and global merge.
+            let mut per_query: Vec<Vec<Neighbor>> =
+                (0..query_count).map(|_| Vec::new()).collect();
+            for tc in thread_ctxs {
+                for (i, heap) in tc.heaps.into_iter().enumerate() {
+                    per_query[tc.q_start + i] = heap.into_vec();
                 }
             }
 
-            pb.set_position((seg_end - base_offset) as u64);
+            // Persist the segment's contribution to cache BEFORE
+            // merging into the global heaps. If we crashed between
+            // merge and write, a subsequent run would double-count
+            // this segment's neighbors. Cache-then-merge ordering
+            // makes this replay-safe: crash after cache write → next
+            // run skips this segment entirely (the load re-creates
+            // the same heap contribution).
+            if let Err(e) = write_segment_cache(
+                &plan[seg_idx].ivec_path,
+                &plan[seg_idx].fvec_path,
+                &per_query, k,
+            ) {
+                // Non-fatal: log and continue. A cache-write failure
+                // doesn't break correctness, just resumability for
+                // this segment.
+                ctx.ui.log(&format!(
+                    "  warning: segment {} cache write failed: {}",
+                    seg_idx, e,
+                ));
+            }
+
+            // Merge segment results into global heaps.
+            merge_segment_into_heaps(&per_query, &mut all_heaps, &mut all_thresholds, k);
+
+            computed_count += 1;
+            let seg_secs = seg_compute_start.elapsed().as_secs_f64();
+            let seg_evals = seg_len as f64 * query_count as f64;
+            let seg_rate = if seg_secs > 0.0 { seg_evals / seg_secs / 1e9 } else { 0.0 };
+            ctx.ui.log(&format!(
+                "  ✓ [seg {:>3}/{}] done in {:.1}s ({:.2}B dist/s) — cache written",
+                seg_idx + 1, n_segments, seg_secs, seg_rate,
+            ));
         }
         pb.finish();
+
+        // Final summary line explicitly names how much work was saved.
+        if cached_count > 0 {
+            ctx.ui.log(&format!(
+                "  segments: {} reused from cache + {} computed = {} total (saved ~{:.0}% of base scans)",
+                cached_count, computed_count, n_segments,
+                100.0 * cached_count as f64 / n_segments as f64,
+            ));
+        } else {
+            ctx.ui.log(&format!(
+                "  segments: {} computed (cache populated for future runs)",
+                computed_count,
+            ));
+        }
 
         let compute_secs = start.elapsed().as_secs_f64();
         let evals = query_count as f64 * base_n as f64;
@@ -898,7 +1494,7 @@ on `std::arch` alone, without SimSIMD, FAISS, or BLAS.
             OptionDesc { name: "normalized".into(), type_name: "bool".into(), required: false, default: Some("false".into()), description: "Vectors are L2-normalized".into(), role: OptionRole::Config },
             OptionDesc { name: "threads".into(), type_name: "int".into(), required: false, default: Some("0".into()), description: "Thread count (0 = auto)".into(), role: OptionRole::Config },
             // Accept but ignore knn-metal options for drop-in compatibility
-            OptionDesc { name: "partition_size".into(), type_name: "int".into(), required: false, default: None, description: "Ignored (no partitioning)".into(), role: OptionRole::Config },
+            OptionDesc { name: "partition_size".into(), type_name: "int".into(), required: false, default: None, description: "Override auto-sized segment length (for testing or finer cache granularity)".into(), role: OptionRole::Config },
             OptionDesc { name: "compress-cache".into(), type_name: "bool".into(), required: false, default: Some("false".into()), description: "Ignored".into(), role: OptionRole::Config },
         ]
     }
@@ -923,7 +1519,6 @@ mod tests {
             profile: String::new(),
             profile_names: vec![],
             workspace: workspace.to_path_buf(),
-            scratch: workspace.join(".scratch"),
             cache: workspace.join(".cache"),
             defaults: indexmap::IndexMap::new(),
             dry_run: false,
@@ -1024,6 +1619,388 @@ mod tests {
             assert!(diff <= 2,
                 "query {}: stdarch {:?} vs metal {:?} — {} differ", q, &stdarch_rows[q], &metal_rows[q], diff);
         }
+    }
+
+    fn read_fvec_rows(path: &std::path::Path) -> Vec<Vec<f32>> {
+        let reader = MmapVectorReader::<f32>::open_fvec(path).unwrap();
+        let count = VectorReader::<f32>::count(&reader);
+        (0..count).map(|i| reader.get_slice(i).to_vec()).collect()
+    }
+
+    /// Build a small repeatable test dataset + run the op through it
+    /// with an explicit `partition_size` so the segment loop runs
+    /// multiple times (exercising the cache write + replay paths).
+    /// Returns `(result, indices_path, distances_path)`.
+    fn run_knn(
+        tmp: &std::path::Path,
+        base: &[Vec<f32>], query: &[Vec<f32>],
+        partition_size: usize,
+        k: usize,
+        metric: &str,
+        stem: &str,
+    ) -> (CommandResult, std::path::PathBuf, std::path::PathBuf) {
+        write_fvec(&tmp.join("b.fvec"), base);
+        write_fvec(&tmp.join("q.fvec"), query);
+        let indices_name = format!("{}.ivec", stem);
+        let distances_name = format!("{}-d.fvec", stem);
+        let mut ctx = make_ctx(tmp);
+        let mut opts = Options::new();
+        opts.set("base", "b.fvec"); opts.set("query", "q.fvec");
+        opts.set("indices", &indices_name);
+        opts.set("distances", &distances_name);
+        opts.set("neighbors", &k.to_string());
+        opts.set("metric", metric);
+        opts.set("partition_size", &partition_size.to_string());
+        let mut op = ComputeKnnStdarchOp;
+        let r = op.execute(&opts, &mut ctx);
+        (r, tmp.join(&indices_name), tmp.join(&distances_name))
+    }
+
+    /// After a successful run, each segment should have left behind
+    /// two cache files of exactly query_count × (4 + k × 4) bytes.
+    #[test]
+    fn cache_files_written_per_segment() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let mut rng = 7u64;
+        let mut nxt = || -> f32 { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+            (rng as f32 / u64::MAX as f32) * 2.0 - 1.0 };
+        let base: Vec<Vec<f32>> = (0..120).map(|_| (0..4).map(|_| nxt()).collect()).collect();
+        let query: Vec<Vec<f32>> = (0..5).map(|_| (0..4).map(|_| nxt()).collect()).collect();
+
+        // 120 base / partition 40 = 3 segments
+        let (r, _, _) = run_knn(tmp.path(), &base, &query, 40, 3, "L2", "out");
+        assert_eq!(r.status, Status::Ok, "{}", r.message);
+
+        // Three segments × two files each = six cache files at
+        // query_count * (4 + k*4) = 5 * (4 + 12) = 80 bytes each.
+        let cache_dir = tmp.path().join(".cache");
+        let files: Vec<_> = std::fs::read_dir(&cache_dir).unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.file_name().and_then(|s| s.to_str())
+                .map(|n| n.starts_with("knn-stdarch.v1.")).unwrap_or(false))
+            .collect();
+        assert_eq!(files.len(), 6,
+            "expected 6 cache files (3 segments × ivec+fvec), got {}: {:?}",
+            files.len(), files);
+        for f in &files {
+            let sz = std::fs::metadata(f).unwrap().len();
+            assert_eq!(sz, 80, "cache file {} has wrong size", f.display());
+        }
+    }
+
+    /// A second run with every segment cached must produce
+    /// byte-identical output, AND must not re-scan any base vectors
+    /// (verified by removing the base file between runs — a fresh
+    /// compute would error, a full cache replay would not).
+    #[test]
+    fn replay_identical_with_full_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let mut rng = 42u64;
+        let mut nxt = || -> f32 { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+            (rng as f32 / u64::MAX as f32) * 2.0 - 1.0 };
+        let base: Vec<Vec<f32>> = (0..80).map(|_| (0..4).map(|_| nxt()).collect()).collect();
+        let query: Vec<Vec<f32>> = (0..4).map(|_| (0..4).map(|_| nxt()).collect()).collect();
+
+        // First run: 2 segments of 40 each
+        let (r1, idx1, dist1) = run_knn(tmp.path(), &base, &query, 40, 3, "L2", "first");
+        assert_eq!(r1.status, Status::Ok, "{}", r1.message);
+        let rows1 = read_ivec_rows(&idx1);
+        let dists1 = read_fvec_rows(&dist1);
+
+        // Second run with a DIFFERENT output name so we're not just
+        // reading back the first run's output — this genuinely replays
+        // every segment from the cache files.
+        let (r2, idx2, dist2) = run_knn(tmp.path(), &base, &query, 40, 3, "L2", "second");
+        assert_eq!(r2.status, Status::Ok, "{}", r2.message);
+        let rows2 = read_ivec_rows(&idx2);
+        let dists2 = read_fvec_rows(&dist2);
+
+        assert_eq!(rows1, rows2, "indices differ between first and replayed run");
+        assert_eq!(dists1.len(), dists2.len());
+        for (a, b) in dists1.iter().zip(dists2.iter()) {
+            for (x, y) in a.iter().zip(b.iter()) {
+                assert!((x - y).abs() < 1e-6, "distance mismatch: {} vs {}", x, y);
+            }
+        }
+    }
+
+    /// Delete one segment's cache mid-flight; the re-run must replay
+    /// the surviving segments, recompute the missing one, and produce
+    /// the same final result.
+    #[test]
+    fn partial_cache_recomputes_missing_segment() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let mut rng = 99u64;
+        let mut nxt = || -> f32 { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+            (rng as f32 / u64::MAX as f32) * 2.0 - 1.0 };
+        let base: Vec<Vec<f32>> = (0..90).map(|_| (0..4).map(|_| nxt()).collect()).collect();
+        let query: Vec<Vec<f32>> = (0..3).map(|_| (0..4).map(|_| nxt()).collect()).collect();
+
+        // First run: 3 segments of 30 each. Baseline result.
+        let (r1, idx1, _) = run_knn(tmp.path(), &base, &query, 30, 2, "L2", "baseline");
+        assert_eq!(r1.status, Status::Ok);
+        let baseline_rows = read_ivec_rows(&idx1);
+
+        // Delete ONE segment's caches (the middle one: range
+        // 000000000030_000000000060). The outer segments' caches
+        // remain and should be replayed.
+        let cache_dir = tmp.path().join(".cache");
+        for entry in std::fs::read_dir(&cache_dir).unwrap() {
+            let p = entry.unwrap().path();
+            if let Some(name) = p.file_name().and_then(|s| s.to_str()) {
+                if name.contains("range_000000000030_000000000060") {
+                    std::fs::remove_file(&p).unwrap();
+                }
+            }
+        }
+
+        // Second run produces same result, but the missing segment
+        // had to be recomputed.
+        let (r2, idx2, _) = run_knn(tmp.path(), &base, &query, 30, 2, "L2", "partial");
+        assert_eq!(r2.status, Status::Ok);
+        let partial_rows = read_ivec_rows(&idx2);
+        assert_eq!(baseline_rows, partial_rows,
+            "partial-cache replay produced different neighbors than baseline");
+
+        // Cache should now be fully populated again (3 segments × 2 files).
+        let files: Vec<_> = std::fs::read_dir(&cache_dir).unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.file_name().and_then(|s| s.to_str())
+                .map(|n| n.starts_with("knn-stdarch.v1.")).unwrap_or(false))
+            .collect();
+        assert_eq!(files.len(), 6,
+            "cache should be re-filled after partial-replay run, got {}", files.len());
+    }
+
+    /// Changing `k` between runs must not reuse caches — different
+    /// k means different per-query top-k → different bytes per row.
+    /// The cache-key includes k, so a new k lands on disjoint paths.
+    #[test]
+    fn different_k_uses_disjoint_caches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut rng = 13u64;
+        let mut nxt = || -> f32 { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+            (rng as f32 / u64::MAX as f32) * 2.0 - 1.0 };
+        let base: Vec<Vec<f32>> = (0..60).map(|_| (0..4).map(|_| nxt()).collect()).collect();
+        let query: Vec<Vec<f32>> = (0..2).map(|_| (0..4).map(|_| nxt()).collect()).collect();
+
+        let (r1, _, _) = run_knn(tmp.path(), &base, &query, 30, 3, "L2", "k3");
+        assert_eq!(r1.status, Status::Ok);
+        let (r2, _, _) = run_knn(tmp.path(), &base, &query, 30, 5, "L2", "k5");
+        assert_eq!(r2.status, Status::Ok);
+
+        let cache_dir = tmp.path().join(".cache");
+        let k3: Vec<_> = std::fs::read_dir(&cache_dir).unwrap()
+            .filter_map(|e| e.ok()).map(|e| e.path())
+            .filter(|p| p.file_name().and_then(|s| s.to_str())
+                .map(|n| n.contains(".k3.")).unwrap_or(false))
+            .collect();
+        let k5: Vec<_> = std::fs::read_dir(&cache_dir).unwrap()
+            .filter_map(|e| e.ok()).map(|e| e.path())
+            .filter(|p| p.file_name().and_then(|s| s.to_str())
+                .map(|n| n.contains(".k5.")).unwrap_or(false))
+            .collect();
+        assert_eq!(k3.len(), 4, "k=3 should have 2 segments × 2 files = 4; got {}", k3.len());
+        assert_eq!(k5.len(), 4, "k=5 should have 2 segments × 2 files = 4; got {}", k5.len());
+    }
+
+    /// Changing the base file size invalidates the cache (the
+    /// cache-key embeds `base_size`). A run against a different-
+    /// sized base writes to fresh paths; the old caches are
+    /// orphaned but harmless.
+    #[test]
+    fn base_file_change_invalidates_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut rng = 21u64;
+        let mut nxt = || -> f32 { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+            (rng as f32 / u64::MAX as f32) * 2.0 - 1.0 };
+
+        // First run: 40 base vectors.
+        let base1: Vec<Vec<f32>> = (0..40).map(|_| (0..4).map(|_| nxt()).collect()).collect();
+        let query: Vec<Vec<f32>> = (0..2).map(|_| (0..4).map(|_| nxt()).collect()).collect();
+        let (r1, _, _) = run_knn(tmp.path(), &base1, &query, 20, 2, "L2", "a");
+        assert_eq!(r1.status, Status::Ok);
+
+        let cache_dir = tmp.path().join(".cache");
+        let before: Vec<_> = std::fs::read_dir(&cache_dir).unwrap()
+            .filter_map(|e| e.ok()).map(|e| e.path())
+            .filter(|p| p.file_name().and_then(|s| s.to_str())
+                .map(|n| n.starts_with("knn-stdarch.v1.")).unwrap_or(false))
+            .collect();
+        assert_eq!(before.len(), 4, "expected 4 cache files after first run");
+
+        // Second run: different-sized base (50 vectors). Same
+        // file name `b.fvec`, but different bytes on disk. The
+        // cache-prefix key includes the file's current byte size,
+        // so this run should NOT reuse the old caches — it should
+        // write new ones at disjoint paths.
+        let base2: Vec<Vec<f32>> = (0..50).map(|_| (0..4).map(|_| nxt()).collect()).collect();
+        let (r2, _, _) = run_knn(tmp.path(), &base2, &query, 20, 2, "L2", "b");
+        assert_eq!(r2.status, Status::Ok);
+
+        let after: Vec<_> = std::fs::read_dir(&cache_dir).unwrap()
+            .filter_map(|e| e.ok()).map(|e| e.path())
+            .filter(|p| p.file_name().and_then(|s| s.to_str())
+                .map(|n| n.starts_with("knn-stdarch.v1.")).unwrap_or(false))
+            .collect();
+        // 4 from run-1 + 6 from run-2 (50/20 = 3 segments × 2 files)
+        // — all coexist under disjoint cache-prefix keys.
+        assert_eq!(after.len(), 10,
+            "second run with different-sized base should write to new cache paths, total should be 10; got {}",
+            after.len());
+    }
+
+    /// Cross-profile reuse: a smaller profile writes caches for its
+    /// segments, then a larger profile with an overlapping base-vector
+    /// range discovers and reuses those caches instead of recomputing
+    /// the overlapping region. This is the main point of the
+    /// scan-all-caches + greedy-chain plan; without it every profile
+    /// would start from scratch.
+    ///
+    /// Simulates two profiles via the `base[start..end)` window sugar:
+    /// profile A uses `b.fvec[0..30)`, profile B uses `b.fvec[0..60)`.
+    /// After A runs, B should replay A's segments and only compute
+    /// the [30..60) tail.
+    #[test]
+    fn larger_profile_reuses_smaller_profile_segments() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let mut rng = 123u64;
+        let mut nxt = || -> f32 { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+            (rng as f32 / u64::MAX as f32) * 2.0 - 1.0 };
+        let base: Vec<Vec<f32>> = (0..60).map(|_| (0..4).map(|_| nxt()).collect()).collect();
+        let query: Vec<Vec<f32>> = (0..3).map(|_| (0..4).map(|_| nxt()).collect()).collect();
+        write_fvec(&tmp.path().join("b.fvec"), &base);
+        write_fvec(&tmp.path().join("q.fvec"), &query);
+
+        let partition_size = 10usize;
+        let k = 2usize;
+        let cache_dir = tmp.path().join(".cache");
+
+        // ── Profile A: base[0..30), which at partition_size=10
+        //    produces 3 cached segments: [0..10), [10..20), [20..30).
+        {
+            let mut ctx = make_ctx(tmp.path());
+            let mut opts = Options::new();
+            opts.set("base", "b.fvec[0..30)"); opts.set("query", "q.fvec");
+            opts.set("indices", "a.ivec"); opts.set("distances", "a-d.fvec");
+            opts.set("neighbors", &k.to_string());
+            opts.set("metric", "L2");
+            opts.set("partition_size", &partition_size.to_string());
+            let mut op = ComputeKnnStdarchOp;
+            let r = op.execute(&opts, &mut ctx);
+            assert_eq!(r.status, Status::Ok, "profile A failed: {}", r.message);
+        }
+
+        let files_after_a: Vec<_> = std::fs::read_dir(&cache_dir).unwrap()
+            .filter_map(|e| e.ok()).map(|e| e.path())
+            .filter(|p| p.file_name().and_then(|s| s.to_str())
+                .map(|n| n.starts_with("knn-stdarch.v1.")).unwrap_or(false))
+            .collect();
+        assert_eq!(files_after_a.len(), 6,
+            "profile A should have written 6 cache files (3 segments × ivec+fvec), got {}",
+            files_after_a.len());
+
+        // ── Profile B: base[0..60). Expected segment plan:
+        //    - [0..10), [10..20), [20..30): REUSED from profile A
+        //    - [30..40), [40..50), [50..60): computed fresh
+        // We detect reuse via mtime — A's files keep their mtime,
+        // fresh files are newer.
+        std::thread::sleep(std::time::Duration::from_millis(50)); // force a detectable mtime gap
+        let a_mtimes: std::collections::HashMap<std::path::PathBuf, std::time::SystemTime> =
+            files_after_a.iter().map(|p| {
+                (p.clone(), std::fs::metadata(p).unwrap().modified().unwrap())
+            }).collect();
+
+        let mut ctx = make_ctx(tmp.path());
+        let mut opts = Options::new();
+        opts.set("base", "b.fvec[0..60)"); opts.set("query", "q.fvec");
+        opts.set("indices", "b.ivec"); opts.set("distances", "b-d.fvec");
+        opts.set("neighbors", &k.to_string());
+        opts.set("metric", "L2");
+        opts.set("partition_size", &partition_size.to_string());
+        let mut op = ComputeKnnStdarchOp;
+        let r = op.execute(&opts, &mut ctx);
+        assert_eq!(r.status, Status::Ok, "profile B failed: {}", r.message);
+
+        // Profile A's three segments must NOT have been rewritten
+        // (mtimes unchanged) — that's the proof they were reused.
+        for (path, orig_mtime) in &a_mtimes {
+            let new_mtime = std::fs::metadata(path).unwrap().modified().unwrap();
+            assert_eq!(*orig_mtime, new_mtime,
+                "profile A's cache file {} was rewritten (should have been reused, not recomputed)",
+                path.display());
+        }
+
+        // Total file count now: 3 from profile A + 3 new from profile B = 12 files
+        let files_after_b: Vec<_> = std::fs::read_dir(&cache_dir).unwrap()
+            .filter_map(|e| e.ok()).map(|e| e.path())
+            .filter(|p| p.file_name().and_then(|s| s.to_str())
+                .map(|n| n.starts_with("knn-stdarch.v1.")).unwrap_or(false))
+            .collect();
+        assert_eq!(files_after_b.len(), 12,
+            "expected 12 cache files (6 from profile A + 6 fresh from profile B), got {}: {:?}",
+            files_after_b.len(), files_after_b);
+
+        // And profile B's result over [0..60) must match a fresh
+        // uncached run — reuse must not distort the answers.
+        let rows_b = read_ivec_rows(&tmp.path().join("b.ivec"));
+        let baseline_tmp = tempfile::tempdir().unwrap();
+        write_fvec(&baseline_tmp.path().join("b.fvec"), &base);
+        write_fvec(&baseline_tmp.path().join("q.fvec"), &query);
+        let mut bctx = make_ctx(baseline_tmp.path());
+        let mut bopts = Options::new();
+        bopts.set("base", "b.fvec[0..60)"); bopts.set("query", "q.fvec");
+        bopts.set("indices", "baseline.ivec"); bopts.set("distances", "baseline-d.fvec");
+        bopts.set("neighbors", &k.to_string());
+        bopts.set("metric", "L2");
+        bopts.set("partition_size", &partition_size.to_string());
+        let mut bop = ComputeKnnStdarchOp;
+        let br = bop.execute(&bopts, &mut bctx);
+        assert_eq!(br.status, Status::Ok);
+        let rows_base = read_ivec_rows(&baseline_tmp.path().join("baseline.ivec"));
+        assert_eq!(rows_b, rows_base,
+            "cross-profile reuse produced different neighbors than fresh compute");
+    }
+
+    /// A corrupted cache file (wrong size on disk) must NOT be
+    /// replayed — the validator catches the size mismatch and the
+    /// segment is recomputed.
+    #[test]
+    fn corrupted_cache_is_recomputed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut rng = 55u64;
+        let mut nxt = || -> f32 { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+            (rng as f32 / u64::MAX as f32) * 2.0 - 1.0 };
+        let base: Vec<Vec<f32>> = (0..50).map(|_| (0..4).map(|_| nxt()).collect()).collect();
+        let query: Vec<Vec<f32>> = (0..2).map(|_| (0..4).map(|_| nxt()).collect()).collect();
+
+        let (r1, idx1, _) = run_knn(tmp.path(), &base, &query, 25, 2, "L2", "first");
+        assert_eq!(r1.status, Status::Ok);
+        let baseline = read_ivec_rows(&idx1);
+
+        // Truncate one cache file to the wrong size.
+        let cache_dir = tmp.path().join(".cache");
+        for entry in std::fs::read_dir(&cache_dir).unwrap() {
+            let p = entry.unwrap().path();
+            if p.extension().and_then(|s| s.to_str()) == Some("ivec") {
+                let data = std::fs::read(&p).unwrap();
+                std::fs::write(&p, &data[..data.len() / 2]).unwrap();
+                break; // corrupt one file is enough
+            }
+        }
+
+        // Run should still succeed and produce same result.
+        let (r2, idx2, _) = run_knn(tmp.path(), &base, &query, 25, 2, "L2", "second");
+        assert_eq!(r2.status, Status::Ok, "{}", r2.message);
+        let recovered = read_ivec_rows(&idx2);
+        assert_eq!(baseline, recovered,
+            "corrupted-cache recovery produced different neighbors");
     }
 
     #[test]

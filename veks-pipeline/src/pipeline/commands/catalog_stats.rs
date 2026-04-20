@@ -383,7 +383,7 @@ fn variable_description(name: &str) -> Option<&'static str> {
             "The number of near-zero base vectors filtered during extraction. A vector is classified \
              as near-zero when its L2 norm (computed in f64 precision) is below the zero threshold \
              (default 1e-6). Near-zero vectors produce degenerate unit vectors after normalization \
-             and are excluded from the output. The zero ordinals are recorded in `zero_ordinals.ivec` \
+             and are excluded from the output. The zero ordinals are recorded in `zero_ordinals.ivecs` \
              for audit purposes.",
 
         "base_count" =>
@@ -548,8 +548,8 @@ fn variable_description(name: &str) -> Option<&'static str> {
         "k" =>
             "The number of nearest neighbors computed per query vector (the 'k' in KNN). \
              Typically 100. Set during bootstrap and used by compute-knn to determine the heap \
-             size for top-k selection. The ground truth files (neighbor_indices.ivec and \
-             neighbor_distances.fvec) contain exactly k neighbors per query, ordered by distance \
+             size for top-k selection. The ground truth files (neighbor_indices.ivecs and \
+             neighbor_distances.fvecs) contain exactly k neighbors per query, ordered by distance \
              ascending with deterministic tie-breaking (lower index wins).",
 
         // Legacy aliases (source stats with old names)

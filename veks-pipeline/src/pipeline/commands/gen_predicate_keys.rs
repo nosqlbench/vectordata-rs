@@ -1206,13 +1206,8 @@ sweep.
         // ── Phase 4: Plan segments ───────────────────────────────────────
 
         // Always use a cache directory to avoid holding all segment results in
-        // memory.  When a step_id is set the cache lives under ctx.cache;
-        // otherwise the scratch directory is used.
-        let cache_dir: PathBuf = if !ctx.step_id.is_empty() {
-            ctx.cache.clone()
-        } else {
-            ctx.scratch.clone()
-        };
+        // memory.
+        let cache_dir: PathBuf = ctx.cache.clone();
         if let Err(e) = std::fs::create_dir_all(&cache_dir) {
             return error_result(
                 format!("cannot create cache dir {}: {}", cache_dir.display(), e),
@@ -2182,7 +2177,6 @@ mod tests {
             profile: String::new(),
             profile_names: vec![],
             workspace: dir.to_path_buf(),
-            scratch: dir.join(".scratch"),
             cache: dir.join(".cache"),
             defaults: IndexMap::new(),
             dry_run: false,

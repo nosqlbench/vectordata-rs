@@ -164,7 +164,7 @@ mod tests {
         assert!(is_merkle_exempt("data.tmp"));
         // Data files — get merkle coverage
         assert!(!is_merkle_exempt("base.fvec"));
-        assert!(!is_merkle_exempt("neighbor_indices.ivec"));
+        assert!(!is_merkle_exempt("neighbor_indices.ivecs"));
         assert!(!is_merkle_exempt("metadata.slab"));
     }
 
