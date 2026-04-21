@@ -208,7 +208,10 @@ pub fn register_all(registry: &mut CommandRegistry) {
     // verify knn-groundtruth: per-profile, default is SimSIMD (metal)
     registry.register("verify knn-groundtruth", verify_knn::factory);
     registry.register("verify predicate-results", verify_predicates::factory);
-    // verify knn-consolidated: multi-profile single-pass, default is SimSIMD
+    // verify knn-consolidated: uses the sgemm kernel (same as compute
+    // knn-blas) so distances are bit-identical. Feature-gated on
+    // `knnutils` because the kernel requires system BLAS.
+    #[cfg(feature = "knnutils")]
     registry.register("verify knn-consolidated", verify_consolidated::knn_consolidated_factory);
     // FAISS verify: explicit opt-in, safe-sampled to avoid BLAS ABI bug
     #[cfg(feature = "faiss")]

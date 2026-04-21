@@ -866,6 +866,33 @@ fn cmd_shuffle(personality: &str) -> &'static str {
     }
 }
 
+/// Build the `base:` option for a per-profile KNN step.
+///
+/// Three cases:
+/// 1. **extract-base materialized** (`slots.base_count.is_some()`): the
+///    pipeline produced a dedicated base file (deduped, normalized,
+///    shuffled). compute-knn reads from that file with `[0..${base_count})`.
+/// 2. **subset applied without extract-base**: subset-vectors (or
+///    convert-vectors with `fraction`) wrote a smaller `all_vectors`.
+///    compute-knn must read that subset, NOT the original source —
+///    otherwise it sees vectors the rest of the pipeline pretends
+///    aren't there. The subset's count is in `${vector_count}`.
+/// 3. **No subset, no extract-base**: pure identity passthrough.
+///    compute-knn reads the whole source file.
+fn compute_knn_base_arg(
+    slots: &PipelineSlots,
+    working_vectors: &str,
+    subset_applied: bool,
+) -> String {
+    if slots.base_count.is_some() {
+        format!("{}[0..${{base_count}})", slots.base_vectors.path())
+    } else if subset_applied {
+        format!("{}[0..${{vector_count}})", working_vectors)
+    } else {
+        slots.base_vectors.path().to_string()
+    }
+}
+
 fn cmd_knn(personality: &str) -> &'static str {
     // knn-blas is the canonical default: numpy / knn_utils kernel
     // parity with segment-cache + streaming pread. It requires the
@@ -1760,11 +1787,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
                 finalize: false,
                 options: {
                     let mut opts = vec![
-                        ("base".into(), if slots.base_count.is_some() {
-                            format!("{}[0..${{base_count}})", slots.base_vectors.path())
-                        } else {
-                            slots.base_vectors.path().to_string()
-                        }),
+                        ("base".into(), compute_knn_base_arg(slots, &working_vectors, subset_applied)),
                         ("query".into(), query_path.clone()),
                         ("indices".into(), "neighbor_indices.ivecs".into()),
                         ("distances".into(), "neighbor_distances.fvecs".into()),
@@ -1839,11 +1862,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
                 finalize: false,
                 options: {
                     let mut opts = vec![
-                        ("base".into(), if slots.base_count.is_some() {
-                        format!("{}[0..${{base_count}})", slots.base_vectors.path())
-                    } else {
-                        slots.base_vectors.path().to_string()
-                    }),
+                        ("base".into(), compute_knn_base_arg(slots, &working_vectors, subset_applied)),
                         ("query".into(), slots.query_vectors.as_ref().unwrap().path().into()),
                         ("metadata-indices".into(), slots.metadata.as_ref().unwrap().predicate_indices.path().into()),
                         ("indices".into(), "filtered_neighbor_indices.ivecs".into()),
@@ -1881,10 +1900,14 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
         // When ground truth is pre-provided (Identity), use the source
         // base vectors for verification — the GT ordinals reference the
         // original ordering, not the post-extraction/shuffle ordering.
+        // Otherwise mirror compute-knn's `base:` exactly (subset-aware).
+        // Mismatch here was the cause of false verify failures when
+        // --base-fraction subsetted the source but verify still pointed
+        // at the unsubsetted file.
         let verify_base = if !needs_computed_knn {
             slots.all_vectors.path().to_string()
         } else {
-            slots.base_vectors.path().to_string()
+            compute_knn_base_arg(slots, &working_vectors, subset_applied)
         };
         let verify_query = if !needs_computed_knn && args.query_vectors.is_some() {
             // Use original query source when GT is pre-provided
@@ -1903,19 +1926,25 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
             per_profile: false, // NOT per-profile — one step verifies all
             phase: 0,
             finalize: false,
-            options: vec![
-                ("base".into(), verify_base),
-                ("query".into(), verify_query),
-                ("metric".into(), args.metric.clone()),
-                ("normalized".into(), if args.normalize { "true" } else { "false" }.into()),
-                ("sample".into(), if args.verify_knn_sample == 0 {
-                    "0".into()
-                } else {
-                    args.verify_knn_sample.to_string()
-                }),
-                ("seed".into(), format!("${{{}}}", "seed")),
-                ("output".into(), "${cache}/verify_knn_consolidated.json".into()),
-            ],
+            options: {
+                let mut opts = vec![
+                    ("base".into(), verify_base),
+                    ("query".into(), verify_query),
+                    ("metric".into(), args.metric.clone()),
+                    ("sample".into(), if args.verify_knn_sample == 0 {
+                        "0".into()
+                    } else {
+                        args.verify_knn_sample.to_string()
+                    }),
+                    ("seed".into(), format!("${{{}}}", "seed")),
+                    ("output".into(), "${cache}/verify_knn_consolidated.json".into()),
+                ];
+                // verify-knn-consolidated now shares the sgemm kernel
+                // with knn-blas; both need the same cosine-mode flags
+                // to agree on arithmetic.
+                opts.extend(knn_cosine_opts(args));
+                opts
+            },
         });
     }
 
@@ -3319,6 +3348,57 @@ mod tests {
     // SRD §12.5 Example 1: Minimal — native fvec, no queries, no metadata
     // Expects: import collapses to identity, self-search activates,
     //          dedup + shuffle + extract + KNN materialize
+    /// Regression: when --base-fraction subsets the source AND
+    /// extract-base does NOT materialize (no dedup / no normalize /
+    /// no shuffle), the compute-knn step's `base:` option must point
+    /// at the SUBSET file with a `[0..${vector_count})` cap — not at
+    /// the unsubsetted source.
+    ///
+    /// Caught only when the symptom appeared in production: compute-knn
+    /// scanned the entire source file even though subset-vectors had
+    /// reduced the effective dataset, then verify failed because the
+    /// returned indices reached past the per-profile boundary.
+    #[test]
+    fn fractioned_compute_knn_reads_only_subset() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base.fvec");
+        let query = dir.path().join("query.fvec");
+        write_fvec(&base, 1000, 4);
+        write_fvec(&query, 10, 4);
+
+        let mut args = default_args();
+        args.base_vectors = Some(base);
+        args.query_vectors = Some(query);
+        args.no_dedup = true;
+        args.no_zero_check = true;
+        args.normalize = false;
+        args.base_fraction = 0.01;
+        args.seed = 0; // disable shuffle so extract-base does not materialize
+
+        let slots = resolve_slots(&args);
+        let steps = emit_steps(&slots, &args, &args.output);
+
+        let knn = steps.iter().find(|s| s.id == "compute-knn")
+            .expect("compute-knn step should be emitted");
+        let base_opt = knn.options.iter().find(|(k, _)| k == "base")
+            .map(|(_, v)| v.as_str())
+            .expect("compute-knn should have a `base` option");
+        // Must read from the SUBSET (working_vectors path) AND cap at
+        // ${vector_count} (which counts the subset). Old buggy
+        // behaviour: base = original source path with no cap → reads
+        // the entire source file.
+        assert!(
+            base_opt.contains("all_vectors.fvec"),
+            "compute-knn must read from the subset (`all_vectors.fvec`), got: {}",
+            base_opt,
+        );
+        assert!(
+            base_opt.contains("${vector_count}"),
+            "compute-knn must cap range at ${{vector_count}}, got: {}",
+            base_opt,
+        );
+    }
+
     #[test]
     fn example1_native_fvec_self_search() {
         let dir = tempfile::tempdir().unwrap();

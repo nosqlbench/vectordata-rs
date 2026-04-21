@@ -148,33 +148,39 @@ impl CommandOp for AnalyzeFindZerosOp {
 
         match etype {
             ElementType::F16 => {
+                // Mmap reader used only for metadata + the per-hit
+                // component display in the report phase. Full scan
+                // uses pread streaming to keep RSS bounded.
                 let reader = match MmapVectorReader::<half::f16>::open_mvec(&source_path) {
                     Ok(r) => r,
                     Err(e) => return error_result(format!("open {}: {}", source_path.display(), e), start),
                 };
-                reader.advise_sequential();
                 let count = VectorReader::<half::f16>::count(&reader);
                 let dim = VectorReader::<half::f16>::dim(&reader);
                 ctx.ui.log(&format!(
                     "find-zeros: scanning {} f16 vectors (dim={}, threshold={:.0e}, {} threads)",
                     count, dim, threshold, threads,
                 ));
-                let zeros = scan_zeros_f16(&reader, count, dim, threshold_sq, limit, threads, ctx);
+                let zeros = scan_zeros_f16(&source_path, count, dim, threshold_sq, limit, threads, ctx);
                 report_zeros_f16(&zeros, &reader, dim, show_components, threshold, count, start, ctx)
             }
             _ => {
+                // Open the mmap reader only for metadata (count, dim)
+                // and for the per-hit component display in the report
+                // phase — which touches ≤ `limit` vectors. The actual
+                // full scan uses pread streaming so RSS stays bounded
+                // regardless of source file size.
                 let reader = match MmapVectorReader::<f32>::open_fvec(&source_path) {
                     Ok(r) => r,
                     Err(e) => return error_result(format!("open {}: {}", source_path.display(), e), start),
                 };
-                reader.advise_sequential();
                 let count = VectorReader::<f32>::count(&reader);
                 let dim = VectorReader::<f32>::dim(&reader);
                 ctx.ui.log(&format!(
                     "find-zeros: scanning {} f32 vectors (dim={}, threshold={:.0e}, {} threads)",
                     count, dim, threshold, threads,
                 ));
-                let zeros = scan_zeros_f32(&reader, count, dim, threshold_sq, limit, threads, ctx);
+                let zeros = scan_zeros_f32(&source_path, count, dim, threshold_sq, limit, threads, ctx);
                 report_zeros_f32(&zeros, &reader, dim, show_components, threshold, count, start, ctx)
             }
         }
@@ -187,8 +193,12 @@ struct ZeroHit {
     norm: f64,
 }
 
+/// Target chunk size for streaming pread. 64 MiB balances syscall
+/// overhead against keeping resident memory small and bounded.
+const SCAN_CHUNK_BYTES: usize = 64 * 1024 * 1024;
+
 fn scan_zeros_f32(
-    reader: &MmapVectorReader<f32>,
+    path: &std::path::Path,
     count: usize,
     dim: usize,
     threshold_sq: f64,
@@ -196,57 +206,120 @@ fn scan_zeros_f32(
     threads: usize,
     ctx: &mut StreamContext,
 ) -> Vec<ZeroHit> {
+    use std::fs::File;
+    use std::os::unix::fs::FileExt;
+
     let pb = ctx.ui.bar_with_unit(count as u64, "scanning", "vectors");
-    let progress = std::sync::atomic::AtomicU64::new(0);
     let found = std::sync::atomic::AtomicUsize::new(0);
     let limit_reached = std::sync::atomic::AtomicBool::new(false);
-
-    let chunk_size = (count / (threads * 4)).max(10_000);
 
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
         .build()
         .ok();
 
-    let compute = || {
-        (0..count).into_par_iter()
-            .chunks(chunk_size)
-            .flat_map(|chunk| {
-                let mut local_zeros = Vec::new();
-                for i in chunk {
+    // Streaming pread scanner: open the file as a plain fd, read one
+    // chunk at a time into a heap buffer, scan in parallel, discard.
+    // This keeps process RSS bounded to the buffer size regardless of
+    // source file size. Backing storage is `Vec<f32>` so the raw-byte
+    // slice we pass to `pread` is 4-byte aligned and the per-vector
+    // `&[f32]` view we extract is safe to construct via slice indexing.
+    //
+    // Guard against degenerate inputs. `dim == 0` or `count == 0` both
+    // indicate an empty / malformed source; there's nothing to scan
+    // and `entry_size` arithmetic would underflow for `dim == 0`.
+    if count == 0 || dim == 0 {
+        pb.finish();
+        return Vec::new();
+    }
+    let entry_size = 4 + dim * 4;
+    let vecs_per_chunk = (SCAN_CHUNK_BYTES / entry_size).max(1);
+    let chunk_capacity_bytes = vecs_per_chunk * entry_size;
+    let chunk_capacity_f32 = (chunk_capacity_bytes + 3) / 4;
+
+    let mut chunk_buf: Vec<f32> = vec![0.0; chunk_capacity_f32];
+
+    let file = match File::open(path) {
+        Ok(f) => f,
+        Err(e) => {
+            pb.finish();
+            log::error!("open {}: {}", path.display(), e);
+            return Vec::new();
+        }
+    };
+
+    let mut all_zeros: Vec<ZeroHit> = Vec::new();
+    let mut offset_vec: usize = 0;
+
+    while offset_vec < count {
+        if limit_reached.load(std::sync::atomic::Ordering::Relaxed) { break; }
+
+        let n_vecs = vecs_per_chunk.min(count - offset_vec);
+        let chunk_bytes_now = n_vecs * entry_size;
+        let byte_off = (offset_vec as u64) * (entry_size as u64);
+
+        // pread straight into the buffer. Reinterpreting `Vec<f32>`
+        // storage as `&mut [u8]` is sound: f32 alignment ≥ u8, same
+        // underlying storage, and we won't read any f32 we didn't
+        // just write.
+        let bytes_mut: &mut [u8] = unsafe {
+            std::slice::from_raw_parts_mut(
+                chunk_buf.as_mut_ptr() as *mut u8,
+                chunk_buf.len() * 4,
+            )
+        };
+        if let Err(e) = file.read_exact_at(&mut bytes_mut[..chunk_bytes_now], byte_off) {
+            log::error!("pread at vec {}: {}", offset_vec, e);
+            break;
+        }
+
+        // Parallel scan of this chunk.
+        let base_vec_idx = offset_vec;
+        let chunk_view: &[f32] = &chunk_buf;
+        let compute = || {
+            (0..n_vecs).into_par_iter()
+                .filter_map(|local_i| {
                     if limit_reached.load(std::sync::atomic::Ordering::Relaxed) {
-                        break;
+                        return None;
                     }
-                    let slice = reader.get_slice(i);
+                    // Each entry in the chunk: 4-byte dim header (1
+                    // f32) followed by `dim` f32 payload elements.
+                    // Header byte-offset in f32-units = local_i * (1 + dim).
+                    let payload_off = local_i * (1 + dim) + 1;
+                    let slice: &[f32] = &chunk_view[payload_off..payload_off + dim];
                     let mut norm_sq = 0.0f64;
-                    for d in 0..dim {
-                        let v = slice[d] as f64;
-                        norm_sq += v * v;
+                    for &v in slice {
+                        let vf = v as f64;
+                        norm_sq += vf * vf;
                     }
                     if norm_sq < threshold_sq {
                         let norm = norm_sq.sqrt();
-                        local_zeros.push(ZeroHit { ordinal: i, norm });
                         let total = found.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                         if let Some(lim) = limit {
                             if total >= lim {
                                 limit_reached.store(true, std::sync::atomic::Ordering::Relaxed);
                             }
                         }
+                        Some(ZeroHit { ordinal: base_vec_idx + local_i, norm })
+                    } else {
+                        None
                     }
-                    let done = progress.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                    if done % 100_000 == 0 { pb.set_position(done); }
-                }
-                local_zeros
-            })
-            .collect::<Vec<_>>()
-    };
+                })
+                .collect::<Vec<_>>()
+        };
 
-    let mut zeros = if let Some(ref p) = pool {
-        p.install(compute)
-    } else {
-        compute()
-    };
+        let chunk_zeros = if let Some(ref p) = pool {
+            p.install(compute)
+        } else {
+            compute()
+        };
+        all_zeros.extend(chunk_zeros);
+
+        offset_vec += n_vecs;
+        pb.set_position(offset_vec as u64);
+    }
     pb.finish();
+    let mut zeros = all_zeros;
 
     zeros.sort_by_key(|z| z.ordinal);
     if let Some(lim) = limit {
@@ -256,7 +329,7 @@ fn scan_zeros_f32(
 }
 
 fn scan_zeros_f16(
-    reader: &MmapVectorReader<half::f16>,
+    path: &std::path::Path,
     count: usize,
     dim: usize,
     threshold_sq: f64,
@@ -264,57 +337,116 @@ fn scan_zeros_f16(
     threads: usize,
     ctx: &mut StreamContext,
 ) -> Vec<ZeroHit> {
+    use std::fs::File;
+    use std::os::unix::fs::FileExt;
+
     let pb = ctx.ui.bar_with_unit(count as u64, "scanning", "vectors");
-    let progress = std::sync::atomic::AtomicU64::new(0);
     let found = std::sync::atomic::AtomicUsize::new(0);
     let limit_reached = std::sync::atomic::AtomicBool::new(false);
-
-    let chunk_size = (count / (threads * 4)).max(10_000);
 
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
         .build()
         .ok();
 
-    let compute = || {
-        (0..count).into_par_iter()
-            .chunks(chunk_size)
-            .flat_map(|chunk| {
-                let mut local_zeros = Vec::new();
-                for i in chunk {
+    // Guard against degenerate inputs — see scan_zeros_f32 for rationale.
+    if count == 0 || dim == 0 {
+        pb.finish();
+        return Vec::new();
+    }
+    // mvec entry: 4-byte dim header + dim × f16 (2 bytes each).
+    // Backing buffer as `Vec<u16>` so it's 2-byte aligned — the
+    // header is 4 bytes (2 u16s), then `dim` u16 payload values
+    // reinterpretable as `half::f16` via `#[repr(transparent)]`.
+    let entry_size = 4 + dim * 2;
+    let vecs_per_chunk = (SCAN_CHUNK_BYTES / entry_size).max(1);
+    let chunk_capacity_bytes = vecs_per_chunk * entry_size;
+    let chunk_capacity_u16 = (chunk_capacity_bytes + 1) / 2;
+
+    let mut chunk_buf: Vec<u16> = vec![0u16; chunk_capacity_u16];
+
+    let file = match File::open(path) {
+        Ok(f) => f,
+        Err(e) => {
+            pb.finish();
+            log::error!("open {}: {}", path.display(), e);
+            return Vec::new();
+        }
+    };
+
+    let mut all_zeros: Vec<ZeroHit> = Vec::new();
+    let mut offset_vec: usize = 0;
+
+    while offset_vec < count {
+        if limit_reached.load(std::sync::atomic::Ordering::Relaxed) { break; }
+
+        let n_vecs = vecs_per_chunk.min(count - offset_vec);
+        let chunk_bytes_now = n_vecs * entry_size;
+        let byte_off = (offset_vec as u64) * (entry_size as u64);
+
+        let bytes_mut: &mut [u8] = unsafe {
+            std::slice::from_raw_parts_mut(
+                chunk_buf.as_mut_ptr() as *mut u8,
+                chunk_buf.len() * 2,
+            )
+        };
+        if let Err(e) = file.read_exact_at(&mut bytes_mut[..chunk_bytes_now], byte_off) {
+            log::error!("pread at vec {}: {}", offset_vec, e);
+            break;
+        }
+
+        let base_vec_idx = offset_vec;
+        let chunk_view: &[u16] = &chunk_buf;
+        // Each entry in the u16 chunk view: 2 u16s of header, then
+        // `dim` u16 payload. Header u16-offset per vector: local_i * (2 + dim).
+        let compute = || {
+            (0..n_vecs).into_par_iter()
+                .filter_map(|local_i| {
                     if limit_reached.load(std::sync::atomic::Ordering::Relaxed) {
-                        break;
+                        return None;
                     }
-                    let slice = reader.get_slice(i);
+                    let payload_off = local_i * (2 + dim) + 2;
+                    let payload_u16 = &chunk_view[payload_off..payload_off + dim];
+                    // Reinterpret u16 → half::f16 (#[repr(transparent)]).
+                    let slice: &[half::f16] = unsafe {
+                        std::slice::from_raw_parts(
+                            payload_u16.as_ptr() as *const half::f16,
+                            dim,
+                        )
+                    };
                     let mut norm_sq = 0.0f64;
-                    for d in 0..dim {
-                        let v = slice[d].to_f64();
-                        norm_sq += v * v;
+                    for v in slice {
+                        let vf = v.to_f64();
+                        norm_sq += vf * vf;
                     }
                     if norm_sq < threshold_sq {
                         let norm = norm_sq.sqrt();
-                        local_zeros.push(ZeroHit { ordinal: i, norm });
                         let total = found.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                         if let Some(lim) = limit {
                             if total >= lim {
                                 limit_reached.store(true, std::sync::atomic::Ordering::Relaxed);
                             }
                         }
+                        Some(ZeroHit { ordinal: base_vec_idx + local_i, norm })
+                    } else {
+                        None
                     }
-                    let done = progress.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                    if done % 100_000 == 0 { pb.set_position(done); }
-                }
-                local_zeros
-            })
-            .collect::<Vec<_>>()
-    };
+                })
+                .collect::<Vec<_>>()
+        };
 
-    let mut zeros = if let Some(ref p) = pool {
-        p.install(compute)
-    } else {
-        compute()
-    };
+        let chunk_zeros = if let Some(ref p) = pool {
+            p.install(compute)
+        } else {
+            compute()
+        };
+        all_zeros.extend(chunk_zeros);
+
+        offset_vec += n_vecs;
+        pb.set_position(offset_vec as u64);
+    }
     pb.finish();
+    let mut zeros = all_zeros;
 
     zeros.sort_by_key(|z| z.ordinal);
     if let Some(lim) = limit {
@@ -628,48 +760,83 @@ fn scan_file_concise_f32(
     limit: Option<usize>,
     threads: usize,
 ) -> Result<(usize, usize, usize, usize), String> {
+    use std::fs::File;
+    use std::os::unix::fs::FileExt;
+
+    // Metadata via mmap (touches only the dim header). Full scan via
+    // pread streaming so RSS stays bounded on terabyte-class sources.
     let reader = MmapVectorReader::<f32>::open_fvec(path)
         .map_err(|e| format!("{}", e))?;
-    reader.advise_sequential();
     let count = VectorReader::<f32>::count(&reader);
     let dim = VectorReader::<f32>::dim(&reader);
-    let chunk_size = (count / (threads * 4)).max(10_000);
+    drop(reader);
+
+    if count == 0 || dim == 0 {
+        return Ok((count, dim, 0, 0));
+    }
+    let entry_size = 4 + dim * 4;
+    let vecs_per_chunk = (SCAN_CHUNK_BYTES / entry_size).max(1);
+    let chunk_capacity_f32 = (vecs_per_chunk * entry_size + 3) / 4;
+    let mut chunk_buf: Vec<f32> = vec![0.0; chunk_capacity_f32];
+
+    let file = File::open(path).map_err(|e| format!("{}", e))?;
 
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
         .build()
         .ok();
 
-    let compute = || {
-        (0..count).into_par_iter()
-            .chunks(chunk_size)
-            .map(|chunk| {
-                let mut zeros = 0usize;
-                let mut exact = 0usize;
-                for i in chunk {
-                    let slice = reader.get_slice(i);
+    let limit_atomic = std::sync::atomic::AtomicUsize::new(0);
+    let mut total_zeros = 0usize;
+    let mut total_exact = 0usize;
+    let mut offset_vec = 0usize;
+
+    while offset_vec < count {
+        if let Some(lim) = limit {
+            if total_zeros >= lim { break; }
+        }
+        let n_vecs = vecs_per_chunk.min(count - offset_vec);
+        let chunk_bytes_now = n_vecs * entry_size;
+        let byte_off = (offset_vec as u64) * (entry_size as u64);
+
+        let bytes_mut: &mut [u8] = unsafe {
+            std::slice::from_raw_parts_mut(
+                chunk_buf.as_mut_ptr() as *mut u8,
+                chunk_buf.len() * 4,
+            )
+        };
+        file.read_exact_at(&mut bytes_mut[..chunk_bytes_now], byte_off)
+            .map_err(|e| format!("pread at vec {}: {}", offset_vec, e))?;
+
+        let chunk_view: &[f32] = &chunk_buf;
+        let compute = || {
+            (0..n_vecs).into_par_iter()
+                .map(|local_i| {
+                    let payload_off = local_i * (1 + dim) + 1;
+                    let slice = &chunk_view[payload_off..payload_off + dim];
                     let mut norm_sq = 0.0f64;
-                    for d in 0..dim {
-                        let v = slice[d] as f64;
-                        norm_sq += v * v;
+                    for &v in slice {
+                        let vf = v as f64;
+                        norm_sq += vf * vf;
                     }
                     if norm_sq < threshold_sq {
-                        zeros += 1;
-                        if slice.iter().all(|v| v.to_bits() == 0) {
-                            exact += 1;
-                        }
-                        if let Some(lim) = limit {
-                            if zeros >= lim { break; }
-                        }
+                        let exact = slice.iter().all(|v| v.to_bits() == 0);
+                        (1usize, if exact { 1usize } else { 0usize })
+                    } else {
+                        (0, 0)
                     }
-                }
-                (zeros, exact)
-            })
-            .reduce(|| (0, 0), |a, b| (a.0 + b.0, a.1 + b.1))
-    };
+                })
+                .reduce(|| (0, 0), |a, b| (a.0 + b.0, a.1 + b.1))
+        };
 
-    let (zc, ec) = if let Some(ref p) = pool { p.install(compute) } else { compute() };
-    Ok((count, dim, zc, ec))
+        let (zc, ec) = if let Some(ref p) = pool { p.install(compute) } else { compute() };
+        total_zeros += zc;
+        total_exact += ec;
+        let _ = limit_atomic.fetch_add(zc, std::sync::atomic::Ordering::Relaxed);
+        offset_vec += n_vecs;
+    }
+
+    Ok((count, dim, total_zeros, total_exact))
 }
 
 /// Scan a single f16 file, return (count, dim, zero_count, exact_zero_count).
@@ -679,46 +846,83 @@ fn scan_file_concise_f16(
     limit: Option<usize>,
     threads: usize,
 ) -> Result<(usize, usize, usize, usize), String> {
+    use std::fs::File;
+    use std::os::unix::fs::FileExt;
+
     let reader = MmapVectorReader::<half::f16>::open_mvec(path)
         .map_err(|e| format!("{}", e))?;
-    reader.advise_sequential();
     let count = VectorReader::<half::f16>::count(&reader);
     let dim = VectorReader::<half::f16>::dim(&reader);
-    let chunk_size = (count / (threads * 4)).max(10_000);
+    drop(reader);
+
+    if count == 0 || dim == 0 {
+        return Ok((count, dim, 0, 0));
+    }
+    let entry_size = 4 + dim * 2;
+    let vecs_per_chunk = (SCAN_CHUNK_BYTES / entry_size).max(1);
+    let chunk_capacity_u16 = (vecs_per_chunk * entry_size + 1) / 2;
+    let mut chunk_buf: Vec<u16> = vec![0u16; chunk_capacity_u16];
+
+    let file = File::open(path).map_err(|e| format!("{}", e))?;
 
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
         .build()
         .ok();
 
-    let compute = || {
-        (0..count).into_par_iter()
-            .chunks(chunk_size)
-            .map(|chunk| {
-                let mut zeros = 0usize;
-                let mut exact = 0usize;
-                for i in chunk {
-                    let slice = reader.get_slice(i);
+    let mut total_zeros = 0usize;
+    let mut total_exact = 0usize;
+    let mut offset_vec = 0usize;
+
+    while offset_vec < count {
+        if let Some(lim) = limit {
+            if total_zeros >= lim { break; }
+        }
+        let n_vecs = vecs_per_chunk.min(count - offset_vec);
+        let chunk_bytes_now = n_vecs * entry_size;
+        let byte_off = (offset_vec as u64) * (entry_size as u64);
+
+        let bytes_mut: &mut [u8] = unsafe {
+            std::slice::from_raw_parts_mut(
+                chunk_buf.as_mut_ptr() as *mut u8,
+                chunk_buf.len() * 2,
+            )
+        };
+        file.read_exact_at(&mut bytes_mut[..chunk_bytes_now], byte_off)
+            .map_err(|e| format!("pread at vec {}: {}", offset_vec, e))?;
+
+        let chunk_view: &[u16] = &chunk_buf;
+        let compute = || {
+            (0..n_vecs).into_par_iter()
+                .map(|local_i| {
+                    let payload_off = local_i * (2 + dim) + 2;
+                    let payload_u16 = &chunk_view[payload_off..payload_off + dim];
+                    let slice: &[half::f16] = unsafe {
+                        std::slice::from_raw_parts(
+                            payload_u16.as_ptr() as *const half::f16,
+                            dim,
+                        )
+                    };
                     let mut norm_sq = 0.0f64;
-                    for d in 0..dim {
-                        let v = slice[d].to_f64();
-                        norm_sq += v * v;
+                    for v in slice {
+                        let vf = v.to_f64();
+                        norm_sq += vf * vf;
                     }
                     if norm_sq < threshold_sq {
-                        zeros += 1;
-                        if slice.iter().all(|v| v.to_bits() == 0) {
-                            exact += 1;
-                        }
-                        if let Some(lim) = limit {
-                            if zeros >= lim { break; }
-                        }
+                        let exact = slice.iter().all(|v| v.to_bits() == 0);
+                        (1usize, if exact { 1usize } else { 0usize })
+                    } else {
+                        (0, 0)
                     }
-                }
-                (zeros, exact)
-            })
-            .reduce(|| (0, 0), |a, b| (a.0 + b.0, a.1 + b.1))
-    };
+                })
+                .reduce(|| (0, 0), |a, b| (a.0 + b.0, a.1 + b.1))
+        };
 
-    let (zc, ec) = if let Some(ref p) = pool { p.install(compute) } else { compute() };
-    Ok((count, dim, zc, ec))
+        let (zc, ec) = if let Some(ref p) = pool { p.install(compute) } else { compute() };
+        total_zeros += zc;
+        total_exact += ec;
+        offset_vec += n_vecs;
+    }
+
+    Ok((count, dim, total_zeros, total_exact))
 }

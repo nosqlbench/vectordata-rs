@@ -135,12 +135,21 @@ fn resolve_path(value: &str, workspace: &Path) -> PathBuf {
 // verify knn-consolidated (multi-threaded)
 // ═══════════════════════════════════════════════════════════════════════════
 
+// verify knn-consolidated uses the same sgemm kernel as compute knn-blas
+// so distances are bit-identical and verify can't false-positive on ULP
+// boundary tie-swaps. That kernel is feature-gated on `knnutils`
+// (system BLAS link); the command is therefore only registered when
+// knnutils is compiled in. Non-knnutils builds can still use the other
+// verify commands (filtered / predicates).
+#[cfg(feature = "knnutils")]
 pub struct VerifyKnnConsolidatedOp;
 
+#[cfg(feature = "knnutils")]
 pub fn knn_consolidated_factory() -> Box<dyn CommandOp> {
     Box::new(VerifyKnnConsolidatedOp)
 }
 
+#[cfg(feature = "knnutils")]
 impl CommandOp for VerifyKnnConsolidatedOp {
     fn command_path(&self) -> &str {
         "verify knn-consolidated"
@@ -192,12 +201,45 @@ impl CommandOp for VerifyKnnConsolidatedOp {
             Some(m) => m,
             None => return error_result(format!("unknown metric: '{}'", metric_str), start),
         };
-        let normalized = options.get("normalized").map(|s| s == "true").unwrap_or(false);
-        let kernel_metric = if normalized && (metric == Metric::Cosine || metric == Metric::DotProduct) {
-            Metric::DotProduct
-        } else {
-            metric
+        // L1 is not supported by the sgemm kernel (no matrix-form
+        // equivalent). knn-blas can't compute L1 either, so there
+        // wouldn't be any L1 output to verify; fail fast with a
+        // precise reason.
+        if matches!(metric, Metric::L1) {
+            return error_result(
+                "verify knn-consolidated: L1 is not supported by the sgemm verification kernel. \
+                 Use metric=L2, COSINE, or DOT_PRODUCT.".to_string(),
+                start,
+            );
+        }
+        // Resolve the cosine strategy. Mirrors compute-knn-blas's
+        // logic so verify and compute see the same arithmetic.
+        let seg_metric = match metric {
+            Metric::L2 => super::knn_segment::Metric::L2,
+            Metric::Cosine => super::knn_segment::Metric::Cosine,
+            Metric::DotProduct => super::knn_segment::Metric::DotProduct,
+            Metric::L1 => unreachable!("L1 rejected above"),
         };
+        let cosine_mode = match super::knn_segment::resolve_cosine_mode_for(
+            matches!(seg_metric, super::knn_segment::Metric::Cosine),
+            options,
+        ) {
+            Ok(m) => m,
+            Err(e) => return error_result(e, start),
+        };
+        let kernel_seg_metric = match (seg_metric, cosine_mode) {
+            (super::knn_segment::Metric::Cosine,
+             Some(super::knn_segment::CosineMode::AssumeNormalized)) =>
+                super::knn_segment::Metric::DotProduct,
+            _ => seg_metric,
+        };
+        let use_ip = matches!(kernel_seg_metric,
+            super::knn_segment::Metric::DotProduct
+            | super::knn_segment::Metric::Cosine);
+        let proper_cosine = matches!(cosine_mode,
+            Some(super::knn_segment::CosineMode::ProperMetric));
+        // `kernel_metric` kept around for the summary log only.
+        let kernel_metric = metric;
 
         let sample_count: usize = match options.parse_or("sample", 100usize) {
             Ok(v) => v, Err(e) => return error_result(e, start),
@@ -210,7 +252,15 @@ impl CommandOp for VerifyKnnConsolidatedOp {
             _ => ctx.governor.current_or("threads", ctx.threads as u64) as usize,
         };
 
-        let base_path = resolve_path(base_str, &ctx.workspace);
+        // base_str may carry an inline window (e.g., `base.fvec[0..N)`).
+        // Strip the window via source_window::resolve_source so opening
+        // the file doesn't blow up on the trailing range syntax —
+        // matching what compute-knn-blas does.
+        let base_source = match super::source_window::resolve_source(base_str, &ctx.workspace) {
+            Ok(s) => s,
+            Err(e) => return error_result(format!("parse base source: {}", e), start),
+        };
+        let base_path = base_source.path.clone();
         let query_path = resolve_path(query_str, &ctx.workspace);
         let output_path = resolve_path(output_str, &ctx.workspace);
 
@@ -281,8 +331,23 @@ impl CommandOp for VerifyKnnConsolidatedOp {
             Ok(r) => r,
             Err(e) => return error_result(format!("failed to open base as f32: {}", e), start),
         };
-        let base_count = VectorReader::<f32>::count(&f32_base_reader);
+        let file_count = VectorReader::<f32>::count(&f32_base_reader);
         let dim = VectorReader::<f32>::dim(&f32_base_reader);
+        // Effective base count = inline window OR `range` option,
+        // clamped to the file. Compute-knn uses the same resolution
+        // (`source_window::resolve_window`), so verify and compute see
+        // identical base bounds when --base-fraction or sized-profile
+        // injection trims the file.
+        let effective_window = super::source_window::resolve_window(
+            base_source.window, options.get("range"),
+        );
+        let (base_offset, base_count) = match effective_window {
+            Some((ws, we)) => {
+                let s = ws.min(file_count);
+                (s, we.min(file_count).saturating_sub(s))
+            }
+            None => (0, file_count),
+        };
         f32_base_reader.advise_sequential();
 
         // Filter out profiles whose declared base_count exceeds the actual
@@ -309,19 +374,54 @@ impl CommandOp for VerifyKnnConsolidatedOp {
         };
         let query_count = query_reader.count();
 
-        // Pick sample query indices (0 = all queries)
-        let sample_indices: Vec<usize> = if sample_count == 0 || sample_count >= query_count {
+        // Enforce a sampling floor: at least 100 queries OR 10% of the
+        // query set, whichever is greater. Verification with a tiny
+        // sample doesn't catch broken results — a single passing
+        // query was the previous "verified" signal even on totally
+        // wrong output.
+        let configured_sample = sample_count;
+        let floor = std::cmp::max(100, query_count / 10);
+        let target_sample = if configured_sample == 0 || configured_sample >= query_count {
+            query_count
+        } else {
+            configured_sample.max(floor).min(query_count)
+        };
+        if target_sample > configured_sample && configured_sample != 0 {
+            ctx.ui.log(&format!(
+                "  raised sample from {} to {} (floor: max(100, 10% of {} queries))",
+                configured_sample, target_sample, query_count,
+            ));
+        }
+
+        // Sample WITHOUT replacement using a real PRNG.
+        // The previous inline xorshift was wrong on two axes:
+        // (1) seed = 0 produces a degenerate fixed-point (0 ^ (0<<n) = 0
+        //     for any n), so every iteration emitted index 0 → after
+        //     `dedup` you got num_samples = 1 regardless of the configured
+        //     value. The user's pipeline runs with seed=0 (no shuffle),
+        //     so verify silently sampled a single query.
+        // (2) Push-then-dedup gives sampling with replacement → fewer
+        //     than the configured number of unique indices even with a
+        //     working RNG.
+        // `rand::seq::index::sample` is the standard fix: deterministic
+        // for a given seed, samples without replacement, returns
+        // exactly the requested count (capped at the population).
+        use rand::SeedableRng;
+        use rand::seq::index::sample as sample_indices_fn;
+        let sample_indices: Vec<usize> = if target_sample >= query_count {
             (0..query_count).collect()
         } else {
-            let mut indices = Vec::with_capacity(sample_count);
-            let mut rng = seed;
-            for _ in 0..sample_count {
-                rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
-                indices.push((rng as usize) % query_count);
-            }
-            indices.sort();
-            indices.dedup();
-            indices
+            // Pick a non-zero seed so any caller-supplied 0 still
+            // gives a useful spread. Mix with a constant so the
+            // user-visible seed semantics ("seed for the data
+            // pipeline") aren't conflated with the verify sampler.
+            let effective_seed = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(effective_seed);
+            let mut idx: Vec<usize> = sample_indices_fn(&mut rng, query_count, target_sample)
+                .into_iter()
+                .collect();
+            idx.sort();
+            idx
         };
         let num_samples = sample_indices.len();
 
@@ -362,31 +462,41 @@ impl CommandOp for VerifyKnnConsolidatedOp {
             profiles.len(), num_samples, k,
         ));
 
-        // Pack sample queries for cache-friendly SIMD.
-        let sample_queries_f32: Vec<Vec<f32>> = sample_indices.iter()
-            .map(|&qi| query_reader.get_f32(qi))
-            .collect();
-        let sample_query_refs: Vec<&[f32]> = sample_queries_f32.iter()
-            .map(|v| v.as_slice())
-            .collect();
+        // ── Pack sample queries flat for sgemm ────────────────────
+        // Row-major `queries_packed[qi*dim..qi*dim+dim]`. Computed
+        // once; fed to every boundary scan.
+        let mut queries_packed: Vec<f32> = Vec::with_capacity(num_samples * dim);
+        for &qi in &sample_indices {
+            queries_packed.extend_from_slice(&query_reader.get_f32(qi));
+        }
+        let query_norms_sq: Vec<f32> = (0..num_samples).map(|qi| {
+            let s = &queries_packed[qi * dim..(qi + 1) * dim];
+            s.iter().map(|v| v * v).sum::<f32>()
+        }).collect();
 
-        // Use compute-knn's exact code path to guarantee bit-identical
-        // distance computation and heap behavior. The verify step only
-        // processes ~100 sample queries, so single-batch processing is
-        // fast and eliminates any threading/merge discrepancies.
-        let dist_fn = simd_distance::select_distance_fn(kernel_metric);
-        let batched_fn = simd_distance::select_batched_fn_f32(kernel_metric);
+        // ── Open base for streaming pread ─────────────────────────
+        // We keep the mmap reader (`f32_base_reader`) around for
+        // metadata only; the sgemm scan reads via pread into heap
+        // buffers so RSS stays bounded.
+        let base_file = match std::fs::File::open(&base_path) {
+            Ok(f) => f,
+            Err(e) => return error_result(format!("open base for streaming: {}", e), start),
+        };
 
+        // ── Allocate scan buffers ONCE, reused across boundaries ──
+        let mut scan_buffers = super::compute_knn_blas::SgemmScanBuffers::new(num_samples, dim);
+        let vecs_per_chunk = scan_buffers.vecs_per_chunk();
+        let qb_size = scan_buffers.qb_size();
         ctx.ui.log(&format!(
-            "  scanning {} base vectors ({} sample queries, {} threads)",
-            base_count, num_samples, threads,
+            "  chunk plan: {} base/chunk × {} queries/sub-batch",
+            vecs_per_chunk, qb_size,
+        ));
+        ctx.ui.log(&format!(
+            "  scanning {} base vectors ({} sample queries, metric={:?}, engine=BLAS sgemm)",
+            base_count, num_samples, kernel_metric,
         ));
 
-        let progress = std::sync::atomic::AtomicU64::new(0);
-
-        // Compute unique profile boundaries (sorted ascending, deduped).
-        // Each boundary is a base_count at which one or more profiles
-        // should be verified.
+        // ── Boundary grouping ─────────────────────────────────────
         let mut boundary_profiles: Vec<(usize, Vec<usize>)> = Vec::new();
         {
             let mut boundary_map: std::collections::BTreeMap<usize, Vec<usize>> =
@@ -403,149 +513,88 @@ impl CommandOp for VerifyKnnConsolidatedOp {
         let mut results: Vec<(String, usize, usize)> = vec![
             (String::new(), 0, 0); profiles.len()
         ];
-        let mut cumulative_results: Vec<Vec<Neighbor>> = (0..num_samples).map(|_| Vec::new()).collect();
-        let stride = 100_000usize;
-        let effective_threads = threads.min(num_samples).max(1);
-        let chunk_size = (num_samples + effective_threads - 1) / effective_threads;
-        let num_worker_chunks = (num_samples + chunk_size - 1) / chunk_size;
+        // Running per-query top-k for [0, prev_boundary). Maintained
+        // in-place across boundaries so each scan extends the range
+        // rather than rebuilding from scratch.
+        let mut cumulative_heaps: Vec<BinaryHeap<Neighbor>> =
+            (0..num_samples).map(|_| BinaryHeap::with_capacity(k + 1)).collect();
+        let mut cumulative_thresholds: Vec<f32> = vec![f32::INFINITY; num_samples];
+        // Drop unused: we no longer have rayon workers at this level.
+        let _ = (threads, &f32_base_reader);
         let scan_pb = ctx.ui.bar_with_unit(
             base_count as u64,
             &format!("scanning {} base ({}q × {}d)", base_count, num_samples, dim),
             "vectors",
         );
-        let threads_done_pb = ctx.ui.bar_with_unit(
-            num_worker_chunks as u64,
-            &format!("threads completing ({} workers)", num_worker_chunks),
-            "threads",
+        let boundary_pb = ctx.ui.bar_with_unit(
+            boundary_profiles.len() as u64,
+            "boundaries",
+            "boundaries",
         );
         let profile_pb = ctx.ui.bar_with_unit(profiles.len() as u64, "profiles verified", "profiles");
-        let base_ref = &f32_base_reader;
         let mut prev_boundary = 0usize;
         let mut profiles_verified = 0usize;
-        let scan_pb_ref = &scan_pb;
 
         // Scan base vectors in segments between profile boundaries.
-        // After each segment, the cumulative heaps contain the correct
-        // top-k for [0, boundary), so we can verify profiles immediately.
-        //
-        // `find_top_k_batch_f32` creates fresh heaps internally and
-        // overwrites the results buffer, so after each segment we merge
-        // the segment results into `cumulative_results` to maintain the
-        // correct cumulative top-k across boundaries.
-        for (boundary, profile_indices) in &boundary_profiles {
+        // `scan_range_sgemm` reuses the exact kernel + buffer layout
+        // that `compute knn-blas` used to produce the output we're
+        // verifying — so distances agree to the last bit of f32 and
+        // tie-ordering cannot drift between compute and verify.
+        for (boundary_idx, (boundary, profile_indices)) in boundary_profiles.iter().enumerate() {
             let seg_start = prev_boundary;
             let seg_end = *boundary;
 
             if seg_end > seg_start {
                 let phase_start = std::time::Instant::now();
-                // Temporary buffer for this segment's results
-                let mut segment_results: Vec<Vec<Neighbor>> = (0..num_samples).map(|_| Vec::new()).collect();
-
-                // Parallel scan of this segment.
-                // Two stage-level progress bars aggregated across threads:
-                //   1. "scanning" — base vectors processed (all threads contribute)
-                //   2. "threads done" — threads that finished scan + heap sort
-                let threads_done = std::sync::atomic::AtomicU64::new(0);
-
-                std::thread::scope(|scope| {
-                    let progress_ref = &progress;
-                    let threads_done_ref = &threads_done;
-
-                    if effective_threads > 1 {
-                        let result_chunks: Vec<&mut [Vec<Neighbor>]> =
-                            segment_results.chunks_mut(chunk_size).collect();
-
-                        for (ci, chunk) in result_chunks.into_iter().enumerate() {
-                            let chunk_start = ci * chunk_size;
-                            let chunk_len = chunk.len();
-                            let chunk_queries: Vec<&[f32]> = (0..chunk_len)
-                                .map(|i| sample_query_refs[chunk_start + i])
-                                .collect();
-
-                            scope.spawn(move || {
-                                // Stage 1: scan base vectors + compute distances
-                                super::compute_knn::find_top_k_batch_f32(
-                                    &chunk_queries,
-                                    base_ref,
-                                    seg_start,
-                                    seg_end,
-                                    k,
-                                    dist_fn,
-                                    batched_fn,
-                                    kernel_metric,
-                                    dim,
-                                    chunk,
-                                    stride,
-                                    progress_ref,
-                                );
-                                // Stage 2: heap sort complete, signal done
-                                threads_done_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            });
-                        }
-
-                        // Tick thread: update both progress bars
-                        let num_batches = num_worker_chunks as u64;
-                        let threads_pb_ref = &threads_done_pb;
-                        scope.spawn(move || {
-                            loop {
-                                let raw = progress_ref.load(std::sync::atomic::Ordering::Relaxed);
-                                scan_pb_ref.set_position((raw / num_batches).min(seg_end as u64));
-                                let done = threads_done_ref.load(std::sync::atomic::Ordering::Relaxed);
-                                threads_pb_ref.set_position(done);
-                                if done >= num_batches {
-                                    break;
-                                }
-                                std::thread::sleep(std::time::Duration::from_millis(100));
-                            }
-                        });
-                    } else {
-                        super::compute_knn::find_top_k_batch_f32(
-                            &sample_query_refs,
-                            base_ref,
-                            seg_start,
-                            seg_end,
-                            k,
-                            dist_fn,
-                            batched_fn,
-                            kernel_metric,
-                            dim,
-                            &mut segment_results,
-                            stride,
-                            &progress,
-                        );
-                        scan_pb_ref.set_position(seg_end as u64);
-                        threads_done.store(1, std::sync::atomic::Ordering::Relaxed);
-                    }
-                });
-
+                let pb_ref = &scan_pb;
+                let prev = prev_boundary;
+                let mut tick_cb = move |done_in_seg: u64| {
+                    pb_ref.set_position((prev as u64) + done_in_seg);
+                };
+                // Boundaries (`seg_start`, `seg_end`) are in
+                // window-relative space ([0..base_count)). Translate
+                // to absolute file indices by adding `base_offset` so
+                // pread reads the right bytes when the source has a
+                // non-zero window start.
+                if let Err(e) = super::compute_knn_blas::scan_range_sgemm(
+                    &base_file,
+                    (base_offset + seg_start)..(base_offset + seg_end),
+                    dim,
+                    &queries_packed,
+                    num_samples,
+                    &query_norms_sq,
+                    use_ip,
+                    proper_cosine,
+                    k,
+                    &mut scan_buffers,
+                    &mut cumulative_heaps,
+                    &mut cumulative_thresholds,
+                    Some(&mut tick_cb),
+                ) {
+                    return error_result(
+                        format!("scan [{}..{}): {}", seg_start, seg_end, e),
+                        start,
+                    );
+                }
                 scan_pb.set_position(seg_end as u64);
-                threads_done_pb.set_position(effective_threads as u64);
                 let scan_elapsed = phase_start.elapsed();
-                ctx.ui.log(&format!("  scan phase: {:.1}s ({} threads)", scan_elapsed.as_secs_f64(), effective_threads));
-                // Merge segment results into cumulative results.
-                let merge_start = std::time::Instant::now();
-                for qi in 0..num_samples {
-                    cumulative_results[qi].extend(segment_results[qi].drain(..));
-                    if cumulative_results[qi].len() > k {
-                        cumulative_results[qi].sort_by(|a, b| {
-                            a.distance.partial_cmp(&b.distance).unwrap_or(std::cmp::Ordering::Equal)
-                                .then(a.index.cmp(&b.index))
-                        });
-                        cumulative_results[qi].truncate(k);
-                    }
-                }
-                let merge_elapsed = merge_start.elapsed();
-                if merge_elapsed.as_millis() > 100 {
-                    ctx.ui.log(&format!("  merge: {:.1}s", merge_elapsed.as_secs_f64()));
-                }
+                ctx.ui.log(&format!(
+                    "  scan [{}..{}): {:.1}s ({:.1}M base/s)",
+                    seg_start, seg_end,
+                    scan_elapsed.as_secs_f64(),
+                    (seg_end - seg_start) as f64 / scan_elapsed.as_secs_f64() / 1e6,
+                ));
             }
 
             prev_boundary = seg_end;
 
-            // Verify all profiles at this boundary.
+            // Verify all profiles at this boundary. Build a snapshot of
+            // the running heaps — `verify_heaps_against_gt` consumes
+            // heaps by reference (sorted internally) and doesn't mutate
+            // the originals.
             let verify_start = std::time::Instant::now();
-            let verify_heaps: Vec<BinaryHeap<Neighbor>> = cumulative_results.iter()
-                .map(|v| v.iter().copied().collect())
+            let verify_heaps: Vec<BinaryHeap<Neighbor>> = cumulative_heaps.iter()
+                .map(|h| h.iter().copied().collect())
                 .collect();
 
             for &pi in profile_indices {
@@ -564,9 +613,10 @@ impl CommandOp for VerifyKnnConsolidatedOp {
             }
             let verify_elapsed = verify_start.elapsed();
             ctx.ui.log(&format!("  verify phase: {:.1}s", verify_elapsed.as_secs_f64()));
+            boundary_pb.set_position((boundary_idx + 1) as u64);
         }
         scan_pb.finish();
-        threads_done_pb.finish();
+        boundary_pb.finish();
         profile_pb.finish();
 
         // Write consolidated report

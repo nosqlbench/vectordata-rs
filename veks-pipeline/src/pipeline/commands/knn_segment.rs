@@ -261,6 +261,7 @@ pub(super) fn load_segment_cache(
     fvec_path: &Path,
     k: usize,
     query_count: usize,
+    flip_sign: bool,
 ) -> Result<Vec<Vec<Neighbor>>, String> {
     use std::io::BufReader;
     let mut iw = BufReader::with_capacity(1 << 20, std::fs::File::open(ivec_path)
@@ -280,7 +281,8 @@ pub(super) fn load_segment_cache(
             iw.read_exact(&mut idx_buf).map_err(|e| format!("read ivec body: {}", e))?;
             fw.read_exact(&mut dist_buf).map_err(|e| format!("read fvec body: {}", e))?;
             let idx = i32::from_le_bytes(idx_buf);
-            let dist = f32::from_le_bytes(dist_buf);
+            let raw = f32::from_le_bytes(dist_buf);
+            let dist = if flip_sign { -raw } else { raw };
             if idx >= 0 {
                 row.push(Neighbor { index: idx as u32, distance: dist });
             }
@@ -320,6 +322,15 @@ pub(super) struct CachedSegment {
     pub(super) end: usize,
     pub(super) ivec_path: PathBuf,
     pub(super) fvec_path: PathBuf,
+    /// True when the loaded distances must be sign-flipped to match the
+    /// kernel's internal convention. The published profile-dir GT for
+    /// IP/DOT/cosine-as-IP stores `+dot` (positive, larger = better)
+    /// because that's what users expect, but the kernel ranks with
+    /// `-dot` so the standard min-distance heap math works. Path-1
+    /// `.cache/` files are written in kernel sign and need no flip;
+    /// Path-2 sibling profile files do, when the metric is one of the
+    /// inner-product variants.
+    pub(super) flip_sign: bool,
 }
 
 /// Scan the cache directory plus sibling profile outputs for every
@@ -378,7 +389,10 @@ pub(super) fn scan_cached_segments(
             if validate_cache_file(&ivec, query_count, k, 4)
                 && validate_cache_file(&fvec, query_count, k, 4)
             {
-                segments.push(CachedSegment { start: s, end: e, ivec_path: ivec, fvec_path: fvec });
+                segments.push(CachedSegment {
+                    start: s, end: e, ivec_path: ivec, fvec_path: fvec,
+                    flip_sign: false,
+                });
             }
         }
     }
@@ -412,10 +426,18 @@ pub(super) fn scan_cached_segments(
                             "  reusing profile '{}' output as segment [0, {})",
                             pname_str, pbc,
                         ));
+                        // Published GT for IP/DOT/cosine-as-IP stores
+                        // `+dot` (user-facing convention: larger = better)
+                        // while the kernel ranks with `-dot`. Flag the
+                        // segment so the loader negates each distance
+                        // before merging into the heap. L2 stores `+L2sq`
+                        // in both places — no flip needed.
+                        let flip_sign = matches!(metric, Metric::DotProduct | Metric::Cosine);
                         segments.push(CachedSegment {
                             start: 0, end: pbc,
                             ivec_path: idx_path,
                             fvec_path: dist_path,
+                            flip_sign,
                         });
                     }
                 }

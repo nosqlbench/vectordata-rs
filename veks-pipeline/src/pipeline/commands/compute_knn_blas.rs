@@ -50,13 +50,23 @@ const ENGINE_NAME: &str = "knn-blas";
 /// I/O chunk size target. Same default as knn-stdarch — 64 MiB of raw
 /// fvec bytes per chunk. Actual `vecs_per_chunk` is derived from
 /// `entry_size` at execute time and may be further clamped so the
-/// sgemm score matrix (`query_count × vecs_per_chunk × 4 bytes`) fits
-/// a configurable RAM budget.
+/// sgemm score matrix fits the `SCORE_MATRIX_BUDGET_BYTES` RAM budget.
 const STREAM_CHUNK_BYTES: usize = 64 * 1024 * 1024;
 
 /// Score-matrix RAM budget. The score matrix is the dominant memory
-/// cost per chunk — `vecs_per_chunk` shrinks to respect this.
+/// cost per sgemm call. `vecs_per_chunk` is sized so that
+/// `QUERY_SUBBATCH_SIZE × vecs_per_chunk × 4 bytes ≤ budget`, and
+/// queries are then processed in sub-batches within each base chunk.
+/// Sub-batching lets `vecs_per_chunk` grow (longer sgemm inner work
+/// between cache-blocking restarts) while keeping the score matrix
+/// bounded.
 const SCORE_MATRIX_BUDGET_BYTES: usize = 1024 * 1024 * 1024;
+
+/// Query sub-batch size: number of queries processed per sgemm call.
+/// Smaller values shrink the score matrix (lets `vecs_per_chunk`
+/// grow). Larger values amortize sgemm startup overhead. 2048 is a
+/// sweet spot on modern x86 with AVX-512 / OpenBLAS.
+const QUERY_SUBBATCH_SIZE: usize = 2048;
 
 // ─── BLAS FFI ────────────────────────────────────────────────────────────
 // Links dynamically against whatever `libblas.so` / `libopenblas.so` /
@@ -298,6 +308,255 @@ pub(super) fn topk_indices(scores: &[f32], k: usize) -> Vec<Neighbor> {
     v
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// Shared streaming scan (compute-knn-blas + verify-knn-consolidated)
+// ═══════════════════════════════════════════════════════════════════════
+//
+// Both compute and verify drive the same math: sgemm for distances,
+// sub-batched for score-matrix bounding, rayon-parallel top-k, merge
+// into caller-owned heaps. By factoring through this function, verify
+// produces *bit-identical* distances to compute — no kernel-diversity
+// mismatch at the ULP boundary, no false positives on 1B-scale runs.
+//
+// Caller is responsible for:
+//   - Opening `base_file` and knowing `dim` / `entry_size`.
+//   - Packing queries contiguously (`queries_packed[qi*dim..qi*dim+dim]`)
+//     and precomputing their squared L2 norms.
+//   - Allocating reusable buffers via [`SgemmScanBuffers::new`] once at
+//     the top of the enclosing execute() and passing by `&mut` so no
+//     allocation happens per call.
+//   - Seeding `heaps` and `thresholds` (identical length = query_count).
+//     Pre-existing entries are preserved; new candidates are merged with
+//     threshold-aware pruning.
+
+/// Reusable buffer set for streaming sgemm scans. Allocate once at the
+/// top of an `execute()` run and pass the same mut reference into every
+/// [`scan_range_sgemm`] call to avoid per-segment allocation.
+#[allow(dead_code)]
+pub(super) struct SgemmScanBuffers {
+    raw_a: Vec<u8>,
+    raw_b: Vec<u8>,
+    packed_a: Vec<f32>,
+    packed_b: Vec<f32>,
+    score_matrix: Vec<f32>,
+    base_norms_sq: Vec<f32>,
+    vecs_per_chunk: usize,
+    qb_size: usize,
+}
+
+impl SgemmScanBuffers {
+    /// Allocate buffers sized for the given shape. Picks `vecs_per_chunk`
+    /// so that the score matrix (`qb_size × vecs_per_chunk × 4`) fits
+    /// [`SCORE_MATRIX_BUDGET_BYTES`] and the raw chunk (`vecs_per_chunk
+    /// × entry_size`) fits [`STREAM_CHUNK_BYTES`].
+    pub(super) fn new(query_count: usize, dim: usize) -> Self {
+        let entry_size = 4 + dim * 4;
+        let qb_size = QUERY_SUBBATCH_SIZE.min(query_count.max(1));
+        let vecs_per_chunk_score = (SCORE_MATRIX_BUDGET_BYTES / (qb_size * 4).max(1)).max(1);
+        let vecs_per_chunk_io = (STREAM_CHUNK_BYTES / entry_size.max(1)).max(1);
+        let vecs_per_chunk = vecs_per_chunk_score.min(vecs_per_chunk_io);
+        let raw_chunk_bytes = vecs_per_chunk * entry_size;
+        let _packed_chunk_f32 = vecs_per_chunk * dim;
+        let score_matrix_len = qb_size * vecs_per_chunk;
+        Self {
+            raw_a: alloc_raw_buf(raw_chunk_bytes),
+            raw_b: alloc_raw_buf(raw_chunk_bytes),
+            packed_a: alloc_packed_buf(vecs_per_chunk, dim),
+            packed_b: alloc_packed_buf(vecs_per_chunk, dim),
+            score_matrix: vec![0.0f32; score_matrix_len],
+            base_norms_sq: Vec::new(), // sized lazily
+            vecs_per_chunk,
+            qb_size,
+        }
+    }
+
+    pub(super) fn vecs_per_chunk(&self) -> usize { self.vecs_per_chunk }
+    pub(super) fn qb_size(&self) -> usize { self.qb_size }
+}
+
+/// Scan `base_range` against `queries_packed`, accumulating top-k
+/// neighbors into caller-owned `heaps` / `thresholds` with threshold
+/// pruning. Uses double-buffered pread streaming + sgemm + sub-batched
+/// top-k — the same math as `compute knn-blas`.
+///
+/// `use_ip` selects the kernel: `true` for IP / DOT / cosine-assume-
+/// normalized; `false` for L2 (norm-adjusted sgemm).
+/// `proper_cosine` additionally divides scores by `|q| × |b|` after
+/// sgemm when computing cosine on non-normalized inputs.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn scan_range_sgemm(
+    base_file: &File,
+    base_range: std::ops::Range<usize>,
+    dim: usize,
+    queries_packed: &[f32],
+    query_count: usize,
+    query_norms_sq: &[f32],
+    use_ip: bool,
+    proper_cosine: bool,
+    k: usize,
+    buffers: &mut SgemmScanBuffers,
+    heaps: &mut [BinaryHeap<Neighbor>],
+    thresholds: &mut [f32],
+    mut progress: Option<&mut dyn FnMut(u64)>,
+) -> Result<(), String> {
+    let entry_size = 4 + dim * 4;
+    let range_start = base_range.start;
+    let range_end = base_range.end;
+    let range_len = range_end.saturating_sub(range_start);
+    if range_len == 0 { return Ok(()); }
+
+    let vecs_per_chunk = buffers.vecs_per_chunk;
+    let qb_size = buffers.qb_size;
+    let n_chunks = (range_len + vecs_per_chunk - 1) / vecs_per_chunk;
+
+    let need_base_norms = !use_ip || proper_cosine;
+    if need_base_norms {
+        buffers.base_norms_sq.resize(vecs_per_chunk, 0.0);
+    }
+
+    let chunk_bounds = |c: usize| -> (usize, usize) {
+        let s = range_start + c * vecs_per_chunk;
+        let e = (s + vecs_per_chunk).min(range_end);
+        (s, e - s)
+    };
+
+    // Destructure buffers so the borrow checker lets us hand `raw_a`/
+    // `packed_a` to one scope thread and `raw_b`/`packed_b` to another.
+    let SgemmScanBuffers { raw_a, raw_b, packed_a, packed_b, score_matrix, base_norms_sq, .. } = buffers;
+
+    // Prime buf_a with chunk 0.
+    let (c0_first, c0_n) = chunk_bounds(0);
+    if c0_n == 0 { return Ok(()); }
+    let c0_off = (c0_first as u64) * (entry_size as u64);
+    pread_and_unpack(base_file, c0_off, c0_n, entry_size, dim, raw_a, packed_a)
+        .map_err(|e| format!("pread chunk 0 @{}: {}", c0_first, e))?;
+
+    let io_err: Arc<std::sync::Mutex<Option<String>>> =
+        Arc::new(std::sync::Mutex::new(None));
+
+    for chunk_i in 0..n_chunks {
+        let is_last = chunk_i + 1 == n_chunks;
+        let (cur_first, cur_n) = chunk_bounds(chunk_i);
+        let (next_first, next_n) = if is_last { (0, 0) } else { chunk_bounds(chunk_i + 1) };
+        let next_off = (next_first as u64) * (entry_size as u64);
+
+        std::thread::scope(|scope| {
+            // Prefetch next chunk in the idle buffer.
+            if !is_last && next_n > 0 {
+                let rb: &mut Vec<u8> = raw_b;
+                let pb_next: &mut Vec<f32> = packed_b;
+                let bf = base_file;
+                let err_slot = Arc::clone(&io_err);
+                scope.spawn(move || {
+                    if let Err(e) = pread_and_unpack(
+                        bf, next_off, next_n, entry_size, dim, rb, pb_next,
+                    ) {
+                        *err_slot.lock().unwrap() =
+                            Some(format!("pread chunk@{}: {}", next_first, e));
+                    }
+                });
+            }
+
+            // Compute task: sub-batched sgemm + top-k + merge into heaps.
+            let packed_cur: &[f32] = &packed_a[..cur_n * dim];
+            let q_packed = queries_packed;
+            let q_norms_ref = query_norms_sq;
+            let heaps_ref: &mut [BinaryHeap<Neighbor>] = heaps;
+            let thr_ref: &mut [f32] = thresholds;
+            let score_matrix_ref: &mut Vec<f32> = score_matrix;
+            let b_norms_ref: Option<&mut Vec<f32>> =
+                if need_base_norms { Some(base_norms_sq) } else { None };
+            scope.spawn(move || {
+                let b_norms_slice: Option<&[f32]> = if need_base_norms {
+                    let bn = b_norms_ref.unwrap();
+                    for (bi, n) in bn[..cur_n].iter_mut().enumerate() {
+                        let s = &packed_cur[bi * dim..(bi + 1) * dim];
+                        *n = s.iter().map(|v| v * v).sum::<f32>();
+                    }
+                    Some(&bn[..cur_n])
+                } else {
+                    None
+                };
+                let b_norms_for_sgemm = if use_ip { None } else { b_norms_slice };
+
+                for qb_start in (0..query_count).step_by(qb_size) {
+                    let qb_end = (qb_start + qb_size).min(query_count);
+                    let qb_n = qb_end - qb_start;
+
+                    let queries_slice = &q_packed[qb_start * dim..qb_end * dim];
+                    let q_norms_slice = &q_norms_ref[qb_start..qb_end];
+                    let scores_slice = &mut score_matrix_ref[..qb_n * cur_n];
+
+                    sgemm_chunk(
+                        queries_slice, qb_n,
+                        packed_cur, cur_n,
+                        dim,
+                        use_ip,
+                        if use_ip { None } else { Some(q_norms_slice) },
+                        b_norms_for_sgemm,
+                        scores_slice,
+                    );
+
+                    if proper_cosine {
+                        let bn = b_norms_slice.unwrap();
+                        for qi in 0..qb_n {
+                            let q_mag = q_norms_slice[qi].sqrt().max(f32::MIN_POSITIVE);
+                            let row = &mut scores_slice[qi * cur_n..(qi + 1) * cur_n];
+                            for (bi, s) in row.iter_mut().enumerate() {
+                                let b_mag = bn[bi].sqrt().max(f32::MIN_POSITIVE);
+                                *s /= q_mag * b_mag;
+                            }
+                        }
+                    }
+
+                    use rayon::prelude::*;
+                    let row_results: Vec<BinaryHeap<Neighbor>> = (0..qb_n)
+                        .into_par_iter()
+                        .map(|qi_local| {
+                            let qi_global = qb_start + qi_local;
+                            let row = &scores_slice[qi_local * cur_n..(qi_local + 1) * cur_n];
+                            let mut heap: BinaryHeap<Neighbor> =
+                                BinaryHeap::with_capacity(k + 1);
+                            let _ = topk_from_scores_into(
+                                row, k, use_ip, cur_first,
+                                thr_ref[qi_global], &mut heap,
+                            );
+                            heap
+                        })
+                        .collect();
+                    for (qi_local, cand_heap) in row_results.into_iter().enumerate() {
+                        let qi_global = qb_start + qi_local;
+                        for n in cand_heap.into_iter() {
+                            if n.distance < thr_ref[qi_global] {
+                                heaps_ref[qi_global].push(n);
+                                if heaps_ref[qi_global].len() > k {
+                                    heaps_ref[qi_global].pop();
+                                    thr_ref[qi_global] = heaps_ref[qi_global].peek().unwrap().distance;
+                                } else if heaps_ref[qi_global].len() == k {
+                                    thr_ref[qi_global] = heaps_ref[qi_global].peek().unwrap().distance;
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        });
+
+        if let Some(msg) = io_err.lock().unwrap().take() {
+            return Err(msg);
+        }
+
+        if !is_last {
+            std::mem::swap(raw_a, raw_b);
+            std::mem::swap(packed_a, packed_b);
+        }
+        if let Some(ref mut cb) = progress {
+            cb((cur_first + cur_n - range_start) as u64);
+        }
+    }
+    Ok(())
+}
+
 fn error_result(msg: impl Into<String>, start: Instant) -> CommandResult {
     CommandResult {
         status: Status::Error,
@@ -533,6 +792,7 @@ Reuses the shared segment-cache infrastructure:
             ivec_path: PathBuf,
             fvec_path: PathBuf,
             cached: bool,
+            flip_sign: bool,
         }
 
         let mut plan: Vec<PlannedSegment> = Vec::new();
@@ -547,6 +807,7 @@ Reuses the shared segment-cache infrastructure:
                     ivec_path: seg.ivec_path.clone(),
                     fvec_path: seg.fvec_path.clone(),
                     cached: true,
+                    flip_sign: seg.flip_sign,
                 });
                 pos = seg.end;
             } else {
@@ -556,6 +817,7 @@ Reuses the shared segment-cache infrastructure:
                     ivec_path: build_cache_path(&ctx.cache, ENGINE_NAME, &cache_prefix, pos, pe, k, kernel_metric, "neighbors", "ivec"),
                     fvec_path: build_cache_path(&ctx.cache, ENGINE_NAME, &cache_prefix, pos, pe, k, kernel_metric, "distances", "fvec"),
                     cached: false,
+                    flip_sign: false,
                 });
                 pos = pe;
             }
@@ -606,7 +868,7 @@ Reuses the shared segment-cache infrastructure:
             let mut replayed_bytes: u64 = 0;
             for (seg_idx, p) in plan.iter().enumerate() {
                 if !p.cached { continue; }
-                let seg = match load_segment_cache(&p.ivec_path, &p.fvec_path, k, query_count) {
+                let seg = match load_segment_cache(&p.ivec_path, &p.fvec_path, k, query_count, p.flip_sign) {
                     Ok(s) => s,
                     Err(e) => {
                         return error_result(
@@ -657,41 +919,24 @@ Reuses the shared segment-cache infrastructure:
             s.iter().map(|v| v * v).sum::<f32>()
         }).collect();
 
-        // ── Chunk sizing: clamp to fit score matrix + I/O window ──
-        // Score matrix dominates RAM; `vecs_per_chunk` is the min of
-        // the score-matrix budget and the I/O chunk-bytes budget.
-        let vecs_per_chunk_score = (SCORE_MATRIX_BUDGET_BYTES / (query_count * 4).max(1)).max(1);
-        let vecs_per_chunk_io = (STREAM_CHUNK_BYTES / entry_size).max(1);
-        let vecs_per_chunk = vecs_per_chunk_score.min(vecs_per_chunk_io);
-        let raw_chunk_bytes = vecs_per_chunk * entry_size;
-        let packed_chunk_f32 = vecs_per_chunk * dim;
-        let score_matrix_len = query_count * vecs_per_chunk;
-        ctx.ui.log(&format!(
-            "  chunk plan: {} base/chunk, raw={} MiB, packed={} MiB, score={} MiB",
-            vecs_per_chunk,
-            raw_chunk_bytes / (1024 * 1024),
-            (packed_chunk_f32 * 4) / (1024 * 1024),
-            (score_matrix_len * 4) / (1024 * 1024),
-        ));
-
-        // Allocate chunk buffers once; reused across segments.
-        let mut raw_a = alloc_raw_buf(raw_chunk_bytes);
-        let mut raw_b = alloc_raw_buf(raw_chunk_bytes);
-        let mut packed_a = alloc_packed_buf(vecs_per_chunk, dim);
-        let mut packed_b = alloc_packed_buf(vecs_per_chunk, dim);
-        let mut score_matrix = vec![0.0f32; score_matrix_len];
-
-        // Base norms² are needed for:
-        //   - L2 (to add to the sgemm output)
-        //   - proper-cosine (to divide the sgemm output by |q| × |b|)
-        // Reused across segments, resized per chunk.
+        // Allocate the shared streaming-scan buffers ONCE for the full
+        // KNN run. `SgemmScanBuffers::new` picks the same chunk +
+        // sub-batch shape that the in-line code did before. The same
+        // `&mut SgemmScanBuffers` is passed to every per-segment
+        // `scan_range_sgemm` call below — no per-segment allocation.
+        let mut scan_buffers = SgemmScanBuffers::new(query_count, dim);
+        let vecs_per_chunk = scan_buffers.vecs_per_chunk();
+        let qb_size = scan_buffers.qb_size();
         let proper_cosine = matches!(cosine_mode, Some(CosineMode::ProperMetric));
-        let need_base_norms = !use_ip || proper_cosine;
-        let mut base_norms_sq = if need_base_norms {
-            vec![0.0f32; vecs_per_chunk]
-        } else {
-            Vec::new()
-        };
+        let n_query_subbatches = (query_count + qb_size - 1) / qb_size;
+        ctx.ui.log(&format!(
+            "  chunk plan: {} base/chunk × {} queries/sub-batch ({} sub-batches), \
+             raw={} MiB, packed={} MiB, score={} MiB",
+            vecs_per_chunk, qb_size, n_query_subbatches,
+            (vecs_per_chunk * entry_size) / (1024 * 1024),
+            (vecs_per_chunk * dim * 4) / (1024 * 1024),
+            (qb_size * vecs_per_chunk * 4) / (1024 * 1024),
+        ));
 
         let mut computed_count = 0usize;
         for seg_idx in 0..n_segments {
@@ -720,149 +965,35 @@ Reuses the shared segment-cache infrastructure:
                 .collect();
             let mut seg_thresholds: Vec<f32> = all_thresholds.clone();
 
-            let chunk_range = |c: usize| -> (usize, usize) {
-                let s = seg_start + c * vecs_per_chunk;
-                let e = (s + vecs_per_chunk).min(seg_end);
-                (s, e - s)
+            // Stream the segment via the shared scan helper. Identical
+            // math as the in-line code that lived here before — now
+            // factored so verify-knn can call the same kernel and get
+            // bit-identical distances. Progress callback advances the
+            // global compute_progress counter as each chunk completes.
+            let pb_for_cb = &pb;
+            let prev_compute_progress = compute_progress;
+            let mut tick_cb = move |done_in_segment: u64| {
+                pb_for_cb.set_position(prev_compute_progress + done_in_segment);
             };
 
-            // Prime buf_a with chunk 0.
-            let (c0_first, c0_n) = chunk_range(0);
-            if c0_n == 0 { continue; } // no work
-            let c0_off = (c0_first as u64) * (entry_size as u64);
-            if let Err(e) = pread_and_unpack(
-                &base_file, c0_off, c0_n, entry_size, dim, &mut raw_a, &mut packed_a,
+            if let Err(e) = scan_range_sgemm(
+                &base_file,
+                seg_start..seg_end,
+                dim,
+                &queries_packed,
+                query_count,
+                &query_norms_sq,
+                use_ip,
+                proper_cosine,
+                k,
+                &mut scan_buffers,
+                &mut seg_heaps,
+                &mut seg_thresholds,
+                Some(&mut tick_cb),
             ) {
-                return error_result(format!("pread seg {} chunk 0: {}", seg_idx, e), start);
+                return error_result(format!("seg {}: {}", seg_idx, e), start);
             }
-
-            let io_err: Arc<std::sync::Mutex<Option<String>>> =
-                Arc::new(std::sync::Mutex::new(None));
-
-            for chunk_i in 0..n_chunks {
-                let is_last = chunk_i + 1 == n_chunks;
-                let (cur_first, cur_n) = chunk_range(chunk_i);
-                let (next_first, next_n) = if is_last { (0, 0) } else { chunk_range(chunk_i + 1) };
-                let next_off = (next_first as u64) * (entry_size as u64);
-
-                std::thread::scope(|scope| {
-                    // I/O task: pread + unpack next chunk into buf_b.
-                    if !is_last && next_n > 0 {
-                        let rb = &mut raw_b;
-                        let pb_next = &mut packed_b;
-                        let bf = Arc::clone(&base_file);
-                        let err_slot = Arc::clone(&io_err);
-                        scope.spawn(move || {
-                            if let Err(e) = pread_and_unpack(
-                                &bf, next_off, next_n, entry_size, dim, rb, pb_next,
-                            ) {
-                                *err_slot.lock().unwrap() =
-                                    Some(format!("pread chunk@{}: {}", next_first, e));
-                            }
-                        });
-                    }
-
-                    // Compute task: sgemm + rayon-parallel top-k +
-                    // merge into segment heaps. sgemm is internally
-                    // multithreaded (OpenBLAS/MKL use all cores).
-                    let packed_cur: &[f32] = &packed_a[..cur_n * dim];
-                    let scores_slice = &mut score_matrix[..query_count * cur_n];
-                    let q_packed = &queries_packed;
-                    let q_norms_ref = &query_norms_sq;
-                    let seg_heaps_ref = &mut seg_heaps;
-                    let seg_thr_ref = &mut seg_thresholds;
-                    let b_norms_ref = if need_base_norms { Some(&mut base_norms_sq) } else { None };
-                    scope.spawn(move || {
-                        let b_norms_slice: Option<&[f32]> = if need_base_norms {
-                            let bn = b_norms_ref.unwrap();
-                            bn.resize(cur_n, 0.0);
-                            for (bi, n) in bn.iter_mut().enumerate() {
-                                let s = &packed_cur[bi * dim..(bi + 1) * dim];
-                                *n = s.iter().map(|v| v * v).sum::<f32>();
-                            }
-                            Some(&bn[..cur_n])
-                        } else {
-                            None
-                        };
-                        // sgemm_chunk itself only consumes base norms
-                        // on the L2 path — for IP / cosine it runs a
-                        // pure matmul. The proper-cosine path still
-                        // needs the norms for the *post-division*
-                        // below.
-                        let b_norms_for_sgemm = if use_ip { None } else { b_norms_slice };
-                        sgemm_chunk(
-                            q_packed, query_count,
-                            packed_cur, cur_n,
-                            dim,
-                            use_ip,
-                            if use_ip { None } else { Some(q_norms_ref) },
-                            b_norms_for_sgemm,
-                            scores_slice,
-                        );
-                        // Proper-cosine path: the scores matrix holds
-                        // raw dot products. Divide row-wise by
-                        // `|q[qi]| × |b[bi]|` so each entry becomes
-                        // cos_sim. Done in f32; accumulation order of
-                        // the norms themselves matches the L2 path.
-                        if proper_cosine {
-                            let bn = b_norms_slice.unwrap();
-                            for qi in 0..query_count {
-                                let q_mag = q_norms_ref[qi].sqrt().max(f32::MIN_POSITIVE);
-                                let row = &mut scores_slice[qi * cur_n..(qi + 1) * cur_n];
-                                for (bi, s) in row.iter_mut().enumerate() {
-                                    let b_mag = bn[bi].sqrt().max(f32::MIN_POSITIVE);
-                                    *s /= q_mag * b_mag;
-                                }
-                            }
-                        }
-                        // Per-query top-k + heap update. Each query
-                        // row is independent; rayon parallelizes.
-                        // We update the segment heaps sequentially
-                        // after rayon produces the per-row candidates
-                        // to avoid lock contention in the inner loop.
-                        use rayon::prelude::*;
-                        let row_results: Vec<(BinaryHeap<Neighbor>, f32)> = (0..query_count)
-                            .into_par_iter()
-                            .map(|qi| {
-                                let row = &scores_slice[qi * cur_n..(qi + 1) * cur_n];
-                                let mut heap: BinaryHeap<Neighbor> =
-                                    BinaryHeap::with_capacity(k + 1);
-                                let thr = topk_from_scores_into(
-                                    row, k, use_ip, cur_first,
-                                    seg_thr_ref[qi], &mut heap,
-                                );
-                                (heap, thr)
-                            })
-                            .collect();
-                        // Sequential merge of per-row candidates into
-                        // segment heaps + threshold update.
-                        for (qi, (cand_heap, _cand_thr)) in row_results.into_iter().enumerate() {
-                            for n in cand_heap.into_iter() {
-                                if n.distance < seg_thr_ref[qi] {
-                                    seg_heaps_ref[qi].push(n);
-                                    if seg_heaps_ref[qi].len() > k {
-                                        seg_heaps_ref[qi].pop();
-                                        seg_thr_ref[qi] = seg_heaps_ref[qi].peek().unwrap().distance;
-                                    } else if seg_heaps_ref[qi].len() == k {
-                                        seg_thr_ref[qi] = seg_heaps_ref[qi].peek().unwrap().distance;
-                                    }
-                                }
-                            }
-                        }
-                    });
-                });
-
-                if let Some(msg) = io_err.lock().unwrap().take() {
-                    return error_result(format!("seg {}: {}", seg_idx, msg), start);
-                }
-
-                if !is_last {
-                    std::mem::swap(&mut raw_a, &mut raw_b);
-                    std::mem::swap(&mut packed_a, &mut packed_b);
-                }
-                compute_progress += cur_n as u64;
-                pb.set_position(compute_progress);
-            }
+            compute_progress = compute_progress.saturating_add(seg_len as u64);
 
             // Collect per-segment heaps into absolute-indexed per_query
             // for cache write and global merge.

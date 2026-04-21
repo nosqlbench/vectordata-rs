@@ -2166,6 +2166,57 @@ default:
         assert_eq!(expanded[2].output_path().unwrap(), "base.mvec");
     }
 
+    /// Regression: when a per-profile step has no explicit `range`
+    /// option, expansion auto-injects one. The auto-injected range
+    /// must be `[0..base_count)` — NOT `[0..base_count + query_count)`.
+    /// Compute-knn reads from `extract-base`'s output which contains
+    /// only base vectors; adding query_count to the upper bound makes
+    /// it scan into the next sized profile's territory and (because
+    /// verify uses `base_count` as its boundary) produces phantom
+    /// neighbor indices that verify can't find. Caught only when this
+    /// test fired; previously the auto-injection branch was never
+    /// covered because every test set `range` explicitly upstream.
+    #[test]
+    fn test_expand_per_profile_auto_injects_range_without_query_count_offset() {
+        let profiles = test_profile_group(r#"
+default:
+  base_vectors: base.fvec
+5M:
+  base_count: 5000000
+"#);
+        let steps = vec![
+            make_per_profile_step(
+                "compute-knn", "compute knn-blas", vec![],
+                vec![
+                    ("base", "base.fvec"),
+                    ("query", "query.fvec"),
+                    ("indices", "neighbor_indices.ivecs"),
+                ],
+            ),
+        ];
+        let expanded = vectordata::dataset::expand_per_profile_steps(
+            steps, &profiles, /* query_count = */ 10_000,
+        );
+        // Find the 5M-expanded step and check its injected range.
+        let s = expanded.iter().find(|s| s.effective_id() == "compute-knn-5M")
+            .expect("expected compute-knn-5M expansion");
+        let range = s.options.get("range")
+            .and_then(|v| v.as_str())
+            .expect("expected auto-injected range option on sized step");
+        assert_eq!(
+            range, "[0..5000000)",
+            "auto-injected range must be [0..base_count); query_count must NOT be added"
+        );
+        // The default profile (no base_count) gets no `range` option.
+        let d = expanded.iter().find(|s| s.effective_id() == "compute-knn"
+            && s.profiles.iter().any(|p| p == "default"))
+            .expect("expected default-profile compute-knn");
+        assert!(
+            d.options.get("range").is_none(),
+            "default profile should not have an auto-injected range"
+        );
+    }
+
     #[test]
     fn test_expand_per_profile_auto_prefix() {
         // Test that bare filenames get auto-prefixed without ${profile_dir}

@@ -792,6 +792,7 @@ on `std::arch` alone, without SimSIMD, FAISS, or BLAS.
             ivec_path: PathBuf,
             fvec_path: PathBuf,
             cached: bool,
+            flip_sign: bool,
         }
 
         // Greedy chain build: at each position, prefer the largest
@@ -810,6 +811,7 @@ on `std::arch` alone, without SimSIMD, FAISS, or BLAS.
                     ivec_path: seg.ivec_path.clone(),
                     fvec_path: seg.fvec_path.clone(),
                     cached: true,
+                    flip_sign: seg.flip_sign,
                 });
                 pos = seg.end;
             } else {
@@ -819,6 +821,7 @@ on `std::arch` alone, without SimSIMD, FAISS, or BLAS.
                     ivec_path: build_cache_path(&ctx.cache, ENGINE_NAME, &cache_prefix, pos, pe, k, kernel_metric, "neighbors", "ivec"),
                     fvec_path: build_cache_path(&ctx.cache, ENGINE_NAME, &cache_prefix, pos, pe, k, kernel_metric, "distances", "fvec"),
                     cached: false,
+                    flip_sign: false,
                 });
                 pos = pe;
             }
@@ -869,7 +872,7 @@ on `std::arch` alone, without SimSIMD, FAISS, or BLAS.
             for (seg_idx, p) in plan.iter().enumerate() {
                 if !p.cached { continue; }
                 let seg = match load_segment_cache(
-                    &p.ivec_path, &p.fvec_path, k, query_count,
+                    &p.ivec_path, &p.fvec_path, k, query_count, p.flip_sign,
                 ) {
                     Ok(s) => s,
                     Err(e) => {

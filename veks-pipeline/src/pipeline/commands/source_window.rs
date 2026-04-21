@@ -98,45 +98,49 @@ pub fn resolve_source(source_str: &str, workspace: &Path) -> Result<ResolvedSour
 /// base file:
 ///
 /// 1. **Inline path window** — a user-typed source like `base.fvec[0..1M]`
-///    parses into `ResolvedSource.window`. This is the authoring-time
-///    form.
+///    parses into `ResolvedSource.window`. Typically expresses a
+///    file-level cap (e.g., the global `--base-fraction` subset).
 /// 2. **Injected `range` option** — for sized profiles, the expansion
 ///    logic in `vectordata::dataset::expansion` auto-injects a
-///    per-profile `range: "[0,base_end)"` option (see
-///    `expansion.rs:237-245`). This is the runtime form that each
-///    sized profile uses to window a shared base file.
+///    per-profile `range: "[0..base_count)"` option. Typically expresses
+///    a per-step cap that is narrower than (or equal to) the file cap.
 ///
-/// This helper consolidates the precedence across all KNN engines:
-/// inline wins when set, otherwise fall back to the `range` option,
-/// otherwise `None`.
-///
-/// Previously each engine open-coded the precedence; knn-metal had the
-/// full logic, knn-stdarch and knn-blas only read the inline form —
-/// which made sized profiles silently scan the full base. Factoring it
-/// here ensures every engine treats the upstream segment mapping the
-/// same way.
+/// **Both must be honored.** The effective window is the *intersection*
+/// of the two — narrowest start to narrowest end. Picking one over the
+/// other was the cause of sized-profile compute scanning past its
+/// declared `base_count` when the inline path also carried a global
+/// subset cap (`--base-fraction`): inline=`[0..N)` (the global subset)
+/// won over option=`[0..bc)` (the per-profile cap), so a 40m profile
+/// computed against the full 48m subset and wrote out-of-range
+/// neighbors that verify (correctly scoped to 40m) couldn't find.
 pub fn resolve_window(
     inline: Option<(usize, usize)>,
     range_option: Option<&str>,
 ) -> Option<(usize, usize)> {
-    if inline.is_some() { return inline; }
-    let r = range_option?;
-    let ds = parse_source_string(&format!("_dummy{}", r)).ok()?;
-    if ds.window.is_empty() { return None; }
-    // Skip empty intervals (`min == max`) and pick the first non-empty
-    // one. Defensive: callers historically wrote `"[0,N)"` which
-    // parse_window splits on `,` into [0,0) and [0,N), and naively
-    // taking window.0[0] picked up the empty [0,0). The injection
-    // path now uses `..`, but the helper stays robust regardless.
-    let interval = ds.window.0.iter()
-        .find(|i| i.max_excl > i.min_incl)?;
-    let start = interval.min_incl as usize;
-    let end = if interval.max_excl == u64::MAX {
-        usize::MAX
-    } else {
-        interval.max_excl as usize
-    };
-    Some((start, end))
+    let option = range_option.and_then(|r| {
+        let ds = parse_source_string(&format!("_dummy{}", r)).ok()?;
+        if ds.window.is_empty() { return None; }
+        // Skip empty intervals (`min == max`) and pick the first non-empty
+        // one. Defensive: callers historically wrote `"[0,N)"` which
+        // parse_window splits on `,` into [0,0) and [0,N), and naively
+        // taking window.0[0] picked up the empty [0,0). The injection
+        // path now uses `..`, but the helper stays robust regardless.
+        let interval = ds.window.0.iter()
+            .find(|i| i.max_excl > i.min_incl)?;
+        let start = interval.min_incl as usize;
+        let end = if interval.max_excl == u64::MAX {
+            usize::MAX
+        } else {
+            interval.max_excl as usize
+        };
+        Some((start, end))
+    });
+
+    match (inline, option) {
+        (Some((is, ie)), Some((os, oe))) => Some((is.max(os), ie.min(oe))),
+        (Some(w), None) | (None, Some(w)) => Some(w),
+        (None, None) => None,
+    }
 }
 
 /// Resolve a source path relative to the workspace.
@@ -223,5 +227,42 @@ mod tests {
         };
         assert_eq!(src.effective_range(10000), (1000, 5000));
         assert_eq!(src.effective_count(10000), 4000);
+    }
+
+    #[test]
+    fn test_resolve_window_intersection() {
+        // Inline window from `--base-fraction` subset = 48M.
+        // Per-profile range option from sized expansion = 40M.
+        // Effective window must be the intersection (0, 40M), so
+        // sized profiles never scan past their declared base_count.
+        let inline = Some((0usize, 48_184_495usize));
+        let range = Some("[0..40000000)");
+        assert_eq!(resolve_window(inline, range), Some((0, 40_000_000)));
+    }
+
+    #[test]
+    fn test_resolve_window_inline_only() {
+        let inline = Some((0usize, 48_184_495usize));
+        assert_eq!(resolve_window(inline, None), Some((0, 48_184_495)));
+    }
+
+    #[test]
+    fn test_resolve_window_option_only() {
+        let range = Some("[0..40000000)");
+        assert_eq!(resolve_window(None, range), Some((0, 40_000_000)));
+    }
+
+    #[test]
+    fn test_resolve_window_neither() {
+        assert_eq!(resolve_window(None, None), None);
+    }
+
+    #[test]
+    fn test_resolve_window_offset_intersection() {
+        // Non-zero starts on both sides — pick narrowest start (max)
+        // and narrowest end (min).
+        let inline = Some((100usize, 5_000usize));
+        let range = Some("[500..10000)");
+        assert_eq!(resolve_window(inline, range), Some((500, 5_000)));
     }
 }
