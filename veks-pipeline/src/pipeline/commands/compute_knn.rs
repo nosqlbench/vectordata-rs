@@ -1741,7 +1741,14 @@ fn execute_f32(
         format_bytes(query_bytes),
     ));
 
-    execute_with_partitions(
+    // Track top-(k + margin) per query through the partitioned scan
+    // so the canonical f64 rerank below has extra material to rerank.
+    // Cache files, partition outputs, and the pre-rerank merged ivec
+    // all carry internal_k entries per row; the post-pass collapses
+    // them to k.
+    let internal_k = super::knn_segment::internal_k(k).min(base_count);
+
+    let result = execute_with_partitions(
         &query_reader,
         &base_reader,
         base_offset,
@@ -1750,7 +1757,7 @@ fn execute_f32(
         base_dim,
         indices_path,
         distances_path,
-        k,
+        internal_k,
         metric,
         display_metric,
         dist_fn,
@@ -1763,7 +1770,37 @@ fn execute_f32(
         ctx,
         start,
         compute_partition,
-    )
+    );
+
+    // Canonical f64-direct rerank of the written top-(k+margin) →
+    // top-k. Every KNN engine ends its execute() with this post-pass
+    // so the on-disk ivec/fvec stores the `Σ((a − b) as f64)²`-ranked
+    // output every engine converges on — the reference against which
+    // cross-engine parity is measured. Only runs on the uncompressed
+    // output path; compressed cache contents are skipped (rerank
+    // would need a decompress/recompress round-trip).
+    if matches!(result.status, Status::Ok) && !compress_cache {
+        // Map simd_distance::Metric → knn_segment::Metric. L1 isn't
+        // canonicalizable this way (the helper only knows L2 / IP /
+        // cosine), so skip rerank there — L1 queries fall back to
+        // the engine-native output.
+        let canonical_metric = match metric {
+            Metric::L2 => Some(super::knn_segment::Metric::L2),
+            Metric::Cosine => Some(super::knn_segment::Metric::Cosine),
+            Metric::DotProduct => Some(super::knn_segment::Metric::DotProduct),
+            Metric::L1 => None,
+        };
+        if let Some(m) = canonical_metric {
+            if let Err(e) = super::knn_segment::rerank_output_post_pass(
+                indices_path, distances_path,
+                &base_reader, &query_reader,
+                m, k, base_offset,
+            ) {
+                ctx.ui.log(&format!("  rerank post-pass skipped: {}", e));
+            }
+        }
+    }
+    result
 }
 
 /// Execute KNN computation using f16 vectors.

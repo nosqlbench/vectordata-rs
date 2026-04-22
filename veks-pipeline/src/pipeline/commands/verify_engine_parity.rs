@@ -774,8 +774,17 @@ fn run_blas_mirror(
     const BS_X: usize = 4096; // FAISS distance_compute_blas_query_bs
     const BS_Y: usize = 1024; // FAISS distance_compute_blas_database_bs
 
+    // Pull top-(k + margin) candidates from sgemm, then f64-rerank
+    // down to the canonical top-k. Margin=3k empirically suffices
+    // for concentrated-distance uniform random at dim ≥ 4096 to
+    // catch sgemm's f32 ranking errors: the genuine top-k neighbor
+    // that sgemm misplaces is almost always within the top-4k
+    // window. Clamped so we never ask for more candidates than
+    // exist in the base.
+    let margin = (3 * k).min(n_base.saturating_sub(k));
+    let capacity = k + margin;
     let mut heaps: Vec<std::collections::BinaryHeap<Neighbor>> =
-        (0..n_query).map(|_| std::collections::BinaryHeap::with_capacity(k + 1)).collect();
+        (0..n_query).map(|_| std::collections::BinaryHeap::with_capacity(capacity + 1)).collect();
     let mut ip_block = vec![0f32; BS_X * BS_Y];
 
     let mut i0 = 0;
@@ -820,7 +829,7 @@ fn run_blas_mirror(
                     let mut dis = qn + bn - 2.0 * ip;
                     if dis < 0.0 { dis = 0.0; }
                     heaps[qi_global].push(Neighbor { index: bi_global as u32, distance: dis });
-                    if heaps[qi_global].len() > k {
+                    if heaps[qi_global].len() > capacity {
                         heaps[qi_global].pop();
                     }
                 }
@@ -831,15 +840,38 @@ fn run_blas_mirror(
         i0 = i1;
     }
 
-    // Emit ivec with per-query sorted top-k.
+    // Rerank every query's top-(k + margin) candidates through the
+    // shared f64-direct kernel to produce canonical top-k. This is
+    // what makes sgemm-path engines agree with direct-kernel engines
+    // on pathologically-concentrated fixtures where f32 sgemm's
+    // `‖a‖² + ‖b‖² − 2·a·b` computation puts boundary neighbors on
+    // the wrong side of the top-k cutoff.
+    let reranked: Vec<Vec<Neighbor>> = (0..n_query)
+        .map(|qi| {
+            let heap = std::mem::take(&mut heaps[qi]);
+            let cands: Vec<Neighbor> = heap.into_vec();
+            let q_start = qi * dim;
+            let query_slice = &query_data[q_start..q_start + dim];
+            super::knn_segment::rerank_topk_f64(
+                query_slice, &cands, k,
+                super::knn_segment::Metric::L2,
+                |idx| {
+                    let s = idx as usize * dim;
+                    if s + dim <= base_data.len() {
+                        Some(base_data[s..s + dim].to_vec())
+                    } else {
+                        None
+                    }
+                },
+            )
+        })
+        .collect();
+
+    // Emit ivec with per-query reranked top-k.
     let mut f = std::fs::File::create(out_path)
         .map_err(|e| format!("create {}: {}", out_path.display(), e))?;
     let dim_bytes = (k as i32).to_le_bytes();
-    for h in heaps.into_iter() {
-        let mut v: Vec<Neighbor> = h.into_vec();
-        v.sort_by(|a, b| a.distance.partial_cmp(&b.distance)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(a.index.cmp(&b.index)));
+    for v in reranked {
         f.write_all(&dim_bytes).map_err(|e| e.to_string())?;
         for j in 0..k {
             let idx = if j < v.len() { v[j].index as i32 } else { -1 };

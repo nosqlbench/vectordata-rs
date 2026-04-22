@@ -606,7 +606,7 @@ Reuses the shared segment-cache infrastructure:
   - Cross-profile cache reuse — smaller sibling profiles' published
     outputs drop in as `[0..N)` segments.
   - Mid-run resumability — each segment's per-query top-K is cached
-    in `<workspace>/.cache/knn-blas.v1.*` files.
+    in `<workspace>/.cache/knn-blas.v2.*` files.
   - Streaming pread — base vectors never enter the mmap address
     space during compute; I/O is double-buffered against sgemm
     compute.
@@ -741,9 +741,16 @@ Reuses the shared segment-cache infrastructure:
         let base_start = base_offset;
         let base_end = base_offset + base_n;
 
+        // Track top-(k + margin) candidates per query so the canonical
+        // f64 rerank post-pass has extra material to reorder. Cache
+        // files, segment merges, and the pre-rerank output ivec all
+        // store internal_k entries per row; the post-pass collapses
+        // them to k.
+        let internal_k = super::knn_segment::internal_k(k).min(base_n);
+
         ctx.ui.log(&format!(
-            "KNN-blas: {} queries × {} base, dim={}, k={}, metric={} (engine=BLAS sgemm)",
-            query_count, base_n, dim, k, metric_str,
+            "KNN-blas: {} queries × {} base, dim={}, k={} (internal {}), metric={} (engine=BLAS sgemm)",
+            query_count, base_n, dim, k, internal_k, metric_str,
         ));
 
         // ── Segment planning (shared with knn-stdarch) ──────────────
@@ -782,7 +789,7 @@ Reuses the shared segment-cache infrastructure:
         }
         let cache_prefix = cache_prefix_for(&base_path, &query_path);
         let cached_segments = scan_cached_segments(
-            &ctx.cache, ENGINE_NAME, &cache_prefix, k, kernel_metric, query_count,
+            &ctx.cache, ENGINE_NAME, &cache_prefix, internal_k, kernel_metric, query_count,
             &ctx.workspace, base_end, &ctx.ui,
         );
 
@@ -814,8 +821,8 @@ Reuses the shared segment-cache infrastructure:
                 let pe = (pos + segment_size).min(base_end);
                 plan.push(PlannedSegment {
                     start: pos, end: pe,
-                    ivec_path: build_cache_path(&ctx.cache, ENGINE_NAME, &cache_prefix, pos, pe, k, kernel_metric, "neighbors", "ivec"),
-                    fvec_path: build_cache_path(&ctx.cache, ENGINE_NAME, &cache_prefix, pos, pe, k, kernel_metric, "distances", "fvec"),
+                    ivec_path: build_cache_path(&ctx.cache, ENGINE_NAME, &cache_prefix, pos, pe, internal_k, kernel_metric, "neighbors", "ivec"),
+                    fvec_path: build_cache_path(&ctx.cache, ENGINE_NAME, &cache_prefix, pos, pe, internal_k, kernel_metric, "distances", "fvec"),
                     cached: false,
                     flip_sign: false,
                 });
@@ -831,9 +838,10 @@ Reuses the shared segment-cache infrastructure:
             .map(|p| p.end - p.start)
             .sum();
 
-        // Global per-query heaps, persisted across segments.
+        // Global per-query heaps, persisted across segments. Sized at
+        // internal_k so margin candidates survive into the rerank.
         let mut all_heaps: Vec<BinaryHeap<Neighbor>> = (0..query_count)
-            .map(|_| BinaryHeap::with_capacity(k + 1))
+            .map(|_| BinaryHeap::with_capacity(internal_k + 1))
             .collect();
         let mut all_thresholds: Vec<f32> = vec![f32::INFINITY; query_count];
 
@@ -868,7 +876,7 @@ Reuses the shared segment-cache infrastructure:
             let mut replayed_bytes: u64 = 0;
             for (seg_idx, p) in plan.iter().enumerate() {
                 if !p.cached { continue; }
-                let seg = match load_segment_cache(&p.ivec_path, &p.fvec_path, k, query_count, p.flip_sign) {
+                let seg = match load_segment_cache(&p.ivec_path, &p.fvec_path, internal_k, query_count, p.flip_sign) {
                     Ok(s) => s,
                     Err(e) => {
                         return error_result(
@@ -877,7 +885,7 @@ Reuses the shared segment-cache infrastructure:
                         );
                     }
                 };
-                merge_segment_into_heaps(&seg, &mut all_heaps, &mut all_thresholds, k);
+                merge_segment_into_heaps(&seg, &mut all_heaps, &mut all_thresholds, internal_k);
                 let ivec_sz = std::fs::metadata(&p.ivec_path).map(|m| m.len()).unwrap_or(0);
                 let fvec_sz = std::fs::metadata(&p.fvec_path).map(|m| m.len()).unwrap_or(0);
                 replayed_bytes += ivec_sz + fvec_sz;
@@ -961,7 +969,7 @@ Reuses the shared segment-cache infrastructure:
             // output is the delta this segment contributes; we merge
             // into global heaps at segment end.
             let mut seg_heaps: Vec<BinaryHeap<Neighbor>> = (0..query_count)
-                .map(|_| BinaryHeap::with_capacity(k + 1))
+                .map(|_| BinaryHeap::with_capacity(internal_k + 1))
                 .collect();
             let mut seg_thresholds: Vec<f32> = all_thresholds.clone();
 
@@ -985,7 +993,7 @@ Reuses the shared segment-cache infrastructure:
                 &query_norms_sq,
                 use_ip,
                 proper_cosine,
-                k,
+                internal_k,
                 &mut scan_buffers,
                 &mut seg_heaps,
                 &mut seg_thresholds,
@@ -1005,7 +1013,7 @@ Reuses the shared segment-cache infrastructure:
             if let Err(e) = write_segment_cache(
                 &plan[seg_idx].ivec_path,
                 &plan[seg_idx].fvec_path,
-                &per_query, k,
+                &per_query, internal_k,
             ) {
                 ctx.ui.log(&format!(
                     "  warning: segment {} cache write failed: {}",
@@ -1013,7 +1021,7 @@ Reuses the shared segment-cache infrastructure:
                 ));
             }
 
-            merge_segment_into_heaps(&per_query, &mut all_heaps, &mut all_thresholds, k);
+            merge_segment_into_heaps(&per_query, &mut all_heaps, &mut all_thresholds, internal_k);
 
             computed_count += 1;
             let seg_secs = seg_compute_start.elapsed().as_secs_f64();
@@ -1069,16 +1077,18 @@ Reuses the shared segment-cache infrastructure:
             },
             None => None,
         };
-        let dim_bytes = (k as i32).to_le_bytes();
+        // Write top-internal_k per query; the canonical f64-direct
+        // rerank below collapses each row to top-k.
+        let dim_bytes = (internal_k as i32).to_le_bytes();
         for row in &all_results {
             idx_file.write_all(&dim_bytes).map_err(|e| e.to_string()).unwrap();
-            for j in 0..k {
+            for j in 0..internal_k {
                 let idx: i32 = if j < row.len() { row[j].index as i32 } else { -1 };
                 idx_file.write_all(&idx.to_le_bytes()).map_err(|e| e.to_string()).unwrap();
             }
             if let Some(ref mut dw) = dist_file {
                 dw.write_all(&dim_bytes).map_err(|e| e.to_string()).unwrap();
-                for j in 0..k {
+                for j in 0..internal_k {
                     // Writer convention matches the stored cache:
                     // L2 writes L2sq (positive), IP/DOT/COSINE write
                     // -dot (the canonical "distance, smaller is better"
@@ -1098,10 +1108,25 @@ Reuses the shared segment-cache infrastructure:
         if let Some(ref mut dw) = dist_file {
             dw.flush().map_err(|e| e.to_string()).unwrap();
         }
+        drop(idx_file);
+        drop(dist_file);
 
         let mut produced = vec![indices_path.clone()];
         if let Some(ref dp) = distances_path {
             produced.push(dp.clone());
+        }
+
+        // Canonical f64-direct rerank — same post-pass every other
+        // KNN engine runs at execute end, so on-disk output across
+        // all engines is identical (canonical) for the same fixture.
+        if let Err(e) = super::knn_segment::rerank_output_post_pass(
+            indices_path.as_path(),
+            distances_path.as_deref(),
+            &base_reader,
+            &query_reader,
+            kernel_metric, k, base_offset,
+        ) {
+            ctx.ui.log(&format!("  rerank post-pass skipped: {}", e));
         }
 
         let elapsed = start.elapsed();
@@ -1371,7 +1396,7 @@ mod tests {
         let files_after_a: Vec<_> = std::fs::read_dir(&cache_dir).unwrap()
             .filter_map(|e| e.ok()).map(|e| e.path())
             .filter(|p| p.file_name().and_then(|s| s.to_str())
-                .map(|n| n.starts_with("knn-blas.v1.")).unwrap_or(false))
+                .map(|n| n.starts_with("knn-blas.v2.")).unwrap_or(false))
             .collect();
         assert_eq!(files_after_a.len(), 6,
             "profile A should have written 6 cache files (3 segments × ivec+fvec), got {}",
@@ -1416,7 +1441,7 @@ mod tests {
         let files_after_b: Vec<_> = std::fs::read_dir(&cache_dir).unwrap()
             .filter_map(|e| e.ok()).map(|e| e.path())
             .filter(|p| p.file_name().and_then(|s| s.to_str())
-                .map(|n| n.starts_with("knn-blas.v1.")).unwrap_or(false))
+                .map(|n| n.starts_with("knn-blas.v2.")).unwrap_or(false))
             .collect();
         assert_eq!(files_after_b.len(), 12,
             "expected 12 cache files (6 from A + 6 fresh from B), got {}",

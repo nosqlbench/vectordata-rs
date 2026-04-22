@@ -218,33 +218,47 @@ done
 `OPENBLAS_NUM_THREADS=1` + MKL/OMP siblings, set at the top of
 `execute`). Without that, FAISS's OpenMP-scheduled sgemm picks
 non-deterministic block-accumulation orders and the comparison
-becomes noise. With it, every row of the table is **100 EXACT** —
-bit-identical neighbor sets across all four engines.
+becomes noise. With it, **every row of the table is 100 EXACT**
+— bit-identical neighbor sets across all four engines — because
+every engine internally tracks top-(k + margin) candidates per
+query (where `margin = RERANK_MARGIN_RATIO · k = 3 · k`), then
+post-processes through a shared **f64-direct canonical rerank**
+(`knn_segment::rerank_output_post_pass`) that recomputes distances
+in f64 using `Σ(a−b)²` and selects the canonical top-k. The
+margin gives every engine enough boundary candidates that the
+sgemm-expansion path (`‖a‖² + ‖b‖² − 2·a·b`) and the direct path
+(`Σ(a−b)²`) both surface the same top-k after f64 rerank.
 
-EXACT count per engine against the metal (SimSIMD) reference:
+EXACT count per engine against the metal (SimSIMD) reference,
+format `stdarch / blas / faiss / blas-mirror`:
 
-| dim  | uniform            | gaussian           | clustered          |
-|------|--------------------|--------------------|--------------------|
-|   8  | stdarch=100 · blas=100 · faiss=100 · blas-mirror=100 | stdarch=100 · blas=100 · faiss=100 · blas-mirror=100 | stdarch=100 · blas=100 · faiss=100 · blas-mirror=100 |
-| 128  | 100 / 100 / 100 / 100 | 100 / 100 / 100 / 100 | 100 / 100 / 100 / 100 |
-| 384  | 100 / 100 / 100 / 100 | 100 / 100 / 100 / 100 | 100 / 100 / 100 / 100 |
-| 768  | 100 / 100 / 100 / 100 | 100 / 100 / 100 / 100 | 100 / 100 / 100 / 100 |
-| 1024 | 100 / 100 / 100 / 100 | 100 / 100 / 100 / 100 | 100 / 100 / 100 / 100 |
-| 2048 | 100 / 100 / 100 / 100 | 100 / 100 / 100 / 100 | 100 / 100 / 100 / 100 |
-| 4096 | 100 / **98** / **98** / **98** | 100 / 100 / 100 / 100 | 100 / 100 / 100 / 100 |
+| dim  | uniform                  | gaussian                  | clustered                 |
+|------|--------------------------|---------------------------|---------------------------|
+|    8 | 100 / 100 / 100 / 100    | 100 / 100 / 100 / 100     | 100 / 100 / 100 / 100     |
+|   32 | 100 / 100 / 100 / 100    | 100 / 100 / 100 / 100     | 100 / 100 / 100 / 100     |
+|  128 | 100 / 100 / 100 / 100    | 100 / 100 / 100 / 100     | 100 / 100 / 100 / 100     |
+|  384 | 100 / 100 / 100 / 100    | 100 / 100 / 100 / 100     | 100 / 100 / 100 / 100     |
+|  512 | 100 / 100 / 100 / 100    | 100 / 100 / 100 / 100     | 100 / 100 / 100 / 100     |
+|  768 | 100 / 100 / 100 / 100    | 100 / 100 / 100 / 100     | 100 / 100 / 100 / 100     |
+| 1024 | 100 / 100 / 100 / 100    | 100 / 100 / 100 / 100     | 100 / 100 / 100 / 100     |
+| 1536 | 100 / 100 / 100 / 100    | 100 / 100 / 100 / 100     | 100 / 100 / 100 / 100     |
+| 2048 | 100 / 100 / 100 / 100    | 100 / 100 / 100 / 100     | 100 / 100 / 100 / 100     |
+| 3072 | 100 / 100 / 100 / 100    | 100 / 100 / 100 / 100     | 100 / 100 / 100 / 100     |
+| 4096 | 100 / 100 / 100 / 100    | 100 / 100 / 100 / 100     | 100 / 100 / 100 / 100     |
 
-The single exception is `uniform, dim=4096`: stdarch/metal (direct
-`Σ(a−b)²`) agree on 100/100 but blas/faiss/blas-mirror (sgemm
-expansion `‖a‖² + ‖b‖² − 2·a·b`) each return 2 queries where the
-top-10 has a single differing neighbor — pure algebraic-form
-precision difference at the ULP boundary on random-uniform
-high-dim data. Any realistic embedding distribution (gaussian,
-clustered) avoids it, and real embedding data has even more
-structure.
+**100% EXACT parity across every dimension, every distribution,
+and every engine.** Uniform-random at dim=4096 — the most
+pathological synthetic case where pairwise distances concentrate
+to within a few-ULP window — is captured cleanly by the margin:
+even when the f32 sgemm and direct kernels disagree on which
+boundary candidate sits at rank 10, both forms hold all of the
+true top-10 within their respective top-(k + margin), and the
+f64 rerank promotes the correct ten regardless of how the f32
+arithmetic ordered them.
 
 ### The path to FAISS parity
 
-Three factors had to align for bit-identical output:
+Four factors had to align for bit-identical output:
 
 1. **Algebraic form** — all sgemm-path engines (blas, faiss,
    blas-mirror) use the expansion `‖a‖² + ‖b‖² − 2·a·b`; the direct
@@ -265,11 +279,28 @@ Three factors had to align for bit-identical output:
    caller — FAISS, our knn-blas, our blas-mirror — produces the same
    bytes. The parity command does this automatically via
    `OPENBLAS_NUM_THREADS`/`MKL_NUM_THREADS`/`OMP_NUM_THREADS`.
+4. **Top-(k + margin) internal tracking** — every engine sizes its
+   per-query heaps and its segment-cache rows at `internal_k = k ×
+   (1 + RERANK_MARGIN_RATIO)` (currently `4 · k`). Pulling extra
+   candidates out of each engine's f32 scan is what closes the
+   boundary-membership gap: even when an f32 sgemm and an f32
+   direct kernel disagree on *which* neighbor sits at rank 10,
+   both forms hold the true top-k within their top-(k + margin),
+   and the canonical rerank (next item) picks the same ten.
+5. **Canonical f64 rerank post-pass** — every `compute knn*` command
+   ends with a call to `knn_segment::rerank_output_post_pass` that
+   reads back its just-written top-(k + margin) ivec, recomputes
+   each candidate's distance in f64 using the direct `Σ(a−b)²`
+   form, and rewrites the file with the canonically-ordered top-k
+   (and matching f64-cast distances if the engine emitted a
+   distances fvec). This makes both the *membership* and the
+   *ordering* canonical across every engine and every fixture.
 
 The `blas-mirror` engine in `verify engine-parity` exists as the
 proof-of-concept for (2) — a ~100-line Rust function that
-reproduces FAISS's exact sgemm call pattern. Its 100% EXACT column
-in the table is the demonstration.
+reproduces FAISS's exact sgemm call pattern. Its 100% EXACT
+column in the table (matching every other engine across every
+dimension and distribution) is the demonstration.
 
 ### Performance note
 
@@ -289,7 +320,14 @@ In-tree unit tests:
   — asserts `diff == 0` (stdarch ≡ metal bit-identical across every
   dim/distribution/seed).
 - [`test_knn_faiss_matches_compute_knn`](../../veks-pipeline/src/pipeline/commands/compute_knn_faiss.rs)
-  — asserts `diff == 0` at dim=8.
+  — asserts `diff == 0` at dim=8 (post-rerank, the FAISS and metal
+  outputs share an identical canonical ranking).
+- [`test_metal_cache_reuse`](../../veks-pipeline/src/pipeline/commands/compute_knn.rs),
+  [`test_stdarch_cache_reuse`](../../veks-pipeline/src/pipeline/commands/compute_knn_stdarch.rs),
+  [`test_blas_cache_reuse`](../../veks-pipeline/src/pipeline/commands/compute_knn_blas.rs)
+  — assert each engine's segment cache filenames carry the
+  engine-specific `ENGINE_NAME` prefix and that a second run hits
+  the cache.
 
 Reproduce the full sweep:
 

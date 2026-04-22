@@ -33,7 +33,34 @@ use super::compute_knn::Neighbor;
 
 /// Cache-format version. Bump when the segment-compute algorithm
 /// changes in a way that would affect stored neighbors or distances.
-pub const CACHE_VERSION: &str = "v1";
+///
+/// v1 → v2: every engine now stores top-(k + RERANK_MARGIN_RATIO·k)
+/// candidates per query in segment caches and final output, rather
+/// than top-k. The canonical f64 rerank post-pass then reduces the
+/// per-query candidate set to top-k. v1 caches have only k entries
+/// per row and would size-mismatch v2's larger row layout.
+pub const CACHE_VERSION: &str = "v2";
+
+/// Multiplier for the rerank margin. Every engine internally tracks
+/// top-(k + RERANK_MARGIN_RATIO · k) candidates per query so the
+/// canonical f64 rerank post-pass has extra candidates to consider
+/// when the engine's f32 kernel mis-ranks a boundary neighbor. With
+/// `RERANK_MARGIN_RATIO = 3` the internal k is 4·user_k.
+///
+/// The 3× factor was chosen empirically: at uniform-random dim=4096
+/// (the most pathological synthetic case where pairwise distances
+/// concentrate to within a few-ULP window) margin=3·k is enough for
+/// every direct-kernel engine to surface the same top-k as the sgemm
+/// engines. Bump it if a future fixture pushes a genuine top-k
+/// candidate out of the top-(4·k) f32 window.
+pub const RERANK_MARGIN_RATIO: usize = 3;
+
+/// Returns the internal candidate count each engine should track per
+/// query: `k + RERANK_MARGIN_RATIO · k = (1 + RERANK_MARGIN_RATIO) · k`.
+/// Saturates on overflow (only relevant for absurdly large k).
+pub(super) fn internal_k(k: usize) -> usize {
+    k.saturating_add(k.saturating_mul(RERANK_MARGIN_RATIO))
+}
 
 /// Which distance metric a KNN engine is computing. Filename tokens
 /// (`cache_tag`) are stable across releases — changing them
@@ -488,6 +515,245 @@ pub(super) fn scan_cached_segments(
         ));
     }
     segments
+}
+
+/// Re-rank candidate neighbors using f64-direct arithmetic to produce
+/// the canonical top-k for a single query.
+///
+/// Why this is the canonical form: all our sgemm-path engines (BLAS,
+/// FAISS, blas-mirror) compute L2² via the expansion
+/// `‖a‖² + ‖b‖² − 2·a·b`, which has f32 catastrophic-cancellation
+/// risk on concentrated-distance data (curse-of-dim uniform random
+/// at high dim, or clustered data with tight within-cluster
+/// distances). The direct form `Σ(a−b)²` doesn't have that risk,
+/// and promoting the accumulation to f64 removes the residual
+/// single-pair f32 rounding too. Using this as the post-sort step
+/// across every engine guarantees bit-identical canonical output
+/// — the "right answer" that all engines agree on.
+///
+/// `candidates` should already hold the engine's top-`(k + margin)`
+/// guesses. `margin > 0` is what catches boundary misses — if an
+/// engine's f32 ranking puts a genuine top-k neighbor just outside
+/// its top-k window, it still appears in top-`(k + margin)`, and the
+/// f64 rerank elevates it. With `margin = 0` we only fix order
+/// within the engine's existing top-k set, which is enough when the
+/// engine's native scan was also k-exact (e.g. partitioned scanners
+/// that keep every visited candidate within k).
+///
+/// Result is sorted ascending by canonical distance with the same
+/// tiebreaker as [`Neighbor`]'s `Ord` impl (lower index wins on
+/// distance tie).
+pub(super) fn rerank_topk_f64<F>(
+    query: &[f32],
+    candidates: &[super::compute_knn::Neighbor],
+    k: usize,
+    metric: Metric,
+    mut get_base: F,
+) -> Vec<super::compute_knn::Neighbor>
+where
+    F: FnMut(u32) -> Option<Vec<f32>>,
+{
+    let q64: Vec<f64> = query.iter().map(|&x| x as f64).collect();
+
+    // Precompute query-side scalars the metric needs once.
+    let (qnorm_sq, qnorm): (f64, f64) = match metric {
+        Metric::L2 => (0.0, 0.0), // unused
+        Metric::DotProduct => (0.0, 0.0),
+        Metric::Cosine => {
+            let ns = q64.iter().map(|x| x * x).sum::<f64>();
+            (ns, ns.sqrt().max(f64::MIN_POSITIVE))
+        }
+    };
+    let _ = qnorm_sq;
+
+    let mut rescored: Vec<super::compute_knn::Neighbor> = Vec::with_capacity(candidates.len());
+    for c in candidates {
+        let base = match get_base(c.index) {
+            Some(v) => v,
+            None => continue,
+        };
+        if base.len() != query.len() {
+            continue;
+        }
+        let d64: f64 = match metric {
+            Metric::L2 => {
+                let mut acc = 0.0f64;
+                for i in 0..base.len() {
+                    let d = q64[i] - base[i] as f64;
+                    acc += d * d;
+                }
+                acc
+            }
+            Metric::DotProduct => {
+                // Engines store -dot as "distance" so smaller is
+                // better. Preserve that convention here.
+                let mut acc = 0.0f64;
+                for i in 0..base.len() {
+                    acc += q64[i] * base[i] as f64;
+                }
+                -acc
+            }
+            Metric::Cosine => {
+                let mut dot = 0.0f64;
+                let mut bn = 0.0f64;
+                for i in 0..base.len() {
+                    dot += q64[i] * base[i] as f64;
+                    bn += (base[i] as f64) * (base[i] as f64);
+                }
+                let denom = qnorm * bn.sqrt().max(f64::MIN_POSITIVE);
+                1.0 - dot / denom
+            }
+        };
+        rescored.push(super::compute_knn::Neighbor {
+            index: c.index,
+            distance: d64 as f32,
+        });
+    }
+
+    rescored.sort_by(|a, b| {
+        a.distance
+            .partial_cmp(&b.distance)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.index.cmp(&b.index))
+    });
+    rescored.truncate(k);
+    rescored
+}
+
+/// Post-pass that rewrites an engine's just-written ivec (and
+/// optionally distances fvec) with the canonical f64-direct ranking.
+///
+/// Why a post-pass and not in-line: every KNN engine has its own
+/// scan/merge architecture. A uniform post-pass that operates only
+/// on the engine's final top-k output (read back from disk) is the
+/// cheapest way to canonicalize every engine without restructuring
+/// each one's main loop. Each query becomes
+/// O((k + margin) × dim) f64 FMAs — trivial vs the full scan.
+///
+/// `margin` extra candidates per query are rerank-eligible; pass 0
+/// to only reorder within the engine's existing top-k. With
+/// `margin > 0`, the input ivec must already hold top-(k + margin)
+/// per row, otherwise we just have top-k to work with and the
+/// margin is implicitly truncated.
+///
+/// On error (mismatched dims, base too small, etc.) the original
+/// files are left untouched — atomic via `.tmp` + rename.
+pub(super) fn rerank_output_post_pass(
+    indices_path: &Path,
+    distances_path: Option<&Path>,
+    base_reader: &vectordata::io::MmapVectorReader<f32>,
+    query_reader: &vectordata::io::MmapVectorReader<f32>,
+    metric: Metric,
+    k: usize,
+    base_offset: usize,
+) -> Result<(), String> {
+    use std::io::{Read, Write};
+    use vectordata::VectorReader;
+
+    // Read the existing indices file. Each row is `[k_header:i32,
+    // i32 × k_header]`.
+    let mut idx_bytes = Vec::new();
+    std::fs::File::open(indices_path)
+        .map_err(|e| format!("open {}: {}", indices_path.display(), e))?
+        .read_to_end(&mut idx_bytes)
+        .map_err(|e| format!("read {}: {}", indices_path.display(), e))?;
+
+    if idx_bytes.is_empty() {
+        return Ok(()); // empty file — nothing to rerank
+    }
+
+    let header_k = i32::from_le_bytes([idx_bytes[0], idx_bytes[1], idx_bytes[2], idx_bytes[3]]) as usize;
+    let row_bytes = 4 + header_k * 4;
+    if idx_bytes.len() % row_bytes != 0 {
+        return Err(format!("indices file {} has unaligned size", indices_path.display()));
+    }
+    let n_rows = idx_bytes.len() / row_bytes;
+    let n_query = <vectordata::io::MmapVectorReader<f32> as VectorReader<f32>>::count(query_reader);
+    if n_rows != n_query {
+        return Err(format!(
+            "indices file rows={} but query reader has count={}",
+            n_rows, n_query));
+    }
+
+    // Parse rows → Vec<Vec<Neighbor>> with f32::INFINITY distance
+    // (we don't have the original distances at parse time — they get
+    // recomputed in the rerank).
+    let mut rows: Vec<Vec<super::compute_knn::Neighbor>> = Vec::with_capacity(n_rows);
+    for r in 0..n_rows {
+        let off = r * row_bytes;
+        let mut row = Vec::with_capacity(header_k);
+        for j in 0..header_k {
+            let p = off + 4 + j * 4;
+            let idx = i32::from_le_bytes([idx_bytes[p], idx_bytes[p+1], idx_bytes[p+2], idx_bytes[p+3]]);
+            if idx >= 0 {
+                row.push(super::compute_knn::Neighbor {
+                    index: idx as u32,
+                    distance: f32::INFINITY, // recomputed below
+                });
+            }
+        }
+        rows.push(row);
+    }
+
+    // Rerank each query's row. `base_offset` lets engines that
+    // store window-relative indices in ivec (like compute_knn.rs
+    // metal) still point the rerank at the correct base-reader
+    // slot; engines that store absolute indices pass `base_offset = 0`.
+    let reranked: Vec<Vec<super::compute_knn::Neighbor>> = rows.into_iter()
+        .enumerate()
+        .map(|(qi, cands)| {
+            let q = query_reader.get_slice(qi);
+            rerank_topk_f64(
+                q, &cands, k, metric,
+                |idx| Some(base_reader.get_slice(base_offset + idx as usize).to_vec()),
+            )
+        })
+        .collect();
+
+    // The ivec stores (possibly-window-relative) indices; rerank
+    // needs to map those back when writing. The helper already
+    // produces Neighbor.index matching the candidate input, so
+    // writes the same scheme back out (no shift needed — the index
+    // round-trips the caller's scheme).
+
+    // Atomically rewrite the indices file.
+    let dim_bytes = (k as i32).to_le_bytes();
+    let tmp_idx = indices_path.with_extension("rerank.tmp");
+    {
+        let mut f = std::fs::File::create(&tmp_idx)
+            .map_err(|e| format!("create {}: {}", tmp_idx.display(), e))?;
+        for row in &reranked {
+            f.write_all(&dim_bytes).map_err(|e| e.to_string())?;
+            for j in 0..k {
+                let idx = if j < row.len() { row[j].index as i32 } else { -1 };
+                f.write_all(&idx.to_le_bytes()).map_err(|e| e.to_string())?;
+            }
+        }
+    }
+    std::fs::rename(&tmp_idx, indices_path)
+        .map_err(|e| format!("rename {} → {}: {}", tmp_idx.display(), indices_path.display(), e))?;
+
+    // If the engine emitted distances, rewrite those too with the
+    // canonical f64-cast-to-f32 values that pair with the reranked
+    // indices.
+    if let Some(dp) = distances_path {
+        let tmp_dist = dp.with_extension("rerank.tmp");
+        {
+            let mut f = std::fs::File::create(&tmp_dist)
+                .map_err(|e| format!("create {}: {}", tmp_dist.display(), e))?;
+            for row in &reranked {
+                f.write_all(&dim_bytes).map_err(|e| e.to_string())?;
+                for j in 0..k {
+                    let d = if j < row.len() { row[j].distance } else { f32::INFINITY };
+                    f.write_all(&d.to_le_bytes()).map_err(|e| e.to_string())?;
+                }
+            }
+        }
+        std::fs::rename(&tmp_dist, dp)
+            .map_err(|e| format!("rename {} → {}: {}", tmp_dist.display(), dp.display(), e))?;
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

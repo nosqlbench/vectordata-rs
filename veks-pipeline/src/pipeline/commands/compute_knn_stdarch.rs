@@ -703,9 +703,18 @@ on `std::arch` alone, without SimSIMD, FAISS, or BLAS.
         } else {
             "pairwise"
         };
+
+        // Track top-(k + margin) per query so the canonical f64 rerank
+        // post-pass can recover boundary candidates the f32 kernel
+        // mis-ranks (curse-of-dim uniform random at high dim, etc.).
+        // Cache files, segment merges, and the pre-rerank output ivec
+        // all carry internal_k entries per row; the post-pass reduces
+        // them to k.
+        let internal_k = super::knn_segment::internal_k(k).min(base_n);
+
         ctx.ui.log(&format!(
-            "KNN-stdarch: {} queries × {} base, dim={}, k={}, metric={}, ISA={} ({}), threads={}",
-            query_count, base_n, dim, k, metric_str, isa_label, batch_label, threads));
+            "KNN-stdarch: {} queries × {} base, dim={}, k={} (internal {}), metric={}, ISA={} ({}), threads={}",
+            query_count, base_n, dim, k, internal_k, metric_str, isa_label, batch_label, threads));
 
         // ── Partitioned base-vector scan ────────────────────────────
         // Split base vectors into cache-friendly segments. All threads
@@ -751,9 +760,10 @@ on `std::arch` alone, without SimSIMD, FAISS, or BLAS.
 
         let chunk_size = (query_count + threads - 1) / threads;
 
-        // Per-query heaps persist across segments
+        // Per-query heaps persist across segments. Sized at internal_k
+        // so the post-rerank stage has margin candidates to choose from.
         let mut all_heaps: Vec<BinaryHeap<Neighbor>> = (0..query_count)
-            .map(|_| BinaryHeap::with_capacity(k + 1))
+            .map(|_| BinaryHeap::with_capacity(internal_k + 1))
             .collect();
         let mut all_thresholds = vec![f32::INFINITY; query_count];
 
@@ -778,7 +788,7 @@ on `std::arch` alone, without SimSIMD, FAISS, or BLAS.
         let base_end = base_offset + base_n;
 
         let cached_segments = scan_cached_segments(
-            &ctx.cache, ENGINE_NAME, &cache_prefix, k, kernel_metric, query_count,
+            &ctx.cache, ENGINE_NAME, &cache_prefix, internal_k, kernel_metric, query_count,
             &ctx.workspace, base_end, &ctx.ui,
         );
 
@@ -818,8 +828,8 @@ on `std::arch` alone, without SimSIMD, FAISS, or BLAS.
                 let pe = (pos + segment_size).min(base_end);
                 plan.push(PlannedSegment {
                     start: pos, end: pe,
-                    ivec_path: build_cache_path(&ctx.cache, ENGINE_NAME, &cache_prefix, pos, pe, k, kernel_metric, "neighbors", "ivec"),
-                    fvec_path: build_cache_path(&ctx.cache, ENGINE_NAME, &cache_prefix, pos, pe, k, kernel_metric, "distances", "fvec"),
+                    ivec_path: build_cache_path(&ctx.cache, ENGINE_NAME, &cache_prefix, pos, pe, internal_k, kernel_metric, "neighbors", "ivec"),
+                    fvec_path: build_cache_path(&ctx.cache, ENGINE_NAME, &cache_prefix, pos, pe, internal_k, kernel_metric, "distances", "fvec"),
                     cached: false,
                     flip_sign: false,
                 });
@@ -872,7 +882,7 @@ on `std::arch` alone, without SimSIMD, FAISS, or BLAS.
             for (seg_idx, p) in plan.iter().enumerate() {
                 if !p.cached { continue; }
                 let seg = match load_segment_cache(
-                    &p.ivec_path, &p.fvec_path, k, query_count, p.flip_sign,
+                    &p.ivec_path, &p.fvec_path, internal_k, query_count, p.flip_sign,
                 ) {
                     Ok(s) => s,
                     Err(e) => {
@@ -883,7 +893,7 @@ on `std::arch` alone, without SimSIMD, FAISS, or BLAS.
                         );
                     }
                 };
-                merge_segment_into_heaps(&seg, &mut all_heaps, &mut all_thresholds, k);
+                merge_segment_into_heaps(&seg, &mut all_heaps, &mut all_thresholds, internal_k);
                 let ivec_sz = std::fs::metadata(&p.ivec_path).map(|m| m.len()).unwrap_or(0);
                 let fvec_sz = std::fs::metadata(&p.fvec_path).map(|m| m.len()).unwrap_or(0);
                 replayed_bytes += ivec_sz + fvec_sz;
@@ -977,7 +987,7 @@ on `std::arch` alone, without SimSIMD, FAISS, or BLAS.
                     }
                 }
                 let heaps: Vec<BinaryHeap<Neighbor>> = (0..q_len)
-                    .map(|_| BinaryHeap::with_capacity(k + 1))
+                    .map(|_| BinaryHeap::with_capacity(internal_k + 1))
                     .collect();
                 // Seed thresholds from the global top-K accumulated by
                 // prior segments — lets us prune early on any base
@@ -1054,7 +1064,7 @@ on `std::arch` alone, without SimSIMD, FAISS, or BLAS.
                             scan_chunk_f32(
                                 sb, cur_n, cur_first, dim,
                                 queries_ref, subs_ref, offs_ref,
-                                k, dist_fn, batch_fn,
+                                internal_k, dist_fn, batch_fn,
                                 heaps_ref, thr_ref,
                             );
                         });
@@ -1099,7 +1109,7 @@ on `std::arch` alone, without SimSIMD, FAISS, or BLAS.
             if let Err(e) = write_segment_cache(
                 &plan[seg_idx].ivec_path,
                 &plan[seg_idx].fvec_path,
-                &per_query, k,
+                &per_query, internal_k,
             ) {
                 // Non-fatal: log and continue. A cache-write failure
                 // doesn't break correctness, just resumability for
@@ -1111,7 +1121,7 @@ on `std::arch` alone, without SimSIMD, FAISS, or BLAS.
             }
 
             // Merge segment results into global heaps.
-            merge_segment_into_heaps(&per_query, &mut all_heaps, &mut all_thresholds, k);
+            merge_segment_into_heaps(&per_query, &mut all_heaps, &mut all_thresholds, internal_k);
 
             computed_count += 1;
             let seg_secs = seg_compute_start.elapsed().as_secs_f64();
@@ -1162,13 +1172,15 @@ on `std::arch` alone, without SimSIMD, FAISS, or BLAS.
                 .unwrap_or_else(|_| panic!("create {}", dp.display()))
         });
 
-        let dim_bytes = (k as i32).to_le_bytes();
+        // Write top-internal_k per query to disk; the canonical
+        // f64-direct rerank below collapses each row to top-k.
+        let dim_bytes = (internal_k as i32).to_le_bytes();
         for qi in 0..query_count {
             idx_file.write_all(&dim_bytes).unwrap();
             if let Some(ref mut dw) = dist_file {
                 dw.write_all(&dim_bytes).unwrap();
             }
-            for j in 0..k {
+            for j in 0..internal_k {
                 if j < all_results[qi].len() {
                     let n = &all_results[qi][j];
                     idx_file.write_all(&(n.index as i32).to_le_bytes()).unwrap();
@@ -1185,9 +1197,25 @@ on `std::arch` alone, without SimSIMD, FAISS, or BLAS.
         }
         idx_file.flush().unwrap();
         if let Some(ref mut dw) = dist_file { dw.flush().unwrap(); }
+        drop(idx_file);
+        drop(dist_file);
 
         let mut produced = vec![indices_path.clone()];
         if let Some(ref dp) = distances_path { produced.push(dp.clone()); }
+
+        // Canonical f64-direct rerank of the written top-k. Every
+        // KNN engine ends its execute() with this post-pass so the
+        // ivec/fvec on disk is the engine-agnostic canonical
+        // ordering — same across stdarch / blas / faiss / metal.
+        if let Err(e) = super::knn_segment::rerank_output_post_pass(
+            indices_path.as_path(),
+            distances_path.as_deref(),
+            base_reader.as_ref(),
+            query_reader.as_ref(),
+            kernel_metric, k, base_offset,
+        ) {
+            ctx.ui.log(&format!("  rerank post-pass skipped: {}", e));
+        }
 
         let elapsed = start.elapsed();
         ctx.ui.log(&format!("  total: {:.2}s", elapsed.as_secs_f64()));
@@ -1487,20 +1515,26 @@ mod tests {
         assert_eq!(r.status, Status::Ok, "{}", r.message);
 
         // Three segments × two files each = six cache files at
-        // query_count * (4 + k*4) = 5 * (4 + 12) = 80 bytes each.
+        // query_count × (4 + internal_k × 4). internal_k =
+        // k × (1 + RERANK_MARGIN_RATIO) = 3 × 4 = 12, so the row size
+        // is 5 × (4 + 12 × 4) = 260 bytes.
         let cache_dir = tmp.path().join(".cache");
         let files: Vec<_> = std::fs::read_dir(&cache_dir).unwrap()
             .filter_map(|e| e.ok())
             .map(|e| e.path())
             .filter(|p| p.file_name().and_then(|s| s.to_str())
-                .map(|n| n.starts_with("knn-stdarch.v1.")).unwrap_or(false))
+                .map(|n| n.starts_with("knn-stdarch.v2.")).unwrap_or(false))
             .collect();
         assert_eq!(files.len(), 6,
             "expected 6 cache files (3 segments × ivec+fvec), got {}: {:?}",
             files.len(), files);
+        let expected_row_bytes = 4 + super::super::knn_segment::internal_k(3) * 4;
+        let expected_file_size = (5 * expected_row_bytes) as u64;
         for f in &files {
             let sz = std::fs::metadata(f).unwrap().len();
-            assert_eq!(sz, 80, "cache file {} has wrong size", f.display());
+            assert_eq!(sz, expected_file_size,
+                "cache file {} has wrong size (expected {} bytes)",
+                f.display(), expected_file_size);
         }
     }
 
@@ -1585,7 +1619,7 @@ mod tests {
             .filter_map(|e| e.ok())
             .map(|e| e.path())
             .filter(|p| p.file_name().and_then(|s| s.to_str())
-                .map(|n| n.starts_with("knn-stdarch.v1.")).unwrap_or(false))
+                .map(|n| n.starts_with("knn-stdarch.v2.")).unwrap_or(false))
             .collect();
         assert_eq!(files.len(), 6,
             "cache should be re-filled after partial-replay run, got {}", files.len());
@@ -1608,16 +1642,20 @@ mod tests {
         let (r2, _, _) = run_knn(tmp.path(), &base, &query, 30, 5, "L2", "k5");
         assert_eq!(r2.status, Status::Ok);
 
+        // Cache filenames embed `internal_k`, not the user-facing k,
+        // so filter by that (k=3 → internal_k=12, k=5 → internal_k=20).
+        let tag_k3 = format!(".k{}.", super::super::knn_segment::internal_k(3));
+        let tag_k5 = format!(".k{}.", super::super::knn_segment::internal_k(5));
         let cache_dir = tmp.path().join(".cache");
         let k3: Vec<_> = std::fs::read_dir(&cache_dir).unwrap()
             .filter_map(|e| e.ok()).map(|e| e.path())
             .filter(|p| p.file_name().and_then(|s| s.to_str())
-                .map(|n| n.contains(".k3.")).unwrap_or(false))
+                .map(|n| n.contains(&tag_k3)).unwrap_or(false))
             .collect();
         let k5: Vec<_> = std::fs::read_dir(&cache_dir).unwrap()
             .filter_map(|e| e.ok()).map(|e| e.path())
             .filter(|p| p.file_name().and_then(|s| s.to_str())
-                .map(|n| n.contains(".k5.")).unwrap_or(false))
+                .map(|n| n.contains(&tag_k5)).unwrap_or(false))
             .collect();
         assert_eq!(k3.len(), 4, "k=3 should have 2 segments × 2 files = 4; got {}", k3.len());
         assert_eq!(k5.len(), 4, "k=5 should have 2 segments × 2 files = 4; got {}", k5.len());
@@ -1644,7 +1682,7 @@ mod tests {
         let before: Vec<_> = std::fs::read_dir(&cache_dir).unwrap()
             .filter_map(|e| e.ok()).map(|e| e.path())
             .filter(|p| p.file_name().and_then(|s| s.to_str())
-                .map(|n| n.starts_with("knn-stdarch.v1.")).unwrap_or(false))
+                .map(|n| n.starts_with("knn-stdarch.v2.")).unwrap_or(false))
             .collect();
         assert_eq!(before.len(), 4, "expected 4 cache files after first run");
 
@@ -1660,7 +1698,7 @@ mod tests {
         let after: Vec<_> = std::fs::read_dir(&cache_dir).unwrap()
             .filter_map(|e| e.ok()).map(|e| e.path())
             .filter(|p| p.file_name().and_then(|s| s.to_str())
-                .map(|n| n.starts_with("knn-stdarch.v1.")).unwrap_or(false))
+                .map(|n| n.starts_with("knn-stdarch.v2.")).unwrap_or(false))
             .collect();
         // 4 from run-1 + 6 from run-2 (50/20 = 3 segments × 2 files)
         // — all coexist under disjoint cache-prefix keys.
@@ -1714,7 +1752,7 @@ mod tests {
         let files_after_a: Vec<_> = std::fs::read_dir(&cache_dir).unwrap()
             .filter_map(|e| e.ok()).map(|e| e.path())
             .filter(|p| p.file_name().and_then(|s| s.to_str())
-                .map(|n| n.starts_with("knn-stdarch.v1.")).unwrap_or(false))
+                .map(|n| n.starts_with("knn-stdarch.v2.")).unwrap_or(false))
             .collect();
         assert_eq!(files_after_a.len(), 6,
             "profile A should have written 6 cache files (3 segments × ivec+fvec), got {}",
@@ -1755,7 +1793,7 @@ mod tests {
         let files_after_b: Vec<_> = std::fs::read_dir(&cache_dir).unwrap()
             .filter_map(|e| e.ok()).map(|e| e.path())
             .filter(|p| p.file_name().and_then(|s| s.to_str())
-                .map(|n| n.starts_with("knn-stdarch.v1.")).unwrap_or(false))
+                .map(|n| n.starts_with("knn-stdarch.v2.")).unwrap_or(false))
             .collect();
         assert_eq!(files_after_b.len(), 12,
             "expected 12 cache files (6 from profile A + 6 fresh from profile B), got {}: {:?}",

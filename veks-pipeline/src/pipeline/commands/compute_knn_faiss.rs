@@ -272,18 +272,23 @@ Only f32 (fvec) inputs are supported.
         let n_chunks = (query_count + chunk_size - 1) / chunk_size;
         let evals = query_count as f64 * base_n as f64;
 
-        ctx.ui.log(&format!("  FAISS search: {} queries x {} base, k={} ({} batches)...",
-            query_count, base_n, k, n_chunks));
+        // Pull top-(k + margin) candidates so the canonical rerank
+        // post-pass has extra material to reorder; clamp to base size
+        // since FAISS errors on requesting more neighbors than vectors.
+        let internal_k = super::knn_segment::internal_k(k).min(base_n);
+
+        ctx.ui.log(&format!("  FAISS search: {} queries x {} base, k={} (internal {}, {} batches)...",
+            query_count, base_n, k, internal_k, n_chunks));
 
         let search_start = Instant::now();
         let pb = ctx.ui.bar(query_count as u64, "FAISS search");
-        let dim_bytes = (k as i32).to_le_bytes();
+        let dim_bytes = (internal_k as i32).to_le_bytes();
 
         for chunk_start in (0..query_count).step_by(chunk_size) {
             let chunk_end = (chunk_start + chunk_size).min(query_count);
             let chunk_data = &query_data[chunk_start * base_dim..chunk_end * base_dim];
 
-            let result = match index.search(chunk_data, k) {
+            let result = match index.search(chunk_data, internal_k) {
                 Ok(r) => r,
                 Err(e) => return error_result(
                     format!("FAISS search batch {}: {}", chunk_start / chunk_size, e), start),
@@ -296,8 +301,8 @@ Only f32 (fvec) inputs are supported.
                 if let Err(e) = idx_file.write_all(&dim_bytes) {
                     return error_result(format!("write indices: {}", e), start);
                 }
-                for j in 0..k {
-                    let label = result.labels[qi * k + j];
+                for j in 0..internal_k {
+                    let label = result.labels[qi * internal_k + j];
                     let idx: i32 = label.get().map(|v| v as i32).unwrap_or(-1);
                     if let Err(e) = idx_file.write_all(&idx.to_le_bytes()) {
                         return error_result(format!("write indices: {}", e), start);
@@ -309,8 +314,8 @@ Only f32 (fvec) inputs are supported.
                     if let Err(e) = dw.write_all(&dim_bytes) {
                         return error_result(format!("write distances: {}", e), start);
                     }
-                    for j in 0..k {
-                        let dist = result.distances[qi * k + j];
+                    for j in 0..internal_k {
+                        let dist = result.distances[qi * internal_k + j];
                         if let Err(e) = dw.write_all(&dist.to_le_bytes()) {
                             return error_result(format!("write distances: {}", e), start);
                         }
@@ -332,6 +337,32 @@ Only f32 (fvec) inputs are supported.
         if let Some(ref mut dw) = dist_file {
             if let Err(e) = dw.flush() {
                 return error_result(format!("flush distances: {}", e), start);
+            }
+        }
+        drop(idx_file);
+        drop(dist_file);
+
+        // Canonical f64-direct rerank pass — gives every engine the
+        // same ranking (and the same f64-cast distances) on top of
+        // whatever its own kernel produced. FAISS already treats
+        // COSINE as inner-product internally (assumes normalized
+        // inputs), so the rerank metric mirrors that mapping.
+        let rerank_metric = match metric_str.to_uppercase().as_str() {
+            "L2" => Some(super::knn_segment::Metric::L2),
+            "IP" | "DOT_PRODUCT" | "COSINE" => Some(super::knn_segment::Metric::DotProduct),
+            _ => None,
+        };
+        if let Some(m) = rerank_metric {
+            if let Err(e) = super::knn_segment::rerank_output_post_pass(
+                &indices_path,
+                distances_path.as_deref(),
+                &base_reader,
+                &query_reader,
+                m,
+                k,
+                base_offset,
+            ) {
+                ctx.ui.log(&format!("  rerank post-pass skipped: {}", e));
             }
         }
 
