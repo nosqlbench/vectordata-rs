@@ -309,6 +309,12 @@ impl DSProfileGroup {
         let templates = self.deferred_facet_templates.take();
         let entries = std::mem::take(&mut self.deferred_sized);
         let mut added = 0;
+        // Collect (count, name, profile) across all strategies first so we
+        // can insert them in ascending-size order. Otherwise the resulting
+        // profile list is grouped by strategy ("all of mul:, then fib:,
+        // then decade:") which interleaves sizes — e.g. 100k after 8mi —
+        // and that's what the user sees in `veks explore` and YAML.
+        let mut pending: Vec<(u64, String, DSProfile)> = Vec::new();
 
         for entry_str in &entries {
             // Interpolate variables
@@ -406,9 +412,20 @@ impl DSProfileGroup {
                         views: base_views,
                     }
                 };
-                self.profiles.insert(prof_name, merged);
-                added += 1;
+                pending.push((count, prof_name, merged));
             }
+        }
+
+        // Sort ascending by base_count, then by name as a tiebreaker for
+        // stability when two strategies emit the same size. Insert in
+        // sorted order; later inserts of the same name overwrite earlier
+        // ones (preserving prior duplicate-handling semantics — the
+        // larger-named or alphabetically-later one wins, but since they
+        // have the same count this is moot for display).
+        pending.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        for (_count, prof_name, merged) in pending {
+            self.profiles.insert(prof_name, merged);
+            added += 1;
         }
 
         added
@@ -2062,6 +2079,48 @@ sized: ["mul:1m/2"]
         assert_eq!(p1m.base_count.unwrap(), 1_000_000);
         assert!(p1m.view("base_vectors").is_some(),
             "sized profile should inherit base_vectors from default");
+    }
+
+    #[test]
+    fn test_deferred_expansion_sorts_across_strategies() {
+        // Multiple deferred entries from different generator strategies
+        // (decade, fib, mul, linear) must produce a single ordering by
+        // count, not "all decade then all fib then all mul". Otherwise
+        // the on-disk YAML and the TUI profile picker show 100k *after*
+        // 8m, which is what triggered this regression.
+        let yaml = r#"
+default:
+  maxk: 100
+  base_vectors: base.mvec
+sized: ["decade", "mul:1m/2", "linear:10m/10m"]
+"#;
+        let mut g: DSProfileGroup = serde_yaml::from_str(yaml).unwrap();
+        let vars = indexmap::IndexMap::new();
+        let added = g.expand_deferred_sized(&vars, 50_000_000);
+        assert!(added > 5, "expected multiple profiles, got {}", added);
+
+        // Inspect the IndexMap insertion order directly (not
+        // profile_names(), which sorts on read) — the goal is that the
+        // *stored* order is already sorted, so YAML emission and any
+        // direct iteration match.
+        let counts: Vec<u64> = g.profiles.iter()
+            .filter(|(n, _)| *n != "default")
+            .map(|(_, p)| p.base_count.unwrap_or(0))
+            .collect();
+        assert!(counts.windows(2).all(|w| w[0] <= w[1]),
+            "expanded sized profiles must be inserted in ascending count order, got {:?}",
+            counts);
+        // Sanity: 100k from decade really did precede 1m from mul.
+        let names: Vec<&str> = g.profiles.keys()
+            .map(|s| s.as_str())
+            .filter(|n| *n != "default")
+            .collect();
+        let pos_100k = names.iter().position(|n| *n == "100k");
+        let pos_1m = names.iter().position(|n| *n == "1m");
+        assert!(pos_100k.is_some() && pos_1m.is_some(),
+            "expected both 100k (decade) and 1m (mul) in {:?}", names);
+        assert!(pos_100k.unwrap() < pos_1m.unwrap(),
+            "100k must come before 1m in {:?}", names);
     }
 
     #[test]

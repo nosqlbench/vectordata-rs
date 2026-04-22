@@ -720,16 +720,27 @@ fn render_loop(
         flush_logs(&mut terminal, &pending_logs)?;
         flush_emits(&mut terminal, &pending_emits)?;
 
-        // Sample RPS from bar position deltas.
+        // Sample RPS from bar position deltas. The chart label uses the
+        // most-recent bar's unit, so we only sum deltas from bars sharing
+        // that unit — otherwise mixing e.g. vector-positions and profile-
+        // positions in the same total produces a number that's nonsense
+        // against either label (e.g. "1.6M profiles/s" when only ~140
+        // profiles exist in the run).
         let rps_dt = state.last_rps_sample.elapsed().as_secs_f64();
         if rps_dt >= 0.25 && !state.bar_order.is_empty() {
+            let chart_unit = state.bar_order.last()
+                .and_then(|id| state.bars.get(id))
+                .map(|b| b.unit.clone());
             let mut total_delta: u64 = 0;
             for id in &state.bar_order {
                 if let Some(bar) = state.bars.get(id) {
                     if bar.kind == ProgressKind::Bar {
                         let prev = state.prev_positions.get(id).copied().unwrap_or(0);
-                        total_delta += bar.position.saturating_sub(prev);
+                        let delta = bar.position.saturating_sub(prev);
                         state.prev_positions.insert(*id, bar.position);
+                        if chart_unit.as_deref() == Some(bar.unit.as_str()) {
+                            total_delta += delta;
+                        }
                     }
                 }
             }
