@@ -42,6 +42,22 @@ pub trait TypedVectorView: Send + Sync {
     fn get_f64(&self, index: usize) -> Option<Vec<f64>>;
     /// Read a single vector as f32.
     fn get_f32(&self, index: usize) -> Option<Vec<f32>>;
+    /// Read `count` consecutive vectors starting at `start` as f64.
+    ///
+    /// The default implementation simply loops `get_f64`, which is
+    /// correct but slow on cached/remote backends — each call pays the
+    /// chunk-validity check, mutex acquisition, and file-seek overhead.
+    /// Backends that can satisfy a contiguous range from a single
+    /// underlying read (e.g. one HTTP chunk fetch covering many vectors,
+    /// or a single mmap slice) should override this method.
+    fn get_f64_range(&self, start: usize, count: usize) -> Vec<Option<Vec<f64>>> {
+        (0..count).map(|i| self.get_f64(start + i)).collect()
+    }
+    /// Read `count` consecutive vectors starting at `start` as f32.
+    /// See [`get_f64_range`](Self::get_f64_range) for rationale.
+    fn get_f32_range(&self, start: usize, count: usize) -> Vec<Option<Vec<f32>>> {
+        (0..count).map(|i| self.get_f32(start + i)).collect()
+    }
     /// Prebuffer a range of vectors for fast subsequent access.
     fn prebuffer(&self, start: usize, end: usize) -> io::Result<()>;
     /// Returns true if all data is locally cached (mmap fast path).
@@ -406,6 +422,85 @@ impl TypedVectorView for CachedVectorView {
         Some(self.bytes_to_f32(&bytes))
     }
 
+    /// Batched range read. The default trait impl makes one channel
+    /// read per vector, which on a remote-backed view means up to one
+    /// HTTP chunk fetch per vector when the visible window crosses
+    /// chunk boundaries — a serial latency wall for any interactive
+    /// scrolling. This override issues a single contiguous read for
+    /// the whole range, so all overlapping chunks are fetched in
+    /// parallel by `fetch_chunks_parallel` and decoded once.
+    fn get_f64_range(&self, start: usize, count: usize) -> Vec<Option<Vec<f64>>> {
+        if count == 0 { return Vec::new(); }
+        let effective = count.min(self.window_count.saturating_sub(start));
+        if effective == 0 { return Vec::new(); }
+
+        // Promoted mmap path: defer to the local reader, which has its
+        // own (cheap) per-index path.
+        if let Ok(guard) = self.promoted.lock() {
+            if let Some(ref local) = *guard {
+                return (0..effective).map(|i| local.get_f64(start + i)).collect();
+            }
+        }
+
+        let bytes_per_vec = self.dim * self.element_type.element_size();
+        let file_index = self.window_start + start;
+        let entry_offset = (file_index * self.entry_size) as u64;
+        // The xvec layout is [u32 dim header | data | u32 dim header | data ...]
+        // for each entry. A contiguous range covers `count * entry_size`
+        // bytes including the per-entry headers — we just step over
+        // each header when slicing the resulting buffer.
+        let total_len = (effective * self.entry_size) as u64;
+        let buf = match self.channel.read(entry_offset, total_len) {
+            Ok(b) => b,
+            Err(_) => return vec![None; effective],
+        };
+
+        let mut out = Vec::with_capacity(effective);
+        for i in 0..effective {
+            let entry_start = i * self.entry_size + 4; // skip dim header
+            let entry_end = entry_start + bytes_per_vec;
+            if entry_end > buf.len() {
+                out.push(None);
+                continue;
+            }
+            out.push(Some(self.bytes_to_f64(&buf[entry_start..entry_end])));
+        }
+        out
+    }
+
+    fn get_f32_range(&self, start: usize, count: usize) -> Vec<Option<Vec<f32>>> {
+        if count == 0 { return Vec::new(); }
+        let effective = count.min(self.window_count.saturating_sub(start));
+        if effective == 0 { return Vec::new(); }
+
+        if let Ok(guard) = self.promoted.lock() {
+            if let Some(ref local) = *guard {
+                return (0..effective).map(|i| local.get_f32(start + i)).collect();
+            }
+        }
+
+        let bytes_per_vec = self.dim * self.element_type.element_size();
+        let file_index = self.window_start + start;
+        let entry_offset = (file_index * self.entry_size) as u64;
+        let total_len = (effective * self.entry_size) as u64;
+        let buf = match self.channel.read(entry_offset, total_len) {
+            Ok(b) => b,
+            Err(_) => return vec![None; effective],
+        };
+
+        let mut out = Vec::with_capacity(effective);
+        for i in 0..effective {
+            let entry_start = i * self.entry_size + 4;
+            let entry_end = entry_start + bytes_per_vec;
+            if entry_end > buf.len() {
+                out.push(None);
+                continue;
+            }
+            out.push(Some(self.bytes_to_f32(&buf[entry_start..entry_end])));
+        }
+        out
+    }
+
     fn prebuffer(&self, start: usize, end: usize) -> io::Result<()> {
         let file_start = self.window_start + start;
         let file_end = self.window_start + end.min(self.window_count);
@@ -510,5 +605,67 @@ mod tests {
         // Window extends beyond file
         let view = LocalVectorView::open(&path, Some((90, 50))).unwrap();
         assert_eq!(view.count(), 10); // clamped to 100 - 90
+    }
+
+    /// In-memory transport for the cached-view range-read test.
+    struct MemTransport(Vec<u8>);
+    impl crate::transport::ChunkedTransport for MemTransport {
+        fn fetch_range(&self, start: u64, len: u64) -> io::Result<Vec<u8>> {
+            let s = start as usize;
+            let e = s + len as usize;
+            Ok(self.0[s..e].to_vec())
+        }
+        fn content_length(&self) -> io::Result<u64> { Ok(self.0.len() as u64) }
+        fn supports_range(&self) -> bool { true }
+    }
+
+    fn fvec_buffer(dim: u32, count: u32) -> Vec<u8> {
+        let mut buf = Vec::new();
+        for i in 0..count {
+            buf.extend_from_slice(&(dim as i32).to_le_bytes());
+            for j in 0..dim {
+                let val = (i * dim + j) as f32;
+                buf.extend_from_slice(&val.to_le_bytes());
+            }
+        }
+        buf
+    }
+
+    #[test]
+    fn test_cached_view_get_f64_range_matches_per_index() {
+        // Build a small fvec, wrap it in CachedChannel via MemTransport,
+        // then verify the optimized batch read returns the same vectors
+        // a per-index loop would. Uses a chunk_size that forces the
+        // range to span multiple chunks so the batched single-channel
+        // read exercises the multi-chunk fetch path.
+        let dim = 4u32;
+        let count = 50u32;
+        let buf = fvec_buffer(dim, count);
+        let chunk_size = 64u64; // ~3 vectors per chunk
+        let mref = crate::merkle::MerkleRef::from_content(&buf, chunk_size);
+        let dir = tempfile::tempdir().unwrap();
+        let transport = Box::new(MemTransport(buf.clone()));
+        let channel = CachedChannel::open(transport, mref, dir.path(), "test.fvec").unwrap();
+        let view = CachedVectorView::new(
+            channel,
+            dir.path().join("test.fvec"),
+            VecElementType::F32,
+            None,
+        ).unwrap();
+
+        let want: Vec<Vec<f64>> = (0..10)
+            .map(|i| view.get_f64(i).unwrap())
+            .collect();
+        let got = view.get_f64_range(0, 10);
+        assert_eq!(got.len(), want.len());
+        for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+            let g = g.as_ref().unwrap_or_else(|| panic!("missing {i}"));
+            assert_eq!(g, w, "row {i}");
+        }
+        // First vector should be [0, 1, 2, 3] per fvec_buffer.
+        assert_eq!(got[0].as_ref().unwrap(), &vec![0.0, 1.0, 2.0, 3.0]);
+        // Range that runs past the end is clamped, not panicked.
+        let tail = view.get_f64_range(48, 10);
+        assert_eq!(tail.len(), 2);
     }
 }

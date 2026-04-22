@@ -375,6 +375,14 @@ pub(super) fn run_interactive_explore(
     let mut loadings_band_size: usize = 0;   // 0 = auto-fit to terminal height
     let mut loadings_scroll: usize = 0;      // vertical scroll offset (band index)
     let mut eigen_sub_mode: usize = 0;       // 0=scree, 1=cumvar, 2=log decay
+    // Color palette + intensity curve for the 4D/5D PCA scatter, where
+    // PC4 drives point hue. Default to Turbo — its 9-stop perceptual
+    // ramp keeps every bin sharply distinct, which is exactly what the
+    // 4D scatter needs to make the PC4 dimension read clearly. Press
+    // `p` to cycle to other palettes (BlueOrange etc) when sign-aware
+    // diverging is more useful.
+    let mut palette = super::palette::Palette::Turbo;
+    let mut curve = super::palette::Curve::Linear;
 
     // ── Computation state (persists across restarts — old data stays visible) ──
     let mut compute_start;
@@ -430,26 +438,55 @@ pub(super) fn run_interactive_explore(
             let mut batch_norms: Vec<f64> = Vec::with_capacity(batch_size);
             let mut batch_count = 0;
 
-            for &idx in &indices_clone {
-                if let Some(v) = bg_reader.get_f32(idx) {
-                    let norm_sq = <f32 as SpatialSimilarity>::dot(&v, &v).unwrap_or(0.0);
-                    batch_norms.push((norm_sq as f64).sqrt());
-                    batch_vecs.extend_from_slice(&v);
-                    batch_count += 1;
+            // Group indices into contiguous runs and serve each run with
+            // a single range read. For Streaming (one big run) and
+            // Clumped (many small runs) sample modes this collapses
+            // O(N) per-vector channel reads into O(runs) — which on a
+            // remote-backed view is the difference between O(N) HTTP
+            // round trips and O(runs) parallel chunk fetches.
+            //
+            // Sparse mode produces no contiguous runs, so each "run" is
+            // length 1 and behaviour matches the old per-index loop.
+            let mut i = 0usize;
+            while i < indices_clone.len() {
+                let run_start = indices_clone[i];
+                let mut run_end = i + 1;
+                while run_end < indices_clone.len()
+                    && indices_clone[run_end] == indices_clone[run_end - 1] + 1 {
+                    run_end += 1;
                 }
-                if batch_count >= batch_size {
-                    let stats = bg_reader.cache_stats();
-                    let _ = read_tx.send(ReadBatch {
-                        vectors: std::mem::take(&mut batch_vecs),
-                        norms: std::mem::take(&mut batch_norms),
-                        count: batch_count,
-                        cache_stats: stats,
-                    });
-                    batch_vecs = Vec::with_capacity(batch_size * dim_copy);
-                    batch_norms = Vec::with_capacity(batch_size);
-                    batch_count = 0;
+                let run_len = run_end - i;
+
+                let vecs = if run_len > 1 {
+                    bg_reader.get_f32_range(run_start, run_len)
+                } else {
+                    vec![bg_reader.get_f32(run_start)]
+                };
+
+                for opt in vecs {
+                    if let Some(v) = opt {
+                        let norm_sq = <f32 as SpatialSimilarity>::dot(&v, &v).unwrap_or(0.0);
+                        batch_norms.push((norm_sq as f64).sqrt());
+                        batch_vecs.extend_from_slice(&v);
+                        batch_count += 1;
+                    }
+                    if batch_count >= batch_size {
+                        let stats = bg_reader.cache_stats();
+                        let _ = read_tx.send(ReadBatch {
+                            vectors: std::mem::take(&mut batch_vecs),
+                            norms: std::mem::take(&mut batch_norms),
+                            count: batch_count,
+                            cache_stats: stats,
+                        });
+                        batch_vecs = Vec::with_capacity(batch_size * dim_copy);
+                        batch_norms = Vec::with_capacity(batch_size);
+                        batch_count = 0;
+                    }
                 }
+
+                i = run_end;
             }
+
             if batch_count > 0 {
                 let stats = bg_reader.cache_stats();
                 let _ = read_tx.send(ReadBatch {
@@ -934,7 +971,7 @@ pub(super) fn run_interactive_explore(
                     chunks[1],
                 );
             } else { match view_mode {
-                V_PCA => render_pca_scatter(frame, chunks[1], &projected, rot_y, rot_x, rot_z, rot_w, &pc_axes, 4),
+                V_PCA => render_pca_scatter(frame, chunks[1], &projected, rot_y, rot_x, rot_z, rot_w, &pc_axes, 4, palette, curve),
                 V_DIMDIST => {
                     let n = vectors_loaded;
                     if n > 0 && dim > 0 && selected_dim < dim {
@@ -1145,6 +1182,16 @@ pub(super) fn run_interactive_explore(
                             pc_axes[1] = pc_axes[2];
                             pc_axes[2] = pc_axes[3];
                             pc_axes[3] = tmp;
+                        }
+                        // p / f: palette and curve cycling, mirroring the
+                        // values grid. Available only on the PCA scatter
+                        // since that's the only unified view that maps a
+                        // continuous quantity (PC4) to color.
+                        KeyCode::Char('p') if view_mode == V_PCA => {
+                            palette = palette.next();
+                        }
+                        KeyCode::Char('f') if view_mode == V_PCA => {
+                            curve = curve.next();
                         }
                         KeyCode::Char('X') if view_mode == V_PCA => {
                             let tmp = pc_axes[3];
@@ -1612,6 +1659,7 @@ fn render_pca_scatter(
     frame: &mut ratatui::Frame, area: ratatui::layout::Rect,
     projected: &[[f64; 5]], rot_y: f64, rot_x: f64, rot_z: f64, rot_w: f64,
     pc_axes: &[usize; 5], dims: usize,
+    palette: super::palette::Palette, curve: super::palette::Curve,
 ) {
     if projected.is_empty() {
         let title = format!(" {}D Scatter ", dims);
@@ -1661,23 +1709,53 @@ fn render_pca_scatter(
             .paint(move |ctx| { ctx.draw(&Points { coords: &pts, color: Color::Green }); });
         frame.render_widget(canvas, area);
     } else {
-        // 4D/5D: color by PC4
+        // 4D/5D: color by PC4 using the user-selected palette + curve.
+        // Bin into BIN_COUNT slots and pick a 24-bit RGB sample per bin
+        // — finer than the old 5-color discrete ramp, and accessibility-
+        // tuned (default palette is color-blind safe).
+        const BIN_COUNT: usize = 16;
         let pc4_min = rotated.iter().map(|p| p.2).fold(f64::INFINITY, f64::min);
         let pc4_max = rotated.iter().map(|p| p.2).fold(f64::NEG_INFINITY, f64::max);
         let pc4_range = (pc4_max - pc4_min).max(1e-10);
-        let colors = [Color::Blue, Color::Cyan, Color::Green, Color::Yellow, Color::Red];
-        let mut bins: Vec<Vec<(f64, f64)>> = vec![Vec::new(); 5];
+        let bin_colors: Vec<Color> = (0..BIN_COUNT)
+            .map(|i| {
+                // Map bin index to t ∈ [0,1] at the bin's center.
+                let t = (i as f64 + 0.5) / BIN_COUNT as f64;
+                // Sequential palettes (Turbo, Spectrum, Cividis) want
+                // the raw t — folding around 0.5 would collapse half
+                // the gradient onto the other and kill the contrast
+                // they exist to provide. Diverging palettes (BlueRed
+                // etc.) keep the fold so both sides spread out from
+                // neutral, with the curve reshaping the magnitude.
+                let shaped = if palette.is_sequential() {
+                    curve.apply(t)
+                } else {
+                    let signed = (t - 0.5) * 2.0;
+                    let mag = curve.apply(signed.abs());
+                    if signed >= 0.0 { 0.5 + 0.5 * mag } else { 0.5 - 0.5 * mag }
+                };
+                let (r, g, b) = palette.sample(shaped);
+                Color::Rgb(r, g, b)
+            })
+            .collect();
+        let mut bins: Vec<Vec<(f64, f64)>> = vec![Vec::new(); BIN_COUNT];
         for p in &rotated {
             let t = ((p.2 - pc4_min) / pc4_range).clamp(0.0, 0.9999);
-            bins[(t * 5.0) as usize].push((p.0, p.1));
+            bins[(t * BIN_COUNT as f64) as usize].push((p.0, p.1));
         }
-        let title = if dims == 4 { " 4D Scatter — PC4→color " } else { " 5D Scatter — PC4→color PC5→brightness " };
+        let title = if dims == 4 {
+            format!(" 4D Scatter — PC4→color · palette={} · curve={} · p/f to cycle ",
+                palette.label(), curve.label())
+        } else {
+            format!(" 5D Scatter — PC4→color PC5→brightness · palette={} · curve={} ",
+                palette.label(), curve.label())
+        };
         let canvas = Canvas::default()
             .block(Block::default().borders(Borders::ALL).title(title))
             .x_bounds([x_min - x_pad, x_max + x_pad]).y_bounds([y_min - y_pad, y_max + y_pad])
             .paint(move |ctx| {
                 for (i, bin) in bins.iter().enumerate() {
-                    if !bin.is_empty() { ctx.draw(&Points { coords: bin, color: colors[i] }); }
+                    if !bin.is_empty() { ctx.draw(&Points { coords: bin, color: bin_colors[i] }); }
                 }
             });
         frame.render_widget(canvas, area);

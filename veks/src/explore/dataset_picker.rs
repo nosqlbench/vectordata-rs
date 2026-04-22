@@ -246,11 +246,43 @@ fn format_bytes(n: u64) -> String {
     else { format!("{} B", n) }
 }
 
+/// Format a vector count for the picker's SIZE column.
+///
+/// Profile names use `m` (10⁶) and `mi` (2²⁰) as distinct suffixes — a
+/// `1mi` profile holds 1,048,576 vectors, not 1,000,000 — so the SIZE
+/// column must preserve that distinction, not collapse both onto `M`.
+/// The magnitude tier is chosen by raw value (so 2.5M doesn't degrade
+/// to 2500K), and within that tier the IEC variant wins iff the count
+/// is an exact power-of-2 multiple; otherwise it falls back to SI with
+/// one decimal.
 fn format_count(n: u64) -> String {
-    if n >= 1_000_000_000 { format!("{:.1}B", n as f64 / 1e9) }
-    else if n >= 1_000_000 { format!("{:.1}M", n as f64 / 1e6) }
-    else if n >= 1_000 { format!("{:.1}K", n as f64 / 1e3) }
-    else { n.to_string() }
+    const KI: u64 = 1 << 10;
+    const MI: u64 = 1 << 20;
+    const GI: u64 = 1 << 30;
+    const K: u64 = 1_000;
+    const M: u64 = 1_000_000;
+    const B: u64 = 1_000_000_000;
+
+    // (tier_threshold, iec_unit, iec_label, si_unit, si_label) from
+    // largest to smallest. The first tier whose threshold `n` clears
+    // determines the unit family.
+    let tiers: [(u64, u64, &str, u64, &str); 3] = [
+        (B, GI, "Gi", B, "B"),
+        (M, MI, "Mi", M, "M"),
+        (K, KI, "Ki", K, "K"),
+    ];
+    for (threshold, iec, iec_label, si, si_label) in tiers {
+        if n >= threshold {
+            if n % iec == 0 {
+                return format!("{}{}", n / iec, iec_label);
+            } else if n % si == 0 {
+                return format!("{}{}", n / si, si_label);
+            } else {
+                return format!("{:.1}{}", n as f64 / si as f64, si_label);
+            }
+        }
+    }
+    n.to_string()
 }
 
 fn matches_filter(row: &PickerRow, filter: &str) -> bool {
@@ -660,4 +692,32 @@ pub fn run_picker() -> Option<String> {
     let _ = disable_raw_mode();
     let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_count;
+
+    #[test]
+    fn format_count_iec_vs_si() {
+        // Decimal-mega counts render as "M".
+        assert_eq!(format_count(1_000_000), "1M");
+        assert_eq!(format_count(2_000_000), "2M");
+        assert_eq!(format_count(13_000_000), "13M");
+        // Mebi (2^20) counts render as "Mi" — these are what `1mi`,
+        // `2mi`, `8mi`, `16mi` profiles produce, and were previously
+        // mis-shown as 1.0M / 2.1M / 8.4M / 16.8M.
+        assert_eq!(format_count(1 << 20), "1Mi");
+        assert_eq!(format_count(2 << 20), "2Mi");
+        assert_eq!(format_count(4 << 20), "4Mi");
+        assert_eq!(format_count(8 << 20), "8Mi");
+        assert_eq!(format_count(16 << 20), "16Mi");
+        // Gibi vs giga.
+        assert_eq!(format_count(1_000_000_000), "1B");
+        assert_eq!(format_count(1 << 30), "1Gi");
+        // Off-grid values fall back to one-decimal SI.
+        assert_eq!(format_count(2_500_000), "2.5M");
+        // Counts below the K threshold render verbatim.
+        assert_eq!(format_count(42), "42");
+    }
 }

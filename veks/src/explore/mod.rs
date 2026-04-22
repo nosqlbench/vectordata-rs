@@ -11,7 +11,9 @@
 pub mod shared;
 mod data_shell;
 mod dataset_picker;
+mod palette;
 mod unified;
+mod values_grid;
 
 use std::path::PathBuf;
 
@@ -66,6 +68,25 @@ pub enum ExploreCommand {
         /// Trailing args passed as command options
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
+    },
+    /// Scrollable raw-values grid: ordinals × dimensions, with sig-digit
+    /// control and 24-bit-color heatmap.
+    Values {
+        /// Dataset from catalog (e.g., img-search or img-search:default)
+        #[arg(long, group = "input")]
+        dataset: Option<String>,
+        /// Any data source: local file path or dataset:profile:facet
+        #[arg(long, group = "input")]
+        source: Option<String>,
+        /// Profile name (used with --dataset; overrides profile in dataset:profile)
+        #[arg(long)]
+        profile: Option<String>,
+        /// First ordinal to display
+        #[arg(long, default_value = "0")]
+        start: u64,
+        /// Initial significant-digit count (1–6)
+        #[arg(long, default_value = "4")]
+        digits: u8,
     },
 }
 
@@ -136,6 +157,28 @@ pub fn run(args: ExploreArgs) {
                         }
                     }
                     unified::ExploreExit::Back => break, // no picker to go back to
+                }
+            }
+        }
+        ExploreCommand::Values { dataset, source, profile, start, digits } => {
+            let from_picker = dataset.is_none() && source.is_none();
+            let mut src = match resolve_input(dataset, source, profile) {
+                Some(s) => s,
+                None => match dataset_picker::run_picker() {
+                    Some(s) => s,
+                    None => { std::process::exit(0); }
+                },
+            };
+            loop {
+                match values_grid::run(&src, start as usize, digits) {
+                    values_grid::Exit::Quit => break,
+                    values_grid::Exit::Back if from_picker => {
+                        match dataset_picker::run_picker() {
+                            Some(s) => { src = s; }
+                            None => break,
+                        }
+                    }
+                    values_grid::Exit::Back => break,
                 }
             }
         }

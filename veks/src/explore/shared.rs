@@ -90,6 +90,21 @@ impl UnifiedReader {
     pub(super) fn get_f32(&self, index: usize) -> Option<Vec<f32>> {
         match self { UnifiedReader::Local(r) => r.get_f32(index), UnifiedReader::Remote(r) => r.get_f32(index) }
     }
+    /// Batched range read; lets remote-backed views satisfy the whole
+    /// visible window of the values grid in a single HTTP-fetch round
+    /// instead of `count` serialized round trips.
+    pub(super) fn get_f64_range(&self, start: usize, count: usize) -> Vec<Option<Vec<f64>>> {
+        match self {
+            UnifiedReader::Local(r)  => r.get_f64_range(start, count),
+            UnifiedReader::Remote(r) => r.get_f64_range(start, count),
+        }
+    }
+    pub(super) fn get_f32_range(&self, start: usize, count: usize) -> Vec<Option<Vec<f32>>> {
+        match self {
+            UnifiedReader::Local(r)  => r.get_f32_range(start, count),
+            UnifiedReader::Remote(r) => r.get_f32_range(start, count),
+        }
+    }
     pub(super) fn cache_stats(&self) -> Option<vectordata::dataset::view::CacheStats> {
         match self {
             UnifiedReader::Local(_) => None,
@@ -293,6 +308,17 @@ impl AnyVectorReader {
         }
     }
 
+    /// Range read of `count` vectors as f64. mmap-backed, so it just
+    /// loops single-vector reads — local files are I/O-cheap and the
+    /// trait-level batch path exists primarily to amortize remote
+    /// (HTTP-cached) chunk fetches.
+    pub(super) fn get_f64_range(&self, start: usize, count: usize) -> Vec<Option<Vec<f64>>> {
+        (0..count).map(|i| self.get_f64(start + i)).collect()
+    }
+    pub(super) fn get_f32_range(&self, start: usize, count: usize) -> Vec<Option<Vec<f32>>> {
+        (0..count).map(|i| self.get_f32(start + i)).collect()
+    }
+
     /// Create from a LoadedDataset's base_vectors view.
     ///
     /// Wraps the dataset so the AnyVectorReader can be used uniformly
@@ -317,6 +343,18 @@ impl AnyDatasetReader {
     }
     pub(super) fn get_f32(&self, index: usize) -> Option<Vec<f32>> {
         self.0.base_vectors()?.get_f32(index)
+    }
+    pub(super) fn get_f64_range(&self, start: usize, count: usize) -> Vec<Option<Vec<f64>>> {
+        match self.0.base_vectors() {
+            Some(v) => v.get_f64_range(start, count),
+            None    => vec![None; count],
+        }
+    }
+    pub(super) fn get_f32_range(&self, start: usize, count: usize) -> Vec<Option<Vec<f32>>> {
+        match self.0.base_vectors() {
+            Some(v) => v.get_f32_range(start, count),
+            None    => vec![None; count],
+        }
     }
 }
 
