@@ -10,51 +10,90 @@ cargo install --path veks
 
 ## Commands
 
-### analyze
+The CLI is organized into a few top-level categories. Most commands
+are also reachable directly without the category prefix (`veks run`
+is shorthand for `veks prepare run`).
 
-Inspect and characterize vector data files.
+| Category | What it does |
+|----------|--------------|
+| `veks datasets` | Browse, search, and cache datasets from configured catalogs |
+| `veks prepare`  | Bootstrap, import, stratify, run pipelines, publish |
+| `veks pipeline` | Run a single pipeline command directly (the building blocks) |
+| `veks interact` | Interactive TUIs for exploring vector data |
 
-```sh
-veks analyze describe base.fvec
-```
+### datasets
 
-### bulkdl
-
-Bulk file downloader driven by a YAML config with token expansion and parallel downloads.
-
-```sh
-veks bulkdl downloads.yaml --concurrency 4
-```
-
-### convert
-
-Convert vector data between formats (fvec, ivec, bvec, dvec, mvec, svec, npy, parquet, slab).
+Discover and cache datasets from configured catalogs.
 
 ```sh
-veks convert --source base.npy --target base.fvec
+veks datasets list
+veks datasets prebuffer --dataset sift1m
+veks datasets cache-status --dataset sift1m
+veks datasets probe https://example.com/datasets/sift1m
+veks datasets drop-cache --dataset sift1m
+veks datasets config show           # cache directory + mounts
 ```
 
-### import
+### prepare
 
-Import source data into preferred internal format by facet type. Automatically selects the output format based on what the data represents (vectors → xvec, indices → ivec, metadata → slab).
+End-to-end dataset preparation. The wizard infers facets, generates
+a `dataset.yaml` with a complete pipeline DAG, and stratifies into
+multi-scale sized profiles when the dataset is large enough.
 
 ```sh
-veks import --dataset ./my-dataset --facet base_vectors --source raw/base.npy
+veks bootstrap -i                    # interactive wizard
+veks bootstrap -y                    # accept defaults
+veks run                             # execute pipeline
+veks run --dry-run
+veks run --clean
+veks check                           # pre-flight readiness checks
+veks publish                         # push to S3 / catalog
+veks stratify --strata "decade"      # add sized profiles after the fact
+veks cache-gc                        # remove orphaned cache files
+veks cache-compress                  # gzip eligible cache artifacts
 ```
 
-### run
+Sized profiles live under the root-level `strata:` block in
+`dataset.yaml`. Available generator strategies:
 
-Execute a multi-step pipeline defined in `dataset.yaml`. Pipelines are DAG-ordered with skip-if-fresh semantics, variable interpolation, and dry-run support.
+| Strategy        | Effect |
+|-----------------|--------|
+| `<size>`            | Single literal size (e.g. `100k`) |
+| `step:<lo>..<hi>/<step>` | Arithmetic range with explicit step |
+| `parts:<lo>..<hi>/<n>`   | Range divided into `n` equal segments |
+| `mul:<lo>..<hi>/<factor>` | Geometric progression by `factor` (upper bound optional) |
+| `fib:<lo>`          | Fibonacci progression starting at `lo`, capped at `base_count` |
+| `linear:<lo>/<step>` | Open-ended arithmetic, capped at `base_count` |
+| `decade`            | 100k, 200k, … 900k, 1m, 2m, … one detent per decimal click |
+
+See [docs/sysref/01-data-model.md](../docs/sysref/01-data-model.md)
+for the full strata spec.
+
+### interact
+
+Interactive TUIs for poking at vector data — open by name from a
+catalog or by file path.
+
+| Command | What it does |
+|---------|--------------|
+| `interact explore` | Norms, distances, eigenvalues, PCA in one TUI; tab-switchable views |
+| `interact shell`   | REPL: `info`, `get`, `range`, `head`, `tail`, `dist`, `norm`, `stats` |
+| `interact values`  | Scrollable raw-values grid: ordinals × dimensions, decimal-aligned, with 24-bit-color heatmap, sig-digit control, L2-norm column, and L2-normalized view toggle |
 
 ```sh
-veks run dataset.yaml
-veks run dataset.yaml --dry-run
-veks run dataset.yaml --clean
+veks interact explore --dataset sift1m
+veks interact values  --source ./data/base.fvec --start 0 --digits 4
+veks interact shell   --source ./data/base.fvec "info; range 0 5"
 ```
+
+See the [Explore tutorial](../docs/tutorials/explore-vector-data.md)
+for the full keybinding sheet (vim hjkl/HJKL navigation, palette/curve
+cycling, color-blind-safe palettes, Turbo / Spectrum scatter palettes).
 
 ### pipeline
 
-Execute individual pipeline commands directly, with full shell tab-completion.
+Run an individual pipeline command directly, with full shell
+tab-completion. Use this when scripting outside the DAG runner.
 
 ```sh
 veks pipeline analyze stats --source=test.fvec
@@ -62,24 +101,26 @@ veks pipeline compute knn --base=base.fvec --queries=query.fvec --k=100
 veks pipeline generate vectors --dimension=128 --count=10000 --output=base.fvec
 ```
 
-Available command groups:
+Pipeline command groups (run `veks pipeline <group> --help` for the
+list of subcommands in each):
 
-| Group | Commands |
-|-------|----------|
-| **analyze** | check-endian, compare, describe, explore, find, flamegraph, histogram, model-diff, plot, profile, select, slice, stats, verify-knn, verify-profiles, zeros |
-| **catalog** | generate |
-| **cleanup** | cleanfvec |
-| **compute** | knn, sort |
-| **config** | init, list-mounts, show |
-| **convert** | file |
-| **datasets** | cache, curlify, list, plan, prebuffer |
-| **fetch** | dlhf |
-| **generate** | dataset, derive, from-model, fvec-extract, ivec-extract, ivec-shuffle, predicated, sketch, vectors |
-| **import** | facet |
-| **info** | compute, file |
-| **json** | jjq, rjq |
-| **merkle** | create, diff, path, spoilbits, spoilchunks, summary, treeview, verify |
-| **slab** | analyze, append, check, explain, export, get, import, inspect, namespaces, rewrite |
+| Group | What it does |
+|-------|--------------|
+| `analyze`   | Inspect / characterize / verify vector data and datasets |
+| `catalog`   | Build catalog index files (`generate`, `stats`) |
+| `cleanup`   | Remove overlapping query vectors |
+| `compute`   | Brute-force KNN engines (stdarch / BLAS / metal), filtered KNN, partition profiles, predicate evaluation |
+| `download`  | Bulk file downloader, HuggingFace fetcher |
+| `generate`  | Synthetic data — vectors, datasets, metadata, predicates, shuffles, sketches |
+| `merkle`    | Create / verify / diff / spoil merkle trees |
+| `pipeline`  | DAG primitives (`require`) |
+| `query`     | jq-like queries against JSON or slab records |
+| `state`     | Pipeline variable management (`set`, `clear`) |
+| `transform` | Convert formats, extract records, normalize / filter for knn_utils parity |
+| `verify`    | Cross-engine, knn_utils-parity, predicate, and partition verification |
+
+The full subcommand list is dense and changes often — `veks pipeline
+--help` is the source of truth.
 
 ### completions
 
