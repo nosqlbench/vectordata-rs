@@ -91,6 +91,7 @@ pub mod transform_normalize_knnutils;
 pub mod transform_remove_zeros_knnutils;
 #[cfg(feature = "knnutils")]
 pub mod verify_dataset_knnutils;
+pub mod verify_engine_parity;
 pub mod verify_knn;
 pub mod verify_predicates;
 pub mod verify_predicates_sqlite;
@@ -206,6 +207,7 @@ pub fn register_all(registry: &mut CommandRegistry) {
     #[cfg(feature = "knnutils")]
     registry.register("verify dataset-knnutils", verify_dataset_knnutils::factory);
     // verify knn-groundtruth: per-profile, default is SimSIMD (metal)
+    registry.register("verify engine-parity", verify_engine_parity::factory);
     registry.register("verify knn-groundtruth", verify_knn::factory);
     registry.register("verify predicate-results", verify_predicates::factory);
     // verify knn-consolidated: uses the sgemm kernel (same as compute

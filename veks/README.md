@@ -2,6 +2,35 @@
 
 A CLI for bulk processing of vector datasets used in approximate nearest neighbor (ANN) benchmarking. Veks handles the full lifecycle — downloading source data, converting between formats, importing into canonical layouts, computing ground truth, and analyzing results.
 
+## Verified against FAISS and numpy
+
+Ground truth produced by `veks` is held to a numerical parity
+guarantee against the Python `knn_utils` reference (FAISS + numpy).
+Four KNN engines (`knn-metal` / SimSIMD, `knn-stdarch`, `knn-blas`,
+`knn-faiss`) are cross-verified at the unit-test level and the
+`verify dataset-knnutils` pipeline command re-runs FAISS on a
+sampled subset of every published dataset to catch regressions.
+See the [conformance section](../docs/sysref/12-knn-utils-verification.md#127-cross-engine-conformance-testing)
+for the comparison model and a per-test breakdown.
+
+**Live demo** — runs every available engine on the same input and
+prints a side-by-side comparison:
+
+```sh
+veks pipeline verify engine-parity --synthetic \
+  --dim 32 --base-count 500 --query-count 20 --neighbors 5
+```
+
+In-tree test runs:
+
+```sh
+cargo test -p veks-pipeline --lib pipeline::commands::compute_knn
+cargo test -p veks-pipeline --features knnutils,faiss \
+  --lib pipeline::commands::compute_knn
+cargo test -p veks-pipeline --features knnutils \
+  --lib pipeline::commands::verify_dataset_knnutils
+```
+
 ## Installation
 
 ```sh

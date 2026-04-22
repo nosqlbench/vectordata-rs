@@ -777,11 +777,17 @@ mod tests {
         assert_eq!(simsimd_rows.len(), faiss_rows.len(), "different query counts");
 
         for q in 0..simsimd_rows.len() {
+            // Single-threaded fixture (dim=8, 100 base, 10 queries,
+            // k=5) — both engines should produce *identical* neighbor
+            // sets. Boundary slack is for the multi-threaded BLAS
+            // rounding regime in production datasets, not for unit
+            // tests at this scale. A single differing neighbor here
+            // would be a real regression.
             let ss_set: HashSet<i32> = simsimd_rows[q].iter().copied().collect();
             let ff_set: HashSet<i32> = faiss_rows[q].iter().copied().collect();
             let diff = ss_set.symmetric_difference(&ff_set).count();
-            assert!(diff <= 2,
-                "query {}: SimSIMD neighbors {:?} vs FAISS {:?} — {} differ (max 2 boundary allowed)",
+            assert_eq!(diff, 0,
+                "query {}: SimSIMD neighbors {:?} vs FAISS {:?} — {} differ (expected 0)",
                 q, &simsimd_rows[q], &faiss_rows[q], diff);
         }
     }

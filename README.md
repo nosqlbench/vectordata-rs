@@ -26,6 +26,40 @@ Local files and remote catalogs use the same API. Uniform vectors
 and variable-length records use the same API. You never pick an
 implementation — just call `open_vec` or `open_vvec` and go.
 
+## Verified against FAISS and numpy
+
+Ground truth produced by vectordata-rs is held to a numerical
+parity guarantee against the Python `knn_utils` reference (FAISS +
+numpy). Four independent KNN engines — SimSIMD (`knn-metal`), pure
+`std::arch` (`knn-stdarch`), BLAS sgemm (`knn-blas`), and FAISS
+(`knn-faiss`) — are cross-verified at the unit-test level (asserting
+*zero* differing neighbors on deterministic fixtures) and re-checked
+end-to-end before every dataset is published. See the
+[KNN engine conformance section](./docs/sysref/12-knn-utils-verification.md#127-cross-engine-conformance-testing)
+for observed numbers and the two degenerate regimes where a small
+boundary tolerance is justified.
+
+**See it live in 5 seconds** — `veks pipeline verify engine-parity`
+runs every available engine on the same fixture and prints a
+side-by-side neighbor table plus a pair-wise classification:
+
+```sh
+cargo install --features knnutils,faiss --path veks
+veks pipeline verify engine-parity --synthetic \
+  --dim 32 --base-count 500 --query-count 20 --neighbors 5
+```
+
+Engines you didn't compile show up as `skipped: feature not enabled`.
+Run the in-tree conformance suite as well:
+
+```sh
+cargo test -p veks-pipeline --lib pipeline::commands::compute_knn
+cargo test -p veks-pipeline --features knnutils,faiss \
+  --lib pipeline::commands::compute_knn
+cargo test -p veks-pipeline --features knnutils \
+  --lib pipeline::commands::verify_dataset_knnutils
+```
+
 ---
 
 ## What's in the box

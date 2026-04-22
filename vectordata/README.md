@@ -5,6 +5,11 @@ Typed access to vector search benchmark datasets by name.
 Find datasets in configured catalogs, discover profiles and facets,
 and read vectors — all without constructing URLs or managing files.
 
+Datasets consumed through this crate carry ground truth that has
+been numerically cross-verified against FAISS and the Python
+`knn_utils` reference (numpy + FAISS) — see the
+[KNN engine conformance section](../docs/sysref/12-knn-utils-verification.md#127-cross-engine-conformance-testing).
+
 ## Quick Start
 
 ```rust

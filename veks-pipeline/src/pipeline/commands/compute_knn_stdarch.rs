@@ -1340,12 +1340,20 @@ mod tests {
         let stdarch_rows = read_ivec_rows(&tmp.path().join("stdarch.ivec"));
         let metal_rows = read_ivec_rows(&tmp.path().join("metal.ivec"));
 
+        // We expect *exact* set equality for the deterministic
+        // single-threaded fixture (dim=8, 100 base, 10 queries, k=5).
+        // Boundary slack would be a defensive allowance for the
+        // multi-threaded BLAS rounding regime — irrelevant here. If
+        // this assertion ever loosens to allow even one differing
+        // neighbor, that's a real regression worth investigating, not
+        // a tolerance to widen.
         for q in 0..stdarch_rows.len() {
             let sa: HashSet<i32> = stdarch_rows[q].iter().copied().collect();
             let mt: HashSet<i32> = metal_rows[q].iter().copied().collect();
             let diff = sa.symmetric_difference(&mt).count();
-            assert!(diff <= 2,
-                "query {}: stdarch {:?} vs metal {:?} — {} differ", q, &stdarch_rows[q], &metal_rows[q], diff);
+            assert_eq!(diff, 0,
+                "query {}: stdarch {:?} vs metal {:?} — {} differ (expected 0)",
+                q, &stdarch_rows[q], &metal_rows[q], diff);
         }
     }
 

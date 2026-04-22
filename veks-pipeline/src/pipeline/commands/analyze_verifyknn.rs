@@ -131,8 +131,16 @@ fn find_true_top_k(
     base_end: usize,
     k: usize,
     metric: DistanceMetric,
+    inner_bar: Option<&veks_core::ui::ProgressHandle>,
 ) -> Vec<Neighbor> {
     let mut heap = BinaryHeap::with_capacity(k + 1);
+
+    // Tick the inner bar in chunks. Once per base vector would dominate
+    // run time on a billion-vector scan; once per ~1M strikes a balance
+    // between meaningful progress signal and negligible overhead, since
+    // the bar's own renderer is throttled to ~250–500ms anyway.
+    const TICK_EVERY: usize = 1_000_000;
+    let mut since_tick = 0usize;
 
     for i in base_offset..base_end {
         let base_vec = match base_reader.get(i) {
@@ -157,6 +165,17 @@ fn find_true_top_k(
                 });
             }
         }
+
+        since_tick += 1;
+        if since_tick >= TICK_EVERY {
+            if let Some(bar) = inner_bar {
+                bar.inc(since_tick as u64);
+            }
+            since_tick = 0;
+        }
+    }
+    if let Some(bar) = inner_bar {
+        if since_tick > 0 { bar.inc(since_tick as u64); }
     }
 
     let mut result: Vec<Neighbor> = heap.into_vec();
@@ -359,6 +378,16 @@ impl CommandOp for AnalyzeVerifyKnnOp {
         // header line until the entire verification finishes —
         // potentially many hours for large base × query combos.
         let pb = ctx.ui.bar_with_unit(n_queries as u64, "verifying queries", "queries");
+        // Inner progress bar: base vectors scanned for the *current*
+        // query. At billion-vector scale a single brute-force scan
+        // takes minutes, so without this users see no feedback between
+        // outer-bar ticks. The inner bar gets its position reset to 0
+        // before each query.
+        let inner_bar = ctx.ui.bar_with_unit(
+            n_base as u64,
+            format!("scanning base for query {}", range_start),
+            "base vectors",
+        );
         let mut pass_count = 0usize;
         let mut fail_count = 0usize;
         let verify_start = std::time::Instant::now();
@@ -384,8 +413,16 @@ impl CommandOp for AnalyzeVerifyKnnOp {
                 Err(e) => return error_result(e, start),
             };
 
+            // Reset the inner bar for this query and update its label
+            // so the user can see which query is currently scanning.
+            inner_bar.set_position(0);
+            inner_bar.set_message(format!("scanning base for query {}", qi));
+
             // Compute true neighbors (within window)
-            let true_neighbors = find_true_top_k(&query_vec, &base_reader, base_offset, base_end, k, metric);
+            let true_neighbors = find_true_top_k(
+                &query_vec, &base_reader, base_offset, base_end, k, metric,
+                Some(&inner_bar),
+            );
 
             // Compare: check overlap of index sets
             let true_set: std::collections::HashSet<u32> =
