@@ -43,7 +43,7 @@ use std::thread;
 ///    single-threaded per worker; decoders below this number leave
 ///    cores idle and slow the whole pipeline.
 ///
-/// 16 sits at the sweet spot for the IBM-scale workload: ~64 EBS
+/// 16 sits at the sweet spot for the billion-vector workload: ~64 EBS
 /// reads contributed by decoders (well under the productive knee) +
 /// enough CPU parallelism to keep the local-NVMe write side fed.
 /// Memory is not the bottleneck — 16 × 360 MiB ≈ 6 GiB resident is
@@ -1866,8 +1866,8 @@ mod natural_cmp_tests {
     }
 
     #[test]
-    fn ibm_datapile_pattern() {
-        // Reproduce the IBM datapile naming: 0..7433 unpadded.
+    fn unpadded_numeric_part_pattern() {
+        // Reproduce a real-world unpadded sequential file naming: 0..7433 unpadded.
         let names: Vec<String> = (0..15).map(|i| format!("{}.parquet", i)).collect();
         let mut shuffled = names.clone();
         shuffled.sort();  // lexicographic puts 10 before 2

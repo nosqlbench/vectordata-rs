@@ -685,7 +685,7 @@ profiles:
         // Bootstrap-generated structured form: `profiles.sized` is a
         // mapping with `ranges` + `facets` keys, not a flat list.
         let dataset_yaml = r#"
-name: ibm-datapile-1b
+name: example-1b
 profiles:
   default:
     maxk: 100
@@ -705,7 +705,7 @@ profiles:
         std::fs::write(
             tmp.path().join("variables.yaml"),
             "combined_bq: 'false'\n\
-             dataset_name: ibm-datapile-1b\n\
+             dataset_name: example-1b\n\
              distance_function: DOT_PRODUCT\n\
              is_self_search: 'false'\n\
              is_shuffled: 'false'\n\

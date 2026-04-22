@@ -1,0 +1,114 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1400 1000" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif">
+<defs>
+  <linearGradient id="bgGrad" x1="0" y1="0" x2="0" y2="1">
+    <stop offset="0%"  stop-color="#0f172a"/>
+    <stop offset="100%" stop-color="#1e293b"/>
+  </linearGradient>
+  <linearGradient id="accentGrad" x1="0" y1="0" x2="1" y2="0">
+    <stop offset="0%"  stop-color="#06b6d4"/>
+    <stop offset="100%" stop-color="#3b82f6"/>
+  </linearGradient>
+  <filter id="glow" x="-20%" y="-20%" width="140%" height="140%">
+    <feGaussianBlur stdDeviation="3" result="blur"/>
+    <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+  </filter>
+</defs>
+<rect x="0" y="0" width="1400" height="1000" fill="url(#bgGrad)"/>
+<text x="60" y="70" fill="#f8fafc" font-size="34" font-weight="700">vectordata-rs · test suite</text>
+<text x="60" y="100" fill="#94a3b8" font-size="14">breakdown by crate, layer, and purpose</text>
+<text x="1340" y="70" text-anchor="end" fill="#94a3b8" font-size="13">generated 2026-04-22</text>
+<text x="60" y="200" fill="url(#accentGrad)" font-size="120" font-weight="800" filter="url(#glow)">1768</text>
+<text x="60" y="240" fill="#cbd5e1" font-size="18">test functions across the workspace</text>
+<g transform="translate(360,150)">
+  <text fill="#3b82f6" font-size="48" font-weight="700">1256</text>
+  <text y="20" fill="#cbd5e1" font-size="13">unit tests</text>
+  <text y="38" fill="#64748b" font-size="11">71%</text>
+</g>
+<g transform="translate(540,150)">
+  <text fill="#10b981" font-size="48" font-weight="700">512</text>
+  <text y="20" fill="#cbd5e1" font-size="13">integration tests</text>
+  <text y="38" fill="#64748b" font-size="11">29%</text>
+</g>
+<g transform="translate(60,300)">
+<text fill="#f8fafc" font-size="20" font-weight="600">Per-crate breakdown</text>
+<text y="22" fill="#94a3b8" font-size="12">stacked: unit (blue) + integration (emerald)</text>
+<text x="0" y="64" fill="#e2e8f0" font-size="13" font-weight="500">veks-pipeline</text>
+<rect x="180" y="50" width="697" height="18" fill="#3b82f6" rx="2"/>
+<rect x="877" y="50" width="102" height="18" fill="#10b981" rx="2"/>
+<text x="992" y="64" fill="#94a3b8" font-size="12">555</text>
+<text x="0" y="92" fill="#e2e8f0" font-size="13" font-weight="500">vectordata</text>
+<rect x="180" y="78" width="366" height="18" fill="#3b82f6" rx="2"/>
+<rect x="546" y="78" width="252" height="18" fill="#10b981" rx="2"/>
+<text x="992" y="92" fill="#94a3b8" font-size="12">429</text>
+<text x="0" y="120" fill="#e2e8f0" font-size="13" font-weight="500">veks</text>
+<rect x="180" y="106" width="180" height="18" fill="#3b82f6" rx="2"/>
+<rect x="360" y="106" width="203" height="18" fill="#10b981" rx="2"/>
+<text x="992" y="120" fill="#94a3b8" font-size="12">266</text>
+<text x="0" y="148" fill="#e2e8f0" font-size="13" font-weight="500">slabtastic</text>
+<rect x="180" y="134" width="89" height="18" fill="#3b82f6" rx="2"/>
+<rect x="269" y="134" width="180" height="18" fill="#10b981" rx="2"/>
+<text x="992" y="148" fill="#94a3b8" font-size="12">187</text>
+<text x="0" y="176" fill="#e2e8f0" font-size="13" font-weight="500">veks-anode</text>
+<rect x="180" y="162" width="203" height="18" fill="#3b82f6" rx="2"/>
+<rect x="383" y="162" width="0" height="18" fill="#10b981" rx="2"/>
+<text x="992" y="176" fill="#94a3b8" font-size="12">141</text>
+<text x="0" y="204" fill="#e2e8f0" font-size="13" font-weight="500">veks-core</text>
+<rect x="180" y="190" width="148" height="18" fill="#3b82f6" rx="2"/>
+<rect x="328" y="190" width="0" height="18" fill="#10b981" rx="2"/>
+<text x="992" y="204" fill="#94a3b8" font-size="12">103</text>
+<text x="0" y="232" fill="#e2e8f0" font-size="13" font-weight="500">veks-io</text>
+<rect x="180" y="218" width="106" height="18" fill="#3b82f6" rx="2"/>
+<rect x="286" y="218" width="0" height="18" fill="#10b981" rx="2"/>
+<text x="992" y="232" fill="#94a3b8" font-size="12">74</text>
+<text x="0" y="260" fill="#e2e8f0" font-size="13" font-weight="500">veks-completion</text>
+<rect x="180" y="246" width="18" height="18" fill="#3b82f6" rx="2"/>
+<rect x="198" y="246" width="0" height="18" fill="#10b981" rx="2"/>
+<text x="992" y="260" fill="#94a3b8" font-size="12">13</text>
+</g>
+<g transform="translate(0,0)">
+<text x="1130" y="290" text-anchor="middle" fill="#f8fafc" font-size="20" font-weight="600">Tests by purpose</text>
+<text x="1130" y="310" text-anchor="middle" fill="#94a3b8" font-size="12">grouped by file/name heuristic</text>
+<path d="M 1130.0 320.0 A 160 160 0 1 1 974.9 519.4 L 1037.9 503.4 A 95 95 0 1 0 1130.0 385.0 Z" fill="#3b82f6" stroke="#0f172a" stroke-width="1.5"/><path d="M 974.9 519.4 A 160 160 0 0 1 971.5 457.9 L 1035.9 466.9 A 95 95 0 0 0 1037.9 503.4 Z" fill="#ef4444" stroke="#0f172a" stroke-width="1.5"/><path d="M 971.5 457.9 A 160 160 0 0 1 988.3 405.6 L 1045.9 435.9 A 95 95 0 0 0 1035.9 466.9 Z" fill="#0ea5e9" stroke="#0f172a" stroke-width="1.5"/><path d="M 988.3 405.6 A 160 160 0 0 1 1017.7 366.1 L 1063.3 412.3 A 95 95 0 0 0 1045.9 435.9 Z" fill="#64748b" stroke="#0f172a" stroke-width="1.5"/><path d="M 1017.7 366.1 A 160 160 0 0 1 1056.1 338.1 L 1086.2 395.7 A 95 95 0 0 0 1063.3 412.3 Z" fill="#ec4899" stroke="#0f172a" stroke-width="1.5"/><path d="M 1056.1 338.1 A 160 160 0 0 1 1072.7 330.6 L 1096.0 391.3 A 95 95 0 0 0 1086.2 395.7 Z" fill="#84cc16" stroke="#0f172a" stroke-width="1.5"/><path d="M 1072.7 330.6 A 160 160 0 0 1 1089.0 325.4 L 1105.6 388.2 A 95 95 0 0 0 1096.0 391.3 Z" fill="#06b6d4" stroke="#0f172a" stroke-width="1.5"/><path d="M 1089.0 325.4 A 160 160 0 0 1 1104.0 322.1 L 1114.5 386.3 A 95 95 0 0 0 1105.6 388.2 Z" fill="#a855f7" stroke="#0f172a" stroke-width="1.5"/><path d="M 1104.0 322.1 A 160 160 0 0 1 1113.5 320.8 L 1120.2 385.5 A 95 95 0 0 0 1114.5 386.3 Z" fill="#eab308" stroke="#0f172a" stroke-width="1.5"/><path d="M 1113.5 320.8 A 160 160 0 0 1 1120.3 320.3 L 1124.3 385.2 A 95 95 0 0 0 1120.2 385.5 Z" fill="#22c55e" stroke="#0f172a" stroke-width="1.5"/><path d="M 1120.3 320.3 A 160 160 0 0 1 1125.5 320.1 L 1127.3 385.0 A 95 95 0 0 0 1124.3 385.2 Z" fill="#14b8a6" stroke="#0f172a" stroke-width="1.5"/><path d="M 1125.5 320.1 A 160 160 0 0 1 1130.0 320.0 L 1130.0 385.0 A 95 95 0 0 0 1127.3 385.0 Z" fill="#f97316" stroke="#0f172a" stroke-width="1.5"/><text x="1130" y="488" text-anchor="middle" fill="#f8fafc" font-size="36" font-weight="700">1768</text>
+<text x="1130" y="510" text-anchor="middle" fill="#94a3b8" font-size="13">total</text>
+</g>
+<g><rect x="920" y="680" width="14" height="14" rx="3" fill="#3b82f6"/>
+<text x="944" y="692" fill="#e2e8f0" font-size="13">In-crate unit</text>
+<text x="1300" y="692" fill="#94a3b8" font-size="13" text-anchor="end">1256 · 71%</text>
+<rect x="920" y="702" width="14" height="14" rx="3" fill="#ef4444"/>
+<text x="944" y="714" fill="#e2e8f0" font-size="13">Adversarial / regression</text>
+<text x="1300" y="714" fill="#94a3b8" font-size="13" text-anchor="end">109 · 6%</text>
+<rect x="920" y="724" width="14" height="14" rx="3" fill="#0ea5e9"/>
+<text x="944" y="736" fill="#e2e8f0" font-size="13">HTTP / remote access</text>
+<text x="1300" y="736" fill="#94a3b8" font-size="13" text-anchor="end">97 · 5%</text>
+<rect x="920" y="746" width="14" height="14" rx="3" fill="#64748b"/>
+<text x="944" y="758" fill="#e2e8f0" font-size="13">Other integration</text>
+<text x="1300" y="758" fill="#94a3b8" font-size="13" text-anchor="end">87 · 5%</text>
+<rect x="920" y="768" width="14" height="14" rx="3" fill="#ec4899"/>
+<text x="944" y="780" fill="#e2e8f0" font-size="13">Check / validation</text>
+<text x="1300" y="780" fill="#94a3b8" font-size="13" text-anchor="end">84 · 5%</text>
+<rect x="920" y="790" width="14" height="14" rx="3" fill="#84cc16"/>
+<text x="944" y="802" fill="#e2e8f0" font-size="13">Typed access</text>
+<text x="1300" y="802" fill="#94a3b8" font-size="13" text-anchor="end">32 · 2%</text>
+<rect x="920" y="812" width="14" height="14" rx="3" fill="#06b6d4"/>
+<text x="944" y="824" fill="#e2e8f0" font-size="13">End-to-end pipeline</text>
+<text x="1300" y="824" fill="#94a3b8" font-size="13" text-anchor="end">30 · 2%</text>
+<rect x="920" y="834" width="14" height="14" rx="3" fill="#a855f7"/>
+<text x="944" y="846" fill="#e2e8f0" font-size="13">DAG configuration</text>
+<text x="1300" y="846" fill="#94a3b8" font-size="13" text-anchor="end">27 · 2%</text>
+<rect x="920" y="856" width="14" height="14" rx="3" fill="#eab308"/>
+<text x="944" y="868" fill="#e2e8f0" font-size="13">Cache / channel</text>
+<text x="1300" y="868" fill="#94a3b8" font-size="13" text-anchor="end">17 · 1%</text>
+<rect x="920" y="878" width="14" height="14" rx="3" fill="#22c55e"/>
+<text x="944" y="890" fill="#e2e8f0" font-size="13">Facet / view access</text>
+<text x="1300" y="890" fill="#94a3b8" font-size="13" text-anchor="end">12 · 1%</text>
+<rect x="920" y="900" width="14" height="14" rx="3" fill="#14b8a6"/>
+<text x="944" y="912" fill="#e2e8f0" font-size="13">Data access</text>
+<text x="1300" y="912" fill="#94a3b8" font-size="13" text-anchor="end">9 · 1%</text>
+<rect x="920" y="922" width="14" height="14" rx="3" fill="#f97316"/>
+<text x="944" y="934" fill="#e2e8f0" font-size="13">Transport</text>
+<text x="1300" y="934" fill="#94a3b8" font-size="13" text-anchor="end">8 · 0%</text>
+</g>
+<text x="60" y="970" fill="#475569" font-size="11">scan: walk &lt;crate&gt;/src &amp; &lt;crate&gt;/tests for #[test] · purpose inferred from file prefix · regenerate with `cargo run -p tools --bin gen_test_infographic`</text>
+</svg>
+

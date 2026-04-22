@@ -68,6 +68,9 @@
 //! - **Linear range (count)**: `0m..400m/10` — 10 equal divisions (bare number = count)
 //! - **Fibonacci**: `fib:1m..400m` — fibonacci multiples of start within range
 //! - **Geometric**: `mul:1m..400m/2` — compound by factor (doubling, tripling, etc.)
+//! - **Decade**: `decade:100k` (or bare `decade`) — engineering-decade
+//!   sweep: 100k, 200k, …, 900k, 1m, 2m, …, 9m, 10m, … step rescales
+//!   each order of magnitude. Always emits decimal (M) units.
 
 use std::fmt;
 
@@ -848,6 +851,12 @@ pub fn needs_base_count(entry: &str) -> bool {
         let range_part = rest.split_once('/').map(|(r, _)| r).unwrap_or(rest);
         return !range_part.contains("..");
     }
+    if entry == "decade" || entry.starts_with("decade:") {
+        // `decade` (no body) and `decade:start` use the implicit
+        // upper bound; `decade:start..end` has an explicit end.
+        let body = entry.strip_prefix("decade:").unwrap_or("");
+        return !body.contains("..");
+    }
     false
 }
 
@@ -877,6 +886,12 @@ fn parse_sized_entry_impl(entry: &str, max_count: u64) -> Result<Vec<(String, u6
     }
     if let Some(rest) = entry.strip_prefix("linear:") {
         return parse_linear_range(rest, max_count);
+    }
+    if entry == "decade" {
+        return parse_decade_range("", max_count);
+    }
+    if let Some(rest) = entry.strip_prefix("decade:") {
+        return parse_decade_range(rest, max_count);
     }
 
     if let Some((range_part, step_str)) = entry.split_once('/') {
@@ -1098,6 +1113,106 @@ fn parse_linear_range(spec: &str, max_count: u64) -> Result<Vec<(String, u64)>, 
         if v == 0 { break; }
     }
     Ok(result)
+}
+
+/// Default starting value for `decade` when no explicit start is given.
+/// Pinned to 100k because billion-vector benchmarks rarely care about
+/// thousands-scale profiles; this default sweeps ~30 useful profiles
+/// across four orders of magnitude (100k…900k, 1m…9m, 10m…90m,
+/// 100m…900m, 1g+) without producing noise at the small end.
+const DECADE_DEFAULT_START: u64 = 100_000;
+
+/// Generate decade-stepped values within `[start, end]`, capped at
+/// `max_count`. The step size is the largest power of 10 that's
+/// `<= current value`; once the count crosses into the next decade
+/// (e.g., 90 → 100), the step rescales accordingly.
+///
+/// Named after engineering "decade" plots / decade resistors / decade
+/// scales — the same 1, 2, …, 9, 10, 20, …, 90, 100, 200, … layout.
+/// Always emits SI/decimal units (`k`, `m`, `g`) — never binary
+/// (`ki`, `mi`, `gi`) — because every value is a clean decimal
+/// multiple by construction.
+///
+/// Examples:
+///   - `decade:5` → 5, 6, 7, 8, 9, 10, 20, 30, …, 90, 100, 200, … (capped)
+///   - `decade:1` → 1, 2, …, 9, 10, 20, …, 90, 100, …
+///   - `decade:100k` → 100k, 200k, …, 900k, 1m, 2m, …, 9m, 10m, …
+///   - `decade:5..100` → 5, 6, …, 9, 10, 20, …, 90, 100
+///   - `decade` (no body) → starts at 100k
+///
+/// Form: `decade:<start>` or `decade:<start>..<end>` or bare `decade`.
+fn parse_decade_range(spec: &str, max_count: u64) -> Result<Vec<(String, u64)>, String> {
+    let spec = spec.trim();
+    let (start, explicit_end) = if spec.is_empty() {
+        // Bare `decade` — apply the documented default start.
+        (DECADE_DEFAULT_START, None)
+    } else if let Some((start_str, end_str)) = spec.split_once("..") {
+        // `decade:..N` (empty start) → use default start
+        let start_trimmed = start_str.trim();
+        let s = if start_trimmed.is_empty() {
+            DECADE_DEFAULT_START
+        } else {
+            parse_number_with_suffix(start_trimmed)?
+        };
+        (s, Some(parse_number_with_suffix(end_str.trim())?))
+    } else {
+        (parse_number_with_suffix(spec)?, None)
+    };
+    let end = match (explicit_end, max_count) {
+        (Some(e), mc) if mc > 0 => e.min(mc - 1),
+        (Some(e), _) => e,
+        (None, mc) if mc > 0 => mc - 1,
+        (None, _) => return Err(format!(
+            "implicit upper bound form 'decade{}{}' requires a known base count",
+            if spec.is_empty() { "" } else { ":" }, spec)),
+    };
+    if start == 0 {
+        return Err(format!("decade start must be > 0, got 'decade:{}'", spec));
+    }
+    if start > end {
+        return Ok(Vec::new());
+    }
+
+    // Step is the largest power of 10 that's <= start. So `decade:5`
+    // starts with step 1 (giving 5,6,7,8,9 before the rescale), and
+    // `decade:100k` starts with step 100k (giving 100k,200k,…,900k).
+    let mut step = pow10_floor(start);
+    let mut v = start;
+    let mut result = Vec::new();
+    let mut guard = 0usize;
+    while v <= end {
+        if max_count == 0 || v < max_count {
+            result.push((format_count_with_suffix(v), v));
+        }
+        // Crossing 10× the current step jumps us into the next decade,
+        // and the new step IS the new floor (so 90+10=100, then step 100).
+        let next = v.saturating_add(step);
+        if next == 0 { break; }
+        v = next;
+        if v >= step.saturating_mul(10) {
+            step = pow10_floor(v);
+        }
+        // Defensive: every iteration must make forward progress; cap
+        // total iterations at a generous upper bound so a malformed
+        // input can't spin forever.
+        guard += 1;
+        if guard > 10_000 {
+            return Err(format!("decade generator runaway for 'decade:{}'", spec));
+        }
+    }
+    Ok(result)
+}
+
+/// Largest power of 10 that's `<= n`. For n=0 returns 1 to avoid a
+/// degenerate step in the decade generator (which guards n>0 anyway).
+fn pow10_floor(n: u64) -> u64 {
+    if n == 0 { return 1; }
+    let mut p: u64 = 1;
+    while let Some(next) = p.checked_mul(10) {
+        if next > n { break; }
+        p = next;
+    }
+    p
 }
 
 // ---------------------------------------------------------------------------
@@ -2288,6 +2403,232 @@ default:
             "explicit override wins over inherited windowed view");
         assert!(bv.source.window.is_empty(),
             "explicit override carries no window unless the YAML says so");
+    }
+
+    // ── decade: strategy ──────────────────────────────────────────────
+    //
+    // Pin the documented behaviour:
+    //   - Step is the largest power of 10 ≤ current value.
+    //   - Step rescales every time the value crosses into the next decade.
+    //   - Bare `decade` defaults to start=100k.
+    //   - Always emits SI/decimal units (k/m/g) — never binary (ki/mi/gi).
+    //   - Caps at max_count (exclusive).
+    //   - Both `decade:start` (open-ended) and `decade:start..end`
+    //     (explicit) forms work.
+    //   - `decade:..N` (empty start) uses the default start.
+
+    #[test]
+    fn decade_starts_at_5_through_explicit_end() {
+        // The motivating example from the spec.
+        let r = parse_sized_entry_impl("decade:5..1000", 0).unwrap();
+        let counts: Vec<u64> = r.iter().map(|(_, c)| *c).collect();
+        assert_eq!(counts,
+            vec![5,6,7,8,9, 10,20,30,40,50,60,70,80,90, 100,200,300,400,500,600,700,800,900, 1000]);
+    }
+
+    #[test]
+    fn decade_starts_at_1_full_sweep() {
+        let r = parse_sized_entry_impl("decade:1..100", 0).unwrap();
+        let counts: Vec<u64> = r.iter().map(|(_, c)| *c).collect();
+        assert_eq!(counts,
+            vec![1,2,3,4,5,6,7,8,9, 10,20,30,40,50,60,70,80,90, 100]);
+    }
+
+    #[test]
+    fn decade_default_start_is_100k() {
+        // Bare `decade` with a known max → must start at 100k.
+        let r = parse_sized_entry_impl("decade", 1_000_000).unwrap();
+        let counts: Vec<u64> = r.iter().map(|(_, c)| *c).collect();
+        // 100k, 200k, …, 900k. Cap excludes 1m (== max).
+        assert_eq!(counts, vec![100_000, 200_000, 300_000, 400_000, 500_000,
+                                600_000, 700_000, 800_000, 900_000]);
+    }
+
+    #[test]
+    fn decade_default_start_via_explicit_end() {
+        // `decade:..N` (empty start) also means default start.
+        let r = parse_sized_entry_impl("decade:..1m", 0).unwrap();
+        let counts: Vec<u64> = r.iter().map(|(_, c)| *c).collect();
+        assert_eq!(counts, vec![100_000, 200_000, 300_000, 400_000, 500_000,
+                                600_000, 700_000, 800_000, 900_000, 1_000_000]);
+    }
+
+    #[test]
+    fn decade_with_si_suffix_start() {
+        // `decade:100k` should produce the same as default start.
+        let r = parse_sized_entry_impl("decade:100k", 1_000_000).unwrap();
+        let counts: Vec<u64> = r.iter().map(|(_, c)| *c).collect();
+        assert_eq!(counts, vec![100_000, 200_000, 300_000, 400_000, 500_000,
+                                600_000, 700_000, 800_000, 900_000]);
+    }
+
+    #[test]
+    fn decade_max_count_caps_strictly_below() {
+        // `<` not `<=` — generated values must never equal max_count
+        // (would conflict with the default profile).
+        let r = parse_sized_entry_impl("decade:5..100", 50).unwrap();
+        let counts: Vec<u64> = r.iter().map(|(_, c)| *c).collect();
+        assert_eq!(counts, vec![5,6,7,8,9, 10,20,30,40]); // 50, 60, … excluded
+    }
+
+    #[test]
+    fn decade_implicit_end_requires_max_count() {
+        // `decade:5` with no max_count is an error — open-ended forms
+        // must defer until base_count is known.
+        assert!(parse_sized_entry_impl("decade:5", 0).is_err());
+        assert!(parse_sized_entry_impl("decade", 0).is_err());
+    }
+
+    #[test]
+    fn decade_implicit_end_resolves_at_runtime() {
+        // With a known max, the open-ended form caps automatically.
+        let r = parse_sized_entry_impl("decade:5", 100).unwrap();
+        let counts: Vec<u64> = r.iter().map(|(_, c)| *c).collect();
+        assert_eq!(counts, vec![5,6,7,8,9, 10,20,30,40,50,60,70,80,90]); // max=100 → <100
+    }
+
+    #[test]
+    fn decade_uses_decimal_units_in_names() {
+        // `format_count_with_suffix` is the naming source — for clean
+        // decimal values it always picks the SI/decimal shorthand
+        // (k/m/g) over binary (ki/mi/gi). Pin that here so a future
+        // change to format_count_with_suffix doesn't sneak Mi back in.
+        let r = parse_sized_entry_impl("decade:100k..10m", 0).unwrap();
+        let names: Vec<&str> = r.iter().map(|(n, _)| n.as_str()).collect();
+        for n in &names {
+            assert!(
+                !n.contains("ki") && !n.contains("mi") && !n.contains("gi"),
+                "decade strategy must emit decimal units, got '{}'", n,
+            );
+        }
+        // Spot-check expected names.
+        assert!(names.contains(&"100k"));
+        assert!(names.contains(&"1m"));
+        assert!(names.contains(&"10m"));
+    }
+
+    #[test]
+    fn decade_zero_start_rejected() {
+        assert!(parse_sized_entry_impl("decade:0..100", 0).is_err());
+    }
+
+    #[test]
+    fn decade_start_above_end_yields_empty() {
+        let r = parse_sized_entry_impl("decade:1000..100", 0).unwrap();
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn decade_needs_base_count_classification() {
+        // Open-ended forms must defer until base_count is known.
+        assert!(needs_base_count("decade"));
+        assert!(needs_base_count("decade:5"));
+        assert!(needs_base_count("decade:100k"));
+        // Explicit-end forms resolve immediately.
+        assert!(!needs_base_count("decade:5..100"));
+        assert!(!needs_base_count("decade:100k..10m"));
+        assert!(!needs_base_count("decade:..1m"));
+    }
+
+    #[test]
+    fn decade_full_sweep_billion_scale() {
+        // Realistic scenario: 1G base. Default-start decade should
+        // cover 100k → 900m without producing 1g (== max) and without
+        // any binary-unit naming.
+        let r = parse_sized_entry_impl("decade", 1_000_000_000).unwrap();
+        let counts: Vec<u64> = r.iter().map(|(_, c)| *c).collect();
+        let names: Vec<&str> = r.iter().map(|(n, _)| n.as_str()).collect();
+        // First few and last few — full list is 36 entries.
+        assert_eq!(counts.first(), Some(&100_000));
+        assert_eq!(counts.last(), Some(&900_000_000));
+        assert_eq!(counts.len(), 36); // 9 per decade × 4 decades (100k, 1m, 10m, 100m)
+        for n in &names {
+            assert!(!n.contains("ki") && !n.contains("mi") && !n.contains("gi"),
+                "all names must be decimal: '{}'", n);
+        }
+    }
+
+    #[test]
+    fn decade_via_root_strata_in_full_config() {
+        // This mirrors the user-observed bug: yaml has root-level
+        // `strata: [...]` containing "decade", plus a flock of
+        // explicit child profile entries from a prior expansion.
+        // After load+expand, the profile map MUST contain the new
+        // decade-specific entries (100k, 4m, 6m, 7m, 9m, ...) that
+        // didn't exist in the previous expansion.
+        use crate::dataset::DatasetConfig;
+        use std::io::Write;
+        let yaml = r#"name: test
+
+attributes:
+  distance_function: DOT_PRODUCT
+
+strata: ["mul:1mi/2", "fib:1m", "linear:10m/10m", "decade"]
+
+profiles:
+  default:
+    maxk: 100
+    base_vectors: profiles/base/base_vectors.fvecs
+    query_vectors: profiles/base/query_vectors.fvecs
+  1m:
+    maxk: 100
+    base_count: 1000000
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("dataset.yaml");
+        std::fs::File::create(&p).unwrap().write_all(yaml.as_bytes()).unwrap();
+
+        let mut cfg = DatasetConfig::load(&p).expect("load full config");
+        // Sanity: strata moved into deferred_sized via the migration.
+        assert_eq!(cfg.strata.len(), 4, "root strata parsed");
+        assert!(cfg.profiles.has_deferred(),
+            "root strata must populate deferred_sized via the migration; \
+             saw raw_sized={:?}, deferred_sized={:?}",
+            cfg.profiles.raw_sized, cfg.profiles.deferred_sized);
+
+        let vars = IndexMap::new();
+        let added = cfg.profiles.expand_deferred_sized(&vars, 963_689_881);
+        assert!(added > 0, "expansion should add profiles");
+
+        // The decade strategy contributes these UNIQUE names (not
+        // produced by mul/fib/linear at all):
+        //   100k, 200k, …, 900k          (9 entries)
+        //   4m, 6m, 7m, 9m                (4 entries — fib has 1,2,3,5,8 only)
+        //   plus 100m, 200m, …, 900m share with linear/fib but pass
+        for name in &[
+            "100k", "200k", "300k", "400k", "500k",
+            "600k", "700k", "800k", "900k",
+            "4m", "6m", "7m", "9m",
+        ] {
+            assert!(
+                cfg.profiles.profile(name).is_some(),
+                "decade-specific profile '{}' missing after expansion. \
+                 deferred entries were: {:?}, profile names present: {:?}",
+                name,
+                cfg.strata,
+                cfg.profiles.profiles.keys().collect::<Vec<_>>(),
+            );
+        }
+    }
+
+    #[test]
+    fn decade_via_strata_spec_in_yaml() {
+        // The deserializer must accept `decade` alongside the legacy
+        // strategies in a `strata:` (or `sized:`) list and produce
+        // sized profiles with windowed `base_vectors`.
+        let yaml = r#"
+default:
+  base_vectors: profiles/base/base_vectors.fvecs
+sized: ["decade:5..50"]
+"#;
+        let g: DSProfileGroup = serde_yaml::from_str(yaml).unwrap();
+        // First sized profile should be "5".
+        let p5 = g.profile("5").expect("decade emits profile '5'");
+        assert_eq!(p5.base_count, Some(5));
+        let bv = p5.view("base_vectors").unwrap();
+        assert_eq!(bv.source.window.0.first().map(|i| i.max_excl), Some(5));
+        // And the highest in the sweep should be 50 (since explicit end is inclusive of last decade detent).
+        assert!(g.profile("50").is_some());
     }
 
     #[test]

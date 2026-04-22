@@ -433,7 +433,7 @@ fn estimate_data_bytes(entry: &CatalogEntry) -> Option<u64> {
 /// Strip surrounding single or double quotes from a string.
 ///
 /// During shell completion, `COMP_WORDS` preserves the raw quotes typed by
-/// the user (e.g. `'.*ibm.*'`). We need to strip them so that
+/// the user (e.g. `'.*foo.*'`). We need to strip them so that
 /// `parse_active_filters` sees the unquoted value.
 fn strip_shell_quotes(s: &str) -> String {
     if (s.starts_with('\'') && s.ends_with('\''))

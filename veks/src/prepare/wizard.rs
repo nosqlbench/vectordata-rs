@@ -1004,8 +1004,8 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
             };
 
             // Compose a sized-profile spec by asking for each stratification
-            // strategy independently. The three strategies produce
-            // *different* size series; users typically want all of them so
+            // strategy independently. The strategies produce *different*
+            // size series; users typically want a couple of them so
             // verification and benchmarking sweep both fast doublings and
             // dense linear samples. Defaults are Y across the board.
             let prompt_strategies = |effective_max: u64| -> Option<String> {
@@ -1021,7 +1021,17 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
                 // least ~10M vectors; below that the step would yield zero
                 // or one profile and the question would just be noise.
                 let want_linear = if effective_max >= 10_000_000 {
-                    confirm("  Include every-10M linear profiles?", true)
+                    confirm("  Include linear/10M profiles?", true)
+                } else {
+                    false
+                };
+                // Decade strategy: 100k, 200k, …, 900k, 1m, 2m, …, 9m,
+                // 10m, … — one detent per decimal "click" within each
+                // order of magnitude. Most useful at million-plus
+                // scale; below 1M the default-start (100k) doesn't
+                // produce a meaningful sweep.
+                let want_decade = if effective_max >= 1_000_000 {
+                    confirm("  Include decade-stepped profiles (100k, 200k, …, 1m, 2m, …)?", true)
                 } else {
                     false
                 };
@@ -1039,6 +1049,12 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
                 }
                 if want_linear {
                     parts.push("linear:10m/10m".to_string());
+                }
+                if want_decade {
+                    // Bare `decade` uses the documented 100k default
+                    // start — keeps the spec compact and idempotent
+                    // across datasets of different absolute sizes.
+                    parts.push("decade".to_string());
                 }
                 if parts.is_empty() {
                     None

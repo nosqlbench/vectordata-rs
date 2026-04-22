@@ -2340,6 +2340,14 @@ fn describe_sized_spec(spec: &str) -> String {
         } else {
             "fibonacci series".into()
         }
+    } else if spec == "decade" {
+        "decade-stepped series (100k, 200k, …, 900k, 1m, 2m, …) up to dataset size".into()
+    } else if let Some(rest) = spec.strip_prefix("decade:") {
+        if let Some((start, end)) = rest.split_once("..") {
+            format!("decade-stepped series from {} to {} (1×, 2×, …, 9×, 10×, … per decade)", start.trim(), end.trim())
+        } else {
+            format!("decade-stepped series from {} (1×, 2×, …, 9×, 10×, … per decade) up to dataset size", rest.trim())
+        }
     } else if let Some((range, step)) = spec.split_once('/') {
         if let Some((start, end)) = range.split_once("..") {
             let step = step.trim();
