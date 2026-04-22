@@ -1298,6 +1298,84 @@ mod tests {
         assert_eq!(rows[0][0], 0, "nearest to [0.1,0.1] should be [0,0]");
     }
 
+    /// Cache-reuse regression: running stdarch twice against the same
+    /// inputs, with different output paths, must hit the segment cache
+    /// on the second run — no rewrites of cache files, byte-identical
+    /// output. Pairs with the equivalent test in `compute_knn.rs`
+    /// (metal engine) to enforce the per-engine cache-key contract:
+    /// each engine has its own namespace under `<workspace>/.cache`,
+    /// keyed by `(ENGINE_NAME, base_stem, query_stem, base_size,
+    /// query_size, range, k, metric)`. Two runs with matching inputs
+    /// land on the same cache files and skip recomputation.
+    #[test]
+    fn test_stdarch_cache_reuse() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = make_ctx(tmp.path());
+
+        // Deterministic fixture small enough that recomputation is
+        // sub-millisecond — we want the test to fail loudly if cache
+        // reuse breaks, not pass by accident on a slow machine.
+        let mut rng = 42u64;
+        let mut next_f32 = || -> f32 {
+            rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+            (rng as f32 / u64::MAX as f32) * 2.0 - 1.0
+        };
+        let base: Vec<Vec<f32>> = (0..50).map(|_| (0..8).map(|_| next_f32()).collect()).collect();
+        let query: Vec<Vec<f32>> = (0..5).map(|_| (0..8).map(|_| next_f32()).collect()).collect();
+        write_fvec(&tmp.path().join("b.fvec"), &base);
+        write_fvec(&tmp.path().join("q.fvec"), &query);
+
+        // First run.
+        let mut opts1 = Options::new();
+        opts1.set("base", "b.fvec"); opts1.set("query", "q.fvec");
+        opts1.set("indices", "out1.ivec"); opts1.set("neighbors", "3"); opts1.set("metric", "L2");
+        let mut op1 = ComputeKnnStdarchOp;
+        let r1 = op1.execute(&opts1, &mut ctx);
+        assert_eq!(r1.status, Status::Ok, "{}", r1.message);
+
+        // Snapshot cache mtimes.
+        let cache_dir = tmp.path().join(".cache");
+        let snapshot = |dir: &std::path::Path| -> Vec<(std::ffi::OsString, std::time::SystemTime)> {
+            let mut v: Vec<_> = std::fs::read_dir(dir).unwrap()
+                .filter_map(|e| e.ok())
+                .map(|e| (e.file_name(), e.metadata().unwrap().modified().unwrap()))
+                .collect();
+            v.sort_by(|a, b| a.0.cmp(&b.0));
+            v
+        };
+        let mtimes_before = snapshot(&cache_dir);
+        assert!(!mtimes_before.is_empty(), "first run must populate the cache");
+        // Every cached file must carry the engine namespace.
+        for (name, _) in &mtimes_before {
+            let s = name.to_string_lossy();
+            assert!(s.starts_with(super::ENGINE_NAME),
+                "cache file {} not in {} namespace", s, super::ENGINE_NAME);
+        }
+
+        // Sleep past mtime resolution so a rewrite would be detectable.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // Second run with different output filename, identical inputs.
+        let mut opts2 = Options::new();
+        opts2.set("base", "b.fvec"); opts2.set("query", "q.fvec");
+        opts2.set("indices", "out2.ivec"); opts2.set("neighbors", "3"); opts2.set("metric", "L2");
+        let mut op2 = ComputeKnnStdarchOp;
+        let r2 = op2.execute(&opts2, &mut ctx);
+        assert_eq!(r2.status, Status::Ok, "{}", r2.message);
+
+        // Cache must not have been rewritten.
+        let mtimes_after = snapshot(&cache_dir);
+        assert_eq!(mtimes_before, mtimes_after,
+            "stdarch cache files were rewritten on identical-input second run");
+
+        // And the per-run outputs must be byte-identical (cache replay
+        // produces the same neighbor sets the original computation
+        // produced — proves the cache hit served the correct data).
+        let out1 = std::fs::read(tmp.path().join("out1.ivec")).unwrap();
+        let out2 = std::fs::read(tmp.path().join("out2.ivec")).unwrap();
+        assert_eq!(out1, out2, "second run produced different output");
+    }
+
     #[test]
     fn test_stdarch_matches_metal() {
         use std::collections::HashSet;

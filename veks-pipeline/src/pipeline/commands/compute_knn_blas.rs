@@ -1443,4 +1443,74 @@ mod tests {
         assert_eq!(rows_b, rows_base,
             "cross-profile reuse produced different neighbors than fresh compute");
     }
+
+    /// Cache-reuse regression: running knn-blas twice against the
+    /// same inputs, with different output paths, must hit the
+    /// segment cache on the second run — no rewrites of cache
+    /// files, byte-identical output. Pairs with the equivalent
+    /// tests in `compute_knn.rs` (metal) and `compute_knn_stdarch.rs`
+    /// (stdarch). All three engines share the per-engine namespace
+    /// contract: `<workspace>/.cache/<engine_name>....`.
+    #[test]
+    fn test_blas_cache_reuse() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = make_ctx(tmp.path());
+
+        let mut rng = 42u64;
+        let mut next_f32 = || -> f32 {
+            rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+            (rng as f32 / u64::MAX as f32) * 2.0 - 1.0
+        };
+        let base: Vec<Vec<f32>> = (0..50).map(|_| (0..8).map(|_| next_f32()).collect()).collect();
+        let query: Vec<Vec<f32>> = (0..5).map(|_| (0..8).map(|_| next_f32()).collect()).collect();
+        write_fvec(&tmp.path().join("base.fvec"), &base);
+        write_fvec(&tmp.path().join("query.fvec"), &query);
+
+        // First run.
+        let mut opts1 = Options::new();
+        opts1.set("base", tmp.path().join("base.fvec").to_string_lossy().to_string());
+        opts1.set("query", tmp.path().join("query.fvec").to_string_lossy().to_string());
+        opts1.set("indices", tmp.path().join("out1.ivec").to_string_lossy().to_string());
+        opts1.set("neighbors", "3"); opts1.set("metric", "L2");
+        let mut op1 = ComputeKnnBlasOp;
+        let r1 = op1.execute(&opts1, &mut ctx);
+        assert_eq!(r1.status, Status::Ok, "{}", r1.message);
+
+        let cache_dir = tmp.path().join(".cache");
+        let snapshot = |dir: &std::path::Path| -> Vec<(std::ffi::OsString, std::time::SystemTime)> {
+            let mut v: Vec<_> = std::fs::read_dir(dir).unwrap()
+                .filter_map(|e| e.ok())
+                .map(|e| (e.file_name(), e.metadata().unwrap().modified().unwrap()))
+                .collect();
+            v.sort_by(|a, b| a.0.cmp(&b.0));
+            v
+        };
+        let mtimes_before = snapshot(&cache_dir);
+        assert!(!mtimes_before.is_empty(), "first run must populate the cache");
+        for (name, _) in &mtimes_before {
+            let s = name.to_string_lossy();
+            assert!(s.starts_with(super::ENGINE_NAME),
+                "cache file {} not in {} namespace", s, super::ENGINE_NAME);
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // Second run, identical inputs, different output path.
+        let mut opts2 = Options::new();
+        opts2.set("base", tmp.path().join("base.fvec").to_string_lossy().to_string());
+        opts2.set("query", tmp.path().join("query.fvec").to_string_lossy().to_string());
+        opts2.set("indices", tmp.path().join("out2.ivec").to_string_lossy().to_string());
+        opts2.set("neighbors", "3"); opts2.set("metric", "L2");
+        let mut op2 = ComputeKnnBlasOp;
+        let r2 = op2.execute(&opts2, &mut ctx);
+        assert_eq!(r2.status, Status::Ok, "{}", r2.message);
+
+        let mtimes_after = snapshot(&cache_dir);
+        assert_eq!(mtimes_before, mtimes_after,
+            "knn-blas cache files were rewritten on identical-input second run");
+
+        let out1 = std::fs::read(tmp.path().join("out1.ivec")).unwrap();
+        let out2 = std::fs::read(tmp.path().join("out2.ivec")).unwrap();
+        assert_eq!(out1, out2, "second run produced different output");
+    }
 }

@@ -335,12 +335,24 @@ struct PartitionMeta {
     cached: bool,
 }
 
+/// Engine identifier embedded in this module's segment-cache keys.
+/// Distinct engines (knn-metal / knn-stdarch / knn-blas / knn-faiss)
+/// produce numerically-different results on the same input due to
+/// different accumulation orders at ULP level. Without an engine name
+/// in the cache key, cross-engine runs can silently replay one
+/// engine's output under another's name — breaking both correctness
+/// (callers get the wrong distances) and parity measurements (the
+/// engines appear to disagree when actually one is replaying the
+/// other's cache).
+const ENGINE_NAME: &str = "knn-metal";
+
 /// Build a cache file path for a partition segment.
 ///
-/// The cache key is derived from the base/query file stems, partition range,
-/// k, and metric — NOT from the pipeline step ID. This allows partition
-/// caches to be shared across profiles that use overlapping base-vector
-/// windows with the same query set, k, and metric.
+/// The cache key includes the engine identifier, base/query file
+/// stems, partition range, k, and metric — NOT the pipeline step ID.
+/// This allows partition caches to be shared across profiles that use
+/// overlapping base-vector windows with the same query set, k, and
+/// metric, while preventing cross-engine pollution.
 fn build_cache_path(
     cache_dir: &Path,
     cache_prefix: &str,
@@ -358,29 +370,21 @@ fn build_cache_path(
         Metric::L1 => "l1",
     };
     cache_dir.join(format!(
-        "{}.range_{:06}_{:06}.k{}.{}.{}.{}",
-        cache_prefix, start, end, k, metric_str, suffix, ext
+        "{}.{}.range_{:06}_{:06}.k{}.{}.{}.{}",
+        ENGINE_NAME, cache_prefix, start, end, k, metric_str, suffix, ext
     ))
 }
 
 /// Derive a cache key prefix from the base and query file paths.
 ///
-/// Uses file stems so that partitions computed for the same physical files
-/// are reusable regardless of which pipeline step or profile triggered them.
+/// Uses file stems so that partitions computed for the same physical
+/// files are reusable regardless of which pipeline step or profile
+/// triggered them, plus a content fingerprint (from `.mref` when
+/// available, else hash of head + tail + size) so regenerating a
+/// file with new content but the same size doesn't silently replay
+/// stale cached partitions.
 fn cache_prefix_for(base_path: &Path, query_path: &Path) -> String {
-    let base_stem = base_path
-        .file_stem()
-        .unwrap_or_default()
-        .to_string_lossy();
-    let query_stem = query_path
-        .file_stem()
-        .unwrap_or_default()
-        .to_string_lossy();
-    // Include file sizes in the cache key so partitions are invalidated
-    // when the data changes (e.g., different base_fraction → different vectors).
-    let base_size = std::fs::metadata(base_path).map(|m| m.len()).unwrap_or(0);
-    let query_size = std::fs::metadata(query_path).map(|m| m.len()).unwrap_or(0);
-    format!("{}.{}.{}_{}", base_stem, query_stem, base_size, query_size)
+    super::knn_segment::cache_prefix_for(base_path, query_path)
 }
 
 /// Validate that a cache file exists and has the expected byte size.
@@ -2137,7 +2141,10 @@ where
             Metric::DotProduct => "dot_product",
             Metric::L1 => "l1",
         };
-        let prefix_pat = format!("{}.range_", cache_prefix);
+        // Scan key must include the engine prefix that `build_cache_path`
+        // writes — otherwise the discovery loop misses the cache files
+        // we just wrote and recomputes everything on the next call.
+        let prefix_pat = format!("{}.{}.range_", ENGINE_NAME, cache_prefix);
         let suffix_pat = format!(".k{}.{}.neighbors.ivec", k, metric_str);
         let gz_suffix_pat = format!("{}.gz", suffix_pat);
 

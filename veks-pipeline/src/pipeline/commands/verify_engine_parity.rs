@@ -35,6 +35,48 @@ use crate::pipeline::command::{
 };
 use super::knn_compare::{compare_query_ordinals, QueryResult, VerifySummary};
 
+#[cfg(feature = "knnutils")]
+unsafe extern "C" {
+    fn cblas_sgemm(
+        order: i32,     // CblasRowMajor = 101
+        transa: i32,    // CblasNoTrans = 111
+        transb: i32,    // CblasTrans = 112
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        a: *const f32,
+        lda: i32,
+        b: *const f32,
+        ldb: i32,
+        beta: f32,
+        c: *mut f32,
+        ldc: i32,
+    );
+
+}
+#[cfg(feature = "knnutils")]
+const CBLAS_ROW_MAJOR: i32 = 101;
+#[cfg(feature = "knnutils")]
+const CBLAS_NO_TRANS: i32 = 111;
+#[cfg(feature = "knnutils")]
+const CBLAS_TRANS: i32 = 112;
+
+/// Set env vars that BLAS libraries read at init time. This only
+/// has an effect if called before the BLAS is first invoked — for
+/// our parity demo the process hasn't touched BLAS yet when this
+/// command starts, so it works. Covers OpenBLAS, MKL, OMP-threaded
+/// BLIS, and Apple Accelerate.
+#[cfg(feature = "knnutils")]
+fn blas_set_single_threaded() {
+    for var in &["OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "OMP_NUM_THREADS", "BLIS_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"] {
+        // set_var is unsafe because it races with getenv from other
+        // threads; we call this at the very top of execute() before
+        // spawning any BLAS work, so it's sound here.
+        unsafe { std::env::set_var(var, "1"); }
+    }
+}
+
 pub fn factory() -> Box<dyn CommandOp> {
     Box::new(VerifyEngineParityOp)
 }
@@ -133,11 +175,31 @@ impl CommandOp for VerifyEngineParityOp {
             OptionDesc { name: "seed".into(),         type_name: "int".into(),  required: false, default: Some("42".into()),
                 description: "Synthetic mode: PRNG seed (xorshift)".into(),
                 role: OptionRole::Config },
+            OptionDesc { name: "distribution".into(), type_name: "enum".into(), required: false, default: Some("uniform".into()),
+                description: "Synthetic mode: 'uniform' (U[-1,1] per component — curse-of-dim kicks in at high dim), 'gaussian' (N(0,1) per component + L2-normalize onto unit sphere — still curse-prone at high dim), or 'clustered' (mixture of 16 Gaussian clusters on the unit sphere — simulates the cluster structure real embedding models produce; this is the distribution where top-k is well-defined at any dim and all kernels agree).".into(),
+                role: OptionRole::Config },
+            OptionDesc { name: "clusters".into(), type_name: "int".into(), required: false, default: Some("16".into()),
+                description: "Synthetic 'clustered' mode: number of Gaussian clusters (default 16). More clusters → denser sphere → more ties.".into(),
+                role: OptionRole::Config },
+            OptionDesc { name: "cluster-spread".into(), type_name: "float".into(), required: false, default: Some("0.05".into()),
+                description: "Synthetic 'clustered' mode: per-vector noise std-dev relative to cluster radius (default 0.05). Smaller → tighter clusters → distances spread more widely → easier top-k.".into(),
+                role: OptionRole::Config },
         ]
     }
 
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
         let start = Instant::now();
+
+        // Force the underlying BLAS to single-threaded BEFORE any
+        // engine runs — FAISS's sgemm is multi-threaded by default,
+        // and OpenMP's non-deterministic block scheduling makes its
+        // output vary across runs with the same inputs. For a
+        // deterministic parity demo we want every sgemm caller
+        // (FAISS and our own blas-mirror) to share an identical
+        // accumulation order. Single-threaded BLAS is the only thread
+        // count that reproduces across BLAS variants.
+        #[cfg(feature = "knnutils")]
+        blas_set_single_threaded();
 
         let neighbors: usize = parse_int(options, "neighbors", 10);
         let metric = options.get("metric").unwrap_or("L2").to_string();
@@ -152,6 +214,18 @@ impl CommandOp for VerifyEngineParityOp {
             Err(e) => return error(format!("could not create workdir: {}", e), start),
         };
 
+        // Isolate the segment cache to this invocation. The shared
+        // knn segment cache in `ctx.workspace/.cache` is keyed by
+        // `(engine, file_stem, file_size, range, k, metric)` — file
+        // content isn't part of the key, so two runs with the same
+        // dim/count/k/metric but different random data produce
+        // colliding cache files. For the parity demo that's fatal:
+        // subsequent invocations happily replay stale results and
+        // the comparison stops measuring the kernels at all.
+        let isolated_cache = workdir.path().join("cache");
+        let _ = std::fs::create_dir_all(&isolated_cache);
+        let saved_ctx_cache = std::mem::replace(&mut ctx.cache, isolated_cache);
+
         // Resolve the (base, query) paths — either user-supplied or
         // synthetic-generated into the workdir.
         let (base_path, query_path) = if synthetic {
@@ -159,16 +233,43 @@ impl CommandOp for VerifyEngineParityOp {
             let base_count: usize = parse_int(options, "base-count", 10_000);
             let query_count: usize = parse_int(options, "query-count", 100);
             let seed:       u64   = parse_int(options, "seed", 42) as u64;
+            let dist_name = options.get("distribution").unwrap_or("uniform").to_lowercase();
+            let clusters: usize = parse_int(options, "clusters", 16);
+            let cluster_spread: f32 = options.get("cluster-spread")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0.05);
+            let dist = match dist_name.as_str() {
+                "uniform" => Distribution::Uniform,
+                "gaussian" | "normal" => Distribution::GaussianNormalized,
+                "clustered" | "clusters" | "embedding" => Distribution::Clustered {
+                    k: clusters.max(1),
+                    spread: cluster_spread.max(0.0),
+                },
+                other => return error(
+                    format!("unknown --distribution '{}': use 'uniform', 'gaussian', or 'clustered'", other),
+                    start,
+                ),
+            };
             let bp = workdir.path().join("base.fvec");
             let qp = workdir.path().join("query.fvec");
+            // Debug: mirror the generated fixture to /tmp so callers can
+            // inspect the exact data each engine saw.
+            if let Ok(probe) = std::env::var("VEKS_PARITY_PROBE_DIR") {
+                let _ = std::fs::create_dir_all(&probe);
+                ctx.ui.log(&format!("  PROBE: mirroring fixture to {}", probe));
+            }
             ctx.ui.log(&format!(
-                "synthetic fixture: dim={}, base={}, query={}, seed={}",
-                dim, base_count, query_count, seed));
-            if let Err(e) = write_synthetic_fvec(&bp, dim, base_count, seed) {
+                "synthetic fixture: dim={}, base={}, query={}, seed={}, distribution={}",
+                dim, base_count, query_count, seed, dist.label()));
+            if let Err(e) = write_synthetic_fvec(&bp, dim, base_count, seed, dist) {
                 return error(format!("synthetic base write: {}", e), start);
             }
-            if let Err(e) = write_synthetic_fvec(&qp, dim, query_count, seed.wrapping_add(1)) {
+            if let Err(e) = write_synthetic_fvec(&qp, dim, query_count, seed.wrapping_add(1), dist) {
                 return error(format!("synthetic query write: {}", e), start);
+            }
+            if let Ok(probe) = std::env::var("VEKS_PARITY_PROBE_DIR") {
+                let _ = std::fs::copy(&bp, std::path::Path::new(&probe).join("base.fvec"));
+                let _ = std::fs::copy(&qp, std::path::Path::new(&probe).join("query.fvec"));
             }
             (bp, qp)
         } else {
@@ -181,7 +282,10 @@ impl CommandOp for VerifyEngineParityOp {
         // --engines; otherwise we run everything that was compiled in.
         let requested: Vec<String> = options.get("engines")
             .map(|s| s.split(',').map(|t| t.trim().to_lowercase()).filter(|t| !t.is_empty()).collect())
-            .unwrap_or_else(|| vec!["metal".into(), "stdarch".into(), "blas".into(), "faiss".into()]);
+            .unwrap_or_else(|| vec![
+                "metal".into(), "stdarch".into(), "blas".into(),
+                "blas-mirror".into(), "faiss".into(),
+            ]);
         let want = |name: &str| requested.iter().any(|r| r == name);
 
         ctx.ui.log(&format!(
@@ -235,6 +339,27 @@ impl CommandOp for VerifyEngineParityOp {
             runs.push(skipped("faiss", "faiss feature not enabled (cargo build --features faiss)"));
         }
 
+        // Probe engine: mirrors FAISS's `exhaustive_L2sqr_blas_default_impl`
+        // exactly — same outer/inner block sizes, same sgemm orientation,
+        // same per-cell post-processing. If FAISS's BLAS link and ours
+        // resolve to the same library, this engine should produce
+        // bit-identical neighbor sets to FAISS at every dim.
+        #[cfg(feature = "knnutils")]
+        if want("blas-mirror") {
+            let started = Instant::now();
+            let path = workdir.path().join("blas-mirror.ivec");
+            let res = run_blas_mirror(&base_path, &query_path, &path, neighbors, &metric);
+            let elapsed = started.elapsed();
+            runs.push(match res {
+                Ok(()) => EngineRun { name: "blas-mirror", indices_path: Some(path), elapsed, note: None },
+                Err(e) => EngineRun { name: "blas-mirror", indices_path: None, elapsed, note: Some(e) },
+            });
+        }
+        #[cfg(not(feature = "knnutils"))]
+        if want("blas-mirror") {
+            runs.push(skipped("blas-mirror", "knnutils feature not enabled"));
+        }
+
         // Print run summaries.
         let mut emit = String::new();
         emit.push('\n');
@@ -253,6 +378,12 @@ impl CommandOp for VerifyEngineParityOp {
         let mut loaded: Vec<(&'static str, Vec<Vec<i32>>)> = Vec::new();
         for r in &runs {
             if let Some(p) = &r.indices_path {
+                if let Ok(probe) = std::env::var("VEKS_PARITY_PROBE_DIR") {
+                    let _ = std::fs::copy(
+                        p,
+                        std::path::Path::new(&probe).join(format!("{}.ivec", r.name)),
+                    );
+                }
                 match read_ivec_rows(p) {
                     Ok(rows) => loaded.push((r.name, rows)),
                     Err(e) => emit.push_str(&format!("  WARN: failed to read {}: {}\n", r.name, e)),
@@ -284,10 +415,11 @@ impl CommandOp for VerifyEngineParityOp {
         // Pair-wise classification table. We pin the first engine as
         // the "reference" and compare every other engine against it.
         // VerifySummary uses the static BOUNDARY_THRESHOLD constant for
-        // its own classification, so we re-classify here against the
-        // user-supplied tolerance: anything beyond `boundary_tolerance`
-        // differing neighbors flips to FAIL, regardless of which bucket
-        // it landed in.
+        // its own classification into exact / set / bound / real, so
+        // we render all four buckets (they must sum to TOTAL) and add
+        // a MAX-DIFF column showing the largest observed disagreement
+        // plus an EXCEED column counting queries that exceed the
+        // user-supplied --boundary-tolerance.
         let (ref_name, ref_rows) = loaded.first().cloned().unwrap();
         let mut any_fail = false;
         emit.push('\n');
@@ -295,11 +427,12 @@ impl CommandOp for VerifyEngineParityOp {
             "Pair-wise comparison (reference = {}, boundary-tolerance = {}):\n",
             ref_name, boundary_tolerance,
         ));
-        emit.push_str("VS                EXACT     SET   BOUND  EXCEED   TOTAL  VERDICT\n");
-        emit.push_str("──────────────── ────── ─────── ─────── ─────── ──────── ────────\n");
+        emit.push_str("VS                EXACT     SET   BOUND    REAL  MAX-DIFF  EXCEED   TOTAL  VERDICT\n");
+        emit.push_str("──────────────── ────── ─────── ─────── ─────── ───────── ─────── ──────── ────────\n");
         for (other_name, other_rows) in loaded.iter().skip(1) {
             let mut summary = VerifySummary::default();
-            let mut over_tolerance = 0usize; // queries with diff > boundary_tolerance
+            let mut max_diff = 0usize;
+            let mut over_tolerance = 0usize;
             for q in 0..n_queries {
                 let r = compare_query_ordinals(&other_rows[q], &ref_rows[q]);
                 summary.record(&r);
@@ -307,17 +440,18 @@ impl CommandOp for VerifyEngineParityOp {
                     QueryResult::ExactMatch | QueryResult::SetMatch => 0,
                     QueryResult::BoundaryMismatch(d) | QueryResult::RealMismatch(d) => d,
                 };
-                if diff > boundary_tolerance {
-                    over_tolerance += 1;
-                }
+                if diff > max_diff { max_diff = diff; }
+                if diff > boundary_tolerance { over_tolerance += 1; }
             }
             let verdict = if over_tolerance == 0 { "PASS" } else { any_fail = true; "FAIL" };
             emit.push_str(&format!(
-                "{:<16} {:>6} {:>7} {:>7} {:>7} {:>8}  {}\n",
+                "{:<16} {:>6} {:>7} {:>7} {:>7} {:>9} {:>7} {:>8}  {}\n",
                 other_name,
                 summary.exact_match,
                 summary.set_match,
                 summary.boundary_mismatch,
+                summary.real_mismatch,
+                max_diff,
                 over_tolerance,
                 summary.total,
                 verdict,
@@ -337,6 +471,8 @@ impl CommandOp for VerifyEngineParityOp {
         };
         emit.push_str(&format!("Result: {}\n", verdict));
         ctx.ui.log(&emit);
+
+        ctx.cache = saved_ctx_cache;
 
         CommandResult {
             status: if any_fail { Status::Error } else { Status::Ok },
@@ -424,22 +560,287 @@ fn skipped(name: &'static str, why: &str) -> EngineRun {
     EngineRun { name, indices_path: None, elapsed: std::time::Duration::ZERO, note: Some(why.into()) }
 }
 
-/// Deterministic xorshift64 fvec writer. Vectors are uniform in
-/// [-1, 1] — same family as the in-tree parity tests use.
-fn write_synthetic_fvec(path: &Path, dim: usize, count: usize, seed: u64) -> std::io::Result<()> {
+/// Distribution shape for the synthetic fixture.
+#[derive(Clone, Copy, PartialEq)]
+enum Distribution {
+    /// Each component drawn from U[-1, 1] independently. Pairwise
+    /// distances concentrate sharply at high dim (curse of
+    /// dimensionality), so neighbor selection collapses into the
+    /// ULP-noise regime where different sgemm callers disagree.
+    Uniform,
+    /// Each component drawn from N(0, 1), per-vector L2-normalized
+    /// onto the unit sphere. Still curse-of-dim prone: at high dim
+    /// random sphere points have `L2² ≈ 2 ± 2/√d` — distances
+    /// concentrate and the top-k is again ULP-dominated.
+    GaussianNormalized,
+    /// Mixture of `k` Gaussian clusters on the unit sphere with
+    /// per-cluster noise `spread`. Simulates the cluster structure
+    /// real embedding models produce, so pairwise distances have a
+    /// wide range (within-cluster: small; between-cluster: near √2)
+    /// and top-k is well-defined at any dimension. All kernels agree.
+    Clustered { k: usize, spread: f32 },
+}
+
+impl Distribution {
+    fn label(self) -> String {
+        match self {
+            Distribution::Uniform => "uniform".into(),
+            Distribution::GaussianNormalized => "gaussian-normalized".into(),
+            Distribution::Clustered { k, spread } => format!("clustered(k={}, σ={})", k, spread),
+        }
+    }
+}
+
+/// Deterministic xorshift64 fvec writer.
+fn write_synthetic_fvec(
+    path: &Path,
+    dim: usize,
+    count: usize,
+    seed: u64,
+    dist: Distribution,
+) -> std::io::Result<()> {
     let mut f = std::fs::File::create(path)?;
     let dim32 = dim as i32;
     let mut rng = seed.max(1);
+
+    // Closure: one uniform-[0,1) draw — building block for both modes.
+    let mut next_uniform01 = || -> f32 {
+        rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+        // Map xorshift's full u64 range into [0,1). Excluding 0 avoids
+        // the log(0) blow-up in the Box-Muller path below.
+        ((rng >> 11) as f64 / (1u64 << 53) as f64) as f32
+    };
+
+    let mut row = vec![0f32; dim];
+
+    // For clustered mode, pre-generate `k` cluster centers (unit
+    // vectors drawn from Gaussian + normalized). Base and query share
+    // the same cluster centers so queries fall near actual clusters
+    // — but the per-vector cluster assignment and noise differs,
+    // which is what would happen with real data.
+    let centers: Vec<Vec<f32>> = if let Distribution::Clustered { k, .. } = dist {
+        // Derive the center-PRNG stream from a fixed sub-seed so
+        // base.fvec and query.fvec (called with different top-level
+        // seeds) use *identical* centers.
+        let mut center_rng = 0xC1057E11_u64;
+        let mut center_next = || -> f32 {
+            center_rng ^= center_rng << 13; center_rng ^= center_rng >> 7; center_rng ^= center_rng << 17;
+            ((center_rng >> 11) as f64 / (1u64 << 53) as f64) as f32
+        };
+        (0..k).map(|_| {
+            let mut c = vec![0f32; dim];
+            fill_gaussian(&mut c, &mut center_next);
+            normalize(&mut c);
+            c
+        }).collect()
+    } else {
+        Vec::new()
+    };
+
     for _ in 0..count {
+        match dist {
+            Distribution::Uniform => {
+                for v in row.iter_mut() {
+                    *v = next_uniform01() * 2.0 - 1.0;
+                }
+            }
+            Distribution::GaussianNormalized => {
+                fill_gaussian(&mut row, &mut next_uniform01);
+                normalize(&mut row);
+            }
+            Distribution::Clustered { k, spread } => {
+                // Pick a uniform cluster, add spread·N(0,1) noise,
+                // normalize back to the unit sphere. The resulting
+                // pairwise distances have a bimodal distribution —
+                // small within-cluster, ~√2 between-cluster — so
+                // top-k is well-defined at any dimension.
+                let c_idx = (next_uniform01() * k as f32) as usize;
+                let c_idx = c_idx.min(k - 1);
+                fill_gaussian(&mut row, &mut next_uniform01);
+                for (i, v) in row.iter_mut().enumerate() {
+                    *v = centers[c_idx][i] + *v * spread;
+                }
+                normalize(&mut row);
+            }
+        }
+
         f.write_all(&dim32.to_le_bytes())?;
-        for _ in 0..dim {
-            rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
-            let v: f32 = (rng as f32 / u64::MAX as f32) * 2.0 - 1.0;
+        for v in &row {
             f.write_all(&v.to_le_bytes())?;
         }
     }
     Ok(())
 }
+
+/// Fill a row with i.i.d. N(0,1) samples via Box-Muller.
+fn fill_gaussian<F: FnMut() -> f32>(row: &mut [f32], rng: &mut F) {
+    let dim = row.len();
+    let mut d = 0;
+    while d < dim {
+        let u1 = rng().max(f32::MIN_POSITIVE);
+        let u2 = rng();
+        let r = (-2.0 * u1.ln()).sqrt();
+        let theta = 2.0 * std::f32::consts::PI * u2;
+        let z0 = r * theta.cos();
+        let z1 = r * theta.sin();
+        row[d] = z0;
+        if d + 1 < dim { row[d + 1] = z1; }
+        d += 2;
+    }
+}
+
+/// Per-vector L2-normalize in place.
+fn normalize(row: &mut [f32]) {
+    let norm_sq: f32 = row.iter().map(|x| x * x).sum();
+    let inv = if norm_sq > 0.0 { 1.0 / norm_sq.sqrt() } else { 0.0 };
+    for v in row.iter_mut() { *v *= inv; }
+}
+
+/// FAISS-mirror KNN: replicates `exhaustive_L2sqr_blas_default_impl`
+/// byte-for-byte (modulo BLAS library choice).
+///
+/// Pattern:
+/// - Outer loop: queries in blocks of `BS_X = 4096` (FAISS's
+///   `distance_compute_blas_query_bs`)
+/// - Inner loop: base in blocks of `BS_Y = 1024` (FAISS's
+///   `distance_compute_blas_database_bs`)
+/// - Per inner block: single `cblas_sgemm` computing the `(nb × nq)`
+///   dot-product matrix with FAISS's exact orientation and `alpha = 1`
+/// - Post-process per cell: `dis = ‖q‖² + ‖b‖² − 2·ip`, clamped ≥ 0
+/// - Update a per-query max-heap of the top-k
+///
+/// The entire base is read into RAM — matches FAISS for the fixtures
+/// the parity demo cares about. Streaming + sgemm for billion-vector
+/// datasets is the job of `compute knn-blas`; this is strictly for
+/// proving the parity hypothesis.
+#[cfg(feature = "knnutils")]
+fn run_blas_mirror(
+    base_path: &Path,
+    query_path: &Path,
+    out_path: &Path,
+    k: usize,
+    metric: &str,
+) -> Result<(), String> {
+    use vectordata::VectorReader;
+    use vectordata::io::MmapVectorReader;
+
+    if metric != "L2" {
+        return Err(format!("blas-mirror currently implements L2 only (got {})", metric));
+    }
+
+    let base_reader = MmapVectorReader::<f32>::open_fvec(base_path)
+        .map_err(|e| format!("open {}: {}", base_path.display(), e))?;
+    let query_reader = MmapVectorReader::<f32>::open_fvec(query_path)
+        .map_err(|e| format!("open {}: {}", query_path.display(), e))?;
+
+    let n_base  = <MmapVectorReader<f32> as VectorReader<f32>>::count(&base_reader);
+    let n_query = <MmapVectorReader<f32> as VectorReader<f32>>::count(&query_reader);
+    let dim     = <MmapVectorReader<f32> as VectorReader<f32>>::dim(&base_reader);
+    let qdim    = <MmapVectorReader<f32> as VectorReader<f32>>::dim(&query_reader);
+    if dim != qdim {
+        return Err(format!("dim mismatch: base={}, query={}", dim, qdim));
+    }
+
+    // Load contiguous f32 payloads (strip the per-entry dim header).
+    let mut base_data: Vec<f32> = Vec::with_capacity(n_base * dim);
+    for i in 0..n_base {
+        base_data.extend_from_slice(base_reader.get_slice(i));
+    }
+    let mut query_data: Vec<f32> = Vec::with_capacity(n_query * dim);
+    for i in 0..n_query {
+        query_data.extend_from_slice(query_reader.get_slice(i));
+    }
+
+    // Precompute per-query and per-base squared norms (FAISS does the same).
+    let q_norms_sq: Vec<f32> = (0..n_query).map(|i| {
+        let s = &query_data[i * dim..(i + 1) * dim];
+        s.iter().map(|v| v * v).sum::<f32>()
+    }).collect();
+    let b_norms_sq: Vec<f32> = (0..n_base).map(|j| {
+        let s = &base_data[j * dim..(j + 1) * dim];
+        s.iter().map(|v| v * v).sum::<f32>()
+    }).collect();
+
+    const BS_X: usize = 4096; // FAISS distance_compute_blas_query_bs
+    const BS_Y: usize = 1024; // FAISS distance_compute_blas_database_bs
+
+    let mut heaps: Vec<std::collections::BinaryHeap<Neighbor>> =
+        (0..n_query).map(|_| std::collections::BinaryHeap::with_capacity(k + 1)).collect();
+    let mut ip_block = vec![0f32; BS_X * BS_Y];
+
+    let mut i0 = 0;
+    while i0 < n_query {
+        let i1 = (i0 + BS_X).min(n_query);
+        let nxi = i1 - i0;
+
+        let mut j0 = 0;
+        while j0 < n_base {
+            let j1 = (j0 + BS_Y).min(n_base);
+            let nyi = j1 - j0;
+
+            // Row-major equivalent of FAISS's column-major
+            //   sgemm_("T", "N", nyi, nxi, di, 1, y+j0*d, di, x+i0*d, di, 0, ip, nyi).
+            //
+            // Column-major(T,N,M=nyi,N=nxi,K=di,A=y,lda=di,B=x,ldb=di,C,ldc=nyi)
+            // is layout-equivalent to row-major with A/B swapped and M/N
+            // swapped, with the transpose flag flipped. cblas handles
+            // this via ROW_MAJOR + NO_TRANS + TRANS with swapped shapes.
+            // Result `ip_block[i * nyi + j]` = query[i0+i] · base[j0+j].
+            unsafe {
+                cblas_sgemm(
+                    CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_TRANS,
+                    nxi as i32, nyi as i32, dim as i32,
+                    1.0,
+                    query_data.as_ptr().add(i0 * dim), dim as i32,
+                    base_data.as_ptr().add(j0 * dim),  dim as i32,
+                    0.0,
+                    ip_block.as_mut_ptr(), nyi as i32,
+                );
+            }
+
+            // Per-cell: dis = ‖q‖² + ‖b‖² - 2·ip, clamp, heap update.
+            for qi_local in 0..nxi {
+                let qi_global = i0 + qi_local;
+                let qn = q_norms_sq[qi_global];
+                let row = &ip_block[qi_local * nyi..qi_local * nyi + nyi];
+                for bi_local in 0..nyi {
+                    let bi_global = j0 + bi_local;
+                    let bn = b_norms_sq[bi_global];
+                    let ip = row[bi_local];
+                    let mut dis = qn + bn - 2.0 * ip;
+                    if dis < 0.0 { dis = 0.0; }
+                    heaps[qi_global].push(Neighbor { index: bi_global as u32, distance: dis });
+                    if heaps[qi_global].len() > k {
+                        heaps[qi_global].pop();
+                    }
+                }
+            }
+
+            j0 = j1;
+        }
+        i0 = i1;
+    }
+
+    // Emit ivec with per-query sorted top-k.
+    let mut f = std::fs::File::create(out_path)
+        .map_err(|e| format!("create {}: {}", out_path.display(), e))?;
+    let dim_bytes = (k as i32).to_le_bytes();
+    for h in heaps.into_iter() {
+        let mut v: Vec<Neighbor> = h.into_vec();
+        v.sort_by(|a, b| a.distance.partial_cmp(&b.distance)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.index.cmp(&b.index)));
+        f.write_all(&dim_bytes).map_err(|e| e.to_string())?;
+        for j in 0..k {
+            let idx = if j < v.len() { v[j].index as i32 } else { -1 };
+            f.write_all(&idx.to_le_bytes()).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "knnutils")]
+use super::compute_knn::Neighbor;
 
 #[cfg(test)]
 mod tests {

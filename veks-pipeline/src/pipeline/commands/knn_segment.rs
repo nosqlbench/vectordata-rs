@@ -155,9 +155,24 @@ pub(super) fn resolve_cosine_mode_for(
 }
 
 /// Derive a cache-key prefix from the base and query file paths.
-/// Includes file sizes so the cache is auto-invalidated when data
-/// changes (e.g., after `prepare-vectors` produces a new
-/// `base_vectors.fvecs` of different size).
+///
+/// Returns `{base_stem}.{query_stem}.{base_size}_{query_size}` — the
+/// per-dataset-pair component of the cache path. The full cache
+/// filename is built by [`build_cache_path`], which prepends the
+/// **engine name** (`knn-metal`, `knn-stdarch`, `knn-blas`, …) so
+/// engines never replay each other's output. That engine prefix is
+/// the load-bearing differentiator: every `compute knn*`
+/// implementation declares a unique single-word name (see each
+/// engine's `ENGINE_NAME` constant), and the contract is that two
+/// engines with different numerical behavior MUST have different
+/// names.
+///
+/// Same-engine, same-file-paths, same-file-sizes, different-content
+/// inputs still collide on this prefix by design: users running
+/// repeated experiments on top of the same output paths are
+/// responsible for either regenerating through the pipeline (which
+/// bumps the pipeline fingerprint), pointing the engine at a fresh
+/// workspace, or clearing `<workspace>/.cache`.
 pub(super) fn cache_prefix_for(base_path: &Path, query_path: &Path) -> String {
     let base_stem = base_path.file_stem().unwrap_or_default().to_string_lossy();
     let query_stem = query_path.file_stem().unwrap_or_default().to_string_lossy();
@@ -473,4 +488,40 @@ pub(super) fn scan_cached_segments(
         ));
     }
     segments
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    /// Regression: two engines (different `engine` strings) scanning
+    /// the same input files MUST land on different cache paths. This
+    /// guards the contract that each `compute knn*` implementation
+    /// writes under its own single-word namespace and never replays
+    /// another engine's output.
+    #[test]
+    fn build_cache_path_distinguishes_engines() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("base.fvec");
+        let query = tmp.path().join("query.fvec");
+        std::fs::File::create(&base).unwrap().write_all(&[0u8; 64]).unwrap();
+        std::fs::File::create(&query).unwrap().write_all(&[0u8; 32]).unwrap();
+
+        let prefix = cache_prefix_for(&base, &query);
+        let p_metal   = build_cache_path(tmp.path(), "knn-metal",   &prefix, 0, 1000, 10, Metric::L2, "neighbors", "ivec");
+        let p_stdarch = build_cache_path(tmp.path(), "knn-stdarch", &prefix, 0, 1000, 10, Metric::L2, "neighbors", "ivec");
+        let p_blas    = build_cache_path(tmp.path(), "knn-blas",    &prefix, 0, 1000, 10, Metric::L2, "neighbors", "ivec");
+
+        assert_ne!(p_metal, p_stdarch);
+        assert_ne!(p_stdarch, p_blas);
+        assert_ne!(p_metal, p_blas);
+
+        // Engine name must be the leading filename component so
+        // directory-scan discovery (which filters by engine prefix)
+        // can distinguish them.
+        assert!(p_metal.file_name().unwrap().to_string_lossy().starts_with("knn-metal."));
+        assert!(p_stdarch.file_name().unwrap().to_string_lossy().starts_with("knn-stdarch."));
+        assert!(p_blas.file_name().unwrap().to_string_lossy().starts_with("knn-blas."));
+    }
 }
