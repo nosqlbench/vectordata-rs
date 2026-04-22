@@ -975,11 +975,11 @@ mod tests {
     #[test]
     fn strip_prefix_trims_subpaths() {
         assert_eq!(
-            strip_prefix("datapile-v0.8-1B/file1.bin", "datapile-v0.8-1B/"),
+            strip_prefix("bulk-v0.8-1B/file1.bin", "bulk-v0.8-1B/"),
             "file1.bin"
         );
         assert_eq!(
-            strip_prefix("datapile-v0.8-1B/sub/file2.bin", "datapile-v0.8-1B/"),
+            strip_prefix("bulk-v0.8-1B/sub/file2.bin", "bulk-v0.8-1B/"),
             "sub/file2.bin"
         );
         assert_eq!(strip_prefix("file.bin", ""), "file.bin");

@@ -568,19 +568,19 @@ mod tests {
         let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
 <ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
   <Name>gtkbackup</Name>
-  <Prefix>datapile-v0.8-1B/</Prefix>
+  <Prefix>bulk-v0.8-1B/</Prefix>
   <KeyCount>2</KeyCount>
   <MaxKeys>1000</MaxKeys>
   <IsTruncated>false</IsTruncated>
   <Contents>
-    <Key>datapile-v0.8-1B/file1.bin</Key>
+    <Key>bulk-v0.8-1B/file1.bin</Key>
     <LastModified>2024-01-01T00:00:00.000Z</LastModified>
     <ETag>"abc"</ETag>
     <Size>12345</Size>
     <StorageClass>STANDARD</StorageClass>
   </Contents>
   <Contents>
-    <Key>datapile-v0.8-1B/sub/file2.bin</Key>
+    <Key>bulk-v0.8-1B/sub/file2.bin</Key>
     <LastModified>2024-01-02T00:00:00.000Z</LastModified>
     <ETag>"def"</ETag>
     <Size>6789</Size>
@@ -589,8 +589,8 @@ mod tests {
 </ListBucketResult>"#;
         let page = parse_list_response(xml).unwrap();
         assert_eq!(page.objects.len(), 2);
-        assert_eq!(page.objects[0], ("datapile-v0.8-1B/file1.bin".to_string(), 12345));
-        assert_eq!(page.objects[1], ("datapile-v0.8-1B/sub/file2.bin".to_string(), 6789));
+        assert_eq!(page.objects[0], ("bulk-v0.8-1B/file1.bin".to_string(), 12345));
+        assert_eq!(page.objects[1], ("bulk-v0.8-1B/sub/file2.bin".to_string(), 6789));
         assert!(!page.is_truncated);
         assert!(page.next_continuation_token.is_none());
     }
@@ -632,10 +632,10 @@ mod tests {
                 session_token: None,
             },
         ).unwrap();
-        let (url, headers) = ctx.signed_get("datapile-v0.8-1B/file1.bin");
+        let (url, headers) = ctx.signed_get("bulk-v0.8-1B/file1.bin");
         assert_eq!(
             url,
-            "https://s3.us-south.cloud-object-storage.appdomain.cloud/gtkbackup/datapile-v0.8-1B/file1.bin"
+            "https://s3.us-south.cloud-object-storage.appdomain.cloud/gtkbackup/bulk-v0.8-1B/file1.bin"
         );
         assert!(headers.contains_key(AUTHORIZATION));
         assert!(headers.contains_key("x-amz-date"));
@@ -654,11 +654,11 @@ mod tests {
                 session_token: None,
             },
         ).unwrap();
-        let (url, _headers) = ctx.signed_list("datapile-v0.8-1B/", Some("tok=en"));
+        let (url, _headers) = ctx.signed_list("bulk-v0.8-1B/", Some("tok=en"));
         // Sorted by key: continuation-token, list-type, prefix
-        // Each value strict-encoded: "tok=en" -> "tok%3Den", "datapile-v0.8-1B/" -> "datapile-v0.8-1B%2F"
+        // Each value strict-encoded: "tok=en" -> "tok%3Den", "bulk-v0.8-1B/" -> "bulk-v0.8-1B%2F"
         assert!(
-            url.ends_with("?continuation-token=tok%3Den&list-type=2&prefix=datapile-v0.8-1B%2F"),
+            url.ends_with("?continuation-token=tok%3Den&list-type=2&prefix=bulk-v0.8-1B%2F"),
             "got url: {}", url
         );
     }
