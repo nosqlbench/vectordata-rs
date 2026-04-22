@@ -78,6 +78,39 @@ pub fn set_and_save(dataset_dir: &Path, name: &str, value: &str) -> Result<(), S
     save(dataset_dir, &vars)
 }
 
+/// Set a single attribute on `dataset.yaml` and persist via the canonical
+/// `DatasetConfig::save()` API.
+///
+/// Used by stand-alone analysis commands (`analyze find-zeros`,
+/// `analyze find-duplicates`) so that running the scan as a one-shot
+/// fills in `is_zero_vector_free` / `is_duplicate_vector_free` without
+/// requiring a full pipeline replay.
+///
+/// Attribute writes do not appear in any step's resolved option map, so
+/// fingerprints of unrelated steps (compute-knn, verify-knn, generate-*)
+/// stay valid — the next `veks run` won't re-trigger downstream work.
+///
+/// Silent no-op when the dataset file is missing or unparseable; the
+/// stand-alone command still succeeds based on its own scan output.
+pub fn set_dataset_attribute(dataset_dir: &Path, key: &str, value: &str) -> Result<(), String> {
+    use vectordata::dataset::DatasetConfig;
+    let candidates = ["dataset.yaml", "dataset.yml"];
+    let dataset_path = match candidates.iter()
+        .map(|n| dataset_dir.join(n))
+        .find(|p| p.exists())
+    {
+        Some(p) => p,
+        None => return Ok(()), // no dataset file to update — nothing to do
+    };
+    let mut config = DatasetConfig::load(&dataset_path)
+        .map_err(|e| format!("load {}: {}", dataset_path.display(), e))?;
+    if !config.set_attribute(key, value) {
+        return Err(format!("unknown attribute key: {}", key));
+    }
+    config.save(&dataset_path)
+        .map_err(|e| format!("save {}: {}", dataset_path.display(), e))
+}
+
 /// Evaluate an expression to a string value.
 ///
 /// Supported expressions:

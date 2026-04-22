@@ -21,7 +21,47 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
     Terminal,
 };
+use unicode_width::UnicodeWidthStr;
 use vectordata::dataset::CatalogEntry;
+
+/// Pad a string to `target` DISPLAY columns (not bytes). Rust's built-in
+/// `format!("{:<w$}", ...)` pads by byte count, which under-reserves
+/// columns whenever the content contains multi-byte glyphs like the
+/// tree-drawing unicode (`▸`, `▾`, `└` — 3 bytes each, 1 column each).
+/// In the picker, that bug let the PROFILE column drift left and kiss
+/// the DATASET column on any row whose name had a tree prefix.
+fn pad_display(s: &str, target: usize) -> String {
+    let w = UnicodeWidthStr::width(s);
+    if w >= target {
+        s.to_string()
+    } else {
+        let mut out = String::with_capacity(s.len() + (target - w));
+        out.push_str(s);
+        for _ in 0..(target - w) {
+            out.push(' ');
+        }
+        out
+    }
+}
+
+/// Truncate a string to at most `target` DISPLAY columns, then pad to
+/// exactly `target`. Matches the behaviour the original code tried to
+/// get out of `format!("{:.w$}", ...)` — that formatter also counts
+/// bytes, not columns, so long UTF-8 strings would overflow the cell.
+fn fit_display(s: &str, target: usize) -> String {
+    let mut out = String::new();
+    let mut used = 0usize;
+    for ch in s.chars() {
+        let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + cw > target { break; }
+        out.push(ch);
+        used += cw;
+    }
+    for _ in used..target {
+        out.push(' ');
+    }
+    out
+}
 
 use crate::catalog::resolver::Catalog;
 use crate::catalog::sources::CatalogSources;
@@ -344,25 +384,42 @@ pub fn run_picker() -> Option<String> {
                 );
             } else {
 
-            // Column widths — name column fits the longest dataset name + tree prefix
+            // Column widths measured in DISPLAY columns. The tree prefix
+            // (" ▸ ", " ▾ ", "  └ ", "   ") is up to 4 display cols wide,
+            // so reserve 4 on top of the longest dataset name, plus 2
+            // trailing blanks so the PROFILE column has a visible gap
+            // even when the widest row fills its cell edge-to-edge.
             let name_w = visible.iter()
-                .map(|r| r.dataset.len() + 5) // 5 for tree prefix " ▸ " etc
+                .map(|r| UnicodeWidthStr::width(r.dataset.as_str()) + 4 + 2)
                 .max()
                 .unwrap_or(20)
+                .max(12);
+            // PROFILE column sized to fit the longest profile name plus
+            // a trailing gap. Default of 14 is plenty for `default`,
+            // `1m`, `40mi` etc., but partition / user-named profiles
+            // can run longer.
+            let prof_w = visible.iter()
+                .map(|r| UnicodeWidthStr::width(r.profile.as_str()) + 2)
+                .max()
+                .unwrap_or(14)
                 .max(10);
-            let prof_w = 14;
             let facet_w = 12;
             let metric_w = 14;
             let size_w = 10;
             let cache_w = 18;
 
+            // Header and data rows share the same cell widths so columns
+            // line up edge-to-edge. Data rows get their leading whitespace
+            // from the tree prefix (3–4 display columns depending on
+            // shape); the header pads DATASET to the same `name_w` so
+            // the PROFILE column lands at identical offsets in both.
             let mut lines = vec![Line::from(vec![
-                Span::styled(format!(" {:<name_w$}", "DATASET"), Style::default().fg(Color::DarkGray)),
-                Span::styled(format!("{:<prof_w$}", "PROFILE"), Style::default().fg(Color::DarkGray)),
-                Span::styled(format!("{:<facet_w$}", "FACETS"), Style::default().fg(Color::DarkGray)),
-                Span::styled(format!("{:<metric_w$}", "METRIC"), Style::default().fg(Color::DarkGray)),
-                Span::styled(format!("{:<size_w$}", "SIZE"), Style::default().fg(Color::DarkGray)),
-                Span::styled(format!("{:<cache_w$}", "CACHED"), Style::default().fg(Color::DarkGray)),
+                Span::styled(pad_display("DATASET", name_w), Style::default().fg(Color::DarkGray)),
+                Span::styled(pad_display("PROFILE", prof_w), Style::default().fg(Color::DarkGray)),
+                Span::styled(pad_display("FACETS", facet_w), Style::default().fg(Color::DarkGray)),
+                Span::styled(pad_display("METRIC", metric_w), Style::default().fg(Color::DarkGray)),
+                Span::styled(pad_display("SIZE", size_w), Style::default().fg(Color::DarkGray)),
+                Span::styled(pad_display("CACHED", cache_w), Style::default().fg(Color::DarkGray)),
             ])];
 
             for (i, row) in visible.iter().enumerate().skip(scroll).take(list_height.saturating_sub(1)) {
@@ -401,19 +458,15 @@ pub fn run_picker() -> Option<String> {
                 };
 
                 let name_field = format!("{}{}", prefix, name_display);
-                let name_truncated = if name_field.len() > name_w {
-                    format!("{:.w$}", name_field, w = name_w)
-                } else {
-                    format!("{:<name_w$}", name_field)
-                };
+                let name_cell = fit_display(&name_field, name_w);
 
                 lines.push(Line::from(vec![
-                    Span::styled(name_truncated, style),
-                    Span::styled(format!("{:<prof_w$}", &row.profile), style),
-                    Span::styled(format!("{:<facet_w$}", &row.facets), style),
-                    Span::styled(format!("{:<metric_w$}", &row.metric), style),
-                    Span::styled(format!("{:<size_w$}", &row.size), style),
-                    Span::styled(format!("{:<cache_w$}", &row.cache_status), cache_style),
+                    Span::styled(name_cell, style),
+                    Span::styled(pad_display(&row.profile, prof_w), style),
+                    Span::styled(pad_display(&row.facets, facet_w), style),
+                    Span::styled(pad_display(&row.metric, metric_w), style),
+                    Span::styled(pad_display(&row.size, size_w), style),
+                    Span::styled(pad_display(&row.cache_status, cache_w), cache_style),
                 ]));
             }
 

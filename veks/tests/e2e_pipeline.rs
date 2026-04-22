@@ -59,6 +59,8 @@ fn default_args(name: &str, output: &Path) -> ImportArgs {
         no_dedup: false,
         no_filtered: false,
         no_zero_check: false,
+        duplicate_count: None,
+        zero_count: None,
         normalize: false,
         force: true,
         base_convert_format: None,
@@ -1181,9 +1183,20 @@ fn e2e_early_stratification() {
     assert!(out.join("profiles/default/neighbor_indices.ivecs").exists(),
         "default profile KNN indices should exist");
 
-    // Check dataset.yaml has the sized profile
+    // Check dataset.yaml has the sized profile materialized.
+    // The finalize pass (generate-dataset-json) re-saves the file in
+    // expanded form so consumers don't need to interpret the compact
+    // generator grammar; concrete profile entries with a `base_count`
+    // are what ships. (We accept the unexpanded root-level `strata:`
+    // spec too — useful for callers that skip the finalize pass.)
     let yaml = std::fs::read_to_string(out.join("dataset.yaml")).unwrap();
-    assert!(yaml.contains("sized:"), "sized: key should be in dataset.yaml");
+    let has_sized_profile = yaml.lines().any(|line| line.trim_start().starts_with("base_count:"));
+    let has_strata_spec = yaml.contains("\nstrata:");
+    assert!(
+        has_sized_profile || has_strata_spec,
+        "expected a concrete sized profile entry (with `base_count`) or the root-level `strata:` spec in dataset.yaml, got:\n{}",
+        yaml,
+    );
 }
 
 /// E2E: Early stratification with base fraction.

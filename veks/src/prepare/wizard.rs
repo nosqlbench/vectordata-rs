@@ -264,6 +264,8 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
             description: None,
             no_dedup: false,
             no_zero_check: false,
+            duplicate_count: None,
+            zero_count: None,
             no_filtered: false,
             normalize: true,
             force: false,
@@ -884,19 +886,45 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
     // are advisory only — the GT was computed against the original ordinal
     // space, so we cannot reindex without invalidating it. The checks
     // still run and report findings, but no exclusion ordinals are generated.
-    let (no_dedup, no_zero_check) = if has_precomputed_gt && base_vectors.is_some() {
-        println!("  Ground truth is pre-computed — dedup/zero checks will be advisory only.");
-        println!("  (Cannot exclude vectors without invalidating ground truth ordinals.)");
-        // Still run the checks but mark them as advisory
-        (true, true) // no ordinal exclusion
-    } else if base_vectors.is_some() {
-        let nd = !confirm("Include deduplication stage?", true);
-        let default_yes = !nd;
-        let nz = !confirm("Check for and exclude zero vectors?", default_yes);
-        (nd, nz)
-    } else {
-        (true, true)
-    };
+    let (no_dedup, no_zero_check, duplicate_count_override, zero_count_override) =
+        if has_precomputed_gt && base_vectors.is_some() {
+            println!("  Ground truth is pre-computed — dedup/zero checks will be advisory only.");
+            println!("  (Cannot exclude vectors without invalidating ground truth ordinals.)");
+            // Still run the checks but mark them as advisory
+            (true, true, None, None) // no ordinal exclusion
+        } else if base_vectors.is_some() {
+            let nd = !confirm("Include deduplication stage?", true);
+            let default_yes = !nd;
+            let nz = !confirm("Check for and exclude zero vectors?", default_yes);
+
+            // When the user declines cleaning, the pipeline would
+            // otherwise still have to run a full-file scan just to
+            // populate `duplicate_count` / `zero_count` (needed for
+            // the `is_*_free` attributes that `veks check` requires).
+            // Skip the scan entirely if the user can assert the
+            // counts now — the default of 0 fits the common case
+            // "I've already checked this source" and satisfies
+            // `dataset-attributes` immediately.
+            let dup_override = if nd {
+                Some(prompt_u64(
+                    "  How many duplicate vectors are in the source? (we'll skip the dedup scan)",
+                    0,
+                ))
+            } else {
+                None
+            };
+            let zero_override = if nz {
+                Some(prompt_u64(
+                    "  How many zero vectors are in the source? (we'll skip the zero scan)",
+                    0,
+                ))
+            } else {
+                None
+            };
+            (nd, nz, dup_override, zero_override)
+        } else {
+            (true, true, None, None)
+        };
 
     if !no_dedup && !no_zero_check {
         println!("  A clean ordinal index will be produced excluding both duplicates and zeros.");
@@ -1313,6 +1341,8 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
         description,
         no_dedup,
         no_zero_check,
+        duplicate_count: duplicate_count_override,
+        zero_count: zero_count_override,
         no_filtered,
         normalize,
         force: true, // user already confirmed overwrite above
@@ -2261,6 +2291,34 @@ fn confirm(question: &str, default: bool) -> bool {
         default
     } else {
         trimmed.starts_with('y')
+    }
+}
+
+/// Non-negative integer prompt with a default value. Used by the
+/// "you declined cleaning but we still need accurate counts for the
+/// `is_*_free` attributes" follow-up questions; the default of 0 is
+/// the common case (the user already knows the source is clean) and
+/// satisfies `veks check dataset-attributes` without forcing another
+/// full-scan pass over the source file.
+fn prompt_u64(question: &str, default: u64) -> u64 {
+    if AUTO_ACCEPT.load(Ordering::Relaxed) {
+        eprintln!("{} [{}]: {}", question, default, default);
+        return default;
+    }
+    loop {
+        eprint!("{} [{}]: ", question, default);
+        io::stderr().flush().unwrap_or(());
+        let mut input = String::new();
+        io::stdin().read_line(&mut input).unwrap_or(0);
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            return default;
+        }
+        // Accept bare integers and SI-suffixed counts ("100k", "2m").
+        match vectordata::dataset::source::parse_number_with_suffix(trimmed) {
+            Ok(n) => return n,
+            Err(_) => eprintln!("  invalid number '{}', try again", trimmed),
+        }
     }
 }
 

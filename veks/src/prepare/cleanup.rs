@@ -349,6 +349,8 @@ pub fn run(args: CleanupArgs) {
             description: None,
             no_dedup: false,
             no_zero_check: false,
+            duplicate_count: None,
+            zero_count: None,
             no_filtered: true,
             normalize: false,
             force: true,

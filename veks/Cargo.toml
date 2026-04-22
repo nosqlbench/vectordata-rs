@@ -40,6 +40,7 @@ serde_json = "1"
 serde_yaml = "0.9"
 signal-hook = "0.3"
 simsimd = "6"
+unicode-width = "0.2"
 slabtastic = { path = "../slabtastic", version = "0.17.0" }
 vectordata = { path = "../vectordata", version = "0.21.0" }
 veks-core = { path = "../veks-core", version = "0.21.0" }
@@ -63,3 +64,12 @@ arrow = "54"
 parquet = "54"
 shadow-terminal = "0.2"
 tempfile = "3"
+# Used by the HTTP-served sized-profile e2e test (tests/e2e_http_sized_profiles.rs).
+# Mirrors the stack the vectordata crate uses for its own HTTP access tests —
+# axum + tower-http's ServeDir gives us a standards-compliant Range/HEAD
+# static server that the vectordata client then hits through its public
+# `TestDataGroup::load(url)` API.
+axum = "0.8"
+tokio = { version = "1", features = ["rt", "net", "macros"] }
+tower-http = { version = "0.6", features = ["fs"] }
+url = "2.5"

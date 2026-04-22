@@ -33,6 +33,16 @@ pub struct ImportArgs {
     pub description: Option<String>,
     pub no_dedup: bool,
     pub no_zero_check: bool,
+    /// User-supplied count asserted when `no_dedup=true`. When set,
+    /// bootstrap writes `duplicate_count=<v>` into `variables.yaml` and
+    /// skips `scan-duplicates` — the derived attribute
+    /// `is_duplicate_vector_free` still lands in `dataset.yaml` through
+    /// the normal sync path. `None` with `no_dedup=true` means "count
+    /// unknown" and `scan-duplicates` still runs.
+    pub duplicate_count: Option<u64>,
+    /// User-supplied zero count. Same semantics as `duplicate_count`
+    /// but for `no_zero_check` / `scan-zeros` / `is_zero_vector_free`.
+    pub zero_count: Option<u64>,
     pub no_filtered: bool,
     pub normalize: bool,
     pub force: bool,
@@ -1236,17 +1246,26 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
         // The exclusion set (duplicates ∪ zeros) is applied directly by
         // extract-base and extract-queries.
     } else if !slots.base_vectors.path().is_empty() {
-        // When prepare-vectors is skipped (Identity base, no dedup), the
-        // dataset attributes for zero/duplicate counts come from these
-        // standalone scans. Respect the user's --no-zero-check /
-        // --no-dedup answers per the sysref §7.4.1 rule: a user-supplied
-        // "no" is never silently overridden — even when the side-effect
-        // is just dataset-attribute population.
-        if !args.no_zero_check {
+        // When prepare-vectors is NOT materialized (Identity base, no
+        // removal requested), `zero_count` / `duplicate_count` must
+        // come from one of:
+        //   1. Standalone `scan-zeros` / `scan-duplicates` pipeline
+        //      steps — a full-file scan that populates the variable.
+        //   2. A user-asserted count seeded into `variables.yaml` at
+        //      bootstrap (the wizard asks "how many zeros?" with
+        //      default 0 when the user declines removal).
+        //
+        // Option 2 is the escape hatch for billion-vector sources
+        // where the user already knows the source is clean — the
+        // scan would take 15+ minutes only to confirm a zero. Skip
+        // the step only when the count is explicitly asserted;
+        // otherwise the scan MUST run so `veks check` can see
+        // `is_*_free` populated in `dataset.yaml`.
+        if args.zero_count.is_none() {
             steps.push(Step {
                 id: "scan-zeros".into(),
                 run: "analyze find-zeros".into(),
-                description: Some("Scan source vectors for zero vectors".into()),
+                description: Some("Scan source vectors for zero vectors (populates is_zero_vector_free)".into()),
                 after: vec!["count-vectors".into()],
                 per_profile: false,
                 phase: 0,
@@ -1256,11 +1275,11 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
                 ],
             });
         }
-        if !args.no_dedup {
+        if args.duplicate_count.is_none() {
             steps.push(Step {
                 id: "scan-duplicates".into(),
                 run: "analyze find-duplicates".into(),
-                description: Some("Scan source vectors for duplicates".into()),
+                description: Some("Scan source vectors for duplicates (populates is_duplicate_vector_free)".into()),
                 after: vec!["count-vectors".into()],
                 per_profile: false,
                 phase: 0,
@@ -2367,9 +2386,25 @@ fn generate_yaml(
     if let Some(ref scope) = oracle_scope_opt {
         out.push_str(&format!("  oracle_scope: {}\n", scope));
     }
+    // Bake user-asserted counts directly into the attributes so they
+    // survive any subsequent `veks run --reset` that wipes
+    // `variables.yaml`. Without this, a reset cycle would drop the
+    // zero/duplicate seeds, the pipeline would produce no scan steps
+    // (bootstrap skipped them based on the same assertion), and
+    // `update_dataset_attributes` would have nothing to sync — so
+    // `veks check dataset-attributes` would go red again despite the
+    // wizard answer being accurate.
+    if let Some(z) = args.zero_count {
+        out.push_str(&format!("  is_zero_vector_free: {}\n", z == 0));
+    }
+    if let Some(d) = args.duplicate_count {
+        out.push_str(&format!("  is_duplicate_vector_free: {}\n", d == 0));
+    }
     // is_normalized, is_duplicate_vector_free, and is_zero_vector_free
     // are set by the pipeline after the relevant steps complete — not
     // at generation time when correctness hasn't been verified yet.
+    // Exception: when the user asserted the counts up front (above),
+    // we can record the derived boolean immediately.
 
     // Upstream pipeline
     if !steps.is_empty() {
@@ -2411,70 +2446,32 @@ fn generate_yaml(
         }
     }
 
+    // strata — root-level sized-profile generator specs (the
+    // `mul:/fib:/linear:/N..M/K` grammar). Moved out from under
+    // `profiles:` so consumers reading the profile map never have
+    // to special-case a non-profile key. Per-profile view paths
+    // are derived at expand time from the per_profile pipeline
+    // templates (`derive_views_from_templates`), so we no longer
+    // need the `facets:` sub-map here either.
+    if let Some(spec) = args.sized_profiles.as_ref() {
+        let specs: Vec<&str> = spec.split(',').map(|s| s.trim()).collect();
+        // Human-readable header comments explaining each expression,
+        // then the flat sequence `serde` expects for `Vec<String>`.
+        out.push_str("\n");
+        for s in &specs {
+            let desc = describe_sized_spec(s);
+            out.push_str(&format!("# strata \"{}\": {}\n", s, desc));
+        }
+        let formatted: Vec<String> = specs.iter().map(|s| format!("\"{}\"", s)).collect();
+        out.push_str(&format!("strata: [{}]\n", formatted.join(", ")));
+    }
+
     // Profiles
-    out.push_str("profiles:\n");
+    out.push_str("\nprofiles:\n");
     out.push_str("  default:\n");
     out.push_str(&format!("    maxk: {}\n", args.neighbors));
     for (facet, path) in views {
         out.push_str(&format!("    {}: {}\n", facet, path));
-    }
-
-    // Sized profiles — generate windowed sub-profiles at multiple scales
-    if args.sized_profiles.is_some() {
-        let spec = args.sized_profiles.as_ref().unwrap();
-        out.push_str("\n  sized:\n");
-        let specs: Vec<&str> = spec.split(',').map(|s| s.trim()).collect();
-        // Add a human-readable comment explaining each expression
-        for s in &specs {
-            let desc = describe_sized_spec(s);
-            out.push_str(&format!("    # \"{}\": {}\n", s, desc));
-        }
-        let formatted: Vec<String> = specs.iter().map(|s| format!("\"{}\"", s)).collect();
-        out.push_str(&format!("    ranges: [{}]\n", formatted.join(", ")));
-        out.push_str("    facets:\n");
-
-        // Build sized facets from the default profile views plus any
-        // computed per-profile facets needed by sized profiles.
-        let mut sized_facets_written = std::collections::HashSet::new();
-
-        for (facet, path) in views.iter() {
-            let windowed = facet == "base_vectors" || facet == "metadata_content";
-            let per_profile = facet == "neighbor_indices"
-                || facet == "neighbor_distances"
-                || facet == "filtered_neighbor_indices"
-                || facet == "filtered_neighbor_distances"
-                || facet == "metadata_indices";
-
-            if windowed {
-                out.push_str(&format!("      {}: \"{}:${{range}}\"\n", facet, path));
-                sized_facets_written.insert(facet.as_str());
-            } else if per_profile {
-                if !args.classic && path.contains("profiles/") {
-                    let templatized = path.replace("profiles/default/", "profiles/${profile}/");
-                    out.push_str(&format!("      {}: \"{}\"\n", facet, templatized));
-                    sized_facets_written.insert(facet.as_str());
-                }
-                // Pre-provided paths (e.g., _gt.ivec) are skipped here —
-                // computed equivalents are added below if needed.
-            } else {
-                out.push_str(&format!("      {}: {}\n", facet, path));
-                sized_facets_written.insert(facet.as_str());
-            }
-        }
-
-        // When compute-knn runs per-profile (for sized profiles), add the
-        // computed KNN facets even if the default profile uses pre-provided GT.
-        let has_compute_knn = steps.iter().any(|s| s.id == "compute-knn");
-        if has_compute_knn {
-            if !sized_facets_written.contains("neighbor_indices") {
-                let sp = args.sized_prefix();
-                out.push_str(&format!("      neighbor_indices: \"{}neighbor_indices.ivecs\"\n", sp));
-            }
-            if !sized_facets_written.contains("neighbor_distances") {
-                let sp = args.sized_prefix();
-                out.push_str(&format!("      neighbor_distances: \"{}neighbor_distances.fvecs\"\n", sp));
-            }
-        }
     }
 
     out
@@ -2590,6 +2587,40 @@ pub fn run(mut args: ImportArgs) {
     if let Err(e) = std::fs::write(&dataset_path, &yaml) {
         eprintln!("Error: failed to write {}: {}", crate::check::rel_display(&dataset_path), e);
         std::process::exit(1);
+    }
+
+    // Seed variables.yaml with user-asserted counts when the wizard
+    // (or the CLI) supplied them. This is the "I know this source is
+    // already clean — don't scan 1.5 TB just to confirm zero_count=0"
+    // shortcut that also stamps the `is_*_free` attributes during the
+    // subsequent `veks run` via `update_dataset_attributes`, skipping
+    // the standalone `scan-zeros` / `scan-duplicates` pipeline steps.
+    if args.zero_count.is_some() || args.duplicate_count.is_some() {
+        let vars_path = output_dir.join("variables.yaml");
+        let mut vars: indexmap::IndexMap<String, String> =
+            if vars_path.exists() {
+                std::fs::read_to_string(&vars_path).ok()
+                    .and_then(|s| serde_yaml::from_str::<std::collections::BTreeMap<String, String>>(&s).ok())
+                    .map(|m| m.into_iter().collect())
+                    .unwrap_or_default()
+            } else {
+                Default::default()
+            };
+        if let Some(z) = args.zero_count {
+            vars.insert("zero_count".to_string(), z.to_string());
+            vars.insert("source_zero_count".to_string(), z.to_string());
+        }
+        if let Some(d) = args.duplicate_count {
+            vars.insert("duplicate_count".to_string(), d.to_string());
+        }
+        // Sorted for deterministic output (matches the runtime writer).
+        let sorted: std::collections::BTreeMap<_, _> =
+            vars.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        if let Ok(content) = serde_yaml::to_string(&sorted) {
+            if let Err(e) = std::fs::write(&vars_path, content) {
+                eprintln!("Warning: failed to seed {}: {}", vars_path.display(), e);
+            }
+        }
     }
 
     // Create .gitignore
@@ -3312,6 +3343,8 @@ mod tests {
             description: None,
             no_dedup: false,
             no_zero_check: false,
+            duplicate_count: None,
+            zero_count: None,
             no_filtered: false,
             normalize: false,
             force: false,

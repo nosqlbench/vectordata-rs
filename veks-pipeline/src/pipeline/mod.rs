@@ -123,8 +123,16 @@ pub fn resolve_all_steps(
                 var_map.insert(k, v);
             }
         }
-        let base_count: u64 = var_map.get("base_count")
-            .and_then(|v| v.parse().ok())
+        // Fall through several count variables in priority order.
+        // Different stages of the pipeline produce different ones; for
+        // sized-profile expansion we just need *some* positive upper
+        // bound on the base size. Mirrors `DatasetConfig::load_and_resolve`
+        // — both must agree on which variable seeds expansion, otherwise
+        // `veks run` and `veks check` see different profile sets and the
+        // check flags every per-profile output as extraneous.
+        let base_count: u64 = ["base_count", "clean_count", "vector_count", "source_base_count"]
+            .iter()
+            .find_map(|k| var_map.get(*k).and_then(|v| v.parse().ok()).filter(|&n: &u64| n > 0))
             .unwrap_or(0);
         if base_count > 0 {
             let added = config.profiles.expand_deferred_sized(&var_map, base_count);
@@ -464,12 +472,22 @@ pub fn run_pipeline(args: RunArgs) -> Result<(), String> {
         // (per_profile=false) depends on `compute-knn` (per_profile=
         // true); if we remove compute-knn without also removing
         // verify-knn, DAG build fails.
+        //
+        // Finalize steps are deliberately excluded from the deferred
+        // set: they run in their own pass via `build_dag_partial`
+        // which silently skips missing `after:` references. Without
+        // this exclusion, transitive deferral would strip every
+        // generate-* step out of the working set, and the downstream
+        // `has_finalize_steps` flag would go false → the finalization
+        // pass would never fire → no .mref files, no dataset.json,
+        // catalog stale, `veks check` red.
         let mut deferred: HashSet<String> = per_profile_template_ids.clone();
         loop {
             let mut added = false;
             for s in &expanded_steps {
                 let id = s.effective_id();
                 if deferred.contains(&id) { continue; }
+                if s.finalize { continue; }
                 if s.after.iter().any(|d| deferred.contains(d)) {
                     deferred.insert(id);
                     added = true;
@@ -1053,10 +1071,49 @@ fn update_dataset_attributes(dataset_path: &Path, workspace: &Path) {
         config.set_attribute("is_normalized", v);
     }
 
-    if let Err(e) = config.save(dataset_path) {
-        eprintln!("  warning: failed to save dataset.yaml: {}", e);
-    } else {
-        eprintln!("  synced {} variables to dataset.yaml", vars.len());
+    // Materialize sized profiles + per-profile output views so the
+    // saved yaml carries the full concrete profile catalogue, not just
+    // the compact `sized:` spec. Without this, `update_dataset_attributes`
+    // (which runs AFTER the finalize pass at the end of every veks run)
+    // would overwrite the expanded yaml that `generate-dataset-json`
+    // just produced, silently reverting clients back to the "no GT
+    // paths" view. The compact `sized:` spec is preserved alongside
+    // the concrete entries for round-trip re-processing — see
+    // `DatasetConfig::save_expanded` for the file shape.
+    if config.profiles.has_deferred() {
+        let base_count: u64 = ["base_count", "clean_count", "vector_count", "source_base_count"]
+            .iter()
+            .find_map(|k| vars.get(*k).and_then(|v| v.parse().ok()).filter(|&n: &u64| n > 0))
+            .unwrap_or(0);
+        if base_count > 0 {
+            config.profiles.expand_deferred_sized(&vars, base_count);
+        }
+    }
+    let templates: Vec<_> = vectordata::dataset::collect_all_steps(&config)
+        .into_iter()
+        .filter(|s| s.per_profile)
+        .collect();
+    config.profiles.derive_views_from_templates(&templates);
+
+    // Compare-before-write so an idempotent second `veks run` doesn't
+    // touch dataset.yaml's mtime (or its progress-tracked size) when
+    // the content would be identical. Without this, every run
+    // invalidates downstream finalize steps (generate-dataset-json,
+    // generate-merkle, ...) for no reason.
+    match config.to_expanded_yaml_string(dataset_path) {
+        Ok(new_content) => {
+            let existing = std::fs::read_to_string(dataset_path).ok();
+            if existing.as_deref() == Some(new_content.as_str()) {
+                eprintln!("  dataset.yaml up-to-date ({} variable(s) already synced)", vars.len());
+            } else if let Err(e) = std::fs::write(dataset_path, &new_content) {
+                eprintln!("  warning: failed to save dataset.yaml: {}", e);
+            } else {
+                eprintln!("  synced {} variables to dataset.yaml", vars.len());
+            }
+        }
+        Err(e) => {
+            eprintln!("  warning: failed to serialize dataset.yaml: {}", e);
+        }
     }
 }
 
@@ -1589,9 +1646,54 @@ pub fn reset_pipeline(workspace: &Path, dataset_path: &Path, config: &DatasetCon
     //    We preserve: dataset.yaml, dataset.json, dataset.log, dataset.jsonl,
     //    variables.yaml, variables.json, catalog.*, .publish, .publish_url,
     //    .catalog_root, .gitignore, and identity symlinks pointing to source data.
-    // Remove generated log/variable/json files
+    // Remove generated log/variable/json files.
+    //
+    // `variables.yaml` deserves a more careful treatment than the
+    // other generated files: some of its keys are derived by the
+    // pipeline and regenerated every run (counts, flags, ...), but
+    // others come from bootstrap-time assertions that the pipeline
+    // CANNOT regenerate because it deliberately skips the
+    // corresponding scan step — `zero_count` and `duplicate_count`
+    // when the user said "no dedup / no zero check, here are the
+    // counts". Wiping those would re-hide the derived
+    // `is_*_free` attributes on the next run.
+    //
+    // Strategy: preserve the bootstrap-asserted keys; drop the rest.
+    let vars_path = workspace.join("variables.yaml");
+    if vars_path.exists() {
+        const PRESERVED_KEYS: &[&str] = &[
+            "zero_count", "source_zero_count", "duplicate_count",
+        ];
+        let preserved: std::collections::BTreeMap<String, String> = std::fs::read_to_string(&vars_path)
+            .ok()
+            .and_then(|s| serde_yaml::from_str::<std::collections::BTreeMap<String, serde_yaml::Value>>(&s).ok())
+            .map(|m| m.into_iter()
+                .filter(|(k, _)| PRESERVED_KEYS.contains(&k.as_str()))
+                .filter_map(|(k, v)| match v {
+                    serde_yaml::Value::String(s) => Some((k, s)),
+                    serde_yaml::Value::Number(n) => Some((k, n.to_string())),
+                    serde_yaml::Value::Bool(b) => Some((k, b.to_string())),
+                    _ => None,
+                })
+                .collect())
+            .unwrap_or_default();
+        if preserved.is_empty() {
+            let _ = std::fs::remove_file(&vars_path);
+            println!("  removed {}", veks_core::paths::rel_display(&vars_path));
+        } else {
+            if let Ok(content) = serde_yaml::to_string(&preserved) {
+                if std::fs::write(&vars_path, content).is_ok() {
+                    println!(
+                        "  pruned {} (kept: {})",
+                        veks_core::paths::rel_display(&vars_path),
+                        preserved.keys().map(|s| s.as_str()).collect::<Vec<_>>().join(", "),
+                    );
+                }
+            }
+        }
+    }
     for name in &["dataset.json", "dataset.jsonl", "dataset.log",
-                   "runlog.jsonl", "variables.yaml", "variables.json"] {
+                   "runlog.jsonl", "variables.json"] {
         let p = workspace.join(name);
         if p.exists() {
             let _ = std::fs::remove_file(&p);
@@ -2433,13 +2535,17 @@ default:
         // Explicit view preserved
         assert_eq!(pdef.view("query_vectors").unwrap().path(), "query.mvec");
 
-        // Sized profile gets window-based views referencing default's files
+        // Sized profile's per-profile-output views point at the
+        // profile's own directory — windowing default's outputs by
+        // base_count was the previous design and was wrong for
+        // neighbor_indices (can't derive a sized-range top-K by
+        // prefixing a full-range top-K). Every per_profile output
+        // now uses a direct per-profile path.
         let p10 = profiles.profile("10M").unwrap();
-        assert_eq!(p10.view("base_vectors").unwrap().path(), "profiles/default/base_vectors.mvec");
-        assert!(!p10.view("base_vectors").unwrap().source.window.is_empty());
-        assert_eq!(p10.view("base_vectors").unwrap().source.window.0[0].max_excl, 10000000);
-        assert_eq!(p10.view("neighbor_indices").unwrap().path(), "profiles/default/neighbor_indices.ivecs");
-        assert!(!p10.view("neighbor_indices").unwrap().source.window.is_empty());
+        assert_eq!(p10.view("base_vectors").unwrap().path(), "profiles/10M/base_vectors.mvec");
+        assert!(p10.view("base_vectors").unwrap().source.window.is_empty());
+        assert_eq!(p10.view("neighbor_indices").unwrap().path(), "profiles/10M/neighbor_indices.ivecs");
+        assert!(p10.view("neighbor_indices").unwrap().source.window.is_empty());
         // Inherited shared view unchanged
         assert_eq!(p10.view("query_vectors").unwrap().path(), "query.mvec");
     }

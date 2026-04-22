@@ -29,13 +29,61 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// Root configuration for a vector dataset.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct DatasetConfig {
     /// Arbitrary attributes describing the dataset (e.g., distance metric, dimension).
-    #[serde(default)]
     pub attributes: HashMap<String, serde_yaml::Value>,
     /// Named profiles defining different views or subsets of the dataset.
     pub profiles: HashMap<String, ProfileConfig>,
+}
+
+// Hand-written deserialize so the client tolerates the compact `sized:`
+// spec sitting next to concrete profile entries. The spec is a sequence
+// (or mapping with a `ranges:` key) used by the pipeline as a shorthand
+// for generating sized profiles; the client doesn't understand the
+// grammar but must not reject datasets that carry it alongside the
+// expanded entries. Any profile-map entry whose value isn't a struct
+// (i.e. not a `ProfileConfig` shape) is skipped with a trace-level log.
+impl<'de> Deserialize<'de> for DatasetConfig {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Raw {
+            #[serde(default)]
+            attributes: HashMap<String, serde_yaml::Value>,
+            #[serde(default)]
+            profiles: HashMap<String, serde_yaml::Value>,
+        }
+
+        let raw = Raw::deserialize(deserializer)?;
+        let mut profiles: HashMap<String, ProfileConfig> = HashMap::new();
+        for (name, value) in raw.profiles {
+            // Skip the compact sized-spec shorthand and any other
+            // non-profile entries. A valid `ProfileConfig` is always
+            // a mapping; sequences (`sized: ["mul:1m/2", ...]`) and
+            // `sized: {ranges: [...], facets: {...}}` maps (which
+            // contain no profile fields) are ignored here and
+            // handled by the pipeline-side `vectordata::dataset`
+            // parser instead.
+            if name == "sized" {
+                continue;
+            }
+            match serde_yaml::from_value::<ProfileConfig>(value) {
+                Ok(cfg) => { profiles.insert(name, cfg); }
+                Err(e) => {
+                    log::trace!(
+                        "skipping unparseable profile entry '{}': {}", name, e);
+                }
+            }
+        }
+
+        Ok(DatasetConfig {
+            attributes: raw.attributes,
+            profiles,
+        })
+    }
 }
 
 /// Configuration for a specific profile within a dataset.

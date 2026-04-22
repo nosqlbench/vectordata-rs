@@ -422,10 +422,6 @@ pub(super) fn scan_cached_segments(
                 {
                     let already = segments.iter().any(|s| s.start == 0 && s.end == pbc);
                     if !already {
-                        ui.log(&format!(
-                            "  reusing profile '{}' output as segment [0, {})",
-                            pname_str, pbc,
-                        ));
                         // Published GT for IP/DOT/cosine-as-IP stores
                         // `+dot` (user-facing convention: larger = better)
                         // while the kernel ranks with `-dot`. Flag the
@@ -448,5 +444,33 @@ pub(super) fn scan_cached_segments(
     // Sort by start, then by size descending — the greedy matcher
     // picks the largest segment starting at a given position.
     segments.sort_by(|a, b| a.start.cmp(&b.start).then(b.end.cmp(&a.end)));
+
+    // One concise summary of what's available. The actual selection
+    // (which is at most one segment per starting offset — the
+    // largest one that fits) is logged later by the engine as
+    // `▸ [seg N/M] REUSED range [X..Y) from FILE`.
+    if !segments.is_empty() {
+        let mut path1 = 0usize;
+        let mut path2 = 0usize;
+        let mut largest_path2 = 0usize;
+        for s in &segments {
+            // Path-1 segments live in `cache_dir`, Path-2 in `<workspace>/profiles/`.
+            let from_path2 = s.ivec_path.parent()
+                .and_then(|p| p.parent())
+                .map(|p| p.ends_with("profiles"))
+                .unwrap_or(false);
+            if from_path2 {
+                path2 += 1;
+                largest_path2 = largest_path2.max(s.end);
+            } else {
+                path1 += 1;
+            }
+        }
+        ui.log(&format!(
+            "  cache discovery: {} candidate(s) — {} from .cache/, {} from sibling profiles/ \
+             (largest sibling segment ends at {}); planner uses at most one per offset",
+            segments.len(), path1, path2, largest_path2,
+        ));
+    }
     segments
 }

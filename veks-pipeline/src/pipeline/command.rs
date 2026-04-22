@@ -86,15 +86,28 @@ pub trait CommandOp: Send {
     /// Build version string for provenance tracking.
     ///
     /// Returns a version identifier that changes whenever the command's
-    /// logic changes. The default combines the crate version and git
-    /// commit hash and build number, injected at compile time. The build
-    /// number (epoch seconds) changes every compilation, so fingerprints
-    /// always invalidate when the binary is rebuilt — even if the git SHA
-    /// is unchanged.
+    /// *source* changes. The default combines the crate version and git
+    /// commit hash (with a `+dirty` suffix if the working tree has any
+    /// uncommitted changes at build time).
     ///
-    /// Format: `{CARGO_PKG_VERSION}+{git_short_hash}.{build_number}`
+    /// Deliberately excluded:
+    ///   - `VEKS_BUILD_NUMBER` (epoch seconds on each build) — would
+    ///     invalidate every step's fingerprint on every `cargo install`
+    ///     even when the source didn't change, forcing full pipeline
+    ///     re-runs for no benefit.
+    ///   - The host `rustc` version — lives in `--version` output for
+    ///     human debugging, but isn't a data-provenance signal.
+    ///
+    /// Consequences for local development with an uncommitted tree:
+    /// the short hash stays fixed at `<last-commit>+dirty` across
+    /// multiple builds of the same working tree, so repeated rebuilds
+    /// with local edits do NOT cascade fingerprints stale. Committing
+    /// (or toggling between dirty/clean) changes the hash and
+    /// invalidates once.
+    ///
+    /// Format: `{CARGO_PKG_VERSION}+{git_short_hash}[+dirty]`
     fn build_version(&self) -> &str {
-        concat!(env!("CARGO_PKG_VERSION"), "+", env!("VEKS_BUILD_HASH"), ".", env!("VEKS_BUILD_NUMBER"))
+        concat!(env!("CARGO_PKG_VERSION"), "+", env!("VEKS_BUILD_HASH"))
     }
 
     /// Declare which resource types this command consumes.

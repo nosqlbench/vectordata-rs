@@ -79,7 +79,7 @@ impl CommandOp for DatasetJsonOp {
             };
         }
 
-        let config = match DatasetConfig::load(&yaml_path) {
+        let mut config = match DatasetConfig::load(&yaml_path) {
             Ok(c) => c,
             Err(e) => return CommandResult {
                 status: Status::Error,
@@ -88,6 +88,60 @@ impl CommandOp for DatasetJsonOp {
                 elapsed: start.elapsed(),
             },
         };
+
+        // Materialize deferred sized profiles before re-emitting, so the
+        // published dataset.yaml/json carries every concrete profile that
+        // a consumer would see — not the compact `sized: [...]` spec
+        // that requires the veks parser to interpret. Use the same
+        // variable-fallthrough as the runtime so this works whether
+        // pipeline state is in `vector_count`, `base_count`, etc.
+        if config.profiles.has_deferred() {
+            let mut vars: indexmap::IndexMap<String, String> = config.variables.clone();
+            if let Ok(file_vars) = crate::pipeline::variables::load(&ctx.workspace) {
+                for (k, v) in file_vars {
+                    vars.insert(k, v);
+                }
+            }
+            let base_count: u64 = ["base_count", "clean_count", "vector_count", "source_base_count"]
+                .iter()
+                .find_map(|k| vars.get(*k).and_then(|v| v.parse().ok()).filter(|&n: &u64| n > 0))
+                .unwrap_or(0);
+            if base_count > 0 {
+                let added = config.profiles.expand_deferred_sized(&vars, base_count);
+                if added > 0 {
+                    ctx.ui.log(&format!(
+                        "  expanded {} sized profile(s) for publish", added));
+                }
+            }
+        }
+
+        // Derive per-profile output views (neighbor_indices,
+        // neighbor_distances, etc.) from the per_profile templates so
+        // each expanded sized profile carries the concrete paths
+        // clients need: `profiles/{name}/neighbor_indices.ivecs` and
+        // friends. Without this, sized profiles serialize with only
+        // `maxk` + `base_count` because the views they inherit from
+        // default get suppressed (default's paths match default's
+        // own paths), and their per-profile output views don't
+        // exist yet to be surfaced.
+        let templates: Vec<_> = vectordata::dataset::collect_all_steps(&config)
+            .into_iter()
+            .filter(|s| s.per_profile)
+            .collect();
+        config.profiles.derive_views_from_templates(&templates);
+
+        // NOTE: the expanded yaml itself is persisted by
+        // `update_dataset_attributes` at the very end of every
+        // `veks run` — it syncs variables + attributes from
+        // `variables.yaml` then calls `save_expanded`. Doing that
+        // write here too would be redundant and cause run-2
+        // freshness failures: this step's `resolved_options`
+        // snapshot would record yaml.size as S1, but the subsequent
+        // `update_dataset_attributes` would bump it to S2 (with the
+        // synced variables), so run 2's freshness check sees
+        // `output 'dataset.yaml' size changed (S1 → S2)` and
+        // pointlessly re-runs every finalize step. Single writer
+        // for dataset.yaml → finalize pass is idempotent.
 
         let json = match serde_json::to_string_pretty(&config) {
             Ok(j) => j,

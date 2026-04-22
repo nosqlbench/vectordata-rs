@@ -85,6 +85,8 @@ fn default_args(name: &str, output: &Path) -> ImportArgs {
         no_dedup: false,
         no_filtered: false,
         no_zero_check: false,
+        duplicate_count: None,
+        zero_count: None,
         normalize: false,
         force: false,
         base_convert_format: None,
@@ -1740,12 +1742,18 @@ fn import_full_pipeline_everything_disabled() {
     assert!(!ids.contains(&"count-duplicates".to_string()), "no count-duplicates: {:?}", ids);
     assert!(!ids.contains(&"convert-metadata".to_string()), "no metadata: {:?}", ids);
     assert!(!ids.contains(&"compute-filtered-knn".to_string()), "no filtered KNN: {:?}", ids);
-    // --no-dedup and --no-zero-check mean NO scan, not even advisory.
-    // Honoring the user's "no" is a hard rule (sysref §7.4.1).
-    assert!(!ids.contains(&"scan-zeros".to_string()),
-        "no_zero_check=true → no scan-zeros: {:?}", ids);
-    assert!(!ids.contains(&"scan-duplicates".to_string()),
-        "no_dedup=true → no scan-duplicates: {:?}", ids);
+    // --no-dedup / --no-zero-check toggle REMOVAL. They used to also
+    // suppress the standalone scans, but that left `zero_count` and
+    // `duplicate_count` unset — which in turn left
+    // `is_zero_vector_free` / `is_duplicate_vector_free` missing from
+    // `dataset.yaml`, which makes `veks check dataset-attributes`
+    // fail every time. Counting is mandatory; cleaning is optional.
+    // When prepare-vectors isn't materialized, emit both scans so
+    // the attributes get populated.
+    assert!(ids.contains(&"scan-zeros".to_string()),
+        "scan-zeros is always emitted when prepare-vectors isn't (needed for is_zero_vector_free): {:?}", ids);
+    assert!(ids.contains(&"scan-duplicates".to_string()),
+        "scan-duplicates is always emitted when prepare-vectors isn't (needed for is_duplicate_vector_free): {:?}", ids);
 
     // Should still have self-search chain + KNN
     assert!(ids.contains(&"count-vectors".to_string()), "count-vectors: {:?}", ids);
@@ -1759,14 +1767,17 @@ fn import_full_pipeline_everything_disabled() {
     assert!(yaml.contains("normalize: true"),
         "normalize: true should always appear on extract steps");
 
-    // count-vectors, count-source-base, set-is_shuffled, set-is_self_search,
-    // set-combined_bq, set-k, generate-shuffle, extract-queries, extract-base,
-    // count-base, compute-knn, verify-knn, generate-dataset-json,
-    // generate-variables-json, generate-dataset-log-jsonl, generate-docs,
-    // generate-merkle, generate-catalog = 18
-    // (scan-zeros + scan-duplicates removed — user's "no" is honored.)
-    assert_eq!(ids.len(), 18,
-        "minimal self-search pipeline should have 18 steps, got {}: {:?}", ids.len(), ids);
+    // count-vectors, count-source-base, set-is_shuffled,
+    // set-is_self_search, set-combined_bq, set-k, scan-zeros,
+    // scan-duplicates, generate-shuffle, extract-queries,
+    // extract-base, count-base, compute-knn, verify-knn,
+    // generate-dataset-json, generate-variables-json,
+    // generate-dataset-log-jsonl, generate-docs, generate-catalog,
+    // generate-merkle = 20
+    // (scan-zeros + scan-duplicates are now mandatory — see above.)
+    assert_eq!(ids.len(), 20,
+        "minimal self-search pipeline should have 20 steps (incl. mandatory scan-zeros + scan-duplicates), got {}: {:?}",
+        ids.len(), ids);
 }
 
 #[test]

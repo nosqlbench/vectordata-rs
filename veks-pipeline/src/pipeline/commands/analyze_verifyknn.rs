@@ -329,13 +329,39 @@ impl CommandOp for AnalyzeVerifyKnnOp {
             None => (0, query_count),
         };
 
+        let n_queries = range_end - range_start;
+        let n_base = base_end - base_offset;
         ctx.ui.log(&format!(
             "Verify KNN: queries [{}, {}), k={}, metric={:?}, phi={}",
             range_start, range_end, k, metric, phi
         ));
+        let total_distances = n_queries as u64 * n_base as u64;
+        let total_label = if total_distances >= 1_000_000_000_000 {
+            format!("{:.1}T", total_distances as f64 / 1e12)
+        } else if total_distances >= 1_000_000_000 {
+            format!("{:.1}G", total_distances as f64 / 1e9)
+        } else if total_distances >= 1_000_000 {
+            format!("{:.1}M", total_distances as f64 / 1e6)
+        } else {
+            total_distances.to_string()
+        };
+        ctx.ui.log(&format!(
+            "  scanning {} base vector(s) per query, {} query/scan(s) total \
+             — total distance computations: {}",
+            n_base, n_queries, total_label,
+        ));
 
+        // Outer progress bar: queries verified. The label includes
+        // pass/fail running totals so even slow scans (billion-vector
+        // base files take minutes per query) give a continuously
+        // updating signal of "how far through" + "what's the verdict
+        // looking like so far". Without this, the user sees only the
+        // header line until the entire verification finishes —
+        // potentially many hours for large base × query combos.
+        let pb = ctx.ui.bar_with_unit(n_queries as u64, "verifying queries", "queries");
         let mut pass_count = 0usize;
         let mut fail_count = 0usize;
+        let verify_start = std::time::Instant::now();
 
         for qi in range_start..range_end {
             // Periodic governor checkpoint every 1000 queries
@@ -405,17 +431,33 @@ impl CommandOp for AnalyzeVerifyKnnOp {
                 }
             }
 
+            // Bump the bar after every query — the per-query brute-
+            // force scan can take minutes on a billion-vector base,
+            // so even one update is meaningful. The bar's own
+            // throttling keeps redraw overhead negligible.
+            pb.inc(1);
+
+            // Periodic running summary (every 100 queries OR on the
+            // last query) for the batch-mode log scrollback. The bar
+            // covers the live UI; this gives anyone tail-ing
+            // dataset.log a stable progress trail.
             if (qi - range_start + 1) % 100 == 0 || qi + 1 == range_end {
+                let done = (qi - range_start + 1) as u64;
+                let elapsed = verify_start.elapsed().as_secs_f64();
+                let rate = if elapsed > 0.0 { done as f64 / elapsed } else { 0.0 };
+                let eta = if rate > 0.0 {
+                    let remaining = (n_queries as u64).saturating_sub(done);
+                    format!("{:.0}s", remaining as f64 / rate)
+                } else {
+                    "?".to_string()
+                };
                 ctx.ui.log(&format!(
-                    "\r  {}/{} verified ({} pass, {} fail)",
-                    qi - range_start + 1,
-                    range_end - range_start,
-                    pass_count,
-                    fail_count
+                    "  {}/{} queries verified — {} pass, {} fail ({:.1} q/s, eta {})",
+                    done, n_queries, pass_count, fail_count, rate, eta,
                 ));
             }
         }
-        ctx.ui.log("");
+        pb.finish();
 
         let total = pass_count + fail_count;
         let status = if fail_count == 0 {

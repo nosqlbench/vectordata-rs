@@ -101,6 +101,21 @@ pub enum PrepareCommand {
         #[arg(long)]
         no_zero_check: bool,
 
+        /// Assert the duplicate count directly (no scan). Intended for
+        /// `--no-dedup` workflows where the user already knows the
+        /// count; writes `duplicate_count=<v>` into `variables.yaml`
+        /// at bootstrap so `scan-duplicates` is not emitted in the
+        /// pipeline. Ignored when `--no-dedup` is false (dedup runs
+        /// and produces its own count).
+        #[arg(long)]
+        duplicate_count: Option<u64>,
+
+        /// Assert the zero-vector count directly (no scan). Same
+        /// semantics as `--duplicate-count` but for
+        /// `--no-zero-check` / `scan-zeros`.
+        #[arg(long)]
+        zero_count: Option<u64>,
+
         /// Skip filtered KNN even when metadata is present
         #[arg(long)]
         no_filtered: bool,
@@ -447,7 +462,8 @@ pub fn run(args: PrepareArgs) {
             interactive, yes, name, output, base_vectors, query_vectors,
             self_search, query_count, metadata, ground_truth,
             ground_truth_distances, metric, neighbors, seed, description,
-            no_dedup, no_zero_check, no_filtered, normalize, no_normalize,
+            no_dedup, no_zero_check, duplicate_count, zero_count,
+            no_filtered, normalize, no_normalize,
             assume_normalized_like_faiss, use_proper_cosine_metric,
             force, reset, clean, recursive,
             base_fraction, required_facets, provided_facets, round_digits, pedantic_dedup, auto, classic, sources,
@@ -744,6 +760,7 @@ pub fn run(args: PrepareArgs) {
                         name, output: out.clone(), base_vectors, query_vectors, self_search,
                         query_count, metadata, ground_truth, ground_truth_distances,
                         metric, neighbors, seed, description, no_dedup, no_zero_check,
+                        duplicate_count, zero_count,
                         no_filtered, normalize, force: force || reset,
                         base_convert_format: None,
                         query_convert_format: None,
@@ -819,6 +836,7 @@ pub fn run(args: PrepareArgs) {
                     name, output, base_vectors, query_vectors, self_search,
                     query_count, metadata, ground_truth, ground_truth_distances,
                     metric, neighbors, seed, description, no_dedup, no_zero_check,
+                    duplicate_count, zero_count,
                     no_filtered, normalize, force,
                     base_convert_format: None,
                     query_convert_format: None,
@@ -1073,6 +1091,7 @@ fn clean_single_dataset(workspace: &std::path::Path) {
                     attributes: None,
                     profiles: Default::default(),
                     upstream: None,
+                    strata: Vec::new(),
                     variables: Default::default(),
                 }
             });

@@ -279,8 +279,20 @@ fn walk_for_datasets(dir: &Path, datasets: &mut Vec<DiscoveredDataset>) {
 
     let yaml_path = dir.join("dataset.yaml");
     if yaml_path.exists() {
-        match DatasetConfig::load(&yaml_path) {
-            Ok(config) => {
+        // Use load_and_resolve so deferred `sized:` profiles are
+        // materialized before catalog emission — without this,
+        // knn_entries.yaml would be missing every sized profile
+        // (only `default` and explicit partition profiles would
+        // surface). Also derive per-profile views from the
+        // per_profile templates so every materialized profile has
+        // concrete base/query/gt paths pointing at its own files.
+        match DatasetConfig::load_and_resolve(&yaml_path) {
+            Ok(mut config) => {
+                let templates: Vec<_> = vectordata::dataset::collect_all_steps(&config)
+                    .into_iter()
+                    .filter(|s| s.per_profile)
+                    .collect();
+                config.profiles.derive_views_from_templates(&templates);
                 datasets.push(DiscoveredDataset { yaml_path, config });
             }
             Err(e) => {

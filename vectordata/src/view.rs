@@ -15,10 +15,68 @@ use crate::io::{self, VectorReader, VvecReader, VvecElement, OpenableElement};
 use crate::model::{FacetConfig, ProfileConfig};
 use crate::{Error, Result};
 use crate::dataset::facet::StandardFacet;
+use crate::io::IoError;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use url::Url;
+
+/// Parse a window string using the canonical dataset-source parser
+/// (`crate::dataset::source::parse_window`). Returns the FIRST
+/// interval as `(start, end)` with `end` exclusive — the multi-
+/// interval form `"[0..1K, 2K..3K]"` is documented but the reader
+/// API only handles a single contiguous range; callers wanting a
+/// disjoint window should split into separate facet configs.
+///
+/// `None` for malformed input or empty windows — callers fall back
+/// to the unwrapped reader.
+fn parse_window_first(s: &str) -> Option<(usize, usize)> {
+    let dsw = crate::dataset::source::parse_window(s).ok()?;
+    let iv = dsw.0.into_iter().next()?;
+    let start = iv.min_incl as usize;
+    let end = iv.max_excl as usize;
+    if end < start { return None; }
+    Some((start, end))
+}
+
+/// Reader wrapper that clips access to a sub-range of the underlying
+/// reader. `count()` reports the window length; `get(i)` reads from
+/// `underlying.get(i + start)` and rejects `i >= window length`.
+///
+/// Built when a `FacetConfig` carries a `window` field — the documented
+/// sub-ordinal suffix model used by sized profiles to express "first
+/// `base_count` rows of the shared base file" without having to copy
+/// the file or trust every consumer to honor `view.base_count()`.
+struct WindowedVectorReader<T> {
+    inner: Box<dyn VectorReader<T>>,
+    start: usize,
+    /// Window length, capped to the underlying file's count.
+    len: usize,
+}
+
+impl<T> WindowedVectorReader<T> {
+    fn new(inner: Box<dyn VectorReader<T>>, start: usize, end: usize) -> Self {
+        let total = inner.count();
+        let s = start.min(total);
+        let e = end.min(total);
+        let len = e.saturating_sub(s);
+        WindowedVectorReader { inner, start: s, len }
+    }
+}
+
+impl<T: Send + Sync> VectorReader<T> for WindowedVectorReader<T> {
+    fn dim(&self) -> usize { self.inner.dim() }
+    fn count(&self) -> usize { self.len }
+    fn get(&self, index: usize) -> std::result::Result<Vec<T>, IoError> {
+        if index >= self.len {
+            return Err(IoError::InvalidFormat(format!(
+                "index {} out of range for windowed reader (len {}, start {})",
+                index, self.len, self.start,
+            )));
+        }
+        self.inner.get(self.start + index)
+    }
+}
 
 /// Describes a single facet declared in a dataset profile.
 ///
@@ -179,15 +237,65 @@ impl GenericTestDataView {
 
     /// Open a uniform vector facet with the unified `open_vec` API.
     /// Handles local (mmap) and remote (HTTP) transparently.
+    ///
+    /// When the facet config carries a `window` field
+    /// (`profiles.X.base_vectors.window: "0..N"`), the returned
+    /// reader is wrapped so that `count()` reports `N - 0` and
+    /// `get(i)` is offset into the underlying file. This is the
+    /// documented sub-ordinal suffix model — sized profiles inherit
+    /// `base_vectors` from default with `[0..base_count)` so every
+    /// consumer reading via the trait gets a clipped reader without
+    /// having to honor `view.base_count()` manually.
     fn open_uniform<T: OpenableElement>(
         &self,
         facet_opt: Option<&FacetConfig>,
         name: &str,
     ) -> Result<Arc<dyn VectorReader<T>>> {
         let facet = facet_opt.ok_or_else(|| Error::MissingFacet(name.to_string()))?;
-        let path_or_url = self.resolve_as_string(facet)?;
-        let reader = io::open_vec::<T>(&path_or_url)?;
+
+        // Two ways the dataset config can carry a sub-ordinal range:
+        //   1. `Detailed { source, window }` — explicit `window:` field.
+        //   2. `Simple("path[0..N)")` — the documented suffix sugar
+        //      that `parse_source_string` understands.
+        // Try the suffix form first (so `Simple` strings work without
+        // forcing the consumer to use `Detailed`); fall back to the
+        // explicit field. Either path produces the same windowed
+        // reader behind the trait.
+        let raw = facet.source();
+        let (path_str, window_from_suffix): (String, Option<(usize, usize)>) =
+            match crate::dataset::source::parse_source_string(raw) {
+                Ok(parsed) if !parsed.window.is_empty() => {
+                    let iv = &parsed.window.0[0];
+                    (parsed.path, Some((iv.min_incl as usize, iv.max_excl as usize)))
+                }
+                _ => (raw.to_string(), None),
+            };
+        let resolved = self.resolve_path_str(&path_str)?;
+        let reader = io::open_vec::<T>(&resolved)?;
+
+        let window = window_from_suffix.or_else(|| {
+            facet.window().and_then(parse_window_first)
+        });
+        if let Some((start, end)) = window {
+            return Ok(Arc::new(WindowedVectorReader::new(reader, start, end)));
+        }
         Ok(Arc::from(reader))
+    }
+
+    /// Resolve a bare path string (no window suffix) against the
+    /// data source root. Mirrors `resolve_as_string` but takes a raw
+    /// path so callers that pre-parsed the suffix can join it
+    /// correctly without round-tripping through `FacetConfig`.
+    fn resolve_path_str(&self, path: &str) -> Result<String> {
+        match &self.source {
+            DataSource::FileSystem(base_path) => {
+                Ok(base_path.join(path).to_string_lossy().to_string())
+            }
+            DataSource::Http(base_url) => {
+                let url = base_url.join(path)?;
+                Ok(url.to_string())
+            }
+        }
     }
 
     /// Open a variable-length vector facet with the unified `open_vvec` API.

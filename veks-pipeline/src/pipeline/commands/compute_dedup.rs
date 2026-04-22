@@ -541,6 +541,19 @@ shuffle, KNN, or metadata alignment. The output index can be fed to
         let elide = options.get("elide")
             .map(|s| s != "false")
             .unwrap_or(true);
+        // When true, skip the per-ordinal random-access zero scan on
+        // the surviving-uniques and duplicate-ordinals files. The
+        // scan is a correctness crutch — dedup misattributes
+        // (N-1) zeros as duplicates if the source has N identical
+        // zero vectors — but it's expensive (one `pread` per
+        // ordinal, billions on a billion-vector source) and not
+        // every caller needs the precise zero-vs-dup split.
+        // `analyze find-duplicates` sets this to true because it
+        // only answers the duplicate question and lets
+        // `analyze find-zeros` answer the zero question separately.
+        let skip_zero_scan = options.get("skip-zero-scan")
+            .map(|s| s == "true")
+            .unwrap_or(false);
         let explicit_batch_size: Option<usize> = options.get("batch-size")
             .and_then(|s| s.parse().ok());
 
@@ -785,8 +798,32 @@ shuffle, KNN, or metadata alignment. The output index can be fed to
             result
         };
 
+        // Two ways to skip the expensive per-ordinal zero scan:
+        //  1. The caller explicitly asked to skip it (`skip-zero-scan=true`).
+        //     `analyze find-duplicates` does this — it only answers the
+        //     duplicate question; `analyze find-zeros` handles zeros
+        //     separately at ~4× the throughput of this scan.
+        //  2. A prior `find-zeros` run recorded `zero_count=0` in
+        //     variables.yaml or the state map. A zero-free source
+        //     can't have zero survivors in either the uniques or
+        //     duplicates lists, so there's nothing to find.
+        //
+        // In either case: exit with `zeros=0` for both outputs. Any
+        // positive `zero_count` (or absence of the hint) and no
+        // explicit skip means we fall through to the full scan.
+        let known_zero_count: Option<u64> = ctx.defaults.get("zero_count")
+            .and_then(|v| v.parse().ok())
+            .or_else(|| crate::pipeline::variables::load(&ctx.workspace).ok()
+                .and_then(|v| v.get("zero_count").and_then(|s| s.parse().ok())));
+        let skip_zero_sweep = skip_zero_scan || known_zero_count == Some(0);
+        if skip_zero_scan {
+            ctx.ui.log("  zero-scan skipped: caller opted out (skip-zero-scan=true)");
+        } else if known_zero_count == Some(0) {
+            ctx.ui.log("  zero-scan skipped: zero_count=0 from prior analyze find-zeros run");
+        }
+
         // Scan the surviving-uniques path and rewrite it without zeros.
-        let output_zero_count = {
+        let output_zero_count = if skip_zero_sweep { 0 } else {
             let ord_data = match std::fs::read(&output_path) {
                 Ok(d) => d,
                 Err(e) => return error_result(format!("read ordinals for zero scan: {}", e), start),
@@ -817,15 +854,19 @@ shuffle, KNN, or metadata alignment. The output index can be fed to
         // Scan the duplicates path — every zero found here was a zero
         // that dedup saw as a "duplicate of another zero". For
         // accurate attribution, count it as a zero, not a dup.
-        let dup_zero_count = match std::fs::read(&duplicates_path) {
-            Ok(data) if !data.is_empty() => {
-                let zeros = match scan_zeros(&data, "zero scan: dups") {
-                    Ok(z) => z,
-                    Err(e) => return error_result(e, start),
-                };
-                zeros.len()
+        // Same short-circuit applies — see the output_zero_count
+        // block for the full reasoning.
+        let dup_zero_count = if skip_zero_sweep { 0 } else {
+            match std::fs::read(&duplicates_path) {
+                Ok(data) if !data.is_empty() => {
+                    let zeros = match scan_zeros(&data, "zero scan: dups") {
+                        Ok(z) => z,
+                        Err(e) => return error_result(e, start),
+                    };
+                    zeros.len()
+                }
+                _ => 0,
             }
-            _ => 0,
         };
         if dup_zero_count > 0 {
             ctx.ui.log(&format!(

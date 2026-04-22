@@ -74,6 +74,147 @@ impl MerkleTree {
         Self::from_leaf_hashes(leaf_hashes, leaf_count, chunk_size, data.len() as u64)
     }
 
+    /// Build a merkle tree from a file via parallel `pread(2)` workers.
+    ///
+    /// Each worker owns a disjoint range of chunk indices, reads them
+    /// with `FileExt::read_at` (no shared file cursor, no shared reader
+    /// thread), hashes, and writes its output into a pre-sized result
+    /// slot. No mpsc channels, no mutex on a reader queue.
+    ///
+    /// Compared to `from_reader_parallel`:
+    ///   - I/O is fully parallel instead of serialised through one
+    ///     reader thread. On NVMe / ext4 / xfs this saturates the
+    ///     device with far fewer hash workers idling.
+    ///   - No per-chunk `Vec<u8>` allocation: each worker owns one
+    ///     buffer sized to `chunk_size` and reuses it across its range.
+    ///   - After each chunk, `posix_fadvise(DONTNEED)` hints the
+    ///     kernel to drop the just-read pages from the page cache.
+    ///     A merkle scan is one-shot — keeping 1.5 TB of source bytes
+    ///     resident only evicts genuinely hot pages belonging to other
+    ///     workloads.
+    ///
+    /// Calls `progress_fn(chunks_hashed_total)` from inside workers as
+    /// chunks complete. The callback must be cheap + thread-safe.
+    fn from_file_parallel(
+        file: &std::fs::File,
+        file_size: u64,
+        chunk_size: usize,
+        hash_threads: usize,
+        progress_fn: impl Fn(u64) + Send + Sync,
+    ) -> std::io::Result<Self> {
+        Self::validate_chunk_size(chunk_size);
+        use std::os::unix::fs::FileExt;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let leaf_count = if file_size == 0 {
+            1
+        } else {
+            ((file_size as usize) + chunk_size - 1) / chunk_size
+        };
+
+        if file_size == 0 {
+            let empty: [u8; HASH_SIZE] = Sha256::digest(&[]).into();
+            progress_fn(1);
+            return Ok(Self::from_leaf_hashes(vec![empty], 1, chunk_size, file_size));
+        }
+
+        // Hint the kernel: we'll read once, sequentially, then never
+        // again. SEQUENTIAL + DONTNEED together minimise cache
+        // pollution and enable aggressive readahead.
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::io::AsRawFd;
+            unsafe {
+                libc::posix_fadvise(
+                    file.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL);
+            }
+        }
+
+        // Results buffer: workers write directly into their slot.
+        // `ManuallyDrop` + `UnsafeCell` would be tidier, but a plain
+        // pre-sized Vec with disjoint &mut splits is safe and simple.
+        let mut results: Vec<[u8; HASH_SIZE]> = vec![[0u8; HASH_SIZE]; leaf_count];
+
+        let hash_threads = hash_threads.max(1).min(leaf_count);
+        // Round-robin chunk distribution: worker `w` handles chunks
+        // `w, w + hash_threads, w + 2*hash_threads, ...`. Spreads
+        // large-file sequential pressure across workers evenly instead
+        // of giving the first worker the whole first half.
+        let progress = AtomicU64::new(0);
+        let progress_ref = &progress;
+        let progress_fn_ref = &progress_fn;
+
+        // Split `results` into per-index disjoint mutable slices so
+        // workers can write without synchronisation. Each worker gets
+        // a Vec<(usize, &mut [u8; HASH_SIZE])> of (chunk_index, slot).
+        let mut worker_slots: Vec<Vec<(usize, &mut [u8; HASH_SIZE])>> =
+            (0..hash_threads).map(|_| Vec::new()).collect();
+        for (i, slot) in results.iter_mut().enumerate() {
+            worker_slots[i % hash_threads].push((i, slot));
+        }
+
+        std::thread::scope(|scope| -> std::io::Result<()> {
+            let mut handles = Vec::with_capacity(hash_threads);
+            for slots in worker_slots {
+                let file_ref = file;
+                let handle = scope.spawn(move || -> std::io::Result<()> {
+                    let mut buf = vec![0u8; chunk_size];
+                    for (idx, slot) in slots {
+                        let offset = idx as u64 * chunk_size as u64;
+                        let want = if offset + chunk_size as u64 > file_size {
+                            (file_size - offset) as usize
+                        } else {
+                            chunk_size
+                        };
+                        // pread_exact equivalent — handle short reads.
+                        let mut filled = 0;
+                        while filled < want {
+                            match file_ref.read_at(&mut buf[filled..want], offset + filled as u64) {
+                                Ok(0) => return Err(std::io::Error::new(
+                                    std::io::ErrorKind::UnexpectedEof,
+                                    format!("short read at offset {}", offset + filled as u64),
+                                )),
+                                Ok(n) => filled += n,
+                                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                                Err(e) => return Err(e),
+                            }
+                        }
+                        *slot = Sha256::digest(&buf[..want]).into();
+
+                        // Drop freshly-read pages from the cache. A
+                        // single chunk is already well past any
+                        // useful prefetch horizon by the time the
+                        // next round-robin pass wants it.
+                        #[cfg(target_os = "linux")]
+                        {
+                            use std::os::unix::io::AsRawFd;
+                            unsafe {
+                                libc::posix_fadvise(
+                                    file_ref.as_raw_fd(),
+                                    offset as libc::off_t,
+                                    want as libc::off_t,
+                                    libc::POSIX_FADV_DONTNEED,
+                                );
+                            }
+                        }
+
+                        let n = progress_ref.fetch_add(1, Ordering::Relaxed) + 1;
+                        progress_fn_ref(n);
+                    }
+                    Ok(())
+                });
+                handles.push(handle);
+            }
+            for h in handles {
+                h.join().map_err(|_| std::io::Error::new(
+                    std::io::ErrorKind::Other, "merkle worker panicked"))??;
+            }
+            Ok(())
+        })?;
+
+        Ok(Self::from_leaf_hashes(results, leaf_count, chunk_size, file_size))
+    }
+
     /// Build a merkle tree by streaming chunks with parallel hashing.
     ///
     /// A reader thread reads chunks sequentially into a bounded queue.
@@ -81,6 +222,10 @@ impl MerkleTree {
     /// Results are collected in chunk-index order so the tree is deterministic.
     ///
     /// Calls `progress_fn(chunks_hashed)` as each hash completes.
+    ///
+    /// Prefer `from_file_parallel` when you have a `std::fs::File` — this
+    /// variant exists for `Read`-only sources (stdin, pipes, decoders).
+    #[allow(dead_code)]
     fn from_reader_parallel<R: std::io::Read + Send + 'static>(
         reader: R,
         file_size: u64,
@@ -504,10 +649,15 @@ byte ranges rather than requiring a full file re-download.
                 }
             };
 
-            // Inner progress: chunks within this file
+            // Inner progress: chunks within this file.
+            // Wrap the progress bar in a Mutex only because `chunk_pb`
+            // isn't `Send + Sync` on its own — the atomic counter
+            // inside `from_file_parallel` is the hot path; the mutex
+            // here just serialises the bar update, which is cheap.
             let chunk_pb = ctx.ui.bar_with_unit(total_chunks as u64, &rel_name, "chunks");
-            let tree = match MerkleTree::from_reader_parallel(f, file_size, chunk_size, hash_threads, |done| {
-                chunk_pb.set_position(done);
+            let chunk_pb_ref = &chunk_pb;
+            let tree = match MerkleTree::from_file_parallel(&f, file_size, chunk_size, hash_threads, |done| {
+                chunk_pb_ref.set_position(done);
             }) {
                 Ok(t) => t,
                 Err(e) => {
@@ -736,17 +886,26 @@ predicate computation.
             Err(e) => return error_result(format!("invalid mref: {}", e), start),
         };
 
-        // Read current file and build verification tree
-        let data = match std::fs::read(&source_path) {
-            Ok(d) => d,
-            Err(e) => {
-                return error_result(
-                    format!("failed to read {}: {}", source_path.display(), e),
-                    start,
-                )
-            }
+        // Build verification tree via parallel pread workers.
+        // The earlier implementation slurped the entire file into RAM
+        // with `std::fs::read` before hashing — OK for a few MB, but
+        // on a 1.5 TB base file that's both fatal (OOM) and
+        // gratuitously slow (no concurrency between I/O and hashing).
+        let file_size = std::fs::metadata(&source_path).map(|m| m.len()).unwrap_or(0);
+        let f = match std::fs::File::open(&source_path) {
+            Ok(f) => f,
+            Err(e) => return error_result(
+                format!("failed to open {}: {}", source_path.display(), e), start),
         };
-        let current_tree = MerkleTree::from_data(&data, ref_tree.chunk_size);
+        let hash_threads = ctx.governor.current_or("threads", ctx.threads as u64)
+            .max(1) as usize;
+        let current_tree = match MerkleTree::from_file_parallel(
+            &f, file_size, ref_tree.chunk_size, hash_threads, |_| {},
+        ) {
+            Ok(t) => t,
+            Err(e) => return error_result(
+                format!("failed to hash {}: {}", source_path.display(), e), start),
+        };
 
         // Compare
         if ref_tree == current_tree {

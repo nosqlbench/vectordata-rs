@@ -208,36 +208,31 @@ fn scan_zeros_f32(
 ) -> Vec<ZeroHit> {
     use std::fs::File;
     use std::os::unix::fs::FileExt;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Mutex;
 
     let pb = ctx.ui.bar_with_unit(count as u64, "scanning", "vectors");
-    let found = std::sync::atomic::AtomicUsize::new(0);
-    let limit_reached = std::sync::atomic::AtomicBool::new(false);
 
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(threads)
-        .build()
-        .ok();
-
-    // Streaming pread scanner: open the file as a plain fd, read one
-    // chunk at a time into a heap buffer, scan in parallel, discard.
-    // This keeps process RSS bounded to the buffer size regardless of
-    // source file size. Backing storage is `Vec<f32>` so the raw-byte
-    // slice we pass to `pread` is 4-byte aligned and the per-vector
-    // `&[f32]` view we extract is safe to construct via slice indexing.
-    //
-    // Guard against degenerate inputs. `dim == 0` or `count == 0` both
-    // indicate an empty / malformed source; there's nothing to scan
-    // and `entry_size` arithmetic would underflow for `dim == 0`.
     if count == 0 || dim == 0 {
         pb.finish();
         return Vec::new();
     }
-    let entry_size = 4 + dim * 4;
-    let vecs_per_chunk = (SCAN_CHUNK_BYTES / entry_size).max(1);
-    let chunk_capacity_bytes = vecs_per_chunk * entry_size;
-    let chunk_capacity_f32 = (chunk_capacity_bytes + 3) / 4;
 
-    let mut chunk_buf: Vec<f32> = vec![0.0; chunk_capacity_f32];
+    // Workers each own a contiguous slab of chunks and do their own
+    // pread → scan → pread → scan loop. No central reader, no rayon
+    // fork-join between chunks, no idle-disk-while-we-scan bubble.
+    // On NVMe, concurrent prefix prereads from disjoint file offsets
+    // happily saturate the device; the old shape (one pread, then
+    // parallel scan) left ~50% of wall time with the disk idle.
+    //
+    // Per-chunk size is kept modest (4 MiB) instead of the old 64 MiB
+    // so threads don't all pin on the same few giant reads — smaller
+    // chunks give the kernel scheduler and the NVMe queue finer-grained
+    // work to interleave. Aggregate in-flight memory stays small
+    // (`threads * chunk_bytes`).
+    const PER_WORKER_CHUNK_BYTES: usize = 4 * 1024 * 1024;
+    let entry_size = 4 + dim * 4;
+    let vecs_per_chunk = (PER_WORKER_CHUNK_BYTES / entry_size).max(1);
 
     let file = match File::open(path) {
         Ok(f) => f,
@@ -248,79 +243,125 @@ fn scan_zeros_f32(
         }
     };
 
-    let mut all_zeros: Vec<ZeroHit> = Vec::new();
-    let mut offset_vec: usize = 0;
-
-    while offset_vec < count {
-        if limit_reached.load(std::sync::atomic::Ordering::Relaxed) { break; }
-
-        let n_vecs = vecs_per_chunk.min(count - offset_vec);
-        let chunk_bytes_now = n_vecs * entry_size;
-        let byte_off = (offset_vec as u64) * (entry_size as u64);
-
-        // pread straight into the buffer. Reinterpreting `Vec<f32>`
-        // storage as `&mut [u8]` is sound: f32 alignment ≥ u8, same
-        // underlying storage, and we won't read any f32 we didn't
-        // just write.
-        let bytes_mut: &mut [u8] = unsafe {
-            std::slice::from_raw_parts_mut(
-                chunk_buf.as_mut_ptr() as *mut u8,
-                chunk_buf.len() * 4,
-            )
-        };
-        if let Err(e) = file.read_exact_at(&mut bytes_mut[..chunk_bytes_now], byte_off) {
-            log::error!("pread at vec {}: {}", offset_vec, e);
-            break;
+    // Kernel hint: we'll read once, sequentially, never come back.
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd;
+        unsafe {
+            libc::posix_fadvise(
+                file.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL);
         }
-
-        // Parallel scan of this chunk.
-        let base_vec_idx = offset_vec;
-        let chunk_view: &[f32] = &chunk_buf;
-        let compute = || {
-            (0..n_vecs).into_par_iter()
-                .filter_map(|local_i| {
-                    if limit_reached.load(std::sync::atomic::Ordering::Relaxed) {
-                        return None;
-                    }
-                    // Each entry in the chunk: 4-byte dim header (1
-                    // f32) followed by `dim` f32 payload elements.
-                    // Header byte-offset in f32-units = local_i * (1 + dim).
-                    let payload_off = local_i * (1 + dim) + 1;
-                    let slice: &[f32] = &chunk_view[payload_off..payload_off + dim];
-                    let mut norm_sq = 0.0f64;
-                    for &v in slice {
-                        let vf = v as f64;
-                        norm_sq += vf * vf;
-                    }
-                    if norm_sq < threshold_sq {
-                        let norm = norm_sq.sqrt();
-                        let total = found.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                        if let Some(lim) = limit {
-                            if total >= lim {
-                                limit_reached.store(true, std::sync::atomic::Ordering::Relaxed);
-                            }
-                        }
-                        Some(ZeroHit { ordinal: base_vec_idx + local_i, norm })
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Vec<_>>()
-        };
-
-        let chunk_zeros = if let Some(ref p) = pool {
-            p.install(compute)
-        } else {
-            compute()
-        };
-        all_zeros.extend(chunk_zeros);
-
-        offset_vec += n_vecs;
-        pb.set_position(offset_vec as u64);
     }
-    pb.finish();
-    let mut zeros = all_zeros;
 
+    let found = AtomicUsize::new(0);
+    let limit_reached = AtomicBool::new(false);
+    let progress = AtomicUsize::new(0);
+    let all_zeros: Mutex<Vec<ZeroHit>> = Mutex::new(Vec::new());
+
+    let threads = threads.max(1).min((count + vecs_per_chunk - 1) / vecs_per_chunk);
+    let file_ref = &file;
+    let found_ref = &found;
+    let limit_reached_ref = &limit_reached;
+    let progress_ref = &progress;
+    let all_zeros_ref = &all_zeros;
+    let pb_ref = &pb;
+
+    std::thread::scope(|scope| {
+        // Contiguous per-worker stride: worker `w` owns vector indices
+        // `[w * stride_vecs, (w+1) * stride_vecs)` (last worker gets
+        // the remainder). Contiguous > round-robin here because
+        // sequential prefetch inside each worker's range is worth
+        // more than even load balance at the chunk level — scan work
+        // per vector is roughly constant.
+        let stride_vecs = (count + threads - 1) / threads;
+        for w in 0..threads {
+            let start_vec = w * stride_vecs;
+            if start_vec >= count { break; }
+            let end_vec = ((w + 1) * stride_vecs).min(count);
+
+            scope.spawn(move || {
+                // One reusable per-worker buffer. `Vec<f32>` for alignment;
+                // the pread path reinterprets it as bytes.
+                let chunk_cap_bytes = vecs_per_chunk * entry_size;
+                let mut buf: Vec<f32> = vec![0.0; (chunk_cap_bytes + 3) / 4];
+
+                let mut v = start_vec;
+                while v < end_vec {
+                    if limit_reached_ref.load(Ordering::Relaxed) { break; }
+
+                    let n_vecs = vecs_per_chunk.min(end_vec - v);
+                    let chunk_bytes = n_vecs * entry_size;
+                    let byte_off = (v as u64) * (entry_size as u64);
+
+                    let bytes_mut: &mut [u8] = unsafe {
+                        std::slice::from_raw_parts_mut(
+                            buf.as_mut_ptr() as *mut u8,
+                            buf.len() * 4,
+                        )
+                    };
+                    if let Err(e) = file_ref.read_exact_at(&mut bytes_mut[..chunk_bytes], byte_off) {
+                        log::error!("pread at vec {}: {}", v, e);
+                        return;
+                    }
+
+                    let mut local_hits: Vec<ZeroHit> = Vec::new();
+                    for local_i in 0..n_vecs {
+                        // Each entry = 4-byte dim header + dim*4 bytes.
+                        // In f32-units: header at `local_i*(1+dim)`, payload
+                        // starts at `local_i*(1+dim)+1`.
+                        let payload_off = local_i * (1 + dim) + 1;
+                        let slice: &[f32] = &buf[payload_off..payload_off + dim];
+                        // Accumulate in f64 to match the previous impl's
+                        // threshold semantics; the extra precision
+                        // matters at the near-zero boundary.
+                        let mut norm_sq = 0.0f64;
+                        for &x in slice {
+                            let xf = x as f64;
+                            norm_sq += xf * xf;
+                        }
+                        if norm_sq < threshold_sq {
+                            let norm = norm_sq.sqrt();
+                            let total = found_ref.fetch_add(1, Ordering::Relaxed) + 1;
+                            if let Some(lim) = limit {
+                                if total >= lim {
+                                    limit_reached_ref.store(true, Ordering::Relaxed);
+                                }
+                            }
+                            local_hits.push(ZeroHit { ordinal: v + local_i, norm });
+                        }
+                    }
+
+                    // Drop the pages we just finished with — a one-shot
+                    // scan never needs them again, and keeping 1+ TB
+                    // of source resident only evicts hot pages.
+                    #[cfg(target_os = "linux")]
+                    {
+                        use std::os::unix::io::AsRawFd;
+                        unsafe {
+                            libc::posix_fadvise(
+                                file_ref.as_raw_fd(),
+                                byte_off as libc::off_t,
+                                chunk_bytes as libc::off_t,
+                                libc::POSIX_FADV_DONTNEED,
+                            );
+                        }
+                    }
+
+                    if !local_hits.is_empty() {
+                        all_zeros_ref.lock().unwrap().extend(local_hits);
+                    }
+
+                    let done = progress_ref.fetch_add(n_vecs, Ordering::Relaxed) + n_vecs;
+                    pb_ref.set_position(done as u64);
+
+                    v += n_vecs;
+                }
+            });
+        }
+    });
+    pb.finish();
+
+    let mut zeros = all_zeros.into_inner().unwrap_or_default();
     zeros.sort_by_key(|z| z.ordinal);
     if let Some(lim) = limit {
         zeros.truncate(lim);
@@ -518,6 +559,14 @@ fn report_zeros_f32(
     let _ = crate::pipeline::variables::set_and_save(
         &ctx.workspace, "source_zero_count", &zero_count.to_string());
     ctx.defaults.insert("source_zero_count".into(), zero_count.to_string());
+    // Mirror the count into `dataset.yaml` as the boolean attribute the
+    // publish-readiness check requires. Running `analyze find-zeros`
+    // standalone now satisfies `veks check dataset-attributes` without
+    // a full pipeline replay; the attribute write does not invalidate
+    // any compute-step fingerprints.
+    let _ = crate::pipeline::variables::set_dataset_attribute(
+        &ctx.workspace, "is_zero_vector_free",
+        if zero_count == 0 { "true" } else { "false" });
 
     CommandResult {
         status: Status::Ok,
@@ -590,6 +639,9 @@ fn report_zeros_f16(
     let _ = crate::pipeline::variables::set_and_save(
         &ctx.workspace, "source_zero_count", &zc.to_string());
     ctx.defaults.insert("source_zero_count".into(), zc.to_string());
+    let _ = crate::pipeline::variables::set_dataset_attribute(
+        &ctx.workspace, "is_zero_vector_free",
+        if zc == 0 { "true" } else { "false" });
 
     CommandResult {
         status: Status::Ok,
@@ -716,6 +768,9 @@ fn scan_directory(
     let _ = crate::pipeline::variables::set_and_save(
         &ctx.workspace, "source_zero_count", &total_zeros.to_string());
     ctx.defaults.insert("source_zero_count".into(), total_zeros.to_string());
+    let _ = crate::pipeline::variables::set_dataset_attribute(
+        &ctx.workspace, "is_zero_vector_free",
+        if total_zeros == 0 { "true" } else { "false" });
 
     CommandResult {
         status: Status::Ok,

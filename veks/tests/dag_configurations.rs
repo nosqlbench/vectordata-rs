@@ -167,6 +167,8 @@ fn default_args(name: &str, output: &Path) -> ImportArgs {
         no_dedup: false,
         no_filtered: false,
         no_zero_check: false,
+        duplicate_count: None,
+        zero_count: None,
         normalize: false,
         force: false,
         base_convert_format: None,
@@ -722,9 +724,10 @@ fn dag_16_sized_profiles() {
     veks::prepare::import::run(args);
     let yaml = read_yaml(&out);
 
-    // YAML should contain sized profile section
-    assert!(yaml.contains("sized:"), "expected sized: section in YAML");
-    assert!(yaml.contains("ranges:"), "expected ranges: in sized section");
+    // YAML should contain the root-level sized-profile generator spec.
+    // Moved from `profiles.sized:` to root `strata:` so consumers of
+    // `profiles:` don't have to special-case a non-profile key.
+    assert!(yaml.contains("\nstrata:"), "expected root-level `strata:` section in YAML, got:\n{}", yaml);
 }
 
 // ── Config 17: Metadata with explicit BQGDMPR (no F) ─────────────────
@@ -884,7 +887,7 @@ fn dag_21_early_stratification() {
     assert_step_present(&steps, "compute-knn");
 
     // Sized profiles should appear in the yaml
-    assert!(yaml.contains("sized:"), "sized: key should be in dataset.yaml");
+    assert!(yaml.contains("\nstrata:"), "root-level strata: key should be in dataset.yaml");
 }
 
 // ── Config 22: Base fraction + early stratification ───────────────────
@@ -912,7 +915,7 @@ fn dag_22_fraction_with_early_stratification() {
     assert_step_present(&steps, "compute-knn");
 
     // Sized profiles in yaml
-    assert!(yaml.contains("sized:"), "sized: key should be in dataset.yaml");
+    assert!(yaml.contains("\nstrata:"), "root-level strata: key should be in dataset.yaml");
 
     // The fraction should appear in the upstream defaults
     assert!(yaml.contains("base_fraction") || yaml.contains("0.5"),
@@ -944,7 +947,7 @@ fn dag_23_full_with_early_stratification() {
     assert_step_present(&steps, "compute-filtered-knn");
 
     // Sized profiles
-    assert!(yaml.contains("sized:"), "sized: key should be in dataset.yaml");
+    assert!(yaml.contains("\nstrata:"), "root-level strata: key should be in dataset.yaml");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

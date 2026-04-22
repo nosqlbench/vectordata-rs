@@ -4995,6 +4995,7 @@ version = "0.21.0"
 dependencies = [
  "arrow",
  "atty",
+ "axum",
  "chrono",
  "clap",
  "crossterm",
@@ -5019,6 +5020,10 @@ dependencies = [
  "simsimd",
  "slabtastic",
  "tempfile",
+ "tokio",
+ "tower-http",
+ "unicode-width 0.2.0",
+ "url",
  "vectordata",
  "veks-completion",
  "veks-core",

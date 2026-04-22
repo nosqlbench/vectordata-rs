@@ -76,7 +76,7 @@ use serde::{Deserialize, Serialize};
 use serde::de::{self, Visitor};
 
 use super::facet::resolve_standard_key;
-use super::source::{DSSource, DSWindow, format_count_with_suffix, parse_number_with_suffix, parse_source_string};
+use super::source::{DSInterval, DSSource, DSWindow, format_count_with_suffix, parse_number_with_suffix, parse_source_string};
 
 /// A view of a data facet within a profile.
 ///
@@ -356,7 +356,36 @@ impl DSProfileGroup {
                 let base_views = scaffold_views.unwrap_or_default();
 
                 let merged = if let Some(ref dp) = default_profile {
-                    let mut merged_views = dp.views.clone();
+                    let mut merged_views: IndexMap<String, DSView> = dp.views.iter()
+                        .filter(|(k, _)| !is_per_profile_output_view(k))
+                        .map(|(k, v)| {
+                            // For per-vector shared facets (base_vectors,
+                            // metadata_content), the sized profile is
+                            // genuinely the first `count` rows of the
+                            // shared file — record that as a windowed
+                            // reference into the inherited path. This is
+                            // the documented sub-ordinal suffix model:
+                            // the source path stays the same as default,
+                            // but `source.window` carries `[0..count)` so
+                            // the `vectordata` reader API can clip
+                            // accesses without the consumer having to
+                            // remember `base_count`.
+                            //
+                            // Other shared facets (query_vectors, etc.)
+                            // are NOT windowed — query sets are the
+                            // same across profiles.
+                            if is_windowed_shared_view(k) && v.source.window.is_empty() {
+                                let mut windowed = v.clone();
+                                windowed.source.window = DSWindow(vec![DSInterval {
+                                    min_incl: 0,
+                                    max_excl: count,
+                                }]);
+                                (k.clone(), windowed)
+                            } else {
+                                (k.clone(), v.clone())
+                            }
+                        })
+                        .collect();
                     for (k, v) in base_views {
                         merged_views.insert(k, v);
                     }
@@ -396,7 +425,7 @@ impl DSProfileGroup {
     /// the dataset crate see the same profile structure without needing the
     /// pipeline runtime.
     pub fn derive_views_from_templates(&mut self, templates: &[crate::dataset::pipeline::StepDef]) {
-        use super::source::{DSInterval, DSSource, DSWindow};
+        use super::source::{DSSource, DSWindow};
 
         // Collect bare output filenames from per_profile templates,
         // paired with the template's command name for facet-scope filtering.
@@ -443,13 +472,13 @@ impl DSProfileGroup {
                     continue;
                 }
 
-                // For non-default sized profiles that are subsets of the default
-                // dataset, reference the default profile's file with a window
-                // [0, base_count). Partition profiles (which have their own
-                // independent base_vectors, not windowed from default) get
-                // direct paths to their own profile directory instead.
+                // Non-default profiles with a `base_count` (sized or
+                // partition) always reference their own profile dir for
+                // per-profile outputs. `bc` is consulted only to gate
+                // the branch — the exact count doesn't drive path
+                // construction any more.
                 if name != "default" {
-                    if let Some(bc) = profile.base_count {
+                    if profile.base_count.is_some() {
                         if profile.partition {
                             // Partition profiles only get views for facets
                             // in their scope (default BQG). Skip metadata,
@@ -475,19 +504,24 @@ impl DSProfileGroup {
                                 },
                             );
                         } else {
-                            // Sized subset profile: window into default
-                            let default_path = format!("profiles/default/{}", filename);
-                            let window = DSWindow(vec![DSInterval {
-                                min_incl: 0,
-                                max_excl: bc,
-                            }]);
+                            // Sized subset profile: outputs live in the
+                            // profile's own directory. The earlier
+                            // "window into default's file" model was
+                            // incorrect — you can't derive a sized-range
+                            // top-K by windowing a full-range top-K (the
+                            // top-N nearest neighbours of the full base
+                            // generally aren't inside the [0..N) prefix).
+                            // compute-knn actually writes per-profile
+                            // files at `profiles/{name}/{filename}`, and
+                            // verify-knn reads them from the same place.
+                            let resolved_path = format!("{}{}", profile_dir, filename);
                             profile.views.insert(
                                 stem,
                                 DSView {
                                     source: DSSource {
-                                        path: default_path,
+                                        path: resolved_path,
                                         namespace: None,
-                                        window,
+                                        window: DSWindow::default(),
                                     },
                                     window: None,
                                 },
@@ -666,6 +700,42 @@ impl<'de> Deserialize<'de> for DSProfile {
 /// end). When provided, no profile will have a `base_count` exceeding this
 /// value. This is typically the default profile's base_count (the actual
 /// dataset size). Pass `None` at parse time when the dataset size is unknown.
+/// View keys whose value is logically the first `base_count` rows of
+/// a shared per-vector file. When inherited from the default profile,
+/// these views must carry a `[0..base_count)` window so the
+/// `vectordata` reader API clamps reads automatically.
+///
+/// Limited to facets that are physically *one row per base vector*:
+///   - `base_vectors` — the actual vectors.
+///   - `metadata_content` — per-vector metadata records.
+///
+/// `query_vectors` is NOT in this list — query sets are the same
+/// across all profiles, not a prefix of anything. Per-profile output
+/// views (`neighbor_indices`, etc.) are also not in this list — they
+/// have their own windowing handled separately.
+fn is_windowed_shared_view(key: &str) -> bool {
+    matches!(key, "base_vectors" | "metadata_content")
+}
+
+/// View keys whose value is per-profile and must NOT be inherited from
+/// the default profile when expanding sized profiles.
+///
+/// A sized profile (`1m`, `40m`, ...) computes its own KNN against a
+/// subset of the base, writing to `profiles/{name}/neighbor_indices.ivecs`.
+/// If we let it inherit `neighbor_indices: profiles/default/...` from the
+/// default profile, every consumer (verify, benchmarks, external tools)
+/// would silently load default's full-base GT instead of the profile's
+/// own — and a verify against default's GT for the 1m boundary's
+/// cumulative top-100 fails 100% of queries by construction.
+///
+/// Filtered KNN outputs follow the same per-profile pattern.
+fn is_per_profile_output_view(key: &str) -> bool {
+    matches!(key,
+        "neighbor_indices" | "neighbor_distances"
+        | "filtered_neighbor_indices" | "filtered_neighbor_distances"
+    )
+}
+
 /// Compute a numeric sort key for a profile.
 ///
 /// Uses `base_count` if available, otherwise parses the profile name as a
@@ -1144,9 +1214,34 @@ impl<'de> Deserialize<'de> for DSProfileGroup {
 
                     let base_views = scaffold_views.unwrap_or_default();
 
-                    // Inherit from default, then overlay scaffold views
+                    // Inherit from default, then overlay scaffold views.
+                    // Per-profile output views (neighbor_indices, etc.) are
+                    // excluded — sized profiles compute their own KNN
+                    // outputs into `profiles/{name}/`, so inheriting
+                    // default's path would mis-route every verify and
+                    // every external consumer to default's full-base GT.
                     let merged = if let Some(ref dp) = default_profile {
-                        let mut merged_views = dp.views.clone();
+                        let mut merged_views: IndexMap<String, DSView> = dp.views.iter()
+                            .filter(|(k, _)| !is_per_profile_output_view(k))
+                            .map(|(k, v)| {
+                                // Same windowed-share treatment as
+                                // `expand_deferred_sized` — see comments
+                                // there. base_vectors / metadata_content
+                                // get a `[0..count)` window when
+                                // inherited; everything else copies
+                                // through unchanged.
+                                if is_windowed_shared_view(k) && v.source.window.is_empty() {
+                                    let mut windowed = v.clone();
+                                    windowed.source.window = DSWindow(vec![DSInterval {
+                                        min_incl: 0,
+                                        max_excl: count,
+                                    }]);
+                                    (k.clone(), windowed)
+                                } else {
+                                    (k.clone(), v.clone())
+                                }
+                            })
+                            .collect();
                         for (k, v) in base_views {
                             merged_views.insert(k, v);
                         }
@@ -1204,7 +1299,37 @@ impl<'de> Deserialize<'de> for DSProfileGroup {
                     views: child.views,
                 }
             } else if let Some(ref dp) = default_profile {
-                let mut merged_views = dp.views.clone();
+                // Inherit shared views (base_vectors, query_vectors, ...)
+                // from default. Per-profile output views are excluded —
+                // every sized/derived profile owns its own
+                // `profiles/{name}/neighbor_*` files; inheriting default's
+                // path silently routes verifies and downstream consumers
+                // to the wrong GT.
+                //
+                // Per-vector shared views (`base_vectors`,
+                // `metadata_content`) get a `[0..base_count)` window
+                // applied on inherit so the reader API can clip
+                // automatically. The child can still override with an
+                // explicit view (handled by the loop below). Without
+                // a `base_count`, the window is meaningless — copy
+                // through unchanged.
+                let child_bc = child.base_count;
+                let mut merged_views: IndexMap<String, DSView> = dp.views.iter()
+                    .filter(|(k, _)| !is_per_profile_output_view(k))
+                    .map(|(k, v)| {
+                        if let Some(bc) = child_bc {
+                            if is_windowed_shared_view(k) && v.source.window.is_empty() {
+                                let mut windowed = v.clone();
+                                windowed.source.window = DSWindow(vec![DSInterval {
+                                    min_incl: 0,
+                                    max_excl: bc,
+                                }]);
+                                return (k.clone(), windowed);
+                            }
+                        }
+                        (k.clone(), v.clone())
+                    })
+                    .collect();
                 for (k, v) in child.views {
                     merged_views.insert(k, v);
                 }
@@ -1889,22 +2014,23 @@ default:
         // Explicit view preserved
         assert_eq!(pdef.view("query_vectors").unwrap().path(), "query.mvec");
 
-        // Sized profile gets windowed views referencing default's files
+        // Sized profile: per-profile-output views (base_vectors
+        // treated as a per_profile template output here) point at the
+        // profile's own directory — the earlier "window into default"
+        // model was wrong for neighbor_indices (can't window a
+        // top-K by prefix) and we use a single rule for all
+        // per_profile outputs.
         let p10 = profiles.profile("10m").unwrap();
         assert_eq!(
             p10.view("base_vectors").unwrap().path(),
-            "profiles/default/base_vectors.mvec"
+            "profiles/10m/base_vectors.mvec"
         );
-        assert!(!p10.view("base_vectors").unwrap().source.window.is_empty());
-        assert_eq!(
-            p10.view("base_vectors").unwrap().source.window.0[0].max_excl,
-            10_000_000
-        );
+        assert!(p10.view("base_vectors").unwrap().source.window.is_empty());
         assert_eq!(
             p10.view("neighbor_indices").unwrap().path(),
-            "profiles/default/neighbor_indices.ivec"
+            "profiles/10m/neighbor_indices.ivec"
         );
-        assert!(!p10.view("neighbor_indices").unwrap().source.window.is_empty());
+        assert!(p10.view("neighbor_indices").unwrap().source.window.is_empty());
         // Inherited shared view unchanged
         assert_eq!(p10.view("query_vectors").unwrap().path(), "query.mvec");
     }
@@ -2041,5 +2167,150 @@ label_09:
         // (all have same base_count, so tiebreak is by natural name sort)
         assert_eq!(names, vec!["default", "label_00", "label_01", "label_02", "label_09", "label_10"],
             "profile names should be in natural numeric order: {:?}", names);
+    }
+
+    // ── Sized-profile windowed-share inheritance ──────────────────────
+    //
+    // These tests pin down the documented sub-ordinal suffix model so
+    // we don't quietly regress it again. The two invariants:
+    //
+    //   1. `base_vectors` (and `metadata_content`) inherited from
+    //      default by a sized profile MUST carry a `[0..base_count)`
+    //      window. Verifying via `view.base_vectors().count()` is
+    //      worth a separate integration test (in
+    //      veks/tests/e2e_http_sized_profiles.rs); these unit tests
+    //      pin the data-model side.
+    //
+    //   2. Per-profile output views (`neighbor_indices`,
+    //      `neighbor_distances`) MUST NOT be inherited at all — sized
+    //      profiles own those files in their own directories. A
+    //      windowed reference into default's GT would silently
+    //      misroute every benchmark.
+
+    #[test]
+    fn sized_profile_inherits_base_vectors_with_window() {
+        // Concrete sized profile entry in the YAML; deserializer
+        // should attach a `[0..base_count)` window to the inherited
+        // base_vectors view automatically.
+        let yaml = r#"
+default:
+  base_vectors: profiles/base/base_vectors.fvecs
+  query_vectors: profiles/base/query_vectors.fvecs
+1m:
+  base_count: 1000000
+  neighbor_indices: profiles/1m/neighbor_indices.ivecs
+  neighbor_distances: profiles/1m/neighbor_distances.fvecs
+"#;
+        let g: DSProfileGroup = serde_yaml::from_str(yaml).unwrap();
+        let p = g.profile("1m").expect("1m exists");
+        let bv = p.view("base_vectors").expect("base_vectors inherited");
+        assert_eq!(bv.source.path, "profiles/base/base_vectors.fvecs",
+            "path must come from default");
+        assert_eq!(bv.source.window.0.len(), 1, "single window applied");
+        assert_eq!(bv.source.window.0[0].min_incl, 0);
+        assert_eq!(bv.source.window.0[0].max_excl, 1_000_000,
+            "window end must equal base_count");
+    }
+
+    #[test]
+    fn sized_profile_query_vectors_inherited_unwindowed() {
+        // query_vectors is shared but NOT windowed — query sets are
+        // identical across profiles, not a prefix of anything.
+        let yaml = r#"
+default:
+  base_vectors: profiles/base/base_vectors.fvecs
+  query_vectors: profiles/base/query_vectors.fvecs
+1m:
+  base_count: 1000000
+"#;
+        let g: DSProfileGroup = serde_yaml::from_str(yaml).unwrap();
+        let p = g.profile("1m").unwrap();
+        let qv = p.view("query_vectors").expect("query_vectors inherited");
+        assert!(qv.source.window.is_empty(),
+            "query_vectors must NOT carry a window — same query set as default");
+    }
+
+    #[test]
+    fn sized_profile_does_not_inherit_per_profile_outputs() {
+        // If default declares `neighbor_indices`, the sized profile
+        // must NOT inherit it (would mis-route to default's full GT).
+        // The sized profile's own GT lives at profiles/{name}/
+        // — see e2e tests for the path-on-disk invariant.
+        let yaml = r#"
+default:
+  base_vectors: profiles/base/base_vectors.fvecs
+  neighbor_indices: profiles/default/neighbor_indices.ivecs
+  neighbor_distances: profiles/default/neighbor_distances.fvecs
+1m:
+  base_count: 1000000
+"#;
+        let g: DSProfileGroup = serde_yaml::from_str(yaml).unwrap();
+        let p = g.profile("1m").unwrap();
+        assert!(p.view("neighbor_indices").is_none(),
+            "sized profile must not inherit default's neighbor_indices");
+        assert!(p.view("neighbor_distances").is_none(),
+            "sized profile must not inherit default's neighbor_distances");
+    }
+
+    #[test]
+    fn sized_profile_metadata_content_gets_window() {
+        // metadata_content is per-vector — same windowing rule as
+        // base_vectors.
+        let yaml = r#"
+default:
+  base_vectors: profiles/base/base_vectors.fvecs
+  metadata_content: profiles/base/metadata_content.slab
+1m:
+  base_count: 1000000
+"#;
+        let g: DSProfileGroup = serde_yaml::from_str(yaml).unwrap();
+        let p = g.profile("1m").unwrap();
+        let mc = p.view("metadata_content").expect("metadata_content inherited");
+        assert_eq!(mc.source.window.0.first().map(|i| i.max_excl), Some(1_000_000));
+    }
+
+    #[test]
+    fn explicit_view_on_sized_profile_overrides_inherited_window() {
+        // Child profile with an explicit `base_vectors` declaration
+        // overrides the auto-windowed inherited one — useful when the
+        // sized profile actually has its own physical file.
+        let yaml = r#"
+default:
+  base_vectors: profiles/base/base_vectors.fvecs
+1m:
+  base_count: 1000000
+  base_vectors: profiles/1m/own_base.fvec
+"#;
+        let g: DSProfileGroup = serde_yaml::from_str(yaml).unwrap();
+        let p = g.profile("1m").unwrap();
+        let bv = p.view("base_vectors").unwrap();
+        assert_eq!(bv.source.path, "profiles/1m/own_base.fvec",
+            "explicit override wins over inherited windowed view");
+        assert!(bv.source.window.is_empty(),
+            "explicit override carries no window unless the YAML says so");
+    }
+
+    #[test]
+    fn sized_profile_via_strata_spec_inherits_with_window() {
+        // The other code path: profiles generated by `sized: [...]`
+        // (now `strata: [...]` at root, but the deserializer accepts
+        // both placements). Same windowing rule must apply.
+        let yaml = r#"
+default:
+  base_vectors: profiles/base/base_vectors.fvecs
+sized: ["1m", "2m"]
+"#;
+        let g: DSProfileGroup = serde_yaml::from_str(yaml).unwrap();
+        for (name, expected_bc) in [("1m", 1_000_000u64), ("2m", 2_000_000u64)] {
+            let p = g.profile(name).unwrap_or_else(|| panic!("expected sized profile '{}'", name));
+            let bv = p.view("base_vectors")
+                .unwrap_or_else(|| panic!("'{}' must inherit base_vectors with a window", name));
+            assert_eq!(
+                bv.source.window.0.first().map(|i| i.max_excl),
+                Some(expected_bc),
+                "profile '{}' base_vectors window should end at {}",
+                name, expected_bc,
+            );
+        }
     }
 }

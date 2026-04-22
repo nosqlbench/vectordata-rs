@@ -367,7 +367,7 @@ fn parse_interval(s: &str) -> Result<DSInterval, String> {
 /// Parse a window specification from a string.
 ///
 /// Can be a single interval or comma-separated list of intervals.
-fn parse_window(s: &str) -> Result<DSWindow, String> {
+pub fn parse_window(s: &str) -> Result<DSWindow, String> {
     let s = s.trim();
     if s.is_empty() {
         return Ok(DSWindow(vec![]));

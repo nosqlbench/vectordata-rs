@@ -123,6 +123,20 @@ pub struct DatasetConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub upstream: Option<PipelineConfig>,
 
+    /// Root-level sized-profile generator specs. Canonical location
+    /// for the `mul:/fib:/linear:/N..M/K`-style expressions the
+    /// pipeline uses to mint sized profiles; replaces the legacy
+    /// `profiles.sized:` placement (which collided with the profile
+    /// mapping and forced every consumer of `profiles:` to special-
+    /// case the `sized` key).
+    ///
+    /// Preserved across save/load cycles so sized profiles can be
+    /// re-generated idempotently from the same dataset.yaml even
+    /// after the concrete per-profile entries have been materialised
+    /// alongside them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub strata: Vec<String>,
+
     /// Named profiles, each mapping view names to data sources.
     #[serde(default)]
     pub profiles: DSProfileGroup,
@@ -144,8 +158,24 @@ impl DatasetConfig {
     pub fn load(path: &Path) -> Result<Self, String> {
         let content = std::fs::read_to_string(path)
             .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
-        serde_yaml::from_str(&content)
-            .map_err(|e| format!("Failed to parse {}: {}", path.display(), e))
+        let mut config: Self = serde_yaml::from_str(&content)
+            .map_err(|e| format!("Failed to parse {}: {}", path.display(), e))?;
+        // Unify root-level `strata:` with the legacy `profiles.sized:`
+        // location (which is still accepted by the deserializer and
+        // surfaces through `DSProfileGroup.raw_sized` +
+        // `deferred_sized`). The modern canonical location is root-
+        // level; if both exist, root-level wins. If only the legacy
+        // location populated `raw_sized`, promote it so downstream
+        // save() emits the modern shape.
+        if config.strata.is_empty() && !config.profiles.raw_sized.is_empty() {
+            config.strata = config.profiles.raw_sized.clone();
+        } else if !config.strata.is_empty() && config.profiles.raw_sized.is_empty() {
+            // Root-level `strata:` — propagate into the profile group
+            // so `expand_deferred_sized` finds something to expand.
+            config.profiles.raw_sized = config.strata.clone();
+            config.profiles.deferred_sized = config.strata.clone();
+        }
+        Ok(config)
     }
 
     /// Load a dataset config and resolve deferred sized profiles from
@@ -316,6 +346,44 @@ impl DatasetConfig {
     /// The license header comment is preserved if the file already has one,
     /// or added if absent.
     pub fn save(&self, path: &Path) -> Result<(), String> {
+        self.save_with_options(path, false)
+    }
+
+    /// Save in publish-ready form: every sized profile is materialized as
+    /// a concrete profile entry with its own `base_count` and inherited
+    /// views. The compact `sized: [...]` spec is omitted.
+    ///
+    /// Used by the finalize pass so consumers that don't know how to
+    /// expand `mul:1mi/2`-style generators (any client reading the
+    /// shipped `dataset.yaml` / `dataset.json` directly) still see the
+    /// full profile catalog. The workspace yaml stops round-tripping
+    /// the original compact spec at this point — that's the cost of
+    /// shipping a self-describing artifact.
+    pub fn save_expanded(&self, path: &Path) -> Result<(), String> {
+        self.save_with_options(path, true)
+    }
+
+    /// Render the expanded YAML representation as a String without
+    /// touching the filesystem. The returned text matches exactly what
+    /// `save_expanded(path)` would write. Callers use this to
+    /// compare-then-maybe-write so rerunning the finalize pass doesn't
+    /// gratuitously bump dataset.yaml's mtime and cascade stale
+    /// checks to downstream steps.
+    ///
+    /// `path` is consulted only to extract the existing license
+    /// header comment block (for round-trip preservation). It does
+    /// not need to exist.
+    pub fn to_expanded_yaml_string(&self, path: &Path) -> Result<String, String> {
+        self.render_yaml(path, true)
+    }
+
+    fn save_with_options(&self, path: &Path, expand_sized: bool) -> Result<(), String> {
+        let out = self.render_yaml(path, expand_sized)?;
+        std::fs::write(path, &out)
+            .map_err(|e| format!("write {}: {}", path.display(), e))
+    }
+
+    fn render_yaml(&self, path: &Path, expand_sized: bool) -> Result<String, String> {
         // If the file exists, extract the leading comment block
         let existing_header = if path.exists() {
             std::fs::read_to_string(path).ok().and_then(|content| {
@@ -373,23 +441,37 @@ impl DatasetConfig {
             }
         }
 
+        // strata — root-level sized-profile generator specs.
+        // Canonical location, replaces the legacy `profiles.sized:`
+        // slot. Always emitted (in both compact and expanded modes)
+        // so a dataset can be re-rendered with `veks run` on a fresh
+        // workspace even after its concrete per-profile entries have
+        // been materialised. `profiles:` now contains only real
+        // profiles — consumers never have to special-case a
+        // `sized` key inside the profile map.
+        let strata = if !self.strata.is_empty() {
+            self.strata.clone()
+        } else {
+            self.profiles.raw_sized.clone()
+        };
+        if !strata.is_empty() {
+            let entries: Vec<String> = strata.iter()
+                .map(|s| format!("\"{}\"", s))
+                .collect();
+            out.push_str(&format!("\nstrata: [{}]\n", entries.join(", ")));
+        }
+
         // profiles
         if !self.profiles.is_empty() || self.profiles.has_deferred() {
             out.push_str("\nprofiles:\n");
 
-            // Sized entries — preserved as compact syntax for round-tripping
-            if !self.profiles.raw_sized.is_empty() {
-                let entries: Vec<String> = self.profiles.raw_sized.iter()
-                    .map(|s| format!("\"{}\"", s))
-                    .collect();
-                out.push_str(&format!("  sized: [{}]\n", entries.join(", ")));
-            }
-
             // Materialized profiles in canonical order: default first, then
             // natural alphabetical. This is deterministic regardless of
             // base_count values (which may change between runs).
-            // Skip profiles generated from sized: entries — they'll be
-            // re-generated from the raw_sized entries on reload.
+            // In compact mode, skip profiles generated from sized: entries —
+            // they'll be re-generated from the raw_sized entries on reload.
+            // In expanded mode, emit them as concrete entries so consumers
+            // that don't know the sized-spec grammar still see them.
             let mut save_names: Vec<&str> = self.profiles.profiles.keys()
                 .map(|k| k.as_str()).collect();
             save_names.sort_by(|a, b| {
@@ -399,8 +481,16 @@ impl DatasetConfig {
                     _ => crate::dataset::profile::natural_cmp(a, b),
                 }
             });
+            // Cache default's views for inheritance suppression below.
+            // Non-default profiles inherit views from default at parse
+            // time, so emitting a view whose source/window match default's
+            // is just noise — skip it to keep the file compact.
+            let default_views = self.profiles.profiles.get("default")
+                .map(|p| &p.views);
             for name in save_names {
-                if self.profiles.sized_profile_names.contains(&name.to_string()) {
+                if !expand_sized
+                    && self.profiles.sized_profile_names.contains(&name.to_string())
+                {
                     continue;
                 }
                 let profile = self.profiles.profiles.get(name).unwrap();
@@ -414,6 +504,21 @@ impl DatasetConfig {
                 // partition is derived structurally (non-default + has own
                 // base_vectors) — not stored in the YAML.
                 for (key, view) in &profile.views {
+                    // For non-default profiles, suppress views that the
+                    // deserializer will re-derive by inheritance from
+                    // default. Without this, expanded-save bloats the
+                    // file with N copies of every shared view.
+                    if name != "default" {
+                        if let Some(dv) = default_views.and_then(|m| m.get(key)) {
+                            if dv.source.path == view.source.path
+                                && dv.source.window == view.source.window
+                                && dv.source.namespace == view.source.namespace
+                                && dv.window == view.window
+                            {
+                                continue;
+                            }
+                        }
+                    }
                     if view.window.is_none()
                         && view.source.namespace.is_none()
                         && view.source.window.is_empty()
@@ -440,8 +545,7 @@ impl DatasetConfig {
             }
         }
 
-        std::fs::write(path, &out)
-            .map_err(|e| format!("write {}: {}", path.display(), e))
+        Ok(out)
     }
 
     // -------------------------------------------------------------------------

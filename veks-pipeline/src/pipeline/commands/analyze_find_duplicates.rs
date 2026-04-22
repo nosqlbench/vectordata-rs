@@ -150,6 +150,15 @@ fn run_dedup(source_path: &Path, ctx: &mut StreamContext) -> Result<DedupResult,
     opts.set("duplicates", &dups_s);
     opts.set("report", &report_s);
     opts.set("elide", "true");
+    // `analyze find-duplicates` answers *only* the duplicate question.
+    // Zero detection is a separate concern — the user has
+    // `analyze find-zeros` for that, which does a much faster
+    // sequential scan than dedup's per-ordinal random-access
+    // `get_f32` sweep on the surviving uniques. Tell dedup to skip
+    // the zero-scan phase entirely; the cost-per-billion-records
+    // is hundreds of seconds of random I/O that this command
+    // has no use for.
+    opts.set("skip-zero-scan", "true");
 
     // Run the dedup command
     let mut cmd = super::compute_dedup::ComputeDedupOp;
@@ -310,6 +319,14 @@ fn scan_single_file(source_path: &Path, ctx: &mut StreamContext, start: Instant)
             let _ = crate::pipeline::variables::set_and_save(
                 &ctx.workspace, "duplicate_count", &result.duplicates.to_string());
             ctx.defaults.insert("duplicate_count".into(), result.duplicates.to_string());
+            // Mirror into the dataset.yaml `attributes:` block so a
+            // standalone scan satisfies `veks check dataset-attributes`
+            // without a full pipeline replay. Attributes are not part
+            // of any step's resolved options, so this write does not
+            // invalidate downstream fingerprints.
+            let _ = crate::pipeline::variables::set_dataset_attribute(
+                &ctx.workspace, "is_duplicate_vector_free",
+                if result.duplicates == 0 { "true" } else { "false" });
 
             CommandResult {
                 status: Status::Ok,
@@ -461,6 +478,9 @@ fn scan_directory_dedup(dir: &Path, ctx: &mut StreamContext, start: Instant) -> 
     let _ = crate::pipeline::variables::set_and_save(
         &ctx.workspace, "duplicate_count", &total_dups.to_string());
     ctx.defaults.insert("duplicate_count".into(), total_dups.to_string());
+    let _ = crate::pipeline::variables::set_dataset_attribute(
+        &ctx.workspace, "is_duplicate_vector_free",
+        if total_dups == 0 { "true" } else { "false" });
 
     CommandResult {
         status: Status::Ok,
