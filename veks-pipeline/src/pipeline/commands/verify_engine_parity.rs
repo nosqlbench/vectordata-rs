@@ -209,22 +209,31 @@ impl CommandOp for VerifyEngineParityOp {
             .map(|s| matches!(s, "true" | "1" | "yes"))
             .unwrap_or(false);
 
-        let workdir = match tempfile::tempdir_in(&ctx.workspace) {
+        // Use the system tempdir (honours $TMPDIR, which `.cargo/config.toml`
+        // points at `target/test-tmp` for cargo-driven runs and which the
+        // OS auto-cleans for direct CLI runs). Avoid `tempdir_in(workspace)`
+        // — it dropped the synthetic fvec fixtures into the project root,
+        // and a SIGINT'd parity run leaves them behind as `.tmpXXXXXX/`
+        // litter. Our fixtures are at most a few MiB; cross-filesystem
+        // rename concerns don't apply.
+        let workdir = match tempfile::tempdir() {
             Ok(d) => d,
             Err(e) => return error(format!("could not create workdir: {}", e), start),
         };
 
-        // Isolate the segment cache to this invocation. The shared
-        // knn segment cache in `ctx.workspace/.cache` is keyed by
-        // `(engine, file_stem, file_size, range, k, metric)` — file
-        // content isn't part of the key, so two runs with the same
-        // dim/count/k/metric but different random data produce
-        // colliding cache files. For the parity demo that's fatal:
-        // subsequent invocations happily replay stale results and
-        // the comparison stops measuring the kernels at all.
+        // Isolate the entire engine working environment — workspace
+        // AND cache — to the per-run tempdir. Without redirecting
+        // workspace, engines that write side-effects relative to it
+        // (e.g. `compute knn-metal` writes `knn_queries_with_ties` /
+        // `knn_tied_neighbors` to `<workspace>/variables.yaml`) leak
+        // those files into the user's cwd. Without redirecting cache,
+        // engines from earlier runs replay each other (the cache key
+        // is content-insensitive — see knn_segment::cache_prefix_for).
+        // Both pointers get restored before this command returns.
         let isolated_cache = workdir.path().join("cache");
         let _ = std::fs::create_dir_all(&isolated_cache);
         let saved_ctx_cache = std::mem::replace(&mut ctx.cache, isolated_cache);
+        let saved_ctx_workspace = std::mem::replace(&mut ctx.workspace, workdir.path().to_path_buf());
 
         // Resolve the (base, query) paths — either user-supplied or
         // synthetic-generated into the workdir.
@@ -473,6 +482,7 @@ impl CommandOp for VerifyEngineParityOp {
         ctx.ui.log(&emit);
 
         ctx.cache = saved_ctx_cache;
+        ctx.workspace = saved_ctx_workspace;
 
         CommandResult {
             status: if any_fail { Status::Error } else { Status::Ok },
