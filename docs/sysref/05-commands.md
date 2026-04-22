@@ -78,7 +78,35 @@ each run against the synthetic-1k test fixture.
 
 ---
 
-## 5.6 Other
+## 5.6 Interact
+
+Interactive TUI tools for poking at vector data. These live under
+`veks interact` rather than the pipeline command registry because
+they're one-shot user-facing surfaces, not composable steps.
+
+| Command | Description |
+|---------|-------------|
+| `interact explore` | Unified vector-space explorer (norms, distances, eigenvalues, PCA in one TUI) |
+| `interact shell`   | REPL for vector files (`info`, `get`, `range`, `dist`, `norm`, `stats`, …) |
+| `interact values`  | Scrollable raw-values grid: ordinals × dimensions, decimal-aligned, with sig-digit control, palette/curve cycling, optional L2-normalized view, and walls every 8 dims |
+
+The `values` command exposes vim-style navigation (`hjkl`/arrows
+single-step, `HJKL`/PgUp/PgDn page, `[`/`]` first/last row, `0`/`$`
+first/last dim), `+`/`-` to adjust significant digits 1–6, `n` to
+cycle the heatmap normalization scope (per-vector / per-column /
+global / off), `p` to cycle palette, `c` to cycle intensity curve
+(linear / sqrt / square / sigmoid), `N` to toggle "show as
+L2-normalized", `g` to jump-to-ordinal, `Esc` to back, `q` to quit.
+Palettes include color-blind-safe diverging variants
+(blue-orange, blue-yellow), Cividis, and the perceptually-uniform
+Turbo + Spectrum scatter palettes.
+
+The PCA scatter inside `interact explore` exposes the same `p` /
+`c` / palette / curve cycling — defaults to Turbo since the 4D
+view's PC4-driven hue benefits most from a high-contrast multi-stop
+palette.
+
+## 5.7 Other
 
 | Command | Description |
 |---------|-------------|

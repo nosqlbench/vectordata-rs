@@ -690,6 +690,40 @@ cached.prebuffer_with_progress(|progress: &DownloadProgress| {
 - `is_failed()` — true if any chunk failed permanently
 - `is_complete()` — true when all chunks are downloaded
 
+### Batched range reads
+
+`TypedVectorView` (the trait returned by
+`DatasetView::base_vectors()`, `query_vectors()`, etc.) provides a
+batched `get_f64_range(start, count) -> Vec<Option<Vec<f64>>>` (and
+`get_f32_range`) alongside the per-index `get_f64`/`get_f32`
+accessors. The batched form is the right choice whenever you need a
+contiguous run of vectors:
+
+- For mmap-backed local views the cost difference is small.
+- For HTTP-cached views (`CachedVectorView`) the batch path is
+  *substantially* faster: it issues one underlying `channel.read`
+  covering the whole range, which lets all overlapping chunks be
+  fetched in parallel by `fetch_chunks_parallel` instead of being
+  serialized one HTTP round per row.
+
+```rust
+let view = group.profile("default").unwrap().base_vectors()?;
+// One channel.read; chunks covering all 256 vectors fetched in parallel.
+let rows = view.get_f64_range(0, 256);
+for (i, opt) in rows.iter().enumerate() {
+    if let Some(v) = opt {
+        // process row `i`
+        let _ = (i, v);
+    }
+}
+```
+
+The default trait impl loops `get_f64` for backends that don't
+override it, so the API works uniformly across all
+`TypedVectorView` implementors. Out-of-range counts are clamped to
+the available range, not an error — `result.len()` tells you how
+many rows were actually returned.
+
 ### Listing cached datasets
 
 ```bash
@@ -829,6 +863,10 @@ let etype = gview.facet_element_type("metadata_content")?;
 ### Profile YAML structure
 
 ```yaml
+# Sized-profile generator strings live at the root, not under profiles:.
+strata:
+  - "mul:100K..1M/2"
+
 profiles:
   default:
     maxk: 100
@@ -838,17 +876,25 @@ profiles:
     metadata_content: profiles/base/metadata_content.u8
     metadata_indices: profiles/default/metadata_indices.ivvec
 
+  # Strata are expanded into per-size profiles when the dataset is
+  # published, so `dataset.yaml` always contains both the templates
+  # and their concrete output. Inherited per-vector facets are
+  # clipped with the `path[0..N)` sub-ordinal window notation so a
+  # consumer reading the `100K` profile gets exactly 100,000 rows.
   100K:
     base_count: 100000
     maxk: 100
-    base_vectors: profiles/base/base_vectors.fvec
+    base_vectors: "profiles/base/base_vectors.fvec[0..100000)"
     query_vectors: profiles/base/query_vectors.fvec
     neighbor_indices: profiles/100K/neighbor_indices.ivec
 ```
 
-Sized profiles share base/query source data but have their own
-computed KNN, filtered results, and metadata indices. The pipeline's
-`per_profile` mechanism generates these automatically.
+Sized profiles share base/query source data — `base_vectors` is
+windowed via the `[lo..hi)` suffix rather than copied — but have
+their own computed KNN, filtered results, and metadata indices. The
+pipeline's `per_profile` mechanism generates these automatically;
+see §1.7 for the full list of generator strategies (`decade`, `mul:`,
+`fib:`, `linear:`, …).
 
 ---
 

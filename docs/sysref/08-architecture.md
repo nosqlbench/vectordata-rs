@@ -50,7 +50,11 @@ vectordata-rs/
 │   ├── prepare/       Producer commands (bootstrap, import, stratify)
 │   ├── publish/       S3 publishing
 │   ├── check/         Preflight checks (integrity, merkle, extraneous)
-│   └── explore/       Interactive TUI visualization
+│   └── explore/       Interactive TUI: dataset picker, unified analytics
+│                      (norms/distances/eigenvalues/PCA), shell REPL,
+│                      values grid (scrollable ordinal × dim, with
+│                      heatmap palettes, sig-digit control, L2-norm
+│                      column, and L2-normalized view toggle)
 │
 ├── veks-pipeline/     Pipeline engine + commands
 │   ├── pipeline/

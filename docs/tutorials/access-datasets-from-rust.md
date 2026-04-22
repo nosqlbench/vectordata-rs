@@ -98,6 +98,72 @@ if let Some(entry) = catalog.find_exact("my-dataset") {
 }
 ```
 
+## Batched range reads (HTTP-cached datasets)
+
+When you need a contiguous run of vectors from a remote-cached
+profile, the per-index `get_f64` / `get_f32` path on `TestDataView`
+issues one underlying read per call — fine for local mmap, but for
+HTTP-cached views it can mean serialized chunk fetches whenever the
+range crosses a chunk boundary. The format-agnostic
+[`TypedVectorView`] returned by [`LoadedDataset::base_vectors`]
+exposes batched range methods that issue one channel read for the
+whole range, fanning out to parallel chunk fetches:
+
+```rust
+use vectordata::dataset::loader::DatasetLoader;
+
+// Open a catalog dataset (returns LoadedDataset).
+let dataset = DatasetLoader::default().load("my-dataset", Some("default"))?;
+let view = dataset.base_vectors().expect("base_vectors facet");
+
+println!("{} vectors, dim={}", view.count(), view.dim());
+
+// One channel.read; chunks covering all 1024 rows fetched in parallel.
+let rows: Vec<Option<Vec<f32>>> = view.get_f32_range(0, 1024);
+for (i, opt) in rows.iter().enumerate() {
+    if let Some(v) = opt {
+        // process row i as &[f32]
+        let _ = (i, v);
+    }
+}
+```
+
+For sparse access patterns (random indices), group adjacent indices
+into contiguous runs and call `get_f32_range` per run. The unified
+explorer's reader thread does exactly this — collapsing 50K
+per-index calls into a handful of parallel chunk fetches when the
+sample mode is streaming or clumped:
+
+```rust
+fn fetch_grouped(view: &dyn vectordata::dataset::view::TypedVectorView,
+                 indices: &[usize]) -> Vec<Vec<f32>> {
+    let mut out = Vec::with_capacity(indices.len());
+    let mut i = 0;
+    while i < indices.len() {
+        let start = indices[i];
+        let mut end = i + 1;
+        while end < indices.len() && indices[end] == indices[end - 1] + 1 {
+            end += 1;
+        }
+        let run = end - i;
+        if run > 1 {
+            for opt in view.get_f32_range(start, run) {
+                if let Some(v) = opt { out.push(v); }
+            }
+        } else if let Some(v) = view.get_f32(start) {
+            out.push(v);
+        }
+        i = end;
+    }
+    out
+}
+```
+
+The trait's default impl just loops `get_f32`, so the same code
+works against any `TypedVectorView` implementor — local mmap
+bypasses the trait override and serves rows from the cached file
+directly.
+
 ## Parallel access
 
 All readers are `Send + Sync`:

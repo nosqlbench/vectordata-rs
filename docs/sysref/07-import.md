@@ -14,6 +14,32 @@
 6. Offers to underscore-prefix source files (excludes from publishing)
 7. Offers to underscore-prefix unassigned files
 
+### Strata prompts
+
+When the dataset is large enough to warrant sub-size profiles, the
+wizard offers a choice of generator strategies (`mul:`, `fib:`,
+`linear:` every-10M, and `decade`). The user can accept any
+combination; the resulting strings are written to the root-level
+`strata:` block (see §7.7 and §1.7) and expanded into concrete
+sized-profile entries the first time the dataset is loaded or
+published.
+
+- The `linear:` strategy is only offered when `base_count ≥ 10M`
+  (below that, every-10M would yield zero or one profile).
+- The `decade` strategy is only offered when `base_count ≥ 1M`
+  (the default-start of 100k makes no meaningful sweep below that).
+
+### Zero / duplicate count assertions
+
+The wizard normally schedules `scan-zeros` and `scan-duplicates` to
+run as part of the pipeline. If the user declines removal — for a
+dataset they already trust — the wizard then asks for the *known*
+zero-count and duplicate-count to assert against. Asserted values
+are written to `variables.yaml` and the matching scan steps are
+skipped, keeping pipeline output complete (the published
+`is_zero_vector_free` / `is_duplicate_vector_free` attributes still
+get set) without re-reading the data.
+
 ### Auto mode
 
 ```bash
@@ -217,12 +243,27 @@ Zero vectors (all-component-zero) are detected and removed from the ordinal set 
 
 ## 7.7 DatasetConfig Round-Trip Serialization
 
-`DatasetConfig.save()` writes `dataset.yaml` with canonical field ordering: `name` → `description` → `attributes` → `upstream` → `profiles` → `variables`. It preserves `sized:` compact syntax (e.g., `sized: 100K`) and is round-trip safe — load, modify, save without format loss. Pipeline commands like `update_dataset_attributes` and `compute partition-profiles` use `DatasetConfig.save()` instead of text surgery, ensuring consistent formatting.
+`DatasetConfig.save()` writes `dataset.yaml` with canonical field ordering: `name` → `description` → `attributes` → `upstream` → `strata` → `profiles` → `variables`. It is round-trip safe — load, modify, save without format loss. Pipeline commands like `update_dataset_attributes` and `compute partition-profiles` use `DatasetConfig.save()` instead of text surgery, ensuring consistent formatting.
+
+`update_dataset_attributes` is the *single* writer of `dataset.yaml` after pipeline runs — earlier commands return their changes via the `DatasetConfig` model rather than touching the file directly. This avoids the multi-writer races that were causing "fixes don't stick" issues where `generate-dataset-json` recorded the file as an output and then `update_dataset_attributes` overwrote it with different content.
+
+Sized profiles live under the root-level `strata:` block as generator strings (`decade`, `mul:1m..16m/2`, `fib:1m`, etc.); see §1.7 for the full list of strategies. Both the unexpanded `strata:` and the resulting per-size profile entries are persisted, so consumers that don't run the loader still see the concrete profile list.
 
 ```yaml
-# Compact sized syntax preserved on round-trip
+# Strata generators at the root, expanded per-size profiles under profiles:
+strata:
+  - "mul:1m..16m/2"
 profiles:
-  100K:
-    sized: 100K
-    base_count: 100000
+  default:
+    maxk: 100
+    base_vectors: profiles/base/base_vectors.fvec
+  1m:
+    base_count: 1000000
+    base_vectors: "profiles/base/base_vectors.fvec[0..1000000)"
+  2m:
+    base_count: 2000000
+    base_vectors: "profiles/base/base_vectors.fvec[0..2000000)"
+  # … 4m, 8m, 16m
 ```
+
+The `path[lo..hi)` suffix on per-vector shared facets (e.g. `base_vectors`) is the canonical sub-ordinal window notation. Sized profiles inherit `base_vectors` from `default` and clip it to their first `base_count` rows; the `vectordata` reader honors the suffix on both `Detailed{source,window}` and `Simple("path[0..N)")` forms, so a consumer reading a `1m` profile sees exactly 1,000,000 rows even though the underlying file is the full base.

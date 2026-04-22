@@ -312,6 +312,18 @@ profiles:
     neighbor_indices: profiles/default/neighbor_indices.ivec
     metadata_content: profiles/base/metadata_content.u8
     metadata_indices: profiles/default/metadata_indices.ivvec
+
+# Strata are generators that expand into per-size sized profiles at
+# load/publish time. They live at the root of dataset.yaml — not under
+# profiles: — so the strata templates and the resulting (already
+# expanded) sized profiles can both be visible in the same file.
+strata:
+  - "decade"             # 100k, 200k, …, 900k, 1m, 2m, … (default start 100k)
+  - "mul:1m..16m/2"      # 1m, 2m, 4m, 8m, 16m
+  - "fib:1m"             # 1m, 2m, 3m, 5m, 8m, … capped at base_count
+  - "linear:10m/10m"     # every 10M up to base_count
+  - "step:1m..3m/1m"     # explicit-step arithmetic: 1m, 2m, 3m
+  - "parts:0m..400m/10"  # 10 equal divisions: 40m, 80m, … 400m
 ```
 
 ### Profiles
@@ -324,11 +336,43 @@ estimate costs, and display summaries.
 - **`default`** — the full dataset, always present. `base_count`
   set by the pipeline after vector preparation.
 - **Sized profiles** — subsets (e.g., `100K`, `1M`) with an explicit
-  `base_count` that windows into shared source data.
+  `base_count` that windows into shared source data. They're produced
+  either by listing them by hand under `profiles:` or, more commonly,
+  by declaring one or more generator strings under the root-level
+  `strata:` block. Strata-expanded profiles inherit per-vector facets
+  (e.g. `base_vectors`) from `default` and clip them with the windowed
+  source notation `path[0..N)` so the `vectordata` reader API serves
+  exactly the first `N` rows.
 - **Partition profiles** — per-label subsets (e.g., `label-0`) with
   `base_count` equal to the number of base vectors matching that
   label. Each has its own extracted base vectors and independently
   computed KNN in its own ordinal space.
+
+### Strata generator strategies
+
+Each entry under `strata:` is one generator string. Every multi-form
+strategy uses an explicit prefix so the intent is unambiguous; only
+the bare literal form is unprefixed.
+
+| Strategy | Form | Effect |
+|----------|------|--------|
+| literal      | `<size>` (e.g. `100k`)         | Emit a single profile at `size`. |
+| step range   | `step:<lo>..<hi>/<step>`       | Emit `lo, lo+step, lo+2·step, …` up to and including `hi`. |
+| parts range  | `parts:<lo>..<hi>/<n>`         | Divide `[lo, hi]` into `n` equal segments and emit each segment endpoint. |
+| geometric    | `mul:<lo>..<hi>/<factor>`      | Emit `lo, lo·factor, lo·factor², …`. The `..<hi>` upper bound is optional; if omitted, expansion stops at `base_count`. |
+| Fibonacci    | `fib:<lo>`                     | Fibonacci progression starting at `lo`, capped at `base_count`. |
+| arithmetic   | `linear:<lo>/<step>`           | Open-ended arithmetic — every `step` starting at `lo`, capped at `base_count`. |
+| decade sweep | `decade` (or `decade:<lo>`)    | 100k, 200k, … 900k, 1m, 2m, … 9m, 10m, … — one detent per decimal click within each order of magnitude. Starts at 100k by default; meaningful only at million-plus scale. |
+
+Legacy bare-range forms (`<lo>..<hi>/<step>` and `<lo>..<hi>/<n>`)
+are still parsed for backward compatibility — the divisor's alpha
+suffix decides between step- and parts-mode — but new entries
+should use the explicit `step:` / `parts:` prefixes.
+
+Profiles emitted by all strata in a single load are inserted into
+`dataset.yaml` sorted by ascending count, regardless of which
+strategy produced them — so e.g. `100k` from `decade` precedes `1m`
+from `mul:` in the file and in TUI views.
 
 ### Required attributes
 

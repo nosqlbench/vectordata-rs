@@ -53,7 +53,7 @@ pub struct ImportArgs {
     pub query_convert_format: Option<String>,
     /// Enable gzip compression for eligible cache artifacts.
     pub compress_cache: bool,
-    /// Sized profile specification (e.g., "mul:1m..400m/2, 0m..400m/10m").
+    /// Sized profile specification (e.g., "mul:1m..400m/2, step:0m..400m/10m").
     /// When set, generates sized profiles in the dataset.yaml.
     pub sized_profiles: Option<String>,
     /// Fraction of base vectors to use (0.0–1.0, default 1.0 = all).

@@ -911,26 +911,68 @@ fn parse_sized_entry_impl(entry: &str, max_count: u64) -> Result<Vec<(String, u6
         return parse_decade_range(rest, max_count);
     }
 
-    if let Some((range_part, step_str)) = entry.split_once('/') {
-        let (start_str, end_str) = range_part
-            .split_once("..")
-            .ok_or_else(|| format!("invalid sized range '{}': expected start..end/step", entry))?;
-        let start = parse_number_with_suffix(start_str.trim())?;
-        let end_raw = parse_number_with_suffix(end_str.trim())?;
-        // Cap explicit end at max_count (profiles >= max_count are invalid)
-        let end = if max_count > 0 { end_raw.min(max_count - 1) } else { end_raw };
-        if start > end {
-            return Ok(Vec::new());
-        }
+    // Explicit-prefix range forms:
+    //   step:<lo>..<hi>/<step>  — emit lo, lo+step, lo+2*step, …, ≤ hi
+    //   parts:<lo>..<hi>/<n>    — divide [lo, hi] into n equal segments
+    // These are the recommended spelling — they make the generator
+    // intent unambiguous. The bare `<lo>..<hi>/<x>` form (where the
+    // divisor's alpha suffix decides between step- and parts-mode) is
+    // still accepted for backward compatibility.
+    if let Some(rest) = entry.strip_prefix("step:") {
+        return parse_bounded_range(rest, max_count, RangeMode::Step);
+    }
+    if let Some(rest) = entry.strip_prefix("parts:") {
+        return parse_bounded_range(rest, max_count, RangeMode::Parts);
+    }
 
-        let step_trimmed = step_str.trim();
-        let has_suffix = step_trimmed.bytes().any(|b| b.is_ascii_alphabetic());
+    if let Some((_, divisor_str)) = entry.split_once('/') {
+        // Bare range: infer step vs parts from the divisor's suffix.
+        // (Legacy form — prefer `step:` / `parts:` in new entries.)
+        let mode = if divisor_str.trim().bytes().any(|b| b.is_ascii_alphabetic()) {
+            RangeMode::Step
+        } else {
+            RangeMode::Parts
+        };
+        return parse_bounded_range(entry, max_count, mode);
+    }
 
-        if has_suffix {
-            // Step-size mode: start..end/step_size
-            let step = parse_number_with_suffix(step_trimmed)?;
+    // Simple value
+    let count = parse_number_with_suffix(entry)?;
+    if max_count > 0 && count >= max_count {
+        return Ok(Vec::new());
+    }
+    Ok(vec![(format_count_with_suffix(count), count)])
+}
+
+#[derive(Clone, Copy)]
+enum RangeMode {
+    Step,
+    Parts,
+}
+
+fn parse_bounded_range(
+    body: &str,
+    max_count: u64,
+    mode: RangeMode,
+) -> Result<Vec<(String, u64)>, String> {
+    let (range_part, divisor_str) = body
+        .split_once('/')
+        .ok_or_else(|| format!("invalid range '{}': expected start..end/divisor", body))?;
+    let (start_str, end_str) = range_part
+        .split_once("..")
+        .ok_or_else(|| format!("invalid range '{}': expected start..end/divisor", body))?;
+    let start = parse_number_with_suffix(start_str.trim())?;
+    let end_raw = parse_number_with_suffix(end_str.trim())?;
+    let end = if max_count > 0 { end_raw.min(max_count - 1) } else { end_raw };
+    if start > end {
+        return Ok(Vec::new());
+    }
+
+    match mode {
+        RangeMode::Step => {
+            let step = parse_number_with_suffix(divisor_str.trim())?;
             if step == 0 {
-                return Err(format!("sized range step must be > 0 in '{}'", entry));
+                return Err(format!("step must be > 0 in '{}'", body));
             }
             let mut result = Vec::new();
             let mut v = start;
@@ -941,12 +983,12 @@ fn parse_sized_entry_impl(entry: &str, max_count: u64) -> Result<Vec<(String, u6
                 v += step;
             }
             Ok(result)
-        } else {
-            // Count mode: start..end/N — divide into N equal parts
-            let count: u64 = step_trimmed.parse()
-                .map_err(|e| format!("invalid division count '{}': {}", step_trimmed, e))?;
+        }
+        RangeMode::Parts => {
+            let count: u64 = divisor_str.trim().parse()
+                .map_err(|e| format!("invalid parts count '{}': {}", divisor_str.trim(), e))?;
             if count == 0 {
-                return Err(format!("sized range division count must be > 0 in '{}'", entry));
+                return Err(format!("parts count must be > 0 in '{}'", body));
             }
             let range = end - start;
             let mut result = Vec::new();
@@ -956,17 +998,9 @@ fn parse_sized_entry_impl(entry: &str, max_count: u64) -> Result<Vec<(String, u6
                     result.push((format_count_with_suffix(val), val));
                 }
             }
-            // Deduplicate (possible with small ranges and large counts)
             result.dedup_by(|a, b| a.1 == b.1);
             Ok(result)
         }
-    } else {
-        // Simple value
-        let count = parse_number_with_suffix(entry)?;
-        if max_count > 0 && count >= max_count {
-            return Ok(Vec::new());
-        }
-        Ok(vec![(format_count_with_suffix(count), count)])
     }
 }
 
@@ -1865,6 +1899,51 @@ sized: [50m, 10m, 100m..300m/100m, 20m]
         for i in 0..10 {
             assert_eq!(pairs[i].1, (i as u64 + 1) * 40_000_000);
         }
+    }
+
+    #[test]
+    fn test_parse_step_prefix_matches_bare_form() {
+        // The new explicit `step:` prefix is the recommended spelling
+        // for arithmetic ranges with an alpha-suffixed step. The bare
+        // form must continue to produce the same result.
+        let bare = parse_sized_entry("1m..3m/1m").unwrap();
+        let prefixed = parse_sized_entry("step:1m..3m/1m").unwrap();
+        assert_eq!(bare, prefixed);
+        assert_eq!(prefixed, vec![
+            ("1m".to_string(), 1_000_000),
+            ("2m".to_string(), 2_000_000),
+            ("3m".to_string(), 3_000_000),
+        ]);
+    }
+
+    #[test]
+    fn test_parse_parts_prefix_matches_bare_form() {
+        // Likewise for `parts:` — explicit-divisions-of-N spelling.
+        let bare = parse_sized_entry("0m..400m/10").unwrap();
+        let prefixed = parse_sized_entry("parts:0m..400m/10").unwrap();
+        assert_eq!(bare, prefixed);
+        assert_eq!(prefixed.len(), 10);
+        assert_eq!(prefixed[0],  ("40m".to_string(),  40_000_000));
+        assert_eq!(prefixed[9],  ("400m".to_string(), 400_000_000));
+    }
+
+    #[test]
+    fn test_parse_step_prefix_overrides_inference() {
+        // `step:` forces step-mode even when the divisor has no suffix
+        // (which the bare-form heuristic would treat as parts-mode).
+        let pairs = parse_sized_entry("step:1..5/2").unwrap();
+        // Step of 2 from 1 to 5 → 1, 3, 5.
+        let counts: Vec<u64> = pairs.iter().map(|(_, c)| *c).collect();
+        assert_eq!(counts, vec![1, 3, 5]);
+    }
+
+    #[test]
+    fn test_parse_parts_prefix_overrides_inference() {
+        // `parts:` forces parts-mode even when the divisor has an
+        // alpha suffix (which the bare-form heuristic would treat as
+        // step-mode).
+        let pairs = parse_sized_entry("parts:0m..400m/10").unwrap();
+        assert_eq!(pairs.len(), 10);
     }
 
     #[test]
