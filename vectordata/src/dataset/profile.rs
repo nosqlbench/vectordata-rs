@@ -2392,6 +2392,41 @@ custom-queries:
         assert_eq!(super::natural_cmp("a10b", "a2b"), std::cmp::Ordering::Greater);
     }
 
+    /// Regression: sized profile names ("100k", "1m", "10mi", …)
+    /// must sort by their parsed value, not by the leading digit run.
+    /// `natural_cmp` alone would put 100k after 1m (because "100" > "1"
+    /// digit-wise); `profile_sort_by_size` parses the suffix first.
+    #[test]
+    fn test_sized_profile_names_sort_by_value_not_digit_string() {
+        use std::cmp::Ordering;
+        // 100k = 100,000; 1m = 1,000,000 — 100k must come first.
+        assert_eq!(
+            super::profile_sort_by_size("100k", None, "1m", None),
+            Ordering::Less,
+            "100k (100,000) should sort before 1m (1,000,000)");
+        // Same idea across the K/M/G boundaries.
+        assert_eq!(
+            super::profile_sort_by_size("999k", None, "1m", None),
+            Ordering::Less);
+        assert_eq!(
+            super::profile_sort_by_size("500m", None, "1g", None),
+            Ordering::Less);
+        // default first regardless of the other side.
+        assert_eq!(
+            super::profile_sort_by_size("default", None, "1k", None),
+            Ordering::Less);
+        // Label-style profiles (don't parse as a number) still sort
+        // via the natural_cmp tiebreaker — preserves label_2 < label_10.
+        assert_eq!(
+            super::profile_sort_by_size("label_2", None, "label_10", None),
+            Ordering::Less);
+        // Sized profiles always sort before label profiles (label
+        // profiles have no parsable count and fall to u64::MAX-1).
+        assert_eq!(
+            super::profile_sort_by_size("100m", None, "label_0", None),
+            Ordering::Less);
+    }
+
     #[test]
     fn test_profile_names_natural_order() {
         // Profile names with numeric suffixes should sort naturally.

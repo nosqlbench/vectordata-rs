@@ -474,12 +474,15 @@ impl DatasetConfig {
             // that don't know the sized-spec grammar still see them.
             let mut save_names: Vec<&str> = self.profiles.profiles.keys()
                 .map(|k| k.as_str()).collect();
+            // `profile_sort_by_size` already sends `default` to the
+            // front and routes sized names ("100k", "1m", "10mi", …)
+            // through `parse_number_with_suffix` so 100k sorts before
+            // 1m. Label-style profiles fall back to `natural_cmp` via
+            // the tiebreaker, preserving label_0..label_10 order.
             save_names.sort_by(|a, b| {
-                match (a == &"default", b == &"default") {
-                    (true, false) => std::cmp::Ordering::Less,
-                    (false, true) => std::cmp::Ordering::Greater,
-                    _ => crate::dataset::profile::natural_cmp(a, b),
-                }
+                let a_bc = self.profiles.profiles.get(*a).and_then(|p| p.base_count);
+                let b_bc = self.profiles.profiles.get(*b).and_then(|p| p.base_count);
+                crate::dataset::profile::profile_sort_by_size(a, a_bc, b, b_bc)
             });
             // Cache default's views for inheritance suppression below.
             // Non-default profiles inherit views from default at parse

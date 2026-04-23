@@ -606,7 +606,7 @@ Reuses the shared segment-cache infrastructure:
   - Cross-profile cache reuse — smaller sibling profiles' published
     outputs drop in as `[0..N)` segments.
   - Mid-run resumability — each segment's per-query top-K is cached
-    in `<workspace>/.cache/knn-blas.v2.*` files.
+    in `<workspace>/.cache/knn-blas.v3.*` files.
   - Streaming pread — base vectors never enter the mmap address
     space during compute; I/O is double-buffered against sgemm
     compute.
@@ -741,12 +741,13 @@ Reuses the shared segment-cache infrastructure:
         let base_start = base_offset;
         let base_end = base_offset + base_n;
 
-        // Track top-(k + margin) candidates per query so the canonical
-        // f64 rerank post-pass has extra material to reorder. Cache
-        // files, segment merges, and the pre-rerank output ivec all
-        // store internal_k entries per row; the post-pass collapses
-        // them to k.
-        let internal_k = super::knn_segment::internal_k(k).min(base_n);
+        // Margin is opt-in: default 0 ⇒ `internal_k == k` ⇒ original
+        // heap sizes and pruning aggressiveness, no slowdown.
+        // `verify engine-parity` sets `rerank_margin_ratio=3` to
+        // recover the last 1% boundary cases on pathological
+        // synthetic distributions.
+        let margin = super::knn_segment::rerank_margin_from(options, k);
+        let internal_k = super::knn_segment::internal_k(k, margin).min(base_n);
 
         ctx.ui.log(&format!(
             "KNN-blas: {} queries × {} base, dim={}, k={} (internal {}), metric={} (engine=BLAS sgemm)",
@@ -799,7 +800,6 @@ Reuses the shared segment-cache infrastructure:
             ivec_path: PathBuf,
             fvec_path: PathBuf,
             cached: bool,
-            flip_sign: bool,
         }
 
         let mut plan: Vec<PlannedSegment> = Vec::new();
@@ -814,7 +814,6 @@ Reuses the shared segment-cache infrastructure:
                     ivec_path: seg.ivec_path.clone(),
                     fvec_path: seg.fvec_path.clone(),
                     cached: true,
-                    flip_sign: seg.flip_sign,
                 });
                 pos = seg.end;
             } else {
@@ -824,7 +823,6 @@ Reuses the shared segment-cache infrastructure:
                     ivec_path: build_cache_path(&ctx.cache, ENGINE_NAME, &cache_prefix, pos, pe, internal_k, kernel_metric, "neighbors", "ivec"),
                     fvec_path: build_cache_path(&ctx.cache, ENGINE_NAME, &cache_prefix, pos, pe, internal_k, kernel_metric, "distances", "fvec"),
                     cached: false,
-                    flip_sign: false,
                 });
                 pos = pe;
             }
@@ -876,7 +874,7 @@ Reuses the shared segment-cache infrastructure:
             let mut replayed_bytes: u64 = 0;
             for (seg_idx, p) in plan.iter().enumerate() {
                 if !p.cached { continue; }
-                let seg = match load_segment_cache(&p.ivec_path, &p.fvec_path, internal_k, query_count, p.flip_sign) {
+                let seg = match load_segment_cache(&p.ivec_path, &p.fvec_path, internal_k, query_count, kernel_metric) {
                     Ok(s) => s,
                     Err(e) => {
                         return error_result(
@@ -1013,7 +1011,7 @@ Reuses the shared segment-cache infrastructure:
             if let Err(e) = write_segment_cache(
                 &plan[seg_idx].ivec_path,
                 &plan[seg_idx].fvec_path,
-                &per_query, internal_k,
+                &per_query, internal_k, kernel_metric,
             ) {
                 ctx.ui.log(&format!(
                     "  warning: segment {} cache write failed: {}",
@@ -1089,14 +1087,13 @@ Reuses the shared segment-cache infrastructure:
             if let Some(ref mut dw) = dist_file {
                 dw.write_all(&dim_bytes).map_err(|e| e.to_string()).unwrap();
                 for j in 0..internal_k {
-                    // Writer convention matches the stored cache:
-                    // L2 writes L2sq (positive), IP/DOT/COSINE write
-                    // -dot (the canonical "distance, smaller is better"
-                    // value). For historical knn-blas compatibility,
-                    // IP output is the raw dot (positive, higher is
-                    // better). See notes below.
+                    // Single sign convention everywhere on disk:
+                    // FAISS publication (`+L2sq`, `+dot`, `+cos_sim`).
+                    // The heap holds kernel-internal distances; convert
+                    // via the shared helper so segment caches, cached
+                    // sibling profiles, and final output all agree.
                     let dist: f32 = if j < row.len() {
-                        if use_ip { -row[j].distance } else { row[j].distance }
+                        super::knn_segment::kernel_to_published(row[j].distance, kernel_metric)
                     } else {
                         f32::INFINITY
                     };
@@ -1104,6 +1101,7 @@ Reuses the shared segment-cache infrastructure:
                 }
             }
         }
+        let _ = use_ip;
         idx_file.flush().map_err(|e| e.to_string()).unwrap();
         if let Some(ref mut dw) = dist_file {
             dw.flush().map_err(|e| e.to_string()).unwrap();
@@ -1125,6 +1123,7 @@ Reuses the shared segment-cache infrastructure:
             &base_reader,
             &query_reader,
             kernel_metric, k, base_offset,
+            &ctx.ui,
         ) {
             ctx.ui.log(&format!("  rerank post-pass skipped: {}", e));
         }
@@ -1396,7 +1395,7 @@ mod tests {
         let files_after_a: Vec<_> = std::fs::read_dir(&cache_dir).unwrap()
             .filter_map(|e| e.ok()).map(|e| e.path())
             .filter(|p| p.file_name().and_then(|s| s.to_str())
-                .map(|n| n.starts_with("knn-blas.v2.")).unwrap_or(false))
+                .map(|n| n.starts_with("knn-blas.v3.")).unwrap_or(false))
             .collect();
         assert_eq!(files_after_a.len(), 6,
             "profile A should have written 6 cache files (3 segments × ivec+fvec), got {}",
@@ -1441,7 +1440,7 @@ mod tests {
         let files_after_b: Vec<_> = std::fs::read_dir(&cache_dir).unwrap()
             .filter_map(|e| e.ok()).map(|e| e.path())
             .filter(|p| p.file_name().and_then(|s| s.to_str())
-                .map(|n| n.starts_with("knn-blas.v2.")).unwrap_or(false))
+                .map(|n| n.starts_with("knn-blas.v3.")).unwrap_or(false))
             .collect();
         assert_eq!(files_after_b.len(), 12,
             "expected 12 cache files (6 from A + 6 fresh from B), got {}",

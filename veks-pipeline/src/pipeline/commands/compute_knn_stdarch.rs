@@ -704,13 +704,13 @@ on `std::arch` alone, without SimSIMD, FAISS, or BLAS.
             "pairwise"
         };
 
-        // Track top-(k + margin) per query so the canonical f64 rerank
-        // post-pass can recover boundary candidates the f32 kernel
-        // mis-ranks (curse-of-dim uniform random at high dim, etc.).
-        // Cache files, segment merges, and the pre-rerank output ivec
-        // all carry internal_k entries per row; the post-pass reduces
-        // them to k.
-        let internal_k = super::knn_segment::internal_k(k).min(base_n);
+        // Margin is opt-in: default 0 ⇒ `internal_k == k` ⇒ original
+        // heap sizes and pruning aggressiveness, no slowdown.
+        // `verify engine-parity` sets `rerank_margin_ratio=3` to
+        // recover the last 1% boundary cases on pathological
+        // synthetic distributions.
+        let margin = super::knn_segment::rerank_margin_from(options, k);
+        let internal_k = super::knn_segment::internal_k(k, margin).min(base_n);
 
         ctx.ui.log(&format!(
             "KNN-stdarch: {} queries × {} base, dim={}, k={} (internal {}), metric={}, ISA={} ({}), threads={}",
@@ -802,7 +802,6 @@ on `std::arch` alone, without SimSIMD, FAISS, or BLAS.
             ivec_path: PathBuf,
             fvec_path: PathBuf,
             cached: bool,
-            flip_sign: bool,
         }
 
         // Greedy chain build: at each position, prefer the largest
@@ -821,7 +820,6 @@ on `std::arch` alone, without SimSIMD, FAISS, or BLAS.
                     ivec_path: seg.ivec_path.clone(),
                     fvec_path: seg.fvec_path.clone(),
                     cached: true,
-                    flip_sign: seg.flip_sign,
                 });
                 pos = seg.end;
             } else {
@@ -831,7 +829,6 @@ on `std::arch` alone, without SimSIMD, FAISS, or BLAS.
                     ivec_path: build_cache_path(&ctx.cache, ENGINE_NAME, &cache_prefix, pos, pe, internal_k, kernel_metric, "neighbors", "ivec"),
                     fvec_path: build_cache_path(&ctx.cache, ENGINE_NAME, &cache_prefix, pos, pe, internal_k, kernel_metric, "distances", "fvec"),
                     cached: false,
-                    flip_sign: false,
                 });
                 pos = pe;
             }
@@ -882,7 +879,7 @@ on `std::arch` alone, without SimSIMD, FAISS, or BLAS.
             for (seg_idx, p) in plan.iter().enumerate() {
                 if !p.cached { continue; }
                 let seg = match load_segment_cache(
-                    &p.ivec_path, &p.fvec_path, internal_k, query_count, p.flip_sign,
+                    &p.ivec_path, &p.fvec_path, internal_k, query_count, kernel_metric,
                 ) {
                     Ok(s) => s,
                     Err(e) => {
@@ -1109,7 +1106,7 @@ on `std::arch` alone, without SimSIMD, FAISS, or BLAS.
             if let Err(e) = write_segment_cache(
                 &plan[seg_idx].ivec_path,
                 &plan[seg_idx].fvec_path,
-                &per_query, internal_k,
+                &per_query, internal_k, kernel_metric,
             ) {
                 // Non-fatal: log and continue. A cache-write failure
                 // doesn't break correctness, just resumability for
@@ -1185,7 +1182,11 @@ on `std::arch` alone, without SimSIMD, FAISS, or BLAS.
                     let n = &all_results[qi][j];
                     idx_file.write_all(&(n.index as i32).to_le_bytes()).unwrap();
                     if let Some(ref mut dw) = dist_file {
-                        dw.write_all(&n.distance.to_le_bytes()).unwrap();
+                        // Convert kernel-internal heap distance to
+                        // FAISS publication convention before writing —
+                        // the single on-disk standard.
+                        let d = super::knn_segment::kernel_to_published(n.distance, kernel_metric);
+                        dw.write_all(&d.to_le_bytes()).unwrap();
                     }
                 } else {
                     idx_file.write_all(&(-1i32).to_le_bytes()).unwrap();
@@ -1213,6 +1214,7 @@ on `std::arch` alone, without SimSIMD, FAISS, or BLAS.
             base_reader.as_ref(),
             query_reader.as_ref(),
             kernel_metric, k, base_offset,
+            &ctx.ui,
         ) {
             ctx.ui.log(&format!("  rerank post-pass skipped: {}", e));
         }
@@ -1514,21 +1516,21 @@ mod tests {
         let (r, _, _) = run_knn(tmp.path(), &base, &query, 40, 3, "L2", "out");
         assert_eq!(r.status, Status::Ok, "{}", r.message);
 
-        // Three segments × two files each = six cache files at
-        // query_count × (4 + internal_k × 4). internal_k =
-        // k × (1 + RERANK_MARGIN_RATIO) = 3 × 4 = 12, so the row size
-        // is 5 × (4 + 12 × 4) = 260 bytes.
+        // Three segments × two files each = six cache files. With the
+        // default margin=0, `internal_k == k`, so each row is
+        // `4 + k × 4` bytes; the file is `query_count × (4 + k × 4)`.
+        // k=3 ⇒ 5 × (4 + 12) = 80 bytes per file.
         let cache_dir = tmp.path().join(".cache");
         let files: Vec<_> = std::fs::read_dir(&cache_dir).unwrap()
             .filter_map(|e| e.ok())
             .map(|e| e.path())
             .filter(|p| p.file_name().and_then(|s| s.to_str())
-                .map(|n| n.starts_with("knn-stdarch.v2.")).unwrap_or(false))
+                .map(|n| n.starts_with("knn-stdarch.v3.")).unwrap_or(false))
             .collect();
         assert_eq!(files.len(), 6,
             "expected 6 cache files (3 segments × ivec+fvec), got {}: {:?}",
             files.len(), files);
-        let expected_row_bytes = 4 + super::super::knn_segment::internal_k(3) * 4;
+        let expected_row_bytes = 4 + super::super::knn_segment::internal_k(3, 0) * 4;
         let expected_file_size = (5 * expected_row_bytes) as u64;
         for f in &files {
             let sz = std::fs::metadata(f).unwrap().len();
@@ -1619,7 +1621,7 @@ mod tests {
             .filter_map(|e| e.ok())
             .map(|e| e.path())
             .filter(|p| p.file_name().and_then(|s| s.to_str())
-                .map(|n| n.starts_with("knn-stdarch.v2.")).unwrap_or(false))
+                .map(|n| n.starts_with("knn-stdarch.v3.")).unwrap_or(false))
             .collect();
         assert_eq!(files.len(), 6,
             "cache should be re-filled after partial-replay run, got {}", files.len());
@@ -1642,10 +1644,10 @@ mod tests {
         let (r2, _, _) = run_knn(tmp.path(), &base, &query, 30, 5, "L2", "k5");
         assert_eq!(r2.status, Status::Ok);
 
-        // Cache filenames embed `internal_k`, not the user-facing k,
-        // so filter by that (k=3 → internal_k=12, k=5 → internal_k=20).
-        let tag_k3 = format!(".k{}.", super::super::knn_segment::internal_k(3));
-        let tag_k5 = format!(".k{}.", super::super::knn_segment::internal_k(5));
+        // Cache filenames embed `internal_k = k + margin`. These runs
+        // don't opt in to a margin, so internal_k == k for both.
+        let tag_k3 = format!(".k{}.", super::super::knn_segment::internal_k(3, 0));
+        let tag_k5 = format!(".k{}.", super::super::knn_segment::internal_k(5, 0));
         let cache_dir = tmp.path().join(".cache");
         let k3: Vec<_> = std::fs::read_dir(&cache_dir).unwrap()
             .filter_map(|e| e.ok()).map(|e| e.path())
@@ -1682,7 +1684,7 @@ mod tests {
         let before: Vec<_> = std::fs::read_dir(&cache_dir).unwrap()
             .filter_map(|e| e.ok()).map(|e| e.path())
             .filter(|p| p.file_name().and_then(|s| s.to_str())
-                .map(|n| n.starts_with("knn-stdarch.v2.")).unwrap_or(false))
+                .map(|n| n.starts_with("knn-stdarch.v3.")).unwrap_or(false))
             .collect();
         assert_eq!(before.len(), 4, "expected 4 cache files after first run");
 
@@ -1698,7 +1700,7 @@ mod tests {
         let after: Vec<_> = std::fs::read_dir(&cache_dir).unwrap()
             .filter_map(|e| e.ok()).map(|e| e.path())
             .filter(|p| p.file_name().and_then(|s| s.to_str())
-                .map(|n| n.starts_with("knn-stdarch.v2.")).unwrap_or(false))
+                .map(|n| n.starts_with("knn-stdarch.v3.")).unwrap_or(false))
             .collect();
         // 4 from run-1 + 6 from run-2 (50/20 = 3 segments × 2 files)
         // — all coexist under disjoint cache-prefix keys.
@@ -1752,7 +1754,7 @@ mod tests {
         let files_after_a: Vec<_> = std::fs::read_dir(&cache_dir).unwrap()
             .filter_map(|e| e.ok()).map(|e| e.path())
             .filter(|p| p.file_name().and_then(|s| s.to_str())
-                .map(|n| n.starts_with("knn-stdarch.v2.")).unwrap_or(false))
+                .map(|n| n.starts_with("knn-stdarch.v3.")).unwrap_or(false))
             .collect();
         assert_eq!(files_after_a.len(), 6,
             "profile A should have written 6 cache files (3 segments × ivec+fvec), got {}",
@@ -1793,7 +1795,7 @@ mod tests {
         let files_after_b: Vec<_> = std::fs::read_dir(&cache_dir).unwrap()
             .filter_map(|e| e.ok()).map(|e| e.path())
             .filter(|p| p.file_name().and_then(|s| s.to_str())
-                .map(|n| n.starts_with("knn-stdarch.v2.")).unwrap_or(false))
+                .map(|n| n.starts_with("knn-stdarch.v3.")).unwrap_or(false))
             .collect();
         assert_eq!(files_after_b.len(), 12,
             "expected 12 cache files (6 from profile A + 6 fresh from profile B), got {}: {:?}",

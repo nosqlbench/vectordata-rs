@@ -214,20 +214,29 @@ for dist in uniform gaussian clustered; do
 done
 ```
 
-`verify engine-parity` forces single-threaded BLAS (via
-`OPENBLAS_NUM_THREADS=1` + MKL/OMP siblings, set at the top of
-`execute`). Without that, FAISS's OpenMP-scheduled sgemm picks
-non-deterministic block-accumulation orders and the comparison
-becomes noise. With it, **every row of the table is 100 EXACT**
-— bit-identical neighbor sets across all four engines — because
-every engine internally tracks top-(k + margin) candidates per
-query (where `margin = RERANK_MARGIN_RATIO · k = 3 · k`), then
-post-processes through a shared **f64-direct canonical rerank**
-(`knn_segment::rerank_output_post_pass`) that recomputes distances
-in f64 using `Σ(a−b)²` and selects the canonical top-k. The
+`verify engine-parity` does two things production `compute knn*`
+calls don't:
+
+1. Forces single-threaded BLAS (via `OPENBLAS_NUM_THREADS=1` +
+   MKL/OMP siblings, set at the top of `execute`). Without that,
+   FAISS's OpenMP-scheduled sgemm picks non-deterministic
+   block-accumulation orders and the comparison becomes noise.
+2. Sets `rerank_margin_ratio=3` on each engine it invokes, so
+   each engine internally tracks top-(k + 3·k) candidates per
+   query rather than top-k. Production `compute knn*` callers
+   leave this option unset → margin = 0 → engine heaps are
+   sized at exactly k (the original pre-rerank behavior, with
+   full pruning aggressiveness — no slowdown). The canonical
+   f64 rerank post-pass still runs at margin=0; it just
+   reorders the engine's existing top-k via f64 direct math.
+
+With both flags on, **every row of the table is 100 EXACT** —
+bit-identical neighbor sets across all four engines — because the
 margin gives every engine enough boundary candidates that the
 sgemm-expansion path (`‖a‖² + ‖b‖² − 2·a·b`) and the direct path
-(`Σ(a−b)²`) both surface the same top-k after f64 rerank.
+(`Σ(a−b)²`) both hold the true top-k inside their respective
+top-(k + margin), and the shared **f64-direct canonical rerank**
+(`knn_segment::rerank_output_post_pass`) selects the same ten.
 
 EXACT count per engine against the metal (SimSIMD) reference,
 format `stdarch / blas / faiss / blas-mirror`:
@@ -279,14 +288,21 @@ Four factors had to align for bit-identical output:
    caller — FAISS, our knn-blas, our blas-mirror — produces the same
    bytes. The parity command does this automatically via
    `OPENBLAS_NUM_THREADS`/`MKL_NUM_THREADS`/`OMP_NUM_THREADS`.
-4. **Top-(k + margin) internal tracking** — every engine sizes its
-   per-query heaps and its segment-cache rows at `internal_k = k ×
-   (1 + RERANK_MARGIN_RATIO)` (currently `4 · k`). Pulling extra
+4. **Top-(k + margin) internal tracking, opt-in** — when invoked
+   with `rerank_margin_ratio=N` (or `rerank_margin=M`) every
+   engine sizes its per-query heaps and segment-cache rows at
+   `internal_k = k + margin` instead of `k`. Pulling extra
    candidates out of each engine's f32 scan is what closes the
    boundary-membership gap: even when an f32 sgemm and an f32
    direct kernel disagree on *which* neighbor sits at rank 10,
    both forms hold the true top-k within their top-(k + margin),
    and the canonical rerank (next item) picks the same ten.
+
+   Margin is **opt-in** because it widens the threshold-pruning
+   cutoff (the worst-of-top-k distance) and slows the scan loop
+   measurably — `verify engine-parity` opts in (it cares about
+   bit-identical agreement, not throughput); production
+   `compute knn*` callers do not (`margin = 0` ⇒ original speed).
 5. **Canonical f64 rerank post-pass** — every `compute knn*` command
    ends with a call to `knn_segment::rerank_output_post_pass` that
    reads back its just-written top-(k + margin) ivec, recomputes

@@ -272,10 +272,12 @@ Only f32 (fvec) inputs are supported.
         let n_chunks = (query_count + chunk_size - 1) / chunk_size;
         let evals = query_count as f64 * base_n as f64;
 
-        // Pull top-(k + margin) candidates so the canonical rerank
-        // post-pass has extra material to reorder; clamp to base size
-        // since FAISS errors on requesting more neighbors than vectors.
-        let internal_k = super::knn_segment::internal_k(k).min(base_n);
+        // Margin is opt-in: default 0 ⇒ `internal_k == k` ⇒ FAISS
+        // searches for top-k as before. `verify engine-parity` sets
+        // `rerank_margin_ratio=3` to pull extra candidates so the
+        // canonical rerank can recover boundary neighbors.
+        let margin = super::knn_segment::rerank_margin_from(options, k);
+        let internal_k = super::knn_segment::internal_k(k, margin).min(base_n);
 
         ctx.ui.log(&format!("  FAISS search: {} queries x {} base, k={} (internal {}, {} batches)...",
             query_count, base_n, k, internal_k, n_chunks));
@@ -361,6 +363,7 @@ Only f32 (fvec) inputs are supported.
                 m,
                 k,
                 base_offset,
+                &ctx.ui,
             ) {
                 ctx.ui.log(&format!("  rerank post-pass skipped: {}", e));
             }

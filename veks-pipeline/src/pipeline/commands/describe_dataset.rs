@@ -711,7 +711,11 @@ fn write_partitions(config: &DatasetConfig, workspace: &Path, doc: &mut String) 
     doc.push_str("|-----------|-------------|---------|---------------|\n");
 
     let mut sorted: Vec<_> = partition_profiles.iter().collect();
-    sorted.sort_by_key(|(n, _)| *n);
+    sorted.sort_by(|(a, ap), (b, bp)| {
+        vectordata::dataset::profile::profile_sort_by_size(
+            a, ap.base_count, b, bp.base_count,
+        )
+    });
 
     let mut total_partition_queries: usize = 0;
 

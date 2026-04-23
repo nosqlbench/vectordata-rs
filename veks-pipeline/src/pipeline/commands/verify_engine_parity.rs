@@ -184,6 +184,12 @@ impl CommandOp for VerifyEngineParityOp {
             OptionDesc { name: "cluster-spread".into(), type_name: "float".into(), required: false, default: Some("0.05".into()),
                 description: "Synthetic 'clustered' mode: per-vector noise std-dev relative to cluster radius (default 0.05). Smaller → tighter clusters → distances spread more widely → easier top-k.".into(),
                 role: OptionRole::Config },
+            OptionDesc { name: "assume_normalized_like_faiss".into(), type_name: "bool".into(), required: false, default: Some("false".into()),
+                description: "metric=COSINE only: treat inputs as already unit-normalized so cosine collapses to inner product (FAISS/numpy/knn_utils convention). Mutually exclusive with use_proper_cosine_metric. Propagated to every engine.".into(),
+                role: OptionRole::Config },
+            OptionDesc { name: "use_proper_cosine_metric".into(), type_name: "bool".into(), required: false, default: Some("false".into()),
+                description: "metric=COSINE only: divide the dot product by |q|·|b| in-kernel so cosine works on un-normalized inputs. Mutually exclusive with assume_normalized_like_faiss. Propagated to every engine.".into(),
+                role: OptionRole::Config },
         ]
     }
 
@@ -297,6 +303,24 @@ impl CommandOp for VerifyEngineParityOp {
             ]);
         let want = |name: &str| requested.iter().any(|r| r == name);
 
+        // Cosine mode propagation. When `metric=COSINE`, every engine
+        // independently requires either `assume_normalized_like_faiss`
+        // or `use_proper_cosine_metric`. Read the parity command's
+        // own flag(s) and forward them to every sub-engine.
+        let assume_normalized = options.get("assume_normalized_like_faiss")
+            .map(|s| s == "true").unwrap_or(false);
+        let use_proper_cosine = options.get("use_proper_cosine_metric")
+            .map(|s| s == "true").unwrap_or(false);
+        let metric_upper = metric.to_uppercase();
+        if metric_upper == "COSINE" && !(assume_normalized ^ use_proper_cosine) {
+            return error(
+                "metric=COSINE: set exactly one of assume_normalized_like_faiss=true \
+                 or use_proper_cosine_metric=true on `verify engine-parity` so the flag \
+                 can be forwarded to every engine",
+                start,
+            );
+        }
+
         ctx.ui.log(&format!(
             "engine-parity: base={} query={} k={} metric={}",
             base_path.display(), query_path.display(), neighbors, metric));
@@ -308,7 +332,7 @@ impl CommandOp for VerifyEngineParityOp {
                 "metal",
                 || super::compute_knn::factory(),
                 &base_path, &query_path, &workdir.path().join("metal.ivec"),
-                neighbors, &metric, ctx,
+                neighbors, &metric, assume_normalized, use_proper_cosine, ctx,
             ));
         }
         if want("stdarch") {
@@ -316,7 +340,7 @@ impl CommandOp for VerifyEngineParityOp {
                 "stdarch",
                 || super::compute_knn_stdarch::factory(),
                 &base_path, &query_path, &workdir.path().join("stdarch.ivec"),
-                neighbors, &metric, ctx,
+                neighbors, &metric, assume_normalized, use_proper_cosine, ctx,
             ));
         }
 
@@ -326,7 +350,7 @@ impl CommandOp for VerifyEngineParityOp {
                 "blas",
                 || super::compute_knn_blas::factory(),
                 &base_path, &query_path, &workdir.path().join("blas.ivec"),
-                neighbors, &metric, ctx,
+                neighbors, &metric, assume_normalized, use_proper_cosine, ctx,
             ));
         }
         #[cfg(not(feature = "knnutils"))]
@@ -336,12 +360,29 @@ impl CommandOp for VerifyEngineParityOp {
 
         #[cfg(feature = "faiss")]
         if want("faiss") {
-            runs.push(run_engine(
-                "faiss",
-                || Box::new(super::compute_knn_faiss::ComputeKnnFaissOp) as Box<dyn CommandOp>,
-                &base_path, &query_path, &workdir.path().join("faiss.ivec"),
-                neighbors, &metric, ctx,
-            ));
+            // FAISS has no native proper-cosine kernel — its
+            // METRIC_INNER_PRODUCT assumes pre-normalized inputs and
+            // never divides by `|q|·|b|`. On *normalized* data
+            // (`assume_normalized_like_faiss=true`, or any naturally
+            // unit-norm distribution like our `gaussian`/`clustered`
+            // synthetics), IP === proper cosine and FAISS agrees with
+            // the other engines. On un-normalized data with
+            // `use_proper_cosine_metric=true`, FAISS would compare
+            // against a different ranking — that's a genuine
+            // semantic difference, not a parity violation, so skip.
+            if metric_upper == "COSINE" && use_proper_cosine {
+                runs.push(skipped("faiss",
+                    "metric=COSINE use_proper_cosine_metric=true: FAISS has no \
+                     native proper-cosine kernel (it treats COSINE as IP on \
+                     assumed-normalized input); not comparable in this mode"));
+            } else {
+                runs.push(run_engine(
+                    "faiss",
+                    || Box::new(super::compute_knn_faiss::ComputeKnnFaissOp) as Box<dyn CommandOp>,
+                    &base_path, &query_path, &workdir.path().join("faiss.ivec"),
+                    neighbors, &metric, assume_normalized, use_proper_cosine, ctx,
+                ));
+            }
         }
         #[cfg(not(feature = "faiss"))]
         if want("faiss") {
@@ -350,14 +391,16 @@ impl CommandOp for VerifyEngineParityOp {
 
         // Probe engine: mirrors FAISS's `exhaustive_L2sqr_blas_default_impl`
         // exactly — same outer/inner block sizes, same sgemm orientation,
-        // same per-cell post-processing. If FAISS's BLAS link and ours
-        // resolve to the same library, this engine should produce
-        // bit-identical neighbor sets to FAISS at every dim.
+        // same per-cell post-processing. Extended for IP/Cosine using the
+        // same sgemm + per-cell post-pass.
         #[cfg(feature = "knnutils")]
         if want("blas-mirror") {
             let started = Instant::now();
             let path = workdir.path().join("blas-mirror.ivec");
-            let res = run_blas_mirror(&base_path, &query_path, &path, neighbors, &metric);
+            let res = run_blas_mirror(
+                &base_path, &query_path, &path, neighbors, &metric,
+                assume_normalized, use_proper_cosine,
+            );
             let elapsed = started.elapsed();
             runs.push(match res {
                 Ok(()) => EngineRun { name: "blas-mirror", indices_path: Some(path), elapsed, note: None },
@@ -535,6 +578,7 @@ fn read_ivec_rows(path: &Path) -> Result<Vec<Vec<i32>>, String> {
 /// Run a single engine, capturing wall time and (on failure) the
 /// engine's own error message — we don't want one engine's failure to
 /// abort the whole demo.
+#[allow(clippy::too_many_arguments)]
 fn run_engine<F>(
     name: &'static str,
     factory: F,
@@ -543,6 +587,8 @@ fn run_engine<F>(
     indices: &Path,
     neighbors: usize,
     metric: &str,
+    assume_normalized: bool,
+    use_proper_cosine: bool,
     ctx: &mut StreamContext,
 ) -> EngineRun
 where
@@ -556,6 +602,19 @@ where
     opts.set("indices", indices.to_string_lossy().to_string());
     opts.set("neighbors", neighbors.to_string());
     opts.set("metric", metric.to_string());
+    // Forward cosine mode — every engine independently requires one
+    // of these flags when `metric=COSINE`. Validated upstream in the
+    // parity command so exactly one is true here.
+    if assume_normalized { opts.set("assume_normalized_like_faiss", "true"); }
+    if use_proper_cosine { opts.set("use_proper_cosine_metric", "true"); }
+    // Parity testing opts in to a margin — each engine pulls
+    // top-(k + 3·k) candidates internally so the canonical f64
+    // rerank can recover the last 1% of boundary cases that
+    // surface on pathological synthetic distributions (uniform
+    // random at very high dim). Production `compute knn*` calls
+    // leave `rerank_margin_ratio` unset → margin=0 → original
+    // heap sizes and full pruning aggressiveness.
+    opts.set("rerank_margin_ratio", "3");
     let started = Instant::now();
     let res = op.execute(&opts, ctx);
     let elapsed = started.elapsed();
@@ -730,13 +789,47 @@ fn run_blas_mirror(
     out_path: &Path,
     k: usize,
     metric: &str,
+    assume_normalized: bool,
+    use_proper_cosine: bool,
 ) -> Result<(), String> {
     use vectordata::VectorReader;
     use vectordata::io::MmapVectorReader;
 
-    if metric != "L2" {
-        return Err(format!("blas-mirror currently implements L2 only (got {})", metric));
-    }
+    // Resolve which sgemm-derived distance to compute. blas-mirror
+    // tracks all four metric paths the engines do, so it can serve
+    // as the FAISS-equivalent reference for every metric:
+    //   - L2:  `‖q‖² + ‖b‖² − 2·ip` (FAISS's exhaustive_L2sqr_blas_default_impl)
+    //   - IP / DOT_PRODUCT: raw `ip`, ranked by max
+    //   - COSINE + assume_normalized: same as IP (FAISS convention)
+    //   - COSINE + use_proper_cosine: `ip / (|q|·|b|)`
+    enum MirrorMode { L2, Ip, CosineProper }
+    let m_upper = metric.to_uppercase();
+    let mode = match m_upper.as_str() {
+        "L2" => MirrorMode::L2,
+        "IP" | "DOT_PRODUCT" => MirrorMode::Ip,
+        "COSINE" => {
+            if assume_normalized && !use_proper_cosine {
+                MirrorMode::Ip
+            } else if use_proper_cosine && !assume_normalized {
+                MirrorMode::CosineProper
+            } else {
+                return Err(
+                    "metric=COSINE: blas-mirror needs exactly one of \
+                     assume_normalized_like_faiss / use_proper_cosine_metric".into(),
+                );
+            }
+        }
+        other => return Err(format!("blas-mirror: unsupported metric '{}'", other)),
+    };
+    // The kernel-internal distance type used downstream:
+    //   L2  → Metric::L2 (positive distance, smaller better)
+    //   IP  → Metric::DotProduct (heap stores `-dot`)
+    //   Cosine proper → Metric::Cosine (heap stores `1 − cos_sim`)
+    let rerank_metric = match mode {
+        MirrorMode::L2 => super::knn_segment::Metric::L2,
+        MirrorMode::Ip => super::knn_segment::Metric::DotProduct,
+        MirrorMode::CosineProper => super::knn_segment::Metric::Cosine,
+    };
 
     let base_reader = MmapVectorReader::<f32>::open_fvec(base_path)
         .map_err(|e| format!("open {}: {}", base_path.display(), e))?;
@@ -761,7 +854,8 @@ fn run_blas_mirror(
         query_data.extend_from_slice(query_reader.get_slice(i));
     }
 
-    // Precompute per-query and per-base squared norms (FAISS does the same).
+    // Precompute squared norms — used by L2 and proper-Cosine; cheap
+    // and unconditional, no branch in the hot loop.
     let q_norms_sq: Vec<f32> = (0..n_query).map(|i| {
         let s = &query_data[i * dim..(i + 1) * dim];
         s.iter().map(|v| v * v).sum::<f32>()
@@ -776,11 +870,8 @@ fn run_blas_mirror(
 
     // Pull top-(k + margin) candidates from sgemm, then f64-rerank
     // down to the canonical top-k. Margin=3k empirically suffices
-    // for concentrated-distance uniform random at dim ≥ 4096 to
-    // catch sgemm's f32 ranking errors: the genuine top-k neighbor
-    // that sgemm misplaces is almost always within the top-4k
-    // window. Clamped so we never ask for more candidates than
-    // exist in the base.
+    // for concentrated-distance uniform random at dim ≥ 4096.
+    // Clamped so we never ask for more candidates than exist.
     let margin = (3 * k).min(n_base.saturating_sub(k));
     let capacity = k + margin;
     let mut heaps: Vec<std::collections::BinaryHeap<Neighbor>> =
@@ -797,13 +888,7 @@ fn run_blas_mirror(
             let j1 = (j0 + BS_Y).min(n_base);
             let nyi = j1 - j0;
 
-            // Row-major equivalent of FAISS's column-major
-            //   sgemm_("T", "N", nyi, nxi, di, 1, y+j0*d, di, x+i0*d, di, 0, ip, nyi).
-            //
-            // Column-major(T,N,M=nyi,N=nxi,K=di,A=y,lda=di,B=x,ldb=di,C,ldc=nyi)
-            // is layout-equivalent to row-major with A/B swapped and M/N
-            // swapped, with the transpose flag flipped. cblas handles
-            // this via ROW_MAJOR + NO_TRANS + TRANS with swapped shapes.
+            // Row-major equivalent of FAISS's column-major sgemm.
             // Result `ip_block[i * nyi + j]` = query[i0+i] · base[j0+j].
             unsafe {
                 cblas_sgemm(
@@ -817,7 +902,9 @@ fn run_blas_mirror(
                 );
             }
 
-            // Per-cell: dis = ‖q‖² + ‖b‖² - 2·ip, clamp, heap update.
+            // Per-cell post-pass — produces a kernel-convention
+            // distance (smaller = better) for every metric so the
+            // heap math is uniform.
             for qi_local in 0..nxi {
                 let qi_global = i0 + qi_local;
                 let qn = q_norms_sq[qi_global];
@@ -826,8 +913,29 @@ fn run_blas_mirror(
                     let bi_global = j0 + bi_local;
                     let bn = b_norms_sq[bi_global];
                     let ip = row[bi_local];
-                    let mut dis = qn + bn - 2.0 * ip;
-                    if dis < 0.0 { dis = 0.0; }
+                    let dis: f32 = match mode {
+                        MirrorMode::L2 => {
+                            let mut d = qn + bn - 2.0 * ip;
+                            if d < 0.0 { d = 0.0; }
+                            d
+                        }
+                        MirrorMode::Ip => {
+                            // Kernel convention for IP: store `-ip` so
+                            // smaller = larger inner product = better.
+                            -ip
+                        }
+                        MirrorMode::CosineProper => {
+                            // cos_sim = ip / (|q|·|b|), guarded against
+                            // zero norm (returns 0 distance there to
+                            // mirror compute_knn_blas's behavior).
+                            let denom = qn.sqrt() * bn.sqrt();
+                            if denom <= f32::MIN_POSITIVE {
+                                1.0 // worst-case "no similarity"
+                            } else {
+                                1.0 - ip / denom
+                            }
+                        }
+                    };
                     heaps[qi_global].push(Neighbor { index: bi_global as u32, distance: dis });
                     if heaps[qi_global].len() > capacity {
                         heaps[qi_global].pop();
@@ -841,11 +949,7 @@ fn run_blas_mirror(
     }
 
     // Rerank every query's top-(k + margin) candidates through the
-    // shared f64-direct kernel to produce canonical top-k. This is
-    // what makes sgemm-path engines agree with direct-kernel engines
-    // on pathologically-concentrated fixtures where f32 sgemm's
-    // `‖a‖² + ‖b‖² − 2·a·b` computation puts boundary neighbors on
-    // the wrong side of the top-k cutoff.
+    // shared f64-direct kernel to produce canonical top-k.
     let reranked: Vec<Vec<Neighbor>> = (0..n_query)
         .map(|qi| {
             let heap = std::mem::take(&mut heaps[qi]);
@@ -854,7 +958,7 @@ fn run_blas_mirror(
             let query_slice = &query_data[q_start..q_start + dim];
             super::knn_segment::rerank_topk_f64(
                 query_slice, &cands, k,
-                super::knn_segment::Metric::L2,
+                rerank_metric,
                 |idx| {
                     let s = idx as usize * dim;
                     if s + dim <= base_data.len() {

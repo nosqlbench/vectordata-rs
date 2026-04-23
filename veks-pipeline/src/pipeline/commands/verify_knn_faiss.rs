@@ -135,7 +135,7 @@ swaps (from BLAS/SIMD rounding) are tolerated.
         };
 
         // Collect profiles with base, query, and GT.
-        let mut profiles: Vec<(String, PathBuf, PathBuf, PathBuf)> = Vec::new();
+        let mut profiles: Vec<(String, PathBuf, PathBuf, PathBuf, Option<u64>)> = Vec::new();
         for (name, profile) in &config.profiles.profiles {
             let base = profile.view("base_vectors")
                 .map(|v| ctx.workspace.join(v.path()));
@@ -146,7 +146,7 @@ swaps (from BLAS/SIMD rounding) are tolerated.
 
             if let (Some(b), Some(q), Some(g)) = (base, query, gt) {
                 if b.exists() && q.exists() && g.exists() {
-                    profiles.push((name.clone(), b, q, g));
+                    profiles.push((name.clone(), b, q, g, profile.base_count));
                 }
             }
         }
@@ -157,7 +157,11 @@ swaps (from BLAS/SIMD rounding) are tolerated.
                 start);
         }
 
-        profiles.sort_by(|a, b| a.0.cmp(&b.0));
+        // Size order — sized profile names ("100k", "1m", …) sort by
+        // their parsed value, not their leading digit string.
+        profiles.sort_by(|a, b| {
+            vectordata::dataset::profile::profile_sort_by_size(&a.0, a.4, &b.0, b.4)
+        });
 
         ctx.ui.log(&format!("verify knn-faiss: {} profiles, metric={}",
             profiles.len(), effective_metric));
@@ -165,7 +169,7 @@ swaps (from BLAS/SIMD rounding) are tolerated.
         let mut overall = VerifySummary::default();
         let mut all_pass = true;
 
-        for (name, base_path, query_path, gt_path) in &profiles {
+        for (name, base_path, query_path, gt_path, _base_count) in &profiles {
             ctx.ui.log(&format!("\n── profile: {} ──────────────────────────────", name));
 
             match verify_profile(

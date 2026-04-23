@@ -34,32 +34,64 @@ use super::compute_knn::Neighbor;
 /// Cache-format version. Bump when the segment-compute algorithm
 /// changes in a way that would affect stored neighbors or distances.
 ///
-/// v1 → v2: every engine now stores top-(k + RERANK_MARGIN_RATIO·k)
-/// candidates per query in segment caches and final output, rather
-/// than top-k. The canonical f64 rerank post-pass then reduces the
-/// per-query candidate set to top-k. v1 caches have only k entries
-/// per row and would size-mismatch v2's larger row layout.
-pub const CACHE_VERSION: &str = "v2";
-
-/// Multiplier for the rerank margin. Every engine internally tracks
-/// top-(k + RERANK_MARGIN_RATIO · k) candidates per query so the
-/// canonical f64 rerank post-pass has extra candidates to consider
-/// when the engine's f32 kernel mis-ranks a boundary neighbor. With
-/// `RERANK_MARGIN_RATIO = 3` the internal k is 4·user_k.
+/// v1 → v2: every engine can opt in to top-(k + margin) candidates
+/// per query (margin defaults to 0 in production). v1 caches assume
+/// `k` entries per row; v2 file rows may contain more.
 ///
-/// The 3× factor was chosen empirically: at uniform-random dim=4096
-/// (the most pathological synthetic case where pairwise distances
-/// concentrate to within a few-ULP window) margin=3·k is enough for
-/// every direct-kernel engine to surface the same top-k as the sgemm
-/// engines. Bump it if a future fixture pushes a genuine top-k
-/// candidate out of the top-(4·k) f32 window.
-pub const RERANK_MARGIN_RATIO: usize = 3;
+/// v2 → v3: every on-disk fvec — both segment caches and published
+/// `neighbor_distances.fvecs` — now uses **FAISS publication
+/// convention** uniformly:
+///   - `L2`         → `+L2sq`     (positive, smaller = better)
+///   - `DotProduct` → `+dot`      (positive, larger  = better)
+///   - `Cosine`     → `+cos_sim`  (`[-1, 1]`, larger = better)
+/// The kernel still operates on monotonic-distance values internally
+/// (smaller = better), but conversion to/from publication convention
+/// happens at every disk boundary via [`kernel_to_published`] and
+/// [`published_to_kernel`]. v2 cache files were a mix (segment caches
+/// in kernel convention, published files in publication convention)
+/// and would be misinterpreted under the new uniform convention.
+pub const CACHE_VERSION: &str = "v3";
 
-/// Returns the internal candidate count each engine should track per
-/// query: `k + RERANK_MARGIN_RATIO · k = (1 + RERANK_MARGIN_RATIO) · k`.
-/// Saturates on overflow (only relevant for absurdly large k).
-pub(super) fn internal_k(k: usize) -> usize {
-    k.saturating_add(k.saturating_mul(RERANK_MARGIN_RATIO))
+/// Default rerank margin ratio for production `compute knn*` calls.
+/// `0` means each engine tracks top-k only — same heap size and
+/// pruning aggressiveness as the pre-margin code, no slowdown.
+///
+/// The canonical f64 rerank post-pass still runs (it just reorders
+/// the engine's existing top-k via f64 direct math — cheap), so
+/// every engine's output is canonicalized; only the *boundary
+/// recovery* is gated by margin.
+///
+/// Cross-engine parity testing (`verify engine-parity`) opts in to a
+/// non-zero margin via `rerank_margin_ratio`/`rerank_margin` options
+/// to recover the last 1% of boundary cases that surface only on
+/// pathological synthetic distributions (uniform random at very
+/// high dim).
+pub const RERANK_MARGIN_RATIO_DEFAULT: usize = 0;
+
+/// Resolve the per-call rerank margin from pipeline options. Returns
+/// the number of *extra* candidates each engine should keep beyond k.
+///
+/// Recognized options (first wins):
+///   - `rerank_margin`: explicit count of extra candidates (e.g. 30)
+///   - `rerank_margin_ratio`: count expressed as a multiplier on k
+///     (e.g. 3 ⇒ margin = 3·k ⇒ internal_k = 4·k)
+///
+/// Defaults to `RERANK_MARGIN_RATIO_DEFAULT * k = 0`.
+pub(super) fn rerank_margin_from(opts: &super::super::command::Options, k: usize) -> usize {
+    if let Some(m) = opts.get("rerank_margin").and_then(|s| s.parse::<usize>().ok()) {
+        return m;
+    }
+    if let Some(r) = opts.get("rerank_margin_ratio").and_then(|s| s.parse::<usize>().ok()) {
+        return r.saturating_mul(k);
+    }
+    RERANK_MARGIN_RATIO_DEFAULT.saturating_mul(k)
+}
+
+/// Returns the per-query candidate count an engine should track:
+/// `k + margin`. With `margin = 0` (the production default), the
+/// engine reverts to top-k tracking.
+pub(super) fn internal_k(k: usize, margin: usize) -> usize {
+    k.saturating_add(margin)
 }
 
 /// Which distance metric a KNN engine is computing. Filename tokens
@@ -100,6 +132,43 @@ impl Metric {
         } else {
             self
         }
+    }
+}
+
+/// Convert a kernel-internal distance (always smaller = better, used
+/// by every per-query heap) to FAISS publication convention (the
+/// shape every on-disk fvec uses):
+///
+///   `L2`         → `+L2sq`     (unchanged — kernel and publication agree)
+///   `DotProduct` → `+dot`      (negated; kernel stores `-dot`)
+///   `Cosine`     → `+cos_sim`  (mapped from kernel's `1 - cos_sim`)
+///
+/// `f32::INFINITY` round-trips as `f32::INFINITY` for the
+/// padding-sentinel case (rows shorter than k).
+#[inline]
+pub(super) fn kernel_to_published(d_kernel: f32, metric: Metric) -> f32 {
+    if d_kernel.is_infinite() {
+        return f32::INFINITY;
+    }
+    match metric {
+        Metric::L2 => d_kernel,
+        Metric::DotProduct => -d_kernel,
+        Metric::Cosine => 1.0 - d_kernel,
+    }
+}
+
+/// Inverse of [`kernel_to_published`]: convert an on-disk publication
+/// distance back to the kernel-internal monotonic form so it can feed
+/// a heap whose ordering is "smaller = better."
+#[inline]
+pub(super) fn published_to_kernel(d_published: f32, metric: Metric) -> f32 {
+    if d_published.is_infinite() {
+        return f32::INFINITY;
+    }
+    match metric {
+        Metric::L2 => d_published,
+        Metric::DotProduct => -d_published,
+        Metric::Cosine => 1.0 - d_published,
     }
 }
 
@@ -253,11 +322,17 @@ pub(super) fn validate_cache_file(path: &Path, query_count: usize, k: usize, ele
 /// matches the final-output format so cache files are directly
 /// inspectable with the same readers. Atomic via `.tmp + rename` —
 /// a crash mid-write never leaves a half-file that looks valid.
+///
+/// Distances are converted from kernel-internal convention (the heap's
+/// "smaller = better" representation) to FAISS publication convention
+/// before writing — that's the single on-disk convention every fvec
+/// in the codebase uses (see [`kernel_to_published`] for the mapping).
 pub(super) fn write_segment_cache(
     ivec_path: &Path,
     fvec_path: &Path,
     per_query: &[Vec<Neighbor>],
     k: usize,
+    metric: Metric,
 ) -> Result<(), String> {
     use std::io::BufWriter;
     let dim_bytes = (k as i32).to_le_bytes();
@@ -277,7 +352,7 @@ pub(super) fn write_segment_cache(
         fw.write_all(&dim_bytes).map_err(|e| e.to_string())?;
         for j in 0..k {
             let (idx_i32, dist_f32) = if j < row.len() {
-                (row[j].index as i32, row[j].distance)
+                (row[j].index as i32, kernel_to_published(row[j].distance, metric))
             } else {
                 (-1i32, f32::INFINITY)
             };
@@ -298,12 +373,17 @@ pub(super) fn write_segment_cache(
 
 /// Load a previously-written segment cache into a per-query structure.
 /// Padding entries (index `-1`, distance `+∞`) are stripped.
+///
+/// The on-disk fvec is in FAISS publication convention; this loader
+/// converts each distance back to kernel-internal convention via
+/// [`published_to_kernel`] so the heap-merging code can compare
+/// distances uniformly as "smaller = better."
 pub(super) fn load_segment_cache(
     ivec_path: &Path,
     fvec_path: &Path,
     k: usize,
     query_count: usize,
-    flip_sign: bool,
+    metric: Metric,
 ) -> Result<Vec<Vec<Neighbor>>, String> {
     use std::io::BufReader;
     let mut iw = BufReader::with_capacity(1 << 20, std::fs::File::open(ivec_path)
@@ -324,7 +404,7 @@ pub(super) fn load_segment_cache(
             fw.read_exact(&mut dist_buf).map_err(|e| format!("read fvec body: {}", e))?;
             let idx = i32::from_le_bytes(idx_buf);
             let raw = f32::from_le_bytes(dist_buf);
-            let dist = if flip_sign { -raw } else { raw };
+            let dist = published_to_kernel(raw, metric);
             if idx >= 0 {
                 row.push(Neighbor { index: idx as u32, distance: dist });
             }
@@ -359,20 +439,16 @@ pub(super) fn merge_segment_into_heaps(
 /// One cached segment discovered during cache scan — either an entry
 /// written by this engine in `.cache/`, or a salvaged published
 /// output from a smaller sibling profile.
+///
+/// Distance sign convention: every on-disk fvec uses FAISS publication
+/// convention (see [`kernel_to_published`]); [`load_segment_cache`]
+/// converts back to kernel convention via the metric. Both Path-1 and
+/// Path-2 sources are uniform now — there's no per-segment sign flag.
 pub(super) struct CachedSegment {
     pub(super) start: usize,
     pub(super) end: usize,
     pub(super) ivec_path: PathBuf,
     pub(super) fvec_path: PathBuf,
-    /// True when the loaded distances must be sign-flipped to match the
-    /// kernel's internal convention. The published profile-dir GT for
-    /// IP/DOT/cosine-as-IP stores `+dot` (positive, larger = better)
-    /// because that's what users expect, but the kernel ranks with
-    /// `-dot` so the standard min-distance heap math works. Path-1
-    /// `.cache/` files are written in kernel sign and need no flip;
-    /// Path-2 sibling profile files do, when the metric is one of the
-    /// inner-product variants.
-    pub(super) flip_sign: bool,
 }
 
 /// Scan the cache directory plus sibling profile outputs for every
@@ -433,7 +509,6 @@ pub(super) fn scan_cached_segments(
             {
                 segments.push(CachedSegment {
                     start: s, end: e, ivec_path: ivec, fvec_path: fvec,
-                    flip_sign: false,
                 });
             }
         }
@@ -464,18 +539,14 @@ pub(super) fn scan_cached_segments(
                 {
                     let already = segments.iter().any(|s| s.start == 0 && s.end == pbc);
                     if !already {
-                        // Published GT for IP/DOT/cosine-as-IP stores
-                        // `+dot` (user-facing convention: larger = better)
-                        // while the kernel ranks with `-dot`. Flag the
-                        // segment so the loader negates each distance
-                        // before merging into the heap. L2 stores `+L2sq`
-                        // in both places — no flip needed.
-                        let flip_sign = matches!(metric, Metric::DotProduct | Metric::Cosine);
+                        // All on-disk fvecs use FAISS publication
+                        // convention now (see [`kernel_to_published`]).
+                        // `load_segment_cache` converts via the metric;
+                        // there's no per-source sign flag.
                         segments.push(CachedSegment {
                             start: 0, end: pbc,
                             ivec_path: idx_path,
                             fvec_path: dist_path,
-                            flip_sign,
                         });
                     }
                 }
@@ -638,6 +709,10 @@ where
 ///
 /// On error (mismatched dims, base too small, etc.) the original
 /// files are left untouched — atomic via `.tmp` + rename.
+///
+/// Emits a spinner/progress-bar via `ui` so the TUI doesn't go
+/// silent on large outputs — the per-query f64 recompute is fast
+/// per row but stacks up at high query count × high dim.
 pub(super) fn rerank_output_post_pass(
     indices_path: &Path,
     distances_path: Option<&Path>,
@@ -646,7 +721,9 @@ pub(super) fn rerank_output_post_pass(
     metric: Metric,
     k: usize,
     base_offset: usize,
+    ui: &veks_core::ui::UiHandle,
 ) -> Result<(), String> {
+    use rayon::prelude::*;
     use std::io::{Read, Write};
     use vectordata::VectorReader;
 
@@ -675,6 +752,11 @@ pub(super) fn rerank_output_post_pass(
             n_rows, n_query));
     }
 
+    ui.log(&format!(
+        "  canonical rerank: {} queries × {} candidates, metric={:?}",
+        n_rows, header_k, metric,
+    ));
+
     // Parse rows → Vec<Vec<Neighbor>> with f32::INFINITY distance
     // (we don't have the original distances at parse time — they get
     // recomputed in the rerank).
@@ -699,16 +781,30 @@ pub(super) fn rerank_output_post_pass(
     // store window-relative indices in ivec (like compute_knn.rs
     // metal) still point the rerank at the correct base-reader
     // slot; engines that store absolute indices pass `base_offset = 0`.
-    let reranked: Vec<Vec<super::compute_knn::Neighbor>> = rows.into_iter()
+    //
+    // Parallelized via rayon so large outputs don't serialize on
+    // one core. Progress is tracked via a bar updated in batches
+    // (every ~1% of rows) so the TUI refresh doesn't become the
+    // bottleneck.
+    let pb = ui.bar(n_rows as u64, "canonical rerank");
+    let progress_tick = (n_rows / 100).max(1);
+    let counter = std::sync::atomic::AtomicUsize::new(0);
+    let reranked: Vec<Vec<super::compute_knn::Neighbor>> = rows.into_par_iter()
         .enumerate()
         .map(|(qi, cands)| {
             let q = query_reader.get_slice(qi);
-            rerank_topk_f64(
+            let result = rerank_topk_f64(
                 q, &cands, k, metric,
                 |idx| Some(base_reader.get_slice(base_offset + idx as usize).to_vec()),
-            )
+            );
+            let done = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if done % progress_tick == 0 || done == n_rows {
+                pb.set_position(done as u64);
+            }
+            result
         })
         .collect();
+    pb.finish();
 
     // The ivec stores (possibly-window-relative) indices; rerank
     // needs to map those back when writing. The helper already
@@ -736,6 +832,23 @@ pub(super) fn rerank_output_post_pass(
     // If the engine emitted distances, rewrite those too with the
     // canonical f64-cast-to-f32 values that pair with the reranked
     // indices.
+    //
+    // Sign-convention contract for the published fvec — load-bearing
+    // for `scan_cached_segments` Path-2 sibling reuse and for the
+    // verifier, which both expect the user-facing convention rather
+    // than the kernel-internal one:
+    //
+    //   L2          → `‖a − b‖²`  (positive, smaller = better)
+    //   DotProduct  → `+dot`      (positive, larger  = better)
+    //   Cosine      → `+cos_sim`  (`[-1, 1]`, larger = better)
+    //
+    // `rerank_topk_f64` returns kernel-internal distances (always
+    // smaller = better, so sorting works uniformly): for DotProduct
+    // that's `-dot`, for Cosine that's `1 - cos_sim`. Convert here
+    // before writing so the on-disk file matches what compute_knn_blas
+    // and friends used to write — otherwise Path-2 sibling segments
+    // get loaded with the wrong sign and the merging heap accumulates
+    // worst-of-k instead of best-of-k.
     if let Some(dp) = distances_path {
         let tmp_dist = dp.with_extension("rerank.tmp");
         {
@@ -744,8 +857,9 @@ pub(super) fn rerank_output_post_pass(
             for row in &reranked {
                 f.write_all(&dim_bytes).map_err(|e| e.to_string())?;
                 for j in 0..k {
-                    let d = if j < row.len() { row[j].distance } else { f32::INFINITY };
-                    f.write_all(&d.to_le_bytes()).map_err(|e| e.to_string())?;
+                    let d_kernel = if j < row.len() { row[j].distance } else { f32::INFINITY };
+                    let d_published = kernel_to_published(d_kernel, metric);
+                    f.write_all(&d_published.to_le_bytes()).map_err(|e| e.to_string())?;
                 }
             }
         }

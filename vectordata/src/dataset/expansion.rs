@@ -115,14 +115,24 @@ pub fn expand_per_profile_steps_scoped(
 
     let mut result = regular;
 
-    // Collect all profiles to expand: natural name order, then default last.
-    // Natural order ensures label_0, label_1, ..., label_9, label_10
-    // (not ASCII order or size order which is arbitrary for partitions).
+    // Collect all profiles to expand. Sort via `profile_sort_by_size`,
+    // the single source of truth for profile ordering across the
+    // codebase: sized profiles ("100k", "1m", "10mi", …) are routed
+    // through `parse_number_with_suffix` and ordered by their actual
+    // base-count value (so 100k < 1m), while label-style profiles
+    // (which don't parse as a number) all hash to the same key and
+    // tiebreak via `natural_cmp` — which still gives the desired
+    // label_0, label_1, …, label_9, label_10 ordering.
+    //
+    // Using bare `natural_cmp` here would compare "100k" vs "1m" by
+    // their leading digit runs ("100" vs "1") and put 100k AFTER 1m.
     let mut non_default: Vec<(&str, Option<u64>)> = profiles.profiles.iter()
         .filter(|(name, _)| name.as_str() != "default")
         .map(|(name, p)| (name.as_str(), p.base_count))
         .collect();
-    non_default.sort_by(|(a, _), (b, _)| super::profile::natural_cmp(a, b));
+    non_default.sort_by(|(a, a_bc), (b, b_bc)| {
+        super::profile::profile_sort_by_size(a, *a_bc, b, *b_bc)
+    });
 
     let mut all_profiles: Vec<(&str, Option<u64>)> = non_default;
     if profiles.profiles.contains_key("default") && !has_explicit_default_steps {

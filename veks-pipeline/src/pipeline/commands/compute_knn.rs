@@ -1019,9 +1019,10 @@ fn write_partition_cache(
     meta: &PartitionMeta,
     results: &[Vec<Neighbor>],
     k: usize,
+    metric: Metric,
 ) -> Result<(), String> {
     write_indices(&meta.neighbors_path, results, k, 0)?;
-    write_distances(&meta.distances_path, results, k)?;
+    write_distances(&meta.distances_path, results, k, metric)?;
     Ok(())
 }
 
@@ -1055,6 +1056,7 @@ fn merge_partitions(
     base_offset: usize,
     compress_cache: bool,
     base_path: &Path,
+    metric: Metric,
     ui: &veks_core::ui::UiHandle,
 ) -> Result<MergeResult, String> {
     // Open all partition files
@@ -1144,9 +1146,13 @@ fn merge_partitions(
                 ]);
 
                 if idx >= 0 && dist.is_finite() {
+                    // Partition cache fvecs are in FAISS publication
+                    // convention; convert to kernel-internal so the
+                    // ascending-distance sort below sees consistent
+                    // "smaller = better" semantics across all metrics.
                     candidates.push(Neighbor {
                         index: idx as u32,
-                        distance: dist,
+                        distance: kernel_distance(dist, metric),
                     });
                 }
             }
@@ -1228,13 +1234,15 @@ fn merge_partitions(
                 .map_err(|e| e.to_string())?;
         }
 
-        // Write merged row to distances output
+        // Write merged row to distances output. Convert from
+        // kernel-internal heap distances to FAISS publication
+        // convention before writing — single on-disk standard.
         if let Some(ref mut dw) = dist_writer {
             dw.write_all(&dim.to_le_bytes())
                 .map_err(|e| e.to_string())?;
             for j in 0..k {
                 let dist: f32 = if j < candidates.len() {
-                    candidates[j].distance
+                    publication_distance(candidates[j].distance, metric)
                 } else {
                     f32::INFINITY
                 };
@@ -1521,12 +1529,19 @@ compare an ANN index's approximate results against this exact ground truth.
             }
             ElementType::F32 | _ => {
                 let dist_fn = simd_distance::select_distance_fn(kernel_metric);
+                // Margin is opt-in: default 0 ⇒ original heap sizes
+                // and pruning aggressiveness, no slowdown.
+                // `verify engine-parity` sets `rerank_margin_ratio=3`
+                // to recover the last 1% boundary cases on
+                // pathological synthetic distributions.
+                let margin = super::knn_segment::rerank_margin_from(options, k);
                 execute_f32(
                     &base_path,
                     &query_path,
                     &indices_path,
                     distances_path.as_deref(),
                     k,
+                    margin,
                     kernel_metric,
                     display_metric,
                     dist_fn,
@@ -1659,6 +1674,7 @@ fn execute_f32(
     indices_path: &Path,
     distances_path: Option<&Path>,
     k: usize,
+    margin: usize,
     metric: Metric,
     display_metric: Metric,
     dist_fn: fn(&[f32], &[f32]) -> f32,
@@ -1741,12 +1757,13 @@ fn execute_f32(
         format_bytes(query_bytes),
     ));
 
-    // Track top-(k + margin) per query through the partitioned scan
-    // so the canonical f64 rerank below has extra material to rerank.
-    // Cache files, partition outputs, and the pre-rerank merged ivec
-    // all carry internal_k entries per row; the post-pass collapses
-    // them to k.
-    let internal_k = super::knn_segment::internal_k(k).min(base_count);
+    // Track top-(k + margin) per query through the partitioned scan.
+    // With `margin = 0` (production default) `internal_k == k` and
+    // the engine's heap sizes / threshold pruning behave exactly as
+    // they did pre-rerank — no slowdown. Larger `margin` lets the
+    // canonical f64 rerank below recover boundary candidates the
+    // f32 kernel mis-ranks (used by `verify engine-parity`).
+    let internal_k = super::knn_segment::internal_k(k, margin).min(base_count);
 
     let result = execute_with_partitions(
         &query_reader,
@@ -1795,6 +1812,7 @@ fn execute_f32(
                 indices_path, distances_path,
                 &base_reader, &query_reader,
                 m, k, base_offset,
+                &ctx.ui,
             ) {
                 ctx.ui.log(&format!("  rerank post-pass skipped: {}", e));
             }
@@ -2538,7 +2556,7 @@ where
                 let ivec_data = serialize_indices(&results, k, 0)?;
                 crate::pipeline::gz_cache::save_gz(&neighbors_path, &ivec_data)?;
 
-                let fvec_data = serialize_distances(&results, k)?;
+                let fvec_data = serialize_distances(&results, k, metric)?;
                 crate::pipeline::gz_cache::save_gz(&distances_path, &fvec_data)?;
 
                 let gz_ivec = crate::pipeline::gz_cache::gz_path(&neighbors_path);
@@ -2559,7 +2577,7 @@ where
                 );
             } else {
                 write_indices(&neighbors_path, &results, k, 0)?;
-                write_distances(&distances_path, &results, k)?;
+                write_distances(&distances_path, &results, k, metric)?;
 
                 if !validate_cache_file(&neighbors_path, part_query_count, k, 4)
                     || !validate_cache_file(&distances_path, part_query_count, k, 4)
@@ -2629,6 +2647,7 @@ where
         base_offset,
         compress_cache,
         base_path,
+        metric,
         &ctx.ui,
     ) {
         Ok(v) => v,
@@ -2762,7 +2781,11 @@ fn write_indices(path: &Path, results: &[Vec<Neighbor>], k: usize, base_offset: 
 }
 
 /// Write neighbor distances as fvec (each row: k f32 distances).
-fn write_distances(path: &Path, results: &[Vec<Neighbor>], k: usize) -> Result<(), String> {
+///
+/// Converts each kernel-internal heap distance to FAISS publication
+/// convention via [`publication_distance`] so the on-disk fvec matches
+/// the single sign convention every other compute/verify command uses.
+fn write_distances(path: &Path, results: &[Vec<Neighbor>], k: usize, metric: Metric) -> Result<(), String> {
     use crate::pipeline::atomic_write::AtomicWriter;
     let mut writer = AtomicWriter::with_capacity(1 << 20, path)
         .map_err(|e| format!("failed to create {}: {}", path.display(), e))?;
@@ -2771,12 +2794,42 @@ fn write_distances(path: &Path, results: &[Vec<Neighbor>], k: usize) -> Result<(
     for row in results {
         writer.write_all(&dim.to_le_bytes()).map_err(|e| e.to_string())?;
         for i in 0..k {
-            let dist: f32 = if i < row.len() { row[i].distance } else { f32::INFINITY };
+            let dist: f32 = if i < row.len() {
+                publication_distance(row[i].distance, metric)
+            } else { f32::INFINITY };
             writer.write_all(&dist.to_le_bytes()).map_err(|e| e.to_string())?;
         }
     }
     writer.finish().map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// Map this engine's [`Metric`] (which adds `L1`) to the
+/// `knn_segment::Metric` used by the shared sign-convention helpers,
+/// then convert. `L1` has no sign-flip — it's already positive
+/// "smaller = better" in both kernel and publication space, so it
+/// passes through unchanged.
+#[inline]
+fn publication_distance(d_kernel: f32, metric: Metric) -> f32 {
+    match metric {
+        Metric::L1 => d_kernel,
+        Metric::L2 => super::knn_segment::kernel_to_published(d_kernel, super::knn_segment::Metric::L2),
+        Metric::DotProduct => super::knn_segment::kernel_to_published(d_kernel, super::knn_segment::Metric::DotProduct),
+        Metric::Cosine => super::knn_segment::kernel_to_published(d_kernel, super::knn_segment::Metric::Cosine),
+    }
+}
+
+/// Inverse of [`publication_distance`]. Used when reading cached
+/// partition fvecs back into the merge heap so all distances behave
+/// uniformly as "smaller = better" regardless of metric.
+#[inline]
+fn kernel_distance(d_published: f32, metric: Metric) -> f32 {
+    match metric {
+        Metric::L1 => d_published,
+        Metric::L2 => super::knn_segment::published_to_kernel(d_published, super::knn_segment::Metric::L2),
+        Metric::DotProduct => super::knn_segment::published_to_kernel(d_published, super::knn_segment::Metric::DotProduct),
+        Metric::Cosine => super::knn_segment::published_to_kernel(d_published, super::knn_segment::Metric::Cosine),
+    }
 }
 
 /// Serialize neighbor indices to an in-memory buffer (ivec format).
@@ -2804,14 +2857,16 @@ fn serialize_indices(results: &[Vec<Neighbor>], k: usize, base_offset: usize) ->
 /// Serialize neighbor distances to an in-memory buffer (fvec format).
 ///
 /// Same layout as [`write_distances`] but returns bytes instead of writing to a file.
-fn serialize_distances(results: &[Vec<Neighbor>], k: usize) -> Result<Vec<u8>, String> {
+fn serialize_distances(results: &[Vec<Neighbor>], k: usize, metric: Metric) -> Result<Vec<u8>, String> {
     let row_bytes = 4 + k * 4;
     let mut buf = Vec::with_capacity(results.len() * row_bytes);
     let dim = k as i32;
     for row in results {
         buf.extend_from_slice(&dim.to_le_bytes());
         for i in 0..k {
-            let dist: f32 = if i < row.len() { row[i].distance } else { f32::INFINITY };
+            let dist: f32 = if i < row.len() {
+                publication_distance(row[i].distance, metric)
+            } else { f32::INFINITY };
             buf.extend_from_slice(&dist.to_le_bytes());
         }
     }
