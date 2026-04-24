@@ -482,6 +482,21 @@ pub(super) fn scan_cached_segments(
 
     let mut segments: Vec<CachedSegment> = Vec::new();
 
+    // ── Cache-version drift check ──────────────────────────────────
+    // If `cache_dir` has files from this engine but with a *different*
+    // CACHE_VERSION, surface a one-line note so users upgrading don't
+    // wonder why a fresh first run is slow. Older-version files are
+    // ignored (silently skipped by the prefix filter below); we just
+    // count them so the message has a number.
+    let prior_version_orphans = scan_prior_cache_versions(cache_dir, engine, cache_prefix);
+    if prior_version_orphans > 0 {
+        ui.log(&format!(
+            "  cache format upgrade: {} file(s) from a prior CACHE_VERSION are being ignored \
+             (current is '{}'); they'll be regenerated on this run. Safe to delete.",
+            prior_version_orphans, CACHE_VERSION,
+        ));
+    }
+
     // ── Path 1: scan <cache_dir>/ for segments written by this engine
     if let Ok(entries) = std::fs::read_dir(cache_dir) {
         for entry in entries.flatten() {
@@ -588,6 +603,27 @@ pub(super) fn scan_cached_segments(
     segments
 }
 
+/// Count files in `cache_dir` that look like this engine's cache
+/// entries (engine + cache_prefix match) but carry a CACHE_VERSION
+/// other than the current one. Used purely for the upgrade-notice
+/// log line — these files are otherwise silently skipped.
+fn scan_prior_cache_versions(cache_dir: &Path, engine: &str, cache_prefix: &str) -> usize {
+    let cur = format!("{}.{}.", engine, CACHE_VERSION);
+    let engine_pre = format!("{}.", engine);
+    let prefix_tail = format!(".{}.range_", cache_prefix);
+    let entries = match std::fs::read_dir(cache_dir) {
+        Ok(e) => e,
+        Err(_) => return 0,
+    };
+    entries.flatten().filter(|e| {
+        let name = e.file_name();
+        let s = name.to_string_lossy();
+        s.starts_with(&engine_pre)
+            && s.contains(&prefix_tail)
+            && !s.starts_with(&cur)
+    }).count()
+}
+
 /// Re-rank candidate neighbors using f64-direct arithmetic to produce
 /// the canonical top-k for a single query.
 ///
@@ -614,7 +650,7 @@ pub(super) fn scan_cached_segments(
 /// Result is sorted ascending by canonical distance with the same
 /// tiebreaker as [`Neighbor`]'s `Ord` impl (lower index wins on
 /// distance tie).
-pub(super) fn rerank_topk_f64<F>(
+pub(super) fn rerank_topk_f64<'a, F>(
     query: &[f32],
     candidates: &[super::compute_knn::Neighbor],
     k: usize,
@@ -622,8 +658,11 @@ pub(super) fn rerank_topk_f64<F>(
     mut get_base: F,
 ) -> Vec<super::compute_knn::Neighbor>
 where
-    F: FnMut(u32) -> Option<Vec<f32>>,
+    F: FnMut(u32) -> Option<&'a [f32]>,
 {
+    // Promote the query to f64 once per query (not per candidate). For
+    // 10k queries × k=100 candidates this saves ~1M redundant f32→f64
+    // casts of the query vector.
     let q64: Vec<f64> = query.iter().map(|&x| x as f64).collect();
 
     // Precompute query-side scalars the metric needs once.
@@ -637,6 +676,13 @@ where
     };
     let _ = qnorm_sq;
 
+    // Hot loop runs once per (query × candidate). At 10k queries × 100
+    // candidates × dim=384 = ~384M f64 mul-adds. Closure returns a
+    // borrowed slice — no per-candidate allocation. Earlier versions
+    // returned `Option<Vec<f32>>`, which forced a 1.5KB malloc per
+    // candidate (1M malloc/copy operations for a typical pipeline
+    // step) and dominated the rerank cost; the borrow form runs at
+    // f64-FMA speed instead of allocator speed.
     let mut rescored: Vec<super::compute_knn::Neighbor> = Vec::with_capacity(candidates.len());
     for c in candidates {
         let base = match get_base(c.index) {
@@ -795,7 +841,7 @@ pub(super) fn rerank_output_post_pass(
             let q = query_reader.get_slice(qi);
             let result = rerank_topk_f64(
                 q, &cands, k, metric,
-                |idx| Some(base_reader.get_slice(base_offset + idx as usize).to_vec()),
+                |idx| Some(base_reader.get_slice(base_offset + idx as usize)),
             );
             let done = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             if done % progress_tick == 0 || done == n_rows {
@@ -812,12 +858,17 @@ pub(super) fn rerank_output_post_pass(
     // writes the same scheme back out (no shift needed — the index
     // round-trips the caller's scheme).
 
-    // Atomically rewrite the indices file.
+    // Atomically rewrite the indices file. Wrapped in BufWriter
+    // because each row issues `1 + k` write_all calls of 4 bytes —
+    // for a typical 10k-query × k=100 file that's 1M syscalls
+    // without buffering, easily 1+ seconds of pure syscall overhead.
+    // BufWriter coalesces them into a handful of large writes.
     let dim_bytes = (k as i32).to_le_bytes();
     let tmp_idx = indices_path.with_extension("rerank.tmp");
     {
-        let mut f = std::fs::File::create(&tmp_idx)
+        let f = std::fs::File::create(&tmp_idx)
             .map_err(|e| format!("create {}: {}", tmp_idx.display(), e))?;
+        let mut f = std::io::BufWriter::with_capacity(1 << 20, f);
         for row in &reranked {
             f.write_all(&dim_bytes).map_err(|e| e.to_string())?;
             for j in 0..k {
@@ -825,6 +876,7 @@ pub(super) fn rerank_output_post_pass(
                 f.write_all(&idx.to_le_bytes()).map_err(|e| e.to_string())?;
             }
         }
+        f.flush().map_err(|e| e.to_string())?;
     }
     std::fs::rename(&tmp_idx, indices_path)
         .map_err(|e| format!("rename {} → {}: {}", tmp_idx.display(), indices_path.display(), e))?;
@@ -852,8 +904,11 @@ pub(super) fn rerank_output_post_pass(
     if let Some(dp) = distances_path {
         let tmp_dist = dp.with_extension("rerank.tmp");
         {
-            let mut f = std::fs::File::create(&tmp_dist)
+            let f = std::fs::File::create(&tmp_dist)
                 .map_err(|e| format!("create {}: {}", tmp_dist.display(), e))?;
+            // Same buffering rationale as the indices write above —
+            // unbuffered writes here cost ~1s on a typical pipeline.
+            let mut f = std::io::BufWriter::with_capacity(1 << 20, f);
             for row in &reranked {
                 f.write_all(&dim_bytes).map_err(|e| e.to_string())?;
                 for j in 0..k {
@@ -862,6 +917,7 @@ pub(super) fn rerank_output_post_pass(
                     f.write_all(&d_published.to_le_bytes()).map_err(|e| e.to_string())?;
                 }
             }
+            f.flush().map_err(|e| e.to_string())?;
         }
         std::fs::rename(&tmp_dist, dp)
             .map_err(|e| format!("rename {} → {}: {}", tmp_dist.display(), dp.display(), e))?;
@@ -903,5 +959,103 @@ mod tests {
         assert!(p_metal.file_name().unwrap().to_string_lossy().starts_with("knn-metal."));
         assert!(p_stdarch.file_name().unwrap().to_string_lossy().starts_with("knn-stdarch."));
         assert!(p_blas.file_name().unwrap().to_string_lossy().starts_with("knn-blas."));
+    }
+
+    /// Pin the FAISS publication convention. Every fvec on disk in
+    /// the codebase uses these exact mappings — changing them would
+    /// silently corrupt every cache and every published distance file.
+    #[test]
+    fn kernel_to_published_pins_faiss_convention() {
+        // L2: kernel and publication agree (always positive, smaller = better).
+        assert_eq!(kernel_to_published(0.0,  Metric::L2), 0.0);
+        assert_eq!(kernel_to_published(1.5,  Metric::L2), 1.5);
+        assert_eq!(kernel_to_published(42.0, Metric::L2), 42.0);
+
+        // DotProduct: heap stores `-dot` (smaller = better); on-disk
+        // is `+dot` (FAISS convention: larger = more similar).
+        assert_eq!(kernel_to_published(-1.5, Metric::DotProduct),  1.5);
+        assert_eq!(kernel_to_published( 0.0, Metric::DotProduct),  0.0);
+        assert_eq!(kernel_to_published( 2.0, Metric::DotProduct), -2.0);
+
+        // Cosine: heap stores `1 - cos_sim` (positive, smaller = better);
+        // on-disk is `+cos_sim` ∈ [-1, 1] (larger = more similar).
+        assert_eq!(kernel_to_published(0.0, Metric::Cosine), 1.0);  // identical → cos_sim=1
+        assert_eq!(kernel_to_published(1.0, Metric::Cosine), 0.0);  // orthogonal → cos_sim=0
+        assert_eq!(kernel_to_published(2.0, Metric::Cosine), -1.0); // opposite → cos_sim=-1
+
+        // The infinity sentinel (used as padding for short rows where
+        // the engine returned fewer than k neighbors) must round-trip.
+        assert!(kernel_to_published(f32::INFINITY, Metric::L2).is_infinite());
+        assert!(kernel_to_published(f32::INFINITY, Metric::DotProduct).is_infinite());
+        assert!(kernel_to_published(f32::INFINITY, Metric::Cosine).is_infinite());
+    }
+
+    /// `published_to_kernel` is the inverse of `kernel_to_published`
+    /// and must round-trip exactly for finite, in-range values, and
+    /// pass infinity through unchanged.
+    ///
+    /// "In range" matters for Cosine: the conversion is `1 ± x`, which
+    /// in f32 only round-trips bit-exactly when `|x| ≤ 2`. Cosine
+    /// values are in `[-1, 1]` by definition, so the round trip is
+    /// exact for every legal value.
+    #[test]
+    fn published_kernel_round_trip() {
+        // L2 / DotProduct: any finite value round-trips exactly.
+        for &m in &[Metric::L2, Metric::DotProduct] {
+            for &v in &[-3.7_f32, -1.0, -0.001, 0.0, 0.001, 0.5, 1.0, 42.5] {
+                let rt1 = published_to_kernel(kernel_to_published(v, m), m);
+                assert_eq!(rt1, v,
+                    "kernel→published→kernel mismatch for metric={:?}, v={}", m, v);
+                let rt2 = kernel_to_published(published_to_kernel(v, m), m);
+                assert_eq!(rt2, v,
+                    "published→kernel→published mismatch for metric={:?}, v={}", m, v);
+            }
+            assert!(published_to_kernel(f32::INFINITY, m).is_infinite());
+        }
+        // Cosine: only `published ∈ [-1, 1]` is meaningful (cos_sim
+        // range), and the corresponding `kernel ∈ [0, 2]`. The
+        // `1 ± x` mapping is exact at the endpoints but has the
+        // expected f32 catastrophic-cancellation loss for values very
+        // near zero (where `1 - (1 - tiny)` loses bits). Bound the
+        // comparison at 1 ULP rather than exact equality.
+        let cos_round_trip_ok = |a: f32, b: f32| -> bool {
+            (a - b).abs() <= f32::EPSILON.max(a.abs().max(b.abs()) * f32::EPSILON)
+        };
+        for &v in &[-1.0_f32, -0.5, -0.001, 0.0, 0.001, 0.5, 0.99, 1.0] {
+            let rt = published_to_kernel(kernel_to_published(v, Metric::Cosine), Metric::Cosine);
+            assert!(cos_round_trip_ok(rt, v),
+                "Cosine kernel→published→kernel: v={}, rt={}", v, rt);
+        }
+        for &v in &[0.0_f32, 0.001, 0.5, 1.0, 1.5, 1.999, 2.0] {
+            let rt = kernel_to_published(published_to_kernel(v, Metric::Cosine), Metric::Cosine);
+            assert!(cos_round_trip_ok(rt, v),
+                "Cosine published→kernel→published: v={}, rt={}", v, rt);
+        }
+        assert!(published_to_kernel(f32::INFINITY, Metric::Cosine).is_infinite());
+    }
+
+    /// Pinning the *direction*: in publication convention, a "better"
+    /// candidate sorts to the front via natural numeric comparison
+    /// for L2 (smaller wins) and via reverse comparison for DotProduct
+    /// and Cosine (larger wins). In kernel convention, all three sort
+    /// "smaller wins" — that's the whole point of the conversion.
+    #[test]
+    fn kernel_convention_is_uniformly_smaller_better() {
+        // L2: distance 0.5 (closer) is better than 1.5
+        let better_l2 = published_to_kernel(0.5, Metric::L2);
+        let worse_l2  = published_to_kernel(1.5, Metric::L2);
+        assert!(better_l2 < worse_l2);
+
+        // DotProduct: dot=0.9 (more similar) is better than dot=0.1
+        let better_dot = published_to_kernel(0.9, Metric::DotProduct);
+        let worse_dot  = published_to_kernel(0.1, Metric::DotProduct);
+        assert!(better_dot < worse_dot,
+            "kernel form: cos=0.9 should sort before cos=0.1, got {} vs {}",
+            better_dot, worse_dot);
+
+        // Cosine: cos_sim=0.9 (more similar) is better than cos_sim=0.1
+        let better_cos = published_to_kernel(0.9, Metric::Cosine);
+        let worse_cos  = published_to_kernel(0.1, Metric::Cosine);
+        assert!(better_cos < worse_cos);
     }
 }

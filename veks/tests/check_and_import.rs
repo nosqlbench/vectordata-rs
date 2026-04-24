@@ -835,8 +835,15 @@ fn project_artifacts_compute_knn_basic() {
 
     let manifest = cmd.project_artifacts("compute-knn", &opts);
     assert_eq!(manifest.step_id, "compute-knn");
-    // The "compute knn" alias resolves to the stdarch implementation.
-    assert_eq!(manifest.command, "compute knn-stdarch");
+    // The "compute knn" alias resolves to the SimSIMD-backed metal
+    // implementation. SimSIMD's hand-tuned kernels use unrolled FMA
+    // accumulator chains and hit a much higher fraction of FMA peak
+    // than the pure-`std::arch` `compute knn-stdarch` (single
+    // accumulator → latency-bound on serial dep). All four engines
+    // (metal/stdarch/blas/faiss) produce byte-identical output after
+    // the canonical f64 rerank, so the alias choice is purely a
+    // performance call.
+    assert_eq!(manifest.command, "compute knn-metal");
     assert_eq!(manifest.inputs, vec![
         "profiles/default/base_vectors.mvecs",
         "query_vectors.mvecs",

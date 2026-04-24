@@ -144,13 +144,23 @@ pub fn register_all(registry: &mut CommandRegistry) {
     registry.register("compute partition-profiles", compute_partition_profiles::factory);
     #[cfg(feature = "knnutils")]
     registry.register("compute knn-blas", compute_knn_blas::factory);
-    // "compute knn" → stdarch (pure std::arch, zero external deps,
-    // supports f32/f16/f64). Kept as the safe default so existing
-    // dataset.yaml files that reference `compute knn` keep working
-    // regardless of input element type. New pipelines emitted by
-    // `prepare bootstrap` prefer `compute knn-blas` explicitly when
-    // the workload is f32 and the knnutils feature is available.
-    registry.register("compute knn", compute_knn_stdarch::factory);
+    // "compute knn" → metal (SimSIMD). SimSIMD's hand-tuned kernels
+    // unroll their FMA accumulator chains so they hit a much higher
+    // fraction of FMA peak than our pure-`std::arch` `compute
+    // knn-stdarch` (which uses a single accumulator and is
+    // latency-bound on a serial dep chain). On a representative
+    // 100k×10k×dim=384 fixture metal hits ~1.2B dist/s vs stdarch's
+    // ~0.9B; on production-shape workloads with cache-friendly
+    // streams the gap is bigger. SimSIMD ships with the `simsimd`
+    // crate and is unconditionally compiled in (no feature gate).
+    //
+    // Older builds (≤ 0.21) routed `compute knn` to metal; a recent
+    // refactor briefly pointed it at stdarch and that regressed
+    // throughput on existing pipelines whose `dataset.yaml` says
+    // `run: compute knn`. Restoring metal as the default fixes that.
+    // Users who specifically want the no-deps stdarch path can ask
+    // for `compute knn-stdarch` explicitly.
+    registry.register("compute knn", compute_knn::factory);
     #[cfg(feature = "faiss")]
     registry.register("compute knn-faiss", compute_knn_faiss::factory);
     registry.register("compute sort", compute_dedup::factory);

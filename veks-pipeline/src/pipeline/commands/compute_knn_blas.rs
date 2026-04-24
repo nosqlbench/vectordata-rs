@@ -631,6 +631,12 @@ Reuses the shared segment-cache infrastructure:
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
         let start = Instant::now();
 
+        // faiss-sys static MKL is poisoned process-wide when the
+        // `faiss` feature is on (see pipeline::blas_abi). sgemm goes
+        // wrong under multi-threaded MKL at dim≥384. Force single-
+        // threaded before any sgemm call.
+        crate::pipeline::blas_abi::set_single_threaded_if_faiss();
+
         let base_str = match options.require("base") {
             Ok(s) => s, Err(e) => return error_result(e, start),
         };

@@ -192,6 +192,11 @@ impl CommandOp for VerifyKnnConsolidatedOp {
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
         let start = Instant::now();
 
+        // Verifier drives `scan_range_sgemm` which calls cblas_sgemm
+        // directly — poisoned by faiss-sys static MKL under multi-
+        // threading (see pipeline::blas_abi). Force single-threaded.
+        crate::pipeline::blas_abi::set_single_threaded_if_faiss();
+
         let base_str = match options.require("base") { Ok(s) => s, Err(e) => return error_result(e, start) };
         let query_str = match options.require("query") { Ok(s) => s, Err(e) => return error_result(e, start) };
         let output_str = match options.require("output") { Ok(s) => s, Err(e) => return error_result(e, start) };
@@ -288,6 +293,14 @@ impl CommandOp for VerifyKnnConsolidatedOp {
             let indices_path = profile.views.get("neighbor_indices")
                 .map(|v| ctx.workspace.join(&v.source.path))
                 .unwrap_or_else(|| ctx.workspace.join(format!("profiles/{}/neighbor_indices.ivecs", name)));
+            // We collect the distances_path for completeness but the
+            // verifier only reads `neighbor_indices.ivecs` — GT
+            // comparison is index-set based, the verifier recomputes
+            // distances itself via `scan_range_sgemm`. If a future
+            // change starts reading these fvec values, remember they
+            // are in FAISS publication convention (see
+            // [`knn_segment::published_to_kernel`]) and need conversion
+            // before being compared to kernel-internal heap distances.
             let distances_path = profile.views.get("neighbor_distances")
                 .map(|v| ctx.workspace.join(&v.source.path))
                 .unwrap_or_else(|| ctx.workspace.join(format!("profiles/{}/neighbor_distances.fvecs", name)));
@@ -817,6 +830,11 @@ impl CommandOp for VerifyFilteredKnnConsolidatedOp {
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
         let start = Instant::now();
 
+        // Belt-and-suspenders against the faiss-sys static-MKL bug
+        // (see pipeline::blas_abi). Filtered-knn verification may
+        // dispatch to sgemm-backed inner kernels.
+        crate::pipeline::blas_abi::set_single_threaded_if_faiss();
+
         let output_str = match options.require("output") { Ok(s) => s, Err(e) => return error_result(e, start) };
         let output_path = resolve_path(output_str, &ctx.workspace);
 
@@ -1102,6 +1120,10 @@ impl CommandOp for VerifyPredicatesConsolidatedOp {
 
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
         let start = Instant::now();
+
+        // Belt-and-suspenders against the faiss-sys static-MKL bug
+        // (see pipeline::blas_abi).
+        crate::pipeline::blas_abi::set_single_threaded_if_faiss();
 
         let metadata_str = match options.require("metadata") { Ok(s) => s, Err(e) => return error_result(e, start) };
         let predicates_str = match options.require("predicates") { Ok(s) => s, Err(e) => return error_result(e, start) };

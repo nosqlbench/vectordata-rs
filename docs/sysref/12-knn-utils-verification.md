@@ -193,26 +193,59 @@ unused; it only starts mattering when synthetic uniform-random
 vectors push us into the curse-of-dimensionality regime (see
 below).
 
-### Actual numbers — dim sweep 8 → 4096
+### Actual numbers — dim sweep 8 → 4096 at k=100
 
-Ran against 1000 base vectors × 100 queries × k=10, seed=42, L2
-metric. All four engines compiled in (`--features knnutils,faiss`).
-Reference engine is metal (SimSIMD). The sweep is run across three
+Ran against 1000 base vectors × 100 queries × **k=100**, seed=42.
+All four engines compiled in (`--features knnutils,faiss`).
+Reference engine is metal (SimSIMD). The sweep covers three
 synthetic distributions (`--distribution uniform|gaussian|clustered`)
-to confirm the divergence pattern is data-shape-independent.
-Reproduce with:
+and all four metric modes the engines support:
+
+- `--metric L2`
+- `--metric DOT_PRODUCT`
+- `--metric COSINE --assume_normalized_like_faiss=true` — cosine
+  collapses to inner product on pre-normalized inputs (FAISS/numpy
+  convention, what `knn_utils` does)
+- `--metric COSINE --use_proper_cosine_metric=true` — in-kernel
+  `dot/(|q|·|b|)` so cosine works on un-normalized inputs (FAISS
+  has no native equivalent and is correctly skipped in this mode)
+
+Result: **every cell in the 11 dims × 3 distributions × 2 metrics
+matrix passes 100 EXACT / 100** for stdarch / blas / faiss /
+blas-mirror against the metal reference. Higher k surfaces
+more boundary candidates (k=100 vs the prior k=10 sweep) and the
+canonical f64 rerank still produces byte-identical output across
+every engine at every dim, including the dim=4096 uniform case
+that historically pushed engines apart.
+
+Reproduce with the built-in `--sweep` mode:
 
 ```bash
-for dist in uniform gaussian clustered; do
-  for dim in 8 32 128 384 512 768 1024 1536 2048 3072 4096; do
-    veks pipeline verify engine-parity --synthetic \
-      --distribution $dist \
-      --dim $dim --base-count 1000 --query-count 100 \
-      --neighbors 10 --metric L2 --show-queries 0 \
-      --boundary-tolerance 1000000   # render-only; never gates verdict
-  done
-done
+# L2 + DOT_PRODUCT × all distributions × dim 8…4096 × k=100
+veks pipeline verify engine-parity --sweep \
+  --base-count 1000 --query-count 100 \
+  --neighbors 100 --show-queries 0 \
+  --boundary-tolerance 1000000
+
+# COSINE (assume-normalized): FAISS-equivalent
+veks pipeline verify engine-parity --sweep \
+  --metrics COSINE --base-count 1000 --query-count 100 \
+  --neighbors 100 --assume_normalized_like_faiss=true \
+  --show-queries 0 --boundary-tolerance 1000000
+
+# COSINE (proper, in-kernel): FAISS skipped — see "FAISS gap" below
+veks pipeline verify engine-parity --sweep \
+  --metrics COSINE --base-count 1000 --query-count 100 \
+  --neighbors 100 --use_proper_cosine_metric=true \
+  --show-queries 0 --boundary-tolerance 1000000
 ```
+
+`--sweep` runs the cross-product of (`--metrics` × `--neighbors-list`
+× `--dims` × `--distributions`) internally and emits a single
+matrix-shaped summary table. Each axis defaults to a standard sweep
+range; pass any subset to narrow. See
+`docs/design/knn-engine-characterization.md` for the
+parity-vs-truth distinction the matrix exists to verify.
 
 `verify engine-parity` does two things production `compute knn*`
 calls don't:
@@ -256,14 +289,32 @@ format `stdarch / blas / faiss / blas-mirror`:
 | 4096 | 100 / 100 / 100 / 100    | 100 / 100 / 100 / 100     | 100 / 100 / 100 / 100     |
 
 **100% EXACT parity across every dimension, every distribution,
-and every engine.** Uniform-random at dim=4096 — the most
-pathological synthetic case where pairwise distances concentrate
-to within a few-ULP window — is captured cleanly by the margin:
-even when the f32 sgemm and direct kernels disagree on which
-boundary candidate sits at rank 10, both forms hold all of the
-true top-10 within their respective top-(k + margin), and the
-f64 rerank promotes the correct ten regardless of how the f32
-arithmetic ordered them.
+and every engine** — for every metric mode any given engine
+supports. Uniform-random at dim=4096 — the most pathological
+synthetic case where pairwise distances concentrate to within a
+few-ULP window — is captured cleanly by the margin: even when the
+f32 sgemm and direct kernels disagree on which boundary candidate
+sits at rank 10, both forms hold all of the true top-10 within
+their respective top-(k + margin), and the f64 rerank promotes the
+correct ten regardless of how the f32 arithmetic ordered them.
+
+The same numbers hold across the metric matrix:
+
+| Metric mode                          | metal | stdarch | blas | faiss | blas-mirror |
+|--------------------------------------|-------|---------|------|-------|-------------|
+| L2                                   |  ref  |  100    | 100  | 100   |  100        |
+| DOT_PRODUCT                          |  ref  |  100    | 100  | 100   |  100        |
+| COSINE + assume_normalized_like_faiss|  ref  |  100    | 100  | 100   |  100        |
+| COSINE + use_proper_cosine_metric    |  ref  |  100    | 100  | (gap) |  100        |
+
+**FAISS gap on COSINE + use_proper_cosine_metric**: FAISS has no
+native proper-cosine kernel — its `METRIC_INNER_PRODUCT` assumes
+pre-normalized inputs and never divides by `|q|·|b|`. In that mode
+`verify engine-parity` correctly skips FAISS (with an explanatory
+note) instead of comparing against a different ranking. On any
+naturally-normalized data (`gaussian`, `clustered`, or
+`assume_normalized_like_faiss=true`), inner product equals proper
+cosine and FAISS agrees with the other engines bit-for-bit.
 
 ### The path to FAISS parity
 
@@ -314,9 +365,40 @@ Four factors had to align for bit-identical output:
 
 The `blas-mirror` engine in `verify engine-parity` exists as the
 proof-of-concept for (2) — a ~100-line Rust function that
-reproduces FAISS's exact sgemm call pattern. Its 100% EXACT
+reproduces FAISS's exact sgemm call pattern across all four metric
+paths (L2, IP, COSINE-as-IP, proper-COSINE). Its 100% EXACT
 column in the table (matching every other engine across every
 dimension and distribution) is the demonstration.
+
+### On-disk distance sign convention
+
+Every fvec the codebase writes — segment caches in `<workspace>/.cache/`,
+published `<workspace>/profiles/<size>/neighbor_distances.fvecs`, and
+final `compute knn*` output — uses **FAISS publication convention**:
+
+| Metric          | On-disk value          | Direction        |
+|-----------------|------------------------|------------------|
+| `L2`            | `+L2sq`                | smaller = better |
+| `DotProduct`    | `+dot`                 | larger = better  |
+| `Cosine`        | `+cos_sim` ∈ `[-1, 1]` | larger = better  |
+
+The kernel still operates on monotonic distances internally
+(smaller = better, so a single heap implementation works for
+every metric). Conversion happens at every disk boundary via
+[`knn_segment::kernel_to_published`] and `published_to_kernel`,
+which are pinned by unit tests in `knn_segment::tests`.
+
+This matters because the segment-cache reuse path (Path-2 sibling
+profile loading) reads files written by *any* prior `compute knn*`
+run. If one engine wrote `-dot` and another reads back assuming
+`+dot`, the heap merging would invert and silently corrupt every
+downstream profile that reused that file.
+
+**Cache-version note**: the on-disk format changed between cache
+versions: v1 (original) → v2 (margin support, mixed sign convention)
+→ v3 (uniform FAISS publication convention). Each `compute knn*`
+run logs a one-line notice if it sees prior-version cache files
+and recomputes everything fresh.
 
 ### Performance note
 
@@ -345,19 +427,22 @@ In-tree unit tests:
   engine-specific `ENGINE_NAME` prefix and that a second run hits
   the cache.
 
-Reproduce the full sweep:
+Reproduce the full sweep (built-in `--sweep` mode runs the cross-product
+internally and emits a single matrix summary):
 
 ```bash
-for dist in uniform gaussian clustered; do
-  for dim in 8 128 384 768 1024 2048 4096; do
-    veks pipeline verify engine-parity --synthetic \
-      --distribution $dist \
-      --dim $dim --base-count 1000 --query-count 100 \
-      --neighbors 10 --metric L2 --show-queries 0 \
-      --boundary-tolerance 1000000
-  done
-done
+veks pipeline verify engine-parity --sweep \
+  --base-count 1000 --query-count 100 \
+  --neighbors 100 --show-queries 0 \
+  --boundary-tolerance 1000000
 ```
+
+Each axis has a default; pass any of them to narrow the matrix:
+
+- `--dims=8,128,4096`              (default: 8,32,128,384,512,768,1024,1536,2048,3072,4096)
+- `--distributions=clustered`      (default: uniform,gaussian,clustered)
+- `--metrics=L2,DOT_PRODUCT`       (default: L2,DOT_PRODUCT)
+- `--neighbors-list=10,100`        (default: just `--neighbors`, or 100 if unset)
 
 > **Segment cache key contract.** Every `compute knn*`
 > implementation declares a unique single-word engine name

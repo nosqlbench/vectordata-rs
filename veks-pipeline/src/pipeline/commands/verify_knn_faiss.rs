@@ -89,6 +89,11 @@ swaps (from BLAS/SIMD rounding) are tolerated.
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
         let start = Instant::now();
 
+        // faiss-sys static MKL + multi-threading = silent sgemm
+        // corruption (see pipeline::blas_abi). This verifier relies
+        // on `index.search()` being correct; force single-threaded.
+        crate::pipeline::blas_abi::set_single_threaded_if_faiss();
+
         let metric_str = options.get("metric").unwrap_or("L2");
         let faiss_mt = match faiss_metric(metric_str) {
             Ok(m) => m,
@@ -205,6 +210,34 @@ swaps (from BLAS/SIMD rounding) are tolerated.
             overall.exact_match, overall.set_match,
             overall.boundary_mismatch, overall.real_mismatch));
 
+        // Write JSON report if `output` option was supplied. Pipeline
+        // runners declare this path as a post-execution artifact, so
+        // skipping the write causes the step to be marked as failing
+        // even when verification itself succeeded.
+        let mut produced: Vec<PathBuf> = Vec::new();
+        if let Some(out_str) = options.get("output") {
+            let out_path = resolve_path(out_str, &ctx.workspace);
+            let report = serde_json::json!({
+                "type": "knn-faiss",
+                "engine": "FAISS",
+                "metric": effective_metric,
+                "profiles_verified": profiles.len(),
+                "queries_total": overall.total,
+                "exact_match": overall.exact_match,
+                "set_match": overall.set_match,
+                "boundary_mismatch": overall.boundary_mismatch,
+                "real_mismatch": overall.real_mismatch,
+                "pass": all_pass,
+            });
+            if let Some(parent) = out_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            match std::fs::write(&out_path, serde_json::to_string_pretty(&report).unwrap_or_default()) {
+                Ok(()) => produced.push(out_path),
+                Err(e) => ctx.ui.log(&format!("  WARNING: write report: {}", e)),
+            }
+        }
+
         CommandResult {
             status: if all_pass { Status::Ok } else { Status::Error },
             message: format!(
@@ -213,7 +246,7 @@ swaps (from BLAS/SIMD rounding) are tolerated.
                 overall.total - overall.real_mismatch,
                 overall.total,
                 overall.real_mismatch),
-            produced: vec![],
+            produced,
             elapsed: start.elapsed(),
         }
     }

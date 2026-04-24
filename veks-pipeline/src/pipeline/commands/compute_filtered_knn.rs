@@ -170,10 +170,21 @@ struct PartitionMeta {
     cached: bool,
 }
 
+/// Cache-format version for filtered-knn partition files.
+///
+/// Bump when the on-disk format changes in a way old files would be
+/// misinterpreted under the new code. v1 (introduced when the rest of
+/// the codebase standardized on FAISS publication sign convention)
+/// uses `+L2sq`, `+dot`, `+cos_sim` for distances — see
+/// [`knn_segment::kernel_to_published`].
+const FKNN_CACHE_VERSION: &str = "fknn-v1";
+
 /// Build a cache file path for a partition.
 ///
 /// Includes `data_size` in the key so partitions are invalidated when the
 /// base vector file changes (e.g., different fraction → different file size).
+/// The leading `FKNN_CACHE_VERSION` token disambiguates on-disk formats so
+/// pre-v1 files are silently ignored after a format bump.
 fn build_cache_path(
     cache_dir: &Path,
     step_id: &str,
@@ -187,8 +198,8 @@ fn build_cache_path(
 ) -> PathBuf {
     let metric_str = metric_label(metric);
     cache_dir.join(format!(
-        "{}.range_{:06}_{:06}.k{}.{}.sz{}.fknn.{}.{}",
-        step_id, start, end, k, metric_str, data_size, suffix, ext,
+        "{}.{}.range_{:06}_{:06}.k{}.{}.sz{}.fknn.{}.{}",
+        step_id, FKNN_CACHE_VERSION, start, end, k, metric_str, data_size, suffix, ext,
     ))
 }
 
@@ -231,7 +242,11 @@ fn write_indices(path: &Path, results: &[Vec<Neighbor>], k: usize, base_offset: 
 }
 
 /// Write neighbor distances as fvec (each row: k f32 distances).
-fn write_distances(path: &Path, results: &[Vec<Neighbor>], k: usize) -> Result<(), String> {
+///
+/// On-disk values use FAISS publication convention via
+/// [`publication_distance`] so filtered-knn fvecs match the same sign
+/// convention as `compute knn*` output and `knn_segment` segment caches.
+fn write_distances(path: &Path, results: &[Vec<Neighbor>], k: usize, metric: Metric) -> Result<(), String> {
     use crate::pipeline::atomic_write::AtomicWriter;
     let mut w = AtomicWriter::with_capacity(1 << 20, path)
         .map_err(|e| format!("create {}: {}", path.display(), e))?;
@@ -239,12 +254,40 @@ fn write_distances(path: &Path, results: &[Vec<Neighbor>], k: usize) -> Result<(
     for row in results {
         w.write_all(&dim.to_le_bytes()).map_err(|e| e.to_string())?;
         for i in 0..k {
-            let dist: f32 = if i < row.len() { row[i].distance } else { f32::INFINITY };
+            let dist: f32 = if i < row.len() {
+                publication_distance(row[i].distance, metric)
+            } else { f32::INFINITY };
             w.write_all(&dist.to_le_bytes()).map_err(|e| e.to_string())?;
         }
     }
     w.finish().map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// Map this command's [`Metric`] (which adds `L1`) to the
+/// `knn_segment::Metric` that knows the sign convention, then convert.
+/// `L1` passes through (positive in both spaces).
+#[inline]
+fn publication_distance(d_kernel: f32, metric: Metric) -> f32 {
+    match metric {
+        Metric::L1 => d_kernel,
+        Metric::L2 => super::knn_segment::kernel_to_published(d_kernel, super::knn_segment::Metric::L2),
+        Metric::DotProduct => super::knn_segment::kernel_to_published(d_kernel, super::knn_segment::Metric::DotProduct),
+        Metric::Cosine => super::knn_segment::kernel_to_published(d_kernel, super::knn_segment::Metric::Cosine),
+    }
+}
+
+/// Inverse of [`publication_distance`]. Used when reading partition
+/// caches back into the merge heap so the ascending-distance sort
+/// behaves uniformly as "smaller = better."
+#[inline]
+fn kernel_distance(d_published: f32, metric: Metric) -> f32 {
+    match metric {
+        Metric::L1 => d_published,
+        Metric::L2 => super::knn_segment::published_to_kernel(d_published, super::knn_segment::Metric::L2),
+        Metric::DotProduct => super::knn_segment::published_to_kernel(d_published, super::knn_segment::Metric::DotProduct),
+        Metric::Cosine => super::knn_segment::published_to_kernel(d_published, super::knn_segment::Metric::Cosine),
+    }
 }
 
 /// Write both ivec and fvec for a partition, then validate.
@@ -256,9 +299,10 @@ fn write_partition_cache(
     k: usize,
     query_count: usize,
     compress_cache: bool,
+    metric: Metric,
 ) -> Result<(), String> {
     write_indices(&meta.neighbors_path, results, k, 0)?;
-    write_distances(&meta.distances_path, results, k)?;
+    write_distances(&meta.distances_path, results, k, metric)?;
 
     if !validate_cache_file(&meta.neighbors_path, query_count, k, 4)
         || !validate_cache_file(&meta.distances_path, query_count, k, 4)
@@ -294,6 +338,7 @@ fn merge_partitions(
     query_count: usize,
     base_offset: usize,
     compress_cache: bool,
+    metric: Metric,
     ui: &UiHandle,
 ) -> Result<(), String> {
     use std::io::Cursor;
@@ -352,7 +397,13 @@ fn merge_partitions(
                     fvec_row[off], fvec_row[off + 1], fvec_row[off + 2], fvec_row[off + 3],
                 ]);
                 if idx >= 0 && dist.is_finite() {
-                    candidates.push(Neighbor { index: idx as u32, distance: dist });
+                    // Partition cache fvecs are in FAISS publication
+                    // convention; convert to kernel-internal so the
+                    // ascending sort below sees uniform "smaller = better."
+                    candidates.push(Neighbor {
+                        index: idx as u32,
+                        distance: kernel_distance(dist, metric),
+                    });
                 }
             }
         }
@@ -370,7 +421,10 @@ fn merge_partitions(
         if let Some(ref mut dw) = dist_writer {
             dw.write_all(&dim.to_le_bytes()).map_err(|e| e.to_string())?;
             for j in 0..k {
-                let dist: f32 = if j < candidates.len() { candidates[j].distance } else { f32::INFINITY };
+                // Final output is publication convention; convert back.
+                let dist: f32 = if j < candidates.len() {
+                    publication_distance(candidates[j].distance, metric)
+                } else { f32::INFINITY };
                 dw.write_all(&dist.to_le_bytes()).map_err(|e| e.to_string())?;
             }
         }
@@ -1171,7 +1225,7 @@ fn execute_with_partitions<T: Send + Sync + 'static>(
         }
         let mut produced = vec![indices_path.to_path_buf()];
         if let Some(dist_path) = distances_path {
-            if let Err(e) = write_distances(dist_path, &results, k) {
+            if let Err(e) = write_distances(dist_path, &results, k, metric) {
                 return error_result(e, start);
             }
             produced.push(dist_path.to_path_buf());
@@ -1371,6 +1425,7 @@ fn execute_with_partitions<T: Send + Sync + 'static>(
         let part_end_idx = part.end;
         let part_query_count = query_count;
         let cc = compress_cache;
+        let part_metric = metric;
         prev_writer = Some(std::thread::spawn(move || {
             let meta = PartitionMeta {
                 start: part_start_idx,
@@ -1379,7 +1434,7 @@ fn execute_with_partitions<T: Send + Sync + 'static>(
                 distances_path: distances_path_clone,
                 cached: false,
             };
-            write_partition_cache(&meta, &results, k, part_query_count, cc)
+            write_partition_cache(&meta, &results, k, part_query_count, cc, part_metric)
         }));
 
         // Release completed partition's pages from page cache
@@ -1404,7 +1459,7 @@ fn execute_with_partitions<T: Send + Sync + 'static>(
     ));
 
     if let Err(e) = merge_partitions(
-        &partitions, indices_path, distances_path, k, query_count, base_offset, compress_cache, &ctx.ui,
+        &partitions, indices_path, distances_path, k, query_count, base_offset, compress_cache, metric, &ctx.ui,
     ) {
         return error_result(format!("merge failed: {}", e), start);
     }

@@ -330,6 +330,10 @@ checks, in a single pipeline step.
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
         let start = Instant::now();
 
+        // knn_utils verifier uses sgemm — same MKL ABI hazard as
+        // every other BLAS-touching command (see pipeline::blas_abi).
+        crate::pipeline::blas_abi::set_single_threaded_if_faiss();
+
         let base_str = match options.require("base") {
             Ok(s) => s, Err(e) => return error_result(e, start),
         };

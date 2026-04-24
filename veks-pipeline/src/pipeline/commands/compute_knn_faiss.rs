@@ -117,6 +117,12 @@ Only f32 (fvec) inputs are supported.
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
         let start = Instant::now();
 
+        // faiss-sys static MKL goes wrong under multi-threading at
+        // dim≥384 (see pipeline::blas_abi). Force single-threaded BLAS
+        // before any FAISS call so the `index.search()` sgemm path
+        // produces correct results.
+        crate::pipeline::blas_abi::set_single_threaded_if_faiss();
+
         // -- Parse options -----------------------------------------------
         let base_str = match options.require("base") {
             Ok(s) => s,

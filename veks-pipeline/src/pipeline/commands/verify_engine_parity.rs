@@ -65,17 +65,9 @@ const CBLAS_TRANS: i32 = 112;
 /// Set env vars that BLAS libraries read at init time. This only
 /// has an effect if called before the BLAS is first invoked — for
 /// our parity demo the process hasn't touched BLAS yet when this
-/// command starts, so it works. Covers OpenBLAS, MKL, OMP-threaded
-/// BLIS, and Apple Accelerate.
-#[cfg(feature = "knnutils")]
-fn blas_set_single_threaded() {
-    for var in &["OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "OMP_NUM_THREADS", "BLIS_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"] {
-        // set_var is unsafe because it races with getenv from other
-        // threads; we call this at the very top of execute() before
-        // spawning any BLAS work, so it's sound here.
-        unsafe { std::env::set_var(var, "1"); }
-    }
-}
+// blas_set_single_threaded() was a private helper here; the logic is
+// now inlined at the top of execute() above. See pipeline::blas_abi
+// for the production-grade variant gated on the `faiss` feature.
 
 pub fn factory() -> Box<dyn CommandOp> {
     Box::new(VerifyEngineParityOp)
@@ -190,6 +182,23 @@ impl CommandOp for VerifyEngineParityOp {
             OptionDesc { name: "use_proper_cosine_metric".into(), type_name: "bool".into(), required: false, default: Some("false".into()),
                 description: "metric=COSINE only: divide the dot product by |q|·|b| in-kernel so cosine works on un-normalized inputs. Mutually exclusive with assume_normalized_like_faiss. Propagated to every engine.".into(),
                 role: OptionRole::Config },
+
+            // ── Sweep mode ────────────────────────────────────────
+            OptionDesc { name: "sweep".into(), type_name: "bool".into(), required: false, default: Some("false".into()),
+                description: "Run the cross-product of (dims × distributions × metrics × neighbors) internally and emit a single matrix-shaped summary table. Each axis defaults to a standard sweep range; pass `--dims=8,32,4096` (etc.) to narrow.".into(),
+                role: OptionRole::Config },
+            OptionDesc { name: "dims".into(), type_name: "string".into(), required: false, default: None,
+                description: "Sweep mode: comma-separated list of dimensions (default: 8,32,128,384,512,768,1024,1536,2048,3072,4096).".into(),
+                role: OptionRole::Config },
+            OptionDesc { name: "distributions".into(), type_name: "string".into(), required: false, default: None,
+                description: "Sweep mode: comma-separated list (default: uniform,gaussian,clustered).".into(),
+                role: OptionRole::Config },
+            OptionDesc { name: "metrics".into(), type_name: "string".into(), required: false, default: None,
+                description: "Sweep mode: comma-separated list (default: L2,DOT_PRODUCT). For COSINE include the explicit mode flag(s) on the parent invocation.".into(),
+                role: OptionRole::Config },
+            OptionDesc { name: "neighbors-list".into(), type_name: "string".into(), required: false, default: None,
+                description: "Sweep mode: comma-separated list of k values (default: just the value of `--neighbors`, or 100 if unset).".into(),
+                role: OptionRole::Config },
         ]
     }
 
@@ -197,15 +206,32 @@ impl CommandOp for VerifyEngineParityOp {
         let start = Instant::now();
 
         // Force the underlying BLAS to single-threaded BEFORE any
-        // engine runs — FAISS's sgemm is multi-threaded by default,
-        // and OpenMP's non-deterministic block scheduling makes its
-        // output vary across runs with the same inputs. For a
-        // deterministic parity demo we want every sgemm caller
-        // (FAISS and our own blas-mirror) to share an identical
-        // accumulation order. Single-threaded BLAS is the only thread
-        // count that reproduces across BLAS variants.
-        #[cfg(feature = "knnutils")]
-        blas_set_single_threaded();
+        // engine runs. Two reasons stack up here:
+        //   1. The faiss-sys static MKL bug (see pipeline::blas_abi)
+        //      corrupts sgemm output under multi-threading.
+        //   2. Even with a clean BLAS, OpenMP's non-deterministic
+        //      block scheduling makes sgemm vary run-to-run, which
+        //      defeats the deterministic-parity-demo goal.
+        // We unconditionally force single-threaded here (not just
+        // when faiss feature is on) to handle reason (2) too.
+        // Done once at the top so a sweep doesn't re-set N times.
+        for var in &["OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "OMP_NUM_THREADS",
+                     "BLIS_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"] {
+            unsafe { std::env::set_var(var, "1"); }
+        }
+
+        // Sweep mode: when `--sweep` is set, the command runs the
+        // cross-product of (dims × distributions × metrics × ks)
+        // internally and emits a single matrix-shaped summary table.
+        // List-valued options (`--dims`, `--distributions`, etc.)
+        // narrow the matrix; with no list options the full default
+        // matrix runs. See `run_sweep` for the full enumeration.
+        let sweep_mode = options.get("sweep")
+            .map(|s| matches!(s, "true" | "1" | "yes"))
+            .unwrap_or(false);
+        if sweep_mode {
+            return run_sweep(options, ctx, start);
+        }
 
         let neighbors: usize = parse_int(options, "neighbors", 10);
         let metric = options.get("metric").unwrap_or("L2").to_string();
@@ -541,6 +567,172 @@ fn parse_int(options: &Options, key: &str, default: u64) -> usize {
     options.get(key)
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(default) as usize
+}
+
+/// Parse a comma-separated list option. Returns `None` if the option is
+/// unset (so the caller can supply a default), or `Some(empty)` if the
+/// option is set to a string with no non-whitespace tokens.
+fn parse_list(options: &Options, key: &str) -> Option<Vec<String>> {
+    options.get(key).map(|s| {
+        s.split(',')
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .collect()
+    })
+}
+
+/// Sweep mode: run the cross-product of (metric × k × dim × distribution)
+/// internally and emit a single matrix-shaped summary table.
+///
+/// Each cell is dispatched by recursively calling `execute` with `sweep`
+/// cleared and the singular axis keys (`dim`, `distribution`, `metric`,
+/// `neighbors`) overridden. All other options on the parent invocation
+/// (engines subset, boundary-tolerance, cosine flags, base-count, etc.)
+/// pass through unchanged.
+fn run_sweep(options: &Options, ctx: &mut StreamContext, start: Instant) -> CommandResult {
+    let dims = parse_list(options, "dims").unwrap_or_else(|| {
+        vec!["8", "32", "128", "384", "512", "768", "1024", "1536", "2048", "3072", "4096"]
+            .into_iter().map(String::from).collect()
+    });
+    let distributions = parse_list(options, "distributions").unwrap_or_else(|| {
+        vec!["uniform", "gaussian", "clustered"].into_iter().map(String::from).collect()
+    });
+    let metrics = parse_list(options, "metrics").unwrap_or_else(|| {
+        vec!["L2", "DOT_PRODUCT"].into_iter().map(String::from).collect()
+    });
+    let ks = parse_list(options, "neighbors-list").unwrap_or_else(|| {
+        let k = options.get("neighbors").map(|s| s.to_string()).unwrap_or_else(|| "100".into());
+        vec![k]
+    });
+
+    let total = dims.len() * distributions.len() * metrics.len() * ks.len();
+    if total == 0 {
+        return error("sweep: empty cross-product (one of --dims/--distributions/--metrics/--neighbors-list is empty)", start);
+    }
+
+    ctx.ui.log(&format!(
+        "engine-parity sweep: {} cells ({} dims × {} distributions × {} metrics × {} ks)",
+        total, dims.len(), distributions.len(), metrics.len(), ks.len(),
+    ));
+
+    struct Cell {
+        dim: String,
+        dist: String,
+        metric: String,
+        k: String,
+        status: Status,
+        msg: String,
+        elapsed: std::time::Duration,
+    }
+    let mut cells: Vec<Cell> = Vec::with_capacity(total);
+
+    let mut idx = 0usize;
+    for metric in &metrics {
+        for k in &ks {
+            for dim in &dims {
+                for dist in &distributions {
+                    idx += 1;
+                    ctx.ui.log(&format!(
+                        "  [{}/{}] metric={} k={} dim={} distribution={}",
+                        idx, total, metric, k, dim, dist,
+                    ));
+
+                    // Build per-cell options: clone parent, force
+                    // synthetic mode, override the swept axes, clear
+                    // `sweep` so the recursive call doesn't re-enter.
+                    let mut cell_opts = options.clone();
+                    cell_opts.set("sweep", "false");
+                    cell_opts.set("synthetic", "true");
+                    cell_opts.set("dim", dim);
+                    cell_opts.set("distribution", dist);
+                    cell_opts.set("metric", metric);
+                    cell_opts.set("neighbors", k);
+
+                    let cell_start = Instant::now();
+                    let mut op = VerifyEngineParityOp;
+                    let r = op.execute(&cell_opts, ctx);
+                    cells.push(Cell {
+                        dim: dim.clone(),
+                        dist: dist.clone(),
+                        metric: metric.clone(),
+                        k: k.clone(),
+                        status: r.status,
+                        msg: r.message,
+                        elapsed: cell_start.elapsed(),
+                    });
+                }
+            }
+        }
+    }
+
+    // Render summary matrix: one (metric × k) section, rows = dim,
+    // columns = distribution. Cell label = "PASS (Xs)" / "FAIL (Xs)".
+    let mut emit = String::new();
+    emit.push('\n');
+    emit.push_str("════════════════════════════════════════════════════════════════════\n");
+    emit.push_str(&format!("ENGINE-PARITY SWEEP SUMMARY ({} cells)\n", total));
+    emit.push_str("════════════════════════════════════════════════════════════════════\n");
+
+    let col_w = 16usize;
+    for metric in &metrics {
+        for k in &ks {
+            emit.push('\n');
+            emit.push_str(&format!("metric={} k={}\n", metric, k));
+            emit.push_str(&format!("{:>8}  ", "dim"));
+            for dist in &distributions {
+                emit.push_str(&format!("{:>w$}  ", dist, w = col_w));
+            }
+            emit.push('\n');
+            for dim in &dims {
+                emit.push_str(&format!("{:>8}  ", dim));
+                for dist in &distributions {
+                    let cell = cells.iter().find(|c|
+                        &c.dim == dim && &c.dist == dist
+                            && &c.metric == metric && &c.k == k);
+                    let lbl = match cell {
+                        Some(c) if matches!(c.status, Status::Ok) =>
+                            format!("PASS ({:.1}s)", c.elapsed.as_secs_f64()),
+                        Some(c) =>
+                            format!("FAIL ({:.1}s)", c.elapsed.as_secs_f64()),
+                        None => "-".to_string(),
+                    };
+                    emit.push_str(&format!("{:>w$}  ", lbl, w = col_w));
+                }
+                emit.push('\n');
+            }
+        }
+    }
+
+    let pass_count = cells.iter().filter(|c| matches!(c.status, Status::Ok)).count();
+    let fail_count = cells.len() - pass_count;
+    emit.push('\n');
+    emit.push_str(&format!(
+        "Result: {}/{} cells PASS, {} FAIL\n",
+        pass_count, cells.len(), fail_count,
+    ));
+    if fail_count > 0 {
+        emit.push_str("Failed cells (see per-cell logs above for full detail):\n");
+        for c in cells.iter().filter(|c| !matches!(c.status, Status::Ok)) {
+            emit.push_str(&format!(
+                "  metric={} k={} dim={} dist={}: {}\n",
+                c.metric, c.k, c.dim, c.dist, truncate(&c.msg, 100),
+            ));
+        }
+    }
+    ctx.ui.log(&emit);
+
+    let final_status = if fail_count == 0 { Status::Ok } else { Status::Error };
+    let msg = if fail_count == 0 {
+        format!("sweep PASS: {}/{} cells", pass_count, total)
+    } else {
+        format!("sweep FAIL: {} of {} cells failed", fail_count, total)
+    };
+    CommandResult {
+        status: final_status,
+        message: msg,
+        produced: vec![],
+        elapsed: start.elapsed(),
+    }
 }
 
 fn resolve(value: &str, workspace: &Path) -> PathBuf {
@@ -962,7 +1154,7 @@ fn run_blas_mirror(
                 |idx| {
                     let s = idx as usize * dim;
                     if s + dim <= base_data.len() {
-                        Some(base_data[s..s + dim].to_vec())
+                        Some(&base_data[s..s + dim])
                     } else {
                         None
                     }
@@ -1041,6 +1233,33 @@ mod tests {
         assert!(r.message.contains("identical neighbor sets")
              || r.message.contains("not enough engines"),
             "unexpected verdict: {}", r.message);
+    }
+
+    #[test]
+    fn engine_parity_sweep_runs_cross_product_and_summarizes() {
+        // Tiny 2×2×1×1 matrix so the test stays under a second. The
+        // same cells run under the non-sweep tests already; what
+        // matters here is that --sweep dispatches through every cell
+        // and returns a single aggregate Ok verdict with a matrix
+        // summary in the message.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = make_ctx(tmp.path());
+
+        let mut opts = Options::new();
+        opts.set("sweep", "true");
+        opts.set("dims", "4,8");
+        opts.set("distributions", "uniform,clustered");
+        opts.set("metrics", "L2");
+        opts.set("neighbors-list", "5");
+        opts.set("base-count", "100");
+        opts.set("query-count", "10");
+        opts.set("seed", "42");
+
+        let mut op = VerifyEngineParityOp;
+        let r = op.execute(&opts, &mut ctx);
+        assert!(matches!(r.status, Status::Ok), "{}", r.message);
+        assert!(r.message.contains("sweep"),
+            "expected sweep-style summary, got: {}", r.message);
     }
 
     #[test]

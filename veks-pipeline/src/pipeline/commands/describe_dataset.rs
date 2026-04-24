@@ -301,7 +301,7 @@ fn write_facet_legend(config: &DatasetConfig, doc: &mut String) {
     doc.push_str("| B | `base_vectors` | Vectors to search against | fvec (f32) |\n");
     doc.push_str("| Q | `query_vectors` | Vectors to search for | fvec (f32) |\n");
     doc.push_str("| G | `neighbor_indices` | Ground-truth k-nearest neighbor ordinals | ivec (i32) |\n");
-    doc.push_str("| D | `neighbor_distances` | Ground-truth distances | fvec (f32) |\n");
+    doc.push_str("| D | `neighbor_distances` | Ground-truth distances (FAISS publication convention: `+L2sq`, `+dot`, `+cos_sim` — larger is better for IP/cosine, smaller for L2) | fvec (f32) |\n");
 
     let has_metadata = config.default_profile()
         .map(|p| p.view("metadata_content").is_some())

@@ -3038,16 +3038,34 @@ fn aggregate(stats: &[QualityStats]) -> AggStats {
 /// mismatches from FP rounding but no real mismatches.
 #[test]
 fn cross_engine_knn_parity() {
+    // Force single-threaded BLAS for the duration of this test. When
+    // we're built with the `faiss` feature, faiss-sys pulls in a
+    // statically-linked MKL that has the ABI-mismatch bug documented
+    // in docs/design/faiss-blas-abi-bug.md. That bug affects ANY
+    // sgemm call in the process — FAISS's own, *and* our
+    // compute_knn_blas — silently producing wrong results at dim
+    // ≥ 384 with small batch sizes. Multi-threaded execution
+    // amplifies this. Single-threaded MKL avoids the bug entirely
+    // and gives deterministic, correct sgemm output. `verify
+    // engine-parity` does the same thing for the same reason.
+    //
+    // Safety: we set env vars before any BLAS work in the test runs.
+    // All test bodies run serially (cargo test default), so no other
+    // thread is reading the env mid-update.
+    for var in &["OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "OMP_NUM_THREADS",
+                 "BLIS_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"] {
+        unsafe { std::env::set_var(var, "1"); }
+    }
+
     let dims = [8, 32, 128, 256, 512, 768, 1024, 1536, 2048, 3072, 4096];
     let metrics = ["L2", "DOT_PRODUCT", "COSINE"];
     let n_base = 200;
     let n_query = 20;
     let k = 10;
 
-    // FAISS has a known BLAS ABI bug that produces corrupt results
-    // at high dimensions. See docs/design/faiss-blas-abi-bug.md.
-    // Only test FAISS at dims where it's known to work, and only
-    // when the faiss feature is enabled.
+    // FAISS has the same ABI bug that our workaround (batch size cap)
+    // only partially addresses. Still limit FAISS to dims where it's
+    // known to work even with single-threaded MKL.
     let faiss_max_dim = 256;
     let faiss_available = {
         let reg = veks_pipeline::pipeline::registry::CommandRegistry::with_builtins();
@@ -3135,15 +3153,16 @@ fn cross_engine_knn_parity() {
                 .collect();
 
             let mut engines: Vec<&str> = vec!["metal", "stdarch"];
-            if test_faiss { engines.push("faiss"); }
-            // knn-blas (and FAISS) follow the knn_utils convention:
-            // COSINE is treated as IP on the input vectors, with the
-            // caller responsible for pre-normalization. That's
-            // different from metal/stdarch which compute cosine
-            // in-kernel from raw inputs. Comparing blas-on-raw-COSINE
-            // against in-kernel-cosine truth is a convention
-            // mismatch, not a correctness regression. L2 and DOT
-            // still demonstrate full numpy/knn_utils parity.
+            // knn-blas AND FAISS both follow the knn_utils convention:
+            // COSINE is computed as IP on the input vectors, with the
+            // caller responsible for pre-normalization. metal and
+            // stdarch compute cosine in-kernel from raw inputs via
+            // use_proper_cosine_metric. Comparing IP-based output
+            // against in-kernel-cosine truth on un-normalized
+            // gen_vectors() data is a convention mismatch, not a
+            // correctness regression — so exclude both from COSINE.
+            // L2 and DOT still exercise full numpy/knn_utils parity.
+            if test_faiss && *metric != "COSINE" { engines.push("faiss"); }
             if blas_available && *metric != "COSINE" { engines.push("blas"); }
 
             for engine in &engines {

@@ -356,7 +356,13 @@ auto-resolved from the profile.
                     let slice = reader.get_slice(partition_knn_ordinal);
                     partition_neighbors = slice.to_vec();
 
-                    // Read distances if available
+                    // Read distances if available. The fvec stores values in
+                    // FAISS publication convention (see
+                    // [`super::knn_segment::kernel_to_published`]):
+                    // `+L2sq` (smaller=better), `+dot` (larger=better),
+                    // `+cos_sim` ∈ [-1, 1] (larger=better). We pass them
+                    // through to the display unchanged — that's what the
+                    // user expects to see.
                     partition_distances = if part_dist_path.exists() {
                         match MmapVectorReader::<f32>::open_fvec(&part_dist_path) {
                             Ok(dr) if partition_knn_ordinal < VectorReader::<f32>::count(&dr) => {

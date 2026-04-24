@@ -903,36 +903,31 @@ fn compute_knn_base_arg(
     }
 }
 
-fn cmd_knn(personality: &str) -> &'static str {
-    // knn-blas is the canonical default: numpy / knn_utils kernel
-    // parity with segment-cache + streaming pread. It requires the
-    // `knnutils` feature (system BLAS at link time). When that
-    // feature isn't compiled in, fall back to `compute knn` (the
-    // stdarch alias) so generated dataset.yaml files reference a
-    // command the binary actually registers.
+fn cmd_knn(_personality: &str) -> &'static str {
+    // Default compute engine is `compute knn` (stdarch SIMD), across
+    // every personality. Rationale:
     //
-    // Datasets whose base is f16 (mvec) should point the `run:` field
-    // at `compute knn` explicitly — knn-blas is f32-only.
-    match personality {
-        "knn_utils" => {
-            #[cfg(feature = "knnutils")]
-            { "compute knn-blas" }
-            #[cfg(not(feature = "knnutils"))]
-            {
-                eprintln!(
-                    "Warning: --personality knn_utils selected but the `knnutils` feature \
-                     is not compiled in. Falling back to `compute knn` (stdarch)."
-                );
-                "compute knn"
-            }
-        }
-        _ => {
-            #[cfg(feature = "knnutils")]
-            { "compute knn-blas" }
-            #[cfg(not(feature = "knnutils"))]
-            { "compute knn" }
-        }
-    }
+    //   - stdarch/metal produce identical top-k to BLAS-sgemm after
+    //     the canonical f64 rerank (see §12.7 of the verification
+    //     doc), and do it 50–180× faster with no BLAS dependency.
+    //   - `compute knn-blas` shares the sgemm path with faiss-sys's
+    //     statically-linked MKL, which has the ABI-mismatch bug
+    //     documented in docs/design/faiss-blas-abi-bug.md. We guard
+    //     against the bug by forcing single-threaded BLAS (see
+    //     pipeline::blas_abi), but running single-threaded throws
+    //     away BLAS's main production benefit (throughput), so the
+    //     user gets the worst of both worlds.
+    //   - FAISS is retained exclusively for *verification* —
+    //     `verify knn-faiss` cross-validates stdarch/metal output
+    //     against the Python `knn_utils` reference with the same
+    //     batch-size cap and single-threaded BLAS constraints that
+    //     keep the faiss-sys MKL stable.
+    //
+    // `compute knn-blas` remains registered for users who explicitly
+    // ask for it (e.g., regression-testing against numpy/knn_utils
+    // bit-for-bit under controlled conditions) but is no longer a
+    // bootstrap default.
+    "compute knn"
 }
 
 /// Build the cosine-mode options for a KNN step. When metric is
@@ -970,9 +965,29 @@ fn knn_cosine_opts(args: &ImportArgs) -> Vec<(String, String)> {
 }
 
 fn cmd_verify_knn(personality: &str) -> &'static str {
+    // Verification cross-validates computed neighbors against an
+    // independent implementation. When the `faiss` feature is
+    // compiled in, prefer `verify knn-faiss` — FAISS is the reference
+    // the `knn_utils` Python ecosystem trusts, and our wrapper keeps
+    // it stable via (a) the batch-size cap from the ABI-bug
+    // workaround and (b) single-threaded MKL (see pipeline::blas_abi).
+    //
+    // Without the faiss feature, fall back to `verify knn-consolidated`,
+    // which uses our own sgemm scan (also single-threaded under
+    // blas_abi) — less independence from the compute path but still
+    // a meaningful sanity check since it was produced by stdarch/metal
+    // SIMD kernels that share no code with sgemm.
+    //
+    // The `knn_utils` personality explicitly wants numpy-path
+    // validation; keep `verify dataset-knnutils` for that.
     match personality {
         "knn_utils" => "verify dataset-knnutils",
-        _ => "verify knn-consolidated",
+        _ => {
+            #[cfg(feature = "faiss")]
+            { "verify knn-faiss" }
+            #[cfg(not(feature = "faiss"))]
+            { "verify knn-consolidated" }
+        }
     }
 }
 
@@ -3656,10 +3671,22 @@ mod tests {
         let runs: Vec<&str> = steps.iter().map(|s| s.run.as_str()).collect();
         assert!(runs.contains(&"compute sort"), "native should use 'compute sort': {:?}", runs);
         assert!(runs.contains(&"generate shuffle"), "native should use 'generate shuffle': {:?}", runs);
-        // Native personality now defaults to knn-blas for KNN (numpy
-        // / knn_utils kernel parity). sort / shuffle remain native.
-        assert!(runs.contains(&"compute knn-blas"),
-            "native should use 'compute knn-blas' by default: {:?}", runs);
+        // Compute engine defaults to stdarch (`compute knn`). Avoids
+        // the faiss-sys static-MKL ABI bug that affects `compute
+        // knn-blas`; produces identical top-k after the canonical
+        // f64 rerank. See pipeline::blas_abi.
+        assert!(runs.contains(&"compute knn"),
+            "native should compute via stdarch (`compute knn`): {:?}", runs);
+        // Verify engine defaults to FAISS when available (cross-
+        // validates against the knn_utils Python reference with
+        // single-threaded BLAS + batch cap), else falls back to our
+        // own sgemm-based consolidated verifier.
+        #[cfg(feature = "faiss")]
+        assert!(runs.contains(&"verify knn-faiss"),
+            "native should verify via `verify knn-faiss` when feature is on: {:?}", runs);
+        #[cfg(not(feature = "faiss"))]
+        assert!(runs.contains(&"verify knn-consolidated"),
+            "native should fall back to `verify knn-consolidated`: {:?}", runs);
     }
 
     #[test]
@@ -3676,8 +3703,15 @@ mod tests {
             "knn_utils personality should use 'compute sort-knnutils': {:?}", runs);
         assert!(runs.contains(&"generate shuffle-knnutils"),
             "knn_utils personality should use 'generate shuffle-knnutils': {:?}", runs);
-        assert!(runs.contains(&"compute knn-blas"),
-            "knn_utils personality should use 'compute knn-blas': {:?}", runs);
+        // Compute engine: stdarch (`compute knn`) across every
+        // personality, including knn_utils. The canonical f64 rerank
+        // makes stdarch output bit-identical to BLAS-sgemm output,
+        // so knn_utils-compatibility is preserved; and stdarch
+        // avoids the faiss-sys static-MKL ABI bug that affects
+        // `compute knn-blas` (see pipeline::blas_abi).
+        assert!(runs.contains(&"compute knn"),
+            "personality should compute via stdarch (`compute knn`): {:?}", runs);
+        // knn_utils personality still uses the numpy-path verifier.
         assert!(runs.contains(&"verify dataset-knnutils"),
             "knn_utils personality should use 'verify dataset-knnutils': {:?}", runs);
     }
