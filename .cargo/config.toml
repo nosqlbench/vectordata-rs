@@ -4,6 +4,7 @@
 [alias]
 t = "test --release"
 b = "build --release"
+ta = "test --workspace --all-features"
 
 # Direct all test temp files to target/test-tmp/ instead of /tmp.
 [env]
