@@ -638,8 +638,11 @@ on `std::arch` alone, without SimSIMD, FAISS, or BLAS.
         let logical_cpus = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1);
+        // CLI default is "0" (= auto). Treat 0 the same as unset so the
+        // engine doesn't silently fall through to single-threaded.
         let threads: usize = options.get("threads")
             .and_then(|s| s.parse().ok())
+            .filter(|&v: &usize| v > 0)
             .unwrap_or(logical_cpus);
 
         // Resolve paths

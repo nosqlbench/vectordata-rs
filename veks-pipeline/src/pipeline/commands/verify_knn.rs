@@ -933,9 +933,17 @@ impl CommandOp for VerifyKnnOp {
             Err(e) => return error_result(e, start),
         };
 
+        // Resolve thread count, treating 0 as "auto" at every layer
+        // (CLI default, missing option, and governor-returns-zero are all
+        // valid auto-detect signals). Without the governor guard a
+        // 128-core box silently runs single-threaded.
+        let auto_threads = || {
+            let from_governor = ctx.governor.current("threads").unwrap_or(0) as usize;
+            if from_governor > 0 { from_governor } else { ctx.threads.max(1) }
+        };
         let threads: usize = match options.parse_opt::<usize>("threads") {
+            Ok(Some(0)) | Ok(None) => auto_threads(),
             Ok(Some(v)) => v,
-            Ok(None) => ctx.governor.current_or("threads", ctx.threads as u64) as usize,
             Err(e) => return error_result(e, start),
         };
 

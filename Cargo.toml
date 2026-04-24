@@ -17,3 +17,12 @@ faiss-sys = { path = "vendor/faiss-sys" }
 
 [profile.bench]
 debug = true
+
+# Release with full DWARF debug info for `perf record --call-graph=dwarf`
+# and source-level annotation in `perf report`. Frame pointers kept so
+# call-graph fp also works. Inherits everything else from `release`.
+[profile.profiling]
+inherits = "release"
+debug = "full"
+strip = "none"
+split-debuginfo = "off"

@@ -240,10 +240,41 @@ fn find_top_k_batch_transposed_f32(
     let mut dist_buf_16 = [0.0f32; SIMD_BATCH_WIDTH];
     let mut dist_buf_32 = [0.0f32; 32];
 
+    // Prefetch distance: how many base vectors ahead we issue T0
+    // prefetch hints. Sized to cover ~100ns DRAM latency at the
+    // observed per-base kernel time. The hardware prefetcher catches
+    // the in-vector sequential reads; what it misses is the cross-
+    // vector boundary where each new `base[j+1]` is a fresh ~1.5KB
+    // address range. Issuing one prefetch per cache line of the
+    // upcoming few base vectors recovers that stall without
+    // saturating the prefetch queue (max ~10 outstanding on Skylake+).
+    const PREFETCH_AHEAD: usize = 4;
+    let base_bytes = dim * std::mem::size_of::<f32>();
+    let cache_lines = (base_bytes + 63) / 64;
+
     let mut i = start;
     while i < end {
         let stride_end = std::cmp::min(i + stride, end);
         for j in i..stride_end {
+            // Prefetch base[j + PREFETCH_AHEAD] while we compute base[j].
+            // T0 = bring into all cache levels (we want it in L1 by
+            // the time we touch it). Numerics are unchanged — this is
+            // a hint only.
+            #[cfg(target_arch = "x86_64")]
+            if j + PREFETCH_AHEAD < stride_end {
+                let pf_vec = base_reader.get_slice(j + PREFETCH_AHEAD);
+                unsafe {
+                    let p = pf_vec.as_ptr() as *const i8;
+                    let mut cl = 0usize;
+                    while cl < cache_lines {
+                        std::arch::x86_64::_mm_prefetch::<{std::arch::x86_64::_MM_HINT_T0}>(
+                            p.add(cl * 64),
+                        );
+                        cl += 1;
+                    }
+                }
+            }
+
             let base_vec = base_reader.get_slice(j);
             let idx = j as u32;
 
@@ -666,10 +697,35 @@ fn find_top_k_batch_transposed_f16(
     let mut dist_buf_16 = [0.0f32; SIMD_BATCH_WIDTH];
     let mut dist_buf_32 = [0.0f32; 32];
 
+    // See find_top_k_batch_transposed_f32 for the rationale; same
+    // pattern applied here. f16 base is half the bytes (2 KB at
+    // dim=384 vs 1.5 KB f32), so prefetch covers fewer cache lines
+    // but the per-base latency-hiding window is identical.
+    const PREFETCH_AHEAD: usize = 4;
+    let base_bytes_f16 = dim * std::mem::size_of::<half::f16>();
+    let cache_lines_f16 = (base_bytes_f16 + 63) / 64;
+
     let mut i = start;
     while i < end {
         let stride_end = std::cmp::min(i + stride, end);
         for j in i..stride_end {
+            // Prefetch base[j + PREFETCH_AHEAD] (T0) — hint only,
+            // numerics unchanged.
+            #[cfg(target_arch = "x86_64")]
+            if j + PREFETCH_AHEAD < stride_end {
+                let pf_vec = base_reader.get_slice(j + PREFETCH_AHEAD);
+                unsafe {
+                    let p = pf_vec.as_ptr() as *const i8;
+                    let mut cl = 0usize;
+                    while cl < cache_lines_f16 {
+                        std::arch::x86_64::_mm_prefetch::<{std::arch::x86_64::_MM_HINT_T0}>(
+                            p.add(cl * 64),
+                        );
+                        cl += 1;
+                    }
+                }
+            }
+
             let base_f16 = base_reader.get_slice(j);
             let idx = j as u32;
 
@@ -1410,9 +1466,26 @@ compare an ANN index's approximate results against this exact ground truth.
         let logical_cpus = std::thread::available_parallelism()
             .map(|n| n.get() as u64)
             .unwrap_or(ctx.threads as u64);
+        // The CLI default is "0" (documented as "auto"). parse_opt returns
+        // Some(0) in that case, so we treat 0 as a synonym for None →
+        // governor's auto-detect (which falls back to logical_cpus).
+        // Without this, a user invoking with --threads 0 (or just the
+        // default) would silently run single-threaded, leaving 100×+
+        // throughput on the table on multi-core boxes.
+        // Resolve thread count, treating 0 as "auto" at every layer:
+        //   - --threads 0  (CLI default per OptionDesc)
+        //   - missing      (in-process callers that don't set the option)
+        //   - governor returns 0 (some governor/budget paths leave the
+        //     effective entry zero-initialized; without the guard we'd
+        //     silently fall back to single-threaded execution, which on
+        //     a 128-core box loses ~100× throughput).
+        let auto_threads = || {
+            let from_governor = ctx.governor.current("threads").unwrap_or(0) as usize;
+            if from_governor > 0 { from_governor } else { logical_cpus as usize }
+        };
         let threads: usize = match options.parse_opt::<usize>("threads") {
+            Ok(Some(0)) | Ok(None) => auto_threads(),
             Ok(Some(v)) => v,
-            Ok(None) => ctx.governor.current_or("threads", logical_cpus) as usize,
             Err(e) => return error_result(e, start),
         };
 
