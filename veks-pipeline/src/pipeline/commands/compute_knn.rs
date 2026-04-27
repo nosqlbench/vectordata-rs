@@ -51,8 +51,16 @@ pub fn factory() -> Box<dyn CommandOp> {
 /// Default number of base-vector strides per thread for progress reporting.
 ///
 /// Each thread breaks its base-vector scan into this many strides and
-/// updates the shared progress counter between strides.
-const STRIDES_PER_THREAD: usize = 10;
+/// updates the shared progress counter between strides. Higher values
+/// give a smoother visible rate at the cost of slightly more atomic
+/// increments — at 100 strides × 128 threads × ~auto partitions the
+/// total atomic-store rate is still well under 1 µs/base, while the
+/// reported progress updates frequently enough that the
+/// silent-stride / burst-update cycle isn't visible as a 1M-period
+/// pulse on auto-sized partitions (stride = base_count / N, so N=100
+/// keeps stride at ~10× partition_size/1000, smaller than the rate
+/// window).
+const STRIDES_PER_THREAD: usize = 100;
 
 // -- Top-K heap ---------------------------------------------------------------
 
