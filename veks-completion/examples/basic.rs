@@ -35,7 +35,7 @@ fn build_tree() -> CommandTree {
             ("knn", Node::leaf_with_flags(
                 &["--base", "--query", "--metric", "--dataset"],
                 &["--exact"],
-            ).with_value_provider("--dataset", complete_datasets)),
+            ).with_value_provider("--dataset", veks_completion::fn_provider(complete_datasets))),
             ("stats", Node::leaf(&["--input", "--output"])),
         ]))
         // Hidden command (completable if typed, but not listed)

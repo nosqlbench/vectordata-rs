@@ -8,7 +8,7 @@
 //! static command map — the tree is built from `build_augmented_cli()`
 //! on every invocation.
 
-use veks_completion::{CommandTree, Node};
+use veks_completion::{CommandTree, Node, ValueProvider};
 
 /// Build the completion tree by walking a clap `Command` recursively.
 ///
@@ -17,7 +17,13 @@ use veks_completion::{CommandTree, Node};
 /// appears automatically — nothing to keep in sync by hand.
 pub fn build_tree(cmd: &clap::Command) -> CommandTree {
     let app_name = cmd.get_name();
-    let root = walk_clap_command(cmd);
+    // Each pipeline CommandOp can declare per-option value-completion
+    // sets via `value_completions()`. Collect those into a flat map
+    // keyed by the full pipeline command path (e.g., "verify
+    // engine-parity"), then thread it through the tree walk so leaf
+    // nodes attach the appropriate value providers.
+    let pipeline_vc = veks_pipeline::pipeline::cli::pipeline_value_completions();
+    let root = walk_clap_command(cmd, &[], &pipeline_vc);
 
     // Identify hidden commands
     let mut hidden: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -35,18 +41,30 @@ pub fn build_tree(cmd: &clap::Command) -> CommandTree {
     };
 
     // Global value providers for options that appear across many commands
+    use veks_completion::fn_provider;
     tree = tree
-        .global_value_provider("--dataset", complete_dataset_names)
-        .global_value_provider("--profile", complete_profile_names)
-        .global_value_provider("--metric", complete_metrics)
-        .global_value_provider("--at", complete_catalog_urls)
-        .global_value_provider("--shell", complete_shells);
+        .global_value_provider("--dataset", fn_provider(complete_dataset_names))
+        .global_value_provider("--profile", fn_provider(complete_profile_names))
+        .global_value_provider("--metric", fn_provider(complete_metrics))
+        .global_value_provider("--at", fn_provider(complete_catalog_urls))
+        .global_value_provider("--shell", fn_provider(complete_shells));
 
     tree
 }
 
 /// Recursively convert a clap `Command` into a completion `Node`.
-fn walk_clap_command(cmd: &clap::Command) -> Node {
+///
+/// `path_segments` accumulates the words leading up to this command
+/// (excluding the program name and the leading `pipeline` group name)
+/// so we can look up per-leaf value providers in `pipeline_vc`.
+fn walk_clap_command(
+    cmd: &clap::Command,
+    path_segments: &[&str],
+    pipeline_vc: &std::collections::BTreeMap<
+        String,
+        std::collections::HashMap<String, veks_pipeline::pipeline::command::ValueCompletions>,
+    >,
+) -> Node {
     let subs: Vec<_> = cmd.get_subcommands().collect();
 
     if subs.is_empty() {
@@ -69,25 +87,83 @@ fn walk_clap_command(cmd: &clap::Command) -> Node {
             }
             options.push(name);
         }
+
+        // Look up per-option value completions for this leaf. The
+        // pipeline registry is keyed by the path joined with spaces
+        // (e.g., "verify engine-parity"), matching the `command_path`
+        // field on each `CommandOp`. When we're walking the
+        // `pipeline` subtree, `path_segments` looks like
+        // `["pipeline", "verify", "engine-parity"]`; strip the
+        // leading "pipeline" to match the registry key. The same
+        // applies when commands are also exposed as hidden top-level
+        // shortcuts (e.g., `veks verify engine-parity` with no
+        // `pipeline` prefix).
+        let mut value_providers: std::collections::BTreeMap<String, ValueProvider> =
+            std::collections::BTreeMap::new();
+        let stripped: Vec<&str> = if path_segments.first() == Some(&"pipeline") {
+            path_segments[1..].to_vec()
+        } else {
+            path_segments.to_vec()
+        };
+        let key = stripped.join(" ");
+        if let Some(opt_map) = pipeline_vc.get(&key) {
+            for (opt_name, vc) in opt_map {
+                let vc = vc.clone();
+                let provider: ValueProvider = std::sync::Arc::new(
+                    move |partial: &str, _ctx: &[&str]| -> Vec<String> {
+                        enum_value_completer(partial, &vc)
+                    });
+                value_providers.insert(format!("--{}", opt_name), provider);
+            }
+        }
+
         Node::Leaf {
             options,
             flags,
-            value_providers: std::collections::BTreeMap::new(),
+            value_providers,
             dynamic_options: None,
         }
     } else {
         // Group command — recurse into children
         let mut children = std::collections::BTreeMap::new();
         for sub in subs {
-            let name = sub.get_name().to_string();
-            let child = walk_clap_command(sub);
-            children.insert(name, child);
+            let name = sub.get_name();
+            let mut child_path: Vec<&str> = path_segments.to_vec();
+            child_path.push(name);
+            let child = walk_clap_command(sub, &child_path, pipeline_vc);
+            children.insert(name.to_string(), child);
         }
-        // If this group also has its own options (e.g., --help, --version
-        // at root), they'll be picked up by the tree walk logic in
-        // veks-completion when the node is a Group with options.
         Node::Group { children }
     }
+}
+
+/// Plain-string version of the enum value completer (the cli.rs
+/// version returns clap_complete `CompletionCandidate`s; this one
+/// returns plain `String`s for the veks-completion engine).
+fn enum_value_completer(
+    partial: &str,
+    vc: &veks_pipeline::pipeline::command::ValueCompletions,
+) -> Vec<String> {
+    if !vc.comma_separated {
+        return vc.values.iter()
+            .filter(|v| partial.is_empty() || v.starts_with(partial))
+            .map(|v| v.clone())
+            .collect();
+    }
+    let (already, rest) = match partial.rfind(',') {
+        Some(i) => (&partial[..=i], &partial[i + 1..]),
+        None    => ("", partial),
+    };
+    let chosen: std::collections::HashSet<&str> = already
+        .split(',')
+        .map(|t| t.trim())
+        .filter(|t| !t.is_empty())
+        .collect();
+    vc.values.iter()
+        .filter(|v| !chosen.contains(v.as_str()))
+        .filter(|v| rest.is_empty() || v.starts_with(rest))
+        .map(|v| format!("{}{}", already, v))
+        .collect()
 }
 
 /// Extract the value of a previously typed `--option` from the completion args.

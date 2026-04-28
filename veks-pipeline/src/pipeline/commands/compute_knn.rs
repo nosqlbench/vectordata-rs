@@ -2146,26 +2146,42 @@ where
     T: Send + Sync + 'static,
 {
     // Auto-size partition when partition_size == 0 (no governor segmentsize).
-    // Target: ~50% of system RAM. This determines how large each cached
-    // partition file is. Profile-aware reuse: the find_largest_cached logic
-    // automatically reuses partitions from smaller profiles.
+    // The partition determines how many base vectors are mmap-resident
+    // at the peak of one partition's scan; with the explicit
+    // release_range at the end of each partition (see below), this
+    // also determines steady-state RSS.
+    //
+    // Target: 25% of the governor's mem ceiling (NOT 50% of raw
+    // system RAM). Reasons:
+    //   - The governor's ceiling is what the user actually authorized
+    //     us to use. Raw /proc/meminfo ignores it.
+    //   - Other engines may run concurrently (verify engine-parity
+    //     keeps the previous engine's output around).
+    //   - The query packed buffers, per-thread heaps, and result
+    //     vectors all add overhead on top of the mmap RSS.
+    // 25% leaves comfortable headroom for emergency thresholds and
+    // the next partition's first few pages while the previous
+    // partition is being released.
     let partition_size = if partition_size == 0 {
-        let total_ram: u64 = std::fs::read_to_string("/proc/meminfo").ok()
-            .and_then(|s| {
-                s.lines()
-                    .find(|l| l.starts_with("MemTotal:"))
-                    .and_then(|l| l.split_whitespace().nth(1))
-                    .and_then(|n| n.parse::<u64>().ok())
-                    .map(|kb| kb * 1024)
-            })
-            .unwrap_or(8 * 1024 * 1024 * 1024);
-        let half_ram = (total_ram / 2) as usize;
+        let mem_ceiling = ctx.governor.current("mem").unwrap_or_else(|| {
+            std::fs::read_to_string("/proc/meminfo").ok()
+                .and_then(|s| {
+                    s.lines()
+                        .find(|l| l.starts_with("MemTotal:"))
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .and_then(|n| n.parse::<u64>().ok())
+                        .map(|kb| kb * 1024)
+                })
+                .unwrap_or(8 * 1024 * 1024 * 1024)
+        });
+        let budget = (mem_ceiling / 4) as usize;
         let entry_size = base_reader.entry_size().max(1);
-        let auto = (half_ram / entry_size).max(1_000_000);
+        let auto = (budget / entry_size).max(1_000_000);
         ctx.ui.log(&format!(
-            "  auto partition size: {} vectors ({:.1} GiB RAM budget)",
+            "  auto partition size: {} vectors ({:.1} GiB budget = 25% of mem ceiling {:.1} GiB)",
             format_count(auto),
-            half_ram as f64 / (1024.0 * 1024.0 * 1024.0),
+            budget as f64 / (1024.0 * 1024.0 * 1024.0),
+            mem_ceiling as f64 / (1024.0 * 1024.0 * 1024.0),
         ));
         auto
     } else {
@@ -2692,6 +2708,18 @@ where
             pi + 1, num_partitions,
             compute_elapsed.as_secs_f64(),
         );
+
+        // Release the just-scanned partition's pages back to the
+        // kernel. `advise_sequential` alone isn't enough on
+        // memory-rich systems: the kernel only reclaims under
+        // pressure, so by the time we'd be in trouble we're already
+        // at the ceiling. Multi-partition runs would otherwise
+        // accumulate every partition's pages in RSS until hitting
+        // the governor's emergency threshold mid-second-partition.
+        // Aligned MADV_DONTNEED (see vectordata::io::release_range)
+        // drops these pages from our process address space
+        // immediately so RSS bounded to ~one partition's worth.
+        base_reader.release_range(part.start, part.end);
     }
 
     // Drain final save

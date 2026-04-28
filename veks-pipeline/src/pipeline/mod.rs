@@ -30,6 +30,7 @@ pub mod cli;
 pub mod command;
 pub mod commands;
 pub mod dag;
+pub mod dataset_lookup;
 pub mod element_type;
 pub mod gz_cache;
 pub mod interpolate;

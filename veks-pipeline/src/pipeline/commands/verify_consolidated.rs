@@ -197,9 +197,26 @@ impl CommandOp for VerifyKnnConsolidatedOp {
         // threading (see pipeline::blas_abi). Force single-threaded.
         crate::pipeline::blas_abi::set_single_threaded_if_faiss();
 
-        let base_str = match options.require("base") { Ok(s) => s, Err(e) => return error_result(e, start) };
-        let query_str = match options.require("query") { Ok(s) => s, Err(e) => return error_result(e, start) };
-        let output_str = match options.require("output") { Ok(s) => s, Err(e) => return error_result(e, start) };
+        // Up-front: confirm the local dataset has the minimum facets
+        // this verify kind requires (see pipeline::dataset_lookup).
+        if let Err(e) = crate::pipeline::dataset_lookup::validate_and_log(
+            ctx, options, crate::pipeline::dataset_lookup::VerifyKind::KnnConsolidated,
+        ) {
+            return error_result(e, start);
+        }
+
+        // Standalone-friendly: missing input options are resolved from
+        // the dataset's profile/facet view (see pipeline::dataset_lookup).
+        let base_str = match crate::pipeline::dataset_lookup::resolve_path_option(
+            ctx, options, "base", "base_vectors",
+        ) { Ok(s) => s, Err(e) => return error_result(e, start) };
+        let query_str = match crate::pipeline::dataset_lookup::resolve_path_option(
+            ctx, options, "query", "query_vectors",
+        ) { Ok(s) => s, Err(e) => return error_result(e, start) };
+        let output_str = match options.require("output") {
+            Ok(s) => s.to_string(),
+            Err(e) => return error_result(e, start),
+        };
 
         let metric_str = options.get("metric").unwrap_or("L2");
         let metric = match Metric::from_str(metric_str) {
@@ -261,13 +278,13 @@ impl CommandOp for VerifyKnnConsolidatedOp {
         // Strip the window via source_window::resolve_source so opening
         // the file doesn't blow up on the trailing range syntax —
         // matching what compute-knn-blas does.
-        let base_source = match super::source_window::resolve_source(base_str, &ctx.workspace) {
+        let base_source = match super::source_window::resolve_source(&base_str, &ctx.workspace) {
             Ok(s) => s,
             Err(e) => return error_result(format!("parse base source: {}", e), start),
         };
         let base_path = base_source.path.clone();
-        let query_path = resolve_path(query_str, &ctx.workspace);
-        let output_path = resolve_path(output_str, &ctx.workspace);
+        let query_path = resolve_path(&query_str, &ctx.workspace);
+        let output_path = resolve_path(&output_str, &ctx.workspace);
 
         // Discover profiles from dataset.yaml
         let dataset_path = ctx.workspace.join("dataset.yaml");
@@ -440,8 +457,11 @@ impl CommandOp for VerifyKnnConsolidatedOp {
 
         let pct = if query_count > 0 { 100.0 * num_samples as f64 / query_count as f64 } else { 0.0 };
         ctx.ui.log(&format!(
-            "verify-knn-consolidated: {} profiles, {} of {} queries ({:.1}%), metric={:?}, threads={}",
-            profiles.len(), num_samples, query_count, pct, kernel_metric, threads,
+            "verify knn-consolidated: KNN ground truth across {} profile{} via cblas_sgemm \
+             (single-threaded, MKL-safe); sample={} of {} queries ({:.1}%), metric={:?}, threads={}",
+            profiles.len(),
+            if profiles.len() == 1 { "" } else { "s" },
+            num_samples, query_count, pct, kernel_metric, threads,
         ));
 
         // Load GT indices for valid profiles only
@@ -835,8 +855,19 @@ impl CommandOp for VerifyFilteredKnnConsolidatedOp {
         // dispatch to sgemm-backed inner kernels.
         crate::pipeline::blas_abi::set_single_threaded_if_faiss();
 
-        let output_str = match options.require("output") { Ok(s) => s, Err(e) => return error_result(e, start) };
-        let output_path = resolve_path(output_str, &ctx.workspace);
+        // Up-front: confirm the local dataset has the minimum facets
+        // this verify kind requires (see pipeline::dataset_lookup).
+        if let Err(e) = crate::pipeline::dataset_lookup::validate_and_log(
+            ctx, options, crate::pipeline::dataset_lookup::VerifyKind::FilteredKnnConsolidated,
+        ) {
+            return error_result(e, start);
+        }
+
+        let output_str = match options.require("output") {
+            Ok(s) => s.to_string(),
+            Err(e) => return error_result(e, start),
+        };
+        let output_path = resolve_path(&output_str, &ctx.workspace);
 
         let sample_count: usize = match options.parse_or("sample", 50usize) {
             Ok(v) => v, Err(e) => return error_result(e, start),
@@ -867,11 +898,15 @@ impl CommandOp for VerifyFilteredKnnConsolidatedOp {
             vectordata::dataset::profile::profile_sort_by_size(a, a_bc, b, b_bc)
         });
 
-        // Load base and query vectors
-        let base_str = match options.require("base") { Ok(s) => s, Err(e) => return error_result(e, start) };
-        let query_str = match options.require("query") { Ok(s) => s, Err(e) => return error_result(e, start) };
-        let base_path = resolve_path(base_str, &ctx.workspace);
-        let query_path = resolve_path(query_str, &ctx.workspace);
+        // Load base and query vectors (standalone-friendly: see dataset_lookup).
+        let base_str = match crate::pipeline::dataset_lookup::resolve_path_option(
+            ctx, options, "base", "base_vectors",
+        ) { Ok(s) => s, Err(e) => return error_result(e, start) };
+        let query_str = match crate::pipeline::dataset_lookup::resolve_path_option(
+            ctx, options, "query", "query_vectors",
+        ) { Ok(s) => s, Err(e) => return error_result(e, start) };
+        let base_path = resolve_path(&base_str, &ctx.workspace);
+        let query_path = resolve_path(&query_str, &ctx.workspace);
 
         let metric_str = options.get("metric").unwrap_or("L2");
         let metric = crate::pipeline::simd_distance::Metric::from_str(metric_str)
@@ -888,11 +923,14 @@ impl CommandOp for VerifyFilteredKnnConsolidatedOp {
         let base_count = vectordata::VectorReader::<f32>::count(&base_reader);
         let query_count = vectordata::VectorReader::<f32>::count(&query_reader);
 
-        ctx.ui.log(&format!(
-            "verify-filtered-knn-consolidated: {} profiles, {} sample queries, {} base, {} queries",
-            profiles.len(), sample_count, base_count, query_count,
-        ));
         let actual_sample = sample_count.min(query_count);
+        ctx.ui.log(&format!(
+            "verify filtered-knn-consolidated: filtered KNN ground truth across {} profile{} via cblas_sgemm \
+             (single-threaded, MKL-safe); sample={} of {} queries, base={}",
+            profiles.len(),
+            if profiles.len() == 1 { "" } else { "s" },
+            actual_sample, query_count, base_count,
+        ));
         let step = if query_count <= actual_sample { 1 } else { query_count / actual_sample };
         let sample_indices: Vec<usize> = (0..actual_sample).map(|i| i * step).collect();
 
@@ -1125,13 +1163,30 @@ impl CommandOp for VerifyPredicatesConsolidatedOp {
         // (see pipeline::blas_abi).
         crate::pipeline::blas_abi::set_single_threaded_if_faiss();
 
-        let metadata_str = match options.require("metadata") { Ok(s) => s, Err(e) => return error_result(e, start) };
-        let predicates_str = match options.require("predicates") { Ok(s) => s, Err(e) => return error_result(e, start) };
-        let output_str = match options.require("output") { Ok(s) => s, Err(e) => return error_result(e, start) };
+        // Up-front: confirm the local dataset has the minimum facets
+        // this verify kind requires (see pipeline::dataset_lookup).
+        if let Err(e) = crate::pipeline::dataset_lookup::validate_and_log(
+            ctx, options, crate::pipeline::dataset_lookup::VerifyKind::PredicatesConsolidated,
+        ) {
+            return error_result(e, start);
+        }
 
-        let metadata_path = resolve_path(metadata_str, &ctx.workspace);
-        let predicates_path = resolve_path(predicates_str, &ctx.workspace);
-        let output_path = resolve_path(output_str, &ctx.workspace);
+        // Standalone-friendly: input paths come from the dataset's
+        // profile/facet view (see pipeline::dataset_lookup).
+        let metadata_str = match crate::pipeline::dataset_lookup::resolve_path_option(
+            ctx, options, "metadata", "metadata_content",
+        ) { Ok(s) => s, Err(e) => return error_result(e, start) };
+        let predicates_str = match crate::pipeline::dataset_lookup::resolve_path_option(
+            ctx, options, "predicates", "metadata_predicates",
+        ) { Ok(s) => s, Err(e) => return error_result(e, start) };
+        let output_str = match options.require("output") {
+            Ok(s) => s.to_string(),
+            Err(e) => return error_result(e, start),
+        };
+
+        let metadata_path = resolve_path(&metadata_str, &ctx.workspace);
+        let predicates_path = resolve_path(&predicates_str, &ctx.workspace);
+        let output_path = resolve_path(&output_str, &ctx.workspace);
 
         let sample_count: usize = match options.parse_or("sample", 50usize) {
             Ok(v) => v, Err(e) => return error_result(e, start),
@@ -1162,11 +1217,6 @@ impl CommandOp for VerifyPredicatesConsolidatedOp {
             vectordata::dataset::profile::profile_sort_by_size(a, a_bc, b, b_bc)
         });
 
-        ctx.ui.log(&format!(
-            "verify-predicates-consolidated: {} profiles, {} predicate samples, {} metadata records",
-            profiles.len(), sample_count, metadata_sample,
-        ));
-
         let pred_reader = match slabtastic::SlabReader::open(&predicates_path) {
             Ok(r) => r,
             Err(e) => return error_result(format!("failed to open predicates: {}", e), start),
@@ -1181,8 +1231,11 @@ impl CommandOp for VerifyPredicatesConsolidatedOp {
         let meta_count = meta_reader.total_records() as usize;
 
         ctx.ui.log(&format!(
-            "  {} predicates, {} metadata records, sampling {} predicates",
-            pred_count, meta_count, actual_pred_sample,
+            "verify predicates-consolidated: predicate evaluation across {} profile{} via in-memory \
+             scan; sample={} of {} predicates × {} metadata records (cap {})",
+            profiles.len(),
+            if profiles.len() == 1 { "" } else { "s" },
+            actual_pred_sample, pred_count, meta_count, metadata_sample,
         ));
 
         let mut all_results = Vec::new();

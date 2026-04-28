@@ -61,17 +61,28 @@ impl CommandOp for VerifyPredicatesOp {
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
         let start = Instant::now();
 
-        let metadata_str = match options.require("metadata") {
-            Ok(s) => s, Err(e) => return error_result(e, start),
-        };
-        let predicates_str = match options.require("predicates") {
-            Ok(s) => s, Err(e) => return error_result(e, start),
-        };
-        let indices_str = match options.require("metadata-indices") {
-            Ok(s) => s, Err(e) => return error_result(e, start),
-        };
+        // Up-front: confirm the local dataset has the minimum facets
+        // this verify kind requires (see pipeline::dataset_lookup).
+        if let Err(e) = crate::pipeline::dataset_lookup::validate_and_log(
+            ctx, options, crate::pipeline::dataset_lookup::VerifyKind::PredicateResults,
+        ) {
+            return error_result(e, start);
+        }
+
+        // Standalone-friendly: missing input paths are resolved from
+        // the active profile's metadata-related facets in dataset.yaml.
+        let metadata_str = match crate::pipeline::dataset_lookup::resolve_path_option(
+            ctx, options, "metadata", "metadata_content",
+        ) { Ok(s) => s, Err(e) => return error_result(e, start) };
+        let predicates_str = match crate::pipeline::dataset_lookup::resolve_path_option(
+            ctx, options, "predicates", "metadata_predicates",
+        ) { Ok(s) => s, Err(e) => return error_result(e, start) };
+        let indices_str = match crate::pipeline::dataset_lookup::resolve_path_option(
+            ctx, options, "metadata-indices", "metadata_layout",
+        ) { Ok(s) => s, Err(e) => return error_result(e, start) };
         let output_str = match options.require("output") {
-            Ok(s) => s, Err(e) => return error_result(e, start),
+            Ok(s) => s.to_string(),
+            Err(e) => return error_result(e, start),
         };
 
         let sample_count: usize = match options.parse_or("sample", 50usize) {
@@ -87,10 +98,10 @@ impl CommandOp for VerifyPredicatesOp {
             Err(e) => return error_result(e, start),
         };
 
-        let metadata_path = resolve_path(metadata_str, &ctx.workspace);
-        let predicates_path = resolve_path(predicates_str, &ctx.workspace);
-        let indices_path = resolve_path(indices_str, &ctx.workspace);
-        let output_path = resolve_path(output_str, &ctx.workspace);
+        let metadata_path = resolve_path(&metadata_str, &ctx.workspace);
+        let predicates_path = resolve_path(&predicates_str, &ctx.workspace);
+        let indices_path = resolve_path(&indices_str, &ctx.workspace);
+        let output_path = resolve_path(&output_str, &ctx.workspace);
 
         // Parse optional range to limit verification to a profile's window.
         // Format: [start,end) — e.g., [0,1010000)
@@ -140,6 +151,13 @@ impl CommandOp for VerifyPredicatesOp {
             Err(e) => return error_result(format!("open predicates: {}", e), start),
         };
         let pred_count = pred_reader.total_records() as usize;
+        let effective_sample_preview = sample_count.min(pred_count);
+        ctx.ui.log(&format!(
+            "verify predicate-results: predicate evaluation via SQLite oracle (in-memory, \
+             sampled metadata); sample={} of {} predicates × {} of {} metadata records",
+            effective_sample_preview, pred_count,
+            metadata_sample.min(meta_count - range_start), meta_count - range_start,
+        ));
         ctx.ui.log(&format!("  predicates: {} from {}", pred_count, predicates_path.display()));
 
         // Open indices slab

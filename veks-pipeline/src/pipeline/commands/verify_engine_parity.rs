@@ -149,6 +149,9 @@ impl CommandOp for VerifyEngineParityOp {
             OptionDesc { name: "show-queries".into(), type_name: "int".into(),  required: false, default: Some("5".into()),
                 description: "Number of queries to print side-by-side".into(),
                 role: OptionRole::Config },
+            OptionDesc { name: "sample".into(), type_name: "int".into(), required: false, default: Some("100".into()),
+                description: "User-data mode: number of queries to sample from the input query file. Each engine then runs against the full base × this many queries. Set to 0 to verify all queries (only feasible for small datasets — every engine scans the full base).".into(),
+                role: OptionRole::Config },
             OptionDesc { name: "boundary-tolerance".into(), type_name: "int".into(), required: false, default: Some("0".into()),
                 description: "Max differing neighbors per query before the verdict flips to FAIL. Default 0 — any disagreement fails. See --help for the regimes where slack is justified.".into(),
                 role: OptionRole::Config },
@@ -165,7 +168,7 @@ impl CommandOp for VerifyEngineParityOp {
                 description: "Synthetic mode: query vector count".into(),
                 role: OptionRole::Config },
             OptionDesc { name: "seed".into(),         type_name: "int".into(),  required: false, default: Some("42".into()),
-                description: "Synthetic mode: PRNG seed (xorshift)".into(),
+                description: "PRNG seed (xorshift) — used by synthetic-mode fixture generation and by user-data-mode query sampling.".into(),
                 role: OptionRole::Config },
             OptionDesc { name: "distribution".into(), type_name: "enum".into(), required: false, default: Some("uniform".into()),
                 description: "Synthetic mode: 'uniform' (U[-1,1] per component — curse-of-dim kicks in at high dim), 'gaussian' (N(0,1) per component + L2-normalize onto unit sphere — still curse-prone at high dim), or 'clustered' (mixture of 16 Gaussian clusters on the unit sphere — simulates the cluster structure real embedding models produce; this is the distribution where top-k is well-defined at any dim and all kernels agree).".into(),
@@ -200,6 +203,22 @@ impl CommandOp for VerifyEngineParityOp {
                 description: "Sweep mode: comma-separated list of k values (default: just the value of `--neighbors`, or 100 if unset).".into(),
                 role: OptionRole::Config },
         ]
+    }
+
+    fn value_completions(&self) -> std::collections::HashMap<String, crate::pipeline::command::ValueCompletions> {
+        use crate::pipeline::command::ValueCompletions;
+        let mut m = std::collections::HashMap::new();
+        m.insert("engines".to_string(), ValueCompletions::comma_separated_enum(
+            &["metal", "stdarch", "blas", "blas-mirror", "faiss"]));
+        m.insert("metric".to_string(), ValueCompletions::enum_values(
+            &["L2", "DOT_PRODUCT", "COSINE", "IP"]));
+        m.insert("distribution".to_string(), ValueCompletions::enum_values(
+            &["uniform", "gaussian", "clustered"]));
+        m.insert("metrics".to_string(), ValueCompletions::comma_separated_enum(
+            &["L2", "DOT_PRODUCT", "COSINE"]));
+        m.insert("distributions".to_string(), ValueCompletions::comma_separated_enum(
+            &["uniform", "gaussian", "clustered"]));
+        m
     }
 
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
@@ -253,22 +272,13 @@ impl CommandOp for VerifyEngineParityOp {
             Err(e) => return error(format!("could not create workdir: {}", e), start),
         };
 
-        // Isolate the entire engine working environment — workspace
-        // AND cache — to the per-run tempdir. Without redirecting
-        // workspace, engines that write side-effects relative to it
-        // (e.g. `compute knn-metal` writes `knn_queries_with_ties` /
-        // `knn_tied_neighbors` to `<workspace>/variables.yaml`) leak
-        // those files into the user's cwd. Without redirecting cache,
-        // engines from earlier runs replay each other (the cache key
-        // is content-insensitive — see knn_segment::cache_prefix_for).
-        // Both pointers get restored before this command returns.
-        let isolated_cache = workdir.path().join("cache");
-        let _ = std::fs::create_dir_all(&isolated_cache);
-        let saved_ctx_cache = std::mem::replace(&mut ctx.cache, isolated_cache);
-        let saved_ctx_workspace = std::mem::replace(&mut ctx.workspace, workdir.path().to_path_buf());
-
         // Resolve the (base, query) paths — either user-supplied or
-        // synthetic-generated into the workdir.
+        // synthetic-generated into the workdir. This MUST happen
+        // before the workspace swap below: in user-data mode the
+        // resolver consults `<workspace>/dataset.yaml` for the
+        // `base_vectors` / `query_vectors` facets, and once
+        // `ctx.workspace` is pointing at the tempdir there's no
+        // dataset.yaml to find.
         let (base_path, query_path) = if synthetic {
             let dim:        usize = parse_int(options, "dim", 128);
             let base_count: usize = parse_int(options, "base-count", 10_000);
@@ -314,10 +324,57 @@ impl CommandOp for VerifyEngineParityOp {
             }
             (bp, qp)
         } else {
-            let b = match options.require("base") { Ok(s) => s, Err(e) => return error(e, start) };
-            let q = match options.require("query") { Ok(s) => s, Err(e) => return error(e, start) };
-            (resolve(&b, &ctx.workspace), resolve(&q, &ctx.workspace))
+            // User-data mode: explicit --base/--query wins; otherwise
+            // resolve from the active profile's `base_vectors` /
+            // `query_vectors` facets in dataset.yaml. See
+            // pipeline::dataset_lookup.
+            let b = match crate::pipeline::dataset_lookup::resolve_path_option(
+                ctx, options, "base", "base_vectors",
+            ) { Ok(s) => s, Err(e) => return error(e, start) };
+            let q = match crate::pipeline::dataset_lookup::resolve_path_option(
+                ctx, options, "query", "query_vectors",
+            ) { Ok(s) => s, Err(e) => return error(e, start) };
+            // Canonicalize to absolute so the per-engine sub-calls
+            // (which run against the swapped tempdir workspace) don't
+            // re-resolve `./profiles/...` against the wrong root.
+            let bp = resolve(&b, &ctx.workspace);
+            let qp = resolve(&q, &ctx.workspace);
+            let bp = bp.canonicalize().unwrap_or(bp);
+            let qp = qp.canonicalize().unwrap_or(qp);
+
+            // Bound per-engine work by sampling queries: each engine
+            // still scans the full base, but only against `sample`
+            // queries. Keeps engine-parity feasible at any base size.
+            // `--sample 0` means "use all queries" (small fixtures).
+            let sample_n: usize = parse_int(options, "sample", 100);
+            let seed_v: u64 = parse_int(options, "seed", 42) as u64;
+            let qp = if sample_n > 0 {
+                match write_sampled_query_file(
+                    &qp, sample_n, seed_v, workdir.path(), &mut ctx.ui,
+                ) {
+                    Ok(p) => p,
+                    Err(e) => return error(format!("query sampling: {}", e), start),
+                }
+            } else {
+                qp
+            };
+
+            (bp, qp)
         };
+
+        // Now isolate the engine working environment — workspace
+        // AND cache — to the per-run tempdir. Without redirecting
+        // workspace, engines that write side-effects relative to it
+        // (e.g. `compute knn-metal` writes `knn_queries_with_ties` /
+        // `knn_tied_neighbors` to `<workspace>/variables.yaml`) leak
+        // those files into the user's cwd. Without redirecting cache,
+        // engines from earlier runs replay each other (the cache key
+        // is content-insensitive — see knn_segment::cache_prefix_for).
+        // Both pointers get restored before this command returns.
+        let isolated_cache = workdir.path().join("cache");
+        let _ = std::fs::create_dir_all(&isolated_cache);
+        let saved_ctx_cache = std::mem::replace(&mut ctx.cache, isolated_cache);
+        let saved_ctx_workspace = std::mem::replace(&mut ctx.workspace, workdir.path().to_path_buf());
 
         // Decide which engines to run. The user can override via
         // --engines; otherwise we run everything that was compiled in.
@@ -421,11 +478,12 @@ impl CommandOp for VerifyEngineParityOp {
         // same sgemm + per-cell post-pass.
         #[cfg(feature = "knnutils")]
         if want("blas-mirror") {
+            ctx.ui.log("  running engine: blas-mirror");
             let started = Instant::now();
             let path = workdir.path().join("blas-mirror.ivec");
             let res = run_blas_mirror(
                 &base_path, &query_path, &path, neighbors, &metric,
-                assume_normalized, use_proper_cosine,
+                assume_normalized, use_proper_cosine, &mut ctx.ui,
             );
             let elapsed = started.elapsed();
             runs.push(match res {
@@ -740,6 +798,71 @@ fn resolve(value: &str, workspace: &Path) -> PathBuf {
     if p.is_absolute() { p.to_path_buf() } else { workspace.join(p) }
 }
 
+/// Sample `n` queries deterministically from `query_path` (an fvec)
+/// and write them as a fresh fvec into `workdir/sampled_query.fvec`.
+/// Returns the path to the sampled file.
+///
+/// This is what bounds engine-parity's per-engine work in user-data
+/// mode: each engine still scans the full base, but only against the
+/// sampled queries. Sampling preserves byte-identical comparison
+/// across engines (every engine sees the same query subset).
+///
+/// Uses a deterministic xorshift seeded by `seed` and "sample-without-
+/// replacement via reservoir" so the resulting subset is reproducible
+/// across runs. If `n >= total_queries`, returns the original path
+/// unchanged (no copy).
+fn write_sampled_query_file(
+    query_path: &Path,
+    n: usize,
+    seed: u64,
+    workdir: &Path,
+    ui: &mut veks_core::ui::UiHandle,
+) -> Result<PathBuf, String> {
+    let reader = MmapVectorReader::<f32>::open_fvec(query_path)
+        .map_err(|e| format!("open query {}: {}", query_path.display(), e))?;
+    let total = <MmapVectorReader<f32> as VectorReader<f32>>::count(&reader);
+    let dim = <MmapVectorReader<f32> as VectorReader<f32>>::dim(&reader);
+    if n >= total {
+        return Ok(query_path.to_path_buf());
+    }
+
+    // Deterministic sample of `n` distinct indices in [0, total).
+    // Reservoir sampling for reproducibility across runs and engines;
+    // independent of `total` value.
+    let mut rng = seed.max(1);
+    let mut next_u64 = || {
+        rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; rng
+    };
+    let mut indices: Vec<usize> = (0..n).collect();
+    for i in n..total {
+        let j = (next_u64() as usize) % (i + 1);
+        if j < n { indices[j] = i; }
+    }
+    indices.sort_unstable();
+
+    let out_path = workdir.join("sampled_query.fvec");
+    let mut f = std::io::BufWriter::with_capacity(
+        1 << 20,
+        std::fs::File::create(&out_path)
+            .map_err(|e| format!("create {}: {}", out_path.display(), e))?,
+    );
+    let dim_bytes = (dim as i32).to_le_bytes();
+    for &qi in &indices {
+        let s = reader.get_slice(qi);
+        f.write_all(&dim_bytes).map_err(|e| e.to_string())?;
+        for v in s {
+            f.write_all(&v.to_le_bytes()).map_err(|e| e.to_string())?;
+        }
+    }
+    f.flush().map_err(|e| e.to_string())?;
+
+    ui.log(&format!(
+        "  sampled {} of {} queries (seed={}) → {}",
+        n, total, seed, out_path.display(),
+    ));
+    Ok(out_path)
+}
+
 fn error(msg: impl Into<String>, start: Instant) -> CommandResult {
     CommandResult { status: Status::Error, message: msg.into(), produced: vec![], elapsed: start.elapsed() }
 }
@@ -983,6 +1106,7 @@ fn run_blas_mirror(
     metric: &str,
     assume_normalized: bool,
     use_proper_cosine: bool,
+    ui: &mut veks_core::ui::UiHandle,
 ) -> Result<(), String> {
     use vectordata::VectorReader;
     use vectordata::io::MmapVectorReader;
@@ -1036,29 +1160,36 @@ fn run_blas_mirror(
         return Err(format!("dim mismatch: base={}, query={}", dim, qdim));
     }
 
-    // Load contiguous f32 payloads (strip the per-entry dim header).
-    let mut base_data: Vec<f32> = Vec::with_capacity(n_base * dim);
-    for i in 0..n_base {
-        base_data.extend_from_slice(base_reader.get_slice(i));
-    }
-    let mut query_data: Vec<f32> = Vec::with_capacity(n_query * dim);
-    for i in 0..n_query {
-        query_data.extend_from_slice(query_reader.get_slice(i));
-    }
-
-    // Precompute squared norms — used by L2 and proper-Cosine; cheap
-    // and unconditional, no branch in the hot loop.
-    let q_norms_sq: Vec<f32> = (0..n_query).map(|i| {
-        let s = &query_data[i * dim..(i + 1) * dim];
-        s.iter().map(|v| v * v).sum::<f32>()
-    }).collect();
-    let b_norms_sq: Vec<f32> = (0..n_base).map(|j| {
-        let s = &base_data[j * dim..(j + 1) * dim];
-        s.iter().map(|v| v * v).sum::<f32>()
-    }).collect();
+    // Streaming: do NOT eagerly copy base or query into Vec<f32>. The
+    // base file can be TB-scale; copying it would always OOM. Instead
+    // hold small per-block buffers that we fill from the mmap reader
+    // on each sgemm step. Memory footprint:
+    //   query_block_buf:    BS_X × dim × 4 bytes  (e.g., 4096 × 384 × 4 = 6 MB)
+    //   base_block_buf:     BS_Y × dim × 4 bytes  (e.g., 1024 × 384 × 4 = 1.5 MB)
+    //   ip_block:           BS_X × BS_Y × 4 bytes (≈ 16 MB)
+    //   q_norms_sq:         n_query × 4 bytes      (10K queries → 40 KB)
+    //   b_norms_sq_block:   BS_Y × 4 bytes         (4 KB per block)
+    // Total: a few tens of MB regardless of base size. Hint sequential
+    // so the kernel reclaims pages behind the cursor.
+    base_reader.advise_sequential();
 
     const BS_X: usize = 4096; // FAISS distance_compute_blas_query_bs
     const BS_Y: usize = 1024; // FAISS distance_compute_blas_database_bs
+
+    let mut query_block_buf: Vec<f32> = vec![0f32; BS_X * dim];
+    let mut base_block_buf: Vec<f32> = vec![0f32; BS_Y * dim];
+    let mut ip_block = vec![0f32; BS_X * BS_Y];
+
+    // Query norms are small (n_query × 4 bytes). Compute up front via
+    // mmap reads; no full query Vec needed.
+    let q_norms_sq: Vec<f32> = (0..n_query).map(|i| {
+        let s = query_reader.get_slice(i);
+        s.iter().map(|v| v * v).sum::<f32>()
+    }).collect();
+
+    // Base norms are computed per BS_Y block on the fly — sized so the
+    // working set stays bounded regardless of n_base.
+    let mut b_norms_sq_block: Vec<f32> = vec![0f32; BS_Y];
 
     // Pull top-(k + margin) candidates from sgemm, then f64-rerank
     // down to the canonical top-k. Margin=3k empirically suffices
@@ -1068,17 +1199,54 @@ fn run_blas_mirror(
     let capacity = k + margin;
     let mut heaps: Vec<std::collections::BinaryHeap<Neighbor>> =
         (0..n_query).map(|_| std::collections::BinaryHeap::with_capacity(capacity + 1)).collect();
-    let mut ip_block = vec![0f32; BS_X * BS_Y];
+
+    // Progress bar for the per-block sgemm scan. Total work is
+    // (n_query / BS_X) outer × n_base inner blocks; we display at
+    // base granularity since base dominates. With ~1B base / 1024
+    // per block ≈ 1M inner iterations, we update every 32 blocks
+    // so the bar feels responsive without atomic-store overhead.
+    let pb = ui.bar_with_unit(
+        n_base as u64,
+        format!(
+            "blas-mirror sgemm: {} queries × {} base, dim={}, mode={}",
+            n_query, n_base, dim,
+            match mode {
+                MirrorMode::L2 => "L2",
+                MirrorMode::Ip => "IP",
+                MirrorMode::CosineProper => "Cosine(proper)",
+            },
+        ),
+        "base",
+    );
 
     let mut i0 = 0;
     while i0 < n_query {
         let i1 = (i0 + BS_X).min(n_query);
         let nxi = i1 - i0;
 
+        // Fill query block from mmap.
+        for qi_local in 0..nxi {
+            let dst = qi_local * dim;
+            query_block_buf[dst..dst + dim].copy_from_slice(query_reader.get_slice(i0 + qi_local));
+        }
+
         let mut j0 = 0;
+        let mut blocks_since_tick = 0usize;
+        const TICK_EVERY_N_BLOCKS: usize = 32;
         while j0 < n_base {
             let j1 = (j0 + BS_Y).min(n_base);
             let nyi = j1 - j0;
+
+            // Fill base block from mmap, computing per-block norms in
+            // the same pass.
+            for bi_local in 0..nyi {
+                let src = base_reader.get_slice(j0 + bi_local);
+                let dst = bi_local * dim;
+                base_block_buf[dst..dst + dim].copy_from_slice(src);
+                let mut s = 0.0f32;
+                for v in src { s += v * v; }
+                b_norms_sq_block[bi_local] = s;
+            }
 
             // Row-major equivalent of FAISS's column-major sgemm.
             // Result `ip_block[i * nyi + j]` = query[i0+i] · base[j0+j].
@@ -1087,8 +1255,8 @@ fn run_blas_mirror(
                     CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_TRANS,
                     nxi as i32, nyi as i32, dim as i32,
                     1.0,
-                    query_data.as_ptr().add(i0 * dim), dim as i32,
-                    base_data.as_ptr().add(j0 * dim),  dim as i32,
+                    query_block_buf.as_ptr(), dim as i32,
+                    base_block_buf.as_ptr(),  dim as i32,
                     0.0,
                     ip_block.as_mut_ptr(), nyi as i32,
                 );
@@ -1103,7 +1271,7 @@ fn run_blas_mirror(
                 let row = &ip_block[qi_local * nyi..qi_local * nyi + nyi];
                 for bi_local in 0..nyi {
                     let bi_global = j0 + bi_local;
-                    let bn = b_norms_sq[bi_global];
+                    let bn = b_norms_sq_block[bi_local];
                     let ip = row[bi_local];
                     let dis: f32 = match mode {
                         MirrorMode::L2 => {
@@ -1135,26 +1303,37 @@ fn run_blas_mirror(
                 }
             }
 
+            // Release pages we just streamed past. Aligned MADV_DONTNEED
+            // keeps RSS bounded (without the page-aligned fix in
+            // vectordata::io::release_range, this would be a no-op).
+            base_reader.release_range(j0, j1);
+            blocks_since_tick += 1;
+            if blocks_since_tick >= TICK_EVERY_N_BLOCKS {
+                pb.set_position(j1 as u64);
+                blocks_since_tick = 0;
+            }
             j0 = j1;
         }
         i0 = i1;
     }
+    pb.finish();
 
     // Rerank every query's top-(k + margin) candidates through the
-    // shared f64-direct kernel to produce canonical top-k.
+    // shared f64-direct kernel to produce canonical top-k. Both the
+    // query slice and the per-candidate base slices are read directly
+    // from mmap — no need to keep a contiguous Vec of either.
     let reranked: Vec<Vec<Neighbor>> = (0..n_query)
         .map(|qi| {
             let heap = std::mem::take(&mut heaps[qi]);
             let cands: Vec<Neighbor> = heap.into_vec();
-            let q_start = qi * dim;
-            let query_slice = &query_data[q_start..q_start + dim];
+            let query_slice = query_reader.get_slice(qi);
             super::knn_segment::rerank_topk_f64(
                 query_slice, &cands, k,
                 rerank_metric,
                 |idx| {
-                    let s = idx as usize * dim;
-                    if s + dim <= base_data.len() {
-                        Some(&base_data[s..s + dim])
+                    let i = idx as usize;
+                    if i < n_base {
+                        Some(base_reader.get_slice(i))
                     } else {
                         None
                     }

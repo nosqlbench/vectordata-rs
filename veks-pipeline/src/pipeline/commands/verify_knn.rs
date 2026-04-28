@@ -117,6 +117,8 @@ fn find_top_k_batch_pairwise_f32(
         .collect();
     let mut thresholds = vec![f32::INFINITY; batch_size];
 
+    let mut reclaim = vectordata::io::StreamReclaim::new(base_reader, start, end);
+
     for i in start..end {
         let base_vec = base_reader.get_slice(i);
         let idx = i as u32;
@@ -134,7 +136,10 @@ fn find_top_k_batch_pairwise_f32(
                 }
             }
         }
+
+        reclaim.advance(i);
     }
+    drop(reclaim);
 
     for (qi, heap) in heaps.into_iter().enumerate() {
         let mut v: Vec<Neighbor> = heap.into_vec();
@@ -175,6 +180,14 @@ fn find_top_k_batch_transposed_f32(
 
     let mut dist_buf = [0.0f32; SIMD_BATCH_WIDTH];
 
+    // Resource cooperation: this scans `[start..end)` of the
+    // mmap-backed base. On TB-scale bases the working set otherwise
+    // accumulates in RSS without bound — see verify dataset-knnutils
+    // for the same fix. advise_sequential lets the kernel free
+    // behind the cursor, and explicit MADV_DONTNEED on each 256 MiB
+    // window keeps RSS bounded even when there's no memory pressure.
+    let mut reclaim = vectordata::io::StreamReclaim::new(base_reader, start, end);
+
     for i in start..end {
         let base_vec = base_reader.get_slice(i);
         let idx = i as u32;
@@ -198,7 +211,10 @@ fn find_top_k_batch_transposed_f32(
                 }
             }
         }
+
+        reclaim.advance(i);
     }
+    drop(reclaim);
 
     for (qi, heap) in heaps.into_iter().enumerate() {
         let mut v: Vec<Neighbor> = heap.into_vec();
@@ -246,6 +262,8 @@ fn find_top_k_batch_pairwise_f16(
         .collect();
     let mut thresholds = vec![f32::INFINITY; batch_size];
 
+    let mut reclaim = vectordata::io::StreamReclaim::new(base_reader, start, end);
+
     for i in start..end {
         let base_vec = base_reader.get_slice(i);
         let idx = i as u32;
@@ -263,7 +281,10 @@ fn find_top_k_batch_pairwise_f16(
                 }
             }
         }
+
+        reclaim.advance(i);
     }
+    drop(reclaim);
 
     for (qi, heap) in heaps.into_iter().enumerate() {
         let mut v: Vec<Neighbor> = heap.into_vec();
@@ -305,6 +326,8 @@ fn find_top_k_batch_transposed_f16(
     let mut base_f32 = vec![0.0f32; dim];
     let mut dist_buf = [0.0f32; SIMD_BATCH_WIDTH];
 
+    let mut reclaim = vectordata::io::StreamReclaim::new(base_reader, start, end);
+
     for i in start..end {
         let base_f16 = base_reader.get_slice(i);
         let idx = i as u32;
@@ -330,7 +353,10 @@ fn find_top_k_batch_transposed_f16(
                 }
             }
         }
+
+        reclaim.advance(i);
     }
+    drop(reclaim);
 
     for (qi, heap) in heaps.into_iter().enumerate() {
         let mut v: Vec<Neighbor> = heap.into_vec();
@@ -358,6 +384,8 @@ fn find_top_k_batch_pairwise_f64(
         .collect();
     let mut thresholds = vec![f32::INFINITY; batch_size];
 
+    let mut reclaim = vectordata::io::StreamReclaim::new(base_reader, start, end);
+
     for i in start..end {
         let base_vec = base_reader.get_slice(i);
         let idx = i as u32;
@@ -375,7 +403,10 @@ fn find_top_k_batch_pairwise_f64(
                 }
             }
         }
+
+        reclaim.advance(i);
     }
+    drop(reclaim);
 
     for (qi, heap) in heaps.into_iter().enumerate() {
         let mut v: Vec<Neighbor> = heap.into_vec();
@@ -874,22 +905,33 @@ impl CommandOp for VerifyKnnOp {
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
         let start = Instant::now();
 
-        // -- Parse required options -------------------------------------------
+        // Up-front: confirm the local dataset has the minimum facets
+        // this verify command requires, and report the scope to the
+        // user before any work runs. See pipeline::dataset_lookup.
+        if let Err(e) = crate::pipeline::dataset_lookup::validate_and_log(
+            ctx, options, crate::pipeline::dataset_lookup::VerifyKind::KnnGroundtruth,
+        ) {
+            return error_result(e, start);
+        }
 
-        let base_str = match options.require("base") {
-            Ok(s) => s,
-            Err(e) => return error_result(e, start),
-        };
-        let query_str = match options.require("query") {
-            Ok(s) => s,
-            Err(e) => return error_result(e, start),
-        };
-        let indices_str = match options.require("indices") {
-            Ok(s) => s,
-            Err(e) => return error_result(e, start),
-        };
+        // -- Parse required options -------------------------------------------
+        //
+        // Standalone-friendly: missing input paths are resolved from
+        // the active profile's `base_vectors` / `query_vectors` /
+        // `neighbor_indices` facets in `dataset.yaml`. See
+        // `pipeline::dataset_lookup`.
+
+        let base_str = match crate::pipeline::dataset_lookup::resolve_path_option(
+            ctx, options, "base", "base_vectors",
+        ) { Ok(s) => s, Err(e) => return error_result(e, start) };
+        let query_str = match crate::pipeline::dataset_lookup::resolve_path_option(
+            ctx, options, "query", "query_vectors",
+        ) { Ok(s) => s, Err(e) => return error_result(e, start) };
+        let indices_str = match crate::pipeline::dataset_lookup::resolve_path_option(
+            ctx, options, "indices", "neighbor_indices",
+        ) { Ok(s) => s, Err(e) => return error_result(e, start) };
         let output_str = match options.require("output") {
-            Ok(s) => s,
+            Ok(s) => s.to_string(),
             Err(e) => return error_result(e, start),
         };
 
@@ -949,14 +991,14 @@ impl CommandOp for VerifyKnnOp {
 
         // -- Resolve paths ----------------------------------------------------
 
-        let base_source = match resolve_source(base_str, &ctx.workspace) {
+        let base_source = match resolve_source(&base_str, &ctx.workspace) {
             Ok(s) => s,
             Err(e) => return error_result(e, start),
         };
         let base_path = base_source.path.clone();
-        let query_path = resolve_path(query_str, &ctx.workspace);
-        let indices_path = resolve_path(indices_str, &ctx.workspace);
-        let output_path = resolve_path(output_str, &ctx.workspace);
+        let query_path = resolve_path(&query_str, &ctx.workspace);
+        let indices_path = resolve_path(&indices_str, &ctx.workspace);
+        let output_path = resolve_path(&output_str, &ctx.workspace);
 
         // Create output directory if needed
         if let Some(parent) = output_path.parent() {
@@ -1004,9 +1046,21 @@ impl CommandOp for VerifyKnnOp {
                 .into_vec()
         };
 
+        // Engine label: the verifier dispatches by element type into a
+        // SimSIMD-backed kernel (f32/f16 paths) plus a canonical f64
+        // rerank for boundary stability. Shown so the user can
+        // correlate output behavior with kernel choice.
+        let engine_label = match etype {
+            ElementType::F32 => "SimSIMD AVX-512 (f32) + canonical f64 rerank",
+            ElementType::F16 => "SimSIMD AVX-512 (f16, f32 accumulator) + canonical f64 rerank",
+            ElementType::F64 => "scalar f64 (no SIMD path for dvec)",
+            _ => "(element-type-specific kernel)",
+        };
         ctx.ui.log(&format!(
-            "verify knn: {} sampled queries out of {}, k={}, metric={:?}, phi={}, seed={}, threads={}, type={}",
-            sampled.len(), indices_count, k, metric, phi, seed, threads, etype
+            "verify knn-groundtruth: KNN ground truth (single profile) via {}; \
+             sample={} of {} queries, k={}, metric={:?}, phi={}, seed={}, threads={}",
+            engine_label,
+            sampled.len(), indices_count, k, metric, phi, seed, threads,
         ));
 
         // -- Dispatch by element type -----------------------------------------

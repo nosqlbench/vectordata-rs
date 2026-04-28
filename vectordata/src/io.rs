@@ -125,6 +125,23 @@ pub trait VectorReader<T>: Send + Sync {
     fn count(&self) -> usize;
     /// Retrieves the vector at the specified index.
     fn get(&self, index: usize) -> Result<Vec<T>, IoError>;
+
+    /// Try to access the vector at `index` as a borrowed slice
+    /// without copying. Returns `None` when the underlying storage
+    /// can't satisfy the request without materializing — e.g.,
+    /// HTTP-backed readers that need to range-fetch on each call,
+    /// or formats that need per-element decoding.
+    ///
+    /// The mmap-backed concrete readers in this crate override
+    /// this to return `Some(&self.mmap[...])` — a true zero-copy
+    /// view into the file's mapped pages. Hot-path consumers can
+    /// branch on `Some` to avoid the `get(...)` allocation.
+    ///
+    /// The default returns `None`, so non-mmap implementations
+    /// continue to work unchanged.
+    fn get_slice(&self, _index: usize) -> Option<&[T]> {
+        None
+    }
 }
 
 /// Trait for types that can be decoded from little-endian bytes.
@@ -477,22 +494,39 @@ impl<T> MmapVectorReader<T> {
     /// no longer needed.
     ///
     /// Issues `madvise(MADV_DONTNEED)` on the byte range, allowing the
-    /// kernel to evict those pages from the page cache. Use this after
-    /// completing a partition scan to reduce page cache pressure.
+    /// kernel to drop those pages from the process's page tables (so
+    /// they no longer count against RSS) and reuse them under memory
+    /// pressure. Use this after completing a partition scan to reduce
+    /// resident-set growth on streaming reads.
+    ///
+    /// Requires page-aligned start and length. The vector entry size
+    /// is generally not a multiple of the page size (e.g., 1540 bytes
+    /// at dim=384 fvec), so we align the start UP and the length DOWN
+    /// to the nearest page. Bytes in the sub-page slack at the
+    /// boundaries stay mapped, but it's at most one page on each side
+    /// — negligible compared to the megabyte-or-larger windows
+    /// typical callers pass in. Without alignment, madvise rejects
+    /// the call with `EINVAL` silently and resident size keeps
+    /// growing — see verify dataset-knnutils on TB-scale base files.
     pub fn release_range(&self, start: usize, end: usize) {
         let byte_start = start * self.entry_size;
         let byte_end = std::cmp::min(end * self.entry_size, self.mmap.len());
-        let byte_len = byte_end.saturating_sub(byte_start);
-        if byte_len > 0 {
-            // memmap2's Advice enum doesn't expose DONTNEED; use libc directly.
-            #[cfg(unix)]
-            unsafe {
-                libc::madvise(
-                    self.mmap.as_ptr().add(byte_start) as *mut libc::c_void,
-                    byte_len,
-                    libc::MADV_DONTNEED,
-                );
-            }
+        if byte_start >= byte_end { return; }
+
+        #[cfg(unix)]
+        unsafe {
+            let page = libc::sysconf(libc::_SC_PAGESIZE) as usize;
+            if page == 0 { return; }
+            // Align start up, end down.
+            let aligned_start = (byte_start + page - 1) & !(page - 1);
+            let aligned_end = byte_end & !(page - 1);
+            if aligned_end <= aligned_start { return; }
+            let len = aligned_end - aligned_start;
+            libc::madvise(
+                self.mmap.as_ptr().add(aligned_start) as *mut libc::c_void,
+                len,
+                libc::MADV_DONTNEED,
+            );
         }
     }
 
@@ -536,6 +570,88 @@ impl<T> MmapVectorReader<T> {
             if let Some(counter) = bytes_paged {
                 counter.fetch_add(page_size as u64, std::sync::atomic::Ordering::Relaxed);
             }
+        }
+    }
+}
+
+/// Streaming-scan resource manager for `MmapVectorReader`.
+///
+/// The problem this solves: a sequential mmap scan over a TB-scale
+/// file accumulates pages in process RSS once they're touched. The
+/// kernel only reclaims under memory pressure, so on RAM-rich
+/// machines RSS climbs to the file size — well past any sensible
+/// resource ceiling — before any reclaim happens.
+///
+/// `MADV_SEQUENTIAL` alone is insufficient: it lets the kernel free
+/// pages behind the cursor when convenient, but doesn't force it.
+/// `MADV_DONTNEED` is the active form, but must be issued
+/// page-aligned (handled by [`MmapVectorReader::release_range`]).
+///
+/// `StreamReclaim` wraps the pattern: advise sequential up front,
+/// release a fixed-byte trailing window each time the cursor
+/// crosses a window boundary, and release any remainder on drop.
+///
+/// Usage:
+/// ```ignore
+/// let mut rec = StreamReclaim::new(&base_reader, start, end);
+/// for i in start..end {
+///     let v = base_reader.get_slice(i);
+///     // ... do work ...
+///     rec.advance(i);
+/// }
+/// // drop releases the trailing tail
+/// ```
+pub struct StreamReclaim<'a, T> {
+    reader: &'a MmapVectorReader<T>,
+    last_released: usize,
+    end: usize,
+    reclaim_window_records: usize,
+}
+
+impl<'a, T> StreamReclaim<'a, T> {
+    /// Default 256 MiB reclaim windows. A reasonable trade-off:
+    /// large enough that the per-window `madvise` overhead is
+    /// negligible, small enough that resident-set growth is bounded.
+    pub fn new(reader: &'a MmapVectorReader<T>, start: usize, end: usize) -> Self {
+        Self::with_reclaim_bytes(reader, start, end, 256 * 1024 * 1024)
+    }
+
+    pub fn with_reclaim_bytes(
+        reader: &'a MmapVectorReader<T>,
+        start: usize,
+        end: usize,
+        reclaim_bytes: usize,
+    ) -> Self {
+        reader.advise_sequential();
+        let entry_size = reader.entry_size().max(1);
+        let reclaim_window_records = (reclaim_bytes / entry_size).max(1024);
+        Self {
+            reader,
+            last_released: start,
+            end,
+            reclaim_window_records,
+        }
+    }
+
+    /// Call after touching index `i`. Releases the trailing window
+    /// when `i` crosses a window boundary. Cheap when the boundary
+    /// hasn't been crossed yet (one comparison + branch).
+    #[inline]
+    pub fn advance(&mut self, i: usize) {
+        if i >= self.last_released + self.reclaim_window_records {
+            self.reader.release_range(
+                self.last_released,
+                self.last_released + self.reclaim_window_records,
+            );
+            self.last_released += self.reclaim_window_records;
+        }
+    }
+}
+
+impl<'a, T> Drop for StreamReclaim<'a, T> {
+    fn drop(&mut self) {
+        if self.last_released < self.end {
+            self.reader.release_range(self.last_released, self.end);
         }
     }
 }
@@ -653,6 +769,11 @@ impl VectorReader<f32> for MmapVectorReader<f32> {
         self.count
     }
 
+    fn get_slice(&self, index: usize) -> Option<&[f32]> {
+        if index >= self.count { return None; }
+        Some(MmapVectorReader::<f32>::get_slice(self, index))
+    }
+
     fn get(&self, index: usize) -> Result<Vec<f32>, IoError> {
         if index >= self.count {
             return Err(IoError::OutOfBounds(index));
@@ -668,10 +789,10 @@ impl VectorReader<f32> for MmapVectorReader<f32> {
 
         let vector_start = start + 4;
         let vector_end = vector_start + self.dim * 4;
-        
+
         let mut vector = Vec::with_capacity(self.dim);
         let mut cursor = Cursor::new(&self.mmap[vector_start..vector_end]);
-        
+
         for _ in 0..self.dim {
             vector.push(cursor.read_f32::<LittleEndian>()?);
         }
@@ -750,6 +871,11 @@ impl VectorReader<i32> for MmapVectorReader<i32> {
 
     fn count(&self) -> usize {
         self.count
+    }
+
+    fn get_slice(&self, index: usize) -> Option<&[i32]> {
+        if index >= self.count { return None; }
+        Some(MmapVectorReader::<i32>::get_slice(self, index))
     }
 
     fn get(&self, index: usize) -> Result<Vec<i32>, IoError> {
@@ -848,6 +974,11 @@ impl VectorReader<half::f16> for MmapVectorReader<half::f16> {
         self.count
     }
 
+    fn get_slice(&self, index: usize) -> Option<&[half::f16]> {
+        if index >= self.count { return None; }
+        Some(MmapVectorReader::<half::f16>::get_slice(self, index))
+    }
+
     fn get(&self, index: usize) -> Result<Vec<half::f16>, IoError> {
         if index >= self.count {
             return Err(IoError::OutOfBounds(index));
@@ -943,6 +1074,11 @@ impl VectorReader<f64> for MmapVectorReader<f64> {
         self.count
     }
 
+    fn get_slice(&self, index: usize) -> Option<&[f64]> {
+        if index >= self.count { return None; }
+        Some(MmapVectorReader::<f64>::get_slice(self, index))
+    }
+
     fn get(&self, index: usize) -> Result<Vec<f64>, IoError> {
         if index >= self.count {
             return Err(IoError::OutOfBounds(index));
@@ -1030,6 +1166,11 @@ impl VectorReader<u8> for MmapVectorReader<u8> {
         self.count
     }
 
+    fn get_slice(&self, index: usize) -> Option<&[u8]> {
+        if index >= self.count { return None; }
+        Some(MmapVectorReader::<u8>::get_slice(self, index))
+    }
+
     fn get(&self, index: usize) -> Result<Vec<u8>, IoError> {
         if index >= self.count {
             return Err(IoError::OutOfBounds(index));
@@ -1113,6 +1254,11 @@ impl VectorReader<i16> for MmapVectorReader<i16> {
 
     fn count(&self) -> usize {
         self.count
+    }
+
+    fn get_slice(&self, index: usize) -> Option<&[i16]> {
+        if index >= self.count { return None; }
+        Some(MmapVectorReader::<i16>::get_slice(self, index))
     }
 
     fn get(&self, index: usize) -> Result<Vec<i16>, IoError> {

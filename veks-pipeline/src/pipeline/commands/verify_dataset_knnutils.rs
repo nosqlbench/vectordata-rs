@@ -103,6 +103,7 @@ fn check_fvecs(
     path: &Path,
     tol_norm: f64,
     tol_zero: f64,
+    ui: &veks_core::ui::UiHandle,
 ) -> Result<FvecsCheckResult, String> {
     let reader = MmapVectorReader::<f32>::open_fvec(path)
         .map_err(|e| format!("open {}: {}", path.display(), e))?;
@@ -120,6 +121,22 @@ fn check_fvecs(
     let mut norm_min: f64 = f64::INFINITY;
     let mut norm_max: f64 = f64::NEG_INFINITY;
 
+    // Resource cooperation: the file may be many TB. mmap'd pages
+    // count toward RSS once touched, and on machines under no
+    // immediate memory pressure the kernel can let RSS grow right up
+    // to the governor's ceiling before reclaiming. `StreamReclaim`
+    // handles MADV_SEQUENTIAL + per-window MADV_DONTNEED so resident
+    // pages stay bounded to ~256 MiB regardless of dim or RAM.
+    let mut reclaim = vectordata::io::StreamReclaim::new(&reader, 0, count);
+
+    let pb_label = format!("checking fvecs: {}", path.file_name()
+        .map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "<input>".into()));
+    let pb = ui.bar_with_unit(count as u64, pb_label, "vectors");
+    // Update progress in 1<<14 chunks. PlainSink throttles renders to
+    // every 250-500 ms internally, so the position update itself is
+    // lock-only and cheap; the chunk size keeps the per-iteration
+    // overhead negligible while still giving a smooth-looking bar.
+    const PB_CHUNK: usize = 1 << 14;
     for i in 0..count {
         let slice = reader.get_slice(i);
         let norm = blas_snrm2(slice) as f64;
@@ -135,7 +152,13 @@ fn check_fvecs(
         if norm < tol_zero {
             zero_count += 1;
         }
+        if i % PB_CHUNK == 0 {
+            pb.set_position(i as u64);
+        }
+        reclaim.advance(i);
     }
+    drop(reclaim);
+    pb.finish();
 
     let norm_mean = norm_sum / count as f64;
     let max_abs_dev = (norm_min - 1.0).abs().max((norm_max - 1.0).abs());
@@ -159,6 +182,7 @@ fn check_ivecs(
     path: &Path,
     required_k: usize,
     max_valid_ordinal: usize,
+    ui: &veks_core::ui::UiHandle,
 ) -> Result<IvecsCheckResult, String> {
     let reader = MmapVectorReader::<i32>::open_ivec(path)
         .map_err(|e| format!("open {}: {}", path.display(), e))?;
@@ -171,7 +195,18 @@ fn check_ivecs(
     let mut truncated_rows: usize = 0;
     let mut overlong_rows: usize = 0;
 
+    // Same resource-cooperation strategy as check_fvecs.
+    let mut reclaim = vectordata::io::StreamReclaim::new(&reader, 0, num_rows);
+
+    let pb_label = format!("checking ivecs: {}", path.file_name()
+        .map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "<input>".into()));
+    let pb = ui.bar_with_unit(num_rows as u64, pb_label, "rows");
+    const PB_CHUNK: usize = 1 << 12;
     for i in 0..num_rows {
+        if i % PB_CHUNK == 0 {
+            pb.set_position(i as u64);
+        }
+        reclaim.advance(i);
         let row = reader.get_slice(i);
         let actual_k = row.len();
 
@@ -200,6 +235,8 @@ fn check_ivecs(
         if has_negative { negative_rows += 1; }
         if has_dup { duplicate_rows += 1; }
     }
+    drop(reclaim);
+    pb.finish();
 
     let ordinal_in_range = max_ordinal < 0 || (max_ordinal as usize) < max_valid_ordinal;
     let passed = duplicate_rows == 0
@@ -334,20 +371,29 @@ checks, in a single pipeline step.
         // every other BLAS-touching command (see pipeline::blas_abi).
         crate::pipeline::blas_abi::set_single_threaded_if_faiss();
 
-        let base_str = match options.require("base") {
-            Ok(s) => s, Err(e) => return error_result(e, start),
-        };
-        let query_str = match options.require("query") {
-            Ok(s) => s, Err(e) => return error_result(e, start),
-        };
-        let indices_str = match options.require("indices") {
-            Ok(s) => s, Err(e) => return error_result(e, start),
-        };
-        let k: usize = match options.require("neighbors") {
-            Ok(s) => match s.parse() {
-                Ok(n) if n > 0 => n,
-                _ => return error_result(format!("invalid neighbors: '{}'", s), start),
-            },
+        // Up-front: confirm the local dataset has the minimum facets
+        // this verify kind requires (see pipeline::dataset_lookup).
+        if let Err(e) = crate::pipeline::dataset_lookup::validate_and_log(
+            ctx, options, crate::pipeline::dataset_lookup::VerifyKind::DatasetKnnutils,
+        ) {
+            return error_result(e, start);
+        }
+
+        // Standalone-friendly: input paths come from the active
+        // profile's facets in dataset.yaml (see pipeline::dataset_lookup).
+        let base_str = match crate::pipeline::dataset_lookup::resolve_path_option(
+            ctx, options, "base", "base_vectors",
+        ) { Ok(s) => s, Err(e) => return error_result(e, start) };
+        let query_str = match crate::pipeline::dataset_lookup::resolve_path_option(
+            ctx, options, "query", "query_vectors",
+        ) { Ok(s) => s, Err(e) => return error_result(e, start) };
+        let indices_str = match crate::pipeline::dataset_lookup::resolve_path_option(
+            ctx, options, "indices", "neighbor_indices",
+        ) { Ok(s) => s, Err(e) => return error_result(e, start) };
+        // Standalone-friendly: `--neighbors` defaults to the active
+        // profile's `maxk` in dataset.yaml when unset.
+        let k: usize = match crate::pipeline::dataset_lookup::resolve_neighbors(ctx, options) {
+            Ok(n) => n,
             Err(e) => return error_result(e, start),
         };
         let tol_norm: f64 = match options.parse_or("tol-norm", 1e-5_f64) {
@@ -361,14 +407,31 @@ checks, in a single pipeline step.
             Ok(v) => v, Err(e) => return error_result(e, start),
         };
 
-        let base_path = resolve_path(base_str, &ctx.workspace);
-        let query_path = resolve_path(query_str, &ctx.workspace);
-        let indices_path = resolve_path(indices_str, &ctx.workspace);
+        let base_path = resolve_path(&base_str, &ctx.workspace);
+        let query_path = resolve_path(&query_str, &ctx.workspace);
+        let indices_path = resolve_path(&indices_str, &ctx.workspace);
 
         let report_path = match options.get("report") {
             Some(s) => resolve_path(s, &ctx.workspace),
             None => ctx.workspace.join(".cache/verify_dataset_knnutils.txt"),
         };
+
+        // Banner: tell the user up-front what's about to happen and at
+        // what scale. Cheap to compute — just peek at the query file
+        // header for the total count via mmap.
+        let query_total = MmapVectorReader::<f32>::open_fvec(&query_path)
+            .map(|r| <MmapVectorReader<f32> as VectorReader<f32>>::count(&r))
+            .ok();
+        let actual_sample = sample_count.min(query_total.unwrap_or(sample_count));
+        let total_str = match query_total {
+            Some(t) => format!("{}", t),
+            None => "?".to_string(),
+        };
+        ctx.ui.log(&format!(
+            "verify dataset-knnutils: norm/zero + neighbor sanity + KNN sample-recompute via BLAS sgemm \
+             (single-threaded, MKL-safe); sample={} of {} queries, k={}, metric={}",
+            actual_sample, total_str, k, metric_str,
+        ));
 
         let mut report = Vec::<String>::new();
         let mut all_passed = true;
@@ -385,7 +448,7 @@ checks, in a single pipeline step.
         // ── fvecs check: base vectors ───────────────────────────────────
         emit(ctx, &format!("--- Base Vectors: {} ---", base_path.display()));
 
-        let base_result = match check_fvecs(&base_path, tol_norm, tol_zero) {
+        let base_result = match check_fvecs(&base_path, tol_norm, tol_zero, &ctx.ui) {
             Ok(r) => r,
             Err(e) => {
                 emit(ctx, &format!("  FAIL: {}", e));
@@ -415,7 +478,7 @@ checks, in a single pipeline step.
         // ── fvecs check: query vectors ──────────────────────────────────
         emit(ctx, &format!("--- Query Vectors: {} ---", query_path.display()));
 
-        let query_result = match check_fvecs(&query_path, tol_norm, tol_zero) {
+        let query_result = match check_fvecs(&query_path, tol_norm, tol_zero, &ctx.ui) {
             Ok(r) => r,
             Err(e) => {
                 emit(ctx, &format!("  FAIL: {}", e));
@@ -445,7 +508,7 @@ checks, in a single pipeline step.
         // ── ivecs check: ground truth ───────────────────────────────────
         emit(ctx, &format!("--- Ground Truth: {} ---", indices_path.display()));
 
-        let ivecs_result = match check_ivecs(&indices_path, k, base_result.count) {
+        let ivecs_result = match check_ivecs(&indices_path, k, base_result.count, &ctx.ui) {
             Ok(r) => r,
             Err(e) => {
                 emit(ctx, &format!("  FAIL: {}", e));
@@ -562,12 +625,64 @@ checks, in a single pipeline step.
 
         let dim = base_result.dim;
 
-        // Load all base vectors
+        // The KNN sample-recompute step copies the full base file
+        // into a Vec<f32> and runs sgemm against the sampled queries
+        // in one shot. That's fine for medium datasets but allocates
+        // base_count × dim × 4 bytes — 1.5 TB for a billion-vector
+        // base — which would always blow past the governor's mem
+        // ceiling. Cooperate with the governor: skip this step when
+        // the projected RSS exceeds 50% of the configured ceiling,
+        // and tell the user why.
+        let projected_bytes = (base_result.count as u64) * (dim as u64) * 4;
+        let mem_budget = ctx.governor.current_or("mem", u64::MAX);
+        let safe_budget = mem_budget / 2;
+        if projected_bytes > safe_budget {
+            emit(ctx, &format!(
+                "  Skipping KNN sample-recompute: would allocate {:.1} GiB (50% of mem budget = {:.1} GiB).",
+                projected_bytes as f64 / (1u64 << 30) as f64,
+                safe_budget as f64 / (1u64 << 30) as f64,
+            ));
+            emit(ctx, "  Use `verify knn-consolidated` (or `verify knn-faiss-consolidated`) for \
+                       streaming KNN verification on large bases.");
+            // Skip the rest of this section but don't fail the
+            // command — file-level checks have already passed.
+            let elapsed = start.elapsed();
+            let final_status = if all_passed { "PASS" } else { "FAIL" };
+            emit(ctx, &format!("\n=== Verification {} ({:.1}s) ===", final_status, elapsed.as_secs_f64()));
+            if let Some(parent) = report_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            match std::fs::write(&report_path, report.join("\n")) {
+                Ok(_) => ctx.ui.log(&format!("  Report saved to {}", report_path.display())),
+                Err(e) => ctx.ui.log(&format!("  Warning: failed to write report: {}", e)),
+            }
+            return CommandResult {
+                status: if all_passed { Status::Ok } else { Status::Error },
+                message: format!("dataset-knnutils {} ({:.1}s) — KNN sample skipped (large base)",
+                    final_status, elapsed.as_secs_f64()),
+                produced: vec![],
+                elapsed,
+            };
+        }
+
+        // Load all base vectors. On large datasets this moves GBs
+        // through memory; emit a progress bar so a standalone
+        // invocation isn't silent during the load.
         emit(ctx, "  Loading base vectors for verification...");
         let mut base_data: Vec<f32> = Vec::with_capacity(base_result.count * dim);
+        let pb_load = ctx.ui.bar_with_unit(
+            base_result.count as u64,
+            "loading base vectors",
+            "vectors",
+        );
+        const PB_LOAD_CHUNK: usize = 1 << 14;
         for i in 0..base_result.count {
             base_data.extend_from_slice(base_reader.get_slice(i));
+            if i % PB_LOAD_CHUNK == 0 {
+                pb_load.set_position(i as u64);
+            }
         }
+        pb_load.finish();
 
         // Generate deterministic sample indices
         let mut sample_indices: Vec<usize> = Vec::with_capacity(actual_sample);

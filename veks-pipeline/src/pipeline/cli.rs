@@ -31,12 +31,30 @@ use super::resource::ResourceType;
 /// Commands are grouped by their first word (e.g. `"analyze"`, `"generate"`)
 /// and each group becomes a subcommand containing its individual commands as
 /// nested subcommands with `Arg` entries derived from `describe_options()`.
+/// Collect each pipeline command's `value_completions()` into a flat
+/// map keyed by full command path (e.g., `"verify engine-parity"`).
+/// Consumed by the shell-completion engine to attach per-leaf value
+/// providers without round-tripping through clap's Arg metadata.
+pub fn pipeline_value_completions() -> BTreeMap<String, std::collections::HashMap<String, super::command::ValueCompletions>> {
+    let registry = CommandRegistry::with_builtins();
+    let mut out = BTreeMap::new();
+    for path in registry.command_paths() {
+        let factory = registry.get(path).unwrap();
+        let cmd = factory();
+        let vc = cmd.value_completions();
+        if !vc.is_empty() {
+            out.insert(path.to_string(), vc);
+        }
+    }
+    out
+}
+
 pub fn build_pipeline_command() -> Command {
     let registry = CommandRegistry::with_builtins();
     let paths = registry.command_paths();
 
     // Group command paths by first word.
-    let mut groups: BTreeMap<String, Vec<(String, Vec<super::command::OptionDesc>, super::command::CommandDoc, Vec<super::command::ResourceDesc>)>> =
+    let mut groups: BTreeMap<String, Vec<(String, Vec<super::command::OptionDesc>, super::command::CommandDoc, Vec<super::command::ResourceDesc>, std::collections::HashMap<String, super::command::ValueCompletions>)>> =
         BTreeMap::new();
 
     for path in &paths {
@@ -50,8 +68,9 @@ pub fn build_pipeline_command() -> Command {
         let opts = cmd.describe_options();
         let doc = cmd.command_doc();
         let resources = cmd.describe_resources();
+        let value_completions = cmd.value_completions();
 
-        groups.entry(group).or_default().push((subname, opts, doc, resources));
+        groups.entry(group).or_default().push((subname, opts, doc, resources, value_completions));
     }
 
     let mut pipeline_cmd = Command::new("pipeline")
@@ -66,7 +85,7 @@ pub fn build_pipeline_command() -> Command {
             .arg_required_else_help(true)
             .disable_help_subcommand(true);
 
-        for (subname, opts, doc, resources) in commands {
+        for (subname, opts, doc, resources, value_completions) in commands {
             // Single-word commands (e.g. "survey") have no subname — attach
             // their options directly to the group command.
             let is_direct = subname.is_empty();
@@ -128,6 +147,14 @@ pub fn build_pipeline_command() -> Command {
                         let mut candidates = datafile_completer(current);
                         candidates.extend(variable_completer(current));
                         candidates
+                    }));
+                } else if let Some(vc) = value_completions.get(&opt.name).cloned() {
+                    // Enum-typed option with a declared value set.
+                    // For comma-separated lists, suggest only values
+                    // not already chosen so the user can chain
+                    // selections via repeated tab-completion.
+                    arg = arg.add(ArgValueCompleter::new(move |current: &OsStr| {
+                        enum_value_completer(current, &vc)
                     }));
                 } else {
                     // Non-path options get variable completion only.
@@ -253,6 +280,51 @@ fn print_pipeline_help(registry: &CommandRegistry, group: Option<&str>) {
             }
         }
     }
+}
+
+/// Completion candidates for an enum-typed option.
+///
+/// Two shapes:
+/// - **Single-value** (`vc.comma_separated == false`): returns the
+///   declared values whose name starts with the current prefix.
+/// - **Comma-separated list** (`vc.comma_separated == true`): parses
+///   `current` as `<already>,<partial>` where `<already>` is a
+///   trailing-comma-or-empty prefix the user has already typed and
+///   `<partial>` is the in-progress segment. Returns candidates of
+///   the form `<already><value>` for every declared value that:
+///     - is not already present in `<already>`, AND
+///     - starts with `<partial>`.
+///   This lets the user chain selections via repeated tab presses
+///   (`--engines metal,<TAB>` → suggests stdarch/blas/blas-mirror/faiss).
+pub fn enum_value_completer(
+    current: &OsStr,
+    vc: &super::command::ValueCompletions,
+) -> Vec<CompletionCandidate> {
+    let s = current.to_string_lossy();
+
+    if !vc.comma_separated {
+        return vc.values.iter()
+            .filter(|v| s.is_empty() || v.starts_with(&*s))
+            .map(|v| CompletionCandidate::new(v.as_str()))
+            .collect();
+    }
+
+    // Comma-separated path: split into "<already_chosen>,<partial>".
+    let (already, partial) = match s.rfind(',') {
+        Some(i) => (&s[..=i], &s[i + 1..]), // include the trailing comma in `already`
+        None    => ("", s.as_ref()),
+    };
+    let chosen: std::collections::HashSet<&str> = already
+        .split(',')
+        .map(|t| t.trim())
+        .filter(|t| !t.is_empty())
+        .collect();
+
+    vc.values.iter()
+        .filter(|v| !chosen.contains(v.as_str()))
+        .filter(|v| partial.is_empty() || v.starts_with(partial))
+        .map(|v| CompletionCandidate::new(format!("{}{}", already, v)))
+        .collect()
 }
 
 /// Completion candidates for `--governor`: lists strategy names with descriptions.

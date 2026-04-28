@@ -59,19 +59,29 @@ impl CommandOp for VerifyPredicatesSqliteOp {
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
         let start = Instant::now();
 
-        let metadata_str = match options.require("metadata") {
-            Ok(s) => s, Err(e) => return error_result(e, start),
-        };
-        let predicates_str = match options.require("predicates") {
-            Ok(s) => s, Err(e) => return error_result(e, start),
-        };
-        let results_str = match options.require("results") {
-            Ok(s) => s, Err(e) => return error_result(e, start),
-        };
+        // Up-front: confirm the local dataset has the minimum facets
+        // this verify kind requires (see pipeline::dataset_lookup).
+        if let Err(e) = crate::pipeline::dataset_lookup::validate_and_log(
+            ctx, options, crate::pipeline::dataset_lookup::VerifyKind::PredicatesSqlite,
+        ) {
+            return error_result(e, start);
+        }
 
-        let metadata_path = resolve_path(metadata_str, &ctx.workspace);
-        let predicates_path = resolve_path(predicates_str, &ctx.workspace);
-        let results_path = resolve_path(results_str, &ctx.workspace);
+        // Standalone-friendly: input paths come from the active
+        // profile's metadata facets in dataset.yaml.
+        let metadata_str = match crate::pipeline::dataset_lookup::resolve_path_option(
+            ctx, options, "metadata", "metadata_content",
+        ) { Ok(s) => s, Err(e) => return error_result(e, start) };
+        let predicates_str = match crate::pipeline::dataset_lookup::resolve_path_option(
+            ctx, options, "predicates", "metadata_predicates",
+        ) { Ok(s) => s, Err(e) => return error_result(e, start) };
+        let results_str = match crate::pipeline::dataset_lookup::resolve_path_option(
+            ctx, options, "results", "metadata_results",
+        ) { Ok(s) => s, Err(e) => return error_result(e, start) };
+
+        let metadata_path = resolve_path(&metadata_str, &ctx.workspace);
+        let predicates_path = resolve_path(&predicates_str, &ctx.workspace);
+        let results_path = resolve_path(&results_str, &ctx.workspace);
 
         let fields: usize = options.parse_or("fields", 1u32).unwrap_or(1) as usize;
         let sample: usize = options.parse_or("sample", 0u32).unwrap_or(0) as usize;
@@ -136,7 +146,11 @@ impl CommandOp for VerifyPredicatesSqliteOp {
 
         let threads = ctx.governor.current_or("threads", ctx.threads as u64).max(1) as usize;
         let verify_threads = threads.min(actual_check).max(1);
-        ctx.ui.log(&format!("  verifying {} predicates across {} threads", actual_check, verify_threads));
+        ctx.ui.log(&format!(
+            "verify predicates-sqlite: predicate evaluation results vs SQLite oracle (in-memory, \
+             {} fields, {} metadata records); sample={} of {} predicates × {} threads",
+            fields, meta_count, actual_check, predicates.len(), verify_threads,
+        ));
 
         let pb = ctx.ui.bar(actual_check as u64, "verifying predicates");
         let progress = std::sync::atomic::AtomicU64::new(0);

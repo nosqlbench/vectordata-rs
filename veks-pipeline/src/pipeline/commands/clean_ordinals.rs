@@ -148,11 +148,15 @@ are excluded from the final dataset.
         let mut kept = 0u64;
         let mut excluded = 0u64;
 
+        // Bound mmap RSS during a full sequential scan.
+        let mut reclaim = vectordata::io::StreamReclaim::new(&reader, 0, total);
+
         for i in 0..total {
             let vec = match reader.get(i) {
                 Ok(v) => v,
                 Err(e) => return error_result(format!("read error at {}: {}", i, e), start),
             };
+            reclaim.advance(i);
             let ordinal = vec[0] as u32;
 
             if exclude.contains(&ordinal) {

@@ -42,7 +42,19 @@ use std::collections::BTreeMap;
 /// Called when the user tabs after an option that has a registered provider.
 /// Receives the partial word being typed and the full context of completed
 /// words on the command line (excluding the program name and the partial).
-pub type ValueProvider = fn(partial: &str, context: &[&str]) -> Vec<String>;
+/// Heap-allocated, thread-safe closure type so providers can capture
+/// data (e.g., a static enum-value list discovered from a
+/// `CommandOp::value_completions` map). Function pointers can be
+/// promoted to this type via [`ValueProvider::from_fn`] so existing
+/// `fn(&str, &[&str]) -> Vec<String>` providers keep working.
+pub type ValueProvider = std::sync::Arc<dyn Fn(&str, &[&str]) -> Vec<String> + Send + Sync>;
+
+/// Helper to wrap a `fn`-pointer provider into the closure-typed
+/// [`ValueProvider`]. Most existing global providers use plain `fn`
+/// pointers and call this when registering.
+pub fn fn_provider(f: fn(&str, &[&str]) -> Vec<String>) -> ValueProvider {
+    std::sync::Arc::new(f)
+}
 
 /// A function that provides additional option candidates based on context.
 ///

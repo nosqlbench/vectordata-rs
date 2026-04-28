@@ -118,6 +118,18 @@ pub trait CommandOp: Send {
         vec![]
     }
 
+    /// Per-option value-completion declarations for shell tab-
+    /// completion. Map key is the option name (matching
+    /// [`OptionDesc::name`]); the value is the candidate set.
+    ///
+    /// Default: empty map. Commands with enum-shaped or
+    /// comma-separated-list options should override and return
+    /// `ValueCompletions` for those keys so users get tab-completion
+    /// at the value position.
+    fn value_completions(&self) -> std::collections::HashMap<String, ValueCompletions> {
+        std::collections::HashMap::new()
+    }
+
     /// Check whether an existing output artifact is complete.
     ///
     /// The default delegates to the format-aware bound check in [`bound`].
@@ -402,6 +414,41 @@ pub struct OptionDesc {
     /// Defaults to `Config`. Commands should set `Input` or `Output`
     /// for path-typed options that represent consumed/produced artifacts.
     pub role: OptionRole,
+}
+
+/// Tab-completion value list for an option's value position. Returned
+/// from [`CommandOp::value_completions`] so commands can declare
+/// enumerated value sets without touching the 400+ existing
+/// `OptionDesc { … }` literals.
+#[derive(Debug, Clone)]
+pub struct ValueCompletions {
+    /// The valid values to suggest.
+    pub values: Vec<String>,
+    /// When true, the option accepts a comma-separated list (e.g.,
+    /// `--engines metal,stdarch,blas`). Completion parses the
+    /// current partial input, drops values already chosen, and
+    /// returns candidates suitable to complete the in-progress
+    /// segment.
+    pub comma_separated: bool,
+}
+
+impl ValueCompletions {
+    /// Construct from a static slice of string literals.
+    pub fn enum_values(values: &[&str]) -> Self {
+        Self {
+            values: values.iter().map(|s| s.to_string()).collect(),
+            comma_separated: false,
+        }
+    }
+
+    /// Same as `enum_values` but flags the option as comma-separated
+    /// so completion suggests only values not already chosen.
+    pub fn comma_separated_enum(values: &[&str]) -> Self {
+        Self {
+            values: values.iter().map(|s| s.to_string()).collect(),
+            comma_separated: true,
+        }
+    }
 }
 
 impl OptionDesc {

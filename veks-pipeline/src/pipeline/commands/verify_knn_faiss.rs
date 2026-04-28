@@ -168,8 +168,13 @@ swaps (from BLAS/SIMD rounding) are tolerated.
             vectordata::dataset::profile::profile_sort_by_size(&a.0, a.4, &b.0, b.4)
         });
 
-        ctx.ui.log(&format!("verify knn-faiss: {} profiles, metric={}",
-            profiles.len(), effective_metric));
+        ctx.ui.log(&format!(
+            "verify knn-faiss-consolidated: KNN ground truth across {} profile{} via FAISS \
+             IndexFlat oracle (single-threaded MKL, batch-capped); sample={}, metric={}",
+            profiles.len(),
+            if profiles.len() == 1 { "" } else { "s" },
+            sample, effective_metric,
+        ));
 
         let mut overall = VerifySummary::default();
         let mut all_pass = true;
@@ -296,22 +301,35 @@ impl VerifyKnnFaissOp {
         limit: usize,
         start: Instant,
     ) -> CommandResult {
-        let base_path = resolve_path(&options.require("base").unwrap(), &ctx.workspace);
-        let query_str = match options.require("query") {
-            Ok(s) => s.to_string(),
-            Err(e) => return error_result(e, start),
-        };
-        let gt_str = options.get("ground-truth")
-            .or_else(|| options.get("indices"))
-            .map(|s| s.to_string());
-        let gt_str = match gt_str {
-            Some(s) => s,
-            None => return error_result("required option 'ground-truth' (or 'indices') not set", start),
+        // Standalone-friendly: input paths come from the active
+        // profile's facets in dataset.yaml.
+        let base_str = match crate::pipeline::dataset_lookup::resolve_path_option(
+            ctx, options, "base", "base_vectors",
+        ) { Ok(s) => s, Err(e) => return error_result(e, start) };
+        let query_str = match crate::pipeline::dataset_lookup::resolve_path_option(
+            ctx, options, "query", "query_vectors",
+        ) { Ok(s) => s, Err(e) => return error_result(e, start) };
+        let base_path = resolve_path(&base_str, &ctx.workspace);
+        // Either `--ground-truth` or `--indices` is accepted; both map
+        // to the `neighbor_indices` facet on standalone fallback.
+        let gt_str = match options.get("ground-truth").or_else(|| options.get("indices")) {
+            Some(s) => s.to_string(),
+            None => match crate::pipeline::dataset_lookup::resolve_path_option(
+                ctx, options, "ground-truth", "neighbor_indices",
+            ) {
+                Ok(s) => s,
+                Err(_) => return error_result(
+                    "required option 'ground-truth' (or 'indices') not set", start),
+            },
         };
         let query_path = resolve_path(&query_str, &ctx.workspace);
         let gt_path = resolve_path(&gt_str, &ctx.workspace);
 
-        ctx.ui.log(&format!("verify knn-faiss: metric={}", metric_str));
+        ctx.ui.log(&format!(
+            "verify knn-faiss: KNN ground truth via FAISS IndexFlat oracle \
+             (single-threaded MKL, batch-capped); metric={}, at_k={}, sample={}, limit={}",
+            metric_str, at_k, sample, limit,
+        ));
 
         let output_path = options.get("output")
             .map(|s| resolve_path(s, &ctx.workspace));
@@ -604,9 +622,26 @@ impl CommandOp for VerifyKnnFaissConsolidatedOp {
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
         let start = Instant::now();
 
-        let base_str = match options.require("base") { Ok(s) => s, Err(e) => return error_result(e, start) };
-        let query_str = match options.require("query") { Ok(s) => s, Err(e) => return error_result(e, start) };
-        let output_str = match options.require("output") { Ok(s) => s, Err(e) => return error_result(e, start) };
+        // Up-front: confirm the local dataset has the minimum facets
+        // this verify kind requires (see pipeline::dataset_lookup).
+        if let Err(e) = crate::pipeline::dataset_lookup::validate_and_log(
+            ctx, options, crate::pipeline::dataset_lookup::VerifyKind::KnnFaissConsolidated,
+        ) {
+            return error_result(e, start);
+        }
+
+        // Standalone-friendly: input paths come from the active
+        // profile's facets in dataset.yaml.
+        let base_str = match crate::pipeline::dataset_lookup::resolve_path_option(
+            ctx, options, "base", "base_vectors",
+        ) { Ok(s) => s, Err(e) => return error_result(e, start) };
+        let query_str = match crate::pipeline::dataset_lookup::resolve_path_option(
+            ctx, options, "query", "query_vectors",
+        ) { Ok(s) => s, Err(e) => return error_result(e, start) };
+        let output_str = match options.require("output") {
+            Ok(s) => s.to_string(),
+            Err(e) => return error_result(e, start),
+        };
 
         let metric_str = options.get("metric").unwrap_or("L2");
         let faiss_mt = match faiss_metric(metric_str) {
@@ -621,9 +656,9 @@ impl CommandOp for VerifyKnnFaissConsolidatedOp {
             .and_then(|s| s.parse().ok())
             .unwrap_or(42);
 
-        let base_path = resolve_path(base_str, &ctx.workspace);
-        let query_path = resolve_path(query_str, &ctx.workspace);
-        let output_path = resolve_path(output_str, &ctx.workspace);
+        let base_path = resolve_path(&base_str, &ctx.workspace);
+        let query_path = resolve_path(&query_str, &ctx.workspace);
+        let output_path = resolve_path(&output_str, &ctx.workspace);
 
         // Load dataset config for profile discovery
         let ds_path = ctx.workspace.join("dataset.yaml");
