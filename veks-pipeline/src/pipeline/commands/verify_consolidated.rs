@@ -155,6 +155,12 @@ impl CommandOp for VerifyKnnConsolidatedOp {
         "verify knn-consolidated"
     }
 
+    fn category(&self) -> &'static dyn veks_completion::CategoryTag {
+        &crate::pipeline::command::CAT_VERIFY
+    }
+
+    fn level(&self) -> &'static dyn veks_completion::LevelTag { &crate::pipeline::command::LVL_PRIMARY }
+
     fn command_doc(&self) -> CommandDoc {
         CommandDoc {
             summary: "Multi-threaded single-pass KNN verification across all profiles".into(),
@@ -816,6 +822,12 @@ pub fn filtered_knn_consolidated_factory() -> Box<dyn CommandOp> {
 
 impl CommandOp for VerifyFilteredKnnConsolidatedOp {
     fn command_path(&self) -> &str { "verify filtered-knn-consolidated" }
+
+    fn category(&self) -> &'static dyn veks_completion::CategoryTag {
+        &crate::pipeline::command::CAT_VERIFY
+    }
+
+    fn level(&self) -> &'static dyn veks_completion::LevelTag { &crate::pipeline::command::LVL_PRIMARY }
     fn command_doc(&self) -> CommandDoc {
         CommandDoc {
             summary: "Single-pass filtered KNN verification across all profiles".into(),
@@ -1134,6 +1146,12 @@ pub fn predicates_consolidated_factory() -> Box<dyn CommandOp> {
 
 impl CommandOp for VerifyPredicatesConsolidatedOp {
     fn command_path(&self) -> &str { "verify predicates-consolidated" }
+
+    fn category(&self) -> &'static dyn veks_completion::CategoryTag {
+        &crate::pipeline::command::CAT_VERIFY
+    }
+
+    fn level(&self) -> &'static dyn veks_completion::LevelTag { &crate::pipeline::command::LVL_PRIMARY }
     fn command_doc(&self) -> CommandDoc {
         CommandDoc {
             summary: "Single-pass predicate verification across all profiles".into(),

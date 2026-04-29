@@ -49,6 +49,31 @@ pub fn pipeline_value_completions() -> BTreeMap<String, std::collections::HashMa
     out
 }
 
+/// Metadata payload returned by [`pipeline_command_metadata`].
+pub struct CommandMetadata {
+    pub category: &'static dyn veks_completion::CategoryTag,
+    pub level:    &'static dyn veks_completion::LevelTag,
+}
+
+/// Collect every pipeline command's discovery metadata
+/// ([`super::command::CommandOp::category`] and `level`) into a flat
+/// map keyed by the full command path. Consumed by the
+/// shell-completion engine to populate `Node::Leaf::category` /
+/// `level` and feed the stratified-completion tab cycle.
+pub fn pipeline_command_metadata() -> BTreeMap<String, CommandMetadata> {
+    let registry = CommandRegistry::with_builtins();
+    let mut out = BTreeMap::new();
+    for path in registry.command_paths() {
+        let factory = registry.get(path).unwrap();
+        let cmd = factory();
+        out.insert(path.to_string(), CommandMetadata {
+            category: cmd.category(),
+            level:    cmd.level(),
+        });
+    }
+    out
+}
+
 pub fn build_pipeline_command() -> Command {
     let registry = CommandRegistry::with_builtins();
     let paths = registry.command_paths();

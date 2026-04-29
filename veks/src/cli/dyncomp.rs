@@ -17,13 +17,15 @@ use veks_completion::{CommandTree, Node, ValueProvider};
 /// appears automatically — nothing to keep in sync by hand.
 pub fn build_tree(cmd: &clap::Command) -> CommandTree {
     let app_name = cmd.get_name();
-    // Each pipeline CommandOp can declare per-option value-completion
-    // sets via `value_completions()`. Collect those into a flat map
-    // keyed by the full pipeline command path (e.g., "verify
-    // engine-parity"), then thread it through the tree walk so leaf
-    // nodes attach the appropriate value providers.
+    // Each pipeline CommandOp declares per-option value-completion
+    // sets via `value_completions()`, and discovery metadata
+    // (category + level) via `category()` / `level()`. Collect both
+    // into flat maps keyed by full pipeline command path (e.g.,
+    // "verify engine-parity"), then thread through the tree walk so
+    // leaf nodes get value providers, category, and level populated.
     let pipeline_vc = veks_pipeline::pipeline::cli::pipeline_value_completions();
-    let root = walk_clap_command(cmd, &[], &pipeline_vc);
+    let pipeline_meta = veks_pipeline::pipeline::cli::pipeline_command_metadata();
+    let root = walk_clap_command(cmd, &[], &pipeline_vc, &pipeline_meta);
 
     // Identify hidden commands
     let mut hidden: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -38,6 +40,7 @@ pub fn build_tree(cmd: &clap::Command) -> CommandTree {
         root,
         hidden,
         global_value_providers: std::collections::BTreeMap::new(),
+        strict_metadata: false,
     };
 
     // Global value providers for options that appear across many commands
@@ -63,6 +66,10 @@ fn walk_clap_command(
     pipeline_vc: &std::collections::BTreeMap<
         String,
         std::collections::HashMap<String, veks_pipeline::pipeline::command::ValueCompletions>,
+    >,
+    pipeline_meta: &std::collections::BTreeMap<
+        String,
+        veks_pipeline::pipeline::cli::CommandMetadata,
     >,
 ) -> Node {
     let subs: Vec<_> = cmd.get_subcommands().collect();
@@ -117,11 +124,19 @@ fn walk_clap_command(
             }
         }
 
+        // Look up category/level metadata for this leaf in the same
+        // way as value_completions: by full pipeline command path.
+        let (category, level) = pipeline_meta.get(&key)
+            .map(|m| (Some(m.category.tag().to_string()), Some(m.level.rank())))
+            .unwrap_or((None, None));
+
         Node::Leaf {
             options,
             flags,
             value_providers,
             dynamic_options: None,
+            category,
+            level,
         }
     } else {
         // Group command — recurse into children
@@ -130,10 +145,10 @@ fn walk_clap_command(
             let name = sub.get_name();
             let mut child_path: Vec<&str> = path_segments.to_vec();
             child_path.push(name);
-            let child = walk_clap_command(sub, &child_path, pipeline_vc);
+            let child = walk_clap_command(sub, &child_path, pipeline_vc, pipeline_meta);
             children.insert(name.to_string(), child);
         }
-        Node::Group { children }
+        Node::Group { children, category: None, level: None }
     }
 }
 

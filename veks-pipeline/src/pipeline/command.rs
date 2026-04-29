@@ -63,6 +63,30 @@ pub trait CommandOp: Send {
     /// Canonical command path, e.g. `"import"` or `"generate vectors"`.
     fn command_path(&self) -> &str;
 
+    /// Discovery category — drives grouping in shell completion and
+    /// help output. Required, with no default: a new command must
+    /// declare where it belongs in the user's mental model.
+    ///
+    /// The return type is a trait object so consumers of
+    /// `veks-completion` outside this crate can define their own
+    /// category enum and reuse the same infrastructure. Inside
+    /// `veks-pipeline`, commands return one of the static instances
+    /// from this module (e.g., [`CAT_VERIFY`], [`CAT_COMPUTE`]) which
+    /// are `PipelineCategory` variants exposed as `&'static dyn`.
+    fn category(&self) -> &'static dyn veks_completion::CategoryTag;
+
+    /// Discovery tier for stratified shell completion. Required, with
+    /// no default: the command's author decides whether the command
+    /// surfaces on the first tab tap or sits behind a deeper one.
+    ///
+    /// Symmetric with [`category`]: returns `&'static dyn LevelTag`
+    /// so consumers of `veks-completion` can define their own tier
+    /// enum. Inside `veks-pipeline`, return one of the static
+    /// instances ([`LVL_PRIMARY`], [`LVL_SECONDARY`], [`LVL_ADVANCED`]).
+    /// The completion engine reads `rank()` for ordering — lower =
+    /// more discoverable.
+    fn level(&self) -> &'static dyn veks_completion::LevelTag;
+
     /// Execute with resolved options.
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult;
 
@@ -397,6 +421,114 @@ pub enum OptionRole {
     #[default]
     Config,
 }
+
+/// `veks-pipeline`'s closed set of discovery categories. Every
+/// project that uses `veks-completion` defines its own enum like this
+/// and implements [`veks_completion::CategoryTag`] on it. The
+/// completion engine groups by `tag()` — implementors with matching
+/// tags collapse into the same group.
+///
+/// Variants mirror the verb-prefix structure of the command paths
+/// (`analyze ...`, `verify ...`, …). For commands that don't fit a
+/// single verb (cross-cutting utilities) use [`PipelineCategory::Pipeline`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PipelineCategory {
+    Analyze,
+    Catalog,
+    Cleanup,
+    Compute,
+    Config,
+    Download,
+    Generate,
+    Merkle,
+    Pipeline,
+    Query,
+    Slab,
+    State,
+    Transform,
+    Verify,
+}
+
+impl veks_completion::CategoryTag for PipelineCategory {
+    fn tag(&self) -> &'static str {
+        match self {
+            Self::Analyze   => "analyze",
+            Self::Catalog   => "catalog",
+            Self::Cleanup   => "cleanup",
+            Self::Compute   => "compute",
+            Self::Config    => "config",
+            Self::Download  => "download",
+            Self::Generate  => "generate",
+            Self::Merkle    => "merkle",
+            Self::Pipeline  => "pipeline",
+            Self::Query     => "query",
+            Self::Slab      => "slab",
+            Self::State     => "state",
+            Self::Transform => "transform",
+            Self::Verify    => "verify",
+        }
+    }
+}
+
+// Static instances per variant. `CommandOp::category()` returns
+// `&'static dyn CategoryTag`, so impls reference these by name
+// instead of constructing a static binding inline.
+pub static CAT_ANALYZE:   PipelineCategory = PipelineCategory::Analyze;
+pub static CAT_CATALOG:   PipelineCategory = PipelineCategory::Catalog;
+pub static CAT_CLEANUP:   PipelineCategory = PipelineCategory::Cleanup;
+pub static CAT_COMPUTE:   PipelineCategory = PipelineCategory::Compute;
+pub static CAT_CONFIG:    PipelineCategory = PipelineCategory::Config;
+pub static CAT_DOWNLOAD:  PipelineCategory = PipelineCategory::Download;
+pub static CAT_GENERATE:  PipelineCategory = PipelineCategory::Generate;
+pub static CAT_MERKLE:    PipelineCategory = PipelineCategory::Merkle;
+pub static CAT_PIPELINE:  PipelineCategory = PipelineCategory::Pipeline;
+pub static CAT_QUERY:     PipelineCategory = PipelineCategory::Query;
+pub static CAT_SLAB:      PipelineCategory = PipelineCategory::Slab;
+pub static CAT_STATE:     PipelineCategory = PipelineCategory::State;
+pub static CAT_TRANSFORM: PipelineCategory = PipelineCategory::Transform;
+pub static CAT_VERIFY:    PipelineCategory = PipelineCategory::Verify;
+
+/// `veks-pipeline`'s discovery-tier enum. Mirrors the
+/// [`PipelineCategory`] pattern: implement
+/// [`veks_completion::LevelTag`] once, expose static instances per
+/// variant, and let `CommandOp` impls reference them by name.
+///
+/// Tier semantics:
+///   - [`PipelineLevel::Primary`] (rank 1) — common everyday
+///     commands; the first tab tap reveals these. The bulk of the
+///     registry.
+///   - [`PipelineLevel::Secondary`] (rank 2) — less common
+///     workflow-completing commands (alternate engines, deep-dive
+///     analysis, finalization). Second tap.
+///   - [`PipelineLevel::Advanced`] (rank 3) —
+///     specialized/internal/diagnostic. Third tap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum PipelineLevel {
+    Primary,
+    Secondary,
+    Advanced,
+}
+
+impl veks_completion::LevelTag for PipelineLevel {
+    fn rank(&self) -> u32 {
+        match self {
+            Self::Primary   => 1,
+            Self::Secondary => 2,
+            Self::Advanced  => 3,
+        }
+    }
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Primary   => "primary",
+            Self::Secondary => "secondary",
+            Self::Advanced  => "advanced",
+        }
+    }
+}
+
+pub static LVL_PRIMARY:   PipelineLevel = PipelineLevel::Primary;
+pub static LVL_SECONDARY: PipelineLevel = PipelineLevel::Secondary;
+pub static LVL_ADVANCED:  PipelineLevel = PipelineLevel::Advanced;
 
 #[derive(Debug, Clone)]
 pub struct OptionDesc {

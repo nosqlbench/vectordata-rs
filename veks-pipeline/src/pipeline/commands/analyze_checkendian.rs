@@ -146,6 +146,12 @@ impl CommandOp for AnalyzeCheckEndianOp {
         "analyze check-endian"
     }
 
+    fn category(&self) -> &'static dyn veks_completion::CategoryTag {
+        &crate::pipeline::command::CAT_ANALYZE
+    }
+
+    fn level(&self) -> &'static dyn veks_completion::LevelTag { &crate::pipeline::command::LVL_PRIMARY }
+
     fn command_doc(&self) -> CommandDoc {
         let options = self.describe_options();
         CommandDoc {

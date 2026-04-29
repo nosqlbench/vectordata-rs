@@ -34,6 +34,12 @@ impl CommandOp for RequirePipelineOp {
         "pipeline require"
     }
 
+    fn category(&self) -> &'static dyn veks_completion::CategoryTag {
+        &crate::pipeline::command::CAT_PIPELINE
+    }
+
+    fn level(&self) -> &'static dyn veks_completion::LevelTag { &crate::pipeline::command::LVL_ADVANCED }
+
     fn command_doc(&self) -> CommandDoc {
         let options = self.describe_options();
         CommandDoc {

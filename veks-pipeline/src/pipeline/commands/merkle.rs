@@ -474,6 +474,12 @@ impl CommandOp for MerkleCreateOp {
         "merkle create"
     }
 
+    fn category(&self) -> &'static dyn veks_completion::CategoryTag {
+        &crate::pipeline::command::CAT_MERKLE
+    }
+
+    fn level(&self) -> &'static dyn veks_completion::LevelTag { &crate::pipeline::command::LVL_PRIMARY }
+
     fn command_doc(&self) -> CommandDoc {
         let options = self.describe_options();
         CommandDoc {
@@ -802,6 +808,12 @@ impl CommandOp for MerkleVerifyOp {
         "merkle verify"
     }
 
+    fn category(&self) -> &'static dyn veks_completion::CategoryTag {
+        &crate::pipeline::command::CAT_MERKLE
+    }
+
+    fn level(&self) -> &'static dyn veks_completion::LevelTag { &crate::pipeline::command::LVL_PRIMARY }
+
     fn command_doc(&self) -> CommandDoc {
         let options = self.describe_options();
         CommandDoc {
@@ -994,6 +1006,12 @@ impl CommandOp for MerkleDiffOp {
     fn command_path(&self) -> &str {
         "merkle diff"
     }
+
+    fn category(&self) -> &'static dyn veks_completion::CategoryTag {
+        &crate::pipeline::command::CAT_MERKLE
+    }
+
+    fn level(&self) -> &'static dyn veks_completion::LevelTag { &crate::pipeline::command::LVL_PRIMARY }
 
     fn command_doc(&self) -> CommandDoc {
         let options = self.describe_options();
@@ -1199,6 +1217,12 @@ impl CommandOp for MerkleSummaryOp {
         "merkle summary"
     }
 
+    fn category(&self) -> &'static dyn veks_completion::CategoryTag {
+        &crate::pipeline::command::CAT_MERKLE
+    }
+
+    fn level(&self) -> &'static dyn veks_completion::LevelTag { &crate::pipeline::command::LVL_PRIMARY }
+
     fn command_doc(&self) -> CommandDoc {
         let options = self.describe_options();
         CommandDoc {
@@ -1325,6 +1349,12 @@ impl CommandOp for MerkleTreeviewOp {
     fn command_path(&self) -> &str {
         "merkle treeview"
     }
+
+    fn category(&self) -> &'static dyn veks_completion::CategoryTag {
+        &crate::pipeline::command::CAT_MERKLE
+    }
+
+    fn level(&self) -> &'static dyn veks_completion::LevelTag { &crate::pipeline::command::LVL_PRIMARY }
 
     fn command_doc(&self) -> CommandDoc {
         let options = self.describe_options();
@@ -1576,6 +1606,12 @@ impl CommandOp for MerklePathOp {
     fn command_path(&self) -> &str {
         "merkle path"
     }
+
+    fn category(&self) -> &'static dyn veks_completion::CategoryTag {
+        &crate::pipeline::command::CAT_MERKLE
+    }
+
+    fn level(&self) -> &'static dyn veks_completion::LevelTag { &crate::pipeline::command::LVL_PRIMARY }
 
     fn command_doc(&self) -> CommandDoc {
         let options = self.describe_options();
@@ -1865,6 +1901,12 @@ impl CommandOp for MerkleSpoilbitsOp {
         "merkle spoilbits"
     }
 
+    fn category(&self) -> &'static dyn veks_completion::CategoryTag {
+        &crate::pipeline::command::CAT_MERKLE
+    }
+
+    fn level(&self) -> &'static dyn veks_completion::LevelTag { &crate::pipeline::command::LVL_ADVANCED }
+
     fn command_doc(&self) -> CommandDoc {
         let options = self.describe_options();
         CommandDoc {
@@ -2041,6 +2083,12 @@ impl CommandOp for MerkleSpoilchunksOp {
     fn command_path(&self) -> &str {
         "merkle spoilchunks"
     }
+
+    fn category(&self) -> &'static dyn veks_completion::CategoryTag {
+        &crate::pipeline::command::CAT_MERKLE
+    }
+
+    fn level(&self) -> &'static dyn veks_completion::LevelTag { &crate::pipeline::command::LVL_ADVANCED }
 
     fn command_doc(&self) -> CommandDoc {
         let options = self.describe_options();

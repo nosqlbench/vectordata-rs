@@ -5131,6 +5131,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "vectordata",
+ "veks-completion",
  "veks-core",
 ]
 

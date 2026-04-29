@@ -45,6 +45,12 @@ impl CommandOp for GenerateFvecExtractOp {
         "transform extract"
     }
 
+    fn category(&self) -> &'static dyn veks_completion::CategoryTag {
+        &crate::pipeline::command::CAT_TRANSFORM
+    }
+
+    fn level(&self) -> &'static dyn veks_completion::LevelTag { &crate::pipeline::command::LVL_PRIMARY }
+
     fn command_doc(&self) -> CommandDoc {
         let options = self.describe_options();
         CommandDoc {
@@ -355,6 +361,12 @@ impl CommandOp for GenerateIvecExtractOp {
     fn command_path(&self) -> &str {
         "transform extract"
     }
+
+    fn category(&self) -> &'static dyn veks_completion::CategoryTag {
+        &crate::pipeline::command::CAT_TRANSFORM
+    }
+
+    fn level(&self) -> &'static dyn veks_completion::LevelTag { &crate::pipeline::command::LVL_PRIMARY }
 
     fn command_doc(&self) -> CommandDoc {
         let options = self.describe_options();
@@ -681,6 +693,12 @@ impl CommandOp for GenerateMvecExtractOp {
         "transform extract"
     }
 
+    fn category(&self) -> &'static dyn veks_completion::CategoryTag {
+        &crate::pipeline::command::CAT_TRANSFORM
+    }
+
+    fn level(&self) -> &'static dyn veks_completion::LevelTag { &crate::pipeline::command::LVL_PRIMARY }
+
     fn command_doc(&self) -> CommandDoc {
         let options = self.describe_options();
         CommandDoc {
@@ -996,6 +1014,12 @@ impl CommandOp for GenerateSlabExtractOp {
     fn command_path(&self) -> &str {
         "transform extract" // delegate — same path as parent
     }
+
+    fn category(&self) -> &'static dyn veks_completion::CategoryTag {
+        &crate::pipeline::command::CAT_TRANSFORM
+    }
+
+    fn level(&self) -> &'static dyn veks_completion::LevelTag { &crate::pipeline::command::LVL_PRIMARY }
 
     fn command_doc(&self) -> CommandDoc {
         CommandDoc {
@@ -2888,6 +2912,12 @@ impl CommandOp for GenerateScalarExtractOp {
         "transform extract"
     }
 
+    fn category(&self) -> &'static dyn veks_completion::CategoryTag {
+        &crate::pipeline::command::CAT_TRANSFORM
+    }
+
+    fn level(&self) -> &'static dyn veks_completion::LevelTag { &crate::pipeline::command::LVL_PRIMARY }
+
     fn command_doc(&self) -> CommandDoc {
         CommandDoc {
             summary: "Extract and reorder records from a scalar file".into(),
@@ -3019,6 +3049,12 @@ impl CommandOp for TransformExtractOp {
     fn command_path(&self) -> &str {
         "transform extract"
     }
+
+    fn category(&self) -> &'static dyn veks_completion::CategoryTag {
+        &crate::pipeline::command::CAT_TRANSFORM
+    }
+
+    fn level(&self) -> &'static dyn veks_completion::LevelTag { &crate::pipeline::command::LVL_PRIMARY }
 
     fn command_doc(&self) -> CommandDoc {
         let options = self.describe_options();

@@ -27,6 +27,12 @@ impl CommandOp for BarrierOp {
         "barrier"
     }
 
+    fn category(&self) -> &'static dyn veks_completion::CategoryTag {
+        &crate::pipeline::command::CAT_PIPELINE
+    }
+
+    fn level(&self) -> &'static dyn veks_completion::LevelTag { &crate::pipeline::command::LVL_ADVANCED }
+
     fn command_doc(&self) -> CommandDoc {
         CommandDoc {
             summary: "Synchronization barrier between profile groups".into(),

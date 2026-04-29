@@ -74,6 +74,12 @@ impl CommandOp for AnalyzeNormalsKnnUtilsOp {
         "analyze check-normalization-knnutils"
     }
 
+    fn category(&self) -> &'static dyn veks_completion::CategoryTag {
+        &crate::pipeline::command::CAT_ANALYZE
+    }
+
+    fn level(&self) -> &'static dyn veks_completion::LevelTag { &crate::pipeline::command::LVL_SECONDARY }
+
     fn command_doc(&self) -> CommandDoc {
         let options = self.describe_options();
         CommandDoc {

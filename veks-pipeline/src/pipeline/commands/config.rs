@@ -112,6 +112,12 @@ impl CommandOp for ConfigShowOp {
         "config show"
     }
 
+    fn category(&self) -> &'static dyn veks_completion::CategoryTag {
+        &crate::pipeline::command::CAT_CONFIG
+    }
+
+    fn level(&self) -> &'static dyn veks_completion::LevelTag { &crate::pipeline::command::LVL_PRIMARY }
+
     fn command_doc(&self) -> CommandDoc {
         let options = self.describe_options();
         CommandDoc {
@@ -227,6 +233,12 @@ impl CommandOp for ConfigInitOp {
     fn command_path(&self) -> &str {
         "config init"
     }
+
+    fn category(&self) -> &'static dyn veks_completion::CategoryTag {
+        &crate::pipeline::command::CAT_CONFIG
+    }
+
+    fn level(&self) -> &'static dyn veks_completion::LevelTag { &crate::pipeline::command::LVL_PRIMARY }
 
     fn command_doc(&self) -> CommandDoc {
         let options = self.describe_options();
@@ -426,6 +438,12 @@ impl CommandOp for ConfigListMountsOp {
     fn command_path(&self) -> &str {
         "config list-mounts"
     }
+
+    fn category(&self) -> &'static dyn veks_completion::CategoryTag {
+        &crate::pipeline::command::CAT_CONFIG
+    }
+
+    fn level(&self) -> &'static dyn veks_completion::LevelTag { &crate::pipeline::command::LVL_PRIMARY }
 
     fn command_doc(&self) -> CommandDoc {
         let options = self.describe_options();

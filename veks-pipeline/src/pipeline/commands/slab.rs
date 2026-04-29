@@ -35,6 +35,12 @@ impl CommandOp for SlabImportOp {
         "slab import"
     }
 
+    fn category(&self) -> &'static dyn veks_completion::CategoryTag {
+        &crate::pipeline::command::CAT_SLAB
+    }
+
+    fn level(&self) -> &'static dyn veks_completion::LevelTag { &crate::pipeline::command::LVL_PRIMARY }
+
     fn command_doc(&self) -> CommandDoc {
         let options = self.describe_options();
         CommandDoc {
@@ -220,6 +226,12 @@ impl CommandOp for SlabExportOp {
         "slab export"
     }
 
+    fn category(&self) -> &'static dyn veks_completion::CategoryTag {
+        &crate::pipeline::command::CAT_SLAB
+    }
+
+    fn level(&self) -> &'static dyn veks_completion::LevelTag { &crate::pipeline::command::LVL_PRIMARY }
+
     fn command_doc(&self) -> CommandDoc {
         let options = self.describe_options();
         CommandDoc {
@@ -364,6 +376,12 @@ impl CommandOp for SlabAppendOp {
         "slab append"
     }
 
+    fn category(&self) -> &'static dyn veks_completion::CategoryTag {
+        &crate::pipeline::command::CAT_SLAB
+    }
+
+    fn level(&self) -> &'static dyn veks_completion::LevelTag { &crate::pipeline::command::LVL_PRIMARY }
+
     fn command_doc(&self) -> CommandDoc {
         let options = self.describe_options();
         CommandDoc {
@@ -507,6 +525,12 @@ impl CommandOp for SlabRewriteOp {
     fn command_path(&self) -> &str {
         "slab rewrite"
     }
+
+    fn category(&self) -> &'static dyn veks_completion::CategoryTag {
+        &crate::pipeline::command::CAT_SLAB
+    }
+
+    fn level(&self) -> &'static dyn veks_completion::LevelTag { &crate::pipeline::command::LVL_PRIMARY }
 
     fn command_doc(&self) -> CommandDoc {
         let options = self.describe_options();
@@ -659,6 +683,12 @@ impl CommandOp for SlabCheckOp {
         "slab check"
     }
 
+    fn category(&self) -> &'static dyn veks_completion::CategoryTag {
+        &crate::pipeline::command::CAT_SLAB
+    }
+
+    fn level(&self) -> &'static dyn veks_completion::LevelTag { &crate::pipeline::command::LVL_PRIMARY }
+
     fn command_doc(&self) -> CommandDoc {
         let options = self.describe_options();
         CommandDoc {
@@ -796,6 +826,12 @@ impl CommandOp for SlabGetOp {
     fn command_path(&self) -> &str {
         "slab get"
     }
+
+    fn category(&self) -> &'static dyn veks_completion::CategoryTag {
+        &crate::pipeline::command::CAT_SLAB
+    }
+
+    fn level(&self) -> &'static dyn veks_completion::LevelTag { &crate::pipeline::command::LVL_PRIMARY }
 
     fn command_doc(&self) -> CommandDoc {
         let options = self.describe_options();
@@ -958,6 +994,12 @@ impl CommandOp for SlabAnalyzeOp {
     fn command_path(&self) -> &str {
         "slab analyze"
     }
+
+    fn category(&self) -> &'static dyn veks_completion::CategoryTag {
+        &crate::pipeline::command::CAT_SLAB
+    }
+
+    fn level(&self) -> &'static dyn veks_completion::LevelTag { &crate::pipeline::command::LVL_SECONDARY }
 
     fn command_doc(&self) -> CommandDoc {
         let options = self.describe_options();
@@ -1140,6 +1182,12 @@ impl CommandOp for SlabExplainOp {
         "slab explain"
     }
 
+    fn category(&self) -> &'static dyn veks_completion::CategoryTag {
+        &crate::pipeline::command::CAT_SLAB
+    }
+
+    fn level(&self) -> &'static dyn veks_completion::LevelTag { &crate::pipeline::command::LVL_SECONDARY }
+
     fn command_doc(&self) -> CommandDoc {
         let options = self.describe_options();
         CommandDoc {
@@ -1293,6 +1341,12 @@ impl CommandOp for SlabNamespacesOp {
         "slab namespaces"
     }
 
+    fn category(&self) -> &'static dyn veks_completion::CategoryTag {
+        &crate::pipeline::command::CAT_SLAB
+    }
+
+    fn level(&self) -> &'static dyn veks_completion::LevelTag { &crate::pipeline::command::LVL_PRIMARY }
+
     fn command_doc(&self) -> CommandDoc {
         let options = self.describe_options();
         CommandDoc {
@@ -1392,6 +1446,12 @@ impl CommandOp for SlabInspectOp {
     fn command_path(&self) -> &str {
         "slab inspect"
     }
+
+    fn category(&self) -> &'static dyn veks_completion::CategoryTag {
+        &crate::pipeline::command::CAT_SLAB
+    }
+
+    fn level(&self) -> &'static dyn veks_completion::LevelTag { &crate::pipeline::command::LVL_SECONDARY }
 
     fn command_doc(&self) -> CommandDoc {
         let options = self.describe_options();
@@ -1534,6 +1594,12 @@ impl CommandOp for SlabSurveyOp {
     fn command_path(&self) -> &str {
         "analyze survey"
     }
+
+    fn category(&self) -> &'static dyn veks_completion::CategoryTag {
+        &crate::pipeline::command::CAT_ANALYZE
+    }
+
+    fn level(&self) -> &'static dyn veks_completion::LevelTag { &crate::pipeline::command::LVL_PRIMARY }
 
     fn command_doc(&self) -> CommandDoc {
         let options = self.describe_options();

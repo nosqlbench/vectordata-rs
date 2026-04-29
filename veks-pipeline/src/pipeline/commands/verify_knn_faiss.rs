@@ -43,6 +43,12 @@ impl CommandOp for VerifyKnnFaissOp {
         "verify knn-faiss"
     }
 
+    fn category(&self) -> &'static dyn veks_completion::CategoryTag {
+        &crate::pipeline::command::CAT_VERIFY
+    }
+
+    fn level(&self) -> &'static dyn veks_completion::LevelTag { &crate::pipeline::command::LVL_SECONDARY }
+
     fn command_doc(&self) -> CommandDoc {
         let options = self.describe_options();
         CommandDoc {
@@ -582,6 +588,12 @@ impl CommandOp for VerifyKnnFaissConsolidatedOp {
     fn command_path(&self) -> &str {
         "verify knn-consolidated"
     }
+
+    fn category(&self) -> &'static dyn veks_completion::CategoryTag {
+        &crate::pipeline::command::CAT_VERIFY
+    }
+
+    fn level(&self) -> &'static dyn veks_completion::LevelTag { &crate::pipeline::command::LVL_PRIMARY }
 
     fn command_doc(&self) -> CommandDoc {
         let options = self.describe_options();

@@ -56,6 +56,60 @@ pub fn fn_provider(f: fn(&str, &[&str]) -> Vec<String>) -> ValueProvider {
     std::sync::Arc::new(f)
 }
 
+/// Discovery-tier abstraction symmetric with [`CategoryTag`].
+///
+/// `veks-completion` doesn't define how many tiers exist or how
+/// they're named — each consuming crate decides. Implement
+/// `LevelTag` on your own enum to declare a closed set of
+/// stratified-completion tiers; commands then return `&'static dyn
+/// LevelTag` and the completion engine orders by [`rank`].
+///
+/// `rank()` is the scalar used by stratified completion (the Nth
+/// tab tap reveals everything with `rank <= N`). Lower = more
+/// discoverable. Two implementors with the same `rank` are treated
+/// as the same tier.
+pub trait LevelTag: 'static + Send + Sync + std::fmt::Debug {
+    /// Numeric tier; lower values are revealed first by the
+    /// stratified-completion tab cycle.
+    fn rank(&self) -> u32;
+
+    /// Optional display name (e.g., "primary", "advanced") for
+    /// help renderers. Default returns the empty string —
+    /// implementors should override for human-friendly listings.
+    fn name(&self) -> &'static str { "" }
+}
+
+/// Discovery-category abstraction.
+///
+/// `veks-completion` doesn't define WHICH categories exist — each
+/// consuming crate decides. Implement `CategoryTag` on your own
+/// enum to declare a closed set of categories specific to your
+/// project; commands then return `&'static dyn CategoryTag`
+/// references and the completion engine groups by `tag()`.
+///
+/// Example:
+/// ```ignore
+/// #[derive(Debug, Clone, Copy)]
+/// enum MyCategory { Foo, Bar }
+/// impl veks_completion::CategoryTag for MyCategory {
+///     fn tag(&self) -> &'static str {
+///         match self { Self::Foo => "foo", Self::Bar => "bar" }
+///     }
+/// }
+/// // Static instances per variant for `&'static dyn` returns:
+/// static CAT_FOO: MyCategory = MyCategory::Foo;
+/// static CAT_BAR: MyCategory = MyCategory::Bar;
+/// ```
+///
+/// `tag()` is the stable, lowercase grouping key. Two implementors
+/// returning the same `tag()` are treated as the same group at
+/// completion time.
+pub trait CategoryTag: 'static + Send + Sync + std::fmt::Debug {
+    /// Stable lowercase tag used by completion grouping and help
+    /// rendering as the user-visible category name.
+    fn tag(&self) -> &'static str;
+}
+
 /// A function that provides additional option candidates based on context.
 ///
 /// Called during leaf completion to discover extra `key=` options that
@@ -67,7 +121,57 @@ pub fn fn_provider(f: fn(&str, &[&str]) -> Vec<String>) -> ValueProvider {
 /// words. Returns additional option names (e.g., `["keyspace=", "table="]`).
 pub type DynamicOptionsProvider = fn(partial: &str, context: &[&str]) -> Vec<String>;
 
+/// Default visibility tier when a node doesn't explicitly opt
+/// into a higher tier. Tier 1 means "show on the very first
+/// tab tap" — preserves the pre-stratification behavior for
+/// existing apps that haven't categorized their commands.
+pub const DEFAULT_LEVEL: u32 = 1;
+
+/// Errors produced by [`CommandTree::validate`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MetadataError {
+    /// A registered command lacks a category tag and the tree
+    /// was built with [`CommandTree::require_metadata`].
+    MissingCategory { command: String },
+    /// A registered command lacks an explicit `with_level()`
+    /// call and the tree was built with
+    /// [`CommandTree::require_metadata`].
+    MissingLevel { command: String },
+}
+
+impl std::fmt::Display for MetadataError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MetadataError::MissingCategory { command } =>
+                write!(f, "command '{command}' is missing a category — call \
+                    Node::with_category(...) when registering"),
+            MetadataError::MissingLevel { command } =>
+                write!(f, "command '{command}' is missing an explicit level — \
+                    call Node::with_level(N) when registering"),
+        }
+    }
+}
+
+impl std::error::Error for MetadataError {}
+
 /// A node in the command tree.
+///
+/// Carries two metadata fields used by stratified
+/// (multi-tap) completion:
+///
+/// - `category` — free-form display tag. Apps can group root
+///   commands by category in expanded help / future renderers
+///   (e.g. `workloads`, `documentation`, `tools`).
+/// - `level` — visibility tier. The Nth tab tap reveals every
+///   root-level node with `level <= N`. Default
+///   [`DEFAULT_LEVEL`] (= 1) means "always shown from the
+///   first tap." Use a higher level (2, 3, …) for
+///   less-discoverable commands so the first tap stays focused
+///   on a small set the user wants by default.
+///
+/// Existing callers that didn't set these fields get the
+/// pre-existing behavior automatically (everything visible at
+/// tap 1, no category metadata).
 #[derive(Clone)]
 pub enum Node {
     /// A leaf command with option names and optional value providers.
@@ -79,24 +183,41 @@ pub enum Node {
         value_providers: BTreeMap<String, ValueProvider>,
         /// Optional provider that discovers additional options from context.
         dynamic_options: Option<DynamicOptionsProvider>,
+        /// Display group tag — see type-level docs for usage.
+        category: Option<String>,
+        /// Tap-tier visibility — see type-level docs for
+        /// usage. `None` means "never explicitly set"; the
+        /// effective level resolves to [`DEFAULT_LEVEL`] but
+        /// strict-metadata mode treats `None` as missing.
+        level: Option<u32>,
     },
     /// A group containing named child nodes.
-    Group { children: BTreeMap<String, Node> },
+    Group {
+        children: BTreeMap<String, Node>,
+        category: Option<String>,
+        level: Option<u32>,
+    },
 }
 
 impl std::fmt::Debug for Node {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Node::Leaf { options, flags, value_providers, dynamic_options } => {
+            Node::Leaf { options, flags, value_providers, dynamic_options, category, level } => {
                 f.debug_struct("Leaf")
                     .field("options", options)
                     .field("flags", flags)
                     .field("value_providers", &value_providers.keys().collect::<Vec<_>>())
                     .field("has_dynamic_options", &dynamic_options.is_some())
+                    .field("category", category)
+                    .field("level", level)
                     .finish()
             }
-            Node::Group { children } => {
-                f.debug_struct("Group").field("children", children).finish()
+            Node::Group { children, category, level } => {
+                f.debug_struct("Group")
+                    .field("children", children)
+                    .field("category", category)
+                    .field("level", level)
+                    .finish()
             }
         }
     }
@@ -110,6 +231,8 @@ impl Node {
             flags: std::collections::HashSet::new(),
             value_providers: BTreeMap::new(),
             dynamic_options: None,
+            category: None,
+            level: None,
         }
     }
 
@@ -120,6 +243,8 @@ impl Node {
             flags: flags.iter().map(|s| s.to_string()).collect(),
             value_providers: BTreeMap::new(),
             dynamic_options: None,
+            category: None,
+            level: None,
         }
     }
 
@@ -142,6 +267,57 @@ impl Node {
         self
     }
 
+    /// Tag this node with a display category (e.g. `"workloads"`,
+    /// `"documentation"`). Categories are free-form strings used by
+    /// renderers to group commands; they don't affect completion
+    /// candidate ordering directly.
+    pub fn with_category(mut self, cat: &str) -> Self {
+        match &mut self {
+            Node::Leaf { category, .. } => *category = Some(cat.to_string()),
+            Node::Group { category, .. } => *category = Some(cat.to_string()),
+        }
+        self
+    }
+
+    /// Set the tap-tier visibility for this node. The Nth tab
+    /// tap reveals every root-level node with `level <= N`.
+    /// Default (when `with_level` is not called) is
+    /// [`DEFAULT_LEVEL`] (= 1) — but strict-metadata mode (see
+    /// [`CommandTree::require_metadata`]) treats the absence
+    /// of an explicit call as a registration error.
+    pub fn with_level(mut self, lvl: u32) -> Self {
+        match &mut self {
+            Node::Leaf { level, .. } => *level = Some(lvl),
+            Node::Group { level, .. } => *level = Some(lvl),
+        }
+        self
+    }
+
+    /// Get the node's category tag, if any.
+    pub fn category(&self) -> Option<&str> {
+        match self {
+            Node::Leaf { category, .. } => category.as_deref(),
+            Node::Group { category, .. } => category.as_deref(),
+        }
+    }
+
+    /// Get the node's effective tap-tier level — explicit
+    /// value if set, otherwise [`DEFAULT_LEVEL`].
+    pub fn level(&self) -> u32 {
+        self.level_explicit().unwrap_or(DEFAULT_LEVEL)
+    }
+
+    /// Get the node's *explicit* tap-tier level — `None` when
+    /// `with_level` was never called. Used by strict-metadata
+    /// validation to distinguish "user picked level 1" from
+    /// "user forgot to set a level."
+    pub fn level_explicit(&self) -> Option<u32> {
+        match self {
+            Node::Leaf { level, .. } => *level,
+            Node::Group { level, .. } => *level,
+        }
+    }
+
     /// Check if an option is a boolean flag (no value expected).
     pub fn is_flag(&self, option: &str) -> bool {
         match self {
@@ -156,18 +332,24 @@ impl Node {
             children: children.into_iter()
                 .map(|(k, v)| (k.to_string(), v))
                 .collect(),
+            category: None,
+            level: None,
         }
     }
 
     /// Create an empty group node.
     pub fn empty_group() -> Self {
-        Node::Group { children: BTreeMap::new() }
+        Node::Group {
+            children: BTreeMap::new(),
+            category: None,
+            level: None,
+        }
     }
 
     /// Add a child to a group node. Panics if called on a leaf.
     pub fn with_child(mut self, name: &str, child: Node) -> Self {
         match &mut self {
-            Node::Group { children } => { children.insert(name.to_string(), child); }
+            Node::Group { children, .. } => { children.insert(name.to_string(), child); }
             Node::Leaf { .. } => panic!("cannot add child to leaf node"),
         }
         self
@@ -176,7 +358,7 @@ impl Node {
     /// Get child names (empty for leaves).
     pub fn child_names(&self) -> Vec<&str> {
         match self {
-            Node::Group { children } => children.keys().map(|k| k.as_str()).collect(),
+            Node::Group { children, .. } => children.keys().map(|k| k.as_str()).collect(),
             Node::Leaf { .. } => Vec::new(),
         }
     }
@@ -184,7 +366,7 @@ impl Node {
     /// Get a child by name.
     pub fn child(&self, name: &str) -> Option<&Node> {
         match self {
-            Node::Group { children } => children.get(name),
+            Node::Group { children, .. } => children.get(name),
             Node::Leaf { .. } => None,
         }
     }
@@ -198,6 +380,128 @@ impl Node {
     }
 }
 
+// =====================================================================
+// Strict-metadata builder (compile-time enforcement)
+// =====================================================================
+
+/// Type-state wrapper around [`Node`] that tracks at the type
+/// level whether the node has been given a category and an
+/// explicit tap-tier level.
+///
+/// Used together with [`CommandTree::strict_command`] /
+/// [`CommandTree::strict_group`] to force compile-time
+/// enforcement of the stratified completion contract: an app
+/// that opts into strict mode cannot register an uncategorized
+/// or unleveled command, because the registration call itself
+/// will not type-check unless both fields have been provided.
+///
+/// The two `bool` const generics flip from `false` to `true`
+/// when the matching builder method is called:
+///
+/// - `with_category("…")` → `HAS_CATEGORY = true`
+/// - `with_level(N)`     → `HAS_LEVEL    = true`
+///
+/// Apps that don't want the compile-time check can keep using
+/// the regular [`Node`] API and call
+/// [`CommandTree::require_metadata`] to get an equivalent
+/// runtime check at registration time.
+///
+/// # Successful registration (compiles)
+///
+/// ```
+/// use veks_completion::{CommandTree, StrictNode};
+/// let tree = CommandTree::new("myapp")
+///     .strict_command(
+///         "run",
+///         StrictNode::leaf(&["--cycles=", "--threads="])
+///             .with_category("workloads")
+///             .with_level(1),
+///     );
+/// # let _ = tree;
+/// ```
+///
+/// # Missing category (compile error)
+///
+/// ```compile_fail
+/// use veks_completion::{CommandTree, StrictNode};
+/// let _tree = CommandTree::new("myapp").strict_command(
+///     "bad",
+///     StrictNode::leaf(&[]).with_level(1),  // missing with_category
+/// );
+/// ```
+///
+/// # Missing level (compile error)
+///
+/// ```compile_fail
+/// use veks_completion::{CommandTree, StrictNode};
+/// let _tree = CommandTree::new("myapp").strict_command(
+///     "bad",
+///     StrictNode::leaf(&[]).with_category("x"),  // missing with_level
+/// );
+/// ```
+pub struct StrictNode<const HAS_CATEGORY: bool, const HAS_LEVEL: bool> {
+    inner: Node,
+}
+
+impl StrictNode<false, false> {
+    /// Begin building a strict leaf node. Both `with_category`
+    /// and `with_level` must be called before this can be
+    /// passed to [`CommandTree::strict_command`].
+    pub fn leaf(options: &[&str]) -> Self {
+        Self { inner: Node::leaf(options) }
+    }
+
+    /// Same as [`Node::leaf_with_flags`] but type-state-checked.
+    pub fn leaf_with_flags(options: &[&str], flags: &[&str]) -> Self {
+        Self { inner: Node::leaf_with_flags(options, flags) }
+    }
+
+    /// Begin building a strict group node.
+    pub fn group(children: Vec<(&str, Node)>) -> Self {
+        Self { inner: Node::group(children) }
+    }
+
+    /// Begin from an already-constructed [`Node`]. Useful when
+    /// migrating an existing tree to strict mode incrementally.
+    pub fn from_node(node: Node) -> Self {
+        Self { inner: node }
+    }
+}
+
+impl<const C: bool, const L: bool> StrictNode<C, L> {
+    /// Tag with a category. Flips `HAS_CATEGORY` to `true`.
+    pub fn with_category(self, cat: &str) -> StrictNode<true, L> {
+        StrictNode { inner: self.inner.with_category(cat) }
+    }
+
+    /// Set the tap-tier level. Flips `HAS_LEVEL` to `true`.
+    pub fn with_level(self, lvl: u32) -> StrictNode<C, true> {
+        StrictNode { inner: self.inner.with_level(lvl) }
+    }
+
+    /// Forward through to the inner node's value-provider
+    /// builder.
+    pub fn with_value_provider(mut self, option: &str, provider: ValueProvider) -> Self {
+        self.inner = self.inner.with_value_provider(option, provider);
+        self
+    }
+
+    /// Forward through to the inner node's dynamic-options
+    /// builder.
+    pub fn with_dynamic_options(mut self, provider: DynamicOptionsProvider) -> Self {
+        self.inner = self.inner.with_dynamic_options(provider);
+        self
+    }
+}
+
+impl StrictNode<true, true> {
+    /// Unwrap a fully-qualified strict node into a plain
+    /// [`Node`]. The compile-time guarantee carries through to
+    /// the moment of unwrapping: only nodes that have set both
+    /// category and level can be downgraded.
+    pub fn into_node(self) -> Node { self.inner }
+}
+
 /// The top-level command tree for an application.
 pub struct CommandTree {
     /// Application name (used for env var naming).
@@ -208,6 +512,16 @@ pub struct CommandTree {
     pub hidden: std::collections::HashSet<String>,
     /// Global value providers keyed by option name.
     pub global_value_providers: BTreeMap<String, ValueProvider>,
+    /// When true, every registered command must declare both a
+    /// category (via [`Node::with_category`]) and an explicit
+    /// level (via [`Node::with_level`]). [`Self::command`] /
+    /// [`Self::group`] / [`Self::hidden_command`] panic on
+    /// registration of an undertagged node, surfacing the
+    /// problem at the call site rather than producing a
+    /// silently-uncategorized completion tree at runtime.
+    /// Opt-in for apps that want their stratified completion
+    /// UX enforced at compile-test time.
+    pub strict_metadata: bool,
 }
 
 impl CommandTree {
@@ -221,6 +535,70 @@ impl CommandTree {
             root: Node::empty_group(),
             hidden: std::collections::HashSet::new(),
             global_value_providers: BTreeMap::new(),
+            strict_metadata: false,
+        }
+    }
+
+    /// Opt-in to strict-metadata mode. Every subsequent call
+    /// to [`Self::command`] / [`Self::group`] /
+    /// [`Self::hidden_command`] checks that the node has both
+    /// a category and an explicit level — registration panics
+    /// if either is missing, with a message naming the
+    /// offending command.
+    ///
+    /// Use this in apps that have committed to a stratified
+    /// completion model and want the build to break if a new
+    /// command is added without categorizing it.
+    pub fn require_metadata(mut self) -> Self {
+        self.strict_metadata = true;
+        self
+    }
+
+    /// Walk every registered command and check for missing
+    /// category / level metadata. Returns `Ok(())` when every
+    /// node satisfies the contract; `Err(Vec<MetadataError>)`
+    /// otherwise with one entry per offending command.
+    ///
+    /// Always available regardless of `strict_metadata` — apps
+    /// that want validation as a one-shot post-build check
+    /// (CI test, debug-assert, etc.) can call this directly
+    /// without enabling the panic-at-registration mode.
+    pub fn validate(&self) -> Result<(), Vec<MetadataError>> {
+        let mut errors = Vec::new();
+        if let Node::Group { children, .. } = &self.root {
+            for (name, node) in children {
+                if node.category().is_none() {
+                    errors.push(MetadataError::MissingCategory {
+                        command: name.clone(),
+                    });
+                }
+                if node.level_explicit().is_none() {
+                    errors.push(MetadataError::MissingLevel {
+                        command: name.clone(),
+                    });
+                }
+            }
+        }
+        if errors.is_empty() { Ok(()) } else { Err(errors) }
+    }
+
+    /// Internal: panic if `strict_metadata` is set and `node`
+    /// is missing required metadata. Called from every
+    /// `command`-style registration helper so the error fires
+    /// at the source line that registered the bad node.
+    fn check_strict(&self, name: &str, node: &Node) {
+        if !self.strict_metadata { return; }
+        if node.category().is_none() {
+            panic!("veks-completion: app '{}' has require_metadata() set, \
+                    but command '{name}' was registered without \
+                    Node::with_category(...). Add a category tag.",
+                self.app_name);
+        }
+        if node.level_explicit().is_none() {
+            panic!("veks-completion: app '{}' has require_metadata() set, \
+                    but command '{name}' was registered without \
+                    Node::with_level(...). Pick a tap-tier level (1, 2, 3, ...).",
+                self.app_name);
         }
     }
 
@@ -228,7 +606,41 @@ impl CommandTree {
     ///
     /// This is a builder method — it consumes and returns `self` for chaining.
     pub fn command(mut self, name: &str, node: Node) -> Self {
+        self.check_strict(name, &node);
         self.root = self.root.with_child(name, node);
+        self
+    }
+
+    /// Add a top-level command using the type-state-checked
+    /// [`StrictNode`] API. The signature requires
+    /// `StrictNode<true, true>`, so calling this with a node
+    /// missing either `with_category(...)` or `with_level(...)`
+    /// is a **compile-time** error — no runtime panic, no
+    /// silent skip. Recommended entry point for apps that want
+    /// the stratified completion model strictly enforced.
+    pub fn strict_command(
+        mut self,
+        name: &str,
+        node: StrictNode<true, true>,
+    ) -> Self {
+        self.root = self.root.with_child(name, node.into_node());
+        self
+    }
+
+    /// Type-state-checked alias for grouping. Same compile-time
+    /// guarantee as [`Self::strict_command`].
+    pub fn strict_group(self, name: &str, node: StrictNode<true, true>) -> Self {
+        self.strict_command(name, node)
+    }
+
+    /// Type-state-checked variant of [`Self::hidden_command`].
+    pub fn strict_hidden_command(
+        mut self,
+        name: &str,
+        node: StrictNode<true, true>,
+    ) -> Self {
+        self.hidden.insert(name.to_string());
+        self.root = self.root.with_child(name, node.into_node());
         self
     }
 
@@ -243,6 +655,7 @@ impl CommandTree {
     /// prefix directly — they are just excluded from the initial empty-prefix
     /// candidate list. Useful for aliases and shorthands.
     pub fn hidden_command(mut self, name: &str, node: Node) -> Self {
+        self.check_strict(name, &node);
         self.hidden.insert(name.to_string());
         self.command(name, node)
     }
@@ -313,10 +726,33 @@ fn is_consumed(option: &str, consumed: &std::collections::HashSet<String>) -> bo
 /// Options already present on the command line are excluded. Both
 /// `--flag` and bare `key=` styles are supported and deduplicated.
 /// Dynamic options from context providers are included.
+///
+/// Always operates at tap level 1. For stratified completion
+/// where successive tabs reveal more candidates, use
+/// [`complete_at_tap`].
 pub fn complete(tree: &CommandTree, words: &[&str]) -> Vec<String> {
+    complete_at_tap(tree, words, 1)
+}
+
+/// Stratified completion: returns root-level candidates with
+/// `Node::level() <= tap_count`, so the Nth tab tap reveals
+/// progressively more commands. Inside a subcommand or with a
+/// non-empty partial, behaves identically to [`complete`] —
+/// the level filter applies only when the user is at the
+/// root prompt with no prefix typed.
+///
+/// Default Node level is [`DEFAULT_LEVEL`] (= 1), so apps that
+/// haven't categorized their commands see the same single-tap
+/// behavior they did before stratification.
+pub fn complete_at_tap(tree: &CommandTree, words: &[&str], tap_count: u32) -> Vec<String> {
     if words.len() <= 1 {
         let mut cmds: Vec<String> = tree.root.child_names().iter()
             .filter(|s| !tree.hidden.contains(**s))
+            .filter(|s| {
+                tree.root.child(s)
+                    .map(|n| n.level() <= tap_count)
+                    .unwrap_or(true)
+            })
             .map(|s| s.to_string())
             .collect();
         cmds.sort_by(|a, b| {
@@ -347,18 +783,27 @@ pub fn complete(tree: &CommandTree, words: &[&str]) -> Vec<String> {
     }
 
     match node {
-        Node::Group { children } => {
-            let mut candidates: Vec<String> = children.keys()
-                .filter(|k| k.starts_with(partial))
-                .filter(|k| !at_root || !partial.is_empty() || !tree.hidden.contains(k.as_str()))
-                .map(|k| k.to_string())
+        Node::Group { children, .. } => {
+            let mut candidates: Vec<String> = children.iter()
+                .filter(|(k, _)| k.starts_with(partial))
+                .filter(|(k, _)| !at_root || !partial.is_empty() || !tree.hidden.contains(k.as_str()))
+                // Level filter only applies at root with an
+                // empty partial — once the user has started
+                // typing a specific name, return matching
+                // commands regardless of tap tier so a
+                // partially-typed level-2 command (e.g.
+                // `--ins<TAB>`) still completes on tap 1.
+                .filter(|(_, child)| {
+                    !at_root || !partial.is_empty() || child.level() <= tap_count
+                })
+                .map(|(k, _)| k.to_string())
                 .collect();
             candidates.sort_by(|a, b| {
                 a.starts_with('-').cmp(&b.starts_with('-')).then_with(|| a.cmp(b))
             });
             candidates
         }
-        Node::Leaf { options, flags, value_providers, dynamic_options } => {
+        Node::Leaf { options, flags, value_providers, dynamic_options, .. } => {
             // Check if the previous word is a --option expecting a separate value.
             if let Some(&prev_word) = remaining.last()
                 && prev_word.starts_with("--") && !prev_word.contains('=') && !flags.contains(prev_word) {
@@ -501,12 +946,28 @@ pub fn handle_complete_env(app_name: &str, tree: &CommandTree) -> bool {
 
     let input_key = words[1..].join(" ");
     let tap_count = tap_detect(app_name, &input_key);
-    let expanded = tap_count >= 3 && tap_count % 2 == 1;
 
-    let candidates = if expanded {
-        complete_expanded(tree, &words)
+    // Stratified completion: tap N reveals every command with
+    // `Node::level() <= N`. The legacy "tap 3+ shows the full
+    // expanded `group cmd` view" behavior is still reachable
+    // — when no node opts into a level above 1, all root
+    // commands appear from tap 1 onward, matching the
+    // pre-stratification behavior, and tap 3 reaches
+    // `complete_expanded` for hierarchical group/command
+    // pairs.
+    let candidates = if tap_count >= 3 && tap_count % 2 == 1 {
+        // Odd-numbered tap >= 3 still reaches the expanded
+        // hierarchical view as a final fallback for trees
+        // with deep groups. For flat trees this returns the
+        // same as the level filter at tap_count.
+        let expanded = complete_expanded(tree, &words);
+        if !expanded.is_empty() {
+            expanded
+        } else {
+            complete_at_tap(tree, &words, tap_count)
+        }
     } else {
-        complete(tree, &words)
+        complete_at_tap(tree, &words, tap_count)
     };
 
     for candidate in candidates {
@@ -558,13 +1019,13 @@ pub fn complete_expanded(tree: &CommandTree, words: &[&str]) -> Vec<String> {
     }
 
     let mut results = Vec::new();
-    if let Node::Group { children } = &tree.root {
+    if let Node::Group { children, .. } = &tree.root {
         for (name, node) in children {
             if name == "help" || name.starts_with('-') {
                 continue;
             }
             match node {
-                Node::Group { children: sub } if !sub.is_empty() => {
+                Node::Group { children: sub, .. } if !sub.is_empty() => {
                     for sub_name in sub.keys() {
                         results.push(format!("{} {}", name, sub_name));
                     }
@@ -719,5 +1180,152 @@ mod tests {
     fn word_matches_dashed_to_bare_equivalence() {
         assert!(word_matches_option("--cycles=1000", "cycles="));
         assert!(word_matches_option("cycles=1000", "--cycles"));
+    }
+
+    // ---- stratified tap completion ----
+
+    fn stratified_tree() -> CommandTree {
+        CommandTree::new("nbrs")
+            .command("run",
+                Node::leaf(&["--cycles="])
+                    .with_category("workloads").with_level(1))
+            .command("--inspector",
+                Node::leaf(&[])
+                    .with_category("tools").with_level(2))
+            .command("--summary",
+                Node::leaf(&[])
+                    .with_category("tools").with_level(2))
+            .command("describe",
+                Node::leaf(&[])
+                    .with_category("documentation").with_level(3))
+            .command("bench",
+                Node::leaf(&[])
+                    .with_category("benchmark").with_level(3))
+    }
+
+    #[test]
+    fn tap1_shows_only_level1_commands() {
+        let tree = stratified_tree();
+        let cands = complete_at_tap(&tree, &["nbrs"], 1);
+        assert_eq!(cands, vec!["run".to_string()]);
+    }
+
+    #[test]
+    fn tap2_adds_level2_commands() {
+        let tree = stratified_tree();
+        let cands = complete_at_tap(&tree, &["nbrs"], 2);
+        assert!(cands.contains(&"run".to_string()));
+        assert!(cands.contains(&"--inspector".to_string()));
+        assert!(cands.contains(&"--summary".to_string()));
+        assert!(!cands.contains(&"describe".to_string()),
+            "level-3 'describe' should not appear at tap 2");
+    }
+
+    #[test]
+    fn tap3_shows_everything() {
+        let tree = stratified_tree();
+        let cands = complete_at_tap(&tree, &["nbrs"], 3);
+        assert!(cands.contains(&"run".to_string()));
+        assert!(cands.contains(&"--inspector".to_string()));
+        assert!(cands.contains(&"describe".to_string()));
+        assert!(cands.contains(&"bench".to_string()));
+    }
+
+    #[test]
+    fn level_filter_does_not_block_partial_match() {
+        // Typing `--ins` should still complete to `--inspector`
+        // even at tap 1, where level-2 commands aren't shown
+        // empty-prefix. Once the user has typed a prefix,
+        // they've signaled intent for that specific command.
+        let tree = stratified_tree();
+        let cands = complete_at_tap(&tree, &["nbrs", "--ins"], 1);
+        assert!(cands.contains(&"--inspector".to_string()),
+            "partial-prefix matches should bypass the tap-tier filter");
+    }
+
+    #[test]
+    fn nodes_without_level_default_to_visible() {
+        // Backward-compat: a node that never called
+        // `with_level` resolves to DEFAULT_LEVEL = 1 and is
+        // visible from tap 1. Apps that haven't migrated to
+        // categorized completion see no behavior change.
+        let tree = CommandTree::new("legacy")
+            .command("run", Node::leaf(&[]))
+            .command("describe", Node::leaf(&[]));
+        let cands = complete_at_tap(&tree, &["legacy"], 1);
+        assert!(cands.contains(&"run".to_string()));
+        assert!(cands.contains(&"describe".to_string()));
+    }
+
+    // ---- strict-metadata: type-state enforcement ----
+
+    #[test]
+    fn strict_node_with_full_metadata_compiles() {
+        // The success case — adding a fully-tagged node
+        // through `strict_command` is the canonical strict
+        // mode usage. The compiler doesn't reject this.
+        let _tree = CommandTree::new("app")
+            .strict_command(
+                "run",
+                StrictNode::leaf(&["--cycles="])
+                    .with_category("workloads")
+                    .with_level(1),
+            );
+    }
+
+    // The next two are intentionally `#[ignore]`d compile-fail
+    // demonstrations. They live here as documentation rather
+    // than tests, since `cargo test` won't try to build them
+    // unless explicitly invoked, but a reader can uncomment to
+    // verify the gate fires.
+    //
+    // ```compile_fail,ignore
+    // CommandTree::new("app").strict_command(
+    //     "bad",
+    //     StrictNode::leaf(&[]).with_category("x"),  // missing with_level
+    // );
+    // ```
+    //
+    // ```compile_fail,ignore
+    // CommandTree::new("app").strict_command(
+    //     "bad",
+    //     StrictNode::leaf(&[]).with_level(1),  // missing with_category
+    // );
+    // ```
+
+    // ---- runtime-validation path ----
+
+    #[test]
+    fn runtime_validate_reports_missing_metadata() {
+        let tree = CommandTree::new("app")
+            .command("run",
+                Node::leaf(&[]).with_category("workloads").with_level(1))
+            .command("undertagged", Node::leaf(&[]));
+        let errors = tree.validate().unwrap_err();
+        assert!(errors.iter().any(|e| matches!(e,
+            MetadataError::MissingCategory { command } if command == "undertagged")));
+        assert!(errors.iter().any(|e| matches!(e,
+            MetadataError::MissingLevel { command } if command == "undertagged")));
+        // The properly-tagged 'run' should not appear in errors.
+        assert!(!errors.iter().any(|e| matches!(e,
+            MetadataError::MissingCategory { command } if command == "run")));
+    }
+
+    #[test]
+    fn runtime_validate_passes_when_all_tagged() {
+        let tree = CommandTree::new("app")
+            .command("run",
+                Node::leaf(&[]).with_category("workloads").with_level(1))
+            .command("describe",
+                Node::leaf(&[]).with_category("docs").with_level(3));
+        assert!(tree.validate().is_ok());
+    }
+
+    #[test]
+    #[should_panic(expected = "without Node::with_category")]
+    fn require_metadata_panics_on_undertagged_command() {
+        let _tree = CommandTree::new("app")
+            .require_metadata()
+            .command("bad", Node::leaf(&[])); // missing both
     }
 }
