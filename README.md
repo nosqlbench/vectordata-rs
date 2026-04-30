@@ -8,23 +8,38 @@ experiments, or publishing reproducible benchmarks — vectordata-rs
 handles the data plumbing so you can focus on the search.
 
 ```rust
-use vectordata::TestDataGroup;
-use vectordata::view::TestDataView;
+use vectordata::catalog::sources::CatalogSources;
+use vectordata::catalog::resolver::Catalog;
+use vectordata::{open_facet_typed, TestDataView, TypedReader};
 
-let group = TestDataGroup::load("https://example.com/datasets/sift1m/")?;
-let view = group.profile("default").unwrap();
+// Catalog → profile → reader. The prescribed entry path.
+let catalog = Catalog::of(&CatalogSources::new().configure_default());
+let view    = catalog.open_profile("sift1m", "default")?;
 
-let base = view.base_vectors()?;           // 1M float vectors
-let gt = view.neighbor_indices()?;         // exact KNN ground truth
-let mi = view.metadata_indices()?;         // predicate filter results
+let base = view.base_vectors()?;       // Arc<dyn VectorReader<f32>>  — 1M vectors
+let gt   = view.neighbor_indices()?;   // Arc<dyn VectorReader<i32>>  — exact KNN
+let mi   = view.metadata_indices()?;   // Arc<dyn VvecReader<i32>>    — predicate matches
 
-let nearest = gt.get(0)?;                  // query 0's nearest neighbors
-let matching = mi.get(0)?;                 // base vectors matching predicate 0
+let nearest:  Vec<i32> = gt.get(0)?;
+let matching: Vec<i32> = mi.get(0)?;
+
+// Typed scalar metadata via the same view handle
+let label: TypedReader<u8> = open_facet_typed(&*view, "metadata_content")?;
+let v: u8 = label.get_native(42);
+
+// Make the whole profile zero-copy mmap for hot loops
+view.prebuffer_all()?;
 ```
 
-Local files and remote catalogs use the same API. Uniform vectors
-and variable-length records use the same API. You never pick an
-implementation — just call `open_vec` or `open_vvec` and go.
+You never construct URLs, never name a transport, and never decide
+whether a remote dataset should be cached. The crate picks the
+right backing storage (local mmap, merkle-cached HTTP with
+auto-promotion to mmap, or direct HTTP fallback) from the catalog
+entry alone. Uniform and variable-length facets share the same
+`view.X()` shape; typed scalars come through `open_facet_typed`.
+
+This is the prescribed pattern — full walk-through in
+[Accessing datasets from Rust](./docs/tutorials/access-datasets-from-rust.md).
 
 ## Verified against FAISS and numpy
 
@@ -66,7 +81,8 @@ cargo test -p veks-pipeline --features knnutils \
 
 **[vectordata](./vectordata/)** — the access library. Add it as a
 dependency and read any dataset from anywhere.
-([API Reference](./docs/sysref/02-api.md))
+([Tutorial](./docs/tutorials/access-datasets-from-rust.md) ·
+[API Reference](./docs/sysref/02-api.md))
 
 **[veks](./veks/)** — the CLI. Bootstrap new datasets, run processing
 pipelines, analyze data, publish to catalogs.

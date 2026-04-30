@@ -185,6 +185,12 @@ pub trait TestDataView: Send + Sync {
     /// Returns the distance function name if declared in attributes.
     fn distance_function(&self) -> Option<String>;
 
+    /// Resolved source string (path or URL) for a named facet, if it
+    /// exists. Used by [`open_facet_typed`] so callers holding an
+    /// `Arc<dyn TestDataView>` can construct typed readers without
+    /// knowing the dataset's transport details.
+    fn facet_source(&self, name: &str) -> Option<String>;
+
     // -- Prebuffer / cache --
 
     /// Force-download every standard facet of this profile into the
@@ -245,6 +251,37 @@ pub trait TestDataView: Send + Sync {
     /// usually correct.
     #[doc(hidden)]
     fn open_facet_storage(&self, name: &str) -> Result<FacetStorage>;
+}
+
+/// Open a typed reader for a named facet on any [`TestDataView`].
+///
+/// This is the dyn-compatible companion to
+/// [`GenericTestDataView::open_facet_typed`] — `Arc<dyn TestDataView>`
+/// from `Catalog::open_profile` works directly:
+///
+/// ```no_run
+/// # use std::sync::Arc;
+/// use vectordata::{open_facet_typed, TypedReader, TestDataView};
+/// # fn demo(view: Arc<dyn TestDataView>) -> Result<(), Box<dyn std::error::Error>> {
+/// let meta: TypedReader<i32> = open_facet_typed(&*view, "metadata_content")?;
+/// let label = meta.get_value(42)?;
+/// # let _ = label; Ok(())
+/// # }
+/// ```
+///
+/// The native element type is inferred from the facet's source
+/// extension via [`TestDataView::facet_element_type`]; the transport
+/// is inferred from the source string via [`TypedReader::open_auto`].
+pub fn open_facet_typed<T: crate::typed_access::TypedElement>(
+    view: &dyn TestDataView,
+    facet_name: &str,
+) -> std::result::Result<crate::typed_access::TypedReader<T>, crate::typed_access::TypedAccessError> {
+    let source = view.facet_source(facet_name)
+        .ok_or_else(|| crate::typed_access::TypedAccessError::Io(
+            format!("facet '{facet_name}' not declared by this view")))?;
+    let native = view.facet_element_type(facet_name)
+        .map_err(|e| crate::typed_access::TypedAccessError::Io(e.to_string()))?;
+    crate::typed_access::TypedReader::<T>::open_auto(&source, native)
 }
 
 /// Snapshot of in-progress prebuffer state for a single facet. Passed
@@ -630,6 +667,16 @@ impl TestDataView for GenericTestDataView {
             .get("distance_function")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
+    }
+
+    fn facet_source(&self, name: &str) -> Option<String> {
+        let facet = self.facet_config_by_name(name)?;
+        let raw = facet.source();
+        let path_str = match crate::dataset::source::parse_source_string(raw) {
+            Ok(parsed) => parsed.path,
+            Err(_) => raw.to_string(),
+        };
+        self.resolve_path_str(&path_str).ok()
     }
 
     fn open_facet_storage(&self, name: &str) -> Result<FacetStorage> {

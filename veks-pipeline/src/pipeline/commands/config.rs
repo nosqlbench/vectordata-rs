@@ -33,13 +33,26 @@ pub(crate) fn settings_path() -> PathBuf {
 /// Resolve the configured cache directory from settings.yaml.
 ///
 /// Delegates to [`vectordata::settings::cache_dir`] — the single
-/// source of truth for cache resolution shared with the
-/// `vectordata` crate. Without this delegation, the two parsers
-/// would have to be kept in sync by hand and could (and did)
-/// drift, leaving users with their `cache_dir:` setting silently
-/// honored by one path and ignored by another.
-pub fn configured_cache_dir() -> PathBuf {
+/// source of truth for cache resolution. Returns
+/// [`vectordata::settings::SettingsError`] when `cache_dir:` is not
+/// configured; print the error directly via its `Display` impl,
+/// which carries actionable commands.
+pub fn configured_cache_dir() -> Result<PathBuf, vectordata::settings::SettingsError> {
     vectordata::settings::cache_dir()
+}
+
+/// Convenience wrapper for CLI commands that prefer to bail with a
+/// clean message rather than propagate the error: prints the
+/// configuration help to stderr and exits with code 2 when
+/// `cache_dir:` is unset.
+pub fn configured_cache_dir_or_exit() -> PathBuf {
+    match configured_cache_dir() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(2);
+        }
+    }
 }
 
 /// Simple settings representation.

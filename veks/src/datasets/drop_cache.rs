@@ -20,7 +20,7 @@ pub fn run(
 ) {
     let cache_dir = cache_dir
         .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| crate::pipeline::commands::config::configured_cache_dir());
+        .unwrap_or_else(|| crate::pipeline::commands::config::configured_cache_dir_or_exit());
 
     if !cache_dir.exists() {
         println!("Cache directory does not exist: {}", cache_dir.display());

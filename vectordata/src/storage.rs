@@ -82,12 +82,20 @@ impl Storage {
     }
 
     /// Open a remote URL with cache-first dispatch. Tries to fetch the
-    /// `.mref` and open a `Storage::Cached`; on failure (no `.mref`
-    /// published, network error on the mref alone), falls back to
-    /// `Storage::Http`. The fallback is silent on purpose — cache is
-    /// best-effort, not required for correctness.
+    /// `.mref` and open a `Storage::Cached`; on `.mref` absence
+    /// (404 / no published reference) falls back to `Storage::Http`.
+    /// The fallback covers the legitimate "remote source has no
+    /// merkle reference published" case; it does **not** mask
+    /// configuration problems.
+    ///
+    /// If `vectordata::settings::cache_dir()` returns
+    /// `Err(SettingsError::NotConfigured)`, this function surfaces
+    /// the actionable error — there is no silent fallback to a
+    /// default cache directory.
     pub(crate) fn open_url(url: Url) -> io::Result<Self> {
-        match Self::open_url_cached(url.clone(), &default_cache_dir()) {
+        let cache_root = default_cache_dir()
+            .map_err(|e| io::Error::new(io::ErrorKind::NotFound, e.to_string()))?;
+        match Self::open_url_cached(url.clone(), &cache_root) {
             Ok(s) => Ok(s),
             Err(_) => Self::open_url_http(url),
         }

@@ -125,7 +125,10 @@ pub mod group;
 
 pub use group::TestDataGroup;
 pub use model::FacetConfig;
-pub use view::{CacheStats, FacetDescriptor, FacetStorage, PrebufferProgress, TestDataView};
+pub use view::{
+    CacheStats, FacetDescriptor, FacetStorage, PrebufferProgress, TestDataView,
+    open_facet_typed,
+};
 pub use io::{VectorReader, VvecReader, XvecReader, IndexedVvecReader, IoError};
 pub use typed_access::{ElementType, TypedAccessError, TypedReader};
 

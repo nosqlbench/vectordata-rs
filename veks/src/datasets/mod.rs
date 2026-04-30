@@ -353,7 +353,7 @@ pub fn run(args: DatasetsArgs) {
             } else if let Some(ds) = dataset {
                 cache::run_cache_status(&ds, verbose, &configdir, &catalog, &at);
                 if tree {
-                    let cache_dir = crate::pipeline::commands::config::configured_cache_dir();
+                    let cache_dir = crate::pipeline::commands::config::configured_cache_dir_or_exit();
                     let ds_cache = cache_dir.join(&ds);
                     if ds_cache.is_dir() {
                         println!();

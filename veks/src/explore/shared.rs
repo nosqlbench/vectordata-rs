@@ -220,7 +220,7 @@ pub(super) fn resolve_source(source: &str) -> PathBuf {
 
 /// Get the configured vectordata cache directory from settings.yaml.
 pub(super) fn dirs_cache_dir() -> PathBuf {
-    crate::pipeline::commands::config::configured_cache_dir()
+    crate::pipeline::commands::config::configured_cache_dir_or_exit()
 }
 
 /// Format-agnostic vector reader that returns f64 values.

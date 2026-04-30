@@ -85,7 +85,7 @@ impl PickerRow {
 }
 
 fn build_rows(entries: &[CatalogEntry]) -> Vec<PickerRow> {
-    let cache_dir = crate::pipeline::commands::config::configured_cache_dir();
+    let cache_dir = crate::pipeline::commands::config::configured_cache_dir_or_exit();
     let mut rows = Vec::new();
     for entry in entries {
         let metric = entry.layout.attributes.as_ref()

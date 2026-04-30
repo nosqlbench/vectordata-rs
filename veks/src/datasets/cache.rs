@@ -8,7 +8,7 @@ use std::path::Path;
 pub fn run(cache_dir: Option<&Path>, verbose: bool) {
     let cache_dir = cache_dir
         .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| crate::pipeline::commands::config::configured_cache_dir());
+        .unwrap_or_else(|| crate::pipeline::commands::config::configured_cache_dir_or_exit());
 
     if !cache_dir.exists() {
         println!("Cache directory does not exist: {}", crate::check::rel_display(&cache_dir));
@@ -81,7 +81,7 @@ pub fn run_cache_status_all(
     extra_catalogs: &[String],
     at: &[String],
 ) {
-    let cache_dir = crate::pipeline::commands::config::configured_cache_dir();
+    let cache_dir = crate::pipeline::commands::config::configured_cache_dir_or_exit();
     println!("Cache directory: {}", crate::check::rel_display(&cache_dir));
     println!();
 
@@ -139,7 +139,7 @@ pub fn run_cache_status(
     use crate::catalog::resolver::Catalog;
     use crate::catalog::sources::CatalogSources;
 
-    let cache_dir = crate::pipeline::commands::config::configured_cache_dir();
+    let cache_dir = crate::pipeline::commands::config::configured_cache_dir_or_exit();
     let ds_cache = cache_dir.join(dataset_name);
 
     // Load catalog to get profile info

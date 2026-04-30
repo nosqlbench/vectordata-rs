@@ -29,7 +29,7 @@ pub fn run(
 ) {
     let cache = cache_dir
         .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| crate::pipeline::commands::config::configured_cache_dir());
+        .unwrap_or_else(|| crate::pipeline::commands::config::configured_cache_dir_or_exit());
 
     // Try local path first
     let local = Path::new(dataset_spec);

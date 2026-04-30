@@ -15,7 +15,12 @@ use url::Url;
 /// thin wrapper so existing call sites stay terse; the actual
 /// resolution lives in `settings.rs` so `vectordata` and consuming
 /// crates share one canonical implementation.
-pub(crate) fn default_cache_dir() -> PathBuf {
+///
+/// Returns [`crate::settings::SettingsError`] when `cache_dir:` is
+/// not configured — there is no silent fallback. Callers that need
+/// to surface the error to the user should print it directly; its
+/// `Display` impl carries actionable commands.
+pub(crate) fn default_cache_dir() -> Result<PathBuf, crate::settings::SettingsError> {
     crate::settings::cache_dir()
 }
 
