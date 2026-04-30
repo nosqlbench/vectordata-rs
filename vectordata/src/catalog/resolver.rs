@@ -352,13 +352,11 @@ fn dir_name_of_path(path: &str) -> String {
     }
 }
 
-/// Fetch content from an HTTP(S) URL using reqwest (blocking).
+/// Fetch content from an HTTP(S) URL using the process-wide shared
+/// `reqwest::blocking::Client` so cert loading and DNS/connection
+/// pool state amortise across every catalog access.
 fn fetch_http(url: &str) -> Result<String, String> {
-    let client = reqwest::blocking::Client::builder()
-        .user_agent("vectordata/0.14")
-        .redirect(reqwest::redirect::Policy::limited(10))
-        .build()
-        .map_err(|e| format!("HTTP client error: {}", e))?;
+    let client = crate::transport::shared_client();
 
     let response = client.get(url).send()
         .map_err(|e| format!("HTTP request to {} failed: {}", url, e))?;

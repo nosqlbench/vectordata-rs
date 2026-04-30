@@ -6,9 +6,14 @@
 //! HTTP file server for integration tests.
 //!
 //! Uses axum + tower-http ServeDir for correct static file serving
-//! with HEAD, GET, and Range request support.
+//! with HEAD, GET, and Range request support. Counts accepted TCP
+//! connections (`accepted_connections()`) so tests can assert that
+//! a client is reusing a pooled connection across many requests
+//! instead of opening a fresh socket each time.
 
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// An HTTP server that serves files from a directory.
 ///
@@ -18,6 +23,7 @@ pub struct TestServer {
     port: u16,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
+    accepted: Arc<AtomicU64>,
 }
 
 impl TestServer {
@@ -26,6 +32,8 @@ impl TestServer {
         let root = root.to_path_buf();
         let (port_tx, port_rx) = std::sync::mpsc::channel();
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let accepted = Arc::new(AtomicU64::new(0));
+        let accepted_for_thread = Arc::clone(&accepted);
 
         let thread = std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -44,10 +52,45 @@ impl TestServer {
                 let addr = listener.local_addr().unwrap();
                 port_tx.send(addr.port()).unwrap();
 
-                axum::serve(listener, app)
-                    .with_graceful_shutdown(async { let _ = shutdown_rx.await; })
-                    .await
-                    .unwrap();
+                // Custom accept loop so we can count incoming TCP
+                // connections. axum::serve hides the accept layer,
+                // so we drive it manually with hyper-util's
+                // TokioExecutor + auto::Builder. Each accepted
+                // socket bumps `accepted_for_thread`; one HTTP/1.1
+                // keep-alive connection serving N requests counts
+                // as 1 — exactly the signal the pooling test needs.
+                use hyper_util::rt::{TokioExecutor, TokioIo};
+                use hyper_util::server::conn::auto;
+                use tower::Service;
+
+                let mut shutdown_rx = shutdown_rx;
+                loop {
+                    tokio::select! {
+                        _ = &mut shutdown_rx => break,
+                        accept = listener.accept() => {
+                            let (stream, _peer) = match accept {
+                                Ok(s) => s,
+                                Err(_) => continue,
+                            };
+                            accepted_for_thread.fetch_add(1, Ordering::Relaxed);
+                            let app = app.clone();
+                            tokio::spawn(async move {
+                                let io = TokioIo::new(stream);
+                                let svc = hyper::service::service_fn(move |req| {
+                                    let mut app = app.clone();
+                                    async move {
+                                        Ok::<_, std::convert::Infallible>(
+                                            app.call(req).await.unwrap()
+                                        )
+                                    }
+                                });
+                                let _ = auto::Builder::new(TokioExecutor::new())
+                                    .serve_connection(io, svc)
+                                    .await;
+                            });
+                        }
+                    }
+                }
             });
         });
 
@@ -58,6 +101,7 @@ impl TestServer {
             port,
             shutdown: Some(shutdown_tx),
             thread: Some(thread),
+            accepted,
         })
     }
 
@@ -66,9 +110,17 @@ impl TestServer {
         format!("http://127.0.0.1:{}/", self.port)
     }
 
-    #[allow(dead_code)]
     pub fn port(&self) -> u16 {
         self.port
+    }
+
+    /// Total number of TCP connections accepted since the server
+    /// started. A reused HTTP/1.1 keep-alive connection counts as
+    /// 1 regardless of how many requests it served — so tests can
+    /// assert connection-pool reuse by comparing this count to the
+    /// number of requests they made.
+    pub fn accepted_connections(&self) -> u64 {
+        self.accepted.load(Ordering::Relaxed)
     }
 }
 

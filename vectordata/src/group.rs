@@ -11,7 +11,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use url::Url;
-use reqwest::blocking::Client;
 
 /// The location of the dataset source.
 #[derive(Clone, Debug)]
@@ -123,7 +122,7 @@ impl TestDataGroup {
             url.join(".")?
         };
 
-        let client = Client::new();
+        let client = crate::transport::shared_client();
 
         // Try dataset.yaml first
         let dataset_url = base_url.join("dataset.yaml")?;

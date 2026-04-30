@@ -205,6 +205,48 @@ bypassing the cache; variable-length vvec having no cached path at
 all) are impossible by construction once every shape adapter routes
 through `Storage`.
 
+## Process-wide `Storage` singleton and shared HTTP client
+
+Two cross-cutting properties keep the storage layer fast and
+correct under concurrent access:
+
+**Per-source singleton.** `Storage::open(source)` returns an
+`Arc<Storage>` from a process-wide registry keyed on canonical
+source identity (URL string after parse round-trip; canonicalised
+absolute path for local files). Concurrent opens against the same
+source return the same `Arc`. Per-source serialization at open time
+ensures the underlying I/O (`.mref` fetch, cache file open) runs
+exactly once even if N threads call `open()` simultaneously — the
+rest block on a per-key condvar and clone the result.
+
+This makes "N threads reading the same dataset" safe by
+construction: there is no second writer to race with on the cache
+file, no parallel `.mref` fetches, and no per-thread `CachedChannel`
+state to drift. Without it, concurrent opens would each construct
+their own `CachedChannel` with independent `MerkleState`, and a
+reader could observe `state.mark_valid()` from one channel before
+another channel's `file.write_all()` had reached the page cache —
+producing the "invalid dimension 0" race that motivates this
+section.
+
+Entries are stored as `Weak<Storage>` so a `Storage` is freed once
+every reader against it drops; the next open re-creates it.
+
+**Shared HTTP client.** A single
+`reqwest::blocking::Client` lives in
+`vectordata::transport::shared_client_inner()` (a `OnceLock`).
+Every internal site that needs a client clones from this singleton
+(`Client` is internally `Arc`-wrapped; clones are cheap and share
+the connection pool, DNS cache, and TLS session state).
+
+Why this matters: `reqwest::blocking::Client::new()` triggers
+`rustls_native_certs::load_native_certs`, which walks
+`/etc/ssl/certs/` and base64-decodes every PEM (~1 ms on Linux).
+A downstream consumer's flame graph showed 35% of CPU going to
+`ClientHandle::new` because vectordata constructed a fresh Client
+at multiple sites. Routing every site through the singleton kills
+the cert-load tax and makes pooling effective process-wide.
+
 ## Strict prebuffer contract and cross-instance lazy promotion
 
 `Storage::prebuffer` honours a strict contract: when `Ok(())`

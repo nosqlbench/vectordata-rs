@@ -790,6 +790,43 @@ veks datasets cache
 
 ---
 
+## 2.12a Process-wide singleton and connection caching
+
+Two performance/correctness properties consumers can rely on:
+
+**Per-source `Storage` singleton.** Every public reader open
+ultimately routes through `Storage::open(source)`, which keys on
+canonical source identity (URL or canonicalised path) and returns
+the same `Arc<Storage>` for concurrent opens of the same source.
+Concrete consequences:
+
+- N threads each calling `view.base_vectors()` against the same
+  dataset get readers that share one underlying `Storage` (one
+  cache file handle, one `MerkleState`, one mmap promotion).
+- Per-source serialization at open time means the `.mref` fetch
+  and cache-file open run exactly once even if many threads race
+  at session-init.
+- A pre-existing `Storage` whose readers all dropped is garbage-
+  collected lazily; the next open re-creates it.
+
+This makes the "session-init prebuffer + per-cycle reads from
+many threads" pattern safe by construction. The
+`many_parallel_opens_of_same_url_dont_corrupt_reads` and
+`parallel_opens_share_single_cache_channel` integration tests
+lock this in.
+
+**Shared `reqwest::blocking::Client`.** A single client lives
+process-wide; every internal HTTP site clones from it. The clone
+is cheap (the client is internally `Arc`-wrapped) and shares the
+connection pool, DNS cache, and TLS session state. Without this,
+each `Client::new()` would trigger
+`rustls_native_certs::load_native_certs` (~1 ms on Linux walking
+`/etc/ssl/certs/`). The
+`many_per_record_reads_share_one_tcp_connection`,
+`many_storage_opens_share_one_client_no_cert_load_storm`, and
+`shared_client_is_singleton_across_storages` integration tests
+lock in the connection-pool reuse property.
+
 ## 2.13 Thread Safety
 
 All reader types are `Send + Sync`:

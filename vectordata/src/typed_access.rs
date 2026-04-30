@@ -234,8 +234,8 @@ impl<T: TypedElement> TypedReader<T> {
         if T::width() < native_type.byte_width() {
             return Err(TypedAccessError::Narrowing { native: native_type, target: T::type_name() });
         }
-        let storage = Arc::new(Storage::open_path(path)
-            .map_err(|e| TypedAccessError::Io(format!("open {}: {e}", path.display())))?);
+        let storage = Storage::open_path(path)
+            .map_err(|e| TypedAccessError::Io(format!("open {}: {e}", path.display())))?;
         let is_scalar = ElementType::is_scalar_format(path);
         Self::from_storage(storage, native_type, is_scalar)
     }
@@ -247,8 +247,8 @@ impl<T: TypedElement> TypedReader<T> {
             return Err(TypedAccessError::Narrowing { native: native_type, target: T::type_name() });
         }
         let is_scalar = is_scalar_url_path(url.path());
-        let storage = Arc::new(Storage::open_url(url.clone())
-            .map_err(|e| TypedAccessError::Io(format!("open_url {url}: {e}")))?);
+        let storage = Storage::open_url(url.clone())
+            .map_err(|e| TypedAccessError::Io(format!("open_url {url}: {e}")))?;
         Self::from_storage(storage, native_type, is_scalar)
     }
 

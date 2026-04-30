@@ -17,6 +17,89 @@ pub use progress::DownloadProgress;
 pub use retry::RetryPolicy;
 
 use std::io;
+use std::sync::OnceLock;
+use std::time::Duration;
+
+/// Process-wide `reqwest::blocking::Client`. Constructed exactly
+/// once on first access; subsequent calls are atomic-load cheap.
+///
+/// Why this exists: building a `reqwest::blocking::Client` triggers
+/// `rustls_native_certs::load_native_certs` (~1 ms on Linux —
+/// walks `/etc/ssl/certs/`, base64-decodes every PEM), plus the
+/// runtime/connection-pool/DNS-cache state that the Client wraps.
+/// A flamegraph from a downstream consumer showed 35% of CPU
+/// going to `ClientHandle::new` because vectordata constructed a
+/// fresh Client at multiple sites. Routing everything through
+/// this single shared client kills both the cert-load tax and
+/// makes the connection pool / DNS cache effective process-wide.
+///
+/// `reqwest::blocking::Client` wraps an inner `Arc`, so cloning is
+/// cheap. Callers that need an owned `Client` (e.g. to pass into
+/// `HttpTransport::with_client`) should call `shared_client()`,
+/// which clones from the singleton.
+fn shared_client_inner() -> &'static reqwest::blocking::Client {
+    static SHARED: OnceLock<reqwest::blocking::Client> = OnceLock::new();
+    SHARED.get_or_init(|| {
+        reqwest::blocking::Client::builder()
+            .user_agent(concat!("vectordata/", env!("CARGO_PKG_VERSION")))
+            .pool_max_idle_per_host(64)
+            .redirect(reqwest::redirect::Policy::limited(10))
+            .timeout(Duration::from_secs(60 * 60)) // 1 h ceiling on long-running large fetches
+            .build()
+            .expect("vectordata shared HTTP client")
+    })
+}
+
+/// Obtain a clone of the process-wide shared client. The clone is
+/// cheap (`Client` is internally `Arc`-wrapped) and shares the
+/// connection pool, DNS cache, and TLS session state.
+pub(crate) fn shared_client() -> reqwest::blocking::Client {
+    shared_client_inner().clone()
+}
+
+#[cfg(test)]
+mod shared_client_tests {
+    use super::*;
+
+    /// `shared_client_inner()` must return the same `Client`
+    /// reference on every call — that's the singleton invariant
+    /// that prevents `load_native_certs` from running per request.
+    /// Verified by pointer equality on the underlying `Client`.
+    #[test]
+    fn shared_client_inner_returns_singleton() {
+        let a = shared_client_inner() as *const _;
+        let b = shared_client_inner() as *const _;
+        assert_eq!(a, b, "shared_client_inner must return the same singleton");
+    }
+
+    /// `shared_client()` clones from the singleton. The clones are
+    /// distinct values but they share the same internal state
+    /// (reqwest::blocking::Client is internally Arc-wrapped, so
+    /// clones share the connection pool). We can't reach inside
+    /// the Client to assert Arc-pointer equality without going
+    /// through reqwest internals, so we instead exercise the
+    /// observable behaviour: many clones can be created cheaply
+    /// (no per-clone cert load).
+    #[test]
+    fn shared_client_clone_is_cheap() {
+        // Warm the singleton.
+        let _ = shared_client();
+        let start = std::time::Instant::now();
+        // 10_000 clones; the bar is "no cert loading happens
+        // here" — should easily complete in well under a second.
+        // load_native_certs alone takes ~1 ms, so 10k of them
+        // would be ~10 s. Set a generous 500 ms ceiling that
+        // would still catch any regression that started loading
+        // certs per clone.
+        for _ in 0..10_000 {
+            let _ = shared_client();
+        }
+        let elapsed = start.elapsed();
+        assert!(elapsed.as_millis() < 500,
+            "10_000 shared_client() calls took {elapsed:?}; if this exceeds \
+             500 ms a per-clone load_native_certs has reappeared somewhere");
+    }
+}
 
 /// Fetch a small remote file to a local path, preserving the remote
 /// `Last-Modified` timestamp as the local mtime.
@@ -26,10 +109,7 @@ use std::io;
 /// is newer than the local copy. Returns `Ok(true)` if the file was
 /// downloaded/updated, `Ok(false)` if the local copy is current.
 pub fn fetch_if_modified(url: &str, local_path: &std::path::Path) -> io::Result<bool> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    let client = shared_client();
 
     // If we have a local copy, do a quick HEAD check
     if local_path.exists() {

@@ -19,7 +19,7 @@
 
 use std::io;
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::sync::atomic::AtomicU64;
 
 use memmap2::Mmap;
@@ -71,39 +71,173 @@ pub(crate) enum Storage {
     },
 }
 
-impl Storage {
-    /// Open from a path or URL string. Local paths get `Mmap`; URLs
-    /// try `Cached` first (fetches `.mref`), fall back to `Http` when
-    /// no `.mref` is published.
-    pub(crate) fn open(source: &str) -> io::Result<Self> {
-        if source.starts_with("http://") || source.starts_with("https://") {
-            let url = Url::parse(source)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("invalid URL '{source}': {e}")))?;
-            Self::open_url(url)
-        } else {
-            Self::open_path(Path::new(source))
+/// Process-wide registry of `Storage` instances keyed on the
+/// canonical source identity (URL string for remote, absolute
+/// canonicalised path for local). Multiple opens against the same
+/// source return the same `Arc<Storage>` so all readers share one
+/// `CachedChannel`, one `MerkleState`, one cache file handle, and
+/// one mmap promotion.
+///
+/// Without this, two `Storage::Cached` against the same URL would
+/// each have independent state, and concurrent reads could observe
+/// the cache file mid-write (the .mrkl saved as "chunk valid" by
+/// thread A while thread B's open is processing — A's writes haven't
+/// been flushed through B's separate file handle yet, so B reads
+/// the pre-allocated zero bytes and fails with "invalid dimension 0").
+///
+/// Entries are stored as `Weak<Storage>` so a `Storage` is freed
+/// once every reader against it drops. The next open re-creates it.
+fn registry() -> &'static std::sync::Mutex<std::collections::HashMap<String, std::sync::Weak<Storage>>> {
+    static REGISTRY: OnceLock<std::sync::Mutex<std::collections::HashMap<String, std::sync::Weak<Storage>>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Per-key open-in-progress coordinator. When N threads concurrently
+/// call `Storage::open(source)` against the same source, only the
+/// first thread actually does the I/O; the rest block on the
+/// `Condvar` and pick up the result without re-doing the work.
+///
+/// Without this, parallel opens against the same URL would each do
+/// their own .mref fetch + chunk-0 download, wasting ~N round trips
+/// for the same single resource (and producing the connection
+/// storm a downstream consumer's flame graph showed).
+struct OpenInFlight {
+    result: std::sync::Mutex<Option<Result<Arc<Storage>, String>>>,
+    notify: std::sync::Condvar,
+}
+
+fn in_flight_opens() -> &'static std::sync::Mutex<std::collections::HashMap<String, Arc<OpenInFlight>>> {
+    static MAP: OnceLock<std::sync::Mutex<std::collections::HashMap<String, Arc<OpenInFlight>>>> = OnceLock::new();
+    MAP.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Compute the registry key for a source string. URLs key on the
+/// URL itself (after parse round-trip for normalisation). Local
+/// paths key on canonicalised absolute path so `./foo` and the
+/// equivalent absolute path map to the same instance.
+fn registry_key(source: &str) -> String {
+    if source.starts_with("http://") || source.starts_with("https://") {
+        match Url::parse(source) {
+            Ok(u) => u.to_string(),
+            Err(_) => source.to_string(),
         }
+    } else {
+        std::fs::canonicalize(source)
+            .ok()
+            .and_then(|p| p.to_str().map(|s| s.to_string()))
+            .unwrap_or_else(|| source.to_string())
+    }
+}
+
+impl Storage {
+    /// Open from a path or URL string. Returns a process-wide shared
+    /// `Arc<Storage>` per source — concurrent opens against the same
+    /// URL or path get the same instance, so they share the cached
+    /// channel, file handle, mmap promotion, and download state.
+    /// This is what makes "many threads reading the same dataset"
+    /// safe by construction: there is no possible second writer to
+    /// race with.
+    ///
+    /// Per-source serialization: when N threads call `open()` for
+    /// the same source concurrently, only the first thread actually
+    /// performs the open I/O (`.mref` fetch, cache file open, etc).
+    /// The rest block on a per-key condvar and clone the resulting
+    /// `Arc<Storage>` without re-doing the work.
+    pub(crate) fn open(source: &str) -> io::Result<Arc<Self>> {
+        let key = registry_key(source);
+
+        // Fast path: already in registry, still alive.
+        if let Some(arc) = registry().lock().unwrap().get(&key).and_then(|w| w.upgrade()) {
+            return Ok(arc);
+        }
+
+        // Per-key coordinator: insert a pending entry if we're
+        // first; otherwise wait for the in-flight open to complete.
+        let (in_flight, we_are_opener) = {
+            let mut map = in_flight_opens().lock().unwrap();
+            if let Some(existing) = map.get(&key).cloned() {
+                (existing, false)
+            } else {
+                let entry = Arc::new(OpenInFlight {
+                    result: std::sync::Mutex::new(None),
+                    notify: std::sync::Condvar::new(),
+                });
+                map.insert(key.clone(), Arc::clone(&entry));
+                (entry, true)
+            }
+        };
+
+        if !we_are_opener {
+            // Block until the chosen opener publishes a result.
+            let mut result = in_flight.result.lock().unwrap();
+            while result.is_none() {
+                result = in_flight.notify.wait(result).unwrap();
+            }
+            return match result.as_ref().unwrap() {
+                Ok(arc) => Ok(Arc::clone(arc)),
+                Err(msg) => Err(io::Error::new(io::ErrorKind::Other, msg.clone())),
+            };
+        }
+
+        // We're the chosen opener. Do the open exactly once.
+        let opened: io::Result<Arc<Storage>> = (|| {
+            // Recheck registry: another thread may have inserted
+            // and dropped between our fast-path check and now.
+            if let Some(arc) = registry().lock().unwrap().get(&key).and_then(|w| w.upgrade()) {
+                return Ok(arc);
+            }
+            let storage = if source.starts_with("http://") || source.starts_with("https://") {
+                let url = Url::parse(source)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("invalid URL '{source}': {e}")))?;
+                Self::open_url_uncached(url)?
+            } else {
+                Self::open_path_uncached(Path::new(source))?
+            };
+            let arc = Arc::new(storage);
+            registry().lock().unwrap().insert(key.clone(), Arc::downgrade(&arc));
+            Ok(arc)
+        })();
+
+        // Publish result and notify waiters before returning.
+        {
+            let mut result = in_flight.result.lock().unwrap();
+            *result = Some(match &opened {
+                Ok(arc) => Ok(Arc::clone(arc)),
+                Err(e) => Err(e.to_string()),
+            });
+            in_flight.notify.notify_all();
+        }
+        // Remove the in-flight entry so future opens (after Arc
+        // drop) can re-trigger the open path.
+        in_flight_opens().lock().unwrap().remove(&key);
+        opened
     }
 
-    /// Open a local file by mmap. Returns `Storage::Mmap`.
-    pub(crate) fn open_path(path: &Path) -> io::Result<Self> {
+    /// Open a local file by mmap, returned via the shared registry.
+    pub(crate) fn open_path(path: &Path) -> io::Result<Arc<Self>> {
+        Self::open(path.to_str().ok_or_else(|| io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("non-UTF8 path: {}", path.display()),
+        ))?)
+    }
+
+    /// Crate-internal: build a fresh local-file `Storage::Mmap` (no
+    /// registry lookup). Used by `Storage::open` after a registry miss.
+    fn open_path_uncached(path: &Path) -> io::Result<Self> {
         let file = std::fs::File::open(path)?;
         let mmap = unsafe { Mmap::map(&file) }?;
         Ok(Storage::Mmap(mmap))
     }
 
-    /// Open a remote URL with cache-first dispatch. Tries to fetch the
-    /// `.mref` and open a `Storage::Cached`; on `.mref` absence
-    /// (404 / no published reference) falls back to `Storage::Http`.
-    /// The fallback covers the legitimate "remote source has no
-    /// merkle reference published" case; it does **not** mask
-    /// configuration problems.
-    ///
-    /// If `vectordata::settings::cache_dir()` returns
-    /// `Err(SettingsError::NotConfigured)`, this function surfaces
-    /// the actionable error — there is no silent fallback to a
-    /// default cache directory.
-    pub(crate) fn open_url(url: Url) -> io::Result<Self> {
+    /// Open a remote URL via the shared registry.
+    pub(crate) fn open_url(url: Url) -> io::Result<Arc<Self>> {
+        Self::open(url.as_str())
+    }
+
+    /// Crate-internal: open a fresh URL-backed `Storage` (no
+    /// registry lookup). Tries `.mref`-cached first, falls back to
+    /// direct HTTP. Used by `Storage::open` after a registry miss.
+    fn open_url_uncached(url: Url) -> io::Result<Self> {
         let cache_root = default_cache_dir()
             .map_err(|e| io::Error::new(io::ErrorKind::NotFound, e.to_string()))?;
         match Self::open_url_cached(url.clone(), &cache_root) {
@@ -116,7 +250,7 @@ impl Storage {
     /// published `.mref`. Crate-internal; callers go through
     /// `open_url` so the fallback path runs uniformly.
     pub(crate) fn open_url_cached(url: Url, cache_root: &Path) -> io::Result<Self> {
-        let client = reqwest::blocking::Client::new();
+        let client = crate::transport::shared_client();
         let mref_url_str = format!("{}.mref", url.as_str());
         let mref_url = Url::parse(&mref_url_str)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("invalid mref URL: {e}")))?;

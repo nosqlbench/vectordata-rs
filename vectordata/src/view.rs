@@ -747,8 +747,8 @@ impl TestDataView for GenericTestDataView {
             Err(_) => raw.to_string(),
         };
         let resolved = self.resolve_path_str(&path_str)?;
-        let storage = std::sync::Arc::new(crate::storage::Storage::open(&resolved)
-            .map_err(|e| Error::Other(format!("storage open '{name}': {e}")))?);
+        let storage = crate::storage::Storage::open(&resolved)
+            .map_err(|e| Error::Other(format!("storage open '{name}': {e}")))?;
         Ok(FacetStorage::new(storage))
     }
 }

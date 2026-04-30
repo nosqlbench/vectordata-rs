@@ -25,10 +25,14 @@ pub struct HttpTransport {
 }
 
 impl HttpTransport {
-    /// Create a new HTTP transport for the given URL.
+    /// Create a new HTTP transport for the given URL. Reuses the
+    /// process-wide shared `reqwest::blocking::Client` rather than
+    /// constructing a fresh one — `Client::new()` triggers a full
+    /// native-cert load that dominates per-request CPU when called
+    /// repeatedly.
     pub fn new(url: Url) -> Self {
         HttpTransport {
-            client: Client::new(),
+            client: super::shared_client(),
             url,
             content_length: OnceLock::new(),
             supports_range: OnceLock::new(),

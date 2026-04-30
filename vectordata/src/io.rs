@@ -279,21 +279,21 @@ impl<T: VvecElement> XvecReader<T> {
     /// the merkle-cache path first and fall back to direct HTTP.
     pub fn open(source: &str) -> Result<Self, IoError> {
         validate_element_for_source(source)?;
-        let storage = Arc::new(Storage::open(source)?);
+        let storage = Storage::open(source)?;
         Self::from_storage(storage)
     }
 
     /// Open a local file by path. Functionally equivalent to
     /// `open(path.to_str().unwrap())` but skips URL parsing.
     pub fn open_path(path: &Path) -> Result<Self, IoError> {
-        let storage = Arc::new(Storage::open_path(path)?);
+        let storage = Storage::open_path(path)?;
         Self::from_storage(storage)
     }
 
     /// Open a remote URL with cache-first dispatch. Equivalent to
     /// `open(url.as_str())` but takes a parsed `Url` directly.
     pub fn open_url(url: Url) -> Result<Self, IoError> {
-        let storage = Arc::new(Storage::open_url(url)?);
+        let storage = Storage::open_url(url)?;
         Self::from_storage(storage)
     }
 
@@ -450,7 +450,7 @@ impl<T: VvecElement> IndexedVvecReader<T> {
                 "extension '.{ext}' implies {inferred}-byte elements but type {} requires {}",
                 std::any::type_name::<T>(), T::ELEM_SIZE)));
         }
-        let storage = Arc::new(Storage::open_path(path)?);
+        let storage = Storage::open_path(path)?;
         let offsets = load_or_build_local_offsets(path, &storage, T::ELEM_SIZE)?;
         Ok(Self { storage, offsets, elem_size: T::ELEM_SIZE, _phantom: PhantomData })
     }
@@ -474,7 +474,7 @@ impl<T: VvecElement> IndexedVvecReader<T> {
         }
 
         let is_remote = source.starts_with("http://") || source.starts_with("https://");
-        let storage = Arc::new(Storage::open(source)?);
+        let storage = Storage::open(source)?;
         let offsets = if is_remote {
             load_or_fetch_remote_offsets(source, &storage, elem_size)?
         } else {
@@ -645,7 +645,7 @@ pub fn open_vvec_untyped(source: &str) -> Result<Box<dyn VvecReader<u8>>, IoErro
             "cannot infer element size from extension '.{ext}'")));
     }
     let is_remote = source.starts_with("http://") || source.starts_with("https://");
-    let storage = Arc::new(Storage::open(source)?);
+    let storage = Storage::open(source)?;
     let offsets = if is_remote {
         load_or_fetch_remote_offsets(source, &storage, elem_size)?
     } else {
@@ -699,7 +699,7 @@ fn load_or_fetch_remote_offsets(
         (format!("{base_str}/IDXFOR__{data_name}.i64"), "i64"),
         (format!("{base_str}/IDXFOR__{data_name}.i32"), "i32"),
     ];
-    let client = reqwest::blocking::Client::new();
+    let client = crate::transport::shared_client();
     for (cand, ext) in &candidates {
         if let Ok(resp) = client.get(cand).send()
             && resp.status().is_success()

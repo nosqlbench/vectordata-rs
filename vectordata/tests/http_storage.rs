@@ -1130,6 +1130,196 @@ fn concurrent_readers_share_promotion_safely() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+// Cross-instance singleton — concurrent opens of the same source MUST
+// return the same Arc<Storage>. Without this, each open builds its
+// own CachedChannel + cache file handle, which races on cache file
+// writes and produces "invalid dimension 0" reads when one channel's
+// .mrkl save outraces another's file flush.
+// ═══════════════════════════════════════════════════════════════════════
+
+#[test]
+fn many_parallel_opens_of_same_url_dont_corrupt_reads() {
+    // Hammer-test the registry: 16 threads each open + read the
+    // same URL repeatedly. Without the singleton, this is the exact
+    // pattern that produces "invalid dimension 0" via channel races.
+    // With the singleton, all opens share one Storage and the only
+    // thing concurrent threads can race on is the OnceLock<Mmap>
+    // (which is race-safe by construction).
+    let tmp = make_tmp();
+    let path = tmp.path().join("base.fvec");
+    write_fvec(&path, 500, 16);
+    write_mref(&path);
+    let server = TestServer::start(tmp.path()).unwrap();
+    reset_cache_for_server(&server);
+    let url = Arc::new(format!("{}base.fvec", server.base_url()));
+
+    let n_threads = 16;
+    let n_iters = 25;
+    std::thread::scope(|s| {
+        for _ in 0..n_threads {
+            let url = Arc::clone(&url);
+            s.spawn(move || {
+                for _ in 0..n_iters {
+                    let r = XvecReader::<f32>::open(&url).unwrap();
+                    // The dim header read at open is exactly the
+                    // path that was returning "invalid dimension 0"
+                    // before the singleton fix.
+                    assert_eq!(r.dim(), 16);
+                    assert_eq!(r.count(), 500);
+                    let v = r.get(0).unwrap();
+                    assert_eq!(v.len(), 16);
+                    assert_eq!(v[0], 0.0);
+                }
+            });
+        }
+    });
+}
+
+#[test]
+fn parallel_opens_share_single_cache_channel() {
+    // 20 parallel opens of the same URL. Each open does an HTTP
+    // HEAD/GET probe. With the singleton, only the first open does
+    // those probes; the rest get a clone of the same Arc<Storage>
+    // (no further HTTP). So total connections should be small —
+    // bounded by what one open + one prebuffer needs.
+    let tmp = make_tmp();
+    let path = tmp.path().join("base.fvec");
+    write_fvec(&path, 1000, 32);
+    write_mref(&path);
+    let server = TestServer::start(tmp.path()).unwrap();
+    reset_cache_for_server(&server);
+    let url = Arc::new(format!("{}base.fvec", server.base_url()));
+
+    let baseline = server.accepted_connections();
+    std::thread::scope(|s| {
+        for _ in 0..20 {
+            let url = Arc::clone(&url);
+            s.spawn(move || {
+                let _r = XvecReader::<f32>::open(&url).unwrap();
+            });
+        }
+    });
+    let new_conns = server.accepted_connections() - baseline;
+    // The first open does .mref fetch + dim-header chunk fetch
+    // (~2 connections worst case). 19 sibling opens get the same
+    // Arc<Storage> with no extra wire traffic. Allow generous slack
+    // for any probe but reject the pre-singleton behaviour where
+    // every open did its own .mref + chunk fetch.
+    assert!(new_conns <= 5,
+        "20 parallel opens of the same URL should share one Storage \
+         (saw {new_conns} new TCP connections; pre-singleton would have been ~40)");
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// HTTP client + connection caching — locks in the fix for the
+// downstream perf bug where every read built a fresh reqwest::Client
+// (and thus walked /etc/ssl/certs/), making ClientHandle::new the
+// dominant CPU cost.
+// ═══════════════════════════════════════════════════════════════════════
+
+#[test]
+fn many_per_record_reads_share_one_tcp_connection() {
+    // Open a direct-HTTP storage and issue many small reads. With
+    // the shared client + HTTP/1.1 keep-alive, every request after
+    // the first must reuse the same TCP connection. Without the
+    // shared client, every read would build a fresh Client and a
+    // fresh socket.
+    let tmp = make_tmp();
+    let path = tmp.path().join("base.fvec");
+    write_fvec(&path, 200, 8);
+    // No .mref → direct HTTP; per-record reads go over the wire.
+    let server = TestServer::start(tmp.path()).unwrap();
+    reset_cache_for_server(&server);
+    let url = format!("{}base.fvec", server.base_url());
+
+    let baseline = server.accepted_connections();
+    let r = XvecReader::<f32>::open(&url).unwrap();
+    // Open does HEAD probe + a chunked-transport probe; that's
+    // typically 1-2 connections.
+    let after_open = server.accepted_connections();
+
+    // 50 per-record reads — each is a separate HTTP RANGE request.
+    for i in 0..50usize {
+        let v = r.get(i).unwrap();
+        assert_eq!(v.len(), 8);
+    }
+    let after_reads = server.accepted_connections();
+    let new_conns_for_reads = after_reads - after_open;
+
+    // The strict assertion: 50 reads must produce far fewer than
+    // 50 new connections. With pooling we'd expect 1 (or a small
+    // handful). Without — every read makes a fresh Client and
+    // every Client opens its own socket — we'd see ~50.
+    assert!(new_conns_for_reads <= 5,
+        "50 per-record reads should pool through ≤ 5 TCP connections (saw {new_conns_for_reads}); \
+         baseline before open: {baseline}, after open: {after_open}");
+}
+
+#[test]
+fn many_storage_opens_share_one_client_no_cert_load_storm() {
+    // Open many separate Storages against the same server. With
+    // the shared client, every open hands the same Client clone
+    // to its HttpTransport; without it, every open paid
+    // load_native_certs.
+    //
+    // We can't directly observe load_native_certs, but the
+    // accepted-connection count tells us pooling is effective:
+    // 20 opens, each doing one HEAD + minimal probe, should
+    // share connections via keep-alive. Without the shared
+    // client, each open would open its own pool from scratch and
+    // we'd see ~20 connections.
+    let tmp = make_tmp();
+    let path = tmp.path().join("base.fvec");
+    write_fvec(&path, 50, 4);
+    let server = TestServer::start(tmp.path()).unwrap();
+    reset_cache_for_server(&server);
+    let url = format!("{}base.fvec", server.base_url());
+
+    let baseline = server.accepted_connections();
+    for _ in 0..20 {
+        let _ = XvecReader::<f32>::open(&url).unwrap();
+    }
+    let after = server.accepted_connections();
+    let new_conns = after - baseline;
+
+    // 20 fresh opens, each doing a HEAD + a tiny dim-header read,
+    // should share connections aggressively. Allow some slack for
+    // probe overhead but reject the pre-fix behaviour where every
+    // open was its own Client + its own pool.
+    assert!(new_conns <= 10,
+        "20 fresh storage opens should share connections (saw {new_conns} new TCP connections)");
+}
+
+#[test]
+fn shared_client_is_singleton_across_storages() {
+    // Two Storages opened independently must end up with the
+    // *same* underlying reqwest::Client (cheap clone of the same
+    // inner Arc). We can't reach into Storage to assert pointer
+    // equality on the Client, but we can assert that the
+    // accepted-connection count stays bounded under repeated
+    // open + close cycles — which is the load-bearing property.
+    let tmp = make_tmp();
+    let path = tmp.path().join("base.fvec");
+    write_fvec(&path, 30, 4);
+    let server = TestServer::start(tmp.path()).unwrap();
+    reset_cache_for_server(&server);
+    let url = format!("{}base.fvec", server.base_url());
+
+    // Hammer: 100 open-then-drop cycles. If every open built a
+    // fresh Client + opened a fresh pool, we'd see 100+ TCP
+    // connections. With the singleton, the count grows much more
+    // slowly (one or two per open at most, and many reuses).
+    let baseline = server.accepted_connections();
+    for _ in 0..100 {
+        let r = XvecReader::<f32>::open(&url).unwrap();
+        let _ = r.get(0).unwrap();
+    }
+    let new_conns = server.accepted_connections() - baseline;
+    assert!(new_conns <= 50,
+        "100 open+read cycles should reuse the shared client's pool (saw {new_conns} new TCP connections)");
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 // All-profiles prebuffer + 250 MiB advisory warning
 // ═══════════════════════════════════════════════════════════════════════
 
