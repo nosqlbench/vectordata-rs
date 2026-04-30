@@ -1,6 +1,6 @@
 [package]
 name = "veks-anode"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
 description = "Self-describing binary wire formats for structured metadata (MNode), predicate trees (PNode), and annotation nodes (ANode)"
 license = "Apache-2.0"
