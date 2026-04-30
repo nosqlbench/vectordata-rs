@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use vectordata::VectorReader;
-use vectordata::io::MmapVectorReader;
+use vectordata::io::XvecReader;
 
 use crate::pipeline::atomic_write::AtomicWriter;
 use crate::pipeline::command::{
@@ -121,12 +121,12 @@ byte-identical shuffle results.
         }
 
         // Open source vectors
-        let reader = match MmapVectorReader::<f32>::open_fvec(&source_path) {
+        let reader = match XvecReader::<f32>::open_path(&source_path) {
             Ok(r) => r,
             Err(e) => return error_result(format!("open {}: {}", source_path.display(), e), start),
         };
-        let count = <MmapVectorReader<f32> as VectorReader<f32>>::count(&reader);
-        let dim = <MmapVectorReader<f32> as VectorReader<f32>>::dim(&reader);
+        let count = <XvecReader<f32> as VectorReader<f32>>::count(&reader);
+        let dim = <XvecReader<f32> as VectorReader<f32>>::dim(&reader);
 
         if count == 0 {
             return error_result("empty source file", start);
@@ -338,7 +338,7 @@ mod tests {
     use crate::pipeline::progress::ProgressLog;
     use indexmap::IndexMap;
     use vectordata::VectorReader;
-    use vectordata::io::MmapVectorReader;
+    use vectordata::io::XvecReader;
 
     fn make_ctx(workspace: &std::path::Path) -> StreamContext {
         StreamContext {
@@ -372,8 +372,8 @@ mod tests {
     }
 
     fn read_ivec_values(path: &std::path::Path) -> Vec<i32> {
-        let reader = MmapVectorReader::<i32>::open_ivec(path).unwrap();
-        let count = <MmapVectorReader<i32> as VectorReader<i32>>::count(&reader);
+        let reader = XvecReader::<i32>::open_path(path).unwrap();
+        let count = <XvecReader<i32> as VectorReader<i32>>::count(&reader);
         (0..count).map(|i| reader.get_slice(i)[0]).collect()
     }
 
@@ -449,7 +449,7 @@ mod tests {
         assert_eq!(dup_ordinals.len(), 2, "should have 2 duplicate vectors");
 
         // Verify the sorted unique ordinals reference distinct vectors
-        let reader = MmapVectorReader::<f32>::open_fvec(&fvec).unwrap();
+        let reader = XvecReader::<f32>::open_path(&fvec).unwrap();
         for i in 0..ordinals.len() - 1 {
             let a = reader.get_slice(ordinals[i] as usize);
             let b = reader.get_slice(ordinals[i + 1] as usize);

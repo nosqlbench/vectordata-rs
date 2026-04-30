@@ -12,7 +12,7 @@ use std::time::Instant;
 
 use rayon::prelude::*;
 use vectordata::VectorReader;
-use vectordata::io::MmapVectorReader;
+use vectordata::io::XvecReader;
 
 use crate::pipeline::command::{
     CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options,
@@ -152,7 +152,7 @@ impl CommandOp for AnalyzeNormsOp {
 
         let (count, dim, norms) = match etype {
             ElementType::F16 => {
-                let reader = match MmapVectorReader::<half::f16>::open_mvec(&source_path) {
+                let reader = match XvecReader::<half::f16>::open_path(&source_path) {
                     Ok(r) => r,
                     Err(e) => return error_result(format!("open {}: {}", source_path.display(), e), start),
                 };
@@ -164,7 +164,7 @@ impl CommandOp for AnalyzeNormsOp {
                 (count, dim, norms)
             }
             _ => {
-                let reader = match MmapVectorReader::<f32>::open_fvec(&source_path) {
+                let reader = match XvecReader::<f32>::open_path(&source_path) {
                     Ok(r) => r,
                     Err(e) => return error_result(format!("open {}: {}", source_path.display(), e), start),
                 };
@@ -268,7 +268,7 @@ fn build_sample_indices(count: usize, sample: Option<usize>) -> Vec<usize> {
 
 /// Compute L2 norms for f32 vectors in parallel.
 fn compute_norms_f32(
-    reader: &MmapVectorReader<f32>,
+    reader: &XvecReader<f32>,
     indices: &[usize],
     dim: usize,
     threads: usize,
@@ -307,7 +307,7 @@ fn compute_norms_f32(
 
 /// Compute L2 norms for f16 vectors in parallel.
 fn compute_norms_f16(
-    reader: &MmapVectorReader<half::f16>,
+    reader: &XvecReader<half::f16>,
     indices: &[usize],
     dim: usize,
     threads: usize,

@@ -29,7 +29,7 @@ use std::time::Instant;
 use crate::pipeline::command::*;
 use crate::pipeline::element_type::ElementType;
 use crate::pipeline::simd_distance::{self, Metric};
-use vectordata::io::MmapVectorReader;
+use vectordata::io::XvecReader;
 use vectordata::VectorReader;
 use vectordata::dataset::DatasetConfig;
 
@@ -38,8 +38,8 @@ use super::compute_knn::Neighbor;
 /// Format-agnostic float vector reader for verification.
 /// Provides f32 slices regardless of storage precision.
 pub(super) enum AnyFloatReader {
-    F16(MmapVectorReader<half::f16>),
-    F32(MmapVectorReader<f32>),
+    F16(XvecReader<half::f16>),
+    F32(XvecReader<f32>),
 }
 
 impl AnyFloatReader {
@@ -47,10 +47,10 @@ impl AnyFloatReader {
         let etype = ElementType::from_path(path)
             .unwrap_or(ElementType::F32);
         match etype {
-            ElementType::F16 => MmapVectorReader::<half::f16>::open_mvec(path)
+            ElementType::F16 => XvecReader::<half::f16>::open_path(path)
                 .map(AnyFloatReader::F16)
                 .map_err(|e| format!("open {}: {}", path.display(), e)),
-            _ => MmapVectorReader::<f32>::open_fvec(path)
+            _ => XvecReader::<f32>::open_path(path)
                 .map(AnyFloatReader::F32)
                 .map_err(|e| format!("open {}: {}", path.display(), e)),
         }
@@ -363,7 +363,7 @@ impl CommandOp for VerifyKnnConsolidatedOp {
         }
 
         // Open base vectors for the scan.
-        let f32_base_reader = match vectordata::io::MmapVectorReader::<f32>::open_fvec(&base_path) {
+        let f32_base_reader = match vectordata::io::XvecReader::<f32>::open_path(&base_path) {
             Ok(r) => r,
             Err(e) => return error_result(format!("failed to open base as f32: {}", e), start),
         };
@@ -473,7 +473,7 @@ impl CommandOp for VerifyKnnConsolidatedOp {
         // Load GT indices for valid profiles only
         let mut profile_gts: Vec<Vec<Vec<i32>>> = Vec::with_capacity(profiles.len());
         for (name, _, indices_path, _) in &profiles {
-            let gt_reader = match MmapVectorReader::<i32>::open_ivec(indices_path) {
+            let gt_reader = match XvecReader::<i32>::open_path(indices_path) {
                 Ok(r) => r,
                 Err(e) => return error_result(format!("failed to open GT for profile '{}': {}", name, e), start),
             };
@@ -925,10 +925,10 @@ impl CommandOp for VerifyFilteredKnnConsolidatedOp {
             .unwrap_or(crate::pipeline::simd_distance::Metric::L2);
         let dist_fn = crate::pipeline::simd_distance::select_distance_fn(metric);
 
-        let base_reader = match vectordata::io::MmapVectorReader::<f32>::open_fvec(&base_path) {
+        let base_reader = match vectordata::io::XvecReader::<f32>::open_path(&base_path) {
             Ok(r) => r, Err(e) => return error_result(format!("open base: {}", e), start),
         };
-        let query_reader = match vectordata::io::MmapVectorReader::<f32>::open_fvec(&query_path) {
+        let query_reader = match vectordata::io::XvecReader::<f32>::open_path(&query_path) {
             Ok(r) => r, Err(e) => return error_result(format!("open query: {}", e), start),
         };
 
@@ -1290,8 +1290,8 @@ impl CommandOp for VerifyPredicatesConsolidatedOp {
                         .collect())
                 });
             } else {
-                // ivvec or ivec — use IndexedXvecReader
-                let reader = match vectordata::io::IndexedXvecReader::open_ivec(&indices_path) {
+                // ivvec or ivec — use IndexedVvecReader
+                let reader = match vectordata::io::IndexedVvecReader::<i32>::open_path(&indices_path) {
                     Ok(r) => r,
                     Err(e) => {
                         ctx.ui.log(&format!("  profile '{}': failed to open eval results: {}", name, e));

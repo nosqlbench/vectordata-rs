@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use vectordata::VectorReader;
-use vectordata::io::MmapVectorReader;
+use vectordata::io::XvecReader;
 
 use crate::pipeline::command::{
     ArtifactManifest, CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options,
@@ -671,10 +671,10 @@ on `std::arch` alone, without SimSIMD, FAISS, or BLAS.
         // through a separate pread(2) path during compute so no base
         // bytes ever enter the process address space — see the scanner
         // module above for rationale.
-        let base_reader = match MmapVectorReader::<f32>::open_fvec(&base_path) {
+        let base_reader = match XvecReader::<f32>::open_path(&base_path) {
             Ok(r) => Arc::new(r), Err(e) => return error_result(format!("open base: {}", e), start),
         };
-        let query_reader = match MmapVectorReader::<f32>::open_fvec(&query_path) {
+        let query_reader = match XvecReader::<f32>::open_path(&query_path) {
             Ok(r) => Arc::new(r), Err(e) => return error_result(format!("open query: {}", e), start),
         };
         // File handle used exclusively for pread-based streaming.
@@ -1310,7 +1310,7 @@ mod tests {
     }
 
     fn read_ivec_rows(path: &std::path::Path) -> Vec<Vec<i32>> {
-        let reader = MmapVectorReader::<i32>::open_ivec(path).unwrap();
+        let reader = XvecReader::<i32>::open_path(path).unwrap();
         let count = VectorReader::<i32>::count(&reader);
         (0..count).map(|i| reader.get_slice(i).to_vec()).collect()
     }
@@ -1475,7 +1475,7 @@ mod tests {
     }
 
     fn read_fvec_rows(path: &std::path::Path) -> Vec<Vec<f32>> {
-        let reader = MmapVectorReader::<f32>::open_fvec(path).unwrap();
+        let reader = XvecReader::<f32>::open_path(path).unwrap();
         let count = VectorReader::<f32>::count(&reader);
         (0..count).map(|i| reader.get_slice(i).to_vec()).collect()
     }

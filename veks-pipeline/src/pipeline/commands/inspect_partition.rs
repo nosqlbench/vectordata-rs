@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use vectordata::VectorReader;
-use vectordata::io::MmapVectorReader;
+use vectordata::io::XvecReader;
 
 use crate::pipeline::command::{
     CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options,
@@ -279,7 +279,7 @@ auto-resolved from the profile.
         ctx.ui.log("├─ Stage 4: Global KNN (default profile) ─────────────────");
 
         let _global_gt: Vec<i32> = if let Some(gt_path) = resolve("neighbor_indices") {
-            match MmapVectorReader::<i32>::open_ivec(&gt_path) {
+            match XvecReader::<i32>::open_path(&gt_path) {
                 Ok(reader) if ordinal < VectorReader::<i32>::count(&reader) => {
                     let slice = reader.get_slice(ordinal);
                     let k = slice.len();
@@ -357,7 +357,7 @@ auto-resolved from the profile.
         let partition_distances: Vec<f32>;
 
         if part_gt_path.exists() && partition_knn_ordinal != usize::MAX {
-            match MmapVectorReader::<i32>::open_ivec(&part_gt_path) {
+            match XvecReader::<i32>::open_path(&part_gt_path) {
                 Ok(reader) if partition_knn_ordinal < VectorReader::<i32>::count(&reader) => {
                     let slice = reader.get_slice(partition_knn_ordinal);
                     partition_neighbors = slice.to_vec();
@@ -370,7 +370,7 @@ auto-resolved from the profile.
                     // through to the display unchanged — that's what the
                     // user expects to see.
                     partition_distances = if part_dist_path.exists() {
-                        match MmapVectorReader::<f32>::open_fvec(&part_dist_path) {
+                        match XvecReader::<f32>::open_path(&part_dist_path) {
                             Ok(dr) if partition_knn_ordinal < VectorReader::<f32>::count(&dr) => {
                                 dr.get_slice(partition_knn_ordinal).to_vec()
                             }
@@ -400,7 +400,7 @@ auto-resolved from the profile.
                     }
                 }
                 _ => {
-                    let count = MmapVectorReader::<i32>::open_ivec(&part_gt_path)
+                    let count = XvecReader::<i32>::open_path(&part_gt_path)
                         .map(|r| VectorReader::<i32>::count(&r)).unwrap_or(0);
                     ctx.ui.log(&format!("│  partition query ordinal {} out of range (partition has {} queries)",
                         partition_knn_ordinal, count));
@@ -426,7 +426,7 @@ auto-resolved from the profile.
         let filtered_path = resolve("filtered_neighbor_indices");
         if let Some(fp) = filtered_path {
             if fp.exists() {
-                match MmapVectorReader::<i32>::open_ivec(&fp) {
+                match XvecReader::<i32>::open_path(&fp) {
                     Ok(reader) if ordinal < VectorReader::<i32>::count(&reader) => {
                         let filtered = reader.get_slice(ordinal);
                         let filtered_set: HashSet<i32> = filtered.iter()

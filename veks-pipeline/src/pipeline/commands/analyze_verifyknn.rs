@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use vectordata::VectorReader;
-use vectordata::io::MmapVectorReader;
+use vectordata::io::XvecReader;
 
 use crate::pipeline::command::{
     CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options, ResourceDesc, Status, StreamContext,
@@ -126,7 +126,7 @@ impl Ord for Neighbor {
 /// Find true top-k nearest neighbors by brute force.
 fn find_true_top_k(
     query: &[f32],
-    base_reader: &MmapVectorReader<f32>,
+    base_reader: &XvecReader<f32>,
     base_offset: usize,
     base_end: usize,
     k: usize,
@@ -184,7 +184,7 @@ fn find_true_top_k(
 }
 
 /// Read neighbor indices from an ivec file for a specific query.
-fn read_ivec_row(reader: &MmapVectorReader<i32>, row: usize) -> Result<Vec<i32>, String> {
+fn read_ivec_row(reader: &XvecReader<i32>, row: usize) -> Result<Vec<i32>, String> {
     reader
         .get(row)
         .map_err(|e| format!("failed to read indices row {}: {}", row, e))
@@ -290,7 +290,7 @@ impl CommandOp for AnalyzeVerifyKnnOp {
         let indices_path = resolve_path(indices_str, &ctx.workspace);
 
         // Open readers
-        let base_reader = match MmapVectorReader::<f32>::open_fvec(&base_path) {
+        let base_reader = match XvecReader::<f32>::open_path(&base_path) {
             Ok(r) => r,
             Err(e) => {
                 return error_result(
@@ -301,7 +301,7 @@ impl CommandOp for AnalyzeVerifyKnnOp {
         };
 
         // Apply window to base vectors
-        let file_count = <MmapVectorReader<f32> as VectorReader<f32>>::count(&base_reader);
+        let file_count = <XvecReader<f32> as VectorReader<f32>>::count(&base_reader);
         let (base_offset, base_end) = match base_source.window {
             Some((ws, we)) => {
                 let ws = ws.min(file_count);
@@ -310,7 +310,7 @@ impl CommandOp for AnalyzeVerifyKnnOp {
             }
             None => (0, file_count),
         };
-        let query_reader = match MmapVectorReader::<f32>::open_fvec(&query_path) {
+        let query_reader = match XvecReader::<f32>::open_path(&query_path) {
             Ok(r) => r,
             Err(e) => {
                 return error_result(
@@ -319,7 +319,7 @@ impl CommandOp for AnalyzeVerifyKnnOp {
                 )
             }
         };
-        let indices_reader = match MmapVectorReader::<i32>::open_ivec(&indices_path) {
+        let indices_reader = match XvecReader::<i32>::open_path(&indices_path) {
             Ok(r) => r,
             Err(e) => {
                 return error_result(
@@ -329,8 +329,8 @@ impl CommandOp for AnalyzeVerifyKnnOp {
             }
         };
 
-        let query_count = <MmapVectorReader<f32> as VectorReader<f32>>::count(&query_reader);
-        let indices_count = <MmapVectorReader<i32> as VectorReader<i32>>::count(&indices_reader);
+        let query_count = <XvecReader<f32> as VectorReader<f32>>::count(&query_reader);
+        let indices_count = <XvecReader<i32> as VectorReader<i32>>::count(&indices_reader);
 
         if indices_count != query_count {
             return error_result(
@@ -343,7 +343,7 @@ impl CommandOp for AnalyzeVerifyKnnOp {
         }
 
         // Auto-detect k from indices dimension
-        let k = <MmapVectorReader<i32> as VectorReader<i32>>::dim(&indices_reader);
+        let k = <XvecReader<i32> as VectorReader<i32>>::dim(&indices_reader);
 
         // Parse range
         let (range_start, range_end) = match range_str {

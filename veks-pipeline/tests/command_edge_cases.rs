@@ -2526,7 +2526,7 @@ fn write_test_ivvec(path: &std::path::Path, records: &[Vec<i32>]) {
     }
     w.flush().unwrap();
     // Build offset index
-    let _ = vectordata::io::IndexedXvecReader::open_ivec(path);
+    let _ = vectordata::io::IndexedVvecReader::<i32>::open_path(path);
 }
 
 #[test]
@@ -2841,7 +2841,7 @@ fn run_engine(
     metric: &str,
 ) -> Vec<Vec<i32>> {
     use vectordata::VectorReader;
-    use vectordata::io::MmapVectorReader;
+    use vectordata::io::XvecReader;
 
     let indices_path = out_dir.join(format!("{}_indices.ivecs", engine));
     let registry = veks_pipeline::pipeline::registry::CommandRegistry::with_builtins();
@@ -2872,7 +2872,7 @@ fn run_engine(
     let r = cmd.execute(&opts, &mut ctx);
     assert_eq!(r.status, Status::Ok, "engine {} metric {} failed: {}", engine, metric, r.message);
 
-    let reader = MmapVectorReader::<i32>::open_ivec(&indices_path).unwrap();
+    let reader = XvecReader::<i32>::open_path(&indices_path).unwrap();
     let count = VectorReader::<i32>::count(&reader);
     (0..count).map(|i| reader.get_slice(i).to_vec()).collect()
 }

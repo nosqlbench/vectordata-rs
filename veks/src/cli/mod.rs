@@ -63,109 +63,29 @@ pub struct CompletionsArgs {
 /// completions. The actual completion logic runs inside `veks` via
 /// the `COMPLETE` env var handled by `CompleteEnv` in `main()`.
 ///
-/// For bash, we emit a custom completion function that reconstructs
-/// words from `COMP_LINE` instead of relying on `COMP_WORDS`, which
-/// splits on `COMP_WORDBREAKS` characters (including `:`). This ensures
-/// that values like `mem:25%` are treated as a single token.
+/// All shell-specific formatting and detection lives in
+/// `veks-completion` so other CLI binaries built on the same
+/// completion engine get the same UX with one line of glue.
 pub fn completions(args: CompletionsArgs) {
     match args.shell {
         Some(shell) => {
-            // Explicit --shell: emit the raw script directly
-            emit_completions(shell);
+            // Explicit --shell: emit the raw script directly.
+            veks_completion::print_completions("veks", to_completion_shell(shell));
         }
         None => {
-            // Auto-detect: emit an indirect one-liner that's safe for
-            // both eval "$(veks completions)" and eval `veks completions`.
-            // The indirection avoids backtick-substitution mangling the
-            // raw script (which contains backslashes and special chars).
-            let veks_path = std::env::current_exe()
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_else(|_| "veks".to_string());
-            match detect_shell() {
-                Some(Shell::Bash) => {
-                    println!("# veks tab-completion for bash");
-                    println!("# To activate:  eval \"$(veks completions)\"");
-                    println!("# To persist:   echo 'eval \"$(veks completions)\"' >> ~/.bashrc");
-                    println!("source <(\"{veks_path}\" completions --shell bash)");
-                }
-                Some(Shell::Zsh) => {
-                    println!("# veks tab-completion for zsh");
-                    println!("# To activate:  eval \"$(veks completions)\"");
-                    println!("# To persist:   echo 'eval \"$(veks completions)\"' >> ~/.zshrc");
-                    println!("source <(\"{veks_path}\" completions --shell zsh)");
-                }
-                Some(Shell::Fish) => {
-                    println!("# veks tab-completion for fish");
-                    println!("# To activate:  eval (veks completions)");
-                    println!("# To persist:   add to ~/.config/fish/config.fish");
-                    println!("\"{veks_path}\" completions --shell fish | source");
-                }
-                Some(shell) => {
-                    emit_completions(shell);
-                }
-                None => {
-                    println!("# veks: could not detect your shell.");
-                    println!("# Use: eval \"$(veks completions --shell bash)\"");
-                }
-            }
+            // Auto-detect + emit indirect `source <(...)` wrapper.
+            veks_completion::print_indirect_wrapper("veks");
         }
     }
 }
 
-fn emit_completions(shell: Shell) {
+fn to_completion_shell(shell: Shell) -> veks_completion::Shell {
     match shell {
-        Shell::Bash => dyncomp::print_bash_script(),
-        Shell::Zsh => {
-            eprintln!("# zsh completions not yet implemented in dyncomp; use bash compatibility mode");
-            dyncomp::print_bash_script(); // bash-compatible fallback
-        }
-        Shell::Fish | Shell::Elvish | Shell::PowerShell => {
-            eprintln!("# {} completions not yet implemented", match shell {
-                Shell::Fish => "fish", Shell::Elvish => "elvish",
-                Shell::PowerShell => "powershell", _ => "unknown",
-            });
-        }
-    }
-}
-
-/// Detect the current shell from environment.
-///
-/// Checks `SHELL` env var first (standard on Unix), then falls back to
-/// inspecting the parent process name on Linux via `/proc`.
-fn detect_shell() -> Option<Shell> {
-    // Try SHELL env var (e.g., /bin/bash, /usr/bin/zsh)
-    if let Ok(shell_path) = std::env::var("SHELL") {
-        let name = std::path::Path::new(&shell_path)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("");
-        if let Some(s) = shell_name_to_enum(name) {
-            return Some(s);
-        }
-    }
-
-    // Fallback: check parent process on Linux
-    #[cfg(target_os = "linux")]
-    {
-        if let Ok(comm) = std::fs::read_to_string(format!("/proc/{}/comm", std::os::unix::process::parent_id())) {
-            let name = comm.trim();
-            if let Some(s) = shell_name_to_enum(name) {
-                return Some(s);
-            }
-        }
-    }
-
-    None
-}
-
-fn shell_name_to_enum(name: &str) -> Option<Shell> {
-    match name {
-        "bash" => Some(Shell::Bash),
-        "zsh" => Some(Shell::Zsh),
-        "fish" => Some(Shell::Fish),
-        "elvish" => Some(Shell::Elvish),
-        "pwsh" | "powershell" => Some(Shell::PowerShell),
-        _ => None,
+        Shell::Bash       => veks_completion::Shell::Bash,
+        Shell::Zsh        => veks_completion::Shell::Zsh,
+        Shell::Fish       => veks_completion::Shell::Fish,
+        Shell::Elvish     => veks_completion::Shell::Elvish,
+        Shell::PowerShell => veks_completion::Shell::PowerShell,
     }
 }
 

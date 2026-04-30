@@ -16,7 +16,7 @@ use std::time::Instant;
 
 use rand::Rng;
 use vectordata::VectorReader;
-use vectordata::io::MmapVectorReader;
+use vectordata::io::XvecReader;
 
 use crate::pipeline::command::{
     CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options, ResourceDesc, Status, StreamContext,
@@ -180,7 +180,7 @@ fn render_histogram(
 ///
 /// `dim_x` and `dim_y` select which dimensions to plot on each axis.
 fn render_scatter(
-    reader: &MmapVectorReader<f32>,
+    reader: &XvecReader<f32>,
     count: usize,
     dim_x: usize,
     dim_y: usize,
@@ -379,7 +379,7 @@ impl CommandOp for AnalyzePlotOp {
 
         for (si, source) in sources.iter().enumerate() {
             let source_path = resolve_path(source.trim(), &ctx.workspace);
-            let reader = match MmapVectorReader::<f32>::open_fvec(&source_path) {
+            let reader = match XvecReader::<f32>::open_path(&source_path) {
                 Ok(r) => r,
                 Err(e) => {
                     return error_result(
@@ -389,8 +389,8 @@ impl CommandOp for AnalyzePlotOp {
                 }
             };
 
-            let total = <MmapVectorReader<f32> as VectorReader<f32>>::count(&reader);
-            let dim = <MmapVectorReader<f32> as VectorReader<f32>>::dim(&reader);
+            let total = <XvecReader<f32> as VectorReader<f32>>::count(&reader);
+            let dim = <XvecReader<f32> as VectorReader<f32>>::dim(&reader);
             let effective = sample.min(total);
             let color = ansi_color(si);
 

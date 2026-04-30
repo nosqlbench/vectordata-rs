@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use vectordata::VectorReader;
-use vectordata::io::MmapVectorReader;
+use vectordata::io::XvecReader;
 
 use crate::pipeline::atomic_write::AtomicWriter;
 use crate::pipeline::command::{
@@ -110,12 +110,12 @@ Norm is computed via BLAS `cblas_snrm2` (matching knn\_utils which uses
             }
         }
 
-        let reader = match MmapVectorReader::<f32>::open_fvec(&source_path) {
+        let reader = match XvecReader::<f32>::open_path(&source_path) {
             Ok(r) => r,
             Err(e) => return error_result(format!("open {}: {}", source_path.display(), e), start),
         };
-        let count = <MmapVectorReader<f32> as VectorReader<f32>>::count(&reader);
-        let dim = <MmapVectorReader<f32> as VectorReader<f32>>::dim(&reader);
+        let count = <XvecReader<f32> as VectorReader<f32>>::count(&reader);
+        let dim = <XvecReader<f32> as VectorReader<f32>>::dim(&reader);
 
         if count == 0 {
             return error_result("empty source file", start);
@@ -232,7 +232,7 @@ mod tests {
     use crate::pipeline::progress::ProgressLog;
     use indexmap::IndexMap;
     use vectordata::VectorReader;
-    use vectordata::io::MmapVectorReader;
+    use vectordata::io::XvecReader;
 
     fn make_ctx(workspace: &std::path::Path) -> StreamContext {
         StreamContext {
@@ -288,8 +288,8 @@ mod tests {
         let r = op.execute(&opts, &mut ctx);
         assert_eq!(r.status, Status::Ok);
 
-        let reader = MmapVectorReader::<f32>::open_fvec(&out).unwrap();
-        assert_eq!(<MmapVectorReader<f32> as VectorReader<f32>>::count(&reader), 3);
+        let reader = XvecReader::<f32>::open_path(&out).unwrap();
+        assert_eq!(<XvecReader<f32> as VectorReader<f32>>::count(&reader), 3);
         assert_eq!(reader.get_slice(0), &[1.0, 2.0, 3.0]);
         assert_eq!(reader.get_slice(1), &[4.0, 5.0, 6.0]);
         assert_eq!(reader.get_slice(2), &[7.0, 8.0, 9.0]);
@@ -317,8 +317,8 @@ mod tests {
         let r = op.execute(&opts, &mut ctx);
         assert_eq!(r.status, Status::Ok);
 
-        let reader = MmapVectorReader::<f32>::open_fvec(&out).unwrap();
-        assert_eq!(<MmapVectorReader<f32> as VectorReader<f32>>::count(&reader), 0);
+        let reader = XvecReader::<f32>::open_path(&out).unwrap();
+        assert_eq!(<XvecReader<f32> as VectorReader<f32>>::count(&reader), 0);
     }
 
     /// No zeros → output identical to input.
@@ -343,8 +343,8 @@ mod tests {
         let r = op.execute(&opts, &mut ctx);
         assert_eq!(r.status, Status::Ok);
 
-        let reader = MmapVectorReader::<f32>::open_fvec(&out).unwrap();
-        assert_eq!(<MmapVectorReader<f32> as VectorReader<f32>>::count(&reader), 2);
+        let reader = XvecReader::<f32>::open_path(&out).unwrap();
+        assert_eq!(<XvecReader<f32> as VectorReader<f32>>::count(&reader), 2);
     }
 
     /// Custom tolerance removes near-zero vectors.
@@ -371,7 +371,7 @@ mod tests {
         let r = op.execute(&opts, &mut ctx);
         assert_eq!(r.status, Status::Ok);
 
-        let reader = MmapVectorReader::<f32>::open_fvec(&out).unwrap();
-        assert_eq!(<MmapVectorReader<f32> as VectorReader<f32>>::count(&reader), 2);
+        let reader = XvecReader::<f32>::open_path(&out).unwrap();
+        assert_eq!(<XvecReader<f32> as VectorReader<f32>>::count(&reader), 2);
     }
 }

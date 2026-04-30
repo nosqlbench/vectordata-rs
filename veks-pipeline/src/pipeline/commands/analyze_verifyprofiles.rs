@@ -14,7 +14,7 @@ use std::time::Instant;
 
 use serde::Deserialize;
 use vectordata::VectorReader;
-use vectordata::io::MmapVectorReader;
+use vectordata::io::XvecReader;
 
 use crate::pipeline::command::{
     CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options, ResourceDesc, Status, StreamContext,
@@ -136,13 +136,13 @@ impl CommandOp for AnalyzeVerifyProfilesOp {
         };
 
         // Open vectors
-        let reader = match MmapVectorReader::<f32>::open_fvec(&vectors_path) {
+        let reader = match XvecReader::<f32>::open_path(&vectors_path) {
             Ok(r) => r,
             Err(e) => return error_result(format!("failed to open vectors {}: {}", vectors_path.display(), e), start),
         };
 
-        let vec_count = <MmapVectorReader<f32> as VectorReader<f32>>::count(&reader);
-        let vec_dim = <MmapVectorReader<f32> as VectorReader<f32>>::dim(&reader);
+        let vec_count = <XvecReader<f32> as VectorReader<f32>>::count(&reader);
+        let vec_dim = <XvecReader<f32> as VectorReader<f32>>::dim(&reader);
 
         if vec_dim != model.dimensions as usize {
             return error_result(

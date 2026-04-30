@@ -153,69 +153,69 @@ impl ToF64 for i64 { #[inline] fn to_f64(self) -> f64 { self as f64 } }
 
 /// Dispatch macro for vector element types.
 ///
-/// Opens the appropriate `MmapVectorReader<T>` based on `ElementType` and
+/// Opens the appropriate `XvecReader<T>` based on `ElementType` and
 /// calls the provided expression block with the reader bound as `$reader`.
 #[macro_export]
 macro_rules! dispatch_reader {
     ($etype:expr, $path:expr, $reader:ident => $body:expr) => {
         match $etype {
             $crate::pipeline::element_type::ElementType::F64 => {
-                let $reader = vectordata::io::MmapVectorReader::<f64>::open_dvec($path)
+                let $reader = vectordata::io::XvecReader::<f64>::open_path($path)
                     .map_err(|e| format!("failed to open {}: {}", $path.display(), e))?;
                 $body
             }
             $crate::pipeline::element_type::ElementType::F32 => {
-                let $reader = vectordata::io::MmapVectorReader::<f32>::open_fvec($path)
+                let $reader = vectordata::io::XvecReader::<f32>::open_path($path)
                     .map_err(|e| format!("failed to open {}: {}", $path.display(), e))?;
                 $body
             }
             $crate::pipeline::element_type::ElementType::F16 => {
-                let $reader = vectordata::io::MmapVectorReader::<half::f16>::open_mvec($path)
+                let $reader = vectordata::io::XvecReader::<half::f16>::open_path($path)
                     .map_err(|e| format!("failed to open {}: {}", $path.display(), e))?;
                 $body
             }
             $crate::pipeline::element_type::ElementType::I32 => {
-                let $reader = vectordata::io::MmapVectorReader::<i32>::open_ivec($path)
+                let $reader = vectordata::io::XvecReader::<i32>::open_path($path)
                     .map_err(|e| format!("failed to open {}: {}", $path.display(), e))?;
                 $body
             }
             $crate::pipeline::element_type::ElementType::I16 => {
-                let $reader = vectordata::io::MmapVectorReader::<i16>::open_svec($path)
+                let $reader = vectordata::io::XvecReader::<i16>::open_path($path)
                     .map_err(|e| format!("failed to open {}: {}", $path.display(), e))?;
                 $body
             }
             $crate::pipeline::element_type::ElementType::U8 => {
-                let $reader = vectordata::io::MmapVectorReader::<u8>::open_bvec($path)
+                let $reader = vectordata::io::XvecReader::<u8>::open_path($path)
                     .map_err(|e| format!("failed to open {}: {}", $path.display(), e))?;
                 $body
             }
             $crate::pipeline::element_type::ElementType::I8 => {
                 // i8vec: reinterpret as u8 (same byte layout)
-                let $reader = vectordata::io::MmapVectorReader::<u8>::open_bvec($path)
+                let $reader = vectordata::io::XvecReader::<u8>::open_path($path)
                     .map_err(|e| format!("failed to open {}: {}", $path.display(), e))?;
                 $body
             }
             $crate::pipeline::element_type::ElementType::U16 => {
                 // u16vec: same layout as i16 but unsigned
-                let $reader = vectordata::io::MmapVectorReader::<i16>::open_svec($path)
+                let $reader = vectordata::io::XvecReader::<i16>::open_path($path)
                     .map_err(|e| format!("failed to open {}: {}", $path.display(), e))?;
                 $body
             }
             $crate::pipeline::element_type::ElementType::U32 => {
                 // u32vec: same layout as i32 but unsigned
-                let $reader = vectordata::io::MmapVectorReader::<i32>::open_ivec($path)
+                let $reader = vectordata::io::XvecReader::<i32>::open_path($path)
                     .map_err(|e| format!("failed to open {}: {}", $path.display(), e))?;
                 $body
             }
             $crate::pipeline::element_type::ElementType::U64 => {
                 // u64vec: same byte layout as i64
-                let $reader = vectordata::io::MmapVectorReader::<f64>::open_dvec($path)
+                let $reader = vectordata::io::XvecReader::<f64>::open_path($path)
                     .map_err(|e| format!("failed to open {}: {}", $path.display(), e))?;
                 $body
             }
             $crate::pipeline::element_type::ElementType::I64 => {
                 // i64vec: same byte layout as f64 (8 bytes)
-                let $reader = vectordata::io::MmapVectorReader::<f64>::open_dvec($path)
+                let $reader = vectordata::io::XvecReader::<f64>::open_path($path)
                     .map_err(|e| format!("failed to open {}: {}", $path.display(), e))?;
                 $body
             }

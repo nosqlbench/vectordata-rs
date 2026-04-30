@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use vectordata::VectorReader;
-use vectordata::io::{IndexedXvecReader, MmapVectorReader, VvecReader};
+use vectordata::io::{IndexedVvecReader, XvecReader, VvecReader};
 
 use crate::pipeline::atomic_write::{AtomicWriter, safe_create_file};
 use crate::pipeline::element_type::ElementType;
@@ -127,7 +127,7 @@ facets of the dataset.
                 let idx_str = spec[bracket+1..].trim_end_matches(']');
                 let record_idx: usize = idx_str.parse().unwrap_or(0);
                 let vvec_path = resolve_path(path_str, &ctx.workspace);
-                match vectordata::io::IndexedXvecReader::open_ivec(&vvec_path) {
+                match vectordata::io::IndexedVvecReader::<i32>::open_path(&vvec_path) {
                     Ok(reader) => match reader.get_i32(record_idx) {
                         Ok(ords) => {
                             ctx.ui.log(&format!("  read {} ordinals from {}[{}]",
@@ -156,7 +156,7 @@ facets of the dataset.
         };
 
         // Open the fvec file (source vectors)
-        let fvec_reader = match MmapVectorReader::<f32>::open_fvec(&fvec_path) {
+        let fvec_reader = match XvecReader::<f32>::open_path(&fvec_path) {
             Ok(r) => r,
             Err(e) => {
                 return error_result(
@@ -176,8 +176,8 @@ facets of the dataset.
             );
         }
 
-        let fvec_count = <MmapVectorReader<f32> as VectorReader<f32>>::count(&fvec_reader);
-        let dim = <MmapVectorReader<f32> as VectorReader<f32>>::dim(&fvec_reader) as u32;
+        let fvec_count = <XvecReader<f32> as VectorReader<f32>>::count(&fvec_reader);
+        let dim = <XvecReader<f32> as VectorReader<f32>>::dim(&fvec_reader) as u32;
 
         // Create output directory
         if let Some(parent) = output_path.parent() {
@@ -195,13 +195,13 @@ facets of the dataset.
 
         if let Some(ref ivec_p) = ivec_path {
             // Index-based extraction via ivec indirection
-            let ivec_reader = match MmapVectorReader::<i32>::open_ivec(ivec_p) {
+            let ivec_reader = match XvecReader::<i32>::open_path(ivec_p) {
                 Ok(r) => r,
                 Err(e) => return error_result(
                     format!("failed to open ivec file {}: {}", ivec_p.display(), e), start,
                 ),
             };
-            let ivec_count = <MmapVectorReader<i32> as VectorReader<i32>>::count(&ivec_reader);
+            let ivec_count = <XvecReader<i32> as VectorReader<i32>>::count(&ivec_reader);
             let range_start = range.start;
             let range_end = range.end.unwrap_or(ivec_count);
             if range_start >= ivec_count {
@@ -446,7 +446,7 @@ ordinal.
         };
 
         // Open the source ivec file
-        let ivec_reader = match MmapVectorReader::<i32>::open_ivec(&ivec_path) {
+        let ivec_reader = match XvecReader::<i32>::open_path(&ivec_path) {
             Ok(r) => r,
             Err(e) => {
                 return error_result(
@@ -456,8 +456,8 @@ ordinal.
             }
         };
 
-        let ivec_count = <MmapVectorReader<i32> as VectorReader<i32>>::count(&ivec_reader);
-        let dim = <MmapVectorReader<i32> as VectorReader<i32>>::dim(&ivec_reader) as u32;
+        let ivec_count = <XvecReader<i32> as VectorReader<i32>>::count(&ivec_reader);
+        let dim = <XvecReader<i32> as VectorReader<i32>>::dim(&ivec_reader) as u32;
 
         // Create output directory
         if let Some(parent) = output_path.parent() {
@@ -482,7 +482,7 @@ ordinal.
 
         if let Some(ref idx_p) = index_path {
             // Index-based extraction: read indices from index-file, look up records in source ivec
-            let idx_reader = match MmapVectorReader::<i32>::open_ivec(idx_p) {
+            let idx_reader = match XvecReader::<i32>::open_path(idx_p) {
                 Ok(r) => r,
                 Err(e) => {
                     return error_result(
@@ -492,7 +492,7 @@ ordinal.
                 }
             };
 
-            let idx_count = <MmapVectorReader<i32> as VectorReader<i32>>::count(&idx_reader);
+            let idx_count = <XvecReader<i32> as VectorReader<i32>>::count(&idx_reader);
             let range_start = range.start;
             let range_end = range.end.unwrap_or(idx_count);
 
@@ -793,7 +793,7 @@ so that `base_metadata.slab[i]` corresponds to `base_vectors.mvec[i]`.
         }
 
         // Open the mvec file
-        let mvec_reader = match MmapVectorReader::<half::f16>::open_mvec(&mvec_path) {
+        let mvec_reader = match XvecReader::<half::f16>::open_path(&mvec_path) {
             Ok(r) => r,
             Err(e) => {
                 return error_result(
@@ -804,9 +804,9 @@ so that `base_metadata.slab[i]` corresponds to `base_vectors.mvec[i]`.
         };
 
         let mvec_count =
-            <MmapVectorReader<half::f16> as VectorReader<half::f16>>::count(&mvec_reader);
+            <XvecReader<half::f16> as VectorReader<half::f16>>::count(&mvec_reader);
         let dim =
-            <MmapVectorReader<half::f16> as VectorReader<half::f16>>::dim(&mvec_reader) as u32;
+            <XvecReader<half::f16> as VectorReader<half::f16>>::dim(&mvec_reader) as u32;
 
         // Create output directory
         if let Some(parent) = output_path.parent() {
@@ -841,7 +841,7 @@ so that `base_metadata.slab[i]` corresponds to `base_vectors.mvec[i]`.
             // into sequential I/O, then write each vector at its correct output
             // offset. Processes in memory-bounded chunks (up to half system RAM)
             // so this works on systems with limited memory.
-            let ivec_reader = match MmapVectorReader::<i32>::open_ivec(ivec_p) {
+            let ivec_reader = match XvecReader::<i32>::open_path(ivec_p) {
                 Ok(r) => r,
                 Err(e) => {
                     return error_result(
@@ -851,7 +851,7 @@ so that `base_metadata.slab[i]` corresponds to `base_vectors.mvec[i]`.
                 }
             };
 
-            let ivec_count = <MmapVectorReader<i32> as VectorReader<i32>>::count(&ivec_reader);
+            let ivec_count = <XvecReader<i32> as VectorReader<i32>>::count(&ivec_reader);
             let range_start = range.start;
             let range_end = range.end.unwrap_or(ivec_count);
 
@@ -1089,7 +1089,7 @@ impl CommandOp for GenerateSlabExtractOp {
 
         if let Some(ref ivec_p) = ivec_path {
             // Index-based extraction: partitioned-pass approach for sequential I/O
-            let ivec_reader = match MmapVectorReader::<i32>::open_ivec(ivec_p) {
+            let ivec_reader = match XvecReader::<i32>::open_path(ivec_p) {
                 Ok(r) => r,
                 Err(e) => {
                     return error_result(
@@ -1099,7 +1099,7 @@ impl CommandOp for GenerateSlabExtractOp {
                 }
             };
 
-            let ivec_count = <MmapVectorReader<i32> as VectorReader<i32>>::count(&ivec_reader);
+            let ivec_count = <XvecReader<i32> as VectorReader<i32>>::count(&ivec_reader);
             let range_start = range.start;
             let range_end = range.end.unwrap_or(ivec_count);
 
@@ -1377,10 +1377,10 @@ fn half_system_ram() -> u64 {
 /// (integer range check only). Source data is only read for records in the
 /// current partition.
 fn sorted_index_extract_mvec(
-    mvec_reader: &MmapVectorReader<half::f16>,
+    mvec_reader: &XvecReader<half::f16>,
     mvec_count: usize,
     dim: u32,
-    ivec_reader: &MmapVectorReader<i32>,
+    ivec_reader: &XvecReader<i32>,
     range_start: usize,
     effective_end: usize,
     output_path: &Path,
@@ -1680,11 +1680,11 @@ fn sorted_index_extract_mvec(
 /// Same algorithm as mvec: for each output partition, scan ivec to build
 /// a read plan, sort by source position, read sequentially, write contiguously.
 fn sorted_index_extract_fvec(
-    fvec_reader: &MmapVectorReader<f32>,
+    fvec_reader: &XvecReader<f32>,
     fvec_path: &Path,
     fvec_count: usize,
     dim: u32,
-    ivec_reader: &MmapVectorReader<i32>,
+    ivec_reader: &XvecReader<i32>,
     range_start: usize,
     effective_end: usize,
     output_path: &Path,
@@ -2331,9 +2331,9 @@ fn sorted_index_extract_fvec(
     let duplicate_zero_count = {
         let dup_path = ctx.workspace.join(".cache/dedup_duplicates.ivecs");
         if dup_path.exists() {
-            match MmapVectorReader::<i32>::open_ivec(&dup_path) {
+            match XvecReader::<i32>::open_path(&dup_path) {
                 Ok(dup_reader) => {
-                    let dup_count = <MmapVectorReader<i32> as VectorReader<i32>>::count(&dup_reader);
+                    let dup_count = <XvecReader<i32> as VectorReader<i32>>::count(&dup_reader);
                     let mut dz = 0usize;
                     for i in 0..dup_count {
                         let ord = dup_reader.get_slice(i)[0] as usize;
@@ -2537,7 +2537,7 @@ struct SlabExtractMeta {
 fn sorted_index_extract_slab(
     reader: &slabtastic::SlabReader,
     slab_count: usize,
-    ivec_reader: &MmapVectorReader<i32>,
+    ivec_reader: &XvecReader<i32>,
     range_start: usize,
     effective_end: usize,
     output_path: &Path,
@@ -2968,7 +2968,7 @@ impl CommandOp for GenerateScalarExtractOp {
         let indices: Vec<usize> = if let Some(ivec_str) = index_str {
             // Index-based: read ivec file, apply range if specified
             let ivec_path = resolve_path(ivec_str, &ctx.workspace);
-            let ivec_reader = match MmapVectorReader::<i32>::open_ivec(&ivec_path) {
+            let ivec_reader = match XvecReader::<i32>::open_path(&ivec_path) {
                 Ok(r) => r,
                 Err(e) => return error_result(format!("open index file: {}", e), start),
             };
@@ -3151,18 +3151,18 @@ impl CommandOp for TransformExtractOp {
                     format!("invalid predicate-index: '{}'", pred_idx_str), start),
             };
             let ivvec_path = resolve_path(ivvec_str, &ctx.workspace);
-            let reader = match vectordata::io::IndexedXvecReader::open_ivec(&ivvec_path) {
+            let reader = match vectordata::io::IndexedVvecReader::<i32>::open_path(&ivvec_path) {
                 Ok(r) => r,
                 Err(e) => return error_result(
                     format!("open index-source {}: {}", ivvec_path.display(), e), start),
             };
-            let record_count = <IndexedXvecReader as VvecReader<i32>>::count(&reader);
+            let record_count = <IndexedVvecReader<i32> as VvecReader<i32>>::count(&reader);
             if pred_idx >= record_count {
                 return error_result(format!(
                     "predicate-index {} out of bounds (ivvec has {} records)",
                     pred_idx, record_count), start);
             }
-            let ordinals = match <IndexedXvecReader as VvecReader<i32>>::get(&reader, pred_idx) {
+            let ordinals = match <IndexedVvecReader<i32> as VvecReader<i32>>::get(&reader, pred_idx) {
                 Ok(v) => v,
                 Err(e) => return error_result(
                     format!("read predicate-index {}: {}", pred_idx, e), start),
@@ -3456,10 +3456,10 @@ mod tests {
         assert_eq!(size, 10 * (4 + 8 * 2));
 
         // Verify extracted vectors match originals
-        let orig = MmapVectorReader::<half::f16>::open_mvec(&mvec_path).unwrap();
-        let extracted = MmapVectorReader::<half::f16>::open_mvec(&out_path).unwrap();
+        let orig = XvecReader::<half::f16>::open_path(&mvec_path).unwrap();
+        let extracted = XvecReader::<half::f16>::open_path(&out_path).unwrap();
         assert_eq!(
-            <MmapVectorReader<half::f16> as VectorReader<half::f16>>::count(&extracted),
+            <XvecReader<half::f16> as VectorReader<half::f16>>::count(&extracted),
             10
         );
         for i in 0..10 {
@@ -3537,11 +3537,11 @@ mod tests {
         assert_eq!(size, 5 * (4 + 8 * 2));
 
         // Verify extracted vectors match shuffled originals
-        let orig = MmapVectorReader::<half::f16>::open_mvec(&mvec_path).unwrap();
-        let extracted = MmapVectorReader::<half::f16>::open_mvec(&out_path).unwrap();
-        let shuffle = MmapVectorReader::<i32>::open_ivec(&ivec_path).unwrap();
+        let orig = XvecReader::<half::f16>::open_path(&mvec_path).unwrap();
+        let extracted = XvecReader::<half::f16>::open_path(&out_path).unwrap();
+        let shuffle = XvecReader::<i32>::open_path(&ivec_path).unwrap();
         assert_eq!(
-            <MmapVectorReader<half::f16> as VectorReader<half::f16>>::count(&extracted),
+            <XvecReader<half::f16> as VectorReader<half::f16>>::count(&extracted),
             5
         );
         for i in 0..5 {
@@ -3622,11 +3622,11 @@ mod tests {
         // This is the critical test for the transpose fix — previously
         // the fvec extract did not preserve ivec ordering for shuffled
         // (non-sorted) indices.
-        let orig = MmapVectorReader::<f32>::open_fvec(&fvec_path).unwrap();
-        let extracted = MmapVectorReader::<f32>::open_fvec(&out_path).unwrap();
-        let shuffle = MmapVectorReader::<i32>::open_ivec(&ivec_path).unwrap();
+        let orig = XvecReader::<f32>::open_path(&fvec_path).unwrap();
+        let extracted = XvecReader::<f32>::open_path(&out_path).unwrap();
+        let shuffle = XvecReader::<i32>::open_path(&ivec_path).unwrap();
         assert_eq!(
-            <MmapVectorReader<f32> as VectorReader<f32>>::count(&extracted),
+            <XvecReader<f32> as VectorReader<f32>>::count(&extracted),
             10
         );
         for i in 0..10 {
@@ -3698,10 +3698,10 @@ mod tests {
         let r = ext.execute(&opts, &mut ctx);
         assert_eq!(r.status, Status::Ok);
 
-        let orig = MmapVectorReader::<f32>::open_fvec(&fvec_path).unwrap();
-        let extracted = MmapVectorReader::<f32>::open_fvec(&out_path).unwrap();
+        let orig = XvecReader::<f32>::open_path(&fvec_path).unwrap();
+        let extracted = XvecReader::<f32>::open_path(&out_path).unwrap();
         assert_eq!(
-            <MmapVectorReader<f32> as VectorReader<f32>>::count(&extracted),
+            <XvecReader<f32> as VectorReader<f32>>::count(&extracted),
             100
         );
 
@@ -3792,14 +3792,14 @@ mod tests {
         // After filtering: [9, _, 5, _, 1, 8, 6, 4, 2, _] → 7 non-zero vectors
         // Output should have 7 vectors in order: source[9], source[5], source[1],
         //   source[8], source[6], source[4], source[2]
-        let extracted = MmapVectorReader::<f32>::open_fvec(&out_path).unwrap();
-        let count = <MmapVectorReader<f32> as VectorReader<f32>>::count(&extracted);
+        let extracted = XvecReader::<f32>::open_path(&out_path).unwrap();
+        let count = <XvecReader<f32> as VectorReader<f32>>::count(&extracted);
         assert_eq!(count, 7, "should have 7 non-zero vectors after filtering");
 
         // Verify the vectors are from the correct source indices, in ivec order
         // (exact float values will differ due to normalization, but the source
         // index should be recoverable from the relative magnitudes)
-        let orig = MmapVectorReader::<f32>::open_fvec(&fvec_path).unwrap();
+        let orig = XvecReader::<f32>::open_path(&fvec_path).unwrap();
         let expected_sources = [9usize, 5, 1, 8, 6, 4, 2];
         for (out_i, &src_i) in expected_sources.iter().enumerate() {
             let e = extracted.get_slice(out_i);

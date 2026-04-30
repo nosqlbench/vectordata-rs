@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use vectordata::VectorReader;
-use vectordata::io::MmapVectorReader;
+use vectordata::io::XvecReader;
 
 use crate::pipeline::command::{
     CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole,
@@ -824,10 +824,10 @@ fn write_sampled_query_file(
     workdir: &Path,
     ui: &mut veks_core::ui::UiHandle,
 ) -> Result<PathBuf, String> {
-    let reader = MmapVectorReader::<f32>::open_fvec(query_path)
+    let reader = XvecReader::<f32>::open_path(query_path)
         .map_err(|e| format!("open query {}: {}", query_path.display(), e))?;
-    let total = <MmapVectorReader<f32> as VectorReader<f32>>::count(&reader);
-    let dim = <MmapVectorReader<f32> as VectorReader<f32>>::dim(&reader);
+    let total = <XvecReader<f32> as VectorReader<f32>>::count(&reader);
+    let dim = <XvecReader<f32> as VectorReader<f32>>::dim(&reader);
     if n >= total {
         return Ok(query_path.to_path_buf());
     }
@@ -884,12 +884,12 @@ fn fmt_neighbors(row: &[i32], k: usize) -> String {
 }
 
 fn read_ivec_rows(path: &Path) -> Result<Vec<Vec<i32>>, String> {
-    let reader = MmapVectorReader::<i32>::open_ivec(path)
+    let reader = XvecReader::<i32>::open_path(path)
         .map_err(|e| format!("open {}: {}", path.display(), e))?;
-    let n = <MmapVectorReader<i32> as VectorReader<i32>>::count(&reader);
+    let n = <XvecReader<i32> as VectorReader<i32>>::count(&reader);
     let mut out = Vec::with_capacity(n);
     for i in 0..n {
-        let row = <MmapVectorReader<i32> as VectorReader<i32>>::get(&reader, i)
+        let row = <XvecReader<i32> as VectorReader<i32>>::get(&reader, i)
             .map_err(|e| format!("read row {}: {}", i, e))?;
         out.push(row);
     }
@@ -1115,7 +1115,7 @@ fn run_blas_mirror(
     ui: &mut veks_core::ui::UiHandle,
 ) -> Result<(), String> {
     use vectordata::VectorReader;
-    use vectordata::io::MmapVectorReader;
+    use vectordata::io::XvecReader;
 
     // Resolve which sgemm-derived distance to compute. blas-mirror
     // tracks all four metric paths the engines do, so it can serve
@@ -1153,15 +1153,15 @@ fn run_blas_mirror(
         MirrorMode::CosineProper => super::knn_segment::Metric::Cosine,
     };
 
-    let base_reader = MmapVectorReader::<f32>::open_fvec(base_path)
+    let base_reader = XvecReader::<f32>::open_path(base_path)
         .map_err(|e| format!("open {}: {}", base_path.display(), e))?;
-    let query_reader = MmapVectorReader::<f32>::open_fvec(query_path)
+    let query_reader = XvecReader::<f32>::open_path(query_path)
         .map_err(|e| format!("open {}: {}", query_path.display(), e))?;
 
-    let n_base  = <MmapVectorReader<f32> as VectorReader<f32>>::count(&base_reader);
-    let n_query = <MmapVectorReader<f32> as VectorReader<f32>>::count(&query_reader);
-    let dim     = <MmapVectorReader<f32> as VectorReader<f32>>::dim(&base_reader);
-    let qdim    = <MmapVectorReader<f32> as VectorReader<f32>>::dim(&query_reader);
+    let n_base  = <XvecReader<f32> as VectorReader<f32>>::count(&base_reader);
+    let n_query = <XvecReader<f32> as VectorReader<f32>>::count(&query_reader);
+    let dim     = <XvecReader<f32> as VectorReader<f32>>::dim(&base_reader);
+    let qdim    = <XvecReader<f32> as VectorReader<f32>>::dim(&query_reader);
     if dim != qdim {
         return Err(format!("dim mismatch: base={}, query={}", dim, qdim));
     }

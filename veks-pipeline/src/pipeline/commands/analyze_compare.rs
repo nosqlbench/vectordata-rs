@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use rayon::prelude::*;
-use vectordata::io::MmapVectorReader;
+use vectordata::io::XvecReader;
 use vectordata::io::VectorReader;
 
 use crate::pipeline::command::{
@@ -188,7 +188,7 @@ impl CommandOp for AnalyzeCompareOp {
         };
         let (orig_count, orig_dim, orig_get): (usize, usize, Box<dyn Fn(usize) -> Vec<f64> + Sync>) = match orig_etype {
             ElementType::F32 => {
-                let r = match MmapVectorReader::<f32>::open_fvec(&orig_path) {
+                let r = match XvecReader::<f32>::open_path(&orig_path) {
                     Ok(r) => r, Err(e) => return error_result(format!("open original: {}", e), start),
                 };
                 let fc = VectorReader::<f32>::count(&r);
@@ -196,7 +196,7 @@ impl CommandOp for AnalyzeCompareOp {
                 (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
             }
             ElementType::F16 => {
-                let r = match MmapVectorReader::<half::f16>::open_mvec(&orig_path) {
+                let r = match XvecReader::<half::f16>::open_path(&orig_path) {
                     Ok(r) => r, Err(e) => return error_result(format!("open original: {}", e), start),
                 };
                 let fc = VectorReader::<half::f16>::count(&r);
@@ -204,7 +204,7 @@ impl CommandOp for AnalyzeCompareOp {
                 (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|v| v.to_f64()).collect()))
             }
             ElementType::F64 => {
-                let r = match MmapVectorReader::<f64>::open_dvec(&orig_path) {
+                let r = match XvecReader::<f64>::open_path(&orig_path) {
                     Ok(r) => r, Err(e) => return error_result(format!("open original: {}", e), start),
                 };
                 let fc = VectorReader::<f64>::count(&r);
@@ -212,7 +212,7 @@ impl CommandOp for AnalyzeCompareOp {
                 (fc, d, Box::new(move |i| r.get(i).unwrap_or_default()))
             }
             ElementType::I32 => {
-                let r = match MmapVectorReader::<i32>::open_ivec(&orig_path) {
+                let r = match XvecReader::<i32>::open_path(&orig_path) {
                     Ok(r) => r, Err(e) => return error_result(format!("open original: {}", e), start),
                 };
                 let fc = VectorReader::<i32>::count(&r);
@@ -220,7 +220,7 @@ impl CommandOp for AnalyzeCompareOp {
                 (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
             }
             ElementType::I16 => {
-                let r = match MmapVectorReader::<i16>::open_svec(&orig_path) {
+                let r = match XvecReader::<i16>::open_path(&orig_path) {
                     Ok(r) => r, Err(e) => return error_result(format!("open original: {}", e), start),
                 };
                 let fc = VectorReader::<i16>::count(&r);
@@ -228,7 +228,7 @@ impl CommandOp for AnalyzeCompareOp {
                 (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
             }
             ElementType::U8 | ElementType::I8 => {
-                let r = match MmapVectorReader::<u8>::open_bvec(&orig_path) {
+                let r = match XvecReader::<u8>::open_path(&orig_path) {
                     Ok(r) => r, Err(e) => return error_result(format!("open original: {}", e), start),
                 };
                 let fc = VectorReader::<u8>::count(&r);
@@ -236,7 +236,7 @@ impl CommandOp for AnalyzeCompareOp {
                 (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
             }
             ElementType::U16 => {
-                let r = match MmapVectorReader::<i16>::open_svec(&orig_path) {
+                let r = match XvecReader::<i16>::open_path(&orig_path) {
                     Ok(r) => r, Err(e) => return error_result(format!("open original: {}", e), start),
                 };
                 let fc = VectorReader::<i16>::count(&r);
@@ -244,7 +244,7 @@ impl CommandOp for AnalyzeCompareOp {
                 (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
             }
             ElementType::U32 => {
-                let r = match MmapVectorReader::<i32>::open_ivec(&orig_path) {
+                let r = match XvecReader::<i32>::open_path(&orig_path) {
                     Ok(r) => r, Err(e) => return error_result(format!("open original: {}", e), start),
                 };
                 let fc = VectorReader::<i32>::count(&r);
@@ -252,7 +252,7 @@ impl CommandOp for AnalyzeCompareOp {
                 (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
             }
             ElementType::U64 | ElementType::I64 => {
-                let r = match MmapVectorReader::<f64>::open_dvec(&orig_path) {
+                let r = match XvecReader::<f64>::open_path(&orig_path) {
                     Ok(r) => r, Err(e) => return error_result(format!("open original: {}", e), start),
                 };
                 let fc = VectorReader::<f64>::count(&r);
@@ -268,7 +268,7 @@ impl CommandOp for AnalyzeCompareOp {
         };
         let (synth_count, synth_dim, synth_get): (usize, usize, Box<dyn Fn(usize) -> Vec<f64> + Sync>) = match synth_etype {
             ElementType::F32 => {
-                let r = match MmapVectorReader::<f32>::open_fvec(&synth_path) {
+                let r = match XvecReader::<f32>::open_path(&synth_path) {
                     Ok(r) => r, Err(e) => return error_result(format!("open synthetic: {}", e), start),
                 };
                 let fc = VectorReader::<f32>::count(&r);
@@ -276,7 +276,7 @@ impl CommandOp for AnalyzeCompareOp {
                 (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
             }
             ElementType::F16 => {
-                let r = match MmapVectorReader::<half::f16>::open_mvec(&synth_path) {
+                let r = match XvecReader::<half::f16>::open_path(&synth_path) {
                     Ok(r) => r, Err(e) => return error_result(format!("open synthetic: {}", e), start),
                 };
                 let fc = VectorReader::<half::f16>::count(&r);
@@ -284,7 +284,7 @@ impl CommandOp for AnalyzeCompareOp {
                 (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|v| v.to_f64()).collect()))
             }
             ElementType::F64 => {
-                let r = match MmapVectorReader::<f64>::open_dvec(&synth_path) {
+                let r = match XvecReader::<f64>::open_path(&synth_path) {
                     Ok(r) => r, Err(e) => return error_result(format!("open synthetic: {}", e), start),
                 };
                 let fc = VectorReader::<f64>::count(&r);
@@ -292,7 +292,7 @@ impl CommandOp for AnalyzeCompareOp {
                 (fc, d, Box::new(move |i| r.get(i).unwrap_or_default()))
             }
             ElementType::I32 => {
-                let r = match MmapVectorReader::<i32>::open_ivec(&synth_path) {
+                let r = match XvecReader::<i32>::open_path(&synth_path) {
                     Ok(r) => r, Err(e) => return error_result(format!("open synthetic: {}", e), start),
                 };
                 let fc = VectorReader::<i32>::count(&r);
@@ -300,7 +300,7 @@ impl CommandOp for AnalyzeCompareOp {
                 (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
             }
             ElementType::I16 => {
-                let r = match MmapVectorReader::<i16>::open_svec(&synth_path) {
+                let r = match XvecReader::<i16>::open_path(&synth_path) {
                     Ok(r) => r, Err(e) => return error_result(format!("open synthetic: {}", e), start),
                 };
                 let fc = VectorReader::<i16>::count(&r);
@@ -308,7 +308,7 @@ impl CommandOp for AnalyzeCompareOp {
                 (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
             }
             ElementType::U8 | ElementType::I8 => {
-                let r = match MmapVectorReader::<u8>::open_bvec(&synth_path) {
+                let r = match XvecReader::<u8>::open_path(&synth_path) {
                     Ok(r) => r, Err(e) => return error_result(format!("open synthetic: {}", e), start),
                 };
                 let fc = VectorReader::<u8>::count(&r);
@@ -316,7 +316,7 @@ impl CommandOp for AnalyzeCompareOp {
                 (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
             }
             ElementType::U16 => {
-                let r = match MmapVectorReader::<i16>::open_svec(&synth_path) {
+                let r = match XvecReader::<i16>::open_path(&synth_path) {
                     Ok(r) => r, Err(e) => return error_result(format!("open synthetic: {}", e), start),
                 };
                 let fc = VectorReader::<i16>::count(&r);
@@ -324,7 +324,7 @@ impl CommandOp for AnalyzeCompareOp {
                 (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
             }
             ElementType::U32 => {
-                let r = match MmapVectorReader::<i32>::open_ivec(&synth_path) {
+                let r = match XvecReader::<i32>::open_path(&synth_path) {
                     Ok(r) => r, Err(e) => return error_result(format!("open synthetic: {}", e), start),
                 };
                 let fc = VectorReader::<i32>::count(&r);
@@ -332,7 +332,7 @@ impl CommandOp for AnalyzeCompareOp {
                 (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
             }
             ElementType::U64 | ElementType::I64 => {
-                let r = match MmapVectorReader::<f64>::open_dvec(&synth_path) {
+                let r = match XvecReader::<f64>::open_path(&synth_path) {
                     Ok(r) => r, Err(e) => return error_result(format!("open synthetic: {}", e), start),
                 };
                 let fc = VectorReader::<f64>::count(&r);

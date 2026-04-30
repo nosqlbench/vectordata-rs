@@ -14,7 +14,7 @@
 //! On restart, loading the state file resumes from the last checkpoint — only
 //! unverified chunks are re-downloaded.
 
-pub mod reader;
+pub(crate) mod reader;
 
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
@@ -56,6 +56,7 @@ pub struct CachedChannel {
     in_flight: Mutex<HashMap<u32, Arc<Condvar>>>,
 }
 
+#[allow(dead_code)] // pub(crate) helpers retained for Storage and tests
 impl CachedChannel {
     /// Open a cached channel for a remote resource.
     ///

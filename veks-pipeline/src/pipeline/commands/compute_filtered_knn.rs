@@ -43,7 +43,7 @@ use byteorder::{LittleEndian, ReadBytesExt};
 use half;
 use veks_core::ui::{ProgressHandle, UiHandle};
 use vectordata::VectorReader;
-use vectordata::io::MmapVectorReader;
+use vectordata::io::XvecReader;
 
 use crate::pipeline::command::{
     ArtifactManifest, CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options,
@@ -107,7 +107,7 @@ pub(crate) enum PredicateIndices {
     /// Slab: each record is packed i32 LE ordinals.
     Slab(slabtastic::SlabReader),
     /// Ivec: variable-length records accessed via offset index.
-    Ivec(vectordata::io::IndexedXvecReader),
+    Ivec(vectordata::io::IndexedVvecReader::<i32>),
 }
 
 impl PredicateIndices {
@@ -121,7 +121,7 @@ impl PredicateIndices {
                 Ok(Self::Slab(reader))
             }
             "ivec" | "ivecs" | "ivvec" | "ivvecs" | "i32vvec" | "i32vvecs" => {
-                let reader = vectordata::io::IndexedXvecReader::open_ivec(path)
+                let reader = vectordata::io::IndexedVvecReader::<i32>::open_path(path)
                     .map_err(|e| format!("open indexed ivec {}: {}", path.display(), e))?;
                 Ok(Self::Ivec(reader))
             }
@@ -446,14 +446,14 @@ fn merge_partitions(
 /// Find top-K neighbors from a filtered set of base vector ordinals (f32).
 fn find_top_k_filtered_f32(
     query: &[f32],
-    base_reader: &MmapVectorReader<f32>,
+    base_reader: &XvecReader<f32>,
     ordinals: &[i32],
     k: usize,
     dist_fn: fn(&[f32], &[f32]) -> f32,
 ) -> Vec<Neighbor> {
     let mut heap: BinaryHeap<Neighbor> = BinaryHeap::with_capacity(k + 1);
     let mut threshold = f32::INFINITY;
-    let base_count = <MmapVectorReader<f32> as VectorReader<f32>>::count(base_reader);
+    let base_count = <XvecReader<f32> as VectorReader<f32>>::count(base_reader);
 
     for &ord in ordinals {
         let idx = ord as usize;
@@ -474,14 +474,14 @@ fn find_top_k_filtered_f32(
 /// Find top-K neighbors from a filtered set of base vector ordinals (f16).
 fn find_top_k_filtered_f16(
     query: &[half::f16],
-    base_reader: &MmapVectorReader<half::f16>,
+    base_reader: &XvecReader<half::f16>,
     ordinals: &[i32],
     k: usize,
     dist_fn: fn(&[half::f16], &[half::f16]) -> f32,
 ) -> Vec<Neighbor> {
     let mut heap: BinaryHeap<Neighbor> = BinaryHeap::with_capacity(k + 1);
     let mut threshold = f32::INFINITY;
-    let base_count = <MmapVectorReader<half::f16> as VectorReader<half::f16>>::count(base_reader);
+    let base_count = <XvecReader<half::f16> as VectorReader<half::f16>>::count(base_reader);
 
     for &ord in ordinals {
         let idx = ord as usize;
@@ -502,7 +502,7 @@ fn find_top_k_filtered_f16(
 /// Find top-K neighbors from a filtered set of base vector ordinals (f64).
 fn find_top_k_filtered_f64(
     query: &[f64],
-    base_reader: &MmapVectorReader<f64>,
+    base_reader: &XvecReader<f64>,
     ordinals: &[i32],
     k: usize,
     dist_fn: fn(&[f64], &[f64]) -> f32,
@@ -529,9 +529,9 @@ fn find_top_k_filtered_f64(
 
 /// Compute filtered KNN for a single base-vector partition `[start, end)` (f64).
 fn compute_partition_filtered_f64(
-    query_reader: &MmapVectorReader<f64>,
+    query_reader: &XvecReader<f64>,
     query_count: usize,
-    base_reader: &Arc<MmapVectorReader<f64>>,
+    base_reader: &Arc<XvecReader<f64>>,
     keys_reader: &PredicateIndices,
     start: usize,
     end: usize,
@@ -599,9 +599,9 @@ fn compute_partition_filtered_f64(
 /// For each query, reads metadata-index ordinals, filters to those within the
 /// partition range, and computes distances only to matching base vectors.
 fn compute_partition_filtered_f32(
-    query_reader: &MmapVectorReader<f32>,
+    query_reader: &XvecReader<f32>,
     query_count: usize,
-    base_reader: &Arc<MmapVectorReader<f32>>,
+    base_reader: &Arc<XvecReader<f32>>,
     keys_reader: &PredicateIndices,
     start: usize,
     end: usize,
@@ -672,9 +672,9 @@ fn compute_partition_filtered_f32(
 
 /// Compute filtered KNN for a single base-vector partition `[start, end)` (f16).
 fn compute_partition_filtered_f16(
-    query_reader: &MmapVectorReader<half::f16>,
+    query_reader: &XvecReader<half::f16>,
     query_count: usize,
-    base_reader: &Arc<MmapVectorReader<half::f16>>,
+    base_reader: &Arc<XvecReader<half::f16>>,
     keys_reader: &PredicateIndices,
     start: usize,
     end: usize,
@@ -1020,18 +1020,18 @@ fn execute_f32(
     start: Instant,
 ) -> CommandResult {
     ctx.ui.log(&format!("  opening base vectors: {}", base_path.display()));
-    let base_reader = match MmapVectorReader::<f32>::open_fvec(base_path) {
+    let base_reader = match XvecReader::<f32>::open_path(base_path) {
         Ok(r) => Arc::new(r),
         Err(e) => return error_result(format!("open base: {}", e), start),
     };
     ctx.ui.log(&format!("  opening query vectors: {}", query_path.display()));
-    let query_reader = match MmapVectorReader::<f32>::open_fvec(query_path) {
+    let query_reader = match XvecReader::<f32>::open_path(query_path) {
         Ok(r) => r,
         Err(e) => return error_result(format!("open query: {}", e), start),
     };
 
-    let file_count = <MmapVectorReader<f32> as VectorReader<f32>>::count(&*base_reader);
-    let query_count = <MmapVectorReader<f32> as VectorReader<f32>>::count(&query_reader);
+    let file_count = <XvecReader<f32> as VectorReader<f32>>::count(&*base_reader);
+    let query_count = <XvecReader<f32> as VectorReader<f32>>::count(&query_reader);
     let keys_count = keys_reader.count();
     let actual_count = query_count.min(keys_count);
 
@@ -1085,18 +1085,18 @@ fn execute_f16(
     start: Instant,
 ) -> CommandResult {
     ctx.ui.log(&format!("  opening base vectors: {}", base_path.display()));
-    let base_reader = match MmapVectorReader::<half::f16>::open_mvec(base_path) {
+    let base_reader = match XvecReader::<half::f16>::open_path(base_path) {
         Ok(r) => Arc::new(r),
         Err(e) => return error_result(format!("open base: {}", e), start),
     };
     ctx.ui.log(&format!("  opening query vectors: {}", query_path.display()));
-    let query_reader = match MmapVectorReader::<half::f16>::open_mvec(query_path) {
+    let query_reader = match XvecReader::<half::f16>::open_path(query_path) {
         Ok(r) => r,
         Err(e) => return error_result(format!("open query: {}", e), start),
     };
 
-    let file_count = <MmapVectorReader<half::f16> as VectorReader<half::f16>>::count(&*base_reader);
-    let query_count = <MmapVectorReader<half::f16> as VectorReader<half::f16>>::count(&query_reader);
+    let file_count = <XvecReader<half::f16> as VectorReader<half::f16>>::count(&*base_reader);
+    let query_count = <XvecReader<half::f16> as VectorReader<half::f16>>::count(&query_reader);
     let keys_count = keys_reader.count();
     let actual_count = query_count.min(keys_count);
 
@@ -1149,12 +1149,12 @@ fn execute_f64(
     start: Instant,
 ) -> CommandResult {
     ctx.ui.log(&format!("  opening base vectors: {}", base_path.display()));
-    let base_reader = match MmapVectorReader::<f64>::open_dvec(base_path) {
+    let base_reader = match XvecReader::<f64>::open_path(base_path) {
         Ok(r) => Arc::new(r),
         Err(e) => return error_result(format!("open base: {}", e), start),
     };
     ctx.ui.log(&format!("  opening query vectors: {}", query_path.display()));
-    let query_reader = match MmapVectorReader::<f64>::open_dvec(query_path) {
+    let query_reader = match XvecReader::<f64>::open_path(query_path) {
         Ok(r) => r,
         Err(e) => return error_result(format!("open query: {}", e), start),
     };
@@ -1202,8 +1202,8 @@ fn execute_f64(
 /// and a background writer flushes results to cache.
 #[allow(clippy::too_many_arguments)]
 fn execute_with_partitions<T: Send + Sync + 'static>(
-    query_reader: &MmapVectorReader<T>,
-    base_reader: &Arc<MmapVectorReader<T>>,
+    query_reader: &XvecReader<T>,
+    base_reader: &Arc<XvecReader<T>>,
     keys_reader: &PredicateIndices,
     base_offset: usize,
     base_count: usize,
@@ -1220,7 +1220,7 @@ fn execute_with_partitions<T: Send + Sync + 'static>(
     ctx: &mut StreamContext,
     start: Instant,
     compute_fn: fn(
-        &MmapVectorReader<T>, usize, &Arc<MmapVectorReader<T>>, &PredicateIndices,
+        &XvecReader<T>, usize, &Arc<XvecReader<T>>, &PredicateIndices,
         usize, usize, usize, fn(&[T], &[T]) -> f32, usize, &ProgressHandle,
     ) -> Vec<Vec<Neighbor>>,
 ) -> CommandResult {

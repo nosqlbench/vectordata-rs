@@ -15,7 +15,7 @@ use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use vectordata::VectorReader;
-use vectordata::io::MmapVectorReader;
+use vectordata::io::XvecReader;
 
 use crate::pipeline::command::{
     CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options, ResourceDesc, Status, StreamContext,
@@ -170,7 +170,7 @@ statistics.
         };
 
         // Open and sample vectors
-        let reader = match MmapVectorReader::<f32>::open_fvec(&base_path) {
+        let reader = match XvecReader::<f32>::open_path(&base_path) {
             Ok(r) => r,
             Err(e) => {
                 return error_result(
@@ -180,8 +180,8 @@ statistics.
             }
         };
 
-        let total_count = <MmapVectorReader<f32> as VectorReader<f32>>::count(&reader);
-        let dim = <MmapVectorReader<f32> as VectorReader<f32>>::dim(&reader);
+        let total_count = <XvecReader<f32> as VectorReader<f32>>::count(&reader);
+        let dim = <XvecReader<f32> as VectorReader<f32>>::dim(&reader);
         let effective_sample = sample.min(total_count);
         let output_count = if count == 0 { total_count as u64 } else { count };
 

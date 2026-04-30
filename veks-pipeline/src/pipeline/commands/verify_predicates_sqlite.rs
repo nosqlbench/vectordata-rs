@@ -472,8 +472,8 @@ fn load_scalar_predicates(path: &Path, ext: &str, fields: usize) -> Result<Vec<V
 fn load_results(path: &Path, ext: &str) -> Result<Vec<Vec<i32>>, String> {
     match ext {
         "ivec" | "ivecs" | "ivvec" | "ivvecs" | "i32vvec" | "i32vvecs" => {
-            // Use IndexedXvecReader for both uniform and variable-length ivec
-            let reader = vectordata::io::IndexedXvecReader::open_ivec(path)
+            // Use IndexedVvecReader::<i32> for both uniform and variable-length ivec
+            let reader = vectordata::io::IndexedVvecReader::<i32>::open_path(path)
                 .map_err(|e| format!("{}: {}", path.display(), e))?;
             let mut results = Vec::with_capacity(reader.count());
             for i in 0..reader.count() {

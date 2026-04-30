@@ -16,7 +16,7 @@ use std::time::Instant;
 
 use vectordata::VectorReader;
 use vectordata::formats::pnode::{PNode, Comparand};
-use vectordata::io::MmapVectorReader;
+use vectordata::io::XvecReader;
 
 use crate::pipeline::command::{
     CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options,
@@ -145,7 +145,7 @@ templates (compute-knn, verify-knn) for the new partition profiles.
         let metadata_path = resolve_path(metadata_str, &ctx.workspace);
 
         // Open base vectors
-        let base_reader = match MmapVectorReader::<f32>::open_fvec(&base_path) {
+        let base_reader = match XvecReader::<f32>::open_path(&base_path) {
             Ok(r) => r,
             Err(e) => return error_result(format!("open base: {}", e), start),
         };
@@ -153,7 +153,7 @@ templates (compute-knn, verify-knn) for the new partition profiles.
         let dim = VectorReader::<f32>::dim(&base_reader);
 
         // Open query vectors (needed for per-label query extraction)
-        let query_reader = match MmapVectorReader::<f32>::open_fvec(&query_path) {
+        let query_reader = match XvecReader::<f32>::open_path(&query_path) {
             Ok(r) => r,
             Err(e) => return error_result(format!("open query: {}", e), start),
         };

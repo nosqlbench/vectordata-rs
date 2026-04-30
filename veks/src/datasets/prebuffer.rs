@@ -89,70 +89,49 @@ pub fn run(
     );
     println!("  Cache: {}", ds_cache.display());
 
-    // Use the data access layer's RemoteDatasetView which sets up
-    // merkle-verified CachedChannels per facet. The prebuffer method
-    // only downloads chunks covering the profile's windowed range.
-    use vectordata::dataset::remote::RemoteDatasetView;
-    let dataset_view = match RemoteDatasetView::open(entry, profile_name, &cache) {
+    // Open through the canonical catalog → TestDataView path. Every
+    // facet's underlying Storage knows how to prebuffer itself —
+    // local files no-op, cached-remote downloads + merkle-verifies,
+    // direct-HTTP no-ops silently.
+    let view = match catalog.open_profile(dataset_name, profile_name) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("Failed to open remote dataset: {}", e);
+            eprintln!("Failed to open dataset: {}", e);
             std::process::exit(1);
         }
     };
 
-    let facets: &[(&str, fn(&RemoteDatasetView) -> Option<&dyn vectordata::dataset::view::TypedVectorView>)] = &[
-        ("base_vectors", |v| v.base_vectors()),
-        ("query_vectors", |v| v.query_vectors()),
-        ("neighbor_indices", |v| v.neighbor_indices()),
-        ("neighbor_distances", |v| v.neighbor_distances()),
-        ("filtered_neighbor_indices", |v| v.filtered_neighbor_indices()),
-        ("filtered_neighbor_distances", |v| v.filtered_neighbor_distances()),
-        ("metadata_content", |v| v.metadata_content()),
-    ];
-
-    let mut prebuffered = 0u32;
-    let mut skipped = 0u32;
-    let mut failed = 0u32;
-
-    for &(name, accessor) in facets {
-        if let Some(view) = accessor(&dataset_view) {
-            let count = view.count();
-            if count == 0 { continue; }
-
-            if let Some(stats) = view.cache_stats() {
-                if stats.is_complete {
-                    println!("  {} — complete ({} chunks)", name, stats.total_chunks);
-                    skipped += 1;
-                    continue;
-                }
-                println!("  {} — prebuffering {} vectors ({}/{} chunks cached)...",
-                    name, count, stats.valid_chunks, stats.total_chunks);
-            } else {
-                println!("  {} — prebuffering {} vectors...", name, count);
+    let mut last_facet = String::new();
+    let mut total_facets = 0u32;
+    let result = view.prebuffer_all_with_progress(&mut |facet, p| {
+        if facet != last_facet {
+            if !last_facet.is_empty() {
+                println!("  {last_facet} — done");
             }
-
-            match view.prebuffer(0, count) {
-                Ok(()) => {
-                    println!("  {} — done", name);
-                    prebuffered += 1;
-                }
-                Err(e) => {
-                    eprintln!("  {} — FAILED: {}", name, e);
-                    failed += 1;
-                }
-            }
+            println!(
+                "  {facet} — prebuffering ({}/{} chunks, {:.1} MiB total)...",
+                p.verified_chunks,
+                p.total_chunks,
+                p.total_bytes as f64 / 1_048_576.0,
+            );
+            last_facet = facet.to_string();
+            total_facets += 1;
         }
+    });
+    if !last_facet.is_empty() {
+        println!("  {last_facet} — done");
     }
 
-    println!();
-    println!(
-        "Prebuffer: {} completed, {} already cached, {} failed",
-        prebuffered, skipped, failed
-    );
-
-    if failed > 0 {
-        std::process::exit(1);
+    match result {
+        Ok(()) => {
+            println!();
+            println!("Prebuffer: {total_facets} facets processed");
+        }
+        Err(e) => {
+            eprintln!();
+            eprintln!("Prebuffer: failed — {e}");
+            std::process::exit(1);
+        }
     }
 }
 

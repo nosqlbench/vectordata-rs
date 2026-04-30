@@ -200,7 +200,7 @@ mod tests {
     use crate::pipeline::progress::ProgressLog;
     use indexmap::IndexMap;
     use vectordata::VectorReader;
-    use vectordata::io::MmapVectorReader;
+    use vectordata::io::XvecReader;
 
     fn make_ctx(workspace: &std::path::Path) -> StreamContext {
         StreamContext {
@@ -254,8 +254,8 @@ mod tests {
         let r = op.execute(&opts, &mut ctx);
         assert_eq!(r.status, Status::Ok);
 
-        let reader = MmapVectorReader::<f32>::open_fvec(&out).unwrap();
-        let count = <MmapVectorReader<f32> as VectorReader<f32>>::count(&reader);
+        let reader = XvecReader::<f32>::open_path(&out).unwrap();
+        let count = <XvecReader<f32> as VectorReader<f32>>::count(&reader);
         assert_eq!(count, 3);
 
         // [3,4] → [0.6, 0.8]
@@ -293,8 +293,8 @@ mod tests {
         let r = op.execute(&opts, &mut ctx);
         assert_eq!(r.status, Status::Ok);
 
-        let reader = MmapVectorReader::<f32>::open_fvec(&out).unwrap();
-        assert_eq!(<MmapVectorReader<f32> as VectorReader<f32>>::count(&reader), 50);
+        let reader = XvecReader::<f32>::open_path(&out).unwrap();
+        assert_eq!(<XvecReader<f32> as VectorReader<f32>>::count(&reader), 50);
 
         // All output vectors should have norm ≈ 1.0
         for i in 0..50 {

@@ -160,10 +160,12 @@ fn enum_value_completer(
     vc: &veks_pipeline::pipeline::command::ValueCompletions,
 ) -> Vec<String> {
     if !vc.comma_separated {
-        return vc.values.iter()
+        let mut out: Vec<String> = vc.values.iter()
             .filter(|v| partial.is_empty() || v.starts_with(partial))
             .map(|v| v.clone())
             .collect();
+        out.sort();
+        return out;
     }
     let (already, rest) = match partial.rfind(',') {
         Some(i) => (&partial[..=i], &partial[i + 1..]),
@@ -174,11 +176,13 @@ fn enum_value_completer(
         .map(|t| t.trim())
         .filter(|t| !t.is_empty())
         .collect();
-    vc.values.iter()
+    let mut out: Vec<String> = vc.values.iter()
         .filter(|v| !chosen.contains(v.as_str()))
         .filter(|v| rest.is_empty() || v.starts_with(rest))
         .map(|v| format!("{}{}", already, v))
-        .collect()
+        .collect();
+    out.sort();
+    out
 }
 
 /// Extract the value of a previously typed `--option` from the completion args.

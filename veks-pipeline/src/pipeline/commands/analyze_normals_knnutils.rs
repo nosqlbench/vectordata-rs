@@ -25,7 +25,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use vectordata::VectorReader;
-use vectordata::io::MmapVectorReader;
+use vectordata::io::XvecReader;
 
 // BLAS snrm2: computes the L2 norm of a float32 vector.
 // This is the same routine numpy calls via MKL for np.linalg.norm().
@@ -137,12 +137,12 @@ Also counts exact-zero vectors (norm == 0.0), matching knn\_utils
 
         let input_path = resolve_path(input_str, &ctx.workspace);
 
-        let reader = match MmapVectorReader::<f32>::open_fvec(&input_path) {
+        let reader = match XvecReader::<f32>::open_path(&input_path) {
             Ok(r) => r,
             Err(e) => return error_result(format!("open: {}", e), start),
         };
-        let count = <MmapVectorReader<f32> as VectorReader<f32>>::count(&reader);
-        let dim = <MmapVectorReader<f32> as VectorReader<f32>>::dim(&reader);
+        let count = <XvecReader<f32> as VectorReader<f32>>::count(&reader);
+        let dim = <XvecReader<f32> as VectorReader<f32>>::dim(&reader);
 
         if count == 0 || dim == 0 {
             return error_result("empty vector file", start);

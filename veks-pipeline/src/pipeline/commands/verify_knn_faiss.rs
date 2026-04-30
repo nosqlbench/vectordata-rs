@@ -15,7 +15,7 @@ use std::time::Instant;
 
 use faiss::Index;
 use vectordata::VectorReader;
-use vectordata::io::MmapVectorReader;
+use vectordata::io::XvecReader;
 
 use crate::pipeline::command::{
     CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options,
@@ -393,11 +393,11 @@ fn verify_profile(
     ctx: &mut StreamContext,
 ) -> Result<VerifySummary, String> {
     // Open readers.
-    let base_reader = MmapVectorReader::<f32>::open_fvec(base_path)
+    let base_reader = XvecReader::<f32>::open_path(base_path)
         .map_err(|e| format!("open base {}: {}", base_path.display(), e))?;
-    let query_reader = MmapVectorReader::<f32>::open_fvec(query_path)
+    let query_reader = XvecReader::<f32>::open_path(query_path)
         .map_err(|e| format!("open query {}: {}", query_path.display(), e))?;
-    let gt_reader = MmapVectorReader::<i32>::open_ivec(gt_path)
+    let gt_reader = XvecReader::<i32>::open_path(gt_path)
         .map_err(|e| format!("open GT {}: {}", gt_path.display(), e))?;
 
     let base_count = VectorReader::<f32>::count(&base_reader);
@@ -718,11 +718,11 @@ impl CommandOp for VerifyKnnFaissConsolidatedOp {
             total_profiles, sized_profiles.len(), partition_profiles.len(), metric_str));
 
         // Open shared base and query readers
-        let base_reader = match MmapVectorReader::<f32>::open_fvec(&base_path) {
+        let base_reader = match XvecReader::<f32>::open_path(&base_path) {
             Ok(r) => r,
             Err(e) => return error_result(format!("open base: {}", e), start),
         };
-        let query_reader = match MmapVectorReader::<f32>::open_fvec(&query_path) {
+        let query_reader = match XvecReader::<f32>::open_path(&query_path) {
             Ok(r) => r,
             Err(e) => return error_result(format!("open query: {}", e), start),
         };
@@ -805,7 +805,7 @@ impl CommandOp for VerifyKnnFaissConsolidatedOp {
             }
 
             // Open GT
-            let gt_reader = match MmapVectorReader::<i32>::open_ivec(gt_path) {
+            let gt_reader = match XvecReader::<i32>::open_path(gt_path) {
                 Ok(r) => r,
                 Err(e) => {
                     ctx.ui.log(&format!("    ERROR: open GT: {}", e));
@@ -899,13 +899,13 @@ impl CommandOp for VerifyKnnFaissConsolidatedOp {
                     let qp = qp.clone();
                     let gp = gp.clone();
                     s.spawn(move || {
-                        let base_reader = match MmapVectorReader::<f32>::open_fvec(&bp) {
+                        let base_reader = match XvecReader::<f32>::open_path(&bp) {
                             Ok(r) => r, Err(e) => return (name, Err(format!("open base: {}", e))),
                         };
-                        let query_reader = match MmapVectorReader::<f32>::open_fvec(&qp) {
+                        let query_reader = match XvecReader::<f32>::open_path(&qp) {
                             Ok(r) => r, Err(e) => return (name, Err(format!("open query: {}", e))),
                         };
-                        let gt_reader = match MmapVectorReader::<i32>::open_ivec(&gp) {
+                        let gt_reader = match XvecReader::<i32>::open_path(&gp) {
                             Ok(r) => r, Err(e) => return (name, Err(format!("open GT: {}", e))),
                         };
 

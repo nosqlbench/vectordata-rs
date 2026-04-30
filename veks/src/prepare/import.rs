@@ -3018,7 +3018,7 @@ fn log_slot(w: &mut impl std::io::Write, name: &str, artifact: &Artifact) {
 /// Uses mmap for sparse sampling — does not read the full file into memory.
 pub fn detect_normalized(path: &Path) -> Option<(bool, usize, f64)> {
     use vectordata::VectorReader;
-    use vectordata::io::MmapVectorReader;
+    use vectordata::io::XvecReader;
     use crate::pipeline::element_type::ElementType;
 
     // Directories (npy) need special handling — probe first npy file directly
@@ -3033,19 +3033,19 @@ pub fn detect_normalized(path: &Path) -> Option<(bool, usize, f64)> {
     // Open via mmap — no full-file read
     let (count, dim, get_f64): (usize, usize, Box<dyn Fn(usize) -> Vec<f64>>) = match etype {
         ElementType::F32 => {
-            let r = MmapVectorReader::<f32>::open_fvec(path).ok()?;
+            let r = XvecReader::<f32>::open_path(path).ok()?;
             let c = VectorReader::<f32>::count(&r);
             let d = VectorReader::<f32>::dim(&r);
             (c, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
         }
         ElementType::F16 => {
-            let r = MmapVectorReader::<half::f16>::open_mvec(path).ok()?;
+            let r = XvecReader::<half::f16>::open_path(path).ok()?;
             let c = VectorReader::<half::f16>::count(&r);
             let d = VectorReader::<half::f16>::dim(&r);
             (c, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|v| v.to_f64()).collect()))
         }
         ElementType::F64 => {
-            let r = MmapVectorReader::<f64>::open_dvec(path).ok()?;
+            let r = XvecReader::<f64>::open_path(path).ok()?;
             let c = VectorReader::<f64>::count(&r);
             let d = VectorReader::<f64>::dim(&r);
             (c, d, Box::new(move |i| r.get(i).unwrap_or_default()))

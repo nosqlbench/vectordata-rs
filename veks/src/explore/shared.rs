@@ -33,24 +33,17 @@ pub(crate) fn parse_sample_mode(s: &str) -> Result<SampleMode, String> {
     }
 }
 
-///
-/// Returns a `LoadedDataset` that owns all the views. The caller accesses
-/// views via `dataset.base_vectors()` etc.
-pub(super) fn open_dataset(source: &str) -> vectordata::dataset::loader::LoadedDataset {
-    use vectordata::dataset::loader::DatasetLoader;
-
-    let cache_dir = crate::pipeline::commands::config::configured_cache_dir();
-    let loader = DatasetLoader::new(cache_dir);
-
-    // Load catalog entries for catalog specifier resolution
-    let catalog_entries = {
-        let sources = crate::catalog::sources::CatalogSources::new().configure_default();
-        let catalog = crate::catalog::resolver::Catalog::of(&sources);
-        catalog.datasets().to_vec()
+/// Resolve a `dataset[:profile]` specifier through the catalog and
+/// return the canonical [`TestDataView`].
+pub(super) fn open_dataset_view(source: &str) -> std::sync::Arc<dyn vectordata::TestDataView> {
+    let (name, profile) = match source.find(':') {
+        Some(pos) => (&source[..pos], &source[pos + 1..]),
+        None => (source, "default"),
     };
-
-    loader.load(source, &catalog_entries).unwrap_or_else(|e| {
-        eprintln!("Error: {}", e);
+    let sources = crate::catalog::sources::CatalogSources::new().configure_default();
+    let catalog = crate::catalog::resolver::Catalog::of(&sources);
+    catalog.open_profile(name, profile).unwrap_or_else(|e| {
+        eprintln!("Error: {e}");
         std::process::exit(1);
     })
 }
@@ -74,8 +67,7 @@ impl UnifiedReader {
             let path = resolve_source(source);
             UnifiedReader::Local(AnyVectorReader::open(&path))
         } else {
-            let dataset = open_dataset(source);
-            UnifiedReader::Remote(AnyDatasetReader(dataset))
+            UnifiedReader::Remote(AnyDatasetReader::from_source(source))
         }
     }
     pub(super) fn count(&self) -> usize {
@@ -105,10 +97,10 @@ impl UnifiedReader {
             UnifiedReader::Remote(r) => r.get_f32_range(start, count),
         }
     }
-    pub(super) fn cache_stats(&self) -> Option<vectordata::dataset::view::CacheStats> {
+    pub(super) fn cache_stats(&self) -> Option<vectordata::CacheStats> {
         match self {
             UnifiedReader::Local(_) => None,
-            UnifiedReader::Remote(r) => r.0.base_vectors()?.cache_stats(),
+            UnifiedReader::Remote(r) => r.cache_stats(),
         }
     }
     pub(super) fn is_remote(&self) -> bool {
@@ -236,25 +228,25 @@ pub(super) fn dirs_cache_dir() -> PathBuf {
 /// Wraps any supported vector format (fvec, mvec, dvec) and converts
 /// individual vectors to f64 on read. No bulk file conversion needed.
 pub(super) enum AnyVectorReader {
-    F32(vectordata::io::MmapVectorReader<f32>),
-    F16(vectordata::io::MmapVectorReader<half::f16>),
+    F32(vectordata::io::XvecReader<f32>),
+    F16(vectordata::io::XvecReader<half::f16>),
 }
 
 impl AnyVectorReader {
     /// Open a vector file, auto-detecting format from extension.
     pub(super) fn open(path: &std::path::Path) -> Self {
-        use vectordata::io::MmapVectorReader;
+        use vectordata::io::XvecReader;
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
         match ext {
             "fvec" | "fvecs" => {
-                AnyVectorReader::F32(MmapVectorReader::<f32>::open_fvec(path).unwrap_or_else(|e| {
+                AnyVectorReader::F32(XvecReader::<f32>::open_path(path).unwrap_or_else(|e| {
                     eprintln!("Error: failed to open {}: {}", path.display(), e);
                     std::process::exit(1);
                 }))
             }
             "mvec" | "mvecs" => {
-                AnyVectorReader::F16(MmapVectorReader::<half::f16>::open_mvec(path).unwrap_or_else(|e| {
+                AnyVectorReader::F16(XvecReader::<half::f16>::open_path(path).unwrap_or_else(|e| {
                     eprintln!("Error: failed to open {}: {}", path.display(), e);
                     std::process::exit(1);
                 }))
@@ -269,16 +261,16 @@ impl AnyVectorReader {
     pub(super) fn count(&self) -> usize {
         use vectordata::VectorReader;
         match self {
-            AnyVectorReader::F32(r) => <vectordata::io::MmapVectorReader<f32> as VectorReader<f32>>::count(r),
-            AnyVectorReader::F16(r) => <vectordata::io::MmapVectorReader<half::f16> as VectorReader<half::f16>>::count(r),
+            AnyVectorReader::F32(r) => <vectordata::io::XvecReader<f32> as VectorReader<f32>>::count(r),
+            AnyVectorReader::F16(r) => <vectordata::io::XvecReader<half::f16> as VectorReader<half::f16>>::count(r),
         }
     }
 
     pub(super) fn dim(&self) -> usize {
         use vectordata::VectorReader;
         match self {
-            AnyVectorReader::F32(r) => <vectordata::io::MmapVectorReader<f32> as VectorReader<f32>>::dim(r),
-            AnyVectorReader::F16(r) => <vectordata::io::MmapVectorReader<half::f16> as VectorReader<half::f16>>::dim(r),
+            AnyVectorReader::F32(r) => <vectordata::io::XvecReader<f32> as VectorReader<f32>>::dim(r),
+            AnyVectorReader::F16(r) => <vectordata::io::XvecReader<half::f16> as VectorReader<half::f16>>::dim(r),
         }
     }
 
@@ -319,43 +311,55 @@ impl AnyVectorReader {
         (0..count).map(|i| self.get_f32(start + i)).collect()
     }
 
-    /// Create from a LoadedDataset's base_vectors view.
-    ///
-    /// Wraps the dataset so the AnyVectorReader can be used uniformly
-    /// for both local files and remote catalog datasets.
-    pub(super) fn from_dataset(dataset: vectordata::dataset::loader::LoadedDataset) -> AnyDatasetReader {
-        AnyDatasetReader(dataset)
-    }
 }
 
-/// Wrapper around LoadedDataset that provides the same interface as AnyVectorReader.
-pub(super) struct AnyDatasetReader(pub(super) vectordata::dataset::loader::LoadedDataset);
+/// Wrapper that opens `base_vectors` (and exposes a cache-stats view)
+/// through the canonical [`vectordata::TestDataView`] path.
+pub(super) struct AnyDatasetReader {
+    view: std::sync::Arc<dyn vectordata::TestDataView>,
+    base: std::sync::Arc<dyn vectordata::VectorReader<f32>>,
+    facet_storage: Option<vectordata::FacetStorage>,
+    dim: usize,
+    count: usize,
+}
 
 impl AnyDatasetReader {
-    pub(super) fn count(&self) -> usize {
-        self.0.base_vectors().map(|v| v.count()).unwrap_or(0)
+    pub(super) fn from_source(source: &str) -> Self {
+        let view = open_dataset_view(source);
+        let base = view.base_vectors().unwrap_or_else(|e| {
+            eprintln!("Error: failed to open base_vectors: {e}");
+            std::process::exit(1);
+        });
+        let dim = base.dim();
+        let count = base.count();
+        let facet_storage = view.open_facet_storage("base_vectors").ok();
+        AnyDatasetReader { view, base, facet_storage, dim, count }
     }
-    pub(super) fn dim(&self) -> usize {
-        self.0.base_vectors().map(|v| v.dim()).unwrap_or(0)
-    }
+
+    pub(super) fn count(&self) -> usize { self.count }
+    pub(super) fn dim(&self) -> usize { self.dim }
+
     pub(super) fn get_f64(&self, index: usize) -> Option<Vec<f64>> {
-        self.0.base_vectors()?.get_f64(index)
+        self.base.get(index).ok().map(|v| v.into_iter().map(|x| x as f64).collect())
     }
     pub(super) fn get_f32(&self, index: usize) -> Option<Vec<f32>> {
-        self.0.base_vectors()?.get_f32(index)
+        self.base.get(index).ok()
     }
     pub(super) fn get_f64_range(&self, start: usize, count: usize) -> Vec<Option<Vec<f64>>> {
-        match self.0.base_vectors() {
-            Some(v) => v.get_f64_range(start, count),
-            None    => vec![None; count],
-        }
+        (0..count).map(|i| self.get_f64(start + i)).collect()
     }
     pub(super) fn get_f32_range(&self, start: usize, count: usize) -> Vec<Option<Vec<f32>>> {
-        match self.0.base_vectors() {
-            Some(v) => v.get_f32_range(start, count),
-            None    => vec![None; count],
-        }
+        (0..count).map(|i| self.get_f32(start + i)).collect()
     }
+
+    pub(super) fn cache_stats(&self) -> Option<vectordata::CacheStats> {
+        self.facet_storage.as_ref()?.cache_stats()
+    }
+
+    /// Suppress unused-field warning — the view handle keeps the
+    /// underlying dataset alive for the lifetime of `base`/`facet_storage`.
+    #[allow(dead_code)]
+    pub(super) fn view(&self) -> &dyn vectordata::TestDataView { &*self.view }
 }
 
 /// Default number of consecutive vectors per clump.

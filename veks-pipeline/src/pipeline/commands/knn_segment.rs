@@ -762,8 +762,8 @@ where
 pub(super) fn rerank_output_post_pass(
     indices_path: &Path,
     distances_path: Option<&Path>,
-    base_reader: &vectordata::io::MmapVectorReader<f32>,
-    query_reader: &vectordata::io::MmapVectorReader<f32>,
+    base_reader: &vectordata::io::XvecReader<f32>,
+    query_reader: &vectordata::io::XvecReader<f32>,
     metric: Metric,
     k: usize,
     base_offset: usize,
@@ -791,7 +791,7 @@ pub(super) fn rerank_output_post_pass(
         return Err(format!("indices file {} has unaligned size", indices_path.display()));
     }
     let n_rows = idx_bytes.len() / row_bytes;
-    let n_query = <vectordata::io::MmapVectorReader<f32> as VectorReader<f32>>::count(query_reader);
+    let n_query = <vectordata::io::XvecReader<f32> as VectorReader<f32>>::count(query_reader);
     if n_rows != n_query {
         return Err(format!(
             "indices file rows={} but query reader has count={}",

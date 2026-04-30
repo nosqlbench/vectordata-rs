@@ -328,8 +328,11 @@ pub fn enum_value_completer(
     let s = current.to_string_lossy();
 
     if !vc.comma_separated {
-        return vc.values.iter()
+        let mut matches: Vec<&String> = vc.values.iter()
             .filter(|v| s.is_empty() || v.starts_with(&*s))
+            .collect();
+        matches.sort();
+        return matches.into_iter()
             .map(|v| CompletionCandidate::new(v.as_str()))
             .collect();
     }
@@ -345,9 +348,12 @@ pub fn enum_value_completer(
         .filter(|t| !t.is_empty())
         .collect();
 
-    vc.values.iter()
+    let mut matches: Vec<&String> = vc.values.iter()
         .filter(|v| !chosen.contains(v.as_str()))
         .filter(|v| partial.is_empty() || v.starts_with(partial))
+        .collect();
+    matches.sort();
+    matches.into_iter()
         .map(|v| CompletionCandidate::new(format!("{}{}", already, v)))
         .collect()
 }

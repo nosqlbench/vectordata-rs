@@ -350,7 +350,7 @@ mod tests {
     use crate::pipeline::progress::ProgressLog;
     use indexmap::IndexMap;
     use vectordata::VectorReader;
-    use vectordata::io::MmapVectorReader;
+    use vectordata::io::XvecReader;
 
     fn make_ctx(workspace: &std::path::Path) -> StreamContext {
         StreamContext {
@@ -372,8 +372,8 @@ mod tests {
     }
 
     fn read_ivec_values(path: &std::path::Path) -> Vec<i32> {
-        let reader = MmapVectorReader::<i32>::open_ivec(path).unwrap();
-        let count = <MmapVectorReader<i32> as VectorReader<i32>>::count(&reader);
+        let reader = XvecReader::<i32>::open_path(path).unwrap();
+        let count = <XvecReader<i32> as VectorReader<i32>>::count(&reader);
         (0..count).map(|i| reader.get_slice(i)[0]).collect()
     }
 

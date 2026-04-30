@@ -12,7 +12,7 @@ use std::time::Instant;
 
 use rayon::prelude::*;
 use vectordata::VectorReader;
-use vectordata::io::MmapVectorReader;
+use vectordata::io::XvecReader;
 
 use crate::pipeline::command::{
     CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options,
@@ -157,7 +157,7 @@ impl CommandOp for AnalyzeFindZerosOp {
                 // Mmap reader used only for metadata + the per-hit
                 // component display in the report phase. Full scan
                 // uses pread streaming to keep RSS bounded.
-                let reader = match MmapVectorReader::<half::f16>::open_mvec(&source_path) {
+                let reader = match XvecReader::<half::f16>::open_path(&source_path) {
                     Ok(r) => r,
                     Err(e) => return error_result(format!("open {}: {}", source_path.display(), e), start),
                 };
@@ -176,7 +176,7 @@ impl CommandOp for AnalyzeFindZerosOp {
                 // phase — which touches ≤ `limit` vectors. The actual
                 // full scan uses pread streaming so RSS stays bounded
                 // regardless of source file size.
-                let reader = match MmapVectorReader::<f32>::open_fvec(&source_path) {
+                let reader = match XvecReader::<f32>::open_path(&source_path) {
                     Ok(r) => r,
                     Err(e) => return error_result(format!("open {}: {}", source_path.display(), e), start),
                 };
@@ -504,7 +504,7 @@ fn scan_zeros_f16(
 
 fn report_zeros_f32(
     zeros: &[ZeroHit],
-    reader: &MmapVectorReader<f32>,
+    reader: &XvecReader<f32>,
     dim: usize,
     show_components: usize,
     threshold: f64,
@@ -585,7 +585,7 @@ fn report_zeros_f32(
 
 fn report_zeros_f16(
     zeros: &[ZeroHit],
-    reader: &MmapVectorReader<half::f16>,
+    reader: &XvecReader<half::f16>,
     dim: usize,
     show_components: usize,
     threshold: f64,
@@ -826,7 +826,7 @@ fn scan_file_concise_f32(
 
     // Metadata via mmap (touches only the dim header). Full scan via
     // pread streaming so RSS stays bounded on terabyte-class sources.
-    let reader = MmapVectorReader::<f32>::open_fvec(path)
+    let reader = XvecReader::<f32>::open_path(path)
         .map_err(|e| format!("{}", e))?;
     let count = VectorReader::<f32>::count(&reader);
     let dim = VectorReader::<f32>::dim(&reader);
@@ -910,7 +910,7 @@ fn scan_file_concise_f16(
     use std::fs::File;
     use std::os::unix::fs::FileExt;
 
-    let reader = MmapVectorReader::<half::f16>::open_mvec(path)
+    let reader = XvecReader::<half::f16>::open_path(path)
         .map_err(|e| format!("{}", e))?;
     let count = VectorReader::<half::f16>::count(&reader);
     let dim = VectorReader::<half::f16>::dim(&reader);

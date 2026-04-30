@@ -18,7 +18,7 @@ use std::time::Instant;
 
 use rayon::prelude::*;
 use vectordata::VectorReader;
-use vectordata::io::MmapVectorReader;
+use vectordata::io::XvecReader;
 
 use crate::pipeline::atomic_write::AtomicWriter;
 use crate::pipeline::command::{
@@ -33,8 +33,8 @@ use crate::pipeline::command::{
 /// Uniform read interface that always returns `Vec<f32>`, upcasting f16
 /// when the source is an mvec file.
 enum VecReader {
-    F32(MmapVectorReader<f32>),
-    F16(MmapVectorReader<half::f16>),
+    F32(XvecReader<f32>),
+    F16(XvecReader<half::f16>),
 }
 
 impl VecReader {
@@ -42,12 +42,12 @@ impl VecReader {
     fn open(path: &Path) -> Result<Self, String> {
         match path.extension().and_then(|e| e.to_str()) {
             Some("mvec") | Some("mvecs") => {
-                MmapVectorReader::<half::f16>::open_mvec(path)
+                XvecReader::<half::f16>::open_path(path)
                     .map(VecReader::F16)
                     .map_err(|e| format!("failed to open {}: {}", path.display(), e))
             }
             _ => {
-                MmapVectorReader::<f32>::open_fvec(path)
+                XvecReader::<f32>::open_path(path)
                     .map(VecReader::F32)
                     .map_err(|e| format!("failed to open {}: {}", path.display(), e))
             }
@@ -56,15 +56,15 @@ impl VecReader {
 
     fn count(&self) -> usize {
         match self {
-            VecReader::F32(r) => <MmapVectorReader<f32> as VectorReader<f32>>::count(r),
-            VecReader::F16(r) => <MmapVectorReader<half::f16> as VectorReader<half::f16>>::count(r),
+            VecReader::F32(r) => <XvecReader<f32> as VectorReader<f32>>::count(r),
+            VecReader::F16(r) => <XvecReader<half::f16> as VectorReader<half::f16>>::count(r),
         }
     }
 
     fn dim(&self) -> usize {
         match self {
-            VecReader::F32(r) => <MmapVectorReader<f32> as VectorReader<f32>>::dim(r),
-            VecReader::F16(r) => <MmapVectorReader<half::f16> as VectorReader<half::f16>>::dim(r),
+            VecReader::F32(r) => <XvecReader<f32> as VectorReader<f32>>::dim(r),
+            VecReader::F16(r) => <XvecReader<half::f16> as VectorReader<half::f16>>::dim(r),
         }
     }
 

@@ -730,7 +730,7 @@ impl GenPredicateKeysOp {
             .map(|f| f.is_vvec()).unwrap_or(false)
             || out_ext == "ivec" || out_ext == "ivecs"
         {
-            match vectordata::io::IndexedXvecReader::open_ivec(&output_path) {
+            match vectordata::io::IndexedVvecReader::<i32>::open_path(&output_path) {
                 Ok(r) => ctx.ui.log(&format!("  built offset index ({} records)", r.count())),
                 Err(e) => ctx.ui.log(&format!("  WARNING: failed to build offset index: {}", e)),
             }

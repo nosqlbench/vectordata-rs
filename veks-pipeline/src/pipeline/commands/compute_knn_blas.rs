@@ -28,7 +28,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use vectordata::VectorReader;
-use vectordata::io::MmapVectorReader;
+use vectordata::io::XvecReader;
 
 use crate::pipeline::command::{
     ArtifactManifest, CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole,
@@ -707,11 +707,11 @@ Reuses the shared segment-cache infrastructure:
         }
 
         // Metadata via mmap; compute uses pread (no base bytes in RSS).
-        let base_reader = match MmapVectorReader::<f32>::open_fvec(&base_path) {
+        let base_reader = match XvecReader::<f32>::open_path(&base_path) {
             Ok(r) => r,
             Err(e) => return error_result(format!("open base: {}", e), start),
         };
-        let query_reader = match MmapVectorReader::<f32>::open_fvec(&query_path) {
+        let query_reader = match XvecReader::<f32>::open_path(&query_path) {
             Ok(r) => r,
             Err(e) => return error_result(format!("open query: {}", e), start),
         };
@@ -720,10 +720,10 @@ Reuses the shared segment-cache infrastructure:
             Err(e) => return error_result(format!("open base for streaming: {}", e), start),
         };
 
-        let base_count = <MmapVectorReader<f32> as VectorReader<f32>>::count(&base_reader);
-        let query_count = <MmapVectorReader<f32> as VectorReader<f32>>::count(&query_reader);
-        let base_dim = <MmapVectorReader<f32> as VectorReader<f32>>::dim(&base_reader);
-        let query_dim = <MmapVectorReader<f32> as VectorReader<f32>>::dim(&query_reader);
+        let base_count = <XvecReader<f32> as VectorReader<f32>>::count(&base_reader);
+        let query_count = <XvecReader<f32> as VectorReader<f32>>::count(&query_reader);
+        let base_dim = <XvecReader<f32> as VectorReader<f32>>::dim(&base_reader);
+        let query_dim = <XvecReader<f32> as VectorReader<f32>>::dim(&query_reader);
 
         if base_dim != query_dim {
             return error_result(
@@ -1207,7 +1207,7 @@ mod tests {
     use crate::pipeline::progress::ProgressLog;
     use indexmap::IndexMap;
     use vectordata::VectorReader;
-    use vectordata::io::MmapVectorReader;
+    use vectordata::io::XvecReader;
 
     fn make_ctx(workspace: &std::path::Path) -> StreamContext {
         let cache = workspace.join(".cache");
@@ -1234,8 +1234,8 @@ mod tests {
     }
 
     fn read_ivec_rows(path: &std::path::Path) -> Vec<Vec<i32>> {
-        let reader = MmapVectorReader::<i32>::open_ivec(path).unwrap();
-        let count = <MmapVectorReader<i32> as VectorReader<i32>>::count(&reader);
+        let reader = XvecReader::<i32>::open_path(path).unwrap();
+        let count = <XvecReader<i32> as VectorReader<i32>>::count(&reader);
         (0..count).map(|i| reader.get_slice(i).to_vec()).collect()
     }
 

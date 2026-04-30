@@ -32,7 +32,7 @@ use std::time::Instant;
 
 use veks_core::ui::ProgressHandle;
 use vectordata::VectorReader;
-use vectordata::io::MmapVectorReader;
+use vectordata::io::XvecReader;
 
 use crate::pipeline::command::{
     ArtifactManifest, CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options,
@@ -111,7 +111,7 @@ impl Ord for Neighbor {
 #[inline(never)]
 pub(super) fn find_top_k_batch_f32(
     queries: &[&[f32]],
-    base_reader: &MmapVectorReader<f32>,
+    base_reader: &XvecReader<f32>,
     start: usize,
     end: usize,
     k: usize,
@@ -134,7 +134,7 @@ pub(super) fn find_top_k_batch_f32(
 #[inline(never)]
 fn find_top_k_batch_pairwise_f32(
     queries: &[&[f32]],
-    base_reader: &MmapVectorReader<f32>,
+    base_reader: &XvecReader<f32>,
     start: usize,
     end: usize,
     k: usize,
@@ -190,7 +190,7 @@ fn find_top_k_batch_pairwise_f32(
 #[inline(never)]
 fn find_top_k_batch_transposed_f32(
     queries: &[&[f32]],
-    base_reader: &MmapVectorReader<f32>,
+    base_reader: &XvecReader<f32>,
     start: usize,
     end: usize,
     k: usize,
@@ -439,9 +439,9 @@ fn validate_cache_file(path: &Path, query_count: usize, k: usize, elem_size: usi
 /// Each thread owns a disjoint subset of queries and scans all base vectors.
 /// Thread count capped so each gets a full QUERY_BATCH_SIZE of queries.
 fn compute_partition(
-    query_reader: &MmapVectorReader<f32>,
+    query_reader: &XvecReader<f32>,
     query_count: usize,
-    base_reader: &Arc<MmapVectorReader<f32>>,
+    base_reader: &Arc<XvecReader<f32>>,
     start: usize,
     end: usize,
     k: usize,
@@ -570,7 +570,7 @@ const QUERY_BATCH_SIZE: usize = 256;
 #[inline(never)]
 fn find_top_k_batch_f16(
     queries: &[&[half::f16]],
-    base_reader: &MmapVectorReader<half::f16>,
+    base_reader: &XvecReader<half::f16>,
     start: usize,
     end: usize,
     k: usize,
@@ -593,7 +593,7 @@ fn find_top_k_batch_f16(
 #[inline(never)]
 fn find_top_k_batch_pairwise_f16(
     queries: &[&[half::f16]],
-    base_reader: &MmapVectorReader<half::f16>,
+    base_reader: &XvecReader<half::f16>,
     start: usize,
     end: usize,
     k: usize,
@@ -654,7 +654,7 @@ fn find_top_k_batch_pairwise_f16(
 #[inline(never)]
 fn find_top_k_batch_transposed_f16(
     queries: &[&[half::f16]],
-    base_reader: &MmapVectorReader<half::f16>,
+    base_reader: &XvecReader<half::f16>,
     start: usize,
     end: usize,
     k: usize,
@@ -820,9 +820,9 @@ fn find_top_k_batch_transposed_f16(
 /// Each thread owns a disjoint subset of queries and scans all base vectors.
 /// Thread count is capped so each gets a full SIMD batch worth of queries.
 fn compute_partition_f16(
-    query_reader: &MmapVectorReader<half::f16>,
+    query_reader: &XvecReader<half::f16>,
     query_count: usize,
-    base_reader: &Arc<MmapVectorReader<half::f16>>,
+    base_reader: &Arc<XvecReader<half::f16>>,
     start: usize,
     end: usize,
     k: usize,
@@ -926,9 +926,9 @@ fn compute_partition_f16(
 /// Uses pairwise distance computation (no transposed batch kernel for f64 yet).
 #[allow(clippy::too_many_arguments)]
 fn compute_partition_f64(
-    query_reader: &MmapVectorReader<f64>,
+    query_reader: &XvecReader<f64>,
     query_count: usize,
-    base_reader: &Arc<MmapVectorReader<f64>>,
+    base_reader: &Arc<XvecReader<f64>>,
     start: usize,
     end: usize,
     k: usize,
@@ -1031,7 +1031,7 @@ fn compute_partition_f64(
 #[inline(never)]
 fn find_top_k_batch_pairwise_f64(
     queries: &[&[f64]],
-    base_reader: &MmapVectorReader<f64>,
+    base_reader: &XvecReader<f64>,
     start: usize,
     end: usize,
     k: usize,
@@ -1773,7 +1773,7 @@ fn execute_f32(
     start: Instant,
 ) -> CommandResult {
     ctx.ui.log(&format!("  opening base vectors: {}", base_path.display()));
-    let base_reader = match MmapVectorReader::<f32>::open_fvec(base_path) {
+    let base_reader = match XvecReader::<f32>::open_path(base_path) {
         Ok(r) => Arc::new(r),
         Err(e) => {
             return error_result(
@@ -1783,7 +1783,7 @@ fn execute_f32(
         }
     };
     ctx.ui.log(&format!("  opening query vectors: {}", query_path.display()));
-    let query_reader = match MmapVectorReader::<f32>::open_fvec(query_path) {
+    let query_reader = match XvecReader::<f32>::open_path(query_path) {
         Ok(r) => r,
         Err(e) => {
             return error_result(
@@ -1793,10 +1793,10 @@ fn execute_f32(
         }
     };
 
-    let file_count = <MmapVectorReader<f32> as VectorReader<f32>>::count(&*base_reader);
-    let query_count = <MmapVectorReader<f32> as VectorReader<f32>>::count(&query_reader);
-    let base_dim = <MmapVectorReader<f32> as VectorReader<f32>>::dim(&*base_reader);
-    let query_dim = <MmapVectorReader<f32> as VectorReader<f32>>::dim(&query_reader);
+    let file_count = <XvecReader<f32> as VectorReader<f32>>::count(&*base_reader);
+    let query_count = <XvecReader<f32> as VectorReader<f32>>::count(&query_reader);
+    let base_dim = <XvecReader<f32> as VectorReader<f32>>::dim(&*base_reader);
+    let query_dim = <XvecReader<f32> as VectorReader<f32>>::dim(&query_reader);
 
     // Apply window to base vectors
     let (base_offset, base_count) = match base_window {
@@ -1927,7 +1927,7 @@ fn execute_f16(
     start: Instant,
 ) -> CommandResult {
     ctx.ui.log(&format!("  opening base vectors: {}", base_path.display()));
-    let base_reader = match MmapVectorReader::<half::f16>::open_mvec(base_path) {
+    let base_reader = match XvecReader::<half::f16>::open_path(base_path) {
         Ok(r) => Arc::new(r),
         Err(e) => {
             return error_result(
@@ -1937,7 +1937,7 @@ fn execute_f16(
         }
     };
     ctx.ui.log(&format!("  opening query vectors: {}", query_path.display()));
-    let query_reader = match MmapVectorReader::<half::f16>::open_mvec(query_path) {
+    let query_reader = match XvecReader::<half::f16>::open_path(query_path) {
         Ok(r) => r,
         Err(e) => {
             return error_result(
@@ -1947,10 +1947,10 @@ fn execute_f16(
         }
     };
 
-    let file_count = <MmapVectorReader<half::f16> as VectorReader<half::f16>>::count(&*base_reader);
-    let query_count = <MmapVectorReader<half::f16> as VectorReader<half::f16>>::count(&query_reader);
-    let base_dim = <MmapVectorReader<half::f16> as VectorReader<half::f16>>::dim(&*base_reader);
-    let query_dim = <MmapVectorReader<half::f16> as VectorReader<half::f16>>::dim(&query_reader);
+    let file_count = <XvecReader<half::f16> as VectorReader<half::f16>>::count(&*base_reader);
+    let query_count = <XvecReader<half::f16> as VectorReader<half::f16>>::count(&query_reader);
+    let base_dim = <XvecReader<half::f16> as VectorReader<half::f16>>::dim(&*base_reader);
+    let query_dim = <XvecReader<half::f16> as VectorReader<half::f16>>::dim(&query_reader);
 
     // Apply window to base vectors
     let (base_offset, base_count) = match base_window {
@@ -2042,12 +2042,12 @@ fn execute_f64(
     start: Instant,
 ) -> CommandResult {
     ctx.ui.log(&format!("  opening base vectors: {}", base_path.display()));
-    let base_reader = match MmapVectorReader::<f64>::open_dvec(base_path) {
+    let base_reader = match XvecReader::<f64>::open_path(base_path) {
         Ok(r) => Arc::new(r),
         Err(e) => return error_result(format!("failed to open base {}: {}", base_path.display(), e), start),
     };
     ctx.ui.log(&format!("  opening query vectors: {}", query_path.display()));
-    let query_reader = match MmapVectorReader::<f64>::open_dvec(query_path) {
+    let query_reader = match XvecReader::<f64>::open_path(query_path) {
         Ok(r) => r,
         Err(e) => return error_result(format!("failed to open query {}: {}", query_path.display(), e), start),
     };
@@ -2126,8 +2126,8 @@ fn execute_f64(
 /// then merged into the final output.
 #[allow(clippy::too_many_arguments)]
 fn execute_with_partitions<T>(
-    query_reader: &MmapVectorReader<T>,
-    base_reader: &Arc<MmapVectorReader<T>>,
+    query_reader: &XvecReader<T>,
+    base_reader: &Arc<XvecReader<T>>,
     base_offset: usize,
     base_count: usize,
     query_count: usize,
@@ -2146,7 +2146,7 @@ fn execute_with_partitions<T>(
     elem_label: &str,
     ctx: &mut StreamContext,
     start: Instant,
-    compute_fn: fn(&MmapVectorReader<T>, usize, &Arc<MmapVectorReader<T>>, usize, usize, usize, fn(&[T], &[T]) -> f32, Metric, usize, usize, &ProgressHandle) -> Vec<Vec<Neighbor>>,
+    compute_fn: fn(&XvecReader<T>, usize, &Arc<XvecReader<T>>, usize, usize, usize, fn(&[T], &[T]) -> f32, Metric, usize, usize, &ProgressHandle) -> Vec<Vec<Neighbor>>,
 ) -> CommandResult
 where
     T: Send + Sync + 'static,

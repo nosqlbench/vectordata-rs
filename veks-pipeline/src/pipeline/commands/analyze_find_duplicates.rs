@@ -202,11 +202,11 @@ fn run_dedup(source_path: &Path, ctx: &mut StreamContext) -> Result<DedupResult,
         .and_then(|etype| {
             match etype {
                 ElementType::F32 => {
-                    vectordata::io::MmapVectorReader::<f32>::open_fvec(source_path).ok()
+                    vectordata::io::XvecReader::<f32>::open_path(source_path).ok()
                         .map(|r| vectordata::VectorReader::<f32>::dim(&r))
                 }
                 ElementType::F16 => {
-                    vectordata::io::MmapVectorReader::<half::f16>::open_mvec(source_path).ok()
+                    vectordata::io::XvecReader::<half::f16>::open_path(source_path).ok()
                         .map(|r| vectordata::VectorReader::<half::f16>::dim(&r))
                 }
                 _ => None,
@@ -238,11 +238,11 @@ fn run_dedup(source_path: &Path, ctx: &mut StreamContext) -> Result<DedupResult,
 /// Analyze duplicate group sizes by reading the sorted ordinals and duplicates.
 fn analyze_dup_groups(dups_path: &Path, sorted_path: &Path) -> Vec<(usize, usize)> {
     use vectordata::VectorReader;
-    use vectordata::io::MmapVectorReader;
+    use vectordata::io::XvecReader;
     use std::collections::BTreeMap;
 
     // Load duplicate ordinals
-    let dup_reader = match MmapVectorReader::<i32>::open_ivec(dups_path) {
+    let dup_reader = match XvecReader::<i32>::open_path(dups_path) {
         Ok(r) => r,
         Err(_) => return vec![],
     };
@@ -250,7 +250,7 @@ fn analyze_dup_groups(dups_path: &Path, sorted_path: &Path) -> Vec<(usize, usize
     if dup_count == 0 { return vec![]; }
 
     // Load sorted ordinals to identify which unique vector each dup belongs to
-    let sorted_reader = match MmapVectorReader::<i32>::open_ivec(sorted_path) {
+    let sorted_reader = match XvecReader::<i32>::open_path(sorted_path) {
         Ok(r) => r,
         Err(_) => return vec![],
     };

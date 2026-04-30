@@ -7,7 +7,7 @@ use std::path::Path;
 
 use byteorder::{LittleEndian, ReadBytesExt};
 use vectordata::VectorReader;
-use vectordata::io::MmapVectorReader;
+use vectordata::io::XvecReader;
 
 use super::VecSource;
 use crate::formats::VecFormat;
@@ -23,7 +23,7 @@ const READ_BUF_SIZE: usize = 4 << 20;
 /// accumulation that causes memory pressure and I/O throttling on large files.
 const READ_DONTNEED_INTERVAL: u64 = 64 << 20; // 64 MiB
 
-/// Opens an xvec source, dispatching to `MmapVectorReader` for
+/// Opens an xvec source, dispatching to `XvecReader` for
 /// fvec/ivec (the canonical implementation) and falling back to a manual
 /// stream reader for bvec/dvec/mvec/svec.
 pub fn open_xvec(path: &Path, format: VecFormat) -> Result<Box<dyn VecSource>, String> {
@@ -37,9 +37,9 @@ pub fn open_xvec(path: &Path, format: VecFormat) -> Result<Box<dyn VecSource>, S
 
 // -- fvec via vectordata -------------------------------------------------------
 
-/// Reads `.fvec` files using `MmapVectorReader<f32>` (mmap-based).
+/// Reads `.fvec` files using `XvecReader<f32>` (mmap-based).
 struct FvecReader {
-    readers: Vec<MmapVectorReader<f32>>,
+    readers: Vec<XvecReader<f32>>,
     current_reader_idx: usize,
     current_index: usize,
     dimension: u32,
@@ -53,7 +53,7 @@ fn open_fvec(path: &Path) -> Result<Box<dyn VecSource>, String> {
     let mut dim: Option<u32> = None;
 
     for f in &files {
-        let r = MmapVectorReader::<f32>::open_fvec(f)
+        let r = XvecReader::<f32>::open_path(f)
             .map_err(|e| format!("Failed to open {}: {}", f.display(), e))?;
         if let Some(d) = dim {
             if r.dim() as u32 != d {
@@ -115,9 +115,9 @@ impl VecSource for FvecReader {
 
 // -- ivec via vectordata -------------------------------------------------------
 
-/// Reads `.ivec` files using `MmapVectorReader<i32>` (mmap-based).
+/// Reads `.ivec` files using `XvecReader<i32>` (mmap-based).
 struct IvecReader {
-    readers: Vec<MmapVectorReader<i32>>,
+    readers: Vec<XvecReader<i32>>,
     current_reader_idx: usize,
     current_index: usize,
     dimension: u32,
@@ -131,7 +131,7 @@ fn open_ivec(path: &Path) -> Result<Box<dyn VecSource>, String> {
     let mut dim: Option<u32> = None;
 
     for f in &files {
-        let r = MmapVectorReader::<i32>::open_ivec(f)
+        let r = XvecReader::<i32>::open_path(f)
             .map_err(|e| format!("Failed to open {}: {}", f.display(), e))?;
         if let Some(d) = dim {
             if r.dim() as u32 != d {

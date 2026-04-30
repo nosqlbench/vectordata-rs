@@ -37,7 +37,7 @@ use super::shared::{
     UnifiedReader, SampleMode, sample_indices, clump_size_for_dim,
     install_abort_handler, normalize,
 };
-use vectordata::dataset::view::CacheStats;
+use vectordata::CacheStats;
 
 // ---------------------------------------------------------------------------
 // View definitions

@@ -13,7 +13,7 @@ use std::time::Instant;
 
 use vectordata::VectorReader;
 use vectordata::dataset::DatasetConfig;
-use vectordata::io::MmapVectorReader;
+use vectordata::io::XvecReader;
 
 use crate::pipeline::command::{
     CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options,
@@ -195,7 +195,7 @@ fn write_header(config: &DatasetConfig, workspace: &Path, doc: &mut String) {
                 "ivec" | "ivecs" => "i32",
                 _ => ext,
             };
-            if let Ok(reader) = MmapVectorReader::<f32>::open_fvec(&path) {
+            if let Ok(reader) = XvecReader::<f32>::open_path(&path) {
                 let count = VectorReader::<f32>::count(&reader);
                 let dim = VectorReader::<f32>::dim(&reader);
                 doc.push_str(&format!("| Base vectors | {} ({} format) |\n", format_count(count), etype));
@@ -204,7 +204,7 @@ fn write_header(config: &DatasetConfig, workspace: &Path, doc: &mut String) {
         }
         if let Some(view) = profile.view("query_vectors") {
             let path = workspace.join(view.path());
-            if let Ok(reader) = MmapVectorReader::<f32>::open_fvec(&path) {
+            if let Ok(reader) = XvecReader::<f32>::open_path(&path) {
                 let count = VectorReader::<f32>::count(&reader);
                 doc.push_str(&format!("| Query vectors | {} |\n", format_count(count)));
             }
@@ -376,7 +376,7 @@ fn write_profiles(config: &DatasetConfig, workspace: &Path, doc: &mut String) {
             // Probe actual count for default profile
             if let Some(view) = profile.view("base_vectors") {
                 let path = workspace.join(view.path());
-                if let Ok(reader) = MmapVectorReader::<f32>::open_fvec(&path) {
+                if let Ok(reader) = XvecReader::<f32>::open_path(&path) {
                     doc.push_str(&format!("- Base count: {} (full dataset)\n",
                         format_count(VectorReader::<f32>::count(&reader))));
                 }
@@ -708,7 +708,7 @@ fn write_partitions(config: &DatasetConfig, workspace: &Path, doc: &mut String) 
         .and_then(|p| p.view("query_vectors"))
         .and_then(|v| {
             let path = workspace.join(v.path());
-            MmapVectorReader::<f32>::open_fvec(&path).ok()
+            XvecReader::<f32>::open_path(&path).ok()
                 .map(|r| VectorReader::<f32>::count(&r))
         })
         .unwrap_or(0);
@@ -736,7 +736,7 @@ fn write_partitions(config: &DatasetConfig, workspace: &Path, doc: &mut String) 
             .unwrap_or(false);
 
         let (qc_str, qc_num) = if qv_path.exists() {
-            match MmapVectorReader::<f32>::open_fvec(&qv_path) {
+            match XvecReader::<f32>::open_path(&qv_path) {
                 Ok(r) => {
                     let n = VectorReader::<f32>::count(&r);
                     (format_count(n), n)
@@ -979,14 +979,14 @@ impl veks_core::ui::UiSink for LogCollector {
 fn probe_count(workspace: &Path, profile: &vectordata::dataset::profile::DSProfile, facet: &str) -> Option<usize> {
     let view = profile.view(facet)?;
     let path = workspace.join(view.path());
-    let reader = MmapVectorReader::<f32>::open_fvec(&path).ok()?;
+    let reader = XvecReader::<f32>::open_path(&path).ok()?;
     Some(VectorReader::<f32>::count(&reader))
 }
 
 fn probe_ivec_count(workspace: &Path, profile: &vectordata::dataset::profile::DSProfile, facet: &str) -> Option<usize> {
     let view = profile.view(facet)?;
     let path = workspace.join(view.path());
-    let reader = MmapVectorReader::<i32>::open_ivec(&path).ok()?;
+    let reader = XvecReader::<i32>::open_path(&path).ok()?;
     Some(VectorReader::<i32>::dim(&reader))
 }
 

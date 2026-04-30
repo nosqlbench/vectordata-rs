@@ -14,7 +14,7 @@ use std::time::Instant;
 
 use byteorder::{LittleEndian, WriteBytesExt};
 use vectordata::VectorReader;
-use vectordata::io::MmapVectorReader;
+use vectordata::io::XvecReader;
 
 use crate::pipeline::atomic_write::AtomicWriter;
 use crate::pipeline::command::{
@@ -139,12 +139,12 @@ are excluded from the final dataset.
         }
 
         // Read source ordinals, filter, write output
-        let reader = match MmapVectorReader::<i32>::open_ivec(&source_path) {
+        let reader = match XvecReader::<i32>::open_path(&source_path) {
             Ok(r) => r,
             Err(e) => return error_result(format!("failed to open {}: {}", source_path.display(), e), start),
         };
 
-        let total = <MmapVectorReader<i32> as VectorReader<i32>>::count(&reader);
+        let total = <XvecReader<i32> as VectorReader<i32>>::count(&reader);
         let mut writer = match AtomicWriter::new(&output_path) {
             Ok(w) => w,
             Err(e) => return error_result(format!("failed to create {}: {}", output_path.display(), e), start),
@@ -255,9 +255,9 @@ are excluded from the final dataset.
 
 /// Load ordinals from a dim=1 ivec file into a HashSet.
 fn load_ordinals_into_set(path: &Path, set: &mut HashSet<u32>) -> Result<usize, String> {
-    let reader = MmapVectorReader::<i32>::open_ivec(path)
+    let reader = XvecReader::<i32>::open_path(path)
         .map_err(|e| format!("failed to open {}: {}", path.display(), e))?;
-    let count = <MmapVectorReader<i32> as VectorReader<i32>>::count(&reader);
+    let count = <XvecReader<i32> as VectorReader<i32>>::count(&reader);
     for i in 0..count {
         let vec = reader.get(i)
             .map_err(|e| format!("failed to read ordinal at {}: {}", i, e))?;
@@ -268,9 +268,9 @@ fn load_ordinals_into_set(path: &Path, set: &mut HashSet<u32>) -> Result<usize, 
 
 /// Count records in a dim=1 ivec file. Returns 0 for empty files.
 fn ivec_record_count(path: &Path) -> Result<usize, String> {
-    let reader = MmapVectorReader::<i32>::open_ivec(path)
+    let reader = XvecReader::<i32>::open_path(path)
         .map_err(|e| format!("failed to open {}: {}", path.display(), e))?;
-    Ok(<MmapVectorReader<i32> as VectorReader<i32>>::count(&reader))
+    Ok(<XvecReader<i32> as VectorReader<i32>>::count(&reader))
 }
 
 fn ensure_parent(path: &Path) {

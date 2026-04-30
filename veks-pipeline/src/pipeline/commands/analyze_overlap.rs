@@ -12,7 +12,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use vectordata::io::MmapVectorReader;
+use vectordata::io::XvecReader;
 use vectordata::io::VectorReader;
 
 use crate::pipeline::command::{
@@ -214,21 +214,21 @@ fn check_overlap_f32(
     query_path: &Path,
     ui: &veks_core::ui::UiHandle,
 ) -> Result<(usize, usize, usize), String> {
-    let base_reader = MmapVectorReader::<f32>::open_fvec(base_path)
+    let base_reader = XvecReader::<f32>::open_path(base_path)
         .map_err(|e| format!("open base {}: {}", base_path.display(), e))?;
-    let query_reader = MmapVectorReader::<f32>::open_fvec(query_path)
+    let query_reader = XvecReader::<f32>::open_path(query_path)
         .map_err(|e| format!("open query {}: {}", query_path.display(), e))?;
 
-    let base_count = <MmapVectorReader<f32> as VectorReader<f32>>::count(&base_reader);
-    let query_count = <MmapVectorReader<f32> as VectorReader<f32>>::count(&query_reader);
-    let dim = <MmapVectorReader<f32> as VectorReader<f32>>::dim(&base_reader);
+    let base_count = <XvecReader<f32> as VectorReader<f32>>::count(&base_reader);
+    let query_count = <XvecReader<f32> as VectorReader<f32>>::count(&query_reader);
+    let dim = <XvecReader<f32> as VectorReader<f32>>::dim(&base_reader);
 
     ui.log(&format!("  hashing {} base vectors (dim={})", base_count, dim));
     let pb = ui.bar(base_count as u64, "hashing base vectors");
 
     let mut base_hashes: HashSet<u64> = HashSet::with_capacity(base_count);
     for i in 0..base_count {
-        let vec = <MmapVectorReader<f32> as VectorReader<f32>>::get(&base_reader, i)
+        let vec = <XvecReader<f32> as VectorReader<f32>>::get(&base_reader, i)
             .map_err(|e| format!("read base[{}]: {}", i, e))?;
         base_hashes.insert(hash_f32_vec(&vec));
         pb.inc(1);
@@ -240,7 +240,7 @@ fn check_overlap_f32(
 
     let mut overlap = 0usize;
     for i in 0..query_count {
-        let vec = <MmapVectorReader<f32> as VectorReader<f32>>::get(&query_reader, i)
+        let vec = <XvecReader<f32> as VectorReader<f32>>::get(&query_reader, i)
             .map_err(|e| format!("read query[{}]: {}", i, e))?;
         if base_hashes.contains(&hash_f32_vec(&vec)) {
             overlap += 1;
@@ -257,21 +257,21 @@ fn check_overlap_f16(
     query_path: &Path,
     ui: &veks_core::ui::UiHandle,
 ) -> Result<(usize, usize, usize), String> {
-    let base_reader = MmapVectorReader::<half::f16>::open_mvec(base_path)
+    let base_reader = XvecReader::<half::f16>::open_path(base_path)
         .map_err(|e| format!("open base {}: {}", base_path.display(), e))?;
-    let query_reader = MmapVectorReader::<half::f16>::open_mvec(query_path)
+    let query_reader = XvecReader::<half::f16>::open_path(query_path)
         .map_err(|e| format!("open query {}: {}", query_path.display(), e))?;
 
-    let base_count = <MmapVectorReader<half::f16> as VectorReader<half::f16>>::count(&base_reader);
-    let query_count = <MmapVectorReader<half::f16> as VectorReader<half::f16>>::count(&query_reader);
-    let dim = <MmapVectorReader<half::f16> as VectorReader<half::f16>>::dim(&base_reader);
+    let base_count = <XvecReader<half::f16> as VectorReader<half::f16>>::count(&base_reader);
+    let query_count = <XvecReader<half::f16> as VectorReader<half::f16>>::count(&query_reader);
+    let dim = <XvecReader<half::f16> as VectorReader<half::f16>>::dim(&base_reader);
 
     ui.log(&format!("  hashing {} base vectors (dim={})", base_count, dim));
     let pb = ui.bar(base_count as u64, "hashing base vectors");
 
     let mut base_hashes: HashSet<u64> = HashSet::with_capacity(base_count);
     for i in 0..base_count {
-        let vec = <MmapVectorReader<half::f16> as VectorReader<half::f16>>::get(&base_reader, i)
+        let vec = <XvecReader<half::f16> as VectorReader<half::f16>>::get(&base_reader, i)
             .map_err(|e| format!("read base[{}]: {}", i, e))?;
         base_hashes.insert(hash_f16_vec(&vec));
         pb.inc(1);
@@ -283,7 +283,7 @@ fn check_overlap_f16(
 
     let mut overlap = 0usize;
     for i in 0..query_count {
-        let vec = <MmapVectorReader<half::f16> as VectorReader<half::f16>>::get(&query_reader, i)
+        let vec = <XvecReader<half::f16> as VectorReader<half::f16>>::get(&query_reader, i)
             .map_err(|e| format!("read query[{}]: {}", i, e))?;
         if base_hashes.contains(&hash_f16_vec(&vec)) {
             overlap += 1;

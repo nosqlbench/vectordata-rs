@@ -73,8 +73,18 @@
 //! - **merkle** — content-addressed integrity verification
 //! - **dataset** — dataset.yaml configuration model
 
-/// Merkle-verified download cache for remote datasets.
-pub mod cache;
+/// Merkle-verified download cache for remote datasets. **Crate-private:**
+/// users access cached data implicitly through public reader types.
+pub(crate) mod cache;
+/// Byte-level storage abstraction shared by every reader. **Crate-private:**
+/// users never see [`storage::Storage`] — they get reader handles whose
+/// transport is chosen for them.
+pub(crate) mod storage;
+/// Per-user `vectordata` settings — the single source of truth for
+/// `cache_dir` resolution. Consuming crates (e.g. `veks`) should call
+/// [`settings::cache_dir`] rather than parsing `settings.yaml`
+/// themselves so the user's override is honored uniformly.
+pub mod settings;
 /// Catalog discovery — find datasets by name from configured sources.
 ///
 /// This is the recommended entry point. Configure catalog sources in
@@ -87,8 +97,9 @@ pub mod dataset;
 pub mod formats;
 /// Content-addressed integrity verification (SHA-256 merkle trees).
 pub mod merkle;
-/// HTTP transport layer (internal — used by cache and readers).
-pub mod transport;
+/// HTTP transport layer. **Crate-private** — exposed only via the
+/// merkle-cache reader path; never reachable from the public API.
+pub(crate) mod transport;
 /// Core data models for `dataset.yaml` parsing.
 pub mod model;
 /// Low-level vector file readers (mmap + cached HTTP).
@@ -114,8 +125,9 @@ pub mod group;
 
 pub use group::TestDataGroup;
 pub use model::FacetConfig;
-pub use view::{FacetDescriptor, TestDataView};
-pub use io::VectorReader;
+pub use view::{CacheStats, FacetDescriptor, FacetStorage, PrebufferProgress, TestDataView};
+pub use io::{VectorReader, VvecReader, XvecReader, IndexedVvecReader, IoError};
+pub use typed_access::{ElementType, TypedAccessError, TypedReader};
 
 use thiserror::Error;
 

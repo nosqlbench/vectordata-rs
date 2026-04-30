@@ -12,8 +12,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use slabtastic::SlabReader;
-use vectordata::VectorReader;
-use vectordata::io::MmapVectorReader;
+use vectordata::io::XvecReader;
 
 use veks_core::formats::anode::ANode;
 use veks_core::formats::anode_vernacular::{self, Vernacular};
@@ -245,7 +244,7 @@ global → partition query mapping and see the partition-specific KNN.
         ctx.ui.log("├─ Stage 3: Unfiltered Ground Truth (G) ──────────────────");
 
         let gt_neighbors: Vec<i32> = if let Some(ref gp) = gt_path {
-            match MmapVectorReader::<i32>::open_ivec(gp) {
+            match XvecReader::<i32>::open_path(gp) {
                 Ok(reader) => {
                     if ordinal < reader.count() {
                         let slice = reader.get_slice(ordinal);
@@ -291,7 +290,7 @@ global → partition query mapping and see the partition-specific KNN.
         let filtered_distances: Vec<f32>;
 
         if let Some(ref fp) = filtered_indices_path {
-            match MmapVectorReader::<i32>::open_ivec(fp) {
+            match XvecReader::<i32>::open_path(fp) {
                 Ok(reader) => {
                     if ordinal < reader.count() {
                         let slice = reader.get_slice(ordinal);
@@ -314,7 +313,7 @@ global → partition query mapping and see the partition-specific KNN.
 
         // Read distances if available
         if let Some(ref dp) = filtered_distances_path {
-            match MmapVectorReader::<f32>::open_fvec(dp) {
+            match XvecReader::<f32>::open_path(dp) {
                 Ok(reader) => {
                     if ordinal < reader.count() {
                         filtered_distances = reader.get_slice(ordinal).to_vec();

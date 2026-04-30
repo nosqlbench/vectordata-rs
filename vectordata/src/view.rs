@@ -11,7 +11,7 @@
 //! describing available facets without materializing data.
 
 use crate::group::DataSource;
-use crate::io::{self, VectorReader, VvecReader, VvecElement, OpenableElement};
+use crate::io::{self, VectorReader, VvecReader, VvecElement};
 use crate::model::{FacetConfig, ProfileConfig};
 use crate::{Error, Result};
 use crate::dataset::facet::StandardFacet;
@@ -184,6 +184,126 @@ pub trait TestDataView: Send + Sync {
 
     /// Returns the distance function name if declared in attributes.
     fn distance_function(&self) -> Option<String>;
+
+    // -- Prebuffer / cache --
+
+    /// Force-download every standard facet of this profile into the
+    /// local cache so subsequent reads are zero-copy. Local-mmap
+    /// facets and direct-HTTP (no `.mref`) facets no-op silently.
+    ///
+    /// The default implementation walks `facet_manifest()` and calls
+    /// `prebuffer()` on each opened reader. Profile implementations
+    /// may override to parallelise or to filter by facet kind.
+    fn prebuffer_all(&self) -> Result<()> {
+        self.prebuffer_all_with_progress(&mut |_, _| {})
+    }
+
+    /// Same as [`prebuffer_all`] with a callback fired per facet
+    /// when its underlying download completes. The callback receives
+    /// the facet name and a progress snapshot.
+    ///
+    /// `cb` is taken by `&mut dyn` rather than as a generic parameter
+    /// so this trait remains dyn-compatible (consumers receive
+    /// `Arc<dyn TestDataView>` from the catalog API).
+    fn prebuffer_all_with_progress(&self, cb: &mut dyn FnMut(&str, &PrebufferProgress)) -> Result<()> {
+        for (name, _desc) in self.facet_manifest() {
+            // Try element-typed open first so scalar metadata facets
+            // (e.g., metadata_content.u8) get the same prebuffer path
+            // as vector facets.
+            let etype = match self.facet_element_type(&name) {
+                Ok(e) => e,
+                Err(_) => continue, // unknown extension — skip silently
+            };
+            // Open through TypedReader to get the underlying Storage
+            // and call its prebuffer_with_progress, regardless of the
+            // facet's data shape (uniform, scalar, or vvec).
+            // Width-i64 widening covers every native element type up
+            // to 8 bytes — opens succeed even if the consumer only
+            // ever reads it as i32 etc.
+            match self.open_facet_storage(&name) {
+                Ok(reader) => {
+                    let _ = reader.prebuffer_with_progress(|p| {
+                        cb(&name, &PrebufferProgress {
+                            verified_chunks: p.completed_chunks(),
+                            total_chunks: p.total_chunks(),
+                            verified_bytes: p.downloaded_bytes(),
+                            total_bytes: p.total_bytes(),
+                        });
+                    });
+                    let _ = etype; // suppressed
+                }
+                Err(_) => continue,
+            }
+        }
+        Ok(())
+    }
+
+    /// **Crate-internal hook** used by the default `prebuffer_all`
+    /// implementation. Returns a handle whose `prebuffer*` methods
+    /// drive the underlying [`crate::storage::Storage`]. Implementors
+    /// rarely override this — the `GenericTestDataView` default is
+    /// usually correct.
+    #[doc(hidden)]
+    fn open_facet_storage(&self, name: &str) -> Result<FacetStorage>;
+}
+
+/// Snapshot of in-progress prebuffer state for a single facet. Passed
+/// to the callback registered with [`TestDataView::prebuffer_all_with_progress`].
+#[derive(Debug, Clone)]
+pub struct PrebufferProgress {
+    pub verified_chunks: u32,
+    pub total_chunks: u32,
+    pub verified_bytes: u64,
+    pub total_bytes: u64,
+}
+
+/// Live cache fill statistics for a single facet's underlying storage.
+/// Returned by [`FacetStorage::cache_stats`]. `None` when the storage
+/// is not cache-backed (e.g., local mmap or direct HTTP).
+#[derive(Debug, Clone)]
+pub struct CacheStats {
+    /// Verified chunks in the local cache.
+    pub valid_chunks: u32,
+    /// Total chunks in the file.
+    pub total_chunks: u32,
+    /// Total content size in bytes.
+    pub content_size: u64,
+    /// Whether every chunk is verified.
+    pub is_complete: bool,
+}
+
+/// Opaque handle to a facet's underlying storage. Returned by
+/// [`TestDataView::open_facet_storage`] and consumed by the default
+/// `prebuffer_all` implementation. There is no public API for
+/// reading bytes through this handle — reads go through the
+/// shape-aware reader returned by `base_vectors()`, `facet()`, or
+/// `open_facet_typed`.
+pub struct FacetStorage {
+    storage: std::sync::Arc<crate::storage::Storage>,
+}
+
+impl FacetStorage {
+    pub(crate) fn new(storage: std::sync::Arc<crate::storage::Storage>) -> Self {
+        Self { storage }
+    }
+    pub fn prebuffer(&self) -> std::io::Result<()> { self.storage.prebuffer() }
+    pub fn prebuffer_with_progress<F>(&self, cb: F) -> std::io::Result<()>
+    where F: FnMut(&crate::transport::DownloadProgress)
+    { self.storage.prebuffer_with_progress(cb) }
+    pub fn is_complete(&self) -> bool { self.storage.is_complete() }
+    pub fn is_local(&self) -> bool { self.storage.is_local() }
+    pub fn total_size(&self) -> u64 { self.storage.total_size() }
+
+    /// Live cache-fill statistics. Returns `None` when the storage is
+    /// not cache-backed (local mmap or direct HTTP).
+    pub fn cache_stats(&self) -> Option<CacheStats> {
+        self.storage.cached_channel().map(|c| CacheStats {
+            valid_chunks: c.valid_count(),
+            total_chunks: c.total_chunks(),
+            content_size: c.content_size(),
+            is_complete: c.is_complete(),
+        })
+    }
 }
 
 /// A generic implementation of `TestDataView`.
@@ -246,7 +366,7 @@ impl GenericTestDataView {
     /// `base_vectors` from default with `[0..base_count)` so every
     /// consumer reading via the trait gets a clipped reader without
     /// having to honor `view.base_count()` manually.
-    fn open_uniform<T: OpenableElement>(
+    fn open_uniform<T: VvecElement>(
         &self,
         facet_opt: Option<&FacetConfig>,
         name: &str,
@@ -510,5 +630,21 @@ impl TestDataView for GenericTestDataView {
             .get("distance_function")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
+    }
+
+    fn open_facet_storage(&self, name: &str) -> Result<FacetStorage> {
+        let facet = self.facet_config_by_name(name)
+            .ok_or_else(|| Error::MissingFacet(name.to_string()))?;
+        // Strip any window suffix from the source so Storage opens
+        // the underlying file/url, not a half-parsed token.
+        let raw = facet.source();
+        let path_str = match crate::dataset::source::parse_source_string(raw) {
+            Ok(parsed) => parsed.path,
+            Err(_) => raw.to_string(),
+        };
+        let resolved = self.resolve_path_str(&path_str)?;
+        let storage = std::sync::Arc::new(crate::storage::Storage::open(&resolved)
+            .map_err(|e| Error::Other(format!("storage open '{name}': {e}")))?);
+        Ok(FacetStorage::new(storage))
     }
 }

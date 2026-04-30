@@ -525,6 +525,24 @@ pub struct CommandTree {
 }
 
 impl CommandTree {
+    /// Maximum [`Node::level`] across all root-level children. Drives
+    /// the rotation cycle in [`complete_rotating`]: a tap beyond
+    /// `max_level()` wraps back to level 1.
+    ///
+    /// Returns at least 1 (since [`DEFAULT_LEVEL`] is 1) so callers
+    /// can use the result directly as a modular cycle length.
+    pub fn max_level(&self) -> u32 {
+        let mut max = DEFAULT_LEVEL;
+        if let Node::Group { children, .. } = &self.root {
+            for (_, child) in children {
+                if child.level() > max {
+                    max = child.level();
+                }
+            }
+        }
+        max
+    }
+
     /// Create a new command tree with an empty root group.
     ///
     /// The `app_name` is used to construct the environment variable name
@@ -734,6 +752,105 @@ pub fn complete(tree: &CommandTree, words: &[&str]) -> Vec<String> {
     complete_at_tap(tree, words, 1)
 }
 
+/// Rotating-tier completion. Returns root-level candidates whose
+/// `Node::level() == only_level` (NOT the cumulative `<=` set), so
+/// successive tab taps cycle through tiers one at a time and wrap
+/// around after the highest. Once the user starts typing a
+/// specific name, behaves identically to [`complete`] — the level
+/// filter applies only at the root with an empty partial.
+///
+/// Use [`complete_rotating`] (or [`handle_complete_env`] which
+/// already wires this up) for the recommended UX:
+///
+///   tap 1 → only level 1   (Primary)
+///   tap 2 → only level 2   (Secondary)
+///   tap 3 → only level 3   (Advanced)
+///   tap 4 → wraps back to level 1
+///   ...
+///
+/// Cycle length is the tree's [`max_level`].
+pub fn complete_at_level_only(tree: &CommandTree, words: &[&str], only_level: u32) -> Vec<String> {
+    // Words shape: [binary, completed..., partial]. At absolute root
+    // with no input at all, words may have just [binary], so treat
+    // missing partial as empty.
+    let partial = if words.len() > 1 { *words.last().unwrap_or(&"") } else { "" };
+    let completed: &[&str] = if words.len() > 1 { &words[1..words.len() - 1] } else { &[] };
+
+    // Rotation only filters when the user is at a group prompt with
+    // no partial typed. Once they start typing a name, we want
+    // anything matching it (regardless of tier) so half-typed
+    // higher-tier commands still complete on the first tap.
+    if !partial.is_empty() {
+        return complete(tree, words);
+    }
+
+    // Walk the tree following completed words to find the current
+    // group node. If we hit a non-existent child or a leaf, fall
+    // back to the standard completion engine.
+    let mut node = &tree.root;
+    let at_root = completed.is_empty();
+    for &word in completed {
+        match node.child(word) {
+            Some(child) => node = child,
+            None => return complete(tree, words),
+        }
+    }
+
+    // Apply the rotation filter to whichever group we landed on.
+    if let Node::Group { children, .. } = node {
+        let mut candidates: Vec<String> = children.iter()
+            .filter(|(k, _)| !at_root || !tree.hidden.contains(k.as_str()))
+            .filter(|(_, child)| child.level() == only_level)
+            .map(|(k, _)| k.to_string())
+            .collect();
+        candidates.sort_by(|a, b| {
+            a.starts_with('-').cmp(&b.starts_with('-')).then_with(|| a.cmp(b))
+        });
+        return candidates;
+    }
+
+    // Landed on a leaf — no children to rotate, defer to standard
+    // completion (which handles option/value completion).
+    complete(tree, words)
+}
+
+/// Convenience wrapper over [`complete_at_level_only`] that maps
+/// the raw tap counter to the rotating level. Cycle length is
+/// computed relative to whichever group node the user has
+/// descended into — a subgroup with only level-1 children has a
+/// cycle length of 1 (every tap shows the same set), while a
+/// subgroup with Primary+Secondary+Advanced children has a cycle
+/// length of 3. A tap beyond the cycle wraps back to level 1.
+pub fn complete_rotating(tree: &CommandTree, words: &[&str], tap_count: u32) -> Vec<String> {
+    // Determine the max level among the children of whichever
+    // group the cursor is currently inside.
+    let completed: &[&str] = if words.len() > 1 { &words[1..words.len() - 1] } else { &[] };
+    let mut node = &tree.root;
+    for &word in completed {
+        match node.child(word) {
+            Some(child) => node = child,
+            None => break,
+        }
+    }
+    let max = max_level_of_children(node).max(1);
+    let only = ((tap_count.saturating_sub(1)) % max) + 1;
+    complete_at_level_only(tree, words, only)
+}
+
+/// Maximum [`Node::level`] across the immediate children of `node`,
+/// or [`DEFAULT_LEVEL`] if `node` is a leaf or has no children.
+fn max_level_of_children(node: &Node) -> u32 {
+    let mut max = DEFAULT_LEVEL;
+    if let Node::Group { children, .. } = node {
+        for (_, child) in children {
+            if child.level() > max {
+                max = child.level();
+            }
+        }
+    }
+    max
+}
+
 /// Stratified completion: returns root-level candidates with
 /// `Node::level() <= tap_count`, so the Nth tab tap reveals
 /// progressively more commands. Inside a subcommand or with a
@@ -816,23 +933,33 @@ pub fn complete_at_tap(tree: &CommandTree, words: &[&str], tap_count: u32) -> Ve
                 return Vec::new();
             }
 
-            // Check if partial is "key=value_prefix" — call value provider for that key.
+            // Partial of the form `key=value_prefix` — the user
+            // has committed to the key, they want value
+            // candidates for it. Bash's default
+            // `COMP_WORDBREAKS` contains `=`, which means
+            // readline already treats the current word as just
+            // the segment AFTER the `=`. So we must return BARE
+            // values here, not `key=value` strings — emitting
+            // the key would replicate it on the line and yield
+            // `key=key=value` ("stutter"). When no provider
+            // matches, return an empty candidate set: the user
+            // has signaled "I'm typing a value", so falling
+            // through to the option-name list (which can
+            // re-emit `key=` and stutter the same way) would be
+            // wrong.
             if let Some(eq_pos) = partial.find('=') {
                 let key = &partial[..eq_pos];
                 let value_partial = &partial[eq_pos + 1..];
                 let key_eq = format!("{key}=");
                 let dashed_key = format!("--{key}");
-                // Try value provider by "key=" or "--key"
                 if let Some(provider) = value_providers.get(&key_eq)
                     .or_else(|| value_providers.get(&dashed_key))
                     .or_else(|| tree.global_value_providers.get(&key_eq))
                     .or_else(|| tree.global_value_providers.get(&dashed_key))
                 {
-                    let values = provider(value_partial, remaining);
-                    return values.into_iter()
-                        .map(|v| format!("{key}={v}"))
-                        .collect();
+                    return provider(value_partial, remaining);
                 }
+                return Vec::new();
             }
 
             // Collect all available options: static + dynamic from context.
@@ -870,7 +997,167 @@ pub fn complete_at_tap(tree: &CommandTree, words: &[&str], tap_count: u32) -> Ve
     }
 }
 
+/// Supported shells for completion-script generation.
+///
+/// `Bash` and `Zsh` (via bash-compatible mode) are fully implemented;
+/// `Fish`, `Elvish`, and `PowerShell` placeholders are accepted but
+/// emit a stub-with-warning so callers can register them in a CLI
+/// `--shell` flag without separate dispatch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Shell {
+    Bash,
+    Zsh,
+    Fish,
+    Elvish,
+    PowerShell,
+}
+
+impl Shell {
+    /// Parse a shell name (case-insensitive) — `"bash"`, `"zsh"`,
+    /// `"fish"`, `"elvish"`, or `"pwsh"` / `"powershell"`. Returns
+    /// `None` for unrecognized names.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "bash" => Some(Self::Bash),
+            "zsh" => Some(Self::Zsh),
+            "fish" => Some(Self::Fish),
+            "elvish" => Some(Self::Elvish),
+            "pwsh" | "powershell" => Some(Self::PowerShell),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Bash => "bash",
+            Self::Zsh => "zsh",
+            Self::Fish => "fish",
+            Self::Elvish => "elvish",
+            Self::PowerShell => "powershell",
+        }
+    }
+}
+
+/// Detect the user's interactive shell.
+///
+/// Tries `$SHELL` first (the standard Unix mechanism), then falls
+/// back to inspecting the parent process's `/proc/PID/comm` on Linux
+/// for the case where `$SHELL` is set to something other than the
+/// actual interactive shell (e.g., when running under a wrapper).
+/// Returns `None` if no recognized shell can be determined.
+pub fn detect_shell() -> Option<Shell> {
+    if let Ok(shell_path) = std::env::var("SHELL") {
+        let name = std::path::Path::new(&shell_path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+        if let Some(s) = Shell::from_name(name) {
+            return Some(s);
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // Read PPid from /proc/self/status — avoids a libc dep on
+        // getppid(2). Format line: `PPid:\t<pid>\n`.
+        if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+            if let Some(ppid_line) = status.lines().find(|l| l.starts_with("PPid:")) {
+                if let Some(ppid) = ppid_line.split_whitespace().nth(1) {
+                    if let Ok(comm) = std::fs::read_to_string(format!("/proc/{}/comm", ppid)) {
+                        let name = comm.trim();
+                        if let Some(s) = Shell::from_name(name) {
+                            return Some(s);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Print a completions snippet for `<app> completions` (no `--shell`)
+/// — the convenience entry point users typically call once at shell
+/// startup. Auto-detects the user's shell and emits a comment header
+/// plus an indirect-`source <(...)` line that pulls the actual script
+/// from `<app> completions --shell <shell>`.
+///
+/// The indirect form is what makes `eval "$(myapp completions)"`
+/// safe regardless of which shell the user is in: the heredoc content
+/// (which contains backslashes, `$`, etc.) is sourced from a
+/// subshell rather than substituted into the caller's `eval` argument.
+///
+/// Falls back to a help message if shell detection fails.
+pub fn print_indirect_wrapper(app_name: &str) {
+    let app_path = std::env::current_exe()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| app_name.to_string());
+
+    match detect_shell() {
+        Some(Shell::Bash) => {
+            println!("# {} tab-completion for bash", app_name);
+            println!("# To activate:  eval \"$({} completions)\"", app_name);
+            println!("# To persist:   echo 'eval \"$({} completions)\"' >> ~/.bashrc", app_name);
+            println!("source <(\"{}\" completions --shell bash)", app_path);
+        }
+        Some(Shell::Zsh) => {
+            println!("# {} tab-completion for zsh", app_name);
+            println!("# To activate:  eval \"$({} completions)\"", app_name);
+            println!("# To persist:   echo 'eval \"$({} completions)\"' >> ~/.zshrc", app_name);
+            println!("source <(\"{}\" completions --shell zsh)", app_path);
+        }
+        Some(Shell::Fish) => {
+            println!("# {} tab-completion for fish", app_name);
+            println!("# To activate:  eval ({} completions)", app_name);
+            println!("# To persist:   add to ~/.config/fish/config.fish");
+            println!("\"{}\" completions --shell fish | source", app_path);
+        }
+        Some(other) => {
+            // Recognized shell but no auto-wrapper format defined;
+            // emit the direct script.
+            print_completions(app_name, other);
+        }
+        None => {
+            println!("# {0}: could not detect your shell.", app_name);
+            println!("# Use: eval \"$({0} completions --shell bash)\"", app_name);
+        }
+    }
+}
+
+/// Print a direct completion script for `<app> completions --shell
+/// <shell>`. This is what the indirect wrapper sources at shell
+/// startup; callers can invoke it directly when they want the raw
+/// script in stdout.
+///
+/// `Bash` is fully implemented. `Zsh` reuses the bash script via
+/// bash-compatible mode (with a stderr note). `Fish`, `Elvish`, and
+/// `PowerShell` print a stderr stub indicating they're not yet
+/// implemented but accept the shell choice without panicking.
+pub fn print_completions(app_name: &str, shell: Shell) {
+    match shell {
+        Shell::Bash => print_bash_script(app_name),
+        Shell::Zsh => {
+            eprintln!("# zsh completions: using bash-compatible mode");
+            print_bash_script(app_name);
+        }
+        Shell::Fish | Shell::Elvish | Shell::PowerShell => {
+            eprintln!(
+                "# {} completions for `{}` are not yet implemented",
+                shell.name(), app_name,
+            );
+        }
+    }
+}
+
 /// Generate a bash completion script that calls back into the app.
+///
+/// The emitted script is intentionally minimal — a single
+/// `complete -F` registration plus a body that hands the raw
+/// `$COMP_LINE` and `$COMP_POINT` to the binary. All
+/// word-splitting and candidate logic runs in Rust inside
+/// [`handle_complete_env`]; the bash side never sees the
+/// completion rules. That keeps user-facing behavior from
+/// drifting between shell and binary on upgrades — the only
+/// thing that can break is the (trivial) handoff itself.
 pub fn print_bash_script(app_name: &str) {
     let env_var = format!("_{}_COMPLETE", app_name.to_uppercase().replace('-', "_"));
 
@@ -888,42 +1175,14 @@ pub fn print_bash_script(app_name: &str) {
         .unwrap_or_else(|| app_name.to_string());
 
     print!(r#"_{app}_complete() {{
-    COMP_WORDBREAKS="${{COMP_WORDBREAKS//:}}"
-    local line="${{COMP_LINE:0:$COMP_POINT}}"
-    local -a words=()
-    local word=""
-    local in_quote=""
-    local i=0
-    while [ $i -lt ${{#line}} ]; do
-        local ch="${{line:$i:1}}"
-        if [ -n "$in_quote" ]; then
-            if [ "$ch" = "$in_quote" ]; then
-                in_quote=""
-            else
-                word+="$ch"
-            fi
-        elif [ "$ch" = "'" ] || [ "$ch" = '"' ]; then
-            in_quote="$ch"
-        elif [ "$ch" = " " ] || [ "$ch" = $'\t' ]; then
-            if [ -n "$word" ]; then
-                words+=("$word")
-                word=""
-            fi
-        else
-            word+="$ch"
-        fi
-        i=$((i + 1))
-    done
-    words+=("$word")
-
     local IFS=$'\n'
-    COMPREPLY=($({env_var}=bash _COMP_SHELL_PID=$$ "{completer}" -- "${{words[@]}}" 2>/dev/tty))
+    COMPREPLY=($({env_var}=bash _COMP_SHELL_PID=$$ "{completer}" "$COMP_LINE" "$COMP_POINT" 2>/dev/null))
+    if [[ ${{#COMPREPLY[@]}} -ge 1 ]] \
+        && [[ "${{COMPREPLY[0]}}" == *= || "${{COMPREPLY[0]}}" == */ ]]; then
+        compopt -o nospace 2>/dev/null
+    fi
 }}
-if [[ "${{BASH_VERSINFO[0]}}" -eq 4 && "${{BASH_VERSINFO[1]}}" -ge 4 || "${{BASH_VERSINFO[0]}}" -gt 4 ]]; then
-    complete -o default -o bashdefault -o nosort -F _{app}_complete {app}
-else
-    complete -o default -o bashdefault -F _{app}_complete {app}
-fi
+complete -F _{app}_complete {app}
 "#,
         app = app_name,
         env_var = env_var,
@@ -931,7 +1190,45 @@ fi
     );
 }
 
+/// Tokenize a shell line up to `point`, returning the prior
+/// completed words and the current (in-progress) token. Honors
+/// single and double quotes and `\` escapes; preserves `=` as
+/// part of a token (so `key=value` stays one word). The first
+/// token (the binary name) is dropped — callers already know it.
+fn split_line(line: &str, point: usize) -> (Vec<String>, String) {
+    let point = point.min(line.len());
+    let head = &line[..point];
+    let mut words: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut in_quote: Option<char> = None;
+    let mut chars = head.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match in_quote {
+            Some(q) if ch == q => { in_quote = None; }
+            Some(_) => cur.push(ch),
+            None => match ch {
+                '\'' | '"' => { in_quote = Some(ch); }
+                '\\' => {
+                    if let Some(next) = chars.next() { cur.push(next); }
+                }
+                ' ' | '\t' => {
+                    if !cur.is_empty() {
+                        words.push(std::mem::take(&mut cur));
+                    }
+                }
+                _ => cur.push(ch),
+            }
+        }
+    }
+    if !words.is_empty() { words.remove(0); }
+    (words, cur)
+}
+
 /// Check for completion env vars and handle them.
+///
+/// Expects the bash shim emitted by [`print_bash_script`] —
+/// `<binary> "$COMP_LINE" "$COMP_POINT"` — and tokenizes the
+/// line in Rust before walking the [`CommandTree`].
 pub fn handle_complete_env(app_name: &str, tree: &CommandTree) -> bool {
     let env_var = format!("_{}_COMPLETE", app_name.to_uppercase().replace('-', "_"));
     let is_ours = std::env::var(&env_var).ok().as_deref() == Some("bash");
@@ -940,35 +1237,39 @@ pub fn handle_complete_env(app_name: &str, tree: &CommandTree) -> bool {
         return false;
     }
 
-    let args: Vec<String> = std::env::args().collect();
-    let words_start = args.iter().position(|a| a == "--").map(|i| i + 1).unwrap_or(1);
-    let words: Vec<&str> = args[words_start..].iter().map(|s| s.as_str()).collect();
+    let argv: Vec<String> = std::env::args().collect();
+    let line = argv.get(1).cloned().unwrap_or_default();
+    let point: usize = argv.get(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(line.len());
+
+    let (prior, cur) = split_line(&line, point);
+    // The downstream API takes a `words: &[&str]` shape where
+    // index 0 is the binary name and the last entry is the
+    // (possibly empty) word under the cursor.
+    let mut words_owned: Vec<String> = vec![app_name.to_string()];
+    words_owned.extend(prior);
+    words_owned.push(cur);
+    let words: Vec<&str> = words_owned.iter().map(|s| s.as_str()).collect();
 
     let input_key = words[1..].join(" ");
     let tap_count = tap_detect(app_name, &input_key);
 
-    // Stratified completion: tap N reveals every command with
-    // `Node::level() <= N`. The legacy "tap 3+ shows the full
-    // expanded `group cmd` view" behavior is still reachable
-    // — when no node opts into a level above 1, all root
-    // commands appear from tap 1 onward, matching the
-    // pre-stratification behavior, and tap 3 reaches
-    // `complete_expanded` for hierarchical group/command
-    // pairs.
-    let candidates = if tap_count >= 3 && tap_count % 2 == 1 {
-        // Odd-numbered tap >= 3 still reaches the expanded
-        // hierarchical view as a final fallback for trees
-        // with deep groups. For flat trees this returns the
-        // same as the level filter at tap_count.
-        let expanded = complete_expanded(tree, &words);
-        if !expanded.is_empty() {
-            expanded
-        } else {
-            complete_at_tap(tree, &words, tap_count)
-        }
-    } else {
-        complete_at_tap(tree, &words, tap_count)
-    };
+    // Rotating-tier completion: each tab tap shows ONLY the next
+    // tier's commands (not the cumulative set), and after reaching
+    // the highest tier wraps back to level 1. The cycle length is
+    // the tree's [`max_level`] — for a tree with Primary +
+    // Secondary + Advanced (max_level=3):
+    //
+    //   tap 1 → only level 1 (Primary)
+    //   tap 2 → only level 2 (Secondary)
+    //   tap 3 → only level 3 (Advanced)
+    //   tap 4 → wraps back to level 1
+    //
+    // Trees that haven't categorized their commands have
+    // max_level == 1, so every tap returns the same level-1 set
+    // (the pre-stratification behavior).
+    let candidates = complete_rotating(tree, &words, tap_count);
 
     for candidate in candidates {
         println!("{}", candidate);
@@ -980,30 +1281,50 @@ pub fn handle_complete_env(app_name: &str, tree: &CommandTree) -> bool {
 fn tap_detect(app_name: &str, input_key: &str) -> u32 {
     use std::io::Write;
 
+    // Cadence semantics:
+    //   gap > 1000 ms  → reset to level 1 (idle resets the rotation)
+    //   gap < 250  ms  → advance to next level (rapid double/triple-tap)
+    //   otherwise      → hold current level
+    const RESET_MS: u128 = 1000;
+    const ADVANCE_MS: u128 = 250;
+
     let ppid = std::env::var("_COMP_SHELL_PID")
         .or_else(|_| std::env::var("PPID"))
         .unwrap_or_else(|_| "0".to_string());
     let tap_file = std::path::PathBuf::from(format!("/tmp/.{}_tap_{}", app_name, ppid));
-    let now = std::time::SystemTime::now()
+    let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
+        .map(|d| d.as_millis())
         .unwrap_or(0);
 
     let mut count = 1u32;
 
+    // Compare key normalized to the same shape on read AND write so
+    // a trailing space (common when the user just typed a separator
+    // before pressing TAB) doesn't reset the tap counter — that
+    // would defeat rotation entirely.
+    let cur_key = input_key.trim_end();
+
     if let Ok(content) = std::fs::read_to_string(&tap_file) {
         let mut parts = content.splitn(3, ' ');
-        let prev_time: u64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let prev_time: u128 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
         let prev_count: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-        let prev_key = parts.next().unwrap_or("").trim();
+        let prev_key = parts.next().unwrap_or("").trim_end();
 
-        if prev_key == input_key && now.saturating_sub(prev_time) < 5 {
-            count = prev_count + 1;
+        if prev_key == cur_key {
+            let gap = now_ms.saturating_sub(prev_time);
+            if gap > RESET_MS {
+                count = 1;
+            } else if gap < ADVANCE_MS {
+                count = prev_count.saturating_add(1).max(1);
+            } else {
+                count = prev_count.max(1);
+            }
         }
     }
 
     if let Ok(mut f) = std::fs::File::create(&tap_file) {
-        let _ = write!(f, "{} {} {}", now, count, input_key);
+        let _ = write!(f, "{} {} {}", now_ms, count, cur_key);
     }
 
     count

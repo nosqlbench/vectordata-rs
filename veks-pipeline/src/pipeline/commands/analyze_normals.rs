@@ -12,7 +12,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use vectordata::VectorReader;
-use vectordata::io::MmapVectorReader;
+use vectordata::io::XvecReader;
 
 use crate::pipeline::command::{
     CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options,
@@ -149,7 +149,7 @@ The threshold is fixed per precision level: 1e-1 (f16), 1e-5 (f32),
         // Open reader and get count/dim
         let (count, dim, get_f64): (usize, usize, Box<dyn Fn(usize) -> Vec<f64>>) = match etype {
             ElementType::F32 => {
-                let r = match MmapVectorReader::<f32>::open_fvec(&input_path) {
+                let r = match XvecReader::<f32>::open_path(&input_path) {
                     Ok(r) => r,
                     Err(e) => return error_result(format!("open: {}", e), start),
                 };
@@ -160,7 +160,7 @@ The threshold is fixed per precision level: 1e-1 (f16), 1e-5 (f32),
                 }))
             }
             ElementType::F16 => {
-                let r = match MmapVectorReader::<half::f16>::open_mvec(&input_path) {
+                let r = match XvecReader::<half::f16>::open_path(&input_path) {
                     Ok(r) => r,
                     Err(e) => return error_result(format!("open: {}", e), start),
                 };
@@ -171,7 +171,7 @@ The threshold is fixed per precision level: 1e-1 (f16), 1e-5 (f32),
                 }))
             }
             ElementType::F64 => {
-                let r = match MmapVectorReader::<f64>::open_dvec(&input_path) {
+                let r = match XvecReader::<f64>::open_path(&input_path) {
                     Ok(r) => r,
                     Err(e) => return error_result(format!("open: {}", e), start),
                 };

@@ -31,7 +31,7 @@ use std::time::Instant;
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use vectordata::VectorReader;
-use vectordata::io::MmapVectorReader;
+use vectordata::io::XvecReader;
 
 use crate::pipeline::command::{
     ArtifactManifest, CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options,
@@ -53,8 +53,8 @@ use crate::pipeline::command::{
 /// comparisons (where the get_slice zero-copy path is faster than a
 /// per-call pread).
 enum VecReader {
-    F32 { mmap: MmapVectorReader<f32>, pread_file: Arc<std::fs::File>, entry_size: usize },
-    F16 { mmap: MmapVectorReader<half::f16>, pread_file: Arc<std::fs::File>, entry_size: usize },
+    F32 { mmap: XvecReader<f32>, pread_file: Arc<std::fs::File>, entry_size: usize },
+    F16 { mmap: XvecReader<half::f16>, pread_file: Arc<std::fs::File>, entry_size: usize },
 }
 
 impl VecReader {
@@ -65,13 +65,13 @@ impl VecReader {
         let pread_file = Arc::new(pread_file);
         match path.extension().and_then(|e| e.to_str()) {
             Some("mvec") | Some("mvecs") => {
-                let mmap = MmapVectorReader::<half::f16>::open_mvec(path)
+                let mmap = XvecReader::<half::f16>::open_path(path)
                     .map_err(|e| format!("failed to open {}: {}", path.display(), e))?;
                 let entry_size = mmap.entry_size();
                 Ok(VecReader::F16 { mmap, pread_file, entry_size })
             }
             _ => {
-                let mmap = MmapVectorReader::<f32>::open_fvec(path)
+                let mmap = XvecReader::<f32>::open_path(path)
                     .map_err(|e| format!("failed to open {}: {}", path.display(), e))?;
                 let entry_size = mmap.entry_size();
                 Ok(VecReader::F32 { mmap, pread_file, entry_size })
@@ -81,15 +81,15 @@ impl VecReader {
 
     fn count(&self) -> usize {
         match self {
-            VecReader::F32 { mmap, .. } => <MmapVectorReader<f32> as VectorReader<f32>>::count(mmap),
-            VecReader::F16 { mmap, .. } => <MmapVectorReader<half::f16> as VectorReader<half::f16>>::count(mmap),
+            VecReader::F32 { mmap, .. } => <XvecReader<f32> as VectorReader<f32>>::count(mmap),
+            VecReader::F16 { mmap, .. } => <XvecReader<half::f16> as VectorReader<half::f16>>::count(mmap),
         }
     }
 
     fn dim(&self) -> usize {
         match self {
-            VecReader::F32 { mmap, .. } => <MmapVectorReader<f32> as VectorReader<f32>>::dim(mmap),
-            VecReader::F16 { mmap, .. } => <MmapVectorReader<half::f16> as VectorReader<half::f16>>::dim(mmap),
+            VecReader::F32 { mmap, .. } => <XvecReader<f32> as VectorReader<f32>>::dim(mmap),
+            VecReader::F16 { mmap, .. } => <XvecReader<half::f16> as VectorReader<half::f16>>::dim(mmap),
         }
     }
 

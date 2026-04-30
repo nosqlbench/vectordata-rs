@@ -22,7 +22,7 @@ use rand_xoshiro::Xoshiro256PlusPlus;
 use serde::Serialize;
 
 use vectordata::VectorReader;
-use vectordata::io::MmapVectorReader;
+use vectordata::io::XvecReader;
 
 use crate::pipeline::command::{
     CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options, ResourceDesc, Status,
@@ -84,7 +84,7 @@ const QUERY_BATCH_SIZE: usize = 256;
 #[inline(never)]
 fn find_top_k_batch_f32(
     queries: &[&[f32]],
-    base_reader: &MmapVectorReader<f32>,
+    base_reader: &XvecReader<f32>,
     start: usize,
     end: usize,
     k: usize,
@@ -104,7 +104,7 @@ fn find_top_k_batch_f32(
 #[inline(never)]
 fn find_top_k_batch_pairwise_f32(
     queries: &[&[f32]],
-    base_reader: &MmapVectorReader<f32>,
+    base_reader: &XvecReader<f32>,
     start: usize,
     end: usize,
     k: usize,
@@ -152,7 +152,7 @@ fn find_top_k_batch_pairwise_f32(
 #[inline(never)]
 fn find_top_k_batch_transposed_f32(
     queries: &[&[f32]],
-    base_reader: &MmapVectorReader<f32>,
+    base_reader: &XvecReader<f32>,
     start: usize,
     end: usize,
     k: usize,
@@ -229,7 +229,7 @@ fn find_top_k_batch_transposed_f32(
 #[inline(never)]
 fn find_top_k_batch_f16(
     queries: &[&[half::f16]],
-    base_reader: &MmapVectorReader<half::f16>,
+    base_reader: &XvecReader<half::f16>,
     start: usize,
     end: usize,
     k: usize,
@@ -249,7 +249,7 @@ fn find_top_k_batch_f16(
 #[inline(never)]
 fn find_top_k_batch_pairwise_f16(
     queries: &[&[half::f16]],
-    base_reader: &MmapVectorReader<half::f16>,
+    base_reader: &XvecReader<half::f16>,
     start: usize,
     end: usize,
     k: usize,
@@ -297,7 +297,7 @@ fn find_top_k_batch_pairwise_f16(
 #[inline(never)]
 fn find_top_k_batch_transposed_f16(
     queries: &[&[half::f16]],
-    base_reader: &MmapVectorReader<half::f16>,
+    base_reader: &XvecReader<half::f16>,
     start: usize,
     end: usize,
     k: usize,
@@ -371,7 +371,7 @@ fn find_top_k_batch_transposed_f16(
 #[inline(never)]
 fn find_top_k_batch_pairwise_f64(
     queries: &[&[f64]],
-    base_reader: &MmapVectorReader<f64>,
+    base_reader: &XvecReader<f64>,
     start: usize,
     end: usize,
     k: usize,
@@ -420,9 +420,9 @@ fn find_top_k_batch_pairwise_f64(
 /// Verify sampled queries using f32 vectors with parallel batched processing.
 #[allow(clippy::too_many_arguments)]
 fn verify_f32(
-    base_reader: &Arc<MmapVectorReader<f32>>,
-    query_reader: &MmapVectorReader<f32>,
-    indices_reader: &MmapVectorReader<i32>,
+    base_reader: &Arc<XvecReader<f32>>,
+    query_reader: &XvecReader<f32>,
+    indices_reader: &XvecReader<i32>,
     sampled_indices: &[usize],
     base_offset: usize,
     base_end: usize,
@@ -434,7 +434,7 @@ fn verify_f32(
     ui: &veks_core::ui::UiHandle,
 ) -> Vec<QueryVerification> {
     let batched_fn = simd_distance::select_batched_fn_f32(metric);
-    let dim = <MmapVectorReader<f32> as VectorReader<f32>>::dim(&**base_reader);
+    let dim = <XvecReader<f32> as VectorReader<f32>>::dim(&**base_reader);
     let sample_count = sampled_indices.len();
 
     let pb = ui.bar_with_unit(sample_count as u64, "verify", "queries");
@@ -536,9 +536,9 @@ fn verify_f32(
 /// Verify sampled queries using f16 vectors with parallel batched processing.
 #[allow(clippy::too_many_arguments)]
 fn verify_f16(
-    base_reader: &Arc<MmapVectorReader<half::f16>>,
-    query_reader: &MmapVectorReader<half::f16>,
-    indices_reader: &MmapVectorReader<i32>,
+    base_reader: &Arc<XvecReader<half::f16>>,
+    query_reader: &XvecReader<half::f16>,
+    indices_reader: &XvecReader<i32>,
     sampled_indices: &[usize],
     base_offset: usize,
     base_end: usize,
@@ -550,7 +550,7 @@ fn verify_f16(
     ui: &veks_core::ui::UiHandle,
 ) -> Vec<QueryVerification> {
     let batched_fn = simd_distance::select_batched_fn_f32(metric);
-    let dim = <MmapVectorReader<half::f16> as VectorReader<half::f16>>::dim(&**base_reader);
+    let dim = <XvecReader<half::f16> as VectorReader<half::f16>>::dim(&**base_reader);
     let sample_count = sampled_indices.len();
 
     let pb = ui.bar_with_unit(sample_count as u64, "verify", "queries");
@@ -647,9 +647,9 @@ fn verify_f16(
 /// Verify sampled queries using f64 vectors with parallel batched processing.
 #[allow(clippy::too_many_arguments)]
 fn verify_f64(
-    base_reader: &Arc<MmapVectorReader<f64>>,
-    query_reader: &MmapVectorReader<f64>,
-    indices_reader: &MmapVectorReader<i32>,
+    base_reader: &Arc<XvecReader<f64>>,
+    query_reader: &XvecReader<f64>,
+    indices_reader: &XvecReader<i32>,
     sampled_indices: &[usize],
     base_offset: usize,
     base_end: usize,
@@ -1020,7 +1020,7 @@ impl CommandOp for VerifyKnnOp {
 
         // -- Open indices reader (type-independent) ---------------------------
 
-        let indices_reader = match MmapVectorReader::<i32>::open_ivec(&indices_path) {
+        let indices_reader = match XvecReader::<i32>::open_path(&indices_path) {
             Ok(r) => r,
             Err(e) => {
                 return error_result(
@@ -1031,8 +1031,8 @@ impl CommandOp for VerifyKnnOp {
         };
 
         let indices_count =
-            <MmapVectorReader<i32> as VectorReader<i32>>::count(&indices_reader);
-        let k = <MmapVectorReader<i32> as VectorReader<i32>>::dim(&indices_reader);
+            <XvecReader<i32> as VectorReader<i32>>::count(&indices_reader);
+        let k = <XvecReader<i32> as VectorReader<i32>>::dim(&indices_reader);
 
         // -- Detect element type and dispatch ---------------------------------
 
@@ -1073,7 +1073,7 @@ impl CommandOp for VerifyKnnOp {
 
         let verifications = match etype {
             ElementType::F32 => {
-                let base_reader = match MmapVectorReader::<f32>::open_fvec(&base_path) {
+                let base_reader = match XvecReader::<f32>::open_path(&base_path) {
                     Ok(r) => Arc::new(r),
                     Err(e) => {
                         return error_result(
@@ -1082,7 +1082,7 @@ impl CommandOp for VerifyKnnOp {
                         )
                     }
                 };
-                let query_reader = match MmapVectorReader::<f32>::open_fvec(&query_path) {
+                let query_reader = match XvecReader::<f32>::open_path(&query_path) {
                     Ok(r) => r,
                     Err(e) => {
                         return error_result(
@@ -1093,7 +1093,7 @@ impl CommandOp for VerifyKnnOp {
                 };
 
                 let file_count =
-                    <MmapVectorReader<f32> as VectorReader<f32>>::count(&*base_reader);
+                    <XvecReader<f32> as VectorReader<f32>>::count(&*base_reader);
                 let (base_offset, base_end) =
                     base_source.effective_range(file_count);
 
@@ -1116,7 +1116,7 @@ impl CommandOp for VerifyKnnOp {
             }
             ElementType::F16 => {
                 let base_reader =
-                    match MmapVectorReader::<half::f16>::open_mvec(&base_path) {
+                    match XvecReader::<half::f16>::open_path(&base_path) {
                         Ok(r) => Arc::new(r),
                         Err(e) => {
                             return error_result(
@@ -1130,7 +1130,7 @@ impl CommandOp for VerifyKnnOp {
                         }
                     };
                 let query_reader =
-                    match MmapVectorReader::<half::f16>::open_mvec(&query_path) {
+                    match XvecReader::<half::f16>::open_path(&query_path) {
                         Ok(r) => r,
                         Err(e) => {
                             return error_result(
@@ -1145,7 +1145,7 @@ impl CommandOp for VerifyKnnOp {
                     };
 
                 let file_count =
-                    <MmapVectorReader<half::f16> as VectorReader<half::f16>>::count(
+                    <XvecReader<half::f16> as VectorReader<half::f16>>::count(
                         &*base_reader,
                     );
                 let (base_offset, base_end) =
@@ -1169,7 +1169,7 @@ impl CommandOp for VerifyKnnOp {
                 )
             }
             ElementType::F64 => {
-                let base_reader = match MmapVectorReader::<f64>::open_dvec(&base_path) {
+                let base_reader = match XvecReader::<f64>::open_path(&base_path) {
                     Ok(r) => Arc::new(r),
                     Err(e) => {
                         return error_result(
@@ -1178,7 +1178,7 @@ impl CommandOp for VerifyKnnOp {
                         )
                     }
                 };
-                let query_reader = match MmapVectorReader::<f64>::open_dvec(&query_path) {
+                let query_reader = match XvecReader::<f64>::open_path(&query_path) {
                     Ok(r) => r,
                     Err(e) => {
                         return error_result(
@@ -1189,7 +1189,7 @@ impl CommandOp for VerifyKnnOp {
                 };
 
                 let file_count =
-                    <MmapVectorReader<f64> as VectorReader<f64>>::count(&*base_reader);
+                    <XvecReader<f64> as VectorReader<f64>>::count(&*base_reader);
                 let (base_offset, base_end) =
                     base_source.effective_range(file_count);
 

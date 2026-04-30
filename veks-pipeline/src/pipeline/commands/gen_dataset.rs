@@ -21,7 +21,7 @@ use std::time::Instant;
 
 use rand::Rng;
 use vectordata::VectorReader;
-use vectordata::io::MmapVectorReader;
+use vectordata::io::XvecReader;
 
 use crate::pipeline::command::{
     CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options, Status, StreamContext,
@@ -424,13 +424,13 @@ fn compute_ground_truth(
         .ok_or_else(|| format!("unknown distance metric: {}", distance_name))?;
     let dist_fn = simd_distance::select_distance_fn(metric);
 
-    let base = MmapVectorReader::<f32>::open_fvec(base_path)
+    let base = XvecReader::<f32>::open_path(base_path)
         .map_err(|e| format!("failed to open base {}: {}", base_path.display(), e))?;
-    let query = MmapVectorReader::<f32>::open_fvec(query_path)
+    let query = XvecReader::<f32>::open_path(query_path)
         .map_err(|e| format!("failed to open query {}: {}", query_path.display(), e))?;
 
-    let base_count = <MmapVectorReader<f32> as VectorReader<f32>>::count(&base);
-    let query_count = <MmapVectorReader<f32> as VectorReader<f32>>::count(&query);
+    let base_count = <XvecReader<f32> as VectorReader<f32>>::count(&base);
+    let query_count = <XvecReader<f32> as VectorReader<f32>>::count(&query);
 
     let mut idx_file = std::io::BufWriter::new(
         safe_create_file(indices_path)
@@ -605,24 +605,24 @@ mod tests {
         assert!(out_dir.join("dataset.yaml").exists());
 
         // Verify base file dimensions
-        let reader = MmapVectorReader::<f32>::open_fvec(&out_dir.join("base.fvec")).unwrap();
+        let reader = XvecReader::<f32>::open_path(&out_dir.join("base.fvec")).unwrap();
         assert_eq!(
-            <MmapVectorReader<f32> as VectorReader<f32>>::count(&reader),
+            <XvecReader<f32> as VectorReader<f32>>::count(&reader),
             20
         );
         assert_eq!(
-            <MmapVectorReader<f32> as VectorReader<f32>>::dim(&reader),
+            <XvecReader<f32> as VectorReader<f32>>::dim(&reader),
             4
         );
 
         // Verify indices file
-        let idx_reader = MmapVectorReader::<i32>::open_ivec(&out_dir.join("indices.ivec")).unwrap();
+        let idx_reader = XvecReader::<i32>::open_path(&out_dir.join("indices.ivec")).unwrap();
         assert_eq!(
-            <MmapVectorReader<i32> as VectorReader<i32>>::count(&idx_reader),
+            <XvecReader<i32> as VectorReader<i32>>::count(&idx_reader),
             5
         );
         assert_eq!(
-            <MmapVectorReader<i32> as VectorReader<i32>>::dim(&idx_reader),
+            <XvecReader<i32> as VectorReader<i32>>::dim(&idx_reader),
             3
         );
     }
@@ -723,7 +723,7 @@ mod tests {
         compute_ground_truth(&base_path, &query_path, &idx_path, &dist_path, 2, "L2").unwrap();
 
         // Nearest to [0.5, 0] should be [0,0] (d=0.5) and [1,0] (d=0.5)
-        let reader = MmapVectorReader::<i32>::open_ivec(&idx_path).unwrap();
+        let reader = XvecReader::<i32>::open_path(&idx_path).unwrap();
         let indices = reader.get(0).unwrap();
         // Both base[0] and base[1] are distance 0.5; base[2] is distance 9.5
         assert!(indices.contains(&0) && indices.contains(&1));

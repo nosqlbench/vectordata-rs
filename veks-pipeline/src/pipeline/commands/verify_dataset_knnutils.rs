@@ -41,7 +41,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use vectordata::VectorReader;
-use vectordata::io::MmapVectorReader;
+use vectordata::io::XvecReader;
 
 use crate::pipeline::command::{
     ArtifactManifest, CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole,
@@ -105,10 +105,10 @@ fn check_fvecs(
     tol_zero: f64,
     ui: &veks_core::ui::UiHandle,
 ) -> Result<FvecsCheckResult, String> {
-    let reader = MmapVectorReader::<f32>::open_fvec(path)
+    let reader = XvecReader::<f32>::open_path(path)
         .map_err(|e| format!("open {}: {}", path.display(), e))?;
-    let count = <MmapVectorReader<f32> as VectorReader<f32>>::count(&reader);
-    let dim = <MmapVectorReader<f32> as VectorReader<f32>>::dim(&reader);
+    let count = <XvecReader<f32> as VectorReader<f32>>::count(&reader);
+    let dim = <XvecReader<f32> as VectorReader<f32>>::dim(&reader);
 
     if count == 0 || dim == 0 {
         return Err(format!("{}: empty file (count={}, dim={})", path.display(), count, dim));
@@ -184,10 +184,10 @@ fn check_ivecs(
     max_valid_ordinal: usize,
     ui: &veks_core::ui::UiHandle,
 ) -> Result<IvecsCheckResult, String> {
-    let reader = MmapVectorReader::<i32>::open_ivec(path)
+    let reader = XvecReader::<i32>::open_path(path)
         .map_err(|e| format!("open {}: {}", path.display(), e))?;
-    let num_rows = <MmapVectorReader<i32> as VectorReader<i32>>::count(&reader);
-    let row_length = <MmapVectorReader<i32> as VectorReader<i32>>::dim(&reader);
+    let num_rows = <XvecReader<i32> as VectorReader<i32>>::count(&reader);
+    let row_length = <XvecReader<i32> as VectorReader<i32>>::dim(&reader);
 
     let mut max_ordinal: i32 = -1;
     let mut duplicate_rows: usize = 0;
@@ -425,8 +425,8 @@ checks, in a single pipeline step.
         // Banner: tell the user up-front what's about to happen and at
         // what scale. Cheap to compute — just peek at the query file
         // header for the total count via mmap.
-        let query_total = MmapVectorReader::<f32>::open_fvec(&query_path)
-            .map(|r| <MmapVectorReader<f32> as VectorReader<f32>>::count(&r))
+        let query_total = XvecReader::<f32>::open_path(&query_path)
+            .map(|r| <XvecReader<f32> as VectorReader<f32>>::count(&r))
             .ok();
         let actual_sample = sample_count.min(query_total.unwrap_or(sample_count));
         let total_str = match query_total {
@@ -610,19 +610,19 @@ checks, in a single pipeline step.
             actual_sample, query_result.count, metric_str, k));
 
         // Recompute KNN for sampled queries using BLAS sgemm
-        let base_reader = MmapVectorReader::<f32>::open_fvec(&base_path)
+        let base_reader = XvecReader::<f32>::open_path(&base_path)
             .map_err(|e| format!("reopen base: {}", e));
         let base_reader = match base_reader {
             Ok(r) => r,
             Err(e) => return error_result(e, start),
         };
-        let query_reader = MmapVectorReader::<f32>::open_fvec(&query_path)
+        let query_reader = XvecReader::<f32>::open_path(&query_path)
             .map_err(|e| format!("reopen query: {}", e));
         let query_reader = match query_reader {
             Ok(r) => r,
             Err(e) => return error_result(e, start),
         };
-        let gt_reader = MmapVectorReader::<i32>::open_ivec(&indices_path)
+        let gt_reader = XvecReader::<i32>::open_path(&indices_path)
             .map_err(|e| format!("reopen gt: {}", e));
         let gt_reader = match gt_reader {
             Ok(r) => r,

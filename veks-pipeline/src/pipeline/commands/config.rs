@@ -32,21 +32,14 @@ pub(crate) fn settings_path() -> PathBuf {
 
 /// Resolve the configured cache directory from settings.yaml.
 ///
-/// Returns the `cache_dir` from `~/.config/vectordata/settings.yaml`,
-/// or a default fallback if not configured.
+/// Delegates to [`vectordata::settings::cache_dir`] — the single
+/// source of truth for cache resolution shared with the
+/// `vectordata` crate. Without this delegation, the two parsers
+/// would have to be kept in sync by hand and could (and did)
+/// drift, leaving users with their `cache_dir:` setting silently
+/// honored by one path and ignored by another.
 pub fn configured_cache_dir() -> PathBuf {
-    let path = settings_path();
-    if let Ok(s) = Settings::load(&path) {
-        if let Some(ref dir) = s.cache_dir {
-            return PathBuf::from(dir);
-        }
-    }
-    // Fallback
-    if let Some(home) = std::env::var_os("HOME") {
-        PathBuf::from(home).join(".cache").join("vectordata")
-    } else {
-        PathBuf::from(".cache/vectordata")
-    }
+    vectordata::settings::cache_dir()
 }
 
 /// Simple settings representation.
