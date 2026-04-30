@@ -41,7 +41,7 @@ serde_yaml = "0.9"
 signal-hook = "0.3"
 simsimd = "6"
 unicode-width = "0.2"
-slabtastic = { path = "../slabtastic", version = "0.17.0" }
+slabtastic = { path = "../slabtastic", version = "1.0.0" }
 vectordata = { path = "../vectordata", version = "1.0.0" }
 veks-core = { path = "../veks-core", version = "1.0.0" }
 veks-pipeline = { path = "../veks-pipeline", version = "1.0.0" }

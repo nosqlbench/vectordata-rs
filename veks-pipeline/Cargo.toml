@@ -47,7 +47,7 @@ hex = "0.4"
 quick-xml = "0.36"
 signal-hook = "0.3"
 simsimd = "6"
-slabtastic = { path = "../slabtastic", version = "0.17.0" }
+slabtastic = { path = "../slabtastic", version = "1.0.0" }
 tempfile = "3"
 tokio = { version = "1", features = ["full"] }
 vectordata = { path = "../vectordata", version = "1.0.0" }

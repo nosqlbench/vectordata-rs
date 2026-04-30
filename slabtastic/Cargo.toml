@@ -1,6 +1,6 @@
 [package]
 name = "slabtastic"
-version = "0.17.0"
+version = "1.0.0"
 edition = "2024"
 description = "A streamable, readable, writeable, randomly accessible file format"
 license = "Apache-2.0"
