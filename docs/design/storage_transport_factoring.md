@@ -205,6 +205,38 @@ bypassing the cache; variable-length vvec having no cached path at
 all) are impossible by construction once every shape adapter routes
 through `Storage`.
 
+## Strict prebuffer contract and cross-instance lazy promotion
+
+`Storage::prebuffer` honours a strict contract: when `Ok(())`
+returns, every byte is locally accessible *and* mmap-promoted.
+There is no variant where this is a no-op. In particular:
+
+- `Storage::Mmap` returns immediately (already resident).
+- `Storage::Cached` downloads + merkle-verifies every chunk;
+  promotes to mmap; performs a strict completion check after
+  download (any unverified chunk surfaces as an error).
+- `Storage::Http` (no `.mref` published) downloads the whole file
+  via HTTP RANGE into the configured cache directory, atomic-renames
+  into place, mmap-promotes. Server-reported size mismatches surface
+  as an error.
+
+Across `Storage` instances pointed at the same source, promotion
+propagates lazily: `mmap_slice`, `mmap_base`, `is_complete`, and
+`is_local` all consult both the in-memory channel state and (for
+`Cached`) the on-disk `.mrkl` state, then mmap-promote on the spot
+when they see completion. This guarantees the downstream pattern of
+"open reader X at session-init; later, run prebuffer on a separate
+storage; per-cycle reads on X must be zero-copy" works without
+requiring callers to re-open or otherwise refresh X.
+
+`view.prebuffer_all_with_progress` and
+`group.prebuffer_all_profiles_with_progress` propagate per-facet
+failure as `Err` instead of silently skipping. The latter also
+fires an advisory `warn_cb(total_bytes)` once before any download
+when the announced cross-profile total exceeds
+`PREBUFFER_LARGE_WARNING_BYTES` (250 MiB) — purely advisory,
+prebuffer continues regardless.
+
 ## Per-facet dispatch and mixed-transport datasets
 
 Source resolution in `TestDataView` is per-facet, so a single

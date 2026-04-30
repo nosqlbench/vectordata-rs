@@ -123,7 +123,7 @@ pub mod view;
 /// Prefer [`catalog::resolver::Catalog::open`] for name-based access.
 pub mod group;
 
-pub use group::TestDataGroup;
+pub use group::{TestDataGroup, PREBUFFER_LARGE_WARNING_BYTES};
 pub use model::FacetConfig;
 pub use view::{
     CacheStats, FacetDescriptor, FacetStorage, PrebufferProgress, TestDataView,

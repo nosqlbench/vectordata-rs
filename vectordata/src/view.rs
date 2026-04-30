@@ -201,53 +201,66 @@ pub trait TestDataView: Send + Sync {
 
     // -- Prebuffer / cache --
 
-    /// Force-download every standard facet of this profile into the
-    /// local cache so subsequent reads are zero-copy. Local-mmap
-    /// facets and direct-HTTP (no `.mref`) facets no-op silently.
-    ///
-    /// The default implementation walks `facet_manifest()` and calls
-    /// `prebuffer()` on each opened reader. Profile implementations
-    /// may override to parallelise or to filter by facet kind.
+    /// Drive every facet of this profile to fully-resident,
+    /// zero-copy state. **Strict contract**: returning `Ok(())`
+    /// means every facet is local and mmap-promoted. Local-mmap
+    /// facets are already complete (no work). Cached-remote and
+    /// direct-HTTP-without-`.mref` facets are downloaded fully and
+    /// promoted. Per-facet failure surfaces as `Err` — callers
+    /// cannot continue with partial state.
     fn prebuffer_all(&self) -> Result<()> {
         self.prebuffer_all_with_progress(&mut |_, _| {})
     }
 
     /// Same as [`prebuffer_all`] with a callback fired per facet
-    /// when its underlying download completes. The callback receives
-    /// the facet name and a progress snapshot.
+    /// after its download completes. The callback receives the
+    /// facet name and a progress snapshot.
+    ///
+    /// **Strict contract**: returning `Ok(())` means every declared
+    /// facet is fully resident and zero-copy ready. Per-facet
+    /// failure is propagated as `Err`, never swallowed — callers
+    /// cannot accidentally continue with partial state.
     ///
     /// `cb` is taken by `&mut dyn` rather than as a generic parameter
     /// so this trait remains dyn-compatible (consumers receive
     /// `Arc<dyn TestDataView>` from the catalog API).
     fn prebuffer_all_with_progress(&self, cb: &mut dyn FnMut(&str, &PrebufferProgress)) -> Result<()> {
         for (name, _desc) in self.facet_manifest() {
-            // Try element-typed open first so scalar metadata facets
-            // (e.g., metadata_content.u8) get the same prebuffer path
-            // as vector facets.
-            let etype = match self.facet_element_type(&name) {
-                Ok(e) => e,
-                Err(_) => continue, // unknown extension — skip silently
-            };
-            // Open through TypedReader to get the underlying Storage
-            // and call its prebuffer_with_progress, regardless of the
-            // facet's data shape (uniform, scalar, or vvec).
-            // Width-i64 widening covers every native element type up
-            // to 8 bytes — opens succeed even if the consumer only
-            // ever reads it as i32 etc.
-            match self.open_facet_storage(&name) {
-                Ok(reader) => {
-                    let _ = reader.prebuffer_with_progress(|p| {
-                        cb(&name, &PrebufferProgress {
-                            verified_chunks: p.completed_chunks(),
-                            total_chunks: p.total_chunks(),
-                            verified_bytes: p.downloaded_bytes(),
-                            total_bytes: p.total_bytes(),
-                        });
-                    });
-                    let _ = etype; // suppressed
-                }
-                Err(_) => continue,
-            }
+            // Skip facets with unrecognised extensions (e.g., layout
+            // sidecars) — they're not data facets the typed reader
+            // API would touch.
+            if self.facet_element_type(&name).is_err() { continue; }
+
+            let storage = self.open_facet_storage(&name)
+                .map_err(|e| Error::Other(format!("open '{name}' for prebuffer: {e}")))?;
+
+            // Capture the latest progress snapshot from the inner
+            // callback. The inner callback only fires when there
+            // was actual download work; for facets that were
+            // already complete (local mmap, or cache hot from a
+            // prior run) the inner cb never fires. We still want
+            // the per-facet outer cb to announce the facet as
+            // resident.
+            let snap = std::cell::RefCell::new(None::<PrebufferProgress>);
+            storage.prebuffer_with_progress(|p| {
+                *snap.borrow_mut() = Some(PrebufferProgress {
+                    verified_chunks: p.completed_chunks(),
+                    total_chunks: p.total_chunks(),
+                    verified_bytes: p.downloaded_bytes(),
+                    total_bytes: p.total_bytes(),
+                });
+            }).map_err(|e| Error::Other(format!("prebuffer '{name}': {e}")))?;
+
+            // Always fire the outer callback once per facet so
+            // consumers can rely on "every declared facet was
+            // visited and is resident".
+            let progress = snap.into_inner().unwrap_or(PrebufferProgress {
+                verified_chunks: 0,
+                total_chunks: 0,
+                verified_bytes: 0,
+                total_bytes: storage.total_size(),
+            });
+            cb(&name, &progress);
         }
         Ok(())
     }
@@ -331,6 +344,12 @@ impl FacetStorage {
     pub(crate) fn new(storage: std::sync::Arc<crate::storage::Storage>) -> Self {
         Self { storage }
     }
+    /// Drive this facet to fully-resident, zero-copy state.
+    /// **Strict**: returns `Err` on any failure — never silently
+    /// leaves the facet in a partially-resident state. After
+    /// `Ok(())`, every read on every reader against this source
+    /// (this `FacetStorage` and any other) takes the zero-copy
+    /// path on next access.
     pub fn prebuffer(&self) -> std::io::Result<()> { self.storage.prebuffer() }
     pub fn prebuffer_with_progress<F>(&self, cb: F) -> std::io::Result<()>
     where F: FnMut(&crate::transport::DownloadProgress)

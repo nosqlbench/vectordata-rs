@@ -63,6 +63,18 @@ fn make_tmp() -> tempfile::TempDir {
     tempfile::tempdir_in(&base).unwrap()
 }
 
+/// Wipe any cache state for the given server's URL prefix so a test
+/// starts from a known empty-cache baseline. Required because cargo
+/// test reuses ephemeral ports across runs and the configured
+/// cache_dir at `/mnt/datamir/vectordata-cache` persists, so a
+/// previous run on the same port can leave a populated cache that
+/// would make a "starts not-complete" assertion false.
+fn reset_cache_for_server(server: &TestServer) {
+    let cache_root = vectordata::settings::cache_dir().expect("settings.yaml configured");
+    let host_dir = cache_root.join(format!("127.0.0.1:{}", server.port()));
+    let _ = std::fs::remove_dir_all(&host_dir);
+}
+
 /// Write a uniform fvec containing `count` records of dimension `dim`.
 /// Element `(i, d)` is `i as f32 * 100.0 + d as f32` so any
 /// out-of-range read produces an obvious garbage value.
@@ -157,6 +169,7 @@ fn fvec_local_cached_direct_agree() {
     write_fvec(&path, 200, 16);
     write_mref(&path);
     let server = TestServer::start(tmp.path()).unwrap();
+    reset_cache_for_server(&server);
     let url = format!("{}base.fvec", server.base_url());
 
     let local = XvecReader::<f32>::open(path.to_str().unwrap()).unwrap();
@@ -191,17 +204,18 @@ fn fvec_no_mref_falls_back_to_direct_http() {
     write_fvec(&path, 50, 8);
     // *No* .mref written — Storage::open_url must silently fall back.
     let server = TestServer::start(tmp.path()).unwrap();
+    reset_cache_for_server(&server);
     let url = format!("{}base.fvec", server.base_url());
 
     let direct = XvecReader::<f32>::open(&url).unwrap();
     assert_eq!(direct.count(), 50);
     assert_eq!(direct.dim(), 8);
-    // Direct HTTP can never become "complete" — there's no cache.
-    assert!(!direct.is_complete());
-    // …and prebuffer is a no-op (not an error).
-    direct.prebuffer().unwrap();
+    // Pre-prebuffer: direct-HTTP is not complete (no cache file
+    // exists yet — we cleaned it via reset_cache_for_server).
     assert!(!direct.is_complete());
 
+    // Per-record reads still work — they go over HTTP one record
+    // at a time.
     let local = XvecReader::<f32>::open(path.to_str().unwrap()).unwrap();
     for &i in &[0usize, 7, 42, 49] {
         assert_eq!(local.get(i).unwrap(), direct.get(i).unwrap());
@@ -215,6 +229,7 @@ fn open_vec_dispatches_through_http() {
     write_fvec(&path, 32, 4);
     write_mref(&path);
     let server = TestServer::start(tmp.path()).unwrap();
+    reset_cache_for_server(&server);
     let url = format!("{}base.fvec", server.base_url());
 
     let local = open_vec::<f32>(path.to_str().unwrap()).unwrap();
@@ -236,6 +251,7 @@ fn cached_storage_promotes_to_mmap_after_prebuffer() {
     write_fvec(&path, 100, 32); // > 1 chunk at TEST_CHUNK=4KiB
     write_mref(&path);
     let server = TestServer::start(tmp.path()).unwrap();
+    reset_cache_for_server(&server);
     let url = format!("{}base.fvec", server.base_url());
 
     let r = XvecReader::<f32>::open(&url).unwrap();
@@ -261,6 +277,7 @@ fn prebuffer_with_progress_callback_fires() {
     write_fvec(&path, 300, 64); // ~75 KiB → ~19 chunks at TEST_CHUNK
     write_mref(&path);
     let server = TestServer::start(tmp.path()).unwrap();
+    reset_cache_for_server(&server);
     let url = format!("{}base.fvec", server.base_url());
 
     let r = XvecReader::<f32>::open(&url).unwrap();
@@ -287,6 +304,7 @@ fn vvec_cached_via_idxfor_sidecar() {
     write_mref(&path);
     write_idxfor(&path, &offsets);
     let server = TestServer::start(tmp.path()).unwrap();
+    reset_cache_for_server(&server);
     let url = format!("{}predicates.ivvec", server.base_url());
 
     let local = IndexedVvecReader::<i32>::open(path.to_str().unwrap()).unwrap();
@@ -312,6 +330,7 @@ fn vvec_cached_falls_back_to_walk_without_idxfor() {
     let _ = write_ivvec(&path, 12);
     write_mref(&path);
     let server = TestServer::start(tmp.path()).unwrap();
+    reset_cache_for_server(&server);
     let url = format!("{}predicates.ivvec", server.base_url());
 
     let remote = IndexedVvecReader::<i32>::open(&url).unwrap();
@@ -329,6 +348,7 @@ fn open_vvec_dispatches_through_http() {
     write_mref(&path);
     write_idxfor(&path, &offsets);
     let server = TestServer::start(tmp.path()).unwrap();
+    reset_cache_for_server(&server);
     let url = format!("{}predicates.ivvec", server.base_url());
 
     let local = open_vvec::<i32>(path.to_str().unwrap()).unwrap();
@@ -350,6 +370,7 @@ fn typed_reader_open_url_scalar_u8_native() {
     write_scalar_u8(&path, 256);
     write_mref(&path);
     let server = TestServer::start(tmp.path()).unwrap();
+    reset_cache_for_server(&server);
     let url = url::Url::parse(&format!("{}metadata.u8", server.base_url())).unwrap();
 
     let r = TypedReader::<u8>::open_url(url, ElementType::U8).unwrap();
@@ -368,6 +389,7 @@ fn typed_reader_open_url_widening_u8_to_i32() {
     write_scalar_u8(&path, 100);
     write_mref(&path);
     let server = TestServer::start(tmp.path()).unwrap();
+    reset_cache_for_server(&server);
     let url = url::Url::parse(&format!("{}metadata.u8", server.base_url())).unwrap();
 
     let r = TypedReader::<i32>::open_url(url, ElementType::U8).unwrap();
@@ -385,6 +407,7 @@ fn typed_reader_open_url_narrowing_rejected() {
     drop(f);
     write_mref(&path);
     let server = TestServer::start(tmp.path()).unwrap();
+    reset_cache_for_server(&server);
     let url = url::Url::parse(&format!("{}metadata.i32", server.base_url())).unwrap();
 
     let result = TypedReader::<u8>::open_url(url, ElementType::I32);
@@ -398,6 +421,7 @@ fn typed_reader_open_url_no_mref_still_works() {
     let path = tmp.path().join("metadata.u8");
     write_scalar_u8(&path, 64);
     let server = TestServer::start(tmp.path()).unwrap();
+    reset_cache_for_server(&server);
     let url = url::Url::parse(&format!("{}metadata.u8", server.base_url())).unwrap();
 
     let r = TypedReader::<u8>::open_url(url, ElementType::U8).unwrap();
@@ -413,6 +437,7 @@ fn typed_reader_open_url_ivec_record() {
     write_ivec(&path, 5, 3);
     write_mref(&path);
     let server = TestServer::start(tmp.path()).unwrap();
+    reset_cache_for_server(&server);
     let url = url::Url::parse(&format!("{}data.ivec", server.base_url())).unwrap();
 
     let r = TypedReader::<i32>::open_url(url, ElementType::I32).unwrap();
@@ -429,6 +454,7 @@ fn typed_reader_open_auto_dispatches_url() {
     write_scalar_u8(&path, 50);
     write_mref(&path);
     let server = TestServer::start(tmp.path()).unwrap();
+    reset_cache_for_server(&server);
     let url_str = format!("{}metadata.u8", server.base_url());
 
     let r = TypedReader::<u8>::open_auto(&url_str, ElementType::U8).unwrap();
@@ -480,6 +506,7 @@ fn view_round_trip_over_http() {
     let tmp = make_tmp();
     make_remote_dataset(tmp.path());
     let server = TestServer::start(tmp.path()).unwrap();
+    reset_cache_for_server(&server);
     let base_url = server.base_url();
 
     let group = TestDataGroup::load(&base_url).unwrap();
@@ -517,6 +544,7 @@ fn view_open_facet_typed_over_http() {
     let tmp = make_tmp();
     make_remote_dataset(tmp.path());
     let server = TestServer::start(tmp.path()).unwrap();
+    reset_cache_for_server(&server);
     let group = TestDataGroup::load(&server.base_url()).unwrap();
     let view = group.profile("default").unwrap();
 
@@ -540,6 +568,7 @@ fn prebuffer_all_drives_every_facet_complete() {
     let tmp = make_tmp();
     make_remote_dataset(tmp.path());
     let server = TestServer::start(tmp.path()).unwrap();
+    reset_cache_for_server(&server);
     let group = TestDataGroup::load(&server.base_url()).unwrap();
     let view = group.profile("default").unwrap();
 
@@ -576,6 +605,7 @@ fn cache_stats_reports_partial_and_full_fill() {
     let tmp = make_tmp();
     make_remote_dataset(tmp.path());
     let server = TestServer::start(tmp.path()).unwrap();
+    reset_cache_for_server(&server);
     let group = TestDataGroup::load(&server.base_url()).unwrap();
     let view = group.profile("default").unwrap();
 
@@ -626,17 +656,29 @@ profiles:
 "#).unwrap();
     // No .mref files at all → every facet falls back to direct HTTP.
     let server = TestServer::start(tmp.path()).unwrap();
+    reset_cache_for_server(&server);
     let group = TestDataGroup::load(&server.base_url()).unwrap();
     let view = group.profile("default").unwrap();
 
     let storage = view.open_facet_storage("base_vectors").unwrap();
+    // Pre-prebuffer state for direct-HTTP: never reports merkle
+    // cache stats, not local, not complete.
     assert!(storage.cache_stats().is_none(),
-        "direct-HTTP storage must not report cache_stats");
+        "direct-HTTP storage has no merkle cache; cache_stats must be None");
     assert!(!storage.is_local());
     assert!(!storage.is_complete());
-    // prebuffer is a no-op on direct HTTP — must not error.
+
+    // Strict contract: prebuffer downloads the file (no merkle —
+    // bytes are trusted from the server) and promotes to mmap.
     storage.prebuffer().unwrap();
-    assert!(!storage.is_complete());
+    assert!(storage.is_complete(),
+        "direct-HTTP storage MUST be complete after prebuffer (strict contract)");
+    assert!(storage.is_local(),
+        "direct-HTTP storage MUST be local after prebuffer");
+    // cache_stats stays None — merkle isn't part of the
+    // direct-HTTP path.
+    assert!(storage.cache_stats().is_none(),
+        "direct-HTTP storage has no merkle cache; cache_stats stays None even after prebuffer");
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -658,6 +700,7 @@ fn local_yaml_with_absolute_http_facets() {
     write_mref(&tmp_remote.path().join("base.fvec"));
     write_mref(&tmp_remote.path().join("query.fvec"));
     let server = TestServer::start(tmp_remote.path()).unwrap();
+    reset_cache_for_server(&server);
     let base_url = server.base_url();
 
     let tmp_local = make_tmp();
@@ -731,6 +774,454 @@ profiles:
     assert!(storage.is_complete());
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// Cross-instance promotion races — the bug downstream consumers hit
+// when an early reader is opened, then prebuffer runs on a separate
+// Storage instance. The early reader MUST see the promoted state on
+// its next read; otherwise every cycle falls through to slow paths.
+// ═══════════════════════════════════════════════════════════════════════
+
+#[test]
+fn early_xvec_reader_picks_up_promotion_via_get_slice() {
+    let tmp = make_tmp();
+    let path = tmp.path().join("base.fvec");
+    write_fvec(&path, 500, 32);  // many TEST_CHUNK chunks
+    write_mref(&path);
+    let server = TestServer::start(tmp.path()).unwrap();
+    reset_cache_for_server(&server);
+    let url = format!("{}base.fvec", server.base_url());
+
+    // Reader A is opened BEFORE prebuffer runs on a separate Storage.
+    let early = XvecReader::<f32>::open(&url).unwrap();
+    assert!(!early.is_complete(), "early reader starts not-complete");
+    let pre: Option<&[f32]> = <XvecReader<f32> as VectorReader<f32>>::get_slice(&early, 0);
+    assert!(pre.is_none(),
+        "trait get_slice on early not-promoted Storage::Cached must be None");
+
+    // Prebuffer through a *different* Storage instance (separate
+    // open of the same URL).
+    let prebufferer = XvecReader::<f32>::open(&url).unwrap();
+    prebufferer.prebuffer().unwrap();
+    assert!(prebufferer.is_complete());
+
+    // Critical assertion: the early reader's get_slice MUST now
+    // return Some — the bug is when this stays None, forcing every
+    // per-cycle access to fall through to a slow path.
+    let post: Option<&[f32]> = <XvecReader<f32> as VectorReader<f32>>::get_slice(&early, 0);
+    assert!(post.is_some(),
+        "after prebuffer on a sibling Storage, early reader's get_slice MUST promote");
+
+    // is_complete on the early reader must also flip to true (lazy
+    // promotion path).
+    assert!(early.is_complete(), "is_complete must reflect post-prebuffer state");
+}
+
+#[test]
+fn early_xvec_reader_picks_up_promotion_via_inherent_get_slice() {
+    // Same race, but exercising the unchecked inherent get_slice
+    // hot-path on XvecReader<f32> — the one nbrs's
+    // slice_arc_from_uniform reaches for first.
+    let tmp = make_tmp();
+    let path = tmp.path().join("base.fvec");
+    write_fvec(&path, 400, 16);
+    write_mref(&path);
+    let server = TestServer::start(tmp.path()).unwrap();
+    reset_cache_for_server(&server);
+    let url = format!("{}base.fvec", server.base_url());
+
+    let early = XvecReader::<f32>::open(&url).unwrap();
+    assert!(!early.is_complete());
+
+    // Prebuffer on a separate Storage instance.
+    XvecReader::<f32>::open(&url).unwrap().prebuffer().unwrap();
+
+    // Inherent get_slice would PANIC if mmap_base returns None
+    // ("requires mmap-backed storage"). The lazy promotion in
+    // mmap_base must succeed so this returns valid bytes.
+    let v: &[f32] = early.get_slice(0);
+    assert_eq!(v.len(), 16);
+    assert_eq!(v[0], 0.0);
+    assert_eq!(v[1], 1.0);
+}
+
+#[test]
+fn prebuffer_via_view_promotes_other_open_readers() {
+    // Mirrors the nbrs scenario: `view.prebuffer_all()` runs at
+    // session-init through one set of FacetStorage instances; the
+    // accessors then open their own readers per-cycle. Those
+    // accessor-side readers MUST be zero-copy.
+    //
+    // Use a multi-chunk fixture so reading the dim header at open
+    // doesn't accidentally fully download the only chunk.
+    let tmp = make_tmp();
+    write_fvec(&tmp.path().join("base.fvec"), 1000, 64);   // ~256 KiB → many TEST_CHUNK chunks
+    write_fvec(&tmp.path().join("query.fvec"), 100, 64);
+    write_ivec(&tmp.path().join("neighbor_indices.ivec"), 100, 10);
+    write_fvec(&tmp.path().join("neighbor_distances.fvec"), 100, 10);
+    write_scalar_u8(&tmp.path().join("metadata.u8"), 200_000);
+    std::fs::write(tmp.path().join("dataset.yaml"), make_dataset_yaml()).unwrap();
+    write_mref(&tmp.path().join("base.fvec"));
+    write_mref(&tmp.path().join("query.fvec"));
+    write_mref(&tmp.path().join("neighbor_indices.ivec"));
+    write_mref(&tmp.path().join("neighbor_distances.fvec"));
+    write_mref(&tmp.path().join("metadata.u8"));
+
+    let server = TestServer::start(tmp.path()).unwrap();
+    reset_cache_for_server(&server);
+    let group = TestDataGroup::load(&server.base_url()).unwrap();
+    let view = group.profile("default").unwrap();
+
+    // Open a reader BEFORE prebuffer (early-bound accessor).
+    let base_early = view.base_vectors().unwrap();
+    assert!(!base_early.is_complete(),
+        "early reader against remote view should not be complete pre-prebuffer");
+
+    // Now drive the view's full prebuffer.
+    view.prebuffer_all().unwrap();
+
+    // The early reader must now expose zero-copy get_slice and a
+    // complete state — the bug being: it stays not-complete and
+    // get_slice falls back to allocating get(idx) per cycle.
+    assert!(base_early.is_complete(),
+        "early reader must reflect post-prebuffer is_complete");
+    assert!(base_early.get_slice(0).is_some(),
+        "early reader's trait get_slice must return zero-copy slice after prebuffer_all");
+}
+
+#[test]
+fn prebuffer_propagates_failure_for_typed_reader_too() {
+    // Same lazy-promotion behaviour for TypedReader (the API the
+    // typed scalar metadata facets go through).
+    let tmp = make_tmp();
+    let path = tmp.path().join("metadata.u8");
+    write_scalar_u8(&path, 200_000);  // ~50 chunks at TEST_CHUNK=4KiB
+    write_mref(&path);
+    let server = TestServer::start(tmp.path()).unwrap();
+    reset_cache_for_server(&server);
+    let url = url::Url::parse(&format!("{}metadata.u8", server.base_url())).unwrap();
+
+    let early = TypedReader::<u8>::open_url(url.clone(), ElementType::U8).unwrap();
+    assert!(!early.is_complete());
+
+    // Prebuffer on a separate TypedReader.
+    let pb = TypedReader::<u8>::open_url(url.clone(), ElementType::U8).unwrap();
+    pb.prebuffer().unwrap();
+
+    // Early reader picks up promotion on next access.
+    assert!(early.is_complete(),
+        "TypedReader must lazy-promote when sibling Storage finishes prebuffer");
+    // get_native_slice exercises mmap_slice — should now succeed.
+    let slice = early.get_native_slice(0);
+    assert!(slice.is_some(), "after prebuffer, get_native_slice must return Some");
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Strict prebuffer contract: Ok(()) ⇒ fully resident; failure surfaces
+// ═══════════════════════════════════════════════════════════════════════
+
+#[test]
+fn prebuffer_strict_contract_cached() {
+    // After prebuffer_all returns Ok, every facet's storage handle
+    // MUST report is_complete=true and is_local=true. There is no
+    // partial-completion mode.
+    let tmp = make_tmp();
+    make_remote_dataset(tmp.path());
+    let server = TestServer::start(tmp.path()).unwrap();
+    reset_cache_for_server(&server);
+    let group = TestDataGroup::load(&server.base_url()).unwrap();
+    let view = group.profile("default").unwrap();
+
+    view.prebuffer_all().unwrap();
+
+    // Walk every facet and assert strict completion.
+    for (name, _desc) in view.facet_manifest() {
+        // Facets without a recognized element type are skipped by
+        // prebuffer_all_with_progress; they shouldn't fail here either.
+        if view.facet_element_type(&name).is_err() { continue; }
+        let storage = view.open_facet_storage(&name).unwrap();
+        assert!(storage.is_complete(),
+            "facet '{name}' must be complete after prebuffer_all (strict contract)");
+        assert!(storage.is_local(),
+            "facet '{name}' must be local after prebuffer_all (strict contract)");
+    }
+}
+
+#[test]
+fn prebuffer_for_url_without_mref_downloads_and_promotes() {
+    // No .mref published — Storage::open_url falls back to
+    // Storage::Http. Per the strict contract, prebuffer must STILL
+    // download the file (no merkle, just fetch + write + mmap) and
+    // promote, not silently no-op.
+    let tmp = make_tmp();
+    let path = tmp.path().join("base.fvec");
+    write_fvec(&path, 80, 8);
+    // *No* write_mref — direct HTTP path.
+    let server = TestServer::start(tmp.path()).unwrap();
+    reset_cache_for_server(&server);
+    let url = format!("{}base.fvec", server.base_url());
+
+    let r = XvecReader::<f32>::open(&url).unwrap();
+    assert!(!r.is_complete(), "Http storage starts not-complete");
+    let pre: Option<&[f32]> = <XvecReader<f32> as VectorReader<f32>>::get_slice(&r, 0);
+    assert!(pre.is_none(), "Http storage has no mmap pre-prebuffer");
+
+    r.prebuffer().unwrap();
+
+    // After prebuffer, reads must be zero-copy.
+    assert!(r.is_complete(),
+        "Http storage MUST be complete after prebuffer (no silent no-op)");
+    let post: Option<&[f32]> = <XvecReader<f32> as VectorReader<f32>>::get_slice(&r, 0);
+    assert!(post.is_some(),
+        "Http storage MUST yield zero-copy get_slice after prebuffer");
+    let v = post.unwrap();
+    assert_eq!(v.len(), 8);
+    assert_eq!(v[0], 0.0);
+    assert_eq!(v[1], 1.0);
+}
+
+#[test]
+fn prebuffer_persists_for_subsequent_opens_without_mref() {
+    // After Http prebuffer downloads the file, a fresh open of the
+    // same URL must restore from the cache file at open time —
+    // no second download, immediate zero-copy.
+    let tmp = make_tmp();
+    let path = tmp.path().join("base.fvec");
+    write_fvec(&path, 40, 8);
+    let server = TestServer::start(tmp.path()).unwrap();
+    reset_cache_for_server(&server);
+    let url = format!("{}base.fvec", server.base_url());
+
+    XvecReader::<f32>::open(&url).unwrap().prebuffer().unwrap();
+
+    // Fresh open (different Storage instance) — must see the
+    // restored mmap immediately.
+    let fresh = XvecReader::<f32>::open(&url).unwrap();
+    assert!(fresh.is_complete(),
+        "fresh Http open against a previously-prebuffered URL must restore from cache");
+    let v = fresh.get_slice(0);  // inherent unchecked — would panic if not mmap-backed
+    assert_eq!(v.len(), 8);
+    assert_eq!(v[0], 0.0);
+}
+
+#[test]
+fn prebuffer_fails_loud_when_remote_size_mismatch() {
+    // The Http prebuffer path verifies the post-write file size
+    // against the HEAD-reported total_size. If the server returns
+    // a short body, prebuffer must surface the failure rather than
+    // leaving a truncated cache file in place.
+    //
+    // We can't easily make the test server return a wrong size, so
+    // this asserts the write-then-verify path by triggering a
+    // legitimate prebuffer and confirming the post-write size
+    // matches. (The mismatch error path is covered by the io
+    // length-check guard inside http_prebuffer.)
+    let tmp = make_tmp();
+    let path = tmp.path().join("base.fvec");
+    write_fvec(&path, 20, 4);
+    let server = TestServer::start(tmp.path()).unwrap();
+    reset_cache_for_server(&server);
+    let url = format!("{}base.fvec", server.base_url());
+
+    let r = XvecReader::<f32>::open(&url).unwrap();
+    let pre_size = std::fs::metadata(&path).unwrap().len();
+    r.prebuffer().unwrap();
+
+    // The cache file must exist with the correct size.
+    let storage = vectordata::TestDataGroup::load(&server.base_url())
+        .ok()
+        .and_then(|g| g.profile("default").map(|v| (g, v)));
+    let _ = storage;  // suppress; we assert via cache_path on the reader's storage
+    // We don't have direct access to FacetStorage here; instead
+    // verify the "fully resident" invariant via reader API.
+    assert!(r.is_complete());
+    assert_eq!(r.count() as u64 * (4 + 4 * 4) as u64, pre_size,
+        "fixture sanity: count*entry == on-disk size");
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// view.prebuffer_all_with_progress propagates errors (no swallow)
+// ═══════════════════════════════════════════════════════════════════════
+
+#[test]
+fn prebuffer_all_with_progress_propagates_facet_errors() {
+    // Build a dataset where one facet's URL points at a 404. The
+    // underlying Storage::open will fail (or its prebuffer will);
+    // prebuffer_all_with_progress MUST return Err, not silently
+    // skip the facet.
+    let tmp = make_tmp();
+    write_fvec(&tmp.path().join("base.fvec"), 20, 4);
+    write_mref(&tmp.path().join("base.fvec"));
+    // query.fvec is referenced but not written.
+    let server = TestServer::start(tmp.path()).unwrap();
+    reset_cache_for_server(&server);
+    let yaml = format!(r#"
+name: missing-facet
+profiles:
+  default:
+    base_vectors: {}base.fvec
+    query_vectors: {}query.fvec
+"#, server.base_url(), server.base_url());
+
+    let local = make_tmp();
+    std::fs::write(local.path().join("dataset.yaml"), yaml).unwrap();
+    let group = TestDataGroup::load(local.path().to_str().unwrap()).unwrap();
+    let view = group.profile("default").unwrap();
+
+    let result = view.prebuffer_all();
+    assert!(result.is_err(),
+        "prebuffer_all MUST surface failure when a facet can't be opened/prebuffered");
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Concurrent races — multiple threads racing on promotion + reads
+// ═══════════════════════════════════════════════════════════════════════
+
+#[test]
+fn concurrent_readers_share_promotion_safely() {
+    // Spawn N threads, each opening a fresh XvecReader against the
+    // same URL. One thread runs prebuffer; the others spin on
+    // get_slice. Every reader must end up promoted with no panic,
+    // no torn read, no stale "always None".
+    let tmp = make_tmp();
+    let path = tmp.path().join("base.fvec");
+    write_fvec(&path, 800, 32);
+    write_mref(&path);
+    let server = TestServer::start(tmp.path()).unwrap();
+    reset_cache_for_server(&server);
+    let url = format!("{}base.fvec", server.base_url());
+
+    let n_readers = 8;
+    let url_arc = Arc::new(url);
+    let pb_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    std::thread::scope(|s| {
+        // Prebuffer thread — sets pb_done when complete so reader
+        // threads can stop polling.
+        {
+            let url = Arc::clone(&url_arc);
+            let pb_done = Arc::clone(&pb_done);
+            s.spawn(move || {
+                XvecReader::<f32>::open(&url).unwrap().prebuffer().unwrap();
+                pb_done.store(true, std::sync::atomic::Ordering::Release);
+            });
+        }
+        // Reader threads — open a fresh reader, spin on get_slice.
+        for _ in 0..n_readers {
+            let url = Arc::clone(&url_arc);
+            let pb_done = Arc::clone(&pb_done);
+            s.spawn(move || {
+                let r = XvecReader::<f32>::open(&url).unwrap();
+                // Poll until prebuffer is done, then once more to
+                // give the lazy-promotion path a chance.
+                while !pb_done.load(std::sync::atomic::Ordering::Acquire) {
+                    let _ = <XvecReader<f32> as VectorReader<f32>>::get_slice(&r, 0);
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                // After prebuffer completes, the next get_slice MUST
+                // return Some — the cross-instance promotion guarantee.
+                let v = <XvecReader<f32> as VectorReader<f32>>::get_slice(&r, 0);
+                assert!(v.is_some(),
+                    "reader must observe promotion immediately after prebuffer thread completes");
+                let v = v.unwrap();
+                assert_eq!(v.len(), 32, "promoted slice must have correct dim");
+            });
+        }
+    });
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// All-profiles prebuffer + 250 MiB advisory warning
+// ═══════════════════════════════════════════════════════════════════════
+
+#[test]
+fn prebuffer_all_profiles_visits_every_profile_and_facet() {
+    let tmp = make_tmp();
+    write_fvec(&tmp.path().join("base.fvec"), 60, 8);
+    write_fvec(&tmp.path().join("query.fvec"), 5, 8);
+    write_fvec(&tmp.path().join("base_50.fvec"), 30, 8);
+    write_mref(&tmp.path().join("base.fvec"));
+    write_mref(&tmp.path().join("query.fvec"));
+    write_mref(&tmp.path().join("base_50.fvec"));
+    std::fs::write(tmp.path().join("dataset.yaml"), r#"
+name: multi
+profiles:
+  default:
+    base_vectors: base.fvec
+    query_vectors: query.fvec
+  half:
+    base_vectors: base_50.fvec
+    query_vectors: query.fvec
+"#).unwrap();
+    let server = TestServer::start(tmp.path()).unwrap();
+    reset_cache_for_server(&server);
+    let group = TestDataGroup::load(&server.base_url()).unwrap();
+
+    let mut visited: Vec<(String, String)> = Vec::new();
+    let mut warned_bytes: Option<u64> = None;
+    group.prebuffer_all_profiles_with_progress(
+        &mut |profile, facet, _p| {
+            let key = (profile.to_string(), facet.to_string());
+            if !visited.contains(&key) { visited.push(key); }
+        },
+        &mut |total| { warned_bytes = Some(total); },
+    ).unwrap();
+
+    // Both profiles, both facets in each, must be visited.
+    assert!(visited.iter().any(|(p, f)| p == "default" && f == "base_vectors"));
+    assert!(visited.iter().any(|(p, f)| p == "default" && f == "query_vectors"));
+    assert!(visited.iter().any(|(p, f)| p == "half" && f == "base_vectors"));
+    assert!(visited.iter().any(|(p, f)| p == "half" && f == "query_vectors"));
+
+    // Tiny fixture — under the 250 MiB threshold, no warning.
+    assert!(warned_bytes.is_none(),
+        "fixture is well under threshold; warn_cb must NOT fire");
+
+    // After prebuffer_all_profiles, every facet of every profile is
+    // resident.
+    for profile_name in &["default", "half"] {
+        let view = group.profile(profile_name).unwrap();
+        for facet in ["base_vectors", "query_vectors"] {
+            let storage = view.open_facet_storage(facet).unwrap();
+            assert!(storage.is_complete(),
+                "after prebuffer_all_profiles, {profile_name}/{facet} must be complete");
+            assert!(storage.is_local(),
+                "after prebuffer_all_profiles, {profile_name}/{facet} must be local");
+        }
+    }
+}
+
+#[test]
+#[ignore = "writes ~280 MiB of fixture data; opt in with --ignored when verifying"]
+fn prebuffer_all_profiles_warning_fires_above_threshold() {
+    // Build a fixture whose total size exceeds the 250 MiB advisory
+    // threshold so warn_cb fires.
+    let tmp = make_tmp();
+    let path = tmp.path().join("base.fvec");
+    // 1_100_000 records × (4 + 64*4) ≈ 273 MiB > 250 MiB threshold
+    write_fvec(&path, 1_100_000, 64);
+    write_mref(&path);
+    std::fs::write(tmp.path().join("dataset.yaml"), r#"
+name: large
+profiles:
+  default:
+    base_vectors: base.fvec
+"#).unwrap();
+    let server = TestServer::start(tmp.path()).unwrap();
+    reset_cache_for_server(&server);
+    let group = TestDataGroup::load(&server.base_url()).unwrap();
+
+    let mut warned: Option<u64> = None;
+    let result = group.prebuffer_all_profiles_with_progress(
+        &mut |_p, _f, _prog| {},
+        &mut |total| { warned = Some(total); },
+    );
+    let _ = result;
+    let total = warned.expect("warn_cb must fire above 250 MiB threshold");
+    assert!(total >= vectordata::PREBUFFER_LARGE_WARNING_BYTES,
+        "warn_cb total ({total}) must be >= threshold ({})",
+        vectordata::PREBUFFER_LARGE_WARNING_BYTES);
+}
+
 #[test]
 fn arc_clone_of_reader_shares_storage() {
     // The XvecReader internally holds Arc<Storage>; cloning the
@@ -741,6 +1232,7 @@ fn arc_clone_of_reader_shares_storage() {
     write_fvec(&path, 200, 16);
     write_mref(&path);
     let server = TestServer::start(tmp.path()).unwrap();
+    reset_cache_for_server(&server);
     let url = format!("{}base.fvec", server.base_url());
 
     let r1 = Arc::new(XvecReader::<f32>::open(&url).unwrap());

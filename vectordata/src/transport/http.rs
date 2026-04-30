@@ -45,6 +45,11 @@ impl HttpTransport {
         }
     }
 
+    /// The remote URL this transport reads from. Used in error
+    /// messages to point operators at the source that needs a
+    /// `.mref` published.
+    pub fn url(&self) -> &Url { &self.url }
+
     /// Probe the remote resource via HEAD to determine size and range support.
     fn probe(&self) -> io::Result<(u64, bool)> {
         let resp = self

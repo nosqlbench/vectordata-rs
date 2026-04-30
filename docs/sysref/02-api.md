@@ -622,32 +622,71 @@ The directory layout under the resolved root is
 Prebuffering downloads every facet of a profile so subsequent reads
 are zero-copy mmap with no further HTTP requests.
 
+#### Strict contract
+
+Every `prebuffer*` API in `vectordata` honours the same strict
+contract:
+
+> **When the call returns `Ok(())`, every facet covered by the call
+> is fully resident on local disk and mmap-promoted. There is no
+> partial-completion mode, no silent no-op variant, and no
+> fallback to a slow per-read path.**
+
+This applies to:
+
+- `Storage::Mmap` → already resident; returns immediately.
+- `Storage::Cached` → downloads + merkle-verifies every chunk;
+  promotes to mmap; errors if any chunk is missing post-download.
+- `Storage::Http` (no `.mref` published) → downloads the whole file
+  via HTTP RANGE into the configured cache directory, atomic-renames
+  into place, mmap-promotes. (No merkle — bytes are trusted from the
+  server. Server-reported size mismatches surface as an error.)
+- `view.prebuffer_all` / `group.prebuffer_all_profiles` →
+  per-facet failure is propagated immediately; no facet is skipped
+  silently.
+
+After a prebuffer call returns `Ok(())`, **every reader against the
+same source — including readers opened *before* the prebuffer call —
+sees the promoted state on its next access** (lazy mmap promotion in
+`mmap_slice` / `mmap_base` / `is_complete` / `is_local`).
+Downstream code that opens a reader at session-init, runs prebuffer,
+and then accesses per-cycle gets the zero-copy fast path on the
+first cycle.
+
 #### From the CLI
 
 ```bash
+# All profiles in the dataset (default — bare name, no profile suffix).
+# Issues a warning to stderr if total cross-profile size exceeds 250 MiB
+# but continues regardless.
 veks datasets prebuffer --dataset my-dataset
+
+# A specific profile only.
 veks datasets prebuffer --dataset my-dataset:default
+
+# Other catalog/cache flags.
 veks datasets prebuffer --dataset my-dataset --at https://host/datasets/
 veks datasets prebuffer --dataset my-dataset --cache-dir /tmp/vd-cache
 ```
 
-#### From Rust
+#### From Rust — single profile
 
 ```rust
 use vectordata::TestDataView;
 
 let view = catalog.open_profile("my-dataset", "default")?;
 
-// Walks every facet declared in the profile, drives each underlying
-// storage to fully-resident state. Local-mmap and direct-HTTP
-// facets no-op silently.
+// Strict: returns Ok(()) only when every facet of this profile is
+// fully resident and zero-copy ready. Per-facet failure is Err.
 view.prebuffer_all()?;
 
-// With per-facet progress
+// With per-facet progress. Callback fires once per declared facet
+// (after that facet's download completes; for already-resident
+// facets it fires once with total_chunks=0).
 view.prebuffer_all_with_progress(&mut |facet, p| {
     let pct = if p.total_chunks > 0 {
         100.0 * p.verified_chunks as f64 / p.total_chunks as f64
-    } else { 0.0 };
+    } else { 100.0 };
     eprintln!("  {facet}: {:.0}% ({}/{} chunks, {:.1} MiB)",
         pct, p.verified_chunks, p.total_chunks,
         p.total_bytes as f64 / 1_048_576.0);
@@ -656,6 +695,33 @@ view.prebuffer_all_with_progress(&mut |facet, p| {
 
 `PrebufferProgress` exposes `verified_chunks`, `total_chunks`,
 `verified_bytes`, `total_bytes`.
+
+#### From Rust — all profiles, with size warning
+
+```rust
+use vectordata::{TestDataGroup, PREBUFFER_LARGE_WARNING_BYTES};
+
+let group = TestDataGroup::load("https://host/datasets/my-dataset/")?;
+
+// Walks every profile in the dataset, prebuffering every facet of
+// each. If the announced cross-profile total exceeds the 250 MiB
+// (PREBUFFER_LARGE_WARNING_BYTES) advisory threshold, warn_cb is
+// invoked once before any download begins; the call continues
+// regardless of the warning.
+group.prebuffer_all_profiles_with_progress(
+    &mut |profile, facet, p| {
+        eprintln!("  [{profile}] {facet}: {}/{} chunks",
+            p.verified_chunks, p.total_chunks);
+    },
+    &mut |total_bytes| {
+        eprintln!("WARNING: prebuffering {:.1} MiB across all profiles \
+                   (above {} MiB threshold). Pass dataset:profile to \
+                   limit which profiles are downloaded.",
+            total_bytes as f64 / 1_048_576.0,
+            PREBUFFER_LARGE_WARNING_BYTES / 1_048_576);
+    },
+)?;
+```
 
 ### Per-facet cache stats
 

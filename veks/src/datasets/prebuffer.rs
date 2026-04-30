@@ -66,8 +66,8 @@ pub fn run(
                 .unwrap_or_else(|| "(unconfigured)".to_string()));
     }
 
-    // Parse spec → (resolution, profile name)
-    let (resolution, profile_name) = resolve_spec(
+    // Parse spec → (resolution, profile selection)
+    let (resolution, profile_sel) = resolve_spec(
         dataset_spec, configdir, extra_catalogs, at,
     );
 
@@ -85,22 +85,31 @@ pub fn run(
         }
     };
 
-    let view = match group.profile(&profile_name) {
-        Some(v) => v,
-        None => {
-            eprintln!("Profile '{profile_name}' not found at {group_path}.");
-            eprintln!("Available profiles: {}",
-                group.profile_names().join(", "));
-            std::process::exit(1);
-        }
-    };
-
-    eprintln!("Prebuffering {group_path}:{profile_name}");
     if let Some(c) = &configured {
         eprintln!("  Cache root: {}", c.display());
     }
 
-    drive_prebuffer(&*view);
+    match profile_sel {
+        ProfileSelection::Named(profile_name) => {
+            let view = match group.profile(&profile_name) {
+                Some(v) => v,
+                None => {
+                    eprintln!("Profile '{profile_name}' not found at {group_path}.");
+                    eprintln!("Available profiles: {}",
+                        group.profile_names().join(", "));
+                    std::process::exit(1);
+                }
+            };
+            eprintln!("Prebuffering {group_path}:{profile_name}");
+            drive_prebuffer(&*view);
+        }
+        ProfileSelection::AllProfiles => {
+            let names = group.profile_names();
+            eprintln!("Prebuffering {group_path} — all profiles ({})",
+                names.join(", "));
+            drive_prebuffer_all(&group);
+        }
+    }
 }
 
 enum Resolved {
@@ -109,12 +118,20 @@ enum Resolved {
     Url(String),
 }
 
+/// Whether the user named a specific profile or asked for all of
+/// them. A bare `dataset` spec (no `:profile` suffix) selects all
+/// profiles; an explicit `dataset:profile` selects just that one.
+enum ProfileSelection {
+    Named(String),
+    AllProfiles,
+}
+
 fn resolve_spec(
     dataset_spec: &str,
     configdir: &str,
     extra_catalogs: &[String],
     at: &[String],
-) -> (Resolved, String) {
+) -> (Resolved, ProfileSelection) {
     // Split off the profile suffix, if any.
     //
     // A spec containing `:` is ambiguous between a `name:profile`
@@ -122,24 +139,28 @@ fn resolve_spec(
     // and URL forms always contain `/`, while a bare catalog name
     // never does — so the colon-split is only applied when the
     // spec contains no `/` and is not a URL.
-    let (head, profile) = if dataset_spec.contains('/')
+    let (head, profile_sel) = if dataset_spec.contains('/')
         || dataset_spec.starts_with("http://")
         || dataset_spec.starts_with("https://")
     {
-        (dataset_spec, "default")
+        // URL / path forms don't carry a profile suffix; default
+        // to all-profiles.
+        (dataset_spec, ProfileSelection::AllProfiles)
     } else if let Some(pos) = dataset_spec.find(':') {
-        (&dataset_spec[..pos], &dataset_spec[pos + 1..])
+        (&dataset_spec[..pos],
+         ProfileSelection::Named(dataset_spec[pos + 1..].to_string()))
     } else {
-        (dataset_spec, "default")
+        // Bare name → all profiles.
+        (dataset_spec, ProfileSelection::AllProfiles)
     };
 
     // 1. Local path or URL?
     if head.starts_with("http://") || head.starts_with("https://") {
-        return (Resolved::Url(head.to_string()), profile.to_string());
+        return (Resolved::Url(head.to_string()), profile_sel);
     }
     let as_path = Path::new(head);
     if as_path.exists() {
-        return (Resolved::Local(head.to_string()), profile.to_string());
+        return (Resolved::Local(head.to_string()), profile_sel);
     }
 
     // 2. Catalog lookup.
@@ -161,14 +182,16 @@ fn resolve_spec(
             std::process::exit(1);
         }
     };
-    if entry.layout.profiles.profile(profile).is_none() {
-        eprintln!("Profile '{profile}' not found in dataset '{}'. Available: {}",
-            entry.name, entry.profile_names().join(", "));
-        std::process::exit(1);
+    if let ProfileSelection::Named(ref p) = profile_sel {
+        if entry.layout.profiles.profile(p).is_none() {
+            eprintln!("Profile '{p}' not found in dataset '{}'. Available: {}",
+                entry.name, entry.profile_names().join(", "));
+            std::process::exit(1);
+        }
     }
     (
         Resolved::CatalogEntry { path: entry.path.clone(), name: entry.name.clone() },
-        profile.to_string(),
+        profile_sel,
     )
 }
 
@@ -220,6 +243,64 @@ fn drive_prebuffer(view: &dyn TestDataView) {
                 let remote = total_facets - local_facets;
                 println!("Prebuffer: {total_facets} facets processed ({remote} remote, {local_facets} local).");
             }
+        }
+        Err(e) => {
+            eprintln!();
+            eprintln!("Prebuffer: failed — {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// All-profiles variant: `view.prebuffer_all` per profile, with a
+/// pre-flight 250 MiB warning so the operator knows what they're
+/// committing to.
+fn drive_prebuffer_all(group: &vectordata::TestDataGroup) {
+    let mut warned = false;
+    let mut last_profile = String::new();
+    let mut total_facets = 0u32;
+    let mut local_facets = 0u32;
+
+    let result = group.prebuffer_all_profiles_with_progress(
+        &mut |profile, facet, p| {
+            if profile != last_profile {
+                if !last_profile.is_empty() { println!(); }
+                println!("[profile {profile}]");
+                last_profile = profile.to_string();
+            }
+            if p.total_chunks == 0 {
+                println!("  {facet} — local (mmap, no prebuffer needed)");
+                local_facets += 1;
+            } else {
+                println!(
+                    "  {facet} — done ({}/{} chunks, {:.1} MiB)",
+                    p.verified_chunks,
+                    p.total_chunks,
+                    p.total_bytes as f64 / 1_048_576.0,
+                );
+            }
+            total_facets += 1;
+        },
+        &mut |total_bytes| {
+            warned = true;
+            eprintln!();
+            eprintln!("WARNING: prebuffer announced {:.1} MiB across all profiles \
+                       (above the {:.0} MiB advisory threshold).",
+                total_bytes as f64 / 1_048_576.0,
+                vectordata::PREBUFFER_LARGE_WARNING_BYTES as f64 / 1_048_576.0);
+            eprintln!("Continuing — pass an explicit `dataset:profile` to limit \
+                       which profiles are downloaded.");
+            eprintln!();
+        },
+    );
+    let _ = warned;
+
+    match result {
+        Ok(()) => {
+            println!();
+            let remote = total_facets - local_facets;
+            println!("Prebuffer: {total_facets} facets across all profiles \
+                      ({remote} remote, {local_facets} local).");
         }
         Err(e) => {
             eprintln!();
