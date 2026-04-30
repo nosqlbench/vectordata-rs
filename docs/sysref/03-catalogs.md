@@ -119,19 +119,29 @@ step). The `veks check --check-merkle` verifier confirms coverage.
 
 ### Cache location
 
-Default: `~/.cache/vectordata/`. Configure via:
+The cache directory must be configured before any HTTP-backed read.
+There is no silent fallback — an unconfigured cache produces an
+error with paste-ready setup commands.
+
+Configure via the CLI:
 
 ```bash
 veks datasets config set-cache /mnt/fast-storage/vd-cache
 ```
 
-Or in `~/.config/vectordata/settings.yaml`:
+Or manually in `~/.config/vectordata/settings.yaml`:
 
 ```yaml
 cache_dir: /mnt/fast-storage/vd-cache
+protect_settings: true
 ```
 
-Resolution order: `--cache-dir` flag > `settings.yaml` > `$HOME/.cache/vectordata/`.
+Resolution order: `--cache-dir` flag (per-command override) >
+`cache_dir:` from `settings.yaml`. If neither is set, every API
+that needs the cache (`Storage::open_url`, `veks datasets prebuffer`,
+…) fails with a `SettingsError::NotConfigured` whose `Display` impl
+prints both the `veks` CLI command and the manual `mkdir`+`echo`
+sequence the user can paste.
 
 ### Prebuffering
 

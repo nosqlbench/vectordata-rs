@@ -232,18 +232,16 @@ veks analyze describe --source profiles/default/metadata_indices.ivvec --scan tr
 ## Access from Rust
 
 ```rust
-use vectordata::TestDataGroup;
-use vectordata::view::TestDataView;
+use vectordata::{open_facet_typed, TestDataGroup, TestDataView, TypedReader};
 
 let group = TestDataGroup::load("./my-predicated-dataset/")?;
 let view = group.profile("default").unwrap();
-let gview = group.generic_view("default").unwrap();
 
 // Verify: every filtered neighbor passes its predicate
 let fki = view.filtered_neighbor_indices()?;
-let mi = view.metadata_indices()?;
-let meta = gview.open_facet_typed::<u8>("metadata_content")?;
-let pred = gview.open_facet_typed::<u8>("metadata_predicates")?;
+let mi  = view.metadata_indices()?;       // Arc<dyn VvecReader<i32>>
+let meta: TypedReader<u8> = open_facet_typed(&*view, "metadata_content")?;
+let pred: TypedReader<u8> = open_facet_typed(&*view, "metadata_predicates")?;
 
 for qi in 0..10 {
     let pred_val = pred.get_native(qi);
@@ -252,5 +250,8 @@ for qi in 0..10 {
         if ord < 0 { continue; }
         assert_eq!(meta.get_native(ord as usize), pred_val);
     }
+    // (mi.get(qi)? gives the variable-length list of base ordinals
+    // matching the predicate, useful for cross-checking coverage.)
+    let _ = mi.get(qi)?;
 }
 ```

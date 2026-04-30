@@ -34,14 +34,16 @@ and UI layer.
 ```
 vectordata-rs/
 ├── vectordata/        Access library (consumer crate)
-│   ├── io.rs          VectorReader, VvecReader, open_vec, open_vvec
-│   ├── view.rs        TestDataView trait, profile facet access
-│   ├── typed_access.rs  TypedReader with width negotiation
+│   ├── io.rs          VectorReader/VvecReader traits + XvecReader/IndexedVvecReader, open_vec, open_vvec
+│   ├── view.rs        TestDataView trait, FacetStorage, prebuffer_all, open_facet_typed
+│   ├── typed_access.rs  TypedReader<T> over crate-private Storage
+│   ├── settings.rs    cache_dir resolution (single source of truth, strict — no silent fallback)
+│   ├── storage.rs     pub(crate) Storage enum (Mmap | Http | Cached) — hidden from consumers
 │   ├── dataset/       dataset.yaml parsing, profiles, catalogs
 │   ├── catalog/       Catalog resolver and sources
 │   ├── merkle/        Merkle hash trees (.mref/.mrkl)
-│   ├── transport/     HTTP transport with Range requests
-│   └── cache/         Read-through cache with Merkle verification
+│   ├── transport/     pub(crate) HTTP RANGE transport with retry + parallel chunk fetch
+│   └── cache/         pub(crate) merkle-verified channel feeding Storage::Cached
 │
 ├── veks/              CLI application
 │   ├── main.rs        Clap CLI, subcommand dispatch

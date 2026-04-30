@@ -109,7 +109,10 @@ veks datasets config show
 Resolution order:
 1. Per-call override (e.g. `--cache-dir` CLI flag).
 2. `cache_dir:` from settings.yaml.
-3. `$HOME/.cache/vectordata/` fallback.
+
+If neither is set, the cache APIs return a `SettingsError::NotConfigured`
+whose `Display` impl prints paste-ready setup commands. There is no
+silent fallback to `$HOME/.cache/vectordata/`.
 
 ## Direct file access (no catalog)
 

@@ -329,10 +329,9 @@ impl XvecReader<f32> {
     /// Zero-copy slice of the vector at `index`. **Panics** if the
     /// underlying storage is not mmap-backed.
     ///
-    /// **No bounds check** on `index` — matches the prior
-    /// `MmapVectorReader::<f32>::get_slice` semantics that hot-path
-    /// callers (KNN scans, normalisation) depend on. Reading past
-    /// `count` is undefined behaviour; the caller is responsible for
+    /// **No bounds check** on `index` — hot-path inner-loop form
+    /// used by KNN scans and normalisation. Reading past `count` is
+    /// undefined behaviour; the caller is responsible for
     /// `index < self.count()`. Use [`VectorReader::get_slice`] for
     /// the bounds-checked `Option<&[T]>` form.
     #[inline]

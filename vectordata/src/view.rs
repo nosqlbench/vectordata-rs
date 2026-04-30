@@ -21,6 +21,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use url::Url;
 
+/// True for `http://` and `https://` schemes — the only schemes the
+/// crate handles as remote. `file://` is intentionally not
+/// recognized: the rest of the I/O stack works directly on
+/// filesystem paths, so a `file://` URL would just confuse it.
+fn is_absolute_url(s: &str) -> bool {
+    s.starts_with("http://") || s.starts_with("https://")
+}
+
 /// Parse a window string using the canonical dataset-source parser
 /// (`crate::dataset::source::parse_window`). Returns the FIRST
 /// interval as `(start, end)` with `end` exclusive — the multi-
@@ -331,6 +339,21 @@ impl FacetStorage {
     pub fn is_local(&self) -> bool { self.storage.is_local() }
     pub fn total_size(&self) -> u64 { self.storage.total_size() }
 
+    /// Path to the local file that backs this facet, when one
+    /// exists. `Some` for `Storage::Cached` (the cache file under
+    /// the configured cache root) and for purely-local datasets
+    /// where no cache is involved. `None` for direct-HTTP storage
+    /// (no `.mref` published — there is no local file).
+    ///
+    /// Hot-path consumers that need a `&Path` to mmap should call
+    /// `prebuffer()` first to ensure the file is fully resident,
+    /// then use this path. Consumers that just want to read should
+    /// prefer `view.facet(name)` / `view.base_vectors()` and let
+    /// the reader handle resident-state for them.
+    pub fn cache_path(&self) -> Option<std::path::PathBuf> {
+        self.storage.local_path()
+    }
+
     /// Live cache-fill statistics. Returns `None` when the storage is
     /// not cache-backed (local mmap or direct HTTP).
     pub fn cache_stats(&self) -> Option<CacheStats> {
@@ -380,6 +403,13 @@ impl GenericTestDataView {
 
     fn resolve_resource(&self, facet: &FacetConfig) -> Result<ResourceLocation> {
         let source_str = facet.source();
+        // Absolute URLs in the YAML override the dataset's base
+        // location — supports the case where a local dataset.yaml
+        // references remote facets, or a remote catalog references
+        // facets in a different bucket.
+        if is_absolute_url(source_str) {
+            return Ok(ResourceLocation::Http(Url::parse(source_str)?));
+        }
         match &self.source {
             DataSource::FileSystem(base_path) => {
                 let path = base_path.join(source_str);
@@ -443,7 +473,15 @@ impl GenericTestDataView {
     /// data source root. Mirrors `resolve_as_string` but takes a raw
     /// path so callers that pre-parsed the suffix can join it
     /// correctly without round-tripping through `FacetConfig`.
+    ///
+    /// Absolute URLs (`http://`, `https://`) in the YAML pass
+    /// through unchanged regardless of the dataset's base location —
+    /// so a local `dataset.yaml` can reference remote facets and a
+    /// remote dataset can reference facets hosted elsewhere.
     fn resolve_path_str(&self, path: &str) -> Result<String> {
+        if is_absolute_url(path) {
+            return Ok(path.to_string());
+        }
         match &self.source {
             DataSource::FileSystem(base_path) => {
                 Ok(base_path.join(path).to_string_lossy().to_string())
@@ -693,5 +731,22 @@ impl TestDataView for GenericTestDataView {
         let storage = std::sync::Arc::new(crate::storage::Storage::open(&resolved)
             .map_err(|e| Error::Other(format!("storage open '{name}': {e}")))?);
         Ok(FacetStorage::new(storage))
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_absolute_url_recognises_http_schemes() {
+        assert!(is_absolute_url("http://example.com/data.fvec"));
+        assert!(is_absolute_url("https://example.com/data.fvec"));
+        assert!(!is_absolute_url("file:///tmp/data.fvec"));
+        assert!(!is_absolute_url("/absolute/local/path.fvec"));
+        assert!(!is_absolute_url("relative/path.fvec"));
+        assert!(!is_absolute_url("data.fvec"));
+        assert!(!is_absolute_url(""));
     }
 }

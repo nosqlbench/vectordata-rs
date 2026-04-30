@@ -1,12 +1,14 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! Cache directory layout helpers.
+//! Cache-directory layout helpers used by
+//! [`crate::storage::Storage::open_url_cached`].
 //!
-//! The reader struct (`CachedVectorReader`) that used to live here is
-//! gone — its responsibilities are absorbed by the canonical
-//! [`crate::storage::Storage::Cached`] variant. Only the path
-//! resolution helpers remain, used by `Storage::open_url_cached`.
+//! The cache root is resolved once via
+//! [`crate::settings::cache_dir`], then per-URL subdirectories are
+//! laid out as `<host>:<port>/<url-path-prefix>/<filename>`. Including
+//! the port isolates per-test fixtures running on ephemeral ports
+//! from each other and from production caches.
 
 use std::path::{Path, PathBuf};
 use url::Url;

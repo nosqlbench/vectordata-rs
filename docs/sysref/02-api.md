@@ -330,6 +330,25 @@ let view: Arc<dyn TestDataView> = group.profile("default").unwrap();
 let gview: GenericTestDataView = group.generic_view("default").unwrap();
 ```
 
+### Source resolution
+
+A facet's source string in `dataset.yaml` may be:
+
+- A **relative path or URL fragment** — joined onto the dataset's
+  base location (the directory of `dataset.yaml` for local datasets,
+  the URL prefix for remote ones).
+- An **absolute HTTP URL** (`http://…` or `https://…`) — passed
+  through unchanged regardless of where the `dataset.yaml` lives.
+  This means a local `dataset.yaml` can declare facets hosted on
+  a remote server, and a remote `dataset.yaml` can pull facets
+  from a different bucket — the dispatch is per-facet.
+- An **absolute local path** — used as-is on local filesystems.
+
+For each facet, the resolved source string is then handed to
+`Storage::open(source)`, which picks the transport variant
+(local mmap, merkle-cached, direct HTTP) without further input from
+the caller.
+
 ### Standard facet methods
 
 All methods on `TestDataView` return readers that work identically
@@ -580,7 +599,12 @@ the single source of truth for cache resolution shared with the
 1. `--cache-dir` CLI flag (per-command override).
 2. `cache_dir:` entry in `~/.config/vectordata/settings.yaml`
    (or `$VECTORDATA_HOME/settings.yaml` for tests).
-3. `$HOME/.cache/vectordata/` fallback.
+
+If neither is set, every API that needs the cache returns
+`vectordata::settings::SettingsError::NotConfigured`. Print the
+error directly — its `Display` impl includes the `veks` CLI
+command and the manual `mkdir`+`echo` sequence the user can paste
+to fix it. There is no silent fallback to `$HOME/.cache/vectordata/`.
 
 Configure via the CLI:
 
@@ -637,15 +661,21 @@ view.prebuffer_all_with_progress(&mut |facet, p| {
 
 `view.open_facet_storage(name)` returns a `FacetStorage` handle —
 opaque from the outside but knowing whether the underlying transport
-is cached. `cache_stats()` reports current fill state for cached
-facets, `None` otherwise:
+is cached.
+
+| Method | local mmap | cached-remote | direct HTTP (no `.mref`) |
+|---|---|---|---|
+| `is_local()` | `true` | `true` once promoted | `false` |
+| `is_complete()` | `true` | `true` once every chunk verified | `false` (always) |
+| `cache_stats()` | `None` | `Some(CacheStats)` | `None` |
+| `cache_path()` | `None` | path to cache file | `None` |
+| `prebuffer()` | no-op | downloads + verifies | no-op |
 
 ```rust
 use vectordata::CacheStats;
 
 let storage = view.open_facet_storage("base_vectors")?;
 
-// Live cache state
 if let Some(cs): Option<CacheStats> = storage.cache_stats() {
     let pct = 100.0 * cs.valid_chunks as f64 / cs.total_chunks as f64;
     println!("cached: {:.0}% ({}/{} chunks, {} bytes total)",
@@ -653,10 +683,17 @@ if let Some(cs): Option<CacheStats> = storage.cache_stats() {
 }
 
 // Drive this single facet to full-resident state (without touching
-// the rest of the profile)
+// the rest of the profile).
 storage.prebuffer()?;
 assert!(storage.is_complete());
 assert!(storage.is_local());
+
+// After prebuffer, the bytes are mmap-promoted; cache_path() points
+// to the local cache file so external tools (mmap, hashing, etc.)
+// can address it directly.
+if let Some(path) = storage.cache_path() {
+    println!("cached file landed at: {}", path.display());
+}
 ```
 
 ### How chunked verification works

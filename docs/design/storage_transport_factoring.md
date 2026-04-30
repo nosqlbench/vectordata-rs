@@ -42,6 +42,7 @@ pub(crate) enum Storage {
 | `mmap_base()` | raw `*const u8` | `None` | raw `*const u8` once promoted |
 | `is_complete()` | `true` | `false` | `true` after every chunk verified |
 | `is_local()` | `true` | `false` | `true` once promoted |
+| `local_path()` | `None` (caller knows the open path) | `None` | path to cache file |
 | `prebuffer()` | no-op | no-op | downloads + verifies + promotes |
 | `advise_sequential` / `advise_random` | madvise | no-op | madvise once promoted |
 | `prefetch_range_bytes` / `release_range_bytes` | madvise | no-op | madvise once promoted |
@@ -204,20 +205,43 @@ bypassing the cache; variable-length vvec having no cached path at
 all) are impossible by construction once every shape adapter routes
 through `Storage`.
 
+## Per-facet dispatch and mixed-transport datasets
+
+Source resolution in `TestDataView` is per-facet, so a single
+`dataset.yaml` can mix transports without any caller-side
+branching. The `view::resolve_path_str` helper recognises absolute
+HTTP URLs and passes them through unchanged regardless of where
+the `dataset.yaml` itself is loaded from:
+
+- A local `dataset.yaml` may declare some facets with relative paths
+  (resolved against the dataset directory → `Storage::Mmap`) and
+  others with `https://…` URLs (resolved as remote → `Storage::Cached`).
+- A remote `dataset.yaml` may pull facets from a different bucket
+  via absolute URLs while inheriting the catalog base for its
+  relative entries.
+
+`view.prebuffer_all_with_progress` honours this per-facet dispatch
+naturally — `Storage::Mmap` and `Storage::Http` no-op silently;
+`Storage::Cached` downloads. The single-source-of-truth cache layout
+under `vectordata::settings::cache_dir()` is the only place
+downloaded bytes ever land — there is no parallel "ad-hoc copy"
+layout in any consuming crate.
+
 ## Settings.yaml resolution
 
 The cache root is resolved via the single function
-[`crate::settings::cache_dir()`], which reads
+[`crate::settings::cache_dir()`], which reads `cache_dir:` from
 `~/.config/vectordata/settings.yaml` (or
-`$VECTORDATA_HOME/settings.yaml` for tests) and returns:
-
-1. The `cache_dir:` value from settings, if present.
-2. `$HOME/.cache/vectordata/` fallback.
+`$VECTORDATA_HOME/settings.yaml` for tests). If the file is missing
+or does not declare `cache_dir:`, the function returns
+`SettingsError::NotConfigured`. The error's `Display` impl carries
+ready-to-paste setup commands; callers should surface it directly
+rather than silently falling back to a default path.
 
 `veks-pipeline`'s `configured_cache_dir()` is a thin alias for
-`vectordata::settings::cache_dir()` — there is one canonical
-implementation, so the user's override is honoured uniformly across
-`vectordata` and any consuming crate.
+`vectordata::settings::cache_dir()`; CLI commands use the
+`configured_cache_dir_or_exit()` helper which prints the error and
+exits with code 2 when the cache is unconfigured.
 
 The cache directory layout under the resolved root is
 `<host>:<port>/<url-path-prefix>/<filename>` plus

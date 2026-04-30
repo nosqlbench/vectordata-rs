@@ -110,112 +110,126 @@ impl UnifiedReader {
 
 /// Resolve a source specifier to a local file path.
 ///
-/// For local files, returns the path directly.
-/// For catalog specifiers, this function should NOT be used —
-/// use `open_dataset()` instead for on-demand remote access.
+/// Routes through the canonical vectordata API for every source
+/// shape — local file path, `dataset[:profile[:facet]]` catalog
+/// reference, or HTTP URL — so the cache layout is the same one
+/// any other vectordata caller would use. No ad-hoc copying, no
+/// alternate flat-cache layout, no manual download.
+///
+/// For catalog and URL specs, this drives the underlying storage
+/// to fully-resident state via `FacetStorage::prebuffer()` and then
+/// returns the local file path the cache landed in. Local-file
+/// inputs are returned unchanged.
 pub(super) fn resolve_source(source: &str) -> PathBuf {
+    // Plain local path — return as-is.
     let as_path = std::path::Path::new(source);
     if as_path.exists() {
         return as_path.to_path_buf();
     }
 
-    if source.contains('/') || source.contains('.') {
-        eprintln!("Error: file not found: {}", source);
+    // URL or path-shaped string that doesn't exist on disk — error.
+    // Catalog references contain neither '/' nor '.'.
+    if (source.contains('/') || source.contains('.'))
+        && !source.starts_with("http://")
+        && !source.starts_with("https://")
+    {
+        eprintln!("Error: file not found: {source}");
         std::process::exit(1);
     }
 
-    // Parse as dataset:profile[:facet]
-    let parts: Vec<&str> = source.split(':').collect();
-    let (dataset_name, profile_name, facet_name) = match parts.len() {
-        1 => (parts[0], "default", "base_vectors"),
-        2 => (parts[0], parts[1], "base_vectors"),
-        3 => (parts[0], parts[1], parts[2]),
-        _ => {
-            eprintln!("Error: invalid source specifier '{}'. Use dataset:profile[:facet]", source);
-            std::process::exit(1);
+    // Parse as dataset[:profile[:facet]] (catalog ref) or treat as
+    // a remote URL pointing at a dataset directory.
+    let (dataset_name, profile_name, facet_name) = if source.starts_with("http://")
+        || source.starts_with("https://")
+    {
+        // URL — use it as the group path; default profile & base_vectors facet.
+        return resolve_via_view(source, "default", "base_vectors");
+    } else {
+        let parts: Vec<&str> = source.split(':').collect();
+        match parts.len() {
+            1 => (parts[0], "default", "base_vectors"),
+            2 => (parts[0], parts[1], "base_vectors"),
+            3 => (parts[0], parts[1], parts[2]),
+            _ => {
+                eprintln!("Error: invalid source specifier '{source}'. Use dataset:profile[:facet]");
+                std::process::exit(1);
+            }
         }
     };
 
-    // Resolve via catalog
+    // Catalog lookup.
     let sources = crate::catalog::sources::CatalogSources::new().configure_default();
     if sources.is_empty() {
-        eprintln!("Error: '{}' is not a local file and no catalogs are configured.", source);
+        eprintln!("Error: '{source}' is not a local file and no catalogs are configured.");
         eprintln!("Create ~/.config/vectordata/catalogs.yaml or use a local file path.");
         std::process::exit(1);
     }
-
     let catalog = crate::catalog::resolver::Catalog::of(&sources);
     let entry = match catalog.find_exact(dataset_name) {
         Some(e) => e,
         None => {
-            eprintln!("Error: dataset '{}' not found in catalog.", dataset_name);
+            eprintln!("Error: dataset '{dataset_name}' not found in catalog.");
             catalog.list_datasets(dataset_name);
             std::process::exit(1);
         }
     };
+    resolve_via_view(&entry.path, profile_name, facet_name)
+}
 
-    let profile = match entry.layout.profiles.profile(profile_name) {
-        Some(p) => p,
-        None => {
-            eprintln!("Error: profile '{}' not found in '{}'. Available: {}",
-                profile_name, entry.name, entry.profile_names().join(", "));
+/// Open the dataset at `group_path` (URL or local path), find the
+/// named facet on the named profile, prebuffer it through the
+/// canonical storage layer, and return the local file path the
+/// bytes landed in.
+fn resolve_via_view(group_path: &str, profile_name: &str, facet_name: &str) -> PathBuf {
+    let group = match vectordata::TestDataGroup::load(group_path) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("Error: failed to open {group_path}: {e}");
             std::process::exit(1);
         }
     };
-
-    let view = match profile.view(facet_name) {
+    let view = match group.profile(profile_name) {
         Some(v) => v,
         None => {
-            eprintln!("Error: facet '{}' not found in {}:{}. Available: {}",
-                facet_name, entry.name, profile_name, profile.view_names().join(", "));
+            eprintln!("Error: profile '{profile_name}' not found at {group_path}. Available: {}",
+                group.profile_names().join(", "));
+            std::process::exit(1);
+        }
+    };
+    let storage = match view.open_facet_storage(facet_name) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Error: facet '{facet_name}' not available: {e}");
             std::process::exit(1);
         }
     };
 
-    let source_path = &view.source.path;
-    let base_url = entry.path.rsplit_once('/').map(|(base, _)| base).unwrap_or("");
-
-    // Check local cache first
-    let cache_dir = dirs_cache_dir().join(&entry.name);
-    let cached_path = cache_dir.join(source_path);
-
-    if cached_path.exists() {
-        eprintln!("Using cached: {}", crate::check::rel_display(&cached_path));
-        return cached_path;
-    }
-
-    // Download to cache
-    let full_url = if source_path.starts_with("http://") || source_path.starts_with("https://") {
-        source_path.clone()
-    } else {
-        format!("{}/{}", base_url, source_path)
-    };
-
-    if !full_url.starts_with("http://") && !full_url.starts_with("https://") {
-        // Local source relative to catalog entry
-        let local_src = std::path::Path::new(&full_url);
-        if local_src.exists() {
-            return local_src.to_path_buf();
-        }
-        eprintln!("Error: source not available: {}", full_url);
+    // Drive cache to fully-resident; no-op for local mmap. Failure
+    // surfaces directly because there is no fallback to a separate
+    // cache layout — the canonical Storage::Cached layout is the
+    // only place data lands.
+    if let Err(e) = storage.prebuffer() {
+        eprintln!("Error: prebuffer failed for {facet_name}: {e}");
         std::process::exit(1);
     }
 
-    eprintln!("Downloading {}:{} ({})...", entry.name, profile_name, facet_name);
-    if let Some(parent) = cached_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+    if let Some(local) = storage.cache_path() {
+        // Cached-remote: report under the configured cache root.
+        eprintln!("Using cached: {}", crate::check::rel_display(&local));
+        return local;
     }
-
-    match crate::datasets::prebuffer::download_file(&full_url, &cached_path) {
-        Ok(size) => {
-            eprintln!("Downloaded {} bytes to {}", size, crate::check::rel_display(&cached_path));
-            cached_path
+    // Non-cached storage: must be a local file. Read the resolved
+    // source path back from the view.
+    if let Some(src) = view.facet_source(facet_name) {
+        let p = std::path::PathBuf::from(&src);
+        if p.exists() {
+            return p;
         }
-        Err(e) => {
-            eprintln!("Error: failed to download {}: {}", full_url, e);
-            std::process::exit(1);
-        }
+        eprintln!("Error: facet '{facet_name}' resolved to {src} but the file does not exist.");
+    } else {
+        eprintln!("Error: facet '{facet_name}' has no resolvable source.");
     }
+    std::process::exit(1);
 }
 
 /// Get the configured vectordata cache directory from settings.yaml.

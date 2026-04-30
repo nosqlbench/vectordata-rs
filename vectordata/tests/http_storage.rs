@@ -644,6 +644,94 @@ profiles:
 // ═══════════════════════════════════════════════════════════════════════
 
 #[test]
+fn local_yaml_with_absolute_http_facets() {
+    // A dataset.yaml that lives on local disk but whose facet
+    // entries are absolute HTTP URLs. The view layer must pass
+    // those through to the remote-cache path rather than
+    // path-joining them onto the local dataset directory.
+    //
+    // Use a multi-chunk file so the dim-header read at open time
+    // doesn't accidentally fully download the file.
+    let tmp_remote = make_tmp();
+    write_fvec(&tmp_remote.path().join("base.fvec"), 1000, 64); // ~256 KiB → many TEST_CHUNK chunks
+    write_fvec(&tmp_remote.path().join("query.fvec"), 50, 64);
+    write_mref(&tmp_remote.path().join("base.fvec"));
+    write_mref(&tmp_remote.path().join("query.fvec"));
+    let server = TestServer::start(tmp_remote.path()).unwrap();
+    let base_url = server.base_url();
+
+    let tmp_local = make_tmp();
+    let yaml = format!(r#"
+name: hybrid
+profiles:
+  default:
+    base_vectors: {base_url}base.fvec
+    query_vectors: {base_url}query.fvec
+"#);
+    std::fs::write(tmp_local.path().join("dataset.yaml"), yaml).unwrap();
+
+    let group = TestDataGroup::load(tmp_local.path().to_str().unwrap()).unwrap();
+    let view = group.profile("default").unwrap();
+
+    // The reader path resolves base/query to remote — counts and
+    // first-record bytes must match the remote source. (This is the
+    // key assertion — without URL-aware resolve_path_str, the
+    // FileSystem branch would have path-joined the URL and failed
+    // to open.)
+    let base = view.base_vectors().unwrap();
+    assert_eq!(base.count(), 1000);
+    assert_eq!(base.dim(), 64);
+    assert_eq!(base.get(0).unwrap()[0], 0.0);
+    assert_eq!(base.get(1).unwrap()[0], 100.0);
+
+    // Storage handle for the same facet must report cached-remote
+    // (not local mmap). It is *not* yet complete because only the
+    // dim header chunk has been touched so far on opens.
+    let storage = view.open_facet_storage("base_vectors").unwrap();
+    assert!(storage.cache_stats().is_some(),
+        "remote facet via local yaml must yield cached storage with cache_stats");
+    assert!(!storage.is_complete(),
+        "multi-chunk file must not be complete from header read alone");
+
+    storage.prebuffer().unwrap();
+    assert!(storage.is_complete());
+
+    // After prebuffer, cache_path returns the local cache file and
+    // is_local is true (mmap-promoted).
+    let local = storage.cache_path()
+        .expect("cached storage must report a local cache path after prebuffer");
+    assert!(local.is_file(), "cache_path must point to an existing file");
+    assert!(storage.is_local(), "cached storage must be local after promotion");
+}
+
+#[test]
+fn local_dataset_facet_storage_is_local_with_no_cache_path() {
+    // A dataset.yaml on local disk with relative facet paths —
+    // every facet should be Storage::Mmap, so cache_path is None
+    // (no cache file involved) and is_local is true from the start.
+    let tmp = make_tmp();
+    write_fvec(&tmp.path().join("base.fvec"), 10, 4);
+    std::fs::write(tmp.path().join("dataset.yaml"), r#"
+name: local
+profiles:
+  default:
+    base_vectors: base.fvec
+"#).unwrap();
+
+    let group = TestDataGroup::load(tmp.path().to_str().unwrap()).unwrap();
+    let view = group.profile("default").unwrap();
+
+    let storage = view.open_facet_storage("base_vectors").unwrap();
+    assert!(storage.is_local(), "local dataset facets are local from the start");
+    assert!(storage.is_complete(), "local dataset facets are complete from the start");
+    assert!(storage.cache_path().is_none(),
+        "local dataset facets have no cache file (data is read in place)");
+    // prebuffer is a no-op
+    storage.prebuffer().unwrap();
+    assert!(storage.is_complete());
+}
+
+#[test]
 fn arc_clone_of_reader_shares_storage() {
     // The XvecReader internally holds Arc<Storage>; cloning the
     // outer Arc<XvecReader<T>> shares the same storage and its

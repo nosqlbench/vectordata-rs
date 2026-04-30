@@ -162,11 +162,55 @@ if let Some(cs): Option<CacheStats> = storage.cache_stats() {
     println!("{}/{} chunks ({} bytes)",
         cs.valid_chunks, cs.total_chunks, cs.content_size);
 }
+
+// After prebuffer, cache_path() returns the local cache file —
+// useful for tools that need a Path to mmap, hash, or copy.
+if let Some(path) = storage.cache_path() {
+    println!("cached at: {}", path.display());
+}
 ```
 
-`open_facet_storage` returns `None` for purely local datasets
-because there's nothing to cache; `cache_stats` returns `None` for
-local storage and for direct-HTTP (no `.mref` published).
+`cache_stats()` and `cache_path()` both return `None` for purely
+local datasets and for direct-HTTP (no `.mref` published) — there
+is no cache file to report. `is_local()` is true for local datasets
+from the start and for cached-remote once promoted.
+
+## 6a. Mixing local and remote in one dataset
+
+A `dataset.yaml` may declare some facets with relative paths and
+others with absolute HTTP URLs. The view layer handles each facet
+independently — the relative ones resolve against the dataset's
+base location, the absolute ones pass through unchanged:
+
+```yaml
+# dataset.yaml on local disk
+profiles:
+  default:
+    base_vectors: profiles/base/base_vectors.fvec        # local
+    query_vectors: https://hosted.example.com/q.fvec     # remote
+    metadata_content: profiles/base/metadata_content.u8  # local
+```
+
+```rust
+let group = vectordata::TestDataGroup::load("./my-dataset/")?;
+let view = group.profile("default").unwrap();
+
+// base_vectors → Storage::Mmap (local, no cache, no copy)
+let base = view.base_vectors()?;
+
+// query_vectors → Storage::Cached (downloads to cache_dir on first
+// read, promotes to mmap once complete)
+let query = view.query_vectors()?;
+
+// prebuffer_all is per-facet aware: local facets no-op, remote
+// facets download.
+view.prebuffer_all()?;
+```
+
+The same logic applies in reverse — a remote `dataset.yaml` can
+point at facets in a different bucket via absolute URLs, and the
+catalog layer resolves each facet via `Storage::open(source)` with
+no special-casing.
 
 ## 7. Read in parallel
 

@@ -386,6 +386,19 @@ impl Storage {
         }
     }
 
+    /// Best-effort path to the local file backing this storage. `Some`
+    /// when the bytes are reachable through the filesystem — i.e.,
+    /// `Storage::Cached` (the cache file). For `Storage::Mmap` we
+    /// don't track the originating path (the `Mmap` doesn't carry
+    /// it), so the caller is expected to remember it from the open
+    /// arguments. `None` for `Storage::Http` (no local file exists).
+    pub(crate) fn local_path(&self) -> Option<std::path::PathBuf> {
+        match self {
+            Storage::Cached { channel, .. } => Some(channel.cache_path().to_path_buf()),
+            _ => None,
+        }
+    }
+
     /// Borrow the underlying [`CachedChannel`] when this storage is
     /// `Cached`. Used by [`crate::view::FacetStorage::cache_stats`]
     /// to report fill state. **Crate-internal**: the channel itself
