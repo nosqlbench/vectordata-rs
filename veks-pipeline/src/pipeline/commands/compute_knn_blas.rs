@@ -115,30 +115,66 @@ fn alloc_packed_buf(n: usize, dim: usize) -> Vec<f32> {
 /// `pread` `n_vecs` entries starting at `byte_off` into `raw`, then
 /// header-strip into `packed`. `raw` must be ≥ `n_vecs * entry_size`
 /// bytes, `packed` must be ≥ `n_vecs * dim` f32s.
+///
+/// `elem_size` selects the on-disk element width: 4 for f32 (`.fvec`)
+/// — fast byte copy — or 2 for f16 (`.mvec`) — convert each pair of
+/// bytes to `half::f16` then upcast to `f32` into the packed buffer.
+/// The sgemm kernel itself only knows f32, so the upcast happens
+/// here at unpack time (cost is negligible vs the sgemm).
 fn pread_and_unpack(
     file: &File,
     byte_off: u64,
     n_vecs: usize,
     entry_size: usize,
     dim: usize,
+    elem_size: usize,
     raw: &mut [u8],
     packed: &mut [f32],
 ) -> std::io::Result<()> {
     let n_bytes = n_vecs * entry_size;
     file.read_exact_at(&mut raw[..n_bytes], byte_off)?;
-    // Unpack: for each entry, skip the 4-byte dim header, copy dim×4
-    // bytes of payload into the packed buffer.
-    for i in 0..n_vecs {
-        let src_off = i * entry_size + 4;
-        let dst_off = i * dim;
-        let src = &raw[src_off..src_off + dim * 4];
-        let dst_bytes = unsafe {
-            std::slice::from_raw_parts_mut(
-                packed[dst_off..].as_mut_ptr() as *mut u8,
-                dim * 4,
-            )
-        };
-        dst_bytes.copy_from_slice(src);
+    // Unpack: for each entry, skip the 4-byte dim header, then
+    // either copy or convert dim elements into the packed buffer.
+    match elem_size {
+        4 => {
+            // f32 fast path — verbatim byte copy.
+            for i in 0..n_vecs {
+                let src_off = i * entry_size + 4;
+                let dst_off = i * dim;
+                let src = &raw[src_off..src_off + dim * 4];
+                let dst_bytes = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        packed[dst_off..].as_mut_ptr() as *mut u8,
+                        dim * 4,
+                    )
+                };
+                dst_bytes.copy_from_slice(src);
+            }
+        }
+        2 => {
+            // f16 path — decode each pair of bytes into half::f16,
+            // then upcast to f32. We use the SIMD bulk converter so
+            // wide vectors don't bottleneck on per-element decode.
+            for i in 0..n_vecs {
+                let src_off = i * entry_size + 4;
+                let dst_off = i * dim;
+                let src = &raw[src_off..src_off + dim * 2];
+                // Reinterpret the LE bytes as half::f16 — sound on
+                // any host where f16 is laid out as 2 LE bytes
+                // (every supported target).
+                let f16_slice: &[half::f16] = unsafe {
+                    std::slice::from_raw_parts(src.as_ptr() as *const half::f16, dim)
+                };
+                crate::pipeline::simd_distance::convert_f16_to_f32_bulk(
+                    f16_slice,
+                    &mut packed[dst_off..dst_off + dim],
+                );
+            }
+        }
+        other => return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("pread_and_unpack: unsupported element size {other} (only 4 and 2 supported by the sgemm scan path)"),
+        )),
     }
     Ok(())
 }
@@ -388,6 +424,10 @@ pub(super) fn scan_range_sgemm(
     base_file: &File,
     base_range: std::ops::Range<usize>,
     dim: usize,
+    // On-disk element width of base records: 4 for `.fvec` / `.fvecs`,
+    // 2 for `.mvec` / `.mvecs`. The sgemm kernel itself runs in f32;
+    // f16 records are upcast at unpack time.
+    elem_size: usize,
     queries_packed: &[f32],
     query_count: usize,
     query_norms_sq: &[f32],
@@ -399,7 +439,7 @@ pub(super) fn scan_range_sgemm(
     thresholds: &mut [f32],
     mut progress: Option<&mut dyn FnMut(u64)>,
 ) -> Result<(), String> {
-    let entry_size = 4 + dim * 4;
+    let entry_size = 4 + dim * elem_size;
     let range_start = base_range.start;
     let range_end = base_range.end;
     let range_len = range_end.saturating_sub(range_start);
@@ -428,7 +468,7 @@ pub(super) fn scan_range_sgemm(
     let (c0_first, c0_n) = chunk_bounds(0);
     if c0_n == 0 { return Ok(()); }
     let c0_off = (c0_first as u64) * (entry_size as u64);
-    pread_and_unpack(base_file, c0_off, c0_n, entry_size, dim, raw_a, packed_a)
+    pread_and_unpack(base_file, c0_off, c0_n, entry_size, dim, elem_size, raw_a, packed_a)
         .map_err(|e| format!("pread chunk 0 @{}: {}", c0_first, e))?;
 
     let io_err: Arc<std::sync::Mutex<Option<String>>> =
@@ -449,7 +489,7 @@ pub(super) fn scan_range_sgemm(
                 let err_slot = Arc::clone(&io_err);
                 scope.spawn(move || {
                     if let Err(e) = pread_and_unpack(
-                        bf, next_off, next_n, entry_size, dim, rb, pb_next,
+                        bf, next_off, next_n, entry_size, dim, elem_size, rb, pb_next,
                     ) {
                         *err_slot.lock().unwrap() =
                             Some(format!("pread chunk@{}: {}", next_first, e));
@@ -998,6 +1038,12 @@ Reuses the shared segment-cache infrastructure:
                 &base_file,
                 seg_start..seg_end,
                 dim,
+                // compute knn-blas hardcodes f32 base for now —
+                // verify-knn-consolidated dispatches on the
+                // file's element type, but this path doesn't yet.
+                // When f16 base support is added here, replace 4
+                // with the dispatched elem_size.
+                4,
                 &queries_packed,
                 query_count,
                 &query_norms_sq,

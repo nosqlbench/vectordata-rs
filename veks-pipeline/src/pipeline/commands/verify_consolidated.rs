@@ -35,6 +35,18 @@ use vectordata::dataset::DatasetConfig;
 
 use super::compute_knn::Neighbor;
 
+/// Type-erased holder for a base reader, kept alive only so its
+/// `madvise(SEQUENTIAL)` hint persists across the streaming pread
+/// scan. Reads themselves go through a separate `std::fs::File` so
+/// we never name the typed reader on the hot path. The variants
+/// match the type-dispatch arms in
+/// `VerifyKnnConsolidatedOp::execute` — adding a new base element
+/// type here means adding a new arm there.
+pub(super) enum BaseKeepalive {
+    F32(XvecReader<f32>),
+    F16(XvecReader<half::f16>),
+}
+
 /// Format-agnostic float vector reader for verification.
 /// Provides f32 slices regardless of storage precision.
 pub(super) enum AnyFloatReader {
@@ -362,13 +374,57 @@ impl CommandOp for VerifyKnnConsolidatedOp {
             return error_result("no profiles with KNN indices found".to_string(), start);
         }
 
-        // Open base vectors for the scan.
-        let f32_base_reader = match vectordata::io::XvecReader::<f32>::open_path(&base_path) {
-            Ok(r) => r,
-            Err(e) => return error_result(format!("failed to open base as f32: {}", e), start),
+        // Open base vectors with element-type dispatch. Matches the
+        // pattern in `compute_knn.rs::execute_{f32,f16,f64}`: detect
+        // the on-disk type once, monomorphize per type, run the
+        // specialized arm. The verify scan is sgemm-based (BLAS only
+        // knows f32) so the f16 arm just upcasts at unpack time —
+        // see `pread_and_unpack`'s `elem_size` parameter. For a
+        // dedicated f16 SIMD path (cblas_hgemm or stdarch f16),
+        // it'd add a third arm here, not collapse into a runtime
+        // enum like AnyFloatReader.
+        let base_etype = match ElementType::from_path(&base_path) {
+            Ok(t) => t,
+            Err(e) => return error_result(format!("base extension: {e}"), start),
         };
-        let file_count = VectorReader::<f32>::count(&f32_base_reader);
-        let dim = VectorReader::<f32>::dim(&f32_base_reader);
+        let base_keepalive: BaseKeepalive;
+        let file_count: usize;
+        let dim: usize;
+        let elem_size: usize;
+        match base_etype {
+            ElementType::F32 => {
+                let r = match vectordata::io::XvecReader::<f32>::open_path(&base_path) {
+                    Ok(r) => r,
+                    Err(e) => return error_result(
+                        format!("failed to open base as f32: {}", e), start),
+                };
+                file_count = VectorReader::<f32>::count(&r);
+                dim = VectorReader::<f32>::dim(&r);
+                r.advise_sequential();
+                elem_size = 4;
+                base_keepalive = BaseKeepalive::F32(r);
+            }
+            ElementType::F16 => {
+                let r = match vectordata::io::XvecReader::<half::f16>::open_path(&base_path) {
+                    Ok(r) => r,
+                    Err(e) => return error_result(
+                        format!("failed to open base as f16: {}", e), start),
+                };
+                file_count = VectorReader::<half::f16>::count(&r);
+                dim = VectorReader::<half::f16>::dim(&r);
+                r.advise_sequential();
+                elem_size = 2;
+                base_keepalive = BaseKeepalive::F16(r);
+            }
+            other => return error_result(
+                format!(
+                    "verify knn-consolidated: base element type {:?} not supported \
+                     (only f32 / .fvec and f16 / .mvec are wired up)",
+                    other,
+                ),
+                start,
+            ),
+        }
         // Effective base count = inline window OR `range` option,
         // clamped to the file. Compute-knn uses the same resolution
         // (`source_window::resolve_window`), so verify and compute see
@@ -384,7 +440,7 @@ impl CommandOp for VerifyKnnConsolidatedOp {
             }
             None => (0, file_count),
         };
-        f32_base_reader.advise_sequential();
+        // (advise_sequential already called in the type-dispatch arm above)
 
         // Filter out profiles whose declared base_count exceeds the actual
         // dataset size. These are oversized profiles that were created at
@@ -514,9 +570,12 @@ impl CommandOp for VerifyKnnConsolidatedOp {
         }).collect();
 
         // ── Open base for streaming pread ─────────────────────────
-        // We keep the mmap reader (`f32_base_reader`) around for
-        // metadata only; the sgemm scan reads via pread into heap
-        // buffers so RSS stays bounded.
+        // The typed reader (`base_keepalive`) is held only to keep
+        // the mmap-based sequential-readahead advice live across
+        // the scan; the sgemm scan reads via pread into heap
+        // buffers so RSS stays bounded. `elem_size` (4 for f32 /
+        // 2 for f16) controls how `pread_and_unpack` decodes
+        // each record into the f32 sgemm packed buffer.
         let base_file = match std::fs::File::open(&base_path) {
             Ok(f) => f,
             Err(e) => return error_result(format!("open base for streaming: {}", e), start),
@@ -559,7 +618,7 @@ impl CommandOp for VerifyKnnConsolidatedOp {
             (0..num_samples).map(|_| BinaryHeap::with_capacity(k + 1)).collect();
         let mut cumulative_thresholds: Vec<f32> = vec![f32::INFINITY; num_samples];
         // Drop unused: we no longer have rayon workers at this level.
-        let _ = (threads, &f32_base_reader);
+        let _ = (threads, &base_keepalive);
         let scan_pb = ctx.ui.bar_with_unit(
             base_count as u64,
             &format!("scanning {} base ({}q × {}d)", base_count, num_samples, dim),
@@ -599,6 +658,7 @@ impl CommandOp for VerifyKnnConsolidatedOp {
                     &base_file,
                     (base_offset + seg_start)..(base_offset + seg_end),
                     dim,
+                    elem_size,
                     &queries_packed,
                     num_samples,
                     &query_norms_sq,
