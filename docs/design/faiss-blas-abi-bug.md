@@ -45,8 +45,8 @@ configuration, not the FAISS algorithm.
 
 Not affected:
 - Python FAISS (uses correctly matched BLAS interface)
-- Datasets where `n_queries * dim <= 65536` per search call (e.g., sift1m
-  at dim=128 with batch_size=512 is within the safe range)
+- Datasets where `n_queries * dim <= 65536` per search call (e.g., a
+  small-dim dataset of 128 with batch_size=512 is within the safe range)
 
 ## Root Cause Analysis
 
@@ -233,9 +233,8 @@ let max_queries_per_batch = (65536 / dim).max(1);
 let chunk_size = max_queries_per_batch.min(query_count);
 ```
 
-This avoids the zero-distance corruption. At dim=128 (sift1m and
-similar datasets), the batch size is 512 — large enough for good
-BLAS performance.
+This avoids the zero-distance corruption. At dim=128, the batch size
+is 512 — large enough for good BLAS performance.
 
 ### Performance impact
 
@@ -249,10 +248,10 @@ BLAS performance.
 
 ### Accuracy with workaround
 
-At dim=128 (sift1m): metal vs faiss shows 111/10000 boundary
-mismatches (1 neighbor swap each, all at the k-th boundary). These
-are floating-point rounding differences, not corruption. Verified
-by `--at-k 99` dropping all mismatches to zero.
+At dim=128: metal vs faiss shows 111/10000 boundary mismatches (1
+neighbor swap each, all at the k-th boundary). These are
+floating-point rounding differences, not corruption. Verified by
+`--at-k 99` dropping all mismatches to zero.
 
 At dim=1024: **not verified as accurate** — the comparison needs
 to be re-run on an idle system. Preliminary results with the batch

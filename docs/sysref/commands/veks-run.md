@@ -45,3 +45,5 @@ Pipeline: 18 steps in topological order (profile: all)
 | `--output tui\|basic\|batch` | Display mode |
 | `--resources 'mem:25%-50%'` | Resource governance |
 | `--governor maximize\|conservative\|fixed` | Governor strategy |
+| `--provenance <SELECTOR>` | Which provenance components decide staleness. Presets: `strict` (default, every component), `version-aware` (ignore minor/patch/git), `config-only` (ignore binary version entirely). Or a custom comma-separated list of `step_id`, `command_path`, `version_major`, `version_minor`, `version_patch`, `git_hash`, `dirty`, `options`, `upstream`. See sysref §4.3. |
+| `--explain-staleness` | Walk every step under the active selector, print fresh/stale + per-component diff lines, and exit without executing. |

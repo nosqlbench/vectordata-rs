@@ -56,10 +56,10 @@ Discover and cache datasets from configured catalogs.
 
 ```sh
 veks datasets list
-veks datasets prebuffer --dataset sift1m
-veks datasets cache-status --dataset sift1m
-veks datasets probe https://example.com/datasets/sift1m
-veks datasets drop-cache --dataset sift1m
+veks datasets prebuffer --dataset myset
+veks datasets cache-status --dataset myset
+veks datasets probe https://example.com/datasets/myset
+veks datasets drop-cache --dataset myset
 veks datasets config show           # cache directory + mounts
 ```
 
@@ -75,6 +75,8 @@ veks bootstrap -y                    # accept defaults
 veks run                             # execute pipeline
 veks run --dry-run
 veks run --clean
+veks run --explain-staleness         # show why each step would re-run
+veks run --provenance version-aware  # ignore minor/patch binary bumps
 veks check                           # pre-flight readiness checks
 veks publish                         # push to S3 / catalog
 veks stratify --strata "decade"      # add sized profiles after the fact
@@ -110,7 +112,7 @@ catalog or by file path.
 | `interact values`  | Scrollable raw-values grid: ordinals × dimensions, decimal-aligned, with 24-bit-color heatmap, sig-digit control, L2-norm column, and L2-normalized view toggle |
 
 ```sh
-veks interact explore --dataset sift1m
+veks interact explore --dataset myset
 veks interact values  --source ./data/base.fvec --start 0 --digits 4
 veks interact shell   --source ./data/base.fvec "info; range 0 5"
 ```

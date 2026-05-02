@@ -33,6 +33,7 @@ each run against the synthetic-1k test fixture.
 | Command | Description |
 |---------|-------------|
 | `compute knn` | Brute-force exact KNN ground truth |
+| `compute knn-distances` | Recover `neighbor_distances.fvecs` from pre-existing `neighbor_indices.ivecs` + base + query (used when the source ships indices but no distances) |
 | `compute filtered-knn` | KNN with predicate pre-filtering |
 | `compute evaluate-predicates` | Evaluate predicates against metadata → vvec results |
 | `compute sort` | Sort vectors for deduplication |

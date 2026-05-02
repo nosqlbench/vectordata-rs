@@ -74,6 +74,35 @@ matching knn_utils' own validation tools:
 | GT format | ivec structure, ordinal validity | `ivecs_check.py` |
 | KNN accuracy | Brute-force recomputation on sample queries | `validate_knn_utils.py` |
 
+### Element types and precision
+
+Both base and query vectors may be stored as `.fvec` (f32) or `.mvec`
+(f16). The verifier dispatches by file extension; the f16 path reads
+through `XvecReader::<half::f16>` and upcasts each vector to f32 for
+the BLAS norm computation.
+
+`tol-norm` defaults adapt to the storage type:
+
+| Storage | Default `tol-norm` | Why |
+|---------|--------------------|-----|
+| `.fvec` (f32) | `1e-5` | full f32 precision; tight band catches any drift |
+| `.mvec` (f16) | `1e-3` | f16 has only 11 bits of mantissa (~9.77e-4 per-element relative precision); a perfectly-normalized vector at typical dim accumulates norm error around `5e-4`, so a `1e-5` band would always falsely fail |
+
+Pass `--tol-norm <value>` to override either default explicitly. The
+report annotates the chosen tolerance with `[auto for "mvecs"]` (or
+`fvecs`) when the per-type default applied so you can see what was
+used.
+
+### Streaming KNN scan (no skip on large bases)
+
+The KNN-accuracy step uses streaming sgemm (`SgemmScanBuffers` +
+`scan_range_sgemm` from `compute_knn_blas`) with running per-query
+top-k heaps. It scans the full base in chunks rather than copying the
+whole base into a single `Vec<f32>`. RSS stays bounded by the chunk +
+score-matrix budgets (megabytes, not gigabytes), so the check runs
+the same way on a million-vector base as on a billion-vector one and
+never silently skips because of memory.
+
 ---
 
 ## 12.4 Verification Levels
@@ -457,8 +486,8 @@ Each axis has a default; pass any of them to narrow the matrix:
 > hit by design. Users iterating with different data on top of the
 > same output paths should point the engine at a fresh workspace
 > (or `rm -rf <workspace>/.cache` between experiments); the pipeline
-> runner does this automatically through its step-fingerprint chain
-> when inputs change upstream.
+> runner does this automatically through its per-step `ProvenanceMap`
+> chain when inputs change upstream.
 
 ### Why this is not a correctness concern
 

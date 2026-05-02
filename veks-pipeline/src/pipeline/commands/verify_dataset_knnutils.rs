@@ -47,6 +47,7 @@ use crate::pipeline::command::{
     ArtifactManifest, CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole,
     Options, Status, StreamContext, render_options_table,
 };
+use crate::pipeline::element_type::ElementType;
 
 // BLAS snrm2: same routine knn_utils calls via np.linalg.norm(vector).
 unsafe extern "C" {
@@ -175,6 +176,129 @@ fn check_fvecs(
         norm_mean,
         max_abs_dev,
     })
+}
+
+/// Check an mvecs (f16) file — same logic as `check_fvecs` but reads
+/// half-precision and upcasts each vector to f32 for the BLAS norm.
+fn check_mvecs(
+    path: &Path,
+    tol_norm: f64,
+    tol_zero: f64,
+    ui: &veks_core::ui::UiHandle,
+) -> Result<FvecsCheckResult, String> {
+    let reader = XvecReader::<half::f16>::open_path(path)
+        .map_err(|e| format!("open {}: {}", path.display(), e))?;
+    let count = <XvecReader<half::f16> as VectorReader<half::f16>>::count(&reader);
+    let dim = <XvecReader<half::f16> as VectorReader<half::f16>>::dim(&reader);
+
+    if count == 0 || dim == 0 {
+        return Err(format!("{}: empty file (count={}, dim={})", path.display(), count, dim));
+    }
+
+    let mut zero_count: u64 = 0;
+    let mut unnormalized_count: u64 = 0;
+    let mut normalized = true;
+    let mut norm_sum: f64 = 0.0;
+    let mut norm_min: f64 = f64::INFINITY;
+    let mut norm_max: f64 = f64::NEG_INFINITY;
+
+    let mut reclaim = vectordata::io::StreamReclaim::new(&reader, 0, count);
+
+    let pb_label = format!("checking mvecs: {}", path.file_name()
+        .map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "<input>".into()));
+    let pb = ui.bar_with_unit(count as u64, pb_label, "vectors");
+    const PB_CHUNK: usize = 1 << 14;
+
+    // Reusable f32 upcast buffer to avoid per-vector allocation.
+    let mut f32_buf: Vec<f32> = vec![0.0; dim];
+
+    for i in 0..count {
+        let slice = reader.get_slice(i);
+        for (j, v) in slice.iter().enumerate() {
+            f32_buf[j] = v.to_f32();
+        }
+        let norm = blas_snrm2(&f32_buf) as f64;
+
+        norm_sum += norm;
+        if norm < norm_min { norm_min = norm; }
+        if norm > norm_max { norm_max = norm; }
+
+        if (norm - 1.0).abs() > tol_norm {
+            normalized = false;
+            unnormalized_count += 1;
+        }
+        if norm < tol_zero {
+            zero_count += 1;
+        }
+        if i % PB_CHUNK == 0 {
+            pb.set_position(i as u64);
+        }
+        reclaim.advance(i);
+    }
+    drop(reclaim);
+    pb.finish();
+
+    let norm_mean = norm_sum / count as f64;
+    let max_abs_dev = (norm_min - 1.0).abs().max((norm_max - 1.0).abs());
+
+    Ok(FvecsCheckResult {
+        path: path.display().to_string(),
+        count,
+        dim,
+        zero_count,
+        unnormalized_count,
+        normalized,
+        norm_min,
+        norm_max,
+        norm_mean,
+        max_abs_dev,
+    })
+}
+
+/// Effective per-element-type tolerance. f16's 11-bit mantissa adds
+/// ~1e-3 of unavoidable per-element relative noise, which after
+/// accumulation across a typical dim lands a normalized vector's L2
+/// norm in a band several orders of magnitude wider than f32's. A
+/// fixed 1e-5 default would cause every f16-stored normalized dataset
+/// to fail this check spuriously; relax it when the user hasn't
+/// pinned the value explicitly.
+fn default_tol_norm_for(etype: ElementType) -> f64 {
+    match etype {
+        ElementType::F32 => 1e-5,
+        ElementType::F16 => 1e-3,
+        _ => 1e-5,
+    }
+}
+
+/// Dispatch an xvec norm/zero check by element type. Today only f32
+/// (.fvec) and f16 (.mvec) bases/queries are accepted by the broader
+/// pipeline, so anything else is a hard error here rather than a
+/// silent-but-wrong f32 reinterpretation.
+///
+/// Returns the (result, effective_tol_norm) pair so the caller can
+/// report the band that was actually applied — useful when the
+/// element type relaxed it from the user-facing default.
+fn check_vectors(
+    path: &Path,
+    user_tol_norm: Option<f64>,
+    tol_zero: f64,
+    ui: &veks_core::ui::UiHandle,
+) -> Result<(FvecsCheckResult, f64), String> {
+    let etype = ElementType::from_path(path)
+        .map_err(|e| format!(
+            "verify dataset-knnutils: cannot determine element type of {}: {}",
+            path.display(), e,
+        ))?;
+    let tol = user_tol_norm.unwrap_or_else(|| default_tol_norm_for(etype));
+    let result = match etype {
+        ElementType::F32 => check_fvecs(path, tol, tol_zero, ui)?,
+        ElementType::F16 => check_mvecs(path, tol, tol_zero, ui)?,
+        _ => return Err(format!(
+            "verify dataset-knnutils: unsupported element type {:?} for {} (only f32/.fvec and f16/.mvec are supported)",
+            etype, path.display(),
+        )),
+    };
+    Ok((result, tol))
 }
 
 /// Check an ivecs file — replicates ivecs_check.py logic.
@@ -402,8 +526,22 @@ checks, in a single pipeline step.
             Ok(n) => n,
             Err(e) => return error_result(e, start),
         };
-        let tol_norm: f64 = match options.parse_or("tol-norm", 1e-5_f64) {
-            Ok(v) => v, Err(e) => return error_result(e, start),
+        // tol-norm default depends on element type. f32 storage holds
+        // a normalized vector to within ~1e-6 per element, so a 1e-5
+        // band on the L2 norm is appropriate. f16 storage only has 11
+        // bits of mantissa (~9.77e-4 per-element relative precision);
+        // a perfectly-normalized f16 vector at dim=512 has accumulated
+        // norm error of order 5e-4, which would always trip a 1e-5
+        // tolerance even though the data is in fact L2-normalized.
+        // Pass the user value through `Option` so `check_vectors` can
+        // pick the per-type default when the user hasn't pinned it.
+        let user_tol_norm: Option<f64> = if options.get("tol-norm").is_some() {
+            match options.parse_or("tol-norm", 1e-5_f64) {
+                Ok(v) => Some(v),
+                Err(e) => return error_result(e, start),
+            }
+        } else {
+            None
         };
         let tol_zero: f64 = match options.parse_or("tol-zero", 1e-6_f64) {
             Ok(v) => v, Err(e) => return error_result(e, start),
@@ -425,9 +563,18 @@ checks, in a single pipeline step.
         // Banner: tell the user up-front what's about to happen and at
         // what scale. Cheap to compute — just peek at the query file
         // header for the total count via mmap.
-        let query_total = XvecReader::<f32>::open_path(&query_path)
-            .map(|r| <XvecReader<f32> as VectorReader<f32>>::count(&r))
-            .ok();
+        // Peek the query count for the banner. Dispatch by element
+        // type so the .mvecs (f16) case doesn't trip the f32 stride
+        // check inside the reader.
+        let query_total = match ElementType::from_path(&query_path) {
+            Ok(ElementType::F32) => XvecReader::<f32>::open_path(&query_path)
+                .map(|r| <XvecReader<f32> as VectorReader<f32>>::count(&r))
+                .ok(),
+            Ok(ElementType::F16) => XvecReader::<half::f16>::open_path(&query_path)
+                .map(|r| <XvecReader<half::f16> as VectorReader<half::f16>>::count(&r))
+                .ok(),
+            _ => None,
+        };
         let actual_sample = sample_count.min(query_total.unwrap_or(sample_count));
         let total_str = match query_total {
             Some(t) => format!("{}", t),
@@ -454,7 +601,7 @@ checks, in a single pipeline step.
         // ── fvecs check: base vectors ───────────────────────────────────
         emit(ctx, &format!("--- Base Vectors: {} ---", base_path.display()));
 
-        let base_result = match check_fvecs(&base_path, tol_norm, tol_zero, &ctx.ui) {
+        let (base_result, base_tol_norm) = match check_vectors(&base_path, user_tol_norm, tol_zero, &ctx.ui) {
             Ok(r) => r,
             Err(e) => {
                 emit(ctx, &format!("  FAIL: {}", e));
@@ -465,8 +612,9 @@ checks, in a single pipeline step.
         emit(ctx, &format!("  Total embeddings: {}", base_result.count));
         emit(ctx, &format!("  Dimensionality: {}", base_result.dim));
         emit(ctx, &format!("  Zero vectors (< {:.0e}): {}", tol_zero, base_result.zero_count));
-        emit(ctx, &format!("  Unnormalized vectors (|norm-1| > {:.0e}): {}",
-            tol_norm, base_result.unnormalized_count));
+        emit(ctx, &format!("  Unnormalized vectors (|norm-1| > {:.0e}): {}{}",
+            base_tol_norm, base_result.unnormalized_count,
+            if user_tol_norm.is_none() { format!(" [auto for {:?}]", base_path.extension().and_then(|e| e.to_str()).unwrap_or("?")) } else { String::new() }));
         emit(ctx, &format!("  Norm max abs deviation from 1.0: {:.9e}", base_result.max_abs_dev));
         emit(ctx, &format!("  Norm mean: {:.9e}", base_result.norm_mean));
         emit(ctx, &format!("  Norm range: [{:.9e}, {:.9e}]", base_result.norm_min, base_result.norm_max));
@@ -477,14 +625,14 @@ checks, in a single pipeline step.
             all_passed = false;
             "FAIL"
         };
-        emit(ctx, &format!("  Normalized: {} (tol={:.0e})", base_result.normalized, tol_norm));
+        emit(ctx, &format!("  Normalized: {} (tol={:.0e})", base_result.normalized, base_tol_norm));
         emit(ctx, &format!("  Status: {}", base_status));
         emit(ctx, "");
 
         // ── fvecs check: query vectors ──────────────────────────────────
         emit(ctx, &format!("--- Query Vectors: {} ---", query_path.display()));
 
-        let query_result = match check_fvecs(&query_path, tol_norm, tol_zero, &ctx.ui) {
+        let (query_result, query_tol_norm) = match check_vectors(&query_path, user_tol_norm, tol_zero, &ctx.ui) {
             Ok(r) => r,
             Err(e) => {
                 emit(ctx, &format!("  FAIL: {}", e));
@@ -495,8 +643,9 @@ checks, in a single pipeline step.
         emit(ctx, &format!("  Total embeddings: {}", query_result.count));
         emit(ctx, &format!("  Dimensionality: {}", query_result.dim));
         emit(ctx, &format!("  Zero vectors (< {:.0e}): {}", tol_zero, query_result.zero_count));
-        emit(ctx, &format!("  Unnormalized vectors (|norm-1| > {:.0e}): {}",
-            tol_norm, query_result.unnormalized_count));
+        emit(ctx, &format!("  Unnormalized vectors (|norm-1| > {:.0e}): {}{}",
+            query_tol_norm, query_result.unnormalized_count,
+            if user_tol_norm.is_none() { format!(" [auto for {:?}]", query_path.extension().and_then(|e| e.to_str()).unwrap_or("?")) } else { String::new() }));
         emit(ctx, &format!("  Norm max abs deviation from 1.0: {:.9e}", query_result.max_abs_dev));
         emit(ctx, &format!("  Norm mean: {:.9e}", query_result.norm_mean));
         emit(ctx, &format!("  Norm range: [{:.9e}, {:.9e}]", query_result.norm_min, query_result.norm_max));
@@ -507,7 +656,7 @@ checks, in a single pipeline step.
             all_passed = false;
             "FAIL"
         };
-        emit(ctx, &format!("  Normalized: {} (tol={:.0e})", query_result.normalized, tol_norm));
+        emit(ctx, &format!("  Normalized: {} (tol={:.0e})", query_result.normalized, query_tol_norm));
         emit(ctx, &format!("  Status: {}", query_status));
         emit(ctx, "");
 
@@ -609,18 +758,30 @@ checks, in a single pipeline step.
         emit(ctx, &format!("  Sampling {} of {} queries, metric={}, k={}",
             actual_sample, query_result.count, metric_str, k));
 
-        // Recompute KNN for sampled queries using BLAS sgemm
-        let base_reader = XvecReader::<f32>::open_path(&base_path)
-            .map_err(|e| format!("reopen base: {}", e));
-        let base_reader = match base_reader {
-            Ok(r) => r,
-            Err(e) => return error_result(e, start),
+        // Recompute KNN for sampled queries using BLAS sgemm. sgemm
+        // wants f32, but the base / query files may be f16. Decide the
+        // element type once per file, then dispatch the actual reads
+        // below — same pattern as `verify knn-consolidated`, no
+        // AnyFloatReader hidden in a hot loop.
+        let base_etype = match ElementType::from_path(&base_path) {
+            Ok(et @ (ElementType::F32 | ElementType::F16)) => et,
+            Ok(et) => return error_result(format!(
+                "verify dataset-knnutils: unsupported base element type {:?} for {}",
+                et, base_path.display(),
+            ), start),
+            Err(e) => return error_result(format!(
+                "verify dataset-knnutils: cannot determine base element type: {}", e,
+            ), start),
         };
-        let query_reader = XvecReader::<f32>::open_path(&query_path)
-            .map_err(|e| format!("reopen query: {}", e));
-        let query_reader = match query_reader {
-            Ok(r) => r,
-            Err(e) => return error_result(e, start),
+        let query_etype = match ElementType::from_path(&query_path) {
+            Ok(et @ (ElementType::F32 | ElementType::F16)) => et,
+            Ok(et) => return error_result(format!(
+                "verify dataset-knnutils: unsupported query element type {:?} for {}",
+                et, query_path.display(),
+            ), start),
+            Err(e) => return error_result(format!(
+                "verify dataset-knnutils: cannot determine query element type: {}", e,
+            ), start),
         };
         let gt_reader = XvecReader::<i32>::open_path(&indices_path)
             .map_err(|e| format!("reopen gt: {}", e));
@@ -631,66 +792,28 @@ checks, in a single pipeline step.
 
         let dim = base_result.dim;
 
-        // The KNN sample-recompute step copies the full base file
-        // into a Vec<f32> and runs sgemm against the sampled queries
-        // in one shot. That's fine for medium datasets but allocates
-        // base_count × dim × 4 bytes — 1.5 TB for a billion-vector
-        // base — which would always blow past the governor's mem
-        // ceiling. Cooperate with the governor: skip this step when
-        // the projected RSS exceeds 50% of the configured ceiling,
-        // and tell the user why.
-        let projected_bytes = (base_result.count as u64) * (dim as u64) * 4;
-        let mem_budget = ctx.governor.current_or("mem", u64::MAX);
-        let safe_budget = mem_budget / 2;
-        if projected_bytes > safe_budget {
-            emit(ctx, &format!(
-                "  Skipping KNN sample-recompute: would allocate {:.1} GiB (50% of mem budget = {:.1} GiB).",
-                projected_bytes as f64 / (1u64 << 30) as f64,
-                safe_budget as f64 / (1u64 << 30) as f64,
-            ));
-            emit(ctx, "  Use `verify knn-consolidated` (or `verify knn-faiss-consolidated`) for \
-                       streaming KNN verification on large bases.");
-            // Skip the rest of this section but don't fail the
-            // command — file-level checks have already passed.
-            let elapsed = start.elapsed();
-            let final_status = if all_passed { "PASS" } else { "FAIL" };
-            emit(ctx, &format!("\n=== Verification {} ({:.1}s) ===", final_status, elapsed.as_secs_f64()));
-            if let Some(parent) = report_path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            match std::fs::write(&report_path, report.join("\n")) {
-                Ok(_) => ctx.ui.log(&format!("  Report saved to {}", report_path.display())),
-                Err(e) => ctx.ui.log(&format!("  Warning: failed to write report: {}", e)),
-            }
-            return CommandResult {
-                status: if all_passed { Status::Ok } else { Status::Error },
-                message: format!("dataset-knnutils {} ({:.1}s) — KNN sample skipped (large base)",
-                    final_status, elapsed.as_secs_f64()),
-                produced: vec![],
-                elapsed,
-            };
-        }
+        // The previous implementation loaded the entire base into a
+        // single Vec<f32> and ran one big sgemm — fine for medium
+        // datasets but a non-starter on hundred-GiB / TB bases, where
+        // it used to silently bail out with a "use verify
+        // knn-consolidated" hint. The KNN check is the headline result
+        // of this verifier; skipping it isn't an option. Use the same
+        // streaming sgemm machinery as `verify knn-consolidated`
+        // (`SgemmScanBuffers` + `scan_range_sgemm` + cumulative top-k
+        // heaps) so RSS stays bounded regardless of base size.
+        let n_base = base_result.count;
+        let use_ip = faiss_mt_is_ip;
+        // Per the knn_utils convention this verifier mirrors, COSINE
+        // assumes pre-normalized inputs and is computed as inner
+        // product. `proper_cosine = false` keeps that contract.
+        let proper_cosine = false;
+        let elem_size: usize = match base_etype {
+            ElementType::F32 => 4,
+            ElementType::F16 => 2,
+            _ => unreachable!("base_etype was filtered to F32/F16 above"),
+        };
 
-        // Load all base vectors. On large datasets this moves GBs
-        // through memory; emit a progress bar so a standalone
-        // invocation isn't silent during the load.
-        emit(ctx, "  Loading base vectors for verification...");
-        let mut base_data: Vec<f32> = Vec::with_capacity(base_result.count * dim);
-        let pb_load = ctx.ui.bar_with_unit(
-            base_result.count as u64,
-            "loading base vectors",
-            "vectors",
-        );
-        const PB_LOAD_CHUNK: usize = 1 << 14;
-        for i in 0..base_result.count {
-            base_data.extend_from_slice(base_reader.get_slice(i));
-            if i % PB_LOAD_CHUNK == 0 {
-                pb_load.set_position(i as u64);
-            }
-        }
-        pb_load.finish();
-
-        // Generate deterministic sample indices
+        // Generate deterministic sample indices.
         let mut sample_indices: Vec<usize> = Vec::with_capacity(actual_sample);
         if actual_sample >= query_result.count {
             sample_indices.extend(0..query_result.count);
@@ -701,42 +824,107 @@ checks, in a single pipeline step.
             }
         }
 
-        // Load sampled queries
-        let mut sample_query_data: Vec<f32> = Vec::with_capacity(actual_sample * dim);
-        for &qi in &sample_indices {
-            sample_query_data.extend_from_slice(query_reader.get_slice(qi));
+        // Pack sampled queries flat (one row per query, dim wide). The
+        // streaming scan reuses this packed buffer on every chunk.
+        let mut queries_packed: Vec<f32> = Vec::with_capacity(actual_sample * dim);
+        match query_etype {
+            ElementType::F32 => {
+                let r = match XvecReader::<f32>::open_path(&query_path) {
+                    Ok(r) => r,
+                    Err(e) => return error_result(format!("reopen query: {}", e), start),
+                };
+                for &qi in &sample_indices {
+                    queries_packed.extend_from_slice(r.get_slice(qi));
+                }
+            }
+            ElementType::F16 => {
+                let r = match XvecReader::<half::f16>::open_path(&query_path) {
+                    Ok(r) => r,
+                    Err(e) => return error_result(format!("reopen query: {}", e), start),
+                };
+                for &qi in &sample_indices {
+                    let s = r.get_slice(qi);
+                    for v in s { queries_packed.push(v.to_f32()); }
+                }
+            }
+            _ => unreachable!("query_etype was filtered to F32/F16 above"),
         }
+        let query_norms_sq: Vec<f32> = (0..actual_sample).map(|qi| {
+            let s = &queries_packed[qi * dim..(qi + 1) * dim];
+            s.iter().map(|v| v * v).sum::<f32>()
+        }).collect();
 
-        // Compute scores via BLAS sgemm: scores = queries @ base.T
-        let use_ip = faiss_mt_is_ip;
-        let n_base = base_result.count;
-        let mut scores: Vec<f32> = vec![0.0f32; actual_sample * n_base];
+        emit(ctx, &format!(
+            "  Streaming sgemm scan over {} base vectors ({} sample queries, elem={}B)",
+            n_base, actual_sample, elem_size,
+        ));
+        let base_file = match std::fs::File::open(&base_path) {
+            Ok(f) => f,
+            Err(e) => return error_result(format!("open base for streaming: {}", e), start),
+        };
 
-        unsafe {
-            super::compute_knn_blas::blas_sgemm_scores(
-                &sample_query_data, actual_sample,
-                &base_data, n_base,
-                dim, use_ip,
-                &mut scores,
-            );
+        let mut scan_buffers = super::compute_knn_blas::SgemmScanBuffers::new(actual_sample, dim);
+        emit(ctx, &format!(
+            "  chunk plan: {} base/chunk × {} queries/sub-batch",
+            scan_buffers.vecs_per_chunk(), scan_buffers.qb_size(),
+        ));
+
+        let mut cumulative_heaps: Vec<std::collections::BinaryHeap<super::compute_knn::Neighbor>> =
+            (0..actual_sample)
+                .map(|_| std::collections::BinaryHeap::with_capacity(k + 1))
+                .collect();
+        let mut cumulative_thresholds: Vec<f32> = vec![f32::INFINITY; actual_sample];
+
+        let scan_pb = ctx.ui.bar_with_unit(
+            n_base as u64,
+            format!("scanning {} base ({}q × {}d)", n_base, actual_sample, dim),
+            "vectors",
+        );
+        let scan_t0 = Instant::now();
+        {
+            let pb_ref = &scan_pb;
+            let mut tick_cb = move |done: u64| { pb_ref.set_position(done); };
+            if let Err(e) = super::compute_knn_blas::scan_range_sgemm(
+                &base_file,
+                0..n_base,
+                dim,
+                elem_size,
+                &queries_packed,
+                actual_sample,
+                &query_norms_sq,
+                use_ip,
+                proper_cosine,
+                k,
+                &mut scan_buffers,
+                &mut cumulative_heaps,
+                &mut cumulative_thresholds,
+                Some(&mut tick_cb),
+            ) {
+                return error_result(format!("streaming scan: {}", e), start);
+            }
         }
+        scan_pb.finish();
+        emit(ctx, &format!(
+            "  scan done in {:.1}s ({:.1}M base/s)",
+            scan_t0.elapsed().as_secs_f64(),
+            n_base as f64 / scan_t0.elapsed().as_secs_f64().max(0.001) / 1e6,
+        ));
 
-        // Top-k selection for each query
-        struct VerifyResult {
-            labels: Vec<i32>,  // flattened [actual_sample * k]
-        }
-        let mut labels = Vec::with_capacity(actual_sample * k);
-        for qi in 0..actual_sample {
-            let row = &scores[qi * n_base..(qi + 1) * n_base];
-            let topk = super::compute_knn_blas::topk_indices(row, k);
+        // Convert heaps → flat labels (ascending distance, nearest
+        // first) for the existing per-query comparison loop. Pad with
+        // -1 if a heap somehow ended short of k.
+        let mut labels: Vec<i32> = Vec::with_capacity(actual_sample * k);
+        for heap in cumulative_heaps.into_iter() {
+            let sorted = heap.into_sorted_vec();
             for j in 0..k {
-                if j < topk.len() {
-                    labels.push(topk[j].index as i32);
+                if j < sorted.len() {
+                    labels.push(sorted[j].index as i32);
                 } else {
                     labels.push(-1);
                 }
             }
         }
+        struct VerifyResult { labels: Vec<i32> }
         let batch_result = VerifyResult { labels };
 
         // Compare each sampled query's result against ground truth.
@@ -878,6 +1066,7 @@ mod tests {
             ui: veks_core::ui::UiHandle::new(std::sync::Arc::new(veks_core::ui::TestSink::new())),
             status_interval: std::time::Duration::from_secs(1),
             estimated_total_steps: 0,
+            provenance_selector: crate::pipeline::provenance::ProvenanceFlags::STRICT,
         }
     }
 

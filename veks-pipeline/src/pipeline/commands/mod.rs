@@ -40,6 +40,7 @@ pub mod compute_dedup;
 pub mod dataset_json;
 pub mod compute_filtered_knn;
 pub mod compute_knn;
+pub mod compute_knn_distances;
 pub mod compute_partition_profiles;
 pub mod knn_segment;
 #[cfg(feature = "knnutils")]
@@ -161,6 +162,7 @@ pub fn register_all(registry: &mut CommandRegistry) {
     // Users who specifically want the no-deps stdarch path can ask
     // for `compute knn-stdarch` explicitly.
     registry.register("compute knn", compute_knn::factory);
+    registry.register("compute knn-distances", compute_knn_distances::factory);
     #[cfg(feature = "faiss")]
     registry.register("compute knn-faiss", compute_knn_faiss::factory);
     registry.register("compute sort", compute_dedup::factory);

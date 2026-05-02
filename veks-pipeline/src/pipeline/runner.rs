@@ -58,6 +58,7 @@ use super::command::{ArtifactState, CommandResult, Options, Status, StreamContex
 use super::dag::ResolvedStep;
 use super::interpolate;
 use super::progress::{OutputRecord, ResourceSummary, StepRecord};
+use super::provenance::ProvenanceMap;
 use super::registry::CommandRegistry;
 use super::schema::OnPartial;
 
@@ -178,31 +179,33 @@ pub fn run_steps(
         let mut cmd = factory();
         let cmd_build_version = cmd.build_version().to_string();
 
-        // 3. Compute configuration fingerprint for this step.
-        //    The fingerprint chains through the DAG: it includes the
-        //    fingerprints of all upstream steps and the command's build
-        //    version. If any upstream step re-executed (new fingerprint),
-        //    or the command was recompiled (new build version), this
-        //    step's computed fingerprint will differ from the stored one.
+        // 3. Build the structured provenance for this step.
+        //    Captures identity, decomposed binary version, resolved
+        //    options, and the recursive provenance maps of every
+        //    upstream step. Staleness is decided by hashing this map
+        //    under the runtime-selected `ProvenanceFlags` selector;
+        //    storing the full structure lets us compare under a
+        //    different selector on a later run without re-execution.
         let upstream_ids: Vec<&str> = step.def.after.iter()
             .map(|s| s.as_str())
             .collect();
-        let fingerprint = ctx.progress.compute_fingerprint(
+        let provenance = ctx.progress.build_provenance(
             &step.id,
             &step.def.run,
             &resolved_map,
             &upstream_ids,
             &cmd_build_version,
         );
+        let selector = ctx.provenance_selector;
 
-        // 4. Check freshness: progress log + fingerprint chain.
-        //    The fingerprint check subsumes mtime-based cascade —
-        //    if an upstream re-executed, its fingerprint changed,
-        //    which changes this step's computed fingerprint.
+        // 4. Check freshness: progress log + provenance under selector.
+        //    The provenance check subsumes the v4 fingerprint cascade —
+        //    if an upstream's recorded provenance differs (under the
+        //    same selector), this step's hash differs.
         let progress_fresh;
-        let fingerprint_reason = ctx.progress.check_fingerprint(&step.id, &fingerprint);
+        let provenance_reason = ctx.progress.check_provenance(&step.id, &provenance, selector);
         match ctx.progress.check_step_freshness(&step.id, Some(&resolved_map), Some(&ctx.workspace)) {
-            None if fingerprint_reason.is_none() => {
+            None if provenance_reason.is_none() => {
                 skipped_count += 1;
                 step_outcomes.push((step.id.clone(), false, "fresh".into()));
                 ctx.ui.log(&format!("{} {} — fresh, skipping", prefix, step.id));
@@ -211,9 +214,9 @@ pub fn run_steps(
                 continue;
             }
             None => {
-                // Outputs/options match but fingerprint changed — upstream config or build changed
+                // Outputs/options match but provenance changed — upstream config or build changed
                 ctx.ui.log(&format!("{} {} — stale: {}", prefix, step.id,
-                    fingerprint_reason.as_deref().unwrap_or("fingerprint changed")));
+                    provenance_reason.as_deref().unwrap_or("provenance changed")));
                 progress_fresh = false;
             }
             Some(reason) => {
@@ -291,8 +294,7 @@ pub fn run_steps(
                                 .collect(),
                             error: None,
                             resource_summary: None,
-                            fingerprint: Some(fingerprint.clone()),
-                            build_version: Some(cmd_build_version.clone()),
+                            provenance: Some(provenance.clone()),
                         },
                     );
                     if let Err(e) = ctx.progress.save() {
@@ -637,7 +639,7 @@ pub fn run_steps(
 
         // 8. Record result with the original (unmunged) options
         ctx.ui.clear();
-        let record = step_record_from_result(&result, &resolved_opts, resource_summary, Some(fingerprint.clone()), Some(cmd_build_version.clone()));
+        let record = step_record_from_result(&result, &resolved_opts, resource_summary, Some(provenance.clone()));
         ctx.progress.record_step(&step.id, record);
 
         // If this step modified files that were outputs of previous steps
@@ -730,8 +732,7 @@ pub fn run_steps(
                             .collect(),
                         error: Some(msg.clone()),
                         resource_summary: None,
-                        fingerprint: Some(fingerprint.clone()),
-                        build_version: Some(cmd_build_version.clone()),
+                        provenance: Some(provenance.clone()),
                     },
                 );
                 if let Err(e) = ctx.progress.save() {
@@ -831,8 +832,7 @@ fn step_record_from_result(
     result: &CommandResult,
     resolved_opts: &indexmap::IndexMap<String, String>,
     resource_summary: Option<ResourceSummary>,
-    fingerprint: Option<String>,
-    build_version: Option<String>,
+    provenance: Option<ProvenanceMap>,
 ) -> StepRecord {
     let outputs: Vec<OutputRecord> = result
         .produced
@@ -873,7 +873,6 @@ fn step_record_from_result(
             .collect::<HashMap<_, _>>(),
         error,
         resource_summary,
-        fingerprint,
-        build_version,
+        provenance,
     }
 }

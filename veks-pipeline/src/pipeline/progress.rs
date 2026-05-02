@@ -4,17 +4,22 @@
 //! Progress log for command stream pipelines.
 //!
 //! Tracks the status of each pipeline step in a persistent YAML file
-//! (`.cache/.upstream.progress.yaml`) in the workspace cache directory. This enables
-//! skip-if-fresh semantics: completed steps are skipped on re-run unless
-//! their inputs have changed.
+//! (`.cache/.upstream.progress.yaml`) in the workspace cache directory.
+//! This enables skip-if-fresh semantics: completed steps are skipped on
+//! re-run unless their inputs have changed.
+//!
+//! Per-step staleness is governed by a structured
+//! [`ProvenanceMap`](super::provenance::ProvenanceMap) — see that module
+//! for details on selector-driven hashing.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::command::Status;
+use super::provenance::{BinaryVersion, ProvenanceFlags, ProvenanceMap};
 
 /// Schema version for the progress log.
 ///
@@ -26,7 +31,9 @@ use super::command::Status;
 /// - v3: fingerprint chains for DAG-based staleness
 /// - v4: build_version in StepRecord, mtime-based staleness removed,
 ///        fingerprint now includes command build version
-const PROGRESS_SCHEMA_VERSION: u32 = 4;
+/// - v5: structured `ProvenanceMap` replaces opaque fingerprint string;
+///        staleness check is selector-driven (see `ProvenanceFlags`)
+const PROGRESS_SCHEMA_VERSION: u32 = 5;
 
 /// Persistent progress log for a pipeline execution.
 ///
@@ -85,17 +92,13 @@ pub struct StepRecord {
     /// Resource consumption summary (peak RSS, CPU, I/O).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource_summary: Option<ResourceSummary>,
-    /// Configuration fingerprint: hash of this step's identity (id, command,
-    /// resolved options, build version) plus the fingerprints of all upstream
-    /// dependencies. When the fingerprint changes, this step and all
-    /// downstream dependents must re-execute.
+    /// Structured provenance for staleness checks. The recorded map
+    /// captures every component (identity, binary version components,
+    /// resolved options, upstream provenance) so the staleness hash can
+    /// be recomputed under any [`ProvenanceFlags`] selector at check
+    /// time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fingerprint: Option<String>,
-    /// Build version of the command that produced this result.
-    /// When the current command's build_version differs from this stored
-    /// value, the step is stale — the command logic may have changed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub build_version: Option<String>,
+    pub provenance: Option<ProvenanceMap>,
 }
 
 /// Record of a single output artifact at completion time.
@@ -163,80 +166,79 @@ impl ProgressLog {
         }
     }
 
-    /// Compute the configuration fingerprint for a step.
-    ///
-    /// The fingerprint is a hash of the step's identity (id, command,
-    /// sorted resolved options) plus the stored fingerprints of all
-    /// upstream dependencies. If any upstream step has no stored
-    /// fingerprint (legacy record), it contributes "unknown".
-    ///
-    /// This creates a Merkle-like chain: changing any step's options
-    /// invalidates that step and cascades to all dependents.
-    pub fn compute_fingerprint(
+    /// Build a [`ProvenanceMap`] for a step. Pulls the upstream maps
+    /// from the stored records of the named upstream steps; missing or
+    /// legacy records contribute an empty default map (the resulting
+    /// hash will treat them as a known-distinct sentinel under any
+    /// selector that includes `UPSTREAM`).
+    pub fn build_provenance(
         &self,
         step_id: &str,
-        run_command: &str,
+        command_path: &str,
         resolved_options: &HashMap<String, String>,
         upstream_ids: &[&str],
         build_version: &str,
-    ) -> String {
-        let mut hasher = FnvHasher::new();
-        hasher.write(step_id.as_bytes());
-        hasher.write(b"\0");
-        hasher.write(run_command.as_bytes());
-        hasher.write(b"\0");
-        hasher.write(build_version.as_bytes());
-        hasher.write(b"\0");
-
-        // Sort options for deterministic ordering
-        let mut sorted: Vec<(&str, &str)> = resolved_options
-            .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str()))
-            .collect();
-        sorted.sort();
-        for (k, v) in sorted {
-            hasher.write(k.as_bytes());
-            hasher.write(b"=");
-            hasher.write(v.as_bytes());
-            hasher.write(b"\0");
+    ) -> ProvenanceMap {
+        let binary = BinaryVersion::parse(build_version);
+        let mut upstream: BTreeMap<String, ProvenanceMap> = BTreeMap::new();
+        for up_id in upstream_ids {
+            let up_map = self
+                .steps
+                .get(*up_id)
+                .and_then(|r| r.provenance.clone())
+                .unwrap_or_else(|| ProvenanceMap {
+                    step_id: (*up_id).to_string(),
+                    command_path: String::new(),
+                    binary_version_major: 0,
+                    binary_version_minor: 0,
+                    binary_version_patch: 0,
+                    binary_git_hash: String::new(),
+                    binary_dirty: false,
+                    options: BTreeMap::new(),
+                    upstream: BTreeMap::new(),
+                });
+            upstream.insert((*up_id).to_string(), up_map);
         }
-
-        // Chain upstream fingerprints
-        hasher.write(b"upstream:");
-        let mut up_sorted: Vec<&str> = upstream_ids.to_vec();
-        up_sorted.sort();
-        for up_id in up_sorted {
-            let up_fp = self.steps.get(up_id)
-                .and_then(|r| r.fingerprint.as_deref())
-                .unwrap_or("unknown");
-            hasher.write(up_id.as_bytes());
-            hasher.write(b":");
-            hasher.write(up_fp.as_bytes());
-            hasher.write(b"\0");
-        }
-
-        format!("{:016x}", hasher.finish())
+        ProvenanceMap::build(step_id, command_path, &binary, resolved_options, upstream)
     }
 
-    /// Check whether a step's stored fingerprint matches its current
-    /// computed fingerprint. Returns `Some(reason)` if stale.
-    pub fn check_fingerprint(
+    /// Check whether a step's stored provenance matches the current
+    /// computed provenance under `selector`. Returns `Some(reason)` if
+    /// stale, `None` if fresh.
+    pub fn check_provenance(
         &self,
         step_id: &str,
-        current_fingerprint: &str,
+        current: &ProvenanceMap,
+        selector: ProvenanceFlags,
     ) -> Option<String> {
         match self.steps.get(step_id) {
-            Some(record) => {
-                match record.fingerprint.as_deref() {
-                    Some(stored) if stored == current_fingerprint => None,
-                    Some(stored) => Some(format!(
-                        "fingerprint changed ({} → {})",
-                        &stored[..8.min(stored.len())],
-                        &current_fingerprint[..8.min(current_fingerprint.len())],
-                    )),
-                    None => None, // legacy record without fingerprint — trust it
+            Some(record) => match record.provenance.as_ref() {
+                Some(stored) => {
+                    let stored_hash = stored.hash(selector);
+                    let current_hash = current.hash(selector);
+                    if stored_hash == current_hash {
+                        None
+                    } else {
+                        let diffs = current.diff(stored);
+                        let summary: Vec<String> =
+                            diffs.iter().take(3).map(|d| d.to_string()).collect();
+                        let extra = if diffs.len() > 3 {
+                            format!(" (+{} more)", diffs.len() - 3)
+                        } else {
+                            String::new()
+                        };
+                        Some(if summary.is_empty() {
+                            format!(
+                                "provenance changed under selector '{}'",
+                                selector.describe()
+                            )
+                        } else {
+                            format!("provenance changed: {}{}", summary.join("; "), extra)
+                        })
+                    }
                 }
-            }
+                None => None, // legacy record without provenance — trust it
+            },
             None => Some("not recorded".to_string()),
         }
     }
@@ -258,7 +260,6 @@ impl ProgressLog {
         // Migrate from old location if needed
         if old_path.exists() {
             if !new_path.exists() {
-                // Ensure .cache/ exists
                 let cache_dir = dir.join(".cache");
                 if std::fs::create_dir_all(&cache_dir).is_ok() {
                     if std::fs::rename(&old_path, &new_path).is_ok() {
@@ -270,7 +271,6 @@ impl ProgressLog {
                     }
                 }
             } else {
-                // Both exist — new location is authoritative, remove orphan
                 let _ = std::fs::remove_file(&old_path);
             }
         }
@@ -311,9 +311,6 @@ impl ProgressLog {
 
     /// Check whether the recorded outputs for a step still match disk state
     /// and the resolved options haven't changed.
-    ///
-    /// Returns `true` if the step is fresh, `false` if it needs re-running.
-    /// Use [`check_step_freshness`] for a detailed reason string.
     pub fn is_step_fresh(
         &self,
         step_id: &str,
@@ -324,16 +321,10 @@ impl ProgressLog {
 
     /// Check whether a step needs to be re-run, returning a reason if stale.
     ///
-    /// Returns `None` if the step is fresh, or `Some(reason)` describing why
-    /// it is stale (options changed, outputs missing/corrupted, etc.).
-    ///
-    /// Staleness from upstream changes is handled by the fingerprint chain
-    /// (see `compute_fingerprint` and `check_fingerprint`) — not by mtime
-    /// comparisons. This method only checks local state: options match,
-    /// outputs exist with correct sizes.
-    ///
-    /// When `workspace` is provided, relative paths in options are resolved
-    /// against it for output file checks.
+    /// Returns `None` if the step is fresh (locally), or `Some(reason)`
+    /// describing why it is stale (options changed, outputs missing/corrupted,
+    /// etc.). Upstream / build / config staleness is handled by
+    /// `check_provenance` — not by this method.
     pub fn check_step_freshness(
         &self,
         step_id: &str,
@@ -351,17 +342,12 @@ impl ProgressLog {
             return Some("previous run was a bound-check skip, re-validating".to_string());
         }
 
-        // Check whether resolved options changed since the last run
         if let Some(current) = current_options {
             if !record.resolved_options.is_empty() && &record.resolved_options != current {
                 return Some("options changed".to_string());
             }
         }
 
-        // Check output files exist with matching sizes.
-        // Catalog files are regenerable artifacts that may be updated
-        // externally (e.g., `veks prepare catalog generate` from a parent
-        // directory) — skip size verification for them.
         for output in &record.outputs {
             let path = resolve_path(&output.path, workspace);
             let filename = std::path::Path::new(&output.path)
@@ -405,8 +391,8 @@ impl ProgressLog {
 
 /// FNV-1a 64-bit hasher for deterministic fingerprinting.
 ///
-/// Used by the pipeline executor to compute per-step configuration
-/// fingerprints. No external dependency.
+/// Used by [`super::provenance`] to compute selector-driven staleness
+/// hashes. No external dependency.
 pub struct FnvHasher {
     state: u64,
 }
@@ -443,6 +429,20 @@ fn resolve_path(value: &str, workspace: Option<&Path>) -> PathBuf {
 mod tests {
     use super::*;
 
+    fn rec(provenance: Option<ProvenanceMap>) -> StepRecord {
+        StepRecord {
+            status: Status::Ok,
+            message: "done".into(),
+            completed_at: Utc::now(),
+            elapsed_secs: 1.0,
+            outputs: vec![],
+            resolved_options: HashMap::new(),
+            error: None,
+            resource_summary: None,
+            provenance,
+        }
+    }
+
     #[test]
     fn test_progress_log_path() {
         let path = ProgressLog::path_for_dataset(Path::new("/data/my-dataset/dataset.yaml"));
@@ -456,23 +456,7 @@ mod tests {
     fn test_record_and_check() {
         let mut log = ProgressLog::new();
         assert!(log.get_step("step1").is_none());
-
-        log.record_step(
-            "step1",
-            StepRecord {
-                status: Status::Ok,
-                message: "done".to_string(),
-                completed_at: Utc::now(),
-                elapsed_secs: 1.5,
-                outputs: vec![],
-                resolved_options: HashMap::new(),
-                error: None,
-                resource_summary: None,
-                fingerprint: None,
-                build_version: None,
-            },
-        );
-
+        log.record_step("step1", rec(None));
         assert!(log.get_step("step1").is_some());
         assert!(log.get_step("step2").is_none());
     }
@@ -480,25 +464,13 @@ mod tests {
     #[test]
     fn test_roundtrip() {
         let mut log = ProgressLog::new();
-        log.record_step(
-            "step1",
-            StepRecord {
-                status: Status::Ok,
-                message: "completed".to_string(),
-                completed_at: Utc::now(),
-                elapsed_secs: 2.0,
-                outputs: vec![OutputRecord {
-                    path: "output.fvec".to_string(),
-                    size: 1024,
-                    mtime: None,
-                }],
-                resolved_options: HashMap::new(),
-                error: None,
-                resource_summary: None,
-                fingerprint: None,
-                build_version: None,
-            },
-        );
+        let mut r = rec(None);
+        r.outputs.push(OutputRecord {
+            path: "output.fvec".into(),
+            size: 1024,
+            mtime: None,
+        });
+        log.record_step("step1", r);
 
         let yaml = serde_yaml::to_string(&log).unwrap();
         let parsed: ProgressLog = serde_yaml::from_str(&yaml).unwrap();
@@ -520,21 +492,7 @@ mod tests {
         let path = cache_dir.join(".upstream.progress.yaml");
 
         let (mut log, _) = ProgressLog::load(&path).unwrap();
-        log.record_step(
-            "test-step",
-            StepRecord {
-                status: Status::Ok,
-                message: "ok".to_string(),
-                completed_at: Utc::now(),
-                elapsed_secs: 0.5,
-                outputs: vec![],
-                resolved_options: HashMap::new(),
-                error: None,
-                resource_summary: None,
-                fingerprint: None,
-                build_version: None,
-            },
-        );
+        log.record_step("test-step", rec(None));
         log.save().unwrap();
 
         let (reloaded, _) = ProgressLog::load(&path).unwrap();
@@ -542,218 +500,127 @@ mod tests {
     }
 
     #[test]
-    fn test_fingerprint_basic() {
+    fn test_build_provenance_basic() {
         let log = ProgressLog::new();
         let mut opts = HashMap::new();
         opts.insert("source".to_string(), "base.fvec".to_string());
         opts.insert("output".to_string(), "out.fvec".to_string());
 
-        let fp1 = log.compute_fingerprint("step1", "transform extract", &opts, &[], "");
-        let fp2 = log.compute_fingerprint("step1", "transform extract", &opts, &[], "");
-        assert_eq!(fp1, fp2, "same inputs should produce same fingerprint");
+        let p1 = log.build_provenance("step1", "transform extract", &opts, &[], "1.0.0+abc");
+        let p2 = log.build_provenance("step1", "transform extract", &opts, &[], "1.0.0+abc");
+        assert_eq!(
+            p1.hash(ProvenanceFlags::STRICT),
+            p2.hash(ProvenanceFlags::STRICT),
+            "same inputs should produce same provenance hash"
+        );
 
-        // Change an option
         opts.insert("source".to_string(), "other.fvec".to_string());
-        let fp3 = log.compute_fingerprint("step1", "transform extract", &opts, &[], "");
-        assert_ne!(fp1, fp3, "different options should produce different fingerprint");
+        let p3 = log.build_provenance("step1", "transform extract", &opts, &[], "1.0.0+abc");
+        assert_ne!(
+            p1.hash(ProvenanceFlags::STRICT),
+            p3.hash(ProvenanceFlags::STRICT),
+            "options change should change hash"
+        );
     }
 
     #[test]
-    fn test_fingerprint_cascades_through_upstream() {
+    fn test_build_provenance_chains_through_upstream() {
         let mut log = ProgressLog::new();
-
-        // Record upstream step with a fingerprint
-        log.record_step("upstream", StepRecord {
-            status: Status::Ok,
-            message: "done".into(),
-            completed_at: Utc::now(),
-            elapsed_secs: 1.0,
-            outputs: vec![],
-            resolved_options: HashMap::new(),
-            error: None,
-            resource_summary: None,
-            fingerprint: Some("aaaa".to_string()),
-            build_version: None,
-        });
-
-        let opts = HashMap::new();
-        let fp1 = log.compute_fingerprint("downstream", "compute knn", &opts, &["upstream"], "");
-
-        // Change upstream fingerprint
-        log.record_step("upstream", StepRecord {
-            status: Status::Ok,
-            message: "done".into(),
-            completed_at: Utc::now(),
-            elapsed_secs: 1.0,
-            outputs: vec![],
-            resolved_options: HashMap::new(),
-            error: None,
-            resource_summary: None,
-            fingerprint: Some("bbbb".to_string()),
-            build_version: None,
-        });
-
-        let fp2 = log.compute_fingerprint("downstream", "compute knn", &opts, &["upstream"], "");
-        assert_ne!(fp1, fp2, "upstream fingerprint change should cascade");
-    }
-
-    #[test]
-    fn test_check_fingerprint_fresh() {
-        let mut log = ProgressLog::new();
-        log.record_step("step1", StepRecord {
-            status: Status::Ok,
-            message: "done".into(),
-            completed_at: Utc::now(),
-            elapsed_secs: 1.0,
-            outputs: vec![],
-            resolved_options: HashMap::new(),
-            error: None,
-            resource_summary: None,
-            fingerprint: Some("abc123".to_string()),
-            build_version: None,
-        });
-
-        assert!(log.check_fingerprint("step1", "abc123").is_none(), "matching fingerprint should be fresh");
-        assert!(log.check_fingerprint("step1", "xyz789").is_some(), "mismatched fingerprint should be stale");
-    }
-
-    #[test]
-    fn test_check_fingerprint_legacy_record() {
-        let mut log = ProgressLog::new();
-        log.record_step("step1", StepRecord {
-            status: Status::Ok,
-            message: "done".into(),
-            completed_at: Utc::now(),
-            elapsed_secs: 1.0,
-            outputs: vec![],
-            resolved_options: HashMap::new(),
-            error: None,
-            resource_summary: None,
-            fingerprint: None, // legacy — no fingerprint
-            build_version: None,
-        });
-
-        // Legacy records without fingerprint should be trusted (not forced stale)
-        assert!(log.check_fingerprint("step1", "anything").is_none(),
-            "legacy record without fingerprint should be trusted");
-    }
-
-    #[test]
-    fn test_staleness_from_upstream_via_fingerprint() {
-        // When an upstream step changes its fingerprint (re-executed),
-        // the downstream step's computed fingerprint changes, making it stale.
-        // This replaces the old mtime-based staleness detection.
-        let mut log = ProgressLog::new();
-
-        // Record upstream step with fingerprint "aaa"
-        log.record_step("extract", StepRecord {
-            status: Status::Ok,
-            message: "done".into(),
-            completed_at: Utc::now(),
-            elapsed_secs: 1.0,
-            outputs: vec![],
-            resolved_options: HashMap::new(),
-            error: None,
-            resource_summary: None,
-            fingerprint: Some("aaa".to_string()),
-            build_version: Some("0.1.0+abc".to_string()),
-        });
-
-        // Compute downstream fingerprint with upstream at "aaa"
-        let opts = HashMap::new();
-        let fp1 = log.compute_fingerprint("knn", "compute knn", &opts, &["extract"], "0.1.0+abc");
-
-        // Record downstream step with this fingerprint
-        log.record_step("knn", StepRecord {
-            status: Status::Ok,
-            message: "done".into(),
-            completed_at: Utc::now(),
-            elapsed_secs: 2.0,
-            outputs: vec![],
-            resolved_options: opts.clone(),
-            error: None,
-            resource_summary: None,
-            fingerprint: Some(fp1.clone()),
-            build_version: Some("0.1.0+abc".to_string()),
-        });
-
-        // Fingerprint should match — step is fresh
-        assert!(log.check_fingerprint("knn", &fp1).is_none(), "should be fresh initially");
-
-        // Now upstream re-executes with a new fingerprint
-        log.record_step("extract", StepRecord {
-            status: Status::Ok,
-            message: "re-ran".into(),
-            completed_at: Utc::now(),
-            elapsed_secs: 1.0,
-            outputs: vec![],
-            resolved_options: HashMap::new(),
-            error: None,
-            resource_summary: None,
-            fingerprint: Some("bbb".to_string()),
-            build_version: Some("0.1.0+abc".to_string()),
-        });
-
-        // Recompute downstream fingerprint — it should differ
-        let fp2 = log.compute_fingerprint("knn", "compute knn", &opts, &["extract"], "0.1.0+abc");
-        assert_ne!(fp1, fp2, "upstream change should produce different fingerprint");
-        assert!(log.check_fingerprint("knn", &fp2).is_some(),
-            "stored fingerprint should be stale after upstream change");
-    }
-
-    #[test]
-    fn test_staleness_from_build_version_change() {
-        // When the command's build version changes (recompilation), the
-        // fingerprint changes, making the step stale.
-        let log = ProgressLog::new();
         let opts = HashMap::new();
 
-        let fp_v1 = log.compute_fingerprint("step1", "compute knn", &opts, &[], "0.17.0+abc123");
-        let fp_v2 = log.compute_fingerprint("step1", "compute knn", &opts, &[], "0.17.0+def456");
+        // Record upstream with one provenance.
+        let up_a = log.build_provenance("upstream", "transform extract", &opts, &[], "1.0.0+aaa");
+        log.record_step("upstream", rec(Some(up_a)));
+        let head_a = log.build_provenance("downstream", "compute knn", &opts, &["upstream"], "1.0.0+abc");
 
-        assert_ne!(fp_v1, fp_v2,
-            "different build versions should produce different fingerprints");
+        // Re-record upstream with a different binary git hash.
+        let up_b = log.build_provenance("upstream", "transform extract", &opts, &[], "1.0.0+bbb");
+        log.record_step("upstream", rec(Some(up_b)));
+        let head_b = log.build_provenance("downstream", "compute knn", &opts, &["upstream"], "1.0.0+abc");
+
+        assert_ne!(
+            head_a.hash(ProvenanceFlags::STRICT),
+            head_b.hash(ProvenanceFlags::STRICT),
+            "upstream change should cascade to head under STRICT"
+        );
+
+        // Under CONFIG_ONLY, the upstream's git hash doesn't matter.
+        assert_eq!(
+            head_a.hash(ProvenanceFlags::CONFIG_ONLY),
+            head_b.hash(ProvenanceFlags::CONFIG_ONLY),
+            "upstream-only-binary change must not cascade under CONFIG_ONLY"
+        );
+    }
+
+    #[test]
+    fn test_check_provenance_fresh_under_strict() {
+        let mut log = ProgressLog::new();
+        let opts = HashMap::new();
+        let p = log.build_provenance("step1", "compute knn", &opts, &[], "1.0.0+abc");
+        log.record_step("step1", rec(Some(p.clone())));
+
+        assert!(log.check_provenance("step1", &p, ProvenanceFlags::STRICT).is_none());
+
+        let p2 = log.build_provenance("step1", "compute knn", &opts, &[], "2.0.0+xyz");
+        assert!(log.check_provenance("step1", &p2, ProvenanceFlags::STRICT).is_some());
+    }
+
+    #[test]
+    fn test_check_provenance_relaxed_selector() {
+        let mut log = ProgressLog::new();
+        let opts = HashMap::new();
+        let stored = log.build_provenance("step1", "compute knn", &opts, &[], "1.0.0+abc");
+        log.record_step("step1", rec(Some(stored)));
+
+        // Different binary version, same options.
+        let current = log.build_provenance("step1", "compute knn", &opts, &[], "1.5.0+xyz");
+
+        // STRICT: stale.
+        assert!(log.check_provenance("step1", &current, ProvenanceFlags::STRICT).is_some());
+
+        // CONFIG_ONLY: fresh — version doesn't matter.
+        assert!(log.check_provenance("step1", &current, ProvenanceFlags::CONFIG_ONLY).is_none());
+
+        // VERSION_AWARE: fresh because major version is the same.
+        assert!(log.check_provenance("step1", &current, ProvenanceFlags::VERSION_AWARE).is_none());
+    }
+
+    #[test]
+    fn test_check_provenance_legacy_record() {
+        let mut log = ProgressLog::new();
+        log.record_step("step1", rec(None)); // legacy record, no provenance
+        let opts = HashMap::new();
+        let current = log.build_provenance("step1", "compute knn", &opts, &[], "1.0.0+abc");
+
+        assert!(
+            log.check_provenance("step1", &current, ProvenanceFlags::STRICT).is_none(),
+            "legacy record without provenance should be trusted"
+        );
     }
 
     #[test]
     fn test_check_step_freshness_output_files_verified() {
-        // Freshness check verifies output files exist with correct sizes.
-        // Missing or size-changed outputs make the step stale.
         let tmp_dir = tempfile::tempdir().unwrap();
         let output_path = tmp_dir.path().join("output.ivec");
-
-        // Create output file
         std::fs::write(&output_path, "result").unwrap();
 
         let mut log = ProgressLog::new();
-        log.record_step("step1", StepRecord {
-            status: Status::Ok,
-            message: "done".into(),
-            completed_at: Utc::now(),
-            elapsed_secs: 1.0,
-            outputs: vec![OutputRecord {
-                path: output_path.to_string_lossy().into_owned(),
-                size: 6, // matches "result" (6 bytes)
-                mtime: None,
-            }],
-            resolved_options: HashMap::new(),
-            error: None,
-            resource_summary: None,
-            fingerprint: None,
-            build_version: None,
+        let mut r = rec(None);
+        r.outputs.push(OutputRecord {
+            path: output_path.to_string_lossy().into_owned(),
+            size: 6,
+            mtime: None,
         });
+        log.record_step("step1", r);
 
-        // Fresh when output exists with correct size
         let reason = log.check_step_freshness("step1", None, None);
         assert!(reason.is_none(), "should be fresh: {:?}", reason);
 
-        // Stale when output size changes
         std::fs::write(&output_path, "longer result").unwrap();
         let reason = log.check_step_freshness("step1", None, None);
         assert!(reason.is_some(), "should be stale after size change");
         assert!(reason.unwrap().contains("size changed"));
 
-        // Stale when output is deleted
         std::fs::remove_file(&output_path).unwrap();
         let reason = log.check_step_freshness("step1", None, None);
         assert!(reason.is_some(), "should be stale when output missing");
@@ -767,7 +634,7 @@ mod tests {
         std::fs::create_dir_all(&cache_dir).unwrap();
         let path = cache_dir.join(".upstream.progress.yaml");
 
-        // Write a progress log with an old schema version
+        // Write a progress log with an old schema version.
         let old_content = "schema_version: 1\nsteps:\n  step1:\n    status: ok\n    message: done\n    completed_at: '2026-01-01T00:00:00Z'\n    elapsed_secs: 1.0\n";
         std::fs::write(&path, old_content).unwrap();
 
@@ -777,5 +644,4 @@ mod tests {
         assert!(log.steps.is_empty(), "steps should be cleared on version mismatch");
         assert_eq!(log.schema_version, PROGRESS_SCHEMA_VERSION);
     }
-
 }

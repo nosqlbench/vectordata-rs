@@ -358,6 +358,70 @@ pub fn enum_value_completer(
         .collect()
 }
 
+/// Completion candidates for `--provenance`: presets when the input has
+/// no comma, individual provenance components when it does.
+///
+/// Up front the user gets the three named presets (`strict`,
+/// `version-aware`, `config-only`) plus the `all` / `config` aliases.
+/// Once they type a comma, they are clearly building a custom selector,
+/// so we switch to suggesting bare component names and exclude any
+/// already chosen earlier in the list.
+pub fn provenance_completer(current: &OsStr) -> Vec<CompletionCandidate> {
+    const PRESETS: &[&str] = &[
+        "strict",
+        "version-aware",
+        "config-only",
+        "all",
+        "config",
+    ];
+    const COMPONENTS: &[&str] = &[
+        "step_id",
+        "command_path",
+        "version_major",
+        "version_minor",
+        "version_patch",
+        "git_hash",
+        "dirty",
+        "options",
+        "upstream",
+    ];
+
+    let s = current.to_string_lossy();
+
+    if !s.contains(',') {
+        let lower = s.to_lowercase();
+        let mut out: Vec<CompletionCandidate> = PRESETS
+            .iter()
+            .filter(|v| lower.is_empty() || v.starts_with(&*lower))
+            .map(|v| CompletionCandidate::new(*v))
+            .collect();
+        // Also offer single components so users can start a list directly.
+        for v in COMPONENTS {
+            if lower.is_empty() || v.starts_with(&*lower) {
+                out.push(CompletionCandidate::new(*v));
+            }
+        }
+        return out;
+    }
+
+    let (already, partial) = match s.rfind(',') {
+        Some(i) => (&s[..=i], &s[i + 1..]),
+        None => ("", s.as_ref()),
+    };
+    let chosen: std::collections::HashSet<&str> = already
+        .split(',')
+        .map(|t| t.trim())
+        .filter(|t| !t.is_empty())
+        .collect();
+    let partial_lower = partial.to_lowercase();
+    COMPONENTS
+        .iter()
+        .filter(|v| !chosen.contains(**v))
+        .filter(|v| partial_lower.is_empty() || v.starts_with(&*partial_lower))
+        .map(|v| CompletionCandidate::new(format!("{}{}", already, v)))
+        .collect()
+}
+
 /// Completion candidates for `--governor`: lists strategy names with descriptions.
 pub fn governor_completer(current: &OsStr) -> Vec<CompletionCandidate> {
     let prefix = current.to_string_lossy().to_lowercase();
@@ -810,6 +874,7 @@ pub fn run_direct(args: Vec<String>) {
         ui: veks_core::ui::UiHandle::new(std::sync::Arc::new(veks_core::ui::PlainSink::new())),
         status_interval: std::time::Duration::from_secs(1),
         estimated_total_steps: 0,
+        provenance_selector: crate::pipeline::provenance::ProvenanceFlags::STRICT,
     };
 
     let mut cmd = factory();

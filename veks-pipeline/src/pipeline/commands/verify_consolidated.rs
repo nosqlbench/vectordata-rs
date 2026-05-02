@@ -28,7 +28,11 @@ use std::time::Instant;
 
 use crate::pipeline::command::*;
 use crate::pipeline::element_type::ElementType;
-use crate::pipeline::simd_distance::{self, Metric};
+use crate::pipeline::simd_distance;
+// `Metric` is only referenced by the bare name inside the
+// knnutils-gated `VerifyKnnConsolidatedOp::execute` impl below.
+#[cfg(feature = "knnutils")]
+use crate::pipeline::simd_distance::Metric;
 use vectordata::io::XvecReader;
 use vectordata::VectorReader;
 use vectordata::dataset::DatasetConfig;

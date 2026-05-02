@@ -59,7 +59,7 @@ pub fn run(catalog_base: &str, dataset_name: &str, profile_name: &str) {
 
     // Step 2: Fetch dataset.yaml using the path from the catalog
     let dataset_url = if let Some(ref cat_path) = dataset_path_from_catalog {
-        // Path from catalog is relative to the catalog directory (e.g., "laion400b/img-search/dataset.yaml")
+        // Path from catalog is relative to the catalog directory (e.g., "<dataset>/<personality>/dataset.yaml")
         format!("{}/{}", base, cat_path)
     } else {
         // Fallback: assume {base}/{name}/dataset.yaml

@@ -328,8 +328,6 @@ fn build_sources(configdir: &str, extra_catalogs: &[String], at: &[String]) -> C
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn local_dataset_directory_prebuffers_via_canonical_path() {
         // A local dataset with a dataset.yaml — every facet should

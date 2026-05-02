@@ -492,6 +492,7 @@ fn run_config_command(command: ConfigSubcommand) {
         ui: crate::ui::UiHandle::new(std::sync::Arc::new(crate::ui::PlainSink::new())),
         status_interval: std::time::Duration::from_secs(1),
         estimated_total_steps: 0,
+        provenance_selector: veks_pipeline::pipeline::provenance::ProvenanceFlags::STRICT,
     };
 
     let mut opts = Options::new();

@@ -38,6 +38,7 @@ fn test_ctx(dir: &Path) -> StreamContext {
         ui: UiHandle::new(Arc::new(TestSink::new())),
         status_interval: Duration::from_secs(1),
         estimated_total_steps: 0,
+        provenance_selector: veks_pipeline::pipeline::provenance::ProvenanceFlags::STRICT,
     }
 }
 
@@ -2274,7 +2275,7 @@ fn partition_profiles_slab_metadata() {
 /// Partition profiles with slab PNode predicates — the production format.
 ///
 /// Validates that PNode-encoded equality predicates are correctly decoded
-/// to extract per-label query vectors. This is the format used by sift1m
+/// to extract per-label query vectors. This is the format used by myset
 /// and any dataset with `synthesis_format: slab`.
 #[test]
 fn partition_profiles_slab_pnode_predicates() {

@@ -84,6 +84,18 @@ Each data facet resolves to one of two artifact types:
 | Query vectors | no format conversion, no overlap removal |
 | Ground truth | pre-computed GT provided |
 
+#### Identity-knn distance recovery
+
+When ground truth is provided as Identity (the source ships
+`neighbor_indices.ivecs` only) and no separate distances file is
+supplied, the default profile would otherwise have indices but no
+distances — a missing facet. The bootstrapper detects this case and
+emits a `compute knn-distances` step that materializes
+`neighbor_distances.fvecs` from the existing indices + base + query
+under the configured metric. The step is skipped when sized profiles
+are present (the `compute-knn` template covers them) or when partition
+oracles are enabled (the `compute-knn-partition` template covers those).
+
 ### The O facet (oracle partitions)
 
 The O facet is never auto-inferred — it must be explicitly requested.

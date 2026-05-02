@@ -403,6 +403,11 @@ pub struct StreamContext {
     /// When > 0 and > the current step count, the runner shows both
     /// the current batch count and the estimated total.
     pub estimated_total_steps: usize,
+    /// Provenance components consulted when deciding whether a step is
+    /// stale. Defaults to [`super::provenance::ProvenanceFlags::STRICT`]
+    /// (every component matters); `veks run --provenance` overrides at
+    /// the CLI.
+    pub provenance_selector: super::provenance::ProvenanceFlags,
 }
 
 /// Describes a single accepted option for a `CommandOp`.

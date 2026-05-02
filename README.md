@@ -14,7 +14,7 @@ use vectordata::{open_facet_typed, TestDataView, TypedReader};
 
 // Catalog → profile → reader. The prescribed entry path.
 let catalog = Catalog::of(&CatalogSources::new().configure_default());
-let view    = catalog.open_profile("sift1m", "default")?;
+let view    = catalog.open_profile("myset", "default")?;
 
 let base = view.base_vectors()?;       // Arc<dyn VectorReader<f32>>  — 1M vectors
 let gt   = view.neighbor_indices()?;   // Arc<dyn VectorReader<i32>>  — exact KNN
@@ -109,13 +109,13 @@ and predicate trees.
 ```bash
 veks datasets config add-catalog https://example.com/datasets/
 veks datasets list
-veks datasets probe --dataset sift1m
+veks datasets probe --dataset myset
 ```
 
 ### Download
 
 ```bash
-veks datasets prebuffer --dataset sift1m
+veks datasets prebuffer --dataset myset
 ```
 
 ### Analyze

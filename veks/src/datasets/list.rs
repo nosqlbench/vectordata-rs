@@ -204,9 +204,9 @@ fn terminal_width() -> usize {
 /// compactly on the same line:
 ///
 /// ```text
-/// sift-128             [default, 1m, 2m, 4m, 10m, 20m, 50m, 100m]  L2
-/// glove-100            [default]
-/// laion400m-img-search [default, 10m, 50m, 100m, 200m, 400m]       Cosine
+/// alpha-128            [default, 1m, 2m, 4m, 10m, 20m, 50m, 100m]   L2
+/// beta-100             [default]
+/// gamma-img-search     [default, 10m, 50m, 100m, 200m, 400m]        Cosine
 /// ```
 fn output_text(entries: &[&CatalogEntry], verbose: bool, group_by: Option<&str>, pv: &ProfileView) {
     if let Some(key) = group_by {

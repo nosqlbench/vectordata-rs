@@ -42,7 +42,7 @@ Rust `faiss-sys` FFI bindings.
 
 ## Performance Characteristics
 
-On a 128-core machine with sift1m (1M base x 10K queries x dim=128 x k=100):
+On a 128-core machine with a 1M base × 10K queries × dim=128 × k=100 workload:
 
 | Aspect | knn-metal | knn-faiss |
 |--------|-----------|-----------|
@@ -99,9 +99,9 @@ base vectors sequentially, which triggers hardware prefetching and requires no
 data copying. The OS page cache provides the buffering.
 
 FAISS requires all base vectors copied into a contiguous `Vec<f32>` buffer
-before building the FlatIndex. For sift1m, that's ~490 MiB of allocation and
-copying just for setup, before any search begins. FAISS internally may copy
-again into its own layout.
+before building the FlatIndex. For a 1M × 128-dim base, that's ~490 MiB of
+allocation and copying just for setup, before any search begins. FAISS
+internally may copy again into its own layout.
 
 ### 4. Top-k fusion
 

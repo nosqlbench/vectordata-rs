@@ -792,7 +792,13 @@ so that `base_metadata.slab[i]` corresponds to `base_vectors.mvec[i]`.
             );
         }
 
-        // Open the mvec file
+        // Open the mvec file. open_path can stall on cold mmap setup or
+        // remote-cached sources; log before+after so the gap is named in
+        // the durable log stream.
+        ctx.ui.log(&format!(
+            "mvec-extract: opening source {}",
+            mvec_path.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
+        ));
         let mvec_reader = match XvecReader::<half::f16>::open_path(&mvec_path) {
             Ok(r) => r,
             Err(e) => {
@@ -807,6 +813,10 @@ so that `base_metadata.slab[i]` corresponds to `base_vectors.mvec[i]`.
             <XvecReader<half::f16> as VectorReader<half::f16>>::count(&mvec_reader);
         let dim =
             <XvecReader<half::f16> as VectorReader<half::f16>>::dim(&mvec_reader) as u32;
+        ctx.ui.log(&format!(
+            "mvec-extract: source has {} vectors of dim {}",
+            mvec_count, dim,
+        ));
 
         // Create output directory
         if let Some(parent) = output_path.parent() {
@@ -841,6 +851,10 @@ so that `base_metadata.slab[i]` corresponds to `base_vectors.mvec[i]`.
             // into sequential I/O, then write each vector at its correct output
             // offset. Processes in memory-bounded chunks (up to half system RAM)
             // so this works on systems with limited memory.
+            ctx.ui.log(&format!(
+                "mvec-extract: opening ivec index {}",
+                ivec_p.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
+            ));
             let ivec_reader = match XvecReader::<i32>::open_path(ivec_p) {
                 Ok(r) => r,
                 Err(e) => {
@@ -1376,6 +1390,25 @@ fn half_system_ram() -> u64 {
 /// Both reads and writes are sequential. The ivec scan per pass is cheap
 /// (integer range check only). Source data is only read for records in the
 /// current partition.
+/// Zero a byte slice in 256 MiB chunks, ticking a UI progress bar each
+/// chunk. Equivalent in cost to `slice.fill(0)` but produces visible
+/// throughput in the TUI for hundred-GiB buffers that would otherwise
+/// block silently for tens of seconds.
+fn zero_in_chunks(slice: &mut [u8], ctx: &mut StreamContext, label: &str) {
+    const CHUNK: usize = 256 * 1024 * 1024;
+    let total = slice.len();
+    if total == 0 { return; }
+    let pb = ctx.ui.bar_with_unit(total as u64, label, "B");
+    let mut done = 0usize;
+    while done < total {
+        let take = (total - done).min(CHUNK);
+        slice[done..done + take].fill(0);
+        done += take;
+        pb.set_position(done as u64);
+    }
+    pb.finish();
+}
+
 fn sorted_index_extract_mvec(
     mvec_reader: &XvecReader<half::f16>,
     mvec_count: usize,
@@ -1416,14 +1449,27 @@ fn sorted_index_extract_mvec(
         (partition_size * record_bytes) as f64 / (1024.0 * 1024.0),
     ));
 
-    // Pre-allocate output file
+    // Pre-allocate output file. set_len is a single syscall and on most
+    // filesystems returns near-instantly for sparse files, but on some
+    // configurations it can stall for many seconds. Log before+after so
+    // the user sees the gap accounted for.
     let total_bytes = (extract_count as u64) * (record_bytes as u64);
+    let prealloc_start = Instant::now();
+    ctx.ui.log(&format!(
+        "mvec-extract: pre-allocating output file ({:.1} GiB) at {}",
+        total_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+        output_path.display(),
+    ));
     {
         let f = safe_create_file(output_path)
             .map_err(|e| format!("failed to create output: {}", e))?;
         f.set_len(total_bytes)
             .map_err(|e| format!("failed to set output size: {}", e))?;
     }
+    ctx.ui.log(&format!(
+        "mvec-extract: output file ready ({:.1}s)",
+        prealloc_start.elapsed().as_secs_f64(),
+    ));
 
     let mut out_file = std::fs::OpenOptions::new()
         .write(true)
@@ -1435,21 +1481,51 @@ fn sorted_index_extract_mvec(
         if num_partitions > 1 { format!(" (pass {}/{})", p + 1, num_partitions) } else { String::new() }
     };
 
-    // Pre-allocate buffers outside the loop to avoid huge alloc/dealloc between passes
+    // Pre-allocate buffers outside the loop to avoid huge alloc/dealloc
+    // between passes. The partition buffer can be tens to hundreds of
+    // GiB; vec![0u8; N] would block silently for tens of seconds while
+    // the kernel zeros pages. Allocate uninitialized then zero in chunks
+    // with a progress bar.
     let max_part_len = partition_size; // first partition is the largest or equal
     let mut read_plan: Vec<(usize, usize)> = Vec::with_capacity(max_part_len);
-    let mut part_buf: Vec<u8> = vec![0u8; max_part_len * record_bytes];
+    let part_buf_total = max_part_len * record_bytes;
+    let alloc_start = Instant::now();
+    ctx.ui.log(&format!(
+        "mvec-extract: allocating partition buffer ({:.1} GiB)",
+        part_buf_total as f64 / (1024.0 * 1024.0 * 1024.0),
+    ));
+    let mut part_buf: Vec<u8> = Vec::with_capacity(part_buf_total);
+    // SAFETY: capacity == part_buf_total; we zero every byte below
+    // before any reader touches the buffer.
+    unsafe { part_buf.set_len(part_buf_total); }
+    zero_in_chunks(
+        &mut part_buf[..part_buf_total],
+        ctx,
+        "allocating partition buffer",
+    );
+    ctx.ui.log(&format!(
+        "mvec-extract: partition buffer ready ({:.1}s, {:.1} GiB/s)",
+        alloc_start.elapsed().as_secs_f64(),
+        (part_buf_total as f64 / (1024.0 * 1024.0 * 1024.0))
+            / alloc_start.elapsed().as_secs_f64().max(0.001),
+    ));
 
     for pass in 0..num_partitions {
+        let pass_t0 = Instant::now();
         let part_start = pass * partition_size;
         let part_end = std::cmp::min(part_start + partition_size, extract_count);
         let part_len = part_end - part_start;
+        ctx.ui.log(&format!(
+            "mvec-extract: pass {}/{} starting ({} vectors, output range [{}..{}))",
+            pass + 1, num_partitions, part_len, part_start, part_end,
+        ));
 
         // Step 1: Scan ivec for this partition's entries only.
         // Output positions are sequential, so we jump directly to the
         // partition's global range instead of iterating all entries.
         let global_start = range_start + part_start;
         let global_end = range_start + part_end;
+        let phase_t = Instant::now();
         let scan_pb = ctx.ui.bar_with_unit(part_len as u64, &format!("scanning indices{}", pass_label(pass)), "vectors");
         read_plan.clear();
         for (local_pos, i) in (global_start..global_end).enumerate() {
@@ -1463,6 +1539,10 @@ fn sorted_index_extract_mvec(
             if (local_pos + 1) % 100_000 == 0 { scan_pb.set_position((local_pos + 1) as u64); }
         }
         scan_pb.finish();
+        ctx.ui.log(&format!(
+            "mvec-extract: pass {}/{} ivec scan done ({} entries in {:.1}s)",
+            pass + 1, num_partitions, read_plan.len(), phase_t.elapsed().as_secs_f64(),
+        ));
 
         // Step 2: Sort by source position — parallel bucket + sort.
         // Distribute into buckets in parallel, sort each bucket in
@@ -1470,6 +1550,7 @@ fn sorted_index_extract_mvec(
         let num_buckets = 256usize;
         let bucket_range = (mvec_count / num_buckets).max(1);
 
+        let phase_t = Instant::now();
         let dist_pb = ctx.ui.bar_with_unit(read_plan.len() as u64, &format!("bucketing {} entries{}", read_plan.len(), pass_label(pass)), "vectors");
         let thread_buckets: Vec<Vec<Vec<(usize, usize)>>>;
         {
@@ -1495,9 +1576,15 @@ fn sorted_index_extract_mvec(
             };
         }
         dist_pb.finish();
+        ctx.ui.log(&format!(
+            "mvec-extract: pass {}/{} bucketing done ({} thread groups, {:.1}s)",
+            pass + 1, num_partitions, thread_buckets.len(), phase_t.elapsed().as_secs_f64(),
+        ));
 
-        // Merge thread-local buckets into unified buckets
-        let merge_pb = ctx.ui.spinner(&format!("merging {} thread buckets{}", thread_buckets.len(), pass_label(pass)));
+        // Merge thread-local buckets into unified buckets. Pure
+        // sequential allocation work; emit before+after log lines so the
+        // gap is visible without a fast-blink spinner.
+        let phase_t = Instant::now();
         let mut buckets: Vec<Vec<(usize, usize)>> = vec![Vec::new(); num_buckets];
         for tb in &thread_buckets {
             for (i, b) in tb.iter().enumerate() {
@@ -1509,8 +1596,12 @@ fn sorted_index_extract_mvec(
                 buckets[i].extend(b);
             }
         }
-        merge_pb.finish();
+        ctx.ui.log(&format!(
+            "mvec-extract: pass {}/{} merged into {} buckets ({:.1}s)",
+            pass + 1, num_partitions, buckets.len(), phase_t.elapsed().as_secs_f64(),
+        ));
 
+        let phase_t = Instant::now();
         let sort_pb = ctx.ui.bar_with_unit(read_plan.len() as u64, &format!("sorting {} entries by source position{}", read_plan.len(), pass_label(pass)), "vectors");
         {
             use rayon::prelude::*;
@@ -1530,9 +1621,15 @@ fn sorted_index_extract_mvec(
             }
         }
         sort_pb.finish();
+        ctx.ui.log(&format!(
+            "mvec-extract: pass {}/{} sort done ({:.1}s)",
+            pass + 1, num_partitions, phase_t.elapsed().as_secs_f64(),
+        ));
 
-        // Flatten sorted buckets into read_plan using prefix-sum offsets
-        let flatten_pb = ctx.ui.spinner(&format!("flattening read plan{}", pass_label(pass)));
+        // Flatten sorted buckets into read_plan using prefix-sum offsets.
+        // Parallel memcpy — fast; log lines bracket it instead of a
+        // fast-blink spinner.
+        let phase_t = Instant::now();
         let total_entries = buckets.iter().map(|b| b.len()).sum::<usize>();
         read_plan.clear();
         read_plan.resize(total_entries, (0, 0));
@@ -1562,15 +1659,24 @@ fn sorted_index_extract_mvec(
                 flatten_fn();
             }
         }
-
-        flatten_pb.finish();
+        ctx.ui.log(&format!(
+            "mvec-extract: pass {}/{} flatten done ({} entries, {:.1}s)",
+            pass + 1, num_partitions, total_entries, phase_t.elapsed().as_secs_f64(),
+        ));
 
         // Step 3: Read source data in parallel, placing each record at its
         // transpose position in the buffer. Each local_pos is unique, so
         // concurrent writes to part_buf are safe (disjoint regions).
-        let read_pb = ctx.ui.bar_with_unit(read_plan.len() as u64, &format!("reading+transposing mvec{}", pass_label(pass)), "vectors");
+        // Re-zero the partition buffer (carried across passes). Same
+        // memory cost as initial allocation — chunk + report.
         let part_buf_len = part_len * record_bytes;
-        part_buf[..part_buf_len].fill(0);
+        zero_in_chunks(
+            &mut part_buf[..part_buf_len],
+            ctx,
+            &format!("zeroing partition buffer{}", pass_label(pass)),
+        );
+        let phase_t = Instant::now();
+        let read_pb = ctx.ui.bar_with_unit(read_plan.len() as u64, &format!("reading+transposing mvec{}", pass_label(pass)), "vectors");
         mvec_reader.advise_sequential();
 
         {
@@ -1609,8 +1715,15 @@ fn sorted_index_extract_mvec(
             result?;
         }
         read_pb.finish();
+        ctx.ui.log(&format!(
+            "mvec-extract: pass {}/{} read+transpose done ({} vectors, {:.1}s, {:.0}k vec/s)",
+            pass + 1, num_partitions, read_plan.len(),
+            phase_t.elapsed().as_secs_f64(),
+            (read_plan.len() as f64 / phase_t.elapsed().as_secs_f64().max(0.001)) / 1000.0,
+        ));
 
         // Optional L2 normalization of vectors in the output buffer
+        let phase_t = Instant::now();
         if normalize {
             let buf_used = part_len * record_bytes;
             let dim_usize = dim as usize;
@@ -1634,9 +1747,14 @@ fn sorted_index_extract_mvec(
                     }
                 }
             }
+            ctx.ui.log(&format!(
+                "mvec-extract: pass {}/{} L2 normalize done ({:.1}s)",
+                pass + 1, num_partitions, phase_t.elapsed().as_secs_f64(),
+            ));
         }
 
         // Step 4: Write partition in chunks with progress, including sync
+        let phase_t = Instant::now();
         let total_write_bytes = part_len * record_bytes;
         let write_mb = total_write_bytes as f64 / (1024.0 * 1024.0);
         // Progress covers writes + sync; reserve 5% of bar for the sync phase
@@ -1659,6 +1777,14 @@ fn sorted_index_extract_mvec(
             .map_err(|e| format!("sync failed: {}", e))?;
         write_pb.set_position(total_write_bytes as u64 + sync_reserve);
         write_pb.finish();
+        ctx.ui.log(&format!(
+            "mvec-extract: pass {}/{} write+sync done ({:.1} GiB in {:.1}s, {:.0} MB/s) — pass total {:.1}s",
+            pass + 1, num_partitions,
+            total_write_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+            phase_t.elapsed().as_secs_f64(),
+            (total_write_bytes as f64 / (1024.0 * 1024.0)) / phase_t.elapsed().as_secs_f64().max(0.001),
+            pass_t0.elapsed().as_secs_f64(),
+        ));
 
         log::debug!(
             "mvec-extract: pass {}/{}, wrote {} records ({:.1} MB)",
@@ -1859,9 +1985,14 @@ fn sorted_index_extract_fvec(
     let mut total_out_norm_samples: Vec<f64> = Vec::new();
 
     for pass in 0..num_partitions {
+        let pass_t0 = Instant::now();
         let part_start = pass * partition_size;
         let part_end = std::cmp::min(part_start + partition_size, extract_count);
         let part_len = part_end - part_start;
+        ctx.ui.log(&format!(
+            "fvec-extract: pass {}/{} starting ({} vectors, output range [{}..{}))",
+            pass + 1, num_partitions, part_len, part_start, part_end,
+        ));
 
         // Step 1: Scan ivec for this partition's entries only.
         let global_start = range_start + part_start;
@@ -2307,6 +2438,11 @@ fn sorted_index_extract_fvec(
             "fvec-extract: pass {}/{}, wrote {} records ({:.1} MB)",
             pass + 1, num_partitions, read_plan.len(), write_mb,
         );
+        ctx.ui.log(&format!(
+            "fvec-extract: pass {}/{} done ({:.1}s, {} records, {:.1} MB)",
+            pass + 1, num_partitions,
+            pass_t0.elapsed().as_secs_f64(), read_plan.len(), write_mb,
+        ));
 
         ctx.governor.checkpoint();
     }
@@ -2648,9 +2784,14 @@ fn sorted_index_extract_slab(
     let mut resumed_count: usize = 0;
 
     for pass in 0..num_partitions {
+        let pass_t0 = Instant::now();
         let part_start = pass * partition_size;
         let part_end = std::cmp::min(part_start + partition_size, extract_count);
         let part_len = part_end - part_start;
+        ctx.ui.log(&format!(
+            "slab-extract: pass {}/{} starting ({} records, output range [{}..{}))",
+            pass + 1, num_partitions, part_len, part_start, part_end,
+        ));
 
         // ---- per-partition cache check ----
         let cache_path = cache_dir.join(format!("slab-extract.part_{:04}.cache", pass));
@@ -2832,6 +2973,11 @@ fn sorted_index_extract_slab(
             "slab-extract: pass {}/{}, wrote {} records",
             pass + 1, num_partitions, records.len(),
         );
+        ctx.ui.log(&format!(
+            "slab-extract: pass {}/{} done ({:.1}s, {} records)",
+            pass + 1, num_partitions,
+            pass_t0.elapsed().as_secs_f64(), records.len(),
+        ));
 
         ctx.governor.checkpoint();
     }
@@ -3427,6 +3573,7 @@ mod tests {
             ui: veks_core::ui::UiHandle::new(std::sync::Arc::new(veks_core::ui::TestSink::new())),
             status_interval: std::time::Duration::from_secs(1),
             estimated_total_steps: 0,
+            provenance_selector: crate::pipeline::provenance::ProvenanceFlags::STRICT,
         };
 
         // Generate 50 f16 vectors of dimension 8
@@ -3497,6 +3644,7 @@ mod tests {
             ui: veks_core::ui::UiHandle::new(std::sync::Arc::new(veks_core::ui::TestSink::new())),
             status_interval: std::time::Duration::from_secs(1),
             estimated_total_steps: 0,
+            provenance_selector: crate::pipeline::provenance::ProvenanceFlags::STRICT,
         };
 
         // Generate 20 f16 vectors of dimension 8
@@ -3580,6 +3728,7 @@ mod tests {
             ui: veks_core::ui::UiHandle::new(std::sync::Arc::new(veks_core::ui::TestSink::new())),
             status_interval: std::time::Duration::from_secs(1),
             estimated_total_steps: 0,
+            provenance_selector: crate::pipeline::provenance::ProvenanceFlags::STRICT,
         };
 
         // Generate 20 vectors of dimension 4
@@ -3664,6 +3813,7 @@ mod tests {
             ui: veks_core::ui::UiHandle::new(std::sync::Arc::new(veks_core::ui::TestSink::new())),
             status_interval: std::time::Duration::from_secs(1),
             estimated_total_steps: 0,
+            provenance_selector: crate::pipeline::provenance::ProvenanceFlags::STRICT,
         };
 
         // Generate 100 vectors of dimension 8
@@ -3743,6 +3893,7 @@ mod tests {
             ui: veks_core::ui::UiHandle::new(std::sync::Arc::new(veks_core::ui::TestSink::new())),
             status_interval: std::time::Duration::from_secs(1),
             estimated_total_steps: 0,
+            provenance_selector: crate::pipeline::provenance::ProvenanceFlags::STRICT,
         };
 
         // Write 10 vectors of dim 4: vectors 0,3,7 are zero vectors

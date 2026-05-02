@@ -165,7 +165,7 @@ _defaults:
     #[test]
     fn test_to_config() {
         let yaml = r#"
-"sift1m:default":
+"myset:default":
   base: profiles/base/base_vectors.fvec
   query: profiles/base/query_vectors.fvec
   gt: profiles/base/neighbor_indices.ivec

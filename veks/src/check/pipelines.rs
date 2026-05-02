@@ -183,8 +183,9 @@ fn check_execution(dataset_path: &Path) -> Result<StepCounts, Vec<String>> {
         errors.push(msg);
     }
 
-    // Per-step fingerprint checking handles invalidation — no whole-log
-    // invalidation needed here.
+    // Per-step provenance checking (v5 ProvenanceMap under the active
+    // selector) handles invalidation — no whole-log invalidation needed
+    // here.
 
     let workspace = dataset_path.parent().unwrap_or(Path::new("."));
     let mut fresh = 0usize;

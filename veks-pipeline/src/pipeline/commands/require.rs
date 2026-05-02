@@ -172,6 +172,8 @@ run), the command returns immediately without re-running anything.
             governor: "maximize".to_string(),
             status_interval: 250,
             output: "auto".to_string(),
+            provenance: "strict".to_string(),
+            explain_staleness: false,
         };
 
         if let Err(e) = crate::pipeline::run_pipeline(run_args) {

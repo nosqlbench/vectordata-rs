@@ -1870,6 +1870,64 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
         }
     }
 
+    // ── Identity-KNN distance recovery ───────────────────────────────
+    //
+    // When ground-truth indices are aliased through the `Identity` slot
+    // and the source ships no distances file (`args.ground_truth_distances`
+    // is `None`), the default profile ends up with `neighbor_indices.ivecs`
+    // and *no* `neighbor_distances.fvecs`. Downstream prebufferers and
+    // verifiers expect both facets, so they fail with 403/missing-facet.
+    //
+    // Emit `compute knn-distances` to materialize the distances from the
+    // existing indices + base + query. Only required when:
+    //   • indices are pre-provided (Identity)
+    //   • no separate distances file was provided
+    //   • no sized profiles (otherwise `compute-knn` was already emitted
+    //     and writes both indices and distances per-profile)
+    //   • no partition oracles (their per-partition `compute-knn-partition`
+    //     already writes distances for partition profiles)
+    let knn_is_identity = slots.knn.as_ref()
+        .map_or(false, |a| !a.is_materialized());
+    let wants_distances = facets_check.contains('D');
+    if knn_is_identity
+        && wants_distances
+        && args.ground_truth_distances.is_none()
+        && !needs_computed_knn
+        && !wants_partition_verify
+        && slots.query_vectors.is_some()
+    {
+        let knn_path = slots.knn.as_ref().unwrap().path().to_string();
+        let mut after = vec![];
+        if slots.base_count.is_some() {
+            after.push("count-base".into());
+        } else if slots.base_vectors.is_materialized() {
+            after.push(slots.base_vectors.step_id().into());
+        }
+        if let Some(ref qv) = slots.query_vectors {
+            if qv.is_materialized() {
+                after.push(qv.step_id().into());
+            }
+        }
+        steps.push(Step {
+            id: "compute-knn-distances".into(),
+            run: "compute knn-distances".into(),
+            description: Some(
+                "Recover neighbor_distances from pre-existing indices + base + query".into(),
+            ),
+            after,
+            per_profile: true,
+            phase: 0,
+            finalize: false,
+            options: vec![
+                ("base".into(), compute_knn_base_arg(slots, &working_vectors, subset_applied)),
+                ("query".into(), slots.query_vectors.as_ref().unwrap().path().to_string()),
+                ("indices".into(), knn_path),
+                ("output".into(), "neighbor_distances.fvecs".into()),
+                ("metric".into(), args.metric.clone()),
+            ],
+        });
+    }
+
     if let Some(ref fknn) = slots.filtered_knn {
         if fknn.is_materialized() {
             let simple = args.synthesis_mode == "simple-int-eq" && args.synthesize_metadata;

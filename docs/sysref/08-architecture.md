@@ -61,7 +61,9 @@ vectordata-rs/
 ├── veks-pipeline/     Pipeline engine + commands
 │   ├── pipeline/
 │   │   ├── mod.rs     DAG resolution, step execution, variable sync
-│   │   ├── runner.rs  Step lifecycle, freshness, fingerprinting
+│   │   ├── runner.rs  Step lifecycle, freshness via ProvenanceMap (v5)
+│   │   ├── progress.rs  Persistent v5 progress log
+│   │   ├── provenance.rs  Structured provenance + selector flags
 │   │   ├── commands/  50+ command implementations
 │   │   └── resource.rs  Resource governance
 │

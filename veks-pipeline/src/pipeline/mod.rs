@@ -39,6 +39,7 @@ pub mod resource;
 pub mod rng;
 pub mod simd_distance;
 pub mod progress;
+pub mod provenance;
 pub mod registry;
 pub mod runner;
 pub mod schema;
@@ -262,6 +263,31 @@ pub struct RunArgs {
     /// Auto-detected when not specified: tui if TTY, basic otherwise.
     #[arg(long, default_value = "auto", value_parser = ["auto", "tui", "basic", "batch"])]
     pub output: String,
+
+    /// Provenance components consulted when deciding whether a step is
+    /// stale. Accepts a preset (`strict`, `version-aware`, `config-only`,
+    /// `all`) or a comma-separated list of components (`step_id`,
+    /// `command_path`, `version_major`, `version_minor`, `version_patch`,
+    /// `git_hash`, `dirty`, `options`, `upstream`).
+    ///
+    /// Default: `strict` — current v4 behaviour. Use `version-aware`
+    /// after a minor/patch binary upgrade to keep cached steps fresh
+    /// without re-running everything; use `config-only` to ignore the
+    /// binary version entirely.
+    #[arg(
+        long,
+        default_value = "strict",
+        value_name = "SELECTOR",
+        add = ArgValueCompleter::new(cli::provenance_completer),
+    )]
+    pub provenance: String,
+
+    /// Print the provenance diff between the stored and current
+    /// provenance for every step (under the active `--provenance`
+    /// selector) and exit without executing anything. Useful for
+    /// understanding *why* a step is going to re-run.
+    #[arg(long)]
+    pub explain_staleness: bool,
 }
 
 /// CLI arguments for `veks script`.
@@ -657,6 +683,13 @@ pub fn run_pipeline(args: RunArgs) -> Result<(), String> {
         args.threads
     };
 
+    // Parse --provenance selector early so a bad value fails fast.
+    let provenance_selector_parsed = provenance::ProvenanceFlags::parse(&args.provenance)
+        .unwrap_or_else(|e| {
+            eprintln!("Invalid --provenance: {}", e);
+            std::process::exit(1);
+        });
+
     // Parse --resources if provided
     let resource_budget = if let Some(ref res_str) = args.resources {
         resource::ResourceBudget::parse(res_str).unwrap_or_else(|e| {
@@ -749,6 +782,7 @@ pub fn run_pipeline(args: RunArgs) -> Result<(), String> {
         },
         status_interval: std::time::Duration::from_millis(args.status_interval),
         estimated_total_steps: estimated_total,
+        provenance_selector: provenance_selector_parsed,
     };
 
     ctx.ui.log(&format!("pipeline initialized: {} steps, profile={}, build={}",
@@ -778,6 +812,14 @@ pub fn run_pipeline(args: RunArgs) -> Result<(), String> {
             // Then show the panic
             prev_hook(info);
         }));
+    }
+
+    // Explain-staleness mode: walk every step under the active
+    // selector, print fresh/stale + diff lines, and exit without
+    // executing. Useful for "why is this re-running?" diagnosis.
+    if args.explain_staleness {
+        explain_staleness(&pipeline_dag.steps, &registry, &ctx, provenance_selector_parsed);
+        return Ok(());
     }
 
     // Phase 1: Run steps (core + any already-resolved per-profile steps)
@@ -1117,6 +1159,121 @@ fn update_dataset_attributes(dataset_path: &Path, workspace: &Path) {
             eprintln!("  warning: failed to serialize dataset.yaml: {}", e);
         }
     }
+}
+
+/// Walk every resolved step under the active provenance selector and
+/// print why it would (or wouldn't) re-run, then return without
+/// executing. Mirrors the runner's per-step staleness logic exactly:
+/// same interpolation, same upstream wiring, same `check_provenance`
+/// call — so the user sees what the runner would see.
+fn explain_staleness(
+    steps: &[dag::ResolvedStep],
+    registry: &registry::CommandRegistry,
+    ctx: &command::StreamContext,
+    selector: provenance::ProvenanceFlags,
+) {
+    use veks_core::term;
+    println!();
+    println!(
+        "{} explaining staleness for {} step(s) under selector '{}'",
+        term::info("Pipeline:"),
+        steps.len(),
+        selector.describe(),
+    );
+    println!();
+
+    // Build a snapshot of the resolved options + command path for each
+    // step up front. We need them for two reasons: (1) to compute each
+    // step's own current provenance, and (2) so an upstream's *current*
+    // provenance is in scope when computing a downstream's — letting
+    // the user see what would happen if every upstream re-ran exactly
+    // as currently configured.
+    let mut current_provenances: std::collections::HashMap<String, provenance::ProvenanceMap> =
+        std::collections::HashMap::new();
+    let mut fresh_count = 0usize;
+    let mut stale_count = 0usize;
+
+    for step in steps {
+        let resolved_opts = match interpolate::interpolate_options(
+            &step.def.options,
+            &ctx.defaults,
+            &ctx.workspace,
+        ) {
+            Ok(o) => o,
+            Err(e) => {
+                println!("  {} {} — option interpolation failed: {}",
+                    term::warn("?"), step.id, e);
+                continue;
+            }
+        };
+        let resolved_map: std::collections::HashMap<String, String> =
+            resolved_opts.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+
+        let factory = match registry.get(&step.def.run) {
+            Some(f) => f,
+            None => {
+                println!("  {} {} — unknown command '{}'",
+                    term::warn("?"), step.id, step.def.run);
+                continue;
+            }
+        };
+        let cmd = factory();
+        let cmd_build_version = cmd.build_version().to_string();
+
+        // Build current provenance the same way runner.rs does, but
+        // pull upstream maps from the in-flight `current_provenances`
+        // when present so the diff reflects the planned re-run order.
+        let upstream_ids: Vec<&str> = step.def.after.iter().map(|s| s.as_str()).collect();
+        let mut upstream_maps: std::collections::BTreeMap<String, provenance::ProvenanceMap> =
+            std::collections::BTreeMap::new();
+        for up in &upstream_ids {
+            if let Some(p) = current_provenances.get(*up) {
+                upstream_maps.insert((*up).to_string(), p.clone());
+            } else if let Some(rec) = ctx.progress.get_step(up) {
+                if let Some(p) = rec.provenance.clone() {
+                    upstream_maps.insert((*up).to_string(), p);
+                }
+            }
+        }
+        let binary = provenance::BinaryVersion::parse(&cmd_build_version);
+        let current = provenance::ProvenanceMap::build(
+            &step.id, &step.def.run, &binary, &resolved_map, upstream_maps,
+        );
+
+        let stored = ctx.progress.get_step(&step.id).and_then(|r| r.provenance.as_ref());
+        match stored {
+            None => {
+                println!("  {} {} — STALE (no prior record)", term::warn("●"), step.id);
+                stale_count += 1;
+            }
+            Some(stored) => {
+                if stored.hash(selector) == current.hash(selector) {
+                    println!("  {} {} — fresh", term::ok("✓"), step.id);
+                    fresh_count += 1;
+                } else {
+                    println!("  {} {} — STALE", term::warn("●"), step.id);
+                    let diffs = current.diff(stored);
+                    let shown = diffs.iter().take(8);
+                    for d in shown {
+                        println!("      {}", d);
+                    }
+                    if diffs.len() > 8 {
+                        println!("      ... and {} more", diffs.len() - 8);
+                    }
+                    stale_count += 1;
+                }
+            }
+        }
+
+        current_provenances.insert(step.id.clone(), current);
+    }
+
+    println!();
+    println!(
+        "{} {} fresh, {} stale (selector: {})",
+        term::info("Summary:"),
+        fresh_count, stale_count, selector.describe(),
+    );
 }
 
 /// Print a post-TUI run summary to stdout.
@@ -2591,8 +2748,7 @@ default:
             resolved_options: HashMap::new(),
             error: None,
             resource_summary: None,
-            fingerprint: None,
-            build_version: None,
+            provenance: None,
         });
     }
 

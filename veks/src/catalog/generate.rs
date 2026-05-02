@@ -67,7 +67,7 @@ impl DiscoveredDataset {
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|_| self.yaml_path.clone());
 
-        // Elide "." components (e.g., "laion400b/./img-search" → "laion400b/img-search")
+        // Elide "." components (e.g., "a/./b" → "a/b")
         let cleaned: std::path::PathBuf = rel_path.components()
             .filter(|c| !matches!(c, std::path::Component::CurDir))
             .collect();

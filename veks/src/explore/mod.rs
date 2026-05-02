@@ -241,6 +241,7 @@ fn run_pipeline_command(
         ui: crate::ui::UiHandle::new(std::sync::Arc::new(crate::ui::PlainSink::new())),
         status_interval: std::time::Duration::from_secs(1),
         estimated_total_steps: 0,
+        provenance_selector: veks_pipeline::pipeline::provenance::ProvenanceFlags::STRICT,
     };
 
     let result = cmd.execute(&opts, &mut ctx);

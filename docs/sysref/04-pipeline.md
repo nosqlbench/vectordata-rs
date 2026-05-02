@@ -76,13 +76,78 @@ range: "[0,${base_count})"        # computed by earlier step
 output: "${cache}/sorted.ivec"    # .cache/ directory
 ```
 
-### Freshness checking
+### Freshness checking — structured provenance (v5)
 
-Staleness is fingerprint-based, not mtime-based. A step is skipped when:
-- The output file exists and has non-zero size
-- The step's configuration fingerprint (which chains through the DAG and includes the build version) matches the progress log
+Staleness is provenance-based, not mtime-based. Each step's progress
+record carries a structured **`ProvenanceMap`** capturing every
+component that *could* be used to decide whether the step is stale:
 
-The fingerprint incorporates all step options, dependency fingerprints, and the build version, so any code change or option change propagates staleness through downstream steps. `--clean` removes all generated artifacts and forces re-execution.
+- **Identity** — `step_id`, `command_path`
+- **Binary version** — `version_major`, `version_minor`, `version_patch`,
+  `git_hash`, `dirty` (parsed from `{CARGO_PKG_VERSION}+{git_hash}[+dirty]`)
+- **Resolved options** — sorted `BTreeMap<String, String>`
+- **Upstream provenance** — recursive: each upstream step's *full*
+  `ProvenanceMap`, not just its hash, so a relaxed selector cascades
+  correctly through the DAG
+
+A step is fresh when:
+- The output file exists with the recorded size, AND
+- The step's `ProvenanceMap.hash(selector)` equals the stored hash
+  under the **active selector**
+
+#### Selectors and presets
+
+The selector is a `ProvenanceFlags` bitset over the components above.
+Three presets cover the common cases:
+
+| Preset | Components | Use when |
+|--------|------------|----------|
+| `strict` (default) | every component | safest; matches v4 behaviour |
+| `version-aware` | identity + `version_major` + options + upstream | binary minor/patch upgrade is known to preserve outputs |
+| `config-only` | identity + options + upstream | binary version differences should never invalidate (e.g., comparing across builds) |
+
+Pick a selector at the CLI:
+
+```bash
+veks run --provenance strict          # default
+veks run --provenance version-aware   # ignore minor/patch/git/dirty
+veks run --provenance config-only     # ignore binary version entirely
+veks run --provenance step_id,command_path,version_major,options
+                                      # custom comma-separated component list
+```
+
+Tab-completion suggests presets up front; once a comma is typed it
+switches to suggesting individual components and excludes any already
+chosen.
+
+#### Why the full map is stored
+
+Storing the full structure (rather than a single opaque hash) means a
+later run can pick a *different* selector against the same record
+without re-execution. The recursive `upstream` field is what makes the
+relaxation cascade: when the head step's hash is computed under
+selector S, each upstream contribution is *also* recomputed under S —
+otherwise the head's hash would still pull in strictly-computed leaves
+and the relaxation would be silently neutered.
+
+#### Schema version
+
+The progress log carries `schema_version: 5`. On load, a v4-or-earlier
+log is invalidated wholesale (records cleared, log re-initialized) so
+the next run starts from a known-correct state. This is a one-time
+penalty per workspace per major schema bump; subsequent v5-on-v5 loads
+preserve all records.
+
+#### Tools
+
+- **`veks run --explain-staleness`** — walk every step under the active
+  selector and print `fresh` / `STALE` plus per-component diff lines
+  (`binary_version_major: 1 → 2`, `option 'k': "100" → "200"`,
+  `upstream 'extract' provenance changed`, …) without executing
+  anything. Upstream maps in the walk use the in-flight currents so the
+  cascade reflects the planned re-run order, not a misleading snapshot.
+- **`--clean`** removes all generated artifacts and forces
+  re-execution from scratch.
 
 ---
 
@@ -134,7 +199,7 @@ The governor prevents system lockups during large-scale operations
 
 ## 4.7 Build Versioning
 
-Each command exposes `build_version()` returning a string of the form `{CARGO_PKG_VERSION}+{git_hash}`. This version is included in the step fingerprint — recompiling with code changes automatically invalidates cached results without manual `--clean`. At bootstrap time, `veks_version` and `veks_build` are stamped into `dataset.yaml` attributes so consumers can trace which build produced a dataset.
+Each command exposes `build_version()` returning a string of the form `{CARGO_PKG_VERSION}+{git_hash}[+dirty]`. The runner parses this into the `BinaryVersion` axes (major/minor/patch/git_hash/dirty) recorded in each step's `ProvenanceMap`, so the staleness check can ignore or honor each axis independently per the active selector (see §4.3). At bootstrap time, `veks_version` and `veks_build` are stamped into `dataset.yaml` attributes so consumers can trace which build produced a dataset.
 
 ```yaml
 attributes:
