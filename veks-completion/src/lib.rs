@@ -37,6 +37,8 @@
 
 use std::collections::BTreeMap;
 
+pub mod providers;
+
 /// A function that provides dynamic completion values for a specific option.
 ///
 /// Called when the user tabs after an option that has a registered provider.
@@ -54,6 +56,100 @@ pub type ValueProvider = std::sync::Arc<dyn Fn(&str, &[&str]) -> Vec<String> + S
 /// pointers and call this when registering.
 pub fn fn_provider(f: fn(&str, &[&str]) -> Vec<String>) -> ValueProvider {
     std::sync::Arc::new(f)
+}
+
+/// A closed set of valid values for a flag. Both static (`&'static
+/// [&'static str]`) and runtime-owned (`Vec<String>`) variants are
+/// supported via the same query API.
+///
+/// Solves two TODO gaps in one type:
+///
+/// - **Item 1** (no per-set glue functions): callers no longer need
+///   to write `fn palette_provider(...) -> Vec<String> { palette.iter()
+///   .filter(...).collect() }` boilerplate per closed set. Just
+///   construct a [`ClosedValues`] and convert to a [`ValueProvider`]
+///   via [`ClosedValues::into_provider`].
+/// - **Item 5** (validation surface): the same declaration that
+///   drives completion can drive parser-side validation —
+///   [`ClosedValues::validate`] returns `true` for any value the
+///   completer would have offered.
+///
+/// ```
+/// use veks_completion::ClosedValues;
+///
+/// let metrics = ClosedValues::Static(&["L2", "IP", "COSINE"]);
+///
+/// // Completion: prefix-filtered.
+/// assert_eq!(metrics.complete(""), vec!["L2", "IP", "COSINE"]);
+/// assert_eq!(metrics.complete("CO"), vec!["COSINE"]);
+///
+/// // Validation: exact set membership.
+/// assert!(metrics.validate("L2"));
+/// assert!(!metrics.validate("bogus"));
+///
+/// // Convert to a ValueProvider for tree registration.
+/// let provider = metrics.clone().into_provider();
+/// assert_eq!(provider("CO", &[]), vec!["COSINE"]);
+/// ```
+#[derive(Debug, Clone)]
+pub enum ClosedValues {
+    /// Borrowed `&'static` slice — preferred when the set is known
+    /// at compile time (the common case).
+    Static(&'static [&'static str]),
+    /// Heap-owned values — for runtime-built specs whose closed set
+    /// isn't known until the binary inspects its environment.
+    Owned(Vec<String>),
+}
+
+impl ClosedValues {
+    /// Iterate over the values as `&str` regardless of variant.
+    pub fn values(&self) -> Vec<&str> {
+        match self {
+            ClosedValues::Static(s) => s.to_vec(),
+            ClosedValues::Owned(v) => v.iter().map(|s| s.as_str()).collect(),
+        }
+    }
+
+    /// Prefix-filtered completion candidates.
+    pub fn complete(&self, partial: &str) -> Vec<String> {
+        match self {
+            ClosedValues::Static(s) => s
+                .iter()
+                .filter(|v| v.starts_with(partial))
+                .map(|v| (*v).to_string())
+                .collect(),
+            ClosedValues::Owned(v) => v
+                .iter()
+                .filter(|val| val.starts_with(partial))
+                .cloned()
+                .collect(),
+        }
+    }
+
+    /// Membership check — `true` iff `value` is in the set.
+    pub fn validate(&self, value: &str) -> bool {
+        match self {
+            ClosedValues::Static(s) => s.iter().any(|v| *v == value),
+            ClosedValues::Owned(v) => v.iter().any(|val| val == value),
+        }
+    }
+
+    /// Wrap as a [`ValueProvider`] for use with
+    /// [`Node::with_value_provider`] /
+    /// [`CommandTree::global_value_provider`]. The set is moved into
+    /// the closure; clone the [`ClosedValues`] first if you also
+    /// need to keep it for validation.
+    pub fn into_provider(self) -> ValueProvider {
+        std::sync::Arc::new(move |partial: &str, _ctx: &[&str]| self.complete(partial))
+    }
+}
+
+/// Convenience: hand any [`ClosedValues`] to APIs that take a
+/// [`ValueProvider`] without explicit `.into_provider()`.
+impl From<ClosedValues> for ValueProvider {
+    fn from(cv: ClosedValues) -> Self {
+        cv.into_provider()
+    }
 }
 
 /// Discovery-tier abstraction symmetric with [`CategoryTag`].
@@ -172,212 +268,593 @@ impl std::error::Error for MetadataError {}
 /// Existing callers that didn't set these fields get the
 /// pre-existing behavior automatically (everything visible at
 /// tap 1, no category metadata).
+///
+/// A node in the command tree. Carries everything a command-tree
+/// node *can* have: subcommand children, flags, providers,
+/// discovery metadata, help text, and a free-form attachment slot.
+///
+/// "Leaf" and "Group" are no longer separate variants. A node with
+/// no children is leaf-shaped; a node with children is group-shaped;
+/// a node with both is hybrid (e.g., `report --workload x base`,
+/// where `report` accepts `--workload` *and* has a `base` subcommand).
+/// Walkers branch on `children.is_empty()` only when the distinction
+/// actually matters.
+///
+/// All builder methods (`with_*`) return `self` so they chain.
+/// Methods that operate on children (e.g. `with_child`) work on
+/// any node — calling them just adds the child, regardless of
+/// whether the node was previously leaf-shaped or not.
 #[derive(Clone)]
-pub enum Node {
-    /// A leaf command with option names and optional value providers.
-    Leaf {
-        options: Vec<String>,
-        /// Options that are boolean flags (no value expected).
-        flags: std::collections::HashSet<String>,
-        /// Dynamic value providers keyed by option name (e.g., "--dataset").
-        value_providers: BTreeMap<String, ValueProvider>,
-        /// Optional provider that discovers additional options from context.
-        dynamic_options: Option<DynamicOptionsProvider>,
-        /// Display group tag — see type-level docs for usage.
-        category: Option<String>,
-        /// Tap-tier visibility — see type-level docs for
-        /// usage. `None` means "never explicitly set"; the
-        /// effective level resolves to [`DEFAULT_LEVEL`] but
-        /// strict-metadata mode treats `None` as missing.
-        level: Option<u32>,
-    },
-    /// A group containing named child nodes.
-    Group {
-        children: BTreeMap<String, Node>,
-        category: Option<String>,
-        level: Option<u32>,
-    },
+pub struct Node {
+    // ---- discovery / display ----
+    /// Display group tag — see [`CategoryTag`] for usage.
+    category: Option<String>,
+    /// Tap-tier visibility. `None` ⇒ "never explicitly set"; the
+    /// effective level resolves to [`DEFAULT_LEVEL`], but
+    /// strict-metadata mode treats `None` as missing.
+    level: Option<u32>,
+    /// One-line `--help` summary. Set via [`Node::with_help`].
+    help: Option<String>,
+
+    // ---- subcommand children ----
+    /// Named children. Empty ⇒ leaf-shaped.
+    children: BTreeMap<String, Node>,
+
+    // ---- flags this node accepts ----
+    /// All flag names (value-taking + boolean), in declared order.
+    flags: Vec<String>,
+    /// Subset of `flags` that don't take a value.
+    boolean_flags: std::collections::HashSet<String>,
+    /// Per-flag help text. Used by [`render_usage`].
+    flag_help: BTreeMap<String, String>,
+    /// Dynamic value providers keyed by flag name.
+    value_providers: BTreeMap<String, ValueProvider>,
+
+    // ---- discovery extras ----
+    /// Optional provider that discovers additional `key=` options
+    /// from context (e.g., workload-file parameters).
+    dynamic_options: Option<DynamicOptionsProvider>,
+    /// Per-node staged tree-globals — promoted to the
+    /// [`CommandTree`]'s global registry by
+    /// [`CommandTree::lift_promoted_globals`].
+    promoted_globals: Vec<(String, ValueProvider)>,
+    /// Context-aware completion override that fires whenever the
+    /// cursor sits inside this subtree.
+    subtree_provider: Option<SubtreeProvider>,
+    /// Free-form attachment slot. Downstream crates use this to
+    /// carry handler payloads, parser state, dispatch rules, etc.,
+    /// without forcing this crate to grow generics.
+    extras: Option<Extras>,
+}
+
+/// Type alias for group-level context-aware completion providers
+/// (TODO item 7). Receives a structured [`PartialParse`] of the
+/// command line state and returns candidates to merge into the
+/// completer's output.
+pub type SubtreeProvider =
+    std::sync::Arc<dyn Fn(&PartialParse) -> Vec<String> + Send + Sync>;
+
+/// Free-form payload slot on a Node (TODO item 8). Wraps an
+/// `Arc<dyn Any + Send + Sync>` so embedders can attach handler
+/// types, parser state, or anything else without forcing
+/// veks-completion to grow generic parameters or hard dependencies.
+///
+/// Recover the payload via `Arc::downcast` on the inner Arc.
+#[derive(Clone)]
+pub struct Extras(pub std::sync::Arc<dyn std::any::Any + Send + Sync>);
+
+impl std::fmt::Debug for Extras {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Extras").field("type_id", &self.0.type_id()).finish()
+    }
+}
+
+impl Extras {
+    /// Wrap any `Send + Sync + 'static` value as an extras payload.
+    pub fn new<T: std::any::Any + Send + Sync + 'static>(value: T) -> Self {
+        Extras(std::sync::Arc::new(value))
+    }
+
+    /// Try to downcast to a concrete type. Returns `None` if the
+    /// payload was attached as a different type.
+    pub fn downcast<T: std::any::Any + Send + Sync + 'static>(
+        &self,
+    ) -> Option<&T> {
+        self.0.downcast_ref::<T>()
+    }
+}
+
+/// Structured snapshot of the partial command-line state at the
+/// cursor position. Passed to subtree providers so they can offer
+/// context-aware completions without re-tokenising `COMP_LINE`.
+///
+/// Carries both the **whitespace-tokenised** view (`completed`,
+/// `partial`, `tree_path` — the same shape every veks-completion
+/// flow uses) AND the **raw line + cursor offset** that grammar-aware
+/// providers (e.g. for embedded query DSLs like MetricsQL or PromQL)
+/// need to resolve quote / bracket / operator state. Callers that
+/// don't have raw context populate `raw_line` with an empty string
+/// and `cursor_offset` with `0` — grammar helpers fall back to the
+/// tokenised view in that case.
+#[derive(Debug, Clone)]
+pub struct PartialParse<'a> {
+    /// Words the user has already completed (whitespace-separated,
+    /// program name excluded).
+    pub completed: Vec<&'a str>,
+    /// The partial word currently under the cursor (may be empty).
+    pub partial: &'a str,
+    /// Path through the command tree that resolved against
+    /// `completed`. Same shape as `completed` but only the prefix
+    /// that maps to actual nodes.
+    pub tree_path: Vec<&'a str>,
+    /// Raw `COMP_LINE` (or equivalent) — the full command line as
+    /// the user typed it, before any tokenisation. Empty when the
+    /// caller didn't have it.
+    pub raw_line: &'a str,
+    /// Byte offset of the cursor within `raw_line`. `0` when
+    /// `raw_line` is empty.
+    pub cursor_offset: usize,
+}
+
+/// Bracket / quote depth at the cursor, computed by
+/// [`PartialParse::bracket_state`]. Lets a grammar-aware provider
+/// answer "am I inside a `{...}`, `(...)`, `[...]`, or quoted
+/// string?" without re-implementing the scanner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BracketState {
+    /// Net `(` minus `)` count up to the cursor. Negative ⇒ extra
+    /// closes (likely user error).
+    pub paren: i32,
+    /// Net `{` minus `}` count up to the cursor.
+    pub brace: i32,
+    /// Net `[` minus `]` count up to the cursor.
+    pub bracket: i32,
+    /// `Some(quote)` when the cursor sits inside an unclosed
+    /// quote of the indicated kind (`"` or `'`); `None` otherwise.
+    pub inside_quote: Option<char>,
+}
+
+impl<'a> PartialParse<'a> {
+    /// Slice of `raw_line` strictly before the cursor. Empty when
+    /// `raw_line` is empty.
+    pub fn before_cursor(&self) -> &'a str {
+        if self.raw_line.is_empty() { return ""; }
+        &self.raw_line[..self.cursor_offset.min(self.raw_line.len())]
+    }
+
+    /// Slice of `raw_line` from the cursor to the end.
+    pub fn after_cursor(&self) -> &'a str {
+        if self.raw_line.is_empty() { return ""; }
+        &self.raw_line[self.cursor_offset.min(self.raw_line.len())..]
+    }
+
+    /// Compute the bracket / quote state at the cursor by linearly
+    /// scanning `before_cursor`. Honors quotes (everything inside
+    /// `"…"` or `'…'` is counted as string content, brackets within
+    /// don't shift the depth) and supports backslash-escapes inside
+    /// quotes.
+    ///
+    /// When `raw_line` is empty (caller didn't supply it), returns
+    /// the default zero-depth state.
+    pub fn bracket_state(&self) -> BracketState {
+        let s = self.before_cursor();
+        let mut state = BracketState::default();
+        let mut chars = s.chars().peekable();
+        while let Some(c) = chars.next() {
+            if let Some(q) = state.inside_quote {
+                if c == '\\' {
+                    // Skip the next character (escaped).
+                    chars.next();
+                    continue;
+                }
+                if c == q {
+                    state.inside_quote = None;
+                }
+                continue;
+            }
+            match c {
+                '(' => state.paren += 1,
+                ')' => state.paren -= 1,
+                '{' => state.brace += 1,
+                '}' => state.brace -= 1,
+                '[' => state.bracket += 1,
+                ']' => state.bracket -= 1,
+                '"' | '\'' => state.inside_quote = Some(c),
+                _ => {}
+            }
+        }
+        state
+    }
+
+    /// Last non-whitespace, non-identifier character before the
+    /// cursor, scanning back over identifier characters first.
+    /// Useful for "what symbol triggered this completion?" — e.g.,
+    /// `=` after `label` means we're in a label-value position.
+    /// Returns `None` if the only thing before the cursor is
+    /// identifier characters or whitespace.
+    pub fn trigger_char(&self) -> Option<char> {
+        let s = self.before_cursor();
+        let mut chars = s.chars().rev();
+        // Skip current identifier-ish run.
+        while let Some(c) = chars.clone().next() {
+            if is_ident_char(c) {
+                chars.next();
+            } else {
+                break;
+            }
+        }
+        chars.next()
+    }
+
+    /// Identifier (or partial identifier) immediately to the left
+    /// of the cursor. For input `up{job=`, returns `""` (cursor is
+    /// right after `=`, so the partial-ident before the cursor is
+    /// empty). For input `up{jo`, returns `"jo"`.
+    pub fn ident_before_cursor(&self) -> &'a str {
+        let s = self.before_cursor();
+        let bytes = s.as_bytes();
+        let mut i = bytes.len();
+        while i > 0 {
+            let c = bytes[i - 1] as char;
+            if is_ident_char(c) {
+                i -= 1;
+            } else {
+                break;
+            }
+        }
+        &s[i..]
+    }
+}
+
+#[inline]
+fn is_ident_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_' || c == ':'
 }
 
 impl std::fmt::Debug for Node {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Node::Leaf { options, flags, value_providers, dynamic_options, category, level } => {
-                f.debug_struct("Leaf")
-                    .field("options", options)
-                    .field("flags", flags)
-                    .field("value_providers", &value_providers.keys().collect::<Vec<_>>())
-                    .field("has_dynamic_options", &dynamic_options.is_some())
-                    .field("category", category)
-                    .field("level", level)
-                    .finish()
-            }
-            Node::Group { children, category, level } => {
-                f.debug_struct("Group")
-                    .field("children", children)
-                    .field("category", category)
-                    .field("level", level)
-                    .finish()
-            }
+        f.debug_struct("Node")
+            .field("category", &self.category)
+            .field("level", &self.level)
+            .field("help", &self.help)
+            .field("children", &self.children)
+            .field("flags", &self.flags)
+            .field("boolean_flags", &self.boolean_flags)
+            .field("flag_help", &self.flag_help.keys().collect::<Vec<_>>())
+            .field("value_providers", &self.value_providers.keys().collect::<Vec<_>>())
+            .field("has_dynamic_options", &self.dynamic_options.is_some())
+            .field("promoted_globals", &self.promoted_globals.iter().map(|(k, _)| k).collect::<Vec<_>>())
+            .field("has_subtree_provider", &self.subtree_provider.is_some())
+            .field("has_extras", &self.extras.is_some())
+            .finish()
+    }
+}
+
+impl Default for Node {
+    fn default() -> Self {
+        Node {
+            category: None,
+            level: None,
+            help: None,
+            children: BTreeMap::new(),
+            flags: Vec::new(),
+            boolean_flags: std::collections::HashSet::new(),
+            flag_help: BTreeMap::new(),
+            value_providers: BTreeMap::new(),
+            dynamic_options: None,
+            promoted_globals: Vec::new(),
+            subtree_provider: None,
+            extras: None,
         }
     }
 }
 
 impl Node {
-    /// Create a leaf node with the given option names (all assumed to take values).
-    pub fn leaf(options: &[&str]) -> Self {
-        Node::Leaf {
-            options: options.iter().map(|s| s.to_string()).collect(),
-            flags: std::collections::HashSet::new(),
-            value_providers: BTreeMap::new(),
-            dynamic_options: None,
-            category: None,
-            level: None,
-        }
-    }
+    /// Empty node — no flags, no children, no metadata. Build up
+    /// from here using the `with_*` builders.
+    pub fn new() -> Self { Self::default() }
 
-    /// Create a leaf node with separate value-options and boolean flags.
-    pub fn leaf_with_flags(options: &[&str], flags: &[&str]) -> Self {
-        Node::Leaf {
-            options: options.iter().chain(flags.iter()).map(|s| s.to_string()).collect(),
+    /// Convenience: a leaf-shaped node carrying the supplied
+    /// value-taking flags (none of them booleans).
+    pub fn leaf(flags: &[&str]) -> Self {
+        Node {
             flags: flags.iter().map(|s| s.to_string()).collect(),
-            value_providers: BTreeMap::new(),
-            dynamic_options: None,
-            category: None,
-            level: None,
+            ..Self::default()
         }
     }
 
-    /// Attach a dynamic value provider to an option on this leaf node.
-    pub fn with_value_provider(mut self, option: &str, provider: ValueProvider) -> Self {
-        if let Node::Leaf { ref mut value_providers, .. } = self {
-            value_providers.insert(option.to_string(), provider);
+    /// Convenience: a leaf-shaped node with separate value-taking
+    /// and boolean flag lists.
+    pub fn leaf_with_flags(value_flags: &[&str], boolean_flags: &[&str]) -> Self {
+        let all: Vec<String> = value_flags.iter()
+            .chain(boolean_flags.iter())
+            .map(|s| s.to_string())
+            .collect();
+        Node {
+            flags: all,
+            boolean_flags: boolean_flags.iter().map(|s| s.to_string()).collect(),
+            ..Self::default()
+        }
+    }
+
+    /// Convenience: a group-shaped node from a list of `(name, child)`
+    /// pairs. Add flags to the group separately via [`Node::with_flags`]
+    /// / [`Node::with_boolean_flags`].
+    pub fn group(children: Vec<(&str, Node)>) -> Self {
+        Node {
+            children: children.into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect(),
+            ..Self::default()
+        }
+    }
+
+    /// Empty group — no children, no flags. Add via [`Node::with_child`].
+    pub fn empty_group() -> Self { Self::default() }
+
+    // ---- shape predicates -----------------------------------------
+
+    /// Leaf-shaped if it has no children. A node with both flags AND
+    /// children is *not* leaf-shaped — it's hybrid.
+    pub fn is_leaf(&self) -> bool { self.children.is_empty() }
+
+    /// Group-shaped if it has at least one child.
+    pub fn is_group(&self) -> bool { !self.children.is_empty() }
+
+    // ---- children -------------------------------------------------
+
+    /// Add a child to this node. Works on any node; if the node was
+    /// previously leaf-shaped, this turns it into a hybrid (flags +
+    /// children).
+    pub fn with_child(mut self, name: &str, child: Node) -> Self {
+        self.children.insert(name.to_string(), child);
+        self
+    }
+
+    /// Direct access to children (empty for leaf-shaped nodes).
+    pub fn children(&self) -> &BTreeMap<String, Node> { &self.children }
+
+    /// Mutable access to children — used by internal walkers.
+    pub fn children_mut(&mut self) -> &mut BTreeMap<String, Node> { &mut self.children }
+
+    /// Names of this node's children, in `BTreeMap` order.
+    pub fn child_names(&self) -> Vec<&str> {
+        self.children.keys().map(|k| k.as_str()).collect()
+    }
+
+    /// Look up a child by name.
+    pub fn child(&self, name: &str) -> Option<&Node> {
+        self.children.get(name)
+    }
+
+    // ---- flags ----------------------------------------------------
+
+    /// Add value-taking flags to this node. Idempotent — duplicates
+    /// are skipped.
+    pub fn with_flags(mut self, flags: &[&str]) -> Self {
+        for f in flags {
+            if !self.flags.iter().any(|x| x == f) {
+                self.flags.push((*f).to_string());
+            }
         }
         self
     }
 
-    /// Attach a dynamic options provider to this leaf node.
+    /// Add boolean flags (no value expected) to this node. Idempotent.
+    pub fn with_boolean_flags(mut self, flags: &[&str]) -> Self {
+        for f in flags {
+            if !self.flags.iter().any(|x| x == f) {
+                self.flags.push((*f).to_string());
+            }
+            self.boolean_flags.insert((*f).to_string());
+        }
+        self
+    }
+
+    /// All flag names this node accepts (value-taking + boolean), in
+    /// declared order.
+    pub fn flags(&self) -> &[String] { &self.flags }
+
+    /// Returns `true` if `flag` is a boolean flag on this node.
+    pub fn is_flag(&self, flag: &str) -> bool {
+        self.boolean_flags.contains(flag)
+    }
+
+    /// Convenience accessor — same as [`Node::flags`] but as a `Vec<&str>`.
+    /// Kept for callers that prefer the `&str` view.
+    pub fn options(&self) -> Vec<&str> {
+        self.flags.iter().map(|s| s.as_str()).collect()
+    }
+
+    /// Attach a value provider to one of this node's flags.
+    pub fn with_value_provider(mut self, flag: &str, provider: ValueProvider) -> Self {
+        self.value_providers.insert(flag.to_string(), provider);
+        self
+    }
+
+    /// Attach the same value provider to every name in `aliases` —
+    /// e.g. `--tofile` and `--to-file`.
+    pub fn with_value_provider_aliases(
+        mut self,
+        aliases: &[&str],
+        provider: ValueProvider,
+    ) -> Self {
+        for name in aliases {
+            self.value_providers.insert((*name).to_string(), provider.clone());
+        }
+        self
+    }
+
+    /// Direct access to the value-provider map (used by walkers).
+    pub fn value_providers(&self) -> &BTreeMap<String, ValueProvider> {
+        &self.value_providers
+    }
+
+    /// Attach a dynamic options provider.
     ///
-    /// The provider is called during completion to discover additional
-    /// `key=` options from context (e.g., workload file parameters).
+    /// The provider is called during completion to discover
+    /// additional `key=` options from context (e.g., workload-file
+    /// parameters).
     pub fn with_dynamic_options(mut self, provider: DynamicOptionsProvider) -> Self {
-        if let Node::Leaf { ref mut dynamic_options, .. } = self {
-            *dynamic_options = Some(provider);
-        }
+        self.dynamic_options = Some(provider);
         self
     }
 
-    /// Tag this node with a display category (e.g. `"workloads"`,
-    /// `"documentation"`). Categories are free-form strings used by
-    /// renderers to group commands; they don't affect completion
-    /// candidate ordering directly.
+    /// The attached dynamic options provider, if any.
+    pub fn dynamic_options(&self) -> Option<DynamicOptionsProvider> {
+        self.dynamic_options
+    }
+
+    // ---- discovery / display --------------------------------------
+
+    /// Tag this node with a display category.
     pub fn with_category(mut self, cat: &str) -> Self {
-        match &mut self {
-            Node::Leaf { category, .. } => *category = Some(cat.to_string()),
-            Node::Group { category, .. } => *category = Some(cat.to_string()),
-        }
-        self
-    }
-
-    /// Set the tap-tier visibility for this node. The Nth tab
-    /// tap reveals every root-level node with `level <= N`.
-    /// Default (when `with_level` is not called) is
-    /// [`DEFAULT_LEVEL`] (= 1) — but strict-metadata mode (see
-    /// [`CommandTree::require_metadata`]) treats the absence
-    /// of an explicit call as a registration error.
-    pub fn with_level(mut self, lvl: u32) -> Self {
-        match &mut self {
-            Node::Leaf { level, .. } => *level = Some(lvl),
-            Node::Group { level, .. } => *level = Some(lvl),
-        }
+        self.category = Some(cat.to_string());
         self
     }
 
     /// Get the node's category tag, if any.
-    pub fn category(&self) -> Option<&str> {
-        match self {
-            Node::Leaf { category, .. } => category.as_deref(),
-            Node::Group { category, .. } => category.as_deref(),
-        }
-    }
+    pub fn category(&self) -> Option<&str> { self.category.as_deref() }
 
-    /// Get the node's effective tap-tier level — explicit
-    /// value if set, otherwise [`DEFAULT_LEVEL`].
-    pub fn level(&self) -> u32 {
-        self.level_explicit().unwrap_or(DEFAULT_LEVEL)
-    }
-
-    /// Get the node's *explicit* tap-tier level — `None` when
-    /// `with_level` was never called. Used by strict-metadata
-    /// validation to distinguish "user picked level 1" from
-    /// "user forgot to set a level."
-    pub fn level_explicit(&self) -> Option<u32> {
-        match self {
-            Node::Leaf { level, .. } => *level,
-            Node::Group { level, .. } => *level,
-        }
-    }
-
-    /// Check if an option is a boolean flag (no value expected).
-    pub fn is_flag(&self, option: &str) -> bool {
-        match self {
-            Node::Leaf { flags, .. } => flags.contains(option),
-            _ => false,
-        }
-    }
-
-    /// Create a group node from a list of `(name, child)` pairs.
-    pub fn group(children: Vec<(&str, Node)>) -> Self {
-        Node::Group {
-            children: children.into_iter()
-                .map(|(k, v)| (k.to_string(), v))
-                .collect(),
-            category: None,
-            level: None,
-        }
-    }
-
-    /// Create an empty group node.
-    pub fn empty_group() -> Self {
-        Node::Group {
-            children: BTreeMap::new(),
-            category: None,
-            level: None,
-        }
-    }
-
-    /// Add a child to a group node. Panics if called on a leaf.
-    pub fn with_child(mut self, name: &str, child: Node) -> Self {
-        match &mut self {
-            Node::Group { children, .. } => { children.insert(name.to_string(), child); }
-            Node::Leaf { .. } => panic!("cannot add child to leaf node"),
-        }
+    /// Set the tap-tier visibility for this node.
+    pub fn with_level(mut self, lvl: u32) -> Self {
+        self.level = Some(lvl);
         self
     }
 
-    /// Get child names (empty for leaves).
-    pub fn child_names(&self) -> Vec<&str> {
-        match self {
-            Node::Group { children, .. } => children.keys().map(|k| k.as_str()).collect(),
-            Node::Leaf { .. } => Vec::new(),
+    /// Effective tap-tier level — explicit value if set, otherwise
+    /// [`DEFAULT_LEVEL`].
+    pub fn level(&self) -> u32 {
+        self.level.unwrap_or(DEFAULT_LEVEL)
+    }
+
+    /// Explicit tap-tier level — `None` when `with_level` was never
+    /// called. Used by strict-metadata validation.
+    pub fn level_explicit(&self) -> Option<u32> { self.level }
+
+    // ---- help -----------------------------------------------------
+
+    /// Attach a one-line help summary.
+    pub fn with_help(mut self, text: &str) -> Self {
+        self.help = Some(text.to_string());
+        self
+    }
+
+    /// Get the node's help text, if any.
+    pub fn help(&self) -> Option<&str> { self.help.as_deref() }
+
+    /// Attach help text for one of this node's flags.
+    pub fn with_flag_help(mut self, flag: &str, help: &str) -> Self {
+        self.flag_help.insert(flag.to_string(), help.to_string());
+        self
+    }
+
+    /// Get help text for one of this node's flags, if any.
+    pub fn flag_help_for(&self, flag: &str) -> Option<&str> {
+        self.flag_help.get(flag).map(|s| s.as_str())
+    }
+
+    // ---- per-node tree-global staging -----------------------------
+
+    /// Stage a tree-global value provider on this node. Promoted to
+    /// the [`CommandTree`]'s global registry when
+    /// [`CommandTree::lift_promoted_globals`] runs.
+    pub fn with_promoted_global(mut self, token: &str, provider: ValueProvider) -> Self {
+        self.promoted_globals.push((token.to_string(), provider));
+        self
+    }
+
+    /// Drain staged globals (recursively) into the supplied
+    /// registry. Used by [`CommandTree::lift_promoted_globals`].
+    fn drain_promoted_globals_into(
+        &mut self,
+        out: &mut std::collections::BTreeMap<String, ValueProvider>,
+    ) {
+        for (token, provider) in std::mem::take(&mut self.promoted_globals) {
+            out.insert(token, provider);
+        }
+        for child in self.children.values_mut() {
+            child.drain_promoted_globals_into(out);
         }
     }
 
-    /// Get a child by name.
-    pub fn child(&self, name: &str) -> Option<&Node> {
-        match self {
-            Node::Group { children, .. } => children.get(name),
-            Node::Leaf { .. } => None,
+    // ---- subtree provider -----------------------------------------
+
+    /// Attach a context-aware completion override for this subtree.
+    pub fn with_subtree_provider(mut self, provider: SubtreeProvider) -> Self {
+        self.subtree_provider = Some(provider);
+        self
+    }
+
+    /// The subtree provider, if any.
+    pub fn subtree_provider(&self) -> Option<&SubtreeProvider> {
+        self.subtree_provider.as_ref()
+    }
+
+    // ---- extras ---------------------------------------------------
+
+    /// Attach a free-form payload (handler, parser state, etc.).
+    pub fn with_extras(mut self, extras: Extras) -> Self {
+        self.extras = Some(extras);
+        self
+    }
+
+    /// The attached extras payload, if any.
+    pub fn extras(&self) -> Option<&Extras> { self.extras.as_ref() }
+}
+
+/// Render a `--help`-style usage block for a node at the given path
+/// (TODO item 6). The same model that drives tab completion drives
+/// help, so the two surfaces can't drift.
+///
+/// Output format:
+///
+/// ```text
+/// USAGE: <path>
+///
+/// <help text>
+///
+/// FLAGS:
+///   --foo    Help text for --foo
+///   --bar    (no help)
+///
+/// SUBCOMMANDS:
+///   sub-a    Help text for sub-a
+///   sub-b    Help text for sub-b
+/// ```
+///
+/// Sections are omitted when their content is empty. Children are
+/// listed in `BTreeMap` order (alphabetical).
+pub fn render_usage(node: &Node, path: &[&str]) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("USAGE: {}\n", path.join(" ")));
+    if let Some(help) = node.help() {
+        out.push('\n');
+        out.push_str(help);
+        out.push('\n');
+    }
+
+    // Flags section.
+    if !node.flags.is_empty() {
+        out.push_str("\nFLAGS:\n");
+        let width = node.flags.iter().map(|f| f.len()).max().unwrap_or(0);
+        for f in &node.flags {
+            let h = node.flag_help_for(f).unwrap_or("");
+            out.push_str(&format!("  {:width$}  {}\n", f, h, width = width));
         }
     }
 
-    /// Get option names (empty for groups).
-    pub fn options(&self) -> Vec<&str> {
-        match self {
-            Node::Leaf { options, .. } => options.iter().map(|s| s.as_str()).collect(),
-            Node::Group { .. } => Vec::new(),
+    // Subcommands section.
+    if !node.children.is_empty() {
+        out.push_str("\nSUBCOMMANDS:\n");
+        let width = node.children.keys().map(|k| k.len()).max().unwrap_or(0);
+        for (name, child) in &node.children {
+            let h = child.help().unwrap_or("");
+            out.push_str(&format!("  {:width$}  {}\n", name, h, width = width));
         }
     }
+
+    out
 }
 
 // =====================================================================
@@ -533,11 +1010,9 @@ impl CommandTree {
     /// can use the result directly as a modular cycle length.
     pub fn max_level(&self) -> u32 {
         let mut max = DEFAULT_LEVEL;
-        if let Node::Group { children, .. } = &self.root {
-            for (_, child) in children {
-                if child.level() > max {
-                    max = child.level();
-                }
+        for child in self.root.children.values() {
+            if child.level() > max {
+                max = child.level();
             }
         }
         max
@@ -583,18 +1058,16 @@ impl CommandTree {
     /// without enabling the panic-at-registration mode.
     pub fn validate(&self) -> Result<(), Vec<MetadataError>> {
         let mut errors = Vec::new();
-        if let Node::Group { children, .. } = &self.root {
-            for (name, node) in children {
-                if node.category().is_none() {
-                    errors.push(MetadataError::MissingCategory {
-                        command: name.clone(),
-                    });
-                }
-                if node.level_explicit().is_none() {
-                    errors.push(MetadataError::MissingLevel {
-                        command: name.clone(),
-                    });
-                }
+        for (name, node) in &self.root.children {
+            if node.category().is_none() {
+                errors.push(MetadataError::MissingCategory {
+                    command: name.clone(),
+                });
+            }
+            if node.level_explicit().is_none() {
+                errors.push(MetadataError::MissingLevel {
+                    command: name.clone(),
+                });
             }
         }
         if errors.is_empty() { Ok(()) } else { Err(errors) }
@@ -688,6 +1161,84 @@ impl CommandTree {
         self.global_value_providers.insert(option.to_string(), provider);
         self
     }
+
+    /// Walk the tree and promote any per-node staged globals (set via
+    /// [`Node::with_promoted_global`]) into the tree-level
+    /// `global_value_providers` map. Solves TODO item 2: lets a spec
+    /// declare globals as part of node construction without a
+    /// post-build patching step.
+    ///
+    /// Idempotent: drains the staged entries, so re-calling is safe
+    /// (and a no-op).
+    pub fn lift_promoted_globals(mut self) -> Self {
+        self.root.drain_promoted_globals_into(&mut self.global_value_providers);
+        self
+    }
+
+    /// Built-in option: enable `--help` everywhere. Walks the whole
+    /// tree and adds `--help` (boolean) to every node that doesn't
+    /// already declare it. Embedders use this to opt into uniform
+    /// help support without writing per-node `with_boolean_flags(&[
+    /// "--help"])` boilerplate. The same `--help` shows up in tab
+    /// completion at every level and is recognised by [`parse_argv`]
+    /// as a known flag.
+    ///
+    /// Pair with [`render_usage`] in your handler:
+    ///
+    /// ```ignore
+    /// let parsed = parse_argv(&tree, &argv)?;
+    /// if parsed.flags.contains_key("--help") {
+    ///     // walk parsed.path to find the node, then:
+    ///     println!("{}", render_usage(node, &parsed.path));
+    ///     return Ok(());
+    /// }
+    /// ```
+    pub fn with_auto_help(mut self) -> Self {
+        attach_auto_help(&mut self.root);
+        self
+    }
+
+    /// Built-in option: attach a [`crate::providers::metricsql_provider`]
+    /// at the supplied subcommand path. The path is `["sub1",
+    /// "sub2", …]` — the chain of children to descend through from
+    /// the root before the provider takes over completion.
+    ///
+    /// Equivalent to manually navigating to the node and calling
+    /// `with_subtree_provider(metricsql_provider(catalog))`, but
+    /// surfaces the intent at tree-construction time.
+    pub fn with_metricsql_at(
+        mut self,
+        path: &[&str],
+        catalog: std::sync::Arc<dyn crate::providers::MetricsqlCatalog>,
+    ) -> Self {
+        if let Some(node) = walk_path_mut(&mut self.root, path) {
+            *node = std::mem::take(node)
+                .with_subtree_provider(crate::providers::metricsql_provider(catalog));
+        }
+        self
+    }
+}
+
+fn attach_auto_help(node: &mut Node) {
+    if !node.flags.iter().any(|f| f == "--help") {
+        node.flags.push("--help".to_string());
+        node.boolean_flags.insert("--help".to_string());
+        if !node.flag_help.contains_key("--help") {
+            node.flag_help.insert("--help".to_string(),
+                "Show usage information for this command.".to_string());
+        }
+    }
+    for child in node.children.values_mut() {
+        attach_auto_help(child);
+    }
+}
+
+fn walk_path_mut<'a>(root: &'a mut Node, path: &[&str]) -> Option<&'a mut Node> {
+    let mut node = root;
+    for segment in path {
+        node = node.children.get_mut(*segment)?;
+    }
+    Some(node)
 }
 
 /// Check if a word on the command line matches (and thus consumes) a
@@ -803,8 +1354,8 @@ pub fn complete_at_level_only(tree: &CommandTree, words: &[&str], only_level: u3
     // *layer order* (layer 1 candidates first, then layer 2, …) with
     // the standard `--`-flags-last + alphabetical ordering applied
     // within each layer.
-    if let Node::Group { children, .. } = node {
-        let mut candidates: Vec<(u32, String)> = children.iter()
+    if !node.children.is_empty() {
+        let mut candidates: Vec<(u32, String)> = node.children.iter()
             .filter(|(k, _)| !at_root || !tree.hidden.contains(k.as_str()))
             .filter(|(_, child)| child.level() <= only_level)
             .map(|(k, child)| (child.level(), k.to_string()))
@@ -830,9 +1381,25 @@ pub fn complete_at_level_only(tree: &CommandTree, words: &[&str], only_level: u3
 /// subgroup with Primary+Secondary+Advanced children has a cycle
 /// length of 3. A tap beyond the cycle wraps back to level 1.
 pub fn complete_rotating(tree: &CommandTree, words: &[&str], tap_count: u32) -> Vec<String> {
+    complete_rotating_with_raw(tree, words, tap_count, "", 0)
+}
+
+/// Same as [`complete_rotating`] but additionally threads the raw
+/// `COMP_LINE` and cursor offset through to subtree providers via
+/// [`PartialParse::raw_line`] / [`PartialParse::cursor_offset`].
+/// Used by [`handle_complete_env`] so grammar-aware providers can
+/// inspect raw text + cursor position.
+pub fn complete_rotating_with_raw(
+    tree: &CommandTree,
+    words: &[&str],
+    tap_count: u32,
+    raw_line: &str,
+    cursor_offset: usize,
+) -> Vec<String> {
     // Determine the max level among the children of whichever
     // group the cursor is currently inside.
     let completed: &[&str] = if words.len() > 1 { &words[1..words.len() - 1] } else { &[] };
+    let partial: &str = if words.len() > 1 { *words.last().unwrap_or(&"") } else { "" };
     let mut node = &tree.root;
     for &word in completed {
         match node.child(word) {
@@ -842,18 +1409,24 @@ pub fn complete_rotating(tree: &CommandTree, words: &[&str], tap_count: u32) -> 
     }
     let max = max_level_of_children(node).max(1);
     let only = ((tap_count.saturating_sub(1)) % max) + 1;
-    complete_at_level_only(tree, words, only)
+    // Empty partial at a group boundary → apply the level filter
+    // via complete_at_level_only (which also handles the no-partial
+    // edge case where words = [binary] only). Otherwise dispatch
+    // through complete_at_tap_with_raw so subtree providers still
+    // see raw context.
+    if partial.is_empty() {
+        return complete_at_level_only(tree, words, only);
+    }
+    complete_at_tap_with_raw(tree, words, only, raw_line, cursor_offset)
 }
 
 /// Maximum [`Node::level`] across the immediate children of `node`,
 /// or [`DEFAULT_LEVEL`] if `node` is a leaf or has no children.
 pub(crate) fn max_level_of_children(node: &Node) -> u32 {
     let mut max = DEFAULT_LEVEL;
-    if let Node::Group { children, .. } = node {
-        for (_, child) in children {
-            if child.level() > max {
-                max = child.level();
-            }
+    for child in node.children.values() {
+        if child.level() > max {
+            max = child.level();
         }
     }
     max
@@ -870,6 +1443,27 @@ pub(crate) fn max_level_of_children(node: &Node) -> u32 {
 /// haven't categorized their commands see the same single-tap
 /// behavior they did before stratification.
 pub fn complete_at_tap(tree: &CommandTree, words: &[&str], tap_count: u32) -> Vec<String> {
+    complete_at_tap_with_raw(tree, words, tap_count, "", 0)
+}
+
+/// Same as [`complete_at_tap`] but additionally accepts the raw
+/// `COMP_LINE` and the cursor's byte offset. Subtree providers
+/// receive these in [`PartialParse::raw_line`] /
+/// [`PartialParse::cursor_offset`], enabling grammar-aware
+/// completion (e.g. for embedded query DSLs like MetricsQL or
+/// PromQL where bracket / quote / operator state at the cursor
+/// matters).
+///
+/// Pass empty `raw_line` and `0` for `cursor_offset` if the caller
+/// doesn't have raw context — grammar helpers in [`PartialParse`]
+/// fall back to the tokenised view in that case.
+pub fn complete_at_tap_with_raw(
+    tree: &CommandTree,
+    words: &[&str],
+    tap_count: u32,
+    raw_line: &str,
+    cursor_offset: usize,
+) -> Vec<String> {
     if words.len() <= 1 {
         let mut cmds: Vec<String> = tree.root.child_names().iter()
             .filter(|s| !tree.hidden.contains(**s))
@@ -890,16 +1484,40 @@ pub fn complete_at_tap(tree: &CommandTree, words: &[&str], tap_count: u32) -> Ve
     let completed = &words[1..words.len() - 1];
     let at_root = completed.is_empty();
 
-    // Walk the tree following completed words.
+    // Walk the tree following completed words. Track the deepest node
+    // with a subtree_provider attached — that provider takes
+    // precedence over the regular completion path (TODO item 7),
+    // letting embedders register context-aware completions inside any
+    // subtree without a pre-walker hook.
     let mut node = &tree.root;
     let mut remaining_start = 0;
+    let mut tree_path: Vec<&str> = Vec::new();
+    let mut deepest_subtree: Option<&SubtreeProvider> = node.subtree_provider();
     for (i, &word) in completed.iter().enumerate() {
         match node.child(word) {
-            Some(child) => { node = child; remaining_start = i + 1; }
+            Some(child) => {
+                node = child;
+                remaining_start = i + 1;
+                tree_path.push(word);
+                if let Some(p) = node.subtree_provider() {
+                    deepest_subtree = Some(p);
+                }
+            }
             None => break,
         }
     }
     let remaining = &completed[remaining_start..];
+
+    if let Some(provider) = deepest_subtree {
+        let pp = PartialParse {
+            completed: completed.to_vec(),
+            partial,
+            tree_path,
+            raw_line,
+            cursor_offset,
+        };
+        return provider(&pp);
+    }
 
     // Check global value providers for the previous word.
     if let Some(&prev_word) = completed.last()
@@ -907,102 +1525,101 @@ pub fn complete_at_tap(tree: &CommandTree, words: &[&str], tap_count: u32) -> Ve
         return provider(partial, remaining);
     }
 
-    match node {
-        Node::Group { children, .. } => {
-            let mut candidates: Vec<String> = children.iter()
-                .filter(|(k, _)| k.starts_with(partial))
-                .filter(|(k, _)| !at_root || !partial.is_empty() || !tree.hidden.contains(k.as_str()))
-                // Level filter only applies at root with an
-                // empty partial — once the user has started
-                // typing a specific name, return matching
-                // commands regardless of tap tier so a
-                // partially-typed level-2 command (e.g.
-                // `--ins<TAB>`) still completes on tap 1.
-                .filter(|(_, child)| {
-                    !at_root || !partial.is_empty() || child.level() <= tap_count
-                })
-                .map(|(k, _)| k.to_string())
-                .collect();
-            candidates.sort_by(|a, b| {
-                a.starts_with('-').cmp(&b.starts_with('-')).then_with(|| a.cmp(b))
-            });
-            candidates
+    // Unified node — a node may carry children, flags, or both.
+    // Order of candidate sourcing:
+    //   1. If the previous word is a value-taking flag, defer
+    //      entirely to its value provider.
+    //   2. If the partial is `key=…`, defer to the key's provider.
+    //   3. Otherwise, collect children (subject to level filter at
+    //      root with empty partial) + flags (static + dynamic) +
+    //      global flag tokens, prefix-filtered.
+
+    // (1) Value-completion for the previous flag.
+    if let Some(&prev_word) = remaining.last()
+        && prev_word.starts_with("--")
+        && !prev_word.contains('=')
+        && !node.boolean_flags.contains(prev_word)
+    {
+        if let Some(provider) = node.value_providers.get(prev_word) {
+            return provider(partial, remaining);
         }
-        Node::Leaf { options, flags, value_providers, dynamic_options, .. } => {
-            // Check if the previous word is a --option expecting a separate value.
-            if let Some(&prev_word) = remaining.last()
-                && prev_word.starts_with("--") && !prev_word.contains('=') && !flags.contains(prev_word) {
-                if let Some(provider) = value_providers.get(prev_word) {
-                    return provider(partial, remaining);
-                }
-                if let Some(provider) = tree.global_value_providers.get(prev_word) {
-                    return provider(partial, remaining);
-                }
-                return Vec::new();
-            }
+        if let Some(provider) = tree.global_value_providers.get(prev_word) {
+            return provider(partial, remaining);
+        }
+        return Vec::new();
+    }
 
-            // Partial of the form `key=value_prefix` — the user
-            // has committed to the key, they want value
-            // candidates for it. Bash's default
-            // `COMP_WORDBREAKS` contains `=`, which means
-            // readline already treats the current word as just
-            // the segment AFTER the `=`. So we must return BARE
-            // values here, not `key=value` strings — emitting
-            // the key would replicate it on the line and yield
-            // `key=key=value` ("stutter"). When no provider
-            // matches, return an empty candidate set: the user
-            // has signaled "I'm typing a value", so falling
-            // through to the option-name list (which can
-            // re-emit `key=` and stutter the same way) would be
-            // wrong.
-            if let Some(eq_pos) = partial.find('=') {
-                let key = &partial[..eq_pos];
-                let value_partial = &partial[eq_pos + 1..];
-                let key_eq = format!("{key}=");
-                let dashed_key = format!("--{key}");
-                if let Some(provider) = value_providers.get(&key_eq)
-                    .or_else(|| value_providers.get(&dashed_key))
-                    .or_else(|| tree.global_value_providers.get(&key_eq))
-                    .or_else(|| tree.global_value_providers.get(&dashed_key))
-                {
-                    return provider(value_partial, remaining);
-                }
-                return Vec::new();
-            }
+    // (2) `key=value_prefix` form. Bash's default COMP_WORDBREAKS
+    // contains `=`, so readline already treats the current word as
+    // just the post-`=` segment. We must return BARE values to
+    // avoid `key=key=value` stutter.
+    if let Some(eq_pos) = partial.find('=') {
+        let key = &partial[..eq_pos];
+        let value_partial = &partial[eq_pos + 1..];
+        let key_eq = format!("{key}=");
+        let dashed_key = format!("--{key}");
+        if let Some(provider) = node.value_providers.get(&key_eq)
+            .or_else(|| node.value_providers.get(&dashed_key))
+            .or_else(|| tree.global_value_providers.get(&key_eq))
+            .or_else(|| tree.global_value_providers.get(&dashed_key))
+        {
+            return provider(value_partial, remaining);
+        }
+        return Vec::new();
+    }
 
-            // Collect all available options: static + dynamic from context.
-            let mut all_options: Vec<String> = options.clone();
-            if let Some(provider) = dynamic_options {
-                let dynamic = provider(partial, remaining);
-                for opt in dynamic {
-                    if !all_options.contains(&opt) {
-                        all_options.push(opt);
-                    }
-                }
-            }
+    // (3) Children (subcommands).
+    let mut child_candidates: Vec<(u32, String)> = node.children.iter()
+        .filter(|(k, _)| k.starts_with(partial))
+        .filter(|(k, _)| !at_root || !partial.is_empty() || !tree.hidden.contains(k.as_str()))
+        .filter(|(_, child)| {
+            // Level filter only applies at root with an empty
+            // partial — once the user starts typing a name,
+            // return matching commands regardless of tap tier.
+            !at_root || !partial.is_empty() || child.level() <= tap_count
+        })
+        .map(|(k, child)| (child.level(), k.to_string()))
+        .collect();
+    child_candidates.sort_by(|(la, a), (lb, b)| {
+        la.cmp(lb)
+            .then_with(|| a.starts_with('-').cmp(&b.starts_with('-')))
+            .then_with(|| a.cmp(b))
+    });
 
-            // Filter out already-consumed options.
-            let consumed = consumed_keys(remaining, &all_options);
-
-            let mut candidates: Vec<String> = all_options.iter()
-                .filter(|o| o.starts_with(partial) && !is_consumed(o, &consumed))
-                .map(|o| o.to_string())
-                .collect();
-
-            // Also offer global provider options.
-            for global_opt in tree.global_value_providers.keys() {
-                if global_opt.starts_with(partial) && !candidates.contains(global_opt) {
-                    candidates.push(global_opt.clone());
+    // (3) Flags on this node — static + dynamic.
+    let mut flag_candidates: Vec<String> = Vec::new();
+    if !node.flags.is_empty() || node.dynamic_options.is_some() {
+        let mut all_flags: Vec<String> = node.flags.clone();
+        if let Some(provider) = node.dynamic_options {
+            for opt in provider(partial, remaining) {
+                if !all_flags.contains(&opt) {
+                    all_flags.push(opt);
                 }
             }
-
-            // Sort: bare params first, then --flags.
-            candidates.sort_by(|a, b| {
-                a.starts_with('-').cmp(&b.starts_with('-')).then_with(|| a.cmp(b))
-            });
-            candidates
+        }
+        let consumed = consumed_keys(remaining, &all_flags);
+        for f in &all_flags {
+            if f.starts_with(partial) && !is_consumed(f, &consumed) {
+                flag_candidates.push(f.clone());
+            }
         }
     }
+
+    // (3) Global flag tokens.
+    for global_opt in tree.global_value_providers.keys() {
+        if global_opt.starts_with(partial) && !flag_candidates.contains(global_opt) {
+            flag_candidates.push(global_opt.clone());
+        }
+    }
+    flag_candidates.sort_by(|a, b| {
+        a.starts_with('-').cmp(&b.starts_with('-')).then_with(|| a.cmp(b))
+    });
+
+    // Children precede flags so a hybrid node lists subcommands
+    // first, then flags.
+    let mut out: Vec<String> = child_candidates.into_iter().map(|(_, k)| k).collect();
+    out.extend(flag_candidates);
+    out
 }
 
 /// Supported shells for completion-script generation.
@@ -1312,7 +1929,7 @@ pub fn handle_complete_env(app_name: &str, tree: &CommandTree) -> bool {
     // order (layer 1 first, then layer 2, …). Trees that haven't
     // categorized their commands have max_level == 1, so every tap
     // returns the same layer-1 set (no stratification visible).
-    let candidates = complete_rotating(tree, &words, tap_count);
+    let candidates = complete_rotating_with_raw(tree, &words, tap_count, &line, point);
 
     for candidate in candidates {
         println!("{}", candidate);
@@ -1454,6 +2071,360 @@ fn tap_detect(app_name: &str, input_key: &str, max_level: u32) -> u32 {
     tap_count
 }
 
+// =====================================================================
+// Directive set adapter (TODO item 10)
+// =====================================================================
+
+/// A richer flag descriptor that bundles the CLI form, optional
+/// YAML mirror, value semantics, and repeatability into one
+/// declaration. Adapters can expand a `&[Directive]` into per-flag
+/// completion + parse rules without the caller writing a parallel
+/// translation layer.
+///
+/// Maps roughly to nbrs's `vocab::Directive` shape — a directive is
+/// "the canonical statement of what a flag IS, in every surface
+/// it appears." Use [`apply_directives`] to register a slice of
+/// directives onto a [`Node`] in one call.
+#[derive(Debug, Clone)]
+pub struct Directive {
+    /// CLI form, e.g. `"--metric"`. Required.
+    pub cli_flag: &'static str,
+    /// One-line help text. Optional.
+    pub help: Option<&'static str>,
+    /// Closed value set for both completion and validation. `None`
+    /// means free-form value (or boolean).
+    pub values: Option<ClosedValues>,
+    /// `true` for boolean flags (no value expected).
+    pub boolean: bool,
+    /// `true` when this flag may appear multiple times. Currently
+    /// informational; reserved for downstream parsers/validators.
+    pub repeatable: bool,
+    /// Optional YAML directive mirror. Currently informational; lets
+    /// downstream YAML parsers cross-reference the same Directive.
+    pub yaml_directive: Option<&'static str>,
+}
+
+impl Directive {
+    /// Construct a value-taking directive with a closed set.
+    pub const fn closed(
+        cli_flag: &'static str,
+        values: &'static [&'static str],
+    ) -> Self {
+        Directive {
+            cli_flag,
+            help: None,
+            values: Some(ClosedValues::Static(values)),
+            boolean: false,
+            repeatable: false,
+            yaml_directive: None,
+        }
+    }
+
+    /// Construct a free-form value-taking directive.
+    pub const fn value(cli_flag: &'static str) -> Self {
+        Directive {
+            cli_flag,
+            help: None,
+            values: None,
+            boolean: false,
+            repeatable: false,
+            yaml_directive: None,
+        }
+    }
+
+    /// Construct a boolean-flag directive.
+    pub const fn boolean(cli_flag: &'static str) -> Self {
+        Directive {
+            cli_flag,
+            help: None,
+            values: None,
+            boolean: true,
+            repeatable: false,
+            yaml_directive: None,
+        }
+    }
+
+    /// Builder: attach help text.
+    pub const fn with_help(mut self, help: &'static str) -> Self {
+        self.help = Some(help);
+        self
+    }
+
+    /// Builder: mark as repeatable.
+    pub const fn repeatable(mut self) -> Self {
+        self.repeatable = true;
+        self
+    }
+
+    /// Builder: attach the YAML mirror directive name.
+    pub const fn with_yaml(mut self, name: &'static str) -> Self {
+        self.yaml_directive = Some(name);
+        self
+    }
+}
+
+/// Apply a slice of [`Directive`]s to a [`Node`] in one call. Each
+/// directive becomes:
+///   - an entry in the node's options/flags list,
+///   - a `flag_help` entry if `help` is set,
+///   - a value provider if `values` is set (also feeding validation).
+///
+/// Vocab-driven CLIs become a one-liner: declare the directive list
+/// once, hand it to `apply_directives`, get tab + help + (with
+/// [`parse_argv`]) parsing all from the same source.
+pub fn apply_directives(mut node: Node, directives: &[Directive]) -> Node {
+    let value_flags: Vec<&str> = directives.iter()
+        .filter(|d| !d.boolean)
+        .map(|d| d.cli_flag)
+        .collect();
+    let bool_flags: Vec<&str> = directives.iter()
+        .filter(|d| d.boolean)
+        .map(|d| d.cli_flag)
+        .collect();
+
+    // Add the flags via the unified builders (idempotent: skip
+    // duplicates).
+    let value_refs: Vec<&str> = value_flags.iter().copied().collect();
+    let bool_refs: Vec<&str> = bool_flags.iter().copied().collect();
+    node = node.with_flags(&value_refs).with_boolean_flags(&bool_refs);
+
+    // Help + value providers via the existing builder methods.
+    for d in directives {
+        if let Some(h) = d.help {
+            node = node.with_flag_help(d.cli_flag, h);
+        }
+        if let Some(values) = &d.values {
+            let provider: ValueProvider = values.clone().into_provider();
+            node = node.with_value_provider(d.cli_flag, provider);
+        }
+    }
+
+    node
+}
+
+// =====================================================================
+// Argv parser companion (TODO item 9)
+// =====================================================================
+
+/// Result of [`parse_argv`] — a structured view of an argv vector
+/// against a [`CommandTree`]. Embedders use this to dispatch handlers
+/// without writing a parallel walker.
+///
+/// Single source of truth: the same tree that drives tab completion
+/// drives argv parsing. Add a flag → both completion and parsing
+/// pick it up. Add a subcommand → both reach it.
+#[derive(Debug, Clone)]
+pub struct ParsedCommand<'a> {
+    /// Path through the tree resolved by argv. `["compute", "knn"]`
+    /// for `myapp compute knn ...`. Excludes the program name.
+    pub path: Vec<&'a str>,
+    /// Flags collected along the way. Multiple values per key when
+    /// the flag was repeated. Boolean flags map to a single empty
+    /// string entry.
+    pub flags: std::collections::BTreeMap<String, Vec<String>>,
+    /// Positional arguments — anything that wasn't consumed as a
+    /// flag, flag value, or subcommand name.
+    pub positionals: Vec<&'a str>,
+}
+
+/// Errors returned by [`parse_argv`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParseError {
+    /// `--flag` was given but the tree expects a value to follow,
+    /// and argv ended.
+    MissingValue {
+        flag: String,
+    },
+    /// A flag appeared that no leaf or ancestor declares.
+    UnknownFlag {
+        flag: String,
+        path: Vec<String>,
+    },
+    /// A `--flag=value` was given for a closed-set flag whose
+    /// validator rejected the value. (Caller-driven; this variant is
+    /// reserved for downstream validators that walk the parse
+    /// result.)
+    InvalidValue {
+        flag: String,
+        value: String,
+    },
+}
+
+impl std::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ParseError::MissingValue { flag } =>
+                write!(f, "flag '{}' expects a value but none was given", flag),
+            ParseError::UnknownFlag { flag, path } =>
+                write!(f, "unknown flag '{}' at '{}'", flag, path.join(" ")),
+            ParseError::InvalidValue { flag, value } =>
+                write!(f, "invalid value '{}' for flag '{}'", value, flag),
+        }
+    }
+}
+
+impl std::error::Error for ParseError {}
+
+/// Parse `argv` (excluding the program name) against the supplied
+/// [`CommandTree`]. Walks subcommands, collects flags, separates
+/// positionals.
+///
+/// Strict-ish: rejects flags that aren't declared anywhere along the
+/// resolved path. Use [`parse_argv_lenient`] when you want unknown
+/// flags treated as positionals.
+///
+/// ```
+/// use veks_completion::{CommandTree, Node, parse_argv};
+///
+/// let tree = CommandTree::new("myapp")
+///     .command("compute", Node::group(vec![
+///         ("knn", Node::leaf_with_flags(&["--metric"], &["--verbose"])),
+///     ]));
+///
+/// let parsed = parse_argv(&tree, &[
+///     "compute", "knn", "--metric", "L2", "--verbose", "input.fvec",
+/// ]).unwrap();
+/// assert_eq!(parsed.path, vec!["compute", "knn"]);
+/// assert_eq!(parsed.flags["--metric"], vec!["L2".to_string()]);
+/// assert_eq!(parsed.flags["--verbose"], vec!["".to_string()]);
+/// assert_eq!(parsed.positionals, vec!["input.fvec"]);
+/// ```
+pub fn parse_argv<'a>(
+    tree: &CommandTree,
+    argv: &[&'a str],
+) -> Result<ParsedCommand<'a>, ParseError> {
+    parse_argv_inner(tree, argv, /*lenient=*/ false)
+}
+
+/// Lenient variant of [`parse_argv`] — unknown flags are treated as
+/// positionals rather than rejected. Useful for "pass-through" CLIs
+/// that wrap external commands.
+pub fn parse_argv_lenient<'a>(
+    tree: &CommandTree,
+    argv: &[&'a str],
+) -> Result<ParsedCommand<'a>, ParseError> {
+    parse_argv_inner(tree, argv, /*lenient=*/ true)
+}
+
+fn parse_argv_inner<'a>(
+    tree: &CommandTree,
+    argv: &[&'a str],
+    lenient: bool,
+) -> Result<ParsedCommand<'a>, ParseError> {
+    let mut path: Vec<&'a str> = Vec::new();
+    let mut flags: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    let mut positionals: Vec<&'a str> = Vec::new();
+
+    // Walk the tree, switching nodes when a subcommand name matches
+    // a child. Flags collected along the way are credited to the
+    // resolved leaf.
+    let mut node: &Node = &tree.root;
+    let mut i = 0usize;
+    while i < argv.len() {
+        let arg = argv[i];
+
+        // Subcommand match: only when we're at a Group and the next
+        // argv token is a child name AND the cursor isn't already
+        // inside a flag-value position.
+        if let Some(child) = node.child(arg) {
+            path.push(arg);
+            node = child;
+            i += 1;
+            continue;
+        }
+
+        // `--key=value` form.
+        if let Some(stripped) = arg.strip_prefix("--") {
+            if let Some(eq_pos) = stripped.find('=') {
+                let key = format!("--{}", &stripped[..eq_pos]);
+                let val = stripped[eq_pos + 1..].to_string();
+                if flag_is_known(node, tree, &key) {
+                    flags.entry(key).or_default().push(val);
+                } else if lenient {
+                    positionals.push(arg);
+                } else {
+                    return Err(ParseError::UnknownFlag {
+                        flag: key,
+                        path: path.iter().map(|s| s.to_string()).collect(),
+                    });
+                }
+                i += 1;
+                continue;
+            }
+
+            // Bare `--flag` form. Look up to see if it's a boolean
+            // or expects a value.
+            let key = arg.to_string();
+            if !flag_is_known(node, tree, &key) {
+                if lenient {
+                    positionals.push(arg);
+                    i += 1;
+                    continue;
+                } else {
+                    return Err(ParseError::UnknownFlag {
+                        flag: key,
+                        path: path.iter().map(|s| s.to_string()).collect(),
+                    });
+                }
+            }
+            if flag_is_boolean(node, &key) {
+                flags.entry(key).or_default().push(String::new());
+                i += 1;
+            } else {
+                if i + 1 >= argv.len() {
+                    return Err(ParseError::MissingValue { flag: key });
+                }
+                let val = argv[i + 1].to_string();
+                flags.entry(key).or_default().push(val);
+                i += 2;
+            }
+            continue;
+        }
+
+        // Single-char `-x` flags get treated as `--x` for now.
+        // Future: explicit short-flag table on the node.
+        if arg.starts_with('-') && arg.len() > 1 && !arg.starts_with("--") {
+            // Treat as positional fallthrough for the additive
+            // version; short-flag handling is deferred (see TODO).
+            positionals.push(arg);
+            i += 1;
+            continue;
+        }
+
+        // Plain positional.
+        positionals.push(arg);
+        i += 1;
+    }
+
+    Ok(ParsedCommand { path, flags, positionals })
+}
+
+fn flag_is_known(node: &Node, tree: &CommandTree, flag: &str) -> bool {
+    // A flag is "known" if the current leaf, the current group's
+    // group-level flags, or the tree's global value-provider map
+    // recognises it.
+    if node.flags.iter().any(|o| flag_canonical_match(o, flag)) {
+        return true;
+    }
+    if tree.global_value_providers.contains_key(flag) {
+        return true;
+    }
+    false
+}
+
+fn flag_is_boolean(node: &Node, flag: &str) -> bool {
+    node.boolean_flags.contains(flag)
+}
+
+fn flag_canonical_match(declared: &str, given: &str) -> bool {
+    // Trim a trailing `=` from a declared `--flag=` form before
+    // comparing — `--metric=` is the declaration shape used in some
+    // pipeline commands.
+    let d = declared.trim_end_matches('=');
+    d == given
+}
+
 /// Expanded completion: show all `group command` pairs.
 pub fn complete_expanded(tree: &CommandTree, words: &[&str]) -> Vec<String> {
     let partial = if words.len() > 1 { words.last().unwrap_or(&"") } else { &"" };
@@ -1464,23 +2435,16 @@ pub fn complete_expanded(tree: &CommandTree, words: &[&str]) -> Vec<String> {
     }
 
     let mut results = Vec::new();
-    if let Node::Group { children, .. } = &tree.root {
-        for (name, node) in children {
-            if name == "help" || name.starts_with('-') {
-                continue;
+    for (name, node) in &tree.root.children {
+        if name == "help" || name.starts_with('-') {
+            continue;
+        }
+        if !node.children.is_empty() {
+            for sub_name in node.children.keys() {
+                results.push(format!("{} {}", name, sub_name));
             }
-            match node {
-                Node::Group { children: sub, .. } if !sub.is_empty() => {
-                    for sub_name in sub.keys() {
-                        results.push(format!("{} {}", name, sub_name));
-                    }
-                }
-                _ => {
-                    if !tree.hidden.contains(name.as_str()) {
-                        results.push(name.to_string());
-                    }
-                }
-            }
+        } else if !tree.hidden.contains(name.as_str()) {
+            results.push(name.to_string());
         }
     }
     results
@@ -1842,6 +2806,360 @@ mod tests {
         assert_eq!(shown, vec![1, 1], "tap exactly at the boundary is fresh");
         let shown = replay_taps(3, "veks", &[1_000, 1_000 + TAP_ADVANCE_MS - 1]);
         assert_eq!(shown, vec![1, 2], "tap just inside the boundary is rapid");
+    }
+
+    // ---- TODO item 1 + 5: ClosedValues -----------------------------
+
+    #[test]
+    fn closed_values_static_completes_and_validates() {
+        let cv = ClosedValues::Static(&["L2", "IP", "COSINE"]);
+        assert_eq!(cv.complete(""), vec!["L2", "IP", "COSINE"]);
+        assert_eq!(cv.complete("CO"), vec!["COSINE"]);
+        assert_eq!(cv.complete("Z"), Vec::<String>::new());
+        assert!(cv.validate("L2"));
+        assert!(cv.validate("COSINE"));
+        assert!(!cv.validate("bogus"));
+    }
+
+    #[test]
+    fn closed_values_owned_completes_and_validates() {
+        let cv = ClosedValues::Owned(vec!["alpha".into(), "beta".into(), "gamma".into()]);
+        assert_eq!(cv.complete("a"), vec!["alpha"]);
+        assert!(cv.validate("beta"));
+        assert!(!cv.validate("delta"));
+    }
+
+    #[test]
+    fn closed_values_into_provider_filters() {
+        let cv = ClosedValues::Static(&["a", "ab", "abc"]);
+        let provider: ValueProvider = cv.into_provider();
+        assert_eq!(provider("ab", &[]), vec!["ab", "abc"]);
+    }
+
+    // ---- TODO item 4: alias slice ----------------------------------
+
+    #[test]
+    fn aliases_share_one_provider() {
+        let provider: ValueProvider = std::sync::Arc::new(|partial: &str, _| {
+            ["red", "green", "blue"].iter()
+                .filter(|s| s.starts_with(partial))
+                .map(|s| s.to_string())
+                .collect()
+        });
+        let leaf = Node::leaf(&["--color", "--colour", "--col"])
+            .with_value_provider_aliases(&["--color", "--colour", "--col"], provider);
+        // Each alias resolves to the same provider — we verify by
+        // confirming all three names complete identically.
+        let tree = CommandTree::new("paint").command("draw", leaf);
+        let out_a = complete(&tree, &["paint", "draw", "--color", "g"]);
+        let out_b = complete(&tree, &["paint", "draw", "--colour", "g"]);
+        let out_c = complete(&tree, &["paint", "draw", "--col", "g"]);
+        assert_eq!(out_a, vec!["green"]);
+        assert_eq!(out_a, out_b);
+        assert_eq!(out_b, out_c);
+    }
+
+    // ---- TODO item 6: help text + render_usage ---------------------
+
+    #[test]
+    fn render_usage_includes_help_flags_and_subcommands() {
+        let leaf = Node::leaf_with_flags(&["--metric"], &["--verbose"])
+            .with_help("Compute KNN over base vectors")
+            .with_flag_help("--metric", "Distance metric: L2 / IP / COSINE")
+            .with_flag_help("--verbose", "Print per-step progress");
+        let tree = CommandTree::new("app")
+            .command("compute", Node::group(vec![
+                ("knn", leaf),
+            ]).with_help("Compute commands"));
+
+        let knn_node = tree.root.child("compute").unwrap().child("knn").unwrap();
+        let out = render_usage(knn_node, &["app", "compute", "knn"]);
+        assert!(out.contains("USAGE: app compute knn"), "{}", out);
+        assert!(out.contains("Compute KNN over base vectors"), "{}", out);
+        assert!(out.contains("--metric"), "{}", out);
+        assert!(out.contains("Distance metric"), "{}", out);
+        assert!(out.contains("--verbose"), "{}", out);
+
+        let compute_node = tree.root.child("compute").unwrap();
+        let out = render_usage(compute_node, &["app", "compute"]);
+        assert!(out.contains("Compute commands"));
+        assert!(out.contains("SUBCOMMANDS:"));
+        assert!(out.contains("knn"));
+    }
+
+    // ---- TODO item 2: per-node global registration -----------------
+
+    #[test]
+    fn promoted_global_lifts_to_tree_globals() {
+        let provider = fn_provider(|p: &str, _: &[&str]| {
+            ["alpha", "beta"].iter()
+                .filter(|s| s.starts_with(p))
+                .map(|s| s.to_string())
+                .collect()
+        });
+        let tree = CommandTree::new("app")
+            .command("run", Node::leaf(&["--name"])
+                .with_promoted_global("--name", provider))
+            .lift_promoted_globals();
+        // The provider should now live in the tree-level globals
+        // map and fire wherever `--name` appears.
+        assert!(tree.global_value_providers.contains_key("--name"));
+        let out = complete(&tree, &["app", "run", "--name", "a"]);
+        assert_eq!(out, vec!["alpha"]);
+    }
+
+    // ---- TODO item 3 (additive): group flags -----------------------
+
+    // ---- built-in option: with_auto_help --------------------------
+
+    #[test]
+    fn with_auto_help_attaches_help_flag_recursively() {
+        let tree = CommandTree::new("app")
+            .command("compute", Node::group(vec![
+                ("knn", Node::leaf(&["--metric"])),
+            ]))
+            .command("run", Node::leaf(&["--input"]))
+            .with_auto_help();
+
+        let knn = tree.root.child("compute").unwrap().child("knn").unwrap();
+        assert!(knn.flags().iter().any(|f| f == "--help"),
+            "leaf 'knn' should have --help auto-attached");
+        assert!(knn.is_flag("--help"), "--help should be boolean");
+        assert!(knn.flag_help_for("--help").is_some());
+
+        let compute = tree.root.child("compute").unwrap();
+        assert!(compute.flags().iter().any(|f| f == "--help"),
+            "group 'compute' should have --help auto-attached");
+
+        let run = tree.root.child("run").unwrap();
+        assert!(run.flags().iter().any(|f| f == "--help"));
+
+        // --help is now a known flag for the parser too.
+        let parsed = parse_argv(&tree, &["compute", "knn", "--help"]).unwrap();
+        assert_eq!(parsed.path, vec!["compute", "knn"]);
+        assert!(parsed.flags.contains_key("--help"));
+    }
+
+    #[test]
+    fn with_auto_help_doesnt_double_register() {
+        let tree = CommandTree::new("app")
+            .command("run", Node::leaf_with_flags(&[], &["--help"]))
+            .with_auto_help();
+        let run = tree.root.child("run").unwrap();
+        let count = run.flags().iter().filter(|f| **f == "--help").count();
+        assert_eq!(count, 1, "auto-help must be idempotent");
+    }
+
+    // ---- built-in option: with_metricsql_at -----------------------
+
+    #[test]
+    fn with_metricsql_at_attaches_provider() {
+        use std::sync::Arc;
+        struct EmptyCatalog;
+        impl crate::providers::MetricsqlCatalog for EmptyCatalog {
+            fn metric_names(&self, p: &str) -> Vec<String> {
+                ["up", "node_cpu"].iter()
+                    .filter(|n| n.starts_with(p))
+                    .map(|s| s.to_string())
+                    .collect()
+            }
+            fn label_keys(&self, _: &str, p: &str) -> Vec<String> {
+                ["job", "instance"].iter()
+                    .filter(|n| n.starts_with(p))
+                    .map(|s| s.to_string())
+                    .collect()
+            }
+            fn label_values(&self, _: &str, _: &str, p: &str) -> Vec<String> {
+                ["prometheus"].iter()
+                    .filter(|n| n.starts_with(p))
+                    .map(|s| s.to_string())
+                    .collect()
+            }
+        }
+
+        let tree = CommandTree::new("nbrs")
+            .command("query", Node::leaf(&[]))
+            .with_metricsql_at(&["query"], Arc::new(EmptyCatalog));
+
+        // Verify the subtree provider was attached.
+        let query = tree.root.child("query").unwrap();
+        assert!(query.subtree_provider().is_some(),
+            "with_metricsql_at must attach a subtree provider");
+    }
+
+    #[test]
+    fn hybrid_node_completes_children_and_flags_together() {
+        // A node that has BOTH children AND flags — the central
+        // capability the unified Node was built for. `report` here
+        // accepts `--workload` (a group-level flag) AND has a
+        // `base` subcommand. Tab at root-after-`report` should
+        // offer both kinds of candidates.
+        let report = Node::group(vec![
+            ("base", Node::leaf(&[])),
+            ("filtered", Node::leaf(&[])),
+        ])
+        .with_flags(&["--workload"])
+        .with_boolean_flags(&["--dry-run"]);
+        let tree = CommandTree::new("app").command("report", report);
+
+        // Empty partial: subcommands first, then flags.
+        let cands = complete(&tree, &["app", "report", ""]);
+        let pos = |name: &str| cands.iter().position(|s| s == name);
+        assert!(pos("base").is_some(), "expected 'base' subcommand: {:?}", cands);
+        assert!(pos("filtered").is_some(), "expected 'filtered' subcommand: {:?}", cands);
+        assert!(pos("--workload").is_some(), "expected '--workload' flag: {:?}", cands);
+        assert!(pos("--dry-run").is_some(), "expected '--dry-run' flag: {:?}", cands);
+        // Subcommands precede flags.
+        assert!(pos("base").unwrap() < pos("--workload").unwrap());
+        assert!(pos("filtered").unwrap() < pos("--dry-run").unwrap());
+
+        // `--workload <TAB>` defers to the parser's general value
+        // path (no provider attached → empty) — the important
+        // part is that it doesn't fall back to listing children.
+        let cands = complete(&tree, &["app", "report", "--workload", ""]);
+        assert!(cands.is_empty() || !cands.iter().any(|c| c == "base"),
+            "value position must not list children: {:?}", cands);
+    }
+
+    #[test]
+    fn group_flags_appear_via_options_accessor() {
+        let group = Node::group(vec![
+            ("sub", Node::leaf(&[])),
+        ])
+        .with_flags(&["--workload"])
+        .with_boolean_flags(&["--dry-run"]);
+        assert!(group.options().iter().any(|o| *o == "--workload"));
+        assert!(group.options().iter().any(|o| *o == "--dry-run"));
+        // Hybrid node — has both children and flags. is_group()
+        // returns true; is_leaf() returns false.
+        assert!(group.is_group());
+        assert!(!group.is_leaf());
+    }
+
+    // ---- TODO item 7: subtree provider -----------------------------
+
+    #[test]
+    fn subtree_provider_takes_over_completion() {
+        // Register a context-aware provider on the `metrics`
+        // subtree. The provider sees a structured PartialParse and
+        // returns its own candidates.
+        let provider: SubtreeProvider = std::sync::Arc::new(|pp: &PartialParse| {
+            // Return the partial echoed plus the path joined with `:`.
+            vec![format!("{}:{}", pp.tree_path.join("/"), pp.partial)]
+        });
+        let tree = CommandTree::new("app")
+            .command("metrics",
+                Node::group(vec![("match", Node::leaf(&[]))])
+                    .with_subtree_provider(provider));
+
+        // Cursor inside the metrics subtree.
+        let out = complete(&tree, &["app", "metrics", "match", "foo"]);
+        assert_eq!(out, vec!["metrics/match:foo".to_string()]);
+    }
+
+    // ---- TODO item 8: extras attachment ----------------------------
+
+    #[test]
+    fn extras_round_trip_via_downcast() {
+        #[derive(Debug, PartialEq, Eq)]
+        struct Handler(u32);
+        let leaf = Node::leaf(&[])
+            .with_extras(Extras::new(Handler(42)));
+        let h: &Handler = leaf.extras().unwrap().downcast::<Handler>().unwrap();
+        assert_eq!(h.0, 42);
+        // Downcast to a different type returns None.
+        assert!(leaf.extras().unwrap().downcast::<u8>().is_none());
+    }
+
+    // ---- TODO item 9: argv parser ----------------------------------
+
+    #[test]
+    fn parse_argv_walks_subcommands_and_collects_flags() {
+        let tree = CommandTree::new("app")
+            .command("compute", Node::group(vec![
+                ("knn", Node::leaf_with_flags(&["--metric"], &["--verbose"])),
+            ]));
+        let parsed = parse_argv(&tree, &[
+            "compute", "knn", "--metric", "L2", "--verbose", "data.fvec",
+        ]).unwrap();
+        assert_eq!(parsed.path, vec!["compute", "knn"]);
+        assert_eq!(parsed.flags["--metric"], vec!["L2".to_string()]);
+        assert_eq!(parsed.flags["--verbose"], vec!["".to_string()]);
+        assert_eq!(parsed.positionals, vec!["data.fvec"]);
+    }
+
+    #[test]
+    fn parse_argv_handles_eq_form() {
+        let tree = CommandTree::new("app")
+            .command("run", Node::leaf(&["--name"]));
+        let parsed = parse_argv(&tree, &["run", "--name=foo"]).unwrap();
+        assert_eq!(parsed.flags["--name"], vec!["foo".to_string()]);
+    }
+
+    #[test]
+    fn parse_argv_repeats_collect_into_vec() {
+        let tree = CommandTree::new("app")
+            .command("run", Node::leaf(&["--set"]));
+        let parsed = parse_argv(&tree, &[
+            "run", "--set", "a=1", "--set", "b=2",
+        ]).unwrap();
+        assert_eq!(parsed.flags["--set"], vec!["a=1".to_string(), "b=2".to_string()]);
+    }
+
+    #[test]
+    fn parse_argv_unknown_flag_strict_errors() {
+        let tree = CommandTree::new("app")
+            .command("run", Node::leaf(&["--known"]));
+        let err = parse_argv(&tree, &["run", "--bogus", "x"]).unwrap_err();
+        assert!(matches!(err, ParseError::UnknownFlag { .. }));
+    }
+
+    #[test]
+    fn parse_argv_unknown_flag_lenient_falls_through() {
+        let tree = CommandTree::new("app")
+            .command("run", Node::leaf(&["--known"]));
+        let parsed = parse_argv_lenient(&tree, &["run", "--bogus", "x"]).unwrap();
+        // `--bogus` was treated as positional; `x` followed.
+        assert_eq!(parsed.positionals, vec!["--bogus", "x"]);
+    }
+
+    #[test]
+    fn parse_argv_missing_value_errors() {
+        let tree = CommandTree::new("app")
+            .command("run", Node::leaf(&["--name"]));
+        let err = parse_argv(&tree, &["run", "--name"]).unwrap_err();
+        assert!(matches!(err, ParseError::MissingValue { .. }));
+    }
+
+    // ---- TODO item 10: directive set adapter -----------------------
+
+    #[test]
+    fn apply_directives_registers_flags_help_and_providers() {
+        const DIRS: &[Directive] = &[
+            Directive::closed("--metric", &["L2", "IP", "COSINE"])
+                .with_help("Distance metric"),
+            Directive::value("--name").with_help("Name of the run"),
+            Directive::boolean("--verbose").with_help("Verbose output"),
+        ];
+        let leaf = apply_directives(Node::leaf(&[]), DIRS);
+        let tree = CommandTree::new("app").command("run", leaf);
+
+        // Tab completion picks up the closed-set values.
+        let out = complete(&tree, &["app", "run", "--metric", "C"]);
+        assert_eq!(out, vec!["COSINE"]);
+
+        // Help text is reachable via flag_help_for.
+        let leaf = tree.root.child("run").unwrap();
+        assert_eq!(leaf.flag_help_for("--metric"), Some("Distance metric"));
+        assert_eq!(leaf.flag_help_for("--verbose"), Some("Verbose output"));
+
+        // The boolean flag is recognized as such by the parser.
+        let parsed = parse_argv(&tree, &[
+            "run", "--metric", "L2", "--verbose", "--name", "test",
+        ]).unwrap();
+        assert_eq!(parsed.flags["--metric"], vec!["L2".to_string()]);
+        assert_eq!(parsed.flags["--verbose"], vec!["".to_string()]);
+        assert_eq!(parsed.flags["--name"], vec!["test".to_string()]);
     }
 
     #[test]

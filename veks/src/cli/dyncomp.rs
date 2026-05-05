@@ -132,14 +132,27 @@ fn walk_clap_command(
             .map(|m| (Some(m.category.tag().to_string()), Some(m.level.rank())))
             .unwrap_or((None, None));
 
-        Node::Leaf {
-            options,
-            flags,
-            value_providers,
-            dynamic_options: None,
-            category,
-            level,
+        // Build via the unified Node API. Separate value_flags from
+        // boolean_flags before handing to the constructors.
+        let value_flags: Vec<&str> = options.iter()
+            .filter(|n| !flags.contains(n.as_str()))
+            .map(|s| s.as_str())
+            .collect();
+        let boolean_flags: Vec<&str> = options.iter()
+            .filter(|n| flags.contains(n.as_str()))
+            .map(|s| s.as_str())
+            .collect();
+        let mut node = Node::leaf_with_flags(&value_flags, &boolean_flags);
+        for (name, provider) in value_providers {
+            node = node.with_value_provider(&name, provider);
         }
+        if let Some(c) = category {
+            node = node.with_category(&c);
+        }
+        if let Some(l) = level {
+            node = node.with_level(l);
+        }
+        node
     } else {
         // Group command — recurse into children. clap's `hide(true)`
         // marks shortcut aliases / disambiguators that we want hidden
@@ -150,7 +163,7 @@ fn walk_clap_command(
         // single TAB at root shows the visible primary groups, a
         // rapid double-tap reveals the cumulative superset that
         // includes every shortcut.
-        let mut children = std::collections::BTreeMap::new();
+        let mut node = Node::empty_group();
         for sub in subs {
             let name = sub.get_name();
             let mut child_path: Vec<&str> = path_segments.to_vec();
@@ -159,9 +172,9 @@ fn walk_clap_command(
             if sub.is_hide_set() && child.level_explicit().is_none() {
                 child = child.with_level(2);
             }
-            children.insert(name.to_string(), child);
+            node = node.with_child(name, child);
         }
-        Node::Group { children, category: None, level: None }
+        node
     }
 }
 
