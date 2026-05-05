@@ -373,8 +373,59 @@ code. The clap-to-tree conversion lives in `dyncomp.rs` inside the
 
 ## Examples
 
-See `examples/basic.rs` for a complete working demo:
+Two runnable examples in `examples/` show how the pieces fit
+together. Read them top-to-bottom — the rustdoc comments narrate
+each step.
+
+### `basic.rs` — first-time setup
 
 ```bash
 cargo run --example basic -p veks-completion
 ```
+
+Builds a small `CommandTree` with a few subcommands and a value
+provider, prints what completion would suggest at sample cursor
+positions. The minimum viable adoption.
+
+### `metricsql.rs` — end-to-end coding scenario
+
+A full integration that mirrors how you'd actually adopt
+veks-completion in a tool with grammar-aware completion needs. It
+shows the four steps of a real adoption:
+
+1. **Implement the catalog** — a small `InMemoryCatalog` that
+   provides the site-specific data the MetricsQL provider needs
+   (metric names, label keys, label values).
+2. **Build the tree** — uses both built-in options:
+   `with_auto_help()` (uniform `--help` everywhere) and
+   `with_metricsql_at(&["query"], catalog)` (grammar-aware
+   completion inside the `query` subcommand).
+3. **Wire the entry point** — `handle_complete_env` for tab
+   callbacks, `print_bash_script` for the activation snippet,
+   `parse_argv` + `render_usage` for `--help` handling, dispatch
+   on the resolved subcommand path.
+4. **Drive the demo** — runs ten realistic MetricsQL cursor
+   positions (top-of-expression, inside `{`, after `key=`, inside
+   open quote, inside `[`, after `by`, after `offset`, etc.) and
+   prints what the completer suggests at each.
+
+```bash
+# Build + register completions, then tab around interactively:
+cargo build --example metricsql -p veks-completion
+eval "$(./target/debug/examples/metricsql completions)"
+./target/debug/examples/metricsql query 'up{<TAB>'
+./target/debug/examples/metricsql query 'rate(http_requests_total[<TAB>'
+./target/debug/examples/metricsql query 'sum by (<TAB>'
+./target/debug/examples/metricsql --help
+./target/debug/examples/metricsql query --help
+
+# Or skip the shell setup and watch the demo print its results:
+cargo run --example metricsql -p veks-completion -- demo
+```
+
+The demo's output for each scenario shows the raw input, the cursor
+byte position, and the candidates the engine would offer — the
+quickest way to sanity-check what your `MetricsqlCatalog` impl
+returns at every cursor position the provider knows about. Adapt
+this scenario script into your own integration tests by swapping in
+your real catalog.

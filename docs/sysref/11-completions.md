@@ -235,7 +235,134 @@ has children.
 
 ---
 
-## 11.8 Built-in Options for Downstream Adopters
+## 11.8 End-to-End Coding Scenario (Worked Example)
+
+`veks-completion/examples/metricsql.rs` is a complete, runnable
+adoption walkthrough — the same pattern any downstream user will
+follow when wiring veks-completion into a tool that needs
+grammar-aware completion. Read it as the reference implementation.
+
+The four steps the example demonstrates:
+
+### Step 1 — Implement the site-specific catalog
+
+```rust
+struct InMemoryCatalog { /* metrics, labels, values from your store */ }
+
+impl MetricsqlCatalog for InMemoryCatalog {
+    fn metric_names(&self, prefix: &str) -> Vec<String> { … }
+    fn label_keys(&self, metric: &str, prefix: &str) -> Vec<String> { … }
+    fn label_values(&self, metric: &str, label: &str, prefix: &str) -> Vec<String> { … }
+}
+```
+
+The built-in MetricsQL grammar (functions, operators, time units,
+modifiers) is baked into the provider; you supply the parts that
+depend on what's actually in your metrics store.
+
+### Step 2 — Build the tree with built-in options
+
+```rust
+fn build_tree() -> CommandTree {
+    let catalog: Arc<dyn MetricsqlCatalog> = Arc::new(InMemoryCatalog::new());
+    CommandTree::new("metricsql")
+        .command("query",
+            Node::leaf(&["--from", "--to", "--step"])
+                .with_help("Execute a MetricsQL query against the configured backend.")
+                .with_flag_help("--from", "Start of query window (RFC3339 or relative)")
+                .with_flag_help("--to",   "End of query window")
+                .with_flag_help("--step", "Resolution / step (e.g. '15s', '1m')"))
+        .command("validate",
+            Node::leaf(&[])
+                .with_help("Parse a MetricsQL expression without executing."))
+        .with_auto_help()                          // built-in: --help everywhere
+        .with_metricsql_at(&["query"], catalog)    // built-in: grammar-aware completion
+}
+```
+
+### Step 3 — Wire the entry point
+
+```rust
+fn main() {
+    let tree = build_tree();
+
+    // (1) Tab-completion callback — bash sets _METRICSQL_COMPLETE=bash
+    if handle_complete_env("metricsql", &tree) { return; }
+
+    let args: Vec<String> = std::env::args().collect();
+
+    // (2) Print the activation snippet
+    if args.get(1).map(|s| s.as_str()) == Some("completions") {
+        print_bash_script("metricsql");
+        return;
+    }
+
+    // (3) Structured argv parse against the same tree
+    let argv: Vec<&str> = args.iter().skip(1).map(|s| s.as_str()).collect();
+    let parsed = parse_argv(&tree, &argv).unwrap_or_else(|e| {
+        eprintln!("error: {}", e);
+        std::process::exit(2);
+    });
+
+    // --help is uniformly available because of with_auto_help()
+    if parsed.flags.contains_key("--help") {
+        let mut node = &tree.root;
+        for segment in &parsed.path {
+            if let Some(child) = node.child(segment) { node = child; }
+        }
+        let mut full_path = vec!["metricsql"];
+        full_path.extend(parsed.path.iter().copied());
+        println!("{}", render_usage(node, &full_path));
+        return;
+    }
+
+    // Dispatch on the resolved subcommand path
+    match parsed.path.as_slice() {
+        ["query"]    => { /* execute */ }
+        ["validate"] => { /* parse only */ }
+        _            => { /* usage */ }
+    }
+}
+```
+
+### Step 4 — Drive the demo / integration tests
+
+The example's `demo` mode walks ten realistic MetricsQL cursor
+positions and prints what the completer offers at each. Same idea
+applies to integration tests — drive `complete_at_tap_with_raw`
+directly with raw line + cursor offset:
+
+```rust
+let cands = complete_at_tap_with_raw(
+    &tree,
+    &["metricsql", "query", "up{job="],
+    /*tap_count=*/ 1,
+    /*raw_line=*/ "metricsql query up{job=",
+    /*cursor=*/ 22,
+);
+assert!(cands.contains(&"\"prometheus\"".to_string()));
+```
+
+### Run it
+
+```bash
+cargo build --example metricsql -p veks-completion
+eval "$(./target/debug/examples/metricsql completions)"
+
+# Tab around interactively
+./target/debug/examples/metricsql query 'up{<TAB>'
+./target/debug/examples/metricsql query 'rate(http_requests_total[<TAB>'
+./target/debug/examples/metricsql query 'sum by (<TAB>'
+./target/debug/examples/metricsql --help
+./target/debug/examples/metricsql query --help
+
+# Or watch the demo print its scenario results
+cargo run --example metricsql -p veks-completion -- demo
+```
+
+---
+
+## 11.9 Built-in Options for Downstream Adopters
 
 Two opt-in builders on `CommandTree` enable common capabilities
 without writing the boilerplate.
@@ -290,7 +417,7 @@ The `MetricsqlCatalog` trait supplies the site-specific parts
 
 ---
 
-## 11.9 Subtree Providers (Context-Sensitive Completion)
+## 11.10 Subtree Providers (Context-Sensitive Completion)
 
 For grammar-aware completion in any subtree (not just MetricsQL):
 
@@ -320,7 +447,7 @@ calls, range selectors, operators) — the MetricsQL provider in
 
 ---
 
-## 11.10 Directive Sets (Vocab-Driven CLIs)
+## 11.11 Directive Sets (Vocab-Driven CLIs)
 
 For repeated flag patterns, declare `Directive`s once and apply onto
 any node:
@@ -344,7 +471,7 @@ Each directive becomes:
 
 ---
 
-## 11.11 Bash Script Generation
+## 11.12 Bash Script Generation
 
 `print_bash_script("veks")` generates:
 
