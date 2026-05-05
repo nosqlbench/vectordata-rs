@@ -1321,26 +1321,104 @@ pub fn handle_complete_env(app_name: &str, tree: &CommandTree) -> bool {
     true
 }
 
+/// Window inside which a same-key tap counts as a rapid follow-up
+/// and advances to the next layer. Outside this window, the next
+/// tap starts fresh at layer 1. Exposed so embedders can mention or
+/// match the same value in their own UX.
+pub const TAP_ADVANCE_MS: u128 = 200;
+
+/// Persistable tap state — the bytes a driver would write between
+/// tap events. Two fields: the wall-clock ms at which the tap
+/// happened, and the count to *persist* (which is the layer just
+/// shown, or 0 if we just closed the cycle by hitting `max_level`).
+///
+/// Embedders can store a `TapState` in any backing they like (file,
+/// memory, an in-process map keyed by shell PID, a test fixture).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TapState {
+    /// Wall-clock time of the previous tap, in milliseconds since
+    /// the UNIX epoch (or any monotonic source the embedder picks —
+    /// the rule only inspects differences).
+    pub time_ms: u128,
+    /// Persisted count from the previous tap. `0` means "cycle was
+    /// just closed; next tap starts fresh"; non-zero means "previous
+    /// tap showed layer N, advance to N+1 if rapid".
+    pub count: u32,
+}
+
+/// Pure cadence rule. Given the previous persisted state (and the
+/// input key it was recorded against), the current time, the current
+/// input key, and the max layer count for the current group, returns:
+///
+///   - `tap_count` — the layer to show on this invocation (the
+///     value the caller passes to [`complete_rotating`]); always in
+///     `1..=max_level`.
+///   - `next` — the [`TapState`] to persist for the *next* tap.
+///
+/// Cadence:
+///
+///   - A same-key tap within [`TAP_ADVANCE_MS`] of the previous tap
+///     advances one layer (`prev.count + 1`, capped at `max_level`).
+///   - Any other tap (cold, idle past the window, or a key change)
+///     starts fresh at layer 1.
+///   - Reaching `max_level` resets the persisted count to 0 so the
+///     next tap (even rapid) starts fresh at layer 1 — closing the
+///     rotation cycle.
+///
+/// Stateless. No file I/O, no clock reads. This is what tests and
+/// embedders should call directly to script arbitrary timing
+/// scenarios:
+///
+/// ```
+/// use veks_completion::{TapState, next_tap_state};
+///
+/// // Cold start — no previous state.
+/// let (tap, st) = next_tap_state(None, 1_000, "veks", 2);
+/// assert_eq!(tap, 1);
+///
+/// // Rapid follow-up 100ms later — advances to layer 2.
+/// let (tap, st) = next_tap_state(Some((st, "veks")), 1_100, "veks", 2);
+/// assert_eq!(tap, 2);
+/// // We hit max (2), so persisted count is 0 — cycle closed.
+/// assert_eq!(st.count, 0);
+///
+/// // Third rapid tap — advances from 0+1 = 1 (fresh start).
+/// let (tap, _) = next_tap_state(Some((st, "veks")), 1_200, "veks", 2);
+/// assert_eq!(tap, 1);
+/// ```
+pub fn next_tap_state(
+    prev: Option<(TapState, &str)>,
+    now_ms: u128,
+    cur_key: &str,
+    max_level: u32,
+) -> (u32, TapState) {
+    let max = max_level.max(1);
+    let mut tap_count = 1u32;
+    if let Some((prev_state, prev_key)) = prev {
+        if prev_key == cur_key
+            && now_ms.saturating_sub(prev_state.time_ms) < TAP_ADVANCE_MS
+        {
+            tap_count = prev_state.count.saturating_add(1).min(max);
+        }
+    }
+    let to_persist = if tap_count >= max { 0 } else { tap_count };
+    let next = TapState {
+        time_ms: now_ms,
+        count: to_persist,
+    };
+    (tap_count, next)
+}
+
+/// File-backed driver around [`next_tap_state`]. Reads previous
+/// state from `/tmp/.<app>_tap_<ppid>`, runs the rule, writes the
+/// new state back. Used by [`handle_complete_env`] for the standard
+/// shell-completion flow.
+///
+/// Embedders that want different storage (in-memory map, custom
+/// path, sandboxed tempdir for tests) should call [`next_tap_state`]
+/// directly and persist the returned [`TapState`] themselves.
 fn tap_detect(app_name: &str, input_key: &str, max_level: u32) -> u32 {
     use std::io::Write;
-
-    // Cadence:
-    //   • A tap that comes within ADVANCE_MS of the previous tap on
-    //     the same input key advances to the next layer.
-    //   • Any other tap (cold, idle past ADVANCE_MS, or a key change)
-    //     starts fresh at layer 1.
-    //   • Once the advance reaches `max_level` (the deepest layer the
-    //     current group has), the persisted count is reset to 0. The
-    //     next tap therefore starts fresh at layer 1, even if it
-    //     comes within ADVANCE_MS — closing the cycle.
-    //
-    // Concretely, with max_level = 3 and rapid tapping:
-    //   tap → layer 1   (persist 1)
-    //   tap → layer 2   (persist 2)
-    //   tap → layer 3   (persist 0  ← reset on reaching max)
-    //   tap → layer 1   (persist 1)  ← cycle restarts
-    const ADVANCE_MS: u128 = 200;
-    let max = max_level.max(1);
 
     let ppid = std::env::var("_COMP_SHELL_PID")
         .or_else(|_| std::env::var("PPID"))
@@ -1356,28 +1434,21 @@ fn tap_detect(app_name: &str, input_key: &str, max_level: u32) -> u32 {
     // before pressing TAB) doesn't trip the same-key check.
     let cur_key = input_key.trim_end();
 
-    let mut tap_count = 1u32;
-    if let Ok(content) = std::fs::read_to_string(&tap_file) {
-        let mut parts = content.splitn(3, ' ');
-        let prev_time: u128 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-        let prev_count: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-        let prev_key = parts.next().unwrap_or("").trim_end();
+    let prev_owned: Option<(TapState, String)> = std::fs::read_to_string(&tap_file)
+        .ok()
+        .and_then(|content| {
+            let mut parts = content.splitn(3, ' ');
+            let time_ms: u128 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+            let count: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+            let key = parts.next().unwrap_or("").trim_end().to_string();
+            Some((TapState { time_ms, count }, key))
+        });
+    let prev = prev_owned.as_ref().map(|(s, k)| (*s, k.as_str()));
 
-        if prev_key == cur_key && now_ms.saturating_sub(prev_time) < ADVANCE_MS {
-            // Rapid follow-up on the same input — advance one layer,
-            // capped at max. A persisted prev_count of 0 means the
-            // previous tap reset the cycle, so we advance from 0 → 1
-            // (a fresh start at layer 1).
-            tap_count = prev_count.saturating_add(1).min(max);
-        }
-    }
+    let (tap_count, next) = next_tap_state(prev, now_ms, cur_key, max_level);
 
-    // Persist for the NEXT tap. When we just hit the deepest layer,
-    // reset to 0 so the next tap (rapid or otherwise) starts fresh
-    // at layer 1.
-    let to_persist = if tap_count >= max { 0 } else { tap_count };
     if let Ok(mut f) = std::fs::File::create(&tap_file) {
-        let _ = write!(f, "{} {} {}", now_ms, to_persist, cur_key);
+        let _ = write!(f, "{} {} {}", next.time_ms, next.count, cur_key);
     }
 
     tap_count
@@ -1679,6 +1750,98 @@ mod tests {
         assert!(pos("--summary") < pos("bench"));
         assert!(pos("--summary") < pos("describe"));
         assert!(pos("bench") < pos("describe"));
+    }
+
+    // ---- pure-rule cadence scenarios (no clock, no file I/O) ----
+
+    /// Drive `next_tap_state` through a sequence of taps the same
+    /// way an embedder would: own the state in a local variable, call
+    /// the pure function with simulated times. Returns the sequence
+    /// of `tap_count` values shown across the script.
+    fn replay_taps(
+        max_level: u32,
+        key: &str,
+        events: &[u128], // wall-clock times of successive taps
+    ) -> Vec<u32> {
+        let mut state: Option<TapState> = None;
+        let mut shown = Vec::with_capacity(events.len());
+        for &t in events {
+            let prev = state.map(|s| (s, key));
+            let (tap, next) = next_tap_state(prev, t, key, max_level);
+            shown.push(tap);
+            state = Some(next);
+        }
+        shown
+    }
+
+    #[test]
+    fn cadence_cold_tap_is_layer1() {
+        let shown = replay_taps(3, "veks", &[1_000]);
+        assert_eq!(shown, vec![1]);
+    }
+
+    #[test]
+    fn cadence_rapid_advances_through_layers() {
+        // Three rapid taps with a 3-layer tree should walk 1 → 2 → 3.
+        let shown = replay_taps(3, "veks", &[1_000, 1_100, 1_200]);
+        assert_eq!(shown, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn cadence_rapid_past_max_resets_cycle() {
+        // Four rapid taps with a 3-layer tree: 1 → 2 → 3 → 1
+        // (the fourth tap reads the reset state and starts fresh).
+        let shown = replay_taps(3, "veks", &[1_000, 1_100, 1_200, 1_300]);
+        assert_eq!(shown, vec![1, 2, 3, 1]);
+    }
+
+    #[test]
+    fn cadence_pause_resets_to_layer1() {
+        // Two taps separated by 500ms (>200ms window) — the second
+        // is treated as a fresh start, not a rapid follow-up.
+        let shown = replay_taps(3, "veks", &[1_000, 1_500]);
+        assert_eq!(shown, vec![1, 1]);
+    }
+
+    #[test]
+    fn cadence_key_change_resets_to_layer1() {
+        // Two rapid taps but the input key changed — second tap is
+        // a fresh start.
+        let mut state: Option<TapState> = None;
+        let (t1, st1) = next_tap_state(None, 1_000, "veks", 3);
+        state = Some(st1);
+        assert_eq!(t1, 1);
+
+        let prev = state.map(|s| (s, "veks"));
+        let (t2, _) = next_tap_state(prev, 1_100, "veks compute", 3);
+        // Different key — fresh start, layer 1.
+        assert_eq!(t2, 1);
+    }
+
+    #[test]
+    fn cadence_max_level_2_alternates() {
+        // With max_level = 2, sustained rapid tapping should
+        // alternate 1 → 2 → 1 → 2 …
+        let shown = replay_taps(2, "veks", &[1_000, 1_100, 1_200, 1_300, 1_400]);
+        assert_eq!(shown, vec![1, 2, 1, 2, 1]);
+    }
+
+    #[test]
+    fn cadence_max_level_1_pinned() {
+        // With max_level = 1 (no stratification), every tap shows
+        // layer 1 — the rotation is a no-op.
+        let shown = replay_taps(1, "veks", &[1_000, 1_100, 1_200, 1_300]);
+        assert_eq!(shown, vec![1, 1, 1, 1]);
+    }
+
+    #[test]
+    fn cadence_advance_window_boundary() {
+        // Exactly TAP_ADVANCE_MS apart should NOT count as rapid
+        // (strict less-than comparison). Just under should.
+        let shown = replay_taps(3, "veks", &[1_000, 1_000 + TAP_ADVANCE_MS]);
+        assert_eq!(shown, vec![1, 1], "tap exactly at the boundary is fresh");
+        let shown = replay_taps(3, "veks", &[1_000, 1_000 + TAP_ADVANCE_MS - 1]);
+        assert_eq!(shown, vec![1, 2], "tap just inside the boundary is rapid");
     }
 
     #[test]
