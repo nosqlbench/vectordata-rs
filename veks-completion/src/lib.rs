@@ -797,16 +797,24 @@ pub fn complete_at_level_only(tree: &CommandTree, words: &[&str], only_level: u3
     }
 
     // Apply the rotation filter to whichever group we landed on.
+    // Cumulative semantics: tap N reveals every child whose level is
+    // <= N. So a single tap shows layer 1; a rapid double-tap shows
+    // layers 1 + 2 together; etc. The result is always sorted in
+    // *layer order* (layer 1 candidates first, then layer 2, …) with
+    // the standard `--`-flags-last + alphabetical ordering applied
+    // within each layer.
     if let Node::Group { children, .. } = node {
-        let mut candidates: Vec<String> = children.iter()
+        let mut candidates: Vec<(u32, String)> = children.iter()
             .filter(|(k, _)| !at_root || !tree.hidden.contains(k.as_str()))
-            .filter(|(_, child)| child.level() == only_level)
-            .map(|(k, _)| k.to_string())
+            .filter(|(_, child)| child.level() <= only_level)
+            .map(|(k, child)| (child.level(), k.to_string()))
             .collect();
-        candidates.sort_by(|a, b| {
-            a.starts_with('-').cmp(&b.starts_with('-')).then_with(|| a.cmp(b))
+        candidates.sort_by(|(la, a), (lb, b)| {
+            la.cmp(lb)
+                .then_with(|| a.starts_with('-').cmp(&b.starts_with('-')))
+                .then_with(|| a.cmp(b))
         });
-        return candidates;
+        return candidates.into_iter().map(|(_, k)| k).collect();
     }
 
     // Landed on a leaf — no children to rotate, defer to standard
@@ -839,7 +847,7 @@ pub fn complete_rotating(tree: &CommandTree, words: &[&str], tap_count: u32) -> 
 
 /// Maximum [`Node::level`] across the immediate children of `node`,
 /// or [`DEFAULT_LEVEL`] if `node` is a leaf or has no children.
-fn max_level_of_children(node: &Node) -> u32 {
+pub(crate) fn max_level_of_children(node: &Node) -> u32 {
     let mut max = DEFAULT_LEVEL;
     if let Node::Group { children, .. } = node {
         for (_, child) in children {
@@ -1088,9 +1096,20 @@ pub fn detect_shell() -> Option<Shell> {
 ///
 /// Falls back to a help message if shell detection fails.
 pub fn print_indirect_wrapper(app_name: &str) {
-    let app_path = std::env::current_exe()
+    // Use argv[0] exactly as the user invoked us. If they typed
+    // `veks completions`, emit `source <(veks completions ...)`.
+    // If they typed `./target/release/veks completions`, emit that
+    // path. The point: the snippet they paste into ~/.bashrc should
+    // re-invoke the binary the *same way* they just did, not via a
+    // canonicalised absolute path that may not exist on a different
+    // machine, in a different toolchain, or after a `cargo install`.
+    // We deliberately do NOT call `std::env::current_exe()` here —
+    // that resolves symlinks and ignores how the user actually ran
+    // the binary.
+    let app_path = std::env::args_os()
+        .next()
         .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| app_name.to_string());
+        .unwrap_or_else(|| app_name.to_string());
 
     match detect_shell() {
         Some(Shell::Bash) => {
@@ -1161,19 +1180,25 @@ pub fn print_completions(app_name: &str, shell: Shell) {
 pub fn print_bash_script(app_name: &str) {
     let env_var = format!("_{}_COMPLETE", app_name.to_uppercase().replace('-', "_"));
 
+    // Echo argv[0] verbatim — whatever the user typed when invoking
+    // the binary (`veks`, `./target/release/veks`,
+    // `/usr/local/bin/veks`, etc.). Resist the temptation to
+    // canonicalise via `current_dir().join(...)` or
+    // `std::env::current_exe()` — both produce paths that survive
+    // `cargo install`/symlinks/PATH-rebinding worse than the bare
+    // argv[0] does, and both surprise users who explicitly chose to
+    // call the binary by short name.
     let completer = std::env::args_os()
         .next()
-        .and_then(|p| {
-            let path = std::path::PathBuf::from(&p);
-            if path.components().count() > 1 {
-                std::env::current_dir().ok().map(|cwd| cwd.join(path))
-            } else {
-                Some(path)
-            }
-        })
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|| app_name.to_string());
 
+    // `-o nosort` is critical: the Rust completion engine returns
+    // candidates in *layer order* (level-1 entries first, then
+    // level-2, …, alphabetical within each layer). Without
+    // `nosort`, readline re-sorts the whole list alphabetically and
+    // visually scrambles the layers — making rapid-tap stratification
+    // pointless.
     print!(r#"_{app}_complete() {{
     local IFS=$'\n'
     COMPREPLY=($({env_var}=bash _COMP_SHELL_PID=$$ "{completer}" "$COMP_LINE" "$COMP_POINT" 2>/dev/null))
@@ -1182,7 +1207,7 @@ pub fn print_bash_script(app_name: &str) {
         compopt -o nospace 2>/dev/null
     fi
 }}
-complete -F _{app}_complete {app}
+complete -o nosort -F _{app}_complete {app}
 "#,
         app = app_name,
         env_var = env_var,
@@ -1253,22 +1278,40 @@ pub fn handle_complete_env(app_name: &str, tree: &CommandTree) -> bool {
     let words: Vec<&str> = words_owned.iter().map(|s| s.as_str()).collect();
 
     let input_key = words[1..].join(" ");
-    let tap_count = tap_detect(app_name, &input_key);
 
-    // Rotating-tier completion: each tab tap shows ONLY the next
-    // tier's commands (not the cumulative set), and after reaching
-    // the highest tier wraps back to level 1. The cycle length is
-    // the tree's [`max_level`] — for a tree with Primary +
-    // Secondary + Advanced (max_level=3):
+    // Determine the max-level of the group the cursor is currently
+    // inside. `tap_detect` needs this to know when to reset the
+    // persistent state (after the user has tapped through to the
+    // last layer).
+    let completed_for_max: &[&str] = if words.len() > 1 {
+        &words[1..words.len() - 1]
+    } else {
+        &[]
+    };
+    let mut max_node = &tree.root;
+    for &word in completed_for_max {
+        if let Some(child) = max_node.child(word) {
+            max_node = child;
+        } else {
+            break;
+        }
+    }
+    let max_level = max_level_of_children(max_node).max(1);
+    let tap_count = tap_detect(app_name, &input_key, max_level);
+
+    // Rotating-tier completion with cumulative supersets:
     //
-    //   tap 1 → only level 1 (Primary)
-    //   tap 2 → only level 2 (Secondary)
-    //   tap 3 → only level 3 (Advanced)
-    //   tap 4 → wraps back to level 1
+    //   tap 1 (cold)         → layer 1
+    //   tap 2 (within 200ms) → layers 1 + 2 (cumulative)
+    //   tap 3 (within 200ms) → layers 1 + 2 + 3 (cumulative, max)
+    //                          ↑ persistent state resets here
+    //   tap 4 (within 200ms) → layer 1 (fresh, because state was reset)
+    //   …
     //
-    // Trees that haven't categorized their commands have
-    // max_level == 1, so every tap returns the same level-1 set
-    // (the pre-stratification behavior).
+    // Within each cumulative result, candidates are sorted in layer
+    // order (layer 1 first, then layer 2, …). Trees that haven't
+    // categorized their commands have max_level == 1, so every tap
+    // returns the same layer-1 set (no stratification visible).
     let candidates = complete_rotating(tree, &words, tap_count);
 
     for candidate in candidates {
@@ -1278,15 +1321,26 @@ pub fn handle_complete_env(app_name: &str, tree: &CommandTree) -> bool {
     true
 }
 
-fn tap_detect(app_name: &str, input_key: &str) -> u32 {
+fn tap_detect(app_name: &str, input_key: &str, max_level: u32) -> u32 {
     use std::io::Write;
 
-    // Cadence semantics:
-    //   gap > 1000 ms  → reset to level 1 (idle resets the rotation)
-    //   gap < 250  ms  → advance to next level (rapid double/triple-tap)
-    //   otherwise      → hold current level
-    const RESET_MS: u128 = 1000;
-    const ADVANCE_MS: u128 = 250;
+    // Cadence:
+    //   • A tap that comes within ADVANCE_MS of the previous tap on
+    //     the same input key advances to the next layer.
+    //   • Any other tap (cold, idle past ADVANCE_MS, or a key change)
+    //     starts fresh at layer 1.
+    //   • Once the advance reaches `max_level` (the deepest layer the
+    //     current group has), the persisted count is reset to 0. The
+    //     next tap therefore starts fresh at layer 1, even if it
+    //     comes within ADVANCE_MS — closing the cycle.
+    //
+    // Concretely, with max_level = 3 and rapid tapping:
+    //   tap → layer 1   (persist 1)
+    //   tap → layer 2   (persist 2)
+    //   tap → layer 3   (persist 0  ← reset on reaching max)
+    //   tap → layer 1   (persist 1)  ← cycle restarts
+    const ADVANCE_MS: u128 = 200;
+    let max = max_level.max(1);
 
     let ppid = std::env::var("_COMP_SHELL_PID")
         .or_else(|_| std::env::var("PPID"))
@@ -1297,37 +1351,36 @@ fn tap_detect(app_name: &str, input_key: &str) -> u32 {
         .map(|d| d.as_millis())
         .unwrap_or(0);
 
-    let mut count = 1u32;
-
     // Compare key normalized to the same shape on read AND write so
     // a trailing space (common when the user just typed a separator
-    // before pressing TAB) doesn't reset the tap counter — that
-    // would defeat rotation entirely.
+    // before pressing TAB) doesn't trip the same-key check.
     let cur_key = input_key.trim_end();
 
+    let mut tap_count = 1u32;
     if let Ok(content) = std::fs::read_to_string(&tap_file) {
         let mut parts = content.splitn(3, ' ');
         let prev_time: u128 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
         let prev_count: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
         let prev_key = parts.next().unwrap_or("").trim_end();
 
-        if prev_key == cur_key {
-            let gap = now_ms.saturating_sub(prev_time);
-            if gap > RESET_MS {
-                count = 1;
-            } else if gap < ADVANCE_MS {
-                count = prev_count.saturating_add(1).max(1);
-            } else {
-                count = prev_count.max(1);
-            }
+        if prev_key == cur_key && now_ms.saturating_sub(prev_time) < ADVANCE_MS {
+            // Rapid follow-up on the same input — advance one layer,
+            // capped at max. A persisted prev_count of 0 means the
+            // previous tap reset the cycle, so we advance from 0 → 1
+            // (a fresh start at layer 1).
+            tap_count = prev_count.saturating_add(1).min(max);
         }
     }
 
+    // Persist for the NEXT tap. When we just hit the deepest layer,
+    // reset to 0 so the next tap (rapid or otherwise) starts fresh
+    // at layer 1.
+    let to_persist = if tap_count >= max { 0 } else { tap_count };
     if let Ok(mut f) = std::fs::File::create(&tap_file) {
-        let _ = write!(f, "{} {} {}", now_ms, count, cur_key);
+        let _ = write!(f, "{} {} {}", now_ms, to_persist, cur_key);
     }
 
-    count
+    tap_count
 }
 
 /// Expanded completion: show all `group command` pairs.
@@ -1562,6 +1615,70 @@ mod tests {
         let cands = complete_at_tap(&tree, &["nbrs", "--ins"], 1);
         assert!(cands.contains(&"--inspector".to_string()),
             "partial-prefix matches should bypass the tap-tier filter");
+    }
+
+    #[test]
+    fn rotating_tap1_baseline_is_layer1_only() {
+        // The production path is `complete_rotating` (used by
+        // `handle_complete_env`). At tap=1 it shows only layer-1
+        // commands, in alphabetical order.
+        let tree = stratified_tree();
+        let cands = complete_rotating(&tree, &["nbrs"], 1);
+        assert_eq!(cands, vec!["run".to_string()]);
+    }
+
+    #[test]
+    fn rotating_tap2_is_cumulative_superset() {
+        // At tap=2 (rapid double-tap), the result is the *cumulative
+        // superset* — every layer-1 command plus every layer-2
+        // command, never just layer 2 alone.
+        let tree = stratified_tree();
+        let cands = complete_rotating(&tree, &["nbrs"], 2);
+        assert!(cands.contains(&"run".to_string()),
+            "layer-1 'run' must remain visible at tap 2");
+        assert!(cands.contains(&"--inspector".to_string()),
+            "layer-2 '--inspector' must appear at tap 2");
+        assert!(cands.contains(&"--summary".to_string()),
+            "layer-2 '--summary' must appear at tap 2");
+    }
+
+    #[test]
+    fn rotating_tap2_orders_by_layer() {
+        // Within the cumulative result, candidates must be sorted
+        // *layer-first* — every layer-1 entry precedes every layer-2
+        // entry — and within a layer, `--`-flags last + alphabetical.
+        let tree = stratified_tree();
+        let cands = complete_rotating(&tree, &["nbrs"], 2);
+        let pos = |name: &str| cands.iter().position(|s| s == name).unwrap();
+        assert!(pos("run") < pos("--inspector"),
+            "layer-1 'run' must precede layer-2 '--inspector'");
+        assert!(pos("run") < pos("--summary"),
+            "layer-1 'run' must precede layer-2 '--summary'");
+        assert!(pos("--inspector") < pos("--summary"),
+            "within a layer, alphabetical: '--inspector' before '--summary'");
+    }
+
+    #[test]
+    fn rotating_tap3_at_max_includes_all_layers() {
+        // At tap=3 (third rapid tap on a 3-layer tree), the
+        // cumulative result must include every layer 1, 2, and 3
+        // candidate, in layer order.
+        let tree = stratified_tree();
+        let cands = complete_rotating(&tree, &["nbrs"], 3);
+        assert!(cands.contains(&"run".to_string()));
+        assert!(cands.contains(&"--inspector".to_string()));
+        assert!(cands.contains(&"--summary".to_string()));
+        assert!(cands.contains(&"describe".to_string()));
+        assert!(cands.contains(&"bench".to_string()));
+
+        let pos = |name: &str| cands.iter().position(|s| s == name).unwrap();
+        // Layer 1 (run) before layer 2 (inspector/summary) before
+        // layer 3 (bench, describe). `bench` and `describe` are both
+        // layer 3; alphabetical within the layer keeps `bench` first.
+        assert!(pos("run") < pos("--inspector"));
+        assert!(pos("--summary") < pos("bench"));
+        assert!(pos("--summary") < pos("describe"));
+        assert!(pos("bench") < pos("describe"));
     }
 
     #[test]

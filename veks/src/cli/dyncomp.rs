@@ -27,13 +27,15 @@ pub fn build_tree(cmd: &clap::Command) -> CommandTree {
     let pipeline_meta = veks_pipeline::pipeline::cli::pipeline_command_metadata();
     let root = walk_clap_command(cmd, &[], &pipeline_vc, &pipeline_meta);
 
-    // Identify hidden commands
-    let mut hidden: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for sub in cmd.get_subcommands() {
-        if sub.is_hide_set() {
-            hidden.insert(sub.get_name().to_string());
-        }
-    }
+    // We deliberately leave `hidden` empty. clap's `hide(true)` means
+    // "don't pollute --help output with this entry" — typically because
+    // it's a shortcut alias for a longer canonical path. For TAB
+    // completion we want those shortcuts *discoverable* (otherwise
+    // `veks run` is impossible to find via tab), just at a higher
+    // rotation tier so the first tap stays uncluttered. The level
+    // assignment below promotes hide-set subs to layer 2; rapid
+    // double-tap reveals them as part of the cumulative superset.
+    let hidden: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     let mut tree = CommandTree {
         app_name: app_name.to_string(),
@@ -139,13 +141,24 @@ fn walk_clap_command(
             level,
         }
     } else {
-        // Group command — recurse into children
+        // Group command — recurse into children. clap's `hide(true)`
+        // marks shortcut aliases / disambiguators that we want hidden
+        // from --help but discoverable via TAB at a higher rotation
+        // tier. Promote those to `level=2`; visible children inherit
+        // the default `level=1` (or whatever metadata they pick up
+        // from the pipeline registry, for leaves). The result: a
+        // single TAB at root shows the visible primary groups, a
+        // rapid double-tap reveals the cumulative superset that
+        // includes every shortcut.
         let mut children = std::collections::BTreeMap::new();
         for sub in subs {
             let name = sub.get_name();
             let mut child_path: Vec<&str> = path_segments.to_vec();
             child_path.push(name);
-            let child = walk_clap_command(sub, &child_path, pipeline_vc, pipeline_meta);
+            let mut child = walk_clap_command(sub, &child_path, pipeline_vc, pipeline_meta);
+            if sub.is_hide_set() && child.level_explicit().is_none() {
+                child = child.with_level(2);
+            }
             children.insert(name.to_string(), child);
         }
         Node::Group { children, category: None, level: None }
