@@ -5,6 +5,13 @@ by a single `CommandTree` declaration. The same tree drives every
 CLI surface — completions, `--help`, argv parse — so they can't drift
 out of sync.
 
+> **Companion doc**: [§11a Completion Functional Spec](./11a-completion-spec.md)
+> covers the per-context behavioral contract — what candidates the
+> engine must emit for every cursor position, and how those
+> candidates must be shaped so bash readline doesn't auto-close
+> wrapper quotes or mis-splice grammar tokens. Read that one when
+> implementing or auditing context-specific completion behavior.
+
 ---
 
 ## 11.1 User Setup
@@ -473,30 +480,150 @@ Each directive becomes:
 
 ## 11.12 Bash Script Generation
 
-`print_bash_script("veks")` generates:
+`print_bash_script("veks")` generates a deliberately minimal hook
+that hands raw `$COMP_LINE` + `$COMP_POINT` to the binary and
+forces bash into "raw mode" so its own quoting heuristics don't
+fight the engine's grammar-aware splicing:
 
 ```bash
 _veks_complete() {
     local IFS=$'\n'
-    COMPREPLY=($(_VEKS_COMPLETE=bash _COMP_SHELL_PID=$$ "veks" \
-        "$COMP_LINE" "$COMP_POINT" 2>/dev/null))
-    if [[ ${#COMPREPLY[@]} -ge 1 ]] \
-        && [[ "${COMPREPLY[0]}" == *= || "${COMPREPLY[0]}" == */ ]]; then
-        compopt -o nospace 2>/dev/null
-    fi
+    local COMP_WORDBREAKS=$' \t\n<>;|&'
+    COMPREPLY=($(_VEKS_COMPLETE=bash "veks" "$COMP_LINE" "$COMP_POINT"))
 }
-complete -o nosort -F _veks_complete veks
+complete -o nosort -o nospace -F _veks_complete veks
 ```
 
-Key details:
+Each line earns its place — see §11.13 for the rationale behind
+`COMP_WORDBREAKS` and `-o nospace`.
 
-- `-o nosort` — preserves the engine's intentional layer ordering.
-  Without this, readline alphabetises and the layer-stratified
-  display is destroyed.
-- `_COMP_SHELL_PID=$$` — passes the shell's PID so the engine can
-  scope tap-cadence state per shell.
+- `local IFS=$'\n'` — candidates may contain spaces (quoted label
+  values, multi-token completions); newline-only IFS preserves them
+  through the `($(…))` array expansion.
+- `local COMP_WORDBREAKS=$' \t\n<>;|&'` — strips bash's default
+  `' " = ( :` from the wordbreak set so grammar tokens stay unsplit.
+  See §11.13 "Raw Mode".
+- `-o nosort` — preserves the engine's intentional layer ordering
+  (rapid-tap tier ordering). Without this, readline alphabetises
+  and the layer-stratified display is destroyed.
+- `-o nospace` — most engine candidates are mid-context inserts
+  (`delta(`, `up{`, `[5m`); a trailing space would push the cursor
+  outside the context the user is building. The user types their
+  own space when done.
+- The shell's PID is read by the binary via `getppid()` (no env
+  var plumbing needed).
 - The completer name in the snippet is `argv[0]` verbatim — whatever
   the user invoked when they ran `veks completions`. No
   `current_exe()` resolution; no `cwd.join()` absolutising. So the
   snippet pasted to `~/.bashrc` re-invokes the binary the same way
   the user just did.
+
+---
+
+## 11.13 Completion Semantics: Intent + Raw Mode
+
+Two layered design rules govern how the engine produces candidates.
+Both come from a single core insight: **a completion candidate is
+not just a string; it is a transition between context states.**
+The engine and the bash hook cooperate so those transitions land
+correctly without the shell's default heuristics second-guessing.
+
+### Layer 1 — Completion Intent
+
+Every candidate fits one of four intent categories. The category
+governs whether the candidate opens a context, closes one, extends
+within one, or wraps the whole expression up.
+
+| Intent     | Example                  | Cursor lands  | Trailing space? | Outer wrappers      |
+|------------|--------------------------|---------------|-----------------|---------------------|
+| `OPEN`     | `delta(`, `{`, `[`       | inside        | NO              | must stay open      |
+| `APPEND`   | `job=`, `http_requests`  | at end        | maybe           | never closed        |
+| `CLOSE`    | `)`, `]`, `}`            | after         | maybe           | unaffected          |
+| `TERMINAL` | finished label value `"`-closed | after  | YES             | may close           |
+
+Concrete consequences:
+
+- An `OPEN` candidate (`delta(`) inside a shell-wrapper-quoted
+  expression must NOT cause readline to auto-close the wrapper —
+  the user is mid-construction.
+- An `APPEND` candidate (a label key) extends current context;
+  trailing space depends on whether the user is composing a list
+  (no space) or finishing a token (space).
+- The engine currently expresses intent implicitly via the shape
+  of the candidate (presence of `(`, trailing operator, etc.) and
+  via the `-o nospace` shell directive (which uniformly suppresses
+  trailing space — the user provides it). Promoting intent to a
+  first-class enum is a natural future refactor; today the model
+  lives in this doc and in the choice of candidate string.
+
+### Layer 2 — Raw Mode (Engine ↔ Bash Hook Cooperation)
+
+The engine alone cannot stop readline from "helpfully":
+
+- Auto-closing an unmatched `'` or `"` when the candidate ends
+  inside an open context (e.g. `delta(` inside `'…`).
+- Splitting a candidate at `=`, `(`, `:` — bash's default
+  `COMP_WORDBREAKS` includes these, so it would hand the engine
+  fragmented "current word" boundaries that don't match grammar.
+- Adding a trailing space after every completion.
+
+The hook puts bash into a deliberately minimal "raw mode" so the
+engine owns the splice contract end-to-end:
+
+1. **`local COMP_WORDBREAKS=$' \t\n<>;|&'`** — keep only real shell
+   metacharacters as wordbreaks. Strip:
+   - `' "` (shell wrapper quotes) — so `'metricsql expr` is one
+     word; readline can't auto-close.
+   - `=` — so `up{job=` is one word; `key=value` candidates splice
+     cleanly.
+   - `(` — so `delta(rate(` is one word; nested function-call
+     completions work.
+   - `:` — so `[5m:1m]` subquery step is one word.
+   This must match `PartialParse::DEFAULT_BASH_WORDBREAKS` exactly
+   so the engine's `shell_word_start()` reasons about the same
+   boundaries bash will splice against.
+
+2. **`-o nospace`** — engine candidates are typically mid-context
+   inserts; a trailing space would land the cursor outside the
+   context being built. The user types their own space.
+
+3. **`-o nosort`** — preserves engine's tier ordering.
+
+4. **`local IFS=$'\n'`** — candidates may contain spaces.
+
+The cost of raw mode is that **every candidate must be
+splice-ready**: it must include the entire shell-perceived
+"current word" prefix, not just the new content. The engine helper
+`PartialParse::splice_candidate(target_start, suggestion)` does
+this automatically — it returns `raw_line[shell_word_start..target_start]
++ suggestion`, so providers think in their own grammar terms
+("the value is `prometheus`") and the helper produces the
+shell-correct candidate (`up{job="prometheus"`).
+
+### Why Both Layers Are Needed
+
+Layer 2 alone (raw mode) makes mechanical splicing correct, but
+without Layer 1 (intent) the engine still produces candidates that
+land the cursor in the wrong place — e.g., a `delta(` candidate
+followed by a trailing space would close the function-call entry
+context the user is trying to enter. Layer 1 alone (intent
+classification) cannot prevent readline from auto-closing the
+wrapper quote — only the hook configuration can. The two layers
+are independent forces; both must be on for grammar-aware
+completion to "just work" inside complex expressions.
+
+### Verifying the Contract
+
+The provider tests in `veks-completion/src/providers.rs` exercise
+both layers:
+
+- Candidate-shape assertions verify Layer 1 (intent): e.g.,
+  function-name completions end with `(` (OPEN), label keys end
+  with `=`/`!=`/`=~`/`!~` (APPEND with operator), label values
+  inside an open quote come back as a bare string (APPEND inside
+  open `"`).
+- `apply_substitution` round-trip tests verify Layer 2: take a
+  candidate, splice it into the line at `shell_word_start`, and
+  check the resulting line is exactly what the user expected to
+  see — proving the engine's view of the splice point matches the
+  hook's `COMP_WORDBREAKS`-driven view.

@@ -394,6 +394,14 @@ pub struct PartialParse<'a> {
     /// Byte offset of the cursor within `raw_line`. `0` when
     /// `raw_line` is empty.
     pub cursor_offset: usize,
+    /// Tap count for this completion invocation. The engine sets
+    /// this from the rotating-tier counter (`1` on the first tap,
+    /// `2` on a rapid follow-up, etc.). Providers may use it to
+    /// layer their output — e.g., tap 1 = primary candidates
+    /// (metric names inside a function-arg position), tap 2 = +
+    /// secondary candidates (inner functions to stack). Defaults
+    /// to `1` for callers that don't drive rotation.
+    pub tap_count: u32,
 }
 
 /// Bracket / quote depth at the cursor, computed by
@@ -484,6 +492,113 @@ impl<'a> PartialParse<'a> {
             }
         }
         chars.next()
+    }
+
+    /// `COMP_WORDBREAKS` value that the engine's bash hook
+    /// installs locally — a deliberately minimal set that keeps
+    /// shell metacharacters as word separators (`< > ; | &`) but
+    /// drops everything bash would otherwise use to "helpfully"
+    /// split inside a grammar token: `' "` (shell wrapper quotes),
+    /// `=` (key=value), `(` (function-call open), `:` (label
+    /// values, subquery step). With these out of the way:
+    ///
+    ///   - `'metricsql expr` is one word → readline doesn't
+    ///     auto-close the wrapper quote when our candidate ends
+    ///     mid-context (e.g. `delta(`).
+    ///   - `up{job=` is one word → label-value candidates splice
+    ///     cleanly without prefix gymnastics.
+    ///   - `delta(rate(` is one word → nested function-call
+    ///     completions work without the shell mid-quoting.
+    ///
+    /// This is the bash-side "raw mode" the engine relies on so
+    /// shell-quoting heuristics don't fight grammar-aware splicing.
+    /// The hook sets it locally per call so the user's interactive
+    /// `COMP_WORDBREAKS` is untouched outside completion.
+    ///
+    /// `{`, `[`, `]`, `}`, `,` were already not in bash's default
+    /// set — they don't split the word in bash, which is what makes
+    /// [`PartialParse::splice_candidate`] necessary in the first
+    /// place. We additionally strip `' " = ( :` to extend the same
+    /// "splicer owns this" treatment to those grammar contexts.
+    pub const DEFAULT_BASH_WORDBREAKS: &'static str = " \t\n<>;|&";
+
+    /// Byte offset in [`Self::raw_line`] where the shell will
+    /// consider the "current word" to begin — the byte after the
+    /// last word-separator character before the cursor, or `0` if
+    /// none. Falls back to `0` when `raw_line` is empty.
+    ///
+    /// Today this assumes bash semantics
+    /// ([`Self::DEFAULT_BASH_WORDBREAKS`]). When other shells gain
+    /// first-class support, this method may take a per-shell
+    /// wordbreak set.
+    pub fn shell_word_start(&self) -> usize {
+        let before = self.before_cursor();
+        before
+            .rfind(|c: char| Self::DEFAULT_BASH_WORDBREAKS.contains(c))
+            .map(|p| p + 1)
+            .unwrap_or(0)
+    }
+
+    /// What the shell sees as the "current word" — the slice
+    /// between [`Self::shell_word_start`] and the cursor. This is
+    /// the segment the shell will *replace* when the user accepts
+    /// a candidate the engine returns.
+    pub fn shell_current_word(&self) -> &'a str {
+        &self.raw_line[self.shell_word_start().min(self.raw_line.len())
+            ..self.cursor_offset.min(self.raw_line.len())]
+    }
+
+    /// Splice a *logical* suggestion into the shell-correct form
+    /// for a COMPREPLY candidate. Providers compute suggestions in
+    /// their own grammar terms (e.g. "the label key is `job`");
+    /// this helper produces the substitution string the shell
+    /// needs so that whatever the user already typed in the
+    /// shell-perceived current word, *before* the suggestion's
+    /// insertion point, is preserved.
+    ///
+    /// `target_start` is the byte offset in [`Self::raw_line`]
+    /// where the suggestion logically begins. For an inside-`{`
+    /// label-key suggestion in `up{job`, `target_start` is the
+    /// position right after the `{`. The helper returns
+    /// `raw_line[shell_word_start..target_start] + suggestion` —
+    /// i.e., the part of the shell's current word that's BEFORE
+    /// the completion target, plus the new content.
+    ///
+    /// When `target_start <= shell_word_start`, the suggestion
+    /// replaces the entire shell word (or starts before it), so
+    /// the helper returns the suggestion unchanged.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use veks_completion::PartialParse;
+    ///
+    /// let pp = PartialParse {
+    ///     completed: vec![],
+    ///     partial: "",
+    ///     tree_path: vec![],
+    ///     raw_line: "myapp query up{",
+    ///     cursor_offset: 15,
+    ///     tap_count: 1,
+    /// };
+    /// assert_eq!(pp.shell_word_start(), 12);          // after the last space
+    /// assert_eq!(pp.shell_current_word(), "up{");     // shell will replace this
+    ///
+    /// // Suggestion: the label key `job`. Logically it starts
+    /// // right after the `{` (byte 15).
+    /// let candidate = pp.splice_candidate(15, "job");
+    /// assert_eq!(candidate, "up{job");
+    /// // → shell replaces "up{" with "up{job" ⇒ final word "up{job"
+    /// ```
+    pub fn splice_candidate(&self, target_start: usize, suggestion: &str) -> String {
+        let sws = self.shell_word_start();
+        if target_start <= sws {
+            suggestion.to_string()
+        } else {
+            let end = target_start.min(self.raw_line.len());
+            let prefix = &self.raw_line[sws..end];
+            format!("{prefix}{suggestion}")
+        }
     }
 
     /// Identifier (or partial identifier) immediately to the left
@@ -1396,8 +1511,6 @@ pub fn complete_rotating_with_raw(
     raw_line: &str,
     cursor_offset: usize,
 ) -> Vec<String> {
-    // Determine the max level among the children of whichever
-    // group the cursor is currently inside.
     let completed: &[&str] = if words.len() > 1 { &words[1..words.len() - 1] } else { &[] };
     let partial: &str = if words.len() > 1 { *words.last().unwrap_or(&"") } else { "" };
     let mut node = &tree.root;
@@ -1407,13 +1520,32 @@ pub fn complete_rotating_with_raw(
             None => break,
         }
     }
+
+    // If any node on the resolved path has a subtree provider, the
+    // rotating-tier filter doesn't apply — the provider owns the
+    // candidate output. Pass the FULL tap_count through (not the
+    // modulo-by-max-children version) so the provider can layer
+    // its own output by tap (e.g., metricsql shows metric names
+    // at tap 1 and adds inner functions at tap 2).
+    let mut subtree_node = &tree.root;
+    let mut has_subtree = subtree_node.subtree_provider().is_some();
+    for &word in completed {
+        if let Some(child) = subtree_node.child(word) {
+            subtree_node = child;
+            if subtree_node.subtree_provider().is_some() {
+                has_subtree = true;
+            }
+        } else { break; }
+    }
+    if has_subtree {
+        return complete_at_tap_with_raw(tree, words, tap_count, raw_line, cursor_offset);
+    }
+
     let max = max_level_of_children(node).max(1);
     let only = ((tap_count.saturating_sub(1)) % max) + 1;
     // Empty partial at a group boundary → apply the level filter
-    // via complete_at_level_only (which also handles the no-partial
-    // edge case where words = [binary] only). Otherwise dispatch
-    // through complete_at_tap_with_raw so subtree providers still
-    // see raw context.
+    // via complete_at_level_only. Otherwise dispatch through
+    // complete_at_tap_with_raw so the engine sees raw context.
     if partial.is_empty() {
         return complete_at_level_only(tree, words, only);
     }
@@ -1515,6 +1647,7 @@ pub fn complete_at_tap_with_raw(
             tree_path,
             raw_line,
             cursor_offset,
+            tap_count,
         };
         return provider(&pp);
     }
@@ -1810,21 +1943,42 @@ pub fn print_bash_script(app_name: &str) {
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|| app_name.to_string());
 
-    // `-o nosort` is critical: the Rust completion engine returns
-    // candidates in *layer order* (level-1 entries first, then
-    // level-2, …, alphabetical within each layer). Without
-    // `nosort`, readline re-sorts the whole list alphabetically and
-    // visually scrambles the layers — making rapid-tap stratification
-    // pointless.
-    print!(r#"_{app}_complete() {{
-    local IFS=$'\n'
-    COMPREPLY=($({env_var}=bash _COMP_SHELL_PID=$$ "{completer}" "$COMP_LINE" "$COMP_POINT" 2>/dev/null))
-    if [[ ${{#COMPREPLY[@]}} -ge 1 ]] \
-        && [[ "${{COMPREPLY[0]}}" == *= || "${{COMPREPLY[0]}}" == */ ]]; then
-        compopt -o nospace 2>/dev/null
-    fi
-}}
-complete -o nosort -F _{app}_complete {app}
+    // Hook contract: force bash into "raw mode" so its built-in
+    // shell-quoting heuristics don't fight grammar-aware splicing.
+    //
+    //   `local IFS=$'\n'`
+    //       Candidates may contain spaces (quoted label values,
+    //       grouped multi-token completions). Newline-only IFS
+    //       keeps `($(…))` from re-splitting them.
+    //
+    //   `local COMP_WORDBREAKS=$' \t\n<>;|&'`
+    //       Bash's default WORDBREAKS includes `' " = ( :`, which
+    //       makes readline (a) split mid-grammar-token and (b)
+    //       auto-close unmatched quotes when the candidate ends in
+    //       an open context (e.g. `delta(` inside `'…'`). Stripping
+    //       those characters tells readline "the engine owns these
+    //       contexts; don't touch them". Set locally so the user's
+    //       interactive `COMP_WORDBREAKS` is untouched outside the
+    //       call. Must match
+    //       [`PartialParse::DEFAULT_BASH_WORDBREAKS`] exactly so
+    //       `shell_word_start` reasons about the same boundaries.
+    //
+    //   `-o nosort`
+    //       Engine emits layer-ordered output (rapid-tap tier
+    //       ordering) — readline must not re-sort alphabetically.
+    //
+    //   `-o nospace`
+    //       Most engine candidates are mid-context inserts
+    //       (`delta(`, `up{`, `[5m`) — adding a trailing space
+    //       would put the cursor outside the context the user is
+    //       building. The user types their own space when done.
+    //
+    // Things deliberately NOT in the script:
+    //   - `_COMP_SHELL_PID=$$`: engine reads it via `getppid()`.
+    //   - `2>/dev/null`: binary is silent in completion mode;
+    //     diagnostics live on `---trace-completion`.
+    print!(r#"_{app}_complete() {{ local IFS=$'\n'; local COMP_WORDBREAKS=$' \t\n<>;|&'; COMPREPLY=($({env_var}=bash "{completer}" "$COMP_LINE" "$COMP_POINT")); }}
+complete -o nosort -o nospace -F _{app}_complete {app}
 "#,
         app = app_name,
         env_var = env_var,
@@ -1871,6 +2025,215 @@ fn split_line(line: &str, point: usize) -> (Vec<String>, String) {
 /// Expects the bash shim emitted by [`print_bash_script`] —
 /// `<binary> "$COMP_LINE" "$COMP_POINT"` — and tokenizes the
 /// line in Rust before walking the [`CommandTree`].
+/// Engine-level diagnostic flags. All start with the triple-dash
+/// (`---`) prefix to make them visually distinct from normal `--`
+/// CLI flags and from `-x` short flags. They're never user-facing —
+/// downstream developers and integration tests use them to introspect
+/// veks-completion behavior programmatically.
+///
+/// **Provider-specific diagnostics live with each provider**, not
+/// here. For example, the MetricsQL provider in [`crate::providers`]
+/// exposes its own `metricsql_diagnostic_args` function the embedder
+/// can call alongside [`handle_diagnostic_args`].
+///
+/// See [`handle_diagnostic_args`] for the dispatcher.
+pub const DIAGNOSTIC_FLAGS: &[&str] = &[
+    "---help",                  // list every recognised diagnostic
+    "---version",               // print veks-completion crate version
+    "---dump-tree",             // print the CommandTree as text
+    "---list-providers",        // list subtree providers by path
+    "---validate",              // run CommandTree::validate, print errors
+    "---trace-completion",      // <line> <point>: run completion + print
+    "---trace-partial-parse",   // <line> <point>: print PartialParse state
+];
+
+/// Triple-dash diagnostic dispatcher. Inspect `std::env::args` for a
+/// recognised `---*` flag (see [`DIAGNOSTIC_FLAGS`]) and, if found,
+/// run the corresponding diagnostic and return `true`. The caller
+/// should `process::exit(0)` (or just return) when this returns
+/// true, exactly like [`handle_complete_env`].
+///
+/// All output goes to stdout (so embedders can pipe into a test).
+/// Output is line-oriented and stable so integration tests can
+/// match against it.
+///
+/// # Why triple-dash?
+///
+/// Single-dash (`-x`) and double-dash (`--xyz`) flags belong to the
+/// downstream app's argv vocabulary. Triple-dash is reserved for
+/// veks-completion-internal diagnostics; the engine intercepts them
+/// before normal argv parsing so they can't collide with user flags.
+///
+/// # Example downstream usage
+///
+/// ```ignore
+/// fn main() {
+///     let tree = build_tree();
+///
+///     // (1) Tab callback
+///     if veks_completion::handle_complete_env("myapp", &tree) { return; }
+///
+///     // (2) ---* diagnostics — for tests + dev workflow
+///     if veks_completion::handle_diagnostic_args("myapp", &tree) { return; }
+///
+///     // (3) Normal CLI parsing & dispatch
+///     let parsed = veks_completion::parse_argv(&tree, &collect_argv())?;
+///     // …
+/// }
+/// ```
+///
+/// # Flags recognised
+///
+/// | Flag | Args | Output |
+/// |------|------|--------|
+/// | `---help` | — | List every recognised flag with one-line description |
+/// | `---version` | — | Crate name + version |
+/// | `---dump-tree` | — | Pretty-printed tree shape (children, flags, levels) |
+/// | `---list-providers` | — | Each path that has a `SubtreeProvider` attached |
+/// | `---validate` | — | Run `CommandTree::validate()`; exit non-zero if errors |
+/// | `---trace-completion` | `<line> <point>` | Run the completion engine on the synthetic input and print one candidate per line |
+/// | `---trace-partial-parse` | `<line> <point>` | Print `PartialParse` state (raw_line, cursor, before/after, bracket_state, ident, trigger) |
+/// | `---metricsql-vocab` | — | Print built-in MetricsQL vocab (functions, time units, modifiers) |
+/// | `---metricsql-context` | `<line> <point>` | Same as `---trace-partial-parse` plus the values `metricsql_provider` would derive |
+pub fn handle_diagnostic_args(app_name: &str, tree: &CommandTree) -> bool {
+    let argv: Vec<String> = std::env::args().collect();
+    let flag_idx = argv.iter().position(|a| a.starts_with("---"));
+    let Some(idx) = flag_idx else { return false; };
+    let flag = argv[idx].as_str();
+    let rest: Vec<&str> = argv.iter().skip(idx + 1).map(|s| s.as_str()).collect();
+    match flag {
+        "---help" => {
+            println!("veks-completion diagnostic flags (triple-dash, reserved):");
+            for f in DIAGNOSTIC_FLAGS {
+                println!("  {f}");
+            }
+            println!();
+            println!("These are dev / test-only. They never collide with normal");
+            println!("`--` CLI flags. See the `handle_diagnostic_args` rustdoc.");
+        }
+        "---version" => {
+            println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+            let _ = app_name;
+        }
+        "---dump-tree" => dump_tree(&tree.root, &mut Vec::new()),
+        "---list-providers" => list_providers(&tree.root, &mut Vec::new()),
+        "---validate" => match tree.validate() {
+            Ok(()) => println!("ok"),
+            Err(errors) => {
+                for e in errors {
+                    println!("{:?}", e);
+                }
+                std::process::exit(1);
+            }
+        },
+        "---trace-completion" => {
+            let (line_with_app, point_in_line) = synth_line_for_trace(app_name, &rest);
+            let (prior, cur) = split_line(&line_with_app, point_in_line);
+            let mut words_owned: Vec<String> = vec![app_name.to_string()];
+            words_owned.extend(prior);
+            words_owned.push(cur);
+            let words: Vec<&str> = words_owned.iter().map(|s| s.as_str()).collect();
+            let cands = complete_at_tap_with_raw(tree, &words, 1, &line_with_app, point_in_line);
+            for c in cands {
+                println!("{c}");
+            }
+        }
+        "---trace-partial-parse" => {
+            let (line_with_app, point_in_line) = synth_line_for_trace(app_name, &rest);
+            let (prior, cur) = split_line(&line_with_app, point_in_line);
+            let prior_owned: Vec<String> = prior;
+            let cur_owned = cur;
+            let pp = PartialParse {
+                completed: prior_owned.iter().map(|s| s.as_str()).collect(),
+                partial: &cur_owned,
+                tree_path: Vec::new(),
+                raw_line: &line_with_app,
+                cursor_offset: point_in_line,
+                tap_count: 1,
+            };
+            print_partial_parse(&pp);
+        }
+        other if other.starts_with("---") => {
+            // Unknown engine-level flag. Don't claim it — return
+            // false so downstream provider-specific dispatchers
+            // get a chance.
+            return false;
+        }
+        _ => return false,
+    }
+    true
+}
+
+/// Build a (line, point) pair for the trace diagnostics. The user
+/// supplies the line as everything-after-the-binary (e.g.
+/// `"query up{"`); we prepend the binary name + a separating space
+/// so `split_line`'s "drop first token" assumption holds and the
+/// engine sees the same shape it would from a real bash invocation.
+fn synth_line_for_trace(app_name: &str, rest: &[&str]) -> (String, usize) {
+    let user_line = rest.first().copied().unwrap_or("");
+    let user_point: usize = rest.get(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(user_line.len());
+    let prefix_len = app_name.len() + 1; // "metricsql "
+    (
+        format!("{} {}", app_name, user_line),
+        user_point + prefix_len,
+    )
+}
+
+/// Pretty-print the engine's view of a `PartialParse` for the
+/// `---trace-partial-parse` and downstream provider diagnostic
+/// flags. Public so provider-specific diagnostic dispatchers
+/// (e.g. [`crate::providers::metricsql_diagnostic_args`]) can reuse
+/// the same output format.
+pub fn print_partial_parse_for_diagnostics(pp: &PartialParse) {
+    print_partial_parse(pp);
+}
+
+fn dump_tree(node: &Node, path: &mut Vec<String>) {
+    let path_str = if path.is_empty() { "/".to_string() } else { format!("/{}", path.join("/")) };
+    let category = node.category().unwrap_or("");
+    let level = node.level();
+    println!("{path_str}  level={level}  category={category}  flags={:?}  has_subtree_provider={}  has_extras={}",
+             node.flags(),
+             node.subtree_provider().is_some(),
+             node.extras().is_some());
+    for (name, child) in node.children() {
+        path.push(name.clone());
+        dump_tree(child, path);
+        path.pop();
+    }
+}
+
+fn list_providers(node: &Node, path: &mut Vec<String>) {
+    if node.subtree_provider().is_some() {
+        let p = if path.is_empty() { "/".to_string() } else { format!("/{}", path.join("/")) };
+        println!("{p}");
+    }
+    for (name, child) in node.children() {
+        path.push(name.clone());
+        list_providers(child, path);
+        path.pop();
+    }
+}
+
+fn print_partial_parse(pp: &PartialParse) {
+    println!("raw_line:              {:?}", pp.raw_line);
+    println!("cursor_offset:         {}", pp.cursor_offset);
+    println!("completed:             {:?}", pp.completed);
+    println!("partial:               {:?}", pp.partial);
+    println!("tree_path:             {:?}", pp.tree_path);
+    println!("before_cursor():       {:?}", pp.before_cursor());
+    println!("after_cursor():        {:?}", pp.after_cursor());
+    println!("ident_before_cursor(): {:?}", pp.ident_before_cursor());
+    println!("trigger_char():        {:?}", pp.trigger_char());
+    let bs = pp.bracket_state();
+    println!("bracket_state:         paren={}  brace={}  bracket={}  inside_quote={:?}",
+             bs.paren, bs.brace, bs.bracket, bs.inside_quote);
+    println!("shell_word_start():    {}", pp.shell_word_start());
+    println!("shell_current_word():  {:?}", pp.shell_current_word());
+}
+
 pub fn handle_complete_env(app_name: &str, tree: &CommandTree) -> bool {
     let env_var = format!("_{}_COMPLETE", app_name.to_uppercase().replace('-', "_"));
     let is_ours = std::env::var(&env_var).ok().as_deref() == Some("bash");
@@ -1906,14 +2269,29 @@ pub fn handle_complete_env(app_name: &str, tree: &CommandTree) -> bool {
         &[]
     };
     let mut max_node = &tree.root;
+    let mut path_has_subtree_provider = max_node.subtree_provider().is_some();
     for &word in completed_for_max {
         if let Some(child) = max_node.child(word) {
             max_node = child;
+            if max_node.subtree_provider().is_some() {
+                path_has_subtree_provider = true;
+            }
         } else {
             break;
         }
     }
-    let max_level = max_level_of_children(max_node).max(1);
+    // When a subtree provider is on the resolved path, the provider
+    // owns its own layered output — but the cadence rule still
+    // gates rapid-tap advancement. The leaf node alone has
+    // max_level_of_children == 1, which would clamp tap_count to 1
+    // forever. Bump the cap so providers that layer their output
+    // by tap (e.g. metricsql tap 1 = metric names, tap 2 = + inner
+    // functions) actually get a tap_count > 1 on rapid follow-ups.
+    let max_level = if path_has_subtree_provider {
+        SUBTREE_PROVIDER_MAX_TAPS
+    } else {
+        max_level_of_children(max_node).max(1)
+    };
     let tap_count = tap_detect(app_name, &input_key, max_level);
 
     // Rotating-tier completion with cumulative supersets:
@@ -1943,6 +2321,15 @@ pub fn handle_complete_env(app_name: &str, tree: &CommandTree) -> bool {
 /// tap starts fresh at layer 1. Exposed so embedders can mention or
 /// match the same value in their own UX.
 pub const TAP_ADVANCE_MS: u128 = 200;
+
+/// Cap on rapid-tap advancement when the resolved completion path
+/// includes a [`SubtreeProvider`]. The provider owns its candidate
+/// output and may layer it by tap (e.g. tap 1 = primary set, tap 2
+/// = primary + secondary), so the engine can't infer a meaningful
+/// max from tree shape alone. This constant defines how many tap
+/// tiers the engine will surface to a provider before the cadence
+/// rule resets back to tap 1.
+pub const SUBTREE_PROVIDER_MAX_TAPS: u32 = 3;
 
 /// Persistable tap state — the bytes a driver would write between
 /// tap events. Two fields: the wall-clock ms at which the tap
@@ -2034,12 +2421,41 @@ pub fn next_tap_state(
 /// Embedders that want different storage (in-memory map, custom
 /// path, sandboxed tempdir for tests) should call [`next_tap_state`]
 /// directly and persist the returned [`TapState`] themselves.
+/// Parent process PID, via `getppid(2)` on unix. Returns `None`
+/// on platforms without a direct syscall — callers fall back to
+/// the `_COMP_SHELL_PID` / `PPID` env vars in that case.
+fn parent_process_id() -> Option<i64> {
+    #[cfg(unix)]
+    {
+        // SAFETY: `getppid` is a thread-safe, side-effect-free
+        // syscall that returns a `pid_t` (i32 on Linux). Always
+        // safe to call.
+        unsafe extern "C" {
+            fn getppid() -> i32;
+        }
+        let pid = unsafe { getppid() };
+        Some(pid as i64)
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
 fn tap_detect(app_name: &str, input_key: &str, max_level: u32) -> u32 {
     use std::io::Write;
 
-    let ppid = std::env::var("_COMP_SHELL_PID")
-        .or_else(|_| std::env::var("PPID"))
-        .unwrap_or_else(|_| "0".to_string());
+    // Scope the tap-state file by the parent process PID — i.e.,
+    // the shell that invoked us. We get this directly from
+    // `getppid()` rather than asking the shell hook to plumb it in
+    // via an env var; that keeps the bash hook a strict one-liner.
+    // Falls back to the env var (or "0") on platforms without a
+    // syscall, so the cross-platform ladder still works.
+    let ppid: String = parent_process_id()
+        .map(|p| p.to_string())
+        .or_else(|| std::env::var("_COMP_SHELL_PID").ok())
+        .or_else(|| std::env::var("PPID").ok())
+        .unwrap_or_else(|| "0".to_string());
     let tap_file = std::path::PathBuf::from(format!("/tmp/.{}_tap_{}", app_name, ppid));
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -3055,6 +3471,30 @@ mod tests {
         // Cursor inside the metrics subtree.
         let out = complete(&tree, &["app", "metrics", "match", "foo"]);
         assert_eq!(out, vec!["metrics/match:foo".to_string()]);
+    }
+
+    #[test]
+    fn rapid_tap_threads_full_count_through_subtree_provider() {
+        // Regression: when a node on the resolved path carries a
+        // SubtreeProvider, complete_rotating_with_raw must bypass
+        // the modulo-by-max-children rotation and pass the FULL
+        // tap_count to the provider — otherwise providers that
+        // layer their output by tap (metricsql shows metric names
+        // at tap 1, adds inner functions at tap 2) never see anything
+        // beyond tap 1.
+        let provider: SubtreeProvider = std::sync::Arc::new(|pp: &PartialParse| {
+            vec![format!("tap={}", pp.tap_count)]
+        });
+        let tree = CommandTree::new("app")
+            .command("query",
+                Node::leaf(&[]).with_subtree_provider(provider));
+
+        let words = ["app", "query", ""];
+        for tap in [1u32, 2, 3, 7] {
+            let out = complete_rotating_with_raw(&tree, &words, tap, "app query ", 10);
+            assert_eq!(out, vec![format!("tap={}", tap)],
+                "tap_count {tap} did not reach the subtree provider: {out:?}");
+        }
     }
 
     // ---- TODO item 8: extras attachment ----------------------------

@@ -36,11 +36,11 @@ use std::sync::Arc;
 
 use veks_completion::{
     CommandTree, Node,
-    handle_complete_env, print_bash_script,
+    handle_complete_env, handle_diagnostic_args, print_bash_script,
     parse_argv, render_usage,
     PartialParse, complete_at_tap_with_raw,
 };
-use veks_completion::providers::MetricsqlCatalog;
+use veks_completion::providers::{MetricsqlCatalog, metricsql_diagnostic_args};
 
 // ---------------------------------------------------------------------
 // Step 1: implement the site-specific data the completer needs.
@@ -174,6 +174,26 @@ fn main() {
     // (1) Completion callback. When this returns true, bash
     // captured the candidate output; we exit silently.
     if handle_complete_env("metricsql", &tree) {
+        return;
+    }
+
+    // (1b) `---*` engine diagnostics. Available to every adopter:
+    //   metricsql ---help
+    //   metricsql ---dump-tree
+    //   metricsql ---list-providers
+    //   metricsql ---validate
+    //   metricsql ---trace-completion 'query up{' 9
+    //   metricsql ---trace-partial-parse 'query up{job=' 13
+    if handle_diagnostic_args("metricsql", &tree) {
+        return;
+    }
+
+    // (1c) `---*` provider-specific diagnostics. Each provider
+    // exposes its own dispatcher; embedders call the ones they've
+    // attached:
+    //   metricsql ---metricsql-vocab
+    //   metricsql ---metricsql-context 'query up{job=' 13
+    if metricsql_diagnostic_args("metricsql") {
         return;
     }
 
@@ -333,6 +353,7 @@ fn run_demo(tree: &CommandTree) {
         tree_path: vec!["query"],
         raw_line: raw,
         cursor_offset: cursor,
+        tap_count: 1,
     };
     println!("raw_line:           {:?}", pp.raw_line);
     println!("cursor_offset:      {}", pp.cursor_offset);
