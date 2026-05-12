@@ -447,124 +447,85 @@ impl DSProfileGroup {
     pub fn derive_views_from_templates(&mut self, templates: &[crate::dataset::pipeline::StepDef]) {
         use super::source::{DSSource, DSWindow};
 
-        // Collect bare output filenames from per_profile templates,
-        // paired with the template's command name for facet-scope filtering.
-        // Skip cache outputs and variable-interpolated names — these are
-        // intermediate artifacts, not dataset views.
-        let template_outputs: Vec<(String, String)> = templates
-            .iter()
-            .filter(|s| s.per_profile)
-            .flat_map(|s| {
-                let cmd = s.run.clone();
-                s.output_paths().into_iter().map(move |p| (p, cmd.clone()))
-            })
-            .filter(|(p, _)| !p.contains("${cache}") && !p.contains("${profile_name}"))
-            .map(|(p, cmd)| {
-                let cleaned = p.strip_prefix("${profile_dir}")
-                    .unwrap_or(&p)
-                    .to_string();
-                (cleaned, cmd)
-            })
-            .collect();
-
-        if template_outputs.is_empty() {
+        let per_profile_templates: Vec<&crate::dataset::pipeline::StepDef> =
+            templates.iter().filter(|s| s.per_profile).collect();
+        if per_profile_templates.is_empty() {
             return;
         }
 
         for (name, profile) in self.profiles.iter_mut() {
-            // Skip profiles without base_count (except default)
+            // Skip non-default profiles without a `base_count` — they
+            // aren't sized or partition profiles, so per-profile
+            // outputs don't apply.
             if name != "default" && profile.base_count.is_none() {
                 continue;
             }
 
             let profile_dir = format!("profiles/{}/", name);
 
-            for (filename, _cmd) in &template_outputs {
-                // Derive the view key from the filename stem
-                let path = std::path::Path::new(filename);
-                let stem = match path.file_stem().and_then(|s| s.to_str()) {
-                    Some(s) => s.to_string(),
-                    None => continue,
-                };
+            for template in &per_profile_templates {
+                let template_id = template.effective_id();
 
-                // Don't override explicitly declared views
-                if profile.views.contains_key(&stem) {
+                // Mirror the expander's filter (see
+                // `expand_per_profile_steps_scoped`): templates with
+                // `partition` in the ID only run for partition
+                // profiles. Without this filter, the default
+                // profile auto-acquired views like
+                // `profiles/default/neighbor_distances.fvec`
+                // pointing at files `compute-knn-partition` never
+                // wrote — the sift1m 403 bug.
+                if !profile.partition && template_id.contains("partition") {
                     continue;
                 }
 
-                // Non-default profiles with a `base_count` (sized or
-                // partition) always reference their own profile dir for
-                // per-profile outputs. `bc` is consulted only to gate
-                // the branch — the exact count doesn't drive path
-                // construction any more.
-                if name != "default" {
-                    if profile.base_count.is_some() {
-                        if profile.partition {
-                            // Partition profiles only get views for facets
-                            // in their scope (default BQG). Skip metadata,
-                            // filtered KNN, and predicate views.
-                            let is_knn_view = stem == "neighbor_indices"
-                                || stem == "neighbor_distances";
-                            if !is_knn_view {
-                                continue;
-                            }
-
-                            // Partition profile: KNN outputs are in the
-                            // profile's own directory
-                            let resolved_path = format!("{}{}", profile_dir, filename);
-                            profile.views.insert(
-                                stem,
-                                DSView {
-                                    source: DSSource {
-                                        path: resolved_path,
-                                        namespace: None,
-                                        window: DSWindow::default(),
-                                    },
-                                    window: None,
-                                },
-                            );
-                        } else {
-                            // Sized subset profile: outputs live in the
-                            // profile's own directory. The earlier
-                            // "window into default's file" model was
-                            // incorrect — you can't derive a sized-range
-                            // top-K by windowing a full-range top-K (the
-                            // top-N nearest neighbours of the full base
-                            // generally aren't inside the [0..N) prefix).
-                            // compute-knn actually writes per-profile
-                            // files at `profiles/{name}/{filename}`, and
-                            // verify-knn reads them from the same place.
-                            let resolved_path = format!("{}{}", profile_dir, filename);
-                            profile.views.insert(
-                                stem,
-                                DSView {
-                                    source: DSSource {
-                                        path: resolved_path,
-                                        namespace: None,
-                                        window: DSWindow::default(),
-                                    },
-                                    window: None,
-                                },
-                            );
-                        }
+                for filename in template.output_paths() {
+                    if filename.contains("${cache}") || filename.contains("${profile_name}") {
                         continue;
                     }
-                }
+                    let filename = filename.strip_prefix("${profile_dir}")
+                        .unwrap_or(&filename)
+                        .to_string();
 
-                // Default profile or profiles without base_count: use direct path
-                let resolved_path = format!("{}{}", profile_dir, filename);
+                    // Derive the view key from the filename stem
+                    let path = std::path::Path::new(&filename);
+                    let stem = match path.file_stem().and_then(|s| s.to_str()) {
+                        Some(s) => s.to_string(),
+                        None => continue,
+                    };
 
-                profile.views.insert(
-                    stem,
-                    DSView {
-                        source: DSSource {
-                            path: resolved_path,
-                            namespace: None,
-                            window: Default::default(),
+                    // Don't override explicitly declared views
+                    if profile.views.contains_key(&stem) {
+                        continue;
+                    }
+
+                    if profile.partition {
+                        // Partition profiles only get views for facets
+                        // in their scope (default BQG). Skip metadata,
+                        // filtered KNN, and predicate views.
+                        let is_knn_view = stem == "neighbor_indices"
+                            || stem == "neighbor_distances";
+                        if !is_knn_view {
+                            continue;
+                        }
+                    }
+
+                    // Per-profile outputs live in the profile's own
+                    // directory. For default this is `profiles/default/`
+                    // — the actual path `compute-filtered-knn` and
+                    // friends write to.
+                    let resolved_path = format!("{}{}", profile_dir, filename);
+                    profile.views.insert(
+                        stem,
+                        DSView {
+                            source: DSSource {
+                                path: resolved_path,
+                                namespace: None,
+                                window: DSWindow::default(),
+                            },
+                            window: None,
                         },
-                        window: None,
-                    },
-                );
+                    );
+                }
             }
         }
     }
@@ -2254,7 +2215,12 @@ default:
         ];
         profiles.derive_views_from_templates(&templates);
 
-        // Default gets auto-derived views
+        // Default gets auto-derived views from per_profile templates
+        // whose IDs don't contain "partition" (those would be
+        // partition-only templates that the expander skips for
+        // default). The bug we previously hit was specific to
+        // partition-named templates being applied to default; see
+        // `test_default_profile_does_not_auto_inject_missing_facets`.
         let pdef = profiles.profile("default").unwrap();
         assert_eq!(
             pdef.view("base_vectors").unwrap().path(),
@@ -2286,6 +2252,103 @@ default:
         assert!(p10.view("neighbor_indices").unwrap().source.window.is_empty());
         // Inherited shared view unchanged
         assert_eq!(p10.view("query_vectors").unwrap().path(), "query.mvec");
+    }
+
+    /// Reproduces the sift1m shape: `compute-knn-partition` is a
+    /// partition-only template (the expander skips it for default
+    /// because the step ID contains "partition") but its outputs
+    /// (`neighbor_indices`, `neighbor_distances`) used to get
+    /// auto-injected into default's view manifest anyway — pointing
+    /// at `profiles/default/<file>` paths that the pipeline never
+    /// writes. Clients then 403/404'd at fetch.
+    ///
+    /// Meanwhile `compute-filtered-knn` is also `per_profile: true`
+    /// but it does NOT have "partition" in its ID and the pipeline
+    /// DOES run it for default, writing real files at
+    /// `profiles/default/filtered_neighbor_*`. Those views must
+    /// still be auto-derived — the fix is to mirror the expander's
+    /// per-template filtering, not to skip default entirely.
+    #[test]
+    fn test_default_profile_does_not_auto_inject_missing_facets() {
+        use crate::dataset::pipeline::StepDef;
+        use indexmap::IndexMap;
+
+        let yaml = r#"
+default:
+  maxk: 100
+  base_vectors: profiles/base/base_vectors.fvec
+  query_vectors: profiles/base/query_vectors.fvec
+  neighbor_indices: profiles/base/neighbor_indices.ivec
+label_00:
+  maxk: 100
+  base_count: 82993
+  partition: true
+"#;
+        let mut profiles: DSProfileGroup = serde_yaml::from_str(yaml).unwrap();
+
+        // (1) Partition-only template — must NOT contribute views to default.
+        let mut opts_partition = IndexMap::new();
+        opts_partition.insert("indices".to_string(),
+            serde_yaml::Value::String("neighbor_indices.ivec".to_string()));
+        opts_partition.insert("distances".to_string(),
+            serde_yaml::Value::String("neighbor_distances.fvec".to_string()));
+        let partition_template = StepDef {
+            id: Some("compute-knn-partition".to_string()),
+            run: "compute knn".to_string(),
+            description: None,
+            after: vec![],
+            profiles: vec![],
+            per_profile: true,
+            phase: 0,
+            finalize: false,
+            on_partial: crate::dataset::pipeline::OnPartial::default(),
+            options: opts_partition,
+        };
+
+        // (2) Non-partition template — IS run for default and so its
+        // outputs SHOULD become auto-derived views on default.
+        let mut opts_filtered = IndexMap::new();
+        opts_filtered.insert("indices".to_string(),
+            serde_yaml::Value::String("filtered_neighbor_indices.ivec".to_string()));
+        opts_filtered.insert("distances".to_string(),
+            serde_yaml::Value::String("filtered_neighbor_distances.fvec".to_string()));
+        let filtered_template = StepDef {
+            id: Some("compute-filtered-knn".to_string()),
+            run: "compute filtered-knn".to_string(),
+            description: None,
+            after: vec![],
+            profiles: vec![],
+            per_profile: true,
+            phase: 0,
+            finalize: false,
+            on_partial: crate::dataset::pipeline::OnPartial::default(),
+            options: opts_filtered,
+        };
+
+        profiles.derive_views_from_templates(&[partition_template, filtered_template]);
+
+        let pdef = profiles.profile("default").unwrap();
+        // Explicit view preserved.
+        assert_eq!(pdef.view("neighbor_indices").unwrap().path(),
+            "profiles/base/neighbor_indices.ivec");
+        // (1) Partition-template output must NOT appear on default.
+        assert!(pdef.view("neighbor_distances").is_none(),
+            "default must not auto-inject neighbor_distances when only \
+             a partition-only template produces it");
+        // (2) Non-partition template outputs DO appear on default —
+        // these files actually exist at profiles/default/.
+        assert_eq!(pdef.view("filtered_neighbor_indices").unwrap().path(),
+            "profiles/default/filtered_neighbor_indices.ivec");
+        assert_eq!(pdef.view("filtered_neighbor_distances").unwrap().path(),
+            "profiles/default/filtered_neighbor_distances.fvec");
+
+        // Partition profile still gets the per-profile path for the
+        // partition template's outputs.
+        let label_00 = profiles.profile("label_00").unwrap();
+        assert_eq!(label_00.view("neighbor_indices").unwrap().path(),
+            "profiles/label_00/neighbor_indices.ivec");
+        assert_eq!(label_00.view("neighbor_distances").unwrap().path(),
+            "profiles/label_00/neighbor_distances.fvec");
     }
 
     #[test]

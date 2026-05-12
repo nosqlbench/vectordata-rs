@@ -217,6 +217,150 @@ fn extract_json_string(content: &str, key: &str) -> Option<String> {
     None
 }
 
+// ─── Targeted prune ─────────────────────────────────────────────────
+
+/// Filter for [`prune_by_filter`]: blobs match when *both* fields
+/// (if set) match the entry's extracted dataset and profile names.
+#[derive(Debug, Default, Clone)]
+pub struct PruneFilter {
+    /// Glob pattern (with `*`/`?`) matched against the dataset name
+    /// extracted from the entry's origin URL.
+    pub dataset: Option<String>,
+    /// Glob pattern matched against the profile name extracted from
+    /// the entry's origin URL.
+    pub profile: Option<String>,
+}
+
+impl PruneFilter {
+    /// True when at least one filter dimension is set. Callers
+    /// should refuse to prune with an empty filter — that would
+    /// nuke the entire cache, which is what `prune-legacy` exists
+    /// for in a more deliberate form.
+    pub fn is_empty(&self) -> bool {
+        self.dataset.is_none() && self.profile.is_none()
+    }
+}
+
+/// Summary returned by [`prune_by_filter`]. Reports both what
+/// matched and what was actually removed so dry-run callers can
+/// preview without performing the deletion.
+#[derive(Debug, Default)]
+pub struct PruneReport {
+    /// Entries whose extracted dataset/profile matched the filter.
+    pub matched: Vec<CacheEntry>,
+    /// Subset of `matched` that were successfully deleted (empty
+    /// for `dry_run=true`).
+    pub removed: Vec<CacheEntry>,
+    /// Total on-disk bytes across `removed`.
+    pub bytes_freed: u64,
+}
+
+/// Walk `cache_root` and remove every content-addressed / URL-keyed
+/// cache entry whose origin URL matches `filter`. The matcher
+/// extracts the dataset name and profile name from the URL path —
+/// the standard published shape is
+/// `…/<dataset>/profiles/<profile>/<file>` — and runs a `*`/`?`
+/// glob against each.
+///
+/// Entries with no `origin.json` sidecar, or where the URL doesn't
+/// fit the expected shape, are *not* pruned regardless of filter —
+/// "unknown origin" is treated conservatively.
+///
+/// Pass `dry_run=true` to preview which entries would be removed.
+pub fn prune_by_filter(
+    cache_root: &Path,
+    filter: &PruneFilter,
+    dry_run: bool,
+) -> io::Result<PruneReport> {
+    let listing = list_entries(cache_root)?;
+    let mut report = PruneReport::default();
+
+    let candidates: Vec<&CacheEntry> = listing.blobs.iter()
+        .chain(listing.http.iter())
+        .collect();
+
+    for entry in candidates {
+        if !entry_matches_filter(entry, filter) { continue; }
+        report.matched.push(entry.clone());
+        if !dry_run {
+            match fs::remove_dir_all(&entry.path) {
+                Ok(()) => {
+                    report.bytes_freed += entry.size_bytes;
+                    report.removed.push(entry.clone());
+                }
+                Err(e) => {
+                    eprintln!("warning: failed to remove {}: {}",
+                        entry.path.display(), e);
+                }
+            }
+        }
+    }
+    Ok(report)
+}
+
+fn entry_matches_filter(entry: &CacheEntry, filter: &PruneFilter) -> bool {
+    // No URL → don't match. The user can't reason about it via the
+    // filter anyway, and we don't want to nuke things we can't
+    // describe.
+    let Some(url) = entry.origin_url.as_deref() else { return false; };
+    let (dataset, profile) = extract_dataset_profile(url);
+    if let Some(pat) = &filter.dataset {
+        let Some(name) = dataset.as_deref() else { return false; };
+        if !glob_match(pat, name) { return false; }
+    }
+    if let Some(pat) = &filter.profile {
+        let Some(name) = profile.as_deref() else { return false; };
+        if !glob_match(pat, name) { return false; }
+    }
+    true
+}
+
+/// Pull `(dataset_name, profile_name)` out of an origin URL.
+///
+/// Recognises the canonical published shape
+/// `…/<dataset>/profiles/<profile>/<file>` — dataset is the path
+/// segment immediately preceding `profiles`, profile is the segment
+/// immediately following it.
+///
+/// Falls back to `(<parent-dir>, None)` for URLs that don't carry a
+/// `profiles` segment — the parent directory in the URL path is
+/// typically the dataset name (e.g. `…/sift1m/dataset.yaml`).
+fn extract_dataset_profile(url: &str) -> (Option<String>, Option<String>) {
+    let parsed = match Url::parse(url) { Ok(u) => u, Err(_) => return (None, None) };
+    let segments: Vec<&str> = match parsed.path_segments() {
+        Some(it) => it.filter(|s| !s.is_empty()).collect(),
+        None => return (None, None),
+    };
+    if let Some(idx) = segments.iter().position(|s| *s == "profiles") {
+        let dataset = if idx > 0 { Some(segments[idx - 1].to_string()) } else { None };
+        let profile = segments.get(idx + 1).map(|s| s.to_string());
+        return (dataset, profile);
+    }
+    if segments.len() >= 2 {
+        (Some(segments[segments.len() - 2].to_string()), None)
+    } else {
+        (None, None)
+    }
+}
+
+/// Minimal glob matcher supporting `*` (any run of characters) and
+/// `?` (one character). Bare strings (no wildcards) match exactly.
+/// Used by [`prune_by_filter`]; intentionally not exposed publicly
+/// to keep the crate's surface focused.
+fn glob_match(pattern: &str, text: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    fn inner(p: &[char], t: &[char], pi: usize, ti: usize) -> bool {
+        if pi == p.len() { return ti == t.len(); }
+        match p[pi] {
+            '*' => (ti..=t.len()).any(|i| inner(p, t, pi + 1, i)),
+            '?' => ti < t.len() && inner(p, t, pi + 1, ti + 1),
+            c   => ti < t.len() && t[ti] == c && inner(p, t, pi + 1, ti + 1),
+        }
+    }
+    inner(&p, &t, 0, 0)
+}
+
 /// Match an old-layout top-level cache-dir name (`<host>` or
 /// `<host>:<port>`) so the legacy-prune utility can delete them. We
 /// intentionally accept only the shapes that the old code emitted —
@@ -535,6 +679,133 @@ mod tests {
         assert!(!is_legacy_layout_name("ibm-datapile-1b"));
         // Anything with a slash isn't a top-level dir name anyway.
         assert!(!is_legacy_layout_name(""));
+    }
+
+    #[test]
+    fn extract_dataset_profile_canonical_shape() {
+        let (d, p) = extract_dataset_profile(
+            "https://example.com/path/sift1m/profiles/default/base.fvec");
+        assert_eq!(d.as_deref(), Some("sift1m"));
+        assert_eq!(p.as_deref(), Some("default"));
+    }
+
+    #[test]
+    fn extract_dataset_profile_partition_profile() {
+        let (d, p) = extract_dataset_profile(
+            "https://example.com/path/sift1m/profiles/label_03/neighbor_indices.ivecs");
+        assert_eq!(d.as_deref(), Some("sift1m"));
+        assert_eq!(p.as_deref(), Some("label_03"));
+    }
+
+    #[test]
+    fn extract_dataset_profile_no_profiles_segment() {
+        let (d, p) = extract_dataset_profile(
+            "https://example.com/path/sift1m/dataset.yaml");
+        assert_eq!(d.as_deref(), Some("sift1m"));
+        assert!(p.is_none());
+    }
+
+    #[test]
+    fn glob_match_basic_patterns() {
+        assert!(glob_match("sift1m", "sift1m"));
+        assert!(!glob_match("sift1m", "sift1m-2"));
+        assert!(glob_match("sift*", "sift1m"));
+        assert!(glob_match("*1m", "sift1m"));
+        assert!(glob_match("sift?m", "sift1m"));
+        assert!(!glob_match("sift?m", "sift10m"));
+        assert!(glob_match("label_*", "label_03"));
+        assert!(!glob_match("label_*", "default"));
+        assert!(glob_match("*", "anything"));
+    }
+
+    #[test]
+    fn prune_filter_matches_dataset_and_profile() {
+        let entry = CacheEntry {
+            path: PathBuf::from("/cache/blobs/aa/abc/data"),
+            size_bytes: 1024,
+            file_count: 1,
+            origin_url: Some(
+                "https://example.com/p/sift1m/profiles/default/file.fvec".into()),
+            origin_host: Some("example.com".into()),
+        };
+        // dataset-only filter matches
+        assert!(entry_matches_filter(&entry, &PruneFilter {
+            dataset: Some("sift*".into()), profile: None }));
+        // profile-only filter matches
+        assert!(entry_matches_filter(&entry, &PruneFilter {
+            dataset: None, profile: Some("default".into()) }));
+        // both, both match
+        assert!(entry_matches_filter(&entry, &PruneFilter {
+            dataset: Some("sift1m".into()),
+            profile: Some("def*".into()) }));
+        // both, dataset mismatches
+        assert!(!entry_matches_filter(&entry, &PruneFilter {
+            dataset: Some("ibm-*".into()),
+            profile: Some("default".into()) }));
+        // both, profile mismatches
+        assert!(!entry_matches_filter(&entry, &PruneFilter {
+            dataset: Some("sift1m".into()),
+            profile: Some("label_*".into()) }));
+    }
+
+    #[test]
+    fn prune_filter_rejects_entries_with_no_origin() {
+        let entry = CacheEntry {
+            path: PathBuf::from("/cache/blobs/aa/abc/data"),
+            size_bytes: 1024, file_count: 1,
+            origin_url: None, origin_host: None,
+        };
+        assert!(!entry_matches_filter(&entry, &PruneFilter {
+            dataset: Some("*".into()), profile: None }));
+    }
+
+    #[test]
+    fn prune_by_filter_dry_run_lists_matches_without_removal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // Two blobs: one matches, one doesn't.
+        let blob1 = root.join("blobs/aa/aabbcc/");
+        let blob2 = root.join("blobs/bb/bbccdd/");
+        fs::create_dir_all(&blob1).unwrap();
+        fs::create_dir_all(&blob2).unwrap();
+        fs::write(blob1.join("data"), b"yes").unwrap();
+        fs::write(blob2.join("data"), b"no").unwrap();
+        let url1 = Url::parse("https://h/p/sift1m/profiles/default/base.fvec").unwrap();
+        let url2 = Url::parse("https://h/p/glove/profiles/default/base.fvec").unwrap();
+        write_origin(&blob1, &url1).unwrap();
+        write_origin(&blob2, &url2).unwrap();
+
+        let report = prune_by_filter(root,
+            &PruneFilter { dataset: Some("sift*".into()), profile: None },
+            true).unwrap();
+        assert_eq!(report.matched.len(), 1);
+        assert_eq!(report.removed.len(), 0, "dry-run must not delete");
+        assert!(blob1.exists() && blob2.exists());
+    }
+
+    #[test]
+    fn prune_by_filter_removes_matching_blobs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let blob1 = root.join("blobs/aa/aabbcc/");
+        let blob2 = root.join("blobs/bb/bbccdd/");
+        fs::create_dir_all(&blob1).unwrap();
+        fs::create_dir_all(&blob2).unwrap();
+        fs::write(blob1.join("data"), b"yes").unwrap();
+        fs::write(blob2.join("data"), b"no").unwrap();
+        write_origin(&blob1, &Url::parse(
+            "https://h/p/sift1m/profiles/label_00/base.fvec").unwrap()).unwrap();
+        write_origin(&blob2, &Url::parse(
+            "https://h/p/sift1m/profiles/default/base.fvec").unwrap()).unwrap();
+
+        let report = prune_by_filter(root,
+            &PruneFilter { dataset: Some("sift1m".into()),
+                profile: Some("label_*".into()) },
+            false).unwrap();
+        assert_eq!(report.matched.len(), 1);
+        assert_eq!(report.removed.len(), 1);
+        assert!(!blob1.exists(), "matched blob must be removed");
+        assert!(blob2.exists(),  "non-matched blob must be preserved");
     }
 
     #[test]

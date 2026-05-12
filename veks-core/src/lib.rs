@@ -11,6 +11,7 @@
 
 pub mod filters;
 pub mod formats;
+pub mod legacy_sweep;
 pub mod paths;
 pub mod term;
 pub mod ui;

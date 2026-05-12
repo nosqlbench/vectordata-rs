@@ -225,42 +225,80 @@ pub trait TestDataView: Send + Sync {
     /// so this trait remains dyn-compatible (consumers receive
     /// `Arc<dyn TestDataView>` from the catalog API).
     fn prebuffer_all_with_progress(&self, cb: &mut dyn FnMut(&str, &PrebufferProgress)) -> Result<()> {
+        use std::cell::{Cell, RefCell};
         for (name, _desc) in self.facet_manifest() {
             // Skip facets with unrecognised extensions (e.g., layout
             // sidecars) — they're not data facets the typed reader
             // API would touch.
             if self.facet_element_type(&name).is_err() { continue; }
 
+            // Pre-open notification: the renderer flips to this
+            // facet's status line *before* `open_facet_storage`
+            // fetches the `.mref`. Without this, the meter shows
+            // the previous facet's last frame for the whole
+            // inter-facet network round trip — which feels stuck
+            // when there are many small facets.
+            {
+                let p = PrebufferProgress {
+                    verified_chunks: 0,
+                    total_chunks: 0,
+                    verified_bytes: 0,
+                    total_bytes: 0,
+                };
+                cb(&name, &p);
+            }
+
             let storage = self.open_facet_storage(&name)
                 .map_err(|e| Error::Other(format!("open '{name}' for prebuffer: {e}")))?;
 
-            // Capture the latest progress snapshot from the inner
-            // callback. The inner callback only fires when there
-            // was actual download work; for facets that were
-            // already complete (local mmap, or cache hot from a
-            // prior run) the inner cb never fires. We still want
-            // the per-facet outer cb to announce the facet as
-            // resident.
-            let snap = std::cell::RefCell::new(None::<PrebufferProgress>);
+            // Post-open notification with the known total size, so
+            // the renderer can show "0 / N MiB" instead of "0 / 0"
+            // for the brief window before the first chunk lands.
+            {
+                let p = PrebufferProgress {
+                    verified_chunks: 0,
+                    total_chunks: 0,
+                    verified_bytes: 0,
+                    total_bytes: storage.total_size(),
+                };
+                cb(&name, &p);
+            }
+
+            // Forward each chunk-level update into the user
+            // callback so consumers can render a live progress
+            // meter, not just a once-per-facet "done" event. The
+            // RefCell holds a reborrow of `cb` so we can also call
+            // `cb` again after the storage call returns (for
+            // already-resident facets that fired no inner updates).
+            let cb_cell: RefCell<&mut dyn FnMut(&str, &PrebufferProgress)>
+                = RefCell::new(&mut *cb);
+            let fired = Cell::new(false);
+            let name_str = name.to_string();
             storage.prebuffer_with_progress(|p| {
-                *snap.borrow_mut() = Some(PrebufferProgress {
+                let progress = PrebufferProgress {
                     verified_chunks: p.completed_chunks(),
                     total_chunks: p.total_chunks(),
                     verified_bytes: p.downloaded_bytes(),
                     total_bytes: p.total_bytes(),
-                });
+                };
+                (cb_cell.borrow_mut())(&name_str, &progress);
+                fired.set(true);
             }).map_err(|e| Error::Other(format!("prebuffer '{name}': {e}")))?;
 
-            // Always fire the outer callback once per facet so
+            // For facets that fired no chunk updates (local mmap,
+            // cache already complete) emit one synthetic event so
             // consumers can rely on "every declared facet was
             // visited and is resident".
-            let progress = snap.into_inner().unwrap_or(PrebufferProgress {
-                verified_chunks: 0,
-                total_chunks: 0,
-                verified_bytes: 0,
-                total_bytes: storage.total_size(),
-            });
-            cb(&name, &progress);
+            if !fired.get() {
+                let total = storage.total_size();
+                let progress = PrebufferProgress {
+                    verified_chunks: 0,
+                    total_chunks: 0,
+                    verified_bytes: total,
+                    total_bytes: total,
+                };
+                (cb_cell.borrow_mut())(&name_str, &progress);
+            }
         }
         Ok(())
     }

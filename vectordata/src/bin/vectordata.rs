@@ -21,8 +21,8 @@ use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{CompleteEnv, Shell};
 
 use vectordata::cache_admin::{
-    CacheEntry, CacheListing, is_legacy_layout_name,
-    list_entries, prune_legacy_layout,
+    CacheEntry, CacheListing, PruneFilter, is_legacy_layout_name,
+    list_entries, prune_by_filter, prune_legacy_layout,
 };
 
 #[derive(Parser)]
@@ -43,6 +43,11 @@ enum Cmd {
     Config {
         #[command(subcommand)]
         command: ConfigCmd,
+    },
+    /// Operations on catalog-published datasets.
+    Datasets {
+        #[command(subcommand)]
+        command: DatasetsCmd,
     },
     /// Print or activate tab-completion for the current shell.
     ///
@@ -95,6 +100,56 @@ enum CacheCmd {
         #[arg(long)]
         cache_dir: Option<PathBuf>,
     },
+    /// Remove content-addressed entries by origin dataset/profile.
+    ///
+    /// Walks every blob/http entry, reads its `origin.json` sidecar,
+    /// extracts the dataset name and (when present) profile name
+    /// from the URL path, and removes the entry when both filters
+    /// (if provided) match. Globs use `*` (any run) and `?` (one
+    /// char). At least one of `--dataset` / `--profile` is required
+    /// — an empty filter would nuke the whole cache, which is what
+    /// you would do by deleting `<cache_root>/{blobs,http}/` by
+    /// hand if that's actually what you want.
+    Prune {
+        /// Glob matched against the dataset name segment of each
+        /// entry's origin URL.
+        #[arg(long)]
+        dataset: Option<String>,
+        /// Glob matched against the profile name segment.
+        #[arg(long)]
+        profile: Option<String>,
+        /// Print what would be removed without deleting.
+        #[arg(long)]
+        dry_run: bool,
+        /// Override the configured cache directory.
+        #[arg(long)]
+        cache_dir: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum DatasetsCmd {
+    /// Download and cache every facet of a dataset profile into the
+    /// configured cache directory. Renders a live per-facet +
+    /// aggregate progress meter on stderr.
+    Prebuffer {
+        /// `name[:profile]`, a path to a `dataset.yaml` or its
+        /// containing directory, or an `http(s)://…` URL.
+        spec: String,
+        /// Configuration directory containing `catalogs.yaml`.
+        #[arg(long, default_value = "~/.config/vectordata")]
+        configdir: String,
+        /// Additional catalog directories, file paths, or HTTP URLs.
+        #[arg(long)]
+        catalog: Vec<String>,
+        /// Catalog URLs or paths to use *instead* of configured catalogs.
+        #[arg(long = "at")]
+        at: Vec<String>,
+        /// Override cache directory location (informational; the
+        /// active cache root still comes from `settings.yaml`).
+        #[arg(long)]
+        cache_dir: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -107,8 +162,14 @@ enum ConfigCmd {
     /// Set the cache directory in settings.yaml. Creates the directory
     /// if it doesn't exist. Refuses to overwrite a protected
     /// settings.yaml unless `--force`.
+    ///
+    /// The special value `largest-writable-mount` (alias `auto`)
+    /// auto-resolves to the largest writable mount with `vectordata-cache`
+    /// as a subdir, falling back to `$HOME/.cache/vectordata` when the
+    /// largest mount is the same filesystem as `$HOME`.
     SetCache {
-        /// New cache directory path.
+        /// New cache directory path, or `largest-writable-mount` / `auto`
+        /// to auto-resolve.
         path: PathBuf,
         /// Overwrite existing protected settings.
         #[arg(long)]
@@ -155,7 +216,19 @@ fn main() {
             CacheCmd::PruneLegacy { dry_run, cache_dir } => {
                 cmd_cache_prune_legacy(cache_dir, dry_run)
             }
+            CacheCmd::Prune { dataset, profile, dry_run, cache_dir } => {
+                cmd_cache_prune(cache_dir, dataset, profile, dry_run)
+            }
         },
+        Cmd::Datasets { command } => {
+            let code = match command {
+                DatasetsCmd::Prebuffer { spec, configdir, catalog, at, cache_dir } => {
+                    vectordata::datasets::prebuffer::run(
+                        &spec, &configdir, &catalog, &at, cache_dir.as_deref())
+                }
+            };
+            if code != 0 { std::process::exit(code); }
+        }
         Cmd::Config { command } => {
             let code = match command {
                 ConfigCmd::Show => vectordata::config::show(),
@@ -269,6 +342,49 @@ fn cmd_cache_list(cache_dir: Option<PathBuf>, verbose: bool) {
         Err(e) => { eprintln!("error scanning {}: {}", root.display(), e); std::process::exit(1); }
     };
     print_listing(&root, &listing, verbose);
+}
+
+fn cmd_cache_prune(
+    cache_dir: Option<PathBuf>,
+    dataset: Option<String>,
+    profile: Option<String>,
+    dry_run: bool,
+) {
+    let filter = PruneFilter { dataset, profile };
+    if filter.is_empty() {
+        eprintln!("Refusing to prune with no filter — pass at least one of \
+            --dataset or --profile.");
+        eprintln!("(To wipe the entire content-addressed cache, remove \
+            `<cache_root>/{{blobs,http}}/` by hand.)");
+        std::process::exit(2);
+    }
+    let root = resolve_cache_dir(cache_dir);
+    let report = match prune_by_filter(&root, &filter, dry_run) {
+        Ok(r) => r,
+        Err(e) => { eprintln!("error pruning {}: {}", root.display(), e); std::process::exit(1); }
+    };
+
+    if report.matched.is_empty() {
+        println!("No cache entries match the filter.");
+        return;
+    }
+
+    println!("Cache directory: {}", root.display());
+    let verb = if dry_run { "Would remove" } else { "Removed" };
+    println!("{verb} {} entry/entries, freeing {}:",
+        report.matched.len(),
+        fmt_size(report.matched.iter().map(|e| e.size_bytes).sum::<u64>()));
+    for entry in &report.matched {
+        let rel = entry.path.strip_prefix(&root)
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| entry.path.display().to_string());
+        let origin = entry.origin_url.as_deref().unwrap_or("<unknown origin>");
+        println!("  {:>12}  {origin}", fmt_size(entry.size_bytes));
+        println!("              path: {rel}");
+    }
+    if dry_run {
+        println!("\nRun without --dry-run to delete.");
+    }
 }
 
 fn cmd_cache_prune_legacy(cache_dir: Option<PathBuf>, dry_run: bool) {

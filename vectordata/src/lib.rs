@@ -85,10 +85,18 @@ pub(crate) mod storage;
 /// [`settings::cache_dir`] rather than parsing `settings.yaml`
 /// themselves so the user's override is honored uniformly.
 pub mod settings;
+/// Live mount-table inspection (shared by [`settings`] for the
+/// auto-bootstrap of `cache_dir` and by [`config`] for the
+/// user-facing `list-mounts` command).
+pub mod mounts;
 /// Canonical implementation of the user-facing `config` admin
 /// commands. Both the `vectordata` binary and the `veks` CLI dispatch
 /// here — there is no parallel implementation in either consumer.
 pub mod config;
+/// Canonical implementation of `<binary> datasets …` subcommands.
+/// Both binaries dispatch into this module — there is exactly one
+/// implementation of each command.
+pub mod datasets;
 /// Catalog discovery — find datasets by name from configured sources.
 ///
 /// This is the recommended entry point. Configure catalog sources in
@@ -139,9 +147,9 @@ pub mod group;
 pub mod cache_admin {
     pub use crate::cache::reader::{
         BLOBS_DIR, HTTP_DIR,
-        CacheEntry, CacheListing,
+        CacheEntry, CacheListing, PruneFilter, PruneReport,
         is_legacy_layout_name, is_reserved_layout_name,
-        list_entries, prune_legacy_layout,
+        list_entries, prune_by_filter, prune_legacy_layout,
     };
 }
 

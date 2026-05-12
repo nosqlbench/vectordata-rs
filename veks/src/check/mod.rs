@@ -290,9 +290,27 @@ pub fn run(args: CheckArgs) {
     // Handle --clean-files: remove extraneous publishable files
     if args.clean_files {
         for ds_path in &dataset_files {
-            let extra = extraneous::find_extraneous(ds_path, &publishable);
+            let workspace = ds_path.parent().unwrap_or(std::path::Path::new("."));
+
+            // First pass: legacy singular-extension siblings
+            // (e.g. `base_vectors.fvec` alongside `base_vectors.fvecs`).
+            // Same sweep `veks run` performs at start-of-pipeline.
+            // Idempotent and bounded by the sibling-presence guard.
+            let swept = veks_core::legacy_sweep::sweep(workspace);
+            if swept > 0 {
+                println!("Removed {swept} legacy singular-extension sibling(s).");
+            }
+
+            // Second pass: anything else the manifest doesn't account
+            // for. Re-enumerate publishable files so the list reflects
+            // the post-sweep state — otherwise the cleanup loop tries
+            // to delete files the sweep just took out.
+            let fresh_publishable = crate::publish::enumerate_publishable_files(&directory);
+            let extra = extraneous::find_extraneous(ds_path, &fresh_publishable);
             if extra.is_empty() {
-                println!("No extraneous files to clean.");
+                if swept == 0 {
+                    println!("No extraneous files to clean.");
+                }
             } else {
                 println!();
                 println!("Removing {} extraneous file(s):", extra.len());

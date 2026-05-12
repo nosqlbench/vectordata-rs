@@ -19,6 +19,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+use crate::mounts;
+
 const CONFIG_DIR: &str = ".config/vectordata";
 const SETTINGS_FILE: &str = "settings.yaml";
 
@@ -66,21 +68,44 @@ impl std::fmt::Display for SettingsError {
                 } else {
                     format!("{} does not exist.", settings_path.display())
                 };
-                let example_path = "/mnt/example/vectordata-cache";
                 let parent = settings_path.parent()
                     .map(|p| p.display().to_string())
                     .unwrap_or_else(|| "$HOME/.config/vectordata".to_string());
+
+                // Pull a concrete recommendation from the live mount
+                // table when possible. If `auto` would land on $HOME
+                // (the auto-bootstrap path that *should* have already
+                // fired) we don't end up here; mentioning `auto`
+                // still makes sense for callers that constructed
+                // `NotConfigured` synthetically (e.g. tests) or for
+                // future readers writing the file by hand.
+                let auto_hint = match auto_resolved_cache_dir() {
+                    Ok(a) => format!("auto would pick: {}", a.path.display()),
+                    Err(_) => "auto-resolution unavailable on this host".into(),
+                };
+                let example_path = match auto_resolved_cache_dir() {
+                    Ok(a) => a.path.display().to_string(),
+                    Err(_) => "/mnt/example/vectordata-cache".into(),
+                };
+
                 write!(f,
                     "vectordata is not configured: {why}\n\
                      \n\
-                     # If you have the `veks` CLI installed:\n\
-                     veks datasets config set-cache {example_path}\n\
+                     # Pick the largest writable mount automatically:\n\
+                     vectordata config set-cache auto\n\
+                     ({auto_hint})\n\
                      \n\
-                     # Or configure manually:\n\
+                     # Or set an explicit path:\n\
+                     vectordata config set-cache <path>\n\
+                     # (veks alias: `veks datasets config set-cache --cache-dir <path>`)\n\
+                     \n\
+                     # Or write the file by hand:\n\
                      mkdir -p {parent}\n\
-                     echo \"cache_dir: {example_path}\" >> {}\n\
-                     echo \"protect_settings: true\" >> {}",
-                    settings_path.display(), settings_path.display(),
+                     cat > {} <<'YAML'\n\
+                     cache_dir: {example_path}\n\
+                     protect_settings: true\n\
+                     YAML",
+                    settings_path.display(),
                 )
             }
         }
@@ -132,6 +157,19 @@ impl From<io::Error> for SettingsWriteError {
     fn from(e: io::Error) -> Self { SettingsWriteError::Io(e) }
 }
 
+/// Result of a successful [`write_cache_dir`]. Distinguishes a
+/// real write from a same-value no-op so the CLI can print
+/// "Configuration updated" vs "Already set" without re-doing the
+/// equality check itself.
+#[derive(Debug, PartialEq, Eq)]
+pub enum WriteCacheOutcome {
+    /// `settings.yaml` was written with a new `cache_dir:` value.
+    Wrote,
+    /// The requested value already matched the existing one —
+    /// `settings.yaml` was not touched.
+    AlreadySet,
+}
+
 /// Path to the `settings.yaml` file. `$VECTORDATA_HOME` takes
 /// precedence over `$HOME/.config/vectordata/` so tests can isolate
 /// without touching the user's real config.
@@ -148,10 +186,19 @@ pub fn settings_path() -> PathBuf {
 /// Resolve the configured cache directory.
 ///
 /// Returns the `cache_dir:` value from the user's `settings.yaml`.
-/// If the file is missing or does not declare `cache_dir:`, returns
-/// [`SettingsError::NotConfigured`] — there is **no silent
-/// fallback**. Print the error directly: its `Display` impl carries
-/// ready-to-paste commands the user can run to configure the cache.
+/// If the file is missing or does not declare `cache_dir:`, this
+/// function will *auto-bootstrap* to `$HOME/.cache/vectordata` —
+/// **only** when the largest writable mount visible to this process
+/// is on the same filesystem as `$HOME` (so we aren't silently
+/// burying a cache on a small volume when there's a larger disk the
+/// user should be choosing). The bootstrap writes the resolved
+/// value to `settings.yaml` and prints a one-line warning to stderr
+/// the first time it runs.
+///
+/// If auto-bootstrap doesn't apply (`$HOME` isn't on the largest
+/// writable mount, `$HOME` unreadable, etc.), returns
+/// [`SettingsError::NotConfigured`] — its `Display` impl carries
+/// ready-to-paste commands.
 ///
 /// If [`override_cache_dir_for_process`] has been called, that value
 /// takes precedence and `settings.yaml` is not consulted.
@@ -159,7 +206,105 @@ pub fn cache_dir() -> Result<PathBuf, SettingsError> {
     if let Some(p) = CACHE_DIR_OVERRIDE.get() {
         return Ok(p.clone());
     }
-    cache_dir_from(&settings_path())
+    let path = settings_path();
+    match cache_dir_from(&path) {
+        Ok(p) => Ok(p),
+        Err(e) => match try_auto_bootstrap(&path) {
+            Some(resolved) => Ok(resolved),
+            None => Err(e),
+        },
+    }
+}
+
+/// Why [`auto_resolved_cache_dir`] picked the path it picked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheDirResolutionReason {
+    /// Largest writable mount is the same filesystem as `$HOME` — we
+    /// picked `$HOME/.cache/vectordata` because there's no bigger
+    /// disk to put it on anyway.
+    HomeIsLargestMount,
+    /// Largest writable mount is on a *different* filesystem than
+    /// `$HOME`. The path is `<that-mount>/vectordata-cache`. The
+    /// auto-bootstrap path in [`cache_dir`] refuses this case — it
+    /// requires the user to explicitly opt in via `set-cache` so we
+    /// don't silently land cache data somewhere unexpected.
+    DifferentMountIsLargest,
+}
+
+/// A cache-directory candidate auto-picked from the live mount table.
+#[derive(Debug, Clone)]
+pub struct AutoResolved {
+    pub path: PathBuf,
+    pub reason: CacheDirResolutionReason,
+    /// The mount-point string that was picked (for diagnostic
+    /// messages).
+    pub mount: String,
+}
+
+/// Pick a cache directory based on the live mount table. Shared by
+/// `set-cache auto` (which honors the choice unconditionally) and
+/// the [`cache_dir`] auto-bootstrap (which only honors
+/// [`CacheDirResolutionReason::HomeIsLargestMount`]).
+///
+/// Bubbles up a printable error when `$HOME` isn't set, no writable
+/// mounts are visible, or `statvfs`/`stat` fail.
+pub fn auto_resolved_cache_dir() -> Result<AutoResolved, String> {
+    let home = std::env::var_os("HOME")
+        .ok_or_else(|| "HOME is not set; cannot auto-resolve cache_dir".to_string())?;
+    let home = PathBuf::from(home);
+    let home_dev = mounts::device_id(&home)
+        .map_err(|e| format!("inspecting $HOME ({}): {e}", home.display()))?;
+
+    let mut candidates: Vec<mounts::MountInfo> = mounts::enumerate()
+        .into_iter()
+        .filter(|m| m.writable)
+        .collect();
+    if candidates.is_empty() {
+        return Err("no writable mounts found — cannot auto-resolve cache_dir".to_string());
+    }
+    let largest = candidates.remove(0);
+    let largest_dev = mounts::device_id(Path::new(&largest.path))
+        .map_err(|e| format!("inspecting mount {}: {e}", largest.path))?;
+    if largest_dev == home_dev {
+        Ok(AutoResolved {
+            path: home.join(".cache/vectordata"),
+            reason: CacheDirResolutionReason::HomeIsLargestMount,
+            mount: largest.path,
+        })
+    } else {
+        Ok(AutoResolved {
+            path: PathBuf::from(&largest.path).join("vectordata-cache"),
+            reason: CacheDirResolutionReason::DifferentMountIsLargest,
+            mount: largest.path,
+        })
+    }
+}
+
+/// Try to auto-bootstrap `settings.yaml` on first read. Returns
+/// `Some(path)` only when the resolution rule fires
+/// (`HomeIsLargestMount`) and the write succeeds. Prints a one-line
+/// stderr warning on success — the user sees what just happened.
+///
+/// On any failure (no `$HOME`, different mount is largest, write
+/// fails) returns `None` so the caller surfaces the original
+/// [`SettingsError`].
+fn try_auto_bootstrap(settings: &Path) -> Option<PathBuf> {
+    let resolved = auto_resolved_cache_dir().ok()?;
+    if resolved.reason != CacheDirResolutionReason::HomeIsLargestMount {
+        return None;
+    }
+    match write_cache_dir_at(settings, &resolved.path, false) {
+        Ok(WriteCacheOutcome::Wrote) => {
+            eprintln!("warning: no cache_dir configured; auto-set to {} \
+                (largest writable mount is $HOME's filesystem). \
+                To choose a different location, run \
+                `vectordata config set-cache <path>`.",
+                resolved.path.display());
+            Some(resolved.path)
+        }
+        Ok(WriteCacheOutcome::AlreadySet) => Some(resolved.path),
+        Err(_) => None,
+    }
 }
 
 /// Variant of [`cache_dir`] that reads from an explicit settings
@@ -211,32 +356,51 @@ pub fn protect_settings_from(settings: &Path) -> bool {
 
 /// Write a new `cache_dir:` into the user's `settings.yaml`,
 /// creating the file and its parent directory as needed. Always
-/// writes `protect_settings: true` so subsequent `set-cache`
-/// invocations have to be deliberate.
+/// writes `protect_settings: true` (for backwards compat with older
+/// readers that still inspect the flag — the writer itself no
+/// longer uses it as a gate).
 ///
-/// If the file already exists with `protect_settings: true`,
-/// refuses to overwrite unless `force=true`, returning
+/// Refuses to overwrite an existing `cache_dir:` with a *different*
+/// value unless `force=true`. A second call with the *same* value
+/// is a no-op (idempotent — does not touch the file). Returns
 /// [`SettingsWriteError::Protected`] with the existing value so the
 /// caller can show the user what's currently configured.
 ///
 /// Also creates `cache_dir` itself if it doesn't exist — having a
 /// `cache_dir:` value pointing at a non-existent path is a common
 /// support trap, so this constructor closes that gap.
-pub fn write_cache_dir(cache_dir: &Path, force: bool) -> Result<(), SettingsWriteError> {
+pub fn write_cache_dir(cache_dir: &Path, force: bool) -> Result<WriteCacheOutcome, SettingsWriteError> {
     write_cache_dir_at(&settings_path(), cache_dir, force)
 }
 
 /// Variant of [`write_cache_dir`] that targets an explicit settings
 /// path — used by tests so they can exercise the writer without
 /// stomping on `$HOME`.
+///
+/// Behavior when `settings` already exists:
+///
+/// - Existing `cache_dir:` equals the requested one → no-op (idempotent).
+/// - Different value, `force == false` → [`SettingsWriteError::Protected`].
+/// - Different value, `force == true` → overwrites unconditionally.
+///
+/// The `protect_settings:` flag in the file is *no longer load-bearing*
+/// for this decision — every write is protected against silent
+/// overwrite. The flag is still written so older readers see the
+/// expected shape.
 pub fn write_cache_dir_at(
     settings: &Path,
     cache_dir: &Path,
     force: bool,
-) -> Result<(), SettingsWriteError> {
-    if settings.is_file() && !force {
+) -> Result<WriteCacheOutcome, SettingsWriteError> {
+    if settings.is_file() {
         let existing = cache_dir_from(settings).ok();
-        if protect_settings_from(settings) {
+        // Same value → no-op; don't even touch the file (avoids
+        // gratuitous mtime bumps that would invalidate any
+        // staleness-tracked downstream).
+        if existing.as_deref() == Some(cache_dir) {
+            return Ok(WriteCacheOutcome::AlreadySet);
+        }
+        if !force {
             return Err(SettingsWriteError::Protected {
                 settings_path: settings.to_path_buf(),
                 existing_cache_dir: existing,
@@ -254,7 +418,7 @@ pub fn write_cache_dir_at(
         cache_dir.display(),
     );
     std::fs::write(settings, content)?;
-    Ok(())
+    Ok(WriteCacheOutcome::Wrote)
 }
 
 #[cfg(test)]
@@ -294,9 +458,16 @@ mod tests {
         // Display message must contain the actionable commands so
         // callers can surface it directly.
         let msg = err.to_string();
-        assert!(msg.contains("veks datasets config set-cache"), "missing CLI hint: {msg}");
-        assert!(msg.contains("mkdir -p"), "missing manual hint: {msg}");
-        assert!(msg.contains("echo \"cache_dir:"), "missing echo hint: {msg}");
+        assert!(msg.contains("vectordata config set-cache auto"),
+            "missing auto-pick hint: {msg}");
+        assert!(msg.contains("vectordata config set-cache <path>"),
+            "missing explicit-path hint: {msg}");
+        assert!(msg.contains("veks datasets config set-cache"),
+            "missing veks alias hint: {msg}");
+        assert!(msg.contains("mkdir -p"), "missing manual mkdir hint: {msg}");
+        assert!(msg.contains("cache_dir:"), "missing cache_dir line: {msg}");
+        assert!(msg.contains("protect_settings: true"),
+            "missing protect_settings line: {msg}");
     }
 
     #[test]
@@ -334,15 +505,48 @@ mod tests {
     }
 
     #[test]
-    fn write_cache_dir_overwrites_unprotected_existing_settings() {
+    fn write_cache_dir_refuses_overwrite_even_without_protect_flag() {
+        // The `protect_settings:` flag in the file is no longer
+        // load-bearing — every existing-with-different-value write
+        // is refused without --force. The earlier "unprotected
+        // settings overwrite freely" rule turned a `set-cache` typo
+        // into a silent reconfiguration.
         let home = tempfile::tempdir().unwrap();
         let settings = home.path().join("settings.yaml");
         let target = home.path().join("cache");
-        // Pre-existing settings without protect_settings.
+        // Pre-existing settings WITHOUT protect_settings.
         std::fs::write(&settings, "cache_dir: /old/path\n").unwrap();
-        write_cache_dir_at(&settings, &target, false)
-            .expect("unprotected settings should overwrite freely");
+
+        let err = write_cache_dir_at(&settings, &target, false).unwrap_err();
+        match err {
+            SettingsWriteError::Protected { ref existing_cache_dir, .. } => {
+                assert_eq!(existing_cache_dir.as_deref(),
+                    Some(std::path::Path::new("/old/path")));
+            }
+            other => panic!("expected Protected, got {other:?}"),
+        }
+        // Force overrides.
+        write_cache_dir_at(&settings, &target, true).unwrap();
         assert_eq!(cache_dir_from(&settings).unwrap(), target);
+    }
+
+    #[test]
+    fn write_cache_dir_is_noop_for_same_value() {
+        let home = tempfile::tempdir().unwrap();
+        let settings = home.path().join("settings.yaml");
+        let target = home.path().join("cache");
+        write_cache_dir_at(&settings, &target, false).unwrap();
+        let before = std::fs::metadata(&settings).unwrap().modified().unwrap();
+        // Force one filesystem-tick of separation so a real write
+        // would be detectable.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        // Writing the same value (no --force) must succeed without
+        // touching the file.
+        write_cache_dir_at(&settings, &target, false)
+            .expect("same-value write must be idempotent");
+        let after = std::fs::metadata(&settings).unwrap().modified().unwrap();
+        assert_eq!(before, after,
+            "same-value write must not touch the settings file");
     }
 
     #[test]

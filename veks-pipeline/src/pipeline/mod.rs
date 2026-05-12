@@ -440,6 +440,16 @@ pub fn run_pipeline(args: RunArgs) -> Result<(), String> {
         .unwrap_or(Path::new("."))
         .to_path_buf();
 
+    // Sweep legacy singular-extension siblings (e.g. `base_vectors.fvec`
+    // alongside `base_vectors.fvecs`) before any step runs. Self-heals
+    // existing datasets that pre-date the canonical-extension switch
+    // without requiring a re-bootstrap. No-op for cleanly-bootstrapped
+    // datasets.
+    let swept = veks_core::legacy_sweep::sweep(&workspace);
+    if swept > 0 {
+        println!("Swept {swept} legacy singular-extension sibling(s) before run");
+    }
+
     // Handle --clean / --reset: full reset (remove all generated artifacts),
     // then continue to run the pipeline from scratch.
     if args.clean || args.reset {
@@ -2687,7 +2697,13 @@ default:
         ];
         profiles.derive_views_from_templates(&templates);
 
-        // Default gets auto-derived views (no explicit base_vectors view)
+        // Default auto-derives views from per_profile templates whose
+        // IDs don't contain "partition" — those steps actually do
+        // run for default and write to `profiles/default/`.
+        // Partition-only templates are filtered out (regression
+        // guard for the sift1m `neighbor_distances` 403 bug); see
+        // `test_default_profile_does_not_auto_inject_missing_facets`
+        // in vectordata::dataset::profile.
         let pdef = profiles.profile("default").unwrap();
         assert_eq!(pdef.view("base_vectors").unwrap().path(), "profiles/default/base_vectors.mvec");
         assert_eq!(pdef.view("neighbor_indices").unwrap().path(), "profiles/default/neighbor_indices.ivecs");

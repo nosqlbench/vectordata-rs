@@ -223,9 +223,14 @@ pub fn parse_facet_spec(spec: &str) -> String {
     // Strip leading '=' that can appear from shell quoting like --flag ="value"
     let spec = spec.strip_prefix('=').unwrap_or(spec);
 
-    // '*' or 'all' → every facet (O excluded — must be explicit)
+    // '*' or 'all' → every facet, *including* O (oracle partitions).
+    // The earlier carve-out excluded O on cost grounds, but it
+    // collides with the obvious reading of "everything": users who
+    // type `*` and don't get partition profiles file it as a
+    // regression. Users who want all-but-O can spell that out
+    // explicitly with `BQGDMPRF`.
     if spec == "*" || spec.eq_ignore_ascii_case("all") {
-        return "BQGDMPRF".to_string();
+        return "BQGDMPRFO".to_string();
     }
 
     // If it's all recognized facet letters (compact codes), treat directly
@@ -2716,6 +2721,17 @@ pub fn run(mut args: ImportArgs) {
     // created there pointing to the actual source file.
     create_identity_symlinks(output_dir, &args, &slots);
 
+    // Sweep the workspace for legacy singular-extension siblings
+    // (e.g. `base_vectors.fvec`) that survived an extension-convention
+    // change. The per-link sweep inside `create_symlink` only fires
+    // for slots that go through the symlink path on *this* bootstrap;
+    // this pass catches everything that's already on disk regardless
+    // of which paths bootstrap exercises this run.
+    let swept = veks_core::legacy_sweep::sweep(output_dir);
+    if swept > 0 {
+        println!("  Swept {swept} legacy singular-extension sibling(s)");
+    }
+
     // Write import provenance to dataset.log
     write_import_log(output_dir, &args, &slots, steps.len());
 
@@ -2850,6 +2866,16 @@ pub(crate) fn create_symlink(target: &std::path::Path, link: &std::path::Path) {
         let _ = std::fs::remove_file(link);
     }
 
+    // Sweep legacy singular-extension siblings. The canonical xvec
+    // extensions were normalised to plural form (fvec→fvecs, ivec→
+    // ivecs, …) in `VecFormat::canonical_extension`. Older datasets
+    // still carry the singular-extension symlinks from before that
+    // change; if we don't remove them here, `veks run`'s merkle step
+    // keeps regenerating their `.mref` siblings each run and
+    // `veks check` correctly flags them as extraneous. The sweep is
+    // a no-op when the legacy sibling isn't present.
+    remove_legacy_xvec_sibling(link);
+
     match veks_core::paths::portable_symlink_file(&rel_target, link) {
         Ok(()) => {
             println!("  Symlinked {} → {}", crate::check::rel_display(link), rel_target.display());
@@ -2857,6 +2883,48 @@ pub(crate) fn create_symlink(target: &std::path::Path, link: &std::path::Path) {
         Err(e) => {
             eprintln!("  Warning: failed to create symlink {} → {}: {}",
                 crate::check::rel_display(link), rel_target.display(), e);
+        }
+    }
+}
+
+/// Remove the legacy singular-extension sibling (and its `.mref`) for
+/// a canonical-extension link. E.g. for `base_vectors.fvecs`, removes
+/// `base_vectors.fvec` and `base_vectors.fvec.mref` if they exist.
+/// Only applies to xvec-style extensions where the plural form is
+/// canonical — scalars (`.u8`, `.slab`, `.parquet`) have no legacy
+/// sibling, so they're passed through unchanged.
+fn remove_legacy_xvec_sibling(canonical_link: &std::path::Path) {
+    let Some(ext) = canonical_link.extension().and_then(|e| e.to_str()) else { return; };
+    // The legacy form is the singular: drop the trailing `s`. Only
+    // act when the plural form actually round-trips through the
+    // canonical-extension normalizer — that's the project-wide
+    // signal that this is an xvec-class extension.
+    if !ext.ends_with('s') { return; }
+    let legacy = &ext[..ext.len() - 1];
+    let canon_check = crate::formats::VecFormat::canonical_extension(legacy);
+    if canon_check != Some(ext) { return; }
+
+    let legacy_link = canonical_link.with_extension(legacy);
+    remove_legacy_pair(&legacy_link);
+}
+
+/// Remove a legacy singular-extension file/symlink and its `.mref`
+/// sibling, if present. Best-effort, no-op when the paths don't
+/// exist.
+fn remove_legacy_pair(legacy_path: &std::path::Path) {
+    let legacy_mref = {
+        let mut p = legacy_path.to_path_buf().into_os_string();
+        p.push(".mref");
+        std::path::PathBuf::from(p)
+    };
+    for p in [legacy_path, legacy_mref.as_path()] {
+        if p.exists() || p.symlink_metadata().is_ok() {
+            if let Err(e) = std::fs::remove_file(p) {
+                eprintln!("  Warning: failed to remove legacy {}: {}",
+                    crate::check::rel_display(p), e);
+            } else {
+                println!("  Removed legacy sibling {}", crate::check::rel_display(p));
+            }
         }
     }
 }
@@ -3776,13 +3844,16 @@ mod tests {
 
     #[test]
     fn parse_facet_spec_star_is_all() {
-        assert_eq!(parse_facet_spec("*"), "BQGDMPRF");
+        // `*` means *every* facet, including O (oracle partitions).
+        // See the comment in `parse_facet_spec` for why O is now
+        // included.
+        assert_eq!(parse_facet_spec("*"), "BQGDMPRFO");
     }
 
     #[test]
     fn parse_facet_spec_all_keyword() {
-        assert_eq!(parse_facet_spec("all"), "BQGDMPRF");
-        assert_eq!(parse_facet_spec("ALL"), "BQGDMPRF");
+        assert_eq!(parse_facet_spec("all"), "BQGDMPRFO");
+        assert_eq!(parse_facet_spec("ALL"), "BQGDMPRFO");
     }
 
     #[test]

@@ -222,7 +222,13 @@ pub fn expand_per_profile_steps_scoped(
                 }
             }).collect();
 
-            // Rewrite option values
+            // Rewrite option values. The set of "output keys" varies
+            // per command: `compute knn` uses `indices`/`distances`
+            // as outputs (no `output:` key); `compute knn-distances`
+            // has `output:` and uses `indices` as an *input*. The
+            // single source of truth is `StepDef::output_keys`,
+            // shared with `output_paths()` so the two stay aligned.
+            let output_keys = template.output_keys();
             let mut expanded_options = template.options.clone();
             for (key, v) in expanded_options.iter_mut() {
                 if let serde_yaml::Value::String(s) = v {
@@ -230,9 +236,7 @@ pub fn expand_per_profile_steps_scoped(
                         *s = s.replace("${profile_dir}", &profile_dir);
                     } else {
                         let bare = s.as_str();
-                        let is_output_key = key == "output"
-                            || key == "indices"
-                            || key == "distances";
+                        let is_output_key = output_keys.iter().any(|k| k == key);
                         let should_prefix = !bare.contains('/')
                             && !bare.contains("${")
                             && (is_output_key || template_output_names.contains(bare));
@@ -438,5 +442,100 @@ mod tests {
         };
         assert_eq!(filter_steps_for_profile(vec![step.clone()], "10m").len(), 1);
         assert_eq!(filter_steps_for_profile(vec![step], "20m").len(), 0);
+    }
+
+    /// Regression test for the sift1m
+    /// `profiles/default/_sift_groundtruth.ivecs: No such file` bug:
+    /// `compute knn-distances` consumes `indices` as an INPUT (a
+    /// pre-existing groundtruth file at the dataset root), and the
+    /// per-profile expander used to auto-prefix it with
+    /// `profiles/default/`. The disambiguation rule: if the step has
+    /// an explicit `output:` key, `indices` is treated as an input.
+    #[test]
+    fn test_knn_distances_indices_is_input_not_output() {
+        use indexmap::IndexMap;
+        use serde_yaml::Value;
+
+        let profiles: DSProfileGroup = serde_yaml::from_str(r#"
+default:
+  base_vectors: profiles/base/base_vectors.fvec
+"#).unwrap();
+
+        let mut opts = IndexMap::new();
+        opts.insert("base".into(),    Value::String("_sift_base_l2.fvecs".into()));
+        opts.insert("query".into(),   Value::String("_sift_query.fvecs".into()));
+        opts.insert("indices".into(), Value::String("_sift_groundtruth.ivecs".into()));
+        opts.insert("output".into(),  Value::String("neighbor_distances.fvecs".into()));
+        opts.insert("metric".into(),  Value::String("L2".into()));
+        let template = StepDef {
+            id: Some("compute-knn-distances".into()),
+            run: "compute knn-distances".into(),
+            description: None,
+            after: vec![],
+            profiles: vec![],
+            per_profile: true,
+            phase: 0,
+            finalize: false,
+            on_partial: crate::dataset::pipeline::OnPartial::default(),
+            options: opts,
+        };
+
+        let expanded = expand_per_profile_steps(vec![template], &profiles, 10_000);
+        let step = expanded.iter()
+            .find(|s| s.effective_id() == "compute-knn-distances")
+            .expect("default-profile expansion present");
+
+        // `indices` is an INPUT — must NOT be prefixed with profile dir.
+        let indices = step.options.get("indices").and_then(|v| v.as_str()).unwrap();
+        assert_eq!(indices, "_sift_groundtruth.ivecs",
+            "indices must stay at the dataset root (was wrongly being \
+             rewritten to profiles/default/_sift_groundtruth.ivecs)");
+        // `output` IS an output — should be prefixed.
+        let output = step.options.get("output").and_then(|v| v.as_str()).unwrap();
+        assert_eq!(output, "profiles/default/neighbor_distances.fvecs");
+    }
+
+    /// Counterpart: `compute knn` has no `output:` key, so its
+    /// `indices` and `distances` are outputs and must be prefixed.
+    /// This test guards against a regression in the other direction.
+    #[test]
+    fn test_compute_knn_indices_distances_are_outputs() {
+        use indexmap::IndexMap;
+        use serde_yaml::Value;
+
+        let profiles: DSProfileGroup = serde_yaml::from_str(r#"
+default:
+  base_vectors: base.fvec
+10M:
+  base_count: 10000000
+"#).unwrap();
+
+        let mut opts = IndexMap::new();
+        opts.insert("base".into(),      Value::String("${profile_dir}base.fvec".into()));
+        opts.insert("query".into(),     Value::String("${profile_dir}query.fvec".into()));
+        opts.insert("indices".into(),   Value::String("neighbor_indices.ivec".into()));
+        opts.insert("distances".into(), Value::String("neighbor_distances.fvec".into()));
+        opts.insert("metric".into(),    Value::String("L2".into()));
+        let template = StepDef {
+            id: Some("compute-knn".into()),
+            run: "compute knn".into(),
+            description: None,
+            after: vec![],
+            profiles: vec![],
+            per_profile: true,
+            phase: 0,
+            finalize: false,
+            on_partial: crate::dataset::pipeline::OnPartial::default(),
+            options: opts,
+        };
+
+        let expanded = expand_per_profile_steps(vec![template], &profiles, 10_000);
+        let step_10m = expanded.iter()
+            .find(|s| s.effective_id() == "compute-knn-10M")
+            .expect("10M expansion present");
+        assert_eq!(step_10m.options.get("indices").and_then(|v| v.as_str()).unwrap(),
+            "profiles/10M/neighbor_indices.ivec");
+        assert_eq!(step_10m.options.get("distances").and_then(|v| v.as_str()).unwrap(),
+            "profiles/10M/neighbor_distances.fvec");
     }
 }

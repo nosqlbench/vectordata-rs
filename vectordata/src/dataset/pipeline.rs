@@ -129,13 +129,11 @@ impl StepDef {
 
     /// Return all option values that look like output file paths.
     ///
-    /// Checks `output`, `indices`, and `distances` keys — the known set of
-    /// option names that commands use for files they write. Used by
-    /// `expand_per_profile_steps()` to auto-prefix bare filenames with the
-    /// profile directory.
+    /// Used by `expand_per_profile_steps()` to auto-prefix bare
+    /// filenames with the profile directory. See [`Self::output_keys`]
+    /// for how output keys are disambiguated.
     pub fn output_paths(&self) -> Vec<String> {
-        const OUTPUT_KEYS: &[&str] = &["output", "indices", "distances"];
-        OUTPUT_KEYS
+        self.output_keys()
             .iter()
             .filter_map(|key| {
                 self.options.get(*key).and_then(|v| match v {
@@ -144,6 +142,31 @@ impl StepDef {
                 })
             })
             .collect()
+    }
+
+    /// Option keys that name *output* artifacts for this step.
+    ///
+    /// `output` is always an output. `indices` and `distances` are
+    /// ambiguous — they're outputs for commands that produce a
+    /// (knn-index, knn-distances) pair like `compute knn` and
+    /// `compute filtered-knn`, but inputs for commands that consume
+    /// a pre-existing index (`compute knn-distances`, which reads
+    /// the indices file and produces distances). We disambiguate by
+    /// the presence of an explicit `output:` key: a step that names
+    /// its sole output via `output:` is using `indices`/`distances`
+    /// as *inputs*, not outputs.
+    ///
+    /// Getting this wrong caused the sift1m
+    /// `profiles/default/_sift_groundtruth.ivecs: No such file` bug —
+    /// the expander auto-prefixed the input `indices` path with
+    /// `profiles/default/` and looked for the file in the wrong
+    /// place.
+    pub fn output_keys(&self) -> &'static [&'static str] {
+        if self.options.contains_key("output") {
+            &["output"]
+        } else {
+            &["output", "indices", "distances"]
+        }
     }
 }
 

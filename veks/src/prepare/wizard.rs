@@ -329,7 +329,7 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
         println!("  (overridden by --required-facets → {})", parsed);
         parsed
     } else {
-        println!("  (use +O to add oracle partitions, e.g., +MPRFO)");
+        println!("  (`*` = every facet including O oracle partitions; `+X` adds X to inferred)");
         loop {
             let input = prompt_with_default(
                 "Facets to include in dataset (* for all, +X to add)",

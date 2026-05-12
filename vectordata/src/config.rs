@@ -29,7 +29,8 @@ use crate::catalog::resolver::Catalog;
 use crate::catalog::sources::{
     CatalogSources, DEFAULT_CONFIG_DIR, expand_tilde, raw_catalog_entries,
 };
-use crate::settings::{self, SettingsWriteError};
+use crate::mounts;
+use crate::settings::{self, SettingsWriteError, WriteCacheOutcome};
 
 // ─── show ────────────────────────────────────────────────────────────
 
@@ -83,15 +84,42 @@ pub fn get_cache() -> i32 {
 
 // ─── set-cache ───────────────────────────────────────────────────────
 
+/// Sentinel values for [`set_cache`] that trigger auto-resolution.
+/// Both spellings are accepted; `largest-writable-mount` is what the
+/// help text advertises and `auto` is the shorter alias.
+pub const AUTO_CACHE_SENTINEL_LONG: &str = "largest-writable-mount";
+pub const AUTO_CACHE_SENTINEL_SHORT: &str = "auto";
+
 /// Write `cache_dir` into `settings.yaml`. Honors
 /// `protect_settings: true` unless `force=true`. Creates the target
 /// directory if it does not exist.
+///
+/// When `cache_dir` is `largest-writable-mount` (or the `auto`
+/// alias), picks a sensible default:
+///
+/// - If the largest writable mount is on a different filesystem than
+///   `$HOME`, uses `<that-mount>/vectordata-cache/`.
+/// - Otherwise (largest mount is the same filesystem as `$HOME`),
+///   uses `$HOME/.cache/vectordata/`.
+///
+/// The "largest" rule looks at available bytes, not total — so a
+/// nearly-full big disk loses to a smaller-but-mostly-empty one.
 pub fn set_cache(cache_dir: &Path, force: bool) -> i32 {
+    let resolved = match resolve_cache_spec(cache_dir) {
+        Ok(p) => p,
+        Err(e) => { eprintln!("{e}"); return 1; }
+    };
+    let cache_dir = resolved.as_path();
     match settings::write_cache_dir(cache_dir, force) {
-        Ok(()) => {
+        Ok(WriteCacheOutcome::Wrote) => {
             println!("Configuration updated:");
             println!("  settings.yaml: {}", settings::settings_path().display());
             println!("  cache_dir:     {}", cache_dir.display());
+            0
+        }
+        Ok(WriteCacheOutcome::AlreadySet) => {
+            println!("cache_dir already set to {}; settings.yaml unchanged.",
+                cache_dir.display());
             0
         }
         Err(SettingsWriteError::Protected { settings_path, existing_cache_dir }) => {
@@ -111,22 +139,36 @@ pub fn set_cache(cache_dir: &Path, force: bool) -> i32 {
     }
 }
 
+/// Resolve a `set_cache` input. Pass-through for normal paths;
+/// expands [`AUTO_CACHE_SENTINEL_LONG`] / [`AUTO_CACHE_SENTINEL_SHORT`]
+/// to a concrete path picked from the live mount table.
+fn resolve_cache_spec(input: &Path) -> Result<PathBuf, String> {
+    let s = input.to_string_lossy();
+    if s == AUTO_CACHE_SENTINEL_LONG || s == AUTO_CACHE_SENTINEL_SHORT {
+        let resolved = pick_auto_cache_dir()?;
+        println!("auto-resolved cache_dir → {}", resolved.display());
+        return Ok(resolved);
+    }
+    Ok(input.to_path_buf())
+}
+
+/// Pick a cache directory based on the live mount table. Delegates
+/// to [`settings::auto_resolved_cache_dir`] so the same selection
+/// rule applies whether the user types `set-cache auto` or the
+/// `cache_dir()` auto-bootstrap kicks in implicitly.
+fn pick_auto_cache_dir() -> Result<PathBuf, String> {
+    settings::auto_resolved_cache_dir().map(|r| r.path)
+}
+
 // ─── list-mounts ─────────────────────────────────────────────────────
 
-/// One mount-point row returned by [`list_mounts`].
-#[derive(Debug)]
-pub struct MountInfo {
-    pub path: String,
-    pub available: u64,
-    pub total: u64,
-    pub writable: bool,
-}
+pub use crate::mounts::MountInfo;
 
 /// List writable mount points suitable for `cache_dir`. By default
 /// hides mounts with less than 100 MiB free; pass `show_all=true` to
 /// include them. Returns 0 unconditionally.
 pub fn list_mounts(show_all: bool) -> i32 {
-    let mounts = enumerate_mounts();
+    let mounts = mounts::enumerate();
     let min = if show_all { 0 } else { 100 * 1024 * 1024 };
 
     println!("{:<40} {:>12} {:>12} {:>8}", "Mount Point", "Available", "Total", "Writable");
@@ -301,92 +343,3 @@ fn dir_size(path: &Path) -> u64 {
     total
 }
 
-#[cfg(target_os = "linux")]
-fn enumerate_mounts() -> Vec<MountInfo> {
-    let mut mounts = Vec::new();
-    let Ok(content) = std::fs::read_to_string("/proc/mounts") else { return mounts; };
-    let mut seen = std::collections::HashSet::new();
-    for line in content.lines() {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 3 { continue; }
-        let mount = parts[1];
-        let fs_type = parts[2];
-        if matches!(fs_type,
-            "proc" | "sysfs" | "devtmpfs" | "devpts" | "cgroup" | "cgroup2"
-            | "securityfs" | "debugfs" | "tracefs" | "hugetlbfs" | "mqueue"
-            | "pstore" | "bpf" | "configfs" | "fusectl" | "autofs"
-            | "rpc_pipefs" | "nfsd" | "binfmt_misc")
-        { continue; }
-        if !seen.insert(mount.to_string()) { continue; }
-        let path = PathBuf::from(mount);
-        if let Some((available, total)) = statvfs_bytes(&path) {
-            mounts.push(MountInfo {
-                path: mount.to_string(),
-                available, total,
-                writable: is_writable(&path),
-            });
-        }
-    }
-    mounts.sort_by(|a, b| b.available.cmp(&a.available));
-    mounts
-}
-
-#[cfg(not(target_os = "linux"))]
-fn enumerate_mounts() -> Vec<MountInfo> {
-    let mut mounts = Vec::new();
-    for p in ["/", "/home", "/tmp"] {
-        let path = PathBuf::from(p);
-        if !path.exists() { continue; }
-        if let Some((available, total)) = statvfs_bytes(&path) {
-            mounts.push(MountInfo {
-                path: p.to_string(), available, total, writable: true,
-            });
-        }
-    }
-    mounts.sort_by(|a, b| b.available.cmp(&a.available));
-    mounts
-}
-
-#[cfg(unix)]
-fn statvfs_bytes(path: &Path) -> Option<(u64, u64)> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-    let c = CString::new(path.as_os_str().as_bytes()).ok()?;
-    unsafe {
-        let mut s: libc::statvfs = std::mem::zeroed();
-        if libc::statvfs(c.as_ptr(), &mut s) != 0 { return None; }
-        let avail = s.f_bavail as u64 * s.f_frsize as u64;
-        let total = s.f_blocks as u64 * s.f_frsize as u64;
-        Some((avail, total))
-    }
-}
-
-#[cfg(not(unix))]
-fn statvfs_bytes(_path: &Path) -> Option<(u64, u64)> { None }
-
-#[cfg(unix)]
-fn is_writable(path: &Path) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    let Ok(meta) = path.metadata() else { return false; };
-    let mode = meta.mode();
-    let uid = unsafe { libc::getuid() };
-    if uid == 0 { return true; }
-    if meta.uid() == uid { return mode & 0o200 != 0; }
-    let gid = unsafe { libc::getegid() };
-    if meta.gid() == gid { return mode & 0o020 != 0; }
-    let mut groups = vec![0u32; 64];
-    let ret = unsafe {
-        libc::getgroups(groups.len() as libc::c_int,
-            groups.as_mut_ptr() as *mut libc::gid_t)
-    };
-    if ret > 0 {
-        groups.truncate(ret as usize);
-        if groups.contains(&meta.gid()) { return mode & 0o020 != 0; }
-    }
-    mode & 0o002 != 0
-}
-
-#[cfg(not(unix))]
-fn is_writable(path: &Path) -> bool {
-    path.metadata().map(|m| !m.permissions().readonly()).unwrap_or(false)
-}
