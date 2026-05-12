@@ -31,6 +31,16 @@ use crate::transport::{
 /// Default concurrency for parallel chunk downloads.
 const DEFAULT_CONCURRENCY: usize = 8;
 
+/// Hex-encode a 32-byte hash for diagnostic messages. Avoids pulling in
+/// the `hex` crate as a runtime dep just for one error string.
+fn hex_short(bytes: &[u8; 32]) -> String {
+    let mut s = String::with_capacity(64);
+    for b in bytes {
+        s.push_str(&format!("{:02x}", b));
+    }
+    s
+}
+
 /// A file channel that transparently downloads, verifies, and caches data
 /// from a remote source using merkle tree integrity checking.
 pub struct CachedChannel {
@@ -81,12 +91,34 @@ impl CachedChannel {
         let cache_path = cache_dir.join(name);
         let state_path = cache_dir.join(format!("{}.mrkl", name));
 
-        // Dual-mode: .mrkl is the single source of truth.
-        // On resume, load state and derive reference from its embedded hashes.
-        // On first access, create state from the downloaded reference and persist immediately.
+        // Dual-mode: .mrkl is the single source of truth for *verified content*,
+        // but the caller's `reference` argument is the single source of truth for
+        // *what content the caller wants*. The two must agree, or the cache is
+        // stale relative to the upstream resource and serving from it would
+        // silently return wrong bytes. Compare root hashes and fail loudly on
+        // mismatch — auto-recovery is the caller's responsibility (delete the
+        // cache dir and reopen) because silent invalidation is what got us into
+        // the stale-bytes regime in the first place.
         let (reference, state) = if state_path.exists() {
             let state = MerkleState::load(&state_path)?;
-            let reference = state.to_ref();
+            let cached_ref = state.to_ref();
+            if cached_ref.root_hash() != reference.root_hash() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "cache at {} is stale: cached merkle root {} disagrees with \
+                         upstream merkle root {}. The remote resource has changed since \
+                         this cache directory was populated. Delete {} and reopen to \
+                         force a refetch.",
+                        cache_dir.display(),
+                        hex_short(cached_ref.root_hash()),
+                        hex_short(reference.root_hash()),
+                        cache_dir.display(),
+                    ),
+                ));
+            }
+            // Prefer the caller's reference (identical content, but it is the
+            // authoritative copy and may carry shape metadata we want to keep).
             (reference, state)
         } else {
             let mut state = MerkleState::from_ref(&reference);
@@ -582,5 +614,70 @@ mod tests {
         // Verify all data is correct
         let all = channel.read(0, 4096).unwrap();
         assert_eq!(&all, &data);
+    }
+
+    /// Reopening a cache dir with a different upstream merkle ref must
+    /// fail loudly, not silently serve the previously cached bytes.
+    /// This is the regression test for the stale-mref bug that the
+    /// `<host>:<port>/` cache directory naming used to paper over.
+    #[test]
+    fn test_open_with_mismatched_reference_errors() {
+        let chunk_size = 256u64;
+        let original: Vec<u8> = (0..1024).map(|i| (i % 251) as u8).collect();
+        let original_ref = MerkleRef::from_content(&original, chunk_size);
+
+        let dir = tempfile::tempdir().unwrap();
+
+        // First open: populate cache against the original ref.
+        {
+            let transport = Box::new(MemoryTransport::new(original.clone()));
+            let channel = CachedChannel::open(
+                transport, original_ref.clone(), dir.path(), "asset.dat",
+            ).unwrap();
+            channel.prebuffer().unwrap();
+            assert!(channel.is_complete());
+        }
+
+        // Reopen with a *different* upstream — same URL, new content.
+        // This is exactly the scenario the old port-isolation hack
+        // hid: now we surface it instead of trusting the stale state.
+        let replaced: Vec<u8> = (0..1024).map(|i| ((i + 7) % 251) as u8).collect();
+        let replaced_ref = MerkleRef::from_content(&replaced, chunk_size);
+        assert_ne!(original_ref.root_hash(), replaced_ref.root_hash());
+
+        let transport = Box::new(MemoryTransport::new(replaced));
+        let err = match CachedChannel::open(
+            transport, replaced_ref, dir.path(), "asset.dat",
+        ) {
+            Ok(_) => panic!("expected stale-cache error, got Ok"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let msg = err.to_string();
+        assert!(msg.contains("stale"), "expected stale-cache phrasing: {msg}");
+        assert!(msg.contains("Delete"), "expected actionable Delete hint: {msg}");
+    }
+
+    /// Reopening a cache dir with the *same* upstream merkle ref must
+    /// succeed and reuse the cached state (no re-download).
+    #[test]
+    fn test_open_with_matching_reference_resumes() {
+        let chunk_size = 256u64;
+        let data: Vec<u8> = (0..1024).map(|i| (i % 251) as u8).collect();
+        let mref = MerkleRef::from_content(&data, chunk_size);
+
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let transport = Box::new(MemoryTransport::new(data.clone()));
+            let channel = CachedChannel::open(
+                transport, mref.clone(), dir.path(), "asset.dat",
+            ).unwrap();
+            channel.prebuffer().unwrap();
+        }
+        let transport = Box::new(MemoryTransport::new(data.clone()));
+        let channel = CachedChannel::open(
+            transport, mref, dir.path(), "asset.dat",
+        ).unwrap();
+        assert!(channel.is_complete(), "matching reopen should resume from valid state");
     }
 }

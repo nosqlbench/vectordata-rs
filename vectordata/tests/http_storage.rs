@@ -34,7 +34,7 @@
 mod support;
 
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use byteorder::{LittleEndian, WriteBytesExt};
 
@@ -46,6 +46,25 @@ use vectordata::{
 use vectordata::merkle::MerkleRef;
 
 use support::testserver::TestServer;
+
+/// Test-wide cache root. Lives in `target/tmp` so it sits next to the
+/// usual fixture tempdirs and gets reaped by `cargo clean`. The TempDir
+/// is dropped at process exit, taking every cache artifact with it —
+/// nothing leaks into the user's real `cache_dir:`. The override is
+/// installed lazily on first `TestServer` use via [`init_test_cache`].
+static TEST_CACHE_DIR: LazyLock<tempfile::TempDir> = LazyLock::new(|| {
+    let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/tmp");
+    std::fs::create_dir_all(&base).unwrap();
+    tempfile::tempdir_in(&base).expect("create test cache root")
+});
+
+/// Redirect `vectordata::settings::cache_dir()` to the per-process
+/// test tempdir. Idempotent — safe to call from every test.
+fn init_test_cache() {
+    vectordata::settings::override_cache_dir_for_process(
+        TEST_CACHE_DIR.path().to_path_buf(),
+    );
+}
 
 // ═══════════════════════════════════════════════════════════════════════
 // Fixtures
@@ -61,18 +80,6 @@ fn make_tmp() -> tempfile::TempDir {
     let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/tmp");
     std::fs::create_dir_all(&base).unwrap();
     tempfile::tempdir_in(&base).unwrap()
-}
-
-/// Wipe any cache state for the given server's URL prefix so a test
-/// starts from a known empty-cache baseline. Required because cargo
-/// test reuses ephemeral ports across runs and the configured
-/// cache_dir at `/mnt/datamir/vectordata-cache` persists, so a
-/// previous run on the same port can leave a populated cache that
-/// would make a "starts not-complete" assertion false.
-fn reset_cache_for_server(server: &TestServer) {
-    let cache_root = vectordata::settings::cache_dir().expect("settings.yaml configured");
-    let host_dir = cache_root.join(format!("127.0.0.1:{}", server.port()));
-    let _ = std::fs::remove_dir_all(&host_dir);
 }
 
 /// Write a uniform fvec containing `count` records of dimension `dim`.
@@ -169,7 +176,7 @@ fn fvec_local_cached_direct_agree() {
     write_fvec(&path, 200, 16);
     write_mref(&path);
     let server = TestServer::start(tmp.path()).unwrap();
-    reset_cache_for_server(&server);
+    init_test_cache();
     let url = format!("{}base.fvec", server.base_url());
 
     let local = XvecReader::<f32>::open(path.to_str().unwrap()).unwrap();
@@ -204,14 +211,15 @@ fn fvec_no_mref_falls_back_to_direct_http() {
     write_fvec(&path, 50, 8);
     // *No* .mref written — Storage::open_url must silently fall back.
     let server = TestServer::start(tmp.path()).unwrap();
-    reset_cache_for_server(&server);
+    init_test_cache();
     let url = format!("{}base.fvec", server.base_url());
 
     let direct = XvecReader::<f32>::open(&url).unwrap();
     assert_eq!(direct.count(), 50);
     assert_eq!(direct.dim(), 8);
     // Pre-prebuffer: direct-HTTP is not complete (no cache file
-    // exists yet — we cleaned it via reset_cache_for_server).
+    // exists yet — this test's cache root is a fresh process-wide
+    // tempdir set up by init_test_cache).
     assert!(!direct.is_complete());
 
     // Per-record reads still work — they go over HTTP one record
@@ -229,7 +237,7 @@ fn open_vec_dispatches_through_http() {
     write_fvec(&path, 32, 4);
     write_mref(&path);
     let server = TestServer::start(tmp.path()).unwrap();
-    reset_cache_for_server(&server);
+    init_test_cache();
     let url = format!("{}base.fvec", server.base_url());
 
     let local = open_vec::<f32>(path.to_str().unwrap()).unwrap();
@@ -251,7 +259,7 @@ fn cached_storage_promotes_to_mmap_after_prebuffer() {
     write_fvec(&path, 100, 32); // > 1 chunk at TEST_CHUNK=4KiB
     write_mref(&path);
     let server = TestServer::start(tmp.path()).unwrap();
-    reset_cache_for_server(&server);
+    init_test_cache();
     let url = format!("{}base.fvec", server.base_url());
 
     let r = XvecReader::<f32>::open(&url).unwrap();
@@ -277,7 +285,7 @@ fn prebuffer_with_progress_callback_fires() {
     write_fvec(&path, 300, 64); // ~75 KiB → ~19 chunks at TEST_CHUNK
     write_mref(&path);
     let server = TestServer::start(tmp.path()).unwrap();
-    reset_cache_for_server(&server);
+    init_test_cache();
     let url = format!("{}base.fvec", server.base_url());
 
     let r = XvecReader::<f32>::open(&url).unwrap();
@@ -304,7 +312,7 @@ fn vvec_cached_via_idxfor_sidecar() {
     write_mref(&path);
     write_idxfor(&path, &offsets);
     let server = TestServer::start(tmp.path()).unwrap();
-    reset_cache_for_server(&server);
+    init_test_cache();
     let url = format!("{}predicates.ivvec", server.base_url());
 
     let local = IndexedVvecReader::<i32>::open(path.to_str().unwrap()).unwrap();
@@ -330,7 +338,7 @@ fn vvec_cached_falls_back_to_walk_without_idxfor() {
     let _ = write_ivvec(&path, 12);
     write_mref(&path);
     let server = TestServer::start(tmp.path()).unwrap();
-    reset_cache_for_server(&server);
+    init_test_cache();
     let url = format!("{}predicates.ivvec", server.base_url());
 
     let remote = IndexedVvecReader::<i32>::open(&url).unwrap();
@@ -348,7 +356,7 @@ fn open_vvec_dispatches_through_http() {
     write_mref(&path);
     write_idxfor(&path, &offsets);
     let server = TestServer::start(tmp.path()).unwrap();
-    reset_cache_for_server(&server);
+    init_test_cache();
     let url = format!("{}predicates.ivvec", server.base_url());
 
     let local = open_vvec::<i32>(path.to_str().unwrap()).unwrap();
@@ -370,7 +378,7 @@ fn typed_reader_open_url_scalar_u8_native() {
     write_scalar_u8(&path, 256);
     write_mref(&path);
     let server = TestServer::start(tmp.path()).unwrap();
-    reset_cache_for_server(&server);
+    init_test_cache();
     let url = url::Url::parse(&format!("{}metadata.u8", server.base_url())).unwrap();
 
     let r = TypedReader::<u8>::open_url(url, ElementType::U8).unwrap();
@@ -389,7 +397,7 @@ fn typed_reader_open_url_widening_u8_to_i32() {
     write_scalar_u8(&path, 100);
     write_mref(&path);
     let server = TestServer::start(tmp.path()).unwrap();
-    reset_cache_for_server(&server);
+    init_test_cache();
     let url = url::Url::parse(&format!("{}metadata.u8", server.base_url())).unwrap();
 
     let r = TypedReader::<i32>::open_url(url, ElementType::U8).unwrap();
@@ -407,7 +415,7 @@ fn typed_reader_open_url_narrowing_rejected() {
     drop(f);
     write_mref(&path);
     let server = TestServer::start(tmp.path()).unwrap();
-    reset_cache_for_server(&server);
+    init_test_cache();
     let url = url::Url::parse(&format!("{}metadata.i32", server.base_url())).unwrap();
 
     let result = TypedReader::<u8>::open_url(url, ElementType::I32);
@@ -421,7 +429,7 @@ fn typed_reader_open_url_no_mref_still_works() {
     let path = tmp.path().join("metadata.u8");
     write_scalar_u8(&path, 64);
     let server = TestServer::start(tmp.path()).unwrap();
-    reset_cache_for_server(&server);
+    init_test_cache();
     let url = url::Url::parse(&format!("{}metadata.u8", server.base_url())).unwrap();
 
     let r = TypedReader::<u8>::open_url(url, ElementType::U8).unwrap();
@@ -437,7 +445,7 @@ fn typed_reader_open_url_ivec_record() {
     write_ivec(&path, 5, 3);
     write_mref(&path);
     let server = TestServer::start(tmp.path()).unwrap();
-    reset_cache_for_server(&server);
+    init_test_cache();
     let url = url::Url::parse(&format!("{}data.ivec", server.base_url())).unwrap();
 
     let r = TypedReader::<i32>::open_url(url, ElementType::I32).unwrap();
@@ -454,7 +462,7 @@ fn typed_reader_open_auto_dispatches_url() {
     write_scalar_u8(&path, 50);
     write_mref(&path);
     let server = TestServer::start(tmp.path()).unwrap();
-    reset_cache_for_server(&server);
+    init_test_cache();
     let url_str = format!("{}metadata.u8", server.base_url());
 
     let r = TypedReader::<u8>::open_auto(&url_str, ElementType::U8).unwrap();
@@ -506,7 +514,7 @@ fn view_round_trip_over_http() {
     let tmp = make_tmp();
     make_remote_dataset(tmp.path());
     let server = TestServer::start(tmp.path()).unwrap();
-    reset_cache_for_server(&server);
+    init_test_cache();
     let base_url = server.base_url();
 
     let group = TestDataGroup::load(&base_url).unwrap();
@@ -544,7 +552,7 @@ fn view_open_facet_typed_over_http() {
     let tmp = make_tmp();
     make_remote_dataset(tmp.path());
     let server = TestServer::start(tmp.path()).unwrap();
-    reset_cache_for_server(&server);
+    init_test_cache();
     let group = TestDataGroup::load(&server.base_url()).unwrap();
     let view = group.profile("default").unwrap();
 
@@ -568,7 +576,7 @@ fn prebuffer_all_drives_every_facet_complete() {
     let tmp = make_tmp();
     make_remote_dataset(tmp.path());
     let server = TestServer::start(tmp.path()).unwrap();
-    reset_cache_for_server(&server);
+    init_test_cache();
     let group = TestDataGroup::load(&server.base_url()).unwrap();
     let view = group.profile("default").unwrap();
 
@@ -605,7 +613,7 @@ fn cache_stats_reports_partial_and_full_fill() {
     let tmp = make_tmp();
     make_remote_dataset(tmp.path());
     let server = TestServer::start(tmp.path()).unwrap();
-    reset_cache_for_server(&server);
+    init_test_cache();
     let group = TestDataGroup::load(&server.base_url()).unwrap();
     let view = group.profile("default").unwrap();
 
@@ -656,7 +664,7 @@ profiles:
 "#).unwrap();
     // No .mref files at all → every facet falls back to direct HTTP.
     let server = TestServer::start(tmp.path()).unwrap();
-    reset_cache_for_server(&server);
+    init_test_cache();
     let group = TestDataGroup::load(&server.base_url()).unwrap();
     let view = group.profile("default").unwrap();
 
@@ -700,7 +708,7 @@ fn local_yaml_with_absolute_http_facets() {
     write_mref(&tmp_remote.path().join("base.fvec"));
     write_mref(&tmp_remote.path().join("query.fvec"));
     let server = TestServer::start(tmp_remote.path()).unwrap();
-    reset_cache_for_server(&server);
+    init_test_cache();
     let base_url = server.base_url();
 
     let tmp_local = make_tmp();
@@ -788,7 +796,7 @@ fn early_xvec_reader_picks_up_promotion_via_get_slice() {
     write_fvec(&path, 500, 32);  // many TEST_CHUNK chunks
     write_mref(&path);
     let server = TestServer::start(tmp.path()).unwrap();
-    reset_cache_for_server(&server);
+    init_test_cache();
     let url = format!("{}base.fvec", server.base_url());
 
     // Reader A is opened BEFORE prebuffer runs on a separate Storage.
@@ -826,7 +834,7 @@ fn early_xvec_reader_picks_up_promotion_via_inherent_get_slice() {
     write_fvec(&path, 400, 16);
     write_mref(&path);
     let server = TestServer::start(tmp.path()).unwrap();
-    reset_cache_for_server(&server);
+    init_test_cache();
     let url = format!("{}base.fvec", server.base_url());
 
     let early = XvecReader::<f32>::open(&url).unwrap();
@@ -867,7 +875,7 @@ fn prebuffer_via_view_promotes_other_open_readers() {
     write_mref(&tmp.path().join("metadata.u8"));
 
     let server = TestServer::start(tmp.path()).unwrap();
-    reset_cache_for_server(&server);
+    init_test_cache();
     let group = TestDataGroup::load(&server.base_url()).unwrap();
     let view = group.profile("default").unwrap();
 
@@ -897,7 +905,7 @@ fn prebuffer_propagates_failure_for_typed_reader_too() {
     write_scalar_u8(&path, 200_000);  // ~50 chunks at TEST_CHUNK=4KiB
     write_mref(&path);
     let server = TestServer::start(tmp.path()).unwrap();
-    reset_cache_for_server(&server);
+    init_test_cache();
     let url = url::Url::parse(&format!("{}metadata.u8", server.base_url())).unwrap();
 
     let early = TypedReader::<u8>::open_url(url.clone(), ElementType::U8).unwrap();
@@ -927,7 +935,7 @@ fn prebuffer_strict_contract_cached() {
     let tmp = make_tmp();
     make_remote_dataset(tmp.path());
     let server = TestServer::start(tmp.path()).unwrap();
-    reset_cache_for_server(&server);
+    init_test_cache();
     let group = TestDataGroup::load(&server.base_url()).unwrap();
     let view = group.profile("default").unwrap();
 
@@ -957,7 +965,7 @@ fn prebuffer_for_url_without_mref_downloads_and_promotes() {
     write_fvec(&path, 80, 8);
     // *No* write_mref — direct HTTP path.
     let server = TestServer::start(tmp.path()).unwrap();
-    reset_cache_for_server(&server);
+    init_test_cache();
     let url = format!("{}base.fvec", server.base_url());
 
     let r = XvecReader::<f32>::open(&url).unwrap();
@@ -988,7 +996,7 @@ fn prebuffer_persists_for_subsequent_opens_without_mref() {
     let path = tmp.path().join("base.fvec");
     write_fvec(&path, 40, 8);
     let server = TestServer::start(tmp.path()).unwrap();
-    reset_cache_for_server(&server);
+    init_test_cache();
     let url = format!("{}base.fvec", server.base_url());
 
     XvecReader::<f32>::open(&url).unwrap().prebuffer().unwrap();
@@ -1019,7 +1027,7 @@ fn prebuffer_fails_loud_when_remote_size_mismatch() {
     let path = tmp.path().join("base.fvec");
     write_fvec(&path, 20, 4);
     let server = TestServer::start(tmp.path()).unwrap();
-    reset_cache_for_server(&server);
+    init_test_cache();
     let url = format!("{}base.fvec", server.base_url());
 
     let r = XvecReader::<f32>::open(&url).unwrap();
@@ -1053,7 +1061,7 @@ fn prebuffer_all_with_progress_propagates_facet_errors() {
     write_mref(&tmp.path().join("base.fvec"));
     // query.fvec is referenced but not written.
     let server = TestServer::start(tmp.path()).unwrap();
-    reset_cache_for_server(&server);
+    init_test_cache();
     let yaml = format!(r#"
 name: missing-facet
 profiles:
@@ -1087,7 +1095,7 @@ fn concurrent_readers_share_promotion_safely() {
     write_fvec(&path, 800, 32);
     write_mref(&path);
     let server = TestServer::start(tmp.path()).unwrap();
-    reset_cache_for_server(&server);
+    init_test_cache();
     let url = format!("{}base.fvec", server.base_url());
 
     let n_readers = 8;
@@ -1150,7 +1158,7 @@ fn many_parallel_opens_of_same_url_dont_corrupt_reads() {
     write_fvec(&path, 500, 16);
     write_mref(&path);
     let server = TestServer::start(tmp.path()).unwrap();
-    reset_cache_for_server(&server);
+    init_test_cache();
     let url = Arc::new(format!("{}base.fvec", server.base_url()));
 
     let n_threads = 16;
@@ -1187,7 +1195,7 @@ fn parallel_opens_share_single_cache_channel() {
     write_fvec(&path, 1000, 32);
     write_mref(&path);
     let server = TestServer::start(tmp.path()).unwrap();
-    reset_cache_for_server(&server);
+    init_test_cache();
     let url = Arc::new(format!("{}base.fvec", server.base_url()));
 
     let baseline = server.accepted_connections();
@@ -1229,7 +1237,7 @@ fn many_per_record_reads_share_one_tcp_connection() {
     write_fvec(&path, 200, 8);
     // No .mref → direct HTTP; per-record reads go over the wire.
     let server = TestServer::start(tmp.path()).unwrap();
-    reset_cache_for_server(&server);
+    init_test_cache();
     let url = format!("{}base.fvec", server.base_url());
 
     let baseline = server.accepted_connections();
@@ -1272,7 +1280,7 @@ fn many_storage_opens_share_one_client_no_cert_load_storm() {
     let path = tmp.path().join("base.fvec");
     write_fvec(&path, 50, 4);
     let server = TestServer::start(tmp.path()).unwrap();
-    reset_cache_for_server(&server);
+    init_test_cache();
     let url = format!("{}base.fvec", server.base_url());
 
     let baseline = server.accepted_connections();
@@ -1302,7 +1310,7 @@ fn shared_client_is_singleton_across_storages() {
     let path = tmp.path().join("base.fvec");
     write_fvec(&path, 30, 4);
     let server = TestServer::start(tmp.path()).unwrap();
-    reset_cache_for_server(&server);
+    init_test_cache();
     let url = format!("{}base.fvec", server.base_url());
 
     // Hammer: 100 open-then-drop cycles. If every open built a
@@ -1343,7 +1351,7 @@ profiles:
     query_vectors: query.fvec
 "#).unwrap();
     let server = TestServer::start(tmp.path()).unwrap();
-    reset_cache_for_server(&server);
+    init_test_cache();
     let group = TestDataGroup::load(&server.base_url()).unwrap();
 
     let mut visited: Vec<(String, String)> = Vec::new();
@@ -1397,7 +1405,7 @@ profiles:
     base_vectors: base.fvec
 "#).unwrap();
     let server = TestServer::start(tmp.path()).unwrap();
-    reset_cache_for_server(&server);
+    init_test_cache();
     let group = TestDataGroup::load(&server.base_url()).unwrap();
 
     let mut warned: Option<u64> = None;
@@ -1422,7 +1430,7 @@ fn arc_clone_of_reader_shares_storage() {
     write_fvec(&path, 200, 16);
     write_mref(&path);
     let server = TestServer::start(tmp.path()).unwrap();
-    reset_cache_for_server(&server);
+    init_test_cache();
     let url = format!("{}base.fvec", server.base_url());
 
     let r1 = Arc::new(XvecReader::<f32>::open(&url).unwrap());

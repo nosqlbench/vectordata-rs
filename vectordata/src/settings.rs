@@ -16,9 +16,30 @@
 //! ready-to-paste set of commands the user can run to configure it.
 
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 const CONFIG_DIR: &str = ".config/vectordata";
 const SETTINGS_FILE: &str = "settings.yaml";
+
+/// Process-wide override for the cache directory. When set, [`cache_dir`]
+/// returns this value verbatim and never reads `settings.yaml`. Intended
+/// for tests that need to isolate cache state in a tempdir without
+/// touching the user's real configuration or racing on `$VECTORDATA_HOME`
+/// (which is a process-wide env var and tests share a process when run
+/// with `cargo test`).
+static CACHE_DIR_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
+
+/// Install a process-wide override for [`cache_dir`]. First call wins;
+/// subsequent calls are silent no-ops so racing test initializers
+/// converge on a single value instead of panicking.
+///
+/// Use this from a one-time test initializer (a `LazyLock<TempDir>` or
+/// equivalent) — never from production code. There is intentionally no
+/// way to clear the override once set, so tests cannot stomp on each
+/// other by alternating overrides.
+pub fn override_cache_dir_for_process(path: PathBuf) {
+    let _ = CACHE_DIR_OVERRIDE.set(path);
+}
 
 /// Settings resolution failure.
 #[derive(Debug)]
@@ -87,7 +108,13 @@ pub fn settings_path() -> PathBuf {
 /// [`SettingsError::NotConfigured`] — there is **no silent
 /// fallback**. Print the error directly: its `Display` impl carries
 /// ready-to-paste commands the user can run to configure the cache.
+///
+/// If [`override_cache_dir_for_process`] has been called, that value
+/// takes precedence and `settings.yaml` is not consulted.
 pub fn cache_dir() -> Result<PathBuf, SettingsError> {
+    if let Some(p) = CACHE_DIR_OVERRIDE.get() {
+        return Ok(p.clone());
+    }
     cache_dir_from(&settings_path())
 }
 
