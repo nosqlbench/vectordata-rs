@@ -28,6 +28,23 @@ sha2 = "0.10"
 half = "2"
 reqwest = { version = "0.13.1", features = ["blocking", "json"] }
 url = "2.5"
+# Optional — only required by the `vectordata` binary. Pulled in by
+# the default `cli` feature so `cargo install vectordata` produces a
+# working binary with no `--features` ceremony. Library-only consumers
+# can drop clap with `default-features = false`.
+clap = { version = "4", features = ["derive", "string"], optional = true }
+clap_complete = { version = "4", features = ["unstable-dynamic"], optional = true }
+
+[features]
+default = ["cli"]
+# Enables the `vectordata` binary. Library users who don't need the
+# binary can disable this with `default-features = false`.
+cli = ["dep:clap", "dep:clap_complete"]
+
+[[bin]]
+name = "vectordata"
+required-features = ["cli"]
+path = "src/bin/vectordata.rs"
 
 [dev-dependencies]
 axum = "0.8"

@@ -26,7 +26,9 @@ use memmap2::Mmap;
 use url::Url;
 
 use crate::cache::CachedChannel;
-use crate::cache::reader::{cache_dir_for_url, default_cache_dir};
+use crate::cache::reader::{
+    blob_dir_for_mref, blob_dir_for_url, default_cache_dir, write_origin,
+};
 use crate::merkle::MerkleRef;
 use crate::transport::HttpTransport;
 
@@ -49,9 +51,9 @@ pub(crate) enum Storage {
         transport: HttpTransport,
         total_size: u64,
         /// Local path where `prebuffer` lands the downloaded file.
-        /// Computed from the URL via `cache_dir_for_url` so multiple
-        /// `Storage::Http` instances against the same URL share one
-        /// on-disk file.
+        /// Computed from the URL via `blob_dir_for_url` (under the
+        /// `http/` subtree) so multiple `Storage::Http` instances
+        /// against the same URL share one on-disk file.
         cache_path: std::path::PathBuf,
         /// Promoted-mmap view of `cache_path`, set by `prebuffer` or
         /// at open time if a prior prebuffer left the file with the
@@ -263,11 +265,14 @@ impl Storage {
         let reference = MerkleRef::from_bytes(&mref_bytes)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("mref parse: {e}")))?;
 
-        let cache_dir = cache_dir_for_url(&url, cache_root);
+        let cache_dir = blob_dir_for_mref(cache_root, &reference);
         let filename: String = url.path_segments()
             .and_then(|mut s| s.next_back())
             .unwrap_or("data")
             .to_string();
+        // Best-effort sidecar — record which URL populated this
+        // content-addressed blob so tooling can group by origin.
+        let _ = write_origin(&cache_dir, &url);
         let transport = HttpTransport::with_client(client, url);
         let channel = CachedChannel::open(
             Box::new(transport),
@@ -292,8 +297,8 @@ impl Storage {
     /// fallback path of `open_url` (used when no `.mref` is
     /// published). Per-read fetches go over HTTP until the caller
     /// runs [`prebuffer`], which downloads the whole file into
-    /// `cache_dir/<host:port>/<url-path-prefix>/<filename>` and
-    /// promotes to mmap.
+    /// `cache_dir/http/<sha256(url)[..2]>/<sha256(url)>/<filename>`
+    /// and promotes to mmap.
     ///
     /// At open time, if the cache file already exists with the
     /// expected size (from a prior prebuffer), this constructor
@@ -302,12 +307,16 @@ impl Storage {
     pub(crate) fn open_url_http(url: Url) -> io::Result<Self> {
         let cache_root = crate::settings::cache_dir()
             .map_err(|e| io::Error::new(io::ErrorKind::NotFound, e.to_string()))?;
-        let cache_dir = cache_dir_for_url(&url, &cache_root);
+        let cache_dir = blob_dir_for_url(&cache_root, &url);
         let filename: String = url.path_segments()
             .and_then(|mut s| s.next_back())
             .unwrap_or("data")
             .to_string();
         let cache_path = cache_dir.join(&filename);
+        // Best-effort sidecar — record which URL populated this dir.
+        // We don't gate on its presence: tools fall back to "unknown
+        // origin" if it's missing.
+        let _ = write_origin(&cache_dir, &url);
 
         let transport = HttpTransport::new(url);
         let total_size = ChunkedTransportExt::content_length_for(&transport)?;

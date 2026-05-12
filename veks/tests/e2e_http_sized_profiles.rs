@@ -28,11 +28,28 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::LazyLock;
 
 use veks::prepare::import::ImportArgs;
 
 mod support;
 use support::testserver::TestServer;
+
+/// Process-wide cache override so the e2e test never writes into the
+/// user's real `cache_dir:`. Mirrors the pattern used in
+/// `vectordata/tests/http_storage.rs`. Lives in `target/tmp` and is
+/// torn down at process exit.
+static TEST_CACHE_DIR: LazyLock<tempfile::TempDir> = LazyLock::new(|| {
+    let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/tmp");
+    std::fs::create_dir_all(&base).unwrap();
+    tempfile::tempdir_in(&base).expect("create test cache root")
+});
+
+fn init_test_cache() {
+    vectordata::settings::override_cache_dir_for_process(
+        TEST_CACHE_DIR.path().to_path_buf(),
+    );
+}
 
 // ─── Shared test helpers (miniature copies of the e2e_pipeline.rs
 // fixtures; duplicated deliberately because integration tests can't
@@ -282,6 +299,7 @@ fn e2e_sized_profiles_published_and_fetchable_over_http() {
     }
 
     // ── (4) + (5): fetch + verify through the client API over HTTP ──
+    init_test_cache();
     let server = TestServer::start(&out).expect("start HTTP test server");
     let group = vectordata::TestDataGroup::load(&server.base_url())
         .expect("TestDataGroup::load over HTTP");

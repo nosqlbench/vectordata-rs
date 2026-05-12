@@ -85,6 +85,10 @@ pub(crate) mod storage;
 /// [`settings::cache_dir`] rather than parsing `settings.yaml`
 /// themselves so the user's override is honored uniformly.
 pub mod settings;
+/// Canonical implementation of the user-facing `config` admin
+/// commands. Both the `vectordata` binary and the `veks` CLI dispatch
+/// here — there is no parallel implementation in either consumer.
+pub mod config;
 /// Catalog discovery — find datasets by name from configured sources.
 ///
 /// This is the recommended entry point. Configure catalog sources in
@@ -122,6 +126,24 @@ pub mod view;
 /// [`TestDataGroup::load`] opens a dataset from a path or URL.
 /// Prefer [`catalog::resolver::Catalog::open`] for name-based access.
 pub mod group;
+
+/// Cache-administration helpers for the `veks` CLI tooling.
+///
+/// Exposes a *minimal* surface for tasks that inspect or scrub the
+/// on-disk cache root — the live cache state itself is owned by
+/// internal types ([`storage::Storage`], [`cache::CachedChannel`])
+/// that are deliberately not reachable from outside this crate. If you
+/// find yourself reaching for more than this module exposes, the right
+/// move is to add another targeted re-export, not to widen visibility
+/// on the core types.
+pub mod cache_admin {
+    pub use crate::cache::reader::{
+        BLOBS_DIR, HTTP_DIR,
+        CacheEntry, CacheListing,
+        is_legacy_layout_name, is_reserved_layout_name,
+        list_entries, prune_legacy_layout,
+    };
+}
 
 pub use group::{TestDataGroup, PREBUFFER_LARGE_WARNING_BYTES};
 pub use model::FacetConfig;

@@ -211,6 +211,18 @@ pub enum DatasetsCommand {
         #[arg(long)]
         cache_dir: Option<PathBuf>,
     },
+    /// Remove legacy `<host>` / `<host>:<port>` cache directories left
+    /// behind by versions before the content-addressed layout. Safe
+    /// to run repeatedly — only matches the exact legacy shapes.
+    PruneLegacyCache {
+        /// Print what would be removed without deleting.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Override cache directory location.
+        #[arg(long)]
+        cache_dir: Option<PathBuf>,
+    },
     /// Download and cache dataset facets locally
     Prebuffer {
         /// Dataset name or dataset:profile from catalog
@@ -244,6 +256,8 @@ pub enum DatasetsCommand {
 pub enum ConfigSubcommand {
     /// Display current vectordata configuration
     Show,
+    /// Print the configured cache_dir (scriptable counterpart to set-cache)
+    GetCache,
     /// Set the cache directory for downloaded datasets
     SetCache {
         /// Cache directory path (e.g., /mnt/data/vectordata-cache)
@@ -401,6 +415,48 @@ pub fn run(args: DatasetsArgs) {
         DatasetsCommand::DropCache { datasets, yes, verbose, cache_dir } => {
             drop_cache::run(&datasets, cache_dir.as_deref(), yes, verbose);
         }
+        DatasetsCommand::PruneLegacyCache { dry_run, cache_dir } => {
+            let cache_dir = cache_dir
+                .unwrap_or_else(|| crate::pipeline::commands::config::configured_cache_dir_or_exit());
+            if dry_run {
+                println!("Scanning {} for legacy <host>[:<port>] cache directories...",
+                    cache_dir.display());
+                let mut would_remove = Vec::new();
+                if let Ok(entries) = std::fs::read_dir(&cache_dir) {
+                    for e in entries.flatten() {
+                        if let Some(name) = e.file_name().to_str()
+                            && vectordata::cache_admin::is_legacy_layout_name(name)
+                            && e.path().is_dir()
+                        {
+                            would_remove.push(name.to_string());
+                        }
+                    }
+                }
+                if would_remove.is_empty() {
+                    println!("No legacy cache directories found.");
+                } else {
+                    println!("Would remove {} legacy dir(s):", would_remove.len());
+                    for name in &would_remove { println!("  {}", name); }
+                    println!("\nRun without --dry-run to delete.");
+                }
+            } else {
+                match vectordata::cache_admin::prune_legacy_layout(&cache_dir) {
+                    Ok(removed) if removed.is_empty() => {
+                        println!("No legacy cache directories found in {}.",
+                            cache_dir.display());
+                    }
+                    Ok(removed) => {
+                        println!("Removed {} legacy cache dir(s) from {}:",
+                            removed.len(), cache_dir.display());
+                        for name in &removed { println!("  {}", name); }
+                    }
+                    Err(e) => {
+                        eprintln!("Error pruning cache: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            }
+        }
         DatasetsCommand::Prebuffer { dataset, profile, configdir, catalog: raw_catalog, at, cache_dir } => {
             let catalog: Vec<String> = raw_catalog.iter().map(|v| resolve_catalog_value(v)).collect();
             let ds = match profile {
@@ -412,98 +468,39 @@ pub fn run(args: DatasetsArgs) {
     }
 }
 
-/// Run a config subcommand by dispatching to the pipeline CommandOp.
+/// Run a `veks config` subcommand. All operations are implemented
+/// once in `vectordata::config`; this function only translates the
+/// clap-derived enum into the library calls. `veks config` is, in
+/// effect, an alias for `vectordata config`.
 fn run_config_command(command: ConfigSubcommand) {
-    use crate::pipeline::command::{CommandOp, Options, StreamContext, Status};
-    use crate::pipeline::progress::ProgressLog;
-    use crate::pipeline::resource::ResourceGovernor;
-    use crate::pipeline::commands::config;
-    use indexmap::IndexMap;
-
-    let (mut cmd, extra_opts): (Box<dyn CommandOp>, Vec<(&str, String)>) = match command {
-        ConfigSubcommand::Show => (config::show_factory(), vec![]),
+    let code = match command {
+        ConfigSubcommand::Show => vectordata::config::show(),
+        ConfigSubcommand::GetCache => vectordata::config::get_cache(),
         ConfigSubcommand::SetCache { cache_dir, force } => {
-            let mut opts = Vec::new();
-            if let Some(dir) = cache_dir {
-                opts.push(("cache-dir", dir));
-            }
-            if force {
-                opts.push(("force", "true".to_string()));
-            }
-            (config::init_factory(), opts)
+            let Some(dir) = cache_dir else {
+                eprintln!("Error: --cache-dir is required.");
+                std::process::exit(1);
+            };
+            vectordata::config::set_cache(std::path::Path::new(&dir), force)
         }
-        ConfigSubcommand::ListMounts => (config::list_mounts_factory(), vec![]),
+        ConfigSubcommand::ListMounts => vectordata::config::list_mounts(false),
         ConfigSubcommand::AddCatalog { source } => {
-            run_catalog_config("add", &source);
-            return;
+            vectordata::config::add_catalog(&source)
         }
-        ConfigSubcommand::RemoveCatalog { source, at } => {
-            match (source, at) {
-                (Some(s), _) => {
-                    run_catalog_config("remove", &s);
-                }
-                (None, Some(idx)) => {
-                    // Resolve index to source URL by loading the catalog list
-                    let config_dir = crate::catalog::sources::expand_tilde(
-                        crate::catalog::sources::DEFAULT_CONFIG_DIR,
-                    );
-                    let catalogs_path = std::path::Path::new(&config_dir).join("catalogs.yaml");
-                    let entries: Vec<String> = if catalogs_path.is_file() {
-                        let content = std::fs::read_to_string(&catalogs_path).unwrap_or_default();
-                        serde_yaml::from_str(&content).unwrap_or_default()
-                    } else {
-                        Vec::new()
-                    };
-                    if idx == 0 || idx > entries.len() {
-                        eprintln!("Error: index {} out of range (1..{})", idx, entries.len());
-                        std::process::exit(1);
-                    }
-                    let source = &entries[idx - 1];
-                    println!("Removing catalog #{}: {}", idx, source);
-                    run_catalog_config("remove", source);
-                }
-                (None, None) => {
-                    eprintln!("Error: specify a catalog URL/path or --at <index>");
-                    eprintln!("  Use `veks config list-catalogs` to see available indices.");
-                    std::process::exit(1);
-                }
+        ConfigSubcommand::RemoveCatalog { source, at } => match (source, at) {
+            (Some(s), _) => vectordata::config::remove_catalog(
+                vectordata::config::RemoveCatalogSpec::Source(&s)),
+            (None, Some(n)) => vectordata::config::remove_catalog(
+                vectordata::config::RemoveCatalogSpec::Index(n)),
+            (None, None) => {
+                eprintln!("Error: specify a catalog URL/path or --at <index>");
+                eprintln!("  Use `veks datasets config list-catalogs` to see available indices.");
+                1
             }
-            return;
-        }
-        ConfigSubcommand::ListCatalogs => {
-            run_catalog_config("list", "");
-            return;
-        }
+        },
+        ConfigSubcommand::ListCatalogs => vectordata::config::list_catalogs(),
     };
-
-    let workspace = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let mut ctx = StreamContext {
-        dataset_name: String::new(),
-        profile: String::new(),
-        profile_names: vec![],
-        workspace: workspace.clone(),
-        cache: workspace.join(".cache"),
-        defaults: IndexMap::new(),
-        dry_run: false,
-        progress: ProgressLog::new(),
-        threads: 0,
-        step_id: String::new(),
-        governor: ResourceGovernor::default_governor(),
-        ui: crate::ui::UiHandle::new(std::sync::Arc::new(crate::ui::PlainSink::new())),
-        status_interval: std::time::Duration::from_secs(1),
-        estimated_total_steps: 0,
-        provenance_selector: veks_pipeline::pipeline::provenance::ProvenanceFlags::STRICT,
-    };
-
-    let mut opts = Options::new();
-    for (k, v) in extra_opts {
-        opts.set(k, &v);
-    }
-    let result = cmd.execute(&opts, &mut ctx);
-    if result.status == Status::Error {
-        eprintln!("Error: {}", result.message);
-        std::process::exit(1);
-    }
+    if code != 0 { std::process::exit(code); }
 }
 
 /// Completer for `--catalog`: suggests configured catalog sources from catalogs.yaml.
@@ -527,90 +524,3 @@ pub fn resolve_catalog_value(value: &str) -> String {
     value.to_string()
 }
 
-/// Manage catalog sources in `~/.config/vectordata/catalogs.yaml`.
-fn run_catalog_config(action: &str, source: &str) {
-    let config_dir = crate::catalog::sources::expand_tilde(
-        crate::catalog::sources::DEFAULT_CONFIG_DIR,
-    );
-    let catalogs_path = std::path::Path::new(&config_dir).join("catalogs.yaml");
-
-    // Load existing entries (or start empty)
-    let mut entries: Vec<String> = if catalogs_path.is_file() {
-        let content = std::fs::read_to_string(&catalogs_path).unwrap_or_default();
-        serde_yaml::from_str(&content).unwrap_or_default()
-    } else {
-        Vec::new()
-    };
-
-    match action {
-        "add" => {
-            if entries.iter().any(|e| e == source) {
-                println!("Already configured: {}", source);
-                return;
-            }
-
-            // Verify the source is reachable and contains a catalog
-            let sources = crate::catalog::sources::CatalogSources::new()
-                .add_catalogs(&[source.to_string()]);
-            let catalog = crate::catalog::resolver::Catalog::of(&sources);
-            let count = catalog.datasets().len();
-
-            if count > 0 {
-                println!("{} {} ({} dataset(s))",
-                    crate::term::ok("OK"),
-                    source,
-                    count);
-            } else {
-                eprintln!("{} {} — no datasets found at this location",
-                    crate::term::fail("FAIL"),
-                    source);
-                std::process::exit(1);
-            }
-
-            entries.push(source.to_string());
-            // Ensure config directory exists
-            if let Some(parent) = catalogs_path.parent() {
-                std::fs::create_dir_all(parent).unwrap_or_else(|e| {
-                    eprintln!("Error creating {}: {}", parent.display(), e);
-                    std::process::exit(1);
-                });
-            }
-            let yaml = serde_yaml::to_string(&entries).unwrap();
-            std::fs::write(&catalogs_path, &yaml).unwrap_or_else(|e| {
-                eprintln!("Error writing {}: {}", catalogs_path.display(), e);
-                std::process::exit(1);
-            });
-            println!("Saved to {}", catalogs_path.display());
-        }
-        "remove" => {
-            let before = entries.len();
-            entries.retain(|e| e != source);
-            if entries.len() == before {
-                eprintln!("Not found: {}", source);
-                std::process::exit(1);
-            }
-            let yaml = serde_yaml::to_string(&entries).unwrap();
-            std::fs::write(&catalogs_path, &yaml).unwrap_or_else(|e| {
-                eprintln!("Error writing {}: {}", catalogs_path.display(), e);
-                std::process::exit(1);
-            });
-            println!("Removed: {}", source);
-        }
-        "list" => {
-            if entries.is_empty() {
-                println!("No catalog sources configured.");
-                println!();
-                println!("Add one with:");
-                println!("  veks datasets config add-catalog <URL-or-path>");
-            } else {
-                println!("Configured catalog sources ({}):", entries.len());
-                for entry in &entries {
-                    println!("  {}", entry);
-                }
-                println!();
-                println!("Catalogs file: {}", catalogs_path.display());
-            }
-        }
-        _ => unreachable!(),
-    }
-}

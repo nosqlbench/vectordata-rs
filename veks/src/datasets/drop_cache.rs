@@ -167,12 +167,22 @@ fn discover_cached_datasets(cache_dir: &Path) -> Vec<PathBuf> {
     if let Ok(entries) = std::fs::read_dir(cache_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.is_dir() {
-                let has_yaml = path.join("dataset.yaml").exists();
-                let has_mrkl = has_mrkl_files(&path);
-                if has_yaml || has_mrkl {
-                    datasets.push(path);
-                }
+            if !path.is_dir() {
+                continue;
+            }
+            // Skip reserved layout subtrees (`blobs/`, `http/`) — they
+            // hold content-addressed cache buckets, not user-facing
+            // datasets, and would otherwise show up as a fake catalog
+            // entry because they contain nested .mrkl files.
+            if let Some(name) = path.file_name().and_then(|n| n.to_str())
+                && vectordata::cache_admin::is_reserved_layout_name(name)
+            {
+                continue;
+            }
+            let has_yaml = path.join("dataset.yaml").exists();
+            let has_mrkl = has_mrkl_files(&path);
+            if has_yaml || has_mrkl {
+                datasets.push(path);
             }
         }
     }

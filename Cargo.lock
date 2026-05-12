@@ -4965,6 +4965,8 @@ dependencies = [
  "anyhow",
  "axum",
  "byteorder",
+ "clap",
+ "clap_complete",
  "filetime",
  "half",
  "hex",

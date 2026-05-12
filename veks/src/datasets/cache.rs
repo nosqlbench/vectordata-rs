@@ -23,7 +23,13 @@ pub fn run(cache_dir: Option<&Path>, verbose: bool) {
     if let Ok(entries) = std::fs::read_dir(&cache_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.is_dir() && path.join("dataset.yaml").exists() {
+            if !path.is_dir() { continue; }
+            if let Some(name) = path.file_name().and_then(|n| n.to_str())
+                && vectordata::cache_admin::is_reserved_layout_name(name)
+            {
+                continue;
+            }
+            if path.join("dataset.yaml").exists() {
                 datasets.push(path);
             }
         }
@@ -99,6 +105,9 @@ pub fn run_cache_status_all(
 
         for entry in dirs {
             let name = entry.file_name().to_string_lossy().to_string();
+            if vectordata::cache_admin::is_reserved_layout_name(&name) {
+                continue;
+            }
             let ds_path = entry.path();
             // Only show directories that have .mrkl files or dataset.yaml
             let has_mrkl = has_mrkl_files(&ds_path);
