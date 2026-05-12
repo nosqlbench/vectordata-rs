@@ -202,7 +202,7 @@ work with.
             // Create relative symlink for portability
             let link_dir = output_path.parent().unwrap_or(std::path::Path::new("."));
             let rel_source = veks_core::paths::relative_path(link_dir, &source_path);
-            match std::os::unix::fs::symlink(&rel_source, &output_path) {
+            match veks_core::paths::portable_symlink_file(&rel_source, &output_path) {
                 Ok(()) => {
                     let record_str = probe.record_count
                         .map_or("unknown".to_string(), |n| n.to_string());

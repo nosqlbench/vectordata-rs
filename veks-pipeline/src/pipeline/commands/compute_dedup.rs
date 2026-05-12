@@ -115,13 +115,12 @@ impl VecReader {
     /// touched) and are copied into the returned buffer, then dropped
     /// at the end of the comparison call.
     fn pread_one_vector_bytes(&self, index: usize) -> Result<Vec<u8>, String> {
-        use std::os::unix::fs::FileExt;
+        use veks_core::formats::portable_io::pread_exact;
         let entry_size = self.entry_size();
         let value_bytes = entry_size - 4;
         let byte_offset = (index * entry_size + 4) as u64;  // skip i32 dim header
         let mut buf = vec![0u8; value_bytes];
-        self.pread_file()
-            .read_exact_at(&mut buf, byte_offset)
+        pread_exact(self.pread_file(), &mut buf, byte_offset)
             .map_err(|e| format!("pread vector {}: {}", index, e))?;
         Ok(buf)
     }
@@ -271,7 +270,7 @@ impl VecReader {
         buf: &mut Vec<u8>,
     ) -> Result<(), String> {
         use rayon::prelude::*;
-        use std::os::unix::fs::FileExt;
+        use veks_core::formats::portable_io::pread_exact;
         let entry_size = self.entry_size();
         let byte_start = (start * entry_size) as u64;
         let byte_len = (end - start) * entry_size;
@@ -301,7 +300,7 @@ impl VecReader {
             .enumerate()
             .try_for_each(|(i, slice)| {
                 let off = byte_start + (i * chunk_size) as u64;
-                file.read_exact_at(slice, off).map_err(|e| format!(
+                pread_exact(file, slice, off).map_err(|e| format!(
                     "pread chunk {} ({} bytes @ {}): {}",
                     i, slice.len(), off, e,
                 ))

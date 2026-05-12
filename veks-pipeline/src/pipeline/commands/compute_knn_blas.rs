@@ -22,7 +22,7 @@
 use std::collections::BinaryHeap;
 use std::fs::File;
 use std::io::Write;
-use std::os::unix::fs::FileExt;
+use veks_core::formats::portable_io::pread_exact;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -132,7 +132,7 @@ fn pread_and_unpack(
     packed: &mut [f32],
 ) -> std::io::Result<()> {
     let n_bytes = n_vecs * entry_size;
-    file.read_exact_at(&mut raw[..n_bytes], byte_off)?;
+    pread_exact(file, &mut raw[..n_bytes], byte_off)?;
     // Unpack: for each entry, skip the 4-byte dim header, then
     // either copy or convert dim elements into the packed buffer.
     match elem_size {

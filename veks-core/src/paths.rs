@@ -5,6 +5,27 @@
 
 use std::path::{Component, Path, PathBuf};
 
+/// Cross-platform symlink-to-file. `std::os::unix::fs::symlink` and
+/// `std::os::windows::fs::symlink_file` are differently-named — wrap
+/// the platform pick in a single helper so call sites stay portable.
+/// On Windows, `symlink_file` requires the process to have the
+/// "Create Symbolic Links" privilege (developer mode is the simplest
+/// way to grant it).
+pub fn portable_symlink_file(target: &Path, link: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    { std::os::unix::fs::symlink(target, link) }
+    #[cfg(windows)]
+    { std::os::windows::fs::symlink_file(target, link) }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (target, link);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "symlinks unsupported on this target",
+        ))
+    }
+}
+
 /// Compute a relative path from `base` directory to `target`.
 ///
 /// Both paths are normalized to absolute before comparison.

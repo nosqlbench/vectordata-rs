@@ -286,7 +286,7 @@ templates (compute-knn, verify-knn) for the new partition profiles.
                 if matching.is_empty() {
                     ctx.ui.log(&format!("    warning: no queries match label {} — symlinking full set", label));
                     let rel = relative_path(&profile_dir, &query_path);
-                    let _ = std::os::unix::fs::symlink(&rel, &part_query_path);
+                    let _ = veks_core::paths::portable_symlink_file(&rel, &part_query_path);
                     query_count
                 } else {
                     let mut f = match std::fs::File::create(&part_query_path) {
@@ -311,7 +311,7 @@ templates (compute-knn, verify-knn) for the new partition profiles.
             } else {
                 // No predicates — symlink full query set
                 let rel = relative_path(&profile_dir, &query_path);
-                let _ = std::os::unix::fs::symlink(&rel, &part_query_path);
+                let _ = veks_core::paths::portable_symlink_file(&rel, &part_query_path);
                 query_count
             };
 

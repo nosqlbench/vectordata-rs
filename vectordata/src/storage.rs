@@ -540,18 +540,26 @@ impl Storage {
 
     /// Hint that the full mapping will be accessed sequentially.
     /// No-op for non-mmap variants (and for `Cached`/`Http` until
-    /// promotion).
+    /// promotion). No-op on non-Unix targets — `memmap2::Mmap::advise`
+    /// is Unix-only (mirrors the `release_range_bytes` pattern).
     pub(crate) fn advise_sequential(&self) {
+        #[cfg(unix)]
         if let Some(m) = self.promoted_mmap() {
             let _ = m.advise(memmap2::Advice::Sequential);
         }
+        #[cfg(not(unix))]
+        let _ = self;
     }
 
     /// Hint that the full mapping will be accessed in random order.
+    /// No-op on non-Unix targets.
     pub(crate) fn advise_random(&self) {
+        #[cfg(unix)]
         if let Some(m) = self.promoted_mmap() {
             let _ = m.advise(memmap2::Advice::Random);
         }
+        #[cfg(not(unix))]
+        let _ = self;
     }
 
     /// Internal helper: borrow the promoted mmap, lazy-promoting
@@ -572,14 +580,22 @@ impl Storage {
     }
 
     /// `madvise(WILLNEED)` over the byte range. Non-blocking hint.
+    /// No-op on non-Unix targets — `Mmap::advise_range` is Unix-only.
     pub(crate) fn prefetch_range_bytes(&self, byte_start: u64, byte_end: u64) {
-        let mmap = self.promoted_mmap();
-        if let Some(m) = mmap {
-            let start = byte_start as usize;
-            let end = (byte_end as usize).min(m.len());
-            if end > start {
-                let _ = m.advise_range(memmap2::Advice::WillNeed, start, end - start);
+        #[cfg(unix)]
+        {
+            let mmap = self.promoted_mmap();
+            if let Some(m) = mmap {
+                let start = byte_start as usize;
+                let end = (byte_end as usize).min(m.len());
+                if end > start {
+                    let _ = m.advise_range(memmap2::Advice::WillNeed, start, end - start);
+                }
             }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (self, byte_start, byte_end);
         }
     }
 
@@ -589,11 +605,15 @@ impl Storage {
     /// larger windows callers pass in. Without alignment, madvise
     /// rejects with EINVAL silently.
     pub(crate) fn release_range_bytes(&self, byte_start: u64, byte_end: u64) {
-        let Some(m) = self.promoted_mmap() else { return; };
+        // `m` is bound only inside the `#[cfg(unix)]` block — leading
+        // underscore keeps the non-Unix build clean of "unused
+        // variable" warnings.
+        let Some(_m) = self.promoted_mmap() else { return; };
         if byte_start >= byte_end { return; }
 
         #[cfg(unix)]
         unsafe {
+            let m = _m;
             let page = libc::sysconf(libc::_SC_PAGESIZE) as usize;
             if page == 0 { return; }
             let start = byte_start as usize;
@@ -612,6 +632,9 @@ impl Storage {
     /// Force the byte range into the page cache via `madvise(WILLNEED)`
     /// + sequential volatile read. Blocks until the pages are
     /// resident. Caller increments `bytes_paged` per page touched.
+    /// The `madvise` portion is Unix-only; the volatile-read fallback
+    /// still executes on all platforms (it's the load-bearing part of
+    /// the prefetch — `madvise` is just a hint).
     pub(crate) fn prefetch_pages_bytes(
         &self,
         byte_start: u64,
@@ -622,7 +645,10 @@ impl Storage {
         let start = byte_start as usize;
         let end = (byte_end as usize).min(m.len());
         if end <= start { return; }
-        let _ = m.advise_range(memmap2::Advice::WillNeed, start, end - start);
+        #[cfg(unix)]
+        {
+            let _ = m.advise_range(memmap2::Advice::WillNeed, start, end - start);
+        }
 
         let data = &m[start..end];
         let page_size = 4096;

@@ -15,7 +15,7 @@ use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::fs::File;
 use std::io::Write;
-use std::os::unix::fs::FileExt;
+use veks_core::formats::portable_io::pread_exact;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -1017,8 +1017,8 @@ on `std::arch` alone, without SimSIMD, FAISS, or BLAS.
             let (c0_first, c0_n) = chunk_range(0);
             let c0_bytes = c0_n * entry_size;
             let c0_off = (c0_first as u64) * (entry_size as u64);
-            if let Err(e) = base_file.read_exact_at(
-                &mut buf_bytes_mut(&mut buf_a)[..c0_bytes], c0_off,
+            if let Err(e) = pread_exact(
+                &base_file, &mut buf_bytes_mut(&mut buf_a)[..c0_bytes], c0_off,
             ) {
                 return error_result(
                     format!("pread seg {} chunk 0: {}", seg_idx, e),
@@ -1049,8 +1049,8 @@ on `std::arch` alone, without SimSIMD, FAISS, or BLAS.
                         let bf = Arc::clone(&base_file);
                         let err_slot = Arc::clone(&io_err);
                         scope.spawn(move || {
-                            if let Err(e) = bf.read_exact_at(
-                                &mut buf_bytes_mut(rb)[..next_bytes], next_off,
+                            if let Err(e) = pread_exact(
+                                &bf, &mut buf_bytes_mut(rb)[..next_bytes], next_off,
                             ) {
                                 *err_slot.lock().unwrap() =
                                     Some(format!("pread chunk@{}: {}", next_first, e));

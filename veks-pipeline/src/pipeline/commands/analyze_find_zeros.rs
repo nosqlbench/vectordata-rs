@@ -213,7 +213,7 @@ fn scan_zeros_f32(
     ctx: &mut StreamContext,
 ) -> Vec<ZeroHit> {
     use std::fs::File;
-    use std::os::unix::fs::FileExt;
+    use veks_core::formats::portable_io::pread_exact;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Mutex;
 
@@ -305,7 +305,7 @@ fn scan_zeros_f32(
                             buf.len() * 4,
                         )
                     };
-                    if let Err(e) = file_ref.read_exact_at(&mut bytes_mut[..chunk_bytes], byte_off) {
+                    if let Err(e) = pread_exact(&file_ref, &mut bytes_mut[..chunk_bytes], byte_off) {
                         log::error!("pread at vec {}: {}", v, e);
                         return;
                     }
@@ -385,7 +385,7 @@ fn scan_zeros_f16(
     ctx: &mut StreamContext,
 ) -> Vec<ZeroHit> {
     use std::fs::File;
-    use std::os::unix::fs::FileExt;
+    use veks_core::formats::portable_io::pread_exact;
 
     let pb = ctx.ui.bar_with_unit(count as u64, "scanning", "vectors");
     let found = std::sync::atomic::AtomicUsize::new(0);
@@ -437,7 +437,7 @@ fn scan_zeros_f16(
                 chunk_buf.len() * 2,
             )
         };
-        if let Err(e) = file.read_exact_at(&mut bytes_mut[..chunk_bytes_now], byte_off) {
+        if let Err(e) = pread_exact(&file, &mut bytes_mut[..chunk_bytes_now], byte_off) {
             log::error!("pread at vec {}: {}", offset_vec, e);
             break;
         }
@@ -822,7 +822,7 @@ fn scan_file_concise_f32(
     threads: usize,
 ) -> Result<(usize, usize, usize, usize), String> {
     use std::fs::File;
-    use std::os::unix::fs::FileExt;
+    use veks_core::formats::portable_io::pread_exact;
 
     // Metadata via mmap (touches only the dim header). Full scan via
     // pread streaming so RSS stays bounded on terabyte-class sources.
@@ -866,7 +866,7 @@ fn scan_file_concise_f32(
                 chunk_buf.len() * 4,
             )
         };
-        file.read_exact_at(&mut bytes_mut[..chunk_bytes_now], byte_off)
+        pread_exact(&file, &mut bytes_mut[..chunk_bytes_now], byte_off)
             .map_err(|e| format!("pread at vec {}: {}", offset_vec, e))?;
 
         let chunk_view: &[f32] = &chunk_buf;
@@ -908,7 +908,7 @@ fn scan_file_concise_f16(
     threads: usize,
 ) -> Result<(usize, usize, usize, usize), String> {
     use std::fs::File;
-    use std::os::unix::fs::FileExt;
+    use veks_core::formats::portable_io::pread_exact;
 
     let reader = XvecReader::<half::f16>::open_path(path)
         .map_err(|e| format!("{}", e))?;
@@ -949,7 +949,7 @@ fn scan_file_concise_f16(
                 chunk_buf.len() * 2,
             )
         };
-        file.read_exact_at(&mut bytes_mut[..chunk_bytes_now], byte_off)
+        pread_exact(&file, &mut bytes_mut[..chunk_bytes_now], byte_off)
             .map_err(|e| format!("pread at vec {}: {}", offset_vec, e))?;
 
         let chunk_view: &[u16] = &chunk_buf;

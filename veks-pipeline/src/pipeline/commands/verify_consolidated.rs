@@ -31,7 +31,7 @@ use crate::pipeline::element_type::ElementType;
 use crate::pipeline::simd_distance;
 // `Metric` is only referenced by the bare name inside the
 // knnutils-gated `VerifyKnnConsolidatedOp::execute` impl below.
-#[cfg(feature = "knnutils")]
+#[cfg(all(feature = "knnutils", unix))]
 use crate::pipeline::simd_distance::Metric;
 use vectordata::io::XvecReader;
 use vectordata::VectorReader;
@@ -157,15 +157,15 @@ fn resolve_path(value: &str, workspace: &Path) -> PathBuf {
 // (system BLAS link); the command is therefore only registered when
 // knnutils is compiled in. Non-knnutils builds can still use the other
 // verify commands (filtered / predicates).
-#[cfg(feature = "knnutils")]
+#[cfg(all(feature = "knnutils", unix))]
 pub struct VerifyKnnConsolidatedOp;
 
-#[cfg(feature = "knnutils")]
+#[cfg(all(feature = "knnutils", unix))]
 pub fn knn_consolidated_factory() -> Box<dyn CommandOp> {
     Box::new(VerifyKnnConsolidatedOp)
 }
 
-#[cfg(feature = "knnutils")]
+#[cfg(all(feature = "knnutils", unix))]
 impl CommandOp for VerifyKnnConsolidatedOp {
     fn command_path(&self) -> &str {
         "verify knn-consolidated"

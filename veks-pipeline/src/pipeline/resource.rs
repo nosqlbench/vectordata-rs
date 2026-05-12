@@ -756,7 +756,14 @@ impl SystemSnapshot {
 
         // Convert utime/stime (in clock ticks) to percentage (rough estimate).
         // This is cumulative, not per-interval, so it's a running average.
+        // `sysconf(_SC_CLK_TCK)` is Unix-only; on non-Unix targets we fall
+        // back to the conventional 100 Hz tick (the actual value never
+        // gets read on non-Linux because `read_proc_*` always returns 0
+        // there — this just keeps the math from dividing by zero).
+        #[cfg(unix)]
         let ticks_per_sec = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as f64;
+        #[cfg(not(unix))]
+        let ticks_per_sec = 100.0;
         let num_cpus = std::thread::available_parallelism()
             .map(|n| n.get() as f64)
             .unwrap_or(1.0);

@@ -25,6 +25,7 @@ pub use vectordata::formats::anode_vernacular;
 pub mod facet;
 pub mod parquet_compiler;
 pub mod parquet_vector_compiler;
+pub mod portable_io;
 pub mod xvec_dir_compiler;
 pub mod convert;
 pub mod reader;

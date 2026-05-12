@@ -35,7 +35,7 @@ use crate::pipeline::command::{
 };
 use super::knn_compare::{compare_query_ordinals, QueryResult, VerifySummary};
 
-#[cfg(feature = "knnutils")]
+#[cfg(all(feature = "knnutils", unix))]
 unsafe extern "C" {
     fn cblas_sgemm(
         order: i32,     // CblasRowMajor = 101
@@ -55,11 +55,11 @@ unsafe extern "C" {
     );
 
 }
-#[cfg(feature = "knnutils")]
+#[cfg(all(feature = "knnutils", unix))]
 const CBLAS_ROW_MAJOR: i32 = 101;
-#[cfg(feature = "knnutils")]
+#[cfg(all(feature = "knnutils", unix))]
 const CBLAS_NO_TRANS: i32 = 111;
-#[cfg(feature = "knnutils")]
+#[cfg(all(feature = "knnutils", unix))]
 const CBLAS_TRANS: i32 = 112;
 
 /// Set env vars that BLAS libraries read at init time. This only
@@ -433,7 +433,7 @@ impl CommandOp for VerifyEngineParityOp {
             ));
         }
 
-        #[cfg(feature = "knnutils")]
+        #[cfg(all(feature = "knnutils", unix))]
         if want("blas") {
             runs.push(run_engine(
                 "blas",
@@ -442,7 +442,7 @@ impl CommandOp for VerifyEngineParityOp {
                 neighbors, &metric, assume_normalized, use_proper_cosine, ctx,
             ));
         }
-        #[cfg(not(feature = "knnutils"))]
+        #[cfg(not(all(feature = "knnutils", unix)))]
         if want("blas") {
             runs.push(skipped("blas", "knnutils feature not enabled (cargo build --features knnutils)"));
         }
@@ -482,7 +482,7 @@ impl CommandOp for VerifyEngineParityOp {
         // exactly — same outer/inner block sizes, same sgemm orientation,
         // same per-cell post-processing. Extended for IP/Cosine using the
         // same sgemm + per-cell post-pass.
-        #[cfg(feature = "knnutils")]
+        #[cfg(all(feature = "knnutils", unix))]
         if want("blas-mirror") {
             ctx.ui.log("  running engine: blas-mirror");
             let started = Instant::now();
@@ -497,7 +497,7 @@ impl CommandOp for VerifyEngineParityOp {
                 Err(e) => EngineRun { name: "blas-mirror", indices_path: None, elapsed, note: Some(e) },
             });
         }
-        #[cfg(not(feature = "knnutils"))]
+        #[cfg(not(all(feature = "knnutils", unix)))]
         if want("blas-mirror") {
             runs.push(skipped("blas-mirror", "knnutils feature not enabled"));
         }
@@ -1103,7 +1103,7 @@ fn normalize(row: &mut [f32]) {
 /// the parity demo cares about. Streaming + sgemm for billion-vector
 /// datasets is the job of `compute knn-blas`; this is strictly for
 /// proving the parity hypothesis.
-#[cfg(feature = "knnutils")]
+#[cfg(all(feature = "knnutils", unix))]
 fn run_blas_mirror(
     base_path: &Path,
     query_path: &Path,
@@ -1362,7 +1362,7 @@ fn run_blas_mirror(
     Ok(())
 }
 
-#[cfg(feature = "knnutils")]
+#[cfg(all(feature = "knnutils", unix))]
 use super::compute_knn::Neighbor;
 
 #[cfg(test)]

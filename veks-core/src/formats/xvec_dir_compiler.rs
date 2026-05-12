@@ -41,7 +41,9 @@
 //!   leaves a half-written file at the published path.
 
 use std::fs::{self, File, OpenOptions};
-use std::os::unix::fs::{FileExt, MetadataExt};
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
+#[cfg(target_os = "linux")]
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -286,8 +288,12 @@ pub fn extract_xvec_dir_to_xvec_threaded(
     // device IDs once, up front, and pick the per-shard copy strategy
     // accordingly: native kernel copy when same-device, chunked
     // read+pwrite (still streaming, still kicked-writeback) when not.
+    // The kernel-copy path is also Linux-only (the syscall doesn't
+    // exist on macOS / *BSD / Windows) — gate the selection on the
+    // target so non-Linux always falls back to the portable
+    // read+pwrite path.
     let same_device = same_filesystem(&probe.files[0], &output_tmp);
-    let copy_mode = if same_device {
+    let copy_mode = if same_device && cfg!(target_os = "linux") {
         CopyMode::KernelCopyFileRange
     } else {
         CopyMode::ReadPwriteFallback
@@ -501,7 +507,10 @@ fn prefetch_loop(
                 .map_err(|e| format!("prefetch open {}: {}", path.display(), e))?;
             // Widen the kernel's readahead window for this fd before
             // pulling pages — turns the discard reads below into the
-            // large sequential I/O pattern EBS rewards.
+            // large sequential I/O pattern EBS rewards. Unix-only;
+            // on other targets the read loop alone still works, just
+            // without the readahead boost.
+            #[cfg(unix)]
             unsafe {
                 libc::posix_fadvise(
                     f.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL,
@@ -556,6 +565,12 @@ impl CopyMode {
 /// file and the destination's parent directory (the destination file
 /// itself was just created so its st_dev is reliable too, but the
 /// parent works whether or not the dest exists).
+///
+/// Unix-only — `MetadataExt::dev()` is the inode device id from
+/// `stat()`. On non-Unix targets we return `false` so the caller
+/// always picks the portable read+pwrite fallback (the kernel
+/// `copy_file_range` path is Linux-only anyway).
+#[cfg(unix)]
 fn same_filesystem(src: &Path, dst: &Path) -> bool {
     let dst_dev = match fs::metadata(dst) {
         Ok(m) => m.dev(),
@@ -569,6 +584,9 @@ fn same_filesystem(src: &Path, dst: &Path) -> bool {
         Err(_) => false,
     }
 }
+
+#[cfg(not(unix))]
+fn same_filesystem(_src: &Path, _dst: &Path) -> bool { false }
 
 /// Single writer thread. Walks file indices 0..total in order and
 /// streams each into the output at strictly monotonically increasing
@@ -741,6 +759,12 @@ fn copy_chunk(
 /// `copy_file_range` variant that takes a source offset (the
 /// `copy_file_range_full` helper in parquet_vector_compiler always
 /// starts at 0). Loops until `len` bytes are copied or EOF.
+///
+/// Linux-only — the syscall doesn't exist on macOS / *BSD / Windows.
+/// `copy_chunk` only routes here when `mode == KernelCopyFileRange`,
+/// and that mode is only chosen on Linux (see the `same_device &&
+/// cfg!(target_os = "linux")` decision in the writer setup).
+#[cfg(target_os = "linux")]
 fn copy_file_range_at(
     src: &File,
     src_off: u64,
@@ -776,12 +800,31 @@ fn copy_file_range_at(
     Ok(())
 }
 
+#[cfg(not(target_os = "linux"))]
+fn copy_file_range_at(
+    _src: &File,
+    _src_off: u64,
+    _dst: &File,
+    _dst_off: u64,
+    _len: u64,
+) -> std::io::Result<()> {
+    // Unreachable in practice — `CopyMode::KernelCopyFileRange` is
+    // only selected on Linux. Keep a real error rather than
+    // `unreachable!` so a misconfiguration becomes a recoverable
+    // I/O failure instead of a panic.
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "copy_file_range is Linux-only",
+    ))
+}
+
 /// Cross-filesystem fallback: read into a user-space scratch buffer,
 /// then pwrite to the destination. Same chunking and same
 /// `sync_file_range`-driven write cadence as the kernel-copy path —
 /// only difference is one extra memcpy per chunk (the round trip
 /// through user space). EBS still sees one streaming sequential
-/// writer, just with slightly more CPU on the host.
+/// writer, just with slightly more CPU on the host. Portable across
+/// Unix/Windows via `formats::portable_io`.
 fn read_pwrite_chunk(
     src: &File,
     src_off: u64,
@@ -790,11 +833,12 @@ fn read_pwrite_chunk(
     len: u64,
     scratch: &mut [u8],
 ) -> std::io::Result<()> {
+    use crate::formats::portable_io::{pread_exact, pwrite_all};
     let len = len as usize;
     debug_assert!(scratch.len() >= len, "scratch too small for chunk");
     let buf = &mut scratch[..len];
-    src.read_exact_at(buf, src_off)?;
-    dst.write_all_at(buf, dst_off)?;
+    pread_exact(src, buf, src_off)?;
+    pwrite_all(dst, buf, dst_off)?;
     Ok(())
 }
 
@@ -805,7 +849,9 @@ fn read_pwrite_chunk(
 ///
 /// Errors are non-fatal: the syscall is advisory, and a failure just
 /// means writeback follows the kernel's default schedule rather than
-/// our explicit kick.
+/// our explicit kick. `sync_file_range` is Linux-only — on other
+/// targets this is a no-op (writeback follows kernel defaults).
+#[cfg(target_os = "linux")]
 fn kick_writeback(file: &File, offset: u64, len: u64) {
     if len == 0 { return; }
     unsafe {
@@ -817,6 +863,9 @@ fn kick_writeback(file: &File, offset: u64, len: u64) {
         );
     }
 }
+
+#[cfg(not(target_os = "linux"))]
+fn kick_writeback(_file: &File, _offset: u64, _len: u64) {}
 
 /// Read the four-byte little-endian dim header from the start of an
 /// xvec file. Cheap enough that the probe phase calls it once per file

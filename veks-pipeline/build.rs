@@ -6,8 +6,17 @@ fn main() {
     // On Ubuntu: `apt install libopenblas-dev` (or `libmkl-dev` for MKL).
     // The system's libblas.so resolves to whichever BLAS is configured
     // via update-alternatives.
+    //
+    // Unix-only: every `cblas_sgemm` call site in the source is gated
+    // on `cfg(all(feature = "knnutils", unix))`, so on non-Unix targets
+    // the FFI symbols are never referenced and the link directive
+    // would just produce a "library not found" error from the linker.
+    // `CARGO_CFG_UNIX` is set in build.rs when the *target* is Unix
+    // (cargo populates these per the target triple, not the host).
     #[cfg(feature = "knnutils")]
-    println!("cargo:rustc-link-lib=blas");
+    if std::env::var_os("CARGO_CFG_UNIX").is_some() {
+        println!("cargo:rustc-link-lib=blas");
+    }
 
     // Inject build metadata as compile-time environment variables.
     // VEKS_BUILD_HASH: short git SHA of the current commit (or "unknown").

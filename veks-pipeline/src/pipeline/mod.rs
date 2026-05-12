@@ -1992,7 +1992,7 @@ fn recover_identity_symlinks(workspace: &Path, config: &DatasetConfig) {
                                 for part in &to_parts[common..] { rel.push(part); }
                                 rel
                             };
-                            match std::os::unix::fs::symlink(&rel, &view_path) {
+                            match veks_core::paths::portable_symlink_file(&rel, &view_path) {
                                 Ok(()) => println!("  recovered symlink: {} → {}",
                                     veks_core::paths::rel_display(&view_path),
                                     rel.display()),

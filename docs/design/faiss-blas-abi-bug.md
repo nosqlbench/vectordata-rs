@@ -4,7 +4,25 @@
 
 **Active workaround in veks.** All FAISS search calls are chunked to
 keep `batch_size <= 65536 / dim`. This prevents the corruption at the
-cost of reduced batch efficiency for high-dimensional datasets.
+cost of reduced batch efficiency for high-dimensional datasets. The
+chunking happens in the *callers* (`verify_knn_faiss.rs`,
+`compute_knn_faiss.rs`, etc.) — the dependency itself is unmodified
+upstream `faiss v0.13` / `faiss-sys v0.7.0` from crates.io.
+
+**FAISS is an opt-in feature.** Off by default in both `veks` and
+`veks-pipeline`. Enable with `--features faiss` (which transitively
+enables `knnutils`). Without the feature, the `compute knn-faiss` /
+`verify knn-faiss` commands aren't registered and `faiss-sys` is
+never compiled — so the cmake / MKL / BLAS / OpenMP toolchain isn't
+required for a default build.
+
+**The vendor patch was removed.** Earlier work staged `vendor/faiss-sys/`
+as a path-override via `[patch.crates-io]` so a `FINTEGER long → int`
+change to `distances.cpp:31` could be tried. The fix turned out to
+introduce a second failure mode (wrong-neighbor results — see "Why
+the FINTEGER fix is insufficient" below) and was reverted; the
+unmodified vendor copy then served no purpose. The batch-cap workaround
+in the callers is the only thing actually keeping results correct.
 
 **The FINTEGER fix alone is insufficient.** Changing `FINTEGER` from
 `long` to `int` in `distances.cpp` eliminates the zero-distance

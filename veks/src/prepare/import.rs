@@ -2850,7 +2850,7 @@ pub(crate) fn create_symlink(target: &std::path::Path, link: &std::path::Path) {
         let _ = std::fs::remove_file(link);
     }
 
-    match std::os::unix::fs::symlink(&rel_target, link) {
+    match veks_core::paths::portable_symlink_file(&rel_target, link) {
         Ok(()) => {
             println!("  Symlinked {} → {}", crate::check::rel_display(link), rel_target.display());
         }

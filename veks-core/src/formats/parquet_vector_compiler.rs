@@ -22,6 +22,7 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Read;
+#[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -1303,7 +1304,7 @@ fn shard_worker_loop(
             // continuously fed instead of bursting at the end.
             let tmp_path = with_tmp_suffix(&shard_path);
             {
-                use std::os::unix::fs::FileExt;
+                use crate::formats::portable_io::pwrite_all;
                 let shard_file = OpenOptions::new()
                     .create(true)
                     .write(true)
@@ -1317,7 +1318,7 @@ fn shard_worker_loop(
                 while written < total {
                     let chunk = WRITE_CHUNK_BYTES.min(total - written);
                     let slice = &scratch[written as usize..(written + chunk) as usize];
-                    shard_file.write_all_at(slice, written)
+                    pwrite_all(&shard_file, slice, written)
                         .map_err(|e| format!(
                             "pwrite {} bytes @ {}: {}", chunk, written, e,
                         ))?;
@@ -1429,8 +1430,11 @@ fn parquet_prefetch_loop(
 
         // Force the file's pages into the page cache. Errors here are
         // non-fatal — the decoder will hit a cache miss and pay the
-        // EBS read cost, but the whole job still completes.
+        // EBS read cost, but the whole job still completes. The
+        // `posix_fadvise` hints are Unix-only; on other targets we
+        // skip them and rely on the reader loop alone.
         if let Ok(f) = File::open(path) {
+            #[cfg(unix)]
             unsafe {
                 libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL);
                 libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_WILLNEED);
@@ -1452,7 +1456,9 @@ fn parquet_prefetch_loop(
 /// `dirty_background_bytes` threshold — keeps the EBS write queue
 /// continuously fed when chained over a large sequential write.
 ///
-/// Errors are non-fatal; the syscall is advisory.
+/// Errors are non-fatal; the syscall is advisory. `sync_file_range`
+/// is Linux-only — on other targets this is a no-op.
+#[cfg(target_os = "linux")]
 pub(super) fn kick_writeback(file: &File, offset: u64, len: u64) {
     if len == 0 { return; }
     unsafe {
@@ -1464,6 +1470,9 @@ pub(super) fn kick_writeback(file: &File, offset: u64, len: u64) {
         );
     }
 }
+
+#[cfg(not(target_os = "linux"))]
+pub(super) fn kick_writeback(_file: &File, _offset: u64, _len: u64) {}
 
 pub(super) fn with_tmp_suffix(path: &Path) -> PathBuf {
     let mut s = path.as_os_str().to_os_string();
@@ -1537,11 +1546,54 @@ fn concat_shards_into_output(
 }
 
 /// Copy `len` bytes from `src` (starting at offset 0) to `dst` (starting
-/// at `dst_offset`) using the `copy_file_range` syscall. The kernel
-/// performs the copy inside the kernel — no user-space buffer, no extra
-/// page-cache fill on the source side. May yield fewer bytes than
-/// requested per call, so we loop until done.
+/// at `dst_offset`). On Linux uses `copy_file_range` for an in-kernel
+/// copy with no user-space buffer; on other targets falls back to a
+/// chunked `pread`+`pwrite` loop via `formats::portable_io`. Same
+/// observable semantics either way (loops until done; errors on
+/// short/zero copies).
 pub(super) fn copy_file_range_full(
+    src: &File,
+    dst: &File,
+    dst_offset: u64,
+    len: u64,
+) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        copy_file_range_full_linux(src, dst, dst_offset, len)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        copy_file_range_full_portable(src, dst, dst_offset, len)
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn copy_file_range_full_portable(
+    src: &File,
+    dst: &File,
+    dst_offset: u64,
+    len: u64,
+) -> std::io::Result<()> {
+    use crate::formats::portable_io::{pread_exact, pwrite_all};
+    // Chunk size matches the WRITE_CHUNK_BYTES sized writes the
+    // kernel-copy path would have produced indirectly via `sgemm`-ish
+    // tiling. 8 MiB keeps the scratch heap allocation modest while
+    // staying large enough to amortize syscall cost.
+    const CHUNK: u64 = 8 * 1024 * 1024;
+    let mut buf = vec![0u8; CHUNK as usize];
+    let mut copied: u64 = 0;
+    while copied < len {
+        let n = CHUNK.min(len - copied);
+        let slice = &mut buf[..n as usize];
+        pread_exact(src, slice, copied)?;
+        pwrite_all(dst, slice, dst_offset + copied)?;
+        copied += n;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn copy_file_range_full_linux(
     src: &File,
     dst: &File,
     dst_offset: u64,
@@ -1590,6 +1642,7 @@ pub(super) fn copy_file_range_full(
 ///
 /// Errors are non-fatal — the syscall is advisory; if it fails, the only
 /// consequence is slightly less efficient cache management.
+#[cfg(unix)]
 pub(super) fn advise_dontneed(file: &File, offset: u64, len: u64) {
     if len == 0 { return; }
     unsafe {
@@ -1601,6 +1654,10 @@ pub(super) fn advise_dontneed(file: &File, offset: u64, len: u64) {
         );
     }
 }
+
+/// No-op on non-Unix targets — `posix_fadvise` is Unix-only.
+#[cfg(not(unix))]
+pub(super) fn advise_dontneed(_file: &File, _offset: u64, _len: u64) {}
 
 /// Read a file in one shot with `posix_fadvise(SEQUENTIAL | WILLNEED)`
 /// hints to the kernel before the read. The hints tell the kernel to
@@ -1615,10 +1672,15 @@ pub(super) fn read_file_with_advise(path: &Path) -> std::io::Result<Vec<u8>> {
     // POSIX_FADV_WILLNEED: ask kernel to start prefetching the whole
     // range into the page cache asynchronously. Errors are non-fatal —
     // the syscalls are advisory and the read below works either way.
-    let fd = file.as_raw_fd();
-    unsafe {
-        libc::posix_fadvise(fd, 0, 0, libc::POSIX_FADV_SEQUENTIAL);
-        libc::posix_fadvise(fd, 0, 0, libc::POSIX_FADV_WILLNEED);
+    // The advise calls are Unix-only; on other targets we just do
+    // the buffered read.
+    #[cfg(unix)]
+    {
+        let fd = file.as_raw_fd();
+        unsafe {
+            libc::posix_fadvise(fd, 0, 0, libc::POSIX_FADV_SEQUENTIAL);
+            libc::posix_fadvise(fd, 0, 0, libc::POSIX_FADV_WILLNEED);
+        }
     }
     let mut buf = Vec::with_capacity(len);
     let mut reader = file;

@@ -97,8 +97,14 @@ impl MmapXvecWriter {
         };
 
         // Advise kernel: random access pattern (not sequential), and
-        // that the region will be written soon
-        let _ = mmap.advise(memmap2::Advice::Random);
+        // that the region will be written soon. Both `advise` and
+        // `Advice` are Unix-only on `memmap2` — gate per the
+        // `release_range_bytes` reference pattern in
+        // vectordata/src/storage.rs.
+        #[cfg(unix)]
+        {
+            let _ = mmap.advise(memmap2::Advice::Random);
+        }
         #[cfg(target_os = "linux")]
         {
             let _ = mmap.advise(memmap2::Advice::WillNeed);

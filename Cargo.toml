@@ -12,9 +12,6 @@ members = [
 ]
 resolver = "3"
 
-[patch.crates-io]
-faiss-sys = { path = "vendor/faiss-sys" }
-
 [profile.bench]
 debug = true
 

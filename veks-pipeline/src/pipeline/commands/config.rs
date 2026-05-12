@@ -635,7 +635,9 @@ fn list_mount_points() -> Vec<MountInfo> {
 /// Check if the current user can write to a directory using POSIX permission bits.
 ///
 /// Checks owner/group/other write bits against the current uid and gids,
-/// matching how the kernel would evaluate access.
+/// matching how the kernel would evaluate access. Non-Unix targets fall
+/// back to the coarse `metadata.permissions().readonly()` flag.
+#[cfg(unix)]
 fn is_writable_by_current_user(path: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;
 
@@ -681,7 +683,18 @@ fn is_writable_by_current_user(path: &Path) -> bool {
     mode & 0o002 != 0
 }
 
-/// Get filesystem stats using libc statvfs.
+#[cfg(not(unix))]
+fn is_writable_by_current_user(path: &Path) -> bool {
+    match path.metadata() {
+        Ok(m) => !m.permissions().readonly(),
+        Err(_) => false,
+    }
+}
+
+/// Get filesystem stats (available, total) in bytes. Uses `statvfs`
+/// on Unix; non-Unix targets currently return an error (the resource
+/// monitor degrades gracefully when the syscall isn't available).
+#[cfg(unix)]
 fn nix_statvfs(path: &Path) -> Result<(u64, u64), String> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
@@ -699,6 +712,11 @@ fn nix_statvfs(path: &Path) -> Result<(u64, u64), String> {
             Err(format!("statvfs failed for {}", path.display()))
         }
     }
+}
+
+#[cfg(not(unix))]
+fn nix_statvfs(_path: &Path) -> Result<(u64, u64), String> {
+    Err("statvfs unavailable on this target".to_string())
 }
 
 fn error_result(message: String, start: Instant) -> CommandResult {

@@ -1835,12 +1835,12 @@ fn sorted_index_extract_fvec(
     // keeps the closure capturing them so it can be moved into
     // par_iter without borrowing `fvec_path`.
     let pread_vector = |source_idx: usize| -> std::io::Result<Vec<f32>> {
-        use std::os::unix::fs::FileExt;
+        use veks_core::formats::portable_io::pread_exact;
         let dim_u = dim as usize;
         let value_bytes = entry_size - 4;
         let mut bytes = vec![0u8; value_bytes];
         let offset = (source_idx * entry_size + 4) as u64;
-        fvec_file.read_exact_at(&mut bytes, offset)?;
+        pread_exact(&fvec_file, &mut bytes, offset)?;
         let mut out = Vec::with_capacity(dim_u);
         for i in 0..dim_u {
             out.push(f32::from_le_bytes([

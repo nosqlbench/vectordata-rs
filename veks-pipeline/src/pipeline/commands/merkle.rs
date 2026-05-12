@@ -103,7 +103,7 @@ impl MerkleTree {
         progress_fn: impl Fn(u64) + Send + Sync,
     ) -> std::io::Result<Self> {
         Self::validate_chunk_size(chunk_size);
-        use std::os::unix::fs::FileExt;
+        use veks_core::formats::portable_io::pread;
         use std::sync::atomic::{AtomicU64, Ordering};
 
         let leaf_count = if file_size == 0 {
@@ -169,7 +169,7 @@ impl MerkleTree {
                         // pread_exact equivalent — handle short reads.
                         let mut filled = 0;
                         while filled < want {
-                            match file_ref.read_at(&mut buf[filled..want], offset + filled as u64) {
+                            match pread(file_ref, &mut buf[filled..want], offset + filled as u64) {
                                 Ok(0) => return Err(std::io::Error::new(
                                     std::io::ErrorKind::UnexpectedEof,
                                     format!("short read at offset {}", offset + filled as u64),
