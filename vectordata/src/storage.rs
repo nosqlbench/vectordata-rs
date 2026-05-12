@@ -275,7 +275,7 @@ impl Storage {
         let _ = write_origin(&cache_dir, &url);
         let transport = HttpTransport::with_client(client, url);
         let channel = CachedChannel::open(
-            Box::new(transport),
+            Arc::new(transport),
             reference,
             &cache_dir,
             &filename,

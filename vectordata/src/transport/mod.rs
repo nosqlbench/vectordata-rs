@@ -250,7 +250,7 @@ pub fn fetch_chunks_parallel(
 }
 
 /// Simple counting semaphore for bounding concurrency.
-mod semaphore {
+pub(crate) mod semaphore {
     use std::sync::{Condvar, Mutex};
 
     pub struct Semaphore {

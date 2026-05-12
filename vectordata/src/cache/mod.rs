@@ -18,18 +18,77 @@ pub(crate) mod reader;
 
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 
 use crate::merkle::{MerkleRef, MerkleState};
 use crate::transport::{
     ChunkRequest, ChunkedTransport, DownloadProgress, RetryPolicy,
-    fetch_chunks_parallel,
 };
 
 /// Default concurrency for parallel chunk downloads.
 const DEFAULT_CONCURRENCY: usize = 8;
+
+/// Thread-safe positional file I/O for the cache file.
+///
+/// On Unix (Linux + macOS), [`pwrite(2)`] / [`pread(2)`] take an
+/// explicit offset and do *not* touch the file's cursor, so multiple
+/// threads can write and read different ranges of the same file
+/// concurrently with no synchronization at all. The wrapper holds
+/// the `File` directly with no mutex.
+///
+/// On Windows, `FileExt::seek_write` / `seek_read` mutate the
+/// file cursor (the "positional" part is implemented client-side
+/// by the std impl) — concurrent calls would race on the cursor.
+/// The wrapper falls back to a `Mutex<File>` + `seek`/`write_all`
+/// pair, which is what the cache module used everywhere before
+/// this change.
+///
+/// The public surface is identical on both platforms so the rest
+/// of the cache code is cfg-agnostic.
+struct CacheFile {
+    #[cfg(unix)]
+    file: File,
+    #[cfg(not(unix))]
+    file: Mutex<File>,
+}
+
+impl CacheFile {
+    fn new(file: File) -> Self {
+        #[cfg(unix)]      { CacheFile { file } }
+        #[cfg(not(unix))] { CacheFile { file: Mutex::new(file) } }
+    }
+
+    /// Read exactly `buf.len()` bytes from `offset`.
+    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
+        #[cfg(unix)] {
+            use std::os::unix::fs::FileExt;
+            self.file.read_exact_at(buf, offset)
+        }
+        #[cfg(not(unix))] {
+            use std::io::{Read, Seek};
+            let mut f = self.file.lock().unwrap();
+            f.seek(SeekFrom::Start(offset))?;
+            f.read_exact(buf)
+        }
+    }
+
+    /// Write exactly `buf.len()` bytes at `offset`.
+    fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
+        #[cfg(unix)] {
+            use std::os::unix::fs::FileExt;
+            self.file.write_all_at(buf, offset)
+        }
+        #[cfg(not(unix))] {
+            use std::io::{Seek, Write};
+            let mut f = self.file.lock().unwrap();
+            f.seek(SeekFrom::Start(offset))?;
+            f.write_all(buf)
+        }
+    }
+}
+
 
 /// Hex-encode a 32-byte hash for diagnostic messages. Avoids pulling in
 /// the `hex` crate as a runtime dep just for one error string.
@@ -45,15 +104,23 @@ fn hex_short(bytes: &[u8; 32]) -> String {
 /// from a remote source using merkle tree integrity checking.
 pub struct CachedChannel {
     /// Local cache file (random-access read/write).
-    cache_file: Mutex<File>,
+    /// Wraps a single `File` handle; on Unix uses pwrite/pread for
+    /// lock-free positional I/O, on Windows falls back to a mutex.
+    cache_file: CacheFile,
     /// Path to the cache file (for reporting).
     cache_path: PathBuf,
     /// Merkle verification state (which chunks are valid).
-    state: Mutex<MerkleState>,
+    /// `mark_valid` and the read-side queries are lock-free via
+    /// atomic `valid_words`; no surrounding `Mutex` needed.
+    state: MerkleState,
     /// Path to the .mrkl state file.
     state_path: PathBuf,
-    /// Remote data source.
-    transport: Box<dyn ChunkedTransport>,
+    /// Remote data source. `Arc<dyn …>` (not `Box`) so two
+    /// `CachedChannel`s opened against the same upstream — same URL,
+    /// distinct cache dirs — can share one transport instance, and
+    /// callers can clone the handle out before constructing the
+    /// channel without losing the original.
+    transport: Arc<dyn ChunkedTransport>,
     /// Reference tree for hash verification.
     reference: MerkleRef,
     /// Retry policy for downloads.
@@ -81,7 +148,7 @@ impl CachedChannel {
     /// embedded hashes. Otherwise creates the `.mrkl` from the provided
     /// reference with a zeroed validity bitset.
     pub fn open(
-        transport: Box<dyn ChunkedTransport>,
+        transport: Arc<dyn ChunkedTransport>,
         reference: MerkleRef,
         cache_dir: &Path,
         name: &str,
@@ -121,7 +188,7 @@ impl CachedChannel {
             // authoritative copy and may carry shape metadata we want to keep).
             (reference, state)
         } else {
-            let mut state = MerkleState::from_ref(&reference);
+            let state = MerkleState::from_ref(&reference);
             if cache_path.exists() {
                 // Cache file exists without merkle state (e.g., from a raw
                 // download). Verify existing content against merkle hashes
@@ -170,9 +237,9 @@ impl CachedChannel {
         }
 
         Ok(CachedChannel {
-            cache_file: Mutex::new(cache_file),
+            cache_file: CacheFile::new(cache_file),
             cache_path,
-            state: Mutex::new(state),
+            state,
             state_path,
             transport,
             reference,
@@ -221,11 +288,10 @@ impl CachedChannel {
         // Ensure all needed chunks are valid
         self.ensure_chunks_valid(first_chunk, last_chunk)?;
 
-        // Read from the cache file
-        let mut file = self.cache_file.lock().unwrap();
-        file.seek(SeekFrom::Start(offset))?;
+        // Read from the cache file (positional — no cursor mutation
+        // on Unix, mutex-guarded on Windows).
         let mut buf = vec![0u8; len as usize];
-        file.read_exact(&mut buf)?;
+        self.cache_file.read_exact_at(&mut buf, offset)?;
         Ok(buf)
     }
 
@@ -234,45 +300,44 @@ impl CachedChannel {
     /// already fetching a chunk, this thread waits for it instead of
     /// issuing a duplicate request.
     fn ensure_chunks_valid(&self, first: u32, last: u32) -> io::Result<()> {
-        // Collect chunks that need work — either missing or in-flight
+        // Collect chunks that need work — either missing or in-flight.
+        // The `state.is_valid` check is lock-free; the in-flight
+        // membership decision happens under the in_flight mutex so
+        // we don't lose a race with a worker that's about to remove
+        // an entry.
         let (to_fetch, to_wait): (Vec<u32>, Vec<(u32, Arc<Condvar>)>) = {
-            let state = self.state.lock().unwrap();
             let mut in_flight = self.in_flight.lock().unwrap();
-
             let mut fetch = Vec::new();
             let mut wait = Vec::new();
-
             for i in first..=last {
-                if state.is_valid(i) {
+                if self.state.is_valid(i) {
                     continue; // Already cached
                 }
                 if let Some(cv) = in_flight.get(&i) {
-                    // Another thread is fetching this chunk — we'll wait
                     wait.push((i, cv.clone()));
                 } else {
-                    // We'll fetch this chunk — register as in-flight
                     let cv = Arc::new(Condvar::new());
                     in_flight.insert(i, cv.clone());
                     fetch.push(i);
                 }
             }
-
             (fetch, wait)
         };
 
-        // Wait for any chunks being fetched by other threads
+        // Wait for any chunks being fetched by other threads.
+        // The condvar is paired with the `in_flight` mutex (the
+        // worker calls `notify_all` after removing its entry from
+        // the map). The release/acquire on the mutex ensures the
+        // state-bit update is visible by the time we observe the
+        // in_flight removal.
         for (chunk_idx, cv) in &to_wait {
-            // Spin-wait with condvar: check state, wait if still invalid
-            let mut state = self.state.lock().unwrap();
-            while !state.is_valid(*chunk_idx) {
-                // Check if it's still in-flight
-                let still_in_flight = self.in_flight.lock().unwrap().contains_key(chunk_idx);
-                if !still_in_flight {
-                    break; // Fetch completed (or failed) — re-check state
+            let mut in_flight = self.in_flight.lock().unwrap();
+            while !self.state.is_valid(*chunk_idx) {
+                if !in_flight.contains_key(chunk_idx) {
+                    break; // Worker finished — re-check state
                 }
-                // Wait briefly then re-check (condvar with timeout)
-                state = cv.wait_timeout(state, std::time::Duration::from_millis(50))
-                    .unwrap().0;
+                in_flight = cv.wait_timeout(in_flight,
+                    std::time::Duration::from_millis(50)).unwrap().0;
             }
         }
 
@@ -281,7 +346,6 @@ impl CachedChannel {
         }
 
         let shape = self.reference.shape();
-
         let requests: Vec<ChunkRequest> = to_fetch
             .iter()
             .map(|&i| ChunkRequest {
@@ -293,73 +357,204 @@ impl CachedChannel {
 
         let total_bytes: u64 = requests.iter().map(|r| r.len).sum();
         let progress = DownloadProgress::new(total_bytes, requests.len() as u32);
+        self.parallel_fetch_verify_write(&requests, &progress, |_| {})
+    }
 
-        let results = fetch_chunks_parallel(
-            self.transport.as_ref(),
-            &requests,
-            &self.retry_policy,
-            &progress,
-            self.concurrency,
-        );
+    /// Core worker-thread fetch pipeline.
+    ///
+    /// For each request, one worker thread performs the full
+    /// **fetch → verify → write → mark → notify** sequence locally.
+    /// SHA-256 verification and disk I/O happen on the same thread
+    /// that did the network fetch, so no main-thread serial post-
+    /// processing bottleneck.
+    ///
+    /// Invariants preserved from the previous (sequential)
+    /// implementation:
+    ///
+    /// - **Differential merkle**: the caller has already filtered
+    ///   out chunks that are valid or in-flight; this method
+    ///   trusts that filter.
+    /// - **In-flight dedup**: each successful or failing chunk
+    ///   removes its entry from `in_flight` and notifies the
+    ///   condvar so concurrent readers can proceed.
+    /// - **Verify-before-trust**: a chunk's bytes are not exposed
+    ///   to readers (and not committed to the state bitmap) until
+    ///   SHA-256 against the merkle reference passes.
+    /// - **Crash-safe resume**: the `.mrkl` file is saved
+    ///   periodically (throttle: at most once per
+    ///   `STATE_SAVE_INTERVAL_MS` from any worker, atomic CAS)
+    ///   *and* unconditionally on completion, so a kill at any
+    ///   moment loses at most a second of progress.
+    /// - **Failure surfaces**: the first worker error short-
+    ///   circuits the rest (subsequent workers see the abort
+    ///   signal and bail) and is returned to the caller.
+    ///
+    /// `progress_cb` is invoked on a ticker (~4 Hz) so live UI
+    /// updates land while the workers are still busy — the
+    /// previous design only invoked it once at completion.
+    fn parallel_fetch_verify_write<F>(
+        &self,
+        requests: &[ChunkRequest],
+        progress: &DownloadProgress,
+        mut progress_cb: F,
+    ) -> io::Result<()>
+    where
+        F: FnMut(&DownloadProgress),
+    {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc;
+        const STATE_SAVE_INTERVAL: std::time::Duration =
+            std::time::Duration::from_millis(1000);
+        const PROGRESS_TICK: std::time::Duration =
+            std::time::Duration::from_millis(250);
 
-        for result in results {
-            let (chunk_index, data) = result?;
-            self.verify_and_cache(chunk_index, &data)?;
+        let abort = AtomicBool::new(false);
+        let (tx, rx) = mpsc::channel::<io::Result<()>>();
 
-            // Notify waiters and remove from in-flight
-            let cv = {
-                let mut in_flight = self.in_flight.lock().unwrap();
-                in_flight.remove(&chunk_index)
-            };
-            if let Some(cv) = cv {
-                cv.notify_all();
+        let result: io::Result<()> = std::thread::scope(|scope| {
+            // Worker pool, bounded by `self.concurrency`.
+            let semaphore = std::sync::Arc::new(
+                crate::transport::semaphore::Semaphore::new(self.concurrency));
+
+            for req in requests {
+                if abort.load(Ordering::Relaxed) {
+                    // Account for this request anyway so the
+                    // receive loop terminates.
+                    let _ = tx.send(Ok(()));
+                    continue;
+                }
+                let req = *req;
+                let permit = semaphore.clone();
+                let abort = &abort;
+                let progress = &*progress;
+                let this = self;
+                let tx = tx.clone();
+
+                scope.spawn(move || {
+                    let result = (|| -> io::Result<()> {
+                        let _permit = permit.acquire();
+                        if abort.load(Ordering::Relaxed) {
+                            return Ok(());
+                        }
+
+                        // ── 1. Fetch (with retry) ──────────────
+                        let data = match this.retry_policy.execute(|| {
+                            this.transport.fetch_range(req.start, req.len)
+                        }) {
+                            Ok(d) => d,
+                            Err(e) => {
+                                abort.store(true, Ordering::Relaxed);
+                                progress.mark_failed();
+                                this.drop_in_flight(req.index);
+                                return Err(e);
+                            }
+                        };
+
+                        // ── 2. Verify (SHA-256 vs merkle ref) ──
+                        if !this.reference.verify_chunk(req.index, &data) {
+                            abort.store(true, Ordering::Relaxed);
+                            progress.mark_failed();
+                            this.drop_in_flight(req.index);
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("chunk {} failed integrity verification \
+                                         (SHA-256 mismatch)", req.index)));
+                        }
+
+                        // ── 3. Write to cache file ─────────────
+                        // Positional write — on Unix this is a
+                        // lock-free `pwrite(2)`, so workers don't
+                        // serialize through a `Mutex<File>`. On
+                        // Windows the wrapper takes a brief lock
+                        // (no public OVERLAPPED-based API in std).
+                        this.cache_file.write_all_at(&data, req.start)?;
+
+                        // ── 4. Mark valid in state bitmap ──────
+                        // Lock-free: `MerkleState::mark_valid` does
+                        // an atomic fetch_or on the bitmap word.
+                        // Save is throttled on the main thread.
+                        this.state.mark_valid(req.index);
+
+                        progress.add_downloaded_bytes(data.len() as u64);
+                        progress.increment_completed();
+
+                        // ── 5. Notify in-flight waiters ────────
+                        this.drop_in_flight(req.index);
+                        Ok(())
+                    })();
+                    let _ = tx.send(result);
+                });
             }
-        }
 
-        // Clean up any remaining in-flight entries (in case of errors)
-        {
+            // Drop the spawner's tx so the channel closes once
+            // every worker drops their clone — guards against
+            // hanging if `done` undercounts due to a panic.
+            drop(tx);
+
+            // Main thread: collect chunk-completion events, fire
+            // the user cb on each (or on timeout for ticker-style
+            // updates), and run throttled .mrkl saves. All cb
+            // calls happen here, so callers don't need a Send
+            // bound — closures that touch !Send state work fine.
+            let mut first_err: io::Result<()> = Ok(());
+            let mut done: usize = 0;
+            let mut last_save = std::time::Instant::now();
+            while done < requests.len() {
+                match rx.recv_timeout(PROGRESS_TICK) {
+                    Ok(Ok(())) => { done += 1; progress_cb(progress); }
+                    Ok(Err(e)) => {
+                        done += 1;
+                        if first_err.is_ok() { first_err = Err(e); }
+                        progress_cb(progress);
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        progress_cb(progress);
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+                if last_save.elapsed() >= STATE_SAVE_INTERVAL {
+                    // No clone needed — `state.save` reads each
+                    // bitmap word with `Relaxed` atomics, so it
+                    // serialises a consistent-per-word snapshot
+                    // even while workers are still flipping bits.
+                    let _ = self.state.save(&self.state_path);
+                    last_save = std::time::Instant::now();
+                }
+            }
+
+            // One last cb so the caller always sees the final
+            // (100% or failed) snapshot.
+            progress_cb(progress);
+            first_err
+        });
+
+        // Final save — even on error so partial progress is
+        // preserved for resume.
+        let _ = self.state.save(&self.state_path);
+
+        // On error, clear any in-flight entries that aborted
+        // workers didn't get to so blocked readers don't hang.
+        if result.is_err() {
             let mut in_flight = self.in_flight.lock().unwrap();
-            for &idx in &to_fetch {
-                if let Some(cv) = in_flight.remove(&idx) {
+            for req in requests {
+                if let Some(cv) = in_flight.remove(&req.index) {
                     cv.notify_all();
                 }
             }
         }
 
-        Ok(())
+        result
     }
 
-    /// Verify a chunk against the reference tree, write to cache, mark valid.
-    fn verify_and_cache(&self, chunk_index: u32, data: &[u8]) -> io::Result<()> {
-        // Verify against reference
-        if !self.reference.verify_chunk(chunk_index, data) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "chunk {} failed integrity verification (SHA-256 mismatch)",
-                    chunk_index
-                ),
-            ));
-        }
-
-        let shape = self.reference.shape();
-        let offset = shape.chunk_start(chunk_index);
-
-        // Write to cache file
-        {
-            let mut file = self.cache_file.lock().unwrap();
-            file.seek(SeekFrom::Start(offset))?;
-            file.write_all(data)?;
-        }
-
-        // Mark valid and persist state
-        {
-            let mut state = self.state.lock().unwrap();
-            state.mark_valid(chunk_index);
-            state.save(&self.state_path)?;
-        }
-
-        Ok(())
+    /// Remove a chunk's in-flight entry and notify any blocked
+    /// readers. Called from the worker thread after a chunk is
+    /// successfully verified+written OR after a fatal error.
+    fn drop_in_flight(&self, chunk_index: u32) {
+        let cv = {
+            let mut inf = self.in_flight.lock().unwrap();
+            inf.remove(&chunk_index)
+        };
+        if let Some(cv) = cv { cv.notify_all(); }
     }
 
     /// Eagerly download and verify all unverified chunks.
@@ -369,22 +564,51 @@ impl CachedChannel {
 
     /// Eagerly download all unverified chunks with a progress callback.
     ///
-    /// The callback is invoked after each batch of chunks is downloaded.
+    /// The callback is invoked on a ticker (~4 Hz) while workers
+    /// are downloading, *and* once more at completion — so long
+    /// downloads emit live progress rather than going silent until
+    /// every chunk lands. Registering missing chunks in the
+    /// in-flight map first prevents a concurrent `read()` from
+    /// double-fetching the same range while prebuffer is running.
     pub fn prebuffer_with_progress<F: FnMut(&DownloadProgress)>(
         &self,
-        mut callback: F,
+        callback: F,
     ) -> io::Result<()> {
+        // Take a snapshot of which chunks need work, then claim
+        // them in the in-flight map under the same lock that the
+        // on-demand `ensure_chunks_valid` path uses. This is the
+        // guard against the race "prebuffer starts fetching a
+        // chunk → on-demand reader sees `state.is_valid()=false`
+        // and `in_flight.get()=None` → fires its own duplicate
+        // fetch".
         let missing = {
-            let state = self.state.lock().unwrap();
-            state.missing_chunks()
+            let mut in_flight = self.in_flight.lock().unwrap();
+            let mut out = Vec::new();
+            for i in self.state.missing_chunks() {
+                if in_flight.contains_key(&i) {
+                    // Another path already owns this chunk's
+                    // fetch — let it race to completion; we'll
+                    // skip it here.
+                    continue;
+                }
+                in_flight.insert(i, Arc::new(Condvar::new()));
+                out.push(i);
+            }
+            out
         };
 
         if missing.is_empty() {
+            // Nothing to do — still fire the cb once so callers
+            // see a "completed" snapshot.
+            let shape = self.reference.shape();
+            let progress = DownloadProgress::new(0, 0);
+            let _ = progress;
+            let mut cb = callback;
+            cb(&DownloadProgress::new(shape.total_content_size, 0));
             return Ok(());
         }
 
         let shape = self.reference.shape();
-
         let requests: Vec<ChunkRequest> = missing
             .iter()
             .map(|&i| ChunkRequest {
@@ -396,34 +620,17 @@ impl CachedChannel {
 
         let total_bytes: u64 = requests.iter().map(|r| r.len).sum();
         let progress = DownloadProgress::new(total_bytes, requests.len() as u32);
-
-        let results = fetch_chunks_parallel(
-            self.transport.as_ref(),
-            &requests,
-            &self.retry_policy,
-            &progress,
-            self.concurrency,
-        );
-
-        for result in results {
-            let (chunk_index, data) = result?;
-            self.verify_and_cache(chunk_index, &data)?;
-        }
-
-        callback(&progress);
-        Ok(())
+        self.parallel_fetch_verify_write(&requests, &progress, callback)
     }
 
     /// Whether all chunks have been downloaded and verified.
     pub fn is_complete(&self) -> bool {
-        let state = self.state.lock().unwrap();
-        state.is_complete()
+        self.state.is_complete()
     }
 
     /// Number of verified chunks.
     pub fn valid_count(&self) -> u32 {
-        let state = self.state.lock().unwrap();
-        state.valid_count()
+        self.state.valid_count()
     }
 
     /// Total number of chunks.
@@ -514,7 +721,7 @@ mod tests {
     ) -> (tempfile::TempDir, CachedChannel) {
         let dir = tempfile::tempdir().unwrap();
         let mref = MerkleRef::from_content(data, chunk_size);
-        let transport = Box::new(MemoryTransport::new(data.to_vec()));
+        let transport = Arc::new(MemoryTransport::new(data.to_vec()));
         let channel = CachedChannel::open(transport, mref, dir.path(), "test.dat").unwrap();
         (dir, channel)
     }
@@ -529,7 +736,7 @@ mod tests {
         let mref = MerkleRef::from_content(&fake_data, 256);
 
         let dir = tempfile::tempdir().unwrap();
-        let transport = Box::new(MemoryTransport::new(real_data));
+        let transport = Arc::new(MemoryTransport::new(real_data));
         let channel = CachedChannel::open(transport, mref, dir.path(), "mismatch.dat")
             .unwrap()
             .with_retry_policy(crate::transport::RetryPolicy {
@@ -555,7 +762,7 @@ mod tests {
 
         // Phase 1: open channel, download first two chunks, then drop
         {
-            let transport = Box::new(MemoryTransport::new(data.clone()));
+            let transport = Arc::new(MemoryTransport::new(data.clone()));
             let channel = CachedChannel::open(
                 transport, mref.clone(), dir.path(), "resume.dat",
             ).unwrap();
@@ -573,7 +780,7 @@ mod tests {
 
         // Phase 2: reopen — should resume from checkpoint
         {
-            let transport = Box::new(MemoryTransport::new(data.clone()));
+            let transport = Arc::new(MemoryTransport::new(data.clone()));
             let channel = CachedChannel::open(
                 transport, mref.clone(), dir.path(), "resume.dat",
             ).unwrap();
@@ -600,6 +807,159 @@ mod tests {
         let result = channel.read(400, 300).unwrap();
         assert_eq!(&result, &data[400..700]);
         assert!(channel.valid_count() >= 2);
+    }
+
+    // ─── Perf harness ────────────────────────────────────────────
+    //
+    // Self-contained throughput probe — *not* a Criterion bench so
+    // we don't add a dep just for a perf check. Inject controllable
+    // latency per `fetch_range` call to simulate LAN / S3 / cross-
+    // region transports, then measure prebuffer wall-clock at each
+    // concurrency level.
+    //
+    // Run with:
+    //   cargo test --release -p vectordata --lib bench_prebuffer_throughput \
+    //              -- --nocapture --ignored
+
+    struct LatencyTransport {
+        data: Vec<u8>,
+        latency_ms: u64,
+        /// Total fetch_range calls observed — exposed so the test
+        /// can assert no duplicate fetches under the in-flight
+        /// dedup contract.
+        fetch_calls: std::sync::atomic::AtomicU64,
+        /// Total bytes returned across all fetches.
+        bytes_served: std::sync::atomic::AtomicU64,
+    }
+
+    impl LatencyTransport {
+        fn new(data: Vec<u8>, latency_ms: u64) -> Self {
+            Self {
+                data, latency_ms,
+                fetch_calls: std::sync::atomic::AtomicU64::new(0),
+                bytes_served: std::sync::atomic::AtomicU64::new(0),
+            }
+        }
+    }
+
+    impl ChunkedTransport for LatencyTransport {
+        fn fetch_range(&self, start: u64, len: u64) -> io::Result<Vec<u8>> {
+            self.fetch_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if self.latency_ms > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(self.latency_ms));
+            }
+            let s = start as usize;
+            let e = s + len as usize;
+            if e > self.data.len() {
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "range past EOF"));
+            }
+            self.bytes_served.fetch_add(len, std::sync::atomic::Ordering::Relaxed);
+            Ok(self.data[s..e].to_vec())
+        }
+        fn content_length(&self) -> io::Result<u64> { Ok(self.data.len() as u64) }
+        fn supports_range(&self) -> bool { true }
+    }
+
+    /// Stress-test the in-flight dedup invariant under concurrent
+    /// reads + prebuffer. Multiple reader threads request
+    /// overlapping ranges while a prebuffer is in flight; the
+    /// `fetch_calls` counter on the transport must end up equal to
+    /// `n_chunks` exactly — no double-fetches, no missed chunks.
+    #[test]
+    fn parallel_reads_dedup_with_prebuffer() {
+        let chunk_size: u64 = 1024;
+        let n_chunks: usize = 32;
+        let data_size = chunk_size as usize * n_chunks;
+        let data: Vec<u8> = (0..data_size).map(|i| (i % 251) as u8).collect();
+        let mref = MerkleRef::from_content(&data, chunk_size);
+
+        let dir = tempfile::tempdir().unwrap();
+        let transport = Arc::new(LatencyTransport::new(data.clone(), 5));
+        let inspect = transport.clone(); // outlives `transport`, used for assertions below.
+        let channel = std::sync::Arc::new(
+            CachedChannel::open(transport, mref.clone(), dir.path(), "concurrent.dat")
+                .unwrap()
+                .with_concurrency(8));
+
+        // Spawn 8 reader threads + 1 prebuffer thread, all racing
+        // to drive the same set of chunks resident.
+        let mut handles = Vec::new();
+        for t in 0..8 {
+            let ch = channel.clone();
+            handles.push(std::thread::spawn(move || {
+                // Each thread reads a different overlapping range.
+                let offset = (t as u64) * (chunk_size / 2);
+                let len = chunk_size * (n_chunks as u64 / 2);
+                let _ = ch.read(offset, len).expect("read should succeed");
+            }));
+        }
+        {
+            let ch = channel.clone();
+            handles.push(std::thread::spawn(move || {
+                ch.prebuffer().expect("prebuffer should succeed");
+            }));
+        }
+        for h in handles { h.join().unwrap(); }
+
+        // All chunks must be valid; no duplicate transport calls.
+        assert!(channel.is_complete());
+        let fetches = inspect.fetch_calls.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(fetches, n_chunks as u64,
+            "in-flight dedup invariant violated: {fetches} fetches for {n_chunks} chunks");
+    }
+
+    /// Throughput probe across concurrency levels. Prints a single
+    /// table to stdout. Marked `#[ignore]` so it doesn't run in the
+    /// default test suite (the sleeps add ~30s wall-clock).
+    #[test]
+    #[ignore]
+    fn bench_prebuffer_throughput() {
+        // 200 chunks × 1 MiB = 200 MiB. Big enough that
+        // overheads matter; small enough that the test finishes
+        // in tens of seconds.
+        let chunk_size: u64 = 1 * 1024 * 1024;
+        let n_chunks: usize = 200;
+        let data_size = chunk_size as usize * n_chunks;
+        let data: Vec<u8> = (0..data_size).map(|i| (i % 251) as u8).collect();
+        let mref = MerkleRef::from_content(&data, chunk_size);
+
+        println!();
+        println!("=== prebuffer throughput (200 MiB, 200×1 MiB chunks) ===");
+        println!("{:<18} {:>12} {:>14} {:>14} {:>12}",
+            "latency_ms x conc", "fetch calls", "wall_ms", "MB/s", "dup_calls");
+
+        for &latency_ms in &[5u64, 50, 200] {
+            for &concurrency in &[1usize, 4, 8, 16, 32, 64] {
+                // Fresh tempdir per run so we always start cold.
+                let dir = tempfile::tempdir().unwrap();
+                let transport = Arc::new(LatencyTransport::new(data.clone(), latency_ms));
+                let inspect = transport.clone();
+                let channel = CachedChannel::open(
+                    transport, mref.clone(), dir.path(), "bench.dat",
+                ).unwrap()
+                 .with_concurrency(concurrency);
+
+                let start = std::time::Instant::now();
+                channel.prebuffer().unwrap();
+                let elapsed = start.elapsed();
+
+                let fetches = inspect.fetch_calls.load(std::sync::atomic::Ordering::Relaxed);
+                let dup = fetches.saturating_sub(n_chunks as u64);
+                let mb_per_s = (data_size as f64 / (1024.0 * 1024.0))
+                    / elapsed.as_secs_f64();
+
+                println!("{:>5}ms x {:>2}     {:>12} {:>14} {:>14.1} {:>12}",
+                    latency_ms, concurrency,
+                    fetches, elapsed.as_millis(), mb_per_s, dup);
+
+                // Invariant: in-flight dedup must prevent duplicate
+                // fetches. Even a single-threaded sequential
+                // prebuffer should issue exactly n_chunks calls.
+                assert_eq!(fetches, n_chunks as u64,
+                    "duplicate fetches detected at conc={concurrency}");
+            }
+        }
+        println!();
     }
 
     #[test]
@@ -630,7 +990,7 @@ mod tests {
 
         // First open: populate cache against the original ref.
         {
-            let transport = Box::new(MemoryTransport::new(original.clone()));
+            let transport = Arc::new(MemoryTransport::new(original.clone()));
             let channel = CachedChannel::open(
                 transport, original_ref.clone(), dir.path(), "asset.dat",
             ).unwrap();
@@ -645,7 +1005,7 @@ mod tests {
         let replaced_ref = MerkleRef::from_content(&replaced, chunk_size);
         assert_ne!(original_ref.root_hash(), replaced_ref.root_hash());
 
-        let transport = Box::new(MemoryTransport::new(replaced));
+        let transport = Arc::new(MemoryTransport::new(replaced));
         let err = match CachedChannel::open(
             transport, replaced_ref, dir.path(), "asset.dat",
         ) {
@@ -668,13 +1028,13 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         {
-            let transport = Box::new(MemoryTransport::new(data.clone()));
+            let transport = Arc::new(MemoryTransport::new(data.clone()));
             let channel = CachedChannel::open(
                 transport, mref.clone(), dir.path(), "asset.dat",
             ).unwrap();
             channel.prebuffer().unwrap();
         }
-        let transport = Box::new(MemoryTransport::new(data.clone()));
+        let transport = Arc::new(MemoryTransport::new(data.clone()));
         let channel = CachedChannel::open(
             transport, mref, dir.path(), "asset.dat",
         ).unwrap();

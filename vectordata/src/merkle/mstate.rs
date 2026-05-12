@@ -6,6 +6,7 @@
 use std::fs;
 use std::io::{self, Cursor};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::{FOOTER_SIZE, FOOTER_SIZE_V2, HASH_SIZE, MerkleRef, MerkleShape, read_hashes, sha256, write_hashes};
 
@@ -14,6 +15,11 @@ use super::{FOOTER_SIZE, FOOTER_SIZE_V2, HASH_SIZE, MerkleRef, MerkleShape, read
 /// Tracks which chunks have been downloaded and verified. The validity bitset
 /// uses Java `BitSet`-compatible encoding: a little-endian `u64` array where
 /// bit N maps to `words[N / 64] & (1 << (N % 64))`.
+///
+/// `valid_words` is stored as `Vec<AtomicU64>` so [`mark_valid`] is
+/// lock-free — workers in `CachedChannel::parallel_fetch_verify_write`
+/// can update the bitmap concurrently without taking a shared mutex.
+/// All reads use `Relaxed`/`Acquire` ordering as appropriate.
 ///
 /// The `.mrkl` file layout is:
 /// ```text
@@ -24,8 +30,22 @@ pub struct MerkleState {
     shape: MerkleShape,
     hashes: Vec<[u8; 32]>,
     /// Validity bits — one per leaf node. Encoded as little-endian u64 words
-    /// matching `java.util.BitSet`.
-    valid_words: Vec<u64>,
+    /// matching `java.util.BitSet`. Workers update via atomic `fetch_or`;
+    /// readers snapshot via `load(Relaxed)`.
+    valid_words: Vec<AtomicU64>,
+}
+
+impl Clone for MerkleState {
+    fn clone(&self) -> Self {
+        let valid_words = self.valid_words.iter()
+            .map(|w| AtomicU64::new(w.load(Ordering::Relaxed)))
+            .collect();
+        MerkleState {
+            shape: self.shape.clone(),
+            hashes: self.hashes.clone(),
+            valid_words,
+        }
+    }
 }
 
 impl MerkleState {
@@ -39,10 +59,12 @@ impl MerkleState {
 
         let word_count = Self::word_count_for_leaves(shape.leaf_count);
 
+        let mut valid_words = Vec::with_capacity(word_count);
+        for _ in 0..word_count { valid_words.push(AtomicU64::new(0)); }
         MerkleState {
             shape,
             hashes,
-            valid_words: vec![0u64; word_count],
+            valid_words,
         }
     }
 
@@ -115,7 +137,7 @@ impl MerkleState {
                 bitset_data[offset + 6],
                 bitset_data[offset + 7],
             ]);
-            valid_words.push(word);
+            valid_words.push(AtomicU64::new(word));
         }
 
         Ok(MerkleState {
@@ -138,9 +160,15 @@ impl MerkleState {
     pub fn write<W: io::Write>(&self, w: &mut W) -> io::Result<()> {
         write_hashes(w, &self.hashes)?;
 
-        // Write bitset as little-endian u64 words
-        for &word in &self.valid_words {
-            w.write_all(&word.to_le_bytes())?;
+        // Write bitset as little-endian u64 words. Each atomic is
+        // loaded with `Relaxed` — concurrent `mark_valid` calls
+        // may flip bits 0 → 1 during the iteration, but the
+        // serialization is well-defined for any consistent snapshot
+        // of each word, and the `.mrkl` we write is monotone
+        // (bits only go from missing to verified across runs).
+        for word in &self.valid_words {
+            let v = word.load(Ordering::Relaxed);
+            w.write_all(&v.to_le_bytes())?;
         }
 
         self.shape.write_footer_with_bitset(w, self.bitset_byte_size() as u32)?;
@@ -159,27 +187,45 @@ impl MerkleState {
         if word_idx >= self.valid_words.len() {
             return false;
         }
-        (self.valid_words[word_idx] & (1u64 << bit_idx)) != 0
+        (self.valid_words[word_idx].load(Ordering::Acquire) & (1u64 << bit_idx)) != 0
     }
 
     /// Mark a chunk as verified (monotonic — bits only transition 0 → 1).
-    pub fn mark_valid(&mut self, chunk_index: u32) {
+    ///
+    /// Lock-free: workers in `CachedChannel::parallel_fetch_verify_write`
+    /// call this concurrently without external synchronization. The
+    /// `fetch_or` is `AcqRel`-ordered so concurrent `is_valid` /
+    /// `valid_count` readers see the bit set as soon as the worker
+    /// returns from this call. Out-of-range indices are silently
+    /// ignored (matching the previous mutable-self contract).
+    pub fn mark_valid(&self, chunk_index: u32) {
         let word_idx = chunk_index as usize / 64;
         let bit_idx = chunk_index as usize % 64;
         if word_idx < self.valid_words.len() {
-            self.valid_words[word_idx] |= 1u64 << bit_idx;
+            self.valid_words[word_idx]
+                .fetch_or(1u64 << bit_idx, Ordering::AcqRel);
         }
     }
 
-    /// Number of verified chunks.
+    /// Number of verified chunks. Sums `count_ones` across the
+    /// atomic bitmap rather than walking chunk-by-chunk via
+    /// `is_valid`, so it's O(words) instead of O(chunks).
     pub fn valid_count(&self) -> u32 {
-        let mut count = 0u32;
-        for i in 0..self.shape.total_chunks {
-            if self.is_valid(i) {
-                count += 1;
-            }
+        let total = self.shape.total_chunks;
+        if total == 0 { return 0; }
+        let full_words = (total as usize) / 64;
+        let tail_bits = (total as usize) % 64;
+        let mut count: u32 = 0;
+        for i in 0..full_words {
+            count = count.saturating_add(
+                self.valid_words[i].load(Ordering::Relaxed).count_ones());
         }
-        count
+        if tail_bits > 0 && full_words < self.valid_words.len() {
+            let mask: u64 = (1u64 << tail_bits) - 1;
+            let w = self.valid_words[full_words].load(Ordering::Relaxed) & mask;
+            count = count.saturating_add(w.count_ones());
+        }
+        count.min(total)
     }
 
     /// Are all chunks verified?
@@ -190,7 +236,7 @@ impl MerkleState {
     /// Verify chunk data and mark as valid if the hash matches.
     ///
     /// Returns `true` if the data is valid (hash matches the reference).
-    pub fn verify_and_mark(&mut self, chunk_index: u32, data: &[u8]) -> bool {
+    pub fn verify_and_mark(&self, chunk_index: u32, data: &[u8]) -> bool {
         let computed = sha256(data);
         let node_idx = self.shape.leaf_node_index(chunk_index) as usize;
         if computed == self.hashes[node_idx] {
@@ -243,7 +289,7 @@ mod tests {
     #[test]
     fn test_mark_valid() {
         let (_, mref) = make_test_ref();
-        let mut state = MerkleState::from_ref(&mref);
+        let state = MerkleState::from_ref(&mref);
 
         state.mark_valid(0);
         assert!(state.is_valid(0));
@@ -258,7 +304,7 @@ mod tests {
     #[test]
     fn test_verify_and_mark() {
         let (data, mref) = make_test_ref();
-        let mut state = MerkleState::from_ref(&mref);
+        let state = MerkleState::from_ref(&mref);
 
         // Good data
         assert!(state.verify_and_mark(0, &data[0..1024]));
@@ -274,7 +320,7 @@ mod tests {
     #[test]
     fn test_is_complete() {
         let (data, mref) = make_test_ref();
-        let mut state = MerkleState::from_ref(&mref);
+        let state = MerkleState::from_ref(&mref);
 
         for i in 0..4u32 {
             let start = (i * 1024) as usize;
@@ -286,7 +332,7 @@ mod tests {
     #[test]
     fn test_missing_chunks() {
         let (data, mref) = make_test_ref();
-        let mut state = MerkleState::from_ref(&mref);
+        let state = MerkleState::from_ref(&mref);
 
         state.verify_and_mark(0, &data[0..1024]);
         state.verify_and_mark(2, &data[2048..3072]);
@@ -298,7 +344,7 @@ mod tests {
     #[test]
     fn test_save_load_round_trip() {
         let (data, mref) = make_test_ref();
-        let mut state = MerkleState::from_ref(&mref);
+        let state = MerkleState::from_ref(&mref);
 
         // Verify some chunks
         state.verify_and_mark(0, &data[0..1024]);
@@ -323,12 +369,12 @@ mod tests {
         // Bit 0 is the LSB of word 0. Bit 63 is the MSB of word 0.
         // Bit 64 is the LSB of word 1.
         let (_, mref) = make_test_ref();
-        let mut state = MerkleState::from_ref(&mref);
+        let state = MerkleState::from_ref(&mref);
 
         state.mark_valid(0); // bit 0 → word[0] |= 1
         state.mark_valid(2); // bit 2 → word[0] |= 4
 
-        assert_eq!(state.valid_words[0], 0b101); // bits 0 and 2
+        assert_eq!(state.valid_words[0].load(Ordering::Relaxed), 0b101); // bits 0 and 2
 
         // Serialize and check raw bytes
         let mut buf = Vec::new();
@@ -344,7 +390,7 @@ mod tests {
     #[test]
     fn test_resume_from_checkpoint() {
         let (data, mref) = make_test_ref();
-        let mut state = MerkleState::from_ref(&mref);
+        let state = MerkleState::from_ref(&mref);
 
         // Simulate partial download
         state.verify_and_mark(0, &data[0..1024]);
@@ -355,7 +401,7 @@ mod tests {
         state.save(&path).unwrap();
 
         // "Resume" — load state, continue verifying
-        let mut resumed = MerkleState::load(&path).unwrap();
+        let resumed = MerkleState::load(&path).unwrap();
         assert_eq!(resumed.valid_count(), 2);
         assert_eq!(resumed.missing_chunks(), vec![2, 3]);
 
@@ -369,7 +415,7 @@ mod tests {
         // Test with > 64 chunks to exercise multi-word bitset
         let data = vec![0u8; 100 * 64]; // 100 chunks of 64 bytes
         let mref = MerkleRef::from_content(&data, 64);
-        let mut state = MerkleState::from_ref(&mref);
+        let state = MerkleState::from_ref(&mref);
 
         assert_eq!(state.shape().total_chunks, 100);
 
@@ -436,7 +482,7 @@ mod tests {
     fn test_single_chunk_mark_complete() {
         let data = vec![0xFFu8; 100];
         let mref = MerkleRef::from_content(&data, 4096);
-        let mut state = MerkleState::from_ref(&mref);
+        let state = MerkleState::from_ref(&mref);
 
         assert_eq!(state.shape().total_chunks, 1);
         assert!(!state.is_complete());
@@ -453,7 +499,7 @@ mod tests {
         let chunk_size = 64usize;
         let data = vec![0u8; chunk_size * 1000];
         let mref = MerkleRef::from_content(&data, chunk_size as u64);
-        let mut state = MerkleState::from_ref(&mref);
+        let state = MerkleState::from_ref(&mref);
 
         assert_eq!(state.shape().total_chunks, 1000);
         assert!(!state.is_complete());
@@ -472,7 +518,7 @@ mod tests {
         let chunk_size = 64usize;
         let data = vec![0u8; chunk_size * 1000];
         let mref = MerkleRef::from_content(&data, chunk_size as u64);
-        let mut state = MerkleState::from_ref(&mref);
+        let state = MerkleState::from_ref(&mref);
 
         // Mark a scattered pattern of valid chunks
         for i in (0..1000u32).step_by(3) {
