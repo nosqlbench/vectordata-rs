@@ -51,6 +51,10 @@ pub struct SinkConfig {
     /// Preferred slab page size override. `None` uses the slabtastic default.
     pub slab_page_size: Option<u32>,
     pub slab_namespace: u8,
+    /// Optional schema descriptor to emit alongside the content
+    /// records as a `:schema` namespace sidecar. Honored only by slab
+    /// sinks; other formats ignore it.
+    pub schema_sidecar: Option<vectordata::metadata_schema::MetadataSchema>,
 }
 
 /// Open a sink writer for the given path, format, and configuration
@@ -72,6 +76,7 @@ pub fn open_sink(
                 record_byte_len,
                 config.slab_page_size,
                 config.slab_namespace,
+                config.schema_sidecar.clone(),
             )
         }
         _ if format.is_xvec() => xvec::XvecWriter::open(path, config.dimension),

@@ -279,6 +279,7 @@ generation, or half-precision storage.
                 required: true,
                 default: None,
                 description: "Output directory for dataset files".to_string(),
+                extended_description: None,
                         role: OptionRole::Output,
         },
             OptionDesc {
@@ -287,6 +288,7 @@ generation, or half-precision storage.
                 required: true,
                 default: None,
                 description: "Vector dimensionality".to_string(),
+                extended_description: None,
                         role: OptionRole::Config,
         },
             OptionDesc {
@@ -295,6 +297,7 @@ generation, or half-precision storage.
                 required: false,
                 default: Some("10000".to_string()),
                 description: "Number of base vectors".to_string(),
+                extended_description: None,
                         role: OptionRole::Config,
         },
             OptionDesc {
@@ -303,6 +306,7 @@ generation, or half-precision storage.
                 required: false,
                 default: Some("1000".to_string()),
                 description: "Number of query vectors".to_string(),
+                extended_description: None,
                         role: OptionRole::Config,
         },
             OptionDesc {
@@ -311,6 +315,7 @@ generation, or half-precision storage.
                 required: false,
                 default: Some("100".to_string()),
                 description: "Ground truth neighbor count (k)".to_string(),
+                extended_description: None,
                         role: OptionRole::Config,
         },
             OptionDesc {
@@ -319,6 +324,7 @@ generation, or half-precision storage.
                 required: false,
                 default: Some("L2".to_string()),
                 description: "Distance metric: L2, Cosine, DotProduct, L1".to_string(),
+                extended_description: None,
                         role: OptionRole::Config,
         },
             OptionDesc {
@@ -327,6 +333,7 @@ generation, or half-precision storage.
                 required: false,
                 default: None,
                 description: "PRNG seed (default: time-based)".to_string(),
+                extended_description: None,
                         role: OptionRole::Config,
         },
             OptionDesc {
@@ -335,6 +342,7 @@ generation, or half-precision storage.
                 required: false,
                 default: Some("0.0".to_string()),
                 description: "Minimum value for uniform distribution".to_string(),
+                extended_description: None,
                         role: OptionRole::Config,
         },
             OptionDesc {
@@ -343,6 +351,7 @@ generation, or half-precision storage.
                 required: false,
                 default: Some("1.0".to_string()),
                 description: "Maximum value for uniform distribution".to_string(),
+                extended_description: None,
                         role: OptionRole::Config,
         },
             OptionDesc {
@@ -351,6 +360,7 @@ generation, or half-precision storage.
                 required: false,
                 default: Some("false".to_string()),
                 description: "Overwrite existing dataset".to_string(),
+                extended_description: None,
                         role: OptionRole::Config,
         },
             OptionDesc {
@@ -359,6 +369,7 @@ generation, or half-precision storage.
                 required: false,
                 default: Some("synthetic".to_string()),
                 description: "Model name metadata".to_string(),
+                extended_description: None,
                         role: OptionRole::Config,
         },
             OptionDesc {
@@ -367,6 +378,7 @@ generation, or half-precision storage.
                 required: false,
                 default: Some("Apache-2.0".to_string()),
                 description: "License metadata".to_string(),
+                extended_description: None,
                         role: OptionRole::Config,
         },
             OptionDesc {
@@ -375,6 +387,7 @@ generation, or half-precision storage.
                 required: false,
                 default: Some("veks".to_string()),
                 description: "Vendor metadata".to_string(),
+                extended_description: None,
                         role: OptionRole::Config,
         },
         ]

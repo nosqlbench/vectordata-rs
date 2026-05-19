@@ -17,7 +17,7 @@ use slabtastic::{OpenProgress, SlabReader, SlabWriter, WriterConfig};
 
 use crate::pipeline::atomic_write::safe_create_file;
 use crate::pipeline::command::{
-    ArtifactManifest, CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options,
+    CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options,
     ResourceDesc, Status, StreamContext, render_options_table,
 };
 
@@ -1579,260 +1579,15 @@ will operate on.
     }
 }
 
-// -- Slab Survey ---------------------------------------------------------------
-
-/// Pipeline command: sample slab records, decode as ANodes, and report per-field
-/// value distribution statistics.
-pub struct SlabSurveyOp;
-
-/// Create a boxed `SlabSurveyOp` command.
-pub fn survey_factory() -> Box<dyn CommandOp> {
-    Box::new(SlabSurveyOp)
-}
-
-impl CommandOp for SlabSurveyOp {
-    fn command_path(&self) -> &str {
-        "analyze survey"
-    }
-
-    fn category(&self) -> &'static dyn veks_completion::CategoryTag {
-        &crate::pipeline::command::CAT_ANALYZE
-    }
-
-    fn level(&self) -> &'static dyn veks_completion::LevelTag { &crate::pipeline::command::LVL_PRIMARY }
-
-    fn command_doc(&self) -> CommandDoc {
-        let options = self.describe_options();
-        CommandDoc {
-            summary: "Survey metadata field value distributions".into(),
-            body: format!(
-                r#"# analyze survey
-
-Survey metadata field value distributions.
-
-## Description
-
-Scans slab records, decodes them as ANode metadata, and reports
-per-field statistics including value type breakdown, numeric ranges,
-string length distributions, and distinct value cardinality. The
-survey can sample a configurable number of records to keep execution
-time manageable on large slabs.
-
-## How It Works
-
-The command opens the slab file and reads up to `samples` records in
-page order. Each record is decoded as an ANode and its fields are
-examined. For every field the command tracks: the number of non-null
-values, a count of values by type tag, numeric min/max/mean for
-numeric fields, string length min/max/mean for string fields, and a
-bounded set of distinct values (up to `max-distinct`). Results are
-printed to the console and optionally written to an output file in a
-structured format suitable for further processing.
-
-## Data Preparation Role
-
-`survey` is a prerequisite for predicate synthesis. Before the pipeline
-can generate predicates for filtered KNN queries, it needs to know
-which metadata fields exist, what types they use, what value ranges
-they span, and how many distinct values they contain. The survey output
-drives decisions about which fields are suitable for predicate
-generation, what bin boundaries to use for numeric fields, and whether
-a field's cardinality is low enough for enumerated predicates. Running
-`survey` early in the pipeline ensures that downstream `compute
-predicates` steps have the schema and cardinality information they need.
-
-## Options
-
-{}"#,
-                render_options_table(&options)
-            ),
-        }
-    }
-
-    fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
-        let start = Instant::now();
-
-        let input_str = match options.require("source") {
-            Ok(s) => s,
-            Err(e) => return error_result(e, start),
-        };
-        let input_path = resolve_path(input_str, &ctx.workspace);
-
-        let max_samples: usize = options
-            .get("samples")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(1000);
-        let max_distinct: usize = options
-            .get("max-distinct")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(20);
-
-        let output_path = options.get("output").map(|s| resolve_path(s, &ctx.workspace));
-
-        let is_ivec = input_path.extension().and_then(|e| e.to_str())
-            .map(|e| matches!(e, "ivec" | "ivecs" | "ivvec" | "ivvecs" | "i32vvec" | "i32vvecs"))
-            .unwrap_or(false);
-        let survey = if is_ivec {
-            match survey_ivec(&input_path, max_samples, max_distinct) {
-                Ok(s) => s,
-                Err(e) => return error_result(e, start),
-            }
-        } else {
-            match survey_slab(&input_path, max_samples, max_distinct, Some(&ctx.ui)) {
-                Ok(s) => s,
-                Err(e) => return error_result(e, start),
-            }
-        };
-
-        // Print results
-        ctx.ui.log(&format!(
-            "Slab Survey: {} ({} of {} records sampled)",
-            input_path.display(),
-            survey.sampled,
-            survey.total_records,
-        ));
-
-        for (name, fs) in &survey.field_stats {
-            ctx.ui.log("");
-            ctx.ui.log(&format!(
-                "  Field \"{}\" — {} values ({} null)",
-                name, fs.count, fs.null_count,
-            ));
-
-            // Type breakdown
-            let mut type_parts: Vec<String> = Vec::new();
-            for (tag, cnt) in &fs.type_counts {
-                type_parts.push(format!("{} ({})", tag, cnt));
-            }
-            if !type_parts.is_empty() {
-                ctx.ui.log(&format!("    types: {}", type_parts.join(", ")));
-            }
-
-            // Numeric stats
-            if fs.numeric_count > 0 {
-                let mean = fs.numeric_sum / fs.numeric_count as f64;
-                ctx.ui.log(&format!(
-                    "    range: {} .. {}   mean: {:.1}",
-                    fs.numeric_min, fs.numeric_max, mean,
-                ));
-            }
-
-            // String length stats
-            if fs.strlen_count > 0 {
-                let mean = fs.strlen_sum as f64 / fs.strlen_count as f64;
-                ctx.ui.log(&format!(
-                    "    strlen: {} .. {}   mean: {:.1}",
-                    fs.strlen_min, fs.strlen_max, mean,
-                ));
-            }
-
-            // Bytes length stats
-            if fs.byteslen_count > 0 {
-                let mean = fs.byteslen_sum as f64 / fs.byteslen_count as f64;
-                ctx.ui.log(&format!(
-                    "    byteslen: {} .. {}   mean: {:.1}",
-                    fs.byteslen_min, fs.byteslen_max, mean,
-                ));
-            }
-
-            // Distinct values
-            if !fs.distinct.is_empty() {
-                let overflow_msg = if fs.distinct_overflow {
-                    " (overflow — more exist)"
-                } else {
-                    ""
-                };
-                ctx.ui.log(&format!(
-                    "    {} distinct values{}",
-                    fs.distinct.len(),
-                    overflow_msg,
-                ));
-            }
-        }
-
-        if survey.non_mnode_count > 0 || survey.decode_errors > 0 {
-            ctx.ui.log("");
-            if survey.non_mnode_count > 0 {
-                ctx.ui.log(&format!("  Non-MNode records: {}", survey.non_mnode_count));
-            }
-            if survey.decode_errors > 0 {
-                ctx.ui.log(&format!("  Decode errors: {}", survey.decode_errors));
-            }
-        }
-
-        // Write JSON output if requested
-        let mut produced = vec![];
-        if let Some(ref out_path) = output_path {
-            match survey_to_json(&survey, out_path) {
-                Ok(()) => {
-                    produced.push(out_path.clone());
-                }
-                Err(e) => return error_result(format!("failed to write JSON: {}", e), start),
-            }
-        }
-
-        // Build field names list for message
-        let field_names: Vec<&str> = survey.field_stats.keys().map(|s| s.as_str()).collect();
-        let message = format!(
-            "{} records sampled, {} fields: {}",
-            survey.sampled,
-            field_names.len(),
-            field_names.join(", "),
-        );
-
-        CommandResult {
-            status: Status::Ok,
-            message,
-            produced,
-            elapsed: start.elapsed(),
-        }
-    }
-
-    fn describe_options(&self) -> Vec<OptionDesc> {
-        vec![
-            OptionDesc {
-                name: "source".to_string(),
-                type_name: "Path".to_string(),
-                required: true,
-                default: None,
-                description: "Slab file to survey".to_string(),
-                role: OptionRole::Input,
-            },
-            OptionDesc {
-                name: "output".to_string(),
-                type_name: "Path".to_string(),
-                required: false,
-                default: None,
-                description: "Optional JSON output file for survey results".to_string(),
-                role: OptionRole::Output,
-            },
-            OptionDesc {
-                name: "samples".to_string(),
-                type_name: "int".to_string(),
-                required: false,
-                default: Some("1000".to_string()),
-                description: "Max records to sample".to_string(),
-                role: OptionRole::Config,
-            },
-            OptionDesc {
-                name: "max-distinct".to_string(),
-                type_name: "int".to_string(),
-                required: false,
-                default: Some("20".to_string()),
-                description: "Max distinct values tracked per field".to_string(),
-                role: OptionRole::Config,
-            },
-        ]
-    }
-
-    fn project_artifacts(&self, step_id: &str, options: &Options) -> ArtifactManifest {
-        crate::pipeline::command::manifest_from_keys(
-            step_id, self.command_path(), options,
-            &["source"],
-            &["output"],
-        )
-    }
-}
+// -- Slab Survey Internal Helpers ---------------------------------------------
+//
+// Bookkeeping types and helpers shared between `generate predicates` and the
+// new `analyze survey` orchestrator. The user-facing single-pass legacy
+// `analyze legacy-survey` command op was removed once the new two-pass
+// `analyze survey` (sysref §13) replaced it; what remains here is the
+// `FieldStats` / `SurveyResult` shape that the predicate generator still
+// consumes, plus the `survey_inline_via_orchestrator` adapter that runs the
+// new orchestrator and projects its richer output down to that shape.
 
 /// Per-field distribution statistics accumulated during a slab survey.
 pub(crate) struct FieldStats {
@@ -1877,73 +1632,6 @@ impl FieldStats {
             distinct_overflow: false,
         }
     }
-
-    /// Observe a single field value, updating all tracked statistics.
-    pub(crate) fn observe(&mut self, value: &veks_core::formats::mnode::MValue, max_distinct: usize) {
-        use veks_core::formats::mnode::MValue;
-
-        self.count += 1;
-
-        if matches!(value, MValue::Null) {
-            self.null_count += 1;
-        }
-
-        let tag_name = value.tag().to_string();
-        *self.type_counts.entry(tag_name).or_insert(0) += 1;
-
-        // Numeric stats
-        let numeric_val: Option<f64> = match value {
-            MValue::Int(v) => Some(*v as f64),
-            MValue::Int32(v) => Some(*v as f64),
-            MValue::Short(v) => Some(*v as f64),
-            MValue::Float(v) => Some(*v),
-            MValue::Float32(v) => Some(*v as f64),
-            MValue::Half(v) => Some(half::f16::from_bits(*v).to_f64()),
-            MValue::Millis(v) => Some(*v as f64),
-            _ => None,
-        };
-        if let Some(v) = numeric_val {
-            if v < self.numeric_min { self.numeric_min = v; }
-            if v > self.numeric_max { self.numeric_max = v; }
-            self.numeric_sum += v;
-            self.numeric_count += 1;
-        }
-
-        // String length stats
-        let str_val: Option<&str> = match value {
-            MValue::Text(s) | MValue::Ascii(s) | MValue::EnumStr(s)
-            | MValue::Date(s) | MValue::Time(s) | MValue::DateTime(s) => Some(s.as_str()),
-            _ => None,
-        };
-        if let Some(s) = str_val {
-            let len = s.len();
-            if len < self.strlen_min { self.strlen_min = len; }
-            if len > self.strlen_max { self.strlen_max = len; }
-            self.strlen_sum += len;
-            self.strlen_count += 1;
-        }
-
-        // Bytes length stats
-        if let MValue::Bytes(b) = value {
-            let len = b.len();
-            if len < self.byteslen_min { self.byteslen_min = len; }
-            if len > self.byteslen_max { self.byteslen_max = len; }
-            self.byteslen_sum += len;
-            self.byteslen_count += 1;
-        }
-
-        // Distinct value tracking
-        if !self.distinct_overflow {
-            let repr = format!("{}", value);
-            if self.distinct.contains_key(&repr) {
-                *self.distinct.get_mut(&repr).unwrap() += 1;
-            } else if self.distinct.len() < max_distinct {
-                self.distinct.insert(repr, 1);
-            } else {
-                self.distinct_overflow = true;
-            }
-        }
-    }
 }
 
 /// Select `n` evenly-spaced page indices from `total` pages.
@@ -1972,372 +1660,148 @@ pub(crate) struct SurveyResult {
     pub(crate) decode_errors: usize,
 }
 
-/// Survey a slab file by sampling records and gathering per-field statistics.
-///
-/// Opens the slab, samples up to `max_samples` records across evenly-spaced
-/// pages, decodes each as an MNode, and accumulates field statistics.
-pub(crate) fn survey_slab(
-    path: &Path,
-    max_samples: usize,
-    max_distinct: usize,
-    ui: Option<&veks_core::ui::UiHandle>,
-) -> Result<SurveyResult, String> {
-    let reader = open_slab(path)
-        .map_err(|e| format!("failed to open {}: {}", path.display(), e))?;
-
-    let page_entries = reader.page_entries();
-    let total_pages = page_entries.len();
-
-    if total_pages == 0 {
-        return Ok(SurveyResult {
-            field_stats: indexmap::IndexMap::new(),
-            sampled: 0,
-            total_records: 0,
-            non_mnode_count: 0,
-            decode_errors: 0,
-        });
-    }
-
-    // Use the cached page index for total record count — no extra I/O
-    let total_records = reader.total_records() as usize;
-
-    let desired_pages = if total_records == 0 {
-        0
-    } else {
-        let avg_recs_per_page = total_records as f64 / total_pages as f64;
-        let needed = (max_samples as f64 / avg_recs_per_page).ceil() as usize;
-        needed.max(1).min(total_pages)
-    };
-    let sample_indices = sample_page_indices(total_pages, desired_pages);
-
-    log::info!(
-        "survey: sampling {} of {} pages ({} total records, target {} samples)",
-        sample_indices.len(), total_pages, total_records, max_samples,
-    );
-
-    use veks_core::formats::anode;
-    use veks_core::formats::anode::ANode;
-
-    let mut field_stats: indexmap::IndexMap<String, FieldStats> = indexmap::IndexMap::new();
-    let mut sampled = 0usize;
-    let mut non_mnode_count = 0usize;
-    let mut decode_errors = 0usize;
-    let sample_page_count = sample_indices.len();
-    let survey_start = std::time::Instant::now();
-    let mut last_report = std::time::Instant::now();
-
-    // Create a progress bar if a UI handle was provided
-    let pb = ui.map(|u| u.bar_with_unit(max_samples as u64, "surveying slab records", "records"));
-
-    'outer: for (progress_idx, &page_idx) in sample_indices.iter().enumerate() {
-        if progress_idx > 0
-            && (last_report.elapsed().as_secs() >= 5 || progress_idx + 1 == sample_page_count)
-        {
-            last_report = std::time::Instant::now();
-            let elapsed = survey_start.elapsed().as_secs_f64();
-            let rate = if elapsed > 0.0 { sampled as f64 / elapsed } else { 0.0 };
-            let pct = (progress_idx + 1) as f64 / sample_page_count as f64 * 100.0;
-            let eta = if rate > 0.0 {
-                let remaining_pages = sample_page_count - progress_idx - 1;
-                let avg_recs_per_page = if progress_idx > 0 { sampled as f64 / progress_idx as f64 } else { 1.0 };
-                let remaining_secs = remaining_pages as f64 * avg_recs_per_page / rate;
-                if remaining_secs < 60.0 { format!(", ETA {:.0}s", remaining_secs) }
-                else if remaining_secs < 3600.0 { format!(", ETA {:.1}m", remaining_secs / 60.0) }
-                else { format!(", ETA {:.1}h", remaining_secs / 3600.0) }
-            } else {
-                String::new()
-            };
-            log::info!(
-                "survey: {:.1}% ({}/{} pages, {} records, {:.0} rec/s{})",
-                pct, progress_idx + 1, sample_page_count, sampled, rate, eta,
-            );
-        }
-
-        let entry = &page_entries[page_idx];
-        let page = match reader.read_data_page(entry) {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-        let rec_count = page.record_count();
-        for i in 0..rec_count {
-            if sampled >= max_samples {
-                break 'outer;
-            }
-            let data = match page.get_record(i) {
-                Some(d) => d,
-                None => continue,
-            };
-            match anode::decode(data) {
-                Ok(ANode::MNode(node)) => {
-                    for (name, value) in &node.fields {
-                        let fs = field_stats
-                            .entry(name.clone())
-                            .or_insert_with(FieldStats::new);
-                        fs.observe(value, max_distinct);
-                    }
-                }
-                Ok(ANode::PNode(_)) => {
-                    non_mnode_count += 1;
-                }
-                Err(_) => {
-                    decode_errors += 1;
-                }
-            }
-            sampled += 1;
-            if sampled % 100_000 == 0 {
-                if let Some(ref p) = pb { p.set_position(sampled as u64); }
-            }
-        }
-    }
-
-    if let Some(ref p) = pb { p.finish(); }
-    log::info!("survey: complete, {} records sampled", sampled);
-
-    Ok(SurveyResult {
-        field_stats,
-        sampled,
-        total_records,
-        non_mnode_count,
-        decode_errors,
-    })
-}
-
-// ── Survey JSON serialization structs ────────────────────────────────
-// Shared between writer and reader to guarantee field name consistency.
-// The JSON representation uses computed `mean` instead of raw `sum`.
-
-#[derive(serde::Serialize, serde::Deserialize)]
-struct SurveyJson {
-    sampled: usize,
-    total_records: usize,
-    non_mnode_count: usize,
-    decode_errors: usize,
-    fields: indexmap::IndexMap<String, FieldStatsJson>,
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-struct FieldStatsJson {
-    count: usize,
-    null_count: usize,
-    types: indexmap::IndexMap<String, usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    numeric: Option<RangeStatsJson>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    strlen: Option<LenStatsJson>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    byteslen: Option<LenStatsJson>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    distinct: Option<indexmap::IndexMap<String, usize>>,
-    #[serde(default)]
-    distinct_overflow: bool,
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-struct RangeStatsJson {
-    min: f64,
-    max: f64,
-    mean: f64,
-    count: usize,
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-struct LenStatsJson {
-    min: usize,
-    max: usize,
-    mean: f64,
-    count: usize,
-}
-
-impl SurveyJson {
-    fn from_survey(survey: &SurveyResult) -> Self {
-        let fields = survey.field_stats.iter().map(|(name, fs)| {
-            let numeric = if fs.numeric_count > 0 {
-                Some(RangeStatsJson {
-                    min: fs.numeric_min,
-                    max: fs.numeric_max,
-                    mean: fs.numeric_sum / fs.numeric_count as f64,
-                    count: fs.numeric_count,
-                })
-            } else { None };
-
-            let strlen = if fs.strlen_count > 0 {
-                Some(LenStatsJson {
-                    min: fs.strlen_min,
-                    max: fs.strlen_max,
-                    mean: fs.strlen_sum as f64 / fs.strlen_count as f64,
-                    count: fs.strlen_count,
-                })
-            } else { None };
-
-            let byteslen = if fs.byteslen_count > 0 {
-                Some(LenStatsJson {
-                    min: fs.byteslen_min,
-                    max: fs.byteslen_max,
-                    mean: fs.byteslen_sum as f64 / fs.byteslen_count as f64,
-                    count: fs.byteslen_count,
-                })
-            } else { None };
-
-            let distinct = if !fs.distinct.is_empty() {
-                Some(fs.distinct.clone())
-            } else { None };
-
-            (name.clone(), FieldStatsJson {
-                count: fs.count,
-                null_count: fs.null_count,
-                types: fs.type_counts.clone(),
-                numeric,
-                strlen,
-                byteslen,
-                distinct,
-                distinct_overflow: fs.distinct_overflow,
-            })
-        }).collect();
-
-        SurveyJson {
-            sampled: survey.sampled,
-            total_records: survey.total_records,
-            non_mnode_count: survey.non_mnode_count,
-            decode_errors: survey.decode_errors,
-            fields,
-        }
-    }
-
-    fn to_survey(&self) -> SurveyResult {
-        let field_stats = self.fields.iter().map(|(name, fj)| {
-            let mut fs = FieldStats::new();
-            fs.count = fj.count;
-            fs.null_count = fj.null_count;
-            fs.type_counts = fj.types.clone();
-
-            if let Some(ref n) = fj.numeric {
-                fs.numeric_min = n.min;
-                fs.numeric_max = n.max;
-                fs.numeric_count = n.count;
-                fs.numeric_sum = n.mean * n.count as f64;
-            }
-            if let Some(ref s) = fj.strlen {
-                fs.strlen_min = s.min;
-                fs.strlen_max = s.max;
-                fs.strlen_count = s.count;
-                fs.strlen_sum = (s.mean * s.count as f64) as usize;
-            }
-            if let Some(ref b) = fj.byteslen {
-                fs.byteslen_min = b.min;
-                fs.byteslen_max = b.max;
-                fs.byteslen_count = b.count;
-                fs.byteslen_sum = (b.mean * b.count as f64) as usize;
-            }
-            if let Some(ref d) = fj.distinct {
-                fs.distinct = d.clone();
-            }
-            fs.distinct_overflow = fj.distinct_overflow;
-
-            (name.clone(), fs)
-        }).collect();
-
-        SurveyResult {
-            field_stats,
-            sampled: self.sampled,
-            total_records: self.total_records,
-            non_mnode_count: self.non_mnode_count,
-            decode_errors: self.decode_errors,
-        }
-    }
-}
-
-/// Survey an ivec file: each record is [dim:i32, val0:i32, val1:i32, ...].
-/// Produces per-field statistics matching the slab survey format.
-fn survey_ivec(
-    path: &Path,
-    max_samples: usize,
-    max_distinct: usize,
-) -> Result<SurveyResult, String> {
-    let data = std::fs::read(path)
-        .map_err(|e| format!("read {}: {}", path.display(), e))?;
-    if data.len() < 4 {
-        return Err(format!("{}: too small for ivec", path.display()));
-    }
-    let dim_i32 = i32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-    if dim_i32 <= 0 {
-        return Err(format!("{}: invalid dimension {}", path.display(), dim_i32));
-    }
-    let dim = dim_i32 as usize;
-    let record_bytes = 4 + dim * 4;
-    let total_records = data.len() / record_bytes;
-    let sample_count = total_records.min(max_samples);
-
-    let mut field_stats: indexmap::IndexMap<String, FieldStats> = indexmap::IndexMap::new();
-    for f in 0..dim {
-        field_stats.insert(format!("field_{}", f), FieldStats::new());
-    }
-
-    // Sample uniformly
-    let step = if total_records <= sample_count { 1 } else { total_records / sample_count };
-    let mut sampled = 0;
-    let mut i = 0;
-    while i < total_records && sampled < sample_count {
-        let base = i * record_bytes + 4; // skip dim header
-        for f in 0..dim {
-            let val = i32::from_le_bytes([
-                data[base + f*4], data[base + f*4 + 1],
-                data[base + f*4 + 2], data[base + f*4 + 3],
-            ]);
-            let fs = field_stats.get_index_mut(f).unwrap().1;
-            fs.count += 1;
-            fs.numeric_count += 1;
-            let fval = val as f64;
-            if fval < fs.numeric_min { fs.numeric_min = fval; }
-            if fval > fs.numeric_max { fs.numeric_max = fval; }
-            fs.numeric_sum += fval;
-            fs.type_counts.entry("int32".into()).and_modify(|c| *c += 1).or_insert(1);
-            if !fs.distinct_overflow {
-                let key = val.to_string();
-                *fs.distinct.entry(key).or_insert(0) += 1;
-                if fs.distinct.len() > max_distinct {
-                    fs.distinct_overflow = true;
-                }
-            }
-        }
-        sampled += 1;
-        i += step;
-    }
-
-    Ok(SurveyResult {
-        field_stats,
-        sampled,
-        total_records,
-        non_mnode_count: 0,
-        decode_errors: 0,
-    })
-}
-
-/// Write survey results to a JSON file.
-fn survey_to_json(survey: &SurveyResult, path: &Path) -> Result<(), String> {
-    let json_obj = SurveyJson::from_survey(survey);
-    let json = serde_json::to_string_pretty(&json_obj)
-        .map_err(|e| format!("JSON serialization failed: {}", e))?;
-
-    if let Some(parent) = path.parent() {
-        if !parent.exists() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("failed to create directory: {}", e))?;
-        }
-    }
-    std::fs::write(path, json)
-        .map_err(|e| format!("failed to write {}: {}", path.display(), e))?;
-
-    log::info!("Survey JSON written to {}", path.display());
-    Ok(())
-}
-
-/// Load survey results from a JSON file previously written by [`survey_to_json`].
+/// Load a [`SurveyResult`] from a `survey.json` produced by
+/// `analyze survey`. The legacy single-pass JSON format and its
+/// reader were removed alongside the legacy command — if you have
+/// an older `survey.json` on disk, re-run `analyze survey` to get a
+/// fresh one.
 pub(crate) fn survey_from_json(path: &Path) -> Result<SurveyResult, String> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("failed to read {}: {}", path.display(), e))?;
-    let json_obj: SurveyJson = serde_json::from_str(&text)
+    let report: crate::pipeline::commands::survey::SurveyReport = serde_json::from_str(&text)
         .map_err(|e| format!("failed to parse survey JSON: {}", e))?;
-    Ok(json_obj.to_survey())
+    Ok(survey_report_to_legacy(&report))
+}
+
+/// Translate a [`crate::pipeline::commands::survey::SurveyReport`]
+/// into the legacy [`SurveyResult`] / [`FieldStats`] shape so the
+/// existing `generate predicates --mode=survey` generator can run
+/// against either survey format.
+///
+/// This adapter is intentionally lossy in one direction only — the
+/// generator only consults `count` / `null_count` / `numeric_min/max`
+/// / `strlen_*` / `distinct` / `distinct_overflow`, which all map
+/// cleanly out of the richer measure outputs.
+fn survey_report_to_legacy(
+    report: &crate::pipeline::commands::survey::SurveyReport,
+) -> SurveyResult {
+    use crate::pipeline::commands::survey::measure::MeasureReport;
+
+    let mut field_stats: indexmap::IndexMap<String, FieldStats> = indexmap::IndexMap::new();
+    for (name, profile) in &report.fields {
+        let mut fs = FieldStats::new();
+        fs.count = profile.presence.present as usize;
+        fs.null_count = profile.presence.null_count as usize;
+        // type_counts: invert the fractional histogram back to integer
+        // counts using `present` as the denominator. Loses precision
+        // when fractions don't divide cleanly; the generator only
+        // uses this for "is this a Text-ish or Int-ish field" gating
+        // so the approximation is fine.
+        for (tag, frac) in &profile.wire_encoding.tag_histogram {
+            let c = (frac * profile.presence.present as f64).round() as usize;
+            if c > 0 {
+                // Legacy FieldStats expected lowercase tag names
+                // (`"int"`, `"text"`); the new orchestrator stores
+                // the Debug form (`"Int"`, `"Text"`). Lowercase here
+                // so the predicate generator's eligibility check
+                // continues to match against its `ELIGIBLE_TYPES`
+                // table without changes.
+                fs.type_counts.insert(tag.to_lowercase(), c);
+            }
+        }
+        if let Some(MeasureReport::ExactExtrema(e)) = profile.measures.get("ExactExtrema") {
+            if let (Some(mn), Some(mx)) = (e.min, e.max) {
+                fs.numeric_min = mn;
+                fs.numeric_max = mx;
+            }
+        }
+        if let Some(MeasureReport::ExactMoments(m)) = profile.measures.get("ExactMoments") {
+            fs.numeric_count = m.count as usize;
+            fs.numeric_sum = m.mean.unwrap_or(0.0) * m.count as f64;
+        }
+        if let Some(MeasureReport::ExactLengthMoments(l)) = profile.measures.get("ExactLengthMoments") {
+            fs.strlen_min = l.bytes.min as usize;
+            fs.strlen_max = l.bytes.max as usize;
+            fs.strlen_count = l.bytes.count as usize;
+            if let Some(mean) = l.bytes.mean {
+                fs.strlen_sum = (mean * l.bytes.count as f64).round() as usize;
+            }
+        }
+        if let Some(MeasureReport::ExactFrequencyTable(t)) = profile.measures.get("ExactFrequencyTable") {
+            for (k, c) in &t.counts {
+                fs.distinct.insert(k.clone(), *c as usize);
+            }
+            fs.distinct_overflow = t.overflowed;
+        } else if let Some(MeasureReport::HeavyHitters(hh)) = profile.measures.get("HeavyHitters") {
+            for entry in &hh.items {
+                fs.distinct.insert(entry.value.clone(), entry.count_lower_bound as usize);
+            }
+            // HeavyHitters only tracks top-K; treat the rest as overflow.
+            fs.distinct_overflow = true;
+        } else {
+            // No frequency data — predicate generator will fall back
+            // to the range-based path.
+            fs.distinct_overflow = matches!(
+                profile.cardinality_regime,
+                crate::pipeline::commands::survey::CardinalityRegime::MidCard { .. }
+                    | crate::pipeline::commands::survey::CardinalityRegime::HighCardOrUnique { .. }
+            );
+        }
+        field_stats.insert(name.clone(), fs);
+    }
+    SurveyResult {
+        field_stats,
+        sampled: report.source.sampled_records as usize,
+        total_records: report.source.total_records as usize,
+        non_mnode_count: 0,
+        decode_errors: 0,
+    }
+}
+
+/// Inline-run the new survey orchestrator and project the result down
+/// to the legacy [`SurveyResult`] shape. Used by
+/// `generate predicates --mode=survey` when no precomputed
+/// `--survey survey.json` was supplied — the generator wants the
+/// `FieldStats` view, and we serve it without an intermediate file.
+pub(crate) fn survey_inline_via_orchestrator(
+    path: &Path,
+    samples: usize,
+    ui: Option<&veks_core::ui::UiHandle>,
+) -> Result<SurveyResult, String> {
+    let cfg = crate::pipeline::commands::survey::SurveyConfig {
+        samples,
+        ..Default::default()
+    };
+    let report = crate::pipeline::commands::survey::survey(path, &cfg, ui)?;
+    Ok(survey_report_to_legacy(&report))
+}
+
+/// Load a [`SurveyReport`] from a `survey.json` written by
+/// `analyze survey`. Same JSON contract — no legacy projection.
+pub(crate) fn survey_report_from_json(
+    path: &Path,
+) -> Result<crate::pipeline::commands::survey::SurveyReport, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("failed to read {}: {}", path.display(), e))?;
+    serde_json::from_str(&text)
+        .map_err(|e| format!("failed to parse survey JSON: {}", e))
+}
+
+/// Inline-run the survey orchestrator and return the raw
+/// [`SurveyReport`] without legacy projection. The richer shape
+/// (semantic types, cardinality regimes, quantile sketches, heavy
+/// hitters, reservoir samples) is what `generate predicates`
+/// consumes directly.
+pub(crate) fn survey_report_inline(
+    path: &Path,
+    samples: usize,
+    ui: Option<&veks_core::ui::UiHandle>,
+) -> Result<crate::pipeline::commands::survey::SurveyReport, String> {
+    let cfg = crate::pipeline::commands::survey::SurveyConfig {
+        samples,
+        ..Default::default()
+    };
+    crate::pipeline::commands::survey::survey(path, &cfg, ui)
 }
 
 // -- Helpers -------------------------------------------------------------------
@@ -2354,7 +1818,7 @@ fn open_slab_display(path: &Path, ui: &veks_core::ui::UiHandle) -> slabtastic::R
     open_slab_with_ui(path, Some(ui))
 }
 
-fn open_slab_with_ui(path: &Path, ui: Option<&veks_core::ui::UiHandle>) -> slabtastic::Result<SlabReader> {
+pub(crate) fn open_slab_with_ui(path: &Path, ui: Option<&veks_core::ui::UiHandle>) -> slabtastic::Result<SlabReader> {
     let pb: std::cell::RefCell<Option<veks_core::ui::ProgressHandle>> = std::cell::RefCell::new(None);
 
     SlabReader::open_with_progress(path, |p| {
@@ -2412,7 +1876,7 @@ fn opt(name: &str, type_name: &str, required: bool, default: Option<&str>, desc:
         type_name: type_name.to_string(),
         required,
         default: default.map(|s| s.to_string()),
-        description: desc.to_string(),
+        description: desc.to_string(), extended_description: None,
         role,
 }
 }
@@ -2621,65 +2085,6 @@ mod tests {
         assert_eq!(parse_ordinals("5").unwrap(), vec![5]);
         assert_eq!(parse_ordinals("0,5..8,10").unwrap(), vec![0, 5, 6, 7, 10]);
         assert!(parse_ordinals("abc").is_err());
-    }
-
-    #[test]
-    fn test_slab_survey() {
-        use veks_core::formats::mnode::MNode;
-        use veks_core::formats::mnode::MValue;
-
-        let tmp = tempfile::tempdir().unwrap();
-        let ws = tmp.path();
-        let mut ctx = test_ctx(ws);
-
-        // Build MNode-encoded records
-        let mut node1 = MNode::new();
-        node1.insert("user_id".into(), MValue::Int(42));
-        node1.insert("name".into(), MValue::Text("alice".into()));
-
-        let mut node2 = MNode::new();
-        node2.insert("user_id".into(), MValue::Int(99));
-        node2.insert("name".into(), MValue::Text("bob".into()));
-
-        let mut node3 = MNode::new();
-        node3.insert("user_id".into(), MValue::Int(7));
-        node3.insert("name".into(), MValue::Null);
-
-        let rec1 = node1.to_bytes();
-        let rec2 = node2.to_bytes();
-        let rec3 = node3.to_bytes();
-
-        let slab_path = create_test_slab(
-            ws,
-            "survey.slab",
-            &[rec1.as_slice(), rec2.as_slice(), rec3.as_slice()],
-        );
-
-        let mut opts = Options::new();
-        opts.set("source", slab_path.to_string_lossy().to_string());
-        opts.set("samples", "100");
-        let mut op = SlabSurveyOp;
-        let result = op.execute(&opts, &mut ctx);
-        assert_eq!(result.status, Status::Ok, "survey failed: {}", result.message);
-        assert!(result.message.contains("user_id"), "message should mention user_id: {}", result.message);
-        assert!(result.message.contains("name"), "message should mention name: {}", result.message);
-        assert!(result.message.contains("3 records sampled"), "message: {}", result.message);
-    }
-
-    #[test]
-    fn test_slab_survey_empty() {
-        let tmp = tempfile::tempdir().unwrap();
-        let ws = tmp.path();
-        let mut ctx = test_ctx(ws);
-
-        let slab_path = create_test_slab(ws, "empty.slab", &[]);
-
-        let mut opts = Options::new();
-        opts.set("source", slab_path.to_string_lossy().to_string());
-        let mut op = SlabSurveyOp;
-        let result = op.execute(&opts, &mut ctx);
-        assert_eq!(result.status, Status::Ok, "survey empty failed: {}", result.message);
-        assert!(result.message.contains("0 records sampled"), "message: {}", result.message);
     }
 
     #[test]

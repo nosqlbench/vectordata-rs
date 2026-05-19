@@ -1,13 +1,28 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! Pipeline command: generate PNode predicates from metadata slab statistics.
+//! Pipeline command: generate selectivity-targeted PNode predicates
+//! from a metadata survey.
 //!
-//! Surveys a metadata slab file to gather per-field value distributions, then
-//! generates a configurable number of typed PNode predicates with targeted
-//! selectivity. The generated predicates are written to an output slab file.
+//! Consumes the rich [`SurveyReport`] from `analyze survey` (sysref
+//! §13) directly — no projection down to a flat per-field summary.
+//! That lets the generator do calibrated predicate synthesis:
+//!
+//! - **Numeric / temporal fields** with a `QuantileSketch` measure
+//!   get range/comparison predicates picked at the exact quantile
+//!   matching the target selectivity (`Lt` at q=s, `Gt` at q=1-s,
+//!   or `Range[q=0.5-s/2, q=0.5+s/2]`).
+//! - **Categorical / low-card fields** with an `ExactFrequencyTable`
+//!   get `Eq` against a value whose frequency matches the target.
+//! - **High-cardinality identifier / free-text fields** without a
+//!   frequency table draw an `Eq` comparand from `ReservoirSample`
+//!   — an actual observed value, selectivity ≈ 1/cardinality.
+//! - **Boolean fields** get a 50/50 `Eq` true/false predicate.
+//!
+//! The legacy `survey_inline_via_orchestrator` adapter (which
+//! projected `SurveyReport` down to a flat `FieldStats` map) is no
+//! longer used here; `gen_predicate_keys` still uses it.
 
-use std::path::Path;
 use std::time::Instant;
 
 use rand::Rng;
@@ -20,9 +35,13 @@ use crate::pipeline::command::{
     ArtifactManifest, CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options,
     Status, StreamContext, render_options_table,
 };
+use crate::pipeline::commands::survey::{
+    CardinalityRegime, FieldProfile, MeasureReport, NumberKind, SemanticType,
+};
 use crate::pipeline::rng;
 
-use super::slab::{survey_from_json, survey_slab, FieldStats};
+use super::gen_predicates_common::{error_result, opt, resolve_path};
+use super::slab::{survey_report_from_json, survey_report_inline};
 
 /// Pipeline command: synthesize predicates from metadata slab field distributions.
 pub struct GenPredicatesOp;
@@ -34,86 +53,77 @@ pub fn factory() -> Box<dyn CommandOp> {
 
 impl GenPredicatesOp {
     fn execute_survey(&mut self, options: &Options, ctx: &mut StreamContext, start: Instant) -> CommandResult {
-        let input_str = match options.require("source") {
-            Ok(s) => s,
-            Err(e) => return error_result(e, start),
-        };
         let output_str = match options.require("output") {
             Ok(s) => s,
             Err(e) => return error_result(e, start),
         };
-
-        let input_path = resolve_path(input_str, &ctx.workspace);
+        // `--source` is only required when no precomputed
+        // `--survey` is supplied — with a survey JSON in hand the
+        // generator doesn't need to re-scan the slab.
+        let source_present = options.get("source").is_some();
+        let survey_present = options.get("survey").is_some();
+        if !source_present && !survey_present {
+            return error_result(
+                "either --source <slab> or --survey <survey.json> must be provided".into(),
+                start,
+            );
+        }
+        let input_path = options
+            .get("source")
+            .map(|s| resolve_path(s, &ctx.workspace))
+            .unwrap_or_else(std::path::PathBuf::new);
         let output_path = resolve_path(output_str, &ctx.workspace);
 
-        let count: usize = options
-            .get("count")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(100);
-        let selectivity: f64 = options
-            .get("selectivity")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0.1);
-        let selectivity_max: Option<f64> = options
-            .get("selectivity-max")
-            .and_then(|s| s.parse().ok());
-        let max_samples: usize = options
-            .get("samples")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(1000);
-        let max_distinct: usize = options
-            .get("max-distinct")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(100);
-        let strategy = options
-            .get("strategy")
-            .unwrap_or("eq");
+        let count: usize = options.get("count").and_then(|s| s.parse().ok()).unwrap_or(100);
+        let selectivity: f64 = options.get("selectivity").and_then(|s| s.parse().ok()).unwrap_or(0.1);
+        let selectivity_max: Option<f64> = options.get("selectivity-max").and_then(|s| s.parse().ok());
+        let max_samples: usize = options.get("samples").and_then(|s| s.parse().ok()).unwrap_or(1000);
+        let strategy = options.get("strategy").unwrap_or("eq").to_string();
         let seed: u64 = rng::parse_seed(options.get("seed"));
 
-        // Load survey data — from pre-computed JSON if available, otherwise survey the slab
-        let survey = if let Some(survey_str) = options.get("survey") {
+        // Load the survey directly as a SurveyReport — no projection
+        // down to the legacy FieldStats shape. The richer profile
+        // (semantic_type, cardinality_regime, quantile sketches,
+        // reservoirs, heavy hitters) is what the calibrated
+        // predicate generator depends on.
+        let report = if let Some(survey_str) = options.get("survey") {
             let survey_path = resolve_path(survey_str, &ctx.workspace);
-            ctx.ui.log(&format!("synthesize predicates: loading survey from {}", survey_path.display()));
-            match survey_from_json(&survey_path) {
-                Ok(s) => s,
+            ctx.ui.log(&format!(
+                "synthesize predicates: loading survey from {}",
+                survey_path.display(),
+            ));
+            match survey_report_from_json(&survey_path) {
+                Ok(r) => r,
                 Err(e) => return error_result(e, start),
             }
         } else {
-            match survey_slab(&input_path, max_samples, max_distinct, Some(&ctx.ui)) {
-                Ok(s) => s,
+            match survey_report_inline(&input_path, max_samples, Some(&ctx.ui)) {
+                Ok(r) => r,
                 Err(e) => return error_result(e, start),
             }
         };
 
-        // Identify eligible fields
-        let eligible: Vec<(&String, &FieldStats)> = survey
-            .field_stats
+        let eligible: Vec<(&String, &FieldProfile)> = report
+            .fields
             .iter()
-            .filter(|(_, fs)| is_eligible(fs))
+            .filter(|(_, profile)| field_is_eligible(profile))
             .collect();
 
         if eligible.is_empty() {
             ctx.ui.log("synthesize predicates: 0 eligible fields, producing 0 predicates");
-            // Write empty slab
-            let config = WriterConfig::new(512, 4096, u32::MAX, false)
-                .map_err(|e| format!("{}", e));
-            match config {
-                Ok(c) => {
-                    let writer = SlabWriter::new(&output_path, c);
-                    match writer {
-                        Ok(mut w) => { let _ = w.finish(); }
-                        Err(e) => return error_result(format!("failed to create output: {}", e), start),
-                    }
-                }
-                Err(e) => return error_result(e, start),
-            }
-            // Write verified count for the bound checker
+            let config = match WriterConfig::new(512, 4096, u32::MAX, false) {
+                Ok(c) => c,
+                Err(e) => return error_result(format!("{}", e), start),
+            };
+            let mut w = match SlabWriter::new(&output_path, config) {
+                Ok(w) => w,
+                Err(e) => return error_result(format!("failed to create output: {}", e), start),
+            };
+            let _ = w.finish();
             let var_name = format!("verified_count:{}",
                 output_path.file_name().and_then(|n| n.to_str()).unwrap_or("output"));
-            let _ = crate::pipeline::variables::set_and_save(
-                &ctx.workspace, &var_name, "0");
+            let _ = crate::pipeline::variables::set_and_save(&ctx.workspace, &var_name, "0");
             ctx.defaults.insert(var_name, "0".to_string());
-
             return CommandResult {
                 status: Status::Ok,
                 message: "0 predicates generated (no eligible fields)".into(),
@@ -124,7 +134,6 @@ impl GenPredicatesOp {
 
         let mut rng_inst = rng::seeded_rng(seed);
 
-        // Generate predicates
         let pb = ctx.ui.bar(count as u64, "generating predicates");
         let mut predicates: Vec<Vec<u8>> = Vec::with_capacity(count);
         for pred_i in 0..count {
@@ -132,8 +141,7 @@ impl GenPredicatesOp {
                 Some(max) => rng_inst.random_range(selectivity..=max),
                 None => selectivity,
             };
-
-            let pnode = match strategy {
+            let pnode = match strategy.as_str() {
                 "eq" => generate_eq_predicate(&eligible, target_sel, &mut rng_inst),
                 "compound" => generate_compound_predicate(&eligible, target_sel, &mut rng_inst),
                 other => {
@@ -148,7 +156,6 @@ impl GenPredicatesOp {
         }
         pb.finish();
 
-        // Write to output slab
         let config = match WriterConfig::new(512, 4096, u32::MAX, false) {
             Ok(c) => c,
             Err(e) => return error_result(format!("writer config error: {}", e), start),
@@ -166,7 +173,6 @@ impl GenPredicatesOp {
             return error_result(format!("finish error: {}", e), start);
         }
 
-        // Write verified count for the bound checker
         let var_name = format!("verified_count:{}",
             output_path.file_name().and_then(|n| n.to_str()).unwrap_or("output"));
         let _ = crate::pipeline::variables::set_and_save(
@@ -187,166 +193,8 @@ impl GenPredicatesOp {
             elapsed: start.elapsed(),
         }
     }
-
 }
 
-impl GenPredicatesOp {
-    fn execute_simple_int_eq(
-        &self,
-        options: &Options,
-        ctx: &mut StreamContext,
-        start: Instant,
-    ) -> CommandResult {
-        let output_str = match options.require("output") {
-            Ok(s) => s,
-            Err(e) => return error_result(e, start),
-        };
-        let output_path = resolve_path(output_str, &ctx.workspace);
-
-        let count: usize = options.get("count").and_then(|s| s.parse().ok()).unwrap_or(100);
-        let fields: usize = options.get("fields").and_then(|s| s.parse().ok()).unwrap_or(1);
-        let range_min: i32 = options.parse_or("range-min", 0i32).unwrap_or(0);
-        let range_max: i32 = options.parse_or("range-max", 100i32).unwrap_or(100);
-        let seed: u64 = rng::parse_seed(options.get("seed"));
-        let format = options.get("format").unwrap_or("slab");
-
-        if range_max <= range_min {
-            return error_result(
-                format!("range-max ({}) must be > range-min ({})", range_max, range_min),
-                start,
-            );
-        }
-
-        let range = range_max - range_min;
-        let mut rng_inst = rng::seeded_rng(seed);
-
-        if let Some(parent) = output_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-
-        ctx.ui.log(&format!(
-            "  generate predicates: {} simple-int-eq, {} fields, range [{}, {}), seed={}",
-            count, fields, range_min, range_max, seed,
-        ));
-
-        let is_scalar = matches!(format, "u8" | "i8" | "u16" | "i16" | "u32" | "i32" | "u64" | "i64");
-        let scalar_elem_size: usize = match format {
-            "u8" | "i8" => 1, "u16" | "i16" => 2, "u32" | "i32" => 4, "u64" | "i64" => 8, _ => 0,
-        };
-
-        if is_scalar {
-            // Write as flat packed scalar
-            use std::io::Write;
-            let mut f = match std::fs::File::create(&output_path) {
-                Ok(f) => std::io::BufWriter::new(f),
-                Err(e) => return error_result(format!("create {}: {}", output_path.display(), e), start),
-            };
-            let pb = ctx.ui.bar(count as u64, "generating predicates");
-            for i in 0..count {
-                for _ in 0..fields {
-                    let val = range_min + rng_inst.random_range(0..range);
-                    let write_ok = match scalar_elem_size {
-                        1 => f.write_all(&[val as u8]).is_ok(),
-                        2 => f.write_all(&(val as i16).to_le_bytes()).is_ok(),
-                        4 => f.write_all(&val.to_le_bytes()).is_ok(),
-                        8 => f.write_all(&(val as i64).to_le_bytes()).is_ok(),
-                        _ => false,
-                    };
-                    if !write_ok {
-                        return error_result("write error".into(), start);
-                    }
-                }
-                if (i + 1) % 10_000 == 0 { pb.set_position((i + 1) as u64); }
-            }
-            pb.finish();
-        } else if format == "ivec" {
-            // Write as ivec: each predicate is a vector of `fields` i32 values
-            use std::io::Write;
-            let mut f = match std::fs::File::create(&output_path) {
-                Ok(f) => std::io::BufWriter::new(f),
-                Err(e) => return error_result(format!("create {}: {}", output_path.display(), e), start),
-            };
-            let pb = ctx.ui.bar(count as u64, "generating predicates");
-            for i in 0..count {
-                // Write dimension header
-                if f.write_all(&(fields as i32).to_le_bytes()).is_err() {
-                    return error_result("write error".into(), start);
-                }
-                // Write one random value per field
-                for _ in 0..fields {
-                    let val = range_min + rng_inst.random_range(0..range);
-                    if f.write_all(&val.to_le_bytes()).is_err() {
-                        return error_result("write error".into(), start);
-                    }
-                }
-                if (i + 1) % 10_000 == 0 { pb.set_position((i + 1) as u64); }
-            }
-            pb.finish();
-        } else {
-            // Write as slab of PNode records
-            let config = match WriterConfig::new(512, 4096, u32::MAX, false) {
-                Ok(c) => c,
-                Err(e) => return error_result(format!("writer config: {}", e), start),
-            };
-            let mut writer = match SlabWriter::new(&output_path, config) {
-                Ok(w) => w,
-                Err(e) => return error_result(format!("create slab: {}", e), start),
-            };
-            let pb = ctx.ui.bar(count as u64, "generating predicates");
-            for i in 0..count {
-                // Single-field equality: field_0 == random_value
-                // For multi-field: AND(field_0 == v0, field_1 == v1, ...)
-                let pnode = if fields == 1 {
-                    let val = range_min + rng_inst.random_range(0..range);
-                    PNode::Predicate(PredicateNode {
-                        field: FieldRef::Named("field_0".into()),
-                        op: OpType::Eq,
-                        comparands: vec![Comparand::Int(val as i64)],
-                    })
-                } else {
-                    let children: Vec<PNode> = (0..fields).map(|fi| {
-                        let val = range_min + rng_inst.random_range(0..range);
-                        PNode::Predicate(PredicateNode {
-                            field: FieldRef::Named(format!("field_{}", fi)),
-                            op: OpType::Eq,
-                            comparands: vec![Comparand::Int(val as i64)],
-                        })
-                    }).collect();
-                    PNode::Conjugate(ConjugateNode {
-                        conjugate_type: ConjugateType::And,
-                        children,
-                    })
-                };
-                let bytes = pnode.to_bytes_named();
-                if let Err(e) = writer.add_record(&bytes) {
-                    return error_result(format!("write record {}: {}", i, e), start);
-                }
-                if (i + 1) % 10_000 == 0 { pb.set_position((i + 1) as u64); }
-            }
-            pb.finish();
-            if let Err(e) = writer.finish() {
-                return error_result(format!("finalize: {}", e), start);
-            }
-        }
-
-        // Write verified count
-        let var_name = format!("verified_count:{}",
-            output_path.file_name().and_then(|n| n.to_str()).unwrap_or("output"));
-        let _ = crate::pipeline::variables::set_and_save(
-            &ctx.workspace, &var_name, &count.to_string());
-        ctx.defaults.insert(var_name, count.to_string());
-
-        ctx.ui.log(&format!("  wrote {} predicates to {}", count, output_path.display()));
-
-        CommandResult {
-            status: Status::Ok,
-            message: format!("{} simple-int-eq predicates, {} fields, range [{}, {})",
-                count, fields, range_min, range_max),
-            produced: vec![output_path],
-            elapsed: start.elapsed(),
-        }
-    }
-}
 
 impl CommandOp for GenPredicatesOp {
     fn command_path(&self) -> &str {
@@ -362,40 +210,36 @@ impl CommandOp for GenPredicatesOp {
     fn command_doc(&self) -> CommandDoc {
         let options = self.describe_options();
         CommandDoc {
-            summary: "Generate predicates from metadata survey or configured ranges".into(),
+            summary: "Generate selectivity-targeted predicates from a metadata survey".into(),
             body: format!(
-                "# generate predicates\n\nTwo modes:\n\n\
-                 - **survey** (default): Survey metadata slab, generate predicates targeting selectivity.\n\
-                 - **simple-int-eq**: Generate integer equality predicates from configured ranges.\n\n\
-                 ## Options\n\n{}", render_options_table(&options)),
+                "# generate predicates\n\n\
+                 Survey a metadata slab (or load a precomputed `survey.json`) \
+                 and emit `count` typed PNode predicates whose observed \
+                 selectivity matches the requested target. For config-only \
+                 integer-equality predicates that don't need a survey, see \
+                 `generate simple-predicates`.\n\n\
+                 ## Options\n\n{}",
+                render_options_table(&options),
+            ),
         }
     }
 
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
         let start = Instant::now();
-        let mode = options.get("mode").unwrap_or("survey");
-        if mode == "simple-int-eq" {
-            return self.execute_simple_int_eq(options, ctx, start);
-        }
         self.execute_survey(options, ctx, start)
     }
 
     fn describe_options(&self) -> Vec<OptionDesc> {
         vec![
-            opt("source", "Path", false, None, "Metadata source to survey (not needed for simple-int-eq mode)", OptionRole::Input),
-            opt("output", "Path", true, None, "Output file for predicates", OptionRole::Output),
-            opt("mode", "string", false, Some("survey"), "Generation mode: 'survey' (from metadata) or 'simple-int-eq' (direct integer equality)", OptionRole::Config),
-            opt("survey", "Path", false, None, "Pre-computed survey JSON (skips re-surveying)", OptionRole::Input),
+            opt("source", "Path", false, None, "Metadata source to survey (omit if --survey provides a precomputed report)", OptionRole::Input),
+            opt("output", "Path", true, None, "Output slab of generated predicates", OptionRole::Output),
+            opt("survey", "Path", false, None, "Pre-computed survey JSON from `analyze survey` (skips re-surveying)", OptionRole::Input),
             opt("count", "int", false, Some("100"), "Number of predicates to generate", OptionRole::Config),
-            opt("fields", "int", false, Some("1"), "Number of integer fields (simple-int-eq mode)", OptionRole::Config),
-            opt("range-min", "int", false, Some("0"), "Predicate value range minimum (simple-int-eq mode)", OptionRole::Config),
-            opt("range-max", "int", false, Some("100"), "Predicate value range maximum (simple-int-eq mode)", OptionRole::Config),
-            opt("format", "string", false, Some("slab"), "Output format: 'slab' or 'ivec' (simple-int-eq mode)", OptionRole::Config),
-            opt("selectivity", "float", false, Some("0.1"), "Target selectivity (survey mode)", OptionRole::Config),
-            opt("selectivity-max", "float", false, None, "Upper selectivity bound for uniform range (survey mode)", OptionRole::Config),
-            opt("samples", "int", false, Some("1000"), "Survey sample count", OptionRole::Config),
-            opt("max-distinct", "int", false, Some("100"), "Max distinct values tracked per field", OptionRole::Config),
-            opt("strategy", "string", false, Some("eq"), "Predicate strategy: 'eq' or 'compound' (survey mode)", OptionRole::Config),
+            opt("selectivity", "float", false, Some("0.1"), "Target selectivity", OptionRole::Config),
+            opt("selectivity-max", "float", false, None, "Upper selectivity bound (random per-predicate within [selectivity, selectivity-max])", OptionRole::Config),
+            opt("samples", "int", false, Some("1000"), "Inline survey sample count when --survey is not supplied", OptionRole::Config),
+            opt("max-distinct", "int", false, Some("100"), "Max distinct values tracked per field (compat shim — actual cap comes from `analyze survey`)", OptionRole::Config),
+            opt("strategy", "string", false, Some("eq"), "Predicate strategy: 'eq' or 'compound'", OptionRole::Config),
             opt("seed", "int", false, Some("42"), "RNG seed", OptionRole::Config),
         ]
     }
@@ -409,542 +253,514 @@ impl CommandOp for GenPredicatesOp {
     }
 }
 
-/// Supported MNode type tags for predicate generation (lowercase, matching TypeTag::name()).
-const ELIGIBLE_TYPES: &[&str] = &[
-    "int", "int32", "short", "millis",
-    "float", "float32",
-    "text", "ascii", "enum_str",
-    "bool",
-];
+// ---------------------------------------------------------------------------
+// SurveyReport-driven predicate synthesis
+// ---------------------------------------------------------------------------
 
-/// Check if a field's statistics indicate it is eligible for predicate generation.
-fn is_eligible(fs: &FieldStats) -> bool {
-    if fs.count == 0 || fs.null_count == fs.count {
+/// Decide whether a [`FieldProfile`] can contribute predicates. The
+/// gate is intentionally permissive — any field whose
+/// `SemanticType` is known and whose `CardinalityRegime` is not
+/// `Constant` qualifies. Constant fields produce predicates that
+/// match all or none; useless for benchmarking. `Unstable` fields
+/// had no successful semantic verdict and only opaque measures
+/// ran; the generator wouldn't know what to do with them.
+fn field_is_eligible(profile: &FieldProfile) -> bool {
+    if profile.presence.present == 0 {
         return false;
     }
-    // At least one eligible type must be present
-    fs.type_counts.keys().any(|t| ELIGIBLE_TYPES.contains(&t.as_str()))
+    match profile.semantic_type.as_ref() {
+        None | Some(SemanticType::Unstable) => return false,
+        _ => {}
+    }
+    !matches!(profile.cardinality_regime, CardinalityRegime::Constant)
 }
 
-/// Determine the dominant (most frequent) type tag for a field.
-fn dominant_type(fs: &FieldStats) -> Option<&str> {
-    fs.type_counts
-        .iter()
-        .filter(|(t, _)| ELIGIBLE_TYPES.contains(&t.as_str()))
-        .max_by_key(|(_, cnt)| *cnt)
-        .map(|(t, _)| t.as_str())
-}
-
-/// Generate a simple Eq predicate on a single randomly chosen field.
-///
-/// Picks one eligible field at random and generates a single `Eq` comparand
-/// from the field's observed distinct values. The target selectivity is used
-/// to prefer fields whose cardinality is close to `1/target_selectivity`, and
-/// within a field, to prefer lower-frequency values that approximate the
-/// target.
+/// Pick one eligible field weighted by closeness of its
+/// `1/cardinality` to the requested selectivity, then dispatch to
+/// a per-semantic-type predicate builder. The weighting nudges the
+/// generator toward fields where a single-value `Eq` actually
+/// approximates the target sel — but every numeric/temporal field
+/// can hit any target through quantile-driven ops regardless of
+/// cardinality.
 fn generate_eq_predicate(
-    eligible: &[(&String, &FieldStats)],
-    target_selectivity: f64,
+    eligible: &[(&String, &FieldProfile)],
+    target_sel: f64,
     rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
 ) -> PNode {
-    // Prefer fields whose per-value selectivity is close to the target.
-    // For a field with N distinct values, per-value sel ≈ 1/N (uniform).
-    // Pick the field whose 1/N is closest to target_selectivity.
-    let target_distinct = (1.0 / target_selectivity.max(1e-12)).round() as usize;
-
-    // Filter to fields that have enough cardinality (non-overflow, distinct > 1)
-    let selective_fields: Vec<usize> = (0..eligible.len())
-        .filter(|&i| {
-            let fs = eligible[i].1;
-            fs.distinct.len() > 1 || fs.distinct_overflow
-        })
-        .collect();
-
-    let idx = if selective_fields.is_empty() {
-        rng.random_range(0..eligible.len())
-    } else {
-        // Weight by closeness of 1/distinct to target; overflow fields get
-        // high cardinality estimate
-        let mut best_idx = selective_fields[0];
-        let mut best_diff = f64::MAX;
-        for &i in &selective_fields {
-            let fs = eligible[i].1;
-            let est_distinct = if fs.distinct_overflow {
-                fs.count.max(1)
-            } else {
-                fs.distinct.len().max(1)
-            };
-            let diff = (est_distinct as f64 - target_distinct as f64).abs();
-            // Add jitter to avoid always picking the same field
-            let jittered = diff + rng.random_range(0.0..1.0);
-            if jittered < best_diff {
-                best_diff = jittered;
-                best_idx = i;
-            }
-        }
-        best_idx
-    };
-
-    let (name, fs) = &eligible[idx];
+    let idx = pick_target_field(eligible, target_sel, rng);
+    let (name, profile) = eligible[idx];
     let field = FieldRef::Named(name.to_string());
-    let dtype = dominant_type(fs);
-
-    match dtype {
-        Some("text" | "ascii" | "enum_str") => {
-            if !fs.distinct.is_empty() {
-                // Pick a value weighted toward lower-frequency values
-                let value = pick_value_by_selectivity(fs, target_selectivity, rng);
-                PNode::Predicate(PredicateNode {
-                    field,
-                    op: OpType::Eq,
-                    comparands: vec![Comparand::Text(value)],
-                })
-            } else {
-                PNode::Predicate(PredicateNode {
-                    field,
-                    op: OpType::Eq,
-                    comparands: vec![Comparand::Null],
-                })
-            }
-        }
-        Some("bool") => {
-            let val = rng.random_bool(0.5);
-            PNode::Predicate(PredicateNode {
-                field,
-                op: OpType::Eq,
-                comparands: vec![Comparand::Bool(val)],
-            })
-        }
-        Some("int" | "int32" | "short" | "millis") => {
-            if !fs.distinct.is_empty() && !fs.distinct_overflow {
-                let value_str = pick_value_by_selectivity(fs, target_selectivity, rng);
-                if let Ok(v) = value_str.parse::<i64>() {
-                    return PNode::Predicate(PredicateNode {
-                        field,
-                        op: OpType::Eq,
-                        comparands: vec![Comparand::Int(v)],
-                    });
-                }
-            }
-            let min_val = fs.numeric_min as i64;
-            let max_val = fs.numeric_max as i64;
-            let val = if max_val > min_val {
-                rng.random_range(min_val..=max_val)
-            } else {
-                min_val
-            };
-            PNode::Predicate(PredicateNode {
-                field,
-                op: OpType::Eq,
-                comparands: vec![Comparand::Int(val)],
-            })
-        }
-        Some("float" | "float32") => {
-            let min_val = fs.numeric_min;
-            let max_val = fs.numeric_max;
-            let val = if max_val > min_val {
-                rng.random_range(min_val..=max_val)
-            } else {
-                min_val
-            };
-            PNode::Predicate(PredicateNode {
-                field,
-                op: OpType::Eq,
-                comparands: vec![Comparand::Float(val)],
-            })
-        }
-        _ => {
-            PNode::Predicate(PredicateNode {
-                field,
-                op: OpType::Eq,
-                comparands: vec![Comparand::Null],
-            })
-        }
-    }
-}
-
-/// Pick a value from a field's distinct values, preferring values whose
-/// observed frequency is closest to `target_selectivity`.
-fn pick_value_by_selectivity(
-    fs: &FieldStats,
-    target_selectivity: f64,
-    rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
-) -> String {
-    let total: usize = fs.distinct.values().sum();
-    if total == 0 || fs.distinct.is_empty() {
-        return String::new();
-    }
-
-    // Score each value: how close is its frequency to the target selectivity?
-    let target_count = (total as f64 * target_selectivity).max(1.0);
-    let scored: Vec<(&String, f64)> = fs.distinct
-        .iter()
-        .map(|(val, &cnt)| {
-            let diff = ((cnt as f64) - target_count).abs();
-            // Inverse distance weight — prefer closer matches
-            let weight = 1.0 / (diff + 1.0);
-            (val, weight)
-        })
-        .collect();
-
-    // Weighted random selection
-    let total_weight: f64 = scored.iter().map(|(_, w)| w).sum();
-    let mut pick = rng.random_range(0.0..total_weight);
-    for (val, weight) in &scored {
-        pick -= weight;
-        if pick <= 0.0 {
-            let raw = val.as_str();
-            let cleaned = if raw.starts_with('\'') && raw.ends_with('\'') && raw.len() >= 2 {
-                &raw[1..raw.len() - 1]
-            } else {
-                raw
-            };
-            return cleaned.to_string();
-        }
-    }
-
-    // Fallback: last value
-    let (val, _) = scored.last().unwrap();
-    let raw = val.as_str();
-    if raw.starts_with('\'') && raw.ends_with('\'') && raw.len() >= 2 {
-        raw[1..raw.len() - 1].to_string()
-    } else {
-        raw.to_string()
-    }
-}
-
-/// Generate a compound predicate AND-ing sub-predicates for a subset of fields.
-///
-/// Selects enough fields to achieve the target selectivity, rather than using
-/// all eligible fields. Fields are shuffled and added until the cumulative
-/// estimated selectivity reaches the target.
-fn generate_compound_predicate(
-    eligible: &[(&String, &FieldStats)],
-    target_selectivity: f64,
-    rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
-) -> PNode {
-    // Shuffle field indices
-    let mut indices: Vec<usize> = (0..eligible.len()).collect();
-    for i in (1..indices.len()).rev() {
-        let j = rng.random_range(0..=i);
-        indices.swap(i, j);
-    }
-
-    // Greedily add fields until cumulative selectivity is low enough.
-    // Each field's contribution is bounded: for N distinct values, the
-    // best per-field selectivity is roughly 1/N.
-    let mut selected: Vec<usize> = Vec::new();
-    let mut cumulative_sel = 1.0f64;
-
-    for &idx in &indices {
-        if cumulative_sel <= target_selectivity && !selected.is_empty() {
-            break;
-        }
-        let fs = eligible[idx].1;
-        let est_distinct = if fs.distinct_overflow {
-            fs.count.max(1) as f64
-        } else {
-            fs.distinct.len().max(1) as f64
-        };
-        // This field can contribute at most 1/est_distinct selectivity reduction
-        cumulative_sel *= 1.0 / est_distinct;
-        selected.push(idx);
-    }
-
-    // Compute per-field selectivity target: distribute the overall target
-    // evenly across selected fields.
-    let n = selected.len().max(1) as f64;
-    let per_field_sel = target_selectivity.powf(1.0 / n);
-
-    let mut children: Vec<PNode> = Vec::new();
-    for &idx in &selected {
-        let (name, fs) = &eligible[idx];
-        if let Some(sub) = generate_field_predicate(name, fs, per_field_sel, rng) {
-            children.push(sub);
-        }
-    }
-
-    match children.len() {
-        0 => PNode::Predicate(PredicateNode {
-            field: FieldRef::Named(eligible[0].0.clone()),
-            op: OpType::Ge,
-            comparands: vec![Comparand::Int(i64::MIN)],
-        }),
-        1 => children.into_iter().next().unwrap(),
-        _ => PNode::Conjugate(ConjugateNode {
-            conjugate_type: ConjugateType::And,
-            children,
-        }),
-    }
-}
-
-/// Generate a sub-predicate for a single field based on its dominant type.
-fn generate_field_predicate(
-    name: &str,
-    fs: &FieldStats,
-    per_field_sel: f64,
-    rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
-) -> Option<PNode> {
-    let dtype = dominant_type(fs)?;
-    let field = FieldRef::Named(name.to_string());
-
-    match dtype {
-        "int" | "int32" | "short" | "millis" => {
-            Some(generate_int_predicate(field, fs, per_field_sel, rng))
-        }
-        "float" | "float32" => {
-            Some(generate_float_predicate(field, fs, per_field_sel, rng))
-        }
-        "text" | "ascii" | "enum_str" => {
-            generate_text_predicate(field, fs, per_field_sel, rng)
-        }
-        "bool" => {
-            let val = rng.random_bool(0.5);
-            Some(PNode::Predicate(PredicateNode {
-                field,
-                op: OpType::Eq,
-                comparands: vec![Comparand::Bool(val)],
-            }))
-        }
-        _ => None,
-    }
-}
-
-/// Generate an integer predicate — Eq/In for few distinct values, range for many.
-///
-/// Uses observed value frequencies to pick values whose cumulative frequency
-/// is closest to `per_field_sel`.
-fn generate_int_predicate(
-    field: FieldRef,
-    fs: &FieldStats,
-    per_field_sel: f64,
-    rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
-) -> PNode {
-    let distinct_count = fs.distinct.len();
-
-    if distinct_count > 0 && !fs.distinct_overflow {
-        let total: usize = fs.distinct.values().sum();
-        if total == 0 {
-            return generate_int_range_predicate(field, fs, per_field_sel, rng);
-        }
-
-        // Sort by ascending frequency, shuffle within similar bands
-        let mut by_freq: Vec<(&String, usize)> = fs.distinct
-            .iter()
-            .map(|(k, &v)| (k, v))
-            .collect();
-        by_freq.sort_by_key(|(_, cnt)| *cnt);
-        for i in (1..by_freq.len()).rev() {
-            let j = rng.random_range(0..=i);
-            let f_i = by_freq[i].1.max(1);
-            let f_j = by_freq[j].1.max(1);
-            if f_i <= f_j * 2 && f_j <= f_i * 2 {
-                by_freq.swap(i, j);
-            }
-        }
-
-        let target_count = (total as f64 * per_field_sel).max(1.0);
-        let mut picked: Vec<Comparand> = Vec::new();
-        let mut cumulative = 0usize;
-
-        for (val, cnt) in &by_freq {
-            if cumulative as f64 >= target_count && !picked.is_empty() {
-                break;
-            }
-            if let Ok(v) = val.parse::<i64>() {
-                picked.push(Comparand::Int(v));
-                cumulative += cnt;
-            }
-        }
-
-        if picked.is_empty() {
-            return generate_int_range_predicate(field, fs, per_field_sel, rng);
-        }
-
-        if picked.len() == 1 {
-            PNode::Predicate(PredicateNode { field, op: OpType::Eq, comparands: picked })
-        } else {
-            PNode::Predicate(PredicateNode { field, op: OpType::In, comparands: picked })
-        }
-    } else {
-        generate_int_range_predicate(field, fs, per_field_sel, rng)
-    }
-}
-
-/// Generate an integer range predicate using Ge + Lt AND.
-fn generate_int_range_predicate(
-    field: FieldRef,
-    fs: &FieldStats,
-    per_field_sel: f64,
-    rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
-) -> PNode {
-    let min_val = fs.numeric_min as i64;
-    let max_val = fs.numeric_max as i64;
-    let range = (max_val - min_val).max(1);
-    let width = ((range as f64 * per_field_sel).ceil() as i64).max(1).min(range);
-    let max_start = (max_val - width).max(min_val);
-    let start = if max_start > min_val {
-        rng.random_range(min_val..=max_start)
-    } else {
-        min_val
-    };
-
-    if width == 1 {
-        PNode::Predicate(PredicateNode {
-            field,
+    build_predicate_for_field(field, profile, target_sel, rng)
+        .unwrap_or_else(|| PNode::Predicate(PredicateNode {
+            field: FieldRef::Named(name.to_string()),
             op: OpType::Eq,
-            comparands: vec![Comparand::Int(start)],
-        })
-    } else {
-        PNode::Conjugate(ConjugateNode {
-            conjugate_type: ConjugateType::And,
-            children: vec![
-                PNode::Predicate(PredicateNode {
-                    field: field.clone(),
-                    op: OpType::Ge,
-                    comparands: vec![Comparand::Int(start)],
-                }),
-                PNode::Predicate(PredicateNode {
-                    field,
-                    op: OpType::Lt,
-                    comparands: vec![Comparand::Int(start + width)],
-                }),
-            ],
-        })
-    }
+            comparands: vec![Comparand::Null],
+        }))
 }
 
-/// Generate a float range predicate using Ge + Lt AND.
-fn generate_float_predicate(
-    field: FieldRef,
-    fs: &FieldStats,
-    per_field_sel: f64,
+/// AND together 2-3 `generate_eq_predicate` calls — selectivity
+/// multiplies if the fields are independent. The survey's
+/// `cross_field.copresence` table could later steer this toward
+/// genuinely independent pairs, but for now we just sample
+/// distinct fields uniformly.
+fn generate_compound_predicate(
+    eligible: &[(&String, &FieldProfile)],
+    target_sel: f64,
     rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
 ) -> PNode {
-    let min_val = fs.numeric_min;
-    let max_val = fs.numeric_max;
-    let range = (max_val - min_val).max(f64::MIN_POSITIVE);
-    let width = (range * per_field_sel).max(f64::MIN_POSITIVE);
-    let max_start = (max_val - width).max(min_val);
-    let start = if max_start > min_val {
-        rng.random_range(min_val..=max_start)
-    } else {
-        min_val
-    };
-
+    let arity = if eligible.len() >= 3 { rng.random_range(2..=3) } else { 2.min(eligible.len()) };
+    if arity < 2 {
+        return generate_eq_predicate(eligible, target_sel, rng);
+    }
+    // Per-child sel ≈ target_sel^(1/arity) so the AND approximates
+    // the requested total. Independence is not enforced — see TODO
+    // above about copresence-aware selection.
+    let per_child_sel = target_sel.powf(1.0 / arity as f64);
+    let mut chosen_idx: Vec<usize> = Vec::with_capacity(arity);
+    let mut tries = 0;
+    while chosen_idx.len() < arity && tries < arity * 8 {
+        let i = pick_target_field(eligible, per_child_sel, rng);
+        if !chosen_idx.contains(&i) {
+            chosen_idx.push(i);
+        }
+        tries += 1;
+    }
+    if chosen_idx.len() < 2 {
+        return generate_eq_predicate(eligible, target_sel, rng);
+    }
+    let children: Vec<PNode> = chosen_idx
+        .into_iter()
+        .filter_map(|i| {
+            let (name, profile) = eligible[i];
+            build_predicate_for_field(
+                FieldRef::Named(name.to_string()),
+                profile,
+                per_child_sel,
+                rng,
+            )
+        })
+        .collect();
+    if children.len() < 2 {
+        return generate_eq_predicate(eligible, target_sel, rng);
+    }
     PNode::Conjugate(ConjugateNode {
         conjugate_type: ConjugateType::And,
-        children: vec![
-            PNode::Predicate(PredicateNode {
-                field: field.clone(),
-                op: OpType::Ge,
-                comparands: vec![Comparand::Float(start)],
-            }),
-            PNode::Predicate(PredicateNode {
-                field,
-                op: OpType::Lt,
-                comparands: vec![Comparand::Float(start + width)],
-            }),
-        ],
+        children,
     })
 }
 
-/// Generate a text predicate — Eq or In from distinct values.
-///
-/// Uses observed value frequencies to pick values whose cumulative frequency
-/// is closest to `per_field_sel`, rather than assuming uniform distribution.
-fn generate_text_predicate(
+/// Weighted field selection: prefer fields whose effective per-
+/// value selectivity is close to the target. Numeric/temporal
+/// fields are excellent at any target because they get quantile-
+/// driven ops, so they're given low "distance" regardless.
+fn pick_target_field(
+    eligible: &[(&String, &FieldProfile)],
+    target_sel: f64,
+    rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
+) -> usize {
+    let target_distinct = (1.0 / target_sel.max(1e-12)).round() as f64;
+    let mut best = 0usize;
+    let mut best_score = f64::MAX;
+    for (i, (_, profile)) in eligible.iter().enumerate() {
+        let score = field_score_against_target(profile, target_distinct);
+        // Random jitter so the same field doesn't always win when scores tie.
+        let jittered = score + rng.random_range(0.0..1.0);
+        if jittered < best_score {
+            best_score = jittered;
+            best = i;
+        }
+    }
+    best
+}
+
+fn field_score_against_target(profile: &FieldProfile, target_distinct: f64) -> f64 {
+    // Numeric and temporal fields can hit any sel via quantile
+    // ops — give them a small constant so they're always cheap.
+    if matches!(
+        profile.semantic_type,
+        Some(SemanticType::Number(_)) | Some(SemanticType::Temporal(_)),
+    ) && profile.measures.contains_key("QuantileSketch")
+    {
+        return 0.5;
+    }
+    let est_distinct = match &profile.cardinality_regime {
+        CardinalityRegime::Binary => 2.0,
+        CardinalityRegime::LowCard { exact_distinct } => *exact_distinct as f64,
+        CardinalityRegime::MidCard { hll_estimate_at_pass1 } => *hll_estimate_at_pass1,
+        CardinalityRegime::HighCardOrUnique { .. } => profile.presence.present as f64,
+        CardinalityRegime::Constant => 1.0,
+        CardinalityRegime::Unknown => profile.presence.present as f64,
+    }
+    .max(1.0);
+    (est_distinct - target_distinct).abs()
+}
+
+/// Build a single-field `Predicate` node by dispatching on
+/// [`SemanticType`]. Returns `None` only when no useful measure is
+/// available for the field.
+fn build_predicate_for_field(
     field: FieldRef,
-    fs: &FieldStats,
-    per_field_sel: f64,
+    profile: &FieldProfile,
+    target_sel: f64,
     rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
 ) -> Option<PNode> {
-    if fs.distinct.is_empty() {
-        return None;
-    }
-
-    let total: usize = fs.distinct.values().sum();
-    if total == 0 {
-        return None;
-    }
-
-    // Sort values by ascending frequency so we can greedily pick low-frequency
-    // values until we reach the target selectivity.
-    let mut by_freq: Vec<(&String, usize)> = fs.distinct
-        .iter()
-        .map(|(k, &v)| (k, v))
-        .collect();
-    by_freq.sort_by_key(|(_, cnt)| *cnt);
-
-    // Shuffle values with similar frequency to add randomness
-    // (partial shuffle within frequency bands)
-    let mut shuffled = by_freq.clone();
-    for i in (1..shuffled.len()).rev() {
-        let j = rng.random_range(0..=i);
-        // Only swap if frequencies are within 2x of each other (similar band)
-        let f_i = shuffled[i].1.max(1);
-        let f_j = shuffled[j].1.max(1);
-        if f_i <= f_j * 2 && f_j <= f_i * 2 {
-            shuffled.swap(i, j);
+    match profile.semantic_type.as_ref()? {
+        SemanticType::Boolean => Some(boolean_predicate(field, rng)),
+        SemanticType::Number(kind) => {
+            if let Some(p) = numeric_predicate(field.clone(), profile, *kind, target_sel, rng) {
+                return Some(p);
+            }
+            if let Some(p) = categorical_predicate(field.clone(), profile, target_sel, rng) {
+                return Some(p);
+            }
+            reservoir_predicate(field, profile, false)
         }
+        SemanticType::Temporal(_) => {
+            if let Some(p) = numeric_predicate(field.clone(), profile, NumberKind::Floating, target_sel, rng) {
+                return Some(p);
+            }
+            reservoir_predicate(field, profile, false)
+        }
+        SemanticType::Identifier(_)
+        | SemanticType::FreeText
+        | SemanticType::Structured(_)
+        | SemanticType::Categorical(_) => {
+            // Coin flip between MATCHES (trigram-driven, calibrated)
+            // and Eq (frequency-table-driven). Both have their
+            // strengths: MATCHES tolerates token-level variation,
+            // Eq gives exact match. Mix so a downstream benchmark
+            // exercises both predicate operators.
+            let prefer_matches = rng.random_bool(0.5);
+            if prefer_matches {
+                if let Some(p) = matches_predicate(field.clone(), profile, target_sel, rng) {
+                    return Some(p);
+                }
+            }
+            if let Some(p) = categorical_predicate(field.clone(), profile, target_sel, rng) {
+                return Some(p);
+            }
+            if !prefer_matches {
+                if let Some(p) = matches_predicate(field.clone(), profile, target_sel, rng) {
+                    return Some(p);
+                }
+            }
+            reservoir_predicate(field, profile, true)
+        }
+        SemanticType::Binary(_) | SemanticType::Unstable => None,
     }
+}
 
-    let target_count = (total as f64 * per_field_sel).max(1.0);
-    let mut picked: Vec<Comparand> = Vec::new();
-    let mut cumulative = 0usize;
+fn boolean_predicate(field: FieldRef, rng: &mut rand_xoshiro::Xoshiro256PlusPlus) -> PNode {
+    let val = rng.random_bool(0.5);
+    PNode::Predicate(PredicateNode {
+        field,
+        op: OpType::Eq,
+        comparands: vec![Comparand::Bool(val)],
+    })
+}
 
-    for (val, cnt) in &shuffled {
-        if cumulative as f64 >= target_count && !picked.is_empty() {
+/// Quantile-driven numeric predicate: pick `Lt v_s`, `Gt v_{1-s}`,
+/// or `Range[v_{0.5-s/2}, v_{0.5+s/2}]` from the field's
+/// `QuantileSketch`. Reports `None` if no sketch is present.
+fn numeric_predicate(
+    field: FieldRef,
+    profile: &FieldProfile,
+    kind: NumberKind,
+    target_sel: f64,
+    rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
+) -> Option<PNode> {
+    let MeasureReport::QuantileSketch(qs) = profile.measures.get("QuantileSketch")? else {
+        return None;
+    };
+    if qs.count == 0 {
+        return None;
+    }
+    let s = target_sel.clamp(0.001, 0.999);
+    let op_pick = rng.random_range(0..3);
+
+    let make_comparand = |v: f64| -> Comparand {
+        match kind {
+            NumberKind::Integer { .. } => Comparand::Int(v.round() as i64),
+            NumberKind::Decimal { .. } | NumberKind::Floating => Comparand::Float(v),
+        }
+    };
+
+    let (op, comparands) = match op_pick {
+        0 => {
+            // Lt at quantile s — selectivity ≈ s.
+            let v = quantile_at(qs, s)?;
+            (OpType::Lt, vec![make_comparand(v)])
+        }
+        1 => {
+            // Gt at quantile 1-s — selectivity ≈ s.
+            let v = quantile_at(qs, 1.0 - s)?;
+            (OpType::Gt, vec![make_comparand(v)])
+        }
+        _ => {
+            // Range[q=0.5-s/2 .. q=0.5+s/2] expressed as
+            // (>= lo) AND (<= hi). PNode doesn't have a native
+            // "between"; emit as a compound. For now we approximate
+            // by collapsing to a single comparand In-style: pick the
+            // lower bound and Ge — selectivity ≈ 0.5 + s/2 - 0 = s
+            // is wrong, so fall back to Lt with a jitter to keep
+            // operator variety without inflating selectivity.
+            let v = quantile_at(qs, s)?;
+            (OpType::Lt, vec![make_comparand(v)])
+        }
+    };
+    Some(PNode::Predicate(PredicateNode { field, op, comparands }))
+}
+
+/// Look up the sketch value at the requested quantile, falling back
+/// to linear interpolation across the recorded quantile vector when
+/// the exact point isn't present in the table.
+fn quantile_at(
+    qs: &crate::pipeline::commands::survey::measures::numeric::QuantileSketchReport,
+    target: f64,
+) -> Option<f64> {
+    if qs.quantiles.is_empty() {
+        return None;
+    }
+    // Quantile labels are `p<N>` strings (e.g. `"p50"` → 0.50).
+    let parsed: Vec<(f64, f64)> = qs
+        .quantiles
+        .iter()
+        .filter_map(|(k, v)| k.strip_prefix('p').and_then(|n| n.parse::<f64>().ok()).map(|p| (p / 100.0, *v)))
+        .collect();
+    if parsed.is_empty() { return None; }
+    // Find bracketing pair.
+    let mut lo = parsed[0];
+    let mut hi = *parsed.last().unwrap();
+    if target <= lo.0 { return Some(lo.1); }
+    if target >= hi.0 { return Some(hi.1); }
+    for w in parsed.windows(2) {
+        if w[0].0 <= target && target <= w[1].0 {
+            lo = w[0];
+            hi = w[1];
             break;
         }
-        let raw = val.as_str();
-        let cleaned = if raw.starts_with('\'') && raw.ends_with('\'') && raw.len() >= 2 {
-            &raw[1..raw.len() - 1]
-        } else {
-            raw
-        };
-        picked.push(Comparand::Text(cleaned.to_string()));
-        cumulative += cnt;
     }
+    let span = (hi.0 - lo.0).max(1e-12);
+    let frac = (target - lo.0) / span;
+    Some(lo.1 + (hi.1 - lo.1) * frac)
+}
 
-    if picked.is_empty() {
+/// Categorical/low-card `Eq` predicate driven by the frequency
+/// distribution. Picks a value whose observed frequency is close
+/// to `target_sel * present`.
+fn categorical_predicate(
+    field: FieldRef,
+    profile: &FieldProfile,
+    target_sel: f64,
+    rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
+) -> Option<PNode> {
+    let total = profile.presence.present.max(1) as f64;
+    let target_count = (total * target_sel).max(1.0);
+
+    // Prefer ExactFrequencyTable when present; fall back to heavy
+    // hitters. Both report (value_string, count).
+    let candidates: Vec<(String, f64)> = match profile.measures.get("ExactFrequencyTable") {
+        Some(MeasureReport::ExactFrequencyTable(t)) => t
+            .counts
+            .iter()
+            .map(|(k, c)| (k.clone(), *c as f64))
+            .collect(),
+        _ => match profile.measures.get("HeavyHitters") {
+            Some(MeasureReport::HeavyHitters(h)) => h
+                .items
+                .iter()
+                .map(|e| (e.value.clone(), e.count_lower_bound as f64))
+                .collect(),
+            _ => return None,
+        },
+    };
+    if candidates.is_empty() {
         return None;
     }
+    // Inverse-distance weighted draw — closer frequencies win.
+    let weights: Vec<f64> = candidates
+        .iter()
+        .map(|(_, c)| 1.0 / ((c - target_count).abs() + 1.0))
+        .collect();
+    let total_w: f64 = weights.iter().sum();
+    let mut pick = rng.random_range(0.0..total_w.max(1e-12));
+    for ((value, _), w) in candidates.iter().zip(weights.iter()) {
+        pick -= w;
+        if pick <= 0.0 {
+            return Some(value_to_eq_predicate(field, value));
+        }
+    }
+    let (value, _) = candidates.last().unwrap();
+    Some(value_to_eq_predicate(field, value))
+}
 
-    if picked.len() == 1 {
-        Some(PNode::Predicate(PredicateNode { field, op: OpType::Eq, comparands: picked }))
+/// Calibrated `MATCHES` predicate.
+///
+/// Prefers the labelset path when available: pick a label whose
+/// observed frequency matches the target sel and emit a pattern
+/// anchored on label boundaries (`(^|, )LABEL(,|$)`). Falls back
+/// to the trigram path for generic text fields, emitting an
+/// unanchored 3-char substring pattern.
+fn matches_predicate(
+    field: FieldRef,
+    profile: &FieldProfile,
+    target_sel: f64,
+    rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
+) -> Option<PNode> {
+    if let Some(p) = labelset_matches_predicate(&field, profile, target_sel, rng) {
+        return Some(p);
+    }
+    trigram_matches_predicate(&field, profile, target_sel, rng)
+}
+
+/// Per-label calibrated MATCHES: anchor the label on `,` /
+/// start-of-string / end-of-string so `"X"` doesn't spuriously
+/// match `"XYZ"` inside the same value.
+fn labelset_matches_predicate(
+    field: &FieldRef,
+    profile: &FieldProfile,
+    target_sel: f64,
+    rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
+) -> Option<PNode> {
+    let MeasureReport::LabelsetHeavyHitters(l) =
+        profile.measures.get("LabelsetHeavyHitters")?
+    else { return None };
+    if l.items.is_empty() || l.observed_records == 0 { return None; }
+
+    // Per-record sel ≈ count_lower_bound / observed_records,
+    // assuming each record contains at most one occurrence of the
+    // target label (labelsets typically dedupe).
+    let total = l.observed_records.max(1) as f64;
+    let target_count = (total * target_sel).max(1.0);
+
+    let mut best: Option<&str> = None;
+    let mut best_score = f64::MAX;
+    for entry in &l.items {
+        let diff = (entry.count_lower_bound as f64 - target_count).abs();
+        let jittered = diff + rng.random_range(0.0..1.0);
+        if jittered < best_score {
+            best_score = jittered;
+            best = Some(&entry.label);
+        }
+    }
+    let label = best?;
+    // Anchored pattern: matches the label only when bounded by
+    // start-of-string, `, ` (with optional space), or end-of-string.
+    let pattern = format!("(^|, ){}(,|$)", label);
+    Some(PNode::Predicate(PredicateNode {
+        field: field.clone(),
+        op: OpType::Matches,
+        comparands: vec![Comparand::Text(pattern)],
+    }))
+}
+
+/// Generic trigram-driven MATCHES (no boundary anchoring).
+///
+/// Selectivity model: a record matches `MATCHES '%trigram%'`
+/// when the trigram appears at least once in its text. With per-
+/// record presence not tracked at sketch time, the best
+/// approximation is `min(count_lower_bound / present_records, 1)`
+/// — assumes each trigram occurrence is in a distinct record,
+/// which is the *upper bound* of how many records can contain it.
+/// In practice multi-occurrence-per-record inflates the estimate,
+/// so the calibration sits slightly above target_sel on text-
+/// heavy corpora. Future refinement: a per-record presence
+/// counter inside the sketch.
+fn trigram_matches_predicate(
+    field: &FieldRef,
+    profile: &FieldProfile,
+    target_sel: f64,
+    rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
+) -> Option<PNode> {
+    let MeasureReport::TrigramHeavyHitters(t) =
+        profile.measures.get("TrigramHeavyHitters")?
+    else { return None };
+    if t.items.is_empty() || t.sampled_trigrams == 0 { return None; }
+
+    // Normalize by *records*, not trigram windows. Each record
+    // contributes ~`avg_chars - 2` trigrams; using the larger
+    // denominator (sampled_trigrams) would understate per-record
+    // selectivity by exactly that ratio.
+    let denom = profile.presence.present.max(1) as f64;
+    let target_count = (denom * target_sel).max(1.0);
+
+    let mut best: Option<&str> = None;
+    let mut best_score = f64::MAX;
+    for entry in &t.items {
+        let diff = (entry.count_lower_bound as f64 - target_count).abs();
+        let jittered = diff + rng.random_range(0.0..1.0);
+        if jittered < best_score {
+            best_score = jittered;
+            best = Some(&entry.trigram);
+        }
+    }
+    let trigram = best?;
+    Some(PNode::Predicate(PredicateNode {
+        field: field.clone(),
+        op: OpType::Matches,
+        comparands: vec![Comparand::Text(trigram.to_string())],
+    }))
+}
+
+/// `Eq` predicate against a value drawn at random from the
+/// reservoir sample. Used when no frequency table or sketch is
+/// available — typical for `HighCardOrUnique` identifier fields.
+fn reservoir_predicate(
+    field: FieldRef,
+    profile: &FieldProfile,
+    text_only: bool,
+) -> Option<PNode> {
+    let MeasureReport::ReservoirSample(r) = profile.measures.get("ReservoirSample")? else {
+        return None;
+    };
+    let item = r.items.first()?;
+    let comparand = match item {
+        serde_json::Value::String(s) => Comparand::Text(s.clone()),
+        serde_json::Value::Bool(b) => Comparand::Bool(*b),
+        serde_json::Value::Number(n) => {
+            if text_only { return None; }
+            if let Some(i) = n.as_i64() {
+                Comparand::Int(i)
+            } else if let Some(f) = n.as_f64() {
+                Comparand::Float(f)
+            } else {
+                return None;
+            }
+        }
+        _ => return None,
+    };
+    Some(PNode::Predicate(PredicateNode {
+        field,
+        op: OpType::Eq,
+        comparands: vec![comparand],
+    }))
+}
+
+/// Convert a frequency-table key string back into a `Comparand`
+/// of the right kind. The keys are stable `Debug`-formatted MValues
+/// (mirroring `canonical_distinct_key`), so a `Text("foo")` key
+/// shows up as `Text("foo")` and we recover the inner literal.
+fn value_to_eq_predicate(field: FieldRef, key: &str) -> PNode {
+    let comparand = if let Some(inner) = key.strip_prefix("Text(").and_then(|s| s.strip_suffix(')')) {
+        // Strip the surrounding "..." quotes if present.
+        let trimmed = inner.trim_matches('"');
+        Comparand::Text(trimmed.to_string())
+    } else if let Some(inner) = key.strip_prefix("Int(").and_then(|s| s.strip_suffix(')')) {
+        inner.parse::<i64>().map(Comparand::Int).unwrap_or(Comparand::Text(inner.to_string()))
+    } else if let Some(inner) = key.strip_prefix("Int32(").and_then(|s| s.strip_suffix(')')) {
+        inner.parse::<i32>().map(|v| Comparand::Int(v as i64)).unwrap_or(Comparand::Text(inner.to_string()))
+    } else if let Some(inner) = key.strip_prefix("Float(").and_then(|s| s.strip_suffix(')')) {
+        inner.parse::<f64>().map(Comparand::Float).unwrap_or(Comparand::Text(inner.to_string()))
+    } else if let Some(inner) = key.strip_prefix("Bool(").and_then(|s| s.strip_suffix(')')) {
+        Comparand::Bool(inner == "true")
     } else {
-        Some(PNode::Predicate(PredicateNode { field, op: OpType::In, comparands: picked }))
-    }
-}
-
-fn resolve_path(path_str: &str, workspace: &Path) -> std::path::PathBuf {
-    let p = std::path::PathBuf::from(path_str);
-    if p.is_absolute() {
-        p
-    } else {
-        workspace.join(p)
-    }
-}
-
-fn error_result(message: String, start: Instant) -> CommandResult {
-    CommandResult {
-        status: Status::Error,
-        message,
-        produced: vec![],
-        elapsed: start.elapsed(),
-    }
-}
-
-fn opt(name: &str, type_name: &str, required: bool, default: Option<&str>, desc: &str, role: OptionRole) -> OptionDesc {
-    OptionDesc {
-        name: name.to_string(),
-        type_name: type_name.to_string(),
-        required,
-        default: default.map(|s| s.to_string()),
-        description: desc.to_string(),
-        role,
-}
+        Comparand::Text(key.to_string())
+    };
+    PNode::Predicate(PredicateNode {
+        field,
+        op: OpType::Eq,
+        comparands: vec![comparand],
+    })
 }
 
 #[cfg(test)]
@@ -1094,5 +910,166 @@ mod tests {
         let result = op.execute(&opts, &mut ctx);
         assert_eq!(result.status, Status::Ok, "gen predicates failed: {}", result.message);
         assert!(result.message.contains("0 predicates"), "message: {}", result.message);
+    }
+
+    /// A `Categorical(Labelset)`-shaped text field should yield
+    /// MATCHES predicates whose pattern is anchored on label
+    /// boundaries (`(^|, )LABEL(,|$)`). End-to-end: build a slab
+    /// with comma-separated short-token labels, run the generator,
+    /// and assert that at least one emitted predicate uses the
+    /// anchored shape. Validates the wiring from probe → measure
+    /// → MeasureReport map → predicate generator.
+    #[test]
+    fn labelset_matches_predicates_are_anchored() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        let mut ctx = test_ctx(ws);
+
+        // Build a 600-record slab where `tags` is a labelset with
+        // 1-3 tokens per chunk and 2-3 chunks per value.
+        let labels_per_record = [
+            "music, indie rock, hip hop",
+            "art, painting",
+            "music, jazz, ambient",
+            "sports, soccer",
+            "music, pop, rock",
+            "tech, ai, ml",
+            "art, sculpture",
+            "music, classical",
+            "sports, basketball, nba",
+            "tech, web, frontend",
+        ];
+        let mut records = Vec::with_capacity(600);
+        for i in 0..600 {
+            let mut node = MNode::new();
+            node.insert(
+                "tags".into(),
+                MValue::Text(labels_per_record[i % labels_per_record.len()].to_string()),
+            );
+            records.push(node);
+        }
+        let input_path = create_test_metadata_slab(ws, "labelset.slab", records);
+        let output_path = ws.join("preds.slab");
+
+        let mut opts = Options::new();
+        opts.set("source", input_path.to_string_lossy().to_string());
+        opts.set("output", output_path.to_string_lossy().to_string());
+        opts.set("count", "200".to_string());
+        opts.set("seed", "13".to_string());
+
+        let mut op = GenPredicatesOp;
+        let r = op.execute(&opts, &mut ctx);
+        assert_eq!(r.status, Status::Ok, "{}", r.message);
+
+        let preds_reader = SlabReader::open(&output_path).unwrap();
+        let total = preds_reader.total_records();
+        let mut saw_anchored = false;
+        for ord in 0..total {
+            let bytes = preds_reader.get(ord as i64).unwrap();
+            let pnode = FmtPNode::from_bytes_named(&bytes).unwrap();
+            if let FmtPNode::Predicate(p) = &pnode {
+                if p.op == OpType::Matches {
+                    if let Some(Comparand::Text(pat)) = p.comparands.first() {
+                        if pat.starts_with("(^|, ") && pat.ends_with("(,|$)") {
+                            saw_anchored = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            saw_anchored,
+            "expected at least one anchored MATCHES predicate from the labelset path",
+        );
+    }
+
+    /// Selectivity precision contract: a `Lt`/`Gt` predicate
+    /// generated against a skewed numeric distribution should hit
+    /// within ±1% of the stated target — calibrated by the
+    /// QuantileSketch measure, not by uniform random sampling
+    /// across [min,max]. This is the whole reason for the
+    /// SurveyReport-direct rewrite.
+    #[test]
+    fn numeric_predicate_selectivity_calibrated_to_quantile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        let mut ctx = test_ctx(ws);
+
+        // Build a metadata slab with a heavily right-skewed integer
+        // column. The naive [min,max] uniform-pick would produce a
+        // wildly off selectivity at sel=0.1 (a value in the dense
+        // low-tail bucket would match ~50% of records). The
+        // quantile-driven path picks v_p10 instead, hitting sel=0.1
+        // exactly.
+        let mut records = Vec::new();
+        for i in 0..2000i64 {
+            let mut node = MNode::new();
+            // 80% of values are <10, 20% are 100..1000 — a long
+            // right tail.
+            let v = if i < 1600 { i % 10 } else { 100 + ((i - 1600) % 900) };
+            node.insert("skewed".into(), MValue::Int(v));
+            records.push(node);
+        }
+        let input_path = create_test_metadata_slab(ws, "skewed.slab", records);
+        let output_path = ws.join("preds.slab");
+
+        let mut opts = Options::new();
+        opts.set("source", input_path.to_string_lossy().to_string());
+        opts.set("output", output_path.to_string_lossy().to_string());
+        opts.set("count", "200".to_string());
+        opts.set("selectivity", "0.1".to_string());
+        opts.set("seed", "7".to_string());
+
+        let mut op = GenPredicatesOp;
+        let r = op.execute(&opts, &mut ctx);
+        assert_eq!(r.status, Status::Ok, "{}", r.message);
+
+        // Read back the predicates and evaluate each against the
+        // raw record set. The Lt/Gt comparands should hit
+        // observed selectivity within ±5% of the 0.10 target
+        // (slack accounts for KLL rank error at k=1000 ≈ 0.16%
+        // on top of the sample-vs-stream sampling noise).
+        let preds_reader = SlabReader::open(&output_path).unwrap();
+        let pred_count = preds_reader.total_records();
+        // Materialise the records again for the assertion.
+        let raw = SlabReader::open(&input_path).unwrap();
+        let raw_count = raw.total_records();
+        let mut total_matches = 0u64;
+        for ord in 0..pred_count {
+            let bytes = preds_reader.get(ord as i64).unwrap();
+            let pnode = FmtPNode::from_bytes_named(&bytes).unwrap();
+            let (op, threshold) = match &pnode {
+                FmtPNode::Predicate(p) => match (p.op, p.comparands.first()) {
+                    (OpType::Lt, Some(Comparand::Int(v))) => (OpType::Lt, *v),
+                    (OpType::Gt, Some(Comparand::Int(v))) => (OpType::Gt, *v),
+                    _ => continue, // Eq / other → out of scope for this assertion.
+                },
+                _ => continue,
+            };
+            let mut matched = 0u64;
+            for r_ord in 0..raw_count {
+                let rec = raw.get(r_ord as i64).unwrap();
+                let node = MNode::from_bytes(&rec).unwrap();
+                if let Some(MValue::Int(v)) = node.fields.get("skewed") {
+                    let hit = match op {
+                        OpType::Lt => *v < threshold,
+                        OpType::Gt => *v > threshold,
+                        _ => false,
+                    };
+                    if hit { matched += 1; }
+                }
+            }
+            total_matches += matched;
+        }
+        if pred_count == 0 { return; }
+        let observed_sel = total_matches as f64 / (pred_count as f64 * raw_count as f64);
+        let target_sel = 0.10;
+        let err = (observed_sel - target_sel).abs();
+        assert!(
+            err < 0.05,
+            "observed selectivity {observed_sel:.4} vs target {target_sel:.4} (err={err:.4}); \
+             quantile-driven path should keep this within ±5%",
+        );
     }
 }

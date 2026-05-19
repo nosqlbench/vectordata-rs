@@ -167,6 +167,7 @@ beginning of a pipeline to log the execution environment.
             required: false,
             default: Some("false".to_string()),
             description: "Show one-line summary only".to_string(),
+            extended_description: None,
                 role: OptionRole::Config,
     }]
     }

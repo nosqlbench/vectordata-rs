@@ -21,6 +21,9 @@ pub enum SlabError {
     InvalidMagic,
     /// The namespace index is not valid (0 = reserved, negative = reserved).
     InvalidNamespaceIndex(u8),
+    /// A namespace name or sequence is not acceptable to the writer
+    /// (empty name, duplicate name, or index ceiling exceeded).
+    InvalidNamespace(String),
     /// The page type byte is not a valid variant.
     InvalidPageType(u8),
     /// The page size in the header does not match the footer.
@@ -60,6 +63,7 @@ impl fmt::Display for SlabError {
         match self {
             SlabError::InvalidMagic => write!(f, "invalid magic bytes (expected SLAB)"),
             SlabError::InvalidNamespaceIndex(v) => write!(f, "invalid namespace index: {v}"),
+            SlabError::InvalidNamespace(msg) => write!(f, "invalid namespace: {msg}"),
             SlabError::InvalidPageType(t) => write!(f, "invalid page type: {t}"),
             SlabError::PageSizeMismatch { header, footer } => {
                 write!(f, "page size mismatch: header={header}, footer={footer}")

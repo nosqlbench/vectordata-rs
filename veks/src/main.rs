@@ -320,6 +320,14 @@ fn main() {
     if cli::dyncomp::handle_complete_env(&augmented) {
         std::process::exit(0);
     }
+    // Engine-level diagnostics — `---dump-tree`, `---trace-completion`,
+    // `---validate`, etc. Triple-dash prefix can't collide with normal
+    // `--` flags. Used by tests to introspect the live tree shape
+    // without going through the bash shim.
+    let tree = cli::dyncomp::build_tree(&augmented);
+    if veks_completion::handle_diagnostic_args("veks", &tree) {
+        std::process::exit(0);
+    }
 
     let veks = Veks::parse();
 

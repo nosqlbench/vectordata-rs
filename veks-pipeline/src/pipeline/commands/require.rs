@@ -258,6 +258,7 @@ run), the command returns immediately without re-running anything.
                 required: true,
                 default: None,
                 description: "Path to the required pipeline YAML file".to_string(),
+                extended_description: None,
                 role: OptionRole::Input,
             },
             OptionDesc {
@@ -266,6 +267,7 @@ run), the command returns immediately without re-running anything.
                 required: false,
                 default: Some("all".to_string()),
                 description: "Profile to run in the required pipeline".to_string(),
+                extended_description: None,
                 role: OptionRole::Config,
             },
         ]

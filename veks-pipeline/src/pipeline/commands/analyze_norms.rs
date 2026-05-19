@@ -91,6 +91,7 @@ impl CommandOp for AnalyzeNormsOp {
                 required: true,
                 default: None,
                 description: "Source vector file (fvec, mvec)".into(),
+                extended_description: None,
                 role: OptionRole::Input,
             },
             OptionDesc {
@@ -99,6 +100,7 @@ impl CommandOp for AnalyzeNormsOp {
                 required: false,
                 default: None,
                 description: "Sample this many vectors (default: all)".into(),
+                extended_description: None,
                 role: OptionRole::Config,
             },
             OptionDesc {
@@ -107,6 +109,7 @@ impl CommandOp for AnalyzeNormsOp {
                 required: false,
                 default: Some("50".into()),
                 description: "Number of histogram bins for the ASCII chart".into(),
+                extended_description: None,
                 role: OptionRole::Config,
             },
             OptionDesc {
@@ -115,6 +118,7 @@ impl CommandOp for AnalyzeNormsOp {
                 required: false,
                 default: Some("60".into()),
                 description: "Maximum bar width in characters".into(),
+                extended_description: None,
                 role: OptionRole::Config,
             },
             OptionDesc {
@@ -123,6 +127,7 @@ impl CommandOp for AnalyzeNormsOp {
                 required: false,
                 default: Some("1e-06".into()),
                 description: "L2-norm threshold for near-zero classification".into(),
+                extended_description: None,
                 role: OptionRole::Config,
             },
         ]

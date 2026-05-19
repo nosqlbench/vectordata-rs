@@ -324,6 +324,7 @@ element type does this dataset use?"
                 required: true,
                 default: None,
                 description: "File or directory to describe".to_string(),
+                extended_description: None,
                         role: OptionRole::Input,
         },
             OptionDesc {
@@ -332,6 +333,7 @@ element type does this dataset use?"
                 required: false,
                 default: None,
                 description: "Format override (auto-detected if omitted)".to_string(),
+                extended_description: None,
                 role: OptionRole::Config,
             },
             OptionDesc {
@@ -340,6 +342,7 @@ element type does this dataset use?"
                 required: false,
                 default: Some("false".to_string()),
                 description: "Walk every record (xvec dim histogram); without it, only file/footer metadata is read".to_string(),
+                extended_description: None,
                 role: OptionRole::Config,
             },
             OptionDesc {
@@ -348,6 +351,7 @@ element type does this dataset use?"
                 required: false,
                 default: Some("false".to_string()),
                 description: "Estimate cardinality from the first file only (stat all files, probe first); fastest mode for huge corpora".to_string(),
+                extended_description: None,
                 role: OptionRole::Config,
             },
         ]

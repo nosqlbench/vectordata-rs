@@ -42,10 +42,19 @@ use crate::config::WriterConfig;
 use crate::constants::{DEFAULT_NAMESPACE_INDEX, FOOTER_V1_SIZE, HEADER_SIZE, PageType};
 use crate::error::{Result, SlabError};
 use crate::footer::Footer;
-use crate::namespaces_page::NamespacesPage;
+use crate::namespaces_page::{NamespaceEntry, NamespacesPage};
 use crate::page::Page;
 use crate::pages_page::PagesPage;
 use crate::task::{self, SlabTask};
+
+/// The largest namespace index reserved for caller-defined namespaces.
+///
+/// The on-disk footer encodes the namespace index in one byte where
+/// `0` is reserved as invalid, `1` is the default namespace `""`,
+/// `2..=127` are user-defined, and `128..=255` are reserved. A single
+/// file therefore supports at most 127 distinct namespaces (the
+/// default plus 126 named).
+const MAX_NAMESPACE_INDEX: u8 = 127;
 
 /// Writes slabtastic files, accumulating records into pages and flushing
 /// them according to the configured page size thresholds.
@@ -66,10 +75,17 @@ use crate::task::{self, SlabTask};
 /// 2. Call [`add_record`](Self::add_record) or
 ///    [`add_records`](Self::add_records) to append records. Pages are
 ///    flushed automatically when the preferred page size is reached.
-/// 3. Call [`finish`](Self::finish) to flush the last page and write the
-///    pages page.
+/// 3. *(Optional)* Call [`start_namespace`](Self::start_namespace) to
+///    seal the current namespace and begin a new one. Subsequent
+///    records land in the new namespace; the file's pages page tail is
+///    automatically promoted to a namespaces page at finish time.
+/// 4. Call [`finish`](Self::finish) to flush the last page and write
+///    the index trailer (pages page in single-namespace mode, namespaces
+///    page in multi-namespace mode).
 ///
 /// ## Examples
+///
+/// Single-namespace file:
 ///
 /// ```rust,no_run
 /// use slabtastic::{SlabWriter, WriterConfig};
@@ -82,6 +98,21 @@ use crate::task::{self, SlabTask};
 /// # Ok(())
 /// # }
 /// ```
+///
+/// Multi-namespace file (default + `"schema"`):
+///
+/// ```rust,no_run
+/// use slabtastic::{SlabWriter, WriterConfig};
+///
+/// # fn main() -> slabtastic::Result<()> {
+/// let mut w = SlabWriter::new("out.slab", WriterConfig::default())?;
+/// w.add_record(b"content-record")?;       // default namespace
+/// w.start_namespace("schema")?;
+/// w.add_record(b"{\"version\":1}")?;     // \"schema\" namespace
+/// w.finish()?;
+/// # Ok(())
+/// # }
+/// ```
 pub struct SlabWriter {
     file: File,
     config: WriterConfig,
@@ -90,10 +121,27 @@ pub struct SlabWriter {
     file_offset: u64,
     next_ordinal: i64,
     page_start_ordinal: i64,
+    /// Index assigned to the data pages and pages page currently being
+    /// built. Starts at [`DEFAULT_NAMESPACE_INDEX`].
+    current_namespace_index: u8,
+    /// Name of the namespace currently being built (`""` for the default).
+    current_namespace_name: String,
+    /// Entries for namespaces that have already been sealed via
+    /// [`SlabWriter::start_namespace`] (or carried forward from an
+    /// existing multi-namespace file in
+    /// [`SlabWriter::append_namespace`]). Non-empty means `finish` must
+    /// emit a [`NamespacesPage`] trailer.
+    sealed_namespaces: Vec<NamespaceEntry>,
 }
 
 impl SlabWriter {
     /// Create a new slabtastic file at the given path.
+    ///
+    /// The writer starts in the default namespace (index 1, name `""`).
+    /// To produce a multi-namespace file, call
+    /// [`start_namespace`](Self::start_namespace) between record batches
+    /// — [`finish`](Self::finish) will then emit a
+    /// [`NamespacesPage`] trailer instead of a bare pages page.
     pub fn new<P: AsRef<Path>>(path: P, config: WriterConfig) -> Result<Self> {
         let file = File::create(path)?;
         Ok(SlabWriter {
@@ -104,6 +152,9 @@ impl SlabWriter {
             file_offset: 0,
             next_ordinal: 0,
             page_start_ordinal: 0,
+            current_namespace_index: DEFAULT_NAMESPACE_INDEX,
+            current_namespace_name: String::new(),
+            sealed_namespaces: Vec::new(),
         })
     }
 
@@ -149,75 +200,91 @@ impl SlabWriter {
         }
 
         // If the last page is a namespaces page, locate the target
-        // namespace's pages page. Otherwise read the pages page directly.
-        let old_pages_page = if footer.page_type == PageType::Namespaces {
-            let ns_page_offset = file_len - footer.page_size as u64;
-            file.seek(SeekFrom::Start(ns_page_offset))?;
-            let mut ns_buf = vec![0u8; footer.page_size as usize];
-            file.read_exact(&mut ns_buf)?;
-            let ns_page = NamespacesPage::deserialize(&ns_buf)?;
-            let ns_entries = ns_page.entries()?;
+        // namespace's pages page and remember the sibling namespaces so
+        // we can carry them forward through `finish`. Otherwise read
+        // the pages page directly.
+        let (old_pages_page, target_index, target_name, sealed_namespaces) =
+            if footer.page_type == PageType::Namespaces {
+                let ns_page_offset = file_len - footer.page_size as u64;
+                file.seek(SeekFrom::Start(ns_page_offset))?;
+                let mut ns_buf = vec![0u8; footer.page_size as usize];
+                file.read_exact(&mut ns_buf)?;
+                let ns_page = NamespacesPage::deserialize(&ns_buf)?;
+                let ns_entries = ns_page.entries()?;
 
-            let target_entry = if let Some(name) = namespace_name {
-                ns_entries.iter().find(|e| e.name == name).cloned()
-            } else {
-                ns_entries
-                    .iter()
-                    .find(|e| {
-                        e.namespace_index == DEFAULT_NAMESPACE_INDEX && e.name.is_empty()
-                    })
-                    .cloned()
-            };
-
-            let pp_offset = match target_entry {
-                Some(entry) => entry.pages_page_offset,
-                None => {
-                    let available: Vec<String> = ns_entries
+                let target_entry = if let Some(name) = namespace_name {
+                    ns_entries.iter().find(|e| e.name == name).cloned()
+                } else {
+                    ns_entries
                         .iter()
-                        .map(|e| {
-                            if e.name.is_empty() {
-                                format!("  index {}: (default)", e.namespace_index)
-                            } else {
-                                format!("  index {}: '{}'", e.namespace_index, e.name)
-                            }
+                        .find(|e| {
+                            e.namespace_index == DEFAULT_NAMESPACE_INDEX && e.name.is_empty()
                         })
-                        .collect();
-                    let ns_desc = if let Some(name) = namespace_name {
-                        format!("namespace '{name}' not found")
-                    } else {
-                        "no default namespace found".to_string()
-                    };
-                    return Err(SlabError::InvalidFooter(format!(
-                        "{}. Available namespaces:\n{}",
-                        ns_desc,
-                        available.join("\n")
-                    )));
-                }
-            };
+                        .cloned()
+                };
 
-            file.seek(SeekFrom::Start(pp_offset as u64))?;
-            let mut hdr = [0u8; HEADER_SIZE];
-            file.read_exact(&mut hdr)?;
-            let pp_size = u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]) as usize;
-            file.seek(SeekFrom::Start(pp_offset as u64))?;
-            let mut pages_buf = vec![0u8; pp_size];
-            file.read_exact(&mut pages_buf)?;
-            PagesPage::deserialize(&pages_buf)?
-        } else {
-            // Single-namespace file
-            if let Some(name) = namespace_name
-                && !name.is_empty() {
-                    return Err(SlabError::InvalidFooter(format!(
-                        "namespace '{}' not found; this is a single-namespace file",
-                        name
-                    )));
-                }
-            let pages_page_offset = file_len - footer.page_size as u64;
-            file.seek(SeekFrom::Start(pages_page_offset))?;
-            let mut pages_buf = vec![0u8; footer.page_size as usize];
-            file.read_exact(&mut pages_buf)?;
-            PagesPage::deserialize(&pages_buf)?
-        };
+                let target = match target_entry {
+                    Some(entry) => entry,
+                    None => {
+                        let available: Vec<String> = ns_entries
+                            .iter()
+                            .map(|e| {
+                                if e.name.is_empty() {
+                                    format!("  index {}: (default)", e.namespace_index)
+                                } else {
+                                    format!("  index {}: '{}'", e.namespace_index, e.name)
+                                }
+                            })
+                            .collect();
+                        let ns_desc = if let Some(name) = namespace_name {
+                            format!("namespace '{name}' not found")
+                        } else {
+                            "no default namespace found".to_string()
+                        };
+                        return Err(SlabError::InvalidFooter(format!(
+                            "{}. Available namespaces:\n{}",
+                            ns_desc,
+                            available.join("\n")
+                        )));
+                    }
+                };
+
+                let pp_offset = target.pages_page_offset;
+                file.seek(SeekFrom::Start(pp_offset as u64))?;
+                let mut hdr = [0u8; HEADER_SIZE];
+                file.read_exact(&mut hdr)?;
+                let pp_size = u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]) as usize;
+                file.seek(SeekFrom::Start(pp_offset as u64))?;
+                let mut pages_buf = vec![0u8; pp_size];
+                file.read_exact(&mut pages_buf)?;
+                let pp = PagesPage::deserialize(&pages_buf)?;
+
+                let target_idx = target.namespace_index;
+                let target_nm = target.name.clone();
+                // Carry forward every sibling namespace verbatim — their
+                // pages pages already live at known offsets and will
+                // remain valid.
+                let sealed: Vec<NamespaceEntry> = ns_entries
+                    .into_iter()
+                    .filter(|e| e.namespace_index != target_idx)
+                    .collect();
+                (pp, target_idx, target_nm, sealed)
+            } else {
+                // Single-namespace file
+                if let Some(name) = namespace_name
+                    && !name.is_empty() {
+                        return Err(SlabError::InvalidFooter(format!(
+                            "namespace '{}' not found; this is a single-namespace file",
+                            name
+                        )));
+                    }
+                let pages_page_offset = file_len - footer.page_size as u64;
+                file.seek(SeekFrom::Start(pages_page_offset))?;
+                let mut pages_buf = vec![0u8; footer.page_size as usize];
+                file.read_exact(&mut pages_buf)?;
+                let pp = PagesPage::deserialize(&pages_buf)?;
+                (pp, DEFAULT_NAMESPACE_INDEX, String::new(), Vec::new())
+            };
 
         // Determine the next ordinal from existing entries
         let entries = old_pages_page.entries();
@@ -253,20 +320,28 @@ impl SlabWriter {
         // Position at the end of the last data page (before the old pages page)
         file.seek(SeekFrom::Start(data_end))?;
 
-        // Build a new pages page carrying forward existing entries
+        // Build a new pages page carrying forward existing entries.
+        // Tag the in-memory pages page and the initial data page with
+        // the target namespace's index so newly emitted pages match.
         let mut pages_page = PagesPage::new();
+        pages_page.page.footer.namespace_index = target_index;
         for entry in &entries {
             pages_page.add_entry(entry.start_ordinal, entry.file_offset);
         }
+        let mut current_page = Page::new(max_ordinal, PageType::Data);
+        current_page.footer.namespace_index = target_index;
 
         Ok(SlabWriter {
             file,
             config,
-            current_page: Page::new(max_ordinal, PageType::Data),
+            current_page,
             pages_page,
             file_offset: data_end,
             next_ordinal: max_ordinal,
             page_start_ordinal: max_ordinal,
+            current_namespace_index: target_index,
+            current_namespace_name: target_name,
+            sealed_namespaces,
         })
     }
 
@@ -437,6 +512,7 @@ impl SlabWriter {
         // Start a new current page
         self.page_start_ordinal = self.next_ordinal;
         self.current_page = Page::new(self.next_ordinal, PageType::Data);
+        self.current_page.footer.namespace_index = self.current_namespace_index;
 
         Ok(())
     }
@@ -446,15 +522,126 @@ impl SlabWriter {
         self.next_ordinal
     }
 
-    /// Finish writing: flush the pending page and write the pages page.
-    pub fn finish(&mut self) -> Result<()> {
+    /// Return the name of the namespace currently being written.
+    /// Empty string for the default namespace.
+    pub fn current_namespace(&self) -> &str {
+        &self.current_namespace_name
+    }
+
+    /// Seal the current namespace and begin a new one with `name`.
+    ///
+    /// The writer flushes the in-flight data page, emits the current
+    /// namespace's pages page at the file's tail, records its entry,
+    /// and rotates state so subsequent records land in a new namespace
+    /// with the next available index. The eventual
+    /// [`finish`](Self::finish) call will emit a [`NamespacesPage`]
+    /// trailer covering every namespace.
+    ///
+    /// The first namespace (the one created implicitly by
+    /// [`new`](Self::new) or selected by
+    /// [`append_namespace`](Self::append_namespace)) is sealed by the
+    /// first call to this method. Subsequent calls seal whichever
+    /// namespace they just started.
+    ///
+    /// # Errors
+    ///
+    /// - [`SlabError::InvalidNamespace`] if `name` is empty (the empty
+    ///   string is reserved for the default namespace).
+    /// - [`SlabError::InvalidNamespace`] if a namespace with the same
+    ///   name has already been sealed in this writer session.
+    /// - [`SlabError::InvalidNamespace`] if the namespace index would
+    ///   exceed `127`. A single file supports at most 127 namespaces
+    ///   (the default plus 126 named).
+    pub fn start_namespace(&mut self, name: &str) -> Result<()> {
+        if name.is_empty() {
+            return Err(SlabError::InvalidNamespace(
+                "namespace name must be non-empty (\"\" is reserved for the default)"
+                    .to_string(),
+            ));
+        }
+        if name == self.current_namespace_name
+            || self.sealed_namespaces.iter().any(|e| e.name == name)
+        {
+            return Err(SlabError::InvalidNamespace(format!(
+                "namespace '{name}' is already present in this writer"
+            )));
+        }
+        if self.current_namespace_index >= MAX_NAMESPACE_INDEX {
+            return Err(SlabError::InvalidNamespace(format!(
+                "namespace index {} would exceed maximum {MAX_NAMESPACE_INDEX}",
+                self.current_namespace_index as u16 + 1
+            )));
+        }
+
+        // Seal the current namespace: flush in-flight records, then
+        // write its pages page at the file tail.
+        self.seal_current_namespace()?;
+
+        // Rotate state for the new namespace.
+        let next_index = self.current_namespace_index + 1;
+        self.current_namespace_index = next_index;
+        self.current_namespace_name = name.to_string();
+        self.pages_page = PagesPage::new();
+        self.pages_page.page.footer.namespace_index = next_index;
+        self.next_ordinal = 0;
+        self.page_start_ordinal = 0;
+        self.current_page = Page::new(0, PageType::Data);
+        self.current_page.footer.namespace_index = next_index;
+
+        Ok(())
+    }
+
+    /// Flush the in-flight data page, serialize the current namespace's
+    /// pages page, write it to the file tail, and record its entry in
+    /// `sealed_namespaces`. Leaves the writer's namespace-rotation
+    /// state untouched — callers (start_namespace, finish) own that.
+    fn seal_current_namespace(&mut self) -> Result<()> {
         self.flush_page()?;
+        self.pages_page.page.footer.namespace_index = self.current_namespace_index;
+        let pp_offset = self.file_offset as i64;
+        let pp_bytes = self.pages_page.serialize();
+        self.file.write_all(&pp_bytes)?;
+        self.file_offset += pp_bytes.len() as u64;
+        self.sealed_namespaces.push(NamespaceEntry {
+            namespace_index: self.current_namespace_index,
+            name: self.current_namespace_name.clone(),
+            pages_page_offset: pp_offset,
+        });
+        Ok(())
+    }
 
-        // Serialize and write the pages page
-        let pages_bytes = self.pages_page.serialize();
-        self.file.write_all(&pages_bytes)?;
+    /// Finish writing: flush the pending page and write the trailing
+    /// index pages.
+    ///
+    /// In single-namespace mode (no calls to
+    /// [`start_namespace`](Self::start_namespace)) the trailer is just
+    /// the [`PagesPage`]. When two or more namespaces have been written
+    /// the trailer is a [`NamespacesPage`] following each namespace's
+    /// own pages page, and the reader will route by name.
+    pub fn finish(&mut self) -> Result<()> {
+        if self.sealed_namespaces.is_empty() {
+            // Single-namespace file: tag and emit the pages page as the
+            // sole trailer.
+            self.flush_page()?;
+            self.pages_page.page.footer.namespace_index = self.current_namespace_index;
+            let pages_bytes = self.pages_page.serialize();
+            self.file.write_all(&pages_bytes)?;
+            self.file.flush()?;
+            return Ok(());
+        }
+
+        // Multi-namespace file: seal the namespace currently being
+        // built, then emit a namespaces page mapping name → pages-page
+        // offset for every namespace in the file.
+        self.seal_current_namespace()?;
+        let mut ns_page = NamespacesPage::new();
+        for entry in &self.sealed_namespaces {
+            ns_page.add_entry(entry);
+        }
+        let ns_bytes = ns_page.serialize();
+        self.file.write_all(&ns_bytes)?;
+        self.file_offset += ns_bytes.len() as u64;
         self.file.flush()?;
-
         Ok(())
     }
 }
@@ -648,5 +835,126 @@ mod tests {
 
         // Nothing was written
         assert_eq!(w.next_ordinal(), 0);
+    }
+
+    /// Writing default + one named namespace produces a file whose
+    /// trailing footer is a Namespaces page, and the reader can open
+    /// each namespace independently and read back its own records.
+    #[test]
+    fn test_start_namespace_roundtrip() {
+        use crate::reader::SlabReader;
+
+        let tmp = NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+
+        let mut w = SlabWriter::new(&path, WriterConfig::default()).unwrap();
+        w.add_record(b"content-0").unwrap();
+        w.add_record(b"content-1").unwrap();
+        w.start_namespace("schema").unwrap();
+        w.add_record(b"{\"version\":1}").unwrap();
+        w.finish().unwrap();
+
+        // Trailer must be a Namespaces page now.
+        let bytes = std::fs::read(&path).unwrap();
+        let tail =
+            Footer::read_from(&bytes[bytes.len() - FOOTER_V1_SIZE..]).unwrap();
+        assert_eq!(tail.page_type, PageType::Namespaces);
+
+        // Default namespace reads its own records.
+        let r_default = SlabReader::open(&path).unwrap();
+        assert_eq!(r_default.get(0).unwrap(), b"content-0");
+        assert_eq!(r_default.get(1).unwrap(), b"content-1");
+        assert!(r_default.get(2).is_err());
+
+        // Schema namespace reads independently with its own ordinal 0.
+        let r_schema = SlabReader::open_namespace(&path, Some("schema")).unwrap();
+        assert_eq!(r_schema.get(0).unwrap(), b"{\"version\":1}");
+        assert!(r_schema.get(1).is_err());
+
+        // The namespaces listing carries both entries.
+        let ns = SlabReader::list_namespaces(&path).unwrap();
+        let names: Vec<String> = ns.iter().map(|e| e.name.clone()).collect();
+        assert!(names.iter().any(|n| n.is_empty()));
+        assert!(names.iter().any(|n| n == "schema"));
+    }
+
+    /// Three namespaces (default + two named) all survive a write/read
+    /// cycle, including a namespace that wasn't given any records.
+    #[test]
+    fn test_start_namespace_multiple_including_empty() {
+        use crate::reader::SlabReader;
+
+        let tmp = NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+
+        let mut w = SlabWriter::new(&path, WriterConfig::default()).unwrap();
+        w.add_record(b"d-0").unwrap();
+        w.start_namespace("alpha").unwrap();
+        // No records — `alpha` is an empty namespace.
+        w.start_namespace("beta").unwrap();
+        w.add_record(b"b-0").unwrap();
+        w.add_record(b"b-1").unwrap();
+        w.finish().unwrap();
+
+        let r_default = SlabReader::open(&path).unwrap();
+        assert_eq!(r_default.get(0).unwrap(), b"d-0");
+
+        let r_alpha = SlabReader::open_namespace(&path, Some("alpha")).unwrap();
+        assert!(r_alpha.get(0).is_err()); // empty namespace
+
+        let r_beta = SlabReader::open_namespace(&path, Some("beta")).unwrap();
+        assert_eq!(r_beta.get(0).unwrap(), b"b-0");
+        assert_eq!(r_beta.get(1).unwrap(), b"b-1");
+    }
+
+    /// `start_namespace("")` is rejected — the empty name is the
+    /// default namespace and can't be created twice.
+    #[test]
+    fn test_start_namespace_empty_name_rejected() {
+        let tmp = NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        let mut w = SlabWriter::new(&path, WriterConfig::default()).unwrap();
+        match w.start_namespace("") {
+            Err(SlabError::InvalidNamespace(_)) => {}
+            other => panic!("expected InvalidNamespace, got {other:?}"),
+        }
+    }
+
+    /// Re-using a namespace name within one writer session is rejected.
+    #[test]
+    fn test_start_namespace_duplicate_name_rejected() {
+        let tmp = NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        let mut w = SlabWriter::new(&path, WriterConfig::default()).unwrap();
+        w.start_namespace("schema").unwrap();
+        match w.start_namespace("schema") {
+            Err(SlabError::InvalidNamespace(_)) => {}
+            other => panic!("expected InvalidNamespace, got {other:?}"),
+        }
+    }
+
+    /// Tagging data pages with the current namespace_index — when a
+    /// flush happens *across* a namespace boundary, the second
+    /// namespace's pages carry index 2, not 1.
+    #[test]
+    fn test_start_namespace_tags_data_pages() {
+        use crate::reader::SlabReader;
+
+        let tmp = NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        let mut w = SlabWriter::new(&path, WriterConfig::default()).unwrap();
+        w.add_record(b"a").unwrap();
+        w.start_namespace("two").unwrap();
+        w.add_record(b"b").unwrap();
+        w.finish().unwrap();
+
+        // Reader can find the right page for each namespace's ordinal 0
+        // independently — the only way that works is if the data page
+        // footer carried the correct namespace_index AND the per-
+        // namespace pages page only references its own data pages.
+        let r1 = SlabReader::open(&path).unwrap();
+        assert_eq!(r1.get(0).unwrap(), b"a");
+        let r2 = SlabReader::open_namespace(&path, Some("two")).unwrap();
+        assert_eq!(r2.get(0).unwrap(), b"b");
     }
 }

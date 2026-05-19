@@ -42,6 +42,8 @@ pub fn build_tree(cmd: &clap::Command) -> CommandTree {
         root,
         hidden,
         global_value_providers: std::collections::BTreeMap::new(),
+        global_flag_help: std::collections::BTreeMap::new(),
+        global_flag_long_help: std::collections::BTreeMap::new(),
         strict_metadata: false,
     };
 
@@ -80,6 +82,8 @@ fn walk_clap_command(
         // Leaf command — collect its options and identify boolean flags
         let mut options: Vec<String> = Vec::new();
         let mut flags: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut flag_helps: Vec<(String, String)> = Vec::new();
+        let mut flag_long_helps: Vec<(String, String)> = Vec::new();
         for a in cmd.get_arguments() {
             if a.get_id() == "help" || a.get_id() == "version" { continue; }
             let name = if let Some(long) = a.get_long() {
@@ -94,7 +98,17 @@ fn walk_clap_command(
             if is_flag {
                 flags.insert(name.clone());
             }
-            options.push(name);
+            options.push(name.clone());
+            // Capture help text so the completion engine can show it on
+            // a rapid double-tab at the value position.
+            if let Some(h) = a.get_help() {
+                flag_helps.push((name.clone(), h.to_string()));
+            }
+            // Capture extended help (clap's `long_help`) for the
+            // rapid triple-tap tier.
+            if let Some(h) = a.get_long_help() {
+                flag_long_helps.push((name, h.to_string()));
+            }
         }
 
         // Look up per-option value completions for this leaf. The
@@ -115,6 +129,10 @@ fn walk_clap_command(
             path_segments.to_vec()
         };
         let key = stripped.join(" ");
+
+        // Step 1: closed-set enums declared by the CommandOp via
+        // `value_completions()`. These take precedence over any
+        // type-driven default because they're the most specific.
         if let Some(opt_map) = pipeline_vc.get(&key) {
             for (opt_name, vc) in opt_map {
                 let vc = vc.clone();
@@ -124,6 +142,38 @@ fn walk_clap_command(
                     });
                 value_providers.insert(format!("--{}", opt_name), provider);
             }
+        }
+
+        // Step 2: type-driven defaults for every value-taking arg that
+        // didn't get a closed-set provider above. The clap arg's
+        // `ValueHint` is the authoritative type signal — it's already
+        // populated from `OptionDesc::type_name == "Path"` (cli.rs:166)
+        // and equivalents. Make sure every value-taking option ends up
+        // with *some* provider so the user always gets useful
+        // completions instead of silence.
+        for a in cmd.get_arguments() {
+            if a.get_id() == "help" || a.get_id() == "version" { continue; }
+            let Some(long) = a.get_long() else { continue };
+            let flag = format!("--{}", long);
+            // Skip boolean flags — they don't take a value.
+            if !a.get_action().takes_values() { continue; }
+            // Skip flags that already have a closed-set provider.
+            if value_providers.contains_key(&flag) { continue; }
+            let provider = match a.get_value_hint() {
+                clap::ValueHint::FilePath => veks_completion::providers::fs_files_provider(),
+                clap::ValueHint::DirPath  => veks_completion::providers::fs_dirs_provider(),
+                clap::ValueHint::AnyPath
+                | clap::ValueHint::ExecutablePath
+                | clap::ValueHint::CommandName
+                | clap::ValueHint::CommandString
+                | clap::ValueHint::CommandWithArguments
+                    => veks_completion::providers::fs_paths_provider(),
+                // No hint or a non-path hint — leave the flag without
+                // a default provider so a global one in CommandTree
+                // (e.g., `--dataset`, `--profile`) can still bind.
+                _ => continue,
+            };
+            value_providers.insert(flag, provider);
         }
 
         // Look up category/level metadata for this leaf in the same
@@ -145,6 +195,12 @@ fn walk_clap_command(
         let mut node = Node::leaf_with_flags(&value_flags, &boolean_flags);
         for (name, provider) in value_providers {
             node = node.with_value_provider(&name, provider);
+        }
+        for (name, help) in flag_helps {
+            node = node.with_flag_help(&name, &help);
+        }
+        for (name, help) in flag_long_helps {
+            node = node.with_flag_long_help(&name, &help);
         }
         if let Some(c) = category {
             node = node.with_category(&c);

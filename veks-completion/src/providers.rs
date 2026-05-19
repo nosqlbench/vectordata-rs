@@ -36,7 +36,144 @@
 
 use std::sync::Arc;
 
-use crate::{BracketState, PartialParse, SubtreeProvider};
+use crate::{BracketState, PartialParse, SubtreeProvider, ValueProvider};
+
+// =====================================================================
+// Built-in value providers
+// =====================================================================
+//
+// These are the "every CLI needs them" candidate resolvers — file
+// paths, directory paths, no-op (explicit "we know what we're doing
+// but there's no closed set"). They're plumbed in by embedders via
+// [`fs_paths_provider`] / [`fs_dirs_provider`] and friends, and the
+// engine's tree-walker can attach them automatically when an
+// [`OptionDesc`]-equivalent declares a `type_name == "Path"`-style
+// hint.
+//
+// Convention: every option that *takes* a value should have *some*
+// provider attached. Use [`no_op_provider`] when the value really is
+// free-form and the user is expected to type it; that documents the
+// intent ("this value is opaque") instead of leaving the slot empty.
+
+/// Tab-complete a filesystem path of any kind (file or directory).
+///
+/// Mirrors readline's default `_filedir` fallback: lists every entry
+/// whose name starts with the in-progress basename, anchoring against
+/// whichever directory the partial points at (`""` → CWD,
+/// `"some/"` → `./some/`, `"/etc/p"` → `/etc/` matching `p*`). A
+/// trailing `/` is appended to directories so the next tab keeps
+/// drilling in.
+pub fn fs_paths_provider() -> ValueProvider {
+    Arc::new(|partial: &str, _ctx: &[&str]| -> Vec<String> {
+        complete_fs_paths(partial, FsKind::Any)
+    })
+}
+
+/// Tab-complete a filesystem path that ultimately points at a file.
+///
+/// Directories are still surfaced (with a trailing `/`) so the user
+/// can descend into them, but plain files are the terminal value.
+pub fn fs_files_provider() -> ValueProvider {
+    Arc::new(|partial: &str, _ctx: &[&str]| -> Vec<String> {
+        complete_fs_paths(partial, FsKind::FilesAndDirsForDescent)
+    })
+}
+
+/// Tab-complete a filesystem path that must be a directory.
+///
+/// Only directories are surfaced. Each candidate gets a trailing `/`
+/// so the next tab continues navigating.
+pub fn fs_dirs_provider() -> ValueProvider {
+    Arc::new(|partial: &str, _ctx: &[&str]| -> Vec<String> {
+        complete_fs_paths(partial, FsKind::DirsOnly)
+    })
+}
+
+/// Sentinel provider for value-taking options where the value is
+/// genuinely free-form (a string, a number, an arbitrary identifier).
+/// Returning an empty `Vec` is honest — there's nothing the engine
+/// could suggest — but the explicit registration documents that
+/// this slot was considered, not forgotten.
+pub fn no_op_provider() -> ValueProvider {
+    Arc::new(|_partial: &str, _ctx: &[&str]| -> Vec<String> { Vec::new() })
+}
+
+#[derive(Clone, Copy)]
+enum FsKind {
+    /// Both files and directories are terminal values.
+    Any,
+    /// Files are terminal; directories are listed so the user can
+    /// descend, but the option's "real" target is a file.
+    FilesAndDirsForDescent,
+    /// Only directories.
+    DirsOnly,
+}
+
+/// Core filesystem completer. Splits the partial into
+/// `(dir_to_list, name_prefix)` and reads `dir_to_list` once.
+/// Returns paths in the same form the user typed — relative if the
+/// partial was relative, absolute if absolute — so the shell can
+/// insert them verbatim.
+fn complete_fs_paths(partial: &str, kind: FsKind) -> Vec<String> {
+    let (dir_to_list, prefix_to_strip, name_prefix) = split_partial(partial);
+    let entries = match std::fs::read_dir(&dir_to_list) {
+        Ok(it) => it,
+        Err(_) => return Vec::new(),
+    };
+    let mut out: Vec<String> = Vec::new();
+    for entry in entries.flatten() {
+        let name_os = entry.file_name();
+        let Some(name) = name_os.to_str() else { continue };
+        // Skip dotfiles unless the user already typed a leading dot.
+        if name.starts_with('.') && !name_prefix.starts_with('.') {
+            continue;
+        }
+        if !name.starts_with(&name_prefix) { continue; }
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        match kind {
+            FsKind::DirsOnly if !is_dir => continue,
+            FsKind::FilesAndDirsForDescent | FsKind::Any | FsKind::DirsOnly => {}
+        }
+        // Reassemble the candidate in the user's original form.
+        let mut candidate = String::with_capacity(prefix_to_strip.len() + name.len() + 1);
+        candidate.push_str(&prefix_to_strip);
+        candidate.push_str(name);
+        if is_dir { candidate.push('/'); }
+        out.push(candidate);
+    }
+    out.sort();
+    out
+}
+
+/// Split a partial path into `(dir_to_read, prefix_to_preserve,
+/// name_prefix_to_match)`.
+///
+/// Examples:
+///   `""`            → (`./`,        ``,         ``)
+///   `"foo"`         → (`./`,        ``,         `foo`)
+///   `"src/m"`       → (`./src/`,    `src/`,     `m`)
+///   `"/etc/p"`      → (`/etc/`,     `/etc/`,    `p`)
+///   `"~/p"`         → (`<home>/`,   `~/`,       `p`)
+fn split_partial(partial: &str) -> (std::path::PathBuf, String, String) {
+    let (dir_str, name_prefix) = match partial.rfind('/') {
+        Some(i) => (&partial[..=i], &partial[i + 1..]),
+        None    => ("", partial),
+    };
+    // Expand a leading `~/` to the user's home for directory reads,
+    // but keep `~/` in the candidate prefix so the shell sees what
+    // the user typed.
+    let dir_to_read: std::path::PathBuf = if let Some(rest) = dir_str.strip_prefix("~/") {
+        let home = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        if rest.is_empty() { home } else { home.join(rest) }
+    } else if dir_str.is_empty() {
+        std::path::PathBuf::from(".")
+    } else {
+        std::path::PathBuf::from(dir_str)
+    };
+    (dir_to_read, dir_str.to_string(), name_prefix.to_string())
+}
 
 // =====================================================================
 // Free-standing grammar helpers — the inner versions of PartialParse
@@ -2699,6 +2836,95 @@ mod tests {
         let cands = engine_run("metricsql query 'up");
         assert!(cands.iter().any(|s| s == "'up'"),
             "expected TERMINAL `'up'` continuation: {cands:?}");
+    }
+
+    /// `fs_paths_provider` lists every entry of CWD matching the
+    /// partial prefix and tags directories with a trailing `/`.
+    #[test]
+    fn fs_paths_lists_relative_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("alpha")).unwrap();
+        std::fs::create_dir(tmp.path().join("alpine")).unwrap();
+        std::fs::write(tmp.path().join("alfa.txt"), b"x").unwrap();
+        std::fs::write(tmp.path().join("zeta.txt"), b"x").unwrap();
+
+        let _guard = ChangeDirGuard::to(tmp.path());
+        let provider = fs_paths_provider();
+        let mut out = provider("al", &[]);
+        out.sort();
+        assert_eq!(out, vec!["alfa.txt", "alpha/", "alpine/"]);
+    }
+
+    /// `fs_dirs_provider` returns only directories.
+    #[test]
+    fn fs_dirs_only_directories() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("data")).unwrap();
+        std::fs::write(tmp.path().join("readme"), b"x").unwrap();
+
+        let _guard = ChangeDirGuard::to(tmp.path());
+        let provider = fs_dirs_provider();
+        let out = provider("", &[]);
+        assert_eq!(out, vec!["data/"]);
+    }
+
+    /// Descending into a subdirectory preserves the partial prefix
+    /// in the returned candidates.
+    #[test]
+    fn fs_paths_preserves_directory_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("profiles/base");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("metadata_content.slab"), b"x").unwrap();
+        std::fs::write(base.join("base_vectors.fvec"), b"x").unwrap();
+
+        let _guard = ChangeDirGuard::to(tmp.path());
+        let provider = fs_paths_provider();
+        let mut out = provider("profiles/base/m", &[]);
+        out.sort();
+        assert_eq!(out, vec!["profiles/base/metadata_content.slab"]);
+    }
+
+    /// Dotfiles are hidden unless the user explicitly typed a `.`.
+    #[test]
+    fn fs_paths_hides_dotfiles_by_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(".hidden"), b"x").unwrap();
+        std::fs::write(tmp.path().join("visible"), b"x").unwrap();
+
+        let _guard = ChangeDirGuard::to(tmp.path());
+        let provider = fs_paths_provider();
+        let out_plain = provider("", &[]);
+        assert_eq!(out_plain, vec!["visible"]);
+        let out_dot = provider(".", &[]);
+        assert!(out_dot.iter().any(|s| s == ".hidden"));
+    }
+
+    /// `no_op_provider` is always empty — useful for value-taking
+    /// flags that have no candidate set worth offering.
+    #[test]
+    fn no_op_provider_is_empty() {
+        let p = no_op_provider();
+        assert!(p("", &[]).is_empty());
+        assert!(p("anything", &["context"]).is_empty());
+    }
+
+    /// Process-wide CWD swap that restores on drop. Used by the fs
+    /// provider tests so they're hermetic.
+    struct ChangeDirGuard {
+        prior: std::path::PathBuf,
+    }
+    impl ChangeDirGuard {
+        fn to(p: &std::path::Path) -> Self {
+            let prior = std::env::current_dir().unwrap();
+            std::env::set_current_dir(p).unwrap();
+            Self { prior }
+        }
+    }
+    impl Drop for ChangeDirGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.prior);
+        }
     }
 
     #[test]

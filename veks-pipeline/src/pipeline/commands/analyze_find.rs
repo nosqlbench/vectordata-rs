@@ -364,6 +364,7 @@ impl CommandOp for AnalyzeFindOp {
                 required: true,
                 default: None,
                 description: "Source file containing the vector to find".to_string(),
+                extended_description: None,
                         role: OptionRole::Input,
         },
             OptionDesc {
@@ -372,6 +373,7 @@ impl CommandOp for AnalyzeFindOp {
                 required: true,
                 default: None,
                 description: "Target file to search in".to_string(),
+                extended_description: None,
                         role: OptionRole::Input,
         },
             OptionDesc {
@@ -380,6 +382,7 @@ impl CommandOp for AnalyzeFindOp {
                 required: true,
                 default: None,
                 description: "0-based index of vector in source file".to_string(),
+                extended_description: None,
                         role: OptionRole::Config,
         },
         ]

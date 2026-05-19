@@ -307,6 +307,11 @@ pub struct Node {
     boolean_flags: std::collections::HashSet<String>,
     /// Per-flag help text. Used by [`render_usage`].
     flag_help: BTreeMap<String, String>,
+    /// Extended help text for flags — shown on triple-tap at a
+    /// value position when present. Mirrors clap's
+    /// `Arg::long_help`. Falls back to `flag_help` if no extended
+    /// text was registered.
+    flag_long_help: BTreeMap<String, String>,
     /// Dynamic value providers keyed by flag name.
     value_providers: BTreeMap<String, ValueProvider>,
 
@@ -655,6 +660,7 @@ impl Default for Node {
             flags: Vec::new(),
             boolean_flags: std::collections::HashSet::new(),
             flag_help: BTreeMap::new(),
+            flag_long_help: BTreeMap::new(),
             value_providers: BTreeMap::new(),
             dynamic_options: None,
             promoted_globals: Vec::new(),
@@ -862,6 +868,19 @@ impl Node {
     pub fn with_flag_help(mut self, flag: &str, help: &str) -> Self {
         self.flag_help.insert(flag.to_string(), help.to_string());
         self
+    }
+
+    /// Builder: register extended help for a flag — surfaced on a
+    /// rapid triple-tap at the value position. Mirrors clap's
+    /// `Arg::long_help` shape.
+    pub fn with_flag_long_help(mut self, flag: &str, help: &str) -> Self {
+        self.flag_long_help.insert(flag.to_string(), help.to_string());
+        self
+    }
+
+    /// Lookup extended help for a flag.
+    pub fn flag_long_help_for(&self, flag: &str) -> Option<&str> {
+        self.flag_long_help.get(flag).map(|s| s.as_str())
     }
 
     /// Get help text for one of this node's flags, if any.
@@ -1104,6 +1123,15 @@ pub struct CommandTree {
     pub hidden: std::collections::HashSet<String>,
     /// Global value providers keyed by option name.
     pub global_value_providers: BTreeMap<String, ValueProvider>,
+    /// Help text for global flags. Falls back to per-node
+    /// `flag_help` when the cursor sits inside a leaf that doesn't
+    /// override the help line for a global flag like `--dataset` or
+    /// `--profile`. Used by the value-position rapid-tap UX.
+    pub global_flag_help: BTreeMap<String, String>,
+    /// Extended help text for global flags. Same fallback chain as
+    /// [`Self::global_flag_help`]; surfaced on triple-tap at a
+    /// value position.
+    pub global_flag_long_help: BTreeMap<String, String>,
     /// When true, every registered command must declare both a
     /// category (via [`Node::with_category`]) and an explicit
     /// level (via [`Node::with_level`]). [`Self::command`] /
@@ -1143,8 +1171,36 @@ impl CommandTree {
             root: Node::empty_group(),
             hidden: std::collections::HashSet::new(),
             global_value_providers: BTreeMap::new(),
+            global_flag_help: BTreeMap::new(),
+            global_flag_long_help: BTreeMap::new(),
             strict_metadata: false,
         }
+    }
+
+    /// Lookup help text for a global flag. Returns `None` if no
+    /// global help was registered for this flag.
+    pub fn global_flag_help_for(&self, flag: &str) -> Option<&str> {
+        self.global_flag_help.get(flag).map(|s| s.as_str())
+    }
+
+    /// Register help text for a global flag. Builder-style so it
+    /// composes with [`Self::global_value_provider`].
+    pub fn global_flag_help(mut self, flag: &str, help: &str) -> Self {
+        self.global_flag_help.insert(flag.to_string(), help.to_string());
+        self
+    }
+
+    /// Lookup extended help for a global flag.
+    pub fn global_flag_long_help_for(&self, flag: &str) -> Option<&str> {
+        self.global_flag_long_help.get(flag).map(|s| s.as_str())
+    }
+
+    /// Register extended help for a global flag — surfaced on
+    /// rapid triple-tap at a value position. Composes with
+    /// [`Self::global_flag_help`].
+    pub fn global_flag_long_help(mut self, flag: &str, help: &str) -> Self {
+        self.global_flag_long_help.insert(flag.to_string(), help.to_string());
+        self
     }
 
     /// Opt-in to strict-metadata mode. Every subsequent call
@@ -1543,13 +1599,33 @@ pub fn complete_rotating_with_raw(
 
     let max = max_level_of_children(node).max(1);
     let only = ((tap_count.saturating_sub(1)) % max) + 1;
+    // The modulo-by-max-children transform is for cycling through
+    // command-level visibility tiers. At a *value* position (the
+    // previous word is a value-taking flag) there are no command
+    // tiers to cycle, so the raw `tap_count` should flow through
+    // unmodified — otherwise a leaf with no children clamps
+    // `tap_count` to 1 forever and the rapid-double-tap help line
+    // (gated on `tap_count == 2` inside
+    // [`complete_at_tap_with_raw`]) never fires.
+    let prev_word_opt = completed.last().copied();
+    let at_value_position = prev_word_opt
+        .map(|w| {
+            w.starts_with("--")
+                && !w.contains('=')
+                && !node.boolean_flags.contains(w)
+                && (node.value_providers.contains_key(w)
+                    || tree.global_value_providers.contains_key(w)
+                    || node.flag_help_for(w).is_some())
+        })
+        .unwrap_or(false);
+    let effective_tap = if at_value_position { tap_count } else { only };
     // Empty partial at a group boundary → apply the level filter
     // via complete_at_level_only. Otherwise dispatch through
     // complete_at_tap_with_raw so the engine sees raw context.
-    if partial.is_empty() {
-        return complete_at_level_only(tree, words, only);
+    if partial.is_empty() && !at_value_position {
+        return complete_at_level_only(tree, words, effective_tap);
     }
-    complete_at_tap_with_raw(tree, words, only, raw_line, cursor_offset)
+    complete_at_tap_with_raw(tree, words, effective_tap, raw_line, cursor_offset)
 }
 
 /// Maximum [`Node::level`] across the immediate children of `node`,
@@ -1673,6 +1749,14 @@ pub fn complete_at_tap_with_raw(
         && !prev_word.contains('=')
         && !node.boolean_flags.contains(prev_word)
     {
+        // Rapid double-tab at a value position prints the flag's
+        // help text to stderr above the candidate list, so the user
+        // can see what the option actually means without abandoning
+        // the completion.  Stdout still carries the candidates so
+        // bash's COMPREPLY is unaffected. Gate to exactly tap 2 so
+        // a hold-the-tab-key burst doesn't stack the help line
+        // over and over.
+        emit_value_position_help(tree, node, prev_word, tap_count);
         if let Some(provider) = node.value_providers.get(prev_word) {
             return provider(partial, remaining);
         }
@@ -2190,12 +2274,75 @@ pub fn print_partial_parse_for_diagnostics(pp: &PartialParse) {
     print_partial_parse(pp);
 }
 
+/// Render the value-position help annotation. Called once per
+/// `complete_rotating` invocation when the cursor sits after a
+/// value-taking flag. Tier matrix:
+///
+/// | tap_count | what we emit                                                  |
+/// |-----------|---------------------------------------------------------------|
+/// |   1       | nothing — first tap is for candidates                         |
+/// |   2       | short help (`flag_help` / `global_flag_help`)                 |
+/// |   3       | extended help (`flag_long_help`); short if extended missing   |
+/// |  >=4      | nothing — past the rotation, candidate-only again             |
+///
+/// Every emitted annotation leads with a blank line so it drops
+/// below the prompt, prefixes every help line with `# ` so it reads
+/// as a comment, and ends with a one-line ctrl-l hint reminding the
+/// user how to clear it and restore the command-line view.
+fn emit_value_position_help(
+    tree: &CommandTree,
+    node: &Node,
+    prev_word: &str,
+    tap_count: u32,
+) {
+    let (label, body): (&str, &str) = match tap_count {
+        2 => match node
+            .flag_help_for(prev_word)
+            .or_else(|| tree.global_flag_help_for(prev_word))
+        {
+            Some(h) => ("help", h),
+            None => return,
+        },
+        3 => {
+            let extended = node
+                .flag_long_help_for(prev_word)
+                .or_else(|| tree.global_flag_long_help_for(prev_word));
+            match extended {
+                Some(h) => ("detail", h),
+                None => match node
+                    .flag_help_for(prev_word)
+                    .or_else(|| tree.global_flag_help_for(prev_word))
+                {
+                    Some(h) => ("help", h),
+                    None => return,
+                },
+            }
+        }
+        _ => return,
+    };
+    eprintln!();
+    eprintln!("# {prev_word} ({label}):");
+    for line in body.lines() {
+        if line.is_empty() {
+            eprintln!("#");
+        } else {
+            eprintln!("# {line}");
+        }
+    }
+    eprintln!("#");
+    eprintln!("# use ctrl-l to clear help and restore the command line view");
+}
+
 fn dump_tree(node: &Node, path: &mut Vec<String>) {
     let path_str = if path.is_empty() { "/".to_string() } else { format!("/{}", path.join("/")) };
     let category = node.category().unwrap_or("");
     let level = node.level();
-    println!("{path_str}  level={level}  category={category}  flags={:?}  has_subtree_provider={}  has_extras={}",
+    let help_keys: Vec<&String> = node.flag_help.keys().collect();
+    let provider_keys: Vec<&String> = node.value_providers.keys().collect();
+    println!("{path_str}  level={level}  category={category}  flags={:?}  flag_help={:?}  value_providers={:?}  has_subtree_provider={}  has_extras={}",
              node.flags(),
+             help_keys,
+             provider_keys,
              node.subtree_provider().is_some(),
              node.extras().is_some());
     for (name, child) in node.children() {
@@ -2287,8 +2434,31 @@ pub fn handle_complete_env(app_name: &str, tree: &CommandTree) -> bool {
     // forever. Bump the cap so providers that layer their output
     // by tap (e.g. metricsql tap 1 = metric names, tap 2 = + inner
     // functions) actually get a tap_count > 1 on rapid follow-ups.
+    //
+    // Same lift applies at a *value position*: when the previous
+    // word is a value-taking flag (e.g. `--source <TAB>`), the
+    // tree-shape `max_level == 1` would clamp double-tap to tap=1
+    // and the value-position help-to-stderr UX would never fire.
+    // Lift to 2 so a rapid double-tap reaches tap_count == 2 and
+    // emits the help line.
+    let at_value_position = words
+        .iter()
+        .rev()
+        .skip(1) // skip the partial under the cursor
+        .next()
+        .map(|w| {
+            w.starts_with("--")
+                && !w.contains('=')
+                && !max_node.boolean_flags.contains(*w)
+                && max_node.flag_help_for(w).is_some()
+        })
+        .unwrap_or(false);
     let max_level = if path_has_subtree_provider {
         SUBTREE_PROVIDER_MAX_TAPS
+    } else if at_value_position {
+        // 3 layers: tap 1 = candidates only, tap 2 = short help,
+        // tap 3 = extended help. See `emit_value_position_help`.
+        max_level_of_children(max_node).max(1).max(3)
     } else {
         max_level_of_children(max_node).max(1)
     };
@@ -3130,6 +3300,86 @@ mod tests {
         assert!(pos("--summary") < pos("bench"));
         assert!(pos("--summary") < pos("describe"));
         assert!(pos("bench") < pos("describe"));
+    }
+
+    /// Double-tab at a value position must:
+    ///  - leave stdout candidates identical to a single tap, and
+    ///  - emit the flag's help line to stderr (which we can't see
+    ///    in-test, but we *can* assert that the engine takes the
+    ///    help-emitting path without disturbing the stdout list).
+    ///
+    /// The shape contract here is the user-visible promise: bash's
+    /// COMPREPLY is unchanged across rapid taps, and the help line
+    /// goes somewhere that doesn't pollute the candidate stream.
+    #[test]
+    fn rotating_tap2_at_value_position_does_not_pollute_stdout() {
+        let provider: ValueProvider = std::sync::Arc::new(
+            |_partial: &str, _ctx: &[&str]| vec!["L2".into(), "IP".into(), "COSINE".into()],
+        );
+        let leaf = Node::leaf_with_flags(&["--metric"], &[])
+            .with_value_provider("--metric", provider)
+            .with_flag_help("--metric", "Distance metric (L2 / IP / COSINE)");
+        let tree = CommandTree::new("nbrs").command("run", leaf);
+
+        // At a value position (last completed word is the flag,
+        // partial is empty), tap=1 and tap=2 must produce identical
+        // stdout candidate lists.
+        let tap1 = complete_rotating(&tree, &["nbrs", "run", "--metric", ""], 1);
+        let tap2 = complete_rotating(&tree, &["nbrs", "run", "--metric", ""], 2);
+        assert_eq!(tap1, tap2, "rapid double-tap must not change the candidate list");
+        assert!(tap1.contains(&"L2".to_string()));
+    }
+
+    /// At a value position on a leaf with no children, the engine
+    /// must lift `max_level` to 2 so a rapid double-tap reaches
+    /// `tap_count == 2`. Otherwise the help-to-stderr branch in
+    /// the value-position dispatcher never fires.
+    #[test]
+    fn value_position_rapid_tap_reaches_tap_count_two() {
+        // A leaf with one value-taking flag, no children.
+        let leaf = Node::leaf_with_flags(&["--top-k"], &[])
+            .with_flag_help("--top-k", "HeavyHitters top-K capacity")
+            .with_value_provider(
+                "--top-k",
+                std::sync::Arc::new(|_p: &str, _c: &[&str]| Vec::new()),
+            );
+        let _tree = CommandTree::new("nbrs").command("run", leaf.clone());
+
+        // The branch is reached only when the engine grants
+        // `tap_count >= 2`. `next_tap_state` clamps at `max_level`,
+        // so without our value-position lift, a leaf with no
+        // children (max_level = 1) would freeze tap_count at 1
+        // forever. Simulate the lift: max_level=2 → second rapid
+        // tap returns 2.
+        let max_level = 2;
+        let key = "nbrs run --top-k ";
+        let (tap1, st1) = next_tap_state(None, 1_000, key, max_level);
+        assert_eq!(tap1, 1, "first tap is always 1");
+        let (tap2, _st2) = next_tap_state(Some((st1, key)), 1_100, key, max_level);
+        assert_eq!(tap2, 2, "rapid second tap must reach 2 at a value position");
+    }
+
+    /// Flag help registered on a leaf is recoverable via the public
+    /// accessor — guards the wire path that the value-position
+    /// rapid-tap UX depends on.
+    #[test]
+    fn flag_help_round_trips_through_leaf() {
+        let leaf = Node::leaf_with_flags(&["--metric"], &[])
+            .with_flag_help("--metric", "Distance metric");
+        assert_eq!(leaf.flag_help_for("--metric"), Some("Distance metric"));
+        assert!(leaf.flag_help_for("--unknown").is_none());
+    }
+
+    /// Global flag help is recoverable on the CommandTree.
+    #[test]
+    fn global_flag_help_round_trips() {
+        let tree = CommandTree::new("nbrs")
+            .global_flag_help("--dataset", "Dataset name in the configured catalogs");
+        assert_eq!(
+            tree.global_flag_help_for("--dataset"),
+            Some("Dataset name in the configured catalogs"),
+        );
+        assert!(tree.global_flag_help_for("--missing").is_none());
     }
 
     // ---- pure-rule cadence scenarios (no clock, no file I/O) ----

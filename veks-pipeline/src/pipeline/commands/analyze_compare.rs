@@ -486,6 +486,7 @@ impl CommandOp for AnalyzeCompareOp {
                 required: true,
                 default: None,
                 description: "Original/reference fvec file".to_string(),
+                extended_description: None,
                         role: OptionRole::Input,
         },
             OptionDesc {
@@ -494,6 +495,7 @@ impl CommandOp for AnalyzeCompareOp {
                 required: true,
                 default: None,
                 description: "Synthetic/comparison fvec file".to_string(),
+                extended_description: None,
                         role: OptionRole::Input,
         },
             OptionDesc {
@@ -502,6 +504,7 @@ impl CommandOp for AnalyzeCompareOp {
                 required: false,
                 default: Some("0.05".to_string()),
                 description: "Significance level for K-S test".to_string(),
+                extended_description: None,
                         role: OptionRole::Config,
         },
             OptionDesc {
@@ -510,6 +513,7 @@ impl CommandOp for AnalyzeCompareOp {
                 required: false,
                 default: Some("10000".to_string()),
                 description: "Max vectors to sample from each file".to_string(),
+                extended_description: None,
                         role: OptionRole::Config,
         },
             OptionDesc {
@@ -518,6 +522,7 @@ impl CommandOp for AnalyzeCompareOp {
                 required: false,
                 default: Some("false".to_string()),
                 description: "Show all dimensions instead of first 10 + failures".to_string(),
+                extended_description: None,
                         role: OptionRole::Config,
         },
             OptionDesc {
@@ -526,6 +531,7 @@ impl CommandOp for AnalyzeCompareOp {
                 required: false,
                 default: None,
                 description: "Test only this specific dimension".to_string(),
+                extended_description: None,
                         role: OptionRole::Config,
         },
         ]

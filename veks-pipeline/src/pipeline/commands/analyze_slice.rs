@@ -302,6 +302,7 @@ impl CommandOp for AnalyzeSliceOp {
                 required: true,
                 default: None,
                 description: "Input vector file (fvec or ivec)".to_string(),
+                extended_description: None,
                         role: OptionRole::Input,
         },
             OptionDesc {
@@ -310,6 +311,7 @@ impl CommandOp for AnalyzeSliceOp {
                 required: false,
                 default: None,
                 description: "Row range: n, m..n, [m,n), [n], etc.".to_string(),
+                extended_description: None,
                         role: OptionRole::Config,
         },
             OptionDesc {
@@ -318,6 +320,7 @@ impl CommandOp for AnalyzeSliceOp {
                 required: false,
                 default: None,
                 description: "Dimension range within each vector".to_string(),
+                extended_description: None,
                         role: OptionRole::Config,
         },
             OptionDesc {
@@ -326,6 +329,7 @@ impl CommandOp for AnalyzeSliceOp {
                 required: false,
                 default: Some("text".to_string()),
                 description: "Output format: text, csv, tsv, json".to_string(),
+                extended_description: None,
                         role: OptionRole::Config,
         },
             OptionDesc {
@@ -334,6 +338,7 @@ impl CommandOp for AnalyzeSliceOp {
                 required: false,
                 default: Some("100".to_string()),
                 description: "Max vectors to display in text mode".to_string(),
+                extended_description: None,
                         role: OptionRole::Config,
         },
         ]

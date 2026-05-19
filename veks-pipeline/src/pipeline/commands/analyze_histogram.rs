@@ -370,6 +370,7 @@ impl CommandOp for AnalyzeHistogramOp {
                 required: true,
                 default: None,
                 description: "Input fvec file".to_string(),
+                extended_description: None,
                         role: OptionRole::Input,
         },
             OptionDesc {
@@ -378,6 +379,7 @@ impl CommandOp for AnalyzeHistogramOp {
                 required: false,
                 default: Some("0".into()),
                 description: "Dimension index to visualize (0-indexed)".to_string(),
+                extended_description: None,
                         role: OptionRole::Config,
         },
             OptionDesc {
@@ -386,6 +388,7 @@ impl CommandOp for AnalyzeHistogramOp {
                 required: false,
                 default: Some("40".to_string()),
                 description: "Number of histogram bins".to_string(),
+                extended_description: None,
                         role: OptionRole::Config,
         },
             OptionDesc {
@@ -394,6 +397,7 @@ impl CommandOp for AnalyzeHistogramOp {
                 required: false,
                 default: Some("60".to_string()),
                 description: "Width of histogram bars in characters".to_string(),
+                extended_description: None,
                         role: OptionRole::Config,
         },
             OptionDesc {
@@ -402,6 +406,7 @@ impl CommandOp for AnalyzeHistogramOp {
                 required: false,
                 default: None,
                 description: "Max vectors to sample (default: all)".to_string(),
+                extended_description: None,
                         role: OptionRole::Config,
         },
         ]

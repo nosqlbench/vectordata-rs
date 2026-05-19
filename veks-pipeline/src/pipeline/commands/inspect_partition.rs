@@ -549,6 +549,7 @@ fn opt(name: &str, type_name: &str, required: bool, default: Option<&str>, desc:
         required,
         default: default.map(|s| s.to_string()),
         description: desc.to_string(),
+        extended_description: None,
         role: OptionRole::Config,
     }
 }

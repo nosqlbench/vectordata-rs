@@ -25,7 +25,14 @@ use std::io;
 /// Read exactly `buf.len()` bytes from `file` starting at `offset`.
 /// Mirrors `FileExt::read_exact_at` semantics on every platform we
 /// support.
-#[inline]
+///
+/// **`#[inline(always)]`**: this is a per-vector hot-path call site
+/// in `gen_extract`, `compute_dedup`, and `analyze_find_zeros`. The
+/// caller crates have no LTO, so plain `#[inline]` is not always
+/// honored across crate boundaries. Forcing inlining lets the
+/// `#[cfg(unix)]` body fold to a direct `read_exact_at` call with
+/// the per-platform dead-code arms eliminated.
+#[inline(always)]
 pub fn pread_exact(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
     #[cfg(unix)]
     {
@@ -63,7 +70,7 @@ pub fn pread_exact(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
 /// Mirrors `FileExt::read_at` semantics on every platform we
 /// support — does NOT loop, lets the caller decide what to do
 /// with a short read.
-#[inline]
+#[inline(always)]
 pub fn pread(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
     #[cfg(unix)]
     {
@@ -87,7 +94,7 @@ pub fn pread(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
 
 /// Write all of `buf` to `file` starting at `offset`. Mirrors
 /// `FileExt::write_all_at` semantics on every platform we support.
-#[inline]
+#[inline(always)]
 pub fn pwrite_all(file: &File, buf: &[u8], offset: u64) -> io::Result<()> {
     #[cfg(unix)]
     {

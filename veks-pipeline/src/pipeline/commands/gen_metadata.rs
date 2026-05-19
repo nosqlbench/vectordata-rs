@@ -252,35 +252,41 @@ compatible with `generate predicates` and `compute evaluate-predicates`.
             OptionDesc {
                 name: "output".into(), type_name: "Path".into(), required: true,
                 default: None, description: "Output slab file".into(),
+            extended_description: None,
                 role: OptionRole::Output,
             },
             OptionDesc {
                 name: "count".into(), type_name: "int".into(), required: true,
                 default: None, description: "Number of metadata records to generate".into(),
+            extended_description: None,
                 role: OptionRole::Config,
             },
             OptionDesc {
                 name: "fields".into(), type_name: "int".into(), required: false,
                 default: Some("3".into()),
                 description: "Number of integer fields per record".into(),
+                extended_description: None,
                 role: OptionRole::Config,
             },
             OptionDesc {
                 name: "range-min".into(), type_name: "int".into(), required: false,
                 default: Some("0".into()),
                 description: "Minimum value (inclusive) for uniform integer distribution".into(),
+                extended_description: None,
                 role: OptionRole::Config,
             },
             OptionDesc {
                 name: "range-max".into(), type_name: "int".into(), required: false,
                 default: Some("1000".into()),
                 description: "Maximum value (exclusive) for uniform integer distribution".into(),
+                extended_description: None,
                 role: OptionRole::Config,
             },
             OptionDesc {
                 name: "seed".into(), type_name: "int".into(), required: false,
                 default: Some("42".into()),
                 description: "Random seed for reproducibility".into(),
+                extended_description: None,
                 role: OptionRole::Config,
             },
         ]

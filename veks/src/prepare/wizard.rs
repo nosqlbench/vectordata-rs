@@ -423,10 +423,7 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
         Some(bv.clone())
     } else {
         let vector_candidates: Vec<&(PathBuf, String, u64)> = candidates.iter()
-            .filter(|(_, fmt, _)| {
-                let f = fmt.as_str();
-                VECTOR_FORMATS.contains(&f) || f == "npy"
-            })
+            .filter(|(_, fmt, _)| is_recognized_vector_format(fmt.as_str()))
             .collect();
 
         if vector_candidates.len() == 1 {
@@ -543,16 +540,14 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
             println!("       Each record gets integer fields in a range.");
             println!("       Predicates are single-field equality checks.");
             println!();
-            println!("    2. Conjugate & selectivity synthesis (not yet implemented)");
-            println!("       Compound AND/OR predicates with selectivity control.");
+            println!("    2. Compound predicates with selectivity targeting");
+            println!("       Synthesizes metadata, surveys it (`analyze survey`,");
+            println!("       sysref §13), then generates compound AND predicates");
+            println!("       whose combined selectivity hits a configured target");
+            println!("       (`generate predicates --mode=survey --strategy=compound`).");
             println!();
 
             let mode_choice = prompt_with_default("Synthesis mode [1/2]", "1");
-
-            if mode_choice == "2" {
-                println!("  Conjugate synthesis is not yet implemented.");
-                println!("  Falling back to simple integer equality.");
-            }
 
             if mode_choice == "1" || mode_choice == "2" {
                 println!();
@@ -611,7 +606,24 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
                 // Stash predicate config for later — avoids redundant prompts
                 simple_int_eq_predicate_count = Some(pred_count);
 
-                (None, true, "simple-int-eq".into(), format, fields, rmin, rmax, pred_rmin, pred_rmax)
+                // Synthesis mode:
+                //   1 → simple-int-eq (each predicate is `field == value`)
+                //   2 → compound (per-field range predicates AND'd together,
+                //       sized to hit the configured selectivity target;
+                //       drives `gen metadata → analyze survey → generate
+                //       predicates --mode=survey --strategy=compound`)
+                let mode = if mode_choice == "2" { "compound" } else { "simple-int-eq" };
+                if mode == "compound" {
+                    println!();
+                    println!("  Compound synthesis configured. The pipeline will:");
+                    println!("    - synthesize the metadata slab from the range above,");
+                    println!("    - run `analyze survey` (two-pass, type-aware),");
+                    println!("    - emit `generate predicates --mode=survey --strategy=compound`");
+                    println!("      so predicate selectivity hits the dataset's");
+                    println!("      `--selectivity` target (default 0.0001; override on");
+                    println!("      the bootstrap command line if needed).");
+                }
+                (None, true, mode.into(), format, fields, rmin, rmax, pred_rmin, pred_rmax)
             } else {
                 // User entered something unexpected — drop M facets
                 println!("  Dropping M facet (no metadata source).");
@@ -843,11 +855,21 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
         }
     };
 
-    // Predicate configuration — skip if already configured by simple-int-eq synthesis
+    // Predicate configuration — skip if already configured by simple-int-eq
+    // or compound synthesis. Compound mode wires `--strategy=compound`
+    // through so `generate predicates` uses the survey for
+    // selectivity-targeted compound AND-predicates (§13.7).
     let (selectivity, predicate_count, predicate_strategy) = if let Some(count) = simple_int_eq_predicate_count {
-        // Simple-int-eq: strategy is always "eq", selectivity is 1/range
         let range = (metadata_range_max - metadata_range_min).max(1) as f64;
-        (1.0 / range, count, "eq".to_string())
+        if synthesis_mode == "compound" {
+            // Compound: keep a meaningful baseline selectivity; the
+            // generator's compound strategy uses the survey to size
+            // per-field selectivity so the joint hits this target.
+            (0.0001, count, "compound".to_string())
+        } else {
+            // simple-int-eq: strategy is always "eq", selectivity is 1/range.
+            (1.0 / range, count, "eq".to_string())
+        }
     } else if confirmed_facets.contains('P') {
         // Non-synthesis predicates — full configuration prompt
         println!();
@@ -1900,16 +1922,36 @@ impl DetectedRoles {
 /// in `is_slab_or_parquet` for `MetadataContent` detection, and that arm
 /// runs first in the role-assignment chain, so parquet files named with
 /// `metadata` still resolve to metadata rather than to base vectors.
-const VECTOR_FORMATS: &[&str] = &[
-    "fvec", "ivec", "mvec", "bvec", "dvec", "svec", "npy", "parquet",
-    "fvvec", "ivvec", "mvvec", "bvvec", "dvvec", "svvec",
-    "i8vec", "u16vec", "i32vec", "u32vec", "i64vec", "u64vec",
-    "i8vvec", "u16vvec", "i32vvec", "u32vvec", "i64vvec", "u64vvec",
-    "f16vec", "f32vec", "f64vec", "f16vvec", "f32vvec", "f64vvec",
-    "u8vec",
-];
-const FLOAT_VECTOR_FORMATS: &[&str] = &["fvec", "dvec", "mvec", "fvvec", "dvvec", "mvvec",
-    "f16vec", "f32vec", "f64vec", "f16vvec", "f32vvec", "f64vvec"];
+/// Recognized as a "vector" format for base/query role detection.
+///
+/// Accepts any singular or plural xvec/vvec extension plus the container
+/// formats `npy` and `parquet`. Routes through [`VecFormat::from_extension`]
+/// so it stays in sync with the full set of supported formats.
+fn is_recognized_vector_format(s: &str) -> bool {
+    match VecFormat::from_extension(s) {
+        Some(f) => f.is_xvec() || matches!(f, VecFormat::Npy | VecFormat::Parquet),
+        None => false,
+    }
+}
+
+/// Recognized as a float-element xvec format (for `neighbor_distances`
+/// role detection).
+fn is_float_vector_format(s: &str) -> bool {
+    match VecFormat::from_extension(s) {
+        Some(f) => f.is_xvec() && !f.is_integer(),
+        None => false,
+    }
+}
+
+/// Recognized as an integer xvec format (for `neighbor_indices` role
+/// detection). vvec variants are excluded — neighbor index files are
+/// uniform-dimension by definition.
+fn is_integer_xvec_format(s: &str) -> bool {
+    match VecFormat::from_extension(s) {
+        Some(f) => f.is_uniform_xvec() && f.is_integer(),
+        None => false,
+    }
+}
 
 /// Detect file roles from filename keyword hints.
 ///
@@ -1949,9 +1991,9 @@ pub(crate) fn detect_roles(candidates: &[(PathBuf, String, u64)]) -> DetectedRol
         // Strip leading `_` prefix (source files renamed by prior import)
         let stem = stem.strip_prefix('_').unwrap_or(&stem);
         let fmt_str = fmt.as_str();
-        let is_vector = VECTOR_FORMATS.contains(&fmt_str);
-        let is_float_vector = FLOAT_VECTOR_FORMATS.contains(&fmt_str);
-        let is_ivec = fmt_str == "ivec";
+        let is_vector = is_recognized_vector_format(fmt_str);
+        let is_float_vector = is_float_vector_format(fmt_str);
+        let is_ivec = is_integer_xvec_format(fmt_str);
         let is_slab = fmt_str == "slab";
         let is_slab_or_parquet = is_slab || fmt_str == "parquet";
 
@@ -2080,9 +2122,14 @@ fn scan_candidates(dir: &Path) -> Vec<(PathBuf, String, u64)> {
         {
             continue;
         }
-        // Skip pipeline-generated artifact names. These are canonical facet
-        // output names that the pipeline produces — not source data.
-        {
+        // Skip canonical pipeline-output filenames only when they are
+        // symlinks. The original intent was to avoid double-counting a
+        // prior-bootstrap symlink alongside its donor source file (e.g.
+        // `base_vectors.fvec` -> `_sift_base.fvec`). When the canonical
+        // name is a real file — as produced by `vectordata datasets
+        // derive` or by hand-curated datasets — it is legitimate input
+        // and must be detected.
+        if std::fs::symlink_metadata(&path).map(|m| m.file_type().is_symlink()).unwrap_or(false) {
             let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
             if matches!(stem,
                 "base_vectors" | "base_vectors_raw"
@@ -2389,6 +2436,115 @@ mod tests {
         assert_eq!(results.len(), 2, "should only find 2 data files");
     }
 
+    /// Write a minimal half-precision xvec (`.mvecs`) file: `[i32 dim, dim*2 bytes]`.
+    fn write_mvecs(path: &Path, records: usize, dim: u32) {
+        use std::io::Write;
+        let f = std::fs::File::create(path).unwrap();
+        let mut w = std::io::BufWriter::new(f);
+        for _ in 0..records {
+            w.write_all(&(dim as i32).to_le_bytes()).unwrap();
+            for _ in 0..dim {
+                w.write_all(&[0u8, 0u8]).unwrap();
+            }
+        }
+        w.flush().unwrap();
+    }
+
+    /// End-to-end regression: a `.mvecs` (canonical plural xvec extension)
+    /// file on disk should round-trip through `scan_candidates` and
+    /// `detect_roles` with the correct role assignment.
+    #[test]
+    fn scan_plus_detect_recognizes_mvecs_as_base() {
+        let dir = tempfile::tempdir().unwrap();
+        write_mvecs(&dir.path().join("base_train.mvecs"), 4, 8);
+        write_mvecs(&dir.path().join("query_test.mvecs"), 2, 8);
+
+        let cands = scan_candidates(dir.path());
+        assert_eq!(cands.len(), 2, "scan should find both .mvecs files: {:?}", cands);
+        for (_, fmt, _) in &cands {
+            assert_eq!(fmt, "mvec", "scan should normalize fmt to canonical name");
+        }
+
+        let roles = detect_roles(&cands);
+        assert!(
+            roles.base_vectors.as_ref().is_some_and(|p| p.ends_with("base_train.mvecs")),
+            "base_train.mvecs should be detected as base_vectors, got {:?}", roles.base_vectors,
+        );
+        assert!(
+            roles.query_vectors.as_ref().is_some_and(|p| p.ends_with("query_test.mvecs")),
+            "query_test.mvecs should be detected as query_vectors, got {:?}", roles.query_vectors,
+        );
+    }
+
+    /// Regression for the scenario reported on derived datasets (output
+    /// of `vectordata datasets derive`): the dataset directory contains
+    /// real files with the canonical pipeline-output names
+    /// (`base_vectors.mvecs`, `query_vectors.mvecs`,
+    /// `neighbor_indices.ivecs`, `neighbor_distances.fvecs`) and no
+    /// donor source files. Bootstrap previously skipped these names
+    /// unconditionally, producing "No recognized data files found".
+    /// They must now be detected because they are real files (not
+    /// symlinks back to a donor tree).
+    #[test]
+    fn scan_recognizes_canonical_names_when_not_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        write_mvecs(&dir.path().join("base_vectors.mvecs"), 4, 8);
+        write_mvecs(&dir.path().join("query_vectors.mvecs"), 2, 8);
+        // ivec record: [i32 dim, dim*4 bytes]
+        {
+            use std::io::Write;
+            let f = std::fs::File::create(dir.path().join("neighbor_indices.ivecs")).unwrap();
+            let mut w = std::io::BufWriter::new(f);
+            for _ in 0..2 {
+                w.write_all(&8i32.to_le_bytes()).unwrap();
+                for _ in 0..8 { w.write_all(&0i32.to_le_bytes()).unwrap(); }
+            }
+            w.flush().unwrap();
+        }
+        // fvec record: [i32 dim, dim*4 bytes]
+        {
+            use std::io::Write;
+            let f = std::fs::File::create(dir.path().join("neighbor_distances.fvecs")).unwrap();
+            let mut w = std::io::BufWriter::new(f);
+            for _ in 0..2 {
+                w.write_all(&8i32.to_le_bytes()).unwrap();
+                for _ in 0..8 { w.write_all(&0f32.to_le_bytes()).unwrap(); }
+            }
+            w.flush().unwrap();
+        }
+
+        let cands = scan_candidates(dir.path());
+        let names: Vec<String> = cands.iter()
+            .map(|(p, _, _)| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(cands.len(), 4, "all four canonical files should be found, got {:?}", names);
+
+        let roles = detect_roles(&cands);
+        assert!(roles.base_vectors.as_ref().is_some_and(|p| p.ends_with("base_vectors.mvecs")));
+        assert!(roles.query_vectors.as_ref().is_some_and(|p| p.ends_with("query_vectors.mvecs")));
+        assert!(roles.neighbor_indices.as_ref().is_some_and(|p| p.ends_with("neighbor_indices.ivecs")));
+        assert!(roles.neighbor_distances.as_ref().is_some_and(|p| p.ends_with("neighbor_distances.fvecs")));
+    }
+
+    /// Conversely, a symlink with a canonical pipeline-output name
+    /// pointing at a donor file is still skipped, so the donor (its
+    /// underscore-prefixed source) is the single unambiguous candidate.
+    #[cfg(unix)]
+    #[test]
+    fn scan_skips_canonical_named_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let donor = dir.path().join("_sift_base.fvec");
+        write_fvec(&donor, 3, 4);
+        std::os::unix::fs::symlink(&donor, dir.path().join("base_vectors.fvec")).unwrap();
+
+        let cands = scan_candidates(dir.path());
+        let names: Vec<String> = cands.iter()
+            .map(|(p, _, _)| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["_sift_base.fvec".to_string()],
+            "symlink with canonical name should be skipped, leaving only the donor");
+    }
+
     #[test]
     fn scan_finds_npy_directory() {
         let dir = tempfile::tempdir().unwrap();
@@ -2572,6 +2728,43 @@ mod tests {
     /// detected as the base-vectors source. Regression: before parquet was
     /// added to VECTOR_FORMATS, the `has_base && is_vector` arm in
     /// `detect_roles` rejected parquet and the user had to assign it by hand.
+    /// Plural-extension regression: a file scanned as `.mvecs` (canonical
+    /// plural xvec extension) should be detected with the same role as its
+    /// singular `.mvec` counterpart. `scan_candidates` normalizes the fmt
+    /// string to [`VecFormat::name`] (singular), but this test exercises
+    /// both the singular and plural fmt strings through `detect_roles` to
+    /// catch any future divergence.
+    #[test]
+    fn detect_roles_accepts_plural_xvec_extensions() {
+        for fmt in ["mvec", "mvecs", "fvec", "fvecs", "i8vecs", "u32vecs"] {
+            let candidates = make_candidates(&[("base_test.bin", fmt)]);
+            let roles = detect_roles(&candidates);
+            assert_eq!(
+                roles.base_vectors.as_deref(),
+                Some(Path::new("base_test.bin")),
+                "base detection failed for fmt={}", fmt,
+            );
+        }
+        for fmt in ["ivec", "ivecs", "i32vecs", "i64vecs"] {
+            let candidates = make_candidates(&[("gt_neighbors.bin", fmt)]);
+            let roles = detect_roles(&candidates);
+            assert_eq!(
+                roles.neighbor_indices.as_deref(),
+                Some(Path::new("gt_neighbors.bin")),
+                "neighbor-indices detection failed for fmt={}", fmt,
+            );
+        }
+        for fmt in ["fvec", "fvecs", "mvecs", "dvecs"] {
+            let candidates = make_candidates(&[("distances.bin", fmt)]);
+            let roles = detect_roles(&candidates);
+            assert_eq!(
+                roles.neighbor_distances.as_deref(),
+                Some(Path::new("distances.bin")),
+                "neighbor-distances detection failed for fmt={}", fmt,
+            );
+        }
+    }
+
     #[test]
     fn detect_roles_parquet_base_vectors() {
         let candidates = make_candidates(&[

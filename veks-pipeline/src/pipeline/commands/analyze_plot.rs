@@ -495,6 +495,7 @@ impl CommandOp for AnalyzePlotOp {
                 default: None,
                 description: "Input fvec file(s), semicolon-separated for multiple series"
                     .to_string(),
+            extended_description: None,
                 role: OptionRole::Input,
             },
             OptionDesc {
@@ -503,6 +504,7 @@ impl CommandOp for AnalyzePlotOp {
                 required: false,
                 default: Some("0".to_string()),
                 description: "Comma-separated dimension indices to plot".to_string(),
+                extended_description: None,
                         role: OptionRole::Config,
         },
             OptionDesc {
@@ -511,6 +513,7 @@ impl CommandOp for AnalyzePlotOp {
                 required: false,
                 default: Some("histogram".to_string()),
                 description: "Plot type: histogram or scatter".to_string(),
+                extended_description: None,
                         role: OptionRole::Config,
         },
             OptionDesc {
@@ -519,6 +522,7 @@ impl CommandOp for AnalyzePlotOp {
                 required: false,
                 default: Some("80".to_string()),
                 description: "Plot width in character columns".to_string(),
+                extended_description: None,
                         role: OptionRole::Config,
         },
             OptionDesc {
@@ -527,6 +531,7 @@ impl CommandOp for AnalyzePlotOp {
                 required: false,
                 default: Some("20".to_string()),
                 description: "Plot height in character rows".to_string(),
+                extended_description: None,
                         role: OptionRole::Config,
         },
             OptionDesc {
@@ -536,6 +541,7 @@ impl CommandOp for AnalyzePlotOp {
                 default: None,
                 description: "Number of histogram bins (default: auto via Sturges' rule)"
                     .to_string(),
+            extended_description: None,
                 role: OptionRole::Config,
             },
             OptionDesc {
@@ -544,6 +550,7 @@ impl CommandOp for AnalyzePlotOp {
                 required: false,
                 default: Some("10000".to_string()),
                 description: "Max vectors to sample".to_string(),
+                extended_description: None,
                         role: OptionRole::Config,
         },
             OptionDesc {
@@ -552,6 +559,7 @@ impl CommandOp for AnalyzePlotOp {
                 required: false,
                 default: Some("42".to_string()),
                 description: "PRNG seed for sampling".to_string(),
+                extended_description: None,
                         role: OptionRole::Config,
         },
         ]

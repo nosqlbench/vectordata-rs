@@ -301,6 +301,7 @@ byte-identical shuffle results.
                 required: true,
                 default: None,
                 description: "Source fvec file".to_string(),
+                extended_description: None,
                 role: OptionRole::Input,
             },
             OptionDesc {
@@ -309,6 +310,7 @@ byte-identical shuffle results.
                 required: true,
                 default: None,
                 description: "Output sorted unique ordinals (ivec)".to_string(),
+                extended_description: None,
                 role: OptionRole::Output,
             },
             OptionDesc {
@@ -317,6 +319,7 @@ byte-identical shuffle results.
                 required: false,
                 default: None,
                 description: "Output duplicate ordinals (ivec)".to_string(),
+                extended_description: None,
                 role: OptionRole::Output,
             },
         ]

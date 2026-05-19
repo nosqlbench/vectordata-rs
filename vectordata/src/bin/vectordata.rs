@@ -129,6 +129,46 @@ enum CacheCmd {
 
 #[derive(Subcommand)]
 enum DatasetsCmd {
+    /// Materialize a profile of an existing dataset into a new,
+    /// self-standing dataset directory.
+    ///
+    /// Where `prebuffer` brings a profile's bytes into the cache
+    /// (still resolved through the parent dataset.yaml), `derive`
+    /// copies them out into a fresh directory with its own
+    /// dataset.yaml — including flattening any windowed views into
+    /// their own files, so the result has no ties back to the
+    /// donor dataset.
+    Derive {
+        /// Source dataset: catalog name, local directory containing
+        /// `dataset.yaml`, path to a `dataset.yaml` file, or HTTPS URL.
+        /// Local directories take a fast path that bypasses the
+        /// runtime cache + access layer entirely.
+        #[arg(long)]
+        dataset: String,
+        /// Profile to derive. Required.
+        #[arg(long)]
+        profile: String,
+        /// Output directory for the new dataset.
+        #[arg(long, short = 'o')]
+        output: PathBuf,
+        /// Override the derived dataset's name (default:
+        /// `<source>-<profile>`).
+        #[arg(long)]
+        name: Option<String>,
+        /// Overwrite the output directory if it already exists.
+        #[arg(long)]
+        force: bool,
+        /// Configuration directory containing `catalogs.yaml`
+        /// (only used when `--dataset` is a catalog name).
+        #[arg(long, default_value = "~/.config/vectordata")]
+        configdir: String,
+        /// Additional catalog directories, file paths, or HTTP URLs.
+        #[arg(long)]
+        catalog: Vec<String>,
+        /// Catalog URLs or paths to use *instead* of configured catalogs.
+        #[arg(long = "at")]
+        at: Vec<String>,
+    },
     /// Download and cache every facet of a dataset profile into the
     /// configured cache directory. Renders a live per-facet +
     /// aggregate progress meter on stderr.
@@ -222,6 +262,11 @@ fn main() {
         },
         Cmd::Datasets { command } => {
             let code = match command {
+                DatasetsCmd::Derive {
+                    dataset, profile, output, name, force, configdir, catalog, at,
+                } => vectordata::datasets::derive::run(
+                    &dataset, &profile, &output, &configdir, &catalog, &at,
+                    name.as_deref(), force),
                 DatasetsCmd::Prebuffer { spec, configdir, catalog, at, cache_dir } => {
                     vectordata::datasets::prebuffer::run(
                         &spec, &configdir, &catalog, &at, cache_dir.as_deref())

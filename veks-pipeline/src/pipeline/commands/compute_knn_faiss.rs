@@ -411,6 +411,7 @@ Only f32 (fvec) inputs are supported.
                 required: true,
                 default: None,
                 description: "Base vectors file (fvec only)".to_string(),
+                extended_description: None,
                 role: OptionRole::Input,
             },
             OptionDesc {
@@ -419,6 +420,7 @@ Only f32 (fvec) inputs are supported.
                 required: true,
                 default: None,
                 description: "Query vectors file (fvec only)".to_string(),
+                extended_description: None,
                 role: OptionRole::Input,
             },
             OptionDesc {
@@ -427,6 +429,7 @@ Only f32 (fvec) inputs are supported.
                 required: true,
                 default: None,
                 description: "Output neighbor indices (ivec)".to_string(),
+                extended_description: None,
                 role: OptionRole::Output,
             },
             OptionDesc {
@@ -435,6 +438,7 @@ Only f32 (fvec) inputs are supported.
                 required: false,
                 default: None,
                 description: "Output neighbor distances (fvec)".to_string(),
+                extended_description: None,
                 role: OptionRole::Output,
             },
             OptionDesc {
@@ -443,6 +447,7 @@ Only f32 (fvec) inputs are supported.
                 required: true,
                 default: None,
                 description: "Number of nearest neighbors (k)".to_string(),
+                extended_description: None,
                 role: OptionRole::Config,
             },
             OptionDesc {
@@ -451,6 +456,7 @@ Only f32 (fvec) inputs are supported.
                 required: false,
                 default: Some("L2".to_string()),
                 description: "Distance metric: L2, DOT_PRODUCT, COSINE, IP".to_string(),
+                extended_description: None,
                 role: OptionRole::Config,
             },
             // Accept but ignore options from compute-knn for drop-in compatibility
@@ -460,6 +466,7 @@ Only f32 (fvec) inputs are supported.
                 required: false,
                 default: Some("false".to_string()),
                 description: "Whether vectors are normalized (accepted for compatibility)".to_string(),
+                extended_description: None,
                 role: OptionRole::Config,
             },
             OptionDesc {
@@ -468,6 +475,7 @@ Only f32 (fvec) inputs are supported.
                 required: false,
                 default: Some("0".to_string()),
                 description: "Ignored (FAISS uses OpenMP threads)".to_string(),
+                extended_description: None,
                 role: OptionRole::Config,
             },
             OptionDesc {
@@ -476,6 +484,7 @@ Only f32 (fvec) inputs are supported.
                 required: false,
                 default: None,
                 description: "Ignored (FAISS indexes all base vectors at once)".to_string(),
+                extended_description: None,
                 role: OptionRole::Config,
             },
             OptionDesc {
@@ -484,6 +493,7 @@ Only f32 (fvec) inputs are supported.
                 required: false,
                 default: Some("false".to_string()),
                 description: "Ignored (no partition cache with FAISS)".to_string(),
+                extended_description: None,
                 role: OptionRole::Config,
             },
         ]

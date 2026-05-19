@@ -987,6 +987,7 @@ shuffle, KNN, or metadata alignment. The output index can be fed to
                 required: true,
                 default: None,
                 description: "Input fvec file".to_string(),
+                extended_description: None,
                 role: OptionRole::Input,
         },
             OptionDesc {
@@ -995,6 +996,7 @@ shuffle, KNN, or metadata alignment. The output index can be fed to
                 required: true,
                 default: None,
                 description: "Output ivec file (sorted ordinal index)".to_string(),
+                extended_description: None,
                 role: OptionRole::Output,
         },
             OptionDesc {
@@ -1003,6 +1005,7 @@ shuffle, KNN, or metadata alignment. The output index can be fed to
                 required: false,
                 default: Some("<output>_duplicates.ivec".to_string()),
                 description: "Output ivec file containing ordinals of duplicate vectors".to_string(),
+                extended_description: None,
                 role: OptionRole::Output,
         },
             OptionDesc {
@@ -1011,6 +1014,7 @@ shuffle, KNN, or metadata alignment. The output index can be fed to
                 required: false,
                 default: Some("<output>.json".to_string()),
                 description: "JSON report with duplicate statistics".to_string(),
+                extended_description: None,
                 role: OptionRole::Output,
         },
             OptionDesc {
@@ -1019,6 +1023,7 @@ shuffle, KNN, or metadata alignment. The output index can be fed to
                 required: false,
                 default: Some("true".to_string()),
                 description: "Remove duplicates from the output index".to_string(),
+                extended_description: None,
                 role: OptionRole::Config,
         },
             OptionDesc {
@@ -1027,6 +1032,7 @@ shuffle, KNN, or metadata alignment. The output index can be fed to
                 required: false,
                 default: Some(DEFAULT_BATCH_SIZE.to_string()),
                 description: "Vectors per sorted run".to_string(),
+                extended_description: None,
                 role: OptionRole::Config,
         },
             OptionDesc {
@@ -1035,6 +1041,7 @@ shuffle, KNN, or metadata alignment. The output index can be fed to
                 required: false,
                 default: Some("0".to_string()),
                 description: "Cache compression level (0=raw, 1-9=gzip)".to_string(),
+                extended_description: None,
                 role: OptionRole::Config,
         },
         ]

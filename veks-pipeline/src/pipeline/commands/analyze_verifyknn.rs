@@ -533,6 +533,7 @@ impl CommandOp for AnalyzeVerifyKnnOp {
                 required: true,
                 default: None,
                 description: "Base vectors file (fvec)".to_string(),
+                extended_description: None,
                         role: OptionRole::Input,
         },
             OptionDesc {
@@ -541,6 +542,7 @@ impl CommandOp for AnalyzeVerifyKnnOp {
                 required: true,
                 default: None,
                 description: "Query vectors file (fvec)".to_string(),
+                extended_description: None,
                         role: OptionRole::Input,
         },
             OptionDesc {
@@ -549,6 +551,7 @@ impl CommandOp for AnalyzeVerifyKnnOp {
                 required: true,
                 default: None,
                 description: "Precomputed neighbor indices (ivec)".to_string(),
+                extended_description: None,
                         role: OptionRole::Input,
         },
             OptionDesc {
@@ -557,6 +560,7 @@ impl CommandOp for AnalyzeVerifyKnnOp {
                 required: false,
                 default: Some("L2".to_string()),
                 description: "Distance metric: L2, COSINE, DOT_PRODUCT, L1".to_string(),
+                extended_description: None,
                         role: OptionRole::Config,
         },
             OptionDesc {
@@ -565,6 +569,7 @@ impl CommandOp for AnalyzeVerifyKnnOp {
                 required: false,
                 default: Some("0.001".to_string()),
                 description: "Floating-point tolerance for distance comparison".to_string(),
+                extended_description: None,
                         role: OptionRole::Config,
         },
             OptionDesc {
@@ -573,6 +578,7 @@ impl CommandOp for AnalyzeVerifyKnnOp {
                 required: false,
                 default: None,
                 description: "Query range to verify (e.g. '0..100')".to_string(),
+                extended_description: None,
                         role: OptionRole::Config,
         },
         ]

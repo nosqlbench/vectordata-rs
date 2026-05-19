@@ -289,6 +289,7 @@ vector ordering exactly.
                 required: true,
                 default: None,
                 description: "Output ivec file path".to_string(),
+                extended_description: None,
                 role: OptionRole::Output,
             },
             OptionDesc {
@@ -297,6 +298,7 @@ vector ordering exactly.
                 required: true,
                 default: None,
                 description: "Number of elements to shuffle (0 to interval-1)".to_string(),
+                extended_description: None,
                 role: OptionRole::Config,
             },
             OptionDesc {
@@ -305,6 +307,7 @@ vector ordering exactly.
                 required: false,
                 default: Some("42".to_string()),
                 description: "Random seed (numpy-compatible MT19937, default 42)".to_string(),
+                extended_description: None,
                 role: OptionRole::Config,
             },
             OptionDesc {
@@ -313,6 +316,7 @@ vector ordering exactly.
                 required: false,
                 default: None,
                 description: "Ordinals ivec to shuffle (if omitted, shuffles [0, interval))".to_string(),
+                extended_description: None,
                 role: OptionRole::Input,
             },
             OptionDesc {
@@ -321,6 +325,7 @@ vector ordering exactly.
                 required: false,
                 default: None,
                 description: "Load PRNG state from file (continue from previous shuffle)".to_string(),
+                extended_description: None,
                 role: OptionRole::Input,
             },
             OptionDesc {
@@ -329,6 +334,7 @@ vector ordering exactly.
                 required: false,
                 default: None,
                 description: "Save PRNG state after shuffle (for chaining to next shuffle)".to_string(),
+                extended_description: None,
                 role: OptionRole::Output,
             },
         ]

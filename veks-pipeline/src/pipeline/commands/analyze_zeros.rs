@@ -267,6 +267,7 @@ impl CommandOp for AnalyzeZerosOp {
                 required: true,
                 default: None,
                 description: "Input vector file (fvec, mvec, dvec, ivec, etc.)".to_string(),
+                extended_description: None,
                 role: OptionRole::Input,
             },
             OptionDesc {
@@ -276,6 +277,7 @@ impl CommandOp for AnalyzeZerosOp {
                 default: None,
                 description: "Output ivec of near-zero vector ordinals for downstream clean steps"
                     .to_string(),
+            extended_description: None,
                 role: OptionRole::Output,
             },
             OptionDesc {
@@ -285,6 +287,7 @@ impl CommandOp for AnalyzeZerosOp {
                 default: Some("1e-06".to_string()),
                 description: "L2-norm threshold below which a vector is classified as near-zero (SRD §19)"
                     .to_string(),
+            extended_description: None,
                 role: OptionRole::Config,
             },
         ]

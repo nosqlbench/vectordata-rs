@@ -327,6 +327,7 @@ data.
                 required: false,
                 default: None,
                 description: "Output file path (or use --append)".to_string(),
+                extended_description: None,
                         role: OptionRole::Output,
         },
             OptionDesc {
@@ -335,6 +336,7 @@ data.
                 required: true,
                 default: None,
                 description: "Vector dimensionality".to_string(),
+                extended_description: None,
                         role: OptionRole::Config,
         },
             OptionDesc {
@@ -343,6 +345,7 @@ data.
                 required: true,
                 default: None,
                 description: "Number of vectors to generate".to_string(),
+                extended_description: None,
                         role: OptionRole::Config,
         },
             OptionDesc {
@@ -351,6 +354,7 @@ data.
                 required: false,
                 default: Some("float[]".to_string()),
                 description: "Element type: float[], int[], double[], byte[], half, short[]".to_string(),
+                extended_description: None,
                         role: OptionRole::Config,
         },
             OptionDesc {
@@ -359,6 +363,7 @@ data.
                 required: false,
                 default: Some("0".to_string()),
                 description: "Random seed for reproducibility".to_string(),
+                extended_description: None,
                         role: OptionRole::Config,
         },
             OptionDesc {
@@ -367,6 +372,7 @@ data.
                 required: false,
                 default: Some("-1.0".to_string()),
                 description: "Minimum value for float/double elements".to_string(),
+                extended_description: None,
                         role: OptionRole::Config,
         },
             OptionDesc {
@@ -375,6 +381,7 @@ data.
                 required: false,
                 default: Some("1.0".to_string()),
                 description: "Maximum value for float/double elements".to_string(),
+                extended_description: None,
                         role: OptionRole::Config,
         },
             OptionDesc {
@@ -383,6 +390,7 @@ data.
                 required: false,
                 default: Some("0.0".to_string()),
                 description: "Fraction of vectors to replace with zero vectors (0.0-1.0)".to_string(),
+                extended_description: None,
                         role: OptionRole::Config,
         },
             OptionDesc {
@@ -391,6 +399,7 @@ data.
                 required: false,
                 default: Some("0.0".to_string()),
                 description: "Fraction of vectors to replace with duplicates of earlier vectors (0.0-1.0)".to_string(),
+                extended_description: None,
                         role: OptionRole::Config,
         },
             OptionDesc {
@@ -399,6 +408,7 @@ data.
                 required: false,
                 default: None,
                 description: "Append to an existing vector file (matches its dimensionality)".to_string(),
+                extended_description: None,
                         role: OptionRole::Input,
         },
         ]

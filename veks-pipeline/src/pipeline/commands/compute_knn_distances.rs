@@ -144,6 +144,7 @@ recover them this way.
                 required: true,
                 default: None,
                 description: "Base vectors (.fvec or .mvec)".into(),
+                extended_description: None,
                 role: OptionRole::Input,
             },
             OptionDesc {
@@ -152,6 +153,7 @@ recover them this way.
                 required: true,
                 default: None,
                 description: "Query vectors (.fvec or .mvec)".into(),
+                extended_description: None,
                 role: OptionRole::Input,
             },
             OptionDesc {
@@ -160,6 +162,7 @@ recover them this way.
                 required: true,
                 default: None,
                 description: "Existing neighbor indices (.ivec)".into(),
+                extended_description: None,
                 role: OptionRole::Input,
             },
             OptionDesc {
@@ -168,6 +171,7 @@ recover them this way.
                 required: true,
                 default: None,
                 description: "Output distances file (.fvec)".into(),
+                extended_description: None,
                 role: OptionRole::Output,
             },
             OptionDesc {
@@ -176,6 +180,7 @@ recover them this way.
                 required: false,
                 default: Some("IP".into()),
                 description: "L2, IP/DOT, COSINE, or L1".into(),
+                extended_description: None,
                 role: OptionRole::Config,
             },
             OptionDesc {
@@ -184,6 +189,7 @@ recover them this way.
                 required: false,
                 default: None,
                 description: "For COSINE metric: treat inputs as pre-normalized and evaluate cosine as inner product (FAISS / numpy / knn_utils convention). Exactly one of this and use_proper_cosine_metric must be set when metric=COSINE.".into(),
+                extended_description: None,
                 role: OptionRole::Config,
             },
             OptionDesc {
@@ -192,6 +198,7 @@ recover them this way.
                 required: false,
                 default: None,
                 description: "For COSINE metric: compute cosine in-kernel from raw vectors via dot/(|q|×|b|). Use when inputs are not pre-normalized.".into(),
+                extended_description: None,
                 role: OptionRole::Config,
             },
         ]

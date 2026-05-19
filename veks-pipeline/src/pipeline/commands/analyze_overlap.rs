@@ -159,6 +159,7 @@ impl CommandOp for AnalyzeOverlapOp {
                 required: true,
                 default: None,
                 description: "Base vectors file".to_string(),
+                extended_description: None,
                 role: OptionRole::Input,
             },
             OptionDesc {
@@ -167,6 +168,7 @@ impl CommandOp for AnalyzeOverlapOp {
                 required: true,
                 default: None,
                 description: "Query vectors file".to_string(),
+                extended_description: None,
                 role: OptionRole::Input,
             },
         ]

@@ -159,6 +159,10 @@ pub fn build_pipeline_command() -> Command {
                     .required(opt.required)
                     .help(help_text);
 
+                if let Some(ext) = opt.extended_description.as_ref() {
+                    arg = arg.long_help(ext.clone());
+                }
+
                 if let Some(ref default) = opt.default {
                     arg = arg.default_value(default.clone());
                 }
@@ -434,17 +438,41 @@ pub fn governor_completer(current: &OsStr) -> Vec<CompletionCandidate> {
 
 /// Recognized data file extensions for pipeline Path-type options.
 ///
-/// These cover the vector, slab, and metadata formats that pipeline commands
-/// typically operate on.
+/// Covers the singular and plural canonical forms of every xvec / vvec /
+/// scalar format known to [`veks_core::formats::VecFormat`], plus the
+/// container/metadata extensions (`slab`, `npy`, `parquet`, `json`,
+/// `yaml`). Plural xvec extensions (`fvecs`, `mvecs`, …) are written by
+/// current bootstraps and must be tab-completed alongside the singular
+/// legacy forms.
 const DATA_EXTENSIONS: &[&str] = &[
-    "fvec", "ivec", "mvec", "bvec", "dvec", "svec",
-    "fvvec", "ivvec", "mvvec", "bvvec", "dvvec", "svvec",
-    "i8vec", "u16vec", "i32vec", "u32vec", "i64vec", "u64vec",
-    "i8vvec", "u16vvec", "i32vvec", "u32vvec", "i64vvec", "u64vvec",
-    "f16vec", "f32vec", "f64vec", "f16vvec", "f32vvec", "f64vvec",
-    "u8vec", "u8vvec",
+    // Uniform xvec (singular + plural canonical + explicit-width aliases)
+    "fvec", "fvecs", "f32vec", "f32vecs",
+    "dvec", "dvecs", "f64vec", "f64vecs",
+    "mvec", "mvecs", "f16vec", "f16vecs",
+    "bvec", "bvecs", "u8vec", "u8vecs",
+    "i8vec", "i8vecs",
+    "svec", "svecs", "i16vec", "i16vecs",
+    "u16vec", "u16vecs",
+    "ivec", "ivecs", "i32vec", "i32vecs",
+    "u32vec", "u32vecs",
+    "i64vec", "i64vecs",
+    "u64vec", "u64vecs",
+    // Variable-length vvec (singular + plural canonical + explicit-width)
+    "fvvec", "fvvecs", "f32vvec", "f32vvecs",
+    "dvvec", "dvvecs", "f64vvec", "f64vvecs",
+    "mvvec", "mvvecs", "f16vvec", "f16vvecs",
+    "bvvec", "bvvecs", "u8vvec", "u8vvecs",
+    "i8vvec", "i8vvecs",
+    "svvec", "svvecs", "i16vvec", "i16vvecs",
+    "u16vvec", "u16vvecs",
+    "ivvec", "ivvecs", "i32vvec", "i32vvecs",
+    "u32vvec", "u32vvecs",
+    "i64vvec", "i64vvecs",
+    "u64vvec", "u64vvecs",
+    // Scalar (flat packed)
     "u8", "i8", "u16", "i16", "u32", "i32", "u64", "i64",
-    "slab", "npy", "parquet", "json", "yaml",
+    // Container / metadata
+    "slab", "npy", "parquet", "hdf5", "h5", "json", "yaml",
 ];
 
 /// Completion candidates for Path-type options: lists files in the current

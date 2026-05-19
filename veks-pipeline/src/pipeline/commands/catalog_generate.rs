@@ -217,6 +217,7 @@ impl CommandOp for CatalogGenerateOp {
                 required: false,
                 default: Some(".".into()),
                 description: "Root directory to scan for datasets".into(),
+                extended_description: None,
                 role: OptionRole::Input,
             },
             OptionDesc {
@@ -225,6 +226,7 @@ impl CommandOp for CatalogGenerateOp {
                 required: false,
                 default: Some("catalog".into()),
                 description: "Base filename for catalog files (without extension)".into(),
+                extended_description: None,
                 role: OptionRole::Config,
             },
         ]

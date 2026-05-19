@@ -629,12 +629,23 @@ Convert with explicit source format override:
 
         ctx.ui.log("  mode: sequential (read-ahead pipeline)");
 
+        // For parquet → slab metadata facets, probe the parquet schema and
+        // build a sidecar that the slab sink will emit into a `:schema`
+        // namespace. The probe is cheap (reads the first file's footer
+        // only) and lets non-veks readers introspect the slab without
+        // parsing any MNode records. Vector facets and non-slab targets
+        // get `None` and behave exactly as before.
+        let schema_sidecar = build_schema_sidecar(
+            &source_path, source_format, to_format, facet, record_count,
+        );
+
         // Open sink
         let sink_config = SinkConfig {
             dimension,
             source_format: if needs_conversion { to_format } else { source_format },
             slab_page_size,
             slab_namespace,
+            schema_sidecar,
         };
         let mut sink = match writer::open_sink(&output_path, to_format, &sink_config) {
             Ok(s) => s,
@@ -786,6 +797,7 @@ Convert with explicit source format override:
                 required: true,
                 default: None,
                 description: "Source file or directory".to_string(),
+                extended_description: None,
                 role: OptionRole::Input,
         },
             OptionDesc {
@@ -794,6 +806,7 @@ Convert with explicit source format override:
                 required: true,
                 default: None,
                 description: "Output file path".to_string(),
+                extended_description: None,
                 role: OptionRole::Output,
         },
             OptionDesc {
@@ -802,6 +815,7 @@ Convert with explicit source format override:
                 required: false,
                 default: None,
                 description: "Output format (fvec, ivec, slab, etc.) — inferred from output extension if omitted".to_string(),
+                extended_description: None,
                 role: OptionRole::Config,
         },
             OptionDesc {
@@ -810,6 +824,7 @@ Convert with explicit source format override:
                 required: false,
                 default: None,
                 description: "Source format override (auto-detected if omitted)".to_string(),
+                extended_description: None,
                 role: OptionRole::Config,
         },
             OptionDesc {
@@ -818,6 +833,7 @@ Convert with explicit source format override:
                 required: false,
                 default: None,
                 description: "Maximum number of records to convert (omit for all)".to_string(),
+                extended_description: None,
                 role: OptionRole::Config,
         },
             OptionDesc {
@@ -826,6 +842,7 @@ Convert with explicit source format override:
                 required: false,
                 default: Some("false".to_string()),
                 description: "L2-normalize f32 vectors during conversion".to_string(),
+                extended_description: None,
                 role: OptionRole::Config,
         },
             OptionDesc {
@@ -840,6 +857,7 @@ Convert with explicit source format override:
                      set, schema probe fails). Use on parquet source steps where \
                      silently falling back to the slow path would be a regression."
                         .to_string(),
+            extended_description: None,
                 role: OptionRole::Config,
         },
             OptionDesc {
@@ -851,6 +869,7 @@ Convert with explicit source format override:
                     "[parquet sources] Column name to extract. Defaults to the \
                      first list-of-numeric column in the schema."
                         .to_string(),
+            extended_description: None,
                 role: OptionRole::Config,
         },
         ]
@@ -963,6 +982,42 @@ fn humanize_count_short(n: u64) -> String {
     else if n >= M { format!("{:.1}M", n as f64 / M as f64) }
     else if n >= K { format!("{:.1}K", n as f64 / K as f64) }
     else { format!("{}", n) }
+}
+
+/// Build a [`MetadataSchema`] sidecar for parquet→slab metadata
+/// imports. Returns `None` when the source/target/facet combination
+/// shouldn't carry a sidecar (vector facets, non-parquet sources,
+/// non-slab targets) — the slab sink then skips the `:schema`
+/// namespace and emits a content-only file as before.
+fn build_schema_sidecar(
+    source_path: &Path,
+    source_format: VecFormat,
+    to_format: VecFormat,
+    facet: Option<veks_core::formats::facet::Facet>,
+    record_count: Option<u64>,
+) -> Option<vectordata::metadata_schema::MetadataSchema> {
+    use veks_core::formats::facet::Facet;
+    use veks_core::formats::reader::parquet_mnode::ParquetMnodeReader;
+
+    if !matches!(to_format, VecFormat::Slab) { return None; }
+    if !matches!(source_format, VecFormat::Parquet) { return None; }
+    match facet {
+        Some(
+            Facet::MetadataContent
+            | Facet::MetadataPredicates
+            | Facet::MetadataResults
+            | Facet::MetadataLayout,
+        ) => {}
+        _ => return None,
+    }
+
+    let fields = ParquetMnodeReader::probe_schema(source_path).ok()?;
+    let source = format!("parquet:{}", source_path.display());
+    let mut schema = vectordata::metadata_schema::MetadataSchema::new(source, fields);
+    if let Some(n) = record_count {
+        schema = schema.with_record_count(n);
+    }
+    Some(schema)
 }
 
 /// Fast-path router for parquet → uniform xvec conversion.

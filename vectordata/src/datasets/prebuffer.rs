@@ -306,7 +306,7 @@ fn plan_prebuffer(view: &dyn TestDataView) -> PrebufferPlan {
 /// stderr isn't a tty (piped, captured), the updates still write
 /// but the terminal won't reflow them — acceptable, since piped
 /// output usually wants a log rather than a meter.
-struct LiveCtx {
+pub(super) struct LiveCtx {
     facet_count: usize,
     total_bytes: u64,
     bytes_per_facet: std::collections::HashMap<String, u64>,
@@ -317,7 +317,7 @@ struct LiveCtx {
 }
 
 impl LiveCtx {
-    fn new(facet_count: usize, total_bytes: u64) -> Self {
+    pub(super) fn new(facet_count: usize, total_bytes: u64) -> Self {
         Self {
             facet_count,
             total_bytes,
@@ -330,7 +330,7 @@ impl LiveCtx {
         }
     }
 
-    fn on_progress(&mut self, facet: &str, p: &PrebufferProgress) {
+    pub(super) fn on_progress(&mut self, facet: &str, p: &PrebufferProgress) {
         if facet != self.current_facet {
             self.flush_facet_summary();
             self.current_facet = facet.to_string();
@@ -389,7 +389,7 @@ impl LiveCtx {
             fmt_bytes(bytes));
     }
 
-    fn finalize<T, E: std::fmt::Display>(&self, result: &Result<T, E>) {
+    pub(super) fn finalize<T, E: std::fmt::Display>(&self, result: &Result<T, E>) {
         self.flush_facet_summary();
         let elapsed = self.started.elapsed().as_secs_f64();
         let done: u64 = self.bytes_per_facet.values().sum();
@@ -406,12 +406,12 @@ impl LiveCtx {
     }
 }
 
-fn pct(done: u64, total: u64) -> u32 {
+pub(super) fn pct(done: u64, total: u64) -> u32 {
     if total == 0 { return 100; }
     ((done as u128 * 100) / total as u128) as u32
 }
 
-fn fmt_bytes(bytes: u64) -> String {
+pub(super) fn fmt_bytes(bytes: u64) -> String {
     const KIB: u64 = 1024;
     const MIB: u64 = 1024 * KIB;
     const GIB: u64 = 1024 * MIB;

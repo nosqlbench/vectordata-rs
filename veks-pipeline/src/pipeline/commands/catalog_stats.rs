@@ -93,6 +93,7 @@ impl CommandOp for CatalogStatsOp {
                 required: false,
                 default: Some(".".into()),
                 description: "Starting directory (walks up to find .catalog_root)".into(),
+                extended_description: None,
                 role: OptionRole::Input,
             },
             OptionDesc {
@@ -101,6 +102,7 @@ impl CommandOp for CatalogStatsOp {
                 required: false,
                 default: Some("stats.csv".into()),
                 description: "Output CSV filename (relative to catalog root)".into(),
+                extended_description: None,
                 role: OptionRole::Output,
             },
         ]

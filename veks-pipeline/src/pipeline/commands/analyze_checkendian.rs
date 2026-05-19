@@ -232,6 +232,7 @@ impl CommandOp for AnalyzeCheckEndianOp {
             required: true,
             default: None,
             description: "xvec file to check endianness".to_string(),
+            extended_description: None,
                 role: OptionRole::Input,
     }]
     }

@@ -232,6 +232,7 @@ impl CommandOp for AnalyzeVerifyProfilesOp {
                 required: true,
                 default: None,
                 description: "Model JSON file to verify against".to_string(),
+                extended_description: None,
                         role: OptionRole::Input,
         },
             OptionDesc {
@@ -240,6 +241,7 @@ impl CommandOp for AnalyzeVerifyProfilesOp {
                 required: true,
                 default: None,
                 description: "Vector fvec file to verify".to_string(),
+                extended_description: None,
                         role: OptionRole::Input,
         },
             OptionDesc {
@@ -248,6 +250,7 @@ impl CommandOp for AnalyzeVerifyProfilesOp {
                 required: false,
                 default: Some("0.05".to_string()),
                 description: "KS D-statistic threshold for pass/fail".to_string(),
+                extended_description: None,
                         role: OptionRole::Config,
         },
             OptionDesc {
@@ -256,6 +259,7 @@ impl CommandOp for AnalyzeVerifyProfilesOp {
                 required: false,
                 default: Some("10000".to_string()),
                 description: "Max vectors to sample".to_string(),
+                extended_description: None,
                         role: OptionRole::Config,
         },
             OptionDesc {
@@ -264,6 +268,7 @@ impl CommandOp for AnalyzeVerifyProfilesOp {
                 required: false,
                 default: Some("false".to_string()),
                 description: "Show per-dimension results".to_string(),
+                extended_description: None,
                         role: OptionRole::Config,
         },
         ]

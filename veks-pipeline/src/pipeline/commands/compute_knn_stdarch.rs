@@ -1242,27 +1242,30 @@ on `std::arch` alone, without SimSIMD, FAISS, or BLAS.
 
     fn describe_options(&self) -> Vec<OptionDesc> {
         vec![
-            OptionDesc { name: "base".into(), type_name: "Path".into(), required: true, default: None, description: "Base vectors (fvec)".into(), role: OptionRole::Input },
-            OptionDesc { name: "query".into(), type_name: "Path".into(), required: true, default: None, description: "Query vectors (fvec)".into(), role: OptionRole::Input },
-            OptionDesc { name: "indices".into(), type_name: "Path".into(), required: true, default: None, description: "Output neighbor indices (ivec)".into(), role: OptionRole::Output },
-            OptionDesc { name: "distances".into(), type_name: "Path".into(), required: false, default: None, description: "Output neighbor distances (fvec)".into(), role: OptionRole::Output },
-            OptionDesc { name: "neighbors".into(), type_name: "int".into(), required: true, default: None, description: "k (number of neighbors)".into(), role: OptionRole::Config },
-            OptionDesc { name: "metric".into(), type_name: "enum".into(), required: false, default: Some("L2".into()), description: "L2, DOT_PRODUCT, COSINE, IP".into(), role: OptionRole::Config },
+            OptionDesc { name: "base".into(), type_name: "Path".into(), required: true, default: None, description: "Base vectors (fvec)".into(), extended_description: None, role: OptionRole::Input },
+            OptionDesc { name: "query".into(), type_name: "Path".into(), required: true, default: None, description: "Query vectors (fvec)".into(), extended_description: None, role: OptionRole::Input },
+            OptionDesc { name: "indices".into(), type_name: "Path".into(), required: true, default: None, description: "Output neighbor indices (ivec)".into(), extended_description: None, role: OptionRole::Output },
+            OptionDesc { name: "distances".into(), type_name: "Path".into(), required: false, default: None, description: "Output neighbor distances (fvec)".into(), extended_description: None, role: OptionRole::Output },
+            OptionDesc { name: "neighbors".into(), type_name: "int".into(), required: true, default: None, description: "k (number of neighbors)".into(), extended_description: None, role: OptionRole::Config },
+            OptionDesc { name: "metric".into(), type_name: "enum".into(), required: false, default: Some("L2".into()), description: "L2, DOT_PRODUCT, COSINE, IP".into(), extended_description: None, role: OptionRole::Config },
             OptionDesc { name: "assume_normalized_like_faiss".into(), type_name: "bool".into(), required: false,
                 default: Some("false".into()),
                 description: "For COSINE metric: treat inputs as pre-normalized and evaluate cosine as inner product (FAISS / numpy / knn_utils convention). Exactly one of this and use_proper_cosine_metric must be set when metric=COSINE.".into(),
+                extended_description: None,
                 role: OptionRole::Config },
             OptionDesc { name: "use_proper_cosine_metric".into(), type_name: "bool".into(), required: false,
                 default: Some("false".into()),
                 description: "For COSINE metric: compute cosine in-kernel as dot / (|q| × |b|). Correct for arbitrary inputs. Exactly one of this and assume_normalized_like_faiss must be set when metric=COSINE.".into(),
+                extended_description: None,
                 role: OptionRole::Config },
             OptionDesc { name: "normalized".into(), type_name: "bool".into(), required: false, default: Some("false".into()),
                 description: "Deprecated alias for assume_normalized_like_faiss; kept for back-compat.".into(),
+                extended_description: None,
                 role: OptionRole::Config },
-            OptionDesc { name: "threads".into(), type_name: "int".into(), required: false, default: Some("0".into()), description: "Thread count (0 = auto)".into(), role: OptionRole::Config },
+            OptionDesc { name: "threads".into(), type_name: "int".into(), required: false, default: Some("0".into()), description: "Thread count (0 = auto)".into(), extended_description: None, role: OptionRole::Config },
             // Accept but ignore knn-metal options for drop-in compatibility
-            OptionDesc { name: "partition_size".into(), type_name: "int".into(), required: false, default: None, description: "Override auto-sized segment length (for testing or finer cache granularity)".into(), role: OptionRole::Config },
-            OptionDesc { name: "compress-cache".into(), type_name: "bool".into(), required: false, default: Some("false".into()), description: "Ignored".into(), role: OptionRole::Config },
+            OptionDesc { name: "partition_size".into(), type_name: "int".into(), required: false, default: None, description: "Override auto-sized segment length (for testing or finer cache granularity)".into(), extended_description: None, role: OptionRole::Config },
+            OptionDesc { name: "compress-cache".into(), type_name: "bool".into(), required: false, default: Some("false".into()), description: "Ignored".into(), extended_description: None, role: OptionRole::Config },
         ]
     }
 

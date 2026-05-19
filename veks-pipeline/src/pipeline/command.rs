@@ -545,8 +545,15 @@ pub struct OptionDesc {
     pub required: bool,
     /// Default value if not provided.
     pub default: Option<String>,
-    /// Human-readable description.
+    /// Human-readable description (one-liner — routed to clap's
+    /// `Arg::help` and to the completion engine's `flag_help`).
     pub description: String,
+    /// Optional extended description (multi-line guidance on how
+    /// to choose a value) — routed to clap's `Arg::long_help` and
+    /// to the completion engine's `flag_long_help`. Surfaced by
+    /// the rapid triple-tap UX. Empty / `None` means "no extended
+    /// help"; the engine falls back to the one-liner.
+    pub extended_description: Option<String>,
     /// Role of this option: input file, output file, or config.
     /// Defaults to `Config`. Commands should set `Input` or `Output`
     /// for path-typed options that represent consumed/produced artifacts.
@@ -592,6 +599,14 @@ impl OptionDesc {
     /// Set the role of this option and return self (builder pattern).
     pub fn with_role(mut self, role: OptionRole) -> Self {
         self.role = role;
+        self
+    }
+
+    /// Attach extended help (multi-line guidance on how to choose a
+    /// value). Surfaces in clap's `--help` long form and in the
+    /// completion engine's rapid triple-tap UX.
+    pub fn with_extended_description(mut self, ext: impl Into<String>) -> Self {
+        self.extended_description = Some(ext.into());
         self
     }
 }

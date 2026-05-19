@@ -110,6 +110,7 @@ Also counts exact-zero vectors (norm == 0.0), matching knn\_utils
                 required: true,
                 default: None,
                 description: "Vector file to check (fvec)".into(),
+                extended_description: None,
                 role: OptionRole::Input,
             },
             OptionDesc {
@@ -118,6 +119,7 @@ Also counts exact-zero vectors (norm == 0.0), matching knn\_utils
                 required: false,
                 default: Some("1e-3".into()),
                 description: "Normalization tolerance (knn_utils default: 1e-3)".into(),
+                extended_description: None,
                 role: OptionRole::Config,
             },
         ]

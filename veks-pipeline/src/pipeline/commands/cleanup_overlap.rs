@@ -159,6 +159,7 @@ impl CommandOp for CleanupOverlapOp {
                 required: true,
                 default: None,
                 description: "Base vectors file (read-only)".to_string(),
+                extended_description: None,
                 role: OptionRole::Input,
             },
             OptionDesc {
@@ -167,6 +168,7 @@ impl CommandOp for CleanupOverlapOp {
                 required: true,
                 default: None,
                 description: "Query vectors file (read-only input)".to_string(),
+                extended_description: None,
                 role: OptionRole::Input,
             },
             OptionDesc {
@@ -175,6 +177,7 @@ impl CommandOp for CleanupOverlapOp {
                 required: false,
                 default: None,
                 description: "Output path for cleaned query vectors (if omitted, query file is rewritten in place)".to_string(),
+                extended_description: None,
                 role: OptionRole::Output,
             },
         ]

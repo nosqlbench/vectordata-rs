@@ -84,6 +84,7 @@ impl CommandOp for AnalyzeFindDuplicatesOp {
                 required: false,
                 default: None,
                 description: "Source vector file or directory (defaults to '.' with --recursive)".into(),
+                extended_description: None,
                 role: OptionRole::Input,
             },
             OptionDesc {
@@ -92,6 +93,7 @@ impl CommandOp for AnalyzeFindDuplicatesOp {
                 required: false,
                 default: Some("false".into()),
                 description: "Recursively scan all vector files under the source directory".into(),
+                extended_description: None,
                 role: OptionRole::Config,
             },
         ]
@@ -346,8 +348,15 @@ fn scan_single_file(source_path: &Path, ctx: &mut StreamContext, start: Instant)
     }
 }
 
-/// Supported vector file extensions.
-const VECTOR_EXTENSIONS: &[&str] = &["fvec", "fvecs", "mvec", "dvec"];
+/// True when `ext` names a recognized xvec (uniform-dimension) vector
+/// file extension. Accepts both singular and plural canonical forms
+/// (e.g. `fvec`/`fvecs`, `mvec`/`mvecs`) by delegating to
+/// [`veks_core::formats::VecFormat::from_extension`].
+fn is_xvec_extension(ext: &str) -> bool {
+    veks_core::formats::VecFormat::from_extension(ext)
+        .map(|f| f.is_uniform_xvec())
+        .unwrap_or(false)
+}
 
 /// Recursive directory scan with concise output.
 fn scan_directory_dedup(dir: &Path, ctx: &mut StreamContext, start: Instant) -> CommandResult {
@@ -517,7 +526,7 @@ fn collect_vector_files(dir: &Path, files: &mut Vec<PathBuf>) {
             collect_vector_files(&path, files);
         } else {
             let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-            if VECTOR_EXTENSIONS.contains(&ext) {
+            if is_xvec_extension(ext) {
                 files.push(path);
             }
         }

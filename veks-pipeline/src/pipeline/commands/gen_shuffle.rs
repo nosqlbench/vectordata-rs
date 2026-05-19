@@ -202,6 +202,7 @@ The same shuffle ivec is also applied to metadata slabs (via
                 required: true,
                 default: None,
                 description: "Output ivec file path".to_string(),
+                extended_description: None,
                 role: OptionRole::Output,
         },
             OptionDesc {
@@ -210,6 +211,7 @@ The same shuffle ivec is also applied to metadata slabs (via
                 required: true,
                 default: None,
                 description: "Number of elements to shuffle (0 to interval-1)".to_string(),
+                extended_description: None,
                 role: OptionRole::Config,
         },
             OptionDesc {
@@ -218,6 +220,7 @@ The same shuffle ivec is also applied to metadata slabs (via
                 required: false,
                 default: Some("0".to_string()),
                 description: "Random seed for reproducibility".to_string(),
+                extended_description: None,
                 role: OptionRole::Config,
         },
             OptionDesc {
@@ -226,6 +229,7 @@ The same shuffle ivec is also applied to metadata slabs (via
                 required: false,
                 default: None,
                 description: "Input ordinals ivec to shuffle (default: generate [0,interval))".to_string(),
+                extended_description: None,
                 role: OptionRole::Input,
         },
         ]

@@ -659,6 +659,7 @@ size check verifies any pre-existing local file before re-downloading.
                 required: true,
                 default: None,
                 description: "Enumeration mode: 'template' or 'cos'".to_string(),
+                extended_description: None,
                 role: OptionRole::Config,
             },
             OptionDesc {
@@ -667,6 +668,7 @@ size check verifies any pre-existing local file before re-downloading.
                 required: true,
                 default: None,
                 description: "Output directory for downloaded files".to_string(),
+                extended_description: None,
                 role: OptionRole::Output,
             },
             // template mode
@@ -676,6 +678,7 @@ size check verifies any pre-existing local file before re-downloading.
                 required: false,
                 default: None,
                 description: "[template] URL template with ${token} placeholders".to_string(),
+                extended_description: None,
                 role: OptionRole::Config,
             },
             OptionDesc {
@@ -684,6 +687,7 @@ size check verifies any pre-existing local file before re-downloading.
                 required: false,
                 default: None,
                 description: "[template] Token ranges, e.g. \"number=[0..409]\"".to_string(),
+                extended_description: None,
                 role: OptionRole::Config,
             },
             // cos mode
@@ -693,6 +697,7 @@ size check verifies any pre-existing local file before re-downloading.
                 required: false,
                 default: None,
                 description: "[cos] S3-compatible endpoint URL (e.g. https://s3.us-south.cloud-object-storage.appdomain.cloud)".to_string(),
+                extended_description: None,
                 role: OptionRole::Config,
             },
             OptionDesc {
@@ -701,6 +706,7 @@ size check verifies any pre-existing local file before re-downloading.
                 required: false,
                 default: None,
                 description: "[cos] Bucket name".to_string(),
+                extended_description: None,
                 role: OptionRole::Config,
             },
             OptionDesc {
@@ -709,6 +715,7 @@ size check verifies any pre-existing local file before re-downloading.
                 required: false,
                 default: Some(String::new()),
                 description: "[cos] Object key prefix to enumerate".to_string(),
+                extended_description: None,
                 role: OptionRole::Config,
             },
             OptionDesc {
@@ -717,6 +724,7 @@ size check verifies any pre-existing local file before re-downloading.
                 required: false,
                 default: Some("us-south".to_string()),
                 description: "[cos] SigV4 region (default: us-south)".to_string(),
+                extended_description: None,
                 role: OptionRole::Config,
             },
             // common
@@ -726,6 +734,7 @@ size check verifies any pre-existing local file before re-downloading.
                 required: false,
                 default: Some("3".to_string()),
                 description: "Number of download attempts per file".to_string(),
+                extended_description: None,
                 role: OptionRole::Config,
             },
             OptionDesc {
@@ -734,6 +743,7 @@ size check verifies any pre-existing local file before re-downloading.
                 required: false,
                 default: Some("4".to_string()),
                 description: "Maximum concurrent downloads".to_string(),
+                extended_description: None,
                 role: OptionRole::Config,
             },
         ]

@@ -405,6 +405,7 @@ the need for an external `jq` binary on the system.
                 required: true,
                 default: None,
                 description: "Input JSONL file".to_string(),
+                extended_description: None,
                         role: OptionRole::Input,
         },
             OptionDesc {
@@ -413,6 +414,7 @@ the need for an external `jq` binary on the system.
                 required: false,
                 default: Some(".".to_string()),
                 description: "JQ expression (e.g. '.field', 'select(.x == 1)')".to_string(),
+                extended_description: None,
                         role: OptionRole::Config,
         },
             OptionDesc {
@@ -421,6 +423,7 @@ the need for an external `jq` binary on the system.
                 required: false,
                 default: None,
                 description: "Output file (default: stderr, 'null' discards)".to_string(),
+                extended_description: None,
                         role: OptionRole::Output,
         },
         ]

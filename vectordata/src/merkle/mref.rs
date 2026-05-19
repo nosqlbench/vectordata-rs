@@ -4,7 +4,7 @@
 //! Read-only merkle reference tree loaded from `.mref` files.
 
 use std::fs;
-use std::io::{self, Cursor};
+use std::io::{self, Cursor, Read};
 use std::path::Path;
 
 use super::{FOOTER_SIZE, FOOTER_SIZE_V2, HASH_SIZE, MerkleShape, read_hashes, sha256, write_hashes};
@@ -86,6 +86,56 @@ impl MerkleRef {
 
         let mut cursor = Cursor::new(&data[..expected_hash_bytes]);
         let hashes = read_hashes(&mut cursor, shape.node_count)?;
+
+        Ok(MerkleRef { shape, hashes })
+    }
+
+    /// Build a reference tree by streaming `path` chunk-by-chunk.
+    ///
+    /// Avoids the full-file slurp performed by
+    /// [`MerkleRef::from_content`] — useful for files that don't
+    /// comfortably fit in memory, and lets the caller drive a
+    /// progress meter. `on_progress` is invoked after each leaf
+    /// hash with the cumulative number of bytes hashed so far.
+    pub fn from_path_with_progress<F: FnMut(u64)>(
+        path: &Path,
+        chunk_size: u64,
+        mut on_progress: F,
+    ) -> io::Result<Self> {
+        let mut file = fs::File::open(path)?;
+        let total_size = file.metadata()?.len();
+        let shape = MerkleShape::for_content(chunk_size, total_size);
+        let mut hashes = vec![[0u8; 32]; shape.node_count as usize];
+
+        // Hash leaves in chunk-index order by streaming the file
+        // sequentially — no random seeks, no full-file buffer.
+        let mut buf = vec![0u8; chunk_size as usize];
+        let mut hashed: u64 = 0;
+        for i in 0..shape.total_chunks {
+            let len = shape.chunk_len(i) as usize;
+            file.read_exact(&mut buf[..len])?;
+            hashes[shape.leaf_node_index(i) as usize] = sha256(&buf[..len]);
+            hashed += len as u64;
+            on_progress(hashed);
+        }
+
+        // Unused leaf slots get hash of empty (matches the Java
+        // implementation; preserves bit-for-bit compatibility).
+        let empty_hash = sha256(b"");
+        for i in shape.total_chunks..shape.leaf_count {
+            hashes[shape.leaf_node_index(i) as usize] = empty_hash;
+        }
+
+        // Internal nodes bottom-up — pure CPU, no I/O. Don't tick
+        // progress here; for files large enough to need a meter,
+        // internal-node work is dwarfed by leaf hashing.
+        if shape.internal_node_count > 0 {
+            for i in (0..shape.internal_node_count).rev() {
+                let left = shape.left_child(i) as usize;
+                let right = shape.right_child(i) as usize;
+                hashes[i as usize] = super::sha256_pair(&hashes[left], &hashes[right]);
+            }
+        }
 
         Ok(MerkleRef { shape, hashes })
     }

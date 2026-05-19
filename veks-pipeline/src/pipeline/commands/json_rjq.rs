@@ -288,6 +288,7 @@ environments.
                 required: true,
                 default: None,
                 description: "Input JSONL file".to_string(),
+                extended_description: None,
                         role: OptionRole::Input,
         },
             OptionDesc {
@@ -296,6 +297,7 @@ environments.
                 required: false,
                 default: Some(".".to_string()),
                 description: "jq expression (full jq syntax via jaq)".to_string(),
+                extended_description: None,
                         role: OptionRole::Config,
         },
             OptionDesc {
@@ -304,6 +306,7 @@ environments.
                 required: false,
                 default: None,
                 description: "Output file (default: stderr, 'null' discards)".to_string(),
+                extended_description: None,
                         role: OptionRole::Output,
         },
         ]

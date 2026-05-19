@@ -312,6 +312,7 @@ unique vectors, preventing wasted storage and incorrect KNN results.
                 required: true,
                 default: None,
                 description: "Input fvec file to clean".to_string(),
+                extended_description: None,
                         role: OptionRole::Input,
         },
             OptionDesc {
@@ -320,6 +321,7 @@ unique vectors, preventing wasted storage and incorrect KNN results.
                 required: true,
                 default: None,
                 description: "Output cleaned fvec file".to_string(),
+                extended_description: None,
                         role: OptionRole::Output,
         },
             OptionDesc {
@@ -328,6 +330,7 @@ unique vectors, preventing wasted storage and incorrect KNN results.
                 required: false,
                 default: Some("true".to_string()),
                 description: "Remove zero vectors".to_string(),
+                extended_description: None,
                         role: OptionRole::Config,
         },
             OptionDesc {
@@ -336,6 +339,7 @@ unique vectors, preventing wasted storage and incorrect KNN results.
                 required: false,
                 default: Some("false".to_string()),
                 description: "Remove duplicate vectors (hash-based)".to_string(),
+                extended_description: None,
                         role: OptionRole::Config,
         },
         ]

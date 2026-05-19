@@ -342,21 +342,21 @@ impl CommandOp for VerifyPredicatesOp {
     fn describe_options(&self) -> Vec<OptionDesc> {
         vec![
             OptionDesc { name: "metadata".into(), type_name: "Path".into(), required: true, default: None,
-                description: "Metadata content slab".into(), role: OptionRole::Input },
+                description: "Metadata content slab".into(), extended_description: None, role: OptionRole::Input },
             OptionDesc { name: "predicates".into(), type_name: "Path".into(), required: true, default: None,
-                description: "Predicates slab (PNode records)".into(), role: OptionRole::Input },
+                description: "Predicates slab (PNode records)".into(), extended_description: None, role: OptionRole::Input },
             OptionDesc { name: "metadata-indices".into(), type_name: "Path".into(), required: true, default: None,
-                description: "Precomputed predicate results slab".into(), role: OptionRole::Input },
+                description: "Precomputed predicate results slab".into(), extended_description: None, role: OptionRole::Input },
             OptionDesc { name: "output".into(), type_name: "Path".into(), required: true, default: None,
-                description: "Verification report output (JSON)".into(), role: OptionRole::Output },
+                description: "Verification report output (JSON)".into(), extended_description: None, role: OptionRole::Output },
             OptionDesc { name: "sample".into(), type_name: "int".into(), required: false, default: Some("50".into()),
-                description: "Number of predicates to spot-check".into(), role: OptionRole::Config },
+                description: "Number of predicates to spot-check".into(), extended_description: None, role: OptionRole::Config },
             OptionDesc { name: "metadata-sample".into(), type_name: "int".into(), required: false, default: Some("100000".into()),
-                description: "Number of metadata records to load into SQLite (bounds memory usage)".into(), role: OptionRole::Config },
+                description: "Number of metadata records to load into SQLite (bounds memory usage)".into(), extended_description: None, role: OptionRole::Config },
             OptionDesc { name: "seed".into(), type_name: "int".into(), required: false, default: Some("42".into()),
-                description: "Random seed for sample selection".into(), role: OptionRole::Config },
+                description: "Random seed for sample selection".into(), extended_description: None, role: OptionRole::Config },
             OptionDesc { name: "range".into(), type_name: "String".into(), required: false, default: None,
-                description: "Ordinal range to limit verification, e.g. '[0,1010000)'. Limits metadata sampling to a profile subset.".into(), role: OptionRole::Config },
+                description: "Ordinal range to limit verification, e.g. '[0,1010000)'. Limits metadata sampling to a profile subset.".into(), extended_description: None, role: OptionRole::Config },
         ]
     }
 }

@@ -298,6 +298,7 @@ facets of the dataset.
                 required: false,
                 default: None,
                 description: "Ivec file containing indices (identity if omitted)".to_string(),
+                extended_description: None,
                 role: OptionRole::Input,
         },
             OptionDesc {
@@ -306,6 +307,7 @@ facets of the dataset.
                 required: true,
                 default: None,
                 description: "Fvec file containing source vectors".to_string(),
+                extended_description: None,
                 role: OptionRole::Input,
         },
             OptionDesc {
@@ -314,6 +316,7 @@ facets of the dataset.
                 required: true,
                 default: None,
                 description: "Output fvec file".to_string(),
+                extended_description: None,
                 role: OptionRole::Output,
         },
             OptionDesc {
@@ -322,6 +325,7 @@ facets of the dataset.
                 required: false,
                 default: None,
                 description: "Index range: [start,end) or start..end".to_string(),
+                extended_description: None,
                 role: OptionRole::Config,
         },
             OptionDesc {
@@ -330,6 +334,7 @@ facets of the dataset.
                 required: false,
                 default: Some("false".to_string()),
                 description: "L2-normalize vectors during extraction".to_string(),
+                extended_description: None,
                 role: OptionRole::Config,
         },
         ]
@@ -638,6 +643,7 @@ ordinal.
                 required: true,
                 default: None,
                 description: "Source ivec file".to_string(),
+                extended_description: None,
                 role: OptionRole::Input,
         },
             OptionDesc {
@@ -646,6 +652,7 @@ ordinal.
                 required: false,
                 default: None,
                 description: "Ivec file containing indices (enables index-based extraction)".to_string(),
+                extended_description: None,
                 role: OptionRole::Input,
         },
             OptionDesc {
@@ -654,6 +661,7 @@ ordinal.
                 required: true,
                 default: None,
                 description: "Output ivec file".to_string(),
+                extended_description: None,
                 role: OptionRole::Output,
         },
             OptionDesc {
@@ -662,6 +670,7 @@ ordinal.
                 required: false,
                 default: None,
                 description: "Range: [start,end) or start..end. Applies to index-file entries (index mode) or ivec records (range mode)".to_string(),
+                extended_description: None,
                 role: OptionRole::Config,
         },
         ]
@@ -970,6 +979,7 @@ so that `base_metadata.slab[i]` corresponds to `base_vectors.mvec[i]`.
                 required: true,
                 default: None,
                 description: "Source mvec file".to_string(),
+                extended_description: None,
                 role: OptionRole::Input,
         },
             OptionDesc {
@@ -978,6 +988,7 @@ so that `base_metadata.slab[i]` corresponds to `base_vectors.mvec[i]`.
                 required: false,
                 default: None,
                 description: "Ivec file containing indices (enables index-based extraction)".to_string(),
+                extended_description: None,
                 role: OptionRole::Input,
         },
             OptionDesc {
@@ -986,6 +997,7 @@ so that `base_metadata.slab[i]` corresponds to `base_vectors.mvec[i]`.
                 required: true,
                 default: None,
                 description: "Output mvec file".to_string(),
+                extended_description: None,
                 role: OptionRole::Output,
         },
             OptionDesc {
@@ -994,6 +1006,7 @@ so that `base_metadata.slab[i]` corresponds to `base_vectors.mvec[i]`.
                 required: false,
                 default: None,
                 description: "Range: [start,end) or start..end. Applies to ivec entries (index mode) or mvec records (range mode)".to_string(),
+                extended_description: None,
                 role: OptionRole::Config,
         },
             OptionDesc {
@@ -1002,6 +1015,7 @@ so that `base_metadata.slab[i]` corresponds to `base_vectors.mvec[i]`.
                 required: false,
                 default: Some("false".to_string()),
                 description: "L2-normalize vectors during extraction".to_string(),
+                extended_description: None,
                 role: OptionRole::Config,
         },
         ]
@@ -1209,6 +1223,7 @@ impl CommandOp for GenerateSlabExtractOp {
                 required: true,
                 default: None,
                 description: "Source slab file".to_string(),
+                extended_description: None,
                 role: OptionRole::Input,
         },
             OptionDesc {
@@ -1217,6 +1232,7 @@ impl CommandOp for GenerateSlabExtractOp {
                 required: false,
                 default: None,
                 description: "Ivec file containing indices (enables index-based extraction)".to_string(),
+                extended_description: None,
                 role: OptionRole::Input,
         },
             OptionDesc {
@@ -1225,6 +1241,7 @@ impl CommandOp for GenerateSlabExtractOp {
                 required: true,
                 default: None,
                 description: "Output slab file".to_string(),
+                extended_description: None,
                 role: OptionRole::Output,
         },
             OptionDesc {
@@ -1233,6 +1250,7 @@ impl CommandOp for GenerateSlabExtractOp {
                 required: false,
                 default: None,
                 description: "Range: [start,end) or start..end. Applies to ivec entries (index mode) or slab records (range mode)".to_string(),
+                extended_description: None,
                 role: OptionRole::Config,
         },
             OptionDesc {
@@ -1241,6 +1259,7 @@ impl CommandOp for GenerateSlabExtractOp {
                 required: false,
                 default: Some("65536".to_string()),
                 description: "Preferred page size for output slab".to_string(),
+                extended_description: None,
                 role: OptionRole::Config,
         },
         ]
@@ -2079,83 +2098,106 @@ fn sorted_index_extract_fvec(
         // per-chunk approach (no transpose needed).
         let chunk_outputs: Vec<ChunkOutput> = if !is_sorted {
             // ── Transpose mode: shared buffer, position-aware writes ────
+            //
+            // Per-chunk local accumulation pattern (the same one
+            // the sorted/sequential branch uses below). The previous
+            // implementation used global `Mutex`-wrapped stat tuples
+            // updated per vector; on a 128-core host the contention
+            // serialized the entire loop on two futexes and progress
+            // collapsed to ~0 kB/s with every worker parked in
+            // `futex_wait`. Each chunk now updates a stack-local
+            // accumulator and we merge once at the end.
             use rayon::prelude::*;
-            use std::sync::atomic::{AtomicU64, AtomicUsize};
+            use std::sync::atomic::AtomicU64;
 
             let mut part_buf = vec![0u8; part_len * record_bytes];
             let shared_buf = SharedBuf::new(&mut part_buf);
             let progress_counter = AtomicU64::new(0);
-            let written_counter = AtomicUsize::new(0);
-            let zero_list = std::sync::Mutex::new(Vec::<usize>::new());
-            let src_stats = std::sync::Mutex::new((0.0f64, 0.0f64, f64::MAX, 0.0f64, 0usize, Vec::<f64>::new()));
-            let out_stats = std::sync::Mutex::new((0.0f64, 0.0f64, f64::MAX, 0.0f64, 0usize, Vec::<f64>::new()));
 
-            let transpose_fn = || {
-                let sample_every = (read_plan.len() / 1000).max(1);
-                read_plan.par_iter().for_each(|&(source_idx, local_pos)| {
-                    // pread the source vector into a heap buffer rather
-                    // than mmap.get_slice — see the file header comment
-                    // for the RSS rationale. The Vec<f32> drops at
-                    // closure end, returning the memory immediately.
-                    let src_vec = match pread_vector(source_idx) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            // Best-effort: count this as a "zero" so it
-                            // gets skipped; the source-fault would have
-                            // crashed the run anyway.
-                            eprintln!("pread error at source_idx={}: {}", source_idx, e);
-                            if let Ok(mut zl) = zero_list.lock() { zl.push(source_idx); }
-                            return;
-                        }
+            // Per-chunk local stats; one record returned per chunk.
+            struct LocalStats {
+                written: usize,
+                zeros: Vec<usize>,
+                src_sum: f64, src_sum_sq: f64, src_min: f64, src_max: f64,
+                src_count: usize, src_samples: Vec<f64>,
+                out_sum: f64, out_sum_sq: f64, out_min: f64, out_max: f64,
+                out_count: usize, out_samples: Vec<f64>,
+            }
+
+            let chunk_size = (read_plan.len() + extract_threads - 1) / extract_threads.max(1);
+            let chunk_size = chunk_size.max(1);
+            let sample_every = (read_plan.len() / 1000).max(1);
+
+            let transpose_fn = || -> Vec<LocalStats> {
+                read_plan.par_chunks(chunk_size).map(|chunk| {
+                    let mut local = LocalStats {
+                        written: 0,
+                        zeros: Vec::new(),
+                        src_sum: 0.0, src_sum_sq: 0.0,
+                        src_min: f64::MAX, src_max: 0.0,
+                        src_count: 0, src_samples: Vec::new(),
+                        out_sum: 0.0, out_sum_sq: 0.0,
+                        out_min: f64::MAX, out_max: 0.0,
+                        out_count: 0, out_samples: Vec::new(),
                     };
-                    let src_slice: &[f32] = &src_vec;
-
-                    if normalize {
-                        let mut norm_sq = 0.0f64;
-                        for d in 0..dim_usize {
-                            let v = src_slice[d] as f64;
-                            norm_sq += v * v;
-                        }
-
-                        if norm_sq < zero_threshold_sq {
-                            if let Ok(mut zl) = zero_list.lock() { zl.push(source_idx); }
-                            let done = progress_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                            if done % 100_000 == 0 { extract_pb.set_position(done); }
-                            return;
-                        }
-
-                        let norm = norm_sq.sqrt();
-                        let src_epsilon = (norm - 1.0).abs();
-                        if let Ok(mut s) = src_stats.lock() {
-                            s.0 += src_epsilon; s.1 += src_epsilon * src_epsilon;
-                            if src_epsilon < s.2 { s.2 = src_epsilon; }
-                            if src_epsilon > s.3 { s.3 = src_epsilon; }
-                            if s.4 % sample_every == 0 { s.5.push(src_epsilon); }
-                            s.4 += 1;
-                        }
-
-                        let buf_offset = local_pos * record_bytes;
-                        let dest = unsafe { shared_buf.slice_mut(buf_offset, record_bytes) };
-                        dest[..4].copy_from_slice(&dim_bytes);
-
-                        if skip_normalize {
-                            let src_bytes: &[u8] = unsafe {
-                                std::slice::from_raw_parts(
-                                    src_slice.as_ptr() as *const u8,
-                                    src_slice.len() * 4,
-                                )
-                            };
-                            dest[4..].copy_from_slice(src_bytes);
-                        } else {
-                            let inv_norm = (1.0 / norm) as f32;
-                            for d in 0..dim_usize {
-                                let normalized = src_slice[d] * inv_norm;
-                                dest[4 + d * 4..4 + (d + 1) * 4]
-                                    .copy_from_slice(&normalized.to_le_bytes());
+                    for &(source_idx, local_pos) in chunk {
+                        let src_vec = match pread_vector(source_idx) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                eprintln!("pread error at source_idx={}: {}", source_idx, e);
+                                local.zeros.push(source_idx);
+                                continue;
                             }
-                        }
+                        };
+                        let src_slice: &[f32] = &src_vec;
 
-                        {
+                        if normalize {
+                            let mut norm_sq = 0.0f64;
+                            for d in 0..dim_usize {
+                                let v = src_slice[d] as f64;
+                                norm_sq += v * v;
+                            }
+
+                            if norm_sq < zero_threshold_sq {
+                                local.zeros.push(source_idx);
+                                let done = progress_counter
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                                if done % 100_000 == 0 { extract_pb.set_position(done); }
+                                continue;
+                            }
+
+                            let norm = norm_sq.sqrt();
+                            let src_epsilon = (norm - 1.0).abs();
+                            local.src_sum += src_epsilon;
+                            local.src_sum_sq += src_epsilon * src_epsilon;
+                            if src_epsilon < local.src_min { local.src_min = src_epsilon; }
+                            if src_epsilon > local.src_max { local.src_max = src_epsilon; }
+                            if local.src_count % sample_every == 0 {
+                                local.src_samples.push(src_epsilon);
+                            }
+                            local.src_count += 1;
+
+                            let buf_offset = local_pos * record_bytes;
+                            let dest = unsafe { shared_buf.slice_mut(buf_offset, record_bytes) };
+                            dest[..4].copy_from_slice(&dim_bytes);
+
+                            if skip_normalize {
+                                let src_bytes: &[u8] = unsafe {
+                                    std::slice::from_raw_parts(
+                                        src_slice.as_ptr() as *const u8,
+                                        src_slice.len() * 4,
+                                    )
+                                };
+                                dest[4..].copy_from_slice(src_bytes);
+                            } else {
+                                let inv_norm = (1.0 / norm) as f32;
+                                for d in 0..dim_usize {
+                                    let normalized = src_slice[d] * inv_norm;
+                                    dest[4 + d * 4..4 + (d + 1) * 4]
+                                        .copy_from_slice(&normalized.to_le_bytes());
+                                }
+                            }
+
                             let mut out_norm_sq_val = 0.0f64;
                             for d in 0..dim_usize {
                                 let v = f32::from_le_bytes([
@@ -2165,47 +2207,69 @@ fn sorted_index_extract_fvec(
                                 out_norm_sq_val += v * v;
                             }
                             let out_epsilon = (out_norm_sq_val.sqrt() - 1.0).abs();
-                            if let Ok(mut s) = out_stats.lock() {
-                                s.0 += out_epsilon; s.1 += out_epsilon * out_epsilon;
-                                if out_epsilon < s.2 { s.2 = out_epsilon; }
-                                if out_epsilon > s.3 { s.3 = out_epsilon; }
-                                if s.4 % sample_every == 0 { s.5.push(out_epsilon); }
-                                s.4 += 1;
+                            local.out_sum += out_epsilon;
+                            local.out_sum_sq += out_epsilon * out_epsilon;
+                            if out_epsilon < local.out_min { local.out_min = out_epsilon; }
+                            if out_epsilon > local.out_max { local.out_max = out_epsilon; }
+                            if local.out_count % sample_every == 0 {
+                                local.out_samples.push(out_epsilon);
                             }
+                            local.out_count += 1;
+                        } else {
+                            let buf_offset = local_pos * record_bytes;
+                            let dest = unsafe { shared_buf.slice_mut(buf_offset, record_bytes) };
+                            dest[..4].copy_from_slice(&dim_bytes);
+                            let src_bytes: &[u8] = unsafe {
+                                std::slice::from_raw_parts(
+                                    src_slice.as_ptr() as *const u8,
+                                    src_slice.len() * 4,
+                                )
+                            };
+                            dest[4..].copy_from_slice(src_bytes);
                         }
-                    } else {
-                        let buf_offset = local_pos * record_bytes;
-                        let dest = unsafe { shared_buf.slice_mut(buf_offset, record_bytes) };
-                        dest[..4].copy_from_slice(&dim_bytes);
-                        let src_bytes: &[u8] = unsafe {
-                            std::slice::from_raw_parts(
-                                src_slice.as_ptr() as *const u8,
-                                src_slice.len() * 4,
-                            )
-                        };
-                        dest[4..].copy_from_slice(src_bytes);
-                    }
-                    written_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        local.written += 1;
 
-                    let done = progress_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                    if done % 100_000 == 0 { extract_pb.set_position(done); }
-                });
+                        let done = progress_counter
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                        if done % 100_000 == 0 { extract_pb.set_position(done); }
+                    }
+                    local
+                }).collect()
             };
 
             let extract_pool = rayon::ThreadPoolBuilder::new()
                 .num_threads(extract_threads)
                 .build()
                 .ok();
-            if let Some(ref p) = extract_pool {
-                p.install(transpose_fn);
+            let locals: Vec<LocalStats> = if let Some(ref p) = extract_pool {
+                p.install(transpose_fn)
             } else {
-                transpose_fn();
-            }
+                transpose_fn()
+            };
 
-            let w = written_counter.load(std::sync::atomic::Ordering::Relaxed);
-            let zeros = zero_list.into_inner().unwrap_or_default();
-            let (ss0, ss1, ss2, ss3, ss4, ss5) = src_stats.into_inner().unwrap_or_default();
-            let (os0, os1, os2, os3, os4, os5) = out_stats.into_inner().unwrap_or_default();
+            // Merge per-chunk locals.
+            let mut w = 0usize;
+            let mut zeros: Vec<usize> = Vec::new();
+            let mut ss0 = 0.0f64; let mut ss1 = 0.0f64;
+            let mut ss2 = f64::MAX; let mut ss3 = 0.0f64;
+            let mut ss4 = 0usize; let mut ss5: Vec<f64> = Vec::new();
+            let mut os0 = 0.0f64; let mut os1 = 0.0f64;
+            let mut os2 = f64::MAX; let mut os3 = 0.0f64;
+            let mut os4 = 0usize; let mut os5: Vec<f64> = Vec::new();
+            for mut local in locals {
+                w += local.written;
+                zeros.append(&mut local.zeros);
+                ss0 += local.src_sum; ss1 += local.src_sum_sq;
+                if local.src_min < ss2 { ss2 = local.src_min; }
+                if local.src_max > ss3 { ss3 = local.src_max; }
+                ss4 += local.src_count;
+                ss5.append(&mut local.src_samples);
+                os0 += local.out_sum; os1 += local.out_sum_sq;
+                if local.out_min < os2 { os2 = local.out_min; }
+                if local.out_max > os3 { os3 = local.out_max; }
+                os4 += local.out_count;
+                os5.append(&mut local.out_samples);
+            }
 
             // When zeros were skipped, the transpose buffer has gaps at
             // those local_pos slots. Compact the buffer by removing the
@@ -3168,13 +3232,13 @@ impl CommandOp for GenerateScalarExtractOp {
     fn describe_options(&self) -> Vec<OptionDesc> {
         vec![
             OptionDesc { name: "source".into(), type_name: "Path".into(), required: true, default: None,
-                description: "Source scalar file".into(), role: OptionRole::Input },
+                description: "Source scalar file".into(), extended_description: None, role: OptionRole::Input },
             OptionDesc { name: "ivec-file".into(), type_name: "Path".into(), required: false, default: None,
-                description: "Index file for indirect extraction".into(), role: OptionRole::Input },
+                description: "Index file for indirect extraction".into(), extended_description: None, role: OptionRole::Input },
             OptionDesc { name: "output".into(), type_name: "Path".into(), required: true, default: None,
-                description: "Output file".into(), role: OptionRole::Output },
+                description: "Output file".into(), extended_description: None, role: OptionRole::Output },
             OptionDesc { name: "range".into(), type_name: "String".into(), required: false, default: None,
-                description: "Record range: [start,end) or start..end".into(), role: OptionRole::Config },
+                description: "Record range: [start,end) or start..end".into(), extended_description: None, role: OptionRole::Config },
         ]
     }
 }
@@ -3377,6 +3441,7 @@ impl CommandOp for TransformExtractOp {
                 required: true,
                 default: None,
                 description: "Source file (format auto-detected from extension)".to_string(),
+                extended_description: None,
                 role: OptionRole::Input,
             },
             OptionDesc {
@@ -3385,6 +3450,7 @@ impl CommandOp for TransformExtractOp {
                 required: false,
                 default: None,
                 description: "Index file for indirect extraction (identity if omitted)".to_string(),
+                extended_description: None,
                 role: OptionRole::Input,
             },
             OptionDesc {
@@ -3393,6 +3459,7 @@ impl CommandOp for TransformExtractOp {
                 required: true,
                 default: None,
                 description: "Output file".to_string(),
+                extended_description: None,
                 role: OptionRole::Output,
             },
             OptionDesc {
@@ -3401,6 +3468,7 @@ impl CommandOp for TransformExtractOp {
                 required: false,
                 default: None,
                 description: "Record range: [start,end) or start..end".to_string(),
+                extended_description: None,
                 role: OptionRole::Config,
             },
             OptionDesc {
@@ -3409,6 +3477,7 @@ impl CommandOp for TransformExtractOp {
                 required: false,
                 default: Some("false".to_string()),
                 description: "L2-normalize vectors during extraction (fvec/mvec only)".to_string(),
+                extended_description: None,
                 role: OptionRole::Config,
             },
             OptionDesc {
@@ -3417,6 +3486,7 @@ impl CommandOp for TransformExtractOp {
                 required: false,
                 default: Some("65536".to_string()),
                 description: "Preferred page size for output slab (slab format only)".to_string(),
+                extended_description: None,
                 role: OptionRole::Config,
             },
             OptionDesc {
@@ -3425,6 +3495,7 @@ impl CommandOp for TransformExtractOp {
                 required: false,
                 default: None,
                 description: "Variable-length ivvec file to read ordinals from (use with predicate-index)".to_string(),
+                extended_description: None,
                 role: OptionRole::Input,
             },
             OptionDesc {
@@ -3433,6 +3504,7 @@ impl CommandOp for TransformExtractOp {
                 required: false,
                 default: None,
                 description: "Record index in the ivvec index-source to use as ordinal set".to_string(),
+                extended_description: None,
                 role: OptionRole::Config,
             },
         ]

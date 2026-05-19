@@ -121,6 +121,12 @@ pub mod model;
 pub mod io;
 /// Parser for `knn_entries.yaml` (jvector-compatible dataset index).
 pub mod knn_entries;
+/// Schema descriptor for metadata slabs (the `:schema` sidecar).
+///
+/// Written into the slab's `schema` namespace at import time. See
+/// [`metadata_schema::MetadataSchema`] for the wire shape and
+/// [`metadata_schema::SCHEMA_NAMESPACE`] for the namespace name.
+pub mod metadata_schema;
 /// Typed ordinal access with runtime type negotiation.
 ///
 /// [`typed_access::TypedReader`] provides ordinal-based access to scalar

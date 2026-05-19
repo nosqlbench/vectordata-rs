@@ -1651,6 +1651,7 @@ compare an ANN index's approximate results against this exact ground truth.
                 required: true,
                 default: None,
                 description: "Base vectors file (fvec, mvec, or dvec)".to_string(),
+                extended_description: None,
                 role: OptionRole::Input,
         },
             OptionDesc {
@@ -1659,6 +1660,7 @@ compare an ANN index's approximate results against this exact ground truth.
                 required: true,
                 default: None,
                 description: "Query vectors file (fvec, mvec, or dvec)".to_string(),
+                extended_description: None,
                 role: OptionRole::Input,
         },
             OptionDesc {
@@ -1667,6 +1669,7 @@ compare an ANN index's approximate results against this exact ground truth.
                 required: true,
                 default: None,
                 description: "Output neighbor indices (ivec)".to_string(),
+                extended_description: None,
                 role: OptionRole::Output,
         },
             OptionDesc {
@@ -1675,6 +1678,7 @@ compare an ANN index's approximate results against this exact ground truth.
                 required: false,
                 default: None,
                 description: "Output neighbor distances (fvec)".to_string(),
+                extended_description: None,
                 role: OptionRole::Output,
         },
             OptionDesc {
@@ -1683,6 +1687,7 @@ compare an ANN index's approximate results against this exact ground truth.
                 required: true,
                 default: None,
                 description: "Number of nearest neighbors (k)".to_string(),
+                extended_description: None,
                 role: OptionRole::Config,
         },
             OptionDesc {
@@ -1691,6 +1696,7 @@ compare an ANN index's approximate results against this exact ground truth.
                 required: false,
                 default: Some("L2".to_string()),
                 description: "Distance metric: L2, COSINE, DOT_PRODUCT, L1".to_string(),
+                extended_description: None,
                 role: OptionRole::Config,
         },
             OptionDesc {
@@ -1699,6 +1705,7 @@ compare an ANN index's approximate results against this exact ground truth.
                 required: false,
                 default: Some("0".to_string()),
                 description: "Thread count (0 = auto)".to_string(),
+                extended_description: None,
                 role: OptionRole::Config,
         },
             OptionDesc {
@@ -1707,6 +1714,7 @@ compare an ANN index's approximate results against this exact ground truth.
                 required: false,
                 default: Some("1000000".to_string()),
                 description: "Base vectors per partition for cache-backed computation".to_string(),
+                extended_description: None,
                 role: OptionRole::Config,
         },
             OptionDesc {
@@ -1715,6 +1723,7 @@ compare an ANN index's approximate results against this exact ground truth.
                 required: false,
                 default: Some("false".to_string()),
                 description: "Gzip-compress partition cache files".to_string(),
+                extended_description: None,
                 role: OptionRole::Config,
         },
             OptionDesc {
@@ -1723,6 +1732,7 @@ compare an ANN index's approximate results against this exact ground truth.
                 required: false,
                 default: Some("false".to_string()),
                 description: "For COSINE metric: treat inputs as pre-normalized and evaluate cosine as inner product (FAISS / numpy / knn_utils convention). Exactly one of this and use_proper_cosine_metric must be set when metric=COSINE.".to_string(),
+                extended_description: None,
                 role: OptionRole::Config,
         },
             OptionDesc {
@@ -1731,6 +1741,7 @@ compare an ANN index's approximate results against this exact ground truth.
                 required: false,
                 default: Some("false".to_string()),
                 description: "For COSINE metric: compute cosine in-kernel as dot / (|q| × |b|). Correct for arbitrary inputs. Exactly one of this and assume_normalized_like_faiss must be set when metric=COSINE.".to_string(),
+                extended_description: None,
                 role: OptionRole::Config,
         },
             OptionDesc {
@@ -1739,6 +1750,7 @@ compare an ANN index's approximate results against this exact ground truth.
                 required: false,
                 default: Some("false".to_string()),
                 description: "Deprecated alias for assume_normalized_like_faiss; kept for back-compat.".to_string(),
+                extended_description: None,
                 role: OptionRole::Config,
         },
         ]

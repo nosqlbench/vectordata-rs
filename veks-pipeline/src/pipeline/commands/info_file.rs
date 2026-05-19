@@ -325,6 +325,7 @@ subtle errors in later pipeline steps.
                 required: true,
                 default: None,
                 description: "Vector file to inspect".to_string(),
+                extended_description: None,
                         role: OptionRole::Input,
         },
             OptionDesc {
@@ -333,6 +334,7 @@ subtle errors in later pipeline steps.
                 required: false,
                 default: Some("0".to_string()),
                 description: "Number of sample vectors to display".to_string(),
+                extended_description: None,
                         role: OptionRole::Config,
         },
         ]

@@ -268,6 +268,7 @@ data with known statistical properties.
                 required: true,
                 default: None,
                 description: "Output fvec file".to_string(),
+                extended_description: None,
                         role: OptionRole::Output,
         },
             OptionDesc {
@@ -276,6 +277,7 @@ data with known statistical properties.
                 required: true,
                 default: None,
                 description: "Vector dimensionality".to_string(),
+                extended_description: None,
                         role: OptionRole::Config,
         },
             OptionDesc {
@@ -284,6 +286,7 @@ data with known statistical properties.
                 required: true,
                 default: None,
                 description: "Number of vectors".to_string(),
+                extended_description: None,
                         role: OptionRole::Config,
         },
             OptionDesc {
@@ -292,6 +295,7 @@ data with known statistical properties.
                 required: false,
                 default: Some("bounded".to_string()),
                 description: "Distribution mix: bounded, normal, beta, uniform, mixed".to_string(),
+                extended_description: None,
                         role: OptionRole::Config,
         },
             OptionDesc {
@@ -300,6 +304,7 @@ data with known statistical properties.
                 required: false,
                 default: Some("0".to_string()),
                 description: "Random seed".to_string(),
+                extended_description: None,
                         role: OptionRole::Config,
         },
             OptionDesc {
@@ -308,6 +313,7 @@ data with known statistical properties.
                 required: false,
                 default: Some("-1.0".to_string()),
                 description: "Lower bound for distributions".to_string(),
+                extended_description: None,
                         role: OptionRole::Config,
         },
             OptionDesc {
@@ -316,6 +322,7 @@ data with known statistical properties.
                 required: false,
                 default: Some("1.0".to_string()),
                 description: "Upper bound for distributions".to_string(),
+                extended_description: None,
                         role: OptionRole::Config,
         },
             OptionDesc {
@@ -324,6 +331,7 @@ data with known statistical properties.
                 required: false,
                 default: Some("true".to_string()),
                 description: "L2-normalize output vectors".to_string(),
+                extended_description: None,
                         role: OptionRole::Config,
         },
         ]

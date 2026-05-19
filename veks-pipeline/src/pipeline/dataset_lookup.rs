@@ -508,14 +508,43 @@ fn canonical_basename_for(canonical: &str) -> &str {
 
 /// File extensions to try when probing canonical filesystem layout
 /// for a facet. The extension depends on the element type the
-/// bootstrap chose, so we try the common ones.
+/// bootstrap chose, so we enumerate every recognized form for the
+/// facet's value-shape (float xvec, integer xvec, slab, etc.).
+///
+/// Plural xvec forms (`fvecs`, `mvecs`, …) come first because that is
+/// the canonical extension written by current bootstraps. Singular
+/// fallbacks remain so older directories continue to resolve.
 fn canonical_extensions_for(canonical: &str) -> &'static [&'static str] {
     match canonical {
-        "base_vectors" | "query_vectors" => &["fvecs", "fvec", "mvec", "dvec"],
-        "neighbor_indices" | "filtered_neighbor_indices" => &["ivecs", "ivec", "slab"],
-        "neighbor_distances" | "filtered_neighbor_distances" => &["fvecs", "fvec"],
+        // Float xvec: f32 / f64 / f16 in plural-then-singular order, plus
+        // explicit-width aliases.
+        "base_vectors" | "query_vectors"
+        | "neighbor_distances" | "filtered_neighbor_distances" => &[
+            "fvecs", "dvecs", "mvecs",
+            "fvec", "dvec", "mvec",
+            "f32vecs", "f64vecs", "f16vecs",
+            "f32vec", "f64vec", "f16vec",
+        ],
+        // Integer xvec used for neighbor IDs: any integer width is
+        // tolerated (i32 is conventional, but bootstrap may write
+        // narrower or wider). `slab` is included for compatibility
+        // with metadata-style storage of indices.
+        "neighbor_indices" | "filtered_neighbor_indices" => &[
+            "ivecs", "i32vecs", "u32vecs",
+            "ivec", "i32vec", "u32vec",
+            "i8vecs", "u8vecs", "bvecs", "i16vecs", "u16vecs", "svecs",
+            "i8vec", "u8vec", "bvec", "i16vec", "u16vec", "svec",
+            "i64vecs", "u64vecs",
+            "i64vec", "u64vec",
+            "slab",
+        ],
         "metadata_content" | "metadata_predicates" | "metadata_results" => &["slab"],
-        "metadata_layout" => &["slab", "ivvec", "ivec"],
+        "metadata_layout" => &[
+            "slab",
+            "ivvecs", "i32vvecs", "u32vvecs",
+            "ivvec", "i32vvec", "u32vvec",
+            "ivecs", "ivec",
+        ],
         _ => &[],
     }
 }

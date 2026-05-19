@@ -2115,7 +2115,7 @@ fn opt(
         type_name: type_name.to_string(),
         required,
         default: default.map(|s| s.to_string()),
-        description: desc.to_string(),
+        description: desc.to_string(), extended_description: None,
         role,
 }
 }
@@ -2244,48 +2244,17 @@ mod tests {
         read_ordinals(data)
     }
 
-    /// Create a minimal survey JSON for the test records produced by [`make_test_records`].
-    fn create_test_survey(dir: &std::path::Path, record_count: usize) -> std::path::PathBuf {
-        let path = dir.join("survey.json");
-        let json = serde_json::json!({
-            "sampled": record_count,
-            "total_records": record_count,
-            "non_mnode_count": 0,
-            "decode_errors": 0,
-            "fields": {
-                "user_id": {
-                    "count": record_count,
-                    "null_count": 0,
-                    "types": { "int": record_count },
-                    "numeric": { "min": 0, "max": record_count - 1, "mean": (record_count - 1) as f64 / 2.0, "count": record_count },
-                    "distinct": {},
-                    "distinct_overflow": true
-                },
-                "name": {
-                    "count": record_count,
-                    "null_count": 0,
-                    "types": { "text": record_count },
-                    "distinct": { "user_0": 4, "user_1": 4, "user_2": 4, "user_3": 4, "user_4": 4 },
-                    "distinct_overflow": false
-                },
-                "score": {
-                    "count": record_count,
-                    "null_count": 0,
-                    "types": { "float": record_count },
-                    "numeric": { "min": 0.0, "max": 28.5, "mean": 14.25, "count": record_count },
-                    "distinct": {},
-                    "distinct_overflow": true
-                },
-                "active": {
-                    "count": record_count,
-                    "null_count": 0,
-                    "types": { "bool": record_count },
-                    "distinct": { "true": record_count / 2, "false": record_count / 2 },
-                    "distinct_overflow": false
-                }
-            }
-        });
-        std::fs::write(&path, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+    /// Create a survey JSON for the test records by running the new
+    /// `analyze survey` orchestrator on the materialized metadata
+    /// slab. Produces the §13.8-shaped `SurveyReport` which is what
+    /// the generator now consumes — no hand-written JSON fixture to
+    /// keep in sync with the schema.
+    fn create_test_survey(meta_path: &std::path::Path, output_dir: &std::path::Path) -> std::path::PathBuf {
+        let path = output_dir.join("survey.json");
+        let cfg = crate::pipeline::commands::survey::SurveyConfig::default();
+        let report = crate::pipeline::commands::survey::survey(meta_path, &cfg, None)
+            .expect("survey orchestrator");
+        std::fs::write(&path, serde_json::to_string_pretty(&report).unwrap()).unwrap();
         path
     }
 
@@ -2324,7 +2293,7 @@ mod tests {
         opts.set("source", meta_path.to_string_lossy().to_string());
         opts.set("predicates", pred_path.to_string_lossy().to_string());
         opts.set("output", output_path.to_string_lossy().to_string());
-        let survey_path = create_test_survey(ws, 20);
+        let survey_path = create_test_survey(&meta_path, ws);
         opts.set("survey", survey_path.to_string_lossy().to_string());
 
         let mut op = GenPredicateKeysOp;
@@ -2370,7 +2339,7 @@ mod tests {
         opts.set("predicates", pred_path.to_string_lossy().to_string());
         opts.set("output", output_path.to_string_lossy().to_string());
         opts.set("limit", "3".to_string());
-        let survey_path = create_test_survey(ws, 20);
+        let survey_path = create_test_survey(&meta_path, ws);
         opts.set("survey", survey_path.to_string_lossy().to_string());
 
         let mut op = GenPredicateKeysOp;
@@ -2421,7 +2390,7 @@ mod tests {
         opts.set("source", meta_path.to_string_lossy().to_string());
         opts.set("predicates", pred_path.to_string_lossy().to_string());
         opts.set("output", output_path.to_string_lossy().to_string());
-        let survey_path = create_test_survey(ws, 20);
+        let survey_path = create_test_survey(&meta_path, ws);
         opts.set("survey", survey_path.to_string_lossy().to_string());
 
         let mut op = GenPredicateKeysOp;
@@ -2458,7 +2427,7 @@ mod tests {
         opts.set("source", meta_path.to_string_lossy().to_string());
         opts.set("predicates", pred_path.to_string_lossy().to_string());
         opts.set("output", output_path.to_string_lossy().to_string());
-        let survey_path = create_test_survey(ws, 20);
+        let survey_path = create_test_survey(&meta_path, ws);
         opts.set("survey", survey_path.to_string_lossy().to_string());
 
         let mut op = GenPredicateKeysOp;

@@ -1671,7 +1671,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
             steps.push(Step {
                 id: "survey-metadata".into(),
                 run: "analyze survey".into(),
-                description: Some("Survey metadata to discover schema and value ranges".into()),
+                description: Some("Survey metadata to discover schema, distributions, and cross-field relationships (sysref §13)".into()),
                 after: survey_after.clone(),
                 per_profile: false,
                 phase: 0,
@@ -1680,7 +1680,6 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
                     ("source".into(), meta.metadata_all.path().into()),
                     ("output".into(), "${cache}/metadata_survey.json".into()),
                     ("samples".into(), "10000".into()),
-                    ("max-distinct".into(), "100".into()),
                 ],
             });
         }

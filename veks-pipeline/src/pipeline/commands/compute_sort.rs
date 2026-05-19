@@ -425,6 +425,7 @@ to match an externally defined permutation or clustering assignment.
                 required: true,
                 default: None,
                 description: "Input fvec file".to_string(),
+                extended_description: None,
                 role: OptionRole::Input,
         },
             OptionDesc {
@@ -433,6 +434,7 @@ to match an externally defined permutation or clustering assignment.
                 required: true,
                 default: None,
                 description: "Output sorted fvec file".to_string(),
+                extended_description: None,
                 role: OptionRole::Output,
         },
             OptionDesc {
@@ -441,6 +443,7 @@ to match an externally defined permutation or clustering assignment.
                 required: false,
                 default: Some("norm".to_string()),
                 description: "Sort criterion: 'norm' or 'dimension:N'".to_string(),
+                extended_description: None,
                 role: OptionRole::Config,
         },
         ]

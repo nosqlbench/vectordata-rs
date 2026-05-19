@@ -85,6 +85,7 @@ impl CommandOp for AnalyzeFindZerosOp {
                 required: false,
                 default: None,
                 description: "Source vector file or directory (defaults to '.' with --recursive)".into(),
+                extended_description: None,
                 role: OptionRole::Input,
             },
             OptionDesc {
@@ -93,6 +94,7 @@ impl CommandOp for AnalyzeFindZerosOp {
                 required: false,
                 default: Some("1e-06".into()),
                 description: "L2-norm threshold for near-zero classification".into(),
+                extended_description: None,
                 role: OptionRole::Config,
             },
             OptionDesc {
@@ -101,6 +103,7 @@ impl CommandOp for AnalyzeFindZerosOp {
                 required: false,
                 default: None,
                 description: "Stop after finding this many zeros (default: report all)".into(),
+                extended_description: None,
                 role: OptionRole::Config,
             },
             OptionDesc {
@@ -109,6 +112,7 @@ impl CommandOp for AnalyzeFindZerosOp {
                 required: false,
                 default: Some("8".into()),
                 description: "Number of leading components to display per zero vector".into(),
+                extended_description: None,
                 role: OptionRole::Config,
             },
             OptionDesc {
@@ -117,6 +121,7 @@ impl CommandOp for AnalyzeFindZerosOp {
                 required: false,
                 default: Some("false".into()),
                 description: "Recursively scan all vector files under the source directory".into(),
+                extended_description: None,
                 role: OptionRole::Config,
             },
         ]
@@ -662,8 +667,15 @@ fn report_zeros_f16(
 // Recursive directory scanning
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Supported vector file extensions for recursive scanning.
-const VECTOR_EXTENSIONS: &[&str] = &["fvec", "fvecs", "mvec", "dvec"];
+/// True when `ext` names a recognized xvec (uniform-dimension) vector
+/// file extension. Accepts both singular and plural canonical forms
+/// (e.g. `fvec`/`fvecs`, `mvec`/`mvecs`) by delegating to
+/// [`veks_core::formats::VecFormat::from_extension`].
+fn is_xvec_extension(ext: &str) -> bool {
+    veks_core::formats::VecFormat::from_extension(ext)
+        .map(|f| f.is_uniform_xvec())
+        .unwrap_or(false)
+}
 
 /// Recursively scan a directory for vector files and report zero counts.
 fn scan_directory(
@@ -807,7 +819,7 @@ fn collect_vector_files(dir: &Path, files: &mut Vec<std::path::PathBuf>) {
             collect_vector_files(&path, files);
         } else {
             let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-            if VECTOR_EXTENSIONS.contains(&ext) {
+            if is_xvec_extension(ext) {
                 files.push(path);
             }
         }

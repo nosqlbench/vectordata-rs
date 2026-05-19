@@ -108,6 +108,7 @@ from the knn\_utils project.
                 required: true,
                 default: None,
                 description: "fvecs file to validate".into(),
+                extended_description: None,
                 role: OptionRole::Input,
             },
             OptionDesc {
@@ -116,6 +117,7 @@ from the knn\_utils project.
                 required: false,
                 default: Some("1e-5".into()),
                 description: "Normalization tolerance (knn_utils default: 1e-5)".into(),
+                extended_description: None,
                 role: OptionRole::Config,
             },
             OptionDesc {
@@ -124,6 +126,7 @@ from the knn\_utils project.
                 required: false,
                 default: Some("1e-6".into()),
                 description: "Zero-vector tolerance (knn_utils default: 1e-6)".into(),
+                extended_description: None,
                 role: OptionRole::Config,
             },
             OptionDesc {
@@ -132,6 +135,7 @@ from the knn\_utils project.
                 required: false,
                 default: None,
                 description: "Output report file path (default: <input>_fvecs_check_report.txt)".into(),
+                extended_description: None,
                 role: OptionRole::Output,
             },
         ]

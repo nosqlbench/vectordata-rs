@@ -221,6 +221,7 @@ import, and vector file assembly.
                 required: true,
                 default: None,
                 description: "HuggingFace repository (e.g. user/dataset-name)".to_string(),
+                extended_description: None,
                 role: OptionRole::Config,
         },
             OptionDesc {
@@ -229,6 +230,7 @@ import, and vector file assembly.
                 required: false,
                 default: None,
                 description: "Output directory for downloaded files".to_string(),
+                extended_description: None,
                 role: OptionRole::Output,
         },
             OptionDesc {
@@ -237,6 +239,7 @@ import, and vector file assembly.
                 required: false,
                 default: Some("*".to_string()),
                 description: "Glob pattern for file matching".to_string(),
+                extended_description: None,
                 role: OptionRole::Config,
         },
             OptionDesc {
@@ -245,6 +248,7 @@ import, and vector file assembly.
                 required: false,
                 default: Some("main".to_string()),
                 description: "Branch or revision to download from".to_string(),
+                extended_description: None,
                 role: OptionRole::Config,
         },
             OptionDesc {
@@ -253,6 +257,7 @@ import, and vector file assembly.
                 required: false,
                 default: Some("dataset".to_string()),
                 description: "Repository type: dataset or model".to_string(),
+                extended_description: None,
                 role: OptionRole::Config,
         },
         ]

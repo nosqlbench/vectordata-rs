@@ -320,6 +320,7 @@ is proprietary or too large to distribute.
                 required: true,
                 default: None,
                 description: "VectorSpaceModel JSON file".to_string(),
+                extended_description: None,
                         role: OptionRole::Input,
         },
             OptionDesc {
@@ -328,6 +329,7 @@ is proprietary or too large to distribute.
                 required: true,
                 default: None,
                 description: "Output fvec file".to_string(),
+                extended_description: None,
                         role: OptionRole::Output,
         },
             OptionDesc {
@@ -336,6 +338,7 @@ is proprietary or too large to distribute.
                 required: true,
                 default: None,
                 description: "Number of vectors to generate".to_string(),
+                extended_description: None,
                         role: OptionRole::Config,
         },
             OptionDesc {
@@ -344,6 +347,7 @@ is proprietary or too large to distribute.
                 required: false,
                 default: Some("0".to_string()),
                 description: "Random seed".to_string(),
+                extended_description: None,
                         role: OptionRole::Config,
         },
         ]

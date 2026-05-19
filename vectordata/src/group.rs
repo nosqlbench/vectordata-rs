@@ -192,6 +192,15 @@ impl TestDataGroup {
         self.config.attributes.get(name)
     }
 
+    /// Direct read-only access to the underlying parsed
+    /// `dataset.yaml`. Used by tooling that needs profile-level
+    /// detail not exposed through [`TestDataView`] (e.g.
+    /// `vectordata datasets derive` reads per-facet windows so it
+    /// can materialize them into a self-standing dataset).
+    pub fn config(&self) -> &DatasetConfig {
+        &self.config
+    }
+
     /// Drive every facet of every profile in this dataset to
     /// fully-resident, zero-copy state.
     ///

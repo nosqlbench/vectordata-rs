@@ -139,6 +139,21 @@ impl ParquetMnodeReader {
         })
     }
 
+    /// Probe the schema of a parquet source as a list of
+    /// [`vectordata::metadata_schema::SchemaField`] descriptors.
+    ///
+    /// Used by the metadata-import path to build a `:schema` sidecar
+    /// without opening the full streaming reader. Reads the schema
+    /// from the first parquet file only.
+    pub fn probe_schema(
+        path: &Path,
+    ) -> Result<Vec<vectordata::metadata_schema::SchemaField>, String> {
+        let files = collect_parquet_files(path)?;
+        let schema = read_schema(&files[0])?;
+        let writer = CompiledMnodeWriter::compile(&schema)?;
+        Ok(writer.schema_fields())
+    }
+
     /// Open a parquet source as a metadata (MNode) reader.
     ///
     /// Reads the schema from the first file, compiles a

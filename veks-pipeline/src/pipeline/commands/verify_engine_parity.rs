@@ -139,74 +139,97 @@ impl CommandOp for VerifyEngineParityOp {
         vec![
             OptionDesc { name: "base".into(),         type_name: "Path".into(), required: false, default: None,
                 description: "Base vectors (fvec). Required unless --synthetic.".into(),
+                extended_description: None,
                 role: OptionRole::Input },
             OptionDesc { name: "query".into(),        type_name: "Path".into(), required: false, default: None,
                 description: "Query vectors (fvec). Required unless --synthetic.".into(),
+                extended_description: None,
                 role: OptionRole::Input },
             OptionDesc { name: "neighbors".into(),    type_name: "int".into(),  required: false, default: Some("10".into()),
                 description: "k (number of neighbors per query)".into(),
+                extended_description: None,
                 role: OptionRole::Config },
             OptionDesc { name: "metric".into(),       type_name: "enum".into(), required: false, default: Some("L2".into()),
                 description: "L2, DOT_PRODUCT, COSINE, IP".into(),
+                extended_description: None,
                 role: OptionRole::Config },
             OptionDesc { name: "engines".into(),      type_name: "string".into(), required: false, default: None,
                 description: "Comma-separated subset (default = all enabled): metal,stdarch,blas,faiss".into(),
+                extended_description: None,
                 role: OptionRole::Config },
             OptionDesc { name: "show-queries".into(), type_name: "int".into(),  required: false, default: Some("5".into()),
                 description: "Number of queries to print side-by-side".into(),
+                extended_description: None,
                 role: OptionRole::Config },
             OptionDesc { name: "sample".into(), type_name: "int".into(), required: false, default: Some("100".into()),
                 description: "User-data mode: number of queries to sample from the input query file. Each engine then runs against the full base × this many queries. Set to 0 to verify all queries (only feasible for small datasets — every engine scans the full base).".into(),
+                extended_description: None,
                 role: OptionRole::Config },
             OptionDesc { name: "boundary-tolerance".into(), type_name: "int".into(), required: false, default: Some("0".into()),
                 description: "Max differing neighbors per query before the verdict flips to FAIL. Default 0 — any disagreement fails. See --help for the regimes where slack is justified.".into(),
+                extended_description: None,
                 role: OptionRole::Config },
             OptionDesc { name: "synthetic".into(),    type_name: "bool".into(), required: false, default: Some("false".into()),
                 description: "Generate a deterministic fixture instead of reading --base/--query".into(),
+                extended_description: None,
                 role: OptionRole::Config },
             OptionDesc { name: "dim".into(),          type_name: "int".into(),  required: false, default: Some("128".into()),
                 description: "Synthetic mode: dimension".into(),
+                extended_description: None,
                 role: OptionRole::Config },
             OptionDesc { name: "base-count".into(),   type_name: "int".into(),  required: false, default: Some("10000".into()),
                 description: "Synthetic mode: base vector count".into(),
+                extended_description: None,
                 role: OptionRole::Config },
             OptionDesc { name: "query-count".into(),  type_name: "int".into(),  required: false, default: Some("100".into()),
                 description: "Synthetic mode: query vector count".into(),
+                extended_description: None,
                 role: OptionRole::Config },
             OptionDesc { name: "seed".into(),         type_name: "int".into(),  required: false, default: Some("42".into()),
                 description: "PRNG seed (xorshift) — used by synthetic-mode fixture generation and by user-data-mode query sampling.".into(),
+                extended_description: None,
                 role: OptionRole::Config },
             OptionDesc { name: "distribution".into(), type_name: "enum".into(), required: false, default: Some("uniform".into()),
                 description: "Synthetic mode: 'uniform' (U[-1,1] per component — curse-of-dim kicks in at high dim), 'gaussian' (N(0,1) per component + L2-normalize onto unit sphere — still curse-prone at high dim), or 'clustered' (mixture of 16 Gaussian clusters on the unit sphere — simulates the cluster structure real embedding models produce; this is the distribution where top-k is well-defined at any dim and all kernels agree).".into(),
+                extended_description: None,
                 role: OptionRole::Config },
             OptionDesc { name: "clusters".into(), type_name: "int".into(), required: false, default: Some("16".into()),
                 description: "Synthetic 'clustered' mode: number of Gaussian clusters (default 16). More clusters → denser sphere → more ties.".into(),
+                extended_description: None,
                 role: OptionRole::Config },
             OptionDesc { name: "cluster-spread".into(), type_name: "float".into(), required: false, default: Some("0.05".into()),
                 description: "Synthetic 'clustered' mode: per-vector noise std-dev relative to cluster radius (default 0.05). Smaller → tighter clusters → distances spread more widely → easier top-k.".into(),
+                extended_description: None,
                 role: OptionRole::Config },
             OptionDesc { name: "assume_normalized_like_faiss".into(), type_name: "bool".into(), required: false, default: Some("false".into()),
                 description: "metric=COSINE only: treat inputs as already unit-normalized so cosine collapses to inner product (FAISS/numpy/knn_utils convention). Mutually exclusive with use_proper_cosine_metric. Propagated to every engine.".into(),
+                extended_description: None,
                 role: OptionRole::Config },
             OptionDesc { name: "use_proper_cosine_metric".into(), type_name: "bool".into(), required: false, default: Some("false".into()),
                 description: "metric=COSINE only: divide the dot product by |q|·|b| in-kernel so cosine works on un-normalized inputs. Mutually exclusive with assume_normalized_like_faiss. Propagated to every engine.".into(),
+                extended_description: None,
                 role: OptionRole::Config },
 
             // ── Sweep mode ────────────────────────────────────────
             OptionDesc { name: "sweep".into(), type_name: "bool".into(), required: false, default: Some("false".into()),
                 description: "Run the cross-product of (dims × distributions × metrics × neighbors) internally and emit a single matrix-shaped summary table. Each axis defaults to a standard sweep range; pass `--dims=8,32,4096` (etc.) to narrow.".into(),
+                extended_description: None,
                 role: OptionRole::Config },
             OptionDesc { name: "dims".into(), type_name: "string".into(), required: false, default: None,
                 description: "Sweep mode: comma-separated list of dimensions (default: 8,32,128,384,512,768,1024,1536,2048,3072,4096).".into(),
+                extended_description: None,
                 role: OptionRole::Config },
             OptionDesc { name: "distributions".into(), type_name: "string".into(), required: false, default: None,
                 description: "Sweep mode: comma-separated list (default: uniform,gaussian,clustered).".into(),
+                extended_description: None,
                 role: OptionRole::Config },
             OptionDesc { name: "metrics".into(), type_name: "string".into(), required: false, default: None,
                 description: "Sweep mode: comma-separated list (default: L2,DOT_PRODUCT). For COSINE include the explicit mode flag(s) on the parent invocation.".into(),
+                extended_description: None,
                 role: OptionRole::Config },
             OptionDesc { name: "neighbors-list".into(), type_name: "string".into(), required: false, default: None,
                 description: "Sweep mode: comma-separated list of k values (default: just the value of `--neighbors`, or 100 if unset).".into(),
+                extended_description: None,
                 role: OptionRole::Config },
         ]
     }
@@ -824,17 +847,51 @@ fn write_sampled_query_file(
     workdir: &Path,
     ui: &mut veks_core::ui::UiHandle,
 ) -> Result<PathBuf, String> {
-    let reader = XvecReader::<f32>::open_path(query_path)
+    // Element-type-aware stride detection. The previous code
+    // hardcoded `XvecReader<f32>`, which broke on `.mvecs` (f16)
+    // and `.dvecs` (f64) inputs — the stride check `file_size %
+    // stride == 0` failed because `T::ELEM_SIZE` didn't match the
+    // file's real per-element byte width. Sampling only needs to
+    // copy records byte-for-byte, so we work at the byte level
+    // with a per-file-extension element width.
+    use vectordata::typed_access::ElementType;
+    let ext = query_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let elem = ElementType::from_extension(ext)
+        .ok_or_else(|| format!("open query {}: unknown element type \
+            for extension '{ext}'", query_path.display()))?;
+    let elem_size = elem.byte_width();
+
+    let mut f_in = std::fs::File::open(query_path)
         .map_err(|e| format!("open query {}: {}", query_path.display(), e))?;
-    let total = <XvecReader<f32> as VectorReader<f32>>::count(&reader);
-    let dim = <XvecReader<f32> as VectorReader<f32>>::dim(&reader);
+    let total_size = f_in.metadata()
+        .map_err(|e| format!("stat {}: {}", query_path.display(), e))?
+        .len();
+    if total_size < 4 {
+        return Err(format!("query file {} too short for xvec header",
+            query_path.display()));
+    }
+    let mut dim_buf = [0u8; 4];
+    use std::io::Read;
+    f_in.read_exact(&mut dim_buf)
+        .map_err(|e| format!("read dim header: {e}"))?;
+    let dim = i32::from_le_bytes(dim_buf);
+    if dim <= 0 {
+        return Err(format!("query file {} has invalid dim {dim}",
+            query_path.display()));
+    }
+    let dim = dim as usize;
+    let stride = 4 + dim * elem_size;
+    if total_size % stride as u64 != 0 {
+        return Err(format!("query file {} has size {total_size} not a multiple \
+            of stride {stride} (dim={dim}, {elem_size}B/elem from .{ext}). \
+            Element type may be misidentified.", query_path.display()));
+    }
+    let total = (total_size / stride as u64) as usize;
+
     if n >= total {
         return Ok(query_path.to_path_buf());
     }
 
-    // Deterministic sample of `n` distinct indices in [0, total).
-    // Reservoir sampling for reproducibility across runs and engines;
-    // independent of `total` value.
     let mut rng = seed.max(1);
     let mut next_u64 = || {
         rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; rng
@@ -846,21 +903,26 @@ fn write_sampled_query_file(
     }
     indices.sort_unstable();
 
-    let out_path = workdir.join("sampled_query.fvec");
-    let mut f = std::io::BufWriter::with_capacity(
+    // Preserve the source extension so downstream readers pick
+    // the right element type when they re-open the sampled file.
+    let out_name = format!("sampled_query.{ext}");
+    let out_path = workdir.join(out_name);
+    let mut f_out = std::io::BufWriter::with_capacity(
         1 << 20,
         std::fs::File::create(&out_path)
             .map_err(|e| format!("create {}: {}", out_path.display(), e))?,
     );
-    let dim_bytes = (dim as i32).to_le_bytes();
+
+    use std::io::{Seek, SeekFrom};
+    let mut buf = vec![0u8; stride];
     for &qi in &indices {
-        let s = reader.get_slice(qi);
-        f.write_all(&dim_bytes).map_err(|e| e.to_string())?;
-        for v in s {
-            f.write_all(&v.to_le_bytes()).map_err(|e| e.to_string())?;
-        }
+        let offset = (qi as u64) * (stride as u64);
+        f_in.seek(SeekFrom::Start(offset))
+            .map_err(|e| e.to_string())?;
+        f_in.read_exact(&mut buf).map_err(|e| e.to_string())?;
+        f_out.write_all(&buf).map_err(|e| e.to_string())?;
     }
-    f.flush().map_err(|e| e.to_string())?;
+    f_out.flush().map_err(|e| e.to_string())?;
 
     ui.log(&format!(
         "  sampled {} of {} queries (seed={}) → {}",

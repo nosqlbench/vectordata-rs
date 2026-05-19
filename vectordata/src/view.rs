@@ -108,13 +108,20 @@ impl FacetDescriptor {
         self.standard_kind.is_some()
     }
 
-    /// Infer the source type from a file extension.
+    /// Infer the source type from a file extension. Accepts any
+    /// recognized xvec/vvec/scalar extension (including plural forms
+    /// like `fvecs`, `mvecs`) via
+    /// [`crate::typed_access::ElementType::from_extension`], plus the
+    /// container extensions (`slab`, `json`, `parquet`, `npy`, `hdf5`,
+    /// `h5`). The returned string is the lowercase canonical form.
     fn infer_type(source: &str) -> Option<String> {
         let ext = source.rsplit('.').next()?;
-        match ext {
-            "fvec" | "ivec" | "mvec" | "slab" | "json" | "parquet" | "npy" => {
-                Some(ext.to_string())
-            }
+        let lower = ext.to_lowercase();
+        if crate::typed_access::ElementType::from_extension(&lower).is_some() {
+            return Some(lower);
+        }
+        match lower.as_str() {
+            "slab" | "json" | "parquet" | "npy" | "hdf5" | "h5" => Some(lower),
             _ => None,
         }
     }

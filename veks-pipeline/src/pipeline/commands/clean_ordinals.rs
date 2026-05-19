@@ -215,6 +215,7 @@ are excluded from the final dataset.
                 required: true,
                 default: None,
                 description: "Input sorted ordinal index (from compute dedup)".to_string(),
+                extended_description: None,
                 role: OptionRole::Input,
             },
             OptionDesc {
@@ -223,6 +224,7 @@ are excluded from the final dataset.
                 required: false,
                 default: None,
                 description: "Duplicate ordinals to exclude (ivec)".to_string(),
+                extended_description: None,
                 role: OptionRole::Input,
             },
             OptionDesc {
@@ -231,6 +233,7 @@ are excluded from the final dataset.
                 required: false,
                 default: None,
                 description: "Zero-vector ordinals to exclude (ivec)".to_string(),
+                extended_description: None,
                 role: OptionRole::Input,
             },
             OptionDesc {
@@ -239,6 +242,7 @@ are excluded from the final dataset.
                 required: true,
                 default: None,
                 description: "Output clean ordinal index (ivec)".to_string(),
+                extended_description: None,
                 role: OptionRole::Output,
             },
         ]

@@ -282,6 +282,7 @@ impl CommandOp for AnalyzeExploreOp {
                 required: true,
                 default: None,
                 description: "Vector file to explore".to_string(),
+                extended_description: None,
                         role: OptionRole::Input,
         },
             OptionDesc {
@@ -290,6 +291,7 @@ impl CommandOp for AnalyzeExploreOp {
                 required: false,
                 default: None,
                 description: "Semicolon-separated commands for non-interactive use".to_string(),
+                extended_description: None,
                         role: OptionRole::Config,
         },
         ]

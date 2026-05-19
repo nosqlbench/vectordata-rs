@@ -4982,6 +4982,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "sha2",
+ "slabtastic",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -5045,6 +5046,9 @@ dependencies = [
 [[package]]
 name = "veks-completion"
 version = "1.0.7"
+dependencies = [
+ "tempfile",
+]
 
 [[package]]
 name = "veks-core"

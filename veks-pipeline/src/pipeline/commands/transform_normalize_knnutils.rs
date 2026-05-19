@@ -171,6 +171,7 @@ print(f'{{n}} {{zero_count}}')
                 required: true,
                 default: None,
                 description: "Source fvec file".to_string(),
+                extended_description: None,
                 role: OptionRole::Input,
             },
             OptionDesc {
@@ -179,6 +180,7 @@ print(f'{{n}} {{zero_count}}')
                 required: true,
                 default: None,
                 description: "Output normalized fvec file".to_string(),
+                extended_description: None,
                 role: OptionRole::Output,
             },
         ]

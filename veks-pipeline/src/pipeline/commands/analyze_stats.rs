@@ -482,6 +482,7 @@ impl CommandOp for AnalyzeStatsOp {
                 required: true,
                 default: None,
                 description: "Input fvec file".to_string(),
+                extended_description: None,
                         role: OptionRole::Input,
         },
             OptionDesc {
@@ -490,6 +491,7 @@ impl CommandOp for AnalyzeStatsOp {
                 required: false,
                 default: None,
                 description: "Specific dimension to analyze (0-indexed)".to_string(),
+                extended_description: None,
                         role: OptionRole::Config,
         },
             OptionDesc {
@@ -498,6 +500,7 @@ impl CommandOp for AnalyzeStatsOp {
                 required: false,
                 default: Some("false".to_string()),
                 description: "Show summary table for all dimensions".to_string(),
+                extended_description: None,
                         role: OptionRole::Config,
         },
             OptionDesc {
@@ -506,6 +509,7 @@ impl CommandOp for AnalyzeStatsOp {
                 required: false,
                 default: None,
                 description: "Max vectors to sample (default: all)".to_string(),
+                extended_description: None,
                         role: OptionRole::Config,
         },
         ]

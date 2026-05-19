@@ -284,6 +284,7 @@ statistics.
                 required: true,
                 default: None,
                 description: "Source dataset directory or fvec file".to_string(),
+                extended_description: None,
                         role: OptionRole::Input,
         },
             OptionDesc {
@@ -292,6 +293,7 @@ statistics.
                 required: true,
                 default: None,
                 description: "Target directory for derived dataset".to_string(),
+                extended_description: None,
                         role: OptionRole::Output,
         },
             OptionDesc {
@@ -300,6 +302,7 @@ statistics.
                 required: false,
                 default: Some("10000".to_string()),
                 description: "Max vectors to sample for model extraction".to_string(),
+                extended_description: None,
                         role: OptionRole::Config,
         },
             OptionDesc {
@@ -308,6 +311,7 @@ statistics.
                 required: false,
                 default: Some("0".to_string()),
                 description: "Target vector count (0 = same as source)".to_string(),
+                extended_description: None,
                         role: OptionRole::Config,
         },
             OptionDesc {
@@ -316,6 +320,7 @@ statistics.
                 required: false,
                 default: Some("derived".to_string()),
                 description: "Name for the derived dataset".to_string(),
+                extended_description: None,
                         role: OptionRole::Config,
         },
             OptionDesc {
@@ -324,6 +329,7 @@ statistics.
                 required: false,
                 default: Some("false".to_string()),
                 description: "Overwrite target if exists".to_string(),
+                extended_description: None,
                         role: OptionRole::Config,
         },
         ]

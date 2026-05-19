@@ -336,6 +336,7 @@ impl CommandOp for AnalyzeModelDiffOp {
                 required: true,
                 default: None,
                 description: "Original model.json file".to_string(),
+                extended_description: None,
                         role: OptionRole::Input,
         },
             OptionDesc {
@@ -344,6 +345,7 @@ impl CommandOp for AnalyzeModelDiffOp {
                 required: true,
                 default: None,
                 description: "Model.json file to compare against".to_string(),
+                extended_description: None,
                         role: OptionRole::Input,
         },
             OptionDesc {
@@ -352,6 +354,7 @@ impl CommandOp for AnalyzeModelDiffOp {
                 required: false,
                 default: Some("1.0".to_string()),
                 description: "Max allowed average drift percentage".to_string(),
+                extended_description: None,
                         role: OptionRole::Config,
         },
             OptionDesc {
@@ -360,6 +363,7 @@ impl CommandOp for AnalyzeModelDiffOp {
                 required: false,
                 default: Some("2.0".to_string()),
                 description: "Max allowed single-dimension drift percentage".to_string(),
+                extended_description: None,
                         role: OptionRole::Config,
         },
             OptionDesc {
@@ -368,6 +372,7 @@ impl CommandOp for AnalyzeModelDiffOp {
                 required: false,
                 default: Some("false".to_string()),
                 description: "Show all dimensions".to_string(),
+                extended_description: None,
                         role: OptionRole::Config,
         },
         ]

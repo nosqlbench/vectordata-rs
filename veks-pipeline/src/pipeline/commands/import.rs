@@ -260,6 +260,7 @@ work with.
             source_format,
             slab_page_size,
             slab_namespace,
+            schema_sidecar: None,
         };
         let mut sink = match writer::open_sink(&output_path, target_format, &sink_config) {
             Ok(s) => s,
@@ -381,6 +382,7 @@ work with.
                 required: true,
                 default: None,
                 description: "Source file or directory".to_string(),
+                extended_description: None,
                 role: OptionRole::Input,
         },
             OptionDesc {
@@ -389,6 +391,7 @@ work with.
                 required: true,
                 default: None,
                 description: "Output file path".to_string(),
+                extended_description: None,
                 role: OptionRole::Output,
         },
             OptionDesc {
@@ -397,6 +400,7 @@ work with.
                 required: true,
                 default: None,
                 description: "Facet type (e.g. base_vectors, query_vectors)".to_string(),
+                extended_description: None,
                 role: OptionRole::Config,
         },
             OptionDesc {
@@ -405,6 +409,7 @@ work with.
                 required: false,
                 default: None,
                 description: "Source format override (auto-detected if omitted)".to_string(),
+                extended_description: None,
                 role: OptionRole::Config,
         },
             OptionDesc {
@@ -413,6 +418,7 @@ work with.
                 required: false,
                 default: Some("0".to_string()),
                 description: "Number of loader threads (0 = auto)".to_string(),
+                extended_description: None,
                 role: OptionRole::Config,
         },
             OptionDesc {
@@ -421,6 +427,7 @@ work with.
                 required: false,
                 default: None,
                 description: "Maximum number of records to import (all if omitted)".to_string(),
+                extended_description: None,
                 role: OptionRole::Config,
         },
         ]

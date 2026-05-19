@@ -1331,6 +1331,7 @@ impl CommandOp for VerifyKnnOp {
                 required: true,
                 default: None,
                 description: "Base vectors file (fvec, mvec, or dvec)".to_string(),
+                extended_description: None,
                 role: OptionRole::Input,
             },
             OptionDesc {
@@ -1339,6 +1340,7 @@ impl CommandOp for VerifyKnnOp {
                 required: true,
                 default: None,
                 description: "Query vectors file (fvec, mvec, or dvec)".to_string(),
+                extended_description: None,
                 role: OptionRole::Input,
             },
             OptionDesc {
@@ -1347,6 +1349,7 @@ impl CommandOp for VerifyKnnOp {
                 required: true,
                 default: None,
                 description: "Precomputed neighbor indices (ivec)".to_string(),
+                extended_description: None,
                 role: OptionRole::Input,
             },
             OptionDesc {
@@ -1355,6 +1358,7 @@ impl CommandOp for VerifyKnnOp {
                 required: false,
                 default: None,
                 description: "Precomputed neighbor distances (fvec, optional)".to_string(),
+                extended_description: None,
                 role: OptionRole::Input,
             },
             OptionDesc {
@@ -1363,6 +1367,7 @@ impl CommandOp for VerifyKnnOp {
                 required: false,
                 default: Some("L2".to_string()),
                 description: "Distance metric: L2, COSINE, DOT_PRODUCT, L1".to_string(),
+                extended_description: None,
                 role: OptionRole::Config,
             },
             OptionDesc {
@@ -1371,6 +1376,7 @@ impl CommandOp for VerifyKnnOp {
                 required: false,
                 default: Some("100".to_string()),
                 description: "Number of query vectors to spot-check".to_string(),
+                extended_description: None,
                 role: OptionRole::Config,
             },
             OptionDesc {
@@ -1379,6 +1385,7 @@ impl CommandOp for VerifyKnnOp {
                 required: false,
                 default: Some("42".to_string()),
                 description: "Random seed for deterministic sample selection".to_string(),
+                extended_description: None,
                 role: OptionRole::Config,
             },
             OptionDesc {
@@ -1387,6 +1394,7 @@ impl CommandOp for VerifyKnnOp {
                 required: false,
                 default: Some("0.001".to_string()),
                 description: "Floating-point tolerance for distance tie detection".to_string(),
+                extended_description: None,
                 role: OptionRole::Config,
             },
             OptionDesc {
@@ -1395,6 +1403,7 @@ impl CommandOp for VerifyKnnOp {
                 required: true,
                 default: None,
                 description: "Output verification report (JSON)".to_string(),
+                extended_description: None,
                 role: OptionRole::Output,
             },
         ]

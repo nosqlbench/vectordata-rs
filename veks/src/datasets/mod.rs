@@ -223,6 +223,46 @@ pub enum DatasetsCommand {
         #[arg(long)]
         cache_dir: Option<PathBuf>,
     },
+    /// Materialize a profile of an existing dataset as a new
+    /// self-standing dataset (flattens windowed views into their
+    /// own files).
+    Derive {
+        /// Source dataset: catalog name, local directory containing
+        /// `dataset.yaml`, path to a `dataset.yaml` file, or HTTPS URL.
+        /// Local directories take a fast path that bypasses the
+        /// runtime cache + access layer entirely.
+        #[arg(long)]
+        dataset: String,
+
+        /// Profile to derive. Required.
+        #[arg(long)]
+        profile: String,
+
+        /// Output directory for the new dataset.
+        #[arg(long, short = 'o')]
+        output: PathBuf,
+
+        /// Override the derived dataset's name (default: `<source>-<profile>`).
+        #[arg(long)]
+        name: Option<String>,
+
+        /// Overwrite the output directory if it already exists.
+        #[arg(long)]
+        force: bool,
+
+        /// Configuration directory containing catalogs.yaml
+        /// (only used when `--dataset` is a catalog name).
+        #[arg(long, default_value = "~/.config/vectordata")]
+        configdir: String,
+
+        /// Additional catalog directories, file paths, or HTTP URLs.
+        #[arg(long)]
+        catalog: Vec<String>,
+
+        /// Catalog URLs or paths to use *instead* of configured catalogs.
+        #[arg(long = "at")]
+        at: Vec<String>,
+    },
     /// Download and cache dataset facets locally
     Prebuffer {
         /// Dataset name or dataset:profile from catalog
@@ -456,6 +496,15 @@ pub fn run(args: DatasetsArgs) {
                     }
                 }
             }
+        }
+        DatasetsCommand::Derive {
+            dataset, profile, output, name, force, configdir, catalog: raw_catalog, at,
+        } => {
+            let catalog: Vec<String> = raw_catalog.iter().map(|v| resolve_catalog_value(v)).collect();
+            let code = vectordata::datasets::derive::run(
+                &dataset, &profile, &output, &configdir, &catalog, &at,
+                name.as_deref(), force);
+            if code != 0 { std::process::exit(code); }
         }
         DatasetsCommand::Prebuffer { dataset, profile, configdir, catalog: raw_catalog, at, cache_dir } => {
             let catalog: Vec<String> = raw_catalog.iter().map(|v| resolve_catalog_value(v)).collect();

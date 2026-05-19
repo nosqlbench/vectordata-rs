@@ -258,6 +258,7 @@ impl CommandOp for AnalyzeSelectOp {
                 required: true,
                 default: None,
                 description: "Vector file to read from".to_string(),
+                extended_description: None,
                         role: OptionRole::Input,
         },
             OptionDesc {
@@ -266,6 +267,7 @@ impl CommandOp for AnalyzeSelectOp {
                 required: true,
                 default: None,
                 description: "Ordinal(s): single (42), range ([0,10) or 0..10 or 0-9), or comma-separated (0,1,2)".to_string(),
+                extended_description: None,
                         role: OptionRole::Config,
         },
             OptionDesc {
@@ -274,6 +276,7 @@ impl CommandOp for AnalyzeSelectOp {
                 required: false,
                 default: Some("text".to_string()),
                 description: "Output format: text, csv, json".to_string(),
+                extended_description: None,
                         role: OptionRole::Config,
         },
         ]

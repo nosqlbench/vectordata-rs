@@ -155,6 +155,7 @@ Then reference in a downstream step:
                 required: true,
                 default: None,
                 description: "Variable name (used as ${name} in downstream steps)".to_string(),
+                extended_description: None,
                 role: OptionRole::Config,
         },
             OptionDesc {
@@ -163,6 +164,7 @@ Then reference in a downstream step:
                 required: true,
                 default: None,
                 description: "Expression: count:<path>, dim:<path>, or a literal value".to_string(),
+                extended_description: None,
                 role: OptionRole::Config,
         },
         ]

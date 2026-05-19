@@ -147,6 +147,35 @@ impl CompiledMnodeWriter {
         let payload_len = (buf.len() - len_pos - 4) as u32;
         buf[len_pos..len_pos + 4].copy_from_slice(&payload_len.to_le_bytes());
     }
+
+    /// Yield one [`vectordata::metadata_schema::SchemaField`] per
+    /// compiled field, in source-schema order.
+    ///
+    /// Used by the metadata-import path to emit a `:schema` namespace
+    /// sidecar describing the records about to be written. Names are
+    /// recovered from each field's pre-encoded `[name_len][name_bytes]`
+    /// prefix; the wire-level MNode tag name is looked up via
+    /// [`TypeTag::name`].
+    pub fn schema_fields(&self) -> Vec<vectordata::metadata_schema::SchemaField> {
+        self.ops
+            .iter()
+            .map(|op| {
+                let name_len =
+                    u16::from_le_bytes([op.name_prefix[0], op.name_prefix[1]]) as usize;
+                let name = std::str::from_utf8(&op.name_prefix[2..2 + name_len])
+                    .expect("field name is utf8 (already encoded from a str)")
+                    .to_string();
+                let type_name = TypeTag::from_u8(op.type_tag)
+                    .map(|t| t.name().to_string())
+                    .unwrap_or_else(|| format!("tag_{}", op.type_tag));
+                vectordata::metadata_schema::SchemaField {
+                    name,
+                    type_name,
+                    nullable: op.nullable,
+                }
+            })
+            .collect()
+    }
 }
 
 /// Resolve the MNode type tag and `ValueWriter` for an Arrow `DataType`.

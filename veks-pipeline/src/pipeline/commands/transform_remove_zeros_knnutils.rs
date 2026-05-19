@@ -195,6 +195,7 @@ Norm is computed via BLAS `cblas_snrm2` (matching knn\_utils which uses
                 required: true,
                 default: None,
                 description: "Source fvec file".to_string(),
+                extended_description: None,
                 role: OptionRole::Input,
             },
             OptionDesc {
@@ -203,6 +204,7 @@ Norm is computed via BLAS `cblas_snrm2` (matching knn\_utils which uses
                 required: true,
                 default: None,
                 description: "Output fvec file (zeros removed)".to_string(),
+                extended_description: None,
                 role: OptionRole::Output,
             },
             OptionDesc {
@@ -211,6 +213,7 @@ Norm is computed via BLAS `cblas_snrm2` (matching knn\_utils which uses
                 required: false,
                 default: Some("0.0".to_string()),
                 description: "Remove vectors with norm <= tolerance (default: 0.0, exact zeros)".to_string(),
+                extended_description: None,
                 role: OptionRole::Config,
             },
         ]

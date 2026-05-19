@@ -73,6 +73,8 @@ pub mod gen_predicate_keys;
 pub mod inspect_filtered_knn;
 pub mod inspect_partition;
 pub mod gen_predicates;
+pub mod gen_predicates_common;
+pub mod gen_simple_predicates;
 pub mod gen_shuffle;
 #[cfg(feature = "knnutils")]
 pub mod gen_shuffle_knnutils;
@@ -89,6 +91,7 @@ pub mod json_rjq;
 pub mod merkle;
 pub mod set_variable;
 pub mod slab;
+pub mod survey;
 pub mod verify_consolidated;
 #[cfg(feature = "knnutils")]
 pub mod transform_normalize_knnutils;
@@ -129,7 +132,7 @@ pub fn register_all(registry: &mut CommandRegistry) {
     registry.register("analyze select", analyze_select::factory);
     registry.register("analyze slice", analyze_slice::factory);
     registry.register("analyze stats", analyze_stats::factory);
-    registry.register("analyze survey", slab::survey_factory);
+    registry.register("analyze survey", survey::factory);
     registry.register("analyze verify-knn", analyze_verifyknn::factory);
     registry.register("analyze verify-profiles", analyze_verifyprofiles::factory);
     registry.register("analyze measure-normals", analyze_normals::factory);
@@ -185,6 +188,7 @@ pub fn register_all(registry: &mut CommandRegistry) {
     registry.register("generate from-model", gen_from_model::factory);
     registry.register("generate metadata", gen_metadata::factory);
     registry.register("generate predicates", gen_predicates::factory);
+    registry.register("generate simple-predicates", gen_simple_predicates::factory);
     registry.register("generate shuffle", gen_shuffle::factory);
     #[cfg(feature = "knnutils")]
     registry.register("generate shuffle-knnutils", gen_shuffle_knnutils::factory);

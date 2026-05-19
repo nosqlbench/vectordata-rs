@@ -425,6 +425,7 @@ checks, in a single pipeline step.
                 required: true,
                 default: None,
                 description: "Base vectors file (fvec)".into(),
+                extended_description: None,
                 role: OptionRole::Input,
             },
             OptionDesc {
@@ -433,6 +434,7 @@ checks, in a single pipeline step.
                 required: true,
                 default: None,
                 description: "Query vectors file (fvec)".into(),
+                extended_description: None,
                 role: OptionRole::Input,
             },
             OptionDesc {
@@ -441,6 +443,7 @@ checks, in a single pipeline step.
                 required: true,
                 default: None,
                 description: "Ground truth neighbor indices (ivec)".into(),
+                extended_description: None,
                 role: OptionRole::Input,
             },
             OptionDesc {
@@ -449,6 +452,7 @@ checks, in a single pipeline step.
                 required: true,
                 default: None,
                 description: "Expected number of neighbors per query (k)".into(),
+                extended_description: None,
                 role: OptionRole::Config,
             },
             OptionDesc {
@@ -457,6 +461,7 @@ checks, in a single pipeline step.
                 required: false,
                 default: Some("1e-5".into()),
                 description: "Normalization tolerance (knn_utils fvecs_check default)".into(),
+                extended_description: None,
                 role: OptionRole::Config,
             },
             OptionDesc {
@@ -465,6 +470,7 @@ checks, in a single pipeline step.
                 required: false,
                 default: Some("1e-6".into()),
                 description: "Zero-vector tolerance (knn_utils fvecs_check default)".into(),
+                extended_description: None,
                 role: OptionRole::Config,
             },
             OptionDesc {
@@ -473,6 +479,7 @@ checks, in a single pipeline step.
                 required: false,
                 default: Some("IP".into()),
                 description: "Distance metric: IP (inner product), L2".into(),
+                extended_description: None,
                 role: OptionRole::Config,
             },
             OptionDesc {
@@ -481,6 +488,7 @@ checks, in a single pipeline step.
                 required: false,
                 default: Some("100".into()),
                 description: "Number of queries to sample for KNN accuracy check".into(),
+                extended_description: None,
                 role: OptionRole::Config,
             },
             OptionDesc {
@@ -489,6 +497,7 @@ checks, in a single pipeline step.
                 required: false,
                 default: None,
                 description: "Output report file path".into(),
+                extended_description: None,
                 role: OptionRole::Output,
             },
         ]
