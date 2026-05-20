@@ -44,10 +44,21 @@ enum Cmd {
         #[command(subcommand)]
         command: ConfigCmd,
     },
-    /// Operations on catalog-published datasets.
+    /// Operations on catalog-published datasets. With no
+    /// subcommand, launches an interactive TUI browser of every
+    /// dataset reachable through the configured catalogs.
     Datasets {
         #[command(subcommand)]
-        command: DatasetsCmd,
+        command: Option<DatasetsCmd>,
+        /// (TUI-mode only) Configuration directory containing catalogs.yaml.
+        #[arg(long, default_value = "~/.config/vectordata", global = true)]
+        configdir: String,
+        /// (TUI-mode only) Additional catalog directories, file paths, or HTTP URLs.
+        #[arg(long, global = true)]
+        catalog: Vec<String>,
+        /// (TUI-mode only) Catalog URLs or paths to use *instead* of configured catalogs.
+        #[arg(long = "at", global = true)]
+        at: Vec<String>,
     },
     /// Print or activate tab-completion for the current shell.
     ///
@@ -129,10 +140,37 @@ enum CacheCmd {
 
 #[derive(Subcommand)]
 enum DatasetsCmd {
+    /// List datasets from configured or specified catalogs.
+    ///
+    /// Reads catalogs in this order: `--at` URLs/paths (when given)
+    /// override everything; otherwise `--configdir`'s `catalogs.yaml`
+    /// is loaded and any extra `--catalog` locations appended. Each
+    /// resolved location may contain a `catalog.{json,yaml}` or a
+    /// legacy `knn_entries.yaml`; both are honored.
+    #[command(alias = "ls")]
+    List(vectordata::datasets::list::ListArgs),
+
+    /// Verify remote dataset access. Walks every facet declared by
+    /// the dataset's profile, reads the first record via HTTP
+    /// range, and reports success/failure per facet.
+    Probe {
+        #[command(flatten)]
+        args: vectordata::datasets::probe::ProbeArgs,
+        /// Configuration directory containing catalogs.yaml
+        #[arg(long, default_value = "~/.config/vectordata")]
+        configdir: String,
+        /// Additional catalog directories, file paths, or HTTP URLs
+        #[arg(long)]
+        catalog: Vec<String>,
+    },
+
+    /// Generate a curl download script for a dataset's published files.
+    Curlify(vectordata::datasets::curlify::CurlifyArgs),
+
     /// Materialize a profile of an existing dataset into a new,
     /// self-standing dataset directory.
     ///
-    /// Where `prebuffer` brings a profile's bytes into the cache
+    /// Where `precache` brings a profile's bytes into the cache
     /// (still resolved through the parent dataset.yaml), `derive`
     /// copies them out into a fresh directory with its own
     /// dataset.yaml — including flattening any windowed views into
@@ -172,7 +210,7 @@ enum DatasetsCmd {
     /// Download and cache every facet of a dataset profile into the
     /// configured cache directory. Renders a live per-facet +
     /// aggregate progress meter on stderr.
-    Prebuffer {
+    Precache {
         /// `name[:profile]`, a path to a `dataset.yaml` or its
         /// containing directory, or an `http(s)://…` URL.
         spec: String,
@@ -260,15 +298,32 @@ fn main() {
                 cmd_cache_prune(cache_dir, dataset, profile, dry_run)
             }
         },
-        Cmd::Datasets { command } => {
+        Cmd::Datasets { command, configdir, catalog, at } => {
+            // No subcommand → TUI browser. The `Option<DatasetsCmd>`
+            // shape makes `vectordata datasets` valid on its own.
+            let Some(command) = command else {
+                std::process::exit(vectordata::datasets::browser::run(&configdir, &catalog, &at));
+            };
             let code = match command {
+                DatasetsCmd::List(args) => {
+                    vectordata::datasets::list::run_args(args);
+                    0
+                }
+                DatasetsCmd::Probe { args, configdir, catalog } => {
+                    vectordata::datasets::probe::run_args(args, &configdir, &catalog, &[]);
+                    0
+                }
+                DatasetsCmd::Curlify(args) => {
+                    vectordata::datasets::curlify::run_args(args);
+                    0
+                }
                 DatasetsCmd::Derive {
                     dataset, profile, output, name, force, configdir, catalog, at,
                 } => vectordata::datasets::derive::run(
                     &dataset, &profile, &output, &configdir, &catalog, &at,
                     name.as_deref(), force),
-                DatasetsCmd::Prebuffer { spec, configdir, catalog, at, cache_dir } => {
-                    vectordata::datasets::prebuffer::run(
+                DatasetsCmd::Precache { spec, configdir, catalog, at, cache_dir } => {
+                    vectordata::datasets::precache::run(
                         &spec, &configdir, &catalog, &at, cache_dir.as_deref())
                 }
             };

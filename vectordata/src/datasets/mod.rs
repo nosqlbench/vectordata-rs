@@ -9,5 +9,12 @@
 //! `Result`s so the dispatch layer in either binary can simply
 //! `std::process::exit(code)`.
 
+pub mod browser;
+pub mod cache;
+pub mod curlify;
 pub mod derive;
-pub mod prebuffer;
+pub mod drop_cache;
+pub mod filter;
+pub mod list;
+pub mod precache;
+pub mod probe;

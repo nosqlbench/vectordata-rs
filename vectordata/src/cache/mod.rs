@@ -558,7 +558,7 @@ impl CachedChannel {
     }
 
     /// Eagerly download and verify all unverified chunks.
-    pub fn prebuffer(&self) -> io::Result<()> {
+    pub fn precache(&self) -> io::Result<()> {
         self.prebuffer_with_progress(|_| {})
     }
 
@@ -569,7 +569,7 @@ impl CachedChannel {
     /// downloads emit live progress rather than going silent until
     /// every chunk lands. Registering missing chunks in the
     /// in-flight map first prevents a concurrent `read()` from
-    /// double-fetching the same range while prebuffer is running.
+    /// double-fetching the same range while precache is running.
     pub fn prebuffer_with_progress<F: FnMut(&DownloadProgress)>(
         &self,
         callback: F,
@@ -577,7 +577,7 @@ impl CachedChannel {
         // Take a snapshot of which chunks need work, then claim
         // them in the in-flight map under the same lock that the
         // on-demand `ensure_chunks_valid` path uses. This is the
-        // guard against the race "prebuffer starts fetching a
+        // guard against the race "precache starts fetching a
         // chunk → on-demand reader sees `state.is_valid()=false`
         // and `in_flight.get()=None` → fires its own duplicate
         // fetch".
@@ -814,7 +814,7 @@ mod tests {
     // Self-contained throughput probe — *not* a Criterion bench so
     // we don't add a dep just for a perf check. Inject controllable
     // latency per `fetch_range` call to simulate LAN / S3 / cross-
-    // region transports, then measure prebuffer wall-clock at each
+    // region transports, then measure precache wall-clock at each
     // concurrency level.
     //
     // Run with:
@@ -861,8 +861,8 @@ mod tests {
     }
 
     /// Stress-test the in-flight dedup invariant under concurrent
-    /// reads + prebuffer. Multiple reader threads request
-    /// overlapping ranges while a prebuffer is in flight; the
+    /// reads + precache. Multiple reader threads request
+    /// overlapping ranges while a precache is in flight; the
     /// `fetch_calls` counter on the transport must end up equal to
     /// `n_chunks` exactly — no double-fetches, no missed chunks.
     #[test]
@@ -881,7 +881,7 @@ mod tests {
                 .unwrap()
                 .with_concurrency(8));
 
-        // Spawn 8 reader threads + 1 prebuffer thread, all racing
+        // Spawn 8 reader threads + 1 precache thread, all racing
         // to drive the same set of chunks resident.
         let mut handles = Vec::new();
         for t in 0..8 {
@@ -896,7 +896,7 @@ mod tests {
         {
             let ch = channel.clone();
             handles.push(std::thread::spawn(move || {
-                ch.prebuffer().expect("prebuffer should succeed");
+                ch.precache().expect("precache should succeed");
             }));
         }
         for h in handles { h.join().unwrap(); }
@@ -924,7 +924,7 @@ mod tests {
         let mref = MerkleRef::from_content(&data, chunk_size);
 
         println!();
-        println!("=== prebuffer throughput (200 MiB, 200×1 MiB chunks) ===");
+        println!("=== precache throughput (200 MiB, 200×1 MiB chunks) ===");
         println!("{:<18} {:>12} {:>14} {:>14} {:>12}",
             "latency_ms x conc", "fetch calls", "wall_ms", "MB/s", "dup_calls");
 
@@ -940,7 +940,7 @@ mod tests {
                  .with_concurrency(concurrency);
 
                 let start = std::time::Instant::now();
-                channel.prebuffer().unwrap();
+                channel.precache().unwrap();
                 let elapsed = start.elapsed();
 
                 let fetches = inspect.fetch_calls.load(std::sync::atomic::Ordering::Relaxed);
@@ -954,7 +954,7 @@ mod tests {
 
                 // Invariant: in-flight dedup must prevent duplicate
                 // fetches. Even a single-threaded sequential
-                // prebuffer should issue exactly n_chunks calls.
+                // precache should issue exactly n_chunks calls.
                 assert_eq!(fetches, n_chunks as u64,
                     "duplicate fetches detected at conc={concurrency}");
             }
@@ -968,7 +968,7 @@ mod tests {
         let (_dir, channel) = setup_cached_channel(&data, 1024);
 
         assert!(!channel.is_complete());
-        channel.prebuffer().unwrap();
+        channel.precache().unwrap();
         assert!(channel.is_complete());
 
         // Verify all data is correct
@@ -994,7 +994,7 @@ mod tests {
             let channel = CachedChannel::open(
                 transport, original_ref.clone(), dir.path(), "asset.dat",
             ).unwrap();
-            channel.prebuffer().unwrap();
+            channel.precache().unwrap();
             assert!(channel.is_complete());
         }
 
@@ -1032,7 +1032,7 @@ mod tests {
             let channel = CachedChannel::open(
                 transport, mref.clone(), dir.path(), "asset.dat",
             ).unwrap();
-            channel.prebuffer().unwrap();
+            channel.precache().unwrap();
         }
         let transport = Arc::new(MemoryTransport::new(data.clone()));
         let channel = CachedChannel::open(

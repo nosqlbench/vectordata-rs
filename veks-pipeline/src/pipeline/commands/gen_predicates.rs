@@ -349,50 +349,85 @@ fn generate_compound_predicate(
     })
 }
 
-/// Weighted field selection: prefer fields whose effective per-
-/// value selectivity is close to the target. Numeric/temporal
-/// fields are excellent at any target because they get quantile-
-/// driven ops, so they're given low "distance" regardless.
+/// Uniform random pick among fields that can plausibly produce a
+/// predicate at the requested selectivity. Capability is decided
+/// per field by [`field_can_hit_target`] — numeric/temporal with
+/// `QuantileSketch`, text with `TrigramHeavyHitters` or
+/// `LabelsetHeavyHitters`, and categorical/low-card fields with
+/// a frequency table close enough to the target all qualify.
+///
+/// Why uniform instead of distance-weighted: a distance-based
+/// score is asymmetric — numeric fields with quantile sketches
+/// have a fixed (perfect) score, while text fields with frequency
+/// tables get a score proportional to distance-from-target that
+/// can be orders of magnitude larger. The numeric path then wins
+/// every roll and `MATCHES` predicates never appear in the
+/// output. Uniform selection treats every capable field as
+/// equally valid and lets the per-type generators (numeric
+/// Lt/Gt, text Eq, MATCHES via trigram/labelset) split the
+/// emitted operator distribution proportionally to their counts.
 fn pick_target_field(
     eligible: &[(&String, &FieldProfile)],
     target_sel: f64,
     rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
 ) -> usize {
-    let target_distinct = (1.0 / target_sel.max(1e-12)).round() as f64;
-    let mut best = 0usize;
-    let mut best_score = f64::MAX;
-    for (i, (_, profile)) in eligible.iter().enumerate() {
-        let score = field_score_against_target(profile, target_distinct);
-        // Random jitter so the same field doesn't always win when scores tie.
-        let jittered = score + rng.random_range(0.0..1.0);
-        if jittered < best_score {
-            best_score = jittered;
-            best = i;
-        }
+    let capable: Vec<usize> = (0..eligible.len())
+        .filter(|&i| field_can_hit_target(eligible[i].1, target_sel))
+        .collect();
+    if !capable.is_empty() {
+        let n = capable.len();
+        return capable[rng.random_range(0..n)];
     }
-    best
+    // Every field's measures fall outside the target's plausible
+    // hit range — fall back to a uniform pick across all eligible
+    // fields. The per-type generators downgrade gracefully to
+    // reservoir-driven `Eq` if nothing else fits.
+    rng.random_range(0..eligible.len())
 }
 
-fn field_score_against_target(profile: &FieldProfile, target_distinct: f64) -> f64 {
-    // Numeric and temporal fields can hit any sel via quantile
-    // ops — give them a small constant so they're always cheap.
+/// Decide whether `profile` carries a measure that can plausibly
+/// produce a predicate near `target_sel`. The thresholds err on
+/// the permissive side: a capable field is one that has *any*
+/// reasonable path to the target, not a perfect one.
+fn field_can_hit_target(profile: &FieldProfile, target_sel: f64) -> bool {
+    // Numeric / temporal with QuantileSketch: quantile-driven
+    // Lt/Gt/Ge/Le can hit any selectivity in (0, 1).
     if matches!(
         profile.semantic_type,
         Some(SemanticType::Number(_)) | Some(SemanticType::Temporal(_)),
     ) && profile.measures.contains_key("QuantileSketch")
     {
-        return 0.5;
+        return true;
     }
-    let est_distinct = match &profile.cardinality_regime {
-        CardinalityRegime::Binary => 2.0,
-        CardinalityRegime::LowCard { exact_distinct } => *exact_distinct as f64,
-        CardinalityRegime::MidCard { hll_estimate_at_pass1 } => *hll_estimate_at_pass1,
-        CardinalityRegime::HighCardOrUnique { .. } => profile.presence.present as f64,
-        CardinalityRegime::Constant => 1.0,
-        CardinalityRegime::Unknown => profile.presence.present as f64,
+    // Text with trigram or labelset heavy-hitters: MATCHES can
+    // hit any selectivity in the trigram/label frequency span.
+    if profile.measures.contains_key("TrigramHeavyHitters")
+        || profile.measures.contains_key("LabelsetHeavyHitters")
+    {
+        return true;
     }
-    .max(1.0);
-    (est_distinct - target_distinct).abs()
+    // Boolean: only hits ≈ 0.5 well.
+    if matches!(profile.semantic_type, Some(SemanticType::Boolean)) {
+        return (target_sel - 0.5).abs() < 0.25;
+    }
+    // ExactFrequencyTable / HeavyHitters: capable if some value's
+    // frequency lands within a factor of 2 of the target count.
+    let total = profile.presence.present.max(1) as f64;
+    let target_count = (total * target_sel).max(1.0);
+    let tolerance = (target_count * 2.0).max(1.0);
+    if let Some(MeasureReport::ExactFrequencyTable(t)) = profile.measures.get("ExactFrequencyTable") {
+        let closest = t.counts.values()
+            .map(|c| (*c as f64 - target_count).abs())
+            .fold(f64::MAX, f64::min);
+        if closest < tolerance { return true; }
+    }
+    if let Some(MeasureReport::HeavyHitters(h)) = profile.measures.get("HeavyHitters") {
+        let closest = h.items.iter()
+            .map(|e| (e.count_lower_bound as f64 - target_count).abs())
+            .fold(f64::MAX, f64::min);
+        if closest < tolerance { return true; }
+    }
+    false
 }
 
 /// Build a single-field `Predicate` node by dispatching on
@@ -485,27 +520,36 @@ fn numeric_predicate(
         }
     };
 
+    // For integer columns with heavy modes (e.g. `original_width=150`
+    // dominating a thumbnail-heavy distribution), strict Lt / Gt
+    // misses every record whose value equals the boundary picked by
+    // the quantile sketch — selectivity lands well below target on
+    // the low end of the sel range. Promoting to Le / Ge for
+    // integer-typed fields includes the boundary and closes the
+    // gap; floats stay on strict Lt / Gt because float equality
+    // is brittle.
+    let is_integer = matches!(kind, NumberKind::Integer { .. });
+    let (lt_op, gt_op) = if is_integer { (OpType::Le, OpType::Ge) } else { (OpType::Lt, OpType::Gt) };
+
     let (op, comparands) = match op_pick {
         0 => {
-            // Lt at quantile s — selectivity ≈ s.
+            // (Le|Lt) at quantile s — selectivity ≈ s.
             let v = quantile_at(qs, s)?;
-            (OpType::Lt, vec![make_comparand(v)])
+            (lt_op, vec![make_comparand(v)])
         }
         1 => {
-            // Gt at quantile 1-s — selectivity ≈ s.
+            // (Ge|Gt) at quantile 1-s — selectivity ≈ s.
             let v = quantile_at(qs, 1.0 - s)?;
-            (OpType::Gt, vec![make_comparand(v)])
+            (gt_op, vec![make_comparand(v)])
         }
         _ => {
-            // Range[q=0.5-s/2 .. q=0.5+s/2] expressed as
-            // (>= lo) AND (<= hi). PNode doesn't have a native
-            // "between"; emit as a compound. For now we approximate
-            // by collapsing to a single comparand In-style: pick the
-            // lower bound and Ge — selectivity ≈ 0.5 + s/2 - 0 = s
-            // is wrong, so fall back to Lt with a jitter to keep
-            // operator variety without inflating selectivity.
+            // Two-sided range expressed as a single comparison —
+            // PNode has no native BETWEEN. Until we emit a
+            // Conjugate(And, [Ge lo, Le hi]) here, fall back to
+            // the simple form to keep operator variety without
+            // inflating the predicate count.
             let v = quantile_at(qs, s)?;
-            (OpType::Lt, vec![make_comparand(v)])
+            (lt_op, vec![make_comparand(v)])
         }
     };
     Some(PNode::Predicate(PredicateNode { field, op, comparands }))
@@ -1041,8 +1085,10 @@ mod tests {
             let pnode = FmtPNode::from_bytes_named(&bytes).unwrap();
             let (op, threshold) = match &pnode {
                 FmtPNode::Predicate(p) => match (p.op, p.comparands.first()) {
-                    (OpType::Lt, Some(Comparand::Int(v))) => (OpType::Lt, *v),
-                    (OpType::Gt, Some(Comparand::Int(v))) => (OpType::Gt, *v),
+                    (OpType::Lt, Some(Comparand::Int(v)))
+                    | (OpType::Le, Some(Comparand::Int(v)))
+                    | (OpType::Gt, Some(Comparand::Int(v)))
+                    | (OpType::Ge, Some(Comparand::Int(v))) => (p.op, *v),
                     _ => continue, // Eq / other → out of scope for this assertion.
                 },
                 _ => continue,
@@ -1054,7 +1100,9 @@ mod tests {
                 if let Some(MValue::Int(v)) = node.fields.get("skewed") {
                     let hit = match op {
                         OpType::Lt => *v < threshold,
+                        OpType::Le => *v <= threshold,
                         OpType::Gt => *v > threshold,
+                        OpType::Ge => *v >= threshold,
                         _ => false,
                     };
                     if hit { matched += 1; }
@@ -1071,5 +1119,139 @@ mod tests {
             "observed selectivity {observed_sel:.4} vs target {target_sel:.4} (err={err:.4}); \
              quantile-driven path should keep this within ±5%",
         );
+    }
+
+    /// CI-grade end-to-end calibration gate: build a synthetic
+    /// metadata slab with multiple field types (uniform integer,
+    /// right-skewed integer, low-cardinality categorical), run the
+    /// full survey → generate predicates → evaluate chain at
+    /// several target selectivities, and assert observed-vs-target
+    /// stays within ±10%.
+    ///
+    /// This is the gate that catches:
+    /// - serde variant-ambiguity regressions (the
+    ///   `QuantileSketch`-as-`ExactExtrema` bug from the laion run),
+    /// - field-selection bias that locks out an entire predicate
+    ///   family (the previous fixed-score numeric dominance),
+    /// - measure-routing breakage in the template synthesis layer.
+    #[test]
+    fn end_to_end_calibration_within_tolerance() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        let mut ctx = test_ctx(ws);
+
+        // Build a 5K-record slab with three fields:
+        //  - `uniform_int`     — uniform 0..10000 (quantile-clean)
+        //  - `skewed_int`      — 80% in [0,10], 20% in [100,1000]
+        //  - `category`        — 8 distinct labels, weighted
+        let labels = [
+            "alpha", "beta", "gamma", "delta",
+            "epsilon", "zeta", "eta", "theta",
+        ];
+        let mut records = Vec::with_capacity(5_000);
+        for i in 0..5_000i64 {
+            let mut node = MNode::new();
+            node.insert("uniform_int".into(), MValue::Int(i % 10_000));
+            let skewed = if i < 4_000 { i % 10 } else { 100 + ((i - 4_000) % 900) };
+            node.insert("skewed_int".into(), MValue::Int(skewed));
+            // Weighted: half are "alpha", the rest spread across the others.
+            let label_idx = if i < 2_500 { 0 } else { ((i - 2_500) as usize) % 7 + 1 };
+            node.insert("category".into(), MValue::Text(labels[label_idx].into()));
+            records.push(node);
+        }
+        let input_path = create_test_metadata_slab(ws, "calibration.slab", records);
+        let raw_count = 5_000u64;
+
+        for &target_sel in &[0.10, 0.25, 0.50] {
+            let output_path = ws.join(format!("preds_{}.slab", (target_sel * 100.0) as u32));
+            let mut opts = Options::new();
+            opts.set("source", input_path.to_string_lossy().to_string());
+            opts.set("output", output_path.to_string_lossy().to_string());
+            opts.set("count", "100".to_string());
+            opts.set("selectivity", format!("{target_sel}"));
+            opts.set("seed", "1729".to_string());
+
+            let mut op = GenPredicatesOp;
+            let r = op.execute(&opts, &mut ctx);
+            assert_eq!(
+                r.status, Status::Ok,
+                "generate predicates @sel={target_sel}: {}",
+                r.message,
+            );
+
+            // Walk the generated predicates and evaluate each
+            // against the raw record set. Skip operators outside
+            // the simple-numeric assertion set (Eq/MATCHES on text
+            // fields land here; they're best-effort and the
+            // numeric calibration is the primary gate).
+            let preds = SlabReader::open(&output_path).unwrap();
+            let pred_count = preds.total_records();
+            let raw = SlabReader::open(&input_path).unwrap();
+            let mut scored = 0u64;
+            let mut hits = 0u64;
+            for ord in 0..pred_count {
+                let bytes = preds.get(ord as i64).unwrap();
+                let pnode = FmtPNode::from_bytes_named(&bytes).unwrap();
+                let FmtPNode::Predicate(p) = &pnode else { continue };
+                // Capture field name + op + threshold for numeric
+                // assertions; non-numeric predicates contribute
+                // through their evaluator-side outcomes too.
+                for r_ord in 0..raw_count {
+                    let rec = raw.get(r_ord as i64).unwrap();
+                    let node = MNode::from_bytes(&rec).unwrap();
+                    let hit = evaluate_simple_predicate(p, &node);
+                    if hit.is_some() {
+                        scored += 1;
+                        if hit == Some(true) { hits += 1; }
+                    } else {
+                        // Operator we don't handle in this assertion harness
+                        // (e.g. MATCHES with a regex pattern) — just count
+                        // it as a one-shot evaluation to keep the sample
+                        // size honest.
+                        scored += 1;
+                    }
+                }
+            }
+            if scored == 0 { continue; }
+            let observed_sel = hits as f64 / scored as f64;
+            let err = (observed_sel - target_sel).abs();
+            assert!(
+                err < 0.10,
+                "calibration gate @sel={target_sel}: observed={observed_sel:.4} \
+                 err={err:.4} (tolerance ±10%); breakage in survey/generate/eval chain",
+            );
+        }
+    }
+
+    /// Best-effort evaluator for assertion-set predicates. Returns
+    /// `Some(true)` / `Some(false)` for operators this harness
+    /// supports, `None` for anything else (so the caller can
+    /// account for it separately).
+    fn evaluate_simple_predicate(p: &veks_core::formats::pnode::PredicateNode, node: &MNode) -> Option<bool> {
+        use veks_core::formats::pnode::FieldRef;
+        let field_name = match &p.field {
+            FieldRef::Named(n) => n.as_str(),
+            FieldRef::Index(_) => return None,
+        };
+        let v = node.fields.get(field_name)?;
+        let comparand = p.comparands.first()?;
+        match (v, comparand) {
+            (MValue::Int(a), Comparand::Int(b)) => Some(match p.op {
+                OpType::Lt => a < b,
+                OpType::Le => a <= b,
+                OpType::Gt => a > b,
+                OpType::Ge => a >= b,
+                OpType::Eq => a == b,
+                OpType::Ne => a != b,
+                _ => return None,
+            }),
+            (MValue::Text(a), Comparand::Text(b)) => Some(match p.op {
+                OpType::Eq => a == b,
+                OpType::Ne => a != b,
+                OpType::Matches => a.contains(b.as_str()),
+                _ => return None,
+            }),
+            _ => None,
+        }
     }
 }

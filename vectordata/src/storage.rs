@@ -42,7 +42,7 @@ pub(crate) enum Storage {
     Mmap(Mmap),
 
     /// Remote URL with no published `.mref`. Per-read fetches go
-    /// through HTTP RANGE; calling [`prebuffer`] downloads the whole
+    /// through HTTP RANGE; calling [`precache`] downloads the whole
     /// file once into the cache directory (no merkle verification —
     /// we don't have hashes for it) and promotes to mmap, so
     /// subsequent reads on this and any other `Storage` instance
@@ -50,13 +50,13 @@ pub(crate) enum Storage {
     Http {
         transport: HttpTransport,
         total_size: u64,
-        /// Local path where `prebuffer` lands the downloaded file.
+        /// Local path where `precache` lands the downloaded file.
         /// Computed from the URL via `blob_dir_for_url` (under the
         /// `http/` subtree) so multiple `Storage::Http` instances
         /// against the same URL share one on-disk file.
         cache_path: std::path::PathBuf,
-        /// Promoted-mmap view of `cache_path`, set by `prebuffer` or
-        /// at open time if a prior prebuffer left the file with the
+        /// Promoted-mmap view of `cache_path`, set by `precache` or
+        /// at open time if a prior precache left the file with the
         /// expected size.
         mmap: OnceLock<Mmap>,
     },
@@ -296,12 +296,12 @@ impl Storage {
     /// Open a remote URL via direct HTTP RANGE. Crate-internal; the
     /// fallback path of `open_url` (used when no `.mref` is
     /// published). Per-read fetches go over HTTP until the caller
-    /// runs [`prebuffer`], which downloads the whole file into
+    /// runs [`precache`], which downloads the whole file into
     /// `cache_dir/http/<sha256(url)[..2]>/<sha256(url)>/<filename>`
     /// and promotes to mmap.
     ///
     /// At open time, if the cache file already exists with the
-    /// expected size (from a prior prebuffer), this constructor
+    /// expected size (from a prior precache), this constructor
     /// mmap-promotes immediately so the new `Storage::Http` starts
     /// in the zero-copy state.
     pub(crate) fn open_url_http(url: Url) -> io::Result<Self> {
@@ -322,7 +322,7 @@ impl Storage {
         let total_size = ChunkedTransportExt::content_length_for(&transport)?;
 
         let mmap = OnceLock::new();
-        // Restore promotion from a prior prebuffer if the cache file
+        // Restore promotion from a prior precache if the cache file
         // is present with the matching size. We don't have hashes —
         // the size match is the strongest invariant we can check
         // without a `.mref` published.
@@ -354,7 +354,7 @@ impl Storage {
                 Ok(m[offset as usize..end as usize].to_vec())
             }
             Storage::Http { transport, mmap, cache_path, total_size } => {
-                // Mmap fast path — promoted by a prior prebuffer or
+                // Mmap fast path — promoted by a prior precache or
                 // restored at open time from a leftover cache file.
                 try_promote_http(cache_path, *total_size, mmap);
                 if let Some(m) = mmap.get() {
@@ -452,7 +452,7 @@ impl Storage {
     /// `true` for `Mmap` always; `true` for `Cached` once every
     /// chunk is verified (consults the on-disk `.mrkl` state if
     /// the in-memory state is stale, e.g., a sibling instance
-    /// completed it); `true` for `Http` once `prebuffer` has
+    /// completed it); `true` for `Http` once `precache` has
     /// downloaded the whole file.
     pub(crate) fn is_complete(&self) -> bool {
         match self {
@@ -498,11 +498,11 @@ impl Storage {
     ///   was published, so we trust the bytes byte-for-byte from the
     ///   server); mmap-promotes. Errors on download or write
     ///   failure.
-    pub(crate) fn prebuffer(&self) -> io::Result<()> {
+    pub(crate) fn precache(&self) -> io::Result<()> {
         self.prebuffer_with_progress(|_| {})
     }
 
-    /// Same as [`prebuffer`] with a progress callback fired after
+    /// Same as [`precache`] with a progress callback fired after
     /// the underlying download completes. Same strict contract:
     /// either every byte is resident on `Ok`, or an `Err` is
     /// returned.
@@ -518,7 +518,7 @@ impl Storage {
             }
             Storage::Cached { channel, mmap } => {
                 channel.prebuffer_with_progress(cb)?;
-                // Strict-completion check: prebuffer downloaded every
+                // Strict-completion check: precache downloaded every
                 // missing chunk; if any chunk is still unverified
                 // (verification mismatch, race with a concurrent
                 // writer, anything), surface the failure now.
@@ -528,7 +528,7 @@ impl Storage {
                     return Err(io::Error::new(
                         io::ErrorKind::Other,
                         format!(
-                            "prebuffer did not complete: {valid}/{total} chunks verified"
+                            "precache did not complete: {valid}/{total} chunks verified"
                         ),
                     ));
                 }
@@ -682,7 +682,7 @@ impl Storage {
     /// Best-effort path to the local file backing this storage. `Some`
     /// when the bytes are reachable through the filesystem — i.e.,
     /// `Storage::Cached` (the cache file) and `Storage::Http` after
-    /// `prebuffer` has downloaded the file (or if a prior prebuffer
+    /// `precache` has downloaded the file (or if a prior precache
     /// left the cache file at the expected path).
     ///
     /// For `Storage::Mmap` we don't track the originating path
@@ -738,7 +738,7 @@ impl std::fmt::Debug for Storage {
 /// state. The latter handles the case where a *sibling* `Storage`
 /// instance has populated the cache without notifying this
 /// channel's in-memory state. Without this fallback, an early
-/// reader opened before `prebuffer` would never see the promotion
+/// reader opened before `precache` would never see the promotion
 /// triggered by another instance.
 ///
 /// Cheap when already promoted (atomic load on `OnceLock::get`).
@@ -767,7 +767,7 @@ fn try_promote_cached(
 /// variant: if the cache file at `path` exists with the expected
 /// `total_size`, mmap it. Used both at open time and lazily on
 /// the read paths so that an Http storage opened *before* a
-/// `prebuffer` on a sibling instance picks up the promotion the
+/// `precache` on a sibling instance picks up the promotion the
 /// first time it's read.
 fn try_promote_http(
     path: &std::path::Path,
@@ -830,7 +830,7 @@ where F: FnMut(&crate::transport::DownloadProgress),
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
                     format!(
-                        "HTTP prebuffer short read at offset {written}: \
+                        "HTTP precache short read at offset {written}: \
                          expected {want}, got {}", bytes.len()
                     ),
                 ));
@@ -850,7 +850,7 @@ where F: FnMut(&crate::transport::DownloadProgress),
     if meta.len() != total_size {
         return Err(io::Error::new(
             io::ErrorKind::Other,
-            format!("HTTP prebuffer size mismatch: expected {total_size}, got {}", meta.len()),
+            format!("HTTP precache size mismatch: expected {total_size}, got {}", meta.len()),
         ));
     }
     let file = std::fs::File::open(cache_path)?;

@@ -1,7 +1,7 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! `veks datasets probe` — verify remote dataset access.
+//! `<binary> datasets probe` — verify remote dataset access.
 //!
 //! Probes a remote dataset by:
 //! 1. Fetching dataset.yaml from the catalog URL
@@ -9,7 +9,55 @@
 //! 3. For each facet, reading the first record via HTTP range request
 //! 4. Reporting success/failure per facet
 
-use vectordata::dataset::DatasetConfig;
+use crate::dataset::DatasetConfig;
+
+/// Shared clap-derived argument struct for `<binary> datasets
+/// probe`. Both the `vectordata` and `veks` binaries import this.
+#[cfg(feature = "cli")]
+#[derive(Debug, clap::Args)]
+pub struct ProbeArgs {
+    /// Catalog base URL (without trailing `/catalog.json`)
+    #[arg(long = "at")]
+    pub at: Option<String>,
+    /// Dataset name in the catalog
+    pub dataset: String,
+    /// Profile to probe
+    #[arg(long, default_value = "default")]
+    pub profile: String,
+}
+
+/// Drive `probe::run` from a parsed [`ProbeArgs`]. Mirrors the
+/// dispatch in `veks::datasets`: when `--at` is omitted, walk
+/// every configured catalog source looking for the dataset.
+#[cfg(feature = "cli")]
+pub fn run_args(args: ProbeArgs, configdir: &str, catalog: &[String], at_extra: &[String]) {
+    let resolved_at = match args.at {
+        Some(a) => a,
+        None => {
+            use crate::catalog::sources::CatalogSources;
+            let sources = CatalogSources::new()
+                .configure(configdir)
+                .add_catalogs(catalog)
+                .add_catalogs(at_extra);
+            let all_locations: Vec<String> =
+                sources.required().iter().chain(sources.optional().iter()).cloned().collect();
+            if all_locations.is_empty() {
+                eprintln!("No catalog sources configured. Use --at <URL>.");
+                std::process::exit(1);
+            }
+            // First catalog source that resolves wins.
+            let cat = crate::catalog::Catalog::of(&sources);
+            match cat.find_exact(&args.dataset) {
+                Some(_) => all_locations[0].clone(),
+                None => {
+                    eprintln!("Dataset '{}' not found in any configured catalog.", args.dataset);
+                    std::process::exit(1);
+                }
+            }
+        }
+    };
+    run(&resolved_at, &args.dataset, &args.profile);
+}
 
 /// Run the probe command.
 pub fn run(catalog_base: &str, dataset_name: &str, profile_name: &str) {

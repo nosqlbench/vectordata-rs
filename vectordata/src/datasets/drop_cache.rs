@@ -20,7 +20,7 @@ pub fn run(
 ) {
     let cache_dir = cache_dir
         .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| crate::pipeline::commands::config::configured_cache_dir_or_exit());
+        .unwrap_or_else(|| configured_cache_dir_or_exit());
 
     if !cache_dir.exists() {
         println!("Cache directory does not exist: {}", cache_dir.display());
@@ -175,7 +175,7 @@ fn discover_cached_datasets(cache_dir: &Path) -> Vec<PathBuf> {
             // datasets, and would otherwise show up as a fake catalog
             // entry because they contain nested .mrkl files.
             if let Some(name) = path.file_name().and_then(|n| n.to_str())
-                && vectordata::cache_admin::is_reserved_layout_name(name)
+                && crate::cache_admin::is_reserved_layout_name(name)
             {
                 continue;
             }
@@ -294,3 +294,14 @@ fn prompt(msg: &str) -> String {
     io::stdin().read_line(&mut input).unwrap_or(0);
     input
 }
+
+fn configured_cache_dir_or_exit() -> std::path::PathBuf {
+    match crate::settings::cache_dir() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(2);
+        }
+    }
+}
+

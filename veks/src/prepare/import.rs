@@ -1702,24 +1702,30 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
             ("count".into(), args.predicate_count.to_string()),
             ("seed".into(), format!("${{{}}}", "seed")),
         ];
-        if is_simple {
+        // Choose the predicate generator: the simple int-eq path
+        // is a distinct CommandOp (`generate simple-predicates`)
+        // that doesn't need a survey; the survey-driven path
+        // (`generate predicates`) consumes a SurveyReport for
+        // calibrated comparand selection.
+        let pred_run = if is_simple {
             // Simple-int-eq: predicates are generated from configured ranges,
             // no survey needed. Pass range params directly.
-            pred_opts.push(("mode".into(), "simple-int-eq".into()));
             pred_opts.push(("fields".into(), args.metadata_fields.to_string()));
             pred_opts.push(("range-min".into(), args.predicate_range_min.to_string()));
             pred_opts.push(("range-max".into(), args.predicate_range_max.to_string()));
             pred_opts.push(("format".into(), args.synthesis_format.clone()));
+            "generate simple-predicates"
         } else {
             // Survey-based: pass survey file and strategy
             pred_opts.push(("source".into(), meta.metadata_all.path().into()));
             pred_opts.push(("survey".into(), "${cache}/metadata_survey.json".into()));
             pred_opts.push(("strategy".into(), args.predicate_strategy.clone()));
             pred_opts.push(("selectivity".into(), args.selectivity.to_string()));
-        }
+            "generate predicates"
+        };
         steps.push(Step {
             id: "generate-predicates".into(),
-            run: "generate predicates".into(),
+            run: pred_run.into(),
             description: Some(if is_simple {
                 "Generate simple integer equality predicates".into()
             } else {

@@ -75,9 +75,46 @@ impl KnnEntries {
 
     /// Convert to a `DatasetConfig` for use with `TestDataGroup`.
     ///
-    /// Groups entries by dataset name (before the `:`) and creates
-    /// profiles for each.
+    /// Returns the first dataset's config — see [`Self::to_config_for`]
+    /// when the file carries multiple datasets and the caller knows
+    /// which one to load, and [`Self::to_configs`] for the full map.
     pub fn to_config(&self) -> DatasetConfig {
+        let by_dataset = self.group_by_dataset();
+        match by_dataset.into_iter().next() {
+            Some((_, profiles)) => build_dataset_config(profiles),
+            None => DatasetConfig {
+                attributes: HashMap::new(),
+                profiles: HashMap::new(),
+            },
+        }
+    }
+
+    /// Convert to a `DatasetConfig` for the specifically named
+    /// dataset. Returns `None` when the file has no entries for
+    /// that dataset name. Use this from any caller that knows
+    /// which dataset it's loading (e.g. `TestDataGroup::load_from_path`
+    /// can match against the directory name).
+    pub fn to_config_for(&self, dataset_name: &str) -> Option<DatasetConfig> {
+        let by_dataset = self.group_by_dataset();
+        for (name, profiles) in by_dataset {
+            if name == dataset_name {
+                return Some(build_dataset_config(profiles));
+            }
+        }
+        None
+    }
+
+    /// Convert every dataset in the file to a `DatasetConfig`,
+    /// keyed by dataset name. Use this when the caller wants to
+    /// surface the full multi-dataset view.
+    pub fn to_configs(&self) -> IndexMap<String, DatasetConfig> {
+        self.group_by_dataset()
+            .into_iter()
+            .map(|(name, profiles)| (name, build_dataset_config(profiles)))
+            .collect()
+    }
+
+    fn group_by_dataset(&self) -> IndexMap<String, IndexMap<String, &KnnEntry>> {
         let mut datasets: IndexMap<String, IndexMap<String, &KnnEntry>> = IndexMap::new();
         for (key, entry) in &self.entries {
             let (ds_name, profile_name) = if let Some(pos) = key.find(':') {
@@ -87,42 +124,7 @@ impl KnnEntries {
             };
             datasets.entry(ds_name).or_default().insert(profile_name, entry);
         }
-
-        // Use the first dataset
-        let (_ds_name, profiles_map) = match datasets.into_iter().next() {
-            Some(pair) => pair,
-            None => return DatasetConfig {
-                attributes: HashMap::new(),
-                profiles: HashMap::new(),
-            },
-        };
-
-        let mut profiles = HashMap::new();
-        for (profile_name, entry) in profiles_map {
-            profiles.insert(profile_name, ProfileConfig {
-                maxk: None,
-                base_count: None,
-                partition: false,
-                base_vectors: Some(FacetConfig::Simple(entry.base.clone())),
-                base_content: None,
-                query_vectors: Some(FacetConfig::Simple(entry.query.clone())),
-                query_terms: None,
-                query_filters: None,
-                neighbor_indices: Some(FacetConfig::Simple(entry.gt.clone())),
-                neighbor_distances: None,
-                filtered_neighbor_indices: None,
-                filtered_neighbor_distances: None,
-                metadata_content: None,
-                metadata_predicates: None,
-                predicate_results: None,
-                metadata_layout: None,
-            });
-        }
-
-        DatasetConfig {
-            attributes: HashMap::new(),
-            profiles,
-        }
+        datasets
     }
 
     /// List dataset names (unique names before the `:` separator).
@@ -132,6 +134,37 @@ impl KnnEntries {
             .collect();
         names.dedup();
         names
+    }
+}
+
+/// Build a [`DatasetConfig`] from the per-profile mapping produced
+/// by `group_by_dataset`. Shared by `to_config`, `to_config_for`,
+/// and `to_configs` so the facet wiring lives in exactly one place.
+fn build_dataset_config(profiles_map: IndexMap<String, &KnnEntry>) -> DatasetConfig {
+    let mut profiles = HashMap::new();
+    for (profile_name, entry) in profiles_map {
+        profiles.insert(profile_name, ProfileConfig {
+            maxk: None,
+            base_count: None,
+            partition: false,
+            base_vectors: Some(FacetConfig::Simple(entry.base.clone())),
+            base_content: None,
+            query_vectors: Some(FacetConfig::Simple(entry.query.clone())),
+            query_terms: None,
+            query_filters: None,
+            neighbor_indices: Some(FacetConfig::Simple(entry.gt.clone())),
+            neighbor_distances: None,
+            filtered_neighbor_indices: None,
+            filtered_neighbor_distances: None,
+            metadata_content: None,
+            metadata_predicates: None,
+            predicate_results: None,
+            metadata_layout: None,
+        });
+    }
+    DatasetConfig {
+        attributes: HashMap::new(),
+        profiles,
     }
 }
 

@@ -17,6 +17,7 @@
 //! }
 //! ```
 
+pub mod knn_entries;
 pub mod resolver;
 pub mod sources;
 

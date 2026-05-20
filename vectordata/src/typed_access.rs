@@ -308,7 +308,7 @@ impl<T: TypedElement> TypedReader<T> {
 
     /// Force-download every byte into the local cache. No-op for
     /// local files and for non-cacheable HTTP. Idempotent.
-    pub fn prebuffer(&self) -> std::io::Result<()> { self.storage.prebuffer() }
+    pub fn precache(&self) -> std::io::Result<()> { self.storage.precache() }
 
     /// Whether all bytes are locally accessible without network round-trips.
     pub fn is_complete(&self) -> bool { self.storage.is_complete() }

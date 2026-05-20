@@ -10,6 +10,7 @@
 
 use crate::dataset::{CatalogEntry, CatalogLayout};
 
+use super::knn_entries::parse_knn_entries_yaml;
 use super::sources::{catalog_file_for, ensure_trailing_slash, CatalogSources};
 
 /// A resolved catalog containing dataset entries from all configured sources.
@@ -174,24 +175,48 @@ fn print_dataset_with_profiles(entry: &CatalogEntry) {
 /// For layout-embedded entries, the `path` field is resolved relative
 /// to the base location to construct full URLs.
 fn load_catalog_entries(location: &str, entries: &mut Vec<CatalogEntry>, required: bool) {
+    // 1) Try the canonical catalog.json / catalog.yaml at the location.
+    if try_load_canonical_catalog(location, entries) { return; }
+
+    // 2) Fallback: knn_entries.yaml (legacy simplified format). We
+    //    only get here if step (1) didn't find a file — meaning
+    //    neither catalog.json nor catalog.yaml was present at
+    //    `location`. The simplified format is treated as a
+    //    complete replacement, not a supplement.
+    if try_load_knn_entries(location, entries) { return; }
+
+    // 3) Nothing found at this location. Emit the right level of
+    //    diagnostic — required catalogs are an error, optional ones
+    //    log at debug only.
+    if required {
+        eprintln!(
+            "ERROR: no catalog file found at {} \
+             (tried catalog.json, catalog.yaml, knn_entries.yaml)",
+            location,
+        );
+    } else {
+        log::debug!(
+            "optional catalog {} has no catalog.json / catalog.yaml / knn_entries.yaml",
+            location,
+        );
+    }
+}
+
+/// Try the canonical `catalog.{json,yaml}` path at `location`.
+/// Returns `true` when the file was read and successfully parsed
+/// (entries appended); `false` when no canonical catalog file was
+/// found OR the file exists but parsing failed (the caller falls
+/// through to the next probe; the parse failure is logged here).
+fn try_load_canonical_catalog(location: &str, entries: &mut Vec<CatalogEntry>) -> bool {
     let catalog_url = catalog_file_for(location);
 
     let content = if catalog_url.starts_with("http://") || catalog_url.starts_with("https://") {
         match fetch_http(&catalog_url) {
             Ok(c) => c,
-            Err(e) => {
-                if required {
-                    eprintln!("ERROR: failed to load required catalog from {}: {}", catalog_url, e);
-                } else {
-                    log::debug!("optional catalog {} unavailable: {}", catalog_url, e);
-                }
-                return;
-            }
+            Err(_) => return false, // missing — let the caller try the next probe
         }
     } else {
-        // Local file
         let path = std::path::Path::new(&catalog_url);
-        // If the URL points to a directory, try catalog.json inside it
         let file_path = if path.is_dir() {
             let json = path.join("catalog.json");
             if json.is_file() {
@@ -201,50 +226,33 @@ fn load_catalog_entries(location: &str, entries: &mut Vec<CatalogEntry>, require
                 if yaml.is_file() {
                     yaml
                 } else {
-                    if required {
-                        eprintln!("ERROR: no catalog file found in {}", path.display());
-                    }
-                    return;
+                    return false;
                 }
             }
-        } else {
+        } else if path.is_file() {
             path.to_path_buf()
+        } else {
+            return false;
         };
 
         match std::fs::read_to_string(&file_path) {
             Ok(c) => c,
-            Err(e) => {
-                if required {
-                    eprintln!(
-                        "ERROR: failed to read catalog {}: {}",
-                        file_path.display(),
-                        e
-                    );
-                }
-                return;
-            }
+            Err(_) => return false,
         }
     };
 
-    // Parse the content as JSON array of entries
     let parsed: Vec<serde_json::Value> = match serde_json::from_str(&content) {
         Ok(v) => v,
-        Err(_) => {
-            // Try YAML
-            match serde_yaml::from_str(&content) {
-                Ok(v) => v,
-                Err(e) => {
-                    if required {
-                        eprintln!("ERROR: failed to parse catalog {}: {}", catalog_url, e);
-                    }
-                    return;
-                }
+        Err(_) => match serde_yaml::from_str(&content) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("ERROR: failed to parse catalog {}: {}", catalog_url, e);
+                return true; // file exists, but couldn't parse — don't fall through
             }
-        }
+        },
     };
 
     let base_url = ensure_trailing_slash(location);
-
     for value in parsed {
         match remap_entry(&value, &base_url) {
             Ok(entry) => entries.push(entry),
@@ -253,6 +261,57 @@ fn load_catalog_entries(location: &str, entries: &mut Vec<CatalogEntry>, require
             }
         }
     }
+    true
+}
+
+/// Try the legacy `knn_entries.yaml` format at `location` as a
+/// fallback when no canonical catalog file was found. See
+/// [`super::knn_entries`] for the format spec.
+///
+/// Returns `true` if a `knn_entries.yaml` was located and parsed
+/// (whether or not any entries were produced); `false` when no
+/// such file exists at the location.
+fn try_load_knn_entries(location: &str, entries: &mut Vec<CatalogEntry>) -> bool {
+    let url = knn_entries_url_for(location);
+    let content = if url.starts_with("http://") || url.starts_with("https://") {
+        match fetch_http(&url) {
+            Ok(c) => c,
+            Err(_) => return false,
+        }
+    } else {
+        let p = std::path::Path::new(&url);
+        if !p.is_file() { return false; }
+        match std::fs::read_to_string(p) {
+            Ok(c) => c,
+            Err(_) => return false,
+        }
+    };
+
+    match parse_knn_entries_yaml(&content, location) {
+        Ok(parsed) => {
+            entries.extend(parsed);
+            true
+        }
+        Err(e) => {
+            eprintln!("ERROR: failed to parse {}: {}", url, e);
+            true
+        }
+    }
+}
+
+/// Resolve a catalog location to the implied `knn_entries.yaml`
+/// URL/path. Mirrors [`super::sources::catalog_file_for`] but for
+/// the legacy filename.
+pub(crate) fn knn_entries_url_for(location: &str) -> String {
+    if location.ends_with("/knn_entries.yaml") { return location.to_string(); }
+    let p = std::path::Path::new(location);
+    if p.is_file()
+        && p.file_name().and_then(|n| n.to_str()) == Some("knn_entries.yaml")
+    {
+        return location.to_string();
+    }
+    let base = ensure_trailing_slash(location);
+    format!("{}knn_entries.yaml", base)
 }
 
 /// Remap a raw JSON/YAML catalog entry into a `CatalogEntry`.

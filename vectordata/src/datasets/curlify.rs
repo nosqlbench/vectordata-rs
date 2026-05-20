@@ -1,9 +1,28 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! `veks datasets curlify` — generate curl download scripts for a dataset.
+//! `<binary> datasets curlify` — generate curl download scripts for a dataset.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+/// Shared clap-derived argument struct for `<binary> datasets
+/// curlify`. Both the `vectordata` and `veks` binaries import this.
+#[cfg(feature = "cli")]
+#[derive(Debug, clap::Args)]
+pub struct CurlifyArgs {
+    /// Dataset directory or path to dataset.yaml
+    #[arg(default_value = ".")]
+    pub path: PathBuf,
+    /// Output directory for downloads (default: same as dataset directory)
+    #[arg(long)]
+    pub output: Option<PathBuf>,
+}
+
+/// Drive `curlify::run` from a parsed [`CurlifyArgs`].
+#[cfg(feature = "cli")]
+pub fn run_args(args: CurlifyArgs) {
+    run(&args.path, args.output.as_deref());
+}
 
 pub fn run(path: &Path, output: Option<&Path>) {
     let yaml_path = if path.is_file() {
@@ -99,9 +118,9 @@ pub fn run(path: &Path, output: Option<&Path>) {
         std::process::exit(1);
     });
 
-    println!("Wrote download script: {}", crate::check::rel_display(&script_path));
+    println!("Wrote download script: {}", rel_display(&script_path));
     println!("  {} curl command(s)", file_count);
-    println!("  Run with: bash {}", crate::check::rel_display(&script_path));
+    println!("  Run with: bash {}", rel_display(&script_path));
 }
 
 fn extract_view_path(entry: &serde_yaml::Value) -> Option<String> {
@@ -143,5 +162,23 @@ profiles:
         assert!(script.contains("curl"));
         assert!(script.contains("base.fvec"));
         assert!(script.contains("query.fvec"));
+    }
+}
+
+/// Display a path relative to the current working directory.
+/// Falls back to the full path if stripping fails. Inlined here
+/// instead of imported because the canonical home for this
+/// helper lives in the veks `check` module — a vectordata-side
+/// import would create a circular dep.
+fn rel_display(path: &std::path::Path) -> String {
+    if let Ok(cwd) = std::env::current_dir() {
+        path.strip_prefix(&cwd)
+            .map(|r| {
+                let s = r.to_string_lossy().to_string();
+                if s.is_empty() { ".".to_string() } else { s }
+            })
+            .unwrap_or_else(|_| path.to_string_lossy().to_string())
+    } else {
+        path.to_string_lossy().to_string()
     }
 }

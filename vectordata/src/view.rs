@@ -206,7 +206,7 @@ pub trait TestDataView: Send + Sync {
     /// knowing the dataset's transport details.
     fn facet_source(&self, name: &str) -> Option<String>;
 
-    // -- Prebuffer / cache --
+    // -- Precache / cache --
 
     /// Drive every facet of this profile to fully-resident,
     /// zero-copy state. **Strict contract**: returning `Ok(())`
@@ -256,7 +256,7 @@ pub trait TestDataView: Send + Sync {
             }
 
             let storage = self.open_facet_storage(&name)
-                .map_err(|e| Error::Other(format!("open '{name}' for prebuffer: {e}")))?;
+                .map_err(|e| Error::Other(format!("open '{name}' for precache: {e}")))?;
 
             // Post-open notification with the known total size, so
             // the renderer can show "0 / N MiB" instead of "0 / 0"
@@ -290,7 +290,7 @@ pub trait TestDataView: Send + Sync {
                 };
                 (cb_cell.borrow_mut())(&name_str, &progress);
                 fired.set(true);
-            }).map_err(|e| Error::Other(format!("prebuffer '{name}': {e}")))?;
+            }).map_err(|e| Error::Other(format!("precache '{name}': {e}")))?;
 
             // For facets that fired no chunk updates (local mmap,
             // cache already complete) emit one synthetic event so
@@ -311,7 +311,7 @@ pub trait TestDataView: Send + Sync {
     }
 
     /// **Crate-internal hook** used by the default `prebuffer_all`
-    /// implementation. Returns a handle whose `prebuffer*` methods
+    /// implementation. Returns a handle whose `precache*` methods
     /// drive the underlying [`crate::storage::Storage`]. Implementors
     /// rarely override this — the `GenericTestDataView` default is
     /// usually correct.
@@ -350,7 +350,7 @@ pub fn open_facet_typed<T: crate::typed_access::TypedElement>(
     crate::typed_access::TypedReader::<T>::open_auto(&source, native)
 }
 
-/// Snapshot of in-progress prebuffer state for a single facet. Passed
+/// Snapshot of in-progress precache state for a single facet. Passed
 /// to the callback registered with [`TestDataView::prebuffer_all_with_progress`].
 #[derive(Debug, Clone)]
 pub struct PrebufferProgress {
@@ -395,7 +395,7 @@ impl FacetStorage {
     /// `Ok(())`, every read on every reader against this source
     /// (this `FacetStorage` and any other) takes the zero-copy
     /// path on next access.
-    pub fn prebuffer(&self) -> std::io::Result<()> { self.storage.prebuffer() }
+    pub fn precache(&self) -> std::io::Result<()> { self.storage.precache() }
     pub fn prebuffer_with_progress<F>(&self, cb: F) -> std::io::Result<()>
     where F: FnMut(&crate::transport::DownloadProgress)
     { self.storage.prebuffer_with_progress(cb) }
@@ -410,7 +410,7 @@ impl FacetStorage {
     /// (no `.mref` published — there is no local file).
     ///
     /// Hot-path consumers that need a `&Path` to mmap should call
-    /// `prebuffer()` first to ensure the file is fully resident,
+    /// `precache()` first to ensure the file is fully resident,
     /// then use this path. Consumers that just want to read should
     /// prefer `view.facet(name)` / `view.base_vectors()` and let
     /// the reader handle resident-state for them.

@@ -1,11 +1,11 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! `<binary> datasets prebuffer` — drive a dataset profile to
+//! `<binary> datasets precache` — drive a dataset profile to
 //! fully-resident state through the canonical reader API.
 //!
-//! Reachable as `vectordata datasets prebuffer` or `veks datasets
-//! prebuffer` — both binaries dispatch into this module.
+//! Reachable as `vectordata datasets precache` or `veks datasets
+//! precache` — both binaries dispatch into this module.
 //!
 //! Source resolution: catalog name, `name:profile` pair, local path
 //! / `dataset.yaml`, or HTTP URL. The reader layer dispatches
@@ -16,7 +16,7 @@
 //!   verify chunks into the configured cache directory, promote to
 //!   mmap on completion.
 //! - **remote URL without `.mref`** → `Storage::Http`; nothing to
-//!   prebuffer.
+//!   precache.
 //!
 //! The driver prints a live single-line status meter with per-facet
 //! and aggregate progress (carriage-return-overwritten on stderr).
@@ -56,7 +56,7 @@ pub fn run(
         Ok(p) => Some(p),
         Err(e) => {
             // Only fatal if we'll actually need the cache. Local-only
-            // datasets prebuffer fine without one. Defer the fatal
+            // datasets precache fine without one. Defer the fatal
             // until we know the dispatch outcome.
             eprintln!("note: {e}");
             eprintln!();
@@ -216,7 +216,7 @@ fn build_sources(configdir: &str, extra_catalogs: &[String], at: &[String]) -> C
 fn drive_prebuffer(view: &dyn TestDataView) -> i32 {
     let plan = plan_prebuffer(view);
     if plan.facets.is_empty() {
-        println!("Prebuffer: profile declared no facets.");
+        println!("Precache: profile declared no facets.");
         return 0;
     }
     eprintln!("Prebuffering {} facet(s), {} to download.",
@@ -242,11 +242,11 @@ fn drive_prebuffer_all(group: &crate::TestDataGroup) -> i32 {
         }
     }
     if all_facets.is_empty() {
-        println!("Prebuffer: no facets across any profile.");
+        println!("Precache: no facets across any profile.");
         return 0;
     }
     if total_bytes >= crate::PREBUFFER_LARGE_WARNING_BYTES {
-        eprintln!("WARNING: prebuffer announced {} across all profiles \
+        eprintln!("WARNING: precache announced {} across all profiles \
                    (above the {} advisory threshold).",
             fmt_bytes(total_bytes),
             fmt_bytes(crate::PREBUFFER_LARGE_WARNING_BYTES));
@@ -298,7 +298,7 @@ fn plan_prebuffer(view: &dyn TestDataView) -> PrebufferPlan {
     PrebufferPlan { facets, total_bytes }
 }
 
-/// In-place stderr renderer for prebuffer progress.
+/// In-place stderr renderer for precache progress.
 ///
 /// Tracks per-facet `verified_bytes` (last callback wins) and
 /// aggregates across all facets. Updates the status line at ~4 Hz
@@ -395,12 +395,12 @@ impl LiveCtx {
         let done: u64 = self.bytes_per_facet.values().sum();
         match result {
             Ok(_) => {
-                eprintln!("Prebuffer done: {} facet(s), {} in {:.1}s ({}/s).",
+                eprintln!("Precache done: {} facet(s), {} in {:.1}s ({}/s).",
                     self.facet_count, fmt_bytes(done), elapsed,
                     fmt_bytes((done as f64 / elapsed.max(0.001)) as u64));
             }
             Err(e) => {
-                eprintln!("Prebuffer: failed — {e}");
+                eprintln!("Precache: failed — {e}");
             }
         }
     }

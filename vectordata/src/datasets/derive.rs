@@ -4,7 +4,7 @@
 //! `<binary> datasets derive` — materialize a profile of an
 //! existing dataset as a self-standing dataset.
 //!
-//! Where `prebuffer` brings a profile's bytes into the local cache
+//! Where `precache` brings a profile's bytes into the local cache
 //! (still resolved through the parent dataset.yaml), `derive` copies
 //! those bytes into a new directory and emits a fresh dataset.yaml
 //! whose `default` profile points at local files only — no parent,
@@ -132,7 +132,7 @@ fn plan_output_size(src: &Path, kind: FacetKind, window: &DSWindow) -> io::Resul
 /// — useful for derivations on workspaces that aren't fully
 /// wired into the runtime access layer (no `.mref`, no
 /// `settings.yaml` cache_dir, etc.). Catalog / URL sources go
-/// through the runtime access layer (prebuffer-then-copy).
+/// through the runtime access layer (precache-then-copy).
 ///
 /// Returns a process exit code (0 on success).
 pub fn run(
@@ -152,7 +152,7 @@ pub fn run(
 
     // Fast local path: a directory containing dataset.yaml, or a
     // direct path to a dataset.yaml file. No catalog lookup, no
-    // runtime access layer, no prebuffer — just read the YAML
+    // runtime access layer, no precache — just read the YAML
     // and slice the files in place.
     if let Some(yaml_path) = local_dataset_yaml(dataset) {
         return derive_local(&yaml_path, profile, output, name_override);
@@ -163,10 +163,12 @@ pub fn run(
         dataset, profile, output, configdir, extra_catalogs, at, name_override)
 }
 
-/// If `dataset` points at a local directory or a local
-/// `dataset.yaml` file, return the resolved path to the yaml.
-/// Returns `None` for URLs, catalog names, or anything that
-/// doesn't exist on disk.
+/// If `dataset` points at a local directory containing a
+/// `dataset.yaml`, or directly at a `dataset.yaml` file, return
+/// the resolved path. Returns `None` for URLs, catalog names,
+/// directories with only a `knn_entries.yaml` (those flow through
+/// the access-layer path because `derive_local` consumes the rich
+/// `DatasetConfig` schema directly), or anything not on disk.
 fn local_dataset_yaml(dataset: &str) -> Option<std::path::PathBuf> {
     if dataset.starts_with("http://") || dataset.starts_with("https://") {
         return None;
@@ -288,7 +290,7 @@ fn derive_via_access_layer(
 
     eprintln!("Prebuffering source profile so windows can be sliced locally…");
     if let Err(e) = view.prebuffer_all() {
-        eprintln!("Failed to prebuffer source: {e}");
+        eprintln!("Failed to precache source: {e}");
         return 1;
     }
 
@@ -362,7 +364,7 @@ fn plan_row_for(
     let kind = classify_facet(facet_name, &src_path, &src_ext)?;
     // Canonical layout: every materialised facet lives under
     // `profiles/base/`, matching the source-side convention used by
-    // `prebuffer` and every dataset.yaml fixture in the workspace.
+    // `precache` and every dataset.yaml fixture in the workspace.
     // The dest filename stored here is the YAML-visible path
     // relative to the dataset root, so dataset.yaml and the on-disk
     // location stay in sync automatically.
@@ -428,7 +430,7 @@ fn run_plan(
 ) -> i32 {
     let total_bytes: u64 = plan.iter().map(|r| r.expected_bytes).sum();
     eprintln!("Materializing {} facet(s), {} to write.",
-        plan.len(), super::prebuffer::fmt_bytes(total_bytes));
+        plan.len(), super::precache::fmt_bytes(total_bytes));
 
     let mut meter = DeriveMeter::new(plan.len(), total_bytes);
     let mut derived_facets: Vec<(String, String)> = Vec::new();
@@ -599,7 +601,7 @@ impl DeriveMeter {
         // Clear the live line and print a permanent ✓ row.
         eprintln!("\r  [{}/{}] {} \u{2713} {}\u{1b}[K",
             self.facet_index, self.facet_count, facet,
-            super::prebuffer::fmt_bytes(expected_bytes));
+            super::precache::fmt_bytes(expected_bytes));
         self.bytes_done_in_prior_facets =
             self.bytes_done_in_prior_facets.saturating_add(expected_bytes);
         self.current_facet.clear();
@@ -617,7 +619,7 @@ impl DeriveMeter {
         use std::io::Write;
         let aggregate_done = self.bytes_done_in_prior_facets
             .saturating_add(self.current_facet_bytes);
-        let pct_total = super::prebuffer::pct(aggregate_done, self.total_bytes);
+        let pct_total = super::precache::pct(aggregate_done, self.total_bytes);
         let facet_state = match self.phase {
             Phase::Copy => {
                 if self.current_facet_total == 0 {
@@ -625,9 +627,9 @@ impl DeriveMeter {
                 } else {
                     format!(
                         "copy {}% ({}/{})",
-                        super::prebuffer::pct(self.current_facet_bytes, self.current_facet_total),
-                        super::prebuffer::fmt_bytes(self.current_facet_bytes),
-                        super::prebuffer::fmt_bytes(self.current_facet_total),
+                        super::precache::pct(self.current_facet_bytes, self.current_facet_total),
+                        super::precache::fmt_bytes(self.current_facet_bytes),
+                        super::precache::fmt_bytes(self.current_facet_total),
                     )
                 }
             }
@@ -637,9 +639,9 @@ impl DeriveMeter {
                 } else {
                     format!(
                         "merkle {}% ({}/{})",
-                        super::prebuffer::pct(self.current_merkle_bytes, self.current_merkle_total),
-                        super::prebuffer::fmt_bytes(self.current_merkle_bytes),
-                        super::prebuffer::fmt_bytes(self.current_merkle_total),
+                        super::precache::pct(self.current_merkle_bytes, self.current_merkle_total),
+                        super::precache::fmt_bytes(self.current_merkle_bytes),
+                        super::precache::fmt_bytes(self.current_merkle_total),
                     )
                 }
             }
@@ -649,8 +651,8 @@ impl DeriveMeter {
             self.facet_index, self.facet_count, self.current_facet,
             facet_state,
             pct_total,
-            super::prebuffer::fmt_bytes(aggregate_done),
-            super::prebuffer::fmt_bytes(self.total_bytes));
+            super::precache::fmt_bytes(aggregate_done),
+            super::precache::fmt_bytes(self.total_bytes));
         let _ = std::io::stderr().flush();
     }
 
@@ -659,9 +661,9 @@ impl DeriveMeter {
         let done = self.bytes_done_in_prior_facets;
         eprintln!("Derive done: {} facet(s), {} in {:.1}s ({}/s).",
             self.facet_count,
-            super::prebuffer::fmt_bytes(done),
+            super::precache::fmt_bytes(done),
             elapsed,
-            super::prebuffer::fmt_bytes((done as f64 / elapsed.max(0.001)) as u64));
+            super::precache::fmt_bytes((done as f64 / elapsed.max(0.001)) as u64));
     }
 }
 
@@ -923,10 +925,10 @@ fn write_dataset_yaml(
     fs::write(output.join("dataset.yaml"), out)
 }
 
-// ─── Spec resolution (shared shape with prebuffer.rs) ───────────
+// ─── Spec resolution (shared shape with precache.rs) ───────────
 
 /// Resolve a head spec (no profile suffix) to (path_or_url, name).
-/// Mirrors the shape used by `prebuffer.rs::resolve_spec` but
+/// Mirrors the shape used by `precache.rs::resolve_spec` but
 /// returns the resolved name separately so derive can use it as
 /// the default for the derived dataset's name.
 fn resolve_spec(

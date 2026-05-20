@@ -175,9 +175,17 @@ fn resolve_catalog_path(path: &str) -> Vec<String> {
             return vec![path.to_string()];
         }
 
+        // Fallback: `knn_entries.yaml` (legacy simplified format).
+        // Treated as a complete catalog by the resolver — see
+        // `super::knn_entries`.
+        let knn_entries = p.join("knn_entries.yaml");
+        if knn_entries.is_file() {
+            return vec![path.to_string()];
+        }
+
         // Directory without any catalog file
         eprintln!(
-            "WARNING: directory {} has no catalogs.yaml or catalog.json",
+            "WARNING: directory {} has no catalogs.yaml / catalog.json / catalog.yaml / knn_entries.yaml",
             path
         );
         return vec![];

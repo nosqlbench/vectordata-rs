@@ -4,17 +4,22 @@
 //! Root-level `veks datasets` command group.
 //!
 //! Provides inventory and exploration of datasets addressable by the catalog
-//! system. Subcommands: list, plan, cache, curlify, prebuffer, catalog.
+//! system. Subcommands: list, plan, cache, curlify, precache, catalog.
 //!
 //! These are standalone commands — no pipeline context or StreamContext required.
 
-mod cache;
-mod curlify;
-mod drop_cache;
-pub mod filter;
-mod list;
-pub(crate) mod prebuffer;
-mod probe;
+pub(crate) mod precache;
+
+// Every useful `datasets` subcommand now lives in
+// `vectordata::datasets` so library consumers can drive them
+// without depending on veks. Re-exported here so call sites in
+// this file (and any veks-only consumer) keep the short path.
+pub use vectordata::datasets::cache;
+pub use vectordata::datasets::curlify;
+pub use vectordata::datasets::drop_cache;
+pub use vectordata::datasets::filter;
+pub use vectordata::datasets::list;
+pub use vectordata::datasets::probe;
 
 use std::path::PathBuf;
 
@@ -264,7 +269,7 @@ pub enum DatasetsCommand {
         at: Vec<String>,
     },
     /// Download and cache dataset facets locally
-    Prebuffer {
+    Precache {
         /// Dataset name or dataset:profile from catalog
         #[arg(long)]
         dataset: String,
@@ -506,13 +511,13 @@ pub fn run(args: DatasetsArgs) {
                 name.as_deref(), force);
             if code != 0 { std::process::exit(code); }
         }
-        DatasetsCommand::Prebuffer { dataset, profile, configdir, catalog: raw_catalog, at, cache_dir } => {
+        DatasetsCommand::Precache { dataset, profile, configdir, catalog: raw_catalog, at, cache_dir } => {
             let catalog: Vec<String> = raw_catalog.iter().map(|v| resolve_catalog_value(v)).collect();
             let ds = match profile {
                 Some(p) => format!("{}:{}", dataset.split(':').next().unwrap_or(&dataset), p),
                 None => dataset,
             };
-            prebuffer::run(&ds, &configdir, &catalog, &at, cache_dir.as_deref());
+            precache::run(&ds, &configdir, &catalog, &at, cache_dir.as_deref());
         }
     }
 }

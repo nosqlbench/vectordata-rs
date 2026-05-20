@@ -19,7 +19,7 @@
 //! The traits [`VectorReader<T>`] and [`VvecReader<T>`] are the
 //! consumer-facing abstractions; the concrete struct types are
 //! provided for callers that want to reach for the storage-aware
-//! methods like `prebuffer()`, `prefetch_range()`, `release_range()`.
+//! methods like `precache()`, `prefetch_range()`, `release_range()`.
 
 use std::fs::File;
 use std::io;
@@ -118,7 +118,7 @@ pub trait VectorReader<T>: Send + Sync {
     /// Force-download the underlying storage into the local cache so
     /// subsequent reads are zero-copy. No-op for local files and for
     /// non-cacheable HTTP. Idempotent.
-    fn prebuffer(&self) -> io::Result<()> { Ok(()) }
+    fn precache(&self) -> io::Result<()> { Ok(()) }
 
     /// Whether all bytes are locally accessible. `true` for local
     /// files, `true` for cached storage once every chunk is verified,
@@ -139,8 +139,8 @@ pub trait VvecReader<T: VvecElement>: Send + Sync {
         let bytes = self.get_bytes(index)?;
         Ok(bytes.chunks_exact(T::ELEM_SIZE).map(T::from_le_bytes).collect())
     }
-    /// See [`VectorReader::prebuffer`].
-    fn prebuffer(&self) -> io::Result<()> { Ok(()) }
+    /// See [`VectorReader::precache`].
+    fn precache(&self) -> io::Result<()> { Ok(()) }
     /// See [`VectorReader::is_complete`].
     fn is_complete(&self) -> bool { true }
 }
@@ -240,7 +240,7 @@ impl<T> XvecReader<T> {
 
     /// Drive the underlying storage to fully resident state. No-op
     /// for local files and for non-cacheable HTTP.
-    pub fn prebuffer(&self) -> io::Result<()> { self.storage.prebuffer() }
+    pub fn precache(&self) -> io::Result<()> { self.storage.precache() }
 
     pub fn prebuffer_with_progress<F>(&self, cb: F) -> io::Result<()>
     where F: FnMut(&crate::transport::DownloadProgress)
@@ -405,7 +405,7 @@ impl<T: VvecElement> VectorReader<T> for XvecReader<T> {
         Some(unsafe { core::slice::from_raw_parts(ptr, self.dim) })
     }
 
-    fn prebuffer(&self) -> io::Result<()> { self.storage.prebuffer() }
+    fn precache(&self) -> io::Result<()> { self.storage.precache() }
     fn is_complete(&self) -> bool { self.storage.is_complete() }
 }
 
@@ -521,7 +521,7 @@ impl<T: VvecElement> IndexedVvecReader<T> {
         self.storage.mmap_slice(body_start, body_len)
     }
 
-    pub fn prebuffer(&self) -> io::Result<()> { self.storage.prebuffer() }
+    pub fn precache(&self) -> io::Result<()> { self.storage.precache() }
     pub fn is_complete(&self) -> bool { self.storage.is_complete() }
 }
 
@@ -535,7 +535,7 @@ impl<T: VvecElement> VvecReader<T> for IndexedVvecReader<T> {
     fn count(&self) -> usize { self.offsets.len() }
     fn dim_at(&self, index: usize) -> Result<usize, IoError> { self.dim_at(index) }
     fn get_bytes(&self, index: usize) -> Result<Vec<u8>, IoError> { self.get_bytes(index) }
-    fn prebuffer(&self) -> io::Result<()> { self.storage.prebuffer() }
+    fn precache(&self) -> io::Result<()> { self.storage.precache() }
     fn is_complete(&self) -> bool { self.storage.is_complete() }
 }
 

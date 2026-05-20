@@ -1,7 +1,7 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! `veks datasets list` — list datasets from configured or specified catalogs.
+//! `<binary> datasets list` — list datasets from configured or specified catalogs.
 //!
 //! Uses the full catalog resolution chain:
 //! 1. If `--at` is specified, use those locations directly (overrides everything).
@@ -10,11 +10,176 @@
 //! 3. Fetch `catalog.json` from each location (HTTP or local file).
 //! 4. Display the aggregated dataset entries.
 
+use super::filter::{self, DatasetFilter, ProfileView};
 use crate::catalog::resolver::Catalog;
 use crate::catalog::sources::CatalogSources;
-use super::filter::{DatasetFilter, ProfileView};
+use crate::dataset::CatalogEntry;
 
-use vectordata::dataset::CatalogEntry;
+/// Shared clap-derived argument struct for `<binary> datasets
+/// list`. Defined once in vectordata so both the `vectordata`
+/// and `veks` binaries register the exact same option surface
+/// (and tab-complete identically).
+///
+/// Feature-gated on `cli` because clap is itself optional.
+#[cfg(feature = "cli")]
+#[derive(Debug, clap::Args)]
+pub struct ListArgs {
+    /// Configuration directory containing catalogs.yaml
+    #[arg(long, default_value = "~/.config/vectordata")]
+    pub configdir: String,
+
+    /// Additional catalog directories, file paths, or HTTP URLs
+    #[arg(long)]
+    pub catalog: Vec<String>,
+
+    /// Catalog URLs or paths to use *instead* of configured catalogs
+    #[arg(long = "at")]
+    pub at: Vec<String>,
+
+    /// Output format
+    #[arg(long = "output-format", short = 'f', default_value = "text", value_parser = ["text", "csv", "json", "yaml"])]
+    pub output_format: String,
+
+    /// Show detailed information including attributes, tags, and views
+    #[arg(long, short = 'v')]
+    pub verbose: bool,
+
+    /// Group output by: source, profile, or metric (text format only)
+    #[arg(long = "group-by", value_name = "KEY", value_parser = ["source", "profile", "metric"])]
+    pub group_by: Option<String>,
+
+    /// Filter profiles by name (substring, regex, or glob)
+    #[arg(long = "matching-profile")]
+    pub matching_profile: Option<String>,
+
+    /// Select a single dataset:profile; fails if the filters are ambiguous
+    #[arg(long)]
+    pub select: Option<String>,
+
+    /// Filter by dataset name (exact match, substring, regex, or glob)
+    #[arg(long, short = 'd')]
+    pub dataset: Option<String>,
+
+    /// Filter by dataset name (substring, regex, or glob) — alias for --dataset
+    #[arg(long = "matching-name", conflicts_with = "dataset")]
+    pub matching_name: Option<String>,
+
+    /// Filter: dataset must contain this facet/view
+    #[arg(long = "with-facet")]
+    pub facet: Vec<String>,
+
+    /// Filter: dataset must use this distance metric
+    #[arg(long = "with-metric")]
+    pub metric: Option<String>,
+
+    /// Filter by description/notes/model (substring, regex, or glob)
+    #[arg(long = "matching-desc")]
+    pub matching_desc: Option<String>,
+
+    /// Filter: dataset has at least this many base vectors (supports K/M/B suffixes)
+    #[arg(long = "with-min-size")]
+    pub min_size: Option<String>,
+
+    /// Filter: dataset has at most this many base vectors (supports K/M/B suffixes)
+    #[arg(long = "with-max-size")]
+    pub max_size: Option<String>,
+
+    /// Filter: dataset has exactly this many base vectors (supports K/M/B suffixes)
+    #[arg(long = "with-size")]
+    pub size: Option<String>,
+
+    /// Filter: minimum dimensionality of base vectors
+    #[arg(long = "with-min-dim")]
+    pub min_dim: Option<u32>,
+
+    /// Filter: maximum dimensionality of base vectors
+    #[arg(long = "with-max-dim")]
+    pub max_dim: Option<u32>,
+
+    /// Filter: exact dimensionality of base vectors
+    #[arg(long = "with-dim")]
+    pub dim: Option<u32>,
+
+    /// Filter: vector data type (float32, float16, uint8, int32, numpy, hdf5)
+    #[arg(long = "with-vtype")]
+    pub vtype: Option<String>,
+
+    /// Filter: minimum total data size in bytes (supports K/M/G/T suffixes)
+    #[arg(long = "with-data-min")]
+    pub data_min: Option<String>,
+
+    /// Filter: maximum total data size in bytes (supports K/M/G/T suffixes)
+    #[arg(long = "with-data-max")]
+    pub data_max: Option<String>,
+}
+
+/// Drive `list::run` from a parsed [`ListArgs`]. Handles the
+/// glob-vs-regex normalization, size/byte parsing, and filter
+/// assembly that the inline veks-side dispatch used to do.
+///
+/// Callers that want a tiny seam can call this directly:
+///
+/// ```ignore
+/// use vectordata::datasets::list::{ListArgs, run_args};
+/// run_args(args);
+/// ```
+#[cfg(feature = "cli")]
+pub fn run_args(args: ListArgs) {
+    let name_filter = args.dataset.or(args.matching_name);
+    let name = name_filter.map(|p| filter::normalize_match_pattern(&p, "--dataset"));
+    let desc = args.matching_desc.map(|p| filter::normalize_match_pattern(&p, "--matching-desc"));
+    let profile_pat = args
+        .matching_profile
+        .map(|p| filter::normalize_match_pattern(&p, "--matching-profile"));
+
+    let f = DatasetFilter {
+        name,
+        facet: args.facet,
+        metric: args.metric,
+        desc,
+        min_size: parse_size_opt(args.min_size.as_deref(), "--with-min-size"),
+        max_size: parse_size_opt(args.max_size.as_deref(), "--with-max-size"),
+        size: parse_size_opt(args.size.as_deref(), "--with-size"),
+        min_dim: args.min_dim,
+        max_dim: args.max_dim,
+        dim: args.dim,
+        vtype: args.vtype,
+        data_min: parse_bytes_opt(args.data_min.as_deref(), "--with-data-min"),
+        data_max: parse_bytes_opt(args.data_max.as_deref(), "--with-data-max"),
+    };
+    let view = ProfileView::new(profile_pat);
+    run(
+        &args.configdir,
+        &args.catalog,
+        &args.at,
+        &args.output_format,
+        args.verbose,
+        args.group_by.as_deref(),
+        &f,
+        &view,
+        args.select.as_deref(),
+    );
+}
+
+#[cfg(feature = "cli")]
+fn parse_size_opt(raw: Option<&str>, label: &str) -> Option<u64> {
+    raw.map(|s| {
+        filter::parse_size(s).unwrap_or_else(|e| {
+            eprintln!("ERROR: {label}: {e}");
+            std::process::exit(1);
+        })
+    })
+}
+
+#[cfg(feature = "cli")]
+fn parse_bytes_opt(raw: Option<&str>, label: &str) -> Option<u64> {
+    raw.map(|s| {
+        filter::parse_bytes(s).unwrap_or_else(|e| {
+            eprintln!("ERROR: {label}: {e}");
+            std::process::exit(1);
+        })
+    })
+}
 
 /// Summary used for structured (json/yaml) output.
 #[derive(Debug, serde::Serialize)]

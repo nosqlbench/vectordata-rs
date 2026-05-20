@@ -117,7 +117,7 @@ impl UnifiedReader {
 /// alternate flat-cache layout, no manual download.
 ///
 /// For catalog and URL specs, this drives the underlying storage
-/// to fully-resident state via `FacetStorage::prebuffer()` and then
+/// to fully-resident state via `FacetStorage::precache()` and then
 /// returns the local file path the cache landed in. Local-file
 /// inputs are returned unchanged.
 pub(super) fn resolve_source(source: &str) -> PathBuf {
@@ -177,7 +177,7 @@ pub(super) fn resolve_source(source: &str) -> PathBuf {
 }
 
 /// Open the dataset at `group_path` (URL or local path), find the
-/// named facet on the named profile, prebuffer it through the
+/// named facet on the named profile, precache it through the
 /// canonical storage layer, and return the local file path the
 /// bytes landed in.
 fn resolve_via_view(group_path: &str, profile_name: &str, facet_name: &str) -> PathBuf {
@@ -208,8 +208,8 @@ fn resolve_via_view(group_path: &str, profile_name: &str, facet_name: &str) -> P
     // surfaces directly because there is no fallback to a separate
     // cache layout — the canonical Storage::Cached layout is the
     // only place data lands.
-    if let Err(e) = storage.prebuffer() {
-        eprintln!("Error: prebuffer failed for {facet_name}: {e}");
+    if let Err(e) = storage.precache() {
+        eprintln!("Error: precache failed for {facet_name}: {e}");
         std::process::exit(1);
     }
 

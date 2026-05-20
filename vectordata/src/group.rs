@@ -80,12 +80,22 @@ impl TestDataGroup {
             });
         }
 
-        // Fall back to knn_entries.yaml
+        // Fall back to knn_entries.yaml. When the file describes
+        // multiple datasets, prefer the one whose name matches the
+        // containing directory; otherwise return the first
+        // dataset's config (preserves the prior behavior for
+        // single-dataset files).
         let knn_path = dir.join("knn_entries.yaml");
         if knn_path.exists() {
             let entries = crate::knn_entries::KnnEntries::load(&knn_path)
                 .map_err(|e| Error::Other(e))?;
-            let config = entries.to_config();
+            let dir_name = dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+            let config = entries
+                .to_config_for(dir_name)
+                .unwrap_or_else(|| entries.to_config());
             return Ok(Self {
                 source: DataSource::FileSystem(dir),
                 config,
@@ -136,13 +146,21 @@ impl TestDataGroup {
             });
         }
 
-        // Fall back to knn_entries.yaml
+        // Fall back to knn_entries.yaml. When the file describes
+        // multiple datasets, prefer the one whose name matches the
+        // last path segment of the URL; otherwise return the first.
         let knn_url = base_url.join("knn_entries.yaml")?;
         let resp = client.get(knn_url).send()?.error_for_status()?;
         let yaml_content = resp.text()?;
         let entries = crate::knn_entries::KnnEntries::parse(&yaml_content)
             .map_err(|e| Error::Other(e))?;
-        let config = entries.to_config();
+        let url_dir_name = base_url
+            .path_segments()
+            .and_then(|s| s.collect::<Vec<_>>().iter().rev().find(|seg| !seg.is_empty()).cloned())
+            .unwrap_or("");
+        let config = entries
+            .to_config_for(url_dir_name)
+            .unwrap_or_else(|| entries.to_config());
 
         Ok(Self {
             source: DataSource::Http(base_url),
@@ -211,7 +229,7 @@ impl TestDataGroup {
     /// If the announced total download size exceeds
     /// [`PREBUFFER_LARGE_WARNING_BYTES`] (250 MiB) and `warn_cb`
     /// is provided, `warn_cb` is invoked once with the total
-    /// before the download begins. Prebuffer continues regardless
+    /// before the download begins. Precache continues regardless
     /// of the warning — the callback is purely advisory.
     pub fn prebuffer_all_profiles(&self) -> crate::Result<()> {
         self.prebuffer_all_profiles_with_progress(
@@ -228,7 +246,7 @@ impl TestDataGroup {
     /// already-resident facets it fires once with `total_chunks=0`).
     /// `warn_cb(total_bytes)` fires at most once if the announced
     /// total exceeds [`PREBUFFER_LARGE_WARNING_BYTES`] — the caller
-    /// may print a warning to the user; prebuffer continues
+    /// may print a warning to the user; precache continues
     /// regardless.
     pub fn prebuffer_all_profiles_with_progress(
         &self,
@@ -266,7 +284,7 @@ impl TestDataGroup {
         for profile_name in &profiles {
             let view = self.profile(profile_name)
                 .ok_or_else(|| crate::Error::Other(format!(
-                    "profile '{profile_name}' missing during prebuffer")))?;
+                    "profile '{profile_name}' missing during precache")))?;
             view.prebuffer_all_with_progress(&mut |facet, prog| {
                 progress_cb(profile_name, facet, prog);
             })?;

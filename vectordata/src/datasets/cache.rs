@@ -8,14 +8,14 @@ use std::path::Path;
 pub fn run(cache_dir: Option<&Path>, verbose: bool) {
     let cache_dir = cache_dir
         .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| crate::pipeline::commands::config::configured_cache_dir_or_exit());
+        .unwrap_or_else(|| configured_cache_dir_or_exit());
 
     if !cache_dir.exists() {
-        println!("Cache directory does not exist: {}", crate::check::rel_display(&cache_dir));
+        println!("Cache directory does not exist: {}", rel_display(&cache_dir));
         return;
     }
 
-    println!("Cache directory: {}", crate::check::rel_display(&cache_dir));
+    println!("Cache directory: {}", rel_display(&cache_dir));
     println!();
 
     let mut datasets = Vec::new();
@@ -25,7 +25,7 @@ pub fn run(cache_dir: Option<&Path>, verbose: bool) {
             let path = entry.path();
             if !path.is_dir() { continue; }
             if let Some(name) = path.file_name().and_then(|n| n.to_str())
-                && vectordata::cache_admin::is_reserved_layout_name(name)
+                && crate::cache_admin::is_reserved_layout_name(name)
             {
                 continue;
             }
@@ -87,8 +87,8 @@ pub fn run_cache_status_all(
     extra_catalogs: &[String],
     at: &[String],
 ) {
-    let cache_dir = crate::pipeline::commands::config::configured_cache_dir_or_exit();
-    println!("Cache directory: {}", crate::check::rel_display(&cache_dir));
+    let cache_dir = configured_cache_dir_or_exit();
+    println!("Cache directory: {}", rel_display(&cache_dir));
     println!();
 
     if !cache_dir.is_dir() {
@@ -105,7 +105,7 @@ pub fn run_cache_status_all(
 
         for entry in dirs {
             let name = entry.file_name().to_string_lossy().to_string();
-            if vectordata::cache_admin::is_reserved_layout_name(&name) {
+            if crate::cache_admin::is_reserved_layout_name(&name) {
                 continue;
             }
             let ds_path = entry.path();
@@ -144,11 +144,11 @@ pub fn run_cache_status(
     extra_catalogs: &[String],
     at: &[String],
 ) {
-    use vectordata::merkle::MerkleState;
+    use crate::merkle::MerkleState;
     use crate::catalog::resolver::Catalog;
     use crate::catalog::sources::CatalogSources;
 
-    let cache_dir = crate::pipeline::commands::config::configured_cache_dir_or_exit();
+    let cache_dir = configured_cache_dir_or_exit();
     let ds_cache = cache_dir.join(dataset_name);
 
     // Load catalog to get profile info
@@ -165,7 +165,7 @@ pub fn run_cache_status(
     let entry = catalog.find_exact(dataset_name);
 
     println!("Cache status: {}", dataset_name);
-    println!("  Cache dir: {}", crate::check::rel_display(&ds_cache));
+    println!("  Cache dir: {}", rel_display(&ds_cache));
     println!();
 
     if !ds_cache.is_dir() {
@@ -265,7 +265,7 @@ fn scan_mrkl_status(
     base: &Path, dir: &Path,
     rows: &mut Vec<(String, u32, u32, u64, u64, bool, String)>,
 ) {
-    use vectordata::merkle::MerkleState;
+    use crate::merkle::MerkleState;
 
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
@@ -298,7 +298,7 @@ fn scan_mrkl_status(
 ///
 /// Output format: `0-99:ok 100-149:miss 150-200:ok`
 /// Consecutive runs of the same state are collapsed.
-fn chunk_coverage_rle(state: &vectordata::merkle::MerkleState) -> String {
+fn chunk_coverage_rle(state: &crate::merkle::MerkleState) -> String {
     let total = state.shape().total_chunks;
     if total == 0 { return String::new(); }
 
@@ -474,5 +474,35 @@ mod tests {
         let (count, size) = scan_directory(tmp.path());
         assert_eq!(count, 0);
         assert_eq!(size, 0);
+    }
+}
+
+/// CLI-style wrapper around [`crate::settings::cache_dir`]:
+/// prints the configuration error to stderr and exits with code 2
+/// when `cache_dir:` is unset. Mirrors the helper that used to
+/// live in veks-pipeline; inlined here so the cache subcommands
+/// don't depend on the pipeline layer.
+fn configured_cache_dir_or_exit() -> std::path::PathBuf {
+    match crate::settings::cache_dir() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(2);
+        }
+    }
+}
+
+/// Display a path relative to the current working directory.
+/// Falls back to the full path if stripping fails.
+fn rel_display(path: &std::path::Path) -> String {
+    if let Ok(cwd) = std::env::current_dir() {
+        path.strip_prefix(&cwd)
+            .map(|r| {
+                let s = r.to_string_lossy().to_string();
+                if s.is_empty() { ".".to_string() } else { s }
+            })
+            .unwrap_or_else(|_| path.to_string_lossy().to_string())
+    } else {
+        path.to_string_lossy().to_string()
     }
 }

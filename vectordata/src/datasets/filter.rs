@@ -1,7 +1,7 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! Dataset filtering predicates for `veks datasets list`.
+//! Dataset filtering predicates for `vectordata datasets list`.
 //!
 //! Each filter option maps to a predicate applied against [`CatalogEntry`]
 //! fields. Filters compose conjunctively — all specified filters must match.
@@ -14,11 +14,10 @@ use std::sync::OnceLock;
 
 use regex::RegexBuilder;
 
-use vectordata::dataset::{CatalogEntry};
-use vectordata::dataset::source::parse_number_with_suffix;
-
 use crate::catalog::resolver::Catalog;
 use crate::catalog::sources::CatalogSources;
+use crate::dataset::source::parse_number_with_suffix;
+use crate::dataset::CatalogEntry;
 
 /// Detect if a string looks like a glob pattern rather than a regex.
 ///
@@ -269,50 +268,8 @@ fn collect_all_view_names(entry: &CatalogEntry) -> Vec<String> {
 
 /// Resolve a user-provided facet name to its canonical form.
 fn resolve_facet_name(name: &str) -> String {
-    vectordata::dataset::facet::resolve_standard_key(name)
+    crate::dataset::facet::resolve_standard_key(name)
         .unwrap_or_else(|| name.to_string())
-}
-
-/// Check if a description-like field contains the search term.
-///
-/// Searches in: attributes.notes, attributes.model, name, tags values.
-fn matches_description(entry: &CatalogEntry, search: &str) -> bool {
-    let lower = search.to_lowercase();
-    if let Some(ref attrs) = entry.layout.attributes {
-        if let Some(ref notes) = attrs.notes {
-            if notes.to_lowercase().contains(&lower) {
-                return true;
-            }
-        }
-        if let Some(ref model) = attrs.model {
-            if model.to_lowercase().contains(&lower) {
-                return true;
-            }
-        }
-        for v in attrs.tags.values() {
-            if v.to_lowercase().contains(&lower) {
-                return true;
-            }
-        }
-    }
-    entry.name.to_lowercase().contains(&lower)
-}
-
-/// Regex match against description-like fields.
-fn matches_description_regex(entry: &CatalogEntry, pattern: &str) -> bool {
-    let mut texts = vec![entry.name.clone()];
-    if let Some(ref attrs) = entry.layout.attributes {
-        if let Some(ref notes) = attrs.notes {
-            texts.push(notes.clone());
-        }
-        if let Some(ref model) = attrs.model {
-            texts.push(model.clone());
-        }
-        for v in attrs.tags.values() {
-            texts.push(v.clone());
-        }
-    }
-    texts.iter().any(|t| simple_match(pattern, t))
 }
 
 /// Get the maximum base_count across all profiles, falling back to the
@@ -385,30 +342,30 @@ pub fn infer_vtype(entry: &CatalogEntry) -> Option<String> {
     None
 }
 
-/// Map a file extension to a vector type name.
+/// Map a file extension to a vector type name. Local table —
+/// avoids depending on `veks-core` from the `vectordata` library
+/// (which would be a circular dep). Kept in sync with
+/// `veks-core::formats::VecFormat::from_extension` by extension.
 fn vtype_from_extension(path: &str) -> Option<String> {
-    use veks_core::formats::VecFormat;
     let ext = std::path::Path::new(path)
         .extension()
-        .and_then(|e| e.to_str())?;
-    let fmt = VecFormat::from_extension(ext)?;
-    let name = match fmt {
-        VecFormat::Fvec => "float32",
-        VecFormat::Mvec => "float16",
-        VecFormat::Bvec => "uint8",
-        VecFormat::I8vec => "int8",
-        VecFormat::Ivec => "int32",
-        VecFormat::Dvec => "float64",
-        VecFormat::Svec => "int16",
-        VecFormat::U16vec => "uint16",
-        VecFormat::U32vec => "uint32",
-        VecFormat::I64vec => "int64",
-        VecFormat::U64vec => "uint64",
-        VecFormat::Npy => "numpy",
-        VecFormat::Hdf5 => "hdf5",
-        VecFormat::Parquet => "parquet",
-        VecFormat::Slab => return None,
-        // Scalar formats have no vector type name
+        .and_then(|e| e.to_str())?
+        .to_lowercase();
+    let name = match ext.as_str() {
+        "fvec" | "fvecs" => "float32",
+        "mvec" | "mvecs" => "float16",
+        "bvec" | "bvecs" => "uint8",
+        "i8vec" | "i8vecs" => "int8",
+        "ivec" | "ivecs" => "int32",
+        "dvec" | "dvecs" => "float64",
+        "svec" | "svecs" => "int16",
+        "u16vec" | "u16vecs" => "uint16",
+        "u32vec" | "u32vecs" => "uint32",
+        "i64vec" | "i64vecs" => "int64",
+        "u64vec" | "u64vecs" => "uint64",
+        "npy" => "numpy",
+        "h5" | "hdf5" => "hdf5",
+        "parquet" => "parquet",
         _ => return None,
     };
     Some(name.to_string())
@@ -771,7 +728,7 @@ pub fn hidden_list_args() -> Vec<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vectordata::dataset::{CatalogLayout, DSProfile, DSProfileGroup};
+    use crate::dataset::{CatalogLayout, DSProfile, DSProfileGroup};
     use indexmap::IndexMap;
 
     fn entry_with_views(name: &str, views: &[&str]) -> CatalogEntry {
@@ -779,11 +736,11 @@ mod tests {
         for v in views {
             view_map.insert(
                 v.to_string(),
-                vectordata::dataset::DSView {
-                    source: vectordata::dataset::DSSource {
+                crate::dataset::DSView {
+                    source: crate::dataset::DSSource {
                         path: format!("{}.fvec", v),
                         namespace: None,
-                        window: vectordata::dataset::source::DSWindow::default(),
+                        window: crate::dataset::source::DSWindow::default(),
                     },
                     window: None,
                 },
@@ -812,7 +769,7 @@ mod tests {
 
     fn entry_with_attrs(name: &str, metric: &str) -> CatalogEntry {
         let mut e = entry_with_views(name, &["base_vectors", "query_vectors"]);
-        e.layout.attributes = Some(vectordata::dataset::DatasetAttributes {
+        e.layout.attributes = Some(crate::dataset::DatasetAttributes {
             distance_function: Some(metric.to_string()),
             ..Default::default()
         });

@@ -1,17 +1,17 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! `veks datasets prebuffer` — thin delegate over
-//! [`vectordata::datasets::prebuffer::run`].
+//! `veks datasets precache` — thin delegate over
+//! [`vectordata::datasets::precache::run`].
 //!
 //! The implementation (spec resolution, live progress meter,
 //! per-facet + aggregate rendering) lives in the vectordata crate so
-//! `vectordata datasets prebuffer …` and `veks datasets prebuffer …`
+//! `vectordata datasets precache …` and `veks datasets precache …`
 //! produce identical behaviour.
 
 use std::path::Path;
 
-/// Entry point for `veks datasets prebuffer`. Exits the process
+/// Entry point for `veks datasets precache`. Exits the process
 /// with the code returned by the shared implementation.
 pub fn run(
     dataset_spec: &str,
@@ -20,7 +20,7 @@ pub fn run(
     at: &[String],
     cache_dir: Option<&Path>,
 ) {
-    let code = vectordata::datasets::prebuffer::run(
+    let code = vectordata::datasets::precache::run(
         dataset_spec, configdir, extra_catalogs, at, cache_dir);
     if code != 0 { std::process::exit(code); }
 }
@@ -30,7 +30,7 @@ mod tests {
     #[test]
     fn local_dataset_directory_prebuffers_via_canonical_path() {
         // A local dataset with a dataset.yaml — every facet should
-        // resolve to Storage::Mmap and prebuffer should be a no-op.
+        // resolve to Storage::Mmap and precache should be a no-op.
         let tmp = tempfile::tempdir().unwrap();
         let ws = tmp.path();
 

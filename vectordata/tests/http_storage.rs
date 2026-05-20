@@ -19,7 +19,7 @@
 //!   `.mref` cached, remote without `.mref` direct-HTTP) → identical
 //!   per-record bytes.
 //! - `cached_promotion`: cached-remote storage starts not-complete /
-//!   no mmap; after `prebuffer` it is complete and zero-copy.
+//!   no mmap; after `precache` it is complete and zero-copy.
 //! - `vvec_remote`: the matrix cell that motivated this refactor —
 //!   variable-length vvec read over cached HTTP, sidecar offsets
 //!   fetched separately.
@@ -189,7 +189,7 @@ fn fvec_local_cached_direct_agree() {
     assert_eq!(cached.dim(), 16);
 
     // Local is mmap-backed and complete; cached starts not-complete
-    // until prebuffer drives every chunk.
+    // until precache drives every chunk.
     assert!(local.is_complete());
     assert!(!cached.is_complete());
 
@@ -217,7 +217,7 @@ fn fvec_no_mref_falls_back_to_direct_http() {
     let direct = XvecReader::<f32>::open(&url).unwrap();
     assert_eq!(direct.count(), 50);
     assert_eq!(direct.dim(), 8);
-    // Pre-prebuffer: direct-HTTP is not complete (no cache file
+    // Pre-precache: direct-HTTP is not complete (no cache file
     // exists yet — this test's cache root is a fresh process-wide
     // tempdir set up by init_test_cache).
     assert!(!direct.is_complete());
@@ -249,7 +249,7 @@ fn open_vec_dispatches_through_http() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// cached_promotion — Cached → Mmap after prebuffer
+// cached_promotion — Cached → Mmap after precache
 // ═══════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -268,10 +268,10 @@ fn cached_storage_promotes_to_mmap_after_prebuffer() {
     let pre: Option<&[f32]> = <XvecReader<f32> as VectorReader<f32>>::get_slice(&r, 0);
     assert!(pre.is_none(), "Cached storage must not expose mmap_slice before promotion");
 
-    r.prebuffer().unwrap();
-    assert!(r.is_complete(), "after prebuffer, cached storage must be complete");
+    r.precache().unwrap();
+    assert!(r.is_complete(), "after precache, cached storage must be complete");
     let post: Option<&[f32]> = <XvecReader<f32> as VectorReader<f32>>::get_slice(&r, 0);
-    assert!(post.is_some(), "after prebuffer, mmap_slice must succeed");
+    assert!(post.is_some(), "after precache, mmap_slice must succeed");
     let v = post.unwrap();
     assert_eq!(v.len(), 32);
     assert_eq!(v[0], 0.0);
@@ -625,9 +625,9 @@ fn cache_stats_reports_partial_and_full_fill() {
     assert!(pre.total_chunks > 0);
     assert!(pre.content_size > 0);
 
-    storage.prebuffer().unwrap();
+    storage.precache().unwrap();
 
-    let post = storage.cache_stats().expect("still cached after prebuffer");
+    let post = storage.cache_stats().expect("still cached after precache");
     assert!(post.is_complete);
     assert_eq!(post.valid_chunks, post.total_chunks);
     assert_eq!(post.content_size, pre.content_size);
@@ -669,24 +669,24 @@ profiles:
     let view = group.profile("default").unwrap();
 
     let storage = view.open_facet_storage("base_vectors").unwrap();
-    // Pre-prebuffer state for direct-HTTP: never reports merkle
+    // Pre-precache state for direct-HTTP: never reports merkle
     // cache stats, not local, not complete.
     assert!(storage.cache_stats().is_none(),
         "direct-HTTP storage has no merkle cache; cache_stats must be None");
     assert!(!storage.is_local());
     assert!(!storage.is_complete());
 
-    // Strict contract: prebuffer downloads the file (no merkle —
+    // Strict contract: precache downloads the file (no merkle —
     // bytes are trusted from the server) and promotes to mmap.
-    storage.prebuffer().unwrap();
+    storage.precache().unwrap();
     assert!(storage.is_complete(),
-        "direct-HTTP storage MUST be complete after prebuffer (strict contract)");
+        "direct-HTTP storage MUST be complete after precache (strict contract)");
     assert!(storage.is_local(),
-        "direct-HTTP storage MUST be local after prebuffer");
+        "direct-HTTP storage MUST be local after precache");
     // cache_stats stays None — merkle isn't part of the
     // direct-HTTP path.
     assert!(storage.cache_stats().is_none(),
-        "direct-HTTP storage has no merkle cache; cache_stats stays None even after prebuffer");
+        "direct-HTTP storage has no merkle cache; cache_stats stays None even after precache");
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -744,13 +744,13 @@ profiles:
     assert!(!storage.is_complete(),
         "multi-chunk file must not be complete from header read alone");
 
-    storage.prebuffer().unwrap();
+    storage.precache().unwrap();
     assert!(storage.is_complete());
 
-    // After prebuffer, cache_path returns the local cache file and
+    // After precache, cache_path returns the local cache file and
     // is_local is true (mmap-promoted).
     let local = storage.cache_path()
-        .expect("cached storage must report a local cache path after prebuffer");
+        .expect("cached storage must report a local cache path after precache");
     assert!(local.is_file(), "cache_path must point to an existing file");
     assert!(storage.is_local(), "cached storage must be local after promotion");
 }
@@ -777,14 +777,14 @@ profiles:
     assert!(storage.is_complete(), "local dataset facets are complete from the start");
     assert!(storage.cache_path().is_none(),
         "local dataset facets have no cache file (data is read in place)");
-    // prebuffer is a no-op
-    storage.prebuffer().unwrap();
+    // precache is a no-op
+    storage.precache().unwrap();
     assert!(storage.is_complete());
 }
 
 // ═══════════════════════════════════════════════════════════════════════
 // Cross-instance promotion races — the bug downstream consumers hit
-// when an early reader is opened, then prebuffer runs on a separate
+// when an early reader is opened, then precache runs on a separate
 // Storage instance. The early reader MUST see the promoted state on
 // its next read; otherwise every cycle falls through to slow paths.
 // ═══════════════════════════════════════════════════════════════════════
@@ -799,17 +799,17 @@ fn early_xvec_reader_picks_up_promotion_via_get_slice() {
     init_test_cache();
     let url = format!("{}base.fvec", server.base_url());
 
-    // Reader A is opened BEFORE prebuffer runs on a separate Storage.
+    // Reader A is opened BEFORE precache runs on a separate Storage.
     let early = XvecReader::<f32>::open(&url).unwrap();
     assert!(!early.is_complete(), "early reader starts not-complete");
     let pre: Option<&[f32]> = <XvecReader<f32> as VectorReader<f32>>::get_slice(&early, 0);
     assert!(pre.is_none(),
         "trait get_slice on early not-promoted Storage::Cached must be None");
 
-    // Prebuffer through a *different* Storage instance (separate
+    // Precache through a *different* Storage instance (separate
     // open of the same URL).
     let prebufferer = XvecReader::<f32>::open(&url).unwrap();
-    prebufferer.prebuffer().unwrap();
+    prebufferer.precache().unwrap();
     assert!(prebufferer.is_complete());
 
     // Critical assertion: the early reader's get_slice MUST now
@@ -817,11 +817,11 @@ fn early_xvec_reader_picks_up_promotion_via_get_slice() {
     // per-cycle access to fall through to a slow path.
     let post: Option<&[f32]> = <XvecReader<f32> as VectorReader<f32>>::get_slice(&early, 0);
     assert!(post.is_some(),
-        "after prebuffer on a sibling Storage, early reader's get_slice MUST promote");
+        "after precache on a sibling Storage, early reader's get_slice MUST promote");
 
     // is_complete on the early reader must also flip to true (lazy
     // promotion path).
-    assert!(early.is_complete(), "is_complete must reflect post-prebuffer state");
+    assert!(early.is_complete(), "is_complete must reflect post-precache state");
 }
 
 #[test]
@@ -840,8 +840,8 @@ fn early_xvec_reader_picks_up_promotion_via_inherent_get_slice() {
     let early = XvecReader::<f32>::open(&url).unwrap();
     assert!(!early.is_complete());
 
-    // Prebuffer on a separate Storage instance.
-    XvecReader::<f32>::open(&url).unwrap().prebuffer().unwrap();
+    // Precache on a separate Storage instance.
+    XvecReader::<f32>::open(&url).unwrap().precache().unwrap();
 
     // Inherent get_slice would PANIC if mmap_base returns None
     // ("requires mmap-backed storage"). The lazy promotion in
@@ -879,19 +879,19 @@ fn prebuffer_via_view_promotes_other_open_readers() {
     let group = TestDataGroup::load(&server.base_url()).unwrap();
     let view = group.profile("default").unwrap();
 
-    // Open a reader BEFORE prebuffer (early-bound accessor).
+    // Open a reader BEFORE precache (early-bound accessor).
     let base_early = view.base_vectors().unwrap();
     assert!(!base_early.is_complete(),
-        "early reader against remote view should not be complete pre-prebuffer");
+        "early reader against remote view should not be complete pre-precache");
 
-    // Now drive the view's full prebuffer.
+    // Now drive the view's full precache.
     view.prebuffer_all().unwrap();
 
     // The early reader must now expose zero-copy get_slice and a
     // complete state — the bug being: it stays not-complete and
     // get_slice falls back to allocating get(idx) per cycle.
     assert!(base_early.is_complete(),
-        "early reader must reflect post-prebuffer is_complete");
+        "early reader must reflect post-precache is_complete");
     assert!(base_early.get_slice(0).is_some(),
         "early reader's trait get_slice must return zero-copy slice after prebuffer_all");
 }
@@ -911,20 +911,20 @@ fn prebuffer_propagates_failure_for_typed_reader_too() {
     let early = TypedReader::<u8>::open_url(url.clone(), ElementType::U8).unwrap();
     assert!(!early.is_complete());
 
-    // Prebuffer on a separate TypedReader.
+    // Precache on a separate TypedReader.
     let pb = TypedReader::<u8>::open_url(url.clone(), ElementType::U8).unwrap();
-    pb.prebuffer().unwrap();
+    pb.precache().unwrap();
 
     // Early reader picks up promotion on next access.
     assert!(early.is_complete(),
-        "TypedReader must lazy-promote when sibling Storage finishes prebuffer");
+        "TypedReader must lazy-promote when sibling Storage finishes precache");
     // get_native_slice exercises mmap_slice — should now succeed.
     let slice = early.get_native_slice(0);
-    assert!(slice.is_some(), "after prebuffer, get_native_slice must return Some");
+    assert!(slice.is_some(), "after precache, get_native_slice must return Some");
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Strict prebuffer contract: Ok(()) ⇒ fully resident; failure surfaces
+// Strict precache contract: Ok(()) ⇒ fully resident; failure surfaces
 // ═══════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -957,7 +957,7 @@ fn prebuffer_strict_contract_cached() {
 #[test]
 fn prebuffer_for_url_without_mref_downloads_and_promotes() {
     // No .mref published — Storage::open_url falls back to
-    // Storage::Http. Per the strict contract, prebuffer must STILL
+    // Storage::Http. Per the strict contract, precache must STILL
     // download the file (no merkle, just fetch + write + mmap) and
     // promote, not silently no-op.
     let tmp = make_tmp();
@@ -971,16 +971,16 @@ fn prebuffer_for_url_without_mref_downloads_and_promotes() {
     let r = XvecReader::<f32>::open(&url).unwrap();
     assert!(!r.is_complete(), "Http storage starts not-complete");
     let pre: Option<&[f32]> = <XvecReader<f32> as VectorReader<f32>>::get_slice(&r, 0);
-    assert!(pre.is_none(), "Http storage has no mmap pre-prebuffer");
+    assert!(pre.is_none(), "Http storage has no mmap pre-precache");
 
-    r.prebuffer().unwrap();
+    r.precache().unwrap();
 
-    // After prebuffer, reads must be zero-copy.
+    // After precache, reads must be zero-copy.
     assert!(r.is_complete(),
-        "Http storage MUST be complete after prebuffer (no silent no-op)");
+        "Http storage MUST be complete after precache (no silent no-op)");
     let post: Option<&[f32]> = <XvecReader<f32> as VectorReader<f32>>::get_slice(&r, 0);
     assert!(post.is_some(),
-        "Http storage MUST yield zero-copy get_slice after prebuffer");
+        "Http storage MUST yield zero-copy get_slice after precache");
     let v = post.unwrap();
     assert_eq!(v.len(), 8);
     assert_eq!(v[0], 0.0);
@@ -989,7 +989,7 @@ fn prebuffer_for_url_without_mref_downloads_and_promotes() {
 
 #[test]
 fn prebuffer_persists_for_subsequent_opens_without_mref() {
-    // After Http prebuffer downloads the file, a fresh open of the
+    // After Http precache downloads the file, a fresh open of the
     // same URL must restore from the cache file at open time —
     // no second download, immediate zero-copy.
     let tmp = make_tmp();
@@ -999,7 +999,7 @@ fn prebuffer_persists_for_subsequent_opens_without_mref() {
     init_test_cache();
     let url = format!("{}base.fvec", server.base_url());
 
-    XvecReader::<f32>::open(&url).unwrap().prebuffer().unwrap();
+    XvecReader::<f32>::open(&url).unwrap().precache().unwrap();
 
     // Fresh open (different Storage instance) — must see the
     // restored mmap immediately.
@@ -1013,14 +1013,14 @@ fn prebuffer_persists_for_subsequent_opens_without_mref() {
 
 #[test]
 fn prebuffer_fails_loud_when_remote_size_mismatch() {
-    // The Http prebuffer path verifies the post-write file size
+    // The Http precache path verifies the post-write file size
     // against the HEAD-reported total_size. If the server returns
-    // a short body, prebuffer must surface the failure rather than
+    // a short body, precache must surface the failure rather than
     // leaving a truncated cache file in place.
     //
     // We can't easily make the test server return a wrong size, so
     // this asserts the write-then-verify path by triggering a
-    // legitimate prebuffer and confirming the post-write size
+    // legitimate precache and confirming the post-write size
     // matches. (The mismatch error path is covered by the io
     // length-check guard inside http_prebuffer.)
     let tmp = make_tmp();
@@ -1032,7 +1032,7 @@ fn prebuffer_fails_loud_when_remote_size_mismatch() {
 
     let r = XvecReader::<f32>::open(&url).unwrap();
     let pre_size = std::fs::metadata(&path).unwrap().len();
-    r.prebuffer().unwrap();
+    r.precache().unwrap();
 
     // The cache file must exist with the correct size.
     let storage = vectordata::TestDataGroup::load(&server.base_url())
@@ -1053,7 +1053,7 @@ fn prebuffer_fails_loud_when_remote_size_mismatch() {
 #[test]
 fn prebuffer_all_with_progress_propagates_facet_errors() {
     // Build a dataset where one facet's URL points at a 404. The
-    // underlying Storage::open will fail (or its prebuffer will);
+    // underlying Storage::open will fail (or its precache will);
     // prebuffer_all_with_progress MUST return Err, not silently
     // skip the facet.
     let tmp = make_tmp();
@@ -1087,7 +1087,7 @@ profiles:
 #[test]
 fn concurrent_readers_share_promotion_safely() {
     // Spawn N threads, each opening a fresh XvecReader against the
-    // same URL. One thread runs prebuffer; the others spin on
+    // same URL. One thread runs precache; the others spin on
     // get_slice. Every reader must end up promoted with no panic,
     // no torn read, no stale "always None".
     let tmp = make_tmp();
@@ -1103,13 +1103,13 @@ fn concurrent_readers_share_promotion_safely() {
     let pb_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     std::thread::scope(|s| {
-        // Prebuffer thread — sets pb_done when complete so reader
+        // Precache thread — sets pb_done when complete so reader
         // threads can stop polling.
         {
             let url = Arc::clone(&url_arc);
             let pb_done = Arc::clone(&pb_done);
             s.spawn(move || {
-                XvecReader::<f32>::open(&url).unwrap().prebuffer().unwrap();
+                XvecReader::<f32>::open(&url).unwrap().precache().unwrap();
                 pb_done.store(true, std::sync::atomic::Ordering::Release);
             });
         }
@@ -1119,17 +1119,17 @@ fn concurrent_readers_share_promotion_safely() {
             let pb_done = Arc::clone(&pb_done);
             s.spawn(move || {
                 let r = XvecReader::<f32>::open(&url).unwrap();
-                // Poll until prebuffer is done, then once more to
+                // Poll until precache is done, then once more to
                 // give the lazy-promotion path a chance.
                 while !pb_done.load(std::sync::atomic::Ordering::Acquire) {
                     let _ = <XvecReader<f32> as VectorReader<f32>>::get_slice(&r, 0);
                     std::thread::sleep(std::time::Duration::from_millis(2));
                 }
-                // After prebuffer completes, the next get_slice MUST
+                // After precache completes, the next get_slice MUST
                 // return Some — the cross-instance promotion guarantee.
                 let v = <XvecReader<f32> as VectorReader<f32>>::get_slice(&r, 0);
                 assert!(v.is_some(),
-                    "reader must observe promotion immediately after prebuffer thread completes");
+                    "reader must observe promotion immediately after precache thread completes");
                 let v = v.unwrap();
                 assert_eq!(v.len(), 32, "promoted slice must have correct dim");
             });
@@ -1189,7 +1189,7 @@ fn parallel_opens_share_single_cache_channel() {
     // HEAD/GET probe. With the singleton, only the first open does
     // those probes; the rest get a clone of the same Arc<Storage>
     // (no further HTTP). So total connections should be small —
-    // bounded by what one open + one prebuffer needs.
+    // bounded by what one open + one precache needs.
     let tmp = make_tmp();
     let path = tmp.path().join("base.fvec");
     write_fvec(&path, 1000, 32);
@@ -1328,7 +1328,7 @@ fn shared_client_is_singleton_across_storages() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// All-profiles prebuffer + 250 MiB advisory warning
+// All-profiles precache + 250 MiB advisory warning
 // ═══════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -1436,7 +1436,7 @@ fn arc_clone_of_reader_shares_storage() {
     let r1 = Arc::new(XvecReader::<f32>::open(&url).unwrap());
     let r2 = Arc::clone(&r1);
     assert!(!r1.is_complete());
-    r2.prebuffer().unwrap();
+    r2.precache().unwrap();
     // Promotion observed through the *other* clone — same Storage.
     assert!(r1.is_complete());
 }
