@@ -209,7 +209,9 @@ fn fvec_no_mref_falls_back_to_direct_http() {
     let tmp = make_tmp();
     let path = tmp.path().join("base.fvec");
     write_fvec(&path, 50, 8);
-    // *No* .mref written — Storage::open_url must silently fall back.
+    // *No* .mref written — Storage::open_url falls back to the
+    // non-merkle Http variant, which performs chunked lazy
+    // partial reads.
     let server = TestServer::start(tmp.path()).unwrap();
     init_test_cache();
     let url = format!("{}base.fvec", server.base_url());
@@ -217,13 +219,9 @@ fn fvec_no_mref_falls_back_to_direct_http() {
     let direct = XvecReader::<f32>::open(&url).unwrap();
     assert_eq!(direct.count(), 50);
     assert_eq!(direct.dim(), 8);
-    // Pre-precache: direct-HTTP is not complete (no cache file
-    // exists yet — this test's cache root is a fresh process-wide
-    // tempdir set up by init_test_cache).
-    assert!(!direct.is_complete());
 
-    // Per-record reads still work — they go over HTTP one record
-    // at a time.
+    // Per-record reads still work — the chunked layer fetches
+    // covering chunks on demand and caches them locally.
     let local = XvecReader::<f32>::open(path.to_str().unwrap()).unwrap();
     for &i in &[0usize, 7, 42, 49] {
         assert_eq!(local.get(i).unwrap(), direct.get(i).unwrap());
@@ -424,7 +422,11 @@ fn typed_reader_open_url_narrowing_rejected() {
 
 #[test]
 fn typed_reader_open_url_no_mref_still_works() {
-    // No .mref → Storage::open_url falls back to direct HTTP.
+    // No .mref → Storage::open_url falls back to the chunked
+    // Http variant. Tiny files complete after the first read
+    // (single chunk covers the whole file) — but the
+    // user-visible contract is "reads return correct bytes
+    // without any explicit precache".
     let tmp = make_tmp();
     let path = tmp.path().join("metadata.u8");
     write_scalar_u8(&path, 64);
@@ -435,7 +437,6 @@ fn typed_reader_open_url_no_mref_still_works() {
     let r = TypedReader::<u8>::open_url(url, ElementType::U8).unwrap();
     assert_eq!(r.count(), 64);
     assert_eq!(r.get_value(7).unwrap(), 7);
-    assert!(!r.is_complete(), "direct HTTP storage cannot become complete");
 }
 
 #[test]
@@ -969,9 +970,6 @@ fn prebuffer_for_url_without_mref_downloads_and_promotes() {
     let url = format!("{}base.fvec", server.base_url());
 
     let r = XvecReader::<f32>::open(&url).unwrap();
-    assert!(!r.is_complete(), "Http storage starts not-complete");
-    let pre: Option<&[f32]> = <XvecReader<f32> as VectorReader<f32>>::get_slice(&r, 0);
-    assert!(pre.is_none(), "Http storage has no mmap pre-precache");
 
     r.precache().unwrap();
 

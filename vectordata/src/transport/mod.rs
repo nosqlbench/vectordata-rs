@@ -57,6 +57,95 @@ pub(crate) fn shared_client() -> reqwest::blocking::Client {
     shared_client_inner().clone()
 }
 
+/// Returns `true` for any URL whose transport vectordata speaks
+/// directly: `http://`, `https://`, or `s3://`. The `s3://` form
+/// is dispatched as a drop-in for HTTPS via
+/// [`normalize_remote_url`] — the actual fetch uses S3's
+/// virtual-hosted-style HTTPS endpoint, so by the time bytes hit
+/// the wire the URL has been rewritten. Anything else is treated
+/// as a local filesystem path by callers.
+pub(crate) fn is_remote_url(s: &str) -> bool {
+    s.starts_with("http://") || s.starts_with("https://") || s.starts_with("s3://")
+}
+
+/// Translate any remote URL to the actual HTTPS form the shared
+/// HTTP client should fetch. `http(s)://` URLs pass through;
+/// `s3://bucket/key` is rewritten to
+/// `https://<bucket>.s3.<region>.amazonaws.com/<key>`.
+///
+/// Region selection (in priority order):
+/// 1. `AWS_REGION` environment variable.
+/// 2. `AWS_DEFAULT_REGION` environment variable.
+/// 3. `us-east-1` fallback. If the bucket lives elsewhere, S3
+///    returns an HTTP 301 with a `Location` header pointing at
+///    the correct regional endpoint; the shared `reqwest::Client`
+///    follows up to 10 redirects, so the wrong-region default
+///    still works at the cost of one extra round trip.
+///
+/// This is the entire "S3 transport" — anonymous public buckets
+/// (the only kind the protected catalog uses) have no auth
+/// requirement, so a plain virtual-hosted-style HTTPS GET is all
+/// we need. Signed requests / private buckets would require a
+/// proper AWS SDK integration; explicitly out of scope here.
+pub(crate) fn normalize_remote_url(s: &str) -> std::borrow::Cow<'_, str> {
+    if let Some(rest) = s.strip_prefix("s3://") {
+        let (bucket, key) = match rest.split_once('/') {
+            Some(pair) => pair,
+            None => (rest, ""),
+        };
+        let region = std::env::var("AWS_REGION")
+            .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
+            .unwrap_or_else(|_| "us-east-1".to_string());
+        std::borrow::Cow::Owned(format!("https://{bucket}.s3.{region}.amazonaws.com/{key}"))
+    } else {
+        std::borrow::Cow::Borrowed(s)
+    }
+}
+
+#[cfg(test)]
+mod s3_normalisation_tests {
+    use super::*;
+
+    #[test]
+    fn s3_url_rewrites_to_virtual_hosted_https() {
+        // Pin a region so the test is independent of the
+        // surrounding env (`AWS_REGION` may be set in the dev
+        // shell). Pin / restore via a guard so concurrent tests
+        // don't see the mutation.
+        let prev = std::env::var("AWS_REGION").ok();
+        unsafe { std::env::set_var("AWS_REGION", "us-east-2") };
+        let translated = normalize_remote_url("s3://example-bucket/path/to/file.bin");
+        assert_eq!(translated.as_ref(), "https://example-bucket.s3.us-east-2.amazonaws.com/path/to/file.bin");
+        // Bucket-only URL (no key path) yields a trailing slash.
+        let bare = normalize_remote_url("s3://only-bucket");
+        assert_eq!(bare.as_ref(), "https://only-bucket.s3.us-east-2.amazonaws.com/");
+        match prev {
+            Some(v) => unsafe { std::env::set_var("AWS_REGION", v) },
+            None => unsafe { std::env::remove_var("AWS_REGION") },
+        }
+    }
+
+    #[test]
+    fn non_s3_urls_pass_through() {
+        let https = normalize_remote_url("https://example.com/x");
+        assert_eq!(https.as_ref(), "https://example.com/x");
+        let http = normalize_remote_url("http://example.com/x");
+        assert_eq!(http.as_ref(), "http://example.com/x");
+        let path = normalize_remote_url("/abs/path");
+        assert_eq!(path.as_ref(), "/abs/path");
+    }
+
+    #[test]
+    fn is_remote_url_covers_all_dispatched_schemes() {
+        assert!(is_remote_url("http://x/y"));
+        assert!(is_remote_url("https://x/y"));
+        assert!(is_remote_url("s3://bucket/key"));
+        assert!(!is_remote_url("file:///abs"));
+        assert!(!is_remote_url("/abs/path"));
+        assert!(!is_remote_url("relative/path"));
+    }
+}
+
 #[cfg(test)]
 mod shared_client_tests {
     use super::*;

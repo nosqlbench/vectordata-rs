@@ -53,26 +53,38 @@ impl TestDataGroup {
         }
     }
 
-    /// Loads a TestDataGroup from a local directory path or a dataset.yaml file.
+    /// Loads a TestDataGroup from a local directory path or a YAML
+    /// catalog file.
     ///
-    /// Falls back to `knn_entries.yaml` if `dataset.yaml` is not found.
+    /// When `path` names a `.yaml`/`.yml` file, that file *is* the
+    /// catalog regardless of its basename — the content is dispatched
+    /// by shape (`dataset.yaml`-shaped struct vs `knn_entries`-shaped
+    /// map), matching the back-end behaviour of jvector's
+    /// `DataSetLoaderSimpleMFD`. When `path` names a directory, the
+    /// canonical cascade applies: `dataset.yaml` → `knn_entries.yaml`.
     pub fn load_from_path<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref();
-        let (dir, yaml_path) = if path.is_dir() {
-            (path.to_path_buf(), path.join("dataset.yaml"))
-        } else if path.extension().map_or(false, |ext| ext == "yaml" || ext == "yml") {
-            (
-                path.parent().unwrap_or(Path::new(".")).to_path_buf(),
-                path.to_path_buf(),
-            )
-        } else {
-             (path.to_path_buf(), path.join("dataset.yaml"))
-        };
 
-        // Try dataset.yaml first
+        // Explicit catalog file: dispatch by content shape, no
+        // sibling probing.
+        if path.is_file()
+            && path.extension().map_or(false, |ext| ext == "yaml" || ext == "yml")
+        {
+            let dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
+            let yaml_content = fs::read_to_string(path).map_err(Error::ConfigIo)?;
+            let dir_name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let config = parse_catalog_content_for(&yaml_content, dir_name)?;
+            return Ok(Self {
+                source: DataSource::FileSystem(dir),
+                config,
+            });
+        }
+
+        // Directory cascade.
+        let dir = path.to_path_buf();
+        let yaml_path = dir.join("dataset.yaml");
         if yaml_path.exists() {
-            let yaml_content = fs::read_to_string(&yaml_path)
-                .map_err(Error::ConfigIo)?;
+            let yaml_content = fs::read_to_string(&yaml_path).map_err(Error::ConfigIo)?;
             let config: DatasetConfig = serde_yaml::from_str(&yaml_content)?;
             return Ok(Self {
                 source: DataSource::FileSystem(dir),
@@ -114,25 +126,40 @@ impl TestDataGroup {
 
     /// Loads a TestDataGroup from a URL.
     ///
-    /// Falls back to `knn_entries.yaml` if `dataset.yaml` is not found (HTTP 404).
+    /// When the URL path ends in `.yaml`/`.yml`, that file *is* the
+    /// catalog regardless of its basename — the content is dispatched
+    /// by shape (`dataset.yaml`-shaped struct vs `knn_entries`-shaped
+    /// map), matching jvector's `DataSetLoaderSimpleMFD`. When the
+    /// URL targets a directory, the canonical cascade applies:
+    /// `dataset.yaml` → `knn_entries.yaml`.
     pub fn load_from_url(url_str: &str) -> Result<Self> {
-        let mut url = Url::parse(url_str)?;
+        let url = Url::parse(url_str)?;
+        let client = crate::transport::shared_client();
 
-        // If URL doesn't end in .yaml, assume it's a directory
-        if !url.path().ends_with(".yaml") && !url.path().ends_with(".yml") {
-            if !url.path().ends_with('/') {
-                url.set_path(&(url.path().to_owned() + "/"));
-            }
+        // Explicit catalog file: dispatch by content shape, no
+        // sibling probing. The base_url for resolving facet paths is
+        // the URL's parent directory.
+        if url.path().ends_with(".yaml") || url.path().ends_with(".yml") {
+            let base_url = url.join(".")?;
+            let resp = client.get(url.clone()).send()?.error_for_status()?;
+            let yaml_content = resp.text()?;
+            let dir_name = base_url
+                .path_segments()
+                .and_then(|s| s.collect::<Vec<_>>().iter().rev().find(|seg| !seg.is_empty()).cloned())
+                .unwrap_or("");
+            let config = parse_catalog_content_for(&yaml_content, dir_name)?;
+            return Ok(Self {
+                source: DataSource::Http(base_url),
+                config,
+            });
         }
 
-        // Base URL is the directory
-        let base_url = if url.path().ends_with('/') {
-            url.clone()
-        } else {
-            url.join(".")?
-        };
-
-        let client = crate::transport::shared_client();
+        // Directory cascade.
+        let mut url = url;
+        if !url.path().ends_with('/') {
+            url.set_path(&(url.path().to_owned() + "/"));
+        }
+        let base_url = url.clone();
 
         // Try dataset.yaml first
         let dataset_url = base_url.join("dataset.yaml")?;
@@ -298,6 +325,88 @@ impl TestDataGroup {
 /// 250 MiB matches the documented operator guidance: a reminder, not
 /// a hard limit.
 pub const PREBUFFER_LARGE_WARNING_BYTES: u64 = 250 * 1024 * 1024;
+
+impl TestDataGroup {
+    /// Construct a `TestDataGroup` directly from a [`CatalogEntry`]
+    /// whose layout already carries the full profile/facet
+    /// description.
+    ///
+    /// For `knn_entries.yaml`-shape entries the catalog file *is*
+    /// the dataset description — there is no separate
+    /// `dataset.yaml` to fetch. The entry's `path` is a base
+    /// location (potentially an `s3://` or `file://` URL the
+    /// catalog publishes) and every facet path inside the layout
+    /// has already been absolutised by the parser, so the
+    /// data-source field is only used as a fallback when a
+    /// downstream caller hands in a relative path. For canonical
+    /// (`catalog.json`-shape) entries the layout is a summary,
+    /// not the full config — use [`Self::load`] instead.
+    pub fn from_catalog_entry(entry: &crate::dataset::CatalogEntry) -> Result<Self> {
+        // Round-trip the layout through YAML so the canonical
+        // `DatasetConfig` deserializer maps each `DSView` to a
+        // `FacetConfig` (Simple or Detailed). The serialisers on
+        // both sides agree on the wire shape — this is the
+        // documented path for crossing the layout↔config gap
+        // without hand-coding a converter that would drift.
+        let layout_yaml = serde_yaml::to_string(&entry.layout)
+            .map_err(Error::from)?;
+        let config: DatasetConfig = serde_yaml::from_str(&layout_yaml)?;
+        let source = data_source_for(&entry.path)?;
+        Ok(Self { source, config })
+    }
+}
+
+/// Choose a [`DataSource`] for an arbitrary catalog-entry path or
+/// URL. `http(s)://` → `Http(url)`; `file://` is normalised to a
+/// plain filesystem path; everything else is treated as a local
+/// path. Returns an error for malformed URLs.
+fn data_source_for(location: &str) -> Result<DataSource> {
+    if location.starts_with("http://") || location.starts_with("https://") {
+        return Ok(DataSource::Http(Url::parse(location)?));
+    }
+    let path = if let Some(rest) = location.strip_prefix("file://") {
+        // file:///abs → /abs; file://host/abs → /abs (host dropped).
+        if rest.starts_with('/') {
+            rest.to_string()
+        } else if let Some(slash) = rest.find('/') {
+            rest[slash..].to_string()
+        } else {
+            format!("/{rest}")
+        }
+    } else {
+        location.to_string()
+    };
+    Ok(DataSource::FileSystem(PathBuf::from(path)))
+}
+
+/// Parse a catalog YAML by content shape and return the resulting
+/// [`DatasetConfig`] for the dataset matching `prefer_name` (or the
+/// first dataset if no match). Used by both the URL and filesystem
+/// load paths when the location targets an explicit YAML file
+/// regardless of its basename — the shape, not the name, decides
+/// which parser handles it.
+fn parse_catalog_content_for(content: &str, prefer_name: &str) -> Result<DatasetConfig> {
+    // Try the canonical `dataset.yaml` shape first. We probe with a
+    // generic YAML value so we can distinguish "wrong shape — try
+    // the alternative" from "right shape but malformed — surface
+    // the error".
+    let value: serde_yaml::Value = serde_yaml::from_str(content)?;
+    if let serde_yaml::Value::Mapping(ref m) = value {
+        // dataset.yaml is identified by the presence of a top-level
+        // `profiles:` key. knn_entries.yaml's top level is a flat
+        // map of `name:profile` keys plus an optional `_defaults`.
+        if m.contains_key(serde_yaml::Value::String("profiles".into())) {
+            return serde_yaml::from_value(value).map_err(Error::from);
+        }
+    }
+
+    // Fall through to the knn_entries shape.
+    let entries = crate::knn_entries::KnnEntries::parse(content)
+        .map_err(Error::Other)?;
+    Ok(entries
+        .to_config_for(prefer_name)
+        .unwrap_or_else(|| entries.to_config()))
+}
 
 #[cfg(test)]
 mod tests {

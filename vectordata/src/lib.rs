@@ -76,6 +76,7 @@
 /// Merkle-verified download cache for remote datasets. **Crate-private:**
 /// users access cached data implicitly through public reader types.
 pub(crate) mod cache;
+pub(crate) mod chunked_http;
 /// Byte-level storage abstraction shared by every reader. **Crate-private:**
 /// users never see [`storage::Storage`] — they get reader handles whose
 /// transport is chosen for them.
@@ -167,6 +168,10 @@ pub use view::{
 };
 pub use io::{VectorReader, VvecReader, XvecReader, IndexedVvecReader, IoError};
 pub use typed_access::{ElementType, TypedAccessError, TypedReader};
+/// Re-exported so external callers of
+/// [`FacetStorage::prebuffer_with_progress`] can name the
+/// progress type their callback receives.
+pub use transport::DownloadProgress;
 
 use thiserror::Error;
 

@@ -11,7 +11,9 @@
 use crate::dataset::{CatalogEntry, CatalogLayout};
 
 use super::knn_entries::parse_knn_entries_yaml;
-use super::sources::{catalog_file_for, ensure_trailing_slash, CatalogSources};
+use super::sources::{
+    catalog_file_for, ensure_trailing_slash, looks_like_catalog_file, CatalogSources,
+};
 
 /// A resolved catalog containing dataset entries from all configured sources.
 #[derive(Debug, Clone)]
@@ -107,6 +109,13 @@ impl Catalog {
     pub fn open(&self, name: &str) -> crate::Result<crate::TestDataGroup> {
         let entry = self.find_exact(name)
             .ok_or_else(|| crate::Error::Other(format!("dataset '{}' not found in catalog", name)))?;
+        // For knn_entries-shape entries the catalog file is the
+        // dataset description — there's no `dataset.yaml` to
+        // re-fetch. Synthesize the group directly from the
+        // embedded layout.
+        if entry.dataset_type == "knn_entries.yaml" {
+            return crate::TestDataGroup::from_catalog_entry(entry);
+        }
         crate::TestDataGroup::load(&entry.path)
     }
 
@@ -174,20 +183,31 @@ fn print_dataset_with_profiles(entry: &CatalogEntry) {
 /// The location may be an HTTP URL or a local file/directory path.
 /// For layout-embedded entries, the `path` field is resolved relative
 /// to the base location to construct full URLs.
+///
+/// Resolution strategy:
+///
+/// 1. **Explicit catalog file** — when `location` ends in `.yaml`,
+///    `.yml`, or `.json`, the file is fetched once and dispatched by
+///    content shape: a YAML/JSON sequence is treated as a canonical
+///    catalog array; a YAML mapping is treated as a `knn_entries`-
+///    style document (jvector `DataSetLoaderSimpleMFD` parity). No
+///    sibling probing — the file *is* the catalog regardless of name.
+///
+/// 2. **Directory cascade** — when `location` is a directory or URL
+///    prefix, the canonical filename set is walked in order:
+///    `catalog.json`, `catalog.yaml`, `knn_entries.yaml`.
 fn load_catalog_entries(location: &str, entries: &mut Vec<CatalogEntry>, required: bool) {
-    // 1) Try the canonical catalog.json / catalog.yaml at the location.
-    if try_load_canonical_catalog(location, entries) { return; }
+    if looks_like_catalog_file(location) {
+        if !load_from_explicit_catalog_file(location, entries) && required {
+            eprintln!("ERROR: could not load catalog from {}", location);
+        }
+        return;
+    }
 
-    // 2) Fallback: knn_entries.yaml (legacy simplified format). We
-    //    only get here if step (1) didn't find a file — meaning
-    //    neither catalog.json nor catalog.yaml was present at
-    //    `location`. The simplified format is treated as a
-    //    complete replacement, not a supplement.
+    // Directory cascade.
+    if try_load_canonical_catalog(location, entries) { return; }
     if try_load_knn_entries(location, entries) { return; }
 
-    // 3) Nothing found at this location. Emit the right level of
-    //    diagnostic — required catalogs are an error, optional ones
-    //    log at debug only.
     if required {
         eprintln!(
             "ERROR: no catalog file found at {} \
@@ -199,6 +219,99 @@ fn load_catalog_entries(location: &str, entries: &mut Vec<CatalogEntry>, require
             "optional catalog {} has no catalog.json / catalog.yaml / knn_entries.yaml",
             location,
         );
+    }
+}
+
+/// Fetch the content of an explicit-filename catalog (one whose URL
+/// or path ends in `.yaml`/`.yml`/`.json`) and dispatch by content
+/// shape: top-level sequence → canonical catalog array; top-level
+/// mapping → `knn_entries`-style. Returns `true` when the file was
+/// fetched and parsed successfully into at least one entry, or when
+/// the file was parsed but contained no entries (still a success —
+/// the file exists). Returns `false` when the file could not be
+/// fetched at all.
+fn load_from_explicit_catalog_file(location: &str, entries: &mut Vec<CatalogEntry>) -> bool {
+    let content = match fetch_location_content(location) {
+        Some(c) => c,
+        None => return false,
+    };
+
+    // Generic YAML parse: subsumes JSON (every JSON document is also
+    // valid YAML). This gives us a single value we can shape-match on
+    // without paying for two separate parse passes.
+    let value: serde_yaml::Value = match serde_yaml::from_str(&content) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("ERROR: failed to parse catalog {}: {}", location, e);
+            return true;
+        }
+    };
+
+    let parent = parent_location_of(location);
+    let base_url = ensure_trailing_slash(&parent);
+
+    match value {
+        serde_yaml::Value::Sequence(seq) => {
+            for item in seq {
+                let as_json: serde_json::Value = match serde_json::to_value(&item) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("WARNING: skipping catalog entry: {}", e);
+                        continue;
+                    }
+                };
+                match remap_entry(&as_json, &base_url) {
+                    Ok(entry) => entries.push(entry),
+                    Err(e) => eprintln!("WARNING: skipping catalog entry: {}", e),
+                }
+            }
+            true
+        }
+        serde_yaml::Value::Mapping(_) => {
+            // knn_entries-style: parser resolves facet paths relative
+            // to the catalog file's parent directory (matching
+            // jvector's per-entry resolution against the entry's
+            // cache directory, with `_defaults.base_url` overriding).
+            match parse_knn_entries_yaml(&content, &parent) {
+                Ok(parsed) => {
+                    entries.extend(parsed);
+                    true
+                }
+                Err(e) => {
+                    eprintln!("ERROR: failed to parse {}: {}", location, e);
+                    true
+                }
+            }
+        }
+        _ => {
+            eprintln!(
+                "ERROR: catalog {} is neither a sequence nor a mapping",
+                location,
+            );
+            true
+        }
+    }
+}
+
+/// Fetch the raw content of any catalog location (HTTP URL or local
+/// path). Returns `None` if the file/URL is unreachable so callers
+/// can fall through to alternative probes.
+fn fetch_location_content(location: &str) -> Option<String> {
+    if location.starts_with("http://") || location.starts_with("https://") {
+        fetch_http(location).ok()
+    } else {
+        std::fs::read_to_string(location).ok()
+    }
+}
+
+/// Return the parent directory of a catalog file URL or path, with
+/// no trailing slash. For `https://a/b/c.yaml` → `https://a/b`. For
+/// `/x/y/z.yaml` → `/x/y`. For something with no separators returns
+/// the empty string.
+fn parent_location_of(location: &str) -> String {
+    match location.rfind('/') {
+        Some(idx) => location[..idx].to_string(),
+        None => String::new(),
     }
 }
 

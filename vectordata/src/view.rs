@@ -22,11 +22,60 @@ use std::sync::Arc;
 use url::Url;
 
 /// True for `http://` and `https://` schemes — the only schemes the
-/// crate handles as remote. `file://` is intentionally not
-/// recognized: the rest of the I/O stack works directly on
-/// filesystem paths, so a `file://` URL would just confuse it.
+/// crate handles as remote.
 fn is_absolute_url(s: &str) -> bool {
     s.starts_with("http://") || s.starts_with("https://")
+}
+
+/// True when `s` starts with `<scheme>://` for any RFC 3986-style
+/// scheme (letter followed by letters/digits/`+`/`-`/`.`). Used to
+/// short-circuit base-URL joining for any absolutely-scoped facet
+/// path the catalog might publish (`http://`, `https://`,
+/// `file://`, `s3://`, `gs://`, etc.) — even when the actual
+/// scheme isn't one vectordata's I/O layer speaks. Joining e.g.
+/// `s3://x/y` onto a base URL would produce a bogus double-
+/// prefixed path that nothing can open; passing the original
+/// through lets the storage layer fail with a precise
+/// "scheme not supported" error instead.
+fn has_absolute_uri_scheme(s: &str) -> bool {
+    let mut chars = s.chars();
+    let Some(first) = chars.next() else { return false };
+    if !first.is_ascii_alphabetic() { return false; }
+    let scheme_end = s.find("://").unwrap_or(usize::MAX);
+    if scheme_end == usize::MAX { return false; }
+    s[1..scheme_end]
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+}
+
+/// True for facet paths that should bypass the catalog's base
+/// location and open directly as a local file. Covers absolute
+/// filesystem paths (`/abs/foo.fvec`) and `file://` URIs — both
+/// are treated identically by the I/O stack. The point is parity
+/// with a fully-precached remote facet: no URL joins, no
+/// download/cache layer, just mmap.
+fn is_local_facet_source(s: &str) -> bool {
+    s.starts_with("file://") || s.starts_with('/')
+}
+
+/// Strip a `file://` prefix to produce a plain filesystem path
+/// string. Pass-through for everything else. Mirrors
+/// `crate::storage::local_source_path` but lives at the view
+/// layer so we can avoid a cross-module dependency for what is a
+/// trivial inline transform.
+fn file_uri_to_path(s: &str) -> &str {
+    if let Some(rest) = s.strip_prefix("file://") {
+        // `file:///abs/path` → `/abs/path`
+        // `file://host/abs/path` → `/abs/path` (host dropped)
+        if rest.starts_with('/') {
+            return rest;
+        }
+        if let Some(slash) = rest.find('/') {
+            return &rest[slash..];
+        }
+        return rest;
+    }
+    s
 }
 
 /// Parse a window string using the canonical dataset-source parser
@@ -474,6 +523,22 @@ impl GenericTestDataView {
         if is_absolute_url(source_str) {
             return Ok(ResourceLocation::Http(Url::parse(source_str)?));
         }
+        // Local-file short-circuit: `file://` URI or absolute path.
+        // Bypass the catalog's base-URL join — the catalog entry
+        // is naming a file that already exists locally, and the
+        // most efficient open is a direct mmap. Same semantic as a
+        // fully-precached remote facet.
+        if is_local_facet_source(source_str) {
+            return Ok(ResourceLocation::FileSystem(PathBuf::from(file_uri_to_path(source_str))));
+        }
+        // Any other absolute URI scheme (e.g. `s3://`) — pass
+        // through verbatim. We can't open it (no transport here),
+        // but the storage layer will surface a precise error
+        // rather than the bogus double-prefixed path we'd get from
+        // joining it against the catalog's base URL.
+        if has_absolute_uri_scheme(source_str) {
+            return Ok(ResourceLocation::FileSystem(PathBuf::from(source_str)));
+        }
         match &self.source {
             DataSource::FileSystem(base_path) => {
                 let path = base_path.join(source_str);
@@ -546,6 +611,12 @@ impl GenericTestDataView {
         if is_absolute_url(path) {
             return Ok(path.to_string());
         }
+        if is_local_facet_source(path) {
+            return Ok(file_uri_to_path(path).to_string());
+        }
+        if has_absolute_uri_scheme(path) {
+            return Ok(path.to_string());
+        }
         match &self.source {
             DataSource::FileSystem(base_path) => {
                 Ok(base_path.join(path).to_string_lossy().to_string())
@@ -573,6 +644,15 @@ impl GenericTestDataView {
     /// Resolve a facet to a path string (local) or URL string (remote).
     fn resolve_as_string(&self, facet: &FacetConfig) -> Result<String> {
         let source_str = facet.source();
+        if is_absolute_url(source_str) {
+            return Ok(source_str.to_string());
+        }
+        if is_local_facet_source(source_str) {
+            return Ok(file_uri_to_path(source_str).to_string());
+        }
+        if has_absolute_uri_scheme(source_str) {
+            return Ok(source_str.to_string());
+        }
         match &self.source {
             DataSource::FileSystem(base_path) => {
                 Ok(base_path.join(source_str).to_string_lossy().to_string())
@@ -812,5 +892,69 @@ mod tests {
         assert!(!is_absolute_url("relative/path.fvec"));
         assert!(!is_absolute_url("data.fvec"));
         assert!(!is_absolute_url(""));
+    }
+
+    #[test]
+    fn local_facet_source_covers_abs_path_and_file_uri() {
+        assert!(is_local_facet_source("/abs/path.fvec"));
+        assert!(is_local_facet_source("file:///abs/path.fvec"));
+        assert!(is_local_facet_source("file://host/abs/path.fvec"));
+        assert!(!is_local_facet_source("relative/path.fvec"));
+        assert!(!is_local_facet_source("data.fvec"));
+        assert!(!is_local_facet_source("http://x/path.fvec"));
+        assert!(!is_local_facet_source(""));
+    }
+
+    #[test]
+    fn file_uri_to_path_strips_scheme_and_host() {
+        assert_eq!(file_uri_to_path("file:///abs/path.fvec"), "/abs/path.fvec");
+        assert_eq!(file_uri_to_path("file://localhost/abs/path.fvec"), "/abs/path.fvec");
+        assert_eq!(file_uri_to_path("/abs/path.fvec"), "/abs/path.fvec");
+        assert_eq!(file_uri_to_path("relative/path.fvec"), "relative/path.fvec");
+    }
+
+    /// When a remote-loaded `TestDataGroup` has a facet whose source
+    /// is a `file://` URI (a fully-precached local file), the resolver
+    /// must yield a `ResourceLocation::FileSystem` — not try to join
+    /// the URI onto the catalog's HTTP base. Symmetric for an
+    /// absolute filesystem path. Same semantic as "remote facet that
+    /// already lives on disk".
+    #[test]
+    fn remote_catalog_with_local_facet_short_circuits_to_filesystem() {
+        use crate::model::FacetConfig;
+
+        fn empty_profile() -> crate::model::ProfileConfig {
+            crate::model::ProfileConfig {
+                base_count: None, maxk: None, partition: false,
+                base_vectors: None, base_content: None,
+                query_vectors: None, query_terms: None, query_filters: None,
+                neighbor_indices: None, neighbor_distances: None,
+                filtered_neighbor_indices: None, filtered_neighbor_distances: None,
+                metadata_content: None, metadata_predicates: None,
+                predicate_results: None, metadata_layout: None,
+            }
+        }
+
+        let mut profile = empty_profile();
+        profile.base_vectors = Some(FacetConfig::Simple("file:///tank/share/base.fvec".to_string()));
+        profile.query_vectors = Some(FacetConfig::Simple("/tank/share/query.fvec".to_string()));
+
+        let base_url = Url::parse("https://catalog.example.com/datasets/x/").unwrap();
+        let view = GenericTestDataView::new(DataSource::Http(base_url), profile);
+
+        let bv = view.config.base_vectors.as_ref().unwrap();
+        let q  = view.config.query_vectors.as_ref().unwrap();
+        match view.resolve_resource(bv).unwrap() {
+            ResourceLocation::FileSystem(p) => assert_eq!(p, PathBuf::from("/tank/share/base.fvec")),
+            ResourceLocation::Http(u) => panic!("expected FileSystem, got Http({u})"),
+        }
+        match view.resolve_resource(q).unwrap() {
+            ResourceLocation::FileSystem(p) => assert_eq!(p, PathBuf::from("/tank/share/query.fvec")),
+            ResourceLocation::Http(u) => panic!("expected FileSystem, got Http({u})"),
+        }
+
+        // resolve_as_string short-circuits the same way (no `https://.../tank/...` join).
+        assert_eq!(view.resolve_as_string(bv).unwrap(), "/tank/share/base.fvec");
+        assert_eq!(view.resolve_as_string(q).unwrap(), "/tank/share/query.fvec");
     }
 }

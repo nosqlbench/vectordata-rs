@@ -173,7 +173,19 @@ pub(super) fn resolve_source(source: &str) -> PathBuf {
             std::process::exit(1);
         }
     };
-    resolve_via_view(&entry.path, profile_name, facet_name)
+    // Open through the catalog: for `knn_entries.yaml`-shape
+    // entries this synthesizes the group from the embedded layout
+    // (no second dataset.yaml fetch); for canonical entries it
+    // re-loads via `entry.path`. Either way the explore path
+    // doesn't have to know the discriminator.
+    let group = match catalog.open(dataset_name) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("Error: failed to open {dataset_name}: {e}");
+            std::process::exit(1);
+        }
+    };
+    resolve_via_view_group(group, &entry.path, profile_name, facet_name)
 }
 
 /// Open the dataset at `group_path` (URL or local path), find the
@@ -188,6 +200,15 @@ fn resolve_via_view(group_path: &str, profile_name: &str, facet_name: &str) -> P
             std::process::exit(1);
         }
     };
+    resolve_via_view_group(group, group_path, profile_name, facet_name)
+}
+
+/// Shared post-open path: pick the profile, open the named facet
+/// via the canonical storage layer, precache, and return the
+/// resolved file path. Used by both raw-URL/path opens and
+/// catalog-resolved opens — the two only differ in how they
+/// obtain the [`TestDataGroup`].
+fn resolve_via_view_group(group: vectordata::TestDataGroup, group_path: &str, profile_name: &str, facet_name: &str) -> PathBuf {
     let view = match group.profile(profile_name) {
         Some(v) => v,
         None => {
@@ -207,11 +228,19 @@ fn resolve_via_view(group_path: &str, profile_name: &str, facet_name: &str) -> P
     // Drive cache to fully-resident; no-op for local mmap. Failure
     // surfaces directly because there is no fallback to a separate
     // cache layout — the canonical Storage::Cached layout is the
-    // only place data lands.
-    if let Err(e) = storage.precache() {
-        eprintln!("Error: precache failed for {facet_name}: {e}");
+    // only place data lands. Use the progress callback so the user
+    // sees a live meter on stderr instead of a static spinner
+    // while large facets stream in.
+    if !storage.is_local() {
+        eprintln!("Fetching {facet_name}…");
+    }
+    let mut meter = PrecacheMeter::new();
+    let cb = |p: &vectordata::DownloadProgress| meter.tick(p);
+    if let Err(e) = storage.prebuffer_with_progress(cb) {
+        eprintln!("\nError: precache failed for {facet_name}: {e}");
         std::process::exit(1);
     }
+    meter.finish();
 
     if let Some(local) = storage.cache_path() {
         // Cached-remote: report under the configured cache root.
@@ -235,6 +264,79 @@ fn resolve_via_view(group_path: &str, profile_name: &str, facet_name: &str) -> P
 /// Get the configured vectordata cache directory from settings.yaml.
 pub(super) fn dirs_cache_dir() -> PathBuf {
     crate::pipeline::commands::config::configured_cache_dir_or_exit()
+}
+
+/// In-place stderr meter for facet precache. Renders bytes /
+/// total + percent + throughput on a single line at ~4 Hz; calls
+/// to [`Self::tick`] arrive once before the first byte (so the
+/// meter shows up immediately) and after each downloaded chunk.
+/// [`Self::finish`] prints the final summary on a new line.
+///
+/// No-op when the facet is local (the first tick reports
+/// `total_bytes == 0` for cached-and-resident storage; we skip
+/// rendering in that case).
+struct PrecacheMeter {
+    started: std::time::Instant,
+    last_render: std::time::Instant,
+    final_total: u64,
+    final_done: u64,
+    rendered_any: bool,
+}
+
+impl PrecacheMeter {
+    fn new() -> Self {
+        Self {
+            started: std::time::Instant::now(),
+            last_render: std::time::Instant::now() - std::time::Duration::from_secs(1),
+            final_total: 0,
+            final_done: 0,
+            rendered_any: false,
+        }
+    }
+
+    fn tick(&mut self, p: &vectordata::DownloadProgress) {
+        let total = p.total_bytes();
+        let done = p.downloaded_bytes();
+        self.final_total = total;
+        self.final_done = done;
+        // Local-only storage reports total=0 (no download needed).
+        // Skip the meter entirely so we don't flash a 0/0 line.
+        if total == 0 { return; }
+        if self.last_render.elapsed().as_millis() < 250 && done < total { return; }
+        self.last_render = std::time::Instant::now();
+        self.rendered_any = true;
+        let pct = if total > 0 { (done as f64 / total as f64) * 100.0 } else { 0.0 };
+        let elapsed = self.started.elapsed().as_secs_f64().max(0.001);
+        let rate = done as f64 / elapsed;
+        use std::io::Write;
+        let _ = eprint!(
+            "\r  {} / {} ({:.0}%) \u{2022} {}/s\u{1b}[K",
+            fmt_bytes(done), fmt_bytes(total), pct, fmt_bytes(rate as u64),
+        );
+        let _ = std::io::stderr().flush();
+    }
+
+    fn finish(self) {
+        if !self.rendered_any { return; }
+        let elapsed = self.started.elapsed().as_secs_f64().max(0.001);
+        let rate = (self.final_done as f64 / elapsed) as u64;
+        eprintln!(
+            "\r  \u{2713} {} in {:.1}s ({}/s)\u{1b}[K",
+            fmt_bytes(self.final_done), elapsed, fmt_bytes(rate),
+        );
+    }
+}
+
+fn fmt_bytes(n: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+    const TB: u64 = GB * 1024;
+    if n >= TB { format!("{:.2} TiB", n as f64 / TB as f64) }
+    else if n >= GB { format!("{:.2} GiB", n as f64 / GB as f64) }
+    else if n >= MB { format!("{:.1} MiB", n as f64 / MB as f64) }
+    else if n >= KB { format!("{:.1} KiB", n as f64 / KB as f64) }
+    else { format!("{n} B") }
 }
 
 /// Format-agnostic vector reader that returns f64 values.
@@ -340,13 +442,32 @@ pub(super) struct AnyDatasetReader {
 impl AnyDatasetReader {
     pub(super) fn from_source(source: &str) -> Self {
         let view = open_dataset_view(source);
+        // Precache base_vectors up front when the storage is
+        // remote. Without this the TUI lazy-reads via per-vector
+        // HTTP RANGE — for a 50k-vector sample window that's 50k
+        // round trips, which user-visibly stalls at 0/s. The
+        // `Storage` arc is process-wide-shared by URL, so the
+        // `view.base_vectors()` reader that we construct next
+        // picks up the same already-mmapped storage.
+        let facet_storage = view.open_facet_storage("base_vectors").ok();
+        if let Some(ref fs) = facet_storage {
+            if !fs.is_local() {
+                eprintln!("Fetching base_vectors…");
+                let mut meter = PrecacheMeter::new();
+                let cb = |p: &vectordata::DownloadProgress| meter.tick(p);
+                if let Err(e) = fs.prebuffer_with_progress(cb) {
+                    eprintln!("\nError: precache failed for base_vectors: {e}");
+                    std::process::exit(1);
+                }
+                meter.finish();
+            }
+        }
         let base = view.base_vectors().unwrap_or_else(|e| {
             eprintln!("Error: failed to open base_vectors: {e}");
             std::process::exit(1);
         });
         let dim = base.dim();
         let count = base.count();
-        let facet_storage = view.open_facet_storage("base_vectors").ok();
         AnyDatasetReader { view, base, facet_storage, dim, count }
     }
 

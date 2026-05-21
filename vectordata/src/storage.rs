@@ -41,23 +41,27 @@ pub(crate) enum Storage {
     /// Local file, mmap'd. Zero-copy, no fallback.
     Mmap(Mmap),
 
-    /// Remote URL with no published `.mref`. Per-read fetches go
-    /// through HTTP RANGE; calling [`precache`] downloads the whole
-    /// file once into the cache directory (no merkle verification —
-    /// we don't have hashes for it) and promotes to mmap, so
-    /// subsequent reads on this and any other `Storage` instance
-    /// pointed at the same URL take the zero-copy path.
+    /// Remote URL with no published `.mref`. Reads route through a
+    /// [`ChunkStore`] that lazily downloads 8 MiB chunks on demand
+    /// — first read covering an unmapped chunk fetches it, writes
+    /// it into a sparse cache file, and records validity in a
+    /// sidecar bitmap. Calling [`precache`] forces every chunk to
+    /// fill. When all chunks are valid the cache file is mmap-
+    /// promoted so subsequent reads take the zero-copy path.
+    ///
+    /// No merkle verification — server bytes are trusted byte-
+    /// for-byte (the intentional difference from
+    /// [`Storage::Cached`], which requires a published `.mref`).
     Http {
-        transport: HttpTransport,
-        total_size: u64,
-        /// Local path where `precache` lands the downloaded file.
-        /// Computed from the URL via `blob_dir_for_url` (under the
-        /// `http/` subtree) so multiple `Storage::Http` instances
-        /// against the same URL share one on-disk file.
-        cache_path: std::path::PathBuf,
-        /// Promoted-mmap view of `cache_path`, set by `precache` or
-        /// at open time if a prior precache left the file with the
-        /// expected size.
+        /// Chunked lazy-fill backend. Shared across every
+        /// `Storage::Http` instance against the same URL via the
+        /// process-wide registry, so concurrent readers benefit
+        /// from a single bitmap and a single in-flight dedup map.
+        chunks: Arc<crate::chunked_http::ChunkStore>,
+        /// Promoted-mmap view of `chunks.cache_path()`. Set by
+        /// `precache`/`prebuffer_with_progress` once every chunk
+        /// is filled, or at open time when an already-complete
+        /// cache file (with bitmap) is detected.
         mmap: OnceLock<Mmap>,
     },
 
@@ -116,19 +120,47 @@ fn in_flight_opens() -> &'static std::sync::Mutex<std::collections::HashMap<Stri
 /// Compute the registry key for a source string. URLs key on the
 /// URL itself (after parse round-trip for normalisation). Local
 /// paths key on canonicalised absolute path so `./foo` and the
-/// equivalent absolute path map to the same instance.
+/// equivalent absolute path map to the same instance. `file://`
+/// URIs are normalised to their plain filesystem path before
+/// keying so a catalog entry that references a local file via
+/// `file:///x` shares an Arc with an explicit `/x` open. `s3://`
+/// URLs are normalised through the transport translation layer
+/// so an `s3://` open shares its Arc with the HTTPS form that
+/// the actual fetch uses.
 fn registry_key(source: &str) -> String {
-    if source.starts_with("http://") || source.starts_with("https://") {
-        match Url::parse(source) {
+    if crate::transport::is_remote_url(source) {
+        let translated = crate::transport::normalize_remote_url(source);
+        match Url::parse(translated.as_ref()) {
             Ok(u) => u.to_string(),
-            Err(_) => source.to_string(),
+            Err(_) => translated.into_owned(),
         }
     } else {
-        std::fs::canonicalize(source)
+        let local = local_source_path(source);
+        std::fs::canonicalize(local.as_ref())
             .ok()
             .and_then(|p| p.to_str().map(|s| s.to_string()))
-            .unwrap_or_else(|| source.to_string())
+            .unwrap_or_else(|| local.into_owned())
     }
+}
+
+/// Convert a source string to a plain filesystem path string. A
+/// `file://` URI is stripped to its path component (`file:///x/y`
+/// → `/x/y`); everything else passes through unchanged. The point
+/// is to give a single short-circuit for "this is a local file"
+/// regardless of which syntactic form the catalog uses.
+pub(crate) fn local_source_path(source: &str) -> std::borrow::Cow<'_, str> {
+    if let Some(rest) = source.strip_prefix("file://") {
+        // file:///abs/path → /abs/path
+        // file://localhost/abs/path → /abs/path  (host stripped)
+        if let Some(after_root) = rest.strip_prefix('/') {
+            return std::borrow::Cow::Owned(format!("/{after_root}"));
+        }
+        if let Some(slash) = rest.find('/') {
+            return std::borrow::Cow::Owned(rest[slash..].to_string());
+        }
+        return std::borrow::Cow::Owned(format!("/{rest}"));
+    }
+    std::borrow::Cow::Borrowed(source)
 }
 
 impl Storage {
@@ -188,12 +220,20 @@ impl Storage {
             if let Some(arc) = registry().lock().unwrap().get(&key).and_then(|w| w.upgrade()) {
                 return Ok(arc);
             }
-            let storage = if source.starts_with("http://") || source.starts_with("https://") {
-                let url = Url::parse(source)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("invalid URL '{source}': {e}")))?;
+            let storage = if crate::transport::is_remote_url(source) {
+                // `s3://bucket/key` is rewritten to its
+                // virtual-hosted HTTPS form here — the rest of the
+                // transport pipeline never sees s3-scheme URLs.
+                let translated = crate::transport::normalize_remote_url(source);
+                let url = Url::parse(translated.as_ref())
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("invalid URL '{source}' (translated to '{translated}'): {e}")))?;
                 Self::open_url_uncached(url)?
             } else {
-                Self::open_path_uncached(Path::new(source))?
+                // `file://` URIs and bare paths both open as local
+                // mmap — `local_source_path` normalises both to a
+                // filesystem path string before we hand it to Path.
+                let local = local_source_path(source);
+                Self::open_path_uncached(Path::new(local.as_ref()))?
             };
             let arc = Arc::new(storage);
             registry().lock().unwrap().insert(key.clone(), Arc::downgrade(&arc));
@@ -321,22 +361,22 @@ impl Storage {
         let transport = HttpTransport::new(url);
         let total_size = ChunkedTransportExt::content_length_for(&transport)?;
 
+        let chunks = Arc::new(crate::chunked_http::ChunkStore::open(
+            transport, total_size, cache_path)?);
+
         let mmap = OnceLock::new();
-        // Restore promotion from a prior precache if the cache file
-        // is present with the matching size. We don't have hashes —
-        // the size match is the strongest invariant we can check
-        // without a `.mref` published.
-        if let Ok(meta) = std::fs::metadata(&cache_path) {
-            if meta.len() == total_size {
-                if let Ok(file) = std::fs::File::open(&cache_path)
-                    && let Ok(m) = unsafe { Mmap::map(&file) }
-                {
-                    let _ = mmap.set(m);
-                }
-            }
+        // Restore promotion when the chunk store reports complete
+        // (either a sidecar with all chunks marked valid, or a
+        // pre-feature precached file at the right size — see
+        // `ChunkStore::open` for the reconciliation rules).
+        if chunks.is_complete()
+            && let Ok(file) = std::fs::File::open(chunks.cache_path())
+            && let Ok(m) = unsafe { Mmap::map(&file) }
+        {
+            let _ = mmap.set(m);
         }
 
-        Ok(Storage::Http { transport, total_size, cache_path, mmap })
+        Ok(Storage::Http { chunks, mmap })
     }
 
     /// Read `len` bytes at `offset`. Always succeeds for an in-bounds
@@ -353,10 +393,11 @@ impl Storage {
                 }
                 Ok(m[offset as usize..end as usize].to_vec())
             }
-            Storage::Http { transport, mmap, cache_path, total_size } => {
-                // Mmap fast path — promoted by a prior precache or
-                // restored at open time from a leftover cache file.
-                try_promote_http(cache_path, *total_size, mmap);
+            Storage::Http { chunks, mmap } => {
+                // Mmap fast path — promoted at open time if a
+                // prior precache populated every chunk, or after
+                // the chunked reader fills the last chunk below.
+                try_promote_http(chunks, mmap);
                 if let Some(m) = mmap.get() {
                     let end = (offset + len) as usize;
                     if end > m.len() {
@@ -365,8 +406,19 @@ impl Storage {
                     }
                     return Ok(m[offset as usize..end].to_vec());
                 }
-                use crate::transport::ChunkedTransport;
-                transport.fetch_range(offset, len)
+                // Lazy chunked read — fetches only the chunks
+                // covering the requested range, caches them to
+                // disk. If this read happened to complete the
+                // file, promote to mmap so the next read takes
+                // the zero-copy path.
+                let bytes = chunks.read(offset, len)?;
+                if mmap.get().is_none() && chunks.is_complete()
+                    && let Ok(file) = std::fs::File::open(chunks.cache_path())
+                    && let Ok(m) = unsafe { Mmap::map(&file) }
+                {
+                    let _ = mmap.set(m);
+                }
+                Ok(bytes)
             }
             Storage::Cached { channel, mmap } => {
                 if let Some(m) = mmap.get() {
@@ -411,8 +463,8 @@ impl Storage {
                 try_promote_cached(channel, mmap);
                 mmap.get().map(|m| m.as_ptr())
             }
-            Storage::Http { cache_path, total_size, mmap, .. } => {
-                try_promote_http(cache_path, *total_size, mmap);
+            Storage::Http { chunks, mmap } => {
+                try_promote_http(chunks, mmap);
                 mmap.get().map(|m| m.as_ptr())
             }
         }
@@ -432,8 +484,8 @@ impl Storage {
                 try_promote_cached(channel, mmap);
                 mmap.get().and_then(|m| m.get(start..end))
             }
-            Storage::Http { cache_path, total_size, mmap, .. } => {
-                try_promote_http(cache_path, *total_size, mmap);
+            Storage::Http { chunks, mmap } => {
+                try_promote_http(chunks, mmap);
                 mmap.get().and_then(|m| m.get(start..end))
             }
         }
@@ -443,7 +495,7 @@ impl Storage {
     pub(crate) fn total_size(&self) -> u64 {
         match self {
             Storage::Mmap(m) => m.len() as u64,
-            Storage::Http { total_size, .. } => *total_size,
+            Storage::Http { chunks, .. } => chunks.total_size(),
             Storage::Cached { channel, .. } => channel.content_size(),
         }
     }
@@ -457,8 +509,8 @@ impl Storage {
     pub(crate) fn is_complete(&self) -> bool {
         match self {
             Storage::Mmap(_) => true,
-            Storage::Http { cache_path, total_size, mmap, .. } => {
-                try_promote_http(cache_path, *total_size, mmap);
+            Storage::Http { chunks, mmap } => {
+                try_promote_http(chunks, mmap);
                 mmap.get().is_some()
             }
             Storage::Cached { channel, mmap } => {
@@ -476,8 +528,8 @@ impl Storage {
                 try_promote_cached(channel, mmap);
                 mmap.get().is_some()
             }
-            Storage::Http { cache_path, total_size, mmap, .. } => {
-                try_promote_http(cache_path, *total_size, mmap);
+            Storage::Http { chunks, mmap } => {
+                try_promote_http(chunks, mmap);
                 mmap.get().is_some()
             }
         }
@@ -502,8 +554,10 @@ impl Storage {
         self.prebuffer_with_progress(|_| {})
     }
 
-    /// Same as [`precache`] with a progress callback fired after
-    /// the underlying download completes. Same strict contract:
+    /// Same as [`precache`] with a progress callback fired in
+    /// flight — once at start (`downloaded_bytes == 0`) and then
+    /// after each completed chunk, so UIs can render a live meter
+    /// rather than wait for completion. Same strict contract:
     /// either every byte is resident on `Ok`, or an `Err` is
     /// returned.
     pub(crate) fn prebuffer_with_progress<F>(&self, cb: F) -> io::Result<()>
@@ -512,9 +566,24 @@ impl Storage {
     {
         match self {
             Storage::Mmap(_) => Ok(()),
-            Storage::Http { transport, total_size, cache_path, mmap } => {
+            Storage::Http { chunks, mmap } => {
                 if mmap.get().is_some() { return Ok(()); }
-                http_prebuffer(transport, *total_size, cache_path, mmap, cb)
+                chunks.prebuffer_with_progress(cb)?;
+                if !chunks.is_complete() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        format!(
+                            "HTTP precache did not complete: {}/{} chunks downloaded",
+                            chunks.valid_count(), chunks.total_chunks(),
+                        ),
+                    ));
+                }
+                if mmap.get().is_none() {
+                    let file = std::fs::File::open(chunks.cache_path())?;
+                    let m = unsafe { Mmap::map(&file) }?;
+                    let _ = mmap.set(m);
+                }
+                Ok(())
             }
             Storage::Cached { channel, mmap } => {
                 channel.prebuffer_with_progress(cb)?;
@@ -581,8 +650,8 @@ impl Storage {
                 try_promote_cached(channel, mmap);
                 mmap.get()
             }
-            Storage::Http { cache_path, total_size, mmap, .. } => {
-                try_promote_http(cache_path, *total_size, mmap);
+            Storage::Http { chunks, mmap } => {
+                try_promote_http(chunks, mmap);
                 mmap.get()
             }
         }
@@ -692,8 +761,8 @@ impl Storage {
     pub(crate) fn local_path(&self) -> Option<std::path::PathBuf> {
         match self {
             Storage::Cached { channel, .. } => Some(channel.cache_path().to_path_buf()),
-            Storage::Http { cache_path, .. } if cache_path.is_file() =>
-                Some(cache_path.clone()),
+            Storage::Http { chunks, .. } if chunks.cache_path().is_file() =>
+                Some(chunks.cache_path().to_path_buf()),
             _ => None,
         }
     }
@@ -714,8 +783,10 @@ impl std::fmt::Debug for Storage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Storage::Mmap(m) => f.debug_struct("Storage::Mmap").field("size", &m.len()).finish(),
-            Storage::Http { total_size, mmap, .. } => f.debug_struct("Storage::Http")
-                .field("size", total_size)
+            Storage::Http { chunks, mmap } => f.debug_struct("Storage::Http")
+                .field("size", &chunks.total_size())
+                .field("chunks_valid", &chunks.valid_count())
+                .field("chunks_total", &chunks.total_chunks())
                 .field("promoted", &mmap.get().is_some())
                 .finish(),
             Storage::Cached { channel, mmap } => f.debug_struct("Storage::Cached")
@@ -764,101 +835,30 @@ fn try_promote_cached(
 }
 
 /// Same as [`try_promote_cached`] but for the merkle-less Http
-/// variant: if the cache file at `path` exists with the expected
-/// `total_size`, mmap it. Used both at open time and lazily on
-/// the read paths so that an Http storage opened *before* a
-/// `precache` on a sibling instance picks up the promotion the
-/// first time it's read.
+/// variant: if the underlying [`ChunkStore`] reports every chunk
+/// is valid, mmap the cache file. Used both at open time and
+/// lazily on the read paths so that an Http storage opened
+/// *before* a `precache` on a sibling instance picks up the
+/// promotion the first time it's read.
+///
+/// Note: we no longer rely on a bare file-size check —
+/// `chunks.is_complete()` consults the persisted chunk bitmap,
+/// which is the only safe signal when partial-fill cache files
+/// may exist on disk (a sparse file with holes still reports
+/// `total_size` from the filesystem).
 fn try_promote_http(
-    path: &std::path::Path,
-    total_size: u64,
+    chunks: &crate::chunked_http::ChunkStore,
     mmap: &OnceLock<Mmap>,
 ) {
     if mmap.get().is_some() { return; }
-    let Ok(meta) = std::fs::metadata(path) else { return; };
-    if meta.len() != total_size { return; }
-    if let Ok(file) = std::fs::File::open(path)
+    if !chunks.is_complete() { return; }
+    if let Ok(file) = std::fs::File::open(chunks.cache_path())
         && let Ok(m) = unsafe { Mmap::map(&file) }
     {
         let _ = mmap.set(m);
     }
 }
 
-/// Download the full file via HTTP RANGE, atomic-rename into
-/// `cache_path`, and mmap-promote. Used by
-/// [`Storage::prebuffer_with_progress`] for the `Http` variant.
-///
-/// We don't have merkle hashes (no `.mref` is published), so the
-/// only integrity check is the post-write file size. If the server
-/// returns fewer bytes than the HEAD-reported `total_size`, this
-/// errors instead of leaving a short file. The download is written
-/// to a `.tmp` sibling and atomically renamed so concurrent readers
-/// either see the fully-resident file or none at all.
-fn http_prebuffer<F>(
-    transport: &HttpTransport,
-    total_size: u64,
-    cache_path: &std::path::Path,
-    mmap: &OnceLock<Mmap>,
-    mut cb: F,
-) -> io::Result<()>
-where F: FnMut(&crate::transport::DownloadProgress),
-{
-    use crate::transport::ChunkedTransport;
-    if let Some(parent) = cache_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    // Stream the download in 8 MiB chunks so memory cost is bounded
-    // regardless of total size, then assemble the file.
-    let chunk_size: u64 = 8 * 1024 * 1024;
-    let progress = crate::transport::DownloadProgress::new(
-        total_size,
-        ((total_size + chunk_size - 1) / chunk_size).max(1) as u32,
-    );
-
-    let tmp_path = cache_path.with_extension(format!(
-        "{}.tmp",
-        cache_path.extension().and_then(|s| s.to_str()).unwrap_or("dl"),
-    ));
-    {
-        use std::io::Write;
-        let mut f = std::fs::File::create(&tmp_path)?;
-        let mut written: u64 = 0;
-        while written < total_size {
-            let want = chunk_size.min(total_size - written);
-            let bytes = transport.fetch_range(written, want)?;
-            if bytes.len() as u64 != want {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    format!(
-                        "HTTP precache short read at offset {written}: \
-                         expected {want}, got {}", bytes.len()
-                    ),
-                ));
-            }
-            f.write_all(&bytes)?;
-            written += want;
-            progress.add_downloaded_bytes(want);
-            progress.increment_completed();
-        }
-        f.sync_all()?;
-    }
-    std::fs::rename(&tmp_path, cache_path)?;
-
-    // Verify the written file matches what the server told us and
-    // mmap-promote.
-    let meta = std::fs::metadata(cache_path)?;
-    if meta.len() != total_size {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!("HTTP precache size mismatch: expected {total_size}, got {}", meta.len()),
-        ));
-    }
-    let file = std::fs::File::open(cache_path)?;
-    let m = unsafe { Mmap::map(&file) }?;
-    let _ = mmap.set(m);
-    cb(&progress);
-    Ok(())
-}
 
 /// Helper to call `ChunkedTransport::content_length` without exposing
 /// the trait through the public surface.

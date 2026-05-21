@@ -222,25 +222,43 @@ pub fn ensure_trailing_slash(s: &str) -> String {
     }
 }
 
-/// Resolve a catalog location to the actual catalog.json URL/path.
+/// Resolve a catalog location to the actual catalog file URL/path.
 ///
-/// If the location already ends with `catalog.json`, returns it as-is.
-/// Otherwise appends `catalog.json`.
+/// If `location` already names a YAML or JSON file (any filename ending
+/// in `.yaml`, `.yml`, or `.json`), it is returned verbatim. This is
+/// what lets back-ends point at non-standard filenames like
+/// `protected-catalog.yaml` — the file *is* the catalog regardless of
+/// its name, and the resolver's content-shape dispatch decides how to
+/// parse it.
+///
+/// Otherwise — when `location` names a directory — the canonical
+/// `catalog.json` is appended. The directory cascade in
+/// `resolver::load_catalog_entries` walks the documented filename set
+/// (`catalog.json` → `catalog.yaml` → `knn_entries.yaml`).
 pub fn catalog_file_for(location: &str) -> String {
-    if location.ends_with("/catalog.json") || location.ends_with("/catalog.yaml") {
+    if looks_like_catalog_file(location) {
         return location.to_string();
     }
 
-    // If it's a path to an existing file that looks like a catalog, use it
+    // Local file paths may exist with non-standard names; honour the
+    // filesystem if it's actually there.
     let p = Path::new(location);
-    if p.is_file()
-        && let Some(name) = p.file_name().and_then(|n| n.to_str())
-        && name.starts_with("catalog") && (name.ends_with(".json") || name.ends_with(".yaml")) {
+    if p.is_file() {
         return location.to_string();
     }
 
     let base = ensure_trailing_slash(location);
     format!("{}catalog.json", base)
+}
+
+/// Returns true when `location` ends in `.yaml`, `.yml`, or `.json`
+/// — the strong signal that it names a catalog file directly rather
+/// than a directory to probe. Matches `DataSetLoaderSimpleMFD`'s
+/// `*.{yaml,yml}` discovery rule (jvector parity).
+pub fn looks_like_catalog_file(location: &str) -> bool {
+    let lower = location.to_ascii_lowercase();
+    let trimmed = lower.trim_end_matches('/');
+    trimmed.ends_with(".yaml") || trimmed.ends_with(".yml") || trimmed.ends_with(".json")
 }
 
 #[cfg(test)]

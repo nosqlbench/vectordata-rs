@@ -473,10 +473,16 @@ impl<T: VvecElement> IndexedVvecReader<T> {
                 "extension '.{ext}' is not a variable-length format; use XvecReader for uniform-stride files")));
         }
 
-        let is_remote = source.starts_with("http://") || source.starts_with("https://");
+        // `s3://` URLs are remote and get dispatched through the
+        // same HTTPS-based offset-fetch path as `http(s)://`. The
+        // storage layer translates the scheme internally so the
+        // remote offset fetcher needs to see the translated URL
+        // when it composes sibling `IDXFOR__` requests.
+        let is_remote = crate::transport::is_remote_url(source);
         let storage = Storage::open(source)?;
         let offsets = if is_remote {
-            load_or_fetch_remote_offsets(source, &storage, elem_size)?
+            let translated = crate::transport::normalize_remote_url(source);
+            load_or_fetch_remote_offsets(translated.as_ref(), &storage, elem_size)?
         } else {
             load_or_build_local_offsets(Path::new(source), &storage, elem_size)?
         };
@@ -644,10 +650,11 @@ pub fn open_vvec_untyped(source: &str) -> Result<Box<dyn VvecReader<u8>>, IoErro
         return Err(IoError::InvalidFormat(format!(
             "cannot infer element size from extension '.{ext}'")));
     }
-    let is_remote = source.starts_with("http://") || source.starts_with("https://");
+    let is_remote = crate::transport::is_remote_url(source);
     let storage = Storage::open(source)?;
     let offsets = if is_remote {
-        load_or_fetch_remote_offsets(source, &storage, elem_size)?
+        let translated = crate::transport::normalize_remote_url(source);
+        load_or_fetch_remote_offsets(translated.as_ref(), &storage, elem_size)?
     } else {
         load_or_build_local_offsets(Path::new(source), &storage, elem_size)?
     };

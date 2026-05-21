@@ -20,6 +20,11 @@ use super::ChunkedTransport;
 pub struct HttpTransport {
     client: Client,
     url: Url,
+    /// URL after any first-probe redirect correction (e.g. S3
+    /// wrong-region rewrite). When set, takes precedence over
+    /// `url` for every subsequent request. Read with
+    /// [`Self::effective_url`].
+    effective_url: OnceLock<Url>,
     content_length: OnceLock<u64>,
     supports_range: OnceLock<bool>,
 }
@@ -34,6 +39,7 @@ impl HttpTransport {
         HttpTransport {
             client: super::shared_client(),
             url,
+            effective_url: OnceLock::new(),
             content_length: OnceLock::new(),
             supports_range: OnceLock::new(),
         }
@@ -44,6 +50,7 @@ impl HttpTransport {
         HttpTransport {
             client,
             url,
+            effective_url: OnceLock::new(),
             content_length: OnceLock::new(),
             supports_range: OnceLock::new(),
         }
@@ -54,32 +61,75 @@ impl HttpTransport {
     /// `.mref` published.
     pub fn url(&self) -> &Url { &self.url }
 
-    /// Probe the remote resource via HEAD to determine size and range support.
+    /// Returns the URL that should actually be hit. This is the
+    /// initial URL unless the first probe corrected it (e.g. an
+    /// S3 cross-region rewrite triggered by an `x-amz-bucket-
+    /// region` redirect header — see [`Self::probe`]).
+    fn effective_url(&self) -> &Url {
+        self.effective_url.get().unwrap_or(&self.url)
+    }
+
+    /// Probe the remote resource via HEAD to determine size and
+    /// range support. If S3 returns a wrong-region redirect
+    /// (`HTTP 301` carrying `x-amz-bucket-region` instead of a
+    /// `Location` header — reqwest's auto-follow can't help
+    /// there), the bucket-hosted URL is rewritten to the correct
+    /// regional endpoint, cached in `effective_url`, and the
+    /// probe retried once. All subsequent `fetch_range` calls
+    /// pick up the corrected URL.
     fn probe(&self) -> io::Result<(u64, bool)> {
         let resp = self
             .client
-            .head(self.url.clone())
+            .head(self.effective_url().clone())
             .send()
-            .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e))?
+            .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e))?;
+
+        // S3 cross-region redirect: 301 with `x-amz-bucket-region`
+        // header and no `Location`. Rewrite the URL and retry
+        // exactly once. We don't loop — if the second probe also
+        // misbehaves we surface the error.
+        if resp.status().as_u16() == 301 {
+            if let Some(region) = resp
+                .headers()
+                .get("x-amz-bucket-region")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string())
+                && let Some(corrected) = rewrite_s3_url_region(self.effective_url(), &region)
+            {
+                let _ = self.effective_url.set(corrected.clone());
+                let retry = self
+                    .client
+                    .head(corrected.clone())
+                    .send()
+                    .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e))?
+                    .error_for_status()
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                return read_probe_headers(&retry);
+            }
+        }
+
+        // Any other unfollowed 3xx is a misconfiguration — reqwest
+        // follows up to 10 redirects when there's a `Location`
+        // header, so a 3xx surfacing here means the response is
+        // missing `Location` (or the limit was exceeded). Surface
+        // it as a clear error rather than letting the "missing
+        // Content-Length" read further down hide the real cause.
+        if resp.status().is_redirection() {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!(
+                    "unfollowed {} from {} (no Location header — \
+                     bucket may be in a different region; set AWS_REGION \
+                     or use the regional endpoint)",
+                    resp.status(),
+                    self.effective_url(),
+                ),
+            ));
+        }
+        let resp = resp
             .error_for_status()
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-
-        let length = resp
-            .headers()
-            .get(CONTENT_LENGTH)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.parse::<u64>().ok())
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "missing Content-Length header")
-            })?;
-
-        let ranges = resp
-            .headers()
-            .get(ACCEPT_RANGES)
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| v.contains("bytes"));
-
-        Ok((length, ranges))
+        read_probe_headers(&resp)
     }
 
     fn ensure_probed(&self) -> io::Result<()> {
@@ -92,12 +142,60 @@ impl HttpTransport {
     }
 }
 
+/// Read `Content-Length` and `Accept-Ranges` from a successful
+/// HEAD/GET response. Factored out so the wrong-region retry path
+/// can re-use it.
+fn read_probe_headers(resp: &reqwest::blocking::Response) -> io::Result<(u64, bool)> {
+    let length = resp
+        .headers()
+        .get(CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "missing Content-Length header")
+        })?;
+    let ranges = resp
+        .headers()
+        .get(ACCEPT_RANGES)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.contains("bytes"));
+    Ok((length, ranges))
+}
+
+/// Rewrite the host of a virtual-hosted-style S3 URL
+/// (`<bucket>.s3.<region>.amazonaws.com`) so the region segment
+/// matches `correct_region`. Returns `None` for URLs that don't
+/// look like S3 — those are passed through unchanged at the call
+/// site.
+pub(crate) fn rewrite_s3_url_region(url: &Url, correct_region: &str) -> Option<Url> {
+    let host = url.host_str()?;
+    // Virtual-hosted-style: `<bucket>.s3.<region>.amazonaws.com`
+    // or `<bucket>.s3.amazonaws.com` (legacy global). The dot-
+    // split shape we recognise: at least 4 segments ending in
+    // `amazonaws.com` and containing an `s3` literal at position 1.
+    let parts: Vec<&str> = host.split('.').collect();
+    if parts.len() < 4 { return None; }
+    if !parts.ends_with(&["amazonaws", "com"]) { return None; }
+    let bucket = parts[0];
+    if parts[1] != "s3" { return None; }
+    let new_host = format!("{bucket}.s3.{correct_region}.amazonaws.com");
+    let mut corrected = url.clone();
+    corrected.set_host(Some(&new_host)).ok()?;
+    Some(corrected)
+}
+
 impl ChunkedTransport for HttpTransport {
     fn fetch_range(&self, start: u64, len: u64) -> io::Result<Vec<u8>> {
+        // Ensure the probe has run — it may have discovered a
+        // wrong-region S3 redirect and corrected `effective_url`.
+        // Without this, the very first range request goes to the
+        // original (wrong) URL and S3 returns a 301 XML body that
+        // confuses the byte-count assertion downstream.
+        self.ensure_probed()?;
         let end = start + len - 1;
         let resp = self
             .client
-            .get(self.url.clone())
+            .get(self.effective_url().clone())
             .header(RANGE, format!("bytes={}-{}", start, end))
             .send()
             .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e))?
@@ -136,3 +234,34 @@ impl ChunkedTransport for HttpTransport {
 }
 
 // HTTP transport integration tests live in tests/transport.rs (using testserver).
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rewrite_s3_region_swaps_the_region_segment() {
+        let original = Url::parse("https://my-bucket.s3.us-east-1.amazonaws.com/path/to/x").unwrap();
+        let corrected = rewrite_s3_url_region(&original, "us-east-2").unwrap();
+        assert_eq!(corrected.as_str(),
+            "https://my-bucket.s3.us-east-2.amazonaws.com/path/to/x");
+    }
+
+    #[test]
+    fn rewrite_s3_region_returns_none_for_non_s3_hosts() {
+        let other = Url::parse("https://example.com/x").unwrap();
+        assert!(rewrite_s3_url_region(&other, "us-east-2").is_none());
+        let github = Url::parse("https://api.github.com/repos/x").unwrap();
+        assert!(rewrite_s3_url_region(&github, "us-east-2").is_none());
+    }
+
+    #[test]
+    fn rewrite_s3_region_handles_three_part_region_codes() {
+        // S3 regions like `ap-southeast-3` have hyphens; the host
+        // split on dots still treats the whole `ap-southeast-3`
+        // segment as one element.
+        let original = Url::parse("https://b.s3.us-east-1.amazonaws.com/k").unwrap();
+        let corrected = rewrite_s3_url_region(&original, "ap-southeast-3").unwrap();
+        assert_eq!(corrected.host_str().unwrap(), "b.s3.ap-southeast-3.amazonaws.com");
+    }
+}
