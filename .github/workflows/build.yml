@@ -1,0 +1,255 @@
+# Copyright (c) Jonathan Shook
+# SPDX-License-Identifier: Apache-2.0
+#
+# Build (and on tag pushes, publish) `vectordata` release binaries.
+#
+#   build — 4-way matrix producing bare per-platform binaries.
+#     All runners are native (no QEMU emulation):
+#       linux/amd64    → ubuntu-24.04          + apt deps (mold linker)
+#       linux/arm64    → ubuntu-24.04-arm      + apt deps (mold linker)
+#       macos/arm64    → macos-14              + system toolchain
+#       windows/amd64  → windows-2022          + bundled MSVC toolchain
+#     Each row: install platform deps, install pinned Rust toolchain,
+#     restore cargo cache, build `vectordata` (release, --no-default-
+#     features --features cli to keep the binary self-contained),
+#     `cargo test -p vectordata --release`, smoke-test the binary,
+#     upload artifact.
+#
+#   release — fires only on `v*` tag pushes. Downloads each per-target
+#     binary artifact, renames it to include the target triple,
+#     generates SHA256SUMS, attaches everything to a GitHub Release.
+#     Tags containing `-` (e.g. `v1.0.0-rc1`) get auto-marked as
+#     prereleases.
+
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+# Cancel superseded runs on the same branch / PR. Tag pushes keep
+# running uniquely (each tag is its own ref).
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      # One platform failing should not stop the others — release
+      # readiness wants the full per-platform signal.
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+            os:     linux
+            bin:    vectordata
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            os:     linux
+            bin:    vectordata
+          - target: aarch64-apple-darwin
+            runner: macos-14              # Apple Silicon (M-series)
+            os:     macos
+            bin:    vectordata
+          - target: x86_64-pc-windows-msvc
+            runner: windows-2022
+            os:     windows
+            bin:    vectordata.exe
+    steps:
+      - uses: actions/checkout@v6
+
+      # ─── Linux deps: mold linker (workspace .cargo/config.toml
+      # pins mold for x86_64; harmless on aarch64 where the config
+      # is silent and the default linker is used).
+      - name: Install Linux build dependencies
+        if: matrix.os == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential mold clang pkg-config ca-certificates
+
+      # ─── macOS / Windows: nothing extra needed. All vectordata
+      # deps are pure-Rust + cross-platform. The system toolchain
+      # (Xcode CLT on macOS, bundled MSVC on windows-2022) covers
+      # everything.
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: vectordata-${{ matrix.target }}
+
+      # ─── Build the `vectordata` binary in release mode. The crate
+      # exposes both a library (default) and a CLI binary gated on the
+      # `cli` feature (on by default). Build with the binary's required
+      # feature explicitly so workspace consumers that disable `cli`
+      # via their own configs can't accidentally turn this off.
+      - name: Build vectordata (release)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release -p vectordata \
+            --target ${{ matrix.target }} \
+            --features cli
+
+      # ─── Run vectordata's own tests against the target. cargo
+      # test routes to a native or cross-built test runner based on
+      # the target triple; our matrix uses native runners only, so
+      # the host can execute the test binaries directly.
+      - name: Test vectordata
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --release -p vectordata \
+            --target ${{ matrix.target }} \
+            --features cli
+
+      # ─── Smoke-test: the built binary actually starts and prints
+      # its version. Catches LD_LIBRARY_PATH / shared-lib regressions
+      # that a successful build wouldn't surface.
+      - name: Smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin_path="target/${{ matrix.target }}/release/${{ matrix.bin }}"
+          "$bin_path" --version
+
+      # ─── Dump dynamic-library deps for the run log. Helps debug
+      # surprises later (a contributor adds a crate with an FFI dep
+      # and suddenly the binary needs libfoo at runtime). Not a
+      # gate — informational only on first pass; we can promote it
+      # to a hard check once the link posture stabilises.
+      - name: Inspect link posture
+        if: matrix.os != 'windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin_path="target/${{ matrix.target }}/release/${{ matrix.bin }}"
+          file "$bin_path"
+          case "${{ matrix.os }}" in
+            linux) ldd  "$bin_path" || true ;;
+            macos) otool -L "$bin_path" || true ;;
+          esac
+
+      # Single-file upload: upload-artifact@v4+ flattens to the
+      # basename when given one file, so the artifact zip contains
+      # just `vectordata` (or `vectordata.exe`) — no nested target/
+      # release/ dirs.
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: vectordata-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/${{ matrix.bin }}
+          if-no-files-found: error
+          retention-days: 14
+
+  # ───────────────────────────────────────────────────────────
+  # GitHub Release — only on `v*` tag refs. Downloads each
+  # per-target binary artifact, renames each to include the
+  # target triple, generates a SHA256SUMS file, and attaches
+  # everything as Release assets (which the GitHub UI serves
+  # without zip wrapping — unlike workflow artifacts). Auto-
+  # generated changelog from commits since the previous tag.
+  # Tags containing `-` (e.g. `v1.0.0-rc1`) get marked
+  # `prerelease=true` automatically.
+  # ───────────────────────────────────────────────────────────
+  release:
+    name: GitHub Release
+    runs-on: ubuntu-24.04
+    needs: [build]
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - name: Download per-target binary artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: vectordata-*
+
+      - name: Stage release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          # Each downloaded artifact is a directory containing a
+          # single `vectordata` (or `vectordata.exe`) file. Rename
+          # each to include the target triple so users downloading
+          # multiple platforms don't get filename collisions.
+          for dir in artifacts/vectordata-*; do
+            target="${dir##*/vectordata-}"
+            case "$target" in
+              *windows*) src="$dir/vectordata.exe"; dst="release/vectordata-$target.exe" ;;
+              *)         src="$dir/vectordata";     dst="release/vectordata-$target" ;;
+            esac
+            cp "$src" "$dst"
+            chmod +x "$dst" || true
+          done
+          (cd release && sha256sum * > SHA256SUMS)
+          ls -la release/
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IS_PRERELEASE: ${{ contains(github.ref_name, '-') }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          notes_file=$(mktemp)
+          cat > "$notes_file" <<'EOF'
+          ## Binaries
+
+          Single-binary release per platform — no archive, no install step.
+
+          | Platform | Asset |
+          | --- | --- |
+          | Linux amd64 | `vectordata-x86_64-unknown-linux-gnu` |
+          | Linux arm64 | `vectordata-aarch64-unknown-linux-gnu` |
+          | macOS Apple Silicon | `vectordata-aarch64-apple-darwin` |
+          | Windows amd64 | `vectordata-x86_64-pc-windows-msvc.exe` |
+
+          Verify with `SHA256SUMS`.
+
+          ## Changes
+
+          EOF
+          # Append GitHub's auto-generated changelog (commits + PRs
+          # since the previous tag).
+          gh api "repos/$REPO/releases/generate-notes" \
+            -f tag_name="$TAG" \
+            --jq .body >> "$notes_file"
+
+          prerelease_flag=()
+          if [ "$IS_PRERELEASE" = "true" ]; then
+            prerelease_flag+=(--prerelease)
+          fi
+
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            gh release edit "$TAG" --repo "$REPO" \
+              --notes-file "$notes_file" "${prerelease_flag[@]}"
+          else
+            gh release create "$TAG" --repo "$REPO" \
+              --title "$TAG" \
+              --notes-file "$notes_file" "${prerelease_flag[@]}"
+          fi
+
+          # --clobber overwrites assets with the same name, so the
+          # step is idempotent across retries.
+          gh release upload "$TAG" --repo "$REPO" release/* --clobber
