@@ -24,10 +24,18 @@
 //! The default is `STRICT` — current v4 behaviour.
 
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use super::progress::FnvHasher;
+
+/// Extension appended to an artifact path to locate its
+/// provenance sidecar. Co-located with the artifact (rather
+/// than centralised in `.cache/`) so the pair survives
+/// `cp -a`, archival, and `mv`. Same convention every consumer
+/// uses; see [`ProvenanceMap::sidecar_path`].
+pub const SIDECAR_EXT: &str = "provenance.json";
 
 /// Structured provenance of a single step's execution.
 ///
@@ -176,6 +184,96 @@ impl ProvenanceMap {
                 h.write(b"\0");
             }
         }
+    }
+
+    /// Path of the provenance sidecar for an artifact. The sidecar
+    /// lives next to the artifact (e.g. `metadata_predicates.slab`
+    /// → `metadata_predicates.slab.provenance.json`) so the pair
+    /// survives `cp -a`, archival, and `mv`. Every producer/consumer
+    /// uses this same convention — see [`SIDECAR_EXT`].
+    pub fn sidecar_path(artifact: &Path) -> PathBuf {
+        let mut p = artifact.as_os_str().to_os_string();
+        p.push(".");
+        p.push(SIDECAR_EXT);
+        PathBuf::from(p)
+    }
+
+    /// Write this `ProvenanceMap` to `artifact`'s sidecar. Producers
+    /// call this immediately after their output artifact is durable
+    /// on disk; consumers can then pick it up via
+    /// [`read_sidecar`](Self::read_sidecar) to populate their own
+    /// `upstream` entry. Pretty-printed JSON so the file is greppable
+    /// in the field.
+    pub fn write_sidecar(&self, artifact: &Path) -> std::io::Result<()> {
+        let path = Self::sidecar_path(artifact);
+        let body = serde_json::to_vec_pretty(self).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+        })?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, body)
+    }
+
+    /// Read the provenance sidecar paired with `artifact`. Returns
+    /// `Ok(None)` if no sidecar is present — consumers should fall
+    /// back to [`degenerate_from_artifact`](Self::degenerate_from_artifact)
+    /// in that case so hand-curated or pre-existing dataset files
+    /// still cascade *something* into the consumer's hash.
+    pub fn read_sidecar(artifact: &Path) -> std::io::Result<Option<Self>> {
+        let path = Self::sidecar_path(artifact);
+        match std::fs::read(&path) {
+            Ok(bytes) => {
+                let parsed: Self = serde_json::from_slice(&bytes).map_err(|e| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+                })?;
+                Ok(Some(parsed))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Build a degenerate `ProvenanceMap` from a file's path, size,
+    /// and mtime when no sidecar is available. The cascade is
+    /// weaker here — two files with identical size/mtime collide —
+    /// but it preserves the *cheap and sticky* contract: an
+    /// overwrite, regenerate, or touch invalidates downstream
+    /// caches without ever reading the file's content.
+    ///
+    /// The resulting map has empty `binary_*` and `upstream` fields;
+    /// its load-bearing distinguishers are the path and the file
+    /// metadata, recorded under `options`. The synthetic step id
+    /// `degenerate:<filename>` makes it clear in `diff` output that
+    /// this entry didn't come from an upstream pipeline step.
+    pub fn degenerate_from_artifact(artifact: &Path) -> std::io::Result<Self> {
+        let meta = std::fs::metadata(artifact)?;
+        let size = meta.len();
+        // `mtime` only — `ctime`/`atime` swing too much to be a
+        // stable cache signal. The literal seconds + nanos make a
+        // string that diff prints cleanly.
+        let mtime = meta.modified().ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| format!("{}.{:09}", d.as_secs(), d.subsec_nanos()))
+            .unwrap_or_else(|| "0".to_string());
+        let name = artifact.file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "unknown".to_string());
+        let mut options: BTreeMap<String, String> = BTreeMap::new();
+        options.insert("path".into(), artifact.to_string_lossy().into_owned());
+        options.insert("size".into(), size.to_string());
+        options.insert("mtime".into(), mtime);
+        Ok(ProvenanceMap {
+            step_id: format!("degenerate:{name}"),
+            command_path: "degenerate".into(),
+            binary_version_major: 0,
+            binary_version_minor: 0,
+            binary_version_patch: 0,
+            binary_git_hash: String::new(),
+            binary_dirty: false,
+            options,
+            upstream: BTreeMap::new(),
+        })
     }
 
     /// Diff two provenance maps, returning the set of components
@@ -552,6 +650,57 @@ mod tests {
         // components are identical → fresh.
         let no_up = ProvenanceFlags(ProvenanceFlags::CONFIG_ONLY.0 & !ProvenanceFlags::UPSTREAM.0);
         assert_eq!(head_a.hash(no_up), head_b.hash(no_up));
+    }
+
+    /// Sidecar round-trip — write to disk next to an artifact,
+    /// read back from disk, recover an identical map. The cache
+    /// layer's upstream cascade depends on this.
+    #[test]
+    fn sidecar_round_trip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let artifact = tmp.path().join("preds.slab");
+        std::fs::write(&artifact, b"placeholder").unwrap();
+        let original = make_map("1.0.0+abcd", opts());
+        original.write_sidecar(&artifact).unwrap();
+
+        // Sidecar lives at exactly the expected path.
+        let sidecar = ProvenanceMap::sidecar_path(&artifact);
+        assert!(sidecar.exists(), "sidecar must be written at <artifact>.provenance.json");
+
+        let recovered = ProvenanceMap::read_sidecar(&artifact).unwrap()
+            .expect("sidecar should be readable");
+        assert_eq!(recovered.hash(ProvenanceFlags::STRICT),
+                   original.hash(ProvenanceFlags::STRICT));
+    }
+
+    /// Missing sidecar is `Ok(None)`, not an error — lets consumers
+    /// fall through cleanly to the degenerate-from-file path for
+    /// hand-curated dataset files that pre-date the sidecar
+    /// convention.
+    #[test]
+    fn sidecar_absent_returns_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let artifact = tmp.path().join("preds.slab");
+        std::fs::write(&artifact, b"placeholder").unwrap();
+        let result = ProvenanceMap::read_sidecar(&artifact).unwrap();
+        assert!(result.is_none(), "absent sidecar must surface as Ok(None)");
+    }
+
+    /// Degenerate provenance captures path/size/mtime so two
+    /// different files at the same path with different sizes
+    /// produce different hashes.
+    #[test]
+    fn degenerate_from_artifact_distinguishes_by_size() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.slab");
+        let b = tmp.path().join("b.slab");
+        std::fs::write(&a, b"short").unwrap();
+        std::fs::write(&b, b"a much longer payload, surely different size").unwrap();
+        let pa = ProvenanceMap::degenerate_from_artifact(&a).unwrap();
+        let pb = ProvenanceMap::degenerate_from_artifact(&b).unwrap();
+        assert_ne!(pa.hash(ProvenanceFlags::STRICT),
+                   pb.hash(ProvenanceFlags::STRICT),
+                   "different files should produce different degenerate provenances");
     }
 
     #[test]

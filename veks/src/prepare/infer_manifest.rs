@@ -764,9 +764,18 @@ fn detect_file_role(path: &Path, roles: &wizard::DetectedRoles) -> String {
     } else if roles.metadata_results.as_deref() == Some(path) {
         "metadata_results".to_string()
     } else if roles.filtered_neighbor_indices.as_deref() == Some(path) {
-        "filtered_neighbor_indices".to_string()
+        // F facet — emit the canonical `prefiltered_*` key. Legacy
+        // `filtered_*` filenames are accepted by the wizard's role
+        // detection and route into this slot, but the manifest carries
+        // the canonical key per docs/design/prefilter-postfilter-facets.md.
+        "prefiltered_neighbor_indices".to_string()
     } else if roles.filtered_neighbor_distances.as_deref() == Some(path) {
-        "filtered_neighbor_distances".to_string()
+        "prefiltered_neighbor_distances".to_string()
+    } else if roles.postfiltered_neighbor_indices.as_deref() == Some(path) {
+        // E facet — post-filter ground truth (G ∩ R).
+        "postfiltered_neighbor_indices".to_string()
+    } else if roles.postfiltered_neighbor_distances.as_deref() == Some(path) {
+        "postfiltered_neighbor_distances".to_string()
     } else {
         "unassigned".to_string()
     }

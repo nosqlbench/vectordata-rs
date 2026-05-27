@@ -197,7 +197,7 @@ Operators: 0=GT, 1=LT, 2=EQ, 3=NE, 4=GE, 5=LE, 6=IN, 7=MATCHES.
 
 ---
 
-## 1.5 Dataset Facets (BQGDMPRF)
+## 1.5 Dataset Facets (BQGDMPREF)
 
 A dataset is a collection of facets — typed data files that together
 describe a vector search benchmark:
@@ -211,8 +211,18 @@ describe a vector search benchmark:
 | **M** | Metadata content | scalar | `.u8` | Per-base-vector attribute values |
 | **P** | Metadata predicates | scalar | `.u8` | Per-query filter values |
 | **R** | Predicate results | variable vec | `.ivvec` | Base ordinals matching each predicate |
-| **F** | Filtered KNN | uniform vec | `.ivec` + `.fvec` | KNN results after predicate filtering |
+| **F** | Pre-filter KNN ground truth | uniform vec | `.ivec` + `.fvec` | ACORN `G_K`: top-K over `X_p` (predicate-passing base vectors). Full K when `\|X_p\| ≥ K`; perfect recall. Canonical key: `prefiltered_neighbor_*`. Legacy key `filtered_neighbor_*` resolves here. |
+| **E** | Post-filter KNN ground truth | uniform vec | `.ivec` + `.fvec` | `G ∩ R`: unfiltered top-K intersected with predicate-passing set. Sparse possible (`\|E\| ∈ [0, K]`). Canonical key: `postfiltered_neighbor_*`. |
 | **O** | Oracle partitions | per-label profiles | directories | Per-label base vectors + partitioned KNN |
+
+The F (pre-filter) and E (post-filter) facets are *both* filtered
+ground truths but answer different questions. F is the verification
+target for engines that aim for perfect recall (pre-filter scan,
+ACORN-style predicate-subgraph traversal, oracle partitions). E is
+the verification target for naive post-filter ANN engines that do
+not expand the search scope past the unfiltered top-K. See
+[`compute prefiltered-knn`](commands/compute-prefiltered-knn.md) and
+[`compute postfiltered-knn`](commands/compute-postfiltered-knn.md).
 
 The **O** facet carries sub-facets controlling what is computed per
 partition. Characters after `O` specify the per-partition scope
@@ -234,9 +244,9 @@ The pipeline infers which facets to produce from the inputs provided:
 | B only | B |
 | B + Q | B Q G D |
 | B + Q + GT | B Q G (D only if distances provided) |
-| B + Q + M | B Q G D M P R F |
-| B + Q + GT + synthesize | B Q G M P R F |
-| above + `+O` | B Q G M P R F O (O must be explicit, partitions get BQG) |
+| B + Q + M | B Q G D M P R F E |
+| B + Q + GT + synthesize | B Q G M P R F E |
+| above + `+O` | B Q G M P R F E O (O must be explicit, partitions get BQG) |
 
 ---
 
@@ -258,8 +268,10 @@ dataset-name/
 │       ├── neighbor_distances.fvec
 │       ├── metadata_indices.ivvec
 │       ├── IDXFOR__metadata_indices.ivvec.i32
-│       ├── filtered_neighbor_indices.ivec
-│       └── filtered_neighbor_distances.fvec
+│       ├── prefiltered_neighbor_indices.ivec      # F facet (ACORN G_K)
+│       ├── prefiltered_neighbor_distances.fvec
+│       ├── postfiltered_neighbor_indices.ivec     # E facet (G ∩ R)
+│       └── postfiltered_neighbor_distances.fvec
 ├── dataset.json              # machine-readable metadata
 ├── variables.yaml            # pipeline-computed variables
 ├── catalog.json              # dataset index for catalog discovery

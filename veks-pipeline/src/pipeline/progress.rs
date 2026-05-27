@@ -279,7 +279,26 @@ impl ProgressLog {
     }
 
     /// Record a step's execution result.
+    ///
+    /// Side-effect: writes a co-located
+    /// `<output>.provenance.json` sidecar for every `OutputRecord`
+    /// path on the record, *if* the step has a provenance map.
+    /// Sidecars are best-effort: failures are logged at warn level
+    /// but do not abort the record. Consumers downstream rely on
+    /// these sidecars to populate their own `upstream` cascade
+    /// (see [`ProvenanceMap::read_sidecar`]).
     pub fn record_step(&mut self, step_id: &str, record: StepRecord) {
+        if let Some(prov) = record.provenance.as_ref() {
+            for out in &record.outputs {
+                let artifact = Path::new(&out.path);
+                if let Err(e) = prov.write_sidecar(artifact) {
+                    log::warn!(
+                        "provenance: failed to write sidecar for {}: {}",
+                        out.path, e,
+                    );
+                }
+            }
+        }
         self.steps.insert(step_id.to_string(), record);
     }
 
@@ -459,6 +478,71 @@ mod tests {
         log.record_step("step1", rec(None));
         assert!(log.get_step("step1").is_some());
         assert!(log.get_step("step2").is_none());
+    }
+
+    /// `record_step` writes a co-located `<output>.provenance.json`
+    /// for every `OutputRecord` path when the record has a
+    /// `ProvenanceMap`. This is the producer half of the
+    /// upstream-cascade contract: downstream consumers find the
+    /// sidecar via [`ProvenanceMap::read_sidecar`] and merge it
+    /// into their own `upstream` map.
+    #[test]
+    fn record_step_writes_sidecars_for_outputs() {
+        use super::super::provenance::BinaryVersion;
+        let tmp = tempfile::tempdir().unwrap();
+        let artifact = tmp.path().join("out.slab");
+        std::fs::write(&artifact, b"placeholder").unwrap();
+
+        let prov = ProvenanceMap::build(
+            "test-step",
+            "test command",
+            &BinaryVersion::parse("1.0.0+abcd"),
+            &HashMap::new(),
+            std::collections::BTreeMap::new(),
+        );
+        let mut r = rec(Some(prov.clone()));
+        r.outputs.push(OutputRecord {
+            path: artifact.to_string_lossy().into_owned(),
+            size: 12,
+            mtime: None,
+        });
+
+        let mut log = ProgressLog::new();
+        log.record_step("test-step", r);
+
+        // Sidecar appears at the conventional path…
+        let sidecar = ProvenanceMap::sidecar_path(&artifact);
+        assert!(sidecar.exists(),
+            "record_step should write a sidecar at {}", sidecar.display());
+
+        // …and round-trips to a structurally-equal map.
+        let recovered = ProvenanceMap::read_sidecar(&artifact).unwrap().unwrap();
+        assert_eq!(recovered.hash(super::super::provenance::ProvenanceFlags::STRICT),
+                   prov.hash(super::super::provenance::ProvenanceFlags::STRICT));
+    }
+
+    /// Producer steps without a `ProvenanceMap` (legacy records or
+    /// commands that haven't been wired up yet) must NOT crash on
+    /// `record_step`. Missing sidecar is the equivalent of "no
+    /// upstream provenance to cascade" — consumers fall back to
+    /// `degenerate_from_artifact`.
+    #[test]
+    fn record_step_without_provenance_does_not_write_sidecar() {
+        let tmp = tempfile::tempdir().unwrap();
+        let artifact = tmp.path().join("legacy.slab");
+        std::fs::write(&artifact, b"placeholder").unwrap();
+
+        let mut r = rec(None);
+        r.outputs.push(OutputRecord {
+            path: artifact.to_string_lossy().into_owned(),
+            size: 12,
+            mtime: None,
+        });
+
+        let mut log = ProgressLog::new();
+        log.record_step("legacy-step", r);
+        assert!(!ProvenanceMap::sidecar_path(&artifact).exists(),
+            "no provenance → no sidecar (best-effort, not mandatory)");
     }
 
     #[test]

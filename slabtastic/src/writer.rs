@@ -35,7 +35,7 @@
 //! There is no multi-page spanning for individual records.
 
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use crate::config::WriterConfig;
@@ -114,7 +114,15 @@ const MAX_NAMESPACE_INDEX: u8 = 127;
 /// # }
 /// ```
 pub struct SlabWriter {
-    file: File,
+    /// File handle wrapped in a `BufWriter` so successive
+    /// page-sized `write_all` calls (page bytes, pages-page
+    /// trailer, namespaces-page trailer) coalesce into larger
+    /// writev-friendly chunks. The buffer is sized to comfortably
+    /// hold a typical preferred-page-size payload without
+    /// fragmenting the syscall. `BufWriter`'s pass-through
+    /// behaviour for writes larger than the buffer keeps oversize
+    /// pages efficient too.
+    file: BufWriter<File>,
     config: WriterConfig,
     current_page: Page,
     pages_page: PagesPage,
@@ -143,7 +151,12 @@ impl SlabWriter {
     /// — [`finish`](Self::finish) will then emit a
     /// [`NamespacesPage`] trailer instead of a bare pages page.
     pub fn new<P: AsRef<Path>>(path: P, config: WriterConfig) -> Result<Self> {
-        let file = File::create(path)?;
+        // 8 MiB buffer: comfortably absorbs the typical 4 MiB
+        // preferred-page payloads emitted on bulk-write paths, and
+        // BufWriter passes through writes larger than the buffer
+        // so oversized records stay zero-copy.
+        const WRITE_BUF: usize = 8 * 1024 * 1024;
+        let file = BufWriter::with_capacity(WRITE_BUF, File::create(path)?);
         Ok(SlabWriter {
             file,
             config,
@@ -331,6 +344,12 @@ impl SlabWriter {
         let mut current_page = Page::new(max_ordinal, PageType::Data);
         current_page.footer.namespace_index = target_index;
 
+        // BufWriter wrapping preserves the underlying File's seek
+        // position, so writes resume at `data_end` (the position
+        // we explicitly seeked to above). Same 8 MiB buffer as the
+        // `new()` path so append matches create on write throughput.
+        const WRITE_BUF: usize = 8 * 1024 * 1024;
+        let file = BufWriter::with_capacity(WRITE_BUF, file);
         Ok(SlabWriter {
             file,
             config,
@@ -362,6 +381,38 @@ impl SlabWriter {
 
         // Check if adding this record would exceed preferred size
         self.current_page.add_record(data);
+        self.next_ordinal += 1;
+        let projected_size = self.current_page.serialized_size();
+
+        if projected_size >= self.config.preferred_page_size as usize
+            && self.current_page.record_count() > 0
+        {
+            self.flush_page()?;
+        }
+
+        Ok(())
+    }
+
+    /// Add a record by taking ownership of its bytes — no clone.
+    ///
+    /// Behaviourally identical to [`add_record`](Self::add_record),
+    /// but accepts the record as `Vec<u8>` so callers that already
+    /// own the bytes avoid the per-record memcpy that
+    /// [`Page::add_record`] performs. Use this on the hot path of
+    /// bulk-write workloads (predicate-merge phases, segment-cache
+    /// consolidation) where the caller has just produced the buffer
+    /// and is about to drop it anyway.
+    pub fn add_record_owned(&mut self, data: Vec<u8>) -> Result<()> {
+        let single_record_page_size =
+            HEADER_SIZE + data.len() + (2 * 4) + FOOTER_V1_SIZE;
+        if single_record_page_size > self.config.max_page_size as usize {
+            return Err(SlabError::RecordTooLarge {
+                record_size: data.len(),
+                max_size: self.config.max_page_size as usize - HEADER_SIZE - 8 - FOOTER_V1_SIZE,
+            });
+        }
+
+        self.current_page.add_record_owned(data);
         self.next_ordinal += 1;
         let projected_size = self.current_page.serialized_size();
 

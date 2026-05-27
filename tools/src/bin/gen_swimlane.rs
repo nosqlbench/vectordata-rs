@@ -146,8 +146,10 @@ const STEPS: &[Step] = &[
         tooltip: "state set: Count records in base_vectors and store as ${base_count}.\nVerifiable: vector_count - duplicate_count - zero_count = base_count." },
     Step { row: 7,  col: 2, label: "compute\nknn [pp]",          cond: "[G + !precomputed]", fill_override: None,
         tooltip: "compute knn: Brute-force exact K-nearest-neighbor computation.\nPer-profile: uses base_vectors[0..base_count) as corpus.\nProduces neighbor_indices.ivec and neighbor_distances.fvec." },
-    Step { row: 7,  col: 7, label: "compute\nfiltered-knn [pp]", cond: "[F]",                fill_override: None,
-        tooltip: "compute filtered-knn: KNN with predicate pre-filtering.\nPer-profile: evaluates predicates to get eligible base vectors,\nthen computes KNN among eligible only." },
+    Step { row: 7,  col: 7, label: "compute\nprefiltered-knn [pp]", cond: "[F]",            fill_override: None,
+        tooltip: "compute prefiltered-knn: pre-filter brute-force KNN (ACORN G_K, F facet).\nPer-profile: filters candidate set to predicate-matching base vectors,\nthen takes top-K by distance. Full K when |X_p| ≥ K — perfect recall.\nLegacy name `compute filtered-knn` aliases to this command." },
+    Step { row: 7,  col: 8, label: "compute\npostfiltered-knn [pp]", cond: "[E]",           fill_override: None,
+        tooltip: "compute postfiltered-knn: post-filter ground truth (E facet) as G ∩ R.\nPer-profile: for each query, intersect unfiltered top-K (G) with\npredicate-matching ordinals (R). Sparse possible. Cheap O(K) per query;\nno base/query reread, distances copied from D." },
     Step { row: 8, col: 2, label: "verify\nknn [pp]",            cond: "[G]",                fill_override: None,
         tooltip: "verify knn: Sparse-sample brute-force recomputation.\nPer-profile: samples queries, recomputes KNN, compares to stored GT." },
     Step { row: 8, col: 7, label: "verify\npredicates [pp]",     cond: "[F]",                fill_override: None,
@@ -168,9 +170,11 @@ const ARTIFACTS: &[Artifact] = &[
     Artifact { col: 5, label: "metadata_predicates\n.slab",
         tooltip: "P: Test predicates for filtered search. At profiles/base/predicates.slab.\nEach record is a PNode (predicate tree) synthesized from the metadata survey.\nConfigurable count and selectivity." },
     Artifact { col: 6, label: "metadata_indices\n.slab",
-        tooltip: "R: Predicate evaluation results. Per-profile at profiles/{profile}/metadata_indices.slab.\nFor each predicate, stores the set of base vector ordinals that match.\nUsed by compute-filtered-knn as the pre-filter." },
-    Artifact { col: 7, label: "filtered_neighbor\n_indices+_distances",
-        tooltip: "F: Filtered KNN results. Per-profile at profiles/{profile}/filtered_neighbor_{indices,distances}.\nSame shape as G/D but computed with predicate pre-filtering.\nEach query uses only base vectors that match its predicate." },
+        tooltip: "R: Predicate evaluation results. Per-profile at profiles/{profile}/metadata_indices.slab.\nFor each predicate, stores the set of base vector ordinals that match.\nUsed by compute-prefiltered-knn as the pre-filter candidate set and by\ncompute-postfiltered-knn as the membership test for G ∩ R." },
+    Artifact { col: 7, label: "prefiltered_neighbor\n_indices+_distances",
+        tooltip: "F: Pre-filter KNN ground truth — ACORN G_K. Per-profile at\nprofiles/{profile}/prefiltered_neighbor_{indices,distances}.{ivec,fvec}.\nTop-K over X_p (predicate-passing base vectors). Full K when |X_p| ≥ K;\nperfect recall by construction. The legacy filename pattern\n`filtered_neighbor_*` also resolves here (same shape on disk)." },
+    Artifact { col: 8, label: "postfiltered_neighbor\n_indices+_distances",
+        tooltip: "E: Post-filter KNN ground truth — G ∩ R. Per-profile at\nprofiles/{profile}/postfiltered_neighbor_{indices,distances}.{ivec,fvec}.\nUnfiltered top-K intersected with the predicate-passing set; sparse\npossible (|F| ∈ [0, K]). The realistic verification target for ANN\nengines that post-filter without rescue scope." },
 ];
 
 const INPUTS: &[Input] = &[

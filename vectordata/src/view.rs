@@ -193,12 +193,21 @@ pub trait TestDataView: Send + Sync {
     /// Returns a reader for the neighbor distances (ground truth).
     fn neighbor_distances(&self) -> Result<Arc<dyn VectorReader<f32>>>;
 
-    // -- Filtered neighbor facets --
+    // -- Filtered neighbor facets (E / F) --
 
-    /// Returns a reader for the filtered neighbor indices.
-    fn filtered_neighbor_indices(&self) -> Result<Arc<dyn VectorReader<i32>>>;
-    /// Returns a reader for the filtered neighbor distances.
-    fn filtered_neighbor_distances(&self) -> Result<Arc<dyn VectorReader<f32>>>;
+    /// Returns a reader for the **pre-filter** KNN ground-truth indices (E).
+    /// Top-K of `X_p` by distance; full K when `|X_p| ≥ K`.
+    fn prefiltered_neighbor_indices(&self) -> Result<Arc<dyn VectorReader<i32>>>;
+    /// Returns a reader for the **pre-filter** KNN ground-truth distances (E).
+    fn prefiltered_neighbor_distances(&self) -> Result<Arc<dyn VectorReader<f32>>>;
+
+    /// Returns a reader for the **post-filter** KNN ground-truth indices (F).
+    /// `G ∩ R` — the unfiltered top-K intersected with the predicate-passing
+    /// set; sparse possible. The legacy `filtered_neighbor_indices` YAML key
+    /// resolves to this facet for backwards compatibility.
+    fn postfiltered_neighbor_indices(&self) -> Result<Arc<dyn VectorReader<i32>>>;
+    /// Returns a reader for the **post-filter** KNN ground-truth distances (F).
+    fn postfiltered_neighbor_distances(&self) -> Result<Arc<dyn VectorReader<f32>>>;
 
     // -- Metadata facets --
 
@@ -677,8 +686,10 @@ impl GenericTestDataView {
             ("metadata_predicates", self.config.metadata_predicates.as_ref(), StandardFacet::MetadataPredicates),
             ("predicate_results", self.config.predicate_results.as_ref(), StandardFacet::MetadataResults),
             ("metadata_layout", self.config.metadata_layout.as_ref(), StandardFacet::MetadataLayout),
-            ("filtered_neighbor_indices", self.config.filtered_neighbor_indices.as_ref(), StandardFacet::FilteredNeighborIndices),
-            ("filtered_neighbor_distances", self.config.filtered_neighbor_distances.as_ref(), StandardFacet::FilteredNeighborDistances),
+            ("prefiltered_neighbor_indices", self.config.prefiltered_neighbor_indices.as_ref(), StandardFacet::PrefilteredNeighborIndices),
+            ("prefiltered_neighbor_distances", self.config.prefiltered_neighbor_distances.as_ref(), StandardFacet::PrefilteredNeighborDistances),
+            ("postfiltered_neighbor_indices", self.config.postfiltered_neighbor_indices.as_ref(), StandardFacet::PostfilteredNeighborIndices),
+            ("postfiltered_neighbor_distances", self.config.postfiltered_neighbor_distances.as_ref(), StandardFacet::PostfilteredNeighborDistances),
         ];
 
         for (name, facet_opt, kind) in standard_facets {
@@ -712,8 +723,17 @@ impl GenericTestDataView {
             "metadata_predicates" => self.config.metadata_predicates.as_ref(),
             "predicate_results" => self.config.predicate_results.as_ref(),
             "metadata_layout" => self.config.metadata_layout.as_ref(),
-            "filtered_neighbor_indices" => self.config.filtered_neighbor_indices.as_ref(),
-            "filtered_neighbor_distances" => self.config.filtered_neighbor_distances.as_ref(),
+            // Canonical pre-filter keys + legacy `filtered_*` aliases
+            // (legacy on-disk files carry pre-filter shape).
+            "prefiltered_neighbor_indices" | "filtered_neighbor_indices" =>
+                self.config.prefiltered_neighbor_indices.as_ref(),
+            "prefiltered_neighbor_distances" | "filtered_neighbor_distances" =>
+                self.config.prefiltered_neighbor_distances.as_ref(),
+            // Canonical post-filter keys.
+            "postfiltered_neighbor_indices" =>
+                self.config.postfiltered_neighbor_indices.as_ref(),
+            "postfiltered_neighbor_distances" =>
+                self.config.postfiltered_neighbor_distances.as_ref(),
             _ => None,
         }
     }
@@ -775,17 +795,31 @@ impl TestDataView for GenericTestDataView {
         self.open_uniform(self.config.neighbor_distances.as_ref(), "neighbor_distances")
     }
 
-    fn filtered_neighbor_indices(&self) -> Result<Arc<dyn VectorReader<i32>>> {
+    fn prefiltered_neighbor_indices(&self) -> Result<Arc<dyn VectorReader<i32>>> {
         self.open_uniform(
-            self.config.filtered_neighbor_indices.as_ref(),
-            "filtered_neighbor_indices",
+            self.config.prefiltered_neighbor_indices.as_ref(),
+            "prefiltered_neighbor_indices",
         )
     }
 
-    fn filtered_neighbor_distances(&self) -> Result<Arc<dyn VectorReader<f32>>> {
+    fn prefiltered_neighbor_distances(&self) -> Result<Arc<dyn VectorReader<f32>>> {
         self.open_uniform(
-            self.config.filtered_neighbor_distances.as_ref(),
-            "filtered_neighbor_distances",
+            self.config.prefiltered_neighbor_distances.as_ref(),
+            "prefiltered_neighbor_distances",
+        )
+    }
+
+    fn postfiltered_neighbor_indices(&self) -> Result<Arc<dyn VectorReader<i32>>> {
+        self.open_uniform(
+            self.config.postfiltered_neighbor_indices.as_ref(),
+            "postfiltered_neighbor_indices",
+        )
+    }
+
+    fn postfiltered_neighbor_distances(&self) -> Result<Arc<dyn VectorReader<f32>>> {
+        self.open_uniform(
+            self.config.postfiltered_neighbor_distances.as_ref(),
+            "postfiltered_neighbor_distances",
         )
     }
 
@@ -814,12 +848,17 @@ impl TestDataView for GenericTestDataView {
     }
 
     fn facet(&self, name: &str) -> Result<Arc<dyn VectorReader<f32>>> {
-        // Try standard facets first (uniform vector types)
+        // Try standard facets first (uniform vector types). The legacy
+        // `filtered_*` aliases route to the prefilter distances method
+        // because legacy on-disk files carry pre-filter shape.
         match name {
             "base_vectors" => return self.base_vectors(),
             "query_vectors" => return self.query_vectors(),
             "neighbor_distances" => return self.neighbor_distances(),
-            "filtered_neighbor_distances" => return self.filtered_neighbor_distances(),
+            "prefiltered_neighbor_distances" | "filtered_neighbor_distances" => {
+                return self.prefiltered_neighbor_distances();
+            }
+            "postfiltered_neighbor_distances" => return self.postfiltered_neighbor_distances(),
             _ => {}
         }
 
@@ -929,7 +968,8 @@ mod tests {
                 base_vectors: None, base_content: None,
                 query_vectors: None, query_terms: None, query_filters: None,
                 neighbor_indices: None, neighbor_distances: None,
-                filtered_neighbor_indices: None, filtered_neighbor_distances: None,
+                prefiltered_neighbor_indices: None, prefiltered_neighbor_distances: None,
+                postfiltered_neighbor_indices: None, postfiltered_neighbor_distances: None,
                 metadata_content: None, metadata_predicates: None,
                 predicate_results: None, metadata_layout: None,
             }

@@ -331,8 +331,42 @@ pub fn check_condition_raw(
                     Some(Ordering::Less | Ordering::Equal)
                 )
         }
-        OpType::Matches => false,
+        OpType::Matches => comparands.iter().any(|c| raw_matches(data, pos, tag, c)),
     }
+}
+
+/// `field MATCHES comparand` — substring containment. Mirrors
+/// the SQL `LIKE '%pattern%'` semantic used by
+/// `verify_predicates::pnode_to_sql`. Operates on length-prefixed
+/// text-family values without allocating; pattern is matched as a
+/// byte sequence (safe across UTF-8 because byte-substring search
+/// is encoding-stable for valid UTF-8).
+fn raw_matches(data: &[u8], pos: usize, tag: u8, c: &Comparand) -> bool {
+    match (tag, c) {
+        // Text family — substring contains.
+        (0 | 6 | 10 | 11, Comparand::Text(pat)) => {
+            let len = read_u32(data, pos) as usize;
+            let haystack = &data[pos + 4..pos + 4 + len];
+            byte_contains(haystack, pat.as_bytes())
+        }
+        // Bytes — byte-substring contains (lets predicates target
+        // binary fields without a string round-trip).
+        (4, Comparand::Bytes(pat)) => {
+            let len = read_u32(data, pos) as usize;
+            let haystack = &data[pos + 4..pos + 4 + len];
+            byte_contains(haystack, pat.as_slice())
+        }
+        // MATCHES on non-textual types is meaningless → false.
+        _ => false,
+    }
+}
+
+/// Empty needles match anywhere (mirrors SQL `LIKE '%%'` ≡ true);
+/// `windows()` would otherwise yield nothing for an empty pattern.
+fn byte_contains(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() { return true; }
+    if needle.len() > haystack.len() { return false; }
+    haystack.windows(needle.len()).any(|w| w == needle)
 }
 
 // ---------------------------------------------------------------------------
@@ -769,6 +803,99 @@ mod tests {
         let (vpos, tag) = find_field_value(&data, 0);
         assert!(check_condition_raw(&data, vpos, tag, &OpType::Eq, &[Comparand::Bool(true)]));
         assert!(!check_condition_raw(&data, vpos, tag, &OpType::Eq, &[Comparand::Bool(false)]));
+    }
+
+    // -- MATCHES (substring containment, SQL LIKE '%pattern%') --
+
+    /// MATCHES on a text field is a substring search. Mirrors
+    /// the high-level [`evaluate`](crate::pnode::eval::evaluate)
+    /// path so the raw scanner produces identical truth values.
+    /// Regression guard for the bug where every trigram-MATCHES
+    /// predicate matched zero records because this branch
+    /// returned `false` unconditionally.
+    #[test]
+    fn test_raw_matches_text_substring_hit() {
+        let data = build_record(&[("caption", MValue::Text("the cat sat".into()))]);
+        let (vpos, tag) = find_field_value(&data, 0);
+        assert!(check_condition_raw(
+            &data, vpos, tag,
+            &OpType::Matches,
+            &[Comparand::Text("the".into())],
+        ));
+        assert!(check_condition_raw(
+            &data, vpos, tag,
+            &OpType::Matches,
+            &[Comparand::Text("cat".into())],
+        ));
+        assert!(check_condition_raw(
+            &data, vpos, tag,
+            &OpType::Matches,
+            &[Comparand::Text("at sa".into())],
+        ));
+    }
+
+    #[test]
+    fn test_raw_matches_text_substring_miss() {
+        let data = build_record(&[("caption", MValue::Text("the cat".into()))]);
+        let (vpos, tag) = find_field_value(&data, 0);
+        assert!(!check_condition_raw(
+            &data, vpos, tag,
+            &OpType::Matches,
+            &[Comparand::Text("xyz".into())],
+        ));
+    }
+
+    #[test]
+    fn test_raw_matches_empty_pattern_is_true() {
+        let data = build_record(&[("caption", MValue::Text("hello".into()))]);
+        let (vpos, tag) = find_field_value(&data, 0);
+        assert!(check_condition_raw(
+            &data, vpos, tag,
+            &OpType::Matches,
+            &[Comparand::Text("".into())],
+        ));
+    }
+
+    #[test]
+    fn test_raw_matches_bytes_substring() {
+        let data = build_record(&[("blob",
+            MValue::Bytes(vec![0x01, 0xAB, 0xCD, 0xEF]))]);
+        let (vpos, tag) = find_field_value(&data, 0);
+        assert!(check_condition_raw(
+            &data, vpos, tag,
+            &OpType::Matches,
+            &[Comparand::Bytes(vec![0xAB, 0xCD])],
+        ));
+        assert!(!check_condition_raw(
+            &data, vpos, tag,
+            &OpType::Matches,
+            &[Comparand::Bytes(vec![0xFE, 0xED])],
+        ));
+    }
+
+    #[test]
+    fn test_raw_matches_on_int_is_false() {
+        let data = build_record(&[("x", MValue::Int(42))]);
+        let (vpos, tag) = find_field_value(&data, 0);
+        assert!(!check_condition_raw(
+            &data, vpos, tag,
+            &OpType::Matches,
+            &[Comparand::Text("42".into())],
+        ));
+    }
+
+    #[test]
+    fn test_raw_matches_multi_comparand_any() {
+        let data = build_record(&[("caption", MValue::Text("the cat".into()))]);
+        let (vpos, tag) = find_field_value(&data, 0);
+        assert!(check_condition_raw(
+            &data, vpos, tag,
+            &OpType::Matches,
+            &[
+                Comparand::Text("xyz".into()),
+                Comparand::Text("cat".into()),
+            ],
+        ));
     }
 
     #[test]

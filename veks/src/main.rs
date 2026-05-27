@@ -143,10 +143,20 @@ fn build_augmented_cli() -> clap::Command {
     cmd = cmd.mut_subcommand("help", |_| {
         build_help_completion_command()
     });
-    // Add pipeline groups as hidden top-level subcommands so that
-    // `veks merkle <TAB>` offers merkle subcommands with full argument
-    // completion. Reuse the full pipeline command tree (which includes
-    // args, value hints, etc.) rather than building stubs.
+    // Add pipeline groups as top-level subcommands so that
+    // `veks slab <TAB>` (single tap) offers slab subcommands with
+    // full argument completion. Reuse the full pipeline command
+    // tree (which includes args, value hints, etc.) rather than
+    // building stubs.
+    //
+    // Why these aren't hidden: dispatch handles `veks slab inspect`
+    // as a top-level invocation (see `dispatch_shorthand`); if the
+    // completion engine treats those groups as tier-2-only, users
+    // discover the dispatch-reachable commands only via double-tap.
+    // That divergence between dispatch and completion is exactly
+    // what the augmented tree was supposed to eliminate. Visible
+    // groups keep `veks --help` longer, but they keep the
+    // "what's typeable" and "what's offered" surfaces aligned.
     {
         let pipeline_cmd = pipeline::cli::build_pipeline_command();
         for group_sub in pipeline_cmd.get_subcommands() {
@@ -155,10 +165,10 @@ fn build_augmented_cli() -> clap::Command {
             if cmd.get_subcommands().any(|c| c.get_name() == group_name) {
                 continue;
             }
-            // Clone the full group command (with all child args) and hide it
-            // from --help while keeping it visible to the completion engine.
-            let hidden_group = group_sub.clone().hide(true);
-            cmd = cmd.subcommand(hidden_group);
+            // Clone the full group command (with all child args).
+            // Visible by default — first-tap completion surfaces it,
+            // dispatch reaches it via `dispatch_shorthand`.
+            cmd = cmd.subcommand(group_sub.clone());
         }
     }
 

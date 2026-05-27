@@ -32,9 +32,10 @@ each run against the synthetic-1k test fixture.
 
 | Command | Description |
 |---------|-------------|
-| `compute knn` | Brute-force exact KNN ground truth |
+| `compute knn` | Brute-force exact KNN ground truth (G facet) |
 | `compute knn-distances` | Recover `neighbor_distances.fvecs` from pre-existing `neighbor_indices.ivecs` + base + query (used when the source ships indices but no distances) |
-| `compute filtered-knn` | KNN with predicate pre-filtering |
+| `compute prefiltered-knn` | Pre-filter KNN ground truth (F facet) — ACORN `G_K`, perfect recall, top-K of `X_p`. Legacy command name `compute filtered-knn` aliases here. |
+| `compute postfiltered-knn` | Post-filter KNN ground truth (E facet) — `G ∩ R`, sparse possible, cheap O(K) derivation |
 | `compute evaluate-predicates` | Evaluate predicates against metadata → vvec results |
 | `compute sort` | Sort vectors for deduplication |
 | `compute partition-profiles` | Extract per-label base vectors and register partition profiles |

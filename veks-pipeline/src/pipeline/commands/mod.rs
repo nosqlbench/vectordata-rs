@@ -18,12 +18,12 @@ pub mod analyze_compare;
 #[cfg(all(feature = "knnutils", unix))]
 pub mod analyze_fvecs_check_knnutils;
 pub mod analyze_explore;
+pub mod analyze_predicate_summary;
 pub mod analyze_find_duplicates;
 pub mod analyze_find_zeros;
 pub mod analyze_find;
 pub mod analyze_histogram;
 pub mod analyze_modeldiff;
-pub mod analyze_plot;
 pub mod analyze_select;
 pub mod analyze_slice;
 pub mod analyze_stats;
@@ -39,7 +39,8 @@ pub mod cleanup_overlap;
 pub mod clean_ordinals;
 pub mod compute_dedup;
 pub mod dataset_json;
-pub mod compute_filtered_knn;
+pub mod compute_prefiltered_knn;
+pub mod compute_postfiltered_knn;
 pub mod compute_knn;
 pub mod compute_knn_distances;
 pub mod compute_partition_profiles;
@@ -55,7 +56,6 @@ pub mod compute_knn_faiss;
 pub mod verify_knn_faiss;
 #[cfg(feature = "knnutils")]
 pub mod compute_sort_knnutils;
-pub mod compute_sort;
 pub mod config;
 mod convert;
 pub mod compute_knn_stdarch;
@@ -71,9 +71,12 @@ pub mod gen_metadata;
 pub mod gen_from_model;
 pub mod gen_predicate_keys;
 pub mod inspect_filtered_knn;
+pub mod inspect_knn;
 pub mod inspect_partition;
 pub mod gen_predicates;
 pub mod gen_predicates_common;
+pub mod gen_predicates_proto;
+pub mod gen_predicates_wizard;
 pub mod gen_simple_predicates;
 pub mod gen_shuffle;
 #[cfg(feature = "knnutils")]
@@ -127,7 +130,9 @@ pub fn register_all(registry: &mut CommandRegistry) {
     registry.register("analyze display-histogram", analyze_histogram::factory);
     registry.register("analyze model-diff", analyze_modeldiff::factory);
     registry.register("analyze explain-predicates", inspect_predicate::factory);
+    registry.register("analyze predicate-summary", analyze_predicate_summary::factory);
     registry.register("analyze explain-filtered-knn", inspect_filtered_knn::factory);
+    registry.register("analyze explain-knn", inspect_knn::factory);
     registry.register("analyze explain-partitions", inspect_partition::factory);
     registry.register("analyze select", analyze_select::factory);
     registry.register("analyze slice", analyze_slice::factory);
@@ -147,7 +152,13 @@ pub fn register_all(registry: &mut CommandRegistry) {
 
     // ── compute ──────────────────────────────────────────────────────
     registry.register("compute evaluate-predicates", gen_predicate_keys::factory);
-    registry.register("compute filtered-knn", compute_filtered_knn::factory);
+    // E facet (pre-filter, ACORN G_K). The legacy command name
+    // `compute filtered-knn` is retained as an alias so existing
+    // pipeline.yaml files keep running.
+    registry.register("compute prefiltered-knn", compute_prefiltered_knn::factory);
+    registry.register("compute filtered-knn", compute_prefiltered_knn::factory);
+    // F facet (post-filter, G ∩ R).
+    registry.register("compute postfiltered-knn", compute_postfiltered_knn::factory);
     registry.register("compute knn-metal", compute_knn::factory);
     registry.register("compute knn-stdarch", compute_knn_stdarch::factory);
     registry.register("compute partition-profiles", compute_partition_profiles::factory);
@@ -210,6 +221,22 @@ pub fn register_all(registry: &mut CommandRegistry) {
     // ── query ────────────────────────────────────────────────────────
     registry.register("query json", json_jjq::factory);
     registry.register("query records", json_rjq::factory);
+
+    // ── slab ─────────────────────────────────────────────────────────
+    // Primary interactive surface for inspecting / manipulating slab
+    // records — `slab inspect`, `slab get`, `slab analyze`, etc. Also
+    // valid in pipelines (e.g. `slab import` to materialise a slab
+    // from external metadata).
+    registry.register("slab analyze", slab::analyze_factory);
+    registry.register("slab append", slab::append_factory);
+    registry.register("slab check", slab::check_factory);
+    registry.register("slab explain", slab::explain_factory);
+    registry.register("slab export", slab::export_factory);
+    registry.register("slab get", slab::get_factory);
+    registry.register("slab import", slab::import_factory);
+    registry.register("slab inspect", slab::inspect_factory);
+    registry.register("slab namespaces", slab::namespaces_factory);
+    registry.register("slab rewrite", slab::rewrite_factory);
 
     // ── state ────────────────────────────────────────────────────────
     registry.register("state set", set_variable::factory);

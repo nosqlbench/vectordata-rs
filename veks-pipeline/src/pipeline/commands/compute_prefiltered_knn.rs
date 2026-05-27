@@ -1,7 +1,7 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! Pipeline command: compute predicate-filtered exact K-nearest neighbors.
+//! Pipeline command: compute pre-filter exact K-nearest neighbors (F facet).
 //!
 //! A variant of `compute knn` that restricts each query's candidate set to
 //! the base vectors matching a pre-computed predicate. The predicate answer
@@ -10,9 +10,13 @@
 //! satisfy predicate `i`.
 //!
 //! For query `i`, only the base vectors whose ordinals appear in the
-//! metadata-indices record `i` are considered. This models pre-filtered
-//! vector search where metadata predicates narrow the candidate set
-//! before distance computation.
+//! metadata-indices record `i` are considered. This is **ACORN's
+//! pre-filtering**: filter candidates first, then top-K. The output is
+//! ACORN's `G_K` — perfect-recall filtered ground truth. Result cardinality
+//! equals K whenever the predicate matches at least K base vectors.
+//!
+//! See `docs/design/prefilter-postfilter-facets.md` for the relationship
+//! to the post-filter facet (`compute postfiltered-knn`).
 //!
 //! ## Partitioned computation
 //!
@@ -53,11 +57,11 @@ use crate::pipeline::simd_distance::{self, Metric};
 use super::source_window::resolve_source;
 
 /// Pipeline command: compute predicate-filtered exact KNN.
-pub struct ComputeFilteredKnnOp;
+pub struct ComputePrefilteredKnnOp;
 
-/// Create a boxed `ComputeFilteredKnnOp` command.
+/// Create a boxed `ComputePrefilteredKnnOp` command.
 pub fn factory() -> Box<dyn CommandOp> {
-    Box::new(ComputeFilteredKnnOp)
+    Box::new(ComputePrefilteredKnnOp)
 }
 
 // -- Top-K heap ---------------------------------------------------------------
@@ -170,14 +174,17 @@ struct PartitionMeta {
     cached: bool,
 }
 
-/// Cache-format version for filtered-knn partition files.
+/// Cache-format version for prefilter-knn partition files (`pfknn-v1`).
 ///
 /// Bump when the on-disk format changes in a way old files would be
-/// misinterpreted under the new code. v1 (introduced when the rest of
-/// the codebase standardized on FAISS publication sign convention)
-/// uses `+L2sq`, `+dot`, `+cos_sim` for distances — see
-/// [`knn_segment::kernel_to_published`].
-const FKNN_CACHE_VERSION: &str = "fknn-v1";
+/// misinterpreted under the new code. The tag is distinct from the
+/// legacy `fknn-v1` used by the pre-rename `compute filtered-knn`; on the
+/// first run after the rename, existing `fknn-v1.*` cache files in the
+/// dataset's `.cache/` are ignored and partitions are recomputed under
+/// the new tag. The cached partition bytes are identical (the algorithm
+/// did not change), so the recompute is wasted work but only happens once
+/// per dataset.
+const FKNN_CACHE_VERSION: &str = "pfknn-v1";
 
 /// Build a cache file path for a partition.
 ///
@@ -749,9 +756,9 @@ use crate::pipeline::element_type::ElementType;
 
 // -- CommandOp ----------------------------------------------------------------
 
-impl CommandOp for ComputeFilteredKnnOp {
+impl CommandOp for ComputePrefilteredKnnOp {
     fn command_path(&self) -> &str {
-        "compute filtered-knn"
+        "compute prefiltered-knn"
     }
 
     fn category(&self) -> &'static dyn veks_completion::CategoryTag {
@@ -763,18 +770,23 @@ impl CommandOp for ComputeFilteredKnnOp {
     fn command_doc(&self) -> CommandDoc {
         let options = self.describe_options();
         CommandDoc {
-            summary: "Brute-force filtered KNN with metadata-index pre-filtering".into(),
-            body: format!(r#"# compute filtered-knn
+            summary: "Brute-force pre-filter KNN ground truth (F facet) — ACORN G_K".into(),
+            body: format!(r#"# compute prefiltered-knn
 
-Brute-force filtered KNN with metadata-index pre-filtering.
+Brute-force pre-filter exact KNN — produces the **F facet** (ACORN's
+`G_K`, the perfect-recall filtered ground truth; the legacy filtered-
+knn shape).
 
 ## Description
 
 A variant of `compute knn` that restricts each query's candidate set to
-the base vectors matching a pre-computed predicate. Like `compute knn` it
-performs an exhaustive brute-force search, but instead of evaluating every
-base vector for every query it only considers the subset of base vectors
-whose metadata satisfies the query's predicate.
+the base vectors matching a pre-computed predicate. This is **ACORN's
+pre-filtering** (§3.2): filter the candidate set first, then take the
+top-K by distance. Result cardinality equals K whenever the predicate
+matches at least K base vectors.
+
+For the post-filter counterpart (G ∩ R, sparse), see
+`compute postfiltered-knn`.
 
 ### How Filtering Works
 
@@ -802,18 +814,18 @@ into the global top-K for each query — identical to the strategy used by
 
 The command produces two files:
 
-- **filtered_neighbor_indices.ivecs** — for each query, the ordinal indices
-  of its K nearest neighbors among the base vectors that match the query's
-  predicate.
-- **filtered_neighbor_distances.fvecs** — the corresponding distances.
+- **prefiltered_neighbor_indices.ivec** — for each query, the ordinal
+  indices of its K nearest neighbors among the base vectors that match the
+  query's predicate.
+- **prefiltered_neighbor_distances.fvec** — the corresponding distances.
 
 ### Role in the Pipeline
 
-These output files serve as the ground truth for **filtered (predicated)
-ANN search**. They answer the question: "given this query and this filter,
-what are the true nearest neighbors?" ANN index implementations that
-support query-time metadata filtering are evaluated by comparing their
-results against this exact filtered ground truth.
+These output files serve as the **pre-filter ground truth (F)**, suitable
+for evaluating any filtered ANN engine that aspires to perfect recall
+(pre-filter scan engines, ACORN-style predicate-subgraph engines, oracle
+partitions). For evaluating post-filter ANN engines without rescue scope,
+use the E facet produced by `compute postfiltered-knn`.
 
 ## Options
 
@@ -825,6 +837,9 @@ results against this exact filtered ground truth.
 - Queries with empty metadata-index sets produce sentinel values (-1 indices, infinity distances).
 - Thread count of 0 uses the system default (all available cores).
 - Partition caching allows incremental and resumable computation.
+- The legacy command name `compute filtered-knn` is retained as an alias
+  for this command. Existing pipelines keep working unchanged; new
+  pipelines should use `compute prefiltered-knn`.
 "#, render_options_table(&options)),
         }
     }
@@ -1685,7 +1700,7 @@ mod tests {
         opts.set("neighbors", "3".to_string());
         opts.set("metric", "L2".to_string());
 
-        let mut op = ComputeFilteredKnnOp;
+        let mut op = ComputePrefilteredKnnOp;
         let result = op.execute(&opts, &mut ctx);
         assert_eq!(result.status, Status::Ok, "failed: {}", result.message);
 
@@ -1716,7 +1731,7 @@ mod tests {
         opts.set("neighbors", "5".to_string());
         opts.set("metric", "L2".to_string());
 
-        let mut op = ComputeFilteredKnnOp;
+        let mut op = ComputePrefilteredKnnOp;
         let result = op.execute(&opts, &mut ctx);
         assert_eq!(result.status, Status::Ok, "failed: {}", result.message);
 
@@ -1764,7 +1779,7 @@ mod tests {
         // Force multiple partitions: 3 base vectors per partition → 4 partitions
         opts.set("partition_size", "3".to_string());
 
-        let mut op = ComputeFilteredKnnOp;
+        let mut op = ComputePrefilteredKnnOp;
         let result = op.execute(&opts, &mut ctx);
         assert_eq!(result.status, Status::Ok, "failed: {}", result.message);
 

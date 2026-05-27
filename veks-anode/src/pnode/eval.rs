@@ -48,7 +48,13 @@ pub fn evaluate(pnode: &PNode, mnode: &MNode) -> bool {
 fn eval_predicate(mv: &MValue, op: OpType, comparands: &[Comparand]) -> bool {
     match op {
         OpType::In => comparands.iter().any(|c| compare_eq(mv, c)),
-        OpType::Matches => false, // unsupported
+        // `MATCHES` is substring containment — mirrors the SQL
+        // `LIKE '%pattern%'` semantic in
+        // `verify_predicates::pnode_to_sql`. Any comparand
+        // contained in the field value succeeds; the raw scanner
+        // in `mnode::scan::check_condition_raw` implements the
+        // zero-allocation twin.
+        OpType::Matches => comparands.iter().any(|c| compare_matches(mv, c)),
         OpType::Eq => {
             assert!(!comparands.is_empty());
             compare_eq(mv, &comparands[0])
@@ -114,6 +120,30 @@ fn compare_eq(mv: &MValue, c: &Comparand) -> bool {
         // All other type combinations are mismatches
         _ => false,
     }
+}
+
+/// `mv MATCHES c` — substring containment. Mirrors SQL
+/// `LIKE '%pattern%'` and the raw-scanner implementation in
+/// `mnode::scan::raw_matches`. Defined only for text- and
+/// bytes-family values; everything else is `false`.
+fn compare_matches(mv: &MValue, c: &Comparand) -> bool {
+    match (mv, c) {
+        // Text families ⊃ Text pattern. Empty pattern always
+        // matches (matches SQL's `LIKE '%%'`).
+        (MValue::Text(a), Comparand::Text(b))
+        | (MValue::Ascii(a), Comparand::Text(b))
+        | (MValue::EnumStr(a), Comparand::Text(b)) => byte_contains(a.as_bytes(), b.as_bytes()),
+        // Bytes ⊃ Bytes pattern — lets MATCHES target binary
+        // fields without a string round-trip.
+        (MValue::Bytes(a), Comparand::Bytes(b)) => byte_contains(a, b),
+        _ => false,
+    }
+}
+
+fn byte_contains(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() { return true; }
+    if needle.len() > haystack.len() { return false; }
+    haystack.windows(needle.len()).any(|w| w == needle)
 }
 
 /// Compare an MValue with a Comparand for ordering, with type coercion.
@@ -244,6 +274,68 @@ mod tests {
         let p = pred("x", OpType::Eq, vec![Comparand::Bytes(vec![1, 2, 3])]);
         assert!(evaluate(&p, &mnode_one("x", MValue::Bytes(vec![1, 2, 3]))));
         assert!(!evaluate(&p, &mnode_one("x", MValue::Bytes(vec![4, 5]))));
+    }
+
+    // -- Matches (substring containment, SQL LIKE '%pattern%') --
+
+    #[test]
+    fn test_matches_text_substring_hit() {
+        let p = pred("caption", OpType::Matches, vec![Comparand::Text("the".into())]);
+        assert!(evaluate(&p, &mnode_one("caption", MValue::Text("the cat".into()))));
+        assert!(evaluate(&p, &mnode_one("caption", MValue::Text("with the dog".into()))));
+        // Pattern at end and across word boundaries.
+        let p2 = pred("caption", OpType::Matches, vec![Comparand::Text("dog".into())]);
+        assert!(evaluate(&p2, &mnode_one("caption", MValue::Text("the dog".into()))));
+    }
+
+    #[test]
+    fn test_matches_text_substring_miss() {
+        let p = pred("caption", OpType::Matches, vec![Comparand::Text("xyz".into())]);
+        assert!(!evaluate(&p, &mnode_one("caption", MValue::Text("the cat".into()))));
+    }
+
+    #[test]
+    fn test_matches_empty_pattern_always_true_on_text() {
+        let p = pred("caption", OpType::Matches, vec![Comparand::Text("".into())]);
+        assert!(evaluate(&p, &mnode_one("caption", MValue::Text("anything".into()))));
+        // Even an empty value matches an empty pattern (SQL LIKE '%%' semantics).
+        assert!(evaluate(&p, &mnode_one("caption", MValue::Text("".into()))));
+    }
+
+    #[test]
+    fn test_matches_ascii_and_enumstr_variants() {
+        let p = pred("x", OpType::Matches, vec![Comparand::Text("foo".into())]);
+        assert!(evaluate(&p, &mnode_one("x", MValue::Ascii("xfoobar".into()))));
+        assert!(evaluate(&p, &mnode_one("x", MValue::EnumStr("foo".into()))));
+    }
+
+    #[test]
+    fn test_matches_bytes_substring() {
+        let p = pred("blob", OpType::Matches, vec![Comparand::Bytes(vec![0xAB, 0xCD])]);
+        assert!(evaluate(&p, &mnode_one("blob",
+            MValue::Bytes(vec![0x01, 0xAB, 0xCD, 0xEF]))));
+        assert!(!evaluate(&p, &mnode_one("blob",
+            MValue::Bytes(vec![0x01, 0x02, 0x03]))));
+    }
+
+    #[test]
+    fn test_matches_on_non_text_is_false() {
+        let p = pred("x", OpType::Matches, vec![Comparand::Text("foo".into())]);
+        assert!(!evaluate(&p, &mnode_one("x", MValue::Int(42))));
+        assert!(!evaluate(&p, &mnode_one("x", MValue::Float(3.14))));
+    }
+
+    #[test]
+    fn test_matches_multi_comparand_any() {
+        // Multi-comparand MATCHES is an OR over patterns — the
+        // same semantic the trigram-heavy-hitter generator uses
+        // when it emits alternates.
+        let p = pred("caption", OpType::Matches, vec![
+            Comparand::Text("xyz".into()),
+            Comparand::Text("cat".into()),
+        ]);
+        assert!(evaluate(&p, &mnode_one("caption", MValue::Text("the cat".into()))));
+        assert!(!evaluate(&p, &mnode_one("caption", MValue::Text("the dog".into()))));
     }
 
     // -- Ne --

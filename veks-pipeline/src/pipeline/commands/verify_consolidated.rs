@@ -1035,7 +1035,7 @@ impl CommandOp for VerifyFilteredKnnConsolidatedOp {
                 for candidate in &pred_indices_candidates {
                     let path = ctx.workspace.join(candidate);
                     if path.exists() {
-                        match crate::pipeline::commands::compute_filtered_knn::PredicateIndices::open(&path) {
+                        match crate::pipeline::commands::compute_prefiltered_knn::PredicateIndices::open(&path) {
                             Ok(r) => { loaded = Some(r); break; }
                             Err(e) => { last_err = e; }
                         }

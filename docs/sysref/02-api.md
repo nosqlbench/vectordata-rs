@@ -360,8 +360,12 @@ let base:  Arc<dyn VectorReader<f32>> = view.base_vectors()?;
 let query: Arc<dyn VectorReader<f32>> = view.query_vectors()?;
 let gt:    Arc<dyn VectorReader<i32>> = view.neighbor_indices()?;
 let dist:  Arc<dyn VectorReader<f32>> = view.neighbor_distances()?;
-let fki:   Arc<dyn VectorReader<i32>> = view.filtered_neighbor_indices()?;
-let fkd:   Arc<dyn VectorReader<f32>> = view.filtered_neighbor_distances()?;
+// F facet — pre-filter ground truth (ACORN G_K).
+let fki:   Arc<dyn VectorReader<i32>> = view.prefiltered_neighbor_indices()?;
+let fkd:   Arc<dyn VectorReader<f32>> = view.prefiltered_neighbor_distances()?;
+// E facet — post-filter ground truth (G ∩ R).
+let pki:   Arc<dyn VectorReader<i32>> = view.postfiltered_neighbor_indices()?;
+let pkd:   Arc<dyn VectorReader<f32>> = view.postfiltered_neighbor_distances()?;
 
 // Variable-length facet → Arc<dyn VvecReader<i32>>
 let mi: Arc<dyn VvecReader<i32>> = view.metadata_indices()?;
@@ -462,8 +466,10 @@ let r = TypedReader::<i64>::open_auto("https://host/metadata.i32",
 | M | `metadata_content` | `metadata_content()` | config + `open_facet_typed` | `.u8`, `.slab` |
 | P | `metadata_predicates` | `metadata_predicates()` | config + `open_facet_typed` | `.u8`, `.slab` |
 | R | `metadata_indices` | `metadata_indices()` | `VvecReader<i32>` | `.ivvec` |
-| F (indices) | `filtered_neighbor_indices` | `filtered_neighbor_indices()` | `VectorReader<i32>` | `.ivec` |
-| F (distances) | `filtered_neighbor_distances` | `filtered_neighbor_distances()` | `VectorReader<f32>` | `.fvec` |
+| F (indices) | `prefiltered_neighbor_indices` (canonical) or `filtered_neighbor_indices` (legacy alias) | `prefiltered_neighbor_indices()` | `VectorReader<i32>` | `.ivec` |
+| F (distances) | `prefiltered_neighbor_distances` (canonical) or `filtered_neighbor_distances` (legacy alias) | `prefiltered_neighbor_distances()` | `VectorReader<f32>` | `.fvec` |
+| E (indices) | `postfiltered_neighbor_indices` | `postfiltered_neighbor_indices()` | `VectorReader<i32>` | `.ivec` |
+| E (distances) | `postfiltered_neighbor_distances` | `postfiltered_neighbor_distances()` | `VectorReader<f32>` | `.fvec` |
 
 For M and P facets, use `open_facet_typed::<T>(view, name)` for
 typed data access (see §2.7).
@@ -486,9 +492,16 @@ profiles:
     metadata_content: profiles/base/metadata_content.u8
     metadata_predicates: profiles/base/predicates.u8
     metadata_indices: profiles/default/metadata_indices.ivvec
-    filtered_neighbor_indices: profiles/default/filtered_neighbor_indices.ivec
-    filtered_neighbor_distances: profiles/default/filtered_neighbor_distances.fvec
+    prefiltered_neighbor_indices: profiles/default/prefiltered_neighbor_indices.ivec    # F
+    prefiltered_neighbor_distances: profiles/default/prefiltered_neighbor_distances.fvec
+    postfiltered_neighbor_indices: profiles/default/postfiltered_neighbor_indices.ivec  # E
+    postfiltered_neighbor_distances: profiles/default/postfiltered_neighbor_distances.fvec
 ```
+
+The legacy keys `filtered_neighbor_indices` /
+`filtered_neighbor_distances` still parse (they resolve to **F**, the
+pre-filter facet) for backwards compatibility with datasets published
+before the F/E split.
 
 The `metadata_indices` key maps to the `predicate_results` field
 internally (serde alias).

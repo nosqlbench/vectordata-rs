@@ -1248,6 +1248,16 @@ changes to the slabtastic writer.
                 .collect()
         });
 
+        // Schema sidecar — every typed slab produced by the
+        // toolchain carries a single-record descriptor in the
+        // `:schema` namespace (see `vectordata::metadata_schema`).
+        // Surface it BEFORE the page-by-page hex dump so the
+        // operator knows what the records actually are (e.g.
+        // PNode-named predicates, MNode-encoded metadata)
+        // rather than having to interpret raw bytes.
+        render_schema_sidecar(&input_path, ctx);
+        render_survey_sidecar(&input_path, ctx);
+
         let reader = match open_slab_display(&input_path, &ctx.ui) {
             Ok(r) => r,
             Err(e) => return error_result(format!("failed to open {}: {}", input_path.display(), e), start),
@@ -1267,31 +1277,43 @@ changes to the slabtastic writer.
                     let recs = page.record_count();
                     let page_size = page.serialized_size();
 
-                    ctx.ui.log(&format!("┌─── Page {} ───────────────────────────┐", i));
-                    ctx.ui.log(&format!("│ Offset:    {:<28}│", entry.file_offset));
-                    ctx.ui.log(&format!("│ Page size: {:<28}│", page_size));
-                    ctx.ui.log(&format!("│ Ordinals:  {:<28}│",
-                        format!("{}..{}", entry.start_ordinal, entry.start_ordinal + recs as i64)));
-                    ctx.ui.log(&format!("│ Records:   {:<28}│", recs));
+                    let mut rows = vec![
+                        format!("Offset:    {}", entry.file_offset),
+                        format!("Page size: {}", page_size),
+                        format!("Ordinals:  {}..{}",
+                            entry.start_ordinal, entry.start_ordinal + recs as i64),
+                        format!("Records:   {}", recs),
+                    ];
 
-                    // Show first few record sizes
+                    // First few records — hex-preview each.
+                    // Compute the hex byte budget from the
+                    // terminal width: each byte costs 3 chars
+                    // (`xx `) and we reserve room for the
+                    // `[N]: NN bytes  ` prefix and a trailing
+                    // `…` ellipsis.
                     let preview_count = recs.min(5) as i64;
                     if preview_count > 0 {
-                        ctx.ui.log("│ Record preview:                       │");
+                        rows.push("Record preview:".into());
+                        let inner = explain_inner_width();
+                        // Header + padding + ellipsis: "  [NNN]: NNNNN bytes  " ≈ 22 chars.
+                        let hex_budget = inner.saturating_sub(28).max(8);
+                        let max_bytes = hex_budget / 3;
                         for j in 0..preview_count {
                             let ord = entry.start_ordinal + j;
                             if let Ok(data) = reader.get(ord) {
-                                let hex_preview: String = data.iter().take(16)
+                                let n = data.len().min(max_bytes);
+                                let hex_preview: String = data.iter().take(n)
                                     .map(|b| format!("{:02x}", b))
                                     .collect::<Vec<_>>()
                                     .join(" ");
-                                let suffix = if data.len() > 16 { "..." } else { "" };
-                                ctx.ui.log(&format!("│   [{}]: {} bytes  {}{:<2}│",
-                                    ord, data.len(), hex_preview, suffix));
+                                let ellipsis = if data.len() > n { "…" } else { "" };
+                                rows.push(format!("  [{}]: {} bytes  {}{}",
+                                    ord, data.len(), hex_preview, ellipsis));
                             }
                         }
                     }
-                    ctx.ui.log("└───────────────────────────────────────┘");
+
+                    render_explain_box(ctx, &format!("Page {}", i), &rows);
                     ctx.ui.log("");
                 }
                 Err(e) => {
@@ -1324,6 +1346,238 @@ changes to the slabtastic writer.
             opt("source", "Path", true, None, "Slab file", OptionRole::Input),
             opt("pages", "String", false, None, "Comma-separated page indices to display", OptionRole::Config),
         ]
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Box renderer — terminal-width-aware drawing for slab explain.
+//
+// The previous renderer used hardcoded format-spec widths
+// (`{:<28}`, `{:<2}`) that didn't line up with the box border
+// glyphs and didn't account for content longer than the assumed
+// width. Result: bottom border floated free of the right edge,
+// long hex previews blew out of the right wall, and `| more`
+// inherited an 80-col terminal but the boxes assumed something
+// narrower. This module replaces the hand-rolled formatting with
+// a width-aware helper that:
+//   - reads the real terminal width via `crossterm::terminal::size()`,
+//     falling back to 80 when stdout isn't a TTY (piped output);
+//   - clamps the inner width into a readable range [40, 120];
+//   - right-pads every content row so the right border lines up;
+//   - truncates long content with `…` so the box never wraps;
+//   - emits the top / bottom borders sized to match.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Effective inner width of an explain-box content row (chars
+/// between the `│ ` and ` │` markers, exclusive of the borders).
+///
+/// Source of truth, in priority order:
+///   1. `ioctl(TIOCGWINSZ)` on stdout — accurate when stdout is
+///      a TTY. Honoured even when stdin is redirected, which is
+///      common (`veks slab explain --source foo | less`).
+///   2. `$COLUMNS` env var — set by interactive shells; survives
+///      a pipe in some shell configs but not all.
+///   3. 80 — universal default; matches the user's `| more` case.
+///
+/// Inner width = terminal columns - 2 border glyphs. Clamped
+/// into `[40, 120]` so narrow terminals still produce a usable
+/// box and wide ones don't waste right-edge space.
+fn explain_inner_width() -> usize {
+    let cols = term_columns().unwrap_or(80);
+    cols.saturating_sub(2).clamp(40, 120)
+}
+
+fn term_columns() -> Option<usize> {
+    // ioctl(TIOCGWINSZ) on stdout.
+    #[cfg(unix)]
+    unsafe {
+        let mut sz: libc::winsize = std::mem::zeroed();
+        if libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut sz as *mut _) == 0
+            && sz.ws_col > 0
+        {
+            return Some(sz.ws_col as usize);
+        }
+    }
+    // Fall through to COLUMNS env var.
+    std::env::var("COLUMNS").ok().and_then(|s| s.parse().ok())
+}
+
+/// Render a box with `title` centered (or left-aligned) in the
+/// top border, followed by each `row` as a `│ row │` line, then
+/// the bottom border. The renderer right-pads each row to the
+/// configured inner width and truncates with `…` if needed so
+/// the borders always line up.
+pub(crate) fn render_explain_box(ctx: &StreamContext, title: &str, rows: &[String]) {
+    let inner = explain_inner_width();
+    ctx.ui.log(&top_border(title, inner));
+    for row in rows {
+        ctx.ui.log(&middle_row(row, inner));
+    }
+    ctx.ui.log(&bottom_border(inner));
+}
+
+fn top_border(title: &str, inner: usize) -> String {
+    // `┌─── <title> ` + dashes + `┐`
+    let prefix = format!("─── {title} ");
+    let prefix_chars = prefix.chars().count();
+    let dashes = inner.saturating_sub(prefix_chars);
+    format!("┌{}{}┐", prefix, "─".repeat(dashes))
+}
+
+fn middle_row(content: &str, inner: usize) -> String {
+    // Pad/truncate to (inner - 2) so the row reads `│ <content> │`
+    // with single-space gutters on both sides.
+    let usable = inner.saturating_sub(2);
+    let trimmed = truncate(content, usable);
+    let width = trimmed.chars().count();
+    let pad = usable.saturating_sub(width);
+    format!("│ {}{} │", trimmed, " ".repeat(pad))
+}
+
+fn bottom_border(inner: usize) -> String {
+    format!("└{}┘", "─".repeat(inner))
+}
+
+/// Render the `:schema`-namespace sidecar (if any) above the
+/// page-by-page diagram. Dispatches on the top-level `kind`
+/// field of the parsed JSON to pick between `MetadataSchema`
+/// and `PredicateSchema` renderers — older schemas without
+/// `kind` are interpreted as metadata for back-compat.
+fn render_schema_sidecar(input_path: &std::path::Path, ctx: &StreamContext) {
+    use vectordata::metadata_schema::{
+        MetadataSchema, PredicateSchema, SCHEMA_KIND_METADATA, SCHEMA_KIND_PREDICATE,
+        SCHEMA_NAMESPACE,
+    };
+    // Open the schema namespace. Absent → silently skip (the
+    // slab is a content-only blob with no sidecar; that's a
+    // valid shape, just no extra info to print).
+    let schema_reader = match slabtastic::SlabReader::open_namespace(
+        input_path, Some(SCHEMA_NAMESPACE),
+    ) {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+    if schema_reader.total_records() == 0 { return; }
+    let bytes = match schema_reader.get(0) {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+    // Peek at the JSON's top-level `kind` to route. Both
+    // descriptors carry it; pre-discriminator records default
+    // to "metadata".
+    let kind = serde_json::from_slice::<serde_json::Value>(&bytes)
+        .ok()
+        .and_then(|v| v.get("kind").and_then(|k| k.as_str()).map(str::to_string))
+        .unwrap_or_else(|| SCHEMA_KIND_METADATA.into());
+
+    match kind.as_str() {
+        SCHEMA_KIND_PREDICATE => match PredicateSchema::from_json_bytes(&bytes) {
+            Ok(s) => {
+                let rows = vec![
+                    format!("kind: predicate"),
+                    format!("wire_format: {}", s.wire_format),
+                    format!("template:    {}", s.template),
+                    format!("selectivity: {}", s.selectivity),
+                    format!("count:       {}", s.count),
+                    format!("seed:        {}", s.seed),
+                    format!("version:     {}", s.version),
+                ];
+                render_explain_box(ctx, ":schema namespace", &rows);
+                ctx.ui.log("");
+            }
+            Err(e) => ctx.ui.log(&format!("  :schema parse error (kind=predicate): {e}")),
+        },
+        SCHEMA_KIND_METADATA | _ => match MetadataSchema::from_json_bytes(&bytes) {
+            Ok(s) => {
+                let mut rows = vec![
+                    format!("kind: metadata"),
+                    format!("source: {}", s.source),
+                    format!("fields: {}", s.fields.len()),
+                ];
+                if let Some(n) = s.record_count {
+                    rows.push(format!("record_count: {n}"));
+                }
+                rows.push(format!("version: {}", s.version));
+                render_explain_box(ctx, ":schema namespace", &rows);
+                ctx.ui.log("");
+                if !s.fields.is_empty() {
+                    ctx.ui.log("  fields:");
+                    for f in &s.fields {
+                        let null = if f.nullable { " (nullable)" } else { "" };
+                        ctx.ui.log(&format!("    {}: {}{}", f.name, f.type_name, null));
+                    }
+                    ctx.ui.log("");
+                }
+            }
+            Err(e) => ctx.ui.log(&format!("  :schema parse error (kind=metadata): {e}")),
+        },
+    }
+}
+
+/// Render a one-box summary of the `:survey` namespace, if
+/// present. The full SurveyReport JSON can be many MB on
+/// real-world slabs; we surface only enough metadata to
+/// confirm the survey is there and point the user at the right
+/// tool to expand it (e.g. `slab get --namespace survey
+/// --ordinal 0 | jq`).
+fn render_survey_sidecar(input_path: &std::path::Path, ctx: &StreamContext) {
+    use vectordata::metadata_schema::SURVEY_NAMESPACE;
+    let reader = match slabtastic::SlabReader::open_namespace(
+        input_path, Some(SURVEY_NAMESPACE),
+    ) {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+    if reader.total_records() == 0 { return; }
+    let bytes = match reader.get(0) {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+    // Parse just enough to surface field count + source.
+    // Full report retrieval is outside `slab explain`'s
+    // mandate — this is a self-describing-summary view, not a
+    // pretty-printer.
+    let summary = serde_json::from_slice::<serde_json::Value>(&bytes)
+        .ok()
+        .and_then(|v| {
+            let fields = v.get("fields")
+                .and_then(|f| f.as_object())
+                .map(|m| m.len())
+                .unwrap_or(0);
+            let source = v.get("source")
+                .and_then(|s| s.get("path"))
+                .and_then(|p| p.as_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| "(unknown)".into());
+            let total = v.get("source")
+                .and_then(|s| s.get("total_records"))
+                .and_then(|n| n.as_u64())
+                .unwrap_or(0);
+            let sampled = v.get("source")
+                .and_then(|s| s.get("sampled_records"))
+                .and_then(|n| n.as_u64())
+                .unwrap_or(0);
+            Some((fields, source, total, sampled))
+        });
+    let rows = match summary {
+        Some((fields, source, total, sampled)) => vec![
+            format!("source:      {}", source),
+            format!("fields:      {}", fields),
+            format!("records:     {} total, {} sampled", total, sampled),
+            format!("payload:     {} bytes (JSON)", bytes.len()),
+        ],
+        None => vec![format!("payload:     {} bytes (unparseable as SurveyReport)", bytes.len())],
+    };
+    render_explain_box(ctx, ":survey namespace", &rows);
+    ctx.ui.log("");
+}
+
+/// Truncate a string for fixed-width box rendering.
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max { s.to_string() } else {
+        let mut out: String = s.chars().take(max - 1).collect();
+        out.push('…');
+        out
     }
 }
 
@@ -1579,62 +1833,9 @@ will operate on.
     }
 }
 
-// -- Slab Survey Internal Helpers ---------------------------------------------
-//
-// Bookkeeping types and helpers shared between `generate predicates` and the
-// new `analyze survey` orchestrator. The user-facing single-pass legacy
-// `analyze legacy-survey` command op was removed once the new two-pass
-// `analyze survey` (sysref §13) replaced it; what remains here is the
-// `FieldStats` / `SurveyResult` shape that the predicate generator still
-// consumes, plus the `survey_inline_via_orchestrator` adapter that runs the
-// new orchestrator and projects its richer output down to that shape.
-
-/// Per-field distribution statistics accumulated during a slab survey.
-pub(crate) struct FieldStats {
-    pub(crate) count: usize,
-    pub(crate) null_count: usize,
-    pub(crate) type_counts: indexmap::IndexMap<String, usize>,
-    pub(crate) numeric_min: f64,
-    pub(crate) numeric_max: f64,
-    pub(crate) numeric_sum: f64,
-    pub(crate) numeric_count: usize,
-    pub(crate) strlen_min: usize,
-    pub(crate) strlen_max: usize,
-    pub(crate) strlen_sum: usize,
-    pub(crate) strlen_count: usize,
-    pub(crate) byteslen_min: usize,
-    pub(crate) byteslen_max: usize,
-    pub(crate) byteslen_sum: usize,
-    pub(crate) byteslen_count: usize,
-    pub(crate) distinct: indexmap::IndexMap<String, usize>,
-    pub(crate) distinct_overflow: bool,
-}
-
-impl FieldStats {
-    pub(crate) fn new() -> Self {
-        FieldStats {
-            count: 0,
-            null_count: 0,
-            type_counts: indexmap::IndexMap::new(),
-            numeric_min: f64::INFINITY,
-            numeric_max: f64::NEG_INFINITY,
-            numeric_sum: 0.0,
-            numeric_count: 0,
-            strlen_min: usize::MAX,
-            strlen_max: 0,
-            strlen_sum: 0,
-            strlen_count: 0,
-            byteslen_min: usize::MAX,
-            byteslen_max: 0,
-            byteslen_sum: 0,
-            byteslen_count: 0,
-            distinct: indexmap::IndexMap::new(),
-            distinct_overflow: false,
-        }
-    }
-}
-
-/// Select `n` evenly-spaced page indices from `total` pages.
+/// Sample `n` page indices from a `total`-page slab at evenly-
+/// spaced intervals. Used by the survey orchestrator to pick the
+/// pages it will read on a sparse pass.
 pub(crate) fn sample_page_indices(total: usize, n: usize) -> Vec<usize> {
     if n == 0 || total == 0 {
         return vec![];
@@ -1644,136 +1845,6 @@ pub(crate) fn sample_page_indices(total: usize, n: usize) -> Vec<usize> {
     }
     let step = total as f64 / n as f64;
     (0..n).map(|i| (i as f64 * step) as usize).collect()
-}
-
-/// Result of surveying a slab file's field distributions.
-pub(crate) struct SurveyResult {
-    /// Per-field distribution statistics, keyed by field name.
-    pub(crate) field_stats: indexmap::IndexMap<String, FieldStats>,
-    /// Total records sampled.
-    pub(crate) sampled: usize,
-    /// Total records in the slab.
-    pub(crate) total_records: usize,
-    /// Number of non-MNode records encountered.
-    pub(crate) non_mnode_count: usize,
-    /// Number of decode errors encountered.
-    pub(crate) decode_errors: usize,
-}
-
-/// Load a [`SurveyResult`] from a `survey.json` produced by
-/// `analyze survey`. The legacy single-pass JSON format and its
-/// reader were removed alongside the legacy command — if you have
-/// an older `survey.json` on disk, re-run `analyze survey` to get a
-/// fresh one.
-pub(crate) fn survey_from_json(path: &Path) -> Result<SurveyResult, String> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|e| format!("failed to read {}: {}", path.display(), e))?;
-    let report: crate::pipeline::commands::survey::SurveyReport = serde_json::from_str(&text)
-        .map_err(|e| format!("failed to parse survey JSON: {}", e))?;
-    Ok(survey_report_to_legacy(&report))
-}
-
-/// Translate a [`crate::pipeline::commands::survey::SurveyReport`]
-/// into the legacy [`SurveyResult`] / [`FieldStats`] shape so the
-/// existing `generate predicates --mode=survey` generator can run
-/// against either survey format.
-///
-/// This adapter is intentionally lossy in one direction only — the
-/// generator only consults `count` / `null_count` / `numeric_min/max`
-/// / `strlen_*` / `distinct` / `distinct_overflow`, which all map
-/// cleanly out of the richer measure outputs.
-fn survey_report_to_legacy(
-    report: &crate::pipeline::commands::survey::SurveyReport,
-) -> SurveyResult {
-    use crate::pipeline::commands::survey::measure::MeasureReport;
-
-    let mut field_stats: indexmap::IndexMap<String, FieldStats> = indexmap::IndexMap::new();
-    for (name, profile) in &report.fields {
-        let mut fs = FieldStats::new();
-        fs.count = profile.presence.present as usize;
-        fs.null_count = profile.presence.null_count as usize;
-        // type_counts: invert the fractional histogram back to integer
-        // counts using `present` as the denominator. Loses precision
-        // when fractions don't divide cleanly; the generator only
-        // uses this for "is this a Text-ish or Int-ish field" gating
-        // so the approximation is fine.
-        for (tag, frac) in &profile.wire_encoding.tag_histogram {
-            let c = (frac * profile.presence.present as f64).round() as usize;
-            if c > 0 {
-                // Legacy FieldStats expected lowercase tag names
-                // (`"int"`, `"text"`); the new orchestrator stores
-                // the Debug form (`"Int"`, `"Text"`). Lowercase here
-                // so the predicate generator's eligibility check
-                // continues to match against its `ELIGIBLE_TYPES`
-                // table without changes.
-                fs.type_counts.insert(tag.to_lowercase(), c);
-            }
-        }
-        if let Some(MeasureReport::ExactExtrema(e)) = profile.measures.get("ExactExtrema") {
-            if let (Some(mn), Some(mx)) = (e.min, e.max) {
-                fs.numeric_min = mn;
-                fs.numeric_max = mx;
-            }
-        }
-        if let Some(MeasureReport::ExactMoments(m)) = profile.measures.get("ExactMoments") {
-            fs.numeric_count = m.count as usize;
-            fs.numeric_sum = m.mean.unwrap_or(0.0) * m.count as f64;
-        }
-        if let Some(MeasureReport::ExactLengthMoments(l)) = profile.measures.get("ExactLengthMoments") {
-            fs.strlen_min = l.bytes.min as usize;
-            fs.strlen_max = l.bytes.max as usize;
-            fs.strlen_count = l.bytes.count as usize;
-            if let Some(mean) = l.bytes.mean {
-                fs.strlen_sum = (mean * l.bytes.count as f64).round() as usize;
-            }
-        }
-        if let Some(MeasureReport::ExactFrequencyTable(t)) = profile.measures.get("ExactFrequencyTable") {
-            for (k, c) in &t.counts {
-                fs.distinct.insert(k.clone(), *c as usize);
-            }
-            fs.distinct_overflow = t.overflowed;
-        } else if let Some(MeasureReport::HeavyHitters(hh)) = profile.measures.get("HeavyHitters") {
-            for entry in &hh.items {
-                fs.distinct.insert(entry.value.clone(), entry.count_lower_bound as usize);
-            }
-            // HeavyHitters only tracks top-K; treat the rest as overflow.
-            fs.distinct_overflow = true;
-        } else {
-            // No frequency data — predicate generator will fall back
-            // to the range-based path.
-            fs.distinct_overflow = matches!(
-                profile.cardinality_regime,
-                crate::pipeline::commands::survey::CardinalityRegime::MidCard { .. }
-                    | crate::pipeline::commands::survey::CardinalityRegime::HighCardOrUnique { .. }
-            );
-        }
-        field_stats.insert(name.clone(), fs);
-    }
-    SurveyResult {
-        field_stats,
-        sampled: report.source.sampled_records as usize,
-        total_records: report.source.total_records as usize,
-        non_mnode_count: 0,
-        decode_errors: 0,
-    }
-}
-
-/// Inline-run the new survey orchestrator and project the result down
-/// to the legacy [`SurveyResult`] shape. Used by
-/// `generate predicates --mode=survey` when no precomputed
-/// `--survey survey.json` was supplied — the generator wants the
-/// `FieldStats` view, and we serve it without an intermediate file.
-pub(crate) fn survey_inline_via_orchestrator(
-    path: &Path,
-    samples: usize,
-    ui: Option<&veks_core::ui::UiHandle>,
-) -> Result<SurveyResult, String> {
-    let cfg = crate::pipeline::commands::survey::SurveyConfig {
-        samples,
-        ..Default::default()
-    };
-    let report = crate::pipeline::commands::survey::survey(path, &cfg, ui)?;
-    Ok(survey_report_to_legacy(&report))
 }
 
 /// Load a [`SurveyReport`] from a `survey.json` written by
@@ -2100,5 +2171,79 @@ mod tests {
         let mut op = SlabExplainOp;
         let result = op.execute(&opts, &mut ctx);
         assert_eq!(result.status, Status::Ok);
+    }
+
+    /// The width-aware box renderer produces lines of equal
+    /// visible width so the borders line up regardless of
+    /// content length. The renderer truncates rows that exceed
+    /// the inner width with `…` rather than letting them
+    /// overflow.
+    #[test]
+    fn explain_box_borders_line_up() {
+        let inner = 40;
+        let top = top_border("Page 0", inner);
+        let bot = bottom_border(inner);
+        let mid_short = middle_row("hi", inner);
+        let mid_long = middle_row(&"x".repeat(200), inner);
+        // All four lines must have the same display width.
+        let w = |s: &str| s.chars().count();
+        assert_eq!(w(&top), w(&bot), "top vs bottom border");
+        assert_eq!(w(&mid_short), w(&top), "short row vs border");
+        assert_eq!(w(&mid_long), w(&top), "long-truncated row vs border");
+        // The truncated long row must end in `…` to signal
+        // truncation, with the `│` border still in place.
+        assert!(mid_long.ends_with(" │"), "right border must close: {mid_long}");
+        assert!(mid_long.contains('…'), "truncated row needs ellipsis: {mid_long}");
+    }
+
+    /// `slab explain` surfaces the `:schema`-namespace sidecar
+    /// above the page-by-page dump. With a predicate slab the
+    /// rendered output must announce `kind: predicate` plus the
+    /// template / wire_format so the operator doesn't have to
+    /// interpret raw hex bytes to know what's in the file.
+    #[test]
+    fn slab_explain_surfaces_predicate_schema_sidecar() {
+        use vectordata::metadata_schema::{PredicateSchema, SCHEMA_NAMESPACE};
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        let mut ctx = test_ctx(ws);
+
+        // Build a slab with two record-bytes and a schema sidecar.
+        let path = ws.join("preds.slab");
+        let config = slabtastic::WriterConfig::new(512, 4096, u32::MAX, false).unwrap();
+        let mut w = slabtastic::SlabWriter::new(&path, config).unwrap();
+        w.add_record(b"\x02\xffrecord-bytes-0").unwrap();
+        w.add_record(b"\x02\xffrecord-bytes-1").unwrap();
+        w.start_namespace(SCHEMA_NAMESPACE).unwrap();
+        let schema = PredicateSchema::new(
+            "(age >= ? AND name MATCHES ?)",
+            "0.05..0.20",
+            42,
+            2,
+        );
+        w.add_record(&schema.to_json_bytes()).unwrap();
+        w.finish().unwrap();
+
+        // Capture the UI output.
+        let sink = std::sync::Arc::new(veks_core::ui::TestSink::new());
+        ctx.ui = veks_core::ui::UiHandle::new(sink.clone());
+
+        let mut opts = Options::new();
+        opts.set("source", path.to_string_lossy().to_string());
+        let mut op = SlabExplainOp;
+        let r = op.execute(&opts, &mut ctx);
+        assert_eq!(r.status, Status::Ok);
+
+        let out = sink.log_messages().join("\n");
+        assert!(out.contains(":schema namespace"),
+            "explain output must mention the :schema namespace, got:\n{out}");
+        assert!(out.contains("kind: predicate"),
+            "explain output must surface kind=predicate, got:\n{out}");
+        assert!(out.contains("pnode:named"),
+            "explain output must surface wire_format=pnode:named, got:\n{out}");
+        // The template is longer than the truncation width so
+        // the full form should appear on its own line.
+        assert!(out.contains("(age >= ? AND name MATCHES ?)"),
+            "explain output must include the full template:\n{out}");
     }
 }

@@ -22,9 +22,10 @@ Every command with a working example run against the
 
 | Command | Description |
 |---------|-------------|
-| [compute knn](./compute-knn.md) | Brute-force exact KNN ground truth |
+| [compute knn](./compute-knn.md) | Brute-force exact KNN ground truth (G facet) |
 | [compute knn-distances](./compute-knn-distances.md) | Recover `neighbor_distances.fvecs` from existing indices + base + query (used when the source ships indices but no distances) |
-| [compute filtered-knn](./compute-filtered-knn.md) | KNN with predicate pre-filtering |
+| [compute prefiltered-knn](./compute-prefiltered-knn.md) | Pre-filter KNN ground truth (F facet) — ACORN `G_K`, perfect recall, top-K of `X_p`. Legacy name `compute filtered-knn` aliases here. |
+| [compute postfiltered-knn](./compute-postfiltered-knn.md) | Post-filter KNN ground truth (E facet) — `G ∩ R`, sparse possible, cheap O(K) derivation |
 | [compute evaluate-predicates](./compute-evaluate-predicates.md) | Evaluate predicates against metadata |
 | [compute partition-profiles](./compute-partition-profiles.md) | Per-label partition profiles with partitioned KNN |
 

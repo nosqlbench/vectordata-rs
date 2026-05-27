@@ -22,7 +22,7 @@ use crate::pipeline::command::{
     CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options, ResourceDesc, Status, StreamContext,
     render_options_table,
 };
-use crate::pipeline::commands::compute_filtered_knn::PredicateIndices;
+use crate::pipeline::commands::compute_prefiltered_knn::PredicateIndices;
 
 /// Pipeline command: inspect predicate ↔ metadata cross-reference.
 pub struct InspectPredicateOp;

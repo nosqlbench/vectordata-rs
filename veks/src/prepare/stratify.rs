@@ -34,10 +34,16 @@ pub(crate) enum FacetRole {
 }
 
 /// Classify a facet by its role in sized profiles.
+///
+/// Both canonical (`prefiltered_*`, `postfiltered_*`) and legacy
+/// (`filtered_*`) F/E facet keys are per-profile — they are
+/// recomputed per profile from the corresponding base/query window.
 pub(crate) fn classify_facet(name: &str) -> FacetRole {
     match name {
         "base_vectors" | "metadata_content" => FacetRole::Windowed,
         "neighbor_indices" | "neighbor_distances"
+        | "prefiltered_neighbor_indices" | "prefiltered_neighbor_distances"
+        | "postfiltered_neighbor_indices" | "postfiltered_neighbor_distances"
         | "filtered_neighbor_indices" | "filtered_neighbor_distances"
         | "metadata_indices" => FacetRole::PerProfile,
         _ => FacetRole::Shared,

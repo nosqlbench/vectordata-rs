@@ -121,12 +121,30 @@ pub struct ProfileConfig {
     /// Configuration for the ground truth neighbor distances.
     pub neighbor_distances: Option<FacetConfig>,
 
-    // -- Filtered neighbor facets --
+    // -- Filtered neighbor facets (F / E per docs/design/prefilter-postfilter-facets.md) --
 
-    /// Filtered ground-truth neighbor indices (pre-conditioned on metadata predicates).
-    pub filtered_neighbor_indices: Option<FacetConfig>,
-    /// Filtered ground-truth neighbor distances (pre-conditioned on metadata predicates).
-    pub filtered_neighbor_distances: Option<FacetConfig>,
+    /// Pre-filter KNN ground-truth indices (**F** facet). Top-K over `X_p`
+    /// (the predicate-passing base vectors). Full K when `|X_p| ≥ K`;
+    /// perfect recall by construction. This is ACORN's `G_K` — the legacy
+    /// filtered-knn shape.
+    ///
+    /// The legacy alias `filtered_neighbor_indices` resolves here, because
+    /// files produced by the legacy `compute filtered-knn` carry pre-filter
+    /// shape on disk.
+    #[serde(default, alias = "filtered_neighbor_indices", alias = "prefilter_indices")]
+    pub prefiltered_neighbor_indices: Option<FacetConfig>,
+    /// Pre-filter KNN ground-truth distances (**F** facet).
+    #[serde(default, alias = "filtered_neighbor_distances", alias = "prefilter_distances")]
+    pub prefiltered_neighbor_distances: Option<FacetConfig>,
+
+    /// Post-filter KNN ground-truth indices (**E** facet). `G ∩ R` — the
+    /// unfiltered top-K intersected with the predicate-passing set.
+    /// Sparse possible. New facet introduced alongside the F/E split.
+    #[serde(default, alias = "postfilter_indices")]
+    pub postfiltered_neighbor_indices: Option<FacetConfig>,
+    /// Post-filter KNN ground-truth distances (**E** facet).
+    #[serde(default, alias = "postfilter_distances")]
+    pub postfiltered_neighbor_distances: Option<FacetConfig>,
 
     // -- Metadata facets --
 
@@ -211,7 +229,7 @@ profiles:
 "#;
         let config: DatasetConfig = serde_yaml::from_str(yaml).unwrap();
         let profile = config.profiles.get("small").unwrap();
-        
+
         match profile.base_vectors.as_ref().unwrap() {
             FacetConfig::Detailed { source, window } => {
                 assert_eq!(source, "base.fvec");
@@ -219,5 +237,71 @@ profiles:
             },
             _ => panic!("Expected Detailed config"),
         }
+    }
+
+    /// Legacy YAML keys `filtered_neighbor_indices` /
+    /// `filtered_neighbor_distances` MUST populate the **pre-filter (F)**
+    /// fields — files produced by the legacy `compute filtered-knn`
+    /// carry pre-filter shape on disk, so the alias points at the
+    /// matching typed slot. Regression-pin per
+    /// `docs/design/prefilter-postfilter-facets.md` §3.1.
+    #[test]
+    fn test_legacy_filtered_yaml_keys_populate_prefiltered() {
+        let yaml = r#"
+profiles:
+  default:
+    base_vectors: base.fvec
+    filtered_neighbor_indices: filtered.ivec
+    filtered_neighbor_distances: filtered.fvec
+"#;
+        let config: DatasetConfig = serde_yaml::from_str(yaml).unwrap();
+        let profile = config.profiles.get("default").unwrap();
+
+        // Legacy aliases populate the canonical F (pre-filter) fields.
+        assert_eq!(
+            profile.prefiltered_neighbor_indices.as_ref().map(|f| f.source()),
+            Some("filtered.ivec"),
+        );
+        assert_eq!(
+            profile.prefiltered_neighbor_distances.as_ref().map(|f| f.source()),
+            Some("filtered.fvec"),
+        );
+        // E (post-filter) stays unset when only the legacy keys are used.
+        assert!(profile.postfiltered_neighbor_indices.is_none());
+        assert!(profile.postfiltered_neighbor_distances.is_none());
+    }
+
+    /// Canonical `prefiltered_*` and `postfiltered_*` keys parse into
+    /// their respective fields and never collide.
+    #[test]
+    fn test_canonical_e_and_f_yaml_keys_parse() {
+        let yaml = r#"
+profiles:
+  default:
+    base_vectors: base.fvec
+    prefiltered_neighbor_indices: prefiltered.ivec
+    prefiltered_neighbor_distances: prefiltered.fvec
+    postfiltered_neighbor_indices: postfiltered.ivec
+    postfiltered_neighbor_distances: postfiltered.fvec
+"#;
+        let config: DatasetConfig = serde_yaml::from_str(yaml).unwrap();
+        let profile = config.profiles.get("default").unwrap();
+
+        assert_eq!(
+            profile.prefiltered_neighbor_indices.as_ref().map(|f| f.source()),
+            Some("prefiltered.ivec"),
+        );
+        assert_eq!(
+            profile.prefiltered_neighbor_distances.as_ref().map(|f| f.source()),
+            Some("prefiltered.fvec"),
+        );
+        assert_eq!(
+            profile.postfiltered_neighbor_indices.as_ref().map(|f| f.source()),
+            Some("postfiltered.ivec"),
+        );
+        assert_eq!(
+            profile.postfiltered_neighbor_distances.as_ref().map(|f| f.source()),
+            Some("postfiltered.fvec"),
+        );
     }
 }

@@ -164,7 +164,15 @@ pub enum VerifyKind {
     KnnGroundtruth,
     KnnConsolidated,
     KnnFaissConsolidated,
+    /// Legacy `verify filtered-knn-consolidated` (kept for
+    /// backwards-compat; produces F-facet verification). New pipelines
+    /// should use [`Self::PrefilteredKnnConsolidated`] or
+    /// [`Self::PostfilteredKnnConsolidated`] as appropriate.
     FilteredKnnConsolidated,
+    /// F-facet verifier — pre-filter ground truth (ACORN G_K).
+    PrefilteredKnnConsolidated,
+    /// E-facet verifier — post-filter ground truth (G ∩ R).
+    PostfilteredKnnConsolidated,
     DatasetKnnutils,
     PredicateResults,
     PredicatesConsolidated,
@@ -174,14 +182,16 @@ pub enum VerifyKind {
 impl VerifyKind {
     pub fn label(self) -> &'static str {
         match self {
-            Self::KnnGroundtruth        => "verify knn-groundtruth",
-            Self::KnnConsolidated       => "verify knn-consolidated",
-            Self::KnnFaissConsolidated  => "verify knn-faiss-consolidated",
+            Self::KnnGroundtruth          => "verify knn-groundtruth",
+            Self::KnnConsolidated         => "verify knn-consolidated",
+            Self::KnnFaissConsolidated    => "verify knn-faiss-consolidated",
             Self::FilteredKnnConsolidated => "verify filtered-knn-consolidated",
-            Self::DatasetKnnutils       => "verify dataset-knnutils",
-            Self::PredicateResults      => "verify predicate-results",
-            Self::PredicatesConsolidated => "verify predicates-consolidated",
-            Self::PredicatesSqlite      => "verify predicates-sqlite",
+            Self::PrefilteredKnnConsolidated => "verify prefiltered-knn-consolidated",
+            Self::PostfilteredKnnConsolidated => "verify postfiltered-knn-consolidated",
+            Self::DatasetKnnutils         => "verify dataset-knnutils",
+            Self::PredicateResults        => "verify predicate-results",
+            Self::PredicatesConsolidated  => "verify predicates-consolidated",
+            Self::PredicatesSqlite        => "verify predicates-sqlite",
         }
     }
 
@@ -197,9 +207,18 @@ impl VerifyKind {
                 ("query", "query_vectors"),
                 ("indices", "neighbor_indices"),
             ],
-            Self::KnnConsolidated | Self::KnnFaissConsolidated | Self::FilteredKnnConsolidated => &[
+            Self::KnnConsolidated
+                | Self::KnnFaissConsolidated
+                | Self::FilteredKnnConsolidated
+                | Self::PrefilteredKnnConsolidated => &[
                 ("base", "base_vectors"),
                 ("query", "query_vectors"),
+            ],
+            // E (postfilter) is derived from G + R alone; no base/query
+            // anchor needed.
+            Self::PostfilteredKnnConsolidated => &[
+                ("ground-truth", "neighbor_indices"),
+                ("metadata-indices", "metadata_results"),
             ],
             Self::PredicateResults => &[
                 ("metadata", "metadata_content"),
@@ -229,7 +248,11 @@ impl VerifyKind {
     pub fn per_profile_facets(self) -> &'static [&'static str] {
         match self {
             Self::KnnConsolidated | Self::KnnFaissConsolidated => &["neighbor_indices"],
-            Self::FilteredKnnConsolidated => &["filtered_neighbor_indices"],
+            // F facet verifier — gated by presence of the prefiltered
+            // (or legacy `filtered_`) facet on the profile.
+            Self::FilteredKnnConsolidated
+                | Self::PrefilteredKnnConsolidated => &["prefiltered_neighbor_indices"],
+            Self::PostfilteredKnnConsolidated => &["postfiltered_neighbor_indices"],
             Self::PredicatesConsolidated  => &["metadata_layout"],
             _ => &[],
         }

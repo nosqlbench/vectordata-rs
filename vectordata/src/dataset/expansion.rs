@@ -61,7 +61,15 @@ fn command_facet(run: &str) -> Option<char> {
         "compute evaluate-predicates" => Some('R'),
         "verify predicates-sqlite" | "verify predicate-results"
             | "verify predicates-consolidated" => Some('R'),
-        "compute filtered-knn" => Some('F'),
+        // F facet — pre-filter KNN (ACORN G_K, the legacy filtered-knn
+        // shape). Legacy command name `compute filtered-knn` aliases to
+        // the same producer.
+        "compute prefiltered-knn" | "compute filtered-knn" => Some('F'),
+        // E facet — post-filter KNN (G ∩ R, new sparse artifact).
+        "compute postfiltered-knn" => Some('E'),
+        // Verifiers route by facet they validate; the consolidated
+        // verifier maps to F (its legacy semantic — pre-filter ground
+        // truth). Phase 3 splits this into F and E verifiers.
         "verify filtered-knn-consolidated" => Some('F'),
         "generate predicates" => Some('P'),
         _ => None,

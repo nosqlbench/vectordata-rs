@@ -312,8 +312,15 @@ fn write_facet_legend(config: &DatasetConfig, doc: &mut String) {
     let has_metadata = config.default_profile()
         .map(|p| p.view("metadata_content").is_some())
         .unwrap_or(false);
-    let has_filtered = config.default_profile()
-        .map(|p| p.view("filtered_neighbor_indices").is_some())
+    // F (pre-filter) — accept both canonical `prefiltered_*` and legacy
+    // `filtered_*` keys. E (post-filter) — canonical only (new facet).
+    let default_profile = config.default_profile();
+    let has_prefilter = default_profile
+        .map(|p| p.view("prefiltered_neighbor_indices").is_some()
+            || p.view("filtered_neighbor_indices").is_some())
+        .unwrap_or(false);
+    let has_postfilter = default_profile
+        .map(|p| p.view("postfiltered_neighbor_indices").is_some())
         .unwrap_or(false);
     let has_partitions = config.profiles.profiles.values().any(|p| p.partition);
 
@@ -322,8 +329,11 @@ fn write_facet_legend(config: &DatasetConfig, doc: &mut String) {
         doc.push_str("| P | `metadata_predicates` | Per-query filter conditions | scalar or slab |\n");
         doc.push_str("| R | `metadata_indices` | Per-query matching base ordinals | ivvec (variable-length i32) |\n");
     }
-    if has_filtered {
-        doc.push_str("| F | `filtered_neighbor_indices` | k-nearest among predicate-matching base vectors | ivec (i32) |\n");
+    if has_prefilter {
+        doc.push_str("| F | `prefiltered_neighbor_indices` | Pre-filter top-K: k-nearest among predicate-matching base vectors (ACORN G_K; full K when \\|X_p\\| ≥ K) | ivec (i32) |\n");
+    }
+    if has_postfilter {
+        doc.push_str("| E | `postfiltered_neighbor_indices` | Post-filter top-K: `G ∩ R` (unfiltered top-K intersected with predicate-matching set; sparse possible) | ivec (i32) |\n");
     }
     if has_partitions {
         doc.push_str("| O | oracle partition profiles | Per-label subsets with independent KNN | per-partition directory |\n");
@@ -1037,7 +1047,12 @@ fn infer_facet_code(step_id: &str, run: &str) -> Option<&'static str> {
         "generate metadata" => Some("M"),
         "generate predicates" => Some("P"),
         "compute evaluate-predicates" => Some("R"),
-        "compute filtered-knn" => Some("F"),
+        // F facet (pre-filter, ACORN G_K, the legacy filtered-knn shape).
+        // Legacy command name `compute filtered-knn` aliases to the same
+        // producer.
+        "compute prefiltered-knn" | "compute filtered-knn" => Some("F"),
+        // E facet (post-filter, G ∩ R, new sparse artifact).
+        "compute postfiltered-knn" => Some("E"),
         "compute partition-profiles" => Some("O"),
         "compute knn" => {
             if step_id.contains("partition") { Some("partition G/D") }

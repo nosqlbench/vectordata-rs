@@ -62,8 +62,10 @@ const TYPED_MARKER: u8 = 0xFF;
 
 pub mod eval;
 pub mod vernacular;
+pub mod from_display;
 
 // vernacular module provides to_cddl/to_cql/to_sql — used from tests
+// from_display module is the reverse direction of PNode::Display
 
 use std::fmt;
 use std::io::{self, Cursor, Read, Write};

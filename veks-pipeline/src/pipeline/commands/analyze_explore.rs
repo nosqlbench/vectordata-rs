@@ -1,302 +1,25 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! Pipeline command: interactive REPL for exploring vector files.
+//! REPL command engine for the interactive explore TUI.
 //!
-//! Opens one or more vector files and provides an interactive command-line
-//! interface for querying vectors, computing distances, finding neighbors,
-//! and inspecting file contents.
+//! This module owns the textual command-table that the explore
+//! TUI's data shell (`veks/src/explore/data_shell.rs`) dispatches
+//! against: `info`, `get`, `range`, `head`, `tail`, `dist`, `norm`,
+//! `stats`, `help`, etc.
 //!
-//! Equivalent to the Java `CMD_analyze_explore` command.
+//! Originally registered as the `"analyze visualize-explore"`
+//! pipeline command, but the interactive surface migrated to the
+//! ratatui-based explorer in `veks/src/explore/unified.rs` (see
+//! sysref §22). The CommandOp wrapper was removed when the
+//! pipeline-command path lost users; the REPL helpers below
+//! survive because the new TUI still uses them as its command
+//! engine.
+//!
+//! Keep this module's `pub` surface stable for `data_shell.rs`'s
+//! consumers; don't re-add a CommandOp wrapper here without
+//! checking with the consumers that the new entry point is needed.
 
-use std::io::{self, BufRead, Write};
-use std::path::{Path, PathBuf};
-use std::time::Instant;
-
-use vectordata::VectorReader;
-use vectordata::io::XvecReader;
-
-use crate::pipeline::command::{
-    CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options, ResourceDesc, Status, StreamContext,
-    render_options_table,
-};
-use crate::pipeline::element_type::ElementType;
-
-/// Pipeline command: interactive vector file explorer.
-pub struct AnalyzeExploreOp;
-
-pub fn factory() -> Box<dyn CommandOp> {
-    Box::new(AnalyzeExploreOp)
-}
-
-impl CommandOp for AnalyzeExploreOp {
-    fn command_path(&self) -> &str {
-        "analyze visualize-explore"
-    }
-
-    fn category(&self) -> &'static dyn veks_completion::CategoryTag {
-        &crate::pipeline::command::CAT_ANALYZE
-    }
-
-    fn level(&self) -> &'static dyn veks_completion::LevelTag { &crate::pipeline::command::LVL_PRIMARY }
-
-    fn command_doc(&self) -> CommandDoc {
-        let options = self.describe_options();
-        CommandDoc {
-            summary: "Interactive exploration of vector file contents".into(),
-            body: format!(
-                "# analyze explore\n\n\
-                Interactive exploration of vector file contents.\n\n\
-                ## Description\n\n\
-                Opens a vector file and provides an interactive REPL (read-eval-print \
-                loop) for browsing vector data, computing distances, inspecting norms, \
-                and viewing per-dimension statistics. The file is memory-mapped, so all \
-                random-access operations are fast regardless of file size.\n\n\
-                ## Available REPL Commands\n\n\
-                - `info` -- show file metadata (vector count, dimensions)\n\
-                - `get <index>` -- display a single vector by index\n\
-                - `range <start> <end>` -- display a range of vectors (capped at 20)\n\
-                - `head [n]` / `tail [n]` -- show first or last n vectors\n\
-                - `dist <metric> <i> <j>` -- compute distance between two vectors \
-                (metrics: l2, cosine, dot)\n\
-                - `norm <index> [n]` -- show L2 norms for n vectors starting at index\n\
-                - `stats [sample]` -- compute per-dimension min/max/mean/std statistics\n\
-                - `help` -- list commands\n\
-                - `quit` -- exit the REPL\n\n\
-                ## Scripted Mode\n\n\
-                When the `commands` option is provided, the REPL executes the given \
-                semicolon-separated commands non-interactively and returns the combined \
-                output. This is useful for automated testing and pipeline integration \
-                without requiring a TTY.\n\n\
-                ## Role in Dataset Preparation\n\n\
-                The explore command provides an ad-hoc investigation tool for when you \
-                need to understand vector file contents without writing custom scripts. \
-                It is particularly useful for diagnosing unexpected KNN results, \
-                inspecting specific vectors flagged by other analysis commands, or \
-                quickly computing distances between vectors of interest.\n\n\
-                ## Options\n\n{}",
-                render_options_table(&options)
-            ),
-        }
-    }
-
-    fn describe_resources(&self) -> Vec<ResourceDesc> {
-        vec![
-            ResourceDesc { name: "mem".into(), description: "Vector data buffers".into(), adjustable: false },
-            ResourceDesc { name: "readahead".into(), description: "Sequential read prefetch".into(), adjustable: false },
-        ]
-    }
-
-    fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
-        let start = Instant::now();
-
-        let source_str = match options.require("source") {
-            Ok(s) => s.to_string(),
-            Err(e) => return error_result(e, start),
-        };
-
-        let source = resolve_path(&source_str, &ctx.workspace);
-
-        if !source.exists() {
-            return error_result(format!("file not found: {}", source.display()), start);
-        }
-
-        let etype = match ElementType::from_path(&source) {
-            Ok(t) => t,
-            Err(e) => return error_result(e, start),
-        };
-
-        let (count, dim, get_f64): (usize, usize, Box<dyn Fn(usize) -> Vec<f64> + Sync>) = match etype {
-            ElementType::F32 => {
-                let r = match XvecReader::<f32>::open_path(&source) {
-                    Ok(r) => r, Err(e) => return error_result(format!("open: {}", e), start),
-                };
-                let fc = VectorReader::<f32>::count(&r);
-                let d = VectorReader::<f32>::dim(&r);
-                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
-            }
-            ElementType::F16 => {
-                let r = match XvecReader::<half::f16>::open_path(&source) {
-                    Ok(r) => r, Err(e) => return error_result(format!("open: {}", e), start),
-                };
-                let fc = VectorReader::<half::f16>::count(&r);
-                let d = VectorReader::<half::f16>::dim(&r);
-                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|v| v.to_f64()).collect()))
-            }
-            ElementType::F64 => {
-                let r = match XvecReader::<f64>::open_path(&source) {
-                    Ok(r) => r, Err(e) => return error_result(format!("open: {}", e), start),
-                };
-                let fc = VectorReader::<f64>::count(&r);
-                let d = VectorReader::<f64>::dim(&r);
-                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default()))
-            }
-            ElementType::I32 => {
-                match XvecReader::<i32>::open_path(&source) {
-                    Ok(r) => {
-                        let fc = VectorReader::<i32>::count(&r);
-                        let d = VectorReader::<i32>::dim(&r);
-                        (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
-                    }
-                    Err(vectordata::io::IoError::VariableLengthRecords(_)) => {
-                        let r = match vectordata::io::IndexedVvecReader::<i32>::open_path(&source) {
-                            Ok(r) => r, Err(e) => return error_result(format!("open indexed ivec: {}", e), start),
-                        };
-                        let rc = r.count();
-                        (rc, 0, Box::new(move |i: usize| {
-                            r.get_i32(i).unwrap_or_default().iter().map(|&v| v as f64).collect()
-                        }) as Box<dyn Fn(usize) -> Vec<f64> + Sync>)
-                    }
-                    Err(e) => return error_result(format!("open: {}", e), start),
-                }
-            }
-            ElementType::I16 => {
-                let r = match XvecReader::<i16>::open_path(&source) {
-                    Ok(r) => r, Err(e) => return error_result(format!("open: {}", e), start),
-                };
-                let fc = VectorReader::<i16>::count(&r);
-                let d = VectorReader::<i16>::dim(&r);
-                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
-            }
-            ElementType::U8 | ElementType::I8 => {
-                let r = match XvecReader::<u8>::open_path(&source) {
-                    Ok(r) => r, Err(e) => return error_result(format!("open: {}", e), start),
-                };
-                let fc = VectorReader::<u8>::count(&r);
-                let d = VectorReader::<u8>::dim(&r);
-                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
-            }
-            ElementType::U16 => {
-                let r = match XvecReader::<i16>::open_path(&source) {
-                    Ok(r) => r, Err(e) => return error_result(format!("open: {}", e), start),
-                };
-                let fc = VectorReader::<i16>::count(&r);
-                let d = VectorReader::<i16>::dim(&r);
-                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
-            }
-            ElementType::U32 => {
-                match XvecReader::<i32>::open_path(&source) {
-                    Ok(r) => {
-                        let fc = VectorReader::<i32>::count(&r);
-                        let d = VectorReader::<i32>::dim(&r);
-                        (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
-                    }
-                    Err(vectordata::io::IoError::VariableLengthRecords(_)) => {
-                        let r = match vectordata::io::IndexedVvecReader::<i32>::open_path(&source) {
-                            Ok(r) => r, Err(e) => return error_result(format!("open indexed ivec: {}", e), start),
-                        };
-                        let rc = r.count();
-                        (rc, 0, Box::new(move |i: usize| {
-                            r.get_i32(i).unwrap_or_default().iter().map(|&v| v as f64).collect()
-                        }) as Box<dyn Fn(usize) -> Vec<f64> + Sync>)
-                    }
-                    Err(e) => return error_result(format!("open: {}", e), start),
-                }
-            }
-            ElementType::U64 | ElementType::I64 => {
-                let r = match XvecReader::<f64>::open_path(&source) {
-                    Ok(r) => r, Err(e) => return error_result(format!("open: {}", e), start),
-                };
-                let fc = VectorReader::<f64>::count(&r);
-                let d = VectorReader::<f64>::dim(&r);
-                (fc, d, Box::new(move |i| r.get(i).unwrap_or_default().iter().map(|&v| v as f64).collect()))
-            }
-        };
-
-        ctx.ui.log(&format!("Exploring: {} ({} vectors, {} dims)", source.display(), count, dim));
-        ctx.ui.log("Type 'help' for available commands, 'quit' to exit.");
-        ctx.ui.log("");
-
-        // Check if stdin is a TTY for interactive mode
-        let is_interactive = atty::is(atty::Stream::Stdin);
-
-        // If running in batch/script mode with no TTY, just print info and return
-        if !is_interactive && !options.has("commands") {
-            return CommandResult {
-                status: Status::Ok,
-                message: format!("{} vectors, {} dims", count, dim),
-                produced: vec![],
-                elapsed: start.elapsed(),
-            };
-        }
-
-        // Process commands from the "commands" option (for scripted/test use)
-        if let Some(cmds) = options.get("commands") {
-            let mut output = Vec::new();
-            for line in cmds.split(';') {
-                let line = line.trim();
-                if line.is_empty() || line == "quit" || line == "exit" {
-                    break;
-                }
-                let result = execute_repl_command(line, &get_f64, count, dim);
-                output.push(result);
-            }
-            return CommandResult {
-                status: Status::Ok,
-                message: output.join("\n"),
-                produced: vec![],
-                elapsed: start.elapsed(),
-            };
-        }
-
-        // Interactive REPL loop
-        let stdin = io::stdin();
-        let mut stdout = io::stdout();
-
-        loop {
-            ctx.ui.emit("explore> ");
-            let _ = stdout.flush();
-
-            let mut line = String::new();
-            match stdin.lock().read_line(&mut line) {
-                Ok(0) => break, // EOF
-                Err(_) => break,
-                _ => {}
-            }
-
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            if line == "quit" || line == "exit" {
-                break;
-            }
-
-            let result = execute_repl_command(line, &get_f64, count, dim);
-            ctx.ui.emitln(result);
-        }
-
-        CommandResult {
-            status: Status::Ok,
-            message: "explore session ended".to_string(),
-            produced: vec![],
-            elapsed: start.elapsed(),
-        }
-    }
-
-    fn describe_options(&self) -> Vec<OptionDesc> {
-        vec![
-            OptionDesc {
-                name: "source".to_string(),
-                type_name: "Path".to_string(),
-                required: true,
-                default: None,
-                description: "Vector file to explore".to_string(),
-                extended_description: None,
-                        role: OptionRole::Input,
-        },
-            OptionDesc {
-                name: "commands".to_string(),
-                type_name: "String".to_string(),
-                required: false,
-                default: None,
-                description: "Semicolon-separated commands for non-interactive use".to_string(),
-                extended_description: None,
-                        role: OptionRole::Config,
-        },
-        ]
-    }
-}
 
 /// Execute a single REPL command and return the output as a string.
 pub fn execute_repl_command(
@@ -551,122 +274,46 @@ fn compute_stats(get_f64: &dyn Fn(usize) -> Vec<f64>, sample: usize, dim: usize)
     lines.join("\n")
 }
 
-fn resolve_path(path_str: &str, workspace: &Path) -> PathBuf {
-    let p = PathBuf::from(path_str);
-    if p.is_absolute() { p } else { workspace.join(p) }
-}
-
-fn error_result(message: String, start: Instant) -> CommandResult {
-    CommandResult {
-        status: Status::Error,
-        message,
-        produced: vec![],
-        elapsed: start.elapsed(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pipeline::command::StreamContext;
-    use crate::pipeline::commands::gen_vectors::GenerateVectorsOp;
-    use crate::pipeline::progress::ProgressLog;
-    use indexmap::IndexMap;
 
-    fn test_ctx(dir: &Path) -> StreamContext {
-        StreamContext {
-            dataset_name: String::new(),
-            profile: String::new(),
-            profile_names: vec![],
-            workspace: dir.to_path_buf(),
-            cache: dir.join(".cache"),
-            defaults: IndexMap::new(),
-            dry_run: false,
-            progress: ProgressLog::new(),
-            threads: 1,
-            step_id: String::new(),
-            governor: crate::pipeline::resource::ResourceGovernor::default_governor(),
-            ui: veks_core::ui::UiHandle::new(std::sync::Arc::new(veks_core::ui::TestSink::new())),
-            status_interval: std::time::Duration::from_secs(1),
-            estimated_total_steps: 0,
-            provenance_selector: crate::pipeline::provenance::ProvenanceFlags::STRICT,
+    /// Synthetic `get_f64` closure that returns vector `[i*10, i*10+1, ..., i*10+(dim-1)]`
+    /// for index `i` — fully deterministic so REPL output is byte-stable.
+    fn synth(dim: usize) -> impl Fn(usize) -> Vec<f64> + Send + Sync + 'static {
+        move |i: usize| (0..dim).map(|d| (i * 10 + d) as f64).collect()
+    }
+
+    #[test]
+    fn info_reports_count_and_dim() {
+        let get = synth(4);
+        let out = execute_repl_command("info", &get, 100, 4);
+        assert!(out.contains("vectors: 100"));
+        assert!(out.contains("dimensions: 4"));
+    }
+
+    #[test]
+    fn dist_self_is_zero_for_l2() {
+        let get = synth(4);
+        let out = execute_repl_command("dist l2 1 1", &get, 10, 4);
+        assert!(out.contains("l2"));
+        // The same vector has L2 distance 0 — exact bytewise equality.
+        assert!(out.contains("0"));
+    }
+
+    #[test]
+    fn norm_emits_l2_label() {
+        let get = synth(4);
+        let out = execute_repl_command("norm 0 3", &get, 10, 4);
+        assert!(out.contains("L2 norm"));
+    }
+
+    #[test]
+    fn help_lists_commands() {
+        let get = synth(4);
+        let out = execute_repl_command("help", &get, 10, 4);
+        for kw in &["info", "get", "range", "head", "tail", "dist", "norm", "stats"] {
+            assert!(out.contains(kw), "help text missing '{kw}': {out}");
         }
-    }
-
-    #[test]
-    fn test_explore_info() {
-        let tmp = tempfile::tempdir().unwrap();
-        let ws = tmp.path();
-        let mut ctx = test_ctx(ws);
-
-        // Generate test vectors
-        let fvec = ws.join("test.fvec");
-        let mut gen_opts = Options::new();
-        gen_opts.set("output", fvec.to_string_lossy().to_string());
-        gen_opts.set("dimension", "4");
-        gen_opts.set("count", "100");
-        gen_opts.set("seed", "42");
-        let mut gen_op = GenerateVectorsOp;
-        gen_op.execute(&gen_opts, &mut ctx);
-
-        let mut opts = Options::new();
-        opts.set("source", fvec.to_string_lossy().to_string());
-        opts.set("commands", "info;head 3;stats 50");
-        let mut op = AnalyzeExploreOp;
-        let result = op.execute(&opts, &mut ctx);
-        assert_eq!(result.status, Status::Ok);
-        assert!(result.message.contains("vectors: 100"));
-        assert!(result.message.contains("dimensions: 4"));
-    }
-
-    #[test]
-    fn test_explore_distance() {
-        let tmp = tempfile::tempdir().unwrap();
-        let ws = tmp.path();
-        let mut ctx = test_ctx(ws);
-
-        let fvec = ws.join("test.fvec");
-        let mut gen_opts = Options::new();
-        gen_opts.set("output", fvec.to_string_lossy().to_string());
-        gen_opts.set("dimension", "4");
-        gen_opts.set("count", "10");
-        gen_opts.set("seed", "42");
-        let mut gen_op = GenerateVectorsOp;
-        gen_op.execute(&gen_opts, &mut ctx);
-
-        let mut opts = Options::new();
-        opts.set("source", fvec.to_string_lossy().to_string());
-        opts.set("commands", "dist l2 0 1;dist cosine 0 0");
-        let mut op = AnalyzeExploreOp;
-        let result = op.execute(&opts, &mut ctx);
-        assert_eq!(result.status, Status::Ok);
-        assert!(result.message.contains("l2"));
-        // Distance of a vector to itself should be 0
-        // Cosine distance of a zero vector to itself is undefined (1.0 by convention)
-        assert!(result.message.contains("cosine([0], [0])"));
-    }
-
-    #[test]
-    fn test_explore_norms() {
-        let tmp = tempfile::tempdir().unwrap();
-        let ws = tmp.path();
-        let mut ctx = test_ctx(ws);
-
-        let fvec = ws.join("test.fvec");
-        let mut gen_opts = Options::new();
-        gen_opts.set("output", fvec.to_string_lossy().to_string());
-        gen_opts.set("dimension", "4");
-        gen_opts.set("count", "10");
-        gen_opts.set("seed", "42");
-        let mut gen_op = GenerateVectorsOp;
-        gen_op.execute(&gen_opts, &mut ctx);
-
-        let mut opts = Options::new();
-        opts.set("source", fvec.to_string_lossy().to_string());
-        opts.set("commands", "norm 0 3");
-        let mut op = AnalyzeExploreOp;
-        let result = op.execute(&opts, &mut ctx);
-        assert_eq!(result.status, Status::Ok);
-        assert!(result.message.contains("L2 norm"));
     }
 }

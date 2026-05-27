@@ -151,18 +151,32 @@ upstream:
       fields: 1
       output: "${cache}/verify_predicates_sqlite.json"
 
-    - id: compute-filtered-knn
-      run: compute filtered-knn
+    # F facet — pre-filter ground truth (ACORN G_K; full K when |X_p| ≥ K).
+    - id: compute-prefiltered-knn
+      run: compute prefiltered-knn
       per_profile: true
       phase: 2
       after: [verify-predicates-sqlite]
       base: profiles/base/base_vectors.fvec
       query: profiles/base/query_vectors.fvec
       metadata-indices: metadata_indices.ivvec
-      indices: filtered_neighbor_indices.ivec
-      distances: filtered_neighbor_distances.fvec
+      indices: prefiltered_neighbor_indices.ivec
+      distances: prefiltered_neighbor_distances.fvec
       neighbors: 100
       metric: L2
+
+    # E facet — post-filter ground truth (G ∩ R; sparse possible).
+    # Cheap to derive — no base/query reread, single pass.
+    - id: compute-postfiltered-knn
+      run: compute postfiltered-knn
+      per_profile: true
+      phase: 2
+      after: [compute-knn, verify-predicates-sqlite]
+      ground-truth: neighbor_indices.ivec
+      ground-truth-distances: neighbor_distances.fvec
+      metadata-indices: metadata_indices.ivvec
+      indices: postfiltered_neighbor_indices.ivec
+      distances: postfiltered_neighbor_distances.fvec
 
     - id: generate-dataset-json
       run: generate dataset-json

@@ -877,6 +877,26 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
 
         let natural_selectivity = 0.0001;
 
+        // Discoverability hint: when the user has R or F facets,
+        // the standalone predicate wizard produces a fully-pinned
+        // proto (fields, ops, conjugate form, selectivity, seed)
+        // for reproducible re-runs and more expressive shape
+        // control than this prompt can offer. The bootstrap stays
+        // on its existing simple-strategy path for backwards
+        // compatibility; users who want the proto path run the
+        // wizard separately and re-bootstrap pointing at the
+        // saved proto.
+        if confirmed_facets.contains('R') || confirmed_facets.contains('F') {
+            println!("  Tip: for finer control (per-field op picks, AND/OR conjugates,");
+            println!("       selectivity intervals), run the dedicated wizard after");
+            println!("       this bootstrap completes:");
+            println!("         veks generate predicates --wizard \\");
+            println!("           --source <metadata.slab> \\");
+            println!("           --output <predicates.slab> \\");
+            println!("           --proto-file <my.proto.yaml>");
+            println!();
+        }
+
         println!("  Predicate strategy:");
         println!("    eq       — single-field equality (simple, default)");
         println!("    compound — multi-field AND (harder, mixed operators)");
@@ -1860,8 +1880,18 @@ pub(crate) struct DetectedRoles {
     pub(crate) metadata: Option<PathBuf>,
     pub(crate) metadata_predicates: Option<PathBuf>,
     pub(crate) metadata_results: Option<PathBuf>,
+    /// F facet — pre-filter KNN ground truth (ACORN G_K). Populated by
+    /// filenames matching `filtered_*` (legacy), `prefiltered_*`, or
+    /// `prefilter_*`. The slot keeps its historical `filtered_neighbor_*`
+    /// field name so consumers in `import.rs` don't need to chase a
+    /// rename; the canonical YAML key emitted at write time is
+    /// `prefiltered_neighbor_*`.
     pub(crate) filtered_neighbor_indices: Option<PathBuf>,
     pub(crate) filtered_neighbor_distances: Option<PathBuf>,
+    /// E facet — post-filter KNN ground truth (G ∩ R). Populated only
+    /// by filenames matching `postfiltered_*` or `postfilter_*`.
+    pub(crate) postfiltered_neighbor_indices: Option<PathBuf>,
+    pub(crate) postfiltered_neighbor_distances: Option<PathBuf>,
     pub(crate) unassigned: Vec<PathBuf>,
 }
 
@@ -1877,6 +1907,8 @@ impl DetectedRoles {
             || self.metadata_results.is_some()
             || self.filtered_neighbor_indices.is_some()
             || self.filtered_neighbor_distances.is_some()
+            || self.postfiltered_neighbor_indices.is_some()
+            || self.postfiltered_neighbor_distances.is_some()
     }
 
     /// Print detected assignments for user confirmation.
@@ -1903,10 +1935,16 @@ impl DetectedRoles {
             println!("  Metadata results:          {}", p.display());
         }
         if let Some(ref p) = self.filtered_neighbor_indices {
-            println!("  Filtered neighbor indices: {}", p.display());
+            println!("  Prefiltered indices (F):   {}", p.display());
         }
         if let Some(ref p) = self.filtered_neighbor_distances {
-            println!("  Filtered neighbor distances: {}", p.display());
+            println!("  Prefiltered distances (F): {}", p.display());
+        }
+        if let Some(ref p) = self.postfiltered_neighbor_indices {
+            println!("  Postfiltered indices (E):  {}", p.display());
+        }
+        if let Some(ref p) = self.postfiltered_neighbor_distances {
+            println!("  Postfiltered distances (E): {}", p.display());
         }
         for p in &self.unassigned {
             println!("  (unassigned):              {}", p.display());
@@ -1961,6 +1999,15 @@ fn is_integer_xvec_format(s: &str) -> bool {
 /// through to manual selection for that role).
 pub(crate) fn detect_roles(candidates: &[(PathBuf, String, u64)]) -> DetectedRoles {
     /// Role tag used during detection before resolving ambiguities.
+    ///
+    /// `FilteredNeighbor*` is the **F facet** slot — pre-filter KNN
+    /// ground truth (ACORN G_K). The legacy `filtered_*.ivec` and the
+    /// canonical `prefiltered_*.ivec` filename patterns both route
+    /// here, because both filenames refer to pre-filter shape under
+    /// the new typing (see `docs/design/prefilter-postfilter-facets.md`).
+    /// `PostfilteredNeighbor*` is the **E facet** slot — post-filter
+    /// KNN ground truth (G ∩ R), only matched by `postfiltered_*` or
+    /// `postfilter_*` filenames.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum Role {
         BaseVectors,
@@ -1972,6 +2019,8 @@ pub(crate) fn detect_roles(candidates: &[(PathBuf, String, u64)]) -> DetectedRol
         MetadataResults,
         FilteredNeighborIndices,
         FilteredNeighborDistances,
+        PostfilteredNeighborIndices,
+        PostfilteredNeighborDistances,
     }
 
     let mut assignments: Vec<(Role, &PathBuf)> = Vec::new();
@@ -2008,7 +2057,18 @@ pub(crate) fn detect_roles(candidates: &[(PathBuf, String, u64)]) -> DetectedRol
 
         // Some keywords are safe as substrings (long, unambiguous);
         // short ones like "gt", "test" use token-boundary matching.
-        let has_filtered = has_token("filtered") || has_token("filter");
+        //
+        // Pre/post-filter precedence: `postfiltered` / `postfilter`
+        // route to the E facet (post-filter). `prefiltered` /
+        // `prefilter` route to the F facet (pre-filter), as does the
+        // bare `filtered` / `filter` keyword (legacy convention; legacy
+        // on-disk shape is pre-filter per docs/design/prefilter-
+        // postfilter-facets.md).
+        let has_postfiltered = has_token("postfiltered") || has_token("postfilter");
+        let has_prefiltered = has_token("prefiltered") || has_token("prefilter");
+        let has_filtered = has_postfiltered
+            || has_prefiltered
+            || has_token("filtered") || has_token("filter");
         let has_indices = has_token("indices") || has_token_or_substring("neighbors")
             || has_token("gt") || has_token_or_substring("groundtruth");
         let has_distances = has_token_or_substring("distance");
@@ -2019,8 +2079,15 @@ pub(crate) fn detect_roles(candidates: &[(PathBuf, String, u64)]) -> DetectedRol
         let has_predicates = has_token_or_substring("predicate");
         let has_results = has_token_or_substring("result");
 
-        // Filtered variants take priority over non-filtered
-        let role = if has_filtered && has_indices && is_ivec {
+        // Filtered variants take priority over non-filtered. Order
+        // matters: postfiltered must be tested before the generic
+        // filtered branch, since `postfiltered_neighbors` also matches
+        // the bare-filtered fallback.
+        let role = if has_postfiltered && has_indices && is_ivec {
+            Some(Role::PostfilteredNeighborIndices)
+        } else if has_postfiltered && has_distances && is_float_vector {
+            Some(Role::PostfilteredNeighborDistances)
+        } else if has_filtered && has_indices && is_ivec {
             Some(Role::FilteredNeighborIndices)
         } else if has_filtered && has_distances && is_float_vector {
             Some(Role::FilteredNeighborDistances)
@@ -2085,6 +2152,8 @@ pub(crate) fn detect_roles(candidates: &[(PathBuf, String, u64)]) -> DetectedRol
             Role::MetadataResults => result.metadata_results = Some(p),
             Role::FilteredNeighborIndices => result.filtered_neighbor_indices = Some(p),
             Role::FilteredNeighborDistances => result.filtered_neighbor_distances = Some(p),
+            Role::PostfilteredNeighborIndices => result.postfiltered_neighbor_indices = Some(p),
+            Role::PostfilteredNeighborDistances => result.postfiltered_neighbor_distances = Some(p),
         }
     }
 

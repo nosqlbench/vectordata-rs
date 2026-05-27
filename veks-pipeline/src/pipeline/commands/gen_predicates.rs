@@ -23,6 +23,7 @@
 //! projected `SurveyReport` down to a flat `FieldStats` map) is no
 //! longer used here; `gen_predicate_keys` still uses it.
 
+use std::path::PathBuf;
 use std::time::Instant;
 
 use rand::Rng;
@@ -31,6 +32,7 @@ use slabtastic::{SlabWriter, WriterConfig};
 use veks_core::formats::pnode::{
     Comparand, ConjugateNode, ConjugateType, FieldRef, OpType, PNode, PredicateNode,
 };
+use veks_core::formats::pnode::PNode as FmtPNode;
 use crate::pipeline::command::{
     ArtifactManifest, CommandDoc, CommandOp, CommandResult, OptionDesc, OptionRole, Options,
     Status, StreamContext, render_options_table,
@@ -41,6 +43,10 @@ use crate::pipeline::commands::survey::{
 use crate::pipeline::rng;
 
 use super::gen_predicates_common::{error_result, opt, resolve_path};
+use super::gen_predicates_proto::{
+    materialize_predicate, parse_template, PredicateProto, PredicateTemplate, SelectivitySpec,
+};
+use super::gen_predicates_wizard::{run_wizard, WizardInputs};
 use super::slab::{survey_report_from_json, survey_report_inline};
 
 /// Pipeline command: synthesize predicates from metadata slab field distributions.
@@ -53,46 +59,193 @@ pub fn factory() -> Box<dyn CommandOp> {
 
 impl GenPredicatesOp {
     fn execute_survey(&mut self, options: &Options, ctx: &mut StreamContext, start: Instant) -> CommandResult {
-        let output_str = match options.require("output") {
-            Ok(s) => s,
-            Err(e) => return error_result(e, start),
-        };
-        // `--source` is only required when no precomputed
-        // `--survey` is supplied — with a survey JSON in hand the
-        // generator doesn't need to re-scan the slab.
-        let source_present = options.get("source").is_some();
-        let survey_present = options.get("survey").is_some();
-        if !source_present && !survey_present {
+        // Wizard mode: interactively build a `PredicateProto`,
+        // save it to disk, then fall into the proto-driven
+        // generation path BY RE-LOADING THE SAVED FILE. The
+        // file is the single source of truth — there is no
+        // in-memory handoff. A "no" answer to the final
+        // prompt exits cleanly without running generation; the
+        // user can replay later via `--proto-file=<saved>`.
+        //
+        // Crucially, the wizard runs BEFORE any CLI option is
+        // required. It can auto-detect the metadata source from
+        // the CWD and prompts for the output slab, so the user
+        // can invoke `veks generate predicates --wizard` with no
+        // other flags.
+        let proto_file_from_wizard: Option<PathBuf> = if options.get("wizard").is_some() {
+            // The wizard derives a proto path next to the
+            // resolved output slab when --proto-file isn't given,
+            // so the two artefacts stay co-located. A CLI
+            // override (--proto-file) wins over that default.
+            let cli_output: Option<PathBuf> = options.get("output")
+                .map(|s| resolve_path(s, &ctx.workspace));
+            let cli_proto: Option<PathBuf> = options.get("proto-file")
+                .map(|s| resolve_path(s, &ctx.workspace));
+            let inputs = WizardInputs {
+                survey_path: options.get("survey").map(|s| resolve_path(s, &ctx.workspace)),
+                source_path: options.get("source").map(|s| resolve_path(s, &ctx.workspace)),
+                samples: options.get("samples").and_then(|s| s.parse().ok()).unwrap_or(1000),
+                output_proto: cli_proto,
+                output_slab: cli_output,
+                search_root: Some(ctx.workspace.clone()),
+            };
+            match run_wizard(inputs) {
+                Ok(out) => {
+                    if !out.proceed {
+                        // User declined to generate now. The
+                        // proto file exists on disk; tell the
+                        // caller to stop cleanly.
+                        return CommandResult {
+                            status: Status::Ok,
+                            message: format!(
+                                "wizard saved proto to {}; generation skipped (user declined)",
+                                out.proto_path.display(),
+                            ),
+                            produced: vec![out.proto_path],
+                            elapsed: start.elapsed(),
+                        };
+                    }
+                    Some(out.proto_path)
+                }
+                Err(e) => return error_result(format!("wizard: {e}"), start),
+            }
+        } else { None };
+
+        // Proto-driven mode: if `--proto-file` is supplied (or
+        // was just produced by the wizard), load a
+        // `PredicateProto` and use its fields to drive
+        // generation. The proto wins over individual flag
+        // overrides for the same knobs (count, selectivity,
+        // seed) so a saved proto is reproducible without having
+        // to also re-pass every flag. The flat flags continue
+        // to work when no proto is supplied.
+        let proto: Option<PredicateProto> = if let Some(path) = proto_file_from_wizard
+            .or_else(|| options.get("proto-file").map(|s| resolve_path(s, &ctx.workspace)))
+        {
+            match PredicateProto::load_from_path(&path) {
+                Ok(p) => Some(p),
+                Err(e) => return error_result(e, start),
+            }
+        } else if let Some(inline) = options.get("proto") {
+            // `--proto '<text>'` accepts either JSON or YAML; we
+            // sniff for a leading `{` to choose the loader so a
+            // pipeline can paste either format verbatim.
+            let trimmed = inline.trim_start();
+            let parsed = if trimmed.starts_with('{') {
+                PredicateProto::from_json(inline)
+            } else {
+                PredicateProto::from_yaml(inline)
+            };
+            match parsed {
+                Ok(p) => Some(p),
+                Err(e) => return error_result(e, start),
+            }
+        } else { None };
+
+        // Resolve `--source`: CLI > proto > error (if no
+        // `--survey` either). The proto's `source` is captured
+        // by the wizard so a `--proto-file=<f>` run replays the
+        // original survey target.
+        let source_resolved: Option<PathBuf> = options.get("source")
+            .map(|s| resolve_path(s, &ctx.workspace))
+            .or_else(|| proto.as_ref().and_then(|p| p.source.as_ref())
+                .map(|s| resolve_path(s, &ctx.workspace)));
+        let survey_resolved: Option<PathBuf> = options.get("survey")
+            .map(|s| resolve_path(s, &ctx.workspace))
+            .or_else(|| proto.as_ref().and_then(|p| p.survey.as_ref())
+                .map(|s| resolve_path(s, &ctx.workspace)));
+        if source_resolved.is_none() && survey_resolved.is_none() {
             return error_result(
-                "either --source <slab> or --survey <survey.json> must be provided".into(),
+                "either --source <slab> or --survey <survey.json> must be provided \
+                 (or carried by --proto-file)".into(),
                 start,
             );
         }
-        let input_path = options
-            .get("source")
-            .map(|s| resolve_path(s, &ctx.workspace))
-            .unwrap_or_else(std::path::PathBuf::new);
-        let output_path = resolve_path(output_str, &ctx.workspace);
+        let input_path = source_resolved.clone().unwrap_or_else(PathBuf::new);
 
-        let count: usize = options.get("count").and_then(|s| s.parse().ok()).unwrap_or(100);
-        let selectivity: f64 = options.get("selectivity").and_then(|s| s.parse().ok()).unwrap_or(0.1);
-        let selectivity_max: Option<f64> = options.get("selectivity-max").and_then(|s| s.parse().ok());
+        // Resolve `--output`: CLI > proto > error. Captured in
+        // the proto by the wizard, so a fresh `--proto-file`
+        // replay needs no other flags.
+        let output_path: PathBuf = match options.get("output")
+            .map(|s| resolve_path(s, &ctx.workspace))
+            .or_else(|| proto.as_ref().and_then(|p| p.output.as_ref())
+                .map(|s| resolve_path(s, &ctx.workspace)))
+        {
+            Some(p) => p,
+            None => return error_result(
+                "--output is required (or set `output:` in the proto file)".into(),
+                start,
+            ),
+        };
+
+        // Pre-validate the template at command launch — a syntax
+        // error here is more useful than running the survey and
+        // then failing.
+        let parsed_template: Option<PredicateTemplate> = match &proto {
+            Some(p) => match parse_template(&p.template) {
+                Ok(t) => Some(t),
+                Err(e) => return error_result(format!("invalid proto template: {e}"), start),
+            },
+            None => None,
+        };
+
+        // Flat-flag fallbacks, used either as the direct values
+        // (no proto) or as overrides for fields the proto doesn't
+        // pin (no count → count flag, no sel → selectivity flag).
+        let count: usize = proto.as_ref().map(|p| p.count)
+            .or_else(|| options.get("count").and_then(|s| s.parse().ok()))
+            .unwrap_or(100);
+        let selectivity_spec: SelectivitySpec = match proto.as_ref() {
+            Some(p) => p.selectivity,
+            None => {
+                let sel: f64 = options.get("selectivity")
+                    .and_then(|s| s.parse().ok()).unwrap_or(0.1);
+                let sel_max: Option<f64> = options.get("selectivity-max")
+                    .and_then(|s| s.parse().ok());
+                SelectivitySpec::from_flags(sel, sel_max)
+            }
+        };
         let max_samples: usize = options.get("samples").and_then(|s| s.parse().ok()).unwrap_or(1000);
         let strategy = options.get("strategy").unwrap_or("eq").to_string();
-        let seed: u64 = rng::parse_seed(options.get("seed"));
+        let seed: u64 = proto.as_ref().map(|p| p.seed)
+            .unwrap_or_else(|| rng::parse_seed(options.get("seed")));
+
+        // Field-selection filters (CLI surface):
+        //  --fields a,b,c       → whitelist (only these names are eligible)
+        //  --exclude-fields x,y → blacklist (drop these names after the whitelist)
+        // Both are case-sensitive, comma-separated, optional. Whitespace
+        // around commas is trimmed.
+        let field_whitelist: Option<Vec<String>> = options.get("fields").map(parse_csv_field_list);
+        let field_blacklist: Vec<String> = options.get("exclude-fields")
+            .map(parse_csv_field_list)
+            .unwrap_or_default();
+
+        // Operator-family filter:
+        //  --ops eq,lt,gt,le,ge,range,matches
+        // Default = all operators allowed (current behaviour). The
+        // per-field generators consult this mask and skip any path
+        // whose output operator isn't in the set, falling back to a
+        // permitted family if available or producing no predicate
+        // for the field on that draw.
+        let op_mask: OperatorMask = match options.get("ops") {
+            Some(s) => match OperatorMask::parse(s) {
+                Ok(m) => m,
+                Err(e) => return error_result(e, start),
+            },
+            None => OperatorMask::all(),
+        };
 
         // Load the survey directly as a SurveyReport — no projection
         // down to the legacy FieldStats shape. The richer profile
         // (semantic_type, cardinality_regime, quantile sketches,
         // reservoirs, heavy hitters) is what the calibrated
         // predicate generator depends on.
-        let report = if let Some(survey_str) = options.get("survey") {
-            let survey_path = resolve_path(survey_str, &ctx.workspace);
+        let report = if let Some(survey_path) = survey_resolved.as_ref() {
             ctx.ui.log(&format!(
                 "synthesize predicates: loading survey from {}",
                 survey_path.display(),
             ));
-            match survey_report_from_json(&survey_path) {
+            match survey_report_from_json(survey_path) {
                 Ok(r) => r,
                 Err(e) => return error_result(e, start),
             }
@@ -106,7 +259,11 @@ impl GenPredicatesOp {
         let eligible: Vec<(&String, &FieldProfile)> = report
             .fields
             .iter()
-            .filter(|(_, profile)| field_is_eligible(profile))
+            .filter(|(name, profile)| {
+                field_is_eligible(profile)
+                    && field_passes_name_filter(name, field_whitelist.as_deref(), &field_blacklist)
+                    && field_supports_any_op(profile, op_mask)
+            })
             .collect();
 
         if eligible.is_empty() {
@@ -134,27 +291,86 @@ impl GenPredicatesOp {
 
         let mut rng_inst = rng::seeded_rng(seed);
 
+        // Build a quick name → profile lookup for the proto path
+        // — `materialize_predicate` resolves field names against
+        // the survey's fields map.
+        let fields_map: std::collections::HashMap<String, FieldProfile> = report.fields.iter()
+            .map(|(k, v)| (k.clone(), v.clone())).collect();
+
+        // Diversity guard knobs. Default to a conservative
+        // floor of 5% — a 10K-emission run must produce ≥500
+        // distinct predicate byte-sequences, else we either
+        // warn (default) or abort (--strict-unique-ratio=true).
+        // The "10K identical MATCHES predicates" failure that
+        // motivated this guard had a unique ratio of 0.0001;
+        // any defensible generation run sits above ~0.10.
+        let min_unique_ratio: f64 = options.get("min-unique-ratio")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.05);
+        let strict_unique_ratio: bool = options.get("strict-unique-ratio")
+            .map(|s| s == "true").unwrap_or(false);
+
         let pb = ctx.ui.bar(count as u64, "generating predicates");
         let mut predicates: Vec<Vec<u8>> = Vec::with_capacity(count);
         for pred_i in 0..count {
-            let target_sel = match selectivity_max {
-                Some(max) => rng_inst.random_range(selectivity..=max),
-                None => selectivity,
-            };
-            let pnode = match strategy.as_str() {
-                "eq" => generate_eq_predicate(&eligible, target_sel, &mut rng_inst),
-                "compound" => generate_compound_predicate(&eligible, target_sel, &mut rng_inst),
-                other => {
-                    return error_result(
-                        format!("unknown strategy '{}', expected 'eq' or 'compound'", other),
-                        start,
-                    );
+            let target_sel = selectivity_spec.sample(&mut rng_inst);
+            let pnode = if let Some(template) = parsed_template.as_ref() {
+                // Proto-driven: template fixes shape; survey fills
+                // `?` placeholders to hit the per-emission target.
+                match materialize_predicate(template, &fields_map, target_sel, &mut rng_inst) {
+                    Ok(p) => p,
+                    Err(e) => return error_result(format!("materialize predicate: {e}"), start),
+                }
+            } else {
+                match strategy.as_str() {
+                    "eq" | "single" => generate_eq_predicate(&eligible, target_sel, op_mask, &mut rng_inst),
+                    "compound" => generate_compound_predicate(&eligible, target_sel, op_mask, &mut rng_inst),
+                    other => {
+                        return error_result(
+                            format!("unknown strategy '{}', expected 'eq' (or 'single') or 'compound'", other),
+                            start,
+                        );
+                    }
                 }
             };
             predicates.push(pnode.to_bytes_named());
             if (pred_i + 1) % 1_000 == 0 { pb.set_position((pred_i + 1) as u64); }
         }
         pb.finish();
+
+        // Diversity check: a generation run that produces 10K
+        // emissions from one heavy-hitter candidate (the
+        // pre-fix bug) writes 10K byte-identical PNode records.
+        // Count distinct byte-sequences and gate on the ratio.
+        let unique_count: usize = predicates.iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        let unique_ratio = if predicates.is_empty() { 1.0 }
+            else { unique_count as f64 / predicates.len() as f64 };
+        let diversity_msg = format!(
+            "generation diversity: {}/{} distinct predicates ({:.2}% unique)",
+            unique_count, predicates.len(), unique_ratio * 100.0,
+        );
+        ctx.ui.log(&diversity_msg);
+        if predicates.len() >= 10 && unique_ratio < min_unique_ratio {
+            let detail = format!(
+                "{} — below the --min-unique-ratio floor of {:.2}%. \
+                 The picker is locking onto a small candidate set; \
+                 typical causes: a heavy-hitter measure with only a \
+                 few entries, an over-tight selectivity target that \
+                 narrows the candidate pool to one, or a generator \
+                 bug. Loosen --selectivity / --selectivity-max to \
+                 widen the candidate range, or pass \
+                 --min-unique-ratio=<lower> to acknowledge a \
+                 genuinely-narrow predicate set.",
+                diversity_msg, min_unique_ratio * 100.0,
+            );
+            if strict_unique_ratio {
+                return error_result(detail, start);
+            } else {
+                ctx.ui.log(&format!("WARNING: {detail}"));
+            }
+        }
 
         let config = match WriterConfig::new(512, 4096, u32::MAX, false) {
             Ok(c) => c,
@@ -169,6 +385,64 @@ impl GenPredicatesOp {
                 return error_result(format!("write error: {}", e), start);
             }
         }
+        // Schema sidecar in the `:schema` namespace — matches the
+        // convention `convert` uses for metadata slabs (see
+        // `vectordata::metadata_schema`). Without this any
+        // downstream consumer would have to know out-of-band that
+        // the content namespace holds PNode-named bytes and that
+        // the generation template was X.
+        //
+        // `template` is the PNode Display vernacular with `?`
+        // placeholders. When the user drove generation from a
+        // proto, we serialise the proto's template verbatim;
+        // when they used the flat flags, we synthesise the
+        // template by rendering the predicate fingerprint
+        // (structural shape with concrete-value slots replaced
+        // by `?`).
+        let schema_template = parsed_template.as_ref()
+            .map(|_| proto.as_ref().map(|p| p.template.clone()).unwrap_or_default())
+            .or_else(|| predicates.first().and_then(|rec| {
+                let pnode = FmtPNode::from_bytes_named(rec).ok()?;
+                Some(render_template_from_pnode(&pnode))
+            }))
+            .unwrap_or_else(|| "<empty>".to_string());
+        let schema_selectivity = match selectivity_spec {
+            SelectivitySpec::Scalar(v) => format!("{v}"),
+            SelectivitySpec::Interval { lo, hi } => format!("{lo}..{hi}"),
+        };
+        let schema = vectordata::metadata_schema::PredicateSchema::new(
+            schema_template,
+            schema_selectivity,
+            seed,
+            predicates.len() as u64,
+        );
+        if let Err(e) = writer.start_namespace(
+            vectordata::metadata_schema::SCHEMA_NAMESPACE,
+        ) {
+            return error_result(format!("schema namespace: {}", e), start);
+        }
+        if let Err(e) = writer.add_record(&schema.to_json_bytes()) {
+            return error_result(format!("schema write: {}", e), start);
+        }
+        // Embed the survey report used to generate the
+        // predicates into a `:survey` namespace so a downstream
+        // consumer can introspect the source distributions
+        // (quantile sketches, heavy hitters, etc.) without
+        // needing the original survey JSON. This is for
+        // explanation / provenance only — the predicate
+        // evaluator doesn't read it.
+        if let Err(e) = writer.start_namespace(
+            vectordata::metadata_schema::SURVEY_NAMESPACE,
+        ) {
+            return error_result(format!("survey namespace: {}", e), start);
+        }
+        let survey_json = match serde_json::to_vec(&report) {
+            Ok(v) => v,
+            Err(e) => return error_result(format!("serialise survey report: {e}"), start),
+        };
+        if let Err(e) = writer.add_record(&survey_json) {
+            return error_result(format!("survey write: {}", e), start);
+        }
         if let Err(e) = writer.finish() {
             return error_result(format!("finish error: {}", e), start);
         }
@@ -180,9 +454,11 @@ impl GenPredicatesOp {
         ctx.defaults.insert(var_name, predicates.len().to_string());
 
         let message = format!(
-            "{} predicates generated from {} eligible fields",
+            "{} predicates generated from {} eligible fields ({} distinct, {:.1}% unique)",
             predicates.len(),
             eligible.len(),
+            unique_count,
+            unique_ratio * 100.0,
         );
         ctx.ui.log(&format!("synthesize predicates: {}", message));
 
@@ -231,16 +507,24 @@ impl CommandOp for GenPredicatesOp {
 
     fn describe_options(&self) -> Vec<OptionDesc> {
         vec![
-            opt("source", "Path", false, None, "Metadata source to survey (omit if --survey provides a precomputed report)", OptionRole::Input),
-            opt("output", "Path", true, None, "Output slab of generated predicates", OptionRole::Output),
+            opt("source", "Path", false, None, "Metadata source to survey (optional when --survey or --proto-file carries it)", OptionRole::Input),
+            opt("output", "Path", false, None, "Output slab of generated predicates (optional when --proto-file carries it; CLI wins on conflict)", OptionRole::Output),
             opt("survey", "Path", false, None, "Pre-computed survey JSON from `analyze survey` (skips re-surveying)", OptionRole::Input),
             opt("count", "int", false, Some("100"), "Number of predicates to generate", OptionRole::Config),
             opt("selectivity", "float", false, Some("0.1"), "Target selectivity", OptionRole::Config),
             opt("selectivity-max", "float", false, None, "Upper selectivity bound (random per-predicate within [selectivity, selectivity-max])", OptionRole::Config),
             opt("samples", "int", false, Some("1000"), "Inline survey sample count when --survey is not supplied", OptionRole::Config),
             opt("max-distinct", "int", false, Some("100"), "Max distinct values tracked per field (compat shim — actual cap comes from `analyze survey`)", OptionRole::Config),
-            opt("strategy", "string", false, Some("eq"), "Predicate strategy: 'eq' or 'compound'", OptionRole::Config),
+            opt("strategy", "string", false, Some("eq"), "Predicate strategy: 'eq' (alias 'single') or 'compound'", OptionRole::Config),
+            opt("fields", "string", false, None, "Comma-separated whitelist of metadata field names (default: all eligible fields)", OptionRole::Config),
+            opt("exclude-fields", "string", false, None, "Comma-separated blacklist of metadata field names (applied after --fields)", OptionRole::Config),
+            opt("ops", "string", false, None, "Comma-separated operator families to emit: eq, lt, gt, le, ge, range, matches (default: all)", OptionRole::Config),
+            opt("proto-file", "Path", false, None, "Replay file produced by the wizard (e.g. predicates.slab.proto.json). Carries the template, source, and output paths so a single --proto-file invocation reproduces the run. Accepts .proto.json or .proto.yaml.", OptionRole::Input),
+            opt("proto", "string", false, None, "Inline predicate prototype (JSON or YAML, same schema as --proto-file). Format inferred from leading `{`.", OptionRole::Config),
+            opt("wizard", "bool", false, None, "Interactively build a predicate prototype and save it to <output>.proto.json (or --proto-file). Re-run later with --proto-file to replay the same config. Auto-detects metadata source from CWD when --source is omitted.", OptionRole::Config),
             opt("seed", "int", false, Some("42"), "RNG seed", OptionRole::Config),
+            opt("min-unique-ratio", "float", false, Some("0.05"), "Minimum distinct/total predicate ratio; below this is logged as a WARNING or aborted with --strict-unique-ratio", OptionRole::Config),
+            opt("strict-unique-ratio", "bool", false, Some("false"), "When true, abort generation if unique-ratio falls below --min-unique-ratio instead of just warning", OptionRole::Config),
         ]
     }
 
@@ -256,6 +540,144 @@ impl CommandOp for GenPredicatesOp {
 // ---------------------------------------------------------------------------
 // SurveyReport-driven predicate synthesis
 // ---------------------------------------------------------------------------
+
+/// Operator families an emitted predicate can wear. The CLI
+/// `--ops` flag turns this into a mask that the per-field
+/// generators consult before producing a predicate.
+///
+/// Layout: one bit per family. `all()` (the default) enables
+/// every family — that's the historical behaviour. A caller can
+/// pass `eq,matches` to restrict the generator to "exact-match
+/// across categorical fields AND substring-match across text
+/// fields" only, with numeric inequalities suppressed entirely.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct OperatorMask(u32);
+
+impl OperatorMask {
+    const EQ:      u32 = 1 << 0;
+    const LT:      u32 = 1 << 1;
+    const GT:      u32 = 1 << 2;
+    const LE:      u32 = 1 << 3;
+    const GE:      u32 = 1 << 4;
+    const RANGE:   u32 = 1 << 5; // numeric Range (two-sided) – currently emits Lt at low/high
+    const MATCHES: u32 = 1 << 6;
+
+    /// All families allowed — matches pre-flag behaviour so an
+    /// invocation without `--ops` runs unchanged.
+    pub(crate) fn all() -> Self { Self(u32::MAX) }
+
+    fn allows(self, bit: u32) -> bool { self.0 & bit != 0 }
+
+    /// Parse a comma-separated list of family names. Returns
+    /// `Err(msg)` for unknown tokens so the operator-typo case
+    /// surfaces at command launch instead of silently emitting
+    /// no predicates.
+    fn parse(s: &str) -> Result<Self, String> {
+        let mut bits: u32 = 0;
+        for raw in s.split(',') {
+            let tok = raw.trim().to_ascii_lowercase();
+            if tok.is_empty() { continue; }
+            bits |= match tok.as_str() {
+                "eq" => Self::EQ,
+                "lt" => Self::LT,
+                "gt" => Self::GT,
+                "le" => Self::LE,
+                "ge" => Self::GE,
+                "range" => Self::RANGE,
+                "matches" => Self::MATCHES,
+                other => return Err(format!(
+                    "unknown operator family '{other}'. \
+                     Expected one of: eq, lt, gt, le, ge, range, matches",
+                )),
+            };
+        }
+        if bits == 0 {
+            return Err("--ops must list at least one operator family".into());
+        }
+        Ok(Self(bits))
+    }
+
+    /// True when the mask permits at least one numeric
+    /// inequality (Lt/Gt/Le/Ge/Range) — the family numeric
+    /// fields with quantile sketches emit.
+    fn allows_numeric_inequality(self) -> bool {
+        self.allows(Self::LT) || self.allows(Self::GT)
+            || self.allows(Self::LE) || self.allows(Self::GE)
+            || self.allows(Self::RANGE)
+    }
+
+    fn allows_eq(self) -> bool { self.allows(Self::EQ) }
+    fn allows_matches(self) -> bool { self.allows(Self::MATCHES) }
+
+    /// Translate a `PNode::Predicate.op` to its mask bit. Used by
+    /// the generators to filter their internal op-pick draws.
+    fn permits_op(self, op: OpType) -> bool {
+        let bit = match op {
+            OpType::Eq | OpType::Ne => Self::EQ,
+            OpType::Lt => Self::LT,
+            OpType::Gt => Self::GT,
+            OpType::Le => Self::LE,
+            OpType::Ge => Self::GE,
+            OpType::Matches => Self::MATCHES,
+            // In/Contains/etc. aren't emitted by the current generators;
+            // leave them disabled rather than silently allowing.
+            _ => return false,
+        };
+        self.allows(bit)
+    }
+}
+
+/// Parse a comma-separated, optionally-quoted list of field
+/// names into a `Vec<String>`. Empty entries (e.g. trailing
+/// commas) are dropped silently — typing one extra comma
+/// shouldn't be a parse error.
+fn parse_csv_field_list(s: &str) -> Vec<String> {
+    s.split(',')
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .collect()
+}
+
+/// Apply the `--fields` / `--exclude-fields` name-filters on
+/// top of [`field_is_eligible`]. Whitelist (when present) keeps
+/// only listed names; blacklist drops named entries
+/// unconditionally. Both filters compare case-sensitive exact
+/// names — the metadata schema is authoritative.
+fn field_passes_name_filter(name: &str, whitelist: Option<&[String]>, blacklist: &[String]) -> bool {
+    if let Some(allowed) = whitelist {
+        if !allowed.iter().any(|n| n == name) { return false; }
+    }
+    if blacklist.iter().any(|n| n == name) { return false; }
+    true
+}
+
+/// Whether the field's measure shape can produce at least one
+/// predicate satisfying the operator mask. Used to drop fields
+/// from the eligible set when `--ops` removes their only
+/// applicable family — otherwise the picker would keep choosing
+/// them and emitting `Eq Null` fallbacks.
+fn field_supports_any_op(profile: &FieldProfile, mask: OperatorMask) -> bool {
+    match profile.semantic_type.as_ref() {
+        Some(SemanticType::Boolean) => mask.allows_eq(),
+        Some(SemanticType::Number(_)) | Some(SemanticType::Temporal(_)) => {
+            // Quantile-driven numeric → inequality family.
+            // Frequency-table / reservoir fallback → Eq.
+            (profile.measures.contains_key("QuantileSketch") && mask.allows_numeric_inequality())
+                || (profile.measures.contains_key("ExactFrequencyTable") && mask.allows_eq())
+                || (profile.measures.contains_key("HeavyHitters") && mask.allows_eq())
+                || (profile.measures.contains_key("Reservoir") && mask.allows_eq())
+        }
+        Some(SemanticType::Identifier(_)) | Some(SemanticType::FreeText)
+        | Some(SemanticType::Structured(_)) | Some(SemanticType::Categorical(_)) => {
+            (profile.measures.contains_key("TrigramHeavyHitters") && mask.allows_matches())
+                || (profile.measures.contains_key("LabelsetHeavyHitters") && mask.allows_matches())
+                || (profile.measures.contains_key("ExactFrequencyTable") && mask.allows_eq())
+                || (profile.measures.contains_key("HeavyHitters") && mask.allows_eq())
+                || (profile.measures.contains_key("Reservoir") && mask.allows_eq())
+        }
+        _ => false,
+    }
+}
 
 /// Decide whether a [`FieldProfile`] can contribute predicates. The
 /// gate is intentionally permissive — any field whose
@@ -285,12 +707,13 @@ fn field_is_eligible(profile: &FieldProfile) -> bool {
 fn generate_eq_predicate(
     eligible: &[(&String, &FieldProfile)],
     target_sel: f64,
+    op_mask: OperatorMask,
     rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
 ) -> PNode {
     let idx = pick_target_field(eligible, target_sel, rng);
     let (name, profile) = eligible[idx];
     let field = FieldRef::Named(name.to_string());
-    build_predicate_for_field(field, profile, target_sel, rng)
+    build_predicate_for_field(field, profile, target_sel, op_mask, rng)
         .unwrap_or_else(|| PNode::Predicate(PredicateNode {
             field: FieldRef::Named(name.to_string()),
             op: OpType::Eq,
@@ -306,11 +729,12 @@ fn generate_eq_predicate(
 fn generate_compound_predicate(
     eligible: &[(&String, &FieldProfile)],
     target_sel: f64,
+    op_mask: OperatorMask,
     rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
 ) -> PNode {
     let arity = if eligible.len() >= 3 { rng.random_range(2..=3) } else { 2.min(eligible.len()) };
     if arity < 2 {
-        return generate_eq_predicate(eligible, target_sel, rng);
+        return generate_eq_predicate(eligible, target_sel, op_mask, rng);
     }
     // Per-child sel ≈ target_sel^(1/arity) so the AND approximates
     // the requested total. Independence is not enforced — see TODO
@@ -326,7 +750,7 @@ fn generate_compound_predicate(
         tries += 1;
     }
     if chosen_idx.len() < 2 {
-        return generate_eq_predicate(eligible, target_sel, rng);
+        return generate_eq_predicate(eligible, target_sel, op_mask, rng);
     }
     let children: Vec<PNode> = chosen_idx
         .into_iter()
@@ -336,12 +760,13 @@ fn generate_compound_predicate(
                 FieldRef::Named(name.to_string()),
                 profile,
                 per_child_sel,
+                op_mask,
                 rng,
             )
         })
         .collect();
     if children.len() < 2 {
-        return generate_eq_predicate(eligible, target_sel, rng);
+        return generate_eq_predicate(eligible, target_sel, op_mask, rng);
     }
     PNode::Conjugate(ConjugateNode {
         conjugate_type: ConjugateType::And,
@@ -437,49 +862,73 @@ fn build_predicate_for_field(
     field: FieldRef,
     profile: &FieldProfile,
     target_sel: f64,
+    op_mask: OperatorMask,
     rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
 ) -> Option<PNode> {
     match profile.semantic_type.as_ref()? {
-        SemanticType::Boolean => Some(boolean_predicate(field, rng)),
+        SemanticType::Boolean => {
+            if !op_mask.allows_eq() { return None; }
+            Some(boolean_predicate(field, rng))
+        }
         SemanticType::Number(kind) => {
-            if let Some(p) = numeric_predicate(field.clone(), profile, *kind, target_sel, rng) {
-                return Some(p);
+            if op_mask.allows_numeric_inequality() {
+                if let Some(p) = numeric_predicate(field.clone(), profile, *kind, target_sel, op_mask, rng) {
+                    return Some(p);
+                }
             }
-            if let Some(p) = categorical_predicate(field.clone(), profile, target_sel, rng) {
-                return Some(p);
+            if op_mask.allows_eq() {
+                if let Some(p) = categorical_predicate(field.clone(), profile, target_sel, rng) {
+                    return Some(p);
+                }
+                return reservoir_predicate(field, profile, false);
             }
-            reservoir_predicate(field, profile, false)
+            None
         }
         SemanticType::Temporal(_) => {
-            if let Some(p) = numeric_predicate(field.clone(), profile, NumberKind::Floating, target_sel, rng) {
-                return Some(p);
+            if op_mask.allows_numeric_inequality() {
+                if let Some(p) = numeric_predicate(field.clone(), profile, NumberKind::Floating, target_sel, op_mask, rng) {
+                    return Some(p);
+                }
             }
-            reservoir_predicate(field, profile, false)
+            if op_mask.allows_eq() {
+                return reservoir_predicate(field, profile, false);
+            }
+            None
         }
         SemanticType::Identifier(_)
         | SemanticType::FreeText
         | SemanticType::Structured(_)
         | SemanticType::Categorical(_) => {
             // Coin flip between MATCHES (trigram-driven, calibrated)
-            // and Eq (frequency-table-driven). Both have their
-            // strengths: MATCHES tolerates token-level variation,
-            // Eq gives exact match. Mix so a downstream benchmark
-            // exercises both predicate operators.
-            let prefer_matches = rng.random_bool(0.5);
-            if prefer_matches {
+            // and Eq (frequency-table-driven), constrained by the
+            // operator mask. When the mask permits only one family,
+            // the coin flip collapses to a single deterministic
+            // call. When neither is permitted there's nothing to
+            // emit and we return None — the caller's fallback
+            // chain handles it.
+            let try_matches = op_mask.allows_matches();
+            let try_eq = op_mask.allows_eq();
+            let prefer_matches = if try_matches && try_eq { rng.random_bool(0.5) }
+                else { try_matches };
+            if prefer_matches && try_matches {
                 if let Some(p) = matches_predicate(field.clone(), profile, target_sel, rng) {
                     return Some(p);
                 }
             }
-            if let Some(p) = categorical_predicate(field.clone(), profile, target_sel, rng) {
-                return Some(p);
+            if try_eq {
+                if let Some(p) = categorical_predicate(field.clone(), profile, target_sel, rng) {
+                    return Some(p);
+                }
             }
-            if !prefer_matches {
+            if !prefer_matches && try_matches {
                 if let Some(p) = matches_predicate(field.clone(), profile, target_sel, rng) {
                     return Some(p);
                 }
             }
-            reservoir_predicate(field, profile, true)
+            if try_eq {
+                return reservoir_predicate(field, profile, true);
+            }
+            None
         }
         SemanticType::Binary(_) | SemanticType::Unstable => None,
     }
@@ -502,6 +951,7 @@ fn numeric_predicate(
     profile: &FieldProfile,
     kind: NumberKind,
     target_sel: f64,
+    op_mask: OperatorMask,
     rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
 ) -> Option<PNode> {
     let MeasureReport::QuantileSketch(qs) = profile.measures.get("QuantileSketch")? else {
@@ -511,7 +961,6 @@ fn numeric_predicate(
         return None;
     }
     let s = target_sel.clamp(0.001, 0.999);
-    let op_pick = rng.random_range(0..3);
 
     let make_comparand = |v: f64| -> Comparand {
         match kind {
@@ -530,6 +979,20 @@ fn numeric_predicate(
     // is brittle.
     let is_integer = matches!(kind, NumberKind::Integer { .. });
     let (lt_op, gt_op) = if is_integer { (OpType::Le, OpType::Ge) } else { (OpType::Lt, OpType::Gt) };
+
+    // Constrain the three-way pick to ops the mask permits. The
+    // mask was already verified at field-eligibility time
+    // (`field_supports_any_op`) to permit at least one of the
+    // numeric inequalities, so this list is non-empty.
+    let candidate_picks: Vec<u8> = {
+        let mut c: Vec<u8> = Vec::with_capacity(3);
+        if op_mask.permits_op(lt_op) { c.push(0); }
+        if op_mask.permits_op(gt_op) { c.push(1); }
+        if op_mask.allows(OperatorMask::RANGE) || op_mask.permits_op(lt_op) { c.push(2); }
+        if c.is_empty() { return None; }
+        c
+    };
+    let op_pick = candidate_picks[rng.random_range(0..candidate_picks.len())];
 
     let (op, comparands) = match op_pick {
         0 => {
@@ -676,18 +1139,10 @@ fn labelset_matches_predicate(
     // target label (labelsets typically dedupe).
     let total = l.observed_records.max(1) as f64;
     let target_count = (total * target_sel).max(1.0);
-
-    let mut best: Option<&str> = None;
-    let mut best_score = f64::MAX;
-    for entry in &l.items {
-        let diff = (entry.count_lower_bound as f64 - target_count).abs();
-        let jittered = diff + rng.random_range(0.0..1.0);
-        if jittered < best_score {
-            best_score = jittered;
-            best = Some(&entry.label);
-        }
-    }
-    let label = best?;
+    let candidates: Vec<(&str, f64)> = l.items.iter()
+        .map(|e| (e.label.as_str(), e.count_lower_bound as f64))
+        .collect();
+    let label = sample_by_target_proximity(&candidates, target_count, rng)?;
     // Anchored pattern: matches the label only when bounded by
     // start-of-string, `, ` (with optional space), or end-of-string.
     let pattern = format!("(^|, ){}(,|$)", label);
@@ -727,23 +1182,48 @@ fn trigram_matches_predicate(
     // selectivity by exactly that ratio.
     let denom = profile.presence.present.max(1) as f64;
     let target_count = (denom * target_sel).max(1.0);
-
-    let mut best: Option<&str> = None;
-    let mut best_score = f64::MAX;
-    for entry in &t.items {
-        let diff = (entry.count_lower_bound as f64 - target_count).abs();
-        let jittered = diff + rng.random_range(0.0..1.0);
-        if jittered < best_score {
-            best_score = jittered;
-            best = Some(&entry.trigram);
-        }
-    }
-    let trigram = best?;
+    let candidates: Vec<(&str, f64)> = t.items.iter()
+        .map(|e| (e.trigram.as_str(), e.count_lower_bound as f64))
+        .collect();
+    let trigram = sample_by_target_proximity(&candidates, target_count, rng)?;
     Some(PNode::Predicate(PredicateNode {
         field: field.clone(),
         op: OpType::Matches,
         comparands: vec![Comparand::Text(trigram.to_string())],
     }))
+}
+
+/// Inverse-distance weighted draw across `(label, count)`
+/// candidates against a `target_count`.
+///
+/// Replaces the previous argmin-with-cosmetic-jitter picker that
+/// always selected the single closest candidate — emitting 10K
+/// identical predicates from a corpus with hundreds of valid
+/// heavy hitters. With inverse-distance weights, candidates
+/// near the target are still picked more often, but every entry
+/// has non-zero probability, so a 10K-emission run produces a
+/// distribution of predicates instead of a monocrop. Mirrors
+/// the model `categorical_predicate` already uses.
+///
+/// Weight = `1 / (|count - target| + 1)`. Returns `None` for an
+/// empty candidate slice.
+fn sample_by_target_proximity<'a, T: Copy>(
+    candidates: &'a [(T, f64)],
+    target_count: f64,
+    rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
+) -> Option<T> {
+    if candidates.is_empty() { return None; }
+    let weights: Vec<f64> = candidates.iter()
+        .map(|(_, c)| 1.0 / ((c - target_count).abs() + 1.0))
+        .collect();
+    let total: f64 = weights.iter().sum();
+    if total <= 0.0 { return Some(candidates[0].0); }
+    let mut pick = rng.random_range(0.0..total);
+    for ((value, _), w) in candidates.iter().zip(weights.iter()) {
+        pick -= *w;
+        if pick <= 0.0 { return Some(*value); }
+    }
+    Some(candidates.last().unwrap().0)
 }
 
 /// `Eq` predicate against a value drawn at random from the
@@ -780,6 +1260,85 @@ fn reservoir_predicate(
     }))
 }
 
+/// Draw a single [`Comparand`] for `field`/`op`/`target_sel`,
+/// reusing the calibrated per-op generators. Used by the
+/// proto-template path ([`super::gen_predicates_proto`]) to
+/// fill `?` placeholders in a template — the existing per-op
+/// generators emit a full `PNode::Predicate`; we discard the
+/// field/op wrappers and return just the comparand so the
+/// caller can plant it into the right slot.
+///
+/// Returns `None` when the field's measure shape can't produce
+/// a comparand for the requested op (e.g. asking for `MATCHES`
+/// against a numeric-only profile, or `Lt` against a field
+/// with no quantile sketch).
+pub(super) fn draw_comparand_for_field(
+    profile: &FieldProfile,
+    op: OpType,
+    target_sel: f64,
+    rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
+) -> Option<Comparand> {
+    // Boolean fields: any equality op picks a 50/50 boolean.
+    if matches!(profile.semantic_type, Some(SemanticType::Boolean))
+        && matches!(op, OpType::Eq | OpType::Ne)
+    {
+        return Some(Comparand::Bool(rng.random_bool(0.5)));
+    }
+
+    // Numeric / temporal inequality: walk the quantile sketch.
+    if matches!(op, OpType::Lt | OpType::Le | OpType::Gt | OpType::Ge) {
+        let qs = match profile.measures.get("QuantileSketch") {
+            Some(MeasureReport::QuantileSketch(qs)) if qs.count > 0 => qs,
+            _ => return None,
+        };
+        let s = target_sel.clamp(0.001, 0.999);
+        let q = match op {
+            OpType::Lt | OpType::Le => s,
+            OpType::Gt | OpType::Ge => 1.0 - s,
+            _ => return None,
+        };
+        let v = quantile_at(qs, q)?;
+        let as_int = matches!(profile.semantic_type,
+            Some(SemanticType::Number(NumberKind::Integer { .. })));
+        return Some(if as_int {
+            Comparand::Int(v.round() as i64)
+        } else {
+            Comparand::Float(v)
+        });
+    }
+
+    // Eq / Ne against a categorical or reservoir-backed field —
+    // reuse the existing per-op generators and pluck the
+    // comparand out of the returned `PNode::Predicate`.
+    if matches!(op, OpType::Eq | OpType::Ne) {
+        let dummy = FieldRef::Named(String::new());
+        if let Some(PNode::Predicate(p)) =
+            categorical_predicate(dummy.clone(), profile, target_sel, rng)
+        {
+            return p.comparands.into_iter().next();
+        }
+        if let Some(PNode::Predicate(p)) = reservoir_predicate(dummy, profile, false) {
+            return p.comparands.into_iter().next();
+        }
+        return None;
+    }
+
+    // MATCHES — trigram / labelset.
+    if matches!(op, OpType::Matches) {
+        let dummy = FieldRef::Named(String::new());
+        if let Some(PNode::Predicate(p)) =
+            matches_predicate(dummy, profile, target_sel, rng)
+        {
+            return p.comparands.into_iter().next();
+        }
+        return None;
+    }
+
+    // IN — not yet supported in template materialisation. Add a
+    // dedicated path when the use case lands.
+    None
+}
+
 /// Convert a frequency-table key string back into a `Comparand`
 /// of the right kind. The keys are stable `Debug`-formatted MValues
 /// (mirroring `canonical_distinct_key`), so a `Text("foo")` key
@@ -805,6 +1364,38 @@ fn value_to_eq_predicate(field: FieldRef, key: &str) -> PNode {
         op: OpType::Eq,
         comparands: vec![comparand],
     })
+}
+
+/// Render a concrete `PNode` back to its `Display`-vernacular
+/// template form by replacing every comparand with `?`. Used to
+/// reconstruct a schema-sidecar template from the first emitted
+/// predicate when no explicit proto template was supplied (i.e.
+/// the user drove generation through the flat flags).
+///
+/// The renderer reuses the existing `PNode::Display` impl on a
+/// fingerprint copy of the tree, then substitutes value tokens
+/// with `?`. This keeps the template grammar consistent with
+/// what `gen_predicates_proto::parse_template` accepts and what
+/// `veks_anode::pnode::from_display` round-trips.
+fn render_template_from_pnode(node: &PNode) -> String {
+    fn placeholder(node: &PNode) -> PNode {
+        match node {
+            PNode::Predicate(p) => PNode::Predicate(PredicateNode {
+                field: p.field.clone(),
+                op: p.op,
+                // Replace every comparand with `Null`; the
+                // textual substitution below converts that to
+                // `?`. See the wizard's `render_template` for
+                // the same trick.
+                comparands: p.comparands.iter().map(|_| Comparand::Null).collect(),
+            }),
+            PNode::Conjugate(c) => PNode::Conjugate(ConjugateNode {
+                conjugate_type: c.conjugate_type,
+                children: c.children.iter().map(placeholder).collect(),
+            }),
+        }
+    }
+    placeholder(node).to_string().replace("NULL", "?")
 }
 
 #[cfg(test)]
@@ -1253,5 +1844,731 @@ mod tests {
             }),
             _ => None,
         }
+    }
+
+    /// Build a small synthetic slab with two numeric fields
+    /// (`age`, `score`) and one text field (`name`) for the
+    /// field-filter and op-filter tests.
+    fn make_mixed_records() -> Vec<MNode> {
+        let labels = ["alpha", "beta", "gamma", "delta", "epsilon"];
+        (0..500i64).map(|i| {
+            let mut node = MNode::new();
+            node.insert("age".into(), MValue::Int(i % 100));
+            node.insert("score".into(), MValue::Int(i % 50 + 1));
+            node.insert("name".into(), MValue::Text(labels[(i as usize) % labels.len()].into()));
+            node
+        }).collect()
+    }
+
+    fn read_emitted_ops(output_path: &std::path::Path) -> Vec<OpType> {
+        let reader = SlabReader::open(output_path).unwrap();
+        let mut ops = Vec::new();
+        for i in 0..reader.total_records() {
+            let bytes = reader.get(i as i64).unwrap();
+            let pnode = FmtPNode::from_bytes_named(&bytes).unwrap();
+            if let FmtPNode::Predicate(p) = pnode { ops.push(p.op); }
+        }
+        ops
+    }
+
+    fn read_emitted_field_names(output_path: &std::path::Path) -> Vec<String> {
+        use veks_core::formats::pnode::FieldRef;
+        let reader = SlabReader::open(output_path).unwrap();
+        let mut names = Vec::new();
+        for i in 0..reader.total_records() {
+            let bytes = reader.get(i as i64).unwrap();
+            let pnode = FmtPNode::from_bytes_named(&bytes).unwrap();
+            if let FmtPNode::Predicate(p) = pnode {
+                if let FieldRef::Named(n) = p.field { names.push(n); }
+            }
+        }
+        names
+    }
+
+    /// `--fields age` restricts predicate generation to that
+    /// field alone — no `score` or `name` predicates appear.
+    #[test]
+    fn fields_whitelist_restricts_predicate_to_named_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        let mut ctx = test_ctx(ws);
+        let input_path = create_test_metadata_slab(ws, "meta.slab", make_mixed_records());
+        let output_path = ws.join("preds.slab");
+
+        let mut opts = Options::new();
+        opts.set("source", input_path.to_string_lossy().to_string());
+        opts.set("output", output_path.to_string_lossy().to_string());
+        opts.set("count", "50".to_string());
+        opts.set("seed", "7".to_string());
+        opts.set("fields", "age".to_string());
+
+        let r = GenPredicatesOp.execute(&opts, &mut ctx);
+        assert_eq!(r.status, Status::Ok, "{}", r.message);
+        let names = read_emitted_field_names(&output_path);
+        assert!(!names.is_empty(), "expected some predicates");
+        for n in &names {
+            assert_eq!(n, "age", "fields whitelist must limit predicates to 'age'");
+        }
+    }
+
+    /// `--exclude-fields age,score` drops both numeric fields
+    /// from eligibility — the text field `name` must carry the
+    /// whole generation load.
+    #[test]
+    fn exclude_fields_blacklist_drops_named_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        let mut ctx = test_ctx(ws);
+        let input_path = create_test_metadata_slab(ws, "meta.slab", make_mixed_records());
+        let output_path = ws.join("preds.slab");
+
+        let mut opts = Options::new();
+        opts.set("source", input_path.to_string_lossy().to_string());
+        opts.set("output", output_path.to_string_lossy().to_string());
+        opts.set("count", "50".to_string());
+        opts.set("seed", "7".to_string());
+        opts.set("exclude-fields", "age,score".to_string());
+
+        let r = GenPredicatesOp.execute(&opts, &mut ctx);
+        assert_eq!(r.status, Status::Ok, "{}", r.message);
+        let names = read_emitted_field_names(&output_path);
+        assert!(!names.is_empty(), "expected some predicates");
+        for n in &names {
+            assert!(n != "age" && n != "score",
+                "exclude-fields must drop both numeric fields, got {n}");
+        }
+    }
+
+    /// `--ops eq` constrains the generator to Eq predicates
+    /// only. No inequalities, no MATCHES.
+    #[test]
+    fn ops_filter_eq_emits_only_eq() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        let mut ctx = test_ctx(ws);
+        let input_path = create_test_metadata_slab(ws, "meta.slab", make_mixed_records());
+        let output_path = ws.join("preds.slab");
+
+        let mut opts = Options::new();
+        opts.set("source", input_path.to_string_lossy().to_string());
+        opts.set("output", output_path.to_string_lossy().to_string());
+        opts.set("count", "50".to_string());
+        opts.set("seed", "11".to_string());
+        opts.set("ops", "eq".to_string());
+
+        let r = GenPredicatesOp.execute(&opts, &mut ctx);
+        assert_eq!(r.status, Status::Ok, "{}", r.message);
+        let ops = read_emitted_ops(&output_path);
+        assert!(!ops.is_empty(), "expected some predicates");
+        for op in &ops {
+            assert_eq!(*op, OpType::Eq, "ops=eq must yield only Eq, saw {op:?}");
+        }
+    }
+
+    /// `--ops matches` constrains the generator to MATCHES
+    /// predicates only — numeric fields drop out of eligibility
+    /// entirely, so the text field carries the load.
+    #[test]
+    fn ops_filter_matches_emits_only_matches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        let mut ctx = test_ctx(ws);
+        let input_path = create_test_metadata_slab(ws, "meta.slab", make_mixed_records());
+        let output_path = ws.join("preds.slab");
+
+        let mut opts = Options::new();
+        opts.set("source", input_path.to_string_lossy().to_string());
+        opts.set("output", output_path.to_string_lossy().to_string());
+        opts.set("count", "50".to_string());
+        opts.set("seed", "13".to_string());
+        opts.set("ops", "matches".to_string());
+
+        let r = GenPredicatesOp.execute(&opts, &mut ctx);
+        assert_eq!(r.status, Status::Ok, "{}", r.message);
+        let ops = read_emitted_ops(&output_path);
+        assert!(!ops.is_empty(), "expected some predicates");
+        for op in &ops {
+            assert_eq!(*op, OpType::Matches,
+                "ops=matches must yield only MATCHES, saw {op:?}");
+        }
+    }
+
+    /// `--ops lt,gt,le,ge,range` constrains the generator to
+    /// numeric inequalities — Eq and MATCHES are suppressed.
+    /// The text field drops out (no inequality family); both
+    /// numeric fields carry the load.
+    #[test]
+    fn ops_filter_numeric_inequalities_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        let mut ctx = test_ctx(ws);
+        let input_path = create_test_metadata_slab(ws, "meta.slab", make_mixed_records());
+        let output_path = ws.join("preds.slab");
+
+        let mut opts = Options::new();
+        opts.set("source", input_path.to_string_lossy().to_string());
+        opts.set("output", output_path.to_string_lossy().to_string());
+        opts.set("count", "50".to_string());
+        opts.set("seed", "17".to_string());
+        opts.set("ops", "lt,gt,le,ge,range".to_string());
+
+        let r = GenPredicatesOp.execute(&opts, &mut ctx);
+        assert_eq!(r.status, Status::Ok, "{}", r.message);
+        let ops = read_emitted_ops(&output_path);
+        assert!(!ops.is_empty(), "expected some predicates");
+        for op in &ops {
+            assert!(matches!(*op,
+                OpType::Lt | OpType::Le | OpType::Gt | OpType::Ge),
+                "ops=lt,gt,le,ge,range must yield only numeric inequalities, saw {op:?}");
+        }
+        let names = read_emitted_field_names(&output_path);
+        for n in &names {
+            assert!(n != "name",
+                "text field 'name' shouldn't appear with numeric-only --ops, saw {n}");
+        }
+    }
+
+    /// Unknown operator token in `--ops` is a clean error, not
+    /// a silent empty output.
+    #[test]
+    fn ops_filter_unknown_token_errors_at_launch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        let mut ctx = test_ctx(ws);
+        let input_path = create_test_metadata_slab(ws, "meta.slab", make_mixed_records());
+        let output_path = ws.join("preds.slab");
+
+        let mut opts = Options::new();
+        opts.set("source", input_path.to_string_lossy().to_string());
+        opts.set("output", output_path.to_string_lossy().to_string());
+        opts.set("ops", "eq,not-a-real-op".to_string());
+
+        let r = GenPredicatesOp.execute(&opts, &mut ctx);
+        assert_eq!(r.status, Status::Error,
+            "unknown operator family must error at launch");
+        assert!(r.message.contains("not-a-real-op"),
+            "error should mention the bad token, got '{}'", r.message);
+    }
+
+    /// End-to-end: a `--proto` (inline YAML) with a Display-form
+    /// template pinning op + conjugate + fields, with `?` slots
+    /// for comparands, produces predicates that match the
+    /// template's structural fingerprint. Every emitted predicate
+    /// has the same shape (AND of `age >= int` and `name MATCHES
+    /// text`) — the proto fixes shape; the survey fills the `?`
+    /// slots. (Byte-identical reproducibility across runs needs a
+    /// pre-computed survey JSON — see the `survey:` field in the
+    /// proto schema; the inline survey path uses thread RNG.)
+    #[test]
+    fn proto_template_drives_generation_structurally() {
+        use veks_core::formats::pnode::{FieldRef, OpType, PNode};
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        let mut ctx = test_ctx(ws);
+        let input_path = create_test_metadata_slab(ws, "meta.slab", make_mixed_records());
+
+        let proto_yaml = format!(
+            r#"
+template: "(age >= ? AND name MATCHES ?)"
+count: 30
+selectivity: 0.10
+seed: 9001
+source: "{}"
+"#,
+            input_path.to_string_lossy()
+        );
+
+        let out_a = ws.join("a.slab");
+        let mut opts = Options::new();
+        opts.set("source", input_path.to_string_lossy().to_string());
+        opts.set("output", out_a.to_string_lossy().to_string());
+        opts.set("proto", proto_yaml);
+        let r = GenPredicatesOp.execute(&opts, &mut ctx);
+        assert_eq!(r.status, Status::Ok, "{}", r.message);
+
+        // Walk the emitted predicates and assert each is an AND of
+        // (`age >= <int>`) and (`name MATCHES <text>`).
+        let reader = SlabReader::open(&out_a).unwrap();
+        let total = reader.total_records();
+        assert!(total > 0, "should emit at least one predicate");
+        for i in 0..total {
+            let bytes = reader.get(i as i64).unwrap();
+            let pnode = FmtPNode::from_bytes_named(&bytes).unwrap();
+            match pnode {
+                PNode::Conjugate(c) => {
+                    assert_eq!(c.conjugate_type, ConjugateType::And);
+                    assert_eq!(c.children.len(), 2, "AND should have 2 children");
+                    // first child: age >= int
+                    if let PNode::Predicate(p) = &c.children[0] {
+                        assert_eq!(p.field, FieldRef::Named("age".into()));
+                        // Integer semantics may promote Ge→Ge or stay Ge;
+                        // we only pin what the template said.
+                        assert_eq!(p.op, OpType::Ge);
+                        assert!(matches!(p.comparands.first(), Some(Comparand::Int(_))));
+                    } else { panic!("child 0 must be a leaf predicate"); }
+                    // second child: name MATCHES text
+                    if let PNode::Predicate(p) = &c.children[1] {
+                        assert_eq!(p.field, FieldRef::Named("name".into()));
+                        assert_eq!(p.op, OpType::Matches);
+                        assert!(matches!(p.comparands.first(), Some(Comparand::Text(_))));
+                    } else { panic!("child 1 must be a leaf predicate"); }
+                }
+                _ => panic!("proto template was AND of two predicates — got non-conjugate"),
+            }
+        }
+    }
+
+    /// A proto with a literal-pinned comparand (no `?`) emits
+    /// that exact value on every predicate — the generator only
+    /// fills `?` slots.
+    #[test]
+    fn proto_template_literal_comparand_is_pinned() {
+        use veks_core::formats::pnode::{FieldRef, OpType, PNode};
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        let mut ctx = test_ctx(ws);
+        let input_path = create_test_metadata_slab(ws, "meta.slab", make_mixed_records());
+        let output_path = ws.join("preds.slab");
+
+        let proto_yaml = format!(
+            r#"
+template: "age = 50"
+count: 10
+seed: 1
+source: "{}"
+"#,
+            input_path.to_string_lossy()
+        );
+        let mut opts = Options::new();
+        opts.set("source", input_path.to_string_lossy().to_string());
+        opts.set("output", output_path.to_string_lossy().to_string());
+        opts.set("proto", proto_yaml);
+
+        let r = GenPredicatesOp.execute(&opts, &mut ctx);
+        assert_eq!(r.status, Status::Ok, "{}", r.message);
+        let reader = SlabReader::open(&output_path).unwrap();
+        for i in 0..reader.total_records() {
+            let bytes = reader.get(i as i64).unwrap();
+            let pnode = FmtPNode::from_bytes_named(&bytes).unwrap();
+            match pnode {
+                PNode::Predicate(p) => {
+                    assert_eq!(p.field, FieldRef::Named("age".into()));
+                    assert_eq!(p.op, OpType::Eq);
+                    assert_eq!(p.comparands, vec![Comparand::Int(50)],
+                        "literal pinned comparand must be emitted verbatim");
+                }
+                _ => panic!("expected leaf predicate"),
+            }
+        }
+    }
+
+    /// Every predicate slab emitted by `generate predicates`
+    /// also embeds the SurveyReport it was generated against
+    /// in a `:survey` namespace, so a downstream consumer can
+    /// introspect the source distributions without needing the
+    /// original survey JSON.
+    #[test]
+    fn predicate_slab_embeds_survey_report_in_survey_namespace() {
+        use vectordata::metadata_schema::SURVEY_NAMESPACE;
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        let mut ctx = test_ctx(ws);
+        let input_path = create_test_metadata_slab(ws, "meta.slab", make_test_records());
+        let output_path = ws.join("preds.slab");
+
+        let mut opts = Options::new();
+        opts.set("source", input_path.to_string_lossy().to_string());
+        opts.set("output", output_path.to_string_lossy().to_string());
+        opts.set("count", "5".to_string());
+        opts.set("seed", "42".to_string());
+        let r = GenPredicatesOp.execute(&opts, &mut ctx);
+        assert_eq!(r.status, Status::Ok, "{}", r.message);
+
+        // The :survey namespace must hold exactly one record:
+        // the serialised SurveyReport.
+        let survey_reader = slabtastic::SlabReader::open_namespace(
+            &output_path, Some(SURVEY_NAMESPACE),
+        ).expect("survey namespace must be present");
+        assert_eq!(survey_reader.total_records(), 1);
+        let bytes = survey_reader.get(0).unwrap();
+        // Round-trip through SurveyReport — same JSON contract
+        // `analyze survey` writes, so any caller that already
+        // consumes a survey.json can consume this too.
+        let parsed: crate::pipeline::commands::survey::SurveyReport =
+            serde_json::from_slice(&bytes).expect("survey JSON parses");
+        assert!(!parsed.fields.is_empty(),
+            "embedded survey must carry at least one field profile");
+    }
+
+    /// Every predicate slab emitted by `generate predicates`
+    /// carries a `:schema` namespace with a `PredicateSchema`
+    /// sidecar describing what's in the content namespace. This
+    /// is what lets downstream consumers know the records are
+    /// PNode-named bytes and recover the originating template
+    /// without out-of-band knowledge.
+    #[test]
+    fn predicate_slab_carries_schema_sidecar_in_schema_namespace() {
+        use vectordata::metadata_schema::{
+            PredicateSchema, SCHEMA_KIND_PREDICATE, SCHEMA_NAMESPACE,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        let mut ctx = test_ctx(ws);
+        let input_path = create_test_metadata_slab(ws, "meta.slab", make_test_records());
+        let output_path = ws.join("preds.slab");
+
+        let mut opts = Options::new();
+        opts.set("source", input_path.to_string_lossy().to_string());
+        opts.set("output", output_path.to_string_lossy().to_string());
+        opts.set("count", "10".to_string());
+        opts.set("seed", "42".to_string());
+        let mut op = GenPredicatesOp;
+        let r = op.execute(&opts, &mut ctx);
+        assert_eq!(r.status, Status::Ok, "gen predicates: {}", r.message);
+
+        // The content namespace still holds the predicate records.
+        let content_reader = SlabReader::open(&output_path).unwrap();
+        assert_eq!(content_reader.total_records(), 10);
+
+        // The schema namespace holds exactly one record.
+        let schema_reader = slabtastic::SlabReader::open_namespace(
+            &output_path, Some(SCHEMA_NAMESPACE),
+        ).expect("schema namespace must be present");
+        assert_eq!(schema_reader.total_records(), 1,
+            "schema namespace should hold exactly one descriptor");
+        let bytes = schema_reader.get(0).unwrap();
+        let schema = PredicateSchema::from_json_bytes(&bytes)
+            .expect("schema record must parse as PredicateSchema");
+
+        // Descriptor sanity.
+        assert_eq!(schema.kind, SCHEMA_KIND_PREDICATE);
+        assert_eq!(schema.wire_format, "pnode:named");
+        assert_eq!(schema.count, 10);
+        assert_eq!(schema.seed, 42);
+        // The template must include at least one `?` placeholder
+        // — that's the templating signature of "fill from
+        // survey", and confirms render_template_from_pnode did
+        // its substitution.
+        assert!(schema.template.contains('?'),
+            "template should contain `?` placeholder(s), got {:?}", schema.template);
+    }
+
+    /// Proto-driven generation must persist the *proto's*
+    /// template verbatim in the schema sidecar (not a re-
+    /// rendered version) — so the consumer can replay the exact
+    /// proto by reading the schema namespace.
+    #[test]
+    fn proto_template_round_trips_through_schema_sidecar() {
+        use vectordata::metadata_schema::{PredicateSchema, SCHEMA_NAMESPACE};
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        let mut ctx = test_ctx(ws);
+        let input_path = create_test_metadata_slab(ws, "meta.slab", make_mixed_records());
+        let output_path = ws.join("preds.slab");
+
+        let proto_yaml = format!(
+            r#"
+template: "(age >= ? AND name MATCHES ?)"
+count: 5
+selectivity: "0.05..0.20"
+seed: 9001
+source: "{}"
+"#,
+            input_path.to_string_lossy()
+        );
+        let mut opts = Options::new();
+        opts.set("source", input_path.to_string_lossy().to_string());
+        opts.set("output", output_path.to_string_lossy().to_string());
+        opts.set("proto", proto_yaml);
+        let r = GenPredicatesOp.execute(&opts, &mut ctx);
+        assert_eq!(r.status, Status::Ok, "{}", r.message);
+
+        let schema_reader = slabtastic::SlabReader::open_namespace(
+            &output_path, Some(SCHEMA_NAMESPACE),
+        ).unwrap();
+        let bytes = schema_reader.get(0).unwrap();
+        let schema = PredicateSchema::from_json_bytes(&bytes).unwrap();
+        assert_eq!(schema.template, "(age >= ? AND name MATCHES ?)");
+        assert_eq!(schema.selectivity, "0.05..0.2");
+        assert_eq!(schema.seed, 9001);
+        assert_eq!(schema.count, 5);
+    }
+
+    /// `--proto-file` round-trips through serde — a proto saved
+    /// to disk reloads to the same shape and produces the same
+    /// output.
+    #[test]
+    fn proto_file_round_trip_via_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        let mut ctx = test_ctx(ws);
+        let input_path = create_test_metadata_slab(ws, "meta.slab", make_mixed_records());
+        let proto_path = ws.join("p.proto.yaml");
+        std::fs::write(&proto_path, format!(
+            "template: \"age >= ?\"\ncount: 5\nselectivity: 0.1\nseed: 17\nsource: \"{}\"\n",
+            input_path.to_string_lossy()
+        )).unwrap();
+
+        let output_path = ws.join("preds.slab");
+        let mut opts = Options::new();
+        opts.set("source", input_path.to_string_lossy().to_string());
+        opts.set("output", output_path.to_string_lossy().to_string());
+        opts.set("proto-file", proto_path.to_string_lossy().to_string());
+
+        let r = GenPredicatesOp.execute(&opts, &mut ctx);
+        assert_eq!(r.status, Status::Ok, "{}", r.message);
+        assert!(SlabReader::open(&output_path).unwrap().total_records() > 0);
+    }
+
+    /// Single source of truth: a JSON proto file carrying
+    /// `source` and `output` is enough to run generation — no
+    /// `--source` or `--output` on the CLI. Covers the wizard's
+    /// hand-off, where the user is told they can replay with
+    /// just `--proto-file=<f>`.
+    #[test]
+    fn proto_file_carries_source_and_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        let mut ctx = test_ctx(ws);
+        let input_path = create_test_metadata_slab(ws, "meta.slab", make_mixed_records());
+        let output_path = ws.join("preds.slab");
+        let proto = PredicateProto {
+            template: "age >= ?".into(),
+            count: 5,
+            selectivity: SelectivitySpec::Scalar(0.1),
+            seed: 19,
+            survey: None,
+            source: Some(input_path.to_string_lossy().to_string()),
+            output: Some(output_path.to_string_lossy().to_string()),
+        };
+        let proto_path = ws.join("preds.proto.json");
+        proto.save_to_path(&proto_path).unwrap();
+
+        // Only --proto-file is set; nothing else.
+        let mut opts = Options::new();
+        opts.set("proto-file", proto_path.to_string_lossy().to_string());
+
+        let r = GenPredicatesOp.execute(&opts, &mut ctx);
+        assert_eq!(r.status, Status::Ok, "{}", r.message);
+        assert!(SlabReader::open(&output_path).unwrap().total_records() > 0,
+            "output slab from proto-only invocation should contain predicates");
+    }
+
+    /// CLI `--output` beats the proto's `output` field. The
+    /// last knob the operator turned wins; that matches every
+    /// other override slot in the command.
+    #[test]
+    fn cli_output_overrides_proto_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        let mut ctx = test_ctx(ws);
+        let input_path = create_test_metadata_slab(ws, "meta.slab", make_mixed_records());
+        let proto_output = ws.join("from_proto.slab");
+        let cli_output = ws.join("from_cli.slab");
+        let proto = PredicateProto {
+            template: "age >= ?".into(),
+            count: 3,
+            selectivity: SelectivitySpec::Scalar(0.1),
+            seed: 11,
+            survey: None,
+            source: Some(input_path.to_string_lossy().to_string()),
+            output: Some(proto_output.to_string_lossy().to_string()),
+        };
+        let proto_path = ws.join("p.proto.json");
+        proto.save_to_path(&proto_path).unwrap();
+
+        let mut opts = Options::new();
+        opts.set("proto-file", proto_path.to_string_lossy().to_string());
+        opts.set("output", cli_output.to_string_lossy().to_string());
+
+        let r = GenPredicatesOp.execute(&opts, &mut ctx);
+        assert_eq!(r.status, Status::Ok, "{}", r.message);
+        assert!(SlabReader::open(&cli_output).unwrap().total_records() > 0,
+            "CLI --output should be the write target");
+        assert!(!proto_output.exists(),
+            "proto's `output` should NOT be written when CLI --output is set");
+    }
+
+    /// Helpful error when neither CLI nor proto supplies an
+    /// output. The message names both knobs so the operator
+    /// knows what to add.
+    #[test]
+    fn missing_output_error_mentions_both_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        let mut ctx = test_ctx(ws);
+        let input_path = create_test_metadata_slab(ws, "meta.slab", make_mixed_records());
+
+        let mut opts = Options::new();
+        opts.set("source", input_path.to_string_lossy().to_string());
+        // No --output, no proto-file with output.
+
+        let r = GenPredicatesOp.execute(&opts, &mut ctx);
+        assert_eq!(r.status, Status::Error);
+        assert!(r.message.contains("--output"),
+            "error must mention --output flag: {}", r.message);
+        assert!(r.message.contains("proto"),
+            "error must mention proto file alternative: {}", r.message);
+    }
+
+    /// `sample_by_target_proximity` returns a distribution over
+    /// candidates, not a single argmin. With 5 candidates near
+    /// the target and 100 draws, we must observe at least 3
+    /// distinct picks — the old picker would produce 1.
+    #[test]
+    fn proximity_sampler_produces_diverse_picks() {
+        let mut rng = rng::seeded_rng(42);
+        let candidates: Vec<(&str, f64)> = vec![
+            ("alpha",   95.0),
+            ("beta",    100.0),
+            ("gamma",   105.0),
+            ("delta",   110.0),
+            ("epsilon", 90.0),
+        ];
+        let target = 100.0;
+        let picks: std::collections::HashSet<&str> = (0..100)
+            .map(|_| sample_by_target_proximity(&candidates, target, &mut rng).unwrap())
+            .collect();
+        assert!(picks.len() >= 3,
+            "expected ≥3 distinct picks across 100 draws, got {:?}", picks);
+    }
+
+    /// Weighting still favours the closest candidate — out of
+    /// 1000 draws, the on-target entry must win more often than
+    /// the far ones.
+    #[test]
+    fn proximity_sampler_favours_closer_candidates() {
+        let mut rng = rng::seeded_rng(123);
+        let candidates: Vec<(&str, f64)> = vec![
+            ("on_target",   100.0),
+            ("near",        110.0),
+            ("far",         200.0),
+        ];
+        let target = 100.0;
+        let mut hist: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for _ in 0..1000 {
+            let pick = sample_by_target_proximity(&candidates, target, &mut rng).unwrap();
+            *hist.entry(pick).or_default() += 1;
+        }
+        let on = hist.get("on_target").copied().unwrap_or(0);
+        let near = hist.get("near").copied().unwrap_or(0);
+        let far = hist.get("far").copied().unwrap_or(0);
+        assert!(on > near, "on_target ({on}) should beat near ({near})");
+        assert!(near > far, "near ({near}) should beat far ({far})");
+    }
+
+    /// Diversity floor is reported in the success message
+    /// regardless of whether the guard trips, so an operator
+    /// always sees the unique/total ratio for the run.
+    #[test]
+    fn diversity_ratio_appears_in_success_message() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        let mut ctx = test_ctx(ws);
+        let input_path = create_test_metadata_slab(ws, "meta.slab", make_test_records());
+        let output_path = ws.join("preds.slab");
+        let mut opts = Options::new();
+        opts.set("source", input_path.to_string_lossy().to_string());
+        opts.set("output", output_path.to_string_lossy().to_string());
+        opts.set("count", "20".to_string());
+        let r = GenPredicatesOp.execute(&opts, &mut ctx);
+        assert_eq!(r.status, Status::Ok, "{}", r.message);
+        assert!(r.message.contains("distinct"),
+            "success message must report distinct/unique ratio, got: {}",
+            r.message);
+        assert!(r.message.contains("% unique"),
+            "success message must include percent-unique, got: {}",
+            r.message);
+    }
+
+    /// `--strict-unique-ratio=true` flips the diversity warning
+    /// into a hard abort when below-floor. Forcing a single-
+    /// field, single-op generation against a binary-cardinality
+    /// boolean field produces 2 distinct predicates max — at
+    /// count=100 the unique ratio = 2/100 = 0.02, below the
+    /// default 0.05 floor.
+    #[test]
+    fn strict_unique_ratio_aborts_below_floor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        let mut ctx = test_ctx(ws);
+        // 100 records, all with a single boolean field — every
+        // emitted predicate is `bool_field = true` or
+        // `bool_field = false`, so at most 2 distinct.
+        let records: Vec<MNode> = (0..100i64).map(|i| {
+            let mut n = MNode::new();
+            n.insert("flag".into(), MValue::Bool(i % 2 == 0));
+            n
+        }).collect();
+        let input_path = create_test_metadata_slab(ws, "meta.slab", records);
+        let output_path = ws.join("preds.slab");
+        let mut opts = Options::new();
+        opts.set("source", input_path.to_string_lossy().to_string());
+        opts.set("output", output_path.to_string_lossy().to_string());
+        opts.set("count", "100".to_string());
+        opts.set("seed", "1".to_string());
+        opts.set("fields", "flag".to_string());
+        opts.set("strict-unique-ratio", "true".to_string());
+        let r = GenPredicatesOp.execute(&opts, &mut ctx);
+        assert_eq!(r.status, Status::Error,
+            "strict mode should abort: {}", r.message);
+        assert!(r.message.contains("unique-ratio") || r.message.contains("min-unique-ratio"),
+            "error message should mention the diversity floor: {}", r.message);
+    }
+
+    /// Generator-level diversity regression: across 50
+    /// emissions on a text-heavy corpus, MATCHES predicates
+    /// must produce at least 3 distinct patterns. The old
+    /// argmin picker would produce 1 (the symptom that
+    /// surfaced on the laion400b dataset).
+    #[test]
+    fn matches_predicates_have_diversity_across_emissions() {
+        use veks_core::formats::pnode::{Comparand, OpType, PNode};
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        let mut ctx = test_ctx(ws);
+
+        // 200 text records with varied content so the trigram
+        // measure has multiple competing heavy hitters.
+        let phrases = [
+            "the quick brown fox", "the lazy dog naps",
+            "rain falls on the meadow", "sunshine after the rain",
+            "kittens play with yarn", "the dog chases its tail",
+            "rivers flow to the sea", "the night is dark and full",
+            "stars shine in the sky", "the wind whispers softly",
+        ];
+        let mut records = Vec::new();
+        for i in 0..200i64 {
+            let mut node = MNode::new();
+            node.insert("text".into(), MValue::Text(phrases[(i as usize) % phrases.len()].into()));
+            records.push(node);
+        }
+        let input_path = create_test_metadata_slab(ws, "meta.slab", records);
+        let output_path = ws.join("preds.slab");
+
+        let mut opts = Options::new();
+        opts.set("source", input_path.to_string_lossy().to_string());
+        opts.set("output", output_path.to_string_lossy().to_string());
+        opts.set("count", "50".to_string());
+        opts.set("seed", "42".to_string());
+        opts.set("ops", "matches".to_string());
+
+        let r = GenPredicatesOp.execute(&opts, &mut ctx);
+        assert_eq!(r.status, Status::Ok, "{}", r.message);
+
+        let reader = SlabReader::open(&output_path).unwrap();
+        let mut patterns: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for i in 0..reader.total_records() {
+            let bytes = reader.get(i as i64).unwrap();
+            if let Ok(PNode::Predicate(p)) = FmtPNode::from_bytes_named(&bytes)
+                && let Some(Comparand::Text(s)) = p.comparands.first()
+            {
+                assert_eq!(p.op, OpType::Matches);
+                patterns.insert(s.clone());
+            }
+        }
+        assert!(patterns.len() >= 3,
+            "expected ≥3 distinct MATCHES patterns across 50 emissions, got {} ({:?})",
+            patterns.len(), patterns);
     }
 }

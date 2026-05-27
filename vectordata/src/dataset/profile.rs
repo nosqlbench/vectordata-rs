@@ -709,10 +709,14 @@ fn is_windowed_shared_view(key: &str) -> bool {
 /// own — and a verify against default's GT for the 1m boundary's
 /// cumulative top-100 fails 100% of queries by construction.
 ///
-/// Filtered KNN outputs follow the same per-profile pattern.
+/// Filtered KNN outputs follow the same per-profile pattern. Both
+/// canonical (`prefiltered_*`, `postfiltered_*`) and legacy
+/// (`filtered_*`) F/E facet keys are recognised here.
 fn is_per_profile_output_view(key: &str) -> bool {
     matches!(key,
         "neighbor_indices" | "neighbor_distances"
+        | "prefiltered_neighbor_indices" | "prefiltered_neighbor_distances"
+        | "postfiltered_neighbor_indices" | "postfiltered_neighbor_distances"
         | "filtered_neighbor_indices" | "filtered_neighbor_distances"
     )
 }

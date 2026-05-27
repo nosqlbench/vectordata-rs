@@ -6,15 +6,29 @@
 //! [`StandardFacet`] enumerates the well-known facet types that define a
 //! dataset's layout: `base_vectors`, `query_vectors`, `neighbor_indices`,
 //! `neighbor_distances`, metadata content/predicates/results/layout, and
-//! their filtered variants.
+//! the two predicated KNN ground-truth variants — pre-filter (`E`) and
+//! post-filter (`F`).
 //!
 //! Each facet has a canonical key name (used in `dataset.yaml` profile
 //! definitions) and a set of shorthand aliases for convenience. This module
 //! provides name resolution without any dependency on file formats or CLI
 //! frameworks.
 //!
-//! Consumers that need format-specific behavior (e.g., preferred output format)
-//! should extend `StandardFacet` in their own crate.
+//! ## E vs F (see `docs/design/prefilter-postfilter-facets.md`)
+//!
+//! - **F** — [`PrefilteredNeighborIndices`] / [`PrefilteredNeighborDistances`]:
+//!   pre-filter ground truth, ACORN's `G_K`. The top-K of `X_p` by distance —
+//!   perfect recall, full K when `|X_p| ≥ K`. This is the **legacy filtered-
+//!   knn shape**, retained under the F code so existing datasets keep their
+//!   meaning.
+//! - **E** — [`PostfilteredNeighborIndices`] / [`PostfilteredNeighborDistances`]:
+//!   post-filter ground truth, `G ∩ R`. The unfiltered top-K intersected
+//!   with the predicate-matching set. Sparse possible. New facet introduced
+//!   alongside the E/F split.
+//!
+//! The legacy keys `filtered_neighbor_indices` / `filtered_neighbor_distances`
+//! resolve to the F (pre-filter) facet — matching the actual shape of files
+//! produced by the legacy `compute filtered-knn` command.
 
 use std::fmt;
 
@@ -24,26 +38,36 @@ use std::fmt;
 /// canonical key name is used in `dataset.yaml` profile definitions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StandardFacet {
-    /// Base vectors (the corpus to search)
+    /// Base vectors (the corpus to search) — facet code `B`
     BaseVectors,
-    /// Query vectors (the queries to run)
+    /// Query vectors (the queries to run) — facet code `Q`
     QueryVectors,
-    /// Ground-truth neighbor indices
+    /// Unfiltered ground-truth neighbor indices — facet code `G`
     NeighborIndices,
-    /// Ground-truth neighbor distances
+    /// Unfiltered ground-truth neighbor distances — facet code `D`
     NeighborDistances,
-    /// Metadata content records (MNode)
+    /// Metadata content records (MNode) — facet code `M`
     MetadataContent,
-    /// Metadata predicate trees (PNode)
+    /// Metadata predicate trees (PNode) — facet code `P`
     MetadataPredicates,
-    /// Metadata filter result bitmaps
+    /// Metadata filter result bitmaps — facet code `R`
     MetadataResults,
     /// Metadata field layout schema
     MetadataLayout,
-    /// Filtered ground-truth neighbor indices
-    FilteredNeighborIndices,
-    /// Filtered ground-truth neighbor distances
-    FilteredNeighborDistances,
+    /// Pre-filter KNN ground-truth indices — facet code `F`.
+    /// Top-K of `X_p` (the predicate-passing base vectors). Full K
+    /// when `|X_p| ≥ K`; perfect recall. This is the legacy filtered-
+    /// knn shape; the legacy YAML key `filtered_neighbor_indices`
+    /// resolves here.
+    PrefilteredNeighborIndices,
+    /// Pre-filter KNN ground-truth distances — facet code `F`.
+    PrefilteredNeighborDistances,
+    /// Post-filter KNN ground-truth indices — facet code `E`.
+    /// `G ∩ R` — the unfiltered top-K intersected with the
+    /// predicate-passing set. Sparse possible.
+    PostfilteredNeighborIndices,
+    /// Post-filter KNN ground-truth distances — facet code `E`.
+    PostfilteredNeighborDistances,
 }
 
 impl StandardFacet {
@@ -57,8 +81,10 @@ impl StandardFacet {
         Self::MetadataPredicates,
         Self::MetadataResults,
         Self::MetadataLayout,
-        Self::FilteredNeighborIndices,
-        Self::FilteredNeighborDistances,
+        Self::PrefilteredNeighborIndices,
+        Self::PrefilteredNeighborDistances,
+        Self::PostfilteredNeighborIndices,
+        Self::PostfilteredNeighborDistances,
     ];
 
     /// Canonical key name used in dataset.yaml.
@@ -72,8 +98,28 @@ impl StandardFacet {
             Self::MetadataPredicates => "metadata_predicates",
             Self::MetadataResults => "metadata_results",
             Self::MetadataLayout => "metadata_layout",
-            Self::FilteredNeighborIndices => "filtered_neighbor_indices",
-            Self::FilteredNeighborDistances => "filtered_neighbor_distances",
+            Self::PrefilteredNeighborIndices => "prefiltered_neighbor_indices",
+            Self::PrefilteredNeighborDistances => "prefiltered_neighbor_distances",
+            Self::PostfilteredNeighborIndices => "postfiltered_neighbor_indices",
+            Self::PostfilteredNeighborDistances => "postfiltered_neighbor_distances",
+        }
+    }
+
+    /// Single-character facet code used by the partition sub-facet scoping
+    /// strings (e.g. `"BQG"`). Layout has no code — it is metadata-about-
+    /// metadata, not a content facet.
+    pub fn code(self) -> Option<char> {
+        match self {
+            Self::BaseVectors => Some('B'),
+            Self::QueryVectors => Some('Q'),
+            Self::NeighborIndices => Some('G'),
+            Self::NeighborDistances => Some('D'),
+            Self::MetadataContent => Some('M'),
+            Self::MetadataPredicates => Some('P'),
+            Self::MetadataResults => Some('R'),
+            Self::MetadataLayout => None,
+            Self::PrefilteredNeighborIndices | Self::PrefilteredNeighborDistances => Some('F'),
+            Self::PostfilteredNeighborIndices | Self::PostfilteredNeighborDistances => Some('E'),
         }
     }
 
@@ -88,8 +134,10 @@ impl StandardFacet {
             "metadata_predicates" => Some(Self::MetadataPredicates),
             "metadata_results" => Some(Self::MetadataResults),
             "metadata_layout" => Some(Self::MetadataLayout),
-            "filtered_neighbor_indices" => Some(Self::FilteredNeighborIndices),
-            "filtered_neighbor_distances" => Some(Self::FilteredNeighborDistances),
+            "prefiltered_neighbor_indices" => Some(Self::PrefilteredNeighborIndices),
+            "prefiltered_neighbor_distances" => Some(Self::PrefilteredNeighborDistances),
+            "postfiltered_neighbor_indices" => Some(Self::PostfilteredNeighborIndices),
+            "postfiltered_neighbor_distances" => Some(Self::PostfilteredNeighborDistances),
             _ => None,
         }
     }
@@ -98,6 +146,13 @@ impl StandardFacet {
     ///
     /// Matches Java's `TestDataKind.OtherNames` — allows YAML authors to use
     /// shorter, more natural names that get normalized to canonical keys.
+    ///
+    /// The legacy keys `filtered_neighbor_indices` and
+    /// `filtered_neighbor_distances` resolve to the **F** (pre-filter) facet
+    /// — matching the actual shape of files produced by the legacy
+    /// `compute filtered-knn` command. Loaders that hit these aliases
+    /// should advise users to migrate to the canonical `prefiltered_*`
+    /// keys.
     pub fn from_alias(name: &str) -> Option<Self> {
         match name {
             "base" | "train" => Some(Self::BaseVectors),
@@ -108,14 +163,35 @@ impl StandardFacet {
             "meta_predicates" => Some(Self::MetadataPredicates),
             "meta_results" | "predicate_results" => Some(Self::MetadataResults),
             "layout" | "meta_layout" => Some(Self::MetadataLayout),
-            "filtered_indices" | "filtered_gt" | "filtered_ground_truth" => {
-                Some(Self::FilteredNeighborIndices)
+            "prefiltered_indices" | "prefiltered_gt" | "prefiltered_ground_truth"
+                | "prefilter_indices" => Some(Self::PrefilteredNeighborIndices),
+            "prefiltered_distances" | "prefilter_distances" | "prefiltered_neighbors" => {
+                Some(Self::PrefilteredNeighborDistances)
             }
-            "filtered_distances" | "filtered_neighbors" => {
-                Some(Self::FilteredNeighborDistances)
+            // Canonical post-filter aliases.
+            "postfiltered_indices" | "postfiltered_gt" | "postfiltered_ground_truth"
+                | "postfilter_indices" => Some(Self::PostfilteredNeighborIndices),
+            "postfiltered_distances" | "postfilter_distances" | "postfiltered_neighbors" => {
+                Some(Self::PostfilteredNeighborDistances)
+            }
+            // Legacy aliases — pre-E/F-split datasets used these for
+            // pre-filter ground truth (now facet code F). They resolve
+            // to the prefiltered variants so the on-disk shape matches
+            // the new typing without forcing regeneration.
+            "filtered_neighbor_indices" | "filtered_indices" | "filtered_gt"
+                | "filtered_ground_truth" => Some(Self::PrefilteredNeighborIndices),
+            "filtered_neighbor_distances" | "filtered_distances" | "filtered_neighbors" => {
+                Some(Self::PrefilteredNeighborDistances)
             }
             _ => None,
         }
+    }
+
+    /// Returns `true` if `name` is a legacy alias that should trigger a
+    /// migration note ("use `postfiltered_*` going forward"). Used by
+    /// loaders to surface a deprecation hint without refusing the file.
+    pub fn is_legacy_filtered_alias(name: &str) -> bool {
+        matches!(name, "filtered_neighbor_indices" | "filtered_neighbor_distances")
     }
 
     /// Returns `true` if the given key is a recognized standard facet
@@ -169,7 +245,70 @@ mod tests {
 
     #[test]
     fn test_preferred_order_is_complete() {
-        assert_eq!(StandardFacet::PREFERRED_ORDER.len(), 10);
+        assert_eq!(StandardFacet::PREFERRED_ORDER.len(), 12);
+    }
+
+    /// Canonical keys for E and F are distinct from the legacy `filtered_*`
+    /// names. The legacy names are resolvable as aliases (see below).
+    #[test]
+    fn test_e_and_f_canonical_keys() {
+        assert_eq!(StandardFacet::PrefilteredNeighborIndices.key(), "prefiltered_neighbor_indices");
+        assert_eq!(StandardFacet::PrefilteredNeighborDistances.key(), "prefiltered_neighbor_distances");
+        assert_eq!(StandardFacet::PostfilteredNeighborIndices.key(), "postfiltered_neighbor_indices");
+        assert_eq!(StandardFacet::PostfilteredNeighborDistances.key(), "postfiltered_neighbor_distances");
+    }
+
+    /// Legacy `filtered_*` keys MUST resolve to the **pre-filter** (F)
+    /// facet — matching the actual shape of files produced by the legacy
+    /// `compute filtered-knn` command (full K, ACORN G_K). Regression-pin
+    /// this so a future refactor can't silently reassign them to the
+    /// post-filter variant (which is a different artifact shape).
+    #[test]
+    fn test_legacy_filtered_alias_resolves_to_prefilter() {
+        assert_eq!(
+            StandardFacet::from_alias("filtered_neighbor_indices"),
+            Some(StandardFacet::PrefilteredNeighborIndices),
+        );
+        assert_eq!(
+            StandardFacet::from_alias("filtered_neighbor_distances"),
+            Some(StandardFacet::PrefilteredNeighborDistances),
+        );
+        // The legacy-alias predicate is what loaders use to emit the
+        // migration note — keep it in sync with the two keys above.
+        assert!(StandardFacet::is_legacy_filtered_alias("filtered_neighbor_indices"));
+        assert!(StandardFacet::is_legacy_filtered_alias("filtered_neighbor_distances"));
+        assert!(!StandardFacet::is_legacy_filtered_alias("postfiltered_neighbor_indices"));
+        assert!(!StandardFacet::is_legacy_filtered_alias("prefiltered_neighbor_indices"));
+    }
+
+    /// Prefiltered aliases route to E; postfiltered aliases route to F.
+    #[test]
+    fn test_e_and_f_aliases() {
+        assert_eq!(StandardFacet::from_alias("prefiltered_gt"), Some(StandardFacet::PrefilteredNeighborIndices));
+        assert_eq!(StandardFacet::from_alias("prefilter_indices"), Some(StandardFacet::PrefilteredNeighborIndices));
+        assert_eq!(StandardFacet::from_alias("postfiltered_gt"), Some(StandardFacet::PostfilteredNeighborIndices));
+        assert_eq!(StandardFacet::from_alias("postfilter_indices"), Some(StandardFacet::PostfilteredNeighborIndices));
+    }
+
+    /// Facet codes per docs/design/prefilter-postfilter-facets.md.
+    /// Pre-filter → **F** (the legacy filtered-knn shape; ACORN G_K).
+    /// Post-filter → **E** (G ∩ R, new sparse artifact). Regression-pin
+    /// this so a future refactor can't silently swap them — swapping
+    /// would mislabel every existing published dataset.
+    #[test]
+    fn test_facet_codes() {
+        assert_eq!(StandardFacet::BaseVectors.code(), Some('B'));
+        assert_eq!(StandardFacet::QueryVectors.code(), Some('Q'));
+        assert_eq!(StandardFacet::NeighborIndices.code(), Some('G'));
+        assert_eq!(StandardFacet::NeighborDistances.code(), Some('D'));
+        assert_eq!(StandardFacet::MetadataContent.code(), Some('M'));
+        assert_eq!(StandardFacet::MetadataPredicates.code(), Some('P'));
+        assert_eq!(StandardFacet::MetadataResults.code(), Some('R'));
+        assert_eq!(StandardFacet::MetadataLayout.code(), None);
+        assert_eq!(StandardFacet::PrefilteredNeighborIndices.code(), Some('F'));
+        assert_eq!(StandardFacet::PrefilteredNeighborDistances.code(), Some('F'));
+        assert_eq!(StandardFacet::PostfilteredNeighborIndices.code(), Some('E'));
+        assert_eq!(StandardFacet::PostfilteredNeighborDistances.code(), Some('E'));
     }
 
     #[test]

@@ -227,14 +227,19 @@ fn facet_indicators(views: &indexmap::IndexMap<String, vectordata::dataset::DSVi
         views.contains_key(facet.key())
     };
 
-    if has(StandardFacet::BaseVectors)            { out.push('B'); }
-    if has(StandardFacet::QueryVectors)           { out.push('Q'); }
-    if has(StandardFacet::NeighborIndices)         { out.push('G'); }
-    if has(StandardFacet::NeighborDistances)       { out.push('D'); }
-    if has(StandardFacet::MetadataContent)         { out.push('M'); }
-    if has(StandardFacet::MetadataPredicates)      { out.push('P'); }
-    if has(StandardFacet::MetadataResults)         { out.push('R'); }
-    if has(StandardFacet::FilteredNeighborIndices) { out.push('F'); }
+    if has(StandardFacet::BaseVectors)                { out.push('B'); }
+    if has(StandardFacet::QueryVectors)               { out.push('Q'); }
+    if has(StandardFacet::NeighborIndices)            { out.push('G'); }
+    if has(StandardFacet::NeighborDistances)          { out.push('D'); }
+    if has(StandardFacet::MetadataContent)            { out.push('M'); }
+    if has(StandardFacet::MetadataPredicates)         { out.push('P'); }
+    if has(StandardFacet::MetadataResults)            { out.push('R'); }
+    // F (pre-filter, the legacy filtered-knn shape) and E (post-filter,
+    // G ∩ R) are distinct facets now; show both letters when both are
+    // present. The legacy `filtered_*` YAML key resolves to F, so older
+    // catalogs that only set that one still light up F.
+    if has(StandardFacet::PrefilteredNeighborIndices)  { out.push('F'); }
+    if has(StandardFacet::PostfilteredNeighborIndices) { out.push('E'); }
 
     out
 }

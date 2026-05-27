@@ -86,6 +86,20 @@ impl Page {
         self.footer.record_count = self.records.len() as u32;
     }
 
+    /// Append a record by taking ownership of its bytes — no clone.
+    ///
+    /// Identical to [`add_record`](Self::add_record) but accepts the
+    /// record as `Vec<u8>` rather than `&[u8]`. Callers that already
+    /// own the bytes (e.g. predicate-merge phases that just produced
+    /// the buffer) avoid a full record-sized memcpy per call. On a
+    /// 10K-predicate × 5 MB-each run this saves ~50 GB of memcpy on
+    /// the SlabWriter intake side.
+    pub fn add_record_owned(&mut self, data: Vec<u8>) {
+        self.record_data_len += data.len();
+        self.records.push(data);
+        self.footer.record_count = self.records.len() as u32;
+    }
+
     /// Compute the total serialized size of this page.
     pub fn serialized_size(&self) -> usize {
         let offset_count = self.records.len() + 1;
