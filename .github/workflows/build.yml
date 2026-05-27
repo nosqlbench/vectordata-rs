@@ -110,10 +110,18 @@ jobs:
       # test routes to a native or cross-built test runner based on
       # the target triple; our matrix uses native runners only, so
       # the host can execute the test binaries directly.
+      #
+      # `mkdir -p target/test-tmp` is required because `.cargo/config.toml`
+      # sets `TMPDIR = "target/test-tmp"` (relative) per the project's
+      # "tests use a project-local tmp" rule. Tests call
+      # `tempfile::tempdir()` and expect TMPDIR to exist; locally the
+      # directory accretes over time, but a clean CI checkout doesn't
+      # have it yet and every tempdir-using test panics on first call.
       - name: Test vectordata
         shell: bash
         run: |
           set -euo pipefail
+          mkdir -p target/test-tmp
           cargo test --release -p vectordata \
             --target ${{ matrix.target }} \
             --features cli
