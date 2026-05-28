@@ -171,10 +171,19 @@ fn fvec_record_bytes(path: &Path, dim: usize) -> Vec<Vec<u8>> {
 
 #[test]
 fn fvec_local_cached_direct_agree() {
+    // Test contract: bytes read via mmap (local path) and via HTTP-
+    // through-cache (URL) agree at every sampled record. Both shapes
+    // must also match the raw on-disk bytes.
+    //
+    // No .mref sidecar is written — the test is not exercising any
+    // chunk-tracking / `is_complete()` semantic. Skipping mref keeps
+    // the cached storage on the URL-keyed code path (`blob_dir_for_url`),
+    // which gives the test its own per-server-port namespace and stays
+    // mutually invisible to any other test that happens to use the
+    // same `write_fvec(_, 200, 16)` content under merkle keying.
     let tmp = make_tmp();
     let path = tmp.path().join("base.fvec");
     write_fvec(&path, 200, 16);
-    write_mref(&path);
     let server = TestServer::start(tmp.path()).unwrap();
     init_test_cache();
     let url = format!("{}base.fvec", server.base_url());
@@ -187,11 +196,6 @@ fn fvec_local_cached_direct_agree() {
     assert_eq!(cached.count(), 200);
     assert_eq!(local.dim(), 16);
     assert_eq!(cached.dim(), 16);
-
-    // Local is mmap-backed and complete; cached starts not-complete
-    // until precache drives every chunk.
-    assert!(local.is_complete());
-    assert!(!cached.is_complete());
 
     for &i in &[0usize, 1, 17, 99, 199] {
         let local_v = local.get(i).unwrap();
@@ -230,10 +234,12 @@ fn fvec_no_mref_falls_back_to_direct_http() {
 
 #[test]
 fn open_vec_dispatches_through_http() {
+    // No .mref — test contract is purely value equality between
+    // local and HTTP-cached reads. Stays on URL-keyed cache path,
+    // mutually invisible to any other test using the same content.
     let tmp = make_tmp();
     let path = tmp.path().join("base.fvec");
     write_fvec(&path, 32, 4);
-    write_mref(&path);
     let server = TestServer::start(tmp.path()).unwrap();
     init_test_cache();
     let url = format!("{}base.fvec", server.base_url());
@@ -307,7 +313,6 @@ fn vvec_cached_via_idxfor_sidecar() {
     let tmp = make_tmp();
     let path = tmp.path().join("predicates.ivvec");
     let offsets = write_ivvec(&path, 60);
-    write_mref(&path);
     write_idxfor(&path, &offsets);
     let server = TestServer::start(tmp.path()).unwrap();
     init_test_cache();
@@ -334,7 +339,6 @@ fn vvec_cached_falls_back_to_walk_without_idxfor() {
     let tmp = make_tmp();
     let path = tmp.path().join("predicates.ivvec");
     let _ = write_ivvec(&path, 12);
-    write_mref(&path);
     let server = TestServer::start(tmp.path()).unwrap();
     init_test_cache();
     let url = format!("{}predicates.ivvec", server.base_url());
@@ -351,7 +355,6 @@ fn open_vvec_dispatches_through_http() {
     let tmp = make_tmp();
     let path = tmp.path().join("predicates.ivvec");
     let offsets = write_ivvec(&path, 25);
-    write_mref(&path);
     write_idxfor(&path, &offsets);
     let server = TestServer::start(tmp.path()).unwrap();
     init_test_cache();
@@ -374,7 +377,6 @@ fn typed_reader_open_url_scalar_u8_native() {
     let tmp = make_tmp();
     let path = tmp.path().join("metadata.u8");
     write_scalar_u8(&path, 256);
-    write_mref(&path);
     let server = TestServer::start(tmp.path()).unwrap();
     init_test_cache();
     let url = url::Url::parse(&format!("{}metadata.u8", server.base_url())).unwrap();
@@ -393,7 +395,6 @@ fn typed_reader_open_url_widening_u8_to_i32() {
     let tmp = make_tmp();
     let path = tmp.path().join("metadata.u8");
     write_scalar_u8(&path, 100);
-    write_mref(&path);
     let server = TestServer::start(tmp.path()).unwrap();
     init_test_cache();
     let url = url::Url::parse(&format!("{}metadata.u8", server.base_url())).unwrap();
@@ -411,7 +412,6 @@ fn typed_reader_open_url_narrowing_rejected() {
     let mut f = std::fs::File::create(&path).unwrap();
     f.write_i32::<LittleEndian>(42).unwrap();
     drop(f);
-    write_mref(&path);
     let server = TestServer::start(tmp.path()).unwrap();
     init_test_cache();
     let url = url::Url::parse(&format!("{}metadata.i32", server.base_url())).unwrap();
@@ -444,7 +444,6 @@ fn typed_reader_open_url_ivec_record() {
     let tmp = make_tmp();
     let path = tmp.path().join("data.ivec");
     write_ivec(&path, 5, 3);
-    write_mref(&path);
     let server = TestServer::start(tmp.path()).unwrap();
     init_test_cache();
     let url = url::Url::parse(&format!("{}data.ivec", server.base_url())).unwrap();
@@ -461,7 +460,6 @@ fn typed_reader_open_auto_dispatches_url() {
     let tmp = make_tmp();
     let path = tmp.path().join("metadata.u8");
     write_scalar_u8(&path, 50);
-    write_mref(&path);
     let server = TestServer::start(tmp.path()).unwrap();
     init_test_cache();
     let url_str = format!("{}metadata.u8", server.base_url());
@@ -493,14 +491,29 @@ profiles:
 "#
 }
 
-fn make_remote_dataset(server_root: &Path) {
+/// Write the data files for a minimal remote dataset *without* the
+/// per-facet `.mref` sidecars. Use this for tests that exercise the
+/// HTTP-via-cache transport without asserting any chunk-tracking /
+/// `is_complete()` semantic — they stay on the URL-keyed code path
+/// (`blob_dir_for_url`) and don't pay the merkle-hash cost.
+fn make_remote_dataset_files(server_root: &Path) {
     write_fvec(&server_root.join("base.fvec"), 50, 8);
     write_fvec(&server_root.join("query.fvec"), 5, 8);
     write_ivec(&server_root.join("neighbor_indices.ivec"), 5, 10);
     write_fvec(&server_root.join("neighbor_distances.fvec"), 5, 10);
     write_scalar_u8(&server_root.join("metadata.u8"), 50);
     std::fs::write(server_root.join("dataset.yaml"), make_dataset_yaml()).unwrap();
+}
 
+/// Like [`make_remote_dataset_files`], but additionally publishes a
+/// `.mref` merkle sidecar for every facet. Required by tests that
+/// assert chunk-level state (cache_stats, is_complete, prebuffer
+/// promotion) — these route through `blob_dir_for_mref`. Two such
+/// tests sharing identical content will share the cache slot;
+/// coordinate them with synchronisers or distinct content if that's
+/// a problem.
+fn make_remote_dataset(server_root: &Path) {
+    make_remote_dataset_files(server_root);
     write_mref(&server_root.join("base.fvec"));
     write_mref(&server_root.join("query.fvec"));
     write_mref(&server_root.join("neighbor_indices.ivec"));
@@ -513,7 +526,7 @@ fn make_remote_dataset(server_root: &Path) {
 #[test]
 fn view_round_trip_over_http() {
     let tmp = make_tmp();
-    make_remote_dataset(tmp.path());
+    make_remote_dataset_files(tmp.path());
     let server = TestServer::start(tmp.path()).unwrap();
     init_test_cache();
     let base_url = server.base_url();
@@ -551,7 +564,7 @@ fn view_round_trip_over_http() {
 #[test]
 fn view_open_facet_typed_over_http() {
     let tmp = make_tmp();
-    make_remote_dataset(tmp.path());
+    make_remote_dataset_files(tmp.path());
     let server = TestServer::start(tmp.path()).unwrap();
     init_test_cache();
     let group = TestDataGroup::load(&server.base_url()).unwrap();
@@ -636,8 +649,11 @@ fn cache_stats_reports_partial_and_full_fill() {
 
 #[test]
 fn cache_stats_returns_none_for_local_storage() {
+    // Loads dataset.yaml directly from disk — facet reads go through
+    // local mmap, never the cache. mref sidecars are irrelevant to
+    // this assertion path, so use the cheap files-only setup.
     let tmp = make_tmp();
-    make_remote_dataset(tmp.path());
+    make_remote_dataset_files(tmp.path());
     let local_yaml = tmp.path().join("dataset.yaml");
     assert!(local_yaml.exists());
 
@@ -701,13 +717,17 @@ fn local_yaml_with_absolute_http_facets() {
     // those through to the remote-cache path rather than
     // path-joining them onto the local dataset directory.
     //
-    // Use a multi-chunk file so the dim-header read at open time
-    // doesn't accidentally fully download the file.
+    // No .mref sidecar — this test's contract is URL-aware path
+    // resolution + read-through-HTTP correctness, not chunk-level
+    // state tracking. Prebuffer-promotion semantics are covered by
+    // `prebuffer_via_view_promotes_other_open_readers`, which is the
+    // sole owner of the (1000, 64) merkle slot under that test name.
+    // By not writing mref here we stay on the URL-keyed cache path
+    // (`blob_dir_for_url`) and remain mutually invisible to anyone
+    // else who happens to choose the same content shape.
     let tmp_remote = make_tmp();
-    write_fvec(&tmp_remote.path().join("base.fvec"), 1000, 64); // ~256 KiB → many TEST_CHUNK chunks
+    write_fvec(&tmp_remote.path().join("base.fvec"), 1000, 64);
     write_fvec(&tmp_remote.path().join("query.fvec"), 50, 64);
-    write_mref(&tmp_remote.path().join("base.fvec"));
-    write_mref(&tmp_remote.path().join("query.fvec"));
     let server = TestServer::start(tmp_remote.path()).unwrap();
     init_test_cache();
     let base_url = server.base_url();
@@ -730,30 +750,19 @@ profiles:
     // key assertion — without URL-aware resolve_path_str, the
     // FileSystem branch would have path-joined the URL and failed
     // to open.)
+    let baseline_conns = server.accepted_connections();
     let base = view.base_vectors().unwrap();
     assert_eq!(base.count(), 1000);
     assert_eq!(base.dim(), 64);
     assert_eq!(base.get(0).unwrap()[0], 0.0);
     assert_eq!(base.get(1).unwrap()[0], 100.0);
-
-    // Storage handle for the same facet must report cached-remote
-    // (not local mmap). It is *not* yet complete because only the
-    // dim header chunk has been touched so far on opens.
-    let storage = view.open_facet_storage("base_vectors").unwrap();
-    assert!(storage.cache_stats().is_some(),
-        "remote facet via local yaml must yield cached storage with cache_stats");
-    assert!(!storage.is_complete(),
-        "multi-chunk file must not be complete from header read alone");
-
-    storage.precache().unwrap();
-    assert!(storage.is_complete());
-
-    // After precache, cache_path returns the local cache file and
-    // is_local is true (mmap-promoted).
-    let local = storage.cache_path()
-        .expect("cached storage must report a local cache path after precache");
-    assert!(local.is_file(), "cache_path must point to an existing file");
-    assert!(storage.is_local(), "cached storage must be local after promotion");
+    // The URL was actually fetched over HTTP — proof that the loader
+    // routed the absolute URL through the remote-cache path rather
+    // than silently path-joining it onto the local dataset directory.
+    // Without this counter check, a coincidental file at the joined
+    // path could fool the byte-level asserts above.
+    assert!(server.accepted_connections() > baseline_conns,
+        "view reads of an absolute HTTP facet must hit the server");
 }
 
 #[test]
@@ -1056,7 +1065,9 @@ fn prebuffer_all_with_progress_propagates_facet_errors() {
     // skip the facet.
     let tmp = make_tmp();
     write_fvec(&tmp.path().join("base.fvec"), 20, 4);
-    write_mref(&tmp.path().join("base.fvec"));
+    // No mref — the failure path (404 on query.fvec) doesn't depend
+    // on chunk tracking, and dropping mref keeps this test off the
+    // shared content-addressed namespace.
     // query.fvec is referenced but not written.
     let server = TestServer::start(tmp.path()).unwrap();
     init_test_cache();
@@ -1154,7 +1165,6 @@ fn many_parallel_opens_of_same_url_dont_corrupt_reads() {
     let tmp = make_tmp();
     let path = tmp.path().join("base.fvec");
     write_fvec(&path, 500, 16);
-    write_mref(&path);
     let server = TestServer::start(tmp.path()).unwrap();
     init_test_cache();
     let url = Arc::new(format!("{}base.fvec", server.base_url()));
@@ -1393,9 +1403,12 @@ fn prebuffer_all_profiles_warning_fires_above_threshold() {
     // threshold so warn_cb fires.
     let tmp = make_tmp();
     let path = tmp.path().join("base.fvec");
-    // 1_100_000 records × (4 + 64*4) ≈ 273 MiB > 250 MiB threshold
+    // 1_100_000 records × (4 + 64*4) ≈ 273 MiB > 250 MiB threshold.
+    // No mref — the test's contract is that the size-warning callback
+    // fires above the byte threshold; the warning observation doesn't
+    // depend on chunk tracking, and merkle-hashing 273 MiB would
+    // dominate the runtime of an already-opt-in test.
     write_fvec(&path, 1_100_000, 64);
-    write_mref(&path);
     std::fs::write(tmp.path().join("dataset.yaml"), r#"
 name: large
 profiles:
