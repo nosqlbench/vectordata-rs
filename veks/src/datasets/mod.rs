@@ -19,7 +19,7 @@ pub use vectordata::datasets::curlify;
 pub use vectordata::datasets::drop_cache;
 pub use vectordata::datasets::filter;
 pub use vectordata::datasets::list;
-pub use vectordata::datasets::probe;
+pub use vectordata::datasets::ping;
 
 use std::path::PathBuf;
 
@@ -183,8 +183,9 @@ pub enum DatasetsCommand {
         #[arg(long = "at")]
         at: Vec<String>,
     },
-    /// Probe a remote dataset: verify catalog access, list facets, read a sample
-    Probe {
+    /// Ping a remote dataset: verify catalog access, list facets, read a sample
+    #[command(alias = "probe")]
+    Ping {
         /// Catalog base URL or number (e.g., 1, https://bucket.s3.amazonaws.com/path/).
         /// If omitted, searches configured catalogs for the dataset.
         #[arg(long)]
@@ -194,7 +195,7 @@ pub enum DatasetsCommand {
         #[arg(long)]
         dataset: String,
 
-        /// Profile to probe (default: "default")
+        /// Profile to ping (default: "default")
         #[arg(long, default_value = "default")]
         profile: String,
     },
@@ -425,37 +426,20 @@ pub fn run(args: DatasetsArgs) {
                 std::process::exit(1);
             }
         }
-        DatasetsCommand::Probe { at, dataset, profile } => {
-            let resolved_at = match at {
-                Some(ref a) => resolve_catalog_value(a),
-                None => {
-                    // Search each configured catalog source for the dataset
-                    let sources = crate::catalog::sources::CatalogSources::new().configure_default();
-                    let all_locations: Vec<String> = sources.required().iter()
-                        .chain(sources.optional().iter())
-                        .cloned()
-                        .collect();
-                    let mut found: Option<String> = None;
-                    for loc in &all_locations {
-                        let single = crate::catalog::sources::CatalogSources::new()
-                            .add_catalogs(&[loc.clone()]);
-                        let cat = crate::catalog::resolver::Catalog::of(&single);
-                        if cat.find_exact(&dataset).is_some() {
-                            found = Some(loc.clone());
-                            break;
-                        }
-                    }
-                    match found {
-                        Some(url) => url,
-                        None => {
-                            eprintln!("Dataset '{}' not found in configured catalogs.", dataset);
-                            eprintln!("Use --at <URL> to specify a catalog, or 'veks datasets config add-catalog <URL>' to add one.");
-                            std::process::exit(1);
-                        }
-                    }
-                }
+        DatasetsCommand::Ping { at, dataset, profile } => {
+            // Ping now goes through the unified resolver; --at pins the
+            // search to that catalog, otherwise every configured one is
+            // in play and the dataset is looked up against the union.
+            let sources = if let Some(ref a) = at {
+                let resolved = resolve_catalog_value(a);
+                crate::catalog::sources::CatalogSources::new()
+                    .add_catalogs(&[resolved])
+            } else {
+                crate::catalog::sources::CatalogSources::new().configure_default()
             };
-            probe::run(&resolved_at, &dataset, &profile);
+            let catalog = crate::catalog::resolver::Catalog::of(&sources);
+            let code = ping::run_via_catalog(&catalog, &dataset, &profile);
+            if code != 0 { std::process::exit(code); }
         }
         DatasetsCommand::DropCache { datasets, yes, verbose, cache_dir } => {
             drop_cache::run(&datasets, cache_dir.as_deref(), yes, verbose);

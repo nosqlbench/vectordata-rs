@@ -13,12 +13,9 @@
 //! `dataset:profile:facet` specifier from the catalog.
 
 pub mod shared;
-pub mod repl;
-mod data_shell;
 mod dataset_picker;
 mod palette;
 mod unified;
-mod values_grid;
 
 /// Resolve the configured cache directory or exit the process with a
 /// helpful error message. Used as the entry-point fallback when the
@@ -28,7 +25,7 @@ pub(crate) fn cache_dir_or_exit() -> std::path::PathBuf {
     match crate::settings::cache_dir() {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("Error: cannot resolve cache_dir from settings: {e}");
+            eprintln!("error: cannot resolve cache_dir from settings: {e}");
             std::process::exit(1);
         }
     }
@@ -47,79 +44,33 @@ pub(crate) fn seeded_rng(seed: u64) -> rand_xoshiro::Xoshiro256PlusPlus {
     rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(seed)
 }
 
-use std::path::PathBuf;
-
-use clap::{Args, Subcommand};
+use clap::Args;
 
 pub use shared::SampleMode;
 use shared::parse_sample_mode;
 
-/// Interactive data exploration and visualization
+/// Unified vector space explorer — norms, distances, eigenvalues, PCA
+/// in one TUI. Run without any source flag to pop the catalog picker.
 #[derive(Args)]
-#[command(disable_help_subcommand = true)]
 pub struct ExploreArgs {
-    #[command(subcommand)]
-    pub command: ExploreCommand,
-}
-
-#[derive(Subcommand)]
-pub enum ExploreCommand {
-    /// Unified vector space explorer — norms, distances, eigenvalues, PCA in one TUI
-    Explore {
-        /// Dataset from catalog (e.g., img-search or img-search:default)
-        #[arg(long, group = "input")]
-        dataset: Option<String>,
-        /// Any data source: local file path or dataset:profile:facet
-        #[arg(long, group = "input")]
-        source: Option<String>,
-        /// Profile name (used with --dataset; overrides profile in dataset:profile)
-        #[arg(long)]
-        profile: Option<String>,
-        /// Number of vectors to sample
-        #[arg(long, default_value = "50000")]
-        sample: usize,
-        /// Random seed
-        #[arg(long, default_value = "42")]
-        seed: u64,
-        /// Sampling mode [streaming, clumped, sparse]
-        #[arg(long, default_value = "streaming", value_parser = parse_sample_mode)]
-        sample_mode: SampleMode,
-    },
-    /// Interactive data exploration shell for vector files
-    Shell {
-        /// Dataset from catalog (e.g., img-search or img-search:default)
-        #[arg(long, group = "input")]
-        dataset: Option<String>,
-        /// Any data source: local file path or dataset:profile:facet
-        #[arg(long, group = "input")]
-        source: Option<String>,
-        /// Profile name (used with --dataset; overrides profile in dataset:profile)
-        #[arg(long)]
-        profile: Option<String>,
-
-        /// Trailing args passed as command options
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
-    },
-    /// Scrollable raw-values grid: ordinals × dimensions, with sig-digit
-    /// control and 24-bit-color heatmap.
-    Values {
-        /// Dataset from catalog (e.g., img-search or img-search:default)
-        #[arg(long, group = "input")]
-        dataset: Option<String>,
-        /// Any data source: local file path or dataset:profile:facet
-        #[arg(long, group = "input")]
-        source: Option<String>,
-        /// Profile name (used with --dataset; overrides profile in dataset:profile)
-        #[arg(long)]
-        profile: Option<String>,
-        /// First ordinal to display
-        #[arg(long, default_value = "0")]
-        start: u64,
-        /// Initial significant-digit count (1–6)
-        #[arg(long, default_value = "4")]
-        digits: u8,
-    },
+    /// Dataset from catalog (e.g., img-search or img-search:default)
+    #[arg(long, group = "input")]
+    pub dataset: Option<String>,
+    /// Any data source: local file path or dataset:profile:facet
+    #[arg(long, group = "input")]
+    pub source: Option<String>,
+    /// Profile name (used with --dataset; overrides profile in dataset:profile)
+    #[arg(long)]
+    pub profile: Option<String>,
+    /// Number of vectors to sample
+    #[arg(long, default_value = "50000")]
+    pub sample: usize,
+    /// Random seed
+    #[arg(long, default_value = "42")]
+    pub seed: u64,
+    /// Sampling mode [streaming, clumped, sparse]
+    #[arg(long, default_value = "streaming", value_parser = parse_sample_mode)]
+    pub sample_mode: SampleMode,
 }
 
 /// Resolve the data source from mutually exclusive --dataset / --source options.
@@ -149,14 +100,15 @@ fn resolve_input(dataset: Option<String>, source: Option<String>, profile: Optio
     })
 }
 
-/// Dispatch a visualize subcommand.
-///
-/// Visualize commands create a standalone ratatui TUI for interactive
-/// display. The user presses 'q' to exit.
-pub fn run(args: ExploreArgs) {
-    // Install a panic hook that restores the terminal before printing the
-    // panic message. Without this, panics during TUI sessions leave the
-    // terminal in raw mode with the alternate screen active, hiding errors.
+/// Launch the unified explore TUI. When no source is supplied, the
+/// catalog picker pops first; each picker selection routes through a
+/// per-row action menu (visualize / precache / purge / ping). Actions
+/// run in-place with the picker's chrome temporarily suspended so the
+/// picker's UI state — cursor, expanded set, filter, scroll, last
+/// menu cursor — is preserved across every action.
+pub fn run(args: ExploreArgs) -> i32 {
+    use dataset_picker::{ActionFlow, PickerAction, PickerOutcome};
+
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = crossterm::terminal::disable_raw_mode();
@@ -168,68 +120,140 @@ pub fn run(args: ExploreArgs) {
         original_hook(info);
     }));
 
-    match args.command {
-        ExploreCommand::Explore { dataset, source, profile, sample, seed, sample_mode } => {
-            let from_picker = dataset.is_none() && source.is_none();
-            let mut src = match resolve_input(dataset, source, profile) {
-                Some(s) => s,
-                None => match dataset_picker::run_picker() {
-                    Some(s) => s,
-                    None => { std::process::exit(0); }
-                },
-            };
-            loop {
-                match unified::run_interactive_explore(&src, sample, seed, sample_mode) {
-                    unified::ExploreExit::Quit => break,
-                    unified::ExploreExit::Back if from_picker => {
-                        // Return to dataset picker
-                        match dataset_picker::run_picker() {
-                            Some(s) => { src = s; }
-                            None => break,
-                        }
-                    }
-                    unified::ExploreExit::Back => break, // no picker to go back to
+    let ExploreArgs { dataset, source, profile, sample, seed, sample_mode } = args;
+
+    // Non-interactive path: explicit source or dataset → straight to
+    // the explorer, no picker, no menu.
+    if dataset.is_some() || source.is_some() {
+        let src = resolve_input(dataset, source, profile)
+            .expect("clap group guarantees exactly one of dataset/source is set here");
+        return match unified::run_interactive_explore(&src, sample, seed, sample_mode) {
+            unified::ExploreExit::Quit | unified::ExploreExit::Back => 0,
+        };
+    }
+
+    // Interactive path: picker owns the loop and dispatches actions
+    // inline. Visualize → Quit exits the picker too; Visualize → Back
+    // keeps the picker open. precache/purge/ping always return to the
+    // picker so the user can chain operations.
+    let dispatch = |specifier: &str, action: PickerAction| -> ActionFlow {
+        match action {
+            PickerAction::Visualize => {
+                match unified::run_interactive_explore(specifier, sample, seed, sample_mode) {
+                    unified::ExploreExit::Quit => ActionFlow::Exit,
+                    unified::ExploreExit::Back => ActionFlow::Stay,
                 }
             }
-        }
-        ExploreCommand::Values { dataset, source, profile, start, digits } => {
-            let from_picker = dataset.is_none() && source.is_none();
-            let mut src = match resolve_input(dataset, source, profile) {
-                Some(s) => s,
-                None => match dataset_picker::run_picker() {
-                    Some(s) => s,
-                    None => { std::process::exit(0); }
-                },
-            };
-            loop {
-                match values_grid::run(&src, start as usize, digits) {
-                    values_grid::Exit::Quit => break,
-                    values_grid::Exit::Back if from_picker => {
-                        match dataset_picker::run_picker() {
-                            Some(s) => { src = s; }
-                            None => break,
-                        }
-                    }
-                    values_grid::Exit::Back => break,
-                }
+            PickerAction::Precache => {
+                run_precache_then_pause(specifier);
+                ActionFlow::Stay
+            }
+            PickerAction::Purge => {
+                run_purge_then_pause(specifier);
+                ActionFlow::Stay
+            }
+            PickerAction::Ping => {
+                run_ping_then_pause(specifier);
+                ActionFlow::Stay
             }
         }
-        ExploreCommand::Shell { dataset, source, profile, args: extra } => {
-            let src = match resolve_input(dataset, source, profile) {
-                Some(s) => s,
-                None => match dataset_picker::run_picker() {
-                    Some(s) => s,
-                    None => { std::process::exit(0); }
-                },
-            };
-            if extra.is_empty() {
-                data_shell::run_data_shell_interactive(&src);
-            } else {
-                let commands = extra.join(" ");
-                data_shell::run_data_shell_batch(&src, &commands);
-            }
+    };
+    match dataset_picker::run_picker(dispatch) {
+        PickerOutcome::Done => 0,
+        PickerOutcome::Failed => 1,
+    }
+}
+
+/// Split a `dataset:profile` specifier. Profile defaults to `default`.
+fn split_specifier(specifier: &str) -> (&str, &str) {
+    match specifier.split_once(':') {
+        Some((d, p)) if !p.is_empty() => (d, p),
+        _ => (specifier, "default"),
+    }
+}
+
+/// Pause for a keystroke so the user can read the action's stderr
+/// output before the picker re-takes the screen.
+fn pause_for_keypress() {
+    eprintln!();
+    eprintln!("Press Enter to return to the picker…");
+    let mut buf = String::new();
+    let _ = std::io::stdin().read_line(&mut buf);
+}
+
+fn run_precache_then_pause(specifier: &str) {
+    let code = crate::datasets::precache::run(
+        specifier,
+        "~/.config/vectordata",
+        &[],
+        &[],
+        None,
+    );
+    if code != 0 {
+        eprintln!("(precache exited with status {code})");
+    }
+    pause_for_keypress();
+}
+
+fn run_purge_then_pause(specifier: &str) {
+    let (dataset, _profile) = split_specifier(specifier);
+    // Purge is per-dataset: every cache leaf whose origin URL belongs
+    // to ANY facet of ANY profile is removed. The profile component of
+    // the specifier is ignored on purpose — the runtime's cache is
+    // content-addressed by URL, not by profile, so per-profile purge
+    // can't actually exist without re-introducing the dataset-named
+    // layout we already moved away from.
+    let sources = crate::catalog::sources::CatalogSources::new().configure_default();
+    let catalog = crate::catalog::resolver::Catalog::of(&sources);
+    let entry = match catalog.datasets().iter().find(|e| e.name == dataset) {
+        Some(e) => e.clone(),
+        None => {
+            eprintln!("error: dataset '{dataset}' not found in any configured catalog");
+            pause_for_keypress();
+            return;
+        }
+    };
+    let cache_dir = crate::settings::cache_dir().unwrap_or_else(|e| {
+        eprintln!("error: cannot resolve cache_dir: {e}");
+        std::process::exit(1);
+    });
+    let (removed, freed) = dataset_picker::purge_cache_for_entry(&entry, &cache_dir);
+    if removed.is_empty() {
+        println!("No cached entries found for '{dataset}'.");
+    } else {
+        println!("Purged {} cache entr{} for '{dataset}' ({}):",
+            removed.len(),
+            if removed.len() == 1 { "y" } else { "ies" },
+            format_bytes_short(freed));
+        for path in &removed {
+            println!("  - {}", path.display());
         }
     }
+    pause_for_keypress();
+}
+
+fn format_bytes_short(n: u64) -> String {
+    const GIB: u64 = 1 << 30;
+    const MIB: u64 = 1 << 20;
+    const KIB: u64 = 1 << 10;
+    if n >= GIB { format!("{:.1} GiB", n as f64 / GIB as f64) }
+    else if n >= MIB { format!("{:.1} MiB", n as f64 / MIB as f64) }
+    else if n >= KIB { format!("{:.1} KiB", n as f64 / KIB as f64) }
+    else { format!("{n} B") }
+}
+
+fn run_ping_then_pause(specifier: &str) {
+    let (dataset, profile) = split_specifier(specifier);
+    // Use the same union catalog the picker built its row list from
+    // so a ping from inside the picker hits exactly the catalogs the
+    // user can see.
+    let sources = crate::catalog::sources::CatalogSources::new().configure_default();
+    let catalog = crate::catalog::resolver::Catalog::of(&sources);
+    let code = crate::datasets::ping::run_via_catalog(&catalog, dataset, profile);
+    if code != 0 {
+        eprintln!("(ping exited with status {code})");
+    }
+    pause_for_keypress();
 }
 
 // `run_pipeline_command` lived here as `#[allow(dead_code)]`

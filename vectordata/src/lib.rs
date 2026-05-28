@@ -128,6 +128,9 @@ pub mod model;
 /// Most users should access data through [`catalog`] → [`view::TestDataView`]
 /// rather than opening files directly with [`io::open_vec`].
 pub mod io;
+/// Access-mode taxonomy: how a source will be opened (local, merkle-
+/// hashed sparse remote, merkle-chunked sparse remote, or full-transfer).
+pub mod access;
 /// Parser for `knn_entries.yaml` (jvector-compatible dataset index).
 pub mod knn_entries;
 /// Schema descriptor for metadata slabs (the `:schema` sidecar).
@@ -175,6 +178,7 @@ pub use view::{
     open_facet_typed,
 };
 pub use io::{VectorReader, VvecReader, XvecReader, IndexedVvecReader, IoError};
+pub use access::AccessMode;
 pub use typed_access::{ElementType, TypedAccessError, TypedReader};
 /// Re-exported so external callers of
 /// [`FacetStorage::prebuffer_with_progress`] can name the

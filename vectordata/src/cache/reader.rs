@@ -161,7 +161,6 @@ pub(crate) fn write_origin(dir: &Path, url: &Url) -> io::Result<()> {
 
 /// Read an origin sidecar. Returns `None` on absent / malformed file —
 /// origin metadata is advisory, never load-bearing.
-#[allow(dead_code)] // Used by the (forthcoming) `vectordata cache list` admin command.
 pub(crate) fn read_origin(dir: &Path) -> Option<Origin> {
     let path = dir.join(ORIGIN_FILE);
     let content = fs::read_to_string(&path).ok()?;

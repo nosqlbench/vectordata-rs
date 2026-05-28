@@ -109,7 +109,7 @@ and predicate trees.
 ```bash
 veks datasets config add-catalog https://example.com/datasets/
 veks datasets list
-veks datasets probe --dataset myset
+veks datasets ping --dataset myset
 ```
 
 ### Download

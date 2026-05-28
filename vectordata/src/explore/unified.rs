@@ -256,7 +256,6 @@ struct DistBatch {
 
 /// Phase 3: eigenvalue result.
 struct EigenMsg {
-    ki: usize,
     eigenvalue: f64,
     eigenvector: Vec<f64>,
     elapsed_ms: f64,
@@ -325,7 +324,7 @@ pub(super) fn run_interactive_explore(
     let dim = reader.dim();
 
     if total == 0 || dim == 0 {
-        eprintln!("Error: no vector data found in '{}' (count={}, dim={})", source, total, dim);
+        eprintln!("error: no vector data found in '{}' (count={}, dim={})", source, total, dim);
         eprintln!("  This may mean the profile doesn't have base_vectors, or the data isn't cached yet.");
         eprintln!("  Try: veks datasets precache --dataset {} --profile {}",
             source.split(':').next().unwrap_or(source),
@@ -350,11 +349,11 @@ pub(super) fn run_interactive_explore(
     install_abort_handler(abort_flag.clone());
 
     if let Err(e) = enable_raw_mode() {
-        eprintln!("Error: {}", e); std::process::exit(1);
+        eprintln!("error: {}", e); std::process::exit(1);
     }
     let mut stdout = std::io::stdout();
     if let Err(e) = execute!(stdout, EnterAlternateScreen) {
-        let _ = disable_raw_mode(); eprintln!("Error: {}", e); std::process::exit(1);
+        let _ = disable_raw_mode(); eprintln!("error: {}", e); std::process::exit(1);
     }
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).unwrap();
@@ -415,7 +414,6 @@ pub(super) fn run_interactive_explore(
     let mut frame_count: usize = 0;
     let mut restart;
     let mut exit_reason = ExploreExit::Quit;
-    let mut last_esc: Option<std::time::Instant> = None;
     // read_rx lives across restarts — reassigned each iteration
     let mut read_rx: mpsc::Receiver<ReadBatch>;
 
@@ -659,7 +657,7 @@ pub(super) fn run_interactive_explore(
                                     let eigenvalue = ev_sum / actual_n as f64;
                                     let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
                                     evecs.push(v.clone());
-                                    if etx.send(EigenMsg { ki, eigenvalue, eigenvector: v, elapsed_ms }).is_err() {
+                                    if etx.send(EigenMsg { eigenvalue, eigenvector: v, elapsed_ms }).is_err() {
                                         break; // receiver dropped
                                     }
                                     ki += 1;
@@ -935,8 +933,9 @@ pub(super) fn run_interactive_explore(
                     Line::from("   Space                           Double sample size"),
                     Line::from("   + / =                           Increase sample by 50%"),
                     Line::from("   r                               Reset sample size + rotations"),
-                    Line::from("   Esc                             Stop processing / quit"),
-                    Line::from("   q / Ctrl-C                      Quit"),
+                    Line::from("   Esc (while loading)             Stop in-flight processing"),
+                    Line::from("   Esc (when idle)                 Return to the dataset picker"),
+                    Line::from("   q / Ctrl-C                      Quit immediately (no picker)"),
                 ];
                 // View-specific keys
                 let view_keys: Vec<Line> = match view_mode {
@@ -1025,7 +1024,9 @@ pub(super) fn run_interactive_explore(
                 .map(|(i, n)| if i == view_mode { format!("[{}]", n) } else { n.to_string() })
                 .collect::<Vec<_>>().join(" ");
             frame.render_widget(Paragraph::new(Span::styled(
-                format!(" {} | Tab/PgDn/PgUp | /: info | ?: help | q quit", vi),
+                format!(" {} | Tab/PgDn/PgUp | /: info | ?: help | {} | q: quit",
+                    vi,
+                    if all_done { "Esc: back to picker" } else { "Esc: stop loading" }),
                 Style::default().fg(Color::DarkGray))), chunks[3]);
 
             // View-specific controls line
@@ -1066,7 +1067,13 @@ pub(super) fn run_interactive_explore(
                         }
                         KeyCode::Esc => {
                             if !all_done {
-                                // First Esc: stop processing
+                                // Mid-load Esc: cancel every in-flight
+                                // phase. Subsequent Esc (now that
+                                // `all_done` is true) backs out to the
+                                // picker — same key, just whichever
+                                // action makes sense in the current
+                                // state. The footer reflects the
+                                // pending action live.
                                 phase1_done = true;
                                 phase2_done = true;
                                 phase3_done = true;
@@ -1074,17 +1081,9 @@ pub(super) fn run_interactive_explore(
                                 dist_rx = None;
                                 eigen_rx = None;
                                 proj_rx = None;
-                                last_esc = None;
                             } else {
-                                // Double-tap Esc to exit
-                                let now = std::time::Instant::now();
-                                if let Some(prev) = last_esc {
-                                    if now.duration_since(prev).as_millis() < 500 {
-                                        exit_reason = ExploreExit::Back;
-                                        break;
-                                    }
-                                }
-                                last_esc = Some(now);
+                                exit_reason = ExploreExit::Back;
+                                break;
                             }
                         }
                         KeyCode::Char('?') => { show_help = !show_help; show_info = false; }
@@ -1312,26 +1311,6 @@ fn render_presorted_curve(
         .step_by(step)
         .map(|(i, &v)| (i as f64 / n as f64, v))
         .collect();
-    let pad = (sorted[n-1] - sorted[0]).max(0.01) * 0.05;
-    let canvas = Canvas::default()
-        .block(Block::default().borders(Borders::ALL).title(title))
-        .x_bounds([0.0, 1.0]).y_bounds([sorted[0] - pad, sorted[n-1] + pad])
-        .paint(move |ctx| { ctx.draw(&Points { coords: &pts, color }); });
-    frame.render_widget(canvas, area);
-}
-
-fn render_sorted_curve(
-    frame: &mut ratatui::Frame, area: ratatui::layout::Rect,
-    values: &[f64], title: &str, color: Color,
-) {
-    if values.len() < 2 {
-        frame.render_widget(Block::default().borders(Borders::ALL).title(title), area);
-        return;
-    }
-    let mut sorted = values.to_vec();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let n = sorted.len();
-    let pts: Vec<(f64, f64)> = sorted.iter().enumerate().map(|(i, &v)| (i as f64 / n as f64, v)).collect();
     let pad = (sorted[n-1] - sorted[0]).max(0.01) * 0.05;
     let canvas = Canvas::default()
         .block(Block::default().borders(Borders::ALL).title(title))

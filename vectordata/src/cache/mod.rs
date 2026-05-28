@@ -27,8 +27,26 @@ use crate::transport::{
     ChunkRequest, ChunkedTransport, DownloadProgress, RetryPolicy,
 };
 
-/// Default concurrency for parallel chunk downloads.
-const DEFAULT_CONCURRENCY: usize = 8;
+/// Default concurrency for parallel chunk downloads. 16 lands well
+/// short of NIC saturation on typical desktop / cloud VM links but
+/// keeps every meaningful S3 / CloudFront origin busy: each TCP
+/// connection caps around 100-300 MB/s; 16 streams sustain >1 GB/s
+/// from a single bucket. Tunable via the `VECTORDATA_DOWNLOAD_CONCURRENCY`
+/// env var for sites running on 25 / 100 Gbps links where pushing
+/// concurrency to 64-128 is worthwhile.
+const DEFAULT_CONCURRENCY: usize = 16;
+
+/// Read the configured parallel-chunk-download worker count. Both
+/// `Storage::Cached` (mref-backed) and `Storage::Http` (chunked-only)
+/// route through this so a single env knob tunes both paths
+/// identically. Floor of 1 — `n=0` would deadlock the queue-pull loop.
+pub(crate) fn download_concurrency() -> usize {
+    std::env::var("VECTORDATA_DOWNLOAD_CONCURRENCY")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_CONCURRENCY)
+}
 
 /// Thread-safe positional file I/O for the cache file.
 ///
@@ -244,7 +262,7 @@ impl CachedChannel {
             transport,
             reference,
             retry_policy: RetryPolicy::default(),
-            concurrency: DEFAULT_CONCURRENCY,
+            concurrency: download_concurrency(),
             in_flight: Mutex::new(HashMap::new()),
         })
     }
@@ -411,84 +429,101 @@ impl CachedChannel {
         let abort = AtomicBool::new(false);
         let (tx, rx) = mpsc::channel::<io::Result<()>>();
 
-        let result: io::Result<()> = std::thread::scope(|scope| {
-            // Worker pool, bounded by `self.concurrency`.
-            let semaphore = std::sync::Arc::new(
-                crate::transport::semaphore::Semaphore::new(self.concurrency));
+        // Fixed-size worker pool. The previous implementation spawned
+        // *one OS thread per ChunkRequest* and gated them through a
+        // semaphore — fine for a few thousand chunks, but a 1.3 TiB
+        // file at 8 MiB chunks is ~170 000 chunks, and pthread_create
+        // refuses the spawn well before that (RLIMIT_NPROC, and each
+        // thread's reserved stack would also exhaust virtual memory).
+        // Workers now pull from a shared `Mutex<Vec<ChunkRequest>>`
+        // queue, so the OS thread count equals `self.concurrency`
+        // regardless of how many chunks are pending.
+        let queue: std::sync::Mutex<Vec<ChunkRequest>> =
+            std::sync::Mutex::new(requests.iter().rev().copied().collect());
 
-            for req in requests {
-                if abort.load(Ordering::Relaxed) {
-                    // Account for this request anyway so the
-                    // receive loop terminates.
-                    let _ = tx.send(Ok(()));
-                    continue;
-                }
-                let req = *req;
-                let permit = semaphore.clone();
+        let result: io::Result<()> = std::thread::scope(|scope| {
+            for _ in 0..self.concurrency.max(1) {
                 let abort = &abort;
                 let progress = &*progress;
                 let this = self;
                 let tx = tx.clone();
+                let queue = &queue;
 
                 scope.spawn(move || {
-                    let result = (|| -> io::Result<()> {
-                        let _permit = permit.acquire();
+                    loop {
+                        // Pull the next pending request. `pop` from
+                        // the back gives the front of the requests
+                        // slice because the queue was reversed at
+                        // construction — keeps chunk-ordering close
+                        // to the original sequential walk.
+                        let req = match queue.lock().unwrap().pop() {
+                            Some(r) => r,
+                            None => break,
+                        };
+
                         if abort.load(Ordering::Relaxed) {
-                            return Ok(());
+                            // Still report so the main loop's
+                            // done-counter can terminate.
+                            let _ = tx.send(Ok(()));
+                            continue;
                         }
 
-                        // ── 1. Fetch (with retry) ──────────────
-                        let data = match this.retry_policy.execute(|| {
-                            this.transport.fetch_range(req.start, req.len)
-                        }) {
-                            Ok(d) => d,
-                            Err(e) => {
+                        let work = (|| -> io::Result<()> {
+                            // ── 1. Fetch (with retry) ──────────
+                            let data = match this.retry_policy.execute(|| {
+                                this.transport.fetch_range(req.start, req.len)
+                            }) {
+                                Ok(d) => d,
+                                Err(e) => {
+                                    abort.store(true, Ordering::Relaxed);
+                                    progress.mark_failed();
+                                    this.drop_in_flight(req.index);
+                                    return Err(e);
+                                }
+                            };
+
+                            // ── 2. Verify (SHA-256 vs merkle ref) ──
+                            if !this.reference.verify_chunk(req.index, &data) {
                                 abort.store(true, Ordering::Relaxed);
                                 progress.mark_failed();
                                 this.drop_in_flight(req.index);
-                                return Err(e);
+                                return Err(io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    format!("chunk {} failed integrity verification \
+                                             (SHA-256 mismatch)", req.index)));
                             }
-                        };
 
-                        // ── 2. Verify (SHA-256 vs merkle ref) ──
-                        if !this.reference.verify_chunk(req.index, &data) {
-                            abort.store(true, Ordering::Relaxed);
-                            progress.mark_failed();
+                            // ── 3. Write to cache file ─────────
+                            // Positional write — on Unix this is a
+                            // lock-free `pwrite(2)`, so workers
+                            // don't serialize through a
+                            // `Mutex<File>`. On Windows the
+                            // wrapper takes a brief lock (no
+                            // public OVERLAPPED-based API in std).
+                            this.cache_file.write_all_at(&data, req.start)?;
+
+                            // ── 4. Mark valid in state bitmap ──
+                            // Lock-free: `MerkleState::mark_valid`
+                            // does an atomic fetch_or on the
+                            // bitmap word. Save is throttled on
+                            // the main thread.
+                            this.state.mark_valid(req.index);
+
+                            progress.add_downloaded_bytes(data.len() as u64);
+                            progress.increment_completed();
+
+                            // ── 5. Notify in-flight waiters ────
                             this.drop_in_flight(req.index);
-                            return Err(io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                format!("chunk {} failed integrity verification \
-                                         (SHA-256 mismatch)", req.index)));
-                        }
-
-                        // ── 3. Write to cache file ─────────────
-                        // Positional write — on Unix this is a
-                        // lock-free `pwrite(2)`, so workers don't
-                        // serialize through a `Mutex<File>`. On
-                        // Windows the wrapper takes a brief lock
-                        // (no public OVERLAPPED-based API in std).
-                        this.cache_file.write_all_at(&data, req.start)?;
-
-                        // ── 4. Mark valid in state bitmap ──────
-                        // Lock-free: `MerkleState::mark_valid` does
-                        // an atomic fetch_or on the bitmap word.
-                        // Save is throttled on the main thread.
-                        this.state.mark_valid(req.index);
-
-                        progress.add_downloaded_bytes(data.len() as u64);
-                        progress.increment_completed();
-
-                        // ── 5. Notify in-flight waiters ────────
-                        this.drop_in_flight(req.index);
-                        Ok(())
-                    })();
-                    let _ = tx.send(result);
+                            Ok(())
+                        })();
+                        let _ = tx.send(work);
+                    }
                 });
             }
 
-            // Drop the spawner's tx so the channel closes once
-            // every worker drops their clone — guards against
-            // hanging if `done` undercounts due to a panic.
+            // Drop the spawner's tx so the channel closes once every
+            // worker drops their clone — guards against hanging if
+            // `done` undercounts due to a panic.
             drop(tx);
 
             // Main thread: collect chunk-completion events, fire

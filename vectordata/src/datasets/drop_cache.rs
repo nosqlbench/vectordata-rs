@@ -56,7 +56,7 @@ pub fn run(
                 }
             }
             if !found {
-                eprintln!("Warning: no cached dataset matches '{}'", pattern);
+                eprintln!("warning: no cached dataset matches '{}'", pattern);
             }
         }
         matched

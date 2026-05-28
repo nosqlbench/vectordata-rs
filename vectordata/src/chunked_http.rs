@@ -224,43 +224,106 @@ impl ChunkStore {
     /// Download every missing chunk, firing the callback after
     /// each chunk completes so callers can render in-flight
     /// progress. Idempotent — chunks already valid are skipped.
+    ///
+    /// Worker pool sized via [`crate::cache::download_concurrency`]
+    /// so both the mref-backed `CachedChannel` and this no-mref
+    /// path scale identically under one env knob. Workers pull
+    /// chunk indices from a shared `Mutex<Vec<u32>>` queue and
+    /// route each fetch through [`Self::fetch_chunk_with_dedup`],
+    /// so concurrent partial-read traffic against the same store
+    /// continues to dedup correctly with the prebuffer loop —
+    /// the prebuffer queue only contains chunks currently not
+    /// `Acquire`-valid, but if a concurrent partial-read worker
+    /// fetches one of those chunks first, the queue's worker
+    /// observes it as valid and skips re-fetching.
     pub(crate) fn prebuffer_with_progress<F>(&self, mut cb: F) -> io::Result<()>
     where F: FnMut(&DownloadProgress)
     {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::mpsc;
+
+        const PROGRESS_TICK: std::time::Duration =
+            std::time::Duration::from_millis(250);
+
         let progress = DownloadProgress::new(self.total_size, self.total_chunks);
-        // Account for any chunks already valid from a prior run.
         let mut already_valid: u64 = 0;
+        let mut pending: Vec<u32> = Vec::new();
         for i in 0..self.total_chunks {
             if self.chunk_state[i as usize].load(Ordering::Acquire) != 0 {
                 already_valid += self.chunk_len(i);
                 progress.increment_completed();
+            } else {
+                pending.push(i);
             }
         }
         progress.add_downloaded_bytes(already_valid);
         cb(&progress);
+        if pending.is_empty() { return Ok(()); }
 
-        if self.is_complete() { return Ok(()); }
+        // Reverse the queue so `pop()` yields the lowest chunk
+        // index first — keeps the on-the-wire order close to the
+        // sequential walk, which S3 / CloudFront read-ahead
+        // heuristics prefer.
+        pending.reverse();
+        let queue: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(pending);
+        let abort = AtomicBool::new(false);
+        let (tx, rx) = mpsc::channel::<io::Result<u64>>();
+        let total_pending = self.total_chunks - progress.completed_chunks() as u32;
 
-        // Walk chunks sequentially. Doing the full file in one
-        // pass keeps the implementation simple — parallel
-        // multi-chunk downloads would mirror
-        // `CachedChannel::parallel_fetch_verify_write` but the
-        // marginal latency win isn't worth the extra concurrency
-        // complexity for the typical "open then read" flow.
-        // Concurrent partial-read paths still share this
-        // store's `in_flight` dedup map, so a partial-read
-        // worker fetching chunk K and this prebuffer loop
-        // reaching chunk K observe each other and dedup
-        // correctly.
-        for i in 0..self.total_chunks {
-            if self.chunk_state[i as usize].load(Ordering::Acquire) != 0 { continue; }
-            let len = self.chunk_len(i);
-            self.fetch_chunk_with_dedup(i)?;
-            progress.add_downloaded_bytes(len);
-            progress.increment_completed();
+        let result: io::Result<()> = std::thread::scope(|scope| {
+            let workers = crate::cache::download_concurrency().max(1);
+            for _ in 0..workers {
+                let abort = &abort;
+                let queue = &queue;
+                let progress = &progress;
+                let this = self;
+                let tx = tx.clone();
+                scope.spawn(move || {
+                    loop {
+                        let idx = match queue.lock().unwrap().pop() {
+                            Some(i) => i,
+                            None => break,
+                        };
+                        if abort.load(Ordering::Relaxed) {
+                            let _ = tx.send(Ok(0));
+                            continue;
+                        }
+                        let len = this.chunk_len(idx);
+                        match this.fetch_chunk_with_dedup(idx) {
+                            Ok(()) => {
+                                progress.add_downloaded_bytes(len);
+                                progress.increment_completed();
+                                let _ = tx.send(Ok(len));
+                            }
+                            Err(e) => {
+                                abort.store(true, Ordering::Relaxed);
+                                progress.mark_failed();
+                                let _ = tx.send(Err(e));
+                            }
+                        }
+                    }
+                });
+            }
+            drop(tx);
+
+            let mut first_err: io::Result<()> = Ok(());
+            let mut done: u32 = 0;
+            while done < total_pending {
+                match rx.recv_timeout(PROGRESS_TICK) {
+                    Ok(Ok(_)) => { done += 1; cb(&progress); }
+                    Ok(Err(e)) => {
+                        done += 1;
+                        if first_err.is_ok() { first_err = Err(e); }
+                        cb(&progress);
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => cb(&progress),
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            }
             cb(&progress);
-        }
-        Ok(())
+            first_err
+        });
+        result
     }
 
     /// Ensure chunks `[first..=last]` are valid. Mirrors

@@ -124,7 +124,7 @@ pub struct ListArgs {
 /// run_args(args);
 /// ```
 #[cfg(feature = "cli")]
-pub fn run_args(args: ListArgs) {
+pub fn run_args(args: ListArgs) -> i32 {
     let name_filter = args.dataset.or(args.matching_name);
     let name = name_filter.map(|p| filter::normalize_match_pattern(&p, "--dataset"));
     let desc = args.matching_desc.map(|p| filter::normalize_match_pattern(&p, "--matching-desc"));
@@ -158,14 +158,14 @@ pub fn run_args(args: ListArgs) {
         &f,
         &view,
         args.select.as_deref(),
-    );
+    )
 }
 
 #[cfg(feature = "cli")]
 fn parse_size_opt(raw: Option<&str>, label: &str) -> Option<u64> {
     raw.map(|s| {
         filter::parse_size(s).unwrap_or_else(|e| {
-            eprintln!("ERROR: {label}: {e}");
+            eprintln!("error: {label}: {e}");
             std::process::exit(1);
         })
     })
@@ -175,7 +175,7 @@ fn parse_size_opt(raw: Option<&str>, label: &str) -> Option<u64> {
 fn parse_bytes_opt(raw: Option<&str>, label: &str) -> Option<u64> {
     raw.map(|s| {
         filter::parse_bytes(s).unwrap_or_else(|e| {
-            eprintln!("ERROR: {label}: {e}");
+            eprintln!("error: {label}: {e}");
             std::process::exit(1);
         })
     })
@@ -204,26 +204,34 @@ pub fn run(
     filter: &DatasetFilter,
     profile_view: &ProfileView,
     select: Option<&str>,
-) {
+) -> i32 {
     let sources = build_sources(configdir, extra_catalogs, at);
 
     if sources.is_empty() {
-        eprintln!("No catalog sources configured.");
+        eprintln!("error: no catalog sources configured");
+        eprintln!();
         eprintln!("Add a catalog with:");
-        eprintln!("  veks datasets config add-catalog <URL-or-path>");
+        eprintln!("  vectordata config add-catalog <URL-or-path>");
         eprintln!();
         eprintln!("Or use --catalog/--at for one-off access.");
-        std::process::exit(1);
+        return 1;
     }
 
     let catalog = Catalog::of(&sources);
 
     if catalog.is_empty() {
-        eprintln!("No datasets found in any configured catalog.");
-        if select.is_some() {
-            std::process::exit(1);
+        eprintln!("error: no datasets found in any configured catalog");
+        // Treat as a failure when the user explicitly pointed at
+        // something (`--at`/`--catalog`) — most likely cause is a bad
+        // URL or unreadable file. Also a failure when `--select` is
+        // set, since that asks for a specific entry we couldn't
+        // produce. Otherwise it's an empty informational result and
+        // exits clean.
+        let user_pinned_source = !at.is_empty() || !extra_catalogs.is_empty();
+        if user_pinned_source || select.is_some() {
+            return 1;
         }
-        return;
+        return 0;
     }
 
     // Apply filters
@@ -235,31 +243,36 @@ pub fn run(
 
     if filtered.is_empty() {
         if filter.is_empty() {
-            eprintln!("No datasets found in any configured catalog.");
+            eprintln!("error: no datasets found in any configured catalog");
         } else {
-            eprintln!("No datasets match the specified filters.");
+            eprintln!("error: no datasets match the specified filters");
             eprintln!(
-                "({} dataset(s) available before filtering)",
+                "  ({} dataset(s) available before filtering)",
                 catalog.datasets().len()
             );
         }
-        if select.is_some() {
-            std::process::exit(1);
+        // `--select` asks for one specific entry — empty result is
+        // always a failure. Otherwise informational (exit 0) unless
+        // the user supplied filters, in which case "no matches" is a
+        // user-error result (exit 1).
+        if select.is_some() || !filter.is_empty() {
+            return 1;
         }
-        return;
+        return 0;
     }
 
     if select.is_some() {
         output_select(&filtered, profile_view, select.unwrap());
-        return;
+        return 0;
     }
 
     match format {
         "json" => output_json(&filtered, verbose, profile_view),
         "yaml" => output_yaml(&filtered, verbose, profile_view),
-        "csv" => output_csv(&filtered, verbose, profile_view),
-        _ => output_text(&filtered, verbose, group_by, profile_view),
+        "csv"  => output_csv(&filtered, verbose, profile_view),
+        _      => output_text(&filtered, verbose, group_by, profile_view),
     }
+    0
 }
 
 /// Handle `--select`: succeed with exactly one dataset:profile, fail if
@@ -501,7 +514,7 @@ fn output_text_grouped(entries: &[&CatalogEntry], verbose: bool, key: &str, pv: 
                 continue;
             }
             other => {
-                eprintln!("Error: unknown --group-by key '{}'. Use: source, profile, metric", other);
+                eprintln!("error: unknown --group-by key '{}'. Use: source, profile, metric", other);
                 std::process::exit(1);
             }
         };

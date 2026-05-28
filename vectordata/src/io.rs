@@ -150,7 +150,7 @@ pub trait VvecReader<T: VvecElement>: Send + Sync {
 // ═══════════════════════════════════════════════════════════════════════
 
 /// Infer element size from an extension string (0 = unknown).
-fn infer_elem_size(ext: &str) -> usize {
+pub(crate) fn infer_elem_size(ext: &str) -> usize {
     match ext.to_lowercase().as_str() {
         // 4-byte
         "fvec" | "fvecs" | "f32vec" | "f32vecs" | "ivec" | "ivecs" | "i32vec" | "i32vecs"
@@ -176,7 +176,7 @@ fn infer_elem_size(ext: &str) -> usize {
 }
 
 /// Whether the extension implies a variable-length record file.
-fn is_vvec_ext(ext: &str) -> bool {
+pub(crate) fn is_vvec_ext(ext: &str) -> bool {
     let e = ext.to_lowercase();
     e.contains("vvec") || e == "ivec" || e == "ivecs"
 }
@@ -193,7 +193,7 @@ fn validate_element_for_source(source: &str) -> Result<(), IoError> {
     Ok(())
 }
 
-fn ext_of(source: &str) -> &str {
+pub(crate) fn ext_of(source: &str) -> &str {
     let name = source.rsplit('/').next().unwrap_or(source);
     name.rsplit('.').next().unwrap_or("")
 }

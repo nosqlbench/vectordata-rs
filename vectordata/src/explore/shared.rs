@@ -23,24 +23,6 @@ pub enum SampleMode {
     Sparse,
 }
 
-/// Display a path relative to the current working directory when
-/// it's a child of it, falling back to the absolute form otherwise.
-/// Mirrors the helper previously imported from `veks::check`; kept
-/// private to explore to avoid pulling another module into the
-/// public surface.
-fn rel_display(path: &std::path::Path) -> String {
-    if let Ok(cwd) = std::env::current_dir() {
-        path.strip_prefix(&cwd)
-            .map(|r| {
-                let s = r.to_string_lossy().to_string();
-                if s.is_empty() { ".".to_string() } else { s }
-            })
-            .unwrap_or_else(|_| path.to_string_lossy().to_string())
-    } else {
-        path.to_string_lossy().to_string()
-    }
-}
-
 /// Parse a `SampleMode` from a CLI string.
 pub(crate) fn parse_sample_mode(s: &str) -> Result<SampleMode, String> {
     match s.to_lowercase().as_str() {
@@ -51,9 +33,25 @@ pub(crate) fn parse_sample_mode(s: &str) -> Result<SampleMode, String> {
     }
 }
 
-/// Resolve a `dataset[:profile]` specifier through the catalog and
-/// return the canonical [`TestDataView`].
+/// Resolve a non-local source — either a `dataset[:profile]` catalog
+/// specifier or a remote URL pointing at a dataset directory — and
+/// return the canonical [`TestDataView`]. URL sources use the default
+/// profile (URLs don't carry a `:profile` suffix because the colon is
+/// reserved for the scheme separator).
 pub(super) fn open_dataset_view(source: &str) -> std::sync::Arc<dyn crate::TestDataView> {
+    if crate::transport::is_remote_url(source) {
+        let group = crate::TestDataGroup::load(source).unwrap_or_else(|e| {
+            eprintln!("error: failed to load {source}: {e}");
+            std::process::exit(1);
+        });
+        return group.profile("default").unwrap_or_else(|| {
+            eprintln!(
+                "error: profile 'default' not found at {source}. Available: {}",
+                group.profile_names().join(", "),
+            );
+            std::process::exit(1);
+        });
+    }
     let (name, profile) = match source.find(':') {
         Some(pos) => (&source[..pos], &source[pos + 1..]),
         None => (source, "default"),
@@ -61,15 +59,21 @@ pub(super) fn open_dataset_view(source: &str) -> std::sync::Arc<dyn crate::TestD
     let sources = crate::catalog::sources::CatalogSources::new().configure_default();
     let catalog = crate::catalog::resolver::Catalog::of(&sources);
     catalog.open_profile(name, profile).unwrap_or_else(|e| {
-        eprintln!("Error: {e}");
+        eprintln!("error: {e}");
         std::process::exit(1);
     })
 }
 
-/// Check if a source specifier refers to a local file.
+/// Check if a source specifier refers to a local file. Remote URLs
+/// (`http://`, `https://`, `s3://`) and bare catalog specs
+/// (`dataset[:profile]`) both classify as non-local — only paths
+/// (either existing on disk, prefixed with a directory separator, or
+/// using a `file://` scheme) are treated as local.
 pub(super) fn is_local_source(source: &str) -> bool {
-    let as_path = std::path::Path::new(source);
-    as_path.exists() || source.contains('/') || source.contains('.')
+    if crate::transport::is_remote_url(source) { return false; }
+    if source.starts_with("file://") { return true; }
+    if source.contains('/') { return true; }
+    std::path::Path::new(source).exists()
 }
 
 /// Unified data reader that wraps both local (AnyVectorReader) and
@@ -94,20 +98,8 @@ impl UnifiedReader {
     pub(super) fn dim(&self) -> usize {
         match self { UnifiedReader::Local(r) => r.dim(), UnifiedReader::Remote(r) => r.dim() }
     }
-    pub(super) fn get_f64(&self, index: usize) -> Option<Vec<f64>> {
-        match self { UnifiedReader::Local(r) => r.get_f64(index), UnifiedReader::Remote(r) => r.get_f64(index) }
-    }
     pub(super) fn get_f32(&self, index: usize) -> Option<Vec<f32>> {
         match self { UnifiedReader::Local(r) => r.get_f32(index), UnifiedReader::Remote(r) => r.get_f32(index) }
-    }
-    /// Batched range read; lets remote-backed views satisfy the whole
-    /// visible window of the values grid in a single HTTP-fetch round
-    /// instead of `count` serialized round trips.
-    pub(super) fn get_f64_range(&self, start: usize, count: usize) -> Vec<Option<Vec<f64>>> {
-        match self {
-            UnifiedReader::Local(r)  => r.get_f64_range(start, count),
-            UnifiedReader::Remote(r) => r.get_f64_range(start, count),
-        }
     }
     pub(super) fn get_f32_range(&self, start: usize, count: usize) -> Vec<Option<Vec<f32>>> {
         match self {
@@ -126,235 +118,24 @@ impl UnifiedReader {
     }
 }
 
-/// Resolve a source specifier to a local file path.
+/// Resolve a *local* source specifier to a filesystem path.
 ///
-/// Routes through the canonical vectordata API for every source
-/// shape — local file path, `dataset[:profile[:facet]]` catalog
-/// reference, or HTTP URL — so the cache layout is the same one
-/// any other vectordata caller would use. No ad-hoc copying, no
-/// alternate flat-cache layout, no manual download.
-///
-/// For catalog and URL specs, this drives the underlying storage
-/// to fully-resident state via `FacetStorage::precache()` and then
-/// returns the local file path the cache landed in. Local-file
-/// inputs are returned unchanged.
+/// Only meant to be called when [`is_local_source`] returns true.
+/// Remote sources (URL, catalog spec) bypass this helper entirely
+/// and route through [`AnyDatasetReader::from_source`], which opens
+/// them in sparse mode (chunked HTTP cache) without writing a
+/// fully-materialised local file. The picker's Precache action is
+/// the explicit channel for triggering a full download.
 pub(super) fn resolve_source(source: &str) -> PathBuf {
-    // Plain local path — return as-is.
-    let as_path = std::path::Path::new(source);
-    if as_path.exists() {
-        return as_path.to_path_buf();
+    if let Some(rest) = source.strip_prefix("file://") {
+        return PathBuf::from(rest);
     }
-
-    // URL or path-shaped string that doesn't exist on disk — error.
-    // Catalog references contain neither '/' nor '.'.
-    if (source.contains('/') || source.contains('.'))
-        && !source.starts_with("http://")
-        && !source.starts_with("https://")
-    {
-        eprintln!("Error: file not found: {source}");
-        std::process::exit(1);
+    let p = std::path::Path::new(source);
+    if p.exists() {
+        return p.to_path_buf();
     }
-
-    // Parse as dataset[:profile[:facet]] (catalog ref) or treat as
-    // a remote URL pointing at a dataset directory.
-    let (dataset_name, profile_name, facet_name) = if source.starts_with("http://")
-        || source.starts_with("https://")
-    {
-        // URL — use it as the group path; default profile & base_vectors facet.
-        return resolve_via_view(source, "default", "base_vectors");
-    } else {
-        let parts: Vec<&str> = source.split(':').collect();
-        match parts.len() {
-            1 => (parts[0], "default", "base_vectors"),
-            2 => (parts[0], parts[1], "base_vectors"),
-            3 => (parts[0], parts[1], parts[2]),
-            _ => {
-                eprintln!("Error: invalid source specifier '{source}'. Use dataset:profile[:facet]");
-                std::process::exit(1);
-            }
-        }
-    };
-
-    // Catalog lookup.
-    let sources = crate::catalog::sources::CatalogSources::new().configure_default();
-    if sources.is_empty() {
-        eprintln!("Error: '{source}' is not a local file and no catalogs are configured.");
-        eprintln!("Create ~/.config/vectordata/catalogs.yaml or use a local file path.");
-        std::process::exit(1);
-    }
-    let catalog = crate::catalog::resolver::Catalog::of(&sources);
-    let entry = match catalog.find_exact(dataset_name) {
-        Some(e) => e,
-        None => {
-            eprintln!("Error: dataset '{dataset_name}' not found in catalog.");
-            catalog.list_datasets(dataset_name);
-            std::process::exit(1);
-        }
-    };
-    // Open through the catalog: for `knn_entries.yaml`-shape
-    // entries this synthesizes the group from the embedded layout
-    // (no second dataset.yaml fetch); for canonical entries it
-    // re-loads via `entry.path`. Either way the explore path
-    // doesn't have to know the discriminator.
-    let group = match catalog.open(dataset_name) {
-        Ok(g) => g,
-        Err(e) => {
-            eprintln!("Error: failed to open {dataset_name}: {e}");
-            std::process::exit(1);
-        }
-    };
-    resolve_via_view_group(group, &entry.path, profile_name, facet_name)
-}
-
-/// Open the dataset at `group_path` (URL or local path), find the
-/// named facet on the named profile, precache it through the
-/// canonical storage layer, and return the local file path the
-/// bytes landed in.
-fn resolve_via_view(group_path: &str, profile_name: &str, facet_name: &str) -> PathBuf {
-    let group = match crate::TestDataGroup::load(group_path) {
-        Ok(g) => g,
-        Err(e) => {
-            eprintln!("Error: failed to open {group_path}: {e}");
-            std::process::exit(1);
-        }
-    };
-    resolve_via_view_group(group, group_path, profile_name, facet_name)
-}
-
-/// Shared post-open path: pick the profile, open the named facet
-/// via the canonical storage layer, precache, and return the
-/// resolved file path. Used by both raw-URL/path opens and
-/// catalog-resolved opens — the two only differ in how they
-/// obtain the [`TestDataGroup`].
-fn resolve_via_view_group(group: crate::TestDataGroup, group_path: &str, profile_name: &str, facet_name: &str) -> PathBuf {
-    let view = match group.profile(profile_name) {
-        Some(v) => v,
-        None => {
-            eprintln!("Error: profile '{profile_name}' not found at {group_path}. Available: {}",
-                group.profile_names().join(", "));
-            std::process::exit(1);
-        }
-    };
-    let storage = match view.open_facet_storage(facet_name) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("Error: facet '{facet_name}' not available: {e}");
-            std::process::exit(1);
-        }
-    };
-
-    // Drive cache to fully-resident; no-op for local mmap. Failure
-    // surfaces directly because there is no fallback to a separate
-    // cache layout — the canonical Storage::Cached layout is the
-    // only place data lands. Use the progress callback so the user
-    // sees a live meter on stderr instead of a static spinner
-    // while large facets stream in.
-    if !storage.is_local() {
-        eprintln!("Fetching {facet_name}…");
-    }
-    let mut meter = PrecacheMeter::new();
-    let cb = |p: &crate::DownloadProgress| meter.tick(p);
-    if let Err(e) = storage.prebuffer_with_progress(cb) {
-        eprintln!("\nError: precache failed for {facet_name}: {e}");
-        std::process::exit(1);
-    }
-    meter.finish();
-
-    if let Some(local) = storage.cache_path() {
-        // Cached-remote: report under the configured cache root.
-        eprintln!("Using cached: {}", rel_display(&local));
-        return local;
-    }
-    // Non-cached storage: must be a local file. Read the resolved
-    // source path back from the view.
-    if let Some(src) = view.facet_source(facet_name) {
-        let p = std::path::PathBuf::from(&src);
-        if p.exists() {
-            return p;
-        }
-        eprintln!("Error: facet '{facet_name}' resolved to {src} but the file does not exist.");
-    } else {
-        eprintln!("Error: facet '{facet_name}' has no resolvable source.");
-    }
+    eprintln!("error: file not found: {source}");
     std::process::exit(1);
-}
-
-/// Get the configured vectordata cache directory from settings.yaml.
-pub(super) fn dirs_cache_dir() -> PathBuf {
-    crate::explore::cache_dir_or_exit()
-}
-
-/// In-place stderr meter for facet precache. Renders bytes /
-/// total + percent + throughput on a single line at ~4 Hz; calls
-/// to [`Self::tick`] arrive once before the first byte (so the
-/// meter shows up immediately) and after each downloaded chunk.
-/// [`Self::finish`] prints the final summary on a new line.
-///
-/// No-op when the facet is local (the first tick reports
-/// `total_bytes == 0` for cached-and-resident storage; we skip
-/// rendering in that case).
-struct PrecacheMeter {
-    started: std::time::Instant,
-    last_render: std::time::Instant,
-    final_total: u64,
-    final_done: u64,
-    rendered_any: bool,
-}
-
-impl PrecacheMeter {
-    fn new() -> Self {
-        Self {
-            started: std::time::Instant::now(),
-            last_render: std::time::Instant::now() - std::time::Duration::from_secs(1),
-            final_total: 0,
-            final_done: 0,
-            rendered_any: false,
-        }
-    }
-
-    fn tick(&mut self, p: &crate::DownloadProgress) {
-        let total = p.total_bytes();
-        let done = p.downloaded_bytes();
-        self.final_total = total;
-        self.final_done = done;
-        // Local-only storage reports total=0 (no download needed).
-        // Skip the meter entirely so we don't flash a 0/0 line.
-        if total == 0 { return; }
-        if self.last_render.elapsed().as_millis() < 250 && done < total { return; }
-        self.last_render = std::time::Instant::now();
-        self.rendered_any = true;
-        let pct = if total > 0 { (done as f64 / total as f64) * 100.0 } else { 0.0 };
-        let elapsed = self.started.elapsed().as_secs_f64().max(0.001);
-        let rate = done as f64 / elapsed;
-        use std::io::Write;
-        let _ = eprint!(
-            "\r  {} / {} ({:.0}%) \u{2022} {}/s\u{1b}[K",
-            fmt_bytes(done), fmt_bytes(total), pct, fmt_bytes(rate as u64),
-        );
-        let _ = std::io::stderr().flush();
-    }
-
-    fn finish(self) {
-        if !self.rendered_any { return; }
-        let elapsed = self.started.elapsed().as_secs_f64().max(0.001);
-        let rate = (self.final_done as f64 / elapsed) as u64;
-        eprintln!(
-            "\r  \u{2713} {} in {:.1}s ({}/s)\u{1b}[K",
-            fmt_bytes(self.final_done), elapsed, fmt_bytes(rate),
-        );
-    }
-}
-
-fn fmt_bytes(n: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = KB * 1024;
-    const GB: u64 = MB * 1024;
-    const TB: u64 = GB * 1024;
-    if n >= TB { format!("{:.2} TiB", n as f64 / TB as f64) }
-    else if n >= GB { format!("{:.2} GiB", n as f64 / GB as f64) }
-    else if n >= MB { format!("{:.1} MiB", n as f64 / MB as f64) }
-    else if n >= KB { format!("{:.1} KiB", n as f64 / KB as f64) }
-    else { format!("{n} B") }
 }
 
 /// Format-agnostic vector reader that returns f64 values.
@@ -375,18 +156,18 @@ impl AnyVectorReader {
         match ext {
             "fvec" | "fvecs" => {
                 AnyVectorReader::F32(XvecReader::<f32>::open_path(path).unwrap_or_else(|e| {
-                    eprintln!("Error: failed to open {}: {}", path.display(), e);
+                    eprintln!("error: failed to open {}: {}", path.display(), e);
                     std::process::exit(1);
                 }))
             }
             "mvec" | "mvecs" => {
                 AnyVectorReader::F16(XvecReader::<half::f16>::open_path(path).unwrap_or_else(|e| {
-                    eprintln!("Error: failed to open {}: {}", path.display(), e);
+                    eprintln!("error: failed to open {}: {}", path.display(), e);
                     std::process::exit(1);
                 }))
             }
             _ => {
-                eprintln!("Error: unsupported format '.{}' for visualization. Use fvec or mvec.", ext);
+                eprintln!("error: unsupported format '.{}' for visualization. Use fvec or mvec.", ext);
                 std::process::exit(1);
             }
         }
@@ -408,19 +189,6 @@ impl AnyVectorReader {
         }
     }
 
-    /// Read a single vector as f64 values. Converts from native format on the fly.
-    pub(super) fn get_f64(&self, index: usize) -> Option<Vec<f64>> {
-        use crate::VectorReader;
-        match self {
-            AnyVectorReader::F32(r) => {
-                r.get(index).ok().map(|v| v.iter().map(|&x| x as f64).collect())
-            }
-            AnyVectorReader::F16(r) => {
-                r.get(index).ok().map(|v| v.iter().map(|x| x.to_f64()).collect())
-            }
-        }
-    }
-
     /// Read a single vector as f32 values (for simsimd hot paths).
     pub(super) fn get_f32(&self, index: usize) -> Option<Vec<f32>> {
         use crate::VectorReader;
@@ -434,13 +202,6 @@ impl AnyVectorReader {
         }
     }
 
-    /// Range read of `count` vectors as f64. mmap-backed, so it just
-    /// loops single-vector reads — local files are I/O-cheap and the
-    /// trait-level batch path exists primarily to amortize remote
-    /// (HTTP-cached) chunk fetches.
-    pub(super) fn get_f64_range(&self, start: usize, count: usize) -> Vec<Option<Vec<f64>>> {
-        (0..count).map(|i| self.get_f64(start + i)).collect()
-    }
     pub(super) fn get_f32_range(&self, start: usize, count: usize) -> Vec<Option<Vec<f32>>> {
         (0..count).map(|i| self.get_f32(start + i)).collect()
     }
@@ -460,28 +221,21 @@ pub(super) struct AnyDatasetReader {
 impl AnyDatasetReader {
     pub(super) fn from_source(source: &str) -> Self {
         let view = open_dataset_view(source);
-        // Precache base_vectors up front when the storage is
-        // remote. Without this the TUI lazy-reads via per-vector
-        // HTTP RANGE — for a 50k-vector sample window that's 50k
-        // round trips, which user-visibly stalls at 0/s. The
-        // `Storage` arc is process-wide-shared by URL, so the
-        // `view.base_vectors()` reader that we construct next
-        // picks up the same already-mmapped storage.
+        // Sparse access mode: don't prebuffer base_vectors at open
+        // time. Reads route through the chunked-HTTP storage layer
+        // (Storage::Cached or Storage::Http) which fetches 8 MiB
+        // chunks on demand and caches them locally. A 50k-vector
+        // streaming sample window at dim=384 f32 is ~75 MB ≈ 10
+        // chunks — well under the previous "download everything
+        // first" cost. The user can still trigger a full
+        // prebuffer via the picker's Precache action.
+        //
+        // `open_facet_storage` is still called so the resulting
+        // `AnyDatasetReader::facet_storage` handle can serve
+        // cache_stats() to the TUI's status line.
         let facet_storage = view.open_facet_storage("base_vectors").ok();
-        if let Some(ref fs) = facet_storage {
-            if !fs.is_local() {
-                eprintln!("Fetching base_vectors…");
-                let mut meter = PrecacheMeter::new();
-                let cb = |p: &crate::DownloadProgress| meter.tick(p);
-                if let Err(e) = fs.prebuffer_with_progress(cb) {
-                    eprintln!("\nError: precache failed for base_vectors: {e}");
-                    std::process::exit(1);
-                }
-                meter.finish();
-            }
-        }
         let base = view.base_vectors().unwrap_or_else(|e| {
-            eprintln!("Error: failed to open base_vectors: {e}");
+            eprintln!("error: failed to open base_vectors: {e}");
             std::process::exit(1);
         });
         let dim = base.dim();
@@ -492,14 +246,8 @@ impl AnyDatasetReader {
     pub(super) fn count(&self) -> usize { self.count }
     pub(super) fn dim(&self) -> usize { self.dim }
 
-    pub(super) fn get_f64(&self, index: usize) -> Option<Vec<f64>> {
-        self.base.get(index).ok().map(|v| v.into_iter().map(|x| x as f64).collect())
-    }
     pub(super) fn get_f32(&self, index: usize) -> Option<Vec<f32>> {
         self.base.get(index).ok()
-    }
-    pub(super) fn get_f64_range(&self, start: usize, count: usize) -> Vec<Option<Vec<f64>>> {
-        (0..count).map(|i| self.get_f64(start + i)).collect()
     }
     pub(super) fn get_f32_range(&self, start: usize, count: usize) -> Vec<Option<Vec<f32>>> {
         (0..count).map(|i| self.get_f32(start + i)).collect()
@@ -625,369 +373,4 @@ pub(super) fn normalize(v: &mut [f64]) {
             *x /= norm;
         }
     }
-}
-
-/// Compute axis bounds with 5% padding.
-pub(super) fn compute_bounds(points: &[(f64, f64)]) -> (f64, f64, f64, f64) {
-    let x_min = points.iter().map(|p| p.0).fold(f64::INFINITY, f64::min);
-    let x_max = points.iter().map(|p| p.0).fold(f64::NEG_INFINITY, f64::max);
-    let y_min = points.iter().map(|p| p.1).fold(f64::INFINITY, f64::min);
-    let y_max = points.iter().map(|p| p.1).fold(f64::NEG_INFINITY, f64::max);
-    let x_pad = (x_max - x_min) * 0.05;
-    let y_pad = (y_max - y_min) * 0.05;
-    (x_min - x_pad, x_max + x_pad, y_min - y_pad, y_max + y_pad)
-}
-
-/// Cache file for PCA results: stores mean, eigenvectors, eigenvalues,
-/// and projected points so recomputation is avoided.
-pub(super) const PCA_CACHE_FILE: &str = "pca_projection.bin";
-
-/// Partition size for incremental PCA (number of vectors per partition).
-pub(super) const PCA_PARTITION_SIZE: usize = 1_000_000;
-
-/// Magic bytes for 5D PCA cache format.
-pub(super) const PCA_5D_MAGIC: &[u8; 4] = b"PC5D";
-
-/// Check if cache file is newer than the source file.
-pub(super) fn is_cache_fresh(cache: &std::path::Path, source: &std::path::Path) -> bool {
-    let cache_mtime = std::fs::metadata(cache).ok().and_then(|m| m.modified().ok());
-    let source_mtime = std::fs::metadata(source).ok().and_then(|m| m.modified().ok());
-    match (cache_mtime, source_mtime) {
-        (Some(c), Some(s)) => c > s,
-        _ => false,
-    }
-}
-
-/// Save 5D PCA projection to cache.
-pub(super) fn save_pca_cache(
-    path: &std::path::Path,
-    projected: &[[f64; 5]],
-    eigenvalues: &[f64],
-    dim: usize,
-    total: usize,
-    filename: &str,
-) -> Result<(), String> {
-    use std::io::Write;
-    let mut f = std::fs::File::create(path).map_err(|e| e.to_string())?;
-    f.write_all(PCA_5D_MAGIC).map_err(|e| e.to_string())?;
-    let fname_bytes = filename.as_bytes();
-    f.write_all(&(dim as u32).to_le_bytes()).map_err(|e| e.to_string())?;
-    f.write_all(&(total as u64).to_le_bytes()).map_err(|e| e.to_string())?;
-    f.write_all(&(fname_bytes.len() as u16).to_le_bytes()).map_err(|e| e.to_string())?;
-    f.write_all(fname_bytes).map_err(|e| e.to_string())?;
-    // Write 10 eigenvalues (padded with zeros if fewer)
-    for i in 0..10 {
-        let ev = eigenvalues.get(i).copied().unwrap_or(0.0);
-        f.write_all(&ev.to_le_bytes()).map_err(|e| e.to_string())?;
-    }
-    f.write_all(&(projected.len() as u64).to_le_bytes()).map_err(|e| e.to_string())?;
-    for p in projected {
-        for &v in p {
-            f.write_all(&v.to_le_bytes()).map_err(|e| e.to_string())?;
-        }
-    }
-    Ok(())
-}
-
-/// Load 5D PCA projection from cache.
-pub(super) fn load_pca_5d_cache(path: &std::path::Path) -> Option<(Vec<[f64; 5]>, Vec<f64>)> {
-    use std::io::Read;
-    let mut f = std::fs::File::open(path).ok()?;
-    let mut buf8 = [0u8; 8];
-    let mut buf4 = [0u8; 4];
-    let mut buf2 = [0u8; 2];
-
-    f.read_exact(&mut buf4).ok()?;
-    if &buf4 != PCA_5D_MAGIC {
-        return None; // Old format — trigger recomputation
-    }
-
-    f.read_exact(&mut buf4).ok()?; // dim
-    f.read_exact(&mut buf8).ok()?; // total
-    f.read_exact(&mut buf2).ok()?;
-    let fname_len = u16::from_le_bytes(buf2) as usize;
-    let mut fname_buf = vec![0u8; fname_len];
-    f.read_exact(&mut fname_buf).ok()?;
-
-    let mut eigenvalues = Vec::with_capacity(10);
-    for _ in 0..10 {
-        f.read_exact(&mut buf8).ok()?;
-        eigenvalues.push(f64::from_le_bytes(buf8));
-    }
-
-    f.read_exact(&mut buf8).ok()?;
-    let n_points = u64::from_le_bytes(buf8) as usize;
-    if n_points > 100_000_000 { return None; }
-
-    let mut projected = Vec::with_capacity(n_points);
-    for _ in 0..n_points {
-        let mut p = [0.0f64; 5];
-        for v in &mut p {
-            f.read_exact(&mut buf8).ok()?;
-            *v = f64::from_le_bytes(buf8);
-        }
-        projected.push(p);
-    }
-
-    Some((projected, eigenvalues))
-}
-
-/// Per-partition statistics for incremental PCA.
-pub(super) struct PartitionStats {
-    pub(super) count: usize,
-    pub(super) mean: Vec<f64>,
-}
-
-/// Save partition statistics to a binary cache file.
-pub(super) fn save_partition_cache(path: &std::path::Path, stats: &PartitionStats) -> Result<(), String> {
-    use std::io::Write;
-    let mut f = std::fs::File::create(path).map_err(|e| e.to_string())?;
-    f.write_all(&(stats.count as u64).to_le_bytes()).map_err(|e| e.to_string())?;
-    f.write_all(&(stats.mean.len() as u32).to_le_bytes()).map_err(|e| e.to_string())?;
-    for &v in &stats.mean {
-        f.write_all(&v.to_le_bytes()).map_err(|e| e.to_string())?;
-    }
-    Ok(())
-}
-
-/// Load partition statistics from a binary cache file.
-pub(super) fn load_partition_cache(path: &std::path::Path) -> Option<PartitionStats> {
-    use std::io::Read;
-    let mut f = std::fs::File::open(path).ok()?;
-    let mut buf8 = [0u8; 8];
-    let mut buf4 = [0u8; 4];
-
-    f.read_exact(&mut buf8).ok()?;
-    let count = u64::from_le_bytes(buf8) as usize;
-
-    f.read_exact(&mut buf4).ok()?;
-    let dim = u32::from_le_bytes(buf4) as usize;
-
-    let mut mean = vec![0.0f64; dim];
-    for i in 0..dim {
-        f.read_exact(&mut buf8).ok()?;
-        mean[i] = f64::from_le_bytes(buf8);
-    }
-
-    Some(PartitionStats { count, mean })
-}
-
-/// Compute the mean vector across sampled indices.
-#[allow(dead_code)]
-pub(super) fn compute_mean(
-    reader: &UnifiedReader,
-    indices: &[usize],
-    dim: usize,
-) -> Vec<f64> {
-    let n = indices.len();
-
-    let partial_sums: Vec<Vec<f64>> = indices
-        .chunks(4096)
-        .map(|chunk| {
-            let mut sum = vec![0.0f64; dim];
-            for &i in chunk {
-                if let Some(v) = reader.get_f64(i) {
-                    for d in 0..dim {
-                        sum[d] += v[d];
-                    }
-                }
-            }
-            sum
-        })
-        .collect();
-
-    let mut mean = vec![0.0f64; dim];
-    for ps in &partial_sums {
-        for d in 0..dim {
-            mean[d] += ps[d];
-        }
-    }
-    for d in 0..dim {
-        mean[d] /= n as f64;
-    }
-    mean
-}
-
-/// Compute top-k eigenvectors of the covariance matrix using power iteration.
-///
-/// For each eigenvector:
-/// 1. Start with a random vector
-/// 2. Repeatedly multiply by the covariance matrix (implicitly, via the data)
-/// 3. Normalize
-/// 4. Deflate the covariance by subtracting the found eigenvector's contribution
-///
-/// The covariance-vector product is computed implicitly:
-///   Cv = (1/n) Σ (x_i - μ)(x_i - μ)ᵀ v = (1/n) Σ (x_i - μ) · ((x_i - μ)ᵀ v)
-/// This avoids materializing the d×d covariance matrix.
-#[allow(dead_code)]
-pub(super) fn compute_top_eigenvectors(
-    reader: &UnifiedReader,
-    indices: &[usize],
-    mean: &[f64],
-    dim: usize,
-    k: usize,
-) -> (Vec<Vec<f64>>, Vec<f64>) {
-    use simsimd::SpatialSimilarity;
-
-    let n = indices.len();
-    let mut eigenvectors: Vec<Vec<f64>> = Vec::with_capacity(k);
-    let mut eigenvalues: Vec<f64> = Vec::with_capacity(k);
-
-    // Pre-compute f32 mean for simsimd dot products
-    let mean_f32: Vec<f32> = mean.iter().map(|&x| x as f32).collect();
-
-    for _ki in 0..k {
-        // Initialize with a deterministic pseudo-random vector
-        let mut v: Vec<f64> = (0..dim).map(|d| ((d * 7 + 13) % 97) as f64 - 48.0).collect();
-        normalize(&mut v);
-
-        // Power iteration: 30 iterations is more than enough for convergence
-        for _iter in 0..30 {
-            // Implicit covariance-vector product: Cv = (1/n) Σ (x-μ)((x-μ)·v)
-            // Use simsimd for the (x-μ)·v dot product in the inner loop.
-            let v_f32: Vec<f32> = v.iter().map(|&x| x as f32).collect();
-            let partial_products: Vec<Vec<f64>> = indices
-                .chunks(4096)
-                .map(|chunk| {
-                    let mut product = vec![0.0f64; dim];
-                    let mut centered = vec![0.0f32; dim];
-                    for &i in chunk {
-                        if let Some(x) = reader.get_f32(i) {
-                            // Center: centered = x - μ
-                            for d in 0..dim {
-                                centered[d] = x[d] - mean_f32[d];
-                            }
-                            // SIMD dot product: (x-μ)·v
-                            let dot = <f32 as SpatialSimilarity>::dot(&centered, &v_f32)
-                                .unwrap_or(0.0) as f64;
-                            // Accumulate outer product contribution in f64
-                            for d in 0..dim {
-                                product[d] += centered[d] as f64 * dot;
-                            }
-                        }
-                    }
-                    product
-                })
-                .collect();
-
-            // Merge partial products
-            let mut new_v = vec![0.0f64; dim];
-            for pp in &partial_products {
-                for d in 0..dim {
-                    new_v[d] += pp[d];
-                }
-            }
-            for d in 0..dim {
-                new_v[d] /= n as f64;
-            }
-
-            // Deflate: remove components along previously found eigenvectors
-            for prev in &eigenvectors {
-                let proj: f64 = new_v.iter().zip(prev.iter()).map(|(a, b)| a * b).sum();
-                for d in 0..dim {
-                    new_v[d] -= proj * prev[d];
-                }
-            }
-
-            normalize(&mut new_v);
-            v = new_v;
-        }
-
-        // Compute eigenvalue: λ = vᵀ C v (via the same implicit product)
-        let v_f32: Vec<f32> = v.iter().map(|&x| x as f32).collect();
-        let eigenvalue_sum: f64 = indices
-            .chunks(4096)
-            .map(|chunk| {
-                let mut sum = 0.0f64;
-                let mut centered = vec![0.0f32; dim];
-                for &i in chunk {
-                    if let Some(x) = reader.get_f32(i) {
-                        for d in 0..dim {
-                            centered[d] = x[d] - mean_f32[d];
-                        }
-                        let dot = <f32 as SpatialSimilarity>::dot(&centered, &v_f32)
-                            .unwrap_or(0.0) as f64;
-                        sum += dot * dot;
-                    }
-                }
-                sum
-            })
-            .sum();
-
-        let eigenvalue = eigenvalue_sum / n as f64;
-        eigenvalues.push(eigenvalue);
-        eigenvectors.push(v);
-    }
-
-    (eigenvectors, eigenvalues)
-}
-
-/// Project sampled vectors onto the top-k eigenvectors.
-///
-/// Uses simsimd for the dot products: (x - μ) · eigenvector.
-#[allow(dead_code)]
-pub(super) fn project_vectors(
-    reader: &UnifiedReader,
-    indices: &[usize],
-    mean: &[f64],
-    eigenvectors: &[Vec<f64>],
-    dim: usize,
-) -> Vec<(f64, f64)> {
-    use simsimd::SpatialSimilarity;
-
-    let mean_f32: Vec<f32> = mean.iter().map(|&x| x as f32).collect();
-    let ev0_f32: Vec<f32> = eigenvectors[0].iter().map(|&x| x as f32).collect();
-    let ev1_f32: Vec<f32> = eigenvectors[1].iter().map(|&x| x as f32).collect();
-
-    let mut centered = vec![0.0f32; dim];
-    indices
-        .iter()
-        .filter_map(|&i| {
-            let x = reader.get_f32(i)?;
-            for d in 0..dim {
-                centered[d] = x[d] - mean_f32[d];
-            }
-            let pc1 = <f32 as SpatialSimilarity>::dot(&centered, &ev0_f32)
-                .unwrap_or(0.0) as f64;
-            let pc2 = <f32 as SpatialSimilarity>::dot(&centered, &ev1_f32)
-                .unwrap_or(0.0) as f64;
-            Some((pc1, pc2))
-        })
-        .collect()
-}
-
-/// Project sampled vectors onto the top-3 eigenvectors (3D).
-#[allow(dead_code)]
-pub(super) fn project_vectors_3d(
-    reader: &UnifiedReader,
-    indices: &[usize],
-    mean: &[f64],
-    eigenvectors: &[Vec<f64>],
-    dim: usize,
-) -> Vec<[f64; 3]> {
-    use simsimd::SpatialSimilarity;
-
-    let mean_f32: Vec<f32> = mean.iter().map(|&x| x as f32).collect();
-    let ev0_f32: Vec<f32> = eigenvectors[0].iter().map(|&x| x as f32).collect();
-    let ev1_f32: Vec<f32> = eigenvectors[1].iter().map(|&x| x as f32).collect();
-    let ev2_f32: Vec<f32> = if eigenvectors.len() > 2 {
-        eigenvectors[2].iter().map(|&x| x as f32).collect()
-    } else {
-        vec![0.0f32; dim]
-    };
-
-    let mut centered = vec![0.0f32; dim];
-    indices
-        .iter()
-        .filter_map(|&i| {
-            let x = reader.get_f32(i)?;
-            for d in 0..dim {
-                centered[d] = x[d] - mean_f32[d];
-            }
-            let pc1 = <f32 as SpatialSimilarity>::dot(&centered, &ev0_f32).unwrap_or(0.0) as f64;
-            let pc2 = <f32 as SpatialSimilarity>::dot(&centered, &ev1_f32).unwrap_or(0.0) as f64;
-            let pc3 = <f32 as SpatialSimilarity>::dot(&centered, &ev2_f32).unwrap_or(0.0) as f64;
-            Some([pc1, pc2, pc3])
-        })
-        .collect()
 }

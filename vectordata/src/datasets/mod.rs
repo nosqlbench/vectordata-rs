@@ -17,4 +17,4 @@ pub mod drop_cache;
 pub mod filter;
 pub mod list;
 pub mod precache;
-pub mod probe;
+pub mod ping;

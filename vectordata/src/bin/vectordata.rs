@@ -25,8 +25,40 @@ use vectordata::cache_admin::{
     list_entries, prune_by_filter, prune_legacy_layout,
 };
 
+/// Compose a richer --version string from the build.rs-emitted
+/// environment variables: package version + git describe + build
+/// profile + build date. Surfaces enough triage info that a user-
+/// reported bug includes "which exact binary" without further
+/// archaeology.
+const LONG_VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("VECTORDATA_GIT_DESCRIBE"),
+    ", ",
+    env!("VECTORDATA_BUILD_PROFILE"),
+    " build, ",
+    env!("VECTORDATA_BUILD_DATE"),
+    ")",
+);
+
 #[derive(Parser)]
-#[command(name = "vectordata", version, about = "vectordata cache + config admin")]
+#[command(
+    name = "vectordata",
+    version = LONG_VERSION,
+    about = "Inspect catalog-published vector datasets, manage the local cache, and \
+             launch the interactive explorer.",
+    long_about = "vectordata — the user-facing entry point for working with \
+                  published vector-search benchmark datasets.\n\n\
+                  Common starting points:\n  \
+                  • `vectordata datasets`          — TUI browser of every reachable dataset\n  \
+                  • `vectordata datasets list`     — text catalog listing\n  \
+                  • `vectordata explore`           — interactive value/distance explorer\n  \
+                  • `vectordata config show`       — review the active configuration\n  \
+                  • `vectordata cache list`        — see what's on disk\n\n\
+                  First-time users typically start by configuring a catalog source \
+                  (`vectordata config add-catalog <url-or-path>`) and a cache directory \
+                  (`vectordata config set-cache <dir>`)."
+)]
 struct Cli {
     #[command(subcommand)]
     command: Cmd,
@@ -60,10 +92,10 @@ enum Cmd {
         #[arg(long = "at", global = true)]
         at: Vec<String>,
     },
-    /// Interactive data visualization and exploration TUI.
-    /// Browse datasets, page through raw vector values, sample
-    /// distances, and run REPL commands against any local file or
-    /// catalog facet.
+    /// Unified vector space explorer — norms, distances, eigenvalues,
+    /// and PCA projections rendered in a single ratatui TUI. Run without
+    /// flags to pop the catalog picker; pass `--source` or `--dataset`
+    /// to launch directly against a known view.
     #[cfg(feature = "explore")]
     Explore(vectordata::explore::ExploreArgs),
     /// Print or activate tab-completion for the current shell.
@@ -159,9 +191,10 @@ enum DatasetsCmd {
     /// Verify remote dataset access. Walks every facet declared by
     /// the dataset's profile, reads the first record via HTTP
     /// range, and reports success/failure per facet.
-    Probe {
+    #[command(alias = "probe")]
+    Ping {
         #[command(flatten)]
-        args: vectordata::datasets::probe::ProbeArgs,
+        args: vectordata::datasets::ping::PingArgs,
         /// Configuration directory containing catalogs.yaml
         #[arg(long, default_value = "~/.config/vectordata")]
         configdir: String,
@@ -311,18 +344,12 @@ fn main() {
                 std::process::exit(vectordata::datasets::browser::run(&configdir, &catalog, &at));
             };
             let code = match command {
-                DatasetsCmd::List(args) => {
-                    vectordata::datasets::list::run_args(args);
-                    0
-                }
-                DatasetsCmd::Probe { args, configdir, catalog } => {
-                    vectordata::datasets::probe::run_args(args, &configdir, &catalog, &[]);
-                    0
-                }
-                DatasetsCmd::Curlify(args) => {
-                    vectordata::datasets::curlify::run_args(args);
-                    0
-                }
+                DatasetsCmd::List(args) =>
+                    vectordata::datasets::list::run_args(args),
+                DatasetsCmd::Ping { args, configdir, catalog } =>
+                    vectordata::datasets::ping::run_args(args, &configdir, &catalog, &[]),
+                DatasetsCmd::Curlify(args) =>
+                    vectordata::datasets::curlify::run_args(args),
                 DatasetsCmd::Derive {
                     dataset, profile, output, name, force, configdir, catalog, at,
                 } => vectordata::datasets::derive::run(
@@ -361,7 +388,10 @@ fn main() {
         }
         Cmd::Completions { shell } => cmd_completions(shell),
         #[cfg(feature = "explore")]
-        Cmd::Explore(args) => vectordata::explore::run(args),
+        Cmd::Explore(args) => {
+            let code = vectordata::explore::run(args);
+            if code != 0 { std::process::exit(code); }
+        }
     }
 }
 
@@ -460,7 +490,7 @@ fn cmd_cache_prune(
 ) {
     let filter = PruneFilter { dataset, profile };
     if filter.is_empty() {
-        eprintln!("Refusing to prune with no filter — pass at least one of \
+        eprintln!("error: refusing to prune with no filter — pass at least one of \
             --dataset or --profile.");
         eprintln!("(To wipe the entire content-addressed cache, remove \
             `<cache_root>/{{blobs,http}}/` by hand.)");

@@ -84,7 +84,7 @@ impl Catalog {
         match simple_regex_match(pattern) {
             Some(matcher) => self.entries.iter().filter(|e| matcher(&e.name)).collect(),
             None => {
-                eprintln!("WARNING: unsupported regex pattern '{}', falling back to substring match", pattern);
+                eprintln!("warning: unsupported regex pattern '{}', falling back to substring match", pattern);
                 let lower = pattern.to_lowercase();
                 self.entries
                     .iter()
@@ -109,10 +109,18 @@ impl Catalog {
     pub fn open(&self, name: &str) -> crate::Result<crate::TestDataGroup> {
         let entry = self.find_exact(name)
             .ok_or_else(|| crate::Error::Other(format!("dataset '{}' not found in catalog", name)))?;
-        // For knn_entries-shape entries the catalog file is the
-        // dataset description — there's no `dataset.yaml` to
-        // re-fetch. Synthesize the group directly from the
-        // embedded layout.
+        Self::open_entry(entry)
+    }
+
+    /// Open a [`CatalogEntry`] directly, dispatching on its shape:
+    /// `knn_entries.yaml`-shape entries synthesise the
+    /// [`TestDataGroup`] from their embedded layout (no
+    /// per-dataset `dataset.yaml` to re-fetch), while canonical
+    /// entries load through [`TestDataGroup::load`] with the
+    /// entry's absolute `dataset.yaml` URL. Callers that already
+    /// hold a `CatalogEntry` (e.g. the picker iterating `datasets()`)
+    /// use this to avoid the `find_exact` round-trip.
+    pub fn open_entry(entry: &CatalogEntry) -> crate::Result<crate::TestDataGroup> {
         if entry.dataset_type == "knn_entries.yaml" {
             return crate::TestDataGroup::from_catalog_entry(entry);
         }
@@ -199,7 +207,7 @@ fn print_dataset_with_profiles(entry: &CatalogEntry) {
 fn load_catalog_entries(location: &str, entries: &mut Vec<CatalogEntry>, required: bool) {
     if looks_like_catalog_file(location) {
         if !load_from_explicit_catalog_file(location, entries) && required {
-            eprintln!("ERROR: could not load catalog from {}", location);
+            eprintln!("error: could not load catalog from {}", location);
         }
         return;
     }
@@ -242,7 +250,7 @@ fn load_from_explicit_catalog_file(location: &str, entries: &mut Vec<CatalogEntr
     let value: serde_yaml::Value = match serde_yaml::from_str(&content) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("ERROR: failed to parse catalog {}: {}", location, e);
+            eprintln!("error: failed to parse catalog {}: {}", location, e);
             return true;
         }
     };
@@ -256,13 +264,13 @@ fn load_from_explicit_catalog_file(location: &str, entries: &mut Vec<CatalogEntr
                 let as_json: serde_json::Value = match serde_json::to_value(&item) {
                     Ok(v) => v,
                     Err(e) => {
-                        eprintln!("WARNING: skipping catalog entry: {}", e);
+                        eprintln!("warning: skipping catalog entry: {}", e);
                         continue;
                     }
                 };
                 match remap_entry(&as_json, &base_url) {
                     Ok(entry) => entries.push(entry),
-                    Err(e) => eprintln!("WARNING: skipping catalog entry: {}", e),
+                    Err(e) => eprintln!("warning: skipping catalog entry: {}", e),
                 }
             }
             true
@@ -278,7 +286,7 @@ fn load_from_explicit_catalog_file(location: &str, entries: &mut Vec<CatalogEntr
                     true
                 }
                 Err(e) => {
-                    eprintln!("ERROR: failed to parse {}: {}", location, e);
+                    eprintln!("error: failed to parse {}: {}", location, e);
                     true
                 }
             }
@@ -362,7 +370,7 @@ fn try_load_canonical_catalog(location: &str, entries: &mut Vec<CatalogEntry>) -
         Err(_) => match serde_yaml::from_str(&content) {
             Ok(v) => v,
             Err(e) => {
-                eprintln!("ERROR: failed to parse catalog {}: {}", catalog_url, e);
+                eprintln!("error: failed to parse catalog {}: {}", catalog_url, e);
                 return true; // file exists, but couldn't parse — don't fall through
             }
         },
@@ -373,7 +381,7 @@ fn try_load_canonical_catalog(location: &str, entries: &mut Vec<CatalogEntry>) -
         match remap_entry(&value, &base_url) {
             Ok(entry) => entries.push(entry),
             Err(e) => {
-                eprintln!("WARNING: skipping catalog entry: {}", e);
+                eprintln!("warning: skipping catalog entry: {}", e);
             }
         }
     }
@@ -409,7 +417,7 @@ fn try_load_knn_entries(location: &str, entries: &mut Vec<CatalogEntry>) -> bool
             true
         }
         Err(e) => {
-            eprintln!("ERROR: failed to parse {}: {}", url, e);
+            eprintln!("error: failed to parse {}: {}", url, e);
             true
         }
     }

@@ -213,7 +213,7 @@ fn derive_local(
     let base_dir = yaml_path.parent().unwrap_or(Path::new("."));
     let config = match RichDatasetConfig::load(yaml_path) {
         Ok(c) => c,
-        Err(e) => { eprintln!("Failed to load {}: {e}", yaml_path.display()); return 1; }
+        Err(e) => { eprintln!("error: failed to load {}: {e}", yaml_path.display()); return 1; }
     };
     let ds_profile = match config.profiles.profile(profile_name) {
         Some(p) => p,
@@ -252,31 +252,51 @@ fn derive_via_access_layer(
     at: &[String],
     name_override: Option<&str>,
 ) -> i32 {
-    let (group_path, derived_default_name) =
+    let (resolution, derived_default_name) =
         match resolve_spec(dataset, configdir, extra_catalogs, at) {
             Some(t) => t,
             None => return 1,
         };
 
-    let group = match crate::TestDataGroup::load(&group_path) {
-        Ok(g) => g,
-        Err(e) => {
-            eprintln!("Failed to open dataset at {group_path}: {e}");
-            return 1;
+    // Catalog-resolved entries open through `Catalog::open(name)` so
+    // the knn_entries-shape synthesis path is taken when applicable.
+    // (resolve_spec already rejected knn_entries-shape entries above —
+    // derive needs the per-dataset dataset.yaml for window metadata,
+    // and those catalogs don't publish one.)
+    let (group, yaml_url) = match resolution {
+        Resolved::CatalogEntry { catalog, name, yaml_url } => {
+            let g = match catalog.open(&name) {
+                Ok(g) => g,
+                Err(e) => {
+                    eprintln!("error: failed to open dataset '{name}': {e}");
+                    return 1;
+                }
+            };
+            (g, yaml_url)
+        }
+        Resolved::Local(path) | Resolved::Url(path) => {
+            let g = match crate::TestDataGroup::load(&path) {
+                Ok(g) => g,
+                Err(e) => {
+                    eprintln!("error: failed to open dataset at {path}: {e}");
+                    return 1;
+                }
+            };
+            (g, path)
         }
     };
     let view = match group.profile(profile_name) {
         Some(v) => v,
         None => {
-            eprintln!("Profile '{profile_name}' not found at {group_path}.");
+            eprintln!("Profile '{profile_name}' not found at {yaml_url}.");
             eprintln!("Available: {}", group.profile_names().join(", "));
             return 1;
         }
     };
-    let rich = match load_rich_config(&group_path) {
+    let rich = match load_rich_config(&yaml_url) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("Failed to re-parse dataset.yaml for window info: {e}");
+            eprintln!("error: failed to re-parse dataset.yaml for window info: {e}");
             return 1;
         }
     };
@@ -290,7 +310,7 @@ fn derive_via_access_layer(
 
     eprintln!("Prebuffering source profile so windows can be sliced locally…");
     if let Err(e) = view.prebuffer_all() {
-        eprintln!("Failed to precache source: {e}");
+        eprintln!("error: failed to precache source: {e}");
         return 1;
     }
 
@@ -489,7 +509,7 @@ fn run_plan(
     if let Err(e) = write_dataset_yaml(output, &derived_name,
         derived_from_attr, source_profile, &derived_facets, src_profile)
     {
-        eprintln!("Failed to write dataset.yaml: {e}");
+        eprintln!("error: failed to write dataset.yaml: {e}");
         return 1;
     }
 
@@ -927,28 +947,26 @@ fn write_dataset_yaml(
 
 // ─── Spec resolution (shared shape with precache.rs) ───────────
 
-/// Resolve a head spec (no profile suffix) to (path_or_url, name).
-/// Mirrors the shape used by `precache.rs::resolve_spec` but
-/// returns the resolved name separately so derive can use it as
-/// the default for the derived dataset's name.
+/// Resolve a head spec (no profile suffix) to (resolution, derived
+/// default name). The derived-default name is used by derive as the
+/// fallback name of the new dataset directory when `--name` is not
+/// passed.
 fn resolve_spec(
     head: &str,
     configdir: &str,
     extra_catalogs: &[String],
     at: &[String],
-) -> Option<(String, String)> {
+) -> Option<(Resolved, String)> {
     if head.starts_with("http://") || head.starts_with("https://") {
-        // For URL specs we don't know the dataset's friendly name —
-        // use the last path segment.
         let name = head.rsplit('/').find(|s| !s.is_empty())
             .unwrap_or("derived").to_string();
-        return Some((head.to_string(), name));
+        return Some((Resolved::Url(head.to_string()), name));
     }
     let as_path = Path::new(head);
     if as_path.exists() {
         let name = as_path.file_stem().and_then(|s| s.to_str())
             .unwrap_or("derived").to_string();
-        return Some((head.to_string(), name));
+        return Some((Resolved::Local(head.to_string()), name));
     }
     let sources = build_sources(configdir, extra_catalogs, at);
     if sources.is_empty() {
@@ -965,7 +983,32 @@ fn resolve_spec(
             return None;
         }
     };
-    Some((entry.path.clone(), entry.name.clone()))
+    if entry.dataset_type == "knn_entries.yaml" {
+        // derive needs the per-dataset `dataset.yaml` to extract
+        // window metadata (see [`load_rich_config`]). knn_entries-
+        // shape catalogs don't publish one — the catalog's embedded
+        // layout *is* the dataset description but lacks the rich
+        // window info derive depends on. Fail early with a clear
+        // diagnostic instead of erroring deep inside the open path.
+        eprintln!("error: derive does not support knn_entries.yaml-shape catalogs ({head})");
+        eprintln!("       (those catalogs have no per-dataset dataset.yaml with window metadata)");
+        return None;
+    }
+    let name = entry.name.clone();
+    let yaml_url = entry.path.clone();
+    Some((
+        Resolved::CatalogEntry { catalog, name: name.clone(), yaml_url },
+        name,
+    ))
+}
+
+enum Resolved {
+    /// Catalog-resolved canonical entry. `yaml_url` is the absolute
+    /// URL or path of the per-dataset `dataset.yaml` (needed by
+    /// `load_rich_config` for window metadata).
+    CatalogEntry { catalog: Catalog, name: String, yaml_url: String },
+    Local(String),
+    Url(String),
 }
 
 fn build_sources(configdir: &str, extra_catalogs: &[String], at: &[String]) -> CatalogSources {

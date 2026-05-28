@@ -77,17 +77,32 @@ pub fn run(
         None => return 1,
     };
 
-    let group_path = match resolution {
-        Resolved::CatalogEntry { path, .. } => path,
-        Resolved::Local(path) => path,
-        Resolved::Url(url) => url,
-    };
-
-    let group = match crate::TestDataGroup::load(&group_path) {
-        Ok(g) => g,
-        Err(e) => {
-            eprintln!("Failed to open dataset at {group_path}: {e}");
-            return 1;
+    // Open through whichever path knows how to materialise this
+    // shape. Catalog-resolved entries MUST go through
+    // `Catalog::open` so the knn_entries-shape synthesis path is
+    // taken when applicable — `TestDataGroup::load(entry.path)`
+    // would point at the catalog base URL for those entries (there
+    // is no per-dataset `dataset.yaml` to load) and fail.
+    let (group, descriptor) = match resolution {
+        Resolved::CatalogEntry { catalog, name } => {
+            let group = match catalog.open(&name) {
+                Ok(g) => g,
+                Err(e) => {
+                    eprintln!("error: failed to open dataset '{name}': {e}");
+                    return 1;
+                }
+            };
+            (group, name)
+        }
+        Resolved::Local(path) | Resolved::Url(path) => {
+            let group = match crate::TestDataGroup::load(&path) {
+                Ok(g) => g,
+                Err(e) => {
+                    eprintln!("error: failed to open dataset at {path}: {e}");
+                    return 1;
+                }
+            };
+            (group, path)
         }
     };
 
@@ -100,18 +115,18 @@ pub fn run(
             let view = match group.profile(&profile_name) {
                 Some(v) => v,
                 None => {
-                    eprintln!("Profile '{profile_name}' not found at {group_path}.");
+                    eprintln!("Profile '{profile_name}' not found at {descriptor}.");
                     eprintln!("Available profiles: {}",
                         group.profile_names().join(", "));
                     return 1;
                 }
             };
-            eprintln!("Prebuffering {group_path}:{profile_name}");
+            eprintln!("Prebuffering {descriptor}:{profile_name}");
             drive_prebuffer(&*view)
         }
         ProfileSelection::AllProfiles => {
             let names = group.profile_names();
-            eprintln!("Prebuffering {group_path} — all profiles ({})",
+            eprintln!("Prebuffering {descriptor} — all profiles ({})",
                 names.join(", "));
             drive_prebuffer_all(&group)
         }
@@ -119,13 +134,14 @@ pub fn run(
 }
 
 enum Resolved {
-    /// Catalog-resolved entry. `name` is currently only used in
-    /// diagnostics so dead-code analysis warns; kept because future
-    /// summary lines will want it (`Prebuffering sift1m:default …`).
-    CatalogEntry {
-        path: String,
-        #[allow(dead_code)] name: String,
-    },
+    /// Catalog-resolved entry. Carries the catalog itself so the
+    /// caller goes through `Catalog::open(name)` — that's the only
+    /// path that handles `knn_entries.yaml`-shape catalogs
+    /// correctly (those entries have no per-dataset `dataset.yaml`;
+    /// the catalog's own embedded layout *is* the dataset
+    /// description, and `Catalog::open` synthesises the group from
+    /// it).
+    CatalogEntry { catalog: Catalog, name: String },
     Local(String),
     Url(String),
 }
@@ -192,10 +208,8 @@ fn resolve_spec(
             return None;
         }
     }
-    Some((
-        Resolved::CatalogEntry { path: entry.path.clone(), name: entry.name.clone() },
-        profile_sel,
-    ))
+    let name = entry.name.clone();
+    Some((Resolved::CatalogEntry { catalog, name }, profile_sel))
 }
 
 fn build_sources(configdir: &str, extra_catalogs: &[String], at: &[String]) -> CatalogSources {
@@ -219,8 +233,9 @@ fn drive_prebuffer(view: &dyn TestDataView) -> i32 {
         println!("Precache: profile declared no facets.");
         return 0;
     }
-    eprintln!("Prebuffering {} facet(s), {} to download.",
-        plan.facets.len(), fmt_bytes(plan.total_bytes));
+    eprintln!("Prebuffering {} facet(s), {} to download. ({} concurrent streams per facet)",
+        plan.facets.len(), fmt_bytes(plan.total_bytes),
+        crate::cache::download_concurrency());
     let mut ctx = LiveCtx::new(plan.facets.len(), plan.total_bytes);
     let result = view.prebuffer_all_with_progress(&mut |facet, p| ctx.on_progress(facet, p));
     ctx.finalize(&result.as_ref().map(|_| ()).map_err(|e| e.to_string()));
@@ -246,7 +261,7 @@ fn drive_prebuffer_all(group: &crate::TestDataGroup) -> i32 {
         return 0;
     }
     if total_bytes >= crate::PREBUFFER_LARGE_WARNING_BYTES {
-        eprintln!("WARNING: precache announced {} across all profiles \
+        eprintln!("warning: precache announced {} across all profiles \
                    (above the {} advisory threshold).",
             fmt_bytes(total_bytes),
             fmt_bytes(crate::PREBUFFER_LARGE_WARNING_BYTES));

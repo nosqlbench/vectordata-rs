@@ -56,7 +56,7 @@ impl CatalogSources {
         let config_dir = expand_tilde(config_dir);
         match load_config(&config_dir) {
             Ok(locations) => self.required.extend(locations),
-            Err(e) => eprintln!("WARNING: {}", e),
+            Err(e) => eprintln!("warning: {}", e),
         }
         self
     }

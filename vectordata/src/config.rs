@@ -38,14 +38,24 @@ use crate::settings::{self, SettingsWriteError, WriteCacheOutcome};
 /// `veks datasets config show` output. Returns 0 unconditionally —
 /// "no configuration" is informational, not an error.
 pub fn show() -> i32 {
-    let path = settings::settings_path();
-    println!("Configuration: {}", path.display());
+    let settings_path = settings::settings_path();
+    let cats_path = catalogs_path();
+    let cats_configured = !raw_catalog_entries(DEFAULT_CONFIG_DIR).is_empty();
 
-    if !path.exists() {
+    println!("Configuration: {}", settings_path.display());
+
+    if !settings_path.exists() {
         println!("  (settings file does not exist)");
         println!();
-        println!("Set up a cache directory with:");
-        println!("  vectordata config set-cache <path>");
+        println!("First-run setup — three quick steps:");
+        println!("  1. Pick a cache directory:");
+        println!("       vectordata config set-cache <path>");
+        println!("       (or `vectordata config set-cache auto` to choose the largest writable mount)");
+        println!("  2. Subscribe to a catalog of published datasets:");
+        println!("       vectordata config add-catalog <URL-or-path>");
+        println!("  3. Browse what's available:");
+        println!("       vectordata datasets       # TUI");
+        println!("       vectordata datasets list  # text");
         return 0;
     }
 
@@ -65,6 +75,22 @@ pub fn show() -> i32 {
         Err(_) => println!("  cache_dir: (not set)"),
     }
     println!("  protect_settings: {}", settings::protect_settings());
+
+    println!();
+    println!("Catalogs: {}", cats_path.display());
+    if cats_configured {
+        // Defer to `list-catalogs` for the actual enumeration — keeps
+        // a single source of truth for catalog output.
+        let entries = raw_catalog_entries(DEFAULT_CONFIG_DIR);
+        for (i, e) in entries.iter().enumerate() {
+            println!("  {:>3}. {}", i + 1, e);
+        }
+    } else {
+        println!("  (no catalogs configured)");
+        println!();
+        println!("Add one to discover published datasets:");
+        println!("  vectordata config add-catalog <URL-or-path>");
+    }
     0
 }
 
@@ -126,14 +152,14 @@ pub fn set_cache(cache_dir: &Path, force: bool) -> i32 {
             let existing = existing_cache_dir.as_ref()
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|| "(not set)".to_string());
-            eprintln!("Refusing to overwrite protected settings at {}.",
+            eprintln!("error: refusing to overwrite protected settings at {}.",
                 settings_path.display());
             eprintln!("Current cache_dir: {existing}");
             eprintln!("Re-run with --force to overwrite.");
             1
         }
         Err(SettingsWriteError::Io(e)) => {
-            eprintln!("Error writing settings: {e}");
+            eprintln!("error: writing settings: {e}");
             1
         }
     }
@@ -257,7 +283,7 @@ pub fn add_catalog(source: &str) -> i32 {
     entries.push(source.to_string());
     match save_catalog_entries(&entries) {
         Ok(path) => { println!("Saved to {}", path.display()); 0 }
-        Err(e) => { eprintln!("Error: {e}"); 1 }
+        Err(e) => { eprintln!("error: {e}"); 1 }
     }
 }
 
@@ -269,7 +295,7 @@ pub fn remove_catalog(spec: RemoveCatalogSpec<'_>) -> i32 {
         RemoveCatalogSpec::Source(s) => s.to_string(),
         RemoveCatalogSpec::Index(n) => {
             if n == 0 || n > entries.len() {
-                eprintln!("Error: index {n} out of range (1..{})", entries.len());
+                eprintln!("error: index {n} out of range (1..{})", entries.len());
                 return 1;
             }
             let s = entries[n - 1].clone();
@@ -285,7 +311,7 @@ pub fn remove_catalog(spec: RemoveCatalogSpec<'_>) -> i32 {
     }
     match save_catalog_entries(&entries) {
         Ok(_) => { println!("Removed: {source}"); 0 }
-        Err(e) => { eprintln!("Error: {e}"); 1 }
+        Err(e) => { eprintln!("error: {e}"); 1 }
     }
 }
 
