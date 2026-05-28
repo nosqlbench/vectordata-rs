@@ -26,7 +26,18 @@ name: build
 on:
   push:
     branches: [main]
-    tags: ['v*']
+    # Tag triggers cover two conventions:
+    #   - `vectordata@*` — cargo-workspaces (`cargo ws publish`) emits
+    #     `<crate>@<version>` tags. We intentionally narrow this to the
+    #     vectordata crate so a `veks-pipeline@X` or `veks-io@X` tag
+    #     (also cargo-workspaces output) doesn't spuriously rebuild +
+    #     publish a vectordata binary release.
+    #   - `v*` — manual unified-workspace tags (e.g. `v1.0.0`) for ad-
+    #     hoc releases outside cargo-workspaces.
+    tags:
+      - 'vectordata@*'
+      - 'veks@*'
+      - 'v*'
   pull_request:
   workflow_dispatch:
 
@@ -49,22 +60,27 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # `exe_suffix` is appended to every binary basename when
+          # composing the release output path. Empty on Unix-likes,
+          # ".exe" on Windows. Keeping it in the matrix means every
+          # later step builds its path with the same `${name}${suffix}`
+          # template — no platform-specific branching in step bodies.
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-24.04
             os:     linux
-            bin:    vectordata
+            exe_suffix: ""
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
             os:     linux
-            bin:    vectordata
+            exe_suffix: ""
           - target: aarch64-apple-darwin
             runner: macos-14              # Apple Silicon (M-series)
             os:     macos
-            bin:    vectordata
+            exe_suffix: ""
           - target: x86_64-pc-windows-msvc
             runner: windows-2022
             os:     windows
-            bin:    vectordata.exe
+            exe_suffix: ".exe"
     steps:
       - uses: actions/checkout@v6
 
@@ -106,6 +122,24 @@ jobs:
             --target ${{ matrix.target }} \
             --features cli
 
+      # ─── Build the `veks` binary in release mode.
+      #
+      # `--no-default-features` skips the `knnutils` feature, which
+      # would otherwise pull in `veks-pipeline/knnutils` and force a
+      # system-BLAS dependency (libopenblas on Linux, Accelerate on
+      # macOS, and no clean story on Windows MSVC). The shipped binary
+      # falls back to `compute knn` (stdarch) as its KNN engine — users
+      # who need `compute knn-blas` can `cargo install veks` with their
+      # own BLAS provider. This keeps the four release binaries
+      # symmetric across platforms with no FFI surprises.
+      - name: Build veks (release, no BLAS)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release -p veks \
+            --target ${{ matrix.target }} \
+            --no-default-features
+
       # ─── Run vectordata's own tests against the target. cargo
       # test routes to a native or cross-built test runner based on
       # the target triple; our matrix uses native runners only, so
@@ -126,15 +160,18 @@ jobs:
             --target ${{ matrix.target }} \
             --features cli
 
-      # ─── Smoke-test: the built binary actually starts and prints
+      # ─── Smoke-test: each built binary actually starts and prints
       # its version. Catches LD_LIBRARY_PATH / shared-lib regressions
-      # that a successful build wouldn't surface.
+      # that a successful build wouldn't surface. Loops over both
+      # binaries so a future addition just appends to the list.
       - name: Smoke test
         shell: bash
         run: |
           set -euo pipefail
-          bin_path="target/${{ matrix.target }}/release/${{ matrix.bin }}"
-          "$bin_path" --version
+          for name in vectordata veks; do
+            bin_path="target/${{ matrix.target }}/release/${name}${{ matrix.exe_suffix }}"
+            "$bin_path" --version
+          done
 
       # ─── Dump dynamic-library deps for the run log. Helps debug
       # surprises later (a contributor adds a crate with an FFI dep
@@ -146,25 +183,37 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          bin_path="target/${{ matrix.target }}/release/${{ matrix.bin }}"
-          file "$bin_path"
-          case "${{ matrix.os }}" in
-            linux) ldd  "$bin_path" || true ;;
-            macos) otool -L "$bin_path" || true ;;
-          esac
+          for name in vectordata veks; do
+            bin_path="target/${{ matrix.target }}/release/${name}${{ matrix.exe_suffix }}"
+            echo "── $name ──"
+            file "$bin_path"
+            case "${{ matrix.os }}" in
+              linux) ldd  "$bin_path" || true ;;
+              macos) otool -L "$bin_path" || true ;;
+            esac
+          done
 
       # Single-file upload: upload-artifact@v4+ flattens to the
-      # basename when given one file, so the artifact zip contains
-      # just `vectordata` (or `vectordata.exe`) — no nested target/
-      # release/ dirs.
-      - name: Upload binary
+      # basename when given one file, so each artifact zip contains
+      # just the bare binary — no nested target/release/ dirs. Two
+      # uploads per row, one per binary; the release job globs them
+      # all back by pattern.
+      - name: Upload vectordata binary
         # @v7 is the current Node-24-native release; @v4 (the prior
         # pin) ran on Node 20 and emits a deprecation warning on every
         # job run as of the 2025-09 GHA notice.
         uses: actions/upload-artifact@v7
         with:
           name: vectordata-${{ matrix.target }}
-          path: target/${{ matrix.target }}/release/${{ matrix.bin }}
+          path: target/${{ matrix.target }}/release/vectordata${{ matrix.exe_suffix }}
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload veks binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: veks-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/veks${{ matrix.exe_suffix }}
           if-no-files-found: error
           retention-days: 14
 
@@ -182,33 +231,42 @@ jobs:
     name: GitHub Release
     runs-on: ubuntu-24.04
     needs: [build]
-    if: startsWith(github.ref, 'refs/tags/v')
+    # Fires on any tag ref we accepted in `on.push.tags` above —
+    # `vectordata@*` (cargo-workspaces) or `v*` (manual). The
+    # workflow-level filter already excludes non-tag refs from
+    # triggering us, but this gate is the per-job safety check that
+    # also keeps PRs / branches from accidentally publishing.
+    if: startsWith(github.ref, 'refs/tags/')
     permissions:
       contents: write
     steps:
       - name: Download per-target binary artifacts
         # @v8 is required to read artifacts produced by
-        # actions/upload-artifact@v7 (matched major versions); @v4 was
-        # the Node-20 release.
+        # actions/upload-artifact@v7 (v7 uploads zipped; v8 download
+        # unzips by default). Two artifacts per platform — vectordata
+        # and veks — pulled by globbing both name prefixes.
         uses: actions/download-artifact@v8
         with:
           path: artifacts
-          pattern: vectordata-*
+          pattern: '{vectordata,veks}-*'
 
       - name: Stage release assets
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p release
-          # Each downloaded artifact is a directory containing a
-          # single `vectordata` (or `vectordata.exe`) file. Rename
-          # each to include the target triple so users downloading
-          # multiple platforms don't get filename collisions.
-          for dir in artifacts/vectordata-*; do
-            target="${dir##*/vectordata-}"
+          # Each downloaded artifact is a directory named
+          # `<binary>-<target>` containing a single bare binary
+          # (`vectordata`, `veks`, `.exe` on Windows). Rename each to
+          # include the target triple so users downloading multiple
+          # platforms don't get filename collisions.
+          for dir in artifacts/*; do
+            base="${dir##*/}"               # e.g. "vectordata-x86_64-unknown-linux-gnu"
+            binary="${base%%-*}"            # "vectordata" or "veks"
+            target="${base#${binary}-}"     # "x86_64-unknown-linux-gnu"
             case "$target" in
-              *windows*) src="$dir/vectordata.exe"; dst="release/vectordata-$target.exe" ;;
-              *)         src="$dir/vectordata";     dst="release/vectordata-$target" ;;
+              *windows*) src="$dir/${binary}.exe"; dst="release/${binary}-${target}.exe" ;;
+              *)         src="$dir/${binary}";     dst="release/${binary}-${target}" ;;
             esac
             cp "$src" "$dst"
             chmod +x "$dst" || true
@@ -230,16 +288,23 @@ jobs:
           cat > "$notes_file" <<'EOF'
           ## Binaries
 
-          Single-binary release per platform — no archive, no install step.
+          Self-contained per-platform binaries — no archive, no install step.
 
-          | Platform | Asset |
-          | --- | --- |
-          | Linux amd64 | `vectordata-x86_64-unknown-linux-gnu` |
-          | Linux arm64 | `vectordata-aarch64-unknown-linux-gnu` |
-          | macOS Apple Silicon | `vectordata-aarch64-apple-darwin` |
-          | Windows amd64 | `vectordata-x86_64-pc-windows-msvc.exe` |
+          | Platform | `vectordata` | `veks` |
+          | --- | --- | --- |
+          | Linux amd64 | `vectordata-x86_64-unknown-linux-gnu` | `veks-x86_64-unknown-linux-gnu` |
+          | Linux arm64 | `vectordata-aarch64-unknown-linux-gnu` | `veks-aarch64-unknown-linux-gnu` |
+          | macOS Apple Silicon | `vectordata-aarch64-apple-darwin` | `veks-aarch64-apple-darwin` |
+          | Windows amd64 | `vectordata-x86_64-pc-windows-msvc.exe` | `veks-x86_64-pc-windows-msvc.exe` |
 
           Verify with `SHA256SUMS`.
+
+          The published `veks` binary is built `--no-default-features`
+          so it doesn't require a system BLAS at runtime. The
+          `compute knn-blas` command is therefore unavailable in this
+          binary; `compute knn` (stdarch) is the default KNN engine.
+          Install via `cargo install veks` if you need the BLAS-backed
+          engine and have a BLAS provider on your system.
 
           ## Changes
 
