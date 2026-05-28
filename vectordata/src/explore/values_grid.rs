@@ -1,7 +1,7 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! `veks explore values` — scrollable raw-values grid.
+//! `vectordata explore values` — scrollable raw-values grid.
 //!
 //! Opens any vector source (local file or `dataset:profile:facet`) and
 //! presents the values as a 2-D grid of ordinals × dimensions, with

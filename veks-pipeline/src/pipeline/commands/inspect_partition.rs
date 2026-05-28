@@ -419,9 +419,21 @@ auto-resolved from the profile.
             partition_distances = vec![];
         }
 
-        // Stage 6: Comparison with filtered KNN
+        // Stage 6: Comparison with the default-profile pre-filter KNN
+        // (F facet). Reads the F slot from the default profile via the
+        // legacy `filtered_neighbor_indices` alias, which the facet
+        // resolver maps to `prefiltered_neighbor_indices` (canonical).
+        //
+        // Note on E vs F at partition scope: partition profiles carry
+        // **F only** by design. Within a partition every base vector
+        // matches that partition's predicate by construction, so the
+        // post-filter intersection `G ∩ R` collapses to the unfiltered
+        // top-K — the E and F facets would carry identical bytes. The
+        // E facet is therefore intentionally absent from partition
+        // profiles; consumers wanting "post-filter at partition scope"
+        // should read the partition's G or its F (they agree).
         ctx.ui.log("│");
-        ctx.ui.log("└─ Stage 6: Partition vs Filtered KNN ────────────────────");
+        ctx.ui.log("└─ Stage 6: Partition vs Filtered KNN (F facet, default profile) ─");
 
         let filtered_path = resolve("filtered_neighbor_indices");
         if let Some(fp) = filtered_path {

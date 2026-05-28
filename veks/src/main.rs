@@ -3,7 +3,7 @@
 
 #![allow(dead_code)] // legacy completion functions pending removal
 
-use veks::{cli, datasets, explore, pipeline, prepare};
+use veks::{cli, datasets, pipeline, prepare};
 
 use clap::{Arg, Command, CommandFactory, Parser, Subcommand};
 
@@ -92,9 +92,11 @@ struct Veks {
 enum Commands {
     /// Browse, search, and manage datasets and catalogs
     Datasets(datasets::DatasetsArgs),
-    /// Interactive data visualization and exploration (under development)
-    #[command(hide = true)]
-    Interact(explore::ExploreArgs),
+    // `Interact(explore::ExploreArgs)` was the `veks explore` /
+    // `veks interact` TUI entry. The implementation migrated to
+    // `vectordata::explore` and is now reachable via the
+    // `vectordata explore` binary; the veks-side subcommand is
+    // intentionally removed to avoid two copies of the same UI.
     /// Import, stratify, and prepare datasets for benchmarking
     Prepare(prepare::PrepareArgs),
     /// Execute a single pipeline command directly
@@ -343,7 +345,6 @@ fn main() {
 
     match veks.command {
         Commands::Datasets(args) => datasets::run(args),
-        Commands::Interact(args) => explore::run(args),
         Commands::Prepare(args) => prepare::run(args),
         Commands::Pipeline { args } => pipeline::cli::run_direct(args),
         Commands::Completions(args) => cli::completions(args),
@@ -634,7 +635,6 @@ fn dispatch_shorthand(args: Vec<String>) {
         let veks = Veks::parse_from(full_args);
         match veks.command {
             Commands::Datasets(a) => datasets::run(a),
-            Commands::Interact(a) => explore::run(a),
             Commands::Prepare(a) => prepare::run(a),
             _ => unreachable!(),
         }

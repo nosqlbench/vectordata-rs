@@ -314,7 +314,7 @@ fn dag_01_minimal_self_search() {
 
     // No metadata (M not in facets)
     assert_step_absent(&steps, "convert-metadata");
-    assert_step_absent(&steps, "compute-filtered-knn");
+    assert_step_absent(&steps, "compute-prefiltered-knn");
 
     // KNN (G in facets)
     assert_step_present(&steps, "compute-knn");
@@ -408,7 +408,7 @@ fn dag_04_with_metadata() {
     let extract_meta = assert_step_present(&steps, "extract-metadata");
     assert_option_contains(extract_meta, "range", "${clean_count}");
 
-    assert_step_present(&steps, "compute-filtered-knn");
+    assert_step_present(&steps, "compute-prefiltered-knn");
     assert_step_present(&steps, "verify-predicates");
 }
 
@@ -494,7 +494,7 @@ fn dag_07_metadata_no_filtered() {
 
     assert_step_present(&steps, "convert-metadata");
     assert_step_present(&steps, "evaluate-predicates");
-    assert_step_absent(&steps, "compute-filtered-knn");
+    assert_step_absent(&steps, "compute-prefiltered-knn");
     assert_step_present(&steps, "verify-predicates");
 }
 
@@ -657,7 +657,7 @@ fn dag_13_explicit_bqg() {
 
     // No metadata chain
     assert_step_absent(&steps, "convert-metadata");
-    assert_step_absent(&steps, "compute-filtered-knn");
+    assert_step_absent(&steps, "compute-prefiltered-knn");
 }
 
 // ── Config 14: No base vectors at all (empty pipeline) ────────────────
@@ -754,7 +754,7 @@ fn dag_17_metadata_explicit_no_filtered() {
     assert_step_present(&steps, "evaluate-predicates");
 
     // No filtered KNN (F not in facets)
-    assert_step_absent(&steps, "compute-filtered-knn");
+    assert_step_absent(&steps, "compute-prefiltered-knn");
     assert_step_present(&steps, "verify-predicates");
 }
 
@@ -796,7 +796,7 @@ fn dag_18_full_pipeline() {
     assert_step_present(&steps, "extract-metadata");
     assert_step_present(&steps, "evaluate-predicates");
     assert_step_present(&steps, "compute-knn");
-    assert_step_present(&steps, "compute-filtered-knn");
+    assert_step_present(&steps, "compute-prefiltered-knn");
     assert_step_present(&steps, "verify-knn");
     assert_step_present(&steps, "verify-predicates");
 
@@ -944,7 +944,7 @@ fn dag_23_full_with_early_stratification() {
 
     // Full facet chain
     assert_step_present(&steps, "convert-metadata");
-    assert_step_present(&steps, "compute-filtered-knn");
+    assert_step_present(&steps, "compute-prefiltered-knn");
 
     // Sized profiles
     assert!(yaml.contains("\nstrata:"), "root-level strata: key should be in dataset.yaml");

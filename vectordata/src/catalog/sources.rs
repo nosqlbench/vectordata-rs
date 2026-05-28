@@ -145,13 +145,17 @@ fn load_config(config_dir: &str) -> Result<Vec<String>, String> {
 /// Resolve a catalog path to a concrete URL or file path.
 ///
 /// Smart detection:
-/// - HTTP(S) URLs are kept as-is
+/// - Remote URLs (`http(s)://`, `s3://`) are kept as-is — the
+///   resolver routes them through [`crate::transport`] which handles
+///   the S3→virtual-hosted-HTTPS rewrite at fetch time.
 /// - Directories containing `catalogs.yaml`: load recursively
 /// - Directories containing `catalog.json`: use the directory URL
 /// - Plain files: use directly
 fn resolve_catalog_path(path: &str) -> Vec<String> {
-    // HTTP URLs pass through
-    if path.starts_with("http://") || path.starts_with("https://") {
+    // Any URL the shared transport speaks (currently `http://`,
+    // `https://`, `s3://`) passes through verbatim — the catalog
+    // fetcher normalises on the way to the wire.
+    if crate::transport::is_remote_url(path) {
         return vec![path.to_string()];
     }
 

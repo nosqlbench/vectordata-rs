@@ -1406,3 +1406,315 @@ impl CommandOp for VerifyPredicatesConsolidatedOp {
         }
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// verify postfiltered-knn-consolidated — verify E = G ∩ R across profiles
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Verifier for the **E facet** (post-filter KNN ground truth). For
+/// each sampled query in each non-partition profile, independently
+/// re-derives `E_q = G_q ∩ R_q` (preserving G's rank order, padding
+/// with `-1` sentinels) and byte-compares against the stored
+/// `postfiltered_neighbor_indices` file.
+///
+/// This is the verifier counterpart to `compute postfiltered-knn`.
+/// Both share a single semantic — E is defined as `G ∩ R` — so this
+/// verifier doesn't pull in BLAS, base vectors, or query vectors. It
+/// only reads G (`neighbor_indices`), R (`metadata_indices`), and the
+/// stored E. Cheap: O(K) per sampled query.
+///
+/// Per the design memo, partitions are F-only (within a partition E
+/// and F are byte-identical because every base vector matches the
+/// partition predicate), so partition profiles are skipped here.
+pub struct VerifyPostfilteredKnnConsolidatedOp;
+
+pub fn postfiltered_knn_consolidated_factory() -> Box<dyn CommandOp> {
+    Box::new(VerifyPostfilteredKnnConsolidatedOp)
+}
+
+impl CommandOp for VerifyPostfilteredKnnConsolidatedOp {
+    fn command_path(&self) -> &str { "verify postfiltered-knn-consolidated" }
+
+    fn category(&self) -> &'static dyn veks_completion::CategoryTag {
+        &crate::pipeline::command::CAT_VERIFY
+    }
+
+    fn level(&self) -> &'static dyn veks_completion::LevelTag {
+        &crate::pipeline::command::LVL_PRIMARY
+    }
+
+    fn command_doc(&self) -> CommandDoc {
+        CommandDoc {
+            summary: "Verify post-filter KNN ground truth (E = G ∩ R) across all profiles".into(),
+            body:
+                "For each non-partition profile, takes `--sample N` \
+                 queries (seeded by `--seed`) and independently \
+                 re-derives the post-filter neighbor row from the \
+                 on-disk unfiltered top-K and the predicate indices, \
+                 comparing byte-for-byte against the stored \
+                 postfiltered_neighbor_indices. Writes a JSON report \
+                 to `--output`. No base/query reread, no distance \
+                 recomputation — cost is O(K) per sampled query for \
+                 the membership test.\n\n\
+                 Partition profiles are skipped: within a partition \
+                 every base vector matches the partition predicate, so \
+                 `G ∩ R` collapses to G and the E/F distinction is \
+                 degenerate at partition scope."
+                .into(),
+        }
+    }
+
+    fn describe_options(&self) -> Vec<OptionDesc> {
+        vec![
+            OptionDesc {
+                name: "sample".into(), type_name: "int".into(), required: false,
+                default: Some("50".into()),
+                description: "Number of queries to sample per profile".into(),
+                extended_description: None, role: OptionRole::Config,
+            },
+            OptionDesc {
+                name: "seed".into(), type_name: "int".into(), required: false,
+                default: Some("42".into()),
+                description: "Sampling seed (reserved; current implementation samples evenly)".into(),
+                extended_description: None, role: OptionRole::Config,
+            },
+            OptionDesc {
+                name: "output".into(), type_name: "Path".into(), required: true,
+                default: None,
+                description: "Output JSON report".into(),
+                extended_description: None, role: OptionRole::Output,
+            },
+        ]
+    }
+
+    fn describe_resources(&self) -> Vec<ResourceDesc> { vec![] }
+
+    fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
+        let start = Instant::now();
+
+        // Facet preflight: E (and its prerequisites G + R) must exist
+        // on at least one non-partition profile, else the verifier has
+        // nothing to compare against.
+        if let Err(e) = crate::pipeline::dataset_lookup::validate_and_log(
+            ctx, options,
+            crate::pipeline::dataset_lookup::VerifyKind::PostfilteredKnnConsolidated,
+        ) {
+            return error_result(e, start);
+        }
+
+        let output_str = match options.require("output") {
+            Ok(s) => s.to_string(),
+            Err(e) => return error_result(e, start),
+        };
+        let output_path = resolve_path(&output_str, &ctx.workspace);
+
+        let sample_count: usize = match options.parse_or("sample", 50usize) {
+            Ok(v) => v, Err(e) => return error_result(e, start),
+        };
+
+        let dataset_path = ctx.workspace.join("dataset.yaml");
+        let config = match DatasetConfig::load(&dataset_path) {
+            Ok(c) => c,
+            Err(e) => return error_result(format!("failed to load dataset.yaml: {}", e), start),
+        };
+
+        // Collect non-partition profiles that have a postfiltered file
+        // on disk. Skip profiles without one — they may legitimately
+        // not have generated E yet, but they're not verifiable here.
+        let mut profiles: Vec<String> = Vec::new();
+        for (name, profile) in &config.profiles.profiles {
+            if profile.partition { continue; }
+            let stored_e = profile.views.get("postfiltered_neighbor_indices")
+                .map(|v| ctx.workspace.join(&v.source.path))
+                .unwrap_or_else(|| ctx.workspace.join(format!(
+                    "profiles/{}/postfiltered_neighbor_indices.ivec", name)));
+            if stored_e.exists() {
+                profiles.push(name.clone());
+            }
+        }
+
+        if profiles.is_empty() {
+            return error_result(
+                "no non-partition profile has postfiltered_neighbor_indices on disk".to_string(),
+                start,
+            );
+        }
+
+        ctx.ui.log(&format!(
+            "verify postfiltered-knn-consolidated: E = G ∩ R across {} profile{}; \
+             sample={} queries per profile",
+            profiles.len(),
+            if profiles.len() == 1 { "" } else { "s" },
+            sample_count,
+        ));
+
+        use std::collections::HashSet;
+
+        let mut all_results = Vec::new();
+        for name in &profiles {
+            let profile = config.profiles.profile(name);
+            let g_path = profile
+                .and_then(|p| p.views.get("neighbor_indices"))
+                .map(|v| ctx.workspace.join(&v.source.path))
+                .unwrap_or_else(|| ctx.workspace.join(format!(
+                    "profiles/{}/neighbor_indices.ivec", name)));
+            let e_path = profile
+                .and_then(|p| p.views.get("postfiltered_neighbor_indices"))
+                .map(|v| ctx.workspace.join(&v.source.path))
+                .unwrap_or_else(|| ctx.workspace.join(format!(
+                    "profiles/{}/postfiltered_neighbor_indices.ivec", name)));
+
+            // R is allowed under several names (canonical ivvec + two
+            // legacy ones) — try each in turn, same shape as the
+            // prefilter verifier.
+            let r_candidates = [
+                format!("profiles/{}/metadata_indices.ivvec", name),
+                format!("profiles/{}/metadata_indices.ivec",  name),
+                format!("profiles/{}/metadata_indices.slab",  name),
+            ];
+            let r_reader = {
+                let mut loaded = None;
+                let mut last_err = String::new();
+                for c in &r_candidates {
+                    let path = ctx.workspace.join(c);
+                    if path.exists() {
+                        match crate::pipeline::commands::compute_prefiltered_knn::PredicateIndices::open(&path) {
+                            Ok(r) => { loaded = Some(r); break; }
+                            Err(e) => { last_err = e; }
+                        }
+                    }
+                }
+                match loaded {
+                    Some(r) => r,
+                    None => {
+                        all_results.push(serde_json::json!({
+                            "name": name, "status": "error",
+                            "message": if last_err.is_empty() { "no metadata_indices file found".into() } else { last_err },
+                        }));
+                        continue;
+                    }
+                }
+            };
+
+            let g_reader = match XvecReader::<i32>::open_path(&g_path) {
+                Ok(r) => r,
+                Err(e) => {
+                    all_results.push(serde_json::json!({
+                        "name": name, "status": "error",
+                        "message": format!("open G ({}): {}", g_path.display(), e),
+                    }));
+                    continue;
+                }
+            };
+            let e_reader = match XvecReader::<i32>::open_path(&e_path) {
+                Ok(r) => r,
+                Err(e) => {
+                    all_results.push(serde_json::json!({
+                        "name": name, "status": "error",
+                        "message": format!("open E ({}): {}", e_path.display(), e),
+                    }));
+                    continue;
+                }
+            };
+
+            let q_count = VectorReader::<i32>::count(&g_reader);
+            let e_count = VectorReader::<i32>::count(&e_reader);
+            if q_count != e_count {
+                all_results.push(serde_json::json!({
+                    "name": name, "status": "error",
+                    "message": format!("G has {q_count} queries, E has {e_count}"),
+                }));
+                continue;
+            }
+            let actual_sample = sample_count.min(q_count);
+            let step = if q_count <= actual_sample || actual_sample == 0 { 1 }
+                       else { q_count / actual_sample };
+
+            let mut mismatches: u64 = 0;
+            let mut sampled: u64 = 0;
+            let mut first_mismatch: Option<usize> = None;
+
+            for i in 0..actual_sample {
+                let q = i * step;
+                if q >= q_count { break; }
+
+                let g_row = g_reader.get_slice(q);
+                let k = g_row.len();
+                let stored_e = e_reader.get_slice(q);
+                if stored_e.len() != k {
+                    if first_mismatch.is_none() { first_mismatch = Some(q); }
+                    mismatches += 1;
+                    sampled += 1;
+                    continue;
+                }
+
+                // Re-derive E_q = G_q ∩ R_q in rank order with -1 pad.
+                let r_set: HashSet<i32> = match r_reader.get_ordinals(q) {
+                    Ok(v) => v.into_iter().collect(),
+                    Err(e) => {
+                        all_results.push(serde_json::json!({
+                            "name": name, "status": "error",
+                            "message": format!("read R q={q}: {e}"),
+                        }));
+                        return finish_report(&output_path, profiles.len(), actual_sample, all_results, start);
+                    }
+                };
+                let mut expected: Vec<i32> = Vec::with_capacity(k);
+                for &ord in g_row.iter() {
+                    if ord < 0 { continue; } // G sentinel
+                    if r_set.contains(&ord) { expected.push(ord); }
+                }
+                while expected.len() < k { expected.push(-1); }
+
+                if expected != stored_e {
+                    if first_mismatch.is_none() { first_mismatch = Some(q); }
+                    mismatches += 1;
+                }
+                sampled += 1;
+            }
+
+            all_results.push(serde_json::json!({
+                "name": name,
+                "status": if mismatches == 0 { "verified" } else { "mismatch" },
+                "queries":  q_count,
+                "sampled":  sampled,
+                "mismatches": mismatches,
+                "first_mismatch_query": first_mismatch,
+            }));
+        }
+
+        finish_report(&output_path, profiles.len(), sample_count, all_results, start)
+    }
+}
+
+/// Common report-writer used by the postfilter verifier above. Lifted
+/// to a free function so the error-exit paths inside the per-profile
+/// loop can short-circuit without duplicating the JSON layout.
+fn finish_report(
+    output_path: &Path,
+    profile_count: usize,
+    sample: usize,
+    profiles: Vec<serde_json::Value>,
+    start: Instant,
+) -> CommandResult {
+    if let Some(parent) = output_path.parent() { let _ = std::fs::create_dir_all(parent); }
+    let report = serde_json::json!({
+        "type": "postfiltered-knn-consolidated",
+        "sample": sample,
+        "profiles": profiles,
+    });
+    let _ = std::fs::write(output_path, serde_json::to_string_pretty(&report).unwrap_or_default());
+
+    let mismatch_total: u64 = report["profiles"].as_array()
+        .map(|a| a.iter().map(|p| p["mismatches"].as_u64().unwrap_or(0)).sum())
+        .unwrap_or(0);
+    CommandResult {
+        status: if mismatch_total == 0 { Status::Ok } else { Status::Error },
+        message: format!(
+            "postfilter verify: {} profiles, sample={}, mismatches={}",
+            profile_count, sample, mismatch_total,
+        ),
+        produced: vec![output_path.to_path_buf()],
+        elapsed: start.elapsed(),
+    }
+}

@@ -37,7 +37,7 @@ use super::shared::{
     UnifiedReader, SampleMode, sample_indices, clump_size_for_dim,
     install_abort_handler, normalize,
 };
-use vectordata::CacheStats;
+use crate::CacheStats;
 
 // ---------------------------------------------------------------------------
 // View definitions
@@ -570,9 +570,20 @@ pub(super) fn run_interactive_explore(
                             dist_rx = Some(drx);
                             let buf2 = buf.clone();
                             std::thread::spawn(move || {
-                                let dist_fn = crate::pipeline::simd_distance::select_distance_fn(
-                                    crate::pipeline::simd_distance::Metric::L2);
-                                let mut rng = crate::pipeline::rng::seeded_rng(42);
+                                // L2 squared via simsimd — the existing
+                                // `.sqrt()` on the result converts to true
+                                // L2 distance. Replaces the migrated-away
+                                // `pipeline::simd_distance::Metric::L2` /
+                                // `select_distance_fn` indirection.
+                                use simsimd::SpatialSimilarity;
+                                // simsimd returns Option<f64>; cast at
+                                // the boundary so the closure stays
+                                // f32-on-the-wire to match the buffer
+                                // and the `.sqrt()` consumer.
+                                let dist_fn = |a: &[f32], b: &[f32]| -> f32 {
+                                    f32::l2sq(a, b).unwrap_or(f64::INFINITY) as f32
+                                };
+                                let mut rng = crate::explore::seeded_rng(42);
                                 use rand::Rng;
                                 let bs = 1000;
                                 let mut batch = Vec::with_capacity(bs);

@@ -1,19 +1,51 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! `veks explore` — interactive visualization and exploration commands.
+//! `vectordata explore` — interactive visualization and exploration.
 //!
-//! These are user-facing TUI/interactive tools that don't belong in the
-//! pipeline command registry (they're not composable pipeline steps).
+//! Owns the ratatui-based dataset browser, raw-values grid, and REPL
+//! command engine. Originally lived in `veks/src/explore/`; migrated
+//! into vectordata to make `vectordata explore` self-contained — the
+//! TUI never had a real pipeline-command-framework dependency (the
+//! wiring that looked like one was dead code).
+//!
 //! The source argument accepts either a local file path or a
 //! `dataset:profile:facet` specifier from the catalog.
 
 pub mod shared;
+pub mod repl;
 mod data_shell;
 mod dataset_picker;
 mod palette;
 mod unified;
 mod values_grid;
+
+/// Resolve the configured cache directory or exit the process with a
+/// helpful error message. Used as the entry-point fallback when the
+/// explore TUI needs to know where remote-cache blobs live and has
+/// nowhere sensible to proceed without one.
+pub(crate) fn cache_dir_or_exit() -> std::path::PathBuf {
+    match crate::settings::cache_dir() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Error: cannot resolve cache_dir from settings: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Deterministic seeded RNG used by sampling code in the explore
+/// TUI. Mirrors the `veks-pipeline::rng::seeded_rng` shape that the
+/// pre-migration code called into — same xoshiro256++ generator, so
+/// any test that pins a sample under a given seed continues to
+/// produce identical output.
+pub(crate) fn seeded_rng(seed: u64) -> rand_xoshiro::Xoshiro256PlusPlus {
+    // SeedableRng is re-exported by rand_xoshiro itself so this works
+    // without a separate `rand` dependency in vectordata's
+    // (non-dev) deps.
+    use rand_xoshiro::rand_core::SeedableRng;
+    rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(seed)
+}
 
 use std::path::PathBuf;
 
@@ -200,53 +232,12 @@ pub fn run(args: ExploreArgs) {
     }
 }
 
-/// Run a pipeline command with a plain (non-TUI) sink.
-#[allow(dead_code)]
-fn run_pipeline_command(
-    mut cmd: Box<dyn crate::pipeline::command::CommandOp>,
-    source: &str,
-    extra_args: &[String],
-) {
-    use crate::pipeline::command::{Options, StreamContext, Status};
-    use crate::pipeline::progress::ProgressLog;
-    use crate::pipeline::resource::ResourceGovernor;
-    use indexmap::IndexMap;
-
-    let workspace = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-
-    let mut opts = Options::new();
-    opts.set("source", source);
-    for arg in extra_args {
-        if let Some(kv) = arg.strip_prefix("--") {
-            if let Some((k, v)) = kv.split_once('=') {
-                opts.set(k, v);
-            } else {
-                opts.set(kv, "true");
-            }
-        }
-    }
-
-    let mut ctx = StreamContext {
-        dataset_name: String::new(),
-        profile: String::new(),
-        profile_names: vec![],
-        workspace: workspace.clone(),
-        cache: workspace.join(".cache"),
-        defaults: IndexMap::new(),
-        dry_run: false,
-        progress: ProgressLog::new(),
-        threads: 0,
-        step_id: String::new(),
-        governor: ResourceGovernor::default_governor(),
-        ui: crate::ui::UiHandle::new(std::sync::Arc::new(crate::ui::PlainSink::new())),
-        status_interval: std::time::Duration::from_secs(1),
-        estimated_total_steps: 0,
-        provenance_selector: veks_pipeline::pipeline::provenance::ProvenanceFlags::STRICT,
-    };
-
-    let result = cmd.execute(&opts, &mut ctx);
-    if result.status == Status::Error {
-        eprintln!("Error: {}", result.message);
-        std::process::exit(1);
-    }
-}
+// `run_pipeline_command` lived here as `#[allow(dead_code)]`
+// scaffolding for invoking pipeline `CommandOp` instances from the
+// explore TUI. It was the only consumer of `veks-pipeline`'s
+// `StreamContext` / `ProgressLog` / `ResourceGovernor` / `ui::*`
+// inside this module, and nothing ever called it. It was deleted
+// during the migration into vectordata — explore is now leaf-crate
+// code and has no business reaching back up into the pipeline
+// command framework. Re-add a vectordata-local equivalent if a
+// future need surfaces.

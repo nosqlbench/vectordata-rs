@@ -324,7 +324,7 @@ fn stale_sidecar_with_missing_data_file_resets_bitmap() {
 /// against an HTTP-served `dataset.yaml`, while concurrently
 /// reading sample records from the underlying view. This
 /// exercises the chunked-http path the same way `vectordata
-/// datasets precache` and `veks explore` do: open via catalog
+/// datasets precache` and `vectordata explore` do: open via catalog
 /// metadata → resolve facets → precache → read.
 #[test]
 fn pipeline_prebuffer_then_concurrent_reads_through_view() {

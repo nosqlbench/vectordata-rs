@@ -17,7 +17,9 @@ pub mod analyze_compare;
 // Calls cblas_snrm2 — Unix-only (BLAS link).
 #[cfg(all(feature = "knnutils", unix))]
 pub mod analyze_fvecs_check_knnutils;
-pub mod analyze_explore;
+// `analyze_explore` (the REPL command engine) migrated to
+// `vectordata::explore::repl` so the TUI lives entirely within the
+// vectordata crate; the explore code was the only consumer.
 pub mod analyze_predicate_summary;
 pub mod analyze_find_duplicates;
 pub mod analyze_find_zeros;
@@ -268,7 +270,14 @@ pub fn register_all(registry: &mut CommandRegistry) {
     registry.register("verify knn-faiss", verify_knn_faiss::factory);
     #[cfg(feature = "faiss")]
     registry.register("verify knn-faiss-consolidated", verify_knn_faiss::consolidated_factory);
-    registry.register("verify filtered-knn-consolidated", verify_consolidated::filtered_knn_consolidated_factory);
+    // F facet (pre-filter) verifier. Legacy `verify filtered-knn-
+    // consolidated` is kept as an alias under the same factory so
+    // pre-E/F-split pipelines keep working; new pipelines should use
+    // `verify prefiltered-knn-consolidated`.
+    registry.register("verify prefiltered-knn-consolidated", verify_consolidated::filtered_knn_consolidated_factory);
+    registry.register("verify filtered-knn-consolidated",   verify_consolidated::filtered_knn_consolidated_factory);
+    // E facet (post-filter) verifier — derives G ∩ R and byte-compares.
+    registry.register("verify postfiltered-knn-consolidated", verify_consolidated::postfiltered_knn_consolidated_factory);
     registry.register("verify predicates-consolidated", verify_consolidated::predicates_consolidated_factory);
     registry.register("verify predicates-sqlite", verify_predicates_sqlite::factory);
 

@@ -264,7 +264,7 @@ fn import_with_metadata_generates_predicate_chain() {
     assert!(yaml.contains("survey-metadata"), "should survey metadata");
     assert!(yaml.contains("generate-predicates"), "should synthesize predicates");
     assert!(yaml.contains("evaluate-predicates"), "should evaluate predicates");
-    assert!(yaml.contains("compute filtered-knn"), "should have filtered KNN");
+    assert!(yaml.contains("compute prefiltered-knn"), "should have filtered KNN");
 }
 
 #[test]
@@ -290,7 +290,7 @@ fn import_no_filtered_skips_filtered_knn() {
     // Metadata chain still present
     assert!(yaml.contains("survey-metadata"));
     // But no filtered KNN
-    assert!(!yaml.contains("compute filtered-knn"),
+    assert!(!yaml.contains("compute prefiltered-knn"),
         "should not have filtered KNN with --no-filtered");
 }
 
@@ -909,13 +909,13 @@ fn project_artifacts_compute_knn_no_distances() {
     assert!(manifest.intermediates.is_empty());
 }
 
-// ── compute filtered-knn ────────────────────────────────────────────────────
+// ── compute prefiltered-knn ────────────────────────────────────────────────────
 
 #[test]
 fn project_artifacts_compute_filtered_knn() {
     use veks::pipeline::command::Options;
 
-    let cmd = make_cmd("compute filtered-knn");
+    let cmd = make_cmd("compute prefiltered-knn");
     let mut opts = Options::new();
     opts.set("base", "base.mvecs[0..${base_count})");
     opts.set("query", "query.mvecs");
@@ -929,7 +929,7 @@ fn project_artifacts_compute_filtered_knn() {
 
     let manifest = cmd.project_artifacts("fknn-step", &opts);
     assert_eq!(manifest.step_id, "fknn-step");
-    assert_eq!(manifest.command, "compute filtered-knn");
+    assert_eq!(manifest.command, "compute prefiltered-knn");
     // Window notation stripped from base
     assert_eq!(manifest.inputs, vec![
         "base.mvecs",
@@ -947,7 +947,7 @@ fn project_artifacts_compute_filtered_knn() {
 fn project_artifacts_compute_filtered_knn_cache_mixed() {
     use veks::pipeline::command::Options;
 
-    let cmd = make_cmd("compute filtered-knn");
+    let cmd = make_cmd("compute prefiltered-knn");
     let mut opts = Options::new();
     opts.set("base", "base.mvecs");
     opts.set("query", "query.mvecs");
@@ -1704,9 +1704,11 @@ fn import_full_pipeline_all_features() {
         "generate-predicates",
         "evaluate-predicates",
         "compute-knn",
-        "compute-filtered-knn",
+        "compute-prefiltered-knn",
+        "compute-postfiltered-knn",
         "verify-knn",
-        "verify-filtered-knn",
+        "verify-prefiltered-knn",
+        "verify-postfiltered-knn",
         "verify-predicates",
         "generate-dataset-json",
         "generate-variables-json",
@@ -1748,7 +1750,7 @@ fn import_full_pipeline_everything_disabled() {
     assert!(!ids.contains(&"prepare-vectors".to_string()), "no prepare: {:?}", ids);
     assert!(!ids.contains(&"count-duplicates".to_string()), "no count-duplicates: {:?}", ids);
     assert!(!ids.contains(&"convert-metadata".to_string()), "no metadata: {:?}", ids);
-    assert!(!ids.contains(&"compute-filtered-knn".to_string()), "no filtered KNN: {:?}", ids);
+    assert!(!ids.contains(&"compute-prefiltered-knn".to_string()), "no filtered KNN: {:?}", ids);
     // --no-dedup / --no-zero-check toggle REMOVAL. They used to also
     // suppress the standalone scans, but that left `zero_count` and
     // `duplicate_count` unset — which in turn left
@@ -1855,7 +1857,7 @@ fn project_artifacts_every_registered_command_no_panic() {
         "analyze slice", "analyze stats", "analyze survey", "analyze verify-knn",
         "analyze verify-profiles", "analyze zeros",
         // compute
-        "compute evaluate-predicates", "compute filtered-knn", "compute knn",
+        "compute evaluate-predicates", "compute prefiltered-knn", "compute knn",
         "compute sort",
         // config — moved to `datasets config` subgroup
         // download

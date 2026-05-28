@@ -4,13 +4,13 @@
 //! REPL command engine for the interactive explore TUI.
 //!
 //! This module owns the textual command-table that the explore
-//! TUI's data shell (`veks/src/explore/data_shell.rs`) dispatches
+//! TUI's data shell (`crate::explore::data_shell`) dispatches
 //! against: `info`, `get`, `range`, `head`, `tail`, `dist`, `norm`,
 //! `stats`, `help`, etc.
 //!
 //! Originally registered as the `"analyze visualize-explore"`
 //! pipeline command, but the interactive surface migrated to the
-//! ratatui-based explorer in `veks/src/explore/unified.rs` (see
+//! ratatui-based explorer in `crate::explore::unified` (see
 //! sysref §22). The CommandOp wrapper was removed when the
 //! pipeline-command path lost users; the REPL helpers below
 //! survive because the new TUI still uses them as its command

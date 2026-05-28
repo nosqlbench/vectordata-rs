@@ -322,7 +322,7 @@ update each requires.
 | `veks/src/prepare/import.rs`                                      | Pipeline scaffolding emits both producers (and both verifiers). |
 | `veks/src/prepare/infer_manifest.rs`                              | File-pattern inference recognises `prefiltered_neighbor_*` and updated `filtered_neighbor_*` semantics. |
 | `veks/src/prepare/stratify.rs`                                    | Partition-profile construction honours the new pairing (see partition note above). |
-| `veks/src/explore/dataset_picker.rs`                              | TUI lists both facets when present. |
+| `vectordata/src/explore/dataset_picker.rs`                        | TUI lists both facets when present. |
 | `tools/src/bin/gen_swimlane.rs`                                   | Re-label F (pre-filter) to make the semantic explicit and add an E (post-filter, G ∩ R) column. Today's F tooltip already describes pre-filtering — keep it on F and add a new tooltip for E that describes G ∩ R. |
 
 ### 7.2 Schema only (variants/keys)

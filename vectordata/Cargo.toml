@@ -39,12 +39,40 @@ url = "2.5"
 # can drop clap with `default-features = false`.
 clap = { version = "4", features = ["derive", "string"], optional = true }
 clap_complete = { version = "4", features = ["unstable-dynamic"], optional = true }
+# Used by the `explore` subcommand's TUI for value similarity, seeded
+# sampling, parallel batched analytics, and Ctrl-C abort handling.
+# All kept optional so library-only consumers (cargo install
+# --no-default-features ...) drop them out.
+simsimd = { version = "6", optional = true }
+rand_xoshiro = { version = "0.7", optional = true }
+rand = { version = "0.9", optional = true }
+rayon = { version = "1", optional = true }
+# signal-hook is POSIX-flavoured; the explore TUI gates its single
+# call site with `#[cfg(unix)]` and falls back to the OS default
+# SIGINT handler on Windows. Kept as a regular optional dep (rather
+# than `[target.'cfg(unix)'.dependencies]`) so feature-flag wiring
+# stays simple — the unused crate on Windows is a tiny compile cost.
+signal-hook = { version = "0.3", optional = true }
 
 [features]
-default = ["cli"]
+default = ["cli", "explore"]
 # Enables the `vectordata` binary. Library users who don't need the
 # binary can disable this with `default-features = false`.
 cli = ["dep:clap", "dep:clap_complete"]
+# Enables the `vectordata explore` interactive TUI subcommand. The
+# crossterm/ratatui/unicode-width terminal stack is already a hard
+# dep of vectordata for the existing datasets browser; this feature
+# only adds the analytic stack (simsimd, rand, rand_xoshiro, rayon)
+# plus a POSIX SIGINT handler (signal-hook, no-op on Windows).
+# Library users who want a smaller dep tree can drop it with
+# --no-default-features.
+explore = [
+    "dep:simsimd",
+    "dep:rand_xoshiro",
+    "dep:rand",
+    "dep:rayon",
+    "dep:signal-hook",
+]
 
 [[bin]]
 name = "vectordata"

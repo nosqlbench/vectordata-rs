@@ -24,6 +24,7 @@ pub mod catalog;
 pub mod check;
 pub mod cli;
 pub mod datasets;
-pub mod explore;
+// `pub mod explore` was migrated to `vectordata::explore`; the
+// `vectordata explore` binary is the single entry point now.
 pub mod prepare;
 pub mod publish;

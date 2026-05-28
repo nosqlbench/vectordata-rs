@@ -815,8 +815,8 @@ fn resolve_slots(args: &ImportArgs) -> PipelineSlots {
         None
     } else {
         Some(Artifact::Materialized {
-            step_id: "compute-filtered-knn".into(),
-            output: "filtered_neighbor_indices.ivecs".into(), // per_profile
+            step_id: "compute-prefiltered-knn".into(),
+            output: "prefiltered_neighbor_indices.ivec".into(), // per_profile
         })
     };
 
@@ -1955,8 +1955,8 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
                 }
             }
             steps.push(Step {
-                id: "compute-filtered-knn".into(),
-                run: "compute filtered-knn".into(),
+                id: "compute-prefiltered-knn".into(),
+                run: "compute prefiltered-knn".into(),
                 description: Some("Compute filtered KNN with predicate pre-filtering".into()),
                 after,
                 per_profile: true,
@@ -1967,8 +1967,8 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
                         ("base".into(), compute_knn_base_arg(slots, &working_vectors, subset_applied)),
                         ("query".into(), slots.query_vectors.as_ref().unwrap().path().into()),
                         ("metadata-indices".into(), slots.metadata.as_ref().unwrap().predicate_indices.path().into()),
-                        ("indices".into(), "filtered_neighbor_indices.ivecs".into()),
-                        ("distances".into(), "filtered_neighbor_distances.fvecs".into()),
+                        ("indices".into(), "prefiltered_neighbor_indices.ivec".into()),
+                        ("distances".into(), "prefiltered_neighbor_distances.fvec".into()),
                         ("neighbors".into(), args.neighbors.to_string()),
                         ("metric".into(), args.metric.clone()),
                     ];
@@ -1977,6 +1977,47 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
                     }
                     opts
                 },
+            });
+
+            // ── compute-postfiltered-knn: derive E = G ∩ R ───────────
+            // Runs after the unfiltered KNN (G) and the predicate
+            // evaluation (R). Cheap O(K) per query — no base/query
+            // reread, no distance recompute. Survivor distances are
+            // copied from D (the unfiltered distances file). See
+            // `docs/design/prefilter-postfilter-facets.md` for the
+            // F/E split rationale.
+            let mut e_after: Vec<String> = Vec::new();
+            if let Some(ref knn) = slots.knn {
+                if knn.is_materialized() {
+                    e_after.push(knn.step_id().into());
+                }
+            }
+            if let Some(ref meta) = slots.metadata {
+                if meta.predicate_indices.is_materialized() {
+                    e_after.push(meta.predicate_indices.step_id().into());
+                }
+            }
+            let mut e_opts: Vec<(String, String)> = vec![
+                ("ground-truth".into(), "neighbor_indices.ivec".into()),
+                ("metadata-indices".into(), slots.metadata.as_ref().unwrap().predicate_indices.path().into()),
+                ("indices".into(), "postfiltered_neighbor_indices.ivec".into()),
+            ];
+            // Only forward D when it's actually present on disk —
+            // skipping it means the producer omits E's distances file
+            // rather than failing the run.
+            if slots.knn.as_ref().is_some_and(|k| k.is_materialized()) {
+                e_opts.push(("ground-truth-distances".into(), "neighbor_distances.fvec".into()));
+                e_opts.push(("distances".into(), "postfiltered_neighbor_distances.fvec".into()));
+            }
+            steps.push(Step {
+                id: "compute-postfiltered-knn".into(),
+                run: "compute postfiltered-knn".into(),
+                description: Some("Derive post-filter KNN ground truth (E = G ∩ R)".into()),
+                after: e_after,
+                per_profile: true,
+                phase: 2,
+                finalize: false,
+                options: e_opts,
             });
         }
     }
@@ -2088,7 +2129,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
     let is_simple_synth = args.synthesis_mode == "simple-int-eq" && args.synthesize_metadata;
     // ── Predicate verification ───────────────────────────────────────
     // verify-predicates-sqlite: SQLite oracle verification of R
-    // Runs after evaluate-predicates, before compute-filtered-knn
+    // Runs after evaluate-predicates, before compute-prefiltered-knn
     if is_simple_synth {
         if let Some(ref meta) = slots.metadata {
             if meta.predicate_indices.is_materialized() {
@@ -2137,12 +2178,12 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
     if let Some(ref fknn) = slots.filtered_knn {
         if fknn.is_materialized() {
             let meta = slots.metadata.as_ref().unwrap();
-            // verify-filtered-knn: brute-force re-computation of filtered KNN
+            // verify-prefiltered-knn: brute-force re-computation of F (pre-filter) ground truth
             steps.push(Step {
-                id: "verify-filtered-knn".into(),
-                run: "verify filtered-knn-consolidated".into(),
+                id: "verify-prefiltered-knn".into(),
+                run: "verify prefiltered-knn-consolidated".into(),
                 description: Some("Verify filtered KNN results via brute-force recomputation".into()),
-                after: vec!["compute-filtered-knn".into()],
+                after: vec!["compute-prefiltered-knn".into()],
                 per_profile: false,
                 phase: 0,
                 finalize: false,
@@ -2155,7 +2196,26 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
                     ("normalized".into(), if args.normalize { "true" } else { "false" }.into()),
                     ("sample".into(), "50".into()),
                     ("seed".into(), format!("${{{}}}", "seed")),
-                    ("output".into(), "${cache}/verify_filtered_knn.json".into()),
+                    ("output".into(), "${cache}/verify_prefiltered_knn.json".into()),
+                ],
+            });
+
+            // ── verify-postfiltered-knn: re-derive E and byte-compare ─
+            // Lightweight check that the stored postfiltered_neighbor_*
+            // files equal `G ∩ R` for sampled queries. Cheap O(K) per
+            // query — no BLAS / no base+query reread.
+            steps.push(Step {
+                id: "verify-postfiltered-knn".into(),
+                run: "verify postfiltered-knn-consolidated".into(),
+                description: Some("Verify post-filter KNN (E = G ∩ R) via re-derivation".into()),
+                after: vec!["compute-postfiltered-knn".into()],
+                per_profile: false,
+                phase: 0,
+                finalize: false,
+                options: vec![
+                    ("sample".into(), "50".into()),
+                    ("seed".into(), format!("${{{}}}", "seed")),
+                    ("output".into(), "${cache}/verify_postfiltered_knn.json".into()),
                 ],
             });
         }
@@ -2172,7 +2232,12 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
     }
     if let Some(ref fknn) = slots.filtered_knn {
         if fknn.is_materialized() {
-            json_after.push("verify-filtered-knn".into());
+            json_after.push("verify-prefiltered-knn".into());
+            // E facet's verifier rides the same materialization gate
+            // because the postfilter step is emitted alongside the
+            // prefilter step (both share the F-facet slot in
+            // `slots.filtered_knn`).
+            json_after.push("verify-postfiltered-knn".into());
         }
     }
     if is_simple_synth && slots.metadata.is_some() {
@@ -2189,7 +2254,7 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
         // If filtered KNN was computed, wait for its verification first.
         // Otherwise, just wait for metadata to be ready.
         let partition_after = if slots.filtered_knn.as_ref().map(|f| f.is_materialized()).unwrap_or(false) {
-            vec!["verify-filtered-knn".into()]
+            vec!["verify-prefiltered-knn".into()]
         } else if let Some(ref meta) = slots.metadata {
             if meta.metadata_content.is_materialized() {
                 vec![meta.metadata_content.step_id().into()]
@@ -2391,8 +2456,12 @@ fn profile_views(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::pa
 
     if let Some(ref fknn) = slots.filtered_knn {
         if fknn.is_materialized() {
-            views.push(("filtered_neighbor_indices".into(), format!("{}filtered_neighbor_indices.ivecs", args.default_prefix())));
-            views.push(("filtered_neighbor_distances".into(), format!("{}filtered_neighbor_distances.fvecs", args.default_prefix())));
+            // F facet — pre-filter ground truth, canonical key
+            views.push(("prefiltered_neighbor_indices".into(),  format!("{}prefiltered_neighbor_indices.ivec",  args.default_prefix())));
+            views.push(("prefiltered_neighbor_distances".into(), format!("{}prefiltered_neighbor_distances.fvec", args.default_prefix())));
+            // E facet — post-filter ground truth (G ∩ R)
+            views.push(("postfiltered_neighbor_indices".into(),  format!("{}postfiltered_neighbor_indices.ivec",  args.default_prefix())));
+            views.push(("postfiltered_neighbor_distances".into(), format!("{}postfiltered_neighbor_distances.fvec", args.default_prefix())));
         }
     }
 
@@ -3676,7 +3745,7 @@ mod tests {
         assert!(step_ids.contains(&"convert-metadata"), "steps: {:?}", step_ids);
         assert!(step_ids.contains(&"survey-metadata"), "steps: {:?}", step_ids);
         assert!(step_ids.contains(&"compute-knn"), "steps: {:?}", step_ids);
-        assert!(step_ids.contains(&"compute-filtered-knn"), "steps: {:?}", step_ids);
+        assert!(step_ids.contains(&"compute-prefiltered-knn"), "steps: {:?}", step_ids);
         // Strategy 1: shuffle and extract ARE present
         assert!(step_ids.contains(&"generate-shuffle"), "steps: {:?}", step_ids);
         assert!(step_ids.contains(&"extract-queries"), "steps: {:?}", step_ids);

@@ -22,7 +22,7 @@ use ratatui::{
     Terminal,
 };
 use unicode_width::UnicodeWidthStr;
-use vectordata::dataset::CatalogEntry;
+use crate::dataset::CatalogEntry;
 
 /// Pad a string to `target` DISPLAY columns (not bytes). Rust's built-in
 /// `format!("{:<w$}", ...)` pads by byte count, which under-reserves
@@ -85,7 +85,7 @@ impl PickerRow {
 }
 
 fn build_rows(entries: &[CatalogEntry]) -> Vec<PickerRow> {
-    let cache_dir = crate::pipeline::commands::config::configured_cache_dir_or_exit();
+    let cache_dir = crate::explore::cache_dir_or_exit();
     let mut rows = Vec::new();
     for entry in entries {
         let metric = entry.layout.attributes.as_ref()
@@ -97,7 +97,7 @@ fn build_rows(entries: &[CatalogEntry]) -> Vec<PickerRow> {
 
         for profile_name in entry.profile_names() {
             let profile = entry.layout.profiles.profile(profile_name);
-            let bc = vectordata::dataset::profile::profile_sort_key(
+            let bc = crate::dataset::profile::profile_sort_key(
                 profile_name, profile.and_then(|p| p.base_count));
             // Show count from profile's base_count (partition profiles, sized profiles)
             let explicit_count = profile.and_then(|p| p.base_count);
@@ -169,9 +169,9 @@ fn build_rows(entries: &[CatalogEntry]) -> Vec<PickerRow> {
 fn profile_cache_coverage(
     ds_cache: &std::path::Path,
     ds_workspace: &std::path::Path,
-    profile: &vectordata::dataset::profile::DSProfile,
+    profile: &crate::dataset::profile::DSProfile,
 ) -> (u32, u32) {
-    use vectordata::merkle::MerkleState;
+    use crate::merkle::MerkleState;
 
     let mut valid = 0u32;
     let mut total = 0u32;
@@ -219,8 +219,8 @@ fn profile_cache_coverage(
 ///
 /// Letters: B(base) Q(query) G(ground-truth indices) D(distances)
 ///          M(metadata) P(predicates) R(results) F(filtered-knn)
-fn facet_indicators(views: &indexmap::IndexMap<String, vectordata::dataset::DSView>) -> String {
-    use vectordata::dataset::StandardFacet;
+fn facet_indicators(views: &indexmap::IndexMap<String, crate::dataset::DSView>) -> String {
+    use crate::dataset::StandardFacet;
 
     let mut out = String::with_capacity(10);
     let has = |facet: StandardFacet| -> bool {

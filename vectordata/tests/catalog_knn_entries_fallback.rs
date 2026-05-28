@@ -288,7 +288,7 @@ fn http_404_on_canonical_falls_through_to_knn_entries() {
 /// because that path is just the catalog's base URL and there is
 /// no `dataset.yaml` at that location. Regression guard for the
 /// "Failed to read dataset configuration: No such file or
-/// directory" failure that hit `veks explore` against an `s3://`
+/// directory" failure that hit `vectordata explore` against an `s3://`
 /// SimpleMFD catalog.
 #[test]
 fn catalog_open_synthesizes_group_for_knn_entries_entry() {

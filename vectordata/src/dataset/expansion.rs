@@ -67,10 +67,14 @@ fn command_facet(run: &str) -> Option<char> {
         "compute prefiltered-knn" | "compute filtered-knn" => Some('F'),
         // E facet — post-filter KNN (G ∩ R, new sparse artifact).
         "compute postfiltered-knn" => Some('E'),
-        // Verifiers route by facet they validate; the consolidated
-        // verifier maps to F (its legacy semantic — pre-filter ground
-        // truth). Phase 3 splits this into F and E verifiers.
-        "verify filtered-knn-consolidated" => Some('F'),
+        // Verifiers route by facet they validate. Both the canonical
+        // `verify prefiltered-knn-consolidated` and the legacy
+        // `verify filtered-knn-consolidated` alias map to F (pre-filter
+        // ground truth). The new `verify postfiltered-knn-consolidated`
+        // re-derives E = G ∩ R and byte-compares.
+        "verify prefiltered-knn-consolidated"
+            | "verify filtered-knn-consolidated" => Some('F'),
+        "verify postfiltered-knn-consolidated" => Some('E'),
         "generate predicates" => Some('P'),
         _ => None,
     }

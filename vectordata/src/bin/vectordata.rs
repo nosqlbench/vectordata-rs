@@ -60,6 +60,12 @@ enum Cmd {
         #[arg(long = "at", global = true)]
         at: Vec<String>,
     },
+    /// Interactive data visualization and exploration TUI.
+    /// Browse datasets, page through raw vector values, sample
+    /// distances, and run REPL commands against any local file or
+    /// catalog facet.
+    #[cfg(feature = "explore")]
+    Explore(vectordata::explore::ExploreArgs),
     /// Print or activate tab-completion for the current shell.
     ///
     /// With no arguments, auto-detects your shell from `$SHELL` and
@@ -354,6 +360,8 @@ fn main() {
             if code != 0 { std::process::exit(code); }
         }
         Cmd::Completions { shell } => cmd_completions(shell),
+        #[cfg(feature = "explore")]
+        Cmd::Explore(args) => vectordata::explore::run(args),
     }
 }
 

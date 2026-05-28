@@ -45,8 +45,10 @@ variables:
   source_zero_count: '0'
   verified_count:base_vectors.fvec: '1000000'
   verified_count:duplicates.ivec: '0'
-  verified_count:filtered_neighbor_distances.fvec: '10000'
-  verified_count:filtered_neighbor_indices.ivec: '10000'
+  verified_count:postfiltered_neighbor_distances.fvec: '10000'
+  verified_count:postfiltered_neighbor_indices.ivec: '10000'
+  verified_count:prefiltered_neighbor_distances.fvec: '10000'
+  verified_count:prefiltered_neighbor_indices.ivec: '10000'
   verified_count:metadata_content.u8: '1000000'
   verified_count:metadata_indices.ivvec: '10000'
   verified_count:neighbor_distances.fvec: '10000'
@@ -176,26 +178,26 @@ upstream:
       fields: 1
       output: "${cache}/verify_predicates_sqlite.json"
 
-    # ── Filtered KNN ─────────────────────────────────────────────
+    # ── Pre-filter KNN (F facet, ACORN G_K) ──────────────────────
 
-    - id: compute-filtered-knn
-      description: Compute filtered KNN with predicate pre-filtering
-      run: compute filtered-knn
+    - id: compute-prefiltered-knn
+      description: Compute pre-filter KNN ground truth (F facet)
+      run: compute prefiltered-knn
       per_profile: true
       phase: 2
       after: [verify-predicates-sqlite]
       base: profiles/base/base_vectors.fvec
       query: profiles/base/query_vectors.fvec
       metadata-indices: metadata_indices.ivvec
-      indices: filtered_neighbor_indices.ivec
-      distances: filtered_neighbor_distances.fvec
+      indices: prefiltered_neighbor_indices.ivec
+      distances: prefiltered_neighbor_distances.fvec
       neighbors: 100
       metric: L2
 
-    - id: verify-filtered-knn
-      description: Verify filtered KNN results
-      run: verify filtered-knn-consolidated
-      after: [compute-filtered-knn]
+    - id: verify-prefiltered-knn
+      description: Verify pre-filter KNN results
+      run: verify prefiltered-knn-consolidated
+      after: [compute-prefiltered-knn]
       base: profiles/base/base_vectors.fvec
       query: profiles/base/query_vectors.fvec
       metadata: profiles/base/metadata_content.u8
@@ -204,7 +206,29 @@ upstream:
       normalized: false
       sample: 50
       seed: 42
-      output: "${cache}/verify_filtered_knn.json"
+      output: "${cache}/verify_prefiltered_knn.json"
+
+    # ── Post-filter KNN (E facet, G ∩ R) ─────────────────────────
+
+    - id: compute-postfiltered-knn
+      description: Derive post-filter KNN ground truth (E = G ∩ R)
+      run: compute postfiltered-knn
+      per_profile: true
+      phase: 2
+      after: [compute-knn, compute-evaluate-predicates]
+      ground-truth: neighbor_indices.ivec
+      ground-truth-distances: neighbor_distances.fvec
+      metadata-indices: metadata_indices.ivvec
+      indices: postfiltered_neighbor_indices.ivec
+      distances: postfiltered_neighbor_distances.fvec
+
+    - id: verify-postfiltered-knn
+      description: Verify post-filter KNN (E = G ∩ R) via re-derivation
+      run: verify postfiltered-knn-consolidated
+      after: [compute-postfiltered-knn]
+      sample: 50
+      seed: 42
+      output: "${cache}/verify_postfiltered_knn.json"
 
     # ── Finalize ─────────────────────────────────────────────────
 
@@ -212,7 +236,7 @@ upstream:
       description: Generate dataset.json
       run: generate dataset-json
       finalize: true
-      after: [verify-filtered-knn, verify-predicates-sqlite]
+      after: [verify-prefiltered-knn, verify-postfiltered-knn, verify-predicates-sqlite]
 
     - id: generate-variables-json
       description: Generate variables.json
@@ -251,5 +275,7 @@ profiles:
     metadata_content: profiles/base/metadata_content.u8
     metadata_predicates: profiles/base/predicates.u8
     metadata_indices: profiles/default/metadata_indices.ivvec
-    filtered_neighbor_indices: profiles/default/filtered_neighbor_indices.ivec
-    filtered_neighbor_distances: profiles/default/filtered_neighbor_distances.fvec
+    prefiltered_neighbor_indices: profiles/default/prefiltered_neighbor_indices.ivec
+    prefiltered_neighbor_distances: profiles/default/prefiltered_neighbor_distances.fvec
+    postfiltered_neighbor_indices: profiles/default/postfiltered_neighbor_indices.ivec
+    postfiltered_neighbor_distances: profiles/default/postfiltered_neighbor_distances.fvec

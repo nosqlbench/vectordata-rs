@@ -2633,7 +2633,7 @@ const ALL_COMMANDS: &[&str] = &[
     // cleanup
     "cleanup overlap",
     // compute
-    "compute evaluate-predicates", "compute filtered-knn", "compute knn",
+    "compute evaluate-predicates", "compute prefiltered-knn", "compute knn",
     "compute partition-profiles", "compute sort",
     // download
     "download bulk", "download huggingface",

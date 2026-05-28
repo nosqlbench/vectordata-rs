@@ -18,7 +18,7 @@ const SHELL_COMMANDS: &[&str] = &[
 /// Interprets positional args as semicolon-separated commands,
 /// executes them against the vector file, prints results to stdout, exits.
 pub(super) fn run_data_shell_batch(source: &str, commands: &str) {
-    use crate::pipeline::commands::analyze_explore;
+    use crate::explore::repl as analyze_explore;
 
     let reader = UnifiedReader::open(source);
     let count = reader.count();
@@ -51,7 +51,7 @@ pub(super) fn run_data_shell_interactive(source: &str) {
         widgets::{Block, Borders, Paragraph, Wrap},
         Terminal,
     };
-    use crate::pipeline::commands::analyze_explore;
+    use crate::explore::repl as analyze_explore;
 
     let reader = UnifiedReader::open(source);
     let count = reader.count();

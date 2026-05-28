@@ -98,6 +98,14 @@ pub mod config;
 /// Both binaries dispatch into this module — there is exactly one
 /// implementation of each command.
 pub mod datasets;
+/// Interactive `vectordata explore` TUI — dataset picker, raw-values
+/// grid, REPL command engine. Migrated from `veks/src/explore` so the
+/// entire TUI lives under vectordata; veks now defers to this module
+/// rather than carrying its own copy. Gated on the `explore` feature
+/// (default on) so library-only consumers can drop the simsimd /
+/// rand_xoshiro deps.
+#[cfg(feature = "explore")]
+pub mod explore;
 /// Catalog discovery — find datasets by name from configured sources.
 ///
 /// This is the recommended entry point. Configure catalog sources in

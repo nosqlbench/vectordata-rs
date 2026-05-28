@@ -297,7 +297,10 @@ fn load_from_explicit_catalog_file(location: &str, entries: &mut Vec<CatalogEntr
 /// path). Returns `None` if the file/URL is unreachable so callers
 /// can fall through to alternative probes.
 fn fetch_location_content(location: &str) -> Option<String> {
-    if location.starts_with("http://") || location.starts_with("https://") {
+    // Anything the shared transport speaks goes through the HTTP
+    // fetcher (which normalises `s3://` → virtual-hosted-style HTTPS
+    // before the wire). Everything else is treated as a local path.
+    if crate::transport::is_remote_url(location) {
         fetch_http(location).ok()
     } else {
         std::fs::read_to_string(location).ok()
@@ -323,7 +326,7 @@ fn parent_location_of(location: &str) -> String {
 fn try_load_canonical_catalog(location: &str, entries: &mut Vec<CatalogEntry>) -> bool {
     let catalog_url = catalog_file_for(location);
 
-    let content = if catalog_url.starts_with("http://") || catalog_url.starts_with("https://") {
+    let content = if crate::transport::is_remote_url(&catalog_url) {
         match fetch_http(&catalog_url) {
             Ok(c) => c,
             Err(_) => return false, // missing — let the caller try the next probe
@@ -524,13 +527,17 @@ fn dir_name_of_path(path: &str) -> String {
     }
 }
 
-/// Fetch content from an HTTP(S) URL using the process-wide shared
+/// Fetch content from a remote URL using the process-wide shared
 /// `reqwest::blocking::Client` so cert loading and DNS/connection
-/// pool state amortise across every catalog access.
+/// pool state amortise across every catalog access. Accepts the URL
+/// forms `is_remote_url` recognises — `http(s)://` pass through, and
+/// `s3://bucket/key` is rewritten via `normalize_remote_url` to the
+/// virtual-hosted HTTPS endpoint before the wire.
 fn fetch_http(url: &str) -> Result<String, String> {
     let client = crate::transport::shared_client();
+    let normalized = crate::transport::normalize_remote_url(url);
 
-    let response = client.get(url).send()
+    let response = client.get(normalized.as_ref()).send()
         .map_err(|e| format!("HTTP request to {} failed: {}", url, e))?;
 
     let status = response.status();

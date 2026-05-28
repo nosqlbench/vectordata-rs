@@ -313,7 +313,7 @@ impl DSProfileGroup {
         // can insert them in ascending-size order. Otherwise the resulting
         // profile list is grouped by strategy ("all of mul:, then fib:,
         // then decade:") which interleaves sizes — e.g. 100k after 8mi —
-        // and that's what the user sees in `veks explore` and YAML.
+        // and that's what the user sees in `vectordata explore` and YAML.
         let mut pending: Vec<(u64, String, DSProfile)> = Vec::new();
 
         for entry_str in &entries {

@@ -1033,7 +1033,7 @@ fn e2e_metadata_pipeline() {
     assert!(vars.contains("base_count"), "missing base_count");
 
     // No filtered KNN (no_filtered=true)
-    assert!(!out.join("profiles/default/filtered_neighbor_indices.ivecs").exists(),
+    assert!(!out.join("profiles/default/prefiltered_neighbor_indices.ivec").exists(),
         "filtered KNN should not be produced with no_filtered=true");
 }
 

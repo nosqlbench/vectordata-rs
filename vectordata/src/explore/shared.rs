@@ -23,6 +23,24 @@ pub enum SampleMode {
     Sparse,
 }
 
+/// Display a path relative to the current working directory when
+/// it's a child of it, falling back to the absolute form otherwise.
+/// Mirrors the helper previously imported from `veks::check`; kept
+/// private to explore to avoid pulling another module into the
+/// public surface.
+fn rel_display(path: &std::path::Path) -> String {
+    if let Ok(cwd) = std::env::current_dir() {
+        path.strip_prefix(&cwd)
+            .map(|r| {
+                let s = r.to_string_lossy().to_string();
+                if s.is_empty() { ".".to_string() } else { s }
+            })
+            .unwrap_or_else(|_| path.to_string_lossy().to_string())
+    } else {
+        path.to_string_lossy().to_string()
+    }
+}
+
 /// Parse a `SampleMode` from a CLI string.
 pub(crate) fn parse_sample_mode(s: &str) -> Result<SampleMode, String> {
     match s.to_lowercase().as_str() {
@@ -35,7 +53,7 @@ pub(crate) fn parse_sample_mode(s: &str) -> Result<SampleMode, String> {
 
 /// Resolve a `dataset[:profile]` specifier through the catalog and
 /// return the canonical [`TestDataView`].
-pub(super) fn open_dataset_view(source: &str) -> std::sync::Arc<dyn vectordata::TestDataView> {
+pub(super) fn open_dataset_view(source: &str) -> std::sync::Arc<dyn crate::TestDataView> {
     let (name, profile) = match source.find(':') {
         Some(pos) => (&source[..pos], &source[pos + 1..]),
         None => (source, "default"),
@@ -97,7 +115,7 @@ impl UnifiedReader {
             UnifiedReader::Remote(r) => r.get_f32_range(start, count),
         }
     }
-    pub(super) fn cache_stats(&self) -> Option<vectordata::CacheStats> {
+    pub(super) fn cache_stats(&self) -> Option<crate::CacheStats> {
         match self {
             UnifiedReader::Local(_) => None,
             UnifiedReader::Remote(r) => r.cache_stats(),
@@ -193,7 +211,7 @@ pub(super) fn resolve_source(source: &str) -> PathBuf {
 /// canonical storage layer, and return the local file path the
 /// bytes landed in.
 fn resolve_via_view(group_path: &str, profile_name: &str, facet_name: &str) -> PathBuf {
-    let group = match vectordata::TestDataGroup::load(group_path) {
+    let group = match crate::TestDataGroup::load(group_path) {
         Ok(g) => g,
         Err(e) => {
             eprintln!("Error: failed to open {group_path}: {e}");
@@ -208,7 +226,7 @@ fn resolve_via_view(group_path: &str, profile_name: &str, facet_name: &str) -> P
 /// resolved file path. Used by both raw-URL/path opens and
 /// catalog-resolved opens — the two only differ in how they
 /// obtain the [`TestDataGroup`].
-fn resolve_via_view_group(group: vectordata::TestDataGroup, group_path: &str, profile_name: &str, facet_name: &str) -> PathBuf {
+fn resolve_via_view_group(group: crate::TestDataGroup, group_path: &str, profile_name: &str, facet_name: &str) -> PathBuf {
     let view = match group.profile(profile_name) {
         Some(v) => v,
         None => {
@@ -235,7 +253,7 @@ fn resolve_via_view_group(group: vectordata::TestDataGroup, group_path: &str, pr
         eprintln!("Fetching {facet_name}…");
     }
     let mut meter = PrecacheMeter::new();
-    let cb = |p: &vectordata::DownloadProgress| meter.tick(p);
+    let cb = |p: &crate::DownloadProgress| meter.tick(p);
     if let Err(e) = storage.prebuffer_with_progress(cb) {
         eprintln!("\nError: precache failed for {facet_name}: {e}");
         std::process::exit(1);
@@ -244,7 +262,7 @@ fn resolve_via_view_group(group: vectordata::TestDataGroup, group_path: &str, pr
 
     if let Some(local) = storage.cache_path() {
         // Cached-remote: report under the configured cache root.
-        eprintln!("Using cached: {}", crate::check::rel_display(&local));
+        eprintln!("Using cached: {}", rel_display(&local));
         return local;
     }
     // Non-cached storage: must be a local file. Read the resolved
@@ -263,7 +281,7 @@ fn resolve_via_view_group(group: vectordata::TestDataGroup, group_path: &str, pr
 
 /// Get the configured vectordata cache directory from settings.yaml.
 pub(super) fn dirs_cache_dir() -> PathBuf {
-    crate::pipeline::commands::config::configured_cache_dir_or_exit()
+    crate::explore::cache_dir_or_exit()
 }
 
 /// In-place stderr meter for facet precache. Renders bytes /
@@ -294,7 +312,7 @@ impl PrecacheMeter {
         }
     }
 
-    fn tick(&mut self, p: &vectordata::DownloadProgress) {
+    fn tick(&mut self, p: &crate::DownloadProgress) {
         let total = p.total_bytes();
         let done = p.downloaded_bytes();
         self.final_total = total;
@@ -344,14 +362,14 @@ fn fmt_bytes(n: u64) -> String {
 /// Wraps any supported vector format (fvec, mvec, dvec) and converts
 /// individual vectors to f64 on read. No bulk file conversion needed.
 pub(super) enum AnyVectorReader {
-    F32(vectordata::io::XvecReader<f32>),
-    F16(vectordata::io::XvecReader<half::f16>),
+    F32(crate::io::XvecReader<f32>),
+    F16(crate::io::XvecReader<half::f16>),
 }
 
 impl AnyVectorReader {
     /// Open a vector file, auto-detecting format from extension.
     pub(super) fn open(path: &std::path::Path) -> Self {
-        use vectordata::io::XvecReader;
+        use crate::io::XvecReader;
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
         match ext {
@@ -375,24 +393,24 @@ impl AnyVectorReader {
     }
 
     pub(super) fn count(&self) -> usize {
-        use vectordata::VectorReader;
+        use crate::VectorReader;
         match self {
-            AnyVectorReader::F32(r) => <vectordata::io::XvecReader<f32> as VectorReader<f32>>::count(r),
-            AnyVectorReader::F16(r) => <vectordata::io::XvecReader<half::f16> as VectorReader<half::f16>>::count(r),
+            AnyVectorReader::F32(r) => <crate::io::XvecReader<f32> as VectorReader<f32>>::count(r),
+            AnyVectorReader::F16(r) => <crate::io::XvecReader<half::f16> as VectorReader<half::f16>>::count(r),
         }
     }
 
     pub(super) fn dim(&self) -> usize {
-        use vectordata::VectorReader;
+        use crate::VectorReader;
         match self {
-            AnyVectorReader::F32(r) => <vectordata::io::XvecReader<f32> as VectorReader<f32>>::dim(r),
-            AnyVectorReader::F16(r) => <vectordata::io::XvecReader<half::f16> as VectorReader<half::f16>>::dim(r),
+            AnyVectorReader::F32(r) => <crate::io::XvecReader<f32> as VectorReader<f32>>::dim(r),
+            AnyVectorReader::F16(r) => <crate::io::XvecReader<half::f16> as VectorReader<half::f16>>::dim(r),
         }
     }
 
     /// Read a single vector as f64 values. Converts from native format on the fly.
     pub(super) fn get_f64(&self, index: usize) -> Option<Vec<f64>> {
-        use vectordata::VectorReader;
+        use crate::VectorReader;
         match self {
             AnyVectorReader::F32(r) => {
                 r.get(index).ok().map(|v| v.iter().map(|&x| x as f64).collect())
@@ -405,7 +423,7 @@ impl AnyVectorReader {
 
     /// Read a single vector as f32 values (for simsimd hot paths).
     pub(super) fn get_f32(&self, index: usize) -> Option<Vec<f32>> {
-        use vectordata::VectorReader;
+        use crate::VectorReader;
         match self {
             AnyVectorReader::F32(r) => {
                 r.get(index).ok().map(|v| v.to_vec())
@@ -430,11 +448,11 @@ impl AnyVectorReader {
 }
 
 /// Wrapper that opens `base_vectors` (and exposes a cache-stats view)
-/// through the canonical [`vectordata::TestDataView`] path.
+/// through the canonical [`crate::TestDataView`] path.
 pub(super) struct AnyDatasetReader {
-    view: std::sync::Arc<dyn vectordata::TestDataView>,
-    base: std::sync::Arc<dyn vectordata::VectorReader<f32>>,
-    facet_storage: Option<vectordata::FacetStorage>,
+    view: std::sync::Arc<dyn crate::TestDataView>,
+    base: std::sync::Arc<dyn crate::VectorReader<f32>>,
+    facet_storage: Option<crate::FacetStorage>,
     dim: usize,
     count: usize,
 }
@@ -454,7 +472,7 @@ impl AnyDatasetReader {
             if !fs.is_local() {
                 eprintln!("Fetching base_vectors…");
                 let mut meter = PrecacheMeter::new();
-                let cb = |p: &vectordata::DownloadProgress| meter.tick(p);
+                let cb = |p: &crate::DownloadProgress| meter.tick(p);
                 if let Err(e) = fs.prebuffer_with_progress(cb) {
                     eprintln!("\nError: precache failed for base_vectors: {e}");
                     std::process::exit(1);
@@ -487,14 +505,14 @@ impl AnyDatasetReader {
         (0..count).map(|i| self.get_f32(start + i)).collect()
     }
 
-    pub(super) fn cache_stats(&self) -> Option<vectordata::CacheStats> {
+    pub(super) fn cache_stats(&self) -> Option<crate::CacheStats> {
         self.facet_storage.as_ref()?.cache_stats()
     }
 
     /// Suppress unused-field warning — the view handle keeps the
     /// underlying dataset alive for the lifetime of `base`/`facet_storage`.
     #[allow(dead_code)]
-    pub(super) fn view(&self) -> &dyn vectordata::TestDataView { &*self.view }
+    pub(super) fn view(&self) -> &dyn crate::TestDataView { &*self.view }
 }
 
 /// Default number of consecutive vectors per clump.
@@ -556,7 +574,7 @@ pub(super) fn sample_indices(total: usize, effective: usize, seed: u64, mode: Sa
             indices
         }
         SampleMode::Sparse => {
-            let mut rng = crate::pipeline::rng::seeded_rng(seed);
+            let mut rng = crate::explore::seeded_rng(seed);
             use rand::Rng;
             let mut idx: Vec<usize> = (0..total).collect();
             for i in 0..effective {
@@ -576,15 +594,27 @@ pub(super) fn sample_indices(total: usize, effective: usize, seed: u64, mode: Sa
 /// After restoring the terminal, it force-exits the process to
 /// ensure we don't hang on blocking I/O.
 pub(super) fn install_abort_handler(flag: std::sync::Arc<std::sync::atomic::AtomicBool>) {
-    // First: register the cooperative flag
-    let _ = signal_hook::flag::register(signal_hook::consts::SIGINT, flag.clone());
-
-    // Second: register conditional default — if flag already set (second Ctrl-C),
-    // the OS default handler runs (immediate termination)
-    let _ = signal_hook::flag::register_conditional_default(
-        signal_hook::consts::SIGINT,
-        flag,
-    );
+    // POSIX-only: signal-hook's `SIGINT` constant and flag registration
+    // are not available on Windows. On Windows the OS default Ctrl-C
+    // handler runs immediately (same behaviour as the
+    // `register_conditional_default` second-press branch on Unix), so
+    // the function degrades to a no-op rather than offering the
+    // cooperative-first-press-then-hard-second-press flow.
+    #[cfg(unix)]
+    {
+        // First: register the cooperative flag
+        let _ = signal_hook::flag::register(signal_hook::consts::SIGINT, flag.clone());
+        // Second: register conditional default — if flag already set (second Ctrl-C),
+        // the OS default handler runs (immediate termination)
+        let _ = signal_hook::flag::register_conditional_default(
+            signal_hook::consts::SIGINT,
+            flag,
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = flag; // suppress unused-variable warning
+    }
 }
 
 /// Normalize a vector to unit length.
