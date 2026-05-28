@@ -233,9 +233,10 @@ fn drive_prebuffer(view: &dyn TestDataView) -> i32 {
         println!("Precache: profile declared no facets.");
         return 0;
     }
-    eprintln!("Prebuffering {} facet(s), {} to download. ({} concurrent streams per facet)",
+    eprintln!("Prebuffering {} facet(s), {} to download. ({} streams × {} HTTP runtimes)",
         plan.facets.len(), fmt_bytes(plan.total_bytes),
-        crate::cache::download_concurrency());
+        crate::cache::download_concurrency(),
+        crate::transport::http_runtimes());
     let mut ctx = LiveCtx::new(plan.facets.len(), plan.total_bytes);
     let result = view.prebuffer_all_with_progress(&mut |facet, p| ctx.on_progress(facet, p));
     ctx.finalize(&result.as_ref().map(|_| ()).map_err(|e| e.to_string()));
@@ -384,12 +385,29 @@ impl LiveCtx {
                 fmt_bytes(p.verified_bytes),
                 fmt_bytes(p.total_bytes))
         };
+        // Throughput + ETA. Held back until we've been downloading
+        // long enough for the rate to be meaningful — the first
+        // second is dominated by TLS handshake + initial chunk
+        // bring-up, so the implied "bytes / elapsed" would suggest
+        // an absurdly long ETA right when the user is most likely
+        // to look at it.
+        let elapsed = self.started.elapsed().as_secs_f64();
+        let trailing = if elapsed > 1.5 && aggregate_done > 0 && self.total_bytes > aggregate_done {
+            let rate = aggregate_done as f64 / elapsed;
+            let remaining = self.total_bytes - aggregate_done;
+            let eta_secs = (remaining as f64 / rate.max(1.0)) as u64;
+            format!(" \u{2022} {}/s \u{2022} ETA {}",
+                fmt_bytes(rate as u64), fmt_duration(eta_secs))
+        } else {
+            String::new()
+        };
         use std::io::Write;
         let _ = eprint!(
-            "\r  [{}/{}] {}: {} \u{2022} total {}% ({}/{})\u{1b}[K",
+            "\r  [{}/{}] {}: {} \u{2022} total {}% ({}/{}){}\u{1b}[K",
             self.facet_index, self.facet_count, facet,
             facet_state,
-            pct_total, fmt_bytes(aggregate_done), fmt_bytes(self.total_bytes));
+            pct_total, fmt_bytes(aggregate_done), fmt_bytes(self.total_bytes),
+            trailing);
         let _ = std::io::stderr().flush();
     }
 
@@ -436,4 +454,19 @@ pub(super) fn fmt_bytes(bytes: u64) -> String {
     else if bytes >= MIB { format!("{:.1} MiB", bytes as f64 / MIB as f64) }
     else if bytes >= KIB { format!("{:.1} KiB", bytes as f64 / KIB as f64) }
     else { format!("{} B", bytes) }
+}
+
+/// Format a duration in seconds as a compact human string. Picks
+/// the largest unit pair: `45s`, `3m 22s`, `1h 12m`, `2d 04h`. The
+/// double-unit form keeps the resolution useful at the boundary
+/// (so a 60m ETA doesn't display as "1h 00m" right next to a 59s
+/// ETA without showing the seconds context).
+pub(super) fn fmt_duration(secs: u64) -> String {
+    const M: u64 = 60;
+    const H: u64 = 60 * M;
+    const D: u64 = 24 * H;
+    if secs < M { format!("{secs}s") }
+    else if secs < H { format!("{}m {:02}s", secs / M, secs % M) }
+    else if secs < D { format!("{}h {:02}m", secs / H, (secs % H) / M) }
+    else             { format!("{}d {:02}h", secs / D, (secs % D) / H) }
 }

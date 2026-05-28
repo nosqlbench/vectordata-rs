@@ -20,41 +20,86 @@ use std::io;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-/// Process-wide `reqwest::blocking::Client`. Constructed exactly
-/// once on first access; subsequent calls are atomic-load cheap.
+/// Default number of distinct `reqwest::blocking::Client` instances
+/// in the process-wide pool. Each Client wraps its own internal
+/// `tokio::runtime::Runtime` built with `new_current_thread()` — one
+/// runtime thread per Client — and `Client::clone` shares everything
+/// (runtime, connection pool, DNS cache) with the original. So *N
+/// workers calling `shared_client()` on a singleton all funnel HTTP
+/// completion processing through the same runtime thread*, capping
+/// aggregate throughput at whatever one core can drive (TLS decrypt
+/// of 8 MiB chunks dominates well before that even matters).
 ///
-/// Why this exists: building a `reqwest::blocking::Client` triggers
-/// `rustls_native_certs::load_native_certs` (~1 ms on Linux —
-/// walks `/etc/ssl/certs/`, base64-decodes every PEM), plus the
-/// runtime/connection-pool/DNS-cache state that the Client wraps.
-/// A flamegraph from a downstream consumer showed 35% of CPU
-/// going to `ClientHandle::new` because vectordata constructed a
-/// fresh Client at multiple sites. Routing everything through
-/// this single shared client kills both the cert-load tax and
-/// makes the connection pool / DNS cache effective process-wide.
+/// A pool of separate Clients gives us N parallel runtime threads.
+/// Workers picking round-robin spreads decryption across cores, so
+/// `download_concurrency` actually translates into multi-stream
+/// aggregate throughput instead of capped by one Tokio thread.
 ///
-/// `reqwest::blocking::Client` wraps an inner `Arc`, so cloning is
-/// cheap. Callers that need an owned `Client` (e.g. to pass into
-/// `HttpTransport::with_client`) should call `shared_client()`,
-/// which clones from the singleton.
-fn shared_client_inner() -> &'static reqwest::blocking::Client {
-    static SHARED: OnceLock<reqwest::blocking::Client> = OnceLock::new();
-    SHARED.get_or_init(|| {
-        reqwest::blocking::Client::builder()
-            .user_agent(concat!("vectordata/", env!("CARGO_PKG_VERSION")))
-            .pool_max_idle_per_host(64)
-            .redirect(reqwest::redirect::Policy::limited(10))
-            .timeout(Duration::from_secs(60 * 60)) // 1 h ceiling on long-running large fetches
-            .build()
-            .expect("vectordata shared HTTP client")
+/// 32 matches the default `DOWNLOAD_CONCURRENCY` 1:1 so every
+/// chunk worker effectively owns its own runtime thread — no
+/// runtime is doing more than one stream's TLS work at peak. On
+/// hosts with fewer than 32 cores the threads schedule onto the
+/// available cores; the overhead of "extra" idle Tokio threads
+/// (~MB of stack each, no wakeups when idle) is negligible
+/// compared to the throughput floor of one-runtime-per-stream.
+/// Tunable via `VECTORDATA_HTTP_RUNTIMES` for environments where
+/// the address space cost matters or where the link bandwidth
+/// doesn't warrant 32 distinct runtimes.
+const DEFAULT_HTTP_RUNTIMES: usize = 32;
+
+fn http_runtime_count() -> usize {
+    std::env::var("VECTORDATA_HTTP_RUNTIMES")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_HTTP_RUNTIMES)
+}
+
+/// Process-wide pool of `reqwest::blocking::Client` instances.
+/// Constructed exactly once on first access. Each entry is a
+/// separate Client with a separate internal current-thread Tokio
+/// runtime — round-robin pick spreads HTTP I/O + TLS work across
+/// the pool's runtime threads so concurrent chunk downloads
+/// actually scale on multi-core hosts.
+fn client_pool() -> &'static [reqwest::blocking::Client] {
+    static POOL: OnceLock<Vec<reqwest::blocking::Client>> = OnceLock::new();
+    POOL.get_or_init(|| {
+        (0..http_runtime_count()).map(|_| build_client()).collect()
     })
 }
 
-/// Obtain a clone of the process-wide shared client. The clone is
-/// cheap (`Client` is internally `Arc`-wrapped) and shares the
-/// connection pool, DNS cache, and TLS session state.
+fn build_client() -> reqwest::blocking::Client {
+    reqwest::blocking::Client::builder()
+        .user_agent(concat!("vectordata/", env!("CARGO_PKG_VERSION")))
+        .pool_max_idle_per_host(64)
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .timeout(Duration::from_secs(60 * 60)) // 1 h ceiling on long-running large fetches
+        .build()
+        .expect("vectordata shared HTTP client")
+}
+
+/// Obtain a clone of one of the process-wide pooled clients,
+/// round-robin. The clone is cheap (`Client` is internally
+/// `Arc`-wrapped) and shares its runtime + connection pool + DNS
+/// cache with the pool entry it was cloned from — but successive
+/// `shared_client()` calls return clones of *different* pool
+/// entries, so callers that each clone-and-use one client end up
+/// spread across distinct runtime threads. This is the difference
+/// between actually scaling N workers and bottlenecking on one
+/// Tokio thread.
 pub(crate) fn shared_client() -> reqwest::blocking::Client {
-    shared_client_inner().clone()
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+    let pool = client_pool();
+    let idx = COUNTER.fetch_add(1, Ordering::Relaxed) % pool.len();
+    pool[idx].clone()
+}
+
+/// Number of independent HTTP runtimes the process-wide client pool
+/// is using. Exposed so progress drivers can show the effective
+/// "(N runtimes × C concurrent streams)" plan to the user.
+pub(crate) fn http_runtimes() -> usize {
+    client_pool().len()
 }
 
 /// Returns `true` for any URL whose transport vectordata speaks
@@ -150,36 +195,24 @@ mod s3_normalisation_tests {
 mod shared_client_tests {
     use super::*;
 
-    /// `shared_client_inner()` must return the same `Client`
-    /// reference on every call — that's the singleton invariant
+    /// `client_pool()` must return the same `&'static [Client]`
+    /// slice on every call — that's the pool-singleton invariant
     /// that prevents `load_native_certs` from running per request.
-    /// Verified by pointer equality on the underlying `Client`.
     #[test]
-    fn shared_client_inner_returns_singleton() {
-        let a = shared_client_inner() as *const _;
-        let b = shared_client_inner() as *const _;
-        assert_eq!(a, b, "shared_client_inner must return the same singleton");
+    fn client_pool_returns_singleton() {
+        let a = client_pool().as_ptr();
+        let b = client_pool().as_ptr();
+        assert_eq!(a, b, "client_pool must return the same singleton slice");
     }
 
-    /// `shared_client()` clones from the singleton. The clones are
-    /// distinct values but they share the same internal state
-    /// (reqwest::blocking::Client is internally Arc-wrapped, so
-    /// clones share the connection pool). We can't reach inside
-    /// the Client to assert Arc-pointer equality without going
-    /// through reqwest internals, so we instead exercise the
-    /// observable behaviour: many clones can be created cheaply
-    /// (no per-clone cert load).
+    /// `shared_client()` rotates through pool entries, but the
+    /// observable cost is still negligible — no per-clone cert
+    /// load. Many round-robin clones should complete in well
+    /// under a second.
     #[test]
     fn shared_client_clone_is_cheap() {
-        // Warm the singleton.
         let _ = shared_client();
         let start = std::time::Instant::now();
-        // 10_000 clones; the bar is "no cert loading happens
-        // here" — should easily complete in well under a second.
-        // load_native_certs alone takes ~1 ms, so 10k of them
-        // would be ~10 s. Set a generous 500 ms ceiling that
-        // would still catch any regression that started loading
-        // certs per clone.
         for _ in 0..10_000 {
             let _ = shared_client();
         }

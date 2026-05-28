@@ -27,14 +27,16 @@ use crate::transport::{
     ChunkRequest, ChunkedTransport, DownloadProgress, RetryPolicy,
 };
 
-/// Default concurrency for parallel chunk downloads. 16 lands well
-/// short of NIC saturation on typical desktop / cloud VM links but
-/// keeps every meaningful S3 / CloudFront origin busy: each TCP
-/// connection caps around 100-300 MB/s; 16 streams sustain >1 GB/s
-/// from a single bucket. Tunable via the `VECTORDATA_DOWNLOAD_CONCURRENCY`
-/// env var for sites running on 25 / 100 Gbps links where pushing
-/// concurrency to 64-128 is worthwhile.
-const DEFAULT_CONCURRENCY: usize = 16;
+/// Default concurrency for parallel chunk downloads. 32 keeps a
+/// modern multi-Gbps link busy against S3 / CloudFront: each TCP
+/// connection caps around 100-300 MB/s, so 32 streams sustain
+/// 3-9 GB/s aggregate. Coupled with [`DEFAULT_HTTP_RUNTIMES`] in
+/// the transport layer (also 32), the per-runtime fanout stays at
+/// ~1 stream so TLS decryption doesn't bottleneck on any one core.
+/// Tunable via `VECTORDATA_DOWNLOAD_CONCURRENCY` for unusual links
+/// (25 / 100 Gbps NICs may benefit from pushing to 64-128, slow
+/// links may want to drop to 8-16 to avoid pool churn).
+const DEFAULT_CONCURRENCY: usize = 32;
 
 /// Read the configured parallel-chunk-download worker count. Both
 /// `Storage::Cached` (mref-backed) and `Storage::Http` (chunked-only)

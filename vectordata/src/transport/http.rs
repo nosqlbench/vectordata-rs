@@ -192,9 +192,16 @@ impl ChunkedTransport for HttpTransport {
         // original (wrong) URL and S3 returns a 301 XML body that
         // confuses the byte-count assertion downstream.
         self.ensure_probed()?;
+        // Pick a client off the round-robin pool **per call**, not
+        // per transport. A single shared `Client` puts every worker's
+        // HTTP completion + TLS decryption on the same internal
+        // Tokio runtime thread, capping aggregate throughput at one
+        // core regardless of `download_concurrency`. Per-call pick
+        // distributes N workers across the pool's N runtime threads
+        // so chunks actually arrive in parallel.
+        let client = super::shared_client();
         let end = start + len - 1;
-        let resp = self
-            .client
+        let resp = client
             .get(self.effective_url().clone())
             .header(RANGE, format!("bytes={}-{}", start, end))
             .send()
