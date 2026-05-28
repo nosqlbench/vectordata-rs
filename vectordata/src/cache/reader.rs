@@ -628,12 +628,17 @@ mod tests {
         assert_eq!(blob_dir_for_url(tmp.path(), &u1), blob_dir_for_url(tmp.path(), &u2));
         assert_ne!(blob_dir_for_url(tmp.path(), &u1), blob_dir_for_url(tmp.path(), &u3));
 
-        // No `:` in the path even for URLs that have a port.
+        // The URL's host (which can carry a `:` for the port) must not
+        // leak into the URL-derived cache path components. Check only
+        // the suffix relative to `cache_root`; the root itself can
+        // legitimately contain `:` on Windows (drive letter).
         let with_port = Url::parse("http://127.0.0.1:32775/base.fvec").unwrap();
         let dir = blob_dir_for_url(tmp.path(), &with_port);
-        let s = dir.to_string_lossy();
-        assert!(!s.contains(':') || s.starts_with('/'),
-            "no `:` should appear in cache dir components: {s}");
+        let suffix = dir.strip_prefix(tmp.path())
+            .expect("blob dir must live under cache_root");
+        let s = suffix.to_string_lossy();
+        assert!(!s.contains(':'),
+            "no `:` should appear in URL-derived cache dir components: {s}");
     }
 
     #[test]
@@ -808,6 +813,13 @@ mod tests {
         assert!(blob2.exists(),  "non-matched blob must be preserved");
     }
 
+    // Unix-only: the legacy cache layout this test simulates used
+    // host:port directory names (e.g. `127.0.0.1:32775`). Windows
+    // reserves `:` and refuses such mkdir calls outright, so these
+    // legacy directories could never have existed on Windows in the
+    // first place — there's nothing for prune_legacy_layout to clean
+    // up there. The Unix-side test continues to exercise the cleanup.
+    #[cfg(not(windows))]
     #[test]
     fn prune_legacy_layout_removes_old_shapes_only() {
         let tmp = tempfile::tempdir().unwrap();
