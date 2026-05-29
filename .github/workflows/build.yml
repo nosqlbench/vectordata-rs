@@ -34,18 +34,21 @@ name: build
 on:
   push:
     branches: [main]
-    # Tag triggers cover two conventions:
-    #   - `vectordata@*` — cargo-workspaces (`cargo ws publish`) emits
-    #     `<crate>@<version>` tags. We intentionally narrow this to the
-    #     vectordata crate so a `veks-pipeline@X` or `veks-io@X` tag
-    #     (also cargo-workspaces output) doesn't spuriously rebuild +
-    #     publish a vectordata binary release.
-    #   - `v*` — manual unified-workspace tags (e.g. `v1.0.0`) for ad-
-    #     hoc releases outside cargo-workspaces.
+    # `cargo ws publish` emits one `<crate>@<version>` tag per
+    # changed crate; an accompanying manual `v<version>` tag is the
+    # canonical workspace-wide release marker. We trigger the build
+    # matrix on every flavour so a regression in any crate's release
+    # cycle gets caught — but the `release` job below only publishes
+    # on `v*` (it checks the ref explicitly), so per-crate tags
+    # build + test without producing duplicate GitHub Releases.
     tags:
+      - 'v*'
       - 'vectordata@*'
       - 'veks@*'
-      - 'v*'
+      - 'veks-pipeline@*'
+      - 'veks-core@*'
+      - 'veks-anode@*'
+      - 'slabtastic@*'
   pull_request:
   workflow_dispatch:
 
@@ -261,12 +264,19 @@ jobs:
     name: GitHub Release
     runs-on: ubuntu-24.04
     needs: [build]
-    # Fires on any tag ref we accepted in `on.push.tags` above —
-    # `vectordata@*` (cargo-workspaces) or `v*` (manual). The
-    # workflow-level filter already excludes non-tag refs from
-    # triggering us, but this gate is the per-job safety check that
-    # also keeps PRs / branches from accidentally publishing.
-    if: startsWith(github.ref, 'refs/tags/')
+    # Fires only on the workspace-wide `v<version>` tags (e.g.
+    # `v1.2.1`). Per-crate `cargo ws` tags (`vectordata@…`,
+    # `veks-pipeline@…`, etc.) trigger the build matrix above but
+    # do *not* create separate GitHub Releases — otherwise one
+    # `cargo ws release` push would produce 5–6 near-identical
+    # Releases, each holding the same binaries with a different
+    # name.
+    #
+    # The `!contains('@')` guard distinguishes `refs/tags/v1.2.1`
+    # (publish) from `refs/tags/vectordata@1.2.1` (build only) —
+    # both start with `refs/tags/v` so the `startsWith` alone
+    # isn't enough.
+    if: startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '@')
     permissions:
       contents: write
     steps:
