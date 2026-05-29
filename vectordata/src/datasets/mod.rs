@@ -13,6 +13,7 @@ pub mod browser;
 pub mod cache;
 pub mod curlify;
 pub mod derive;
+pub mod describe;
 pub mod drop_cache;
 pub mod filter;
 pub mod list;

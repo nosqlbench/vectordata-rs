@@ -202,6 +202,25 @@ enum DatasetsCmd {
         catalog: Vec<String>,
     },
 
+    /// Print the full catalog descriptor for a dataset + profile.
+    ///
+    /// Same data the picker's `Describe` overlay shows — dataset
+    /// path + type, catalog attributes, profile metadata
+    /// (`maxk`, `base_count`, `partition`), every facet with its
+    /// source / namespace / window — but as plain text suitable for
+    /// `less`, `grep`, redirects, and diff-against-expected scripts.
+    #[command(alias = "desc")]
+    Describe {
+        #[command(flatten)]
+        args: vectordata::datasets::describe::DescribeArgs,
+        /// Configuration directory containing catalogs.yaml
+        #[arg(long, default_value = "~/.config/vectordata")]
+        configdir: String,
+        /// Additional catalog directories, file paths, or HTTP URLs
+        #[arg(long)]
+        catalog: Vec<String>,
+    },
+
     /// Generate a curl download script for a dataset's published files.
     Curlify(vectordata::datasets::curlify::CurlifyArgs),
 
@@ -347,6 +366,8 @@ fn main() {
                     vectordata::datasets::list::run_args(args),
                 DatasetsCmd::Ping { args, configdir, catalog } =>
                     vectordata::datasets::ping::run_args(args, &configdir, &catalog, &[]),
+                DatasetsCmd::Describe { args, configdir, catalog } =>
+                    vectordata::datasets::describe::run_args(args, &configdir, &catalog, &[]),
                 DatasetsCmd::Curlify(args) =>
                     vectordata::datasets::curlify::run_args(args),
                 DatasetsCmd::Derive {
