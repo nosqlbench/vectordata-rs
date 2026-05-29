@@ -398,17 +398,26 @@ mod tests {
 
     #[test]
     fn list_entries_classifies_natural_legacy_and_other() {
+        // Only exercises shapes that can actually exist on every
+        // platform we ship for. The pre-1.1 `<host>[:<port>]/`
+        // cache layout was a defect — NTFS reserves `:` in path
+        // components, so it could never have produced such a
+        // directory on Windows — and we don't reproduce that
+        // mistake here just to assert detection. Name-shape
+        // recognition is covered by
+        // `legacy_layout_dir_recognizes_pre_cutover_shapes` as a
+        // pure-string unit test that runs everywhere.
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
 
         // Natural-layout dataset.
         seed_dataset(root, "sift1m", "https://example.com/sift1m/");
-        // Legacy buckets.
+        // Legacy buckets — the two cutover-era shapes that are
+        // cross-platform safe to construct.
         fs::create_dir_all(root.join("blobs/aa/bb")).unwrap();
         fs::write(root.join("blobs/aa/bb/data"), b"x").unwrap();
         fs::create_dir_all(root.join("http/cc/dd")).unwrap();
         fs::write(root.join("http/cc/dd/data"), b"y").unwrap();
-        fs::create_dir_all(root.join("127.0.0.1:8080")).unwrap();
         // Unrecognised top-level dir.
         fs::create_dir_all(root.join("weirdo")).unwrap();
         fs::write(root.join("weirdo/file"), b"z").unwrap();
@@ -420,7 +429,7 @@ mod tests {
 
         assert_eq!(names(&listing.datasets), vec!["sift1m"]);
         let mut leg = names(&listing.legacy); leg.sort();
-        assert_eq!(leg, vec!["127.0.0.1:8080", "blobs", "http"]);
+        assert_eq!(leg, vec!["blobs", "http"]);
         assert_eq!(names(&listing.other), vec!["weirdo"]);
     }
 
