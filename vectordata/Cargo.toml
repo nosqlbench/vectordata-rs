@@ -31,7 +31,13 @@ httpdate = "1"
 log = "0.4"
 sha2 = "0.10"
 half = "2"
-reqwest = { version = "0.13.1", features = ["blocking", "json"] }
+# `default-features = false` drops `default-tls` (OpenSSL via native-
+# tls) so a `*-unknown-linux-musl` static build doesn't need OpenSSL
+# headers / libs on the build host. `rustls` is pure-Rust TLS that
+# links cleanly into a static binary; no functional difference from
+# native-tls for the URLs this crate fetches. The `json` feature
+# wasn't actually used anywhere.
+reqwest = { version = "0.13.1", default-features = false, features = ["blocking", "rustls"] }
 url = "2.5"
 # Optional — only required by the `vectordata` binary. Pulled in by
 # the default `cli` feature so `cargo install vectordata` produces a
