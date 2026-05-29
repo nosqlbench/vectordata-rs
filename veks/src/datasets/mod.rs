@@ -448,13 +448,14 @@ pub fn run(args: DatasetsArgs) {
             let cache_dir = cache_dir
                 .unwrap_or_else(|| crate::pipeline::commands::config::configured_cache_dir_or_exit());
             if dry_run {
-                println!("Scanning {} for legacy <host>[:<port>] cache directories...",
+                println!("Scanning {} for pre-cutover cache directories \
+                    (blobs/, http/, <host>[:<port>]/)...",
                     cache_dir.display());
                 let mut would_remove = Vec::new();
                 if let Ok(entries) = std::fs::read_dir(&cache_dir) {
                     for e in entries.flatten() {
                         if let Some(name) = e.file_name().to_str()
-                            && vectordata::cache_admin::is_legacy_layout_name(name)
+                            && vectordata::cache_admin::is_legacy_layout_dir(name)
                             && e.path().is_dir()
                         {
                             would_remove.push(name.to_string());

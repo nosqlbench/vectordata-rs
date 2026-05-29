@@ -507,10 +507,12 @@ fn prefetch_loop(
                 .map_err(|e| format!("prefetch open {}: {}", path.display(), e))?;
             // Widen the kernel's readahead window for this fd before
             // pulling pages — turns the discard reads below into the
-            // large sequential I/O pattern EBS rewards. Unix-only;
-            // on other targets the read loop alone still works, just
-            // without the readahead boost.
-            #[cfg(unix)]
+            // large sequential I/O pattern EBS rewards. Linux-only:
+            // `posix_fadvise` is a Linux extension that Apple's libc
+            // doesn't expose, so on macOS / BSD the read loop alone
+            // does the work without the explicit readahead boost (the
+            // cost is some throughput, not correctness).
+            #[cfg(target_os = "linux")]
             unsafe {
                 libc::posix_fadvise(
                     f.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL,

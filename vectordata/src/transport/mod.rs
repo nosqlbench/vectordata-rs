@@ -35,24 +35,33 @@ use std::time::Duration;
 /// `download_concurrency` actually translates into multi-stream
 /// aggregate throughput instead of capped by one Tokio thread.
 ///
-/// 32 matches the default `DOWNLOAD_CONCURRENCY` 1:1 so every
-/// chunk worker effectively owns its own runtime thread — no
-/// runtime is doing more than one stream's TLS work at peak. On
-/// hosts with fewer than 32 cores the threads schedule onto the
+/// Default parallel-stream fanout — used as the default for both the
+/// HTTP runtime pool (one runtime per stream so TLS decryption
+/// spreads across cores) and the chunk-download worker pool (one
+/// worker per stream so all runtimes stay busy). The 1:1 coupling
+/// is load-bearing: with N runtimes and M workers, the per-runtime
+/// fanout is M/N, and any imbalance leaves cores idle or
+/// re-introduces the single-Tokio-thread bottleneck.
+///
+/// On hosts with fewer than 32 cores the threads schedule onto the
 /// available cores; the overhead of "extra" idle Tokio threads
 /// (~MB of stack each, no wakeups when idle) is negligible
 /// compared to the throughput floor of one-runtime-per-stream.
-/// Tunable via `VECTORDATA_HTTP_RUNTIMES` for environments where
-/// the address space cost matters or where the link bandwidth
-/// doesn't warrant 32 distinct runtimes.
-const DEFAULT_HTTP_RUNTIMES: usize = 32;
+///
+/// Tunable independently per layer if needed:
+///   - `VECTORDATA_HTTP_RUNTIMES`         (transport / runtime pool)
+///   - `VECTORDATA_DOWNLOAD_CONCURRENCY`  (cache / chunk worker count)
+///
+/// Both fall back to this constant when unset, so the default
+/// stays matched without two places to update.
+pub(crate) const DEFAULT_PARALLEL_STREAMS: usize = 32;
 
 fn http_runtime_count() -> usize {
     std::env::var("VECTORDATA_HTTP_RUNTIMES")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&n| n > 0)
-        .unwrap_or(DEFAULT_HTTP_RUNTIMES)
+        .unwrap_or(DEFAULT_PARALLEL_STREAMS)
 }
 
 /// Process-wide pool of `reqwest::blocking::Client` instances.

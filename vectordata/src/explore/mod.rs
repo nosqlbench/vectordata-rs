@@ -156,6 +156,13 @@ pub fn run(args: ExploreArgs) -> i32 {
                 run_ping_then_pause(specifier);
                 ActionFlow::Stay
             }
+            PickerAction::Describe | PickerAction::Source => {
+                // Picker-local — the action menu handles them
+                // directly via `is_picker_local()` and never reaches
+                // dispatch. These arms are unreachable in practice
+                // but the match needs to be exhaustive.
+                ActionFlow::Stay
+            }
         }
     };
     match dataset_picker::run_picker(dispatch) {
@@ -182,6 +189,25 @@ fn pause_for_keypress() {
 }
 
 fn run_precache_then_pause(specifier: &str) {
+    // Picker-initiated precache drives the *highlighted profile only*.
+    // Earlier this stripped the `:profile` suffix and walked every
+    // profile via `ProfileSelection::AllProfiles`, but for datasets
+    // with many sized profiles (e.g. `ibm-datapile-1b` has ~130)
+    // that's two pathologies at once:
+    //   1. `plan_prebuffer` opens FacetStorage for every facet of
+    //      every profile to learn its total_size, which means O(130
+    //      × ~5) `.mref` HEAD probes serialised behind the planner
+    //      before any progress line prints — looked like the
+    //      precache had hung.
+    //   2. `total_bytes` double-counts every windowed profile against
+    //      the same underlying file, producing wildly inflated
+    //      headlines ("169 TiB to download" for a 1.3 TiB dataset).
+    // Sized/windowed profiles share base URLs, so the registry +
+    // cache dedup means precaching the default already fills the
+    // shared file for every window. Partition profiles have their
+    // own bytes and need to be precached explicitly — but that's
+    // what the picker rows are for: the user highlights the partition
+    // profile and runs precache against it directly.
     let code = crate::datasets::precache::run(
         specifier,
         "~/.config/vectordata",

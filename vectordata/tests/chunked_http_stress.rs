@@ -462,20 +462,33 @@ profiles:
 // helpers — locate the on-disk cache file + sidecar for a URL.
 // ═════════════════════════════════════════════════════════════════════
 
-/// The `Storage` layer hashes the URL to derive its blob dir
-/// (see `vectordata::cache::blob_dir_for_url`). We mirror the
-/// computation here so the tests can verify on-disk artefacts
-/// without going through private API.
+/// Mirror [`vectordata::storage::layout_for_url`]: with the natural
+/// cache layout the file lives at
+/// `<cache_root>/<host[_port]>/<url-path-parent>/<basename>` and
+/// the chunked-HTTP sidecar at `<file>.chunks`. The duplication is
+/// deliberate — `layout_for_url` is crate-private, and the tests
+/// need a stable path-derivation rule they can assert against
+/// independently of the production crate's internals.
 fn locate_cache_files(url: &str) -> (std::path::PathBuf, std::path::PathBuf) {
-    use sha2::{Digest, Sha256};
-    let mut h = Sha256::new();
-    h.update(url.as_bytes());
-    let digest = format!("{:x}", h.finalize());
+    let parsed = url::Url::parse(url).unwrap();
+    let host = parsed.host_str().unwrap_or("_remote");
+    let authority = match parsed.port() {
+        Some(port) => format!("{host}_{port}"),
+        None => host.to_string(),
+    };
+    let raw_path = parsed.path().trim_start_matches('/');
+    let (parent, basename) = match raw_path.rsplit_once('/') {
+        Some((p, b)) if !b.is_empty() => (p, b),
+        _ => ("", raw_path),
+    };
+    let basename = if basename.is_empty() { "data" } else { basename };
     let cache_root = TEST_CACHE_DIR.path().to_path_buf();
-    let blob_dir = cache_root.join("http").join(&digest[..2]).join(&digest);
-    let filename = url.rsplit('/').next().unwrap_or("data");
-    let cache_file = blob_dir.join(filename);
-    let sidecar = blob_dir.join(format!("{filename}.chunks"));
+    let mut dir = cache_root.join(authority);
+    if !parent.is_empty() {
+        for seg in parent.split('/') { dir.push(seg); }
+    }
+    let cache_file = dir.join(basename);
+    let sidecar = dir.join(format!("{basename}.chunks"));
     (cache_file, sidecar)
 }
 

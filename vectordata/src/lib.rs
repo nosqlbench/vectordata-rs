@@ -164,9 +164,9 @@ pub mod group;
 /// on the core types.
 pub mod cache_admin {
     pub use crate::cache::reader::{
-        BLOBS_DIR, HTTP_DIR,
+        LEGACY_BLOBS_DIR, LEGACY_HTTP_DIR,
         CacheEntry, CacheListing, PruneFilter, PruneReport,
-        is_legacy_layout_name, is_reserved_layout_name,
+        is_legacy_layout_dir,
         list_entries, prune_by_filter, prune_legacy_layout,
     };
 }

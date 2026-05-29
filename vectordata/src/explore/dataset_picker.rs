@@ -16,7 +16,7 @@ use crossterm::{
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
-    style::{Color, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
     Terminal,
@@ -39,8 +39,10 @@ const ACCENT_CORAL:   Color = Color::Rgb(255, 115, 145); // error / full-transfe
 const TEXT_PRIMARY:   Color = Color::Rgb(225, 230, 245); // default row text
 const TEXT_MUTED:     Color = Color::Rgb(135, 145, 175); // column headers, footer
 const TEXT_DIM:       Color = Color::Rgb( 90, 100, 130); // tertiary text, "—" rows
-const SELECTED_BG:    Color = Color::Rgb( 40,  55,  95); // selection band
-const SELECTED_FG:    Color = Color::Rgb(245, 250, 255); // selection text
+// Selection uses `Modifier::REVERSED` rather than explicit fg/bg
+// colours so the highlight bar is independent of palette state —
+// works under the neon theme, the mono toggle, and broken-ANSI
+// terminals alike.
 
 /// Pad a string to `target` DISPLAY columns (not bytes). Rust's built-in
 /// `format!("{:<w$}", ...)` pads by byte count, which under-reserves
@@ -107,7 +109,7 @@ impl PickerRow {
 
 fn build_rows(
     entries: &[CatalogEntry],
-    cache_survey: &std::collections::HashMap<String, (u32, u32)>,
+    cache_survey: &std::collections::HashMap<String, FacetCacheView>,
 ) -> Vec<PickerRow> {
     use crate::dataset::StandardFacet;
 
@@ -227,11 +229,18 @@ fn build_rows(
 ///      up in the survey.
 ///   3. Otherwise count as one missing chunk (we know the facet
 ///      exists but have no evidence of it being cached).
+///
+/// For *windowed* views (sized profiles where `view.source.window`
+/// carries a `[start..end)` range), the coverage is bounded to the
+/// chunks covering the window's byte range — otherwise every sized
+/// profile sharing a base file would report the whole file's chunk
+/// count and the picker's CACHED column would show identical
+/// numerators / denominators across every row.
 fn profile_cache_coverage(
     entry: &CatalogEntry,
     profile: &crate::dataset::profile::DSProfile,
     ds_workspace: &std::path::Path,
-    survey: &std::collections::HashMap<String, (u32, u32)>,
+    survey: &std::collections::HashMap<String, FacetCacheView>,
 ) -> (u32, u32) {
     let mut valid = 0u32;
     let mut total = 0u32;
@@ -247,21 +256,33 @@ fn profile_cache_coverage(
         // the manifest each added 1 to `total` without ever showing up
         // in the cache.
         let ext = clean.rsplit('.').next().unwrap_or("");
-        if crate::io::infer_elem_size(ext) == 0 { continue; }
+        let elem_size = crate::io::infer_elem_size(ext);
+        if elem_size == 0 { continue; }
 
+        // Prefer the survey (which reads the `.mrkl` / `.chunks`
+        // sidecar for true chunk-level coverage). Post-cutover the
+        // natural-layout cache path is *exactly* `<cache>/<dataset>/
+        // <facet>` — the same place a `derive`-style flat file
+        // would live, but Storage pre-allocates the file as sparse
+        // before downloading any chunks. A `file.exists()` check
+        // therefore lights up as `100% (1/1)` from the moment
+        // precache opens the facet, masking the real chunk progress.
+        // Survey first, file-existence second (as the `derive`-style
+        // flat-file fallback when there is no sidecar to consult).
+        if let Some(url) = resolve_facet_url(entry, view) {
+            let canonical = canonicalize_cache_url(&url);
+            if let Some(cv) = survey.get(&canonical) {
+                let (v, t) = window_bounded_coverage(cv, view, source_path, ext, elem_size);
+                valid += v;
+                total += t;
+                continue;
+            }
+        }
         let local_path = ds_workspace.join(clean);
         if local_path.exists() {
             valid += 1;
             total += 1;
             continue;
-        }
-        if let Some(url) = resolve_facet_url(entry, view) {
-            let canonical = canonicalize_cache_url(&url);
-            if let Some(&(v, t)) = survey.get(&canonical) {
-                valid += v;
-                total += t;
-                continue;
-            }
         }
         total += 1;
     }
@@ -275,10 +296,12 @@ fn profile_cache_coverage(
 fn build_details_lines(
     row: &PickerRow,
     entry: Option<&CatalogEntry>,
+    colors_on: bool,
 ) -> Vec<Line<'static>> {
-    let dim_gray = Style::default().fg(TEXT_MUTED);
-    let val_white = Style::default().fg(TEXT_PRIMARY);
-    let head_cyan = Style::default().fg(ACCENT_CYAN);
+    let tint = |c: Color| if colors_on { Style::default().fg(c) } else { Style::default() };
+    let dim_gray = tint(TEXT_MUTED);
+    let val_white = tint(TEXT_PRIMARY);
+    let head_cyan = tint(ACCENT_CYAN);
 
     let mut lines: Vec<Line<'static>> = Vec::new();
 
@@ -335,11 +358,303 @@ fn build_details_lines(
     };
     lines.push(Line::from(Span::styled(
         format!(" {}", row.access.description()),
-        Style::default().fg(access_color),
+        tint(access_color),
     )));
     lines.push(kv("cache", &row.cache_status, dim_gray, val_white));
 
     lines
+}
+
+/// Compose the full descriptor for the scrollable Describe overlay.
+/// Goes deeper than [`build_details_lines`]: every view's path,
+/// namespace (when set), and explicit window range; the origin URL
+/// pulled from the catalog entry; access mode rationale; per-row
+/// cache state.
+fn build_descriptor_lines(
+    row: &PickerRow,
+    entry: Option<&CatalogEntry>,
+    colors_on: bool,
+) -> Vec<Line<'static>> {
+    let tint = |c: Color| if colors_on { Style::default().fg(c) } else { Style::default() };
+    let dim_gray = tint(TEXT_MUTED);
+    let val_white = tint(TEXT_PRIMARY);
+    let head_cyan = tint(ACCENT_CYAN);
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    lines.push(Line::from(vec![
+        Span::styled(" Dataset: ", dim_gray),
+        Span::styled(row.dataset.clone(), val_white),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled(" Profile: ", dim_gray),
+        Span::styled(row.profile.clone(), val_white),
+    ]));
+
+    if let Some(entry) = entry {
+        lines.push(kv("path", &entry.path, dim_gray, val_white));
+        lines.push(kv("type", &entry.dataset_type, dim_gray, val_white));
+    }
+
+    if let Some(entry) = entry
+        && let Some(attrs) = entry.layout.attributes.as_ref()
+    {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(" Attributes ", head_cyan)));
+        if let Some(v) = attrs.model.as_deref()
+            { lines.push(kv("model", v, dim_gray, val_white)); }
+        if let Some(v) = attrs.distance_function.as_deref()
+            { lines.push(kv("distance", v, dim_gray, val_white)); }
+        if let Some(v) = attrs.vendor.as_deref()
+            { lines.push(kv("vendor", v, dim_gray, val_white)); }
+        if let Some(v) = attrs.license.as_deref()
+            { lines.push(kv("license", v, dim_gray, val_white)); }
+        if let Some(v) = attrs.url.as_deref()
+            { lines.push(kv("upstream", v, dim_gray, val_white)); }
+        if let Some(b) = attrs.is_normalized
+            { lines.push(kv("normalized", if b { "yes" } else { "no" }, dim_gray, val_white)); }
+        if let Some(v) = attrs.notes.as_deref()
+            { lines.push(kv("notes", v, dim_gray, val_white)); }
+    }
+
+    if let Some(entry) = entry
+        && let Some(profile) = entry.layout.profiles.profile(&row.profile)
+    {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(" Profile ", head_cyan)));
+        if let Some(maxk) = profile.maxk
+            { lines.push(kv("maxk", &maxk.to_string(), dim_gray, val_white)); }
+        if let Some(bc) = profile.base_count
+            { lines.push(kv("base_count", &format_count(bc), dim_gray, val_white)); }
+        if profile.partition
+            { lines.push(kv("partition", "yes (independent base)", dim_gray, val_white)); }
+
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(" Facets ", head_cyan)));
+        for (facet, view) in &profile.views {
+            // Header line: facet name in primary tint, then nested
+            // fields underneath for source path / namespace / window.
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(format!("{facet}:"), val_white),
+            ]));
+            lines.push(kv_indent(2, "source", &view.source.path, dim_gray, val_white));
+            if let Some(ns) = view.source.namespace.as_deref() {
+                lines.push(kv_indent(2, "namespace", ns, dim_gray, val_white));
+            }
+            // Both window fields the catalog YAML can populate. The
+            // view-level override (sibling of `source`) shadows the
+            // source-level one; show both if set so users can see
+            // which one wins.
+            if let Some(view_w) = view.window.as_ref()
+                && let Some(iv) = view_w.0.first()
+            {
+                lines.push(kv_indent(2, "window",
+                    &format!("[{}..{}) (view override)", iv.min_incl, iv.max_excl),
+                    dim_gray, val_white));
+            }
+            if let Some(iv) = view.source.window.0.first() {
+                lines.push(kv_indent(2, "source.window",
+                    &format!("[{}..{})", iv.min_incl, iv.max_excl),
+                    dim_gray, val_white));
+            }
+        }
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(" Access & Cache ", head_cyan)));
+    let access_color = match row.access {
+        AccessMode::Local         => ACCENT_CYAN,
+        AccessMode::MerkleHashed  => ACCENT_MINT,
+        AccessMode::MerkleChunked => ACCENT_LAVENDR,
+        AccessMode::FullTransfer  => ACCENT_CORAL,
+    };
+    lines.push(kv("access", row.access.short_label(), dim_gray, tint(access_color)));
+    lines.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled(format!("{:<12}", ""), dim_gray),
+        Span::raw(" "),
+        Span::styled(row.access.description().to_string(), dim_gray),
+    ]));
+    lines.push(kv("cache", &row.cache_status, dim_gray, val_white));
+    lines.push(kv("size", &row.size, dim_gray, val_white));
+    lines.push(kv("metric", &row.metric, dim_gray, val_white));
+
+    lines
+}
+
+/// Locate and load the raw catalog YAML backing a dataset, return
+/// `(title_suffix, lines)`. For canonical `dataset.yaml` catalogs
+/// the file is returned verbatim; for `knn_entries.yaml` catalogs
+/// only the entries matching `entry.name` (plus `_defaults:`) are
+/// kept so a 1268-line / 253-entry file collapses to the ~100 lines
+/// the user actually cares about.
+///
+/// Both local paths and HTTP(S) URLs are handled. On failure the
+/// returned line vector carries a single error message — the overlay
+/// still opens so the user can see what went wrong.
+fn build_source_lines(
+    entry: &CatalogEntry,
+    colors_on: bool,
+) -> (String, Vec<Line<'static>>) {
+    let tint = |c: Color| if colors_on { Style::default().fg(c) } else { Style::default() };
+    let body_style = tint(TEXT_PRIMARY);
+    let error_style = tint(ACCENT_CORAL);
+
+    // Source location: canonical entries point at the dataset.yaml
+    // URL directly; knn_entries-shape entries point at the catalog
+    // base, so we append the file name.
+    let (source_url, title_suffix) = if entry.dataset_type == "knn_entries.yaml" {
+        let url = format!("{}/knn_entries.yaml", entry.path.trim_end_matches('/'));
+        (url, "knn_entries.yaml")
+    } else {
+        (entry.path.clone(), "dataset.yaml")
+    };
+
+    let raw = match fetch_yaml_text(&source_url) {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                format!("Source error — {title_suffix}"),
+                vec![
+                    Line::from(Span::styled(format!(" {source_url}"), tint(TEXT_MUTED))),
+                    Line::from(""),
+                    Line::from(Span::styled(format!(" error: {e}"), error_style)),
+                ],
+            );
+        }
+    };
+
+    let filtered = if entry.dataset_type == "knn_entries.yaml" {
+        filter_knn_entries_for(&raw, &entry.name)
+    } else {
+        raw
+    };
+
+    // Preserve verbatim whitespace by rendering each line as a raw
+    // span. The Paragraph widget already honours the line breaks;
+    // the leading space keeps content from kissing the border.
+    let lines: Vec<Line<'static>> = std::iter::once(
+        Line::from(Span::styled(format!(" {source_url}"), tint(TEXT_MUTED))),
+    )
+    .chain(std::iter::once(Line::from("")))
+    .chain(filtered.lines().map(|l| {
+        Line::from(Span::styled(format!(" {l}"), body_style))
+    }))
+    .collect();
+
+    (format!("Source — {title_suffix}"), lines)
+}
+
+/// Read raw text from a URL or filesystem path. `file://` URIs are
+/// stripped to their path component; bare `http(s)://` URLs route
+/// through the shared transport client (warm connection pool, same
+/// 32-way runtime fanout as the rest of the runtime); everything
+/// else is treated as a filesystem path.
+fn fetch_yaml_text(location: &str) -> Result<String, String> {
+    if location.starts_with("http://") || location.starts_with("https://") {
+        let client = crate::transport::shared_client();
+        return client.get(location).send()
+            .map_err(|e| format!("HTTP fetch: {e}"))?
+            .error_for_status()
+            .map_err(|e| format!("HTTP status: {e}"))?
+            .text()
+            .map_err(|e| format!("HTTP decode: {e}"));
+    }
+    let fs_path: &str = if let Some(rest) = location.strip_prefix("file://") {
+        // file:///abs → /abs; file://host/abs → /abs.
+        if rest.starts_with('/') { rest }
+        else if let Some(slash) = rest.find('/') { &rest[slash..] }
+        else { rest }
+    } else {
+        location
+    };
+    std::fs::read_to_string(fs_path)
+        .map_err(|e| format!("read {fs_path}: {e}"))
+}
+
+/// Filter a `knn_entries.yaml` body to the blocks belonging to a
+/// specific dataset. Keeps `_defaults:` (the file's shared base_url
+/// / cache_dir context) plus every entry whose key starts with
+/// `"<dataset>:`. A "block" is a top-level key line plus its
+/// indented continuation. Blank lines between kept blocks are
+/// preserved so the output stays readable; other blank lines are
+/// dropped to keep the filtered view tight.
+fn filter_knn_entries_for(content: &str, dataset_name: &str) -> String {
+    let mut out = String::new();
+    let mut iter = content.lines().peekable();
+    while let Some(line) = iter.next() {
+        // Top-level key lines: not blank, not indented, contain `:`.
+        let is_top_level = !line.is_empty()
+            && !line.starts_with(' ')
+            && !line.starts_with('\t')
+            && line.contains(':');
+        if !is_top_level {
+            // Carry through file-leading comments verbatim; drop
+            // everything else at the top level (blank lines between
+            // entries we're filtering out).
+            if line.starts_with('#') {
+                out.push_str(line);
+                out.push('\n');
+            }
+            continue;
+        }
+
+        // Extract the key (quoted or bare).
+        let key_raw = line.split(':').next().unwrap_or("");
+        let key = key_raw.trim().trim_matches('"');
+        let keep = key == "_defaults"
+            || key.split(':').next().is_some_and(|name| name == dataset_name);
+
+        if keep {
+            out.push_str(line);
+            out.push('\n');
+            // Consume continuation: indented lines and blank lines
+            // that sit between continuation lines.
+            while let Some(next) = iter.peek() {
+                if next.is_empty()
+                    || next.starts_with(' ')
+                    || next.starts_with('\t')
+                {
+                    out.push_str(next);
+                    out.push('\n');
+                    iter.next();
+                } else {
+                    break;
+                }
+            }
+        } else {
+            // Skip block: consume its continuation lines without
+            // emitting them.
+            while let Some(next) = iter.peek() {
+                if next.is_empty()
+                    || next.starts_with(' ')
+                    || next.starts_with('\t')
+                {
+                    iter.next();
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+    if out.is_empty() {
+        format!("# no entries matched '{dataset_name}' in knn_entries.yaml\n")
+    } else {
+        out
+    }
+}
+
+/// Like [`kv`] but with a custom leading-indent depth (in spaces of
+/// 2). Used by the descriptor view's nested facet fields.
+fn kv_indent(depth: usize, key: &str, value: &str, key_style: Style, val_style: Style) -> Line<'static> {
+    let pad = " ".repeat(depth * 2 + 2);
+    Line::from(vec![
+        Span::raw(pad),
+        Span::styled(format!("{key:<12}"), key_style),
+        Span::raw(" "),
+        Span::styled(value.to_string(), val_style),
+    ])
 }
 
 /// Two-column "  key   value" line used by the details overlay.
@@ -385,63 +700,281 @@ fn strip_window_suffix(source_path: &str) -> &str {
 /// normalisation [`crate::storage`] applies on `open` (s3 → https,
 /// then `Url::parse`'s canonical form), so a row's facet URL hashed
 /// here matches whatever the runtime would have hashed.
+/// Walk every per-dataset directory under `cache_root` (identified by
+/// the presence of an `origin.json`), then within each one read every
+/// `.mrkl` / `.chunks` sidecar to extract `(valid, total)` chunk
+/// counts. Returns a map keyed by the *facet URL* — the per-dataset
+/// origin URL joined with the sidecar's filesystem path relative to
+/// the dataset directory. Callers consult this map by canonicalising
+/// the row's facet URL the same way and looking it up.
+///
+/// Layout assumed (the natural-cache layout established by
+/// [`crate::storage::layout_for_url`]):
+///
+/// ```text
+/// <cache_root>/<authority>/<.../subdirs>/
+///   ├── origin.json
+///   ├── base.fvec
+///   ├── base.fvec.mrkl
+///   ├── query.fvec
+///   └── query.fvec.chunks
+/// ```
 fn survey_cache_state(cache_dir: &std::path::Path)
-    -> std::collections::HashMap<String, (u32, u32)>
+    -> std::collections::HashMap<String, FacetCacheView>
 {
-    let mut map: std::collections::HashMap<String, (u32, u32)> =
+    let mut map: std::collections::HashMap<String, FacetCacheView> =
         std::collections::HashMap::new();
-    for subdir in ["blobs", "http"] {
-        scan_addressed_subtree(&cache_dir.join(subdir), &mut map);
-    }
+    walk_dataset_dirs(cache_dir, &mut |dataset_dir| {
+        let Some(origin) = crate::cache::layout::read_dataset_origin(dataset_dir) else { return; };
+        let base_url = origin.source;
+        walk_sidecars(dataset_dir, dataset_dir, &base_url, &mut map);
+    });
     map
 }
 
-fn scan_addressed_subtree(
-    root: &std::path::Path,
-    map: &mut std::collections::HashMap<String, (u32, u32)>,
-) {
-    let Ok(prefixes) = std::fs::read_dir(root) else { return; };
-    for prefix in prefixes.flatten() {
-        let pp = prefix.path();
-        if !pp.is_dir() { continue; }
-        let Ok(leaves) = std::fs::read_dir(&pp) else { continue; };
-        for leaf in leaves.flatten() {
-            let lp = leaf.path();
-            if !lp.is_dir() { continue; }
-            scan_cache_leaf(&lp, map);
-        }
+/// Per-facet cache state captured by [`survey_cache_state`]. Carries
+/// enough chunk-level detail that windowed coverage can be computed
+/// at picker time — without the per-chunk bitmap, every sized profile
+/// sharing a base file would report the whole file's chunk count and
+/// the CACHED column would look identical across windows of wildly
+/// different sizes.
+pub(crate) struct FacetCacheView {
+    /// Chunk size in bytes (from the merkle reference, or the
+    /// `.chunks` sidecar's implied 8 MiB).
+    chunk_size: u64,
+    /// Total chunk count for the whole file.
+    total_chunks: u32,
+    /// Total file size in bytes.
+    total_size: u64,
+    /// Per-chunk validity bitmap, `true` when the chunk is downloaded
+    /// and (for merkle-backed entries) verified.
+    valid_bits: Vec<bool>,
+    /// Absolute path to the cache file. Used by windowed-coverage
+    /// computation to peek at byte 0..4 — the xvec dim header — to
+    /// derive bytes-per-record without separate format-specific
+    /// metadata.
+    cache_file_path: std::path::PathBuf,
+}
+
+impl FacetCacheView {
+    /// Total valid chunks across the whole file.
+    fn whole_file_valid(&self) -> u32 {
+        self.valid_bits.iter().filter(|&&b| b).count() as u32
     }
 }
 
-fn scan_cache_leaf(
-    leaf: &std::path::Path,
-    map: &mut std::collections::HashMap<String, (u32, u32)>,
-) {
-    let Some(origin) = crate::cache::reader::read_origin(leaf) else { return; };
-    let Ok(entries) = std::fs::read_dir(leaf) else { return; };
-    for dirent in entries.flatten() {
-        let path = dirent.path();
-        let Some(ext) = path.extension().and_then(|e| e.to_str()) else { continue; };
-        match ext {
-            "mrkl" => {
-                if let Ok(state) = crate::merkle::MerkleState::load(&path) {
-                    map.insert(
-                        canonicalize_cache_url(&origin.url),
-                        (state.valid_count(), state.shape().total_chunks),
-                    );
-                    return;
-                }
+/// Compute the picker's `(valid, total)` chunk contribution for a
+/// single facet. For windowed views (sized profiles), this bounds
+/// counting to chunks covering the window's byte range — so the
+/// CACHED column reflects what the profile actually needs, not the
+/// shared base file's full chunk count.
+///
+/// Falls back to whole-file counts when:
+///   - the view has no window (default profile);
+///   - the format isn't a uniform-stride xvec (vvec / parquet / etc.
+///     would need format-specific record→byte logic we don't have at
+///     this layer);
+///   - bytes-per-record can't be read from the cache file (chunk 0
+///     isn't downloaded yet, so the xvec dim header is unavailable).
+fn window_bounded_coverage(
+    cv: &FacetCacheView,
+    view: &crate::dataset::profile::DSView,
+    source_path: &str,
+    ext: &str,
+    elem_size: usize,
+) -> (u32, u32) {
+    // Window: `view.effective_window()` returns the view-level
+    // override when set, else the source-level window. The catalog's
+    // explicit form (`base_vectors: { source: ..., window: [...] }`)
+    // populates `view.window` (sibling of `source`), so reading from
+    // `view.source.window` alone misses it entirely — and was the
+    // reason every sized profile reported the whole-file chunk count
+    // even after windowed coverage was wired up. Fall back to a
+    // `[start..end)` suffix embedded in the source path for catalogs
+    // that use the legacy `Simple("path[0..N)")` form.
+    let effective = view.effective_window();
+    let window: Option<(u64, u64)> = effective.0.first()
+        .map(|iv| (iv.min_incl, iv.max_excl))
+        .or_else(|| parse_path_suffix_window(source_path));
+
+    let Some((win_start, win_end)) = window else {
+        return (cv.whole_file_valid(), cv.total_chunks);
+    };
+    if win_end <= win_start {
+        return (cv.whole_file_valid(), cv.total_chunks);
+    }
+
+    // Format guard: only uniform-stride xvec is record→byte computable
+    // from `4 + dim * elem_size`. vvec / parquet need metadata we
+    // don't carry at this layer.
+    if crate::io::is_vvec_ext(ext) {
+        return (cv.whole_file_valid(), cv.total_chunks);
+    }
+
+    let Some(bpr) = read_xvec_bpr(&cv.cache_file_path, elem_size) else {
+        // Cache file isn't downloaded far enough to read the dim
+        // header — windowed coverage can't be computed; reporting
+        // the whole-file count is the only honest fallback.
+        return (cv.whole_file_valid(), cv.total_chunks);
+    };
+
+    let byte_start = win_start.saturating_mul(bpr).min(cv.total_size);
+    let byte_end = win_end.saturating_mul(bpr).min(cv.total_size);
+    chunks_for_byte_range(cv, byte_start, byte_end)
+}
+
+/// Read the 4-byte xvec dim header at byte 0 of the cache file, then
+/// compute bytes-per-record as `4 + dim * elem_size`. Returns `None`
+/// when chunk 0 isn't downloaded (sparse hole at the start of the
+/// file → reads as zeros → dim parses as 0 → rejected by sanity
+/// bounds) or when the file can't be opened.
+fn read_xvec_bpr(cache_file: &std::path::Path, elem_size: usize) -> Option<u64> {
+    use std::io::Read;
+    let mut buf = [0u8; 4];
+    let mut f = std::fs::File::open(cache_file).ok()?;
+    f.read_exact(&mut buf).ok()?;
+    let dim = i32::from_le_bytes(buf);
+    if dim <= 0 || dim > 1_000_000 { return None; }
+    Some(4 + (dim as u64) * (elem_size as u64))
+}
+
+/// Count `(valid_chunks_in_range, total_chunks_in_range)` for the
+/// chunks intersecting `[byte_start, byte_end)`. An empty range
+/// returns `(0, 0)`.
+fn chunks_for_byte_range(
+    cv: &FacetCacheView,
+    byte_start: u64,
+    byte_end: u64,
+) -> (u32, u32) {
+    if cv.chunk_size == 0 || byte_start >= byte_end { return (0, 0); }
+    let first = (byte_start / cv.chunk_size) as u32;
+    let last_inclusive = ((byte_end - 1) / cv.chunk_size) as u32;
+    let last_inclusive = last_inclusive.min(cv.total_chunks.saturating_sub(1));
+    if first > last_inclusive { return (0, 0); }
+    let total = last_inclusive - first + 1;
+    let mut valid = 0u32;
+    for i in first..=last_inclusive {
+        if let Some(&b) = cv.valid_bits.get(i as usize)
+            && b { valid += 1; }
+    }
+    (valid, total)
+}
+
+/// Parse a `[start..end)` window suffix from a source path. Returns
+/// `None` when the path has no suffix or the contents don't parse —
+/// callers fall back to either the explicit `view.source.window`
+/// field or treat the facet as unwindowed.
+fn parse_path_suffix_window(path: &str) -> Option<(u64, u64)> {
+    let parsed = crate::dataset::source::parse_source_string(path).ok()?;
+    let iv = parsed.window.0.first()?;
+    Some((iv.min_incl, iv.max_excl))
+}
+
+/// Recursively walk `root`, invoking `visit` on every directory that
+/// contains an `origin.json` (i.e., every per-dataset cache
+/// directory). Descends through the in-between authority/path-segment
+/// directories that have no origin.json.
+fn walk_dataset_dirs<F: FnMut(&std::path::Path)>(root: &std::path::Path, visit: &mut F) {
+    let Ok(entries) = std::fs::read_dir(root) else { return; };
+    let mut has_origin = false;
+    let mut sub_dirs = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file() {
+            if path.file_name().is_some_and(|n| n == crate::cache::layout::DATASET_ORIGIN_FILE) {
+                has_origin = true;
             }
-            "chunks" => {
-                if let Ok(bytes) = std::fs::read(&path) {
-                    let total = bytes.len() as u32;
-                    let valid = bytes.iter().filter(|&&b| b != 0).count() as u32;
-                    map.insert(canonicalize_cache_url(&origin.url), (valid, total));
-                    return;
-                }
-            }
-            _ => {}
+        } else if path.is_dir() {
+            sub_dirs.push(path);
         }
+    }
+    if has_origin {
+        visit(root);
+        // A dataset directory can still nest further (sized
+        // profiles, partition dirs) — keep walking subdirs in case
+        // they're separate datasets in their own right with their
+        // own `origin.json`.
+    }
+    for sub in sub_dirs {
+        walk_dataset_dirs(&sub, visit);
+    }
+}
+
+/// Within a single dataset directory (where origin.json lives), walk
+/// every file and record per-chunk cache state. The URL recorded in
+/// the map is `<base_url><relpath>` where `relpath` is the sidecar's
+/// logical filename (`.mrkl` / `.chunks` trimmed) relative to the
+/// dataset directory.
+fn walk_sidecars(
+    dataset_dir: &std::path::Path,
+    current: &std::path::Path,
+    base_url: &str,
+    map: &mut std::collections::HashMap<String, FacetCacheView>,
+) {
+    let Ok(entries) = std::fs::read_dir(current) else { return; };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            walk_sidecars(dataset_dir, &path, base_url, map);
+            continue;
+        }
+        let Some(ext) = path.extension().and_then(|e| e.to_str()) else { continue; };
+        // Strip `.mrkl` / `.chunks` to get the data file's path;
+        // that path is the cache file we'll later peek at (for the
+        // xvec dim header) when computing windowed coverage.
+        let cache_file_path = path.with_extension("");
+        let view = match ext {
+            "mrkl" => crate::merkle::MerkleState::load(&path).ok().map(|s| {
+                let shape = s.shape();
+                let total_chunks = shape.total_chunks;
+                let valid_bits: Vec<bool> = (0..total_chunks).map(|i| s.is_valid(i)).collect();
+                FacetCacheView {
+                    chunk_size: shape.chunk_size,
+                    total_chunks,
+                    total_size: shape.total_content_size,
+                    valid_bits,
+                    cache_file_path: cache_file_path.clone(),
+                }
+            }),
+            "chunks" => std::fs::read(&path).ok().map(|bytes| {
+                // The `.chunks` sidecar carries one byte per chunk —
+                // non-zero means valid. We don't have a shape sidecar
+                // alongside it; chunk_size and total_size come from
+                // the cache file itself (the chunk size used by
+                // `ChunkStore` is fixed at the storage layer; we
+                // approximate total_size from the file metadata so
+                // windowed coverage still works).
+                let total = bytes.len() as u32;
+                let valid_bits: Vec<bool> = bytes.iter().map(|&b| b != 0).collect();
+                let chunk_size = crate::chunked_http::DEFAULT_CHUNK_SIZE;
+                let total_size = std::fs::metadata(&cache_file_path)
+                    .ok()
+                    .map(|m| m.len())
+                    .unwrap_or((total as u64) * chunk_size);
+                FacetCacheView {
+                    chunk_size,
+                    total_chunks: total,
+                    total_size,
+                    valid_bits,
+                    cache_file_path: cache_file_path.clone(),
+                }
+            }),
+            _ => None,
+        };
+        let Some(view) = view else { continue; };
+        let Ok(relpath) = cache_file_path.strip_prefix(dataset_dir) else { continue; };
+        let relpath_str = relpath.to_string_lossy().replace('\\', "/");
+        let facet_url = format!("{}{}", base_url.trim_end_matches('/'), {
+            // base_url already ends with `/` (recorded as the parent
+            // URL). If it doesn't, add one. Use `.starts_with('/')`
+            // on the relpath to avoid a double slash either way.
+            if relpath_str.starts_with('/') {
+                relpath_str.clone()
+            } else {
+                format!("/{relpath_str}")
+            }
+        });
+        map.insert(canonicalize_cache_url(&facet_url), view);
     }
 }
 
@@ -491,28 +1024,44 @@ pub(super) fn purge_cache_for_entry(
     let facet_urls = entry_facet_urls(entry);
     let mut removed = Vec::new();
     let mut freed: u64 = 0;
-    for subdir in ["blobs", "http"] {
-        let root = cache_dir.join(subdir);
-        let Ok(prefixes) = std::fs::read_dir(&root) else { continue; };
-        for prefix in prefixes.flatten() {
-            let pp = prefix.path();
-            if !pp.is_dir() { continue; }
-            let Ok(leaves) = std::fs::read_dir(&pp) else { continue; };
-            for leaf in leaves.flatten() {
-                let lp = leaf.path();
-                if !lp.is_dir() { continue; }
-                let Some(origin) = crate::cache::reader::read_origin(&lp) else { continue; };
-                let canonical = canonicalize_cache_url(&origin.url);
-                if !facet_urls.contains(&canonical) { continue; }
-                let leaf_bytes = leaf_size_bytes(&lp);
-                if std::fs::remove_dir_all(&lp).is_ok() {
-                    freed += leaf_bytes;
-                    removed.push(lp);
-                }
-            }
+    // Walk dataset directories the same way the survey does. For each
+    // one, check whether ANY facet URL we know belongs to this entry
+    // would resolve into this dataset_dir — if so the whole tree
+    // belongs to us and gets removed atomically.
+    walk_dataset_dirs(cache_dir, &mut |dataset_dir| {
+        let Some(origin) = crate::cache::layout::read_dataset_origin(dataset_dir) else { return; };
+        // Canonicalise the recorded origin before comparing — without
+        // this, an s3:// origin and a facet URL already-canonicalised
+        // to https:// (by `entry_facet_urls`) would never share a
+        // prefix and purge would silently match nothing. Both sides
+        // must travel the same translation through
+        // `transport::normalize_remote_url`.
+        let base_url = canonicalize_cache_url(&origin.source);
+        // A dataset directory's recorded origin is the *parent URL*
+        // of every facet that ought to live there. We check whether
+        // any facet URL we know has the dataset directory's origin
+        // as a URL prefix. Conservative — only delete what's clearly
+        // ours, never sibling caches that happen to share an origin
+        // host.
+        let matches = facet_urls.iter().any(|u| base_url_matches_facet(&base_url, u));
+        if !matches { return; }
+        let bytes = leaf_size_bytes(dataset_dir);
+        if std::fs::remove_dir_all(dataset_dir).is_ok() {
+            freed += bytes;
+            removed.push(dataset_dir.to_path_buf());
         }
-    }
+    });
     (removed, freed)
+}
+
+/// True iff a facet URL is a child of `base_url` (the recorded
+/// parent-URL origin of a dataset directory). The picker computes
+/// every facet URL declared by the dataset entry; if any of them
+/// has the dataset directory's origin as a prefix, the directory
+/// belongs to this dataset.
+fn base_url_matches_facet(base_url: &str, facet_url: &str) -> bool {
+    let base = base_url.trim_end_matches('/');
+    facet_url.starts_with(&format!("{base}/")) || facet_url == base
 }
 
 fn leaf_size_bytes(dir: &std::path::Path) -> u64 {
@@ -691,6 +1240,16 @@ fn matches_filter(row: &PickerRow, filter: &str) -> bool {
 pub enum PickerAction {
     /// Launch the unified vector-space explorer for this profile.
     Visualize,
+    /// Open a scrollable text view of the full catalog descriptor
+    /// for this dataset+profile (attributes, facets with windows,
+    /// origin URLs, cache state). Renders inside the picker as an
+    /// overlay — does not exit the picker.
+    Describe,
+    /// Open a scrollable text view of the raw catalog YAML — the
+    /// `dataset.yaml` file for canonical catalogs, or the relevant
+    /// entries pulled out of `knn_entries.yaml` for the legacy
+    /// shape. Picker-local like Describe.
+    Source,
     /// Download every facet's bytes into the local cache directory.
     Precache,
     /// Delete the dataset's cached files from disk.
@@ -704,6 +1263,8 @@ impl PickerAction {
     fn label(self) -> &'static str {
         match self {
             PickerAction::Visualize => "Visualize",
+            PickerAction::Describe  => "Describe",
+            PickerAction::Source    => "Source",
             PickerAction::Precache  => "Precache",
             PickerAction::Purge     => "Purge",
             PickerAction::Ping      => "Ping",
@@ -714,6 +1275,10 @@ impl PickerAction {
         match self {
             PickerAction::Visualize =>
                 "Open the interactive explorer: norms, distances, eigenvalues, PCA.",
+            PickerAction::Describe =>
+                "Show full descriptor: attributes, facets (paths + windows), origin, cache state. Scrollable.",
+            PickerAction::Source =>
+                "Show the raw catalog YAML — dataset.yaml verbatim, or the relevant entries from knn_entries.yaml. Scrollable.",
             PickerAction::Precache =>
                 "Download every facet of this profile into the cache directory.",
             PickerAction::Purge =>
@@ -725,13 +1290,25 @@ impl PickerAction {
 
     /// Menu order — visualize first (the dominant action) so a
     /// double-Enter from the picker still lands on the explorer.
+    /// Describe sits second so a quick "what's in this profile?"
+    /// look is one keystroke away; Source is right after for the
+    /// "show me the raw YAML" path.
     fn menu_order() -> &'static [PickerAction] {
         &[
             PickerAction::Visualize,
+            PickerAction::Describe,
+            PickerAction::Source,
             PickerAction::Precache,
             PickerAction::Ping,
             PickerAction::Purge,
         ]
+    }
+
+    /// True for actions handled inside the picker (overlay state only)
+    /// rather than dispatched to the runner. Picker-local actions
+    /// don't suspend the chrome and don't go through `dispatch`.
+    fn is_picker_local(self) -> bool {
+        matches!(self, PickerAction::Describe | PickerAction::Source)
     }
 }
 
@@ -833,6 +1410,23 @@ where F: FnMut(&str, PickerAction) -> ActionFlow,
     let mut show_help = false;
     let mut show_details = false;
     let mut menu_open = false;
+    // Scrollable text overlay. Reused by Describe (parsed descriptor)
+    // and Source (raw catalog YAML) — both populate `descriptor_lines`
+    // + `descriptor_title` and flip `descriptor_open`. Lines are
+    // recomputed per-open from the current row + entry so cache
+    // state and remote fetch results stay fresh.
+    let mut descriptor_open = false;
+    let mut descriptor_scroll: u16 = 0;
+    let mut descriptor_lines: Vec<Line<'static>> = Vec::new();
+    let mut descriptor_title: String = String::new();
+    // Reading colour-naming detection from terminals is unreliable
+    // (TERM, COLORTERM, NO_COLOR all lie or are missing in tmux /
+    // ssh / screen / older xterm-256 setups). Instead, default to
+    // colour-on and let the user toggle with Ctrl-T when their
+    // terminal mangles the palette into illegible blocks. Selection
+    // is rendered via `Modifier::REVERSED` in both modes so it
+    // remains visible even when fg/bg colours are stripped.
+    let mut colors_enabled = true;
     let mut menu_cursor: usize = 0;
     let result: PickerOutcome;
 
@@ -849,6 +1443,24 @@ where F: FnMut(&str, PickerAction) -> ActionFlow,
             cursor = visible.len() - 1;
         }
 
+        // Local closures bound to the current theme state. `tinted`
+        // applies an accent colour only when colours are enabled; in
+        // mono mode it returns terminal-default styling (with modifier
+        // bits preserved). `selected_style` is always `REVERSED` so
+        // the highlight bar stays visible whether the user has colour
+        // turned on or has Ctrl-T'd it off because their terminal
+        // butchers ANSI colours.
+        let theme_on = colors_enabled;
+        let tinted = |c: Color| -> Style {
+            if theme_on { Style::default().fg(c) } else { Style::default() }
+        };
+        let bordered = |c: Color| -> Style {
+            if theme_on { Style::default().fg(c) } else { Style::default() }
+        };
+        let selected_style = || -> Style {
+            Style::default().add_modifier(Modifier::REVERSED)
+        };
+
         let drew = terminal.draw(|frame| {
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
@@ -861,21 +1473,22 @@ where F: FnMut(&str, PickerAction) -> ActionFlow,
 
             // Filter input — neon "Filter:" label, cyan caret, lavender
             // chrome on the box so the picker reads as a single tinted
-            // panel instead of plain ASCII.
+            // panel instead of plain ASCII. In mono mode all tints
+            // collapse to terminal default.
             let filter_line = Line::from(vec![
-                Span::styled(" Filter: ", Style::default().fg(TEXT_MUTED)),
-                Span::styled(filter.clone(), Style::default().fg(TEXT_PRIMARY)),
-                Span::styled("█", Style::default().fg(ACCENT_CYAN)),
+                Span::styled(" Filter: ", tinted(TEXT_MUTED)),
+                Span::styled(filter.clone(), tinted(TEXT_PRIMARY)),
+                Span::styled("█", tinted(ACCENT_CYAN)),
             ]);
             frame.render_widget(
                 Paragraph::new(filter_line)
                     .block(Block::default().borders(Borders::ALL)
-                        .border_style(Style::default().fg(ACCENT_LAVENDR))
+                        .border_style(bordered(ACCENT_LAVENDR))
                         .title(Span::styled(
                             format!(" Select Dataset — {} shown ({}) ",
                                 visible.len(),
                                 if show_all_profiles { "all profiles" } else { "default only — Tab for all" }),
-                            Style::default().fg(ACCENT_CYAN),
+                            tinted(ACCENT_CYAN),
                         ))),
                 chunks[0],
             );
@@ -891,7 +1504,7 @@ where F: FnMut(&str, PickerAction) -> ActionFlow,
 
             if show_help {
                 let help = vec![
-                    Line::from(Span::styled(" Dataset Picker — Keyboard Shortcuts", Style::default().fg(ACCENT_CYAN))),
+                    Line::from(Span::styled(" Dataset Picker — Keyboard Shortcuts", tinted(ACCENT_CYAN))),
                     Line::from(""),
                     Line::from(" Navigation"),
                     Line::from("   ↑ / ↓               Move selection"),
@@ -911,6 +1524,7 @@ where F: FnMut(&str, PickerAction) -> ActionFlow,
                     Line::from(""),
                     Line::from(" Inspection"),
                     Line::from("   Ctrl-D                Toggle dataset details overlay"),
+                    Line::from("   Ctrl-T                Toggle colour / mono theme"),
                     Line::from(""),
                     Line::from(" Exit"),
                     Line::from("   Esc                   Close details → collapse → clear filter → exit (one step per press)"),
@@ -919,8 +1533,8 @@ where F: FnMut(&str, PickerAction) -> ActionFlow,
                 ];
                 frame.render_widget(
                     Paragraph::new(help).block(Block::default().borders(Borders::ALL)
-                        .border_style(Style::default().fg(ACCENT_LAVENDR))
-                        .title(Span::styled(" Help ", Style::default().fg(ACCENT_CYAN)))),
+                        .border_style(bordered(ACCENT_LAVENDR))
+                        .title(Span::styled(" Help ", tinted(ACCENT_CYAN)))),
                     chunks[1],
                 );
             } else {
@@ -956,51 +1570,64 @@ where F: FnMut(&str, PickerAction) -> ActionFlow,
             // shape); the header pads DATASET to the same `name_w` so
             // the PROFILE column lands at identical offsets in both.
             let mut lines = vec![Line::from(vec![
-                Span::styled(pad_display("DATASET", name_w), Style::default().fg(TEXT_MUTED)),
-                Span::styled(pad_display("PROFILE", prof_w), Style::default().fg(TEXT_MUTED)),
-                Span::styled(pad_display("FACETS", facet_w), Style::default().fg(TEXT_MUTED)),
-                Span::styled(pad_display("METRIC", metric_w), Style::default().fg(TEXT_MUTED)),
-                Span::styled(pad_display("SIZE", size_w), Style::default().fg(TEXT_MUTED)),
-                Span::styled(pad_display("ACCESS", access_w), Style::default().fg(TEXT_MUTED)),
-                Span::styled(pad_display("CACHED", cache_w), Style::default().fg(TEXT_MUTED)),
+                Span::styled(pad_display("DATASET", name_w), tinted(TEXT_MUTED)),
+                Span::styled(pad_display("PROFILE", prof_w), tinted(TEXT_MUTED)),
+                Span::styled(pad_display("FACETS", facet_w), tinted(TEXT_MUTED)),
+                Span::styled(pad_display("METRIC", metric_w), tinted(TEXT_MUTED)),
+                Span::styled(pad_display("SIZE", size_w), tinted(TEXT_MUTED)),
+                Span::styled(pad_display("ACCESS", access_w), tinted(TEXT_MUTED)),
+                Span::styled(pad_display("CACHED", cache_w), tinted(TEXT_MUTED)),
             ])];
 
             for (i, row) in visible.iter().enumerate().skip(scroll).take(list_height.saturating_sub(1)) {
                 let selected = i == cursor;
-                let (fg, bg) = if selected {
-                    (SELECTED_FG, SELECTED_BG)
+                // Selection is always REVERSED — independent of the
+                // colour state, so the highlight bar stays visible
+                // on terminals that mangle ANSI 24-bit colour or
+                // when the user has Ctrl-T'd colours off.
+                let style = if selected {
+                    selected_style()
                 } else if row.cache_status != "—" {
-                    (ACCENT_MINT, Color::Reset)
+                    tinted(ACCENT_MINT)
                 } else {
-                    (TEXT_PRIMARY, Color::Reset)
+                    tinted(TEXT_PRIMARY)
                 };
-                let style = Style::default().fg(fg).bg(bg);
                 let cache_style = if selected {
                     style
                 } else if row.cache_status != "—" {
-                    Style::default().fg(ACCENT_MINT).bg(bg)
+                    tinted(ACCENT_MINT)
                 } else {
-                    Style::default().fg(TEXT_DIM).bg(bg)
+                    tinted(TEXT_DIM)
                 };
 
-                // Tree indicator for collapsed/expanded datasets
+                // Tree indicator for collapsed/expanded datasets.
+                // The leftmost column is reserved for the selection
+                // cursor pip (`▶`) so the selected row is identifiable
+                // by *shape*, not just colour — load-bearing for
+                // terminals that mangle ANSI 24-bit colour or for the
+                // user's Ctrl-T mono mode. The original prefix used
+                // the leftmost char as padding; we replace that with
+                // the cursor marker (or space) and keep the tree
+                // glyph in the position it already occupied so column
+                // widths and indentation depth are unchanged.
                 let is_expanded = expanded.contains(&row.dataset);
                 let has_siblings = all_rows.iter().filter(|r| r.dataset == row.dataset).count() > 1;
                 let is_child = is_expanded && row.profile != "default";
 
-                let (prefix, name_display) = if show_all_profiles {
-                    (" ", row.dataset.as_str())
+                let cursor_pip = if selected { '▶' } else { ' ' };
+                let (tree_glyph, name_display) = if show_all_profiles {
+                    ("", row.dataset.as_str())
                 } else if is_child {
-                    ("  └ ", row.dataset.as_str())
+                    (" └ ", row.dataset.as_str())
                 } else if has_siblings && !is_expanded {
-                    (" ▸ ", row.dataset.as_str())
+                    ("▸ ", row.dataset.as_str())
                 } else if has_siblings && is_expanded {
-                    (" ▾ ", row.dataset.as_str())
+                    ("▾ ", row.dataset.as_str())
                 } else {
-                    ("   ", row.dataset.as_str())
+                    ("  ", row.dataset.as_str())
                 };
 
-                let name_field = format!("{}{}", prefix, name_display);
+                let name_field = format!("{cursor_pip}{tree_glyph}{name_display}");
                 let name_cell = fit_display(&name_field, name_w);
 
                 let access_color = match row.access {
@@ -1012,7 +1639,7 @@ where F: FnMut(&str, PickerAction) -> ActionFlow,
                 let access_style = if selected {
                     style
                 } else {
-                    Style::default().fg(access_color).bg(bg)
+                    tinted(access_color)
                 };
 
                 lines.push(Line::from(vec![
@@ -1029,16 +1656,18 @@ where F: FnMut(&str, PickerAction) -> ActionFlow,
             frame.render_widget(
                 Paragraph::new(lines)
                     .block(Block::default().borders(Borders::ALL)
-                        .border_style(Style::default().fg(ACCENT_LAVENDR))),
+                        .border_style(bordered(ACCENT_LAVENDR))),
                 chunks[1],
             );
 
             } // close help/list else
 
-            // Detail panel for selected row. The dataset:profile name
-            // is already shown highlighted in the list above, so the
-            // detail line skips it and just expands the facet legend +
-            // access mode.
+            // Detail panel for selected row. Facet legend turns into
+            // present/absent emphasis via brackets in mono mode so
+            // users without colour can still tell which facets are
+            // declared by this profile (mint/amber/pink/coral in the
+            // colour palette collapse to undifferentiated terminal
+            // default otherwise).
             let (detail_line, access_line) = if let Some(row) = visible.get(cursor) {
                 let mut spans: Vec<Span<'_>> = vec![Span::raw(" ")];
                 let facet_details: &[(&str, char, Color)] = &[
@@ -1052,10 +1681,17 @@ where F: FnMut(&str, PickerAction) -> ActionFlow,
                     ("Filtered", 'F', ACCENT_CORAL),
                 ];
                 for (label, code, color) in facet_details {
-                    if row.facets.contains(*code) {
-                        spans.push(Span::styled(format!("{} ", label), Style::default().fg(*color)));
+                    let present = row.facets.contains(*code);
+                    if theme_on {
+                        let style = if present { Style::default().fg(*color) }
+                                    else { Style::default().fg(TEXT_DIM) };
+                        spans.push(Span::styled(format!("{} ", label), style));
                     } else {
-                        spans.push(Span::styled(format!("{} ", label), Style::default().fg(TEXT_DIM)));
+                        // Mono: bracket present facets, strike absent ones with
+                        // surrounding dots so the legend still reads at a glance.
+                        let glyph = if present { format!("[{label}] ") }
+                                    else { format!(" {label}  ") };
+                        spans.push(Span::raw(glyph));
                     }
                 }
                 let access_color = match row.access {
@@ -1066,7 +1702,7 @@ where F: FnMut(&str, PickerAction) -> ActionFlow,
                 };
                 let access = Line::from(Span::styled(
                     format!(" access: {}", row.access.description()),
-                    Style::default().fg(access_color),
+                    tinted(access_color),
                 ));
                 (Line::from(spans), access)
             } else {
@@ -1077,15 +1713,16 @@ where F: FnMut(&str, PickerAction) -> ActionFlow,
                     detail_line,
                     access_line,
                 ]).block(Block::default().borders(Borders::TOP)
-                    .border_style(Style::default().fg(ACCENT_LAVENDR))),
+                    .border_style(bordered(ACCENT_LAVENDR))),
                 chunks[2],
             );
 
             // Footer
+            let mono_hint = if theme_on { "Ctrl-T: mono" } else { "Ctrl-T: colour" };
             frame.render_widget(
                 Paragraph::new(Span::styled(
-                    " ↑↓: navigate | Enter/→: expand | ←: collapse | Tab: all profiles | type to filter | Ctrl-D: details | Esc: back | q: quit",
-                    Style::default().fg(TEXT_MUTED))),
+                    format!(" ↑↓: navigate | Enter/→: expand | ←: collapse | Tab: all profiles | type to filter | Ctrl-D: details | {mono_hint} | Esc: back | q: quit"),
+                    tinted(TEXT_MUTED))),
                 chunks[3],
             );
 
@@ -1107,23 +1744,71 @@ where F: FnMut(&str, PickerAction) -> ActionFlow,
                         height: popup_h,
                     };
                     let entry = entries.iter().find(|e| e.name == row.dataset);
-                    let lines = build_details_lines(row, entry);
+                    let lines = build_details_lines(row, entry, theme_on);
                     frame.render_widget(ratatui::widgets::Clear, area);
                     frame.render_widget(
                         Paragraph::new(lines)
                             .block(Block::default().borders(Borders::ALL)
-                                .border_style(Style::default().fg(ACCENT_LAVENDR))
+                                .border_style(bordered(ACCENT_LAVENDR))
                                 .title(Span::styled(
                                     format!(" Dataset Details — {}:{} (Ctrl-D / Esc to close) ", row.dataset, row.profile),
-                                    Style::default().fg(ACCENT_CYAN),
+                                    tinted(ACCENT_CYAN),
                                 ))),
                         area,
                     );
                 }
             }
 
+            // Descriptor overlay (Describe action). Larger than the
+            // Ctrl-D details popup so the full facet list, windows,
+            // and origin URLs stay readable; scrollable to handle
+            // dataset.yaml descriptors that overflow the screen.
+            if descriptor_open {
+                // No row guard: descriptor_title was captured when
+                // the overlay opened, so the popup keeps making
+                // sense even if the user's filter or expansion
+                // state shifts the row index behind the overlay.
+                let outer = frame.area();
+                let popup_w = outer.width.saturating_sub(6).max(40);
+                let popup_h = outer.height.saturating_sub(4).max(8);
+                let popup_x = (outer.width.saturating_sub(popup_w)) / 2;
+                let popup_y = (outer.height.saturating_sub(popup_h)) / 2;
+                let area = ratatui::layout::Rect {
+                    x: outer.x + popup_x,
+                    y: outer.y + popup_y,
+                    width: popup_w,
+                    height: popup_h,
+                };
+                // Clamp scroll so the bottom of the descriptor
+                // never disappears off-screen — if the user
+                // resizes the terminal smaller, the scroll
+                // position needs to slide back up.
+                let inner_h = popup_h.saturating_sub(2); // borders
+                let max_scroll = (descriptor_lines.len() as u16).saturating_sub(inner_h);
+                if descriptor_scroll > max_scroll {
+                    descriptor_scroll = max_scroll;
+                }
+                frame.render_widget(ratatui::widgets::Clear, area);
+                frame.render_widget(
+                    Paragraph::new(descriptor_lines.clone())
+                        .scroll((descriptor_scroll, 0))
+                        .block(Block::default().borders(Borders::ALL)
+                            .border_style(bordered(ACCENT_LAVENDR))
+                            .title(Span::styled(
+                                format!(" {} ({}/{} · ↑↓/PgUp/PgDn/Home/End · Esc to close) ",
+                                    descriptor_title,
+                                    descriptor_scroll + 1,
+                                    descriptor_lines.len().max(1)),
+                                tinted(ACCENT_CYAN),
+                            ))),
+                    area,
+                );
+            }
+
             // Action menu (opens on Enter against a leaf row). Drawn
-            // last so it lands on top of any other overlay.
+            // last so it lands on top of any other overlay. Selection
+            // cursor `▸` doubles the colour-based reverse-video so it
+            // is unambiguous in mono mode too.
             if menu_open {
                 if let Some(row) = visible.get(cursor) {
                     let outer = frame.area();
@@ -1140,9 +1825,9 @@ where F: FnMut(&str, PickerAction) -> ActionFlow,
                     for (i, action) in actions.iter().enumerate() {
                         let marker = if i == menu_cursor { " ▸ " } else { "   " };
                         let style = if i == menu_cursor {
-                            Style::default().fg(SELECTED_FG).bg(SELECTED_BG)
+                            selected_style()
                         } else {
-                            Style::default().fg(TEXT_PRIMARY)
+                            tinted(TEXT_PRIMARY)
                         };
                         lines.push(Line::from(Span::styled(
                             format!("{marker}{}", action.label()),
@@ -1152,16 +1837,16 @@ where F: FnMut(&str, PickerAction) -> ActionFlow,
                     lines.push(Line::from(""));
                     lines.push(Line::from(Span::styled(
                         format!(" {}", actions[menu_cursor].description()),
-                        Style::default().fg(TEXT_MUTED),
+                        tinted(TEXT_MUTED),
                     )));
                     frame.render_widget(ratatui::widgets::Clear, area);
                     frame.render_widget(
                         Paragraph::new(lines)
                             .block(Block::default().borders(Borders::ALL)
-                                .border_style(Style::default().fg(ACCENT_CYAN))
+                                .border_style(bordered(ACCENT_CYAN))
                                 .title(Span::styled(
                                     format!(" Action — {}:{} (Enter to confirm · Esc to cancel) ", row.dataset, row.profile),
-                                    Style::default().fg(ACCENT_CYAN),
+                                    tinted(ACCENT_CYAN),
                                 ))),
                         area,
                     );
@@ -1184,6 +1869,54 @@ where F: FnMut(&str, PickerAction) -> ActionFlow,
                 }
                 if key.code == KeyCode::Char('d') && key.modifiers.contains(KeyModifiers::CONTROL) {
                     show_details = !show_details;
+                    continue;
+                }
+                if key.code == KeyCode::Char('t') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                    // Ctrl-T: toggle colour theme. The rendering
+                    // codepaths fall back to terminal-default fg/bg
+                    // when this is off; selection still inverts via
+                    // `Modifier::REVERSED` so the highlight is
+                    // visible regardless.
+                    colors_enabled = !colors_enabled;
+                    continue;
+                }
+
+                // Descriptor overlay is modal — when open, swallow
+                // everything but scroll/close keys so the underlying
+                // list doesn't drift behind the popup. Checked
+                // *before* `menu_open` because Describe closes the
+                // menu before opening this overlay (they're never
+                // both open at once, but the ordering still matters
+                // for the Esc cascade further down).
+                if descriptor_open {
+                    let page = 10u16;
+                    match key.code {
+                        KeyCode::Esc | KeyCode::Char('q') => {
+                            descriptor_open = false;
+                        }
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            descriptor_scroll = descriptor_scroll.saturating_sub(1);
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            descriptor_scroll = descriptor_scroll.saturating_add(1);
+                        }
+                        KeyCode::PageUp => {
+                            descriptor_scroll = descriptor_scroll.saturating_sub(page);
+                        }
+                        KeyCode::PageDown => {
+                            descriptor_scroll = descriptor_scroll.saturating_add(page);
+                        }
+                        KeyCode::Home | KeyCode::Char('g') => {
+                            descriptor_scroll = 0;
+                        }
+                        KeyCode::End | KeyCode::Char('G') => {
+                            descriptor_scroll = u16::MAX;
+                            // Renderer clamps on next draw — saves
+                            // us from re-computing the popup height
+                            // here.
+                        }
+                        _ => {}
+                    }
                     continue;
                 }
 
@@ -1210,6 +1943,41 @@ where F: FnMut(&str, PickerAction) -> ActionFlow,
                                 let action = PickerAction::menu_order()[menu_cursor];
                                 let specifier = row.specifier();
                                 menu_open = false;
+                                // Picker-local actions never leave the
+                                // chrome: they flip an overlay flag and
+                                // skip the dispatch+chrome-suspend cycle.
+                                if action.is_picker_local() {
+                                    match action {
+                                        PickerAction::Describe => {
+                                            let entry = entries.iter().find(|e| e.name == row.dataset);
+                                            descriptor_lines = build_descriptor_lines(row, entry, theme_on);
+                                            descriptor_title = format!(
+                                                "Descriptor — {}:{}", row.dataset, row.profile);
+                                            descriptor_scroll = 0;
+                                            descriptor_open = true;
+                                        }
+                                        PickerAction::Source => {
+                                            let entry = entries.iter().find(|e| e.name == row.dataset);
+                                            let (title, lines) = match entry {
+                                                Some(e) => build_source_lines(e, theme_on),
+                                                None => (
+                                                    "Source — error".to_string(),
+                                                    vec![Line::from(
+                                                        Span::styled(" no catalog entry found".to_string(),
+                                                            if theme_on { Style::default().fg(ACCENT_CORAL) }
+                                                            else { Style::default() }),
+                                                    )],
+                                                ),
+                                            };
+                                            descriptor_lines = lines;
+                                            descriptor_title = title;
+                                            descriptor_scroll = 0;
+                                            descriptor_open = true;
+                                        }
+                                        _ => {} // future picker-local actions land here
+                                    }
+                                    continue;
+                                }
                                 // Suspend our chrome so the action can
                                 // own the terminal (visualizer enters
                                 // its own raw mode; precache/ping/purge

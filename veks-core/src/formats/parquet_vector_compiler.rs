@@ -22,7 +22,7 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Read;
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -1431,10 +1431,11 @@ fn parquet_prefetch_loop(
         // Force the file's pages into the page cache. Errors here are
         // non-fatal — the decoder will hit a cache miss and pay the
         // EBS read cost, but the whole job still completes. The
-        // `posix_fadvise` hints are Unix-only; on other targets we
-        // skip them and rely on the reader loop alone.
+        // `posix_fadvise` hints are Linux-only (Apple's libc doesn't
+        // expose them); on other targets we skip them and rely on
+        // the reader loop alone.
         if let Ok(f) = File::open(path) {
-            #[cfg(unix)]
+            #[cfg(target_os = "linux")]
             unsafe {
                 libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL);
                 libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_WILLNEED);
@@ -1642,7 +1643,7 @@ fn copy_file_range_full_linux(
 ///
 /// Errors are non-fatal — the syscall is advisory; if it fails, the only
 /// consequence is slightly less efficient cache management.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 pub(super) fn advise_dontneed(file: &File, offset: u64, len: u64) {
     if len == 0 { return; }
     unsafe {
@@ -1655,8 +1656,9 @@ pub(super) fn advise_dontneed(file: &File, offset: u64, len: u64) {
     }
 }
 
-/// No-op on non-Unix targets — `posix_fadvise` is Unix-only.
-#[cfg(not(unix))]
+/// No-op on non-Linux targets — `posix_fadvise` is a Linux extension
+/// that Apple's libc / the BSDs don't expose.
+#[cfg(not(target_os = "linux"))]
 pub(super) fn advise_dontneed(_file: &File, _offset: u64, _len: u64) {}
 
 /// Read a file in one shot with `posix_fadvise(SEQUENTIAL | WILLNEED)`
@@ -1672,9 +1674,9 @@ pub(super) fn read_file_with_advise(path: &Path) -> std::io::Result<Vec<u8>> {
     // POSIX_FADV_WILLNEED: ask kernel to start prefetching the whole
     // range into the page cache asynchronously. Errors are non-fatal —
     // the syscalls are advisory and the read below works either way.
-    // The advise calls are Unix-only; on other targets we just do
-    // the buffered read.
-    #[cfg(unix)]
+    // The advise calls are Linux-only (Apple's libc doesn't expose
+    // them); on other targets we just do the buffered read.
+    #[cfg(target_os = "linux")]
     {
         let fd = file.as_raw_fd();
         unsafe {

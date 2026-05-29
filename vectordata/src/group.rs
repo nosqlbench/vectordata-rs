@@ -28,6 +28,22 @@ pub enum DataSource {
 pub struct TestDataGroup {
     source: DataSource,
     config: DatasetConfig,
+    /// URL the dataset description was loaded from — the
+    /// `dataset.yaml` URL for canonical-shape catalogs, the
+    /// `knn_entries.yaml` (or wherever the synthesised layout
+    /// originated) for the legacy shape. Recorded in the
+    /// per-dataset `<cache_root>/<dataset>/origin.json` so a
+    /// catalog that moves can be migrated by editing one file.
+    /// `None` only when the group was built via a constructor that
+    /// doesn't have URL provenance (test fixtures); the cache
+    /// then falls back to URL-derived layout.
+    catalog_source: Option<String>,
+    /// Dataset identifier used as the per-dataset cache directory
+    /// name (`<cache_root>/<dataset_name>/`). Derived from the
+    /// catalog entry name when opened through `Catalog::open_entry`,
+    /// or from the last path/URL segment otherwise. `None` skips
+    /// catalog-anchored layout (URL-derived fallback wins).
+    dataset_name: Option<String>,
 }
 
 impl TestDataGroup {
@@ -74,9 +90,13 @@ impl TestDataGroup {
             let yaml_content = fs::read_to_string(path).map_err(Error::ConfigIo)?;
             let dir_name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
             let config = parse_catalog_content_for(&yaml_content, dir_name)?;
+            let dataset_name = dir.file_name()
+                .and_then(|n| n.to_str()).map(|s| s.to_string());
             return Ok(Self {
-                source: DataSource::FileSystem(dir),
+                source: DataSource::FileSystem(dir.clone()),
                 config,
+                catalog_source: dir.to_str().map(with_trailing_slash),
+                dataset_name,
             });
         }
 
@@ -86,9 +106,13 @@ impl TestDataGroup {
         if yaml_path.exists() {
             let yaml_content = fs::read_to_string(&yaml_path).map_err(Error::ConfigIo)?;
             let config: DatasetConfig = serde_yaml::from_str(&yaml_content)?;
+            let dataset_name = dir.file_name()
+                .and_then(|n| n.to_str()).map(|s| s.to_string());
             return Ok(Self {
-                source: DataSource::FileSystem(dir),
+                source: DataSource::FileSystem(dir.clone()),
                 config,
+                catalog_source: dir.to_str().map(with_trailing_slash),
+                dataset_name,
             });
         }
 
@@ -108,9 +132,13 @@ impl TestDataGroup {
             let config = entries
                 .to_config_for(dir_name)
                 .unwrap_or_else(|| entries.to_config());
+            let dataset_name = dir.file_name()
+                .and_then(|n| n.to_str()).map(|s| s.to_string());
             return Ok(Self {
-                source: DataSource::FileSystem(dir),
+                source: DataSource::FileSystem(dir.clone()),
                 config,
+                catalog_source: dir.to_str().map(with_trailing_slash),
+                dataset_name,
             });
         }
 
@@ -118,9 +146,13 @@ impl TestDataGroup {
         let yaml_content = fs::read_to_string(&yaml_path)
             .map_err(Error::ConfigIo)?;
         let config: DatasetConfig = serde_yaml::from_str(&yaml_content)?;
+        let dataset_name = dir.file_name()
+            .and_then(|n| n.to_str()).map(|s| s.to_string());
         Ok(Self {
-            source: DataSource::FileSystem(dir),
+            source: DataSource::FileSystem(dir.clone()),
             config,
+            catalog_source: dir.to_str().map(|s| s.to_string()),
+            dataset_name,
         })
     }
 
@@ -148,9 +180,16 @@ impl TestDataGroup {
                 .and_then(|s| s.collect::<Vec<_>>().iter().rev().find(|seg| !seg.is_empty()).cloned())
                 .unwrap_or("");
             let config = parse_catalog_content_for(&yaml_content, dir_name)?;
+            let dataset_name = base_url
+                .path_segments()
+                .and_then(|s| s.collect::<Vec<_>>()
+                    .iter().rev().find(|seg| !seg.is_empty()).cloned())
+                .map(|s| s.to_string());
             return Ok(Self {
-                source: DataSource::Http(base_url),
+                source: DataSource::Http(base_url.clone()),
                 config,
+                catalog_source: Some(with_trailing_slash(base_url.as_str())),
+                dataset_name,
             });
         }
 
@@ -167,9 +206,16 @@ impl TestDataGroup {
         if resp.status().is_success() {
             let yaml_content = resp.text()?;
             let config: DatasetConfig = serde_yaml::from_str(&yaml_content)?;
+            let dataset_name = base_url
+                .path_segments()
+                .and_then(|s| s.collect::<Vec<_>>()
+                    .iter().rev().find(|seg| !seg.is_empty()).cloned())
+                .map(|s| s.to_string());
             return Ok(Self {
-                source: DataSource::Http(base_url),
+                source: DataSource::Http(base_url.clone()),
                 config,
+                catalog_source: Some(with_trailing_slash(base_url.as_str())),
+                dataset_name,
             });
         }
 
@@ -189,9 +235,16 @@ impl TestDataGroup {
             .to_config_for(url_dir_name)
             .unwrap_or_else(|| entries.to_config());
 
+        let dataset_name = base_url
+            .path_segments()
+            .and_then(|s| s.collect::<Vec<_>>()
+                .iter().rev().find(|seg| !seg.is_empty()).cloned())
+            .map(|s| s.to_string());
         Ok(Self {
-            source: DataSource::Http(base_url),
+            source: DataSource::Http(base_url.clone()),
             config,
+            catalog_source: Some(with_trailing_slash(base_url.as_str())),
+            dataset_name,
         })
     }
 
@@ -200,11 +253,14 @@ impl TestDataGroup {
     /// Returns `None` if the profile name does not exist in the configuration.
     pub fn profile(&self, name: &str) -> Option<Arc<dyn TestDataView>> {
         let profile_config = self.config.profiles.get(name)?;
-        let view = GenericTestDataView::with_attributes(
+        let mut view = GenericTestDataView::with_attributes(
             self.source.clone(),
             profile_config.clone(),
             self.config.attributes.clone(),
         );
+        if let (Some(name), Some(src)) = (&self.dataset_name, &self.catalog_source) {
+            view = view.with_catalog_identity(name.clone(), src.clone());
+        }
         Some(Arc::new(view))
     }
 
@@ -214,11 +270,15 @@ impl TestDataGroup {
     /// concrete type so clients can call `open_facet_typed::<T>()`.
     pub fn generic_view(&self, name: &str) -> Option<GenericTestDataView> {
         let profile_config = self.config.profiles.get(name)?;
-        Some(GenericTestDataView::with_attributes(
+        let mut view = GenericTestDataView::with_attributes(
             self.source.clone(),
             profile_config.clone(),
             self.config.attributes.clone(),
-        ))
+        );
+        if let (Some(name), Some(src)) = (&self.dataset_name, &self.catalog_source) {
+            view = view.with_catalog_identity(name.clone(), src.clone());
+        }
+        Some(view)
     }
 
     /// Returns the names of all available profiles.
@@ -352,7 +412,29 @@ impl TestDataGroup {
             .map_err(Error::from)?;
         let config: DatasetConfig = serde_yaml::from_str(&layout_yaml)?;
         let source = data_source_for(&entry.path)?;
-        Ok(Self { source, config })
+        // The dataset's *home URL* is the URL the cache should
+        // mirror under `<cache>/<dataset_name>/`. For
+        // knn_entries-shape catalogs `entry.path` is the catalog
+        // base (no dataset segment) so we have to append the
+        // dataset name. For canonical catalogs `entry.path` is the
+        // `dataset.yaml` URL whose parent directory IS the home
+        // URL. View facet URLs strip this prefix to derive the
+        // relative path that the cache mirrors under the dataset
+        // directory.
+        let dataset_home_url = if entry.dataset_type == "knn_entries.yaml" {
+            format!("{}/{}/", entry.path.trim_end_matches('/'), entry.name)
+        } else {
+            match entry.path.rsplit_once('/') {
+                Some((parent, _)) => format!("{parent}/"),
+                None => entry.path.clone(),
+            }
+        };
+        Ok(Self {
+            source,
+            config,
+            catalog_source: Some(dataset_home_url),
+            dataset_name: Some(entry.name.clone()),
+        })
     }
 }
 
@@ -360,6 +442,16 @@ impl TestDataGroup {
 /// URL. `http(s)://` → `Http(url)`; `file://` is normalised to a
 /// plain filesystem path; everything else is treated as a local
 /// path. Returns an error for malformed URLs.
+/// Normalise a dataset-home URL/path so the trailing `/` is always
+/// present. Required because [`crate::view::GenericTestDataView::open_facet_storage`]
+/// derives `file_relpath` via prefix strip; an inconsistent trailing
+/// slash would either fail the strip (`<home>` vs `<home>/facet`) or
+/// erase the first segment of the relpath.
+fn with_trailing_slash<S: AsRef<str>>(s: S) -> String {
+    let s = s.as_ref();
+    if s.ends_with('/') { s.to_string() } else { format!("{s}/") }
+}
+
 fn data_source_for(location: &str) -> Result<DataSource> {
     if location.starts_with("http://") || location.starts_with("https://") {
         return Ok(DataSource::Http(Url::parse(location)?));
@@ -413,6 +505,56 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::tempdir;
+
+    #[test]
+    fn dataset_home_url_canonical_strips_dataset_yaml_basename() {
+        // Build a CatalogEntry with the canonical `dataset.yaml` shape
+        // and assert that the home URL we record as catalog_source is
+        // the *directory containing* the dataset.yaml, not the URL of
+        // the YAML itself. View facet URLs strip this prefix to get
+        // a clean file_relpath like "base.fvec".
+        let layout = crate::dataset::CatalogLayout {
+            attributes: None,
+            profiles: Default::default(),
+        };
+        let entry = crate::dataset::CatalogEntry {
+            name: "sift1m".to_string(),
+            path: "https://example.com/datasets/sift1m/dataset.yaml".to_string(),
+            dataset_type: "dataset.yaml".to_string(),
+            layout,
+        };
+        let group = TestDataGroup::from_catalog_entry(&entry).unwrap();
+        assert_eq!(
+            group.catalog_source.as_deref(),
+            Some("https://example.com/datasets/sift1m/"),
+        );
+        assert_eq!(group.dataset_name.as_deref(), Some("sift1m"));
+    }
+
+    #[test]
+    fn dataset_home_url_knn_entries_appends_dataset_name() {
+        // For knn_entries-shape catalogs, entry.path is the catalog
+        // *base* (no dataset segment). The home URL needs the
+        // dataset name appended so the strip-prefix in
+        // view.open_facet_storage yields the right relpath
+        // ("base.fvec", not the absolute URL).
+        let layout = crate::dataset::CatalogLayout {
+            attributes: None,
+            profiles: Default::default(),
+        };
+        let entry = crate::dataset::CatalogEntry {
+            name: "ada002-100k".to_string(),
+            path: "s3://jvector-datasets-public/datasets-clean".to_string(),
+            dataset_type: "knn_entries.yaml".to_string(),
+            layout,
+        };
+        let group = TestDataGroup::from_catalog_entry(&entry).unwrap();
+        assert_eq!(
+            group.catalog_source.as_deref(),
+            Some("s3://jvector-datasets-public/datasets-clean/ada002-100k/"),
+        );
+        assert_eq!(group.dataset_name.as_deref(), Some("ada002-100k"));
+    }
 
     #[test]
     fn test_load_from_path_success() {

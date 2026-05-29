@@ -24,12 +24,16 @@ pub fn run(cache_dir: Option<&Path>, verbose: bool) {
         for entry in entries.flatten() {
             let path = entry.path();
             if !path.is_dir() { continue; }
+            // Skip pre-cutover detritus — `blobs/`, `http/`,
+            // `<host>[:<port>]/`. The natural-layout marker (the
+            // per-dataset `origin.json` written by
+            // `crate::cache::layout`) drives inclusion below.
             if let Some(name) = path.file_name().and_then(|n| n.to_str())
-                && crate::cache_admin::is_reserved_layout_name(name)
+                && crate::cache_admin::is_legacy_layout_dir(name)
             {
                 continue;
             }
-            if path.join("dataset.yaml").exists() {
+            if crate::cache::layout::read_dataset_origin(&path).is_some() {
                 datasets.push(path);
             }
         }
@@ -61,8 +65,12 @@ pub fn run(cache_dir: Option<&Path>, verbose: bool) {
                 if let Ok(files) = std::fs::read_dir(ds_dir) {
                     for f in files.flatten() {
                         let fp = f.path();
+                        // Skip the natural-layout origin sidecar in
+                        // verbose per-file listing — it's a metadata
+                        // file, not a data facet.
                         if fp.is_file()
-                            && fp.file_name().and_then(|n| n.to_str()) != Some("dataset.yaml")
+                            && fp.file_name().and_then(|n| n.to_str())
+                                != Some(crate::cache::layout::DATASET_ORIGIN_FILE)
                         {
                             let fname =
                                 fp.file_name().and_then(|n| n.to_str()).unwrap_or("?");
@@ -105,14 +113,19 @@ pub fn run_cache_status_all(
 
         for entry in dirs {
             let name = entry.file_name().to_string_lossy().to_string();
-            if crate::cache_admin::is_reserved_layout_name(&name) {
+            // Skip pre-cutover detritus the user should clean up via
+            // `prune-legacy`, not surface as cached datasets.
+            if crate::cache_admin::is_legacy_layout_dir(&name) {
                 continue;
             }
             let ds_path = entry.path();
-            // Only show directories that have .mrkl files or dataset.yaml
+            // Surface anything that looks like a cached dataset: the
+            // natural-layout marker (origin.json) or any .mrkl
+            // sidecar (covering hand-managed dirs that never went
+            // through Storage::open_layered).
+            let has_origin = crate::cache::layout::read_dataset_origin(&ds_path).is_some();
             let has_mrkl = has_mrkl_files(&ds_path);
-            let has_yaml = ds_path.join("dataset.yaml").exists();
-            if has_mrkl || has_yaml {
+            if has_origin || has_mrkl {
                 if found { println!(); }
                 found = true;
                 run_cache_status(&name, verbose, configdir, extra_catalogs, at);

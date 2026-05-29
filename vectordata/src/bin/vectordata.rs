@@ -21,7 +21,7 @@ use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{CompleteEnv, Shell};
 
 use vectordata::cache_admin::{
-    CacheEntry, CacheListing, PruneFilter, is_legacy_layout_name,
+    CacheEntry, CacheListing, PruneFilter, is_legacy_layout_dir,
     list_entries, prune_by_filter, prune_legacy_layout,
 };
 
@@ -140,7 +140,11 @@ enum CacheCmd {
         #[arg(short = 'v', long)]
         verbose: bool,
     },
-    /// Remove pre-1.1 `<host>` / `<host>:<port>` cache directories.
+    /// Remove pre-cutover legacy directories: `blobs/`, `http/`, and
+    /// the older `<host>[:<port>]/` shape. Natural-layout dataset
+    /// directories are not touched — those have a dataset name and
+    /// are removed via `cache prune --dataset` or the picker's
+    /// per-dataset Purge action.
     PruneLegacy {
         /// Print what would be removed without deleting.
         #[arg(long)]
@@ -149,24 +153,19 @@ enum CacheCmd {
         #[arg(long)]
         cache_dir: Option<PathBuf>,
     },
-    /// Remove content-addressed entries by origin dataset/profile.
+    /// Remove natural-layout dataset directories by name.
     ///
-    /// Walks every blob/http entry, reads its `origin.json` sidecar,
-    /// extracts the dataset name and (when present) profile name
-    /// from the URL path, and removes the entry when both filters
-    /// (if provided) match. Globs use `*` (any run) and `?` (one
-    /// char). At least one of `--dataset` / `--profile` is required
-    /// — an empty filter would nuke the whole cache, which is what
-    /// you would do by deleting `<cache_root>/{blobs,http}/` by
-    /// hand if that's actually what you want.
+    /// Walks every natural-layout dataset directory (one with
+    /// `origin.json` at its root) and removes those whose directory
+    /// name matches `--dataset`. Globs use `*` (any run) and `?`
+    /// (one char). `--dataset` is required — an empty filter would
+    /// wipe every cached dataset, which is what you would do by
+    /// deleting `<cache_root>` by hand if that's actually what you
+    /// want.
     Prune {
-        /// Glob matched against the dataset name segment of each
-        /// entry's origin URL.
+        /// Glob matched against each dataset directory's name.
         #[arg(long)]
         dataset: Option<String>,
-        /// Glob matched against the profile name segment.
-        #[arg(long)]
-        profile: Option<String>,
         /// Print what would be removed without deleting.
         #[arg(long)]
         dry_run: bool,
@@ -333,8 +332,8 @@ fn main() {
             CacheCmd::PruneLegacy { dry_run, cache_dir } => {
                 cmd_cache_prune_legacy(cache_dir, dry_run)
             }
-            CacheCmd::Prune { dataset, profile, dry_run, cache_dir } => {
-                cmd_cache_prune(cache_dir, dataset, profile, dry_run)
+            CacheCmd::Prune { dataset, dry_run, cache_dir } => {
+                cmd_cache_prune(cache_dir, dataset, dry_run)
             }
         },
         Cmd::Datasets { command, configdir, catalog, at } => {
@@ -485,15 +484,15 @@ fn cmd_cache_list(cache_dir: Option<PathBuf>, verbose: bool) {
 fn cmd_cache_prune(
     cache_dir: Option<PathBuf>,
     dataset: Option<String>,
-    profile: Option<String>,
     dry_run: bool,
 ) {
-    let filter = PruneFilter { dataset, profile };
+    let filter = PruneFilter { dataset };
     if filter.is_empty() {
-        eprintln!("error: refusing to prune with no filter — pass at least one of \
-            --dataset or --profile.");
-        eprintln!("(To wipe the entire content-addressed cache, remove \
-            `<cache_root>/{{blobs,http}}/` by hand.)");
+        eprintln!("error: refusing to prune with no filter — pass --dataset \
+            with a name or glob pattern.");
+        eprintln!("(To wipe every cached dataset, remove `<cache_root>` by \
+            hand. To clean up pre-cutover detritus, run \
+            `vectordata cache prune-legacy`.)");
         std::process::exit(2);
     }
     let root = resolve_cache_dir(cache_dir);
@@ -532,7 +531,7 @@ fn cmd_cache_prune_legacy(cache_dir: Option<PathBuf>, dry_run: bool) {
         if let Ok(entries) = std::fs::read_dir(&root) {
             for e in entries.flatten() {
                 if let Some(name) = e.file_name().to_str()
-                    && is_legacy_layout_name(name)
+                    && is_legacy_layout_dir(name)
                     && e.path().is_dir()
                 {
                     would_remove.push(name.to_string());
@@ -569,34 +568,18 @@ fn print_listing(root: &std::path::Path, l: &CacheListing, verbose: bool) {
     println!("Total on disk:   {}", fmt_size(l.total_bytes()));
     println!();
 
-    if !l.catalog_datasets.is_empty() {
-        println!("Catalog datasets (top-level with dataset.yaml):");
-        print_simple_rows(&l.catalog_datasets, root);
-        println!();
-    }
-
-    if !l.blobs.is_empty() {
-        println!("Content-addressed blobs (blobs/<hex>/...):");
+    if !l.datasets.is_empty() {
+        println!("Datasets:");
         if verbose {
-            print_blob_rows_verbose(&l.blobs, root);
+            print_dataset_rows_verbose(&l.datasets, root);
         } else {
-            print_blob_rows_by_host(&l.blobs);
-        }
-        println!();
-    }
-
-    if !l.http.is_empty() {
-        println!("Direct-HTTP cache (http/<hex>/...) — no merkle verification:");
-        if verbose {
-            print_blob_rows_verbose(&l.http, root);
-        } else {
-            print_blob_rows_by_host(&l.http);
+            print_dataset_rows(&l.datasets, root);
         }
         println!();
     }
 
     if !l.legacy.is_empty() {
-        println!("Legacy <host>[:<port>] dirs (pre-1.1 layout):");
+        println!("Legacy detritus (pre-cutover layout):");
         print_simple_rows(&l.legacy, root);
         println!("  → remove with: vectordata cache prune-legacy");
         println!();
@@ -608,9 +591,7 @@ fn print_listing(root: &std::path::Path, l: &CacheListing, verbose: bool) {
         println!();
     }
 
-    if l.catalog_datasets.is_empty() && l.blobs.is_empty()
-        && l.http.is_empty() && l.legacy.is_empty() && l.other.is_empty()
-    {
+    if l.datasets.is_empty() && l.legacy.is_empty() && l.other.is_empty() {
         println!("(empty)");
     }
 }
@@ -628,39 +609,36 @@ fn print_simple_rows(rows: &[CacheEntry], root: &std::path::Path) {
     }
 }
 
-/// Grouped-by-host summary for content-addressed blobs (the default
-/// listing mode — keeps `cache list` readable when there are
-/// thousands of blobs).
-fn print_blob_rows_by_host(rows: &[CacheEntry]) {
-    use std::collections::BTreeMap;
-    let mut by_host: BTreeMap<String, (u64, usize)> = BTreeMap::new();
+/// Default dataset listing: one row per dataset, name + size +
+/// file count + origin host.
+fn print_dataset_rows(rows: &[CacheEntry], root: &std::path::Path) {
+    let name_w = rows.iter()
+        .map(|e| rel_name(&e.path, root).len())
+        .max().unwrap_or(20).max(20);
     for e in rows {
-        let host = e.origin_host.clone()
-            .unwrap_or_else(|| "<unknown origin>".to_string());
-        let slot = by_host.entry(host).or_insert((0u64, 0usize));
-        slot.0 += e.size_bytes;
-        slot.1 += 1;
-    }
-    let mut pairs: Vec<_> = by_host.into_iter().collect();
-    pairs.sort_by(|a, b| b.1.0.cmp(&a.1.0));
-    let host_w = pairs.iter().map(|(h, _)| h.len()).max().unwrap_or(20).max(20);
-    for (host, (size, count)) in pairs {
-        let note = if host.starts_with("127.0.0.1") || host == "localhost" {
-            "  ← looks like test debris"
-        } else { "" };
-        println!("  {:<host_w$}  {:>12}  ({} blob{}){}",
-            host, fmt_size(size), count,
-            if count == 1 { "" } else { "s" }, note);
+        let name = rel_name(&e.path, root);
+        let host = e.origin_host.as_deref().unwrap_or("");
+        let host_note = if host.is_empty() {
+            String::new()
+        } else {
+            format!("  from {host}")
+        };
+        println!("  {:<name_w$}  {:>12}  ({} file{}){}",
+            name, fmt_size(e.size_bytes),
+            e.file_count, if e.file_count == 1 { "" } else { "s" },
+            host_note);
     }
 }
 
-/// Verbose mode: one row per blob, full origin URL.
-fn print_blob_rows_verbose(rows: &[CacheEntry], root: &std::path::Path) {
+/// Verbose dataset listing: full origin URL per entry, on its own row.
+fn print_dataset_rows_verbose(rows: &[CacheEntry], root: &std::path::Path) {
     for e in rows {
         let rel = rel_name(&e.path, root);
         let origin = e.origin_url.as_deref().unwrap_or("<unknown origin>");
-        println!("  {:>12}  {}", fmt_size(e.size_bytes), origin);
-        println!("              path: {}", rel);
+        println!("  {:>12}  {} ({} file{})",
+            fmt_size(e.size_bytes), rel,
+            e.file_count, if e.file_count == 1 { "" } else { "s" });
+        println!("              origin: {}", origin);
     }
 }
 

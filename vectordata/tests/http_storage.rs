@@ -177,10 +177,11 @@ fn fvec_local_cached_direct_agree() {
     //
     // No .mref sidecar is written — the test is not exercising any
     // chunk-tracking / `is_complete()` semantic. Skipping mref keeps
-    // the cached storage on the URL-keyed code path (`blob_dir_for_url`),
-    // which gives the test its own per-server-port namespace and stays
-    // mutually invisible to any other test that happens to use the
-    // same `write_fvec(_, 200, 16)` content under merkle keying.
+    // the cached storage on the direct-HTTP code path
+    // (`Storage::open_url_http`), where the natural layout puts the
+    // cache file at `<cache>/<host>_<port>/base.fvec`. Per-server-port
+    // authority keeps it mutually invisible to any other test that
+    // happens to use the same `write_fvec(_, 200, 16)` content.
     let tmp = make_tmp();
     let path = tmp.path().join("base.fvec");
     write_fvec(&path, 200, 16);
@@ -616,6 +617,80 @@ fn prebuffer_all_drives_every_facet_complete() {
     let base_storage = view.open_facet_storage("base_vectors").unwrap();
     assert!(base_storage.is_complete(), "base_vectors must be complete after prebuffer_all");
     assert!(base_storage.is_local(), "fully-prebuffered cached storage must report is_local");
+}
+
+/// dataset.yaml with a `sized` profile that windows base_vectors to
+/// `[0..20)`. The full file is 200 records of dim 64 (≈ 52 KiB,
+/// ~13 chunks at 4 KiB); the window is 20 records (≈ 5.2 KiB,
+/// ~2 chunks). Used by [`windowed_precache_only_fetches_window_chunks`].
+fn windowed_dataset_yaml() -> &'static str {
+    r#"
+name: windowed-test-ds
+attributes:
+  distance_function: COSINE
+profiles:
+  default:
+    base_vectors: base.fvec
+    query_vectors: query.fvec
+    neighbor_indices: neighbor_indices.ivec
+    neighbor_distances: neighbor_distances.fvec
+  windowed:
+    base_vectors: "base.fvec[0..20)"
+    query_vectors: query.fvec
+    neighbor_indices: neighbor_indices.ivec
+    neighbor_distances: neighbor_distances.fvec
+"#
+}
+
+#[test]
+fn windowed_precache_only_fetches_window_chunks() {
+    let tmp = make_tmp();
+    // 200 records × (4 + 64*4) = 200 × 260 = 52000 bytes ≈ 13 chunks
+    // at TEST_CHUNK=4096. Window [0..20) = 20 × 260 = 5200 bytes,
+    // which spans the chunks covering bytes [0..5200), i.e. chunks
+    // 0 and 1 (chunk 0 = [0..4096), chunk 1 = [4096..8192)). So
+    // 2 chunks valid, 13 total.
+    write_fvec(&tmp.path().join("base.fvec"), 200, 64);
+    write_fvec(&tmp.path().join("query.fvec"), 5, 8);
+    write_ivec(&tmp.path().join("neighbor_indices.ivec"), 5, 10);
+    write_fvec(&tmp.path().join("neighbor_distances.fvec"), 5, 10);
+    write_mref(&tmp.path().join("base.fvec"));
+    write_mref(&tmp.path().join("query.fvec"));
+    write_mref(&tmp.path().join("neighbor_indices.ivec"));
+    write_mref(&tmp.path().join("neighbor_distances.fvec"));
+    std::fs::write(tmp.path().join("dataset.yaml"), windowed_dataset_yaml()).unwrap();
+
+    let server = TestServer::start(tmp.path()).unwrap();
+    init_test_cache();
+    let group = TestDataGroup::load(&server.base_url()).unwrap();
+    let view = group.profile("windowed").unwrap();
+
+    view.prebuffer_all_with_progress(&mut |_facet, _p| {}).unwrap();
+
+    // The base.fvec storage must NOT be fully fetched — only the
+    // chunks covering bytes [0..5200) should be valid.
+    let base_storage = view.open_facet_storage("base_vectors").unwrap();
+    let stats = base_storage.cache_stats()
+        .expect("merkle-cached base must report cache_stats");
+    assert!(stats.total_chunks >= 5,
+        "fixture must span enough chunks to demonstrate windowing (got {})",
+        stats.total_chunks);
+    assert!(stats.valid_chunks < stats.total_chunks,
+        "windowed precache must NOT fetch the whole file ({}/{} valid)",
+        stats.valid_chunks, stats.total_chunks);
+    // Window covers 5200 bytes; expect 1-2 chunks at 4 KiB each.
+    assert!(stats.valid_chunks <= 3,
+        "windowed precache should only need ~2 chunks for the [0..20) window \
+         (got {} valid)", stats.valid_chunks);
+    assert!(stats.valid_chunks >= 1,
+        "windowed precache must fetch at least one chunk to cover the window \
+         (got {} valid)", stats.valid_chunks);
+
+    // The small full-file facets (query, GT) must be fully cached —
+    // they have no window in the sized profile.
+    let query_storage = view.open_facet_storage("query_vectors").unwrap();
+    assert!(query_storage.is_complete(),
+        "query_vectors (no window) must be fully fetched by windowed precache");
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1272,18 +1347,27 @@ fn many_per_record_reads_share_one_tcp_connection() {
 }
 
 #[test]
-fn many_storage_opens_share_one_client_no_cert_load_storm() {
-    // Open many separate Storages against the same server. With
-    // the shared client, every open hands the same Client clone
-    // to its HttpTransport; without it, every open paid
-    // load_native_certs.
+fn many_storage_opens_bounded_by_pool_no_cert_load_storm() {
+    // Open many separate Storages against the same server. The
+    // load-bearing property: cert loading is bounded by the size
+    // of the HTTP-client pool (one cert load per pool entry, at
+    // pool init), not by the number of opens. Pre-pool, every
+    // fresh Client paid `load_native_certs` independently — the
+    // "storm" — and `ClientHandle::new` dominated CPU.
     //
-    // We can't directly observe load_native_certs, but the
-    // accepted-connection count tells us pooling is effective:
-    // 20 opens, each doing one HEAD + minimal probe, should
-    // share connections via keep-alive. Without the shared
-    // client, each open would open its own pool from scratch and
-    // we'd see ~20 connections.
+    // We can't directly observe `load_native_certs`, so the
+    // accepted-connection count is the proxy. With the pool of
+    // N Clients, round-robin distributes opens across pool
+    // entries, and each entry's own connection pool keep-alives
+    // its bytes. The count is bounded by `pool_size × (HEAD +
+    // chunk-probe ≈ 2)` plus slack, *not* by the number of
+    // opens — and crucially the bound doesn't grow with the
+    // open count past the pool's saturation point.
+    //
+    // The legacy assertion (`≤ 10` for 20 opens) reflected
+    // singleton-Client behaviour where every open keep-alived
+    // through the same connection. That invariant moved when
+    // the pool replaced the singleton.
     let tmp = make_tmp();
     let path = tmp.path().join("base.fvec");
     write_fvec(&path, 50, 4);
@@ -1298,22 +1382,32 @@ fn many_storage_opens_share_one_client_no_cert_load_storm() {
     let after = server.accepted_connections();
     let new_conns = after - baseline;
 
-    // 20 fresh opens, each doing a HEAD + a tiny dim-header read,
-    // should share connections aggressively. Allow some slack for
-    // probe overhead but reject the pre-fix behaviour where every
-    // open was its own Client + its own pool.
-    assert!(new_conns <= 10,
-        "20 fresh storage opens should share connections (saw {new_conns} new TCP connections)");
+    // Bound = pool_size × 2 + 5 slack:
+    //   - 2 conns per pool client = HEAD probe + chunk-zero
+    //     fetch (the dim-header read), worst case if keep-alive
+    //     across the two within a Client misses.
+    //   - 5 slack for redirect probes, retries, and CI flake.
+    // Pre-fix per-open Client construction would have produced
+    // 20 × cert-loaded Clients → ~40+ fresh sockets AND each
+    // run paid the cert-load cost again; this bound catches
+    // that regression without failing on the legitimate
+    // bounded-pool fanout.
+    let pool_bound = 32 * 2 + 5;
+    assert!(new_conns <= pool_bound,
+        "20 fresh storage opens with the pooled HTTP client should make at most \
+         pool_size × 2 + slack connections (saw {new_conns}, bound {pool_bound})");
 }
 
 #[test]
-fn shared_client_is_singleton_across_storages() {
-    // Two Storages opened independently must end up with the
-    // *same* underlying reqwest::Client (cheap clone of the same
-    // inner Arc). We can't reach into Storage to assert pointer
-    // equality on the Client, but we can assert that the
+fn pooled_clients_keep_connection_count_bounded_under_open_close_churn() {
+    // Two Storages opened independently must end up *bounded by
+    // the HTTP client pool's connection footprint* (not building
+    // a fresh Client per open). We can't reach into Storage to
+    // assert pool-entry equality, but we can assert that the
     // accepted-connection count stays bounded under repeated
-    // open + close cycles — which is the load-bearing property.
+    // open + close cycles — which is the load-bearing property
+    // (no per-open `load_native_certs` storm, no unbounded
+    // socket creation).
     let tmp = make_tmp();
     let path = tmp.path().join("base.fvec");
     write_fvec(&path, 30, 4);
@@ -1323,16 +1417,24 @@ fn shared_client_is_singleton_across_storages() {
 
     // Hammer: 100 open-then-drop cycles. If every open built a
     // fresh Client + opened a fresh pool, we'd see 100+ TCP
-    // connections. With the singleton, the count grows much more
-    // slowly (one or two per open at most, and many reuses).
+    // connections growing linearly with cycles. With the bounded
+    // pool, the count plateaus once every pool client's
+    // keep-alive socket is warmed — sub-linear, regardless of
+    // the cycle count.
     let baseline = server.accepted_connections();
     for _ in 0..100 {
         let r = XvecReader::<f32>::open(&url).unwrap();
         let _ = r.get(0).unwrap();
     }
     let new_conns = server.accepted_connections() - baseline;
-    assert!(new_conns <= 50,
-        "100 open+read cycles should reuse the shared client's pool (saw {new_conns} new TCP connections)");
+    // Pool of 32 clients × 3 conn each (HEAD + chunk-probe +
+    // record-read worst case if keep-alive misses one) + 4
+    // slack for retries / redirect probes. Pre-fix per-open
+    // Client construction would have produced 100+ sockets.
+    let pool_bound = 32 * 3 + 4;
+    assert!(new_conns <= pool_bound,
+        "100 open+read cycles with the pooled HTTP client should plateau at \
+         pool_size × 3 + slack connections (saw {new_conns}, bound {pool_bound})");
 }
 
 // ═══════════════════════════════════════════════════════════════════════

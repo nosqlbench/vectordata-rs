@@ -302,12 +302,17 @@ struct PrebufferPlan {
 fn plan_prebuffer(view: &dyn TestDataView) -> PrebufferPlan {
     let mut facets = Vec::new();
     let mut total_bytes = 0u64;
-    for (name, _desc) in view.facet_manifest() {
+    for (name, desc) in view.facet_manifest() {
         if view.facet_element_type(&name).is_err() { continue; }
         if let Ok(storage) = view.open_facet_storage(&name) {
-            if !storage.is_local() {
-                total_bytes += storage.total_size();
-            }
+            // Windowed facets contribute their window size, not the
+            // shared base file's full size — otherwise a sized
+            // profile against a 1.3 TiB base announces "1.3 TiB to
+            // download" even though the windowed precache only
+            // pulls a fraction. `facet_download_bytes` handles the
+            // local/remote and windowed/full split in one call.
+            total_bytes += crate::view::facet_download_bytes(
+                desc.source_path.as_deref(), &storage);
             facets.push(FacetPlanRow { qualified_name: name });
         }
     }

@@ -236,7 +236,45 @@ impl ChunkStore {
     /// `Acquire`-valid, but if a concurrent partial-read worker
     /// fetches one of those chunks first, the queue's worker
     /// observes it as valid and skips re-fetching.
-    pub(crate) fn prebuffer_with_progress<F>(&self, mut cb: F) -> io::Result<()>
+    pub(crate) fn prebuffer_with_progress<F>(&self, cb: F) -> io::Result<()>
+    where F: FnMut(&DownloadProgress)
+    {
+        self.prebuffer_chunk_range(0, self.total_chunks, cb)
+    }
+
+    /// Same as [`Self::prebuffer_with_progress`] but bounded to the
+    /// chunks covering `[byte_start, byte_end)`. Used by the view
+    /// layer to honor profile windows — a windowed profile against a
+    /// large base file only needs the chunks covering its window's
+    /// byte range, not the whole file. `byte_end` is clamped to the
+    /// total file size; an empty range is a no-op.
+    pub(crate) fn prebuffer_range_with_progress<F>(
+        &self,
+        byte_start: u64,
+        byte_end: u64,
+        cb: F,
+    ) -> io::Result<()>
+    where F: FnMut(&DownloadProgress)
+    {
+        let end = byte_end.min(self.total_size);
+        if byte_start >= end {
+            let mut cb = cb;
+            cb(&DownloadProgress::new(0, 0));
+            return Ok(());
+        }
+        let first = (byte_start / self.chunk_size) as u32;
+        let last_inclusive = ((end - 1) / self.chunk_size) as u32;
+        let exclusive = last_inclusive + 1;
+        self.prebuffer_chunk_range(first, exclusive, cb)
+    }
+
+    /// Common backend for the whole-file and ranged prebuffer entry
+    /// points. Pulls only chunks in `[first..exclusive)`. The progress
+    /// snapshot reports `range_bytes` / `range_chunks` so the UI meter
+    /// shows progress against the bounded plan, not the full file
+    /// size (otherwise a 100k-window profile's meter would top out
+    /// at 0.1% even after the entire window is resident).
+    fn prebuffer_chunk_range<F>(&self, first: u32, exclusive: u32, mut cb: F) -> io::Result<()>
     where F: FnMut(&DownloadProgress)
     {
         use std::sync::atomic::AtomicBool;
@@ -245,10 +283,18 @@ impl ChunkStore {
         const PROGRESS_TICK: std::time::Duration =
             std::time::Duration::from_millis(250);
 
-        let progress = DownloadProgress::new(self.total_size, self.total_chunks);
+        let exclusive = exclusive.min(self.total_chunks);
+        if first >= exclusive {
+            cb(&DownloadProgress::new(0, 0));
+            return Ok(());
+        }
+        let range_chunks = exclusive - first;
+        let range_bytes: u64 = (first..exclusive).map(|i| self.chunk_len(i)).sum();
+
+        let progress = DownloadProgress::new(range_bytes, range_chunks);
         let mut already_valid: u64 = 0;
         let mut pending: Vec<u32> = Vec::new();
-        for i in 0..self.total_chunks {
+        for i in first..exclusive {
             if self.chunk_state[i as usize].load(Ordering::Acquire) != 0 {
                 already_valid += self.chunk_len(i);
                 progress.increment_completed();
@@ -268,7 +314,7 @@ impl ChunkStore {
         let queue: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(pending);
         let abort = AtomicBool::new(false);
         let (tx, rx) = mpsc::channel::<io::Result<u64>>();
-        let total_pending = self.total_chunks - progress.completed_chunks() as u32;
+        let total_pending = range_chunks - progress.completed_chunks() as u32;
 
         let result: io::Result<()> = std::thread::scope(|scope| {
             let workers = crate::cache::download_concurrency().max(1);

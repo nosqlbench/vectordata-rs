@@ -145,11 +145,13 @@ impl AccessMode {
 /// Best-effort check: is a `.mrkl` sidecar already present under the
 /// cache root that matches this source's filename?
 ///
-/// The actual cache layout is content-addressed under
-/// `blob_dir_for_mref(...)`, which we can't compute without the merkle
-/// reference itself. Walk the cache root for any `<filename>.mrkl`
-/// match instead — false positives are unlikely because the cache root
-/// is namespaced per blob.
+/// We don't try to compute the exact natural-layout cache path
+/// (`<cache>/<dataset>/<facet_relpath>.mrkl`) from a source string
+/// alone — that needs catalog context (dataset_name, file_relpath
+/// stripping) we don't have at access-mode classification time.
+/// Walk the cache root for any `<filename>.mrkl` match instead;
+/// false positives across datasets are unlikely because dataset
+/// directories namespace the sidecar names.
 fn mrkl_sidecar_present(resolved_source: &str, cache_dir: &Path) -> bool {
     if cache_dir.as_os_str().is_empty() { return false; }
     let filename = resolved_source

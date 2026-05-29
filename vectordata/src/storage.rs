@@ -18,7 +18,7 @@
 //! construction once every shape adapter routes through `Storage`.
 
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::sync::atomic::AtomicU64;
 
@@ -26,9 +26,7 @@ use memmap2::Mmap;
 use url::Url;
 
 use crate::cache::CachedChannel;
-use crate::cache::reader::{
-    blob_dir_for_mref, blob_dir_for_url, default_cache_dir, write_origin,
-};
+use crate::cache::layout;
 use crate::merkle::MerkleRef;
 use crate::transport::HttpTransport;
 
@@ -163,6 +161,88 @@ pub(crate) fn local_source_path(source: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Borrowed(source)
 }
 
+/// Concrete decision of where bytes for a particular open land on
+/// disk. Built once by [`layout_for_url`] (the URL-only path) and
+/// shared between the `Storage::Cached` and `Storage::Http` opens
+/// so they both write into the same natural-layout dataset
+/// directory.
+pub(crate) struct LayoutChoice {
+    /// Per-dataset cache directory: `<cache_root>/<dataset>/`. Holds
+    /// the data files and the per-dataset `origin.json`.
+    pub dataset_dir: PathBuf,
+    /// Data file path relative to `dataset_dir`. May contain `/` if
+    /// the dataset's view declares nested layout
+    /// (`profiles/1m/base.fvec`). Subdirs are created on demand.
+    pub file_relpath: String,
+    /// URL recorded in `<dataset_dir>/origin.json`. Subsequent
+    /// opens must produce the same `origin_source` or the open
+    /// fails with [`crate::cache::layout::OriginMismatch`] —
+    /// that's how a moved catalog is migrated by user-visible
+    /// `origin.json` edit instead of an opaque cache surgery.
+    pub origin_source: String,
+}
+
+/// Derive a [`LayoutChoice`] from a URL for URL-only opens (no
+/// catalog context). The dataset directory is the URL's host plus
+/// the directory portion of the path; the file relpath is the URL
+/// path's basename; `origin.json` records the URL's parent
+/// directory (so a sibling file under the same parent shares the
+/// dataset directory naturally).
+///
+/// Examples:
+///   - `https://example.com/datasets/sift1m/base.fvec`
+///     → dataset_dir: `<cache>/example.com/datasets/sift1m`
+///     → file_relpath: `base.fvec`
+///     → origin: `https://example.com/datasets/sift1m/`
+///   - `https://example.com/data.fvec`
+///     → dataset_dir: `<cache>/example.com`
+///     → file_relpath: `data.fvec`
+///     → origin: `https://example.com/`
+pub(crate) fn layout_for_url(url: &Url) -> io::Result<LayoutChoice> {
+    let cache_root = crate::settings::cache_dir()
+        .map_err(|e| io::Error::new(io::ErrorKind::NotFound, e.to_string()))?;
+    let host = url.host_str().unwrap_or("_remote");
+    // Include explicit port in the authority component so two
+    // servers on the same host (different ports) — common in
+    // tests, also possible in production — land in distinct
+    // dataset directories. Default ports (80 / 443) are
+    // omitted so a URL with an implicit port and an equivalent
+    // explicit-default URL converge.
+    let authority = match url.port() {
+        Some(port) => format!("{host}_{port}"),
+        None => host.to_string(),
+    };
+    let raw_path = url.path().trim_start_matches('/');
+    let (parent, basename) = match raw_path.rsplit_once('/') {
+        Some((p, b)) if !b.is_empty() => (p, b),
+        _ => ("", raw_path),
+    };
+    let basename = if basename.is_empty() { "data" } else { basename };
+    let mut dataset_dir = cache_root.join(authority);
+    if !parent.is_empty() {
+        for segment in parent.split('/') {
+            dataset_dir.push(segment);
+        }
+    }
+    // Origin = URL with the basename trimmed off, preserving scheme
+    // + host + port so a sibling URL under the same parent path
+    // canonicalises identically.
+    let mut origin = url.clone();
+    let new_path = if parent.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{parent}/")
+    };
+    origin.set_path(&new_path);
+    origin.set_query(None);
+    origin.set_fragment(None);
+    Ok(LayoutChoice {
+        dataset_dir,
+        file_relpath: basename.to_string(),
+        origin_source: origin.to_string(),
+    })
+}
+
 impl Storage {
     /// Open from a path or URL string. Returns a process-wide shared
     /// `Arc<Storage>` per source — concurrent opens against the same
@@ -178,6 +258,60 @@ impl Storage {
     /// The rest block on a per-key condvar and clone the resulting
     /// `Arc<Storage>` without re-doing the work.
     pub(crate) fn open(source: &str) -> io::Result<Arc<Self>> {
+        Self::open_inner(source, None)
+    }
+
+    /// Catalog-aware open. The view layer routes every facet through
+    /// here so the cache lands at `<cache_root>/<dataset_name>/
+    /// <file_relpath>` (stable across catalog moves) and
+    /// `origin.json` records `catalog_source` (editable by the user
+    /// when the catalog moves but the bytes are the same).
+    ///
+    /// `fetch_url` is the actual byte source. `dataset_name` +
+    /// `file_relpath` are the natural cache coordinates. The
+    /// pre-flight origin check (against `catalog_source`) runs
+    /// *before* the registry lookup so a mismatch fails fast even
+    /// if the URL is already in the process-wide cache.
+    pub(crate) fn open_layered(
+        fetch_url: &str,
+        dataset_name: &str,
+        file_relpath: &str,
+        catalog_source: &str,
+    ) -> io::Result<Arc<Self>> {
+        // Local sources route to `open_path_uncached` (plain mmap) —
+        // there is no cache directory to lay out for them. Skip the
+        // dataset-dir + origin.json setup that would otherwise leave
+        // an empty `<cache>/<dataset_name>/origin.json` behind. This
+        // is what was producing the `.tmp*` debris: every test
+        // fixture that built a TestDataGroup from a tempdir's
+        // dataset.yaml routed through here, the tempdir basename
+        // became `dataset_name`, and a stub origin file landed under
+        // the real cache root even though the actual bytes were
+        // mmap'd locally.
+        if !crate::transport::is_remote_url(fetch_url) {
+            let _ = (dataset_name, file_relpath, catalog_source);
+            return Self::open(fetch_url);
+        }
+        let cache_root = crate::settings::cache_dir()
+            .map_err(|e| io::Error::new(io::ErrorKind::NotFound, e.to_string()))?;
+        let dataset_dir = layout::dataset_cache_dir(&cache_root, dataset_name);
+        // Pre-flight: surface OriginMismatch before anything else.
+        layout::verify_or_record_origin(&dataset_dir, catalog_source)
+            .map_err(io::Error::from)?;
+        let layout = LayoutChoice {
+            dataset_dir,
+            file_relpath: file_relpath.to_string(),
+            origin_source: catalog_source.to_string(),
+        };
+        Self::open_inner(fetch_url, Some(layout))
+    }
+
+    /// Common registry-coordinated open. `layout_override`, when set,
+    /// is passed to [`Self::open_url_uncached`] instead of the
+    /// URL-derived layout — that's how `open_layered` plumbs the
+    /// catalog-anchored dataset path through this routine without
+    /// duplicating the in-flight + condvar machinery.
+    fn open_inner(source: &str, layout_override: Option<LayoutChoice>) -> io::Result<Arc<Self>> {
         let key = registry_key(source);
 
         // Fast path: already in registry, still alive.
@@ -227,11 +361,14 @@ impl Storage {
                 let translated = crate::transport::normalize_remote_url(source);
                 let url = Url::parse(translated.as_ref())
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("invalid URL '{source}' (translated to '{translated}'): {e}")))?;
-                Self::open_url_uncached(url)?
+                Self::open_url_uncached(url, layout_override)?
             } else {
                 // `file://` URIs and bare paths both open as local
                 // mmap — `local_source_path` normalises both to a
                 // filesystem path string before we hand it to Path.
+                // Layout override is meaningless for local mmap
+                // (no cache directory involved), so it's dropped.
+                let _ = layout_override;
                 let local = local_source_path(source);
                 Self::open_path_uncached(Path::new(local.as_ref()))?
             };
@@ -279,19 +416,21 @@ impl Storage {
     /// Crate-internal: open a fresh URL-backed `Storage` (no
     /// registry lookup). Tries `.mref`-cached first, falls back to
     /// direct HTTP. Used by `Storage::open` after a registry miss.
-    fn open_url_uncached(url: Url) -> io::Result<Self> {
-        let cache_root = default_cache_dir()
-            .map_err(|e| io::Error::new(io::ErrorKind::NotFound, e.to_string()))?;
-        match Self::open_url_cached(url.clone(), &cache_root) {
+    fn open_url_uncached(url: Url, layout_override: Option<LayoutChoice>) -> io::Result<Self> {
+        let layout = match layout_override {
+            Some(l) => l,
+            None => layout_for_url(&url)?,
+        };
+        match Self::open_url_cached(url.clone(), &layout) {
             Ok(s) => Ok(s),
-            Err(_) => Self::open_url_http(url),
+            Err(_) => Self::open_url_http(url, &layout),
         }
     }
 
     /// Open a remote URL through the merkle-cache path. Requires a
     /// published `.mref`. Crate-internal; callers go through
     /// `open_url` so the fallback path runs uniformly.
-    pub(crate) fn open_url_cached(url: Url, cache_root: &Path) -> io::Result<Self> {
+    pub(crate) fn open_url_cached(url: Url, layout: &LayoutChoice) -> io::Result<Self> {
         let client = crate::transport::shared_client();
         let mref_url_str = format!("{}.mref", url.as_str());
         let mref_url = Url::parse(&mref_url_str)
@@ -305,20 +444,14 @@ impl Storage {
         let reference = MerkleRef::from_bytes(&mref_bytes)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("mref parse: {e}")))?;
 
-        let cache_dir = blob_dir_for_mref(cache_root, &reference);
-        let filename: String = url.path_segments()
-            .and_then(|mut s| s.next_back())
-            .unwrap_or("data")
-            .to_string();
-        // Best-effort sidecar — record which URL populated this
-        // content-addressed blob so tooling can group by origin.
-        let _ = write_origin(&cache_dir, &url);
+        layout::verify_or_record_origin(&layout.dataset_dir, &layout.origin_source)
+            .map_err(io::Error::from)?;
         let transport = HttpTransport::with_client(client, url);
         let channel = CachedChannel::open(
             Arc::new(transport),
             reference,
-            &cache_dir,
-            &filename,
+            &layout.dataset_dir,
+            &layout.file_relpath,
         )?;
 
         let mmap = OnceLock::new();
@@ -337,26 +470,17 @@ impl Storage {
     /// fallback path of `open_url` (used when no `.mref` is
     /// published). Per-read fetches go over HTTP until the caller
     /// runs [`precache`], which downloads the whole file into
-    /// `cache_dir/http/<sha256(url)[..2]>/<sha256(url)>/<filename>`
-    /// and promotes to mmap.
+    /// `<dataset_dir>/<file_relpath>` (per the natural layout) and
+    /// promotes to mmap.
     ///
     /// At open time, if the cache file already exists with the
     /// expected size (from a prior precache), this constructor
     /// mmap-promotes immediately so the new `Storage::Http` starts
     /// in the zero-copy state.
-    pub(crate) fn open_url_http(url: Url) -> io::Result<Self> {
-        let cache_root = crate::settings::cache_dir()
-            .map_err(|e| io::Error::new(io::ErrorKind::NotFound, e.to_string()))?;
-        let cache_dir = blob_dir_for_url(&cache_root, &url);
-        let filename: String = url.path_segments()
-            .and_then(|mut s| s.next_back())
-            .unwrap_or("data")
-            .to_string();
-        let cache_path = cache_dir.join(&filename);
-        // Best-effort sidecar — record which URL populated this dir.
-        // We don't gate on its presence: tools fall back to "unknown
-        // origin" if it's missing.
-        let _ = write_origin(&cache_dir, &url);
+    pub(crate) fn open_url_http(url: Url, layout: &LayoutChoice) -> io::Result<Self> {
+        layout::verify_or_record_origin(&layout.dataset_dir, &layout.origin_source)
+            .map_err(io::Error::from)?;
+        let cache_path = layout.dataset_dir.join(&layout.file_relpath);
 
         let transport = HttpTransport::new(url);
         let total_size = ChunkedTransportExt::content_length_for(&transport)?;
@@ -365,10 +489,6 @@ impl Storage {
             transport, total_size, cache_path)?);
 
         let mmap = OnceLock::new();
-        // Restore promotion when the chunk store reports complete
-        // (either a sidecar with all chunks marked valid, or a
-        // pre-feature precached file at the right size — see
-        // `ChunkStore::open` for the reconciliation rules).
         if chunks.is_complete()
             && let Ok(file) = std::fs::File::open(chunks.cache_path())
             && let Ok(m) = unsafe { Mmap::map(&file) }
@@ -378,6 +498,7 @@ impl Storage {
 
         Ok(Storage::Http { chunks, mmap })
     }
+
 
     /// Read `len` bytes at `offset`. Always succeeds for an in-bounds
     /// range — slow-path downloads chunks first if necessary.
@@ -552,6 +673,46 @@ impl Storage {
     ///   failure.
     pub(crate) fn precache(&self) -> io::Result<()> {
         self.prebuffer_with_progress(|_| {})
+    }
+
+    /// Drive the storage to fully-resident state over the byte range
+    /// `[byte_start, byte_end)`. Same strict-contract / progress
+    /// semantics as [`prebuffer_with_progress`], but only the chunks
+    /// covering that range are fetched. Used by the view layer to
+    /// honor profile windows so a windowed profile against a large
+    /// base file doesn't fetch the whole file.
+    ///
+    /// `byte_end` is clamped to `total_size()`. An empty range
+    /// (`byte_start >= byte_end`) fires the completion callback once
+    /// and returns `Ok(())`. mmap promotion is *not* attempted on the
+    /// ranged path — the file isn't fully resident, so the mmap
+    /// promotion contract (every read takes the zero-copy path)
+    /// doesn't apply. Promotion still happens lazily on later reads
+    /// or on a subsequent full prebuffer.
+    pub(crate) fn prebuffer_range_with_progress<F>(
+        &self,
+        byte_start: u64,
+        byte_end: u64,
+        cb: F,
+    ) -> io::Result<()>
+    where
+        F: FnMut(&crate::transport::DownloadProgress),
+    {
+        match self {
+            // Local mmap is already fully resident — fire one
+            // completion event so callers' meters land at 100%.
+            Storage::Mmap(m) => {
+                let mut cb = cb;
+                cb(&crate::transport::DownloadProgress::new(m.len() as u64, 0));
+                Ok(())
+            }
+            Storage::Http { chunks, mmap: _ } => {
+                chunks.prebuffer_range_with_progress(byte_start, byte_end, cb)
+            }
+            Storage::Cached { channel, mmap: _ } => {
+                channel.prebuffer_range_with_progress(byte_start, byte_end, cb)
+            }
+        }
     }
 
     /// Same as [`precache`] with a progress callback fired in

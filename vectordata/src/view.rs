@@ -96,6 +96,99 @@ fn parse_window_first(s: &str) -> Option<(usize, usize)> {
     Some((start, end))
 }
 
+/// Compute the byte range a facet's window covers, for the windowed-
+/// precache path. Returns `Some((byte_start, byte_end))` only when:
+///   - `raw_source` carries a `[start..end)` suffix (the canonical
+///     sized-profile encoding, e.g. `base.fvec[0..1000000)`), AND
+///   - the format is xvec (uniform-stride) so record→byte is
+///     just `4 + dim * elem_size`
+///
+/// Returns `None` for:
+///   - facets with no suffix window — caller should use the
+///     unbounded prebuffer; an empty `window:` field in canonical
+///     `dataset.yaml` syntax also lands here (rare in practice;
+///     extending to honor it would need a trait-method to surface
+///     `FacetConfig.window()` through `TestDataView`)
+///   - vvec / parquet / unrecognized formats (record→byte mapping
+///     needs metadata beyond `dim * elem_size`)
+///   - degenerate cases (zero dim, empty range, end ≤ start)
+///
+/// The dim is read from the xvec header at byte 0 of the storage
+/// — a 4-byte fetch that triggers a single chunk download in the
+/// remote case. That's the same first-chunk download every reader
+/// would do on first access anyway, so the cost is paid once
+/// regardless of whether the precache is windowed.
+pub(crate) fn facet_window_byte_range(
+    raw_source: &str,
+    storage: &FacetStorage,
+) -> Option<(u64, u64)> {
+    // Parse the window — `[start..end)` suffix form, the canonical
+    // sized-profile encoding.
+    let (path_no_window, win_start, win_end): (String, u64, u64) =
+        match crate::dataset::source::parse_source_string(raw_source) {
+            Ok(parsed) if !parsed.window.is_empty() => {
+                let iv = &parsed.window.0[0];
+                (parsed.path, iv.min_incl as u64, iv.max_excl as u64)
+            }
+            _ => return None,
+        };
+
+    if win_end <= win_start { return None; }
+
+    // Format guard: only uniform-stride xvec is record→byte
+    // computable from `4 + dim * elem_size`. vvec needs the per-
+    // record offset index; parquet has its own row-group/page
+    // structure; both fall back to unbounded prebuffer.
+    let ext = path_no_window.rsplit('.').next().unwrap_or("");
+    let elem_size = crate::io::infer_elem_size(ext);
+    if elem_size == 0 || crate::io::is_vvec_ext(ext) {
+        return None;
+    }
+
+    // Pull the 4-byte xvec dim header. `read_bytes(0, 4)` triggers
+    // a chunk-0 fetch on the chunked-HTTP / merkle paths if not
+    // already cached; cheap (~8 MiB on the wire vs the ~1.3 TiB
+    // a full prebuffer would have pulled).
+    let header = storage.storage.read_bytes(0, 4).ok()?;
+    if header.len() != 4 { return None; }
+    let dim = i32::from_le_bytes([header[0], header[1], header[2], header[3]]);
+    if dim <= 0 || dim > 1_000_000 { return None; } // sanity vs corrupt header
+    let bpr = 4 + (dim as u64) * (elem_size as u64);
+
+    let total = storage.total_size();
+    let byte_start = win_start.saturating_mul(bpr).min(total);
+    let byte_end = win_end.saturating_mul(bpr).min(total);
+    if byte_start >= byte_end { return None; }
+    Some((byte_start, byte_end))
+}
+
+/// How many bytes a facet contributes to a precache plan.
+///
+/// Returns `0` for facets already resident locally (mmap-backed) —
+/// they don't enter the download tally. For remote facets, returns
+/// the windowed byte range when [`facet_window_byte_range`] succeeds
+/// (sized-profile xvec with chunk-0 resident), and the full file
+/// size otherwise.
+///
+/// Used by `precache::plan_prebuffer` so the "to download" headline
+/// reflects what will actually fetch, not the full-base size that
+/// every sized profile sharing a base file would otherwise inherit
+/// (a 1m windowed profile against a 1.3 TiB base used to announce
+/// 1.3 TiB even though the windowed precache only pulls ~150 MiB).
+pub(crate) fn facet_download_bytes(
+    raw_source: Option<&str>,
+    storage: &FacetStorage,
+) -> u64 {
+    if storage.is_local() { return 0; }
+    let Some(raw_source) = raw_source else {
+        return storage.total_size();
+    };
+    match facet_window_byte_range(raw_source, storage) {
+        Some((start, end)) => end - start,
+        None => storage.total_size(),
+    }
+}
+
 /// Reader wrapper that clips access to a sub-range of the underlying
 /// reader. `count()` reports the window length; `get(i)` reads from
 /// `underlying.get(i + start)` and rejects `i >= window length`.
@@ -291,7 +384,7 @@ pub trait TestDataView: Send + Sync {
     /// `Arc<dyn TestDataView>` from the catalog API).
     fn prebuffer_all_with_progress(&self, cb: &mut dyn FnMut(&str, &PrebufferProgress)) -> Result<()> {
         use std::cell::{Cell, RefCell};
-        for (name, _desc) in self.facet_manifest() {
+        for (name, desc) in self.facet_manifest() {
             // Skip facets with unrecognised extensions (e.g., layout
             // sidecars) — they're not data facets the typed reader
             // API would touch.
@@ -316,15 +409,32 @@ pub trait TestDataView: Send + Sync {
             let storage = self.open_facet_storage(&name)
                 .map_err(|e| Error::Other(format!("open '{name}' for precache: {e}")))?;
 
+            // Honor the facet's window for precache: if the profile
+            // only reads vectors [start..end) of an xvec base file,
+            // there's no point downloading the rest. The window
+            // helper returns `None` for non-windowed facets, vvec
+            // (no per-record byte-offset index at this layer), and
+            // parquet (different format model entirely) — those
+            // cases fall back to the unbounded prebuffer below.
+            let window_bytes = desc.source_path.as_deref()
+                .and_then(|src| facet_window_byte_range(src, &storage));
+            let total_for_display = match window_bytes {
+                Some((s, e)) => e - s,
+                None => storage.total_size(),
+            };
+
             // Post-open notification with the known total size, so
             // the renderer can show "0 / N MiB" instead of "0 / 0"
             // for the brief window before the first chunk lands.
+            // For windowed facets the "total" is the window's byte
+            // count, not the whole file — meter tops out at 100%
+            // when the window is resident, not at 0.1%.
             {
                 let p = PrebufferProgress {
                     verified_chunks: 0,
                     total_chunks: 0,
                     verified_bytes: 0,
-                    total_bytes: storage.total_size(),
+                    total_bytes: total_for_display,
                 };
                 cb(&name, &p);
             }
@@ -339,7 +449,7 @@ pub trait TestDataView: Send + Sync {
                 = RefCell::new(&mut *cb);
             let fired = Cell::new(false);
             let name_str = name.to_string();
-            storage.prebuffer_with_progress(|p| {
+            let forward = |p: &crate::transport::DownloadProgress| {
                 let progress = PrebufferProgress {
                     verified_chunks: p.completed_chunks(),
                     total_chunks: p.total_chunks(),
@@ -348,19 +458,24 @@ pub trait TestDataView: Send + Sync {
                 };
                 (cb_cell.borrow_mut())(&name_str, &progress);
                 fired.set(true);
-            }).map_err(|e| Error::Other(format!("precache '{name}': {e}")))?;
+            };
+            let result = match window_bytes {
+                Some((byte_start, byte_end)) => storage
+                    .prebuffer_range_with_progress(byte_start, byte_end, forward),
+                None => storage.prebuffer_with_progress(forward),
+            };
+            result.map_err(|e| Error::Other(format!("precache '{name}': {e}")))?;
 
             // For facets that fired no chunk updates (local mmap,
             // cache already complete) emit one synthetic event so
             // consumers can rely on "every declared facet was
             // visited and is resident".
             if !fired.get() {
-                let total = storage.total_size();
                 let progress = PrebufferProgress {
                     verified_chunks: 0,
                     total_chunks: 0,
-                    verified_bytes: total,
-                    total_bytes: total,
+                    verified_bytes: total_for_display,
+                    total_bytes: total_for_display,
                 };
                 (cb_cell.borrow_mut())(&name_str, &progress);
             }
@@ -457,6 +572,21 @@ impl FacetStorage {
     pub fn prebuffer_with_progress<F>(&self, cb: F) -> std::io::Result<()>
     where F: FnMut(&crate::transport::DownloadProgress)
     { self.storage.prebuffer_with_progress(cb) }
+
+    /// Same as [`Self::prebuffer_with_progress`] but only fetches
+    /// chunks covering `[byte_start, byte_end)`. Used by windowed
+    /// profile precache so a `:1m` window against a 1.3 TiB base
+    /// only pulls the chunks for the window's byte range. The
+    /// view layer computes the byte range from the window record
+    /// count and the format's bytes-per-record.
+    pub fn prebuffer_range_with_progress<F>(
+        &self,
+        byte_start: u64,
+        byte_end: u64,
+        cb: F,
+    ) -> std::io::Result<()>
+    where F: FnMut(&crate::transport::DownloadProgress)
+    { self.storage.prebuffer_range_with_progress(byte_start, byte_end, cb) }
     pub fn is_complete(&self) -> bool { self.storage.is_complete() }
     pub fn is_local(&self) -> bool { self.storage.is_local() }
     pub fn total_size(&self) -> u64 { self.storage.total_size() }
@@ -498,6 +628,19 @@ pub struct GenericTestDataView {
     config: ProfileConfig,
     /// Dataset-level attributes for metadata accessors.
     attributes: HashMap<String, serde_yaml::Value>,
+    /// Dataset name (matches the `name:` field in `dataset.yaml`,
+    /// or the catalog entry name for knn_entries-shape catalogs).
+    /// When set, [`Self::open_facet_storage`] routes every facet
+    /// through [`crate::storage::Storage::open_layered`] so cached
+    /// bytes land at `<cache_root>/<dataset_name>/<facet_relpath>`
+    /// — stable across catalog moves. `None` falls back to URL-
+    /// derived layout (sufficient for direct URL opens that have
+    /// no catalog context to anchor on).
+    dataset_name: Option<String>,
+    /// Catalog source URL recorded in the per-dataset `origin.json`.
+    /// Verified on subsequent opens; editable by the user when the
+    /// catalog moves but the bytes are the same.
+    catalog_source: Option<String>,
 }
 
 impl GenericTestDataView {
@@ -507,6 +650,8 @@ impl GenericTestDataView {
             source,
             config,
             attributes: HashMap::new(),
+            dataset_name: None,
+            catalog_source: None,
         }
     }
 
@@ -520,7 +665,24 @@ impl GenericTestDataView {
             source,
             config,
             attributes,
+            dataset_name: None,
+            catalog_source: None,
         }
+    }
+
+    /// Set the catalog-anchored cache identity. Both must be set
+    /// together — `dataset_name` is the per-dataset cache
+    /// directory name, `catalog_source` is the URL recorded in
+    /// `origin.json` (typically the dataset.yaml URL, or the
+    /// knn_entries.yaml URL for that catalog shape).
+    pub fn with_catalog_identity(
+        mut self,
+        dataset_name: impl Into<String>,
+        catalog_source: impl Into<String>,
+    ) -> Self {
+        self.dataset_name = Some(dataset_name.into());
+        self.catalog_source = Some(catalog_source.into());
+        self
     }
 
     fn resolve_resource(&self, facet: &FacetConfig) -> Result<ResourceLocation> {
@@ -873,7 +1035,17 @@ impl TestDataView for GenericTestDataView {
     fn facet_element_type(&self, name: &str) -> Result<crate::typed_access::ElementType> {
         let facet = self.facet_config_by_name(name)
             .ok_or_else(|| Error::MissingFacet(name.to_string()))?;
-        let source = facet.source();
+        // Strip the `[start..end)` window suffix before inspecting
+        // the extension — otherwise "base.fvec[0..1000)" splits at the
+        // dots inside the window and yields "1000)" as the "extension",
+        // which infers to no element type at all. The whole facet then
+        // looks unrecognised to the precache iterator and gets silently
+        // skipped — exactly the symptom that started this fix.
+        let raw = facet.source();
+        let source = match crate::dataset::source::parse_source_string(raw) {
+            Ok(parsed) => parsed.path,
+            Err(_) => raw.to_string(),
+        };
         crate::typed_access::ElementType::from_extension(
             source.rsplit('.').next().unwrap_or("")
         ).ok_or_else(|| Error::Other(format!("unknown element type for facet '{name}'")))
@@ -911,8 +1083,33 @@ impl TestDataView for GenericTestDataView {
             Err(_) => raw.to_string(),
         };
         let resolved = self.resolve_path_str(&path_str)?;
-        let storage = crate::storage::Storage::open(&resolved)
-            .map_err(|e| Error::Other(format!("storage open '{name}': {e}")))?;
+        // Catalog-anchored open: cache lands at
+        // `<cache_root>/<dataset>/<file_relpath>` where
+        // `file_relpath` is the facet URL's path *relative to the
+        // dataset's home URL* (`catalog_source`). This matters for
+        // knn_entries-shape catalogs where `path_str` is already an
+        // absolute URL: joining `<cache>/<dataset>/` with that URL
+        // produced a nested-URL-shaped path on disk and the colon
+        // broke Windows outright. Strip-by-prefix recovers the
+        // logical relpath ("base.fvec", "profiles/1m/base.fvec").
+        let storage = match (&self.dataset_name, &self.catalog_source) {
+            (Some(ds_name), Some(home)) => {
+                let home_norm = if home.ends_with('/') {
+                    home.clone()
+                } else {
+                    format!("{home}/")
+                };
+                let file_relpath = resolved
+                    .strip_prefix(&home_norm)
+                    .unwrap_or(path_str.as_str())
+                    .to_string();
+                crate::storage::Storage::open_layered(
+                    &resolved, ds_name, &file_relpath, home,
+                )
+            }
+            _ => crate::storage::Storage::open(&resolved),
+        }
+        .map_err(|e| Error::Other(format!("storage open '{name}': {e}")))?;
         Ok(FacetStorage::new(storage))
     }
 }

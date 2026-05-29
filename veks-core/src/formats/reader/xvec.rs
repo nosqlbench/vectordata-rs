@@ -328,7 +328,15 @@ impl VecSource for RawXvecReader {
 ///
 /// Prevents page cache accumulation that causes memory pressure and
 /// I/O throttling on large sequential reads.
-#[cfg(unix)]
+///
+/// Gated on Linux only: `posix_fadvise` is a Linux-specific extension
+/// (POSIX.1-2001 defines the function, but Apple's libc doesn't expose
+/// it — macOS uses `posix_madvise` on mmap regions instead, and there's
+/// no fd-level equivalent). On macOS / BSD the call becomes a no-op:
+/// page-cache eviction still happens, just without the explicit hint
+/// (the cost is some extra page-cache pressure on huge sequential
+/// reads, not correctness).
+#[cfg(target_os = "linux")]
 fn advise_dontneed_reader(reader: &BufReader<File>, offset: u64, end: u64) {
     use std::os::unix::io::AsRawFd;
     let fd = reader.get_ref().as_raw_fd();
@@ -337,14 +345,15 @@ fn advise_dontneed_reader(reader: &BufReader<File>, offset: u64, end: u64) {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(not(target_os = "linux"))]
 fn advise_dontneed_reader(_reader: &BufReader<File>, _offset: u64, _end: u64) {}
 
 /// Hint the kernel that this file will be read sequentially.
 ///
 /// Sets `FADV_SEQUENTIAL` which encourages aggressive read-ahead and
-/// reduces page cache pollution on large files.
-#[cfg(unix)]
+/// reduces page cache pollution on large files. Linux-only — see the
+/// note on [`advise_dontneed_reader`] for the macOS / BSD rationale.
+#[cfg(target_os = "linux")]
 fn advise_sequential(file: &File) {
     use std::os::unix::io::AsRawFd;
     unsafe {
@@ -352,7 +361,7 @@ fn advise_sequential(file: &File) {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(not(target_os = "linux"))]
 fn advise_sequential(_file: &File) {}
 
 /// Collect xvec files from a path (single file or directory), sorted

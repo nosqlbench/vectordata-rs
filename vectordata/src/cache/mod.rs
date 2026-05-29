@@ -14,6 +14,7 @@
 //! On restart, loading the state file resumes from the last checkpoint — only
 //! unverified chunks are re-downloaded.
 
+pub(crate) mod layout;
 pub(crate) mod reader;
 
 use std::collections::HashMap;
@@ -27,27 +28,24 @@ use crate::transport::{
     ChunkRequest, ChunkedTransport, DownloadProgress, RetryPolicy,
 };
 
-/// Default concurrency for parallel chunk downloads. 32 keeps a
-/// modern multi-Gbps link busy against S3 / CloudFront: each TCP
-/// connection caps around 100-300 MB/s, so 32 streams sustain
-/// 3-9 GB/s aggregate. Coupled with [`DEFAULT_HTTP_RUNTIMES`] in
-/// the transport layer (also 32), the per-runtime fanout stays at
-/// ~1 stream so TLS decryption doesn't bottleneck on any one core.
-/// Tunable via `VECTORDATA_DOWNLOAD_CONCURRENCY` for unusual links
-/// (25 / 100 Gbps NICs may benefit from pushing to 64-128, slow
-/// links may want to drop to 8-16 to avoid pool churn).
-const DEFAULT_CONCURRENCY: usize = 32;
-
 /// Read the configured parallel-chunk-download worker count. Both
 /// `Storage::Cached` (mref-backed) and `Storage::Http` (chunked-only)
 /// route through this so a single env knob tunes both paths
-/// identically. Floor of 1 — `n=0` would deadlock the queue-pull loop.
+/// identically. Floor of 1 — `n=0` would deadlock the queue-pull
+/// loop. Defaults to [`crate::transport::DEFAULT_PARALLEL_STREAMS`]
+/// so worker count and runtime count stay matched 1:1 without two
+/// constants to keep in sync. 32 keeps a modern multi-Gbps link
+/// busy against S3 / CloudFront: each TCP connection caps around
+/// 100-300 MB/s, so 32 streams sustain 3-9 GB/s aggregate. Tunable
+/// via `VECTORDATA_DOWNLOAD_CONCURRENCY` for unusual links (25 /
+/// 100 Gbps NICs may benefit from pushing to 64-128, slow links
+/// may want to drop to 8-16 to avoid pool churn).
 pub(crate) fn download_concurrency() -> usize {
     std::env::var("VECTORDATA_DOWNLOAD_CONCURRENCY")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&n| n > 0)
-        .unwrap_or(DEFAULT_CONCURRENCY)
+        .unwrap_or(crate::transport::DEFAULT_PARALLEL_STREAMS)
 }
 
 /// Thread-safe positional file I/O for the cache file.
@@ -167,16 +165,27 @@ impl CachedChannel {
     /// resumes from that checkpoint and derives the reference from its
     /// embedded hashes. Otherwise creates the `.mrkl` from the provided
     /// reference with a zeroed validity bitset.
+    ///
+    /// The data file lives at `cache_dir/name` for the entire lifetime
+    /// of the cache — sparse during download, fully populated when
+    /// complete. Chunks are verified against the merkle reference on
+    /// every access, so reads work against partial files; this is the
+    /// load-bearing in-place semantic of the merkle-cached design.
     pub fn open(
         transport: Arc<dyn ChunkedTransport>,
         reference: MerkleRef,
         cache_dir: &Path,
         name: &str,
     ) -> io::Result<Self> {
-        fs::create_dir_all(cache_dir)?;
-
         let cache_path = cache_dir.join(name);
         let state_path = cache_dir.join(format!("{}.mrkl", name));
+        // Natural layout allows `name` to contain `/` (e.g.
+        // `profiles/1m/base.fvec`), so the data file's parent
+        // directory may be a subdir of `cache_dir`. Create the
+        // *whole* chain, not just `cache_dir` itself.
+        if let Some(parent) = cache_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
 
         // Dual-mode: .mrkl is the single source of truth for *verified content*,
         // but the caller's `reference` argument is the single source of truth for
@@ -611,21 +620,74 @@ impl CachedChannel {
         &self,
         callback: F,
     ) -> io::Result<()> {
-        // Take a snapshot of which chunks need work, then claim
-        // them in the in-flight map under the same lock that the
-        // on-demand `ensure_chunks_valid` path uses. This is the
-        // guard against the race "precache starts fetching a
-        // chunk → on-demand reader sees `state.is_valid()=false`
-        // and `in_flight.get()=None` → fires its own duplicate
-        // fetch".
+        let shape = self.reference.shape();
+        self.prebuffer_chunks_with_progress(
+            self.state.missing_chunks(),
+            shape.total_content_size,
+            callback,
+        )
+    }
+
+    /// Eagerly download every chunk overlapping the byte range
+    /// `[byte_start, byte_end)`. Same chunk-pull / dedup / progress
+    /// semantics as [`Self::prebuffer_with_progress`], but bounded.
+    /// Used by the view layer to honor profile windows so a 1m-window
+    /// profile against a 1.3 TiB base only fetches the first ~150 MiB
+    /// of chunks, not the whole file.
+    ///
+    /// `byte_end` is clamped to `total_content_size`. An empty range
+    /// (`byte_start >= byte_end`) is a no-op — fires the completion
+    /// callback once with zero bytes.
+    pub fn prebuffer_range_with_progress<F: FnMut(&DownloadProgress)>(
+        &self,
+        byte_start: u64,
+        byte_end: u64,
+        callback: F,
+    ) -> io::Result<()> {
+        let shape = self.reference.shape();
+        let total = shape.total_content_size;
+        let end = byte_end.min(total);
+        if byte_start >= end {
+            let mut cb = callback;
+            cb(&DownloadProgress::new(0, 0));
+            return Ok(());
+        }
+        let first_chunk = (byte_start / shape.chunk_size) as u32;
+        let last_chunk = ((end - 1) / shape.chunk_size) as u32;
+        let candidates: Vec<u32> = (first_chunk..=last_chunk)
+            .filter(|i| !self.state.is_valid(*i))
+            .collect();
+        // Total bytes in the range (for the "already complete" cb).
+        let range_bytes: u64 = (first_chunk..=last_chunk)
+            .map(|i| shape.chunk_len(i))
+            .sum();
+        self.prebuffer_chunks_with_progress(candidates, range_bytes, callback)
+    }
+
+    /// Common backend for both `prebuffer_with_progress` (whole-file)
+    /// and `prebuffer_range_with_progress` (window-bounded). Takes a
+    /// pre-filtered set of chunks that may need work, claims them in
+    /// the in-flight map under the same lock the on-demand
+    /// `ensure_chunks_valid` path uses, and drives them through the
+    /// parallel fetch+verify+write pipeline. `completion_bytes` is
+    /// the byte total surfaced to the callback when there's nothing
+    /// left to fetch (so the meter shows "100%" rather than "0/0").
+    fn prebuffer_chunks_with_progress<F: FnMut(&DownloadProgress)>(
+        &self,
+        candidate_chunks: Vec<u32>,
+        completion_bytes: u64,
+        callback: F,
+    ) -> io::Result<()> {
+        // Claim the chunks under the in-flight lock. Skipping chunks
+        // already owned by a concurrent reader's on-demand fetch is
+        // the load-bearing race guard against "precache starts
+        // fetching → on-demand reader sees `state.is_valid()=false`
+        // and `in_flight.get()=None` → fires its own duplicate fetch".
         let missing = {
             let mut in_flight = self.in_flight.lock().unwrap();
             let mut out = Vec::new();
-            for i in self.state.missing_chunks() {
+            for i in candidate_chunks {
                 if in_flight.contains_key(&i) {
-                    // Another path already owns this chunk's
-                    // fetch — let it race to completion; we'll
-                    // skip it here.
                     continue;
                 }
                 in_flight.insert(i, Arc::new(Condvar::new()));
@@ -635,13 +697,16 @@ impl CachedChannel {
         };
 
         if missing.is_empty() {
-            // Nothing to do — still fire the cb once so callers
-            // see a "completed" snapshot.
-            let shape = self.reference.shape();
-            let progress = DownloadProgress::new(0, 0);
-            let _ = progress;
+            // Already complete — mark `downloaded_bytes = completion_bytes`
+            // so the renderer can distinguish "everything is here"
+            // from "nothing happened yet". Without this, an already-
+            // cached facet shows `✓ 0 B` instead of `✓ <size>` because
+            // the callback's downloaded count starts at zero by
+            // default.
             let mut cb = callback;
-            cb(&DownloadProgress::new(shape.total_content_size, 0));
+            let progress = DownloadProgress::new(completion_bytes, 0);
+            progress.add_downloaded_bytes(completion_bytes);
+            cb(&progress);
             return Ok(());
         }
 
