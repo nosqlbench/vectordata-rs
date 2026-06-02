@@ -21,6 +21,10 @@ log — while remaining a *transparent drop-in* for the HTTPS endpoint that
 path; a `.publish_url` of `https://vecd-host/datasets/glove-100/` plus a
 bearer token Just Works.
 
+(Why a new daemon rather than an off-the-shelf system? See the
+[build-vs-buy footnote](#footnote-build-vs-buy--why-build-vecd) — the
+field surveyed, and why none of it covers the load-bearing middle.)
+
 ```
 veks publish ─▶ vectordata push ─▶ HTTPS (PUT/GET/…) ─▶ ┌──────────────┐
                 vectordata read  ─▶ HTTPS (GET/HEAD)  ─▶ │     vecd     │
@@ -1345,3 +1349,130 @@ content-addressed keyed substructure beneath the mirrored logical name);
 **versioning** (tags + `manifest_hash`, `@latest`/`@tag` addressing,
 latest-by-default); and **named parameterized privilege profiles**
 (`{placeholder}` token positions).
+
+## Footnote: build vs. buy — why build `vecd`
+
+Before committing to a new daemon we surveyed the strongest open-source,
+freely-available systems that might cover this functional surface
+off-the-shelf. The conclusion: **no single system covers it, and the
+gaps fall in the load-bearing middle, not the edges.** The honest posture
+is *build the control plane, buy the backend* — vecd's `kind: s3|local|mem`
+abstraction already "buys" the commodity byte-storage tier; what it builds
+is the thin AAA + namespace + transactional-versioning plane that the
+existing client already speaks natively.
+
+**The discriminating requirement surface** (the axes that matter):
+
+- **R1** REST object gateway honoring conditional writes (`If-Match` /
+  `If-None-Match`) — `push`'s single-provenance CAS guarantee rides on it.
+- **R2** namespace→backend indirection (hierarchical, cascading config,
+  one-endpoint-one-config).
+- **R3** bearer-token RBAC *cone* — privilege tree (read⊂publish⊂maintain⊂
+  curate), levels, roles, `PUBLIC`/`KNOWN` groups, ownership, intersection
+  narrowing.
+- **R4** delegated expiring scoped keys + parameterized profiles
+  (`{placeholder}` token positions).
+- **R5** transactional versioned publication (pushlog-driven session,
+  atomic pointer-flip).
+- **R6** metadata-hash manifests + version tags + `@latest`/`@tag`, COW
+  tree keyed by version hash.
+- **R7** non-destructive stasis lifecycle (expire→hidden, admin
+  extend/purge, `X-`header signal).
+- **R8** hierarchical quotas + `IGNORE-QUOTAS` system privilege.
+- **R9** single-binary SQLite ops, multi-process safe, live config reload.
+- **R10** client-driven incremental/resumable/self-verifying off-system
+  backup + object-store introspection.
+- **R11** native fit with the existing push/pull + pushlog/SHA256SUMS
+  provenance (no protocol impedance).
+
+**The five strongest contenders, and where each falls down:**
+
+1. **lakeFS** (Apache-2.0, Go) — git-for-data: atomic commits, branches,
+   merges, zero-copy branching over S3/GCS/Azure, *plus* an S3 gateway.
+   Closest match on **R5/R6**. But granular RBAC is a lakeFS-Cloud /
+   enterprise feature — OSS auth is thin (no delegated scoped expiring
+   keys, no privilege cone, no profile placeholders → misses **R3/R4**);
+   deployment needs Go server **+ an external KV store** (Postgres/Dynamo),
+   so no single-binary-SQLite story (**R9**); no stasis lifecycle (**R7**)
+   or per-namespace backend indirection (**R2**); its versioning model is
+   its own, so coupling to pushlog/SHA256SUMS provenance is impedance, not
+   fit (**R11**). *The one tempting "buy" — lakeFS as the versioning
+   substrate — still loses: we'd use almost none of its branch/merge
+   surface (our model is immutable, tagged, atomically-published
+   snapshots) while inheriting all of its operational weight and bypassing
+   its auth entirely. Impedance cost > implementation cost.*
+2. **Harbor / OCI registries (Zot)** (CNCF, Apache-2.0) — content-addressed
+   blobs, manifests, **tags**, project=namespace, **RBAC**, **per-project
+   quotas**, **retention**, replication: strong on **R3/R6/R8** and partial
+   **R7**. Disqualifier is the **protocol** — clients must speak the OCI
+   distribution protocol, not plain REST `PUT`/`GET`; it does not front
+   arbitrary S3 backends as namespaces (**R2**), gives no whole-tree atomic
+   publication (**R5** partial), and has zero native fit with push/pull
+   (**R11**). Adopting it means reframing every dataset as an OCI artifact
+   and rewriting the client transport.
+3. **MinIO** (**AGPLv3** — licensing friction for a tool we ship, Go) — S3
+   server with IAM policies, bucket versioning, ILM expiry. But ILM
+   *deletes* (our stasis never deletes — **R7**); gateway mode was removed,
+   so no namespace→backend indirection (**R2**); no transactional dataset
+   publication (**R5**), no delegated profile tokens (**R4**), no pushlog
+   fit (**R11**). Best read as a **candidate backend behind vecd**, not a
+   replacement for it.
+4. **S3 gateways — versitygw / s3proxy / Zenko CloudServer** — the only
+   contenders that natively do **R2** (versitygw even keeps per-bucket
+   metadata in a `--meta-bucket`). But auth is S3 SigV4 access/secret keys,
+   not a bearer-token RBAC cone (**R3/R4**), and none do versioning,
+   manifests, tags, stasis, or quotas (**R5–R8**). They solve exactly one
+   of eleven axes.
+5. **Lightweight S3 stores — SeaweedFS (Apache-2.0) / Garage (Rust, single
+   binary) / Ceph RGW** — raw S3 with access-key auth (**R1** only). Garage
+   is the operational cousin of what we want (Rust, single binary, ~512 MB,
+   zero deps) but *explicitly lacks versioning, object lock, and
+   lifecycle*. Like MinIO, these are **backend candidates**, not
+   control-plane replacements.
+
+*(Out-of-class and rejected: DVC = client-side git+remote, no server AAA;
+Pachyderm = needs Kubernetes; Quilt = AWS-centric catalog.)*
+
+**Coverage matrix** (✓ full · ◑ partial/conditional · ✗ none):
+
+| | R1 | R2 | R3 | R4 | R5 | R6 | R7 | R8 | R9 | R10 | R11 |
+|---|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|
+| **lakeFS** | ◑ | ✗ | ◑¹ | ✗ | ✓ | ✓ | ✗ | ✗ | ✗ | ◑ | ✗ |
+| **Harbor/Zot** | ✗² | ✗ | ✓ | ◑ | ◑ | ✓ | ◑ | ✓ | ✗ | ✗ | ✗ |
+| **MinIO** | ✓ | ✗ | ◑ | ◑ | ✗ | ◑ | ◑³ | ◑ | ✗ | ✗ | ✗ |
+| **versitygw/s3proxy** | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ◑ | ✗ | ✗ |
+| **SeaweedFS/Garage** | ◑⁴ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ◑ | ✗ | ✗ |
+| **`vecd` (proposed)** | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+
+¹ enterprise/Cloud only · ² OCI protocol, not REST · ³ ILM deletes, not
+stasis · ⁴ Garage has no versioning.
+
+**Verdict.** The field splits into *backends* (MinIO, SeaweedFS, Garage,
+Ceph — R1 and nothing above it; already "bought" as vecd backends) and
+*partial control planes* that each nail one cluster and structurally miss
+the rest (lakeFS owns versioning but not AAA-or-ops; Harbor owns
+content-addressing+RBAC+quota but speaks the wrong protocol and can't front
+S3 namespaces; the gateways own backend-indirection alone). The combination
+that *defines* vecd — bearer-token RBAC cone + delegated expiring
+profile-tokens + namespace→backend indirection + pushlog-native
+transactional versioning addressable as `@latest`/`@tag` + non-destructive
+stasis + single-binary-SQLite ops + zero-impedance fit with the existing
+push/pull/SHA256SUMS provenance — exists in no off-the-shelf system. To
+"buy" it you would assemble *versitygw (R2) + lakeFS (R5/R6) + an external
+IdP/OPA (R3/R4) + custom lifecycle glue (R7) + custom backup tooling (R10)*
+and **still** not get **R11** — the seam where the assembled stack would
+leak. So: **buy the backend, build the control plane**, because the closest
+adoptable substitute brings more integration surface than the control plane
+itself.
+
+*Sources surveyed: [lakeFS](https://github.com/treeverse/lakeFS) /
+[docs](https://docs.lakefs.io/); [Harbor](https://github.com/goharbor/harbor)
+and the [OCI distribution spec](https://github.com/opencontainers/distribution-spec/blob/main/spec.md);
+MinIO [versioning](https://github.com/minio/minio/blob/master/docs/bucket/versioning/README.md)
+and [ILM](https://github.com/minio/minio/blob/master/docs/bucket/lifecycle/README.md);
+[versitygw](https://github.com/versity/versitygw/wiki/S3-Backend),
+[s3proxy](https://github.com/gaul/s3proxy),
+[Zenko CloudServer](https://github.com/scality/cloudserver);
+[SeaweedFS](https://github.com/seaweedfs/seaweedfs) and
+[Garage](https://rilavek.com/resources/self-hosted-s3-compatible-object-storage-2026);
+[DVC/Pachyderm](https://www.pachyderm.com/blog/data-versioning-comparing-dvc-with-pachyderm/).*
