@@ -674,6 +674,79 @@ fn real_midupload_failure_leaves_resumable_tombstone() {
     assert!(remote_log(&remote).open_update().is_none());
 }
 
+// ─── robustness: scan refuses what it can't publish faithfully ──────
+
+#[cfg(unix)]
+#[test]
+fn scan_refuses_symlinks() {
+    let src = unique("symlink-src");
+    let remote = unique("symlink-remote");
+    make_dataset(&src);
+    std::os::unix::fs::symlink(src.join("base.fvec"), src.join("link.fvec")).unwrap();
+    let err = execute(&opts(&src, &remote)).expect_err("symlink must be refused");
+    assert!(matches!(err, Failure::Usage(m) if m.contains("symbolic link")));
+}
+
+#[cfg(unix)]
+#[test]
+fn scan_refuses_non_utf8_names() {
+    use std::os::unix::ffi::OsStrExt;
+    let src = unique("nonutf8-src");
+    let remote = unique("nonutf8-remote");
+    make_dataset(&src);
+    let bad = std::ffi::OsStr::from_bytes(b"bad\xFFname.bin");
+    std::fs::write(src.join(bad), b"x").unwrap();
+    let err = execute(&opts(&src, &remote)).expect_err("non-utf8 name must be refused");
+    assert!(matches!(err, Failure::Usage(m) if m.contains("non-UTF-8")));
+}
+
+#[test]
+fn changed_since_detects_mid_push_mutation() {
+    let d = unique("toctou");
+    std::fs::write(d.join("a"), b"one").unwrap();
+    let mut pre = std::collections::BTreeMap::new();
+    pre.insert("a".to_string(), super::checksums::len_mtime(&d.join("a")).unwrap());
+    assert!(super::changed_since(&d, &pre).unwrap().is_none(), "unchanged → None");
+
+    // Rewrite with different content and a clearly-newer mtime.
+    std::fs::write(d.join("a"), b"two-and-longer").unwrap();
+    let future =
+        filetime::FileTime::from_unix_time(filetime::FileTime::now().unix_seconds() + 100, 0);
+    filetime::set_file_mtime(d.join("a"), future).unwrap();
+    assert_eq!(super::changed_since(&d, &pre).unwrap().as_deref(), Some("a"));
+}
+
+#[test]
+fn crash_between_abort_and_begin_heals_not_wedges() {
+    let src = unique("abrt-heal-src");
+    let remote = unique("abrt-heal-remote");
+    make_dataset(&src);
+    execute(&opts(&src, &remote)).unwrap(); // v1: both [b1,c1]
+
+    // Manufacture the "crashed between abort and the fresh begin" state:
+    // remote = [b1, c1, begin(2), abort(2)]; local stays at [b1, c1].
+    let mut rl = remote_log(&remote);
+    rl.events.push(Event::Begin {
+        seq: 2, ts: "Mon, 01 Jan 2024 00:00:00 GMT".into(), actor: "crashed@host".into(),
+        cmd: "x".into(), message: None, overwrites: vec![], added: vec![], deletes: vec![],
+        sums: std::collections::BTreeMap::new(), tool_version: "x".into(),
+    });
+    rl.events.push(Event::Abort {
+        seq: 2, ts: "Mon, 01 Jan 2024 00:00:01 GMT".into(),
+        actor: "crashed@host".into(), reason: Some("crash".into()),
+    });
+    std::fs::write(remote.join(pushlog::PUSHLOG_FILE), rl.render()).unwrap();
+
+    // New (additive) content; the push should proceed as v3, not wedge.
+    std::fs::write(src.join("extra.fvec"), b"E").unwrap();
+    let outcome = execute(&opts(&src, &remote)).expect("should heal and proceed");
+    assert!(!outcome.resumed);
+    assert_eq!(outcome.version, 3);
+    let rl = remote_log(&remote);
+    assert_eq!(rl.stable_version(), Some(3));
+    assert!(rl.events.iter().any(|e| matches!(e, Event::Abort { seq: 2, .. })));
+}
+
 #[test]
 fn keep_policy_refuses_stale_checksums() {
     let src = unique("keep-src");

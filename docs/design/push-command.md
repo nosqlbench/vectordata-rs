@@ -509,6 +509,316 @@ auth, partial transfer — leaves an open `begin` event as the seq-N tombstone),
 open update in progress / stale checksums under `keep` (the "you need to do
 something different" class).
 
+## Failure modes
+
+This is the exhaustive catalogue of what can go wrong in a push, how the
+system detects it, and how it responds. The guiding principle is the one
+stated up top — *low ceremony for the happy path, hard stops for the
+dangerous ones* — refined by experience into three rules:
+
+1. **Never silently change or lose remote data.** Anything destructive
+   (overwrite, delete) is gated behind `-m` and recorded; anything
+   ambiguous is refused, not guessed.
+2. **Never silently skip work.** A flag that can't be honored (e.g.
+   `--delete` on a transport that can't list) errors loudly.
+3. **Always be resumable.** Every multi-object write is bracketed so a
+   failure leaves a well-defined, recoverable state, never a torn one
+   that looks complete.
+
+Exit codes: **0** success (including `--dry-run` and the no-op
+fast-forward); **1** operational failure (transport, auth, I/O, a
+concurrency race); **2** the "you must do something different" class
+(usage, binding/provenance conflicts, ungated destructive change).
+Failures in classes A–E are detected *before any remote write*, so they
+leave the remote untouched.
+
+### A. Source resolution & validation (exit 2; remote untouched)
+
+| Trigger | Response | Test |
+|---|---|---|
+| `PATH` is not a directory | refuse | — |
+| No `dataset.yaml`/`knn_entries.yaml` and no `--raw` | refuse, tell user to pass `--raw` | `no_recognized_mode_without_raw_is_refused` |
+| Structured: `dataset.yaml` unparseable | refuse | — |
+| Structured: `is_zero_vector_free`/`is_duplicate_vector_free` missing or not `true` | refuse, naming the attribute | `structured_missing_attributes_…` |
+| Catalog: `knn_entries.yaml` unparseable | refuse | — |
+| Catalog: a referenced facet file is missing on disk | refuse, naming the file | `catalog_mode_end_to_end_and_missing_file_…` |
+
+`--no-check` bypasses this whole class (the binding/provenance/gate
+rules below still apply); covered by the `…no_check bypasses` assertion.
+
+### B. Binding (exit 2; remote untouched)
+
+| Trigger | Response | Test |
+|---|---|---|
+| No `.publish_url` (here or in a parent) and no `--to` | refuse — "no destination", with the `echo … > .publish_url` hint | `no_destination_is_refused` |
+| `.publish_url` malformed / unsupported scheme | hard stop | `malformed_publish_url_is_a_hard_stop` |
+| Local `.publish_url` and `--to` disagree | conflict — re-binding is deliberate | `binding_conflict_is_refused` |
+| Remote root already bound to a *different* endpoint | remote conflict | `remote_bound_elsewhere_is_a_conflict` |
+
+### C. Checksums (exit 2 under `keep`; `auto` self-heals)
+
+| Trigger | Response | Test |
+|---|---|---|
+| `--checksums keep` + missing `SHA256SUMS` | refuse | `keep_policy_refuses_stale_checksums` |
+| `--checksums keep` + stale `SHA256SUMS` | refuse, with the staleness reason | (same) |
+| `--checksums auto` + stale/missing | recompute (default happy path) | overwrite/`generate` tests |
+
+Residual risk: freshness is judged by the mtime invariant, anchored to
+the newest *described file's* mtime (not `now()`, which jitters against
+the filesystem clock on some hosts). On a filesystem with coarse (≥1 s)
+mtime granularity, a content change in the *same second* as the last
+checksum generation is invisible to the heuristic. Documented limit; the
+remote `SHA256SUMS` (regenerated each `auto` push) still bounds it in
+practice.
+
+### D. Provenance & convergence (exit 2, except the recoveries)
+
+Convergence is judged against the remote's **committed** history (the
+log minus any trailing open `begin`).
+
+| Trigger | Response | Test |
+|---|---|---|
+| Remote committed-ahead, **and** local content differs from the remote head | refuse — divergent provenance | `divergent_provenance_is_refused` |
+| Remote committed-ahead, **but** local content reproduces the remote head | **fast-forward** the local log, report up-to-date (exit 0) | `crash_after_complete_before_mirror_fast_forwards` |
+| Forked (neither log a prefix of the other) | refuse — manual reconciliation | `forked_provenance_is_refused` |
+| Local ahead of remote committed | proceed; carry the local-only tail up | `local_ahead_carries_its_tail_up` |
+| Open `begin` on remote, intended `sums` **match** ours | **resume** that seq (idempotent finish) | `resume_finishes_an_interrupted_push` |
+| Open `begin`, `sums` differ, no `--abort-incomplete` | refuse, offering resume-from-source or `--abort-incomplete` | `open_push_with_changed_source_…`, `open_update_tombstone_blocks` |
+| Open `begin`, `sums` differ, `--abort-incomplete` | record `abort`, push fresh at next seq | `open_push_with_changed_source_…` |
+
+### E. Destructive-change gate (exit 2; remote untouched)
+
+| Trigger | Response | Test |
+|---|---|---|
+| Plan overwrites existing content, no `-m` | refuse, listing the keys | `overwrite_without_message_is_blocked` |
+| `--delete` would remove orphans, no `-m` | refuse, listing the keys | `delete_removes_orphans_gated_by_message` |
+
+A resume skips this gate — the interrupted push was already authorized
+when its `begin` was written. A `SHA256SUMS` updating to reflect a purely
+*additive* change does not trip it.
+
+### F. Transport & operational (exit 1)
+
+| Trigger | Response | Test |
+|---|---|---|
+| Credentials missing / rejected (S3 chain, https bearer) | fail fast at the preflight HEAD; actionable message | `https_auth_failure_then_success_with_token` |
+| Endpoint doesn't accept object `PUT` (HTTP 405) | error — "not a writable object store?" | (https transport) |
+| `aws` CLI absent from `PATH` (s3) | error with install hint | — |
+| `--delete` on a generic `https://` endpoint (no listing) | error loudly — orphan cleanup unsupported here | `https_transport_verbs_…` (`list` errs) |
+| Generic I/O / protocol error | surfaced as operational | — |
+| **Concurrency race**: another writer changed `pushlog.jsonl` between our read and our conditional write (`If-Match` precondition fails) | error — "re-run to re-converge"; no silent clobber | `transport_conditional_put_enforces_if_match`, `https_transport_verbs_…` |
+
+### G. Partial failure & crash recovery
+
+The commit order is `[abort] → begin → upload (SHA256SUMS last per dir)
+→ .publish_url → complete → delete`. `begin` is written *before* any
+object, so any failure between `begin` and `complete` leaves an open
+`begin` tombstone and a recoverable state — never a torn "looks done".
+
+| Where the push dies | State left | Recovery on rerun |
+|---|---|---|
+| After `begin`, before any upload | open `begin`; no objects | resume re-uploads everything, writes `complete` |
+| Mid-upload | open `begin`; some objects present | resume re-uploads only what's missing/differing (idempotent), writes `complete` |
+| After content, before `SHA256SUMS` | open `begin`; content up, sums stale/absent | resume uploads sums + `complete` |
+| After `complete`, before local mirror | committed remote; local behind | fast-forward (D, row 2) — no wedge |
+| During the `abort` write (abort-then-fresh) | open `begin` still present | rerun re-evaluates the open begin from scratch |
+| Confirmation declined, or non-interactive without `-y` | nothing written | exit 2 |
+
+End-to-end proof that a *real* mid-upload fault leaves a resumable
+tombstone (not only a manufactured state):
+`real_midupload_failure_leaves_resumable_tombstone` injects a read-only
+remote directory, confirms the push dies with the open `begin` recorded
+and the object absent, then clears the fault and verifies the rerun
+resumes the same seq to completion.
+
+### H. Residual risks (acknowledged, not fully eliminated)
+
+- **The in-flux window is detectable, not atomic.** Between `begin` and
+  `complete` a reader that consults the log (or reads `SHA256SUMS`-last
+  per directory) sees the prior stable version; a reader that ignores the
+  log entirely could observe a torn set. Full atomicity would need
+  version-prefixed publication + a pointer flip (noted as future work).
+- **Deletion is not transactional with the version.** Orphans are removed
+  *after* `complete`, so a reader pinned to a prior version may lose files
+  that version referenced. `--delete` is opt-in and `-m`-gated precisely
+  because it is destructive across versions.
+- **Multi-object upload is not rolled back on failure** — it is *resumed*.
+  The remote may hold a partial set between a crash and the next push;
+  that set is reconciled, never presented as complete (no `complete`
+  event exists for it).
+- **Same-second checksum staleness** on coarse-granularity filesystems
+  (see C).
+- **S3 transport spawns one `aws` process per object** — a throughput
+  limit, not a correctness issue; a native SDK is the future swap.
+- **Untestable in CI here**: live-endpoint S3 auth (the https-bearer
+  equivalent *is* covered against the in-repo object-store mock).
+
+### I. Causal shell — second-order failure modes
+
+Classes A–H are the *surface* failures: what the user sees and how the
+command responds. This section is the next ring outward — the underlying
+causes and the failures that live *beneath the mechanisms* A–H rely on.
+Each row is tagged: **[mitigated]** (handled or structurally prevented),
+**[residual]** (real but accepted, documented limit), or **[gap]** (a
+hardening we should do; not yet implemented).
+
+#### Beneath A (source scan) — what the walk assumes about the tree
+
+| Deeper cause | Surface failure it produces | Status |
+|---|---|---|
+| A symlink in the source tree (`file_type()` reports neither file nor dir) | symlinked content is **silently omitted** from the publish set — violates "never silently skip" | **[mitigated]** — scan now refuses symlinks with a clear error (`scan_refuses_symlinks`) |
+| Symlink loop / cycle | (currently moot — symlinks skipped, so no recursion) | **[mitigated]** by the skip above |
+| Non-UTF-8 filename | `to_string_lossy` would mangle the key (U+FFFD), so the published name ≠ the real byte name | **[mitigated]** — scan now refuses non-UTF-8 names (`scan_refuses_non_utf8_names`) |
+| Filename containing whitespace/newline | the line-based `SHA256SUMS` format isn't injective — the entry round-trips wrong, corrupting that dir's manifest | **[mitigated]** — coreutils `\`-escaping of newline/backslash names (`escapes_names_with_backslash_or_newline`) |
+| `is_zero_vector_free: true` asserted but untrue | validation trusts the *metadata*, never verifies the content — a mislabeled dataset publishes as "known-good" | **[residual]** — by design veks owns content verification |
+| A file is read for its SHA-256, then **changes before upload** (TOCTOU) | remote bytes ≠ the digest recorded in `SHA256SUMS` → silent integrity violation | **[mitigated]** — `(len,mtime)` snapshot at hash time is re-checked before any write; a change aborts pre-commit (`changed_since_detects_mid_push_mutation`). Same-second same-size edit on coarse fs remains the documented limit |
+
+#### Beneath B (binding) — URL identity & ancestry
+
+| Deeper cause | Surface failure | Status |
+|---|---|---|
+| Binding equality is string comparison of the normalized URL | case / trailing-slash variants within a scheme → **false conflict or false match** | **[mitigated]** — normalize now lowercases scheme+host and fixes the trailing slash (`canonicalizes_scheme_and_host_case`). Cross-scheme aliases (`s3://` vs its `https` virtual-host form) and percent-encoding remain **[residual]** |
+| `.publish_url` walk-up crosses into an unintended ancestor / mount | binds to the wrong remote | **[residual]** — logical-path walk limits but doesn't eliminate |
+| Two sibling sources both covered by one ancestor `.publish_url` | they collide on one root `pushlog.jsonl`/manifest → interleaved provenance | **[residual]** — whole-hierarchy delegation makes this rare |
+
+#### Beneath D/F (provenance & the wire) — trust in fetched bytes
+
+| Deeper cause | Surface failure | Status |
+|---|---|---|
+| A `GET` of `pushlog.jsonl` returns a valid **prefix** (trailing line dropped by a truncated/reset response) | fewer events parsed → **misclassified convergence** (looks like remote is behind) → possible wrong overwrite/diverge verdict | **[mitigated]** — `get` verifies body length against `Content-Length` (and reqwest already errors on a premature EOF); a short body errors instead of parsing |
+| The endpoint **silently ignores** `If-Match`/`If-None-Match` (older S3-compatible stores) | the CAS guard no-ops → two racing pushers clobber the pushlog and **lose events** — the single-provenance guarantee breaks | **[mitigated]** — a preflight conditional-write probe refuses any endpoint that ignores the precondition (`push_refuses_endpoint_that_ignores_conditional_writes`) |
+| `pushlog.jsonl` grows without bound | every push reads + rewrites the whole log (O(n) each, O(n²) over history); large logs cost memory/bandwidth and widen the CAS race window | **[residual]** — no compaction yet |
+| The entire skip/resume/fast-forward logic trusts SHA-256 collision resistance | a collision → wrong "skip"/false match | **[residual]** — accepted cryptographic assumption |
+| Local `pushlog.jsonl` corrupted/hand-edited but still parses | mis-converges (e.g. spurious "forked") | **[residual]** — recover by deleting the local log → fast-forward heals |
+
+#### Beneath F (transport) — the moving parts under "operational error"
+
+| Deeper cause | Surface failure | Status |
+|---|---|---|
+| S3 region redirect (301/307) on a **PUT** to a wrong-region virtual host | reqwest may not replay the request body → upload fails or misbehaves (the read path tolerates GET redirects; the write path is less forgiving) | **[mitigated]** — a redirect on PUT now surfaces a clear "use the correct regional endpoint or s3://" error instead of an opaque failure; using an `s3://` binding avoids it entirely |
+| `aws` CLI error classified by **stderr substring** ("not found", "accessdenied") | a different CLI version/locale → an auth error miscategorized as generic (wrong exit code + worse message) | **[residual]** — fragile; structured `--output json` errors would be better |
+| A killed large `aws s3 cp` (multipart) | orphaned incomplete multipart parts → **storage-cost leak**, no visible object | **[residual]** — relies on a bucket lifecycle rule to reap |
+| Transient DNS/TLS/timeout on a write | the push fails with no automatic retry (the read path has `RetryPolicy`; the write path has none) | **[deferred — judgement]** resume already recovers any failed push, and auto-retrying a *conditional* put risks turning a lost-response success into a spurious precondition failure; favoring correctness over convenience, retry is deliberately not added |
+
+#### Beneath G (crash recovery) — gaps between the bracketed writes
+
+| Deeper cause | Surface failure | Status |
+|---|---|---|
+| Crash **between** the `abort` write and the fresh `begin` (abort-then-fresh) | remote is `[…, begin(N), abort(N)]`, local behind, new content differs from the (stale) stable head → classified divergent → **wedge** until the user syncs the local pushlog | **[residual]** — recoverable (the error says how), but two non-atomic writes |
+| Crash mid-write of the **local** mirror on `file://` | torn/half-written local `pushlog.jsonl` | **[mitigated]** — local mirror + binding writes are now temp-file + atomic `rename`; and as a backstop, deleting the local log → fast-forward heals |
+| Crash mid-write of a remote `SHA256SUMS` on `file://` | truncated remote manifest → bad overwrite oracle | **[mitigated]** — the `file://` transport now writes via temp + atomic `rename`, so objects are never torn (matching S3/https whole-object PUT atomicity) |
+| The injected fault never clears (read-only dir stays read-only) | each rerun re-attempts and re-fails; never progresses | **[mitigated]** — no corruption, just no progress; the tombstone keeps it resumable |
+
+#### Cross-cutting assumption
+
+The single-provenance guarantee rests on **one logical writer per publish
+root, serialized by the pushlog's conditional write**. Concurrent writers
+are serialized (the loser gets `PreconditionFailed` and retries) *only if
+the store honors conditional writes* (see the [gap] above). The
+file:///in-memory-mock tests exercise the conditional path; real-store
+behaviors (multipart ETags, region redirects, eventual consistency) are
+not yet exercised against a live endpoint.
+
+## Failure modes by aspect
+
+The same modes (surface classes A–H and the causal shell I/X), cross-cut
+by four questions: **who owns robustness** for it, **how much control the
+user has** to avoid it (None/Low/Med/High), **whether there is a remedy**
+once it happens, and the **design cost to eliminate** it entirely
+(None = already handled; Small/Med/Large otherwise). IDs reuse the
+section labels above; the `I*`/`X1` rows are the causal-shell items in
+their listed order.
+
+| ID | Failure (brief) | Owns robustness | User control | Remedy once hit | Design cost to eliminate |
+|---|---|---|---|---|---|
+| A1 | PATH not a directory | User | High | fix the path | None (handled) |
+| A2 | no mode + no `--raw` | User | High | add a descriptor or `--raw` | None |
+| A3 | `dataset.yaml` unparseable | User / veks | High | fix the file | None |
+| A4 | publishable attrs missing/false | User / veks | High | set attrs, or `--no-check` | None |
+| A5 | `knn_entries.yaml` unparseable | User | High | fix the file | None |
+| A6 | catalog references a missing file | User | High | provide the file | None |
+| B1 | no destination (no binding, no `--to`) | User | High | write `.publish_url` or pass `--to` | None |
+| B2 | malformed/unsupported `.publish_url` | User | High | fix the URL | None |
+| B3 | local `.publish_url` vs `--to` disagree | User | High | edit binding or drop `--to` | Small (a `rebind` verb) |
+| B4 | remote already bound elsewhere | User + remote | Med | choose another path / coordinate | Med (ownership model) |
+| C1 | `keep` + missing `SHA256SUMS` | User | High | use `auto`, or generate sums | None |
+| C2 | `keep` + stale `SHA256SUMS` | User | High | use `auto`, or regenerate | None |
+| D1 | divergent (remote ahead, content differs) | User + remote | Med | re-sync local log, reconcile, re-push | Med (reconcile tool) |
+| D3 | forked provenance | User + remote | Low | manual reconciliation | Large (multi-writer merge) |
+| D6 | open begin, intent differs | User | High | resume from source, or `--abort-incomplete` | None (remedies built in) |
+| E1 | overwrite without `-m` | User | High | supply `-m` | None (intentional gate) |
+| E2 | delete without `-m` | User | High | supply `-m` | None (intentional gate) |
+| F1 | credentials missing/rejected | User + env | High | set creds / token | None (clear error) |
+| F2 | endpoint won't accept `PUT` (405) | User + remote | Med | point at a writable object store | None–Small |
+| F3 | `aws` CLI absent | User / env | High | install it | Small (native SDK) |
+| F4 | `--delete` on a non-listable `https` | User + transport | High | drop `--delete`, or use s3/file | Med (often impossible) |
+| F5 | transient I/O / protocol error | transport / network | Low | re-run (resumes) | Small (write retry) |
+| F6 | CAS race (precondition fails) | push + concurrent user | Low | re-run (re-converges) | None (guard working) |
+| I1 | symlink in tree silently dropped | push (scan) | Low | restructure tree; notice the gap | Small (warn/resolve/refuse) |
+| I2 | non-UTF-8 filename mangled | push + OS | Med | rename | Small (byte-preserve/reject) |
+| I3 | filename whitespace breaks `SHA256SUMS` | push (format) + user | Med | rename | Small (escape/reject) |
+| I4 | publishability attrs asserted but untrue | User / veks | High | honesty / content verify upstream | Med (push-side verify) |
+| I5 | content changes between hash and upload (TOCTOU) | push + user | Med | don't mutate mid-push; re-push | Med (verify-after / lock) |
+| I6 | URL equality false match/conflict | push (binding) | Low | make URLs textually identical | Small (canonicalize) |
+| I7 | walk-up binds wrong ancestor | user (layout) + push | Med | place `.publish_url` correctly | Small |
+| I8 | two sources share one root | user (layout) | Med | separate publish roots | Med |
+| I9 | truncated pushlog fetch → misclassify | transport + push | None | (dangerous: may act silently) re-run | Small (Content-Length guard) |
+| I10 | store silently ignores conditional writes | remote store + push | Low | use a conforming store | Small (probe at preflight) |
+| I11 | `pushlog.jsonl` unbounded growth | push (design) | None | none (slow degrade) | Med (compaction/snapshot) |
+| I12 | SHA-256 collision assumption | crypto | None | none | Large (and unwarranted) |
+| I13 | local pushlog corrupt but parses | user / crash | High | delete local log → fast-forward | None |
+| I14 | S3 region redirect on `PUT` | transport + user | High | set region / use aws transport | Small (handle redirect) |
+| I15 | fragile `aws` stderr classification | push (transport) | None | none (worse message only) | Small (structured errors) |
+| I16 | orphaned multipart on killed upload | transport + remote | Low | bucket lifecycle rule | Small / external |
+| I17 | no write-side retry | push (transport) | Low | re-run (resumes) | Small (RetryPolicy on writes) |
+| I18 | crash between `abort` and fresh `begin` | push (non-atomic writes) | None | sync local log → re-run | Med (atomic, or auto-sync) |
+| I19 | torn local mirror write (crash) | push + OS | None | delete local log → fast-forward | Small (atomic rename) |
+| I20 | torn remote `SHA256SUMS` on `file://` | push + OS | None | replace file / re-push dir | Small (atomic rename) |
+| I21 | injected fault never clears | environment | Med | fix the fault → re-run resumes | None (stays resumable) |
+| X1 | >1 logical writer per root | design assumption | Med | serialize pushers | Large (multi-writer) |
+
+### What the matrix shows
+
+- **The happy-path guardrails cost nothing to keep correct.** Every
+  *user-controllable* mode (A, B1–B3, C, E, most of F, D6) is High-control
+  with a clear remedy and **None** design cost — they are working as
+  intended: refuse early, tell the user exactly what to change.
+- **The residual risk concentrates in the transport/remote layer** the
+  push command doesn't own (I9, I10, I14–I17, F5) — almost all **Small**
+  fixes (a fetch-length guard, a conditional-write probe, write retries,
+  region handling, structured `aws` errors). These are the highest
+  value-per-effort hardening and the place to spend next.
+- **The "None user control" rows are the ones to design against**, since
+  the user can't avoid them: I9 (silent misclassification — the most
+  dangerous, Small to fix), I10 (silent guarantee loss, Small to detect),
+  I11/I18 (Med), and the crash-torn-write trio I19/I20 (Small, atomic
+  rename). Notably most are still **Small**.
+- **Only genuinely multi-writer concurrency (D3, X1) needs Large change.**
+  Everything else is None/Small/Med — the single-writer, single-provenance
+  model is cheap to harden and only expensive to abandon.
+
+### Hardening status (implemented)
+
+The matrix's "design cost to eliminate" column is the *pre-hardening*
+estimate. The following have since been implemented (the per-mode rows in
+§I carry the specifics and test names):
+
+- **Closed:** I1 (refuse symlinks), I2 (refuse non-UTF-8 names), I3
+  (coreutils-escaped manifest names), I5 (TOCTOU `(len,mtime)` recheck),
+  I6 (scheme+host URL canonicalization), I9 (`Content-Length` fetch
+  guard), I10 (conditional-write preflight probe), I14 (clear PUT-redirect
+  error), I18 (RemoteAhead fast-forward generalized to abandoned/abort
+  tails), I19/I20 (atomic temp+rename for local writes).
+- **Deferred by judgement, with rationale:** I17 (no write-side retry —
+  resume already recovers; auto-retrying conditional puts risks
+  correctness). I11 (pushlog compaction — no correctness impact, future).
+  I15 (`aws` stderr classification — message quality only). I16 (orphaned
+  multipart — bucket-lifecycle territory). I12 (SHA-256 collision —
+  accepted cryptographic assumption).
+- **Still residual (large or out-of-model):** cross-scheme URL aliasing
+  (part of I6), D3/X1 multi-writer forks, live-endpoint S3 auth (untested
+  here, behavior in place).
+
 ## Open questions for review
 
 1. **Identity for catalog/ad-hoc roots.** `dataset.yaml` gives a natural

@@ -62,11 +62,8 @@ impl PushTransport for LocalTransport {
 
     fn put_file(&self, rel: &str, src: &Path) -> Result<(), PushError> {
         let dst = self.path_for(rel);
-        if let Some(parent) = dst.parent() {
-            std::fs::create_dir_all(parent).map_err(io)?;
-        }
-        std::fs::copy(src, &dst).map_err(io)?;
-        Ok(())
+        let bytes = std::fs::read(src).map_err(io)?;
+        atomic_write(&dst, &bytes)
     }
 
     fn put_bytes(&self, rel: &str, data: &[u8], if_match: Option<&str>) -> Result<(), PushError> {
@@ -81,11 +78,7 @@ impl PushTransport for LocalTransport {
                 (_, _) => return Err(PushError::PreconditionFailed),
             }
         }
-        if let Some(parent) = dst.parent() {
-            std::fs::create_dir_all(parent).map_err(io)?;
-        }
-        std::fs::write(&dst, data).map_err(io)?;
-        Ok(())
+        atomic_write(&dst, data)
     }
 
     fn preflight(&self) -> Result<(), PushError> {
@@ -140,4 +133,24 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<String>) -> std::io::Result<()> {
 
 fn io(e: std::io::Error) -> PushError {
     PushError::Other(e.to_string())
+}
+
+/// Write `data` to `dst` crash-atomically: stage in a sibling temp file,
+/// then `rename` over the target (atomic on the same filesystem). A crash
+/// mid-write leaves either the old file or the new one — never a torn
+/// half-written object.
+fn atomic_write(dst: &Path, data: &[u8]) -> Result<(), PushError> {
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent).map_err(io)?;
+    }
+    let file_name = dst.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let tmp = dst.with_file_name(format!(".{file_name}.tmp.{}", std::process::id()));
+    std::fs::write(&tmp, data).map_err(io)?;
+    match std::fs::rename(&tmp, dst) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(io(e))
+        }
+    }
 }

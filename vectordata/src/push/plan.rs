@@ -156,8 +156,7 @@ impl Scan {
 pub fn scan(root: &Path) -> Result<Scan, String> {
     let mut files = Vec::new();
     let mut content_dirs = Vec::new();
-    walk(root, root, &mut files, &mut content_dirs)
-        .map_err(|e| format!("scanning {}: {e}", root.display()))?;
+    walk(root, root, &mut files, &mut content_dirs)?;
     files.sort();
     content_dirs.sort();
     content_dirs.dedup();
@@ -169,18 +168,41 @@ fn walk(
     dir: &Path,
     files: &mut Vec<String>,
     content_dirs: &mut Vec<String>,
-) -> std::io::Result<()> {
+) -> Result<(), String> {
     let mut had_content = false;
     let mut subdirs = Vec::new();
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let ft = entry.file_type()?;
-        let name = entry.file_name().to_string_lossy().into_owned();
+    let entries = std::fs::read_dir(dir).map_err(|e| format!("scanning {}: {e}", dir.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("scanning {}: {e}", dir.display()))?;
+        let ft = entry.file_type().map_err(|e| format!("scanning {}: {e}", dir.display()))?;
+        let path = entry.path();
+
+        // Refuse to publish anything we can't represent faithfully and
+        // completely. A symlink would either be silently dropped (data
+        // loss) or escape the publish root if followed; a non-UTF-8 name
+        // can't round-trip through the URL/SHA256SUMS key space without
+        // lossy mangling. Both are hard stops, not silent surprises.
+        if ft.is_symlink() {
+            return Err(format!(
+                "refusing to publish: '{}' is a symbolic link.\n\
+                 Symlinks can't be published faithfully (they'd be dropped or escape the root). \
+                 Materialize it into a real file first.",
+                rel_display(root, &path)
+            ));
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            return Err(format!(
+                "refusing to publish: '{}' has a non-UTF-8 file name, which can't be represented \
+                 as an object key. Rename it.",
+                path.display()
+            ));
+        };
+
         if ft.is_dir() {
-            subdirs.push(entry.path());
+            subdirs.push(path);
         } else if ft.is_file() && !is_sentinel(&name) {
             had_content = true;
-            files.push(rel_of(root, &entry.path()));
+            files.push(rel_of(root, &path));
         }
     }
     if had_content {
@@ -191,6 +213,13 @@ fn walk(
         walk(root, &sd, files, content_dirs)?;
     }
     Ok(())
+}
+
+/// Best-effort relative display of `path` under `root` for messages.
+fn rel_display(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .map(|r| r.display().to_string())
+        .unwrap_or_else(|_| path.display().to_string())
 }
 
 /// Forward-slashed path of `path` relative to `root` (`""` for root).

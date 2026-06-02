@@ -69,7 +69,29 @@ impl PushTransport for HttpsTransport {
         let client = crate::transport::shared_client();
         let resp = self.auth(client.get(self.url(rel))).send().map_err(other)?;
         match resp.status() {
-            s if s.is_success() => Ok(Some(resp.bytes().map_err(other)?.to_vec())),
+            s if s.is_success() => {
+                // Capture the advertised length before consuming the body,
+                // then verify we received all of it. A truncated response
+                // (connection reset mid-body) must error here — silently
+                // returning a short body would let a partial pushlog parse
+                // as a valid shorter log and misclassify provenance.
+                let advertised = resp
+                    .headers()
+                    .get(reqwest::header::CONTENT_LENGTH)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.parse::<u64>().ok());
+                let body = resp.bytes().map_err(other)?;
+                if let Some(len) = advertised
+                    && body.len() as u64 != len
+                {
+                    return Err(PushError::Other(format!(
+                        "GET {} returned {} bytes but Content-Length was {len} (truncated response)",
+                        self.url(rel),
+                        body.len(),
+                    )));
+                }
+                Ok(Some(body.to_vec()))
+            }
             StatusCode::NOT_FOUND => Ok(None),
             s @ (StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) => Err(auth(rel, s)),
             s => Err(PushError::Other(format!("GET {} -> HTTP {s}", self.url(rel)))),
@@ -141,6 +163,14 @@ impl HttpsTransport {
             s @ (StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) => Err(auth(rel, s)),
             StatusCode::METHOD_NOT_ALLOWED => Err(PushError::Other(format!(
                 "{} does not accept object PUT (HTTP 405); not a writable object store?",
+                self.url(rel)
+            ))),
+            // A redirect on a PUT (classically an S3 wrong-region 301/307)
+            // can't be followed with a streaming body — surface it clearly
+            // instead of as an opaque failure.
+            s if s.is_redirection() => Err(PushError::Other(format!(
+                "PUT {} was redirected (HTTP {s}); point at the correct regional endpoint, \
+                 or use an s3:// binding so credentials and region are resolved for you",
                 self.url(rel)
             ))),
             s => Err(PushError::Other(format!("PUT {} -> HTTP {s}", self.url(rel)))),

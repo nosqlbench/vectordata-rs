@@ -210,9 +210,26 @@ pub fn execute(opts: &Options) -> Result<Outcome, Failure> {
         local_sums.insert(dir_rel.clone(), cf);
     }
 
+    // Snapshot (len, mtime) of every content file as of checksum time, so
+    // a concurrent mutation before the bytes are uploaded (TOCTOU) is
+    // caught rather than publishing bytes that disagree with the manifest.
+    let mut pre_stats: BTreeMap<String, (u64, std::time::SystemTime)> = BTreeMap::new();
+    for rel in &scan.files {
+        let p = root.join(rel.replace('/', std::path::MAIN_SEPARATOR_STR));
+        pre_stats.insert(rel.clone(), checksums::len_mtime(&p).map_err(Failure::op)?);
+    }
+
     // 4. Open transport + auth/reachability preflight (fail fast).
     let tx = transport::open(&endpoint, &opts.transport).map_err(Failure::Usage)?;
     tx.preflight().map_err(map_transport)?;
+
+    // 4b. The single-provenance guarantee rests on the store honoring
+    //     conditional writes (the pushlog `If-Match`/`If-None-Match` CAS).
+    //     Probe it before trusting it; refuse an endpoint that silently
+    //     ignores the precondition. Skipped in dry-run (it would write).
+    if !opts.dry_run {
+        verify_conditional_writes(tx.as_ref())?;
+    }
 
     // 5. Remote binding (identity-by-URL): the remote publish root may
     //    already be bound. Equal → ours; different → conflict.
@@ -235,26 +252,30 @@ pub fn execute(opts: &Options) -> Result<Outcome, Failure> {
     //    open `begin`, which is an in-flight or crashed push reconciled in
     //    step 7).
     let (remote_log, remote_log_etag) = read_remote_log(tx.as_ref())?;
-    let local_log = read_local_log(root)?;
+    let mut local_log = read_local_log(root)?;
     let remote_committed = remote_log.committed();
 
     match local_log.classify(&remote_committed) {
         Convergence::Equal | Convergence::LocalAhead { .. } => {}
         Convergence::RemoteAhead { extra } => {
-            // Local is behind the remote's committed history. Two cases:
+            // Local is behind the remote's committed history. Three cases:
             //   (a) our content already reproduces the remote's current
-            //       head (same stable `sums`) — local merely fell behind,
-            //       e.g. a crash after the remote `complete` but before
-            //       the local mirror, or a re-run after losing the local
-            //       pushlog. Nothing to push: fast-forward local
+            //       head (same stable `sums`) — local merely fell behind
+            //       (e.g. a crash after the remote `complete` but before
+            //       the local mirror). Nothing to push: fast-forward local
             //       provenance and report up-to-date.
-            //   (b) our content differs — a genuine conflicting update.
-            //       Refuse and make the user reconcile.
+            //   (b) the remote has no newer *committed version* than local
+            //       — it is ahead only by abandoned bookkeeping (a
+            //       begin+abort, or a crash between `abort` and the fresh
+            //       `begin`). No stable content is being skipped: adopt the
+            //       committed history as the baseline and proceed.
+            //   (c) the remote has a newer committed version with different
+            //       content — a genuine conflicting update. Refuse.
             if remote_committed.stable_sums() == Some(&sums_digests) {
                 if !opts.dry_run {
-                    std::fs::write(
-                        root.join(pushlog::PUSHLOG_FILE),
-                        remote_committed.render(),
+                    atomic_write_local(
+                        &root.join(pushlog::PUSHLOG_FILE),
+                        remote_committed.render().as_bytes(),
                     )
                     .map_err(Failure::op)?;
                 }
@@ -270,12 +291,17 @@ pub fn execute(opts: &Options) -> Result<Outcome, Failure> {
                     dry_run: opts.dry_run,
                 });
             }
-            return Err(Failure::Usage(format!(
-                "divergent provenance: the remote has {extra} committed event(s) this source has \
-                 not seen, and your content differs from the remote head.\n\
-                 Re-sync the local copy (and its {}) before pushing, then reconcile.",
-                pushlog::PUSHLOG_FILE
-            )));
+            if remote_committed.stable_version() == local_log.stable_version() {
+                // (b) — fast-forward the local baseline, then fall through.
+                local_log = remote_committed.clone();
+            } else {
+                return Err(Failure::Usage(format!(
+                    "divergent provenance: the remote has {extra} committed event(s) this source \
+                     has not seen, and a newer stable version with different content.\n\
+                     Re-sync the local copy (and its {}) before pushing, then reconcile.",
+                    pushlog::PUSHLOG_FILE
+                )));
+            }
         }
         Convergence::Diverged { common } => {
             return Err(Failure::Usage(format!(
@@ -417,7 +443,18 @@ pub fn execute(opts: &Options) -> Result<Outcome, Failure> {
         confirm(&outcome, &added, &overwrites, &deletes)?;
     }
 
-    // 13. Commit, in order: [abort] → begin → upload (sums last)
+    // 13. TOCTOU guard: confirm no content file changed since it was
+    //     checksummed. If one did, the manifest we are about to publish
+    //     would disagree with the bytes — abort before writing anything,
+    //     so a fresh re-run recomputes a consistent snapshot.
+    if let Some(rel) = changed_since(root, &pre_stats).map_err(Failure::op)? {
+        return Err(Failure::Operational(format!(
+            "'{rel}' changed during the push (size/mtime differs from when it was \
+             checksummed); re-run to publish a consistent snapshot."
+        )));
+    }
+
+    // 14. Commit, in order: [abort] → begin → upload (sums last)
     //     → .publish_url → complete → delete orphans. The `begin` is
     //     skipped when resuming (it is already on the remote); the abort
     //     is written only in the AbortThenFresh case.
@@ -495,11 +532,17 @@ pub fn execute(opts: &Options) -> Result<Outcome, Failure> {
         tx.delete(key).map_err(map_transport)?;
     }
 
-    // 14. Mirror into the local pushlog; persist a staged binding.
-    std::fs::write(root.join(pushlog::PUSHLOG_FILE), log.render()).map_err(Failure::op)?;
+    // 15. Mirror into the local pushlog; persist a staged binding. Both
+    //     are written crash-atomically (temp + rename) so an interrupted
+    //     mirror can't leave a torn local pushlog.
+    atomic_write_local(&root.join(pushlog::PUSHLOG_FILE), log.render().as_bytes())
+        .map_err(Failure::op)?;
     if matches!(bind, Binding::Staged(_)) {
-        std::fs::write(root.join(binding::PUBLISH_FILE), format!("{}\n", endpoint.url))
-            .map_err(Failure::op)?;
+        atomic_write_local(
+            &root.join(binding::PUBLISH_FILE),
+            format!("{}\n", endpoint.url).as_bytes(),
+        )
+        .map_err(Failure::op)?;
     }
 
     Ok(outcome)
@@ -613,6 +656,64 @@ fn map_transport(e: PushError) -> Failure {
         PushError::Auth(m) => Failure::Operational(format!("authentication failed: {m}")),
         PushError::Other(m) => Failure::Operational(m),
     }
+}
+
+/// Probe whether the endpoint honors conditional writes. Creates a
+/// throwaway key with a must-not-exist precondition, then attempts the
+/// same again: a conforming store refuses the second with
+/// [`PushError::PreconditionFailed`]. If the second *succeeds*, the store
+/// ignores the precondition and cannot serialize concurrent pushers, so
+/// the provenance log could be silently clobbered — refuse.
+fn verify_conditional_writes(tx: &dyn PushTransport) -> Result<(), Failure> {
+    const PROBE: &str = ".push-cas-probe";
+    // Clear any probe left by a previous interrupted run.
+    let _ = tx.delete(PROBE);
+    match tx.put_bytes(PROBE, b"1", Some("")) {
+        Ok(()) => {}
+        // A leftover we couldn't delete — inconclusive; don't block.
+        Err(PushError::PreconditionFailed) => {
+            let _ = tx.delete(PROBE);
+            return Ok(());
+        }
+        Err(e) => return Err(map_transport(e)),
+    }
+    let honored =
+        matches!(tx.put_bytes(PROBE, b"2", Some("")), Err(PushError::PreconditionFailed));
+    let _ = tx.delete(PROBE);
+    if honored {
+        Ok(())
+    } else {
+        Err(Failure::Operational(format!(
+            "{} does not honor conditional writes (If-None-Match): concurrent pushes could \
+             silently clobber the provenance log. Refusing — single provenance can't be \
+             guaranteed on this endpoint.",
+            tx.describe()
+        )))
+    }
+}
+
+/// Return the first content file (relative key) whose `(len, mtime)`
+/// differs from the snapshot taken at checksum time — i.e. one that was
+/// mutated during the push (TOCTOU). `None` if all are unchanged.
+fn changed_since(
+    root: &Path,
+    pre_stats: &BTreeMap<String, (u64, std::time::SystemTime)>,
+) -> std::io::Result<Option<String>> {
+    for (rel, before) in pre_stats {
+        let p = root.join(rel.replace('/', std::path::MAIN_SEPARATOR_STR));
+        if checksums::len_mtime(&p)? != *before {
+            return Ok(Some(rel.clone()));
+        }
+    }
+    Ok(None)
+}
+
+/// Crash-atomic write of a local file (temp + rename on the same dir).
+fn atomic_write_local(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let tmp = path.with_file_name(format!(".{name}.tmp.{}", std::process::id()));
+    std::fs::write(&tmp, data)?;
+    std::fs::rename(&tmp, path)
 }
 
 fn dir_join(root: &Path, dir_rel: &str) -> PathBuf {

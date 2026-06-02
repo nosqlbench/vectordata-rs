@@ -56,22 +56,31 @@ pub struct ChecksumFile {
 
 impl ChecksumFile {
     /// Parse the normative `sha256sum` format. Tolerates the optional
-    /// binary-mode `*` marker (`<hex> *<name>`) and blank lines.
+    /// binary-mode `*` marker (`<hex> *<name>`) and blank lines, and
+    /// understands the GNU coreutils backslash-escaped form (a leading
+    /// `\` on the line, with `\\` and `\n` escapes in the name) used when
+    /// a file name contains a backslash or newline.
     pub fn parse(text: &str) -> Result<Self, String> {
         let mut entries = Vec::new();
         for (n, line) in text.lines().enumerate() {
-            let line = line.trim_end();
+            let line = line.trim_end_matches(['\r', '\n']);
             if line.trim().is_empty() {
                 continue;
             }
-            // hex, then whitespace, then (optionally '*') name.
-            let (hex, rest) = line
+            // A leading backslash marks an escaped line (the name held a
+            // backslash or newline); strip it before reading the digest.
+            let (escaped, body) = match line.strip_prefix('\\') {
+                Some(rest) => (true, rest),
+                None => (false, line),
+            };
+            let (hex, rest) = body
                 .split_once(char::is_whitespace)
                 .ok_or_else(|| format!("malformed SHA256SUMS line {}: {line:?}", n + 1))?;
-            let name = rest.trim_start().trim_start_matches('*').to_string();
             if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
                 return Err(format!("malformed digest on line {}: {hex:?}", n + 1));
             }
+            let raw = rest.trim_start().trim_start_matches('*');
+            let name = if escaped { unescape_name(raw) } else { raw.to_string() };
             entries.push(ChecksumEntry { hex: hex.to_lowercase(), name });
         }
         entries.sort_by(|a, b| a.name.cmp(&b.name));
@@ -79,15 +88,24 @@ impl ChecksumFile {
     }
 
     /// Render in normative `sha256sum` format (two spaces between digest
-    /// and name), names sorted for byte-stable output.
+    /// and name), names sorted for byte-stable output. Names containing a
+    /// backslash or newline are emitted in the coreutils escaped form so
+    /// the manifest stays a faithful, line-oriented, injective mapping.
     pub fn render(&self) -> String {
         let mut sorted = self.entries.clone();
         sorted.sort_by(|a, b| a.name.cmp(&b.name));
         let mut out = String::new();
         for e in &sorted {
-            out.push_str(&e.hex);
-            out.push_str("  ");
-            out.push_str(&e.name);
+            if name_needs_escape(&e.name) {
+                out.push('\\');
+                out.push_str(&e.hex);
+                out.push_str("  ");
+                out.push_str(&escape_name(&e.name));
+            } else {
+                out.push_str(&e.hex);
+                out.push_str("  ");
+                out.push_str(&e.name);
+            }
             out.push('\n');
         }
         out
@@ -128,6 +146,39 @@ pub fn sha256_bytes(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data);
     hex(&hasher.finalize())
+}
+
+/// Whether a file name must use the escaped line form.
+fn name_needs_escape(name: &str) -> bool {
+    name.contains('\\') || name.contains('\n') || name.contains('\r')
+}
+
+/// Escape a name for the coreutils `\`-prefixed line form.
+fn escape_name(name: &str) -> String {
+    name.replace('\\', "\\\\").replace('\n', "\\n").replace('\r', "\\r")
+}
+
+/// Inverse of [`escape_name`].
+fn unescape_name(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('r') => out.push('\r'),
+                Some('\\') => out.push('\\'),
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -242,6 +293,14 @@ fn mtime(path: &Path) -> std::io::Result<SystemTime> {
     std::fs::metadata(path)?.modified()
 }
 
+/// `(len, mtime)` of a file — a cheap fingerprint for detecting that a
+/// file changed between when it was checksummed and when it is uploaded
+/// (the TOCTOU window).
+pub fn len_mtime(path: &Path) -> std::io::Result<(u64, SystemTime)> {
+    let m = std::fs::metadata(path)?;
+    Ok((m.len(), m.modified()?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -300,6 +359,30 @@ mod tests {
         assert!(matches!(freshness(&d, &names2).unwrap(), Freshness::Stale { .. }));
 
         std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn escapes_names_with_backslash_or_newline() {
+        let a = "a".repeat(64);
+        let b = "b".repeat(64);
+        let c = "c".repeat(64);
+        let cf = ChecksumFile {
+            entries: vec![
+                ChecksumEntry { hex: a.clone(), name: "weird\nname".into() },
+                ChecksumEntry { hex: b.clone(), name: "back\\slash".into() },
+                ChecksumEntry { hex: c.clone(), name: "normal.bin".into() },
+            ],
+        };
+        let text = cf.render();
+        // The two awkward names use the escaped line form; the plain one doesn't.
+        assert_eq!(text.lines().filter(|l| l.starts_with('\\')).count(), 2);
+        assert!(!text.contains("weird\nname")); // the literal newline is escaped away
+
+        // Round-trips back to the exact original names.
+        let parsed = ChecksumFile::parse(&text).unwrap();
+        assert_eq!(parsed.digest_of("weird\nname"), Some(a.as_str()));
+        assert_eq!(parsed.digest_of("back\\slash"), Some(b.as_str()));
+        assert_eq!(parsed.digest_of("normal.bin"), Some(c.as_str()));
     }
 
     #[test]

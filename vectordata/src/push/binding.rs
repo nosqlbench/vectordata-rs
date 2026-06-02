@@ -75,10 +75,18 @@ pub fn parse_publish_url(content: &str) -> Result<ParsedPublishUrl, String> {
         return Err(format!("empty path in URL: {url}"));
     }
 
-    let normalized = if url.ends_with('/') {
-        url
+    // Canonicalize for stable equality: lowercase scheme (already done)
+    // and host, preserve path case, ensure a single trailing slash. This
+    // makes `S3://Bucket/p` and `s3://bucket/p/` compare equal. Note it
+    // does NOT unify cross-scheme aliases (an `s3://` URL vs its
+    // `https://bucket.s3…/` virtual-host form) — that remains a residual.
+    let rest_after_host = &after_scheme[host.len()..];
+    let host_norm = if scheme == "file" { host.to_string() } else { host.to_lowercase() };
+    let rebuilt = format!("{scheme}://{host_norm}{rest_after_host}");
+    let normalized = if rebuilt.ends_with('/') {
+        rebuilt
     } else {
-        format!("{url}/")
+        format!("{rebuilt}/")
     };
 
     Ok(ParsedPublishUrl { url: normalized, scheme })
@@ -220,6 +228,21 @@ mod tests {
         // file:///abs/path has an empty authority but a real path.
         let p = parse_publish_url("file:///abs/path").unwrap();
         assert_eq!(p.url, "file:///abs/path/");
+    }
+
+    #[test]
+    fn canonicalizes_scheme_and_host_case() {
+        let p = parse_publish_url("S3://Bucket/Prefix").unwrap();
+        // scheme + host lowercased, path case preserved, trailing slash added
+        assert_eq!(p.url, "s3://bucket/Prefix/");
+        assert_eq!(p.scheme, "s3");
+        // case-variant URLs compare equal (no false conflict)
+        assert_eq!(
+            parse_publish_url("S3://Bucket/p").unwrap(),
+            parse_publish_url("s3://bucket/p/").unwrap(),
+        );
+        // file:// paths are case-sensitive and not lowercased
+        assert_eq!(parse_publish_url("file:///Abs/Path").unwrap().url, "file:///Abs/Path/");
     }
 
     #[test]
