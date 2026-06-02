@@ -1,19 +1,19 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! Dataset publishing to S3 (`veks publish`).
+//! Dataset publishing (`veks publish`).
 //!
-//! Synchronizes the publishable content of a local dataset directory to
-//! a remote destination using the transport specified by the `.publish_url`
-//! file. Currently supports S3 (`s3://`) via the AWS CLI.
-
-mod transport;
+//! veks owns *what* is publishable — it discovers `.publish`-marked
+//! datasets, applies the publishable-file filters, and runs the
+//! pre-flight check suite. The actual transfer is delegated to
+//! [`vectordata::push`], which owns *how*: one push of the whole
+//! hierarchy from the publish root, with per-directory `SHA256SUMS`, a
+//! single `pushlog.jsonl`, binding refresh, opt-in deletion, and
+//! scheme-dispatched transport (`s3://`, `https://`, `file://`).
 
 use std::path::{Path, PathBuf};
 
 use clap::Args;
-
-use transport::{SyncOptions, transport_for_scheme};
 
 /// Arguments for `veks publish`.
 #[derive(Args)]
@@ -29,6 +29,11 @@ pub struct PublishArgs {
     /// Show what would be uploaded without transferring
     #[arg(long)]
     pub dry_run: bool,
+
+    /// Justification recorded in the remote pushlog. Required when the
+    /// publish would overwrite or delete existing remote data.
+    #[arg(short = 'm', long)]
+    pub message: Option<String>,
 
     /// Remove remote objects that no longer exist locally
     #[arg(long)]
@@ -212,21 +217,11 @@ pub fn run(args: PublishArgs) {
         println!();
     }
 
-    // Select transport based on URL scheme
-    let transport = match transport_for_scheme(&parsed.scheme) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("Error: {}", e);
-            std::process::exit(2);
-        }
-    };
-
     // Build the include list from enumerate_publishable_files — the single
-    // source of truth for what gets published. The sync uses exclude-all +
-    // include-only, so no separate exclude logic is needed.
+    // source of truth for what gets published.
     let include_files: Vec<String> = publishable.iter()
         .filter_map(|p| p.strip_prefix(&publish_root).ok())
-        .map(|r| r.to_string_lossy().to_string())
+        .map(|r| r.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/"))
         .collect();
 
     // Log infrastructure files for debugging publish completeness
@@ -243,17 +238,59 @@ pub fn run(args: PublishArgs) {
         eprintln!("           Check that .publish sentinel exists in the dataset directory.");
     }
 
-    let sync_opts = SyncOptions {
+    // Delegate the actual transfer to `vectordata push`. The two layers
+    // split cleanly: veks owns *what* is published (the enumerate above,
+    // honoring .publish markers and filters) and the pre-flight checks;
+    // push owns *how* — one push of the whole hierarchy from the publish
+    // root, with per-directory SHA256SUMS, a single root pushlog.jsonl,
+    // the binding refresh, opt-in --delete, and scheme-dispatched
+    // transport. push skips its own known-good validation (no_check)
+    // since the check suite already ran, and skips its confirmation
+    // prompt (assume_yes) since veks confirmed above.
+    let actor = format!(
+        "{}@{}",
+        std::env::var("USER").or_else(|_| std::env::var("USERNAME")).unwrap_or_else(|_| "unknown".into()),
+        std::env::var("HOSTNAME").unwrap_or_else(|_| "host".into()),
+    );
+    let push_opts = vectordata::push::Options {
+        path: publish_root.clone(),
+        to: None, // bind from the publish root's .publish_url
+        message: args.message.clone(),
+        raw: false,
+        checksums: vectordata::push::ChecksumPolicy::Auto,
         dry_run: args.dry_run,
+        no_check: true,
+        assume_yes: true,
         delete: args.delete,
-        size_only: args.size_only,
-        include_files: &include_files,
-        profile: args.profile.as_deref(),
-        endpoint_url: args.endpoint_url.as_deref(),
+        abort_incomplete: false,
+        concurrency: args.concurrency,
+        files: Some(include_files),
+        transport: vectordata::push::transport::TransportOptions {
+            token: None,
+            profile: args.profile.clone(),
+            endpoint_url: args.endpoint_url.clone(),
+        },
+        cmd: std::env::args().collect::<Vec<_>>().join(" "),
+        actor,
     };
-
-    let exit_code = transport.sync(&publish_root, &s3_url, &sync_opts);
-    std::process::exit(exit_code);
+    match vectordata::push::execute(&push_opts) {
+        Ok(o) if o.dry_run => std::process::exit(0),
+        Ok(o) => {
+            println!(
+                "Published version {} to {} — {} new, {} overwritten, {} deleted, {} unchanged.",
+                o.version, o.destination, o.added, o.overwritten, o.deleted, o.skipped,
+            );
+            std::process::exit(0);
+        }
+        Err(vectordata::push::Failure::Usage(m)) => {
+            eprintln!("publish: {m}");
+            std::process::exit(2);
+        }
+        Err(vectordata::push::Failure::Operational(m)) => {
+            eprintln!("publish: {m}");
+            std::process::exit(1);
+        }
+    }
 }
 
 /// Run all pre-flight checks before publishing.

@@ -98,6 +98,12 @@ pub mod config;
 /// Both binaries dispatch into this module — there is exactly one
 /// implementation of each command.
 pub mod datasets;
+/// `vectordata push` — put an already known-good dataset (or an ad-hoc
+/// directory) at a remote endpoint over the transport its `.publish_url`
+/// implies, with content checksums and a single-provenance event log.
+/// Canonical home for the `.publish_url` binding logic (`veks` depends
+/// on `vectordata`, so the binding lives here and `veks` can delegate).
+pub mod push;
 /// Interactive `vectordata explore` TUI — dataset picker, raw-values
 /// grid, REPL command engine. Migrated from `veks/src/explore` so the
 /// entire TUI lives under vectordata; veks now defers to this module

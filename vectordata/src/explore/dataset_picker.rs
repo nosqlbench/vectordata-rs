@@ -1310,6 +1310,25 @@ impl PickerAction {
     fn is_picker_local(self) -> bool {
         matches!(self, PickerAction::Describe | PickerAction::Source)
     }
+
+    /// True when this action can sensibly run against a set of
+    /// selected rows in sequence. `Visualize` is excluded because
+    /// it opens an interactive single-target viewer; `Describe` and
+    /// `Source` are picker-local overlays that only have meaning
+    /// for one row at a time. The remaining three — precache,
+    /// ping, purge — chain naturally across a batch.
+    fn batch_safe(self) -> bool {
+        matches!(self,
+            PickerAction::Precache
+            | PickerAction::Ping
+            | PickerAction::Purge)
+    }
+
+    /// Batch menu order — same precedence as `menu_order` but
+    /// filtered to actions that make sense across many rows.
+    fn batch_menu_order() -> Vec<PickerAction> {
+        Self::menu_order().iter().copied().filter(|a| a.batch_safe()).collect()
+    }
 }
 
 /// Whether the picker should continue running after an action
@@ -1345,8 +1364,14 @@ pub enum PickerOutcome {
 /// expanded set, filter, scroll, menu cursor) is preserved across
 /// dispatches because the function never exits between them.
 pub fn run_picker<F>(mut dispatch: F) -> PickerOutcome
-where F: FnMut(&str, PickerAction) -> ActionFlow,
+where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
 {
+    // Third dispatch argument is `pause_after`: when true, the runner
+    // pauses for a keypress after printing its output so the user can
+    // read it before the picker's chrome takes the screen back. The
+    // picker passes `true` for single-row dispatches and for the
+    // *last* item in a batch loop only, so a 10-row batch precache
+    // pauses once at the end instead of 10 times in a row.
     // Load catalog
     let sources = CatalogSources::new().configure_default();
     if sources.is_empty() {
@@ -1410,6 +1435,34 @@ where F: FnMut(&str, PickerAction) -> ActionFlow,
     let mut show_help = false;
     let mut show_details = false;
     let mut menu_open = false;
+    // ── Multi-select state ─────────────────────────────────────────
+    // `selected` is the persistent set of toggled row specifiers
+    // (`<dataset>:<profile>`). Space toggles the cursor row in/out.
+    //
+    // `range_anchor` is the *temporary* shift-arrow extend anchor.
+    // While Some, the rows between anchor and cursor render with the
+    // selection (REVERSED) bar drawn over the whole range, and a
+    // subsequent Space commits that range into `selected` (toggling
+    // each row's membership) and clears the anchor. Plain arrow keys
+    // clear the anchor — shift-arrow is the only way to enter range
+    // mode, so any other movement is treated as exiting it.
+    let mut selected: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    let mut range_anchor: Option<usize> = None;
+    // When the action menu opens, this flag records whether it's a
+    // single-target menu (cursor row only) or a batch menu (every
+    // member of `selected`). The two differ in their action list
+    // (batch excludes Visualize / Describe / Source) and in how
+    // Enter dispatches.
+    let mut menu_is_batch = false;
+    // Disambiguation prompt: opens when the user hits Enter with a
+    // non-empty `selected` set but the cursor row is *not* itself
+    // selected. We can't tell whether they meant "apply to the row
+    // I'm pointing at" or "apply to the N rows I previously
+    // toggled" — the prompt asks. Three options: highlighted row,
+    // batch, cancel.
+    let mut disambig_open = false;
+    let mut disambig_cursor: usize = 0;
     // Scrollable text overlay. Reused by Describe (parsed descriptor)
     // and Source (raw catalog YAML) — both populate `descriptor_lines`
     // + `descriptor_title` and flip `descriptor_open`. Lines are
@@ -1468,7 +1521,7 @@ where F: FnMut(&str, PickerAction) -> ActionFlow,
                     Constraint::Length(3),  // filter input
                     Constraint::Min(5),    // list
                     Constraint::Length(3),  // detail panel
-                    Constraint::Length(1),  // footer
+                    Constraint::Length(2),  // footer: selection summary + keybinds
                 ]).split(frame.area());
 
             // Filter input — neon "Filter:" label, cyan caret, lavender
@@ -1493,10 +1546,18 @@ where F: FnMut(&str, PickerAction) -> ActionFlow,
                 chunks[0],
             );
 
-            // Dataset list
+            // Dataset list. `list_height` is the inner height of the
+            // bordered box (frame minus top/bottom borders). Of that,
+            // one row goes to the column header — leaving
+            // `data_rows = list_height - 1` for selectable rows. The
+            // scroll calculation below must use `data_rows`, not
+            // `list_height`, otherwise the cursor can park one row
+            // below the last rendered data row and visibly land on
+            // the box's bottom border.
             let list_height = chunks[1].height.saturating_sub(2) as usize;
-            if cursor >= scroll + list_height && list_height > 0 {
-                scroll = cursor - list_height + 1;
+            let data_rows = list_height.saturating_sub(1);
+            if data_rows > 0 && cursor >= scroll + data_rows {
+                scroll = cursor - data_rows + 1;
             }
             if cursor < scroll {
                 scroll = cursor;
@@ -1507,11 +1568,17 @@ where F: FnMut(&str, PickerAction) -> ActionFlow,
                     Line::from(Span::styled(" Dataset Picker — Keyboard Shortcuts", tinted(ACCENT_CYAN))),
                     Line::from(""),
                     Line::from(" Navigation"),
-                    Line::from("   ↑ / ↓               Move selection"),
-                    Line::from("   PgUp / PgDn          Jump by page"),
-                    Line::from("   Enter / →            Expand dataset / select profile"),
-                    Line::from("   ←                    Collapse expanded dataset"),
-                    Line::from("   Tab                  Toggle: default profiles / all profiles"),
+                    Line::from("   ↑ / ↓                 Move cursor"),
+                    Line::from("   PgUp / PgDn           Jump by page"),
+                    Line::from("   Enter / →             Expand dataset / open action menu"),
+                    Line::from("   ←                     Collapse expanded dataset"),
+                    Line::from("   Tab                   Toggle: default profiles / all profiles"),
+                    Line::from(""),
+                    Line::from(" Multi-select"),
+                    Line::from("   Space                 Toggle the cursor row into / out of selection"),
+                    Line::from("   Shift+↑ / Shift+↓     Extend a temporary highlighted range"),
+                    Line::from("   Space (in range)      Toggle every row in the highlighted range"),
+                    Line::from("   Enter (with selection) Open batch action menu (Precache / Ping / Purge)"),
                     Line::from(""),
                     Line::from(" Filtering"),
                     Line::from("   type letters          Filter by name, profile, or metric"),
@@ -1527,7 +1594,7 @@ where F: FnMut(&str, PickerAction) -> ActionFlow,
                     Line::from("   Ctrl-T                Toggle colour / mono theme"),
                     Line::from(""),
                     Line::from(" Exit"),
-                    Line::from("   Esc                   Close details → collapse → clear filter → exit (one step per press)"),
+                    Line::from("   Esc                   Drop range → clear selection → close details → collapse → clear filter → exit"),
                     Line::from("   q / Ctrl-C            Quit immediately"),
                     Line::from("   ?                     Toggle this help"),
                 ];
@@ -1539,13 +1606,17 @@ where F: FnMut(&str, PickerAction) -> ActionFlow,
                 );
             } else {
 
-            // Column widths measured in DISPLAY columns. The tree prefix
-            // (" ▸ ", " ▾ ", "  └ ", "   ") is up to 4 display cols wide,
-            // so reserve 4 on top of the longest dataset name, plus 2
-            // trailing blanks so the PROFILE column has a visible gap
-            // even when the widest row fills its cell edge-to-edge.
+            // Column widths measured in DISPLAY columns. The prefix
+            // is split into independent slots so the cursor pip and
+            // the multi-select toggle marker never collide:
+            //   col 0  cursor pip ('▶' or ' ')
+            //   col 1  toggle mark ('●' or ' ')
+            //   col 2-4 tree glyph (up to 3 cols: " └ ", "▸ ", etc.)
+            // Reserve 5 cols on top of the longest dataset name plus
+            // 2 trailing blanks so the PROFILE column has a visible
+            // gap even when the widest row fills its cell edge-to-edge.
             let name_w = visible.iter()
-                .map(|r| UnicodeWidthStr::width(r.dataset.as_str()) + 4 + 2)
+                .map(|r| UnicodeWidthStr::width(r.dataset.as_str()) + 5 + 2)
                 .max()
                 .unwrap_or(20)
                 .max(12);
@@ -1579,20 +1650,38 @@ where F: FnMut(&str, PickerAction) -> ActionFlow,
                 Span::styled(pad_display("CACHED", cache_w), tinted(TEXT_MUTED)),
             ])];
 
+            // Compute the inclusive range of visible-row indices
+            // that should render with the REVERSED bar. When
+            // `range_anchor` is set, the whole anchor..=cursor span
+            // is highlighted — that's the shift-arrow "I am about
+            // to toggle these" preview. Otherwise just the cursor.
+            let (highlight_lo, highlight_hi) = match range_anchor {
+                Some(a) => (a.min(cursor), a.max(cursor)),
+                None    => (cursor, cursor),
+            };
             for (i, row) in visible.iter().enumerate().skip(scroll).take(list_height.saturating_sub(1)) {
-                let selected = i == cursor;
+                let is_cursor = i == cursor;
+                let in_range = i >= highlight_lo && i <= highlight_hi;
+                let is_toggled = selected.contains(&row.specifier());
                 // Selection is always REVERSED — independent of the
                 // colour state, so the highlight bar stays visible
                 // on terminals that mangle ANSI 24-bit colour or
-                // when the user has Ctrl-T'd colours off.
-                let style = if selected {
+                // when the user has Ctrl-T'd colours off. The
+                // REVERSED bar now covers any row in the visual
+                // range (cursor or shift-arrow extend).
+                let style = if in_range {
                     selected_style()
+                } else if is_toggled {
+                    // Persistent multi-select: tinted accent so a
+                    // toggled-but-not-current row is visible without
+                    // overwhelming the cursor's REVERSED bar.
+                    tinted(ACCENT_LAVENDR)
                 } else if row.cache_status != "—" {
                     tinted(ACCENT_MINT)
                 } else {
                     tinted(TEXT_PRIMARY)
                 };
-                let cache_style = if selected {
+                let cache_style = if in_range {
                     style
                 } else if row.cache_status != "—" {
                     tinted(ACCENT_MINT)
@@ -1600,21 +1689,23 @@ where F: FnMut(&str, PickerAction) -> ActionFlow,
                     tinted(TEXT_DIM)
                 };
 
-                // Tree indicator for collapsed/expanded datasets.
-                // The leftmost column is reserved for the selection
-                // cursor pip (`▶`) so the selected row is identifiable
-                // by *shape*, not just colour — load-bearing for
-                // terminals that mangle ANSI 24-bit colour or for the
-                // user's Ctrl-T mono mode. The original prefix used
-                // the leftmost char as padding; we replace that with
-                // the cursor marker (or space) and keep the tree
-                // glyph in the position it already occupied so column
-                // widths and indentation depth are unchanged.
+                // Row prefix layout (display columns):
+                //   col 0  cursor pip   '▶' or ' '
+                //   col 1  toggle mark  '●' or ' '
+                //   col 2+ tree glyph + dataset name
+                // Two independent marker columns so a row that's
+                // both the cursor AND toggled shows '▶●' — neither
+                // marker hides the other. In mono mode (Ctrl-T) both
+                // remain visible by shape alone; with colour, the
+                // REVERSED highlight bar layers on top of the cursor
+                // row and the lavender tint on toggled rows still
+                // distinguishes them at a glance.
                 let is_expanded = expanded.contains(&row.dataset);
                 let has_siblings = all_rows.iter().filter(|r| r.dataset == row.dataset).count() > 1;
                 let is_child = is_expanded && row.profile != "default";
 
-                let cursor_pip = if selected { '▶' } else { ' ' };
+                let cursor_pip = if is_cursor { '▶' } else { ' ' };
+                let toggle_mark = if is_toggled { '●' } else { ' ' };
                 let (tree_glyph, name_display) = if show_all_profiles {
                     ("", row.dataset.as_str())
                 } else if is_child {
@@ -1627,7 +1718,7 @@ where F: FnMut(&str, PickerAction) -> ActionFlow,
                     ("  ", row.dataset.as_str())
                 };
 
-                let name_field = format!("{cursor_pip}{tree_glyph}{name_display}");
+                let name_field = format!("{cursor_pip}{toggle_mark}{tree_glyph}{name_display}");
                 let name_cell = fit_display(&name_field, name_w);
 
                 let access_color = match row.access {
@@ -1636,7 +1727,7 @@ where F: FnMut(&str, PickerAction) -> ActionFlow,
                     AccessMode::MerkleChunked => ACCENT_LAVENDR,
                     AccessMode::FullTransfer  => ACCENT_CORAL,
                 };
-                let access_style = if selected {
+                let access_style = if in_range {
                     style
                 } else {
                     tinted(access_color)
@@ -1717,12 +1808,32 @@ where F: FnMut(&str, PickerAction) -> ActionFlow,
                 chunks[2],
             );
 
-            // Footer
+            // Footer: two lines. The first is the selection summary
+            // — always present per the multi-select UX contract, so
+            // the user can see at a glance how many rows their next
+            // batch action will hit. The second is the keybind
+            // cheat sheet. The range-mode hint only renders when
+            // shift-arrow is active, to avoid noise the rest of the
+            // time.
+            let selected_count = selected.len();
+            let range_count = range_anchor.map(|a| {
+                let lo = a.min(cursor);
+                let hi = a.max(cursor);
+                hi - lo + 1
+            });
+            let summary = match (selected_count, range_count) {
+                (0, None)        => " No rows selected — Space toggles · Shift+↑↓ extends range".to_string(),
+                (n, None)        => format!(" Selected: {n} · Space toggles cursor · Enter for batch menu"),
+                (n, Some(r))     => format!(" Selected: {n} · Range: {r} highlighted · Space toggles range"),
+            };
             let mono_hint = if theme_on { "Ctrl-T: mono" } else { "Ctrl-T: colour" };
             frame.render_widget(
-                Paragraph::new(Span::styled(
-                    format!(" ↑↓: navigate | Enter/→: expand | ←: collapse | Tab: all profiles | type to filter | Ctrl-D: details | {mono_hint} | Esc: back | q: quit"),
-                    tinted(TEXT_MUTED))),
+                Paragraph::new(vec![
+                    Line::from(Span::styled(summary, tinted(ACCENT_CYAN))),
+                    Line::from(Span::styled(
+                        format!(" ↑↓: navigate | Shift+↑↓: range | Space: toggle | Enter/→: expand | ←: collapse | Tab: all profiles | Ctrl-D: details | {mono_hint} | Esc: back | q: quit"),
+                        tinted(TEXT_MUTED))),
+                ]),
                 chunks[3],
             );
 
@@ -1805,52 +1916,113 @@ where F: FnMut(&str, PickerAction) -> ActionFlow,
                 );
             }
 
+            // Disambiguation prompt: cursor row is outside the toggled
+            // selection, so we ask which target the user meant. Three
+            // options live in the popup: highlighted row, batch over
+            // the toggled set, cancel.
+            if disambig_open {
+                let cursor_spec = visible.get(cursor)
+                    .map(|r| r.specifier())
+                    .unwrap_or_else(|| "(no row)".to_string());
+                let options: [String; 3] = [
+                    format!("Apply action to highlighted row ({cursor_spec})"),
+                    format!("Apply action to {} selected row(s)", selected.len()),
+                    "Cancel".to_string(),
+                ];
+                if disambig_cursor >= options.len() { disambig_cursor = 0; }
+                let outer = frame.area();
+                let popup_h: u16 = (options.len() as u16) + 4;
+                let popup_w: u16 = 70;
+                let area = ratatui::layout::Rect {
+                    x: outer.x + outer.width.saturating_sub(popup_w) / 2,
+                    y: outer.y + outer.height.saturating_sub(popup_h) / 2,
+                    width: popup_w.min(outer.width),
+                    height: popup_h.min(outer.height),
+                };
+                let mut lines: Vec<Line<'static>> = Vec::new();
+                for (i, opt) in options.iter().enumerate() {
+                    let marker = if i == disambig_cursor { " ▸ " } else { "   " };
+                    let style = if i == disambig_cursor {
+                        selected_style()
+                    } else {
+                        tinted(TEXT_PRIMARY)
+                    };
+                    lines.push(Line::from(Span::styled(
+                        format!("{marker}{opt}"),
+                        style,
+                    )));
+                }
+                lines.push(Line::from(""));
+                frame.render_widget(ratatui::widgets::Clear, area);
+                frame.render_widget(
+                    Paragraph::new(lines)
+                        .block(Block::default().borders(Borders::ALL)
+                            .border_style(bordered(ACCENT_LAVENDR))
+                            .title(Span::styled(
+                                " Which target? (↑↓ · Enter · Esc) ",
+                                tinted(ACCENT_LAVENDR),
+                            ))),
+                    area,
+                );
+            }
+
             // Action menu (opens on Enter against a leaf row). Drawn
             // last so it lands on top of any other overlay. Selection
             // cursor `▸` doubles the colour-based reverse-video so it
             // is unambiguous in mono mode too.
             if menu_open {
-                if let Some(row) = visible.get(cursor) {
-                    let outer = frame.area();
-                    let menu_h: u16 = (PickerAction::menu_order().len() as u16) + 5;
-                    let menu_w: u16 = 60;
-                    let area = ratatui::layout::Rect {
-                        x: outer.x + outer.width.saturating_sub(menu_w) / 2,
-                        y: outer.y + outer.height.saturating_sub(menu_h) / 2,
-                        width: menu_w.min(outer.width),
-                        height: menu_h.min(outer.height),
+                let actions: Vec<PickerAction> = if menu_is_batch {
+                    PickerAction::batch_menu_order()
+                } else {
+                    PickerAction::menu_order().to_vec()
+                };
+                if menu_cursor >= actions.len() { menu_cursor = 0; }
+                // Single-target: title shows the cursor's row. Batch:
+                // title shows the selection count instead.
+                let title_text = if menu_is_batch {
+                    format!(" Batch action — {} row(s) selected (Enter to confirm · Esc to cancel) ",
+                        selected.len())
+                } else if let Some(row) = visible.get(cursor) {
+                    format!(" Action — {}:{} (Enter to confirm · Esc to cancel) ",
+                        row.dataset, row.profile)
+                } else {
+                    " Action ".to_string()
+                };
+                let outer = frame.area();
+                let menu_h: u16 = (actions.len() as u16) + 5;
+                let menu_w: u16 = 64;
+                let area = ratatui::layout::Rect {
+                    x: outer.x + outer.width.saturating_sub(menu_w) / 2,
+                    y: outer.y + outer.height.saturating_sub(menu_h) / 2,
+                    width: menu_w.min(outer.width),
+                    height: menu_h.min(outer.height),
+                };
+                let mut lines: Vec<Line<'static>> = Vec::new();
+                for (i, action) in actions.iter().enumerate() {
+                    let marker = if i == menu_cursor { " ▸ " } else { "   " };
+                    let style = if i == menu_cursor {
+                        selected_style()
+                    } else {
+                        tinted(TEXT_PRIMARY)
                     };
-                    let actions = PickerAction::menu_order();
-                    let mut lines: Vec<Line<'static>> = Vec::new();
-                    for (i, action) in actions.iter().enumerate() {
-                        let marker = if i == menu_cursor { " ▸ " } else { "   " };
-                        let style = if i == menu_cursor {
-                            selected_style()
-                        } else {
-                            tinted(TEXT_PRIMARY)
-                        };
-                        lines.push(Line::from(Span::styled(
-                            format!("{marker}{}", action.label()),
-                            style,
-                        )));
-                    }
-                    lines.push(Line::from(""));
                     lines.push(Line::from(Span::styled(
-                        format!(" {}", actions[menu_cursor].description()),
-                        tinted(TEXT_MUTED),
+                        format!("{marker}{}", action.label()),
+                        style,
                     )));
-                    frame.render_widget(ratatui::widgets::Clear, area);
-                    frame.render_widget(
-                        Paragraph::new(lines)
-                            .block(Block::default().borders(Borders::ALL)
-                                .border_style(bordered(ACCENT_CYAN))
-                                .title(Span::styled(
-                                    format!(" Action — {}:{} (Enter to confirm · Esc to cancel) ", row.dataset, row.profile),
-                                    tinted(ACCENT_CYAN),
-                                ))),
-                        area,
-                    );
                 }
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    format!(" {}", actions[menu_cursor].description()),
+                    tinted(TEXT_MUTED),
+                )));
+                frame.render_widget(ratatui::widgets::Clear, area);
+                frame.render_widget(
+                    Paragraph::new(lines)
+                        .block(Block::default().borders(Borders::ALL)
+                            .border_style(bordered(ACCENT_CYAN))
+                            .title(Span::styled(title_text, tinted(ACCENT_CYAN)))),
+                    area,
+                );
             }
         });
         if let Err(e) = drew {
@@ -1920,6 +2092,50 @@ where F: FnMut(&str, PickerAction) -> ActionFlow,
                     continue;
                 }
 
+                // Disambiguation prompt is modal — three-way choice
+                // between "highlighted row", "batch over selected",
+                // and "cancel". Confirmation routes to the appropriate
+                // action menu shape.
+                if disambig_open {
+                    match key.code {
+                        KeyCode::Esc => {
+                            disambig_open = false;
+                        }
+                        KeyCode::Up => {
+                            if disambig_cursor > 0 { disambig_cursor -= 1; }
+                        }
+                        KeyCode::Down => {
+                            if disambig_cursor + 1 < 3 { disambig_cursor += 1; }
+                        }
+                        KeyCode::Enter => {
+                            match disambig_cursor {
+                                0 => {
+                                    // Highlighted row → single-target
+                                    // action menu against the cursor.
+                                    disambig_open = false;
+                                    menu_open = true;
+                                    menu_is_batch = false;
+                                    menu_cursor = 0;
+                                }
+                                1 => {
+                                    // Batch → menu over `selected`.
+                                    disambig_open = false;
+                                    menu_open = true;
+                                    menu_is_batch = true;
+                                    menu_cursor = 0;
+                                }
+                                _ => {
+                                    // Cancel — close the prompt and
+                                    // leave the selection intact.
+                                    disambig_open = false;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+
                 // Action menu is modal — when open, swallow everything
                 // but the menu's own navigation/select/cancel keys so
                 // the underlying list doesn't drift.
@@ -1930,7 +2146,12 @@ where F: FnMut(&str, PickerAction) -> ActionFlow,
                             if menu_cursor > 0 { menu_cursor -= 1; }
                         }
                         KeyCode::Down => {
-                            if menu_cursor + 1 < PickerAction::menu_order().len() {
+                            let menu_len = if menu_is_batch {
+                                PickerAction::batch_menu_order().len()
+                            } else {
+                                PickerAction::menu_order().len()
+                            };
+                            if menu_cursor + 1 < menu_len {
                                 menu_cursor += 1;
                             }
                         }
@@ -1939,6 +2160,51 @@ where F: FnMut(&str, PickerAction) -> ActionFlow,
                                 .filter(|r| show_all_profiles || r.profile == "default" || expanded.contains(&r.dataset))
                                 .filter(|r| matches_filter(r, &filter))
                                 .collect();
+                            // Batch path: loop the chosen action
+                            // over every specifier in the persistent
+                            // `selected` set, in sorted order so
+                            // re-runs are deterministic. Picker-local
+                            // actions don't make batch sense (the
+                            // overlay is single-target) — they were
+                            // excluded from `batch_menu_order` so
+                            // there's no need to special-case here.
+                            if menu_is_batch {
+                                let actions = PickerAction::batch_menu_order();
+                                if menu_cursor >= actions.len() { menu_cursor = 0; }
+                                let action = actions[menu_cursor];
+                                let mut specs: Vec<String> = selected.iter().cloned().collect();
+                                specs.sort();
+                                menu_open = false;
+                                let _ = disable_raw_mode();
+                                let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
+                                let mut exit_after = false;
+                                for (idx, spec) in specs.iter().enumerate() {
+                                    eprintln!("── [{}/{}] {} {} ──",
+                                        idx + 1, specs.len(), action.label(), spec);
+                                    // Pause only after the LAST item.
+                                    // Intermediate items chain through
+                                    // so the user reads the whole batch
+                                    // output once and presses Enter once.
+                                    let is_last = idx + 1 == specs.len();
+                                    let flow = dispatch(spec, action, is_last);
+                                    if matches!(flow, ActionFlow::Exit) { exit_after = true; break; }
+                                }
+                                let _ = execute!(std::io::stdout(), EnterAlternateScreen);
+                                let _ = enable_raw_mode();
+                                let _ = terminal.clear();
+                                if exit_after {
+                                    result = PickerOutcome::Done;
+                                    break;
+                                }
+                                // Cache survey reflects every change
+                                // the batch made.
+                                cache_survey = survey_cache_state(&cache_dir);
+                                all_rows = build_rows(entries, &cache_survey);
+                                // Selection stays toggled — user can
+                                // chain another batch action without
+                                // re-selecting. Press Esc to clear.
+                                continue;
+                            }
                             if let Some(row) = vis.get(cursor) {
                                 let action = PickerAction::menu_order()[menu_cursor];
                                 let specifier = row.specifier();
@@ -1986,7 +2252,9 @@ where F: FnMut(&str, PickerAction) -> ActionFlow,
                                 // we never exit run_picker.
                                 let _ = disable_raw_mode();
                                 let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
-                                let flow = dispatch(&specifier, action);
+                                // Single-target dispatch — always pause
+                                // after so the user sees the output.
+                                let flow = dispatch(&specifier, action, true);
                                 let _ = execute!(std::io::stdout(), EnterAlternateScreen);
                                 let _ = enable_raw_mode();
                                 let _ = terminal.clear();
@@ -2038,7 +2306,14 @@ where F: FnMut(&str, PickerAction) -> ActionFlow,
                         // is "in the way" of leaving the picker gets
                         // peeled off first. No double-tap; the user can
                         // just keep tapping Esc until they're out.
-                        if show_details {
+                        // Order matters — multi-select state peels off
+                        // first (most ephemeral), then UI overlays,
+                        // then list shape, then filter, then exit.
+                        if range_anchor.is_some() {
+                            range_anchor = None;
+                        } else if !selected.is_empty() {
+                            selected.clear();
+                        } else if show_details {
                             show_details = false;
                         } else if !expanded.is_empty() && !show_all_profiles {
                             expanded.clear();
@@ -2056,19 +2331,34 @@ where F: FnMut(&str, PickerAction) -> ActionFlow,
                             .filter(|r| show_all_profiles || r.profile == "default" || expanded.contains(&r.dataset))
                             .filter(|r| matches_filter(r, &filter))
                             .collect();
-                        if let Some(row) = vis.get(cursor) {
-                            // If in collapsed mode and this dataset has multiple profiles, expand it
-                            let profile_count = all_rows.iter()
-                                .filter(|r| r.dataset == row.dataset)
-                                .count();
-                            if !show_all_profiles && !expanded.contains(&row.dataset) && profile_count > 1 {
-                                expanded.insert(row.dataset.clone());
-                            } else {
-                                // Leaf row — open the action menu rather
-                                // than launching the explorer directly.
-                                menu_open = true;
-                                menu_cursor = 0;
+                        let cursor_in_selection = vis.get(cursor)
+                            .map(|r| selected.contains(&r.specifier()))
+                            .unwrap_or(false);
+                        // Decision tree:
+                        //   selected empty                 → single-target menu (cursor row)
+                        //   selected non-empty + cursor in it → batch menu directly
+                        //   selected non-empty + cursor outside → disambig prompt
+                        //     (the user might mean either; ask explicitly)
+                        if selected.is_empty() {
+                            if let Some(row) = vis.get(cursor) {
+                                let profile_count = all_rows.iter()
+                                    .filter(|r| r.dataset == row.dataset)
+                                    .count();
+                                if !show_all_profiles && !expanded.contains(&row.dataset) && profile_count > 1 {
+                                    expanded.insert(row.dataset.clone());
+                                } else {
+                                    menu_open = true;
+                                    menu_is_batch = false;
+                                    menu_cursor = 0;
+                                }
                             }
+                        } else if cursor_in_selection {
+                            menu_open = true;
+                            menu_is_batch = true;
+                            menu_cursor = 0;
+                        } else {
+                            disambig_open = true;
+                            disambig_cursor = 0;
                         }
                     }
                     KeyCode::Left => {
@@ -2101,15 +2391,65 @@ where F: FnMut(&str, PickerAction) -> ActionFlow,
                         }
                     }
                     KeyCode::Up => {
+                        // Shift+↑ enters range mode (or extends it):
+                        // capture the anchor on first press, then let
+                        // the cursor move freely while keeping the
+                        // REVERSED bar drawn over the whole span.
+                        // Plain ↑ leaves range mode if it was active.
+                        if key.modifiers.contains(KeyModifiers::SHIFT) {
+                            if range_anchor.is_none() { range_anchor = Some(cursor); }
+                        } else {
+                            range_anchor = None;
+                        }
                         cursor = cursor.saturating_sub(1);
                     }
                     KeyCode::Down => {
+                        if key.modifiers.contains(KeyModifiers::SHIFT) {
+                            if range_anchor.is_none() { range_anchor = Some(cursor); }
+                        } else {
+                            range_anchor = None;
+                        }
                         let visible_count = all_rows.iter()
                             .filter(|r| show_all_profiles || r.profile == "default" || expanded.contains(&r.dataset))
                             .filter(|r| matches_filter(r, &filter))
                             .count();
                         if cursor + 1 < visible_count {
                             cursor += 1;
+                        }
+                    }
+                    KeyCode::Char(' ') => {
+                        // Toggle persistent multi-select membership.
+                        // Range-mode behaviour: toggle every row in
+                        // anchor..=cursor (commits the shift-arrow
+                        // preview into the actual selected set) and
+                        // exits range mode. Otherwise toggle just the
+                        // cursor row.
+                        let vis: Vec<&PickerRow> = all_rows.iter()
+                            .filter(|r| show_all_profiles || r.profile == "default" || expanded.contains(&r.dataset))
+                            .filter(|r| matches_filter(r, &filter))
+                            .collect();
+                        match range_anchor {
+                            Some(a) => {
+                                let lo = a.min(cursor);
+                                let hi = a.max(cursor);
+                                for i in lo..=hi {
+                                    if let Some(row) = vis.get(i) {
+                                        let spec = row.specifier();
+                                        if !selected.remove(&spec) {
+                                            selected.insert(spec);
+                                        }
+                                    }
+                                }
+                                range_anchor = None;
+                            }
+                            None => {
+                                if let Some(row) = vis.get(cursor) {
+                                    let spec = row.specifier();
+                                    if !selected.remove(&spec) {
+                                        selected.insert(spec);
+                                    }
+                                }
+                            }
                         }
                     }
                     KeyCode::PageUp => {

@@ -244,6 +244,13 @@ pub fn run_cache_status(
     if let Some(entry) = entry {
         println!();
         println!("  Profiles:");
+        // Memoize `.mrkl` reads, keeping the full `MerkleState` so
+        // window-bounded chunk accounting can consult the per-chunk
+        // validity bitmap. Sized profiles share `base_vectors`'s
+        // `.mrkl` — without memoisation a 134 MiB sidecar gets
+        // re-parsed once per profile (~25× for `ibm-datapile-1b`).
+        let mut mrkl_cache: std::collections::HashMap<std::path::PathBuf, Option<MerkleState>> =
+            std::collections::HashMap::new();
         for pname in entry.profile_names() {
             if let Some(profile) = entry.layout.profiles.profile(pname) {
                 let mut pv = 0u32;
@@ -255,10 +262,12 @@ pub fn run_cache_status(
                         &source[..b]
                     } else { source.as_str() };
                     let mrkl = ds_cache.join(format!("{}.mrkl", clean));
-                    if let Ok(state) = MerkleState::load(&mrkl) {
-                        pv += state.valid_count();
-                        pt += state.shape().total_chunks;
-                    }
+                    let state_opt = mrkl_cache.entry(mrkl.clone())
+                        .or_insert_with(|| MerkleState::load(&mrkl).ok());
+                    let Some(state) = state_opt.as_ref() else { continue; };
+                    let (v, t) = facet_chunk_coverage(state, view, source, clean, &ds_cache);
+                    pv += v;
+                    pt += t;
                 }
                 if pt > 0 {
                     let ppct = 100.0 * pv as f64 / pt as f64;
@@ -271,6 +280,79 @@ pub fn run_cache_status(
             }
         }
     }
+}
+
+/// Compute `(valid_chunks, total_chunks)` for a single facet of a
+/// profile. When the view declares a window — either as the
+/// `[start..end)` suffix on the source path or as the explicit
+/// `view.window` / `view.source.window` field surfaced by
+/// `effective_window` — and the format is uniform-stride xvec,
+/// counting is restricted to the chunks covering the window's byte
+/// range. Without this every sized profile sharing a `.mrkl` reports
+/// the whole file's chunk count, which is what made
+/// `ibm-datapile-1b:100k` show `(1415347/1415355 chunks)` instead of
+/// the few-hundred chunks the 100K window actually needs.
+///
+/// Falls back to whole-file counts when:
+///   - the view carries no window;
+///   - the format isn't xvec (vvec / parquet need a record→byte map
+///     we don't have at this layer);
+///   - the cache file's chunk 0 is missing so the xvec dim header
+///     reads as zeros.
+fn facet_chunk_coverage(
+    state: &crate::merkle::MerkleState,
+    view: &crate::dataset::profile::DSView,
+    source: &str,
+    clean: &str,
+    ds_cache: &Path,
+) -> (u32, u32) {
+    let shape = state.shape();
+    let whole = || (state.valid_count(), shape.total_chunks);
+
+    let window = view.effective_window().0.first()
+        .map(|iv| (iv.min_incl, iv.max_excl))
+        .or_else(|| {
+            let parsed = crate::dataset::source::parse_source_string(source).ok()?;
+            let iv = parsed.window.0.first()?;
+            Some((iv.min_incl, iv.max_excl))
+        });
+    let Some((win_start, win_end)) = window else { return whole(); };
+    if win_end <= win_start { return whole(); }
+
+    let ext = clean.rsplit('.').next().unwrap_or("");
+    let elem_size = crate::io::infer_elem_size(ext);
+    if elem_size == 0 || crate::io::is_vvec_ext(ext) { return whole(); }
+
+    let cache_file = ds_cache.join(clean);
+    let Some(bpr) = read_xvec_bpr(&cache_file, elem_size) else { return whole(); };
+
+    let byte_start = win_start.saturating_mul(bpr);
+    let byte_end = win_end.saturating_mul(bpr).min(shape.total_content_size);
+    if shape.chunk_size == 0 || byte_start >= byte_end { return (0, 0); }
+    let first = (byte_start / shape.chunk_size) as u32;
+    let last_inclusive = ((byte_end - 1) / shape.chunk_size) as u32;
+    let last_inclusive = last_inclusive.min(shape.total_chunks.saturating_sub(1));
+    if first > last_inclusive { return (0, 0); }
+    let total_in_window = last_inclusive - first + 1;
+    let mut valid = 0u32;
+    for i in first..=last_inclusive {
+        if state.is_valid(i) { valid += 1; }
+    }
+    (valid, total_in_window)
+}
+
+/// Read the 4-byte xvec dim header at byte 0 of a cache file and
+/// derive bytes-per-record (`4 + dim * elem_size`). Returns `None`
+/// when chunk 0 isn't downloaded (sparse hole reads as zeros →
+/// dim = 0 → bounds reject) or the file can't be opened.
+fn read_xvec_bpr(cache_file: &Path, elem_size: usize) -> Option<u64> {
+    use std::io::Read;
+    let mut buf = [0u8; 4];
+    let mut f = std::fs::File::open(cache_file).ok()?;
+    f.read_exact(&mut buf).ok()?;
+    let dim = i32::from_le_bytes(buf);
+    if dim <= 0 || dim > 1_000_000 { return None; }
+    Some(4 + (dim as u64) * (elem_size as u64))
 }
 
 /// Rows: (path, valid_chunks, total_chunks, cached_bytes, content_bytes, complete, rle_string)

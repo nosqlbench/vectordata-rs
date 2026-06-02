@@ -136,24 +136,27 @@ pub fn run(args: ExploreArgs) -> i32 {
     // inline. Visualize → Quit exits the picker too; Visualize → Back
     // keeps the picker open. precache/purge/ping always return to the
     // picker so the user can chain operations.
-    let dispatch = |specifier: &str, action: PickerAction| -> ActionFlow {
+    let dispatch = |specifier: &str, action: PickerAction, pause: bool| -> ActionFlow {
         match action {
             PickerAction::Visualize => {
+                // Interactive viewer — `pause` is irrelevant; the
+                // viewer owns the terminal until the user exits it.
+                let _ = pause;
                 match unified::run_interactive_explore(specifier, sample, seed, sample_mode) {
                     unified::ExploreExit::Quit => ActionFlow::Exit,
                     unified::ExploreExit::Back => ActionFlow::Stay,
                 }
             }
             PickerAction::Precache => {
-                run_precache_then_pause(specifier);
+                run_precache(specifier, pause);
                 ActionFlow::Stay
             }
             PickerAction::Purge => {
-                run_purge_then_pause(specifier);
+                run_purge(specifier, pause);
                 ActionFlow::Stay
             }
             PickerAction::Ping => {
-                run_ping_then_pause(specifier);
+                run_ping(specifier, pause);
                 ActionFlow::Stay
             }
             PickerAction::Describe | PickerAction::Source => {
@@ -161,6 +164,7 @@ pub fn run(args: ExploreArgs) -> i32 {
                 // directly via `is_picker_local()` and never reaches
                 // dispatch. These arms are unreachable in practice
                 // but the match needs to be exhaustive.
+                let _ = pause;
                 ActionFlow::Stay
             }
         }
@@ -188,7 +192,7 @@ fn pause_for_keypress() {
     let _ = std::io::stdin().read_line(&mut buf);
 }
 
-fn run_precache_then_pause(specifier: &str) {
+fn run_precache(specifier: &str, pause: bool) {
     // Picker-initiated precache drives the *highlighted profile only*.
     // Earlier this stripped the `:profile` suffix and walked every
     // profile via `ProfileSelection::AllProfiles`, but for datasets
@@ -218,10 +222,10 @@ fn run_precache_then_pause(specifier: &str) {
     if code != 0 {
         eprintln!("(precache exited with status {code})");
     }
-    pause_for_keypress();
+    if pause { pause_for_keypress(); }
 }
 
-fn run_purge_then_pause(specifier: &str) {
+fn run_purge(specifier: &str, pause: bool) {
     let (dataset, _profile) = split_specifier(specifier);
     // Purge is per-dataset: every cache leaf whose origin URL belongs
     // to ANY facet of ANY profile is removed. The profile component of
@@ -235,7 +239,7 @@ fn run_purge_then_pause(specifier: &str) {
         Some(e) => e.clone(),
         None => {
             eprintln!("error: dataset '{dataset}' not found in any configured catalog");
-            pause_for_keypress();
+            if pause { pause_for_keypress(); }
             return;
         }
     };
@@ -255,7 +259,7 @@ fn run_purge_then_pause(specifier: &str) {
             println!("  - {}", path.display());
         }
     }
-    pause_for_keypress();
+    if pause { pause_for_keypress(); }
 }
 
 fn format_bytes_short(n: u64) -> String {
@@ -268,7 +272,7 @@ fn format_bytes_short(n: u64) -> String {
     else { format!("{n} B") }
 }
 
-fn run_ping_then_pause(specifier: &str) {
+fn run_ping(specifier: &str, pause: bool) {
     let (dataset, profile) = split_specifier(specifier);
     // Use the same union catalog the picker built its row list from
     // so a ping from inside the picker hits exactly the catalogs the
@@ -279,7 +283,7 @@ fn run_ping_then_pause(specifier: &str) {
     if code != 0 {
         eprintln!("(ping exited with status {code})");
     }
-    pause_for_keypress();
+    if pause { pause_for_keypress(); }
 }
 
 // `run_pipeline_command` lived here as `#[allow(dead_code)]`

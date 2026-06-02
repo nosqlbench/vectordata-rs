@@ -264,6 +264,17 @@ enum DatasetsCmd {
         #[arg(long = "at")]
         at: Vec<String>,
     },
+    /// Push an already known-good dataset (or, with `--raw`, an ad-hoc
+    /// directory) up to the remote its `.publish_url` names.
+    ///
+    /// Unlike `veks publish` (which builds + checks + syncs a whole
+    /// publish root), `push` only moves bytes for one already-good
+    /// source: it confirms the dataset, generates per-directory
+    /// `SHA256SUMS`, refuses to clobber remote data without an audit
+    /// message, and brackets the upload with `begin`/`complete` events
+    /// in a single-provenance `pushlog.jsonl`. The transport is chosen
+    /// from the URL scheme (`s3://`, `https://`, `file://`).
+    Push(vectordata::push::PushArgs),
     /// Download and cache every facet of a dataset profile into the
     /// configured cache directory. Renders a live per-facet +
     /// aggregate progress meter on stderr.
@@ -370,6 +381,8 @@ fn main() {
                     vectordata::datasets::describe::run_args(args, &configdir, &catalog, &[]),
                 DatasetsCmd::Curlify(args) =>
                     vectordata::datasets::curlify::run_args(args),
+                DatasetsCmd::Push(args) =>
+                    vectordata::push::run(args),
                 DatasetsCmd::Derive {
                     dataset, profile, output, name, force, configdir, catalog, at,
                 } => vectordata::datasets::derive::run(
