@@ -2235,7 +2235,10 @@ sweep.
     fn project_artifacts(&self, step_id: &str, options: &Options) -> ArtifactManifest {
         crate::pipeline::command::manifest_from_keys(
             step_id, self.command_path(), options,
-            &["source", "predicates"],
+            // `survey` is an optional input the command reads (the upstream
+            // metadata survey JSON, wired in by `prepare/import`); list it
+            // when present so artifact projection is complete.
+            &["source", "predicates", "survey"],
             &["output"],
         )
     }

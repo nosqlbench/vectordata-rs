@@ -1997,16 +1997,20 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
                     e_after.push(meta.predicate_indices.step_id().into());
                 }
             }
+            // G (ground-truth) and D (ground-truth-distances) are resolved
+            // by the command from the profile's facets — the correct
+            // per-profile path with `.ivecs`/`.ivec` tolerance — so they
+            // are deliberately NOT hardcoded here. (A prior hardcoded
+            // `neighbor_indices.ivec` pointed at the workspace root with
+            // the wrong extension; see
+            // docs/analysis/e2e-partition-profiles-failure.md.)
             let mut e_opts: Vec<(String, String)> = vec![
-                ("ground-truth".into(), "neighbor_indices.ivec".into()),
                 ("metadata-indices".into(), slots.metadata.as_ref().unwrap().predicate_indices.path().into()),
                 ("indices".into(), "postfiltered_neighbor_indices.ivec".into()),
             ];
-            // Only forward D when it's actually present on disk —
-            // skipping it means the producer omits E's distances file
-            // rather than failing the run.
+            // Only forward the distances *output* when G's distances exist
+            // — the command then resolves the D input facet to fill it.
             if slots.knn.as_ref().is_some_and(|k| k.is_materialized()) {
-                e_opts.push(("ground-truth-distances".into(), "neighbor_distances.fvec".into()));
                 e_opts.push(("distances".into(), "postfiltered_neighbor_distances.fvec".into()));
             }
             steps.push(Step {

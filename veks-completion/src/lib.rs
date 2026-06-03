@@ -2289,19 +2289,34 @@ pub fn print_partial_parse_for_diagnostics(pp: &PartialParse) {
 /// below the prompt, prefixes every help line with `# ` so it reads
 /// as a comment, and ends with a one-line ctrl-l hint reminding the
 /// user how to clear it and restore the command-line view.
-fn emit_value_position_help(
+fn emit_value_position_help(tree: &CommandTree, node: &Node, prev_word: &str, tap_count: u32) {
+    if let Some(text) = value_position_help(tree, node, prev_word, tap_count) {
+        eprint!("{text}");
+    }
+}
+
+/// The value-position help annotation for a given tap count, or `None`
+/// when nothing should be shown — the pure decision+formatting that
+/// [`emit_value_position_help`] prints to stderr. Split out so the tier
+/// table can be unit-tested deterministically (the wall-clock tap-count
+/// derivation is covered separately by [`next_tap_state`]).
+///
+/// The returned block leads with a blank line so it drops below the
+/// prompt, prefixes every line with `# ` so it reads as a comment, and
+/// ends with the ctrl-l clear hint.
+fn value_position_help(
     tree: &CommandTree,
     node: &Node,
     prev_word: &str,
     tap_count: u32,
-) {
+) -> Option<String> {
     let (label, body): (&str, &str) = match tap_count {
         2 => match node
             .flag_help_for(prev_word)
             .or_else(|| tree.global_flag_help_for(prev_word))
         {
             Some(h) => ("help", h),
-            None => return,
+            None => return None,
         },
         3 => {
             let extended = node
@@ -2314,23 +2329,25 @@ fn emit_value_position_help(
                     .or_else(|| tree.global_flag_help_for(prev_word))
                 {
                     Some(h) => ("help", h),
-                    None => return,
+                    None => return None,
                 },
             }
         }
-        _ => return,
+        _ => return None,
     };
-    eprintln!();
-    eprintln!("# {prev_word} ({label}):");
+    let mut out = String::new();
+    out.push('\n');
+    out.push_str(&format!("# {prev_word} ({label}):\n"));
     for line in body.lines() {
         if line.is_empty() {
-            eprintln!("#");
+            out.push_str("#\n");
         } else {
-            eprintln!("# {line}");
+            out.push_str(&format!("# {line}\n"));
         }
     }
-    eprintln!("#");
-    eprintln!("# use ctrl-l to clear help and restore the command line view");
+    out.push_str("#\n");
+    out.push_str("# use ctrl-l to clear help and restore the command line view\n");
+    Some(out)
 }
 
 fn dump_tree(node: &Node, path: &mut Vec<String>) {
@@ -3357,6 +3374,50 @@ mod tests {
         assert_eq!(tap1, 1, "first tap is always 1");
         let (tap2, _st2) = next_tap_state(Some((st1, key)), 1_100, key, max_level);
         assert_eq!(tap2, 2, "rapid second tap must reach 2 at a value position");
+    }
+
+    /// The value-position help *tier table* — deterministic, no clock,
+    /// no subprocess. Replaces the wall-clock double/triple-tap E2E
+    /// tests (which raced two real process spawns against a 200ms
+    /// window): the tap-count derivation is covered by `next_tap_state`
+    /// above, and this covers what each tap count emits.
+    #[test]
+    fn value_position_help_tier_table() {
+        let leaf = Node::leaf_with_flags(&["--top-k"], &[])
+            .with_flag_help("--top-k", "HeavyHitters top-K capacity")
+            .with_flag_long_help("--top-k", "Misra-Gries detail body\n\nsecond paragraph");
+        let tree = CommandTree::new("nbrs").command("run", leaf.clone());
+
+        // tap 1: candidates only — no help.
+        assert!(value_position_help(&tree, &leaf, "--top-k", 1).is_none());
+
+        // tap 2: short help, comment-prefixed, leading blank line + ctrl-l hint.
+        let s2 = value_position_help(&tree, &leaf, "--top-k", 2).expect("short help at tap 2");
+        assert!(s2.starts_with("\n# "), "leads with newline + '# ': {s2:?}");
+        assert!(s2.contains("--top-k (help):"));
+        assert!(s2.contains("HeavyHitters top-K capacity"));
+        assert!(s2.contains("use ctrl-l to clear help"));
+
+        // tap 3: extended help, labelled (detail).
+        let s3 = value_position_help(&tree, &leaf, "--top-k", 3).expect("extended help at tap 3");
+        assert!(s3.contains("--top-k (detail):"));
+        assert!(s3.contains("Misra-Gries detail body"));
+        // empty body lines render as a bare '#'.
+        assert!(s3.contains("\n#\n"));
+
+        // tap >= 4: past the rotation — nothing again.
+        assert!(value_position_help(&tree, &leaf, "--top-k", 4).is_none());
+
+        // tap 3 with no extended help falls back to the short help.
+        let short_only = Node::leaf_with_flags(&["--x"], &[]).with_flag_help("--x", "short only");
+        let t2 = CommandTree::new("a").command("b", short_only.clone());
+        let s = value_position_help(&t2, &short_only, "--x", 3).expect("fallback to short");
+        assert!(s.contains("--x (help):") && s.contains("short only"));
+
+        // A flag with no help at all emits nothing, even at tap 2.
+        let no_help = Node::leaf_with_flags(&["--bare"], &[]);
+        let t3 = CommandTree::new("a").command("b", no_help.clone());
+        assert!(value_position_help(&t3, &no_help, "--bare", 2).is_none());
     }
 
     /// Flag help registered on a leaf is recoverable via the public

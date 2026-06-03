@@ -161,7 +161,10 @@ impl StandardFacet {
             "distances" => Some(Self::NeighborDistances),
             "content" | "meta_content" | "meta_base" => Some(Self::MetadataContent),
             "meta_predicates" => Some(Self::MetadataPredicates),
-            "meta_results" | "predicate_results" => Some(Self::MetadataResults),
+            // `metadata_indices` is the legacy on-disk/key name for the
+            // predicate-match index (the R facet); accept it as an alias so
+            // extant datasets resolve under canonical `metadata_results`.
+            "meta_results" | "predicate_results" | "metadata_indices" => Some(Self::MetadataResults),
             "layout" | "meta_layout" => Some(Self::MetadataLayout),
             "prefiltered_indices" | "prefiltered_gt" | "prefiltered_ground_truth"
                 | "prefilter_indices" => Some(Self::PrefilteredNeighborIndices),

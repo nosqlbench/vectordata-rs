@@ -80,11 +80,33 @@ fn lookup_facet(
     let profile_name = options.get("profile").unwrap_or("default");
     let profile = cfg.profiles.profile(profile_name)?;
     let canonical = resolve_standard_key(facet_alias)?;
-    let view = profile.view(&canonical)?;
-    let raw = view.path();
-    let p = Path::new(raw);
+    // Resolve the declared view: prefer a view keyed by the canonical
+    // name, but also accept one whose (possibly legacy/alias) key
+    // normalizes to the same canonical facet — e.g. a `metadata_indices`
+    // view satisfies a `metadata_results` lookup. A facet is identified by
+    // its canonical identity, not by a single literal key.
+    let raw = profile
+        .view(&canonical)
+        .map(|v| v.path().to_string())
+        .or_else(|| {
+            profile
+                .views()
+                .find(|(k, _)| resolve_standard_key(k).as_deref() == Some(canonical.as_str()))
+                .map(|(_, v)| v.path().to_string())
+        })?;
+    // A view path may address a slab namespace (`file#namespace`); resolve
+    // the file part against the dataset root and preserve the namespace.
+    let (file_part, ns_part) = match raw.split_once('#') {
+        Some((f, n)) => (f, Some(n)),
+        None => (raw.as_str(), None),
+    };
+    let p = Path::new(file_part);
     let resolved = if p.is_absolute() { p.to_path_buf() } else { dataset_root.join(p) };
-    Some(resolved.to_string_lossy().into_owned())
+    let resolved = resolved.to_string_lossy().into_owned();
+    Some(match ns_part {
+        Some(ns) => format!("{resolved}#{ns}"),
+        None => resolved,
+    })
 }
 
 /// Resolve `--neighbors` (k), falling back to the active profile's
@@ -215,7 +237,10 @@ impl VerifyKind {
                 ("query", "query_vectors"),
             ],
             // E (postfilter) is derived from G + R alone; no base/query
-            // anchor needed.
+            // anchor needed. The R input is the per-query predicate-match
+            // index — the `metadata_results` facet (its on-disk file is
+            // named `metadata_results.{ivvecs,slab,…}`, or `metadata_indices.*`
+            // on legacy datasets; `canonical_basenames_for` resolves both).
             Self::PostfilteredKnnConsolidated => &[
                 ("ground-truth", "neighbor_indices"),
                 ("metadata-indices", "metadata_results"),
@@ -223,7 +248,7 @@ impl VerifyKind {
             Self::PredicateResults => &[
                 ("metadata", "metadata_content"),
                 ("predicates", "metadata_predicates"),
-                ("metadata-indices", "metadata_layout"),
+                ("metadata-indices", "metadata_results"),
             ],
             Self::PredicatesConsolidated => &[
                 ("metadata", "metadata_content"),
@@ -240,11 +265,11 @@ impl VerifyKind {
     /// Canonical facet names that must exist on EACH per-profile
     /// entry in scope. Empty for single-profile commands.
     ///
-    /// `PredicatesConsolidated` iterates by `metadata_layout` (the
-    /// per-profile metadata-index file), matching the existing
+    /// `PredicatesConsolidated` iterates by `metadata_results` (the
+    /// per-profile predicate-match index file), matching the existing
     /// internal scan logic in `verify_consolidated.rs` — it's the
-    /// presence of `profiles/<name>/metadata_indices.{slab,ivvec,ivec}`
-    /// that gates a profile's inclusion, not the eval results.
+    /// presence of `profiles/<name>/metadata_results.{ivvecs,slab,…}`
+    /// (or legacy `metadata_indices.*`) that gates a profile's inclusion.
     pub fn per_profile_facets(self) -> &'static [&'static str] {
         match self {
             Self::KnnConsolidated | Self::KnnFaissConsolidated => &["neighbor_indices"],
@@ -253,7 +278,7 @@ impl VerifyKind {
             Self::FilteredKnnConsolidated
                 | Self::PrefilteredKnnConsolidated => &["prefiltered_neighbor_indices"],
             Self::PostfilteredKnnConsolidated => &["postfiltered_neighbor_indices"],
-            Self::PredicatesConsolidated  => &["metadata_layout"],
+            Self::PredicatesConsolidated  => &["metadata_results"],
             _ => &[],
         }
     }
@@ -499,34 +524,59 @@ fn facet_present(
     canonical: &str,
 ) -> bool {
     if let Some(view) = profile.view(canonical) {
-        if facet_file_exists(dataset_root, view.path()) {
+        // A view path may address a namespace within a slab
+        // (`file#namespace`); existence is a property of the file.
+        if facet_file_exists(dataset_root, strip_namespace(view.path())) {
             return true;
         }
     }
-    // Fallback: probe canonical filesystem layout.
-    let basename = canonical_basename_for(canonical);
+    // Fallback: probe canonical filesystem layout. A facet may own its
+    // file under more than one basename (canonical + legacy), so try each.
     let extensions = canonical_extensions_for(canonical);
-    for ext in extensions {
-        let candidate = dataset_root.join(format!(
-            "profiles/{}/{}.{}",
-            profile_name, basename, ext,
-        ));
-        if candidate.exists() {
-            return true;
+    for basename in canonical_basenames_for(canonical) {
+        for ext in extensions {
+            let candidate = dataset_root.join(format!(
+                "profiles/{}/{}.{}",
+                profile_name, basename, ext,
+            ));
+            if candidate.exists() {
+                return true;
+            }
         }
     }
     false
 }
 
-/// The on-disk basename the bootstrap uses for a given canonical
-/// facet. Most facets use the same name as their canonical key; the
-/// historical exception is `metadata_layout` which writes as
-/// `metadata_indices` on disk (matching the alias users typed).
-fn canonical_basename_for(canonical: &str) -> &str {
+/// The on-disk basename(s) a facet's file may use, in priority order. A
+/// facet is **not** 1:1 with a single filename: most facets use their
+/// canonical key, but `metadata_results` (the predicate-match index) also
+/// resolves the legacy `metadata_indices` name written by older bootstraps.
+fn canonical_basenames_for(canonical: &str) -> &'static [&'static str] {
     match canonical {
-        "metadata_layout" => "metadata_indices",
-        other => other, // canonical key matches on-disk basename
+        "metadata_results" => &["metadata_results", "metadata_indices"],
+        "base_vectors" => &["base_vectors"],
+        "query_vectors" => &["query_vectors"],
+        "neighbor_indices" => &["neighbor_indices"],
+        "neighbor_distances" => &["neighbor_distances"],
+        "filtered_neighbor_indices" => &["filtered_neighbor_indices"],
+        "filtered_neighbor_distances" => &["filtered_neighbor_distances"],
+        "metadata_content" => &["metadata_content"],
+        "metadata_predicates" => &["metadata_predicates"],
+        "metadata_layout" => &["metadata_layout"],
+        "prefiltered_neighbor_indices" => &["prefiltered_neighbor_indices"],
+        "prefiltered_neighbor_distances" => &["prefiltered_neighbor_distances"],
+        "postfiltered_neighbor_indices" => &["postfiltered_neighbor_indices"],
+        "postfiltered_neighbor_distances" => &["postfiltered_neighbor_distances"],
+        // Unknown canonical: rely on the declared view (the probe is only
+        // a fallback for facets with a known on-disk basename).
+        _ => &[],
     }
+}
+
+/// Strip a `#namespace` suffix from a view path, leaving the file path.
+/// `metadata_content.slab#layout` → `metadata_content.slab`.
+fn strip_namespace(path: &str) -> &str {
+    path.split('#').next().unwrap_or(path)
 }
 
 /// File extensions to try when probing canonical filesystem layout
@@ -561,13 +611,21 @@ fn canonical_extensions_for(canonical: &str) -> &'static [&'static str] {
             "i64vec", "u64vec",
             "slab",
         ],
-        "metadata_content" | "metadata_predicates" | "metadata_results" => &["slab"],
-        "metadata_layout" => &[
-            "slab",
+        "metadata_content" | "metadata_predicates" => &["slab"],
+        // The predicate-match index (R): a variable-length integer xvec
+        // (`ivvecs`) by default, or a `slab` in simple-int mode. (This list
+        // previously lived under `metadata_layout`, which is *why* R could
+        // only be found by detouring through that facet — now fixed.)
+        "metadata_results" => &[
             "ivvecs", "i32vvecs", "u32vvecs",
             "ivvec", "i32vvec", "u32vvec",
             "ivecs", "ivec",
+            "slab",
         ],
+        // The metadata field-schema. Now stored as a `#layout` namespace
+        // inside the metadata slabs rather than a standalone file; a bare
+        // `metadata_layout.slab` is still tolerated for any standalone case.
+        "metadata_layout" => &["slab"],
         _ => &[],
     }
 }

@@ -84,7 +84,7 @@ impl CommandOp for VerifyPredicatesOp {
             ctx, options, "predicates", "metadata_predicates",
         ) { Ok(s) => s, Err(e) => return error_result(e, start) };
         let indices_str = match crate::pipeline::dataset_lookup::resolve_path_option(
-            ctx, options, "metadata-indices", "metadata_layout",
+            ctx, options, "metadata-indices", "metadata_results",
         ) { Ok(s) => s, Err(e) => return error_result(e, start) };
         let output_str = match options.require("output") {
             Ok(s) => s.to_string(),

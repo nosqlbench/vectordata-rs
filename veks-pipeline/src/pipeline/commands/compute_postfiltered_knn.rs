@@ -141,7 +141,16 @@ sign convention (FAISS publication convention for KNN outputs from
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult {
         let start = Instant::now();
 
-        let gt_str = match options.require("ground-truth") {
+        // Resolve the G (ground-truth) input through the facet layer: when
+        // the pipeline doesn't pass an explicit `--ground-truth`, this
+        // resolves the profile's `neighbor_indices` facet from
+        // `dataset.yaml` — the correct per-profile path, with the locator's
+        // `.ivecs`/`.ivec` tolerance for extant datasets. (The previous
+        // hardcoded literal was both in the wrong directory and the wrong
+        // extension.)
+        let gt_str = match crate::pipeline::dataset_lookup::resolve_path_option(
+            ctx, options, "ground-truth", "neighbor_indices",
+        ) {
             Ok(s) => s, Err(e) => return error_result(e, start),
         };
         let keys_str = match options.require("metadata-indices") {
@@ -155,10 +164,23 @@ sign convention (FAISS publication convention for KNN outputs from
         let keys_path = resolve_path(&keys_str, &ctx.workspace);
         let indices_path = resolve_path(&indices_str, &ctx.workspace);
 
-        let gt_distances_path = options.get("ground-truth-distances")
-            .map(|s| resolve_path(s, &ctx.workspace));
         let distances_path = options.get("distances")
             .map(|s| resolve_path(s, &ctx.workspace));
+        // D (ground-truth-distances) is needed only to emit E's distances.
+        // Resolve it the same way as G when a distances output is wanted
+        // and no explicit input was supplied.
+        let gt_distances_path = if let Some(s) = options.get("ground-truth-distances") {
+            Some(resolve_path(s, &ctx.workspace))
+        } else if distances_path.is_some() {
+            match crate::pipeline::dataset_lookup::resolve_path_option(
+                ctx, options, "ground-truth-distances", "neighbor_distances",
+            ) {
+                Ok(s) => Some(resolve_path(&s, &ctx.workspace)),
+                Err(e) => return error_result(e, start),
+            }
+        } else {
+            None
+        };
 
         // Distances output without distances input is nonsensical — we
         // have nothing to write. Reject up front rather than silently
@@ -361,7 +383,11 @@ sign convention (FAISS publication convention for KNN outputs from
 
     fn describe_options(&self) -> Vec<OptionDesc> {
         vec![
-            opt("ground-truth", "Path", true, None,
+            // Optional at the schema level: when the pipeline doesn't pass
+            // an explicit path, the command resolves the `neighbor_indices`
+            // facet from dataset.yaml (per-profile, ext-tolerant). Mirrors
+            // how the verify_* commands declare facet-resolvable inputs.
+            opt("ground-truth", "Path", false, None,
                 "Unfiltered KNN indices (G facet, ivec/ivecs)", OptionRole::Input),
             opt("ground-truth-distances", "Path", false, None,
                 "Unfiltered KNN distances (D facet, fvec/fvecs). When supplied, survivor distances are copied into the F output.",

@@ -2911,14 +2911,25 @@ mod tests {
 
     /// Process-wide CWD swap that restores on drop. Used by the fs
     /// provider tests so they're hermetic.
+    /// Scoped `chdir`. The current directory is **process-global**, so two
+    /// tests changing it concurrently (libtest runs tests on parallel
+    /// threads) clobber each other and flake. The guard holds a
+    /// process-wide lock for its whole lifetime, serializing every
+    /// cwd-changing test against every other. Field order matters: the
+    /// `Drop` impl restores the directory first, then `_lock` is released,
+    /// so the next waiter only proceeds once the prior directory is back.
     struct ChangeDirGuard {
         prior: std::path::PathBuf,
+        _lock: std::sync::MutexGuard<'static, ()>,
     }
     impl ChangeDirGuard {
         fn to(p: &std::path::Path) -> Self {
+            static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            // Recover from poison so one panicking test doesn't cascade.
+            let lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             let prior = std::env::current_dir().unwrap();
             std::env::set_current_dir(p).unwrap();
-            Self { prior }
+            Self { prior, _lock: lock }
         }
     }
     impl Drop for ChangeDirGuard {
