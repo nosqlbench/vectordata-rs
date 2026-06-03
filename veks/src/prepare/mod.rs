@@ -234,6 +234,22 @@ pub enum PrepareCommand {
         #[arg(long, default_value = "slab")]
         synthesis_format: String,
 
+        /// Target predicate selectivity — the fraction of base vectors a
+        /// generated predicate matches. For `simple-int-eq` synthesis a
+        /// single `field == v` predicate matches `1/range` of rows, so this
+        /// drives the synthetic metadata/predicate value range to
+        /// `round(1/selectivity)` (superseding `--metadata-range`'s span in
+        /// that mode), keeping predicate matches dense and non-degenerate.
+        /// Must be in `(0, 1]`. The default suits million-scale corpora;
+        /// raise it (e.g. `0.05`) for small toy datasets.
+        #[arg(long, default_value = "0.0001")]
+        selectivity: f64,
+
+        /// Number of synthesized predicates to generate (one per query when
+        /// matched to the query set).
+        #[arg(long, default_value = "10000")]
+        predicate_count: u32,
+
         /// Explicit source files to consider (repeatable). When provided,
         /// directory scanning is skipped and only these files are used
         /// for role detection.
@@ -468,7 +484,7 @@ pub fn run(args: PrepareArgs) {
             force, reset, clean, recursive,
             base_fraction, required_facets, provided_facets, round_digits, pedantic_dedup, auto, classic, sources,
             personality, synthesize_metadata, metadata_fields, metadata_range,
-            synthesis_mode, synthesis_format,
+            synthesis_mode, synthesis_format, selectivity, predicate_count,
         } => {
             // Derive cosine_mode from the two mutually-exclusive
             // flags. Clap already enforces "can't both be true".
@@ -483,7 +499,7 @@ pub fn run(args: PrepareArgs) {
                 None
             };
             // Parse metadata range "min..max"
-            let (metadata_range_min, metadata_range_max) = {
+            let (metadata_range_min, mut metadata_range_max) = {
                 let parts: Vec<&str> = metadata_range.split("..").collect();
                 if parts.len() == 2 {
                     let min: i32 = parts[0].parse().unwrap_or(0);
@@ -493,6 +509,26 @@ pub fn run(args: PrepareArgs) {
                     (0, 1000)
                 }
             };
+            // For simple-int-eq synthesis a predicate is the conjunction of
+            // one `field_i == v` term per field, so over uniform metadata its
+            // selectivity is `(1/span)^fields`. Inverting, the per-field value
+            // range that yields the requested overall selectivity is
+            // `span = round((1/selectivity)^(1/fields))`. Deriving the span
+            // this way (rather than leaving the default 1000) keeps synthetic
+            // predicates dense and non-degenerate for any `--metadata-fields`,
+            // so small toys can pick e.g. `--selectivity 0.05` and still have
+            // every value well-populated. Supersedes `--metadata-range`'s span
+            // in this mode. Validated by the pipeline's predicate verifiers.
+            if synthesize_metadata && synthesis_mode == "simple-int-eq" {
+                if !(selectivity > 0.0 && selectivity <= 1.0) {
+                    eprintln!("error: --selectivity must be in (0, 1] (got {selectivity})");
+                    std::process::exit(2);
+                }
+                let fields = metadata_fields.max(1) as f64;
+                let span = (1.0 / selectivity).powf(1.0 / fields).round();
+                let span = (span as i64).clamp(2, i32::MAX as i64) as i32;
+                metadata_range_max = metadata_range_min.saturating_add(span);
+            }
 
             // Handle --clean: reset all generated artifacts.
             // If other flags indicate re-bootstrapping (--overwrite, -i, --reset,
@@ -771,8 +807,8 @@ pub fn run(args: PrepareArgs) {
                         provided_facets: provided_facets.clone(),
                         round_digits,
                         pedantic_dedup,
-                        selectivity: 0.0001,
-                        predicate_count: 10000,
+                        selectivity,
+                        predicate_count,
                         predicate_strategy: "eq".to_string(),
                         classic,
                         personality: personality.clone(),
@@ -847,8 +883,8 @@ pub fn run(args: PrepareArgs) {
                     provided_facets,
                     round_digits,
                     pedantic_dedup,
-                    selectivity: 0.0001,
-                    predicate_count: 10000,
+                    selectivity,
+                    predicate_count,
                     predicate_strategy: "eq".to_string(),
                     classic,
                     personality: personality.clone(),

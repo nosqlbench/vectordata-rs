@@ -3406,10 +3406,29 @@ impl CommandOp for TransformExtractOp {
             _temp_ivec = None;
         }
 
-        // Pass through common options
+        // Pass through common options.
+        //
+        // The incoming `ivec-file` is the *index* file (ordinals selecting
+        // which source records to gather). For fvec/mvec/scalar sources the
+        // source occupies its own data slot (`fvec-file`/`mvec-file`/`source`),
+        // so the index file maps straight to the delegate's `ivec-file`.
+        //
+        // For an i32 (`.ivec`) source, the source itself was placed in
+        // `ivec-file` above (that is the i32 extractor's data slot), so the
+        // index file must instead be routed to `index-file` — otherwise it
+        // would overwrite the data source and the extractor would slice the
+        // index file by range rather than gather the source by those indices
+        // (which silently turned reordered ivec metadata into bare ordinals).
+        let source_in_ivec_slot = !is_scalar && matches!(etype, Some(ElementType::I32));
         if _temp_ivec.is_none() {
             // Only pass ivec-file if we didn't resolve from predicate-index
-            if let Some(v) = options.get("ivec-file") { delegate_opts.set("ivec-file", v); }
+            if let Some(v) = options.get("ivec-file") {
+                if source_in_ivec_slot {
+                    delegate_opts.set("index-file", v);
+                } else {
+                    delegate_opts.set("ivec-file", v);
+                }
+            }
             if let Some(v) = options.get("index-file") { delegate_opts.set("index-file", v); }
         }
         if let Some(v) = options.get("output") { delegate_opts.set("output", v); }
