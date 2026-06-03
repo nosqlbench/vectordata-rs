@@ -104,6 +104,18 @@ pub mod datasets;
 /// Canonical home for the `.publish_url` binding logic (`veks` depends
 /// on `vectordata`, so the binding lives here and `veks` can delegate).
 pub mod push;
+/// Per-endpoint client credential store + bearer-token resolution
+/// (`vectordata login`), shared by push and the read/pull transport.
+pub mod credentials;
+/// Client for a `vecd` endpoint's auth/introspection API (`login`,
+/// `ping`, `token issue`, `backup`).
+pub mod endpoint;
+/// Client-driven resumable off-system backup/restore of a `vecd` store.
+pub mod backup;
+/// Command handlers for the client-side `vecd` verbs (`login`/`logout`/
+/// `whoami`/`ping`/`token`). No clap dependency — usable by library
+/// consumers (and the daemon's tests) regardless of the `cli` feature.
+pub mod client_cli;
 /// Interactive `vectordata explore` TUI — dataset picker, raw-values
 /// grid, REPL command engine. Migrated from `veks/src/explore` so the
 /// entire TUI lives under vectordata; veks now defers to this module

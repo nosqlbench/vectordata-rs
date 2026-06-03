@@ -1311,6 +1311,151 @@ to only what's actually used, so the server stays lean.
       `vectordata login`/`ping`/`token issue` + read-side bearer auth, and
       the resumable client-driven `vectordata backup`/`restore`.
 
+## Implementation status
+
+**Phase 1 is built and green** (the `vecd/` workspace crate, bin + lib).
+The request-handling core is **synchronous and runtime-free** — `db`,
+`model`, `backend` (`local`/`mem`/`s3`), `authz` (the privilege cone),
+`auth`, `namespace`, `store` (the DB-as-CAS-authority object store) — with
+`server` a thin `axum`/`tokio` shell that marshals each request onto it via
+`spawn_blocking`, plus `admin` (the control-plane CRUD library), `backup`
+(`VACUUM INTO` → file/s3), `config`, and `cli`/`main` (clap + dynamic
+completions). Live reload is wired (poll `PRAGMA data_version` →
+`auth_generation` → atomic snapshot swap).
+
+Delivered against this Phase 1 list: `serve` (+ rustls TLS path),
+namespaces, backend configs, users + tokens (mandatory expiry + access
+profiles + named parameterized profiles), roles + `bind`/`grant`, the
+authn/authz cone (all seven worked examples are unit tests), live reload,
+and DB backup. The acceptance criterion — the **real `vectordata push`
+engine** pushing/pulling end-to-end against `vecd`, conditional-write probe
+and begin→complete CAS chain included — is covered by an in-process
+integration test (`tests/push_against_vecd.rs`) and a compiled-binary
+integration test (`tests/cli_end_to_end.rs`).
+
+The object identity / ETag is the **content-key** per the terminology
+invariant — a sha256 over a canonical descriptor `{size, full-content
+merkle root}`, **not** a whole-content hash — so it is content-determining
+and dedup-ready while remaining a metadata hash (a unit test pins that it
+is *not* `sha256(bytes)`). The one Phase-1 simplification, called out
+honestly: `objects` is a **flat per-namespace manifest**, so the COW
+`versions`/`version_objects` tree, tags, and `@latest`/`@tag` addressing
+land in Phase 2. The `s3` backend, the TLS path, and SQLCipher encryption
+are implemented but not yet integration-tested.
+
+**Phase 2 progress.** The server-side surface is now substantially
+complete and tested (67 tests):
+
+- **Introspection/listing** — `GET /-/whoami`, `GET /-/namespaces`
+  (operator-gated), `GET /<prefix>?list` (server side of push `--delete`).
+- **Daemon lifecycle** — self-daemonizing `start`/`stop`/`status`/
+  `restart` (pidfile, `vecd.addr`), draining on SIGINT/SIGTERM.
+- **COW version tree + transactional sessions** — the pushlog `begin`
+  opens a staging manifest (COW-initialised from the live manifest, begin
+  `deletes` applied), object PUTs stage invisibly to readers, and
+  `complete` commits in one transaction (atomic pointer flip + immutable
+  version snapshot). This closes push's in-flux window with no client
+  change. Writes outside a session mutate the live manifest with per-object
+  CAS (so the conditional-write probe never pollutes version history).
+- **Version addressing + introspection** — `@latest`/`@v<seq>`/`@<tag>`/
+  `@<hash>` selectors, `X-Vecd-Version`/`X-Vecd-Manifest` headers,
+  `GET /-/versions/<ns>`, `GET /<ns>/@<ver>/-/manifest`.
+- **Stasis lifecycle** — a background sweeper moves expired committed
+  versions to stasis (non-destructive, rolling each namespace back to its
+  newest survivor); `410 Gone` + `X-Vecd-Lifecycle` headers; `vecd cleanup
+  list`/`extend`/`purge` (purge the only path that removes bytes,
+  respecting content-key sharing).
+- **Delegated token API** — `POST /auth/token` (password grant, drives
+  `vectordata login`), `POST /tokens` (delegated profile keys, drives
+  `vectordata token issue`), `DELETE /tokens/<id>`; a freshly minted key is
+  usable immediately (synchronous snapshot reload).
+- **Abuse throttle + metrics** — per-source auth-failure backoff → `429`;
+  `GET /metrics` (Prometheus counters).
+
+**Client side (`vectordata` crate) — built and tested, additively.** Every
+addition kept the frozen contract green (see *Client contract* above):
+
+- **Per-origin credential store** (`credentials.rs`) +
+  `vectordata login`/`logout`/`whoami`/`login --list` over `POST
+  /auth/token`; token resolution precedence (`--token`/env/store/none).
+- **`vectordata ping <url>`** over `GET /-/whoami`, with graceful fallback
+  on non-`vecd` hosts.
+- **`vectordata token issue`/`revoke`** over `POST /tokens` / `DELETE
+  /tokens/<id>`.
+- **Read-side bearer auth** — the read transport attaches a token resolved
+  by origin; private pulls work, and public/anonymous reads are unchanged
+  (proven by the frozen `http_storage.rs` plus a dedicated private-pull
+  test through the public reader API).
+- **push `--delete` over vecd** — the push `https` transport's `list()`
+  uses `GET <prefix>?list`, enabling orphan removal against a `vecd`
+  endpoint while staying unsupported against a generic host.
+- **Resumable `backup`/`restore`** — `backup` mirrors readable namespaces →
+  versions → manifests → content into a content-addressed COW tree
+  (`blobs/<content-key>` write-once; per-version `manifest.json` written
+  last as the completion marker), resumable and incremental; `restore`
+  republishes a mirror's latest state into a target `vecd`. A cross-store
+  round-trip test (A → mirror → fresh B) passes.
+
+Still outstanding: the content-addressed `GET /-/blob/<content-key>`
+shortcut (a global content-key index — `backup` currently fetches by
+`@<ver>/<key>`, which works without it); full version-history *restore*
+replay (latest-state restore is implemented); and integration coverage for
+the `s3` backend, TLS, and SQLCipher (all implemented, exercised only by
+unit/build paths).
+
+## Client contract — stabilized tests & additive integration
+
+The `vectordata`-side support for `vecd` is built **incrementally and
+additively**: every new client behavior layers onto a `vecd` endpoint that
+is already implemented and tested, and the existing client↔endpoint
+contract is **frozen** — the tests below must stay green through every
+addition. New behavior is opt-in and never changes an existing call site
+or the anonymous defaults.
+
+**Frozen contract (must not regress):**
+
+- **REST object contract push relies on** — `vectordata/tests/push_https.rs`:
+  `https_transport_verbs_and_conditional_put`, `push_over_https_end_to_end`,
+  `https_auth_failure_then_success_with_token`,
+  `push_refuses_endpoint_that_ignores_conditional_writes`.
+- **push ↔ vecd** — `vecd/tests/push_against_vecd.rs`:
+  `push_succeeds_and_is_retrievable`, `push_without_token_is_rejected`,
+  `read_only_token_cannot_push`, and (the read-path invariant)
+  **`public_binding_enables_anonymous_pull`**; plus
+  `vecd/tests/cli_end_to_end.rs::cli_init_serve_push_pull`.
+- **Read/pull path (anonymous)** — `vectordata/tests/http_storage.rs` (the
+  cached/chunked/merkle-verified read stack) and
+  `vectordata/tests/chunked_http_stress.rs` (chunk-resumable download). These
+  are the guardrail that **read-side auth stays opt-in**: public reads keep
+  working with no token, and the resume machinery the client backup reuses
+  does not regress. (`catalog_knn_entries_fallback.rs` covers HTTP catalog
+  discovery on the same path.)
+- **Push engine internals** — the `vectordata` `push::` unit tests
+  (add/skip/overwrite, resume, abort, CAS probe, SHA256SUMS oracle); the
+  `--delete` work must not regress them.
+
+**Additive integration plan** — each row ships with its own incremental
+test and re-runs the frozen set green:
+
+| New `vectordata` behavior | Builds on (vecd, already tested) | Guardrail preserved |
+|---|---|---|
+| `login`/`logout`/`whoami`/`--list` + per-origin credential store | `POST /auth/token` | (new `~/.config/vectordata` file) |
+| `ping <url>` | `GET /-/whoami` | graceful fallback on non-vecd hosts |
+| `token issue`/`revoke` | `POST /tokens`, `DELETE /tokens/<id>` | — |
+| **read-side bearer auth** (resolve token by origin) | private namespaces | `public_binding_enables_anonymous_pull` + all of `http_storage.rs` |
+| push `--delete` over vecd | `GET /<prefix>?list` | the `push::` engine tests |
+| `backup`/`restore` (resumable mirror) | `/-/versions`, `/-/manifest`, `@<ver>` reads | `chunked_http_stress.rs` |
+
+The only change touching an existing hot path is the read-side auth hook;
+its guardrail (`http_storage.rs`, anonymous reads) is exactly what forces it
+to remain additive — a token is resolved by request origin, and its absence
+falls back to anonymous, unchanged.
+
+**Token resolution precedence** (push and pull), first present wins:
+explicit `--token` / call-site override → `$VECTORDATA_PUSH_TOKEN`
+(push) / `$VECTORDATA_TOKEN` → the stored credential for the request origin
+(`vectordata login`) → none (anonymous).
+
 ## Design-review resolutions
 
 A structured review surfaced these tensions, gaps, and missing essentials

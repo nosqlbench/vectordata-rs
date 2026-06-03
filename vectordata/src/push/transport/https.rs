@@ -130,14 +130,24 @@ impl PushTransport for HttpsTransport {
         }
     }
 
-    fn list(&self, _prefix: &str) -> Result<Vec<String>, PushError> {
-        // A bare REST endpoint has no portable object-listing verb, so we
-        // cannot enumerate orphans. Fail loudly rather than silently skip.
-        Err(PushError::Other(
-            "--delete is not supported over generic https:// (no object listing); \
-             use an s3:// or file:// endpoint for orphan cleanup"
-                .to_string(),
-        ))
+    fn list(&self, prefix: &str) -> Result<Vec<String>, PushError> {
+        // A `vecd` endpoint exposes a listing via `GET <prefix>?list`
+        // returning `{"keys":[{"key":..,"etag":..}]}`. We attempt it and,
+        // on a well-formed JSON response, enumerate the keys — enabling
+        // push `--delete` over `https://vecd-host/…`. A generic REST host
+        // has no such verb (404, or a non-JSON 200): there we fail loudly
+        // rather than risk deleting against an endpoint we can't enumerate.
+        let url = format!("{}?list", self.url(prefix));
+        let client = crate::transport::shared_client();
+        let resp = self.auth(client.get(&url)).send().map_err(other)?;
+        match resp.status() {
+            s if s.is_success() => {
+                let body = resp.bytes().map_err(other)?;
+                parse_list_keys(&body).ok_or_else(unsupported_list)
+            }
+            s @ (StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) => Err(auth(prefix, s)),
+            _ => Err(unsupported_list()),
+        }
     }
 
     fn delete(&self, rel: &str) -> Result<(), PushError> {
@@ -180,6 +190,25 @@ impl HttpsTransport {
 
 fn other<E: std::fmt::Display>(e: E) -> PushError {
     PushError::Other(e.to_string())
+}
+
+/// The error for an endpoint that can't enumerate objects (non-`vecd`
+/// `https`): `--delete` can't be supported there.
+fn unsupported_list() -> PushError {
+    PushError::Other(
+        "--delete is not supported over this https:// endpoint (no object listing); \
+         it works against a vecd endpoint, or an s3:// / file:// endpoint"
+            .to_string(),
+    )
+}
+
+/// Parse vecd's `?list` JSON (`{"keys":[{"key":..,"etag":..}]}`) into the
+/// list of keys. Returns `None` if the body is not that shape (so a
+/// generic 200 response falls back to "unsupported").
+fn parse_list_keys(body: &[u8]) -> Option<Vec<String>> {
+    let v: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let arr = v.get("keys")?.as_array()?;
+    Some(arr.iter().filter_map(|e| e.get("key").and_then(|k| k.as_str()).map(String::from)).collect())
 }
 
 fn auth(rel: &str, status: StatusCode) -> PushError {

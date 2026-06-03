@@ -241,6 +241,7 @@ mod shared_client_tests {
 /// downloaded/updated, `Ok(false)` if the local copy is current.
 pub fn fetch_if_modified(url: &str, local_path: &std::path::Path) -> io::Result<bool> {
     let client = shared_client();
+    let parsed = url::Url::parse(url).ok();
 
     // If we have a local copy, do a quick HEAD check
     if local_path.exists() {
@@ -248,7 +249,7 @@ pub fn fetch_if_modified(url: &str, local_path: &std::path::Path) -> io::Result<
             .modified()
             .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
 
-        if let Ok(resp) = client.head(url).send() {
+        if let Ok(resp) = apply_read_auth(client.head(url), parsed.as_ref()).send() {
             if resp.status().is_success() {
                 if let Some(remote_mtime) = parse_last_modified(&resp) {
                     if remote_mtime <= local_mtime {
@@ -261,7 +262,7 @@ pub fn fetch_if_modified(url: &str, local_path: &std::path::Path) -> io::Result<
     }
 
     // Download the file
-    let resp = client.get(url).send()
+    let resp = apply_read_auth(client.get(url), parsed.as_ref()).send()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
     if !resp.status().is_success() {
         return Err(io::Error::new(
@@ -283,6 +284,20 @@ pub fn fetch_if_modified(url: &str, local_path: &std::path::Path) -> io::Result<
     }
 
     Ok(true)
+}
+
+/// Attach a bearer token resolved by request origin (read-side auth), when
+/// one is configured (`$VECTORDATA_TOKEN` or the `vectordata login` store).
+/// **Additive**: with no token resolvable — or no parseable URL — the
+/// request is returned unchanged, so anonymous/public reads are unaffected.
+pub(crate) fn apply_read_auth(
+    rb: reqwest::blocking::RequestBuilder,
+    url: Option<&url::Url>,
+) -> reqwest::blocking::RequestBuilder {
+    match url.and_then(|u| crate::credentials::resolve_read_token(u)) {
+        Some(token) => rb.bearer_auth(token),
+        None => rb,
+    }
 }
 
 /// Parse `Last-Modified` header into a `SystemTime`.

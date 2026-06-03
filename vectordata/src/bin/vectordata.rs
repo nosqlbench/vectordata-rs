@@ -127,6 +127,70 @@ enum Cmd {
         #[arg(long, value_enum)]
         shell: Option<Shell>,
     },
+
+    /// Establish a stored credential for a `vecd` endpoint.
+    Login {
+        /// Endpoint URL (e.g. https://vecd-host/). Omit with --list.
+        url: Option<String>,
+        /// Username for a password grant.
+        #[arg(long)]
+        user: Option<String>,
+        /// Store this pre-issued token directly (no password exchange).
+        #[arg(long)]
+        token: Option<String>,
+        /// Password (else $VECTORDATA_PASSWORD, else an interactive prompt).
+        #[arg(long)]
+        password: Option<String>,
+        /// Requested token lifetime (e.g. 90d), subject to the server max.
+        #[arg(long)]
+        expires: Option<String>,
+        /// List endpoints with stored credentials and exit.
+        #[arg(long)]
+        list: bool,
+    },
+    /// Forget the stored credential for an endpoint.
+    Logout { url: String },
+    /// Show your stored identity + access at an endpoint.
+    Whoami { url: String },
+    /// Probe what your access lets you see and do at a datasource URL.
+    Ping { url: String },
+    /// Mint or revoke delegated API tokens at an endpoint.
+    Token {
+        #[command(subcommand)]
+        command: TokenCmd,
+    },
+    /// Mirror a readable `vecd` store off-system (resumable, content-addressed).
+    Backup {
+        url: String,
+        #[arg(long)]
+        to: String,
+        /// Skip versions already completely mirrored.
+        #[arg(long)]
+        incremental: bool,
+    },
+    /// Push a mirror's latest state back into a `vecd` endpoint.
+    Restore {
+        src: String,
+        #[arg(long)]
+        to: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum TokenCmd {
+    /// Mint a delegated key (≤ your access) to hand to someone.
+    Issue {
+        url: String,
+        #[arg(long)]
+        description: String,
+        /// A (class, scope) subset, e.g. "read datasets/glove, publish datasets/scratch".
+        #[arg(long)]
+        profile: Option<String>,
+        #[arg(long)]
+        expires: Option<String>,
+    },
+    /// Revoke a key you issued.
+    Revoke { url: String, id: i64 },
 }
 
 #[derive(Subcommand)]
@@ -420,6 +484,48 @@ fn main() {
             if code != 0 { std::process::exit(code); }
         }
         Cmd::Completions { shell } => cmd_completions(shell),
+        Cmd::Login { url, user, token, password, expires, list } => {
+            let code = if list {
+                vectordata::client_cli::list_logins()
+            } else if let Some(url) = url {
+                vectordata::client_cli::login(
+                    &url, user.as_deref(), token.as_deref(), password.as_deref(), expires.as_deref(),
+                )
+            } else {
+                eprintln!("login needs a <url> (or --list)");
+                2
+            };
+            if code != 0 { std::process::exit(code); }
+        }
+        Cmd::Logout { url } => {
+            let code = vectordata::client_cli::logout(&url);
+            if code != 0 { std::process::exit(code); }
+        }
+        Cmd::Whoami { url } => {
+            let code = vectordata::client_cli::ping(&url, false);
+            if code != 0 { std::process::exit(code); }
+        }
+        Cmd::Ping { url } => {
+            let code = vectordata::client_cli::ping(&url, true);
+            if code != 0 { std::process::exit(code); }
+        }
+        Cmd::Token { command } => {
+            let code = match command {
+                TokenCmd::Issue { url, description, profile, expires } => {
+                    vectordata::client_cli::token_issue(&url, &description, profile.as_deref(), expires.as_deref())
+                }
+                TokenCmd::Revoke { url, id } => vectordata::client_cli::token_revoke(&url, id),
+            };
+            if code != 0 { std::process::exit(code); }
+        }
+        Cmd::Backup { url, to, incremental } => {
+            let code = vectordata::client_cli::backup(&url, &to, incremental);
+            if code != 0 { std::process::exit(code); }
+        }
+        Cmd::Restore { src, to } => {
+            let code = vectordata::client_cli::restore(&src, &to);
+            if code != 0 { std::process::exit(code); }
+        }
         #[cfg(feature = "explore")]
         Cmd::Explore(args) => {
             let code = vectordata::explore::run(args);

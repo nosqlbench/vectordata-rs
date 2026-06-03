@@ -78,9 +78,8 @@ impl HttpTransport {
     /// probe retried once. All subsequent `fetch_range` calls
     /// pick up the corrected URL.
     fn probe(&self) -> io::Result<(u64, bool)> {
-        let resp = self
-            .client
-            .head(self.effective_url().clone())
+        let target = self.effective_url().clone();
+        let resp = super::apply_read_auth(self.client.head(target.clone()), Some(&target))
             .send()
             .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e))?;
 
@@ -97,9 +96,7 @@ impl HttpTransport {
                 && let Some(corrected) = rewrite_s3_url_region(self.effective_url(), &region)
             {
                 let _ = self.effective_url.set(corrected.clone());
-                let retry = self
-                    .client
-                    .head(corrected.clone())
+                let retry = super::apply_read_auth(self.client.head(corrected.clone()), Some(&corrected))
                     .send()
                     .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e))?
                     .error_for_status()
@@ -201,8 +198,8 @@ impl ChunkedTransport for HttpTransport {
         // so chunks actually arrive in parallel.
         let client = super::shared_client();
         let end = start + len - 1;
-        let resp = client
-            .get(self.effective_url().clone())
+        let target = self.effective_url().clone();
+        let resp = super::apply_read_auth(client.get(target.clone()), Some(&target))
             .header(RANGE, format!("bytes={}-{}", start, end))
             .send()
             .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e))?

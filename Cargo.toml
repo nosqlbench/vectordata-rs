@@ -6,6 +6,7 @@ members = [
     "veks-pipeline",
     "veks-completion",
     "veks",
+    "vecd",
     "slabtastic",
     "veks-io",
     "tools",

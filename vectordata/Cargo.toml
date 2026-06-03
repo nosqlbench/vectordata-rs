@@ -21,6 +21,8 @@ unicode-width = "0.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
+# Per-origin client credential store (`~/.config/vectordata/credentials.toml`).
+toml = "0.8"
 thiserror = "2.0.18"
 anyhow = "1.0"
 memmap2 = "0.9"
@@ -37,7 +39,7 @@ half = "2"
 # links cleanly into a static binary; no functional difference from
 # native-tls for the URLs this crate fetches. The `json` feature
 # wasn't actually used anywhere.
-reqwest = { version = "0.13.1", default-features = false, features = ["blocking", "rustls"] }
+reqwest = { version = "0.13.1", default-features = false, features = ["blocking", "rustls", "json"] }
 url = "2.5"
 # Optional — only required by the `vectordata` binary. Pulled in by
 # the default `cli` feature so `cargo install vectordata` produces a
