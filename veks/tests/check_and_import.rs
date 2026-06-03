@@ -267,6 +267,78 @@ fn import_with_metadata_generates_predicate_chain() {
     assert!(yaml.contains("compute prefiltered-knn"), "should have filtered KNN");
 }
 
+/// The dataset.yaml emitted by `import` must conform to the standardized
+/// facet spec — every profile/facet/resource declared with a format the
+/// facet permits. This is the generator↔spec agreement guard behind the
+/// `veks check` facet-conformance gate.
+#[test]
+fn import_generated_dataset_conforms_to_facet_spec() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("base.fvecs");
+    let query = dir.path().join("query.fvecs");
+    let meta = dir.path().join("meta");
+    write_fvec(&base, 100, 3);
+    write_fvec(&query, 10, 3);
+    write_parquet_dir(&meta);
+
+    let out = dir.path().join("dataset");
+    let mut args = default_args("conformance", &out);
+    args.base_vectors = Some(base);
+    args.query_vectors = Some(query);
+    args.metadata = Some(meta);
+
+    veks::prepare::import::run(args);
+
+    let config = vectordata::dataset::DatasetConfig::load(&out.join("dataset.yaml"))
+        .expect("load generated dataset.yaml");
+    if let Err(violations) =
+        vectordata::dataset::conformance::validate_conformance(&config)
+    {
+        let detail = violations
+            .iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join("\n  ");
+        panic!("import emitted a non-conformant dataset.yaml:\n  {detail}");
+    }
+}
+
+/// Synthesized metadata declares the optional `metadata_layout` facet,
+/// pointing at a standalone `metadata_layout.slab`, and the `generate
+/// metadata` step is wired to produce it via `layout-output`. The emitted
+/// dataset.yaml stays conformant with the facet spec.
+#[test]
+fn import_synthesized_metadata_declares_layout_facet() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("base.fvecs");
+    let query = dir.path().join("query.fvecs");
+    write_fvec(&base, 100, 3);
+    write_fvec(&query, 10, 3);
+
+    let out = dir.path().join("dataset");
+    let mut args = default_args("synth-layout", &out);
+    args.base_vectors = Some(base);
+    args.query_vectors = Some(query);
+    // `--synthesize-metadata` alone implies the metadata facets.
+    args.synthesize_metadata = true;
+
+    veks::prepare::import::run(args);
+
+    let yaml = read_yaml(&out);
+    // The standalone layout facet is declared and the producer is wired.
+    assert!(yaml.contains("metadata_layout"), "should declare metadata_layout facet:\n{yaml}");
+    assert!(yaml.contains("metadata_layout.slab"), "facet should point at the standalone slab");
+    assert!(yaml.contains("layout-output"), "generate metadata step should produce the layout");
+
+    // The declared facet view is spec-conformant.
+    let config = vectordata::dataset::DatasetConfig::load(&out.join("dataset.yaml"))
+        .expect("load generated dataset.yaml");
+    assert!(
+        vectordata::dataset::conformance::validate_conformance(&config).is_ok(),
+        "synthesized dataset.yaml must conform to the facet spec",
+    );
+}
+
 #[test]
 fn import_no_filtered_skips_filtered_knn() {
     let dir = tempfile::tempdir().unwrap();

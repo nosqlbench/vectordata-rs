@@ -17,9 +17,11 @@
 //! - **catalog** — `CatalogEntry`, `CatalogLayout` (dataset index files).
 
 pub mod catalog;
+pub mod conformance;
 pub mod config;
 pub mod expansion;
 pub mod facet;
+pub mod layout;
 pub mod pipeline;
 pub mod profile;
 pub mod source;

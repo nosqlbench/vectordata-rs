@@ -158,7 +158,7 @@ pub fn check(
 
             // Skip IDXFOR__ index files if their data file is accounted for
             if filename.starts_with("IDXFOR__") {
-                // IDXFOR__metadata_indices.ivvec.i32 → metadata_indices.ivvec
+                // IDXFOR__metadata_results.ivvec.i32 → metadata_results.ivvec
                 let data_name = filename.strip_prefix("IDXFOR__")
                     .and_then(|s| s.rsplit_once('.'))  // strip .i32/.i64
                     .map(|(base, _)| base);

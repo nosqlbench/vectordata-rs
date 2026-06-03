@@ -182,7 +182,8 @@ global → partition query mapping and see the partition-specific KNN.
             Some(p) => p,
             None => return error_result("cannot resolve metadata path".into(), start),
         };
-        let indices_path = resolve("metadata_indices", "metadata-indices");
+        // R facet — canonical `metadata_results` key, legacy `metadata_indices`.
+        let indices_path = resolve_with_legacy("metadata_results", "metadata_indices", "metadata-indices");
         let gt_path = resolve("neighbor_indices", "ground-truth");
         // F (pre-filter) — the legacy filtered-knn shape. Accept both
         // canonical `prefiltered_*` and legacy `filtered_*` keys, plus

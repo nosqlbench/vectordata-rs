@@ -1024,8 +1024,9 @@ fn e2e_metadata_pipeline() {
     let predicates = out.join("profiles/base/predicates.slab");
     assert!(predicates.exists(), "predicates.slab not produced");
 
-    let meta_indices = out.join("profiles/default/metadata_indices.slab");
-    assert!(meta_indices.exists(), "metadata_indices.slab not produced");
+    // R facet — now produced under the canonical `metadata_results` name.
+    let meta_results = out.join("profiles/default/metadata_results.slab");
+    assert!(meta_results.exists(), "metadata_results.slab not produced");
 
     // Verify variables
     let vars = std::fs::read_to_string(out.join("variables.yaml")).unwrap();

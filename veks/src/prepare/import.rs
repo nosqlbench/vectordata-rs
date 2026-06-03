@@ -202,7 +202,7 @@ pub const FACET_CODES: &[(&str, char, &str)] = &[
     ("neighbor_distances",         'D', "Ground-truth KNN distances"),
     ("metadata_content",           'M', "Metadata content"),
     ("metadata_predicates",        'P', "Predicates"),
-    ("metadata_indices",           'R', "Predicate evaluation results"),
+    ("metadata_results",           'R', "Predicate evaluation results"),
     ("filtered_neighbor_indices",  'F', "Filtered KNN"),
     ("oracle_partitions",          'O', "Oracle partition profiles"),
 ];
@@ -262,7 +262,7 @@ pub fn parse_facet_spec(spec: &str) -> String {
             "d" | "dist" | "distances" | "neighbor_distances" => 'D',
             "m" | "meta" | "metadata" | "metadata_content" => 'M',
             "p" | "pred" | "predicates" | "metadata_predicates" => 'P',
-            "r" | "results" | "metadata_indices" => 'R',
+            "r" | "results" | "metadata_results" | "metadata_indices" => 'R',
             "f" | "filtered" | "filtered_neighbor_indices" => 'F',
             "o" | "oracle" | "oracles" | "oracle_partitions" | "partitions" => 'O',
             other => {
@@ -327,9 +327,10 @@ pub fn resolve_facets(args: &ImportArgs) -> String {
         if has_gt_dist {
             facets.push('D');
         }
-        // MPRF: include when metadata is provided OR when BQG are all
-        // provided (metadata can be synthesized)
-        if has_meta || has_gt {
+        // MPRF: include when metadata is provided, when BQG are all
+        // provided, or when synthesis is requested (metadata can be
+        // synthesized in-pipeline via `--synthesize-metadata`).
+        if has_meta || has_gt || args.synthesize_metadata {
             facets.push('M');
             facets.push('P');
             facets.push('R');
@@ -735,7 +736,7 @@ fn resolve_slots(args: &ImportArgs) -> PipelineSlots {
         };
         let predicate_indices = Artifact::Materialized {
             step_id: "evaluate-predicates".into(),
-            output: "metadata_indices.slab".into(),
+            output: "metadata_results.slab".into(),
         };
 
         MetadataSlots { metadata_all, metadata_content, survey, predicates, predicate_indices }
@@ -788,7 +789,7 @@ fn resolve_slots(args: &ImportArgs) -> PipelineSlots {
         // variable-length list of matching ordinals, not a scalar value
         let predicate_indices = Artifact::Materialized {
             step_id: "evaluate-predicates".into(),
-            output: "metadata_indices.ivvecs".into(),
+            output: "metadata_results.ivvecs".into(),
         };
         Some(MetadataSlots { metadata_all, metadata_content, survey, predicates, predicate_indices })
     } else {
@@ -1598,6 +1599,13 @@ fn emit_steps(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::path:
                 // Synthesize metadata via generate metadata command
                 let mut gen_meta_opts = vec![
                     ("output".into(), meta.metadata_all.path().into()),
+                    // Authoritative, slicing-proof home of the metadata
+                    // layout (schema): a standalone slab in the profile dir,
+                    // backing the optional `metadata_layout` facet. Written
+                    // regardless of content format, and byte-identical to the
+                    // embedded `layout` namespace when content is a slab.
+                    ("layout-output".into(),
+                        format!("{}metadata_layout.slab", args.profile_prefix())),
                     ("count".into(), "${vector_count}".into()),
                     ("fields".into(), args.metadata_fields.to_string()),
                     ("range-min".into(), args.metadata_range_min.to_string()),
@@ -2425,6 +2433,15 @@ fn profile_views(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::pa
     if let Some(ref meta) = slots.metadata {
         views.push(("metadata_content".into(), meta.metadata_content.path().into()));
         views.push(("metadata_predicates".into(), meta.predicates.path().into()));
+        // The optional `metadata_layout` facet — the field schema in its own
+        // standalone slab. Only declared when the `generate metadata` step
+        // actually produces it (via `layout-output`); imported/converted
+        // metadata (step id `convert-metadata` or an identity source) does
+        // not yet emit a standalone layout, so no view is declared for it.
+        if meta.metadata_all.step_id() == "generate-metadata" {
+            views.push(("metadata_layout".into(),
+                format!("{}metadata_layout.slab", args.profile_prefix())));
+        }
     }
 
     if let Some(ref knn) = slots.knn {
@@ -2454,7 +2471,10 @@ fn profile_views(slots: &PipelineSlots, args: &ImportArgs, _output_dir: &std::pa
     }
 
     if let Some(ref meta) = slots.metadata {
-        views.push(("metadata_indices".into(),
+        // R facet — canonical key `metadata_results` (the file is now
+        // produced canonically; the legacy `metadata_indices` name is still
+        // resolved on read for extant datasets).
+        views.push(("metadata_results".into(),
             format!("{}{}", args.default_prefix(), meta.predicate_indices.path())));
     }
 
@@ -2663,7 +2683,11 @@ pub fn run(mut args: ImportArgs) {
         if p.contains('Q') && args.query_vectors.is_none() { missing.push("Q (query vectors)"); }
         if p.contains('G') && args.ground_truth.is_none() { missing.push("G (ground truth)"); }
         if p.contains('D') && args.ground_truth_distances.is_none() { missing.push("D (distances)"); }
-        if p.contains('M') && args.metadata.is_none() { missing.push("M (metadata)"); }
+        // M is satisfied by a metadata input *or* by synthesis
+        // (`--synthesize-metadata` generates the metadata facet in-pipeline).
+        if p.contains('M') && args.metadata.is_none() && !args.synthesize_metadata {
+            missing.push("M (metadata)");
+        }
         if !missing.is_empty() {
             eprintln!("Error: --provided-facets declares {} but no matching inputs were found:",
                 provided);

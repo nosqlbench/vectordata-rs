@@ -508,9 +508,10 @@ fn facet_file_exists(dataset_root: &Path, raw_path: &str) -> bool {
 ///   1. The profile declares a view for `canonical` AND the
 ///      view's file exists on disk.
 ///   2. The default canonical filesystem layout
-///      `profiles/<profile_name>/<canonical_basename>.<ext>` exists,
-///      where `canonical_basename` matches the bootstrap-generated
-///      naming convention (see `canonical_basename_for`).
+///      `profiles/<profile_name>/<basename>.<ext>` exists, for any
+///      basename/format the facet permits — driven by the `vectordata`
+///      facet spec (`StandardFacet::basenames`/`formats`), the single
+///      authority for a facet's valid resources.
 ///
 /// (2) exists for backward compat with bootstrap-generated datasets
 /// that write artifacts to canonical paths without registering them
@@ -530,102 +531,30 @@ fn facet_present(
             return true;
         }
     }
-    // Fallback: probe canonical filesystem layout. A facet may own its
-    // file under more than one basename (canonical + legacy), so try each.
-    let extensions = canonical_extensions_for(canonical);
-    for basename in canonical_basenames_for(canonical) {
-        for ext in extensions {
-            let candidate = dataset_root.join(format!(
-                "profiles/{}/{}.{}",
-                profile_name, basename, ext,
-            ));
-            if candidate.exists() {
-                return true;
+    // Fallback: probe the canonical filesystem layout, driven entirely by
+    // the `vectordata` facet spec (the single authority for a facet's valid
+    // basenames + formats/extensions). A facet may own its file under more
+    // than one basename (canonical + legacy) and several formats.
+    if let Some(facet) = vectordata::dataset::facet::StandardFacet::from_key(canonical) {
+        for basename in facet.basenames() {
+            for format in facet.formats() {
+                for ext in format.extensions() {
+                    let candidate = dataset_root.join(format!(
+                        "profiles/{}/{}.{}",
+                        profile_name, basename, ext,
+                    ));
+                    if candidate.exists() {
+                        return true;
+                    }
+                }
             }
         }
     }
     false
 }
 
-/// The on-disk basename(s) a facet's file may use, in priority order. A
-/// facet is **not** 1:1 with a single filename: most facets use their
-/// canonical key, but `metadata_results` (the predicate-match index) also
-/// resolves the legacy `metadata_indices` name written by older bootstraps.
-fn canonical_basenames_for(canonical: &str) -> &'static [&'static str] {
-    match canonical {
-        "metadata_results" => &["metadata_results", "metadata_indices"],
-        "base_vectors" => &["base_vectors"],
-        "query_vectors" => &["query_vectors"],
-        "neighbor_indices" => &["neighbor_indices"],
-        "neighbor_distances" => &["neighbor_distances"],
-        "filtered_neighbor_indices" => &["filtered_neighbor_indices"],
-        "filtered_neighbor_distances" => &["filtered_neighbor_distances"],
-        "metadata_content" => &["metadata_content"],
-        "metadata_predicates" => &["metadata_predicates"],
-        "metadata_layout" => &["metadata_layout"],
-        "prefiltered_neighbor_indices" => &["prefiltered_neighbor_indices"],
-        "prefiltered_neighbor_distances" => &["prefiltered_neighbor_distances"],
-        "postfiltered_neighbor_indices" => &["postfiltered_neighbor_indices"],
-        "postfiltered_neighbor_distances" => &["postfiltered_neighbor_distances"],
-        // Unknown canonical: rely on the declared view (the probe is only
-        // a fallback for facets with a known on-disk basename).
-        _ => &[],
-    }
-}
-
 /// Strip a `#namespace` suffix from a view path, leaving the file path.
 /// `metadata_content.slab#layout` → `metadata_content.slab`.
 fn strip_namespace(path: &str) -> &str {
     path.split('#').next().unwrap_or(path)
-}
-
-/// File extensions to try when probing canonical filesystem layout
-/// for a facet. The extension depends on the element type the
-/// bootstrap chose, so we enumerate every recognized form for the
-/// facet's value-shape (float xvec, integer xvec, slab, etc.).
-///
-/// Plural xvec forms (`fvecs`, `mvecs`, …) come first because that is
-/// the canonical extension written by current bootstraps. Singular
-/// fallbacks remain so older directories continue to resolve.
-fn canonical_extensions_for(canonical: &str) -> &'static [&'static str] {
-    match canonical {
-        // Float xvec: f32 / f64 / f16 in plural-then-singular order, plus
-        // explicit-width aliases.
-        "base_vectors" | "query_vectors"
-        | "neighbor_distances" | "filtered_neighbor_distances" => &[
-            "fvecs", "dvecs", "mvecs",
-            "fvec", "dvec", "mvec",
-            "f32vecs", "f64vecs", "f16vecs",
-            "f32vec", "f64vec", "f16vec",
-        ],
-        // Integer xvec used for neighbor IDs: any integer width is
-        // tolerated (i32 is conventional, but bootstrap may write
-        // narrower or wider). `slab` is included for compatibility
-        // with metadata-style storage of indices.
-        "neighbor_indices" | "filtered_neighbor_indices" => &[
-            "ivecs", "i32vecs", "u32vecs",
-            "ivec", "i32vec", "u32vec",
-            "i8vecs", "u8vecs", "bvecs", "i16vecs", "u16vecs", "svecs",
-            "i8vec", "u8vec", "bvec", "i16vec", "u16vec", "svec",
-            "i64vecs", "u64vecs",
-            "i64vec", "u64vec",
-            "slab",
-        ],
-        "metadata_content" | "metadata_predicates" => &["slab"],
-        // The predicate-match index (R): a variable-length integer xvec
-        // (`ivvecs`) by default, or a `slab` in simple-int mode. (This list
-        // previously lived under `metadata_layout`, which is *why* R could
-        // only be found by detouring through that facet — now fixed.)
-        "metadata_results" => &[
-            "ivvecs", "i32vvecs", "u32vvecs",
-            "ivvec", "i32vvec", "u32vvec",
-            "ivecs", "ivec",
-            "slab",
-        ],
-        // The metadata field-schema. Now stored as a `#layout` namespace
-        // inside the metadata slabs rather than a standalone file; a bare
-        // `metadata_layout.slab` is still tolerated for any standalone case.
-        "metadata_layout" => &["slab"],
-        _ => &[],
-    }
 }

@@ -73,24 +73,150 @@ No files were renamed and no schema is written yet — the facet now simply
 *owns both names*, so extant datasets keep working while the canonical name
 is established.
 
-## Stage 2 — the layout namespace + compatibility (TODO)
+## How the design fork was found and resolved
 
-1. **Write** the schema into a `layout` namespace of the metadata content
-   slab and the metadata results slab (`slabtastic` `start_namespace` on
-   fresh writes, `append_namespace` when augmenting an existing slab). The
-   bytes are the `anode`-encoded schema, written **identically** to both.
-2. **Declare** the optional `metadata_layout` facet view as
-   `…/metadata_content.slab#layout` (and/or the results slab). `vectordata`
-   exposes it as raw bytes (caller decodes via `anode`).
-3. **Read** via the namespace-aware locator (the `#namespace` plumbing from
-   Stage 1) → `SlabReader::open_namespace(path, Some("layout"))`.
-4. **Compatibility check**: a content↔results compatibility test compares
-   the two `layout` namespaces byte-for-byte.
-5. **Canonical file rename** (optional follow-on): emit new R files as
-   `metadata_results.*` instead of `metadata_indices.*`. Not required for
-   correctness — the facet already owns both names — but completes the
-   canonicalization. Carries the only remaining backcompat surface, so do
-   it deliberately with the suite as guard.
+**The `vectordata` layout API** (`vectordata/src/dataset/layout.rs`):
+- `LAYOUT_NAMESPACE` (`"layout"`), `read_layout_bytes(locator)` (reads the
+  opaque schema bytes from a `path` / `path#namespace` slab locator; a
+  missing namespace is `Ok(None)`, not an error), and
+  `layouts_compatible(a, b)` (the byte-for-byte content↔results / dataset↔
+  dataset compatibility test — the design driver, ruling 6). 6 unit tests.
+  This realizes rulings 6 & 7: schema exposed as raw bytes; compatibility =
+  byte match.
+- The producer (`gen_metadata`) writes the `layout` namespace into the
+  content slab on the `generate metadata` slab path.
 
-Stage 2 touches the metadata production path (the slab writers) and the
-`anode` schema bytes; it is feature work on top of the Stage-1 cleanup.
+**The fork surfaced while wiring the producer/view side.** The
+`layout` namespace, as written today, only survives to the
+`metadata_content.*` path in the **non-self-search synthesize-slab** case.
+It is **absent** in the other two common paths:
+
+1. **Self-search (`extract-metadata`).** `gen_extract` rebuilds the content
+   slab with plain `SlabWriter::new` / `SlabReader::open` (default namespace
+   only) — sibling namespaces are not carried across. This is the same
+   limitation `derive::materialize_slab` documents for windowed slicing:
+   **windowed/rebuilt slab derives drop sibling namespaces.**
+2. **Imported / converted metadata.** `convert-metadata` (and identity
+   symlink) producers do not write a `layout` namespace at all.
+
+So emitting an unconditional `metadata_content.slab#layout` view would
+**dangle** in exactly the dominant paths. **Resolution (chosen): option B —
+the standalone `metadata_layout.slab` is the authoritative home.** The
+content-slab `layout` namespace remains a byte-identical convenience copy
+where it naturally survives; the standalone file is slicing-proof and
+unaffected by content rebuilds.
+
+## Stage 2 — layout namespace + compatibility (DONE, standalone design)
+
+Implemented and verified (`cargo test --workspace --no-fail-fast`: **2462
+passed, 0 failed**):
+
+1. **The authoritative schema is a standalone `metadata_layout.slab`.** Its
+   *default* namespace holds the single schema record (the whole file *is*
+   the layout). `gen_metadata` gained a `layout-output` option (role
+   `Output`, declared in `project_artifacts`) that writes it from the same
+   `field_N` schema backing every content format — so the layout is emitted
+   even when content is a flat scalar/`ivec`. The in-content `layout`
+   namespace is kept as a byte-identical convenience copy on the slab path.
+2. **The `metadata_layout` facet view** is declared by `import` as
+   `…/metadata_layout.slab` (bare locator → default namespace) — but only
+   when the `generate metadata` step actually produces it (gated on
+   `metadata_all.step_id() == "generate-metadata"`), so it never dangles for
+   imported/converted metadata. Conformant under the facet spec
+   (`MetadataLayout` accepts `Slab`).
+3. **Reading** is `vectordata::dataset::layout::read_layout_bytes(locator)`
+   — honours the locator's namespace (default for the standalone bare path,
+   `#layout` for the embedded copy). Schema exposed as raw bytes (ruling 7).
+4. **Compatibility** is `layouts_compatible(a, b)` — byte-for-byte (ruling
+   6). The producer guarantees the standalone and the embedded copy are
+   byte-identical by construction (same `metadata_layout_bytes`), so a
+   content slab and the standalone layout always compare equal.
+
+**Contradiction fixed in passing.** Wiring this surfaced that
+`--synthesize-metadata` did *not* imply the `M` facet: `resolve_facets` only
+inferred `MPRF` when metadata or `G` was present (despite its own comment
+"metadata can be synthesized"), and the `--provided-facets` validator
+demanded an `M` *input* even under synthesis. Both now honour
+`synthesize_metadata`, so `--synthesize-metadata` alone produces the
+metadata chain.
+
+**Canonical file rename (DONE).** R files are now emitted under the
+canonical `metadata_results.*` name, and the dataset.yaml view key is
+`metadata_results`. Legacy reading is fully retained — the facet spec lists
+`metadata_indices` as a legacy basename, the resolver/verifiers probe
+canonical-first then legacy, the `model.rs` config field accepts
+`metadata_indices`/`predicate_results` as serde aliases, and the public
+`TestDataView` method was renamed `metadata_indices()` → `metadata_results()`
+(a deliberate public-API change; callers adjust). The `synthetic-1k/1m`
+fixtures and `typed_access.rs` still pass unchanged on the legacy name,
+proving backcompat. The verifier probes are now driven by
+`StandardFacet::MetadataResults.basenames()` (single source of truth) rather
+than hardcoded names. Surfaced & fixed in passing: `--synthesize-metadata`
+now implies the `M` facet (see above).
+
+**Embedded-copy survival across slab derives (DONE for `materialize_slab`).**
+Windowed `derive::materialize_slab` now carries sibling namespaces forward
+verbatim (windowing applies only to the default content namespace; metadata
+namespaces like `layout` are copied whole). This also resolved an internal
+contradiction — the function's own doc already *claimed* namespace
+preservation while a test documented the opposite; code and doc now agree.
+
+**Remaining (optional follow-on):**
+- **`extract-metadata` (`gen_extract`)** uses a bespoke partition/reorder
+  slab writer and does not carry the embedded `layout` namespace across.
+  Harmless under the standalone design (the standalone `metadata_layout.slab`
+  is authoritative and is written directly by `generate metadata`, not via
+  extract; the `metadata_layout` facet view points at the standalone, never
+  the embedded copy). Carrying it through the partition writer would make the
+  content slab's convenience copy survive self-search too, but adds no
+  correctness.
+
+## Stage 3 — standardized facet↔resource spec + conformance enforcement (DONE)
+
+The facet↔file model above is now **standardized in the `vectordata`
+crate as the single authority**, and enforced. This makes the design
+rulings mechanically checkable rather than convention:
+
+> "We still require, as a matter of design, an explicit set of possible
+> mappings for each facet type… standardized in vectordata so that we can
+> always tell what facet a file or resource goes with, or how to look for,
+> given a facet, what files or resources it may contain."
+
+**The spec — `vectordata/src/dataset/facet.rs`:**
+- `FacetFormat` enumerates the coarse on-disk shapes (`FloatXvec`,
+  `IntegerXvec`, `IntegerVarXvec`, `ScalarPacked`, `Slab`) and owns the
+  extension↔format mapping (`extensions`, `from_extension`).
+- `StandardFacet` gains the authoritative spec methods: `formats()` (which
+  shapes a facet may take), `basenames()` (canonical + legacy filenames it
+  may own), `namespaces()` (e.g. `metadata_layout` → `["layout",""]`),
+  `accepts_format`/`accepts_extension`, and `classify(name)` (given any
+  resource path, return the `(facet, format)` it belongs to — strips dir,
+  `#namespace`, and `IDXFOR__` sidecar prefix).
+
+  This directly answers the design questions: *"Can I store metadata in an
+  integer xvec file?"* → `MetadataContent.accepts_format(IntegerXvec)`;
+  *"Does this file belong to `metadata_content`?"* → `classify(path)`;
+  *"What resources may facet R contain?"* →
+  `MetadataResults.basenames() × formats().extensions() × namespaces()`.
+
+**The resolver consumes the spec — `veks-pipeline/dataset_lookup.rs`:**
+The duplicated, divergent `canonical_basenames_for` /
+`canonical_extensions_for` tables (the root cause of the original
+three-name R-facet drift) are **deleted**; `facet_present` now derives the
+filesystem probe entirely from `StandardFacet::basenames()` ×
+`formats().extensions()`. There is one source of truth.
+
+**Enforcement is a check-time gate —
+`vectordata/src/dataset/conformance.rs` + `veks/src/check`:**
+- `validate_conformance(&DatasetConfig) -> Result<(), Vec<FacetViolation>>`
+  verifies every profile view whose key resolves to a standard facet
+  declares a resource whose format the facet permits (custom keys and
+  templated/synthetic locators are out of scope and skipped).
+- Wired into `veks check` as the **`facet-conformance`** category. **Load
+  stays lenient** (a mid-pipeline dataset may declare facets not yet
+  produced); the strict gate runs when the dataset is meant to be complete.
+- Guarded by `import_generated_dataset_conforms_to_facet_spec` — the
+  generator↔spec agreement test proving `import` emits conformant YAML.
+
+Full workspace green after Stage 3: `cargo test --workspace
+--no-fail-fast` = **2453 passed, 0 failed**.

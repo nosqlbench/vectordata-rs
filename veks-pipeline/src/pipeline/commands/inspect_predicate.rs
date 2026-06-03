@@ -154,7 +154,11 @@ in predicate synthesis, metadata indexing, or query execution.
                 let m = match resolve("metadata_content", options.get("metadata")) {
                     Ok(s) => s, Err(e) => return error_result(e, start),
                 };
-                let k = match resolve("metadata_indices", options.get("metadata-indices")) {
+                // R facet — canonical `metadata_results` key, falling back to
+                // the legacy `metadata_indices` key for extant datasets.
+                let k = match resolve("metadata_results", options.get("metadata-indices"))
+                    .or_else(|_| resolve("metadata_indices", options.get("metadata-indices")))
+                {
                     Ok(s) => s, Err(e) => return error_result(e, start),
                 };
                 ctx.ui.log(&format!("  resolved from profile '{}': predicates={} metadata={} indices={}",

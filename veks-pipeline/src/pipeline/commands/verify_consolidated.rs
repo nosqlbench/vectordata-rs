@@ -147,6 +147,22 @@ fn resolve_path(value: &str, workspace: &Path) -> PathBuf {
     if p.is_absolute() { p.to_path_buf() } else { workspace.join(p) }
 }
 
+/// Candidate on-disk paths for the R (predicate-results) facet under a
+/// profile, in priority order: the canonical `metadata_results.*` first,
+/// then the legacy `metadata_indices.*`, across the index extensions the
+/// loaders accept (`ivvec`/`ivec`/`slab`). Basenames come from the
+/// `vectordata` facet spec — the single source of truth — so this stays in
+/// sync with the resolver rather than re-hardcoding the names.
+fn predicate_results_candidates(workspace: &Path, profile: &str) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for base in vectordata::dataset::facet::StandardFacet::MetadataResults.basenames() {
+        for ext in ["ivvec", "ivec", "slab"] {
+            out.push(workspace.join(format!("profiles/{}/{}.{}", profile, base, ext)));
+        }
+    }
+    out
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // verify knn-consolidated (multi-threaded)
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1023,17 +1039,12 @@ impl CommandOp for VerifyFilteredKnnConsolidatedOp {
                 continue;
             }
 
-            // Load predicate results — try ivvec (canonical), ivec (legacy), slab
-            let pred_indices_candidates = [
-                format!("profiles/{}/metadata_indices.ivvec", name),
-                format!("profiles/{}/metadata_indices.ivec", name),
-                format!("profiles/{}/metadata_indices.slab", name),
-            ];
+            // Load predicate results (R facet) — canonical `metadata_results.*`
+            // first, then legacy `metadata_indices.*`, per the facet spec.
             let pred_indices = {
                 let mut loaded = None;
                 let mut last_err = String::new();
-                for candidate in &pred_indices_candidates {
-                    let path = ctx.workspace.join(candidate);
+                for path in predicate_results_candidates(&ctx.workspace, name) {
                     if path.exists() {
                         match crate::pipeline::commands::compute_prefiltered_knn::PredicateIndices::open(&path) {
                             Ok(r) => { loaded = Some(r); break; }
@@ -1046,7 +1057,7 @@ impl CommandOp for VerifyFilteredKnnConsolidatedOp {
                     None => {
                         results.push(serde_json::json!({
                             "name": name, "status": "error",
-                            "message": if last_err.is_empty() { "no metadata_indices file found".into() } else { last_err },
+                            "message": if last_err.is_empty() { "no predicate-results (metadata_results) file found".into() } else { last_err },
                         }));
                         continue;
                     }
@@ -1286,9 +1297,9 @@ impl CommandOp for VerifyPredicatesConsolidatedOp {
         let mut profiles: Vec<(String, u64)> = Vec::new();
         for (name, profile) in &config.profiles.profiles {
             let bc = profile.base_count.unwrap_or(u64::MAX);
-            let has_indices = ["ivvec", "ivec", "slab"].iter().any(|ext| {
-                ctx.workspace.join(format!("profiles/{}/metadata_indices.{}", name, ext)).exists()
-            });
+            let has_indices = predicate_results_candidates(&ctx.workspace, name)
+                .iter()
+                .any(|p| p.exists());
             if has_indices {
                 profiles.push((name.clone(), bc));
             }
@@ -1324,12 +1335,13 @@ impl CommandOp for VerifyPredicatesConsolidatedOp {
         let pb = ctx.ui.bar_with_unit(profiles.len() as u64, "verifying profiles", "profiles");
 
         for (_pi, (name, bc)) in profiles.iter().enumerate() {
-            // Try multiple extensions for metadata indices
-            let indices_candidates = ["ivvec", "ivec", "slab"];
-            let indices_path = indices_candidates.iter()
-                .map(|ext| ctx.workspace.join(format!("profiles/{}/metadata_indices.{}", name, ext)))
+            // R-facet candidates: canonical `metadata_results.*` then legacy
+            // `metadata_indices.*` (from the facet spec), falling back to the
+            // canonical slab path when none exist yet.
+            let indices_path = predicate_results_candidates(&ctx.workspace, name)
+                .into_iter()
                 .find(|p| p.exists())
-                .unwrap_or_else(|| ctx.workspace.join(format!("profiles/{}/metadata_indices.slab", name)));
+                .unwrap_or_else(|| ctx.workspace.join(format!("profiles/{}/metadata_results.slab", name)));
 
             let indices_ext = indices_path.extension().and_then(|e| e.to_str()).unwrap_or("slab");
             let eval_count: usize;
@@ -1564,19 +1576,13 @@ impl CommandOp for VerifyPostfilteredKnnConsolidatedOp {
                 .unwrap_or_else(|| ctx.workspace.join(format!(
                     "profiles/{}/postfiltered_neighbor_indices.ivec", name)));
 
-            // R is allowed under several names (canonical ivvec + two
-            // legacy ones) — try each in turn, same shape as the
-            // prefilter verifier.
-            let r_candidates = [
-                format!("profiles/{}/metadata_indices.ivvec", name),
-                format!("profiles/{}/metadata_indices.ivec",  name),
-                format!("profiles/{}/metadata_indices.slab",  name),
-            ];
+            // R is allowed under several names (canonical `metadata_results`
+            // + legacy `metadata_indices`) × index extensions — try each in
+            // turn, same shape as the prefilter verifier.
             let r_reader = {
                 let mut loaded = None;
                 let mut last_err = String::new();
-                for c in &r_candidates {
-                    let path = ctx.workspace.join(c);
+                for path in predicate_results_candidates(&ctx.workspace, name) {
                     if path.exists() {
                         match crate::pipeline::commands::compute_prefiltered_knn::PredicateIndices::open(&path) {
                             Ok(r) => { loaded = Some(r); break; }
@@ -1589,7 +1595,7 @@ impl CommandOp for VerifyPostfilteredKnnConsolidatedOp {
                     None => {
                         all_results.push(serde_json::json!({
                             "name": name, "status": "error",
-                            "message": if last_err.is_empty() { "no metadata_indices file found".into() } else { last_err },
+                            "message": if last_err.is_empty() { "no predicate-results (metadata_results) file found".into() } else { last_err },
                         }));
                         continue;
                     }

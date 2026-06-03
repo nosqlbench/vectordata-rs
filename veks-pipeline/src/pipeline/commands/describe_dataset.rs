@@ -327,7 +327,7 @@ fn write_facet_legend(config: &DatasetConfig, doc: &mut String) {
     if has_metadata {
         doc.push_str("| M | `metadata_content` | Per-base-vector metadata labels | scalar (u8/i32/etc.) |\n");
         doc.push_str("| P | `metadata_predicates` | Per-query filter conditions | scalar or slab |\n");
-        doc.push_str("| R | `metadata_indices` | Per-query matching base ordinals | ivvec (variable-length i32) |\n");
+        doc.push_str("| R | `metadata_results` | Per-query matching base ordinals | ivvec (variable-length i32) |\n");
     }
     if has_prefilter {
         doc.push_str("| F | `prefiltered_neighbor_indices` | Pre-filter top-K: k-nearest among predicate-matching base vectors (ACORN G_K; full K when \\|X_p\\| ≥ K) | ivec (i32) |\n");
@@ -645,7 +645,7 @@ fn write_ordinals(config: &DatasetConfig, workspace: &Path, doc: &mut String) {
         doc.push_str(&format!("neighbor_indices[42]           → i32[{}] nearest base ordinals (G facet)\n", k));
         if profile.view("metadata_predicates").is_some() {
             doc.push_str("metadata_predicates[42]        → the filter condition for this query (P facet)\n");
-            doc.push_str("metadata_indices[42]           → variable-length list of matching base ordinals (R facet)\n");
+            doc.push_str("metadata_results[42]           → variable-length list of matching base ordinals (R facet)\n");
             doc.push_str(&format!("filtered_neighbor_indices[42]  → i32[{}] nearest among matching bases (F facet)\n", k));
         }
         doc.push_str("```\n\n");
@@ -669,12 +669,12 @@ fn write_ordinals(config: &DatasetConfig, workspace: &Path, doc: &mut String) {
         doc.push_str("metadata_predicates[q]    \"field_0 == 5\"     (one predicate per query)\n");
         doc.push_str("        │\n");
         doc.push_str("        ▼  evaluate against metadata_content[0..N]\n");
-        doc.push_str("metadata_indices[q]       [12, 45, 89, ...]  (variable-length: all matching base ordinals)\n");
+        doc.push_str("metadata_results[q]       [12, 45, 89, ...]  (variable-length: all matching base ordinals)\n");
         doc.push_str("        │\n");
         doc.push_str("        ▼  brute-force KNN restricted to matching ordinals\n");
         doc.push_str("filtered_neighbor_indices[q]  [89, 12, 45, ...]  (top-k nearest among matches)\n");
         doc.push_str("```\n\n");
-        doc.push_str("Note: `metadata_indices` uses ivvec format (variable-length records) because \
+        doc.push_str("Note: `metadata_results` uses ivvec format (variable-length records) because \
             the number of matching base vectors varies per query. \
             `filtered_neighbor_indices` is fixed-length ivec (always k neighbors).\n\n");
     }

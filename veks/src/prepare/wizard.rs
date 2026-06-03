@@ -2206,7 +2206,8 @@ fn scan_candidates(dir: &Path) -> Vec<(PathBuf, String, u64)> {
                 | "query_vectors_clean"
                 | "neighbor_indices" | "neighbor_distances"
                 | "filtered_neighbor_indices" | "filtered_neighbor_distances"
-                | "metadata_content" | "metadata_predicates" | "metadata_indices"
+                | "metadata_content" | "metadata_predicates"
+                | "metadata_results" | "metadata_indices"
             ) {
                 continue;
             }

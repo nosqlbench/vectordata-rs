@@ -765,6 +765,54 @@ fn materialize_slab<F: FnMut(u64)>(
             cb(data.len() as u64);
         }
     }
+
+    // Carry sibling namespaces (e.g. the metadata `layout` schema) forward
+    // verbatim. Windowing applies only to the default content namespace;
+    // sibling namespaces are metadata (not per-row), so they are copied
+    // whole rather than sliced. Without this, a windowed derive would drop
+    // the embedded layout copy.
+    let namespaces = slabtastic::SlabReader::list_namespaces(src).map_err(|e| {
+        io::Error::other(format!("list namespaces of {}: {e}", src.display()))
+    })?;
+    for ns in &namespaces {
+        if ns.name.is_empty() {
+            continue; // default namespace — already written (windowed) above
+        }
+        let ns_reader =
+            slabtastic::SlabReader::open_namespace(src, Some(&ns.name)).map_err(|e| {
+                io::Error::other(format!(
+                    "open namespace '{}' of {}: {e}",
+                    ns.name,
+                    src.display()
+                ))
+            })?;
+        writer.start_namespace(&ns.name).map_err(|e| {
+            io::Error::other(format!(
+                "start namespace '{}' in {}: {e}",
+                ns.name,
+                dest.display()
+            ))
+        })?;
+        let total = ns_reader.total_records() as i64;
+        for ord in 0..total {
+            let data = ns_reader.get(ord).map_err(|e| {
+                io::Error::other(format!(
+                    "read namespace '{}' ordinal {ord} from {}: {e}",
+                    ns.name,
+                    src.display()
+                ))
+            })?;
+            writer.add_record(&data).map_err(|e| {
+                io::Error::other(format!(
+                    "write namespace '{}' ordinal {ord} to {}: {e}",
+                    ns.name,
+                    dest.display()
+                ))
+            })?;
+            cb(data.len() as u64);
+        }
+    }
+
     writer
         .finish()
         .map_err(|e| io::Error::other(format!("finalize slab {}: {e}", dest.display())))?;
@@ -1116,27 +1164,32 @@ mod tests {
         assert!(written > 0, "byte copy should have ticked progress");
     }
 
-    /// Windowed derive of a slab keeps only the selected ordinals in
-    /// the content namespace; sibling namespaces are not yet carried
-    /// across (an explicit known limitation — windowed slicing today
-    /// rebuilds only the default namespace).
+    /// Windowed derive of a slab keeps only the selected ordinals in the
+    /// content namespace, **and** carries sibling namespaces (e.g. the
+    /// `:schema`/`layout` sidecar) forward verbatim — they are metadata, not
+    /// per-row, so they are copied whole rather than sliced.
     #[test]
-    fn materialize_slab_with_window_slices_content() {
+    fn materialize_slab_with_window_slices_content_and_keeps_namespaces() {
         let tmp = tempfile::tempdir().unwrap();
         let src = tmp.path().join("m.slab");
         let dst = tmp.path().join("m-derived.slab");
-        write_test_slab(&src, 10);
+        write_test_slab(&src, 10); // also writes a `schema` namespace record
 
         let window = DSWindow(vec![DSInterval { min_incl: 2, max_excl: 5 }]);
         let mut written = 0u64;
         materialize_slab(&src, &dst, &window, |d| written += d).unwrap();
 
+        // Content namespace: exactly the windowed range.
         let r = slabtastic::SlabReader::open(&dst).unwrap();
         assert_eq!(r.get(0).unwrap(), b"r-2");
         assert_eq!(r.get(1).unwrap(), b"r-3");
         assert_eq!(r.get(2).unwrap(), b"r-4");
         assert!(r.get(3).is_err(), "window should produce exactly 3 records");
         assert!(written > 0);
+
+        // Sibling namespace: carried across verbatim (the prior limitation).
+        let s = slabtastic::SlabReader::open_namespace(&dst, Some("schema")).unwrap();
+        assert_eq!(s.get(0).unwrap(), b"{\"v\":1}");
     }
 
     /// `classify_facet` recognizes `.slab` without demanding an

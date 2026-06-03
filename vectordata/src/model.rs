@@ -242,8 +242,10 @@ pub struct ProfileConfig {
     pub metadata_content: Option<FacetConfig>,
     /// Metadata predicate trees (PNode-encoded slab).
     pub metadata_predicates: Option<FacetConfig>,
-    /// Predicate result indices — ordinals matching metadata records for each predicate.
-    #[serde(alias = "metadata_indices")]
+    /// Predicate result indices — ordinals matching metadata records for each
+    /// predicate. Canonical key `metadata_results`; the legacy `metadata_indices`
+    /// and the old field name `predicate_results` are accepted as aliases.
+    #[serde(rename = "metadata_results", alias = "metadata_indices", alias = "predicate_results")]
     pub predicate_results: Option<FacetConfig>,
     /// Metadata layout describing the field schema.
     pub metadata_layout: Option<FacetConfig>,

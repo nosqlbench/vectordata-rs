@@ -855,7 +855,8 @@ mod tests {
     /// Filename-based classifier correctly distinguishes the
     /// canonical sibling slabs in a dataset directory: only
     /// `metadata_content.slab` is classified as a metadata
-    /// source; `metadata_predicates.slab`, `metadata_indices.slab`,
+    /// source; `metadata_predicates.slab`, the R-facet index
+    /// (`metadata_results.slab` / legacy `metadata_indices.slab`),
     /// and `predicates.slab` are all skipped.
     #[test]
     fn autodetect_picks_only_metadata_content_when_siblings_present() {
@@ -865,6 +866,7 @@ mod tests {
         std::fs::create_dir_all(&nested).unwrap();
         write_plain_slab(&nested.join("metadata_content.slab"));
         write_plain_slab(&nested.join("metadata_predicates.slab"));
+        write_plain_slab(&nested.join("metadata_results.slab"));
         write_plain_slab(&nested.join("metadata_indices.slab"));
         write_plain_slab(&root.join("predicates.slab"));
 

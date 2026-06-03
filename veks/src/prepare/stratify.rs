@@ -45,7 +45,7 @@ pub(crate) fn classify_facet(name: &str) -> FacetRole {
         | "prefiltered_neighbor_indices" | "prefiltered_neighbor_distances"
         | "postfiltered_neighbor_indices" | "postfiltered_neighbor_distances"
         | "filtered_neighbor_indices" | "filtered_neighbor_distances"
-        | "metadata_indices" => FacetRole::PerProfile,
+        | "metadata_results" | "metadata_indices" => FacetRole::PerProfile,
         _ => FacetRole::Shared,
     }
 }

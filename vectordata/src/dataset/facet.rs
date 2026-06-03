@@ -36,6 +36,56 @@ use std::fmt;
 ///
 /// Each variant identifies a specific role within a test dataset. The
 /// canonical key name is used in `dataset.yaml` profile definitions.
+/// The value-shape a facet's bytes take in a file/resource. This is the
+/// coarse format taxonomy; specific element widths live in the extension
+/// list each format owns. It is the authority for questions like
+/// "can this facet be stored as an integer xvec?".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FacetFormat {
+    /// Float xvec (`fvecs`/`fvec`/`dvecs`/…) — vectors and distances.
+    FloatXvec,
+    /// Fixed-width integer xvec (`ivecs`/`ivec`/`i32vecs`/…) — neighbor IDs.
+    IntegerXvec,
+    /// Variable-length integer xvec (`ivvecs`/`ivvec`/…) — the per-query
+    /// predicate-match index (R).
+    IntegerVarXvec,
+    /// Raw packed scalars (`u8`/`i32`/…) — flat metadata columns.
+    ScalarPacked,
+    /// A slabtastic slab (`slab`) — MNode/PNode records, layout namespaces.
+    Slab,
+}
+
+impl FacetFormat {
+    /// Every recognized file extension for this format, plural (canonical)
+    /// forms first.
+    pub fn extensions(self) -> &'static [&'static str] {
+        match self {
+            Self::FloatXvec => &[
+                "fvecs", "dvecs", "mvecs", "fvec", "dvec", "mvec",
+                "f32vecs", "f64vecs", "f16vecs", "f32vec", "f64vec", "f16vec",
+            ],
+            Self::IntegerXvec => &[
+                "ivecs", "i32vecs", "u32vecs", "ivec", "i32vec", "u32vec",
+                "i8vecs", "u8vecs", "bvecs", "i16vecs", "u16vecs", "svecs",
+                "i8vec", "u8vec", "bvec", "i16vec", "u16vec", "svec",
+                "i64vecs", "u64vecs", "i64vec", "u64vec",
+            ],
+            Self::IntegerVarXvec => &[
+                "ivvecs", "i32vvecs", "u32vvecs", "ivvec", "i32vvec", "u32vvec",
+            ],
+            Self::ScalarPacked => &["u8", "i8", "u16", "i16", "u32", "i32", "u64", "i64"],
+            Self::Slab => &["slab"],
+        }
+    }
+
+    /// The format an extension belongs to, if recognized.
+    pub fn from_extension(ext: &str) -> Option<Self> {
+        [Self::FloatXvec, Self::IntegerXvec, Self::IntegerVarXvec, Self::ScalarPacked, Self::Slab]
+            .into_iter()
+            .find(|f| f.extensions().contains(&ext))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StandardFacet {
     /// Base vectors (the corpus to search) — facet code `B`
@@ -121,6 +171,94 @@ impl StandardFacet {
             Self::PrefilteredNeighborIndices | Self::PrefilteredNeighborDistances => Some('F'),
             Self::PostfilteredNeighborIndices | Self::PostfilteredNeighborDistances => Some('E'),
         }
+    }
+
+    /// The value-shape(s) this facet's bytes may legitimately take. The
+    /// authority for "can facet X be stored as format Y?".
+    pub fn formats(self) -> &'static [FacetFormat] {
+        use FacetFormat::*;
+        match self {
+            Self::BaseVectors | Self::QueryVectors | Self::NeighborDistances
+            | Self::PrefilteredNeighborDistances | Self::PostfilteredNeighborDistances => &[FloatXvec],
+            Self::NeighborIndices
+            | Self::PrefilteredNeighborIndices | Self::PostfilteredNeighborIndices => &[IntegerXvec],
+            // Metadata content may be a slab of MNode records, raw packed
+            // scalars, or an integer xvec (see `gen metadata`'s modes).
+            Self::MetadataContent => &[Slab, ScalarPacked, IntegerXvec],
+            // Predicate trees are a PNode slab; synthesis modes also emit
+            // raw packed / integer-xvec encodings.
+            Self::MetadataPredicates => &[Slab, ScalarPacked, IntegerXvec],
+            // The predicate-match index (R): a variable-length integer xvec
+            // by default, a fixed integer xvec or slab in other modes.
+            Self::MetadataResults => &[IntegerVarXvec, IntegerXvec, Slab],
+            // The schema: a slab (its own file, or a `#layout` namespace
+            // inside a metadata slab).
+            Self::MetadataLayout => &[Slab],
+        }
+    }
+
+    /// On-disk basename(s) the facet's primary file may use — canonical
+    /// first, then legacy names retained for extant datasets. (A facet is
+    /// not 1:1 with a single filename.)
+    pub fn basenames(self) -> &'static [&'static str] {
+        match self {
+            Self::BaseVectors => &["base_vectors"],
+            Self::QueryVectors => &["query_vectors"],
+            Self::NeighborIndices => &["neighbor_indices"],
+            Self::NeighborDistances => &["neighbor_distances"],
+            Self::MetadataContent => &["metadata_content"],
+            Self::MetadataPredicates => &["metadata_predicates"],
+            // Historically the predicate-match index was `metadata_indices`.
+            Self::MetadataResults => &["metadata_results", "metadata_indices"],
+            Self::MetadataLayout => &["metadata_layout"],
+            // Legacy `filtered_*` names retained for extant datasets.
+            Self::PrefilteredNeighborIndices => &["prefiltered_neighbor_indices", "filtered_neighbor_indices"],
+            Self::PrefilteredNeighborDistances => &["prefiltered_neighbor_distances", "filtered_neighbor_distances"],
+            Self::PostfilteredNeighborIndices => &["postfiltered_neighbor_indices"],
+            Self::PostfilteredNeighborDistances => &["postfiltered_neighbor_distances"],
+        }
+    }
+
+    /// The slab namespace(s) the facet's data may live in. Most facets use
+    /// the default namespace (`""`); the layout schema may instead be a
+    /// `layout` namespace co-located in a metadata slab.
+    pub fn namespaces(self) -> &'static [&'static str] {
+        match self {
+            Self::MetadataLayout => &["layout", ""],
+            _ => &[""],
+        }
+    }
+
+    /// Does this facet accept the given value-shape?
+    pub fn accepts_format(self, format: FacetFormat) -> bool {
+        self.formats().contains(&format)
+    }
+
+    /// Every file extension valid for this facet (the union over its
+    /// formats). Answers "can I store this facet in a `*.ivecs` file?".
+    pub fn accepts_extension(self, ext: &str) -> bool {
+        self.formats().iter().any(|f| f.extensions().contains(&ext))
+    }
+
+    /// Classify a file/resource name to the facet (and format) it belongs
+    /// to, or `None` if it matches no facet. Strips a directory prefix, a
+    /// `#namespace` suffix, and an `IDXFOR__…` sidecar wrapper.
+    pub fn classify(name: &str) -> Option<(StandardFacet, FacetFormat)> {
+        let name = name.rsplit(['/', '\\']).next().unwrap_or(name);
+        let name = name.split('#').next().unwrap_or(name);
+        // An `IDXFOR__<data>.<idx-ext>` sidecar belongs to the same facet as
+        // its data file `<data>`; drop the wrapper and the index extension.
+        let name = match name.strip_prefix("IDXFOR__") {
+            Some(rest) => rest.rsplit_once('.').map(|(base, _)| base).unwrap_or(rest),
+            None => name,
+        };
+        let (basename, ext) = name.rsplit_once('.')?;
+        let fmt = FacetFormat::from_extension(ext)?;
+        Self::PREFERRED_ORDER
+            .iter()
+            .copied()
+            .find(|f| f.basenames().contains(&basename) && f.accepts_format(fmt))
+            .map(|f| (f, fmt))
     }
 
     /// Parse a facet from its canonical key name.
@@ -249,6 +387,58 @@ mod tests {
     #[test]
     fn test_preferred_order_is_complete() {
         assert_eq!(StandardFacet::PREFERRED_ORDER.len(), 12);
+    }
+
+    /// The three questions the standardized spec must answer cheaply.
+    #[test]
+    fn spec_answers_facet_format_validity() {
+        // "Can I store my metadata (content) in an integer xvec file?" — yes.
+        assert!(StandardFacet::MetadataContent.accepts_format(FacetFormat::IntegerXvec));
+        assert!(StandardFacet::MetadataContent.accepts_extension("ivecs"));
+        // Base vectors are float xvec only — not integer.
+        assert!(!StandardFacet::BaseVectors.accepts_format(FacetFormat::IntegerXvec));
+        assert!(StandardFacet::BaseVectors.accepts_extension("fvecs"));
+        // The R index accepts the variable-length integer xvec form.
+        assert!(StandardFacet::MetadataResults.accepts_format(FacetFormat::IntegerVarXvec));
+        assert!(StandardFacet::MetadataResults.accepts_extension("ivvecs"));
+    }
+
+    #[test]
+    fn spec_classifies_resources_to_facets() {
+        // "Does this file belong to the metadata_content facet?"
+        assert_eq!(
+            StandardFacet::classify("profiles/base/metadata_content.slab"),
+            Some((StandardFacet::MetadataContent, FacetFormat::Slab)),
+        );
+        // The R index, under canonical and legacy names + its IDXFOR sidecar.
+        assert_eq!(
+            StandardFacet::classify("profiles/default/metadata_results.ivvecs").map(|(f, _)| f),
+            Some(StandardFacet::MetadataResults),
+        );
+        assert_eq!(
+            StandardFacet::classify("profiles/default/metadata_indices.ivvecs").map(|(f, _)| f),
+            Some(StandardFacet::MetadataResults),
+        );
+        assert_eq!(
+            StandardFacet::classify("IDXFOR__metadata_results.ivvecs.i32").map(|(f, _)| f),
+            Some(StandardFacet::MetadataResults),
+        );
+        // A `#namespace` locator classifies by its file part.
+        assert_eq!(
+            StandardFacet::classify("metadata_content.slab#layout").map(|(f, _)| f),
+            Some(StandardFacet::MetadataContent),
+        );
+        assert_eq!(StandardFacet::classify("random_unknown.xyz"), None);
+    }
+
+    #[test]
+    fn spec_enumerates_facet_resources() {
+        // "What files/resources/namespaces are associated with facet R?"
+        let r = StandardFacet::MetadataResults;
+        assert_eq!(r.basenames(), &["metadata_results", "metadata_indices"]);
+        assert!(r.accepts_extension("ivvecs") && r.accepts_extension("slab"));
+        // The layout schema may be a co-located `layout` namespace.
+        assert!(StandardFacet::MetadataLayout.namespaces().contains(&"layout"));
     }
 
     /// Canonical keys for E and F are distinct from the legacy `filtered_*`

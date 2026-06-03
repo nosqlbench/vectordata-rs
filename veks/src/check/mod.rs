@@ -176,6 +176,7 @@ pub fn run(args: CheckArgs) {
     // Check required dataset attributes
     if is_dataset_context && (run_all || args.check_pipelines) {
         results.push(check_dataset_attributes(&dataset_files));
+        results.push(check_conformance(&dataset_files));
     }
     if run_publish {
         results.push(publish_url::check(&directory, &dataset_files));
@@ -370,6 +371,42 @@ pub fn run(args: CheckArgs) {
 
 /// Remove empty directories recursively (bottom-up), excluding hidden dirs.
 /// Check that each dataset.yaml has the required attributes set.
+/// Validate that every dataset.yaml conforms to the standardized facet
+/// spec (`vectordata::dataset::facet`): each profile/facet/resource must be
+/// expressed consistently, so a facet's valid files/formats are always
+/// derivable from the spec. This is the **check-time** enforcement gate;
+/// loading stays lenient (a mid-pipeline dataset may declare facets not yet
+/// produced), but a completed dataset must adhere strictly.
+fn check_conformance(dataset_files: &[PathBuf]) -> CheckResult {
+    let mut violation_msgs: Vec<String> = Vec::new();
+
+    for ds_path in dataset_files {
+        let config = match vectordata::dataset::DatasetConfig::load(ds_path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        let ds_dir = ds_path.parent().unwrap_or(std::path::Path::new("."));
+        let ds_rel = rel_display(ds_dir);
+
+        if let Err(violations) =
+            vectordata::dataset::conformance::validate_conformance(&config)
+        {
+            for v in violations {
+                violation_msgs.push(format!("{}: {}", ds_rel, v));
+            }
+        }
+    }
+
+    if violation_msgs.is_empty() {
+        let mut r = CheckResult::ok("facet-conformance");
+        r.messages.push("all profiles/facets/resources conform to the facet spec".to_string());
+        r
+    } else {
+        CheckResult::fail("facet-conformance", violation_msgs)
+    }
+}
+
 fn check_dataset_attributes(dataset_files: &[PathBuf]) -> CheckResult {
     let mut missing_msgs: Vec<String> = Vec::new();
 

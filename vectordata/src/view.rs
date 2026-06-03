@@ -313,10 +313,12 @@ pub trait TestDataView: Send + Sync {
     /// Returns the facet config for metadata layout, if present.
     fn metadata_layout(&self) -> Option<&FacetConfig>;
 
-    /// Returns a reader for predicate result indices (metadata_indices).
-    /// This is typically a variable-length file (ivvec) where each
-    /// predicate maps to a different number of matching base ordinals.
-    fn metadata_indices(&self) -> Result<Arc<dyn VvecReader<i32>>>;
+    /// Returns a reader for the predicate-result indices (the `R` facet,
+    /// canonically `metadata_results`; legacy `metadata_indices` is still
+    /// resolved on read). This is typically a variable-length file (ivvec)
+    /// where each predicate maps to a different number of matching base
+    /// ordinals.
+    fn metadata_results(&self) -> Result<Arc<dyn VvecReader<i32>>>;
 
     // -- Facet discovery --
 
@@ -1005,8 +1007,8 @@ impl TestDataView for GenericTestDataView {
         self.collect_facets()
     }
 
-    fn metadata_indices(&self) -> Result<Arc<dyn VvecReader<i32>>> {
-        self.open_variable(self.config.predicate_results.as_ref(), "metadata_indices")
+    fn metadata_results(&self) -> Result<Arc<dyn VvecReader<i32>>> {
+        self.open_variable(self.config.predicate_results.as_ref(), "metadata_results")
     }
 
     fn facet(&self, name: &str) -> Result<Arc<dyn VectorReader<f32>>> {

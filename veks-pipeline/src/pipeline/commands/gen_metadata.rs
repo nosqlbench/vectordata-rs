@@ -34,6 +34,25 @@ fn error_result(msg: impl Into<String>, start: Instant) -> CommandResult {
     }
 }
 
+/// Canonical name of the slab namespace carrying the metadata layout
+/// (schema) alongside the metadata content. Addressed in a view as
+/// `…/metadata_content.slab#layout`.
+pub const LAYOUT_NAMESPACE: &str = "layout";
+
+/// The metadata layout (schema) bytes for a set of integer metadata
+/// fields: the structural fingerprint (field names + types, values
+/// defaulted) of one record, serialized as anode `MNode` bytes. Opaque to
+/// the pipeline — callers decode with an `anode` implementation. Two
+/// metadata artifacts are schema-compatible iff these bytes match
+/// byte-for-byte.
+pub fn metadata_layout_bytes(field_names: &[String]) -> Vec<u8> {
+    let mut schema = MNode::new();
+    for name in field_names {
+        schema.insert(name.clone(), MValue::Int32(0));
+    }
+    schema.fingerprint().to_bytes()
+}
+
 fn resolve_path(s: &str, workspace: &Path) -> std::path::PathBuf {
     let p = std::path::Path::new(s);
     if p.is_absolute() { p.to_path_buf() } else { workspace.join(p) }
@@ -136,6 +155,11 @@ compatible with `generate predicates` and `compute evaluate-predicates`.
             "u8" | "i8" => 1, "u16" | "i16" => 2, "u32" | "i32" => 4, "u64" | "i64" => 8, _ => 0,
         };
 
+        // The metadata field schema. The same `field_N` names back every
+        // content format (scalar/ivec/slab), so the layout is identical
+        // regardless of how the content is encoded.
+        let field_names: Vec<String> = (0..fields).map(|i| format!("field_{}", i)).collect();
+
         if is_scalar {
             // Write as flat packed scalar: each record is `fields` values of the scalar type
             use std::io::Write;
@@ -189,10 +213,6 @@ compatible with `generate predicates` and `compute evaluate-predicates`.
             pb.finish();
         } else {
             // Write as slab of MNode records
-            let field_names: Vec<String> = (0..fields)
-                .map(|i| format!("field_{}", i))
-                .collect();
-
             let config = match slabtastic::WriterConfig::new(512, 4096, u32::MAX, false) {
                 Ok(c) => c,
                 Err(e) => return error_result(format!("slab config: {}", e), start),
@@ -219,9 +239,56 @@ compatible with `generate predicates` and `compute evaluate-predicates`.
             }
             pb.finish();
 
+            // Co-locate the metadata layout (schema) as a `layout` namespace
+            // in the same slab. The layout is the records' structural
+            // fingerprint (field names + types, values defaulted) — opaque
+            // anode bytes here; callers decode with an `anode` impl. Two
+            // metadata slabs are schema-compatible iff their `layout`
+            // namespaces are byte-identical (see `metadata_layout_bytes`).
+            if let Err(e) = writer.start_namespace("layout") {
+                return error_result(format!("open layout namespace: {}", e), start);
+            }
+            if let Err(e) = writer.add_record(&metadata_layout_bytes(&field_names)) {
+                return error_result(format!("write layout: {}", e), start);
+            }
+
             if let Err(e) = writer.finish() {
                 return error_result(format!("finalize slab: {}", e), start);
             }
+        }
+
+        // Write the authoritative metadata layout (schema) to a standalone
+        // `metadata_layout.slab` when requested. Its *default* namespace
+        // holds the single schema record. Unlike the in-content `layout`
+        // namespace (a convenience copy that slab slicing/extract may drop),
+        // this standalone file is the slicing-proof home of the schema and
+        // backs the optional `metadata_layout` facet. Identical bytes to the
+        // embedded copy, so `vectordata`'s byte-for-byte layout compatibility
+        // check holds across both.
+        let mut produced = vec![output_path.clone()];
+        if let Some(layout_str) = options.get("layout-output") {
+            let layout_path = resolve_path(layout_str, &ctx.workspace);
+            if let Some(parent) = layout_path.parent() {
+                if !parent.exists() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+            }
+            let cfg = match slabtastic::WriterConfig::new(512, 4096, u32::MAX, false) {
+                Ok(c) => c,
+                Err(e) => return error_result(format!("layout slab config: {}", e), start),
+            };
+            let mut lw = match slabtastic::SlabWriter::new(&layout_path, cfg) {
+                Ok(w) => w,
+                Err(e) => return error_result(format!("create layout slab: {}", e), start),
+            };
+            if let Err(e) = lw.add_record(&metadata_layout_bytes(&field_names)) {
+                return error_result(format!("write layout record: {}", e), start);
+            }
+            if let Err(e) = lw.finish() {
+                return error_result(format!("finalize layout slab: {}", e), start);
+            }
+            ctx.ui.log(&format!("  wrote metadata layout schema to {}", layout_path.display()));
+            produced.push(layout_path);
         }
 
         // Set verified count variable
@@ -242,7 +309,7 @@ compatible with `generate predicates` and `compute evaluate-predicates`.
                 "{} records, {} fields, range [{}..{}), seed={}",
                 count, fields, range_min, range_max, seed,
             ),
-            produced: vec![output_path],
+            produced,
             elapsed: start.elapsed(),
         }
     }
@@ -253,6 +320,19 @@ compatible with `generate predicates` and `compute evaluate-predicates`.
                 name: "output".into(), type_name: "Path".into(), required: true,
                 default: None, description: "Output slab file".into(),
             extended_description: None,
+                role: OptionRole::Output,
+            },
+            OptionDesc {
+                name: "layout-output".into(), type_name: "Path".into(), required: false,
+                default: None,
+                description: "Standalone slab to receive the metadata layout (schema)".into(),
+                extended_description: Some(
+                    "When set, writes the field schema as a single record in this \
+                     slab's default namespace — the authoritative, slicing-proof home \
+                     of the metadata layout, backing the optional `metadata_layout` \
+                     facet. Byte-identical to the `layout` namespace embedded in slab \
+                     content.".into(),
+                ),
                 role: OptionRole::Output,
             },
             OptionDesc {
@@ -296,7 +376,7 @@ compatible with `generate predicates` and `compute evaluate-predicates`.
         crate::pipeline::command::manifest_from_keys(
             step_id, self.command_path(), options,
             &[],
-            &["output"],
+            &["output", "layout-output"],
         )
     }
 }
@@ -390,6 +470,95 @@ mod tests {
         let data1 = std::fs::read(&out1).unwrap();
         let data2 = std::fs::read(&out2).unwrap();
         assert_eq!(data1, data2, "same seed should produce identical output");
+    }
+
+    #[test]
+    fn metadata_layout_namespace_and_schema_compat() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = make_ctx(tmp.path());
+        let out = tmp.path().join("metadata_content.slab");
+        let mut opts = Options::new();
+        opts.set("output", out.to_string_lossy().to_string());
+        opts.set("count", "20");
+        opts.set("fields", "3");
+        opts.set("range-min", "0");
+        opts.set("range-max", "10");
+        let mut op = GenerateMetadataOp;
+        assert_eq!(op.execute(&opts, &mut ctx).status, Status::Ok);
+
+        // The content lives in the default namespace; the schema is a
+        // co-located `layout` namespace, byte-equal to the canonical bytes.
+        let field_names: Vec<String> = (0..3).map(|i| format!("field_{i}")).collect();
+        let layout = slabtastic::SlabReader::open_namespace(&out, Some(LAYOUT_NAMESPACE)).unwrap();
+        assert_eq!(
+            layout.get(0).unwrap(),
+            metadata_layout_bytes(&field_names),
+            "the `layout` namespace must hold the canonical schema bytes",
+        );
+
+        // Compatibility = byte-for-byte schema match: same field structure
+        // → identical bytes; a different field count → different bytes.
+        let four: Vec<String> = (0..4).map(|i| format!("field_{i}")).collect();
+        assert_eq!(metadata_layout_bytes(&field_names), metadata_layout_bytes(&field_names.clone()));
+        assert_ne!(metadata_layout_bytes(&field_names), metadata_layout_bytes(&four));
+
+        // The default namespace still holds the content records, intact.
+        let content = slabtastic::SlabReader::open(&out).unwrap();
+        let node = MNode::from_bytes(&content.get(0).unwrap()).unwrap();
+        assert_eq!(node.fields.len(), 3);
+    }
+
+    /// `layout-output` writes a standalone `metadata_layout.slab` whose
+    /// default namespace carries the schema, byte-identical to the embedded
+    /// `layout` namespace copy — so a content slab and the standalone are
+    /// compatible under `vectordata`'s byte-for-byte layout check.
+    #[test]
+    fn standalone_layout_output_is_byte_identical_to_embedded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = make_ctx(tmp.path());
+        let content = tmp.path().join("metadata_content.slab");
+        let layout = tmp.path().join("metadata_layout.slab");
+        let mut opts = Options::new();
+        opts.set("output", content.to_string_lossy().to_string());
+        opts.set("layout-output", layout.to_string_lossy().to_string());
+        opts.set("count", "20");
+        opts.set("fields", "3");
+        let mut op = GenerateMetadataOp;
+        let result = op.execute(&opts, &mut ctx);
+        assert_eq!(result.status, Status::Ok);
+        // Both outputs are reported as produced.
+        assert!(result.produced.contains(&layout), "layout slab must be a produced artifact");
+
+        // Standalone: schema in the *default* namespace, record 0.
+        let standalone = slabtastic::SlabReader::open(&layout).unwrap();
+        let field_names: Vec<String> = (0..3).map(|i| format!("field_{i}")).collect();
+        assert_eq!(standalone.get(0).unwrap(), metadata_layout_bytes(&field_names));
+
+        // Byte-identical to the embedded `layout` namespace copy.
+        let embedded = slabtastic::SlabReader::open_namespace(&content, Some(LAYOUT_NAMESPACE)).unwrap();
+        assert_eq!(standalone.get(0).unwrap(), embedded.get(0).unwrap());
+    }
+
+    /// The standalone layout is written even when the content format is a
+    /// flat scalar (no embedded namespace) — the schema is format-agnostic.
+    #[test]
+    fn standalone_layout_output_for_scalar_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = make_ctx(tmp.path());
+        let content = tmp.path().join("metadata_content.u8");
+        let layout = tmp.path().join("metadata_layout.slab");
+        let mut opts = Options::new();
+        opts.set("output", content.to_string_lossy().to_string());
+        opts.set("layout-output", layout.to_string_lossy().to_string());
+        opts.set("count", "16");
+        opts.set("fields", "2");
+        opts.set("format", "u8");
+        let mut op = GenerateMetadataOp;
+        assert_eq!(op.execute(&opts, &mut ctx).status, Status::Ok);
+
+        let standalone = slabtastic::SlabReader::open(&layout).unwrap();
+        let field_names: Vec<String> = (0..2).map(|i| format!("field_{i}")).collect();
+        assert_eq!(standalone.get(0).unwrap(), metadata_layout_bytes(&field_names));
     }
 
     #[test]
