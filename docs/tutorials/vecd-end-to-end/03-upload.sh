@@ -5,14 +5,14 @@
 # Run:  bash 03-upload.sh   (after 01 and 02)
 source "$(dirname "$0")/env.sh"
 
-TOKEN="$(cat "$ALICE_TOKEN_FILE")"
+TOKEN="$(cat "$DEMO/alice.token")"   # minted for alice in step 01
 
-say "push the dataset to $VECD_BASE/$NS_DATASET/"
+say "push the dataset to $(vecd_base)/datasets/toy/"
 # vectordata speaks vecd's object-REST protocol: a versioned PUT of every
 # facet file under the namespace, bearer-authenticated. The first push to an
 # empty namespace creates version 1.
-vectordata datasets push "$DATASET_DIR" \
-  --to "$VECD_BASE/$NS_DATASET/" \
+vectordata datasets push "$DEMO/work/toy" \
+  --to "$(vecd_base)/datasets/toy/" \
   --token "$TOKEN" \
   --yes
 
@@ -22,22 +22,22 @@ say "generate a catalog that lists the dataset"
 # writes one entry per .publish-marked dataset, embedding each dataset's
 # profiles/facets. We mark the dataset publishable and point the catalog
 # root's .publish_url at the namespace, then generate.
-: > "$DATASET_DIR/.publish"                                  # mark toy publishable
-[ -n "$DATASET_DIR" ] && rm -f "$DATASET_DIR/.publish_url"   # push wrote this; the root owns it
-printf '%s\n' "$VECD_BASE/$NS_ROOT/" > "$WORK_DIR/.publish_url"
-veks prepare catalog generate "$WORK_DIR"
+: > "$DEMO/work/toy/.publish"                  # mark toy publishable
+rm -f "$DEMO/work/toy/.publish_url"            # push wrote this; the root owns it
+printf '%s\n' "$(vecd_base)/datasets/" > "$DEMO/work/.publish_url"
+veks prepare catalog generate "$DEMO/work"
 
-say "upload the catalog to the '$NS_ROOT' namespace root"
+say "upload the catalog to the 'datasets' namespace root"
 # The resolver probes a directory URL for catalog.json then catalog.yaml, so
 # placing them at the namespace root makes the whole namespace a catalog.
 # Each entry's `path` (toy/dataset.yaml) resolves relative to this location.
 for c in catalog.json catalog.yaml; do
-  curl -fsS -X PUT "$VECD_BASE/$NS_ROOT/$c" \
+  curl -fsS -X PUT "$(vecd_base)/datasets/$c" \
     -H "Authorization: Bearer $TOKEN" \
-    --data-binary @"$WORK_DIR/$c" -o /dev/null \
+    --data-binary @"$DEMO/work/$c" -o /dev/null \
     -w "  PUT $c -> HTTP %{http_code}\n"
 done
 
 echo
-echo "uploaded the dataset to $VECD_BASE/$NS_DATASET/"
-echo "published a catalog at $VECD_BASE/$NS_ROOT/catalog.yaml"
+echo "uploaded the dataset to $(vecd_base)/datasets/toy/"
+echo "published a catalog at $(vecd_base)/datasets/catalog.yaml"

@@ -14,15 +14,19 @@
 #   E postfiltered_neighbor_indices — post-filter KNN ground truth (+distances)
 # plus the optional metadata_layout (the field schema, as a standalone slab).
 #
+# The dataset is built under $DEMO/work; nothing here needs the server.
+#
 # Run:  bash 02-generate-dataset.sh
 source "$(dirname "$0")/env.sh"
 
-mkdir -p "$WORK_DIR"
-BASE_VECS="$WORK_DIR/base.fvecs"
+mkdir -p "$DEMO/work"
 
 say "generate 2000 random 16-dim base vectors (no external data needed)"
+# --workspace keeps this ad-hoc command's bookkeeping (its variable cache,
+# .cache/) inside the demo's work dir instead of the current directory.
 veks pipeline generate vectors \
-  --output "$BASE_VECS" \
+  --workspace "$DEMO/work" \
+  --output "$DEMO/work/base.fvecs" \
   --dimension 16 \
   --count 2000 \
   --seed 7
@@ -36,9 +40,9 @@ say "bootstrap a dataset.yaml requesting ALL facets, with synthetic metadata"
 #                        and the strict predicate cross-verification passes
 # --required-facets      pin the full facet set
 veks prepare bootstrap \
-  --name "$DATASET_NAME" \
-  --output "$DATASET_DIR" \
-  --base-vectors "$BASE_VECS" \
+  --name toy \
+  --output "$DEMO/work/toy" \
+  --base-vectors "$DEMO/work/base.fvecs" \
   --self-search \
   --query-count 50 \
   --metric L2 \
@@ -47,24 +51,26 @@ veks prepare bootstrap \
   --synthesize-metadata \
   --metadata-fields 3 \
   --selectivity 0.05 \
-  --predicate-count 1000 \
+  --predicate-count 12000 \
   --synthesis-mode simple-int-eq \
   --synthesis-format ivec \
   --required-facets "BQGDMPRF" \
   --force
-# --predicate-count keeps the R (metadata_results) facet small. A larger
-# count is fine for real datasets, but note vecd currently buffers each
-# uploaded object in memory with a default request-body cap (~2 MB), so a
-# toy stays well under it. See README "A note on object sizes".
+# --predicate-count drives the size of the R (metadata_results) facet:
+# ~12000 predicates × ~100 matching ordinals × 4 bytes ≈ a multi-MB object.
+# vecd now *streams* each upload straight to storage (no whole-object
+# buffering, no request-body cap), so large facets ride through unimpeded —
+# the per-namespace quota (50 TiB default) is the only size gate. See README
+# "A note on object sizes".
 
 say "run the pipeline to materialize and cross-verify every facet"
-veks run "$DATASET_DIR/dataset.yaml" --output batch
+veks run "$DEMO/work/toy/dataset.yaml" --output batch
 
 say "verify file-format integrity and facet-spec conformance"
-veks check "$DATASET_DIR" --check-integrity
+veks check "$DEMO/work/toy" --check-integrity
 
 say "the produced facet files"
-find "$DATASET_DIR/profiles" -type f ! -name '*.provenance.json' ! -name '*.mref' \
-  | sort | sed "s#$DATASET_DIR/##"
+find "$DEMO/work/toy/profiles" -type f ! -name '*.provenance.json' ! -name '*.mref' \
+  | sort | sed "s#$DEMO/work/toy/##"
 echo
-echo "toy dataset ready at $DATASET_DIR"
+echo "toy dataset ready at $DEMO/work/toy"

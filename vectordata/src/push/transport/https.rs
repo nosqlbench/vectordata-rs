@@ -9,26 +9,61 @@
 //! Auth is a bearer token (`--token` / `VECTORDATA_PUSH_TOKEN`) when
 //! present, anonymous otherwise. The endpoint must honor object `PUT`;
 //! a `405` surfaces as a clear "not a writable object store" error.
+//!
+//! **Content uploads adapt to the endpoint.** Against a generic REST host a
+//! content file is one streaming `PUT`. Against a **`vecd`** endpoint (probed
+//! once via `/-/whoami`) content files instead use the IETF "Resumable
+//! Uploads for HTTP" protocol — `POST` create → ≥2 sparse `PATCH` chunks →
+//! finalize-on-full — which streams in bounded chunks, advertises a
+//! resumable offset, and recovers from a dropped connection via `HEAD`. The
+//! resumable path is taken for *every* content file (even small ones, split
+//! into ≥2 chunks) so it gets continuous exercise. The small control
+//! artifacts (`SHA256SUMS`, `.publish_url`, the conditional `pushlog`) stay
+//! plain `PUT` via [`HttpsTransport::put_bytes`].
 
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
+use std::sync::OnceLock;
 
-use reqwest::blocking::RequestBuilder;
+use reqwest::blocking::{RequestBuilder, Response};
 use reqwest::StatusCode;
 
 use super::{join_rel, PushError, PushTransport, RemoteObject};
 
+/// Target size of each resumable `PATCH` chunk. A file is always split into
+/// at least two chunks (so the resumable path is exercised even for small
+/// files); larger files split into ~this-sized pieces.
+const RESUMABLE_CHUNK_BYTES: u64 = 4 * 1024 * 1024;
+
+/// How many times to re-`HEAD`-and-resume a single file's upload before
+/// giving up on a transient failure.
+const MAX_RESUME_ATTEMPTS: u32 = 3;
+
 pub struct HttpsTransport {
     base: String,
     token: Option<String>,
+    /// Memoized capability probe: is the endpoint a `vecd` server (so the
+    /// resumable-upload protocol is available)?
+    vecd: OnceLock<bool>,
 }
 
 impl HttpsTransport {
     pub fn new(base: String, token: Option<String>) -> Self {
-        HttpsTransport { base, token }
+        HttpsTransport { base, token, vecd: OnceLock::new() }
     }
 
     fn url(&self, rel: &str) -> String {
         join_rel(&self.base, rel)
+    }
+
+    /// Resolve an absolute server path (e.g. an upload `Location`) against
+    /// the endpoint's origin — `http://host:port` + the absolute path.
+    fn origin_join(&self, abs_path: &str) -> Result<String, PushError> {
+        let base = reqwest::Url::parse(&self.base)
+            .map_err(|e| PushError::Other(format!("invalid endpoint URL '{}': {e}", self.base)))?;
+        base.join(abs_path)
+            .map(|u| u.to_string())
+            .map_err(|e| PushError::Other(format!("joining '{abs_path}' onto '{}': {e}", self.base)))
     }
 
     /// Apply bearer auth if a token is configured.
@@ -37,6 +72,23 @@ impl HttpsTransport {
             Some(t) => rb.bearer_auth(t),
             None => rb,
         }
+    }
+
+    /// Is this endpoint a `vecd` server? Probed once (anonymously-capable
+    /// `/-/whoami`, which self-identifies) and memoized. A failed or
+    /// ambiguous probe answers `false`, so we simply fall back to plain
+    /// `PUT` — which a `vecd` endpoint also accepts.
+    fn is_vecd(&self) -> bool {
+        *self.vecd.get_or_init(|| {
+            let Ok(url) = self.origin_join("/-/whoami") else { return false };
+            let client = crate::transport::shared_client();
+            match self.auth(client.get(&url)).send() {
+                Ok(resp) if resp.status().is_success() => {
+                    resp.text().map(|b| b.contains("\"endpoint\":\"vecd\"")).unwrap_or(false)
+                }
+                _ => false,
+            }
+        })
     }
 }
 
@@ -99,6 +151,12 @@ impl PushTransport for HttpsTransport {
     }
 
     fn put_file(&self, rel: &str, src: &Path) -> Result<(), PushError> {
+        // Against a vecd endpoint, drive the resumable protocol (chunked,
+        // resumable, ≥2 splits). Against a generic REST host, one streaming
+        // PUT — the body streams off disk, so large files are fine here too.
+        if self.is_vecd() {
+            return self.resumable_put_file(rel, src);
+        }
         let file = std::fs::File::open(src).map_err(other)?;
         let client = crate::transport::shared_client();
         let resp = self
@@ -165,6 +223,141 @@ impl PushTransport for HttpsTransport {
     }
 }
 
+// ── resumable upload driver (vecd endpoints) ────────────────────────
+impl HttpsTransport {
+    /// Upload a content file to a `vecd` endpoint via the resumable
+    /// protocol: `POST` to create the upload, stream it as ≥2 sparse
+    /// `PATCH` chunks, and let the server finalize-on-full. On a transient
+    /// failure it `HEAD`s for the acked offset and resumes; on a permanent
+    /// failure it abandons the upload (best-effort `DELETE`).
+    fn resumable_put_file(&self, rel: &str, src: &Path) -> Result<(), PushError> {
+        let total = std::fs::metadata(src).map_err(other)?.len();
+        let upload_url = self.create_upload(rel, total)?;
+        let result = self.drive_upload(&upload_url, src, total);
+        if result.is_err() {
+            // Free the staging blob + state we won't be completing.
+            let _ = self.delete_upload(&upload_url);
+        }
+        result
+    }
+
+    /// `POST <rel>` with `Upload-Length` → the absolute upload URL parsed
+    /// from `Location`.
+    fn create_upload(&self, rel: &str, total: u64) -> Result<String, PushError> {
+        let client = crate::transport::shared_client();
+        let resp = self
+            .auth(client.post(self.url(rel)))
+            .header("Upload-Length", total.to_string())
+            .send()
+            .map_err(other)?;
+        match resp.status() {
+            StatusCode::CREATED | StatusCode::OK => {
+                let loc = resp
+                    .headers()
+                    .get(reqwest::header::LOCATION)
+                    .and_then(|v| v.to_str().ok())
+                    .ok_or_else(|| {
+                        PushError::Other(format!("creating upload for '{rel}' returned no Location"))
+                    })?;
+                self.origin_join(loc)
+            }
+            s @ (StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) => Err(auth(rel, s)),
+            s => Err(PushError::Other(format!("POST {} -> HTTP {s}", self.url(rel)))),
+        }
+    }
+
+    /// Send every chunk from `start_offset` to the end, retrying the whole
+    /// remainder after a `HEAD`-resync on a transient failure.
+    fn drive_upload(&self, upload_url: &str, src: &Path, total: u64) -> Result<(), PushError> {
+        let mut offset = 0u64;
+        let mut attempts = 0u32;
+        loop {
+            match self.send_chunks(upload_url, src, total, offset) {
+                Ok(()) => return Ok(()),
+                // Auth / CAS failures are terminal — no point resuming.
+                Err(e @ (PushError::Auth(_) | PushError::PreconditionFailed)) => return Err(e),
+                Err(e) => {
+                    attempts += 1;
+                    if attempts > MAX_RESUME_ATTEMPTS {
+                        return Err(e);
+                    }
+                    // Resume from the server's acknowledged contiguous offset.
+                    offset = self.upload_offset(upload_url)?;
+                }
+            }
+        }
+    }
+
+    /// Stream `[start_offset, total)` of `src` as ≥2 sparse `PATCH` chunks.
+    fn send_chunks(&self, upload_url: &str, src: &Path, total: u64, start_offset: u64) -> Result<(), PushError> {
+        // A zero-byte object: one empty PATCH finalizes it.
+        if total == 0 {
+            self.put_chunk(upload_url, 0, Vec::new())?;
+            return Ok(());
+        }
+        // At least two chunks: cap each at ⌈total/2⌉ (and at the chunk size).
+        let chunk = RESUMABLE_CHUNK_BYTES.min(total.div_ceil(2)).max(1);
+        let mut file = std::fs::File::open(src).map_err(other)?;
+        if start_offset > 0 {
+            file.seek(SeekFrom::Start(start_offset)).map_err(other)?;
+        }
+        let mut offset = start_offset;
+        while offset < total {
+            let len = chunk.min(total - offset);
+            let mut buf = vec![0u8; len as usize];
+            file.read_exact(&mut buf).map_err(other)?;
+            self.put_chunk(upload_url, offset, buf)?;
+            offset += len;
+        }
+        Ok(())
+    }
+
+    /// `PATCH <upload-url>` with `Upload-Offset` and the chunk body.
+    /// Returns `(acked_offset, complete)`.
+    fn put_chunk(&self, upload_url: &str, offset: u64, body: Vec<u8>) -> Result<(u64, bool), PushError> {
+        let client = crate::transport::shared_client();
+        let resp = self
+            .auth(client.patch(upload_url))
+            .header("Upload-Offset", offset.to_string())
+            .body(body)
+            .send()
+            .map_err(other)?;
+        match resp.status() {
+            s if s.is_success() => {
+                let acked = header_u64(&resp, "upload-offset").unwrap_or(offset);
+                let complete = resp
+                    .headers()
+                    .get("upload-complete")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|v| v.trim() == "?1")
+                    .unwrap_or(false);
+                Ok((acked, complete))
+            }
+            StatusCode::PRECONDITION_FAILED => Err(PushError::PreconditionFailed),
+            s @ (StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) => Err(auth(upload_url, s)),
+            s => Err(PushError::Other(format!("PATCH {upload_url} @ {offset} -> HTTP {s}"))),
+        }
+    }
+
+    /// `HEAD <upload-url>` → the server's acknowledged contiguous offset.
+    fn upload_offset(&self, upload_url: &str) -> Result<u64, PushError> {
+        let client = crate::transport::shared_client();
+        let resp = self.auth(client.head(upload_url)).send().map_err(other)?;
+        match resp.status() {
+            s if s.is_success() => Ok(header_u64(&resp, "upload-offset").unwrap_or(0)),
+            s @ (StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) => Err(auth(upload_url, s)),
+            s => Err(PushError::Other(format!("HEAD {upload_url} -> HTTP {s}"))),
+        }
+    }
+
+    /// `DELETE <upload-url>` — abandon an upload (best-effort cleanup).
+    fn delete_upload(&self, upload_url: &str) -> Result<(), PushError> {
+        let client = crate::transport::shared_client();
+        self.auth(client.delete(upload_url)).send().map_err(other)?;
+        Ok(())
+    }
+}
+
 impl HttpsTransport {
     fn check_put(&self, rel: &str, resp: reqwest::blocking::Response) -> Result<(), PushError> {
         match resp.status() {
@@ -190,6 +383,12 @@ impl HttpsTransport {
 
 fn other<E: std::fmt::Display>(e: E) -> PushError {
     PushError::Other(e.to_string())
+}
+
+/// Parse an unsigned-integer response header (the resumable structured
+/// fields `Upload-Offset` / `Upload-Length`).
+fn header_u64(resp: &Response, name: &str) -> Option<u64> {
+    resp.headers().get(name)?.to_str().ok()?.trim().parse().ok()
 }
 
 /// The error for an endpoint that can't enumerate objects (non-`vecd`

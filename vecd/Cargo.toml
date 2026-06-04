@@ -18,6 +18,9 @@ categories = ["command-line-utilities", "network-programming", "web-programming:
 axum = "0.8"
 tokio = { version = "1", features = ["full"] }
 tower = { version = "0.5", features = ["util"] }
+# Stream the request body off the wire to backend storage in bounded
+# chunks (StreamExt over axum's BodyDataStream) — no whole-object buffering.
+futures-util = "0.3"
 # TLS termination in-process (rustls; pure-Rust, matches vectordata's
 # reqwest rustls choice). Plain HTTP when no cert is configured.
 axum-server = { version = "0.7", features = ["tls-rustls"] }

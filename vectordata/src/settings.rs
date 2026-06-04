@@ -186,19 +186,25 @@ pub fn settings_path() -> PathBuf {
 /// Resolve the configured cache directory.
 ///
 /// Returns the `cache_dir:` value from the user's `settings.yaml`.
-/// If the file is missing or does not declare `cache_dir:`, this
-/// function will *auto-bootstrap* to `$HOME/.cache/vectordata` —
-/// **only** when the largest writable mount visible to this process
-/// is on the same filesystem as `$HOME` (so we aren't silently
-/// burying a cache on a small volume when there's a larger disk the
-/// user should be choosing). The bootstrap writes the resolved
-/// value to `settings.yaml` and prints a one-line warning to stderr
-/// the first time it runs.
+/// If the file is missing or does not declare `cache_dir:`:
 ///
-/// If auto-bootstrap doesn't apply (`$HOME` isn't on the largest
-/// writable mount, `$HOME` unreadable, etc.), returns
-/// [`SettingsError::NotConfigured`] — its `Display` impl carries
-/// ready-to-paste commands.
+/// - When `$VECTORDATA_HOME` is set, the cache defaults to
+///   `$VECTORDATA_HOME/cache`. That env var already roots the config
+///   ([`settings_path`]), so it is a complete isolation boundary —
+///   pointing it at a throwaway directory isolates *all* client state
+///   (config, credentials, and cache) under one root, never touching
+///   the user's real `~/.config` or `~/.cache`.
+/// - Otherwise this function *auto-bootstraps* to `$HOME/.cache/vectordata`
+///   — **only** when the largest writable mount visible to this process
+///   is on the same filesystem as `$HOME` (so we aren't silently
+///   burying a cache on a small volume when there's a larger disk the
+///   user should be choosing). The bootstrap writes the resolved
+///   value to `settings.yaml` and prints a one-line warning to stderr
+///   the first time it runs.
+///
+/// If neither applies (`$HOME` isn't on the largest writable mount,
+/// `$HOME` unreadable, etc.), returns [`SettingsError::NotConfigured`] —
+/// its `Display` impl carries ready-to-paste commands.
 ///
 /// If [`override_cache_dir_for_process`] has been called, that value
 /// takes precedence and `settings.yaml` is not consulted.
@@ -209,11 +215,20 @@ pub fn cache_dir() -> Result<PathBuf, SettingsError> {
     let path = settings_path();
     match cache_dir_from(&path) {
         Ok(p) => Ok(p),
-        Err(e) => match try_auto_bootstrap(&path) {
-            Some(resolved) => Ok(resolved),
-            None => Err(e),
+        // An explicit `cache_dir:` wins; only fall back when unconfigured.
+        // `$VECTORDATA_HOME` isolates the cache alongside the config it
+        // already roots, without the mount-table auto-bootstrap dance.
+        Err(e) => match vectordata_home_cache_from(std::env::var_os("VECTORDATA_HOME")) {
+            Some(dir) => Ok(dir),
+            None => try_auto_bootstrap(&path).ok_or(e),
         },
     }
+}
+
+/// Pure resolver: `<vectordata_home>/cache` when `$VECTORDATA_HOME` is set,
+/// else `None`. Tested directly so the env-var mapping needs no env mutation.
+fn vectordata_home_cache_from(vectordata_home: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    vectordata_home.map(|root| PathBuf::from(root).join("cache"))
 }
 
 /// Why [`auto_resolved_cache_dir`] picked the path it picked.
@@ -434,6 +449,18 @@ mod tests {
         ).unwrap();
         assert_eq!(cache_dir_from(&yaml).unwrap(),
             PathBuf::from("/mnt/datamir/vectordata-cache"));
+    }
+
+    #[test]
+    fn vectordata_home_defaults_cache_under_the_home() {
+        // When $VECTORDATA_HOME is set and settings.yaml pins no cache_dir,
+        // the cache lands at <home>/cache — so isolating the home isolates
+        // the cache too. Tested via the pure resolver (no env mutation).
+        assert_eq!(
+            vectordata_home_cache_from(Some(std::ffi::OsString::from("/tmp/iso-home"))),
+            Some(PathBuf::from("/tmp/iso-home/cache"))
+        );
+        assert_eq!(vectordata_home_cache_from(None), None);
     }
 
     #[test]

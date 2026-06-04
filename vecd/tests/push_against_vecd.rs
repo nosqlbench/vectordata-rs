@@ -498,6 +498,89 @@ fn push_delete_removes_orphans_over_vecd() {
 }
 
 #[test]
+fn large_object_streams_past_the_old_body_cap() {
+    // A >2 MiB object once tripped axum's default body limit (413). With the
+    // streaming PUT path it rides straight to the backend and round-trips
+    // byte-for-byte, with an envelope ETag that is independent of content.
+    let (_d, db, token) = setup("datasets/glove", "vecd-e2e-15", false);
+    let server = Vecd::start(db);
+    let client = reqwest::blocking::Client::new();
+
+    // 3 MiB of non-trivial bytes (so a sparse/zero shortcut can't pass).
+    let body: Vec<u8> = (0..3 * 1024 * 1024).map(|i| (i * 31 + 7) as u8).collect();
+    let put = client
+        .put(server.url("datasets/glove/big.bin"))
+        .bearer_auth(&token)
+        .body(body.clone())
+        .send()
+        .unwrap();
+    assert_eq!(put.status(), 201, "large PUT must succeed, not 413");
+    let etag = put.headers().get("etag").unwrap().to_str().unwrap().to_string();
+    assert!(!etag.is_empty());
+
+    let got = client
+        .get(server.url("datasets/glove/big.bin"))
+        .bearer_auth(&token)
+        .send()
+        .unwrap();
+    assert_eq!(got.status(), 200);
+    assert_eq!(got.bytes().unwrap().as_ref(), body.as_slice(), "bytes must round-trip exactly");
+}
+
+#[test]
+fn push_uses_the_resumable_upload_protocol_for_content() {
+    // The client detects a vecd endpoint and uploads every content file via
+    // the resumable POST/PATCH/finalize protocol (≥2 splits each), not a
+    // plain PUT. Proof: the server's `uploads` table carries a completed
+    // resumable-upload row per content file after the push.
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("vecd.db");
+    let mut db = Db::init(&db_path).unwrap();
+    admin::add_backend(&mut db, "store", "mem", "mem:vecd-e2e-17", None, None, None, true).unwrap();
+    admin::add_user(&mut db, "alice", Level::User, None, None).unwrap();
+    admin::add_namespace(&mut db, "datasets/glove", "alice", Some("store"), true, Listable::Grantees, None, None).unwrap();
+    admin::bind(&mut db, "alice", "curate", "datasets/glove").unwrap();
+    let token = admin::create_token(&mut db, "alice", "push", Some("30d"), None).unwrap().plaintext;
+
+    let server = Vecd::start(db);
+    let src = tempfile::tempdir().unwrap();
+    make_dataset(src.path()); // dataset.yaml + base.fvec (two content files)
+    execute(&opts(src.path(), server.ns_url("datasets/glove"), Some(token.clone()))).expect("push");
+
+    // A second connection (WAL) inspects the upload bookkeeping.
+    let admin_conn = Db::open(&db_path).unwrap();
+    let completed: i64 = admin_conn
+        .conn()
+        .query_row("SELECT COUNT(*) FROM uploads WHERE complete=1", [], |r| r.get(0))
+        .unwrap();
+    assert!(completed >= 2, "expected a completed resumable upload per content file, got {completed}");
+    // Each completed upload recorded its committed envelope ETag.
+    let with_etag: i64 = admin_conn
+        .conn()
+        .query_row("SELECT COUNT(*) FROM uploads WHERE complete=1 AND etag IS NOT NULL", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(with_etag, completed, "every completed upload should carry its ETag");
+}
+
+#[test]
+fn empty_object_streams_and_round_trips() {
+    // A zero-byte object must finalize too: the streaming writer materializes
+    // an empty staging blob so there is something to promote. (Regression:
+    // empty `.ivecs` cache artifacts 500'd before this.)
+    let (_d, db, token) = setup("datasets/glove", "vecd-e2e-16", false);
+    let server = Vecd::start(db);
+    let client = reqwest::blocking::Client::new();
+
+    let put = client.put(server.url("datasets/glove/empty.bin")).bearer_auth(&token).body(Vec::<u8>::new()).send().unwrap();
+    assert_eq!(put.status(), 201, "empty PUT must succeed");
+
+    let got = client.get(server.url("datasets/glove/empty.bin")).bearer_auth(&token).send().unwrap();
+    assert_eq!(got.status(), 200);
+    assert_eq!(got.headers().get("content-length").unwrap(), "0");
+    assert!(got.bytes().unwrap().is_empty());
+}
+
+#[test]
 fn healthz_is_open() {
     let (_d, db, _t) = setup("datasets/glove", "vecd-e2e-5", false);
     let server = Vecd::start(db);

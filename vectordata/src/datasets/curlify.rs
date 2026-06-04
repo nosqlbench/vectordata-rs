@@ -3,7 +3,10 @@
 
 //! `<binary> datasets curlify` — generate curl download scripts for a dataset.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
+// `PathBuf` only appears in the `cli`-gated `CurlifyArgs` fields.
+#[cfg(feature = "cli")]
+use std::path::PathBuf;
 
 /// Shared clap-derived argument struct for `<binary> datasets
 /// curlify`. Both the `vectordata` and `veks` binaries import this.

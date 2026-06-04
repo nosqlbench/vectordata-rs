@@ -40,7 +40,7 @@ pub enum DatasetsCommand {
     #[command(alias = "ls")]
     List {
         /// Configuration directory containing catalogs.yaml
-        #[arg(long, default_value = "~/.config/vectordata")]
+        #[arg(long, default_value_t = vectordata::catalog::sources::config_dir())]
         configdir: String,
 
         /// Additional catalog directories, file paths, or HTTP URLs
@@ -172,7 +172,7 @@ pub enum DatasetsCommand {
         tree: bool,
 
         /// Configuration directory containing catalogs.yaml
-        #[arg(long, default_value = "~/.config/vectordata")]
+        #[arg(long, default_value_t = vectordata::catalog::sources::config_dir())]
         configdir: String,
 
         /// Additional catalog directories, file paths, or HTTP URLs
@@ -258,7 +258,7 @@ pub enum DatasetsCommand {
 
         /// Configuration directory containing catalogs.yaml
         /// (only used when `--dataset` is a catalog name).
-        #[arg(long, default_value = "~/.config/vectordata")]
+        #[arg(long, default_value_t = vectordata::catalog::sources::config_dir())]
         configdir: String,
 
         /// Additional catalog directories, file paths, or HTTP URLs.
@@ -280,7 +280,7 @@ pub enum DatasetsCommand {
         profile: Option<String>,
 
         /// Configuration directory containing catalogs.yaml
-        #[arg(long, default_value = "~/.config/vectordata")]
+        #[arg(long, default_value_t = vectordata::catalog::sources::config_dir())]
         configdir: String,
 
         /// Additional catalog directories, file paths, or HTTP URLs

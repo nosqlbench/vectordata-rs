@@ -20,6 +20,7 @@
 //! coincidence at best, false negatives on `s3://` catalogs always.
 
 use crate::catalog::resolver::Catalog;
+#[cfg(feature = "cli")]
 use crate::catalog::sources::CatalogSources;
 
 /// Shared clap-derived argument struct for `<binary> datasets

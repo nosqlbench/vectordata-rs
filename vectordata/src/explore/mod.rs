@@ -214,7 +214,7 @@ fn run_precache(specifier: &str, pause: bool) {
     // profile and runs precache against it directly.
     let code = crate::datasets::precache::run(
         specifier,
-        "~/.config/vectordata",
+        &crate::catalog::sources::config_dir(),
         &[],
         &[],
         None,

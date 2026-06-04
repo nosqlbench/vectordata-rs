@@ -10,7 +10,10 @@
 //! 3. Fetch `catalog.json` from each location (HTTP or local file).
 //! 4. Display the aggregated dataset entries.
 
-use super::filter::{self, DatasetFilter, ProfileView};
+use super::filter::{DatasetFilter, ProfileView};
+// The `filter::` free functions are only called from `cli`-gated arg parsing.
+#[cfg(feature = "cli")]
+use super::filter;
 use crate::catalog::resolver::Catalog;
 use crate::catalog::sources::CatalogSources;
 use crate::dataset::CatalogEntry;
@@ -25,7 +28,7 @@ use crate::dataset::CatalogEntry;
 #[derive(Debug, clap::Args)]
 pub struct ListArgs {
     /// Configuration directory containing catalogs.yaml
-    #[arg(long, default_value = "~/.config/vectordata")]
+    #[arg(long, default_value_t = crate::catalog::sources::config_dir())]
     pub configdir: String,
 
     /// Additional catalog directories, file paths, or HTTP URLs

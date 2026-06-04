@@ -5,10 +5,16 @@
 //! root directory. This is the I19/I20 lesson from the push spec: a write
 //! is never observed half-applied.
 
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use crate::backend::Backend;
 use crate::model::VecdError;
+
+/// Directory (under the backend root) that holds in-progress upload staging
+/// blobs. Hidden from object listings and on the same filesystem as the
+/// objects, so finalize is an atomic same-fs rename.
+const STAGING_DIR: &str = ".uploads";
 
 pub struct LocalBackend {
     root: PathBuf,
@@ -30,6 +36,12 @@ impl LocalBackend {
             return Err(VecdError::usage(format!("invalid object key '{key}'")));
         }
         Ok(self.root.join(key))
+    }
+
+    /// Filesystem path of a staging blob. The `staging_key` is an opaque,
+    /// server-generated id (no path separators), so a plain join is safe.
+    fn staging_path(&self, staging_key: &str) -> PathBuf {
+        self.root.join(STAGING_DIR).join(staging_key)
     }
 }
 
@@ -55,6 +67,39 @@ impl Backend for LocalBackend {
         std::fs::write(&tmp, data)?;
         std::fs::rename(&tmp, &path)?;
         Ok(())
+    }
+
+    fn put_at(&self, staging_key: &str, offset: u64, chunk: &[u8]) -> Result<(), VecdError> {
+        let path = self.staging_path(staging_key);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        // Open-or-create, then seek to the offset. Seeking past the current
+        // end leaves a hole that reads back as zeros (a sparse file) — the
+        // gap a later out-of-order chunk will fill.
+        let mut f = std::fs::OpenOptions::new().read(true).write(true).create(true).open(&path)?;
+        f.seek(SeekFrom::Start(offset))?;
+        f.write_all(chunk)?;
+        Ok(())
+    }
+
+    fn finalize_staged(&self, staging_key: &str, final_key: &str) -> Result<(), VecdError> {
+        let from = self.staging_path(staging_key);
+        let to = self.path_of(final_key)?;
+        if let Some(parent) = to.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        // Same-filesystem rename → atomic promotion; no torn read.
+        std::fs::rename(&from, &to)?;
+        Ok(())
+    }
+
+    fn discard_staged(&self, staging_key: &str) -> Result<(), VecdError> {
+        match std::fs::remove_file(self.staging_path(staging_key)) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        }
     }
 
     fn head(&self, key: &str) -> Result<Option<u64>, VecdError> {
@@ -97,6 +142,10 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<String>) -> Result<(), VecdError>
         let entry = entry?;
         let path = entry.path();
         if path.is_dir() {
+            // The staging area is internal — never an object listing.
+            if path.file_name().and_then(|n| n.to_str()) == Some(STAGING_DIR) {
+                continue;
+            }
             walk(root, &path, out)?;
         } else if let Ok(rel) = path.strip_prefix(root) {
             // Skip any in-flight temp files.

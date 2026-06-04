@@ -40,5 +40,6 @@ pub mod lifetime;
 pub mod server;
 pub mod session;
 pub mod store;
+pub mod upload;
 
 pub use model::{Action, ActionSet, Class, Level, Listable, VecdError};

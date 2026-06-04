@@ -36,13 +36,21 @@ impl CatalogSources {
         Self::default()
     }
 
-    /// Configure from the default config directory (`~/.config/vectordata`).
+    /// Configure from the default config directory ([`config_dir`] —
+    /// `$VECTORDATA_HOME`, else `~/.config/vectordata`).
     ///
-    /// Loads `catalogs.yaml` from the directory. If the file does not exist,
-    /// returns self unchanged (non-fatal for the default location).
-    pub fn configure_default(mut self) -> Self {
-        let config_dir = expand_tilde(DEFAULT_CONFIG_DIR);
-        if let Ok(locations) = load_config(&config_dir) {
+    /// Composes the env-aware [`config_dir`] resolver with the dir-taking
+    /// [`Self::configure_optional`] loader; both are tested independently, so
+    /// this is correct by construction and needs no env-mutating test.
+    pub fn configure_default(self) -> Self {
+        self.configure_optional(&config_dir())
+    }
+
+    /// Load `catalogs.yaml` from an explicit config directory as *optional*
+    /// sources (a missing file is non-fatal). The env-free seam behind
+    /// [`Self::configure_default`].
+    pub fn configure_optional(mut self, config_dir: &str) -> Self {
+        if let Ok(locations) = load_config(&expand_tilde(config_dir)) {
             self.optional.extend(locations);
         }
         self
@@ -212,6 +220,30 @@ pub fn expand_tilde(path: &str) -> String {
     path.to_string()
 }
 
+/// The client configuration directory that holds `catalogs.yaml`.
+///
+/// `$VECTORDATA_HOME` takes precedence over `~/.config/vectordata`,
+/// mirroring [`crate::settings::settings_path`] and the credentials store.
+/// Routing every catalog read and write through here means that one env
+/// var isolates *all* client config — catalogs, settings, and credentials —
+/// under a single root, so tests and tutorials never touch the real config.
+///
+/// This is the thin env-reading wrapper; the resolution logic lives in the
+/// pure [`config_dir_from`] so it can be tested without mutating the
+/// process-wide environment.
+pub fn config_dir() -> String {
+    config_dir_from(std::env::var_os("VECTORDATA_HOME"))
+}
+
+/// Pure resolver behind [`config_dir`]: the given `$VECTORDATA_HOME` value if
+/// set, else the tilde-expanded `~/.config/vectordata` default.
+fn config_dir_from(vectordata_home: Option<std::ffi::OsString>) -> String {
+    match vectordata_home {
+        Some(root) => root.to_string_lossy().into_owned(),
+        None => expand_tilde(DEFAULT_CONFIG_DIR),
+    }
+}
+
 /// Get the user's home directory.
 fn home_dir() -> Option<String> {
     std::env::var("HOME").ok()
@@ -280,6 +312,43 @@ mod tests {
     fn test_expand_tilde_no_tilde() {
         assert_eq!(expand_tilde("/absolute/path"), "/absolute/path");
         assert_eq!(expand_tilde("relative/path"), "relative/path");
+    }
+
+    #[test]
+    fn config_dir_prefers_vectordata_home() {
+        // The regression guard: a set $VECTORDATA_HOME wins over ~/.config,
+        // so catalog reads/writes stay inside an isolated client home.
+        let resolved = config_dir_from(Some(std::ffi::OsString::from("/tmp/iso-home")));
+        assert_eq!(resolved, "/tmp/iso-home");
+    }
+
+    #[test]
+    fn config_dir_falls_back_to_default_when_home_unset() {
+        let resolved = config_dir_from(None);
+        assert!(resolved.ends_with(".config/vectordata"), "got {resolved}");
+        assert!(!resolved.starts_with('~'), "must be tilde-expanded, got {resolved}");
+    }
+
+    #[test]
+    fn configure_optional_loads_from_the_given_dir_only() {
+        // An explicit dir with no catalogs.yaml yields nothing — proving the
+        // loader reads the dir it is handed and never a real config elsewhere.
+        let empty = tempfile::tempdir().unwrap();
+        let s = CatalogSources::new().configure_optional(&empty.path().to_string_lossy());
+        assert!(s.optional().is_empty() && s.required().is_empty());
+
+        // With a catalogs.yaml in that dir, its entries are loaded.
+        std::fs::write(
+            empty.path().join("catalogs.yaml"),
+            "- https://example.invalid/catalog/\n",
+        )
+        .unwrap();
+        let s = CatalogSources::new().configure_optional(&empty.path().to_string_lossy());
+        assert!(
+            s.optional().iter().any(|e| e.contains("example.invalid")),
+            "expected the dir's catalogs.yaml entry, got {:?}",
+            s.optional()
+        );
     }
 
     #[test]

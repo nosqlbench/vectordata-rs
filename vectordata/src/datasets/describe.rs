@@ -12,6 +12,7 @@
 //! diff-against-an-expected-value scripts.
 
 use crate::catalog::resolver::Catalog;
+#[cfg(feature = "cli")]
 use crate::catalog::sources::CatalogSources;
 use crate::dataset::CatalogEntry;
 
@@ -71,6 +72,7 @@ pub fn run_via_catalog(catalog: &Catalog, dataset_name: &str, profile_name: &str
 /// including the bare-trailing-colon case (`sift1m:` → `sift1m` +
 /// `default`) so a stray keystroke doesn't produce a dataset name
 /// with a useless trailing `:` that no catalog lookup resolves.
+#[cfg(any(feature = "cli", test))]
 fn split_spec(spec: &str) -> (String, String) {
     match spec.split_once(':') {
         Some((d, p)) if !p.is_empty() => (d.to_string(), p.to_string()),

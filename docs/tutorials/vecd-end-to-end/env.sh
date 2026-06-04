@@ -1,82 +1,34 @@
-# Shared configuration for the vecd end-to-end tutorial.
+# Shared setup for the vecd end-to-end tutorial — sourced by every step.
 #
-# Source this from every step:  source ./env.sh
+# The whole demo lives under one throwaway directory ($DEMO) and is fully
+# isolated by just two environment variables, so your real configuration
+# and cache are never touched:
 #
-# Everything the tutorial creates lives under a single self-contained
-# directory ($DEMO_DIR) so the whole thing is trivially disposable and
-# never touches your real ~/.config/vectordata or ~/.cache.
+#   VECD_CONFIG     — vecd's config dir; its DB + objects live in data/ under it
+#   VECTORDATA_HOME — the client's config AND cache
+#
+# Everything else in the steps is a plain literal you can read inline.
 
 set -euo pipefail
 
-# ----------------------------------------------------------------------
-# Where everything lives. Override by exporting DEMO_DIR before sourcing.
-# ----------------------------------------------------------------------
-: "${DEMO_DIR:=$(pwd)/vecd-demo}"
-export DEMO_DIR
+# One throwaway root for the entire demo. Override: DEMO=/path bash 01-...
+: "${DEMO:=$(pwd)/vecd-demo}"
+export DEMO
 
-# vecd control-plane state (SQLite DB, pidfile, logs, vecd.addr).
-export VECD_DATA_DIR="$DEMO_DIR/vecd/data"
-# vecd config directory (vecd.conf). VECD_CONFIG is read by the vecd binary.
-export VECD_CONFIG="$DEMO_DIR/vecd/config"
-# The object backing store — a plain local directory. This is the
-# "backing store in a subdirectory" the daemon writes blobs into.
-export VECD_OBJECTS="$DEMO_DIR/vecd/objects"
+# Run the freshly-built binaries straight from the checkout without
+# installing them. If you've `cargo install`ed vecd/veks/vectordata, those
+# copies on PATH win; otherwise these fall back to the workspace target/.
+_repo="$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel 2>/dev/null)"
+[ -n "$_repo" ] && PATH="$_repo/target/release:$_repo/target/debug:$PATH"
 
-# Where the daemon listens. Loopback + a high port keeps it private.
-export VECD_HOST="127.0.0.1"
-export VECD_PORT="18443"
-export VECD_BASE="http://$VECD_HOST:$VECD_PORT"
+# The two isolation knobs. Both binaries read these from the environment.
+export VECD_CONFIG="$DEMO/server"      # vecd state → $DEMO/server/{data,...}
+export VECTORDATA_HOME="$DEMO/client"  # client config + cache, all isolated
 
-# Catalog root namespace on the server, and the dataset under it.
-export NS_ROOT="datasets"            # holds catalog.yaml
-export DATASET_NAME="toy"            # logical dataset name
-export NS_DATASET="$NS_ROOT/$DATASET_NAME"
-
-# Local workspace where veks builds the toy dataset before upload.
-export WORK_DIR="$DEMO_DIR/work"
-export DATASET_DIR="$WORK_DIR/$DATASET_NAME"
-
-# Isolate the vectordata client entirely inside the demo: HOME drives
-# ~/.config/vectordata (catalogs.yaml, credentials, settings) and the
-# cache. Pointing HOME here means the tutorial leaves your real client
-# config untouched.
-export DEMO_HOME="$DEMO_DIR/client-home"
-
-# Files holding the tokens minted during setup (written by step 01).
-export ROOT_TOKEN_FILE="$DEMO_DIR/root.token"
-export ALICE_TOKEN_FILE="$DEMO_DIR/alice.token"
-
-# ----------------------------------------------------------------------
-# Binaries. If you've `cargo install`ed them (or they're on PATH) these
-# names resolve directly. Otherwise we fall back to the debug builds in
-# this checkout's target/ so the tutorial runs from a fresh clone.
-# ----------------------------------------------------------------------
-_repo_root() { git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel 2>/dev/null; }
-_pick_bin() {
-  local name="$1" found
-  # `type -P` only matches an executable on PATH — never a shell function
-  # or alias — so the wrapper functions below can safely share the name.
-  found="$(type -P "$name" 2>/dev/null || true)"
-  if [ -n "$found" ]; then echo "$found"; return; fi
-  local root; root="$(_repo_root)"
-  for build in release debug; do
-    if [ -n "$root" ] && [ -x "$root/target/$build/$name" ]; then
-      echo "$root/target/$build/$name"; return
-    fi
-  done
-  echo "$name"   # last resort: let the shell report "command not found"
-}
-export VECD_BIN="${VECD_BIN:-$(_pick_bin vecd)}"
-export VEKS_BIN="${VEKS_BIN:-$(_pick_bin veks)}"
-export VECTORDATA_BIN="${VECTORDATA_BIN:-$(_pick_bin vectordata)}"
-export VECD_CONFIG   # the vecd binary reads this from the environment
-
-# Wrappers that pin the daemon's config/data dirs and the client's HOME.
-# (Not exported: each step sources this file, so they're always in scope;
-# exporting them would let `type`/`command` see them as the binary name.)
-vecd()       { "$VECD_BIN" --data-dir "$VECD_DATA_DIR" "$@"; }
-veks()       { "$VEKS_BIN" "$@"; }
-vectordata() { HOME="$DEMO_HOME" "$VECTORDATA_BIN" "$@"; }
+# The base URL the running daemon actually bound. `vecd start` publishes its
+# real address to data/vecd.addr, so this is the single source of truth — no
+# host/port variables to keep in sync.
+vecd_base() { echo "http://$(cat "$VECD_CONFIG/data/vecd.addr")"; }
 
 # Pretty step banners.
 say() { printf '\n\033[1;36m== %s\033[0m\n' "$*"; }

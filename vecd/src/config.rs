@@ -53,7 +53,7 @@ impl Config {
         Self::parse(&text)
     }
 
-    fn parse(text: &str) -> Result<Self, VecdError> {
+    pub(crate) fn parse(text: &str) -> Result<Self, VecdError> {
         let mut values = HashMap::new();
         for (n, raw) in text.lines().enumerate() {
             let line = raw.split('#').next().unwrap_or("").trim();

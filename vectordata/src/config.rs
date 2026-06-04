@@ -26,9 +26,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::catalog::resolver::Catalog;
-use crate::catalog::sources::{
-    CatalogSources, DEFAULT_CONFIG_DIR, expand_tilde, raw_catalog_entries,
-};
+use crate::catalog::sources::{CatalogSources, raw_catalog_entries};
 use crate::mounts;
 use crate::settings::{self, SettingsWriteError, WriteCacheOutcome};
 
@@ -40,7 +38,8 @@ use crate::settings::{self, SettingsWriteError, WriteCacheOutcome};
 pub fn show() -> i32 {
     let settings_path = settings::settings_path();
     let cats_path = catalogs_path();
-    let cats_configured = !raw_catalog_entries(DEFAULT_CONFIG_DIR).is_empty();
+    let config_dir = crate::catalog::sources::config_dir();
+    let cats_configured = !raw_catalog_entries(&config_dir).is_empty();
 
     println!("Configuration: {}", settings_path.display());
 
@@ -81,7 +80,7 @@ pub fn show() -> i32 {
     if cats_configured {
         // Defer to `list-catalogs` for the actual enumeration — keeps
         // a single source of truth for catalog output.
-        let entries = raw_catalog_entries(DEFAULT_CONFIG_DIR);
+        let entries = raw_catalog_entries(&config_dir);
         for (i, e) in entries.iter().enumerate() {
             println!("  {:>3}. {}", i + 1, e);
         }
@@ -235,8 +234,7 @@ pub enum RemoveCatalogSpec<'a> {
 }
 
 fn catalogs_path() -> PathBuf {
-    let dir = expand_tilde(DEFAULT_CONFIG_DIR);
-    PathBuf::from(dir).join("catalogs.yaml")
+    PathBuf::from(crate::catalog::sources::config_dir()).join("catalogs.yaml")
 }
 
 fn load_catalog_entries() -> Vec<String> {
@@ -318,7 +316,7 @@ pub fn remove_catalog(spec: RemoveCatalogSpec<'_>) -> i32 {
 /// List the configured catalog sources.
 pub fn list_catalogs() -> i32 {
     let path = catalogs_path();
-    let config_dir = expand_tilde(DEFAULT_CONFIG_DIR);
+    let config_dir = crate::catalog::sources::config_dir();
     let entries = raw_catalog_entries(&config_dir);
     if entries.is_empty() {
         println!("No catalog sources configured.");

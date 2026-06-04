@@ -25,22 +25,34 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::body::Bytes;
+use axum::body::{Body, Bytes};
 use axum::extract::{ConnectInfo, Path, State};
 use axum::http::{header, HeaderMap, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
+use futures_util::StreamExt;
 
 use crate::auth;
 use crate::authz::{Caller, Snapshot};
+use crate::backend::Backend;
 use crate::db::Db;
 use crate::model::{Action, VecdError, PRIV_IGNORE_QUOTAS};
 use crate::namespace::{self, Resolved};
 use crate::session;
 use crate::store::{self, Precondition, PutResult};
+use crate::upload;
 
 use vectordata::push::pushlog::{Event, Log, PUSHLOG_FILE};
+
+/// Upper bound on a *buffered* request body (the small pushlog control file
+/// that must be parsed, plus empty GET/HEAD/DELETE bodies). Object content
+/// never takes this path — it streams (see [`stream_put`]).
+const MAX_BUFFERED_BODY: usize = 256 * 1024 * 1024;
+
+/// Bytes accumulated before each [`Backend::put_at`] while streaming a body
+/// to staging — bounds resident memory and amortizes per-chunk backend I/O.
+const UPLOAD_FLUSH_BYTES: usize = 1 << 20;
 
 /// Lightweight Prometheus-style counters.
 #[derive(Default)]
@@ -143,6 +155,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/auth/token", axum::routing::post(auth_token))
         .route("/tokens", axum::routing::post(issue_token))
         .route("/tokens/{id}", axum::routing::delete(revoke_token))
+        .route(
+            "/-/uploads/{id}",
+            axum::routing::patch(upload_patch).head(upload_head).delete(upload_delete),
+        )
         .fallback(object_handler)
         .with_state(state)
 }
@@ -445,6 +461,8 @@ fn method_action(method: &Method) -> Option<Action> {
         Method::GET => Some(Action::Read),
         Method::HEAD => Some(Action::Read),
         Method::PUT => Some(Action::Write),
+        // POST on an object path creates a resumable upload — a write.
+        Method::POST => Some(Action::Write),
         Method::DELETE => Some(Action::Delete),
         _ => None,
     }
@@ -497,6 +515,10 @@ impl Out {
         self.content_length = Some(n);
         self
     }
+    fn set_status(mut self, status: StatusCode) -> Self {
+        self.status = status;
+        self
+    }
 }
 
 impl IntoResponse for Out {
@@ -521,7 +543,7 @@ async fn object_handler(
     method: Method,
     uri: Uri,
     headers: HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> Response {
     let remote = addr.ip().to_string();
     let bearer = auth::bearer_from_header(
@@ -529,10 +551,34 @@ async fn object_handler(
     )
     .map(|s| s.to_string());
 
-    // The blocking core runs off the async runtime so DB/backend I/O never
-    // stalls the reactor.
+    // Streaming write path: a `PUT` of object content (anything but the
+    // parsed pushlog control file) goes straight to backend storage in
+    // bounded chunks — the whole object is never buffered in memory, so
+    // there is no request-size cap beyond the namespace quota. Resolution is
+    // pure (snapshot only), so deciding the path needs no DB or body.
+    if method == Method::PUT {
+        let snap = state.snapshot();
+        let parsed = parse_path(uri.path());
+        if let Ok(resolved) = namespace::resolve(&snap, &parsed.logical) {
+            if resolved.rel_key != PUSHLOG_FILE {
+                return stream_put(state, snap, parsed.logical, headers, bearer, remote, resolved, body)
+                    .await;
+            }
+        }
+    }
+
+    // Buffered path: GET/HEAD/DELETE (empty bodies) and the small pushlog
+    // PUT (which must be parsed). The blocking core runs off the async
+    // runtime so DB/backend I/O never stalls the reactor.
+    let bytes = match axum::body::to_bytes(body, MAX_BUFFERED_BODY).await {
+        Ok(b) => b,
+        Err(_) => {
+            return (StatusCode::PAYLOAD_TOO_LARGE, "request body too large to buffer\n")
+                .into_response()
+        }
+    };
     let out = tokio::task::spawn_blocking(move || {
-        handle_blocking(&state, &method, &uri, &headers, bearer.as_deref(), &body, &remote)
+        handle_blocking(&state, &method, &uri, &headers, bearer.as_deref(), bytes.as_ref(), &remote)
     })
     .await
     .unwrap_or_else(|_| Out::status(StatusCode::INTERNAL_SERVER_ERROR));
@@ -540,33 +586,32 @@ async fn object_handler(
     out.into_response()
 }
 
-/// The synchronous request core. Returns the [`Out`] to render; also
-/// appends the access-log row (the final pipeline stage).
-fn handle_blocking(
+/// The shared request preamble for object operations: count, abuse-throttle,
+/// authenticate, stamp `last_used`, and authorize the action against the
+/// cone. On any terminal outcome it records the access-log row itself and
+/// returns the [`Out`] to send; on success it returns the authorized caller
+/// (the caller logs the final status once the op completes). Used by both
+/// the buffered ([`handle_blocking`]) and streaming ([`stream_put`]) paths.
+fn gate(
     state: &AppState,
+    snap: &Snapshot,
     method: &Method,
-    uri: &Uri,
-    headers: &HeaderMap,
+    path: &str,
     bearer: Option<&str>,
-    body: &[u8],
     remote: &str,
-) -> Out {
-    let snap = state.snapshot();
-    let parsed = parse_path(uri.path());
-    let path = parsed.logical.as_str();
+) -> Result<Caller, Out> {
     let action_name = method.as_str();
-
     state.metrics.requests.fetch_add(1, Ordering::Relaxed);
 
     // ── abuse throttle ──────────────────────────────────────────────
     if state.is_throttled(remote) {
         state.metrics.throttled.fetch_add(1, Ordering::Relaxed);
-        return Out::status(StatusCode::TOO_MANY_REQUESTS)
-            .body(b"too many failed attempts; slow down\n".to_vec());
+        return Err(Out::status(StatusCode::TOO_MANY_REQUESTS)
+            .body(b"too many failed attempts; slow down\n".to_vec()));
     }
 
     // ── authenticate ────────────────────────────────────────────────
-    let caller = match auth::authenticate(&snap, bearer, now_secs()) {
+    let caller = match auth::authenticate(snap, bearer, now_secs()) {
         Ok(c) => c,
         Err(e) => {
             state.metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
@@ -574,7 +619,7 @@ fn handle_blocking(
             let out = Out::status(StatusCode::UNAUTHORIZED)
                 .body(format!("{}\n", e.message()).into_bytes());
             log(state, &Caller::Anonymous, action_name, path, out.status, 0, remote);
-            return out;
+            return Err(out);
         }
     };
     if caller.is_authenticated() {
@@ -592,7 +637,7 @@ fn handle_blocking(
     let Some(action) = method_action(method) else {
         let out = Out::status(StatusCode::METHOD_NOT_ALLOWED);
         log(state, &caller, action_name, path, out.status, 0, remote);
-        return out;
+        return Err(out);
     };
     if !snap.can(&caller, action, path) {
         state.metrics.denials.fetch_add(1, Ordering::Relaxed);
@@ -605,8 +650,32 @@ fn handle_blocking(
         };
         let out = Out::status(status);
         log(state, &caller, action_name, path, out.status, 0, remote);
-        return out;
+        return Err(out);
     }
+
+    Ok(caller)
+}
+
+/// The synchronous request core for the buffered path. Returns the [`Out`]
+/// to render; also appends the access-log row (the final pipeline stage).
+fn handle_blocking(
+    state: &AppState,
+    method: &Method,
+    uri: &Uri,
+    headers: &HeaderMap,
+    bearer: Option<&str>,
+    body: &[u8],
+    remote: &str,
+) -> Out {
+    let snap = state.snapshot();
+    let parsed = parse_path(uri.path());
+    let path = parsed.logical.as_str();
+    let action_name = method.as_str();
+
+    let caller = match gate(state, &snap, method, path, bearer, remote) {
+        Ok(c) => c,
+        Err(out) => return out,
+    };
 
     // ── resolve + handle ────────────────────────────────────────────
     let out = match handle_object(state, &snap, &caller, method, &parsed, headers, body, uri.query()) {
@@ -619,6 +688,427 @@ fn handle_blocking(
     };
     log(state, &caller, action_name, path, out.status, out.content_length.unwrap_or(0), remote);
     out
+}
+
+/// The streaming `PUT` path: gate, then stream the request body into a
+/// backend staging blob in bounded chunks, then finalize (session-stage or a
+/// CAS+quota lone write). Object content never lands in memory whole.
+#[allow(clippy::too_many_arguments)]
+async fn stream_put(
+    state: AppState,
+    snap: Arc<Snapshot>,
+    path: String,
+    headers: HeaderMap,
+    bearer: Option<String>,
+    remote: String,
+    resolved: Resolved,
+    body: Body,
+) -> Response {
+    // ── gate (throttle + authn + authz) before any storage I/O ──────
+    let caller = {
+        let state = state.clone();
+        let snap = snap.clone();
+        let path = path.clone();
+        let bearer = bearer.clone();
+        let remote = remote.clone();
+        let gated = tokio::task::spawn_blocking(move || {
+            gate(&state, &snap, &Method::PUT, &path, bearer.as_deref(), &remote)
+        })
+        .await
+        .unwrap_or_else(|_| Err(Out::status(StatusCode::INTERNAL_SERVER_ERROR)));
+        match gated {
+            Ok(c) => c,
+            Err(out) => return out.into_response(),
+        }
+    };
+
+    // ── stream the body into a backend staging blob ─────────────────
+    let staging_key = new_upload_id();
+    let backend = resolved.backend.clone();
+    let size = match stream_to_staging(backend.clone(), staging_key.clone(), 0, u64::MAX, body).await {
+        Ok(n) => n,
+        Err(e) => {
+            let _ = backend.discard_staged(&staging_key);
+            let out =
+                Out::status(StatusCode::BAD_REQUEST).body(format!("{e}\n").into_bytes());
+            log(&state, &caller, "PUT", &path, out.status, 0, &remote);
+            return out.into_response();
+        }
+    };
+
+    // ── finalize (DB commit) off the reactor ────────────────────────
+    let cond = precondition(&headers);
+    let ignore_quota = snap.has_system_privilege(&caller, PRIV_IGNORE_QUOTAS);
+    let quota = snap
+        .namespace(&resolved.storage_ns)
+        .map(|n| n.quota_bytes)
+        .unwrap_or(crate::model::DEFAULT_QUOTA_BYTES);
+    let finalized = {
+        let state = state.clone();
+        tokio::task::spawn_blocking(move || {
+            finalize_streamed_put(&state, resolved, &staging_key, size, &cond, quota, ignore_quota)
+        })
+        .await
+        .unwrap_or_else(|_| Err(VecdError::op("finalize task failed")))
+    };
+    let out = match finalized {
+        Ok(out) => out,
+        Err(VecdError::Usage(m)) => {
+            Out::status(StatusCode::BAD_REQUEST).body(format!("{m}\n").into_bytes())
+        }
+        Err(e) => Out::status(StatusCode::INTERNAL_SERVER_ERROR).body(format!("{e}\n").into_bytes()),
+    };
+    log(&state, &caller, "PUT", &path, out.status, out.content_length.unwrap_or(0), &remote);
+    out.into_response()
+}
+
+/// Stream a request body to a backend staging blob starting at byte
+/// `base_offset`, returning the number of bytes written. The async task
+/// pulls body frames and hands them, with backpressure (a bounded channel),
+/// to a blocking writer that coalesces them into `UPLOAD_FLUSH_BYTES`
+/// [`Backend::put_at`] calls — so resident memory stays bounded regardless
+/// of object size. No byte is written at or beyond `ceiling` (the declared
+/// object length for a resumable `PATCH`; `u64::MAX` for an unbounded whole
+/// `PUT`); a body that would overrun it is rejected.
+async fn stream_to_staging(
+    backend: Arc<dyn Backend>,
+    staging_key: String,
+    base_offset: u64,
+    ceiling: u64,
+    body: Body,
+) -> Result<u64, VecdError> {
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Bytes>(8);
+    let writer = {
+        let staging_key = staging_key.clone();
+        tokio::task::spawn_blocking(move || -> Result<u64, VecdError> {
+            let mut offset = base_offset;
+            let mut buf: Vec<u8> = Vec::new();
+            while let Ok(chunk) = rx.recv() {
+                buf.extend_from_slice(&chunk);
+                if buf.len() >= UPLOAD_FLUSH_BYTES {
+                    backend.put_at(&staging_key, offset, &buf)?;
+                    offset += buf.len() as u64;
+                    buf.clear();
+                }
+            }
+            if !buf.is_empty() {
+                backend.put_at(&staging_key, offset, &buf)?;
+                offset += buf.len() as u64;
+            }
+            // Materialize the staging blob even when nothing was written, so
+            // a zero-byte object (e.g. an empty `.ivecs`) still finalizes
+            // (otherwise there is no staged blob to promote).
+            if offset == base_offset {
+                backend.put_at(&staging_key, base_offset, &[])?;
+            }
+            Ok(offset - base_offset)
+        })
+    };
+
+    let mut stream = body.into_data_stream();
+    let mut written = base_offset;
+    let mut read_err = None;
+    while let Some(frame) = stream.next().await {
+        match frame {
+            Ok(chunk) => {
+                if chunk.is_empty() {
+                    continue;
+                }
+                if written.saturating_add(chunk.len() as u64) > ceiling {
+                    read_err = Some(VecdError::usage(
+                        "chunk extends past the declared Upload-Length".to_string(),
+                    ));
+                    break;
+                }
+                written += chunk.len() as u64;
+                if tx.send(chunk).is_err() {
+                    break; // the writer stopped (its error surfaces below)
+                }
+            }
+            Err(e) => {
+                read_err = Some(VecdError::op(format!("reading request body: {e}")));
+                break;
+            }
+        }
+    }
+    drop(tx); // signal end-of-stream; the writer flushes and returns
+    let written = writer
+        .await
+        .map_err(|e| VecdError::op(format!("upload writer join: {e}")))??;
+    if let Some(e) = read_err {
+        return Err(e);
+    }
+    Ok(written)
+}
+
+/// Finalize a streamed `PUT`: inside an open session it stages (invisible to
+/// readers); otherwise it is a lone write with per-object CAS + quota. The
+/// bytes already live in the backend staging blob `staging_key`.
+fn finalize_streamed_put(
+    state: &AppState,
+    resolved: Resolved,
+    staging_key: &str,
+    size: u64,
+    cond: &Precondition,
+    quota: u64,
+    ignore_quota: bool,
+) -> Result<Out, VecdError> {
+    let mut db = state.db.lock().unwrap();
+    if session::is_open(&db, &resolved.storage_ns)? {
+        let etag = session::stage_put_staged(&mut db, &resolved, staging_key, size)?;
+        return Ok(Out::status(StatusCode::CREATED).etag(etag));
+    }
+    match store::put_staged(&mut db, &resolved, staging_key, size, cond, quota, ignore_quota)? {
+        PutResult::Written { etag } => Ok(Out::status(StatusCode::CREATED).etag(etag)),
+        PutResult::PreconditionFailed => Ok(Out::status(StatusCode::PRECONDITION_FAILED)),
+        PutResult::QuotaExceeded { quota } => {
+            Ok(Out::status(StatusCode::INSUFFICIENT_STORAGE).header("X-Vecd-Quota", quota.to_string()))
+        }
+    }
+}
+
+/// A fresh, collision-resistant id for an upload resource / staging blob.
+fn new_upload_id() -> String {
+    format!("{:016x}{:016x}", rand::random::<u64>(), rand::random::<u64>())
+}
+
+/// Parse a structured-fields integer header (RFC 8941 — an sf-integer is the
+/// plain decimal number). Backs `Upload-Length` / `Upload-Offset`.
+fn parse_sf_integer(headers: &HeaderMap, name: &str) -> Option<u64> {
+    headers.get(name).and_then(|v| v.to_str().ok()).and_then(|s| s.trim().parse::<u64>().ok())
+}
+
+/// `POST /<ns>/<key>` with `Upload-Length: <N>` — create a resumable upload
+/// resource (IETF "Resumable Uploads for HTTP"). Allocates an upload id and a
+/// backend staging blob, captures any CAS precondition for finalize, and
+/// returns `201` with the upload URL in `Location` and `Upload-Offset: 0`.
+fn handle_create_upload(state: &AppState, r: &Resolved, headers: &HeaderMap) -> Result<Out, VecdError> {
+    let total = parse_sf_integer(headers, "upload-length").ok_or_else(|| {
+        VecdError::usage("creating an upload requires an Upload-Length header".to_string())
+    })?;
+    let (if_match, if_none_match) = match precondition(headers) {
+        Precondition::None => (None, false),
+        Precondition::IfNoneMatchStar => (None, true),
+        Precondition::IfMatch(e) => (Some(e), false),
+    };
+    let upload_id = new_upload_id();
+    let staging_key = new_upload_id();
+    {
+        let db = state.db.lock().unwrap();
+        upload::create(
+            &db,
+            &upload_id,
+            &r.storage_ns,
+            &r.rel_key,
+            total,
+            &staging_key,
+            if_match.as_deref(),
+            if_none_match,
+            now_secs(),
+        )?;
+    }
+    Ok(Out::status(StatusCode::CREATED)
+        .header("Location", format!("/-/uploads/{upload_id}"))
+        .header("Upload-Offset", "0".to_string())
+        .header("Upload-Length", total.to_string())
+        .header("Upload-Complete", "?0".to_string()))
+}
+
+/// Authenticate, load the upload by id, and authorize WRITE on its key.
+/// Returns `(snapshot, caller, upload)` or a terminal response.
+fn authorize_upload(
+    state: &AppState,
+    headers: &HeaderMap,
+    upload_id: &str,
+) -> Result<(Arc<Snapshot>, Caller, upload::Upload), Response> {
+    let (snap, caller) = auth_or_401(state, headers)?;
+    let found = {
+        let db = state.db.lock().unwrap();
+        upload::find(&db, upload_id)
+    };
+    let upload = match found {
+        Ok(Some(u)) => u,
+        Ok(None) => return Err((StatusCode::NOT_FOUND, "no such upload\n").into_response()),
+        Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("{e}\n")).into_response()),
+    };
+    if !snap.can(&caller, Action::Write, &upload.path()) {
+        let status =
+            if caller.is_authenticated() { StatusCode::FORBIDDEN } else { StatusCode::UNAUTHORIZED };
+        return Err((status, "").into_response());
+    }
+    Ok((snap, caller, upload))
+}
+
+/// A bare resumable-upload status response: the `Upload-Offset` /
+/// `Upload-Length` / `Upload-Complete` structured-field headers (and the
+/// object `ETag` once finalized), with no body.
+fn upload_status_response(
+    status: StatusCode,
+    offset: u64,
+    total: u64,
+    complete: bool,
+    etag: Option<&str>,
+) -> Response {
+    let mut b = Response::builder()
+        .status(status)
+        .header("Upload-Offset", offset.to_string())
+        .header("Upload-Length", total.to_string())
+        .header("Upload-Complete", if complete { "?1" } else { "?0" });
+    if let Some(e) = etag {
+        b = b.header(header::ETAG, format!("\"{e}\""));
+    }
+    b.body(Body::empty()).unwrap()
+}
+
+/// `PATCH /-/uploads/<id>` with `Upload-Offset: <k>` and a chunk body — write
+/// `[k, k+len)` sparsely to the staging blob, merge the received interval,
+/// and acknowledge the linearized contiguous-prefix offset. Concurrent
+/// PATCHes at disjoint offsets are allowed; the interval-merge is serialized
+/// by the DB mutex. When the prefix reaches `Upload-Length`, the object is
+/// committed (finalize-on-full).
+async fn upload_patch(
+    State(state): State<AppState>,
+    Path(upload_id): Path<String>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let (snap, caller, upload) = match authorize_upload(&state, &headers, &upload_id) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    // Already committed → idempotent acknowledgement.
+    if upload.complete {
+        return upload_status_response(
+            StatusCode::NO_CONTENT,
+            upload.total_length,
+            upload.total_length,
+            true,
+            upload.etag.as_deref(),
+        );
+    }
+    let Some(k) = parse_sf_integer(&headers, "upload-offset") else {
+        return (StatusCode::BAD_REQUEST, "PATCH requires an Upload-Offset header\n").into_response();
+    };
+    if k > upload.total_length {
+        return (StatusCode::BAD_REQUEST, "Upload-Offset is past Upload-Length\n").into_response();
+    }
+    let resolved = match namespace::resolve(&snap, &upload.path()) {
+        Ok(r) => r,
+        Err(_) => return (StatusCode::NOT_FOUND, "upload target no longer resolves\n").into_response(),
+    };
+
+    // Stream the chunk to [k, ..), bounded by the declared length. Sparse
+    // writes to disjoint regions proceed in parallel with other PATCHes.
+    let len = match stream_to_staging(
+        resolved.backend.clone(),
+        upload.staging_key.clone(),
+        k,
+        upload.total_length,
+        body,
+    )
+    .await
+    {
+        Ok(n) => n,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("{e}\n")).into_response(),
+    };
+
+    // Merge the interval (serialized by the DB mutex) and read the prefix +
+    // whether this PATCH won the right to finalize the now-full upload.
+    let (prefix, claimed) = {
+        let mut db = state.db.lock().unwrap();
+        match upload::record_chunk(&mut db, &upload_id, k, len, upload.total_length) {
+            Ok(r) => r,
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}\n")).into_response(),
+        }
+    };
+
+    // Finalize-on-full: exactly one PATCH (the claimer) promotes the staged
+    // blob to the object; concurrent fillers just report the full offset.
+    if claimed {
+        let cond = upload.precondition();
+        let ignore_quota = snap.has_system_privilege(&caller, PRIV_IGNORE_QUOTAS);
+        let quota = snap
+            .namespace(&resolved.storage_ns)
+            .map(|n| n.quota_bytes)
+            .unwrap_or(crate::model::DEFAULT_QUOTA_BYTES);
+        let total = upload.total_length;
+        let staging_key = upload.staging_key.clone();
+        match finalize_streamed_put(&state, resolved, &staging_key, total, &cond, quota, ignore_quota) {
+            Ok(out) if out.status == StatusCode::CREATED => {
+                if let Some(etag) = &out.etag {
+                    let db = state.db.lock().unwrap();
+                    let _ = upload::mark_complete(&db, &upload_id, etag);
+                }
+                return upload_status_response(StatusCode::NO_CONTENT, total, total, true, out.etag.as_deref());
+            }
+            // CAS / quota failure at finalize — release the claim so the
+            // upload can be retried or deleted, and surface the status.
+            Ok(out) => {
+                let db = state.db.lock().unwrap();
+                let _ = upload::reset_finalizing(&db, &upload_id);
+                return out.into_response();
+            }
+            Err(e) => {
+                let db = state.db.lock().unwrap();
+                let _ = upload::reset_finalizing(&db, &upload_id);
+                return match e {
+                    VecdError::Usage(m) => (StatusCode::BAD_REQUEST, format!("{m}\n")).into_response(),
+                    e => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}\n")).into_response(),
+                };
+            }
+        }
+    }
+
+    // Not the finalizer: report the contiguous offset (which equals total
+    // when another PATCH is finalizing — the client can HEAD for the commit).
+    upload_status_response(StatusCode::NO_CONTENT, prefix, upload.total_length, false, None)
+}
+
+/// `HEAD /-/uploads/<id>` — report the resumable offset so a client can
+/// resume after an interruption (re-send only the ranges at/after the
+/// contiguous offset).
+async fn upload_head(
+    State(state): State<AppState>,
+    Path(upload_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let (_snap, _caller, upload) = match authorize_upload(&state, &headers, &upload_id) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let (offset, complete) = if upload.complete {
+        (upload.total_length, true)
+    } else {
+        let db = state.db.lock().unwrap();
+        match upload::received(&db, &upload_id, upload.total_length) {
+            Ok(rr) => (rr.contiguous_prefix(), false),
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}\n")).into_response(),
+        }
+    };
+    upload_status_response(StatusCode::NO_CONTENT, offset, upload.total_length, complete, upload.etag.as_deref())
+}
+
+/// `DELETE /-/uploads/<id>` — abandon an in-progress upload: free its staging
+/// blob and forget its state. Idempotent once gone.
+async fn upload_delete(
+    State(state): State<AppState>,
+    Path(upload_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let (snap, _caller, upload) = match authorize_upload(&state, &headers, &upload_id) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    if !upload.complete {
+        if let Ok(resolved) = namespace::resolve(&snap, &upload.path()) {
+            let _ = resolved.backend.discard_staged(&upload.staging_key);
+        }
+    }
+    {
+        let db = state.db.lock().unwrap();
+        let _ = upload::delete(&db, &upload_id);
+    }
+    (StatusCode::NO_CONTENT, "").into_response()
 }
 
 fn handle_object(
@@ -662,28 +1152,38 @@ fn handle_object(
         Method::HEAD => {
             let db = state.db.lock().unwrap();
             if let Some(sel) = &pinned {
-                return read_pinned(&db, &resolved, sel, false);
+                return read_pinned(&db, &resolved, sel, false)
+                    .map(|out| if out.status == StatusCode::OK {
+                        out.header("Accept-Ranges", "bytes".to_string())
+                    } else {
+                        out
+                    });
             }
             match store::head(&db, &resolved)? {
                 Some(meta) => Ok(latest_headers(&db, &resolved.storage_ns, Out::status(StatusCode::OK))?
                     .etag(meta.etag)
-                    .content_length(meta.size)),
+                    .content_length(meta.size)
+                    .header("Accept-Ranges", "bytes".to_string())),
                 None => Ok(absent_or_gone(&db, &resolved.storage_ns)?),
             }
         }
         Method::GET => {
             let db = state.db.lock().unwrap();
             if let Some(sel) = &pinned {
-                return read_pinned(&db, &resolved, sel, true);
+                return read_pinned(&db, &resolved, sel, true).map(|out| apply_get_range(out, headers));
             }
             match store::get(&db, &resolved)? {
-                Some((bytes, meta)) => Ok(latest_headers(&db, &resolved.storage_ns, Out::status(StatusCode::OK))?
-                    .etag(meta.etag)
-                    .body(bytes)),
+                Some((bytes, meta)) => Ok(apply_get_range(
+                    latest_headers(&db, &resolved.storage_ns, Out::status(StatusCode::OK))?
+                        .etag(meta.etag)
+                        .body(bytes),
+                    headers,
+                )),
                 None => Ok(absent_or_gone(&db, &resolved.storage_ns)?),
             }
         }
         Method::PUT => handle_put(state, snap, caller, &resolved, headers, body),
+        Method::POST => handle_create_upload(state, &resolved, headers),
         Method::DELETE => {
             let mut db = state.db.lock().unwrap();
             if session::is_open(&db, &resolved.storage_ns)? {
@@ -776,6 +1276,94 @@ fn read_pinned(db: &Db, r: &Resolved, selector: &str, with_body: bool) -> Result
         }
     } else {
         Ok(base.content_length(size))
+    }
+}
+
+/// Outcome of parsing a `Range` header against a known object size.
+enum RangeOutcome {
+    /// No range to honor (absent, multi-range, or unparseable) — serve the
+    /// full `200` body. RFC 7233 §3.1 permits ignoring a range we don't honor.
+    Full,
+    /// A satisfiable single byte range, inclusive of `end`.
+    Satisfiable { start: u64, end: u64 },
+    /// The range lies wholly outside the object — `416`.
+    Unsatisfiable,
+}
+
+/// Parse a single-range `bytes=` specifier against the object's `total` size.
+/// Supports `bytes=a-b`, `bytes=a-` (to end), and `bytes=-n` (suffix). A
+/// multi-range set or garbage falls back to [`RangeOutcome::Full`].
+fn parse_byte_range(spec: &str, total: u64) -> RangeOutcome {
+    let Some(set) = spec.trim().strip_prefix("bytes=") else {
+        return RangeOutcome::Full;
+    };
+    // Only single ranges are honored; a comma-separated set falls back to 200.
+    if set.contains(',') {
+        return RangeOutcome::Full;
+    }
+    let Some((a, b)) = set.trim().split_once('-') else {
+        return RangeOutcome::Full;
+    };
+    let (a, b) = (a.trim(), b.trim());
+    if total == 0 {
+        return RangeOutcome::Unsatisfiable;
+    }
+    let last = total - 1;
+    let (start, end) = if a.is_empty() {
+        // Suffix form `bytes=-n`: the final `n` bytes.
+        match b.parse::<u64>() {
+            Ok(0) => return RangeOutcome::Unsatisfiable,
+            Ok(n) => (total.saturating_sub(n), last),
+            Err(_) => return RangeOutcome::Full,
+        }
+    } else {
+        let start = match a.parse::<u64>() {
+            Ok(s) => s,
+            Err(_) => return RangeOutcome::Full,
+        };
+        let end = if b.is_empty() {
+            last
+        } else {
+            match b.parse::<u64>() {
+                Ok(e) => e.min(last),
+                Err(_) => return RangeOutcome::Full,
+            }
+        };
+        (start, end)
+    };
+    if start > last || start > end {
+        return RangeOutcome::Unsatisfiable;
+    }
+    RangeOutcome::Satisfiable { start, end }
+}
+
+/// Apply a request `Range` header to a fully-bodied `200 OK` object response.
+///
+/// Advertises `Accept-Ranges: bytes`. A satisfiable single byte range becomes
+/// `206 Partial Content` with `Content-Range` and the sliced body, preserving
+/// the ETag and version headers; an unsatisfiable range yields `416`. Non-`200`
+/// responses (404/410/…) pass through untouched.
+fn apply_get_range(out: Out, headers: &HeaderMap) -> Out {
+    if out.status != StatusCode::OK {
+        return out;
+    }
+    let out = out.header("Accept-Ranges", "bytes".to_string());
+    let Some(spec) = headers.get(header::RANGE).and_then(|v| v.to_str().ok()) else {
+        return out;
+    };
+    let total = out.body.len() as u64;
+    match parse_byte_range(spec, total) {
+        RangeOutcome::Full => out,
+        RangeOutcome::Satisfiable { start, end } => {
+            let slice = out.body[start as usize..=end as usize].to_vec();
+            out.header("Content-Range", format!("bytes {start}-{end}/{total}"))
+                .set_status(StatusCode::PARTIAL_CONTENT)
+                .body(slice)
+        }
+        RangeOutcome::Unsatisfiable => out
+            .header("Content-Range", format!("bytes */{total}"))
+            .set_status(StatusCode::RANGE_NOT_SATISFIABLE)
+            .body(Vec::new()),
     }
 }
 
@@ -1064,4 +1652,61 @@ pub async fn serve_listener(
     let make = app.into_make_service_with_connect_info::<SocketAddr>();
     axum::serve(listener, make).with_graceful_shutdown(shutdown).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod range_tests {
+    use super::{parse_byte_range, RangeOutcome};
+
+    fn sat(spec: &str, total: u64) -> (u64, u64) {
+        match parse_byte_range(spec, total) {
+            RangeOutcome::Satisfiable { start, end } => (start, end),
+            RangeOutcome::Full => panic!("expected satisfiable for {spec:?}, got Full"),
+            RangeOutcome::Unsatisfiable => panic!("expected satisfiable for {spec:?}, got Unsatisfiable"),
+        }
+    }
+
+    #[test]
+    fn closed_range_is_inclusive() {
+        // The exact slices the precache client requests for a multi-MB facet.
+        assert_eq!(sat("bytes=0-1048575", 3525800), (0, 1048575));
+        assert_eq!(sat("bytes=2097152-3145727", 3525800), (2097152, 3145727));
+    }
+
+    #[test]
+    fn open_ended_range_runs_to_last_byte() {
+        assert_eq!(sat("bytes=10-", 100), (10, 99));
+    }
+
+    #[test]
+    fn suffix_range_takes_the_tail() {
+        assert_eq!(sat("bytes=-20", 100), (80, 99));
+        // A suffix larger than the object clamps to the whole object.
+        assert_eq!(sat("bytes=-500", 100), (0, 99));
+    }
+
+    #[test]
+    fn end_past_eof_clamps_to_last_byte() {
+        assert_eq!(sat("bytes=90-1000", 100), (90, 99));
+    }
+
+    #[test]
+    fn whitespace_is_tolerated() {
+        assert_eq!(sat(" bytes=0-9 ", 100), (0, 9));
+    }
+
+    #[test]
+    fn start_past_eof_is_unsatisfiable() {
+        assert!(matches!(parse_byte_range("bytes=100-200", 100), RangeOutcome::Unsatisfiable));
+        assert!(matches!(parse_byte_range("bytes=-0", 100), RangeOutcome::Unsatisfiable));
+        assert!(matches!(parse_byte_range("bytes=0-0", 0), RangeOutcome::Unsatisfiable));
+    }
+
+    #[test]
+    fn unsupported_or_garbage_falls_back_to_full() {
+        // No `bytes=` unit, multi-range, and non-numeric all serve the full body.
+        assert!(matches!(parse_byte_range("items=0-9", 100), RangeOutcome::Full));
+        assert!(matches!(parse_byte_range("bytes=0-9,20-29", 100), RangeOutcome::Full));
+        assert!(matches!(parse_byte_range("bytes=abc-def", 100), RangeOutcome::Full));
+    }
 }

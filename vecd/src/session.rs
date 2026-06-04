@@ -87,7 +87,26 @@ pub fn open(db: &mut Db, ns: &str, actor: Option<&str>, deletes: &[String]) -> R
 /// only conditional writes push makes are on the pushlog, handled by the
 /// caller against the committed manifest.
 pub fn stage_put_bytes(db: &mut Db, r: &Resolved, data: &[u8]) -> Result<String, VecdError> {
-    let (ck, size) = store::write_blob(r, data)?;
+    let (ck, size) = store::write_blob(db, r, data)?;
+    db.conn().execute(
+        "INSERT INTO staging_objects(namespace_path,key,content_key,size) VALUES(?1,?2,?3,?4)
+         ON CONFLICT(namespace_path,key) DO UPDATE SET content_key=excluded.content_key, size=excluded.size",
+        params![r.storage_ns, r.rel_key, ck, size as i64],
+    )?;
+    Ok(ck)
+}
+
+/// Stage a **streamed** object PUT into the open session: promote the
+/// upload's staged blob (`staging_key`, `size` bytes) to its content path
+/// and record it in the staging manifest. The streaming analogue of
+/// [`stage_put_bytes`]; returns the content-key (ETag).
+pub fn stage_put_staged(
+    db: &mut Db,
+    r: &Resolved,
+    staging_key: &str,
+    size: u64,
+) -> Result<String, VecdError> {
+    let (ck, size) = store::commit_staged_blob(db, r, staging_key, size)?;
     db.conn().execute(
         "INSERT INTO staging_objects(namespace_path,key,content_key,size) VALUES(?1,?2,?3,?4)
          ON CONFLICT(namespace_path,key) DO UPDATE SET content_key=excluded.content_key, size=excluded.size",
@@ -368,6 +387,31 @@ mod tests {
         assert_eq!(store::get(&db, &r(&snap, "ds/a")).unwrap().unwrap().0, b"v2a");
         assert_eq!(store::get(&db, &r(&snap, "ds/b")).unwrap().unwrap().0, b"newb");
         assert!(!is_open(&db, "ds").unwrap());
+    }
+
+    #[test]
+    fn staged_streamed_upload_commits_into_version() {
+        // A resumable/streamed upload that finalizes inside an open session
+        // stages via `stage_put_staged` and is snapshotted by the COW commit.
+        let (_d, mut db, snap) = fixture();
+        session_open(&mut db, "ds", &[]);
+        let res = r(&snap, "ds/big");
+        // Bytes arrive in the backend staging blob (as the HTTP PATCH path
+        // would write them), then the upload stages.
+        res.backend.put_at("upl-1", 0, b"STREAMEDDATA").unwrap();
+        let etag = stage_put_staged(&mut db, &res, "upl-1", 12).unwrap();
+        assert!(!etag.is_empty());
+        // Still invisible to readers until commit (in-flux window closed).
+        assert!(store::get(&db, &res).unwrap().is_none());
+
+        let info = commit(&mut db, "ds", None).unwrap();
+        assert_eq!(info.seq, 1);
+        // The streamed bytes are live and frozen into the committed version.
+        assert_eq!(store::get(&db, &res).unwrap().unwrap().0, b"STREAMEDDATA");
+        let v = current_version(&db, "ds").unwrap().unwrap();
+        let (vck, vsize) = version_object(&db, v.id, "big").unwrap().unwrap();
+        assert_eq!(vck, etag);
+        assert_eq!(vsize, 12);
     }
 
     #[test]

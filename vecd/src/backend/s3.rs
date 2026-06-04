@@ -10,7 +10,8 @@
 //! Backends are *plain byte stores* — no conditional-write support is
 //! required here; `vecd`'s DB is the CAS authority.
 
-use std::io::Write;
+use std::io::{Seek, SeekFrom, Write};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use crate::backend::Backend;
@@ -87,6 +88,13 @@ impl S3Backend {
             ))
         })
     }
+
+    /// Local temp path holding an in-progress upload's bytes. S3 has no
+    /// native sparse/append `PutObject`, so chunks are assembled on local
+    /// disk (sparse via `seek`) and uploaded in one `aws s3 cp` at finalize.
+    fn staging_path(&self, staging_key: &str) -> PathBuf {
+        std::env::temp_dir().join("vecd-uploads").join(staging_key)
+    }
 }
 
 impl Backend for S3Backend {
@@ -124,6 +132,44 @@ impl Backend for S3Backend {
                 self.uri(key),
                 String::from_utf8_lossy(&out.stderr).trim()
             )))
+        }
+    }
+
+    fn put_at(&self, staging_key: &str, offset: u64, chunk: &[u8]) -> Result<(), VecdError> {
+        let path = self.staging_path(staging_key);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut f = std::fs::OpenOptions::new().read(true).write(true).create(true).open(&path)?;
+        f.seek(SeekFrom::Start(offset))?;
+        f.write_all(chunk)?;
+        Ok(())
+    }
+
+    fn finalize_staged(&self, staging_key: &str, final_key: &str) -> Result<(), VecdError> {
+        let path = self.staging_path(staging_key);
+        // Stream the assembled file straight off disk — `aws s3 cp <file>`
+        // never buffers the whole object in this process.
+        let mut cmd = self.aws();
+        cmd.arg("s3").arg("cp").arg(&path).arg(self.uri(final_key));
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let out = self.run(cmd)?;
+        if !out.status.success() {
+            return Err(VecdError::op(format!(
+                "s3 finalize {} failed: {}",
+                self.uri(final_key),
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
+        }
+        let _ = std::fs::remove_file(&path);
+        Ok(())
+    }
+
+    fn discard_staged(&self, staging_key: &str) -> Result<(), VecdError> {
+        match std::fs::remove_file(self.staging_path(staging_key)) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
         }
     }
 

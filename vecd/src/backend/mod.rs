@@ -32,6 +32,25 @@ pub trait Backend: Send + Sync {
     /// Store (create or overwrite) an object. Must be atomic enough that a
     /// reader never sees a torn write (local uses temp+rename).
     fn put(&self, key: &str, data: &[u8]) -> Result<(), VecdError>;
+
+    /// Write `chunk` at byte `offset` of the **staging** blob `staging_key`,
+    /// creating it if absent and zero-filling any hole before `offset`. This
+    /// is the streaming/sparse write that backs both the plain whole-object
+    /// `PUT` (sequential chunks) and resumable `PATCH` (out-of-order, sparse)
+    /// — bytes go straight to the backend, never buffered whole in memory.
+    /// Staging blobs are transient (an in-progress upload) and never appear
+    /// in [`Backend::list`]; they become an object only at
+    /// [`Backend::finalize_staged`].
+    fn put_at(&self, staging_key: &str, offset: u64, chunk: &[u8]) -> Result<(), VecdError>;
+
+    /// Atomically promote a completed staging blob to the object `final_key`
+    /// (local: a same-filesystem rename). The move must be atomic enough that
+    /// a reader never sees a torn object.
+    fn finalize_staged(&self, staging_key: &str, final_key: &str) -> Result<(), VecdError>;
+
+    /// Discard a staging blob — an abandoned (`DELETE` upload) or rejected
+    /// (failed precondition / quota) upload. Idempotent if already gone.
+    fn discard_staged(&self, staging_key: &str) -> Result<(), VecdError>;
     /// Object size, or `None` if absent.
     fn head(&self, key: &str) -> Result<Option<u64>, VecdError>;
     /// Remove an object; succeeds (idempotent) if already absent.
@@ -93,6 +112,39 @@ mod tests {
         b.delete("a/b").unwrap();
         assert!(b.get("a/b").unwrap().is_none());
         b.delete("a/b").unwrap(); // idempotent
+    }
+
+    /// Staging: out-of-order sparse writes assemble into the final object,
+    /// finalize promotes it (and the staging blob never shows up in `list`),
+    /// and discard removes an abandoned upload.
+    fn staging_roundtrip(b: &dyn Backend) {
+        // Sparse, out of order: tail then head → "HELLOworld".
+        b.put_at("up1", 5, b"world").unwrap();
+        b.put_at("up1", 0, b"HELLO").unwrap();
+        // Not visible as an object yet, nor in listings.
+        assert!(b.get("dst/obj").unwrap().is_none());
+        assert!(b.list("").unwrap().iter().all(|k| !k.contains("up1")));
+        b.finalize_staged("up1", "dst/obj").unwrap();
+        assert_eq!(b.get("dst/obj").unwrap().unwrap(), b"HELLOworld");
+        // Discard is idempotent and leaves no object behind.
+        b.put_at("up2", 0, b"temp").unwrap();
+        b.discard_staged("up2").unwrap();
+        b.discard_staged("up2").unwrap();
+        b.finalize_staged("up2", "dst/never").ok();
+        assert!(b.get("dst/never").unwrap().is_none());
+    }
+
+    #[test]
+    fn local_staging() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = open(&row("local", &format!("local:{}", dir.path().display()))).unwrap();
+        staging_roundtrip(b.as_ref());
+    }
+
+    #[test]
+    fn mem_staging() {
+        let b = open(&row("mem", "mem:staging")).unwrap();
+        staging_roundtrip(b.as_ref());
     }
 
     #[test]

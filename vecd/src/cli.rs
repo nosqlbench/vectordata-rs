@@ -40,6 +40,9 @@ pub enum Cmd {
         /// Name for the bootstrap superuser.
         #[arg(long, default_value = "root")]
         superuser: String,
+        /// Print only the token plaintext (for `$(…)` capture in scripts).
+        #[arg(long)]
+        quiet: bool,
     },
     /// Run the gateway in the foreground (the workhorse `start` execs).
     Serve {
@@ -158,9 +161,10 @@ pub enum Cmd {
 /// Flags shared by `serve`, `start`, and `restart`.
 #[derive(Args, Clone)]
 pub struct ServeArgs {
-    /// Bind address (use `:0` for an ephemeral port).
-    #[arg(long, default_value = "0.0.0.0:8443")]
-    pub bind: String,
+    /// Bind address (use `:0` for an ephemeral port). Falls back to the
+    /// `bind` key in `vecd.conf`, then to `0.0.0.0:8443`.
+    #[arg(long)]
+    pub bind: Option<String>,
     /// TLS certificate (PEM). With `--tls-key`, serves HTTPS.
     #[arg(long)]
     pub tls_cert: Option<PathBuf>,
@@ -217,6 +221,9 @@ pub enum TokensCmd {
         /// Fill a placeholder of `--from` (repeatable): `pos=val`.
         #[arg(long = "set", value_name = "POS=VAL")]
         sets: Vec<String>,
+        /// Print only the token plaintext (for `$(…)` capture in scripts).
+        #[arg(long)]
+        quiet: bool,
     },
     List {
         #[arg(long)]
@@ -366,6 +373,14 @@ fn resolve_data_dir(flag: &Option<PathBuf>, cfg: &config::Config) -> PathBuf {
     config::default_data_dir()
 }
 
+/// Resolve the bind address: `--bind`, else config `bind`, else the default
+/// `0.0.0.0:8443`. Mirrors [`resolve_data_dir`]'s flag-over-config precedence.
+fn resolve_bind(flag: &Option<String>, cfg: &config::Config) -> String {
+    flag.clone()
+        .or_else(|| cfg.get("bind").map(|s| s.to_string()))
+        .unwrap_or_else(|| "0.0.0.0:8443".to_string())
+}
+
 /// Open the DB, surfacing the SQLCipher key from config into the env (used
 /// only when built with the `sqlcipher` feature).
 fn open_db(data_dir: &std::path::Path, cfg: &config::Config) -> Result<Db, VecdError> {
@@ -399,7 +414,7 @@ pub fn run(cli: Cli) -> i32 {
 
 fn dispatch(cmd: Cmd, data_dir: &std::path::Path, cfg: &config::Config) -> Result<(), VecdError> {
     match cmd {
-        Cmd::Init { superuser } => cmd_init(data_dir, &superuser),
+        Cmd::Init { superuser, quiet } => cmd_init(data_dir, &superuser, quiet),
         Cmd::Serve { serve } => cmd_serve(data_dir, cfg, &serve),
         Cmd::Start { serve } => {
             let dd = data_dir.to_path_buf();
@@ -464,7 +479,7 @@ fn dispatch(cmd: Cmd, data_dir: &std::path::Path, cfg: &config::Config) -> Resul
     }
 }
 
-fn cmd_init(data_dir: &std::path::Path, superuser: &str) -> Result<(), VecdError> {
+fn cmd_init(data_dir: &std::path::Path, superuser: &str, quiet: bool) -> Result<(), VecdError> {
     config::write_starter(&config::config_dir())?;
     let db_path = config::db_path(data_dir);
     if db_path.exists() {
@@ -476,6 +491,10 @@ fn cmd_init(data_dir: &std::path::Path, superuser: &str) -> Result<(), VecdError
     let mut db = Db::init(&db_path)?;
     admin::add_user(&mut db, superuser, Level::Superuser, None, None)?;
     let tok = admin::create_token(&mut db, superuser, "vecd init superuser key", None, None)?;
+    if quiet {
+        println!("{}", tok.plaintext);
+        return Ok(());
+    }
     println!("initialized vecd at {}", data_dir.display());
     println!("superuser:  {superuser}");
     println!("token:      {}", tok.plaintext);
@@ -485,10 +504,10 @@ fn cmd_init(data_dir: &std::path::Path, superuser: &str) -> Result<(), VecdError
 }
 
 fn cmd_serve(data_dir: &std::path::Path, cfg: &config::Config, a: &ServeArgs) -> Result<(), VecdError> {
-    let addr: SocketAddr = a
-        .bind
+    let bind = resolve_bind(&a.bind, cfg);
+    let addr: SocketAddr = bind
         .parse()
-        .map_err(|e| VecdError::usage(format!("bad --bind address '{}': {e}", a.bind)))?;
+        .map_err(|e| VecdError::usage(format!("bad bind address '{bind}': {e}")))?;
     let tls = match (a.tls_cert.clone(), a.tls_key.clone()) {
         (Some(cert), Some(key)) => Some(server::TlsConfig { cert, key }),
         (None, None) => None,
@@ -616,7 +635,7 @@ fn cmd_users(data_dir: &std::path::Path, cfg: &config::Config, c: UsersCmd) -> R
 fn cmd_tokens(data_dir: &std::path::Path, cfg: &config::Config, c: TokensCmd) -> Result<(), VecdError> {
     let mut db = open_db(data_dir, cfg)?;
     match c {
-        TokensCmd::Create { user, description, expires, profile, from, sets } => {
+        TokensCmd::Create { user, description, expires, profile, from, sets, quiet } => {
             let profile_json = match (profile, from) {
                 (Some(_), Some(_)) => {
                     return Err(VecdError::usage("give either --profile or --from, not both"))
@@ -629,10 +648,14 @@ fn cmd_tokens(data_dir: &std::path::Path, cfg: &config::Config, c: TokensCmd) ->
                 (None, None) => None,
             };
             let tok = admin::create_token(&mut db, &user, &description, expires.as_deref(), profile_json)?;
-            println!("token:   {}", tok.plaintext);
-            println!("id:      {}", tok.id);
-            println!("expires: {}", admin::fmt_epoch(tok.expires_at));
-            println!("\nStore this token now — it is not recoverable.");
+            if quiet {
+                println!("{}", tok.plaintext);
+            } else {
+                println!("token:   {}", tok.plaintext);
+                println!("id:      {}", tok.id);
+                println!("expires: {}", admin::fmt_epoch(tok.expires_at));
+                println!("\nStore this token now — it is not recoverable.");
+            }
         }
         TokensCmd::List { user } => {
             for (id, u, desc, exp) in admin::list_tokens(&db, user.as_deref())? {
@@ -963,5 +986,26 @@ fn toggle_opt(active: bool, no_active: bool, what: &str) -> Result<Option<bool>,
         (true, false) => Ok(Some(true)),
         (false, true) => Ok(Some(false)),
         _ => Err(VecdError::usage(format!("--active and --no-active conflict for {what}"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_bind_precedence() {
+        let empty = config::Config::default();
+        let with_bind = config::Config::parse("bind = 10.0.0.1:9000").unwrap();
+
+        // --bind flag wins over everything.
+        assert_eq!(
+            resolve_bind(&Some("127.0.0.1:1".to_string()), &with_bind),
+            "127.0.0.1:1"
+        );
+        // No flag → fall back to vecd.conf's `bind`.
+        assert_eq!(resolve_bind(&None, &with_bind), "10.0.0.1:9000");
+        // Neither set → the built-in default.
+        assert_eq!(resolve_bind(&None, &empty), "0.0.0.0:8443");
     }
 }

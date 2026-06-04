@@ -10,9 +10,17 @@ This tutorial walks the full loop with runnable scripts:
    dataset — listing, describing, pinging, and precaching it over HTTP.
 
 Everything the tutorial creates lives under a single throwaway directory
-(`./vecd-demo` by default) and the `vectordata` client is pointed at an
-isolated `HOME`, so **your real `~/.config/vectordata` and `~/.cache` are
-never touched.**
+(`./vecd-demo` by default). Two environment variables — set once in
+`env.sh` — isolate all state under it, so **your real `~/.config/vectordata`
+and `~/.cache` are never touched:**
+
+- `VECD_CONFIG` → the server's config dir (its DB and objects live under it),
+- `VECTORDATA_HOME` → all client state: config (catalogs, credentials,
+  settings) and the cache (`$VECTORDATA_HOME/cache` by default).
+
+Everything else in the steps is a plain literal — the namespace `datasets`,
+the dataset `toy`, the loopback bind `127.0.0.1:18443` — that you can read
+right where it's used instead of chasing it through a wall of `$VARS`.
 
 ## Prerequisites
 
@@ -32,8 +40,9 @@ back to `target/release/<bin>` or `target/debug/<bin>` automatically:
 cargo build -p vecd -p veks -p vectordata --bins
 ```
 
-(If you have older copies on your `PATH`, the scripts prefer those; export
-`VECD_BIN` / `VEKS_BIN` / `VECTORDATA_BIN` to force specific binaries.)
+`env.sh` prepends the workspace `target/{release,debug}` to `PATH`, so the
+steps just call `vecd` / `veks` / `vectordata` by name. If you have copies
+already on your `PATH` (e.g. from `cargo install`), those win.
 
 ## Run it
 
@@ -46,23 +55,27 @@ bash 04-explore.sh           # add the catalog and explore over HTTP
 bash 99-teardown.sh          # stop the daemon (prints how to delete the dir)
 ```
 
-Each script sources `env.sh`, which defines the shared paths, ports, and
-binary-resolving `vecd`/`veks`/`vectordata` shell wrappers. Override the
-location with `DEMO_DIR=/path bash 01-start-vecd.sh` (export it for all
-steps).
+Each script sources `env.sh`, which sets `DEMO` (the throwaway root),
+prepends the build dir to `PATH`, and exports the two isolation variables.
+Override the location with `DEMO=/path bash 01-start-vecd.sh` (export it for
+all steps).
 
 ## What each step shows
 
 ### 01 — the server and its AAA
-- `vecd init` creates the SQLite control-plane DB under `--data-dir` and
-  mints a one-time superuser token.
+- A one-line `vecd.conf` (just `bind = 127.0.0.1:18443`) under `$VECD_CONFIG`
+  is vecd's only operator setting; the DB and pidfile live in `data/` under
+  that dir automatically, so no `--data-dir` is threaded through the steps.
+- `vecd init --quiet` creates the SQLite control-plane DB and mints a
+  one-time superuser token, printing just the token for `$(…)` capture.
 - `vecd backends add … --kind local --endpoint local:<dir>` registers the
   **backing store** — a plain directory blobs are written into.
-- `vecd users add`, `vecd ns add`, `vecd bind`, `vecd tokens create` set up
-  a user who **owns** the `datasets` namespace, a **public read** grant, and
-  a **push token**. The namespace is a path prefix, so it governs both the
-  dataset (`datasets/toy/…`) and the catalog file (`datasets/catalog.yaml`).
-- `vecd start` daemonizes; the script waits for `/healthz`.
+- `vecd users add`, `vecd ns add`, `vecd bind`, `vecd tokens create --quiet`
+  set up a user who **owns** the `datasets` namespace, a **public read**
+  grant, and a **push token**. The namespace is a path prefix, so it governs
+  both the dataset (`datasets/toy/…`) and the catalog (`datasets/catalog.yaml`).
+- `vecd start` daemonizes (bind comes from `vecd.conf`), publishes its real
+  address to `data/vecd.addr`, and the script waits for `/healthz`.
 
 ### 02 — the toy dataset (all facets)
 `veks pipeline generate vectors` makes 2000 random vectors; `veks prepare
@@ -93,13 +106,18 @@ the isolated cache.
 
 ## A note on object sizes
 
-`vecd` currently **buffers each uploaded object in memory** and applies a
-default request-body cap of ~2 MB (per-namespace *quotas* — 50 TiB by
-default — are the intended size control, but the body cap bites first). The
-toy stays well under this; `--predicate-count` in step 02 keeps the largest
-facet (`metadata_results`) small. For real datasets with multi-MB/GB facets,
-that cap and the in-memory buffering need to be raised/streamed server-side —
-a known limitation, not a property of the protocol.
+`vecd` **streams each uploaded object straight to storage** in bounded
+chunks — it never buffers the whole object in memory and imposes no
+request-body cap, so a facet can be any size. The only size gate is the
+per-namespace **quota** (50 TiB by default). Step 02 deliberately sets
+`--predicate-count 12000`, which makes the `metadata_results` facet a
+multi-MB object, to exercise that large-object path end-to-end. (vecd also
+exposes the IETF resumable-upload endpoints — `POST`/`PATCH`/`HEAD` with
+sparse, parallel, resumable chunks — for clients that want resume-on-failure
+or parallel uploads; the plain streaming `PUT` the push engine uses needs
+none of that.) Integrity is the client's job: `vectordata push` verifies
+content via its separate `SHA256SUMS` round-trip and treats vecd's
+envelope ETags as opaque — vecd itself never hashes content.
 
 ## A note on the facets
 

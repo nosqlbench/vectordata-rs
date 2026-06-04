@@ -31,8 +31,9 @@ use rusqlite::{params, Connection, OptionalExtension};
 use crate::model::{DEFAULT_QUOTA_BYTES, VecdError};
 
 /// The schema version this binary writes. Bumped when the schema changes
-/// in a way that needs a migration.
-pub const SCHEMA_VERSION: i64 = 2;
+/// in a way that needs a migration. v3 adds the resumable-upload tables
+/// (`uploads`/`upload_ranges`).
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// A handle to the control-plane database.
 pub struct Db {
@@ -354,6 +355,33 @@ CREATE TABLE IF NOT EXISTS staging_objects (
     PRIMARY KEY(namespace_path, key)
 );
 
+-- In-progress resumable uploads (the IETF "Resumable Uploads for HTTP"
+-- convention with a parallel-sparse extension). An upload streams bytes into
+-- a backend staging blob; `upload_ranges` records the received byte
+-- intervals (kept merged), whose contiguous prefix from 0 is the
+-- acknowledged Upload-Offset. Finalizing promotes the staged blob to an
+-- object and marks the row complete.
+CREATE TABLE IF NOT EXISTS uploads (
+    upload_id      TEXT PRIMARY KEY,
+    namespace_path TEXT NOT NULL,           -- storage namespace
+    key            TEXT NOT NULL,           -- namespace-relative object key
+    total_length   INTEGER NOT NULL,        -- declared Upload-Length
+    staging_key    TEXT NOT NULL,           -- backend staging blob id
+    created        INTEGER NOT NULL,
+    complete       INTEGER NOT NULL DEFAULT 0,
+    etag           TEXT,                     -- committed object ETag (at finalize)
+    if_match       TEXT,                     -- CAS captured at create
+    if_none_match  INTEGER NOT NULL DEFAULT 0
+);
+
+-- Merged received byte intervals [start,end) for an in-progress upload.
+CREATE TABLE IF NOT EXISTS upload_ranges (
+    upload_id TEXT NOT NULL REFERENCES uploads(upload_id) ON DELETE CASCADE,
+    start     INTEGER NOT NULL,
+    end       INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_upload_ranges ON upload_ranges(upload_id);
+
 CREATE TABLE IF NOT EXISTS access_log (
     id          INTEGER PRIMARY KEY,
     ts          INTEGER NOT NULL,
@@ -622,6 +650,28 @@ impl Db {
             .conn
             .query_row("SELECT id FROM users WHERE name=?1", params![name], |r| r.get(0))
             .optional()?)
+    }
+
+    /// Allocate the next monotonic **ETag sequence** value. Every committed
+    /// object write draws a fresh one so its envelope ETag (see
+    /// [`crate::store::envelope_etag`]) is unique — keeping
+    /// `If-Match`/`If-None-Match` CAS meaningful and giving every write a
+    /// distinct content-addressed blob path (copy-on-write friendly). The
+    /// counter lives in `meta`, so it stays monotonic across daemon
+    /// restarts; it is *not* a control-plane mutation and never bumps
+    /// `auth_generation`.
+    pub fn next_etag_seq(&self) -> Result<i64, VecdError> {
+        self.conn.execute(
+            "INSERT INTO meta(key,value) VALUES('etag_seq','1')
+             ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(value AS INTEGER)+1 AS TEXT)",
+            [],
+        )?;
+        Ok(self
+            .conn
+            .query_row("SELECT value FROM meta WHERE key='etag_seq'", [], |r| {
+                let s: String = r.get(0)?;
+                Ok(s.parse::<i64>().unwrap_or(0))
+            })?)
     }
 
     /// Best-effort `last_used` stamp on a token (no generation bump).

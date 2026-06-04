@@ -14,7 +14,7 @@ fi
 
 echo
 echo "demo directory left in place:"
-echo "  $DEMO_DIR"
+echo "  $DEMO"
 echo
 echo "to remove it, run (a literal path you can verify):"
-echo "  rm -rf $DEMO_DIR"
+echo "  rm -rf $DEMO"

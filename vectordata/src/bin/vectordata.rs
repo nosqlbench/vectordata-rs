@@ -83,7 +83,7 @@ enum Cmd {
         #[command(subcommand)]
         command: Option<DatasetsCmd>,
         /// (TUI-mode only) Configuration directory containing catalogs.yaml.
-        #[arg(long, default_value = "~/.config/vectordata", global = true)]
+        #[arg(long, default_value_t = vectordata::catalog::sources::config_dir(), global = true)]
         configdir: String,
         /// (TUI-mode only) Additional catalog directories, file paths, or HTTP URLs.
         #[arg(long, global = true)]
@@ -259,7 +259,7 @@ enum DatasetsCmd {
         #[command(flatten)]
         args: vectordata::datasets::ping::PingArgs,
         /// Configuration directory containing catalogs.yaml
-        #[arg(long, default_value = "~/.config/vectordata")]
+        #[arg(long, default_value_t = vectordata::catalog::sources::config_dir())]
         configdir: String,
         /// Additional catalog directories, file paths, or HTTP URLs
         #[arg(long)]
@@ -278,7 +278,7 @@ enum DatasetsCmd {
         #[command(flatten)]
         args: vectordata::datasets::describe::DescribeArgs,
         /// Configuration directory containing catalogs.yaml
-        #[arg(long, default_value = "~/.config/vectordata")]
+        #[arg(long, default_value_t = vectordata::catalog::sources::config_dir())]
         configdir: String,
         /// Additional catalog directories, file paths, or HTTP URLs
         #[arg(long)]
@@ -319,7 +319,7 @@ enum DatasetsCmd {
         force: bool,
         /// Configuration directory containing `catalogs.yaml`
         /// (only used when `--dataset` is a catalog name).
-        #[arg(long, default_value = "~/.config/vectordata")]
+        #[arg(long, default_value_t = vectordata::catalog::sources::config_dir())]
         configdir: String,
         /// Additional catalog directories, file paths, or HTTP URLs.
         #[arg(long)]
@@ -347,7 +347,7 @@ enum DatasetsCmd {
         /// containing directory, or an `http(s)://…` URL.
         spec: String,
         /// Configuration directory containing `catalogs.yaml`.
-        #[arg(long, default_value = "~/.config/vectordata")]
+        #[arg(long, default_value_t = vectordata::catalog::sources::config_dir())]
         configdir: String,
         /// Additional catalog directories, file paths, or HTTP URLs.
         #[arg(long)]
