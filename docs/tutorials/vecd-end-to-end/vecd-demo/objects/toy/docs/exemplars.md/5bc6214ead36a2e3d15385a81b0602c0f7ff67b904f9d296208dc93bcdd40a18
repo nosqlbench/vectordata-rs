@@ -1,0 +1,10 @@
+# toy — Exemplar Explain Outputs
+
+These are sample outputs from the explain commands, showing how data flows through the pipeline for representative queries.
+
+## Predicate Explanation (query 0)
+
+```
+  resolved from profile 'default': predicates=profiles/base/predicates.ivec metadata=profiles/base/metadata_content.ivec indices=profiles/default/metadata_results.ivvecs
+── predicate [ordinal 0] ──────────────────────────────────```
+

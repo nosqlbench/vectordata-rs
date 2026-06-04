@@ -1,0 +1,291 @@
+{"type":"session","ts":"2026-06-04T16:28:08","message":"veks run"}
+{"ts":"2026-06-04T16:28:08","level":"INFO","message":"pipeline initialized: 24 steps, profile=all, build=1.2.1+0fc7f50258+dirty.1780582124"}
+{"ts":"2026-06-04T16:28:08","level":"INFO","message":"toy [all] — 24 step(s) ready, ~30 total with deferred profiles\n"}
+{"ts":"2026-06-04T16:28:08","level":"INFO","message":"toy [all] [1/24 of ~30] count-vectors — running: state set"}
+{"ts":"2026-06-04T16:28:08","level":"INFO","message":"  vector_count = 2000"}
+{"ts":"2026-06-04T16:28:08","level":"INFO","message":"toy [all] [1/24 of ~30] count-vectors — OK (0.0s): set vector_count = 2000"}
+{"ts":"2026-06-04T16:28:08","level":"INFO ","target":"veks_pipeline::pipeline::runner","message":"Step count-vectors completed in 0.0s"}
+{"ts":"2026-06-04T16:28:08","level":"INFO","message":"toy [all] [2/24 of ~30] count-source-base — running: state set"}
+{"ts":"2026-06-04T16:28:08","level":"INFO","message":"  source_base_count = 2000"}
+{"ts":"2026-06-04T16:28:08","level":"INFO","message":"toy [all] [2/24 of ~30] count-source-base — OK (0.0s): set source_base_count = 2000"}
+{"ts":"2026-06-04T16:28:08","level":"INFO ","target":"veks_pipeline::pipeline::runner","message":"Step count-source-base completed in 0.0s"}
+{"ts":"2026-06-04T16:28:08","level":"INFO","message":"toy [all] [3/24 of ~30] count-source-queries — running: state set"}
+{"ts":"2026-06-04T16:28:08","level":"INFO","message":"  source_query_count = 0"}
+{"ts":"2026-06-04T16:28:08","level":"INFO","message":"toy [all] [3/24 of ~30] count-source-queries — OK (0.0s): set source_query_count = 0"}
+{"ts":"2026-06-04T16:28:08","level":"INFO ","target":"veks_pipeline::pipeline::runner","message":"Step count-source-queries completed in 0.0s"}
+{"ts":"2026-06-04T16:28:08","level":"INFO","message":"toy [all] [4/24 of ~30] set-is_shuffled — running: state set"}
+{"ts":"2026-06-04T16:28:08","level":"INFO","message":"  is_shuffled = true"}
+{"ts":"2026-06-04T16:28:08","level":"INFO","message":"toy [all] [4/24 of ~30] set-is_shuffled — OK (0.0s): set is_shuffled = true"}
+{"ts":"2026-06-04T16:28:08","level":"INFO ","target":"veks_pipeline::pipeline::runner","message":"Step set-is_shuffled completed in 0.0s"}
+{"ts":"2026-06-04T16:28:08","level":"INFO","message":"toy [all] [5/24 of ~30] set-is_self_search — running: state set"}
+{"ts":"2026-06-04T16:28:08","level":"INFO","message":"  is_self_search = true"}
+{"ts":"2026-06-04T16:28:08","level":"INFO","message":"toy [all] [5/24 of ~30] set-is_self_search — OK (0.0s): set is_self_search = true"}
+{"ts":"2026-06-04T16:28:08","level":"INFO ","target":"veks_pipeline::pipeline::runner","message":"Step set-is_self_search completed in 0.0s"}
+{"ts":"2026-06-04T16:28:08","level":"INFO","message":"toy [all] [6/24 of ~30] set-combined_bq — running: state set"}
+{"ts":"2026-06-04T16:28:08","level":"INFO","message":"  combined_bq = false"}
+{"ts":"2026-06-04T16:28:08","level":"INFO","message":"toy [all] [6/24 of ~30] set-combined_bq — OK (0.0s): set combined_bq = false"}
+{"ts":"2026-06-04T16:28:08","level":"INFO ","target":"veks_pipeline::pipeline::runner","message":"Step set-combined_bq completed in 0.0s"}
+{"ts":"2026-06-04T16:28:08","level":"INFO","message":"toy [all] [7/24 of ~30] set-k — running: state set"}
+{"ts":"2026-06-04T16:28:08","level":"INFO","message":"  k = 10"}
+{"ts":"2026-06-04T16:28:08","level":"INFO","message":"toy [all] [7/24 of ~30] set-k — OK (0.0s): set k = 10"}
+{"ts":"2026-06-04T16:28:08","level":"INFO ","target":"veks_pipeline::pipeline::runner","message":"Step set-k completed in 0.0s"}
+{"ts":"2026-06-04T16:28:08","level":"INFO","message":"toy [all] [8/24 of ~30] prepare-vectors — External merge-sort + duplicate detection (builds sorted-ordinal index in lex order)"}
+{"ts":"2026-06-04T16:28:08","level":"INFO","message":"toy [all] [8/24 of ~30] prepare-vectors — running: compute sort"}
+{"ts":"2026-06-04T16:28:08","level":"INFO","message":"  governor-derived batch size: 2000 (available: 268264 MiB, RSS: 21 MiB, ceiling: 670714 MiB, per-entry: 504 B incl. overhead)"}
+{"ts":"2026-06-04T16:28:08","level":"INFO","message":"Dedup: 2K vectors (f32, dim=16), elide=true, batch_size=2K"}
+{"ts":"2026-06-04T16:28:08","level":"INFO","message":"  source: base.fvecs (132.8 KiB)"}
+{"ts":"2026-06-04T16:28:08","level":"INFO","message":"Phase 1: creating sorted runs"}
+{"ts":"2026-06-04T16:28:08","level":"INFO","message":"  128 threads for parallel read + sort"}
+{"ts":"2026-06-04T16:28:08","level":"INFO","message":"  run 1/1: reading 2K vectors [0-2000)"}
+{"ts":"2026-06-04T16:28:08","level":"INFO","message":"  run 1/1: read done (0.0s, 293885 vec/s)"}
+{"ts":"2026-06-04T16:28:08","level":"INFO","message":"  run 1/1: sort done (0.0s, 20041285 vec/s, 128 threads)"}
+{"ts":"2026-06-04T16:28:08","level":"INFO","message":"  run 1/1 done: read 0.0s + sort 0.0s + save 0.0s = 0.0s"}
+{"ts":"2026-06-04T16:28:08","level":"INFO","message":"  1 sorted run(s) in 0.0s (164989 vec/s, 10.7 MB/s read)"}
+{"ts":"2026-06-04T16:28:08","level":"INFO","message":"Phase 2: parallel merge + dedup"}
+{"ts":"2026-06-04T16:28:08","level":"INFO","message":"  loading 1 run files (128 threads)..."}
+{"ts":"2026-06-04T16:28:08","level":"INFO","message":"  loaded in 0.0s"}
+{"ts":"2026-06-04T16:28:08","level":"INFO","message":"  2000 records collected (0.0s, 0 MB)"}
+{"ts":"2026-06-04T16:28:08","level":"INFO","message":"  sorted in 0.0s (99339393 rec/s)"}
+{"ts":"2026-06-04T16:28:08","level":"INFO","message":"  dedup+write: 128 threads, 2000 records"}
+{"ts":"2026-06-04T16:28:08","level":"INFO","message":"  dedup: 0.0s (33743884 vec/s), 2000 unique, 0 dups (0 boundary)"}
+{"ts":"2026-06-04T16:28:08","level":"INFO","message":"  prefix groups: 2000 singleton, 0 multi-element (0.0% collision rate)"}
+{"ts":"2026-06-04T16:28:08","level":"INFO","message":"  prefix collisions: 0 vectors in multi-groups, largest group: 0, full-vector reads: 0"}
+{"ts":"2026-06-04T16:28:08","level":"INFO","message":"  writing 0.0 MB output + 0.0 MB dups..."}
+{"ts":"2026-06-04T16:28:08","level":"INFO","message":"  files written in 0.0s"}
+{"ts":"2026-06-04T16:28:08","level":"INFO","message":"  merge: 0.0s (285652 vec/s), 2K full-vector comparisons avoided by prefix"}
+{"ts":"2026-06-04T16:28:08","level":"INFO","message":"2K vectors -> 2K unique, 0 dup (0.00%) elided, 0.0s (89299 vec/s, 5.8 MB/s), prefix_width=10"}
+{"ts":"2026-06-04T16:28:09","level":"INFO","message":"toy [all] [8/24 of ~30] prepare-vectors — OK (0.0s): 2K vectors -> 2K unique, 0 dup (0.00%) elided, 0.0s (89299 vec/s, 5.8 MB/s), prefix_width=10"}
+{"ts":"2026-06-04T16:28:09","level":"INFO","message":"toy [all] [8/24 of ~30] prepare-vectors — warning: produced file '/mnt/datamir/home/jshook/projects/vectordata-rs/docs/tutorials/vecd-end-to-end/vecd-demo/work/toy/.cache/dedup_duplicates.ivecs' is empty (zero bytes)"}
+{"ts":"2026-06-04T16:28:09","level":"INFO ","target":"veks_pipeline::pipeline::runner","message":"Step prepare-vectors completed in 0.0s"}
+{"ts":"2026-06-04T16:28:09","level":"INFO","message":"toy [all] [9/24 of ~30] count-duplicates — running: state set"}
+{"ts":"2026-06-04T16:28:09","level":"INFO","message":"  duplicate_count = 0"}
+{"ts":"2026-06-04T16:28:09","level":"INFO","message":"toy [all] [9/24 of ~30] count-duplicates — OK (0.0s): set duplicate_count = 0"}
+{"ts":"2026-06-04T16:28:09","level":"INFO ","target":"veks_pipeline::pipeline::runner","message":"Step count-duplicates completed in 0.0s"}
+{"ts":"2026-06-04T16:28:09","level":"INFO","message":"toy [all] [10/24 of ~30] generate-shuffle — Reproducible random permutation of base vector order"}
+{"ts":"2026-06-04T16:28:09","level":"INFO","message":"toy [all] [10/24 of ~30] generate-shuffle — running: generate shuffle"}
+{"ts":"2026-06-04T16:28:09","level":"INFO","message":"  loading ordinals from /mnt/datamir/home/jshook/projects/vectordata-rs/docs/tutorials/vecd-end-to-end/vecd-demo/work/toy/.cache/sorted_ordinals.ivecs"}
+{"ts":"2026-06-04T16:28:09","level":"INFO","message":"toy [all] [10/24 of ~30] generate-shuffle — OK (0.0s): generated shuffle permutation of 2000 elements to /mnt/datamir/home/jshook/projects/vectordata-rs/docs/tutorials/vecd-end-to-end/vecd-demo/work/toy/.cache/shuffle.ivecs"}
+{"ts":"2026-06-04T16:28:09","level":"INFO ","target":"veks_pipeline::pipeline::runner","message":"Step generate-shuffle completed in 0.0s"}
+{"ts":"2026-06-04T16:28:09","level":"INFO","message":"toy [all] [11/24 of ~30] extract-queries — First 50 shuffled vectors -> query set (perturbed)"}
+{"ts":"2026-06-04T16:28:09","level":"INFO","message":"toy [all] [11/24 of ~30] extract-queries — running: transform extract"}
+{"ts":"2026-06-04T16:28:09","level":"INFO","message":"  L2 normalization enabled during extraction"}
+{"ts":"2026-06-04T16:28:09","level":"INFO","message":"  source not normalized (mean_ε=1.30e0 >= 1e-5) — normalizing during extraction"}
+{"ts":"2026-06-04T16:28:09","level":"INFO","message":"fvec-extract: using 128 threads"}
+{"ts":"2026-06-04T16:28:09","level":"INFO","message":"fvec-extract: 50 vectors, 68 bytes/record, 2 passes (budget: 100.8 GiB, 0 MB/partition)"}
+{"ts":"2026-06-04T16:28:09","level":"INFO","message":"fvec-extract: pass 1/2 starting (25 vectors, output range [0..25))"}
+{"ts":"2026-06-04T16:28:09","level":"DEBUG","target":"veks_pipeline::pipeline::commands::gen_extract","message":"fvec-extract: pass 1/2, wrote 25 records (0.0 MB)"}
+{"ts":"2026-06-04T16:28:09","level":"INFO","message":"fvec-extract: pass 1/2 done (0.0s, 25 records, 0.0 MB)"}
+{"ts":"2026-06-04T16:28:09","level":"INFO","message":"fvec-extract: pass 2/2 starting (25 vectors, output range [25..50))"}
+{"ts":"2026-06-04T16:28:09","level":"DEBUG","target":"veks_pipeline::pipeline::commands::gen_extract","message":"fvec-extract: pass 2/2, wrote 25 records (0.0 MB)"}
+{"ts":"2026-06-04T16:28:09","level":"INFO","message":"fvec-extract: pass 2/2 done (0.0s, 25 records, 0.0 MB)"}
+{"ts":"2026-06-04T16:28:09","level":"INFO","message":"  source norms: mean_ε=1.33e0, stddev=2.46e-1, median=1.38e0, max_ε=1.92e0, was_normalized=false"}
+{"ts":"2026-06-04T16:28:09","level":"INFO","message":"  output norms: mean_ε=2.05e-8, stddev=1.45e-8, median=1.94e-8, max_ε=5.85e-8"}
+{"ts":"2026-06-04T16:28:09","level":"INFO","message":"toy [all] [11/24 of ~30] extract-queries — OK (0.0s): extracted 50 fvec vectors (50 input, 0 near-zero filtered, range [0..50), 2 passes, 128 threads) to /mnt/datamir/home/jshook/projects/vectordata-rs/docs/tutorials/vecd-end-to-end/vecd-demo/work/toy/profiles/base/query_vectors.fvecs"}
+{"ts":"2026-06-04T16:28:09","level":"INFO ","target":"veks_pipeline::pipeline::runner","message":"Step extract-queries completed in 0.0s"}
+{"ts":"2026-06-04T16:28:09","level":"INFO","message":"toy [all] [12/24 of ~30] extract-base — Remainder of shuffled vectors -> base set"}
+{"ts":"2026-06-04T16:28:09","level":"INFO","message":"toy [all] [12/24 of ~30] extract-base — running: transform extract"}
+{"ts":"2026-06-04T16:28:09","level":"INFO","message":"  L2 normalization enabled during extraction"}
+{"ts":"2026-06-04T16:28:09","level":"INFO","message":"  source not normalized (mean_ε=1.30e0 >= 1e-5) — normalizing during extraction"}
+{"ts":"2026-06-04T16:28:09","level":"INFO","message":"fvec-extract: using 128 threads"}
+{"ts":"2026-06-04T16:28:09","level":"INFO","message":"fvec-extract: 1950 vectors, 68 bytes/record, 2 passes (budget: 100.8 GiB, 0 MB/partition)"}
+{"ts":"2026-06-04T16:28:09","level":"INFO","message":"fvec-extract: pass 1/2 starting (975 vectors, output range [0..975))"}
+{"ts":"2026-06-04T16:28:09","level":"DEBUG","target":"veks_pipeline::pipeline::commands::gen_extract","message":"fvec-extract: pass 1/2, wrote 975 records (0.1 MB)"}
+{"ts":"2026-06-04T16:28:09","level":"INFO","message":"fvec-extract: pass 1/2 done (0.0s, 975 records, 0.1 MB)"}
+{"ts":"2026-06-04T16:28:09","level":"INFO","message":"fvec-extract: pass 2/2 starting (975 vectors, output range [975..1950))"}
+{"ts":"2026-06-04T16:28:09","level":"DEBUG","target":"veks_pipeline::pipeline::commands::gen_extract","message":"fvec-extract: pass 2/2, wrote 975 records (0.1 MB)"}
+{"ts":"2026-06-04T16:28:09","level":"INFO","message":"fvec-extract: pass 2/2 done (0.0s, 975 records, 0.1 MB)"}
+{"ts":"2026-06-04T16:28:09","level":"INFO","message":"  source norms: mean_ε=1.30e0, stddev=2.61e-1, median=1.30e0, max_ε=2.13e0, was_normalized=false"}
+{"ts":"2026-06-04T16:28:09","level":"INFO","message":"  output norms: mean_ε=2.00e-8, stddev=1.31e-8, median=1.87e-8, max_ε=6.86e-8"}
+{"ts":"2026-06-04T16:28:09","level":"INFO","message":"toy [all] [12/24 of ~30] extract-base — OK (0.0s): extracted 1950 fvec vectors (1950 input, 0 near-zero filtered, range [50..2000), 2 passes, 128 threads) to /mnt/datamir/home/jshook/projects/vectordata-rs/docs/tutorials/vecd-end-to-end/vecd-demo/work/toy/profiles/base/base_vectors.fvecs"}
+{"ts":"2026-06-04T16:28:09","level":"INFO ","target":"veks_pipeline::pipeline::runner","message":"Step extract-base completed in 0.0s"}
+{"ts":"2026-06-04T16:28:09","level":"INFO","message":"toy [all] [13/24 of ~30] count-base — running: state set"}
+{"ts":"2026-06-04T16:28:09","level":"INFO","message":"  base_count = 1950"}
+{"ts":"2026-06-04T16:28:09","level":"INFO","message":"toy [all] [13/24 of ~30] count-base — OK (0.0s): set base_count = 1950"}
+{"ts":"2026-06-04T16:28:09","level":"INFO ","target":"veks_pipeline::pipeline::runner","message":"Step count-base completed in 0.0s"}
+{"ts":"2026-06-04T16:28:09","level":"INFO","message":"toy [all] [14/24 of ~30] generate-metadata — Synthesize random integer metadata"}
+{"ts":"2026-06-04T16:28:09","level":"INFO","message":"toy [all] [14/24 of ~30] generate-metadata — running: generate metadata"}
+{"ts":"2026-06-04T16:28:09","level":"INFO","message":"  generate metadata: 2000 records, 3 fields, range [0..3), seed=7, format=ivec"}
+{"ts":"2026-06-04T16:28:09","level":"INFO","message":"  wrote metadata layout schema to /mnt/datamir/home/jshook/projects/vectordata-rs/docs/tutorials/vecd-end-to-end/vecd-demo/work/toy/profiles/base/metadata_layout.slab"}
+{"ts":"2026-06-04T16:28:09","level":"INFO","message":"  wrote 2000 metadata records (3 fields each) to /mnt/datamir/home/jshook/projects/vectordata-rs/docs/tutorials/vecd-end-to-end/vecd-demo/work/toy/.cache/metadata_all.ivec"}
+{"ts":"2026-06-04T16:28:09","level":"INFO","message":"toy [all] [14/24 of ~30] generate-metadata — OK (0.0s): 2000 records, 3 fields, range [0..3), seed=7"}
+{"ts":"2026-06-04T16:28:09","level":"INFO ","target":"veks_pipeline::pipeline::runner","message":"Step generate-metadata completed in 0.0s"}
+{"ts":"2026-06-04T16:28:09","level":"INFO","message":"toy [all] [15/24 of ~30] extract-metadata — Reorder metadata to match shuffled base vectors"}
+{"ts":"2026-06-04T16:28:09","level":"INFO","message":"toy [all] [15/24 of ~30] extract-metadata — running: transform extract"}
+{"ts":"2026-06-04T16:28:09","level":"INFO","message":"toy [all] [15/24 of ~30] extract-metadata — OK (0.0s): extracted 1950 ivec records by index (range [50..2000)) to /mnt/datamir/home/jshook/projects/vectordata-rs/docs/tutorials/vecd-end-to-end/vecd-demo/work/toy/profiles/base/metadata_content.ivec"}
+{"ts":"2026-06-04T16:28:09","level":"INFO ","target":"veks_pipeline::pipeline::runner","message":"Step extract-metadata completed in 0.0s"}
+{"ts":"2026-06-04T16:28:09","level":"INFO","message":"toy [all] [16/24 of ~30] generate-predicates — Generate simple integer equality predicates"}
+{"ts":"2026-06-04T16:28:09","level":"INFO","message":"toy [all] [16/24 of ~30] generate-predicates — running: generate simple-predicates"}
+{"ts":"2026-06-04T16:28:09","level":"INFO","message":"  generate simple-predicates: 12000 preds, 3 fields, range [0, 3), seed=7"}
+{"ts":"2026-06-04T16:28:09","level":"INFO","message":"  wrote 12000 predicates to /mnt/datamir/home/jshook/projects/vectordata-rs/docs/tutorials/vecd-end-to-end/vecd-demo/work/toy/profiles/base/predicates.ivec"}
+{"ts":"2026-06-04T16:28:09","level":"INFO","message":"toy [all] [16/24 of ~30] generate-predicates — OK (0.0s): 12000 simple-int-eq predicates, 3 fields, range [0, 3)"}
+{"ts":"2026-06-04T16:28:09","level":"INFO ","target":"veks_pipeline::pipeline::runner","message":"Step generate-predicates completed in 0.0s"}
+{"ts":"2026-06-04T16:28:09","level":"INFO","message":"toy [all] [17/24 of ~30] compute-knn — Compute brute-force exact KNN ground truth"}
+{"ts":"2026-06-04T16:28:09","level":"INFO","message":"toy [all] [17/24 of ~30] compute-knn — running: compute knn"}
+{"ts":"2026-06-04T16:28:09","level":"INFO","message":"  opening base vectors: /mnt/datamir/home/jshook/projects/vectordata-rs/docs/tutorials/vecd-end-to-end/vecd-demo/work/toy/profiles/base/base_vectors.fvecs"}
+{"ts":"2026-06-04T16:28:09","level":"INFO","message":"  opening query vectors: /mnt/datamir/home/jshook/projects/vectordata-rs/docs/tutorials/vecd-end-to-end/vecd-demo/work/toy/profiles/base/query_vectors.fvecs"}
+{"ts":"2026-06-04T16:28:09","level":"INFO","message":"KNN: 50 queries x 1950 base vectors (f32, dim=16), k=10, metric=L2, threads=128, simd=SimSIMD (L1: AVX-512), batch=transposed AVX-512 (16-wide)"}
+{"ts":"2026-06-04T16:28:09","level":"INFO","message":"  base: base_vectors.fvecs (121.9 KiB)  query: query_vectors.fvecs (3.1 KiB)"}
+{"ts":"2026-06-04T16:28:09","level":"INFO","message":"  auto partition size: 2.6B vectors (163.7 GiB budget = 25% of mem ceiling 655.0 GiB)"}
+{"ts":"2026-06-04T16:28:09","level":"INFO","message":"  planning ~1 partitions (partition_size=2.6B)..."}
+{"ts":"2026-06-04T16:28:09","level":"INFO","message":"  partition [0, 1950): compute"}
+{"ts":"2026-06-04T16:28:09","level":"INFO","message":"  1 partitions (segment_size=2.6B, 0 cached, 1 to compute)"}
+{"ts":"2026-06-04T16:28:09","level":"INFO","message":"  1 uncached partition to compute"}
+{"ts":"2026-06-04T16:28:09","level":"INFO","message":"  partition 1/1 [0,1950) — 50 queries x 1950 base (129.5 KiB) metric=L2  [1/1]"}
+{"ts":"2026-06-04T16:28:09","level":"INFO","message":"    done in 0.1s (952.8K/s distance evaluations)"}
+{"ts":"2026-06-04T16:28:09","level":"INFO ","target":"veks_pipeline::pipeline::commands::compute_knn","message":"partition 1/1 — compute done in 0.1s (save in background)"}
+{"ts":"2026-06-04T16:28:09","level":"INFO ","target":"veks_pipeline::pipeline::commands::compute_knn","message":"→ knn-metal.base_vectors.query_vectors.132600_3400.range_000000_001950.k10.l2.neighbors.ivec  (2.1 KiB)"}
+{"ts":"2026-06-04T16:28:09","level":"INFO ","target":"veks_pipeline::pipeline::commands::compute_knn","message":"→ knn-metal.base_vectors.query_vectors.132600_3400.range_000000_001950.k10.l2.distances.fvec  (2.1 KiB)"}
+{"ts":"2026-06-04T16:28:09","level":"INFO ","target":"veks_pipeline::pipeline::commands::compute_knn","message":"final save completed in 0.0s"}
+{"ts":"2026-06-04T16:28:09","level":"INFO","message":"  merging 1 partitions (50 queries)..."}
+{"ts":"2026-06-04T16:28:09","level":"INFO","message":"  canonical rerank: 50 queries × 10 candidates, metric=L2"}
+{"ts":"2026-06-04T16:28:10","level":"INFO","message":"toy [all] [17/24 of ~30] compute-knn — OK (0.1s): computed KNN: 50 queries, k=10, metric=L2, 1950 base vectors (1 partitions)"}
+{"ts":"2026-06-04T16:28:10","level":"INFO ","target":"veks_pipeline::pipeline::runner","message":"Step compute-knn completed in 0.1s"}
+{"ts":"2026-06-04T16:28:10","level":"INFO","message":"toy [all] [18/24 of ~30] verify-knn — Multi-threaded single-pass KNN verification across all profiles"}
+{"ts":"2026-06-04T16:28:10","level":"INFO","message":"toy [all] [18/24 of ~30] verify-knn — running: verify knn-consolidated"}
+{"ts":"2026-06-04T16:28:10","level":"INFO","message":"verify knn-consolidated: dataset=/mnt/datamir/home/jshook/projects/vectordata-rs/docs/tutorials/vecd-end-to-end/vecd-demo/work/toy/dataset.yaml anchor=default scope=1/1 profile"}
+{"ts":"2026-06-04T16:28:10","level":"INFO","message":"    default (in scope)"}
+{"ts":"2026-06-04T16:28:10","level":"INFO","message":"verify knn-consolidated: KNN ground truth across 1 profile via cblas_sgemm (single-threaded, MKL-safe); sample=50 of 50 queries (100.0%), metric=L2, threads=128"}
+{"ts":"2026-06-04T16:28:10","level":"INFO","message":"  loaded GT for 1 profiles, 50 sample queries, k=10"}
+{"ts":"2026-06-04T16:28:10","level":"INFO","message":"  chunk plan: 986895 base/chunk × 50 queries/sub-batch"}
+{"ts":"2026-06-04T16:28:10","level":"INFO","message":"  scanning 1950 base vectors (50 sample queries, metric=L2, engine=BLAS sgemm)"}
+{"ts":"2026-06-04T16:28:10","level":"INFO","message":"  scan [0..1950): 0.0s (0.1M base/s)"}
+{"ts":"2026-06-04T16:28:10","level":"INFO","message":"  profile 'default' (base_count=1950): 50/50 pass, 0 fail, recall@10=1.0000"}
+{"ts":"2026-06-04T16:28:10","level":"INFO","message":"  verify phase: 0.0s"}
+{"ts":"2026-06-04T16:28:10","level":"INFO","message":"toy [all] [18/24 of ~30] verify-knn — OK (0.0s): verified 1 profiles (50 sample queries, 128 threads): 0 failures"}
+{"ts":"2026-06-04T16:28:10","level":"INFO ","target":"veks_pipeline::pipeline::runner","message":"Step verify-knn completed in 0.0s"}
+{"ts":"2026-06-04T16:28:10","level":"INFO","message":"toy [all] [19/24 of ~30] evaluate-predicates — running: compute evaluate-predicates"}
+{"ts":"2026-06-04T16:28:10","level":"INFO","message":"  evaluate: 1950 metadata records, 3 fields (format=ivec)"}
+{"ts":"2026-06-04T16:28:10","level":"INFO","message":"  evaluate: 12000 predicates (format=ivec)"}
+{"ts":"2026-06-04T16:28:10","level":"INFO","message":"  built index: 27 distinct value tuples"}
+{"ts":"2026-06-04T16:28:10","level":"INFO","message":"  built offset index (12000 records)"}
+{"ts":"2026-06-04T16:28:10","level":"INFO","message":"  12000 predicates evaluated, avg 72.5 matches/predicate"}
+{"ts":"2026-06-04T16:28:10","level":"INFO","message":"toy [all] [19/24 of ~30] evaluate-predicates — OK (0.0s): 12000 predicates, avg 72.5 matches"}
+{"ts":"2026-06-04T16:28:10","level":"INFO ","target":"veks_pipeline::pipeline::runner","message":"Step evaluate-predicates completed in 0.0s"}
+{"ts":"2026-06-04T16:28:10","level":"INFO","message":"toy [all] [20/24 of ~30] verify-predicates-sqlite — Verify predicate evaluations using SQLite oracle"}
+{"ts":"2026-06-04T16:28:10","level":"INFO","message":"toy [all] [20/24 of ~30] verify-predicates-sqlite — running: verify predicates-sqlite"}
+{"ts":"2026-06-04T16:28:10","level":"INFO","message":"verify predicates-sqlite: dataset=/mnt/datamir/home/jshook/projects/vectordata-rs/docs/tutorials/vecd-end-to-end/vecd-demo/work/toy/dataset.yaml anchor=default scope=1/1 profile"}
+{"ts":"2026-06-04T16:28:10","level":"INFO","message":"    default (in scope)"}
+{"ts":"2026-06-04T16:28:10","level":"INFO","message":"  verify predicates-sqlite: metadata=/mnt/datamir/home/jshook/projects/vectordata-rs/docs/tutorials/vecd-end-to-end/vecd-demo/work/toy/profiles/base/metadata_content.ivec predicates=/mnt/datamir/home/jshook/projects/vectordata-rs/docs/tutorials/vecd-end-to-end/vecd-demo/work/toy/profiles/base/predicates.ivec results=/mnt/datamir/home/jshook/projects/vectordata-rs/docs/tutorials/vecd-end-to-end/vecd-demo/work/toy/profiles/default/metadata_results.ivvecs"}
+{"ts":"2026-06-04T16:28:10","level":"INFO","message":"  loaded 1950 metadata records into SQLite (3 fields)"}
+{"ts":"2026-06-04T16:28:10","level":"INFO","message":"  loaded 12000 predicates"}
+{"ts":"2026-06-04T16:28:10","level":"INFO","message":"  loaded 12000 result records"}
+{"ts":"2026-06-04T16:28:10","level":"INFO","message":"verify predicates-sqlite: predicate evaluation results vs SQLite oracle (in-memory, 3 fields, 1950 metadata records); sample=12000 of 12000 predicates × 128 threads"}
+{"ts":"2026-06-04T16:28:10","level":"INFO","message":"  exemplar [846]:"}
+{"ts":"2026-06-04T16:28:10","level":"INFO","message":"    SQL: SELECT ordinal FROM metadata WHERE field_0 = 1 AND field_1 = 1 AND field_2 = 0 ORDER BY ordinal"}
+{"ts":"2026-06-04T16:28:10","level":"INFO","message":"    SQL result: 69 ordinals"}
+{"ts":"2026-06-04T16:28:10","level":"INFO","message":"    stored R:   69 ordinals"}
+{"ts":"2026-06-04T16:28:10","level":"INFO","message":"    SQL ordinals (first 5):    [0, 42, 72, 106, 135, ...]"}
+{"ts":"2026-06-04T16:28:10","level":"INFO","message":"    stored ordinals (first 5): [0, 42, 72, 106, 135, ...]"}
+{"ts":"2026-06-04T16:28:10","level":"INFO","message":"    exact match ✓"}
+{"ts":"2026-06-04T16:28:10","level":"INFO","message":"  exemplar [847]:"}
+{"ts":"2026-06-04T16:28:10","level":"INFO","message":"    SQL: SELECT ordinal FROM metadata WHERE field_0 = 1 AND field_1 = 2 AND field_2 = 0 ORDER BY ordinal"}
+{"ts":"2026-06-04T16:28:10","level":"INFO","message":"    SQL result: 77 ordinals"}
+{"ts":"2026-06-04T16:28:10","level":"INFO","message":"    stored R:   77 ordinals"}
+{"ts":"2026-06-04T16:28:10","level":"INFO","message":"    SQL ordinals (first 5):    [63, 91, 110, 123, 136, ...]"}
+{"ts":"2026-06-04T16:28:10","level":"INFO","message":"    stored ordinals (first 5): [63, 91, 110, 123, 136, ...]"}
+{"ts":"2026-06-04T16:28:10","level":"INFO","message":"    exact match ✓"}
+{"ts":"2026-06-04T16:28:10","level":"INFO","message":"  exemplar [848]:"}
+{"ts":"2026-06-04T16:28:10","level":"INFO","message":"    SQL: SELECT ordinal FROM metadata WHERE field_0 = 0 AND field_1 = 1 AND field_2 = 0 ORDER BY ordinal"}
+{"ts":"2026-06-04T16:28:10","level":"INFO","message":"    SQL result: 77 ordinals"}
+{"ts":"2026-06-04T16:28:10","level":"INFO","message":"    stored R:   77 ordinals"}
+{"ts":"2026-06-04T16:28:10","level":"INFO","message":"    SQL ordinals (first 5):    [2, 28, 77, 99, 103, ...]"}
+{"ts":"2026-06-04T16:28:10","level":"INFO","message":"    stored ordinals (first 5): [2, 28, 77, 99, 103, ...]"}
+{"ts":"2026-06-04T16:28:10","level":"INFO","message":"    exact match ✓"}
+{"ts":"2026-06-04T16:28:16","level":"INFO","message":"  12000 pass, 0 fail (12000 checked of 12000, 128 threads)"}
+{"ts":"2026-06-04T16:28:16","level":"INFO","message":"toy [all] [20/24 of ~30] verify-predicates-sqlite — OK (5.9s): 12000 pass, 0 fail (12000 checked)"}
+{"ts":"2026-06-04T16:28:16","level":"INFO ","target":"veks_pipeline::pipeline::runner","message":"Step verify-predicates-sqlite completed in 5.9s"}
+{"ts":"2026-06-04T16:28:16","level":"INFO","message":"toy [all] [21/24 of ~30] compute-prefiltered-knn — Compute filtered KNN with predicate pre-filtering"}
+{"ts":"2026-06-04T16:28:16","level":"INFO","message":"toy [all] [21/24 of ~30] compute-prefiltered-knn — running: compute prefiltered-knn"}
+{"ts":"2026-06-04T16:28:16","level":"INFO","message":"  opening base vectors: /mnt/datamir/home/jshook/projects/vectordata-rs/docs/tutorials/vecd-end-to-end/vecd-demo/work/toy/profiles/base/base_vectors.fvecs"}
+{"ts":"2026-06-04T16:28:16","level":"INFO","message":"  opening query vectors: /mnt/datamir/home/jshook/projects/vectordata-rs/docs/tutorials/vecd-end-to-end/vecd-demo/work/toy/profiles/base/query_vectors.fvecs"}
+{"ts":"2026-06-04T16:28:16","level":"INFO","message":"filtered KNN: 50 queries x 1,950 base vectors (f32), k=10, metric=L2, threads=128"}
+{"ts":"2026-06-04T16:28:16","level":"INFO","message":"  base: base_vectors.fvecs (129.5 KiB)  keys: 12,000 records"}
+{"ts":"2026-06-04T16:28:16","level":"INFO","message":"  writing results..."}
+{"ts":"2026-06-04T16:28:16","level":"INFO","message":"toy [all] [21/24 of ~30] compute-prefiltered-knn — OK (0.0s): filtered KNN: 50 queries, k=10, metric=L2, 1950 base vectors"}
+{"ts":"2026-06-04T16:28:16","level":"INFO ","target":"veks_pipeline::pipeline::runner","message":"Step compute-prefiltered-knn completed in 0.0s"}
+{"ts":"2026-06-04T16:28:16","level":"INFO","message":"toy [all] [22/24 of ~30] verify-prefiltered-knn — Verify filtered KNN results via brute-force recomputation"}
+{"ts":"2026-06-04T16:28:16","level":"INFO","message":"toy [all] [22/24 of ~30] verify-prefiltered-knn — running: verify prefiltered-knn-consolidated"}
+{"ts":"2026-06-04T16:28:16","level":"INFO","message":"verify filtered-knn-consolidated: dataset=/mnt/datamir/home/jshook/projects/vectordata-rs/docs/tutorials/vecd-end-to-end/vecd-demo/work/toy/dataset.yaml anchor=default scope=1/1 profile"}
+{"ts":"2026-06-04T16:28:16","level":"INFO","message":"    default (in scope)"}
+{"ts":"2026-06-04T16:28:16","level":"INFO","message":"verify filtered-knn-consolidated: filtered KNN ground truth across 0 profiles via cblas_sgemm (single-threaded, MKL-safe); sample=50 of 50 queries, base=1950"}
+{"ts":"2026-06-04T16:28:17","level":"INFO","message":"toy [all] [22/24 of ~30] verify-prefiltered-knn — OK (0.0s): verified filtered KNN for 0 profiles"}
+{"ts":"2026-06-04T16:28:17","level":"INFO ","target":"veks_pipeline::pipeline::runner","message":"Step verify-prefiltered-knn completed in 0.0s"}
+{"ts":"2026-06-04T16:28:17","level":"INFO","message":"toy [all] [23/24 of ~30] compute-postfiltered-knn — Derive post-filter KNN ground truth (E = G ∩ R)"}
+{"ts":"2026-06-04T16:28:17","level":"INFO","message":"toy [all] [23/24 of ~30] compute-postfiltered-knn — running: compute postfiltered-knn"}
+{"ts":"2026-06-04T16:28:17","level":"INFO","message":"  WARNING: G has 50 queries, R has 12000 predicates; using min=50"}
+{"ts":"2026-06-04T16:28:17","level":"INFO","message":"toy [all] [23/24 of ~30] compute-postfiltered-knn — OK (0.0s): postfiltered KNN (F = G ∩ R): 50 queries, k=10, avg survivors 0.42, avg sentinels 9.58"}
+{"ts":"2026-06-04T16:28:17","level":"INFO ","target":"veks_pipeline::pipeline::runner","message":"Step compute-postfiltered-knn completed in 0.0s"}
+{"ts":"2026-06-04T16:28:17","level":"INFO","message":"toy [all] [24/24 of ~30] verify-postfiltered-knn — Verify post-filter KNN (E = G ∩ R) via re-derivation"}
+{"ts":"2026-06-04T16:28:17","level":"INFO","message":"toy [all] [24/24 of ~30] verify-postfiltered-knn — running: verify postfiltered-knn-consolidated"}
+{"ts":"2026-06-04T16:28:17","level":"INFO","message":"verify postfiltered-knn-consolidated: dataset=/mnt/datamir/home/jshook/projects/vectordata-rs/docs/tutorials/vecd-end-to-end/vecd-demo/work/toy/dataset.yaml anchor=default scope=1/1 profile"}
+{"ts":"2026-06-04T16:28:17","level":"INFO","message":"    default (in scope)"}
+{"ts":"2026-06-04T16:28:17","level":"INFO","message":"verify postfiltered-knn-consolidated: E = G ∩ R across 1 profile; sample=50 queries per profile"}
+{"ts":"2026-06-04T16:28:17","level":"INFO","message":"toy [all] [24/24 of ~30] verify-postfiltered-knn — OK (0.0s): postfilter verify: 1 profiles, sample=50, mismatches=0"}
+{"ts":"2026-06-04T16:28:17","level":"INFO ","target":"veks_pipeline::pipeline::runner","message":"Step verify-postfiltered-knn completed in 0.0s"}
+{"ts":"2026-06-04T16:28:17","level":"INFO","message":"Finalization: 6 step(s) to run"}
+{"ts":"2026-06-04T16:28:17","level":"INFO","message":"toy [all] — 6 step(s) ready, ~30 total with deferred profiles\n"}
+{"ts":"2026-06-04T16:28:17","level":"INFO","message":"toy [all] [1/6 of ~30] generate-dataset-json — Generate dataset.json from dataset.yaml"}
+{"ts":"2026-06-04T16:28:17","level":"INFO","message":"toy [all] [1/6 of ~30] generate-dataset-json — running: generate dataset-json"}
+{"ts":"2026-06-04T16:28:17","level":"INFO","message":"  wrote /mnt/datamir/home/jshook/projects/vectordata-rs/docs/tutorials/vecd-end-to-end/vecd-demo/work/toy/dataset.json"}
+{"ts":"2026-06-04T16:28:17","level":"INFO","message":"toy [all] [1/6 of ~30] generate-dataset-json — OK (0.0s): wrote dataset.json"}
+{"ts":"2026-06-04T16:28:17","level":"INFO ","target":"veks_pipeline::pipeline::runner","message":"Step generate-dataset-json completed in 0.0s"}
+{"ts":"2026-06-04T16:28:17","level":"INFO","message":"toy [all] [2/6 of ~30] generate-variables-json — Generate variables.json from variables.yaml"}
+{"ts":"2026-06-04T16:28:17","level":"INFO","message":"toy [all] [2/6 of ~30] generate-variables-json — running: generate variables-json"}
+{"ts":"2026-06-04T16:28:17","level":"INFO","message":"  wrote variables.json: 56 variables"}
+{"ts":"2026-06-04T16:28:17","level":"INFO","message":"toy [all] [2/6 of ~30] generate-variables-json — OK (0.0s): wrote 56 variables to /mnt/datamir/home/jshook/projects/vectordata-rs/docs/tutorials/vecd-end-to-end/vecd-demo/work/toy/variables.json"}
+{"ts":"2026-06-04T16:28:17","level":"INFO ","target":"veks_pipeline::pipeline::runner","message":"Step generate-variables-json completed in 0.0s"}
+{"ts":"2026-06-04T16:28:17","level":"INFO","message":"toy [all] [3/6 of ~30] generate-dataset-log-jsonl — Generate dataset.jsonl from dataset.log"}
+{"ts":"2026-06-04T16:28:17","level":"INFO","message":"toy [all] [3/6 of ~30] generate-dataset-log-jsonl — running: generate dataset-log-jsonl"}
+{"ts":"2026-06-04T16:28:17","level":"INFO","message":"  wrote dataset.jsonl: 279 entries"}
+{"ts":"2026-06-04T16:28:18","level":"INFO","message":"toy [all] [3/6 of ~30] generate-dataset-log-jsonl — OK (0.0s): wrote 279 entries to /mnt/datamir/home/jshook/projects/vectordata-rs/docs/tutorials/vecd-end-to-end/vecd-demo/work/toy/dataset.jsonl"}
+{"ts":"2026-06-04T16:28:18","level":"INFO ","target":"veks_pipeline::pipeline::runner","message":"Step generate-dataset-log-jsonl completed in 0.0s"}
+{"ts":"2026-06-04T16:28:18","level":"INFO","message":"toy [all] [4/6 of ~30] generate-docs — Generate dataset documentation in docs/"}
+{"ts":"2026-06-04T16:28:18","level":"INFO","message":"toy [all] [4/6 of ~30] generate-docs — running: analyze describe-dataset"}
+{"ts":"2026-06-04T16:28:18","level":"INFO","message":"  generating dataset.md for 'toy'..."}
+{"ts":"2026-06-04T16:28:18","level":"INFO","message":"  wrote /mnt/datamir/home/jshook/projects/vectordata-rs/docs/tutorials/vecd-end-to-end/vecd-demo/work/toy/docs/dataset.md"}
+{"ts":"2026-06-04T16:28:18","level":"INFO","message":"  generating exemplars.md..."}
+{"ts":"2026-06-04T16:28:18","level":"INFO","message":"  wrote /mnt/datamir/home/jshook/projects/vectordata-rs/docs/tutorials/vecd-end-to-end/vecd-demo/work/toy/docs/exemplars.md"}
+{"ts":"2026-06-04T16:28:18","level":"INFO","message":"toy [all] [4/6 of ~30] generate-docs — OK (0.0s): generated dataset.md for 'toy'"}
+{"ts":"2026-06-04T16:28:18","level":"INFO ","target":"veks_pipeline::pipeline::runner","message":"Step generate-docs completed in 0.0s"}
+{"ts":"2026-06-04T16:28:18","level":"INFO","message":"toy [all] [5/6 of ~30] generate-catalog — Generate catalog index for the dataset directory"}
+{"ts":"2026-06-04T16:28:18","level":"INFO","message":"toy [all] [5/6 of ~30] generate-catalog — running: catalog generate"}
+{"ts":"2026-06-04T16:28:18","level":"INFO","message":"  scanning /mnt/datamir/home/jshook/projects/vectordata-rs/docs/tutorials/vecd-end-to-end/vecd-demo/work/toy for datasets..."}
+{"ts":"2026-06-04T16:28:18","level":"INFO","message":"toy [all] [5/6 of ~30] generate-catalog — OK (0.0s): no datasets found — no catalogs written"}
+{"ts":"2026-06-04T16:28:18","level":"INFO ","target":"veks_pipeline::pipeline::runner","message":"Step generate-catalog completed in 0.0s"}
+{"ts":"2026-06-04T16:28:18","level":"INFO","message":"toy [all] [6/6 of ~30] generate-merkle — Create merkle hash trees for all publishable data files"}
+{"ts":"2026-06-04T16:28:18","level":"INFO","message":"toy [all] [6/6 of ~30] generate-merkle — running: merkle create"}
+{"ts":"2026-06-04T16:28:18","level":"INFO","message":"Merkle: 31 file(s) to process, min-size=0 B, 128 hash thread(s)"}
+{"ts":"2026-06-04T16:28:18","level":"INFO","message":"  dataset.json.provenance.json (72.1 KiB, 1 chunks)"}
+{"ts":"2026-06-04T16:28:18","level":"INFO","message":"  dataset.jsonl.provenance.json (78.0 KiB, 1 chunks)"}
+{"ts":"2026-06-04T16:28:18","level":"INFO","message":"  docs/dataset.md (10.3 KiB, 1 chunks)"}
+{"ts":"2026-06-04T16:28:18","level":"INFO","message":"  docs/dataset.md.provenance.json (167.7 KiB, 1 chunks)"}
+{"ts":"2026-06-04T16:28:18","level":"INFO","message":"  docs/exemplars.md (507 B, 1 chunks)"}
+{"ts":"2026-06-04T16:28:18","level":"INFO","message":"  profiles/base/base_vectors.fvecs (129.5 KiB, 1 chunks)"}
+{"ts":"2026-06-04T16:28:18","level":"INFO","message":"  profiles/base/base_vectors.fvecs.provenance.json (2.0 KiB, 1 chunks)"}
+{"ts":"2026-06-04T16:28:18","level":"INFO","message":"  profiles/base/metadata_content.ivec (30.5 KiB, 1 chunks)"}
+{"ts":"2026-06-04T16:28:18","level":"INFO","message":"  profiles/base/metadata_content.ivec.provenance.json (3.2 KiB, 1 chunks)"}
+{"ts":"2026-06-04T16:28:18","level":"INFO","message":"  profiles/base/metadata_layout.slab (125 B, 1 chunks)"}
+{"ts":"2026-06-04T16:28:18","level":"INFO","message":"  profiles/base/metadata_layout.slab.provenance.json (967 B, 1 chunks)"}
+{"ts":"2026-06-04T16:28:18","level":"INFO","message":"  profiles/base/predicates.ivec (187.5 KiB, 1 chunks)"}
+{"ts":"2026-06-04T16:28:18","level":"INFO","message":"  profiles/base/predicates.ivec.provenance.json (1.5 KiB, 1 chunks)"}
+{"ts":"2026-06-04T16:28:18","level":"INFO","message":"  profiles/base/query_vectors.fvecs (3.3 KiB, 1 chunks)"}
+{"ts":"2026-06-04T16:28:18","level":"INFO","message":"  profiles/base/query_vectors.fvecs.provenance.json (2.1 KiB, 1 chunks)"}
+{"ts":"2026-06-04T16:28:18","level":"INFO","message":"  profiles/default/IDXFOR__metadata_results.ivvecs.i32 (46.9 KiB, 1 chunks)"}
+{"ts":"2026-06-04T16:28:18","level":"INFO","message":"  profiles/default/metadata_results.ivvecs (3.4 MiB, 4 chunks)"}
+{"ts":"2026-06-04T16:28:18","level":"INFO","message":"  profiles/default/metadata_results.ivvecs.provenance.json (12.1 KiB, 1 chunks)"}
+{"ts":"2026-06-04T16:28:18","level":"INFO","message":"  profiles/default/neighbor_distances.fvecs (2.1 KiB, 1 chunks)"}
+{"ts":"2026-06-04T16:28:18","level":"INFO","message":"  profiles/default/neighbor_distances.fvecs.provenance.json (5.6 KiB, 1 chunks)"}
+{"ts":"2026-06-04T16:28:18","level":"INFO","message":"  profiles/default/neighbor_indices.ivecs (2.1 KiB, 1 chunks)"}
+{"ts":"2026-06-04T16:28:18","level":"INFO","message":"  profiles/default/neighbor_indices.ivecs.provenance.json (5.6 KiB, 1 chunks)"}
+{"ts":"2026-06-04T16:28:18","level":"INFO","message":"  profiles/default/postfiltered_neighbor_distances.fvec (2.1 KiB, 1 chunks)"}
+{"ts":"2026-06-04T16:28:18","level":"INFO","message":"  profiles/default/postfiltered_neighbor_distances.fvec.provenance.json (19.9 KiB, 1 chunks)"}
+{"ts":"2026-06-04T16:28:18","level":"INFO","message":"  profiles/default/postfiltered_neighbor_indices.ivec (2.1 KiB, 1 chunks)"}
+{"ts":"2026-06-04T16:28:18","level":"INFO","message":"  profiles/default/postfiltered_neighbor_indices.ivec.provenance.json (19.9 KiB, 1 chunks)"}
+{"ts":"2026-06-04T16:28:18","level":"INFO","message":"  profiles/default/prefiltered_neighbor_distances.fvec (2.1 KiB, 1 chunks)"}
+{"ts":"2026-06-04T16:28:18","level":"INFO","message":"  profiles/default/prefiltered_neighbor_distances.fvec.provenance.json (20.9 KiB, 1 chunks)"}
+{"ts":"2026-06-04T16:28:18","level":"INFO","message":"  profiles/default/prefiltered_neighbor_indices.ivec (2.1 KiB, 1 chunks)"}
+{"ts":"2026-06-04T16:28:18","level":"INFO","message":"  profiles/default/prefiltered_neighbor_indices.ivec.provenance.json (20.9 KiB, 1 chunks)"}
+{"ts":"2026-06-04T16:28:18","level":"INFO","message":"  variables.json.provenance.json (78.0 KiB, 1 chunks)"}
+{"ts":"2026-06-04T16:28:18","level":"INFO","message":"31 created, 0 up-to-date, 31 total (4.3 MiB, 0.0s, 338 MB/s)"}
+{"ts":"2026-06-04T16:28:18","level":"INFO","message":"toy [all] [6/6 of ~30] generate-merkle — OK (0.0s): 31 created, 0 up-to-date, 31 total (4.3 MiB, 0.0s, 338 MB/s)"}
+{"ts":"2026-06-04T16:28:18","level":"INFO ","target":"veks_pipeline::pipeline::runner","message":"Step generate-merkle completed in 0.0s"}

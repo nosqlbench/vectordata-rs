@@ -1,0 +1,55 @@
+{
+  "step_id": "generate-predicates",
+  "command_path": "generate simple-predicates",
+  "binary_version_major": 1,
+  "binary_version_minor": 2,
+  "binary_version_patch": 1,
+  "binary_git_hash": "0fc7f50258",
+  "binary_dirty": true,
+  "options": {
+    "count": "12000",
+    "fields": "3",
+    "format": "ivec",
+    "output": "profiles/base/predicates.ivec",
+    "range-max": "3",
+    "range-min": "0",
+    "seed": "7"
+  },
+  "upstream": {
+    "generate-metadata": {
+      "step_id": "generate-metadata",
+      "command_path": "generate metadata",
+      "binary_version_major": 1,
+      "binary_version_minor": 2,
+      "binary_version_patch": 1,
+      "binary_git_hash": "0fc7f50258",
+      "binary_dirty": true,
+      "options": {
+        "count": "2000",
+        "fields": "3",
+        "format": "ivec",
+        "layout-output": "profiles/base/metadata_layout.slab",
+        "output": "/mnt/datamir/home/jshook/projects/vectordata-rs/docs/tutorials/vecd-end-to-end/vecd-demo/work/toy/.cache/metadata_all.ivec",
+        "range-max": "3",
+        "range-min": "0",
+        "seed": "7"
+      },
+      "upstream": {
+        "count-vectors": {
+          "step_id": "count-vectors",
+          "command_path": "state set",
+          "binary_version_major": 1,
+          "binary_version_minor": 2,
+          "binary_version_patch": 1,
+          "binary_git_hash": "0fc7f50258",
+          "binary_dirty": true,
+          "options": {
+            "name": "vector_count",
+            "value": "count:../base.fvecs"
+          },
+          "upstream": {}
+        }
+      }
+    }
+  }
+}

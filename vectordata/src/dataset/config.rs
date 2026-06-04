@@ -397,9 +397,11 @@ impl DatasetConfig {
             None
         };
 
-        let header = existing_header.unwrap_or_else(|| {
-            "# Copyright (c) Jonathan Shook\n# SPDX-License-Identifier: Apache-2.0\n\n".to_string()
-        });
+        // Preserve an author's own leading comment block, but never fabricate
+        // one. A dataset.yaml describes data — often a third party's — and must
+        // not be stamped with our source-code copyright/license header. Doing
+        // so also made re-serialized copies disagree with the origin file.
+        let header = existing_header.unwrap_or_default();
 
         let mut out = header;
 
@@ -1012,6 +1014,30 @@ attributes:
         let saved = std::fs::read_to_string(tmp.path()).unwrap();
         assert!(saved.starts_with("# Custom header\n# Another line\n"),
             "header should be preserved:\n{}", saved);
+    }
+
+    #[test]
+    fn test_save_does_not_fabricate_a_copyright_header() {
+        // A dataset.yaml with no leading comment must round-trip WITHOUT
+        // gaining our source-code copyright/license header — that metadata
+        // describes data (often third-party), and stamping it also made
+        // re-serialized copies disagree with the origin file.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), "name: test\n").unwrap();
+
+        let config: DatasetConfig = serde_yaml::from_str("name: test\n").unwrap();
+        config.save(tmp.path()).unwrap();
+
+        let saved = std::fs::read_to_string(tmp.path()).unwrap();
+        assert!(saved.starts_with("name:"), "must start with content, not a header:\n{saved}");
+        assert!(!saved.contains("Copyright"), "must not fabricate a copyright header:\n{saved}");
+        assert!(!saved.contains("SPDX"), "must not fabricate a license header:\n{saved}");
+
+        // Rendering an in-memory config with no backing file (the explore
+        // "Source" / display path) must likewise be header-free.
+        let rendered = config.to_expanded_yaml_string(std::path::Path::new("/nonexistent/dataset.yaml")).unwrap();
+        assert!(!rendered.contains("Copyright") && !rendered.contains("SPDX"),
+            "string render must not fabricate a header:\n{rendered}");
     }
 
     #[test]

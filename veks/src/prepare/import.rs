@@ -2548,9 +2548,9 @@ fn generate_yaml(
 ) -> String {
     let mut out = String::new();
 
-    out.push_str("# Copyright (c) Jonathan Shook\n");
-    out.push_str("# SPDX-License-Identifier: Apache-2.0\n\n");
-
+    // A generated dataset.yaml is data metadata, not source code — no
+    // copyright/license header. (The dataset's own license, if any, belongs
+    // in `attributes.license`.)
     out.push_str(&format!("name: {}\n", args.name));
     if let Some(ref desc) = args.description {
         out.push_str(&format!("description: >-\n  {}\n", desc));

@@ -1,0 +1,85 @@
+{
+  "step_id": "extract-metadata",
+  "command_path": "transform extract",
+  "binary_version_major": 1,
+  "binary_version_minor": 2,
+  "binary_version_patch": 1,
+  "binary_git_hash": "0fc7f50258",
+  "binary_dirty": true,
+  "options": {
+    "ivec-file": "/mnt/datamir/home/jshook/projects/vectordata-rs/docs/tutorials/vecd-end-to-end/vecd-demo/work/toy/.cache/shuffle.ivecs",
+    "output": "profiles/base/metadata_content.ivec",
+    "range": "[50,2000)",
+    "source": "/mnt/datamir/home/jshook/projects/vectordata-rs/docs/tutorials/vecd-end-to-end/vecd-demo/work/toy/.cache/metadata_all.ivec"
+  },
+  "upstream": {
+    "generate-metadata": {
+      "step_id": "generate-metadata",
+      "command_path": "generate metadata",
+      "binary_version_major": 1,
+      "binary_version_minor": 2,
+      "binary_version_patch": 1,
+      "binary_git_hash": "0fc7f50258",
+      "binary_dirty": true,
+      "options": {
+        "count": "2000",
+        "fields": "3",
+        "format": "ivec",
+        "layout-output": "profiles/base/metadata_layout.slab",
+        "output": "/mnt/datamir/home/jshook/projects/vectordata-rs/docs/tutorials/vecd-end-to-end/vecd-demo/work/toy/.cache/metadata_all.ivec",
+        "range-max": "3",
+        "range-min": "0",
+        "seed": "7"
+      },
+      "upstream": {
+        "count-vectors": {
+          "step_id": "count-vectors",
+          "command_path": "state set",
+          "binary_version_major": 1,
+          "binary_version_minor": 2,
+          "binary_version_patch": 1,
+          "binary_git_hash": "0fc7f50258",
+          "binary_dirty": true,
+          "options": {
+            "name": "vector_count",
+            "value": "count:../base.fvecs"
+          },
+          "upstream": {}
+        }
+      }
+    },
+    "generate-shuffle": {
+      "step_id": "generate-shuffle",
+      "command_path": "generate shuffle",
+      "binary_version_major": 1,
+      "binary_version_minor": 2,
+      "binary_version_patch": 1,
+      "binary_git_hash": "0fc7f50258",
+      "binary_dirty": true,
+      "options": {
+        "interval": "2000",
+        "ordinals": "/mnt/datamir/home/jshook/projects/vectordata-rs/docs/tutorials/vecd-end-to-end/vecd-demo/work/toy/.cache/sorted_ordinals.ivecs",
+        "output": "/mnt/datamir/home/jshook/projects/vectordata-rs/docs/tutorials/vecd-end-to-end/vecd-demo/work/toy/.cache/shuffle.ivecs",
+        "seed": "7"
+      },
+      "upstream": {
+        "prepare-vectors": {
+          "step_id": "prepare-vectors",
+          "command_path": "compute sort",
+          "binary_version_major": 1,
+          "binary_version_minor": 2,
+          "binary_version_patch": 1,
+          "binary_git_hash": "0fc7f50258",
+          "binary_dirty": true,
+          "options": {
+            "duplicates": "/mnt/datamir/home/jshook/projects/vectordata-rs/docs/tutorials/vecd-end-to-end/vecd-demo/work/toy/.cache/dedup_duplicates.ivecs",
+            "output": "/mnt/datamir/home/jshook/projects/vectordata-rs/docs/tutorials/vecd-end-to-end/vecd-demo/work/toy/.cache/sorted_ordinals.ivecs",
+            "report": "/mnt/datamir/home/jshook/projects/vectordata-rs/docs/tutorials/vecd-end-to-end/vecd-demo/work/toy/.cache/dedup_report.json",
+            "source": "../base.fvecs"
+          },
+          "upstream": {}
+        }
+      }
+    }
+  }
+}

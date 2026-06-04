@@ -1,0 +1,279 @@
+{"message":"veks prepare bootstrap 2026-06-04 16:28:08","type":"session"}
+{"name":"Inputs","type":"section"}
+{"text":"name:           toy","type":"line"}
+{"text":"output:         /mnt/datamir/home/jshook/projects/vectordata-rs/docs/tutorials/vecd-end-to-end/vecd-demo/work/toy","type":"line"}
+{"text":"base_vectors:   /mnt/datamir/home/jshook/projects/vectordata-rs/docs/tutorials/vecd-end-to-end/vecd-demo/work/base.fvecs","type":"line"}
+{"text":"query_vectors:  self-search (count=50)","type":"line"}
+{"text":"metadata:       (none)","type":"line"}
+{"text":"ground_truth:   (compute)","type":"line"}
+{"text":"metric:         L2","type":"line"}
+{"text":"neighbors:      10","type":"line"}
+{"text":"seed:           7","type":"line"}
+{"text":"normalize:      false","type":"line"}
+{"text":"dedup:          true","type":"line"}
+{"text":"zero_check:     true","type":"line"}
+{"text":"filtered_knn:   true","type":"line"}
+{"text":"compress_cache: false","type":"line"}
+{"text":"Starting scenario:","type":"line"}
+{"text":"vectors + compute GT (no metadata)","type":"line"}
+{"text":"Dataflow graph entry points (30 steps):","type":"line"}
+{"text":"all_vectors: Identity -> ../base.fvecs","type":"line"}
+{"text":"prepare: Materialized (prepare-vectors) -> ${cache}/sorted_ordinals.ivecs","type":"line"}
+{"text":"vector_count: Materialized (count-vectors)","type":"line"}
+{"text":"mode: self-search (query_count=50)","type":"line"}
+{"text":"shuffle: Materialized (generate-shuffle) -> ${cache}/shuffle.ivecs","type":"line"}
+{"text":"query_vectors: Materialized (extract-queries) -> profiles/base/query_vectors.fvecs","type":"line"}
+{"text":"base_vectors: Materialized (extract-base) -> profiles/base/base_vectors.fvecs","type":"line"}
+{"text":"base_count: Materialized (count-base)","type":"line"}
+{"text":"metadata_all: Materialized (generate-metadata) -> ${cache}/metadata_all.ivec","type":"line"}
+{"text":"metadata_content: Materialized (extract-metadata) -> profiles/base/metadata_content.ivec","type":"line"}
+{"text":"survey: Identity (skipped)","type":"line"}
+{"text":"predicates: Materialized (generate-predicates) -> profiles/base/predicates.ivec","type":"line"}
+{"text":"predicate_indices: Materialized (evaluate-predicates) -> metadata_results.ivvecs","type":"line"}
+{"text":"knn: Materialized (compute-knn) -> neighbor_indices.ivecs","type":"line"}
+{"text":"filtered_knn: Materialized (compute-prefiltered-knn) -> prefiltered_neighbor_indices.ivec","type":"line"}
+{"message":"veks run 2026-06-04 16:28:08","type":"session"}
+{"text":"pipeline: 24 steps, profile: all","type":"line"}
+{"text":"16:28:08 [start] count-vectors — state set","type":"line"}
+{"text":"16:28:08 [ok] count-vectors (0.0s): set vector_count = 2000","type":"line"}
+{"text":"16:28:08 | toy [all] [1/24 of ~30] count-vectors — running: state set","type":"line"}
+{"text":"16:28:08 |   vector_count = 2000","type":"line"}
+{"text":"16:28:08 | toy [all] [1/24 of ~30] count-vectors — OK (0.0s): set vector_count = 2000","type":"line"}
+{"text":"16:28:08 [start] count-source-base — state set","type":"line"}
+{"text":"16:28:08 [ok] count-source-base (0.0s): set source_base_count = 2000","type":"line"}
+{"text":"16:28:08 | toy [all] [2/24 of ~30] count-source-base — running: state set","type":"line"}
+{"text":"16:28:08 |   source_base_count = 2000","type":"line"}
+{"text":"16:28:08 | toy [all] [2/24 of ~30] count-source-base — OK (0.0s): set source_base_count = 2000","type":"line"}
+{"text":"16:28:08 [start] count-source-queries — state set","type":"line"}
+{"text":"16:28:08 [ok] count-source-queries (0.0s): set source_query_count = 0","type":"line"}
+{"text":"16:28:08 | toy [all] [3/24 of ~30] count-source-queries — running: state set","type":"line"}
+{"text":"16:28:08 |   source_query_count = 0","type":"line"}
+{"text":"16:28:08 | toy [all] [3/24 of ~30] count-source-queries — OK (0.0s): set source_query_count = 0","type":"line"}
+{"text":"16:28:08 [start] set-is_shuffled — state set","type":"line"}
+{"text":"16:28:08 [ok] set-is_shuffled (0.0s): set is_shuffled = true","type":"line"}
+{"text":"16:28:08 | toy [all] [4/24 of ~30] set-is_shuffled — running: state set","type":"line"}
+{"text":"16:28:08 |   is_shuffled = true","type":"line"}
+{"text":"16:28:08 | toy [all] [4/24 of ~30] set-is_shuffled — OK (0.0s): set is_shuffled = true","type":"line"}
+{"text":"16:28:08 [start] set-is_self_search — state set","type":"line"}
+{"text":"16:28:08 [ok] set-is_self_search (0.0s): set is_self_search = true","type":"line"}
+{"text":"16:28:08 | toy [all] [5/24 of ~30] set-is_self_search — running: state set","type":"line"}
+{"text":"16:28:08 |   is_self_search = true","type":"line"}
+{"text":"16:28:08 | toy [all] [5/24 of ~30] set-is_self_search — OK (0.0s): set is_self_search = true","type":"line"}
+{"text":"16:28:08 [start] set-combined_bq — state set","type":"line"}
+{"text":"16:28:08 [ok] set-combined_bq (0.0s): set combined_bq = false","type":"line"}
+{"text":"16:28:08 | toy [all] [6/24 of ~30] set-combined_bq — running: state set","type":"line"}
+{"text":"16:28:08 |   combined_bq = false","type":"line"}
+{"text":"16:28:08 | toy [all] [6/24 of ~30] set-combined_bq — OK (0.0s): set combined_bq = false","type":"line"}
+{"text":"16:28:08 [start] set-k — state set","type":"line"}
+{"text":"16:28:08 [ok] set-k (0.0s): set k = 10","type":"line"}
+{"text":"16:28:08 | toy [all] [7/24 of ~30] set-k — running: state set","type":"line"}
+{"text":"16:28:08 |   k = 10","type":"line"}
+{"text":"16:28:08 | toy [all] [7/24 of ~30] set-k — OK (0.0s): set k = 10","type":"line"}
+{"text":"16:28:08 [start] prepare-vectors — compute sort","type":"line"}
+{"text":"16:28:09 [ok] prepare-vectors (0.0s): 2K vectors -> 2K unique, 0 dup (0.00%) elided, 0.0s (89299 vec/s, 5.8 MB/s), prefix_width=10","type":"line"}
+{"text":"16:28:09 | toy [all] [8/24 of ~30] prepare-vectors — running: compute sort","type":"line"}
+{"text":"16:28:09 |   governor-derived batch size: 2000 (available: 268264 MiB, RSS: 21 MiB, ceiling: 670714 MiB, per-entry: 504 B incl. overhead)","type":"line"}
+{"text":"16:28:09 | Dedup: 2K vectors (f32, dim=16), elide=true, batch_size=2K","type":"line"}
+{"text":"16:28:09 |   source: base.fvecs (132.8 KiB)","type":"line"}
+{"text":"16:28:09 | Phase 1: creating sorted runs","type":"line"}
+{"text":"16:28:09 |   128 threads for parallel read + sort","type":"line"}
+{"text":"16:28:09 |   run 1/1: reading 2K vectors [0-2000)","type":"line"}
+{"text":"16:28:09 |   run 1/1: read done (0.0s, 293885 vec/s)","type":"line"}
+{"text":"16:28:09 |   run 1/1: sort done (0.0s, 20041285 vec/s, 128 threads)","type":"line"}
+{"text":"16:28:09 |   run 1/1 done: read 0.0s + sort 0.0s + save 0.0s = 0.0s","type":"line"}
+{"text":"16:28:09 |   1 sorted run(s) in 0.0s (164989 vec/s, 10.7 MB/s read)","type":"line"}
+{"text":"16:28:09 | Phase 2: parallel merge + dedup","type":"line"}
+{"text":"16:28:09 |   loading 1 run files (128 threads)...","type":"line"}
+{"text":"16:28:09 |   loaded in 0.0s","type":"line"}
+{"text":"16:28:09 |   2000 records collected (0.0s, 0 MB)","type":"line"}
+{"text":"16:28:09 |   sorted in 0.0s (99339393 rec/s)","type":"line"}
+{"text":"16:28:09 |   dedup+write: 128 threads, 2000 records","type":"line"}
+{"text":"16:28:09 |   dedup: 0.0s (33743884 vec/s), 2000 unique, 0 dups (0 boundary)","type":"line"}
+{"text":"16:28:09 |   prefix groups: 2000 singleton, 0 multi-element (0.0% collision rate)","type":"line"}
+{"text":"16:28:09 |   prefix collisions: 0 vectors in multi-groups, largest group: 0, full-vector reads: 0","type":"line"}
+{"text":"16:28:09 |   writing 0.0 MB output + 0.0 MB dups...","type":"line"}
+{"text":"16:28:09 |   files written in 0.0s","type":"line"}
+{"text":"16:28:09 |   merge: 0.0s (285652 vec/s), 2K full-vector comparisons avoided by prefix","type":"line"}
+{"text":"16:28:09 | 2K vectors -> 2K unique, 0 dup (0.00%) elided, 0.0s (89299 vec/s, 5.8 MB/s), prefix_width=10","type":"line"}
+{"text":"16:28:09 | toy [all] [8/24 of ~30] prepare-vectors — OK (0.0s): 2K vectors -> 2K unique, 0 dup (0.00%) elided, 0.0s (89299 vec/s, 5.8 MB/s), prefix_width=10","type":"line"}
+{"text":"16:28:09 [start] count-duplicates — state set","type":"line"}
+{"text":"16:28:09 [ok] count-duplicates (0.0s): set duplicate_count = 0","type":"line"}
+{"text":"16:28:09 | toy [all] [9/24 of ~30] count-duplicates — running: state set","type":"line"}
+{"text":"16:28:09 |   duplicate_count = 0","type":"line"}
+{"text":"16:28:09 | toy [all] [9/24 of ~30] count-duplicates — OK (0.0s): set duplicate_count = 0","type":"line"}
+{"text":"16:28:09 [start] generate-shuffle — generate shuffle","type":"line"}
+{"text":"16:28:09 [ok] generate-shuffle (0.0s): generated shuffle permutation of 2000 elements to /mnt/datamir/home/jshook/projects/vectordata-rs/docs/tutorials/vecd-end-to-end/vecd-demo/work/toy/.cache/shuffle.ivecs","type":"line"}
+{"text":"16:28:09 | toy [all] [10/24 of ~30] generate-shuffle — running: generate shuffle","type":"line"}
+{"text":"16:28:09 |   loading ordinals from /mnt/datamir/home/jshook/projects/vectordata-rs/docs/tutorials/vecd-end-to-end/vecd-demo/work/toy/.cache/sorted_ordinals.ivecs","type":"line"}
+{"text":"16:28:09 | toy [all] [10/24 of ~30] generate-shuffle — OK (0.0s): generated shuffle permutation of 2000 elements to /mnt/datamir/home/jshook/projects/vectordata-rs/docs/tutorials/vecd-end-to-end/vecd-demo/work/toy/.cache/shuffle.ivecs","type":"line"}
+{"text":"16:28:09 [start] extract-queries — transform extract","type":"line"}
+{"text":"16:28:09 [ok] extract-queries (0.0s): extracted 50 fvec vectors (50 input, 0 near-zero filtered, range [0..50), 2 passes, 128 threads) to /mnt/datamir/home/jshook/projects/vectordata-rs/docs/tutorials/vecd-end-to-end/vecd-demo/work/toy/profiles/base/query_vectors.fvecs","type":"line"}
+{"text":"16:28:09 | toy [all] [11/24 of ~30] extract-queries — running: transform extract","type":"line"}
+{"text":"16:28:09 |   L2 normalization enabled during extraction","type":"line"}
+{"text":"16:28:09 |   source not normalized (mean_ε=1.30e0 >= 1e-5) — normalizing during extraction","type":"line"}
+{"text":"16:28:09 | fvec-extract: using 128 threads","type":"line"}
+{"text":"16:28:09 | fvec-extract: 50 vectors, 68 bytes/record, 2 passes (budget: 100.8 GiB, 0 MB/partition)","type":"line"}
+{"text":"16:28:09 | fvec-extract: pass 1/2 starting (25 vectors, output range [0..25))","type":"line"}
+{"text":"16:28:09 | fvec-extract: pass 1/2 done (0.0s, 25 records, 0.0 MB)","type":"line"}
+{"text":"16:28:09 | fvec-extract: pass 2/2 starting (25 vectors, output range [25..50))","type":"line"}
+{"text":"16:28:09 | fvec-extract: pass 2/2 done (0.0s, 25 records, 0.0 MB)","type":"line"}
+{"text":"16:28:09 |   source norms: mean_ε=1.33e0, stddev=2.46e-1, median=1.38e0, max_ε=1.92e0, was_normalized=false","type":"line"}
+{"text":"16:28:09 |   output norms: mean_ε=2.05e-8, stddev=1.45e-8, median=1.94e-8, max_ε=5.85e-8","type":"line"}
+{"text":"16:28:09 | toy [all] [11/24 of ~30] extract-queries — OK (0.0s): extracted 50 fvec vectors (50 input, 0 near-zero filtered, range [0..50), 2 passes, 128 threads) to /mnt/datamir/home/jshook/projects/vectordata-rs/docs/tutorials/vecd-end-to-end/vecd-demo/work/toy/profiles/base/query_vectors.fvecs","type":"line"}
+{"text":"16:28:09 [start] extract-base — transform extract","type":"line"}
+{"text":"16:28:09 [ok] extract-base (0.0s): extracted 1950 fvec vectors (1950 input, 0 near-zero filtered, range [50..2000), 2 passes, 128 threads) to /mnt/datamir/home/jshook/projects/vectordata-rs/docs/tutorials/vecd-end-to-end/vecd-demo/work/toy/profiles/base/base_vectors.fvecs","type":"line"}
+{"text":"16:28:09 | toy [all] [12/24 of ~30] extract-base — running: transform extract","type":"line"}
+{"text":"16:28:09 |   L2 normalization enabled during extraction","type":"line"}
+{"text":"16:28:09 |   source not normalized (mean_ε=1.30e0 >= 1e-5) — normalizing during extraction","type":"line"}
+{"text":"16:28:09 | fvec-extract: using 128 threads","type":"line"}
+{"text":"16:28:09 | fvec-extract: 1950 vectors, 68 bytes/record, 2 passes (budget: 100.8 GiB, 0 MB/partition)","type":"line"}
+{"text":"16:28:09 | fvec-extract: pass 1/2 starting (975 vectors, output range [0..975))","type":"line"}
+{"text":"16:28:09 | fvec-extract: pass 1/2 done (0.0s, 975 records, 0.1 MB)","type":"line"}
+{"text":"16:28:09 | fvec-extract: pass 2/2 starting (975 vectors, output range [975..1950))","type":"line"}
+{"text":"16:28:09 | fvec-extract: pass 2/2 done (0.0s, 975 records, 0.1 MB)","type":"line"}
+{"text":"16:28:09 |   source norms: mean_ε=1.30e0, stddev=2.61e-1, median=1.30e0, max_ε=2.13e0, was_normalized=false","type":"line"}
+{"text":"16:28:09 |   output norms: mean_ε=2.00e-8, stddev=1.31e-8, median=1.87e-8, max_ε=6.86e-8","type":"line"}
+{"text":"16:28:09 | toy [all] [12/24 of ~30] extract-base — OK (0.0s): extracted 1950 fvec vectors (1950 input, 0 near-zero filtered, range [50..2000), 2 passes, 128 threads) to /mnt/datamir/home/jshook/projects/vectordata-rs/docs/tutorials/vecd-end-to-end/vecd-demo/work/toy/profiles/base/base_vectors.fvecs","type":"line"}
+{"text":"16:28:09 [start] count-base — state set","type":"line"}
+{"text":"16:28:09 [ok] count-base (0.0s): set base_count = 1950","type":"line"}
+{"text":"16:28:09 | toy [all] [13/24 of ~30] count-base — running: state set","type":"line"}
+{"text":"16:28:09 |   base_count = 1950","type":"line"}
+{"text":"16:28:09 | toy [all] [13/24 of ~30] count-base — OK (0.0s): set base_count = 1950","type":"line"}
+{"text":"16:28:09 [start] generate-metadata — generate metadata","type":"line"}
+{"text":"16:28:09 [ok] generate-metadata (0.0s): 2000 records, 3 fields, range [0..3), seed=7","type":"line"}
+{"text":"16:28:09 | toy [all] [14/24 of ~30] generate-metadata — running: generate metadata","type":"line"}
+{"text":"16:28:09 |   generate metadata: 2000 records, 3 fields, range [0..3), seed=7, format=ivec","type":"line"}
+{"text":"16:28:09 |   wrote metadata layout schema to /mnt/datamir/home/jshook/projects/vectordata-rs/docs/tutorials/vecd-end-to-end/vecd-demo/work/toy/profiles/base/metadata_layout.slab","type":"line"}
+{"text":"16:28:09 |   wrote 2000 metadata records (3 fields each) to /mnt/datamir/home/jshook/projects/vectordata-rs/docs/tutorials/vecd-end-to-end/vecd-demo/work/toy/.cache/metadata_all.ivec","type":"line"}
+{"text":"16:28:09 | toy [all] [14/24 of ~30] generate-metadata — OK (0.0s): 2000 records, 3 fields, range [0..3), seed=7","type":"line"}
+{"text":"16:28:09 [start] extract-metadata — transform extract","type":"line"}
+{"text":"16:28:09 [ok] extract-metadata (0.0s): extracted 1950 ivec records by index (range [50..2000)) to /mnt/datamir/home/jshook/projects/vectordata-rs/docs/tutorials/vecd-end-to-end/vecd-demo/work/toy/profiles/base/metadata_content.ivec","type":"line"}
+{"text":"16:28:09 | toy [all] [15/24 of ~30] extract-metadata — running: transform extract","type":"line"}
+{"text":"16:28:09 | toy [all] [15/24 of ~30] extract-metadata — OK (0.0s): extracted 1950 ivec records by index (range [50..2000)) to /mnt/datamir/home/jshook/projects/vectordata-rs/docs/tutorials/vecd-end-to-end/vecd-demo/work/toy/profiles/base/metadata_content.ivec","type":"line"}
+{"text":"16:28:09 [start] generate-predicates — generate simple-predicates","type":"line"}
+{"text":"16:28:09 [ok] generate-predicates (0.0s): 12000 simple-int-eq predicates, 3 fields, range [0, 3)","type":"line"}
+{"text":"16:28:09 | toy [all] [16/24 of ~30] generate-predicates — running: generate simple-predicates","type":"line"}
+{"text":"16:28:09 |   generate simple-predicates: 12000 preds, 3 fields, range [0, 3), seed=7","type":"line"}
+{"text":"16:28:09 |   wrote 12000 predicates to /mnt/datamir/home/jshook/projects/vectordata-rs/docs/tutorials/vecd-end-to-end/vecd-demo/work/toy/profiles/base/predicates.ivec","type":"line"}
+{"text":"16:28:09 | toy [all] [16/24 of ~30] generate-predicates — OK (0.0s): 12000 simple-int-eq predicates, 3 fields, range [0, 3)","type":"line"}
+{"text":"16:28:09 [start] compute-knn — compute knn","type":"line"}
+{"text":"16:28:10 [ok] compute-knn (0.1s): computed KNN: 50 queries, k=10, metric=L2, 1950 base vectors (1 partitions)","type":"line"}
+{"text":"16:28:10 | toy [all] [17/24 of ~30] compute-knn — running: compute knn","type":"line"}
+{"text":"16:28:10 |   opening base vectors: /mnt/datamir/home/jshook/projects/vectordata-rs/docs/tutorials/vecd-end-to-end/vecd-demo/work/toy/profiles/base/base_vectors.fvecs","type":"line"}
+{"text":"16:28:10 |   opening query vectors: /mnt/datamir/home/jshook/projects/vectordata-rs/docs/tutorials/vecd-end-to-end/vecd-demo/work/toy/profiles/base/query_vectors.fvecs","type":"line"}
+{"text":"16:28:10 | KNN: 50 queries x 1950 base vectors (f32, dim=16), k=10, metric=L2, threads=128, simd=SimSIMD (L1: AVX-512), batch=transposed AVX-512 (16-wide)","type":"line"}
+{"text":"16:28:10 |   base: base_vectors.fvecs (121.9 KiB)  query: query_vectors.fvecs (3.1 KiB)","type":"line"}
+{"text":"16:28:10 |   auto partition size: 2.6B vectors (163.7 GiB budget = 25% of mem ceiling 655.0 GiB)","type":"line"}
+{"text":"16:28:10 |   planning ~1 partitions (partition_size=2.6B)...","type":"line"}
+{"text":"16:28:10 |   partition [0, 1950): compute","type":"line"}
+{"text":"16:28:10 |   1 partitions (segment_size=2.6B, 0 cached, 1 to compute)","type":"line"}
+{"text":"16:28:10 |   1 uncached partition to compute","type":"line"}
+{"text":"16:28:10 |   partition 1/1 [0,1950) — 50 queries x 1950 base (129.5 KiB) metric=L2  [1/1]","type":"line"}
+{"text":"16:28:10 |     done in 0.1s (952.8K/s distance evaluations)","type":"line"}
+{"text":"16:28:10 |   merging 1 partitions (50 queries)...","type":"line"}
+{"text":"16:28:10 |   canonical rerank: 50 queries × 10 candidates, metric=L2","type":"line"}
+{"text":"16:28:10 | toy [all] [17/24 of ~30] compute-knn — OK (0.1s): computed KNN: 50 queries, k=10, metric=L2, 1950 base vectors (1 partitions)","type":"line"}
+{"text":"16:28:10 [start] verify-knn — verify knn-consolidated","type":"line"}
+{"text":"16:28:10 [ok] verify-knn (0.0s): verified 1 profiles (50 sample queries, 128 threads): 0 failures","type":"line"}
+{"text":"16:28:10 | toy [all] [18/24 of ~30] verify-knn — running: verify knn-consolidated","type":"line"}
+{"text":"16:28:10 | verify knn-consolidated: dataset=/mnt/datamir/home/jshook/projects/vectordata-rs/docs/tutorials/vecd-end-to-end/vecd-demo/work/toy/dataset.yaml anchor=default scope=1/1 profile","type":"line"}
+{"text":"16:28:10 |     default (in scope)","type":"line"}
+{"text":"16:28:10 | verify knn-consolidated: KNN ground truth across 1 profile via cblas_sgemm (single-threaded, MKL-safe); sample=50 of 50 queries (100.0%), metric=L2, threads=128","type":"line"}
+{"text":"16:28:10 |   loaded GT for 1 profiles, 50 sample queries, k=10","type":"line"}
+{"text":"16:28:10 |   chunk plan: 986895 base/chunk × 50 queries/sub-batch","type":"line"}
+{"text":"16:28:10 |   scanning 1950 base vectors (50 sample queries, metric=L2, engine=BLAS sgemm)","type":"line"}
+{"text":"16:28:10 |   scan [0..1950): 0.0s (0.1M base/s)","type":"line"}
+{"text":"16:28:10 |   profile 'default' (base_count=1950): 50/50 pass, 0 fail, recall@10=1.0000","type":"line"}
+{"text":"16:28:10 |   verify phase: 0.0s","type":"line"}
+{"text":"16:28:10 | toy [all] [18/24 of ~30] verify-knn — OK (0.0s): verified 1 profiles (50 sample queries, 128 threads): 0 failures","type":"line"}
+{"text":"16:28:10 [start] evaluate-predicates — compute evaluate-predicates","type":"line"}
+{"text":"16:28:10 [ok] evaluate-predicates (0.0s): 12000 predicates, avg 72.5 matches","type":"line"}
+{"text":"16:28:10 | toy [all] [19/24 of ~30] evaluate-predicates — running: compute evaluate-predicates","type":"line"}
+{"text":"16:28:10 |   evaluate: 1950 metadata records, 3 fields (format=ivec)","type":"line"}
+{"text":"16:28:10 |   evaluate: 12000 predicates (format=ivec)","type":"line"}
+{"text":"16:28:10 |   built index: 27 distinct value tuples","type":"line"}
+{"text":"16:28:10 |   built offset index (12000 records)","type":"line"}
+{"text":"16:28:10 |   12000 predicates evaluated, avg 72.5 matches/predicate","type":"line"}
+{"text":"16:28:10 | toy [all] [19/24 of ~30] evaluate-predicates — OK (0.0s): 12000 predicates, avg 72.5 matches","type":"line"}
+{"text":"16:28:10 [start] verify-predicates-sqlite — verify predicates-sqlite","type":"line"}
+{"text":"16:28:16 [ok] verify-predicates-sqlite (5.9s): 12000 pass, 0 fail (12000 checked)","type":"line"}
+{"text":"16:28:16 | toy [all] [20/24 of ~30] verify-predicates-sqlite — running: verify predicates-sqlite","type":"line"}
+{"text":"16:28:16 | verify predicates-sqlite: dataset=/mnt/datamir/home/jshook/projects/vectordata-rs/docs/tutorials/vecd-end-to-end/vecd-demo/work/toy/dataset.yaml anchor=default scope=1/1 profile","type":"line"}
+{"text":"16:28:16 |     default (in scope)","type":"line"}
+{"text":"16:28:16 |   verify predicates-sqlite: metadata=/mnt/datamir/home/jshook/projects/vectordata-rs/docs/tutorials/vecd-end-to-end/vecd-demo/work/toy/profiles/base/metadata_content.ivec predicates=/mnt/datamir/home/jshook/projects/vectordata-rs/docs/tutorials/vecd-end-to-end/vecd-demo/work/toy/profiles/base/predicates.ivec results=/mnt/datamir/home/jshook/projects/vectordata-rs/docs/tutorials/vecd-end-to-end/vecd-demo/work/toy/profiles/default/metadata_results.ivvecs","type":"line"}
+{"text":"16:28:16 |   loaded 1950 metadata records into SQLite (3 fields)","type":"line"}
+{"text":"16:28:16 |   loaded 12000 predicates","type":"line"}
+{"text":"16:28:16 |   loaded 12000 result records","type":"line"}
+{"text":"16:28:16 | verify predicates-sqlite: predicate evaluation results vs SQLite oracle (in-memory, 3 fields, 1950 metadata records); sample=12000 of 12000 predicates × 128 threads","type":"line"}
+{"text":"16:28:16 |   exemplar [846]:","type":"line"}
+{"text":"16:28:16 |     SQL: SELECT ordinal FROM metadata WHERE field_0 = 1 AND field_1 = 1 AND field_2 = 0 ORDER BY ordinal","type":"line"}
+{"text":"16:28:16 |     SQL result: 69 ordinals","type":"line"}
+{"text":"16:28:16 |     stored R:   69 ordinals","type":"line"}
+{"text":"16:28:16 |     SQL ordinals (first 5):    [0, 42, 72, 106, 135, ...]","type":"line"}
+{"text":"16:28:16 |     stored ordinals (first 5): [0, 42, 72, 106, 135, ...]","type":"line"}
+{"text":"16:28:16 |     exact match ✓","type":"line"}
+{"text":"16:28:16 |   exemplar [847]:","type":"line"}
+{"text":"16:28:16 |     SQL: SELECT ordinal FROM metadata WHERE field_0 = 1 AND field_1 = 2 AND field_2 = 0 ORDER BY ordinal","type":"line"}
+{"text":"16:28:16 |     SQL result: 77 ordinals","type":"line"}
+{"text":"16:28:16 |     stored R:   77 ordinals","type":"line"}
+{"text":"16:28:16 |     SQL ordinals (first 5):    [63, 91, 110, 123, 136, ...]","type":"line"}
+{"text":"16:28:16 |     stored ordinals (first 5): [63, 91, 110, 123, 136, ...]","type":"line"}
+{"text":"16:28:16 |     exact match ✓","type":"line"}
+{"text":"16:28:16 |   exemplar [848]:","type":"line"}
+{"text":"16:28:16 |     SQL: SELECT ordinal FROM metadata WHERE field_0 = 0 AND field_1 = 1 AND field_2 = 0 ORDER BY ordinal","type":"line"}
+{"text":"16:28:16 |     SQL result: 77 ordinals","type":"line"}
+{"text":"16:28:16 |     stored R:   77 ordinals","type":"line"}
+{"text":"16:28:16 |     SQL ordinals (first 5):    [2, 28, 77, 99, 103, ...]","type":"line"}
+{"text":"16:28:16 |     stored ordinals (first 5): [2, 28, 77, 99, 103, ...]","type":"line"}
+{"text":"16:28:16 |     exact match ✓","type":"line"}
+{"text":"16:28:16 |   12000 pass, 0 fail (12000 checked of 12000, 128 threads)","type":"line"}
+{"text":"16:28:16 | toy [all] [20/24 of ~30] verify-predicates-sqlite — OK (5.9s): 12000 pass, 0 fail (12000 checked)","type":"line"}
+{"text":"16:28:16 [start] compute-prefiltered-knn — compute prefiltered-knn","type":"line"}
+{"text":"16:28:16 [ok] compute-prefiltered-knn (0.0s): filtered KNN: 50 queries, k=10, metric=L2, 1950 base vectors","type":"line"}
+{"text":"16:28:16 | toy [all] [21/24 of ~30] compute-prefiltered-knn — running: compute prefiltered-knn","type":"line"}
+{"text":"16:28:16 |   opening base vectors: /mnt/datamir/home/jshook/projects/vectordata-rs/docs/tutorials/vecd-end-to-end/vecd-demo/work/toy/profiles/base/base_vectors.fvecs","type":"line"}
+{"text":"16:28:16 |   opening query vectors: /mnt/datamir/home/jshook/projects/vectordata-rs/docs/tutorials/vecd-end-to-end/vecd-demo/work/toy/profiles/base/query_vectors.fvecs","type":"line"}
+{"text":"16:28:16 | filtered KNN: 50 queries x 1,950 base vectors (f32), k=10, metric=L2, threads=128","type":"line"}
+{"text":"16:28:16 |   base: base_vectors.fvecs (129.5 KiB)  keys: 12,000 records","type":"line"}
+{"text":"16:28:16 |   writing results...","type":"line"}
+{"text":"16:28:16 | toy [all] [21/24 of ~30] compute-prefiltered-knn — OK (0.0s): filtered KNN: 50 queries, k=10, metric=L2, 1950 base vectors","type":"line"}
+{"text":"16:28:16 [start] verify-prefiltered-knn — verify prefiltered-knn-consolidated","type":"line"}
+{"text":"16:28:17 [ok] verify-prefiltered-knn (0.0s): verified filtered KNN for 0 profiles","type":"line"}
+{"text":"16:28:17 | toy [all] [22/24 of ~30] verify-prefiltered-knn — running: verify prefiltered-knn-consolidated","type":"line"}
+{"text":"16:28:17 | verify filtered-knn-consolidated: dataset=/mnt/datamir/home/jshook/projects/vectordata-rs/docs/tutorials/vecd-end-to-end/vecd-demo/work/toy/dataset.yaml anchor=default scope=1/1 profile","type":"line"}
+{"text":"16:28:17 |     default (in scope)","type":"line"}
+{"text":"16:28:17 | verify filtered-knn-consolidated: filtered KNN ground truth across 0 profiles via cblas_sgemm (single-threaded, MKL-safe); sample=50 of 50 queries, base=1950","type":"line"}
+{"text":"16:28:17 | toy [all] [22/24 of ~30] verify-prefiltered-knn — OK (0.0s): verified filtered KNN for 0 profiles","type":"line"}
+{"text":"16:28:17 [start] compute-postfiltered-knn — compute postfiltered-knn","type":"line"}
+{"text":"16:28:17 [ok] compute-postfiltered-knn (0.0s): postfiltered KNN (F = G ∩ R): 50 queries, k=10, avg survivors 0.42, avg sentinels 9.58","type":"line"}
+{"text":"16:28:17 | toy [all] [23/24 of ~30] compute-postfiltered-knn — running: compute postfiltered-knn","type":"line"}
+{"text":"16:28:17 |   WARNING: G has 50 queries, R has 12000 predicates; using min=50","type":"line"}
+{"text":"16:28:17 | toy [all] [23/24 of ~30] compute-postfiltered-knn — OK (0.0s): postfiltered KNN (F = G ∩ R): 50 queries, k=10, avg survivors 0.42, avg sentinels 9.58","type":"line"}
+{"text":"16:28:17 [start] verify-postfiltered-knn — verify postfiltered-knn-consolidated","type":"line"}
+{"text":"16:28:17 [ok] verify-postfiltered-knn (0.0s): postfilter verify: 1 profiles, sample=50, mismatches=0","type":"line"}
+{"text":"16:28:17 | toy [all] [24/24 of ~30] verify-postfiltered-knn — running: verify postfiltered-knn-consolidated","type":"line"}
+{"text":"16:28:17 | verify postfiltered-knn-consolidated: dataset=/mnt/datamir/home/jshook/projects/vectordata-rs/docs/tutorials/vecd-end-to-end/vecd-demo/work/toy/dataset.yaml anchor=default scope=1/1 profile","type":"line"}
+{"text":"16:28:17 |     default (in scope)","type":"line"}
+{"text":"16:28:17 | verify postfiltered-knn-consolidated: E = G ∩ R across 1 profile; sample=50 queries per profile","type":"line"}
+{"text":"16:28:17 | toy [all] [24/24 of ~30] verify-postfiltered-knn — OK (0.0s): postfilter verify: 1 profiles, sample=50, mismatches=0","type":"line"}
+{"message":"summary: 24 executed (6.2s), 0 skipped, 24 total","type":"summary"}
+{"name":"data flow","type":"section"}
+{"text":"source vectors:              2000","type":"line"}
+{"text":"duplicates removed:             0","type":"line"}
+{"text":"zero vectors:                   0","type":"line"}
+{"text":"after cleaning:              2000","type":"line"}
+{"text":"query vectors:                 50","type":"line"}
+{"text":"base vectors:                1950","type":"line"}
+{"message":"veks run 2026-06-04 16:28:17","type":"session"}
+{"text":"pipeline: 6 steps, profile: all","type":"line"}
+{"text":"16:28:17 [start] generate-dataset-json — generate dataset-json","type":"line"}
+{"text":"16:28:17 [ok] generate-dataset-json (0.0s): wrote dataset.json","type":"line"}
+{"text":"16:28:17 | toy [all] [1/6 of ~30] generate-dataset-json — running: generate dataset-json","type":"line"}
+{"text":"16:28:17 |   wrote /mnt/datamir/home/jshook/projects/vectordata-rs/docs/tutorials/vecd-end-to-end/vecd-demo/work/toy/dataset.json","type":"line"}
+{"text":"16:28:17 | toy [all] [1/6 of ~30] generate-dataset-json — OK (0.0s): wrote dataset.json","type":"line"}
+{"text":"16:28:17 [start] generate-variables-json — generate variables-json","type":"line"}
+{"text":"16:28:17 [ok] generate-variables-json (0.0s): wrote 56 variables to /mnt/datamir/home/jshook/projects/vectordata-rs/docs/tutorials/vecd-end-to-end/vecd-demo/work/toy/variables.json","type":"line"}
+{"text":"16:28:17 | toy [all] [2/6 of ~30] generate-variables-json — running: generate variables-json","type":"line"}
+{"text":"16:28:17 |   wrote variables.json: 56 variables","type":"line"}
+{"text":"16:28:17 | toy [all] [2/6 of ~30] generate-variables-json — OK (0.0s): wrote 56 variables to /mnt/datamir/home/jshook/projects/vectordata-rs/docs/tutorials/vecd-end-to-end/vecd-demo/work/toy/variables.json","type":"line"}
+{"text":"16:28:17 [start] generate-dataset-log-jsonl — generate dataset-log-jsonl","type":"line"}
