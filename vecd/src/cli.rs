@@ -180,6 +180,24 @@ pub struct ServeArgs {
     /// Keep the newest N snapshots.
     #[arg(long, default_value_t = 24)]
     pub backup_retain: usize,
+    /// Per-connection (IP:port) **download** cap, e.g. `8MiB`. `0`/unset =
+    /// unlimited. Falls back to `ratelimit_connection_download` in
+    /// `vecd.conf`. With more connections, aggregate scales past this.
+    #[arg(long, value_name = "RATE")]
+    pub ratelimit_connection_download: Option<String>,
+    /// Per-connection (IP:port) **upload** cap. Falls back to
+    /// `ratelimit_connection_upload` in `vecd.conf`.
+    #[arg(long, value_name = "RATE")]
+    pub ratelimit_connection_upload: Option<String>,
+    /// Per-client (IP) **download** cap — shared across all of one host's
+    /// connections, so concurrency can't exceed it. Falls back to
+    /// `ratelimit_client_download` in `vecd.conf`.
+    #[arg(long, value_name = "RATE")]
+    pub ratelimit_client_download: Option<String>,
+    /// Per-client (IP) **upload** cap. Falls back to
+    /// `ratelimit_client_upload` in `vecd.conf`.
+    #[arg(long, value_name = "RATE")]
+    pub ratelimit_client_upload: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -381,6 +399,29 @@ fn resolve_bind(flag: &Option<String>, cfg: &config::Config) -> String {
         .unwrap_or_else(|| "0.0.0.0:8443".to_string())
 }
 
+/// Resolve the four bandwidth caps with flag-over-config precedence (each
+/// axis independent). A `--ratelimit-*` flag wins; else the matching
+/// `vecd.conf` key; else `0` (unlimited). CLI flags and config keys are
+/// congruent mirrors — every cap is reachable from both surfaces.
+fn resolve_rate_limits(
+    a: &ServeArgs,
+    cfg: &config::Config,
+) -> Result<crate::ratelimit::RateLimits, VecdError> {
+    let axis = |flag: &Option<String>, key: &str| -> Result<u64, VecdError> {
+        match flag {
+            Some(v) => config::parse_byte_rate(v)
+                .map_err(|m| VecdError::usage(format!("--{}: {m}", key.replace('_', "-")))),
+            None => cfg.byte_rate(key),
+        }
+    };
+    Ok(crate::ratelimit::RateLimits {
+        connection_download: axis(&a.ratelimit_connection_download, "ratelimit_connection_download")?,
+        connection_upload: axis(&a.ratelimit_connection_upload, "ratelimit_connection_upload")?,
+        client_download: axis(&a.ratelimit_client_download, "ratelimit_client_download")?,
+        client_upload: axis(&a.ratelimit_client_upload, "ratelimit_client_upload")?,
+    })
+}
+
 /// Open the DB, surfacing the SQLCipher key from config into the env (used
 /// only when built with the `sqlcipher` feature).
 fn open_db(data_dir: &std::path::Path, cfg: &config::Config) -> Result<Db, VecdError> {
@@ -514,7 +555,15 @@ fn cmd_serve(data_dir: &std::path::Path, cfg: &config::Config, a: &ServeArgs) ->
         _ => return Err(VecdError::usage("--tls-cert and --tls-key must be given together")),
     };
     let db = open_db(data_dir, cfg)?;
-    let state = server::AppState::new(db)?;
+    let limits = resolve_rate_limits(a, cfg)?;
+    if !limits.is_unlimited() {
+        log::info!(
+            "vecd: rate limits (bytes/sec, 0=off) — per-connection down={} up={}, per-client down={} up={}",
+            limits.connection_download, limits.connection_upload,
+            limits.client_download, limits.client_upload,
+        );
+    }
+    let state = server::AppState::new(db)?.with_rate_limits(limits);
 
     let backup_dest = a.db_backup.clone().or_else(|| cfg.db_backup().map(|s| s.to_string()));
     let interval_secs = admin::parse_duration(&a.backup_interval)?;

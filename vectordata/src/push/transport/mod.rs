@@ -107,16 +107,20 @@ pub trait PushTransport {
     fn describe(&self) -> String;
 }
 
-/// Select and construct the transport for a bound endpoint.
+/// Select and construct the transport for a bound endpoint. `concurrency`
+/// bounds parallel chunk uploads on transports that support them (the `vecd`
+/// resumable path); others ignore it.
 pub fn open(
     binding: &ParsedPublishUrl,
     opts: &TransportOptions,
+    concurrency: u32,
 ) -> Result<Box<dyn PushTransport>, String> {
     match binding.scheme.as_str() {
         "file" => Ok(Box::new(local::LocalTransport::from_url(&binding.url)?)),
-        "https" | "http" => Ok(Box::new(https::HttpsTransport::new(
+        "https" | "http" => Ok(Box::new(https::HttpsTransport::with_concurrency(
             binding.url.clone(),
             opts.token.clone(),
+            concurrency,
         ))),
         "s3" => Ok(Box::new(s3::S3Transport::from_url(&binding.url, opts)?)),
         other => Err(format!("no push transport for scheme '{other}'")),

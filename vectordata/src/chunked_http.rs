@@ -85,16 +85,21 @@ pub(crate) struct ChunkStore {
     /// under this lock so concurrent finishers can't race on
     /// the rename.
     in_flight: Arc<Mutex<HashMap<u32, Arc<Condvar>>>>,
+    /// Transient-failure retry policy for chunk fetches, matching the
+    /// `.mref` [`crate::cache::CachedChannel`] path. A flaky connection on
+    /// one chunk of a concurrent prebuffer must not fail the whole download.
+    retry_policy: crate::transport::RetryPolicy,
 }
 
 impl ChunkStore {
     /// Open a chunk store for `transport` (already pointed at
     /// the remote URL) with the given total size. Allocates the
-    /// sparse cache file if absent, loads the bitmap sidecar if
-    /// present, and reconciles the two — if the cache file
-    /// exists at the expected size but no bitmap, treats every
-    /// chunk as valid (the file was produced by a pre-feature
-    /// precache or by a fully-completed prior chunked fill).
+    /// sparse cache file if absent and loads the `.chunks` bitmap
+    /// sidecar if present. The sidecar is the sole source of
+    /// truth for chunk validity: a data file at the expected size
+    /// with no sidecar is treated as all-missing (its bytes are
+    /// an unproven sparse placeholder, not a completed download),
+    /// so reads never silently return zeroed regions.
     pub(crate) fn open(
         transport: HttpTransport,
         total_size: u64,
@@ -136,17 +141,24 @@ impl ChunkStore {
             reset_bitmap = true;
         }
 
-        // Load the bitmap. Cases (in order):
+        // Load the bitmap. The `.chunks` sidecar is the *sole*
+        // source of truth for which chunks are valid — a data
+        // file present at the expected size is **not** proof of a
+        // completed download, because `open` always pre-sizes the
+        // sparse data file (`set_len`) so random-offset chunk
+        // writes have somewhere to land. An interrupted or
+        // size-probe-only open therefore leaves a full-size file
+        // of zeros with no sidecar; trusting its size would mark
+        // every chunk valid and silently serve zeroed bytes as
+        // resident data (and skip the real download). Cases:
         // 1. Data file was just created/resized → bitmap MUST
         //    reset to all-zero. Stale sidecar bits are discarded
         //    and the file on disk (`.chunks`) is removed so a
         //    later open can't pick up the stale state again.
         // 2. `chunks_path` exists and matches `total_chunks`
         //    → use it verbatim.
-        // 3. `chunks_path` is absent but the data file existed
-        //    at the right size → assume complete (pre-feature
-        //    precache compatibility). Mark every chunk valid.
-        // 4. Otherwise (no bitmap, fresh open) → start empty.
+        // 3. No sidecar (fresh open, or a prior open's unproven
+        //    placeholder) → start empty and re-fetch every chunk.
         let initial: Vec<u8> = if reset_bitmap {
             let _ = std::fs::remove_file(&chunks_path);
             vec![0u8; total_chunks as usize]
@@ -154,8 +166,6 @@ impl ChunkStore {
             load_bitmap(&chunks_path, total_chunks as usize).unwrap_or_else(|_| {
                 vec![0u8; total_chunks as usize]
             })
-        } else if file_existed && file_size_matches {
-            vec![1u8; total_chunks as usize]
         } else {
             vec![0u8; total_chunks as usize]
         };
@@ -171,6 +181,7 @@ impl ChunkStore {
             chunks_path,
             chunk_state: Arc::new(chunk_state),
             in_flight: Arc::new(Mutex::new(HashMap::new())),
+            retry_policy: crate::transport::RetryPolicy::default(),
         })
     }
 
@@ -277,9 +288,6 @@ impl ChunkStore {
     fn prebuffer_chunk_range<F>(&self, first: u32, exclusive: u32, mut cb: F) -> io::Result<()>
     where F: FnMut(&DownloadProgress)
     {
-        use std::sync::atomic::AtomicBool;
-        use std::sync::mpsc;
-
         const PROGRESS_TICK: std::time::Duration =
             std::time::Duration::from_millis(250);
 
@@ -306,69 +314,39 @@ impl ChunkStore {
         cb(&progress);
         if pending.is_empty() { return Ok(()); }
 
-        // Reverse the queue so `pop()` yields the lowest chunk
-        // index first — keeps the on-the-wire order close to the
-        // sequential walk, which S3 / CloudFront read-ahead
-        // heuristics prefer.
-        pending.reverse();
-        let queue: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(pending);
-        let abort = AtomicBool::new(false);
-        let (tx, rx) = mpsc::channel::<io::Result<u64>>();
-        let total_pending = range_chunks - progress.completed_chunks() as u32;
-
-        let result: io::Result<()> = std::thread::scope(|scope| {
-            let workers = crate::cache::download_concurrency().max(1);
-            for _ in 0..workers {
-                let abort = &abort;
-                let queue = &queue;
-                let progress = &progress;
-                let this = self;
-                let tx = tx.clone();
-                scope.spawn(move || {
-                    loop {
-                        let idx = match queue.lock().unwrap().pop() {
-                            Some(i) => i,
-                            None => break,
-                        };
-                        if abort.load(Ordering::Relaxed) {
-                            let _ = tx.send(Ok(0));
-                            continue;
-                        }
-                        let len = this.chunk_len(idx);
-                        match this.fetch_chunk_with_dedup(idx) {
-                            Ok(()) => {
-                                progress.add_downloaded_bytes(len);
-                                progress.increment_completed();
-                                let _ = tx.send(Ok(len));
-                            }
-                            Err(e) => {
-                                abort.store(true, Ordering::Relaxed);
-                                progress.mark_failed();
-                                let _ = tx.send(Err(e));
-                            }
-                        }
+        // The worker-pool / queue / abort / completion mechanics are owned
+        // by `drain_parallel` (shared with the merkle-verified
+        // `CachedChannel` path). `drain_parallel` reverses the work list so
+        // `pop()` yields the lowest chunk index first — near-sequential
+        // range requests, which S3 / CloudFront read-ahead prefers. This
+        // path's only per-chunk work is the dedup-aware fetch (which writes
+        // to the sparse cache file, marks the chunk valid, and persists the
+        // `.chunks` sidecar itself) plus progress accounting — no merkle
+        // verification, by design, since no `.mref` was published.
+        let result = crate::transport::pump::drain_parallel(
+            pending,
+            crate::cache::download_concurrency(),
+            PROGRESS_TICK,
+            |&idx: &u32| -> io::Result<()> {
+                let len = self.chunk_len(idx);
+                match self.fetch_chunk_with_dedup(idx) {
+                    Ok(()) => {
+                        progress.add_downloaded_bytes(len);
+                        progress.increment_completed();
+                        Ok(())
                     }
-                });
-            }
-            drop(tx);
-
-            let mut first_err: io::Result<()> = Ok(());
-            let mut done: u32 = 0;
-            while done < total_pending {
-                match rx.recv_timeout(PROGRESS_TICK) {
-                    Ok(Ok(_)) => { done += 1; cb(&progress); }
-                    Ok(Err(e)) => {
-                        done += 1;
-                        if first_err.is_ok() { first_err = Err(e); }
-                        cb(&progress);
+                    Err(e) => {
+                        progress.mark_failed();
+                        Err(e)
                     }
-                    Err(mpsc::RecvTimeoutError::Timeout) => cb(&progress),
-                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 }
-            }
-            cb(&progress);
-            first_err
-        });
+            },
+            || cb(&progress),
+        );
+
+        // Terminal frame so the caller always sees the final (100% or
+        // failed) snapshot — `drain_parallel` fires no event of its own.
+        cb(&progress);
         result
     }
 
@@ -479,7 +457,10 @@ impl ChunkStore {
     fn fetch_and_write_chunk(&self, i: u32) -> io::Result<()> {
         let start = self.chunk_start(i);
         let len = self.chunk_len(i);
-        let bytes = self.transport.fetch_range(start, len)?;
+        // Retry transient fetch failures with backoff — a flaky connection on
+        // one chunk of a concurrent prebuffer is recovered in place rather
+        // than failing the whole download (parity with the `.mref` path).
+        let bytes = self.retry_policy.execute(|| self.transport.fetch_range(start, len))?;
         if bytes.len() as u64 != len {
             return Err(io::Error::new(io::ErrorKind::UnexpectedEof,
                 format!("chunk {i} short read: expected {len}, got {}", bytes.len())));
@@ -617,19 +598,29 @@ mod tests {
         assert_eq!(store.chunk_len(2), 4 * 1024 * 1024);
     }
 
-    /// When the cache file already exists at the right size
-    /// and no sidecar is present, the bitmap initialises to
-    /// "all valid" so legacy precached files keep working.
+    /// A cache file present at the expected size but with **no**
+    /// `.chunks` sidecar must NOT be assumed complete. `open`
+    /// always pre-sizes the sparse data file so chunk writes have
+    /// somewhere to land, so a full-size file with no sidecar is
+    /// an unproven placeholder — typically left by a size-probe or
+    /// an interrupted open. Trusting its size would silently serve
+    /// its zeroed bytes as resident data and skip the real
+    /// download. Regression guard: the sidecar is the sole source
+    /// of truth, so this store reports *nothing* valid and will
+    /// re-fetch every chunk.
     #[test]
-    fn legacy_precached_file_initialises_as_complete() {
+    fn full_size_file_without_sidecar_is_not_complete() {
         let cache = tempfile::tempdir().unwrap();
         let path = cache.path().join("data.bin");
         let total: u64 = 1024;
+        // Pre-existing full-size file (e.g. a prior open's sparse
+        // allocation) with no sidecar alongside it.
         std::fs::write(&path, vec![0u8; total as usize]).unwrap();
+        assert!(!chunks_sidecar_path(&path).exists());
         let transport = HttpTransport::new(url::Url::parse("http://example.com/x").unwrap());
         let store = ChunkStore::open(transport, total, path).unwrap();
-        assert!(store.is_complete());
-        assert_eq!(store.valid_count(), store.total_chunks());
+        assert!(!store.is_complete(), "full-size file without a sidecar must not be trusted as complete");
+        assert_eq!(store.valid_count(), 0, "no chunk is proven valid without a sidecar");
     }
 
     /// Sidecar bitmap round-trip — write a partial bitmap,

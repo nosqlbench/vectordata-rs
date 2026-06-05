@@ -220,7 +220,7 @@ pub fn execute(opts: &Options) -> Result<Outcome, Failure> {
     }
 
     // 4. Open transport + auth/reachability preflight (fail fast).
-    let tx = transport::open(&endpoint, &opts.transport).map_err(Failure::Usage)?;
+    let tx = transport::open(&endpoint, &opts.transport, opts.concurrency).map_err(Failure::Usage)?;
     tx.preflight().map_err(map_transport)?;
 
     // 4b. The single-provenance guarantee rests on the store honoring

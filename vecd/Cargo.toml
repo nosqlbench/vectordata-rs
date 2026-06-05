@@ -63,6 +63,13 @@ default = []
 # `key` PRAGMA is applied from the config file and backups are encrypted
 # by construction.
 sqlcipher = ["rusqlite/bundled-sqlcipher"]
+# Opt-in operational/integration scenarios that are too slow or
+# resource-heavy for the default `cargo test` (e.g. transport saturation
+# with a throttled proxy). Gated as `required-features` on their `[[test]]`
+# targets so they compile/run only under `cargo test --features
+# extended-tests` (or `cargo ta`, the workspace `--all-features` alias) —
+# no `#[ignore]` pragmas.
+extended-tests = []
 
 [lib]
 name = "vecd"
@@ -71,6 +78,12 @@ path = "src/lib.rs"
 [[bin]]
 name = "vecd"
 path = "src/main.rs"
+
+# Transport saturation scenarios — opt-in (see the `extended-tests` feature).
+[[test]]
+name = "transport_saturation"
+path = "tests/transport_saturation.rs"
+required-features = ["extended-tests"]
 
 [dev-dependencies]
 tempfile = "3.8"

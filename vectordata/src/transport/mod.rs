@@ -10,6 +10,7 @@
 #![allow(dead_code)] // pub(crate) module — many helpers are kept for Storage and tests
 pub mod http;
 mod progress;
+pub(crate) mod pump;
 mod retry;
 
 pub use http::HttpTransport;

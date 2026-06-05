@@ -87,6 +87,9 @@ pub struct AppState {
     pub metrics: Arc<Metrics>,
     /// Per-source auth-failure throttle state.
     rate: Arc<Mutex<HashMap<String, RateEntry>>>,
+    /// Bandwidth rate limiter for object transfers (per-connection /
+    /// per-client, each direction). Unlimited by default.
+    limiter: Arc<crate::ratelimit::RateLimiter>,
 }
 
 impl AppState {
@@ -98,7 +101,16 @@ impl AppState {
             snapshot: Arc::new(RwLock::new(Arc::new(snap))),
             metrics: Arc::new(Metrics::default()),
             rate: Arc::new(Mutex::new(HashMap::new())),
+            limiter: crate::ratelimit::RateLimiter::new(crate::ratelimit::RateLimits::default()),
         })
+    }
+
+    /// Attach bandwidth rate limits (per-connection / per-client × upload /
+    /// download). The default from [`AppState::new`] is unlimited; the
+    /// daemon calls this with limits resolved from CLI flags + `vecd.conf`.
+    pub fn with_rate_limits(mut self, limits: crate::ratelimit::RateLimits) -> Self {
+        self.limiter = crate::ratelimit::RateLimiter::new(limits);
+        self
     }
 
     fn snapshot(&self) -> Arc<Snapshot> {
@@ -561,7 +573,7 @@ async fn object_handler(
         let parsed = parse_path(uri.path());
         if let Ok(resolved) = namespace::resolve(&snap, &parsed.logical) {
             if resolved.rel_key != PUSHLOG_FILE {
-                return stream_put(state, snap, parsed.logical, headers, bearer, remote, resolved, body)
+                return stream_put(state, snap, parsed.logical, headers, bearer, remote, addr, resolved, body)
                     .await;
             }
         }
@@ -577,13 +589,26 @@ async fn object_handler(
                 .into_response()
         }
     };
+    // Pace the response body for downloads (GET object reads). Capture what
+    // the throttle needs before `state`/`method` move into the blocking core.
+    let limiter = state.limiter.clone();
+    let is_download = method == Method::GET;
     let out = tokio::task::spawn_blocking(move || {
         handle_blocking(&state, &method, &uri, &headers, bearer.as_deref(), bytes.as_ref(), &remote)
     })
     .await
     .unwrap_or_else(|_| Out::status(StatusCode::INTERNAL_SERVER_ERROR));
 
-    out.into_response()
+    let resp = out.into_response();
+    if is_download {
+        // Shape server→client throughput to the per-connection / per-client
+        // download caps (no-op when unlimited). Total bytes are unchanged —
+        // `Content-Length` stays correct — only the timing is shaped.
+        let (parts, body) = resp.into_parts();
+        Response::from_parts(parts, limiter.throttle_download(addr, body))
+    } else {
+        resp
+    }
 }
 
 /// The shared request preamble for object operations: count, abuse-throttle,
@@ -701,6 +726,7 @@ async fn stream_put(
     headers: HeaderMap,
     bearer: Option<String>,
     remote: String,
+    addr: SocketAddr,
     resolved: Resolved,
     body: Body,
 ) -> Response {
@@ -725,7 +751,8 @@ async fn stream_put(
     // ── stream the body into a backend staging blob ─────────────────
     let staging_key = new_upload_id();
     let backend = resolved.backend.clone();
-    let size = match stream_to_staging(backend.clone(), staging_key.clone(), 0, u64::MAX, body).await {
+    let shaper = state.limiter.upload(addr);
+    let size = match stream_to_staging(backend.clone(), staging_key.clone(), 0, u64::MAX, body, shaper).await {
         Ok(n) => n,
         Err(e) => {
             let _ = backend.discard_staged(&staging_key);
@@ -776,6 +803,7 @@ async fn stream_to_staging(
     base_offset: u64,
     ceiling: u64,
     body: Body,
+    shaper: Option<crate::ratelimit::Shaper>,
 ) -> Result<u64, VecdError> {
     let (tx, rx) = std::sync::mpsc::sync_channel::<Bytes>(8);
     let writer = {
@@ -819,6 +847,12 @@ async fn stream_to_staging(
                         "chunk extends past the declared Upload-Length".to_string(),
                     ));
                     break;
+                }
+                // Pace client→server throughput to the per-connection /
+                // per-client upload caps before handing the chunk to the
+                // backend writer (no-op when unlimited).
+                if let Some(sh) = &shaper {
+                    sh.pace(chunk.len()).await;
                 }
                 written += chunk.len() as u64;
                 if tx.send(chunk).is_err() {
@@ -968,6 +1002,7 @@ fn upload_status_response(
 /// committed (finalize-on-full).
 async fn upload_patch(
     State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Path(upload_id): Path<String>,
     headers: HeaderMap,
     body: Body,
@@ -999,12 +1034,14 @@ async fn upload_patch(
 
     // Stream the chunk to [k, ..), bounded by the declared length. Sparse
     // writes to disjoint regions proceed in parallel with other PATCHes.
+    let shaper = state.limiter.upload(addr);
     let len = match stream_to_staging(
         resolved.backend.clone(),
         upload.staging_key.clone(),
         k,
         upload.total_length,
         body,
+        shaper,
     )
     .await
     {

@@ -37,6 +37,7 @@ pub mod cli;
 pub mod config;
 pub mod daemon;
 pub mod lifetime;
+pub mod ratelimit;
 pub mod server;
 pub mod session;
 pub mod store;

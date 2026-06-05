@@ -82,6 +82,59 @@ impl Config {
     pub fn db_backup(&self) -> Option<&str> {
         self.get("db_backup")
     }
+
+    /// Parse a byte-rate config key (e.g. `ratelimit_connection_download`)
+    /// into bytes/sec. Absent → `0` (unlimited). See [`parse_byte_rate`]
+    /// for the accepted syntax.
+    pub fn byte_rate(&self, key: &str) -> Result<u64, VecdError> {
+        match self.get(key) {
+            Some(v) => parse_byte_rate(v)
+                .map_err(|m| VecdError::usage(format!("vecd.conf '{key}': {m}"))),
+            None => Ok(0),
+        }
+    }
+}
+
+/// Parse a human-friendly byte-rate into **bytes per second**.
+///
+/// Accepts a bare integer (bytes/sec), or an integer/decimal with a unit
+/// suffix: binary `KiB`/`MiB`/`GiB` (×1024ⁿ) or decimal `KB`/`MB`/`GB` and
+/// the bare `K`/`M`/`G` (×1000ⁿ). Case-insensitive; surrounding and
+/// internal spaces are ignored. `0` (any unit) means **unlimited**.
+///
+/// Examples: `8MiB` → 8 388 608, `1MB` → 1 000 000, `1048576` → 1 048 576,
+/// `0` → 0.
+pub fn parse_byte_rate(s: &str) -> Result<u64, String> {
+    let t = s.trim().replace(' ', "");
+    if t.is_empty() {
+        return Err("empty rate".to_string());
+    }
+    let lower = t.to_ascii_lowercase();
+    // Longest suffixes first so "kib" isn't shadowed by "k"/"b".
+    let units: &[(&str, f64)] = &[
+        ("kib", 1024.0),
+        ("mib", 1024.0 * 1024.0),
+        ("gib", 1024.0 * 1024.0 * 1024.0),
+        ("kb", 1000.0),
+        ("mb", 1_000_000.0),
+        ("gb", 1_000_000_000.0),
+        ("k", 1000.0),
+        ("m", 1_000_000.0),
+        ("g", 1_000_000_000.0),
+        ("b", 1.0),
+    ];
+    let (num_str, mult) = units
+        .iter()
+        .find(|(suf, _)| lower.ends_with(suf))
+        .map(|(suf, m)| (&lower[..lower.len() - suf.len()], *m))
+        .unwrap_or((lower.as_str(), 1.0));
+    let num: f64 = num_str
+        .parse()
+        .map_err(|_| format!("invalid byte rate '{s}'"))?;
+    if num < 0.0 {
+        return Err(format!("negative byte rate '{s}'"));
+    }
+    Ok((num * mult).round() as u64)
 }
 
 /// Write a starter config file (mode 0600) into `dir`, created `0700`.
@@ -97,7 +150,17 @@ pub fn write_starter(dir: &Path) -> Result<PathBuf, VecdError> {
             # tls_cert   = /etc/vecd/cert.pem\n\
             # tls_key    = /etc/vecd/key.pem\n\
             # db_key     = <SQLCipher key — build with --features sqlcipher>\n\
-            # db_backup  = s3://vecd-private/backups/\n";
+            # db_backup  = s3://vecd-private/backups/\n\
+            #\n\
+            # Bandwidth rate limits (bytes/sec; suffixes KiB/MiB/GiB, KB/MB/GB; 0 = unlimited).\n\
+            # Per-connection caps shape each TCP connection — opening more connections scales\n\
+            # aggregate throughput. Per-client caps shape the sum across one host's (IP's)\n\
+            # connections — concurrency can't exceed the cap. Each --ratelimit-* flag overrides\n\
+            # the matching key below.\n\
+            # ratelimit_connection_download = 0\n\
+            # ratelimit_connection_upload   = 0\n\
+            # ratelimit_client_download     = 0\n\
+            # ratelimit_client_upload       = 0\n";
         std::fs::write(&path, starter)?;
         set_mode(&path, 0o600);
     }
@@ -131,5 +194,25 @@ mod tests {
     #[test]
     fn malformed_line_is_usage_error() {
         assert!(matches!(Config::parse("no equals here"), Err(VecdError::Usage(_))));
+    }
+
+    #[test]
+    fn byte_rate_units() {
+        assert_eq!(parse_byte_rate("0"), Ok(0));
+        assert_eq!(parse_byte_rate("1048576"), Ok(1024 * 1024));
+        assert_eq!(parse_byte_rate("8MiB"), Ok(8 * 1024 * 1024));
+        assert_eq!(parse_byte_rate("1MB"), Ok(1_000_000));
+        assert_eq!(parse_byte_rate("2 mib"), Ok(2 * 1024 * 1024));
+        assert_eq!(parse_byte_rate("512KiB"), Ok(512 * 1024));
+        assert_eq!(parse_byte_rate("1G"), Ok(1_000_000_000));
+        assert!(parse_byte_rate("nonsense").is_err());
+        assert!(parse_byte_rate("-5MiB").is_err());
+    }
+
+    #[test]
+    fn byte_rate_accessor_defaults_to_zero() {
+        let c = Config::parse("ratelimit_connection_download = 8MiB").unwrap();
+        assert_eq!(c.byte_rate("ratelimit_connection_download").unwrap(), 8 * 1024 * 1024);
+        assert_eq!(c.byte_rate("ratelimit_client_upload").unwrap(), 0);
     }
 }

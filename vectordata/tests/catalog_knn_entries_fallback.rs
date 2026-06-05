@@ -541,9 +541,8 @@ fn test_data_group_picks_dataset_matching_directory_name() {
 /// open+mmap+byte-read chain that the user-facing API exercises.
 #[test]
 fn local_knn_entries_relative_paths_open_and_read_correctly() {
-    use std::io::Write;
     use byteorder::{LittleEndian, WriteBytesExt};
-    use vectordata::{VectorReader, TestDataGroup};
+    use vectordata::TestDataGroup;
 
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
@@ -658,9 +657,7 @@ fn local_knn_entries_relative_paths_open_and_read_correctly() {
 /// `vectordata datasets list` and similar tools use.
 #[test]
 fn local_knn_entries_via_catalog_open_reads_correctly() {
-    use std::io::Write;
     use byteorder::{LittleEndian, WriteBytesExt};
-    use vectordata::VectorReader;
 
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();

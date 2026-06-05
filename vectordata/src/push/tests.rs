@@ -609,7 +609,7 @@ fn transport_conditional_put_enforces_if_match() {
     use super::transport::{open, PushError, TransportOptions};
     let dir = unique("cas");
     let binding = binding::parse_publish_url(&file_url(&dir)).unwrap();
-    let tx = open(&binding, &TransportOptions::default()).unwrap();
+    let tx = open(&binding, &TransportOptions::default(), 1).unwrap();
 
     // must-not-exist precondition: succeeds while absent…
     tx.put_bytes("log", b"v1", Some("")).unwrap();

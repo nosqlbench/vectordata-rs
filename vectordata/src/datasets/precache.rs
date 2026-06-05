@@ -13,10 +13,13 @@
 //!
 //! - **local file** → `Storage::Mmap`, no copy, no merkle, no work.
 //! - **remote URL with `.mref`** → `Storage::Cached`; download +
-//!   verify chunks into the configured cache directory, promote to
-//!   mmap on completion.
-//! - **remote URL without `.mref`** → `Storage::Http`; nothing to
-//!   precache.
+//!   merkle-verify chunks into the configured cache directory,
+//!   promote to mmap on completion.
+//! - **remote URL without `.mref`** → `Storage::Http`; download the
+//!   full file via parallel fixed-size HTTP RANGE chunks (same
+//!   `download_concurrency` worker pool + retry policy as the
+//!   `.mref` path, but trusting TLS rather than a per-chunk hash
+//!   chain) into the cache directory, promote to mmap on completion.
 //!
 //! The driver prints a live single-line status meter with per-facet
 //! and aggregate progress (carriage-return-overwritten on stderr).

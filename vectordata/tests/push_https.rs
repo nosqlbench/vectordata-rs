@@ -49,7 +49,7 @@ fn make_dataset(dir: &std::path::Path) {
 fn https_transport_verbs_and_conditional_put() {
     let store = ObjectStore::start().unwrap();
     let binding = parse_publish_url(&store.base_url()).unwrap();
-    let tx = open(&binding, &TransportOptions::default()).unwrap();
+    let tx = open(&binding, &TransportOptions::default(), 1).unwrap();
 
     // Absent → None.
     assert!(tx.head("x").unwrap().is_none());
@@ -94,7 +94,7 @@ fn push_over_https_end_to_end() {
 
     // Everything is retrievable back over the wire.
     let binding = parse_publish_url(&store.base_url()).unwrap();
-    let tx = open(&binding, &TransportOptions::default()).unwrap();
+    let tx = open(&binding, &TransportOptions::default(), 1).unwrap();
     assert_eq!(tx.get("base.fvec").unwrap().unwrap(), b"HTTPBASE");
     assert!(tx.get("SHA256SUMS").unwrap().is_some());
     assert!(tx.get(".publish_url").unwrap().is_some());
