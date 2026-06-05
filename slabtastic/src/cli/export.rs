@@ -10,15 +10,13 @@
 use std::io::{self, Write};
 use std::path::Path;
 
-use clap::ValueEnum;
-
 use crate::{SlabReader, SlabWriter};
 
 use super::ordinal_range;
 use super::{make_writer_config, write_with_buffer_rename, ProgressReporter};
 
 /// Export output format selectable via `--format`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExportFormatArg {
     /// Write bytes exactly as stored — no added delimiters.
     Raw,
@@ -30,6 +28,22 @@ pub enum ExportFormatArg {
     Hex,
     /// Slabtastic slab format.
     Slab,
+}
+
+impl std::str::FromStr for ExportFormatArg {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "raw" => Ok(ExportFormatArg::Raw),
+            "text" => Ok(ExportFormatArg::Text),
+            "cstrings" => Ok(ExportFormatArg::Cstrings),
+            "hex" => Ok(ExportFormatArg::Hex),
+            "slab" => Ok(ExportFormatArg::Slab),
+            other => Err(format!(
+                "unknown export format '{other}' (expected raw|text|cstrings|hex|slab)"
+            )),
+        }
+    }
 }
 
 /// Internal resolved export format (mirrors `ExportFormatArg` but also

@@ -825,9 +825,8 @@ fn print_plan(
 #[cfg(feature = "cli")]
 mod cli {
     use super::*;
-    use clap::{Args, ValueEnum};
 
-    #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
     pub enum ChecksumMode {
         /// Recompute a stale or missing SHA256SUMS before pushing.
         Auto,
@@ -835,9 +834,20 @@ mod cli {
         Keep,
     }
 
+    impl std::str::FromStr for ChecksumMode {
+        type Err = String;
+        fn from_str(s: &str) -> Result<Self, Self::Err> {
+            match s {
+                "auto" => Ok(ChecksumMode::Auto),
+                "keep" => Ok(ChecksumMode::Keep),
+                other => Err(format!("unknown checksum mode '{other}' (expected auto|keep)")),
+            }
+        }
+    }
+
     /// `vectordata datasets push` — push an already-good dataset or an
     /// ad-hoc directory to its bound remote.
-    #[derive(Debug, Args)]
+    #[derive(Debug, veks_completion_derive::VeksCli)]
     pub struct PushArgs {
         /// Dataset directory, catalog directory, or (with --raw) ad-hoc
         /// directory to push.
@@ -859,7 +869,7 @@ mod cli {
         pub raw: bool,
 
         /// How to treat a stale/missing SHA256SUMS.
-        #[arg(long, value_enum, default_value = "auto")]
+        #[arg(long, value_parser = ["auto", "keep"], default_value = "auto")]
         pub checksums: ChecksumMode,
 
         /// Resolve, validate, and print the plan without writing.
@@ -912,7 +922,21 @@ mod cli {
                 std::env::var("HOSTNAME").unwrap_or_else(|_| "host".into()),
             );
             let cmd = std::env::args().collect::<Vec<_>>().join(" ");
-            let token = self.token.or_else(|| std::env::var("VECTORDATA_PUSH_TOKEN").ok());
+            // Token precedence: --token, then $VECTORDATA_PUSH_TOKEN, then the
+            // stored login credential for the target endpoint (so `vectordata
+            // login` is auto-used for push, not only for reads).
+            let token = self
+                .token
+                .or_else(|| std::env::var("VECTORDATA_PUSH_TOKEN").ok())
+                .or_else(|| {
+                    self.to.as_deref().and_then(|to| {
+                        let t = crate::credentials::stored_token(to);
+                        if t.is_some() {
+                            crate::credentials::warn_if_expiring(to);
+                        }
+                        t
+                    })
+                });
             Options {
                 path: self.path,
                 to: self.to,
@@ -941,7 +965,19 @@ mod cli {
     }
 
     /// Dispatch entry point. Returns a process exit code.
-    pub fn run(args: PushArgs) -> i32 {
+    pub fn run(mut args: PushArgs) -> i32 {
+        // `--token` may be a literal token or a file (JSON token record, a
+        // credential store, or a bare token); resolve it to the literal — using
+        // the destination's origin to pick from a store — before the engine sees it.
+        if let Some(t) = &args.token {
+            match crate::credentials::resolve_token_arg(t, args.to.as_deref()) {
+                Ok(r) => args.token = Some(r.token),
+                Err(e) => {
+                    eprintln!("push: {e}");
+                    return 2;
+                }
+            }
+        }
         match execute(&args.into_options()) {
             Ok(o) => {
                 if o.dry_run {

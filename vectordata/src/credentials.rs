@@ -49,9 +49,34 @@ pub struct Entry {
     /// Informational: the user the token was minted for.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
-    /// Informational: the token's expiry, if known (RFC3339).
+    /// Informational: the token's expiry as epoch seconds (a stringified
+    /// `i64`), if the server reported one at login. Used to warn before a
+    /// credential lapses rather than surprising the user with a 401.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires: Option<String>,
+}
+
+/// A stored credential's standing relative to a reference time.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Expiry {
+    /// No expiry was recorded (or it didn't parse).
+    Unknown,
+    /// Still valid, with this many seconds left.
+    Active { secs_left: i64 },
+    /// Already lapsed, this many seconds ago.
+    Expired { secs_ago: i64 },
+}
+
+impl Entry {
+    /// Classify this credential's expiry against `now` (epoch seconds).
+    /// Pure — the time is a parameter so callers/tests don't depend on a clock.
+    pub fn expiry_status(&self, now: i64) -> Expiry {
+        match self.expires.as_deref().and_then(|s| s.trim().parse::<i64>().ok()) {
+            None => Expiry::Unknown,
+            Some(exp) if exp <= now => Expiry::Expired { secs_ago: now - exp },
+            Some(exp) => Expiry::Active { secs_left: exp - now },
+        }
+    }
 }
 
 /// The credential store — a map of origin → [`Entry`].
@@ -143,6 +168,162 @@ pub fn stored_token(url: &str) -> Option<String> {
     Store::load().get(&origin).map(|e| e.token.clone())
 }
 
+/// The endpoint a command should act on: the given `url`, else the sole
+/// logged-in endpoint's origin — so commands "just work" while logged in.
+/// Errors (asking for an explicit `<url>`) when none or several are stored.
+pub fn resolve_endpoint(url: Option<&str>) -> Result<String, String> {
+    if let Some(u) = url {
+        return Ok(u.to_string());
+    }
+    let entries = Store::load().list();
+    match entries.len() {
+        0 => Err(
+            "not logged in to any endpoint — give a <url>, or run `vectordata login <url>` first"
+                .to_string(),
+        ),
+        1 => Ok(entries.into_iter().next().unwrap().0),
+        _ => Err(format!(
+            "logged in to several endpoints — specify one as <url>: {}",
+            entries.iter().map(|(o, _)| o.as_str()).collect::<Vec<_>>().join(", ")
+        )),
+    }
+}
+
+/// A bearer token resolved from a `--token` argument, with any user/expiry the
+/// source carried.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedToken {
+    pub token: String,
+    /// The user the token is for, if the source named it (a JSON token record).
+    pub user: Option<String>,
+    /// Expiry as epoch-seconds (stringified), if the source carried it.
+    pub expires: Option<String>,
+}
+
+/// Resolve a `--token` argument that may be a **literal token**, or a path to a
+/// **file**. Recognized file shapes:
+///   * a JSON token record `{ "token", "user", "expires_at", … }` (as emitted
+///     by `vecd tokens create --json`);
+///   * a credential store `{ "<origin>": { "token", "user", "expires" }, … }`
+///     (e.g. `~/.config/vecd/credentials.json`) — the entry for `for_url`'s
+///     origin is used (or the sole entry when there's just one);
+///   * a bare token string on its own.
+/// A value that isn't an existing file is taken verbatim.
+pub fn resolve_token_arg(value: &str, for_url: Option<&str>) -> Result<ResolvedToken, String> {
+    let path = std::path::Path::new(value);
+    if !path.is_file() {
+        // Literal token string.
+        return Ok(ResolvedToken { token: value.to_string(), user: None, expires: None });
+    }
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("reading token file {value}: {e}"))?;
+    let trimmed = text.trim();
+    if trimmed.starts_with('{') {
+        let v: serde_json::Value = serde_json::from_str(trimmed)
+            .map_err(|e| format!("parsing token JSON {value}: {e}"))?;
+        // A single token record carries a top-level "token".
+        if let Some(token) = v.get("token").and_then(|t| t.as_str()) {
+            return Ok(ResolvedToken {
+                token: token.to_string(),
+                user: v.get("user").and_then(|u| u.as_str()).map(String::from),
+                expires: v.get("expires_at").and_then(epoch_str),
+            });
+        }
+        // Otherwise it's a credential store keyed by endpoint origin.
+        if let Some(obj) = v.as_object() {
+            return token_from_store(obj, value, for_url);
+        }
+        return Err(format!("token file {value}: missing a \"token\" field"));
+    }
+    // A bare-token file (just the secret on a line).
+    if trimmed.is_empty() {
+        return Err(format!("token file {value} is empty"));
+    }
+    Ok(ResolvedToken { token: trimmed.to_string(), user: None, expires: None })
+}
+
+/// Pull one entry out of a credential-store map: the one matching `for_url`'s
+/// origin, or the sole entry when the URL is omitted and there's just one.
+fn token_from_store(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    file: &str,
+    for_url: Option<&str>,
+) -> Result<ResolvedToken, String> {
+    let entry = match for_url {
+        Some(url) => {
+            let origin =
+                origin_of_str(url).ok_or_else(|| format!("not a valid endpoint URL: {url}"))?;
+            obj.get(&origin).ok_or_else(|| {
+                let have = obj.keys().cloned().collect::<Vec<_>>().join(", ");
+                format!("{file} has no credential for {origin} (it holds: {have})")
+            })?
+        }
+        None if obj.len() == 1 => obj.values().next().unwrap(),
+        None => return Err(format!("{file} holds several credentials — specify the endpoint URL")),
+    };
+    let token = entry
+        .get("token")
+        .and_then(|t| t.as_str())
+        .ok_or_else(|| format!("token file {file}: the matching entry has no \"token\" field"))?
+        .to_string();
+    Ok(ResolvedToken {
+        token,
+        user: entry.get("user").and_then(|u| u.as_str()).map(String::from),
+        expires: entry.get("expires").and_then(epoch_str),
+    })
+}
+
+/// A JSON number or string epoch rendered as a string.
+fn epoch_str(v: &serde_json::Value) -> Option<String> {
+    match v {
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        serde_json::Value::String(s) => Some(s.clone()),
+        _ => None,
+    }
+}
+
+/// Credentials within this window of expiry get a heads-up warning.
+const EXPIRY_WARN_SECS: i64 = 7 * 24 * 3600;
+
+/// Print a stderr warning if the stored credential for `url`'s origin is past
+/// expiry, or within [`EXPIRY_WARN_SECS`] of it — so a lapsing token surfaces
+/// as a clear "go re-login" rather than an opaque 401 later. No-op when there
+/// is no stored credential or it carries no expiry. Call it from commands that
+/// rely on a stored credential.
+pub fn warn_if_expiring(url: &str) {
+    warn_if_expiring_in(url, now_secs(), &Store::load());
+}
+
+/// Testable core of [`warn_if_expiring`] (time + store injected).
+fn warn_if_expiring_in(url: &str, now: i64, store: &Store) {
+    let Some(origin) = origin_of_str(url) else { return };
+    let Some(entry) = store.get(&origin) else { return };
+    match entry.expiry_status(now) {
+        Expiry::Expired { .. } => eprintln!(
+            "warning: your stored credential for {origin} has expired — \
+             run `vectordata login {url}` to refresh it."
+        ),
+        Expiry::Active { secs_left } if secs_left <= EXPIRY_WARN_SECS => {
+            // Round up to whole days (secs_left > 0 in the Active arm).
+            let days = (secs_left + 24 * 3600 - 1) / (24 * 3600);
+            eprintln!(
+                "warning: your stored credential for {origin} expires in ~{days} day(s) — \
+                 run `vectordata login {url}` to refresh it."
+            );
+        }
+        _ => {}
+    }
+}
+
+/// Current time in epoch seconds.
+fn now_secs() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 #[cfg(unix)]
 fn set_mode(path: &std::path::Path, mode: u32) {
     use std::os::unix::fs::PermissionsExt;
@@ -161,6 +342,71 @@ mod tests {
         assert_eq!(origin_of(&u).unwrap(), "https://vecd-host:8443");
         let u2 = Url::parse("https://example.com/x").unwrap();
         assert_eq!(origin_of(&u2).unwrap(), "https://example.com");
+    }
+
+    #[test]
+    fn resolve_token_literal_vs_file() {
+        // A value that isn't a file is taken verbatim.
+        assert_eq!(
+            resolve_token_arg("vd_abc123", None).unwrap(),
+            ResolvedToken { token: "vd_abc123".into(), user: None, expires: None }
+        );
+        let dir = tempfile::tempdir().unwrap();
+        // JSON token record (as `vecd tokens create --json` emits).
+        let jpath = dir.path().join("tok.json");
+        std::fs::write(&jpath, r#"{"token":"vd_xyz","user":"alice","id":7,"expires_at":1893456000}"#).unwrap();
+        assert_eq!(
+            resolve_token_arg(jpath.to_str().unwrap(), None).unwrap(),
+            ResolvedToken { token: "vd_xyz".into(), user: Some("alice".into()), expires: Some("1893456000".into()) }
+        );
+        // Bare-token file (just the secret).
+        let bpath = dir.path().join("tok.txt");
+        std::fs::write(&bpath, "vd_bare\n").unwrap();
+        assert_eq!(
+            resolve_token_arg(bpath.to_str().unwrap(), None).unwrap(),
+            ResolvedToken { token: "vd_bare".into(), user: None, expires: None }
+        );
+        // A credential store (origin → entry), e.g. ~/.config/vecd/credentials.json:
+        // pick the entry for the target url's origin.
+        let spath = dir.path().join("credentials.json");
+        std::fs::write(&spath, r#"{"http://h:8443":{"token":"vd_store","user":"root","expires":"1893456000"},"https://other":{"token":"vd_o","user":"bob","expires":null}}"#).unwrap();
+        assert_eq!(
+            resolve_token_arg(spath.to_str().unwrap(), Some("http://h:8443/")).unwrap(),
+            ResolvedToken { token: "vd_store".into(), user: Some("root".into()), expires: Some("1893456000".into()) }
+        );
+        // Store + a url whose origin isn't present → error.
+        assert!(resolve_token_arg(spath.to_str().unwrap(), Some("http://nope:1/")).is_err());
+        // Store + no url, several entries → ambiguous error.
+        assert!(resolve_token_arg(spath.to_str().unwrap(), None).is_err());
+        // JSON with neither a top-level token nor a usable entry is an error.
+        let npath = dir.path().join("bad.json");
+        std::fs::write(&npath, r#"{"user":"alice"}"#).unwrap();
+        assert!(resolve_token_arg(npath.to_str().unwrap(), None).is_err());
+    }
+
+    #[test]
+    fn expiry_status_classifies_against_now() {
+        let mk = |exp: Option<&str>| Entry {
+            token: "t".into(),
+            user: None,
+            expires: exp.map(str::to_string),
+        };
+        // now = 1_000_000.
+        assert_eq!(mk(None).expiry_status(1_000_000), Expiry::Unknown);
+        assert_eq!(mk(Some("not-a-number")).expiry_status(1_000_000), Expiry::Unknown);
+        assert_eq!(
+            mk(Some("1000500")).expiry_status(1_000_000),
+            Expiry::Active { secs_left: 500 }
+        );
+        assert_eq!(
+            mk(Some("999000")).expiry_status(1_000_000),
+            Expiry::Expired { secs_ago: 1000 }
+        );
+        // Exactly now counts as expired (boundary).
+        assert_eq!(
+            mk(Some("1000000")).expiry_status(1_000_000),
+            Expiry::Expired { secs_ago: 0 }
+        );
     }
 
     #[test]

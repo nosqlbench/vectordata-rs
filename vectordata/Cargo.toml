@@ -44,9 +44,9 @@ url = "2.5"
 # Optional — only required by the `vectordata` binary. Pulled in by
 # the default `cli` feature so `cargo install vectordata` produces a
 # working binary with no `--features` ceremony. Library-only consumers
-# can drop clap with `default-features = false`.
-clap = { version = "4", features = ["derive", "string"], optional = true }
-clap_complete = { version = "4", features = ["unstable-dynamic"], optional = true }
+# can drop the CLI framework with `default-features = false`.
+veks-completion = { path = "../veks-completion", optional = true }
+veks-completion-derive = { path = "../veks-completion-derive", optional = true }
 # Used by the `explore` subcommand's TUI for value similarity, seeded
 # sampling, parallel batched analytics, and Ctrl-C abort handling.
 # All kept optional so library-only consumers (cargo install
@@ -66,7 +66,7 @@ signal-hook = { version = "0.3", optional = true }
 default = ["cli", "explore"]
 # Enables the `vectordata` binary. Library users who don't need the
 # binary can disable this with `default-features = false`.
-cli = ["dep:clap", "dep:clap_complete"]
+cli = ["dep:veks-completion", "dep:veks-completion-derive"]
 # Enables the `vectordata explore` interactive TUI subcommand. The
 # crossterm/ratatui/unicode-width terminal stack is already a hard
 # dep of vectordata for the existing datasets browser; this feature

@@ -119,9 +119,9 @@ Catalogs are configured in `~/.config/vectordata/catalogs.yaml`:
 Manage catalogs via the CLI:
 
 ```bash
-veks datasets config add-catalog https://example.com/datasets/
-veks datasets config list-catalogs
-veks datasets config remove-catalog 2
+veks datasets config catalog add https://example.com/datasets/
+veks datasets config catalog list
+veks datasets config catalog remove --index 2
 ```
 
 ### Discovering datasets
@@ -622,8 +622,8 @@ to fix it. There is no silent fallback to `$HOME/.cache/vectordata/`.
 Configure via the CLI:
 
 ```bash
-veks datasets config set-cache /mnt/fast-storage/vectordata-cache
-veks datasets config show
+veks datasets config set cache /mnt/fast-storage/vectordata-cache
+veks datasets config get
 ```
 
 The directory layout under the resolved root is

@@ -33,6 +33,28 @@ fn is_s3(dest: &str) -> bool {
     dest.starts_with("s3://")
 }
 
+/// Verify the `aws` CLI is on `PATH` before an S3 backup operation. vecd shells
+/// out to `aws s3 …` for S3 transfers (the only place it does), so a missing
+/// dependency would otherwise surface as an opaque "No such file or directory"
+/// from a failed spawn. Turn that into an actionable message up front.
+fn require_aws() -> Result<(), VecdError> {
+    match Command::new("aws")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+    {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(VecdError::op(
+            "S3 backups need the `aws` CLI on PATH, but it was not found. Install the AWS \
+             CLI (https://aws.amazon.com/cli/) and configure credentials, or use a \
+             filesystem path for the backup destination instead of an s3:// URL."
+                .to_string(),
+        )),
+        Err(e) => Err(VecdError::op(format!("checking for the aws CLI: {e}"))),
+    }
+}
+
 /// Strip an optional `file://` scheme and normalize to a directory path.
 fn local_dir(dest: &str) -> String {
     dest.strip_prefix("file://").unwrap_or(dest).trim_end_matches('/').to_string()
@@ -60,6 +82,7 @@ pub fn backup_now(db: &Db, dest: &str, retain: Option<usize>) -> Result<String, 
     let name = format!("vecd-{}.db", now_secs());
 
     let placed = if is_s3(dest) {
+        require_aws()?;
         let uri = format!("{}/{name}", dest.trim_end_matches('/'));
         let out = Command::new("aws")
             .arg("s3")
@@ -99,6 +122,7 @@ pub fn backup_now(db: &Db, dest: &str, retain: Option<usize>) -> Result<String, 
 /// epoch).
 pub fn list_backups(dest: &str) -> Result<Vec<String>, VecdError> {
     let mut names: Vec<String> = if is_s3(dest) {
+        require_aws()?;
         let out = Command::new("aws")
             .arg("s3")
             .arg("ls")
@@ -169,6 +193,7 @@ pub fn restore(snapshot_uri: &str, db_path: &Path) -> Result<(), VecdError> {
         std::fs::create_dir_all(parent)?;
     }
     if is_s3(snapshot_uri) {
+        require_aws()?;
         let out = Command::new("aws")
             .arg("s3")
             .arg("cp")

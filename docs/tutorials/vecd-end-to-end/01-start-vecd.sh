@@ -10,11 +10,13 @@ source "$(dirname "$0")/env.sh"
 
 mkdir -p "$VECD_CONFIG"
 
-say "tell vecd to bind a private loopback port (its only operator setting)"
-# vecd reads operator settings from $VECD_CONFIG/vecd.conf. Putting the bind
-# address here means `vecd start` needs no flags. The DB and pidfile live in
+say "configure vecd — a private loopback bind (vecd requires a config to run)"
+# `vecd config` manages vecd.conf under $VECD_CONFIG; `set` creates it on first
+# use. (For a fresh box you'd usually run `vecd config auto` for safe defaults,
+# then tweak — here we pin the demo's port directly.) The DB + pidfile live in
 # data/ under this same dir automatically.
-printf 'bind = 127.0.0.1:18443\n' > "$VECD_CONFIG/vecd.conf"
+vecd config set bind 127.0.0.1:18443
+vecd config get
 
 say "init the control-plane DB + capture a superuser token"
 # `init` creates the SQLite DB and mints a one-time superuser token; --quiet

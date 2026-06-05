@@ -594,7 +594,7 @@ to 0):
 
 ```bash
 # Self-contained: deterministic synthetic fixture in a temp dir.
-veks pipeline verify engine-parity --synthetic \
+veks pipeline verify engine-parity --use-synthetic \
   --dim 32 --base-count 500 --query-count 20 --neighbors 5 --metric L2
 
 # Or against your own dataset:

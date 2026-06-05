@@ -491,6 +491,9 @@ fn e2e_separate_queries() {
     let mut args = default_args("e2e-separate", &out);
     args.base_vectors = Some(base_fvec);
     args.query_vectors = Some(query_fvec);
+    // Combining separate B+Q into a self-search source is opt-in (--self-search);
+    // without it the 20 provided queries would be used as-is.
+    args.self_search = true;
 
     veks::prepare::import::run(args);
     let (success, output) = run_pipeline(&out.join("dataset.yaml"));
@@ -1299,10 +1302,16 @@ fn adversarial_empty_base_vectors() {
     let fvec = tmp.path().join("empty.fvecs");
     std::fs::write(&fvec, b"").unwrap(); // 0 bytes
 
+    // A separate query avoids the self-search carve — a 0-vector base can't
+    // satisfy `query_count < base`, a doomed config the import guard rejects up
+    // front (by design). This still exercises empty-base handling otherwise.
+    let query = tmp.path().join("query.fvecs");
+    write_test_fvec(&query, 5, 4);
+
     let out = tmp.path().join("out");
     let mut args = default_args("empty-base", &out);
     args.base_vectors = Some(fvec);
-    args.self_search = true;
+    args.query_vectors = Some(query);
     args.no_dedup = true;
     args.no_zero_check = true;
 
@@ -1335,7 +1344,9 @@ fn adversarial_query_count_exceeds_vectors() {
     let mut args = default_args("query-exceed", &out);
     args.base_vectors = Some(fvec);
     args.self_search = true;
-    args.query_count = 300; // exceeds 200 vectors
+    // query_count >= base is rejected up front by the import cardinality guard;
+    // stress the pipeline with a large-but-valid carve (150 of 200) instead.
+    args.query_count = 150;
     args.no_dedup = true;
     args.no_zero_check = true;
 

@@ -8,7 +8,6 @@
 
 use std::path::{Path, PathBuf};
 
-use clap::Args;
 
 pub mod publish_url;
 pub mod catalogs;
@@ -19,7 +18,7 @@ pub mod merkle;
 pub mod pipelines;
 
 /// Arguments for `veks check`.
-#[derive(Args)]
+#[derive(veks_completion_derive::VeksCli)]
 pub struct CheckArgs {
     /// Target directory to check (default: current directory)
     #[arg(default_value = ".")]

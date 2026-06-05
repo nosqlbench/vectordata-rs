@@ -1019,7 +1019,7 @@ fn resolve_spec(
     let sources = build_sources(configdir, extra_catalogs, at);
     if sources.is_empty() {
         eprintln!("'{head}' is not a local path, not a URL, and no catalog is configured.");
-        eprintln!("Add a catalog with: vectordata config add-catalog <URL-or-path>");
+        eprintln!("Add a catalog with: vectordata config catalog add <URL-or-path>");
         return None;
     }
     let catalog = Catalog::of(&sources);

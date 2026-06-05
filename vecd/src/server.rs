@@ -666,14 +666,30 @@ fn gate(
     };
     if !snap.can(&caller, action, path) {
         state.metrics.denials.fetch_add(1, Ordering::Relaxed);
-        // 401 when the caller could authenticate to gain access; 403 when
-        // an authenticated principal is simply not permitted.
-        let status = if caller.is_authenticated() {
-            StatusCode::FORBIDDEN
+        // 401 when the caller could authenticate to gain access; 403 when an
+        // authenticated principal is simply not permitted. Each carries a hint
+        // body so a newcomer knows whether to send a token or request access —
+        // an empty 401/403 is indistinguishable and leaves them stuck.
+        let (status, hint) = if caller.is_authenticated() {
+            (
+                StatusCode::FORBIDDEN,
+                format!(
+                    "forbidden: your credentials are valid but not authorized for \
+                     {action_name} on '{path}'. Ask the namespace owner to grant \
+                     access (e.g. `vecd bind --to <you> --role <role> --ns <ns>`).\n"
+                ),
+            )
         } else {
-            StatusCode::UNAUTHORIZED
+            (
+                StatusCode::UNAUTHORIZED,
+                format!(
+                    "unauthorized: {action_name} on '{path}' is not permitted \
+                     anonymously. Send a bearer token with access \
+                     (Authorization: Bearer <token>), e.g. `--token <token>`.\n"
+                ),
+            )
         };
-        let out = Out::status(status);
+        let out = Out::status(status).body(hint.into_bytes());
         log(state, &caller, action_name, path, out.status, 0, remote);
         return Err(out);
     }
@@ -895,15 +911,30 @@ fn finalize_streamed_put(
     match store::put_staged(&mut db, &resolved, staging_key, size, cond, quota, ignore_quota)? {
         PutResult::Written { etag } => Ok(Out::status(StatusCode::CREATED).etag(etag)),
         PutResult::PreconditionFailed => Ok(Out::status(StatusCode::PRECONDITION_FAILED)),
-        PutResult::QuotaExceeded { quota } => {
-            Ok(Out::status(StatusCode::INSUFFICIENT_STORAGE).header("X-Vecd-Quota", quota.to_string()))
-        }
+        PutResult::QuotaExceeded { quota } => Ok(quota_exceeded_response(quota)),
     }
 }
 
 /// A fresh, collision-resistant id for an upload resource / staging blob.
 fn new_upload_id() -> String {
     format!("{:016x}{:016x}", rand::random::<u64>(), rand::random::<u64>())
+}
+
+/// The `507 Insufficient Storage` response for a quota-exceeded write: the
+/// machine-readable `X-Vecd-Quota` header (the limit in bytes) plus a human
+/// hint naming the next step. Shared by the streaming and buffered write
+/// paths so the body stays consistent.
+fn quota_exceeded_response(quota: u64) -> Out {
+    Out::status(StatusCode::INSUFFICIENT_STORAGE)
+        .header("X-Vecd-Quota", quota.to_string())
+        .body(
+            format!(
+                "insufficient storage: this write would exceed the namespace quota \
+                 of {quota} bytes. Remove old objects/versions, or ask an operator to \
+                 raise it with `vecd ns set <ns> --quota <bytes>`.\n"
+            )
+            .into_bytes(),
+        )
 }
 
 /// Parse a structured-fields integer header (RFC 8941 — an sf-integer is the
@@ -1509,9 +1540,7 @@ fn handle_put(
     match store::put(&mut db, r, body, &cond, quota, ignore_quota)? {
         PutResult::Written { etag } => Ok(Out::status(StatusCode::CREATED).etag(etag)),
         PutResult::PreconditionFailed => Ok(Out::status(StatusCode::PRECONDITION_FAILED)),
-        PutResult::QuotaExceeded { quota } => {
-            Ok(Out::status(StatusCode::INSUFFICIENT_STORAGE).header("X-Vecd-Quota", quota.to_string()))
-        }
+        PutResult::QuotaExceeded { quota } => Ok(quota_exceeded_response(quota)),
     }
 }
 
@@ -1745,5 +1774,27 @@ mod range_tests {
         assert!(matches!(parse_byte_range("items=0-9", 100), RangeOutcome::Full));
         assert!(matches!(parse_byte_range("bytes=0-9,20-29", 100), RangeOutcome::Full));
         assert!(matches!(parse_byte_range("bytes=abc-def", 100), RangeOutcome::Full));
+    }
+}
+
+#[cfg(test)]
+mod response_tests {
+    use super::*;
+
+    /// The quota response is machine-readable (status + `X-Vecd-Quota`) AND
+    /// carries a human hint naming the limit and the next step — never a bare,
+    /// bodyless 507.
+    #[test]
+    fn quota_response_carries_header_and_hint() {
+        let out = quota_exceeded_response(1234);
+        assert_eq!(out.status, StatusCode::INSUFFICIENT_STORAGE);
+        assert!(
+            out.extra.iter().any(|(k, v)| *k == "X-Vecd-Quota" && v == "1234"),
+            "X-Vecd-Quota header must carry the limit"
+        );
+        let body = String::from_utf8(out.body.clone()).unwrap();
+        assert!(body.contains("1234"), "body names the quota: {body}");
+        assert!(body.to_lowercase().contains("quota"));
+        assert!(out.content_length == Some(out.body.len() as u64));
     }
 }

@@ -6,7 +6,7 @@
 //! This binary is intentionally small. It exists so that downstream
 //! consumers of the `vectordata` library can inspect and curate their
 //! local cache (`vectordata cache list`, `vectordata cache prune-legacy`,
-//! `vectordata config show`) without building or installing the
+//! `vectordata config get`) without building or installing the
 //! larger `veks` toolkit. The `veks` CLI delegates the same
 //! operations into the same library entry points so there is exactly
 //! one implementation of each command.
@@ -17,8 +17,8 @@
 
 use std::path::PathBuf;
 
-use clap::{CommandFactory, Parser, Subcommand};
-use clap_complete::{CompleteEnv, Shell};
+use veks_completion::cli as vcli;
+use veks_completion::VeksCli;
 
 use vectordata::cache_admin::{
     CacheEntry, CacheListing, PruneFilter, is_legacy_layout_dir,
@@ -41,7 +41,7 @@ const LONG_VERSION: &str = concat!(
     ")",
 );
 
-#[derive(Parser)]
+#[derive(veks_completion_derive::VeksCli)]
 #[command(
     name = "vectordata",
     version = LONG_VERSION,
@@ -53,18 +53,18 @@ const LONG_VERSION: &str = concat!(
                   • `vectordata datasets`          — TUI browser of every reachable dataset\n  \
                   • `vectordata datasets list`     — text catalog listing\n  \
                   • `vectordata explore`           — interactive value/distance explorer\n  \
-                  • `vectordata config show`       — review the active configuration\n  \
+                  • `vectordata config get`        — review the active configuration\n  \
                   • `vectordata cache list`        — see what's on disk\n\n\
                   First-time users typically start by configuring a catalog source \
-                  (`vectordata config add-catalog <url-or-path>`) and a cache directory \
-                  (`vectordata config set-cache <dir>`)."
+                  (`vectordata config catalog add <url-or-path>`) and a cache directory \
+                  (`vectordata config set cache <dir>`)."
 )]
 struct Cli {
     #[command(subcommand)]
     command: Cmd,
 }
 
-#[derive(Subcommand)]
+#[derive(veks_completion_derive::VeksCli)]
 enum Cmd {
     /// Inspect, list, or curate the on-disk cache.
     Cache {
@@ -124,8 +124,8 @@ enum Cmd {
     Completions {
         /// Emit the raw completion script for this shell instead of
         /// the auto-detected wrapper.
-        #[arg(long, value_enum)]
-        shell: Option<Shell>,
+        #[arg(long, value_parser = ["bash", "zsh", "fish", "elvish", "powershell"])]
+        shell: Option<String>,
     },
 
     /// Establish a stored credential for a `vecd` endpoint.
@@ -149,11 +149,20 @@ enum Cmd {
         list: bool,
     },
     /// Forget the stored credential for an endpoint.
-    Logout { url: String },
+    Logout {
+        /// Endpoint URL (defaults to the one you're logged in to).
+        url: Option<String>,
+    },
     /// Show your stored identity + access at an endpoint.
-    Whoami { url: String },
+    Whoami {
+        /// Endpoint URL (defaults to the one you're logged in to).
+        url: Option<String>,
+    },
     /// Probe what your access lets you see and do at a datasource URL.
-    Ping { url: String },
+    Ping {
+        /// Endpoint URL (defaults to the one you're logged in to).
+        url: Option<String>,
+    },
     /// Mint or revoke delegated API tokens at an endpoint.
     Token {
         #[command(subcommand)]
@@ -176,11 +185,12 @@ enum Cmd {
     },
 }
 
-#[derive(Subcommand)]
+#[derive(veks_completion_derive::VeksCli)]
 enum TokenCmd {
     /// Mint a delegated key (≤ your access) to hand to someone.
     Issue {
-        url: String,
+        /// Endpoint URL (defaults to the one you're logged in to).
+        url: Option<String>,
         #[arg(long)]
         description: String,
         /// A (class, scope) subset, e.g. "read datasets/glove, publish datasets/scratch".
@@ -190,10 +200,15 @@ enum TokenCmd {
         expires: Option<String>,
     },
     /// Revoke a key you issued.
-    Revoke { url: String, id: i64 },
+    Revoke {
+        /// ID of the token to revoke.
+        id: i64,
+        /// Endpoint URL (defaults to the one you're logged in to).
+        url: Option<String>,
+    },
 }
 
-#[derive(Subcommand)]
+#[derive(veks_completion_derive::VeksCli)]
 enum CacheCmd {
     /// Show every cached entry, grouped by category, with origin and size.
     List {
@@ -239,7 +254,7 @@ enum CacheCmd {
     },
 }
 
-#[derive(Subcommand)]
+#[derive(veks_completion_derive::VeksCli)]
 enum DatasetsCmd {
     /// List datasets from configured or specified catalogs.
     ///
@@ -362,64 +377,100 @@ enum DatasetsCmd {
     },
 }
 
-#[derive(Subcommand)]
+#[derive(veks_completion_derive::VeksCli)]
 enum ConfigCmd {
-    /// Show settings.yaml path, cache_dir, used space, and protect flag.
-    Show,
-    /// Print the configured cache_dir on a single line (scriptable).
-    /// Exits 1 with an actionable error on stderr if not configured.
-    GetCache,
-    /// Set the cache directory in settings.yaml. Creates the directory
-    /// if it doesn't exist. Refuses to overwrite a protected
-    /// settings.yaml unless `--force`.
+    /// Read config — all settings, or one value.
     ///
-    /// The special value `largest-writable-mount` (alias `auto`)
-    /// auto-resolves to the largest writable mount with `vectordata-cache`
-    /// as a subdir, falling back to `$HOME/.cache/vectordata` when the
-    /// largest mount is the same filesystem as `$HOME`.
-    SetCache {
-        /// New cache directory path, or `largest-writable-mount` / `auto`
-        /// to auto-resolve.
-        path: PathBuf,
-        /// Overwrite existing protected settings.
+    ///   vectordata config get          # settings.yaml path, cache_dir, etc.
+    ///   vectordata config get cache    # the cache_dir on one line (scriptable)
+    Get {
+        /// A single setting key (currently `cache`); omit to show everything.
+        key: Option<String>,
+    },
+    /// Write a config value, e.g. `vectordata config set cache <dir>`.
+    ///
+    /// For `cache`, the special value `auto` (alias `largest-writable-mount`)
+    /// auto-resolves to the largest writable mount with `vectordata-cache` as a
+    /// subdir, falling back to `$HOME/.cache/vectordata`.
+    Set {
+        /// Setting key (currently `cache`).
+        key: String,
+        /// New value (for `cache`: a path, or `auto`).
+        value: String,
+        /// Overwrite a protected settings.yaml.
         #[arg(long)]
         force: bool,
     },
-    /// List writable mount points with available + total disk space,
-    /// to help pick a `cache_dir`.
-    ListMounts {
+    /// Manage catalog sources (the list in catalogs.yaml).
+    Catalog {
+        #[command(subcommand)]
+        command: CatalogCmd,
+    },
+    /// List writable mount points with available + total disk space, to help
+    /// pick a cache dir for `config set cache`.
+    Mounts {
         /// Include mounts with less than 100 MiB free.
         #[arg(long)]
         all: bool,
     },
-    /// Add a catalog source (URL or path) to catalogs.yaml.
-    #[command(alias = "add")]
-    AddCatalog {
+}
+
+#[derive(veks_completion_derive::VeksCli)]
+enum CatalogCmd {
+    /// Add a catalog source (URL or path).
+    Add {
         /// Catalog URL or path (e.g. https://host/path/ or /local/path).
         source: String,
     },
-    /// Remove a catalog source from catalogs.yaml (by URL/path or index).
+    /// Remove a catalog source (by URL/path or `--at <index>`).
     #[command(alias = "rm")]
-    RemoveCatalog {
+    Remove {
         /// Catalog URL or path to remove.
         source: Option<String>,
-        /// Remove by 1-based index (see `list-catalogs`).
+        /// Remove by 1-based index (see `config catalog list`).
         #[arg(long)]
         at: Option<usize>,
     },
-    /// List configured catalog sources from catalogs.yaml.
-    ListCatalogs,
+    /// List configured catalog sources.
+    List,
 }
 
 fn main() {
-    // Dynamic-completion entry: when invoked with `COMPLETE=<shell>`,
-    // emit candidates and exit. The shell snippet from
-    // `vectordata completions` is a one-liner that re-invokes the
-    // binary with this env var set, so completion logic lives here
-    // (in clap-derived metadata) rather than in a frozen script.
-    CompleteEnv::with_factory(Cli::command).complete();
+    let spec = Cli::veks_command_spec("vectordata");
 
-    let cli = Cli::parse();
+    // Dynamic-completion entry: when invoked with `COMPLETE=<shell>` (or
+    // `_VECTORDATA_COMPLETE=…`), emit candidates and exit. The snippet from
+    // `vectordata completions` re-invokes the binary with that env var set, so
+    // completion logic lives in the spec rather than a frozen script.
+    let resolvers: std::collections::BTreeMap<String, veks_completion::ValueProvider> =
+        std::collections::BTreeMap::new();
+    let tree = vcli::build_completion_tree(&spec, &resolvers);
+    if veks_completion::handle_complete_env("vectordata", &tree) {
+        return;
+    }
+
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    if argv.iter().any(|a| a == "--version" || a == "-V") {
+        println!("vectordata {LONG_VERSION}");
+        return;
+    }
+    if argv.first().is_none() || argv.iter().any(|a| a == "--help" || a == "-h") {
+        if let Some(sub) = argv.first().and_then(|f| spec.subcommands.iter().find(|c| &c.name == f)) {
+            print!("{}", vcli::render_help(sub));
+        } else {
+            print!("{}", vcli::render_help(&spec));
+        }
+        return;
+    }
+
+    let parsed = vcli::parse(&spec, &argv).unwrap_or_else(|e| {
+        eprintln!("vectordata: {e}");
+        std::process::exit(2);
+    });
+    let cli = <Cli as VeksCli>::veks_from_parsed(&parsed).unwrap_or_else(|e| {
+        eprintln!("vectordata: {e}");
+        std::process::exit(2);
+    });
     match cli.command {
         Cmd::Cache { command } => match command {
             CacheCmd::List { cache_dir, verbose } => cmd_cache_list(cache_dir, verbose),
@@ -461,25 +512,37 @@ fn main() {
         }
         Cmd::Config { command } => {
             let code = match command {
-                ConfigCmd::Show => vectordata::config::show(),
-                ConfigCmd::GetCache => vectordata::config::get_cache(),
-                ConfigCmd::SetCache { path, force } => {
-                    vectordata::config::set_cache(&path, force)
-                }
-                ConfigCmd::ListMounts { all } => vectordata::config::list_mounts(all),
-                ConfigCmd::AddCatalog { source } => vectordata::config::add_catalog(&source),
-                ConfigCmd::RemoveCatalog { source, at } => match (source, at) {
-                    (Some(s), _) => vectordata::config::remove_catalog(
-                        vectordata::config::RemoveCatalogSpec::Source(&s)),
-                    (None, Some(n)) => vectordata::config::remove_catalog(
-                        vectordata::config::RemoveCatalogSpec::Index(n)),
-                    (None, None) => {
-                        eprintln!("Specify a catalog URL/path or --at <index>.");
-                        eprintln!("Use `vectordata config list-catalogs` to see indices.");
-                        1
+                ConfigCmd::Get { key } => match key.as_deref() {
+                    None => vectordata::config::show(),
+                    Some("cache") => vectordata::config::get_cache(),
+                    Some(other) => {
+                        eprintln!("unknown config key '{other}' (try `config get cache`, or `config get` for all)");
+                        2
                     }
                 },
-                ConfigCmd::ListCatalogs => vectordata::config::list_catalogs(),
+                ConfigCmd::Set { key, value, force } => match key.as_str() {
+                    "cache" => vectordata::config::set_cache(std::path::Path::new(&value), force),
+                    other => {
+                        eprintln!("unknown config key '{other}' (settable keys: cache)");
+                        2
+                    }
+                },
+                ConfigCmd::Mounts { all } => vectordata::config::list_mounts(all),
+                ConfigCmd::Catalog { command } => match command {
+                    CatalogCmd::Add { source } => vectordata::config::add_catalog(&source),
+                    CatalogCmd::Remove { source, at } => match (source, at) {
+                        (Some(s), _) => vectordata::config::remove_catalog(
+                            vectordata::config::RemoveCatalogSpec::Source(&s)),
+                        (None, Some(n)) => vectordata::config::remove_catalog(
+                            vectordata::config::RemoveCatalogSpec::Index(n)),
+                        (None, None) => {
+                            eprintln!("Specify a catalog URL/path or --at <index>.");
+                            eprintln!("Use `vectordata config catalog list` to see indices.");
+                            1
+                        }
+                    },
+                    CatalogCmd::List => vectordata::config::list_catalogs(),
+                },
             };
             if code != 0 { std::process::exit(code); }
         }
@@ -498,23 +561,23 @@ fn main() {
             if code != 0 { std::process::exit(code); }
         }
         Cmd::Logout { url } => {
-            let code = vectordata::client_cli::logout(&url);
+            let code = vectordata::client_cli::logout(&endpoint_or_exit(url));
             if code != 0 { std::process::exit(code); }
         }
         Cmd::Whoami { url } => {
-            let code = vectordata::client_cli::ping(&url, false);
+            let code = vectordata::client_cli::ping(&endpoint_or_exit(url), false);
             if code != 0 { std::process::exit(code); }
         }
         Cmd::Ping { url } => {
-            let code = vectordata::client_cli::ping(&url, true);
+            let code = vectordata::client_cli::ping(&endpoint_or_exit(url), true);
             if code != 0 { std::process::exit(code); }
         }
         Cmd::Token { command } => {
             let code = match command {
                 TokenCmd::Issue { url, description, profile, expires } => {
-                    vectordata::client_cli::token_issue(&url, &description, profile.as_deref(), expires.as_deref())
+                    vectordata::client_cli::token_issue(&endpoint_or_exit(url), &description, profile.as_deref(), expires.as_deref())
                 }
-                TokenCmd::Revoke { url, id } => vectordata::client_cli::token_revoke(&url, id),
+                TokenCmd::Revoke { url, id } => vectordata::client_cli::token_revoke(&endpoint_or_exit(url), id),
             };
             if code != 0 { std::process::exit(code); }
         }
@@ -540,15 +603,27 @@ fn main() {
 /// `CompleteEnv` in `main()`. No frozen completion script ever lives
 /// on disk; subcommands added later automatically show up next time
 /// the user hits Tab.
+/// Resolve an endpoint-URL argument, defaulting to the logged-in endpoint when
+/// omitted. Exits 2 with guidance when not logged in or several are stored.
+fn endpoint_or_exit(url: Option<String>) -> String {
+    match vectordata::credentials::resolve_endpoint(url.as_deref()) {
+        Ok(u) => u,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(2);
+        }
+    }
+}
+
 ///
 /// With no `--shell`, detects from `$SHELL` and emits the snippet for
 /// that shell.
-fn cmd_completions(shell: Option<Shell>) {
+fn cmd_completions(shell: Option<String>) {
     let argv0 = std::env::args_os().next()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "vectordata".to_string());
 
-    let shell = match shell.or_else(detect_shell) {
+    let name = match shell.or_else(detect_shell) {
         Some(s) => s,
         None => {
             eprintln!("Could not auto-detect your shell from $SHELL.");
@@ -557,14 +632,13 @@ fn cmd_completions(shell: Option<Shell>) {
         }
     };
 
-    let name = shell_name(shell);
     println!("# vectordata tab-completion for {name} (dynamic — defers to the binary)");
     println!("# To activate now:  eval \"$(vectordata completions)\"");
     println!("# To persist:       add the activation line to your shell rc file");
-    match shell {
-        Shell::Fish       => println!("COMPLETE=fish \"{argv0}\" | source"),
-        Shell::Elvish     => println!("eval (COMPLETE=elvish \"{argv0}\" | slurp)"),
-        Shell::PowerShell => println!(
+    match name.as_str() {
+        "fish"       => println!("COMPLETE=fish \"{argv0}\" | source"),
+        "elvish"     => println!("eval (COMPLETE=elvish \"{argv0}\" | slurp)"),
+        "powershell" => println!(
             r#"(& {{ $env:COMPLETE="powershell"; "{argv0}" }}) | Invoke-Expression"#),
         _ /* Bash / Zsh */ => println!("source <(COMPLETE={name} \"{argv0}\")"),
     }
@@ -573,34 +647,20 @@ fn cmd_completions(shell: Option<Shell>) {
 /// Detect the user's shell from `$SHELL`. Returns `None` if the env
 /// var is missing or the basename isn't recognised — the caller
 /// surfaces a helpful error in that case.
-fn detect_shell() -> Option<Shell> {
+fn detect_shell() -> Option<String> {
     let raw = std::env::var_os("SHELL")?;
     let path = std::path::PathBuf::from(raw);
     let name = path.file_name()?.to_str()?;
     match name {
-        "bash"       => Some(Shell::Bash),
-        "zsh"        => Some(Shell::Zsh),
-        "fish"       => Some(Shell::Fish),
-        "elvish"     => Some(Shell::Elvish),
-        "pwsh" | "powershell" => Some(Shell::PowerShell),
+        "bash" | "zsh" | "fish" | "elvish" => Some(name.to_string()),
+        "pwsh" | "powershell" => Some("powershell".to_string()),
         _ => None,
-    }
-}
-
-fn shell_name(s: Shell) -> &'static str {
-    match s {
-        Shell::Bash       => "bash",
-        Shell::Zsh        => "zsh",
-        Shell::Fish       => "fish",
-        Shell::Elvish     => "elvish",
-        Shell::PowerShell => "powershell",
-        _                 => "bash",
     }
 }
 
 /// Resolve the cache root: caller override > settings.yaml. Exits
 /// with a printable error if neither is set so users see actionable
-/// guidance (e.g. the `veks datasets config set-cache` hint).
+/// guidance (e.g. the `veks datasets config set cache` hint).
 fn resolve_cache_dir(override_: Option<PathBuf>) -> PathBuf {
     if let Some(p) = override_ { return p; }
     match vectordata::settings::cache_dir() {

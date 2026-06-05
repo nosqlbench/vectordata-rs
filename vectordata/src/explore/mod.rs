@@ -44,14 +44,11 @@ pub(crate) fn seeded_rng(seed: u64) -> rand_xoshiro::Xoshiro256PlusPlus {
     rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(seed)
 }
 
-use clap::Args;
-
 pub use shared::SampleMode;
-use shared::parse_sample_mode;
 
 /// Unified vector space explorer — norms, distances, eigenvalues, PCA
 /// in one TUI. Run without any source flag to pop the catalog picker.
-#[derive(Args)]
+#[derive(veks_completion_derive::VeksCli)]
 pub struct ExploreArgs {
     /// Dataset from catalog (e.g., img-search or img-search:default)
     #[arg(long, group = "input")]
@@ -69,7 +66,7 @@ pub struct ExploreArgs {
     #[arg(long, default_value = "42")]
     pub seed: u64,
     /// Sampling mode [streaming, clumped, sparse]
-    #[arg(long, default_value = "streaming", value_parser = parse_sample_mode)]
+    #[arg(long, default_value = "streaming", value_parser = ["streaming", "clumped", "sparse"])]
     pub sample_mode: SampleMode,
 }
 
@@ -82,7 +79,10 @@ fn resolve_input(dataset: Option<String>, source: Option<String>, profile: Optio
         (Some(ds), None) => ds,
         (None, Some(src)) => src,
         (None, None) => return None,
-        (Some(_), Some(_)) => unreachable!("clap group ensures mutual exclusion"),
+        (Some(_), Some(_)) => {
+            eprintln!("vectordata explore: --dataset and --source are mutually exclusive — pass only one");
+            std::process::exit(2);
+        }
     };
 
     Some(match profile {
@@ -126,7 +126,7 @@ pub fn run(args: ExploreArgs) -> i32 {
     // the explorer, no picker, no menu.
     if dataset.is_some() || source.is_some() {
         let src = resolve_input(dataset, source, profile)
-            .expect("clap group guarantees exactly one of dataset/source is set here");
+            .expect("guarded above: at least one of --dataset/--source is set here");
         return match unified::run_interactive_explore(&src, sample, seed, sample_mode) {
             unified::ExploreExit::Quit | unified::ExploreExit::Back => 0,
         };

@@ -1,13 +1,47 @@
 // Copyright 2026 Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-use clap::{CommandFactory, Parser};
-use clap_complete::CompleteEnv;
 use slabtastic::cli;
+use veks_completion::cli as vcli;
+use veks_completion::VeksCli;
 
 fn main() {
-    CompleteEnv::with_factory(cli::Cli::command).complete();
-    let cli = cli::Cli::parse();
+    let spec = cli::Cli::veks_command_spec("slab");
+
+    // Dynamic shell completion (COMPLETE=bash/zsh/… or _SLAB_COMPLETE=…),
+    // driven by the same spec that drives parsing.
+    let resolvers: std::collections::BTreeMap<String, veks_completion::ValueProvider> =
+        std::collections::BTreeMap::new();
+    let tree = vcli::build_completion_tree(&spec, &resolvers);
+    if veks_completion::handle_complete_env("slab", &tree) {
+        return;
+    }
+
+    let args: Vec<String> = std::env::args().skip(1).collect();
+
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        println!("slab {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+    if args.first().is_none() || args.iter().any(|a| a == "--help" || a == "-h") {
+        // Render the matching subcommand's help when the first word names one;
+        // otherwise the top-level overview.
+        if let Some(sub) = args.first().and_then(|f| spec.subcommands.iter().find(|c| &c.name == f)) {
+            print!("{}", vcli::render_help(sub));
+        } else {
+            print!("{}", vcli::render_help(&spec));
+        }
+        return;
+    }
+
+    let parsed = vcli::parse(&spec, &args).unwrap_or_else(|e| {
+        eprintln!("slab: {e}");
+        std::process::exit(2);
+    });
+    let cli = <cli::Cli as VeksCli>::veks_from_parsed(&parsed).unwrap_or_else(|e| {
+        eprintln!("slab: {e}");
+        std::process::exit(2);
+    });
     if let Err(e) = cli::run(cli) {
         eprintln!("Error: {e}");
         std::process::exit(1);

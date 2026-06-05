@@ -33,6 +33,13 @@ pub(crate) fn parse_sample_mode(s: &str) -> Result<SampleMode, String> {
     }
 }
 
+impl std::str::FromStr for SampleMode {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        parse_sample_mode(s)
+    }
+}
+
 /// Resolve a non-local source — either a `dataset[:profile]` catalog
 /// specifier or a remote URL pointing at a dataset directory — and
 /// return the canonical [`TestDataView`]. URL sources use the default

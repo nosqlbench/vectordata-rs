@@ -456,6 +456,27 @@ impl HttpsTransport {
                 "{} does not accept object PUT (HTTP 405); not a writable object store?",
                 self.url(rel)
             ))),
+            // Quota exceeded — surface vecd's `X-Vecd-Quota` (the limit in
+            // bytes) and any hint body instead of a bare "HTTP 507", so the
+            // user knows it's a quota wall and what to do about it.
+            StatusCode::INSUFFICIENT_STORAGE => {
+                let quota = resp
+                    .headers()
+                    .get("x-vecd-quota")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string);
+                let body = resp.text().unwrap_or_default();
+                let hint = body.trim();
+                let limit = match quota {
+                    Some(q) => format!(" (namespace quota {q} bytes)"),
+                    None => " (namespace quota exceeded)".to_string(),
+                };
+                let detail = if hint.is_empty() { String::new() } else { format!(": {hint}") };
+                Err(PushError::Other(format!(
+                    "PUT {} -> HTTP 507 Insufficient Storage{limit}{detail}",
+                    self.url(rel)
+                )))
+            }
             // A redirect on a PUT (classically an S3 wrong-region 301/307)
             // can't be followed with a streaming body — surface it clearly
             // instead of as an opaque failure.
@@ -585,7 +606,8 @@ fn parse_list_keys(body: &[u8]) -> Option<Vec<String>> {
 fn auth(rel: &str, status: StatusCode) -> PushError {
     let where_ = if rel.is_empty() { "endpoint".to_string() } else { format!("'{rel}'") };
     PushError::Auth(format!(
-        "{where_} rejected (HTTP {status}); set --token / VECTORDATA_PUSH_TOKEN with write access"
+        "{where_} rejected (HTTP {status}); authenticate with `vectordata login <endpoint>` \
+         (or set --token / VECTORDATA_PUSH_TOKEN) using a credential that has write access"
     ))
 }
 

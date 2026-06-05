@@ -47,7 +47,7 @@ pub fn run(configdir: &str, extra_catalogs: &[String], at: &[String]) -> i32 {
     let sources = build_sources(configdir, extra_catalogs, at);
     if sources.is_empty() {
         eprintln!("No catalog sources configured.");
-        eprintln!("Add one with:  vectordata datasets config add-catalog <URL-or-path>");
+        eprintln!("Add one with:  vectordata config catalog add <URL-or-path>");
         eprintln!("Or use --catalog/--at for one-off access.");
         return 1;
     }

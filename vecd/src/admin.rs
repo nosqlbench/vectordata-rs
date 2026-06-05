@@ -206,6 +206,8 @@ pub fn list_users(db: &Db) -> Result<Vec<(String, String, bool)>, VecdError> {
 /// A freshly minted token — the plaintext is shown once and not stored.
 pub struct TokenCreated {
     pub id: i64,
+    /// The user this token authenticates as.
+    pub user: String,
     pub plaintext: String,
     pub expires_at: i64,
 }
@@ -246,7 +248,7 @@ pub fn create_token(
         )?;
         Ok(tx.last_insert_rowid())
     })?;
-    Ok(TokenCreated { id, plaintext, expires_at })
+    Ok(TokenCreated { id, user: user.to_string(), plaintext, expires_at })
 }
 
 pub fn revoke_token(db: &mut Db, id: i64) -> Result<(), VecdError> {

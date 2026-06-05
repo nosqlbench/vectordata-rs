@@ -66,6 +66,7 @@ pub mod describe_dataset;
 pub mod fetch_bulkdl;
 pub mod fetch_dlhf;
 pub mod gen_dataset;
+pub mod gen_example_dataset;
 pub mod knn_compare;
 pub mod gen_derive;
 pub mod gen_extract;
@@ -197,6 +198,7 @@ pub fn register_all(registry: &mut CommandRegistry) {
     // ── generate ─────────────────────────────────────────────────────
     registry.register("generate dataset", gen_dataset::factory);
     registry.register("generate dataset-json", dataset_json::factory);
+    registry.register("generate example-dataset", gen_example_dataset::factory);
     registry.register("generate derive", gen_derive::factory);
     registry.register("generate from-model", gen_from_model::factory);
     registry.register("generate metadata", gen_metadata::factory);

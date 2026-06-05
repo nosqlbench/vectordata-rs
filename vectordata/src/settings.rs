@@ -92,12 +92,12 @@ impl std::fmt::Display for SettingsError {
                     "vectordata is not configured: {why}\n\
                      \n\
                      # Pick the largest writable mount automatically:\n\
-                     vectordata config set-cache auto\n\
+                     vectordata config set cache auto\n\
                      ({auto_hint})\n\
                      \n\
                      # Or set an explicit path:\n\
-                     vectordata config set-cache <path>\n\
-                     # (veks alias: `veks datasets config set-cache --cache-dir <path>`)\n\
+                     vectordata config set cache <path>\n\
+                     # (veks alias: `veks datasets config set cache <path>`)\n\
                      \n\
                      # Or write the file by hand:\n\
                      mkdir -p {parent}\n\
@@ -313,7 +313,7 @@ fn try_auto_bootstrap(settings: &Path) -> Option<PathBuf> {
             eprintln!("warning: no cache_dir configured; auto-set to {} \
                 (largest writable mount is $HOME's filesystem). \
                 To choose a different location, run \
-                `vectordata config set-cache <path>`.",
+                `vectordata config set cache <path>`.",
                 resolved.path.display());
             Some(resolved.path)
         }
@@ -347,7 +347,7 @@ pub fn cache_dir_from(settings: &Path) -> Result<PathBuf, SettingsError> {
 
 /// Whether `settings.yaml` declares `protect_settings: true`. Used by
 /// [`write_cache_dir`] (and surfaced to callers like
-/// `vectordata config show`) so users can see at a glance that the
+/// `vectordata config get`) so users can see at a glance that the
 /// file is guarded against accidental overwrites.
 ///
 /// Returns `false` if the file does not exist or does not declare the
@@ -485,11 +485,11 @@ mod tests {
         // Display message must contain the actionable commands so
         // callers can surface it directly.
         let msg = err.to_string();
-        assert!(msg.contains("vectordata config set-cache auto"),
+        assert!(msg.contains("vectordata config set cache auto"),
             "missing auto-pick hint: {msg}");
-        assert!(msg.contains("vectordata config set-cache <path>"),
+        assert!(msg.contains("vectordata config set cache <path>"),
             "missing explicit-path hint: {msg}");
-        assert!(msg.contains("veks datasets config set-cache"),
+        assert!(msg.contains("veks datasets config set cache"),
             "missing veks alias hint: {msg}");
         assert!(msg.contains("mkdir -p"), "missing manual mkdir hint: {msg}");
         assert!(msg.contains("cache_dir:"), "missing cache_dir line: {msg}");

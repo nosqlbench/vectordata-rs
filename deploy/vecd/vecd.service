@@ -1,0 +1,38 @@
+# systemd unit for the vecd dataset gateway.
+#
+# Install:
+#   sudo install -m0755 target/release/vecd /usr/local/bin/vecd
+#   sudo useradd --system --home-dir /var/lib/vecd --create-home vecd
+#   sudo install -m0644 deploy/vecd/vecd.service /etc/systemd/system/vecd.service
+#   sudo -u vecd VECD_CONFIG=/var/lib/vecd vecd init --superuser root   # one-time
+#   # edit /var/lib/vecd/vecd.conf: set bind + tls_cert/tls_key for network use
+#   sudo systemctl enable --now vecd
+#
+# This runs `vecd serve` in the foreground so systemd supervises the process
+# directly (NOT `vecd start`, which self-daemonizes). bind, TLS, backups, and
+# rate limits come from /var/lib/vecd/vecd.conf.
+
+[Unit]
+Description=vecd dataset gateway
+Documentation=https://github.com/jshook/vectordata-rs
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=vecd
+Group=vecd
+Environment=VECD_CONFIG=/var/lib/vecd
+ExecStart=/usr/local/bin/vecd serve
+Restart=on-failure
+RestartSec=2
+
+# Hardening — vecd only needs to write its own data dir.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/vecd
+
+[Install]
+WantedBy=multi-user.target

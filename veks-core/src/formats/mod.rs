@@ -34,8 +34,6 @@ pub mod writer;
 use std::fmt;
 use std::path::Path;
 
-use clap::ValueEnum;
-
 /// A vector data format recognized by veks.
 ///
 /// **Vector formats** (xvec family) store one record per vector as
@@ -45,7 +43,7 @@ use clap::ValueEnum;
 /// with no header. Extension is the bare type name (e.g., `.u8`, `.i32`).
 ///
 /// **Container formats** (npy, parquet, slab, hdf5) use their own structure.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VecFormat {
     // ── Container formats ──────────────────────────────────────────
     /// NumPy `.npy` — float32 arrays.

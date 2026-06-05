@@ -182,6 +182,8 @@ impl Drop for DaemonGuard<'_> {
 #[test]
 fn cli_daemon_start_status_stop() {
     let h = Harness::new();
+    // vecd requires a config before any operational command — establish one.
+    h.vecd(&["config", "auto", "--yes"]);
     h.vecd(&["init", "--superuser", "root"]);
 
     // status before start: not running.
@@ -216,6 +218,10 @@ fn cli_daemon_start_status_stop() {
 #[test]
 fn cli_init_serve_push_pull() {
     let h = Harness::new();
+
+    // vecd requires a config before any operational command (config auto writes
+    // safe defaults; --data-dir below overrides the data dir it records).
+    h.vecd(&["config", "auto", "--yes"]);
 
     // init mints a superuser token and prints it once.
     let init_out = h.vecd(&["init", "--superuser", "root"]);

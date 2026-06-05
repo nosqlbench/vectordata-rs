@@ -1,0 +1,9 @@
+# Keep the Docker build context small. The vecd image (deploy/vecd/Dockerfile)
+# builds from source, so it needs the crate sources + Cargo manifests but none
+# of the build output, VCS history, scratch, or runnable tutorial demo state.
+target/
+.git/
+local/
+# Tutorial demo run-state (committed snapshots + any local scratch).
+docs/tutorials/**/vecd-demo/
+**/*.swp

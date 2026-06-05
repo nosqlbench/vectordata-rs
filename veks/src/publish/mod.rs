@@ -13,10 +13,9 @@
 
 use std::path::{Path, PathBuf};
 
-use clap::Args;
 
 /// Arguments for `veks publish`.
-#[derive(Args)]
+#[derive(veks_completion_derive::VeksCli)]
 pub struct PublishArgs {
     /// Target directory to publish (default: current directory)
     #[arg(default_value = ".")]

@@ -43,7 +43,7 @@ options, dataset names, and catalog indexes.
 ### Add a Catalog
 
 ```shell
-veks datasets config add-catalog https://example.com/datasets/
+veks datasets config catalog add https://example.com/datasets/
 ```
 
 ### List and Explore
@@ -64,7 +64,7 @@ Downloads all facets into `~/.cache/vectordata/my-dataset/`, verified
 against merkle hashes. Configure the cache location:
 
 ```shell
-veks datasets config set-cache /mnt/fast-storage/vd-cache
+veks datasets config set cache /mnt/fast-storage/vd-cache
 ```
 
 ---
@@ -156,7 +156,7 @@ veks publish              # upload (prompts for confirmation)
 After publishing, others can access the dataset:
 
 ```shell
-veks datasets config add-catalog https://my-bucket.s3.amazonaws.com/datasets/
+veks datasets config catalog add https://my-bucket.s3.amazonaws.com/datasets/
 veks datasets list
 ```
 
@@ -168,7 +168,7 @@ veks datasets list
 |------|---------|
 | Install | `cargo install veks` |
 | Tab completion | `eval "$(veks completions)"` |
-| Add catalog | `veks datasets config add-catalog <URL>` |
+| Add catalog | `veks datasets config catalog add <URL>` |
 | List datasets | `veks datasets list` |
 | Probe dataset | `veks datasets probe --dataset <name>` |
 | Prebuffer | `veks datasets prebuffer --dataset <name>` |

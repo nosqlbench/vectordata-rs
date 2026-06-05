@@ -20,7 +20,7 @@ use crate::dataset::CatalogEntry;
 /// describe`. Mirrors the shape of `PingArgs` so the catalog-
 /// resolution surface stays uniform across CLI commands.
 #[cfg(feature = "cli")]
-#[derive(Debug, clap::Args)]
+#[derive(Debug, veks_completion_derive::VeksCli)]
 pub struct DescribeArgs {
     /// Pin describe to a single catalog location (URL or path). When
     /// omitted, every catalog configured under `<configdir>/
@@ -46,7 +46,7 @@ pub fn run_args(args: DescribeArgs, configdir: &str, catalog: &[String], at_extr
     if sources.is_empty() {
         eprintln!("error: no catalog sources configured");
         eprintln!();
-        eprintln!("Add a catalog with `vectordata config add-catalog <URL-or-path>`,");
+        eprintln!("Add a catalog with `vectordata config catalog add <URL-or-path>`,");
         eprintln!("or pass `--at <URL-or-path>` for one-off use.");
         return 1;
     }

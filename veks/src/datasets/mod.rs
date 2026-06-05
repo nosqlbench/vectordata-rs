@@ -23,10 +23,9 @@ pub use vectordata::datasets::ping;
 
 use std::path::PathBuf;
 
-use clap::{Args, Subcommand};
 
 /// Browse, search, and manage datasets
-#[derive(Args)]
+#[derive(veks_completion_derive::VeksCli)]
 #[command(disable_help_subcommand = true)]
 pub struct DatasetsArgs {
     #[command(subcommand)]
@@ -34,7 +33,7 @@ pub struct DatasetsArgs {
 }
 
 /// Available subcommands under `veks datasets`.
-#[derive(Subcommand)]
+#[derive(veks_completion_derive::VeksCli)]
 pub enum DatasetsCommand {
     /// List available datasets from configured or specified catalogs
     #[command(alias = "ls")]
@@ -56,7 +55,7 @@ pub enum DatasetsCommand {
         output_format: String,
 
         /// Show detailed information including attributes, tags, and views
-        #[arg(long, short = 'v')]
+        #[arg(long)]
         verbose: bool,
 
         /// Group output by: source, profile, or metric (text format only)
@@ -74,7 +73,7 @@ pub enum DatasetsCommand {
         // -- Filter predicates --
 
         /// Filter by dataset name (exact match, substring, regex, or glob)
-        #[arg(long, short = 'd')]
+        #[arg(long)]
         dataset: Option<String>,
 
         /// Filter by dataset name (substring, regex, or glob) — alias for --dataset
@@ -164,7 +163,7 @@ pub enum DatasetsCommand {
         all: bool,
 
         /// Show per-chunk RLE coverage detail
-        #[arg(long, short = 'v')]
+        #[arg(long)]
         verbose: bool,
 
         /// Show file tree of the cache directory
@@ -186,10 +185,10 @@ pub enum DatasetsCommand {
     /// Ping a remote dataset: verify catalog access, list facets, read a sample
     #[command(alias = "probe")]
     Ping {
-        /// Catalog base URL or number (e.g., 1, https://bucket.s3.amazonaws.com/path/).
-        /// If omitted, searches configured catalogs for the dataset.
-        #[arg(long)]
-        at: Option<String>,
+        /// Catalog base URL(s) or number(s) (e.g., 1, https://bucket.s3.amazonaws.com/path/)
+        /// to pin the search to. If omitted, searches configured catalogs for the dataset.
+        #[arg(long = "at")]
+        at: Vec<String>,
 
         /// Dataset name within the catalog
         #[arg(long)]
@@ -210,7 +209,7 @@ pub enum DatasetsCommand {
         yes: bool,
 
         /// List all files in each dataset before dropping
-        #[arg(long, short = 'v')]
+        #[arg(long)]
         verbose: bool,
 
         /// Override cache directory location
@@ -245,7 +244,7 @@ pub enum DatasetsCommand {
         profile: String,
 
         /// Output directory for the new dataset.
-        #[arg(long, short = 'o')]
+        #[arg(long)]
         output: PathBuf,
 
         /// Override the derived dataset's name (default: `<source>-<profile>`).
@@ -297,42 +296,59 @@ pub enum DatasetsCommand {
     },
 }
 
-/// Subcommands under `veks datasets config`.
-#[derive(Subcommand)]
+/// Subcommands under `veks datasets config` (mirrors `vectordata config`).
+#[derive(veks_completion_derive::VeksCli)]
 pub enum ConfigSubcommand {
-    /// Display current vectordata configuration
-    Show,
-    /// Print the configured cache_dir (scriptable counterpart to set-cache)
-    GetCache,
-    /// Set the cache directory for downloaded datasets
-    SetCache {
-        /// Cache directory path (e.g., /mnt/data/vectordata-cache)
-        #[arg(long = "cache-dir")]
-        cache_dir: Option<String>,
-
-        /// Overwrite existing protected settings
+    /// Read config — all settings, or one value.
+    ///
+    ///   veks datasets config get          # current configuration
+    ///   veks datasets config get cache    # the cache_dir on one line
+    Get {
+        /// A single setting key (currently `cache`); omit to show everything.
+        key: Option<String>,
+    },
+    /// Write a config value, e.g. `veks datasets config set cache <dir>`.
+    Set {
+        /// Setting key (currently `cache`).
+        key: String,
+        /// New value (for `cache`: a path, or `auto`).
+        value: String,
+        /// Overwrite a protected settings.yaml.
         #[arg(long)]
         force: bool,
     },
-    /// List configured dataset mount points
-    ListMounts,
-    /// Add a catalog source (URL or path) to catalogs.yaml
-    #[command(alias = "add")]
-    AddCatalog {
-        /// Catalog URL or path (e.g., https://host/path/ or /local/path)
+    /// Manage catalog sources (the list in catalogs.yaml).
+    Catalog {
+        #[command(subcommand)]
+        command: ConfigCatalogSubcommand,
+    },
+    /// List writable mount points to help pick a cache dir.
+    Mounts {
+        /// Include mounts with less than 100 MiB free.
+        #[arg(long)]
+        all: bool,
+    },
+}
+
+/// Catalog-source management under `veks datasets config catalog`.
+#[derive(veks_completion_derive::VeksCli)]
+pub enum ConfigCatalogSubcommand {
+    /// Add a catalog source (URL or path).
+    Add {
+        /// Catalog URL or path (e.g., https://host/path/ or /local/path).
         source: String,
     },
-    /// Remove a catalog source from catalogs.yaml (by URL/path or index)
+    /// Remove a catalog source (by URL/path or `--index <N>`).
     #[command(alias = "rm")]
-    RemoveCatalog {
-        /// Catalog URL or path to remove
+    Remove {
+        /// Catalog URL or path to remove.
         source: Option<String>,
-        /// Remove by 1-based index (from `list-catalogs` output)
+        /// Remove by 1-based index (see `config catalog list`).
         #[arg(long)]
-        at: Option<usize>,
+        index: Option<usize>,
     },
-    /// List configured catalog sources
-    ListCatalogs,
+    /// List configured catalog sources.
+    List,
 }
 
 /// Dispatch to the appropriate datasets subcommand.
@@ -430,12 +446,11 @@ pub fn run(args: DatasetsArgs) {
             // Ping now goes through the unified resolver; --at pins the
             // search to that catalog, otherwise every configured one is
             // in play and the dataset is looked up against the union.
-            let sources = if let Some(ref a) = at {
-                let resolved = resolve_catalog_value(a);
-                crate::catalog::sources::CatalogSources::new()
-                    .add_catalogs(&[resolved])
-            } else {
+            let sources = if at.is_empty() {
                 crate::catalog::sources::CatalogSources::new().configure_default()
+            } else {
+                let resolved: Vec<String> = at.iter().map(|a| resolve_catalog_value(a)).collect();
+                crate::catalog::sources::CatalogSources::new().add_catalogs(&resolved)
             };
             let catalog = crate::catalog::resolver::Catalog::of(&sources);
             let code = ping::run_via_catalog(&catalog, &dataset, &profile);
@@ -513,31 +528,37 @@ pub fn run(args: DatasetsArgs) {
 /// effect, an alias for `vectordata config`.
 fn run_config_command(command: ConfigSubcommand) {
     let code = match command {
-        ConfigSubcommand::Show => vectordata::config::show(),
-        ConfigSubcommand::GetCache => vectordata::config::get_cache(),
-        ConfigSubcommand::SetCache { cache_dir, force } => {
-            let Some(dir) = cache_dir else {
-                eprintln!("Error: --cache-dir is required.");
-                std::process::exit(1);
-            };
-            vectordata::config::set_cache(std::path::Path::new(&dir), force)
-        }
-        ConfigSubcommand::ListMounts => vectordata::config::list_mounts(false),
-        ConfigSubcommand::AddCatalog { source } => {
-            vectordata::config::add_catalog(&source)
-        }
-        ConfigSubcommand::RemoveCatalog { source, at } => match (source, at) {
-            (Some(s), _) => vectordata::config::remove_catalog(
-                vectordata::config::RemoveCatalogSpec::Source(&s)),
-            (None, Some(n)) => vectordata::config::remove_catalog(
-                vectordata::config::RemoveCatalogSpec::Index(n)),
-            (None, None) => {
-                eprintln!("Error: specify a catalog URL/path or --at <index>");
-                eprintln!("  Use `veks datasets config list-catalogs` to see available indices.");
-                1
+        ConfigSubcommand::Get { key } => match key.as_deref() {
+            None => vectordata::config::show(),
+            Some("cache") => vectordata::config::get_cache(),
+            Some(other) => {
+                eprintln!("unknown config key '{other}' (try `config get cache`, or `config get` for all)");
+                2
             }
         },
-        ConfigSubcommand::ListCatalogs => vectordata::config::list_catalogs(),
+        ConfigSubcommand::Set { key, value, force } => match key.as_str() {
+            "cache" => vectordata::config::set_cache(std::path::Path::new(&value), force),
+            other => {
+                eprintln!("unknown config key '{other}' (settable keys: cache)");
+                2
+            }
+        },
+        ConfigSubcommand::Mounts { all } => vectordata::config::list_mounts(all),
+        ConfigSubcommand::Catalog { command } => match command {
+            ConfigCatalogSubcommand::Add { source } => vectordata::config::add_catalog(&source),
+            ConfigCatalogSubcommand::Remove { source, index } => match (source, index) {
+                (Some(s), _) => vectordata::config::remove_catalog(
+                    vectordata::config::RemoveCatalogSpec::Source(&s)),
+                (None, Some(n)) => vectordata::config::remove_catalog(
+                    vectordata::config::RemoveCatalogSpec::Index(n)),
+                (None, None) => {
+                    eprintln!("Error: specify a catalog URL/path or --index <N>");
+                    eprintln!("  Use `veks datasets config catalog list` to see available indices.");
+                    1
+                }
+            },
+            ConfigCatalogSubcommand::List => vectordata::config::list_catalogs(),
+        },
     };
     if code != 0 { std::process::exit(code); }
 }
@@ -557,7 +578,7 @@ pub fn resolve_catalog_value(value: &str) -> String {
                 return url.clone();
             }
         }
-        eprintln!("Error: catalog #{} not found. Use 'veks datasets config list-catalogs' to see available catalogs.", value);
+        eprintln!("Error: catalog #{} not found. Use 'veks datasets config catalog list' to see available catalogs.", value);
         std::process::exit(1);
     }
     value.to_string()

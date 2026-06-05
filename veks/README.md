@@ -17,7 +17,7 @@ for the comparison model and a per-test breakdown.
 prints a side-by-side comparison:
 
 ```sh
-veks pipeline verify engine-parity --synthetic \
+veks pipeline verify engine-parity --use-synthetic \
   --dim 32 --base-count 500 --query-count 20 --neighbors 5
 ```
 
@@ -60,7 +60,7 @@ veks datasets prebuffer --dataset myset
 veks datasets cache-status --dataset myset
 veks datasets probe https://example.com/datasets/myset
 veks datasets drop-cache --dataset myset
-veks datasets config show           # cache directory + mounts
+veks datasets config get            # cache directory + mounts
 ```
 
 ### prepare

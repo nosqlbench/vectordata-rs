@@ -60,7 +60,7 @@ side-by-side neighbor table plus a pair-wise classification:
 
 ```sh
 cargo install --features knnutils,faiss --path veks
-veks pipeline verify engine-parity --synthetic \
+veks pipeline verify engine-parity --use-synthetic \
   --dim 32 --base-count 500 --query-count 20 --neighbors 5
 ```
 
@@ -90,6 +90,13 @@ pipelines, analyze data, publish to catalogs.
 [Pipeline](./docs/sysref/04-pipeline.md) |
 [Import](./docs/sysref/07-import.md))
 
+**[vecd](./vecd/)** — the server. Self-host a private gateway that publishes
+datasets over HTTP with authentication, per-namespace access control, and
+versioned atomic uploads.
+([Intro & quickstart](./docs/guides/vecd-intro.md) ·
+[End-to-end tutorial](./docs/tutorials/vecd-end-to-end/) ·
+[Design](./docs/design/vecd-daemon.md))
+
 **[veks-pipeline](./veks-pipeline/)** — 50+ pipeline commands for KNN
 computation, metadata synthesis, predicate evaluation, filtered search,
 and verification.
@@ -107,7 +114,7 @@ and predicate trees.
 ### Discover
 
 ```bash
-veks datasets config add-catalog https://example.com/datasets/
+veks datasets config catalog add https://example.com/datasets/
 veks datasets list
 veks datasets ping --dataset myset
 ```

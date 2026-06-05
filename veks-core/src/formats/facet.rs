@@ -13,14 +13,12 @@
 
 use std::fmt;
 
-use clap::ValueEnum;
-
 use super::VecFormat;
 
 /// Canonical facet kinds as defined by the Java `TestDataKind` registry.
 ///
 /// Listed in preferred ordering for dataset.yaml.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Facet {
     /// Base vectors (the corpus to search)
     BaseVectors,

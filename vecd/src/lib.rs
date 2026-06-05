@@ -35,6 +35,7 @@ pub mod admin;
 pub mod backup;
 pub mod cli;
 pub mod config;
+pub mod credentials;
 pub mod daemon;
 pub mod lifetime;
 pub mod ratelimit;

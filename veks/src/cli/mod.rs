@@ -3,8 +3,6 @@
 
 //! CLI argument parsing and shell completion support.
 //!
-//! CLI argument parsing and shell completion support.
-//!
 //! Dynamic completions are handled by the `dyncomp` module. The
 //! `completions` subcommand outputs a sourceable shell snippet.
 //!
@@ -17,16 +15,28 @@
 
 pub mod dyncomp;
 
-use clap::Args;
 /// Supported shells for completion script generation.
-#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+#[derive(Clone, Copy, Debug)]
 pub enum Shell {
     Bash,
     Zsh,
     Fish,
     Elvish,
-    #[value(name = "powershell")]
     PowerShell,
+}
+
+impl std::str::FromStr for Shell {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "bash" => Ok(Shell::Bash),
+            "zsh" => Ok(Shell::Zsh),
+            "fish" => Ok(Shell::Fish),
+            "elvish" => Ok(Shell::Elvish),
+            "powershell" => Ok(Shell::PowerShell),
+            other => Err(format!("unknown shell '{other}' (expected bash|zsh|fish|elvish|powershell)")),
+        }
+    }
 }
 
 /// Generate shell completions for veks.
@@ -40,7 +50,7 @@ pub enum Shell {
 ///   eval "$(veks completions --shell bash)"
 ///   eval "$(veks completions --shell zsh)"
 ///   veks completions --shell fish | source
-#[derive(Args)]
+#[derive(veks_completion_derive::VeksCli)]
 #[command(after_long_help = "\
 EXAMPLES:
   # Auto-detect shell and activate completions:
@@ -55,7 +65,7 @@ EXAMPLES:
   veks completions --shell fish | source")]
 pub struct CompletionsArgs {
     /// Shell to generate completions for (bash, zsh, fish, elvish, powershell)
-    #[arg(long, value_enum)]
+    #[arg(long)]
     pub shell: Option<Shell>,
 }
 

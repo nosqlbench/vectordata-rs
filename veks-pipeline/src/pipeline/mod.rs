@@ -89,8 +89,6 @@ pub(crate) fn physical_core_count() -> usize {
 
 use std::path::{Path, PathBuf};
 
-use clap::Args;
-use clap_complete::engine::ArgValueCompleter;
 use indexmap::IndexMap;
 
 use vectordata::dataset::DatasetConfig;
@@ -177,7 +175,7 @@ pub fn resolve_all_steps(
 }
 
 /// CLI arguments for `veks run`.
-#[derive(Args)]
+#[derive(veks_completion_derive::VeksCli)]
 pub struct RunArgs {
     /// Path to dataset.yaml, or a directory when --recursive is given
     /// (default: dataset.yaml in current directory)
@@ -186,7 +184,7 @@ pub struct RunArgs {
     /// Recursively find and run all dataset.yaml files under the target
     /// directory. The positional argument is treated as a root directory
     /// instead of a single dataset.yaml path.
-    #[arg(long, short = 'r')]
+    #[arg(long)]
     pub recursive: bool,
 
     /// Run steps for a specific profile, or `all` to run every profile
@@ -243,7 +241,7 @@ pub struct RunArgs {
     /// Controls how much of the system's resources the pipeline may use.
     /// Supports absolute values, percentages, and ranges that the governor
     /// adjusts dynamically during execution.
-    #[arg(long, num_args = 1, add = ArgValueCompleter::new(cli::resource_completer))]
+    #[arg(long)]
     pub resources: Option<String>,
 
     /// Governor strategy for resource adjustment.
@@ -274,12 +272,7 @@ pub struct RunArgs {
     /// after a minor/patch binary upgrade to keep cached steps fresh
     /// without re-running everything; use `config-only` to ignore the
     /// binary version entirely.
-    #[arg(
-        long,
-        default_value = "strict",
-        value_name = "SELECTOR",
-        add = ArgValueCompleter::new(cli::provenance_completer),
-    )]
+    #[arg(long, default_value = "strict", value_name = "SELECTOR")]
     pub provenance: String,
 
     /// Print the provenance diff between the stored and current
@@ -291,7 +284,7 @@ pub struct RunArgs {
 }
 
 /// CLI arguments for `veks script`.
-#[derive(Args)]
+#[derive(veks_completion_derive::VeksCli)]
 pub struct ScriptArgs {
     /// Path to dataset.yaml (default: dataset.yaml in current directory)
     pub dataset: Option<PathBuf>,

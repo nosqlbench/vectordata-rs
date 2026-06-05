@@ -11,8 +11,8 @@ keywords = ["vector", "dataset", "ann", "testing", "automation"]
 categories = ["filesystem", "network-programming", "science"]
 
 [dependencies]
-clap = { version = "4", features = ["derive"] }
-clap_complete = { version = "4", features = ["unstable-dynamic"] }
+veks-completion = { path = "../veks-completion" }
+veks-completion-derive = { path = "../veks-completion-derive" }
 csv = "1"
 memmap2 = "0.9"
 serde = { version = "1", features = ["derive"] }

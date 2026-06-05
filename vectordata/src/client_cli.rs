@@ -27,8 +27,22 @@ pub fn login(
     };
 
     let (token, user, expires_at) = if let Some(tok) = token {
-        // Pre-issued token: store as given.
-        (tok.to_string(), user.map(|s| s.to_string()), None)
+        // --token is a literal token or a file (JSON record / credential store
+        // / bare token); a store is keyed by origin, so pass the target url.
+        let resolved = match crate::credentials::resolve_token_arg(tok, Some(url)) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("{e}");
+                return 2;
+            }
+        };
+        // The token's user: from the JSON record, else --user, else ask the
+        // endpoint (so the stored credential is labeled with its user).
+        let user = resolved
+            .user
+            .or_else(|| user.map(|s| s.to_string()))
+            .or_else(|| whoami_user(url, &resolved.token));
+        (resolved.token, user, resolved.expires)
     } else {
         let Some(user) = user else {
             eprintln!("login needs either --token, or --user to exchange a password");
@@ -63,13 +77,25 @@ pub fn login(
     };
 
     let mut store = Store::load();
+    let user_note = user.as_deref().map(|u| format!(" as {u}")).unwrap_or_default();
     store.set(origin.clone(), Entry { token, user, expires: expires_at });
     if let Err(e) = store.save() {
         eprintln!("could not write credentials: {e}");
         return 1;
     }
-    println!("logged in to {origin}");
+    println!("logged in to {origin}{user_note}");
     0
+}
+
+/// Best-effort: ask the endpoint which user a token authenticates as, so a
+/// stored credential can be labeled. `None` on any error or anonymous access.
+fn whoami_user(url: &str, token: &str) -> Option<String> {
+    let v = endpoint::whoami(url, Some(token)).ok()?;
+    if v.get("authenticated").and_then(|a| a.as_bool()) == Some(true) {
+        v.get("identity").and_then(|i| i.as_str()).map(String::from)
+    } else {
+        None
+    }
 }
 
 /// `vectordata logout <url>` — forget a stored credential.
@@ -112,6 +138,7 @@ pub fn list_logins() -> i32 {
 /// non-`vecd` host.
 pub fn ping(url: &str, graceful: bool) -> i32 {
     let token = crate::credentials::stored_token(url);
+    crate::credentials::warn_if_expiring(url);
     match endpoint::whoami(url, token.as_deref()) {
         Ok(view) => {
             print_access(url, &view);
@@ -169,6 +196,7 @@ pub fn token_issue(
         eprintln!("not logged in to {url} — run `vectordata login {url}` first");
         return 2;
     };
+    crate::credentials::warn_if_expiring(url);
     match endpoint::issue_token(url, &session, description, profile, expires) {
         Ok(resp) => {
             println!("token: {}", resp.token);

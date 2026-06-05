@@ -126,7 +126,7 @@ impl CommandOp for VerifyEngineParityOp {
                 ## Two modes\n\n\
                 - **User-data mode**: pass `--base` and `--query` to compare engines on \
                   your own files.\n\
-                - **Synthetic mode**: pass `--synthetic` (with optional `--dim` / \
+                - **Synthetic mode**: pass `--use-synthetic` (with optional `--dim` / \
                   `--base-count` / `--query-count` / `--seed`) to run on a deterministic \
                   in-process fixture.\n\n\
                 ## Options\n\n{}",
@@ -138,11 +138,11 @@ impl CommandOp for VerifyEngineParityOp {
     fn describe_options(&self) -> Vec<OptionDesc> {
         vec![
             OptionDesc { name: "base".into(),         type_name: "Path".into(), required: false, default: None,
-                description: "Base vectors (fvec). Required unless --synthetic.".into(),
+                description: "Base vectors (fvec). Required unless --use-synthetic.".into(),
                 extended_description: None,
                 role: OptionRole::Input },
             OptionDesc { name: "query".into(),        type_name: "Path".into(), required: false, default: None,
-                description: "Query vectors (fvec). Required unless --synthetic.".into(),
+                description: "Query vectors (fvec). Required unless --use-synthetic.".into(),
                 extended_description: None,
                 role: OptionRole::Input },
             OptionDesc { name: "neighbors".into(),    type_name: "int".into(),  required: false, default: Some("10".into()),
@@ -169,7 +169,7 @@ impl CommandOp for VerifyEngineParityOp {
                 description: "Max differing neighbors per query before the verdict flips to FAIL. Default 0 — any disagreement fails. See --help for the regimes where slack is justified.".into(),
                 extended_description: None,
                 role: OptionRole::Config },
-            OptionDesc { name: "synthetic".into(),    type_name: "bool".into(), required: false, default: Some("false".into()),
+            OptionDesc { name: "use-synthetic".into(),    type_name: "bool".into(), required: false, default: Some("false".into()),
                 description: "Generate a deterministic fixture instead of reading --base/--query".into(),
                 extended_description: None,
                 role: OptionRole::Config },
@@ -285,7 +285,7 @@ impl CommandOp for VerifyEngineParityOp {
         let metric = options.get("metric").unwrap_or("L2").to_string();
         let show_queries: usize = parse_int(options, "show-queries", 5);
         let boundary_tolerance: usize = parse_int(options, "boundary-tolerance", 0);
-        let synthetic = options.get("synthetic")
+        let synthetic = options.get("use-synthetic")
             .map(|s| matches!(s, "true" | "1" | "yes"))
             .unwrap_or(false);
 
@@ -729,7 +729,7 @@ fn run_sweep(options: &Options, ctx: &mut StreamContext, start: Instant) -> Comm
                     // `sweep` so the recursive call doesn't re-enter.
                     let mut cell_opts = options.clone();
                     cell_opts.set("sweep", "false");
-                    cell_opts.set("synthetic", "true");
+                    cell_opts.set("use-synthetic", "true");
                     cell_opts.set("dim", dim);
                     cell_opts.set("distribution", dist);
                     cell_opts.set("metric", metric);
@@ -1463,7 +1463,7 @@ mod tests {
         let mut ctx = make_ctx(tmp.path());
 
         let mut opts = Options::new();
-        opts.set("synthetic", "true");
+        opts.set("use-synthetic", "true");
         opts.set("dim", "8");
         opts.set("base-count", "100");
         opts.set("query-count", "10");
@@ -1521,7 +1521,7 @@ mod tests {
         let mut ctx = make_ctx(tmp.path());
 
         let mut opts = Options::new();
-        opts.set("synthetic", "true");
+        opts.set("use-synthetic", "true");
         opts.set("dim", "4");
         opts.set("base-count", "50");
         opts.set("query-count", "5");

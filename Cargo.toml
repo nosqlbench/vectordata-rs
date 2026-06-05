@@ -5,6 +5,7 @@ members = [
     "veks-core",
     "veks-pipeline",
     "veks-completion",
+    "veks-completion-derive",
     "veks",
     "vecd",
     "slabtastic",

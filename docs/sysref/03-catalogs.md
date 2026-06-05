@@ -20,9 +20,9 @@ the datasets under it.
 ### CLI management
 
 ```bash
-veks datasets config add-catalog https://example.com/datasets/
-veks datasets config list-catalogs
-veks datasets config remove-catalog 2
+veks datasets config catalog add https://example.com/datasets/
+veks datasets config catalog list
+veks datasets config catalog remove --index 2
 ```
 
 ### Programmatic access
@@ -126,7 +126,7 @@ error with paste-ready setup commands.
 Configure via the CLI:
 
 ```bash
-veks datasets config set-cache /mnt/fast-storage/vd-cache
+veks datasets config set cache /mnt/fast-storage/vd-cache
 ```
 
 Or manually in `~/.config/vectordata/settings.yaml`:

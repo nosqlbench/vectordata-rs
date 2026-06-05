@@ -102,8 +102,8 @@ protect_settings: true
 Or via the CLI:
 
 ```bash
-veks datasets config set-cache /mnt/fast-storage/vectordata-cache
-veks datasets config show
+veks datasets config set cache /mnt/fast-storage/vectordata-cache
+veks datasets config get
 ```
 
 Resolution order:

@@ -18,10 +18,9 @@ pub(crate) mod wizard;
 
 use std::path::PathBuf;
 
-use clap::{Args, Subcommand};
 
 /// Dataset preparation and pipeline management
-#[derive(Args)]
+#[derive(veks_completion_derive::VeksCli)]
 #[command(disable_help_subcommand = true)]
 pub struct PrepareArgs {
     #[command(subcommand)]
@@ -29,7 +28,7 @@ pub struct PrepareArgs {
 }
 
 /// Available subcommands under `veks prepare`.
-#[derive(Subcommand)]
+#[derive(veks_completion_derive::VeksCli)]
 pub enum PrepareCommand {
     /// Bootstrap a new dataset directory from source files
     Bootstrap {
@@ -46,7 +45,7 @@ pub enum PrepareCommand {
         name: Option<String>,
 
         /// Output directory for the new dataset (required unless --interactive)
-        #[arg(long, short = 'o')]
+        #[arg(long)]
         output: Option<PathBuf>,
 
         /// Path to base vectors (file or directory)
@@ -149,7 +148,7 @@ pub enum PrepareCommand {
         /// Start fresh — remove generated artifacts, dataset.yaml,
         /// variables.yaml, and .cache state, then re-bootstrap from
         /// initial conditions.
-        #[arg(long, short = 'r')]
+        #[arg(long)]
         reset: bool,
 
         /// Remove all generated artifacts (cache, profiles, pipeline outputs)
@@ -159,7 +158,7 @@ pub enum PrepareCommand {
 
         /// Recursively find and process all dataset.yaml files under the
         /// current directory. Applies --clean or --reset to each dataset found.
-        #[arg(long, short = 'R')]
+        #[arg(long)]
         recursive: bool,
 
         /// Fraction of base vectors to use. Use "%" suffix for percentages
@@ -253,7 +252,7 @@ pub enum PrepareCommand {
         /// Explicit source files to consider (repeatable). When provided,
         /// directory scanning is skipped and only these files are used
         /// for role detection.
-        #[arg(long = "source", value_hint = clap::ValueHint::FilePath)]
+        #[arg(long = "sources")]
         sources: Vec<PathBuf>,
     },
     /// Add sized profiles to an existing dataset for multi-scale benchmarking
@@ -333,7 +332,7 @@ pub enum PrepareCommand {
         root: PathBuf,
 
         /// Output path for the manifest file
-        #[arg(long, short = 'o', default_value = "inferred-manifest.yaml")]
+        #[arg(long, default_value = "inferred-manifest.yaml")]
         output: PathBuf,
     },
     /// Build a parallel dataset tree from loose files
@@ -380,7 +379,7 @@ pub enum PrepareCommand {
 }
 
 /// Subcommands under `veks prepare catalog`.
-#[derive(Subcommand)]
+#[derive(veks_completion_derive::VeksCli)]
 pub enum CatalogSubcommand {
     /// Generate catalog.json and catalog.yaml from dataset directories
     Generate {

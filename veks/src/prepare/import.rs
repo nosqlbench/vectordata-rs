@@ -553,7 +553,12 @@ fn resolve_slots(args: &ImportArgs) -> PipelineSlots {
     // separately, treat the inputs as independent (use Q as-is) per the
     // sysref §7.4.1 rule: a user-supplied "no shuffle" is never silently
     // overridden, and Q-provided is categorically not self-search.
-    let combined_bq = has_separate_query && !is_hdf5_source
+    // When a query set is provided, use it as-is. Self-search exists to carve
+    // the query set out of shuffled base vectors *exclusively* — when no query
+    // set was given. Combining provided B+Q into one source and re-deriving Q
+    // from base discards the user's queries, so only do it when the user
+    // explicitly opts in with `--self-search`.
+    let combined_bq = args.self_search && has_separate_query && !is_hdf5_source
         && !has_precomputed_gt && shuffle_enabled;
     let self_search = wants_queries && (!has_separate_query || combined_bq);
     let has_queries = has_separate_query || self_search;
@@ -2734,6 +2739,40 @@ pub fn run(mut args: ImportArgs) {
     // Resolve all slots
     let slots = resolve_slots(&args);
 
+    // Cardinality spot check: when the resolved pipeline derives the query set
+    // from the base vectors (`self_search` — including the combined B+Q
+    // shuffle-split, which carves both Q and B from base even when a query
+    // file was provided), the `extract-base` step takes `[query_count, base)`.
+    // So `query_count` must leave at least one base vector. We know both
+    // numbers here, before anything is written or any source file is renamed,
+    // so flag the unsatisfiable case now rather than failing mid-`veks run`.
+    if slots.self_search
+        && let Some(bv) = args.base_vectors.as_ref()
+        && let Some(mut base_n) = VecFormat::detect(bv)
+            .and_then(|fmt| veks_core::formats::reader::probe_source(bv, fmt).ok())
+            .and_then(|m| m.record_count)
+    {
+        // In combined B+Q mode the separate query file is folded into the base
+        // pool before the shuffle split, so the pool the queries are carved from
+        // is base + query, not base alone.
+        if slots.combined_bq
+            && let Some(qv) = args.query_vectors.as_ref()
+            && let Some(q_n) = VecFormat::detect(qv)
+                .and_then(|fmt| veks_core::formats::reader::probe_source(qv, fmt).ok())
+                .and_then(|m| m.record_count)
+        {
+            base_n += q_n;
+        }
+
+        if (args.query_count as u64) >= base_n {
+            eprintln!("Error: query-count ({}) leaves no base vectors.", args.query_count);
+            eprintln!("  This pipeline derives the query set from the {base_n} base vectors");
+            eprintln!("  (shuffle split), so query-count must be < {base_n}.");
+            eprintln!("  Lower --query-count, or use a larger base.");
+            std::process::exit(1);
+        }
+    }
+
     // Report what was resolved
     println!("Resolving pipeline slots:");
     print_slot("all_vectors", &slots.all_vectors);
@@ -3753,14 +3792,19 @@ mod tests {
 
         let slots = resolve_slots(&args);
 
-        // Strategy 1: combined B+Q → self_search with shuffle
-        assert!(slots.self_search, "combined B+Q should be self-search");
-        assert!(slots.combined_bq, "should be combined_bq");
-        assert!(slots.shuffle.is_some(), "should have shuffle");
-        assert!(slots.query_vectors.as_ref().unwrap().is_materialized(), "queries extracted from shuffle");
-        assert!(slots.base_vectors.is_materialized(), "base extracted from shuffle");
+        // B+Q both provided with no --self-search: the provided queries are
+        // used as-is, NOT re-derived from base. So this is not self-search and
+        // not a combined B+Q shuffle-split.
+        assert!(!slots.self_search, "B+Q provided must not auto-select self-search");
+        assert!(!slots.combined_bq, "B+Q provided must not auto-combine");
+        assert!(slots.shuffle.is_some(), "shuffle still reorders the base");
+        // Query is the provided file, used as-is (no extraction/carve).
+        assert!(!slots.query_vectors.as_ref().unwrap().is_materialized(), "provided queries used as-is");
+        // Base materializes only to apply dedup/shuffle over the full set — it
+        // is NOT carved into a query/base split.
+        assert!(slots.base_vectors.is_materialized(), "base reordered (dedup/shuffle)");
 
-        // Metadata: import materializes (parquet dir), extract materializes (shuffle reorders)
+        // Metadata import materializes (parquet dir).
         let meta = slots.metadata.as_ref().unwrap();
         assert!(meta.metadata_all.is_materialized());
 
@@ -3774,9 +3818,9 @@ mod tests {
         assert!(step_ids.contains(&"survey-metadata"), "steps: {:?}", step_ids);
         assert!(step_ids.contains(&"compute-knn"), "steps: {:?}", step_ids);
         assert!(step_ids.contains(&"compute-prefiltered-knn"), "steps: {:?}", step_ids);
-        // Strategy 1: shuffle and extract ARE present
+        // Shuffle + full-base extract present; queries are NOT carved from base.
         assert!(step_ids.contains(&"generate-shuffle"), "steps: {:?}", step_ids);
-        assert!(step_ids.contains(&"extract-queries"), "steps: {:?}", step_ids);
+        assert!(!step_ids.contains(&"extract-queries"), "provided queries must not be carved: {:?}", step_ids);
         assert!(step_ids.contains(&"extract-base"), "steps: {:?}", step_ids);
     }
 

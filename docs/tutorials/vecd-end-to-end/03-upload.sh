@@ -7,13 +7,20 @@ source "$(dirname "$0")/env.sh"
 
 TOKEN="$(cat "$DEMO/alice.token")"   # minted for alice in step 01
 
+say "authenticate to the endpoint with vectordata login"
+# `login` stores alice's token for this endpoint under $VECTORDATA_HOME, keyed
+# by origin. Reads and pushes to the endpoint then use it automatically — no
+# --token needed below. (`vectordata login <url> --user alice --password …`
+# does a password grant instead; here we already hold a minted token.)
+vectordata login "$(vecd_base)/" --token "$TOKEN"
+vectordata whoami "$(vecd_base)/"
+
 say "push the dataset to $(vecd_base)/datasets/toy/"
 # vectordata speaks vecd's object-REST protocol: a versioned PUT of every
 # facet file under the namespace, bearer-authenticated. The first push to an
-# empty namespace creates version 1.
+# empty namespace creates version 1. The stored login supplies the token.
 vectordata datasets push "$DEMO/work/toy" \
   --to "$(vecd_base)/datasets/toy/" \
-  --token "$TOKEN" \
   --yes
 
 say "generate a catalog that lists the dataset"

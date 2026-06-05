@@ -11,13 +11,10 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use clap::{Args, Parser, Subcommand};
-use clap_complete::Shell;
-
 use crate::model::{Level, Listable, VecdError};
 use crate::{admin, backup, config, db::Db, server};
 
-#[derive(Parser)]
+#[derive(veks_completion_derive::VeksCli)]
 #[command(
     name = "vecd",
     about = "vectordata endpoint daemon — an AAA gateway in front of object storage",
@@ -29,11 +26,26 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub data_dir: Option<PathBuf>,
 
+    /// Config directory to use (overrides `$VECD_CONFIG`; warns if both are
+    /// set). For a one-shot from a json/yaml file, see `--config-import`.
+    #[arg(long, global = true, value_name = "DIR")]
+    pub conf: Option<PathBuf>,
+
+    /// When a config exists in BOTH the current dir and your home config,
+    /// use the current-dir one (`./vecd.conf`).
+    #[arg(long, global = true, conflicts_with = "config_is_home")]
+    pub config_is_local: bool,
+
+    /// When a config exists in BOTH locations, use the home one
+    /// (`~/.config/vecd/vecd.conf`).
+    #[arg(long, global = true)]
+    pub config_is_home: bool,
+
     #[command(subcommand)]
     pub command: Cmd,
 }
 
-#[derive(Subcommand)]
+#[derive(veks_completion_derive::VeksCli)]
 pub enum Cmd {
     /// Create the DB + schema and mint the first superuser token.
     Init {
@@ -43,6 +55,48 @@ pub enum Cmd {
         /// Print only the token plaintext (for `$(…)` capture in scripts).
         #[arg(long)]
         quiet: bool,
+        /// Single-shot standup: seed the config from this json/yaml/dir before
+        /// creating the DB (allowed with no pre-existing config).
+        #[arg(long, value_name = "PATH")]
+        config_import: Option<PathBuf>,
+    },
+    /// Inspect and edit operator configuration (`vecd.conf`).
+    Config {
+        #[command(subcommand)]
+        command: ConfigCmd,
+    },
+    /// Authenticate to a vecd endpoint and store its token (in the config
+    /// dir's `credentials.json`); it's then used automatically for that
+    /// endpoint (e.g. `vecd whoami`).
+    Login {
+        /// Endpoint URL (its origin identifies the credential). Omit with `--list`.
+        url: Option<String>,
+        /// Store this token directly instead of logging in with a password.
+        #[arg(long)]
+        token: Option<String>,
+        /// User to authenticate as (with `--password`).
+        #[arg(long)]
+        user: Option<String>,
+        /// Password for `--user` (a password grant via `/auth/token`); else
+        /// `$VECD_PASSWORD`.
+        #[arg(long)]
+        password: Option<String>,
+        /// Requested token lifetime, e.g. `30d`.
+        #[arg(long)]
+        expires: Option<String>,
+        /// List endpoints with stored credentials and exit.
+        #[arg(long)]
+        list: bool,
+    },
+    /// Forget the stored token for an endpoint.
+    Logout {
+        /// Endpoint URL (defaults to the one you're logged in to).
+        url: Option<String>,
+    },
+    /// Show your effective access at an endpoint (uses the stored token).
+    Whoami {
+        /// Endpoint URL (defaults to the one you're logged in to).
+        url: Option<String>,
     },
     /// Run the gateway in the foreground (the workhorse `start` execs).
     Serve {
@@ -145,24 +199,53 @@ pub enum Cmd {
         #[command(subcommand)]
         command: CleanupCmd,
     },
-    /// Read the access log.
+    /// List live objects under a namespace (key + size), with a total.
+    Objects {
+        /// Namespace path, e.g. `datasets`.
+        ns: String,
+    },
+    /// List session-published versions of a namespace (newest first). Plain
+    /// `push` writes are lone objects (see `vecd objects`); versions appear
+    /// here only for transactional, session-based publication.
+    Versions {
+        /// Namespace path, e.g. `datasets/mydata`.
+        ns: String,
+    },
+    /// List role bindings (who has what access where).
+    Bindings {
+        /// Only bindings whose namespace path starts with this prefix.
+        #[arg(long)]
+        ns: Option<String>,
+    },
+    /// Read the access log (newest last), with optional filters.
     Log {
-        #[arg(long, default_value_t = 50)]
+        #[arg(long, default_value = "50")]
         tail: usize,
+        /// Only rows for this principal.
+        #[arg(long)]
+        principal: Option<String>,
+        /// Only rows with this HTTP status code (e.g. 403).
+        #[arg(long)]
+        status: Option<i64>,
+        /// Only rows for this action (HTTP method, e.g. GET, PUT).
+        #[arg(long)]
+        action: Option<String>,
     },
     /// Emit a sourceable shell snippet that activates dynamic completions:
     ///   eval "$(vecd completions)"
     Completions {
-        #[arg(long)]
-        shell: Option<Shell>,
+        #[arg(long, value_parser = ["bash", "zsh", "fish", "elvish", "powershell"])]
+        shell: Option<String>,
     },
 }
 
 /// Flags shared by `serve`, `start`, and `restart`.
-#[derive(Args, Clone)]
+#[derive(Clone, veks_completion_derive::VeksCli)]
 pub struct ServeArgs {
     /// Bind address (use `:0` for an ephemeral port). Falls back to the
-    /// `bind` key in `vecd.conf`, then to `0.0.0.0:8443`.
+    /// `bind` key in `vecd.conf`, then to the local-only default
+    /// `127.0.0.1:8443`. Bind a non-loopback address to expose vecd on the
+    /// network (configure TLS too, or vecd warns about cleartext).
     #[arg(long)]
     pub bind: Option<String>,
     /// TLS certificate (PEM). With `--tls-key`, serves HTTPS.
@@ -178,7 +261,7 @@ pub struct ServeArgs {
     #[arg(long, default_value = "1h")]
     pub backup_interval: String,
     /// Keep the newest N snapshots.
-    #[arg(long, default_value_t = 24)]
+    #[arg(long, default_value = "24")]
     pub backup_retain: usize,
     /// Per-connection (IP:port) **download** cap, e.g. `8MiB`. `0`/unset =
     /// unlimited. Falls back to `ratelimit_connection_download` in
@@ -200,7 +283,59 @@ pub struct ServeArgs {
     pub ratelimit_client_upload: Option<String>,
 }
 
-#[derive(Subcommand)]
+#[derive(veks_completion_derive::VeksCli)]
+pub enum ConfigCmd {
+    /// Write sensible defaults (local-only bind + data dir) and confirm.
+    Auto {
+        /// Don't prompt — write the defaults straight away (for scripts).
+        #[arg(long)]
+        yes: bool,
+        /// Overwrite an existing config (required once one is established).
+        #[arg(long)]
+        force: bool,
+    },
+    /// Read config — the whole config, one value, or to a file/format.
+    ///
+    ///   vecd config get                 # whole config (native) → stdout
+    ///   vecd config get bind            # one value → stdout
+    ///   vecd config get --format json   # whole config as JSON → stdout
+    ///   vecd config get --out cfg.yaml  # whole config → a .json/.yaml file or dir
+    Get {
+        /// A single config key; omit to read the whole config.
+        param: Option<String>,
+        /// Write the whole config to this path (`.json`/`.yaml` file, a
+        /// directory's `vecd.conf`, or `-` for stdout) instead of stdout.
+        #[arg(long, value_name = "PATH")]
+        out: Option<PathBuf>,
+        /// Stdout format for the whole config: `native` (default), `json`, or
+        /// `yaml`.
+        #[arg(long, value_name = "FMT")]
+        format: Option<String>,
+    },
+    /// Write config — set one value, or replace the whole config from a source.
+    ///
+    ///   vecd config set bind 0.0.0.0:8443    # one value
+    ///   vecd config set --from cfg.json      # replace from json/yaml/conf/dir
+    ///   vecd config get | vecd config set --from -   # round-trip via stdin
+    ///
+    /// Lock against edits with `vecd config set lock_config on`.
+    Set {
+        /// Config key (with `<value>`); omit when using `--from`.
+        param: Option<String>,
+        /// Value for `<key>`.
+        value: Option<String>,
+        /// Replace the whole config from this source: a `.json`/`.yaml`/`.conf`
+        /// file, a directory's `vecd.conf`, or `-` for native text on stdin.
+        #[arg(long, value_name = "PATH")]
+        from: Option<PathBuf>,
+        /// Required to change an already-set value, or to replace an existing
+        /// config.
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+#[derive(veks_completion_derive::VeksCli)]
 pub enum UsersCmd {
     Add {
         name: String,
@@ -221,7 +356,7 @@ pub enum UsersCmd {
     Remove { name: String },
 }
 
-#[derive(Subcommand)]
+#[derive(veks_completion_derive::VeksCli)]
 pub enum TokensCmd {
     Create {
         #[arg(long)]
@@ -242,6 +377,10 @@ pub enum TokensCmd {
         /// Print only the token plaintext (for `$(…)` capture in scripts).
         #[arg(long)]
         quiet: bool,
+        /// Print the token record as JSON ({token,user,id,expires_at,…}) —
+        /// readable back via `--token <file>` and `login --token <file>`.
+        #[arg(long, conflicts_with = "quiet")]
+        json: bool,
     },
     List {
         #[arg(long)]
@@ -250,7 +389,7 @@ pub enum TokensCmd {
     Revoke { id: i64 },
 }
 
-#[derive(Subcommand)]
+#[derive(veks_completion_derive::VeksCli)]
 pub enum RolesCmd {
     List,
     Add {
@@ -261,7 +400,7 @@ pub enum RolesCmd {
     Remove { name: String },
 }
 
-#[derive(Subcommand)]
+#[derive(veks_completion_derive::VeksCli)]
 pub enum BackendsCmd {
     Add {
         name: String,
@@ -289,7 +428,7 @@ pub enum BackendsCmd {
     Remove { name: String },
 }
 
-#[derive(Subcommand)]
+#[derive(veks_completion_derive::VeksCli)]
 pub enum NsCmd {
     Add {
         path: String,
@@ -327,7 +466,7 @@ pub enum NsCmd {
     Remove { path: String },
 }
 
-#[derive(Subcommand)]
+#[derive(veks_completion_derive::VeksCli)]
 pub enum PrivCmd {
     Grant {
         privilege: String,
@@ -341,7 +480,7 @@ pub enum PrivCmd {
     },
 }
 
-#[derive(Subcommand)]
+#[derive(veks_completion_derive::VeksCli)]
 pub enum ProfilesCmd {
     Add {
         name: String,
@@ -354,7 +493,7 @@ pub enum ProfilesCmd {
     Remove { name: String },
 }
 
-#[derive(Subcommand)]
+#[derive(veks_completion_derive::VeksCli)]
 pub enum CleanupCmd {
     /// List versions in stasis (expired, awaiting extend or purge).
     List,
@@ -368,7 +507,7 @@ pub enum CleanupCmd {
     Purge { target: String },
 }
 
-#[derive(Subcommand)]
+#[derive(veks_completion_derive::VeksCli)]
 pub enum BackupCmd {
     Now {
         /// Destination (file path or `s3://…`); defaults to config `db_backup`.
@@ -381,22 +520,53 @@ pub enum BackupCmd {
 
 /// Resolve the data dir: `--data-dir`, else config `data_dir`, else the
 /// default under the config dir.
-fn resolve_data_dir(flag: &Option<PathBuf>, cfg: &config::Config) -> PathBuf {
+fn resolve_data_dir(flag: &Option<PathBuf>, cfg: &config::Config, config_dir: &std::path::Path) -> PathBuf {
     if let Some(d) = flag {
         return d.clone();
     }
     if let Some(d) = cfg.get("data_dir") {
         return PathBuf::from(d);
     }
-    config::default_data_dir()
+    config_dir.join("data")
+}
+
+/// Every command except `config` and `completions` needs a configured base
+/// path, so they require a `vecd.conf` to exist. `init --config-import` is the
+/// single-shot exception — it bootstraps the config itself.
+fn requires_config(cmd: &Cmd) -> bool {
+    !matches!(
+        cmd,
+        Cmd::Config { .. }
+            | Cmd::Completions { .. }
+            | Cmd::Login { .. }
+            | Cmd::Logout { .. }
+            | Cmd::Whoami { .. }
+            | Cmd::Init { config_import: Some(_), .. }
+    )
 }
 
 /// Resolve the bind address: `--bind`, else config `bind`, else the default
-/// `0.0.0.0:8443`. Mirrors [`resolve_data_dir`]'s flag-over-config precedence.
+/// **loopback** `127.0.0.1:8443`. Mirrors [`resolve_data_dir`]'s
+/// flag-over-config precedence. The default is loopback so a bare
+/// `vecd start` is safe out of the box — reachable only from the local host;
+/// exposing it to the network is an explicit choice (set `bind` to a
+/// non-loopback address), and pairing that with TLS is checked by
+/// [`exposes_plaintext`].
 fn resolve_bind(flag: &Option<String>, cfg: &config::Config) -> String {
     flag.clone()
         .or_else(|| cfg.get("bind").map(|s| s.to_string()))
-        .unwrap_or_else(|| "0.0.0.0:8443".to_string())
+        .unwrap_or_else(|| "127.0.0.1:8443".to_string())
+}
+
+/// Whether binding `addr` without TLS would serve **plaintext beyond the
+/// local host** — i.e. a non-loopback address with no TLS configured. The
+/// operator is warned (not refused) in that case: terminating TLS at a
+/// reverse proxy in front of a plaintext vecd is a legitimate setup, so this
+/// can't be a hard error — but the bare "exposed plaintext on a public
+/// interface" mistake deserves a loud heads-up. Pure function so the policy
+/// is unit-tested without binding a socket.
+fn exposes_plaintext(addr: &SocketAddr, tls_configured: bool) -> bool {
+    !tls_configured && !addr.ip().is_loopback()
 }
 
 /// Resolve the four bandwidth caps with flag-over-config precedence (each
@@ -434,16 +604,70 @@ fn open_db(data_dir: &std::path::Path, cfg: &config::Config) -> Result<Db, VecdE
 
 /// Entry point. Returns a process exit code.
 pub fn run(cli: Cli) -> i32 {
-    let cfg = match config::Config::load(&config::config_dir()) {
+    let prefer = if cli.config_is_local {
+        Some(config::Prefer::Local)
+    } else if cli.config_is_home {
+        Some(config::Prefer::Home)
+    } else {
+        None
+    };
+    let resolved = match config::resolve(cli.conf.as_deref(), prefer) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("vecd: {e}");
+            return e.exit_code();
+        }
+    };
+
+    // Single-shot standup: seed the config from --config-import before anything
+    // reads it, so the rest of startup (data-dir resolution, the DB) sees it.
+    // This is for a *fresh* standup — it won't clobber an existing config.
+    if let Cmd::Init { config_import: Some(src), .. } = &cli.command {
+        if resolved.exists {
+            eprintln!(
+                "vecd: a config already exists at {} ({}); `init --config-import` is for fresh \
+                 standup. Use `vecd config set --from {} --force` then `vecd init`.",
+                resolved.dir.display(),
+                resolved.source.label(),
+                src.display()
+            );
+            return VecdError::usage("config already exists").exit_code();
+        }
+        match config::import_from(src).and_then(|c| c.write_to(&resolved.dir).map(|_| ())) {
+            Ok(()) => eprintln!(
+                "vecd: seeded config from {} → {}",
+                src.display(),
+                resolved.conf_path().display()
+            ),
+            Err(e) => {
+                eprintln!("vecd: {e}");
+                return e.exit_code();
+            }
+        }
+    }
+
+    // Gate: refuse to operate against an unconfigured base path.
+    if requires_config(&cli.command) && !resolved.exists {
+        eprintln!(
+            "vecd: not configured — no vecd.conf at {} (resolved via {}).\n\
+             Run `vecd config auto` to create one, or `vecd init --config-import <json|yaml|dir>` \
+             for a one-shot standup. (`vecd config …` and `vecd completions` don't need a config.)",
+            resolved.dir.display(),
+            resolved.source.label()
+        );
+        return VecdError::usage("not configured").exit_code();
+    }
+
+    let cfg = match config::Config::load(&resolved.dir) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("vecd: {e}");
             return e.exit_code();
         }
     };
-    let data_dir = resolve_data_dir(&cli.data_dir, &cfg);
+    let data_dir = resolve_data_dir(&cli.data_dir, &cfg, &resolved.dir);
 
-    let result = dispatch(cli.command, &data_dir, &cfg);
+    let result = dispatch(cli.command, &resolved, &data_dir, &cfg);
     match result {
         Ok(()) => 0,
         Err(e) => {
@@ -453,9 +677,23 @@ pub fn run(cli: Cli) -> i32 {
     }
 }
 
-fn dispatch(cmd: Cmd, data_dir: &std::path::Path, cfg: &config::Config) -> Result<(), VecdError> {
+fn dispatch(
+    cmd: Cmd,
+    resolved: &config::Resolved,
+    data_dir: &std::path::Path,
+    cfg: &config::Config,
+) -> Result<(), VecdError> {
     match cmd {
-        Cmd::Init { superuser, quiet } => cmd_init(data_dir, &superuser, quiet),
+        // config_import was already applied in `run`; just build the DB here.
+        Cmd::Init { superuser, quiet, config_import: _ } => {
+            cmd_init(resolved, data_dir, cfg, &superuser, quiet)
+        }
+        Cmd::Config { command } => cmd_config(resolved, command),
+        Cmd::Login { url, token, user, password, expires, list } => {
+            cmd_login(resolved, url, token, user, password, expires.as_deref(), list)
+        }
+        Cmd::Logout { url } => cmd_logout(resolved, resolve_endpoint(resolved, url)?.as_str()),
+        Cmd::Whoami { url } => cmd_client_whoami(resolved, resolve_endpoint(resolved, url)?.as_str()),
         Cmd::Serve { serve } => cmd_serve(data_dir, cfg, &serve),
         Cmd::Start { serve } => {
             let dd = data_dir.to_path_buf();
@@ -512,7 +750,12 @@ fn dispatch(cmd: Cmd, data_dir: &std::path::Path, cfg: &config::Config) -> Resul
             Ok(())
         }
         Cmd::Cleanup { command } => cmd_cleanup(data_dir, cfg, command),
-        Cmd::Log { tail } => cmd_log(data_dir, cfg, tail),
+        Cmd::Objects { ns } => cmd_objects(data_dir, cfg, &ns),
+        Cmd::Versions { ns } => cmd_versions(data_dir, cfg, &ns),
+        Cmd::Bindings { ns } => cmd_bindings(data_dir, cfg, ns.as_deref()),
+        Cmd::Log { tail, principal, status, action } => {
+            cmd_log(data_dir, cfg, tail, principal.as_deref(), status, action.as_deref())
+        }
         Cmd::Completions { shell } => {
             cmd_completions(shell);
             Ok(())
@@ -520,8 +763,16 @@ fn dispatch(cmd: Cmd, data_dir: &std::path::Path, cfg: &config::Config) -> Resul
     }
 }
 
-fn cmd_init(data_dir: &std::path::Path, superuser: &str, quiet: bool) -> Result<(), VecdError> {
-    config::write_starter(&config::config_dir())?;
+fn cmd_init(
+    resolved: &config::Resolved,
+    data_dir: &std::path::Path,
+    cfg: &config::Config,
+    superuser: &str,
+    quiet: bool,
+) -> Result<(), VecdError> {
+    // The config already exists by here (the gate requires it, and
+    // `--config-import` seeded it in `run`) — `config auto`/`import` own config
+    // creation now, so init only builds the DB.
     let db_path = config::db_path(data_dir);
     if db_path.exists() {
         return Err(VecdError::usage(format!(
@@ -532,15 +783,418 @@ fn cmd_init(data_dir: &std::path::Path, superuser: &str, quiet: bool) -> Result<
     let mut db = Db::init(&db_path)?;
     admin::add_user(&mut db, superuser, Level::Superuser, None, None)?;
     let tok = admin::create_token(&mut db, superuser, "vecd init superuser key", None, None)?;
+
+    // Auto-login: store the superuser token in the credential store, keyed by
+    // the local endpoint the configured bind implies — so the admin can use
+    // the client commands (`vecd whoami`, pushes, …) the moment `vecd start`
+    // is up, with no separate `vecd login`. The token is irrecoverable, so we
+    // point the user at the file that now holds it.
+    let endpoint = local_endpoint_url(cfg);
+    let origin = vectordata::credentials::origin_of_str(&endpoint).unwrap_or_else(|| endpoint.clone());
+    let mut store = crate::credentials::Store::load(&resolved.dir);
+    store.set(
+        origin.clone(),
+        crate::credentials::Entry {
+            token: tok.plaintext.clone(),
+            user: Some(superuser.to_string()),
+            expires: Some(tok.expires_at.to_string()),
+        },
+    );
+    store.save(&resolved.dir)?;
+    let cred_path = resolved.dir.join("credentials.json");
+
     if quiet {
         println!("{}", tok.plaintext);
+        eprintln!("superuser token stored in {}", cred_path.display());
         return Ok(());
     }
     println!("initialized vecd at {}", data_dir.display());
-    println!("superuser:  {superuser}");
-    println!("token:      {}", tok.plaintext);
-    println!("expires:    {}", admin::fmt_epoch(tok.expires_at));
-    println!("\nStore this token now — it is not recoverable.");
+    println!("superuser:   {superuser}");
+    println!("token:       {}", tok.plaintext);
+    println!("expires:     {}", admin::fmt_epoch(tok.expires_at));
+    println!("logged in:   {origin}  (used automatically by vecd/vectordata)");
+    println!("credentials: {}", cred_path.display());
+    println!("\nThat credentials file now holds the superuser token — the");
+    println!("irrecoverable admin key. Keep it safe (it is created mode 0600).");
+    Ok(())
+}
+
+/// The local client URL a freshly-`init`ed admin should use, derived from the
+/// configured bind: scheme from any TLS config, host from `bind` (wildcard
+/// addresses map to loopback so the URL is usable), and the configured port.
+fn local_endpoint_url(cfg: &config::Config) -> String {
+    let scheme = if cfg.get("tls_cert").is_some() && cfg.get("tls_key").is_some() {
+        "https"
+    } else {
+        "http"
+    };
+    let bind = resolve_bind(&None, cfg);
+    match bind.parse::<SocketAddr>() {
+        Ok(addr) => {
+            let host = if addr.ip().is_unspecified() {
+                if addr.is_ipv6() { "[::1]".to_string() } else { "127.0.0.1".to_string() }
+            } else if addr.is_ipv6() {
+                format!("[{}]", addr.ip())
+            } else {
+                addr.ip().to_string()
+            };
+            format!("{scheme}://{host}:{}/", addr.port())
+        }
+        Err(_) => format!("{scheme}://{bind}/"),
+    }
+}
+
+/// `vecd config …` — inspect and edit `vecd.conf` at the resolved location.
+fn cmd_config(resolved: &config::Resolved, cmd: ConfigCmd) -> Result<(), VecdError> {
+    match cmd {
+        ConfigCmd::Auto { yes, force } => cmd_config_auto(resolved, yes, force),
+        ConfigCmd::Get { param, out, format } => cmd_config_get(resolved, param, out, format),
+        ConfigCmd::Set { param, value, from, force } => {
+            cmd_config_set(resolved, param, value, from, force)
+        }
+    }
+}
+
+/// `vecd config get` — read the whole config or a single value, to stdout or a
+/// file/dir in the chosen format. Stdout output is clean (no decoration) so it
+/// round-trips: `vecd config get | vecd config set --from -`.
+fn cmd_config_get(
+    resolved: &config::Resolved,
+    param: Option<String>,
+    out: Option<PathBuf>,
+    format: Option<String>,
+) -> Result<(), VecdError> {
+    let cfg = config::Config::load(&resolved.dir)?;
+
+    // Single key → just its value.
+    if let Some(key) = param {
+        if out.is_some() || format.is_some() {
+            return Err(VecdError::usage(
+                "--out/--format apply to the whole config, not a single key".to_string(),
+            ));
+        }
+        let key = key.replace('-', "_");
+        return match cfg.get(&key) {
+            Some(v) => {
+                println!("{v}");
+                Ok(())
+            }
+            None => Err(VecdError::usage(format!("config '{key}' is not set"))),
+        };
+    }
+
+    // Whole config → a file/dir (by extension), or stdout in `format`.
+    if let Some(out) = out {
+        if format.is_some() {
+            return Err(VecdError::usage(
+                "pass --out (file/dir) or --format (stdout), not both".to_string(),
+            ));
+        }
+        config::export_to(&cfg, &out)?;
+        if out.as_os_str() != "-" {
+            eprintln!("wrote {}", out.display());
+        }
+        return Ok(());
+    }
+    let text = match format.as_deref() {
+        None | Some("native") => cfg.to_text(),
+        Some("json") => cfg.to_json(),
+        Some("yaml") | Some("yml") => cfg.to_yaml(),
+        Some(other) => {
+            return Err(VecdError::usage(format!(
+                "unknown --format '{other}' (expected native|json|yaml)"
+            )));
+        }
+    };
+    print!("{text}");
+    Ok(())
+}
+
+/// `vecd config set` — set one value, or replace the whole config from a
+/// source. Honors the lock and the `--force` change guard.
+fn cmd_config_set(
+    resolved: &config::Resolved,
+    param: Option<String>,
+    value: Option<String>,
+    from: Option<PathBuf>,
+    force: bool,
+) -> Result<(), VecdError> {
+    match (param, value, from) {
+        // Set one key.
+        (Some(param), Some(value), None) => {
+            let key = param.replace('-', "_"); // accept lock-config / ratelimit-… too
+            let mut cfg = config::Config::load(&resolved.dir)?;
+            // The one mutation allowed on a locked config is unlocking it.
+            let unlocking = key == "lock_config" && config::as_bool(&value) == Some(false);
+            guard_locked(&cfg, unlocking)?;
+            // Changing an already-set value (to something different) needs --force.
+            if let Some(cur) = cfg.get(&key)
+                && cur != value
+                && !force
+            {
+                return Err(VecdError::usage(format!(
+                    "config '{key}' is already set to '{cur}' — pass --force to change it to '{value}'."
+                )));
+            }
+            cfg.set(&key, &value)?;
+            let path = cfg.write_to(&resolved.dir)?;
+            println!("set {key} = {value}  → {}", path.display());
+            Ok(())
+        }
+        // Replace the whole config from a source.
+        (None, None, Some(from)) => {
+            let existing = config::Config::load(&resolved.dir)?;
+            guard_replace(&existing, resolved.exists, force)?;
+            let cfg = if from.as_os_str() == "-" {
+                let cfg = config::Config::parse(&read_file_or_stdin(None)?)?;
+                cfg.validate_all()?;
+                cfg
+            } else {
+                config::import_from(&from)?
+            };
+            let path = cfg.write_to(&resolved.dir)?;
+            println!("replaced config from {} → {}", from.display(), path.display());
+            Ok(())
+        }
+        _ => Err(VecdError::usage(
+            "usage: `vecd config set <key> <value>` to set one value, or \
+             `vecd config set --from <json|yaml|conf|dir|->` to replace the whole config"
+                .to_string(),
+        )),
+    }
+}
+
+/// Refuse a config change when `lock_config` is on — unless the change is the
+/// one act of unlocking it.
+fn guard_locked(existing: &config::Config, unlocking: bool) -> Result<(), VecdError> {
+    if existing.is_locked() && !unlocking {
+        return Err(VecdError::usage(
+            "config is locked (lock_config=on) — run `vecd config set lock_config off --force` \
+             to allow changes."
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Guard a whole-config replacement (`auto`/`load`/`import`): refuse on a
+/// locked config, and require `--force` to overwrite an existing one.
+fn guard_replace(existing: &config::Config, exists: bool, force: bool) -> Result<(), VecdError> {
+    guard_locked(existing, false)?;
+    if exists && !force {
+        return Err(VecdError::usage(
+            "a config already exists here — pass --force to replace it (`vecd config get` to view it)."
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// `vecd config auto` — propose safe defaults, confirm (unless `--yes`), write.
+fn cmd_config_auto(resolved: &config::Resolved, yes: bool, force: bool) -> Result<(), VecdError> {
+    let existing = config::Config::load(&resolved.dir)?;
+    guard_replace(&existing, resolved.exists, force)?;
+    let cfg = config::auto_defaults(&resolved.dir);
+    let path = resolved.conf_path();
+    println!("Proposed config for {} ({}):\n", path.display(), resolved.source.label());
+    print!("{}", cfg.to_text());
+    println!();
+    if resolved.exists {
+        println!("(a config already exists here and will be overwritten)");
+    }
+    if !yes && !confirm(&format!("Write this to {}?", path.display()))? {
+        println!("aborted — no changes written.");
+        return Ok(());
+    }
+    let written = cfg.write_to(&resolved.dir)?;
+    println!("wrote {written}", written = written.display());
+    println!("next: `vecd init` to create the DB and mint a superuser token.");
+    Ok(())
+}
+
+/// Prompt for a yes/no on stdin; defaults to no.
+fn confirm(prompt: &str) -> Result<bool, VecdError> {
+    use std::io::Write;
+    print!("{prompt} [y/N] ");
+    std::io::stdout().flush().ok();
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line).map_err(VecdError::Io)?;
+    Ok(matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes"))
+}
+
+/// Read native config text from a file, or stdin when the path is absent or `-`.
+fn read_file_or_stdin(file: Option<&std::path::Path>) -> Result<String, VecdError> {
+    match file {
+        Some(p) if p.as_os_str() != "-" => std::fs::read_to_string(p)
+            .map_err(|e| VecdError::usage(format!("reading {}: {e}", p.display()))),
+        _ => {
+            use std::io::Read;
+            let mut s = String::new();
+            std::io::stdin().read_to_string(&mut s).map_err(VecdError::Io)?;
+            Ok(s)
+        }
+    }
+}
+
+/// `vecd login <url>` — authenticate to a vecd endpoint and store its token in
+/// the config dir's `credentials.json`, keyed by origin. Either `--token`
+/// (store a token directly) or `--user` + `--password` (a password grant via
+/// the endpoint's `/auth/token`).
+#[allow(clippy::too_many_arguments)]
+fn cmd_login(
+    resolved: &config::Resolved,
+    url: Option<String>,
+    token: Option<String>,
+    user: Option<String>,
+    password: Option<String>,
+    expires: Option<&str>,
+    list: bool,
+) -> Result<(), VecdError> {
+    // `--list`: print every endpoint with a stored credential and exit.
+    if list {
+        let store = crate::credentials::Store::load(&resolved.dir);
+        let entries = store.list();
+        if entries.is_empty() {
+            println!("no stored credentials ({})", resolved.dir.join("credentials.json").display());
+        } else {
+            for (origin, e) in entries {
+                match &e.user {
+                    Some(u) => println!("{origin}  (user: {u})"),
+                    None => println!("{origin}"),
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    let url = url.ok_or_else(|| VecdError::usage("login needs a <url> (or --list)"))?;
+    let origin = vectordata::credentials::origin_of_str(&url)
+        .ok_or_else(|| VecdError::usage(format!("not a valid endpoint URL: {url}")))?;
+    let (token, user, expires_at) = match token {
+        Some(t) => {
+            // --token is a literal token or a file (JSON record / credential
+            // store / bare token); a store is keyed by origin, so pass the url.
+            let r = vectordata::credentials::resolve_token_arg(&t, Some(url.as_str()))
+                .map_err(VecdError::op)?;
+            // The token's user: from the JSON record, else --user, else ask the
+            // endpoint, so the stored credential is labeled with its user.
+            let user = r.user.or(user).or_else(|| whoami_user(&url, &r.token));
+            (r.token, user, r.expires)
+        }
+        None => {
+            let user = user.ok_or_else(|| {
+                VecdError::usage("login needs --token, or --user with --password")
+            })?;
+            let password = password
+                .or_else(|| std::env::var("VECD_PASSWORD").ok())
+                .ok_or_else(|| {
+                    VecdError::usage("login with --user needs --password or $VECD_PASSWORD")
+                })?;
+            let resp =
+                vectordata::endpoint::login_password(&url, &user, &password, Some("vecd login"), expires)
+                    .map_err(VecdError::op)?;
+            let exp = resp.expires_at.map(|e| e.to_string());
+            (resp.token, resp.user.or(Some(user)), exp)
+        }
+    };
+    let user_note = user.as_deref().map(|u| format!(" as {u}")).unwrap_or_default();
+    let mut store = crate::credentials::Store::load(&resolved.dir);
+    store.set(origin.clone(), crate::credentials::Entry { token, user, expires: expires_at });
+    store.save(&resolved.dir)?;
+    println!(
+        "logged in to {origin}{user_note} — token stored at {}",
+        resolved.dir.join("credentials.json").display()
+    );
+    Ok(())
+}
+
+/// Best-effort: ask the endpoint which user a token authenticates as, so a
+/// stored credential can be labeled. `None` on any error or anonymous access.
+fn whoami_user(url: &str, token: &str) -> Option<String> {
+    let v = vectordata::endpoint::whoami(url, Some(token)).ok()?;
+    if v.get("authenticated").and_then(|a| a.as_bool()) == Some(true) {
+        v.get("identity").and_then(|i| i.as_str()).map(String::from)
+    } else {
+        None
+    }
+}
+
+/// Resolve the endpoint a command acts on: the given `url`, else the sole
+/// stored credential's endpoint — so commands "just work" while logged in.
+/// Errors (asking for an explicit `<url>`) when none or several are stored.
+fn resolve_endpoint(resolved: &config::Resolved, url: Option<String>) -> Result<String, VecdError> {
+    if let Some(u) = url {
+        return Ok(u);
+    }
+    let store = crate::credentials::Store::load(&resolved.dir);
+    let entries = store.list();
+    if entries.is_empty() {
+        return Err(VecdError::usage(
+            "not logged in to any endpoint — give a <url>, or run `vecd login <url>` first".to_string(),
+        ));
+    }
+    if entries.len() > 1 {
+        let list = entries.iter().map(|(o, _)| o.as_str()).collect::<Vec<_>>().join(", ");
+        return Err(VecdError::usage(format!(
+            "logged in to several endpoints — specify one as <url>: {list}"
+        )));
+    }
+    Ok(entries[0].0.clone())
+}
+
+/// `vecd logout [url]` — forget the stored token for an endpoint's origin.
+fn cmd_logout(resolved: &config::Resolved, url: &str) -> Result<(), VecdError> {
+    let origin = vectordata::credentials::origin_of_str(url)
+        .ok_or_else(|| VecdError::usage(format!("not a valid endpoint URL: {url}")))?;
+    let mut store = crate::credentials::Store::load(&resolved.dir);
+    if store.remove(&origin) {
+        store.save(&resolved.dir)?;
+        println!("logged out of {origin}");
+    } else {
+        println!("no stored credential for {origin}");
+    }
+    Ok(())
+}
+
+/// `vecd whoami <url>` — show effective access at an endpoint, using the
+/// stored token automatically.
+fn cmd_client_whoami(resolved: &config::Resolved, url: &str) -> Result<(), VecdError> {
+    let origin = vectordata::credentials::origin_of_str(url)
+        .ok_or_else(|| VecdError::usage(format!("not a valid endpoint URL: {url}")))?;
+    let token = crate::credentials::stored_token(&resolved.dir, url);
+    let view = vectordata::endpoint::whoami(url, token.as_deref()).map_err(|e| {
+        if e == "not-a-vecd" {
+            VecdError::op(format!("{origin} is not a vecd endpoint"))
+        } else if token.is_none() {
+            VecdError::op(format!("{e} (no stored credential — try `vecd login {url}`)"))
+        } else {
+            VecdError::op(e)
+        }
+    })?;
+    println!("endpoint:  {origin}");
+    let identity = view.get("identity").and_then(|v| v.as_str()).unwrap_or("(anonymous)");
+    let level = view.get("level").and_then(|v| v.as_str()).unwrap_or("-");
+    let how = if token.is_some() { "stored token" } else { "anonymous (no stored token)" };
+    println!("identity:  {identity:<20} level: {level}   [{how}]");
+    if let Some(nss) = view.get("namespaces").and_then(|v| v.as_array())
+        && !nss.is_empty()
+    {
+        println!("namespaces:");
+        for ns in nss {
+            let path = ns.get("path").and_then(|v| v.as_str()).unwrap_or("?");
+            let actions: Vec<&str> = ns
+                .get("actions")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|x| x.as_str()).collect())
+                .unwrap_or_default();
+            println!("  {path:<28} {}", actions.join(","));
+        }
+    }
+    if let Some(hidden) = view.get("hidden").and_then(|v| v.as_u64())
+        && hidden > 0
+    {
+        println!("hidden from you: {hidden} namespace(s)");
+    }
     Ok(())
 }
 
@@ -549,11 +1203,30 @@ fn cmd_serve(data_dir: &std::path::Path, cfg: &config::Config, a: &ServeArgs) ->
     let addr: SocketAddr = bind
         .parse()
         .map_err(|e| VecdError::usage(format!("bad bind address '{bind}': {e}")))?;
-    let tls = match (a.tls_cert.clone(), a.tls_key.clone()) {
+    // TLS paths mirror the other settings: a flag wins, else the vecd.conf
+    // key (`tls_cert` / `tls_key`) — so a persistent secure deploy configures
+    // TLS once in the file instead of on every `restart`.
+    let tls_cert = a.tls_cert.clone().or_else(|| cfg.get("tls_cert").map(PathBuf::from));
+    let tls_key = a.tls_key.clone().or_else(|| cfg.get("tls_key").map(PathBuf::from));
+    let tls = match (tls_cert, tls_key) {
         (Some(cert), Some(key)) => Some(server::TlsConfig { cert, key }),
         (None, None) => None,
-        _ => return Err(VecdError::usage("--tls-cert and --tls-key must be given together")),
+        _ => return Err(VecdError::usage(
+            "TLS needs both cert and key — give --tls-cert and --tls-key together, \
+             or set both tls_cert and tls_key in vecd.conf",
+        )),
     };
+    if exposes_plaintext(&addr, tls.is_some()) {
+        let banner = format!(
+            "WARNING: vecd is binding {addr} (a non-loopback address) WITHOUT TLS.\n\
+             Traffic — including bearer tokens — will cross the network in cleartext.\n\
+             Use --tls-cert/--tls-key (or set tls_cert/tls_key in vecd.conf) for direct\n\
+             exposure, or terminate TLS at a reverse proxy in front of vecd. Bind to\n\
+             127.0.0.1 to keep vecd local-only."
+        );
+        log::warn!("{banner}");
+        eprintln!("\n\x1b[1;33m{banner}\x1b[0m\n");
+    }
     let db = open_db(data_dir, cfg)?;
     let limits = resolve_rate_limits(a, cfg)?;
     if !limits.is_unlimited() {
@@ -684,7 +1357,7 @@ fn cmd_users(data_dir: &std::path::Path, cfg: &config::Config, c: UsersCmd) -> R
 fn cmd_tokens(data_dir: &std::path::Path, cfg: &config::Config, c: TokensCmd) -> Result<(), VecdError> {
     let mut db = open_db(data_dir, cfg)?;
     match c {
-        TokensCmd::Create { user, description, expires, profile, from, sets, quiet } => {
+        TokensCmd::Create { user, description, expires, profile, from, sets, quiet, json } => {
             let profile_json = match (profile, from) {
                 (Some(_), Some(_)) => {
                     return Err(VecdError::usage("give either --profile or --from, not both"))
@@ -697,10 +1370,22 @@ fn cmd_tokens(data_dir: &std::path::Path, cfg: &config::Config, c: TokensCmd) ->
                 (None, None) => None,
             };
             let tok = admin::create_token(&mut db, &user, &description, expires.as_deref(), profile_json)?;
-            if quiet {
+            if json {
+                // A machine-readable token record — feed it to `--token <file>`
+                // / `login --token <file>` to use the token as its user.
+                let record = serde_json::json!({
+                    "token": tok.plaintext,
+                    "user": tok.user,
+                    "id": tok.id,
+                    "expires_at": tok.expires_at,
+                    "description": description,
+                });
+                println!("{}", serde_json::to_string_pretty(&record).map_err(|e| VecdError::op(e.to_string()))?);
+            } else if quiet {
                 println!("{}", tok.plaintext);
             } else {
                 println!("token:   {}", tok.plaintext);
+                println!("user:    {}", tok.user);
                 println!("id:      {}", tok.id);
                 println!("expires: {}", admin::fmt_epoch(tok.expires_at));
                 println!("\nStore this token now — it is not recoverable.");
@@ -968,13 +1653,127 @@ fn open_backend_for_ns(
     crate::backend::open(row)
 }
 
-fn cmd_log(data_dir: &std::path::Path, cfg: &config::Config, tail: usize) -> Result<(), VecdError> {
+/// `vecd objects <ns>` — the live objects under a namespace subtree (what a
+/// plain `push` writes), with sizes and a total. This is the "what's actually
+/// published here" view, distinct from session `versions`.
+fn cmd_objects(data_dir: &std::path::Path, cfg: &config::Config, ns: &str) -> Result<(), VecdError> {
     let db = open_db(data_dir, cfg)?;
     let mut stmt = db.conn().prepare(
-        "SELECT ts,principal,action,key,status,bytes,remote_addr FROM access_log ORDER BY id DESC LIMIT ?1",
+        "SELECT key, size, created FROM objects \
+         WHERE namespace_path=?1 OR namespace_path LIKE ?1||'/%' ORDER BY key",
     )?;
     let rows = stmt
-        .query_map([tail as i64], |r| {
+        .query_map([ns], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, Option<i64>>(2)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    if rows.is_empty() {
+        println!("no objects under '{ns}'");
+        return Ok(());
+    }
+    println!("{:>12}  {:<20}  key", "bytes", "created");
+    let mut total: i64 = 0;
+    for (key, size, created) in &rows {
+        total += *size;
+        println!(
+            "{:>12}  {:<20}  {}",
+            size,
+            created.map(admin::fmt_epoch).unwrap_or_else(|| "-".into()),
+            key,
+        );
+    }
+    println!("{} object(s), {total} bytes total", rows.len());
+    Ok(())
+}
+
+/// `vecd versions <ns>` — the session-published versions of a namespace,
+/// newest first.
+fn cmd_versions(data_dir: &std::path::Path, cfg: &config::Config, ns: &str) -> Result<(), VecdError> {
+    let db = open_db(data_dir, cfg)?;
+    let rows = crate::session::list_versions(&db, ns)?;
+    if rows.is_empty() {
+        println!("no session versions for '{ns}' (plain `push` writes show under `vecd objects {ns}`)");
+        return Ok(());
+    }
+    println!("{:>4}  {:<10} {:<10} {:<20} manifest", "seq", "state", "tag", "committed");
+    for v in rows {
+        let manifest = &v.manifest_hash[..v.manifest_hash.len().min(16)];
+        println!(
+            "{:>4}  {:<10} {:<10} {:<20} {}",
+            v.seq,
+            v.state,
+            if v.tag.is_empty() { "-".to_string() } else { v.tag },
+            v.committed_at.map(admin::fmt_epoch).unwrap_or_else(|| "-".into()),
+            manifest,
+        );
+    }
+    Ok(())
+}
+
+/// `vecd bindings [--ns <prefix>]` — every role binding, optionally filtered to
+/// a namespace prefix. Answers "who can do what, where" from the admin CLI
+/// instead of needing the introspection endpoint or raw DB access.
+fn cmd_bindings(
+    data_dir: &std::path::Path,
+    cfg: &config::Config,
+    ns_prefix: Option<&str>,
+) -> Result<(), VecdError> {
+    let db = open_db(data_dir, cfg)?;
+    let rows: Vec<_> = admin::list_bindings(&db)?
+        .into_iter()
+        .filter(|(_, _, nsp)| ns_prefix.is_none_or(|p| nsp.starts_with(p)))
+        .collect();
+    if rows.is_empty() {
+        match ns_prefix {
+            Some(p) => println!("no bindings under '{p}'"),
+            None => println!("no bindings"),
+        }
+        return Ok(());
+    }
+    println!("{:<20} {:<12} namespace", "principal", "role");
+    for (principal, role, nsp) in rows {
+        println!("{principal:<20} {role:<12} {nsp}");
+    }
+    Ok(())
+}
+
+fn cmd_log(
+    data_dir: &std::path::Path,
+    cfg: &config::Config,
+    tail: usize,
+    principal: Option<&str>,
+    status: Option<i64>,
+    action: Option<&str>,
+) -> Result<(), VecdError> {
+    let db = open_db(data_dir, cfg)?;
+    // Build the optional filter clause, keeping each predicate's positional
+    // placeholder (`?N`) in lockstep with its pushed param.
+    let mut clauses: Vec<String> = Vec::new();
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    if let Some(p) = principal {
+        params.push(Box::new(p.to_string()));
+        clauses.push(format!("principal=?{}", params.len()));
+    }
+    if let Some(s) = status {
+        params.push(Box::new(s));
+        clauses.push(format!("status=?{}", params.len()));
+    }
+    if let Some(a) = action {
+        params.push(Box::new(a.to_string()));
+        clauses.push(format!("action=?{}", params.len()));
+    }
+    let where_sql = if clauses.is_empty() { String::new() } else { format!("WHERE {}", clauses.join(" AND ")) };
+    params.push(Box::new(tail as i64));
+    let limit_idx = params.len();
+    let sql = format!(
+        "SELECT ts,principal,action,key,status,bytes,remote_addr FROM access_log \
+         {where_sql} ORDER BY id DESC LIMIT ?{limit_idx}"
+    );
+
+    let mut stmt = db.conn().prepare(&sql)?;
+    let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
+    let rows = stmt
+        .query_map(param_refs.as_slice(), |r| {
             Ok((
                 r.get::<_, i64>(0)?,
                 r.get::<_, Option<String>>(1)?,
@@ -1001,14 +1800,47 @@ fn cmd_log(data_dir: &std::path::Path, cfg: &config::Config, tail: usize) -> Res
     Ok(())
 }
 
-/// Print the completions activation snippet (mirrors `vectordata`).
-fn cmd_completions(shell: Option<Shell>) {
-    let shell = shell
-        .or_else(Shell::from_env)
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| "bash".to_string());
-    println!("COMPLETE={shell} vecd");
-    eprintln!("# To activate now:  eval \"$(vecd completions)\"");
+/// Emit a *dynamic* completion activation snippet (mirrors `vectordata`): one
+/// sourceable line that hands control back to the `CompleteEnv` wired in
+/// `main()` by re-invoking the binary with `COMPLETE=<shell>`. No frozen
+/// script — subcommands added later show up automatically. With no `--shell`,
+/// detect from `$SHELL`.
+fn cmd_completions(shell: Option<String>) {
+    let argv0 = std::env::args_os()
+        .next()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "vecd".to_string());
+    let name = match shell.or_else(detect_shell_from_env) {
+        Some(s) => s,
+        None => {
+            eprintln!("Could not auto-detect your shell from $SHELL.");
+            eprintln!("Pass --shell explicitly: bash | zsh | fish | elvish | powershell");
+            std::process::exit(1);
+        }
+    };
+    println!("# vecd tab-completion for {name} (dynamic — defers to the binary)");
+    println!("# To activate now:  eval \"$(vecd completions)\"");
+    println!("# To persist:       add the activation line to your shell rc file");
+    match name.as_str() {
+        "fish" => println!("COMPLETE=fish \"{argv0}\" | source"),
+        "elvish" => println!("eval (COMPLETE=elvish \"{argv0}\" | slurp)"),
+        "powershell" => {
+            println!(r#"(& {{ $env:COMPLETE="powershell"; "{argv0}" }}) | Invoke-Expression"#)
+        }
+        _ /* Bash / Zsh */ => println!("source <(COMPLETE={name} \"{argv0}\")"),
+    }
+}
+
+/// Best-effort shell name from `$SHELL` (the basename), or `None`.
+fn detect_shell_from_env() -> Option<String> {
+    let sh = std::env::var("SHELL").ok()?;
+    let base = std::path::Path::new(&sh).file_name()?.to_string_lossy().to_string();
+    match base.as_str() {
+        "bash" | "zsh" | "fish" | "elvish" | "powershell" | "pwsh" => Some(
+            if base == "pwsh" { "powershell".to_string() } else { base },
+        ),
+        _ => None,
+    }
 }
 
 fn parse_sets(sets: &[String]) -> Result<Vec<(String, String)>, VecdError> {
@@ -1054,7 +1886,41 @@ mod tests {
         );
         // No flag → fall back to vecd.conf's `bind`.
         assert_eq!(resolve_bind(&None, &with_bind), "10.0.0.1:9000");
-        // Neither set → the built-in default.
-        assert_eq!(resolve_bind(&None, &empty), "0.0.0.0:8443");
+        // Neither set → the built-in loopback default (safe out of the box).
+        assert_eq!(resolve_bind(&None, &empty), "127.0.0.1:8443");
+    }
+
+    #[test]
+    fn local_endpoint_url_from_bind() {
+        let url = |conf: &str| local_endpoint_url(&config::Config::parse(conf).unwrap());
+        // Loopback default (no config) stays loopback.
+        assert_eq!(local_endpoint_url(&config::Config::default()), "http://127.0.0.1:8443/");
+        // A fixed bind is used as-is.
+        assert_eq!(url("bind = 127.0.0.1:18443"), "http://127.0.0.1:18443/");
+        // Wildcard binds map to loopback for a usable client URL.
+        assert_eq!(url("bind = 0.0.0.0:8443"), "http://127.0.0.1:8443/");
+        // TLS config → https scheme.
+        assert_eq!(
+            url("bind = 10.0.0.5:9000\ntls_cert = /c.pem\ntls_key = /k.pem"),
+            "https://10.0.0.5:9000/"
+        );
+    }
+
+    #[test]
+    fn exposes_plaintext_policy() {
+        let loopback: SocketAddr = "127.0.0.1:8443".parse().unwrap();
+        let loopback6: SocketAddr = "[::1]:8443".parse().unwrap();
+        let any: SocketAddr = "0.0.0.0:8443".parse().unwrap();
+        let public: SocketAddr = "10.0.0.5:8443".parse().unwrap();
+
+        // Loopback is always fine, TLS or not.
+        assert!(!exposes_plaintext(&loopback, false));
+        assert!(!exposes_plaintext(&loopback6, false));
+        // Non-loopback without TLS is the cleartext-exposure case → warn.
+        assert!(exposes_plaintext(&any, false));
+        assert!(exposes_plaintext(&public, false));
+        // Non-loopback WITH TLS is fine (and so is loopback with TLS).
+        assert!(!exposes_plaintext(&any, true));
+        assert!(!exposes_plaintext(&public, true));
     }
 }

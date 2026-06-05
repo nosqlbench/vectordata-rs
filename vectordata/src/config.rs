@@ -33,7 +33,7 @@ use crate::settings::{self, SettingsWriteError, WriteCacheOutcome};
 // ─── show ────────────────────────────────────────────────────────────
 
 /// Print the active vectordata configuration. Mirrors the historical
-/// `veks datasets config show` output. Returns 0 unconditionally —
+/// `veks datasets config get` output. Returns 0 unconditionally —
 /// "no configuration" is informational, not an error.
 pub fn show() -> i32 {
     let settings_path = settings::settings_path();
@@ -48,10 +48,10 @@ pub fn show() -> i32 {
         println!();
         println!("First-run setup — three quick steps:");
         println!("  1. Pick a cache directory:");
-        println!("       vectordata config set-cache <path>");
-        println!("       (or `vectordata config set-cache auto` to choose the largest writable mount)");
+        println!("       vectordata config set cache <path>");
+        println!("       (or `vectordata config set cache auto` to choose the largest writable mount)");
         println!("  2. Subscribe to a catalog of published datasets:");
-        println!("       vectordata config add-catalog <URL-or-path>");
+        println!("       vectordata config catalog add <URL-or-path>");
         println!("  3. Browse what's available:");
         println!("       vectordata datasets       # TUI");
         println!("       vectordata datasets list  # text");
@@ -88,7 +88,7 @@ pub fn show() -> i32 {
         println!("  (no catalogs configured)");
         println!();
         println!("Add one to discover published datasets:");
-        println!("  vectordata config add-catalog <URL-or-path>");
+        println!("  vectordata config catalog add <URL-or-path>");
     }
     0
 }
@@ -217,7 +217,7 @@ pub fn list_mounts(show_all: bool) -> i32 {
         }
     } else {
         println!();
-        println!("To set the cache dir: vectordata config set-cache <path>");
+        println!("To set the cache dir: vectordata config set cache <path>");
     }
     0
 }
@@ -322,7 +322,7 @@ pub fn list_catalogs() -> i32 {
         println!("No catalog sources configured.");
         println!();
         println!("Add one with:");
-        println!("  vectordata config add-catalog <URL-or-path>");
+        println!("  vectordata config catalog add <URL-or-path>");
     } else {
         println!("Configured catalog sources ({}):", entries.len());
         for (i, e) in entries.iter().enumerate() {

@@ -30,12 +30,12 @@ Common starting points:
   • vectordata datasets          — TUI browser of every reachable dataset
   • vectordata datasets list     — text catalog listing
   • vectordata explore           — interactive value/distance explorer
-  • vectordata config show       — review the active configuration
+  • vectordata config get       — review the active configuration
   • vectordata cache list        — see what's on disk
 
 First-time users typically start by configuring a catalog source
-(vectordata config add-catalog <url-or-path>) and a cache directory
-(vectordata config set-cache <dir>).
+(vectordata config catalog add <url-or-path>) and a cache directory
+(vectordata config set cache <dir>).
 ```
 
 ### `vectordata --version` is now useful in bug reports
@@ -75,8 +75,8 @@ non-zero exits.
 | `vectordata explore --source /missing`                    | `1`    | `1`   |
 | `vectordata` (no subcommand)                              | `2`    | `2`   |
 | `vectordata bogus-subcommand`                             | `2`    | `2`   |
-| `vectordata config show`                                  | `0`    | `0`   |
-| `vectordata config get-cache` (configured)                | `0`    | `0`   |
+| `vectordata config get`                                  | `0`    | `0`   |
+| `vectordata config get cache` (configured)                | `0`    | `0`   |
 
 Where the "before" already matched the "after", the path is now also
 backed by a return-value chain instead of a deep `std::process::exit`,
@@ -118,20 +118,20 @@ or pass an explicit `--source`/`--dataset`.
 
 ### Better first-run onboarding
 
-`vectordata config show` on a fresh machine — no `settings.yaml`, no
+`vectordata config get` on a fresh machine — no `settings.yaml`, no
 `catalogs.yaml` — now walks you through setup:
 
 ```
-$ vectordata config show
+$ vectordata config get
 Configuration: /home/you/.config/vectordata/settings.yaml
   (settings file does not exist)
 
 First-run setup — three quick steps:
   1. Pick a cache directory:
-       vectordata config set-cache <path>
-       (or `vectordata config set-cache auto` to choose the largest writable mount)
+       vectordata config set cache <path>
+       (or `vectordata config set cache auto` to choose the largest writable mount)
   2. Subscribe to a catalog of published datasets:
-       vectordata config add-catalog <URL-or-path>
+       vectordata config catalog add <URL-or-path>
   3. Browse what's available:
        vectordata datasets       # TUI
        vectordata datasets list  # text
@@ -153,7 +153,7 @@ to a case-insensitive match or to lowercase `error:`.
 ### Stale `veks` references in help/error text
 
 A handful of error messages still pointed users at `veks datasets
-config add-catalog <URL>`. Since the explorer migrated into the
+config catalog add <URL>`. Since the explorer migrated into the
 `vectordata` binary, those references were both wrong (the explorer
 isn't owned by `veks` any more) and unactionable for users who only
 have `vectordata` installed. They now correctly say `vectordata config

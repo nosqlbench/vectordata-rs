@@ -15,10 +15,6 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use std::ffi::OsStr;
-
-use clap::{Arg, Command, ValueHint};
-use clap_complete::engine::{ArgValueCompleter, CompletionCandidate};
 use indexmap::IndexMap;
 
 use super::command::{Options, StreamContext};
@@ -74,186 +70,144 @@ pub fn pipeline_command_metadata() -> BTreeMap<String, CommandMetadata> {
     out
 }
 
-pub fn build_pipeline_command() -> Command {
+/// The full pipeline command tree as a [`veks_completion::CommandSpec`] — the
+/// clap-free replacement for [`build_pipeline_command`]. Commands are grouped by
+/// first word; a single-word command (empty subname) becomes the group node
+/// itself (matching the clap builder's `is_direct` behavior).
+pub fn pipeline_command_spec() -> veks_completion::CommandSpec {
+    use veks_completion::CommandSpec;
+
     let registry = CommandRegistry::with_builtins();
-    let paths = registry.command_paths();
-
-    // Group command paths by first word.
-    let mut groups: BTreeMap<String, Vec<(String, Vec<super::command::OptionDesc>, super::command::CommandDoc, Vec<super::command::ResourceDesc>, std::collections::HashMap<String, super::command::ValueCompletions>)>> =
-        BTreeMap::new();
-
-    for path in &paths {
+    let mut groups: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
+    for path in registry.command_paths() {
         let mut parts = path.splitn(2, ' ');
         let group = parts.next().unwrap().to_string();
         let subname = parts.next().unwrap_or("").to_string();
-
-        // Get option descriptions, documentation, and resource declarations from a fresh command instance.
-        let factory = registry.get(path).unwrap();
-        let cmd = factory();
-        let opts = cmd.describe_options();
-        let doc = cmd.command_doc();
-        let resources = cmd.describe_resources();
-        let value_completions = cmd.value_completions();
-
-        groups.entry(group).or_default().push((subname, opts, doc, resources, value_completions));
+        groups.entry(group).or_default().push((subname, path.to_string()));
     }
 
-    let mut pipeline_cmd = Command::new("pipeline")
-        .about("Execute a single pipeline command directly")
-        .subcommand_required(false)
-        .disable_help_subcommand(true);
-
-    for (group, commands) in groups {
-        let mut group_cmd = Command::new(group.clone())
-            .about(format!("{} commands", group))
-            .subcommand_required(true)
-            .arg_required_else_help(true)
-            .disable_help_subcommand(true);
-
-        for (subname, opts, doc, resources, value_completions) in commands {
-            // Single-word commands (e.g. "survey") have no subname — attach
-            // their options directly to the group command.
-            let is_direct = subname.is_empty();
-            let mut sub_cmd = if is_direct {
-                group_cmd.clone()
-                    .about(doc.summary.clone())
-                    .long_about(doc.body.clone())
-                    .subcommand_required(false)
-                    .arg_required_else_help(false)
+    let mut pipeline = CommandSpec::new("pipeline").about("Execute a single pipeline command directly");
+    for (group, cmds) in groups {
+        let mut group_spec = CommandSpec::new(&group).about(format!("{} commands", group));
+        group_spec.subcommand_required = true;
+        let mut direct: Option<CommandSpec> = None;
+        for (subname, path) in cmds {
+            let factory = registry.get(&path).unwrap();
+            let cmd = factory();
+            if subname.is_empty() {
+                // Single-word command: the group node *is* the command.
+                direct = Some(command_op_to_spec(&group, &*cmd));
             } else {
-                Command::new(subname)
-                    .about(doc.summary.clone())
-                    .long_about(doc.body.clone())
-            }
-                .arg(
-                    Arg::new("emit-yaml")
-                        .long("emit-yaml")
-                        .num_args(0)
-                        .help("Emit a YAML step block for dataset.yaml instead of executing"),
-                )
-                .arg(
-                    Arg::new("id")
-                        .long("id")
-                        .help("Step identifier for the YAML block"),
-                )
-                .arg(
-                    Arg::new("after")
-                        .long("after")
-                        .help("Comma-separated step IDs this step depends on"),
-                );
-
-            // Collect option names before consuming opts, for resource alias conflict check.
-            let opt_names: std::collections::HashSet<String> = opts.iter()
-                .map(|o| o.name.clone())
-                .collect();
-
-            for opt in opts {
-                // DOC-04a: Append type/default info to help text so it
-                // appears as a shell-rendered description at both
-                // --option-name and value positions, without injecting
-                // anything into the command line.
-                let help_text = build_option_help(&opt.description, &opt.type_name, opt.default.as_deref());
-
-                let mut arg = Arg::new(opt.name.clone())
-                    .long(opt.name.clone())
-                    .required(opt.required)
-                    .help(help_text);
-
-                if let Some(ext) = opt.extended_description.as_ref() {
-                    arg = arg.long_help(ext.clone());
-                }
-
-                if let Some(ref default) = opt.default {
-                    arg = arg.default_value(default.clone());
-                }
-
-                if opt.type_name == "Path" {
-                    arg = arg.value_hint(ValueHint::AnyPath);
-                    // Path options get combined file + variable completion.
-                    // Only one ArgValueCompleter can be attached per arg (last
-                    // wins), so we merge both into a single closure.
-                    arg = arg.add(ArgValueCompleter::new(|current: &OsStr| {
-                        let mut candidates = datafile_completer(current);
-                        candidates.extend(variable_completer(current));
-                        candidates
-                    }));
-                } else if let Some(vc) = value_completions.get(&opt.name).cloned() {
-                    // Enum-typed option with a declared value set.
-                    // For comma-separated lists, suggest only values
-                    // not already chosen so the user can chain
-                    // selections via repeated tab-completion.
-                    arg = arg.add(ArgValueCompleter::new(move |current: &OsStr| {
-                        enum_value_completer(current, &vc)
-                    }));
-                } else {
-                    // Non-path options get variable completion only.
-                    arg = arg.add(ArgValueCompleter::new(variable_completer));
-                }
-
-                sub_cmd = sub_cmd.arg(arg);
-            }
-
-            // Add --resources arg with completion candidates listing all resource
-            // types. Every command gets the full list so users can always
-            // discover what's available; commands that declare specific resources
-            // also get per-command help text noting which are applicable.
-            {
-                let help_text = if !resources.is_empty() {
-                    let resource_names: Vec<&str> = resources.iter()
-                        .map(|r| r.name.as_str())
-                        .collect();
-                    format!("Resource limits (applicable: {})", resource_names.join(", "))
-                } else {
-                    "Resource limits (this command declares no resource requirements)".to_string()
-                };
-
-                sub_cmd = sub_cmd.arg(
-                    Arg::new("resources")
-                        .long("resources")
-                        .help(help_text)
-                        .num_args(1)
-                        .add(ArgValueCompleter::new(resource_completer)),
-                );
-            }
-
-            // Add long-form resource aliases (e.g., --mem, --readahead) for each
-            // declared resource. Skip aliases that conflict with existing option names.
-            if !resources.is_empty() {
-                for res in &resources {
-                    if opt_names.contains(&res.name) {
-                        continue; // Skip — option already provides this flag
-                    }
-                    if let Some(rt) = ResourceType::from_name(&res.name) {
-                        sub_cmd = sub_cmd.arg(
-                            Arg::new(format!("resource-{}", res.name))
-                                .long(res.name.clone())
-                                .help(format!("{} (resource alias)", rt.description())),
-                        );
-                    }
-                }
-            }
-
-            // Add --governor strategy selection with value completions
-            sub_cmd = sub_cmd.arg(
-                Arg::new("governor")
-                    .long("governor")
-                    .default_value("maximize")
-                    .help("Governor strategy: maximize, conservative, fixed")
-                    .add(ArgValueCompleter::new(governor_completer)),
-            );
-
-            if is_direct {
-                // Single-word command: replace the group command entirely
-                group_cmd = sub_cmd;
-            } else {
-                group_cmd = group_cmd.subcommand(sub_cmd);
+                group_spec = group_spec.subcommand(command_op_to_spec(&subname, &*cmd));
             }
         }
+        pipeline = pipeline.subcommand(direct.unwrap_or(group_spec));
+    }
+    pipeline
+}
 
-        pipeline_cmd = pipeline_cmd.subcommand(group_cmd);
+/// Map a single pipeline command's options — the common ones plus its
+/// `describe_options()` — into a [`veks_completion::CommandSpec`]. Fixes the
+/// command's *shape* (flags, value options, required-ness, defaults, help) and
+/// attaches value completers (path → file completion, enum → declared value set,
+/// governor → its strategy set).
+pub fn command_op_to_spec(name: &str, cmd: &dyn super::command::CommandOp) -> veks_completion::CommandSpec {
+    use veks_completion::{CommandSpec, OptionDef, OptionSpec};
+
+    let doc = cmd.command_doc();
+    let value_completions = cmd.value_completions();
+    let mut spec = CommandSpec::new(name).about(doc.summary.clone());
+
+    // Common args injected onto every pipeline command (mirrors
+    // build_pipeline_command's emit-yaml / id / after).
+    spec = spec
+        .option(OptionSpec::new(OptionDef::flag("--emit-yaml")
+            .help("Emit a YAML step block for dataset.yaml instead of executing")))
+        .option(OptionSpec::new(OptionDef::value("--id")
+            .help("Step identifier for the YAML block")))
+        .option(OptionSpec::new(OptionDef::value("--after")
+            .help("Comma-separated step IDs this step depends on")));
+
+    // The command's declared options.
+    for opt in cmd.describe_options() {
+        spec = spec.option(optiondesc_to_spec(&opt, value_completions.get(&opt.name)));
     }
 
-    pipeline_cmd
+    // Trailing common args: --resources and --governor (default "maximize",
+    // completes to its strategy set).
+    let governor_vc = super::command::ValueCompletions::enum_values(&["maximize", "conservative", "fixed"]);
+    spec = spec
+        .option(OptionSpec::new(OptionDef::value("--resources").help("Resource limits")))
+        .option(OptionSpec::new(OptionDef::value("--governor")
+            .help("Governor strategy: maximize, conservative, fixed"))
+            .default("maximize")
+            .value_completion(enum_provider(governor_vc)));
+
+    spec
+}
+
+/// Map one `OptionDesc` to an `OptionSpec`: a `bool`/`flag` becomes a real
+/// flag; everything else a value option carrying required-ness, default, help
+/// (`build_option_help` reproduces the type/default suffix clap showed), and a
+/// value completer (`Path` → file paths, enum → its declared `value_completions`).
+fn optiondesc_to_spec(
+    opt: &super::command::OptionDesc,
+    vc: Option<&super::command::ValueCompletions>,
+) -> veks_completion::OptionSpec {
+    use veks_completion::{OptionDef, OptionSpec};
+    let dashed = format!("--{}", opt.name);
+    let help = build_option_help(&opt.description, &opt.type_name, opt.default.as_deref());
+    if matches!(opt.type_name.as_str(), "bool" | "flag") {
+        OptionSpec::new(OptionDef::flag(dashed).help(help))
+    } else {
+        let mut spec = OptionSpec::new(OptionDef::value(dashed).help(help)).required(opt.required);
+        if let Some(d) = &opt.default {
+            spec = spec.default(d.clone());
+        }
+        if opt.type_name == "Path" {
+            spec = spec.value_completion(veks_completion::providers::fs_paths_provider());
+        } else if let Some(vc) = vc {
+            spec = spec.value_completion(enum_provider(vc.clone()));
+        }
+        spec
+    }
+}
+
+/// Wrap a [`ValueCompletions`](super::command::ValueCompletions) closed set as a
+/// veks [`ValueProvider`](veks_completion::ValueProvider).
+fn enum_provider(vc: super::command::ValueCompletions) -> veks_completion::ValueProvider {
+    std::sync::Arc::new(move |partial: &str, _ctx: &[&str]| enum_complete(partial, &vc))
+}
+
+/// Plain-`String` closed-set completion (the veks-native counterpart of the
+/// clap_complete [`enum_value_completer`]). Handles comma-separated lists by
+/// dropping already-chosen values.
+fn enum_complete(partial: &str, vc: &super::command::ValueCompletions) -> Vec<String> {
+    if !vc.comma_separated {
+        let mut out: Vec<String> = vc
+            .values
+            .iter()
+            .filter(|v| partial.is_empty() || v.starts_with(partial))
+            .cloned()
+            .collect();
+        out.sort();
+        return out;
+    }
+    let (already, rest) = match partial.rfind(',') {
+        Some(i) => (&partial[..=i], &partial[i + 1..]),
+        None => ("", partial),
+    };
+    let chosen: std::collections::HashSet<&str> =
+        already.split(',').map(|t| t.trim()).filter(|t| !t.is_empty()).collect();
+    let mut out: Vec<String> = vc
+        .values
+        .iter()
+        .filter(|v| !chosen.contains(v.as_str()))
+        .filter(|v| rest.is_empty() || v.starts_with(rest))
+        .map(|v| format!("{}{}", already, v))
+        .collect();
+    out.sort();
+    out
 }
 
 /// Print pipeline help — either all commands or a specific group.
@@ -311,344 +265,6 @@ fn print_pipeline_help(registry: &CommandRegistry, group: Option<&str>) {
     }
 }
 
-/// Completion candidates for an enum-typed option.
-///
-/// Two shapes:
-/// - **Single-value** (`vc.comma_separated == false`): returns the
-///   declared values whose name starts with the current prefix.
-/// - **Comma-separated list** (`vc.comma_separated == true`): parses
-///   `current` as `<already>,<partial>` where `<already>` is a
-///   trailing-comma-or-empty prefix the user has already typed and
-///   `<partial>` is the in-progress segment. Returns candidates of
-///   the form `<already><value>` for every declared value that:
-///     - is not already present in `<already>`, AND
-///     - starts with `<partial>`.
-///   This lets the user chain selections via repeated tab presses
-///   (`--engines metal,<TAB>` → suggests stdarch/blas/blas-mirror/faiss).
-pub fn enum_value_completer(
-    current: &OsStr,
-    vc: &super::command::ValueCompletions,
-) -> Vec<CompletionCandidate> {
-    let s = current.to_string_lossy();
-
-    if !vc.comma_separated {
-        let mut matches: Vec<&String> = vc.values.iter()
-            .filter(|v| s.is_empty() || v.starts_with(&*s))
-            .collect();
-        matches.sort();
-        return matches.into_iter()
-            .map(|v| CompletionCandidate::new(v.as_str()))
-            .collect();
-    }
-
-    // Comma-separated path: split into "<already_chosen>,<partial>".
-    let (already, partial) = match s.rfind(',') {
-        Some(i) => (&s[..=i], &s[i + 1..]), // include the trailing comma in `already`
-        None    => ("", s.as_ref()),
-    };
-    let chosen: std::collections::HashSet<&str> = already
-        .split(',')
-        .map(|t| t.trim())
-        .filter(|t| !t.is_empty())
-        .collect();
-
-    let mut matches: Vec<&String> = vc.values.iter()
-        .filter(|v| !chosen.contains(v.as_str()))
-        .filter(|v| partial.is_empty() || v.starts_with(partial))
-        .collect();
-    matches.sort();
-    matches.into_iter()
-        .map(|v| CompletionCandidate::new(format!("{}{}", already, v)))
-        .collect()
-}
-
-/// Completion candidates for `--provenance`: presets when the input has
-/// no comma, individual provenance components when it does.
-///
-/// Up front the user gets the three named presets (`strict`,
-/// `version-aware`, `config-only`) plus the `all` / `config` aliases.
-/// Once they type a comma, they are clearly building a custom selector,
-/// so we switch to suggesting bare component names and exclude any
-/// already chosen earlier in the list.
-pub fn provenance_completer(current: &OsStr) -> Vec<CompletionCandidate> {
-    const PRESETS: &[&str] = &[
-        "strict",
-        "version-aware",
-        "config-only",
-        "all",
-        "config",
-    ];
-    const COMPONENTS: &[&str] = &[
-        "step_id",
-        "command_path",
-        "version_major",
-        "version_minor",
-        "version_patch",
-        "git_hash",
-        "dirty",
-        "options",
-        "upstream",
-    ];
-
-    let s = current.to_string_lossy();
-
-    if !s.contains(',') {
-        let lower = s.to_lowercase();
-        let mut out: Vec<CompletionCandidate> = PRESETS
-            .iter()
-            .filter(|v| lower.is_empty() || v.starts_with(&*lower))
-            .map(|v| CompletionCandidate::new(*v))
-            .collect();
-        // Also offer single components so users can start a list directly.
-        for v in COMPONENTS {
-            if lower.is_empty() || v.starts_with(&*lower) {
-                out.push(CompletionCandidate::new(*v));
-            }
-        }
-        return out;
-    }
-
-    let (already, partial) = match s.rfind(',') {
-        Some(i) => (&s[..=i], &s[i + 1..]),
-        None => ("", s.as_ref()),
-    };
-    let chosen: std::collections::HashSet<&str> = already
-        .split(',')
-        .map(|t| t.trim())
-        .filter(|t| !t.is_empty())
-        .collect();
-    let partial_lower = partial.to_lowercase();
-    COMPONENTS
-        .iter()
-        .filter(|v| !chosen.contains(**v))
-        .filter(|v| partial_lower.is_empty() || v.starts_with(&*partial_lower))
-        .map(|v| CompletionCandidate::new(format!("{}{}", already, v)))
-        .collect()
-}
-
-/// Completion candidates for `--governor`: lists strategy names with descriptions.
-pub fn governor_completer(current: &OsStr) -> Vec<CompletionCandidate> {
-    let prefix = current.to_string_lossy().to_lowercase();
-    ["maximize", "conservative", "fixed"]
-        .iter()
-        .filter(|v| prefix.is_empty() || v.starts_with(&*prefix))
-        .map(|v| CompletionCandidate::new(*v))
-        .collect()
-}
-
-/// Recognized data file extensions for pipeline Path-type options.
-///
-/// Covers the singular and plural canonical forms of every xvec / vvec /
-/// scalar format known to [`veks_core::formats::VecFormat`], plus the
-/// container/metadata extensions (`slab`, `npy`, `parquet`, `json`,
-/// `yaml`). Plural xvec extensions (`fvecs`, `mvecs`, …) are written by
-/// current bootstraps and must be tab-completed alongside the singular
-/// legacy forms.
-const DATA_EXTENSIONS: &[&str] = &[
-    // Uniform xvec (singular + plural canonical + explicit-width aliases)
-    "fvec", "fvecs", "f32vec", "f32vecs",
-    "dvec", "dvecs", "f64vec", "f64vecs",
-    "mvec", "mvecs", "f16vec", "f16vecs",
-    "bvec", "bvecs", "u8vec", "u8vecs",
-    "i8vec", "i8vecs",
-    "svec", "svecs", "i16vec", "i16vecs",
-    "u16vec", "u16vecs",
-    "ivec", "ivecs", "i32vec", "i32vecs",
-    "u32vec", "u32vecs",
-    "i64vec", "i64vecs",
-    "u64vec", "u64vecs",
-    // Variable-length vvec (singular + plural canonical + explicit-width)
-    "fvvec", "fvvecs", "f32vvec", "f32vvecs",
-    "dvvec", "dvvecs", "f64vvec", "f64vvecs",
-    "mvvec", "mvvecs", "f16vvec", "f16vvecs",
-    "bvvec", "bvvecs", "u8vvec", "u8vvecs",
-    "i8vvec", "i8vvecs",
-    "svvec", "svvecs", "i16vvec", "i16vvecs",
-    "u16vvec", "u16vvecs",
-    "ivvec", "ivvecs", "i32vvec", "i32vvecs",
-    "u32vvec", "u32vvecs",
-    "i64vvec", "i64vvecs",
-    "u64vvec", "u64vvecs",
-    // Scalar (flat packed)
-    "u8", "i8", "u16", "i16", "u32", "i32", "u64", "i64",
-    // Container / metadata
-    "slab", "npy", "parquet", "hdf5", "h5", "json", "yaml",
-];
-
-/// Completion candidates for Path-type options: lists files in the current
-/// directory (recursively one level) whose extension matches a recognized
-/// data format.
-///
-/// When the user types a partial value, only files whose name starts with
-/// that prefix are returned. Directories that contain at least one matching
-/// file are also suggested (with a trailing `/`) so the user can drill down.
-pub fn datafile_completer(current: &OsStr) -> Vec<CompletionCandidate> {
-    let partial = current.to_string_lossy();
-
-    // Split into directory prefix and filename prefix.
-    // e.g. "data/tes" -> dir="data/", file_prefix="tes"
-    //       "tes"      -> dir=".",    file_prefix="tes"
-    let (dir_str, file_prefix) = match partial.rfind('/') {
-        Some(pos) => (&partial[..=pos], &partial[pos + 1..]),
-        None => ("", partial.as_ref()),
-    };
-    let search_dir = if dir_str.is_empty() {
-        std::env::current_dir().unwrap_or_default()
-    } else {
-        std::path::PathBuf::from(dir_str)
-    };
-
-    let entries = match std::fs::read_dir(&search_dir) {
-        Ok(rd) => rd,
-        Err(_) => return vec![],
-    };
-
-    let mut candidates = Vec::new();
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-
-        // Filter by the typed filename prefix.
-        if !file_prefix.is_empty() && !name_str.starts_with(file_prefix) {
-            continue;
-        }
-
-        let path = entry.path();
-        if path.is_dir() {
-            // Suggest directories so the user can navigate deeper.
-            let display = format!("{}{}/", dir_str, name_str);
-            candidates.push(CompletionCandidate::new(display)
-                .help(Some("directory".into())));
-        } else if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-            // Check direct extension match, or for .gz files check the
-            // inner extension (e.g. "foo.ivec.gz" → inner ext "ivec").
-            let is_data = if DATA_EXTENSIONS.iter().any(|de| de.eq_ignore_ascii_case(ext)) {
-                true
-            } else if ext.eq_ignore_ascii_case("gz") {
-                // Check inner extension: strip .gz and look at what's underneath
-                std::path::Path::new(path.file_stem().unwrap_or_default())
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .map(|inner| DATA_EXTENSIONS.iter().any(|de| de.eq_ignore_ascii_case(inner)))
-                    .unwrap_or(false)
-            } else {
-                false
-            };
-            if is_data {
-                let display = format!("{}{}", dir_str, name_str);
-                let help = format!(".{} file", ext);
-                candidates.push(CompletionCandidate::new(display)
-                    .help(Some(help.into())));
-            }
-        }
-    }
-
-    candidates.sort_by(|a, b| a.get_value().cmp(b.get_value()));
-    candidates
-}
-
-/// Context-sensitive completer for `--resources` values.
-///
-/// Handles the `name:value,name:value,...` syntax:
-///
-/// - Empty or after a comma: suggests all resource type names not yet used
-/// - After `name:`: shows the value format help for that resource type
-/// - After `name:value,`: suggests remaining resource types
-pub fn resource_completer(current: &OsStr) -> Vec<CompletionCandidate> {
-    let full = current.to_string_lossy();
-
-    // Split at the last comma to isolate the segment being typed.
-    let (prefix, segment) = match full.rfind(',') {
-        Some(pos) => (&full[..=pos], &full[pos + 1..]),
-        None => ("", full.as_ref()),
-    };
-
-    // If the segment contains a colon, the user is typing a freeform value.
-    // Return multiple comment candidates so bash displays them as a list
-    // (avoiding auto-insertion) and the user sees the format help.
-    if let Some((name, _partial)) = segment.split_once(':') {
-        if let Some(rt) = ResourceType::from_name(name) {
-            let (hint, example) = match rt.value_kind() {
-                super::resource::ValueKind::Memory => (
-                    "Accepts: absolute (4GiB), percent (25%), or range (1GiB-4GiB, 25%-50%)",
-                    format!("{}4GiB", full),
-                ),
-                super::resource::ValueKind::Count => (
-                    "Accepts: integer (8) or range (4-16)",
-                    format!("{}8", full),
-                ),
-            };
-            return vec![
-                CompletionCandidate::new(format!("# {}: {}", rt.name(), rt.description())),
-                CompletionCandidate::new(format!("# {}", hint)),
-                CompletionCandidate::new(example),
-            ];
-        }
-        return vec![];
-    }
-
-    // Collect resource names already present before the current segment.
-    let used: std::collections::HashSet<&str> = full
-        .split(',')
-        .filter_map(|s| {
-            let name = s.split(':').next().unwrap_or("");
-            if !name.is_empty() && name != segment { Some(name) } else { None }
-        })
-        .collect();
-
-    // Suggest resource types not yet used, filtered by the typed prefix.
-    ResourceType::all()
-        .iter()
-        .filter(|rt| !used.contains(rt.name()))
-        .filter(|rt| rt.name().starts_with(segment))
-        .map(|rt| {
-            CompletionCandidate::new(format!("{}{}:", prefix, rt.name()))
-                .help(Some(rt.description().into()))
-        })
-        .collect()
-}
-
-/// Context-sensitive completer for option values that may reference pipeline
-/// variables. Suggests `'${variables:name}'` candidates from `variables.yaml`
-/// in the current working directory (or `--workspace` if set).
-///
-/// The suggestions are single-quoted so shells pass them through verbatim.
-pub fn variable_completer(current: &OsStr) -> Vec<CompletionCandidate> {
-    let partial = current.to_string_lossy();
-
-    // Only trigger when the user has started typing a variable reference
-    // or the value is empty (show all available variables as hints).
-    let workspace = std::env::current_dir().unwrap_or_default();
-    let vars = match super::variables::load(&workspace) {
-        Ok(v) => v,
-        Err(_) => return vec![],
-    };
-    if vars.is_empty() {
-        return vec![];
-    }
-
-    // Only suggest variables when the user has started typing a variable
-    // reference. Otherwise return empty so bash falls back to filesystem
-    // completion via -o bashdefault.
-    let filter = if let Some(rest) = partial.strip_prefix("'${variables:") {
-        rest.trim_end_matches(['\'', '}'].as_ref())
-    } else if let Some(rest) = partial.strip_prefix("${variables:") {
-        rest.trim_end_matches('}')
-    } else if partial.starts_with('$') || partial.starts_with("'$") {
-        // Starting a variable reference but hasn't typed the full prefix yet
-        ""
-    } else {
-        return vec![];
-    };
-
-    vars.iter()
-        .filter(|(name, _)| filter.is_empty() || name.starts_with(filter))
-        .map(|(name, value)| {
-            CompletionCandidate::new(format!("'${{variables:{}}}'", name))
-                .help(Some(format!("= {}", value).into()))
-        })
-        .collect()
-}
 
 /// Build the help string for an option arg (DOC-04a).
 ///
@@ -694,11 +310,9 @@ pub fn run_direct(args: Vec<String>) {
         && registry.command_paths().iter().any(|p| p.starts_with(&format!("{} ", group)));
 
     if is_help_request || is_bare_group {
-        let pipeline_cmd = build_pipeline_command();
-        if let Some(group_cmd) = pipeline_cmd.get_subcommands().find(|c| c.get_name() == group.as_str()) {
-            let mut group_cmd = group_cmd.clone();
-            group_cmd.print_help().ok();
-            println!();
+        let spec = pipeline_command_spec();
+        if let Some(group_spec) = spec.subcommands.iter().find(|c| c.name == group.as_str()) {
+            print!("{}", veks_completion::cli::render_help(group_spec));
         } else {
             print_pipeline_help(&registry, Some(group));
         }
@@ -727,31 +341,27 @@ pub fn run_direct(args: Vec<String>) {
         }
     };
 
-    // Check for --help anywhere in args before parsing. Show the clap-generated
-    // help which lists all --option flags the command accepts.
+    // Check for --help anywhere in args before parsing. Render the command's
+    // spec help (lists all --option flags it accepts).
     if option_args.iter().any(|a| a == "--help" || a == "-h") {
-        let pipeline_cmd = build_pipeline_command();
-        // For single-word commands the options are on the group command itself;
+        let spec = pipeline_command_spec();
+        // For single-word commands the options are on the group node itself;
         // for two-word commands navigate to the nested subcommand.
         let parts: Vec<&str> = command_path.splitn(2, ' ').collect();
-        if let Some(group_cmd) = pipeline_cmd.get_subcommands().find(|c| c.get_name() == parts[0]) {
-            if parts.len() == 1 {
-                // Single-word command: group IS the command
-                let mut cmd = group_cmd.clone();
-                cmd.print_help().ok();
-                println!();
-                std::process::exit(0);
-            } else if let Some(sub_cmd) = group_cmd.get_subcommands().find(|c| c.get_name() == parts[1]) {
-                let mut sub_cmd = sub_cmd.clone();
-                sub_cmd.print_help().ok();
-                println!();
+        if let Some(group_spec) = spec.subcommands.iter().find(|c| c.name == parts[0]) {
+            let target = if parts.len() == 1 {
+                Some(group_spec)
+            } else {
+                group_spec.subcommands.iter().find(|c| c.name == parts[1])
+            };
+            if let Some(cmd_spec) = target {
+                print!("{}", veks_completion::cli::render_help(cmd_spec));
                 std::process::exit(0);
             }
         }
-        // Fallback to doc body if clap tree doesn't match
+        // Fallback to doc body if the spec tree doesn't match.
         let cmd = factory();
-        let doc = cmd.command_doc();
-        println!("{}", doc.body);
+        println!("{}", cmd.command_doc().body);
         std::process::exit(0);
     }
 
@@ -1048,66 +658,41 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_build_pipeline_command_has_all_commands() {
-        let cmd = build_pipeline_command();
+    fn test_pipeline_command_spec_has_all_commands() {
+        let spec = pipeline_command_spec();
         let registry = CommandRegistry::with_builtins();
-        let paths = registry.command_paths();
 
-        // Every registered command should be reachable as a subcommand.
-        for path in &paths {
+        // Every registered command should be reachable in the spec.
+        for path in registry.command_paths() {
             let mut parts = path.splitn(2, ' ');
             let group = parts.next().unwrap();
             let subname = parts.next().unwrap_or("");
 
-            let group_cmd = cmd
-                .get_subcommands()
-                .find(|c| c.get_name() == group);
-            assert!(
-                group_cmd.is_some(),
-                "Missing group subcommand: '{}'",
-                group
-            );
+            let group_spec = spec.subcommands.iter().find(|c| c.name == group);
+            assert!(group_spec.is_some(), "Missing group: '{}'", group);
 
             if subname.is_empty() {
-                // Single-word command (e.g. "barrier", "survey", "import"):
-                // the group command itself IS the command — no subcommand needed.
+                // Single-word command: the group node IS the command.
                 continue;
             }
-
-            let sub_cmd = group_cmd
-                .unwrap()
-                .get_subcommands()
-                .find(|c| c.get_name() == subname);
-            assert!(
-                sub_cmd.is_some(),
-                "Missing subcommand: '{}' under group '{}'",
-                subname, group
-            );
+            let sub = group_spec.unwrap().subcommands.iter().find(|c| c.name == subname);
+            assert!(sub.is_some(), "Missing subcommand '{}' under group '{}'", subname, group);
         }
     }
 
     #[test]
-    fn test_build_pipeline_command_has_args_from_describe_options() {
-        let cmd = build_pipeline_command();
+    fn test_pipeline_spec_has_args_from_describe_options() {
+        let spec = pipeline_command_spec();
         let registry = CommandRegistry::with_builtins();
+        let expected_opts = registry.get("analyze stats").unwrap()().describe_options();
 
-        // Spot-check a few commands for their expected args.
-        let factory = registry.get("analyze stats").unwrap();
-        let expected_opts = factory().describe_options();
-
-        let analyze = cmd
-            .get_subcommands()
-            .find(|c| c.get_name() == "analyze")
-            .unwrap();
-        let stats = analyze
-            .get_subcommands()
-            .find(|c| c.get_name() == "stats")
-            .unwrap();
+        let analyze = spec.subcommands.iter().find(|c| c.name == "analyze").unwrap();
+        let stats = analyze.subcommands.iter().find(|c| c.name == "stats").unwrap();
 
         for opt in &expected_opts {
-            let arg = stats.get_arguments().find(|a| a.get_id() == opt.name.as_str());
+            let flag = format!("--{}", opt.name);
             assert!(
-                arg.is_some(),
+                stats.options.iter().any(|o| o.flag() == flag),
                 "analyze stats missing arg: '{}'",
                 opt.name
             );
@@ -1188,105 +773,6 @@ mod tests {
     }
 
     #[test]
-    fn test_completion_tree_has_emit_yaml_arg() {
-        let cmd = build_pipeline_command();
-        let analyze = cmd
-            .get_subcommands()
-            .find(|c| c.get_name() == "analyze")
-            .unwrap();
-        let stats = analyze
-            .get_subcommands()
-            .find(|c| c.get_name() == "stats")
-            .unwrap();
-        assert!(
-            stats.get_arguments().any(|a| a.get_id() == "emit-yaml"),
-            "analyze stats should have --emit-yaml arg"
-        );
-        assert!(
-            stats.get_arguments().any(|a| a.get_id() == "id"),
-            "analyze stats should have --id arg"
-        );
-        assert!(
-            stats.get_arguments().any(|a| a.get_id() == "after"),
-            "analyze stats should have --after arg"
-        );
-    }
-
-    #[test]
-    fn test_resource_args_per_command() {
-        let cmd = build_pipeline_command();
-        let registry = CommandRegistry::with_builtins();
-
-        // Every command should have --resources and --governor args.
-        for path in registry.command_paths() {
-            let mut parts = path.splitn(2, ' ');
-            let group = parts.next().unwrap();
-            let subname = parts.next().unwrap_or("");
-
-            let group_cmd = cmd
-                .get_subcommands()
-                .find(|c| c.get_name() == group)
-                .unwrap();
-            // Single-word commands (e.g. "barrier") are direct — the group
-            // command itself carries the args.
-            let sub_cmd = if subname.is_empty() {
-                group_cmd
-            } else {
-                group_cmd
-                    .get_subcommands()
-                    .find(|c| c.get_name() == subname)
-                    .unwrap()
-            };
-
-            assert!(
-                sub_cmd.get_arguments().any(|a| a.get_id() == "resources"),
-                "Command '{}' missing --resources arg",
-                path,
-            );
-            assert!(
-                sub_cmd.get_arguments().any(|a| a.get_id() == "governor"),
-                "Command '{}' missing --governor arg",
-                path,
-            );
-        }
-
-        // Commands that declare resources should have long-form aliases
-        // (except when the resource name conflicts with an existing option).
-        let factory = registry.get("compute knn").unwrap();
-        let cmd_instance = factory();
-        let resources = cmd_instance.describe_resources();
-        let option_names: std::collections::HashSet<String> = cmd_instance
-            .describe_options()
-            .iter()
-            .map(|o| o.name.clone())
-            .collect();
-        assert!(!resources.is_empty(), "compute knn should declare resources");
-
-        let compute = cmd
-            .get_subcommands()
-            .find(|c| c.get_name() == "compute")
-            .unwrap();
-        let knn = compute
-            .get_subcommands()
-            .find(|c| c.get_name() == "knn")
-            .unwrap();
-
-        for res in &resources {
-            if option_names.contains(&res.name) {
-                continue; // Resource name conflicts with option — no alias
-            }
-            if super::super::resource::ResourceType::from_name(&res.name).is_some() {
-                let alias_id = format!("resource-{}", res.name);
-                assert!(
-                    knn.get_arguments().any(|a| a.get_id().as_str() == alias_id),
-                    "compute knn missing resource alias --{} (id: {})",
-                    res.name, alias_id,
-                );
-            }
-        }
-    }
-
-    #[test]
     fn test_option_help_format() {
         assert_eq!(
             build_option_help("Input file path", "Path", None),
@@ -1296,36 +782,6 @@ mod tests {
             build_option_help("Number of neighbors", "int", Some("100")),
             "Number of neighbors (type: int, default: 100)"
         );
-    }
-
-    #[test]
-    fn test_option_args_have_type_in_help() {
-        // Verify that build_pipeline_command includes type/default info in arg help text.
-        let cmd = build_pipeline_command();
-        let registry = CommandRegistry::with_builtins();
-
-        let factory = registry.get("compute knn").unwrap();
-        let expected_opts = factory().describe_options();
-
-        let compute = cmd
-            .get_subcommands()
-            .find(|c| c.get_name() == "compute")
-            .unwrap();
-        let knn = compute
-            .get_subcommands()
-            .find(|c| c.get_name() == "knn")
-            .unwrap();
-
-        for opt in &expected_opts {
-            let arg = knn.get_arguments().find(|a| a.get_id() == opt.name.as_str());
-            assert!(arg.is_some(), "compute knn missing arg '{}'", opt.name);
-            let help = arg.unwrap().get_help().map(|h| h.to_string()).unwrap_or_default();
-            assert!(
-                help.contains(&format!("type: {}", opt.type_name)),
-                "compute knn arg '{}' help missing type info, got: {}",
-                opt.name, help,
-            );
-        }
     }
 
     #[test]
@@ -1366,30 +822,73 @@ mod tests {
     }
 
     #[test]
-    fn test_all_commands_reachable() {
+    fn command_op_to_spec_maps_common_and_declared_options() {
         let registry = CommandRegistry::with_builtins();
-        let count = registry.command_paths().len();
-        assert!(
-            count >= 45,
-            "Expected at least 45 registered commands, found {}",
-            count
-        );
+        let factory = registry.get("compute knn").expect("compute knn registered");
+        let cmd = factory();
+        let spec = command_op_to_spec("knn", &*cmd);
 
-        let cmd = build_pipeline_command();
-        let mut reachable = 0;
-        for group_cmd in cmd.get_subcommands() {
-            let sub_count = group_cmd.get_subcommands().count();
-            if sub_count == 0 {
-                // Direct (single-word) command — the group itself is the command
-                reachable += 1;
-            } else {
-                reachable += sub_count;
-            }
-        }
+        let names: Vec<&str> = spec.options.iter().map(|o| o.flag()).collect();
+        assert!(names.contains(&"--emit-yaml"), "common --emit-yaml present");
+        assert!(names.contains(&"--governor"), "common --governor present");
+
+        // emit-yaml is a flag (no value); governor is a value option defaulting
+        // to "maximize".
+        let emit = spec.options.iter().find(|o| o.flag() == "--emit-yaml").unwrap();
+        assert!(!emit.def.takes_value, "--emit-yaml must be a flag");
+        let gov = spec.options.iter().find(|o| o.flag() == "--governor").unwrap();
+        assert!(gov.def.takes_value, "--governor takes a value");
+        assert_eq!(gov.default.as_deref(), Some("maximize"));
+
+        // The command's own declared options are mapped too.
+        assert!(spec.options.len() > 5, "declared options mapped alongside common ones");
+    }
+
+    #[test]
+    fn runargs_veks_cli_spec_parse_and_extract() {
+        use veks_completion::VeksCli;
+        let spec = crate::pipeline::RunArgs::veks_command_spec("run");
+
+        let names: Vec<&str> = spec.options.iter().map(|o| o.flag()).collect();
+        assert!(names.contains(&"--recursive"));
+        assert!(names.contains(&"--profile"));
+        assert!(names.contains(&"--set")); // overrides field, renamed via #[arg(long = "set")]
+        assert_eq!(spec.positionals.len(), 1, "dataset is a positional");
+        let profile = spec.options.iter().find(|o| o.flag() == "--profile").unwrap();
+        assert_eq!(profile.default.as_deref(), Some("all"));
+
+        // Parse + typed extraction of a real invocation.
+        let argv: Vec<String> = ["--recursive", "--threads", "8", "mydata.yaml"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let parsed = veks_completion::cli::parse(&spec, &argv).unwrap();
+        let run = crate::pipeline::RunArgs::veks_from_parsed(&parsed).unwrap();
+        assert!(run.recursive);
+        assert_eq!(run.threads, 8);
+        assert_eq!(run.dataset, Some(std::path::PathBuf::from("mydata.yaml")));
+        assert_eq!(run.profile, "all", "default applied");
+        assert_eq!(run.governor, "maximize", "default applied");
+    }
+
+    #[test]
+    fn pipeline_command_spec_builds_tree_with_completers() {
+        let spec = pipeline_command_spec();
+
+        // Group → command structure, mirroring build_pipeline_command.
+        let compute = spec.subcommands.iter().find(|c| c.name == "compute").expect("compute group");
+        assert!(compute.subcommand_required);
+        let knn = compute.subcommands.iter().find(|c| c.name == "knn").expect("compute knn");
+        assert!(knn.options.iter().any(|o| o.flag() == "--governor"));
+
+        // Completion via the bridge: --governor completes to its strategy set,
+        // carried on the option's own value_completion.
+        let resolvers = std::collections::BTreeMap::new();
+        let tree = veks_completion::cli::build_completion_tree(&spec, &resolvers);
+        let out = veks_completion::complete(&tree, &["veks", "compute", "knn", "--governor", ""]);
         assert_eq!(
-            reachable, count,
-            "Subcommand count ({}) != registry count ({})",
-            reachable, count
+            out,
+            vec!["conservative".to_string(), "fixed".to_string(), "maximize".to_string()]
         );
     }
 }

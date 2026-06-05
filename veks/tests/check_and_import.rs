@@ -73,8 +73,11 @@ fn default_args(name: &str, output: &Path) -> ImportArgs {
         output: output.to_path_buf(),
         base_vectors: None,
         query_vectors: None,
+        // Small default so self-search tests (which carve the query set from
+        // the base) stay within the small bases these structure-checks use;
+        // tests that care about the count override it explicitly.
         self_search: false,
-        query_count: 100,
+        query_count: 8,
         metadata: None,
         ground_truth: None,
         ground_truth_distances: None,
@@ -206,6 +209,9 @@ fn import_separate_query_combined_bq() {
     let mut args = default_args("sep-query", &out);
     args.base_vectors = Some(base);
     args.query_vectors = Some(query.clone());
+    // Combining separate B+Q into a self-search source is opt-in (--self-search);
+    // without it, the provided query file is used as-is.
+    args.self_search = true;
 
     veks::prepare::import::run(args);
 
@@ -1720,6 +1726,8 @@ fn import_normalize_separate_query_combined_bq() {
     args.base_vectors = Some(base);
     args.query_vectors = Some(query);
     args.normalize = true;
+    // Combining separate B+Q into a self-search source is opt-in.
+    args.self_search = true;
 
     veks::prepare::import::run(args);
     let yaml = read_yaml(&dir.path().join("out"));

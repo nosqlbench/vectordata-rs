@@ -98,9 +98,9 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
         println!();
     }
 
-    // Scan for candidate data files, or use explicit --source list
+    // Scan for candidate data files, or use explicit --sources list
     let candidates = if !seeds.sources.is_empty() {
-        // Build candidates from explicit --source paths
+        // Build candidates from explicit --sources paths
         let mut explicit = Vec::new();
         for src in &seeds.sources {
             let path = if src.is_absolute() { src.clone() } else { cwd.join(src) };
@@ -122,7 +122,7 @@ pub fn run_wizard_with_options(auto_accept: bool, auto_mode: bool, seeds: Wizard
                     explicit.push((src.clone(), format.name().to_string(), size));
                 }
             } else {
-                eprintln!("Warning: unrecognized format for --source {}", src.display());
+                eprintln!("Warning: unrecognized format for --sources {}", src.display());
             }
         }
         explicit

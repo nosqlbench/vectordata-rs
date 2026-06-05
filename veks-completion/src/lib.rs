@@ -37,7 +37,19 @@
 
 use std::collections::BTreeMap;
 
+// Lets `#[derive(VeksCli)]`-generated code (which emits `::veks_completion::…`
+// paths) resolve correctly when used *inside* this crate's own tests.
+extern crate self as veks_completion;
+
+pub mod cli;
+pub mod options;
 pub mod providers;
+
+// NB: `cli::ParseError` is intentionally not re-exported at the crate root —
+// it would collide with the existing completion `ParseError`. Reach it as
+// `veks_completion::cli::ParseError`.
+pub use cli::{render_help, CommandSpec, OptionSpec, ParsedArgs, PositionalSpec, VeksCli};
+pub use options::{CommandOption, OptionConflict, OptionDef, OptionRegistry, ParseMismatch};
 
 /// A function that provides dynamic completion values for a specific option.
 ///
@@ -56,6 +68,20 @@ pub type ValueProvider = std::sync::Arc<dyn Fn(&str, &[&str]) -> Vec<String> + S
 /// pointers and call this when registering.
 pub fn fn_provider(f: fn(&str, &[&str]) -> Vec<String>) -> ValueProvider {
     std::sync::Arc::new(f)
+}
+
+/// Build a [`ValueProvider`] over a fixed set of candidate values, filtered by
+/// the typed prefix. This is the completion side of a closed-set option — e.g.
+/// the derive emits it for `#[arg(value_parser = ["text", "csv", "json"])]` so
+/// the same single declaration that drives parsing also feeds tab-completion.
+pub fn closed_set(values: &'static [&'static str]) -> ValueProvider {
+    std::sync::Arc::new(move |partial: &str, _ctx: &[&str]| {
+        values
+            .iter()
+            .filter(|v| partial.is_empty() || v.starts_with(partial))
+            .map(|v| v.to_string())
+            .collect()
+    })
 }
 
 /// A closed set of valid values for a flag. Both static (`&'static
@@ -135,8 +161,7 @@ impl ClosedValues {
     }
 
     /// Wrap as a [`ValueProvider`] for use with
-    /// [`Node::with_value_provider`] /
-    /// [`CommandTree::global_value_provider`]. The set is moved into
+    /// [`Node::with_value_provider`]. The set is moved into
     /// the closure; clone the [`ClosedValues`] first if you also
     /// need to keep it for validation.
     pub fn into_provider(self) -> ValueProvider {
@@ -319,10 +344,6 @@ pub struct Node {
     /// Optional provider that discovers additional `key=` options
     /// from context (e.g., workload-file parameters).
     dynamic_options: Option<DynamicOptionsProvider>,
-    /// Per-node staged tree-globals — promoted to the
-    /// [`CommandTree`]'s global registry by
-    /// [`CommandTree::lift_promoted_globals`].
-    promoted_globals: Vec<(String, ValueProvider)>,
     /// Context-aware completion override that fires whenever the
     /// cursor sits inside this subtree.
     subtree_provider: Option<SubtreeProvider>,
@@ -643,7 +664,6 @@ impl std::fmt::Debug for Node {
             .field("flag_help", &self.flag_help.keys().collect::<Vec<_>>())
             .field("value_providers", &self.value_providers.keys().collect::<Vec<_>>())
             .field("has_dynamic_options", &self.dynamic_options.is_some())
-            .field("promoted_globals", &self.promoted_globals.iter().map(|(k, _)| k).collect::<Vec<_>>())
             .field("has_subtree_provider", &self.subtree_provider.is_some())
             .field("has_extras", &self.extras.is_some())
             .finish()
@@ -663,7 +683,6 @@ impl Default for Node {
             flag_long_help: BTreeMap::new(),
             value_providers: BTreeMap::new(),
             dynamic_options: None,
-            promoted_globals: Vec::new(),
             subtree_provider: None,
             extras: None,
         }
@@ -888,29 +907,6 @@ impl Node {
         self.flag_help.get(flag).map(|s| s.as_str())
     }
 
-    // ---- per-node tree-global staging -----------------------------
-
-    /// Stage a tree-global value provider on this node. Promoted to
-    /// the [`CommandTree`]'s global registry when
-    /// [`CommandTree::lift_promoted_globals`] runs.
-    pub fn with_promoted_global(mut self, token: &str, provider: ValueProvider) -> Self {
-        self.promoted_globals.push((token.to_string(), provider));
-        self
-    }
-
-    /// Drain staged globals (recursively) into the supplied
-    /// registry. Used by [`CommandTree::lift_promoted_globals`].
-    fn drain_promoted_globals_into(
-        &mut self,
-        out: &mut std::collections::BTreeMap<String, ValueProvider>,
-    ) {
-        for (token, provider) in std::mem::take(&mut self.promoted_globals) {
-            out.insert(token, provider);
-        }
-        for child in self.children.values_mut() {
-            child.drain_promoted_globals_into(out);
-        }
-    }
 
     // ---- subtree provider -----------------------------------------
 
@@ -1121,8 +1117,6 @@ pub struct CommandTree {
     pub root: Node,
     /// Commands that exist but are hidden from root-level listing.
     pub hidden: std::collections::HashSet<String>,
-    /// Global value providers keyed by option name.
-    pub global_value_providers: BTreeMap<String, ValueProvider>,
     /// Help text for global flags. Falls back to per-node
     /// `flag_help` when the cursor sits inside a leaf that doesn't
     /// override the help line for a global flag like `--dataset` or
@@ -1170,7 +1164,6 @@ impl CommandTree {
             app_name: app_name.to_string(),
             root: Node::empty_group(),
             hidden: std::collections::HashSet::new(),
-            global_value_providers: BTreeMap::new(),
             global_flag_help: BTreeMap::new(),
             global_flag_long_help: BTreeMap::new(),
             strict_metadata: false,
@@ -1183,8 +1176,7 @@ impl CommandTree {
         self.global_flag_help.get(flag).map(|s| s.as_str())
     }
 
-    /// Register help text for a global flag. Builder-style so it
-    /// composes with [`Self::global_value_provider`].
+    /// Register help text for a global flag. Builder-style.
     pub fn global_flag_help(mut self, flag: &str, help: &str) -> Self {
         self.global_flag_help.insert(flag.to_string(), help.to_string());
         self
@@ -1320,30 +1312,6 @@ impl CommandTree {
         self.check_strict(name, &node);
         self.hidden.insert(name.to_string());
         self.command(name, node)
-    }
-
-    /// Register a value provider that applies to an option name across all
-    /// leaf commands in the tree.
-    ///
-    /// When the user types `--dataset <TAB>`, the provider is called regardless
-    /// of which leaf command is active. Per-leaf providers registered via
-    /// [`Node::with_value_provider`] take precedence over global providers.
-    pub fn global_value_provider(mut self, option: &str, provider: ValueProvider) -> Self {
-        self.global_value_providers.insert(option.to_string(), provider);
-        self
-    }
-
-    /// Walk the tree and promote any per-node staged globals (set via
-    /// [`Node::with_promoted_global`]) into the tree-level
-    /// `global_value_providers` map. Solves TODO item 2: lets a spec
-    /// declare globals as part of node construction without a
-    /// post-build patching step.
-    ///
-    /// Idempotent: drains the staged entries, so re-calling is safe
-    /// (and a no-op).
-    pub fn lift_promoted_globals(mut self) -> Self {
-        self.root.drain_promoted_globals_into(&mut self.global_value_providers);
-        self
     }
 
     /// Built-in option: enable `--help` everywhere. Walks the whole
@@ -1614,7 +1582,6 @@ pub fn complete_rotating_with_raw(
                 && !w.contains('=')
                 && !node.boolean_flags.contains(w)
                 && (node.value_providers.contains_key(w)
-                    || tree.global_value_providers.contains_key(w)
                     || node.flag_help_for(w).is_some())
         })
         .unwrap_or(false);
@@ -1728,12 +1695,6 @@ pub fn complete_at_tap_with_raw(
         return provider(&pp);
     }
 
-    // Check global value providers for the previous word.
-    if let Some(&prev_word) = completed.last()
-        && let Some(provider) = tree.global_value_providers.get(prev_word) {
-        return provider(partial, remaining);
-    }
-
     // Unified node — a node may carry children, flags, or both.
     // Order of candidate sourcing:
     //   1. If the previous word is a value-taking flag, defer
@@ -1760,9 +1721,6 @@ pub fn complete_at_tap_with_raw(
         if let Some(provider) = node.value_providers.get(prev_word) {
             return provider(partial, remaining);
         }
-        if let Some(provider) = tree.global_value_providers.get(prev_word) {
-            return provider(partial, remaining);
-        }
         return Vec::new();
     }
 
@@ -1777,8 +1735,6 @@ pub fn complete_at_tap_with_raw(
         let dashed_key = format!("--{key}");
         if let Some(provider) = node.value_providers.get(&key_eq)
             .or_else(|| node.value_providers.get(&dashed_key))
-            .or_else(|| tree.global_value_providers.get(&key_eq))
-            .or_else(|| tree.global_value_providers.get(&dashed_key))
         {
             return provider(value_partial, remaining);
         }
@@ -1822,12 +1778,6 @@ pub fn complete_at_tap_with_raw(
         }
     }
 
-    // (3) Global flag tokens.
-    for global_opt in tree.global_value_providers.keys() {
-        if global_opt.starts_with(partial) && !flag_candidates.contains(global_opt) {
-            flag_candidates.push(global_opt.clone());
-        }
-    }
     flag_candidates.sort_by(|a, b| {
         a.starts_with('-').cmp(&b.starts_with('-')).then_with(|| a.cmp(b))
     });
@@ -2942,7 +2892,7 @@ fn parse_argv_inner<'a>(
             if let Some(eq_pos) = stripped.find('=') {
                 let key = format!("--{}", &stripped[..eq_pos]);
                 let val = stripped[eq_pos + 1..].to_string();
-                if flag_is_known(node, tree, &key) {
+                if flag_is_known(node, &key) {
                     flags.entry(key).or_default().push(val);
                 } else if lenient {
                     positionals.push(arg);
@@ -2959,7 +2909,7 @@ fn parse_argv_inner<'a>(
             // Bare `--flag` form. Look up to see if it's a boolean
             // or expects a value.
             let key = arg.to_string();
-            if !flag_is_known(node, tree, &key) {
+            if !flag_is_known(node, &key) {
                 if lenient {
                     positionals.push(arg);
                     i += 1;
@@ -3003,17 +2953,9 @@ fn parse_argv_inner<'a>(
     Ok(ParsedCommand { path, flags, positionals })
 }
 
-fn flag_is_known(node: &Node, tree: &CommandTree, flag: &str) -> bool {
-    // A flag is "known" if the current leaf, the current group's
-    // group-level flags, or the tree's global value-provider map
-    // recognises it.
-    if node.flags.iter().any(|o| flag_canonical_match(o, flag)) {
-        return true;
-    }
-    if tree.global_value_providers.contains_key(flag) {
-        return true;
-    }
-    false
+fn flag_is_known(node: &Node, flag: &str) -> bool {
+    // A flag is "known" if the current leaf or group declares it.
+    node.flags.iter().any(|o| flag_canonical_match(o, flag))
 }
 
 fn flag_is_boolean(node: &Node, flag: &str) -> bool {
@@ -3612,27 +3554,6 @@ mod tests {
         assert!(out.contains("Compute commands"));
         assert!(out.contains("SUBCOMMANDS:"));
         assert!(out.contains("knn"));
-    }
-
-    // ---- TODO item 2: per-node global registration -----------------
-
-    #[test]
-    fn promoted_global_lifts_to_tree_globals() {
-        let provider = fn_provider(|p: &str, _: &[&str]| {
-            ["alpha", "beta"].iter()
-                .filter(|s| s.starts_with(p))
-                .map(|s| s.to_string())
-                .collect()
-        });
-        let tree = CommandTree::new("app")
-            .command("run", Node::leaf(&["--name"])
-                .with_promoted_global("--name", provider))
-            .lift_promoted_globals();
-        // The provider should now live in the tree-level globals
-        // map and fire wherever `--name` appears.
-        assert!(tree.global_value_providers.contains_key("--name"));
-        let out = complete(&tree, &["app", "run", "--name", "a"]);
-        assert_eq!(out, vec!["alpha"]);
     }
 
     // ---- TODO item 3 (additive): group flags -----------------------

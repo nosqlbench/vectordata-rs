@@ -156,7 +156,9 @@ fn default_args(name: &str, output: &Path) -> ImportArgs {
         base_vectors: None,
         query_vectors: None,
         self_search: false,
-        query_count: 100,
+        // Small so self-search configs (which carve the query set from the
+        // base) stay within these tests' small bases; tests that care override.
+        query_count: 5,
         metadata: None,
         ground_truth: None,
         ground_truth_distances: None,
@@ -367,6 +369,8 @@ fn dag_03_separate_queries() {
     let mut args = default_args("separate-queries", &out);
     args.base_vectors = Some(base);
     args.query_vectors = Some(query);
+    // Combining separate B+Q into a self-search source is opt-in (--self-search).
+    args.self_search = true;
 
     veks::prepare::import::run(args);
     let yaml = read_yaml(&out);

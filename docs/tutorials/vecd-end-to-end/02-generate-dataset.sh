@@ -2,6 +2,11 @@
 # Step 02 — use veks to build a small, fully-synthetic toy dataset that
 # exercises EVERY core facet, then materialize and verify it locally.
 #
+# Just want a trivial demo? Run `02-quick-dataset.sh` instead — one
+# `veks generate example-dataset` command lays down the source facets (base +
+# query vectors), and steps 03–04 work the same (with fewer facets to explore).
+# This full script then builds the DERIVED facets on top of such source files.
+#
 # Facets produced (veks facet codes):
 #   B base_vectors                  — the searchable vectors
 #   Q query_vectors                 — query set (extracted via --self-search)

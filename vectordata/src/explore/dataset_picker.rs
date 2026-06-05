@@ -1377,7 +1377,7 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
     if sources.is_empty() {
         eprintln!("error: no catalog sources configured");
         eprintln!();
-        eprintln!("Add one with `vectordata config add-catalog <URL-or-path>`.");
+        eprintln!("Add one with `vectordata config catalog add <URL-or-path>`.");
         return PickerOutcome::Failed;
     }
     let catalog = Catalog::of(&sources);

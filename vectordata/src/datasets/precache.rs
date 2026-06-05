@@ -191,7 +191,7 @@ fn resolve_spec(
         eprintln!("'{}' is not a local path, not a URL, and no catalog is configured.",
             head);
         eprintln!("Add a catalog with:");
-        eprintln!("  vectordata config add-catalog <URL-or-path>");
+        eprintln!("  vectordata config catalog add <URL-or-path>");
         eprintln!("Or use --catalog/--at for one-off access.");
         return None;
     }

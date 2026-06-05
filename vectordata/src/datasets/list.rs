@@ -25,7 +25,7 @@ use crate::dataset::CatalogEntry;
 ///
 /// Feature-gated on `cli` because clap is itself optional.
 #[cfg(feature = "cli")]
-#[derive(Debug, clap::Args)]
+#[derive(Debug, veks_completion_derive::VeksCli)]
 pub struct ListArgs {
     /// Configuration directory containing catalogs.yaml
     #[arg(long, default_value_t = crate::catalog::sources::config_dir())]
@@ -214,7 +214,7 @@ pub fn run(
         eprintln!("error: no catalog sources configured");
         eprintln!();
         eprintln!("Add a catalog with:");
-        eprintln!("  vectordata config add-catalog <URL-or-path>");
+        eprintln!("  vectordata config catalog add <URL-or-path>");
         eprintln!();
         eprintln!("Or use --catalog/--at for one-off access.");
         return 1;

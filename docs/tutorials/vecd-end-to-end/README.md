@@ -49,11 +49,30 @@ already on your `PATH` (e.g. from `cargo install`), those win.
 ```bash
 cd docs/tutorials/vecd-end-to-end
 bash 01-start-vecd.sh        # init DB, backend, user, namespace, tokens; start daemon
-bash 02-generate-dataset.sh  # build + verify the toy dataset locally
+bash 02-generate-dataset.sh  # build + verify the full all-facets toy dataset
+#  └─ or the shortcut: bash 02-quick-dataset.sh  (a trivial base-vectors-only dataset)
 bash 03-upload.sh            # push dataset to vecd + publish a catalog
 bash 04-explore.sh           # add the catalog and explore over HTTP
 bash 99-teardown.sh          # stop the daemon (prints how to delete the dir)
 ```
+
+### Step 02: full dataset or the quick shortcut
+
+You have a choice for step 02 — pick **one**:
+
+- **`02-generate-dataset.sh`** (full) — uses `veks prepare bootstrap` +
+  `veks run` to build a dataset that exercises **every core facet**: base and
+  query vectors, exact + filtered KNN ground truth, metadata, and predicates.
+  Choose this to watch every facet type flow through vecd.
+- **`02-quick-dataset.sh`** (shortcut) — one command,
+  `veks generate example-dataset`, scaffolds the **source facets** (base +
+  query vectors; 2,000 base + 100 query, dim 16). Choose this when you just
+  want to see vecd serve a dataset; steps 03–04 work identically, with fewer
+  facets to explore. (The full script bootstraps + runs the derived facets on
+  top of source files exactly like these.)
+
+Both leave a ready `vecd-demo/work/toy/dataset.yaml`, so 03 and 04 are the
+same either way.
 
 Each script sources `env.sh`, which sets `DEMO` (the throwaway root),
 prepends the build dir to `PATH`, and exports the two isolation variables.
@@ -63,11 +82,17 @@ all steps).
 ## What each step shows
 
 ### 01 — the server and its AAA
-- A one-line `vecd.conf` (just `bind = 127.0.0.1:18443`) under `$VECD_CONFIG`
-  is vecd's only operator setting; the DB and pidfile live in `data/` under
-  that dir automatically, so no `--data-dir` is threaded through the steps.
+- `vecd config set bind 127.0.0.1:18443` writes the one operator setting into
+  `vecd.conf` under `$VECD_CONFIG` (`vecd config get` prints it). vecd
+  **requires a config before it will run**; `config set` creates one on first
+  use, and `vecd config auto` would write safe defaults for a real box. The DB
+  and pidfile live in `data/` under that dir automatically.
 - `vecd init --quiet` creates the SQLite control-plane DB and mints a
-  one-time superuser token, printing just the token for `$(…)` capture.
+  superuser token, printing just the token for `$(…)` capture. It also
+  **auto-logs-in the superuser** — storing that token (keyed by the local
+  endpoint the `bind` implies) in `$VECD_CONFIG/credentials.json` and naming
+  that file, so the admin can use client commands right after `vecd start`
+  without a separate `vecd login`. That file holds the irrecoverable admin key.
 - `vecd backends add … --kind local --endpoint local:<dir>` registers the
   **backing store** — a plain directory blobs are written into.
 - `vecd users add`, `vecd ns add`, `vecd bind`, `vecd tokens create --quiet`
@@ -90,15 +115,18 @@ pre-/post-filtered KNN ground truth — plus the optional metadata-layout
 dense ~5% of the corpus (it sets the metadata/predicate value range), so the
 predicate-evaluation cross-check passes on a small toy.
 
-### 03 — upload + catalog
-`vectordata datasets push` uploads every facet to the namespace as a new
-version (bearer-authenticated PUTs over vecd's object-REST protocol). Then
-`veks prepare catalog generate` writes a `catalog.{json,yaml}` listing the
-dataset (with its facets embedded), which we PUT to the namespace root — that
-is what turns the namespace into a discoverable **catalog**.
+### 03 — authenticate + upload + catalog
+`vectordata login <endpoint> --token …` stores alice's token (keyed by origin)
+under `$VECTORDATA_HOME`; `vectordata datasets push` then uploads every facet as
+a new version (bearer-authenticated PUTs over vecd's object-REST protocol)
+**using the stored login automatically — no `--token` flag**. Then `veks prepare
+catalog generate` writes a `catalog.{json,yaml}` listing the dataset (with its
+facets embedded), which we PUT to the namespace root — that is what turns the
+namespace into a discoverable **catalog**. (Step 04 also shows `vecd login` /
+`vecd whoami` — the vecd CLI is a client too.)
 
 ### 04 — explore
-`vectordata config add-catalog <namespace-url>` records the catalog; then
+`vectordata config catalog add <namespace-url>` records the catalog; then
 `datasets list` / `describe` / `ping` / `precache` browse and read the
 dataset, fetching facets over HTTP from vecd (anonymously, via the public
 read grant). `ping` reports every facet readable; `precache` pulls them into

@@ -32,7 +32,7 @@ regimes where users might opt into `--boundary-tolerance > 0`.
 side-by-side, prints neighbor tables + classification):
 
 ```sh
-veks pipeline verify engine-parity --synthetic \
+veks pipeline verify engine-parity --use-synthetic \
   --dim 32 --base-count 500 --query-count 20 --neighbors 5
 ```
 

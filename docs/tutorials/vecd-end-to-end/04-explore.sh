@@ -10,7 +10,7 @@
 source "$(dirname "$0")/env.sh"
 
 say "add the vecd namespace as a catalog"
-vectordata config add-catalog "$(vecd_base)/datasets/"
+vectordata config catalog add "$(vecd_base)/datasets/"
 
 say "list datasets in the catalog"
 vectordata datasets list
@@ -26,6 +26,14 @@ vectordata datasets precache "toy:default"
 
 say "show what was cached"
 vectordata cache list
+
+say "the vecd CLI is also a client — log in and check access with it"
+# `vecd login`/`whoami` mirror vectordata's: the token is stored under
+# $VECD_CONFIG (keyed by origin) and used automatically. --token accepts the
+# token file directly, and once you're logged in the endpoint commands
+# (whoami, logout, …) default to that endpoint — so no URL needed.
+vecd login "$(vecd_base)/" --token "$DEMO/alice.token"
+vecd whoami
 
 echo
 echo "explored toy from $(vecd_base)/datasets/ — all facets readable."

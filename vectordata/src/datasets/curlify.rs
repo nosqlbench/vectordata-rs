@@ -11,7 +11,7 @@ use std::path::PathBuf;
 /// Shared clap-derived argument struct for `<binary> datasets
 /// curlify`. Both the `vectordata` and `veks` binaries import this.
 #[cfg(feature = "cli")]
-#[derive(Debug, clap::Args)]
+#[derive(Debug, veks_completion_derive::VeksCli)]
 pub struct CurlifyArgs {
     /// Dataset directory or path to dataset.yaml
     #[arg(default_value = ".")]

@@ -49,13 +49,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use clap::builder::ValueHint;
-use clap::{Parser, Subcommand};
-use clap_complete::Shell;
 use crate::WriterConfig;
 
 /// slab — slabtastic file maintenance tool
-#[derive(Parser)]
+#[derive(veks_completion_derive::VeksCli)]
 #[command(name = "slab", version, about = "Slabtastic file maintenance tool")]
 pub struct Cli {
     #[command(subcommand)]
@@ -63,12 +60,12 @@ pub struct Cli {
 }
 
 /// Available subcommands.
-#[derive(Subcommand)]
+#[derive(veks_completion_derive::VeksCli)]
 pub enum Command {
     /// Display file structure and statistics.
     Analyze {
         /// Path to the slabtastic file.
-        #[arg(value_hint = ValueHint::FilePath)]
+        #[arg(positional)]
         file: String,
         /// Number of records/pages to sample for statistics.
         #[arg(long)]
@@ -83,7 +80,7 @@ pub enum Command {
     /// Check a slabtastic file for structural errors.
     Check {
         /// Path to the slabtastic file.
-        #[arg(value_hint = ValueHint::FilePath)]
+        #[arg(positional)]
         file: String,
         /// Namespace to check (checks default namespace if omitted).
         #[arg(long)]
@@ -92,7 +89,7 @@ pub enum Command {
     /// Retrieve records by ordinal.
     Get {
         /// Path to the slabtastic file.
-        #[arg(value_hint = ValueHint::FilePath)]
+        #[arg(positional)]
         file: String,
         /// Ordinals to retrieve (individual or range specifiers).
         ordinals: Vec<String>,
@@ -112,10 +109,10 @@ pub enum Command {
     /// Rewrite a slabtastic file: reorder by ordinal and repack to new page settings.
     Rewrite {
         /// Input slabtastic file.
-        #[arg(value_hint = ValueHint::FilePath)]
+        #[arg(positional)]
         input: String,
         /// Output slabtastic file.
-        #[arg(value_hint = ValueHint::FilePath)]
+        #[arg(positional)]
         output: String,
         /// Ordinal range to rewrite (e.g., "100", "[5,10)", "0..99").
         #[arg(long)]
@@ -139,11 +136,11 @@ pub enum Command {
     /// Append records from stdin or a source file to an existing slab file.
     Append {
         /// Path to the existing slabtastic file to append to.
-        #[arg(value_hint = ValueHint::FilePath)]
+        #[arg(positional)]
         file: String,
         /// Optional source file to read records from (one per line).
         /// If omitted, reads from stdin.
-        #[arg(long, value_hint = ValueHint::FilePath)]
+        #[arg(long)]
         source: Option<String>,
         /// Preferred page size in bytes.
         #[arg(long)]
@@ -164,10 +161,10 @@ pub enum Command {
     /// Import data from an external file format into a slab file.
     Import {
         /// Path to the target slabtastic file.
-        #[arg(value_hint = ValueHint::FilePath)]
+        #[arg(positional)]
         file: String,
         /// Path to the source file to import from.
-        #[arg(value_hint = ValueHint::FilePath)]
+        #[arg(positional)]
         source: String,
         /// Force newline-delimited text format.
         #[arg(long)]
@@ -218,13 +215,13 @@ pub enum Command {
     /// Export content from a slab file to an external format.
     Export {
         /// Path to the slabtastic file.
-        #[arg(value_hint = ValueHint::FilePath)]
+        #[arg(positional)]
         file: String,
         /// Output file path (stdout if omitted).
-        #[arg(long, value_hint = ValueHint::FilePath)]
+        #[arg(long)]
         output: Option<String>,
         /// Output format: raw, text, cstrings, hex, slab (default: raw).
-        #[arg(long, value_enum)]
+        #[arg(long, value_parser = ["raw", "text", "cstrings", "hex", "slab"])]
         format: Option<export::ExportFormatArg>,
         /// Ordinal range to export (e.g., "100", "[5,10)", "0..99").
         #[arg(long)]
@@ -248,19 +245,19 @@ pub enum Command {
     /// List all namespaces in a slab file.
     Namespaces {
         /// Path to the slabtastic file.
-        #[arg(value_hint = ValueHint::FilePath)]
+        #[arg(positional)]
         file: String,
     },
     /// Generate shell completions.
     Completions {
         /// Shell to generate completions for (bash, zsh, fish, elvish, powershell).
-        #[arg(long, value_enum)]
-        shell: Shell,
+        #[arg(long, value_parser = ["bash", "zsh", "fish", "elvish", "powershell"])]
+        shell: String,
     },
     /// Display block diagrams of page layouts.
     Explain {
         /// Path to the slabtastic file.
-        #[arg(value_hint = ValueHint::FilePath)]
+        #[arg(positional)]
         file: String,
         /// Show specific page indices (0-based).
         #[arg(long, num_args = 1..)]
@@ -392,16 +389,16 @@ pub fn is_new_file(path: &str) -> bool {
 }
 
 /// Print the shell snippet that registers dynamic completions for `slab`.
-fn completions(shell: Shell) {
+fn completions(shell: &str) {
     match shell {
-        Shell::Bash => print!(r#"source <(COMPLETE=bash slab)"#),
-        Shell::Zsh => print!(r#"source <(COMPLETE=zsh slab)"#),
-        Shell::Fish => print!(r#"COMPLETE=fish slab | source"#),
-        Shell::Elvish => print!(r#"eval (COMPLETE=elvish slab | slurp)"#),
-        Shell::PowerShell => {
+        "bash" => print!(r#"source <(COMPLETE=bash slab)"#),
+        "zsh" => print!(r#"source <(COMPLETE=zsh slab)"#),
+        "fish" => print!(r#"COMPLETE=fish slab | source"#),
+        "elvish" => print!(r#"eval (COMPLETE=elvish slab | slurp)"#),
+        "powershell" => {
             print!(r#"(& {{ $env:COMPLETE="powershell"; slab }}) | Invoke-Expression"#)
         }
-        _ => eprintln!("Unsupported shell: {:?}", shell),
+        other => eprintln!("Unsupported shell: {other}"),
     }
 }
 
@@ -517,7 +514,7 @@ pub fn run(cli: Cli) -> std::result::Result<(), Box<dyn std::error::Error>> {
             progress,
             &namespace,
         )?,
-        Command::Completions { shell } => completions(shell),
+        Command::Completions { shell } => completions(&shell),
         Command::Namespaces { file } => namespaces::run(&file)?,
         Command::Explain {
             file,
