@@ -116,7 +116,9 @@ pub fn command_op_to_spec(name: &str, cmd: &dyn super::command::CommandOp) -> ve
 
     let doc = cmd.command_doc();
     let value_completions = cmd.value_completions();
-    let mut spec = CommandSpec::new(name).about(doc.summary.clone());
+    let mut spec = CommandSpec::new(name)
+        .about(doc.summary.clone())
+        .stability(cmd.stability());
 
     // Common args injected onto every pipeline command (mirrors
     // build_pipeline_command's emit-yaml / id / after).

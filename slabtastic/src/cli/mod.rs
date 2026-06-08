@@ -388,17 +388,13 @@ pub fn is_new_file(path: &str) -> bool {
     !Path::new(path).exists()
 }
 
-/// Print the shell snippet that registers dynamic completions for `slab`.
+/// Print the registration script for `slab` completions. Delegates to the
+/// completion framework, which owns the protocol (the emitted bash shim calls
+/// back via `_SLAB_COMPLETE`, never a bare `COMPLETE=bash slab`).
 fn completions(shell: &str) {
-    match shell {
-        "bash" => print!(r#"source <(COMPLETE=bash slab)"#),
-        "zsh" => print!(r#"source <(COMPLETE=zsh slab)"#),
-        "fish" => print!(r#"COMPLETE=fish slab | source"#),
-        "elvish" => print!(r#"eval (COMPLETE=elvish slab | slurp)"#),
-        "powershell" => {
-            print!(r#"(& {{ $env:COMPLETE="powershell"; slab }}) | Invoke-Expression"#)
-        }
-        other => eprintln!("Unsupported shell: {other}"),
+    match veks_completion::Shell::from_name(shell) {
+        Some(sh) => veks_completion::print_completions("slab", sh),
+        None => eprintln!("unknown shell '{shell}' (expected bash | zsh | fish | elvish | powershell)"),
     }
 }
 

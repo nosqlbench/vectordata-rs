@@ -148,6 +148,7 @@ fn main() {
     if veks_completion::handle_complete_env("veks", &tree) {
         std::process::exit(0);
     }
+    veks_completion::hint_completions_unregistered("veks");
     // Engine-level diagnostics — `---dump-tree`, `---trace-completion`,
     // `---validate`, etc. Triple-dash prefix can't collide with normal `--`
     // flags. Used by tests to introspect the live tree shape.

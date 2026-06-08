@@ -277,6 +277,71 @@ impl std::error::Error for MetadataError {}
 
 /// A node in the command tree.
 ///
+/// Maturity tier a command can declare, governing whether it is offered during
+/// tab-completion. Ordered least-to-most stable, so the derived `Ord` reads as
+/// "at least this stable": a command is suggested when its stability `>=` the
+/// active [`CommandTree::min_stability`] threshold.
+///
+/// Commands default to [`Stability::Stable`]. The completion threshold defaults
+/// to [`Stability::Preview`], so `Experimental` commands are hidden from
+/// suggestions until the threshold is lowered (e.g. a leading `---experimental`
+/// on the line). Stability only governs what completion *suggests* — every
+/// command remains runnable regardless of its tier.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub enum Stability {
+    /// Early / unstable. Hidden from completion unless the threshold is lowered.
+    Experimental,
+    /// Available for preview. Shown at the default threshold.
+    Preview,
+    /// Production-ready. The default for any command that doesn't declare one.
+    #[default]
+    Stable,
+}
+
+impl Stability {
+    /// Parse a stability name (case-insensitive): `stable`, `preview`, or
+    /// `experimental`. `None` for anything else.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name.to_ascii_lowercase().as_str() {
+            "stable" => Some(Self::Stable),
+            "preview" => Some(Self::Preview),
+            "experimental" => Some(Self::Experimental),
+            _ => None,
+        }
+    }
+
+    /// The lowercase canonical name.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Experimental => "experimental",
+            Self::Preview => "preview",
+            Self::Stable => "stable",
+        }
+    }
+}
+
+/// Extract the completion stability threshold from a line's already-completed
+/// words. A `---stable` / `---preview` / `---experimental` token sets the
+/// threshold (last one wins); `default` applies when none is present. Every
+/// `---…` token is removed from the returned words — they're reserved engine
+/// meta, never subcommands and never offered as candidates.
+fn split_stability_prefix(prior: Vec<String>, default: Stability) -> (Stability, Vec<String>) {
+    let mut threshold = default;
+    let filtered = prior
+        .into_iter()
+        .filter(|w| match w.strip_prefix("---") {
+            Some(rest) => {
+                if let Some(s) = Stability::from_name(rest) {
+                    threshold = s;
+                }
+                false
+            }
+            None => true,
+        })
+        .collect();
+    (threshold, filtered)
+}
+
 /// Carries two metadata fields used by stratified
 /// (multi-tap) completion:
 ///
@@ -314,6 +379,9 @@ pub struct Node {
     // ---- discovery / display ----
     /// Display group tag — see [`CategoryTag`] for usage.
     category: Option<String>,
+    /// Maturity tier — see [`Stability`]. Governs whether this command is
+    /// offered during completion (vs. the active threshold). Default `Stable`.
+    stability: Stability,
     /// Tap-tier visibility. `None` ⇒ "never explicitly set"; the
     /// effective level resolves to [`DEFAULT_LEVEL`], but
     /// strict-metadata mode treats `None` as missing.
@@ -674,6 +742,7 @@ impl Default for Node {
     fn default() -> Self {
         Node {
             category: None,
+            stability: Stability::default(),
             level: None,
             help: None,
             children: BTreeMap::new(),
@@ -855,6 +924,16 @@ impl Node {
 
     /// Get the node's category tag, if any.
     pub fn category(&self) -> Option<&str> { self.category.as_deref() }
+
+    /// Declare this command's maturity tier (see [`Stability`]). Controls
+    /// whether it's offered during completion at the active threshold.
+    pub fn with_stability(mut self, stability: Stability) -> Self {
+        self.stability = stability;
+        self
+    }
+
+    /// This node's maturity tier (default [`Stability::Stable`]).
+    pub fn stability(&self) -> Stability { self.stability }
 
     /// Set the tap-tier visibility for this node.
     pub fn with_level(mut self, lvl: u32) -> Self {
@@ -1110,6 +1189,7 @@ impl StrictNode<true, true> {
 }
 
 /// The top-level command tree for an application.
+#[derive(Clone)]
 pub struct CommandTree {
     /// Application name (used for env var naming).
     pub app_name: String,
@@ -1136,6 +1216,12 @@ pub struct CommandTree {
     /// Opt-in for apps that want their stratified completion
     /// UX enforced at compile-test time.
     pub strict_metadata: bool,
+    /// Minimum command [`Stability`] offered during completion. Commands below
+    /// this threshold are omitted from suggestions (but remain runnable).
+    /// Defaults to [`Stability::Preview`], so `Experimental` commands are hidden
+    /// until lowered. [`handle_complete_env`] adjusts it per-completion when the
+    /// line begins with `---experimental` / `---preview` / `---stable`.
+    pub min_stability: Stability,
 }
 
 impl CommandTree {
@@ -1167,6 +1253,7 @@ impl CommandTree {
             global_flag_help: BTreeMap::new(),
             global_flag_long_help: BTreeMap::new(),
             strict_metadata: false,
+            min_stability: Stability::Preview,
         }
     }
 
@@ -1496,6 +1583,7 @@ pub fn complete_at_level_only(tree: &CommandTree, words: &[&str], only_level: u3
     if !node.children.is_empty() {
         let mut candidates: Vec<(u32, String)> = node.children.iter()
             .filter(|(k, _)| !at_root || !tree.hidden.contains(k.as_str()))
+            .filter(|(_, child)| child.stability() >= tree.min_stability)
             .filter(|(_, child)| child.level() <= only_level)
             .map(|(k, child)| (child.level(), k.to_string()))
             .collect();
@@ -1644,6 +1732,11 @@ pub fn complete_at_tap_with_raw(
             .filter(|s| !tree.hidden.contains(**s))
             .filter(|s| {
                 tree.root.child(s)
+                    .map(|n| n.stability() >= tree.min_stability)
+                    .unwrap_or(true)
+            })
+            .filter(|s| {
+                tree.root.child(s)
                     .map(|n| n.level() <= tap_count)
                     .unwrap_or(true)
             })
@@ -1745,6 +1838,7 @@ pub fn complete_at_tap_with_raw(
     let mut child_candidates: Vec<(u32, String)> = node.children.iter()
         .filter(|(k, _)| k.starts_with(partial))
         .filter(|(k, _)| !at_root || !partial.is_empty() || !tree.hidden.contains(k.as_str()))
+        .filter(|(_, child)| child.stability() >= tree.min_stability)
         .filter(|(_, child)| {
             // Level filter only applies at root with an empty
             // partial — once the user starts typing a name,
@@ -1963,6 +2057,10 @@ pub fn print_completions(app_name: &str, shell: Shell) {
 /// thing that can break is the (trivial) handoff itself.
 pub fn print_bash_script(app_name: &str) {
     let env_var = format!("_{}_COMPLETE", app_name.to_uppercase().replace('-', "_"));
+    // Sourcing this script marks completions as registered in the shell. The
+    // marker is exported so the binary itself can detect it (and stop nudging
+    // the user to enable completions). See [`completions_registered_marker`].
+    let marker = completions_registered_marker(app_name);
 
     // Echo argv[0] verbatim — whatever the user typed when invoking
     // the binary (`veks`, `./target/release/veks`,
@@ -2011,12 +2109,51 @@ pub fn print_bash_script(app_name: &str) {
     //   - `_COMP_SHELL_PID=$$`: engine reads it via `getppid()`.
     //   - `2>/dev/null`: binary is silent in completion mode;
     //     diagnostics live on `---trace-completion`.
-    print!(r#"_{app}_complete() {{ local IFS=$'\n'; local COMP_WORDBREAKS=$' \t\n<>;|&'; COMPREPLY=($({env_var}=bash "{completer}" "$COMP_LINE" "$COMP_POINT")); }}
+    print!(r#"export {marker}=1
+_{app}_complete() {{ local IFS=$'\n'; local COMP_WORDBREAKS=$' \t\n<>;|&'; COMPREPLY=($({env_var}=bash "{completer}" "$COMP_LINE" "$COMP_POINT")); }}
 complete -o nosort -o nospace -F _{app}_complete {app}
 "#,
         app = app_name,
+        marker = marker,
         env_var = env_var,
         completer = completer,
+    );
+}
+
+/// The environment variable the completion-registration script exports to mark
+/// that completions are wired up in the current shell — e.g.
+/// `_VECTORDATA_COMPLETIONS_REGISTERED`. The binary checks it (see
+/// [`hint_completions_unregistered`]) to decide whether to nudge the user.
+pub fn completions_registered_marker(app_name: &str) -> String {
+    format!("_{}_COMPLETIONS_REGISTERED", app_name.to_uppercase().replace('-', "_"))
+}
+
+/// Print a one-line nudge to **stderr** when tab-completion for `app_name` is
+/// not yet enabled in this shell, telling the user how to turn it on
+/// permanently. Call once per normal (non-completion) invocation.
+///
+/// No-op when:
+/// - the registration marker is already exported (completions are active), or
+/// - stderr is not a terminal (don't spam pipes, scripts, cron, or daemons), or
+/// - the user is in the middle of running `<app> completions` (setting it up).
+pub fn hint_completions_unregistered(app_name: &str) {
+    use std::io::IsTerminal;
+
+    if std::env::var_os(completions_registered_marker(app_name)).is_some() {
+        return;
+    }
+    if !std::io::stderr().is_terminal() {
+        return;
+    }
+    if std::env::args().skip(1).any(|a| a == "completions") {
+        return;
+    }
+
+    eprintln!(
+        "note: tab-completion for `{app}` is not enabled in this shell.\n  \
+         enable now:        eval \"$({app} completions)\"\n  \
+         enable permanently: echo 'eval \"$({app} completions)\"' >> ~/.bashrc   # or ~/.zshrc",
+        app = app_name,
     );
 }
 
@@ -2137,13 +2274,24 @@ pub fn handle_diagnostic_args(app_name: &str, tree: &CommandTree) -> bool {
     let rest: Vec<&str> = argv.iter().skip(idx + 1).map(|s| s.as_str()).collect();
     match flag {
         "---help" => {
-            println!("veks-completion diagnostic flags (triple-dash, reserved):");
-            for f in DIAGNOSTIC_FLAGS {
-                println!("  {f}");
-            }
+            println!("Triple-dash engine options (reserved — never collide with normal");
+            println!("`--` CLI flags):");
             println!();
-            println!("These are dev / test-only. They never collide with normal");
-            println!("`--` CLI flags. See the `handle_diagnostic_args` rustdoc.");
+            println!("  Completion stability threshold — put at the START of the line to");
+            println!("  control which commands tab-completion suggests:");
+            println!("    ---stable         only stable commands");
+            println!("    ---preview        stable + preview commands  (default)");
+            println!("    ---experimental   everything, incl. experimental commands");
+            println!();
+            println!("  List commands by maturity tier (prints the inventory, runs nothing):");
+            println!("    ---list-stable        commands tagged stable");
+            println!("    ---list-preview       commands tagged preview");
+            println!("    ---list-experimental  commands tagged experimental");
+            println!();
+            println!("  Diagnostics (dev / test only):");
+            for f in DIAGNOSTIC_FLAGS {
+                println!("    {f}");
+            }
         }
         "---version" => {
             println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
@@ -2151,6 +2299,11 @@ pub fn handle_diagnostic_args(app_name: &str, tree: &CommandTree) -> bool {
         }
         "---dump-tree" => dump_tree(&tree.root, &mut Vec::new()),
         "---list-providers" => list_providers(&tree.root, &mut Vec::new()),
+        "---list-stable" => list_by_stability(&tree.root, &mut Vec::new(), Stability::Stable),
+        "---list-preview" => list_by_stability(&tree.root, &mut Vec::new(), Stability::Preview),
+        "---list-experimental" => {
+            list_by_stability(&tree.root, &mut Vec::new(), Stability::Experimental)
+        }
         "---validate" => match tree.validate() {
             Ok(()) => println!("ok"),
             Err(errors) => {
@@ -2331,6 +2484,20 @@ fn list_providers(node: &Node, path: &mut Vec<String>) {
     }
 }
 
+/// Print the space-joined path of every command whose stability is *exactly*
+/// `want`, depth-first. Backs `---list-{stable,preview,experimental}`: a flat,
+/// scriptable inventory of the commands at one maturity tier.
+fn list_by_stability(node: &Node, path: &mut Vec<String>, want: Stability) {
+    if !path.is_empty() && node.stability() == want {
+        println!("{}", path.join(" "));
+    }
+    for (name, child) in node.children() {
+        path.push(name.clone());
+        list_by_stability(child, path, want);
+        path.pop();
+    }
+}
+
 fn print_partial_parse(pp: &PartialParse) {
     println!("raw_line:              {:?}", pp.raw_line);
     println!("cursor_offset:         {}", pp.cursor_offset);
@@ -2349,20 +2516,55 @@ fn print_partial_parse(pp: &PartialParse) {
 }
 
 pub fn handle_complete_env(app_name: &str, tree: &CommandTree) -> bool {
+    // ONLY the app-namespaced `_<APP>_COMPLETE` diverts execution. We do NOT
+    // honor a bare global `COMPLETE` env var: it's set by clap_complete-era
+    // shims and, if it leaks into the environment, would turn every normal
+    // invocation (`<app> --version`, `<app> serve …`) into a silent completion
+    // request — a binary that mysteriously stops running. The registration
+    // script we emit uses `_<APP>_COMPLETE` precisely so it can't collide.
     let env_var = format!("_{}_COMPLETE", app_name.to_uppercase().replace('-', "_"));
-    let is_ours = std::env::var(&env_var).ok().as_deref() == Some("bash");
-    let is_legacy = std::env::var("COMPLETE").ok().as_deref() == Some("bash");
-    if !is_ours && !is_legacy {
+    if std::env::var(&env_var).ok().as_deref() != Some("bash") {
         return false;
     }
 
     let argv: Vec<String> = std::env::args().collect();
+
+    // Activation handshake vs. completion request. A completion callback always
+    // passes the command line as `argv[1]` (the `$COMP_LINE`/`$COMP_POINT` shim
+    // in `print_bash_script`). A *bare* `_<APP>_COMPLETE=bash <app>` carries no
+    // line and means "give me the registration script" — emit the shim rather
+    // than completing the empty line (which would dump the subcommand list).
+    if argv.len() <= 1 {
+        print_bash_script(app_name);
+        return true;
+    }
+
     let line = argv.get(1).cloned().unwrap_or_default();
     let point: usize = argv.get(2)
         .and_then(|s| s.parse().ok())
         .unwrap_or(line.len());
 
     let (prior, cur) = split_line(&line, point);
+
+    // A leading `---experimental` / `---preview` / `---stable` token sets the
+    // completion stability threshold for this request. Every `---…` token is
+    // engine meta — never a subcommand and never itself offered as a candidate —
+    // so strip all of them from the path words before resolution.
+    let (threshold, prior) = split_stability_prefix(prior, tree.min_stability);
+
+    // Scope the tree to the requested threshold (cheap clone; this process is
+    // short-lived and runs once per keystroke). Avoid the clone in the common
+    // case where the threshold is unchanged.
+    let scoped: CommandTree;
+    let tree: &CommandTree = if threshold == tree.min_stability {
+        tree
+    } else {
+        let mut t = tree.clone();
+        t.min_stability = threshold;
+        scoped = t;
+        &scoped
+    };
+
     // The downstream API takes a `words: &[&str]` shape where
     // index 0 is the binary name and the last entry is the
     // (possibly empty) word under the cursor.

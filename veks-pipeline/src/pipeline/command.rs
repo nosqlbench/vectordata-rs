@@ -87,6 +87,15 @@ pub trait CommandOp: Send {
     /// more discoverable.
     fn level(&self) -> &'static dyn veks_completion::LevelTag;
 
+    /// Maturity tier governing whether this command is offered during
+    /// tab-completion. Defaults to [`veks_completion::Stability::Stable`];
+    /// override with `Preview` or `Experimental` to keep an in-progress command
+    /// out of the default suggestion set. It stays runnable regardless, and
+    /// surfaces in completion under a `---experimental` / `---preview` prefix.
+    fn stability(&self) -> veks_completion::Stability {
+        veks_completion::Stability::Stable
+    }
+
     /// Execute with resolved options.
     fn execute(&mut self, options: &Options, ctx: &mut StreamContext) -> CommandResult;
 

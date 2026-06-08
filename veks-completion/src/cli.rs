@@ -116,6 +116,10 @@ pub struct CommandSpec {
     /// Free-form text appended after the options block in `--help` (examples,
     /// notes). From `#[command(after_help/after_long_help = …)]`.
     pub after_help: Option<String>,
+    /// Maturity tier (see [`crate::Stability`]) — governs whether this command is
+    /// offered during completion. From `#[command(stability = "…")]`. Defaults
+    /// to `Stable`.
+    pub stability: crate::Stability,
 }
 
 impl CommandSpec {
@@ -133,6 +137,11 @@ impl CommandSpec {
     }
     pub fn after_help(mut self, a: impl Into<String>) -> Self {
         self.after_help = Some(a.into());
+        self
+    }
+    /// Declare this command's maturity tier (see [`crate::Stability`]).
+    pub fn stability(mut self, s: crate::Stability) -> Self {
+        self.stability = s;
         self
     }
     pub fn option(mut self, o: OptionSpec) -> Self {
@@ -268,6 +277,15 @@ pub fn parse(spec: &CommandSpec, argv: &[String]) -> Result<ParsedArgs, ParseErr
 
         if !options_ended && arg == "--" {
             options_ended = true;
+            i += 1;
+            continue;
+        }
+
+        // Triple-dash tokens are reserved engine meta (e.g. `---experimental`
+        // steers tab-completion; `---dump-tree` is a diagnostic). They are never
+        // real `--` flags, so skip them — a line the user completed with one
+        // (`veks ---experimental datasets list`) still parses and runs.
+        if !options_ended && arg.starts_with("---") {
             i += 1;
             continue;
         }
@@ -446,6 +464,25 @@ fn render_two_col(out: &mut String, rows: &[(String, String)]) {
     }
 }
 
+/// Render `--help` for the deepest subcommand named by the leading words of
+/// `argv`, so `app group leaf --help` shows the leaf's options rather than the
+/// group overview. Stops descending at the first flag (or unknown word) and
+/// renders whatever level was reached (the root when `argv` names none).
+pub fn render_help_for<S: AsRef<str>>(root: &CommandSpec, argv: &[S]) -> String {
+    let mut spec = root;
+    for word in argv {
+        let word = word.as_ref();
+        if word.starts_with('-') {
+            break;
+        }
+        match spec.find_subcommand(word) {
+            Some(sub) => spec = sub,
+            None => break,
+        }
+    }
+    render_help(spec)
+}
+
 /// Render `--help` text for a command spec, formatted comparably to clap:
 /// about, usage, aliases, commands, arguments, options (with an auto
 /// `-h, --help`), and any `after_help`.
@@ -589,13 +626,13 @@ fn spec_to_node(
                 }
             }
         }
-        node
+        node.with_stability(spec.stability)
     } else {
         let mut node = crate::Node::empty_group();
         for sub in &spec.subcommands {
             node = node.with_child(&sub.name, spec_to_node(sub, resolvers));
         }
-        node
+        node.with_stability(spec.stability)
     }
 }
 
@@ -819,6 +856,43 @@ mod derive_tests {
         },
     }
 
+    #[derive(VeksCli)]
+    #[command(stability = "preview")]
+    struct PreviewArgs {
+        #[arg(long)]
+        x: bool,
+    }
+
+    #[derive(VeksCli)]
+    enum StabilityCmd {
+        /// Stable by default (no attribute).
+        Steady {
+            #[arg(long)]
+            a: bool,
+        },
+        #[command(stability = "experimental")]
+        Risky {
+            #[arg(long)]
+            b: bool,
+        },
+    }
+
+    #[test]
+    fn derive_reads_command_stability() {
+        use crate::Stability;
+        // Type-level `#[command(stability = "preview")]`.
+        assert_eq!(
+            PreviewArgs::veks_command_spec("preview-args").stability,
+            Stability::Preview
+        );
+        // Variant-level: explicit on one, default (Stable) on the other.
+        let spec = StabilityCmd::veks_command_spec("app");
+        let steady = spec.subcommands.iter().find(|c| c.name == "steady").unwrap();
+        let risky = spec.subcommands.iter().find(|c| c.name == "risky").unwrap();
+        assert_eq!(steady.stability, Stability::Stable);
+        assert_eq!(risky.stability, Stability::Experimental);
+    }
+
     #[test]
     fn derive_enum_subcommand_dispatch() {
         let spec = Cmd::veks_command_spec("veks");
@@ -832,5 +906,67 @@ mod derive_tests {
         // named-field variant
         let p2 = crate::cli::parse(&spec, &argv(&["list", "--verbose"])).unwrap();
         assert_eq!(Cmd::veks_from_parsed(&p2).unwrap(), Cmd::List { verbose: true });
+    }
+
+    #[test]
+    fn completion_hides_commands_below_stability_threshold() {
+        use crate::{CommandSpec, Stability};
+        let spec = CommandSpec::new("app")
+            .subcommand(CommandSpec::new("stable-cmd"))
+            .subcommand(CommandSpec::new("preview-cmd").stability(Stability::Preview))
+            .subcommand(CommandSpec::new("exp-cmd").stability(Stability::Experimental));
+        let resolvers = std::collections::BTreeMap::new();
+        let mut tree = crate::cli::build_completion_tree(&spec, &resolvers);
+
+        let has = |t: &crate::CommandTree, name: &str| {
+            crate::complete_at_tap_with_raw(t, &["app", ""], 1, "app ", 4)
+                .iter()
+                .any(|c| c.split('\t').next() == Some(name))
+        };
+
+        // Default threshold (Preview): stable + preview shown, experimental hidden.
+        tree.min_stability = Stability::Preview;
+        assert!(has(&tree, "stable-cmd"));
+        assert!(has(&tree, "preview-cmd"));
+        assert!(!has(&tree, "exp-cmd"), "experimental hidden at the default threshold");
+
+        // Experimental threshold: everything, including experimental.
+        tree.min_stability = Stability::Experimental;
+        assert!(has(&tree, "exp-cmd"), "experimental shown when threshold is lowered");
+
+        // Stable threshold: only stable.
+        tree.min_stability = Stability::Stable;
+        assert!(has(&tree, "stable-cmd"));
+        assert!(!has(&tree, "preview-cmd"), "preview hidden at the stable threshold");
+    }
+
+    #[test]
+    fn parse_skips_triple_dash_engine_tokens() {
+        use crate::{CommandSpec, OptionDef, OptionSpec};
+        // A `---experimental` left on the line by tab-completion must not break
+        // execution — `cli::parse` skips all `---…` tokens.
+        let spec = CommandSpec::new("app").subcommand(
+            CommandSpec::new("go").option(OptionSpec::new(OptionDef::flag("--verbose"))),
+        );
+        let p = crate::cli::parse(&spec, &argv(&["---experimental", "go", "--verbose"])).unwrap();
+        let (sub, sp) = p.subcommand().unwrap();
+        assert_eq!(sub, "go");
+        assert!(sp.has_flag("--verbose"));
+    }
+
+    #[test]
+    fn stability_prefix_sets_threshold_and_strips_meta() {
+        use crate::Stability;
+        let (t, words) = crate::split_stability_prefix(
+            vec!["---experimental".into(), "datasets".into()],
+            Stability::Preview,
+        );
+        assert_eq!(t, Stability::Experimental);
+        assert_eq!(words, vec!["datasets".to_string()]);
+
+        // No threshold token → the default is kept, non-meta words untouched.
+        let (t2, w2) = crate::split_stability_prefix(vec!["x".into()], Stability::Preview);
+        assert_eq!(t2, Stability::Preview);
+        assert_eq!(w2, vec!["x".to_string()]);
     }
 }

@@ -1806,40 +1806,19 @@ fn cmd_log(
 /// script — subcommands added later show up automatically. With no `--shell`,
 /// detect from `$SHELL`.
 fn cmd_completions(shell: Option<String>) {
-    let argv0 = std::env::args_os()
-        .next()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "vecd".to_string());
-    let name = match shell.or_else(detect_shell_from_env) {
-        Some(s) => s,
-        None => {
-            eprintln!("Could not auto-detect your shell from $SHELL.");
-            eprintln!("Pass --shell explicitly: bash | zsh | fish | elvish | powershell");
-            std::process::exit(1);
-        }
-    };
-    println!("# vecd tab-completion for {name} (dynamic — defers to the binary)");
-    println!("# To activate now:  eval \"$(vecd completions)\"");
-    println!("# To persist:       add the activation line to your shell rc file");
-    match name.as_str() {
-        "fish" => println!("COMPLETE=fish \"{argv0}\" | source"),
-        "elvish" => println!("eval (COMPLETE=elvish \"{argv0}\" | slurp)"),
-        "powershell" => {
-            println!(r#"(& {{ $env:COMPLETE="powershell"; "{argv0}" }}) | Invoke-Expression"#)
-        }
-        _ /* Bash / Zsh */ => println!("source <(COMPLETE={name} \"{argv0}\")"),
-    }
-}
-
-/// Best-effort shell name from `$SHELL` (the basename), or `None`.
-fn detect_shell_from_env() -> Option<String> {
-    let sh = std::env::var("SHELL").ok()?;
-    let base = std::path::Path::new(&sh).file_name()?.to_string_lossy().to_string();
-    match base.as_str() {
-        "bash" | "zsh" | "fish" | "elvish" | "powershell" | "pwsh" => Some(
-            if base == "pwsh" { "powershell".to_string() } else { base },
-        ),
-        _ => None,
+    // Delegate to the completion framework, which owns the registration
+    // protocol (the emitted bash shim calls back via `_VECD_COMPLETE`, never a
+    // bare `COMPLETE=bash vecd`). With no `--shell`, auto-detect and emit the
+    // indirect `source <(…)` wrapper.
+    match shell {
+        Some(s) => match veks_completion::Shell::from_name(&s) {
+            Some(sh) => veks_completion::print_completions("vecd", sh),
+            None => {
+                eprintln!("unknown shell '{s}' (expected bash | zsh | fish | elvish | powershell)");
+                std::process::exit(1);
+            }
+        },
+        None => veks_completion::print_indirect_wrapper("vecd"),
     }
 }
 

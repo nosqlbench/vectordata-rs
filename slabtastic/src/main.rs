@@ -16,6 +16,10 @@ fn main() {
     if veks_completion::handle_complete_env("slab", &tree) {
         return;
     }
+    if veks_completion::handle_diagnostic_args("slab", &tree) {
+        return;
+    }
+    veks_completion::hint_completions_unregistered("slab");
 
     let args: Vec<String> = std::env::args().skip(1).collect();
 
@@ -24,13 +28,9 @@ fn main() {
         return;
     }
     if args.first().is_none() || args.iter().any(|a| a == "--help" || a == "-h") {
-        // Render the matching subcommand's help when the first word names one;
-        // otherwise the top-level overview.
-        if let Some(sub) = args.first().and_then(|f| spec.subcommands.iter().find(|c| &c.name == f)) {
-            print!("{}", vcli::render_help(sub));
-        } else {
-            print!("{}", vcli::render_help(&spec));
-        }
+        // Render help for the deepest subcommand named on the line (group →
+        // leaf), falling back to the top-level overview.
+        print!("{}", vcli::render_help_for(&spec, &args));
         return;
     }
 

@@ -191,6 +191,43 @@ fn parse_field_attrs(field: &Field) -> syn::Result<FieldAttrs> {
 }
 
 /// `#[command(about = "…")]` or the type's doc comment.
+/// Read a `#[command(key = "literal")]` string from an attribute list (works
+/// for both type-level and enum-variant attrs).
+fn command_str_attr(attrs: &[Attribute], key: &str) -> Option<String> {
+    for attr in attrs {
+        if attr.path().is_ident("command") {
+            let mut out = None;
+            let _ = attr.parse_nested_meta(|meta| {
+                if meta.path.is_ident(key) {
+                    if let Ok(v) = meta.value() {
+                        if let Ok(s) = v.parse::<syn::LitStr>() {
+                            out = Some(s.value());
+                        }
+                    }
+                } else {
+                    let _ = meta.value().and_then(|v| v.parse::<Expr>());
+                }
+                Ok(())
+            });
+            if out.is_some() {
+                return out;
+            }
+        }
+    }
+    None
+}
+
+/// The `.stability(…)` builder call from `#[command(stability = "…")]`, if any.
+/// An unrecognized value falls back to the default (`Stable`) at runtime.
+fn stability_call(attrs: &[Attribute]) -> TS2 {
+    match command_str_attr(attrs, "stability") {
+        Some(s) => quote! {
+            .stability(::veks_completion::Stability::from_name(#s).unwrap_or_default())
+        },
+        None => quote! {},
+    }
+}
+
 fn type_about(di: &DeriveInput) -> Option<String> {
     for attr in &di.attrs {
         if attr.path().is_ident("command") {
@@ -252,7 +289,8 @@ fn about_after_help_calls(di: &DeriveInput) -> TS2 {
         Some(h) => quote! { .after_help(#h) },
         None => quote! {},
     };
-    quote! { #about #after }
+    let stability = stability_call(&di.attrs);
+    quote! { #about #after #stability }
 }
 
 // ---------------------------------------------------------------------------
@@ -617,7 +655,8 @@ fn derive_enum(
         };
         let aliases = collect_aliases(&variant.attrs);
         let alias_calls = quote! { #(.alias(#aliases))* };
-        let vabout_call = quote! { #vabout_call #alias_calls };
+        let stability = stability_call(&variant.attrs);
+        let vabout_call = quote! { #vabout_call #alias_calls #stability };
 
         match &variant.fields {
             Fields::Unit => {
