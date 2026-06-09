@@ -1,5 +1,0 @@
-.scratch/
-.cache/
-*
-!dataset.yaml
-!.gitignore
