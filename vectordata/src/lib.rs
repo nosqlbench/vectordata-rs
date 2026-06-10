@@ -86,6 +86,11 @@ pub(crate) mod storage;
 /// [`settings::cache_dir`] rather than parsing `settings.yaml`
 /// themselves so the user's override is honored uniformly.
 pub mod settings;
+/// Unified file/directory filtering rules (excluded dirs/files, infrastructure
+/// metadata, merkle/staleness exemptions). The base definition lives here so the
+/// push engine and the higher `veks publish` surface share one set of rules;
+/// `veks-core`/`veks` re-export it as `filters`.
+pub mod filters;
 /// Live mount-table inspection (shared by [`settings`] for the
 /// auto-bootstrap of `cache_dir` and by [`config`] for the
 /// user-facing `list-mounts` command).

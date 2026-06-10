@@ -74,7 +74,7 @@ Behind `#[cfg(feature = "faiss")]` only:
 ### `--personality knn_utils` Bootstrap
 
 ```bash
-veks prepare bootstrap --personality knn_utils --base-vectors source.fvec --metric Cosine
+veks prepare bootstrap --personality knn_utils --base-vectors source.fvecs --metric Cosine
 ```
 
 Maps native commands to knn\_utils equivalents:
@@ -142,7 +142,7 @@ package is freely distributed by Intel via apt under the Intel
 Simplified Software License (ISSL).
 
 **With MKL**: `compute knn-blas` output matches Python knn\_utils on
-the same machine (verified byte-identical for sift128e HDF5 dataset).
+the same machine (verified byte-identical for a 128-dim HDF5 dataset).
 
 **With OpenBLAS**: 99.95% identical neighbor sets; ~5 queries per 10k
 swap a single neighbor at the k=100 boundary (ULP-level BLAS rounding).
@@ -156,12 +156,12 @@ swap a single neighbor at the k=100 boundary (ULP-level BLAS rounding).
 
 | Dataset | Source | Base | Query | GT | Engine |
 |---------|--------|------|-------|----|--------|
-| **sift128e** | HDF5 | BYTE-IDENTICAL | BYTE-IDENTICAL | BYTE-IDENTICAL | knn-blas (OpenBLAS) |
-| **ada0021m** | non-HDF5 (zeros, unnormalized) | Self-consistent PASS | Self-consistent PASS | Self-consistent PASS | knn-blas |
+| **128-dim HDF5 dataset** | HDF5 | BYTE-IDENTICAL | BYTE-IDENTICAL | BYTE-IDENTICAL | knn-blas (OpenBLAS) |
+| **1536-dim non-HDF5 dataset** | non-HDF5 (zeros, unnormalized) | Self-consistent PASS | Self-consistent PASS | Self-consistent PASS | knn-blas |
 
 ### A/B Testing (knn-blas vs knn-faiss)
 
-sift128e (985k×10k×128, k=10): 9998/10000 exact match, 2 set match, 0 real differences.
+128-dim HDF5 dataset (985k×10k×128, k=10): 9998/10000 exact match, 2 set match, 0 real differences.
 
 ---
 

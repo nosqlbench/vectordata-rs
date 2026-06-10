@@ -9,8 +9,8 @@ Three record structures, distinguished by file extension:
 | Structure | Extension pattern | Header | Random access |
 |-----------|------------------|--------|---------------|
 | **Scalar** | `.<type>` (`.u8`, `.i32`, `.f64`) | None | `offset = ordinal × elem_size` |
-| **Uniform vector** | `.<type>vec` (`.fvec`, `.ivec`) | 4-byte dim per record | `offset = ordinal × stride` |
-| **Variable vector** | `.<type>vvec` (`.ivvec`, `.fvvec`) | 4-byte dim per record | Requires offset index |
+| **Uniform vector** | `.<type>vec` (`.fvecs`, `.ivecs`) | 4-byte dim per record | `offset = ordinal × stride` |
+| **Variable vector** | `.<type>vvec` (`.ivvecs`, `.fvvecs`) | 4-byte dim per record | Requires offset index |
 
 ### Scalar
 
@@ -60,17 +60,17 @@ The index is a scalar file of byte offsets — one per record.
 
 | Type | Size | Scalar ext | Vec ext | Vvec ext | Legacy |
 |------|------|-----------|---------|----------|--------|
-| f32 | 4 B | — | `.f32vec` | `.f32vvec` | `.fvec` |
-| f64 | 8 B | — | `.f64vec` | `.f64vvec` | `.dvec` |
-| f16 | 2 B | — | `.f16vec` | `.f16vvec` | `.mvec` |
-| u8 | 1 B | `.u8` | `.u8vec` | `.u8vvec` | `.bvec` |
-| i8 | 1 B | `.i8` | `.i8vec` | `.i8vvec` | — |
-| u16 | 2 B | `.u16` | `.u16vec` | `.u16vvec` | — |
-| i16 | 2 B | `.i16` | `.i16vec` | `.i16vvec` | `.svec` |
-| u32 | 4 B | `.u32` | `.u32vec` | `.u32vvec` | — |
-| i32 | 4 B | `.i32` | `.i32vec` | `.i32vvec` | `.ivec` |
-| u64 | 8 B | `.u64` | `.u64vec` | `.u64vvec` | — |
-| i64 | 8 B | `.i64` | `.i64vec` | `.i64vvec` | — |
+| f32 | 4 B | — | `.f32vecs` | `.f32vvecs` | `.fvecs` |
+| f64 | 8 B | — | `.f64vecs` | `.f64vvecs` | `.dvecs` |
+| f16 | 2 B | — | `.f16vecs` | `.f16vvecs` | `.mvecs` |
+| u8 | 1 B | `.u8` | `.u8vecs` | `.u8vvecs` | `.bvecs` |
+| i8 | 1 B | `.i8` | `.i8vecs` | `.i8vvecs` | — |
+| u16 | 2 B | `.u16` | `.u16vecs` | `.u16vvecs` | — |
+| i16 | 2 B | `.i16` | `.i16vecs` | `.i16vvecs` | `.svecs` |
+| u32 | 4 B | `.u32` | `.u32vecs` | `.u32vvecs` | — |
+| i32 | 4 B | `.i32` | `.i32vecs` | `.i32vvecs` | `.ivecs` |
+| u64 | 8 B | `.u64` | `.u64vecs` | `.u64vvecs` | — |
+| i64 | 8 B | `.i64` | `.i64vecs` | `.i64vvecs` | — |
 
 All legacy extensions are fully supported as aliases. Plural forms
 (`.fvecs`, `.ivvecs`) are accepted everywhere.
@@ -100,13 +100,13 @@ Python or any HDF5-capable tool:
 import h5py, numpy as np
 with h5py.File('dataset.hdf5', 'r') as f:
     vecs = np.array(f['train'], dtype=np.float32)
-    with open('base_vectors.fvec', 'wb') as out:
+    with open('base_vectors.fvecs', 'wb') as out:
         for v in vecs:
             out.write(np.int32(len(v)).tobytes())
             out.write(v.tobytes())
 ```
 
-Then use the resulting `.fvec` file as input to `veks bootstrap`.
+Then use the resulting `.fvecs` file as input to `veks bootstrap`.
 
 ### Slab internals
 
@@ -204,15 +204,15 @@ describe a vector search benchmark:
 
 | Code | Name | Structure | Typical format | Description |
 |------|------|-----------|---------------|-------------|
-| **B** | Base vectors | uniform vec | `.fvec` | The searchable vector collection |
-| **Q** | Query vectors | uniform vec | `.fvec` | Vectors to search for |
-| **G** | Ground truth indices | uniform vec | `.ivec` | Exact k-nearest neighbor ordinals per query |
-| **D** | Ground truth distances | uniform vec | `.fvec` | Distances to the k-nearest neighbors |
+| **B** | Base vectors | uniform vec | `.fvecs` | The searchable vector collection |
+| **Q** | Query vectors | uniform vec | `.fvecs` | Vectors to search for |
+| **G** | Ground truth indices | uniform vec | `.ivecs` | Exact k-nearest neighbor ordinals per query |
+| **D** | Ground truth distances | uniform vec | `.fvecs` | Distances to the k-nearest neighbors |
 | **M** | Metadata content | scalar | `.u8` | Per-base-vector attribute values |
 | **P** | Metadata predicates | scalar | `.u8` | Per-query filter values |
-| **R** | Predicate results | variable vec | `.ivvec` | Base ordinals matching each predicate |
-| **F** | Pre-filter KNN ground truth | uniform vec | `.ivec` + `.fvec` | ACORN `G_K`: top-K over `X_p` (predicate-passing base vectors). Full K when `\|X_p\| ≥ K`; perfect recall. Canonical key: `prefiltered_neighbor_*`. Legacy key `filtered_neighbor_*` resolves here. |
-| **E** | Post-filter KNN ground truth | uniform vec | `.ivec` + `.fvec` | `G ∩ R`: unfiltered top-K intersected with predicate-passing set. Sparse possible (`\|E\| ∈ [0, K]`). Canonical key: `postfiltered_neighbor_*`. |
+| **R** | Predicate results | variable vec | `.ivvecs` | Base ordinals matching each predicate |
+| **F** | Pre-filter KNN ground truth | uniform vec | `.ivecs` + `.fvecs` | ACORN `G_K`: top-K over `X_p` (predicate-passing base vectors). Full K when `\|X_p\| ≥ K`; perfect recall. Canonical key: `prefiltered_neighbor_*`. Legacy key `filtered_neighbor_*` resolves here. |
+| **E** | Post-filter KNN ground truth | uniform vec | `.ivecs` + `.fvecs` | `G ∩ R`: unfiltered top-K intersected with predicate-passing set. Sparse possible (`\|E\| ∈ [0, K]`). Canonical key: `postfiltered_neighbor_*`. |
 | **O** | Oracle partitions | per-label profiles | directories | Per-label base vectors + partitioned KNN |
 
 The F (pre-filter) and E (post-filter) facets are *both* filtered
@@ -259,19 +259,19 @@ dataset-name/
 ├── dataset.yaml              # manifest: attributes, pipeline, profiles
 ├── profiles/
 │   ├── base/                 # shared source data (symlinks or generated)
-│   │   ├── base_vectors.fvec
-│   │   ├── query_vectors.fvec
+│   │   ├── base_vectors.fvecs
+│   │   ├── query_vectors.fvecs
 │   │   ├── metadata_content.u8
 │   │   └── predicates.u8
 │   └── default/              # per-profile computed artifacts
-│       ├── neighbor_indices.ivec
-│       ├── neighbor_distances.fvec
-│       ├── metadata_indices.ivvec
-│       ├── IDXFOR__metadata_indices.ivvec.i32
-│       ├── prefiltered_neighbor_indices.ivec      # F facet (ACORN G_K)
-│       ├── prefiltered_neighbor_distances.fvec
-│       ├── postfiltered_neighbor_indices.ivec     # E facet (G ∩ R)
-│       └── postfiltered_neighbor_distances.fvec
+│       ├── neighbor_indices.ivecs
+│       ├── neighbor_distances.fvecs
+│       ├── metadata_indices.ivvecs
+│       ├── IDXFOR__metadata_indices.ivvecs.i32
+│       ├── prefiltered_neighbor_indices.ivecs      # F facet (ACORN G_K)
+│       ├── prefiltered_neighbor_distances.fvecs
+│       ├── postfiltered_neighbor_indices.ivecs     # E facet (G ∩ R)
+│       └── postfiltered_neighbor_distances.fvecs
 ├── dataset.json              # machine-readable metadata
 ├── variables.yaml            # pipeline-computed variables
 ├── catalog.json              # dataset index for catalog discovery
@@ -319,11 +319,11 @@ upstream:
 profiles:
   default:
     maxk: 100
-    base_vectors: profiles/base/base_vectors.fvec
-    query_vectors: profiles/base/query_vectors.fvec
-    neighbor_indices: profiles/default/neighbor_indices.ivec
+    base_vectors: profiles/base/base_vectors.fvecs
+    query_vectors: profiles/base/query_vectors.fvecs
+    neighbor_indices: profiles/default/neighbor_indices.ivecs
     metadata_content: profiles/base/metadata_content.u8
-    metadata_indices: profiles/default/metadata_indices.ivvec
+    metadata_indices: profiles/default/metadata_indices.ivvecs
 
 # Strata are generators that expand into per-size sized profiles at
 # load/publish time. They live at the root of dataset.yaml — not under

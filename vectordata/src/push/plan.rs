@@ -177,19 +177,8 @@ fn walk(
         let ft = entry.file_type().map_err(|e| format!("scanning {}: {e}", dir.display()))?;
         let path = entry.path();
 
-        // Refuse to publish anything we can't represent faithfully and
-        // completely. A symlink would either be silently dropped (data
-        // loss) or escape the publish root if followed; a non-UTF-8 name
-        // can't round-trip through the URL/SHA256SUMS key space without
-        // lossy mangling. Both are hard stops, not silent surprises.
-        if ft.is_symlink() {
-            return Err(format!(
-                "refusing to publish: '{}' is a symbolic link.\n\
-                 Symlinks can't be published faithfully (they'd be dropped or escape the root). \
-                 Materialize it into a real file first.",
-                rel_display(root, &path)
-            ));
-        }
+        // A non-UTF-8 name can't round-trip through the URL/SHA256SUMS key space
+        // without lossy mangling — a hard stop, not a silent surprise.
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
             return Err(format!(
                 "refusing to publish: '{}' has a non-UTF-8 file name, which can't be represented \
@@ -198,12 +187,53 @@ fn walk(
             ));
         };
 
-        if ft.is_dir() {
-            subdirs.push(path);
-        } else if ft.is_file() && !is_sentinel(&name) {
-            had_content = true;
-            files.push(rel_of(root, &path));
+        // Resolve dir-vs-file, *following* symlinks: a symlinked entry is
+        // published as its target's content under the link's own name (datasets
+        // routinely symlink a facet to a shared file). `metadata` follows the
+        // link; an `Err` means it's broken. The bytes are later read via the
+        // same path, which follows the link too — so faithful content ships.
+        let (is_dir, is_file) = if ft.is_symlink() {
+            match std::fs::metadata(&path) {
+                Ok(m) => (m.is_dir(), m.is_file()),
+                Err(_) => (false, false), // broken link — handled below
+            }
+        } else {
+            (ft.is_dir(), ft.is_file())
+        };
+
+        // Same include/exclude rules as `veks publish` (shared `filters`):
+        // hidden/scratch dirs & files, build/tooling dirs, temp/partial files.
+        if is_dir {
+            if ft.is_symlink() {
+                // A symlink to a directory can't be "pushed as a whole file";
+                // following it risks escaping the root or looping. Refuse with
+                // guidance (unless the name is excluded anyway).
+                if !crate::filters::is_excluded_dir(&name) {
+                    return Err(format!(
+                        "refusing to publish: '{}' is a symlink to a directory. \
+                         Publish the directory's real contents instead.",
+                        rel_display(root, &path)
+                    ));
+                }
+            } else if !crate::filters::is_excluded_dir(&name) {
+                subdirs.push(path);
+            }
+        } else if is_file {
+            if !is_sentinel(&name) && !crate::filters::is_excluded_file(&name) {
+                had_content = true;
+                files.push(rel_of(root, &path));
+            }
+        } else if ft.is_symlink() && !crate::filters::is_excluded_file(&name) {
+            // Broken link, or one pointing at a non-regular file — refuse rather
+            // than silently drop it (an excluded name is skipped quietly above).
+            return Err(format!(
+                "refusing to publish: '{}' is a broken symbolic link (or points to a \
+                 non-regular file). Repair its target, materialize it, or remove it.",
+                rel_display(root, &path)
+            ));
         }
+        // else: a non-regular, non-symlink entry (fifo/socket) — skipped, as
+        // the previous `is_file()`-only rule did.
     }
     if had_content {
         content_dirs.push(rel_of(root, dir));

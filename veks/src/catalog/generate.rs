@@ -439,7 +439,7 @@ mod tests {
         std::fs::create_dir(&ds).unwrap();
         std::fs::write(
             ds.join("dataset.yaml"),
-            r#"name: sift-128
+            r#"name: glove-100
 attributes:
   distance_function: L2
   license: MIT
@@ -458,7 +458,7 @@ profiles:
         let root = tmp.path().canonicalize().unwrap();
         let entry = datasets[0].to_entry(&root);
 
-        assert_eq!(entry.name, "sift-128");
+        assert_eq!(entry.name, "glove-100");
         assert_eq!(entry.dataset_type, "dataset.yaml");
         assert!(entry.path.contains("dataset.yaml"));
 

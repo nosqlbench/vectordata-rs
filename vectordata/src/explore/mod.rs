@@ -196,7 +196,7 @@ fn run_precache(specifier: &str, pause: bool) {
     // Picker-initiated precache drives the *highlighted profile only*.
     // Earlier this stripped the `:profile` suffix and walked every
     // profile via `ProfileSelection::AllProfiles`, but for datasets
-    // with many sized profiles (e.g. `ibm-datapile-1b` has ~130)
+    // with many sized profiles (e.g. `example-1b` has ~130)
     // that's two pathologies at once:
     //   1. `plan_prebuffer` opens FacetStorage for every facet of
     //      every profile to learn its total_size, which means O(130

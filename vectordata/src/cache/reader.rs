@@ -368,19 +368,19 @@ mod tests {
     fn legacy_layout_dir_rejects_natural_dataset_names() {
         // Catalog dataset names (no dots, no auth-shape) — should be
         // left alone.
-        assert!(!is_legacy_layout_dir("sift1m"));
-        assert!(!is_legacy_layout_dir("ibm-datapile-1b"));
+        assert!(!is_legacy_layout_dir("vecs1m"));
+        assert!(!is_legacy_layout_dir("example-1b"));
         assert!(!is_legacy_layout_dir(""));
     }
 
     #[test]
     fn glob_match_basic_patterns() {
-        assert!(glob_match("sift1m", "sift1m"));
-        assert!(!glob_match("sift1m", "sift1m-2"));
-        assert!(glob_match("sift*", "sift1m"));
-        assert!(glob_match("*1m", "sift1m"));
-        assert!(glob_match("sift?m", "sift1m"));
-        assert!(!glob_match("sift?m", "sift10m"));
+        assert!(glob_match("vecs1m", "vecs1m"));
+        assert!(!glob_match("vecs1m", "vecs1m-2"));
+        assert!(glob_match("vecs*", "vecs1m"));
+        assert!(glob_match("*1m", "vecs1m"));
+        assert!(glob_match("vecs?m", "vecs1m"));
+        assert!(!glob_match("vecs?m", "vecs10m"));
         assert!(glob_match("label_*", "label_03"));
         assert!(!glob_match("label_*", "default"));
         assert!(glob_match("*", "anything"));
@@ -411,7 +411,7 @@ mod tests {
         let root = tmp.path();
 
         // Natural-layout dataset.
-        seed_dataset(root, "sift1m", "https://example.com/sift1m/");
+        seed_dataset(root, "vecs1m", "https://example.com/vecs1m/");
         // Legacy buckets — the two cutover-era shapes that are
         // cross-platform safe to construct.
         fs::create_dir_all(root.join("blobs/aa/bb")).unwrap();
@@ -427,7 +427,7 @@ mod tests {
             .map(|e| e.path.file_name().unwrap().to_string_lossy().to_string())
             .collect::<Vec<_>>();
 
-        assert_eq!(names(&listing.datasets), vec!["sift1m"]);
+        assert_eq!(names(&listing.datasets), vec!["vecs1m"]);
         let mut leg = names(&listing.legacy); leg.sort();
         assert_eq!(leg, vec!["blobs", "http"]);
         assert_eq!(names(&listing.other), vec!["weirdo"]);
@@ -437,12 +437,12 @@ mod tests {
     fn list_entries_records_dataset_origin() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        seed_dataset(root, "sift1m", "https://example.com/sift1m/");
+        seed_dataset(root, "vecs1m", "https://example.com/vecs1m/");
         let listing = list_entries(root).unwrap();
         assert_eq!(listing.datasets.len(), 1);
         let entry = &listing.datasets[0];
         assert_eq!(entry.origin_url.as_deref(),
-            Some("https://example.com/sift1m/"));
+            Some("https://example.com/vecs1m/"));
         assert_eq!(entry.origin_host.as_deref(), Some("example.com"));
     }
 
@@ -450,28 +450,28 @@ mod tests {
     fn prune_by_filter_dry_run_lists_matches_without_removal() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        seed_dataset(root, "sift1m", "https://example.com/sift1m/");
+        seed_dataset(root, "vecs1m", "https://example.com/vecs1m/");
         seed_dataset(root, "glove", "https://example.com/glove/");
 
         let report = prune_by_filter(root,
-            &PruneFilter { dataset: Some("sift*".into()) }, true).unwrap();
+            &PruneFilter { dataset: Some("vecs*".into()) }, true).unwrap();
         assert_eq!(report.matched.len(), 1);
         assert_eq!(report.removed.len(), 0, "dry-run must not delete");
-        assert!(root.join("sift1m").exists() && root.join("glove").exists());
+        assert!(root.join("vecs1m").exists() && root.join("glove").exists());
     }
 
     #[test]
     fn prune_by_filter_removes_matching_datasets() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        seed_dataset(root, "sift1m", "https://example.com/sift1m/");
+        seed_dataset(root, "vecs1m", "https://example.com/vecs1m/");
         seed_dataset(root, "glove", "https://example.com/glove/");
 
         let report = prune_by_filter(root,
-            &PruneFilter { dataset: Some("sift1m".into()) }, false).unwrap();
+            &PruneFilter { dataset: Some("vecs1m".into()) }, false).unwrap();
         assert_eq!(report.matched.len(), 1);
         assert_eq!(report.removed.len(), 1);
-        assert!(!root.join("sift1m").exists(), "matched dataset must be removed");
+        assert!(!root.join("vecs1m").exists(), "matched dataset must be removed");
         assert!(root.join("glove").exists(),   "non-matched dataset must survive");
     }
 
@@ -483,12 +483,12 @@ mod tests {
         // must be invisible to dataset-level prune.
         fs::create_dir_all(root.join("blobs/aa/bb")).unwrap();
         fs::write(root.join("blobs/aa/bb/data"), b"x").unwrap();
-        seed_dataset(root, "sift1m", "https://example.com/sift1m/");
+        seed_dataset(root, "vecs1m", "https://example.com/vecs1m/");
 
         let report = prune_by_filter(root,
             &PruneFilter { dataset: Some("*".into()) }, false).unwrap();
         assert_eq!(report.removed.len(), 1);
-        assert!(!root.join("sift1m").exists());
+        assert!(!root.join("vecs1m").exists());
         assert!(root.join("blobs").exists(), "legacy must survive dataset prune");
     }
 
@@ -507,7 +507,7 @@ mod tests {
             fs::write(root.join(name).join("marker"), name).unwrap();
         }
         // A natural-layout dataset that must NOT be touched.
-        seed_dataset(root, "sift1m", "https://example.com/sift1m/");
+        seed_dataset(root, "vecs1m", "https://example.com/vecs1m/");
 
         let mut removed = prune_legacy_layout(root).unwrap();
         removed.sort();
@@ -518,7 +518,7 @@ mod tests {
             "http".to_string(),
             "localhost:8080".to_string(),
         ]);
-        assert!(root.join("sift1m/origin.json").exists(),
+        assert!(root.join("vecs1m/origin.json").exists(),
             "natural-layout datasets must survive legacy purge");
     }
 }

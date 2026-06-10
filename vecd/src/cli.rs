@@ -65,6 +65,11 @@ pub enum Cmd {
         #[command(subcommand)]
         command: ConfigCmd,
     },
+    /// Generate or export the server's TLS certificate.
+    Tls {
+        #[command(subcommand)]
+        command: TlsCmd,
+    },
     /// Authenticate to a vecd endpoint and store its token (in the config
     /// dir's `credentials.json`); it's then used automatically for that
     /// endpoint (e.g. `vecd whoami`).
@@ -143,35 +148,54 @@ pub enum Cmd {
         command: NsCmd,
     },
     /// Bind a role to a principal on a namespace subtree.
+    #[command(
+        after_help = "Examples:\n  \
+            vecd bind --to alice  --role curate --ns datasets\n  \
+            vecd bind --to PUBLIC --role reader --ns datasets"
+    )]
     Bind {
+        /// Principal to grant: a user name, or `PUBLIC` for anyone.
         #[arg(long)]
         to: String,
+        /// Role to grant (see `vecd roles list`), e.g. reader, curate.
         #[arg(long)]
         role: String,
+        /// Namespace subtree the binding applies to.
         #[arg(long)]
         ns: String,
     },
     /// Remove a binding (omit `--role` to remove all for the principal).
+    #[command(after_help = "Example:\n  vecd unbind --to alice --ns datasets")]
     Unbind {
+        /// Principal whose binding to remove.
         #[arg(long)]
         to: String,
+        /// Specific role to remove; omit to remove all of the principal's roles here.
         #[arg(long)]
         role: Option<String>,
+        /// Namespace subtree the binding was on.
         #[arg(long)]
         ns: String,
     },
     /// Convenience grant: map `--read/--write/--delete/--admin` to a role.
+    #[command(after_help = "Example:\n  vecd grant --to alice --ns datasets --read --write")]
     Grant {
+        /// Principal to grant access to (a user, or `PUBLIC`).
         #[arg(long)]
         to: String,
+        /// Namespace subtree to grant on.
         #[arg(long)]
         ns: String,
+        /// Allow reads.
         #[arg(long)]
         read: bool,
+        /// Allow writes (push/PUT).
         #[arg(long)]
         write: bool,
+        /// Allow deletes.
         #[arg(long)]
         delete: bool,
+        /// Allow administration of the subtree.
         #[arg(long)]
         admin: bool,
     },
@@ -284,6 +308,30 @@ pub struct ServeArgs {
 }
 
 #[derive(veks_completion_derive::VeksCli)]
+pub enum TlsCmd {
+    /// Generate a self-signed cert + key and configure vecd to serve HTTPS.
+    #[command(
+        after_help = "Example:\n  vecd tls generate            # cert for the bind host + loopback\n  vecd tls generate --host my-host.local"
+    )]
+    Generate {
+        /// Directory for tls-cert.pem / tls-key.pem (default: the config dir).
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Subject alternative name to certify (repeatable). Default: the bind
+        /// host plus `127.0.0.1` and `localhost`.
+        #[arg(long)]
+        host: Vec<String>,
+    },
+    /// Export the configured server certificate (the trust anchor) to a file,
+    /// to add to vectordata's `settings.yaml` `trusted_ca_certs`.
+    #[command(after_help = "Example:\n  vecd tls export ~/.config/vectordata/vecd-ca.pem")]
+    Export {
+        /// File to write the certificate PEM to.
+        out: PathBuf,
+    },
+}
+
+#[derive(veks_completion_derive::VeksCli)]
 pub enum ConfigCmd {
     /// Write sensible defaults (local-only bind + data dir) and confirm.
     Auto {
@@ -337,8 +385,12 @@ pub enum ConfigCmd {
 
 #[derive(veks_completion_derive::VeksCli)]
 pub enum UsersCmd {
+    /// Create a user (a principal you can bind roles to and mint tokens for).
+    #[command(after_help = "Example:\n  vecd users add alice --level user")]
     Add {
+        /// User name.
         name: String,
+        /// Privilege level: user | operator | admin | superuser.
         #[arg(long, default_value = "user")]
         level: String,
         /// Set a password (for `vectordata login`); prompts are Phase 2.
@@ -348,21 +400,54 @@ pub enum UsersCmd {
         #[arg(long)]
         home_backend: Option<String>,
     },
+    /// List users with level and enabled/disabled state.
     List,
-    Level { name: String, level: String },
-    Passwd { name: String, password: String },
-    Disable { name: String },
-    Enable { name: String },
-    Remove { name: String },
+    /// Change a user's privilege level.
+    Level {
+        /// User name.
+        name: String,
+        /// New level: user | operator | admin | superuser.
+        level: String,
+    },
+    /// Set a user's password.
+    Passwd {
+        /// User name.
+        name: String,
+        /// New password.
+        password: String,
+    },
+    /// Disable a user (keeps the record; blocks authentication).
+    Disable {
+        /// User name.
+        name: String,
+    },
+    /// Re-enable a disabled user.
+    Enable {
+        /// User name.
+        name: String,
+    },
+    /// Remove a user.
+    Remove {
+        /// User name.
+        name: String,
+    },
 }
 
 #[derive(veks_completion_derive::VeksCli)]
 pub enum TokensCmd {
+    /// Mint an API token for a user (used by clients to authenticate).
+    #[command(
+        after_help = "Example:\n  \
+            vecd tokens create --user alice --description \"push key\" --expires 30d --quiet > alice.token"
+    )]
     Create {
+        /// User the token authenticates as.
         #[arg(long)]
         user: String,
+        /// Human-readable label for the token (shown in `tokens list`).
         #[arg(long)]
         description: String,
+        /// Expiry duration, e.g. `30d`, `12h`; omit for no expiry.
         #[arg(long)]
         expires: Option<String>,
         /// Ad-hoc profile, e.g. "read datasets/glove, publish datasets/scratch".
@@ -382,88 +467,170 @@ pub enum TokensCmd {
         #[arg(long, conflicts_with = "quiet")]
         json: bool,
     },
+    /// List tokens (optionally filtered to one user).
     List {
+        /// Only this user's tokens.
         #[arg(long)]
         user: Option<String>,
     },
-    Revoke { id: i64 },
+    /// Revoke a token by its numeric id (from `tokens list`).
+    Revoke {
+        /// Token id to revoke.
+        id: i64,
+    },
 }
 
 #[derive(veks_completion_derive::VeksCli)]
 pub enum RolesCmd {
+    /// List roles and the actions each grants.
     List,
+    /// Define a role as a set of actions (bind it with `vecd bind --role`).
+    #[command(after_help = "Example:\n  vecd roles add publisher --actions read,write,publish")]
     Add {
+        /// Role name.
         name: String,
+        /// Comma-separated actions, e.g. `read,write,publish,delete,admin`.
         #[arg(long)]
         actions: String,
     },
-    Remove { name: String },
+    /// Remove a role.
+    Remove {
+        /// Role name to remove.
+        name: String,
+    },
 }
 
 #[derive(veks_completion_derive::VeksCli)]
 pub enum BackendsCmd {
+    /// Register a storage backend — the physical store a namespace writes into.
+    ///
+    /// `local` keeps blobs on disk under a directory; `s3` targets an S3-compatible
+    /// bucket. The stored `local` endpoint is normalized to `local:<absolute-dir>`
+    /// (and the directory is created), so a bare/relative name is corrected for you.
+    #[command(
+        after_help = "Examples:\n  \
+            vecd backends add store --kind local --endpoint ~/vecd-store --active\n  \
+            vecd backends add s3 --kind s3 --endpoint my-bucket --region us-east-1 --active"
+    )]
     Add {
+        /// Backend name, referenced by `ns add --backend-config <name>`.
         name: String,
+        /// Storage kind: local | s3 | mem.
         #[arg(long)]
         kind: String,
+        /// For local: a directory (becomes `local:<abs>`). For s3: the bucket.
         #[arg(long)]
         endpoint: String,
+        /// S3-compatible endpoint URL (e.g. a MinIO host); omit for AWS.
         #[arg(long)]
         endpoint_url: Option<String>,
+        /// S3 region.
         #[arg(long)]
         region: Option<String>,
+        /// Named AWS profile to source credentials from.
         #[arg(long)]
         aws_profile: Option<String>,
+        /// Activate now (only active backends serve writes).
         #[arg(long)]
         active: bool,
     },
+    /// List backends with kind, endpoint, and active/standby state.
     List,
+    /// Change a backend: activate/deactivate it, or repoint its storage.
+    #[command(
+        after_help = "Examples:\n  \
+            vecd backends set store --endpoint ~/vecd-store2\n  \
+            vecd backends set store --active"
+    )]
     Set {
+        /// Backend name to modify.
         name: String,
+        /// Activate the backend.
         #[arg(long)]
         active: bool,
+        /// Deactivate the backend (standby; stops serving).
         #[arg(long)]
         no_active: bool,
+        /// Repoint the backend's storage (a `local:` directory is normalized).
+        #[arg(long)]
+        endpoint: Option<String>,
     },
-    Remove { name: String },
+    /// Remove a backend (refused while a namespace still references it).
+    Remove {
+        /// Backend name to remove.
+        name: String,
+    },
 }
 
 #[derive(veks_completion_derive::VeksCli)]
 pub enum NsCmd {
+    /// Create a namespace — a path prefix served by one storage backend.
+    ///
+    /// Everything under the prefix (the dataset `datasets/toy/…` and the catalog
+    /// `datasets/catalog.yaml`) is governed by this namespace's backend, owner,
+    /// and bindings. A namespace must be `--active` AND have a `--backend-config`
+    /// before it can store objects.
+    #[command(
+        after_help = "Example:\n  vecd ns add datasets --owner alice --backend-config store --active"
+    )]
     Add {
+        /// Namespace path prefix, e.g. `datasets` or `team/exp`.
         path: String,
+        /// Owning principal — a user, or a system role like `@operator`.
         #[arg(long)]
         owner: String,
+        /// Storage backend that serves this namespace (see `vecd backends list`).
         #[arg(long)]
         backend_config: Option<String>,
+        /// Activate now; otherwise it's config-only and rejects writes.
         #[arg(long)]
         active: bool,
+        /// Who may see the namespace exists: public | known | grantees (default).
         #[arg(long, default_value = "grantees")]
         listable: String,
+        /// Auto-expire objects after this duration, e.g. `30d`, `12h`.
         #[arg(long)]
         ttl: Option<String>,
+        /// Storage quota in bytes (suffixes ok, e.g. `50G`).
         #[arg(long)]
         quota: Option<String>,
     },
+    /// List namespaces with owner, backend, active/inactive state, and listability.
     List,
+    /// Change an existing namespace (activate it, repoint its backend, etc.).
+    #[command(
+        after_help = "Examples:\n  vecd ns set datasets --active\n  vecd ns set datasets --backend-config store"
+    )]
     Set {
+        /// Namespace path to modify.
         path: String,
+        /// New owning principal.
         #[arg(long)]
         owner: Option<String>,
+        /// Attach/replace the storage backend that serves this namespace.
         #[arg(long)]
         backend_config: Option<String>,
+        /// Activate the namespace (it can then store objects).
         #[arg(long)]
         active: bool,
+        /// Deactivate the namespace (config-only; rejects writes).
         #[arg(long)]
         no_active: bool,
+        /// Change listability: public | known | grantees.
         #[arg(long)]
         listable: Option<String>,
+        /// Change the object TTL, e.g. `30d`.
         #[arg(long)]
         ttl: Option<String>,
+        /// Change the storage quota.
         #[arg(long)]
         quota: Option<String>,
     },
-    Remove { path: String },
+    /// Remove a namespace's config entry (objects in its backend are untouched).
+    Remove {
+        /// Namespace path to remove.
+        path: String,
+    },
 }
 
 #[derive(veks_completion_derive::VeksCli)]
@@ -520,7 +687,11 @@ pub enum BackupCmd {
 
 /// Resolve the data dir: `--data-dir`, else config `data_dir`, else the
 /// default under the config dir.
-fn resolve_data_dir(flag: &Option<PathBuf>, cfg: &config::Config, config_dir: &std::path::Path) -> PathBuf {
+pub(crate) fn resolve_data_dir(
+    flag: &Option<PathBuf>,
+    cfg: &config::Config,
+    config_dir: &std::path::Path,
+) -> PathBuf {
     if let Some(d) = flag {
         return d.clone();
     }
@@ -689,6 +860,7 @@ fn dispatch(
             cmd_init(resolved, data_dir, cfg, &superuser, quiet)
         }
         Cmd::Config { command } => cmd_config(resolved, command),
+        Cmd::Tls { command } => cmd_tls(resolved, command),
         Cmd::Login { url, token, user, password, expires, list } => {
             cmd_login(resolved, url, token, user, password, expires.as_deref(), list)
         }
@@ -845,6 +1017,72 @@ fn local_endpoint_url(cfg: &config::Config) -> String {
 }
 
 /// `vecd config …` — inspect and edit `vecd.conf` at the resolved location.
+fn cmd_tls(resolved: &config::Resolved, cmd: TlsCmd) -> Result<(), VecdError> {
+    match cmd {
+        TlsCmd::Generate { out, host } => {
+            let dir = out.unwrap_or_else(|| resolved.dir.clone());
+            std::fs::create_dir_all(&dir).map_err(VecdError::Io)?;
+            let cert_path = dir.join("tls-cert.pem");
+            let key_path = dir.join("tls-key.pem");
+
+            // SANs to certify: explicit --host, else the bind host (when it's a
+            // concrete address) plus loopback.
+            let mut sans = host;
+            if sans.is_empty() {
+                if let Ok(cfg) = config::Config::load(&resolved.dir)
+                    && let Some(bind) = cfg.get("bind")
+                {
+                    let h = bind.rsplit_once(':').map(|(h, _)| h).unwrap_or(bind);
+                    if !h.is_empty() && h != "0.0.0.0" {
+                        sans.push(h.to_string());
+                    }
+                }
+                sans.push("127.0.0.1".to_string());
+                sans.push("localhost".to_string());
+            }
+            sans.sort();
+            sans.dedup();
+
+            let ck = rcgen::generate_simple_self_signed(sans.clone())
+                .map_err(|e| VecdError::op(format!("generating self-signed cert: {e}")))?;
+            std::fs::write(&cert_path, ck.cert.pem()).map_err(VecdError::Io)?;
+            std::fs::write(&key_path, ck.key_pair.serialize_pem()).map_err(VecdError::Io)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600));
+            }
+
+            // Wire cert/key into vecd.conf so `start`/`serve` serve HTTPS.
+            let mut cfg = config::Config::load(&resolved.dir)?;
+            cfg.set("tls_cert", &cert_path.to_string_lossy())?;
+            cfg.set("tls_key", &key_path.to_string_lossy())?;
+            cfg.write_to(&resolved.dir)?;
+
+            println!("generated self-signed TLS certificate for: {}", sans.join(", "));
+            println!("  cert: {}", cert_path.display());
+            println!("  key:  {}", key_path.display());
+            println!("configured tls_cert/tls_key in vecd.conf — restart vecd to serve HTTPS.");
+            println!("trust it from a client:  vecd tls export <file>");
+            Ok(())
+        }
+        TlsCmd::Export { out } => {
+            let cfg = config::Config::load(&resolved.dir)?;
+            let cert = cfg.get("tls_cert").ok_or_else(|| {
+                VecdError::usage(
+                    "no tls_cert configured — run `vecd tls generate` first, or set tls_cert in vecd.conf",
+                )
+            })?;
+            let pem = std::fs::read(cert)
+                .map_err(|e| VecdError::op(format!("reading tls_cert '{cert}': {e}")))?;
+            std::fs::write(&out, &pem).map_err(VecdError::Io)?;
+            println!("exported server certificate → {}", out.display());
+            println!("add this path to vectordata's settings.yaml `trusted_ca_certs:` to trust it.");
+            Ok(())
+        }
+    }
+}
+
 fn cmd_config(resolved: &config::Resolved, cmd: ConfigCmd) -> Result<(), VecdError> {
     match cmd {
         ConfigCmd::Auto { yes, force } => cmd_config_auto(resolved, yes, force),
@@ -1429,11 +1667,25 @@ fn cmd_backends(data_dir: &std::path::Path, cfg: &config::Config, c: BackendsCmd
     let mut db = open_db(data_dir, cfg)?;
     match c {
         BackendsCmd::Add { name, kind, endpoint, endpoint_url, region, aws_profile, active } => {
+            // For a local backend, normalize the directory to `local:<abs>` up
+            // front (create it, canonicalize), and tell the user when that
+            // rewrote what they typed — a bare/relative name is a silent trap.
+            let endpoint = if kind == "local" {
+                let resolved = crate::backend::local::resolve_dir(&endpoint)?;
+                if resolved != endpoint {
+                    println!("note: local directory canonicalized to an absolute path");
+                    println!("      '{endpoint}'  →  '{resolved}'");
+                }
+                resolved
+            } else {
+                endpoint
+            };
             admin::add_backend(
                 &mut db, &name, &kind, &endpoint, endpoint_url.as_deref(), region.as_deref(),
                 aws_profile.as_deref(), active,
             )?;
-            println!("added backend {name}");
+            let shown = if kind == "local" { format!(" ({endpoint})") } else { String::new() };
+            println!("added backend {name}{shown}");
         }
         BackendsCmd::List => {
             for (name, kind, endpoint, active) in admin::list_backends(&db)? {
@@ -1441,10 +1693,35 @@ fn cmd_backends(data_dir: &std::path::Path, cfg: &config::Config, c: BackendsCmd
                 println!("{name:<16} {kind:<6} {endpoint:<40} {tag}");
             }
         }
-        BackendsCmd::Set { name, active, no_active } => {
-            let want = resolve_toggle(active, no_active, "backend")?;
-            admin::set_backend_active(&mut db, &name, want)?;
-            println!("backend {name} → {}", if want { "active" } else { "standby" });
+        BackendsCmd::Set { name, active, no_active, endpoint } => {
+            if endpoint.is_none() && !active && !no_active {
+                return Err(VecdError::usage(
+                    "nothing to set: pass --endpoint, --active, or --no-active",
+                ));
+            }
+            // Repoint storage first (so a subsequent activation lands on a valid
+            // endpoint). Local directories are normalized to `local:<abs>`.
+            if let Some(raw) = endpoint {
+                let kind = admin::backend_kind(&db, &name)?
+                    .ok_or_else(|| VecdError::usage(format!("no such backend '{name}'")))?;
+                let ep = if kind == "local" {
+                    let resolved = crate::backend::local::resolve_dir(&raw)?;
+                    if resolved != raw {
+                        println!("note: local directory canonicalized to an absolute path");
+                        println!("      '{raw}'  →  '{resolved}'");
+                    }
+                    resolved
+                } else {
+                    raw
+                };
+                admin::set_backend_endpoint(&mut db, &name, &ep)?;
+                println!("backend {name} endpoint → {ep}");
+            }
+            if active || no_active {
+                let want = resolve_toggle(active, no_active, "backend")?;
+                admin::set_backend_active(&mut db, &name, want)?;
+                println!("backend {name} → {}", if want { "active" } else { "standby" });
+            }
         }
         BackendsCmd::Remove { name } => {
             admin::remove_backend(&mut db, &name)?;
@@ -1468,9 +1745,16 @@ fn cmd_ns(data_dir: &std::path::Path, cfg: &config::Config, c: NsCmd) -> Result<
         NsCmd::List => {
             for (path, owner, backend, active, listable) in admin::list_namespaces(&db)? {
                 let p = if path.is_empty() { "(root)".to_string() } else { path };
+                let has_backend = backend.is_some();
                 let backend = backend.unwrap_or_else(|| "-".to_string());
-                let tag = if active { "active" } else { "config-only" };
-                println!("{p:<28} owner={owner:<14} backend={backend:<12} {tag:<12} listable={listable}");
+                // A namespace is writable only when it's active AND has a backend;
+                // spell out the state so it's obvious why a push won't land.
+                let state = match (active, has_backend) {
+                    (true, true) => "active",
+                    (true, false) => "active,no-backend",
+                    (false, _) => "INACTIVE",
+                };
+                println!("{p:<28} owner={owner:<14} backend={backend:<12} {state:<16} listable={listable}");
             }
         }
         NsCmd::Set { path, owner, backend_config, active, no_active, listable, ttl, quota } => {

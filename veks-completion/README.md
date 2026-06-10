@@ -124,12 +124,12 @@ The same `CommandTree` produces structured parses:
 use veks_completion::{parse_argv, ParsedCommand};
 
 let parsed = parse_argv(&tree, &[
-    "compute", "knn", "--metric", "L2", "--verbose", "data.fvec",
+    "compute", "knn", "--metric", "L2", "--verbose", "data.fvecs",
 ])?;
 assert_eq!(parsed.path,        vec!["compute", "knn"]);
 assert_eq!(parsed.flags["--metric"],  vec!["L2".to_string()]);
 assert_eq!(parsed.flags["--verbose"], vec!["".to_string()]); // boolean
-assert_eq!(parsed.positionals, vec!["data.fvec"]);
+assert_eq!(parsed.positionals, vec!["data.fvecs"]);
 ```
 
 `parse_argv_lenient` treats unknown flags as positionals — useful for

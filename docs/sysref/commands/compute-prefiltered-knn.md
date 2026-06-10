@@ -21,11 +21,11 @@ to this command — existing pipeline.yaml files keep working unchanged.
   per_profile: true
   phase: 2
   after: [verify-predicates-sqlite]
-  base: profiles/base/base_vectors.fvec
-  query: profiles/base/query_vectors.fvec
-  metadata-indices: metadata_indices.ivvec
-  indices: prefiltered_neighbor_indices.ivec
-  distances: prefiltered_neighbor_distances.fvec
+  base: profiles/base/base_vectors.fvecs
+  query: profiles/base/query_vectors.fvecs
+  metadata-indices: metadata_indices.ivvecs
+  indices: prefiltered_neighbor_indices.ivecs
+  distances: prefiltered_neighbor_distances.fvecs
   neighbors: 100
   metric: L2
 ```

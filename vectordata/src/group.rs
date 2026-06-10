@@ -166,7 +166,7 @@ impl TestDataGroup {
     /// `dataset.yaml` → `knn_entries.yaml`.
     pub fn load_from_url(url_str: &str) -> Result<Self> {
         let url = Url::parse(url_str)?;
-        let client = crate::transport::shared_client();
+        let client = crate::transport::shared_client_for(url_str);
 
         // Explicit catalog file: dispatch by content shape, no
         // sibling probing. The base_url for resolving facet paths is
@@ -518,17 +518,17 @@ mod tests {
             profiles: Default::default(),
         };
         let entry = crate::dataset::CatalogEntry {
-            name: "sift1m".to_string(),
-            path: "https://example.com/datasets/sift1m/dataset.yaml".to_string(),
+            name: "vecs1m".to_string(),
+            path: "https://example.com/datasets/vecs1m/dataset.yaml".to_string(),
             dataset_type: "dataset.yaml".to_string(),
             layout,
         };
         let group = TestDataGroup::from_catalog_entry(&entry).unwrap();
         assert_eq!(
             group.catalog_source.as_deref(),
-            Some("https://example.com/datasets/sift1m/"),
+            Some("https://example.com/datasets/vecs1m/"),
         );
-        assert_eq!(group.dataset_name.as_deref(), Some("sift1m"));
+        assert_eq!(group.dataset_name.as_deref(), Some("vecs1m"));
     }
 
     #[test]
@@ -543,17 +543,17 @@ mod tests {
             profiles: Default::default(),
         };
         let entry = crate::dataset::CatalogEntry {
-            name: "ada002-100k".to_string(),
-            path: "s3://jvector-datasets-public/datasets-clean".to_string(),
+            name: "emb-002-100k".to_string(),
+            path: "s3://vector-datasets-public/datasets-clean".to_string(),
             dataset_type: "knn_entries.yaml".to_string(),
             layout,
         };
         let group = TestDataGroup::from_catalog_entry(&entry).unwrap();
         assert_eq!(
             group.catalog_source.as_deref(),
-            Some("s3://jvector-datasets-public/datasets-clean/ada002-100k/"),
+            Some("s3://vector-datasets-public/datasets-clean/emb-002-100k/"),
         );
-        assert_eq!(group.dataset_name.as_deref(), Some("ada002-100k"));
+        assert_eq!(group.dataset_name.as_deref(), Some("emb-002-100k"));
     }
 
     #[test]

@@ -71,13 +71,13 @@ testing, debugging, or building tools on top of the library:
 use vectordata::io::{open_vec, open_vvec, VectorReader, VvecReader};
 
 // Uniform vectors — local or remote, same call
-let reader = open_vec::<f32>("base_vectors.fvec")?;
-let reader = open_vec::<f32>("https://example.com/dataset/base.fvec")?;
+let reader = open_vec::<f32>("base_vectors.fvecs")?;
+let reader = open_vec::<f32>("https://example.com/dataset/base.fvecs")?;
 println!("{} vectors, dim={}", reader.count(), reader.dim());
 let v: Vec<f32> = reader.get(42)?;
 
 // Variable-length vectors (vvec)
-let reader = open_vvec::<i32>("metadata_indices.ivvec")?;
+let reader = open_vvec::<i32>("metadata_indices.ivvecs")?;
 println!("{} records", reader.count());
 let record: Vec<i32> = reader.get(0)?;
 let dim: usize = reader.dim_at(0)?;
@@ -175,12 +175,12 @@ specification.
 | Suffix | Structure | Example |
 |--------|-----------|---------|
 | `.<type>` | Scalar (flat packed, no header) | `.u8`, `.i32`, `.f64` |
-| `.<type>vec` | Uniform vector (fixed dimension per record) | `.fvec`, `.ivec`, `.u8vec` |
-| `.<type>vvec` | Variable-length vector (per-record dimension) | `.ivvec`, `.fvvec`, `.u8vvec` |
+| `.<type>vec` | Uniform vector (fixed dimension per record) | `.fvecs`, `.ivecs`, `.u8vecs` |
+| `.<type>vvec` | Variable-length vector (per-record dimension) | `.ivvecs`, `.fvvecs`, `.u8vvecs` |
 
-Legacy aliases: `.fvec`=`.f32vec`, `.ivec`=`.i32vec`,
-`.bvec`=`.u8vec`, `.svec`=`.i16vec`, `.mvec`=`.f16vec`,
-`.dvec`=`.f64vec`.
+Legacy aliases: `.fvecs`=`.f32vecs`, `.ivecs`=`.i32vecs`,
+`.bvecs`=`.u8vecs`, `.svecs`=`.i16vecs`, `.mvecs`=`.f16vecs`,
+`.dvecs`=`.f64vecs`.
 
 ### Record layout
 
@@ -206,8 +206,8 @@ published, falling back silently to direct HTTP RANGE otherwise.
 ```rust
 use vectordata::io::{open_vec, VectorReader};
 
-let r = open_vec::<f32>("data/base.fvec")?;             // local mmap
-let r = open_vec::<i32>("https://host/neighbors.ivec")?; // cached or direct HTTP
+let r = open_vec::<f32>("data/base.fvecs")?;             // local mmap
+let r = open_vec::<i32>("https://host/neighbors.ivecs")?; // cached or direct HTTP
 
 println!("count={}, dim={}", r.count(), r.dim());
 let vec: Vec<f32> = r.get(0)?;
@@ -217,7 +217,7 @@ let vec: Vec<f32> = r.get(0)?;
 `u8`, `u16`, `u32`, `u64`, `i64`.
 
 The type parameter `T` must match the file's element width. A
-mismatch (e.g., `open_vec::<f32>("data.dvec")` where `.dvec` is
+mismatch (e.g., `open_vec::<f32>("data.dvecs")` where `.dvecs` is
 8-byte f64) returns an error at open time.
 
 ### `open_vvec<T>(path_or_url) → Box<dyn VvecReader<T>>`
@@ -233,7 +233,7 @@ Opens a variable-length vector file. Requires a companion
 ```rust
 use vectordata::io::{open_vvec, VvecReader};
 
-let r = open_vvec::<i32>("metadata_indices.ivvec")?;
+let r = open_vvec::<i32>("metadata_indices.ivvecs")?;
 println!("{} records", r.count());
 let record: Vec<i32> = r.get(42)?;
 let dim: usize = r.dim_at(42)?;
@@ -459,17 +459,17 @@ let r = TypedReader::<i64>::open_auto("https://host/metadata.i32",
 
 | Facet code | YAML key | Trait method | Reader type | Typical format |
 |-----------|----------|-------------|-------------|---------------|
-| B | `base_vectors` | `base_vectors()` | `VectorReader<f32>` | `.fvec` |
-| Q | `query_vectors` | `query_vectors()` | `VectorReader<f32>` | `.fvec` |
-| G | `neighbor_indices` | `neighbor_indices()` | `VectorReader<i32>` | `.ivec` |
-| D | `neighbor_distances` | `neighbor_distances()` | `VectorReader<f32>` | `.fvec` |
+| B | `base_vectors` | `base_vectors()` | `VectorReader<f32>` | `.fvecs` |
+| Q | `query_vectors` | `query_vectors()` | `VectorReader<f32>` | `.fvecs` |
+| G | `neighbor_indices` | `neighbor_indices()` | `VectorReader<i32>` | `.ivecs` |
+| D | `neighbor_distances` | `neighbor_distances()` | `VectorReader<f32>` | `.fvecs` |
 | M | `metadata_content` | `metadata_content()` | config + `open_facet_typed` | `.u8`, `.slab` |
 | P | `metadata_predicates` | `metadata_predicates()` | config + `open_facet_typed` | `.u8`, `.slab` |
-| R | `metadata_indices` | `metadata_indices()` | `VvecReader<i32>` | `.ivvec` |
-| F (indices) | `prefiltered_neighbor_indices` (canonical) or `filtered_neighbor_indices` (legacy alias) | `prefiltered_neighbor_indices()` | `VectorReader<i32>` | `.ivec` |
-| F (distances) | `prefiltered_neighbor_distances` (canonical) or `filtered_neighbor_distances` (legacy alias) | `prefiltered_neighbor_distances()` | `VectorReader<f32>` | `.fvec` |
-| E (indices) | `postfiltered_neighbor_indices` | `postfiltered_neighbor_indices()` | `VectorReader<i32>` | `.ivec` |
-| E (distances) | `postfiltered_neighbor_distances` | `postfiltered_neighbor_distances()` | `VectorReader<f32>` | `.fvec` |
+| R | `metadata_indices` | `metadata_indices()` | `VvecReader<i32>` | `.ivvecs` |
+| F (indices) | `prefiltered_neighbor_indices` (canonical) or `filtered_neighbor_indices` (legacy alias) | `prefiltered_neighbor_indices()` | `VectorReader<i32>` | `.ivecs` |
+| F (distances) | `prefiltered_neighbor_distances` (canonical) or `filtered_neighbor_distances` (legacy alias) | `prefiltered_neighbor_distances()` | `VectorReader<f32>` | `.fvecs` |
+| E (indices) | `postfiltered_neighbor_indices` | `postfiltered_neighbor_indices()` | `VectorReader<i32>` | `.ivecs` |
+| E (distances) | `postfiltered_neighbor_distances` | `postfiltered_neighbor_distances()` | `VectorReader<f32>` | `.fvecs` |
 
 For M and P facets, use `open_facet_typed::<T>(view, name)` for
 typed data access (see §2.7).
@@ -485,17 +485,17 @@ paths. All paths are relative to the dataset directory:
 profiles:
   default:
     maxk: 100
-    base_vectors: profiles/base/base_vectors.fvec
-    query_vectors: profiles/base/query_vectors.fvec
-    neighbor_indices: profiles/default/neighbor_indices.ivec
-    neighbor_distances: profiles/default/neighbor_distances.fvec
+    base_vectors: profiles/base/base_vectors.fvecs
+    query_vectors: profiles/base/query_vectors.fvecs
+    neighbor_indices: profiles/default/neighbor_indices.ivecs
+    neighbor_distances: profiles/default/neighbor_distances.fvecs
     metadata_content: profiles/base/metadata_content.u8
     metadata_predicates: profiles/base/predicates.u8
-    metadata_indices: profiles/default/metadata_indices.ivvec
-    prefiltered_neighbor_indices: profiles/default/prefiltered_neighbor_indices.ivec    # F
-    prefiltered_neighbor_distances: profiles/default/prefiltered_neighbor_distances.fvec
-    postfiltered_neighbor_indices: profiles/default/postfiltered_neighbor_indices.ivec  # E
-    postfiltered_neighbor_distances: profiles/default/postfiltered_neighbor_distances.fvec
+    metadata_indices: profiles/default/metadata_indices.ivvecs
+    prefiltered_neighbor_indices: profiles/default/prefiltered_neighbor_indices.ivecs    # F
+    prefiltered_neighbor_distances: profiles/default/prefiltered_neighbor_distances.fvecs
+    postfiltered_neighbor_indices: profiles/default/postfiltered_neighbor_indices.ivecs  # E
+    postfiltered_neighbor_distances: profiles/default/postfiltered_neighbor_distances.fvecs
 ```
 
 The legacy keys `filtered_neighbor_indices` /
@@ -517,10 +517,10 @@ inherit views from the default profile:
     maxk: 100
     base_count: 82993
     partition: true
-    base_vectors: profiles/label-0/base_vectors.fvec
-    query_vectors: profiles/label-0/query_vectors.fvec
-    neighbor_indices: profiles/label-0/neighbor_indices.ivec
-    neighbor_distances: profiles/label-0/neighbor_distances.fvec
+    base_vectors: profiles/label-0/base_vectors.fvecs
+    query_vectors: profiles/label-0/query_vectors.fvecs
+    neighbor_indices: profiles/label-0/neighbor_indices.ivecs
+    neighbor_distances: profiles/label-0/neighbor_distances.fvecs
 ```
 
 ### `knn_entries.yaml` fallback
@@ -533,9 +533,9 @@ _defaults:
   base_url: https://example.com/data
 
 "my-dataset:default":
-  base: profiles/base/base_vectors.fvec
-  query: profiles/base/query_vectors.fvec
-  gt:    profiles/base/neighbor_indices.ivec
+  base: profiles/base/base_vectors.fvecs
+  query: profiles/base/query_vectors.fvecs
+  gt:    profiles/base/neighbor_indices.ivecs
 ```
 
 The `knn_entries` module can also be used directly:
@@ -552,13 +552,13 @@ let config = entries.to_config();  // → DatasetConfig
 
 ## 2.10 Offset index files
 
-Variable-length vector files (`.ivvec`, `.fvvec`, etc.) require a
+Variable-length vector files (`.ivvecs`, `.fvvecs`, etc.) require a
 companion offset index for random access:
 
 ```
-data/metadata_indices.ivvec              # variable-length data
-data/IDXFOR__metadata_indices.ivvec.i32  # offset index (< 2 GB data)
-data/IDXFOR__metadata_indices.ivvec.i64  # offset index (≥ 2 GB data)
+data/metadata_indices.ivvecs              # variable-length data
+data/IDXFOR__metadata_indices.ivvecs.i32  # offset index (< 2 GB data)
+data/IDXFOR__metadata_indices.ivvecs.i64  # offset index (≥ 2 GB data)
 ```
 
 The index is a flat-packed array of byte offsets (one per record).
@@ -581,7 +581,7 @@ correct; the rebuilt index is not persisted to the remote source).
 ```rust
 use vectordata::io::IoError;
 
-match open_vec::<f32>("data.fvec") {
+match open_vec::<f32>("data.fvecs") {
     Ok(reader) => { /* use reader */ }
     Err(IoError::Io(e)) => eprintln!("I/O error: {e}"),
     Err(IoError::Http(e)) => eprintln!("HTTP error: {e}"),
@@ -914,18 +914,18 @@ strata:
 profiles:
   default:
     maxk: 100
-    base_vectors: profiles/base/base_vectors.fvec
-    query_vectors: profiles/base/query_vectors.fvec
-    neighbor_indices: profiles/default/neighbor_indices.ivec
+    base_vectors: profiles/base/base_vectors.fvecs
+    query_vectors: profiles/base/query_vectors.fvecs
+    neighbor_indices: profiles/default/neighbor_indices.ivecs
     metadata_content: profiles/base/metadata_content.u8
-    metadata_indices: profiles/default/metadata_indices.ivvec
+    metadata_indices: profiles/default/metadata_indices.ivvecs
 
   100K:
     base_count: 100000
     maxk: 100
-    base_vectors: "profiles/base/base_vectors.fvec[0..100000)"
-    query_vectors: profiles/base/query_vectors.fvec
-    neighbor_indices: profiles/100K/neighbor_indices.ivec
+    base_vectors: "profiles/base/base_vectors.fvecs[0..100000)"
+    query_vectors: profiles/base/query_vectors.fvecs
+    neighbor_indices: profiles/100K/neighbor_indices.ivecs
 ```
 
 Sized profiles share base/query data — `base_vectors` is windowed

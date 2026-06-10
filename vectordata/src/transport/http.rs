@@ -37,7 +37,9 @@ impl HttpTransport {
     /// repeatedly.
     pub fn new(url: Url) -> Self {
         HttpTransport {
-            client: super::shared_client(),
+            // url-aware: a self-signed endpoint listed in `trust_self_signed`
+            // gets the non-verifying client; everyone else the verifying one.
+            client: super::shared_client_for(url.as_str()),
             url,
             effective_url: OnceLock::new(),
             content_length: OnceLock::new(),
@@ -196,9 +198,9 @@ impl ChunkedTransport for HttpTransport {
         // core regardless of `download_concurrency`. Per-call pick
         // distributes N workers across the pool's N runtime threads
         // so chunks actually arrive in parallel.
-        let client = super::shared_client();
         let end = start + len - 1;
         let target = self.effective_url().clone();
+        let client = super::shared_client_for(target.as_str());
         let resp = super::apply_read_auth(client.get(target.clone()), Some(&target))
             .header(RANGE, format!("bytes={}-{}", start, end))
             .send()

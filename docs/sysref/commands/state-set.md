@@ -23,4 +23,4 @@ veks pipeline state set --name example_var --value 42
 | Syntax | Meaning |
 |--------|---------|
 | `42` | Literal string value |
-| `count:file.fvec` | Record count of the file |
+| `count:file.fvecs` | Record count of the file |

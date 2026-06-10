@@ -50,7 +50,7 @@ veks datasets config catalog add https://example.com/datasets/
 
 ```shell
 veks datasets list
-veks datasets list --matching-name "sift*"
+veks datasets list --matching-name "glove*"
 veks datasets probe --dataset my-dataset
 ```
 
@@ -77,8 +77,8 @@ Start with a directory containing your source files:
 
 ```
 my-dataset/
-├── _base_vectors.fvec       # base corpus (underscore = source, not published)
-├── _query_vectors.fvec      # query vectors
+├── _base_vectors.fvecs       # base corpus (underscore = source, not published)
+├── _query_vectors.fvecs      # query vectors
 └── _groundtruth.ivecs       # optional pre-computed ground truth
 ```
 
@@ -121,7 +121,7 @@ Use `--clean` to start fresh (preserves source symlinks).
 ### Analyze Results
 
 ```shell
-veks analyze describe --source profiles/base/base_vectors.fvec
+veks analyze describe --source profiles/base/base_vectors.fvecs
 veks analyze explain-predicates --ordinal 42
 veks analyze explain-filtered-knn --ordinal 42
 ```

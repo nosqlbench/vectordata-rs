@@ -596,13 +596,17 @@ pub fn build_completion_tree(
     resolvers: &std::collections::BTreeMap<String, crate::ValueProvider>,
 ) -> crate::CommandTree {
     let mut tree = crate::CommandTree::new(&spec.name);
-    tree.root = spec_to_node(spec, resolvers);
+    tree.root = spec_to_node(spec, resolvers, "");
     tree
 }
 
+/// `path` is the space-joined subcommand path to this spec, excluding the binary
+/// name (e.g. `"backends remove"`). Positional providers are keyed by that path
+/// in `resolvers`; space-separated keys never collide with `--flag` keys.
 fn spec_to_node(
     spec: &CommandSpec,
     resolvers: &std::collections::BTreeMap<String, crate::ValueProvider>,
+    path: &str,
 ) -> crate::Node {
     if spec.subcommands.is_empty() {
         let value_flags: Vec<&str> =
@@ -626,11 +630,21 @@ fn spec_to_node(
                 }
             }
         }
+        // First-positional completion: a resolver registered under this command's
+        // full path (e.g. "backends remove"), applied only when the command
+        // actually takes a positional.
+        if !spec.positionals.is_empty() {
+            if let Some(p) = resolvers.get(path).cloned() {
+                node = node.with_positional_provider(p);
+            }
+        }
         node.with_stability(spec.stability)
     } else {
         let mut node = crate::Node::empty_group();
         for sub in &spec.subcommands {
-            node = node.with_child(&sub.name, spec_to_node(sub, resolvers));
+            let child_path =
+                if path.is_empty() { sub.name.clone() } else { format!("{path} {}", sub.name) };
+            node = node.with_child(&sub.name, spec_to_node(sub, resolvers, &child_path));
         }
         node.with_stability(spec.stability)
     }
@@ -670,11 +684,11 @@ mod tests {
     #[test]
     fn parses_value_space_and_equals_forms() {
         let spec = datasets_ping();
-        let p = parse(&spec, &argv(&["--dataset", "sift1m", "--at", "1"])).unwrap();
-        assert_eq!(p.value("--dataset"), Some("sift1m"));
+        let p = parse(&spec, &argv(&["--dataset", "glove", "--at", "1"])).unwrap();
+        assert_eq!(p.value("--dataset"), Some("glove"));
         assert_eq!(p.values("--at"), &["1".to_string()]);
-        let p2 = parse(&spec, &argv(&["--dataset=sift1m"])).unwrap();
-        assert_eq!(p2.value("--dataset"), Some("sift1m"));
+        let p2 = parse(&spec, &argv(&["--dataset=glove"])).unwrap();
+        assert_eq!(p2.value("--dataset"), Some("glove"));
     }
 
     #[test]
@@ -807,7 +821,7 @@ mod derive_tests {
         assert_eq!(spec.about.as_deref(), Some("Ping a remote dataset"));
         let p = crate::cli::parse(
             &spec,
-            &argv(&["--dataset", "sift1m", "--at", "1", "--at", "2", "--verbose"]),
+            &argv(&["--dataset", "glove", "--at", "1", "--at", "2", "--verbose"]),
         )
         .unwrap();
         let ping = Ping::veks_from_parsed(&p).unwrap();
@@ -815,7 +829,7 @@ mod derive_tests {
             ping,
             Ping {
                 at: vec!["1".into(), "2".into()],
-                dataset: "sift1m".into(),
+                dataset: "glove".into(),
                 profile: "default".into(),
                 verbose: true,
             }
@@ -938,6 +952,40 @@ mod derive_tests {
         tree.min_stability = Stability::Stable;
         assert!(has(&tree, "stable-cmd"));
         assert!(!has(&tree, "preview-cmd"), "preview hidden at the stable threshold");
+    }
+
+    #[test]
+    fn positional_provider_completes_by_command_path() {
+        use crate::{CommandSpec, PositionalSpec, ValueProvider};
+        // app -> backends -> {remove <name>, list}
+        let spec = CommandSpec::new("app").subcommand(
+            CommandSpec::new("backends")
+                .subcommand(CommandSpec::new("remove").positional(PositionalSpec::new("name")))
+                .subcommand(CommandSpec::new("list")),
+        );
+        let provider: ValueProvider = std::sync::Arc::new(|partial: &str, _: &[&str]| {
+            ["store", "archive"]
+                .iter()
+                .filter(|s| s.starts_with(partial))
+                .map(|s| s.to_string())
+                .collect()
+        });
+        // Positional resolver keyed by the FULL command path.
+        let mut resolvers = std::collections::BTreeMap::new();
+        resolvers.insert("backends remove".to_string(), provider);
+        let tree = crate::cli::build_completion_tree(&spec, &resolvers);
+
+        // `app backends remove <TAB>` → the positional's candidates.
+        let all = crate::complete(&tree, &["app", "backends", "remove", ""]);
+        assert!(all.contains(&"store".to_string()) && all.contains(&"archive".to_string()), "{all:?}");
+
+        // Prefix filter applies at the positional slot.
+        let pref = crate::complete(&tree, &["app", "backends", "remove", "st"]);
+        assert!(pref.contains(&"store".to_string()) && !pref.contains(&"archive".to_string()), "{pref:?}");
+
+        // Keyed by full path: a sibling command does NOT inherit the provider.
+        let other = crate::complete(&tree, &["app", "backends", "list", ""]);
+        assert!(!other.contains(&"store".to_string()), "sibling must not complete: {other:?}");
     }
 
     #[test]

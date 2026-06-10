@@ -168,32 +168,31 @@ fn test_data_group_load_from_path_falls_back_to_knn_entries() {
 /// HTTP fixture: a real test server serves `knn_entries.yaml`
 /// (no `catalog.{json,yaml}`) and the catalog resolver discovers
 /// the datasets through the live network round-trip. Mirrors how
-/// the laion / ibm-datapile S3-hosted catalogs are consumed in
-/// production.
+/// large S3-hosted catalogs are consumed in production.
 #[test]
 fn http_catalog_resolver_discovers_knn_entries_yaml() {
     let tmp = tempfile::tempdir().unwrap();
     // Lay out the dataset-shaped tree the user pointed at:
-    //   <root>/ibm-datapile-1b/knn_entries.yaml
-    let dataset_dir = tmp.path().join("ibm-datapile-1b");
+    //   <root>/example-1b/knn_entries.yaml
+    let dataset_dir = tmp.path().join("example-1b");
     std::fs::create_dir(&dataset_dir).unwrap();
     let yaml = r#"
 _defaults:
   base_url: REPLACED_AT_RUNTIME
 
-"ibm-datapile-1b:default":
+"example-1b:default":
   base: profiles/base/base_vectors.fvecs
   query: profiles/base/query_vectors.fvecs
   gt: profiles/default/neighbor_indices.ivecs
 
-"ibm-datapile-1b:100k":
+"example-1b:100k":
   base: profiles/base/base_vectors.fvecs
   query: profiles/base/query_vectors.fvecs
   gt: profiles/100k/neighbor_indices.ivecs
 "#;
     let server = TestServer::start(tmp.path()).unwrap();
     let base = server.base_url();
-    let dataset_url = format!("{base}/ibm-datapile-1b");
+    let dataset_url = format!("{base}/example-1b");
     // Substitute the real base_url so the synthesized facet paths
     // point at the running fixture server.
     let yaml = yaml.replace("REPLACED_AT_RUNTIME", &dataset_url);
@@ -203,9 +202,9 @@ _defaults:
     let catalog = Catalog::of(&sources);
 
     let names: Vec<&str> = catalog.datasets().iter().map(|e| e.name.as_str()).collect();
-    assert_eq!(names, vec!["ibm-datapile-1b"], "got names: {names:?}");
+    assert_eq!(names, vec!["example-1b"], "got names: {names:?}");
 
-    let entry = catalog.find_exact("ibm-datapile-1b").expect("dataset resolves");
+    let entry = catalog.find_exact("example-1b").expect("dataset resolves");
     assert_eq!(entry.dataset_type, "knn_entries.yaml");
     let profiles: Vec<&str> = entry.profile_names();
     assert!(profiles.contains(&"default"));
@@ -497,7 +496,7 @@ fn test_data_group_load_from_path_with_arbitrary_yaml_filename() {
 
 /// When a `knn_entries.yaml` describes multiple datasets, the
 /// `TestDataGroup::load` fallback picks the dataset matching the
-/// containing directory name. This is the laion-style layout
+/// containing directory name. This is the knn_entries-style layout
 /// where the catalog file lives inside a per-dataset directory.
 #[test]
 fn test_data_group_picks_dataset_matching_directory_name() {

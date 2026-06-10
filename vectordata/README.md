@@ -1,18 +1,55 @@
 # vectordata
 
-Typed access to vector search benchmark datasets by name.
+Find, download, and read vector-search benchmark datasets by name —
+from the terminal or from Rust. You never construct URLs, choose a
+transport, or manage cache files: you name a dataset and read its
+vectors.
 
-Find datasets in configured catalogs, discover profiles and facets,
-and read vectors — without constructing URLs, choosing transports,
-or managing files. Datasets carry ground truth that has been
+Datasets carry ground truth (exact and filtered KNN) that has been
 numerically cross-verified against FAISS and the Python `knn_utils`
 reference (numpy + FAISS) — see the
 [KNN engine conformance section](../docs/sysref/12-knn-utils-verification.md#127-cross-engine-conformance-testing).
 
-## The prescribed pattern
+There are **two ways in**, both built on the same
+catalog → profile → facet model:
 
-This is the entry path the crate is designed around. Use this for
-everything unless you genuinely have no catalog to start from.
+## 1. Find and download datasets from the CLI
+
+The quickest entry point is `vectordata explore`: run it with no
+arguments and it pops a **catalog picker**, lets you browse the datasets
+in your configured catalogs, and opens a TUI (norms, distances,
+eigenvalues, PCA projections) against whichever you choose — fetching
+data on demand.
+
+```bash
+# Register a catalog once (an HTTP URL or a local directory); remembered after.
+vectordata config catalog add https://example.com/datasets/
+
+# Easiest entry point — browse + visualize interactively:
+vectordata explore                    # pops the catalog picker
+vectordata explore --dataset my-dataset   # …or jump straight to one
+
+# Or drive it explicitly:
+vectordata datasets list              # what's available
+vectordata datasets describe my-dataset   # profiles, facets, metric
+vectordata datasets ping my-dataset       # confirm every facet is readable
+vectordata datasets precache my-dataset   # download + verify into the local cache
+vectordata cache list                 # what's cached locally
+```
+
+Datasets are addressed by name (`my-dataset`) or `name:profile`
+(`my-dataset:default`). `precache` downloads each facet, verifies it against
+its SHA-256 chunk hashes, and persists it to disk — subsequent reads
+(and `explore`) are then zero-copy mmap.
+
+Full walk-through: [Find and fetch datasets with the CLI](./docs/find-and-fetch-datasets.md).
+
+## 2. Read datasets from Rust
+
+The same find-and-read flow, programmatically: resolve a catalog, open a
+profile by name, and read its facets through typed readers. This is the
+entry path the crate is designed around — use it unless you genuinely
+have no catalog to start from.
 
 ```rust
 use vectordata::catalog::sources::CatalogSources;
@@ -50,7 +87,7 @@ direct-HTTP path on a URL that has a published `.mref` — see the
 design note.
 
 For the full walk-through, see the
-[Accessing datasets from Rust](../docs/tutorials/access-datasets-from-rust.md)
+[Accessing datasets from Rust](./docs/access-datasets-from-rust.md)
 tutorial.
 
 ## Discover profiles and facets
@@ -102,8 +139,8 @@ protect_settings: true
 Or via the CLI:
 
 ```bash
-veks datasets config set cache /mnt/fast-storage/vectordata-cache
-veks datasets config get
+vectordata config set cache /mnt/fast-storage/vectordata-cache
+vectordata config get cache
 ```
 
 Resolution order:
@@ -123,9 +160,9 @@ paths mmap; URLs go through the cache when `.mref` is published.
 ```rust
 use vectordata::io::{open_vec, open_vvec, VectorReader, VvecReader};
 
-let r = open_vec::<f32>("base_vectors.fvec")?;
-let r = open_vec::<f32>("https://example.com/dataset/base.fvec")?;
-let r = open_vvec::<i32>("metadata_indices.ivvec")?;
+let r = open_vec::<f32>("base_vectors.fvecs")?;
+let r = open_vec::<f32>("https://example.com/dataset/base.fvecs")?;
+let r = open_vvec::<i32>("metadata_indices.ivvecs")?;
 ```
 
 ## Features
@@ -142,7 +179,7 @@ let r = open_vvec::<i32>("metadata_indices.ivvec")?;
   complete.
 - **All element types** — `f32`, `f64`, `f16`, `i32`, `i16`, `i8`,
   `u8`, `u16`, `u32`, `u64`, `i64`.
-- **Variable-length records** — `.ivvec` etc. with `IDXFOR__`
+- **Variable-length records** — `.ivvecs` etc. with `IDXFOR__`
   offset index, fetched as a sibling for remote datasets.
 - **Typed access** — `TypedReader<T>` with widening, cross-sign
   checks, and zero-copy native reads.
@@ -154,7 +191,7 @@ let r = open_vvec::<i32>("metadata_indices.ivvec")?;
 ## Documentation
 
 - [API reference](../docs/sysref/02-api.md) — full consumer reference.
-- [Tutorial: Accessing datasets from Rust](../docs/tutorials/access-datasets-from-rust.md)
+- [Tutorial: Accessing datasets from Rust](./docs/access-datasets-from-rust.md)
   — end-to-end walk-through of the prescribed pattern.
 - [Data Model](../docs/sysref/01-data-model.md) — file formats,
   facets, profiles.

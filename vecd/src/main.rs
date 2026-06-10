@@ -16,8 +16,9 @@ fn main() {
     // `_VECD_COMPLETE=…`), emit candidates and exit. `vecd completions` is a
     // one-liner that re-invokes the binary with that env var set, so completion
     // logic lives in the spec, not a frozen script.
-    let resolvers: std::collections::BTreeMap<String, veks_completion::ValueProvider> =
-        std::collections::BTreeMap::new();
+    // Dynamic value completion for admin commands: backend names, namespace
+    // paths, roles, principals — read live from the control-plane DB.
+    let resolvers = vecd::completion::resolvers();
     let tree = vcli::build_completion_tree(&spec, &resolvers);
     if veks_completion::handle_complete_env("vecd", &tree) {
         return;

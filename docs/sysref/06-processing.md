@@ -6,9 +6,9 @@
 
 Sort-based deduplication using bitwise vector equality:
 
-1. **Sort** — Radix sort on vector bytes, producing `sorted_ordinals.ivec`
+1. **Sort** — Radix sort on vector bytes, producing `sorted_ordinals.ivecs`
 2. **Compare** — Adjacent vectors in sorted order are compared bitwise
-3. **Mark** — Duplicate ordinals written to `dedup_duplicates.ivec`
+3. **Mark** — Duplicate ordinals written to `dedup_duplicates.ivecs`
 4. **Filter** — Extract steps skip marked ordinals
 
 The unified `prepare-vectors` step (`compute sort`) handles sort +
@@ -64,7 +64,7 @@ Generates random integer metadata and equality predicates:
    range, one per query, written as scalar
 3. **Evaluation** (`compute evaluate-predicates`): For each predicate
    value, finds all base ordinals with matching metadata. Output is
-   variable-length `.ivvec` — each record lists the matching ordinals
+   variable-length `.ivvecs` — each record lists the matching ordinals
 
 ### Selectivity
 
@@ -80,7 +80,7 @@ The `evaluate-predicates` command:
 1. Reads metadata (scalar) and predicates (scalar)
 2. Builds a hash map index: `value → [ordinals]`
 3. For each predicate, looks up matching ordinals
-4. Writes results as `.ivvec` (variable-length records)
+4. Writes results as `.ivvecs` (variable-length records)
 5. Builds the `IDXFOR__` offset index for the output
 
 Time complexity: O(M) to build index + O(P) to evaluate.
@@ -112,7 +112,7 @@ the definitive quality reference and cross-verification methodology.
 
 1. For each query, compute distance to every base vector
 2. Maintain a max-heap of size k
-3. Write indices (`.ivec`) and distances (`.fvec`)
+3. Write indices (`.ivecs`) and distances (`.fvecs`)
 
 Metrics: L2, Cosine, DotProduct. Multi-threaded.
 
@@ -120,7 +120,7 @@ Metrics: L2, Cosine, DotProduct. Multi-threaded.
 
 Predicate-filtered KNN pre-filters the candidate set:
 
-1. Load predicate results (`.ivvec` or `.slab`) for the query's predicate
+1. Load predicate results (`.ivvecs` or `.slab`) for the query's predicate
 2. Compute distances only to matching base vectors
 3. Top-k from the filtered set
 

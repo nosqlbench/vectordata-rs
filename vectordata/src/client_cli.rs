@@ -76,15 +76,60 @@ pub fn login(
         }
     };
 
+    // Record under the URL you logged in to: an origin (`https://h/`) records an
+    // origin-wide credential; a catalog URL (`https://h/datasets/`) records one
+    // scoped to that catalog, which then wins for reads under it.
+    let key = crate::credentials::credential_key(url).unwrap_or_else(|| origin.clone());
     let mut store = Store::load();
     let user_note = user.as_deref().map(|u| format!(" as {u}")).unwrap_or_default();
-    store.set(origin.clone(), Entry { token, user, expires: expires_at });
+    store.set(key.clone(), Entry { token, user, expires: expires_at });
     if let Err(e) = store.save() {
         eprintln!("could not write credentials: {e}");
         return 1;
     }
-    println!("logged in to {origin}{user_note}");
+    println!("logged in to {key}{user_note}");
     0
+}
+
+/// After a successful login, offer to add the endpoint's namespace catalogs to
+/// the local catalog list. Interactive only — skipped in scripts/pipes — and a
+/// no-op when the endpoint exposes no namespaces you can target.
+///
+/// Called from the binary's `login` command (the interactive entry point), **not**
+/// from [`login`] itself, so the pure handler never blocks on a stdin prompt
+/// (which would hang non-interactive callers such as integration tests).
+pub fn offer_endpoint_catalogs(url: &str) {
+    use std::io::{IsTerminal, Write};
+    if !std::io::stdin().is_terminal() {
+        return;
+    }
+    let base = url.trim_end_matches('/');
+    let token = crate::credentials::stored_token(base);
+    let namespaces = crate::endpoint::candidate_namespaces(base, token.as_deref());
+    if namespaces.is_empty() {
+        return;
+    }
+    let urls: Vec<String> =
+        namespaces.iter().map(|ns| format!("{base}/{}/", ns.trim_matches('/'))).collect();
+
+    let plural = if urls.len() == 1 { "" } else { "s" };
+    println!("\nThis endpoint exposes {} namespace{plural} you can target:", urls.len());
+    for u in &urls {
+        println!("  {u}");
+    }
+    print!("Add as catalog{plural} so `datasets list` shows them? [Y/n] ");
+    let _ = std::io::stdout().flush();
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line).is_err() {
+        return;
+    }
+    let ans = line.trim().to_lowercase();
+    if !(ans.is_empty() || ans == "y" || ans == "yes") {
+        return;
+    }
+    for u in urls {
+        crate::config::add_catalog(&u);
+    }
 }
 
 /// Best-effort: ask the endpoint which user a token authenticates as, so a
@@ -100,19 +145,20 @@ fn whoami_user(url: &str, token: &str) -> Option<String> {
 
 /// `vectordata logout <url>` — forget a stored credential.
 pub fn logout(url: &str) -> i32 {
-    let Some(origin) = origin_of_str(url) else {
+    // Forget the credential recorded under this exact key (origin or catalog).
+    let Some(key) = crate::credentials::credential_key(url) else {
         eprintln!("not a valid endpoint URL: {url}");
         return 2;
     };
     let mut store = Store::load();
-    if store.remove(&origin) {
+    if store.remove(&key) {
         if let Err(e) = store.save() {
             eprintln!("could not write credentials: {e}");
             return 1;
         }
-        println!("logged out of {origin}");
+        println!("logged out of {key}");
     } else {
-        println!("no stored credential for {origin}");
+        println!("no stored credential for {key}");
     }
     0
 }

@@ -473,7 +473,7 @@ impl DSProfileGroup {
                 // profile auto-acquired views like
                 // `profiles/default/neighbor_distances.fvec`
                 // pointing at files `compute-knn-partition` never
-                // wrote — the sift1m 403 bug.
+                // wrote — the vecs1m 403 bug.
                 if !profile.partition && template_id.contains("partition") {
                     continue;
                 }
@@ -2258,7 +2258,7 @@ default:
         assert_eq!(p10.view("query_vectors").unwrap().path(), "query.mvec");
     }
 
-    /// Reproduces the sift1m shape: `compute-knn-partition` is a
+    /// Reproduces the vecs1m shape: `compute-knn-partition` is a
     /// partition-only template (the expander skips it for default
     /// because the step ID contains "partition") but its outputs
     /// (`neighbor_indices`, `neighbor_distances`) used to get

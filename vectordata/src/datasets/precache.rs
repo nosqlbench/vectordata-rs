@@ -36,7 +36,7 @@ use crate::{PrebufferProgress, TestDataView};
 /// Entry point.
 ///
 /// `dataset_spec` is one of:
-/// - `name:profile` resolved via the catalog (e.g. `sift-128:default`)
+/// - `name:profile` resolved via the catalog (e.g. `glove-100:default`)
 /// - `name` resolved via the catalog (uses *all* profiles)
 /// - a local directory containing a `dataset.yaml`
 /// - a path to a `dataset.yaml` file

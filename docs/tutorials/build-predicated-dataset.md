@@ -25,8 +25,8 @@ predicated vector search.
 mkdir my-predicated-dataset && cd my-predicated-dataset
 
 # If you have source vectors:
-cp /path/to/base.fvec _base_vectors.fvec
-cp /path/to/queries.fvec _query_vectors.fvec
+cp /path/to/base.fvecs _base_vectors.fvecs
+cp /path/to/queries.fvecs _query_vectors.fvecs
 
 veks bootstrap -i
 ```
@@ -58,7 +58,7 @@ upstream:
   steps:
     - id: generate-base
       run: generate vectors
-      output: profiles/base/base_vectors.fvec
+      output: profiles/base/base_vectors.fvecs
       dimension: 128
       count: 1000000
       seed: 42
@@ -66,7 +66,7 @@ upstream:
 
     - id: generate-queries
       run: generate vectors
-      output: profiles/base/query_vectors.fvec
+      output: profiles/base/query_vectors.fvecs
       dimension: 128
       count: 10000
       seed: 1337
@@ -75,21 +75,21 @@ upstream:
     - id: scan-zeros
       run: analyze find-zeros
       after: [generate-base]
-      source: profiles/base/base_vectors.fvec
+      source: profiles/base/base_vectors.fvecs
 
     - id: scan-duplicates
       run: analyze find-duplicates
       after: [generate-base]
-      source: profiles/base/base_vectors.fvec
+      source: profiles/base/base_vectors.fvecs
 
     - id: compute-knn
       run: compute knn
       per_profile: true
       after: [generate-base, generate-queries]
-      base: profiles/base/base_vectors.fvec
-      query: profiles/base/query_vectors.fvec
-      indices: neighbor_indices.ivec
-      distances: neighbor_distances.fvec
+      base: profiles/base/base_vectors.fvecs
+      query: profiles/base/query_vectors.fvecs
+      indices: neighbor_indices.ivecs
+      distances: neighbor_distances.fvecs
       neighbors: 100
       metric: L2
       normalized: false
@@ -97,8 +97,8 @@ upstream:
     - id: verify-knn
       run: verify knn-consolidated
       after: [compute-knn]
-      base: profiles/base/base_vectors.fvec
-      query: profiles/base/query_vectors.fvec
+      base: profiles/base/base_vectors.fvecs
+      query: profiles/base/query_vectors.fvecs
       metric: L2
       normalized: false
       sample: 100
@@ -138,7 +138,7 @@ upstream:
       mode: simple-int-eq
       fields: 1
       range: "[0,1000000)"
-      output: metadata_indices.ivvec
+      output: metadata_indices.ivvecs
 
     - id: verify-predicates-sqlite
       run: verify predicates-sqlite
@@ -147,7 +147,7 @@ upstream:
       after: [evaluate-predicates]
       metadata: profiles/base/metadata_content.u8
       predicates: profiles/base/predicates.u8
-      results: metadata_indices.ivvec
+      results: metadata_indices.ivvecs
       fields: 1
       output: "${cache}/verify_predicates_sqlite.json"
 
@@ -157,11 +157,11 @@ upstream:
       per_profile: true
       phase: 2
       after: [verify-predicates-sqlite]
-      base: profiles/base/base_vectors.fvec
-      query: profiles/base/query_vectors.fvec
-      metadata-indices: metadata_indices.ivvec
-      indices: prefiltered_neighbor_indices.ivec
-      distances: prefiltered_neighbor_distances.fvec
+      base: profiles/base/base_vectors.fvecs
+      query: profiles/base/query_vectors.fvecs
+      metadata-indices: metadata_indices.ivvecs
+      indices: prefiltered_neighbor_indices.ivecs
+      distances: prefiltered_neighbor_distances.fvecs
       neighbors: 100
       metric: L2
 
@@ -172,11 +172,11 @@ upstream:
       per_profile: true
       phase: 2
       after: [compute-knn, verify-predicates-sqlite]
-      ground-truth: neighbor_indices.ivec
-      ground-truth-distances: neighbor_distances.fvec
-      metadata-indices: metadata_indices.ivvec
-      indices: postfiltered_neighbor_indices.ivec
-      distances: postfiltered_neighbor_distances.fvec
+      ground-truth: neighbor_indices.ivecs
+      ground-truth-distances: neighbor_distances.fvecs
+      metadata-indices: metadata_indices.ivvecs
+      indices: postfiltered_neighbor_indices.ivecs
+      distances: postfiltered_neighbor_distances.fvecs
 
     - id: generate-dataset-json
       run: generate dataset-json
@@ -209,15 +209,15 @@ upstream:
 profiles:
   default:
     maxk: 100
-    base_vectors: profiles/base/base_vectors.fvec
-    query_vectors: profiles/base/query_vectors.fvec
-    neighbor_indices: profiles/default/neighbor_indices.ivec
-    neighbor_distances: profiles/default/neighbor_distances.fvec
+    base_vectors: profiles/base/base_vectors.fvecs
+    query_vectors: profiles/base/query_vectors.fvecs
+    neighbor_indices: profiles/default/neighbor_indices.ivecs
+    neighbor_distances: profiles/default/neighbor_distances.fvecs
     metadata_content: profiles/base/metadata_content.u8
     metadata_predicates: profiles/base/predicates.u8
-    metadata_indices: profiles/default/metadata_indices.ivvec
-    filtered_neighbor_indices: profiles/default/filtered_neighbor_indices.ivec
-    filtered_neighbor_distances: profiles/default/filtered_neighbor_distances.fvec
+    metadata_indices: profiles/default/metadata_indices.ivvecs
+    filtered_neighbor_indices: profiles/default/filtered_neighbor_indices.ivecs
+    filtered_neighbor_distances: profiles/default/filtered_neighbor_distances.fvecs
 ```
 
 Run it:
@@ -239,8 +239,8 @@ veks analyze explain-predicates --ordinal 42
 veks analyze explain-filtered-knn --ordinal 42
 
 # Describe file structure
-veks analyze describe --source profiles/default/metadata_indices.ivvec
-veks analyze describe --source profiles/default/metadata_indices.ivvec --scan true
+veks analyze describe --source profiles/default/metadata_indices.ivvecs
+veks analyze describe --source profiles/default/metadata_indices.ivvecs --scan true
 ```
 
 ## Access from Rust

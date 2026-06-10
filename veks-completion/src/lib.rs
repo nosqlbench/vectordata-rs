@@ -407,6 +407,10 @@ pub struct Node {
     flag_long_help: BTreeMap<String, String>,
     /// Dynamic value providers keyed by flag name.
     value_providers: BTreeMap<String, ValueProvider>,
+    /// Provider for this command's first positional argument (e.g. the backend
+    /// name in `backends remove <name>`). Consulted when the cursor sits at a
+    /// bare positional slot rather than after a value flag.
+    positional_provider: Option<ValueProvider>,
 
     // ---- discovery extras ----
     /// Optional provider that discovers additional `key=` options
@@ -751,6 +755,7 @@ impl Default for Node {
             flag_help: BTreeMap::new(),
             flag_long_help: BTreeMap::new(),
             value_providers: BTreeMap::new(),
+            positional_provider: None,
             dynamic_options: None,
             subtree_provider: None,
             extras: None,
@@ -897,6 +902,17 @@ impl Node {
     /// Direct access to the value-provider map (used by walkers).
     pub fn value_providers(&self) -> &BTreeMap<String, ValueProvider> {
         &self.value_providers
+    }
+
+    /// Attach a provider for this command's first positional argument.
+    pub fn with_positional_provider(mut self, provider: ValueProvider) -> Self {
+        self.positional_provider = Some(provider);
+        self
+    }
+
+    /// The first-positional provider, if any.
+    pub fn positional_provider(&self) -> Option<&ValueProvider> {
+        self.positional_provider.as_ref()
     }
 
     /// Attach a dynamic options provider.
@@ -1876,11 +1892,52 @@ pub fn complete_at_tap_with_raw(
         a.starts_with('-').cmp(&b.starts_with('-')).then_with(|| a.cmp(b))
     });
 
-    // Children precede flags so a hybrid node lists subcommands
-    // first, then flags.
+    // (4) First-positional value completion: when this command takes a
+    // positional, none has been entered yet, and the cursor is on a bare word
+    // (not after a flag), offer the positional's dynamic candidates.
+    let mut positional_candidates: Vec<String> = Vec::new();
+    if let Some(provider) = node.positional_provider() {
+        if !partial.starts_with('-')
+            && positionals_entered(remaining, &node.flags, &node.boolean_flags) == 0
+        {
+            positional_candidates = provider(partial, remaining);
+        }
+    }
+
+    // Children, then positional values, then flags.
     let mut out: Vec<String> = child_candidates.into_iter().map(|(_, k)| k).collect();
+    out.extend(positional_candidates);
     out.extend(flag_candidates);
     out
+}
+
+/// Count the bare positional words already entered in `remaining`, skipping
+/// flags and the values consumed by value-taking flags this node knows about.
+/// (Global value-flags the node doesn't list may be miscounted; that only
+/// suppresses a suggestion, never misfires one.)
+fn positionals_entered(
+    remaining: &[&str],
+    flags: &[String],
+    boolean_flags: &std::collections::HashSet<String>,
+) -> usize {
+    let mut count = 0;
+    let mut i = 0;
+    while i < remaining.len() {
+        let w = remaining[i];
+        if w.starts_with("--") {
+            let takes_value =
+                !w.contains('=') && flags.iter().any(|f| f == w) && !boolean_flags.contains(w);
+            if takes_value {
+                i += 1; // skip the flag's value
+            }
+        } else if w.starts_with('-') && w.len() > 1 {
+            // short flag(s) — not treated as a positional
+        } else {
+            count += 1;
+        }
+        i += 1;
+    }
+    count
 }
 
 /// Supported shells for completion-script generation.

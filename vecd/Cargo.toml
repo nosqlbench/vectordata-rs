@@ -24,6 +24,9 @@ futures-util = "0.3"
 # TLS termination in-process (rustls; pure-Rust, matches vectordata's
 # reqwest rustls choice). Plain HTTP when no cert is configured.
 axum-server = { version = "0.7", features = ["tls-rustls"] }
+# Self-signed cert generation for `vecd tls generate` (ring crypto, matching
+# the rustls/ring backend already in the tree — no C toolchain needed).
+rcgen = { version = "0.13", default-features = false, features = ["pem", "ring"] }
 
 # Control-plane store. `bundled` matches the workspace's established
 # rusqlite choice (veks-pipeline). The DB is the CAS authority + the

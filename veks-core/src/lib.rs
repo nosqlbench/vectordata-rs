@@ -9,7 +9,9 @@
 
 #![allow(dead_code)]
 
-pub mod filters;
+/// Unified filtering rules — re-exported from `vectordata` (the base crate),
+/// where the single definition lives so the push engine shares the same rules.
+pub use vectordata::filters;
 pub mod formats;
 pub mod legacy_sweep;
 pub mod paths;

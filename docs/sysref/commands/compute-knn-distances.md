@@ -28,9 +28,9 @@ already cover distances).
 
 ```bash
 veks pipeline compute knn-distances \
-  --base    profiles/base/base_vectors.fvec \
-  --query   profiles/base/query_vectors.fvec \
-  --indices profiles/default/neighbor_indices.ivec \
+  --base    profiles/base/base_vectors.fvecs \
+  --query   profiles/base/query_vectors.fvecs \
+  --indices profiles/default/neighbor_indices.ivecs \
   --output  profiles/default/neighbor_distances.fvecs \
   --metric  IP
 ```
@@ -39,17 +39,17 @@ veks pipeline compute knn-distances \
 
 | Option | Required | Default | Description |
 |--------|----------|---------|-------------|
-| `--base` | yes | — | Base vectors (`.fvec` / `.mvec`) |
-| `--query` | yes | — | Query vectors (`.fvec` / `.mvec`) |
-| `--indices` | yes | — | Existing neighbor indices (`.ivec`) |
-| `--output` | yes | — | Output distances file (`.fvec`) |
+| `--base` | yes | — | Base vectors (`.fvecs` / `.mvecs`) |
+| `--query` | yes | — | Query vectors (`.fvecs` / `.mvecs`) |
+| `--indices` | yes | — | Existing neighbor indices (`.ivecs`) |
+| `--output` | yes | — | Output distances file (`.fvecs`) |
 | `--metric` | no | `IP` | `L2`, `IP` / `DOT`, `COSINE`, or `L1` |
 | `--assume_normalized_like_faiss=true` | when `metric=COSINE` | — | Treat inputs as pre-normalized; evaluate cosine as inner product (FAISS / numpy / knn_utils convention). Exactly one of this and `use_proper_cosine_metric` must be set when `metric=COSINE`. |
 | `--use_proper_cosine_metric=true` | when `metric=COSINE` | — | Compute cosine in-kernel from raw vectors via dot/(\|q\|×\|b\|). Use when inputs are not pre-normalized. |
 
 ## Element types
 
-Both base and query may be stored as `.fvec` (f32) or `.mvec` (f16).
+Both base and query may be stored as `.fvecs` (f32) or `.mvecs` (f16).
 The command dispatches to a monomorphized inner loop per (base, query)
 element-type pair — `(f32, f32)`, `(f32, f16)`, `(f16, f32)`,
 `(f16, f16)` — with no dynamic dispatch in the hot path. The sgemm

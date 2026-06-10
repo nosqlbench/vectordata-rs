@@ -7,7 +7,7 @@ Generate random vectors with configurable distribution.
 ```yaml
 - id: generate-base
   run: generate vectors
-  output: profiles/base/base_vectors.fvec
+  output: profiles/base/base_vectors.fvecs
   dimension: 128
   count: 1000000
   seed: 42

@@ -13,7 +13,7 @@ veks pipeline analyze select --source <file> --range <spec> [--format text|json|
 ### Single vector (text)
 
 ```bash
-veks pipeline analyze select --source profiles/base/base_vectors.fvec --range 0
+veks pipeline analyze select --source profiles/base/base_vectors.fvecs --range 0
 ```
 
 ```
@@ -37,7 +37,7 @@ veks pipeline analyze select --source profiles/base/metadata_content.u8 --range 
 ### Variable-length record (ivvec)
 
 ```bash
-veks pipeline analyze select --source profiles/default/metadata_indices.ivvec --range 0
+veks pipeline analyze select --source profiles/default/metadata_indices.ivvecs --range 0
 ```
 
 ```
@@ -47,7 +47,7 @@ veks pipeline analyze select --source profiles/default/metadata_indices.ivvec --
 ### Ground truth neighbors
 
 ```bash
-veks pipeline analyze select --source profiles/default/neighbor_indices.ivec --range 0
+veks pipeline analyze select --source profiles/default/neighbor_indices.ivecs --range 0
 ```
 
 ```
@@ -57,7 +57,7 @@ veks pipeline analyze select --source profiles/default/neighbor_indices.ivec --r
 ### JSON output
 
 ```bash
-veks pipeline analyze select --source profiles/base/base_vectors.fvec --range 0 --format json
+veks pipeline analyze select --source profiles/base/base_vectors.fvecs --range 0 --format json
 ```
 
 ## Range syntax

@@ -8,8 +8,8 @@ Multi-threaded brute-force KNN verification across all profiles.
 - id: verify-knn
   run: verify knn-consolidated
   after: [compute-knn]
-  base: profiles/base/base_vectors.fvec
-  query: profiles/base/query_vectors.fvec
+  base: profiles/base/base_vectors.fvecs
+  query: profiles/base/query_vectors.fvecs
   metric: L2
   normalized: false
   sample: 100

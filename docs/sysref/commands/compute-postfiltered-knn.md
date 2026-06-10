@@ -23,11 +23,11 @@ For the perfect-recall pre-filter sibling (ACORN `G_K`, full K), see
   per_profile: true
   phase: 2
   after: [compute-knn, compute-evaluate-predicates]
-  ground-truth: profiles/{profile}/neighbor_indices.ivec
-  ground-truth-distances: profiles/{profile}/neighbor_distances.fvec
-  metadata-indices: profiles/{profile}/metadata_indices.ivvec
-  indices: postfiltered_neighbor_indices.ivec
-  distances: postfiltered_neighbor_distances.fvec
+  ground-truth: profiles/{profile}/neighbor_indices.ivecs
+  ground-truth-distances: profiles/{profile}/neighbor_distances.fvecs
+  metadata-indices: profiles/{profile}/metadata_indices.ivvecs
+  indices: postfiltered_neighbor_indices.ivecs
+  distances: postfiltered_neighbor_distances.fvecs
 ```
 
 ## Options

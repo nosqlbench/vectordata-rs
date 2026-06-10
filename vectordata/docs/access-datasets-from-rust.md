@@ -186,8 +186,8 @@ base location, the absolute ones pass through unchanged:
 # dataset.yaml on local disk
 profiles:
   default:
-    base_vectors: profiles/base/base_vectors.fvec        # local
-    query_vectors: https://hosted.example.com/q.fvec     # remote
+    base_vectors: profiles/base/base_vectors.fvecs        # local
+    query_vectors: https://hosted.example.com/q.fvecs     # remote
     metadata_content: profiles/base/metadata_content.u8  # local
 ```
 
@@ -249,7 +249,7 @@ are reading a local file) and the call site is in a hot loop:
 use vectordata::{XvecReader, VectorReader};
 
 // Direct concrete-type access
-let base = XvecReader::<f32>::open_path(std::path::Path::new("base.fvec"))?;
+let base = XvecReader::<f32>::open_path(std::path::Path::new("base.fvecs"))?;
 base.advise_sequential();                // madvise hint
 for i in 0..base.count() {
     let v: &[f32] = base.get_slice(i);   // zero-copy, no bounds check
@@ -272,10 +272,10 @@ published, fall back to direct HTTP otherwise.
 ```rust
 use vectordata::io::{open_vec, open_vvec, VectorReader, VvecReader};
 
-let r = open_vec::<f32>("base.fvec")?;
-let r = open_vec::<i32>("https://example.com/neighbors.ivec")?;
+let r = open_vec::<f32>("base.fvecs")?;
+let r = open_vec::<i32>("https://example.com/neighbors.ivecs")?;
 
-let r = open_vvec::<i32>("metadata_indices.ivvec")?;
+let r = open_vvec::<i32>("metadata_indices.ivvecs")?;
 ```
 
 For typed scalar access without a `TestDataView`:
@@ -296,8 +296,8 @@ let r = TypedReader::<i64>::open_auto("https://host/metadata.i32",
 
 ## Where to go next
 
-- [API reference](../sysref/02-api.md) — full method-by-method reference.
-- [Catalogs](../sysref/03-catalogs.md) — publishing datasets and
+- [API reference](../../docs/sysref/02-api.md) — full method-by-method reference.
+- [Catalogs](../../docs/sysref/03-catalogs.md) — publishing datasets and
   managing catalog sources.
-- [Storage / transport factoring](../design/storage_transport_factoring.md)
+- [Storage / transport factoring](../../docs/design/storage_transport_factoring.md)
   — the design behind the unified open dispatch.

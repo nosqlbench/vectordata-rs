@@ -17,7 +17,7 @@ correctness at every processing stage.
   sudo apt install libopenblas-dev
   cargo build --release --features knnutils
   ```
-- A source dataset (e.g., sift-128-euclidean from ann-benchmarks)
+- A source dataset (e.g., an ann-benchmarks 128-dim euclidean dataset)
 - Python 3 with `knn_utils` installed (for the reference run)
 
 ---
@@ -28,8 +28,8 @@ The `--personality knn_utils` flag tells the bootstrap wizard to use
 knn_utils-compatible commands at every pipeline stage:
 
 ```bash
-mkdir sift128e && cd sift128e
-cp /path/to/sift-128-euclidean.hdf5 _source.hdf5
+mkdir vecs-128 && cd vecs-128
+cp /path/to/ann-benchmarks-128-euclidean.hdf5 _source.hdf5
 
 veks bootstrap -i --personality knn_utils
 ```
@@ -53,9 +53,9 @@ The pipeline uses:
 
 ```bash
 veks pipeline verify dataset-knnutils \
-  --base profiles/base/base_vectors.fvec \
-  --query profiles/base/query_vectors.fvec \
-  --indices profiles/default/neighbor_indices.ivec \
+  --base profiles/base/base_vectors.fvecs \
+  --query profiles/base/query_vectors.fvecs \
+  --indices profiles/default/neighbor_indices.ivecs \
   --neighbors 100 \
   --metric IP \
   --sample 1000
@@ -67,7 +67,7 @@ This runs the full knn_utils verification suite:
 === knn_utils Dataset Verification ===
 
 --- Base vectors (fvecs_check) ---
-  file: profiles/base/base_vectors.fvec
+  file: profiles/base/base_vectors.fvecs
   vectors: 985462, dim: 128
   zero vectors: 0 (threshold 1e-6)
   normalization: PASS (max deviation 1.19e-7, tolerance 1e-5)
@@ -75,12 +75,12 @@ This runs the full knn_utils verification suite:
   PASS
 
 --- Query vectors (fvecs_check) ---
-  file: profiles/base/query_vectors.fvec
+  file: profiles/base/query_vectors.fvecs
   vectors: 10000, dim: 128
   PASS
 
 --- Ground truth (ivecs_check) ---
-  file: profiles/default/neighbor_indices.ivec
+  file: profiles/default/neighbor_indices.ivecs
   queries: 10000, k: 100
   all ordinals in range [0, 985462)
   PASS
@@ -102,11 +102,11 @@ you can compare byte-for-byte:
 
 ```bash
 # Compare base vectors
-cmp veks_output/profiles/base/base_vectors.fvec knn_utils_output/base_vectors.fvecs
+cmp veks_output/profiles/base/base_vectors.fvecs knn_utils_output/base_vectors.fvecs
 # (no output = identical)
 
 # Compare ground truth
-cmp veks_output/profiles/default/neighbor_indices.ivec knn_utils_output/gt.ivecs
+cmp veks_output/profiles/default/neighbor_indices.ivecs knn_utils_output/gt.ivecs
 ```
 
 With the same BLAS (MKL) and knn_utils personality, these should
@@ -120,7 +120,7 @@ BLAS implementations (OpenBLAS vs MKL):
 ```bash
 # Check neighbor set overlap
 veks pipeline analyze compare-files \
-  --source veks_output/profiles/default/neighbor_indices.ivec \
+  --source veks_output/profiles/default/neighbor_indices.ivecs \
   --reference knn_utils_output/gt.ivecs
 ```
 
@@ -151,9 +151,9 @@ To additionally cross-verify against knn_utils:
 
 ```bash
 veks pipeline verify dataset-knnutils \
-  --base profiles/base/base_vectors.fvec \
-  --query profiles/base/query_vectors.fvec \
-  --indices profiles/default/neighbor_indices.ivec \
+  --base profiles/base/base_vectors.fvecs \
+  --query profiles/base/query_vectors.fvecs \
+  --indices profiles/default/neighbor_indices.ivecs \
   --neighbors 100 \
   --metric L2 \
   --sample 1000
@@ -193,12 +193,12 @@ veks run dataset.yaml
 
 # Verify against knn_utils standards
 veks pipeline verify dataset-knnutils \
-  --base base.fvec --query query.fvec --indices gt.ivec \
+  --base base.fvecs --query query.fvecs --indices gt.ivecs \
   --neighbors 100 --metric IP --sample 1000
 
 # A/B test (requires --features knnutils,faiss)
 veks pipeline compute knn-faiss \
-  --base base.fvec --query query.fvec \
-  --indices gt_faiss.ivec --distances gt_faiss.fvec \
+  --base base.fvecs --query query.fvecs \
+  --indices gt_faiss.ivecs --distances gt_faiss.fvecs \
   --neighbors 100 --metric IP
 ```

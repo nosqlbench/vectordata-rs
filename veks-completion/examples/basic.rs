@@ -15,7 +15,7 @@ use veks_completion::{CommandTree, Node, complete, handle_complete_env, print_ba
 
 /// Example value provider: suggests dataset names for `--dataset`.
 fn complete_datasets(partial: &str, _context: &[&str]) -> Vec<String> {
-    let datasets = ["sift128", "glove100", "cohere768", "ada1536"];
+    let datasets = ["vecs-128", "glove100", "vecs768", "emb1536"];
     datasets.iter()
         .filter(|d| partial.is_empty() || d.starts_with(partial))
         .map(|d| d.to_string())

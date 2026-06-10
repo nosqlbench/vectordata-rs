@@ -779,10 +779,10 @@ mod tests {
     #[test]
     fn test_filter_name_substring() {
         let f = DatasetFilter {
-            name: Some("sift".to_string()),
+            name: Some("vecs".to_string()),
             ..Default::default()
         };
-        let entry = entry_with_views("sift-128", &["base_vectors"]);
+        let entry = entry_with_views("vecs-128", &["base_vectors"]);
         assert!(f.matches(&entry));
 
         let entry2 = entry_with_views("glove-100", &["base_vectors"]);
@@ -792,10 +792,10 @@ mod tests {
     #[test]
     fn test_filter_name_regex() {
         let f = DatasetFilter {
-            name: Some("sift.*".to_string()),
+            name: Some("vecs.*".to_string()),
             ..Default::default()
         };
-        let entry = entry_with_views("sift-128", &["base_vectors"]);
+        let entry = entry_with_views("vecs-128", &["base_vectors"]);
         assert!(f.matches(&entry));
     }
 
@@ -850,9 +850,9 @@ mod tests {
 
     #[test]
     fn test_infer_dimension_from_name() {
-        assert_eq!(extract_dim_from_name("ada_002_d1536_b10000_q10000_mk100"), Some(1536));
-        assert_eq!(extract_dim_from_name("sift-128"), None);
-        assert_eq!(extract_dim_from_name("E5-base-v2_d768_b10000"), Some(768));
+        assert_eq!(extract_dim_from_name("emb_002_d1536_b10000_q10000_mk100"), Some(1536));
+        assert_eq!(extract_dim_from_name("vecs-128"), None);
+        assert_eq!(extract_dim_from_name("emb-base-v2_d768_b10000"), Some(768));
         assert_eq!(extract_dim_from_name("no-dimension-here"), None);
     }
 
@@ -862,10 +862,10 @@ mod tests {
             dim: Some(1536),
             ..Default::default()
         };
-        let entry = entry_with_views("ada_002_d1536_b10000_q10000_mk100", &["base_vectors"]);
+        let entry = entry_with_views("emb_002_d1536_b10000_q10000_mk100", &["base_vectors"]);
         assert!(f.matches(&entry));
 
-        let entry2 = entry_with_views("ada_002_d768_b10000", &["base_vectors"]);
+        let entry2 = entry_with_views("emb_002_d768_b10000", &["base_vectors"]);
         assert!(!f.matches(&entry2));
     }
 
@@ -962,18 +962,18 @@ mod tests {
 
     #[test]
     fn test_simple_match_regex() {
-        assert!(simple_match("sift.*", "sift-128"));
-        assert!(simple_match(".*sift.*", "my-sift-128"));
-        assert!(!simple_match("^sift.*", "glove-100"));
-        assert!(simple_match("128$", "sift-128"));
-        assert!(!simple_match("128$", "sift-256"));
-        assert!(simple_match(".*lai.*", "cohere_laion"));
+        assert!(simple_match("vecs.*", "vecs-128"));
+        assert!(simple_match(".*emb.*", "my-emb-128"));
+        assert!(!simple_match("^emb.*", "vec-100"));
+        assert!(simple_match("128$", "vec-128"));
+        assert!(!simple_match("128$", "vec-256"));
+        assert!(simple_match(".*set.*", "my_dataset"));
     }
 
     #[test]
     fn test_simple_match_exact() {
-        assert!(simple_match("sift-128", "sift-128"));
-        assert!(simple_match("SIFT-128", "sift-128"));
-        assert!(!simple_match("^sift-128$", "sift-256"));
+        assert!(simple_match("vecs-128", "vecs-128"));
+        assert!(simple_match("VECS-128", "vecs-128"));
+        assert!(!simple_match("^vecs-128$", "vecs-256"));
     }
 }

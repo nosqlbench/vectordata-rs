@@ -15,7 +15,7 @@ result file mapping each predicate to its matching base ordinals.
   mode: simple-int-eq
   fields: 1
   range: "[0,1000000)"
-  output: metadata_indices.ivvec
+  output: metadata_indices.ivvecs
 ```
 
 ## Options
@@ -25,7 +25,7 @@ result file mapping each predicate to its matching base ordinals.
 | `--source` | yes | Metadata file (scalar or slab) |
 | `--predicates` | yes | Predicates file |
 | `--mode` | yes | Evaluation mode (simple-int-eq or survey) |
-| `--output` | yes | Output file (.ivvec or .slab) |
+| `--output` | yes | Output file (.ivvecs or .slab) |
 | `--fields` | no | Number of metadata fields |
 | `--range` | no | Base vector ordinal range |
 

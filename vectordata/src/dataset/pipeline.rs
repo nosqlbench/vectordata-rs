@@ -156,8 +156,8 @@ impl StepDef {
     /// its sole output via `output:` is using `indices`/`distances`
     /// as *inputs*, not outputs.
     ///
-    /// Getting this wrong caused the sift1m
-    /// `profiles/default/_sift_groundtruth.ivecs: No such file` bug —
+    /// Getting this wrong caused the vecs1m
+    /// `profiles/default/_gt.ivecs: No such file` bug —
     /// the expander auto-prefixed the input `indices` path with
     /// `profiles/default/` and looked for the file in the wrong
     /// place.

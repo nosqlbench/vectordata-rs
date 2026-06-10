@@ -11,11 +11,11 @@ veks pipeline analyze stats --source <file>
 ## Example
 
 ```bash
-veks pipeline analyze stats --source profiles/base/base_vectors.fvec
+veks pipeline analyze stats --source profiles/base/base_vectors.fvecs
 ```
 
 ```
-  source: ./profiles/base/base_vectors.fvec (f32, dim=128, 1000 records)
+  source: ./profiles/base/base_vectors.fvecs (f32, dim=128, 1000 records)
 Global statistics (1000 vectors, 128 dims, 128000 values):
   Mean:     0.001584
   StdDev:   0.576655

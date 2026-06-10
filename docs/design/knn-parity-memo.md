@@ -83,7 +83,7 @@ Three regressions in this work cycle, in chronological order.
 
 ### (i) Canonical-rerank sign convention
 
-**Symptom**: user's `ibm-datapile-1b` dataset, freshly recomputed, had
+**Symptom**: user's dataset, freshly recomputed, had
 `recall@100 = 0.0000` for every profile from `300k` onward.
 
 **Cause**: I added a canonical f64 rerank post-pass to every `compute
@@ -246,7 +246,7 @@ Three places I conflated things or underspecified:
   an obvious hole now that we're defaulting verification through
   FAISS.
 - The Python-reference verification path hasn't been re-run end-to-end
-  since the convention changes; user's `ibm-datapile-1b-2` verification
+  since the convention changes; user's dataset verification
   confirms the compute side is fine, but the bytes-match-numpy claim
   in the `knn_utils` personality docs is untested against the new
   writer conventions.

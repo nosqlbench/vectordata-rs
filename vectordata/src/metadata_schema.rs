@@ -81,7 +81,7 @@ pub struct MetadataSchema {
     pub kind: String,
     /// Provenance string identifying the source the slab was imported
     /// from. Convention: `"<kind>:<path-or-spec>"` — for example
-    /// `"parquet:/data/laion400b/*.parquet"`.
+    /// `"parquet:/data/embeddings/*.parquet"`.
     pub source: String,
     /// Wall-clock time of the import, as Unix epoch seconds.
     pub imported_at_epoch_secs: u64,

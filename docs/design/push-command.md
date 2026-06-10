@@ -189,7 +189,7 @@ lives at the publish root and is never relegated to a side prefix. It is an
 *bracketed* by two events that share one monotonically increasing `seq`:
 
 ```json
-{"event":"begin","seq":42,"ts":"2026-06-01T18:22:04Z","actor":"jshook@host","cmd":"vectordata push --to s3://my-bucket/datasets/glove-100/ -m \"regen neighbors after dedup\"","message":"regen neighbors after dedup","overwrites":[{"key":"profiles/1m/neighbor_indices.ivec","old_digest":"…","new_digest":"…"}],"added":["profiles/2m/…"],"sums":{"":"sha256:…","profiles/1m":"sha256:…"},"tool_version":"1.2.2"}
+{"event":"begin","seq":42,"ts":"2026-06-01T18:22:04Z","actor":"jshook@host","cmd":"vectordata push --to s3://my-bucket/datasets/glove-100/ -m \"regen neighbors after dedup\"","message":"regen neighbors after dedup","overwrites":[{"key":"profiles/1m/neighbor_indices.ivecs","old_digest":"…","new_digest":"…"}],"added":["profiles/2m/…"],"sums":{"":"sha256:…","profiles/1m":"sha256:…"},"tool_version":"1.2.2"}
 {"event":"complete","seq":42,"ts":"2026-06-01T18:23:10Z","sums":{"":"sha256:…","profiles/1m":"sha256:…"}}
 ```
 
@@ -293,8 +293,8 @@ stock tool:
 
 ```
 # <dir>/SHA256SUMS
-e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  base_vectors.fvec
-a1b2c3...                                                          query_vectors.fvec
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  base_vectors.fvecs
+a1b2c3...                                                          query_vectors.fvecs
 ```
 
 ### One file per directory level

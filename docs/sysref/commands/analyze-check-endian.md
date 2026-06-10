@@ -11,11 +11,11 @@ veks pipeline analyze check-endian --source <file>
 ## Example
 
 ```bash
-veks pipeline analyze check-endian --source profiles/base/base_vectors.fvec
+veks pipeline analyze check-endian --source profiles/base/base_vectors.fvecs
 ```
 
 ```
-File: ./profiles/base/base_vectors.fvec
+File: ./profiles/base/base_vectors.fvecs
   Size: 516000 bytes
   Format: fvec (element width: 4 bytes)
   Little-endian: dim=128, valid=true, vectors=1000

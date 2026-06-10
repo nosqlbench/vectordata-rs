@@ -122,6 +122,202 @@ fn setup(ns: &str, mem_id: &str, public_read: bool) -> (tempfile::TempDir, Db, S
 }
 
 #[test]
+fn candidate_namespaces_via_whoami_for_bound_user() {
+    // A regular user with a curate binding: `/-/namespaces` is forbidden (not
+    // operator), so we fall back to the writable namespaces in `whoami`.
+    let (_d, db, token) = setup("datasets/glove", "vecd-ns-1", false);
+    let server = Vecd::start(db);
+    let nss = vectordata::endpoint::candidate_namespaces(&server.url(""), Some(&token));
+    assert!(
+        nss.iter().any(|n| n == "datasets/glove"),
+        "writable namespace should surface via whoami: {nss:?}"
+    );
+}
+
+#[test]
+fn candidate_namespaces_via_namespaces_endpoint_for_superuser() {
+    // The reported case: a superuser holds no explicit namespace binding (so
+    // `whoami` lists none), yet `/-/namespaces` (operator+) returns the full
+    // list — which is what drives the smart push default and `--to` completion.
+    let (_d, mut db, _alice) = setup("datasets/glove", "vecd-ns-2", false);
+    admin::add_user(&mut db, "root", Level::Superuser, None, None).unwrap();
+    let root_tok = admin::create_token(&mut db, "root", "admin key", Some("30d"), None)
+        .unwrap()
+        .plaintext;
+    let server = Vecd::start(db);
+
+    // whoami alone gives a superuser no namespaces …
+    let view = vectordata::endpoint::whoami(&server.url(""), Some(&root_tok)).unwrap();
+    let whoami_count =
+        view.get("namespaces").and_then(|n| n.as_array()).map(|a| a.len()).unwrap_or(0);
+    // … but candidate_namespaces consults /-/namespaces and finds it.
+    let nss = vectordata::endpoint::candidate_namespaces(&server.url(""), Some(&root_tok));
+    assert!(
+        nss.iter().any(|n| n == "datasets/glove"),
+        "superuser should see the namespace via /-/namespaces (whoami listed {whoami_count}): {nss:?}"
+    );
+    // A backend-attached namespace IS suggested; the next test covers one without.
+}
+
+#[test]
+fn push_to_backendless_namespace_explains_why() {
+    // The reported case: the namespace exists and is active, but has NO storage
+    // backend. vecd 404s on write — and now returns the reason in the body,
+    // which the client surfaces instead of a blank status.
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = Db::init(&dir.path().join("vecd.db")).unwrap();
+    admin::add_user(&mut db, "alice", Level::User, None, None).unwrap();
+    // backend_config = None → the namespace has no storage backend.
+    admin::add_namespace(&mut db, "datasets/nobk", "alice", None, true, Listable::Grantees, None, None)
+        .unwrap();
+    admin::bind(&mut db, "alice", "curate", "datasets/nobk").unwrap();
+    let token = admin::create_token(&mut db, "alice", "k", Some("30d"), None).unwrap().plaintext;
+    admin::add_user(&mut db, "root", Level::Superuser, None, None).unwrap();
+    let root_tok = admin::create_token(&mut db, "root", "k", Some("30d"), None).unwrap().plaintext;
+    let server = Vecd::start(db);
+
+    // Writing 404s, but the reason is surfaced (not an opaque status).
+    let src = tempfile::tempdir().unwrap();
+    make_dataset(src.path());
+    let err = execute(&opts(src.path(), server.ns_url("datasets/nobk"), Some(token))).unwrap_err();
+    match err {
+        vectordata::push::Failure::Operational(m) => {
+            assert!(
+                m.contains("has no storage backend"),
+                "the 404 should name the missing backend, not be opaque: {m}"
+            );
+            // No writable namespace exists anywhere → the endpoint-wide hint fires.
+            assert!(
+                m.contains("no namespace with a storage backend"),
+                "an unconfigured endpoint should say so to an authenticated caller: {m}"
+            );
+        }
+        other => panic!("expected an Operational error explaining the backend gap, got {other:?}"),
+    }
+
+    // The privileged namespace list omits a backendless namespace, so it's never
+    // offered as a smart default / `--to` completion candidate.
+    let suggested = vectordata::endpoint::candidate_namespaces(&server.url(""), Some(&root_tok));
+    assert!(
+        !suggested.iter().any(|n| n == "datasets/nobk"),
+        "a backendless namespace must not be suggested: {suggested:?}"
+    );
+}
+
+#[test]
+fn dynamic_catalog_lists_datasets_under_a_namespace() {
+    // No catalog was ever published, yet a GET of the namespace catalog returns
+    // a live listing of the datasets stored under it — so a pushed dataset is
+    // discoverable without a manual `catalog generate`/publish step.
+    let (_d, db, token) = setup("datasets", "vecd-cat-1", false);
+    let server = Vecd::start(db);
+    let client = reqwest::blocking::Client::new();
+
+    // Two datasets' dataset.yaml objects (as a push would land them), each with
+    // the attributes + profiles a real dataset.yaml carries.
+    for name in ["toy", "glove"] {
+        let yaml = format!(
+            "name: {name}\n\
+             attributes:\n  distance_function: L2\n\
+             profiles:\n  default:\n    base_vectors: profiles/base/base.fvecs\n"
+        );
+        client
+            .put(server.url(&format!("datasets/{name}/dataset.yaml")))
+            .bearer_auth(&token)
+            .body(yaml)
+            .send()
+            .unwrap();
+    }
+
+    // The synthesized catalog lists both, with namespace-relative paths AND the
+    // embedded layout (metric + profiles) read from each dataset.yaml.
+    let resp = client.get(server.url("datasets/catalog.json")).bearer_auth(&token).send().unwrap();
+    assert!(resp.status().is_success(), "catalog should be synthesized, got {}", resp.status());
+    let cat: serde_json::Value = resp.json().unwrap();
+    let arr = cat.as_array().expect("catalog is a JSON array");
+    assert_eq!(arr.len(), 2, "{cat}");
+    let toy = arr.iter().find(|e| e["name"] == "toy").expect("toy listed");
+    assert_eq!(toy["path"], "toy/dataset.yaml", "{cat}");
+    assert_eq!(toy["layout"]["attributes"]["distance_function"], "L2", "metric embedded: {cat}");
+    assert!(toy["layout"]["profiles"]["default"].is_object(), "profiles embedded: {cat}");
+    assert!(arr.iter().any(|e| e["name"] == "glove"), "catalog should list glove: {cat}");
+
+    // An empty namespace has no datasets → a real 404, not an empty catalog.
+    let (_d2, db2, tok2) = setup("empty", "vecd-cat-2", false);
+    let server2 = Vecd::start(db2);
+    let empty = reqwest::blocking::Client::new()
+        .get(server2.url("empty/catalog.json"))
+        .bearer_auth(&tok2)
+        .send()
+        .unwrap();
+    assert_eq!(empty.status(), reqwest::StatusCode::NOT_FOUND);
+}
+
+#[test]
+fn middleware_gives_every_error_a_body() {
+    // A bare `Out::status(412)` in the handler (a CAS conflict) must still reach
+    // the wire with a readable body — the response middleware guarantees it.
+    let (_d, db, token) = setup("datasets/glove", "vecd-body-1", false);
+    let server = Vecd::start(db);
+    let client = reqwest::blocking::Client::new();
+    let url = server.url("datasets/glove/.probe");
+    let put = |b: &str| {
+        client
+            .put(&url)
+            .bearer_auth(&token)
+            .header("If-None-Match", "*")
+            .body(b.to_string())
+            .send()
+            .unwrap()
+    };
+
+    let _ = put("1"); // conditional create
+    let conflict = put("2"); // same precondition → 412
+    assert_eq!(conflict.status(), reqwest::StatusCode::PRECONDITION_FAILED);
+    assert!(
+        !conflict.text().unwrap().trim().is_empty(),
+        "the middleware must give even a bare 412 a readable body"
+    );
+}
+
+#[test]
+fn push_to_inactive_namespace_says_to_activate_it() {
+    // The reported case: the namespace HAS a backend ("store") but is inactive
+    // (config-only). vecd must name the real fix — activate it — not a backend
+    // message.
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = Db::init(&dir.path().join("vecd.db")).unwrap();
+    admin::add_backend(&mut db, "store", "mem", "mem:inactive-ns", None, None, None, true).unwrap();
+    admin::add_user(&mut db, "alice", Level::User, None, None).unwrap();
+    // active = false → config-only, despite having a backend.
+    admin::add_namespace(
+        &mut db,
+        "datasets/dormant",
+        "alice",
+        Some("store"),
+        false,
+        Listable::Grantees,
+        None,
+        None,
+    )
+    .unwrap();
+    admin::bind(&mut db, "alice", "curate", "datasets/dormant").unwrap();
+    let token = admin::create_token(&mut db, "alice", "k", Some("30d"), None).unwrap().plaintext;
+    let server = Vecd::start(db);
+
+    let src = tempfile::tempdir().unwrap();
+    make_dataset(src.path());
+    let err = execute(&opts(src.path(), server.ns_url("datasets/dormant"), Some(token))).unwrap_err();
+    match err {
+        vectordata::push::Failure::Operational(m) => assert!(
+            m.contains("is inactive") && m.contains("vecd ns set datasets/dormant --active"),
+            "an inactive namespace should say to activate it: {m}"
+        ),
+        other => panic!("expected an Operational error telling us to activate, got {other:?}"),
+    }
+}
+
+#[test]
 fn push_succeeds_and_is_retrievable() {
     let (_d, db, token) = setup("datasets/glove", "vecd-e2e-1", false);
     let server = Vecd::start(db);

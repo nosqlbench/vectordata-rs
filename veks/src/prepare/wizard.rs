@@ -2194,7 +2194,7 @@ fn scan_candidates(dir: &Path) -> Vec<(PathBuf, String, u64)> {
         // Skip canonical pipeline-output filenames only when they are
         // symlinks. The original intent was to avoid double-counting a
         // prior-bootstrap symlink alongside its donor source file (e.g.
-        // `base_vectors.fvec` -> `_sift_base.fvec`). When the canonical
+        // `base_vectors.fvec` -> `_base.fvec`). When the canonical
         // name is a real file — as produced by `vectordata datasets
         // derive` or by hand-curated datasets — it is legitimate input
         // and must be detected.
@@ -2603,7 +2603,7 @@ mod tests {
     #[test]
     fn scan_skips_canonical_named_symlinks() {
         let dir = tempfile::tempdir().unwrap();
-        let donor = dir.path().join("_sift_base.fvec");
+        let donor = dir.path().join("_base.fvec");
         write_fvec(&donor, 3, 4);
         std::os::unix::fs::symlink(&donor, dir.path().join("base_vectors.fvec")).unwrap();
 
@@ -2611,7 +2611,7 @@ mod tests {
         let names: Vec<String> = cands.iter()
             .map(|(p, _, _)| p.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
-        assert_eq!(names, vec!["_sift_base.fvec".to_string()],
+        assert_eq!(names, vec!["_base.fvec".to_string()],
             "symlink with canonical name should be skipped, leaving only the donor");
     }
 

@@ -481,8 +481,8 @@ backend config**, then stores/serves the object at
 `config.endpoint + (key relative to that namespace)`:
 
 - namespace `datasets` → config `vd-s3` (`s3://vd-bucket/ds/`, active):
-  `GET /datasets/glove/base.fvec` is served from
-  `s3://vd-bucket/ds/glove/base.fvec` — `vecd` applies AAA, then proxies
+  `GET /datasets/glove/base.fvecs` is served from
+  `s3://vd-bucket/ds/glove/base.fvecs` — `vecd` applies AAA, then proxies
   to/from S3 with that config's credentials. `vecd` is an **AAA gateway in
   front of S3**.
 - namespace `teamA` → config `team-local` (`local:/srv/vecd/teamA/`).
@@ -679,8 +679,8 @@ its logical front-end name by default** (`<backend>/<namespace-relative
 key>/…`), and under each object name sits a **keyed substructure, present
 in every case** — the content keyed by its **content-key** (a canonical
 descriptive-metadata hash; see *Hashing & addressing* — **not** a
-whole-content hash). So `datasets/glove/base.fvec` lives at
-`<backend>/datasets/glove/base.fvec/<content-key>`. The bucket/dir stays
+whole-content hash). So `datasets/glove/base.fvecs` lives at
+`<backend>/datasets/glove/base.fvecs/<content-key>`. The bucket/dir stays
 **human-navigable** (you can see which logical object an extent belongs
 to), while the keyed layer lets **multiple versions of the same object
 coexist** and lets the manifest + current-version pointer select the live

@@ -20,6 +20,47 @@ pub struct LocalBackend {
     root: PathBuf,
 }
 
+/// Normalize a user-supplied local-backend directory to the canonical stored
+/// form, `local:<absolute-dir>`.
+///
+/// Accepts any of `store`, `./data`, `/abs/dir`, or an already-prefixed
+/// `local:store` — the `local:` prefix is optional on input. The directory part
+/// is taken relative to the current directory (where the admin command runs),
+/// created if missing, and canonicalized to an absolute path. Two reasons this
+/// matters: the on-disk format `open()` expects is `local:DIR`, and the path
+/// must be absolute because `vecd serve` may run from a different working
+/// directory than the `vecd backends add` that created it — a relative endpoint
+/// would silently resolve against the *server's* CWD (or nowhere).
+///
+/// Returns the canonical `local:<abs>` string; the caller can compare it against
+/// the raw input to tell the user when a rewrite happened.
+pub fn resolve_dir(raw: &str) -> Result<String, VecdError> {
+    let dir_part = raw.strip_prefix("local:").unwrap_or(raw);
+    if dir_part.trim().is_empty() {
+        return Err(VecdError::usage("local backend directory must not be empty"));
+    }
+    let p = Path::new(dir_part);
+    let abs = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| {
+                VecdError::usage(format!("resolving local backend directory '{dir_part}': {e}"))
+            })?
+            .join(p)
+    };
+    std::fs::create_dir_all(&abs).map_err(|e| {
+        VecdError::usage(format!(
+            "local backend directory '{}' can't be created or written: {e}",
+            abs.display()
+        ))
+    })?;
+    // canonicalize requires existence (created above); fall back to the absolute
+    // path if the FS can't canonicalize (e.g. exotic mounts).
+    let resolved = std::fs::canonicalize(&abs).unwrap_or(abs);
+    Ok(format!("local:{}", resolved.to_string_lossy()))
+}
+
 impl LocalBackend {
     pub fn new(dir: &str) -> Result<Self, VecdError> {
         let root = PathBuf::from(dir);
@@ -156,4 +197,28 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<String>) -> Result<(), VecdError>
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod resolve_tests {
+    use super::*;
+
+    #[test]
+    fn resolve_dir_normalizes_to_absolute_local_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sub = tmp.path().join("store");
+
+        // An absolute directory → `local:<abs>`, and it gets created.
+        let out = resolve_dir(sub.to_str().unwrap()).unwrap();
+        assert!(out.starts_with("local:/"), "want absolute local: prefix, got {out}");
+        assert!(sub.is_dir(), "the directory is created");
+
+        // The `local:` prefix is optional on input and yields the same result.
+        let out2 = resolve_dir(&format!("local:{}", sub.display())).unwrap();
+        assert_eq!(out, out2);
+
+        // Empty / prefix-only → a clear error, not a silent bad endpoint.
+        assert!(resolve_dir("local:").is_err());
+        assert!(resolve_dir("   ").is_err());
+    }
 }

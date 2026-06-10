@@ -11,7 +11,7 @@
 //! no windowed references, no shared facets.
 //!
 //! The whole point is to flatten windowed views into their own
-//! files. A profile like `sift1m:25` has `base_vectors` declared as
+//! files. A profile like `vecs1m:25` has `base_vectors` declared as
 //! `profiles/base/base_vectors.fvecs[0..25)` — a 25-vector window
 //! into the full base. After `derive` the output directory holds a
 //! 25-vector `base_vectors.fvecs` file that any consumer can open
@@ -1106,7 +1106,7 @@ fn load_rich_config(group_path: &str) -> Result<RichDatasetConfig, String> {
 }
 
 fn fetch_yaml_url(url: &str) -> io::Result<String> {
-    use crate::transport::shared_client;
+    use crate::transport::shared_client_for;
     let mut u = url::Url::parse(url)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
     if !u.path().ends_with(".yaml") && !u.path().ends_with(".yml") {
@@ -1116,7 +1116,7 @@ fn fetch_yaml_url(url: &str) -> io::Result<String> {
         u = u.join("dataset.yaml")
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
     }
-    let resp = shared_client().get(u).send()
+    let resp = shared_client_for(u.as_str()).get(u).send()
         .and_then(|r| r.error_for_status())
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
     resp.text().map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))

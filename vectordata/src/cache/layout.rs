@@ -7,9 +7,9 @@
 //! ```text
 //! <cache_root>/<dataset>/
 //!   ├── origin.json                  (records the catalog source URL)
-//!   ├── base.fvec                    (data file matching the view path)
-//!   ├── base.fvec.mrkl               (merkle state sidecar)
-//!   ├── query.fvec
+//!   ├── base.fvecs                    (data file matching the view path)
+//!   ├── base.fvecs.mrkl               (merkle state sidecar)
+//!   ├── query.fvecs
 //!   └── ...
 //! ```
 //!
@@ -19,7 +19,7 @@
 //! addressed `<sha256>/<sha256>/` jumble.
 //!
 //! Collisions across catalogs (two different catalogs both publishing
-//! a dataset named `sift1m`, with different bytes behind it) are
+//! a dataset named `vecs1m`, with different bytes behind it) are
 //! detected by [`verify_or_record_origin`]: the first download writes
 //! `origin.json` with the catalog source URL, subsequent opens compare,
 //! and a mismatch is a hard error. Users resolve it by editing
@@ -55,8 +55,8 @@ pub(crate) fn dataset_cache_dir(cache_root: &Path, dataset: &str) -> PathBuf {
 }
 
 /// Compute the cache file path for a specific facet within a dataset.
-/// `facet_relpath` is whatever the view declares (`base.fvec`,
-/// `profiles/1m/base.fvec`, etc.) — passed through verbatim so the
+/// `facet_relpath` is whatever the view declares (`base.fvecs`,
+/// `profiles/1m/base.fvecs`, etc.) — passed through verbatim so the
 /// cache layout mirrors the catalog layout.
 #[allow(dead_code)] // tests use this; production goes through Storage::open_layered which passes
                     // dataset_dir + file_relpath separately to CachedChannel/ChunkStore.
@@ -272,32 +272,32 @@ mod tests {
 
     #[test]
     fn dataset_cache_dir_is_flat() {
-        let p = dataset_cache_dir(Path::new("/cache"), "sift1m");
-        assert_eq!(p, Path::new("/cache/sift1m"));
+        let p = dataset_cache_dir(Path::new("/cache"), "vecs1m");
+        assert_eq!(p, Path::new("/cache/vecs1m"));
     }
 
     #[test]
     fn facet_cache_path_preserves_view_relpath() {
-        let p = facet_cache_path(Path::new("/cache"), "sift1m", "base.fvec");
-        assert_eq!(p, Path::new("/cache/sift1m/base.fvec"));
-        let nested = facet_cache_path(Path::new("/cache"), "sift1m", "profiles/1m/base.fvec");
-        assert_eq!(nested, Path::new("/cache/sift1m/profiles/1m/base.fvec"));
+        let p = facet_cache_path(Path::new("/cache"), "vecs1m", "base.fvecs");
+        assert_eq!(p, Path::new("/cache/vecs1m/base.fvecs"));
+        let nested = facet_cache_path(Path::new("/cache"), "vecs1m", "profiles/1m/base.fvecs");
+        assert_eq!(nested, Path::new("/cache/vecs1m/profiles/1m/base.fvecs"));
     }
 
     #[test]
     fn fresh_directory_writes_origin_on_first_call() {
         let tmp = tempfile::tempdir().unwrap();
-        let ds = tmp.path().join("sift1m");
-        assert!(verify_or_record_origin(&ds, "https://example.com/sift1m/dataset.yaml").is_ok());
+        let ds = tmp.path().join("vecs1m");
+        assert!(verify_or_record_origin(&ds, "https://example.com/vecs1m/dataset.yaml").is_ok());
         let recorded = read_dataset_origin(&ds).unwrap();
-        assert_eq!(recorded.source, "https://example.com/sift1m/dataset.yaml");
+        assert_eq!(recorded.source, "https://example.com/vecs1m/dataset.yaml");
     }
 
     #[test]
     fn matching_origin_passes_through() {
         let tmp = tempfile::tempdir().unwrap();
-        let ds = tmp.path().join("sift1m");
-        let url = "https://example.com/sift1m/dataset.yaml";
+        let ds = tmp.path().join("vecs1m");
+        let url = "https://example.com/vecs1m/dataset.yaml";
         verify_or_record_origin(&ds, url).unwrap();
         // Second open with the same URL must succeed.
         assert!(verify_or_record_origin(&ds, url).is_ok());
@@ -306,12 +306,12 @@ mod tests {
     #[test]
     fn mismatched_origin_errors_with_remediation_hint() {
         let tmp = tempfile::tempdir().unwrap();
-        let ds = tmp.path().join("sift1m");
-        verify_or_record_origin(&ds, "https://a.example.com/sift1m/dataset.yaml").unwrap();
-        let err = verify_or_record_origin(&ds, "https://b.example.com/sift1m/dataset.yaml")
+        let ds = tmp.path().join("vecs1m");
+        verify_or_record_origin(&ds, "https://a.example.com/vecs1m/dataset.yaml").unwrap();
+        let err = verify_or_record_origin(&ds, "https://b.example.com/vecs1m/dataset.yaml")
             .unwrap_err();
-        assert_eq!(err.recorded, "https://a.example.com/sift1m/dataset.yaml");
-        assert_eq!(err.requested, "https://b.example.com/sift1m/dataset.yaml");
+        assert_eq!(err.recorded, "https://a.example.com/vecs1m/dataset.yaml");
+        assert_eq!(err.requested, "https://b.example.com/vecs1m/dataset.yaml");
         let msg = err.to_string();
         assert!(msg.contains("rm -rf"),
             "error must suggest deletion of the dataset directory: {msg}");

@@ -15,7 +15,7 @@ Starting point: a single vector file.
 
 ```bash
 mkdir my-dataset && cd my-dataset
-cp /path/to/vectors.fvec _base_vectors.fvec
+cp /path/to/vectors.fvecs _base_vectors.fvecs
 veks bootstrap -i
 ```
 
@@ -35,9 +35,9 @@ When you already have KNN results:
 
 ```bash
 mkdir my-dataset && cd my-dataset
-cp /path/to/base.fvecs _sift_base.fvecs
-cp /path/to/query.fvecs _sift_query.fvecs
-cp /path/to/gt.ivecs _sift_groundtruth.ivecs
+cp /path/to/base.fvecs _base.fvecs
+cp /path/to/query.fvecs _query.fvecs
+cp /path/to/gt.ivecs _gt.ivecs
 veks bootstrap -i
 ```
 
@@ -84,13 +84,13 @@ veks bootstrap -i
 This adds:
 - `generate metadata` → `profiles/base/metadata_content.u8`
 - `generate predicates` → `profiles/base/predicates.u8`
-- `evaluate-predicates` → `profiles/default/metadata_indices.ivvec`
+- `evaluate-predicates` → `profiles/default/metadata_indices.ivvecs`
   (or `.slab` for complex predicates)
 - `verify-predicates-sqlite` → SQLite oracle verification
-- `compute filtered-knn` → `profiles/default/filtered_neighbor_indices.ivec`
+- `compute filtered-knn` → `profiles/default/filtered_neighbor_indices.ivecs`
 
 Predicate results format depends on the synthesis mode:
-- **simple-int-eq**: `.ivvec` — variable-length ordinal lists, no index
+- **simple-int-eq**: `.ivvecs` — variable-length ordinal lists, no index
   file needed for sequential access
 - **survey (slab)**: `.slab` — supports arbitrary PNode predicate trees
   with complex conjunctions, no separate offset index needed
@@ -113,7 +113,7 @@ When base and query vectors come from the same source:
 
 ```bash
 mkdir my-dataset && cd my-dataset
-cp /path/to/source.fvec _base_vectors.fvec
+cp /path/to/source.fvecs _base_vectors.fvecs
 veks bootstrap -i
 # Choose self_search=true, query_count=10000
 ```
@@ -153,7 +153,7 @@ upstream:
   steps:
     - id: generate-base
       run: generate vectors
-      output: profiles/base/base_vectors.fvec
+      output: profiles/base/base_vectors.fvecs
       dimension: 128
       count: 1000000
       seed: 42
@@ -161,7 +161,7 @@ upstream:
 
     - id: generate-queries
       run: generate vectors
-      output: profiles/base/query_vectors.fvec
+      output: profiles/base/query_vectors.fvecs
       dimension: 128
       count: 10000
       seed: 1337
@@ -179,7 +179,7 @@ example with all BQGDMPRF facets.
 
 - **Ordinal correspondence**: `metadata[i]` describes `base_vectors[i]`.
   When shuffling, the same permutation must be applied to both.
-- **Underscore prefix**: source files named `_foo.fvec` are excluded
+- **Underscore prefix**: source files named `_foo.fvecs` are excluded
   from publishing. The wizard handles this automatically.
 - **Idempotent pipelines**: `veks run` is resumable. Only stale steps
   re-execute. Use `--clean` for a full reset.

@@ -52,7 +52,7 @@ cargo build --features knnutils
 
 ```bash
 veks bootstrap -i --personality knn_utils \
-  --base-vectors source.fvec --metric Cosine
+  --base-vectors source.fvecs --metric Cosine
 ```
 
 This generates a pipeline using knn_utils-compatible commands at
@@ -76,7 +76,7 @@ matching knn_utils' own validation tools:
 
 ### Element types and precision
 
-Both base and query vectors may be stored as `.fvec` (f32) or `.mvec`
+Both base and query vectors may be stored as `.fvecs` (f32) or `.mvecs`
 (f16). The verifier dispatches by file extension; the f16 path reads
 through `XvecReader::<half::f16>` and upcasts each vector to f32 for
 the BLAS norm computation.
@@ -85,8 +85,8 @@ the BLAS norm computation.
 
 | Storage | Default `tol-norm` | Why |
 |---------|--------------------|-----|
-| `.fvec` (f32) | `1e-5` | full f32 precision; tight band catches any drift |
-| `.mvec` (f16) | `1e-3` | f16 has only 11 bits of mantissa (~9.77e-4 per-element relative precision); a perfectly-normalized vector at typical dim accumulates norm error around `5e-4`, so a `1e-5` band would always falsely fail |
+| `.fvecs` (f32) | `1e-5` | full f32 precision; tight band catches any drift |
+| `.mvecs` (f16) | `1e-3` | f16 has only 11 bits of mantissa (~9.77e-4 per-element relative precision); a perfectly-normalized vector at typical dim accumulates norm error around `5e-4`, so a `1e-5` band would always falsely fail |
 
 Pass `--tol-norm <value>` to override either default explicitly. The
 report annotates the chosen tolerance with `[auto for "mvecs"]` (or
@@ -178,8 +178,8 @@ provides an independent third implementation for A/B testing:
 cargo build --features knnutils,faiss
 
 # Compare knn-blas vs knn-faiss
-veks pipeline compute knn-blas --base base.fvec --query query.fvec ...
-veks pipeline compute knn-faiss --base base.fvec --query query.fvec ...
+veks pipeline compute knn-blas --base base.fvecs --query query.fvecs ...
+veks pipeline compute knn-faiss --base base.fvecs --query query.fvecs ...
 
 # Results should match (same BLAS → identical, different → set-equivalent)
 ```
@@ -491,8 +491,8 @@ Each axis has a default; pass any of them to narrow the matrix:
 
 ### Why this is not a correctness concern
 
-Real embedding models (sentence-transformers, CLIP, OpenAI
-text-embedding-3, etc.) produce vectors where meaningful clusters
+Real embedding models (text, image, and multimodal
+encoders, etc.) produce vectors where meaningful clusters
 exist — pairwise distances are not concentrated, the top-k is
 well-defined, and all four engines agree. The divergence above is a
 property of synthetic uniform-random data at high dim, not of the
@@ -599,8 +599,8 @@ veks pipeline verify engine-parity --use-synthetic \
 
 # Or against your own dataset:
 veks pipeline verify engine-parity \
-  --base profiles/base/base_vectors.fvec \
-  --query profiles/base/query_vectors.fvec \
+  --base profiles/base/base_vectors.fvecs \
+  --query profiles/base/query_vectors.fvecs \
   --neighbors 100 --metric L2 --show-queries 5
 ```
 
@@ -661,17 +661,17 @@ cargo test -p veks-pipeline --features knnutils,faiss \
 ### Demonstrate against your own dataset
 
 For a dataset laid out in the canonical wizard layout (`profiles/base/`
-holds `base_vectors.fvec` + `query_vectors.fvec`, `profiles/default/`
-holds `neighbor_indices.ivec`), every verifier is a single command.
+holds `base_vectors.fvecs` + `query_vectors.fvecs`, `profiles/default/`
+holds `neighbor_indices.ivecs`), every verifier is a single command.
 Run from the dataset directory.
 
 **Quick sanity — recompute distances and compare against stored GT:**
 
 ```bash
 veks pipeline analyze verify-knn \
-  --base    profiles/base/base_vectors.fvec \
-  --query   profiles/base/query_vectors.fvec \
-  --indices profiles/default/neighbor_indices.ivec \
+  --base    profiles/base/base_vectors.fvecs \
+  --query   profiles/base/query_vectors.fvecs \
+  --indices profiles/default/neighbor_indices.ivecs \
   --metric  L2
 ```
 
@@ -685,8 +685,8 @@ required.
 
 ```bash
 veks pipeline verify knn-consolidated \
-  --base   profiles/base/base_vectors.fvec \
-  --query  profiles/base/query_vectors.fvec \
+  --base   profiles/base/base_vectors.fvecs \
+  --query  profiles/base/query_vectors.fvecs \
   --metric L2 \
   --sample 100 \
   --output verification.json
@@ -705,9 +705,9 @@ query as `ExactMatch` / `SetMatch` / `BoundaryMismatch(d)` /
 # Requires `cargo install --features knnutils --path veks` so the
 # command is registered; the verifier itself uses BLAS directly.
 veks pipeline verify dataset-knnutils \
-  --base      profiles/base/base_vectors.fvec \
-  --query     profiles/base/query_vectors.fvec \
-  --indices   profiles/default/neighbor_indices.ivec \
+  --base      profiles/base/base_vectors.fvecs \
+  --query     profiles/base/query_vectors.fvecs \
+  --indices   profiles/default/neighbor_indices.ivecs \
   --neighbors 100 \
   --metric    IP \
   --sample    100 \

@@ -699,8 +699,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let json = serde_json::json!([
             {
-                "name": "sift-128",
-                "path": "sift-128/dataset.yaml",
+                "name": "vecs-128",
+                "path": "vecs-128/dataset.yaml",
                 "dataset_type": "dataset.yaml",
                 "layout": {
                     "attributes": {"distance_function": "L2"},
@@ -732,8 +732,8 @@ mod tests {
         assert_eq!(catalog.datasets().len(), 2);
 
         // Verify profile_names works
-        let sift = catalog.find_exact("sift-128").unwrap();
-        let profiles = sift.profile_names();
+        let vecs = catalog.find_exact("vecs-128").unwrap();
+        let profiles = vecs.profile_names();
         assert!(profiles.contains(&"default"));
     }
 }

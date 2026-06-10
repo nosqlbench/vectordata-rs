@@ -2035,9 +2035,9 @@ sweep.
 
         // Loud-failure guard: an answer key where most predicates
         // match nothing is almost always a generator bug or a
-        // field/encoding mismatch (the laion400b "10K identical
-        // MATCHES predicates against a corpus with no `th ` in
-        // any caption" failure mode). Silently writing the empty
+        // field/encoding mismatch (the "10K identical MATCHES
+        // predicates against a corpus with no `th ` in any
+        // caption" failure mode seen on a real corpus). Silently writing the empty
         // slab lets the bad answer key flow downstream to
         // filtered-KNN, where it manifests as recall=0 with no
         // obvious cause. Catch it here.

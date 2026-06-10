@@ -11,7 +11,7 @@ veks pipeline analyze find-zeros --source <file> [--threshold 1e-6]
 ## Example
 
 ```bash
-veks pipeline analyze find-zeros --source profiles/base/base_vectors.fvec
+veks pipeline analyze find-zeros --source profiles/base/base_vectors.fvecs
 ```
 
 ```

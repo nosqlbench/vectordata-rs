@@ -195,12 +195,12 @@ completer uses:
 
 ```rust
 let parsed = parse_argv(&tree, &[
-    "compute", "knn", "--metric", "L2", "--verbose", "data.fvec",
+    "compute", "knn", "--metric", "L2", "--verbose", "data.fvecs",
 ])?;
 // → ParsedCommand {
 //     path: ["compute", "knn"],
 //     flags: { "--metric": ["L2"], "--verbose": [""] },
-//     positionals: ["data.fvec"],
+//     positionals: ["data.fvecs"],
 //   }
 ```
 

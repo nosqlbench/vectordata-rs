@@ -706,7 +706,7 @@ fn load_or_fetch_remote_offsets(
         (format!("{base_str}/IDXFOR__{data_name}.i64"), "i64"),
         (format!("{base_str}/IDXFOR__{data_name}.i32"), "i32"),
     ];
-    let client = crate::transport::shared_client();
+    let client = crate::transport::shared_client_for(&base_str);
     for (cand, ext) in &candidates {
         if let Ok(resp) = client.get(cand).send()
             && resp.status().is_success()

@@ -71,45 +71,83 @@ fn http_runtime_count() -> usize {
 /// runtime — round-robin pick spreads HTTP I/O + TLS work across
 /// the pool's runtime threads so concurrent chunk downloads
 /// actually scale on multi-core hosts.
-fn client_pool() -> &'static [reqwest::blocking::Client] {
-    static POOL: OnceLock<Vec<reqwest::blocking::Client>> = OnceLock::new();
-    POOL.get_or_init(|| {
-        (0..http_runtime_count()).map(|_| build_client()).collect()
-    })
+/// The process-wide TLS-trust policy from `settings.yaml`, read once.
+fn tls_trust() -> &'static crate::settings::TlsTrust {
+    static T: OnceLock<crate::settings::TlsTrust> = OnceLock::new();
+    T.get_or_init(crate::settings::tls_trust)
 }
 
-fn build_client() -> reqwest::blocking::Client {
-    reqwest::blocking::Client::builder()
+/// The secure pool (default) and the insecure pool (built only if an endpoint
+/// is configured `trust_self_signed`). Both add any configured `trusted_ca_certs`
+/// to their roots; the insecure one additionally skips cert verification.
+fn client_pool(insecure: bool) -> &'static [reqwest::blocking::Client] {
+    static SECURE: OnceLock<Vec<reqwest::blocking::Client>> = OnceLock::new();
+    static INSECURE: OnceLock<Vec<reqwest::blocking::Client>> = OnceLock::new();
+    let slot = if insecure { &INSECURE } else { &SECURE };
+    slot.get_or_init(|| (0..http_runtime_count()).map(|_| build_client(insecure)).collect())
+}
+
+fn build_client(insecure: bool) -> reqwest::blocking::Client {
+    let mut b = reqwest::blocking::Client::builder()
         .user_agent(concat!("vectordata/", env!("CARGO_PKG_VERSION")))
         .pool_max_idle_per_host(64)
         .redirect(reqwest::redirect::Policy::limited(10))
-        .timeout(Duration::from_secs(60 * 60)) // 1 h ceiling on long-running large fetches
-        .build()
-        .expect("vectordata shared HTTP client")
+        .timeout(Duration::from_secs(60 * 60)); // 1 h ceiling on long-running large fetches
+    // Augment the system trust roots with any configured CA/leaf certs (e.g. a
+    // private vecd's exported cert). Verification stays ON — this is the secure
+    // way to trust a self-signed deployment.
+    for path in &tls_trust().trusted_ca_certs {
+        match std::fs::read(path).map(|pem| reqwest::Certificate::from_pem(&pem)) {
+            Ok(Ok(cert)) => b = b.add_root_certificate(cert),
+            Ok(Err(e)) => log::warn!("trusted_ca_certs: {} is not a valid PEM cert: {e}", path.display()),
+            Err(e) => log::warn!("trusted_ca_certs: cannot read {}: {e}", path.display()),
+        }
+    }
+    // Only the insecure pool skips verification, and only for endpoints the user
+    // explicitly listed in `trust_self_signed` (see `shared_client_for`).
+    if insecure {
+        b = b.danger_accept_invalid_certs(true);
+    }
+    b.build().expect("vectordata shared HTTP client")
 }
 
-/// Obtain a clone of one of the process-wide pooled clients,
-/// round-robin. The clone is cheap (`Client` is internally
-/// `Arc`-wrapped) and shares its runtime + connection pool + DNS
-/// cache with the pool entry it was cloned from — but successive
-/// `shared_client()` calls return clones of *different* pool
-/// entries, so callers that each clone-and-use one client end up
-/// spread across distinct runtime threads. This is the difference
-/// between actually scaling N workers and bottlenecking on one
-/// Tokio thread.
-pub(crate) fn shared_client() -> reqwest::blocking::Client {
+fn pick(pool: &'static [reqwest::blocking::Client]) -> reqwest::blocking::Client {
     use std::sync::atomic::{AtomicUsize, Ordering};
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
-    let pool = client_pool();
     let idx = COUNTER.fetch_add(1, Ordering::Relaxed) % pool.len();
     pool[idx].clone()
+}
+
+/// A round-robin clone of a process-wide **verifying** client. Cheap (the
+/// `Client` is `Arc`-wrapped); successive calls spread work across runtime
+/// threads. This is the default — use it unless you have the target URL.
+pub(crate) fn shared_client() -> reqwest::blocking::Client {
+    pick(client_pool(false))
+}
+
+/// Like [`shared_client`] but honors the per-endpoint `trust_self_signed` policy:
+/// if `url`'s origin is listed there, returns a client that skips cert
+/// verification; otherwise the normal verifying client. Use this for any request
+/// to a user-configured endpoint so a self-signed local vecd is reachable.
+pub(crate) fn shared_client_for(url: &str) -> reqwest::blocking::Client {
+    pick(client_pool(trusts_self_signed(url)))
+}
+
+/// Whether `url`'s origin is configured (`settings.yaml` `trust_self_signed`) to
+/// accept a self-signed/invalid server cert. Origins are compared normalized.
+fn trusts_self_signed(url: &str) -> bool {
+    let Some(origin) = crate::credentials::origin_of_str(url) else { return false };
+    tls_trust()
+        .trust_self_signed
+        .iter()
+        .any(|c| crate::credentials::origin_of_str(c).as_deref() == Some(origin.as_str()))
 }
 
 /// Number of independent HTTP runtimes the process-wide client pool
 /// is using. Exposed so progress drivers can show the effective
 /// "(N runtimes × C concurrent streams)" plan to the user.
 pub(crate) fn http_runtimes() -> usize {
-    client_pool().len()
+    client_pool(false).len()
 }
 
 /// Returns `true` for any URL whose transport vectordata speaks
@@ -210,9 +248,11 @@ mod shared_client_tests {
     /// that prevents `load_native_certs` from running per request.
     #[test]
     fn client_pool_returns_singleton() {
-        let a = client_pool().as_ptr();
-        let b = client_pool().as_ptr();
+        let a = client_pool(false).as_ptr();
+        let b = client_pool(false).as_ptr();
         assert_eq!(a, b, "client_pool must return the same singleton slice");
+        // The secure and insecure pools are distinct singletons.
+        assert_ne!(client_pool(false).as_ptr(), client_pool(true).as_ptr());
     }
 
     /// `shared_client()` rotates through pool entries, but the

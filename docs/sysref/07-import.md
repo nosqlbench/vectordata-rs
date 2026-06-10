@@ -143,11 +143,11 @@ filtered KNN (F) on the main dataset.
 Profile views always use canonical paths regardless of artifact type:
 
 ```yaml
-# Identity: symlink at profiles/base/base_vectors.fvec → ../../source.fvecs
-base_vectors: profiles/base/base_vectors.fvec
+# Identity: symlink at profiles/base/base_vectors.fvecs → ../../source.fvecs
+base_vectors: profiles/base/base_vectors.fvecs
 
 # Materialized: step output
-neighbor_indices: profiles/default/neighbor_indices.ivec
+neighbor_indices: profiles/default/neighbor_indices.ivecs
 ```
 
 ---
@@ -268,13 +268,13 @@ strata:
 profiles:
   default:
     maxk: 100
-    base_vectors: profiles/base/base_vectors.fvec
+    base_vectors: profiles/base/base_vectors.fvecs
   1m:
     base_count: 1000000
-    base_vectors: "profiles/base/base_vectors.fvec[0..1000000)"
+    base_vectors: "profiles/base/base_vectors.fvecs[0..1000000)"
   2m:
     base_count: 2000000
-    base_vectors: "profiles/base/base_vectors.fvec[0..2000000)"
+    base_vectors: "profiles/base/base_vectors.fvecs[0..2000000)"
   # … 4m, 8m, 16m
 ```
 

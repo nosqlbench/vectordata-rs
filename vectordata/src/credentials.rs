@@ -112,6 +112,21 @@ impl Store {
         self.entries.get(origin)
     }
 
+    /// The credential governing `url`, by **longest-prefix** match over the
+    /// stored keys: an exact match, else the most specific stored key that is a
+    /// path-prefix of `url`. This is what lets a per-catalog credential (a token
+    /// scoped to `https://host/datasets`) win over an origin-wide one
+    /// (`https://host`) for reads under that catalog, while still covering the
+    /// rest of the origin from the origin key.
+    pub fn token_for_url(&self, url: &str) -> Option<&Entry> {
+        let q = credential_key(url)?;
+        self.entries
+            .iter()
+            .filter(|(k, _)| q == **k || q.starts_with(&format!("{k}/")))
+            .max_by_key(|(k, _)| k.len())
+            .map(|(_, e)| e)
+    }
+
     pub fn set(&mut self, origin: String, entry: Entry) {
         self.entries.insert(origin, entry);
     }
@@ -142,6 +157,18 @@ pub fn origin_of_str(url: &str) -> Option<String> {
     Url::parse(url).ok().as_ref().and_then(origin_of)
 }
 
+/// The credential-store key for a URL: its origin plus any non-root path, with
+/// trailing slashes trimmed. `https://h/` and `https://h` both key `https://h`
+/// (origin-wide); `https://h/datasets/` keys `https://h/datasets` (catalog-
+/// scoped). Used both to **record** a login and (via [`Store::token_for_url`])
+/// to **match** a read to the most specific credential.
+pub fn credential_key(url: &str) -> Option<String> {
+    let u = Url::parse(url).ok()?;
+    let origin = origin_of(&u)?;
+    let path = u.path().trim_end_matches('/');
+    Some(if path.is_empty() { origin } else { format!("{origin}{path}") })
+}
+
 /// The cached store for this process (so per-request reads don't re-read
 /// the file). A short-lived CLI invocation loads it once.
 fn cached_store() -> &'static Store {
@@ -150,22 +177,27 @@ fn cached_store() -> &'static Store {
 }
 
 /// Resolve a bearer token for a **read/pull** to `url`: `$VECTORDATA_TOKEN`,
-/// then the stored credential for the origin, else `None` (anonymous).
+/// then the credential recorded at `vectordata login` for the URL's origin,
+/// else `None` (anonymous).
 pub fn resolve_read_token(url: &Url) -> Option<String> {
-    if let Ok(t) = std::env::var("VECTORDATA_TOKEN") {
-        if !t.is_empty() {
-            return Some(t);
-        }
-    }
-    let origin = origin_of(url)?;
-    cached_store().get(&origin).map(|e| e.token.clone())
+    let env = std::env::var("VECTORDATA_TOKEN").ok().filter(|t| !t.is_empty());
+    resolve_read_token_with(env.as_deref(), url, cached_store())
 }
 
-/// Resolve a token by origin from the store only (no env) — used by the
-/// CLI commands that act on a specific endpoint.
+/// Pure core of [`resolve_read_token`]: `$VECTORDATA_TOKEN` (passed in) wins,
+/// else the `store` credential keyed by the URL's origin. Separated so the
+/// precedence can be tested without touching process env or the on-disk store.
+fn resolve_read_token_with(env_token: Option<&str>, url: &Url, store: &Store) -> Option<String> {
+    if let Some(t) = env_token {
+        return Some(t.to_string());
+    }
+    store.token_for_url(url.as_str()).map(|e| e.token.clone())
+}
+
+/// Resolve a token for `url` from the store only (no env), by longest-prefix —
+/// used by the CLI commands that act on a specific endpoint or catalog.
 pub fn stored_token(url: &str) -> Option<String> {
-    let origin = origin_of_str(url)?;
-    Store::load().get(&origin).map(|e| e.token.clone())
+    Store::load().token_for_url(url).map(|e| e.token.clone())
 }
 
 /// The endpoint a command should act on: the given `url`, else the sole
@@ -342,6 +374,69 @@ mod tests {
         assert_eq!(origin_of(&u).unwrap(), "https://vecd-host:8443");
         let u2 = Url::parse("https://example.com/x").unwrap();
         assert_eq!(origin_of(&u2).unwrap(), "https://example.com");
+    }
+
+    #[test]
+    fn read_token_prefers_env_then_login_store_by_origin() {
+        // A credential as `vectordata login` would record it: keyed by origin.
+        let mut store = Store::default();
+        store.set(
+            "https://vecd-host:8443".to_string(),
+            Entry { token: "login-tok".to_string(), user: Some("alice".to_string()), expires: None },
+        );
+        // A facet URL under that origin — what the access API reads.
+        let facet =
+            Url::parse("https://vecd-host:8443/datasets/toy/profiles/base/base.fvecs").unwrap();
+
+        // $VECTORDATA_TOKEN wins when present.
+        assert_eq!(
+            resolve_read_token_with(Some("env-tok"), &facet, &store).as_deref(),
+            Some("env-tok")
+        );
+        // Otherwise the token recorded at login, matched by the URL's origin —
+        // so reads to that endpoint authenticate with the login credential.
+        assert_eq!(
+            resolve_read_token_with(None, &facet, &store).as_deref(),
+            Some("login-tok")
+        );
+        // An origin we never logged into → anonymous (no token attached).
+        let other = Url::parse("https://elsewhere:9000/x/y.fvecs").unwrap();
+        assert_eq!(resolve_read_token_with(None, &other, &store), None);
+    }
+
+    #[test]
+    fn per_catalog_token_wins_by_longest_prefix() {
+        // Two credentials at the same origin: one origin-wide, one scoped to a
+        // catalog URL (as `vectordata login https://h:8443/datasets/` records).
+        let mut store = Store::default();
+        store.set(
+            "https://h:8443".to_string(),
+            Entry { token: "origin-tok".into(), user: None, expires: None },
+        );
+        store.set(
+            "https://h:8443/datasets".to_string(),
+            Entry { token: "cat-tok".into(), user: None, expires: None },
+        );
+
+        // A read under the catalog path → the catalog-scoped token (most specific).
+        let under = Url::parse("https://h:8443/datasets/toy/profiles/base/base.fvecs").unwrap();
+        assert_eq!(resolve_read_token_with(None, &under, &store).as_deref(), Some("cat-tok"));
+        // A read elsewhere at the origin → the origin-wide token.
+        let other = Url::parse("https://h:8443/private/x.fvecs").unwrap();
+        assert_eq!(resolve_read_token_with(None, &other, &store).as_deref(), Some("origin-tok"));
+
+        // A key that only shares a string prefix must NOT match (segment boundary).
+        let mut store2 = Store::default();
+        store2.set(
+            "https://h:8443/data".to_string(),
+            Entry { token: "data-tok".into(), user: None, expires: None },
+        );
+        let sibling = Url::parse("https://h:8443/datasets/x.fvecs").unwrap();
+        assert_eq!(
+            resolve_read_token_with(None, &sibling, &store2),
+            None,
+            "`/data` must not match `/datasets`"
+        );
     }
 
     #[test]

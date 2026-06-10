@@ -217,13 +217,13 @@ interacts with the misread parameters.
 
 ```bash
 # Fails (65 * 1024 = 66560 > 65536):
-veks compute knn-faiss --base data.fvec --query q65.fvec \
-    --indices out.ivec --neighbors 5 --metric L2
+veks compute knn-faiss --base data.fvecs --query q65.fvecs \
+    --indices out.ivecs --neighbors 5 --metric L2
 # → distances all 0.0, wrong indices
 
 # Works (64 * 1024 = 65536):
-veks compute knn-faiss --base data.fvec --query q64.fvec \
-    --indices out.ivec --neighbors 5 --metric L2
+veks compute knn-faiss --base data.fvecs --query q64.fvecs \
+    --indices out.ivecs --neighbors 5 --metric L2
 # → correct distances and indices
 
 # Python FAISS works at any size:
@@ -236,8 +236,8 @@ print(D[0])  # correct non-zero distances
 "
 
 # Cross-engine verification:
-veks compute knn-metal --base data.fvec --query q.fvec --indices metal.ivec ...
-veks compute knn-faiss --base data.fvec --query q.fvec --indices faiss.ivec ...
+veks compute knn-metal --base data.fvecs --query q.fvecs --indices metal.ivecs ...
+veks compute knn-faiss --base data.fvecs --query q.fvecs --indices faiss.ivecs ...
 # Compare neighbor sets — should have >95% overlap at dim=128,
 # but may show 0% at dim>=1024
 ```

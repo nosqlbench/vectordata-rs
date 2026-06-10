@@ -172,7 +172,34 @@ pub fn build_router(state: AppState) -> Router {
             axum::routing::patch(upload_patch).head(upload_head).delete(upload_delete),
         )
         .fallback(object_handler)
+        .layer(axum::middleware::from_fn(ensure_error_body))
         .with_state(state)
+}
+
+/// Response post-processor: guarantee that **every** non-2xx reply carries a
+/// text body. Handlers that know the actual reason set it (e.g. "namespace 'x'
+/// is inactive …"); this is the safety net so a bare error status never reaches
+/// a user or admin without *something* to read. `HEAD` is left alone (it must
+/// not carry a body), and successful responses are never buffered.
+async fn ensure_error_body(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let is_head = req.method() == Method::HEAD;
+    let resp = next.run(req).await;
+    let status = resp.status();
+    if is_head || !(status.is_client_error() || status.is_server_error()) {
+        return resp;
+    }
+    let (mut parts, body) = resp.into_parts();
+    let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap_or_default();
+    if !bytes.is_empty() {
+        return Response::from_parts(parts, axum::body::Body::from(bytes));
+    }
+    // Empty error body → at least the canonical status reason, so the wire never
+    // carries a silent failure. Drop the stale (0) content-length; the new body
+    // re-derives it.
+    parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+    let phrase = parts.status.canonical_reason().unwrap_or("error");
+    let msg = format!("{} {}\n", parts.status.as_u16(), phrase);
+    Response::from_parts(parts, axum::body::Body::from(msg))
 }
 
 async fn healthz() -> impl IntoResponse {
@@ -294,7 +321,7 @@ async fn revoke_token(
         Err(r) => return r,
     };
     let Some(user) = caller.name() else {
-        return (StatusCode::UNAUTHORIZED, "").into_response();
+        return (StatusCode::UNAUTHORIZED, "a token is required to revoke keys\n").into_response();
     };
     let allowed = {
         let db = state.db.lock().unwrap();
@@ -430,9 +457,12 @@ async fn versions_list(
     };
     let ns = crate::authz::normalize(&ns);
     if !snap.can(&caller, Action::Read, &ns) {
-        let status =
-            if caller.is_authenticated() { StatusCode::FORBIDDEN } else { StatusCode::UNAUTHORIZED };
-        return (status, "").into_response();
+        let (status, body) = if caller.is_authenticated() {
+            (StatusCode::FORBIDDEN, format!("forbidden: no read access to namespace '{ns}'\n"))
+        } else {
+            (StatusCode::UNAUTHORIZED, "authentication required to read this namespace\n".to_string())
+        };
+        return (status, body).into_response();
     }
     let versions = {
         let db = state.db.lock().unwrap();
@@ -997,9 +1027,12 @@ fn authorize_upload(
         Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("{e}\n")).into_response()),
     };
     if !snap.can(&caller, Action::Write, &upload.path()) {
-        let status =
-            if caller.is_authenticated() { StatusCode::FORBIDDEN } else { StatusCode::UNAUTHORIZED };
-        return Err((status, "").into_response());
+        let (status, body) = if caller.is_authenticated() {
+            (StatusCode::FORBIDDEN, format!("forbidden: no write access to '{}'\n", upload.path()))
+        } else {
+            (StatusCode::UNAUTHORIZED, "authentication required to write\n".to_string())
+        };
+        return Err((status, body).into_response());
     }
     Ok((snap, caller, upload))
 }
@@ -1179,6 +1212,21 @@ async fn upload_delete(
     (StatusCode::NO_CONTENT, "").into_response()
 }
 
+/// Whether any namespace on the endpoint is actually writable — active, with an
+/// active storage backend attached. Drives the "no backend anywhere" hint on a
+/// routing-miss 404, so an authenticated caller learns the endpoint isn't set up
+/// rather than chasing a per-path message.
+fn any_writable_namespace(snap: &Snapshot) -> bool {
+    snap.namespaces().any(|n| {
+        n.active
+            && n.backend_config
+                .as_ref()
+                .and_then(|b| snap.backend(b))
+                .map(|brow| brow.active)
+                .unwrap_or(false)
+    })
+}
+
 fn handle_object(
     state: &AppState,
     snap: &Snapshot,
@@ -1202,10 +1250,27 @@ fn handle_object(
         return handle_list(state, snap, path);
     }
 
-    // Routing miss (no active backend / addresses a namespace) → 404.
+    // Routing miss → 404. The caller is already authorized here, so surface the
+    // precise reason (e.g. "no active storage backend serves '<ns>/…'" when a
+    // namespace exists but has no backend attached) rather than a blank 404 —
+    // a bare 404 here is what makes "why won't my push write?" unanswerable.
     let resolved = match namespace::resolve(snap, path) {
         Ok(r) => r,
-        Err(VecdError::Usage(_)) => return Ok(Out::status(StatusCode::NOT_FOUND)),
+        Err(VecdError::Usage(m)) => {
+            let mut body = format!("{m}\n");
+            // When the *whole endpoint* has no writable namespace, an
+            // authenticated caller gets the actionable root cause (an operator
+            // must wire up a backend) — not just the per-path message.
+            if caller.is_authenticated() && !any_writable_namespace(snap) {
+                body.push_str(
+                    "This endpoint has no namespace with a storage backend attached. \
+                     An operator must add one, e.g.:\n  \
+                     vecd backends add store --kind local --endpoint <dir> --active\n  \
+                     vecd ns add <namespace> --owner <user> --backend-config store --active\n",
+                );
+            }
+            return Ok(Out::status(StatusCode::NOT_FOUND).body(body.into_bytes()));
+        }
         Err(e) => return Err(e),
     };
 
@@ -1247,7 +1312,19 @@ fn handle_object(
                         .body(bytes),
                     headers,
                 )),
-                None => Ok(absent_or_gone(&db, &resolved.storage_ns)?),
+                None => {
+                    // No stored catalog at the namespace root? Synthesize a
+                    // live one listing the datasets currently under the
+                    // namespace, so a freshly-pushed dataset is discoverable
+                    // without anyone publishing a catalog by hand. (READ is
+                    // already authorized above, so this respects access.)
+                    if is_catalog_key(&resolved.rel_key) {
+                        if let Some(out) = dynamic_catalog(&db, &resolved)? {
+                            return Ok(out);
+                        }
+                    }
+                    Ok(absent_or_gone(&db, &resolved.storage_ns)?)
+                }
             }
         }
         Method::PUT => handle_put(state, snap, caller, &resolved, headers, body),
@@ -1264,6 +1341,77 @@ fn handle_object(
         }
         _ => Ok(Out::status(StatusCode::METHOD_NOT_ALLOWED)),
     }
+}
+
+/// `catalog.json` / `catalog.yaml` at a namespace root — the keys a vectordata
+/// client probes to discover a namespace's datasets.
+fn is_catalog_key(rel_key: &str) -> bool {
+    rel_key == "catalog.json" || rel_key == "catalog.yaml"
+}
+
+/// Synthesize a live catalog for a namespace from the datasets currently stored
+/// under it — one entry per `<dir>/dataset.yaml`. Returns `None` when there are
+/// none (the caller then falls back to a real 404). Each entry embeds the
+/// dataset's `layout` (its `attributes` + `profiles`, read straight from its
+/// `dataset.yaml`) — the same shape `veks … catalog generate` embeds — so the
+/// client sees profiles, metric, and facets with no per-dataset fetches. The
+/// body is JSON or YAML to match the requested key.
+fn dynamic_catalog(db: &Db, resolved: &namespace::Resolved) -> Result<Option<Out>, VecdError> {
+    let entries = store::list(db, &resolved.storage_ns)?;
+    let mut seen = std::collections::BTreeSet::new();
+    let mut datasets: Vec<serde_json::Value> = Vec::new();
+    for (key, _etag) in &entries {
+        let Some(dir) = key.strip_suffix("/dataset.yaml") else { continue };
+        if dir.is_empty() || !seen.insert(dir.to_string()) {
+            continue;
+        }
+        let name = dir.rsplit('/').next().unwrap_or(dir);
+        let mut entry = serde_json::json!({
+            "name": name,
+            "path": format!("{dir}/dataset.yaml"),
+            "dataset_type": "dataset.yaml",
+        });
+        if let Some(layout) = dataset_layout(db, resolved, key) {
+            entry["layout"] = layout;
+        }
+        datasets.push(entry);
+    }
+    if datasets.is_empty() {
+        return Ok(None);
+    }
+    let (body, ctype) = if resolved.rel_key.ends_with(".yaml") {
+        (serde_yaml::to_string(&datasets).unwrap_or_default().into_bytes(), "application/yaml")
+    } else {
+        (serde_json::to_vec_pretty(&datasets).unwrap_or_default(), "application/json")
+    };
+    Ok(Some(Out::status(StatusCode::OK).header("Content-Type", ctype.to_string()).body(body)))
+}
+
+/// Read a dataset's `dataset.yaml` from the same backend and extract its catalog
+/// `layout` — the `attributes` and `profiles` blocks, copied verbatim (this is
+/// exactly what `catalog generate` does). `None` if it can't be read or parsed,
+/// or carries neither block.
+fn dataset_layout(
+    db: &Db,
+    resolved: &namespace::Resolved,
+    ds_key: &str,
+) -> Option<serde_json::Value> {
+    let ds = namespace::Resolved {
+        storage_ns: resolved.storage_ns.clone(),
+        backend: resolved.backend.clone(),
+        rel_key: ds_key.to_string(),
+        backend_config: resolved.backend_config.clone(),
+    };
+    let (bytes, _) = store::get(db, &ds).ok().flatten()?;
+    let doc: serde_json::Value = serde_yaml::from_slice(&bytes).ok()?;
+    let mut layout = serde_json::Map::new();
+    if let Some(a) = doc.get("attributes") {
+        layout.insert("attributes".to_string(), a.clone());
+    }
+    if let Some(p) = doc.get("profiles") {
+        layout.insert("profiles".to_string(), p.clone());
+    }
+    (!layout.is_empty()).then(|| serde_json::Value::Object(layout))
 }
 
 /// A request path split around an optional `@<selector>` version segment.

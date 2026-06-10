@@ -369,6 +369,51 @@ pub fn protect_settings_from(settings: &Path) -> bool {
     false
 }
 
+/// Client TLS-trust policy, read from `settings.yaml`.
+///
+/// ```yaml
+/// # Extra CA / leaf certificates (PEM) to ADD to the system trust roots —
+/// # the secure way to trust a private vecd (export its cert with `vecd tls
+/// # export`). Verification stays on.
+/// trusted_ca_certs:
+///   - /home/me/.config/vectordata/vecd-ca.pem
+/// # Endpoint origins for which an invalid/self-signed server cert is accepted
+/// # WITHOUT verification — insecure, off by default. Use only for local dev.
+/// trust_self_signed:
+///   - https://127.0.0.1:18443
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TlsTrust {
+    /// PEM files added to the client's trusted roots (verification stays on).
+    pub trusted_ca_certs: Vec<PathBuf>,
+    /// Origins (`scheme://host[:port]`) whose server cert is accepted without
+    /// verification — insecure; empty by default.
+    pub trust_self_signed: Vec<String>,
+}
+
+/// Read the [`TlsTrust`] policy from the user's `settings.yaml` (empty when the
+/// file is absent or declares neither key).
+pub fn tls_trust() -> TlsTrust {
+    tls_trust_from(&settings_path())
+}
+
+/// [`tls_trust`] reading from an explicit path. Pure given the file content, so
+/// tests pass a tempdir path rather than mutating process env.
+pub fn tls_trust_from(settings: &Path) -> TlsTrust {
+    let Ok(content) = std::fs::read_to_string(settings) else { return TlsTrust::default() };
+    let doc: serde_yaml::Value = serde_yaml::from_str(&content).unwrap_or(serde_yaml::Value::Null);
+    let strings = |key: &str| -> Vec<String> {
+        doc.get(key)
+            .and_then(|v| v.as_sequence())
+            .map(|seq| seq.iter().filter_map(|x| x.as_str().map(str::to_owned)).collect())
+            .unwrap_or_default()
+    };
+    TlsTrust {
+        trusted_ca_certs: strings("trusted_ca_certs").into_iter().map(PathBuf::from).collect(),
+        trust_self_signed: strings("trust_self_signed"),
+    }
+}
+
 /// Write a new `cache_dir:` into the user's `settings.yaml`,
 /// creating the file and its parent directory as needed. Always
 /// writes `protect_settings: true` (for backwards compat with older
@@ -439,6 +484,30 @@ pub fn write_cache_dir_at(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tls_trust_parses_both_lists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("settings.yaml");
+        std::fs::write(
+            &f,
+            "cache_dir: /x\n\
+             trusted_ca_certs:\n  - /a/ca.pem\n  - /b/ca.pem\n\
+             trust_self_signed:\n  - https://127.0.0.1:18443\n",
+        )
+        .unwrap();
+        let t = tls_trust_from(&f);
+        assert_eq!(
+            t.trusted_ca_certs,
+            vec![PathBuf::from("/a/ca.pem"), PathBuf::from("/b/ca.pem")]
+        );
+        assert_eq!(t.trust_self_signed, vec!["https://127.0.0.1:18443".to_string()]);
+
+        // A file without the keys, or no file at all, yields the empty policy.
+        std::fs::write(&f, "cache_dir: /x\n").unwrap();
+        assert_eq!(tls_trust_from(&f), TlsTrust::default());
+        assert_eq!(tls_trust_from(&tmp.path().join("absent.yaml")), TlsTrust::default());
+    }
 
     #[test]
     fn cache_dir_honors_settings_override() {

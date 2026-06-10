@@ -8,10 +8,10 @@ Brute-force exact KNN ground truth computation.
 - id: compute-knn
   run: compute knn
   per_profile: true
-  base: profiles/base/base_vectors.fvec
-  query: profiles/base/query_vectors.fvec
-  indices: neighbor_indices.ivec
-  distances: neighbor_distances.fvec
+  base: profiles/base/base_vectors.fvecs
+  query: profiles/base/query_vectors.fvecs
+  indices: neighbor_indices.ivecs
+  distances: neighbor_distances.fvecs
   neighbors: 100
   metric: L2
   normalized: false
@@ -21,10 +21,10 @@ Brute-force exact KNN ground truth computation.
 
 ```bash
 veks pipeline compute knn \
-  --base profiles/base/base_vectors.fvec \
-  --query profiles/base/query_vectors.fvec \
-  --indices neighbor_indices.ivec \
-  --distances neighbor_distances.fvec \
+  --base profiles/base/base_vectors.fvecs \
+  --query profiles/base/query_vectors.fvecs \
+  --indices neighbor_indices.ivecs \
+  --distances neighbor_distances.fvecs \
   --neighbors 100 \
   --metric L2
 ```

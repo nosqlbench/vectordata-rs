@@ -153,7 +153,10 @@ pub fn execute(opts: &Options) -> Result<Outcome, Failure> {
         m
     };
 
-    // 2. Resolve the destination binding (local .publish_url vs --to).
+    // 2. Resolve the destination binding (local .publish_url vs --to). The
+    //    no-destination → logged-in-endpoint fallback (with its prompt) is
+    //    handled one layer up in `run`, which fills in `--to`; here the engine
+    //    stays deterministic given its `Options`.
     let existing = binding::read_binding(root).map_err(Failure::Usage)?.map(|(_, p)| p);
     let bind = binding::reconcile(existing, opts.to.as_deref()).map_err(Failure::Usage)?;
     let endpoint = bind.url().clone();
@@ -675,7 +678,32 @@ fn verify_conditional_writes(tx: &dyn PushTransport) -> Result<(), Failure> {
             let _ = tx.delete(PROBE);
             return Ok(());
         }
-        Err(e) => return Err(map_transport(e)),
+        Err(e) => {
+            // This probe is the FIRST write to the destination. A 404/403 here
+            // almost always means the path doesn't name an existing namespace
+            // you can write to — surface that, not the raw probe URL.
+            let raw = e.to_string();
+            let lc = raw.to_lowercase();
+            if lc.contains("404") || lc.contains("not found")
+                || lc.contains("403") || lc.contains("forbidden")
+            {
+                return Err(Failure::Operational(format!(
+                    "cannot write to {}: {raw}\n\
+                     The server won't accept writes there. Usually the namespace exists but has \
+                     no active storage backend, or the path names no namespace at all. \
+                     On the server, check:\n  \
+                     • `vecd ns list`        — does the namespace exist, and is its `backend_config` set?\n  \
+                     • `vecd backends list`  — is that backend present and active?\n\
+                     Attach a backend, e.g.:\n  \
+                     `vecd backends add store --kind local --endpoint <dir>`\n  \
+                     `vecd ns set <namespace> --backend-config store`\n\
+                     (or create the namespace whole: \
+                     `vecd ns add <namespace> --owner <you> --backend-config store --active`).",
+                    tx.describe()
+                )));
+            }
+            return Err(map_transport(e));
+        }
     }
     let honored =
         matches!(tx.put_bytes(PROBE, b"2", Some("")), Err(PushError::PreconditionFailed));
@@ -769,6 +797,147 @@ fn confirm(
         Ok(())
     } else {
         Err(Failure::Usage("aborted by user".to_string()))
+    }
+}
+
+/// When `push` has no destination (`.publish_url` absent, no `--to`) but the
+/// user is logged in, offer to push to that endpoint. Returns the chosen
+/// destination URL (`Some`) once confirmed, or `None` when there's no usable
+/// fallback (not logged in / ambiguous, or non-interactive without `-y`) so the
+/// caller emits the standard "no destination" error.
+///
+/// The default path is *smart*: when the user can write to exactly one
+/// namespace on the endpoint (per `whoami`), the dataset lands under it
+/// (`<endpoint>/<namespace>/<dataset>/`); otherwise it falls back to
+/// `<endpoint>/<dataset>/`. Interactively the default is shown and editable.
+#[cfg(feature = "cli")]
+fn derive_destination(root: &std::path::Path, assume_yes: bool) -> Result<Option<String>, String> {
+    use std::io::{IsTerminal, Write};
+
+    let endpoint = match crate::credentials::resolve_endpoint(None) {
+        Ok(e) => e,
+        Err(_) => return Ok(None), // not logged in, or several — standard error
+    };
+    let base = endpoint.trim_end_matches('/').to_string();
+    let dataset = dataset_name(root);
+
+    // We can only fill in a destination if we can either auto-proceed (`-y`) or
+    // prompt (a terminal). Otherwise leave it to the engine's standard error —
+    // and skip the `whoami` probe below entirely.
+    if !assume_yes && !std::io::stdin().is_terminal() {
+        return Ok(None);
+    }
+
+    let token = crate::credentials::stored_token(&base);
+    let namespaces = crate::endpoint::candidate_namespaces(&base, token.as_deref());
+    let mut default_url = match namespaces.as_slice() {
+        // Exactly one namespace to target → place the dataset under it.
+        [only] => format!("{base}/{}/{dataset}/", only.trim_matches('/')),
+        // None or several — leave the namespace out of the default; the user
+        // edits the prompt (and `--to` tab-completion offers the namespaces).
+        _ => format!("{base}/{dataset}/"),
+    };
+    if !default_url.ends_with('/') {
+        default_url.push('/');
+    }
+
+    // `-y`: don't prompt — announce the derived destination and proceed.
+    if assume_yes {
+        println!("No destination set; using your logged-in endpoint:\n  {default_url}");
+        return Ok(Some(default_url));
+    }
+
+    println!();
+    println!("No .publish_url here and no --to, but you're logged in to");
+    println!("  {base}");
+    println!();
+    print!("Push \"{dataset}\" to [{default_url}]: ");
+    let _ = std::io::stdout().flush();
+    let mut line = String::new();
+    let n = std::io::stdin()
+        .read_line(&mut line)
+        .map_err(|e| format!("reading destination: {e}"))?;
+    if n == 0 {
+        // EOF (Ctrl-D) — treat as "no, don't push".
+        return Err("aborted — no destination chosen".to_string());
+    }
+    let typed = line.trim();
+    let mut url = if typed.is_empty() { default_url } else { typed.to_string() };
+    if !url.ends_with('/') {
+        url.push('/');
+    }
+    Ok(Some(url))
+}
+
+/// The dataset name used as the remote subdirectory: the canonical basename of
+/// the source path (falling back to `"dataset"`).
+#[cfg(feature = "cli")]
+fn dataset_name(root: &std::path::Path) -> String {
+    std::fs::canonicalize(root)
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "dataset".to_string())
+}
+
+/// Resolve a `--to` value into a full destination URL.
+///
+/// - A URL (contains `://`) is used as-is (trailing slash ensured).
+/// - Otherwise it's a namespace shorthand resolved against the **authenticated**
+///   endpoint: `root` (or `/`) targets the root `/` namespace; a bare name
+///   targets the namespace whose path equals it (or whose last segment does),
+///   provided exactly one matches. The dataset lands under it as
+///   `<endpoint>/<namespace>/<dataset>/`.
+#[cfg(feature = "cli")]
+fn resolve_to(to: &str, root: &std::path::Path) -> Result<String, String> {
+    if to.contains("://") {
+        let mut u = to.to_string();
+        if !u.ends_with('/') {
+            u.push('/');
+        }
+        return Ok(u);
+    }
+    let endpoint = crate::credentials::resolve_endpoint(None)
+        .map_err(|e| format!("--to '{to}' is a namespace name, but {e}"))?;
+    let base = endpoint.trim_end_matches('/');
+    let token = crate::credentials::stored_token(base);
+    let namespaces = crate::endpoint::candidate_namespaces(base, token.as_deref());
+    build_to_url(base, &dataset_name(root), to, &namespaces)
+}
+
+/// Pure core of [`resolve_to`] for a namespace shorthand: build the destination
+/// URL from the resolved endpoint `base`, the local `dataset` name, the `to`
+/// shorthand, and the endpoint's `namespaces`.
+#[cfg(feature = "cli")]
+fn build_to_url(base: &str, dataset: &str, to: &str, namespaces: &[String]) -> Result<String, String> {
+    let base = base.trim_end_matches('/');
+    if to == "root" || to == "/" {
+        return Ok(format!("{base}/{dataset}/"));
+    }
+    let want = to.trim_matches('/');
+    let matches: Vec<&str> = namespaces
+        .iter()
+        .map(|s| s.trim_matches('/'))
+        .filter(|ns| *ns == want || ns.rsplit('/').next() == Some(want))
+        .collect();
+    match matches.as_slice() {
+        [one] => Ok(format!("{base}/{one}/{dataset}/")),
+        [] => {
+            let avail = if namespaces.is_empty() {
+                "no writable namespaces found — check `vecd ns list` (and that a namespace has \
+                 an active backend)"
+                    .to_string()
+            } else {
+                format!("writable namespaces: {}", namespaces.join(", "))
+            };
+            // `candidate_namespaces` only lists writable ones, so a miss can mean
+            // "doesn't exist" OR "exists but has no backend".
+            Err(format!("no writable namespace '{to}' on {base} (it may exist but lack a backend) — {avail}"))
+        }
+        _ => Err(format!(
+            "namespace '{to}' is ambiguous — matches {}; give the full namespace path",
+            matches.join(", ")
+        )),
     }
 }
 
@@ -966,6 +1135,38 @@ mod cli {
 
     /// Dispatch entry point. Returns a process exit code.
     pub fn run(mut args: PushArgs) -> i32 {
+        // A bare `--to <namespace>` (or `--to root`) is shorthand for a full URL
+        // on the endpoint you're logged in to — expand it before anything reads
+        // the destination (token resolution, the engine, .publish_url).
+        if let Some(to) = args.to.clone() {
+            if !to.contains("://") {
+                match super::resolve_to(&to, &args.path) {
+                    Ok(url) => args.to = Some(url),
+                    Err(e) => {
+                        eprintln!("push: {e}");
+                        return 2;
+                    }
+                }
+            }
+        }
+
+        // No destination at all (no --to, no .publish_url)? If the user is
+        // logged in, offer to push to that endpoint — prompting for the path
+        // with a smart default — and fill `--to` in so the engine sees a
+        // concrete destination (and persists the .publish_url on success).
+        if args.to.is_none()
+            && super::binding::read_binding(&args.path).ok().flatten().is_none()
+        {
+            match super::derive_destination(&args.path, args.yes) {
+                Ok(Some(url)) => args.to = Some(url),
+                Ok(None) => {} // no fallback — the engine emits the standard error
+                Err(e) => {
+                    eprintln!("push: {e}");
+                    return 2;
+                }
+            }
+        }
+
         // `--token` may be a literal token or a file (JSON token record, a
         // credential store, or a bare token); resolve it to the literal — using
         // the destination's origin to pick from a store — before the engine sees it.

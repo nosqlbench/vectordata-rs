@@ -17,8 +17,8 @@
 //! ## Catalog file format
 //!
 //! ```yaml
-//! - name: sift-128
-//!   path: vendor/sift/dataset.yaml
+//! - name: glove-100
+//!   path: vendor/glove-100/dataset.yaml
 //!   dataset_type: dataset.yaml
 //!   layout:
 //!     attributes:
@@ -165,8 +165,8 @@ mod tests {
     #[test]
     fn test_roundtrip_yaml() {
         let yaml = r#"
-- name: sift-128
-  path: sift/dataset.yaml
+- name: glove-100
+  path: glove-100/dataset.yaml
   dataset_type: dataset.yaml
   layout:
     profiles:
@@ -175,7 +175,7 @@ mod tests {
 "#;
         let entries: Vec<CatalogEntry> = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].name, "sift-128");
+        assert_eq!(entries[0].name, "glove-100");
         assert!(entries[0].layout.attributes.is_none());
         assert_eq!(entries[0].profile_count(), 1);
     }

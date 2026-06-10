@@ -13,11 +13,11 @@ veks pipeline analyze describe --source <file> [--scan true]
 ### Uniform vector file (fvec)
 
 ```bash
-veks pipeline analyze describe --source profiles/base/base_vectors.fvec
+veks pipeline analyze describe --source profiles/base/base_vectors.fvecs
 ```
 
 ```
-File:        ./profiles/base/base_vectors.fvec
+File:        ./profiles/base/base_vectors.fvecs
 Format:      fvec
 Dimensions:  128
 Element:     4 bytes (f32/i32)
@@ -30,11 +30,11 @@ Structure:   uniform (all records dim=128, 1000 records)
 ### Variable-length vector file (ivvec)
 
 ```bash
-veks pipeline analyze describe --source profiles/default/metadata_indices.ivvec
+veks pipeline analyze describe --source profiles/default/metadata_indices.ivvecs
 ```
 
 ```
-File:        ./profiles/default/metadata_indices.ivvec
+File:        ./profiles/default/metadata_indices.ivvecs
 Format:      ivvec
 Dimensions:  81
 Element:     4 bytes (f32/i32)
@@ -63,7 +63,7 @@ File size:   1000 B
 ### Scan mode (record length histogram)
 
 ```bash
-veks pipeline analyze describe --source profiles/default/metadata_indices.ivvec --scan true
+veks pipeline analyze describe --source profiles/default/metadata_indices.ivvecs --scan true
 ```
 
 Walks all records and reports dimension distribution for variable-length files.

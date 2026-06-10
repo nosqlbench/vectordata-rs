@@ -13,10 +13,10 @@ label-specific search evaluation.
 - id: partition-profiles
   run: compute partition-profiles
   after: [evaluate-predicates]
-  base: profiles/base/base_vectors.fvec
-  query: profiles/base/query_vectors.fvec
+  base: profiles/base/base_vectors.fvecs
+  query: profiles/base/query_vectors.fvecs
   metadata: profiles/base/metadata_content.u8
-  metadata-indices: profiles/default/metadata_indices.ivvec
+  metadata-indices: profiles/default/metadata_indices.ivvecs
   neighbors: 100
   metric: L2
 ```
@@ -25,10 +25,10 @@ label-specific search evaluation.
 
 ```bash
 veks pipeline compute partition-profiles \
-  --base profiles/base/base_vectors.fvec \
-  --query profiles/base/query_vectors.fvec \
+  --base profiles/base/base_vectors.fvecs \
+  --query profiles/base/query_vectors.fvecs \
   --metadata profiles/base/metadata_content.u8 \
-  --metadata-indices profiles/default/metadata_indices.ivvec \
+  --metadata-indices profiles/default/metadata_indices.ivvecs \
   --neighbors 100 \
   --metric L2
 ```
@@ -40,12 +40,12 @@ For a dataset with metadata labels 0..12, creates 13 partition profiles:
 ```
 profiles/
 ├── label-0/
-│   ├── base_vectors.fvec          # ~8.3% of base vectors (label == 0)
-│   ├── query_vectors.fvec         # symlink → ../../base/query_vectors.fvec
-│   ├── neighbor_indices.ivec      # KNN within label-0 partition
-│   └── neighbor_distances.fvec    # distances within label-0 partition
+│   ├── base_vectors.fvecs          # ~8.3% of base vectors (label == 0)
+│   ├── query_vectors.fvecs         # symlink → ../../base/query_vectors.fvecs
+│   ├── neighbor_indices.ivecs      # KNN within label-0 partition
+│   └── neighbor_distances.fvecs    # distances within label-0 partition
 ├── label-1/
-│   ├── base_vectors.fvec
+│   ├── base_vectors.fvecs
 │   ├── ...
 ```
 
@@ -54,10 +54,10 @@ Each partition profile is added to `dataset.yaml`:
 ```yaml
 profiles:
   label-0:
-    base_vectors: profiles/label-0/base_vectors.fvec
-    query_vectors: profiles/base/query_vectors.fvec
-    neighbor_indices: profiles/label-0/neighbor_indices.ivec
-    neighbor_distances: profiles/label-0/neighbor_distances.fvec
+    base_vectors: profiles/label-0/base_vectors.fvecs
+    query_vectors: profiles/base/query_vectors.fvecs
+    neighbor_indices: profiles/label-0/neighbor_indices.ivecs
+    neighbor_distances: profiles/label-0/neighbor_distances.fvecs
   label-1:
     ...
 ```

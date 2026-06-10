@@ -11,13 +11,13 @@ veks pipeline analyze file --source <file>
 ## Example
 
 ```bash
-veks pipeline analyze file --source profiles/base/base_vectors.fvec
+veks pipeline analyze file --source profiles/base/base_vectors.fvecs
 ```
 
 ```
-File: ./profiles/base/base_vectors.fvec
+File: ./profiles/base/base_vectors.fvecs
   Size:       503.9 KB (516000 bytes)
-  Format:     .fvec (float32)
+  Format:     .fvecs (float32)
   Element:    4 bytes per value
   Dimensions: 128
   Vectors:    1000

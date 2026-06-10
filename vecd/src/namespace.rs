@@ -55,7 +55,7 @@ pub fn resolve(snap: &Snapshot, request_path: &str) -> Result<Resolved, VecdErro
     let mut covering: Vec<_> = snap.namespaces().filter(|n| covers(&n.path, &key)).collect();
     covering.sort_by_key(|n| std::cmp::Reverse(n.path.len()));
 
-    for ns in covering {
+    for ns in &covering {
         if !ns.active {
             continue;
         }
@@ -79,9 +79,30 @@ pub fn resolve(snap: &Snapshot, request_path: &str) -> Result<Resolved, VecdErro
         });
     }
 
-    Err(VecdError::usage(format!(
-        "no active storage backend serves '{request_path}'"
-    )))
+    // Nothing active + backed served the key. Diagnose from the most-specific
+    // covering namespace so the caller learns the actual fix (inactive vs. no
+    // backend vs. a dead backend) instead of a generic "no backend".
+    if let Some(ns) = covering.first() {
+        let label = if ns.path.is_empty() { "/".to_string() } else { ns.path.clone() };
+        if !ns.active {
+            return Err(VecdError::usage(format!(
+                "namespace '{label}' is inactive (config-only) — activate it with \
+                 `vecd ns set {label} --active`"
+            )));
+        }
+        return match &ns.backend_config {
+            None => Err(VecdError::usage(format!(
+                "namespace '{label}' has no storage backend — attach one with \
+                 `vecd ns set {label} --backend-config <name>`"
+            ))),
+            Some(bn) => Err(VecdError::usage(format!(
+                "namespace '{label}' uses backend '{bn}', which is missing or inactive — \
+                 check `vecd backends list` (activate with `vecd backends set {bn} --active`)"
+            ))),
+        };
+    }
+
+    Err(VecdError::usage(format!("no namespace covers '{request_path}'")))
 }
 
 /// Resolve a *prefix* (which may name a namespace itself) to its storage

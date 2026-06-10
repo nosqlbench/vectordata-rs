@@ -1,12 +1,14 @@
 // Copyright (c) Jonathan Shook
 // SPDX-License-Identifier: Apache-2.0
 
-//! Unified file and directory filtering rules for the entire veks crate.
+//! Unified file and directory filtering rules for the whole toolchain.
 //!
 //! All decisions about which files/directories to include or exclude —
-//! for publishing, merkle coverage, catalog generation, workspace checks,
-//! and sync operations — are defined here. No other module should inline
-//! its own filtering predicates.
+//! for publishing/pushing, merkle coverage, catalog generation, workspace
+//! checks, and sync operations — are defined here. No other module should
+//! inline its own filtering predicates. This lives in `vectordata` (the base
+//! crate) so the push engine can apply exactly the same rules as the higher
+//! `veks publish` surface; `veks-core` and `veks` re-export it unchanged.
 
 /// Directories that are always skipped during any tree walk.
 ///
@@ -87,17 +89,26 @@ pub fn is_catalog_staleness_exempt(name: &str) -> bool {
         || name.ends_with(".mref")
 }
 
+/// Files that are themselves *derived metadata about another file* — provenance
+/// sidecars (`*.provenance.json`) and merkle references (`*.mref`/`*.mrkl`).
+///
+/// These must never be given their own provenance sidecar or merkle reference,
+/// or the suffixes compound without bound — e.g.
+/// `query_vectors.fvecs.provenance.json.mref.provenance.json`. Both the merkle
+/// generator and the provenance writer treat this as a hard skip.
+pub fn is_derived_sidecar(name: &str) -> bool {
+    name.ends_with(".provenance.json") || name.ends_with(".mref") || name.ends_with(".mrkl")
+}
+
 /// Files that should not receive their own merkle coverage.
 ///
 /// Infrastructure files at the dataset root level (dataset.yaml, catalog
 /// files, variables.yaml) are too small to benefit from chunked merkle
 /// verification. Everything within `profiles/` gets coverage categorically.
-/// Merkle state files themselves and excluded files are always exempt.
+/// Derived sidecars (provenance/merkle) and excluded files are always exempt —
+/// merkle must not cover a provenance sidecar or another merkle file.
 pub fn is_merkle_exempt(name: &str) -> bool {
-    is_infrastructure_file(name)
-        || name.ends_with(".mref")
-        || name.ends_with(".mrkl")
-        || is_excluded_file(name)
+    is_infrastructure_file(name) || is_derived_sidecar(name) || is_excluded_file(name)
 }
 
 
@@ -151,14 +162,28 @@ mod tests {
     }
 
     #[test]
+    fn test_derived_sidecar() {
+        // Provenance sidecars and merkle refs are derived metadata.
+        assert!(is_derived_sidecar("base.fvec.provenance.json"));
+        assert!(is_derived_sidecar("base.fvec.mref"));
+        assert!(is_derived_sidecar("data.mrkl"));
+        // …including compounded ones (which is exactly what we must stop growing).
+        assert!(is_derived_sidecar("q.fvecs.provenance.json.mref"));
+        // Real content is not.
+        assert!(!is_derived_sidecar("base.fvec"));
+        assert!(!is_derived_sidecar("dataset.json"));
+    }
+
+    #[test]
     fn test_merkle_exempt() {
         // Infrastructure files at dataset root — exempt (too small)
         assert!(is_merkle_exempt("dataset.yaml"));
         assert!(is_merkle_exempt("catalog.json"));
         assert!(is_merkle_exempt("variables.yaml"));
-        // Merkle files themselves — exempt
+        // Derived sidecars — exempt (merkle must not cover provenance/merkle files)
         assert!(is_merkle_exempt("base.fvec.mref"));
         assert!(is_merkle_exempt("data.mrkl"));
+        assert!(is_merkle_exempt("base.fvec.provenance.json"), "provenance sidecars get no .mref");
         // Excluded files — exempt
         assert!(is_merkle_exempt(".hidden"));
         assert!(is_merkle_exempt("data.tmp"));

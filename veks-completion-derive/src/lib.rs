@@ -254,9 +254,10 @@ fn type_about(di: &DeriveInput) -> Option<String> {
     collect_docs(&di.attrs)
 }
 
-/// `#[command(after_help = "…")]` / `#[command(after_long_help = "…")]`.
-fn type_after_help(di: &DeriveInput) -> Option<String> {
-    for attr in &di.attrs {
+/// `#[command(after_help = "…")]` / `#[command(after_long_help = "…")]` on any
+/// attribute list (a type or an enum variant).
+fn after_help_from_attrs(attrs: &[Attribute]) -> Option<String> {
+    for attr in attrs {
         if attr.path().is_ident("command") {
             let mut out = None;
             let _ = attr.parse_nested_meta(|meta| {
@@ -277,6 +278,10 @@ fn type_after_help(di: &DeriveInput) -> Option<String> {
         }
     }
     None
+}
+
+fn type_after_help(di: &DeriveInput) -> Option<String> {
+    after_help_from_attrs(&di.attrs)
 }
 
 /// The `.about(…).after_help(…)` builder calls for a type's command spec.
@@ -653,10 +658,14 @@ fn derive_enum(
             Some(a) => quote! { .about(#a) },
             None => quote! {},
         };
+        let vafter_call = match after_help_from_attrs(&variant.attrs) {
+            Some(h) => quote! { .after_help(#h) },
+            None => quote! {},
+        };
         let aliases = collect_aliases(&variant.attrs);
         let alias_calls = quote! { #(.alias(#aliases))* };
         let stability = stability_call(&variant.attrs);
-        let vabout_call = quote! { #vabout_call #alias_calls #stability };
+        let vabout_call = quote! { #vabout_call #vafter_call #alias_calls #stability };
 
         match &variant.fields {
             Fields::Unit => {

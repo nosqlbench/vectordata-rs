@@ -27,10 +27,10 @@ steps:
     after: [generate-base, generate-queries]
     per_profile: true
     phase: 0
-    base: profiles/base/base_vectors.fvec
-    query: profiles/base/query_vectors.fvec
-    indices: neighbor_indices.ivec
-    distances: neighbor_distances.fvec
+    base: profiles/base/base_vectors.fvecs
+    query: profiles/base/query_vectors.fvecs
+    indices: neighbor_indices.ivecs
+    distances: neighbor_distances.fvecs
     neighbors: 100
     metric: L2
 ```
@@ -73,7 +73,7 @@ Step options can reference variables:
 ```yaml
 count: "${vector_count}"          # from variables section
 range: "[0,${base_count})"        # computed by earlier step
-output: "${cache}/sorted.ivec"    # .cache/ directory
+output: "${cache}/sorted.ivecs"    # .cache/ directory
 ```
 
 ### Freshness checking — structured provenance (v5)
@@ -171,9 +171,9 @@ Steps with `per_profile: true` are templates. The engine expands them
 once per profile, prefixing output paths:
 
 ```
-evaluate-predicates (template, output: metadata_indices.ivvec)
-  → evaluate-predicates       (default, output: profiles/default/metadata_indices.ivvec)
-  → evaluate-predicates-100K  (100K,    output: profiles/100K/metadata_indices.ivvec)
+evaluate-predicates (template, output: metadata_indices.ivvecs)
+  → evaluate-predicates       (default, output: profiles/default/metadata_indices.ivvecs)
+  → evaluate-predicates-100K  (100K,    output: profiles/100K/metadata_indices.ivvecs)
 ```
 
 The `phase` field controls ordering within expansion: all phase-0

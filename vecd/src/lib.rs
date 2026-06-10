@@ -34,6 +34,7 @@ pub mod namespace;
 pub mod admin;
 pub mod backup;
 pub mod cli;
+pub mod completion;
 pub mod config;
 pub mod credentials;
 pub mod daemon;

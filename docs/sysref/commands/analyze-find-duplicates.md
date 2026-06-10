@@ -11,11 +11,11 @@ veks pipeline analyze find-duplicates --source <file>
 ## Example
 
 ```bash
-veks pipeline analyze find-duplicates --source profiles/base/base_vectors.fvec
+veks pipeline analyze find-duplicates --source profiles/base/base_vectors.fvecs
 ```
 
 ```
-find-duplicates: scanning ./profiles/base/base_vectors.fvec
+find-duplicates: scanning ./profiles/base/base_vectors.fvecs
 Dedup: 1K vectors (f32, dim=128)
 Phase 1: creating sorted runs
 Phase 2: parallel merge + dedup

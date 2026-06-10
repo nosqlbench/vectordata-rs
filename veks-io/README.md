@@ -7,12 +7,12 @@ approximate nearest neighbor (ANN) benchmarks and embedding datasets.
 
 | Format | Extension | Element Type | Read | Write | Mmap |
 |--------|-----------|-------------|------|-------|------|
-| fvec   | `.fvec`   | float32     | ✓    | ✓     | ✓    |
-| ivec   | `.ivec`   | int32       | ✓    | ✓     | ✓    |
-| bvec   | `.bvec`   | uint8       | ✓    | ✓     | ✓    |
-| dvec   | `.dvec`   | float64     | ✓    | ✓     | ✓    |
-| mvec   | `.mvec`   | float16     | ✓    | ✓     | ✓    |
-| svec   | `.svec`   | int16       | ✓    | ✓     | ✓    |
+| fvec   | `.fvecs`   | float32     | ✓    | ✓     | ✓    |
+| ivec   | `.ivecs`   | int32       | ✓    | ✓     | ✓    |
+| bvec   | `.bvecs`   | uint8       | ✓    | ✓     | ✓    |
+| dvec   | `.dvecs`   | float64     | ✓    | ✓     | ✓    |
+| mvec   | `.mvecs`   | float16     | ✓    | ✓     | ✓    |
+| svec   | `.svecs`   | int16       | ✓    | ✓     | ✓    |
 | npy    | `.npy`    | float       | ✓*   | —     | —    |
 | parquet| `.parquet` | float      | ✓*   | —     | —    |
 | slab   | `.slab`   | binary      | ✓*   | ✓*    | —    |
@@ -39,17 +39,17 @@ veks-io = { version = "0.13", features = ["npy", "parquet"] }
 use veks_io::{open, create, probe};
 
 // Probe metadata without reading all data
-let meta = probe("dataset.fvec")?;
+let meta = probe("dataset.fvecs")?;
 println!("dim={}, records={:?}", meta.dimension, meta.record_count);
 
 // Stream-read all records
-let mut reader = open("dataset.fvec")?;
+let mut reader = open("dataset.fvecs")?;
 while let Some(record) = reader.next_record() {
     // record: Vec<u8> — raw little-endian element bytes
 }
 
 // Write vectors
-let mut writer = create("output.fvec", 128)?;  // dimension=128
+let mut writer = create("output.fvecs", 128)?;  // dimension=128
 writer.write_record(0, &data);
 writer.finish()?;
 ```
@@ -61,7 +61,7 @@ For random-access on xvec files, use memory-mapped readers:
 ```rust
 use veks_io::xvec::mmap::MmapReader;
 
-let reader = MmapReader::<f32>::open_fvec("base.fvec".as_ref())?;
+let reader = MmapReader::<f32>::open_fvec("base.fvecs".as_ref())?;
 let vec: &[f32] = reader.get_slice(42);  // zero-copy, no allocation
 ```
 
@@ -70,7 +70,7 @@ let vec: &[f32] = reader.get_slice(42);  // zero-copy, no allocation
 For files where records have non-uniform dimensions:
 
 ```rust
-let mut reader = veks_io::open_varlen("mixed.fvec")?;
+let mut reader = veks_io::open_varlen("mixed.fvecs")?;
 while let Some(record) = reader.next_record() {
     println!("dim={}, bytes={}", record.dimension, record.data.len());
 }

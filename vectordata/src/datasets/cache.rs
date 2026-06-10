@@ -248,7 +248,7 @@ pub fn run_cache_status(
         // window-bounded chunk accounting can consult the per-chunk
         // validity bitmap. Sized profiles share `base_vectors`'s
         // `.mrkl` — without memoisation a 134 MiB sidecar gets
-        // re-parsed once per profile (~25× for `ibm-datapile-1b`).
+        // re-parsed once per profile (~25× for `example-1b`).
         let mut mrkl_cache: std::collections::HashMap<std::path::PathBuf, Option<MerkleState>> =
             std::collections::HashMap::new();
         for pname in entry.profile_names() {
@@ -290,7 +290,7 @@ pub fn run_cache_status(
 /// counting is restricted to the chunks covering the window's byte
 /// range. Without this every sized profile sharing a `.mrkl` reports
 /// the whole file's chunk count, which is what made
-/// `ibm-datapile-1b:100k` show `(1415347/1415355 chunks)` instead of
+/// `example-1b:100k` show `(1415347/1415355 chunks)` instead of
 /// the few-hundred chunks the 100K window actually needs.
 ///
 /// Falls back to whole-file counts when:

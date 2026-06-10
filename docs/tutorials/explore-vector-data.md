@@ -7,7 +7,7 @@ Three TUI surfaces under `veks interact` for poking at vector data:
 the **values grid** (raw cell viewer with heatmap), the **unified
 explorer** (sampled analytics — norms, distances, eigenvalues, PCA),
 and the **shell** (REPL for ad-hoc queries). All three open any
-vector source — a local `.fvec` / `.mvec` file, a catalog dataset
+vector source — a local `.fvecs` / `.mvecs` file, a catalog dataset
 specifier (`name:profile:facet`), or a profile from a remote catalog.
 
 ## Prerequisites
@@ -32,7 +32,7 @@ heatmap.
 veks interact values --dataset my-dataset
 
 # Or open a local file
-veks interact values --source ./data/base.fvec
+veks interact values --source ./data/base.fvecs
 
 # Jump straight to the middle of a 10M dataset at 5 sig digits
 veks interact values --dataset my-dataset --start 5000000 --digits 5
@@ -163,10 +163,10 @@ scripts via the batch form.
 
 ```bash
 # Interactive
-veks interact shell --source ./data/base.fvec
+veks interact shell --source ./data/base.fvecs
 
 # Batch: semicolon-separated commands, one result per line, then exit
-veks interact shell --source ./data/base.fvec "info; range 0 5; norm 0"
+veks interact shell --source ./data/base.fvecs "info; range 0 5; norm 0"
 ```
 
 Available REPL commands: `info`, `get <i>`, `range <start> <end>`,

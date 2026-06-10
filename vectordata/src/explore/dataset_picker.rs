@@ -252,7 +252,7 @@ fn profile_cache_coverage(
         // whose extension doesn't infer to a known vector element type
         // (sidecar YAMLs, layout files, etc.). Counting them as
         // "missing chunks" was the reason a freshly-precached
-        // ada002-100k displayed `97% (73/75)` — two non-data facets in
+        // emb-002-100k displayed `97% (73/75)` — two non-data facets in
         // the manifest each added 1 to `total` without ever showing up
         // in the cache.
         let ext = clean.rsplit('.').next().unwrap_or("");
@@ -553,7 +553,7 @@ fn build_source_lines(
 /// else is treated as a filesystem path.
 fn fetch_yaml_text(location: &str) -> Result<String, String> {
     if location.starts_with("http://") || location.starts_with("https://") {
-        let client = crate::transport::shared_client();
+        let client = crate::transport::shared_client_for(location);
         return client.get(location).send()
             .map_err(|e| format!("HTTP fetch: {e}"))?
             .error_for_status()

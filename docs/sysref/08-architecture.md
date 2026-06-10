@@ -162,7 +162,7 @@ pub struct StreamContext {
 ### Problem
 
 Unbounded memory growth during large-scale operations (e.g.,
-predicate evaluation on LAION-400M: 400M metadata records ×
+predicate evaluation on a 400M-vector corpus: 400M metadata records ×
 predicate count → OOM). The resource governor prevents this.
 
 ### Architecture

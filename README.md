@@ -1,11 +1,52 @@
 # vectordata-rs
 
-A Rust toolkit for building, sharing, and consuming vector search
-benchmark datasets.
+A Rust toolkit for **building, sharing, and consuming** vector-search
+benchmark datasets — for evaluating an ANN index, running filtered-search
+experiments, or publishing reproducible benchmarks, with the data
+plumbing handled for you.
 
-Whether you're evaluating an ANN index, running filtered search
-experiments, or publishing reproducible benchmarks — vectordata-rs
-handles the data plumbing so you can focus on the search.
+## Which tool do you need?
+
+- **Download & read datasets** → **`vectordata`** — the access CLI + Rust library.
+- **Host & publish datasets** → **`vecd`** — the server (a private gateway with auth + TLS).
+- **Build, process & verify datasets** → **`veks`** — the pipeline + analysis CLI.
+
+Grab a prebuilt binary from [**Releases**](https://github.com/nosqlbench/vectordata-rs/releases),
+or install from source with cargo:
+
+```bash
+cargo install --git https://github.com/nosqlbench/vectordata-rs vectordata   # download + read
+cargo install --git https://github.com/nosqlbench/vectordata-rs vecd         # host + publish
+cargo install --git https://github.com/nosqlbench/vectordata-rs veks         # build + process
+```
+
+Most people start by **consuming** datasets: find one in a catalog and
+read its vectors. There are two ways to do that, both over the same
+catalog → profile → facet model. (Building and serving your own come
+further down.)
+
+## 1. Find & download datasets — the CLI
+
+The quickest entry point is `vectordata explore`: with no arguments it
+pops a **catalog picker**, lets you browse the datasets in your
+configured catalogs, and opens a TUI (norms, distances, eigenvalues, PCA)
+against any of them — fetching data on demand.
+
+```bash
+vectordata config catalog add https://example.com/datasets/   # register a catalog (once)
+
+vectordata explore                    # easiest: pick + visualize interactively
+vectordata datasets list              # what's available
+vectordata datasets describe my-dataset   # profiles, facets, metric
+vectordata datasets precache my-dataset   # download + verify into the local cache
+```
+
+Full walk-through: [Find and fetch datasets with the CLI](./vectordata/docs/find-and-fetch-datasets.md).
+
+## 2. Read datasets — the Rust API
+
+The same flow programmatically: resolve a catalog, open a profile by
+name, read its facets through typed readers.
 
 ```rust
 use vectordata::catalog::sources::CatalogSources;
@@ -39,49 +80,13 @@ entry alone. Uniform and variable-length facets share the same
 `view.X()` shape; typed scalars come through `open_facet_typed`.
 
 This is the prescribed pattern — full walk-through in
-[Accessing datasets from Rust](./docs/tutorials/access-datasets-from-rust.md).
-
-## Verified against FAISS and numpy
-
-Ground truth produced by vectordata-rs is held to a numerical
-parity guarantee against the Python `knn_utils` reference (FAISS +
-numpy). Four independent KNN engines — SimSIMD (`knn-metal`), pure
-`std::arch` (`knn-stdarch`), BLAS sgemm (`knn-blas`), and FAISS
-(`knn-faiss`) — are cross-verified at the unit-test level (asserting
-*zero* differing neighbors on deterministic fixtures) and re-checked
-end-to-end before every dataset is published. See the
-[KNN engine conformance section](./docs/sysref/12-knn-utils-verification.md#127-cross-engine-conformance-testing)
-for observed numbers and the two degenerate regimes where a small
-boundary tolerance is justified.
-
-**See it live in 5 seconds** — `veks pipeline verify engine-parity`
-runs every available engine on the same fixture and prints a
-side-by-side neighbor table plus a pair-wise classification:
-
-```sh
-cargo install --features knnutils,faiss --path veks
-veks pipeline verify engine-parity --use-synthetic \
-  --dim 32 --base-count 500 --query-count 20 --neighbors 5
-```
-
-Engines you didn't compile show up as `skipped: feature not enabled`.
-Run the in-tree conformance suite as well:
-
-```sh
-cargo test -p veks-pipeline --lib pipeline::commands::compute_knn
-cargo test -p veks-pipeline --features knnutils,faiss \
-  --lib pipeline::commands::compute_knn
-cargo test -p veks-pipeline --features knnutils \
-  --lib pipeline::commands::verify_dataset_knnutils
-```
-
----
+[Accessing datasets from Rust](./vectordata/docs/access-datasets-from-rust.md).
 
 ## What's in the box
 
 **[vectordata](./vectordata/)** — the access library. Add it as a
 dependency and read any dataset from anywhere.
-([Tutorial](./docs/tutorials/access-datasets-from-rust.md) ·
+([Tutorial](./vectordata/docs/access-datasets-from-rust.md) ·
 [API Reference](./docs/sysref/02-api.md))
 
 **[veks](./veks/)** — the CLI. Bootstrap new datasets, run processing
@@ -109,38 +114,69 @@ and predicate trees.
 
 ---
 
-## Working with datasets
+## Build, analyze, and serve your own
 
-### Discover
+Finding and reading datasets (above) is the consume side. The rest of the
+toolkit lets you **make** and **host** them.
 
-```bash
-veks datasets config catalog add https://example.com/datasets/
-veks datasets list
-veks datasets ping --dataset myset
-```
-
-### Download
-
-```bash
-veks datasets prebuffer --dataset myset
-```
-
-### Analyze
-
-```bash
-veks analyze describe --source base_vectors.fvec
-veks analyze explain-predicates --ordinal 42
-veks analyze explain-filtered-knn --ordinal 42
-```
-
-### Build your own
+### Build & analyze — the `veks` CLI
 
 ```bash
 veks bootstrap -i                    # interactive wizard
-veks run dataset.yaml                # run the full pipeline
+veks run dataset.yaml                # run the full pipeline (KNN, metadata, predicates, …)
 veks check                           # verify everything
-veks publish                         # push to catalog
+veks publish                         # push to a catalog
+
+veks analyze describe --source base_vectors.fvecs
+veks analyze explain-filtered-knn --ordinal 42
 ```
+
+### Reproducible & cross-verified — the FAISS/numpy parity guarantee
+
+This is what makes a published benchmark *reproducible*. The ground truth `veks`
+produces is held to a numerical parity guarantee against the Python `knn_utils`
+reference (FAISS + numpy). Four independent KNN engines — SimSIMD (`knn-metal`),
+pure `std::arch` (`knn-stdarch`), BLAS sgemm (`knn-blas`), and FAISS
+(`knn-faiss`) — are cross-verified at the unit-test level (asserting *zero*
+differing neighbors on deterministic fixtures) and re-checked end-to-end before
+every dataset is published. See the
+[KNN engine conformance section](./docs/sysref/12-knn-utils-verification.md#127-cross-engine-conformance-testing)
+for observed numbers and the two degenerate regimes where a small boundary
+tolerance is justified.
+
+See it live in 5 seconds — every available engine on one fixture, side by side:
+
+```bash
+cargo install --features knnutils,faiss --path veks
+veks pipeline verify engine-parity --use-synthetic \
+  --dim 32 --base-count 500 --query-count 20 --neighbors 5
+```
+
+Engines you didn't compile show up as `skipped: feature not enabled`. The
+in-tree conformance suite runs the same checks:
+
+```bash
+cargo test -p veks-pipeline --features knnutils,faiss \
+  --lib pipeline::commands::compute_knn
+cargo test -p veks-pipeline --features knnutils \
+  --lib pipeline::commands::verify_dataset_knnutils
+```
+
+### Serve — the `vecd` server
+
+Self-host a private gateway that publishes datasets over (optionally
+TLS-secured) HTTP, with authentication, per-namespace access control, and
+versioned atomic uploads. A vectordata client then `config catalog add`s
+your endpoint and reads from it exactly like any other catalog.
+
+```bash
+vecd tls generate                                          # self-signed cert → HTTPS (optional)
+vecd ns add datasets --owner me --backend-config store --active
+vecd start
+vectordata datasets push ./my-dataset --to datasets       # publish; then `datasets list` finds it
+```
+
+Full walk-through: the [end-to-end vecd tutorial](./docs/tutorials/vecd-end-to-end/).
 
 ---
 
@@ -161,8 +197,8 @@ A dataset is a set of typed facets describing a vector search benchmark:
 | **O** | Oracle partitions | Per-label base vectors + partitioned KNN |
 
 Files come in three flavors: **scalar** (`.u8`, `.i32` — flat arrays),
-**uniform vector** (`.fvec`, `.ivec` — fixed dimension per record), and
-**variable-length vector** (`.ivvec` — each record has its own
+**uniform vector** (`.fvecs`, `.ivecs` — fixed dimension per record), and
+**variable-length vector** (`.ivvecs` — each record has its own
 dimension).
 
 [Data Model Reference](./docs/sysref/01-data-model.md)

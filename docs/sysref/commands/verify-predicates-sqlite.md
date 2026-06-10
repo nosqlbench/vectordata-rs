@@ -12,7 +12,7 @@ SQLite oracle verification for predicate evaluation results.
   after: [evaluate-predicates]
   metadata: profiles/base/metadata_content.u8
   predicates: profiles/base/predicates.u8
-  results: metadata_indices.ivvec
+  results: metadata_indices.ivvecs
   fields: 1
   output: "${cache}/verify_predicates_sqlite.json"
 ```

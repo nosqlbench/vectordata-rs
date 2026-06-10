@@ -435,6 +435,23 @@ enum CatalogCmd {
     List,
 }
 
+/// Tab-completion for `--to` (the push destination): the namespace names on the
+/// endpoint you're logged in to, plus `root` (the `/` namespace). A bare name is
+/// expanded to a full URL at push time. Best-effort and short-timeout: no
+/// suggestions when you're not logged in or the server is unreachable.
+fn complete_push_to(partial: &str, _ctx: &[&str]) -> Vec<String> {
+    let Ok(endpoint) = vectordata::credentials::resolve_endpoint(None) else {
+        return Vec::new();
+    };
+    let base = endpoint.trim_end_matches('/').to_string();
+    let token = vectordata::credentials::stored_token(&base);
+    let mut out = vectordata::endpoint::candidate_namespaces(&base, token.as_deref());
+    out.push("root".to_string());
+    out.into_iter()
+        .filter(|s| partial.is_empty() || s.starts_with(partial))
+        .collect()
+}
+
 fn main() {
     let spec = Cli::veks_command_spec("vectordata");
 
@@ -442,8 +459,10 @@ fn main() {
     // `_VECTORDATA_COMPLETE=…`), emit candidates and exit. The snippet from
     // `vectordata completions` re-invokes the binary with that env var set, so
     // completion logic lives in the spec rather than a frozen script.
-    let resolvers: std::collections::BTreeMap<String, veks_completion::ValueProvider> =
+    let mut resolvers: std::collections::BTreeMap<String, veks_completion::ValueProvider> =
         std::collections::BTreeMap::new();
+    // `--to` (push destination): suggest namespace URLs on the logged-in endpoint.
+    resolvers.insert("--to".to_string(), veks_completion::fn_provider(complete_push_to));
     let tree = vcli::build_completion_tree(&spec, &resolvers);
     if veks_completion::handle_complete_env("vectordata", &tree) {
         return;
@@ -552,9 +571,16 @@ fn main() {
             let code = if list {
                 vectordata::client_cli::list_logins()
             } else if let Some(url) = url {
-                vectordata::client_cli::login(
+                let code = vectordata::client_cli::login(
                     &url, user.as_deref(), token.as_deref(), password.as_deref(), expires.as_deref(),
-                )
+                );
+                // After a successful login, offer (interactively) to register the
+                // endpoint's namespaces as catalogs so `datasets list` reflects them.
+                // This is the interactive entry point — kept out of the pure handler.
+                if code == 0 {
+                    vectordata::client_cli::offer_endpoint_catalogs(&url);
+                }
+                code
             } else {
                 eprintln!("login needs a <url> (or --list)");
                 2

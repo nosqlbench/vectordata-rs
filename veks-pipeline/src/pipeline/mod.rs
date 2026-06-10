@@ -2694,7 +2694,7 @@ default:
         // IDs don't contain "partition" — those steps actually do
         // run for default and write to `profiles/default/`.
         // Partition-only templates are filtered out (regression
-        // guard for the sift1m `neighbor_distances` 403 bug); see
+        // guard for a remote dataset's `neighbor_distances` 403 bug); see
         // `test_default_profile_does_not_auto_inject_missing_facets`
         // in vectordata::dataset::profile.
         let pdef = profiles.profile("default").unwrap();

@@ -113,8 +113,8 @@ catalog or by file path.
 
 ```sh
 veks interact explore --dataset myset
-veks interact values  --source ./data/base.fvec --start 0 --digits 4
-veks interact shell   --source ./data/base.fvec "info; range 0 5"
+veks interact values  --source ./data/base.fvecs --start 0 --digits 4
+veks interact shell   --source ./data/base.fvecs "info; range 0 5"
 ```
 
 See the [Explore tutorial](../docs/tutorials/explore-vector-data.md)
@@ -127,9 +127,9 @@ Run an individual pipeline command directly, with full shell
 tab-completion. Use this when scripting outside the DAG runner.
 
 ```sh
-veks pipeline analyze stats --source=test.fvec
-veks pipeline compute knn --base=base.fvec --queries=query.fvec --k=100
-veks pipeline generate vectors --dimension=128 --count=10000 --output=base.fvec
+veks pipeline analyze stats --source=test.fvecs
+veks pipeline compute knn --base=base.fvecs --queries=query.fvecs --k=100
+veks pipeline generate vectors --dimension=128 --count=10000 --output=base.fvecs
 ```
 
 Pipeline command groups (run `veks pipeline <group> --help` for the
@@ -165,12 +165,12 @@ veks completions bash > ~/.local/share/bash-completion/completions/veks
 
 | Extension | Type | Element |
 |-----------|------|---------|
-| `.fvec` | float vectors | 4 bytes (f32) |
-| `.ivec` | integer vectors | 4 bytes (i32) |
-| `.bvec` | byte vectors | 4 bytes (u8 padded) |
-| `.dvec` | double vectors | 8 bytes (f64) |
-| `.mvec` | half-float vectors | 2 bytes (f16) |
-| `.svec` | short vectors | 2 bytes (i16) |
+| `.fvecs` | float vectors | 4 bytes (f32) |
+| `.ivecs` | integer vectors | 4 bytes (i32) |
+| `.bvecs` | byte vectors | 4 bytes (u8 padded) |
+| `.dvecs` | double vectors | 8 bytes (f64) |
+| `.mvecs` | half-float vectors | 2 bytes (f16) |
+| `.svecs` | short vectors | 2 bytes (i16) |
 | `.npy` | NumPy arrays | varies |
 | `.parquet` | Apache Parquet | varies |
 | `.slab` | slabtastic | variable-length records |

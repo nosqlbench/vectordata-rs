@@ -291,6 +291,17 @@ impl ProgressLog {
         if let Some(prov) = record.provenance.as_ref() {
             for out in &record.outputs {
                 let artifact = Path::new(&out.path);
+                // A derived sidecar (a `.mref` the merkle step just produced, or
+                // a provenance sidecar) must not itself get a provenance sidecar,
+                // or the suffixes compound — `…fvecs.provenance.json.mref.provenance.json`.
+                let is_sidecar = artifact
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(veks_core::filters::is_derived_sidecar)
+                    .unwrap_or(false);
+                if is_sidecar {
+                    continue;
+                }
                 if let Err(e) = prov.write_sidecar(artifact) {
                     log::warn!(
                         "provenance: failed to write sidecar for {}: {}",
@@ -519,6 +530,37 @@ mod tests {
         let recovered = ProvenanceMap::read_sidecar(&artifact).unwrap().unwrap();
         assert_eq!(recovered.hash(super::super::provenance::ProvenanceFlags::STRICT),
                    prov.hash(super::super::provenance::ProvenanceFlags::STRICT));
+    }
+
+    /// A derived sidecar output (a `.mref` from the merkle step, or a provenance
+    /// sidecar) must NOT itself get a provenance sidecar — otherwise suffixes
+    /// compound without bound (`…fvecs.provenance.json.mref.provenance.json`).
+    #[test]
+    fn record_step_skips_sidecar_for_derived_outputs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let prov = ProvenanceMap::build(
+            "merkle-step",
+            "merkle create",
+            &BinaryVersion::parse("1.0.0+abcd"),
+            &HashMap::new(),
+            std::collections::BTreeMap::new(),
+        );
+        for derived in ["base.fvec.mref", "base.fvec.provenance.json", "data.mrkl"] {
+            let artifact = tmp.path().join(derived);
+            std::fs::write(&artifact, b"derived").unwrap();
+            let mut r = rec(Some(prov.clone()));
+            r.outputs.push(OutputRecord {
+                path: artifact.to_string_lossy().into_owned(),
+                size: 7,
+                mtime: None,
+            });
+            let mut log = ProgressLog::new();
+            log.record_step("merkle-step", r);
+            assert!(
+                !ProvenanceMap::sidecar_path(&artifact).exists(),
+                "{derived} must not get a provenance sidecar"
+            );
+        }
     }
 
     /// Producer steps without a `ProvenanceMap` (legacy records or

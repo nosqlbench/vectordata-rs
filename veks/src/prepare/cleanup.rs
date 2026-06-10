@@ -526,50 +526,50 @@ mod tests {
     #[test]
     fn parse_simple_manifest() {
         let yaml = r#"
-sift-128:
-  - sift/sift_base.fvecs
-  - sift/sift_query.fvecs
+vecs-128:
+  - vecs/vecs_base.fvecs
+  - vecs/vecs_query.fvecs
 glove-200:
   - glove/base.fvec
 "#;
         let manifest = parse_manifest(yaml).unwrap();
         assert_eq!(manifest.len(), 2);
-        assert_eq!(manifest["sift-128"].files.len(), 2);
-        assert!(manifest["sift-128"].layout.is_empty());
+        assert_eq!(manifest["vecs-128"].files.len(), 2);
+        assert!(manifest["vecs-128"].layout.is_empty());
         assert_eq!(manifest["glove-200"].files.len(), 1);
     }
 
     #[test]
     fn parse_rich_manifest() {
         let yaml = r#"
-sift:
+vecs:
   files:
-    - sift/sift_base.fvecs
-    - sift/sift_query.fvecs
+    - vecs/vecs_base.fvecs
+    - vecs/vecs_query.fvecs
   layout:
-    sift/sift_base.fvecs: base_vectors
-    sift/sift_query.fvecs: query_vectors
+    vecs/vecs_base.fvecs: base_vectors
+    vecs/vecs_query.fvecs: query_vectors
 "#;
         let manifest = parse_manifest(yaml).unwrap();
         assert_eq!(manifest.len(), 1);
-        assert_eq!(manifest["sift"].files.len(), 2);
-        assert_eq!(manifest["sift"].layout.len(), 2);
-        assert_eq!(manifest["sift"].layout["sift/sift_base.fvecs"], "base_vectors");
+        assert_eq!(manifest["vecs"].files.len(), 2);
+        assert_eq!(manifest["vecs"].layout.len(), 2);
+        assert_eq!(manifest["vecs"].layout["vecs/vecs_base.fvecs"], "base_vectors");
     }
 
     #[test]
     fn parse_sectioned_manifest() {
         let yaml = r#"
 complete:
-  sift:
+  vecs:
     files:
-      - sift/sift_base.fvec
-      - sift/sift_query.fvec
-      - sift/sift_gt.ivec
+      - vecs/vecs_base.fvec
+      - vecs/vecs_query.fvec
+      - vecs/vecs_gt.ivec
     layout:
-      sift/sift_base.fvec: base_vectors
-      sift/sift_query.fvec: query_vectors
-      sift/sift_gt.ivec: neighbor_indices
+      vecs/vecs_base.fvec: base_vectors
+      vecs/vecs_query.fvec: query_vectors
+      vecs/vecs_gt.ivec: neighbor_indices
 incomplete:
   glove:
     files:
@@ -585,13 +585,13 @@ orphans:
         let manifest = parse_manifest(yaml).unwrap();
         // complete and incomplete sections are flattened, orphans skipped
         assert_eq!(manifest.len(), 2);
-        assert_eq!(manifest["sift"].files.len(), 3);
+        assert_eq!(manifest["vecs"].files.len(), 3);
         assert_eq!(manifest["glove"].files.len(), 1);
     }
 
     #[test]
     fn symlink_name_canonicalizes_extension() {
-        let source = Path::new("data/sift_base.fvecs");
+        let source = Path::new("data/vecs_base.fvecs");
         let stem = Path::new(source.file_name().unwrap()).file_stem().unwrap().to_string_lossy();
         let ext = source.extension()
             .and_then(|e| e.to_str())
@@ -600,7 +600,7 @@ orphans:
         let link_name = format!("_{}.{}", stem, ext);
         // `canonical_extension` normalizes to the plural form (the convention
         // this project writes), so a `.fvec` source resolves to `.fvecs`.
-        assert_eq!(link_name, "_sift_base.fvecs");
+        assert_eq!(link_name, "_vecs_base.fvecs");
     }
 
     #[test]

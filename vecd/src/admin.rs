@@ -317,6 +317,59 @@ pub fn list_roles(db: &Db) -> Result<Vec<(String, String, bool)>, VecdError> {
 
 // ── backends ────────────────────────────────────────────────────────
 
+/// Enforce the stored-endpoint invariant for a local backend: it must be
+/// `local:<absolute-dir>`, or it resolves against the serving process's CWD (or
+/// fails at open). The CLI normalizes user input via
+/// [`crate::backend::local::resolve_dir`] before persisting; this guards the
+/// persistence layer so no caller (CLI or otherwise) can store a bare/relative
+/// directory. Non-local kinds are unconstrained here.
+fn validate_local_endpoint(kind: &str, endpoint: &str) -> Result<(), VecdError> {
+    if kind != "local" {
+        return Ok(());
+    }
+    let dir = endpoint.strip_prefix("local:").filter(|d| !d.is_empty()).ok_or_else(|| {
+        VecdError::usage(format!("local backend endpoint must be local:<absolute-dir>, got '{endpoint}'"))
+    })?;
+    if !std::path::Path::new(dir).is_absolute() {
+        return Err(VecdError::usage(format!(
+            "local backend directory must be an absolute path, got '{dir}'"
+        )));
+    }
+    Ok(())
+}
+
+/// The `kind` of a backend (`local`/`s3`/`mem`), or `None` if there's no such
+/// backend. Lets the CLI decide whether to normalize a `--endpoint` as a local
+/// directory before repointing.
+pub fn backend_kind(db: &Db, name: &str) -> Result<Option<String>, VecdError> {
+    Ok(db
+        .conn()
+        .query_row("SELECT kind FROM backends WHERE name=?1", params![name], |r| r.get(0))
+        .optional()?)
+}
+
+/// Repoint an existing backend's endpoint (e.g. fix a local directory that was
+/// stored wrong). Enforces the same `local:<absolute>` invariant as
+/// [`add_backend`]; the CLI normalizes the directory first.
+pub fn set_backend_endpoint(db: &mut Db, name: &str, endpoint: &str) -> Result<(), VecdError> {
+    db.with_cp_txn(|tx| {
+        let (kind, active): (String, bool) = tx
+            .query_row(
+                "SELECT kind, active FROM backends WHERE name=?1",
+                params![name],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? != 0)),
+            )
+            .optional()?
+            .ok_or_else(|| VecdError::usage(format!("no such backend '{name}'")))?;
+        validate_local_endpoint(&kind, endpoint)?;
+        if active {
+            ensure_endpoint_free(tx, endpoint, Some(name))?;
+        }
+        tx.execute("UPDATE backends SET endpoint=?1 WHERE name=?2", params![endpoint, name])?;
+        Ok(())
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn add_backend(
     db: &mut Db,
@@ -331,6 +384,7 @@ pub fn add_backend(
     if !["local", "s3", "mem"].contains(&kind) {
         return Err(VecdError::usage(format!("unknown backend kind '{kind}' (local|s3|mem)")));
     }
+    validate_local_endpoint(kind, endpoint)?;
     db.with_cp_txn(|tx| {
         if active {
             ensure_endpoint_free(tx, endpoint, None)?;

@@ -116,8 +116,8 @@ fn load_dataset_metadata(root: &Path) -> IndexMap<String, String> {
 ///
 /// First tries an exact match, then normalizes both names (strip sizes,
 /// collapse delimiters, lowercase) to find a base-identity match. E.g.
-/// group `ada-002-100000` matches metadata key `ada002-100k` because
-/// both normalize to `ada002`.
+/// group `emb-002-100000` matches metadata key `emb002-100k` because
+/// both normalize to `emb002`.
 fn lookup_similarity(name: &str, metadata: &IndexMap<String, String>) -> Option<String> {
     // Exact match
     if let Some(sf) = metadata.get(name) {
@@ -138,9 +138,9 @@ fn lookup_similarity(name: &str, metadata: &IndexMap<String, String>) -> Option<
 /// Normalize a dataset name for fuzzy matching: lowercase, strip size
 /// tokens, strip version fragments, and remove delimiters.
 ///
-/// E.g. "ada-002-100000" → "ada002", "ada002-100k" → "ada002",
-/// "cohere-english-v3-0-1024-100000" → "cohereenglishv301024",
-/// "cohere-english-v3-100k" → "cohereenglishv3"
+/// E.g. "emb-002-100000" → "emb002", "emb002-100k" → "emb002",
+/// "emb-english-v3-0-1024-100000" → "embenglishv301024",
+/// "emb-english-v3-100k" → "embenglishv3"
 fn normalize_for_match(name: &str) -> String {
     name.to_lowercase()
         .split(|c: char| c == '-' || c == '_' || c == '.')
@@ -210,7 +210,7 @@ pub fn run(args: InferManifestArgs) {
     // For groups with base+query but no ground truth, look for groups in the
     // same directory that have ground truth (ivec) but no base vectors.
     // This handles the common pattern where gt files have a different prefix
-    // (e.g. "dpr_1m_gt..." vs "c4-en_base..." in the same directory).
+    // (e.g. "retr_1m_gt..." vs "corpus-en_base..." in the same directory).
     merge_within_directories(&mut raw_groups);
 
     // Classify groups into complete, incomplete, and orphan
@@ -372,7 +372,7 @@ fn split_by_size(
 ///
 /// Returns the first size token that appears *before* the first role
 /// keyword in the filename. This position distinguishes dataset sizes
-/// (e.g. `ada_002_100000_base_vectors`) from per-role counts that
+/// (e.g. `emb_002_100000_base_vectors`) from per-role counts that
 /// appear after the role keyword (e.g. `_query_vectors_10000`).
 ///
 /// When a file has a size token only *after* the role keyword (like
@@ -683,12 +683,12 @@ fn is_noise_token(token: &str) -> bool {
 /// (e.g. base has 1000000, query has 10000).
 ///
 /// Examples:
-/// - `data/sift/sift_base.fvecs` → `sift`
+/// - `data/vecs/vecs_base.fvecs` → `vecs`
 /// - `embeddings/glove-200_query_vectors.fvec` → `glove-200`
-/// - `deep1b/base.fvec` → `deep1b` (falls back to parent dir)
-/// - `wiki/ada_002_100000_base_vectors.fvec` → `ada-002`
-/// - `cohere/cohere_wiki_en_flat_base_1m_norm.fvecs` → `cohere-wiki-en`
-/// - `wiki/100k/cohere_embed-english-v3.0_1024_base_vectors_100000.fvec` → `cohere-english-v3-0-1024`
+/// - `bigset1b/base.fvec` → `bigset1b` (falls back to parent dir)
+/// - `corpus/emb_002_100000_base_vectors.fvec` → `emb-002`
+/// - `embset/emb_wiki_en_flat_base_1m_norm.fvecs` → `emb-wiki-en`
+/// - `corpus/100k/emb_embed-english-v3.0_1024_base_vectors_100000.fvec` → `emb-english-v3-0-1024`
 fn infer_dataset_name(path: &Path) -> String {
     let stem = path.file_stem()
         .map(|s| s.to_string_lossy().to_lowercase())
@@ -787,71 +787,71 @@ mod tests {
 
     #[test]
     fn infer_name_strips_role_tokens() {
-        assert_eq!(infer_dataset_name(Path::new("data/sift_base.fvec")), "sift");
-        assert_eq!(infer_dataset_name(Path::new("data/sift_query.fvec")), "sift");
-        assert_eq!(infer_dataset_name(Path::new("data/sift_base_vectors.fvec")), "sift");
+        assert_eq!(infer_dataset_name(Path::new("data/vecs_base.fvec")), "vecs");
+        assert_eq!(infer_dataset_name(Path::new("data/vecs_query.fvec")), "vecs");
+        assert_eq!(infer_dataset_name(Path::new("data/vecs_base_vectors.fvec")), "vecs");
     }
 
     #[test]
     fn infer_name_preserves_dataset_identifiers() {
         assert_eq!(infer_dataset_name(Path::new("x/glove-200_base.fvec")), "glove-200");
-        assert_eq!(infer_dataset_name(Path::new("x/deep1b_query_vectors.mvec")), "deep1b");
+        assert_eq!(infer_dataset_name(Path::new("x/bigset1b_query_vectors.mvec")), "bigset1b");
     }
 
     #[test]
     fn infer_name_falls_back_to_parent_dir() {
-        assert_eq!(infer_dataset_name(Path::new("sift/base_vectors.fvec")), "sift");
+        assert_eq!(infer_dataset_name(Path::new("vecs/base_vectors.fvec")), "vecs");
         assert_eq!(infer_dataset_name(Path::new("mydata/query.fvec")), "mydata");
     }
 
     #[test]
     fn infer_name_falls_back_past_numeric_dirs() {
         assert_eq!(
-            infer_dataset_name(Path::new("wikipedia_squad/100k/base_vectors.fvec")),
-            "wikipedia_squad"
+            infer_dataset_name(Path::new("embset_corpus/100k/base_vectors.fvec")),
+            "embset_corpus"
         );
     }
 
     #[test]
     fn infer_name_strips_underscore_prefix() {
-        assert_eq!(infer_dataset_name(Path::new("data/_sift_base.fvec")), "sift");
+        assert_eq!(infer_dataset_name(Path::new("data/_vecs_base.fvec")), "vecs");
     }
 
     #[test]
     fn infer_name_multi_token_dataset() {
         assert_eq!(
-            infer_dataset_name(Path::new("x/ann_sift_128_base.fvec")),
-            "ann-sift-128"
+            infer_dataset_name(Path::new("x/ann_vecs_128_base.fvec")),
+            "ann-vecs-128"
         );
     }
 
-    // ── Tests from jvector MultiFileDatasource naming patterns ──────
+    // ── Tests from multi-file datasource naming patterns ───────────
 
     #[test]
     fn infer_name_strips_counts() {
         assert_eq!(
-            infer_dataset_name(Path::new("wiki/ada_002_100000_base_vectors.fvec")),
-            "ada-002"
+            infer_dataset_name(Path::new("corpus/emb_002_100000_base_vectors.fvec")),
+            "emb-002"
         );
         assert_eq!(
-            infer_dataset_name(Path::new("wiki/ada_002_100000_query_vectors_10000.fvec")),
-            "ada-002"
+            infer_dataset_name(Path::new("corpus/emb_002_100000_query_vectors_10000.fvec")),
+            "emb-002"
         );
         assert_eq!(
-            infer_dataset_name(Path::new("wiki/ada_002_100000_indices_query_10000.ivec")),
-            "ada-002"
+            infer_dataset_name(Path::new("corpus/emb_002_100000_indices_query_10000.ivec")),
+            "emb-002"
         );
     }
 
     #[test]
     fn infer_name_strips_qualifiers() {
         assert_eq!(
-            infer_dataset_name(Path::new("cohere/cohere_wiki_en_flat_base_1m_norm.fvecs")),
-            "cohere-wiki-en"
+            infer_dataset_name(Path::new("embset/emb_wiki_en_flat_base_1m_norm.fvecs")),
+            "emb-wiki-en"
         );
         assert_eq!(
-            infer_dataset_name(Path::new("cohere/cohere_wiki_en_flat_query_10k_norm.fvecs")),
-            "cohere-wiki-en"
+            infer_dataset_name(Path::new("embset/emb_wiki_en_flat_query_10k_norm.fvecs")),
+            "emb-wiki-en"
         );
     }
 
@@ -859,51 +859,51 @@ mod tests {
     fn infer_name_strips_metric_tokens() {
         // "ip" (inner product) should be stripped as a qualifier
         assert_eq!(
-            infer_dataset_name(Path::new("dpr/dpr_1m_gt_norm_ip_k100.ivecs")),
-            "dpr"
+            infer_dataset_name(Path::new("retr/retr_1m_gt_norm_ip_k100.ivecs")),
+            "retr"
         );
     }
 
     #[test]
-    fn infer_name_cohere_embed_model() {
+    fn infer_name_embed_model() {
         assert_eq!(
-            infer_dataset_name(Path::new("wiki/100k/cohere_embed-english-v3.0_1024_base_vectors_100000.fvec")),
-            "cohere-english-v3-0-1024"
+            infer_dataset_name(Path::new("corpus/100k/emb_embed-english-v3.0_1024_base_vectors_100000.fvec")),
+            "emb-english-v3-0-1024"
         );
         assert_eq!(
-            infer_dataset_name(Path::new("wiki/100k/cohere_embed-english-v3.0_1024_query_vectors_10000.fvec")),
-            "cohere-english-v3-0-1024"
+            infer_dataset_name(Path::new("corpus/100k/emb_embed-english-v3.0_1024_query_vectors_10000.fvec")),
+            "emb-english-v3-0-1024"
         );
         assert_eq!(
-            infer_dataset_name(Path::new("wiki/100k/cohere_embed-english-v3.0_1024_indices_b100000_q10000_k100.ivec")),
-            "cohere-english-v3-0-1024"
+            infer_dataset_name(Path::new("corpus/100k/emb_embed-english-v3.0_1024_indices_b100000_q10000_k100.ivec")),
+            "emb-english-v3-0-1024"
         );
     }
 
     #[test]
-    fn infer_name_gecko_model() {
+    fn infer_name_two_token_model() {
         assert_eq!(
-            infer_dataset_name(Path::new("wiki/1M/textembedding-gecko_1000000_base_vectors.fvec")),
-            "textembedding-gecko"
+            infer_dataset_name(Path::new("corpus/1M/textembedding-emb_1000000_base_vectors.fvec")),
+            "textembedding-emb"
         );
         assert_eq!(
-            infer_dataset_name(Path::new("wiki/1M/textembedding-gecko_1000000_query_vectors_10000.fvec")),
-            "textembedding-gecko"
+            infer_dataset_name(Path::new("corpus/1M/textembedding-emb_1000000_query_vectors_10000.fvec")),
+            "textembedding-emb"
         );
     }
 
     #[test]
     fn infer_name_degen() {
         assert_eq!(
-            infer_dataset_name(Path::new("ada-degen/degen_base_vectors.fvec")),
+            infer_dataset_name(Path::new("emb-degen/degen_base_vectors.fvec")),
             "degen"
         );
         assert_eq!(
-            infer_dataset_name(Path::new("ada-degen/degen_query_vectors.fvec")),
+            infer_dataset_name(Path::new("emb-degen/degen_query_vectors.fvec")),
             "degen"
         );
         assert_eq!(
-            infer_dataset_name(Path::new("ada-degen/degen_ground_truth.ivec")),
+            infer_dataset_name(Path::new("emb-degen/degen_ground_truth.ivec")),
             "degen"
         );
     }
@@ -911,41 +911,41 @@ mod tests {
     #[test]
     fn infer_name_cap_dataset() {
         assert_eq!(
-            infer_dataset_name(Path::new("cap/Caselaw_gte-Qwen2-1.5B_embeddings_base_1m_norm_shuffle.fvecs")),
-            "caselaw-gte-qwen2-1-5b"
+            infer_dataset_name(Path::new("cap/Corpus_emb-model2-1.5B_embeddings_base_1m_norm_shuffle.fvecs")),
+            "corpus-emb-model2-1-5b"
         );
         assert_eq!(
-            infer_dataset_name(Path::new("cap/Caselaw_gte-Qwen2-1.5B_embeddings_query_10k_norm_shuffle.fvecs")),
-            "caselaw-gte-qwen2-1-5b"
+            infer_dataset_name(Path::new("cap/Corpus_emb-model2-1.5B_embeddings_query_10k_norm_shuffle.fvecs")),
+            "corpus-emb-model2-1-5b"
         );
     }
 
     #[test]
-    fn infer_name_dpr_dataset() {
+    fn infer_name_split_prefix_dataset() {
         assert_eq!(
-            infer_dataset_name(Path::new("dpr/c4-en_base_1M_norm_files0_2.fvecs")),
-            "c4-en"
+            infer_dataset_name(Path::new("retr/corpus-en_base_1M_norm_files0_2.fvecs")),
+            "corpus-en"
         );
         assert_eq!(
-            infer_dataset_name(Path::new("dpr/c4-en_query_10k_norm_files0_1.fvecs")),
-            "c4-en"
+            infer_dataset_name(Path::new("retr/corpus-en_query_10k_norm_files0_1.fvecs")),
+            "corpus-en"
         );
     }
 
-    // ── Cross-prefix merge test (DPR/CAP pattern) ──────────────────
+    // ── Cross-prefix merge test (split-prefix gt pattern) ──────────
 
     #[test]
-    fn dpr_gt_different_prefix_merges_into_base_group() {
-        // DPR pattern: base/query are "c4-en", gt is "dpr" — same directory
-        // After name inference: two groups: c4-en (base+query) and dpr (gt)
-        // Merge should combine them.
-        let base = PathBuf::from("/data/dpr/c4-en_base_1M_norm_files0_2.fvecs");
-        let query = PathBuf::from("/data/dpr/c4-en_query_10k_norm_files0_1.fvecs");
-        let gt = PathBuf::from("/data/dpr/dpr_1m_gt_norm_ip_k100.ivecs");
+    fn gt_different_prefix_merges_into_base_group() {
+        // Split-prefix pattern: base/query are "corpus-en", gt is "retr" —
+        // same directory. After name inference: two groups: corpus-en
+        // (base+query) and retr (gt). Merge should combine them.
+        let base = PathBuf::from("/data/retr/corpus-en_base_1M_norm_files0_2.fvecs");
+        let query = PathBuf::from("/data/retr/corpus-en_query_10k_norm_files0_1.fvecs");
+        let gt = PathBuf::from("/data/retr/retr_1m_gt_norm_ip_k100.ivecs");
 
         let mut groups = vec![
             RawGroup {
-                name: "c4-en".to_string(),
+                name: "corpus-en".to_string(),
                 files: vec![
                     (base.clone(), VecFormat::Fvec),
                     (query.clone(), VecFormat::Fvec),
@@ -958,7 +958,7 @@ mod tests {
                 },
             },
             RawGroup {
-                name: "dpr".to_string(),
+                name: "retr".to_string(),
                 files: vec![(gt.clone(), VecFormat::Ivec)],
                 roles: wizard::DetectedRoles {
                     neighbor_indices: Some(gt),
@@ -971,7 +971,7 @@ mod tests {
 
         // Should have merged into one group
         assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].name, "c4-en");
+        assert_eq!(groups[0].name, "corpus-en");
         assert_eq!(groups[0].files.len(), 3);
         assert!(groups[0].roles.base_vectors.is_some());
         assert!(groups[0].roles.query_vectors.is_some());
@@ -979,19 +979,19 @@ mod tests {
     }
 
     #[test]
-    fn cap_gt_merges_by_size_token() {
-        // CAP pattern: base/query are "caselaw-gte-qwen2-1-5b" with 1m,
-        // gt is "cap" with 1m — should match by size token.
-        let base = PathBuf::from("/data/cap/Caselaw_base_1m.fvecs");
-        let query = PathBuf::from("/data/cap/Caselaw_query_10k.fvecs");
-        let base_6m = PathBuf::from("/data/cap/Caselaw_base_6m.fvecs");
-        let query_6m = PathBuf::from("/data/cap/Caselaw_query_6m_10k.fvecs");
-        let gt_1m = PathBuf::from("/data/cap/cap_1m_gt.ivecs");
-        let gt_6m = PathBuf::from("/data/cap/cap_6m_gt.ivecs");
+    fn split_prefix_gt_merges_by_size_token() {
+        // Split-prefix pattern: base/query are "corpus" with 1m,
+        // gt is "gtx" with 1m — should match by size token.
+        let base = PathBuf::from("/data/gtx/Corpus_base_1m.fvecs");
+        let query = PathBuf::from("/data/gtx/Corpus_query_10k.fvecs");
+        let base_6m = PathBuf::from("/data/gtx/Corpus_base_6m.fvecs");
+        let query_6m = PathBuf::from("/data/gtx/Corpus_query_6m_10k.fvecs");
+        let gt_1m = PathBuf::from("/data/gtx/gtx_1m_gt.ivecs");
+        let gt_6m = PathBuf::from("/data/gtx/gtx_6m_gt.ivecs");
 
         let mut groups = vec![
             RawGroup {
-                name: "caselaw".to_string(),
+                name: "corpus".to_string(),
                 files: vec![
                     (base.clone(), VecFormat::Fvec),
                     (query.clone(), VecFormat::Fvec),
@@ -1003,7 +1003,7 @@ mod tests {
                 },
             },
             RawGroup {
-                name: "caselaw-6m".to_string(),
+                name: "corpus-6m".to_string(),
                 files: vec![
                     (base_6m.clone(), VecFormat::Fvec),
                     (query_6m.clone(), VecFormat::Fvec),
@@ -1015,7 +1015,7 @@ mod tests {
                 },
             },
             RawGroup {
-                name: "cap".to_string(),
+                name: "gtx".to_string(),
                 files: vec![
                     (gt_1m.clone(), VecFormat::Ivec),
                     (gt_6m.clone(), VecFormat::Ivec),
@@ -1031,7 +1031,7 @@ mod tests {
 
         merge_within_directories(&mut groups);
 
-        // The 1:many case won't merge perfectly (cap group has 2 files
+        // The 1:many case won't merge perfectly (gtx group has 2 files
         // but only 1 detected as neighbor_indices due to ambiguity).
         // The simple 1:1 case is tested above. This test just verifies
         // the multi-way merge doesn't panic or corrupt data.
@@ -1041,16 +1041,16 @@ mod tests {
     #[test]
     fn split_by_size_creates_subgroups() {
         let files = vec![
-            (PathBuf::from("cap/base_1m.fvecs"), VecFormat::Fvec),
-            (PathBuf::from("cap/base_6m.fvecs"), VecFormat::Fvec),
-            (PathBuf::from("cap/query_10k.fvecs"), VecFormat::Fvec),  // shared (no base/gt keyword)
+            (PathBuf::from("gtx/base_1m.fvecs"), VecFormat::Fvec),
+            (PathBuf::from("gtx/base_6m.fvecs"), VecFormat::Fvec),
+            (PathBuf::from("gtx/query_10k.fvecs"), VecFormat::Fvec),  // shared (no base/gt keyword)
         ];
-        let result = split_by_size("caselaw", &files);
+        let result = split_by_size("corpus", &files);
         assert_eq!(result.len(), 2);
         // Each sub-group should have the base + shared query
         let names: Vec<&str> = result.iter().map(|(n, _)| n.as_str()).collect();
-        assert!(names.contains(&"caselaw-1m"));
-        assert!(names.contains(&"caselaw-6m"));
+        assert!(names.contains(&"corpus-1m"));
+        assert!(names.contains(&"corpus-6m"));
         for (_, sub_files) in &result {
             assert_eq!(sub_files.len(), 2); // base + shared query
         }
@@ -1062,14 +1062,14 @@ mod tests {
             (PathBuf::from("x/base_1m.fvec"), VecFormat::Fvec),
             (PathBuf::from("x/query.fvec"), VecFormat::Fvec),
         ];
-        let result = split_by_size("sift", &files);
+        let result = split_by_size("vecs", &files);
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].0, "sift");
+        assert_eq!(result[0].0, "vecs");
     }
 
     #[test]
     fn extract_size_from_various_roles() {
-        // Size AFTER base/gt keyword (DPR/CAP pattern)
+        // Size AFTER base/gt keyword (split-prefix pattern)
         assert_eq!(
             extract_size_token(Path::new("x/base_1m.fvec")),
             Some("1m".to_string())
@@ -1078,17 +1078,17 @@ mod tests {
             extract_size_token(Path::new("x/gt_10m.ivec")),
             Some("10m".to_string())
         );
-        // Size BEFORE role keyword (astra-vector pattern)
+        // Size BEFORE role keyword (size-prefixed pattern)
         assert_eq!(
-            extract_size_token(Path::new("x/ada_002_100000_base_vectors.fvec")),
+            extract_size_token(Path::new("x/emb_002_100000_base_vectors.fvec")),
             Some("100000".to_string())
         );
         assert_eq!(
-            extract_size_token(Path::new("x/ada_002_100000_query_vectors_10000.fvec")),
+            extract_size_token(Path::new("x/emb_002_100000_query_vectors_10000.fvec")),
             Some("100000".to_string())
         );
         assert_eq!(
-            extract_size_token(Path::new("x/ada_002_100000_indices_query_10000.ivec")),
+            extract_size_token(Path::new("x/emb_002_100000_indices_query_10000.ivec")),
             Some("100000".to_string())
         );
         // Query with size only AFTER keyword → None (shared)
@@ -1098,11 +1098,11 @@ mod tests {
         );
         // Indices/distances: extract from b-prefix
         assert_eq!(
-            extract_size_token(Path::new("x/cohere_indices_b100000_q10000_k100.ivec")),
+            extract_size_token(Path::new("x/embset_indices_b100000_q10000_k100.ivec")),
             Some("100000".to_string())
         );
         assert_eq!(
-            extract_size_token(Path::new("x/cohere_distances_b1000000_q10000_k100.fvec")),
+            extract_size_token(Path::new("x/embset_distances_b1000000_q10000_k100.fvec")),
             Some("1000000".to_string())
         );
         // No size at all → None
@@ -1128,7 +1128,7 @@ mod tests {
         assert!(!is_count_or_noise_token("128"));
         assert!(!is_count_or_noise_token("1024"));
         assert!(!is_count_or_noise_token("v3"));
-        assert!(!is_count_or_noise_token("sift"));
+        assert!(!is_count_or_noise_token("vecs"));
         assert!(!is_count_or_noise_token("002"));
         assert!(!is_count_or_noise_token("5b"));
         assert!(!is_count_or_noise_token("1"));
@@ -1142,6 +1142,6 @@ mod tests {
         assert!(is_size_token("100k"));
         assert!(is_size_token("1000000"));
         assert!(!is_size_token("128"));
-        assert!(!is_size_token("sift"));
+        assert!(!is_size_token("vecs"));
     }
 }

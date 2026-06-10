@@ -116,7 +116,7 @@ Resolution rules:
   each alias in declaration order. The legacy `filtered_*` alias is
   the last fallback for F, so an existing dataset.yaml referencing
   `filtered_neighbor_indices` keeps working without edits.
-- The wizard / file-pattern inference recognises `filtered_*.ivec` files
+- The wizard / file-pattern inference recognises `filtered_*.ivecs` files
   during dataset discovery and emits a deprecation note suggesting the
   user re-run with the new canonical names.
 
@@ -141,17 +141,17 @@ helper). They do **not** refuse to read the file; the rename is opt-in.
 ```yaml
 profiles:
   default:
-    base_vectors: profiles/default/base_vectors.fvec
-    query_vectors: profiles/default/query_vectors.fvec
+    base_vectors: profiles/default/base_vectors.fvecs
+    query_vectors: profiles/default/query_vectors.fvecs
     predicates: profiles/default/predicates.slab
     metadata_content: profiles/default/metadata_content.u8
-    metadata_indices: profiles/default/metadata_indices.ivvec     # R
-    neighbor_indices: profiles/default/neighbor_indices.ivec      # G
-    neighbor_distances: profiles/default/neighbor_distances.fvec  # D
-    prefiltered_neighbor_indices:   profiles/default/prefiltered_neighbor_indices.ivec    # F (ACORN G_K)
-    prefiltered_neighbor_distances: profiles/default/prefiltered_neighbor_distances.fvec
-    postfiltered_neighbor_indices:  profiles/default/postfiltered_neighbor_indices.ivec   # E (G ∩ R)
-    postfiltered_neighbor_distances: profiles/default/postfiltered_neighbor_distances.fvec
+    metadata_indices: profiles/default/metadata_indices.ivvecs     # R
+    neighbor_indices: profiles/default/neighbor_indices.ivecs      # G
+    neighbor_distances: profiles/default/neighbor_distances.fvecs  # D
+    prefiltered_neighbor_indices:   profiles/default/prefiltered_neighbor_indices.ivecs    # F (ACORN G_K)
+    prefiltered_neighbor_distances: profiles/default/prefiltered_neighbor_distances.fvecs
+    postfiltered_neighbor_indices:  profiles/default/postfiltered_neighbor_indices.ivecs   # E (G ∩ R)
+    postfiltered_neighbor_distances: profiles/default/postfiltered_neighbor_distances.fvecs
 ```
 
 ## 4. Relationship to the current implementation

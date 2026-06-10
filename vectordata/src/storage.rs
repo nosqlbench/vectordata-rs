@@ -190,10 +190,10 @@ pub(crate) struct LayoutChoice {
 /// dataset directory naturally).
 ///
 /// Examples:
-///   - `https://example.com/datasets/sift1m/base.fvec`
-///     → dataset_dir: `<cache>/example.com/datasets/sift1m`
+///   - `https://example.com/datasets/vecs1m/base.fvec`
+///     → dataset_dir: `<cache>/example.com/datasets/vecs1m`
 ///     → file_relpath: `base.fvec`
-///     → origin: `https://example.com/datasets/sift1m/`
+///     → origin: `https://example.com/datasets/vecs1m/`
 ///   - `https://example.com/data.fvec`
 ///     → dataset_dir: `<cache>/example.com`
 ///     → file_relpath: `data.fvec`
@@ -431,7 +431,7 @@ impl Storage {
     /// published `.mref`. Crate-internal; callers go through
     /// `open_url` so the fallback path runs uniformly.
     pub(crate) fn open_url_cached(url: Url, layout: &LayoutChoice) -> io::Result<Self> {
-        let client = crate::transport::shared_client();
+        let client = crate::transport::shared_client_for(url.as_str());
         let mref_url_str = format!("{}.mref", url.as_str());
         let mref_url = Url::parse(&mref_url_str)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("invalid mref URL: {e}")))?;

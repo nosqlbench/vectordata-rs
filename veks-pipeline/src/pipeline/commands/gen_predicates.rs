@@ -1721,7 +1721,7 @@ mod tests {
     ///
     /// This is the gate that catches:
     /// - serde variant-ambiguity regressions (the
-    ///   `QuantileSketch`-as-`ExactExtrema` bug from the laion run),
+    ///   `QuantileSketch`-as-`ExactExtrema` bug from a production run),
     /// - field-selection bias that locks out an entire predicate
     ///   family (the previous fixed-score numeric dominance),
     /// - measure-routing breakage in the template synthesis layer.
@@ -2520,7 +2520,7 @@ source: "{}"
     /// emissions on a text-heavy corpus, MATCHES predicates
     /// must produce at least 3 distinct patterns. The old
     /// argmin picker would produce 1 (the symptom that
-    /// surfaced on the laion400b dataset).
+    /// surfaced on a large production dataset).
     #[test]
     fn matches_predicates_have_diversity_across_emissions() {
         use veks_core::formats::pnode::{Comparand, OpType, PNode};

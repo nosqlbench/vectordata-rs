@@ -69,7 +69,7 @@ pub fn run_via_catalog(catalog: &Catalog, dataset_name: &str, profile_name: &str
 }
 
 /// Split `<dataset>[:<profile>]`. Profile defaults to `default`,
-/// including the bare-trailing-colon case (`sift1m:` → `sift1m` +
+/// including the bare-trailing-colon case (`myset:` → `myset` +
 /// `default`) so a stray keystroke doesn't produce a dataset name
 /// with a useless trailing `:` that no catalog lookup resolves.
 #[cfg(any(feature = "cli", test))]
@@ -163,12 +163,12 @@ mod tests {
 
     #[test]
     fn split_spec_defaults_to_default_profile() {
-        assert_eq!(split_spec("sift1m"), ("sift1m".to_string(), "default".to_string()));
+        assert_eq!(split_spec("myset"), ("myset".to_string(), "default".to_string()));
     }
 
     #[test]
     fn split_spec_honours_explicit_profile() {
-        assert_eq!(split_spec("sift1m:1m"), ("sift1m".to_string(), "1m".to_string()));
+        assert_eq!(split_spec("myset:1m"), ("myset".to_string(), "1m".to_string()));
     }
 
     /// Bare trailing colon falls back to the default profile rather
@@ -176,6 +176,6 @@ mod tests {
     /// resolve.
     #[test]
     fn split_spec_empty_profile_after_colon_is_default() {
-        assert_eq!(split_spec("sift1m:"), ("sift1m".to_string(), "default".to_string()));
+        assert_eq!(split_spec("myset:"), ("myset".to_string(), "default".to_string()));
     }
 }

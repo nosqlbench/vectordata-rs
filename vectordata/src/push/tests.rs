@@ -442,6 +442,43 @@ fn no_destination_is_refused() {
     assert!(matches!(err, Failure::Usage(m) if m.contains("no destination")));
 }
 
+#[cfg(feature = "cli")]
+#[test]
+fn build_to_url_resolves_namespace_shorthands() {
+    let nss = vec![
+        "datasets/glove".to_string(),
+        "general".to_string(),
+        "experiments/glove".to_string(),
+    ];
+    let b = |to: &str| super::build_to_url("http://h:8443", "toy", to, &nss);
+
+    // `root` / `/` → the root namespace (no namespace segment).
+    assert_eq!(b("root").unwrap(), "http://h:8443/toy/");
+    assert_eq!(b("/").unwrap(), "http://h:8443/toy/");
+
+    // Exact full-path match.
+    assert_eq!(b("general").unwrap(), "http://h:8443/general/toy/");
+    assert_eq!(b("datasets/glove").unwrap(), "http://h:8443/datasets/glove/toy/");
+
+    // Ambiguous last-segment (`glove` matches two) → error.
+    assert!(b("glove").unwrap_err().contains("ambiguous"));
+
+    // Unknown name → error listing what's available.
+    let err = b("nope").unwrap_err();
+    assert!(err.contains("no writable namespace 'nope'") && err.contains("general"), "{err}");
+}
+
+#[cfg(feature = "cli")]
+#[test]
+fn build_to_url_unique_last_segment_resolves() {
+    let nss = vec!["datasets/glove".to_string(), "general".to_string()];
+    // `glove` matches only datasets/glove → resolves to its full path.
+    assert_eq!(
+        super::build_to_url("http://h:8443/", "toy", "glove", &nss).unwrap(),
+        "http://h:8443/datasets/glove/toy/"
+    );
+}
+
 #[test]
 fn existing_binding_is_used_without_to() {
     let src = unique("bind-src");
@@ -678,13 +715,57 @@ fn real_midupload_failure_leaves_resumable_tombstone() {
 
 #[cfg(unix)]
 #[test]
-fn scan_refuses_symlinks() {
+fn scan_follows_file_symlinks() {
+    // A symlink to a regular file is published as that file's content under the
+    // link's own name — followed, not refused.
     let src = unique("symlink-src");
-    let remote = unique("symlink-remote");
     make_dataset(&src);
     std::os::unix::fs::symlink(src.join("base.fvec"), src.join("link.fvec")).unwrap();
-    let err = execute(&opts(&src, &remote)).expect_err("symlink must be refused");
-    assert!(matches!(err, Failure::Usage(m) if m.contains("symbolic link")));
+    let scan = super::plan::scan(&src).expect("a file symlink is followed, not refused");
+    assert!(
+        scan.files.iter().any(|f| f == "link.fvec"),
+        "symlinked file should publish under its link name: {:?}",
+        scan.files
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn scan_refuses_dir_and_broken_symlinks() {
+    let src = unique("symlink-bad-src");
+    make_dataset(&src);
+    // Symlink to a directory → refused (can't be a "whole file").
+    std::fs::create_dir_all(src.join("realdir")).unwrap();
+    std::fs::write(src.join("realdir/x.fvec"), b"x").unwrap();
+    std::os::unix::fs::symlink(src.join("realdir"), src.join("dirlink")).unwrap();
+    let err = super::plan::scan(&src).expect_err("dir symlink refused");
+    assert!(err.contains("symlink to a directory"), "{err}");
+    std::fs::remove_file(src.join("dirlink")).unwrap();
+
+    // Broken symlink → refused.
+    std::os::unix::fs::symlink(src.join("does-not-exist"), src.join("broken.fvec")).unwrap();
+    let err2 = super::plan::scan(&src).expect_err("broken symlink refused");
+    assert!(err2.contains("broken symbolic link"), "{err2}");
+}
+
+#[test]
+fn scan_excludes_hidden_scratch_and_temp() {
+    // Push honors the same `filters` rules as `veks publish`: hidden/scratch
+    // files & dirs, temp/partial artifacts — never shipped.
+    let src = unique("filter-src");
+    make_dataset(&src);
+    std::fs::write(src.join(".hidden"), b"x").unwrap();
+    std::fs::write(src.join("_scratch.fvec"), b"x").unwrap();
+    std::fs::write(src.join("data.tmp"), b"x").unwrap();
+    std::fs::create_dir_all(src.join(".git")).unwrap();
+    std::fs::write(src.join(".git/config"), b"x").unwrap();
+
+    let scan = super::plan::scan(&src).unwrap();
+    assert!(!scan.files.iter().any(|f| f.contains(".hidden")), "{:?}", scan.files);
+    assert!(!scan.files.iter().any(|f| f.contains("_scratch")), "{:?}", scan.files);
+    assert!(!scan.files.iter().any(|f| f.ends_with(".tmp")), "{:?}", scan.files);
+    assert!(!scan.files.iter().any(|f| f.contains(".git")), "{:?}", scan.files);
+    assert!(scan.files.iter().any(|f| f == "base.fvec"), "real content kept: {:?}", scan.files);
 }
 
 #[cfg(unix)]

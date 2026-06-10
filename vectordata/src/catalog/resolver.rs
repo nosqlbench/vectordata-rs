@@ -542,10 +542,21 @@ fn dir_name_of_path(path: &str) -> String {
 /// `s3://bucket/key` is rewritten via `normalize_remote_url` to the
 /// virtual-hosted HTTPS endpoint before the wire.
 fn fetch_http(url: &str) -> Result<String, String> {
-    let client = crate::transport::shared_client();
+    let client = crate::transport::shared_client_for(url);
     let normalized = crate::transport::normalize_remote_url(url);
 
-    let response = client.get(normalized.as_ref()).send()
+    let mut rb = client.get(normalized.as_ref());
+    // Authenticate the catalog fetch with the SAME resolution as data reads
+    // (`apply_read_auth`/`resolve_read_token`): `$VECTORDATA_TOKEN`, else the
+    // login-stored credential keyed by origin. So a catalog and the datasets it
+    // points at authenticate identically — private vecd namespaces are
+    // fetchable, not just public-read ones.
+    if let Ok(parsed) = url::Url::parse(url) {
+        if let Some(token) = crate::credentials::resolve_read_token(&parsed) {
+            rb = rb.bearer_auth(token);
+        }
+    }
+    let response = rb.send()
         .map_err(|e| format!("HTTP request to {} failed: {}", url, e))?;
 
     let status = response.status();
@@ -656,13 +667,13 @@ mod tests {
     fn test_find_exact() {
         let catalog = Catalog {
             entries: vec![
-                make_entry("sift-128", &["default"]),
+                make_entry("vecs-128", &["default"]),
                 make_entry("glove-100", &["default", "10m"]),
             ],
         };
 
-        assert!(catalog.find_exact("sift-128").is_some());
-        assert!(catalog.find_exact("SIFT-128").is_some()); // case insensitive
+        assert!(catalog.find_exact("vecs-128").is_some());
+        assert!(catalog.find_exact("VECS-128").is_some()); // case insensitive
         assert!(catalog.find_exact("nonexistent").is_none());
     }
 
@@ -670,13 +681,13 @@ mod tests {
     fn test_match_glob() {
         let catalog = Catalog {
             entries: vec![
-                make_entry("sift-128", &["default"]),
-                make_entry("sift-256", &["default"]),
+                make_entry("vecs-128", &["default"]),
+                make_entry("vecs-256", &["default"]),
                 make_entry("glove-100", &["default"]),
             ],
         };
 
-        let matches = catalog.match_glob("sift-*");
+        let matches = catalog.match_glob("vecs-*");
         assert_eq!(matches.len(), 2);
     }
 
@@ -771,7 +782,7 @@ mod tests {
 
     #[test]
     fn test_glob_to_regex() {
-        assert_eq!(glob_to_regex("sift-*"), "^sift-.*$");
+        assert_eq!(glob_to_regex("vecs-*"), "^vecs-.*$");
         assert_eq!(glob_to_regex("?est"), "^.est$");
         assert_eq!(glob_to_regex("exact"), "^exact$");
     }

@@ -94,7 +94,7 @@ impl HttpsTransport {
     fn is_vecd(&self) -> bool {
         *self.vecd.get_or_init(|| {
             let Ok(url) = self.origin_join("/-/whoami") else { return false };
-            let client = crate::transport::shared_client();
+            let client = crate::transport::shared_client_for(&self.base);
             match self.auth(client.get(&url)).send() {
                 Ok(resp) if resp.status().is_success() => {
                     resp.text().map(|b| b.contains("\"endpoint\":\"vecd\"")).unwrap_or(false)
@@ -107,7 +107,7 @@ impl HttpsTransport {
 
 impl PushTransport for HttpsTransport {
     fn head(&self, rel: &str) -> Result<Option<RemoteObject>, PushError> {
-        let client = crate::transport::shared_client();
+        let client = crate::transport::shared_client_for(&self.base);
         let resp = self.auth(client.head(self.url(rel))).send().map_err(other)?;
         match resp.status() {
             s if s.is_success() => {
@@ -131,7 +131,7 @@ impl PushTransport for HttpsTransport {
     }
 
     fn get(&self, rel: &str) -> Result<Option<Vec<u8>>, PushError> {
-        let client = crate::transport::shared_client();
+        let client = crate::transport::shared_client_for(&self.base);
         let resp = self.auth(client.get(self.url(rel))).send().map_err(other)?;
         match resp.status() {
             s if s.is_success() => {
@@ -171,7 +171,7 @@ impl PushTransport for HttpsTransport {
             return self.resumable_put_file(rel, src);
         }
         let file = std::fs::File::open(src).map_err(other)?;
-        let client = crate::transport::shared_client();
+        let client = crate::transport::shared_client_for(&self.base);
         let resp = self
             .auth(client.put(self.url(rel)))
             .body(reqwest::blocking::Body::from(file))
@@ -181,7 +181,7 @@ impl PushTransport for HttpsTransport {
     }
 
     fn put_bytes(&self, rel: &str, data: &[u8], if_match: Option<&str>) -> Result<(), PushError> {
-        let client = crate::transport::shared_client();
+        let client = crate::transport::shared_client_for(&self.base);
         let mut rb = self.auth(client.put(self.url(rel))).body(data.to_vec());
         match if_match {
             Some("") => rb = rb.header(reqwest::header::IF_NONE_MATCH, "*"),
@@ -193,7 +193,7 @@ impl PushTransport for HttpsTransport {
     }
 
     fn preflight(&self) -> Result<(), PushError> {
-        let client = crate::transport::shared_client();
+        let client = crate::transport::shared_client_for(&self.base);
         let resp = self.auth(client.head(&self.base)).send().map_err(other)?;
         match resp.status() {
             s @ (StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) => Err(auth("", s)),
@@ -209,7 +209,7 @@ impl PushTransport for HttpsTransport {
         // has no such verb (404, or a non-JSON 200): there we fail loudly
         // rather than risk deleting against an endpoint we can't enumerate.
         let url = format!("{}?list", self.url(prefix));
-        let client = crate::transport::shared_client();
+        let client = crate::transport::shared_client_for(&self.base);
         let resp = self.auth(client.get(&url)).send().map_err(other)?;
         match resp.status() {
             s if s.is_success() => {
@@ -222,7 +222,7 @@ impl PushTransport for HttpsTransport {
     }
 
     fn delete(&self, rel: &str) -> Result<(), PushError> {
-        let client = crate::transport::shared_client();
+        let client = crate::transport::shared_client_for(&self.base);
         let resp = self.auth(client.delete(self.url(rel))).send().map_err(other)?;
         match resp.status() {
             s if s.is_success() || s == StatusCode::NOT_FOUND => Ok(()),
@@ -257,7 +257,7 @@ impl HttpsTransport {
     /// `POST <rel>` with `Upload-Length` → the absolute upload URL parsed
     /// from `Location`.
     fn create_upload(&self, rel: &str, total: u64) -> Result<String, PushError> {
-        let client = crate::transport::shared_client();
+        let client = crate::transport::shared_client_for(&self.base);
         let resp = self
             .auth(client.post(self.url(rel)))
             .header("Upload-Length", total.to_string())
@@ -423,7 +423,7 @@ impl HttpsTransport {
     /// complete headers are advisory (the client tracks per-chunk acks
     /// itself), so they are not consumed here.
     fn put_chunk(&self, upload_url: &str, offset: u64, body: Vec<u8>) -> Result<(), PushError> {
-        let client = crate::transport::shared_client();
+        let client = crate::transport::shared_client_for(&self.base);
         let resp = self
             .auth(client.patch(upload_url))
             .header("Upload-Offset", offset.to_string())
@@ -440,7 +440,7 @@ impl HttpsTransport {
 
     /// `DELETE <upload-url>` — abandon an upload (best-effort cleanup).
     fn delete_upload(&self, upload_url: &str) -> Result<(), PushError> {
-        let client = crate::transport::shared_client();
+        let client = crate::transport::shared_client_for(&self.base);
         self.auth(client.delete(upload_url)).send().map_err(other)?;
         Ok(())
     }
@@ -485,7 +485,18 @@ impl HttpsTransport {
                  or use an s3:// binding so credentials and region are resolved for you",
                 self.url(rel)
             ))),
-            s => Err(PushError::Other(format!("PUT {} -> HTTP {s}", self.url(rel)))),
+            // Include the server's explanatory body when present (e.g. vecd's
+            // "no active storage backend serves '<ns>/…'") so a 404/400 isn't
+            // an opaque status code.
+            s => {
+                let body = resp.text().unwrap_or_default();
+                let body = body.trim();
+                if body.is_empty() {
+                    Err(PushError::Other(format!("PUT {} -> HTTP {s}", self.url(rel))))
+                } else {
+                    Err(PushError::Other(format!("PUT {} -> HTTP {s}: {body}", self.url(rel))))
+                }
+            }
         }
     }
 }

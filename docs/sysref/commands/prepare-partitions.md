@@ -21,8 +21,8 @@ Phase 2 (partition expansion):
   prepare-partitions:
     1. Read metadata labels (M facet)
     2. For each viable label (count >= k):
-       a. Extract matching base vectors → profiles/label-N/base_vectors.fvec
-       b. Symlink query vectors → profiles/label-N/query_vectors.fvec
+       a. Extract matching base vectors → profiles/label-N/base_vectors.fvecs
+       b. Symlink query vectors → profiles/label-N/query_vectors.fvecs
        c. Register profile "label-N" in dataset.yaml with paths
     3. Set variable partition_count = N
 
@@ -57,11 +57,11 @@ Phase 3 (finalize):
 ```yaml
 profiles:
   label-0:
-    base_vectors: profiles/label-0/base_vectors.fvec
-    query_vectors: profiles/base/query_vectors.fvec
+    base_vectors: profiles/label-0/base_vectors.fvecs
+    query_vectors: profiles/base/query_vectors.fvecs
   label-1:
-    base_vectors: profiles/label-1/base_vectors.fvec
-    query_vectors: profiles/base/query_vectors.fvec
+    base_vectors: profiles/label-1/base_vectors.fvecs
+    query_vectors: profiles/base/query_vectors.fvecs
 ```
 
 These are concrete profiles (not deferred) — they have fixed paths,

@@ -386,7 +386,7 @@ mod tests {
 
     #[test]
     fn test_large_dimension_records() {
-        // Test with high-dimensional vectors (768-d, like BERT embeddings)
+        // Test with high-dimensional vectors (768-d embeddings)
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("large_dim.fvec");
 

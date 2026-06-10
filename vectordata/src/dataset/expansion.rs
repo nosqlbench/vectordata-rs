@@ -456,8 +456,8 @@ mod tests {
         assert_eq!(filter_steps_for_profile(vec![step], "20m").len(), 0);
     }
 
-    /// Regression test for the sift1m
-    /// `profiles/default/_sift_groundtruth.ivecs: No such file` bug:
+    /// Regression test for the vecs1m
+    /// `profiles/default/_gt.ivecs: No such file` bug:
     /// `compute knn-distances` consumes `indices` as an INPUT (a
     /// pre-existing groundtruth file at the dataset root), and the
     /// per-profile expander used to auto-prefix it with
@@ -474,9 +474,9 @@ default:
 "#).unwrap();
 
         let mut opts = IndexMap::new();
-        opts.insert("base".into(),    Value::String("_sift_base_l2.fvecs".into()));
-        opts.insert("query".into(),   Value::String("_sift_query.fvecs".into()));
-        opts.insert("indices".into(), Value::String("_sift_groundtruth.ivecs".into()));
+        opts.insert("base".into(),    Value::String("_base_l2.fvecs".into()));
+        opts.insert("query".into(),   Value::String("_query.fvecs".into()));
+        opts.insert("indices".into(), Value::String("_gt.ivecs".into()));
         opts.insert("output".into(),  Value::String("neighbor_distances.fvecs".into()));
         opts.insert("metric".into(),  Value::String("L2".into()));
         let template = StepDef {
@@ -499,9 +499,9 @@ default:
 
         // `indices` is an INPUT — must NOT be prefixed with profile dir.
         let indices = step.options.get("indices").and_then(|v| v.as_str()).unwrap();
-        assert_eq!(indices, "_sift_groundtruth.ivecs",
+        assert_eq!(indices, "_gt.ivecs",
             "indices must stay at the dataset root (was wrongly being \
-             rewritten to profiles/default/_sift_groundtruth.ivecs)");
+             rewritten to profiles/default/_gt.ivecs)");
         // `output` IS an output — should be prefixed.
         let output = step.options.get("output").and_then(|v| v.as_str()).unwrap();
         assert_eq!(output, "profiles/default/neighbor_distances.fvecs");
