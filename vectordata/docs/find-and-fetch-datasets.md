@@ -16,6 +16,21 @@ We use a dataset named `glove` as the running example — substitute whatever yo
 catalog actually contains (`vectordata explore` and `vectordata datasets list`
 both show you).
 
+## Quick start (Linux)
+
+The whole loop in four commands (Linux x64 — other platforms under [Install](#install)):
+
+```bash
+curl -fL -o vectordata https://github.com/nosqlbench/vectordata-rs/releases/latest/download/vectordata-x86_64-unknown-linux-musl
+chmod +x vectordata
+./vectordata config set cache auto       # cache to the largest writable mount
+./vectordata explore                     # browse + visualize a catalog's datasets
+```
+
+`explore` opens your configured catalogs — add one first with
+`./vectordata config catalog add <catalog-url>`. The sections below explain every
+step (and other platforms) in detail.
+
 ## Install
 
 The simplest way to get started: download the latest prebuilt binary for your
