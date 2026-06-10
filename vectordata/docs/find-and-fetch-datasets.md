@@ -18,18 +18,17 @@ both show you).
 
 ## Quick start (Linux)
 
-The whole loop in four commands (Linux x64 — other platforms under [Install](#install)):
+The whole loop in five commands (Linux x64 — other platforms under [Install](#install)):
 
 ```bash
 curl -fL -o vectordata https://github.com/nosqlbench/vectordata-rs/releases/latest/download/vectordata-x86_64-unknown-linux-musl
 chmod +x vectordata
-./vectordata config set cache auto       # cache to the largest writable mount
-./vectordata explore                     # browse + visualize a catalog's datasets
+./vectordata config set cache auto                             # cache → largest writable mount
+./vectordata config catalog add https://example.com/datasets/  # your catalog URL
+./vectordata explore                                           # browse + visualize the datasets
 ```
 
-`explore` opens your configured catalogs — add one first with
-`./vectordata config catalog add <catalog-url>`. The sections below explain every
-step (and other platforms) in detail.
+The sections below explain every step (and other platforms) in detail.
 
 ## Install
 
