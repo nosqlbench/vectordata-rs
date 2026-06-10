@@ -45,8 +45,8 @@ url = "2.5"
 # the default `cli` feature so `cargo install vectordata` produces a
 # working binary with no `--features` ceremony. Library-only consumers
 # can drop the CLI framework with `default-features = false`.
-veks-completion = { path = "../veks-completion", optional = true }
-veks-completion-derive = { path = "../veks-completion-derive", optional = true }
+veks-completion = { path = "../veks-completion", optional = true, version = "1.3.0" }
+veks-completion-derive = { path = "../veks-completion-derive", optional = true, version = "1.3.0" }
 # Used by the `explore` subcommand's TUI for value similarity, seeded
 # sampling, parallel batched analytics, and Ctrl-C abort handling.
 # All kept optional so library-only consumers (cargo install
