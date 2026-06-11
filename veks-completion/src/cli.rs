@@ -642,7 +642,9 @@ fn spec_to_node(
         // actually takes a positional.
         if !spec.positionals.is_empty()
             && let Some(p) = resolvers.get(path).cloned() {
-                node = node.with_positional_provider(p);
+                node = node
+                    .with_positional_provider(p)
+                    .with_positional_slots(spec.positionals.len());
             }
         node.with_stability(spec.stability)
     } else {
@@ -794,6 +796,55 @@ mod tests {
         // Value completion: the --at resolver fires on ping.
         let at_vals = crate::complete(&tree, &["veks", "datasets", "ping", "--at", ""]);
         assert_eq!(at_vals, vec!["1".to_string(), "2".to_string()]);
+    }
+
+    /// A command with two positional slots (`config set <key>
+    /// <value>`) completes the first slot, then the second — the
+    /// provider sees the entered positionals and decides. The engine
+    /// previously hard-gated providers to the first slot only.
+    #[test]
+    fn two_slot_positional_completion() {
+        let spec = CommandSpec::new("vectordata").subcommand(
+            CommandSpec::new("config").subcommand(
+                CommandSpec::new("set")
+                    .positional(PositionalSpec::new("key"))
+                    .positional(PositionalSpec::new("value"))
+                    .option(OptionSpec::new(OptionDef::flag("--force"))),
+            ),
+        );
+        let mut resolvers: std::collections::BTreeMap<String, crate::ValueProvider> =
+            std::collections::BTreeMap::new();
+        resolvers.insert(
+            "config set".to_string(),
+            crate::fn_provider(|p, ctx| {
+                let positionals: Vec<&&str> =
+                    ctx.iter().filter(|w| !w.starts_with('-')).collect();
+                let cands: Vec<&str> = match positionals.first() {
+                    None => vec!["cache"],
+                    Some(&&"cache") => vec!["auto", "/data/vectordata-cache"],
+                    Some(_) => vec![],
+                };
+                cands.iter()
+                    .filter(|c| p.is_empty() || c.starts_with(p))
+                    .map(|c| c.to_string())
+                    .collect()
+            }),
+        );
+        let tree = build_completion_tree(&spec, &resolvers);
+
+        // Slot 0: keys.
+        let keys = crate::complete(&tree, &["vectordata", "config", "set", ""]);
+        assert!(keys.contains(&"cache".to_string()), "{keys:?}");
+        // Slot 1: values for the entered key.
+        let vals = crate::complete(&tree, &["vectordata", "config", "set", "cache", ""]);
+        assert!(vals.contains(&"auto".to_string()), "{vals:?}");
+        assert!(vals.contains(&"/data/vectordata-cache".to_string()), "{vals:?}");
+        // Slot 2 doesn't exist: no positional candidates.
+        let done = crate::complete(&tree, &["vectordata", "config", "set", "cache", "auto", ""]);
+        assert!(!done.contains(&"auto".to_string()), "{done:?}");
+        // A flag between positionals doesn't shift slot counting.
+        let vals2 = crate::complete(&tree, &["vectordata", "config", "set", "--force", "cache", ""]);
+        assert!(vals2.contains(&"auto".to_string()), "{vals2:?}");
     }
 
     /// A short flag at the previous-word position must value-complete

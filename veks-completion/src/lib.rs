@@ -415,6 +415,12 @@ pub struct Node {
     flag_long_help: BTreeMap<String, String>,
     /// Dynamic value providers keyed by flag name.
     value_providers: BTreeMap<String, ValueProvider>,
+    /// How many positional slots this command's provider serves.
+    /// 1 (the default) preserves the original first-positional-only
+    /// behavior; a command like `config set <key> <value>` sets 2
+    /// and its provider inspects the already-entered positionals to
+    /// decide which slot it is completing.
+    positional_slots: usize,
     /// Provider for this command's first positional argument (e.g. the backend
     /// name in `backends remove <name>`). Consulted when the cursor sits at a
     /// bare positional slot rather than after a value flag.
@@ -914,6 +920,9 @@ impl Node {
 
     /// Attach a provider for this command's first positional argument.
     pub fn with_positional_provider(mut self, provider: ValueProvider) -> Self {
+        if self.positional_slots == 0 {
+            self.positional_slots = 1;
+        }
         self.positional_provider = Some(provider);
         self
     }
@@ -921,6 +930,13 @@ impl Node {
     /// The first-positional provider, if any.
     pub fn positional_provider(&self) -> Option<&ValueProvider> {
         self.positional_provider.as_ref()
+    }
+
+    /// Declare how many positional slots the provider serves. The
+    /// provider receives the completed words and decides per slot.
+    pub fn with_positional_slots(mut self, slots: usize) -> Self {
+        self.positional_slots = slots.max(1);
+        self
     }
 
     /// Attach a dynamic options provider.
@@ -1901,13 +1917,18 @@ pub fn complete_at_tap_with_raw(
         a.starts_with('-').cmp(&b.starts_with('-')).then_with(|| a.cmp(b))
     });
 
-    // (4) First-positional value completion: when this command takes a
-    // positional, none has been entered yet, and the cursor is on a bare word
-    // (not after a flag), offer the positional's dynamic candidates.
+    // (4) Positional value completion: when this command takes
+    // positionals, fewer than its declared slot count have been
+    // entered, and the cursor is on a bare word (not after a flag),
+    // offer the provider's dynamic candidates. The provider sees the
+    // completed words and decides what the slot under the cursor
+    // means (e.g. `config set <key> <value>` completes keys at slot
+    // 0 and key-specific values at slot 1).
     let mut positional_candidates: Vec<String> = Vec::new();
     if let Some(provider) = node.positional_provider()
         && !partial.starts_with('-')
-            && positionals_entered(remaining, &node.flags, &node.boolean_flags) == 0
+            && positionals_entered(remaining, &node.flags, &node.boolean_flags)
+                < node.positional_slots.max(1)
         {
             positional_candidates = provider(partial, remaining);
         }

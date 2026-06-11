@@ -41,23 +41,43 @@ fn enumerate_raw() -> Vec<MountInfo> {
     let Ok(content) = std::fs::read_to_string("/proc/mounts") else { return mounts; };
     let mut seen = std::collections::HashSet::new();
     for line in content.lines() {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 3 { continue; }
-        let mount = parts[1];
-        let fs_type = parts[2];
-        if !is_persistent_storage_fs(fs_type) { continue; }
-        if is_system_mount_path(mount) { continue; }
-        if !seen.insert(mount.to_string()) { continue; }
-        let path = PathBuf::from(mount);
+        let Some((mount, rw_mounted)) = parse_mount_line(line) else { continue; };
+        if !seen.insert(mount.clone()) { continue; }
+        let path = PathBuf::from(&mount);
         if let Some((available, total)) = statvfs_bytes(&path) {
             mounts.push(MountInfo {
-                path: mount.to_string(),
+                path: mount,
                 available, total,
-                writable: is_writable(&path),
+                writable: rw_mounted,
             });
         }
     }
     mounts
+}
+
+/// Parse one `/proc/mounts` line into `(mount_point, rw_mounted)`,
+/// applying the fs-type and system-path filters. Pure — testable
+/// without a live mount table.
+///
+/// `rw_mounted` reports the FILESYSTEM's posture (the `rw` mount
+/// option), not the current user's permission on the mount root. A
+/// stock cloud image has exactly one mount — `/`, rw-mounted but
+/// root-owned 0755 — and judging it by the root directory's mode
+/// bits filtered out every mount on such hosts, wedging cache
+/// auto-resolution entirely. Per-user permission matters only when
+/// a caller wants to create something at the mount root; that
+/// caller checks [`is_writable`] itself.
+pub(crate) fn parse_mount_line(line: &str) -> Option<(String, bool)> {
+    let parts: Vec<&str> = line.split_whitespace().collect();
+    if parts.len() < 3 { return None; }
+    let mount = parts[1];
+    let fs_type = parts[2];
+    if !is_persistent_storage_fs(fs_type) { return None; }
+    if is_system_mount_path(mount) { return None; }
+    let rw_mounted = parts.get(3)
+        .map(|opts| opts.split(',').any(|o| o == "rw"))
+        .unwrap_or(false);
+    Some((mount.to_string(), rw_mounted))
 }
 
 /// Reject filesystem types that aren't persistent disk-backed
@@ -108,6 +128,9 @@ pub(crate) fn is_system_mount_path(mount: &str) -> bool {
         || mount.starts_with("/snap")
         || mount.starts_with("/var/snap")
         || mount.starts_with("/var/lib/snapd")
+        // snapd's per-snap confined rootfs: a bind-mount of `/`
+        // (so it looks like a big rw ext4 mount) parked under /tmp.
+        || mount.starts_with("/tmp/snap.")
         || mount.starts_with("/proc")
         || mount.starts_with("/sys")
         || mount == "/dev"
@@ -281,6 +304,33 @@ mod tests {
         ] {
             assert!(!is_system_mount_path(p), "{p} should be accepted");
         }
+    }
+
+    /// The EC2 wedge: a stock cloud image's only mount is `/` —
+    /// ext4, rw-mounted, root-owned. It must surface as a writable
+    /// candidate (filesystem posture), or cache auto-resolution has
+    /// nothing to work with and errors out.
+    #[test]
+    fn root_mount_rw_option_counts_as_writable() {
+        let line = "/dev/root / ext4 rw,relatime,discard,errors=remount-ro 0 0";
+        assert_eq!(parse_mount_line(line), Some(("/".to_string(), true)));
+    }
+
+    #[test]
+    fn ro_mount_is_not_writable() {
+        let line = "/dev/sdb1 /data ext4 ro,relatime 0 0";
+        assert_eq!(parse_mount_line(line), Some(("/data".to_string(), false)));
+    }
+
+    #[test]
+    fn filtered_lines_parse_to_none() {
+        assert_eq!(parse_mount_line("tmpfs /run tmpfs rw,nosuid 0 0"), None);
+        assert_eq!(parse_mount_line("/dev/sda1 /boot/efi vfat rw 0 0"), None);
+        // snap's confined-rootfs bind mounts look like big rw ext4
+        // mounts but are system detritus.
+        assert_eq!(parse_mount_line(
+            "/dev/root /tmp/snap.rootfs_SF7rpo ext4 rw,relatime 0 0"), None);
+        assert_eq!(parse_mount_line("garbage"), None);
     }
 
     /// Regression: with the mount-table sample the user provided,

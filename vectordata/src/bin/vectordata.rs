@@ -452,6 +452,45 @@ fn complete_push_to(partial: &str, _ctx: &[&str]) -> Vec<String> {
         .collect()
 }
 
+/// Tab-completion for `config set <key> <value>`: keys at the first
+/// slot; key-specific values at the second. For `cache`, values are
+/// live system facts — `auto`, the XDG default under `$HOME`, and a
+/// `vectordata-cache` directory on each rw-mounted filesystem — so
+/// the completion shows exactly the places `auto` could pick.
+fn complete_config_set(partial: &str, ctx: &[&str]) -> Vec<String> {
+    let positionals: Vec<&str> =
+        ctx.iter().copied().filter(|w| !w.starts_with('-')).collect();
+    let mut out: Vec<String> = match positionals.first() {
+        None => vec!["cache".to_string()],
+        Some(&"cache") => {
+            let mut vals = vec!["auto".to_string()];
+            if let Some(home) = std::env::var_os("HOME") {
+                vals.push(std::path::PathBuf::from(home)
+                    .join(".cache/vectordata").display().to_string());
+            }
+            for m in vectordata::mounts::enumerate() {
+                if m.writable && m.path != "/" {
+                    vals.push(format!("{}/vectordata-cache", m.path.trim_end_matches('/')));
+                }
+            }
+            vals
+        }
+        Some(_) => Vec::new(),
+    };
+    out.retain(|s| partial.is_empty() || s.starts_with(partial));
+    out.dedup();
+    out
+}
+
+/// Tab-completion for `config get <key>` — the same key set as
+/// `config set`.
+fn complete_config_get(partial: &str, _ctx: &[&str]) -> Vec<String> {
+    ["cache"].iter()
+        .filter(|k| partial.is_empty() || k.starts_with(partial))
+        .map(|k| k.to_string())
+        .collect()
+}
+
 fn main() {
     let spec = Cli::veks_command_spec("vectordata");
 
@@ -463,6 +502,9 @@ fn main() {
         std::collections::BTreeMap::new();
     // `--to` (push destination): suggest namespace URLs on the logged-in endpoint.
     resolvers.insert("--to".to_string(), veks_completion::fn_provider(complete_push_to));
+    // Positional completion, keyed by subcommand path.
+    resolvers.insert("config set".to_string(), veks_completion::fn_provider(complete_config_set));
+    resolvers.insert("config get".to_string(), veks_completion::fn_provider(complete_config_get));
     let tree = vcli::build_completion_tree(&spec, &resolvers);
     if veks_completion::handle_complete_env("vectordata", &tree) {
         return;

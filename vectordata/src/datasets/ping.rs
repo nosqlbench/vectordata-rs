@@ -70,6 +70,18 @@ pub fn run_args(args: PingArgs, configdir: &str, catalog: &[String], at_extra: &
 /// and by `run_args` after it has built the catalog from its CLI
 /// inputs.
 pub fn run_via_catalog(catalog: &Catalog, dataset_name: &str, profile_name: &str) -> i32 {
+    // Pre-flight: every facet probe below opens through the cache
+    // layer, which needs a resolvable cache directory. Without this
+    // check, a missing cache_dir surfaced as N cryptic per-facet
+    // "storage open" failures instead of the actual problem.
+    if let Err(e) = crate::settings::cache_dir() {
+        eprintln!("error: no usable cache directory is configured: {e}");
+        eprintln!();
+        eprintln!("Facet probes open through the cache layer, so ping cannot run without one.");
+        eprintln!("Fix with:  vectordata config set cache auto");
+        eprintln!("      or:  vectordata config set cache <directory>");
+        return 1;
+    }
     if catalog.find_exact(dataset_name).is_none() {
         eprintln!("error: dataset '{dataset_name}' not found in any configured catalog");
         eprintln!();

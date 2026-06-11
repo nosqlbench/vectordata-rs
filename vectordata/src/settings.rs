@@ -244,6 +244,13 @@ pub enum CacheDirResolutionReason {
     /// requires the user to explicitly opt in via `set-cache` so we
     /// don't silently land cache data somewhere unexpected.
     DifferentMountIsLargest,
+    /// The mount table was unusable — no writable mounts visible
+    /// (containers, restricted /proc, exotic platforms) or device
+    /// inspection failed. `$HOME` demonstrably exists (the process
+    /// is running with one), so the XDG default
+    /// `~/.cache/vectordata` is the answer; a missing mount table
+    /// must never block `config set cache auto`.
+    MountTableUnavailable,
 }
 
 /// A cache-directory candidate auto-picked from the live mount table.
@@ -267,37 +274,73 @@ pub fn auto_resolved_cache_dir() -> Result<AutoResolved, String> {
     let home = std::env::var_os("HOME")
         .ok_or_else(|| "HOME is not set; cannot auto-resolve cache_dir".to_string())?;
     let home = PathBuf::from(home);
-    let home_dev = mounts::device_id(&home)
-        .map_err(|e| format!("inspecting $HOME ({}): {e}", home.display()))?;
 
-    let mut candidates: Vec<mounts::MountInfo> = mounts::enumerate()
-        .into_iter()
-        .filter(|m| m.writable)
-        .collect();
-    if candidates.is_empty() {
-        return Err("no writable mounts found — cannot auto-resolve cache_dir".to_string());
+    // The mount-table walk below is an *optimization* — it exists to
+    // find a bigger data disk than $HOME's filesystem. When the
+    // table is unusable (no writable mounts visible, device
+    // inspection failing — containers and minimal cloud images get
+    // here), the XDG default under $HOME is the answer, not an
+    // error.
+    let xdg_default = || AutoResolved {
+        path: xdg_cache_home(&home).join("vectordata"),
+        reason: CacheDirResolutionReason::MountTableUnavailable,
+        mount: home.display().to_string(),
+    };
+
+    let Ok(home_dev) = mounts::device_id(&home) else {
+        return Ok(xdg_default());
+    };
+
+    // Walk rw-mounted filesystems from largest to smallest. The
+    // first acceptable one wins:
+    //   - same filesystem as $HOME → the XDG default under $HOME
+    //     (no bigger disk to prefer);
+    //   - a different filesystem → `<mount>/vectordata-cache`, but
+    //     only when the current user can actually create that
+    //     directory at the mount root (a root-owned `/` is
+    //     rw-mounted yet unusable for this).
+    for candidate in mounts::enumerate().into_iter().filter(|m| m.writable) {
+        let path = Path::new(&candidate.path);
+        let Ok(dev) = mounts::device_id(path) else { continue };
+        if dev == home_dev {
+            return Ok(AutoResolved {
+                path: xdg_cache_home(&home).join("vectordata"),
+                reason: CacheDirResolutionReason::HomeIsLargestMount,
+                mount: candidate.path,
+            });
+        }
+        if mounts::is_writable(path) {
+            return Ok(AutoResolved {
+                path: PathBuf::from(&candidate.path).join("vectordata-cache"),
+                reason: CacheDirResolutionReason::DifferentMountIsLargest,
+                mount: candidate.path,
+            });
+        }
     }
-    let largest = candidates.remove(0);
-    let largest_dev = mounts::device_id(Path::new(&largest.path))
-        .map_err(|e| format!("inspecting mount {}: {e}", largest.path))?;
-    if largest_dev == home_dev {
-        Ok(AutoResolved {
-            path: home.join(".cache/vectordata"),
-            reason: CacheDirResolutionReason::HomeIsLargestMount,
-            mount: largest.path,
-        })
-    } else {
-        Ok(AutoResolved {
-            path: PathBuf::from(&largest.path).join("vectordata-cache"),
-            reason: CacheDirResolutionReason::DifferentMountIsLargest,
-            mount: largest.path,
-        })
+    // Mount table empty, unusable, or nothing acceptable — $HOME
+    // exists, so the XDG default is the answer, never an error.
+    Ok(xdg_default())
+}
+
+/// The XDG cache base: `$XDG_CACHE_HOME` when set (absolute), else
+/// `<home>/.cache` per the XDG Base Directory spec.
+fn xdg_cache_home(home: &Path) -> PathBuf {
+    xdg_cache_home_from(std::env::var_os("XDG_CACHE_HOME"), home)
+}
+
+/// Pure core of [`xdg_cache_home`]: the env value arrives as a
+/// parameter so tests don't mutate process env.
+fn xdg_cache_home_from(xdg: Option<std::ffi::OsString>, home: &Path) -> PathBuf {
+    match xdg {
+        Some(p) if Path::new(&p).is_absolute() => PathBuf::from(p),
+        _ => home.join(".cache"),
     }
 }
 
 /// Try to auto-bootstrap `settings.yaml` on first read. Returns
 /// `Some(path)` only when the resolution rule fires
-/// (`HomeIsLargestMount`) and the write succeeds. Prints a one-line
+/// (`HomeIsLargestMount` / `MountTableUnavailable` — both resolve
+/// under `$HOME`) and the write succeeds. Prints a one-line
 /// stderr warning on success — the user sees what just happened.
 ///
 /// On any failure (no `$HOME`, different mount is largest, write
@@ -305,7 +348,10 @@ pub fn auto_resolved_cache_dir() -> Result<AutoResolved, String> {
 /// [`SettingsError`].
 fn try_auto_bootstrap(settings: &Path) -> Option<PathBuf> {
     let resolved = auto_resolved_cache_dir().ok()?;
-    if resolved.reason != CacheDirResolutionReason::HomeIsLargestMount {
+    if !matches!(resolved.reason,
+        CacheDirResolutionReason::HomeIsLargestMount
+        | CacheDirResolutionReason::MountTableUnavailable)
+    {
         return None;
     }
     match write_cache_dir_at(settings, &resolved.path, false) {
@@ -517,6 +563,21 @@ fn rewrite_cache_dir_line(existing: &str, cache_dir: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Auto-resolution lands on the XDG default under $HOME — with
+    /// `$XDG_CACHE_HOME` honored when absolute, ignored otherwise.
+    #[test]
+    fn xdg_cache_home_resolution() {
+        let home = Path::new("/home/u");
+        assert_eq!(xdg_cache_home_from(None, home), PathBuf::from("/home/u/.cache"));
+        assert_eq!(
+            xdg_cache_home_from(Some("/fast/cache".into()), home),
+            PathBuf::from("/fast/cache"));
+        // Relative XDG_CACHE_HOME must be ignored per the XDG spec.
+        assert_eq!(
+            xdg_cache_home_from(Some("relative".into()), home),
+            PathBuf::from("/home/u/.cache"));
+    }
 
     /// A forced `cache_dir` overwrite must edit only the
     /// `cache_dir:` line — comments and unrelated keys in
