@@ -4066,7 +4066,7 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
 name = "slabtastic"
-version = "1.3.0"
+version = "1.3.1"
 dependencies = [
  "criterion",
  "csv",
@@ -4986,7 +4986,7 @@ checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
 
 [[package]]
 name = "vecd"
-version = "1.3.0"
+version = "1.3.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -5015,7 +5015,7 @@ dependencies = [
 
 [[package]]
 name = "vectordata"
-version = "1.3.0"
+version = "1.3.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -5059,7 +5059,7 @@ dependencies = [
 
 [[package]]
 name = "veks"
-version = "1.3.0"
+version = "1.3.1"
 dependencies = [
  "arrow",
  "atty",
@@ -5100,7 +5100,7 @@ dependencies = [
 
 [[package]]
 name = "veks-anode"
-version = "1.1.5"
+version = "1.3.1"
 dependencies = [
  "byteorder",
  "indexmap",
@@ -5110,7 +5110,7 @@ dependencies = [
 
 [[package]]
 name = "veks-completion"
-version = "1.3.0"
+version = "1.3.1"
 dependencies = [
  "tempfile",
  "veks-completion-derive",
@@ -5118,7 +5118,7 @@ dependencies = [
 
 [[package]]
 name = "veks-completion-derive"
-version = "1.3.0"
+version = "1.3.1"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5127,7 +5127,7 @@ dependencies = [
 
 [[package]]
 name = "veks-core"
-version = "1.3.0"
+version = "1.3.1"
 dependencies = [
  "arrow",
  "atty",
@@ -5153,7 +5153,7 @@ dependencies = [
 
 [[package]]
 name = "veks-io"
-version = "1.3.0"
+version = "1.3.1"
 dependencies = [
  "arrow",
  "byteorder",
@@ -5170,7 +5170,7 @@ dependencies = [
 
 [[package]]
 name = "veks-pipeline"
-version = "1.3.0"
+version = "1.3.1"
 dependencies = [
  "atty",
  "byteorder",
