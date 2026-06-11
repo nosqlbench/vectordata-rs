@@ -244,17 +244,99 @@ fn load_catalog_entries() -> Vec<String> {
     serde_yaml::from_str(&content).unwrap_or_default()
 }
 
-fn save_catalog_entries(entries: &[String]) -> Result<PathBuf, String> {
+// ── Comment-preserving textual edits ────────────────────────────────
+//
+// `catalogs.yaml` is a hand-edited file: commenting an entry out (and
+// back in) is a normal workflow. Writes therefore NEVER round-trip
+// through a YAML serializer — that would discard every comment and
+// reflow the user's formatting. Instead, `add` appends one entry line
+// and `remove` deletes exactly the matching entry line; every other
+// byte of the file is preserved.
+
+/// True when a line is a block-sequence entry (`- value`), as opposed
+/// to a comment, blank line, or something structurally different.
+fn is_entry_line(line: &str) -> bool {
+    let t = line.trim_start();
+    t.starts_with("- ") || t == "-"
+}
+
+/// Parse the scalar value of an entry line, unquoting via the YAML
+/// scalar parser so `- "url"` and `- url` compare equal.
+fn entry_line_value(line: &str) -> Option<String> {
+    let t = line.trim_start().strip_prefix('-')?.trim();
+    if t.is_empty() { return None; }
+    serde_yaml::from_str::<String>(t).ok()
+}
+
+/// Append `source` as a new entry line, preserving the rest of the
+/// file byte-for-byte. Refuses when the existing content isn't a
+/// simple block list (flow style, mappings) — rewriting such a file
+/// without a serializer isn't safe, and rewriting WITH one would
+/// destroy comments.
+fn append_entry_text(content: &str, source: &str) -> Result<String, String> {
+    for line in content.lines() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') || is_entry_line(line) { continue; }
+        return Err(format!(
+            "catalogs.yaml contains a non-list line ({t:?}); \
+             refusing to edit it automatically — add the entry manually"));
+    }
+    let mut out = content.to_string();
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(&format!("- {source}\n"));
+    Ok(out)
+}
+
+/// Remove the entry line(s) whose value equals `source`, preserving
+/// every other byte (comments and commented-out entries included).
+/// Returns `(new_content, removed_any)`.
+fn remove_entry_text(content: &str, source: &str) -> (String, bool) {
+    let mut removed = false;
+    let kept: Vec<&str> = content.lines()
+        .filter(|line| {
+            let is_match = entry_line_value(line).as_deref() == Some(source);
+            if is_match { removed = true; }
+            !is_match
+        })
+        .collect();
+    let mut out = kept.join("\n");
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    (out, removed)
+}
+
+fn append_catalog_entry(source: &str) -> Result<PathBuf, String> {
     let path = catalogs_path();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("creating {}: {e}", parent.display()))?;
     }
-    let yaml = serde_yaml::to_string(entries)
-        .map_err(|e| format!("serializing catalogs.yaml: {e}"))?;
-    std::fs::write(&path, yaml)
+    let content = if path.is_file() {
+        std::fs::read_to_string(&path)
+            .map_err(|e| format!("reading {}: {e}", path.display()))?
+    } else {
+        String::new()
+    };
+    let new_content = append_entry_text(&content, source)?;
+    std::fs::write(&path, new_content)
         .map_err(|e| format!("writing {}: {e}", path.display()))?;
     Ok(path)
+}
+
+fn remove_catalog_entry(source: &str) -> Result<bool, String> {
+    let path = catalogs_path();
+    if !path.is_file() { return Ok(false); }
+    let content = std::fs::read_to_string(&path)
+        .map_err(|e| format!("reading {}: {e}", path.display()))?;
+    let (new_content, removed) = remove_entry_text(&content, source);
+    if removed {
+        std::fs::write(&path, new_content)
+            .map_err(|e| format!("writing {}: {e}", path.display()))?;
+    }
+    Ok(removed)
 }
 
 /// Verify a catalog source end-to-end before it is accepted:
@@ -300,7 +382,7 @@ pub fn verify_catalog_source(source: &str) -> Result<usize, String> {
 /// answer a catalog ping — before anything is recorded. Returns 1
 /// if verification fails; nothing is saved in that case.
 pub fn add_catalog(source: &str) -> i32 {
-    let mut entries = load_catalog_entries();
+    let entries = load_catalog_entries();
     if entries.iter().any(|e| e == source) {
         println!("Already configured: {source}");
         return 0;
@@ -316,8 +398,7 @@ pub fn add_catalog(source: &str) -> i32 {
     };
     println!("OK   {source} ({count} dataset(s))");
 
-    entries.push(source.to_string());
-    match save_catalog_entries(&entries) {
+    match append_catalog_entry(source) {
         Ok(path) => { println!("Saved to {}", path.display()); 0 }
         Err(e) => { eprintln!("error: {e}"); 1 }
     }
@@ -326,7 +407,7 @@ pub fn add_catalog(source: &str) -> i32 {
 /// Remove a catalog source by URL/path or 1-based index. Returns 1
 /// if the spec doesn't match anything.
 pub fn remove_catalog(spec: RemoveCatalogSpec<'_>) -> i32 {
-    let mut entries = load_catalog_entries();
+    let entries = load_catalog_entries();
     let source = match spec {
         RemoveCatalogSpec::Source(s) => s.to_string(),
         RemoveCatalogSpec::Index(n) => {
@@ -339,14 +420,9 @@ pub fn remove_catalog(spec: RemoveCatalogSpec<'_>) -> i32 {
             s
         }
     };
-    let before = entries.len();
-    entries.retain(|e| e != &source);
-    if entries.len() == before {
-        eprintln!("Not found: {source}");
-        return 1;
-    }
-    match save_catalog_entries(&entries) {
-        Ok(_) => { println!("Removed: {source}"); 0 }
+    match remove_catalog_entry(&source) {
+        Ok(true) => { println!("Removed: {source}"); 0 }
+        Ok(false) => { eprintln!("Not found: {source}"); 1 }
         Err(e) => { eprintln!("error: {e}"); 1 }
     }
 }
@@ -405,3 +481,71 @@ fn dir_size(path: &Path) -> u64 {
     total
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const HAND_EDITED: &str = "\
+# my catalogs — keep sorted
+- https://a.example/cat/
+# temporarily disabled:
+# - https://b.example/cat/
+
+- https://c.example/cat/
+";
+
+    /// `config catalog add` must never disturb existing bytes —
+    /// comments and commented-out entries are a normal hand-edit
+    /// workflow and were previously destroyed by a serde round-trip.
+    #[test]
+    fn append_preserves_comments_and_formatting() {
+        let out = append_entry_text(HAND_EDITED, "https://d.example/cat/").unwrap();
+        assert!(out.starts_with(HAND_EDITED),
+            "existing content must be byte-identical:\n{out}");
+        assert!(out.ends_with("- https://d.example/cat/\n"));
+    }
+
+    #[test]
+    fn append_to_empty_or_missing_file() {
+        assert_eq!(append_entry_text("", "https://x/").unwrap(), "- https://x/\n");
+        // No trailing newline on the last line — one is inserted.
+        let out = append_entry_text("- https://a/", "https://x/").unwrap();
+        assert_eq!(out, "- https://a/\n- https://x/\n");
+    }
+
+    #[test]
+    fn append_refuses_non_list_structure() {
+        let err = append_entry_text("catalogs:\n  - https://a/\n", "https://x/")
+            .unwrap_err();
+        assert!(err.contains("refusing"), "{err}");
+    }
+
+    /// Removal drops exactly the matching entry line; comments —
+    /// including a commented-out copy of the same URL — survive.
+    #[test]
+    fn remove_preserves_comments_including_commented_twin() {
+        let content = "\
+# header comment
+- https://a.example/cat/
+# - https://a.example/cat/   (disabled mirror)
+- \"https://b.example/cat/\"
+";
+        let (out, removed) = remove_entry_text(content, "https://a.example/cat/");
+        assert!(removed);
+        assert!(out.contains("# header comment"));
+        assert!(out.contains("# - https://a.example/cat/"),
+            "commented twin must survive: {out}");
+        assert!(!out.lines().any(|l| l == "- https://a.example/cat/"));
+        // Quoted entries compare by parsed value.
+        let (out2, removed2) = remove_entry_text(&out, "https://b.example/cat/");
+        assert!(removed2, "quoted entry must match by value");
+        assert!(!out2.contains("b.example"));
+    }
+
+    #[test]
+    fn remove_of_absent_entry_changes_nothing() {
+        let (out, removed) = remove_entry_text(HAND_EDITED, "https://nope/");
+        assert!(!removed);
+        assert_eq!(out, HAND_EDITED);
+    }
+}

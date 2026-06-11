@@ -140,7 +140,12 @@ pub fn run(args: ExploreArgs) -> i32 {
     // Interactive path: picker owns the loop and dispatches actions
     // inline. Visualize → Quit exits the picker too; Visualize → Back
     // keeps the picker open. precache/purge/ping always return to the
-    // picker so the user can chain operations.
+    // picker so the user can chain operations. Locate buffers one
+    // line per dataset and exits the picker after the last selected
+    // item — the lines print to stdout only after the picker's
+    // alternate screen is gone, so they survive on the terminal (and
+    // pipe cleanly into `cd $(...)`-style use).
+    let mut located: Vec<String> = Vec::new();
     let dispatch = |specifier: &str, action: PickerAction, pause: bool| -> ActionFlow {
         match action {
             PickerAction::Visualize => {
@@ -151,6 +156,18 @@ pub fn run(args: ExploreArgs) -> i32 {
                     unified::ExploreExit::Quit => ActionFlow::Exit,
                     unified::ExploreExit::Back => ActionFlow::Stay,
                 }
+            }
+            PickerAction::Locate => {
+                let line = locate_line(specifier, &cache_dir_or_exit());
+                if !located.contains(&line) {
+                    located.push(line);
+                }
+                // `pause` doubles as "this is the last item of the
+                // batch" (always true for single dispatch): exit so
+                // the buffered lines print beneath the restored
+                // terminal instead of being swallowed by the
+                // picker's alternate screen.
+                if pause { ActionFlow::Exit } else { ActionFlow::Stay }
             }
             PickerAction::Precache => {
                 run_precache(specifier, pause);
@@ -174,9 +191,26 @@ pub fn run(args: ExploreArgs) -> i32 {
             }
         }
     };
-    match dataset_picker::run_picker(dispatch) {
+    let outcome = dataset_picker::run_picker(dispatch);
+    for line in &located {
+        println!("{line}");
+    }
+    match outcome {
         PickerOutcome::Done => 0,
         PickerOutcome::Failed => 1,
+    }
+}
+
+/// One stdout line for the Locate action: the dataset's cache
+/// directory when it exists, otherwise a `#`-commented note so
+/// shell consumers can filter real paths with `grep -v '^#'`.
+fn locate_line(specifier: &str, cache_root: &std::path::Path) -> String {
+    let (dataset, _profile) = split_specifier(specifier);
+    let dir = cache_root.join(dataset);
+    if dir.is_dir() {
+        dir.display().to_string()
+    } else {
+        format!("# {dataset}: not cached")
     }
 }
 
@@ -252,7 +286,10 @@ fn run_purge(specifier: &str, pause: bool) {
         eprintln!("error: cannot resolve cache_dir: {e}");
         std::process::exit(1);
     });
-    let (removed, freed) = dataset_picker::purge_cache_for_entry(&entry, &cache_dir);
+    let (removed, freed, skipped) = dataset_picker::purge_cache_for_entry(&entry, &cache_dir);
+    for note in &skipped {
+        eprintln!("skipped: {note}");
+    }
     if removed.is_empty() {
         println!("No cached entries found for '{dataset}'.");
     } else {
@@ -300,3 +337,23 @@ fn run_ping(specifier: &str, pause: bool) {
 // code and has no business reaching back up into the pipeline
 // command framework. Re-add a vectordata-local equivalent if a
 // future need surfaces.
+
+#[cfg(test)]
+mod tests {
+    use super::locate_line;
+
+    /// Locate prints the dataset's cache directory when present, and
+    /// a `#`-commented note when not — so shell consumers can filter
+    /// real paths with `grep -v '^#'`.
+    #[test]
+    fn locate_line_path_or_commented_note() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cached = tmp.path().join("ds-a");
+        std::fs::create_dir_all(&cached).unwrap();
+
+        assert_eq!(locate_line("ds-a:default", tmp.path()), cached.display().to_string());
+        // Profile suffix is irrelevant — the cache is dataset-keyed.
+        assert_eq!(locate_line("ds-a:100k", tmp.path()), cached.display().to_string());
+        assert_eq!(locate_line("ds-b:default", tmp.path()), "# ds-b: not cached");
+    }
+}

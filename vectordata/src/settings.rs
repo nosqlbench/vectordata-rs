@@ -473,17 +473,77 @@ pub fn write_cache_dir_at(
     }
     std::fs::create_dir_all(cache_dir)?;
 
-    let content = format!(
-        "cache_dir: {}\nprotect_settings: true\n",
-        cache_dir.display(),
-    );
+    let content = if settings.is_file() {
+        // Forced overwrite of an existing file: edit ONLY the
+        // `cache_dir:` line and keep every other byte — comments and
+        // any additional keys are the user's, not ours to discard.
+        let existing = std::fs::read_to_string(settings)?;
+        rewrite_cache_dir_line(&existing, cache_dir)
+    } else {
+        format!(
+            "cache_dir: {}\nprotect_settings: true\n",
+            cache_dir.display(),
+        )
+    };
     std::fs::write(settings, content)?;
     Ok(WriteCacheOutcome::Wrote)
+}
+
+/// Replace the value of the top-level `cache_dir:` line in an existing
+/// `settings.yaml`, preserving every other line byte-for-byte
+/// (comments, unknown keys, formatting). Appends the line when no
+/// uncommented `cache_dir:` exists.
+fn rewrite_cache_dir_line(existing: &str, cache_dir: &Path) -> String {
+    let mut replaced = false;
+    let mut lines: Vec<String> = existing.lines()
+        .map(|line| {
+            let t = line.trim_start();
+            if !replaced && t.starts_with("cache_dir:") && !t.starts_with('#') {
+                replaced = true;
+                format!("cache_dir: {}", cache_dir.display())
+            } else {
+                line.to_string()
+            }
+        })
+        .collect();
+    if !replaced {
+        lines.push(format!("cache_dir: {}", cache_dir.display()));
+    }
+    let mut out = lines.join("\n");
+    out.push('\n');
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A forced `cache_dir` overwrite must edit only the
+    /// `cache_dir:` line — comments and unrelated keys in
+    /// `settings.yaml` are the user's and were previously destroyed
+    /// by the whole-file template rewrite.
+    #[test]
+    fn forced_cache_dir_write_preserves_comments_and_other_keys() {
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = tmp.path().join("settings.yaml");
+        let new_cache = tmp.path().join("cache");
+        std::fs::write(&settings, "\
+# tuned by hand — do not lose this comment
+cache_dir: /old/path
+protect_settings: true
+# experimental:
+# download_concurrency: 32
+").unwrap();
+
+        let outcome = write_cache_dir_at(&settings, &new_cache, true).unwrap();
+        assert!(matches!(outcome, WriteCacheOutcome::Wrote));
+        let content = std::fs::read_to_string(&settings).unwrap();
+        assert!(content.contains("# tuned by hand — do not lose this comment"));
+        assert!(content.contains("# download_concurrency: 32"));
+        assert!(content.contains("protect_settings: true"));
+        assert!(content.contains(&format!("cache_dir: {}", new_cache.display())));
+        assert!(!content.contains("/old/path"));
+    }
 
     #[test]
     fn tls_trust_parses_both_lists() {

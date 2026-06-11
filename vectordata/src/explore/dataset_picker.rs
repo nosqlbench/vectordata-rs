@@ -1025,51 +1025,72 @@ fn entry_facet_urls(entry: &CatalogEntry) -> std::collections::HashSet<String> {
     urls
 }
 
-/// Purge every cache leaf whose `origin.json` URL belongs to this
-/// dataset (any facet of any profile). Mirrors the survey's discovery
-/// path — same URL canonicalisation, same walk over
-/// `cache_root/{blobs,http}/<prefix>/<hash>/` — so the delete set is
-/// exactly the set of leaves the survey would have attributed to this
-/// dataset.
+/// Purge a dataset's cache. Two sweeps:
 ///
-/// Returns `(removed_paths, freed_bytes)`. A leaf removal failure
-/// (permission, missing dir) is silently skipped so a single bad
-/// entry doesn't abort the whole purge.
+/// 1. **The dataset-keyed directory** — `<cache_root>/<entry.name>/`
+///    is where the mandated layout puts everything the dataset
+///    pulled, including out-of-home facets cached flat by basename
+///    (whose URLs are NOT under the recorded origin, which is why
+///    the old facet-URL-prefix match silently removed nothing for
+///    them). Guarded by the origin binding: when `origin.json`
+///    names a different home than this entry's, the directory
+///    belongs to a same-named dataset from another catalog and is
+///    reported as skipped instead of clobbered.
+/// 2. **URL-derived locations** — any other origin-bearing directory
+///    whose recorded origin is a URL-prefix of one of this entry's
+///    facet URLs (direct-URL-open caches of the same files).
+///
+/// Returns `(removed_paths, freed_bytes, skipped_notes)`. A removal
+/// failure (permission, missing dir) is silently skipped so a single
+/// bad entry doesn't abort the whole purge.
 pub(super) fn purge_cache_for_entry(
     entry: &CatalogEntry,
     cache_dir: &std::path::Path,
-) -> (Vec<std::path::PathBuf>, u64) {
-    let facet_urls = entry_facet_urls(entry);
+) -> (Vec<std::path::PathBuf>, u64, Vec<String>) {
     let mut removed = Vec::new();
     let mut freed: u64 = 0;
-    // Walk dataset directories the same way the survey does. For each
-    // one, check whether ANY facet URL we know belongs to this entry
-    // would resolve into this dataset_dir — if so the whole tree
-    // belongs to us and gets removed atomically.
+    let mut skipped = Vec::new();
+    let remove_dir = |dir: &std::path::Path, removed: &mut Vec<std::path::PathBuf>, freed: &mut u64| {
+        let bytes = leaf_size_bytes(dir);
+        if std::fs::remove_dir_all(dir).is_ok() {
+            *freed += bytes;
+            removed.push(dir.to_path_buf());
+        }
+    };
+
+    // Sweep 1: the dataset-keyed directory.
+    let name_dir = cache_dir.join(&entry.name);
+    if name_dir.is_dir() {
+        let home = canonicalize_cache_url(&entry.dataset_home_url());
+        match crate::cache::layout::read_dataset_origin(&name_dir) {
+            Some(origin) if canonicalize_cache_url(&origin.source) != home => {
+                skipped.push(format!(
+                    "{} — origin.json records {} (a different catalog's dataset \
+                     with the same name); not removed. Delete it manually if \
+                     that's really what you want.",
+                    name_dir.display(), origin.source,
+                ));
+            }
+            // Matching origin, or no origin recorded (derive-style
+            // workspace) — the directory is this dataset's by layout.
+            _ => remove_dir(&name_dir, &mut removed, &mut freed),
+        }
+    }
+
+    // Sweep 2: URL-derived caches of the same files (origin is the
+    // facet's parent URL → prefix-matches the facet URL). Both sides
+    // canonicalised so an s3:// origin and an https:// facet URL
+    // compare in the same scheme.
+    let facet_urls = entry_facet_urls(entry);
     walk_dataset_dirs(cache_dir, &mut |dataset_dir| {
+        if removed.iter().any(|r| dataset_dir.starts_with(r)) { return; }
         let Some(origin) = crate::cache::layout::read_dataset_origin(dataset_dir) else { return; };
-        // Canonicalise the recorded origin before comparing — without
-        // this, an s3:// origin and a facet URL already-canonicalised
-        // to https:// (by `entry_facet_urls`) would never share a
-        // prefix and purge would silently match nothing. Both sides
-        // must travel the same translation through
-        // `transport::normalize_remote_url`.
         let base_url = canonicalize_cache_url(&origin.source);
-        // A dataset directory's recorded origin is the *parent URL*
-        // of every facet that ought to live there. We check whether
-        // any facet URL we know has the dataset directory's origin
-        // as a URL prefix. Conservative — only delete what's clearly
-        // ours, never sibling caches that happen to share an origin
-        // host.
         let matches = facet_urls.iter().any(|u| base_url_matches_facet(&base_url, u));
         if !matches { return; }
-        let bytes = leaf_size_bytes(dataset_dir);
-        if std::fs::remove_dir_all(dataset_dir).is_ok() {
-            freed += bytes;
-            removed.push(dataset_dir.to_path_buf());
-        }
+        remove_dir(dataset_dir, &mut removed, &mut freed);
     });
-    (removed, freed)
+    (removed, freed, skipped)
 }
 
 /// True iff a facet URL is a child of `base_url` (the recorded
@@ -1260,6 +1281,10 @@ fn matches_filter(row: &PickerRow, filter: &str) -> bool {
 pub enum PickerAction {
     /// Launch the unified vector-space explorer for this profile.
     Visualize,
+    /// Print the dataset's cache directory to stdout when the picker
+    /// exits — or a commented not-cached line when nothing is cached.
+    /// Batch-safe: selecting several datasets prints one line each.
+    Locate,
     /// Open a scrollable text view of the full catalog descriptor
     /// for this dataset+profile (attributes, facets with windows,
     /// origin URLs, cache state). Renders inside the picker as an
@@ -1283,6 +1308,7 @@ impl PickerAction {
     fn label(self) -> &'static str {
         match self {
             PickerAction::Visualize => "Visualize",
+            PickerAction::Locate    => "Locate",
             PickerAction::Describe  => "Describe",
             PickerAction::Source    => "Source",
             PickerAction::Precache  => "Precache",
@@ -1295,6 +1321,8 @@ impl PickerAction {
         match self {
             PickerAction::Visualize =>
                 "Open the interactive explorer: norms, distances, eigenvalues, PCA.",
+            PickerAction::Locate =>
+                "Print the dataset's cache directory to stdout on exit (a commented line when not cached). Works on a multi-selection.",
             PickerAction::Describe =>
                 "Show full descriptor: attributes, facets (paths + windows), origin, cache state. Scrollable.",
             PickerAction::Source =>
@@ -1318,6 +1346,7 @@ impl PickerAction {
             PickerAction::Visualize,
             PickerAction::Describe,
             PickerAction::Source,
+            PickerAction::Locate,
             PickerAction::Precache,
             PickerAction::Ping,
             PickerAction::Purge,
@@ -1339,7 +1368,8 @@ impl PickerAction {
     /// ping, purge — chain naturally across a batch.
     fn batch_safe(self) -> bool {
         matches!(self,
-            PickerAction::Precache
+            PickerAction::Locate
+            | PickerAction::Precache
             | PickerAction::Ping
             | PickerAction::Purge)
     }
@@ -2516,6 +2546,61 @@ where F: FnMut(&str, PickerAction, bool) -> ActionFlow,
 #[cfg(test)]
 mod tests {
     use super::format_count;
+
+    fn knn_entry(name: &str, base: &str) -> crate::dataset::CatalogEntry {
+        crate::dataset::CatalogEntry {
+            name: name.to_string(),
+            path: base.to_string(),
+            dataset_type: "knn_entries.yaml".to_string(),
+            catalog_file: None,
+            layout: crate::dataset::CatalogLayout {
+                attributes: None,
+                profiles: Default::default(),
+            },
+        }
+    }
+
+    /// Purge must remove the dataset-keyed directory even when every
+    /// facet lives OUTSIDE the dataset's home URL — the previous
+    /// facet-URL-prefix match found nothing for such datasets and
+    /// silently removed nothing.
+    #[test]
+    fn purge_removes_dataset_dir_with_out_of_home_facets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path();
+        let ds = cache.join("ds-a");
+        std::fs::create_dir_all(&ds).unwrap();
+        // Origin records the dataset HOME — facets are elsewhere.
+        std::fs::write(ds.join("origin.json"),
+            r#"{"source":"https://h/cat/ds-a/","fetched_at":"x"}"#).unwrap();
+        std::fs::write(ds.join("query.fvecs"), b"data").unwrap();
+
+        let entry = knn_entry("ds-a", "https://h/cat");
+        let (removed, _freed, skipped) = super::purge_cache_for_entry(&entry, cache);
+        assert_eq!(removed, vec![ds.clone()], "dataset dir must be purged");
+        assert!(skipped.is_empty(), "no skip notes expected: {skipped:?}");
+        assert!(!ds.exists());
+    }
+
+    /// A same-named directory bound to a DIFFERENT catalog's home
+    /// must be skipped with a note, never clobbered.
+    #[test]
+    fn purge_skips_dataset_dir_bound_to_other_catalog() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path();
+        let ds = cache.join("ds-a");
+        std::fs::create_dir_all(&ds).unwrap();
+        std::fs::write(ds.join("origin.json"),
+            r#"{"source":"https://OTHER/cat/ds-a/","fetched_at":"x"}"#).unwrap();
+        std::fs::write(ds.join("query.fvecs"), b"data").unwrap();
+
+        let entry = knn_entry("ds-a", "https://h/cat");
+        let (removed, freed, skipped) = super::purge_cache_for_entry(&entry, cache);
+        assert!(removed.is_empty(), "foreign-bound dir must not be removed");
+        assert_eq!(freed, 0);
+        assert_eq!(skipped.len(), 1, "must report the binding mismatch");
+        assert!(ds.join("query.fvecs").exists());
+    }
 
     /// The CACHED column's coverage must agree with where the storage
     /// layer actually puts cache files — for home-relative facets AND
