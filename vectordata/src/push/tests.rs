@@ -776,7 +776,16 @@ fn scan_refuses_non_utf8_names() {
     let remote = unique("nonutf8-remote");
     make_dataset(&src);
     let bad = std::ffi::OsStr::from_bytes(b"bad\xFFname.bin");
-    std::fs::write(src.join(bad), b"x").unwrap();
+    // APFS (macOS) enforces UTF-8 filenames at the filesystem level
+    // and refuses to create this fixture (EILSEQ). On such a
+    // filesystem the invariant under test cannot be violated in the
+    // first place — there is nothing for scan to refuse — so skip
+    // instead of failing the platform's release build. (This single
+    // fixture write blocked every macOS release leg from v1.3.0 on.)
+    if std::fs::write(src.join(bad), b"x").is_err() {
+        eprintln!("skipping: filesystem refuses non-UTF-8 names; invariant is fs-enforced here");
+        return;
+    }
     let err = execute(&opts(&src, &remote)).expect_err("non-utf8 name must be refused");
     assert!(matches!(err, Failure::Usage(m) if m.contains("non-UTF-8")));
 }
